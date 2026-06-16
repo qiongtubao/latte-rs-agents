@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "latte-agent-core",
+    "latte-agent-orchestrator",
+    "latte-agent-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates (path references to sibling projects)
+latte-ai = { path = "../latte-rs-model-router/latte-ai" }
+latte-rs-agent-tools = { path = "../latte-rs-agent-tools" }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Templating
+handlebars = "6"
+
+# Error handling
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }

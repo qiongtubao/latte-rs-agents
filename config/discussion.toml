@@ -1,0 +1,141 @@
+# Discussion Workflow Configuration
+# Pre-defined workflows for common multi-agent discussion patterns.
+
+[default_workflow]
+name = "standard-software-discussion"
+description = "Standard software development discussion: requirements → design → estimate → review → decide"
+max_rounds = 3
+context_token_budget = 32000
+
+[[default_workflow.steps]]
+id = "requirements"
+description = "PM presents the requirements and goals"
+speakers = ["pm"]
+prompt = "Present the requirements for: {{topic}}. Cover: user story, acceptance criteria, scope boundaries, and priority."
+
+[[default_workflow.steps]]
+id = "architecture"
+description = "Architect reviews feasibility and suggests design"
+speakers = ["architect"]
+prompt = "Review the requirements above from a technical perspective. Suggest architecture, identify risks, and discuss tradeoffs."
+
+[[default_workflow.steps]]
+id = "implementation"
+description = "Programmer estimates effort and implementation approach"
+speakers = ["programmer"]
+prompt = "Given the requirements and architecture above, estimate the implementation approach. Identify key modules, data flow, and complexity."
+
+[[default_workflow.steps]]
+id = "quality"
+description = "Tester identifies test strategy and edge cases"
+speakers = ["tester"]
+prompt = "Review the requirements and implementation plan above. Identify testing strategy, edge cases, and acceptance criteria gaps."
+
+[[default_workflow.steps]]
+id = "review"
+description = "Reviewer checks quality and security concerns"
+speakers = ["reviewer", "security"]
+prompt = "Review the full discussion above. Reviewer: code quality and patterns concerns. Security: vulnerability and threat considerations."
+
+[[default_workflow.steps]]
+id = "decide"
+description = "Manager makes final decision on scope and timeline"
+speakers = ["pm", "manager"]
+prompt = "Based on the full discussion above, finalize scope, priorities, and timeline. Manager: assess risk and resource constraints."
+
+# ─── Pre-defined Workflows ───────────────────────────────────────────────────
+
+[workflows.requirements_review]
+name = "Requirements Review"
+description = "PM presents requirements, team discusses feasibility and scope."
+max_rounds = 2
+
+[[workflows.requirements_review.steps]]
+id = "present"
+speakers = ["pm"]
+prompt = "Present the requirements for: {{topic}}. Include user stories with acceptance criteria."
+
+[[workflows.requirements_review.steps]]
+id = "architecture"
+speakers = ["architect"]
+prompt = "Review technical feasibility and suggest architecture for the requirements above."
+
+[[workflows.requirements_review.steps]]
+id = "estimate"
+speakers = ["programmer", "tester"]
+prompt = "Estimate effort and identify risks. Programmer: implementation complexity and rough timeline. Tester: test surface and edge cases."
+
+[[workflows.requirements_review.steps]]
+id = "decide"
+speakers = ["manager", "pm"]
+prompt = "Based on the discussion, finalize scope and priorities. Manager: assess risk and timeline feasibility."
+
+[workflows.code_review]
+name = "Code Review"
+description = "Multi-perspective code review with security, style, and logic checks."
+max_rounds = 1
+
+[[workflows.code_review.steps]]
+id = "explain"
+speakers = ["programmer"]
+prompt = "Explain the changes in the code at: {{code_path}}. What was changed and why?"
+
+[[workflows.code_review.steps]]
+id = "review"
+speakers = ["reviewer", "security", "tester"]
+prompt = "Review the code changes described above. Reviewer: patterns and code quality. Security: vulnerabilities. Tester: edge cases and test coverage gaps."
+
+[[workflows.code_review.steps]]
+id = "respond"
+speakers = ["programmer"]
+prompt = "Address the review feedback. For each point, either accept and explain the fix, or push back with reasoning."
+
+[workflows.design_brainstorm]
+name = "Design Brainstorm"
+description = "Open-ended creative discussion about architecture or feature design."
+max_rounds = 2
+
+[[workflows.design_brainstorm.steps]]
+id = "context"
+speakers = ["pm"]
+prompt = "Describe the problem and goals: {{topic}}. What user need are we solving?"
+
+[[workflows.design_brainstorm.steps]]
+id = "brainstorm"
+speakers = ["architect", "programmer", "designer"]
+prompt = "Brainstorm approaches. Architect: system design options. Programmer: practical implementation concerns. Designer: UX implications. Build on each other's ideas."
+
+[[workflows.design_brainstorm.steps]]
+id = "evaluate"
+speakers = ["reviewer", "security", "devops"]
+prompt = "Evaluate the proposed approaches. Consider: maintainability, security, and operational cost."
+
+[[workflows.design_brainstorm.steps]]
+id = "synthesize"
+speakers = ["architect", "pm"]
+prompt = "Synthesize the discussion into a recommended approach with tradeoffs documented."
+
+[workflows.bug_triage]
+name = "Bug Triage"
+description = "Triage a bug report with multi-role analysis."
+max_rounds = 2
+
+[[workflows.bug_triage.steps]]
+id = "describe"
+speakers = ["tester"]
+prompt = "Describe the bug: {{topic}}. Include reproduction steps, expected vs actual behavior, and severity."
+
+[[workflows.bug_triage.steps]]
+id = "diagnose"
+speakers = ["programmer"]
+prompt = "Analyze the bug described above. What is the likely root cause? What area of the code is affected?"
+
+[[workflows.bug_triage.steps]]
+id = "impact"
+speakers = ["security", "devops"]
+prompt = "Assess the impact of this bug. Security: any security implications? DevOps: any operational impact?"
+
+[[workflows.bug_triage.steps]]
+id = "plan"
+speakers = ["programmer", "manager"]
+prompt = "Propose a fix plan. Programmer: fix approach and estimate. Manager: priority and scheduling."

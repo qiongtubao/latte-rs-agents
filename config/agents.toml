@@ -1,0 +1,103 @@
+# Agent Role Configuration
+# Each section defines a role that participates in discussions.
+# Users can add custom roles by adding new [roles.<id>] sections.
+
+[roles.pm]
+id = "pm"
+name = "Product Manager"
+category = "planning"
+model_tier = "standard"
+prompt_file = "prompts/pm.md"
+temperature = 0.7
+tools = ["read", "search"]
+icon = "📋"
+
+[roles.architect]
+id = "architect"
+name = "System Architect"
+category = "planning"
+model_tier = "premium"
+prompt_file = "prompts/architect.md"
+temperature = 0.5
+tools = ["read", "search"]
+icon = "🏗️"
+
+[roles.programmer]
+id = "programmer"
+name = "Software Engineer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/programmer.md"
+temperature = 0.3
+tools = ["read", "write", "bash", "search"]
+icon = "💻"
+
+[roles.tester]
+id = "tester"
+name = "QA Engineer"
+category = "verification"
+model_tier = "budget"
+prompt_file = "prompts/tester.md"
+temperature = 0.4
+tools = ["read", "bash", "search"]
+icon = "🧪"
+
+[roles.reviewer]
+id = "reviewer"
+name = "Code Reviewer"
+category = "verification"
+model_tier = "standard"
+prompt_file = "prompts/reviewer.md"
+temperature = 0.4
+tools = ["read", "search"]
+icon = "🔍"
+
+[roles.devops]
+id = "devops"
+name = "DevOps Engineer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/devops.md"
+temperature = 0.3
+tools = ["read", "bash", "write"]
+icon = "🚀"
+
+[roles.security]
+id = "security"
+name = "Security Auditor"
+category = "verification"
+model_tier = "standard"
+prompt_file = "prompts/security.md"
+temperature = 0.4
+tools = ["read", "search"]
+icon = "🛡️"
+
+[roles.designer]
+id = "designer"
+name = "UI/UX Designer"
+category = "planning"
+model_tier = "standard"
+prompt_file = "prompts/designer.md"
+temperature = 0.7
+tools = ["read"]
+icon = "🎨"
+
+[roles.tech_writer]
+id = "tech_writer"
+name = "Technical Writer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/tech_writer.md"
+temperature = 0.5
+tools = ["read", "write"]
+icon = "📝"
+
+[roles.manager]
+id = "manager"
+name = "Engineering Manager"
+category = "planning"
+model_tier = "premium"
+prompt_file = "prompts/manager.md"
+temperature = 0.5
+tools = ["read"]
+icon = "👔"

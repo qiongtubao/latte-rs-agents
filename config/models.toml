@@ -1,0 +1,103 @@
+# Model Catalog & Tier Configuration
+# Compatible with latte-rs-model-router/models.toml format, extended with tier mapping.
+
+# ─── Tier Mappings ───────────────────────────────────────────────────────────
+# Global tier → model_id. Per-role overrides below.
+
+[tiers]
+premium = "claude-opus-4-20250514"
+standard = "claude-sonnet-4-20250514"
+budget = "deepseek-chat"
+
+# ─── Per-Role Tier Overrides (optional) ─────────────────────────────────────
+# Override which model a specific role uses at each tier.
+
+[role_tiers.pm]
+premium = "claude-opus-4-20250514"
+standard = "claude-sonnet-4-20250514"
+budget = "deepseek-chat"
+
+[role_tiers.architect]
+premium = "claude-opus-4-20250514"
+standard = "claude-sonnet-4-20250514"
+budget = "deepseek-chat"
+
+[role_tiers.programmer]
+premium = "claude-sonnet-4-20250514"
+standard = "deepseek-chat"
+budget = "qwen2.5-coder-32b-instruct"
+
+[role_tiers.manager]
+premium = "claude-opus-4-20250514"
+standard = "claude-sonnet-4-20250514"
+budget = "deepseek-chat"
+
+# ─── Model Definitions ───────────────────────────────────────────────────────
+
+[[models]]
+id = "claude-opus-4-20250514"
+name = "Claude Opus 4"
+api = "anthropic"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+context_window = 200000
+max_tokens = 8192
+supports_thinking = true
+cost_per_million_input = 15.0
+cost_per_million_output = 75.0
+tier = "premium"
+
+[[models]]
+id = "claude-sonnet-4-20250514"
+name = "Claude Sonnet 4"
+api = "anthropic"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+context_window = 200000
+max_tokens = 8192
+supports_thinking = true
+cost_per_million_input = 3.0
+cost_per_million_output = 15.0
+tier = "standard"
+
+[[models]]
+id = "deepseek-chat"
+name = "DeepSeek Chat V3"
+api = "openai"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+context_window = 65536
+max_tokens = 8192
+supports_thinking = false
+cost_per_million_input = 0.27
+cost_per_million_output = 1.10
+tier = "budget"
+
+[[models]]
+id = "qwen2.5-coder-32b-instruct"
+name = "Qwen 2.5 Coder 32B"
+api = "openai"
+provider = "ollama"
+base_url = "http://localhost:11434"
+api_key = "ollama"
+context_window = 32768
+max_tokens = 4096
+supports_thinking = false
+tier = "budget"
+
+[[models]]
+id = "gpt-4o"
+name = "GPT-4o"
+api = "openai"
+provider = "openai"
+base_url = "https://api.openai.com"
+api_key = "${OPENAI_API_KEY}"
+context_window = 128000
+max_tokens = 16384
+supports_thinking = false
+cost_per_million_input = 2.50
+cost_per_million_output = 10.0
+tier = "standard"
