@@ -63,4 +63,19 @@ pub enum AgentError {
     /// Orchestration error (for phase 2+).
     #[error("orchestration error: {0}")]
     Orchestration(String),
+
+    /// All models in the role's fallback chain are unavailable
+    /// (rate-limited / 5xx / cooldown).
+    ///
+    /// `tried`: model_ids attempted in priority order (skipping
+    ///          already-on-cooldown entries).
+    /// `next_retry_in`: how long until the **earliest** model in the chain
+    ///                  exits cooldown. `None` if no model has a future
+    ///                  cooldown (i.e. the failures were non-retryable but
+    ///                  were swallowed by the fallback loop — caller's hint
+    #[error("all models unavailable (tried: {tried:?}); next retry in {next_retry_in:?}")]
+    ModelsUnavailable {
+        tried: Vec<String>,
+        next_retry_in: Option<std::time::Duration>,
+    },
 }

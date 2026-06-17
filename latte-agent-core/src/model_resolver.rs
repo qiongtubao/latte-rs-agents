@@ -162,7 +162,6 @@ impl ModelResolver {
             reason: "no models in catalog".into(),
         })
     }
-
     /// Escalate tier and resolve the escalated model. Returns `None` if already at max.
     pub fn resolve_escalated(
         &self,
@@ -171,6 +170,33 @@ impl ModelResolver {
     ) -> Option<(ModelTier, AgentResult<Model>)> {
         let escalated = current.escalate()?;
         Some((escalated, self.resolve(role_id, escalated)))
+    }
+
+    /// Resolve a primary model plus a priority-ordered fallback chain.
+    ///
+    /// Returns `[primary, fallback_1, fallback_2, ...]` with duplicates removed
+    /// (the primary is never repeated even if it also appears in `chain_ids`).
+    /// Models that fail to resolve (unknown id) are silently dropped from the
+    /// chain; if the primary itself can't be resolved, the error is returned.
+    pub fn resolve_chain(
+        &self,
+        role_id: &str,
+        tier: ModelTier,
+        chain_ids: &[String],
+    ) -> AgentResult<Vec<Model>> {
+        let primary = self.resolve(role_id, tier)?;
+        let mut out = Vec::with_capacity(1 + chain_ids.len());
+        out.push(primary);
+        for id in chain_ids {
+            // Skip if same id as the primary (dedup, including tier-aliased ids)
+            if out.iter().any(|m| &m.id == id) {
+                continue;
+            }
+            if let Ok(m) = self.build_model(id) {
+                out.push(m);
+            }
+        }
+        Ok(out)
     }
 
     /// List all known model tiers for a role.
@@ -355,5 +381,106 @@ mod tests {
         assert_eq!(resolve_env_vars("prefix_${TEST_KEY}_suffix"), "prefix_resolved-value_suffix");
         assert_eq!(resolve_env_vars("${NONEXISTENT}"), "");
         std::env::remove_var("TEST_KEY");
+    }
+    // ─── resolve_chain tests ───────────────────────────────────────────
+
+    fn catalog_with_three() -> AgentConfig {
+        AgentConfig {
+            models: crate::config::ModelCatalog {
+                models: vec![
+                    test_model_def("premium", Some("premium")),
+                    test_model_def("standard", Some("standard")),
+                    test_model_def("budget", Some("budget")),
+                ],
+                tiers: Some(
+                    [
+                        ("premium".into(), "premium".into()),
+                        ("standard".into(), "standard".into()),
+                        ("budget".into(), "budget".into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_chain_returns_primary_first() {
+        let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        let chain = resolver
+            .resolve_chain("any", ModelTier::Premium, &["standard".into()])
+            .unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, "premium");
+        assert_eq!(chain[1].id, "standard");
+    }
+
+    #[test]
+    fn test_resolve_chain_preserves_order() {
+        let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        let chain = resolver
+            .resolve_chain("any", ModelTier::Premium, &["budget".into(), "standard".into()])
+            .unwrap();
+        assert_eq!(
+            chain.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["premium", "budget", "standard"],
+            "fallback order must match the input list"
+        );
+    }
+
+    #[test]
+    fn test_resolve_chain_dedups_primary() {
+        // If the chain list also names the primary, the primary
+        // must not appear twice.
+        let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        let chain = resolver
+            .resolve_chain("any", ModelTier::Premium, &["premium".into(), "budget".into()])
+            .unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, "premium");
+        assert_eq!(chain[1].id, "budget");
+    }
+
+    #[test]
+    fn test_resolve_chain_drops_unknown_ids() {
+        // Unknown ids in the chain are silently skipped — the agent
+        // shouldn't fail just because a config listed a typo.
+        let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        let chain = resolver
+            .resolve_chain(
+                "any",
+                ModelTier::Premium,
+                &["nonexistent".into(), "budget".into()],
+            )
+            .unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, "premium");
+        assert_eq!(chain[1].id, "budget");
+    }
+
+    #[test]
+    fn test_resolve_chain_with_empty_chain_returns_only_primary() {
+        let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        let chain = resolver
+            .resolve_chain("any", ModelTier::Premium, &[])
+            .unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, "premium");
+    }
+
+    #[test]
+    fn test_resolve_chain_errors_when_primary_unresolvable() {
+        // With an empty catalog, the primary itself can't be resolved —
+        // resolve_chain must surface that error rather than silently
+        // returning an empty chain.
+        let empty = AgentConfig::default();
+        let resolver = ModelResolver::from_config(&empty).unwrap();
+        let err = resolver
+            .resolve_chain("any", ModelTier::Premium, &["fallback".into()])
+            .expect_err("empty catalog should fail primary resolution");
+        assert!(matches!(err, AgentError::ModelResolutionFailed { .. }));
     }
 }

@@ -78,13 +78,15 @@ impl DiscussCmd {
                 .roles
                 .get(role_name)
                 .ok_or_else(|| format!("role '{}' not found in config", role_name))?;
-
             let role = template.resolve(&default_params).await?;
             let tier = role.default_model_tier;
-            let model = resolver.resolve(&role.id, tier)?;
-            let model_id = model.id.clone();
+            // Resolve the full model chain (primary + fallbacks) so the
+            // agent can walk the priority list when the primary is
+            // rate-limited or otherwise unavailable.
+            let models = resolver.resolve_chain(&role.id, tier, &role.model_chain)?;
+            let model_id = models[0].id.clone();
 
-            let agent = Agent::new(role_name.clone(), role, model, default_params.clone())?;
+            let agent = Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
             let runner = AgentRunner::new(agent);
 
             agents.insert(role_name.clone(), runner);
