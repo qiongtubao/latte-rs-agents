@@ -44,7 +44,7 @@ pub mod role;
 
 pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
 pub use config::AgentConfig;
-pub use context::ConversationContext;
+pub use context::{ConversationContext, Importance};
 pub use error::{AgentError, AgentResult};
 pub use model_resolver::{ModelResolver, ModelTier};
 pub use role::{Role, RoleCategory, RoleTemplate};
@@ -53,7 +53,7 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 pub mod prelude {
     pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
     pub use crate::config::AgentConfig;
-    pub use crate::context::ConversationContext;
+    pub use crate::context::{ConversationContext, Importance};
     pub use crate::error::AgentResult;
     pub use crate::model_resolver::{ModelResolver, ModelTier};
     pub use crate::role::{Role, RoleCategory};
