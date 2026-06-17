@@ -276,10 +276,10 @@ impl DiscussionOrchestrator {
 
                     let response = agent_runner
                         .run_turn(
-                            &[Message {
-                                role: Role::User,
-                                content: context_prompt,
-                            }],
+                        &[Message {
+                            role: Role::User,
+                            content: context_prompt,
+                        }],
                             Some(&system_vars),
                         )
                         .await?;

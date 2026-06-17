@@ -47,8 +47,14 @@ pub struct Role {
     pub category: RoleCategory,
     /// System prompt template (handlebars). Rendered with context variables.
     pub system_prompt: String,
-    /// Default model tier for this role.
+    /// Default model tier for this role (resolves to the primary model).
     pub default_model_tier: crate::model_resolver::ModelTier,
+    /// Fallback model chain, in priority order (highest first).
+    ///
+    /// When the primary model (resolved from `default_model_tier`) is
+    /// unavailable (rate-limited, 5xx, etc.), the agent walks this list and
+    /// tries each model in order. Empty = no fallback beyond the primary.
+    pub model_chain: Vec<String>,
     /// Default generation params (temperature, top_p, etc.).
     pub default_params: GenerateParams,
     /// Tools this role typically uses (tool names).
@@ -88,6 +94,10 @@ pub struct RoleTemplate {
     pub name: String,
     pub category: String,
     pub model_tier: String,
+    /// Fallback model chain in priority order (highest priority first).
+    /// TOML example: `model_chain = ["gpt-4o", "deepseek-chat", "claude-3-haiku"]`.
+    #[serde(default)]
+    pub model_chain: Vec<String>,
     pub prompt_file: Option<String>,
     #[serde(default)]
     pub temperature: Option<f64>,
@@ -137,6 +147,7 @@ impl RoleTemplate {
             category,
             system_prompt,
             default_model_tier: model_tier,
+            model_chain: self.model_chain.clone(),
             default_params: params,
             allowed_tools: self.tools.clone(),
             icon: if self.icon.is_empty() {
@@ -199,6 +210,7 @@ mod tests {
             category: RoleCategory::Discussion,
             system_prompt: "You are a {{role_name}}. Topic: {{topic}}".into(),
             default_model_tier: crate::model_resolver::ModelTier::Standard,
+            model_chain: vec![],
             default_params: GenerateParams::default(),
             allowed_tools: vec![],
             icon: "🧪".into(),

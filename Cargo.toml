@@ -32,4 +32,6 @@ handlebars = "6"
 thiserror = "2"
 
 # CLI
+# Sync primitives (used by agent cooldown map for non-blocking &self access)
+parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }

@@ -27,7 +27,7 @@
 //!
 //! let mut runner = AgentRunner::new(agent);
 //! let response = runner.run_turn(
-//!     &[Message { role: Role::User, content: "Features for MVP?".into() }],
+//!     &[Message { role: Role::User, content: "Features for MVP?".to_string() }],
 //!     None,
 //! ).await?;
 //! println!("{}", response);
@@ -42,7 +42,7 @@ pub mod error;
 pub mod model_resolver;
 pub mod role;
 
-pub use agent::{Agent, AgentRunner, AgentParams};
+pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
 pub use config::AgentConfig;
 pub use context::ConversationContext;
 pub use error::{AgentError, AgentResult};
@@ -51,7 +51,7 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 
 /// Convenience re-exports.
 pub mod prelude {
-    pub use crate::agent::{Agent, AgentRunner, AgentParams};
+    pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
     pub use crate::config::AgentConfig;
     pub use crate::context::ConversationContext;
     pub use crate::error::AgentResult;
