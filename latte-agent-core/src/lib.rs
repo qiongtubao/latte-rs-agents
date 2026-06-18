@@ -40,6 +40,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod model_resolver;
+pub mod prompts;
 pub mod role;
 
 pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
