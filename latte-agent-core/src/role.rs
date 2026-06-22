@@ -179,7 +179,11 @@ fn default_icon(role_id: &str) -> String {
 fn new_handlebars() -> handlebars::Handlebars<'static> {
     let mut reg = handlebars::Handlebars::new();
     reg.register_escape_fn(handlebars::no_escape);
-    reg.set_strict_mode(true);
+    // Strict mode is OFF: missing variables render as `{{var}}` literals
+    // rather than failing. This keeps prompts that reference project
+    // context (e.g. manager.md) usable from the chat REPL where the
+    // orchestrator's full context variables aren't injected.
+    reg.set_strict_mode(false);
     reg
 }
 

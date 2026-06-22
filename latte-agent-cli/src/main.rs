@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 
-use commands::{config::ConfigCmd, discuss::DiscussCmd, list::ListCmd};
+use commands::{chat::ChatCmd, config::ConfigCmd, discuss::DiscussCmd, list::ListCmd, workflow::WorkflowCmd};
 
 #[derive(Parser)]
 #[command(name = "latte-agent", version, about = "Multi-role agent discussion system")]
@@ -20,24 +20,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a multi-agent discussion
     Discuss(DiscussCmd),
-    /// List available roles, models, or workflows
+    Chat(ChatCmd),
+    /// Run a multi-agent discussion using a named workflow
+    Workflow(WorkflowCmd),
     List(ListCmd),
-    /// Show or modify configuration
     Config(ConfigCmd),
 }
-
 #[tokio::main]
-async fn main() {
+ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
         Command::Discuss(cmd) => cmd.run().await,
+        Command::Chat(cmd) => cmd.run().await,
+        Command::Workflow(cmd) => cmd.run().await,
         Command::List(cmd) => cmd.run().await,
         Command::Config(cmd) => cmd.run().await,
     };
-
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);

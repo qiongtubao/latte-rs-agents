@@ -1,0 +1,18 @@
+name = "code_review"
+description = "Multi-perspective code review with security, style, and logic checks."
+max_rounds = 1
+
+[[steps]]
+id = "explain"
+speakers = ["programmer"]
+prompt = "Explain the changes in the code at: {{code_path}}. What was changed and why?"
+
+[[steps]]
+id = "review"
+speakers = ["reviewer", "security", "tester"]
+prompt = "Review the code changes described above. Reviewer: patterns and code quality. Security: vulnerabilities. Tester: edge cases and test coverage gaps."
+
+[[steps]]
+id = "respond"
+speakers = ["programmer"]
+prompt = "Address the review feedback. For each point, either accept and explain the fix, or push back with reasoning."

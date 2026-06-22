@@ -21,7 +21,7 @@ pub enum AgentError {
     ModelNotFound(String),
 
     /// Model tier resolution failed.
-    #[error("cannot resolve model for role '{role}' at tier '{tier:?}': {reason}")]
+    #[error("cannot resolve model for role '{role}' at tier '{tier}': {reason}")]
     ModelResolutionFailed {
         role: String,
         tier: String,

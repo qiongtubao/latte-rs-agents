@@ -13,7 +13,7 @@ pub mod workflow;
 pub use consensus::ConsensusMethod;
 pub use orchestrator::DiscussionOrchestrator;
 pub use round::{Round, Turn, TurnOrder, TurnRecord};
-pub use workflow::{DiscussionWorkflow, StepHook, WorkflowStep};
+pub use workflow::{DiscussionWorkflow, StepHook, WorkflowRegistry, WorkflowStep};
 
 /// Convenience re-exports.
 pub mod prelude {

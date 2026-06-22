@@ -23,12 +23,90 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    /// Load config from a TOML file path.
+    /// Load config from a path. If `path` is a directory, merge every
+    /// `*.toml` inside (models and roles are concatenated). If it is a
+    /// file, load that file directly.
+    ///
+    /// Directory mode supports the layout:
+    ///   config/agents/
+    ///     pm.toml
+    ///     architect.toml
+    ///     ...
+    ///   config/workflows/
+    ///     code_review.toml
+    ///     ...
     pub fn load(path: &str) -> AgentResult<Self> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            AgentError::Config(format!("cannot stat config path '{}': {}", path, e))
+        })?;
+
+        if meta.is_dir() {
+            return Self::load_dir(path);
+        }
+
         let content = std::fs::read_to_string(path).map_err(|e| {
             AgentError::Config(format!("cannot read config file '{}': {}", path, e))
         })?;
         Self::parse(&content)
+    }
+
+    /// Load every `*.toml` file in `dir` (non-recursive) and merge the
+    /// results. A `roles.<id>` key collision across files is an error so
+    /// users get immediate feedback on duplicate role definitions.
+    fn load_dir(dir: &str) -> AgentResult<Self> {
+        let mut merged = Self::default();
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map_err(|e| AgentError::Config(format!("cannot read dir '{}': {}", dir, e)))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.extension().and_then(|s| s.to_str()) == Some("toml")
+            })
+            .collect();
+        // Deterministic merge order.
+        entries.sort();
+
+        for entry in &entries {
+            let content = std::fs::read_to_string(entry).map_err(|e| {
+                AgentError::Config(format!(
+                    "cannot read '{}': {}",
+                    entry.display(),
+                    e
+                ))
+            })?;
+            let part = Self::parse(&content)?;
+
+            // Roles: detect duplicate IDs.
+            for id in part.roles.keys() {
+                if merged.roles.contains_key(id) {
+                    return Err(AgentError::Config(format!(
+                        "duplicate role '{}' in {}",
+                        id,
+                        entry.display()
+                    )));
+                }
+            }
+            merged.roles.extend(part.roles);
+
+            // Models: append.
+            merged.models.models.extend(part.models.models);
+            // Tier maps: merge shallowly (last writer wins per key).
+            if let Some(tiers) = part.models.tiers {
+                merged.models.tiers.get_or_insert_with(Default::default).extend(tiers);
+            }
+            if let Some(rt) = part.models.role_tiers {
+                let dst = merged
+                    .models
+                    .role_tiers
+                    .get_or_insert_with(Default::default);
+                for (role, tier_map) in rt {
+                    dst.entry(role).or_insert_with(Default::default).extend(tier_map);
+                }
+            }
+        }
+
+        Ok(merged)
     }
 
     /// Parse config from TOML string.
@@ -175,5 +253,67 @@ tier = "budget"
         assert_eq!(def.id, "test-model");
         assert_eq!(def.api, "openai");
         assert_eq!(def.tier, Some("budget".into()));
+    }
+    #[test]
+    fn test_load_dir_merges_role_files() {
+        let tmp = std::env::temp_dir().join("latte_agent_test_dir_merge");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("pm.toml"),
+            r#"
+[roles.pm]
+id = "pm"
+name = "PM"
+category = "planning"
+model_tier = "standard"
+icon = "P"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("architect.toml"),
+            r#"
+[roles.architect]
+id = "architect"
+name = "Arch"
+category = "planning"
+model_tier = "premium"
+icon = "A"
+"#,
+        )
+        .unwrap();
+        // Non-TOML files must be ignored.
+        std::fs::write(tmp.join("README.md"), "ignore me").unwrap();
+
+        let cfg = AgentConfig::load(tmp.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.roles.len(), 2);
+        assert!(cfg.roles.contains_key("pm"));
+        assert!(cfg.roles.contains_key("architect"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_dir_detects_duplicate_role() {
+        let tmp = std::env::temp_dir().join("latte_agent_test_dir_dup");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let body = r#"
+[roles.pm]
+id = "pm"
+name = "PM"
+category = "planning"
+model_tier = "standard"
+"#;
+        std::fs::write(tmp.join("a.toml"), body).unwrap();
+        std::fs::write(tmp.join("b.toml"), body).unwrap();
+
+        let err = AgentConfig::load(tmp.to_str().unwrap()).unwrap_err();
+        assert!(format!("{}", err).contains("duplicate role 'pm'"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

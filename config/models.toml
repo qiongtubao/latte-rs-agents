@@ -34,7 +34,7 @@ budget = "deepseek-chat"
 
 # ─── Model Definitions ───────────────────────────────────────────────────────
 
-[[models]]
+[[models.models]]
 id = "claude-opus-4-20250514"
 name = "Claude Opus 4"
 api = "anthropic"
@@ -48,7 +48,7 @@ cost_per_million_input = 15.0
 cost_per_million_output = 75.0
 tier = "premium"
 
-[[models]]
+[[models.models]]
 id = "claude-sonnet-4-20250514"
 name = "Claude Sonnet 4"
 api = "anthropic"
@@ -62,7 +62,7 @@ cost_per_million_input = 3.0
 cost_per_million_output = 15.0
 tier = "standard"
 
-[[models]]
+[[models.models]]
 id = "deepseek-chat"
 name = "DeepSeek Chat V3"
 api = "openai"
@@ -76,7 +76,7 @@ cost_per_million_input = 0.27
 cost_per_million_output = 1.10
 tier = "budget"
 
-[[models]]
+[[models.models]]
 id = "qwen2.5-coder-32b-instruct"
 name = "Qwen 2.5 Coder 32B"
 api = "openai"
@@ -88,7 +88,7 @@ max_tokens = 4096
 supports_thinking = false
 tier = "budget"
 
-[[models]]
+[[models.models]]
 id = "gpt-4o"
 name = "GPT-4o"
 api = "openai"

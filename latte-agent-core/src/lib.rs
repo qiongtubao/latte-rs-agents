@@ -39,6 +39,7 @@ pub mod agent;
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod global_config;
 pub mod model_resolver;
 pub mod prompts;
 pub mod role;

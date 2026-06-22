@@ -119,85 +119,101 @@ impl ModelResolver {
             role_tiers,
         })
     }
-
     /// Resolve a concrete `Model` for a given role and tier.
     ///
-    /// Lookup order: role_tiers override → tier_defaults → model's own tier field.
+    /// Lookup order: role_tiers override → tier_defaults → model's own tier
+    /// field → first model in catalog. If the chosen model has no
+    /// `api_key` configured (empty after env-var resolution), walks the
+    /// same priority order for an alternative whose `api_key` *is* set,
+    /// so a stale `${ENV_VAR}` placeholder that the env never filled
+    /// does not silently kill the role. Returns `Err` only when no
+    /// candidate has a key.
     pub fn resolve(&self, role_id: &str, tier: ModelTier) -> AgentResult<Model> {
-        // 1. Check per-role tier override
-        if let Some(role_map) = self.role_tiers.get(role_id) {
-            if let Some(model_id) = role_map.get(&tier) {
-                return self.build_model(model_id);
+        for model_id in self.candidates_for(role_id, tier) {
+            if let Ok(m) = self.build_model(&model_id) {
+                if !m.api_key.trim().is_empty() {
+                    return Ok(m);
+                }
             }
         }
-
-        // 2. Check global tier defaults
-        if let Some(model_id) = self.tier_defaults.get(&tier) {
-            return self.build_model(model_id);
-        }
-
-        // 3. Find first model matching this tier in the catalog
-        let matching = self
-            .models
-            .values()
-            .find(|m| {
-                m.tier
-                    .as_ref()
-                    .map(|t| ModelTier::parse(t).ok() == Some(tier))
-                    .unwrap_or(false)
-            });
-
-        if let Some(def) = matching {
-            return self.build_model(&def.id);
-        }
-
-        // 4. Fallback: return first model in catalog
-        if let Some(def) = self.models.values().next() {
-            return self.build_model(&def.id);
-        }
-
         Err(AgentError::ModelResolutionFailed {
             role: role_id.into(),
             tier: tier.label().into(),
-            reason: "no models in catalog".into(),
+            reason: "no tier candidate has a configured api_key".into(),
         })
     }
-    /// Escalate tier and resolve the escalated model. Returns `None` if already at max.
-    pub fn resolve_escalated(
-        &self,
-        role_id: &str,
-        current: ModelTier,
-    ) -> Option<(ModelTier, AgentResult<Model>)> {
-        let escalated = current.escalate()?;
-        Some((escalated, self.resolve(role_id, escalated)))
+
+    /// Returns every model id that could satisfy this (role, tier) in
+    /// priority order: per-role override → global tier default → catalog
+    /// match on `tier` field → first model in catalog.
+    fn candidates_for(&self, role_id: &str, tier: ModelTier) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut push = |id: &str| {
+            if seen.insert(id.to_string()) {
+                out.push(id.to_string());
+            }
+        };
+        if let Some(role_map) = self.role_tiers.get(role_id) {
+            if let Some(id) = role_map.get(&tier) {
+                push(id);
+            }
+        }
+        if let Some(id) = self.tier_defaults.get(&tier) {
+            push(id);
+        }
+        if let Some(def) = self.models.values().find(|m| {
+            m.tier
+                .as_ref()
+                .and_then(|t| ModelTier::parse(t).ok())
+                == Some(tier)
+        }) {
+            push(&def.id);
+        }
+        if let Some(def) = self.models.values().next() {
+            push(&def.id);
+        }
+        out
     }
 
     /// Resolve a primary model plus a priority-ordered fallback chain.
     ///
-    /// Returns `[primary, fallback_1, fallback_2, ...]` with duplicates removed
-    /// (the primary is never repeated even if it also appears in `chain_ids`).
-    /// Models that fail to resolve (unknown id) are silently dropped from the
-    /// chain; if the primary itself can't be resolved, the error is returned.
+    /// The head of the returned chain is the *first* model in the
+    /// tier-resolution order that has an `api_key` set; subsequent
+    /// entries are `chain_ids` (deduped) where the model also has a
+    /// key. Models whose `api_key` is empty are skipped, so the
+    /// agent never tries a model it cannot authenticate against.
     pub fn resolve_chain(
         &self,
         role_id: &str,
         tier: ModelTier,
         chain_ids: &[String],
     ) -> AgentResult<Vec<Model>> {
-        let primary = self.resolve(role_id, tier)?;
-        let mut out = Vec::with_capacity(1 + chain_ids.len());
-        out.push(primary);
+        let mut out: Vec<Model> = Vec::with_capacity(1 + chain_ids.len());
+        if let Ok(primary) = self.resolve(role_id, tier) {
+            out.push(primary);
+        }
         for id in chain_ids {
-            // Skip if same id as the primary (dedup, including tier-aliased ids)
             if out.iter().any(|m| &m.id == id) {
                 continue;
             }
             if let Ok(m) = self.build_model(id) {
-                out.push(m);
+                if !m.api_key.trim().is_empty() {
+                    out.push(m);
+                }
             }
+        }
+        if out.is_empty() {
+            return Err(AgentError::ModelResolutionFailed {
+                role: role_id.into(),
+                tier: tier.label().into(),
+                reason: "no candidate with a configured api_key".into(),
+            });
         }
         Ok(out)
     }
+
+
 
     /// List all known model tiers for a role.
     pub fn available_tiers(&self, role_id: &str) -> Vec<ModelTier> {
@@ -221,7 +237,48 @@ impl ModelResolver {
         tiers.into_iter().collect()
     }
 
-    fn build_model(&self, model_id: &str) -> AgentResult<Model> {
+    /// Resolve a model by **id or display name**. `id` is matched
+    /// exactly; `name` is matched case-insensitively. The returned
+    /// `Model` is the same as `build_model(id)` for the resolved id.
+    /// On miss, the error message lists every known `(id, name)` so
+    /// the operator can see what they meant.
+    pub fn resolve_id_or_name(&self, query: &str) -> AgentResult<Model> {
+        // 1) Exact id hit.
+        if self.models.contains_key(query) {
+            return self.build_model(query);
+        }
+        // 2) Case-insensitive name match.
+        let q = query.to_lowercase();
+        let mut hits: Vec<&str> = self
+            .models
+            .values()
+            .filter(|m| m.name.to_lowercase() == q)
+            .map(|m| m.id.as_str())
+            .collect();
+        if hits.len() == 1 {
+            return self.build_model(&hits.remove(0));
+        }
+        if hits.len() > 1 {
+            return Err(AgentError::Config(format!(
+                "--model-id {} matches multiple models by name: {}",
+                query,
+                hits.join(", ")
+            )));
+        }
+        // 3) Miss — build a helpful error.
+        let known: Vec<String> = self
+            .models
+            .values()
+            .map(|m| format!("{} ({})", m.id, m.name))
+            .collect();
+        Err(AgentError::Config(format!(
+            "--model-id {}: no such id or display name. Available: [{}]",
+            query,
+            known.join(", ")
+        )))
+    }
+
+     pub fn build_model(&self, model_id: &str) -> AgentResult<Model> {
         let def = self
             .models
             .get(model_id)
@@ -237,6 +294,12 @@ impl ModelResolver {
                 )))
             }
         };
+        // Resolve `${ENV_VAR}` placeholders. Unset variables become the
+        // empty string: that's the "not configured here" marker. The
+        // three-layer merge (global → project → CLI) decides whether an
+        // empty `api_key` stays empty (and the chat call later fails with
+        // a clear `Config` error from `AiClient::check_api_key`).
+        let api_key = resolve_env_vars(&def.api_key);
 
         Ok(Model {
             id: def.id.clone(),
@@ -244,7 +307,7 @@ impl ModelResolver {
             api: api_type,
             provider: def.provider.clone(),
             base_url: def.base_url.clone(),
-            api_key: resolve_env_vars(&def.api_key),
+            api_key,
             context_window: def.context_window,
             max_tokens: def.max_tokens,
             supports_thinking: def.supports_thinking,
@@ -255,6 +318,12 @@ impl ModelResolver {
 }
 
 /// Resolve `${ENV_VAR}` placeholders in a string.
+///
+/// Unset variables become the empty string (the "not configured" marker).
+/// The caller is responsible for deciding whether an empty result is
+/// acceptable in context; for `api_key` the three-layer config merge
+/// resolves that and `AiClient::check_api_key` produces a final error
+/// if all layers were blank.
 fn resolve_env_vars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -269,8 +338,11 @@ fn resolve_env_vars(s: &str) -> String {
                 }
                 var_name.push(ch);
             }
-            let value = std::env::var(&var_name).unwrap_or_default();
-            result.push_str(&value);
+            match std::env::var(&var_name) {
+                Ok(value) => result.push_str(&value),
+                // Unset variable → empty string (not-configured marker).
+                Err(_) => {}
+            }
         } else {
             result.push(c);
         }
@@ -278,7 +350,6 @@ fn resolve_env_vars(s: &str) -> String {
 
     result
 }
-
 impl std::fmt::Debug for ModelResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ModelResolver")
@@ -375,12 +446,75 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_id_or_name_by_exact_id() {
+        let mut def = test_model_def("deepseek-v4-flash", None);
+        def.name = "DeepSeek-v4-flash".into();
+        let config = AgentConfig {
+            models: crate::config::ModelCatalog {
+                models: vec![def],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        let m = resolver.resolve_id_or_name("deepseek-v4-flash").unwrap();
+        assert_eq!(m.id, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_resolve_id_or_name_by_case_insensitive_name() {
+        let mut def = test_model_def("deepseek-v4-flash", None);
+        def.name = "DeepSeek-v4-flash".into();
+        let config = AgentConfig {
+            models: crate::config::ModelCatalog {
+                models: vec![def],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        // Display name with original casing should match.
+        let m = resolver.resolve_id_or_name("DeepSeek-v4-flash").unwrap();
+        assert_eq!(m.id, "deepseek-v4-flash");
+        // And a lowercased form should also match.
+        let m = resolver.resolve_id_or_name("deepseek-v4-flash").unwrap();
+        assert_eq!(m.id, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn test_resolve_id_or_name_miss_lists_available() {
+        let mut def = test_model_def("real-id", None);
+        def.name = "Real Name".into();
+        let config = AgentConfig {
+            models: crate::config::ModelCatalog {
+                models: vec![def],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        let err = resolver
+            .resolve_id_or_name("nope")
+            .expect_err("should miss");
+        let msg = format!("{}", err);
+        assert!(msg.contains("nope"), "msg should contain query: {msg}");
+        assert!(msg.contains("real-id"), "msg should list real id: {msg}");
+        assert!(msg.contains("Real Name"), "msg should list real name: {msg}");
+    }
     fn test_env_var_resolution() {
         std::env::set_var("TEST_KEY", "resolved-value");
         assert_eq!(resolve_env_vars("${TEST_KEY}"), "resolved-value");
-        assert_eq!(resolve_env_vars("prefix_${TEST_KEY}_suffix"), "prefix_resolved-value_suffix");
-        assert_eq!(resolve_env_vars("${NONEXISTENT}"), "");
+        assert_eq!(
+            resolve_env_vars("prefix_${TEST_KEY}_suffix"),
+            "prefix_resolved-value_suffix"
+        );
+        // Unset env var → empty string (not-configured marker); the
+        // three-layer merge decides whether the empty key is acceptable.
         std::env::remove_var("TEST_KEY");
+        assert_eq!(resolve_env_vars("${DEFINITELY_UNSET}"), "");
     }
     // ─── resolve_chain tests ───────────────────────────────────────────
 

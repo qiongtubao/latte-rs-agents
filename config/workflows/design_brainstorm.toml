@@ -1,0 +1,23 @@
+name = "design_brainstorm"
+description = "Open-ended creative discussion about architecture or feature design."
+max_rounds = 2
+
+[[steps]]
+id = "context"
+speakers = ["pm"]
+prompt = "Describe the problem and goals: {{topic}}. What user need are we solving?"
+
+[[steps]]
+id = "brainstorm"
+speakers = ["architect", "programmer", "designer"]
+prompt = "Brainstorm approaches. Architect: system design options. Programmer: practical implementation concerns. Designer: UX implications. Build on each other's ideas."
+
+[[steps]]
+id = "evaluate"
+speakers = ["reviewer", "security", "devops"]
+prompt = "Evaluate the proposed approaches. Consider: maintainability, security, and operational cost."
+
+[[steps]]
+id = "synthesize"
+speakers = ["architect", "pm"]
+prompt = "Synthesize the discussion into a recommended approach with tradeoffs documented."

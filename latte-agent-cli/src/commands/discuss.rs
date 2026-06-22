@@ -4,12 +4,12 @@ use std::collections::HashMap;
 
 use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
-use latte_agent_core::config::AgentConfig;
-use latte_agent_core::model_resolver::ModelResolver;
 use latte_agent_orchestrator::orchestrator::{DiscussionConfig, DiscussionOrchestrator};
 use latte_agent_orchestrator::ConsensusMethod;
 use latte_agent_orchestrator::DiscussionWorkflow;
 use latte_ai::params::GenerateParams;
+
+use super::config_layer::{self, CliOverrides};
 
 type AnyResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -28,16 +28,16 @@ pub struct DiscussCmd {
     #[arg(short, long)]
     pub workflow: Option<String>,
 
-    /// Path to agents config TOML.
-    #[arg(long, default_value = "config/agents.toml")]
+    /// Path to agents config TOML (file or directory).
+    #[arg(long, default_value = "config/agents")]
     pub agents_config: String,
 
     /// Path to models config TOML.
     #[arg(long, default_value = "config/models.toml")]
     pub models_config: String,
 
-    /// Path to discussion workflow TOML.
-    #[arg(long, default_value = "config/discussion.toml")]
+    /// Path to discussion workflow TOML (file or directory).
+    #[arg(long, default_value = "config/workflows")]
     pub discussion_config: String,
 
     /// Maximum discussion rounds.
@@ -47,6 +47,19 @@ pub struct DiscussCmd {
     /// Consensus method: majority, none, weighted.
     #[arg(long, default_value = "none")]
     pub consensus: String,
+
+    /// Override the api_key for a model. With `--model`, only that model is
+    /// touched; otherwise every model that has an empty api_key is filled.
+    #[arg(long, value_name = "KEY")]
+    pub api_key: Option<String>,
+
+    /// Restrict `--api-key` to a single model id.
+    #[arg(long, value_name = "ID", requires = "api_key")]
+    pub model: Option<String>,
+
+    /// Per-model field override, repeatable: `id.field=value`.
+    #[arg(long = "model-override", value_name = "ID.FIELD=VALUE")]
+    pub model_overrides: Vec<String>,
 }
 
 impl DiscussCmd {
@@ -55,21 +68,18 @@ impl DiscussCmd {
         println!("Topic: {}", self.topic);
         println!("Roles: {:?}", self.roles);
         println!();
+        // 1. Three-layer config: global (~/.latte/) ← project (CLI flags) ← CLI overrides.
+        let cli = build_cli_overrides(self)?;
+        let resolved = config_layer::load(
+            Some(&self.agents_config),
+            Some(&self.models_config),
+            cli,
+        )
+        .map_err(|e| format!("failed to load configuration: {}", e))?;
+        let merged = resolved.config;
+        let resolver = resolved.resolver;
 
-        // 1. Load configs
-        let agent_config = AgentConfig::load(&self.agents_config)
-            .map_err(|e| format!("failed to load agents config: {}", e))?;
-        let models_config = AgentConfig::load(&self.models_config)
-            .map_err(|e| format!("failed to load models config: {}", e))?;
-
-        // Merge models from models_config into agent_config
-        let mut merged = agent_config;
-        merged.models = models_config.models;
-
-        // 2. Build model resolver
-        let resolver = ModelResolver::from_config(&merged)?;
-
-        // 3. Resolve roles and create agents
+        // 2. Resolve roles and create agents
         let default_params = GenerateParams::default();
         let mut agents: HashMap<String, AgentRunner> = HashMap::new();
 
@@ -164,33 +174,22 @@ impl DiscussCmd {
     }
 
     fn load_named_workflow(&self, name: &str) -> Result<DiscussionWorkflow, Box<dyn std::error::Error>> {
-        use serde::Deserialize;
-
-        #[derive(Deserialize)]
-        struct WorkflowsFile {
-            #[serde(default)]
-            default_workflow: Option<DiscussionWorkflow>,
-            #[serde(default)]
-            workflows: HashMap<String, DiscussionWorkflow>,
-        }
-
-        let content = std::fs::read_to_string(&self.discussion_config)?;
-        let wf_file: WorkflowsFile = toml::from_str(&content)?;
-
-        // Try named workflow first, then default
-        if let Some(wf) = wf_file.workflows.get(name) {
-            Ok(wf.clone())
-        } else if name == "default" {
-            wf_file
-                .default_workflow
-                .ok_or_else(|| "no default workflow found".into())
-        } else {
-            Err(format!(
-                "workflow '{}' not found. Available: {:?}",
-                name,
-                wf_file.workflows.keys().collect::<Vec<_>>()
-            )
-            .into())
-        }
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load(&self.discussion_config)
+            .map_err(|e| format!("failed to load workflows: {}", e))?;
+        registry.resolve(Some(name)).map_err(|e| e.into())
     }
+}
+
+fn build_cli_overrides(cmd: &DiscussCmd) -> Result<CliOverrides, String> {
+    let mut out = CliOverrides {
+        api_key: cmd.api_key.clone(),
+        api_key_target: cmd.model.clone(),
+        field_overrides: Vec::with_capacity(cmd.model_overrides.len()),
+    };
+    for raw in &cmd.model_overrides {
+        let (id, field, value) = super::chat::parse_model_override(raw)
+            .map_err(|e| format!("invalid --model-override '{}': {}", raw, e))?;
+        out.field_overrides.push((id, field, value));
+    }
+    Ok(out)
 }

@@ -2,8 +2,9 @@
 
 use clap::{Args, Subcommand};
 
-type AnyResult = Result<(), Box<dyn std::error::Error>>;
+use super::config_layer::CliOverrides;
 
+type AnyResult = Result<(), Box<dyn std::error::Error>>;
 /// Show or modify configuration.
 #[derive(Args, Debug)]
 pub struct ConfigCmd {
@@ -19,16 +20,16 @@ enum ConfigAction {
 
 #[derive(Args, Debug)]
 struct ConfigShow {
-    /// Path to agents config.
-    #[arg(long, default_value = "config/agents.toml")]
+    /// Path to agents config (file or directory).
+    #[arg(long, default_value = "config/agents")]
     pub agents_config: String,
 
     /// Path to models config.
     #[arg(long, default_value = "config/models.toml")]
     pub models_config: String,
 
-    /// Path to discussion config.
-    #[arg(long, default_value = "config/discussion.toml")]
+    /// Path to discussion workflows (file or directory).
+    #[arg(long, default_value = "config/workflows")]
     pub discussion_config: String,
 }
 
@@ -39,47 +40,72 @@ impl ConfigCmd {
         }
     }
 }
-
 impl ConfigShow {
     async fn run(&self) -> AnyResult {
         println!("=== Configuration ===\n");
 
-        // Agents config
-        println!("[Agents: {}]", self.agents_config);
-        match std::fs::read_to_string(&self.agents_config) {
-            Ok(content) => {
-                let line_count = content.lines().count();
-                println!("  {} lines, {} bytes", line_count, content.len());
-            }
-            Err(e) => {
-                println!("  Not found: {}", e);
-            }
-        }
-
-        // Models config
-        println!("\n[Models: {}]", self.models_config);
-        match std::fs::read_to_string(&self.models_config) {
-            Ok(content) => {
-                let line_count = content.lines().count();
-                println!("  {} lines, {} bytes", line_count, content.len());
-            }
-            Err(e) => {
-                println!("  Not found: {}", e);
+        // Three-layer merge: global (~/.latte/) ← project (CLI flags) ← CLI overrides.
+        let resolved = super::config_layer::load(
+            Some(&self.agents_config),
+            Some(&self.models_config),
+            CliOverrides::default(),
+        )?;
+        if resolved.sources.global.is_empty() {
+            println!("  (none found; checked ~/.latte/models.{{yaml,toml}} and ~/.latte/models.d/)");
+        } else {
+            for src in &resolved.sources.global {
+                println!("  {}", src);
             }
         }
 
-        // Discussion config
+        println!("\n[Project: agents @ {}]", self.agents_config);
+        match std::fs::metadata(&self.agents_config) {
+            Ok(m) => println!("  loaded ({} bytes)", m.len()),
+            Err(_) => println!("  (not present)"),
+        }
+
+        println!("\n[Project: models @ {}]", self.models_config);
+        match std::fs::metadata(&self.models_config) {
+            Ok(m) => println!("  loaded ({} bytes)", m.len()),
+            Err(_) => println!("  (not present)"),
+        }
+
         println!("\n[Discussion: {}]", self.discussion_config);
-        match std::fs::read_to_string(&self.discussion_config) {
-            Ok(content) => {
-                let line_count = content.lines().count();
-                println!("  {} lines, {} bytes", line_count, content.len());
-            }
-            Err(e) => {
-                println!("  Not found: {}", e);
+        match std::fs::metadata(&self.discussion_config) {
+            Ok(m) => println!("  loaded ({} bytes)", m.len()),
+            Err(_) => println!("  (not present)"),
+        }
+        println!("\n[Merged model catalog: {} models]", resolved.config.models.models.len());
+        for m in &resolved.config.models.models {
+            let key = classify_key(&m.api_key);
+            println!(
+                "  {:<35} provider={} base_url={} api_key={}",
+                m.id, m.provider, m.base_url, key
+            );
+        }
+
+        if !resolved.sources.cli_overrides.is_empty() {
+            println!("\n[CLI overrides]");
+            for o in &resolved.sources.cli_overrides {
+                println!("  {}", o);
             }
         }
 
         Ok(())
+    }
+}
+
+/// Three-state display for an api_key: empty, unresolved `${VAR}` placeholder,
+/// or a real (redacted) value.
+fn classify_key(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        "<empty>".to_string()
+    } else if t.starts_with("${") {
+        format!("<placeholder:{}>", t)
+    } else if t.len() <= 8 {
+        "***".to_string()
+    } else {
+        format!("{}***{}", &t[..4], &t[t.len() - 2..])
     }
 }

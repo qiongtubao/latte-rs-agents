@@ -201,6 +201,7 @@ impl Agent {
         })
     }
 
+
     /// Send a single chat completion request (one-turn, no context).
     ///
     /// Walks `model_chain` in priority order, skipping models on cooldown.
@@ -333,11 +334,17 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
         AiError::Api { status, .. } => match *status {
             429 => Some(Duration::from_secs(60)),
             500..=599 => Some(Duration::from_secs(30)),
-            // 4xx other than 429 = caller error (bad request, not found,
-            // etc.) — same model will keep failing.
-            _ => None,
+            // 4xx (other than 429) usually means "this model id doesn't
+            // exist on this vendor" or "bad request payload for this
+            // model". Walking the fallback chain is still worth it
+            // because the next model may have a different id format or
+            // accept the payload. Short cooldown to avoid hammering a
+            // broken model.
+            400..=499 => Some(Duration::from_secs(5)),
+            // Anything else (3xx redirects we don't auto-follow, 6xx
+            // exotic) — also retryable, very long cooldown.
+            _ => Some(Duration::from_secs(30)),
         },
-        // Transient network / reqwest errors — short cooldown.
         AiError::Http(_) => Some(Duration::from_secs(10)),
         // Everything else is non-retryable: vendor config, serde,
         // auth, unsupported provider, etc.
@@ -403,7 +410,6 @@ impl AgentRunner {
     pub fn set_max_tool_rounds(&mut self, n: usize) {
         self.max_tool_rounds = n;
     }
-
     /// Get a reference to the agent.
     pub fn agent(&self) -> &Agent {
         &self.agent
@@ -418,6 +424,7 @@ impl AgentRunner {
     pub fn context_mut(&mut self) -> &mut ConversationContext {
         &mut self.context
     }
+
 
     /// Total token usage accumulated so far.
     pub fn total_usage(&self) -> &TokenUsage {
@@ -475,20 +482,34 @@ impl AgentRunner {
                     role: Role::Assistant,
                     content: final_response.clone(),
                 });
-
                 // Execute each tool call
                 for tc in &tool_calls {
-                    let input: serde_json::Value = serde_json::from_str(&tc.args)
-                        .unwrap_or(serde_json::Value::String(tc.args.clone()));
+                     let input: serde_json::Value = serde_json::from_str(&tc.args)
+                         .unwrap_or(serde_json::Value::String(tc.args.clone()));
 
                     let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
                         &tc.name,
                         1,
                     );
-
-                    match tm.execute(&tc.name, input.clone(), Some(ctx)).await {
+                    // Resolve the short name the model emits ("read")
+                    // to the namespaced form the registry stores
+                    // ("file.read"). We try the name as-is first, then
+                    // fall back to any registered tool whose short
+                    // suffix matches. This lets role.allowed_tools
+                    // list `["read", "list", "search"]` while the
+                    // registry stores them under their package prefix.
+                    let full_name = tm
+                        .get_tool(&tc.name)
+                        .map(|_| tc.name.clone())
+                        .or_else(|| {
+                            tm.get_tool_names().into_iter().find(|n| {
+                                n.rsplit_once('.').map(|(_, s)| s) == Some(tc.name.as_str())
+                            })
+                        })
+                        .unwrap_or_else(|| tc.name.clone());
+                    match tm.execute(&full_name, input.clone(), Some(ctx)).await {
                         Ok(result) => {
-                            messages.push(Message {
+                             messages.push(Message {
                                 role: Role::User,
                                 content: format!(
                                     "[tool_result for {}]\n{}",
@@ -795,14 +816,15 @@ End"#;
     }
 
     #[test]
-    fn test_cooldown_for_4xx_other_than_429_is_none() {
-        // 400/401/403/404 are caller errors — fallback won't help.
+    fn test_cooldown_for_4xx_other_than_429_is_5s() {
+        // 400/401/403/404 cooldown short so the chain can fall through
+        // to the next model (different id or different vendor).
         for status in [400u16, 401, 403, 404] {
             let d = cooldown_for_error(&AiError::Api {
                 status,
                 message: "bad request".into(),
             });
-            assert_eq!(d, None, "status={status}");
+            assert_eq!(d, Some(Duration::from_secs(5)), "status={status}");
         }
     }
 
