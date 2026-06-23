@@ -15,6 +15,7 @@ use latte_ai::models::{Message, Role as MsgRole};
 use latte_ai::params::GenerateParams;
 
 use super::config_layer::{self, CliOverrides};
+use super::style;
 type AnyResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 /// Start an interactive REPL chat session with a single agent.
@@ -155,15 +156,12 @@ impl ChatCmd {
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
+        let term_width = style::terminal_width();
         loop {
-            let model_id = session
-                .runner
-                .agent()
-                .model_chain
-                .first()
-                .map(|mc| mc.model.id.as_str())
-                .unwrap_or("?");
-            print!("{} [{}]> ", session.role_id, model_id);
+            let model_id = session.primary_model_id();
+            let role_icon = session.role_icon();
+            // Prompt: `👔 manager · deepseek-v4-flash › ` (colorized when TTY).
+            print!("{}", style::render_prompt(role_icon, &session.role_id, model_id));
             stdout.flush()?;
 
             let mut line = String::new();
@@ -188,21 +186,27 @@ impl ChatCmd {
             let in_delta = usage_after.input_tokens - usage_before.input_tokens;
             let out_delta = usage_after.output_tokens - usage_before.output_tokens;
             if let Some(resp) = &session.last_response {
-                println!("\n{}\n", resp);
+                // Render the model reply in a colored rounded box so
+                // multi-paragraph output is visually separated from
+                // the prompt and status line.
+                let boxed = style::render_response_box(
+                    role_icon,
+                    &session.role_id,
+                    resp,
+                    term_width,
+                );
+                println!("\n{}\n", boxed);
             }
+            // Token status: `·  [deepseek-v4-flash] ↑N in ↓M out · session total ↑X ↓Y`
             eprintln!(
-                "[{}] ↑{} in ↓{} out · session total ↑{} ↓{}",
-                session
-                    .runner
-                    .agent()
-                    .model_chain
-                    .first()
-                    .map(|mc| mc.model.id.as_str())
-                    .unwrap_or("?"),
-                in_delta,
-                out_delta,
-                usage_after.input_tokens,
-                usage_after.output_tokens,
+                "{}",
+                style::render_status_line(
+                    session.primary_model_id(),
+                    in_delta,
+                    out_delta,
+                    usage_after.input_tokens,
+                    usage_after.output_tokens,
+                )
             );
         }
         Ok(())
@@ -249,6 +253,31 @@ impl ChatSession {
         }
     }
 
+    /// Look up the role's display icon (emoji) from the merged config.
+    /// Falls back to a generic 🤖 if the role is not configured.
+    fn role_icon(&self) -> &'static str {
+        self.merged
+            .roles
+            .get(&self.role_id)
+            .map(|t| {
+                // Icon is owned by the template, but we only need a
+                // short-lived display — leak a &'static str. In practice
+                // icons are 1-4 bytes of UTF-8 + emoji so the leak is tiny.
+                Box::leak(t.icon.clone().into_boxed_str()) as &'static str
+            })
+            .unwrap_or("🤖")
+    }
+
+    /// Return the chain's primary model id (head) or "?" if empty.
+    fn primary_model_id(&self) -> &str {
+        self.runner
+            .agent()
+            .model_chain
+            .first()
+            .map(|mc| mc.model.id.as_str())
+            .unwrap_or("?")
+    }
+
     async fn turn(&mut self, user_input: &str) -> AnyResult {
         let chain_ids: Vec<String> = self
             .runner
@@ -272,7 +301,13 @@ impl ChatSession {
             role: MsgRole::User,
             content: user_input.to_string(),
         }];
-        match self.runner.run_turn(&msgs, None).await {
+        // Show a braille spinner while the model is generating. The
+        // spinner writes to stderr with `\r` so it doesn't fight
+        // stdout on a TTY; piped (non-TTY) runs get no decoration.
+        let spinner = style::Spinner::start("thinking…");
+        let result = self.runner.run_turn(&msgs, None).await;
+        spinner.stop();
+        match result {
             Ok(response) => {
                 if let Some(log) = &self.log {
                     log.info(
@@ -760,7 +795,28 @@ async fn register_delegate_tool(
                 .map_err(|e| {
                     tool_err(format!("failed to create agent for '{}': {}", role_id, e))
                 })?;
-                let mut runner = AgentRunner::new(agent);
+                // Give the specialist the tools its role template allows
+                // (e.g. programmer has read/write/bash/search). Without
+                // this the specialist answers "I have no file access" —
+                // the bug we hit in late June 2026 where the manager
+                // delegated but the programmer refused to read any code.
+                let specialist_tm = if role.allowed_tools.is_empty() {
+                    None
+                } else {
+                    match build_tool_manager(&role.allowed_tools).await {
+                        Ok(tm) => Some(tm),
+                        Err(e) => {
+                            return Err(tool_err(format!(
+                                "tool setup for '{}' failed: {}",
+                                role_id, e
+                            )));
+                        }
+                    }
+                };
+                let mut runner = match specialist_tm {
+                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 8),
+                    None => AgentRunner::new(agent),
+                };
                 let msgs = vec![Message {
                     role: MsgRole::User,
                     content: task,
