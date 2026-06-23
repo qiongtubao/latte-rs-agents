@@ -1,23 +1,87 @@
+# Workflow: design_brainstorm
+# =============================================================================
+# A workflow defines a structured multi-agent discussion — a sequence of steps
+# where specific roles speak in order, each building on the previous output.
+#
+# Fields explained in detail below.
+
+# Unique workflow identifier — used in CLI: `latte-agent workflow run <name>`
 name = "design_brainstorm"
+
+# Human-readable description — shown in `latte-agent list workflows`
 description = "Open-ended creative discussion about architecture or feature design."
+
+# Maximum discussion rounds — how many times the full step sequence repeats.
+# Each round, agents can refine their answers based on the previous round.
+#   max_rounds = 1  → single pass (e.g., code review)
+#   max_rounds = 2  → two passes (e.g., brainstorm then refine)
+#   max_rounds = 3  → three passes (e.g., requirements → design → estimate)
 max_rounds = 2
 
+# ─── Steps ───────────────────────────────────────────────────────────────────
+# Each [[steps]] block defines one turn in the discussion.
+# Steps execute in order; each step's output is visible to subsequent steps.
+
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "context"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["pm"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Describe the problem and goals: {{topic}}. What user need are we solving?"
 
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "brainstorm"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["architect", "programmer", "designer"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Brainstorm approaches. Architect: system design options. Programmer: practical implementation concerns. Designer: UX implications. Build on each other's ideas."
 
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "evaluate"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["reviewer", "security", "devops"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Evaluate the proposed approaches. Consider: maintainability, security, and operational cost."
 
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "synthesize"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["architect", "pm"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Synthesize the discussion into a recommended approach with tradeoffs documented."

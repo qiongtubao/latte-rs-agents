@@ -1,25 +1,50 @@
-# Workflow: tech_director dispatch.
+# Workflow: tech_director_dispatch
+# =============================================================================
+# A workflow defines a structured multi-agent discussion — a sequence of steps
+# where specific roles speak in order, each building on the previous output.
 #
-# Pattern: tech_director (a senior engineering role) reads the user's task,
-# decomposes it into per-role subtasks (PM requirements, architect design,
-# programmer implementation, tester quality), then summarizes the
-# collected subtask outputs into a final answer.
-#
-# This is the "responsible manager" workflow: rather than broadcasting the
-# same prompt to every role, the tech_director acts as a router.
+# Fields explained in detail below.
 
+# Unique workflow identifier — used in CLI: `latte-agent workflow run <name>`
 name = "tech_director_dispatch"
+
+# Human-readable description — shown in `latte-agent list workflows`
 description = "Tech director decomposes the task, dispatches to PM/architect/programmer/tester, then summarizes."
+
+# Maximum discussion rounds — how many times the full step sequence repeats.
+# Each round, agents can refine their answers based on the previous round.
+#   max_rounds = 1  → single pass (e.g., code review)
+#   max_rounds = 2  → two passes (e.g., brainstorm then refine)
+#   max_rounds = 3  → three passes (e.g., requirements → design → estimate)
 max_rounds = 1
+
+# Context token budget — max tokens for the shared discussion context.
+# Older messages are summarized/truncated when the budget is exceeded.
+# Optional; defaults to a reasonable value if omitted.
 context_token_budget = 32000
 
-# Step 1: tech_director reads the topic and writes a plan. The plan
-# tells subsequent roles what to focus on. We use `output_key` so the
-# plan is included in the shared context for the next steps.
+# ─── Steps ───────────────────────────────────────────────────────────────────
+# Each [[steps]] block defines one turn in the discussion.
+# Steps execute in order; each step's output is visible to subsequent steps.
+
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "decompose"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
 description = "Tech director decomposes the user's task into per-role subtasks."
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["manager"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = """You are the Tech Director. Read the user's task below and produce a tight
 plan that decomposes it into four parallel subtasks — one for PM, one for
 architect, one for programmer, one for tester. For each subtask, write
@@ -36,15 +61,29 @@ Format your response as:
     TESTER: <what the tester should examine or test>
 
 Be specific and concrete. Keep the whole response under 200 words."""
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
 output_key = "plan"
 
-# Step 2: PM analyzes the topic along the lines the tech director set
-# out. We pass the plan as a context variable so the PM doesn't have
-# to re-read the original topic.
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "requirements"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
 description = "PM reviews the plan and produces requirements / user-facing analysis."
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["pm"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = """You are the Product Manager. The Tech Director has produced this
 plan for the user's task:
 
@@ -56,14 +95,29 @@ Using the plan as your guide, produce a clear set of requirements:
 user stories (1-3), acceptance criteria, scope boundaries, and priority.
 Do NOT implement or design — your job is to make sure the user's needs
 are captured precisely. Keep your response under 250 words."""
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
 output_key = "pm"
 
-# Step 3: architect reviews the plan + PM's requirements, produces
-# the technical design / risk assessment.
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "architecture"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
 description = "Architect produces a technical design and risk assessment."
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["architect"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = """You are the System Architect. The Tech Director's plan:
 
 {{plan}}
@@ -77,15 +131,29 @@ Original user task: {{topic}}
 Produce a concise technical design: key modules, data flow, external
 dependencies, and the top 2-3 risks or trade-offs. Do NOT implement.
 Keep your response under 250 words."""
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
 output_key = "architect"
 
-# Step 4: programmer investigates the codebase / produces a concrete
-# implementation sketch. This is the only step that should actually
-# emit `<tool_call>` blocks to read code.
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "implementation"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
 description = "Programmer investigates the code / sketches the implementation."
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["programmer"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = """You are the Software Engineer. The Tech Director's plan:
 
 {{plan}}
@@ -103,14 +171,29 @@ answering. Produce:
 - A short test plan (which test files to add, what to cover).
 
 Keep your response under 300 words. Cite specific paths you read."""
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
 output_key = "programmer"
 
-# Step 5: tester reviews the program and reports on test coverage /
-# edge cases.
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "quality"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
 description = "Tester evaluates test coverage and edge cases."
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["tester"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = """You are the QA Engineer. The Tech Director's plan:
 
 {{plan}}
@@ -127,14 +210,29 @@ Report on:
 - Concrete test cases you would add (file path + what to assert).
 
 Keep your response under 200 words."""
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
 output_key = "tester"
 
-# Step 6: tech_director synthesizes all four contributions into a
-# single concise answer for the user.
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "synthesize"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
 description = "Tech director synthesizes the four contributions into a final answer."
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["manager"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = """You are the Tech Director. The four roles have finished their
 contributions. Your job is to write the final, single answer for the
 user.
@@ -161,4 +259,7 @@ Produce a concise, well-structured final answer that:
 
 Keep the whole answer under 400 words. Do not hedge — give a real
 decision, not a list of options."""
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
 output_key = "final"

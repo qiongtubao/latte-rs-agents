@@ -128,17 +128,17 @@ impl ChatCmd {
                 ("model_id", initial_primary.unwrap_or("").to_string()),
             ],
         );
-
-        let mut session = ChatSession::new(
+        let mut session = ChatSession {
             merged,
             resolver,
-            default_params,
+            default_params: default_params.clone(),
             runner,
             role_id,
-            initial_tier,
-            self.model_id.clone(),
-        );
-        session.log = Some(log);
+            tier: initial_tier,
+            primary_id: self.model_id.clone(),
+            log: Some(log),
+            last_response: None,
+        };
         if !io::stdout().is_terminal() {
             // Non-interactive: read one message from stdin and reply once.
             let mut input = String::new();
@@ -156,7 +156,14 @@ impl ChatCmd {
         let stdin = io::stdin();
         let mut stdout = io::stdout();
         loop {
-            print!("{}> ", session.role_id);
+            let model_id = session
+                .runner
+                .agent()
+                .model_chain
+                .first()
+                .map(|mc| mc.model.id.as_str())
+                .unwrap_or("?");
+            print!("{} [{}]> ", session.role_id, model_id);
             stdout.flush()?;
 
             let mut line = String::new();
@@ -165,8 +172,8 @@ impl ChatCmd {
                 println!();
                 break;
             }
-            let line = line.trim_end_matches(['\n', '\r']).to_string();
-            if line.is_empty() {
+
+            if line.trim().is_empty() {
                 continue;
             }
             if line.starts_with('/') {
@@ -175,10 +182,28 @@ impl ChatCmd {
                 }
                 continue;
             }
+            let usage_before = session.runner.total_usage().clone();
             session.turn(&line).await?;
+            let usage_after = session.runner.total_usage();
+            let in_delta = usage_after.input_tokens - usage_before.input_tokens;
+            let out_delta = usage_after.output_tokens - usage_before.output_tokens;
             if let Some(resp) = &session.last_response {
                 println!("\n{}\n", resp);
             }
+            eprintln!(
+                "[{}] ↑{} in ↓{} out · session total ↑{} ↓{}",
+                session
+                    .runner
+                    .agent()
+                    .model_chain
+                    .first()
+                    .map(|mc| mc.model.id.as_str())
+                    .unwrap_or("?"),
+                in_delta,
+                out_delta,
+                usage_after.input_tokens,
+                usage_after.output_tokens,
+            );
         }
         Ok(())
     }
@@ -464,6 +489,55 @@ impl ChatSession {
                     }
                 }
             }
+            "/status" => {
+                let chain: Vec<String> = self
+                    .runner
+                    .agent()
+                    .model_chain
+                    .iter()
+                    .map(|mc| mc.model.id.clone())
+                    .collect();
+                let primary = chain.first().map(String::as_str).unwrap_or("?");
+                let usage = self.runner.total_usage();
+                let ctx_msgs = self.runner.context().messages().len();
+                println!(
+                    "role    : {}\n\
+                     tier    : {}\n\
+                     model   : {}\n\
+                     chain   : {}\n\
+                     tokens  : ↑{} in ↓{} out (session)\n\
+                     context : {} messages",
+                    self.role_id,
+                    self.tier.label(),
+                    primary,
+                    if chain.is_empty() {
+                        "(empty)".to_string()
+                    } else {
+                        chain.join(" → ")
+                    },
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    ctx_msgs,
+                );
+            }
+            "/tools" => {
+                let role = self.merged.roles.get(&self.role_id);
+                let tools: Vec<String> = role
+                    .map(|r| r.tools.clone())
+                    .unwrap_or_default();
+                if tools.is_empty() {
+                    println!("role '{}' has no tools configured", self.role_id);
+                } else {
+                    println!("role '{}' tools ({}):", self.role_id, tools.len());
+                    for t in &tools {
+                        println!("  - {}", t);
+                    }
+                    println!(
+                        "\nFormat: <tool_call>{} {{\"arg\": \"value\"}}</tool_call>",
+                        tools.first().map(String::as_str).unwrap_or("name")
+                    );
+                }
+            }
             other => {
                 println!("unknown command: {} (try /help)", other);
             }
@@ -525,13 +599,20 @@ async fn build_runner(
         .into());
     }
     let mut role = role;
+
     if !role.allowed_tools.is_empty() {
         // Append a tool-usage section to the system prompt so the
         // model knows it can call tools and how. The model emits
         // `<tool_call>name {"arg": ...}</tool_call>` and `AgentRunner`
         // parses that to drive `tool_manager.execute`.
-        role.system_prompt
-            .push_str(&tool_usage_prompt(&role.allowed_tools));
+        let mut prompt = tool_usage_prompt(&role.allowed_tools);
+        // If the role can dispatch subtasks to specialist agents,
+        // describe the delegate tool so the model knows to use it.
+        if role_id == "manager" {
+            prompt.push_str(&DELEGATE_TOOL_HINT);
+        }
+
+        role.system_prompt.push_str(&prompt);
     }
     let agent = Agent::new_with_chain(
         role_id.to_string(),
@@ -542,6 +623,16 @@ async fn build_runner(
     let runner = if !role.allowed_tools.is_empty() {
         let tm = build_tool_manager(&role.allowed_tools).await
             .map_err(|e| format!("tool setup failed: {}", e))?;
+        // Register the delegate tool so the manager can dispatch
+        // subtasks to specialist agents.
+        register_delegate_tool(
+            &tm,
+            Arc::new(merged.clone()),
+            Arc::new(resolver.clone()),
+            default_params.clone(),
+        )
+        .await
+        .map_err(|e| format!("delegate tool setup failed: {}", e))?;
         AgentRunner::new_with_tools(agent, tm, 8)
     } else {
         AgentRunner::new(agent)
@@ -581,6 +672,121 @@ pub async fn build_tool_manager(
     Ok(mgr)
 }
 
+/// Register a `delegate` tool on the tool manager. The tool lets the
+/// manager agent dispatch subtasks to specialist roles (programmer,
+/// architect, reviewer, etc.) and receive their responses.
+async fn register_delegate_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    default_params: GenerateParams,
+) -> AnyResult {
+    use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputProperty, ToolInputSchema};
+
+    let input_schema = ToolInputSchema {
+        schema_type: latte_rs_agent_tools::types::SchemaType,
+        properties: vec![
+            ("role".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "Specialist role id: programmer, architect, reviewer, tester, security, devops, designer, tech_writer, pm"
+                        .into(),
+                ),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+            ("task".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "Natural-language task for the specialist to perform".into(),
+                ),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+        ]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["role".into(), "task".into()]),
+        ..Default::default()
+    };
+
+    let handler: latte_rs_agent_tools::types::SharedToolHandler =
+        std::sync::Arc::new(move |input: serde_json::Value, _ctx| {
+            let merged = Arc::clone(&merged);
+            let resolver = Arc::clone(&resolver);
+            let default_params = default_params.clone();
+            Box::pin(async move {
+                let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+                let role_id = input
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| tool_err("missing 'role' field".into()))?
+                    .to_string();
+                let task = input
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| tool_err("missing 'task' field".into()))?
+                    .to_string();
+
+                // Resolve the role and build a temporary AgentRunner.
+                let template = merged
+                    .roles
+                    .get(&role_id)
+                    .ok_or_else(|| {
+                        tool_err(format!("role '{}' not found in config", role_id))
+                    })?
+                    .clone();
+                let role = template.resolve(&default_params).await.map_err(|e| {
+                    tool_err(format!("failed to resolve role '{}': {}", role_id, e))
+                })?;
+                let tier = role.default_model_tier;
+                let models = resolver
+                    .resolve_chain(&role.id, tier, &role.model_chain)
+                    .map_err(|e| {
+                        tool_err(format!("no model for role '{}': {}", role_id, e))
+                    })?;
+                let agent = Agent::new_with_chain(
+                    role_id.clone(),
+                    role.clone(),
+                    models,
+                    default_params.clone(),
+                )
+                .map_err(|e| {
+                    tool_err(format!("failed to create agent for '{}': {}", role_id, e))
+                })?;
+                let mut runner = AgentRunner::new(agent);
+                let msgs = vec![Message {
+                    role: MsgRole::User,
+                    content: task,
+                }];
+                let response = runner.run_turn(&msgs, None).await.map_err(|e| {
+                    tool_err(format!("delegate to '{}' failed: {}", role_id, e))
+                })?;
+                Ok(serde_json::json!({
+                    "role": role_id,
+                    "response": response,
+                }))
+            })
+        });
+
+    let tool = Tool::builder(
+        "delegate".to_string(),
+        "Delegate a subtask to a specialist agent. The specialist will analyze and respond, then return results to you for synthesis.".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm.register(tool, Some("manager"));
+    Ok(())
+}
+
 /// Build the [`CliOverrides`] from a [`ChatCmd`]. Parses each
 /// `--model-override id.field=value` into the flat tuple form the loader
 /// expects; a malformed entry is an error.
@@ -610,13 +816,76 @@ pub(crate) fn parse_model_override(s: &str) -> Result<(String, String, String), 
     }
     Ok((id.to_string(), field.to_string(), value.to_string()))
 }
+pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
+    let tool_list = allowed.join(", ");
+    format!(
+        r#"
 
+## Tool calling protocol
+
+When you need to use a tool, emit EXACTLY this format on its own line
+(no markdown, no code fences, no backticks — the raw markers below are
+parsed verbatim by the host):
+
+<tool_call>NAME {{"arg": "value"}}</tool_call>
+
+Rules you MUST follow:
+  1. Start with the literal text <tool_call> (no spaces, no backticks).
+  2. Then the tool name and a single space, then a JSON object of args.
+  3. Close with the literal text </tool_call>.
+  4. Do NOT wrap the line in markdown code blocks (```...```) or indent
+     it as a code block — the parser will not see the markers.
+  5. You may emit multiple <tool_call> lines in one response; the host
+     runs them and feeds results back as the next turn.
+  6. When you have enough information to answer, respond in plain text
+     with NO <tool_call> block and the loop ends.
+
+Allowed tool names for this role: {tool_list}.
+
+Examples (raw, copy the format exactly):
+
+<tool_call>list {{"path": "."}}</tool_call>
+<tool_call>read {{"path": "README.md"}}</tool_call>
+<tool_call>search {{"path": "src", "pattern": "TODO", "max_results": 20}}</tool_call>
+"#
+    )
+}
+
+/// System-prompt hint describing the `delegate` tool, appended for
+/// the manager role so it knows it can dispatch subtasks to
+/// specialist agents.
+const DELEGATE_TOOL_HINT: &str = r#"
+
+### Delegating to specialists
+
+You also have access to a `delegate` tool that dispatches a subtask
+to a specialist agent and returns the result. Use it for substantive
+code analysis or work that a specialist is best at.
+
+<tool_call>delegate {"role": "programmer", "task": "Read src/agent.rs and summarize the AgentRunner::run_turn flow"}</tool_call>
+
+Available specialist roles: programmer, architect, reviewer, tester,
+security, devops, designer, tech_writer, pm.
+
+When to delegate:
+- Deep code analysis → programmer
+- Architecture / design review → architect
+- Code quality review → reviewer
+- Testing strategy / bug analysis → tester
+- Security audit → security
+
+You can call `delegate` multiple times in parallel (in one response
+with multiple `<tool_call>` blocks) to fan out independent subtasks.
+Synthesize the results into a coherent answer.
+"#;
 fn print_help() {
     println!(
         "Commands:\n\
          /role <id>           Switch to a different role (preserves history)\n\
          /model <tier>        Switch model tier: premium | standard | budget\n\
          /roles               List available roles\n\
+         /status              Show current model, chain, tokens, context\n\
+         /tools               List available tools for this role\n\
          /clear               Clear conversation history\n\
          /history             Show recent messages\n\
          /save <file>         Save conversation to a JSONL file\n\
@@ -626,39 +895,6 @@ fn print_help() {
     );
 }
 
-/// Build the "Tool usage" section appended to a role's system
-/// prompt when the role has `allowed_tools` set. Teaches the model
-/// the `<tool_call>name args</tool_call>` text protocol that
-/// `AgentRunner` parses, and lists exactly the tools this role is
-/// permitted to call (so it doesn't waste a turn trying a name that
-/// doesn't exist).
-pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
-    let tool_list = allowed.join(", ");
-    format!(
-        r#"
-
-## Tool usage
-
-You have access to these tools (and only these): {tool_list}. To call
-one, emit a single line in EXACTLY this format:
-
-    <tool_call><name> {{<json-args>}}</tool_call>
-
-Use whichever name is in your allowed list. Examples for `read`,
-`list`, `search`:
-
-    <tool_call>list {{"path": "."}}</tool_call>
-    <tool_call>read {{"path": "README.md"}}</tool_call>
-    <tool_call>search {{"path": "src", "pattern": "TODO", "max_results": 20}}</tool_call>
-
-After you emit one or more `<tool_call>` lines, the system will run
-them and feed the results back to you as a new turn. You can call
-multiple tools in one response. Once you have enough information to
-answer the user, respond in plain text (no `<tool_call>` block) and
-the loop will end.
-"#
-    )
-}
 
 /// Truncate a string for log display, keeping the head and adding an
 /// ellipsis when trimmed. Used so we don't dump multi-kilobyte model

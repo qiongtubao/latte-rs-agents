@@ -1,23 +1,124 @@
+# Workflow: bug_triage
+# =============================================================================
+# A workflow defines a structured multi-agent discussion — a sequence of steps
+# where specific roles speak in order, each building on the previous output.
+#
+# Fields explained in detail below.
+
+# Unique workflow identifier — used in CLI: `latte-agent workflow run <name>`
 name = "bug_triage"
+
+# Human-readable description — shown in `latte-agent list workflows`
 description = "Triage a bug report with multi-role analysis."
+
+# Maximum discussion rounds — how many times the full step sequence repeats.
+# Each round, agents can refine their answers based on the previous round.
+#   max_rounds = 1  → single pass (e.g., code review)
+#   max_rounds = 2  → two passes (e.g., brainstorm then refine)
+#   max_rounds = 3  → three passes (e.g., requirements → design → estimate)
 max_rounds = 2
 
+# Context token budget — max tokens for the shared discussion context.
+# Older messages are summarized/truncated when the budget is exceeded.
+# Optional; defaults to a reasonable value if omitted.
+# context_token_budget = 32000
+
+# ─── Steps ───────────────────────────────────────────────────────────────────
+# Each [[steps]] block defines one turn in the discussion.
+# Steps execute in order; each step's output is visible to subsequent steps.
+
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "describe"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
+# description = "<what this step does>"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["tester"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Describe the bug: {{topic}}. Include reproduction steps, expected vs actual behavior, and severity."
 
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
+# output_key = "<key>"
+
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "diagnose"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
+# description = "<what this step does>"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["programmer"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Analyze the bug described above. What is the likely root cause? What area of the code is affected?"
 
-[[steps]]
-id = "impact"
-speakers = ["security", "devops"]
-prompt = "Assess the impact of this bug. Security: any security implications? DevOps: any operational impact?"
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
+# output_key = "<key>"
 
 [[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
+id = "impact"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
+# description = "<what this step does>"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
+speakers = ["security", "devops"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
+prompt = "Assess the impact of this bug. Security: any security implications? DevOps: any operational impact?"
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
+# output_key = "<key>"
+
+[[steps]]
+# Step identifier — unique within this workflow, used for output_key references.
 id = "plan"
+
+# Human-readable step description — shown in progress logs.
+# Optional; defaults to the id if omitted.
+# description = "<what this step does>"
+
+# Speakers — which roles speak in this step (by role id).
+# Multiple speakers means a round-robin: each speaks in turn, seeing the
+# previous speaker's output. Order matters.
 speakers = ["programmer", "manager"]
+
+# Prompt template — what to ask the speaker(s).
+# Supports {{variable}} substitution from:
+#   - CLI flags: --var key=value
+#   - Previous step outputs: {{output_key}} (when a step sets output_key)
+#   - Built-in variables: {{topic}} (the discussion topic)
 prompt = "Propose a fix plan. Programmer: fix approach and estimate. Manager: priority and scheduling."
+
+# Output key — save this step's output as a named variable for later steps.
+# Optional; when set, later steps can reference this output via {{key}}.
+# output_key = "<key>"

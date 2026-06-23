@@ -1,9 +1,56 @@
+# Role: Code Reviewer
+# =============================================================================
+# This file defines an AI agent role. Each role has:
+#   - a system prompt (markdown file that shapes the agent's personality)
+#   - a default model tier (quality/cost level)
+#   - allowed tools (what the agent can do)
+#   - generation parameters (temperature controls creativity)
+#
+# Fields explained in detail below.
+
 [roles.reviewer]
+# Unique identifier — used in CLI flags, workflow steps, and tier mappings.
 id = "reviewer"
+
+# Human-readable display name — shown in logs and discussion transcripts.
 name = "Code Reviewer"
+
+# Lifecycle category determines when the role participates in a discussion:
+#   planning     — upfront design/requirements (pm, architect, designer, manager)
+#   execution    — hands-on implementation (programmer, devops, tech_writer)
+#   verification — quality assurance (tester, reviewer, security)
 category = "verification"
+
+# Default model tier — which quality/cost level this role uses by default.
+#   premium  — best quality (e.g., Claude Opus)
+#   standard — balanced (e.g., Claude Sonnet, GPT-4o)
+#   budget   — fast/cheap (e.g., DeepSeek, Qwen)
+# Override with --tier flag or per-role tier in models.toml.
 model_tier = "standard"
+
+# Fallback model chain — pinned to deepseek-v4-flash so specialists
+# always have a working model (deepseek-v4-flash has the real API key
+# in ~/.latte/models.yaml, while Ollama/qwen2.5 needs a local server).
+model_chain = ["deepseek-v4-flash"]
+
+# Path to the system prompt markdown file (relative to project root).
+# This file defines the agent's personality, expertise, and behavioral rules.
 prompt_file = "prompts/reviewer.md"
+
+# Generation temperature (0.0–1.0).
+#   Lower (0.1–0.3) = more deterministic, consistent — good for code, analysis
+#   Higher (0.5–0.8) = more creative, varied — good for brainstorming, design
+#   Default: 0.7 (if omitted)
 temperature = 0.4
+
+# Allowed tools — which capabilities this role has access to in chat mode.
+# Available tools: read, write, bash, search, list
+#   read    — read files and directories
+#   write   — create or overwrite files
+#   bash    — execute shell commands
+#   search  — regex search across files
+#   list    — list agents, workflows, config
 tools = ["read", "list", "search"]
+
+# Display emoji shown next to the role name in logs and transcripts.
 icon = "🔍"

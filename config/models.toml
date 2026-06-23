@@ -1,38 +1,85 @@
 # Model Catalog & Tier Configuration
 # Compatible with latte-rs-model-router/models.toml format, extended with tier mapping.
+#
+# This file defines:
+#   1. Tier mappings — which model ID to use at each quality tier
+#   2. Per-role tier overrides — role-specific model assignments
+#   3. Model definitions — concrete model metadata (API, context window, cost, etc.)
+#
+# Three-layer resolution (lowest → highest priority):
+#   1. Global config  (~/.latte/models.yaml or ~/.latte/models.d/*)
+#   2. Project config  (this file, typically config/models.toml)
+#   3. CLI overrides   (--api-key, --model-override id.field=value)
+#
+# Within each layer, identical model.id entries merge by filling empty fields
+# (a project model with a real api_key is not clobbered by a global entry).
 
 # ─── Tier Mappings ───────────────────────────────────────────────────────────
-# Global tier → model_id. Per-role overrides below.
+# Global tier → model_id. These are the defaults used when a role has no
+# per-role override. Tiers represent quality/cost levels:
+#   premium  — best available model (highest quality, highest cost)
+#   standard — balanced quality/cost
+#   budget   — fast/cheap model (lowest cost, acceptable quality)
 
-[tiers]
+[models.tiers]  # was: [tiers] (top-level) — serde ignored it; must nest under [models] for AgentConfig::parse
 premium = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
 budget = "deepseek-chat"
 
 # ─── Per-Role Tier Overrides (optional) ─────────────────────────────────────
 # Override which model a specific role uses at each tier.
+# Format: [models.role_tiers.<role_id>]
+#   premium  = "model-id"   # model used when role runs at premium tier
+#   standard = "model-id"   # model used when role runs at standard tier
+#   budget   = "model-id"   # model used when role runs at budget tier
+#
+# Must be nested under [models] because `role_tiers` is a field of
+# `ModelCatalog` (the `models` table). A bare `[role_tiers.X]` at the
+# top level is silently ignored by serde.
+#
+# If a role is not listed here, it falls back to the global [models.tiers] mapping.
+# If a tier is not specified for a role, that tier falls back to the global tier.
 
-[role_tiers.pm]
+[models.role_tiers.pm]  # was: [role_tiers.pm] (top-level)
 premium = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
 budget = "deepseek-chat"
 
-[role_tiers.architect]
+[models.role_tiers.architect]  # was: [role_tiers.architect] (top-level)
 premium = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
 budget = "deepseek-chat"
 
-[role_tiers.programmer]
+[models.role_tiers.programmer]  # was: [role_tiers.programmer] (top-level)
 premium = "claude-sonnet-4-20250514"
 standard = "deepseek-chat"
 budget = "qwen2.5-coder-32b-instruct"
 
-[role_tiers.manager]
+[models.role_tiers.manager]  # was: [role_tiers.manager] (top-level)
 premium = "claude-opus-4-20250514"
-standard = "claude-sonnet-4-20250514"
+standard = "deepseek-v4-flash"
 budget = "deepseek-chat"
 
 # ─── Model Definitions ───────────────────────────────────────────────────────
+# Each [[models.models]] block defines one AI model.
+#
+# Required fields:
+#   id               — unique identifier, used in tier mappings and CLI flags
+#   name             — human-readable display name
+#   api              — API protocol: "anthropic" | "openai" | "google"
+#   provider         — provider slug: "anthropic" | "openai" | "deepseek" | "ollama" | "google"
+#   base_url         — API endpoint base URL
+#   api_key          — API key; use "${ENV_VAR}" to reference environment variables
+#   context_window   — max input tokens the model accepts
+#   max_tokens       — max output tokens per generation
+#
+# Optional fields:
+#   supports_thinking — whether the model supports extended thinking/reasoning (default: false)
+#   cost_per_million_input  — USD per 1M input tokens (for cost tracking)
+#   cost_per_million_output — USD per 1M output tokens (for cost tracking)
+#   tier             — which tier this model belongs to (informational, not used for resolution)
+
+# ─── Anthropic Models ────────────────────────────────────────────────────────
 
 [[models.models]]
 id = "claude-opus-4-20250514"
@@ -62,6 +109,8 @@ cost_per_million_input = 3.0
 cost_per_million_output = 15.0
 tier = "standard"
 
+# ─── DeepSeek Models ─────────────────────────────────────────────────────────
+
 [[models.models]]
 id = "deepseek-chat"
 name = "DeepSeek Chat V3"
@@ -77,6 +126,22 @@ cost_per_million_output = 1.10
 tier = "budget"
 
 [[models.models]]
+id = "deepseek-v4-flash"
+name = "DeepSeek V4 Flash"
+api = "openai"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+context_window = 1000000
+max_tokens = 384000
+supports_thinking = false
+cost_per_million_input = 0.14
+cost_per_million_output = 0.55
+tier = "budget"
+
+# ─── Ollama (Local) Models ───────────────────────────────────────────────────
+
+[[models.models]]
 id = "qwen2.5-coder-32b-instruct"
 name = "Qwen 2.5 Coder 32B"
 api = "openai"
@@ -87,6 +152,8 @@ context_window = 32768
 max_tokens = 4096
 supports_thinking = false
 tier = "budget"
+
+# ─── OpenAI Models ───────────────────────────────────────────────────────────
 
 [[models.models]]
 id = "gpt-4o"

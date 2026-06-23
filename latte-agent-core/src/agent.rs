@@ -620,6 +620,7 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
 }
 
 /// Convenience: parameters override for agent construction.
+
 pub struct AgentParams {
     pub params: GenerateParams,
 }

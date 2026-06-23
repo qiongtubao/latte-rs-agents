@@ -62,6 +62,7 @@ impl ModelTier {
 /// 1. Per-role tier override in config (`role_tiers.<role>.<tier>`)
 /// 2. Global tier default (`tiers.<tier>`)
 /// 3. Model's own `tier` field in catalog
+#[derive(Clone)]
 pub struct ModelResolver {
     /// All known models indexed by id.
     models: std::collections::HashMap<String, ModelDef>,
@@ -129,17 +130,42 @@ impl ModelResolver {
     /// does not silently kill the role. Returns `Err` only when no
     /// candidate has a key.
     pub fn resolve(&self, role_id: &str, tier: ModelTier) -> AgentResult<Model> {
-        for model_id in self.candidates_for(role_id, tier) {
-            if let Ok(m) = self.build_model(&model_id) {
+        let candidates: Vec<String> = self.candidates_for(role_id, tier);
+        let mut missing_env: Vec<String> = Vec::new();
+
+        for model_id in &candidates {
+            if let Ok(m) = self.build_model(model_id) {
                 if !m.api_key.trim().is_empty() {
                     return Ok(m);
                 }
             }
+            // Collect which env var this model needs.
+            if let Some(def) = self.models.get(model_id) {
+                if let Some(var) = extract_env_var(&def.api_key) {
+                    if !missing_env.contains(&var) {
+                        missing_env.push(var);
+                    }
+                }
+            }
         }
+
+        let reason = if missing_env.is_empty() {
+            format!(
+                "no api_key configured for candidates: {}. Set an api_key in config or via --api-key",
+                candidates.join(", ")
+            )
+        } else {
+            format!(
+                "no api_key configured for candidates: {}. Set environment variable(s): {}",
+                candidates.join(", "),
+                missing_env.join(" ")
+            )
+        };
+
         Err(AgentError::ModelResolutionFailed {
             role: role_id.into(),
             tier: tier.label().into(),
-            reason: "no tier candidate has a configured api_key".into(),
+            reason,
         })
     }
 
@@ -200,6 +226,26 @@ impl ModelResolver {
             if let Ok(m) = self.build_model(id) {
                 if !m.api_key.trim().is_empty() {
                     out.push(m);
+                }
+            }
+        }
+        // Last-resort safety net: if neither the tier candidates nor the
+        // explicit chain yielded a model, walk the full catalog for any
+        // model with a valid `api_key`. This handles the case where the
+        // operator has a working model in `~/.latte/models.yaml` (with a
+        // real key) but the project's `model_chain` for the role is
+        // empty AND no candidate at the requested tier has a key — e.g.
+        // tier=`standard` maps to `claude-sonnet-4` (env unset) but the
+        // operator only configured a `deepseek-chat` key. We pick the
+        // first catalog model that authenticates; the operator still
+        // gets a clear error if nothing in the catalog works.
+        if out.is_empty() {
+            for def in self.models.values() {
+                if let Ok(m) = self.build_model(&def.id) {
+                    if !m.api_key.trim().is_empty() {
+                        out.push(m);
+                        break;
+                    }
                 }
             }
         }
@@ -349,6 +395,16 @@ fn resolve_env_vars(s: &str) -> String {
     }
 
     result
+}
+
+/// Extract the first `${ENV_VAR}` name from an api_key string.
+/// Returns `None` if the string contains no `${VAR}` placeholder.
+fn extract_env_var(s: &str) -> Option<String> {
+    let start = s.find("${")?;
+    let rest = &s[start + 2..];
+    let end = rest.find('}')?;
+    let var = &rest[..end];
+    if var.is_empty() { None } else { Some(var.to_string()) }
 }
 impl std::fmt::Debug for ModelResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

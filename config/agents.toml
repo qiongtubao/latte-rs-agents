@@ -1,6 +1,22 @@
 # Agent Role Configuration
-# Each section defines a role that participates in discussions.
-# Users can add custom roles by adding new [roles.<id>] sections.
+# =============================================================================
+# This file is the merged single-file agent config — all 10 roles in one file.
+# Each [roles.<id>] section defines a role that participates in discussions.
+#
+# Prefer the per-file layout (config/agents/*.toml) for user editing.
+# This merged file exists for backward compatibility and for the install script.
+#
+# Role categories:
+#   planning     — upfront design/requirements (pm, architect, designer, manager)
+#   execution    — hands-on implementation (programmer, devops, tech_writer)
+#   verification — quality assurance (tester, reviewer, security)
+#
+# Model tiers:
+#   premium  — best quality (Claude Opus)
+#   standard — balanced quality (Claude Sonnet, GPT-4o)
+#   budget   — fast/cheap (DeepSeek, Qwen)
+
+# ─── Planning Roles ──────────────────────────────────────────────────────
 
 [roles.pm]
 id = "pm"
@@ -9,7 +25,7 @@ category = "planning"
 model_tier = "standard"
 prompt_file = "prompts/pm.md"
 temperature = 0.7
-tools = ["read", "search"]
+tools = ["read", "list", "search"]
 icon = "📋"
 
 [roles.architect]
@@ -19,58 +35,8 @@ category = "planning"
 model_tier = "premium"
 prompt_file = "prompts/architect.md"
 temperature = 0.5
-tools = ["read", "search"]
+tools = ["read", "list", "search"]
 icon = "🏗️"
-
-[roles.programmer]
-id = "programmer"
-name = "Software Engineer"
-category = "execution"
-model_tier = "budget"
-prompt_file = "prompts/programmer.md"
-temperature = 0.3
-tools = ["read", "write", "bash", "search"]
-icon = "💻"
-
-[roles.tester]
-id = "tester"
-name = "QA Engineer"
-category = "verification"
-model_tier = "budget"
-prompt_file = "prompts/tester.md"
-temperature = 0.4
-tools = ["read", "bash", "search"]
-icon = "🧪"
-
-[roles.reviewer]
-id = "reviewer"
-name = "Code Reviewer"
-category = "verification"
-model_tier = "standard"
-prompt_file = "prompts/reviewer.md"
-temperature = 0.4
-tools = ["read", "search"]
-icon = "🔍"
-
-[roles.devops]
-id = "devops"
-name = "DevOps Engineer"
-category = "execution"
-model_tier = "budget"
-prompt_file = "prompts/devops.md"
-temperature = 0.3
-tools = ["read", "bash", "write"]
-icon = "🚀"
-
-[roles.security]
-id = "security"
-name = "Security Auditor"
-category = "verification"
-model_tier = "standard"
-prompt_file = "prompts/security.md"
-temperature = 0.4
-tools = ["read", "search"]
-icon = "🛡️"
 
 [roles.designer]
 id = "designer"
@@ -82,6 +48,42 @@ temperature = 0.7
 tools = ["read"]
 icon = "🎨"
 
+[roles.manager]
+id = "manager"
+name = "Engineering Manager"
+category = "planning"
+model_tier = "premium"
+prompt_file = "prompts/manager.md"
+temperature = 0.5
+tools = ["read", "list", "search"]
+icon = "👔"
+
+# Fallback model chain in priority order (highest first).
+# See config/agents/manager.toml for rationale.
+model_chain = ["deepseek-v4-flash"]
+
+# ─── Execution Roles ─────────────────────────────────────────────────────
+
+[roles.programmer]
+id = "programmer"
+name = "Software Engineer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/programmer.md"
+temperature = 0.3
+tools = ["read", "write", "bash", "search"]
+icon = "💻"
+
+[roles.devops]
+id = "devops"
+name = "DevOps Engineer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/devops.md"
+temperature = 0.3
+tools = ["read", "bash", "write"]
+icon = "🚀"
+
 [roles.tech_writer]
 id = "tech_writer"
 name = "Technical Writer"
@@ -92,12 +94,34 @@ temperature = 0.5
 tools = ["read", "write"]
 icon = "📝"
 
-[roles.manager]
-id = "manager"
-name = "Engineering Manager"
-category = "planning"
-model_tier = "premium"
-prompt_file = "prompts/manager.md"
-temperature = 0.5
-tools = ["read"]
-icon = "👔"
+# ─── Verification Roles ──────────────────────────────────────────────────
+
+[roles.tester]
+id = "tester"
+name = "QA Engineer"
+category = "verification"
+model_tier = "budget"
+prompt_file = "prompts/tester.md"
+temperature = 0.4
+tools = ["read", "list", "bash", "search"]
+icon = "🧪"
+
+[roles.reviewer]
+id = "reviewer"
+name = "Code Reviewer"
+category = "verification"
+model_tier = "standard"
+prompt_file = "prompts/reviewer.md"
+temperature = 0.4
+tools = ["read", "list", "search"]
+icon = "🔍"
+
+[roles.security]
+id = "security"
+name = "Security Auditor"
+category = "verification"
+model_tier = "standard"
+prompt_file = "prompts/security.md"
+temperature = 0.4
+tools = ["read", "list", "search"]
+icon = "🛡️"

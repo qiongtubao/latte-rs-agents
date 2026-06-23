@@ -1,5 +1,26 @@
 # Discussion Workflow Configuration
-# Pre-defined workflows for common multi-agent discussion patterns.
+# =============================================================================
+# This file is the merged single-file workflow config — all workflows in one file.
+# Each [default_workflow] or [workflows.<id>] section defines a structured
+# multi-agent discussion.
+#
+# Prefer the per-file layout (config/workflows/*.toml) for user editing.
+# This merged file exists for backward compatibility and for the install script.
+#
+# A workflow defines:
+#   - name: unique identifier used in CLI (latte-agent workflow run <name>)
+#   - description: human-readable summary
+#   - max_rounds: how many times the step sequence repeats (1 = single pass)
+#   - context_token_budget: max tokens for shared context (optional)
+#   - steps: ordered list of [[steps]] blocks, each with:
+#       - id: unique step identifier
+#       - speakers: which roles speak (by role id, in order)
+#       - prompt: template with {{variable}} substitution
+#       - output_key: (optional) save output as named variable for later steps
+
+# ─── Default Workflow ────────────────────────────────────────────────────
+# The default workflow used when no workflow is specified.
+# Runs the full software discussion cycle: requirements → design → estimate → review → decide.
 
 [default_workflow]
 name = "standard-software-discussion"
@@ -43,8 +64,10 @@ description = "Manager makes final decision on scope and timeline"
 speakers = ["pm", "manager"]
 prompt = "Based on the full discussion above, finalize scope, priorities, and timeline. Manager: assess risk and resource constraints."
 
-# ─── Pre-defined Workflows ───────────────────────────────────────────────────
+# ─── Pre-defined Workflows ───────────────────────────────────────────────
 
+# Workflow: requirements_review
+# Lightweight requirements review: PM → architect → programmer+tester → manager+pm.
 [workflows.requirements_review]
 name = "Requirements Review"
 description = "PM presents requirements, team discusses feasibility and scope."
@@ -70,6 +93,8 @@ id = "decide"
 speakers = ["manager", "pm"]
 prompt = "Based on the discussion, finalize scope and priorities. Manager: assess risk and timeline feasibility."
 
+# Workflow: code_review
+# Multi-perspective code review: programmer explains → reviewers analyze → programmer responds.
 [workflows.code_review]
 name = "Code Review"
 description = "Multi-perspective code review with security, style, and logic checks."
@@ -90,6 +115,8 @@ id = "respond"
 speakers = ["programmer"]
 prompt = "Address the review feedback. For each point, either accept and explain the fix, or push back with reasoning."
 
+# Workflow: design_brainstorm
+# Creative open-ended discussion: PM sets context → team brainstorms → evaluators review → synthesize.
 [workflows.design_brainstorm]
 name = "Design Brainstorm"
 description = "Open-ended creative discussion about architecture or feature design."
@@ -115,6 +142,8 @@ id = "synthesize"
 speakers = ["architect", "pm"]
 prompt = "Synthesize the discussion into a recommended approach with tradeoffs documented."
 
+# Workflow: bug_triage
+# Bug analysis: tester describes → programmer diagnoses → security+devops assess → plan fix.
 [workflows.bug_triage]
 name = "Bug Triage"
 description = "Triage a bug report with multi-role analysis."
