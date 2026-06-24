@@ -30,14 +30,15 @@ use crate::role::Role as RoleDef;
 /// chain is currently on cooldown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WaitPolicy {
-    /// Return `AgentError::ModelsUnavailable` immediately. The error
-    /// carries `next_retry_in` so the caller can decide when to retry.
-    #[default]
-    NoWait,
     /// Sleep until the highest-priority model's cooldown expires, then
     /// retry that model exactly once. If the retry also fails, return
-    /// `ModelsUnavailable` with refreshed timing.
+    /// `ModelsUnavailable` with refreshed timing. This is the default
+    /// so callers don't have to plumb retry timing themselves.
+    #[default]
     WaitAndRetry,
+    /// Return `AgentError::ModelsUnavailable` immediately. The error
+    /// carries `next_retry_in` so the caller can decide when to retry.
+    NoWait,
 }
 
 // ─── ModelClient ──────────────────────────────────────────────────────────
@@ -211,13 +212,13 @@ impl Agent {
     /// surface immediately without walking the rest of the chain.
     ///
     /// If every model is on cooldown:
-    /// - [`WaitPolicy::NoWait`] (default) returns
-    ///   `AgentError::ModelsUnavailable { tried, next_retry_in }` so the
-    ///   caller can decide when to resume.
-    /// - [`WaitPolicy::WaitAndRetry`] sleeps until the highest-priority
-    ///   model's cooldown expires, then retries that model once. On
-    ///   second failure, returns `ModelsUnavailable` with refreshed
-    ///   timing.
+    /// - [`WaitPolicy::WaitAndRetry`] (default) sleeps until the
+    ///   highest-priority model's cooldown expires, then retries that
+    ///   model once. On second failure, returns `ModelsUnavailable`
+    ///   with refreshed timing.
+    /// - [`WaitPolicy::NoWait`] returns
+    ///   `AgentError::ModelsUnavailable { tried, next_retry_in }` so
+    ///   the caller can decide when to resume.
     pub async fn chat(
         &self,
         messages: &[Message],
@@ -462,7 +463,7 @@ impl AgentRunner {
         let mut final_response = String::new();
 
         for round in 0..max_rounds {
-            let completion = self.agent.chat(&messages, None, WaitPolicy::NoWait).await?;
+            let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
 
             self.total_usage.input_tokens += completion.usage.input_tokens;
             self.total_usage.output_tokens += completion.usage.output_tokens;
@@ -566,7 +567,7 @@ impl AgentRunner {
         let mut messages = vec![self.agent.system_message(vars)?];
         messages.extend_from_slice(new_messages);
 
-        let completion = self.agent.chat(&messages, None, WaitPolicy::NoWait).await?;
+        let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
         Ok(completion.content)
     }
 
