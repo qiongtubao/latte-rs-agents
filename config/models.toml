@@ -42,22 +42,22 @@ budget = "deepseek-chat"
 
 [models.role_tiers.pm]  # was: [role_tiers.pm] (top-level)
 premium = "claude-opus-4-20250514"
-standard = "claude-sonnet-4-20250514"
+standard = "deepseek-v4-flash"  # was: claude-sonnet (no API key) — fallthrough to deepseek-chat hallucinates
 budget = "deepseek-chat"
 
 [models.role_tiers.architect]  # was: [role_tiers.architect] (top-level)
 premium = "claude-opus-4-20250514"
-standard = "claude-sonnet-4-20250514"
+standard = "deepseek-v4-flash"  # was: claude-sonnet (no API key)
 budget = "deepseek-chat"
 
 [models.role_tiers.programmer]  # was: [role_tiers.programmer] (top-level)
 premium = "claude-sonnet-4-20250514"
-standard = "deepseek-chat"
+standard = "deepseek-v4-flash"  # was: deepseek-chat (hallucinates instead of actually invoking tools)
 budget = "qwen2.5-coder-32b-instruct"
 
 [models.role_tiers.manager]  # was: [role_tiers.manager] (top-level)
 premium = "claude-opus-4-20250514"
-standard = "deepseek-v4-flash"
+standard = "deepseek-v4-flash"  # was: deepseek-chat (which hallucinates instead of using tools)
 budget = "deepseek-chat"
 
 # ─── Model Definitions ───────────────────────────────────────────────────────

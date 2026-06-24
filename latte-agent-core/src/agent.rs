@@ -484,11 +484,19 @@ impl AgentRunner {
                 });
                 // Execute each tool call
                 for tc in &tool_calls {
+                     // Map friendly config aliases ("bash") to the real
+                     // builtin tool names ("exec"). Without this, model
+                     // outputs trained as `bash` get "tool not found"
+                     // because the registry stores it as `shell.exec`.
+                     let resolved_name: String = match tc.name.as_str() {
+                         "bash" => "exec".to_string(),
+                         n => n.to_string(),
+                     };
                      let input: serde_json::Value = serde_json::from_str(&tc.args)
                          .unwrap_or(serde_json::Value::String(tc.args.clone()));
 
                     let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
-                        &tc.name,
+                        &resolved_name,
                         1,
                     );
                     // Resolve the short name the model emits ("read")
@@ -499,14 +507,14 @@ impl AgentRunner {
                     // list `["read", "list", "search"]` while the
                     // registry stores them under their package prefix.
                     let full_name = tm
-                        .get_tool(&tc.name)
-                        .map(|_| tc.name.clone())
+                        .get_tool(&resolved_name)
+                        .map(|_| resolved_name.clone())
                         .or_else(|| {
                             tm.get_tool_names().into_iter().find(|n| {
-                                n.rsplit_once('.').map(|(_, s)| s) == Some(tc.name.as_str())
+                                n.rsplit_once('.').map(|(_, s)| s) == Some(resolved_name.as_str())
                             })
                         })
-                        .unwrap_or_else(|| tc.name.clone());
+                        .unwrap_or_else(|| resolved_name.clone());
                     match tm.execute(&full_name, input.clone(), Some(ctx)).await {
                         Ok(result) => {
                              messages.push(Message {

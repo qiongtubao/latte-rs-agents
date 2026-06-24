@@ -691,10 +691,19 @@ pub async fn build_tool_manager(
             .map_err(|e| format!("register_package: {}", e))?;
     }
     // Allowlist filter: short name or namespaced id.
-    let keep: std::collections::HashSet<String> = allowed
+    let mut keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
+    // Alias mapping: configs use friendly names ("bash") but builtin
+    // tools register under different short names ("shell.exec",
+    // "shell.spawn"). Map the friendly name to the real one so
+    // specialist configs don't need to know internal tool names.
+    for alias in &["bash"] {
+        if keep.contains(*alias) || keep.contains(&alias.to_lowercase()) {
+            keep.insert("exec".to_string());
+        }
+    }
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -824,6 +833,11 @@ async fn register_delegate_tool(
                 let response = runner.run_turn(&msgs, None).await.map_err(|e| {
                     tool_err(format!("delegate to '{}' failed: {}", role_id, e))
                 })?;
+                eprintln!("[delegate-result] role={} len={} preview={:?}",
+                    role_id,
+                    response.len(),
+                    response.chars().take(100).collect::<String>()
+                );
                 Ok(serde_json::json!({
                     "role": role_id,
                     "response": response,
@@ -873,7 +887,19 @@ pub(crate) fn parse_model_override(s: &str) -> Result<(String, String, String), 
     Ok((id.to_string(), field.to_string(), value.to_string()))
 }
 pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
-    let tool_list = allowed.join(", ");
+    // Map friendly config aliases to real builtin tool names. Configs
+    // use "bash" because that's what most operators know, but the
+    // builtin package registers it as "shell.exec". Without this map
+    // the system prompt lies to the model about what's available and
+    // every `tool_callbash` fails with "tool not found".
+    let real_names: Vec<String> = allowed
+        .iter()
+        .map(|s| match s.as_str() {
+            "bash" => "exec".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    let tool_list = real_names.join(", ");
     format!(
         r#"
 
