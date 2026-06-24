@@ -719,7 +719,7 @@ async fn build_runner(
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
-        AgentRunner::new_with_tools(agent, tm, 8)
+        AgentRunner::new_with_tools(agent, tm, 16)
     } else {
         AgentRunner::new(agent)
     };
