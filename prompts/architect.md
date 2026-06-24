@@ -32,10 +32,10 @@ The task you receive describes what to investigate — but I do not know what fi
 
 Emit each call on its own line in EXACTLY this format:
 
-tool_callbash {"command": "pwd && ls"}tool_call_end
-tool_callread {"path": "Cargo.toml"}tool_call_end
-tool_calllist {"path": "."}tool_call_end
-tool_callsearch {"path": "src", "pattern": "TODO"}tool_call_end
+<tool_callbash> {"command": "pwd && ls"}</tool_call>
+<tool_callread> {"path": "Cargo.toml"}</tool_call>
+<tool_calllist> {"path": "."}</tool_call>
+<tool_callsearch> {"path": "src", "pattern": "TODO"}</tool_call>
 
 No code fences, no backticks, no indentation as a code block — the markers are parsed verbatim.
 

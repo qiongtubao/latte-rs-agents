@@ -833,11 +833,6 @@ async fn register_delegate_tool(
                 let response = runner.run_turn(&msgs, None).await.map_err(|e| {
                     tool_err(format!("delegate to '{}' failed: {}", role_id, e))
                 })?;
-                eprintln!("[delegate-result] role={} len={} preview={:?}",
-                    role_id,
-                    response.len(),
-                    response.chars().take(100).collect::<String>()
-                );
                 Ok(serde_json::json!({
                     "role": role_id,
                     "response": response,

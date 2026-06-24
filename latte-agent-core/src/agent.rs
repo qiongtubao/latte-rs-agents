@@ -606,7 +606,7 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut results = Vec::new();
     let mut remaining = text;
 
-    while let Some(start) = remaining.find("<tool_call>") {
+    while let Some(start) = remaining.find("<tool_call") {
         let inner_start = start + "<tool_call>".len();
         if let Some(end) = remaining[inner_start..].find("</tool_call>") {
             let inner = &remaining[inner_start..inner_start + end];
@@ -615,7 +615,7 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
                 let a = inner[space + 1..].trim().to_string();
                 (n, a)
             } else {
-                (inner.trim().to_string(), String::new())
+                (inner.trim().trim_start_matches('>').trim().to_string(), String::new())
             };
             results.push(ToolCall { name, args });
             remaining = &remaining[inner_start + end + "</tool_call>".len()..];
