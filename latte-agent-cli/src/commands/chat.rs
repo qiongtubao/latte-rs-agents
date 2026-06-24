@@ -47,6 +47,11 @@ pub struct ChatCmd {
     #[arg(short = 'm', long = "model-id", value_name = "ID")]
     pub model_id: Option<String>,
 
+    /// Resume from a previously saved session file (written by
+    /// /save <path> or by the auto-save on turn failure).
+    #[arg(long, value_name = "PATH")]
+    pub resume: Option<String>,
+
     /// Path to agents config (file or directory).
     #[arg(long, default_value = "config/agents")]
     pub agents_config: String,
@@ -149,6 +154,14 @@ impl ChatCmd {
             log: Some(log),
             last_response: None,
         };
+        // If --resume was passed, load the saved history into the
+        // session context before the user starts chatting.
+        if let Some(path) = &self.resume {
+            let history = load_session(path)
+                .map_err(|e| format!("failed to load resume file '{}': {}", path, e))?;
+            session.load_history(history);
+            eprintln!("[resume] loaded {} messages from {}", session.runner.context().messages().len(), path);
+        }
         if !io::stdout().is_terminal() {
             // Non-interactive: read one message from stdin and reply once.
             let mut input = String::new();
@@ -190,33 +203,26 @@ impl ChatCmd {
                 continue;
             }
             let usage_before = session.runner.total_usage().clone();
-            session.turn(&line).await?;
+            if let Err(e) = session.turn(&line).await {
+                // Auto-save on turn failure so the user can resume
+                // with `latte-agent chat --resume <path>` after the
+                let saved = session.save_to_default();
+                eprintln!("\n[auto-save] turn failed: {}", e);
+                match saved {
+                    Ok(path) => eprintln!(
+                        "[auto-save] session saved to {}\n[auto-save] resume later: latte-agent chat --resume {}",
+                        path.display(), path.display()
+                    ),
+                    Err(save_err) => eprintln!(
+                        "[auto-save] could not save session: {}",
+                        save_err
+                    ),
+                }
+                return Err(e.into());
+            }
             let usage_after = session.runner.total_usage();
             let in_delta = usage_after.input_tokens - usage_before.input_tokens;
             let out_delta = usage_after.output_tokens - usage_before.output_tokens;
-            if let Some(resp) = &session.last_response {
-                // Render the model reply in a colored rounded box so
-                // multi-paragraph output is visually separated from
-                // the prompt and status line.
-                let boxed = style::render_response_box(
-                    role_icon,
-                    &session.role_id,
-                    resp,
-                    term_width,
-                );
-                println!("\n{}\n", boxed);
-            }
-            // Token status: `·  [deepseek-v4-flash] ↑N in ↓M out · session total ↑X ↓Y`
-            eprintln!(
-                "{}",
-                style::render_status_line(
-                    session.primary_model_id(),
-                    in_delta,
-                    out_delta,
-                    usage_after.input_tokens,
-                    usage_after.output_tokens,
-                )
-            );
         }
         Ok(())
     }
@@ -285,6 +291,32 @@ impl ChatSession {
             .first()
             .map(|mc| mc.model.id.as_str())
             .unwrap_or("?")
+    }
+
+    /// Inject previously-saved conversation history into the agent's
+    /// context (does NOT re-emit the system prompt; the agent re-derives
+    /// that per turn). Used by --resume to restore a session that was
+    /// saved by  or by the auto-save on turn failure.
+    fn load_history(&mut self, msgs: Vec<Message>) {
+        self.runner.context_mut().extend(msgs);
+    }
+
+    /// Auto-save the current conversation history to a timestamped
+    /// file under ~/.latte/chat-saves/. Called by the REPL when a
+    /// turn fails so the user can resume with --resume.
+    fn save_to_default(&self) -> Result<std::path::PathBuf, String> {
+        let dir = default_save_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create {}: {}", dir.display(), e))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir.join(format!("chat-{}-{}.jsonl", self.role_id, stamp));
+        let msgs: Vec<Message> = self.runner.context().messages().to_vec();
+        save_session(path.to_str().unwrap(), &msgs)
+            .map_err(|e| format!("write {}: {}", path.display(), e))?;
+        Ok(path)
     }
 
     async fn turn(&mut self, user_input: &str) -> AnyResult {
@@ -1060,6 +1092,15 @@ fn load_session(path: &str) -> AnyResult<Vec<Message>> {
         msgs.push(m);
     }
     Ok(msgs)
+}
+
+/// Default directory for auto-saved sessions (used when a turn fails
+/// and the user didn't specify a path). Created on demand.
+fn default_save_dir() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".latte").join("chat-saves")
 }
 
 #[cfg(test)]
