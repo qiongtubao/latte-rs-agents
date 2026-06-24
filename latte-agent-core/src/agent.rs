@@ -608,15 +608,25 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut remaining = text;
 
     while let Some(start) = remaining.find("<tool_call") {
-        let inner_start = start + "<tool_call>".len();
+        // NOTE: must match the prefix length passed to find() above.
+        // Earlier d5bd7d1 changed find("<tool_call>") (11 chars, with
+        // closing `>`) to find("<tool_call") (10 chars, no `>`) but
+        // forgot this offset, so the parser landed one char past the
+        // real start and either skipped a letter of the tool name or
+        // — by accident — landed on the right char when the model
+        // happened to emit `>` between `call` and the name.
+        let inner_start = start + "<tool_call".len();
         if let Some(end) = remaining[inner_start..].find("</tool_call>") {
             let inner = &remaining[inner_start..inner_start + end];
+            // `trim_matches('>')` strips leading and trailing `>`, so
+            // both `<tool_callNAME {...}` (no `>`) and
+            // `<tool_callNAME> {...}` (`>` after name) yield name == NAME.
             let (name, args) = if let Some(space) = inner.find(char::is_whitespace) {
-                let n = inner[..space].trim().to_string();
+                let n = inner[..space].trim().trim_matches('>').trim().to_string();
                 let a = inner[space + 1..].trim().to_string();
                 (n, a)
             } else {
-                (inner.trim().trim_start_matches('>').trim().to_string(), String::new())
+                (inner.trim().trim_matches('>').trim().to_string(), String::new())
             };
             results.push(ToolCall { name, args });
             remaining = &remaining[inner_start + end + "</tool_call>".len()..];
@@ -769,6 +779,40 @@ End"#;
         assert_eq!(calls[1].args, r#"{"pattern": "TODO"}"#);
     }
 
+    #[test]
+    fn test_extract_tool_calls_prompt_format_with_closing_gt() {
+        // The specialist prompts (programmer.md, architect.md, manager.md)
+        // teach the model to emit:
+        //   <tool_callbash> {"command": "pwd && ls"}</tool_call>
+        // — note the `>` between name and args. The parser must strip
+        // that `>` so the name is `bash` (not `bash>`) and the
+        // `bash → exec` alias in AgentRunner::run_turn actually fires.
+        let text = r#"<tool_callbash> {"command": "pwd && ls"}</tool_call>
+<tool_callread> {"path": "src/main.rs"}</tool_call>
+<tool_calldelegate> {"role": "programmer", "task": "read"}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 3, "expected 3 tool calls, got {:?}", calls);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].args, r#"{"command": "pwd && ls"}"#);
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(calls[1].args, r#"{"path": "src/main.rs"}"#);
+        assert_eq!(calls[2].name, "delegate");
+        assert_eq!(calls[2].args, r#"{"role": "programmer", "task": "read"}"#);
+    }
+
+    #[test]
+    fn test_extract_tool_calls_prompt_format_without_closing_gt() {
+        // Commit d5bd7d1 message describes this variant (no `>`
+        // anywhere inside the marker). Also accept it.
+        let text = r#"<tool_call>bash {"command": "pwd"}</tool_call>
+<tool_call>read {"path": "x"}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2, "got {:?}", calls);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].args, r#"{"command": "pwd"}"#);
+        assert_eq!(calls[1].name, "read");
+        assert_eq!(calls[1].args, r#"{"path": "x"}"#);
+    }
     #[test]
     fn test_extract_tool_calls_no_args() {
         let text = "<tool_call>list_models</tool_call>";
