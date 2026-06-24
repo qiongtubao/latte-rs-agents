@@ -6,6 +6,15 @@
 
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Semaphore;
+use tokio::time::timeout as tokio_timeout;
+
+/// Max concurrent `delegate` tool calls per manager session.
+const DEFAULT_DELEGATE_CONCURRENCY: usize = 4;
+/// Per-specialist wall-clock timeout in seconds.
+const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 60;
 
 use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
@@ -665,6 +674,16 @@ async fn build_runner(
             Arc::new(merged.clone()),
             Arc::new(resolver.clone()),
             default_params.clone(),
+            Arc::new(Semaphore::new(
+                std::env::var("LATTE_AGENT_DELEGATE_CONCURRENCY")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_DELEGATE_CONCURRENCY)
+            )),
+            std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
@@ -724,6 +743,8 @@ async fn register_delegate_tool(
     merged: Arc<AgentConfig>,
     resolver: Arc<ModelResolver>,
     default_params: GenerateParams,
+    delegate_sem: Arc<Semaphore>,
+    delegate_timeout_secs: u64,
 ) -> AnyResult {
     use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputProperty, ToolInputSchema};
 
@@ -765,6 +786,8 @@ async fn register_delegate_tool(
             let merged = Arc::clone(&merged);
             let resolver = Arc::clone(&resolver);
             let default_params = default_params.clone();
+            let sem = Arc::clone(&delegate_sem);
+            let timeout_s = delegate_timeout_secs;
             Box::pin(async move {
                 let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
                 let role_id = input
@@ -830,9 +853,30 @@ async fn register_delegate_tool(
                     role: MsgRole::User,
                     content: task,
                 }];
-                let response = runner.run_turn(&msgs, None).await.map_err(|e| {
-                    tool_err(format!("delegate to '{}' failed: {}", role_id, e))
+                // Acquire concurrency permit (blocks if too many
+                // specialists are already running).
+                let _permit = sem.acquire().await.map_err(|_| {
+                    tool_err("delegate pool shut down".into())
                 })?;
+                // Run the specialist with a wall-clock timeout.
+                let response = match tokio_timeout(
+                    Duration::from_secs(timeout_s),
+                    runner.run_turn(&msgs, None),
+                ).await {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
+                        return Err(tool_err(format!(
+                            "delegate to '{}' failed: {}", role_id, e
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(tool_err(format!(
+                            "delegate to '{}' timed out after {}s",
+                            role_id, timeout_s
+                        )));
+                    }
+                };
+                drop(_permit);
                 Ok(serde_json::json!({
                     "role": role_id,
                     "response": response,
