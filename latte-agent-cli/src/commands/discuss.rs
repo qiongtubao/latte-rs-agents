@@ -60,6 +60,22 @@ pub struct DiscussCmd {
     /// Per-model field override, repeatable: `id.field=value`.
     #[arg(long = "model-override", value_name = "ID.FIELD=VALUE")]
     pub model_overrides: Vec<String>,
+
+    /// Enable full-chain observability (see `latte-agent chat --debug`).
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Format for the on-stdout debug stream.
+    #[arg(long, value_enum, default_value_t = super::debug::DebugFormat::Auto)]
+    pub debug_format: super::debug::DebugFormat,
+
+    /// Comma-separated list of built-in hook names.
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub debug_hooks: Vec<String>,
+
+    /// Opt out of the always-on metadata index.
+    #[arg(long)]
+    pub no_session_index: bool,
 }
 
 impl DiscussCmd {
@@ -96,8 +112,19 @@ impl DiscussCmd {
             let models = resolver.resolve_chain(&role.id, tier, &role.model_chain)?;
             let model_id = models[0].id.clone();
 
+            let debug_flags = super::DebugFlags {
+                debug: self.debug,
+                debug_format: self.debug_format,
+                debug_hooks: self.debug_hooks.clone(),
+                no_session_index: self.no_session_index,
+            };
+            let sink = super::build_debug_sink(role_name, &debug_flags);
+            let hooks = super::build_debug_hooks(&debug_flags);
             let agent = Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
-            let runner = AgentRunner::new(agent);
+            let runner = AgentRunner::new(agent)
+                .with_sink(sink)
+                .with_hooks(hooks)
+                .with_role(role_name.clone());
 
             agents.insert(role_name.clone(), runner);
             println!("  {} ({}) → {}", role_name, template.model_tier, model_id);
