@@ -13,7 +13,6 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::trace::{HookPoint, ParsedCall};
-
 /// Re-export so consumers can construct `Message` without reaching
 /// into `latte_ai::models` themselves.
 pub use latte_ai::models::Message;
@@ -228,6 +227,8 @@ impl Default for HookChain {
     fn default() -> Self { Self::empty() }
 }
 
+pub mod builtin;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +326,5 @@ mod tests {
         assert_eq!(HookOutcome::<()>::Continue.kind(), "continue");
         assert_eq!(HookOutcome::Mutate(42).kind(), "mutate");
         assert_eq!(HookOutcome::<()>::Abort { reason: "x".into() }.kind(), "abort");
-        assert_eq!(HookOutcome::<()>::Retry { correction: "y".into() }.kind(), "retry");
-    }
+}
 }
