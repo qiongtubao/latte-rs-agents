@@ -56,9 +56,13 @@ standard = "deepseek-v4-flash"  # was: deepseek-chat (hallucinates instead of ac
 budget = "qwen2.5-coder-32b-instruct"
 
 [models.role_tiers.manager]  # was: [role_tiers.manager] (top-level)
-premium = "claude-opus-4-20250514"
-standard = "deepseek-v4-flash"  # was: deepseek-chat (which hallucinates instead of using tools)
-budget = "deepseek-chat"
+# 2026-06-25: switched all three tiers to glm-5.2 (5h resource refresh,
+# user preference). Previously: premium=opus, standard=deepseek-v4-flash,
+# budget=deepseek-chat. Opus stays reachable via the global merged
+# catalog (provider=anthropic) for CLI override use.
+premium = "glm-5.2"
+standard = "glm-5.2"
+budget = "glm-5.2"
 
 # ─── Model Definitions ───────────────────────────────────────────────────────
 # Each [[models.models]] block defines one AI model.
