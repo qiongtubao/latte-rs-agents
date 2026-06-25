@@ -17,8 +17,9 @@ use super::config_layer::{self, CliOverrides};
 use super::trace_store;
 /// and `Jsonl` otherwise, matching the spec's "pretty if tty, jsonl
 /// otherwise" default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DebugFormat {
+    #[default]
     Auto,
     Pretty,
     Jsonl,

@@ -74,6 +74,30 @@ pub struct ChatCmd {
     /// `--model-override deepseek-chat.base_url=http://localhost:11434`
     #[arg(long = "model-override", value_name = "ID.FIELD=VALUE")]
     pub model_overrides: Vec<String>,
+
+    /// Enable full-chain observability (TraceSink + HookChain).
+    /// Emits TraceEvents to stdout AND writes a complete trace to
+    /// `~/.latte/traces/<session-id>.jsonl`. Without this flag,
+    /// only the always-on `~/.latte/sessions/<id>.idx` metadata
+    /// index is written.
+    #[arg(long)]
+    pub debug: bool,
+
+    /// Format for the on-stdout debug stream when `--debug` is set.
+    /// `auto` (default) picks pretty on a tty and jsonl when piped.
+    #[arg(long, value_enum, default_value_t = super::debug::DebugFormat::Auto)]
+    pub debug_format: super::debug::DebugFormat,
+
+    /// Comma-separated list of built-in hook names to register for
+    /// this session. Available: `redact_pii`, `enforce_tool_allowlist`,
+    /// `require_tool_call`.
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub debug_hooks: Vec<String>,
+
+    /// Opt out of the always-on metadata index. Useful on shared
+    /// machines where the file's contents are sensitive.
+    #[arg(long)]
+    pub no_session_index: bool,
 }
 impl ChatCmd {
     pub async fn run(&self) -> AnyResult {
@@ -121,6 +145,7 @@ impl ChatCmd {
             &initial_role,
             initial_tier,
             initial_primary,
+            &super::DebugFlags { debug: self.debug, debug_format: self.debug_format, debug_hooks: self.debug_hooks.clone(), no_session_index: self.no_session_index },
         )
         .await
         {
@@ -153,6 +178,12 @@ impl ChatCmd {
             primary_id: self.model_id.clone(),
             log: Some(log),
             last_response: None,
+            debug_flags: super::DebugFlags {
+                debug: self.debug,
+                debug_format: self.debug_format,
+                debug_hooks: self.debug_hooks.clone(),
+                no_session_index: self.no_session_index,
+            },
         };
         // If --resume was passed, load the saved history into the
         // session context before the user starts chatting.
@@ -243,6 +274,7 @@ struct ChatSession {
     /// still constructible in unit tests that don't write a file.
     log: Option<super::chatlog::ChatLog>,
     last_response: Option<String>,
+    debug_flags: super::DebugFlags,
 }
 
 impl ChatSession {
@@ -254,6 +286,7 @@ impl ChatSession {
         role_id: String,
         tier: ModelTier,
         primary_id: Option<String>,
+        debug_flags: super::DebugFlags,
     ) -> Self {
         Self {
             merged,
@@ -265,6 +298,7 @@ impl ChatSession {
             primary_id,
             log: None,
             last_response: None,
+            debug_flags,
         }
     }
 
@@ -421,6 +455,7 @@ impl ChatSession {
                     id,
                     new_tier,
                     self.primary_id.as_deref(),
+                    &self.debug_flags,
                 )
                 .await
                 {
@@ -468,8 +503,7 @@ impl ChatSession {
                 match parse_tier(t) {
                     Ok(new_tier) => {
                         let role_id = self.role_id.clone();
-                        let history: Vec<Message> =
-                            self.runner.context().messages().to_vec();
+                        let history: Vec<Message> = self.runner.context().messages().to_vec();
                         match build_runner(
                             &self.merged,
                             &self.resolver,
@@ -477,6 +511,7 @@ impl ChatSession {
                             &role_id,
                             new_tier,
                             self.primary_id.as_deref(),
+                            &self.debug_flags,
                         )
                         .await
                         {
@@ -633,6 +668,7 @@ async fn build_runner(
     role_id: &str,
     tier: ModelTier,
     primary_id: Option<&str>,
+    debug_flags: &super::DebugFlags,
 ) -> AnyResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -696,6 +732,8 @@ async fn build_runner(
         models,
         default_params.clone(),
     )?;
+    let sink = super::build_debug_sink(&role_id, debug_flags);
+    let hooks = super::build_debug_hooks(debug_flags);
     let runner = if !role.allowed_tools.is_empty() {
         let tm = build_tool_manager(&role.allowed_tools).await
             .map_err(|e| format!("tool setup failed: {}", e))?;
@@ -721,8 +759,14 @@ async fn build_runner(
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
         AgentRunner::new_with_tools(agent, tm, 16)
+            .with_sink(Arc::clone(&sink))
+            .with_hooks(Arc::clone(&hooks))
+            .with_role(role_id.clone())
     } else {
         AgentRunner::new(agent)
+            .with_sink(Arc::clone(&sink))
+            .with_hooks(Arc::clone(&hooks))
+            .with_role(role_id.clone())
     };
     Ok((runner, role_id.to_string()))
 }
