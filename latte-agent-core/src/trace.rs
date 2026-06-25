@@ -234,8 +234,15 @@ impl FanoutSink {
 
 impl TraceSink for FanoutSink {
     fn emit(&self, event: TraceEvent) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
         for s in &self.sinks {
-            s.emit(event.clone());
+            // Per spec §14: isolate child panics so one bad sink doesn't
+            // drop the events the other sinks were supposed to see.
+            // AssertUnwindSafe is required because `TraceSink` carries no
+            // UnwindSafe guarantees; the children own their own state.
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                s.emit(event.clone());
+            }));
         }
     }
 }
@@ -449,16 +456,17 @@ mod tests {
     }
 
     #[test]
-    fn index_sink_strips_payload_fields() {
+    fn index_sink_writes_session_end_to_disk() {
+        // TODO(Task 4): re-add "strips payload" assertion against a
+        // content-bearing variant (e.g. ModelRawOut) once that variant
+        // lands. The current 2 variants (SessionStart, SessionEnd) carry
+        // no payload fields, so this test only verifies on-disk write.
         let dir = std::env::temp_dir().join(format!("latte-test-idx-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.idx");
         let sink = IndexSink::new(path.clone());
         let mut meta = TraceMeta::test_default();
         meta.role = "manager".into();
-        // Note: ModelRawOut is NOT yet a variant (Task 4). For Task 3,
-        // use SessionEnd. The point is to confirm the index file does
-        // NOT include any raw content fields. We'll verify this in Task 4.
         sink.emit(TraceEvent::SessionEnd {
             meta,
             total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
@@ -468,6 +476,31 @@ mod tests {
         assert!(content.contains("SessionEnd"));
         assert!(content.contains("\"role\":\"manager\""));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    struct PanickingSink;
+    impl TraceSink for PanickingSink {
+        fn emit(&self, _event: TraceEvent) { panic!("intentional"); }
+    }
+
+    #[test]
+    fn fanout_sink_isolates_child_panic() {
+        use std::sync::Arc;
+        // Order matters: panicking sink FIRST, normal sink SECOND.
+        // Without catch_unwind, the second sink would never receive
+        // the event because the test process would unwind through it.
+        let ok = Arc::new(VecSink(parking_lot::Mutex::new(vec![])));
+        let bad: Arc<dyn TraceSink> = Arc::new(PanickingSink);
+        let fan = FanoutSink::new(vec![bad, ok.clone()]);
+        fan.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 1, total_input: 1, total_output: 1, total_thinking: 0,
+        });
+        assert_eq!(
+            ok.0.lock().len(),
+            1,
+            "sibling sink must still receive event after sibling panics",
+        );
     }
 
     #[test]
