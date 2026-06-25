@@ -603,40 +603,65 @@ struct ToolCall {
 }
 
 /// Extract `<tool_call>name args</tool_call>` patterns from model output.
+/// Close-tag variants accepted: `</tool_call>` (canonical prompt form)
+/// and `</tool_callNAME>` (XML-style match tag, what deepseek-v4-flash
+/// actually emits). The open prefix is always `<tool_call` (10 chars,
+/// no `>`); the name runs to the first non-`[A-Za-z0-9_]` char.
+
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut results = Vec::new();
     let mut remaining = text;
+    const OPEN: &str = "<tool_call";
+    const CANONICAL_CLOSE: &str = "</tool_call>";
 
-    while let Some(start) = remaining.find("<tool_call") {
-        // NOTE: must match the prefix length passed to find() above.
-        // Earlier d5bd7d1 changed find("<tool_call>") (11 chars, with
-        // closing `>`) to find("<tool_call") (10 chars, no `>`) but
-        // forgot this offset, so the parser landed one char past the
-        // real start and either skipped a letter of the tool name or
-        // — by accident — landed on the right char when the model
-        // happened to emit `>` between `call` and the name.
-        let inner_start = start + "<tool_call".len();
-        if let Some(end) = remaining[inner_start..].find("</tool_call>") {
-            let inner = &remaining[inner_start..inner_start + end];
-            // `trim_matches('>')` strips leading and trailing `>`, so
-            // both `<tool_callNAME {...}` (no `>`) and
-            // `<tool_callNAME> {...}` (`>` after name) yield name == NAME.
-            let (name, args) = if let Some(space) = inner.find(char::is_whitespace) {
-                let n = inner[..space].trim().trim_matches('>').trim().to_string();
-                let a = inner[space + 1..].trim().to_string();
-                (n, a)
-            } else {
-                (inner.trim().trim_matches('>').trim().to_string(), String::new())
-            };
-            results.push(ToolCall { name, args });
-            remaining = &remaining[inner_start + end + "</tool_call>".len()..];
-        } else {
-            break;
+    while let Some(start) = remaining.find(OPEN) {
+        let after_open = &remaining[start + OPEN.len()..];
+        // Legacy open was `<tool_call>NAME` (10+`>`+name), current XML
+        // open is `<tool_callNAME>` (10+name+`>`). Either way, if the
+        // char right after `<tool_call` is `>`, skip it before parsing
+        // the name. This lets one parser accept all three formats.
+        let after_open = after_open.strip_prefix('>').unwrap_or(after_open);
+        let name_len = after_open
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+
+        if name_len == 0 {
+            // `<tool_call` with no name following — skip past the
+            // prefix to avoid an infinite loop.
+            remaining = &remaining[start + OPEN.len()..];
+            continue;
         }
+
+        let name = after_open[..name_len].to_string();
+        let after_name = &after_open[name_len..];
+        let after_name = after_name
+            .strip_prefix('>')        // drop `>` from `<tool_callNAME>`
+            .unwrap_or(after_name)
+            .trim_start();
+
+        // Look for the close tag. Try the XML-style match tag first
+        // (what the model actually emits), then fall back to the
+        // canonical prompt form.
+        let xml_close = format!("</tool_call{}>", name);
+        let (close_pos, close_len) = match after_name.find(&xml_close) {
+            Some(p) => (p, xml_close.len()),
+            None => match after_name.find(CANONICAL_CLOSE) {
+                Some(p) => (p, CANONICAL_CLOSE.len()),
+                None => break, // malformed / truncated: give up
+            },
+        };
+
+        let args = after_name[..close_pos].trim().to_string();
+        results.push(ToolCall { name, args });
+        remaining = &after_name[close_pos + close_len..];
     }
 
     results
 }
+
 
 /// Convenience: parameters override for agent construction.
 
@@ -799,20 +824,23 @@ End"#;
         assert_eq!(calls[2].name, "delegate");
         assert_eq!(calls[2].args, r#"{"role": "programmer", "task": "read"}"#);
     }
-
     #[test]
-    fn test_extract_tool_calls_prompt_format_without_closing_gt() {
-        // Commit d5bd7d1 message describes this variant (no `>`
-        // anywhere inside the marker). Also accept it.
-        let text = r#"<tool_call>bash {"command": "pwd"}</tool_call>
-<tool_call>read {"path": "x"}</tool_call>"#;
+    fn test_extract_tool_calls_xml_style_close() {
+        // What deepseek-v4-flash actually emits in real chat sessions
+        // (observed 2026-06-25): the open and close are XML-style
+        // matching tags `<tool_callNAME>...</tool_callNAME>`, not the
+        // prompt-taught canonical form. The parser must accept this.
+        let text = r#"<tool_calldelegate> {"role": "programmer", "task": "read chat.rs"}</tool_calldelegate>
+<tool_callreviewer> {"role": "reviewer", "task": "audit chat.rs"}</tool_callreviewer>"#;
         let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 2, "got {:?}", calls);
-        assert_eq!(calls[0].name, "bash");
-        assert_eq!(calls[0].args, r#"{"command": "pwd"}"#);
-        assert_eq!(calls[1].name, "read");
-        assert_eq!(calls[1].args, r#"{"path": "x"}"#);
+        assert_eq!(calls.len(), 2, "expected 2 calls, got {:?}", calls);
+        assert_eq!(calls[0].name, "delegate");
+        assert_eq!(calls[0].args, r#"{"role": "programmer", "task": "read chat.rs"}"#);
+        assert_eq!(calls[1].name, "reviewer");
+        assert_eq!(calls[1].args, r#"{"role": "reviewer", "task": "audit chat.rs"}"#);
     }
+
+
     #[test]
     fn test_extract_tool_calls_no_args() {
         let text = "<tool_call>list_models</tool_call>";
