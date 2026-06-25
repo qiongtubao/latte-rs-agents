@@ -367,6 +367,12 @@ pub struct AgentRunner {
     tool_manager: Option<Arc<dyn latte_rs_agent_tools::types::ToolManager>>,
     /// Accumulated token usage across all turns.
     total_usage: TokenUsage,
+    /// Trace sink for observability events.
+    sink: Arc<dyn crate::trace::TraceSink>,
+    /// Hook chain for pre/post processing.
+    hooks: Arc<crate::hooks::HookChain>,
+    /// Role identifier for this runner.
+    role_id: String,
 }
 
 impl AgentRunner {
@@ -378,10 +384,12 @@ impl AgentRunner {
             max_tool_rounds: 0,
             tool_manager: None,
             total_usage: TokenUsage::default(),
+            sink: Arc::new(crate::trace::NullSink),
+            hooks: Arc::new(crate::hooks::HookChain::empty()),
+            role_id: "default".to_string(),
         }
     }
 
-    /// Create a runner with tool support.
     pub fn new_with_tools(
         agent: Agent,
         tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
@@ -393,10 +401,12 @@ impl AgentRunner {
             max_tool_rounds,
             tool_manager: Some(tool_manager),
             total_usage: TokenUsage::default(),
+            sink: Arc::new(crate::trace::NullSink),
+            hooks: Arc::new(crate::hooks::HookChain::empty()),
+            role_id: "default".to_string(),
         }
     }
 
-    /// Create a runner with a pre-existing context.
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
         Self {
             agent,
@@ -404,9 +414,11 @@ impl AgentRunner {
             max_tool_rounds: 0,
             tool_manager: None,
             total_usage: TokenUsage::default(),
+            sink: Arc::new(crate::trace::NullSink),
+            hooks: Arc::new(crate::hooks::HookChain::empty()),
+            role_id: "default".to_string(),
         }
     }
-
     /// Set the max tool-call round trips per turn.
     pub fn set_max_tool_rounds(&mut self, n: usize) {
         self.max_tool_rounds = n;
@@ -579,6 +591,43 @@ impl AgentRunner {
     /// Prune context to stay within token budget, keeping last N messages.
     pub fn prune_context(&mut self, keep_last: usize) {
         self.context.prune_to_budget(keep_last);
+    }
+
+    // ── Builder methods ─────────────────────────────────────────────────────
+
+    /// Set the trace sink.
+    pub fn with_sink(mut self, sink: Arc<dyn crate::trace::TraceSink>) -> Self {
+        self.sink = sink;
+        self
+    }
+
+    /// Set the hook chain.
+    pub fn with_hooks(mut self, hooks: Arc<crate::hooks::HookChain>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Set the role identifier.
+    pub fn with_role(mut self, role_id: impl Into<String>) -> Self {
+        self.role_id = role_id.into();
+        self
+    }
+
+    // ── Accessors ───────────────────────────────────────────────────────────
+
+    /// Get the trace sink.
+    pub fn sink(&self) -> &Arc<dyn crate::trace::TraceSink> {
+        &self.sink
+    }
+
+    /// Get the hook chain.
+    pub fn hooks(&self) -> &Arc<crate::hooks::HookChain> {
+        &self.hooks
+    }
+
+    /// Get the role identifier.
+    pub fn role_id(&self) -> &str {
+        &self.role_id
     }
 }
 
