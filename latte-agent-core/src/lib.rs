@@ -43,6 +43,7 @@ pub mod global_config;
 pub mod model_resolver;
 pub mod prompts;
 pub mod role;
+pub mod trace;
 
 pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
 pub use config::AgentConfig;
