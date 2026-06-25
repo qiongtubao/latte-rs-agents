@@ -4,7 +4,7 @@
 //! for the design.
 
 use std::path::PathBuf;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Per-event metadata. Carried on every `TraceEvent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -27,8 +27,9 @@ impl TraceMeta {
     }
 }
 
-/// Trace event emitted by the agent runtime. Only the minimal skeleton
-/// variants are defined here; the full 9-variant enum populates in Task 4.
+/// Trace event emitted by the agent runtime. Carries metadata plus a
+/// payload that varies per variant. 9 variants cover the full
+/// run_turn lifecycle (Task 10 wires the emit/hook call sites).
 #[derive(Debug, Clone, Serialize)]
 pub enum TraceEvent {
     SessionStart {
@@ -37,6 +38,50 @@ pub enum TraceEvent {
         model_chain: Vec<String>,
         allowed_tools: Vec<String>,
     },
+    PromptBuilt {
+        meta: TraceMeta,
+        system_rendered: String,
+        history_len: usize,
+        user_input: String,
+        est_input_tokens: u32,
+    },
+    ModelCall {
+        meta: TraceMeta,
+        model_id: String,
+        params_json: String,
+        latency_ms: u64,
+        finish_reason: String,
+    },
+    ModelRawOut {
+        meta: TraceMeta,
+        raw_content: String,
+    },
+    ParseToolCalls {
+        meta: TraceMeta,
+        raw_in: String,
+        parsed: Vec<ParsedCall>,
+        diagnostics: ParseDiag,
+    },
+    ToolExec {
+        meta: TraceMeta,
+        name: String,
+        args_json: String,
+        latency_ms: u64,
+        status: ToolStatus,
+    },
+    HookFired {
+        meta: TraceMeta,
+        hook_name: String,
+        point: HookPoint,
+        outcome_kind: String,
+    },
+    TurnEnd {
+        meta: TraceMeta,
+        total_input: u32,
+        total_output: u32,
+        total_thinking: u32,
+        elapsed_ms: u64,
+    },
     SessionEnd {
         meta: TraceMeta,
         total_turns: u32,
@@ -44,7 +89,34 @@ pub enum TraceEvent {
         total_output: u32,
         total_thinking: u32,
     },
-    // ... more variants added in later tasks; SessionEnd is enough for Task 1.
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParsedCall {
+    pub name: String,
+    pub args: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParseDiag {
+    pub opens_found: u32,
+    pub closes_matched: u32,
+    pub unmatched_opens: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolStatus {
+    Ok(String),
+    Err(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookPoint {
+    PreCall,
+    PostResponse,
+    PostParse,
+    PreTool,
+    PostTool,
 }
 
 /// Receiver of trace events. Implementations must be `Send + Sync` so they
@@ -102,30 +174,60 @@ impl TraceSink for JsonlSink {
 impl TraceEvent {
     pub fn meta(&self) -> &TraceMeta {
         match self {
-            TraceEvent::SessionStart { meta, .. } | TraceEvent::SessionEnd { meta, .. } => meta,
+            TraceEvent::SessionStart { meta, .. }
+            | TraceEvent::PromptBuilt { meta, .. }
+            | TraceEvent::ModelCall { meta, .. }
+            | TraceEvent::ModelRawOut { meta, .. }
+            | TraceEvent::ParseToolCalls { meta, .. }
+            | TraceEvent::ToolExec { meta, .. }
+            | TraceEvent::HookFired { meta, .. }
+            | TraceEvent::TurnEnd { meta, .. }
+            | TraceEvent::SessionEnd { meta, .. } => meta,
         }
     }
     pub fn variant_name(&self) -> &'static str {
         match self {
             TraceEvent::SessionStart { .. } => "SessionStart",
+            TraceEvent::PromptBuilt { .. } => "PromptBuilt",
+            TraceEvent::ModelCall { .. } => "ModelCall",
+            TraceEvent::ModelRawOut { .. } => "ModelRawOut",
+            TraceEvent::ParseToolCalls { .. } => "ParseToolCalls",
+            TraceEvent::ToolExec { .. } => "ToolExec",
+            TraceEvent::HookFired { .. } => "HookFired",
+            TraceEvent::TurnEnd { .. } => "TurnEnd",
             TraceEvent::SessionEnd { .. } => "SessionEnd",
         }
     }
-    /// Multi-line body for the StdoutSink pretty form. For Task 3
-    /// only the 2 existing variants are populated; Task 4 will add
-    /// arms for the other 7 variants.
     pub fn body_for_pretty(&self) -> String {
         match self {
             TraceEvent::SessionStart { tier, model_chain, allowed_tools, .. } =>
                 format!("tier={} model_chain={:?} tools={:?}", tier, model_chain, allowed_tools),
+            TraceEvent::PromptBuilt { est_input_tokens, history_len, user_input, .. } =>
+                format!("est_input={} history_len={} user_input={:?}",
+                    est_input_tokens, history_len,
+                    if user_input.len() > 60 { format!("{}…", &user_input[..60]) } else { user_input.clone() }),
+            TraceEvent::ModelCall { model_id, latency_ms, finish_reason, .. } =>
+                format!("model={} latency={}ms finish={}", model_id, latency_ms, finish_reason),
+            TraceEvent::ModelRawOut { raw_content, .. } =>
+                format!("{} chars: {}", raw_content.len(),
+                    if raw_content.len() > 80 { format!("{}…", &raw_content[..80]) } else { raw_content.clone() }),
+            TraceEvent::ParseToolCalls { parsed, diagnostics, .. } =>
+                format!("parsed={} opens={} matched={} unmatched={}",
+                    parsed.len(), diagnostics.opens_found, diagnostics.closes_matched, diagnostics.unmatched_opens.len()),
+            TraceEvent::ToolExec { name, latency_ms, status, .. } =>
+                format!("name={} latency={}ms status={}",
+                    name, latency_ms, match status { ToolStatus::Ok(_) => "ok", ToolStatus::Err(_) => "err" }),
+            TraceEvent::HookFired { hook_name, point, outcome_kind, .. } =>
+                format!("{} {:?} {}", hook_name, point, outcome_kind),
+            TraceEvent::TurnEnd { total_input, total_output, total_thinking, elapsed_ms, .. } =>
+                format!("in={} out={} think={} elapsed={}ms",
+                    total_input, total_output, total_thinking, elapsed_ms),
             TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } =>
                 format!("turns={} in={} out={} think={}", total_turns, total_input, total_output, total_thinking),
         }
     }
     /// Metadata-only projection for IndexSink. Returns None for
-    /// events that have no indexable information. For Task 3 only
-    /// the 2 existing variants are populated; Task 4 will add
-    /// arms for the other 7 variants.
+    /// events that have no indexable information.
     pub fn to_index_line(&self) -> Option<IndexLine> {
         let meta = self.meta();
         Some(match self {
@@ -135,10 +237,56 @@ impl TraceEvent {
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: format!("tier={} chain_len={} tools={}", tier, model_chain.len(), allowed_tools.len()),
             },
+            TraceEvent::PromptBuilt { est_input_tokens, history_len, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "PromptBuilt".into(),
+                model_id: None, latency_ms: None,
+                tokens_in: Some(*est_input_tokens), tokens_out: None, tokens_think: None,
+                detail: format!("history_len={}", history_len),
+            },
+            TraceEvent::ModelCall { model_id, latency_ms, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ModelCall".into(),
+                model_id: Some(model_id.clone()), latency_ms: Some(*latency_ms),
+                tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: String::new(),
+            },
+            TraceEvent::ModelRawOut { .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ModelRawOut".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: String::new(),
+            },
+            TraceEvent::ParseToolCalls { parsed, diagnostics, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ParseToolCalls".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("parsed={} unmatched={}", parsed.len(), diagnostics.unmatched_opens.len()),
+            },
+            TraceEvent::ToolExec { name, latency_ms, status, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ToolExec".into(),
+                model_id: None, latency_ms: Some(*latency_ms), tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("name={} status={}", name, match status { ToolStatus::Ok(_) => "ok", ToolStatus::Err(_) => "err" }),
+            },
+            TraceEvent::HookFired { hook_name, point, outcome_kind, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "HookFired".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("hook={} point={:?} outcome={}", hook_name, point, outcome_kind),
+            },
+            TraceEvent::TurnEnd { total_input, total_output, total_thinking, elapsed_ms, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "TurnEnd".into(),
+                model_id: None, latency_ms: Some(*elapsed_ms),
+                tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
+                detail: String::new(),
+            },
             TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } => IndexLine {
                 turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
                 kind: "SessionEnd".into(),
-                model_id: None, latency_ms: None, tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
+                model_id: None, latency_ms: None,
+                tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
                 detail: format!("turns={}", total_turns),
             },
         })
@@ -266,7 +414,15 @@ impl ScopedSink {
 impl TraceSink for ScopedSink {
     fn emit(&self, mut event: TraceEvent) {
         match &mut event {
-            TraceEvent::SessionStart { meta, .. } | TraceEvent::SessionEnd { meta, .. } => {
+            TraceEvent::SessionStart { meta, .. }
+            | TraceEvent::PromptBuilt { meta, .. }
+            | TraceEvent::ModelCall { meta, .. }
+            | TraceEvent::ModelRawOut { meta, .. }
+            | TraceEvent::ParseToolCalls { meta, .. }
+            | TraceEvent::ToolExec { meta, .. }
+            | TraceEvent::HookFired { meta, .. }
+            | TraceEvent::TurnEnd { meta, .. }
+            | TraceEvent::SessionEnd { meta, .. } => {
                 meta.role = self.role.clone();
             }
         }
@@ -538,6 +694,78 @@ mod tests {
                 assert_eq!(meta.role, "programmer", "scoped sink did not override role");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn trace_event_variants_serialize_roundtrip() {
+        // Task 4: all 9 variants must survive JSON round-trip. Each
+        // arm constructs the variant with realistic-looking data,
+        // serializes via serde_json, parses back, and asserts the
+        // discriminant (variant name) is preserved.
+        let mut meta = TraceMeta::test_default();
+        meta.role = "tester".into();
+        let events: Vec<TraceEvent> = vec![
+            TraceEvent::SessionStart {
+                meta: meta.clone(),
+                tier: "standard".into(),
+                model_chain: vec!["glm-5.2".into(), "deepseek-v4-flash".into()],
+                allowed_tools: vec!["read".into(), "bash".into()],
+            },
+            TraceEvent::PromptBuilt {
+                meta: meta.clone(),
+                system_rendered: "you are a tester".into(),
+                history_len: 3,
+                user_input: "analyze chat.rs".into(),
+                est_input_tokens: 1234,
+            },
+            TraceEvent::ModelCall {
+                meta: meta.clone(),
+                model_id: "glm-5.2".into(),
+                params_json: r#"{"temperature":0.5}"#.into(),
+                latency_ms: 2741,
+                finish_reason: "stop".into(),
+            },
+            TraceEvent::ModelRawOut {
+                meta: meta.clone(),
+                raw_content: "<tool_callexec> {\"command\": \"pwd\"}</tool_call>".into(),
+            },
+            TraceEvent::ParseToolCalls {
+                meta: meta.clone(),
+                raw_in: "<tool_callexec> {\"command\": \"pwd\"}</tool_call>".into(),
+                parsed: vec![ParsedCall { name: "exec".into(), args: "{}".into() }],
+                diagnostics: ParseDiag { opens_found: 1, closes_matched: 1, unmatched_opens: vec![] },
+            },
+            TraceEvent::ToolExec {
+                meta: meta.clone(),
+                name: "exec".into(),
+                args_json: r#"{"command":"pwd"}"#.into(),
+                latency_ms: 50,
+                status: ToolStatus::Ok("/Users/zhouguodong".into()),
+            },
+            TraceEvent::HookFired {
+                meta: meta.clone(),
+                hook_name: "redact_pii".into(),
+                point: HookPoint::PreCall,
+                outcome_kind: "mutate".into(),
+            },
+            TraceEvent::TurnEnd {
+                meta: meta.clone(),
+                total_input: 100, total_output: 200, total_thinking: 0, elapsed_ms: 5000,
+            },
+            TraceEvent::SessionEnd {
+                meta,
+                total_turns: 3, total_input: 300, total_output: 600, total_thinking: 10,
+            },
+        ];
+        assert_eq!(events.len(), 9);
+        for e in &events {
+            let json = serde_json::to_string(e).expect("serialize");
+            let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+            // Each variant serializes as a single-key object whose key
+            // is the variant name. Verify the key matches variant_name().
+            let key = v.as_object().expect("object").keys().next().expect("one key").clone();
+            assert_eq!(key, e.variant_name(), "variant_name mismatch for {}", key);
         }
     }
 }
