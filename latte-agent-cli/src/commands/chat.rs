@@ -110,12 +110,26 @@ impl ChatCmd {
         if let Some(p) = log.path() {
             eprintln!("[chatlog] writing session events to {}", p.display());
         }
+        // Derive the canonical session_id from the ChatLog file stem
+        // (`chat-YYYYMMDD-HHMMSS-<pid>` without the `.log` suffix).
+        // This is what spec §9 calls the "log ↔ idx ↔ jsonl correlate"
+        // anchor — every TraceMeta emitted by the runner carries this
+        // id, the per-session index sits at `~/.latte/sessions/<id>.idx`,
+        // the trace JSONL sits at `~/.latte/traces/<id>.jsonl`, and the
+        // chat log sits at `~/.latte/logs/<id>.log`. Fall back to a
+        // PID-based id if the log couldn't be opened (e.g. the logs
+        // directory is read-only) so the trace files are still useful.
+        let session_id: String = log
+            .path()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_else(|| format!("chat-{}", std::process::id()));
         log.info(
             "session start",
             &[
                 ("role", self.role.clone().unwrap_or_else(|| "manager".into())),
                 ("tier", self.tier.clone()),
                 ("model_id", self.model_id.clone().unwrap_or_default()),
+                ("session_id", session_id.clone()),
             ],
         );
 
@@ -137,6 +151,17 @@ impl ChatCmd {
         let initial_tier = parse_tier(&self.tier)?;
         let initial_primary = self.model_id.as_deref();
 
+        // Build the DebugFlags bundle once and reuse it everywhere —
+        // the session_id is part of it so the runner's TraceMeta,
+        // the per-session idx, and the trace JSONL all line up.
+        let debug_flags = super::DebugFlags {
+            debug: self.debug,
+            debug_format: self.debug_format,
+            debug_hooks: self.debug_hooks.clone(),
+            no_session_index: self.no_session_index,
+            session_id: session_id.clone(),
+        };
+
         // Build the initial runner.
         let (runner, role_id) = match build_runner(
             &merged,
@@ -145,7 +170,7 @@ impl ChatCmd {
             &initial_role,
             initial_tier,
             initial_primary,
-            &super::DebugFlags { debug: self.debug, debug_format: self.debug_format, debug_hooks: self.debug_hooks.clone(), no_session_index: self.no_session_index },
+            &debug_flags,
         )
         .await
         {
@@ -166,6 +191,7 @@ impl ChatCmd {
                 ("role", role_id.clone()),
                 ("tier", initial_tier.label().to_string()),
                 ("model_id", initial_primary.unwrap_or("").to_string()),
+                ("session_id", session_id.clone()),
             ],
         );
         let mut session = ChatSession {
@@ -178,12 +204,7 @@ impl ChatCmd {
             primary_id: self.model_id.clone(),
             log: Some(log),
             last_response: None,
-            debug_flags: super::DebugFlags {
-                debug: self.debug,
-                debug_format: self.debug_format,
-                debug_hooks: self.debug_hooks.clone(),
-                no_session_index: self.no_session_index,
-            },
+            debug_flags: debug_flags.clone(),
         };
         // If --resume was passed, load the saved history into the
         // session context before the user starts chatting.
@@ -732,8 +753,18 @@ async fn build_runner(
         models,
         default_params.clone(),
     )?;
-    let sink = super::build_debug_sink(&role_id, debug_flags);
+    // Use the canonical session_id (from the ChatLog file stem in chat,
+    // synthesized for discuss) — NOT the role_id. The role_id is what
+    // each runner does, but the session_id is what groups every
+    // TraceMeta emitted in this session so chat log / trace JSONL /
+    // session idx all share the same stem per spec §9.
+    let sink = super::build_debug_sink(&debug_flags.session_id, debug_flags);
     let hooks = super::build_debug_hooks(debug_flags);
+    // with_session_id flows into every TraceMeta the runner emits —
+    // without this the emitted events default to `session_id = ""`
+    // and the JsonlSink / IndexSink records can't be cross-referenced
+    // back to the chat log or session directory.
+    let with_session = |r: AgentRunner| r.with_session_id(debug_flags.session_id.clone());
     let runner = if !role.allowed_tools.is_empty() {
         let tm = build_tool_manager(&role.allowed_tools).await
             .map_err(|e| format!("tool setup failed: {}", e))?;
@@ -754,19 +785,29 @@ async fn build_runner(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
-            Arc::new(latte_agent_core::trace::NullSink),
+            // Pass the manager's real sink through — without this every
+            // specialist's HookFired / ToolExec / TurnEnd event was
+            // emitted to NullSink and never reached stdout / jsonl /
+            // the session index. The ScopedSink inside the delegate
+            // handler wraps this so specialist events get the right
+            // `role` field for the trace consumer.
+            Arc::clone(&sink),
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
-        AgentRunner::new_with_tools(agent, tm, 16)
-            .with_sink(Arc::clone(&sink))
-            .with_hooks(Arc::clone(&hooks))
-            .with_role(role_id)
+        with_session(
+            AgentRunner::new_with_tools(agent, tm, 16)
+                .with_sink(Arc::clone(&sink))
+                .with_hooks(Arc::clone(&hooks))
+                .with_role(role_id)
+        )
     } else {
-        AgentRunner::new(agent)
-            .with_sink(Arc::clone(&sink))
-            .with_hooks(Arc::clone(&hooks))
-            .with_role(role_id)
+        with_session(
+            AgentRunner::new(agent)
+                .with_sink(Arc::clone(&sink))
+                .with_hooks(Arc::clone(&hooks))
+                .with_role(role_id)
+        )
     };
     Ok((runner, role_id.to_string()))
 }

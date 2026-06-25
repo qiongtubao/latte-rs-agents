@@ -79,6 +79,13 @@ pub struct DebugFlags {
     pub debug_format: DebugFormat,
     pub debug_hooks: Vec<String>,
     pub no_session_index: bool,
+    /// Canonical session id for this run. For chat it's the stem of
+    /// the per-session ChatLog file (`chat-YYYYMMDD-HHMMSS-<pid>`),
+    /// so the trace JSONL, session idx, and chat log all share a
+    /// stem and can be cross-referenced per spec §9. For discuss
+    /// it's a synthesized `discuss-...` id. Threaded through every
+    /// `TraceMeta.session_id` emitted by the runner.
+    pub session_id: String,
 }
 
 fn latte_dir() -> PathBuf {

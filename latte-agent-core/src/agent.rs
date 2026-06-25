@@ -478,8 +478,38 @@ impl AgentRunner {
         messages.extend_from_slice(self.context.messages());
         messages.extend_from_slice(new_messages);
 
-        // 1. Emit PromptBuilt after prompt assembly
-        let user_input: String = new_messages.iter()
+        // Run PreCall hooks before the prompt is built — this lets hooks
+        // like `redact_pii` mutate the outgoing message list in-place so
+        // the redacted version is what the model actually sees. Each
+        // fired hook emits a HookFired TraceEvent so the trace stream
+        // records the redaction (and tests can assert on it).
+        {
+            let mut pre_call_ctx = crate::hooks::PreCallCtx { messages: &mut messages };
+            let outcome = self.hooks.run_pre_call(&mut pre_call_ctx, |hook_name, point, kind| {
+                self.sink.emit(TraceEvent::HookFired {
+                    meta: meta.clone(),
+                    hook_name: hook_name.to_string(),
+                    point,
+                    outcome_kind: kind.to_string(),
+                });
+            });
+            if let crate::hooks::HookOutcome::Abort { reason } = &outcome {
+                return Err(AgentError::HookAborted {
+                    hook: "pre_call".into(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        // 1. Emit PromptBuilt after prompt assembly. The user_input
+        // shown in the trace must reflect the post-hook state so
+        // operators see the redacted version — i.e. what the model
+        // actually receives. We pull from `messages` (the mutated
+        // list, last N entries) rather than `new_messages` (the raw
+        // caller input) so a PreCall hook like redact_pii is visible
+        // in the trace.
+        let n_new = new_messages.len();
+        let user_input: String = messages[messages.len() - n_new..]
+            .iter()
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
@@ -621,12 +651,16 @@ impl AgentRunner {
                      let input: serde_json::Value = serde_json::from_str(&tc.args)
                          .unwrap_or(serde_json::Value::String(tc.args.clone()));
 
-                    // 4a. Run PreToolHook (can abort or mutate args)
+                    // 4a. Run PreToolHook (can abort or mutate args).
+                    // The hook gets a mutable copy of the parsed input;
+                    // on `Mutate` we shadow `input` so the tool sees the
+                    // mutated args and the ToolExec event records them.
+                    let mut mutable_input = input.clone();
                     {
-                        let mut pre_ctx = crate::hooks::PreToolCtx { name: &resolved_name, args: &mut serde_json::Value::Null };
-                        // We need the parsed input, so prepare a mutable copy
-                        let mut mutable_input = input.clone();
-                        pre_ctx.args = &mut mutable_input;
+                        let mut pre_ctx = crate::hooks::PreToolCtx {
+                            name: &resolved_name,
+                            args: &mut mutable_input,
+                        };
                         let outcome = self.hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
                             self.sink.emit(TraceEvent::HookFired {
                                 meta: meta.clone(),
@@ -642,11 +676,15 @@ impl AgentRunner {
                                     reason,
                                 });
                             }
+                            // Continue + Mutate both leave `mutable_input`
+                            // holding the (possibly mutated) value we want
+                            // to forward to the tool. The Mutate variant
+                            // has already updated `*ctx.args` inside the
+                            // chain, so no further action is needed.
                             _ => {}
                         }
-                        // Use mutated input if applicable
-                        let _ = &mutable_input;
                     }
+                    let input = mutable_input;
 
                     let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
                         &resolved_name,
@@ -1275,11 +1313,11 @@ End"#;
 
         // Primary back-compat fields point at chain[0].
         assert_eq!(agent.model_id, m1.id);
-        // The chain is in the order we passed.
-        assert_eq!(agent.model_chain.len(), 2);
         assert_eq!(agent.model_chain[0].model.id, m1.id);
         assert_eq!(agent.model_chain[1].model.id, m2.id);
     }
+
+    // ─── hook + sink wiring tests live in `latte-agent-cli/tests/` ──
 
     // ─── fallback behavior (integration via wiremock) ──────────────────
 

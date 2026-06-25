@@ -99,6 +99,26 @@ impl DiscussCmd {
         let default_params = GenerateParams::default();
         let mut agents: HashMap<String, AgentRunner> = HashMap::new();
 
+        // Synthesize a session_id for this discussion. Discuss has no
+        // per-session ChatLog file to anchor on (it's not the REPL path),
+        // so we mint a `discuss-YYYYMMDD-HHMMSS-PID` id that follows
+        // the same shape as the chat session ids and so lines up with
+        // `~/.latte/sessions/<id>.idx` and `~/.latte/traces/<id>.jsonl`.
+        // One id for the whole discussion, shared across every role's
+        // runner, so all events from the discussion correlate.
+        let session_id: String = format!(
+            "discuss-{}-{}",
+            chat_timestamp_compact(),
+            std::process::id(),
+        );
+        let debug_flags = super::DebugFlags {
+            debug: self.debug,
+            debug_format: self.debug_format,
+            debug_hooks: self.debug_hooks.clone(),
+            no_session_index: self.no_session_index,
+            session_id: session_id.clone(),
+        };
+
         for role_name in &self.roles {
             let template = merged
                 .roles
@@ -112,19 +132,17 @@ impl DiscussCmd {
             let models = resolver.resolve_chain(&role.id, tier, &role.model_chain)?;
             let model_id = models[0].id.clone();
 
-            let debug_flags = super::DebugFlags {
-                debug: self.debug,
-                debug_format: self.debug_format,
-                debug_hooks: self.debug_hooks.clone(),
-                no_session_index: self.no_session_index,
-            };
-            let sink = super::build_debug_sink(role_name, &debug_flags);
+            // Pass the orchestrator's session_id, not the role_name, so
+            // all events from this discussion land in the same trace
+            // file and session index.
+            let sink = super::build_debug_sink(&debug_flags.session_id, &debug_flags);
             let hooks = super::build_debug_hooks(&debug_flags);
             let agent = Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
             let runner = AgentRunner::new(agent)
                 .with_sink(sink)
                 .with_hooks(hooks)
-                .with_role(role_name.clone());
+                .with_role(role_name.clone())
+                .with_session_id(debug_flags.session_id.clone());
 
             agents.insert(role_name.clone(), runner);
             println!("  {} ({}) → {}", role_name, template.model_tier, model_id);
@@ -219,4 +237,97 @@ fn build_cli_overrides(cmd: &DiscussCmd) -> Result<CliOverrides, String> {
         out.field_overrides.push((id, field, value));
     }
     Ok(out)
+}
+
+/// Format the current UTC time as `YYYYMMDD-HHMMSS` (compact form, no
+/// separators). Used to mint the discuss session_id so it matches the
+/// shape of the chat log's file stem. We avoid pulling chrono in; this
+/// is good enough for trace-file naming and is sortable
+/// lexicographically. Mirrors `chatlog::iso_local_date_time` so the
+/// two commands produce visually similar timestamps.
+fn chat_timestamp_compact() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = epoch_to_ymdhms(secs);
+    format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, mo, d, h, mi, s)
+}
+
+/// Tiny proleptic-Gregorian epoch-to-calendar converter. Lifted
+/// verbatim from `chatlog::epoch_to_ymdhms` because discuss doesn't
+/// open a chat log file (so it can't borrow it from there) and the
+/// logic is small enough to duplicate.
+fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = (secs % 60) as u32;
+    let mins = (secs / 60) as u32;
+    let mi = mins % 60;
+    let hours = mins / 60;
+    let h = hours % 24;
+    let mut days = (hours / 24) as i64;
+    let mut year = 1970i64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let dy = if leap { 366 } else { 365 };
+        if days >= dy {
+            days -= dy;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+    let month_lens = [31, 28, 31, 30, 31, 30, 31, 31, 31, 30, 31, 30];
+    let mut month = 0usize;
+    while month < 12 {
+        let ml = if month == 1 && is_leap(year) { 29 } else { month_lens[month] };
+        if days >= ml {
+            days -= ml;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+    (year as u32, month as u32 + 1, days as u32 + 1, h, mi, s)
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn epoch_zero_is_1970_01_01_00_00_00() {
+        assert_eq!(super::epoch_to_ymdhms(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn epoch_one_day_is_1970_01_02() {
+        assert_eq!(super::epoch_to_ymdhms(86_400), (1970, 1, 2, 0, 0, 0));
+    }
+
+    #[test]
+    fn epoch_one_year_is_1971() {
+        // 1970 is not a leap year; 365 * 86400 = 31_536_000.
+        assert_eq!(super::epoch_to_ymdhms(31_536_000), (1971, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn leap_year_handling() {
+        // 1972 is a leap year; 1971-01-01 + 365d = 1972-01-01 (we went
+        // through the leap day, so it should still be Jan 1).
+        assert_eq!(super::epoch_to_ymdhms(63_072_000), (1972, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn chat_timestamp_compact_has_expected_shape() {
+        let s = super::chat_timestamp_compact();
+        assert_eq!(s.len(), 15); // YYYYMMDD-HHMMSS
+        assert_eq!(s.as_bytes()[8], b'-');
+        for (i, c) in s.chars().enumerate() {
+            if i == 8 { continue; }
+            assert!(c.is_ascii_digit(), "expected digit at position {} in {}", i, s);
+        }
+    }
 }
