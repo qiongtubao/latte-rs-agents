@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// Per-event metadata. Carried on every `TraceEvent`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceMeta {
     pub turn: u32,
     pub role: String, // "manager", "programmer", ...
@@ -25,12 +25,77 @@ impl TraceMeta {
             session_id: "test-session".into(),
         }
     }
+
+    /// Build a `TraceMeta` with the current UTC timestamp.
+    /// Used by the agent runtime so emitted events carry a usable
+    /// ISO8601 `ts` for timeline display (e.g. `latte-agent debug
+    /// trace`). The `turn` is supplied by the caller because the
+    /// runner increments it turn-by-turn.
+    pub fn now(turn: u32, role: impl Into<String>, session_id: impl Into<String>) -> Self {
+        Self {
+            turn,
+            role: role.into(),
+            ts: iso8601_utc_now(),
+            session_id: session_id.into(),
+        }
+    }
 }
 
+/// Format the current UTC time as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled
+/// (no `chrono` dep) so the trace module stays stdlib + serde +
+/// parking_lot. Good enough for `latte-agent debug trace` timeline
+/// display; not designed for sub-second precision or timezone math.
+fn iso8601_utc_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = epoch_to_ymdhms(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
+}
+
+/// Convert a Unix-epoch second count to a `(year, month, day, h, m, s)`
+/// tuple in UTC. Proleptic-Gregorian, correct for every timestamp we
+/// care about in 2026.
+fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let s = (secs % 60) as u32;
+    let mins = (secs / 60) as u32;
+    let mi = mins % 60;
+    let hours = mins / 60;
+    let h = hours % 24;
+    let mut days = (hours / 24) as i64;
+    let mut year = 1970i64;
+    loop {
+        let leap = is_leap(year);
+        let dy = if leap { 366 } else { 365 };
+        if days >= dy {
+            days -= dy;
+            year += 1;
+        } else {
+            break;
+        }
+    }
+    let month_lens = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 0usize;
+    while month < 12 {
+        let ml = if month == 1 && is_leap(year) { 29 } else { month_lens[month] };
+        if days >= ml {
+            days -= ml;
+            month += 1;
+        } else {
+            break;
+        }
+    }
+    (year as u32, month as u32 + 1, days as u32 + 1, h, mi, s)
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
 /// Trace event emitted by the agent runtime. Carries metadata plus a
 /// payload that varies per variant. 9 variants cover the full
-/// run_turn lifecycle (Task 10 wires the emit/hook call sites).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
     SessionStart {
         meta: TraceMeta,
@@ -293,7 +358,7 @@ impl TraceEvent {
     }
 }
 
-#[derive(Debug, serde::Serialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct IndexLine {
     pub turn: u32,
     pub ts: String,
@@ -307,20 +372,45 @@ pub struct IndexLine {
     pub detail: String,
 }
 
-/// Writes a human-readable multi-line pretty form to a `Write` impl.
-/// `use_color` is set by the caller based on `IsTerminal`.
+/// Writes a human-readable multi-line pretty form (default) or
+/// raw JSONL (one event per line) to a `Write` impl. The mode is
+/// chosen at construction so the format is stable for the lifetime
+/// of the sink — output never flips mid-stream.
+///
+/// `pretty=true` is the default: multi-line, optionally colorized
+/// when `use_color` is also true and the writer is a TTY. This is
+/// what `latte-agent chat --debug` uses.
+///
+/// `pretty=false` is the JSONL mode: one `serde_json::to_string`
+/// per event, newline-terminated. This is what
+/// `latte-agent chat --debug --debug-format jsonl` selects so
+/// downstream tools (jq, ripgrep, the future `latte-agent debug
+/// replay`) can read the stream.
 pub struct StdoutSink {
     writer: parking_lot::Mutex<Box<dyn std::io::Write + Send>>,
+    pretty: bool,
     #[allow(dead_code)] // wired up in a later task when the color path lands
     use_color: bool,
 }
 
 impl StdoutSink {
+    /// Construct a pretty sink bound to stdout. `use_color` is
+    /// honored when the writer is a TTY.
     pub fn new(use_color: bool) -> Self {
-        Self { writer: parking_lot::Mutex::new(Box::new(std::io::stdout())), use_color }
+        Self { writer: parking_lot::Mutex::new(Box::new(std::io::stdout())), pretty: true, use_color }
     }
+    /// Construct a pretty sink with a caller-supplied writer.
     pub fn with_writer(w: impl std::io::Write + Send + 'static, use_color: bool) -> Self {
-        Self { writer: parking_lot::Mutex::new(Box::new(w)), use_color }
+        Self { writer: parking_lot::Mutex::new(Box::new(w)), pretty: true, use_color }
+    }
+    /// Construct a JSONL sink bound to stdout. Each emitted event
+    /// is one JSON object per line; `use_color` is ignored.
+    pub fn new_jsonl() -> Self {
+        Self { writer: parking_lot::Mutex::new(Box::new(std::io::stdout())), pretty: false, use_color: false }
+    }
+    /// Construct a JSONL sink with a caller-supplied writer.
+    pub fn with_writer_jsonl(w: impl std::io::Write + Send + 'static) -> Self {
+        Self { writer: parking_lot::Mutex::new(Box::new(w)), pretty: false, use_color: false }
     }
 }
 
@@ -328,12 +418,17 @@ impl TraceSink for StdoutSink {
     fn emit(&self, event: TraceEvent) {
         use std::io::Write;
         let mut guard = self.writer.lock();
-        let _ = writeln!(guard, "─── turn {} · role={} · session={} · {} ───",
-            event.meta().turn, event.meta().role, event.meta().session_id, event.meta().ts);
-        let _ = writeln!(guard, "[{}]", event.variant_name());
-        let body = event.body_for_pretty();
-        for line in body.lines() {
-            let _ = writeln!(guard, "  {}", line);
+        if self.pretty {
+            let _ = writeln!(guard, "─── turn {} · role={} · session={} · {} ───",
+                event.meta().turn, event.meta().role, event.meta().session_id, event.meta().ts);
+            let _ = writeln!(guard, "[{}]", event.variant_name());
+            let body = event.body_for_pretty();
+            for line in body.lines() {
+                let _ = writeln!(guard, "  {}", line);
+            }
+        } else {
+            let json = serde_json::to_string(&event).expect("TraceEvent serialization");
+            let _ = writeln!(guard, "{}", json);
         }
         let _ = guard.flush();
     }

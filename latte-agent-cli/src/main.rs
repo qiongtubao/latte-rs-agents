@@ -4,12 +4,16 @@
 //!   latte-agent discuss --topic "Design REST API" --roles pm,architect,programmer
 //!   latte-agent list roles
 //!   latte-agent config show
+//!   latte-agent debug <subcommand>   # offline inspection of recorded sessions
 
 use clap::{Parser, Subcommand};
 
 mod commands;
 
-use commands::{chat::ChatCmd, config::ConfigCmd, discuss::DiscussCmd, list::ListCmd, workflow::WorkflowCmd};
+use commands::{
+    chat::ChatCmd, config::ConfigCmd, debug::DebugCmd, discuss::DiscussCmd,
+    list::ListCmd, workflow::WorkflowCmd,
+};
 
 #[derive(Parser)]
 #[command(name = "latte-agent", version, about = "Multi-role agent discussion system")]
@@ -26,9 +30,12 @@ enum Command {
     Workflow(WorkflowCmd),
     List(ListCmd),
     Config(ConfigCmd),
+    /// Offline inspection of recorded sessions, prompts, parser, and hooks
+    Debug(DebugCmd),
 }
+
 #[tokio::main]
- async fn main() {
+async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -37,6 +44,7 @@ enum Command {
         Command::Workflow(cmd) => cmd.run().await,
         Command::List(cmd) => cmd.run().await,
         Command::Config(cmd) => cmd.run().await,
+        Command::Debug(cmd) => cmd.run().await,
     };
     if let Err(e) = result {
         eprintln!("Error: {}", e);

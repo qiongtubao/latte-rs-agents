@@ -373,8 +373,13 @@ pub struct AgentRunner {
     hooks: Arc<crate::hooks::HookChain>,
     /// Role identifier for this runner.
     role_id: String,
+    /// Session id for this runner. Filled in by the CLI so events
+    /// emitted by this runner can be cross-referenced with the
+    /// matching `~/.latte/sessions/<id>.idx` and
+    /// `~/.latte/traces/<id>.jsonl` files. Empty string when the
+    /// runner was built without an explicit id (test paths).
+    session_id: String,
 }
-
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
     pub fn new(agent: Agent) -> Self {
@@ -387,6 +392,7 @@ impl AgentRunner {
             sink: Arc::new(crate::trace::NullSink),
             hooks: Arc::new(crate::hooks::HookChain::empty()),
             role_id: "default".to_string(),
+            session_id: String::new(),
         }
     }
 
@@ -404,6 +410,7 @@ impl AgentRunner {
             sink: Arc::new(crate::trace::NullSink),
             hooks: Arc::new(crate::hooks::HookChain::empty()),
             role_id: "default".to_string(),
+            session_id: String::new(),
         }
     }
 
@@ -417,6 +424,7 @@ impl AgentRunner {
             sink: Arc::new(crate::trace::NullSink),
             hooks: Arc::new(crate::hooks::HookChain::empty()),
             role_id: "default".to_string(),
+            session_id: String::new(),
         }
     }
     /// Set the max tool-call round trips per turn.
@@ -458,12 +466,7 @@ impl AgentRunner {
     ) -> AgentResult<String> {
         use crate::trace::{HookPoint, ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
-        let meta = TraceMeta {
-            turn: 0,
-            role: self.role_id.clone(),
-            ts: String::new(),
-            session_id: String::new(),
-        };
+        let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
 
         let default_vars = serde_json::json!({});
         let vars = system_vars.unwrap_or(&default_vars);
@@ -807,6 +810,15 @@ impl AgentRunner {
         self
     }
 
+    /// Set the session identifier. The id flows into every emitted
+    /// `TraceMeta.session_id` so CLI tooling can correlate events
+    /// with the matching `~/.latte/sessions/<id>.idx` /
+    /// `~/.latte/traces/<id>.jsonl` files.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
+    }
+
     // ── Accessors ───────────────────────────────────────────────────────────
 
     /// Get the trace sink.
@@ -903,6 +915,41 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     }
 
     results
+}
+/// Public, structured wrapper around the private [`extract_tool_calls`].
+/// Returns the parsed calls together with parse diagnostics so the CLI
+/// `debug parse` / `debug replay` subcommands can report what the
+/// parser saw in a model output (or any other text).
+///
+/// `opens_found` is the count of `<tool_call` substrings in `text`.
+/// `closes_matched` is the number of well-formed calls the parser
+/// extracted. `opens_found - closes_matched` is the number of opens
+/// that had no matching close; their raw text is collected (up to
+/// 40 chars per slice) into `unmatched_opens` for diagnostic display.
+pub fn parse_tool_calls(text: &str) -> (Vec<crate::trace::ParsedCall>, crate::trace::ParseDiag) {
+    use crate::trace::{ParseDiag, ParsedCall};
+    let opens_found = text.matches("<tool_call").count() as u32;
+    let raw = extract_tool_calls(text);
+    let parsed: Vec<ParsedCall> = raw.iter()
+        .map(|tc| ParsedCall { name: tc.name.clone(), args: tc.args.clone() })
+        .collect();
+    let closes_matched = parsed.len() as u32;
+    let unmatched = opens_found.saturating_sub(closes_matched);
+    let mut unmatched_opens: Vec<String> = Vec::new();
+    if unmatched > 0 {
+        // Take the LAST `unmatched` opens — those are the ones
+        // `extract_tool_calls` couldn't close. Earlier opens were
+        // already paired with their close tag and consumed.
+        let positions: Vec<(usize, &str)> = text.match_indices("<tool_call").collect();
+        for &(pos, _) in positions.iter().rev().take(unmatched as usize) {
+            let end = text[pos..]
+                .find(|c: char| c.is_whitespace() || c == '>' || c == '\n')
+                .map(|p| pos + p)
+                .unwrap_or(text.len().min(pos + 40));
+            unmatched_opens.push(text[pos..end].to_string());
+        }
+    }
+    (parsed, ParseDiag { opens_found, closes_matched, unmatched_opens })
 }
 
 
