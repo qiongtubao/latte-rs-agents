@@ -200,7 +200,11 @@ pub struct IndexSink {
 
 impl IndexSink {
     pub fn new(path: PathBuf) -> Self {
-        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                panic!("IndexSink: failed to create parent dir {}: {}", parent.display(), e);
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .create(true).append(true).open(&path)
             .expect("IndexSink open");
@@ -216,7 +220,7 @@ impl TraceSink for IndexSink {
         let index = event.to_index_line();
         if let Some(line) = index {
             let json = serde_json::to_string(&line).expect("index serialization");
-            let _ = writeln!(guard, "{}", json);
+writeln!(guard, "{}", json).expect("IndexSink write");
         }
     }
 }
