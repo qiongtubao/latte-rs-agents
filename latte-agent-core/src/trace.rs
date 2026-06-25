@@ -3,8 +3,11 @@
 //! See `docs/superpowers/specs/2026-06-25-latte-agent-debug-observability-design.md`
 //! for the design.
 
+use std::path::PathBuf;
+use serde::Serialize;
+
 /// Per-event metadata. Carried on every `TraceEvent`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TraceMeta {
     pub turn: u32,
     pub role: String, // "manager", "programmer", ...
@@ -26,7 +29,7 @@ impl TraceMeta {
 
 /// Trace event emitted by the agent runtime. Only the minimal skeleton
 /// variants are defined here; the full 9-variant enum populates in Task 4.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum TraceEvent {
     SessionStart {
         meta: TraceMeta,
@@ -56,6 +59,42 @@ pub struct NullSink;
 impl TraceSink for NullSink {
     #[inline]
     fn emit(&self, _event: TraceEvent) {}
+}
+
+/// Writes each event as one JSON object per line. Thread-safe; uses
+/// an internal Mutex<BufWriter> so concurrent emit() calls don't
+/// interleave bytes.
+pub struct JsonlSink {
+    inner: parking_lot::Mutex<std::io::BufWriter<std::fs::File>>,
+    path: PathBuf,
+}
+
+impl JsonlSink {
+    pub fn new(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("JsonlSink: failed to open trace file");
+        Self {
+            inner: parking_lot::Mutex::new(std::io::BufWriter::new(file)),
+            path,
+        }
+    }
+    pub fn path(&self) -> &PathBuf { &self.path }
+}
+
+impl TraceSink for JsonlSink {
+    fn emit(&self, event: TraceEvent) {
+        use std::io::Write;
+        let mut guard = self.inner.lock();
+        let json = serde_json::to_string(&event)
+            .expect("TraceEvent serialization");
+        writeln!(guard, "{}", json).expect("JsonlSink write");
+    }
 }
 
 #[cfg(test)]
@@ -106,5 +145,31 @@ mod tests {
             total_thinking: 6,
         });
         assert_eq!(s.drain().len(), 2);
+    }
+
+    #[test]
+    fn jsonl_sink_writes_one_line_per_event() {
+        let dir = std::env::temp_dir().join(format!("latte-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trace.jsonl");
+        let sink = JsonlSink::new(path.clone());
+        sink.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
+        });
+        sink.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 2, total_input: 100, total_output: 200, total_thinking: 5,
+        });
+        drop(sink);  // flush BufWriter
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 JSONL lines, got: {:?}", content);
+        // Each line must be valid JSON with a "SessionEnd" key
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(v.get("SessionEnd").is_some(), "line missing SessionEnd: {}", line);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
