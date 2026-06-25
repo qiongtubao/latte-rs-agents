@@ -761,12 +761,12 @@ async fn build_runner(
         AgentRunner::new_with_tools(agent, tm, 16)
             .with_sink(Arc::clone(&sink))
             .with_hooks(Arc::clone(&hooks))
-            .with_role(role_id.clone())
+            .with_role(role_id)
     } else {
         AgentRunner::new(agent)
             .with_sink(Arc::clone(&sink))
             .with_hooks(Arc::clone(&hooks))
-            .with_role(role_id.clone())
+            .with_role(role_id)
     };
     Ok((runner, role_id.to_string()))
 }
