@@ -464,7 +464,7 @@ impl AgentRunner {
         new_messages: &[Message],
         system_vars: Option<&serde_json::Value>,
     ) -> AgentResult<String> {
-        use crate::trace::{HookPoint, ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
+        use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
 
