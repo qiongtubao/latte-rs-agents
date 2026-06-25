@@ -99,6 +99,169 @@ impl TraceSink for JsonlSink {
     }
 }
 
+impl TraceEvent {
+    pub fn meta(&self) -> &TraceMeta {
+        match self {
+            TraceEvent::SessionStart { meta, .. } | TraceEvent::SessionEnd { meta, .. } => meta,
+        }
+    }
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            TraceEvent::SessionStart { .. } => "SessionStart",
+            TraceEvent::SessionEnd { .. } => "SessionEnd",
+        }
+    }
+    /// Multi-line body for the StdoutSink pretty form. For Task 3
+    /// only the 2 existing variants are populated; Task 4 will add
+    /// arms for the other 7 variants.
+    pub fn body_for_pretty(&self) -> String {
+        match self {
+            TraceEvent::SessionStart { tier, model_chain, allowed_tools, .. } =>
+                format!("tier={} model_chain={:?} tools={:?}", tier, model_chain, allowed_tools),
+            TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } =>
+                format!("turns={} in={} out={} think={}", total_turns, total_input, total_output, total_thinking),
+        }
+    }
+    /// Metadata-only projection for IndexSink. Returns None for
+    /// events that have no indexable information. For Task 3 only
+    /// the 2 existing variants are populated; Task 4 will add
+    /// arms for the other 7 variants.
+    pub fn to_index_line(&self) -> Option<IndexLine> {
+        let meta = self.meta();
+        Some(match self {
+            TraceEvent::SessionStart { tier, model_chain, allowed_tools, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "SessionStart".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("tier={} chain_len={} tools={}", tier, model_chain.len(), allowed_tools.len()),
+            },
+            TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "SessionEnd".into(),
+                model_id: None, latency_ms: None, tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
+                detail: format!("turns={}", total_turns),
+            },
+        })
+    }
+}
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct IndexLine {
+    pub turn: u32,
+    pub ts: String,
+    pub role: String,
+    pub kind: String,
+    pub model_id: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+    pub tokens_think: Option<u32>,
+    pub detail: String,
+}
+
+/// Writes a human-readable multi-line pretty form to a `Write` impl.
+/// `use_color` is set by the caller based on `IsTerminal`.
+pub struct StdoutSink {
+    writer: parking_lot::Mutex<Box<dyn std::io::Write + Send>>,
+    #[allow(dead_code)] // wired up in a later task when the color path lands
+    use_color: bool,
+}
+
+impl StdoutSink {
+    pub fn new(use_color: bool) -> Self {
+        Self { writer: parking_lot::Mutex::new(Box::new(std::io::stdout())), use_color }
+    }
+    pub fn with_writer(w: impl std::io::Write + Send + 'static, use_color: bool) -> Self {
+        Self { writer: parking_lot::Mutex::new(Box::new(w)), use_color }
+    }
+}
+
+impl TraceSink for StdoutSink {
+    fn emit(&self, event: TraceEvent) {
+        use std::io::Write;
+        let mut guard = self.writer.lock();
+        let _ = writeln!(guard, "─── turn {} · role={} · session={} · {} ───",
+            event.meta().turn, event.meta().role, event.meta().session_id, event.meta().ts);
+        let _ = writeln!(guard, "[{}]", event.variant_name());
+        let body = event.body_for_pretty();
+        for line in body.lines() {
+            let _ = writeln!(guard, "  {}", line);
+        }
+        let _ = guard.flush();
+    }
+}
+
+/// Always-on metadata-only index. Strips content fields to keep the
+/// index small and safe for always-on writing.
+pub struct IndexSink {
+    inner: parking_lot::Mutex<std::io::BufWriter<std::fs::File>>,
+    path: PathBuf,
+}
+
+impl IndexSink {
+    pub fn new(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+        let file = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&path)
+            .expect("IndexSink open");
+        Self { inner: parking_lot::Mutex::new(std::io::BufWriter::new(file)), path }
+    }
+    pub fn path(&self) -> &PathBuf { &self.path }
+}
+
+impl TraceSink for IndexSink {
+    fn emit(&self, event: TraceEvent) {
+        use std::io::Write;
+        let mut guard = self.inner.lock();
+        let index = event.to_index_line();
+        if let Some(line) = index {
+            let json = serde_json::to_string(&line).expect("index serialization");
+            let _ = writeln!(guard, "{}", json);
+        }
+    }
+}
+
+/// Routes a single emit to N child sinks in order. Each child runs in
+/// the caller's thread (no async/spawning); sink implementations are
+/// expected to be cheap or internally-thread-safe.
+pub struct FanoutSink { sinks: Vec<std::sync::Arc<dyn TraceSink>> }
+
+impl FanoutSink {
+    pub fn new(sinks: Vec<std::sync::Arc<dyn TraceSink>>) -> Self { Self { sinks } }
+    pub fn push(&mut self, s: std::sync::Arc<dyn TraceSink>) { self.sinks.push(s); }
+    pub fn children(&self) -> &[std::sync::Arc<dyn TraceSink>] { &self.sinks }
+}
+
+impl TraceSink for FanoutSink {
+    fn emit(&self, event: TraceEvent) {
+        for s in &self.sinks {
+            s.emit(event.clone());
+        }
+    }
+}
+
+/// Wraps another sink and overrides the `role` field on every event.
+/// Used by `register_delegate_tool` to tag specialist events with the
+/// specialist's role id without the caller having to remember.
+pub struct ScopedSink {
+    inner: std::sync::Arc<dyn TraceSink>,
+    role: String,
+}
+
+impl ScopedSink {
+    pub fn new(inner: std::sync::Arc<dyn TraceSink>, role: String) -> Self { Self { inner, role } }
+}
+
+impl TraceSink for ScopedSink {
+    fn emit(&self, mut event: TraceEvent) {
+        match &mut event {
+            TraceEvent::SessionStart { meta, .. } | TraceEvent::SessionEnd { meta, .. } => {
+                meta.role = self.role.clone();
+            }
+        }
+        self.inner.emit(event);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +423,84 @@ mod tests {
             .expect("second line not valid JSON");
         assert!(v.get("SessionEnd").is_some(), "second line missing SessionEnd: {}", lines[1]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn stdout_sink_writes_to_writer() {
+        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let writer = StdoutSinkWriter(buf.clone());
+        let sink = StdoutSink::with_writer(writer, false /* no color */);
+        sink.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
+        });
+        let out = String::from_utf8(buf.lock().clone()).unwrap();
+        assert!(out.contains("SessionEnd"), "missing variant: {}", out);
+        assert!(out.contains("test-session"), "missing session_id: {}", out);
+    }
+
+    /// Test-only writer adapter so we can capture stdout in tests.
+    pub struct StdoutSinkWriter(pub std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for StdoutSinkWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn index_sink_strips_payload_fields() {
+        let dir = std::env::temp_dir().join(format!("latte-test-idx-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.idx");
+        let sink = IndexSink::new(path.clone());
+        let mut meta = TraceMeta::test_default();
+        meta.role = "manager".into();
+        // Note: ModelRawOut is NOT yet a variant (Task 4). For Task 3,
+        // use SessionEnd. The point is to confirm the index file does
+        // NOT include any raw content fields. We'll verify this in Task 4.
+        sink.emit(TraceEvent::SessionEnd {
+            meta,
+            total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
+        });
+        drop(sink);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("SessionEnd"));
+        assert!(content.contains("\"role\":\"manager\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fanout_sink_routes_to_all_children() {
+        let s1 = std::sync::Arc::new(VecSink(parking_lot::Mutex::new(vec![])));
+        let s2 = std::sync::Arc::new(VecSink(parking_lot::Mutex::new(vec![])));
+        let fan = FanoutSink::new(vec![s1.clone(), s2.clone()]);
+        fan.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 1, total_input: 1, total_output: 1, total_thinking: 0,
+        });
+        assert_eq!(s1.0.lock().len(), 1);
+        assert_eq!(s2.0.lock().len(), 1);
+    }
+
+    #[test]
+    fn scoped_sink_overrides_role() {
+        // Use a fresh local VecSink; the test-only VecSink has pub inner field
+        let inner = std::sync::Arc::new(VecSink(parking_lot::Mutex::new(vec![])));
+        let scoped = ScopedSink::new(inner.clone(), "programmer".into());
+        let mut meta = TraceMeta::test_default();
+        meta.role = "WRONG".into();
+        scoped.emit(TraceEvent::SessionEnd {
+            meta,
+            total_turns: 1, total_input: 1, total_output: 1, total_thinking: 0,
+        });
+        let captured = inner.0.lock();
+        assert_eq!(captured.len(), 1);
+        match &captured[0] {
+            TraceEvent::SessionEnd { meta, .. } => {
+                assert_eq!(meta.role, "programmer", "scoped sink did not override role");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
