@@ -156,6 +156,13 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 /// Split a line into tokens, preserving ANSI escape sequences as their own
 /// zero-width tokens so wrapping doesn't break them.
 fn split_tokens(line: &str) -> Vec<String> {
+    // Token = either an ANSI escape sequence ([..m) or a maximal
+    // run of non-whitespace, non-escape chars. Whitespace is a
+    // word boundary: it gets dropped (wrap_line inserts the join
+    // space) and the current word token is flushed first. This
+    // is what `wrap_line` needs to actually wrap — without the
+    // whitespace split, the entire line would be one giant token
+    // and width>line-width would never trigger a break.
     let mut tokens = Vec::new();
     let mut buf = String::new();
     let mut chars = line.chars().peekable();
@@ -172,6 +179,12 @@ fn split_tokens(line: &str) -> Vec<String> {
                 }
             }
             tokens.push(std::mem::take(&mut buf));
+        } else if c.is_whitespace() {
+            if !buf.is_empty() {
+                tokens.push(std::mem::take(&mut buf));
+            }
+            // whitespace itself is dropped — wrap_line joins
+            // adjacent tokens with a single space.
         } else {
             buf.push(c);
         }
