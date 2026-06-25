@@ -452,6 +452,60 @@ impl AgentRunner {
         &self.total_usage
     }
 
+    /// Emit a `SessionStart` trace event. Call once at session
+    /// initialization, before the first `run_turn`. Carries the
+    /// runner's identity (role, session id) and the configured
+    /// model chain + tool allowlist so the trace can be replayed
+    /// end-to-end without re-reading config. Turn is always 0
+    /// because this precedes the first turn.
+    pub fn emit_session_start(&self, tier: &str) {
+        let meta = crate::trace::TraceMeta::now(
+            0,
+            self.role_id.clone(),
+            self.session_id.clone(),
+        );
+        let model_chain: Vec<String> = self
+            .agent
+            .model_chain
+            .iter()
+            .map(|mc| mc.model.id.clone())
+            .collect();
+        let allowed_tools: Vec<String> = self
+            .agent
+            .role
+            .allowed_tools
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        self.sink.emit(crate::trace::TraceEvent::SessionStart {
+            meta,
+            tier: tier.to_string(),
+            model_chain,
+            allowed_tools,
+        });
+    }
+
+    /// Emit a `SessionEnd` trace event. Call once at session
+    /// shutdown, after the last `run_turn`. `total_turns` is the
+    /// number of `run_turn` invocations the caller made (the
+    /// runner itself doesn't track turn count because it can be
+    /// reused across sessions). The three token counters come
+    /// straight from the runner's accumulated `total_usage`.
+    pub fn emit_session_end(&self, total_turns: u32) {
+        let meta = crate::trace::TraceMeta::now(
+            0,
+            self.role_id.clone(),
+            self.session_id.clone(),
+        );
+        self.sink.emit(crate::trace::TraceEvent::SessionEnd {
+            meta,
+            total_turns,
+            total_input: self.total_usage.input_tokens,
+            total_output: self.total_usage.output_tokens,
+            total_thinking: self.total_usage.thinking_tokens,
+        });
+    }
+
     /// Run one turn: process a user message and return the assistant's response.
     ///
     /// The turn builds a complete message list:
@@ -1655,5 +1709,145 @@ End"#;
             "should not have waited the full default 60s: {elapsed:?}"
         );
     }
-}
 
+    // HIGH 4: integration test for `run_turn` hook + sink wiring.
+    // Verifies the four review fixes from commit 93b8441 are
+    // actually end-to-end:
+    //   1. PreCall hook fires (redact_pii) and mutates messages
+    //   2. session_id flows through to TraceMeta
+    //   3. sink receives the expected event sequence
+    //
+    // Uses wiremock to stub the model API so no real network is hit.
+    // Uses Arc<VecSink> (concrete) so the test can lock the inner
+    // Mutex and read events back out.
+    #[tokio::test]
+    async fn test_run_turn_wires_hooks_and_sinks() {
+        use crate::trace::{HookPoint, TraceEvent, TraceSink};
+        // Local VecSink test helper (mirrors the one in trace::tests
+        // which is not pub-exported from the parent module).
+        struct LocalVecSink(parking_lot::Mutex<Vec<TraceEvent>>);
+        impl TraceSink for LocalVecSink {
+            fn emit(&self, e: TraceEvent) {
+                self.0.lock().push(e);
+            }
+        }
+        use crate::hooks::{Hook, HookChain, PreCallCtx, HookOutcome};
+        use std::sync::Arc;
+
+        // Stub model returns a plain text response (no tool calls).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let s = wiremock::MockServer::start().await;
+        s.register(
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200)
+                    .set_body_string(openai_completion_body("plain text reply"))),
+        )
+        .await;
+
+        // PreCall hook: redacts PII in user messages.
+        struct RedactPreCall;
+        impl Hook for RedactPreCall {
+            fn name(&self) -> &str { "redact_pre_call" }
+            fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
+                for m in ctx.messages.iter_mut() {
+                    if m.role == MsgRole::User {
+                        m.content = m.content.replace("13812345678", "<REDACTED>");
+                    }
+                }
+                HookOutcome::Continue
+            }
+        }
+
+        let sink = Arc::new(LocalVecSink(parking_lot::Mutex::new(vec![])));
+        let hooks: Arc<HookChain> = Arc::new(
+            HookChain::empty()
+                .push(Arc::new(RedactPreCall) as Arc<dyn Hook>)
+        );
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "wiring-test".into(),
+            role,
+            vec![model_at(&s, "stub-model")],
+            GenerateParams::default(),
+        ).unwrap();
+
+        let mut runner = AgentRunner::new(agent)
+            .with_sink(sink.clone() as Arc<dyn TraceSink>)
+            .with_hooks(hooks.clone())
+            .with_role(String::from("wiring-test"))
+            .with_session_id(String::from("integration-sess-1"));
+
+        // 1. Emit SessionStart and assert it lands in the sink.
+        runner.emit_session_start("standard");
+        {
+            let events = sink.0.lock();
+            assert!(matches!(&events[0], TraceEvent::SessionStart { .. }),
+                "first event should be SessionStart, got {:?}", events[0]);
+            if let TraceEvent::SessionStart { tier, model_chain, .. } = &events[0] {
+                assert_eq!(tier, "standard");
+                assert_eq!(model_chain, &["stub-model".to_string()]);
+            }
+            // session_id flows through to TraceMeta (bug 4 fix).
+            if let TraceEvent::SessionStart { meta, .. } = &events[0] {
+                assert_eq!(meta.session_id, "integration-sess-1");
+            }
+        }
+
+        // 2. Run a turn with PII in the input; redact hook should
+        //    mutate it, and PromptBuilt.user_input should reflect
+        //    the post-hook state.
+        let msgs = vec![Message {
+            role: MsgRole::User,
+            content: "call me at 13812345678 about it".to_string(),
+        }];
+        let resp = runner.run_turn(&msgs, None).await
+            .expect("run_turn should succeed against wiremock");
+        assert_eq!(resp, "plain text reply");
+
+        // 3. Sink should contain the expected event sequence.
+        let events = sink.0.lock();
+        let kinds: Vec<&'static str> = events.iter().map(|e| e.variant_name()).collect();
+        assert!(kinds.contains(&"SessionStart"), "missing SessionStart: {kinds:?}");
+        assert!(kinds.contains(&"HookFired"), "missing HookFired: {kinds:?}");
+        assert!(kinds.contains(&"PromptBuilt"), "missing PromptBuilt: {kinds:?}");
+        assert!(kinds.contains(&"ModelCall"), "missing ModelCall: {kinds:?}");
+        assert!(kinds.contains(&"ModelRawOut"), "missing ModelRawOut: {kinds:?}");
+        assert!(kinds.contains(&"ParseToolCalls"), "missing ParseToolCalls: {kinds:?}");
+        assert!(kinds.contains(&"TurnEnd"), "missing TurnEnd: {kinds:?}");
+
+        // 4. PreCall hook fired exactly once (bug 1 fix verified).
+        let pre_call_fires: usize = events.iter().filter(|e| {
+            matches!(e, TraceEvent::HookFired { point: HookPoint::PreCall, .. })
+        }).count();
+        assert_eq!(pre_call_fires, 1, "expected 1 PreCall HookFired, got {pre_call_fires}");
+
+        // 5. PromptBuilt's user_input is the post-hook (redacted)
+        //    message, NOT the original input. This is the visible
+        //    end-to-end proof that the PreCall hook mutation is
+        //    applied to the model call.
+        let prompt_built = events.iter().find_map(|e| {
+            if let TraceEvent::PromptBuilt { user_input, .. } = e {
+                Some(user_input.clone())
+            } else { None }
+        }).expect("PromptBuilt should be present");
+        assert!(prompt_built.contains("<REDACTED>"),
+            "PromptBuilt.user_input should be redacted, got: {prompt_built:?}");
+        assert!(!prompt_built.contains("13812345678"),
+            "PromptBuilt.user_input should not contain raw PII, got: {prompt_built:?}");
+
+        drop(events);
+
+        // 6. Emit SessionEnd and assert it lands in the sink.
+        runner.emit_session_end(1);
+        let events = sink.0.lock();
+        let last = events.last().expect("should have events");
+        assert!(matches!(last, TraceEvent::SessionEnd { .. }),
+            "last event should be SessionEnd, got {last:?}");
+        if let TraceEvent::SessionEnd { total_turns, .. } = last {
+            assert_eq!(*total_turns, 1u32);
+        }
+    }
+}

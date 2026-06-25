@@ -194,6 +194,12 @@ impl ChatCmd {
                 ("session_id", session_id.clone()),
             ],
         );
+        // Emit SessionStart trace event now that the runner is
+        // fully built. The sink + session_id were wired via
+        // build_runner earlier. `tier` is the initial_tier label
+        // (premium | standard | budget) so the trace carries the
+        // same model-tier metadata the chat log records.
+        runner.emit_session_start(&initial_tier.label());
         let mut session = ChatSession {
             merged,
             resolver,
@@ -204,6 +210,7 @@ impl ChatCmd {
             primary_id: self.model_id.clone(),
             log: Some(log),
             last_response: None,
+            turn_count: 0,
             debug_flags: debug_flags.clone(),
         };
         // If --resume was passed, load the saved history into the
@@ -294,6 +301,9 @@ struct ChatSession {
     /// Per-session event log. Held as `Option` so the type is
     /// still constructible in unit tests that don't write a file.
     log: Option<super::chatlog::ChatLog>,
+    /// Number of `run_turn` invocations. Fed to `SessionEnd`
+    /// so the trace carries the total turn count.
+    turn_count: u32,
     last_response: Option<String>,
     debug_flags: super::DebugFlags,
 }
@@ -319,6 +329,7 @@ impl ChatSession {
             primary_id,
             log: None,
             last_response: None,
+            turn_count: 0,
             debug_flags,
         }
     }
@@ -375,6 +386,7 @@ impl ChatSession {
     }
 
     async fn turn(&mut self, user_input: &str) -> AnyResult {
+        self.turn_count += 1;
         let chain_ids: Vec<String> = self
             .runner
             .agent()
@@ -1241,5 +1253,17 @@ mod tests {
         assert_eq!(msgs.len(), 2);
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Drop is the canonical place to emit the trailing `SessionEnd`
+/// trace event: it covers EOF in the REPL, the non-tty stdin
+/// flush path, and any early error return without requiring the
+/// caller to remember a teardown call. `emit_session_end` takes
+/// `&self`, so a `&mut self` Drop impl is fine — we just read
+/// the accumulated turn count and the runner's `total_usage`.
+impl Drop for ChatSession {
+    fn drop(&mut self) {
+        self.runner.emit_session_end(self.turn_count);
     }
 }

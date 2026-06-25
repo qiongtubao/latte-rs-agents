@@ -143,6 +143,10 @@ impl DiscussCmd {
                 .with_hooks(hooks)
                 .with_role(role_name.clone())
                 .with_session_id(debug_flags.session_id.clone());
+            // Emit SessionStart trace event for this role. Each role
+            // gets its own SessionStart so the trace can be filtered
+            // by role via `latte-agent debug trace --role <name>`.
+            runner.emit_session_start(&tier.label());
 
             agents.insert(role_name.clone(), runner);
             println!("  {} ({}) → {}", role_name, template.model_tier, model_id);
@@ -176,6 +180,15 @@ impl DiscussCmd {
 
         let mut orchestrator = DiscussionOrchestrator::new(agents, config)?;
         let result = orchestrator.run().await?;
+        // Emit SessionEnd for every role. The orchestrator kept the
+        // runners (see orchestrator.agents()); we use the total
+        // round count as a stand-in for per-role turn count.
+        // Operators can re-derive per-role turn counts from the
+        // TurnEnd events in the trace.
+        let rounds = result.rounds.len() as u32;
+        for (_role, runner) in orchestrator.agents() {
+            runner.emit_session_end(rounds);
+        }
 
         // 7. Print results
         println!("\n=== Discussion Complete ===");

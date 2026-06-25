@@ -77,6 +77,15 @@ impl DiscussionOrchestrator {
         })
     }
 
+    /// Borrow the registered agents. Used by callers that need
+    /// to emit per-role trace events (e.g. `SessionEnd`) after
+    /// `run()` returns. The orchestrator already drove the
+    /// runners through their turns, so the cumulative token
+    /// usage is available via `runner.total_usage()`.
+    pub fn agents(&self) -> &HashMap<String, AgentRunner> {
+        &self.agents
+    }
+
     /// Run the full discussion. Returns the discussion result.
     pub async fn run(&mut self) -> OrchResult<DiscussionResult> {
         let max_rounds = self.config.effective_max_rounds();

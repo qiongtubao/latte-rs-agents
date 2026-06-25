@@ -6,7 +6,6 @@
 //! `debug replay` useful: iterate on hook strategies against real
 //! recorded prompts without burning tokens.
 
-use std::io::IsTerminal;
 use std::sync::Arc;
 
 use clap::{Args, Subcommand, ValueEnum};
@@ -38,40 +37,6 @@ impl DebugFormat {
     }
 }
 
-/// Bundle the four `--debug*` flags shared by `chat` and `discuss`.
-/// `is_tty` is captured at construction so the `--debug-format Auto`
-/// decision is stable for the whole command (we don't want stdout
-/// switching from pretty to jsonl mid-stream when piped through
-/// `less`).
-#[derive(Debug, Clone, Args)]
-pub struct DebugFlags {
-    /// Enable full trace (pretty to stdout + jsonl to disk).
-    #[arg(long)]
-    pub debug: bool,
-
-    /// Stdout format when `--debug` is on.
-    /// Default: pretty if tty, jsonl otherwise.
-    #[arg(long, value_enum, default_value = "auto", value_name = "FORMAT")]
-    pub debug_format: DebugFormat,
-
-    /// Comma-separated built-in hooks to register for this session.
-    /// Names: `redact_pii`, `enforce_tool_allowlist`, `require_tool_call`.
-    /// Prefix with `no:` to exclude a default, e.g. `no:require_tool_call`.
-    #[arg(long, value_name = "NAMES")]
-    pub debug_hooks: Option<String>,
-
-    /// Opt out of the always-on metadata index (sensitive environments).
-    #[arg(long)]
-    pub no_session_index: bool,
-}
-
-impl DebugFlags {
-    /// Resolve `--debug-format Auto` against the current TTY state.
-    pub fn resolved_format(&self) -> DebugFormat {
-        let is_tty = std::io::stdout().is_terminal();
-        self.debug_format.resolve(is_tty)
-    }
-}
 
 /// `latte-agent debug` subcommand set. See spec §8.2.
 ///
