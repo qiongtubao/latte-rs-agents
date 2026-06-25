@@ -72,7 +72,9 @@ pub struct JsonlSink {
 impl JsonlSink {
     pub fn new(path: PathBuf) -> Self {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                panic!("JsonlSink: failed to create parent dir {}: {}", parent.display(), e);
+            }
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -170,6 +172,93 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(v.get("SessionEnd").is_some(), "line missing SessionEnd: {}", line);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_sink_concurrent_emits_do_not_interleave() {
+        // Characterization test: the struct doc claims concurrent emit() calls
+        // don't interleave bytes. If the Mutex<BufWriter> ever regressed (e.g.
+        // switched to per-call open/append), serde_json::from_str on each line
+        // would fail because mid-line byte mixing produces invalid JSON.
+        let dir = std::env::temp_dir().join(format!("latte-test-concurrent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trace-concurrent.jsonl");
+        let sink = std::sync::Arc::new(JsonlSink::new(path.clone()));
+
+        let mut handles = Vec::new();
+        for thread_idx in 0u32..4 {
+            let sink = std::sync::Arc::clone(&sink);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    sink.emit(TraceEvent::SessionEnd {
+                        meta: TraceMeta::test_default(),
+                        total_turns: thread_idx,
+                        total_input: 0,
+                        total_output: 0,
+                        total_thinking: 0,
+                    });
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(sink);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 100, "expected 100 JSONL lines, got: {}", lines.len());
+
+        // Each line must be valid JSON whose SessionEnd.total_turns matches
+        // the originating thread index. Any byte-mixing between threads
+        // would either fail JSON parsing or yield a total_turns value that
+        // does not match any single thread index.
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line not valid JSON (byte interleaving?): {} -- {}", line, e));
+            let se = v.get("SessionEnd")
+                .unwrap_or_else(|| panic!("line missing SessionEnd: {}", line));
+            let total_turns = se.get("total_turns")
+                .and_then(|x| x.as_u64())
+                .expect("total_turns missing or not u64");
+            assert!(
+                total_turns < 4,
+                "total_turns={} from a thread index 0..=3 — line is corrupt: {}",
+                total_turns, line
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jsonl_sink_appends_to_existing_file() {
+        // Characterization test: append-mode is load-bearing for re-running
+        // debug sessions. JsonlSink::new must NOT truncate prior content.
+        let dir = std::env::temp_dir().join(format!("latte-test-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trace-append.jsonl");
+
+        // Pre-existing line written via std::fs::write (independent of sink).
+        std::fs::write(&path, "{\"pre\":1}\n").unwrap();
+
+        let sink = JsonlSink::new(path.clone());
+        sink.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 7,
+            total_input: 0,
+            total_output: 0,
+            total_thinking: 0,
+        });
+        drop(sink);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines (1 prior + 1 new), got: {:?}", content);
+        // The new (second) line must be the SessionEnd event we emitted.
+        let v: serde_json::Value = serde_json::from_str(lines[1])
+            .expect("second line not valid JSON");
+        assert!(v.get("SessionEnd").is_some(), "second line missing SessionEnd: {}", lines[1]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
