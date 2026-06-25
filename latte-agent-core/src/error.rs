@@ -78,4 +78,8 @@ pub enum AgentError {
         tried: Vec<String>,
         next_retry_in: Option<std::time::Duration>,
     },
+
+    /// A lifecycle hook aborted execution.
+    #[error("hook '{hook}' aborted: {reason}")]
+    HookAborted { hook: String, reason: String },
 }

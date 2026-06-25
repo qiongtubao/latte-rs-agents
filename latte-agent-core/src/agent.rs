@@ -456,15 +456,41 @@ impl AgentRunner {
         new_messages: &[Message],
         system_vars: Option<&serde_json::Value>,
     ) -> AgentResult<String> {
+        use crate::trace::{HookPoint, ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
+        let turn_start = Instant::now();
+        let meta = TraceMeta {
+            turn: 0,
+            role: self.role_id.clone(),
+            ts: String::new(),
+            session_id: String::new(),
+        };
+
         let default_vars = serde_json::json!({});
         let vars = system_vars.unwrap_or(&default_vars);
 
         let sys_msg = self.agent.system_message(vars)?;
-
+        let system_rendered = sys_msg.content.clone();
         let mut messages: Vec<Message> = Vec::new();
         messages.push(sys_msg);
         messages.extend_from_slice(self.context.messages());
         messages.extend_from_slice(new_messages);
+
+        // 1. Emit PromptBuilt after prompt assembly
+        let user_input: String = new_messages.iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let model_id = self.agent.model_chain.first()
+            .map(|mc| mc.model.id.clone())
+            .unwrap_or_default();
+        let est_input_tokens = (messages.iter().map(|m| m.content.len()).sum::<usize>() / 4) as u32;
+        self.sink.emit(TraceEvent::PromptBuilt {
+            meta: meta.clone(),
+            system_rendered,
+            history_len: self.context.messages().len(),
+            user_input: user_input.clone(),
+            est_input_tokens,
+        });
 
         let max_rounds = if self.tool_manager.is_some() {
             self.max_tool_rounds.max(1)
@@ -473,20 +499,104 @@ impl AgentRunner {
         };
 
         let mut final_response = String::new();
+        let mut total_input: u32 = 0;
+        let mut total_output: u32 = 0;
+        let mut total_thinking: u32 = 0;
 
         for round in 0..max_rounds {
+            // 2a. Emit ModelCall + ModelRawOut after agent.chat()
+            let chat_start = Instant::now();
             let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
+            let latency_ms = chat_start.elapsed().as_millis() as u64;
 
             self.total_usage.input_tokens += completion.usage.input_tokens;
             self.total_usage.output_tokens += completion.usage.output_tokens;
             self.total_usage.thinking_tokens += completion.usage.thinking_tokens;
+            total_input += completion.usage.input_tokens;
+            total_output += completion.usage.output_tokens;
+            total_thinking += completion.usage.thinking_tokens;
 
             final_response = completion.content.clone();
 
+            self.sink.emit(TraceEvent::ModelCall {
+                meta: meta.clone(),
+                model_id: model_id.clone(),
+                params_json: serde_json::to_string(&self.agent.params).unwrap_or_default(),
+                latency_ms,
+                finish_reason: completion.stop_reason.clone(),
+            });
+            self.sink.emit(TraceEvent::ModelRawOut {
+                meta: meta.clone(),
+                raw_content: final_response.clone(),
+            });
+
+            // 2b. Run PostResponseHook
+            {
+                let mut ctx = crate::hooks::PostResponseCtx { raw: &final_response };
+                let outcome = self.hooks.run_post_response(&mut ctx, |hook_name, point, kind| {
+                    self.sink.emit(TraceEvent::HookFired {
+                        meta: meta.clone(),
+                        hook_name: hook_name.to_string(),
+                        point,
+                        outcome_kind: kind.to_string(),
+                    });
+                });
+                if let crate::hooks::HookOutcome::Abort { reason } = &outcome {
+                    return Err(AgentError::HookAborted {
+                        hook: "PostResponse".into(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+
             // Check for tool calls
             let tool_calls = extract_tool_calls(&final_response);
+
+            // 3a. Emit ParseToolCalls
+            let opens_found = final_response.matches("<tool_call").count() as u32;
+            let parsed_calls: Vec<ParsedCall> = tool_calls.iter().map(|tc| ParsedCall {
+                name: tc.name.clone(),
+                args: tc.args.clone(),
+            }).collect();
+            self.sink.emit(TraceEvent::ParseToolCalls {
+                meta: meta.clone(),
+                raw_in: final_response.clone(),
+                parsed: parsed_calls.clone(),
+                diagnostics: ParseDiag {
+                    opens_found,
+                    closes_matched: tool_calls.len() as u32,
+                    unmatched_opens: Vec::new(),
+                },
+            });
+
             if tool_calls.is_empty() {
                 break;
+            }
+
+            // 3b. Run PostParseHook (can mutate parsed calls)
+            let mut post_parse_calls: Vec<ParsedCall> = parsed_calls;
+            {
+                let mut ctx = crate::hooks::PostParseCtx { parsed: &mut post_parse_calls };
+                let outcome = self.hooks.run_post_parse(&mut ctx, |hook_name, point, kind| {
+                    self.sink.emit(TraceEvent::HookFired {
+                        meta: meta.clone(),
+                        hook_name: hook_name.to_string(),
+                        point,
+                        outcome_kind: kind.to_string(),
+                    });
+                });
+                match outcome {
+                    crate::hooks::HookOutcome::Abort { reason } => {
+                        return Err(AgentError::HookAborted {
+                            hook: "PostParse".into(),
+                            reason,
+                        });
+                    }
+                    crate::hooks::HookOutcome::Mutate(ref mutated) => {
+                        post_parse_calls = mutated.clone();
+                    }
+                    _ => {}
+                }
             }
 
             if let Some(tm) = &self.tool_manager {
@@ -496,7 +606,7 @@ impl AgentRunner {
                     content: final_response.clone(),
                 });
                 // Execute each tool call
-                for tc in &tool_calls {
+                for tc in &post_parse_calls {
                      // Map friendly config aliases ("bash") to the real
                      // builtin tool names ("exec"). Without this, model
                      // outputs trained as `bash` get "tool not found"
@@ -507,6 +617,33 @@ impl AgentRunner {
                      };
                      let input: serde_json::Value = serde_json::from_str(&tc.args)
                          .unwrap_or(serde_json::Value::String(tc.args.clone()));
+
+                    // 4a. Run PreToolHook (can abort or mutate args)
+                    {
+                        let mut pre_ctx = crate::hooks::PreToolCtx { name: &resolved_name, args: &mut serde_json::Value::Null };
+                        // We need the parsed input, so prepare a mutable copy
+                        let mut mutable_input = input.clone();
+                        pre_ctx.args = &mut mutable_input;
+                        let outcome = self.hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
+                            self.sink.emit(TraceEvent::HookFired {
+                                meta: meta.clone(),
+                                hook_name: hook_name.to_string(),
+                                point,
+                                outcome_kind: kind.to_string(),
+                            });
+                        });
+                        match outcome {
+                            crate::hooks::HookOutcome::Abort { reason } => {
+                                return Err(AgentError::HookAborted {
+                                    hook: "PreTool".into(),
+                                    reason,
+                                });
+                            }
+                            _ => {}
+                        }
+                        // Use mutated input if applicable
+                        let _ = &mutable_input;
+                    }
 
                     let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
                         &resolved_name,
@@ -528,19 +665,66 @@ impl AgentRunner {
                             })
                         })
                         .unwrap_or_else(|| resolved_name.clone());
-                    match tm.execute(&full_name, input.clone(), Some(ctx)).await {
+
+                    // 4b. Execute tool + emit ToolExec
+                    let tool_start = Instant::now();
+                    let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
+                    let tool_latency = tool_start.elapsed().as_millis() as u64;
+
+                    let args_json = serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
+
+                    match exec_result {
                         Ok(result) => {
-                             messages.push(Message {
+                            self.sink.emit(TraceEvent::ToolExec {
+                                meta: meta.clone(),
+                                name: tc.name.clone(),
+                                args_json: args_json.clone(),
+                                latency_ms: tool_latency,
+                                status: ToolStatus::Ok(serde_json::to_string(&result).unwrap_or_default()),
+                            });
+                            // 4c. Run PostToolHook
+                            let mut result_str = serde_json::to_string_pretty(&result)
+                                .unwrap_or_else(|_| format!("{:?}", result));
+                            {
+                                let mut post_ctx = crate::hooks::PostToolCtx { name: &resolved_name, result: &mut result_str };
+                                let outcome = self.hooks.run_post_tool(&mut post_ctx, |hook_name, point, kind| {
+                                    self.sink.emit(TraceEvent::HookFired {
+                                        meta: meta.clone(),
+                                        hook_name: hook_name.to_string(),
+                                        point,
+                                        outcome_kind: kind.to_string(),
+                                    });
+                                });
+                                match outcome {
+                                    crate::hooks::HookOutcome::Abort { reason } => {
+                                        return Err(AgentError::HookAborted {
+                                            hook: "PostTool".into(),
+                                            reason,
+                                        });
+                                    }
+                                    crate::hooks::HookOutcome::Mutate(ref mutated) => {
+                                        result_str = mutated.clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            messages.push(Message {
                                 role: Role::User,
                                 content: format!(
                                     "[tool_result for {}]\n{}",
                                     tc.name,
-                                    serde_json::to_string_pretty(&result)
-                                        .unwrap_or_else(|_| format!("{:?}", result))
+                                    result_str,
                                 ),
                             });
                         }
                         Err(e) => {
+                            self.sink.emit(TraceEvent::ToolExec {
+                                meta: meta.clone(),
+                                name: tc.name.clone(),
+                                args_json,
+                                latency_ms: tool_latency,
+                                status: ToolStatus::Err(e.to_string()),
+                            });
                             messages.push(Message {
                                 role: Role::User,
                                 content: format!("[tool_error for {}]\n{}", tc.name, e),
@@ -554,6 +738,16 @@ impl AgentRunner {
                 return Err(AgentError::MaxToolRoundsExceeded(max_rounds));
             }
         }
+
+        // 5. Emit TurnEnd
+        let elapsed_ms = turn_start.elapsed().as_millis() as u64;
+        self.sink.emit(TraceEvent::TurnEnd {
+            meta,
+            total_input,
+            total_output,
+            total_thinking,
+            elapsed_ms,
+        });
 
         // Store in context
         for msg in new_messages {

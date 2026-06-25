@@ -716,6 +716,7 @@ async fn build_runner(
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+            Arc::new(latte_agent_core::trace::NullSink),
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
@@ -777,6 +778,7 @@ async fn register_delegate_tool(
     default_params: GenerateParams,
     delegate_sem: Arc<Semaphore>,
     delegate_timeout_secs: u64,
+    delegate_sink: Arc<dyn latte_agent_core::trace::TraceSink>,
 ) -> AnyResult {
     use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputProperty, ToolInputSchema};
 
@@ -820,6 +822,7 @@ async fn register_delegate_tool(
             let default_params = default_params.clone();
             let sem = Arc::clone(&delegate_sem);
             let timeout_s = delegate_timeout_secs;
+            let sink = Arc::clone(&delegate_sink);
             Box::pin(async move {
                 let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
                 let role_id = input
@@ -877,9 +880,17 @@ async fn register_delegate_tool(
                         }
                     }
                 };
+                let scoped_sink = Arc::new(latte_agent_core::trace::ScopedSink::new(
+                    Arc::clone(&sink),
+                    role_id.clone(),
+                ));
                 let mut runner = match specialist_tm {
-                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 8),
-                    None => AgentRunner::new(agent),
+                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 8)
+                        .with_sink(scoped_sink.clone())
+                        .with_role(role_id.clone()),
+                    None => AgentRunner::new(agent)
+                        .with_sink(scoped_sink.clone())
+                        .with_role(role_id.clone()),
                 };
                 let msgs = vec![Message {
                     role: MsgRole::User,
