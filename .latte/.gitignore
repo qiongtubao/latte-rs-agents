@@ -1,2 +1,7 @@
-# Per-session chat logs are runtime artefacts, not configuration.
+# Per-session chat logs, session indices, and full trace JSONLs are
+# runtime artefacts, not configuration. The directory is created
+# by `latte-agent chat` (or `latte-agent discuss` for traces) the
+# first time it runs in this project.
 logs/
+sessions/
+traces/

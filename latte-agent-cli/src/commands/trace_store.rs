@@ -37,6 +37,13 @@ pub fn latte_home() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
+    // Project-level `<cwd>/.latte/` takes priority so session
+    // metadata lives next to the project it's debugging, rather
+    // than being scattered across the operator's `$HOME`.
+    let project_lat = PathBuf::from(".latte");
+    if project_lat.is_dir() {
+        return Some(project_lat);
+    }
     std::env::var_os("HOME").map(PathBuf::from).map(|h| h.join(".latte"))
 }
 

@@ -120,7 +120,6 @@ impl ModelResolver {
             role_tiers,
         })
     }
-    /// Resolve a concrete `Model` for a given role and tier.
     ///
     /// Lookup order: role_tiers override → tier_defaults → model's own tier
     /// field → first model in catalog. If the chosen model has no

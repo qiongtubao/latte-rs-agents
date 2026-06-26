@@ -108,19 +108,13 @@ pub struct DebugFlags {
 }
 
 fn latte_dir() -> PathBuf {
-    // Honor `LATTE_HOME` (used by tests and sandboxed dev envs) and
-    // fall back to `$HOME/.latte`. `trace_store::latte_home()`
-    // encodes the same precedence rule; we re-implement it here to
-    // keep the `--debug` sink constructors on the simple
-    // unwrapping contract — they need a real path even when no
-    // home is discoverable.
-    if let Ok(p) = std::env::var("LATTE_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".latte")
+    // Delegate to `trace_store::latte_home` so the precedence rule
+    // (LATTE_HOME → project .latte/ → ~/.latte/) is defined in
+    // exactly one place. Falls back to `/tmp/.latte` if no
+    // discoverable home exists so the sink constructors can
+    // still get a writable path.
+    crate::commands::trace_store::latte_home()
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(".latte"))
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 # ─── Tier Mappings ───────────────────────────────────────────────────────────
 # Global tier → model_id. Per-role overrides below.
 
-[tiers]
+[models.tiers]
 premium = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
 budget = "deepseek-chat"
@@ -12,25 +12,25 @@ budget = "deepseek-chat"
 # ─── Per-Role Tier Overrides (optional) ─────────────────────────────────────
 # Override which model a specific role uses at each tier.
 
-[role_tiers.pm]
+[models.role_tiers.pm]
 premium = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
 budget = "deepseek-chat"
 
-[role_tiers.architect]
+[models.role_tiers.architect]
 premium = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
 budget = "deepseek-chat"
 
-[role_tiers.programmer]
+[models.role_tiers.programmer]
 premium = "claude-sonnet-4-20250514"
 standard = "deepseek-chat"
 budget = "qwen2.5-coder-32b-instruct"
 
-[role_tiers.manager]
-premium = "claude-opus-4-20250514"
-standard = "claude-sonnet-4-20250514"
-budget = "deepseek-chat"
+[models.role_tiers.manager]
+premium = "glm-5.2"
+standard = "glm-5.2"
+budget = "glm-5.2"
 
 # ─── Model Definitions ───────────────────────────────────────────────────────
 
