@@ -29,15 +29,15 @@ pub struct DiscussCmd {
     pub workflow: Option<String>,
 
     /// Path to agents config TOML (file or directory).
-    #[arg(long, default_value = "config/agents")]
+    #[arg(long, default_value = ".latte/agents")]
     pub agents_config: String,
 
     /// Path to models config TOML.
-    #[arg(long, default_value = "config/models.toml")]
+    #[arg(long, default_value = ".latte/models.toml")]
     pub models_config: String,
 
     /// Path to discussion workflow TOML (file or directory).
-    #[arg(long, default_value = "config/workflows")]
+    #[arg(long, default_value = ".latte/workflows")]
     pub discussion_config: String,
 
     /// Maximum discussion rounds.
@@ -174,7 +174,7 @@ impl DiscussCmd {
     }
 
     fn load_named_workflow(&self, name: &str) -> Result<DiscussionWorkflow, Box<dyn std::error::Error>> {
-        let registry = latte_agent_orchestrator::WorkflowRegistry::load(&self.discussion_config)
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(&self.discussion_config))
             .map_err(|e| format!("failed to load workflows: {}", e))?;
         registry.resolve(Some(name)).map_err(|e| e.into())
     }

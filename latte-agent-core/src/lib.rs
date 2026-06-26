@@ -17,7 +17,7 @@
 //! use latte_ai::models::{Message, Role};
 //!
 //! # async fn example() -> std::result::Result<(), Box<dyn std::error::Error>> {
-//! let config = AgentConfig::load("config/agents.toml")?;
+//! let config = AgentConfig::load(".latte/agents.toml")?;
 //! let resolver = ModelResolver::from_config(&config)?;
 //!
 //! let template = config.roles.get("pm").unwrap();
@@ -60,4 +60,15 @@ pub mod prelude {
     pub use crate::model_resolver::{ModelResolver, ModelTier};
     pub use crate::role::{Role, RoleCategory};
     pub use latte_ai::prelude::*;
+}
+
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::sync::{Mutex, OnceLock};
+    /// Process-wide mutex serialising `LATTE_HOME` env-var access
+    /// across all unit tests in the crate. `cargo test` runs tests on
+    /// multiple threads; env vars are process-wide, so concurrent
+    /// test threads setting `LATTE_HOME` clobber each other.
+    pub(crate) static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 }

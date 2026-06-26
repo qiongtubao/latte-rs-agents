@@ -6,7 +6,7 @@
 //! 1. **Global** — `~/.latte/models.yaml`, `~/.latte/models.toml`, or every
 //!    `*.yaml`/`*.toml` under `~/.latte/models.d/`. Optional.
 //! 2. **Project** — the model catalog passed to the CLI
-//!    (typically `config/models.toml` + `config/agents/`).
+//!    (typically .latte/models.toml + .latte/agents/).
 //! 3. **CLI overrides** — `--api-key <key>`, `--model-override k=v`.
 //!
 //! Within each layer a model is identified by its `id`; later sources replace

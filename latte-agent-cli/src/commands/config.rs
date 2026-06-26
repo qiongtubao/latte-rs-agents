@@ -21,15 +21,15 @@ enum ConfigAction {
 #[derive(Args, Debug)]
 struct ConfigShow {
     /// Path to agents config (file or directory).
-    #[arg(long, default_value = "config/agents")]
+    #[arg(long, default_value = ".latte/agents")]
     pub agents_config: String,
 
     /// Path to models config.
-    #[arg(long, default_value = "config/models.toml")]
+    #[arg(long, default_value = ".latte/models.toml")]
     pub models_config: String,
 
     /// Path to discussion workflows (file or directory).
-    #[arg(long, default_value = "config/workflows")]
+    #[arg(long, default_value = ".latte/workflows")]
     pub discussion_config: String,
 }
 

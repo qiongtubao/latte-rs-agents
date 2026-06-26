@@ -1,0 +1,41 @@
+# Default workflow: standard-software-discussion
+name = "standard-software-discussion"
+description = "Standard software development discussion: requirements → design → estimate → review → decide"
+max_rounds = 3
+context_token_budget = 32000
+
+[[steps]]
+id = "requirements"
+description = "PM presents the requirements and goals"
+speakers = ["pm"]
+prompt = "Present the requirements for: {{topic}}. Cover: user story, acceptance criteria, scope boundaries, and priority."
+
+[[steps]]
+id = "architecture"
+description = "Architect reviews feasibility and suggests design"
+speakers = ["architect"]
+prompt = "Review the requirements above from a technical perspective. Suggest architecture, identify risks, and discuss tradeoffs."
+
+[[steps]]
+id = "implementation"
+description = "Programmer estimates effort and implementation approach"
+speakers = ["programmer"]
+prompt = "Given the requirements and architecture above, estimate the implementation approach. Identify key modules, data flow, and complexity."
+
+[[steps]]
+id = "quality"
+description = "Tester identifies test strategy and edge cases"
+speakers = ["tester"]
+prompt = "Review the requirements and implementation plan above. Identify testing strategy, edge cases, and acceptance criteria gaps."
+
+[[steps]]
+id = "review"
+description = "Reviewer checks quality and security concerns"
+speakers = ["reviewer", "security"]
+prompt = "Review the full discussion above. Reviewer: code quality and patterns concerns. Security: vulnerability and threat considerations."
+
+[[steps]]
+id = "decide"
+description = "Manager makes final decision on scope and timeline"
+speakers = ["pm", "manager"]
+prompt = "Based on the full discussion above, finalize scope, priorities, and timeline. Manager: assess risk and resource constraints."

@@ -1,5 +1,26 @@
 # Config layout
 
+> **What this directory is**: `config/` is a **reference / template**
+> bundle for new projects. It is **not** read by `latte-agent` at
+> runtime in the `latte-rs-agents` repo itself.
+>
+> At runtime, `latte-agent` reads from the **project root**:
+>
+> - `.latte/agents/` (per-role TOML files)
+> - `.latte/models.toml` (model catalog)
+> - `.latte/workflows/` (per-workflow TOML files)
+> - `.latte/logs/` (chat session logs)
+>
+> …and from the **user home** (`$LATTE_HOME` or `~/.latte/`):
+>
+> - `agents.d/`, `models.d/`, `workflows.d/`, `prompts.d/`, `logs/`
+>
+> The actual config files at runtime live in `.latte/`. `config/`
+> is here so contributors can copy it as a starting point for a new
+> project, and so the binary's built-in defaults (compiled in via
+> `prompts.rs::template_for`) match a checked-in example.
+
+
 Both **single-file** and **directory** layouts are supported by
 `AgentConfig::load` / `WorkflowRegistry::load`.
 
@@ -31,6 +52,30 @@ config/
 ├── models.toml
 └── discussion.toml     # [default_workflow] + [workflows.*]
 ```
+
+## Global layer (~/.latte/)
+
+Three subdirectories under `~/.latte/` (or `$LATTE_HOME`) are read by
+the CLI when present. **The global layer is optional**; a missing path
+is silently skipped so a project-only setup keeps working.
+
+| Subdir | Loaded by | Per-file format |
+| ------ | --------- | --------------- |
+| `models.{yaml,toml,yml}` and `models.d/*.yaml\|*.toml` | `GlobalConfig::load_default` | router-style or project-style (see below) |
+| `agents.d/` and `agents.toml` | `AgentConfig::load_with_global` | one `[roles.<id>]` per file, or single combined file |
+| `workflows.d/` and `discussion.toml` | `WorkflowRegistry::load_with_global` | one workflow per file, or `[workflows.*]` section |
+
+**Merge semantics** for the agents/workflows layer:
+
+| Priority | Source | Location |
+| -------- | ------ | -------- |
+| 3 (lowest) | Global | `~/.latte/models.yaml` / `.toml` / `.yml`, or every `*.yaml`/`*.toml` under `~/.latte/models.d/` (override with `$LATTE_HOME`) |
+| 2 | Project | `--models-config` flag, default `.latte/models.toml` |
+  declare.
+- Missing project path → fall through to global layer.
+- Missing global path → fall through to project layer.
+
+Model merging has different semantics (field-filling, see below).
 
 Point CLI flags at either the file path or the directory path; the
 loader detects via `std::fs::metadata`.
