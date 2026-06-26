@@ -1,0 +1,23 @@
+name = "bug_triage"
+description = "Triage a bug report with multi-role analysis."
+max_rounds = 2
+
+[[steps]]
+id = "describe"
+speakers = ["tester"]
+prompt = "Describe the bug: {{topic}}. Include reproduction steps, expected vs actual behavior, and severity."
+
+[[steps]]
+id = "diagnose"
+speakers = ["programmer"]
+prompt = "Analyze the bug described above. What is the likely root cause? What area of the code is affected?"
+
+[[steps]]
+id = "impact"
+speakers = ["security", "devops"]
+prompt = "Assess the impact of this bug. Security: any security implications? DevOps: any operational impact?"
+
+[[steps]]
+id = "plan"
+speakers = ["programmer", "manager"]
+prompt = "Propose a fix plan. Programmer: fix approach and estimate. Manager: priority and scheduling."

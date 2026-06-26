@@ -129,16 +129,51 @@ impl RoleTemplate {
         }
 
         let system_prompt = match &self.prompt_file {
-            Some(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
-                crate::error::AgentError::Config(format!(
-                    "cannot read prompt file '{}' for role '{}': {}",
-                    path, self.id, e
-                ))
-            })?,
-            None => format!(
-                "You are a {}. Respond in character as a {}.\nYour task: {{topic}}",
-                self.name, self.name
-            ),
+            Some(path) => match tokio::fs::read_to_string(path).await {
+                Ok(content) => content,
+                Err(primary_err) => {
+                    // Absolute paths, `~`-prefixed paths, and paths
+                    // with `..` are deliberate user intent — we
+                    // still try the global `prompts.d/` override,
+                    // but we do NOT fall back to the binary's
+                    // built-in prompts (the user clearly meant
+                    // *this* file, not a default).
+                    let skip_global =
+                        path.starts_with('/') || path.starts_with('~') || path.contains("..");
+                    if skip_global {
+                        return Err(crate::error::AgentError::Config(format!(
+                            "cannot read prompt file '{}' for role '{}': {}",
+                            path, self.id, primary_err
+                        )));
+                    }
+                    match resolve_global_prompt(path, &self.id).await {
+                        Some(content) => content,
+                        None => match crate::prompts::for_role(&self.id) {
+                            // Built-in: compiled into the binary at
+                            // build time via `include_str!`. Always
+                            // available, no filesystem dependency.
+                            // This is what makes `latte-agent chat`
+                            // work out-of-the-box on a fresh checkout
+                            // (no project config, no global
+                            // overrides, just the binary).
+                            Some(content) => content.to_string(),
+                            None => {
+                                return Err(crate::error::AgentError::Config(format!(
+                                    "cannot read prompt file '{}' for role '{}': {}",
+                                    path, self.id, primary_err
+                                )));
+                            }
+                        },
+                    }
+                }
+            },
+            None => match crate::prompts::for_role(&self.id) {
+                Some(content) => content.to_string(),
+                None => format!(
+                    "You are a {}. Respond in character as a {}.\nYour task: {{topic}}",
+                    self.name, self.name
+                ),
+            },
         };
 
         Ok(Role {
@@ -231,4 +266,169 @@ mod tests {
         assert!(rendered.contains("Tester"));
         assert!(rendered.contains("Login flow"));
     }
+    // ── global prompt fallback ──────────────────────────────────────────
+
+    /// Helper: redirect `LATTE_HOME` to a temp dir for the duration of a
+    /// test. Same thread-safety pattern as `config::tests::with_latte_home`.
+    /// Async-aware: the closure returns a future so the env var stays
+    /// set for the duration of the awaited operation.
+    /// Helper for `#[tokio::test]` tests. Sets `LATTE_HOME` to a
+    /// thread-scoped temp dir, runs `f` (which receives the path
+    /// and returns a future), and cleans up `LATTE_HOME` on drop of
+    /// the returned guard. The global `Mutex` serialises env-var
+    /// access across parallel test threads. The closure is invoked
+    /// synchronously to ensure env-var ordering; the returned future
+    /// runs on the caller's tokio runtime.
+    fn with_latte_home<F, Fut>(f: F) -> impl std::future::Future<Output = ()>
+    where
+        F: FnOnce(std::path::PathBuf) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use std::sync::{Mutex, MutexGuard};
+        // `MutexGuard` doesn't have a `'static` bound by default, so
+        // we coerce via the `static` lifetime explicitly.
+        let lock_guard: MutexGuard<'static, ()> = crate::test_util::ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+
+
+        let tmp = std::env::temp_dir().join(format!(
+            "latte_role_test_home_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var("LATTE_HOME").ok();
+        std::env::set_var("LATTE_HOME", &tmp);
+
+        // Run the closure synchronously to obtain the future. Then
+        // move the cleanup work into a Drop guard so it fires after
+        // the caller has awaited the future.
+        let tmp_for_closure = tmp.clone();
+        let fut = f(tmp_for_closure.clone());
+        struct Cleanup {
+            _lock_guard: std::sync::MutexGuard<'static, ()>,
+            tmp: std::path::PathBuf,
+            prev: Option<String>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var("LATTE_HOME", v),
+                    None => std::env::remove_var("LATTE_HOME"),
+                }
+                let _ = std::fs::remove_dir_all(&self.tmp);
+            }
+        }
+        let cleanup = Cleanup {
+            _lock_guard: lock_guard,
+            tmp,
+            prev,
+        };
+        async move {
+            fut.await;
+            drop(cleanup);
+        }
+    }
+    fn make_template(prompt_file: Option<&str>) -> RoleTemplate {
+        RoleTemplate {
+            id: "pm".into(),
+            name: "PM".into(),
+            category: "planning".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: prompt_file.map(String::from),
+            temperature: None,
+            tools: vec![],
+            icon: "".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_uses_project_prompt_first() {
+        // Project-side prompt exists; global override also exists.
+        // Project must win.
+        let project_prompt = std::env::temp_dir().join("latte_role_test_project_prompt.md");
+        std::fs::write(&project_prompt, "FROM_PROJECT").unwrap();
+        let template = make_template(Some(project_prompt.to_str().unwrap()));
+
+        with_latte_home(|home| async move {
+            let prompts = home.join("prompts.d");
+            std::fs::create_dir_all(&prompts).unwrap();
+            // (No global file for this test — project path is the
+            // only source.)
+            let role = template.resolve(&GenerateParams::default()).await.unwrap();
+            assert_eq!(role.system_prompt, "FROM_PROJECT");
+        })
+        .await;
+        let _ = std::fs::remove_file(&project_prompt);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_falls_back_to_global_prompts_d() {
+        // Project path is missing; global prompts.d has the file.
+        let template = make_template(Some("pm.md"));
+        with_latte_home(|home| async move {
+            let prompts = home.join("prompts.d");
+            std::fs::create_dir_all(&prompts).unwrap();
+            std::fs::write(prompts.join("pm.md"), "FROM_GLOBAL_FALLBACK").unwrap();
+            let role = template.resolve(&GenerateParams::default()).await.unwrap();
+            assert_eq!(role.system_prompt, "FROM_GLOBAL_FALLBACK");
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn test_resolve_skips_global_for_absolute_paths() {
+        // Absolute configured path: no global fallback attempted.
+        let template = make_template(Some("/nonexistent/absolute/path.md"));
+        with_latte_home(|home| async move {
+            let prompts = home.join("prompts.d");
+            std::fs::create_dir_all(&prompts).unwrap();
+            std::fs::write(prompts.join("path.md"), "SHOULD_NOT_BE_USED").unwrap();
+            let err = template
+                .resolve(&GenerateParams::default())
+                .await
+                .err()
+                .expect("absolute path missing on disk must error");
+            assert!(format!("{err}").contains("cannot read prompt file"));
+        })
+        .await;
+    }
 }
+
+/// Try to load a role's prompt from the global `~/.latte/prompts.d/`
+/// directory. Returns `Some(content)` if the global file exists, `None`
+/// otherwise (no `LATTE_HOME`, missing dir, or missing file).
+///
+/// Lookup rules:
+/// 1. Take the **basename** of the configured `prompt_file` (e.g.
+///    `prompts/pm.md` → `pm.md`).
+/// 2. Read `$LATTE_HOME/prompts.d/<basename>`.
+/// 3. Absolute paths, `~`-prefixed paths, and paths containing `..`
+///    skip the global fallback (the user clearly meant a specific
+///    location).
+async fn resolve_global_prompt(
+    configured: &str,
+    _role_id: &str,
+) -> Option<String> {
+    use crate::global_config::GlobalConfig;
+    let global_dir = GlobalConfig::global_dir()?;
+
+    if configured.starts_with('/') || configured.starts_with('~') {
+        return None;
+    }
+    if configured.contains("..") {
+        return None;
+    }
+    let basename = std::path::Path::new(configured)
+        .file_name()
+        .and_then(|s| s.to_str())?;
+    let candidate = global_dir.join("prompts.d").join(basename);
+    match tokio::fs::read_to_string(&candidate).await {
+        Ok(content) => Some(content),
+        Err(_) => None,
+    }
+}
+

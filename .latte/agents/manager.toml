@@ -1,0 +1,9 @@
+[roles.manager]
+id = "manager"
+name = "Engineering Manager"
+category = "planning"
+model_tier = "premium"
+prompt_file = "prompts/manager.md"
+temperature = 0.5
+tools = ["read", "list", "search"]
+icon = "👔"

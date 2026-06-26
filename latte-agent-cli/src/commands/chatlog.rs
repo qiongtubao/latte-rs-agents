@@ -111,6 +111,14 @@ fn global_log_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
+    // Project-level: `./.latte/logs/` from the current working dir
+    // takes priority. This keeps session logs next to the project
+    // they're debugging, instead of dumping them in `$HOME`.
+    let project_logs = PathBuf::from(".latte").join("logs");
+    if project_logs.is_dir() {
+        return Some(project_logs);
+    }
+    // Fall back to global `~/.latte/logs/`.
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".latte").join("logs"))
 }

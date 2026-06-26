@@ -45,15 +45,15 @@ pub struct WorkflowCmd {
     pub workflow: Option<String>,
 
     /// Path to agents config TOML (file or directory).
-    #[arg(long, default_value = "config/agents")]
+    #[arg(long, default_value = ".latte/agents")]
     pub agents_config: String,
 
     /// Path to models config TOML.
-    #[arg(long, default_value = "config/models.toml")]
+    #[arg(long, default_value = ".latte/models.toml")]
     pub models_config: String,
 
     /// Path to discussion workflow TOML (file or directory).
-    #[arg(long, default_value = "config/workflows")]
+    #[arg(long, default_value = ".latte/workflows")]
     pub discussion_config: String,
 
     /// Maximum discussion rounds.
@@ -103,7 +103,7 @@ impl WorkflowCmd {
         let resolver = resolved.resolver;
 
         // 2. Load the named workflow (default: tech_director_dispatch).
-        let registry = latte_agent_orchestrator::WorkflowRegistry::load(&self.discussion_config)
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(&self.discussion_config))
             .map_err(|e| format!("failed to load workflows: {}", e))?;
         let wf_name = self.workflow_name();
         let workflow = registry

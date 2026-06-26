@@ -28,11 +28,11 @@ impl AgentConfig {
     /// file, load that file directly.
     ///
     /// Directory mode supports the layout:
-    ///   config/agents/
+    ///   .latte/agents/
     ///     pm.toml
     ///     architect.toml
     ///     ...
-    ///   config/workflows/
+    ///   .latte/workflows/
     ///     code_review.toml
     ///     ...
     pub fn load(path: &str) -> AgentResult<Self> {
@@ -48,6 +48,166 @@ impl AgentConfig {
             AgentError::Config(format!("cannot read config file '{}': {}", path, e))
         })?;
         Self::parse(&content)
+    }
+    /// Load project + global configs and merge them.
+    ///
+    /// Lookup order:
+    /// 1. `project_path` if it exists (file or directory). Missing
+    ///    path is silently skipped.
+    /// 2. `~/.latte/agents.d/` (directory) if it exists.
+    /// 3. `~/.latte/agents.toml` (single file) if it exists.
+    ///
+    /// Roles and models with the same `id` in both layers are
+    /// **project-wins**: the project's version replaces the global
+    /// one, so a project can override a default shipped globally. The
+    /// global layer only contributes ids the project did not declare.
+    ///
+    /// Returns `Ok(default)` if neither layer has anything.
+    pub fn load_with_global(project_path: Option<&str>) -> AgentResult<Self> {
+        use crate::global_config::GlobalConfig;
+        let mut merged = Self::default();
+
+        // 1) Project path. A missing path is silently skipped so a
+        //    bare `~/.latte/agents.d` setup can work with no project
+        //    config at all.
+        if let Some(path) = project_path {
+            if std::fs::metadata(path).is_ok() {
+                let part = Self::load(path)?;
+                // Roles: project goes in unconditionally (project-wins
+                // is implemented at merge-into-global time below).
+                merged.roles.extend(part.roles);
+                // Models: project goes in unconditionally; the global
+                // model layer will be merged on top later if the
+                // caller wants field-filling semantics, but here we
+                // just preserve the union.
+                for m in part.models.models {
+                    if !merged.models.models.iter().any(|e| e.id == m.id) {
+                        merged.models.models.push(m);
+                    }
+                }
+                if let Some(t) = part.models.tiers {
+                    merged
+                        .models
+                        .tiers
+                        .get_or_insert_with(Default::default)
+                        .extend(t);
+                }
+                if let Some(rt) = part.models.role_tiers {
+                    let dst = merged
+                        .models
+                        .role_tiers
+                        .get_or_insert_with(Default::default);
+                    for (role, tier_map) in rt {
+                        dst.entry(role).or_insert_with(Default::default).extend(tier_map);
+                    }
+                }
+            }
+        }
+
+        // 2) Global layer. We try the canonical `$LATTE_HOME` (or
+        //    `~/.latte/`) for an `agents.d/` directory and a legacy
+        //    `agents.toml` single file. Both are optional.
+        if let Some(global_dir) = GlobalConfig::global_dir() {
+            // 2a) Directory of per-role toml files.
+            let agents_dir = global_dir.join("agents.d");
+            if std::fs::metadata(&agents_dir)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                let global_part = Self::load(agents_dir.to_str().unwrap())?;
+                // Project-wins per role id.
+                for (id, role) in global_part.roles {
+                    merged.roles.entry(id).or_insert(role);
+                }
+                // Models: only add ids the project did not define.
+                for m in global_part.models.models {
+                    if !merged.models.models.iter().any(|e| e.id == m.id) {
+                        merged.models.models.push(m);
+                    }
+                }
+                if let Some(t) = global_part.models.tiers {
+                    let dst = merged
+                        .models
+                        .tiers
+                        .get_or_insert_with(Default::default);
+                    for (k, v) in t {
+                        dst.entry(k).or_insert(v);
+                    }
+                }
+                if let Some(rt) = global_part.models.role_tiers {
+                    let dst = merged
+                        .models
+                        .role_tiers
+                        .get_or_insert_with(Default::default);
+                    for (role, tier_map) in rt {
+                        let entry = dst.entry(role).or_insert_with(Default::default);
+                        for (k, v) in tier_map {
+                            entry.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
+            // 2b) Legacy single-file ~/.latte/agents.toml.
+            let single = global_dir.join("agents.toml");
+            if single.is_file() {
+                let global_part = Self::load(single.to_str().unwrap())?;
+                for (id, role) in global_part.roles {
+                    merged.roles.entry(id).or_insert(role);
+                }
+                for m in global_part.models.models {
+                    if !merged.models.models.iter().any(|e| e.id == m.id) {
+                        merged.models.models.push(m);
+                    }
+                }
+                if let Some(t) = global_part.models.tiers {
+                    let dst = merged
+                        .models
+                        .tiers
+                        .get_or_insert_with(Default::default);
+                    for (k, v) in t {
+                        dst.entry(k).or_insert(v);
+                    }
+                }
+                if let Some(rt) = global_part.models.role_tiers {
+                    let dst = merged
+                        .models
+                        .role_tiers
+                        .get_or_insert_with(Default::default);
+                    for (role, tier_map) in rt {
+                        let entry = dst.entry(role).or_insert_with(Default::default);
+                        for (k, v) in tier_map {
+                            entry.entry(k).or_insert(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3) Built-in role fallback. If neither the project nor the
+        //    global layer declared any role, the binary still works
+        //    using the 10 hard-coded defaults from `prompts.rs`.
+        //    This makes `latte-agent` runnable on a fresh checkout
+        //    with no config files at all.
+        if merged.roles.is_empty() {
+            for id in [
+                "pm",
+                "architect",
+                "programmer",
+                "tester",
+                "reviewer",
+                "devops",
+                "security",
+                "designer",
+                "tech_writer",
+                "manager",
+            ] {
+                if let Some(tmpl) = crate::prompts::template_for(id) {
+                    merged.roles.insert(id.to_string(), tmpl);
+                }
+            }
+        }
+
+        Ok(merged)
     }
 
     /// Load every `*.toml` file in `dir` (non-recursive) and merge the
@@ -327,5 +487,242 @@ model_tier = "standard"
         assert!(format!("{}", err).contains("duplicate role 'pm'"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── load_with_global ────────────────────────────────────────────────
+
+    /// Helper: redirect `LATTE_HOME` to a temp dir for the duration of a
+    /// test, restoring the previous value afterwards. Takes a global
+    /// mutex so concurrent test threads don't clobber each other's
+    /// `LATTE_HOME` (env vars are process-wide, but cargo test runs
+    /// each `#[test]` on a separate thread).
+    fn with_latte_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let _guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+
+        let tmp = std::env::temp_dir().join(format!(
+            "latte_agent_test_home_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var("LATTE_HOME").ok();
+        std::env::set_var("LATTE_HOME", &tmp);
+        f(&tmp);
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_with_global_only_project() {
+        // No global layer: project roles only.
+        let tmp = std::env::temp_dir().join("latte_agent_test_lwg_project_only");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("pm.toml"),
+            r#"
+[roles.pm]
+id = "pm"
+name = "PM"
+category = "planning"
+model_tier = "standard"
+icon = "P"
+"#,
+        )
+        .unwrap();
+
+        with_latte_home(|_home| {
+            let cfg = AgentConfig::load_with_global(Some(tmp.to_str().unwrap())).unwrap();
+            assert_eq!(cfg.roles.len(), 1);
+            assert!(cfg.roles.contains_key("pm"));
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_with_global_fills_missing_from_global() {
+        // Project defines `pm`; global defines `architect`. Both should
+        // appear in the merged result, with project-wins on collision.
+        let project = std::env::temp_dir().join("latte_agent_test_lwg_project_fill");
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pm.toml"),
+            r#"
+[roles.pm]
+id = "pm"
+name = "PM_from_project"
+category = "planning"
+model_tier = "standard"
+icon = "P"
+"#,
+        )
+        .unwrap();
+
+        with_latte_home(|home| {
+            let agents_dir = home.join("agents.d");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(
+                agents_dir.join("architect.toml"),
+                r#"
+[roles.architect]
+id = "architect"
+name = "Arch_from_global"
+category = "planning"
+model_tier = "premium"
+icon = "A"
+"#,
+            )
+            .unwrap();
+
+            let cfg =
+                AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            assert_eq!(cfg.roles.len(), 2);
+            assert!(cfg.roles.contains_key("pm"));
+            assert!(cfg.roles.contains_key("architect"));
+            // Project-wins: PM came from project.
+            assert_eq!(cfg.roles["pm"].name, "PM_from_project");
+            // Architect came from global.
+            assert_eq!(cfg.roles["architect"].name, "Arch_from_global");
+        });
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn test_load_with_global_project_wins_on_collision() {
+        // Same id `pm` in both layers: project version wins.
+        let project = std::env::temp_dir().join("latte_agent_test_lwg_collision");
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pm.toml"),
+            r#"
+[roles.pm]
+id = "pm"
+name = "PM_project"
+category = "planning"
+model_tier = "standard"
+icon = "P"
+"#,
+        )
+        .unwrap();
+
+        with_latte_home(|home| {
+            let agents_dir = home.join("agents.d");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(
+                agents_dir.join("pm.toml"),
+                r#"
+[roles.pm]
+id = "pm"
+name = "PM_global"
+category = "planning"
+model_tier = "standard"
+icon = "G"
+"#,
+            )
+            .unwrap();
+
+            let cfg =
+                AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            assert_eq!(cfg.roles.len(), 1);
+            assert_eq!(cfg.roles["pm"].name, "PM_project");
+            assert_eq!(cfg.roles["pm"].icon, "P");
+        });
+        let _ = std::fs::remove_dir_all(&project);
+    }
+    // ── load_with_global: built-in role fallback ──────────────────────
+
+    #[test]
+    fn test_load_with_global_falls_back_to_builtin_roles() {
+        // No project, no global: only built-ins. We redirect
+        // LATTE_HOME to a temp dir with no `agents.d/`, so the
+        // global layer is empty, and the project path is a
+        // nonexistent path so the project layer is also empty.
+        with_latte_home(|_home| {
+            let cfg = AgentConfig::load_with_global(Some(
+                "/tmp/__definitely_nonexistent_for_builtin_test__",
+            ))
+            .unwrap();
+            // We expect at minimum the 10 built-ins.
+            for id in [
+                "pm",
+                "architect",
+                "programmer",
+                "tester",
+                "reviewer",
+                "devops",
+                "security",
+                "designer",
+                "tech_writer",
+                "manager",
+            ] {
+                assert!(
+                    cfg.roles.contains_key(id),
+                    "missing built-in role '{id}'"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_load_with_global_does_not_override_existing_with_builtin() {
+        // Project defines `pm`; the built-in should NOT clobber it
+        // (project-wins is the invariant). Built-ins are only used
+        // when no layer contributes any role.
+        let tmp = std::env::temp_dir().join("latte_agent_test_builtin_no_override");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("pm.toml"),
+            r#"
+[roles.pm]
+id = "pm"
+name = "PM_project_custom"
+category = "planning"
+model_tier = "standard"
+icon = "P"
+"#,
+        )
+        .unwrap();
+        with_latte_home(|_home| {
+            let cfg = AgentConfig::load_with_global(Some(tmp.to_str().unwrap())).unwrap();
+            assert_eq!(cfg.roles["pm"].name, "PM_project_custom");
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+
+    #[test]
+    fn test_load_with_global_only_global() {
+        // Project path is None; global layer supplies everything.
+        with_latte_home(|home| {
+            let agents_dir = home.join("agents.d");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(
+                agents_dir.join("pm.toml"),
+                r#"
+[roles.pm]
+id = "pm"
+name = "PM_global_only"
+category = "planning"
+model_tier = "standard"
+icon = "G"
+"#,
+            )
+            .unwrap();
+
+            let cfg = AgentConfig::load_with_global(None).unwrap();
+            assert_eq!(cfg.roles.len(), 1);
+            assert_eq!(cfg.roles["pm"].name, "PM_global_only");
+        });
     }
 }

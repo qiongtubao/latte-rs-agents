@@ -1,0 +1,9 @@
+[roles.architect]
+id = "architect"
+name = "System Architect"
+category = "planning"
+model_tier = "premium"
+prompt_file = "prompts/architect.md"
+temperature = 0.5
+tools = ["read", "list", "search"]
+icon = "🏗️"

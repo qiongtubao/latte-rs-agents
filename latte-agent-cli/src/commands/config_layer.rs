@@ -3,7 +3,7 @@
 //! Precedence (highest → lowest):
 //!
 //! 1. CLI overrides (`--api-key`, `--model-override id.field=value`).
-//! 2. Project config (typically `config/agents` + `config/models.toml`).
+//! 2. Project config (typically .latte/agents + .latte/models.toml).
 //! 3. Global config (`~/.latte/models.{yaml,toml}` or `~/.latte/models.d/*`).
 //!
 //! Within a layer, identical `model.id` entries merge by **filling empty
@@ -80,7 +80,10 @@ pub struct Resolved {
 /// Load the merged config and build a `ModelResolver` from it.
 ///
 /// `project_agents` and `project_models` are paths (file or directory) as
-/// accepted by `AgentConfig::load`. Pass `None` to skip that layer.
+/// accepted by `AgentConfig::load`. Pass `None` to skip the project
+/// layer entirely (the global layer `~/.latte/agents.d/` is still tried).
+/// A missing project path is silently skipped via
+/// [`AgentConfig::load_with_global`].
 ///
 /// The CLI overrides are applied last and on top of everything.
 pub fn load(
@@ -112,26 +115,28 @@ pub fn load(
         }
     }
 
-    // Layer 2: project (agents + models). Each path can be a file or
-    // directory; `AgentConfig::load` handles both layouts.
-    let mut project_cfg = AgentConfig::default();
+    // Layer 2: project (agents + models) merged with the global
+    // `~/.latte/agents.d/` directory via `load_with_global` (project-wins
+    // per role / model id; global fills in anything the project did not
+    // declare). A missing project path is silently skipped so a bare
+    // `~/.latte/agents.d` setup can drive the system end-to-end.
+    let mut project_cfg = AgentConfig::load_with_global(project_agents)?;
     if let Some(path) = project_agents {
-        let part = AgentConfig::load(path)?;
-        for id in part.roles.keys() {
-            if project_cfg.roles.contains_key(id) {
-                return Err(latte_agent_core::error::AgentError::Config(format!(
-                    "duplicate role '{}' across project configs",
-                    id
-                )));
-            }
+        if std::fs::metadata(path).is_ok() {
+            sources.project_agents = Some(path.to_string());
         }
-        merge_into(&mut project_cfg, &part);
-        sources.project_agents = Some(path.to_string());
     }
+    // Models: project wins, but the global `models.{yaml,toml}` /
+    // `models.d/*.yaml` is still merged on top below. We do NOT call
+    // `load_with_global` for models here because the global *models*
+    // layer is merged in a separate step (`global.merge_into_project`)
+    // that already implements id-based field-filling semantics.
     if let Some(path) = project_models {
-        let part = AgentConfig::load(path)?;
-        merge_into(&mut project_cfg, &part);
-        sources.project_models = Some(path.to_string());
+        if std::fs::metadata(path).is_ok() {
+            let part = AgentConfig::load(path)?;
+            merge_into(&mut project_cfg, &part);
+            sources.project_models = Some(path.to_string());
+        }
     }
 
     // Layer 1 (highest): CLI overrides.

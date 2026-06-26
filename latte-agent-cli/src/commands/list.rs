@@ -21,15 +21,15 @@ pub struct ListCmd {
     pub target: ListTarget,
 
     /// Path to agents config (file or directory).
-    #[arg(long, default_value = "config/agents")]
+    #[arg(long, default_value = ".latte/agents")]
     pub agents_config: String,
 
     /// Path to models config.
-    #[arg(long, default_value = "config/models.toml")]
+    #[arg(long, default_value = ".latte/models.toml")]
     pub models_config: String,
 
     /// Path to discussion workflows (file or directory).
-    #[arg(long, default_value = "config/workflows")]
+    #[arg(long, default_value = ".latte/workflows")]
     pub discussion_config: String,
 }
 
@@ -113,7 +113,7 @@ impl ListCmd {
     }
 
     async fn list_workflows(&self) -> AnyResult {
-        let registry = latte_agent_orchestrator::WorkflowRegistry::load(&self.discussion_config)
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(&self.discussion_config))
             .map_err(|e| format!("failed to load workflows: {}", e))?;
 
         if let Some(ref default_wf) = registry.default {

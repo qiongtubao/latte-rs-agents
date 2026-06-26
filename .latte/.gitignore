@@ -1,0 +1,2 @@
+# Per-session chat logs are runtime artefacts, not configuration.
+logs/

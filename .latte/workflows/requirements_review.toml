@@ -1,0 +1,23 @@
+name = "requirements_review"
+description = "PM presents requirements, team discusses feasibility and scope."
+max_rounds = 2
+
+[[steps]]
+id = "present"
+speakers = ["pm"]
+prompt = "Present the requirements for: {{topic}}. Include user stories with acceptance criteria."
+
+[[steps]]
+id = "architecture"
+speakers = ["architect"]
+prompt = "Review technical feasibility and suggest architecture for the requirements above."
+
+[[steps]]
+id = "estimate"
+speakers = ["programmer", "tester"]
+prompt = "Estimate effort and identify risks. Programmer: implementation complexity and rough timeline. Tester: test surface and edge cases."
+
+[[steps]]
+id = "decide"
+speakers = ["manager", "pm"]
+prompt = "Based on the discussion, finalize scope and priorities. Manager: assess risk and timeline feasibility."

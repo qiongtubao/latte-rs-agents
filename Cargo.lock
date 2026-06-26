@@ -1024,16 +1024,13 @@ dependencies = [
 name = "latte-ai"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "futures-util",
- "parking_lot",
  "reqwest",
  "reqwest-eventsource",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
- "toml",
  "tracing",
 ]
 

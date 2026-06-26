@@ -55,12 +55,150 @@ pub fn for_role(id: &str) -> Option<&'static str> {
     })
 }
 
+/// Default role template factory for built-in roles. Returns `Some`
+/// only for the 10 hard-coded roles below; callers use this when no
+/// project config and no global config is present so the binary can
+/// still serve its built-in defaults.
+///
+/// The role metadata (id, name, category, model_tier, tools, icon)
+/// is duplicated from `.latte/agents/<id>.toml` because we want the
+/// binary to work without that directory existing on disk. Keep the
+/// two in sync when changing role metadata.
+pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
+    use crate::role::RoleTemplate;
+    Some(match id {
+        "pm" => RoleTemplate {
+            id: "pm".into(),
+            name: "Product Manager".into(),
+            category: "planning".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None, // built-in; RoleTemplate::resolve will
+                               // fall through to `for_role`.
+            temperature: Some(0.7),
+            tools: vec!["read".into(), "list".into(), "search".into()],
+            icon: "📋".into(),
+        },
+        "architect" => RoleTemplate {
+            id: "architect".into(),
+            name: "System Architect".into(),
+            category: "planning".into(),
+            model_tier: "premium".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.5),
+            tools: vec!["read".into(), "list".into(), "search".into()],
+            icon: "🏗️".into(),
+        },
+        "programmer" => RoleTemplate {
+            id: "programmer".into(),
+            name: "Software Engineer".into(),
+            category: "execution".into(),
+            model_tier: "budget".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.3),
+            tools: vec![
+                "read".into(),
+                "write".into(),
+                "bash".into(),
+                "search".into(),
+            ],
+            icon: "💻".into(),
+        },
+        "tester" => RoleTemplate {
+            id: "tester".into(),
+            name: "QA Engineer".into(),
+            category: "verification".into(),
+            model_tier: "budget".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.4),
+            tools: vec![
+                "read".into(),
+                "list".into(),
+                "bash".into(),
+                "search".into(),
+            ],
+            icon: "🧪".into(),
+        },
+        "reviewer" => RoleTemplate {
+            id: "reviewer".into(),
+            name: "Code Reviewer".into(),
+            category: "verification".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.4),
+            tools: vec!["read".into(), "list".into(), "search".into()],
+            icon: "🔍".into(),
+        },
+        "devops" => RoleTemplate {
+            id: "devops".into(),
+            name: "DevOps Engineer".into(),
+            category: "execution".into(),
+            model_tier: "budget".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.3),
+            tools: vec!["read".into(), "bash".into(), "write".into()],
+            icon: "🚀".into(),
+        },
+        "security" => RoleTemplate {
+            id: "security".into(),
+            name: "Security Auditor".into(),
+            category: "verification".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.4),
+            tools: vec!["read".into(), "list".into(), "search".into()],
+            icon: "🛡️".into(),
+        },
+        "designer" => RoleTemplate {
+            id: "designer".into(),
+            name: "UI/UX Designer".into(),
+            category: "planning".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.7),
+            tools: vec!["read".into()],
+            icon: "🎨".into(),
+        },
+        "tech_writer" => RoleTemplate {
+            id: "tech_writer".into(),
+            name: "Technical Writer".into(),
+            category: "execution".into(),
+            model_tier: "budget".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.5),
+            tools: vec!["read".into(), "write".into()],
+            icon: "📝".into(),
+        },
+        "manager" => RoleTemplate {
+            id: "manager".into(),
+            name: "Engineering Manager".into(),
+            category: "planning".into(),
+            model_tier: "premium".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.5),
+            tools: vec!["read".into()],
+            icon: "👔".into(),
+        },
+        _ => return None,
+    })
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every role defined in `latte-rs-agents/config/agents.toml`
-    /// must have a matching prompt here. Adding a role upstream
+    /// Every role declared by `prompts::template_for` below must
+    /// have a matching prompt here. Adding a role upstream
     /// without adding the prompt constant will fail this test.
     #[test]
     fn all_default_roles_have_prompts() {

@@ -157,6 +157,72 @@ impl WorkflowRegistry {
             Self::load_file(path)
         }
     }
+    /// Load project + global workflow registries and merge them.
+    ///
+    /// Lookup order:
+    /// 1. `project_path` if it exists. Missing path is silently skipped.
+    /// 2. `~/.latte/workflows.d/` (directory) if it exists.
+    /// 3. `~/.latte/discussion.toml` (single file) if it exists.
+    ///
+    /// On id collision, **project-wins**: the project's workflow
+    /// replaces the global one. The `default` slot is set from
+    /// whichever layer has a `default.toml` / `name = "default"`
+    /// workflow — if both do, the project's wins. When neither is
+    /// present, returns an empty registry.
+    pub fn load_with_global(project_path: Option<&str>) -> OrchResult<Self> {
+        let mut merged = Self::default();
+
+        // 1) Project path, if it exists.
+        if let Some(path) = project_path {
+            if std::fs::metadata(path).is_ok() {
+                let part = Self::load(path)?;
+                // Project's `default` wins if the global layer also
+                // contributes one.
+                if part.default.is_some() {
+                    merged.default = part.default.clone();
+                }
+                for (id, wf) in part.workflows {
+                    // Project always wins per id.
+                    merged.workflows.insert(id, wf);
+                }
+            }
+        }
+
+        // 2) Global layer. Uses the same $LATTE_HOME / ~/.latte/
+        //    resolution that the model global config uses.
+        if let Some(global_dir) =
+            latte_agent_core::global_config::GlobalConfig::global_dir()
+        {
+            // 2a) Directory of per-workflow toml files.
+            let wf_dir = global_dir.join("workflows.d");
+            if std::fs::metadata(&wf_dir)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                let global_part = Self::load(wf_dir.to_str().unwrap())?;
+                if merged.default.is_none() {
+                    merged.default = global_part.default;
+                }
+                for (id, wf) in global_part.workflows {
+                    // Project-wins; only add ids the project did not define.
+                    merged.workflows.entry(id).or_insert(wf);
+                }
+            }
+            // 2b) Legacy single-file ~/.latte/discussion.toml.
+            let single = global_dir.join("discussion.toml");
+            if single.is_file() {
+                let global_part = Self::load(single.to_str().unwrap())?;
+                if merged.default.is_none() {
+                    merged.default = global_part.default;
+                }
+                for (id, wf) in global_part.workflows {
+                    merged.workflows.entry(id).or_insert(wf);
+                }
+            }
+        }
+
+        Ok(merged)
+    }
     /// Load every `*.toml` in `dir` (non-recursive). Each file is parsed
     /// as a single `DiscussionWorkflow`. A file named `default.toml` (or
     /// whose `name` field is "default") is also stored in the default slot.
@@ -437,4 +503,133 @@ prompt = "Hi"
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // ── load_with_global ────────────────────────────────────────────────
+
+    /// Helper: redirect `LATTE_HOME` to a temp dir for the duration of a
+    /// test, restoring the previous value afterwards. Takes a global
+    /// mutex so concurrent test threads don't clobber each other's
+    /// `LATTE_HOME` (env vars are process-wide, but cargo test runs
+    /// each `#[test]` on a separate thread).
+    fn with_latte_home<F: FnOnce(&std::path::Path)>(f: F) {
+        use std::sync::Mutex;
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+
+        let tmp = std::env::temp_dir().join(format!(
+            "latte_wf_test_home_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let prev = std::env::var("LATTE_HOME").ok();
+        std::env::set_var("LATTE_HOME", &tmp);
+        f(&tmp);
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_with_global_only_project() {
+        // No global layer; project workflows only.
+        let tmp = std::env::temp_dir().join("latte_wf_lwg_project_only");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("code_review.toml"),
+            r#"
+name = "code_review"
+description = "Project"
+[[steps]]
+id = "s1"
+speakers = ["reviewer"]
+prompt = "Review"
+"#,
+        )
+        .unwrap();
+        with_latte_home(|_home| {
+            let reg = WorkflowRegistry::load_with_global(Some(tmp.to_str().unwrap())).unwrap();
+            assert_eq!(reg.workflows.len(), 1);
+            assert!(reg.workflows.contains_key("code_review"));
+            assert_eq!(
+                reg.workflows["code_review"].description,
+                "Project"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_load_with_global_fills_missing() {
+        // Project has `code_review`; global has `bug_triage`. Both end
+        // up in the registry, project-wins on collision.
+        let project = std::env::temp_dir().join("latte_wf_lwg_fill");
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("code_review.toml"),
+            r#"
+name = "code_review"
+description = "From_project"
+[[steps]]
+id = "s1"
+speakers = ["reviewer"]
+prompt = "Review"
+"#,
+        )
+        .unwrap();
+        with_latte_home(|home| {
+            let wf_dir = home.join("workflows.d");
+            std::fs::create_dir_all(&wf_dir).unwrap();
+            std::fs::write(
+                wf_dir.join("bug_triage.toml"),
+                r#"
+name = "bug_triage"
+description = "From_global"
+[[steps]]
+id = "s1"
+speakers = ["tester"]
+prompt = "Triage"
+"#,
+            )
+            .unwrap();
+            let reg =
+                WorkflowRegistry::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            assert_eq!(reg.workflows.len(), 2);
+            assert!(reg.workflows.contains_key("code_review"));
+            assert!(reg.workflows.contains_key("bug_triage"));
+            assert_eq!(reg.workflows["code_review"].description, "From_project");
+            assert_eq!(reg.workflows["bug_triage"].description, "From_global");
+        });
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn test_load_with_global_only_global() {
+        // No project path; global layer supplies everything.
+        with_latte_home(|home| {
+            let wf_dir = home.join("workflows.d");
+            std::fs::create_dir_all(&wf_dir).unwrap();
+            std::fs::write(
+                wf_dir.join("default.toml"),
+                r#"
+name = "default"
+description = "From_global_only"
+[[steps]]
+id = "s1"
+speakers = ["pm"]
+prompt = "Hi"
+"#,
+            )
+            .unwrap();
+            let reg = WorkflowRegistry::load_with_global(None).unwrap();
+            assert_eq!(reg.workflows.len(), 1);
+            assert!(reg.workflows.contains_key("default"));
+            assert!(reg.default.is_some());
+            assert_eq!(reg.default.as_ref().unwrap().description, "From_global_only");
+        });
+    }
 }
