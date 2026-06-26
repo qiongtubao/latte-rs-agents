@@ -22,3 +22,10 @@ toml = { workspace = true }
 serde_yaml = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# `tempfile` was already in Cargo.lock as a transitive dep; pinning it
+# explicitly here avoids surprise version bumps the next time the lock
+# is regenerated. Used by tests/blackbox/common to create per-test
+# isolated LATTE_HOME directories.
+tempfile = "3"
