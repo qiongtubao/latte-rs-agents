@@ -952,21 +952,17 @@ async fn register_delegate_tool(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| tool_err("missing 'task' field".into()))?
                     .to_string();
-
                 // Surface the dispatch to the user. The chat log
                 // records these as structured events, but the user
                 // running interactively needs to see *something*
                 // happen during the spinner — a 60s specialist
                 // run otherwise feels like a hang. Use eprintln
                 // so we don't fight the spinner on stdout.
-                // Truncate the task to one line.
-                let task_preview: String = task
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-                    .replace('\n', " ");
+                // We print the dispatch *after* resolving the
+                // specialist's model chain so the header line
+                // carries the model id + tier the user is about
+                // to wait on.
                 let dispatch_start = std::time::Instant::now();
-                eprintln!("  → delegating to {}: \"{}\"", role_id, task_preview);
 
                 // Resolve the role and build a temporary AgentRunner.
                 let template = merged
@@ -985,6 +981,18 @@ async fn register_delegate_tool(
                     .map_err(|e| {
                         tool_err(format!("no model for role '{}': {}", role_id, e))
                     })?;
+                // Print the dispatch header now that we know which
+                // model the specialist will use. Multi-line task
+                // is shown verbatim so the user can see what was
+                // actually sent to the specialist.
+                eprintln!(
+                    "  → delegating to {} (model={}, tier={})",
+                    role_id, models[0].id, tier.label(),
+                );
+                eprintln!("    task:");
+                for line in task.lines() {
+                    eprintln!("      | {}", line);
+                }
                 let agent = Agent::new_with_chain(
                     role_id.clone(),
                     role.clone(),
@@ -994,7 +1002,6 @@ async fn register_delegate_tool(
                 .map_err(|e| {
                     tool_err(format!("failed to create agent for '{}': {}", role_id, e))
                 })?;
-                // Give the specialist the tools its role template allows
                 // (e.g. programmer has read/write/bash/search). Without
                 // this the specialist answers "I have no file access" —
                 // the bug we hit in late June 2026 where the manager
