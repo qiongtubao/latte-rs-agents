@@ -1119,10 +1119,13 @@ const DELEGATE_TOOL_HINT: &str = r#"
 
 ### Delegating to specialists
 
-You also have access to a `delegate` tool that dispatches a subtask
-to a specialist agent and returns the result. Use it for substantive
-code analysis or work that a specialist is best at.
+You have access to a `delegate` tool that dispatches a subtask to a
+specialist agent and returns the result. For substantive work —
+code analysis, architecture review, testing strategy, security audit,
+multi-file refactors — you SHOULD fan out to the right specialists
+in parallel and synthesize the results.
 
+Example:
 <tool_call>delegate {"role": "programmer", "task": "Read src/agent.rs and summarize the AgentRunner::run_turn flow"}</tool_call>
 
 Available specialist roles: programmer, architect, reviewer, tester,
@@ -1138,6 +1141,28 @@ When to delegate:
 You can call `delegate` multiple times in parallel (in one response
 with multiple `<tool_call>` blocks) to fan out independent subtasks.
 Synthesize the results into a coherent answer.
+
+#### When you answer directly without delegating
+
+You are allowed to answer directly (without using `delegate`) when the
+task is small enough that a specialist dispatch would be overkill —
+e.g. a one-line explanation, a quick definition, a small code snippet,
+a single-file edit. Use your judgement.
+
+BUT: when you choose to answer directly, your response MUST start with
+a `## Why no delegation` section that briefly explains why the task
+doesn't warrant a specialist dispatch. Format:
+
+    ## Why no delegation
+    <one or two sentences: what kind of task this is, and why a
+    specialist round-trip would be unnecessary overhead>
+
+    <then your actual answer>
+
+This gives the user visibility into your routing decision. If the
+reasoning is wrong, the user can correct you and re-prompt. Do NOT
+skip this section — a direct answer with no justification will be
+treated as a routing error.
 "#;
 fn print_help() {
     println!(
