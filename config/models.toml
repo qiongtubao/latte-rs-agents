@@ -171,4 +171,30 @@ max_tokens = 16384
 supports_thinking = false
 cost_per_million_input = 2.50
 cost_per_million_output = 10.0
+
+# ─── GLM Models ──────────────────────────────────────────────────────────────
+# GLM 5.2 (Zhipu/Z.AI). Per-model `timeout_secs = 120` because the model
+# is slow on 8-step tasks; the default 60s in the CLI fires before GLM
+# can complete. Resolution order in `register_delegate_tool`:
+#   1. model.timeout_secs  (this field — 120s for glm-5.2)
+#   2. LATTE_AGENT_DELEGATE_TIMEOUT_SECS env var
+#   3. DEFAULT_DELEGATE_TIMEOUT_SECS (60s)
+#
+# `api_key` uses ${GLM_API_KEY} so secrets stay out of git. Operators
+# set the env var in their shell, or override via the global
+# ~/.latte/models.yaml (which is gitignored).
+
+[[models.models]]
+id = "glm-5.2"
+name = "GLM 5.2"
+api = "openai"
+provider = "glm"
+base_url = "https://yuanyuaicloud.cn/v1"
+api_key = "${GLM_API_KEY}"
+context_window = 1000000
+max_tokens = 384000
+supports_thinking = false
+cost_per_million_input = 0.27
+cost_per_million_output = 1.10
 tier = "standard"
+timeout_secs = 120  # GLM 5.2 is slow on 8-step tasks

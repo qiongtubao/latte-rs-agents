@@ -361,6 +361,16 @@ impl ModelResolver {
             cost_per_million_output: def.cost_per_million_output.unwrap_or(0.0),
         })
     }
+    /// Look up the raw `ModelDef` for a model id, returning the catalog
+    /// entry unchanged. Used by callers that need fields `Model` doesn't
+    /// surface (e.g. `timeout_secs` for the `delegate` tool's
+    /// per-model timeout budget). `Model` is a `latte_ai` value with a
+    /// fixed schema, so we can't add fields there without modifying a
+    /// foreign crate; this lookup lets the CLI pull per-model config
+    /// out of the catalog without round-tripping through `Model`.
+    pub fn get_def(&self, model_id: &str) -> Option<&ModelDef> {
+        self.models.get(model_id)
+    }
 }
 
 /// Resolve `${ENV_VAR}` placeholders in a string.
@@ -435,6 +445,7 @@ mod tests {
             cost_per_million_input: Some(0.0),
             cost_per_million_output: Some(0.0),
             tier: tier.map(|s| s.into()),
+            timeout_secs: None,
         }
     }
 

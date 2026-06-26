@@ -552,6 +552,62 @@ impl TraceSink for ScopedSink {
         self.inner.emit(event);
     }
 }
+
+/// Drops events whose `variant_name()` isn't in the allow-list. Used by
+/// the `--debug-events` CLI flag to filter the on-stdout debug stream
+/// down to a subset of `TraceEvent` variants (e.g. `ToolExec,HookFired`).
+/// The JsonlSink / IndexSink stay unfiltered — operators still want
+/// the full trace on disk; the filter is only for the live stdout view.
+/// `allow: "all"` (or empty) disables filtering; any other comma-separated
+/// string is treated as variant names. Comparison is exact-match against
+/// `TraceEvent::variant_name()` (e.g. `"ToolExec"`, `"HookFired"`,
+/// `"ModelCall"`).
+pub struct FilterSink {
+    inner: std::sync::Arc<dyn TraceSink>,
+    /// Set of allowed variant names. `None` means "all" (no filter);
+    /// `Some(empty)` means "match nothing" (filter out everything).
+    allowed: Option<std::collections::HashSet<String>>,
+}
+
+impl FilterSink {
+    /// Build a `FilterSink` from a comma-separated list. `"all"` or
+    /// `""` means no filtering (every event passes through). Otherwise the
+    /// string is split on `,` and each token is treated as a variant
+    /// name. Whitespace around tokens is trimmed.
+    ///
+    /// Unknown variant names pass through silently — the filter is
+    /// best-effort and shouldn't fail the program if a user typo'd
+    /// `ToolExecution` instead of `ToolExec`. Operators will simply
+    /// see fewer events than they expected, which is recoverable.
+    pub fn new(inner: std::sync::Arc<dyn TraceSink>, filter: &str) -> Self {
+        let trimmed = filter.trim();
+        let allowed = if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+            None
+        } else {
+            Some(
+                trimmed
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            )
+        };
+        Self { inner, allowed }
+    }
+}
+
+impl TraceSink for FilterSink {
+    fn emit(&self, event: TraceEvent) {
+        if let Some(allowed) = &self.allowed {
+            // `variant_name()` returns `&'static str`; `HashSet<String>`
+            // lookups accept `&str` via `Borrow`, so no allocation here.
+            if !allowed.contains(event.variant_name()) {
+                return;
+            }
+        }
+        self.inner.emit(event);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

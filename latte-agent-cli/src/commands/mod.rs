@@ -43,10 +43,22 @@ pub fn build_debug_sink(
             DebugFormat::Pretty => Arc::new(latte_agent_core::trace::StdoutSink::new(true)),
             DebugFormat::Jsonl => Arc::new(latte_agent_core::trace::StdoutSink::new_jsonl()),
         };
+        // Apply the --debug-events filter on top of the stdout sink only.
+        // The JSONL sink and the session index are deliberately unfiltered
+        // so the on-disk trace keeps every event (operators can re-filter
+        // post-hoc with `latte-agent debug trace --filter ...`).
+        let stdout: Arc<dyn TraceSink> = match &flags.debug_events {
+            Some(filter) => Arc::new(latte_agent_core::trace::FilterSink::new(stdout, filter)),
+            None => stdout,
+        };
         let fanout = Arc::new(latte_agent_core::trace::FanoutSink::new(vec![
             jsonl,
             stdout,
         ]));
+        // Wrap the (jsonl + filtered-stdout) fanout in an outer
+        // fanout that also writes to the always-on session index.
+        // Two layers so a stdout-only filter doesn't drop the JSONL
+        // or the index — both are written unconditionally.
         Arc::new(latte_agent_core::trace::FanoutSink::new(vec![
             fanout,
             index_sink,
@@ -79,6 +91,13 @@ pub struct DebugFlags {
     pub debug_format: DebugFormat,
     pub debug_hooks: Vec<String>,
     pub no_session_index: bool,
+    /// Comma-separated list of TraceEvent variant names to forward to
+    /// the on-stdout debug stream. `None` or `"all"` means no filter
+    /// (every event lands on stdout). Wired to the `--debug-events`
+    /// CLI flag. The JSONL trace and session index stay unfiltered
+    /// so the full event stream is still on disk — the filter is only
+    /// for the live stdout view.
+    pub debug_events: Option<String>,
     /// Canonical session id for this run. For chat it's the stem of
     /// the per-session ChatLog file (`chat-YYYYMMDD-HHMMSS-<pid>`),
     /// so the trace JSONL, session idx, and chat log all share a
@@ -133,7 +152,6 @@ mod tests {
     /// HIGH 3 verification: `build_debug_sink` should honor
     /// `LATTE_HOME` so tests and sandboxed dev envs can redirect
     /// the `~/.latte/traces/...` and `~/.latte/sessions/...` writes.
-    /// We sniff the sink by inspecting the `IndexSink`'s on-disk
     /// path via a custom no-op sink that records what was passed.
     #[test]
     fn debug_sink_uses_latte_home_when_set() {
@@ -143,6 +161,7 @@ mod tests {
             debug_format: crate::commands::debug::DebugFormat::Jsonl,
             debug_hooks: vec![],
             no_session_index: false,
+            debug_events: None,
             session_id: "test-sess".into(),
         };
         // The sink is built but we don't run it; we just verify it
@@ -169,6 +188,7 @@ mod tests {
             debug_format: crate::commands::debug::DebugFormat::Auto,
             debug_hooks: vec![],
             no_session_index: false,
+            debug_events: None,
             session_id: "test-sess-fallback".into(),
         };
         let _sink = build_debug_sink(&flags.session_id, &flags);

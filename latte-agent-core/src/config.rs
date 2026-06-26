@@ -158,7 +158,13 @@ pub struct ModelCatalog {
 /// A single model definition in the catalog.
 ///
 /// Compatible with `latte-rs-model-router/models.toml` format, extended with
-/// optional `tier` and `supports_thinking` fields.
+/// optional `tier`, `supports_thinking`, and `timeout_secs` fields.
+///
+/// `timeout_secs` is used by the `delegate` tool to set the per-specialist
+/// wall-clock budget. Resolution order in the CLI:
+/// 1. `model.timeout_secs` from this field (per-model override)
+/// 2. `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` env var
+/// 3. `DEFAULT_DELEGATE_TIMEOUT_SECS` (60s)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     /// Model identifier (e.g. "claude-sonnet-4-20250514").
@@ -189,6 +195,12 @@ pub struct ModelDef {
     /// Which tier this model belongs to (for auto-resolution without explicit tier map).
     #[serde(default)]
     pub tier: Option<String>,
+    /// Per-specialist wall-clock timeout (seconds) for the `delegate` tool.
+    /// Default: 60s if not set; can be overridden per-model and via
+    /// `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`. Used by slow models (e.g. GLM 5.2
+    /// on 8-step tasks) that need a longer budget than the global default.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[cfg(test)]

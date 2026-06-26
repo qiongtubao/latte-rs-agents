@@ -324,6 +324,17 @@ impl std::fmt::Debug for Agent {
 /// Returns `None` for non-retryable errors (auth, config, serialization,
 /// caller-fault 4xx other than 429). The agent should surface these
 /// immediately rather than walking the fallback chain.
+/// Surface hook fires to stderr so the operator sees the hook
+/// chain in action without grepping the trace JSONL. One line
+/// per fire, easy to grep:
+///   [hook] redact_pii PreCall: continue
+///   [hook] enforce_tool_allowlist PreTool: mutate
+/// Called from every run_pre_*/post_* site in run_turn so it
+/// covers PreCall / PostResponse / PostParse / PreTool / PostTool.
+fn log_hook_fire(name: &str, point: crate::trace::HookPoint, kind: &str) {
+    eprintln!("[hook] {} {:?}: {}", name, point, kind);
+}
+
 fn cooldown_for_error(e: &AiError) -> Option<Duration> {
     match e {
         // Vendor told us how long to wait — respect it (floor 1s).
@@ -546,6 +557,7 @@ impl AgentRunner {
                     point,
                     outcome_kind: kind.to_string(),
                 });
+                log_hook_fire(hook_name, point, kind);
             });
             if let crate::hooks::HookOutcome::Abort { reason } = &outcome {
                 return Err(AgentError::HookAborted {
@@ -627,6 +639,7 @@ impl AgentRunner {
                         point,
                         outcome_kind: kind.to_string(),
                     });
+                    log_hook_fire(hook_name, point, kind);
                 });
                 if let crate::hooks::HookOutcome::Abort { reason } = &outcome {
                     return Err(AgentError::HookAborted {
@@ -671,6 +684,7 @@ impl AgentRunner {
                         point,
                         outcome_kind: kind.to_string(),
                     });
+                    log_hook_fire(hook_name, point, kind);
                 });
                 match outcome {
                     crate::hooks::HookOutcome::Abort { reason } => {
@@ -722,6 +736,7 @@ impl AgentRunner {
                                 point,
                                 outcome_kind: kind.to_string(),
                             });
+                            log_hook_fire(hook_name, point, kind);
                         });
                         match outcome {
                             crate::hooks::HookOutcome::Abort { reason } => {
@@ -789,6 +804,7 @@ impl AgentRunner {
                                         point,
                                         outcome_kind: kind.to_string(),
                                     });
+                                    log_hook_fire(hook_name, point, kind);
                                 });
                                 match outcome {
                                     crate::hooks::HookOutcome::Abort { reason } => {

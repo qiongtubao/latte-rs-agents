@@ -94,6 +94,13 @@ pub struct ChatCmd {
     #[arg(long, value_delimiter = ',', default_value = "")]
     pub debug_hooks: Vec<String>,
 
+    /// Filter the on-stdout `--debug` stream to a comma-separated list
+    /// of `TraceEvent` variant names (e.g. `ToolExec,HookFired,ModelCall`).
+    /// Default is `all` (no filter — every event lands on stdout).
+    /// The JSONL trace and session index stay unfiltered regardless.
+    #[arg(long, value_name = "NAMES|all", default_value = "all")]
+    pub debug_events: String,
+
     /// Opt out of the always-on metadata index. Useful on shared
     /// machines where the file's contents are sensitive.
     #[arg(long)]
@@ -150,15 +157,16 @@ impl ChatCmd {
         let initial_role = self.role.clone().unwrap_or_else(|| "manager".into());
         let initial_tier = parse_tier(&self.tier)?;
         let initial_primary = self.model_id.as_deref();
-
-        // Build the DebugFlags bundle once and reuse it everywhere —
-        // the session_id is part of it so the runner's TraceMeta,
-        // the per-session idx, and the trace JSONL all line up.
         let debug_flags = super::DebugFlags {
             debug: self.debug,
             debug_format: self.debug_format,
             debug_hooks: self.debug_hooks.clone(),
             no_session_index: self.no_session_index,
+            debug_events: if self.debug_events.eq_ignore_ascii_case("all") {
+                None
+            } else {
+                Some(self.debug_events.clone())
+            },
             session_id: session_id.clone(),
         };
 
@@ -813,10 +821,14 @@ async fn build_runner(
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(DEFAULT_DELEGATE_CONCURRENCY)
             )),
+            // Per-model timeout is resolved inside the closure after
+            // the specialist's model chain is known (model.timeout_secs
+            // > env > DEFAULT_DELEGATE_TIMEOUT_SECS). The env value
+            // is captured once here since the env doesn't change at
+            // runtime.
             std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
                 .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+                .and_then(|s| s.parse().ok()),
             // Pass the manager's real sink through — without this every
             // specialist's HookFired / ToolExec / TurnEnd event was
             // emitted to NullSink and never reached stdout / jsonl /
@@ -888,13 +900,19 @@ pub async fn build_tool_manager(
 /// Register a `delegate` tool on the tool manager. The tool lets the
 /// manager agent dispatch subtasks to specialist roles (programmer,
 /// architect, reviewer, etc.) and receive their responses.
+///
+/// `env_timeout_secs` is the `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` value
+/// resolved once at the call site (env doesn't change at runtime);
+/// the per-call timeout is then resolved as
+/// `model.timeout_secs > env_timeout_secs > DEFAULT_DELEGATE_TIMEOUT_SECS`
+/// — see the closure below. Default 60s.
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: Arc<AgentConfig>,
     resolver: Arc<ModelResolver>,
     default_params: GenerateParams,
     delegate_sem: Arc<Semaphore>,
-    delegate_timeout_secs: u64,
+    env_timeout_secs: Option<u64>,
     delegate_sink: Arc<dyn latte_agent_core::trace::TraceSink>,
 ) -> AnyResult {
     use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputProperty, ToolInputSchema};
@@ -931,14 +949,13 @@ async fn register_delegate_tool(
         required: Some(vec!["role".into(), "task".into()]),
         ..Default::default()
     };
-
     let handler: latte_rs_agent_tools::types::SharedToolHandler =
         std::sync::Arc::new(move |input: serde_json::Value, _ctx| {
             let merged = Arc::clone(&merged);
             let resolver = Arc::clone(&resolver);
             let default_params = default_params.clone();
             let sem = Arc::clone(&delegate_sem);
-            let timeout_s = delegate_timeout_secs;
+            let env_timeout = env_timeout_secs;
             let sink = Arc::clone(&delegate_sink);
             Box::pin(async move {
                 let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
@@ -980,7 +997,19 @@ async fn register_delegate_tool(
                     .resolve_chain(&role.id, tier, &role.model_chain)
                     .map_err(|e| {
                         tool_err(format!("no model for role '{}': {}", role_id, e))
-                    })?;
+                })?;
+                // Resolve the per-specialist wall-clock timeout. Order:
+                //   1. `model.timeout_secs` from the model catalog (per-model
+                //      override — e.g. glm-5.2 sets 120s because it's slow
+                //      on 8-step tasks)
+                //   2. `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` (env, captured
+                //      once at startup as `env_timeout`)
+                //   3. `DEFAULT_DELEGATE_TIMEOUT_SECS` (60s)
+                let timeout_s = resolver
+                    .get_def(&models[0].id)
+                    .and_then(|d| d.timeout_secs)
+                    .or(env_timeout)
+                    .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS);
                 // Print the dispatch header now that we know which
                 // model the specialist will use. Multi-line task
                 // is shown verbatim so the user can see what was

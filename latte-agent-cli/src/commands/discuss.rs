@@ -73,6 +73,11 @@ pub struct DiscussCmd {
     #[arg(long, value_delimiter = ',', default_value = "")]
     pub debug_hooks: Vec<String>,
 
+    /// Filter the on-stdout `--debug` stream to a comma-separated list
+    /// of `TraceEvent` variant names. Default is `all` (no filter).
+    #[arg(long, value_name = "NAMES|all", default_value = "all")]
+    pub debug_events: String,
+
     /// Opt out of the always-on metadata index.
     #[arg(long)]
     pub no_session_index: bool,
@@ -116,6 +121,11 @@ impl DiscussCmd {
             debug_format: self.debug_format,
             debug_hooks: self.debug_hooks.clone(),
             no_session_index: self.no_session_index,
+            debug_events: if self.debug_events.eq_ignore_ascii_case("all") {
+                None
+            } else {
+                Some(self.debug_events.clone())
+            },
             session_id: session_id.clone(),
         };
 
