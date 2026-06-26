@@ -287,12 +287,12 @@ impl TraceEvent {
             TraceEvent::PromptBuilt { est_input_tokens, history_len, user_input, .. } =>
                 format!("est_input={} history_len={} user_input={:?}",
                     est_input_tokens, history_len,
-                    if user_input.len() > 60 { format!("{}…", &user_input[..60]) } else { user_input.clone() }),
+                    truncate_for_pretty(user_input, 60)),
             TraceEvent::ModelCall { model_id, latency_ms, finish_reason, .. } =>
                 format!("model={} latency={}ms finish={}", model_id, latency_ms, finish_reason),
             TraceEvent::ModelRawOut { raw_content, .. } =>
                 format!("{} chars: {}", raw_content.len(),
-                    if raw_content.len() > 80 { format!("{}…", &raw_content[..80]) } else { raw_content.clone() }),
+                    truncate_for_pretty(raw_content, 80)),
             TraceEvent::ParseToolCalls { parsed, diagnostics, .. } =>
                 format!("parsed={} opens={} matched={} unmatched={}",
                     parsed.len(), diagnostics.opens_found, diagnostics.closes_matched, diagnostics.unmatched_opens.len()),
