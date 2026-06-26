@@ -20,6 +20,33 @@
 > project, and so the binary's built-in defaults (compiled in via
 > `prompts.rs::template_for`) match a checked-in example.
 
+## Internationalisation
+
+All role prompts (`prompts/*.md`) and workflows (`.latte/workflows/*.toml`)
+in this repo are written in **Simplified Chinese**. They are the source
+of truth that `latte-agent` compiles into the binary via
+`include_str!`, and they are mirrored to `.latte/prompts.d/` and
+`~/.latte/prompts.d/` for the runtime override chain.
+
+If you want to ship your own role definitions or workflows in a different
+language, the layering is:
+
+1. **Compile-time defaults** (in the binary): `prompts/<id>.md` and
+   `config/agents.toml` (role metadata) are embedded via `include_str!`
+   in `latte-agent-core/src/prompts.rs::template_for`. Re-bake the
+   binary to change.
+2. **Project-level runtime override** (per project): `.latte/prompts.d/`
+   and `.latte/agents.d/`. The first file matching `<role>.md` wins;
+   fall-through order is the role's `prompt_file` (project) →
+   `~/.latte/prompts.d/` (global) → `prompts::for_role` (compile-time).
+3. **Global runtime override** (per user, per machine):
+   `~/.latte/prompts.d/` and `~/.latte/agents.d/`. Same fall-through rules.
+
+XML-tagged regions inside prompts (`<role>`, `<rules>`,
+`<tool_calldelegate>`) and tool names (`delegate`, `bash`, `read`,
+`write`, `list`, `search`, `deepseek-v4-flash`, etc.) are parsed
+verbatim by the model and the runner — do **not** translate them,
+only the surrounding prose.
 
 Both **single-file** and **directory** layouts are supported by
 `AgentConfig::load` / `WorkflowRegistry::load`.
