@@ -34,8 +34,12 @@ pub struct ChatCmd {
     pub role: Option<String>,
 
     /// Initial model tier: premium | standard | budget. Short form: `-t`.
-    #[arg(short = 't', long, default_value = "standard")]
-    pub tier: String,
+    /// When omitted, the role's `model_tier` from its TOML config is
+    /// used. This lets reviewer roles (sanity/architecture/security)
+    /// ship with their own tier defaults instead of forcing every
+    /// role through `standard`.
+    #[arg(short = 't', long)]
+    pub tier: Option<String>,
 
     /// Pin the chat to a specific model id (overrides the tier-based
     /// resolution). The model must exist in the merged catalog
@@ -134,7 +138,7 @@ impl ChatCmd {
             "session start",
             &[
                 ("role", self.role.clone().unwrap_or_else(|| "manager".into())),
-                ("tier", self.tier.clone()),
+                ("tier", self.tier.clone().unwrap_or_else(|| "auto".into())),
                 ("model_id", self.model_id.clone().unwrap_or_default()),
                 ("session_id", session_id.clone()),
             ],
@@ -155,7 +159,19 @@ impl ChatCmd {
         let default_params = GenerateParams::default();
 
         let initial_role = self.role.clone().unwrap_or_else(|| "manager".into());
-        let initial_tier = parse_tier(&self.tier)?;
+        // Tier resolution: explicit --tier flag wins, otherwise the
+        // role's `model_tier` from its TOML config. This is the
+        // fix for "reviewer_sanity stays at standard instead of
+        // budget" — without this, every role defaulted to standard
+        // regardless of what the role said.
+        let initial_tier = if let Some(t) = &self.tier {
+            parse_tier(t)?
+        } else {
+            let template = merged.roles.get(&initial_role).ok_or_else(|| {
+                format!("role '{}' not found in config", initial_role)
+            })?;
+            parse_tier(&template.model_tier)?
+        };
         let initial_primary = self.model_id.as_deref();
         let debug_flags = super::DebugFlags {
             debug: self.debug,
