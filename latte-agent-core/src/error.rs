@@ -55,6 +55,12 @@ pub enum AgentError {
     /// Max tool-call rounds exceeded.
     #[error("max tool rounds ({0}) exceeded")]
     MaxToolRoundsExceeded(usize),
+    /// A tool loop was detected: the model called the same tool with
+    /// the same arguments `LOOP_STREAK_THRESHOLD+` times in a row,
+    /// indicating it is stuck. We break out before
+    /// `max_tool_rounds` is exhausted so the user can intervene.
+    #[error("tool loop detected: {tool} — {reason}")]
+    ToolLoopDetected { tool: String, reason: String },
 
     /// Invalid parameter.
     #[error("invalid parameter: {0}")]

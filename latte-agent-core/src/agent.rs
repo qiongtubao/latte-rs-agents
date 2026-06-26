@@ -334,6 +334,78 @@ impl std::fmt::Debug for Agent {
 fn log_hook_fire(name: &str, point: crate::trace::HookPoint, kind: &str) {
     eprintln!("[hook] {} {:?}: {}", name, point, kind);
 }
+// ─── LoopDetector ─────────────────────────────────────────────────────────
+
+/// Detects when a model is stuck calling the same tool with the
+/// same args repeatedly. Used to break the tool-call loop early
+/// before `max_tool_rounds` is exhausted.
+///
+/// The "model is stuck" failure mode: the model emits the same
+/// `<tool_call>` on every round, gets the same result, but can't break
+/// out of the pattern on its own. With a hard cap of 8 rounds that's
+/// 8 wasted model calls before we surface a `MaxToolRoundsExceeded`
+/// error. With this detector, the 3rd consecutive identical call
+/// trips and we return a `ToolLoopDetected` error that names the
+/// offending tool — much faster feedback, much less wasted spend.
+#[derive(Default)]
+struct LoopDetector {
+    /// Recent (tool_name, args_json) pairs, capped at `LOOP_WINDOW_SIZE`.
+    history: Vec<(String, String)>,
+    /// Count of consecutive identical tool calls seen at the tail.
+    streak: usize,
+}
+
+const LOOP_WINDOW_SIZE: usize = 5;
+const LOOP_STREAK_THRESHOLD: usize = 3;
+
+impl LoopDetector {
+    /// Record a tool call and decide whether to continue or break.
+    ///
+    /// `tool_name` is the name emitted by the model (e.g. `"read"`,
+    /// `"list"`, or the resolved name like `"file.read"`).
+    /// `args_json` is the JSON-serialized args that will be passed
+    /// to the tool. We compare on the serialized form because the
+    /// model may emit semantically equivalent but textually distinct
+    /// args (key order, whitespace) — two identical logical calls
+    /// should hash equal here.
+    fn record(&mut self, tool_name: &str, args_json: &str) -> LoopDecision {
+        let key = (tool_name.to_string(), args_json.to_string());
+        if self.history.last().map(|k| k == &key).unwrap_or(false) {
+            self.streak += 1;
+            if self.streak >= LOOP_STREAK_THRESHOLD {
+                return LoopDecision::Break(format!(
+                    "'{}' called {} times in a row with identical args; \
+                     the model is stuck. Breaking out so the user can intervene.",
+                    tool_name, self.streak + 1,
+                ));
+            }
+        } else {
+            self.streak = 1;
+        }
+        self.history.push(key);
+        if self.history.len() > LOOP_WINDOW_SIZE {
+            self.history.remove(0);
+        }
+        LoopDecision::Continue
+    }
+
+    /// Clear all state. Tests use it to reset between scenarios.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn reset(&mut self) {
+        self.history.clear();
+        self.streak = 0;
+    }
+}
+
+/// Outcome of `LoopDetector::record` — either keep going or break out.
+enum LoopDecision {
+    /// The call is not part of a stuck-pattern; keep iterating.
+    Continue,
+    /// The call matches the previous `LOOP_STREAK_THRESHOLD` calls
+    /// exactly; the caller should abort the loop with the carried
+    /// reason string.
+    Break(String),
+}
 
 fn cooldown_for_error(e: &AiError) -> Option<Duration> {
     match e {
@@ -602,6 +674,13 @@ impl AgentRunner {
         let mut total_output: u32 = 0;
         let mut total_thinking: u32 = 0;
 
+        // Detects "model is stuck" failure mode — same tool called
+        // with identical args `LOOP_STREAK_THRESHOLD+` times in a row.
+        // We break out of the tool-call loop early so the user can
+        // intervene (or the manager can escalate) instead of waiting
+        // for the full `max_rounds` cap to be exhausted.
+        let mut loop_detector = LoopDetector::default();
+
         for round in 0..max_rounds {
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
             let chat_start = Instant::now();
@@ -782,6 +861,23 @@ impl AgentRunner {
                     let tool_latency = tool_start.elapsed().as_millis() as u64;
 
                     let args_json = serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
+
+                    // 4b-extra. Loop detection: if the model is
+                    // stuck calling the same tool with the same args
+                    // repeatedly, bail out before `max_tool_rounds`
+                    // is exhausted. We use `tc.name` (the name the
+                    // model emitted) rather than `full_name` (the
+                    // resolved one) so that the loop key matches what
+                    // the model is reasoning about — if a model
+                    // switches between emitting "read" and "file.read"
+                    // that should count as a fresh call, not a
+                    // continuation of the streak.
+                    if let LoopDecision::Break(reason) = loop_detector.record(&tc.name, &args_json) {
+                        return Err(AgentError::ToolLoopDetected {
+                            tool: tc.name.clone(),
+                            reason,
+                        });
+                    }
 
                     match exec_result {
                         Ok(result) => {
@@ -1865,5 +1961,57 @@ End"#;
         if let TraceEvent::SessionEnd { total_turns, .. } = last {
             assert_eq!(*total_turns, 1u32);
         }
+    }
+
+    // ─── LoopDetector tests ──────────────────────────────────────────────
+    //
+    // The detector is the agent's safety net against the "model is
+    // stuck" failure mode: it watches for repeated identical tool
+    // calls and breaks the loop early. These tests pin down the
+    // threshold (3 consecutive identical calls) and the reset
+    // behaviour (a different call resets the streak counter).
+    #[test]
+    fn loop_detector_breaks_on_repeated_calls() {
+        let mut d = LoopDetector::default();
+        // First two calls don't trip the threshold.
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        // Third identical call trips. The reason string should
+        // name the offending tool so the user can act on it.
+        let decision = d.record("read", "{\"path\":\"a.rs\"}");
+        match decision {
+            LoopDecision::Break(reason) => {
+                assert!(reason.contains("read"),
+                    "break reason should name the offending tool, got: {reason}");
+            }
+            LoopDecision::Continue => panic!("expected Break on third identical call"),
+        }
+    }
+
+    #[test]
+    fn loop_detector_resets_on_different_call() {
+        let mut d = LoopDetector::default();
+        // Build up a near-streak with the same call.
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        // A different call resets the streak.
+        assert!(matches!(d.record("list", "{\"path\":\".\"}"), LoopDecision::Continue));
+        // Now two `read` calls in a row — the counter starts at 1,
+        // then 2; still below the threshold.
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        // Third consecutive after the reset trips.
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Break(_)));
+    }
+
+    #[test]
+    fn loop_detector_reset_clears_state() {
+        let mut d = LoopDetector::default();
+        d.record("read", "{\"path\":\"a.rs\"}");
+        d.record("read", "{\"path\":\"a.rs\"}");
+        d.reset();
+        // After reset, the streak is gone; next call starts fresh.
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
     }
 }

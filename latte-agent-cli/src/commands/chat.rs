@@ -1053,7 +1053,13 @@ async fn register_delegate_tool(
                     role_id.clone(),
                 ));
                 let mut runner = match specialist_tm {
-                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 8)
+                    // 24 (was 8) — legitimate deep tasks (architect reading
+                    // 13+ files, programmer iterating on a fix across several
+                    // files) need more room. The LoopDetector in agent.rs
+                    // trips earlier on actual stuck-pattern loops, so the
+                    // higher cap doesn't waste rounds on bad cases — it just
+                    // stops premature termination on good cases.
+                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 24)
                         .with_sink(scoped_sink.clone())
                         .with_role(role_id.clone()),
                     None => AgentRunner::new(agent)
@@ -1199,28 +1205,62 @@ const DELEGATE_TOOL_HINT: &str = r#"
 
 ### Delegating to specialists
 
-You have access to a `delegate` tool that dispatches a subtask to a
-specialist agent and returns the result. For substantive work —
-code analysis, architecture review, testing strategy, security audit,
-multi-file refactors — you SHOULD fan out to the right specialists
-in parallel and synthesize the results.
+For substantive tasks you SHOULD fan out to specialists and
+synthesize. Available specialist roles:
+- `programmer` — code analysis, reading code, understanding
+- `architect` — module structure, dependency graph, design overview
+- `reviewer_sanity` — fast fact-check: file references, syntax,
+  internal consistency. Uses read + list only.
+- `reviewer_architecture` — design check: module deps, interfaces,
+  circular imports. Uses read + search + list.
+- `reviewer_security` — deep audit: security, perf, edge cases.
+  Uses read + search + list.
+(Plus the older roles: `reviewer`, `tester`, `security`, `devops`,
+`designer`, `tech_writer`, `pm` — for the discuss workflow.)
 
-Example:
-<tool_call>delegate {"role": "programmer", "task": "Read src/agent.rs and summarize the AgentRunner::run_turn flow"}</tool_call>
+### Layered review protocol
 
-Available specialist roles: programmer, architect, reviewer, tester,
-security, devops, designer, tech_writer, pm.
+After you receive a specialist's report, run a layered review
+before finalizing your synthesis. This is the defense against
+hallucinations and the "stuck model" failure mode:
 
-When to delegate:
-- Deep code analysis → programmer
-- Architecture / design review → architect
-- Code quality review → reviewer
-- Testing strategy / bug analysis → tester
-- Security audit → security
+1. **ALWAYS dispatch to `reviewer_sanity` first.** It's cheap
+   (budget model, read-only). It catches file-reference
+   hallucinations, syntax errors, and internal contradictions.
+   A 5400-char report from a single specialist is NOT trustworthy
+   without a sanity pass.
 
-You can call `delegate` multiple times in parallel (in one response
-with multiple `<tool_call>` blocks) to fan out independent subtasks.
-Synthesize the results into a coherent answer.
+2. **If `reviewer_sanity` returns VERDICT: FAIL:**
+   - DO NOT synthesize the report as-is.
+   - Dispatch to `programmer` with the specific issues found,
+     ask for a fix.
+   - After programmer returns, re-run `reviewer_sanity`.
+   - Only proceed to step 4 if sanity now passes.
+
+3. **If `reviewer_sanity` returns VERDICT: WARN:**
+   - You may either fix minor issues yourself (you have no tools,
+     so just mention them in your final answer) or dispatch to
+     `programmer` for a fix.
+   - If the warnings are about the report's claims (not just style),
+     dispatch to programmer.
+
+4. **If `reviewer_sanity` returns VERDICT: PASS but you suspect a
+   design issue** (e.g., the report contradicts the project's
+   known architecture, mentions a new module, changes a public
+   interface, or touches multiple files in ways that suggest a
+   layer violation):
+   - Dispatch to `reviewer_architecture` for a deeper check.
+   - Only proceed if architecture also returns PASS or WARN.
+
+5. **If the task touches auth, user data, network, file I/O on
+   user-controlled paths, or process execution:**
+   - Dispatch to `reviewer_security` after `reviewer_architecture`
+     passes (or directly after sanity if you skipped architecture).
+   - This is the deep audit. It's expensive on purpose.
+
+6. **ONLY after all relevant review layers pass, synthesize your
+   final answer.** Cite each reviewer ("per reviewer_sanity: ...,
+   per reviewer_architecture: ..., per reviewer_security: ...").
 
 #### When you answer directly without delegating
 

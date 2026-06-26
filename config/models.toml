@@ -64,6 +64,29 @@ premium = "glm-5.2"
 standard = "glm-5.2"
 budget = "glm-5.2"
 
+[models.role_tiers.reviewer_sanity]  # Layer 1 — fast fact-check (budget by design)
+# premium reserved for when the operator wants extra care, but
+# standard/budget point to fast cheap models — the whole point of
+# sanity is that it's run on every specialist output.
+premium = "claude-sonnet-4-20250514"
+standard = "deepseek-v4-flash"
+budget = "qwen2.5-coder-32b-instruct"
+
+[models.role_tiers.reviewer_architecture]  # Layer 2 — design/dependency check
+premium = "claude-sonnet-4-20250514"
+standard = "deepseek-v4-flash"
+# deepseek-chat at the budget tier so this role still has a
+# working model even on machines without Ollama running.
+budget = "deepseek-chat"
+
+[models.role_tiers.reviewer_security]  # Layer 3 — deep security/audit
+# Premium goes to opus (full power) for deep audit. Standard is
+# sonnet so the role still works when no opus API key is set.
+# Budget falls back to deepseek-v4-flash.
+premium = "claude-opus-4-20250514"
+standard = "claude-sonnet-4-20250514"
+budget = "deepseek-v4-flash"
+
 # ─── Model Definitions ───────────────────────────────────────────────────────
 # Each [[models.models]] block defines one AI model.
 #

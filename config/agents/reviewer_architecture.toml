@@ -1,0 +1,55 @@
+# Role: Architecture Reviewer
+# =============================================================================
+# Deeper Layer-2 check focused on module structure, dependency
+# direction, interface contracts, and circular imports. Triggered
+# by the manager when Layer 1 (sanity) passes but a design issue
+# is suspected (e.g. the report contradicts the project's known
+# module graph).
+#
+# Read-only by design — never edits code. Has `search` (unlike
+# sanity) because dependency-graph checks need cross-file greps.
+
+[roles.reviewer_architecture]
+# Unique identifier — used in CLI flags, workflow steps, and tier mappings.
+id = "reviewer_architecture"
+
+# Human-readable display name — shown in logs and discussion transcripts.
+name = "Architecture Reviewer"
+
+# Lifecycle category: verification. Same as the existing `reviewer`
+# role — distinguished by `model_tier` and tool surface.
+category = "verification"
+
+# Default model tier — standard. Architecture review needs more
+# reasoning than sanity (it tracks module graphs in head) but
+# doesn't justify the premium tier; deepseek-v4-flash is the
+# workhorse here.
+model_tier = "standard"
+
+# Fallback model chain — deepseek-v4-flash pinned because the
+# standard tier can resolve to sonnet (no key) in some configs
+# and we want a deterministic, working model.
+model_chain = ["deepseek-v4-flash"]
+
+# Path to the system prompt markdown file (relative to project root).
+# This file defines the agent's personality, expertise, and behavioral rules.
+prompt_file = "prompts/reviewer_architecture.md"
+
+# Generation temperature (0.0–1.0).
+#   Lower (0.1–0.3) = more deterministic, consistent — good for code, analysis
+#   Higher (0.5–0.8) = more creative, varied — good for brainstorming, design
+#   Default: 0.7 (if omitted)
+# 0.2 — slightly more flexible than sanity (which is 0.1) because
+# dependency-graph judgments have more "is this okay in context"
+# nuance than pure fact-checks.
+temperature = 0.2
+
+# Allowed tools — read + search + list. No writes, no bash.
+# `search` is the new capability vs. sanity: dependency-graph
+# questions need cross-file regex (e.g. "find every `use` of
+# module A in module B"). Still no writes — this role is a
+# reviewer, not an editor.
+tools = ["read", "list", "search"]
+
+# Display emoji shown next to the role name in logs and transcripts.
+icon = "🏗️"
