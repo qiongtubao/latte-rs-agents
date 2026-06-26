@@ -279,6 +279,26 @@ impl ChatCmd {
                 }
                 return Err(e.into());
             }
+            // Render the response after a successful turn. The
+            // non-tty path above already does this; the tty REPL
+            // was missing it, so the synthesis was stored in
+            // `last_response` but never displayed. The user would
+            // only see log entries (truncated to 400 chars for
+            // preview) and the next prompt.
+            if let Some(resp) = &session.last_response {
+                if std::io::stdout().is_terminal() {
+                    let body = style::render_response_box(
+                        &session.role_icon(),
+                        &session.role_id,
+                        resp,
+                        style::terminal_width(),
+                    );
+                    print!("{}", body);
+                } else {
+                    println!("{}", resp);
+                }
+                stdout.flush()?;
+            }
             let usage_after = session.runner.total_usage();
             let in_delta = usage_after.input_tokens - usage_before.input_tokens;
             let out_delta = usage_after.output_tokens - usage_before.output_tokens;
@@ -933,6 +953,21 @@ async fn register_delegate_tool(
                     .ok_or_else(|| tool_err("missing 'task' field".into()))?
                     .to_string();
 
+                // Surface the dispatch to the user. The chat log
+                // records these as structured events, but the user
+                // running interactively needs to see *something*
+                // happen during the spinner — a 60s specialist
+                // run otherwise feels like a hang. Use eprintln
+                // so we don't fight the spinner on stdout.
+                // Truncate the task to one line.
+                let task_preview: String = task
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                    .replace('\n', " ");
+                let dispatch_start = std::time::Instant::now();
+                eprintln!("  → delegating to {}: \"{}\"", role_id, task_preview);
+
                 // Resolve the role and build a temporary AgentRunner.
                 let template = merged
                     .roles
@@ -1005,11 +1040,13 @@ async fn register_delegate_tool(
                 ).await {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
+                        eprintln!("  ← {} failed: {}", role_id, e);
                         return Err(tool_err(format!(
                             "delegate to '{}' failed: {}", role_id, e
                         )));
                     }
                     Err(_) => {
+                        eprintln!("  ← {} timed out after {}s", role_id, timeout_s);
                         return Err(tool_err(format!(
                             "delegate to '{}' timed out after {}s",
                             role_id, timeout_s
@@ -1017,6 +1054,13 @@ async fn register_delegate_tool(
                     }
                 };
                 drop(_permit);
+                let elapsed = dispatch_start.elapsed();
+                eprintln!(
+                    "  ← {} returned ({} chars in {:.1}s)",
+                    role_id,
+                    response.len(),
+                    elapsed.as_secs_f64(),
+                );
                 Ok(serde_json::json!({
                     "role": role_id,
                     "response": response,
