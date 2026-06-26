@@ -9,7 +9,7 @@
 # same prompt to every role, the tech_director acts as a router.
 
 name = "tech_director_dispatch"
-description = "Tech director decomposes the task, dispatches to PM/architect/programmer/tester, then summarizes."
+description = "技术总监拆解任务，分派给 PM/架构师/程序员/测试员，然后综合总结。"
 max_rounds = 1
 context_token_budget = 32000
 
@@ -18,24 +18,21 @@ context_token_budget = 32000
 # plan is included in the shared context for the next steps.
 [[steps]]
 id = "decompose"
-description = "Tech director decomposes the user's task into per-role subtasks."
+description = "技术总监把用户任务拆解成每个角色的子任务。"
 speakers = ["manager"]
-prompt = """You are the Tech Director. Read the user's task below and produce a tight
-plan that decomposes it into four parallel subtasks — one for PM, one for
-architect, one for programmer, one for tester. For each subtask, write
-exactly one sentence telling the role what to investigate or produce.
+prompt = """你是技术总监。阅读下面的用户任务，产出一份紧凑的计划，把它拆解成四个并行的子任务 —— 一个给 PM、一个给架构师、一个给程序员、一个给测试员。对每个子任务，写一句话告诉该角色要调查或产出什么。
 
-User's task:
+用户的任务：
 {{topic}}
 
-Format your response as:
+按以下格式回应：
 
-    PM: <what the PM should look into or write up>
-    ARCHITECT: <what the architect should design or evaluate>
-    PROGRAMMER: <what the programmer should investigate, sketch, or implement>
-    TESTER: <what the tester should examine or test>
+    PM: <PM 应该调查或撰写的内容>
+    ARCHITECT: <架构师应该设计或评估的内容>
+    PROGRAMMER: <程序员应该调查、勾勒或实现的内容>
+    TESTER: <测试员应该检查或测试的内容>
 
-Be specific and concrete. Keep the whole response under 200 words."""
+具体、明确。整条回复控制在 200 字以内。"""
 output_key = "plan"
 
 # Step 2: PM analyzes the topic along the lines the tech director set
@@ -43,40 +40,34 @@ output_key = "plan"
 # to re-read the original topic.
 [[steps]]
 id = "requirements"
-description = "PM reviews the plan and produces requirements / user-facing analysis."
+description = "PM 审阅计划并产出需求 / 用户面分析。"
 speakers = ["pm"]
-prompt = """You are the Product Manager. The Tech Director has produced this
-plan for the user's task:
+prompt = """你是产品经理。技术总监已经为用户任务产出了这份计划：
 
 {{plan}}
 
-Original user task: {{topic}}
+原始用户任务：{{topic}}
 
-Using the plan as your guide, produce a clear set of requirements:
-user stories (1-3), acceptance criteria, scope boundaries, and priority.
-Do NOT implement or design — your job is to make sure the user's needs
-are captured precisely. Keep your response under 250 words."""
+以这份计划为指引，产出一组清晰的需求：用户故事（1-3 个）、验收标准、范围边界、优先级。不要实现或设计 —— 你的工作是把用户需求精准捕获。回复控制在 250 字以内。"""
 output_key = "pm"
 
 # Step 3: architect reviews the plan + PM's requirements, produces
 # the technical design / risk assessment.
 [[steps]]
 id = "architecture"
-description = "Architect produces a technical design and risk assessment."
+description = "架构师产出技术设计和风险评估。"
 speakers = ["architect"]
-prompt = """You are the System Architect. The Tech Director's plan:
+prompt = """你是系统架构师。技术总监的计划：
 
 {{plan}}
 
-The PM's requirements:
+PM 的需求：
 
 {{pm}}
 
-Original user task: {{topic}}
+原始用户任务：{{topic}}
 
-Produce a concise technical design: key modules, data flow, external
-dependencies, and the top 2-3 risks or trade-offs. Do NOT implement.
-Keep your response under 250 words."""
+产出简洁的技术设计：关键模块、数据流、外部依赖、以及最关键 2-3 个风险或权衡。不要实现。回复控制在 250 字以内。"""
 output_key = "architect"
 
 # Step 4: programmer investigates the codebase / produces a concrete
@@ -84,81 +75,76 @@ output_key = "architect"
 # emit `<tool_call>` blocks to read code.
 [[steps]]
 id = "implementation"
-description = "Programmer investigates the code / sketches the implementation."
+description = "程序员调查代码 / 勾勒实现。"
 speakers = ["programmer"]
-prompt = """You are the Software Engineer. The Tech Director's plan:
+prompt = """你是软件工程师。技术总监的计划：
 
 {{plan}}
 
-The architect's design:
+架构师的设计：
 
 {{architect}}
 
-Original user task: {{topic}}
+原始用户任务：{{topic}}
 
-You may use file read/list/search tools to inspect the codebase before
-answering. Produce:
-- A concrete file-by-file change list (or "no code change needed" if
-  the answer is purely informational).
-- A short test plan (which test files to add, what to cover).
+你可以用 file read/list/search 工具先检查代码库再回答。产出：
+- 具体的文件级改动列表（如果纯信息性回答，则写"不需要改代码"）。
+- 简短的测试计划（添加哪些测试文件、覆盖什么）。
 
-Keep your response under 300 words. Cite specific paths you read."""
+回复控制在 300 字以内。引用你读过的具体路径。"""
 output_key = "programmer"
 
 # Step 5: tester reviews the program and reports on test coverage /
 # edge cases.
 [[steps]]
 id = "quality"
-description = "Tester evaluates test coverage and edge cases."
+description = "测试员评估测试覆盖和边界用例。"
 speakers = ["tester"]
-prompt = """You are the QA Engineer. The Tech Director's plan:
+prompt = """你是 QA 工程师。技术总监的计划：
 
 {{plan}}
 
-The programmer's implementation:
+程序员的实现：
 
 {{programmer}}
 
-Original user task: {{topic}}
+原始用户任务：{{topic}}
 
-Report on:
-- Test coverage gaps (which paths are not exercised?)
-- Edge cases / failure modes not handled.
-- Concrete test cases you would add (file path + what to assert).
+报告：
+- 测试覆盖缺口（哪些路径没被测到？）。
+- 未处理的边界用例 / 失败模式。
+- 你会添加的具体测试用例（文件路径 + 断言什么）。
 
-Keep your response under 200 words."""
+回复控制在 200 字以内。"""
 output_key = "tester"
 
 # Step 6: tech_director synthesizes all four contributions into a
 # single concise answer for the user.
 [[steps]]
 id = "synthesize"
-description = "Tech director synthesizes the four contributions into a final answer."
+description = "技术总监把四份产出综合成最终答复。"
 speakers = ["manager"]
-prompt = """You are the Tech Director. The four roles have finished their
-contributions. Your job is to write the final, single answer for the
-user.
+prompt = """你是技术总监。四个角色已经完成他们的产出。你的工作是给用户写一份最终、单一的答复。
 
-User's original task:
+用户的原始任务：
 {{topic}}
 
-PM said:
+PM 说：
 {{pm}}
 
-Architect said:
+架构师说：
 {{architect}}
 
-Programmer said:
+程序员说：
 {{programmer}}
 
-Tester said:
+测试员说：
 {{tester}}
 
-Produce a concise, well-structured final answer that:
-- States the answer or plan in plain language first.
-- References the key trade-offs / risks.
-- Lists concrete next steps.
+产出简洁、结构清晰的最终答复，要求：
+- 先用平实语言说明答复或计划。
+- 引用关键权衡 / 风险。
+- 列出具体的下一步。
 
-Keep the whole answer under 400 words. Do not hedge — give a real
-decision, not a list of options."""
+整条答复控制在 400 字以内。不要含糊 —— 给一个真实的决策，而不是选项列表。"""
 output_key = "final"

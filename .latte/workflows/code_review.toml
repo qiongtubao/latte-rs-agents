@@ -1,18 +1,18 @@
 name = "code_review"
-description = "Multi-perspective code review with security, style, and logic checks."
+description = "多角度代码审查：覆盖安全、风格与逻辑。"
 max_rounds = 1
 
 [[steps]]
 id = "explain"
 speakers = ["programmer"]
-prompt = "Explain the changes in the code at: {{code_path}}. What was changed and why?"
+prompt = "解释 {{code_path}} 处的代码变更。改了什么，为什么改？"
 
 [[steps]]
 id = "review"
 speakers = ["reviewer", "security", "tester"]
-prompt = "Review the code changes described above. Reviewer: patterns and code quality. Security: vulnerabilities. Tester: edge cases and test coverage gaps."
+prompt = "审查上面描述的代码变更。Reviewer：模式与代码质量。Security：漏洞。Tester：边界用例和测试覆盖缺口。"
 
 [[steps]]
 id = "respond"
 speakers = ["programmer"]
-prompt = "Address the review feedback. For each point, either accept and explain the fix, or push back with reasoning."
+prompt = "回应审查反馈。对每一条意见，要么接受并解释修复方案，要么讲清楚理由反驳。"

@@ -1,23 +1,23 @@
 name = "requirements_review"
-description = "PM presents requirements, team discusses feasibility and scope."
+description = "PM 阐述需求，团队讨论可行性和范围。"
 max_rounds = 2
 
 [[steps]]
 id = "present"
 speakers = ["pm"]
-prompt = "Present the requirements for: {{topic}}. Include user stories with acceptance criteria."
+prompt = "为 {{topic}} 阐明需求。包含带验收标准的用户故事。"
 
 [[steps]]
 id = "architecture"
 speakers = ["architect"]
-prompt = "Review technical feasibility and suggest architecture for the requirements above."
+prompt = "审查技术可行性并为上述需求建议架构。"
 
 [[steps]]
 id = "estimate"
 speakers = ["programmer", "tester"]
-prompt = "Estimate effort and identify risks. Programmer: implementation complexity and rough timeline. Tester: test surface and edge cases."
+prompt = "估算工期和风险。Programmer：实现复杂度和大致时间线。Tester：测试面和边界用例。"
 
 [[steps]]
 id = "decide"
 speakers = ["manager", "pm"]
-prompt = "Based on the discussion, finalize scope and priorities. Manager: assess risk and timeline feasibility."
+prompt = "基于讨论最终确定范围和优先级。Manager：评估风险和时间线可行性。"

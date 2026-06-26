@@ -1,23 +1,23 @@
 name = "bug_triage"
-description = "Triage a bug report with multi-role analysis."
+description = "用多角色分析分诊 bug 报告。"
 max_rounds = 2
 
 [[steps]]
 id = "describe"
 speakers = ["tester"]
-prompt = "Describe the bug: {{topic}}. Include reproduction steps, expected vs actual behavior, and severity."
+prompt = "描述这个 bug：{{topic}}。包括复现步骤、预期行为 vs 实际行为、以及严重程度。"
 
 [[steps]]
 id = "diagnose"
 speakers = ["programmer"]
-prompt = "Analyze the bug described above. What is the likely root cause? What area of the code is affected?"
+prompt = "分析上面描述的 bug。最可能的根本原因是什么？影响的是哪部分代码？"
 
 [[steps]]
 id = "impact"
 speakers = ["security", "devops"]
-prompt = "Assess the impact of this bug. Security: any security implications? DevOps: any operational impact?"
+prompt = "评估这个 bug 的影响。Security：有没有安全相关的影响？DevOps：有没有运维层面的影响？"
 
 [[steps]]
 id = "plan"
 speakers = ["programmer", "manager"]
-prompt = "Propose a fix plan. Programmer: fix approach and estimate. Manager: priority and scheduling."
+prompt = "提出修复计划。Programmer：修复方案和工期估算。Manager：优先级和排期。"
