@@ -53,7 +53,7 @@ budget = "deepseek-chat"
 [models.role_tiers.programmer]  # was: [role_tiers.programmer] (top-level)
 premium = "claude-sonnet-4-20250514"
 standard = "deepseek-v4-flash"  # was: deepseek-chat (hallucinates instead of actually invoking tools)
-budget = "qwen2.5-coder-32b-instruct"
+budget = "deepseek-v4-flash"  # was: qwen2.5-coder-32b-instruct (Ollama timed out at 30s)
 
 [models.role_tiers.manager]  # was: [role_tiers.manager] (top-level)
 # 2026-06-25: switched all three tiers to glm-5.2 (5h resource refresh,
@@ -64,13 +64,15 @@ premium = "glm-5.2"
 standard = "glm-5.2"
 budget = "glm-5.2"
 
-[models.role_tiers.reviewer_sanity]  # Layer 1 — fast fact-check (budget by design)
-# premium reserved for when the operator wants extra care, but
-# standard/budget point to fast cheap models — the whole point of
-# sanity is that it's run on every specialist output.
-premium = "claude-sonnet-4-20250514"
+[models.role_tiers.reviewer_sanity]  # Layer 1 — fast fact-check
+# 2026-06-26: switched all three tiers to deepseek-v4-flash because
+# the budget mapping (qwen2.5-coder-32b-instruct via Ollama) was
+# timing out at 30s on machines without a local Ollama server.
+# The "cheap fact-check on every output" rationale was sound in
+# theory but the Ollama dependency made it unreliable in practice.
+premium = "deepseek-v4-flash"
 standard = "deepseek-v4-flash"
-budget = "qwen2.5-coder-32b-instruct"
+budget = "deepseek-v4-flash"
 
 [models.role_tiers.reviewer_architecture]  # Layer 2 — design/dependency check
 premium = "claude-sonnet-4-20250514"

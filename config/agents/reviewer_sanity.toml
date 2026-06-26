@@ -25,13 +25,17 @@ category = "verification"
 # model_chain to qwen2.5-coder-32b-instruct (the budget default);
 # operators with a working Ollama server can flip to that model
 # directly via `--model-override`.
-model_tier = "budget"
+# Switched from "budget" to "standard" (2026-06-26) so the
+# default head model is deepseek-v4-flash via the role_tiers
+# mapping, instead of qwen2.5-coder-32b-instruct via Ollama
+# (which timed out at 30s on machines without a local server).
+# The "cheap fast fact-check" rationale was sound in theory
+# but the Ollama dependency made it unreliable in practice.
+model_tier = "standard"
 
-# Fallback model chain — qwen2.5-coder-32b-instruct first; falls
-# through to deepseek-v4-flash if the local Ollama server is down.
-# Same chain as `programmer`'s budget tier so the two share a working
-# model without ceremony.
-model_chain = ["qwen2.5-coder-32b-instruct", "deepseek-v4-flash"]
+# Fallback model chain — deepseek-v4-flash only (was:
+# qwen2.5-coder-32b-instruct first, deepseek-v4-flash second).
+model_chain = ["deepseek-v4-flash"]
 
 # Path to the system prompt markdown file (relative to project root).
 # This file defines the agent's personality, expertise, and behavioral rules.

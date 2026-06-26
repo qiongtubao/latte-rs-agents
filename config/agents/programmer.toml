@@ -26,7 +26,11 @@ category = "execution"
 #   standard — balanced (e.g., Claude Sonnet, GPT-4o)
 #   budget   — fast/cheap (e.g., DeepSeek, Qwen)
 # Override with --tier flag or per-role tier in models.toml.
-model_tier = "budget"
+# Switched from "budget" to "standard" (2026-06-26) so the
+# default head model is deepseek-v4-flash via the role_tiers
+# mapping, instead of qwen2.5-coder-32b-instruct via Ollama
+# (which timed out at 30s on machines without a local server).
+model_tier = "standard"
 
 # Fallback model chain — pinned to deepseek-v4-flash so specialists
 # always have a working model (deepseek-v4-flash has the real API key
