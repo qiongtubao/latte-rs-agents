@@ -207,6 +207,23 @@ SessionStarted {
         mode: String,                // "code" | "trace" | "full"
         rolled_back_to: String,      // git_commit SHA
     },
+    AskHuman {
+        meta: TraceMeta,
+        task_id: String,
+        role: String,
+        question: String,
+    },
+    RoundStarted {
+        meta: TraceMeta,
+        task_id: String,
+        round: u32,
+        roles: Vec<String>,
+    },
+    RoundEnded {
+        meta: TraceMeta,
+        task_id: String,
+        round: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -304,7 +321,10 @@ impl TraceEvent {
             | TraceEvent::SessionStarted { meta, .. }
             | TraceEvent::SessionPaused { meta, .. }
             | TraceEvent::SessionResumed { meta, .. }
-            | TraceEvent::RoleInjected { meta, .. } => meta,
+            | TraceEvent::RoleInjected { meta, .. }
+            | TraceEvent::AskHuman { meta, .. }
+            | TraceEvent::RoundStarted { meta, .. }
+            | TraceEvent::RoundEnded { meta, .. }
             | TraceEvent::CheckpointCreated { meta, .. }
             | TraceEvent::CheckpointRolledBack { meta, .. } => meta,
         }
@@ -324,6 +344,9 @@ impl TraceEvent {
             TraceEvent::SessionPaused { .. } => "SessionPaused",
             TraceEvent::SessionResumed { .. } => "SessionResumed",
             TraceEvent::RoleInjected { .. } => "RoleInjected",
+            TraceEvent::AskHuman { .. } => "AskHuman",
+            TraceEvent::RoundStarted { .. } => "RoundStarted",
+            TraceEvent::RoundEnded { .. } => "RoundEnded",
             TraceEvent::CheckpointCreated { .. } => "CheckpointCreated",
             TraceEvent::CheckpointRolledBack { .. } => "CheckpointRolledBack",
         }
@@ -373,6 +396,12 @@ impl TraceEvent {
                 format!("task={} turn={}", task_id, turn),
             TraceEvent::RoleInjected { task_id, target_role, message_preview, .. } =>
                 format!("task={} -> {} preview={:?}", task_id, target_role, message_preview),
+            TraceEvent::AskHuman { task_id, role, question, .. } =>
+                format!("task={} role={} question={:?}", task_id, role, question),
+            TraceEvent::RoundStarted { task_id, round, roles, .. } =>
+                format!("task={} round={} roles=[{}]", task_id, round, roles.join(",")),
+            TraceEvent::RoundEnded { task_id, round, .. } =>
+                format!("task={} round={}", task_id, round),
             TraceEvent::CheckpointCreated { checkpoint_id, git_commit, trigger_kind, diff_summary, .. } =>
                 format!("id={} commit={} trigger={} files={} +{}/-{}",
                     checkpoint_id, git_commit, trigger_kind,
@@ -467,6 +496,24 @@ impl TraceEvent {
                 kind: "RoleInjected".into(),
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: format!("task={} target={}", task_id, target_role),
+            },
+            TraceEvent::AskHuman { task_id, role, question, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "AskHuman".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} role={} q_len={}", task_id, role, question.len()),
+            },
+            TraceEvent::RoundStarted { task_id, round, roles, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "RoundStarted".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} round={} roles={}", task_id, round, roles.len()),
+            },
+            TraceEvent::RoundEnded { task_id, round, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "RoundEnded".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} round={}", task_id, round),
             },
             TraceEvent::CheckpointCreated { checkpoint_id, git_commit, diff_summary, .. } => IndexLine {
                 turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
@@ -660,6 +707,9 @@ impl TraceSink for ScopedSink {
             | TraceEvent::SessionPaused { meta, .. }
             | TraceEvent::SessionResumed { meta, .. }
             | TraceEvent::RoleInjected { meta, .. }
+            | TraceEvent::AskHuman { meta, .. }
+            | TraceEvent::RoundStarted { meta, .. }
+            | TraceEvent::RoundEnded { meta, .. }
             | TraceEvent::CheckpointCreated { meta, .. }
             | TraceEvent::CheckpointRolledBack { meta, .. } => {
                 meta.role = self.role.clone();
