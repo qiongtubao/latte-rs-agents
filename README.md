@@ -196,47 +196,59 @@ that this plan enables is exercised by running the system against a
 real workload and inspecting `~/.latte/traces/*.jsonl` with
 `latte-agent debug trace <id>`.
 
-## Workspace + Checkpoint (v1)
+## HIL Blackboard (v1)
 
-Run an isolated task inside a git worktree with automatic per-write checkpoints and per-checkpoint rollback:
+Run a multi-role agent session inside a git worktree with a `plan.md` blackboard, support for `/pause` + `/resume`, and `@<role>` injection routed to a specific specialist:
 
 ```bash
-# Start an isolated task
-latte-agent run --task-id fix-redis-bug --roles programmer,reviewer \
-    --initial-prompt "Redis pool doesn't recycle after 5xx"
+# Start a session (auto-creates the worktree + plan.md)
+latte-agent run --task-id fix-redis-bug --initial-prompt "Redis pool doesn't recycle after 5xx"
 
-# Inject a human message mid-run
-latte-agent inject --task-id fix-redis-bug --role programmer \
-    --message "Ignore formatting; focus on the lock logic"
+# Open the HIL REPL
+latte-agent chat --task-id fix-redis-bug --roles manager,programmer,reviewer
 
-# Pause / resume
+# In the REPL:
+#   > look at the redis pool
+#   > /pause                  # exits; state persisted to .latte/sessions/<id>.json
+#   > @programmer check this  # queues a message for programmer's next turn
+#   > /resume                 # (only valid if state is Paused)
+#   > /quit                   # marks the session Done
+
+# Resume from outside the REPL
+latte-agent chat --task-id fix-redis-bug
+
+# Inject from another terminal
+latte-agent inject --task-id fix-redis-bug --role programmer --message "..."
+
+# Pause / resume from outside the REPL
 latte-agent pause  --task-id fix-redis-bug
 latte-agent resume --task-id fix-redis-bug
 
-# Inspect / roll back
-latte-agent checkpoint list    --task-id fix-redis-bug
-latte-agent checkpoint rollback --task-id fix-redis-bug --id 3 --mode full
+# Surgical rollback: reset the worktree code, keep plan.md and trace
+latte-agent checkpoint rollback --task-id fix-redis-bug --id 3
 
-# Archive (merge --no-ff into the base branch) + optional cleanup
+# Archive + cleanup
 latte-agent run --task-id fix-redis-bug --archive --cleanup
 ```
 
 The worktree lives at `<repo>/.latte/worktrees/<task-id>/`; the base
-branch HEAD stays clean for the entire run. Checkpoint diffs are at
-`<repo>/.latte/checkpoints/<task-id>/<id>.patch`. Two new `TraceEvent`
-variants (`CheckpointCreated`, `CheckpointRolledBack`) land in
-`~/.latte/traces/<task-id>.jsonl` and are visible via
-`latte-agent debug session <id>`.
+branch HEAD stays clean for the entire session. Session state is
+persisted atomically to `<worktree>/.latte/sessions/<id>.json` and is
+human-readable / hand-editable (operators can delete "毒药消息" while
+paused). Six new `TraceEvent` variants (`SessionStarted`, `SessionPaused`,
+`SessionResumed`, `RoleInjected`, plus the inherited `CheckpointCreated` and
+`CheckpointRolledBack` from the `WorkspaceManager`/`CheckpointEngine`
+modules) land in `~/.latte/traces/<id>.jsonl`.
 
-See `docs/superpowers/specs/2026-06-27-blackboard-worktree-sandbox-design.md`
-for the design and `docs/superpowers/plans/2026-06-27-blackboard-worktree-sandbox-impl.md`
+See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v1-design.md`
+for the design and `docs/superpowers/plans/2026-06-28-latte-hil-blackboard-v1-impl.md`
 for the implementation plan.
 
 ## Roadmap
 
 Per spec `docs/superpowers/specs/2026-06-25-latte-agent-debug-observability-design.md` §3:
 
-- **Checkpoint / node-level retry** — the v1 of the Workspace + Checkpoint
-  system ships in this release (see the "Workspace + Checkpoint (v1)"
+- **Checkpoint / node-level retry** — the v1 of the HIL Blackboard
+  system ships in this release (see the "HIL Blackboard (v1)"
   section above). The v2 spec will add full state serialization,
   restore-from-snapshot, retry budget, and a real `SessionManager`.
