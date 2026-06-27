@@ -171,7 +171,7 @@ pub enum TraceEvent {
         total_output: u32,
         total_thinking: u32,
     },
-    SessionStarted {
+SessionStarted {
         meta: TraceMeta,
         task_id: String,
         roles: Vec<String>,
@@ -193,6 +193,19 @@ pub enum TraceEvent {
         task_id: String,
         target_role: String,
         message_preview: String,
+    },
+    CheckpointCreated {
+        meta: TraceMeta,
+        checkpoint_id: u32,
+        git_commit: String,
+        trigger_kind: String,        // "tool_write" | "explicit" | "pre_hazard"
+        diff_summary: DiffSummary,
+    },
+    CheckpointRolledBack {
+        meta: TraceMeta,
+        checkpoint_id: u32,
+        mode: String,                // "code" | "trace" | "full"
+        rolled_back_to: String,      // git_commit SHA
     },
 }
 
@@ -292,6 +305,8 @@ impl TraceEvent {
             | TraceEvent::SessionPaused { meta, .. }
             | TraceEvent::SessionResumed { meta, .. }
             | TraceEvent::RoleInjected { meta, .. } => meta,
+            | TraceEvent::CheckpointCreated { meta, .. }
+            | TraceEvent::CheckpointRolledBack { meta, .. } => meta,
         }
     }
     pub fn variant_name(&self) -> &'static str {
@@ -309,6 +324,8 @@ impl TraceEvent {
             TraceEvent::SessionPaused { .. } => "SessionPaused",
             TraceEvent::SessionResumed { .. } => "SessionResumed",
             TraceEvent::RoleInjected { .. } => "RoleInjected",
+            TraceEvent::CheckpointCreated { .. } => "CheckpointCreated",
+            TraceEvent::CheckpointRolledBack { .. } => "CheckpointRolledBack",
         }
     }
     pub fn body_for_pretty(&self) -> String {
@@ -356,6 +373,12 @@ impl TraceEvent {
                 format!("task={} turn={}", task_id, turn),
             TraceEvent::RoleInjected { task_id, target_role, message_preview, .. } =>
                 format!("task={} -> {} preview={:?}", task_id, target_role, message_preview),
+            TraceEvent::CheckpointCreated { checkpoint_id, git_commit, trigger_kind, diff_summary, .. } =>
+                format!("id={} commit={} trigger={} files={} +{}/-{}",
+                    checkpoint_id, git_commit, trigger_kind,
+                    diff_summary.files_changed, diff_summary.insertions, diff_summary.deletions),
+            TraceEvent::CheckpointRolledBack { checkpoint_id, mode, rolled_back_to, .. } =>
+                format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
         }
     }
     /// Metadata-only projection for IndexSink. Returns None for
@@ -445,6 +468,20 @@ impl TraceEvent {
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: format!("task={} target={}", task_id, target_role),
             },
+            TraceEvent::CheckpointCreated { checkpoint_id, git_commit, diff_summary, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "CheckpointCreated".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("id={} commit={} files={} +{}/-{}",
+                    checkpoint_id, git_commit,
+                    diff_summary.files_changed, diff_summary.insertions, diff_summary.deletions),
+            },
+            TraceEvent::CheckpointRolledBack { checkpoint_id, mode, rolled_back_to, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "CheckpointRolledBack".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
+            },
         })
     }
 }
@@ -461,6 +498,16 @@ pub struct IndexLine {
     pub tokens_out: Option<u32>,
     pub tokens_think: Option<u32>,
     pub detail: String,
+}
+
+/// Per-checkpoint diff summary. Stored on `CheckpointCreated` events
+/// and on the on-disk `manifest.json` so operators can see what
+/// changed without reading the patch file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffSummary {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
 }
 
 /// Writes a human-readable multi-line pretty form (default) or
@@ -612,7 +659,9 @@ impl TraceSink for ScopedSink {
             | TraceEvent::SessionStarted { meta, .. }
             | TraceEvent::SessionPaused { meta, .. }
             | TraceEvent::SessionResumed { meta, .. }
-            | TraceEvent::RoleInjected { meta, .. } => {
+            | TraceEvent::RoleInjected { meta, .. }
+            | TraceEvent::CheckpointCreated { meta, .. }
+            | TraceEvent::CheckpointRolledBack { meta, .. } => {
                 meta.role = self.role.clone();
             }
         }
@@ -674,6 +723,14 @@ impl TraceSink for FilterSink {
         }
         self.inner.emit(event);
     }
+}
+
+/// Format a Unix epoch second count as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
+/// Exposed for use by `checkpoint.rs` so we don't duplicate the
+/// proleptic-Gregorian math already in this module.
+pub fn iso8601_utc_now_for(secs: u64) -> String {
+    let (y, mo, d, h, mi, s) = epoch_to_ymdhms(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 #[cfg(test)]
 mod tests {
@@ -1013,5 +1070,53 @@ mod tests {
             let key = v.as_object().expect("object").keys().next().expect("one key").clone();
             assert_eq!(key, e.variant_name(), "variant_name mismatch for {}", key);
         }
+    }
+
+    #[test]
+    fn checkpoint_variants_serde_round_trip() {
+        use crate::trace::{TraceEvent, TraceMeta, DiffSummary};
+        use crate::checkpoint::{CheckpointTrigger, RollbackMode};
+
+        let meta = TraceMeta {
+            turn: 1,
+            role: "manager".into(),
+            ts: "2026-06-27T00:00:00Z".into(),
+            session_id: "fix-redis-bug".into(),
+        };
+
+        let created = TraceEvent::CheckpointCreated {
+            meta: meta.clone(),
+            checkpoint_id: 1,
+            git_commit: "abc123".into(),
+            trigger_kind: "tool_write".into(),
+            diff_summary: DiffSummary { files_changed: 1, insertions: 5, deletions: 0 },
+        };
+        let json = serde_json::to_string(&created).unwrap();
+        let back: TraceEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            TraceEvent::CheckpointCreated { checkpoint_id, .. } => {
+                assert_eq!(checkpoint_id, 1);
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+
+        let rolled = TraceEvent::CheckpointRolledBack {
+            meta,
+            checkpoint_id: 1,
+            mode: "full".into(),
+            rolled_back_to: "abc123".into(),
+        };
+        let json = serde_json::to_string(&rolled).unwrap();
+        let back: TraceEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            TraceEvent::CheckpointRolledBack { mode, .. } => assert_eq!(mode, "full"),
+            _ => panic!("wrong variant after round-trip"),
+        }
+
+        // Sanity: triggers and modes serialize lowercase.
+        let trig = serde_json::to_string(&CheckpointTrigger::Explicit).unwrap();
+        assert_eq!(trig, "\"explicit\"");
+        let mode = serde_json::to_string(&RollbackMode::Code).unwrap();
+        assert_eq!(mode, "\"code\"");
     }
 }

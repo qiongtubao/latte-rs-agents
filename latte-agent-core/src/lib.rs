@@ -36,16 +36,18 @@
 //! ```
 
 pub mod agent;
+pub mod checkpoint;
 pub mod config;
 pub mod context;
 pub mod error;
 pub mod global_config;
+pub mod hooks;
 pub mod model_resolver;
 pub mod prompts;
-pub mod trace;
 pub mod role;
-pub mod hooks;
 pub mod session;
+pub mod trace;
+pub mod workspace;
 
 pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
 pub use config::AgentConfig;
@@ -57,12 +59,15 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 /// Convenience re-exports.
 pub mod prelude {
     pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
+    pub use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointTrigger, RollbackMode};
     pub use crate::config::AgentConfig;
     pub use crate::context::{ConversationContext, Importance};
     pub use crate::error::AgentResult;
     pub use crate::model_resolver::{ModelResolver, ModelTier};
     pub use crate::role::{Role, RoleCategory};
-    pub use crate::session::{SessionManager, SessionRecord, SessionState, RoleHistory, SessionError};
+    pub use crate::session::{RoleHistory, SessionError, SessionManager, SessionRecord, SessionState};
+    pub use crate::trace::DiffSummary;
+    pub use crate::workspace::{Blackboard, MergeMode, WorktreeSpec, WorkspaceError, WorkspaceState};
     pub use latte_ai::prelude::*;
 }
 

@@ -196,10 +196,47 @@ that this plan enables is exercised by running the system against a
 real workload and inspecting `~/.latte/traces/*.jsonl` with
 `latte-agent debug trace <id>`.
 
+## Workspace + Checkpoint (v1)
+
+Run an isolated task inside a git worktree with automatic per-write checkpoints and per-checkpoint rollback:
+
+```bash
+# Start an isolated task
+latte-agent run --task-id fix-redis-bug --roles programmer,reviewer \
+    --initial-prompt "Redis pool doesn't recycle after 5xx"
+
+# Inject a human message mid-run
+latte-agent inject --task-id fix-redis-bug --role programmer \
+    --message "Ignore formatting; focus on the lock logic"
+
+# Pause / resume
+latte-agent pause  --task-id fix-redis-bug
+latte-agent resume --task-id fix-redis-bug
+
+# Inspect / roll back
+latte-agent checkpoint list    --task-id fix-redis-bug
+latte-agent checkpoint rollback --task-id fix-redis-bug --id 3 --mode full
+
+# Archive (merge --no-ff into the base branch) + optional cleanup
+latte-agent run --task-id fix-redis-bug --archive --cleanup
+```
+
+The worktree lives at `<repo>/.latte/worktrees/<task-id>/`; the base
+branch HEAD stays clean for the entire run. Checkpoint diffs are at
+`<repo>/.latte/checkpoints/<task-id>/<id>.patch`. Two new `TraceEvent`
+variants (`CheckpointCreated`, `CheckpointRolledBack`) land in
+`~/.latte/traces/<task-id>.jsonl` and are visible via
+`latte-agent debug session <id>`.
+
+See `docs/superpowers/specs/2026-06-27-blackboard-worktree-sandbox-design.md`
+for the design and `docs/superpowers/plans/2026-06-27-blackboard-worktree-sandbox-impl.md`
+for the implementation plan.
+
 ## Roadmap
 
 Per spec `docs/superpowers/specs/2026-06-25-latte-agent-debug-observability-design.md` §3:
 
-- **Checkpoint / node-level retry** (deferred) — state serialization,
-  restore from a snapshot, retry budget. Hooks reserve the
-  `HookOutcome::Retry { correction }` variant for this future work.
+- **Checkpoint / node-level retry** — the v1 of the Workspace + Checkpoint
+  system ships in this release (see the "Workspace + Checkpoint (v1)"
+  section above). The v2 spec will add full state serialization,
+  restore-from-snapshot, retry budget, and a real `SessionManager`.

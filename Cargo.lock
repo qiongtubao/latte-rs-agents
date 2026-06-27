@@ -975,6 +975,7 @@ dependencies = [
 name = "latte-agent-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "latte-agent-core",
  "latte-agent-orchestrator",
