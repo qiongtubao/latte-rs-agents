@@ -244,6 +244,32 @@ See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v1-design.md`
 for the design and `docs/superpowers/plans/2026-06-28-latte-hil-blackboard-v1-impl.md`
 for the implementation plan.
 
+## HIL Blackboard v1.1 (peer discussion)
+
+v1.1 extends `chat --task-id` with a round-robin peer discussion scheduler. Each round, every role speaks once (alphabetical order, with manager last as the natural summary position). Specialists see only their own H2-tagged slice of `plan.md` plus the initial-prompt header (selective injection — saves tokens as the discussion grows).
+
+```bash
+# Round-robin mode (default: 10 rounds, 50K token budget)
+latte-agent chat --task-id fix-redis-bug --roles manager,programmer,reviewer \
+    --initial-prompt "Redis pool doesn't recycle after 5xx"
+
+# v1-compat manager-dispatch-only mode
+latte-agent chat --task-id fix-redis-bug --max-rounds 0
+
+# Disable ask_human (escape hatch for users who don't want pauses)
+latte-agent chat --task-id fix-redis-bug --no-ask-human
+
+# Tighten the token budget
+latte-agent chat --task-id fix-redis-bug --session-token-budget 10000
+```
+
+New in v1.1:
+- `ask_human` tool — a specialist that needs clarification calls it; the session auto-pauses, the REPL shows the question, the human's reply is appended to that role's history
+- Session-level Supervisor — auto-pauses on token-budget exceeded or dead-loop (same role, same decision, 3 turns in a row)
+- 3 new `TraceEvent` variants: `AskHuman`, `RoundStarted`, `RoundEnded`
+
+See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v11-design.md` for the design and `docs/superpowers/plans/2026-06-28-latte-hil-blackboard-v11-impl.md` for the implementation plan.
+
 ## Roadmap
 
 Per spec `docs/superpowers/specs/2026-06-25-latte-agent-debug-observability-design.md` §3:
