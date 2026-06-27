@@ -5,6 +5,7 @@ pub mod config_layer;
 pub mod debug;
 pub mod discuss;
 pub mod list;
+pub mod repl;
 pub mod style;
 pub mod trace_store;
 pub mod workflow;
