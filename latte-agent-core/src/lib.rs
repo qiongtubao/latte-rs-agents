@@ -67,7 +67,7 @@ pub mod prelude {
     pub use crate::error::AgentResult;
     pub use crate::model_resolver::{ModelResolver, ModelTier};
     pub use crate::role::{Role, RoleCategory};
-    pub use crate::scheduler::plan_md_slice_for;
+    pub use crate::scheduler::{plan_md_slice_for, AgentOutcome, RoundScheduler, RoundSchedulerConfig, RunSummary};
     pub use crate::session::{RoleHistory, SessionError, SessionManager, SessionRecord, SessionState};
     pub use crate::supervisor::{Supervisor, SupervisorConfig};
     pub use crate::trace::DiffSummary;
