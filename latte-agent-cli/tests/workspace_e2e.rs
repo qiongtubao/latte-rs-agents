@@ -1,6 +1,6 @@
 //! End-to-end test: run a 2-checkpoint synthetic task via the
-//! `latte-agent` binary, then rollback --mode full, and assert the
-//! worktree is back to the post-Checkpoint-0 state.
+//! `latte-agent` binary, then rollback --id 1, and assert the
+//! worktree is back to the post-Checkpoint-1 state.
 
 use std::path::Path;
 use std::process::Command;
@@ -59,7 +59,7 @@ fn run_then_rollback_full_returns_worktree_to_baseline() {
     // 4. Roll back to id 1 (first user-created checkpoint). Worktree's
     //    main.txt should be "v1".
     let out = Command::new(bin())
-        .args(["checkpoint", "rollback", "--task-id", "e2e", "--id", "1", "--mode", "full"])
+        .args(["checkpoint", "rollback", "--task-id", "e2e", "--id", "1"])
         .current_dir(repo)
         .output().unwrap();
     assert!(out.status.success(), "rollback failed: {}",

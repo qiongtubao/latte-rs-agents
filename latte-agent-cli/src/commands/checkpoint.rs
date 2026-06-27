@@ -5,7 +5,7 @@
 //!   list     — print the manifest entries
 //!   rollback — reset the worktree to a previous checkpoint id
 
-use clap::{Args, Subcommand, ValueEnum};
+use clap::{Args, Subcommand};
 use latte_agent_core::checkpoint::{CheckpointEngine, RollbackMode};
 use latte_agent_core::trace::{NullSink, TraceSink};
 use latte_agent_core::workspace::WorkspaceManager;
@@ -31,35 +31,15 @@ pub enum CheckpointAction {
         #[arg(long)]
         task_id: String,
     },
-    /// Roll back to a specific checkpoint.
+    /// Roll back to a specific checkpoint. v1 only supports `code`
+    /// mode (the worktree is reset; `plan.md` and the trace JSONL
+    /// are preserved per spec §三.3 "撤销代码,保留讨论").
     Rollback {
         #[arg(long)]
         task_id: String,
         #[arg(long)]
         id: u32,
-        #[arg(long, value_enum, default_value_t = RollbackArg::Full)]
-        mode: RollbackArg,
     },
-}
-
-/// CLI-facing mirror of `RollbackMode`. clap requires a separate
-/// `ValueEnum` type so it can derive the parser without coupling to
-/// the core enum's serde rename rules.
-#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RollbackArg {
-    Code,
-    Trace,
-    Full,
-}
-
-impl From<RollbackArg> for RollbackMode {
-    fn from(v: RollbackArg) -> Self {
-        match v {
-            RollbackArg::Code => RollbackMode::Code,
-            RollbackArg::Trace => RollbackMode::Trace,
-            RollbackArg::Full => RollbackMode::Full,
-        }
-    }
 }
 
 impl CheckpointCmd {
@@ -98,9 +78,9 @@ impl CheckpointCmd {
                     );
                 }
             }
-            CheckpointAction::Rollback { task_id, id, mode } => {
+            CheckpointAction::Rollback { task_id, id } => {
                 let (engine, _) = open_engine(&repo_root, &task_id)?;
-                let cp = engine.rollback(id, mode.into()).map_err(anyhow::Error::from)?;
+                let cp = engine.rollback(id, RollbackMode::Code).map_err(anyhow::Error::from)?;
                 println!("rolled back to #{} (commit {})", cp.id, short_sha(&cp.git_commit));
             }
         }
