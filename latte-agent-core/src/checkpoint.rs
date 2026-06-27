@@ -245,7 +245,7 @@ fn parse_shortstat(s: &str) -> DiffSummary {
     out
 }
 
-fn short_hash(s: &str) -> String {
+pub fn short_hash(s: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
