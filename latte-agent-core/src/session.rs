@@ -8,6 +8,7 @@
 //! See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v1-design.md` §4.3.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -50,6 +51,10 @@ pub struct SessionManager {
     record: SessionRecord,
     session_path: PathBuf,
     worktree_root: PathBuf,
+    /// Optional sink for trace emission. Added in v1.1 so the
+    /// scheduler can emit AskHuman / RoundStarted / RoundEnded events.
+    /// When None, the emit_* methods are no-ops.
+    sink: Option<Arc<dyn crate::trace::TraceSink>>,
 }
 
 impl SessionManager {
@@ -82,6 +87,7 @@ impl SessionManager {
             },
             session_path,
             worktree_root,
+            sink: None,
         }
     }
 
@@ -120,6 +126,36 @@ impl SessionManager {
         self.record.paused_at = None;
         self.record.pause_reason = None;
         self.persist()
+    }
+    /// Set pause_reason and paused_at, transition to Paused, persist.
+    /// Same logic as `pause` but takes a fully-formed reason (no
+    /// internal "user /pause" prefix). Used by the supervisor and by
+    /// ask_human.
+    pub fn pause_with_reason(&mut self, reason: &str) -> Result<(), SessionError> {
+        self.transition(SessionState::Paused)?;
+        self.record.paused_at = Some(crate::trace::iso8601_utc_now());
+        self.record.pause_reason = Some(reason.to_string());
+        self.persist()
+    }
+
+    /// Resume from Paused, append a synthetic user message to the
+    /// named role's history, and persist. The role's next turn will
+    /// see the human's reply in its history.
+    pub fn resume_with_message(
+        &mut self,
+        role_id: &str,
+        message: &str,
+    ) -> Result<(), SessionError> {
+        self.transition(SessionState::Resumed)?;
+        self.record.paused_at = None;
+        self.record.pause_reason = None;
+        let now = crate::trace::iso8601_utc_now();
+        let synthetic = latte_ai::models::Message {
+            role: latte_ai::models::Role::User,
+            content: format!("[HUMAN @ {}]\n{}", now, message),
+        };
+        self.append_to_role(role_id, synthetic)?;
+        Ok(())
     }
 
     pub fn mark_done(&mut self) -> Result<(), SessionError> {
@@ -163,7 +199,75 @@ impl SessionManager {
             .join(".latte")
             .join("sessions")
             .join(format!("{}.json", record.session_id));
-        Self { record, session_path, worktree_root }
+        Self { record, session_path, worktree_root, sink: None }
+    }
+
+    /// Attach a trace sink. Used by the REPL driver in Phase 7 to
+    /// emit session lifecycle events.
+    pub fn with_sink(mut self, sink: Arc<dyn crate::trace::TraceSink>) -> Self {
+        self.sink = Some(sink);
+        self
+    }
+
+    pub fn sink(&self) -> Option<&Arc<dyn crate::trace::TraceSink>> {
+        self.sink.as_ref()
+    }
+
+    /// Append a TraceEvent::AskHuman to the sink. No-op if no sink
+    /// is attached (which is the case in unit tests and in v1 callers).
+    pub fn emit_ask_human_event(&self, role: &str, question: &str) {
+        if let Some(sink) = &self.sink {
+            use crate::trace::{TraceEvent, TraceMeta};
+            let meta = TraceMeta {
+                turn: 0,
+                role: role.to_string(),
+                ts: crate::trace::iso8601_utc_now(),
+                session_id: self.record.session_id.clone(),
+            };
+            sink.emit(TraceEvent::AskHuman {
+                meta,
+                task_id: self.record.task_id.clone(),
+                role: role.to_string(),
+                question: question.to_string(),
+            });
+        }
+    }
+
+    /// Emit RoundStarted to the sink. No-op if no sink.
+    pub fn emit_round_started(&self, round: u32, roles: &[String]) {
+        if let Some(sink) = &self.sink {
+            use crate::trace::{TraceEvent, TraceMeta};
+            let meta = TraceMeta {
+                turn: 0,
+                role: "scheduler".to_string(),
+                ts: crate::trace::iso8601_utc_now(),
+                session_id: self.record.session_id.clone(),
+            };
+            sink.emit(TraceEvent::RoundStarted {
+                meta,
+                task_id: self.record.task_id.clone(),
+                round,
+                roles: roles.to_vec(),
+            });
+        }
+    }
+
+    /// Emit RoundEnded to the sink. No-op if no sink.
+    pub fn emit_round_ended(&self, round: u32) {
+        if let Some(sink) = &self.sink {
+            use crate::trace::{TraceEvent, TraceMeta};
+            let meta = TraceMeta {
+                turn: 0,
+                role: "scheduler".to_string(),
+                ts: crate::trace::iso8601_utc_now(),
+                session_id: self.record.session_id.clone(),
+            };
+            sink.emit(TraceEvent::RoundEnded {
+                meta,
+                task_id: self.record.task_id.clone(),
+                round,
+            });
+        }
     }
 
     /// Check that the target state is a legal next state, update
@@ -302,5 +406,28 @@ mod tests {
         assert_eq!(mgr.record().current_turn, 1);
         mgr.advance_turn().unwrap();
         assert_eq!(mgr.record().current_turn, 2);
+    }
+    #[test]
+    fn pause_with_reason_sets_paused_at_and_reason() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_with_reason("token budget exceeded (50001 / 50000)").unwrap();
+        assert_eq!(mgr.state(), SessionState::Paused);
+        assert_eq!(
+            mgr.record().pause_reason.as_deref(),
+            Some("token budget exceeded (50001 / 50000)")
+        );
+        assert!(mgr.record().paused_at.is_some());
+    }
+
+    #[test]
+    fn resume_with_message_appends_synthetic_user_message() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_with_reason("ask_human: programmer asked: how should I parse the CSV?").unwrap();
+        mgr.resume_with_message("programmer", "use serde").unwrap();
+        assert_eq!(mgr.state(), SessionState::Resumed);
+        assert!(mgr.record().paused_at.is_none());
+        let history = mgr.role_history("programmer");
+        assert!(history.last().unwrap().content.contains("[HUMAN @"));
+        assert!(history.last().unwrap().content.contains("use serde"));
     }
 }

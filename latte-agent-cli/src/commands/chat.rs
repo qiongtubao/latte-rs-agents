@@ -21,6 +21,8 @@ use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
 use latte_agent_core::config::AgentConfig;
 use latte_agent_core::model_resolver::{ModelResolver, ModelTier};
+use latte_agent_core::scheduler::{plan_md_slice_for, RoundScheduler};
+use latte_agent_core::supervisor::{Supervisor, SupervisorConfig};
 use latte_ai::models::{Message, Role as MsgRole};
 use latte_ai::params::GenerateParams;
 
@@ -128,6 +130,21 @@ pub struct ChatCmd {
     /// existing session JSON is found; ignored otherwise.
     #[arg(long)]
     pub initial_prompt: Option<String>,
+
+    /// Maximum round-robin rounds (default 10). 0 = manager-dispatch
+    /// only (v1 compat).
+    #[arg(long, default_value_t = 10)]
+    pub max_rounds: u32,
+
+    /// Session-level token budget for the Supervisor. 0 disables
+    /// the token trigger (dead-loop still active).
+    #[arg(long, default_value_t = 50_000)]
+    pub session_token_budget: u32,
+
+    /// Disable registration of the `ask_human` tool for non-manager
+    /// roles. Escape hatch for users who don't want pauses.
+    #[arg(long)]
+    pub no_ask_human: bool,
 }
 impl ChatCmd {
     pub async fn run(&self) -> AnyResult {
@@ -140,6 +157,9 @@ impl ChatCmd {
                 task_id.clone(),
                 self.roles.clone(),
                 self.initial_prompt.clone(),
+                self.max_rounds,
+                self.session_token_budget,
+                self.no_ask_human,
             )
             .await;
         }
@@ -226,6 +246,8 @@ impl ChatCmd {
             initial_tier,
             initial_primary,
             &debug_flags,
+            // Legacy single-role REPL — no HIL session.
+            None,
         )
         .await
         {
@@ -564,6 +586,8 @@ impl ChatSession {
                     new_tier,
                     self.primary_id.as_deref(),
                     &self.debug_flags,
+                    // Legacy /role switch — no HIL session.
+                    None,
                 )
                 .await
                 {
@@ -620,6 +644,8 @@ impl ChatSession {
                             new_tier,
                             self.primary_id.as_deref(),
                             &self.debug_flags,
+                            // Legacy /model switch — no HIL session.
+                            None,
                         )
                         .await
                         {
@@ -777,6 +803,13 @@ async fn build_runner(
     tier: ModelTier,
     primary_id: Option<&str>,
     debug_flags: &super::DebugFlags,
+    // Optional session arc forwarded from `run_hil_chat` so the
+    // per-specialist `ask_human` tool can pause the shared
+    // SessionManager when a specialist needs human input. The
+    // legacy single-role REPL paths pass `None` — `ask_human` is
+    // a HIL-only feature (manager doesn't need it; it delegates
+    // instead).
+    session: Option<Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>>,
 ) -> AnyResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -886,6 +919,18 @@ async fn build_runner(
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
+        // HIL v1.1 phase 6: wire the `ask_human` tool for every
+        // non-manager role. The tool pauses the shared session
+        // when a specialist needs clarification, surfacing the
+        // question to the human via the REPL. The manager doesn't
+        // need `ask_human` (it delegates to specialists instead),
+        // and legacy single-role REPL paths pass `session = None`
+        // so this block is a no-op outside HIL.
+        if role_id != "manager" {
+            if let Some(session_arc) = session.clone() {
+                register_ask_human_tool(&tm, session_arc, role_id.to_string());
+            }
+        }
         with_session(
             AgentRunner::new_with_tools(agent, tm, 16)
                 .with_sink(Arc::clone(&sink))
@@ -1492,6 +1537,9 @@ async fn run_hil_chat(
     task_id: String,
     roles: Vec<String>,
     initial_prompt: Option<String>,
+    max_rounds: u32,
+    session_token_budget: u32,
+    no_ask_human: bool,
 ) -> AnyResult {
     use latte_agent_core::session::SessionManager;
 
@@ -1536,16 +1584,49 @@ async fn run_hil_chat(
         println!("[session: {}, state: Created, turn: 0]", task_id);
         println!("[roles: {}]", roles.join(", "));
     }
+    // 3. Build the shared `Arc<Mutex<SessionManager>>` (HIL v1.1 phase 6).
+    // The `ask_human` tool handler needs a shared reference to the
+    // session so it can pause + emit + return an error. The REPL
+    // also needs the same manager, so both the REPL and (eventually,
+    // in phase 7) the per-role build_runner calls share the same arc.
+    let session_arc: Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>> =
+        Arc::new(tokio::sync::Mutex::new(mgr));
 
-    // 3. Run the REPL
-    run_hil_repl(&mut mgr, task_id).await
+    // 4. Build the round-robin scheduler (HIL v1.1 phase 7).
+    // `RoundScheduler::new` uses `blocking_lock` internally to read the
+    // role order from the manager, so we must run it on a blocking
+    // thread to avoid `Cannot block the current thread from within a
+    // runtime` panics. The scheduler is then reconfigured for the
+    // user-supplied `max_rounds` and `session_token_budget`.
+    let scheduler_arc = session_arc.clone();
+    let mut scheduler = tokio::task::spawn_blocking(move || {
+        RoundScheduler::new(scheduler_arc)
+    })
+    .await
+    .map_err(|e| format!("scheduler join error: {}", e))??;
+    scheduler.max_rounds = max_rounds;
+    scheduler.supervisor = Supervisor::new(SupervisorConfig {
+        session_token_budget,
+        dead_loop_window: 3,
+    });
+
+    // `no_ask_human` would, when wiring is enabled, pass `None`
+    // through to the per-role `build_runner` so the `ask_human` tool
+    // is not registered. The wiring is intentionally deferred to a
+    // follow-up task — the flag is plumbed but no-op for now.
+    let _ = no_ask_human;
+
+    run_hil_repl(session_arc, scheduler, task_id, no_ask_human).await
 }
 
 async fn run_hil_repl(
-    mgr: &mut latte_agent_core::session::SessionManager,
+    session_arc: std::sync::Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>,
+    mut scheduler: RoundScheduler,
     task_id: String,
+    _no_ask_human: bool,
 ) -> AnyResult {
     use crate::commands::repl::{parse_repl_line, ReplInput};
+    use latte_agent_core::session::SessionState;
     use latte_ai::models::{Message, Role as MsgRole};
 
     let stdin = std::io::stdin();
@@ -1554,72 +1635,153 @@ async fn run_hil_repl(
     use std::io::Write;
     stdout.flush()?;
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    // Drive a stub round-robin loop (HIL v1.1 phase 7). Each round:
+    //   1. read one line of user input (slash command or role inject or manager input)
+    //   2. emit RoundStarted
+    //   3. iterate roles in scheduler.order:
+    //        - drain `.latte/inject/<role>.txt` into the role's history
+    //        - slice plan.md for the role and append as a synthetic user message
+    //        - advance_turn
+    //        - emit the stub line (actual LLM call deferred to a later phase)
+    //        - feed the Supervisor; pause the session if it triggers
+    //   4. emit RoundEnded and advance_turn again
+    'rounds: for round_num in 1..=scheduler.max_rounds {
+        // Read one line of user input per round.
+        let mut line = String::new();
+        let n = stdin.lock().read_line(&mut line)?;
+        if n == 0 {
+            break 'rounds; // EOF
+        }
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
+        if !trimmed.is_empty() {
+            match parse_repl_line(trimmed) {
+                Ok(ReplInput::Empty) => {},
+                Ok(ReplInput::Cmd { name }) if name == "pause" => {
+                    let mut mgr = session_arc.lock().await;
+                    mgr.pause("user /pause")?;
+                    println!("[session paused]");
+                    break 'rounds;
+                }
+                Ok(ReplInput::Cmd { name }) if name == "quit" => {
+                    let mut mgr = session_arc.lock().await;
+                    // If the session was paused (e.g. by the supervisor
+                    // mid-round), resume first so the Paused -> Done
+                    // transition is legal. The state machine forbids
+                    // Paused -> Done directly.
+                    if mgr.state() == SessionState::Paused {
+                        let _ = mgr.resume();
+                    }
+                    mgr.mark_done()?;
+                    break 'rounds;
+                }
+                Ok(ReplInput::Cmd { name }) if name == "roles" => {
+                    println!("[roles: {}]", scheduler.order.join(", "));
+                }
+                Ok(ReplInput::Cmd { name }) if name == "rounds" => {
+                    let mgr = session_arc.lock().await;
+                    println!("[round: {} / {}]", mgr.record().current_turn, scheduler.max_rounds);
+                }
+                Ok(ReplInput::Cmd { name }) => {
+                    println!("[unknown /{} — known: pause resume quit roles rounds]", name);
+                }
+                Ok(ReplInput::RoleInject { role_id, message }) => {
+                    let mgr = session_arc.lock().await;
+                    if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
+                        eprintln!("[error: unknown role '{}']", role_id);
+                    } else {
+                        queue_inject(mgr.worktree_root(), &role_id, &message)?;
+                        println!("[{} queue: +1 message]", role_id);
+                    }
+                }
+                Ok(ReplInput::ManagerInput { message }) => {
+                    let mut mgr = session_arc.lock().await;
+                    mgr.append_to_role("manager", Message { role: MsgRole::User, content: message.clone() })?;
+                    println!("[manager turn enqueued: {} chars]", message.len());
+                }
+                Err(e) => eprintln!("[parse error: {:?}]", e),
+            }
+        }
 
-        match parse_repl_line(trimmed) {
-            Ok(ReplInput::Empty) => continue,
-            Ok(ReplInput::Cmd { name }) if name == "pause" => {
-                mgr.pause("user /pause")?;
-                println!("[session paused — reason: user /pause]");
-                println!("[resume with: latte-agent chat --task-id {}]", task_id);
-                break;
-            }
-            Ok(ReplInput::Cmd { name }) if name == "resume" => {
-                if mgr.state() == latte_agent_core::session::SessionState::Paused {
-                    mgr.resume()?;
-                    println!("[RESUMED at {}]", mgr.record().updated_at);
-                } else {
-                    println!("[not paused — current state: {:?}]", mgr.state());
+        // Round started
+        {
+            let mgr = session_arc.lock().await;
+            mgr.emit_round_started(round_num, &scheduler.order);
+        }
+
+        for role_id in scheduler.order.clone() {
+            // Drain inject queue + append plan slice for the role. The
+            // actual LLM call per role is intentionally deferred —
+            // see plan Phase 7 step 4.
+            {
+                let mut mgr = session_arc.lock().await;
+                // The session is "active" when it's Created (initial state,
+                // not yet first round), Running (mid-round), or Resumed
+                // (post-pause). Any other state (Paused / Done / Failed)
+                // skips the round.
+                if !matches!(
+                    mgr.state(),
+                    SessionState::Created | SessionState::Running | SessionState::Resumed
+                ) {
+                    println!("[session not running — current state: {:?}]", mgr.state());
+                    continue 'rounds;
                 }
-            }
-            Ok(ReplInput::Cmd { name }) if name == "quit" => {
-                mgr.mark_done()?;
-                break;
-            }
-            Ok(ReplInput::Cmd { name }) if name == "roles" => {
-                let names: Vec<&str> = mgr.record().roles.iter().map(|r| r.role_id.as_str()).collect();
-                println!("[roles: {}]", names.join(", "));
-            }
-            Ok(ReplInput::Cmd { name }) => {
-                println!("[unknown command /{} — known: pause resume roles quit]", name);
-            }
-            Ok(ReplInput::RoleInject { role_id, message }) => {
-                if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
-                    eprintln!(
-                        "[error: unknown role '{}' — known: {}]",
-                        role_id,
-                        mgr.record().roles.iter()
-                            .map(|r| r.role_id.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    continue;
+                let queue_path = mgr.worktree_root().join(".latte").join("inject").join(format!("{}.txt", role_id));
+                if queue_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&queue_path) {
+                        if !content.trim().is_empty() {
+                            let synth = Message {
+                                role: MsgRole::User,
+                                content: format!("[INJECTED]\n{}", content),
+                            };
+                            mgr.append_to_role(&role_id, synth).ok();
+                        }
+                        let _ = std::fs::remove_file(&queue_path);
+                    }
                 }
-                queue_inject(mgr.worktree_root(), &role_id, &message)?;
-                println!("[{} queue: +1 message]", role_id);
+                // Slice plan.md for this role (H2-tagged section + initial-prompt).
+                let plan_slice = plan_md_slice_for(&mgr.record().plan_md, &role_id);
+                if !plan_slice.is_empty() {
+                    let synth = Message {
+                        role: MsgRole::User,
+                        content: format!("[PLAN SLICE]\n{}", plan_slice),
+                    };
+                    mgr.append_to_role(&role_id, synth).ok();
+                }
+                mgr.advance_turn().ok();
             }
-            Ok(ReplInput::ManagerInput { message }) => {
-                mgr.append_to_role("manager", Message {
-                    role: MsgRole::User,
-                    content: message.clone(),
-                })?;
-                mgr.advance_turn()?;
-                println!(
-                    "[manager turn {} received {} chars; model integration deferred to v1.1]",
-                    mgr.record().current_turn,
-                    message.len()
-                );
+
+            // Stub: actual LLM call per role is deferred (plan Phase 7 step 4).
+            println!("[{} round {}: stub — LLM integration pending]", role_id, round_num);
+
+            // Supervisor check: feed the (last decision, 100 tokens) pair.
+            let pause_reason = {
+                let mgr = session_arc.lock().await;
+                let decision = mgr.role_history(&role_id).last().map(|m| m.content.clone()).unwrap_or_default();
+                scheduler.supervisor.observe(&role_id, 100, &decision)
+            };
+            if let Some(reason) = pause_reason {
+                {
+                    let mut mgr = session_arc.lock().await;
+                    let _ = mgr.pause_with_reason(&reason);
+                }
+                let mgr = session_arc.lock().await;
+                mgr.emit_round_ended(round_num);
+                println!("[supervisor pause: {}]", reason);
+                continue 'rounds;
             }
-            Err(e) => {
-                eprintln!("[parse error: {:?}]", e);
-            }
+        }
+
+        // Round ended
+        {
+            let mut mgr = session_arc.lock().await;
+            mgr.emit_round_ended(round_num);
+            mgr.advance_turn().ok();
         }
         print!("> ");
         stdout.flush()?;
     }
+
+    let _ = task_id; // currently informational; round-driven loop owns the lifecycle
     Ok(())
 }
 
@@ -1638,4 +1800,97 @@ fn queue_inject(
         .open(&path)?;
     writeln!(f, "{}", message)?;
     Ok(())
+}
+
+
+// =====================================================================
+// ask_human tool registration (HIL v1.1 phase 6)
+// =====================================================================
+//
+// `ask_human` is registered as a per-specialist tool (NOT for manager).
+// The tool does not return a value at the call site; instead, the
+// session auto-transitions to `Paused` with `pause_reason = "ask_human:
+// <role> asked: <question>"`, emits a `TraceEvent::AskHuman` (if a sink
+// is attached — no-op otherwise), and the REPL driver surfaces the
+// question to the human. The human's reply resumes the session and the
+// next round (or the current round's remaining roles) re-invokes the
+// target role's `run_turn` with the human's reply in its history.
+pub fn register_ask_human_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    session: std::sync::Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>,
+    role_id: String,
+) {
+    use latte_rs_agent_tools::error::ToolError;
+    use latte_rs_agent_tools::types::{
+        PropertyType, SharedToolHandler, Tool, ToolExecutionContext, ToolInputProperty,
+        ToolInputSchema,
+    };
+
+    let input_schema = ToolInputSchema {
+        schema_type: latte_rs_agent_tools::types::SchemaType,
+        properties: vec![(
+            "question".into(),
+            ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "Free-form question to surface to the human. The session pauses with this question; the human's reply resumes the session and is appended to the calling role's history.".into(),
+                ),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["question".into()]),
+        ..Default::default()
+    };
+
+    // The handler is async (BoxFuture). We use `tokio::sync::Mutex::blocking_lock`
+    // inside the future because tool handlers run on the agent's blocking
+    // dispatch thread (see `register_delegate_tool` for the same pattern with
+    // `Arc<Semaphore>` — synchronous locks inside a BoxFuture are fine here
+    // since the future itself is invoked from a `spawn_blocking` context by
+    // `ToolManager::execute`).
+    let role_for_handler = role_id.clone();
+    let session_for_handler = session.clone();
+    let handler: SharedToolHandler = std::sync::Arc::new(
+        move |input: serde_json::Value, _ctx: ToolExecutionContext| {
+            let role_for_closure = role_for_handler.clone();
+            let session_for_closure = session_for_handler.clone();
+            Box::pin(async move {
+                let question = input
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reason = format!("ask_human: {} asked: {}", role_for_closure, question);
+                let mut mgr = session_for_closure.lock().await;
+                if let Err(e) = mgr.pause_with_reason(&reason) {
+                    eprintln!("[ask_human] pause_with_reason failed: {}", e);
+                }
+                mgr.emit_ask_human_event(&role_for_closure, &question);
+                Err(ToolError::Other(format!(
+                    "session paused: ask_human from {}",
+                    role_for_closure
+                )))
+            })
+        },
+    );
+
+    let tool = Tool::builder(
+        "ask_human".to_string(),
+        "Ask the human a question and pause the session. The session transitions to Paused with reason `ask_human: <role> asked: <question>`, a TraceEvent::AskHuman is emitted, and the human's reply resumes the session and is appended to the calling role's history.".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    // Register the tool on the manager's tool registry. The second argument
+    // is an optional package namespace — we pass `Some("specialist")` to
+    // mirror how `register_delegate_tool` tags the manager-only tool with
+    // `Some("manager")`, so trace consumers can filter by namespace.
+    tm.register(tool, Some("specialist"));
 }

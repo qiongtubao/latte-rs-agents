@@ -1102,6 +1102,46 @@ impl AgentRunner {
     pub fn role_id(&self) -> &str {
         &self.role_id
     }
+
+    /// Return a string describing the last turn's main decision.
+    /// Used by the Supervisor to detect dead loops.
+    /// Possible values: `"text"` | `"tool_call:<name>:<args_hash>"` |
+    ///                  `"delegate"` | `"ask_human"`
+    pub fn last_decision_kind(&self) -> String {
+        use latte_ai::models::Role as MsgRole;
+        use crate::checkpoint::short_hash;
+        let Some(last) = self.context.messages().last() else { return "text".to_string(); };
+        if last.role != MsgRole::Assistant { return "text".to_string(); }
+        let content = &last.content;
+        // Order matters: more specific tool tags (delegate, ask_human)
+        // win over the generic `<tool_callNAME>` extraction below.
+        if content.contains("<tool_calldelegate>") { return "delegate".to_string(); }
+        if content.contains("<tool_callask_human>") { return "ask_human".to_string(); }
+        if let Some(open_idx) = content.find("<tool_call") {
+            let after_open = &content[open_idx + "<tool_call".len()..];
+            // Name runs from after_open[0] to the first char that is
+            // whitespace or `>` (same rule the parser uses).
+            let name_end = after_open
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(after_open.len());
+            let name = &after_open[..name_end];
+            // Args: the JSON between the tool name terminator and the
+            // canonical close tag; we hash the trimmed args so
+            // `decision_kind` collisions only happen on identical payloads.
+            let rest = &after_open[name_end..];
+            let close = rest.find("</tool_call>").unwrap_or(rest.len());
+            // Strip the optional `>` terminator after the tool name plus any
+            // surrounding whitespace, so the hash matches the raw args the
+            // caller passed in (no `>` or extra spaces leaking in).
+            let mut args_str = rest[..close].trim();
+            if let Some(stripped) = args_str.strip_prefix('>') {
+                args_str = stripped.trim_start();
+            }
+            let args_hash = short_hash(args_str);
+            return format!("tool_call:{}:{}", name, &args_hash[..8]);
+        }
+        "text".to_string()
+    }
 }
 
 impl std::fmt::Debug for AgentRunner {
@@ -2101,5 +2141,39 @@ End"#;
         assert_eq!(first.role, MsgRole::User);
         assert_eq!(first.content, "[INJECTED]\nlook at foo.rs\n");
         assert!(!queue.exists());
+    }
+
+    #[test]
+    fn last_decision_kind_returns_text_for_plain_response() {
+        use latte_ai::models::Role as MsgRole;
+        let role = test_role();
+        let agent =
+            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
+                .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        runner.context_mut().push(Message {
+            role: MsgRole::Assistant,
+            content: "no tools here".to_string(),
+        });
+        assert_eq!(runner.last_decision_kind(), "text");
+    }
+
+    #[test]
+    fn last_decision_kind_returns_tool_call_for_write() {
+        use latte_ai::models::Role as MsgRole;
+        use crate::checkpoint::short_hash;
+        let role = test_role();
+        let agent =
+            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
+                .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let args_json = r#"{"path":"/tmp/x"}"#;
+        // Canonical open tag + close tag the v1 parser uses.
+        runner.context_mut().push(Message {
+            role: MsgRole::Assistant,
+            content: format!("<tool_callwrite> {}</tool_call>", args_json),
+        });
+        let expected = format!("tool_call:write:{}", &short_hash(args_json)[..8]);
+        assert_eq!(runner.last_decision_kind(), expected);
     }
 }
