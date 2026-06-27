@@ -226,6 +226,8 @@ impl ChatCmd {
             initial_tier,
             initial_primary,
             &debug_flags,
+            // Legacy single-role REPL — no HIL session.
+            None,
         )
         .await
         {
@@ -564,6 +566,8 @@ impl ChatSession {
                     new_tier,
                     self.primary_id.as_deref(),
                     &self.debug_flags,
+                    // Legacy /role switch — no HIL session.
+                    None,
                 )
                 .await
                 {
@@ -620,6 +624,8 @@ impl ChatSession {
                             new_tier,
                             self.primary_id.as_deref(),
                             &self.debug_flags,
+                            // Legacy /model switch — no HIL session.
+                            None,
                         )
                         .await
                         {
@@ -777,6 +783,13 @@ async fn build_runner(
     tier: ModelTier,
     primary_id: Option<&str>,
     debug_flags: &super::DebugFlags,
+    // Optional session arc forwarded from `run_hil_chat` so the
+    // per-specialist `ask_human` tool can pause the shared
+    // SessionManager when a specialist needs human input. The
+    // legacy single-role REPL paths pass `None` — `ask_human` is
+    // a HIL-only feature (manager doesn't need it; it delegates
+    // instead).
+    session: Option<Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>>,
 ) -> AnyResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -886,6 +899,18 @@ async fn build_runner(
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
+        // HIL v1.1 phase 6: wire the `ask_human` tool for every
+        // non-manager role. The tool pauses the shared session
+        // when a specialist needs clarification, surfacing the
+        // question to the human via the REPL. The manager doesn't
+        // need `ask_human` (it delegates to specialists instead),
+        // and legacy single-role REPL paths pass `session = None`
+        // so this block is a no-op outside HIL.
+        if role_id != "manager" {
+            if let Some(session_arc) = session.clone() {
+                register_ask_human_tool(&tm, session_arc, role_id.to_string());
+            }
+        }
         with_session(
             AgentRunner::new_with_tools(agent, tm, 16)
                 .with_sink(Arc::clone(&sink))
@@ -1537,12 +1562,18 @@ async fn run_hil_chat(
         println!("[roles: {}]", roles.join(", "));
     }
 
-    // 3. Run the REPL
-    run_hil_repl(&mut mgr, task_id).await
+    // 3. Build the shared `Arc<Mutex<SessionManager>>` (HIL v1.1 phase 6).
+    // The `ask_human` tool handler needs a shared reference to the
+    // session so it can pause + emit + return an error. The REPL
+    // also needs the same manager, so both the REPL and (eventually,
+    // in phase 7) the per-role build_runner calls share the same arc.
+    let session_arc: Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>> =
+        Arc::new(tokio::sync::Mutex::new(mgr));
+    run_hil_repl(&session_arc, task_id).await
 }
 
 async fn run_hil_repl(
-    mgr: &mut latte_agent_core::session::SessionManager,
+    mgr: &Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>,
     task_id: String,
 ) -> AnyResult {
     use crate::commands::repl::{parse_repl_line, ReplInput};
@@ -1562,12 +1593,18 @@ async fn run_hil_repl(
         match parse_repl_line(trimmed) {
             Ok(ReplInput::Empty) => continue,
             Ok(ReplInput::Cmd { name }) if name == "pause" => {
+                // Lock per command: never hold the mutex across
+                // the stdin read, so a concurrent `ask_human` tool
+                // handler (Phase 7's per-role build_runner) can
+                // grab it to pause the session.
+                let mut mgr = mgr.lock().await;
                 mgr.pause("user /pause")?;
                 println!("[session paused — reason: user /pause]");
                 println!("[resume with: latte-agent chat --task-id {}]", task_id);
                 break;
             }
             Ok(ReplInput::Cmd { name }) if name == "resume" => {
+                let mut mgr = mgr.lock().await;
                 if mgr.state() == latte_agent_core::session::SessionState::Paused {
                     mgr.resume()?;
                     println!("[RESUMED at {}]", mgr.record().updated_at);
@@ -1576,10 +1613,12 @@ async fn run_hil_repl(
                 }
             }
             Ok(ReplInput::Cmd { name }) if name == "quit" => {
+                let mut mgr = mgr.lock().await;
                 mgr.mark_done()?;
                 break;
             }
             Ok(ReplInput::Cmd { name }) if name == "roles" => {
+                let mgr = mgr.lock().await;
                 let names: Vec<&str> = mgr.record().roles.iter().map(|r| r.role_id.as_str()).collect();
                 println!("[roles: {}]", names.join(", "));
             }
@@ -1587,6 +1626,7 @@ async fn run_hil_repl(
                 println!("[unknown command /{} — known: pause resume roles quit]", name);
             }
             Ok(ReplInput::RoleInject { role_id, message }) => {
+                let mut mgr = mgr.lock().await;
                 if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
                     eprintln!(
                         "[error: unknown role '{}' — known: {}]",
@@ -1602,6 +1642,7 @@ async fn run_hil_repl(
                 println!("[{} queue: +1 message]", role_id);
             }
             Ok(ReplInput::ManagerInput { message }) => {
+                let mut mgr = mgr.lock().await;
                 mgr.append_to_role("manager", Message {
                     role: MsgRole::User,
                     content: message.clone(),
@@ -1638,4 +1679,97 @@ fn queue_inject(
         .open(&path)?;
     writeln!(f, "{}", message)?;
     Ok(())
+}
+
+
+// =====================================================================
+// ask_human tool registration (HIL v1.1 phase 6)
+// =====================================================================
+//
+// `ask_human` is registered as a per-specialist tool (NOT for manager).
+// The tool does not return a value at the call site; instead, the
+// session auto-transitions to `Paused` with `pause_reason = "ask_human:
+// <role> asked: <question>"`, emits a `TraceEvent::AskHuman` (if a sink
+// is attached — no-op otherwise), and the REPL driver surfaces the
+// question to the human. The human's reply resumes the session and the
+// next round (or the current round's remaining roles) re-invokes the
+// target role's `run_turn` with the human's reply in its history.
+pub fn register_ask_human_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    session: std::sync::Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>,
+    role_id: String,
+) {
+    use latte_rs_agent_tools::error::ToolError;
+    use latte_rs_agent_tools::types::{
+        PropertyType, SharedToolHandler, Tool, ToolExecutionContext, ToolInputProperty,
+        ToolInputSchema,
+    };
+
+    let input_schema = ToolInputSchema {
+        schema_type: latte_rs_agent_tools::types::SchemaType,
+        properties: vec![(
+            "question".into(),
+            ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "Free-form question to surface to the human. The session pauses with this question; the human's reply resumes the session and is appended to the calling role's history.".into(),
+                ),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["question".into()]),
+        ..Default::default()
+    };
+
+    // The handler is async (BoxFuture). We use `tokio::sync::Mutex::blocking_lock`
+    // inside the future because tool handlers run on the agent's blocking
+    // dispatch thread (see `register_delegate_tool` for the same pattern with
+    // `Arc<Semaphore>` — synchronous locks inside a BoxFuture are fine here
+    // since the future itself is invoked from a `spawn_blocking` context by
+    // `ToolManager::execute`).
+    let role_for_handler = role_id.clone();
+    let session_for_handler = session.clone();
+    let handler: SharedToolHandler = std::sync::Arc::new(
+        move |input: serde_json::Value, _ctx: ToolExecutionContext| {
+            let role_for_closure = role_for_handler.clone();
+            let session_for_closure = session_for_handler.clone();
+            Box::pin(async move {
+                let question = input
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let reason = format!("ask_human: {} asked: {}", role_for_closure, question);
+                let mut mgr = session_for_closure.lock().await;
+                if let Err(e) = mgr.pause_with_reason(&reason) {
+                    eprintln!("[ask_human] pause_with_reason failed: {}", e);
+                }
+                mgr.emit_ask_human_event(&role_for_closure, &question);
+                Err(ToolError::Other(format!(
+                    "session paused: ask_human from {}",
+                    role_for_closure
+                )))
+            })
+        },
+    );
+
+    let tool = Tool::builder(
+        "ask_human".to_string(),
+        "Ask the human a question and pause the session. The session transitions to Paused with reason `ask_human: <role> asked: <question>`, a TraceEvent::AskHuman is emitted, and the human's reply resumes the session and is appended to the calling role's history.".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    // Register the tool on the manager's tool registry. The second argument
+    // is an optional package namespace — we pass `Some("specialist")` to
+    // mirror how `register_delegate_tool` tags the manager-only tool with
+    // `Some("manager")`, so trace consumers can filter by namespace.
+    tm.register(tool, Some("specialist"));
 }
