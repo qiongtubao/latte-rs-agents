@@ -1,10 +1,15 @@
 pub mod chat;
 pub mod chatlog;
+pub mod checkpoint;
 pub mod config;
 pub mod config_layer;
 pub mod debug;
 pub mod discuss;
+pub mod inject;
 pub mod list;
+pub mod pause;
+pub mod resume;
+pub mod run;
 pub mod style;
 pub mod trace_store;
 pub mod workflow;
