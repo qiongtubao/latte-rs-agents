@@ -43,6 +43,7 @@ pub mod global_config;
 pub mod model_resolver;
 pub mod prompts;
 pub mod trace;
+pub mod checkpoint;
 pub mod role;
 pub mod hooks;
 
@@ -60,6 +61,8 @@ pub mod prelude {
     pub use crate::context::{ConversationContext, Importance};
     pub use crate::error::AgentResult;
     pub use crate::model_resolver::{ModelResolver, ModelTier};
+    pub use crate::checkpoint::{Checkpoint, CheckpointTrigger, CheckpointError, RollbackMode};
+    pub use crate::trace::DiffSummary;
     pub use crate::role::{Role, RoleCategory};
     pub use latte_ai::prelude::*;
 }
