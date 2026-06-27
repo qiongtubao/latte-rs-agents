@@ -282,3 +282,76 @@ fn iso8601_utc_now_now() -> String {
         .unwrap_or(0);
     crate::trace::iso8601_utc_now_for(secs)
 }
+
+impl CheckpointEngine {
+    /// Roll back to a previous checkpoint. Reads `manifest.json` to
+    /// find the git commit for `id`, then runs `git reset --hard`.
+    /// If `mode` is `Trace` or `Full`, also truncates the on-disk
+    /// trace JSONL to the recorded `trace_event_index`.
+    pub fn rollback(
+        &self,
+        id: u32,
+        mode: RollbackMode,
+    ) -> Result<Checkpoint, CheckpointError> {
+        use crate::trace::TraceEvent;
+        let target = self
+            .read_manifest_entry(id)?
+            .ok_or_else(|| CheckpointError::NotFound(id, self.task_id().to_string()))?;
+
+        // 1. Always reset the worktree (Code is the floor)
+        if matches!(mode, RollbackMode::Code | RollbackMode::Full) {
+            run_git(&self.worktree_root, &["reset", "--hard", &target.git_commit])?;
+        }
+
+        // 2. Truncate trace if requested
+        if matches!(mode, RollbackMode::Trace | RollbackMode::Full) {
+            if let Ok(p) = std::env::var("LATTE_TRACE_FILE") {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    let len = target.trace_event_index.min(meta.len());
+                    let f = std::fs::OpenOptions::new().write(true).open(&p)?;
+                    f.set_len(len)?;
+                }
+            }
+        }
+
+        // 3. Emit the rolled-back event
+        let meta = crate::trace::TraceMeta {
+            turn: 0,
+            role: "checkpoint".into(),
+            ts: iso8601_utc_now_now(),
+            session_id: self.task_id().to_string(),
+        };
+        let mode_str = match mode {
+            RollbackMode::Code => "code",
+            RollbackMode::Trace => "trace",
+            RollbackMode::Full => "full",
+        };
+        self.sink.emit(TraceEvent::CheckpointRolledBack {
+            meta,
+            checkpoint_id: id,
+            mode: mode_str.into(),
+            rolled_back_to: target.git_commit.clone(),
+        });
+
+        Ok(target)
+    }
+
+    fn read_manifest_entry(&self, id: u32) -> Result<Option<Checkpoint>, CheckpointError> {
+        let path = self.storage_dir.join("manifest.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(&path)?;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let cp: Checkpoint = serde_json::from_str(line)
+                .map_err(|e| CheckpointError::GitFailed(e.to_string()))?;
+            if cp.id == id {
+                return Ok(Some(cp));
+            }
+        }
+        Ok(None)
+    }
+}
