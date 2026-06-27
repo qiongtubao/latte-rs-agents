@@ -46,6 +46,7 @@ pub mod trace;
 pub mod checkpoint;
 pub mod role;
 pub mod hooks;
+pub mod workspace;
 
 pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
 pub use config::AgentConfig;
@@ -64,6 +65,7 @@ pub mod prelude {
     pub use crate::checkpoint::{Checkpoint, CheckpointTrigger, CheckpointError, RollbackMode};
     pub use crate::trace::DiffSummary;
     pub use crate::role::{Role, RoleCategory};
+    pub use crate::workspace::{WorktreeSpec, WorkspaceState, WorkspaceError, Blackboard, MergeMode};
     pub use latte_ai::prelude::*;
 }
 
