@@ -941,6 +941,26 @@ pub async fn build_tool_manager(
 /// the per-call timeout is then resolved as
 /// `model.timeout_secs > env_timeout_secs > DEFAULT_DELEGATE_TIMEOUT_SECS`
 /// — see the closure below. Default 60s.
+// =====================================================================
+// HIL v1 Phase 6 — checkpoint wire-up verification marker
+//
+// The HIL v1 spec §4.8 asserts that specialist writes issued from the
+// delegate closure land in the same WorktreeSpec::worktree_root shared
+// by WorkspaceManager::create (run.rs) and CheckpointEngine::new
+// (run.rs). Both paths resolve through WorktreeSpec::derive_paths, so
+// a single source of truth binds them. The manager tm passed into
+// register_delegate_tool below is built by build_tool_manager (line
+// ~899) as a vanilla create_tool_manager() carrying builtin packages
+// filtered by role.allowed_tools — it is NOT wrapped by
+// WorkspaceManager. The fresh specialist_tm built inside the closure
+// is also not wrapped. v1 therefore relies on the convention that
+// latte-agent chat --task-id X is launched from the repo root, so
+// writes land in the worktree's branch directory by way of
+// git-worktree-link semantics. Checkpoints are explicit-only in v1
+// (no ToolManager::execute hook wraps record_write); they are
+// produced by latte-agent run at init and latte-agent checkpoint
+// create on demand. Auto-checkpoint-on-write is deferred.
+// =====================================================================
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: Arc<AgentConfig>,
