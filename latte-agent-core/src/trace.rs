@@ -45,7 +45,7 @@ impl TraceMeta {
 /// (no `chrono` dep) so the trace module stays stdlib + serde +
 /// parking_lot. Good enough for `latte-agent debug trace` timeline
 /// display; not designed for sub-second precision or timezone math.
-fn iso8601_utc_now() -> String {
+pub(crate) fn iso8601_utc_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -171,6 +171,29 @@ pub enum TraceEvent {
         total_output: u32,
         total_thinking: u32,
     },
+    SessionStarted {
+        meta: TraceMeta,
+        task_id: String,
+        roles: Vec<String>,
+        initial_prompt: String,
+    },
+    SessionPaused {
+        meta: TraceMeta,
+        task_id: String,
+        reason: String,
+        turn: u32,
+    },
+    SessionResumed {
+        meta: TraceMeta,
+        task_id: String,
+        turn: u32,
+    },
+    RoleInjected {
+        meta: TraceMeta,
+        task_id: String,
+        target_role: String,
+        message_preview: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,7 +287,11 @@ impl TraceEvent {
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::HookFired { meta, .. }
             | TraceEvent::TurnEnd { meta, .. }
-            | TraceEvent::SessionEnd { meta, .. } => meta,
+            | TraceEvent::SessionEnd { meta, .. }
+            | TraceEvent::SessionStarted { meta, .. }
+            | TraceEvent::SessionPaused { meta, .. }
+            | TraceEvent::SessionResumed { meta, .. }
+            | TraceEvent::RoleInjected { meta, .. } => meta,
         }
     }
     pub fn variant_name(&self) -> &'static str {
@@ -278,6 +305,10 @@ impl TraceEvent {
             TraceEvent::HookFired { .. } => "HookFired",
             TraceEvent::TurnEnd { .. } => "TurnEnd",
             TraceEvent::SessionEnd { .. } => "SessionEnd",
+            TraceEvent::SessionStarted { .. } => "SessionStarted",
+            TraceEvent::SessionPaused { .. } => "SessionPaused",
+            TraceEvent::SessionResumed { .. } => "SessionResumed",
+            TraceEvent::RoleInjected { .. } => "RoleInjected",
         }
     }
     pub fn body_for_pretty(&self) -> String {
@@ -317,6 +348,14 @@ impl TraceEvent {
                     total_input, total_output, total_thinking, elapsed_ms),
             TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } =>
                 format!("turns={} in={} out={} think={}", total_turns, total_input, total_output, total_thinking),
+            TraceEvent::SessionStarted { task_id, roles, .. } =>
+                format!("task={} roles={}", task_id, roles.join(",")),
+            TraceEvent::SessionPaused { task_id, reason, turn, .. } =>
+                format!("task={} turn={} reason={}", task_id, turn, reason),
+            TraceEvent::SessionResumed { task_id, turn, .. } =>
+                format!("task={} turn={}", task_id, turn),
+            TraceEvent::RoleInjected { task_id, target_role, message_preview, .. } =>
+                format!("task={} -> {} preview={:?}", task_id, target_role, message_preview),
         }
     }
     /// Metadata-only projection for IndexSink. Returns None for
@@ -381,6 +420,30 @@ impl TraceEvent {
                 model_id: None, latency_ms: None,
                 tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
                 detail: format!("turns={}", total_turns),
+            },
+            TraceEvent::SessionStarted { task_id, roles, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "SessionStarted".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} roles={}", task_id, roles.len()),
+            },
+            TraceEvent::SessionPaused { task_id, reason, turn, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "SessionPaused".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} turn={} reason={}", task_id, turn, reason),
+            },
+            TraceEvent::SessionResumed { task_id, turn, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "SessionResumed".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} turn={}", task_id, turn),
+            },
+            TraceEvent::RoleInjected { task_id, target_role, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "RoleInjected".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("task={} target={}", task_id, target_role),
             },
         })
     }
@@ -545,7 +608,11 @@ impl TraceSink for ScopedSink {
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::HookFired { meta, .. }
             | TraceEvent::TurnEnd { meta, .. }
-            | TraceEvent::SessionEnd { meta, .. } => {
+            | TraceEvent::SessionEnd { meta, .. }
+            | TraceEvent::SessionStarted { meta, .. }
+            | TraceEvent::SessionPaused { meta, .. }
+            | TraceEvent::SessionResumed { meta, .. }
+            | TraceEvent::RoleInjected { meta, .. } => {
                 meta.role = self.role.clone();
             }
         }
