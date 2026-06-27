@@ -462,6 +462,12 @@ pub struct AgentRunner {
     /// `~/.latte/traces/<id>.jsonl` files. Empty string when the
     /// runner was built without an explicit id (test paths).
     session_id: String,
+    /// Optional worktree root for the per-role inject queue. When
+    /// set, `run_turn` (via `drain_inject_queue`) reads
+    /// `<worktree>/.latte/inject/<role>.txt` at the start of every
+    /// turn and prepends a synthetic user message containing the
+    /// queue's content.
+    inject_worktree_root: Option<std::path::PathBuf>,
 }
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
@@ -476,6 +482,7 @@ impl AgentRunner {
             hooks: Arc::new(crate::hooks::HookChain::empty()),
             role_id: "default".to_string(),
             session_id: String::new(),
+            inject_worktree_root: None,
         }
     }
 
@@ -494,6 +501,7 @@ impl AgentRunner {
             hooks: Arc::new(crate::hooks::HookChain::empty()),
             role_id: "default".to_string(),
             session_id: String::new(),
+            inject_worktree_root: None,
         }
     }
 
@@ -508,8 +516,52 @@ impl AgentRunner {
             hooks: Arc::new(crate::hooks::HookChain::empty()),
             role_id: "default".to_string(),
             session_id: String::new(),
+            inject_worktree_root: None,
         }
     }
+    /// Read and drain the per-role inject queue, if any. Prepends a
+    /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
+    /// to `self.context.messages`. Deletes the queue file. This is
+    /// called at the start of `run_turn` and can also be called
+    /// directly from tests.
+    fn drain_inject_queue(&mut self) {
+        let Some(root) = self.inject_worktree_root.clone() else {
+            return;
+        };
+        let queue_path = root
+            .join(".latte")
+            .join("inject")
+            .join(format!("{}.txt", self.role_id));
+        if !queue_path.exists() {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(&queue_path) else {
+            return;
+        };
+        if content.trim().is_empty() {
+            let _ = std::fs::remove_file(&queue_path);
+            return;
+        }
+        let synthetic = latte_ai::models::Message {
+            role: latte_ai::models::Role::User,
+            content: format!("[INJECTED]\n{}", content),
+        };
+        // Prepend the synthetic message. `messages_mut()` returns a
+        // `&mut [Message]` slice which has no `insert(0, _)`, and
+        // there's no `Vec`-level accessor on `ConversationContext`
+        // outside this file. Clone into a local Vec, prepend, then
+        // rebuild the context via `clear` + `push` — slightly wasteful
+        // for large histories but only on a rare inject-drain path.
+        let existing: Vec<latte_ai::models::Message> =
+            self.context.messages_mut().to_vec();
+        self.context.clear();
+        self.context.push(synthetic);
+        for m in existing {
+            self.context.push(m);
+        }
+        let _ = std::fs::remove_file(&queue_path);
+    }
+
     /// Set the max tool-call round trips per turn.
     pub fn set_max_tool_rounds(&mut self, n: usize) {
         self.max_tool_rounds = n;
@@ -601,6 +653,8 @@ impl AgentRunner {
         new_messages: &[Message],
         system_vars: Option<&serde_json::Value>,
     ) -> AgentResult<String> {
+        // HIL blackboard: drain per-role inject queue.
+        self.drain_inject_queue();
         use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
@@ -1011,6 +1065,15 @@ impl AgentRunner {
     /// Set the role identifier.
     pub fn with_role(mut self, role_id: impl Into<String>) -> Self {
         self.role_id = role_id.into();
+        self
+    }
+
+    /// Set the inject-queue worktree root. When set, `run_turn`
+    /// prepends any pending `<root>/.latte/inject/<role_id>.txt`
+    /// content to the conversation as a synthetic user message
+    /// before invoking the model.
+    pub fn with_inject_worktree_root(mut self, root: std::path::PathBuf) -> Self {
+        self.inject_worktree_root = Some(root);
         self
     }
 
@@ -2013,5 +2076,30 @@ End"#;
         // After reset, the streak is gone; next call starts fresh.
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+    }
+
+    #[test]
+    fn drain_inject_queue_prepends_synthetic_user_message() {
+        use latte_ai::models::Role as MsgRole;
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir.path().join(".latte").join("inject").join("programmer.txt");
+        std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        std::fs::write(&queue, "look at foo.rs\n").unwrap();
+
+        let role = test_role();
+        let agent =
+            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
+                .unwrap();
+        let mut runner = AgentRunner::new(agent)
+            .with_role("programmer")
+            .with_inject_worktree_root(dir.path().to_path_buf());
+        runner.drain_inject_queue();
+
+        assert!(!runner.context.messages().is_empty());
+        let first = &runner.context.messages()[0];
+        assert_eq!(first.role, MsgRole::User);
+        assert_eq!(first.content, "[INJECTED]\nlook at foo.rs\n");
+        assert!(!queue.exists());
     }
 }
