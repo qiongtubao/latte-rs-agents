@@ -45,6 +45,7 @@ pub mod hooks;
 pub mod model_resolver;
 pub mod prompts;
 pub mod role;
+pub mod scheduler;
 pub mod session;
 pub mod trace;
 pub mod workspace;
@@ -65,6 +66,7 @@ pub mod prelude {
     pub use crate::error::AgentResult;
     pub use crate::model_resolver::{ModelResolver, ModelTier};
     pub use crate::role::{Role, RoleCategory};
+    pub use crate::scheduler::plan_md_slice_for;
     pub use crate::session::{RoleHistory, SessionError, SessionManager, SessionRecord, SessionState};
     pub use crate::trace::DiffSummary;
     pub use crate::workspace::{Blackboard, MergeMode, WorktreeSpec, WorkspaceError, WorkspaceState};
