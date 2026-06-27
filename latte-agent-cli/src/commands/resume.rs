@@ -1,14 +1,9 @@
-//! `latte-agent resume` — remove the paused sentinel so the running
-//! loop resumes issuing role turns. Idempotent: if the task was not
-//! paused, this just prints a notice.
-
 use clap::Args;
+use latte_agent_core::session::SessionManager;
 use latte_agent_core::workspace::WorkspaceManager;
 
-/// Resume a paused task.
 #[derive(Args, Debug)]
 pub struct ResumeCmd {
-    /// Task id whose worktree to resume.
     #[arg(long)]
     pub task_id: String,
 }
@@ -18,19 +13,39 @@ impl ResumeCmd {
         let cwd = std::env::current_dir()?;
         let repo_root = WorkspaceManager::resolve_repo_root(&cwd)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let flag = repo_root
-            .join(".latte")
-            .join("worktrees")
-            .join(&self.task_id)
-            .join(".latte")
-            .join("control")
-            .join("paused");
-        if flag.exists() {
-            std::fs::remove_file(&flag)?;
-            println!("resumed task {}", self.task_id);
-        } else {
-            println!("task {} was not paused", self.task_id);
+        let worktree_root = repo_root.join(".latte").join("worktrees").join(&self.task_id);
+        if !worktree_root.exists() {
+            anyhow::bail!("worktree for task '{}' not found at {}", self.task_id, worktree_root.display());
         }
+        let session = find_latest_session(&worktree_root, &self.task_id)?;
+        let mut mgr = SessionManager::from_record(session, worktree_root);
+        mgr.resume()?;
+        println!("resumed task {} (state: {:?})", self.task_id, mgr.state());
         Ok(())
     }
+}
+
+fn find_latest_session(
+    worktree_root: &std::path::Path,
+    task_id: &str,
+) -> anyhow::Result<latte_agent_core::session::SessionRecord> {
+    let sessions_dir = worktree_root.join(".latte").join("sessions");
+    if !sessions_dir.exists() {
+        anyhow::bail!("no session found for task '{}' (sessions dir does not exist)", task_id);
+    }
+    let mut best: Option<(std::time::SystemTime, latte_agent_core::session::SessionRecord)> = None;
+    for entry in std::fs::read_dir(&sessions_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+        let modified = entry.metadata()?.modified()?;
+        let raw = std::fs::read_to_string(&path)?;
+        let record: latte_agent_core::session::SessionRecord = serde_json::from_str(&raw)?;
+        if record.task_id != task_id { continue; }
+        match &best {
+            Some((t, _)) if *t >= modified => {}
+            _ => best = Some((modified, record)),
+        }
+    }
+    best.map(|(_, r)| r).ok_or_else(|| anyhow::anyhow!("no session JSON for task '{}'", task_id))
 }
