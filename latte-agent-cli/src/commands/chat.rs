@@ -5,6 +5,7 @@
 //! switch model tier, clear context, and save/load sessions.
 
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1445,4 +1446,164 @@ impl Drop for ChatSession {
     fn drop(&mut self) {
         self.runner.emit_session_end(self.turn_count);
     }
+}
+
+
+// =========================================================================
+// HIL blackboard chat (Task 3.2): drive a multi-role session via
+// SessionManager JSON when --task-id is given. The plain `chat` flow above
+// is untouched for users who don't pass --task-id.
+// =========================================================================
+
+async fn run_hil_chat(
+    _cmd: &ChatCmd,
+    task_id: String,
+    roles: Vec<String>,
+    initial_prompt: Option<String>,
+) -> AnyResult {
+    use latte_agent_core::session::SessionManager;
+
+    // 1. Resolve worktree root
+    let cwd = std::env::current_dir()?;
+    let repo_root = latte_agent_core::workspace::WorkspaceManager::resolve_repo_root(&cwd)
+        .map_err(|e| format!("{}", e))?;
+    let worktree_root = repo_root.join(".latte").join("worktrees").join(&task_id);
+    if !worktree_root.exists() {
+        return Err(format!(
+            "worktree for task '{}' not found at {}. Run `latte-agent run --task-id {}` first.",
+            task_id, worktree_root.display(), task_id
+        ).into());
+    }
+
+    // 2. Open or create the SessionManager
+    let mut mgr = SessionManager::new(&task_id, worktree_root.clone(), roles.clone());
+    if mgr.session_path().exists() {
+        let raw = std::fs::read_to_string(mgr.session_path())?;
+        let record: latte_agent_core::session::SessionRecord = serde_json::from_str(&raw)?;
+        mgr = SessionManager::from_record(record, worktree_root.clone());
+        println!(
+            "[session: {}, state: {:?}, turn: {}]",
+            mgr.record().task_id, mgr.state(), mgr.record().current_turn
+        );
+        if mgr.state() == latte_agent_core::session::SessionState::Paused {
+            mgr.resume()?;
+            println!("[RESUMED at {}]", mgr.record().updated_at);
+        }
+    } else {
+        // Fresh session: require --initial-prompt
+        let prompt = match initial_prompt {
+            Some(p) => p,
+            None => return Err(format!(
+                "no session for task '{}' — pass --initial-prompt to start one",
+                task_id
+            ).into()),
+        };
+        let bb = latte_agent_core::workspace::Blackboard::new(worktree_root.join("plan.md"));
+        bb.write(&format!("# Task: {}\n\n## Initial prompt\n\n{}\n", task_id, prompt))?;
+        mgr.persist()?;
+        println!("[session: {}, state: Created, turn: 0]", task_id);
+        println!("[roles: {}]", roles.join(", "));
+    }
+
+    // 3. Run the REPL
+    run_hil_repl(&mut mgr, task_id).await
+}
+
+async fn run_hil_repl(
+    mgr: &mut latte_agent_core::session::SessionManager,
+    task_id: String,
+) -> AnyResult {
+    use crate::commands::repl::{parse_repl_line, ReplInput};
+    use latte_ai::models::{Message, Role as MsgRole};
+
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    print!("> ");
+    use std::io::Write;
+    stdout.flush()?;
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+
+        match parse_repl_line(trimmed) {
+            Ok(ReplInput::Empty) => continue,
+            Ok(ReplInput::Cmd { name }) if name == "pause" => {
+                mgr.pause("user /pause")?;
+                println!("[session paused — reason: user /pause]");
+                println!("[resume with: latte-agent chat --task-id {}]", task_id);
+                break;
+            }
+            Ok(ReplInput::Cmd { name }) if name == "resume" => {
+                if mgr.state() == latte_agent_core::session::SessionState::Paused {
+                    mgr.resume()?;
+                    println!("[RESUMED at {}]", mgr.record().updated_at);
+                } else {
+                    println!("[not paused — current state: {:?}]", mgr.state());
+                }
+            }
+            Ok(ReplInput::Cmd { name }) if name == "quit" => {
+                mgr.mark_done()?;
+                break;
+            }
+            Ok(ReplInput::Cmd { name }) if name == "roles" => {
+                let names: Vec<&str> = mgr.record().roles.iter().map(|r| r.role_id.as_str()).collect();
+                println!("[roles: {}]", names.join(", "));
+            }
+            Ok(ReplInput::Cmd { name }) => {
+                println!("[unknown command /{} — known: pause resume roles quit]", name);
+            }
+            Ok(ReplInput::RoleInject { role_id, message }) => {
+                if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
+                    eprintln!(
+                        "[error: unknown role '{}' — known: {}]",
+                        role_id,
+                        mgr.record().roles.iter()
+                            .map(|r| r.role_id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    continue;
+                }
+                queue_inject(mgr.worktree_root(), &role_id, &message)?;
+                println!("[{} queue: +1 message]", role_id);
+            }
+            Ok(ReplInput::ManagerInput { message }) => {
+                mgr.append_to_role("manager", Message {
+                    role: MsgRole::User,
+                    content: message.clone(),
+                })?;
+                mgr.advance_turn()?;
+                println!(
+                    "[manager turn {} received {} chars; model integration deferred to v1.1]",
+                    mgr.record().current_turn,
+                    message.len()
+                );
+            }
+            Err(e) => {
+                eprintln!("[parse error: {:?}]", e);
+            }
+        }
+        print!("> ");
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn queue_inject(
+    worktree_root: &Path,
+    role_id: &str,
+    message: &str,
+) -> std::io::Result<()> {
+    let dir = worktree_root.join(".latte").join("inject");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.txt", role_id));
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(f, "{}", message)?;
+    Ok(())
 }
