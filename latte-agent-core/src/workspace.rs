@@ -207,4 +207,47 @@ impl WorkspaceManager {
             state: WorkspaceState::Created,
         })
     }
+    /// Auto-commit any uncommitted changes, then merge the worktree
+    /// branch into the base branch. On conflict, transitions to
+    /// `Failed` and preserves the worktree. Returns the merge commit
+    /// SHA on success.
+    pub fn archive(&mut self, mode: MergeMode) -> Result<String, WorkspaceError> {
+        // First, catch any writes the engine missed
+        let dirty = !git_cmd(&self.spec.worktree_root, &["status", "--porcelain"])?.is_empty();
+        if dirty {
+            git_cmd(&self.spec.worktree_root, &["add", "-A"])?;
+            git_cmd(
+                &self.spec.worktree_root,
+                &["commit", "-m", "[auto-commit-pre-archive]"],
+            )?;
+        }
+
+        self.state = WorkspaceState::Archiving;
+        let merge_flag = match mode {
+            MergeMode::NoFf => "--no-ff",
+            MergeMode::Squash => "--squash",
+            MergeMode::FastForward => "--ff-only",
+        };
+
+        let res = git_cmd(
+            &self.repo_root,
+            &[
+                "merge",
+                merge_flag,
+                "-m",
+                &format!("archive({})", self.spec.task_id),
+                &self.spec.branch_name,
+            ],
+        );
+        if let Err(e) = res {
+            // Try to abort the merge so the main branch isn't left mid-merge.
+            let _ = git_cmd(&self.repo_root, &["merge", "--abort"]);
+            self.state = WorkspaceState::Failed { reason: e.to_string() };
+            return Err(e);
+        }
+
+        let merge_commit = git_cmd(&self.repo_root, &["rev-parse", "HEAD"])?;
+        self.state = WorkspaceState::Archived { merge_commit: merge_commit.clone() };
+        Ok(merge_commit)
+    }
 }
