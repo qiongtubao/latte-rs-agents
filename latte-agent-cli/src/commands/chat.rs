@@ -109,6 +109,24 @@ pub struct ChatCmd {
     /// machines where the file's contents are sensitive.
     #[arg(long)]
     pub no_session_index: bool,
+
+    /// Task ID for the HIL blackboard session. When set, the chat
+    /// runs in worktree mode and the REPL supports `/pause` + `@<role>`.
+    /// When absent, the legacy single-role REPL is used.
+    #[arg(long, value_name = "ID")]
+    pub task_id: Option<String>,
+
+    /// Comma-separated list of role ids participating in the
+    /// HIL session. Defaults to "manager" (i.e. only the manager).
+    /// Used together with `--task-id` and `--initial-prompt`.
+    #[arg(long, value_delimiter = ',', default_value = "manager")]
+    pub roles: Vec<String>,
+
+    /// Initial prompt written to plan.md and used as the manager's
+    /// first user message. Required when `--task-id` is given and no
+    /// existing session JSON is found; ignored otherwise.
+    #[arg(long)]
+    pub initial_prompt: Option<String>,
 }
 impl ChatCmd {
     pub async fn run(&self) -> AnyResult {
