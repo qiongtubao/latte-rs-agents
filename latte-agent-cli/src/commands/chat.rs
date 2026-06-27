@@ -131,6 +131,18 @@ pub struct ChatCmd {
 }
 impl ChatCmd {
     pub async fn run(&self) -> AnyResult {
+        // HIL blackboard mode: when --task-id is given, drive the
+        // session from the SessionManager JSON instead of the
+        // legacy single-role REPL.
+        if let Some(task_id) = &self.task_id {
+            return run_hil_chat(
+                self,
+                task_id.clone(),
+                self.roles.clone(),
+                self.initial_prompt.clone(),
+            )
+            .await;
+        }
         // Per-session log file (also echoed to stderr). Always on —
         // the whole point of `-m` + the resolver work is to debug
         // "why did this fall through to that model", and a single

@@ -58,7 +58,7 @@ fn chat_hil_pause_resume_inject_rollback() {
 
     // 2. Open chat, send a manager message, then /pause.
     let script1 = b"first task\n/pause\n";
-    let out1 = latte(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer"], Some(script1));
+    let out1 = latte(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script1));
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     println!("[chat1 stdout]\n{}", stdout1);
     println!("[chat1 stderr]\n{}", String::from_utf8_lossy(&out1.stderr));
@@ -86,7 +86,7 @@ fn chat_hil_pause_resume_inject_rollback() {
 
     // 5. Re-open the chat, send @programmer, then /quit.
     let script2 = b"@programmer check this\n/quit\n";
-    let out2 = latte(repo, &["chat", "--task-id", "e2e"], Some(script2));
+    let out2 = latte(repo, &["chat", "--task-id", "e2e", "--initial-prompt", "noop"], Some(script2));
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     println!("[chat2 stdout]\n{}", stdout2);
     println!("[chat2 stderr]\n{}", String::from_utf8_lossy(&out2.stderr));
