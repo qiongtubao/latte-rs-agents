@@ -196,10 +196,59 @@ that this plan enables is exercised by running the system against a
 real workload and inspecting `~/.latte/traces/*.jsonl` with
 `latte-agent debug trace <id>`.
 
+## HIL Blackboard (v1)
+
+Run a multi-role agent session inside a git worktree with a `plan.md` blackboard, support for `/pause` + `/resume`, and `@<role>` injection routed to a specific specialist:
+
+```bash
+# Start a session (auto-creates the worktree + plan.md)
+latte-agent run --task-id fix-redis-bug --initial-prompt "Redis pool doesn't recycle after 5xx"
+
+# Open the HIL REPL
+latte-agent chat --task-id fix-redis-bug --roles manager,programmer,reviewer
+
+# In the REPL:
+#   > look at the redis pool
+#   > /pause                  # exits; state persisted to .latte/sessions/<id>.json
+#   > @programmer check this  # queues a message for programmer's next turn
+#   > /resume                 # (only valid if state is Paused)
+#   > /quit                   # marks the session Done
+
+# Resume from outside the REPL
+latte-agent chat --task-id fix-redis-bug
+
+# Inject from another terminal
+latte-agent inject --task-id fix-redis-bug --role programmer --message "..."
+
+# Pause / resume from outside the REPL
+latte-agent pause  --task-id fix-redis-bug
+latte-agent resume --task-id fix-redis-bug
+
+# Surgical rollback: reset the worktree code, keep plan.md and trace
+latte-agent checkpoint rollback --task-id fix-redis-bug --id 3
+
+# Archive + cleanup
+latte-agent run --task-id fix-redis-bug --archive --cleanup
+```
+
+The worktree lives at `<repo>/.latte/worktrees/<task-id>/`; the base
+branch HEAD stays clean for the entire session. Session state is
+persisted atomically to `<worktree>/.latte/sessions/<id>.json` and is
+human-readable / hand-editable (operators can delete "毒药消息" while
+paused). Six new `TraceEvent` variants (`SessionStarted`, `SessionPaused`,
+`SessionResumed`, `RoleInjected`, plus the inherited `CheckpointCreated` and
+`CheckpointRolledBack` from the `WorkspaceManager`/`CheckpointEngine`
+modules) land in `~/.latte/traces/<id>.jsonl`.
+
+See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v1-design.md`
+for the design and `docs/superpowers/plans/2026-06-28-latte-hil-blackboard-v1-impl.md`
+for the implementation plan.
+
 ## Roadmap
 
 Per spec `docs/superpowers/specs/2026-06-25-latte-agent-debug-observability-design.md` §3:
 
-- **Checkpoint / node-level retry** (deferred) — state serialization,
-  restore from a snapshot, retry budget. Hooks reserve the
-  `HookOutcome::Retry { correction }` variant for this future work.
+- **Checkpoint / node-level retry** — the v1 of the HIL Blackboard
+  system ships in this release (see the "HIL Blackboard (v1)"
+  section above). The v2 spec will add full state serialization,
+  restore-from-snapshot, retry budget, and a real `SessionManager`.

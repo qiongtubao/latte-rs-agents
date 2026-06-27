@@ -11,8 +11,9 @@ use clap::{Parser, Subcommand};
 mod commands;
 
 use commands::{
-    chat::ChatCmd, config::ConfigCmd, debug::DebugCmd, discuss::DiscussCmd,
-    list::ListCmd, workflow::WorkflowCmd,
+    chat::ChatCmd, checkpoint::CheckpointCmd, config::ConfigCmd, debug::DebugCmd,
+    discuss::DiscussCmd, inject::InjectCmd, list::ListCmd, pause::PauseCmd,
+    resume::ResumeCmd, run::RunCmd, workflow::WorkflowCmd,
 };
 
 #[derive(Parser)]
@@ -32,6 +33,16 @@ enum Command {
     Config(ConfigCmd),
     /// Offline inspection of recorded sessions, prompts, parser, and hooks
     Debug(DebugCmd),
+    /// Run a task inside an isolated worktree sandbox
+    Run(RunCmd),
+    /// Inject a message into a running task
+    Inject(InjectCmd),
+    /// Pause a running task
+    Pause(PauseCmd),
+    /// Resume a paused task
+    Resume(ResumeCmd),
+    /// Manage checkpoints (create / list / rollback)
+    Checkpoint(CheckpointCmd),
 }
 
 #[tokio::main]
@@ -45,6 +56,11 @@ async fn main() {
         Command::List(cmd) => cmd.run().await,
         Command::Config(cmd) => cmd.run().await,
         Command::Debug(cmd) => cmd.run().await,
+        Command::Run(cmd) => cmd.run().map_err(Into::into),
+        Command::Inject(cmd) => cmd.run().map_err(Into::into),
+        Command::Pause(cmd) => cmd.run().map_err(Into::into),
+        Command::Resume(cmd) => cmd.run().map_err(Into::into),
+        Command::Checkpoint(cmd) => cmd.run().map_err(Into::into),
     };
     if let Err(e) = result {
         eprintln!("Error: {}", e);
