@@ -250,4 +250,24 @@ impl WorkspaceManager {
         self.state = WorkspaceState::Archived { merge_commit: merge_commit.clone() };
         Ok(merge_commit)
     }
+    /// Best-effort: remove the worktree directory and delete the
+    /// branch. Never panics; logs failures via `eprintln!` and
+    /// returns Ok(()) if the worktree is already gone.
+    pub fn cleanup(&mut self) -> Result<(), WorkspaceError> {
+        // Remove the worktree
+        if self.spec.worktree_root.exists() {
+            if let Err(e) = git_cmd(&self.repo_root, &["worktree", "remove", "--force", self.spec.worktree_root.to_str().unwrap()]) {
+                eprintln!("[workspace] worktree remove failed: {}", e);
+                // Fall back to manual removal
+                let _ = std::fs::remove_dir_all(&self.spec.worktree_root);
+            }
+        }
+        // Delete the branch (may already be gone, that's fine)
+        if let Err(e) = git_cmd(&self.repo_root, &["branch", "-D", &self.spec.branch_name]) {
+            eprintln!("[workspace] branch delete failed (ok if already gone): {}", e);
+        }
+        // Prune worktree bookkeeping
+        let _ = git_cmd(&self.repo_root, &["worktree", "prune"]);
+        Ok(())
+    }
 }
