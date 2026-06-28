@@ -36,6 +36,7 @@
 //! ```
 
 pub mod agent;
+pub mod controller;
 pub mod checkpoint;
 pub mod config;
 pub mod context;

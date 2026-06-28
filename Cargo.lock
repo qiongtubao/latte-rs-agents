@@ -981,6 +981,7 @@ dependencies = [
  "latte-agent-orchestrator",
  "latte-ai",
  "latte-rs-agent-tools",
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -30,3 +30,8 @@ anyhow = "1"
 # is regenerated. Used by tests/blackbox/common to create per-test
 # isolated LATTE_HOME directories.
 tempfile = "3"
+# `parking_lot` mirrors the workspace dep used in the agent / trace
+# code so the mock server in `hil_v11_trace_events_e2e` (and any
+# future HTTP-mock e2e) can use the same `Mutex` flavor as the
+# production code path (no .unwrap() on lock results).
+parking_lot = { workspace = true }
