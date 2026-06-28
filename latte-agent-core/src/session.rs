@@ -163,6 +163,27 @@ impl SessionManager {
         self.persist()
     }
 
+    /// Auto-transition to Running from Created or Resumed. Idempotent
+    /// if already Running. Errors with InvalidTransition if the
+    /// current state is Paused, Done, or Failed (those are terminal
+    /// or require explicit human action).
+    pub fn start(&mut self) -> Result<(), SessionError> {
+        use SessionState::*;
+        match self.record.state {
+            Created | Resumed | Running => {
+                self.record.state = Running;
+                self.persist()
+            }
+            Paused | Done | Failed => {
+                Err(SessionError::InvalidTransition {
+                    from: self.record.state,
+                    to: Running,
+                })
+            }
+        }
+    }
+
+
     pub fn mark_failed(&mut self, reason: &str) -> Result<(), SessionError> {
         self.transition(SessionState::Failed)?;
         self.record.pause_reason = Some(reason.to_string());
@@ -429,5 +450,39 @@ mod tests {
         let history = mgr.role_history("programmer");
         assert!(history.last().unwrap().content.contains("[HUMAN @"));
         assert!(history.last().unwrap().content.contains("use serde"));
+    }
+
+    #[test]
+    fn start_transitions_created_to_running() {
+        let (_dir, mut mgr) = make_mgr();
+        assert_eq!(mgr.state(), SessionState::Created);
+        mgr.start().unwrap();
+        assert_eq!(mgr.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn start_is_idempotent_for_running() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.start().unwrap();
+        mgr.start().unwrap();
+        assert_eq!(mgr.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn start_transitions_resumed_to_running() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_with_reason("test").unwrap();
+        mgr.resume().unwrap();
+        assert_eq!(mgr.state(), SessionState::Resumed);
+        mgr.start().unwrap();
+        assert_eq!(mgr.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn start_from_paused_is_rejected() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_with_reason("test").unwrap();
+        let res = mgr.start();
+        assert!(matches!(res, Err(SessionError::InvalidTransition { .. })));
     }
 }
