@@ -11,6 +11,7 @@ use clap::Args;
 use latte_agent_core::checkpoint::CheckpointEngine;
 use latte_agent_core::trace::{FanoutSink, IndexSink, JsonlSink, NullSink, TraceSink};
 use latte_agent_core::workspace::{MergeMode, WorkspaceManager};
+use latte_agent_core::config::ConfigLayer;
 
 /// Run a task inside an isolated worktree sandbox.
 #[derive(Args, Debug)]
@@ -120,15 +121,16 @@ fn build_sink(task_id: &str) -> anyhow::Result<Arc<dyn TraceSink>> {
     Ok(Arc::new(FanoutSink::new(vec![jsonl, index])))
 }
 
-/// Resolve the LATTE_HOME root for sink output. Mirrors the
-/// `latte_home()` helpers elsewhere in the CLI so all per-task
-/// trace/index files land in the same tree.
+/// Resolve the root directory for sink output.
+///
+/// Priority: `LATTE_HOME` env var → `ConfigLayer::Project` → `ConfigLayer::Global`.
 fn latte_home() -> std::path::PathBuf {
     std::env::var_os("LATTE_HOME")
         .map(std::path::PathBuf::from)
+        .or_else(|| ConfigLayer::Project.root_dir())
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".latte"))
+            ConfigLayer::Global
+                .root_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from(".latte"))
         })
 }

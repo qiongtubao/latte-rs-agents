@@ -45,15 +45,15 @@ pub struct WorkflowCmd {
     pub workflow: Option<String>,
 
     /// Path to agents config TOML (file or directory).
-    #[arg(long, default_value = ".latte/agents")]
+    #[arg(long, default_value = ".latte/agents.d")]
     pub agents_config: String,
 
     /// Path to models config TOML.
-    #[arg(long, default_value = ".latte/models.toml")]
+    #[arg(long, default_value = ".latte/models.d")]
     pub models_config: String,
 
     /// Path to discussion workflow TOML (file or directory).
-    #[arg(long, default_value = ".latte/workflows")]
+    #[arg(long, default_value = ".latte/workflows.d")]
     pub discussion_config: String,
 
     /// Maximum discussion rounds.

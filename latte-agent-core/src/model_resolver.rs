@@ -207,7 +207,14 @@ impl ModelResolver {
     /// tier-resolution order that has an `api_key` set; subsequent
     /// entries are `chain_ids` (deduped) where the model also has a
     /// key. Models whose `api_key` is empty are skipped, so the
-    /// agent never tries a model it cannot authenticate against.
+    /// Resolve candidate models in priority order.
+    ///
+    /// When `chain_ids` is non-empty, the **first chain model** is used as
+    /// the primary candidate (instead of the tier-based default from
+    /// `[role_tiers]` / `[tiers]`).  Remaining chain ids are appended as
+    /// fallbacks.
+    ///
+    /// When `chain_ids` is empty, falls back to the tier-based resolution.
     pub fn resolve_chain(
         &self,
         role_id: &str,
@@ -215,29 +222,41 @@ impl ModelResolver {
         chain_ids: &[String],
     ) -> AgentResult<Vec<Model>> {
         let mut out: Vec<Model> = Vec::with_capacity(1 + chain_ids.len());
-        if let Ok(primary) = self.resolve(role_id, tier) {
-            out.push(primary);
-        }
-        for id in chain_ids {
-            if out.iter().any(|m| &m.id == id) {
-                continue;
-            }
-            if let Ok(m) = self.build_model(id) {
-                if !m.api_key.trim().is_empty() {
-                    out.push(m);
+
+        if !chain_ids.is_empty() {
+            // model_chain is set: use chain[0] as primary,
+            // then append remaining chain ids as fallbacks.
+            for id in chain_ids {
+                if out.iter().any(|m| &m.id == id) {
+                    continue;
+                }
+                if let Ok(m) = self.build_model(id) {
+                    if !m.api_key.trim().is_empty() {
+                        out.push(m);
+                    }
                 }
             }
         }
-        // Last-resort safety net: if neither the tier candidates nor the
-        // explicit chain yielded a model, walk the full catalog for any
-        // model with a valid `api_key`. This handles the case where the
-        // operator has a working model in `~/.latte/models.yaml` (with a
-        // real key) but the project's `model_chain` for the role is
-        // empty AND no candidate at the requested tier has a key — e.g.
-        // tier=`standard` maps to `claude-sonnet-4` (env unset) but the
-        // operator only configured a `deepseek-chat` key. We pick the
-        // first catalog model that authenticates; the operator still
-        // gets a clear error if nothing in the catalog works.
+
+        // No chain or chain models all failed: fall back to tier-based resolve.
+        if out.is_empty() {
+            if let Ok(primary) = self.resolve(role_id, tier) {
+                out.push(primary);
+            }
+        }
+
+        // Also append tier-based candidates that aren't already in the chain,
+        // as additional fallbacks (only when chain was used).
+        if !chain_ids.is_empty() {
+            if let Ok(primary) = self.resolve(role_id, tier) {
+                if !out.iter().any(|m| &m.id == &primary.id) {
+                    out.push(primary);
+                }
+            }
+        }
+
+        // Last-resort safety net: walk the full catalog for any model
+        // with a valid `api_key`.
         if out.is_empty() {
             for def in self.models.values() {
                 if let Ok(m) = self.build_model(&def.id) {
@@ -610,24 +629,26 @@ mod tests {
     #[test]
     fn test_resolve_chain_returns_primary_first() {
         let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        // chain[0] is the primary, tier-based primary appended as fallback.
         let chain = resolver
             .resolve_chain("any", ModelTier::Premium, &["standard".into()])
             .unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].id, "premium");
-        assert_eq!(chain[1].id, "standard");
+        assert_eq!(chain[0].id, "standard");
+        assert_eq!(chain[1].id, "premium");
     }
 
     #[test]
     fn test_resolve_chain_preserves_order() {
         let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
+        // chain[0] becomes primary, then chain[1], then tier-based fallback.
         let chain = resolver
             .resolve_chain("any", ModelTier::Premium, &["budget".into(), "standard".into()])
             .unwrap();
         assert_eq!(
             chain.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["premium", "budget", "standard"],
-            "fallback order must match the input list"
+            vec!["budget", "standard", "premium"],
+            "chain order must be preserved, tier-based fallback appended"
         );
     }
 
@@ -657,8 +678,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].id, "premium");
-        assert_eq!(chain[1].id, "budget");
+        assert_eq!(chain[0].id, "budget");
+        assert_eq!(chain[1].id, "premium");
     }
 
     #[test]

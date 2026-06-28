@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use latte_agent_core::trace::{IndexLine, TraceEvent};
+use latte_agent_core::config::ConfigLayer;
 
 /// Per-session summary derived from one or more of the three sibling
 /// files. `size_bytes` is the on-disk total across whichever files
@@ -30,26 +31,29 @@ pub struct SessionSummary {
 }
 
 /// Resolve the latte root directory. Returns `None` if no home is
-/// discoverable (no `HOME` and no `LATTE_HOME`).
+/// discoverable.
+///
+/// Priority: `LATTE_HOME` env var → project `.latte/` → `~/.latte/`.
 pub fn latte_home() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("LATTE_HOME") {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    // Project-level `<cwd>/.latte/` takes priority so session
-    // metadata lives next to the project it's debugging, rather
-    // than being scattered across the operator's `$HOME`.
     let project_lat = PathBuf::from(".latte");
     if project_lat.is_dir() {
         return Some(project_lat);
     }
-    std::env::var_os("HOME").map(PathBuf::from).map(|h| h.join(".latte"))
+    ConfigLayer::Global.root_dir()
 }
 
-pub fn logs_dir() -> Option<PathBuf> { latte_home().map(|h| h.join("logs")) }
+pub fn logs_dir() -> Option<PathBuf> {
+    ConfigLayer::Project.logs_dir().filter(|d| d.is_dir())
+        .or_else(|| ConfigLayer::Global.logs_dir())
+}
 pub fn sessions_dir() -> Option<PathBuf> { latte_home().map(|h| h.join("sessions")) }
 pub fn traces_dir() -> Option<PathBuf> { latte_home().map(|h| h.join("traces")) }
+
 
 /// Sanity-check that `id` is a plausible session id. Lenient by
 /// design: rejects path traversal (`..`, `/`) and empty strings;
@@ -107,9 +111,9 @@ pub fn index_path(id: &str) -> Option<PathBuf> {
     sessions_dir().map(|d| d.join(format!("{}.idx", id)))
 }
 
-/// Path to a session's chat-log file (`~/.latte/logs/<id>.log`).
+/// Path to a session's chat-log file (`~/.latte/logs/agents/<id>.log`).
 pub fn log_path(id: &str) -> Option<PathBuf> {
-    logs_dir().map(|d| d.join(format!("{}.log", id)))
+    logs_dir().map(|d| d.join("agents").join(format!("{}.log", id)))
 }
 
 /// Errors from `load_*` and friends. `NotFound` is the typical case

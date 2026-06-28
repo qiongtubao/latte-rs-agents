@@ -159,64 +159,52 @@ impl WorkflowRegistry {
     }
     /// Load project + global workflow registries and merge them.
     ///
-    /// Lookup order:
-    /// 1. `project_path` if it exists. Missing path is silently skipped.
-    /// 2. `~/.latte/workflows.d/` (directory) if it exists.
-    /// 3. `~/.latte/discussion.toml` (single file) if it exists.
+    /// Both layers use the same layout via [`ConfigLayer`]:
+    /// - Project: `ConfigLayer::Project.workflows_dir()` (`./.latte/workflows/`)
+    /// - Global:  `ConfigLayer::Global.workflows_dir()` (`$LATTE_HOME/workflows.d/` or `~/.latte/workflows.d/`)
     ///
     /// On id collision, **project-wins**: the project's workflow
     /// replaces the global one. The `default` slot is set from
     /// whichever layer has a `default.toml` / `name = "default"`
     /// workflow — if both do, the project's wins. When neither is
     /// present, returns an empty registry.
+    ///
+    /// `project_path` — optional override for the project workflows dir.
+    /// When `None`, defaults to [`ConfigLayer::Project.workflows_dir()`].
     pub fn load_with_global(project_path: Option<&str>) -> OrchResult<Self> {
         let mut merged = Self::default();
 
-        // 1) Project path, if it exists.
-        if let Some(path) = project_path {
-            if std::fs::metadata(path).is_ok() {
-                let part = Self::load(path)?;
-                // Project's `default` wins if the global layer also
-                // contributes one.
+        // 1) Project layer: use explicit path or fallback to ConfigLayer.
+        let project_dir: Option<String> = project_path
+            .filter(|p| std::fs::metadata(p).is_ok())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                latte_agent_core::config::ConfigLayer::Project
+                    .workflows_dir()
+                    .filter(|d| d.is_dir())
+                    .and_then(|d| d.to_str().map(|s| s.to_string()))
+            });
+        if let Some(path) = project_dir {
+            if let Ok(part) = Self::load(&path) {
                 if part.default.is_some() {
-                    merged.default = part.default.clone();
+                    merged.default = part.default;
                 }
                 for (id, wf) in part.workflows {
-                    // Project always wins per id.
                     merged.workflows.insert(id, wf);
                 }
             }
         }
 
-        // 2) Global layer. Uses the same $LATTE_HOME / ~/.latte/
-        //    resolution that the model global config uses.
-        if let Some(global_dir) =
-            latte_agent_core::global_config::GlobalConfig::global_dir()
-        {
-            // 2a) Directory of per-workflow toml files.
-            let wf_dir = global_dir.join("workflows.d");
-            if std::fs::metadata(&wf_dir)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                let global_part = Self::load(wf_dir.to_str().unwrap())?;
-                if merged.default.is_none() {
-                    merged.default = global_part.default;
-                }
-                for (id, wf) in global_part.workflows {
-                    // Project-wins; only add ids the project did not define.
-                    merged.workflows.entry(id).or_insert(wf);
-                }
-            }
-            // 2b) Legacy single-file ~/.latte/discussion.toml.
-            let single = global_dir.join("discussion.toml");
-            if single.is_file() {
-                let global_part = Self::load(single.to_str().unwrap())?;
-                if merged.default.is_none() {
-                    merged.default = global_part.default;
-                }
-                for (id, wf) in global_part.workflows {
-                    merged.workflows.entry(id).or_insert(wf);
+        // 2) Global layer: always uses ConfigLayer::Global.
+        if let Some(wf_dir) = latte_agent_core::config::ConfigLayer::Global.workflows_dir() {
+            if wf_dir.is_dir() {
+                if let Ok(global_part) = Self::load(wf_dir.to_str().unwrap()) {
+                    if merged.default.is_none() {
+                        merged.default = global_part.default;
+                    }
+                    for (id, wf) in global_part.workflows {
+                        merged.workflows.entry(id).or_insert(wf);
+                    }
                 }
             }
         }

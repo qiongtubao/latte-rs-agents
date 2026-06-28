@@ -3,7 +3,7 @@
 //! Precedence (highest → lowest):
 //!
 //! 1. CLI overrides (`--api-key`, `--model-override id.field=value`).
-//! 2. Project config (typically .latte/agents + .latte/models.toml).
+//! 2. Project config (project `.latte/agents.d/` + `.latte/models.d/`).
 //! 3. Global config (`~/.latte/models.{yaml,toml}` or `~/.latte/models.d/*`).
 //!
 //! Within a layer, identical `model.id` entries merge by **filling empty

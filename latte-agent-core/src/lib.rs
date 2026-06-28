@@ -17,7 +17,7 @@
 //! use latte_ai::models::{Message, Role};
 //!
 //! # async fn example() -> std::result::Result<(), Box<dyn std::error::Error>> {
-//! let config = AgentConfig::load(".latte/agents.toml")?;
+//! # let config = AgentConfig::load(".latte/agents")?;
 //! let resolver = ModelResolver::from_config(&config)?;
 //!
 //! let template = config.roles.get("pm").unwrap();
@@ -51,8 +51,7 @@ pub mod supervisor;
 pub mod trace;
 pub mod workspace;
 
-pub use agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
-pub use config::AgentConfig;
+pub use config::{AgentConfig, ConfigLayer};
 pub use context::{ConversationContext, Importance};
 pub use error::{AgentError, AgentResult};
 pub use model_resolver::{ModelResolver, ModelTier};
@@ -62,7 +61,7 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 pub mod prelude {
     pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
     pub use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointTrigger, RollbackMode};
-    pub use crate::config::AgentConfig;
+    pub use crate::config::{AgentConfig, ConfigLayer};
     pub use crate::context::{ConversationContext, Importance};
     pub use crate::error::AgentResult;
     pub use crate::model_resolver::{ModelResolver, ModelTier};

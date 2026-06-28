@@ -8,6 +8,117 @@ use std::collections::HashMap;
 
 use crate::error::{AgentError, AgentResult};
 use crate::role::RoleTemplate;
+use std::path::PathBuf;
+
+/// Which layer of the layered config system we are loading from.
+///
+/// Both layers use the same directory layout: `agents/` for per-role
+/// TOML files, `workflows/` for per-workflow TOML files, etc.
+/// The only difference is the root directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLayer {
+    /// Project layer — `.latte/` under the current working directory.
+    Project,
+    /// Global layer — `$LATTE_HOME/` or `~/.latte/`.
+    Global,
+}
+
+impl ConfigLayer {
+    /// Return the root directory for this layer.
+    ///
+    /// - `Project` → `./.latte`
+    /// - `Global` → `$LATTE_HOME` or `$HOME/.latte`
+    pub fn root_dir(&self) -> Option<PathBuf> {
+        match self {
+            ConfigLayer::Project => Some(PathBuf::from(".latte")),
+            ConfigLayer::Global => crate::global_config::GlobalConfig::global_dir(),
+        }
+    }
+
+    /// Return the agents directory for this layer.
+    /// Both project and global layers use `agents.d/`.
+    pub fn agents_dir(&self) -> Option<PathBuf> {
+        self.root_dir().map(|d| d.join("agents.d"))
+    }
+
+    /// Return the workflows directory for this layer.
+    /// Both project and global layers use `workflows.d/`.
+    pub fn workflows_dir(&self) -> Option<PathBuf> {
+        self.root_dir().map(|d| d.join("workflows.d"))
+    }
+
+    /// Return the logs root directory for this layer.
+    pub fn logs_dir(&self) -> Option<PathBuf> {
+        self.root_dir().map(|d| d.join("logs"))
+    }
+
+    /// Return the logs/agents directory for this layer.
+    pub fn log_agents_dir(&self) -> Option<PathBuf> {
+        self.root_dir().map(|d| d.join("logs").join("agents"))
+    }
+}
+
+/// Merge `src` roles/tiers into `dst` using **field-level** semantics:
+/// - New role ids from `src` are inserted as-is.
+/// - Existing role ids get only **empty fields** filled from `src`
+///   (`model_chain`, `icon`, `temperature`). Name, category,
+///   model_tier, prompt_file, and tools stay with the project's value.
+fn merge_global_into(dst: &mut HashMap<String, RoleTemplate>, src: &HashMap<String, RoleTemplate>) {
+    for (id, role) in src {
+        match dst.entry(id.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(role.clone());
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                let existing = e.get_mut();
+                // model_chain: global fills in if project has none.
+                if existing.model_chain.is_empty() && !role.model_chain.is_empty() {
+                    existing.model_chain = role.model_chain.clone();
+                }
+                // icon: global fills in if project has default empty.
+                if existing.icon.is_empty() && !role.icon.is_empty() {
+                    existing.icon = role.icon.clone();
+                }
+                // temperature: global fills in if project omitted it.
+                if existing.temperature.is_none() && role.temperature.is_some() {
+                    existing.temperature = role.temperature;
+                }
+            }
+        }
+    }
+}
+
+fn merge_models_or_insert(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
+    for m in src {
+        if !dst.iter().any(|e| e.id == m.id) {
+            dst.push(m.clone());
+        }
+    }
+}
+
+fn merge_tiers_or_insert(dst: &mut Option<HashMap<String, String>>, src: &Option<HashMap<String, String>>) {
+    if let Some(s) = src {
+        let d = dst.get_or_insert_with(Default::default);
+        for (k, v) in s {
+            d.entry(k.clone()).or_insert(v.clone());
+        }
+    }
+}
+
+fn merge_role_tiers_or_insert(
+    dst: &mut Option<HashMap<String, HashMap<String, String>>>,
+    src: &Option<HashMap<String, HashMap<String, String>>>,
+) {
+    if let Some(s) = src {
+        let d = dst.get_or_insert_with(Default::default);
+        for (role, tier_map) in s {
+            let entry = d.entry(role.clone()).or_insert_with(Default::default);
+            for (k, v) in tier_map {
+                entry.entry(k.clone()).or_insert(v.clone());
+            }
+        }
+    }
+}
 
 // ─── Top-level config ────────────────────────────────────────────────────
 
@@ -51,35 +162,34 @@ impl AgentConfig {
     }
     /// Load project + global configs and merge them.
     ///
-    /// Lookup order:
-    /// 1. `project_path` if it exists (file or directory). Missing
-    ///    path is silently skipped.
-    /// 2. `~/.latte/agents.d/` (directory) if it exists.
-    /// 3. `~/.latte/agents.toml` (single file) if it exists.
+    /// Both layers use the same layout via [`ConfigLayer`]:
+    /// - Project: `ConfigLayer::Project.agents_dir()` (`./.latte/agents.d/`)
+    /// - Global:  `ConfigLayer::Global.agents_dir()` (`$LATTE_HOME/agents.d/` or `~/.latte/agents.d/`)
     ///
-    /// Roles and models with the same `id` in both layers are
-    /// **project-wins**: the project's version replaces the global
-    /// one, so a project can override a default shipped globally. The
-    /// global layer only contributes ids the project did not declare.
+    /// **Project-wins** per role id: the project's version replaces
+    /// the global one. The global layer only contributes ids the
+    /// project did not declare.
+    ///
+    /// `project_path` — optional override for the project agents dir.
+    /// When `None`, defaults to [`ConfigLayer::Project.agents_dir()`].
     ///
     /// Returns `Ok(default)` if neither layer has anything.
     pub fn load_with_global(project_path: Option<&str>) -> AgentResult<Self> {
-        use crate::global_config::GlobalConfig;
         let mut merged = Self::default();
 
-        // 1) Project path. A missing path is silently skipped so a
-        //    bare `~/.latte/agents.d` setup can work with no project
-        //    config at all.
-        if let Some(path) = project_path {
-            if std::fs::metadata(path).is_ok() {
-                let part = Self::load(path)?;
-                // Roles: project goes in unconditionally (project-wins
-                // is implemented at merge-into-global time below).
+        // 1) Project layer: use explicit path or fallback to ConfigLayer.
+        let project_dir: Option<String> = project_path
+            .filter(|p| std::fs::metadata(p).is_ok())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                ConfigLayer::Project
+                    .agents_dir()
+                    .filter(|d| d.is_dir())
+                    .and_then(|d| d.to_str().map(|s| s.to_string()))
+            });
+        if let Some(path) = project_dir {
+            if let Ok(part) = Self::load(&path) {
                 merged.roles.extend(part.roles);
-                // Models: project goes in unconditionally; the global
-                // model layer will be merged on top later if the
-                // caller wants field-filling semantics, but here we
-                // just preserve the union.
                 for m in part.models.models {
                     if !merged.models.models.iter().any(|e| e.id == m.id) {
                         merged.models.models.push(m);
@@ -104,90 +214,19 @@ impl AgentConfig {
             }
         }
 
-        // 2) Global layer. We try the canonical `$LATTE_HOME` (or
-        //    `~/.latte/`) for an `agents.d/` directory and a legacy
-        //    `agents.toml` single file. Both are optional.
-        if let Some(global_dir) = GlobalConfig::global_dir() {
-            // 2a) Directory of per-role toml files.
-            let agents_dir = global_dir.join("agents.d");
-            if std::fs::metadata(&agents_dir)
-                .map(|m| m.is_dir())
-                .unwrap_or(false)
-            {
-                let global_part = Self::load(agents_dir.to_str().unwrap())?;
-                // Project-wins per role id.
-                for (id, role) in global_part.roles {
-                    merged.roles.entry(id).or_insert(role);
-                }
-                // Models: only add ids the project did not define.
-                for m in global_part.models.models {
-                    if !merged.models.models.iter().any(|e| e.id == m.id) {
-                        merged.models.models.push(m);
-                    }
-                }
-                if let Some(t) = global_part.models.tiers {
-                    let dst = merged
-                        .models
-                        .tiers
-                        .get_or_insert_with(Default::default);
-                    for (k, v) in t {
-                        dst.entry(k).or_insert(v);
-                    }
-                }
-                if let Some(rt) = global_part.models.role_tiers {
-                    let dst = merged
-                        .models
-                        .role_tiers
-                        .get_or_insert_with(Default::default);
-                    for (role, tier_map) in rt {
-                        let entry = dst.entry(role).or_insert_with(Default::default);
-                        for (k, v) in tier_map {
-                            entry.entry(k).or_insert(v);
-                        }
-                    }
-                }
-            }
-            // 2b) Legacy single-file ~/.latte/agents.toml.
-            let single = global_dir.join("agents.toml");
-            if single.is_file() {
-                let global_part = Self::load(single.to_str().unwrap())?;
-                for (id, role) in global_part.roles {
-                    merged.roles.entry(id).or_insert(role);
-                }
-                for m in global_part.models.models {
-                    if !merged.models.models.iter().any(|e| e.id == m.id) {
-                        merged.models.models.push(m);
-                    }
-                }
-                if let Some(t) = global_part.models.tiers {
-                    let dst = merged
-                        .models
-                        .tiers
-                        .get_or_insert_with(Default::default);
-                    for (k, v) in t {
-                        dst.entry(k).or_insert(v);
-                    }
-                }
-                if let Some(rt) = global_part.models.role_tiers {
-                    let dst = merged
-                        .models
-                        .role_tiers
-                        .get_or_insert_with(Default::default);
-                    for (role, tier_map) in rt {
-                        let entry = dst.entry(role).or_insert_with(Default::default);
-                        for (k, v) in tier_map {
-                            entry.entry(k).or_insert(v);
-                        }
-                    }
+        // 2) Global layer: always uses ConfigLayer::Global.
+        if let Some(agents_dir) = ConfigLayer::Global.agents_dir() {
+            if agents_dir.is_dir() {
+                if let Ok(global_part) = Self::load(agents_dir.to_str().unwrap()) {
+                    merge_global_into(&mut merged.roles, &global_part.roles);
+                    merge_models_or_insert(&mut merged.models.models, &global_part.models.models);
+                    merge_tiers_or_insert(&mut merged.models.tiers, &global_part.models.tiers);
+                    merge_role_tiers_or_insert(&mut merged.models.role_tiers, &global_part.models.role_tiers);
                 }
             }
         }
 
-        // 3) Built-in role fallback. If neither the project nor the
-        //    global layer declared any role, the binary still works
-        //    using the 10 hard-coded defaults from `prompts.rs`.
-        //    This makes `latte-agent` runnable on a fresh checkout
-        //    with no config files at all.
+        // 3) Built-in role fallback.
         if merged.roles.is_empty() {
             for id in [
                 "pm",
@@ -703,7 +742,6 @@ icon = "P"
 
     #[test]
     fn test_load_with_global_only_global() {
-        // Project path is None; global layer supplies everything.
         with_latte_home(|home| {
             let agents_dir = home.join("agents.d");
             std::fs::create_dir_all(&agents_dir).unwrap();

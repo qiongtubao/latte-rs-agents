@@ -11,9 +11,8 @@
 > - `.latte/workflows/` (per-workflow TOML files)
 > - `.latte/logs/` (chat session logs)
 >
-> …and from the **user home** (`$LATTE_HOME` or `~/.latte/`):
->
-> - `agents.d/`, `models.d/`, `workflows.d/`, `prompts.d/`, `logs/`
+> - `agents/`, `models/`, `workflows/`, `prompts/`, `logs/` (same layout as project)
+> - `logs/agents/` (per-agent session logs, separated by agent id)
 >
 > The actual config files at runtime live in `.latte/`. `config/`
 > is here so contributors can copy it as a starting point for a new
@@ -35,80 +34,37 @@ language, the layering is:
    `config/agents.toml` (role metadata) are embedded via `include_str!`
    in `latte-agent-core/src/prompts.rs::template_for`. Re-bake the
    binary to change.
-2. **Project-level runtime override** (per project): `.latte/prompts.d/`
-   and `.latte/agents.d/`. The first file matching `<role>.md` wins;
+2. **Project-level runtime override** (per project): `.latte/agents/`
+   and `.latte/prompts/`. The first file matching `<role>.md` wins;
    fall-through order is the role's `prompt_file` (project) →
-   `~/.latte/prompts.d/` (global) → `prompts::for_role` (compile-time).
+   `~/.latte/prompts/` (global) → `prompts::for_role` (compile-time).
 3. **Global runtime override** (per user, per machine):
-   `~/.latte/prompts.d/` and `~/.latte/agents.d/`. Same fall-through rules.
-
+   `~/.latte/prompts/` and `~/.latte/agents/`. Same fall-through rules.
 XML-tagged regions inside prompts (`<role>`, `<rules>`,
 `<tool_calldelegate>`) and tool names (`delegate`, `bash`, `read`,
 `write`, `list`, `search`, `deepseek-v4-flash`, etc.) are parsed
 verbatim by the model and the runner — do **not** translate them,
 only the surrounding prose.
 
-Both **single-file** and **directory** layouts are supported by
-`AgentConfig::load` / `WorkflowRegistry::load`.
-
-## Directory layout (preferred)
-
-```
-config/
-├── agents.toml            # optional top-level defaults
-├── agents/                # one file per role
-│   ├── pm.toml
-│   ├── architect.toml
-│   └── ...
-├── workflows/             # one file per workflow
-│   ├── code_review.toml
-│   ├── bug_triage.toml
-│   └── ...
-└── models.toml            # model catalog (single file)
-```
-
-Each `agents/<role>.toml` declares one `[roles.<id>]` section.
-Each `workflows/<name>.toml` declares a single `DiscussionWorkflow`
-(the `name` field is the canonical id).
-
-## Legacy single-file layout (still supported)
-
-```
-config/
-├── agents.toml         # [models] + [roles.*]
-├── models.toml
-└── discussion.toml     # [default_workflow] + [workflows.*]
-```
-
+Both **directory** layouts are supported by
+`AgentConfig::load` / `WorkflowRegistry::load` (single-file
+`agents.toml` / `discussion.toml` are still loadable by
+`load()` on the project layer, but the global layer uses
+`agents/` and `workflows/` directories only).
 ## Global layer (~/.latte/)
 
-Three subdirectories under `~/.latte/` (or `$LATTE_HOME`) are read by
-the CLI when present. **The global layer is optional**; a missing path
-is silently skipped so a project-only setup keeps working.
+All subdirectories under `~/.latte/` (or `$LATTE_HOME`) use the same
+layout as the project layer. **The global layer is optional**; a missing
+path is silently skipped so a project-only setup keeps working.
 
 | Subdir | Loaded by | Per-file format |
 | ------ | --------- | --------------- |
-| `models.{yaml,toml,yml}` and `models.d/*.yaml\|*.toml` | `GlobalConfig::load_default` | router-style or project-style (see below) |
-| `agents.d/` and `agents.toml` | `AgentConfig::load_with_global` | one `[roles.<id>]` per file, or single combined file |
-| `workflows.d/` and `discussion.toml` | `WorkflowRegistry::load_with_global` | one workflow per file, or `[workflows.*]` section |
-
-**Merge semantics** for the agents/workflows layer:
-
-| Priority | Source | Location |
-| -------- | ------ | -------- |
-| 3 (lowest) | Global | `~/.latte/models.yaml` / `.toml` / `.yml`, or every `*.yaml`/`*.toml` under `~/.latte/models.d/` (override with `$LATTE_HOME`) |
-| 2 | Project | `--models-config` flag, default `.latte/models.toml` |
-  declare.
-- Missing project path → fall through to global layer.
-- Missing global path → fall through to project layer.
-
-Model merging has different semantics (field-filling, see below).
-
-Point CLI flags at either the file path or the directory path; the
-loader detects via `std::fs::metadata`.
-
-## Three-layer model config resolution
-
+| `models.{yaml,toml,yml}` and `models/*.yaml\|*.toml` | `GlobalConfig::load_default` | router-style or project-style (see below) |
+| `agents/` | `AgentConfig::load_with_global` | one `[roles.<id>]` per file |
+| `workflows/` | `WorkflowRegistry::load_with_global` | one workflow per file |
+| `prompts/` | `role.rs::resolve_global_prompt` | one `*.md` per role |
+| `logs/` | `ChatLog` / `TraceSink` | chat session logs |
+| `logs/agents/` | `ChatLog` / `TraceSink` | per-agent session logs |
 `api_key`, `base_url`, and other `ModelDef` fields are resolved from
 three sources in increasing priority. The first non-empty value wins;
 later layers fill only the fields an earlier layer left unset (so

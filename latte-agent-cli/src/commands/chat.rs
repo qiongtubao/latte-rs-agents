@@ -60,11 +60,11 @@ pub struct ChatCmd {
     pub resume: Option<String>,
 
     /// Path to agents config (file or directory).
-    #[arg(long, default_value = ".latte/agents")]
+    #[arg(long, default_value = ".latte/agents.d")]
     pub agents_config: String,
 
     /// Path to models config.
-    #[arg(long, default_value = ".latte/models.toml")]
+    #[arg(long, default_value = ".latte/models.d")]
     pub models_config: String,
 
     /// Override the api_key for a model. With `--model`, only that model is
