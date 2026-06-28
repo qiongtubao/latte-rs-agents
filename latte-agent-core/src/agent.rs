@@ -718,7 +718,11 @@ impl AgentRunner {
         });
 
         let max_rounds = if self.tool_manager.is_some() {
-            self.max_tool_rounds.max(1)
+            if self.max_tool_rounds == 0 {
+                usize::MAX
+            } else {
+                self.max_tool_rounds
+            }
         } else {
             1
         };

@@ -933,7 +933,7 @@ async fn build_runner(
             }
         }
         with_session(
-            AgentRunner::new_with_tools(agent, tm, 16)
+            AgentRunner::new_with_tools(agent, tm, 0)
                 .with_sink(Arc::clone(&sink))
                 .with_hooks(Arc::clone(&hooks))
                 .with_role(role_id)
@@ -1166,13 +1166,9 @@ async fn register_delegate_tool(
                     role_id.clone(),
                 ));
                 let mut runner = match specialist_tm {
-                    // 24 (was 8) — legitimate deep tasks (architect reading
-                    // 13+ files, programmer iterating on a fix across several
-                    // files) need more room. The LoopDetector in agent.rs
-                    // trips earlier on actual stuck-pattern loops, so the
-                    // higher cap doesn't waste rounds on bad cases — it just
-                    // stops premature termination on good cases.
-                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 24)
+                    // unlimited tool rounds — model decides when it's done.
+                    // LoopDetector in agent.rs trips on actual stuck patterns.
+                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 0)
                         .with_sink(scoped_sink.clone())
                         .with_role(role_id.clone()),
                     None => AgentRunner::new(agent)
