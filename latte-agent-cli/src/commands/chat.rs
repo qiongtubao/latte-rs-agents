@@ -1591,6 +1591,16 @@ async fn run_hil_chat(
     // in phase 7) the per-role build_runner calls share the same arc.
     let session_arc: Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>> =
         Arc::new(tokio::sync::Mutex::new(mgr));
+    // Transition Created → Running (idempotent for Resumed/Running).
+    // Must run on a blocking thread because tokio::sync::Mutex's
+    // `blocking_lock` panics from within the runtime (same pattern
+    // as RoundScheduler::new below).
+    let start_arc = session_arc.clone();
+    tokio::task::spawn_blocking(move || {
+        start_arc.blocking_lock().start().ok();
+    })
+    .await
+    .map_err(|e| format!("start join error: {}", e))?;
 
     // 4. Build the round-robin scheduler (HIL v1.1 phase 7).
     // `RoundScheduler::new` uses `blocking_lock` internally to read the
@@ -1781,14 +1791,12 @@ async fn run_hil_repl(
             // see plan Phase 7 step 4.
             {
                 let mut mgr = session_arc.lock().await;
-                // The session is "active" when it's Created (initial state,
-                // not yet first round), Running (mid-round), or Resumed
-                // (post-pause). Any other state (Paused / Done / Failed)
-                // skips the round.
-                if !matches!(
-                    mgr.state(),
-                    SessionState::Created | SessionState::Running | SessionState::Resumed
-                ) {
+                // The session is "active" only when Running. Created
+                // and Resumed are auto-transitioned to Running by
+                // `SessionManager::start()` at session creation
+                // time (HIL v1.3). Any other state (Paused / Done /
+                // Failed) skips the round.
+                if mgr.state() != SessionState::Running {
                     println!("[session not running — current state: {:?}]", mgr.state());
                     continue 'rounds;
                 }
