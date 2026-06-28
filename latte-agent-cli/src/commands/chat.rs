@@ -1533,7 +1533,7 @@ impl Drop for ChatSession {
 // =========================================================================
 
 async fn run_hil_chat(
-    _cmd: &ChatCmd,
+    cmd: &ChatCmd,
     task_id: String,
     roles: Vec<String>,
     initial_prompt: Option<String>,
@@ -1610,17 +1610,84 @@ async fn run_hil_chat(
         dead_loop_window: 3,
     });
 
-    // `no_ask_human` would, when wiring is enabled, pass `None`
-    // through to the per-role `build_runner` so the `ask_human` tool
-    // is not registered. The wiring is intentionally deferred to a
-    // follow-up task — the flag is plumbed but no-op for now.
-    let _ = no_ask_human;
+    // Load agent + model config so we can build a per-role
+    // `AgentRunner` for each role in `scheduler.order`. The runners
+    // are reused across rounds (v1.2 keeps them alive instead of
+    // rebuilding per round) and the REPL drives each role's
+    // `run_turn` directly. v1.1's `no_ask_human` flag suppresses
+    // the per-specialist `ask_human` tool registration when set.
+    let cli = build_cli_overrides(cmd)?;
+    let resolved = config_layer::load(
+        Some(&cmd.agents_config),
+        Some(&cmd.models_config),
+        cli,
+    )
+    .map_err(|e| format!("failed to load configuration: {}", e))?;
+    let merged = resolved.config;
+    let resolver = resolved.resolver;
+    let default_params = GenerateParams::default();
+    let session_id = format!("hil-{}", task_id);
+    let debug_flags = super::DebugFlags {
+        debug: cmd.debug,
+        debug_format: cmd.debug_format,
+        debug_hooks: cmd.debug_hooks.clone(),
+        no_session_index: cmd.no_session_index,
+        debug_events: if cmd.debug_events.eq_ignore_ascii_case("all") {
+            None
+        } else {
+            Some(cmd.debug_events.clone())
+        },
+        session_id: session_id.clone(),
+    };
+    // Build one `AgentRunner` per role, in the scheduler's order.
+    // `no_ask_human` is a global kill switch that also passes
+    // `None` for non-manager roles (so the `ask_human` tool is
+    // not registered). Manager always uses `None` (it delegates
+    // instead of asking).
+    let mut runners: Vec<(String, AgentRunner)> = Vec::with_capacity(scheduler.order.len());
+    for role_id in scheduler.order.clone() {
+        let tier_str = if let Some(t) = &cmd.tier {
+            t.clone()
+        } else {
+            merged
+                .roles
+                .get(&role_id)
+                .map(|r| r.model_tier.clone())
+                .unwrap_or_else(|| "standard".to_string())
+        };
+        let tier = parse_tier(&tier_str)?;
+        let session_arg = if no_ask_human || role_id == "manager" {
+            None
+        } else {
+            Some(session_arc.clone())
+        };
+        let (mut runner, _canonical_id) = build_runner(
+            &merged,
+            &resolver,
+            &default_params,
+            &role_id,
+            tier,
+            cmd.model_id.as_deref(),
+            &debug_flags,
+            session_arg,
+        )
+        .await?;
+        // Wire the per-role inject queue drain path. With
+        // `with_inject_worktree_root` set, `AgentRunner::run_turn`
+        // will internally prepend queued `[INJECTED]` messages to
+        // its in-memory context. The REPL also still writes the
+        // inject to `role_history.messages` so the next round's
+        // replay sees it.
+        runner = runner.with_inject_worktree_root(worktree_root.clone());
+        runners.push((role_id, runner));
+    }
 
-    run_hil_repl(session_arc, scheduler, task_id, no_ask_human).await
+    run_hil_repl(session_arc, runners, scheduler, task_id, no_ask_human).await
 }
 
 async fn run_hil_repl(
     session_arc: std::sync::Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>,
+    mut runners: Vec<(String, AgentRunner)>,
     mut scheduler: RoundScheduler,
     task_id: String,
     _no_ask_human: bool,
@@ -1750,15 +1817,79 @@ async fn run_hil_repl(
                 mgr.advance_turn().ok();
             }
 
-            // Stub: actual LLM call per role is deferred (plan Phase 7 step 4).
-            println!("[{} round {}: stub — LLM integration pending]", role_id, round_num);
+            // Find the runner for this role. The Vec is built once
+            // in `run_hil_chat` and lives for the whole REPL
+            // session, so a missing entry is a programming error.
+            let runner = runners
+                .iter_mut()
+                .find(|(id, _)| id == &role_id)
+                .map(|(_, r)| r)
+                .expect("runner for role should exist");
 
-            // Supervisor check: feed the (last decision, 100 tokens) pair.
-            let pause_reason = {
+            // Replay the role's persistent history into the
+            // runner's `ConversationContext`. The runner was built
+            // empty in `run_hil_chat`; on every round we clear and
+            // copy the latest `role_history(role_id)` into the
+            // context so the model sees all prior turns (including
+            // any specialist output from earlier in the same round
+            // that the manager needs to read). The synthetic
+            // `[INJECTED]` and `[PLAN SLICE]` messages added above
+            // are already in `role_history`, so they replay along
+            // with everything else.
+            {
                 let mgr = session_arc.lock().await;
-                let decision = mgr.role_history(&role_id).last().map(|m| m.content.clone()).unwrap_or_default();
-                scheduler.supervisor.observe(&role_id, 100, &decision)
+                let history = mgr.role_history(&role_id);
+                let ctx = runner.context_mut();
+                ctx.clear();
+                for m in history {
+                    ctx.push(m);
+                }
+            }
+
+            // Drive the LLM. We pass no new messages — everything
+            // the model needs is in the replayed context.
+            println!("[{} round {}: calling LLM...]", role_id, round_num);
+            let turn_result = runner.run_turn(&[], None).await;
+            let new_assistant_text = match turn_result {
+                Ok(text) => {
+                    println!("[{} round {}: ok, {} chars]", role_id, round_num, text.len());
+                    text
+                }
+                Err(e) => {
+                    // Don't pause on a transient LLM error — the
+                    // supervisor's dead-loop window will catch
+                    // repeated failures via the decision_kind
+                    // signal below. We emit the error so the
+                    // operator sees what happened, and leave the
+                    // assistant message empty so the role history
+                    // doesn't grow on a hard failure.
+                    eprintln!("[{} round {}: error: {}]", role_id, round_num, e);
+                    String::new()
+                }
             };
+
+            // Persist the assistant turn back to the
+            // SessionManager so the next round's replay sees it.
+            // Seed the supervisor with `runner.last_decision_kind()`
+            // (text vs tool_call vs delegate vs ask_human) instead
+            // of the v1.1 stub's raw text dump.
+            {
+                let mut mgr = session_arc.lock().await;
+                if !new_assistant_text.is_empty() {
+                    let assistant_msg = Message {
+                        role: MsgRole::Assistant,
+                        content: new_assistant_text,
+                    };
+                    if let Err(e) = mgr.append_to_role(&role_id, assistant_msg) {
+                        eprintln!(
+                            "[{} round {}: failed to append assistant turn: {}]",
+                            role_id, round_num, e
+                        );
+                    }
+                }
+            }
+            let decision_kind = runner.last_decision_kind();
+            let pause_reason = scheduler.supervisor.observe(&role_id, 100, &decision_kind);
             if let Some(reason) = pause_reason {
                 {
                     let mut mgr = session_arc.lock().await;

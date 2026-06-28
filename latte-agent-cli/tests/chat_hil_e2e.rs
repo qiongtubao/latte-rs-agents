@@ -57,11 +57,17 @@ fn chat_hil_pause_resume_inject_rollback() {
     let wt = repo.join(".latte/worktrees/e2e");
 
     // 2. Open chat, send a manager message, then /pause.
+    //    v1.2: each round drives a real per-role LLM call (~5-10s),
+    //    so this whole invocation takes several seconds. The 2-line
+    //    stdin script is fully buffered before the binary spawns,
+    //    so timing is deterministic.
     let script1 = b"first task\n/pause\n";
     let out1 = latte(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script1));
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
     println!("[chat1 stdout]\n{}", stdout1);
-    println!("[chat1 stderr]\n{}", String::from_utf8_lossy(&out1.stderr));
+    println!("[chat1 stderr]\n{}", stderr1);
+    assert!(out1.status.success(), "chat1 exited non-zero: {}", stderr1);
     assert!(stdout1.contains("session: e2e"), "expected session banner, got: {}", stdout1);
     assert!(stdout1.contains("paused"), "expected paused message, got: {}", stdout1);
 
@@ -78,18 +84,25 @@ fn chat_hil_pause_resume_inject_rollback() {
         }
     }
     let paused_session = paused_session.expect("expected a Paused session JSON");
-    println!("paused session at {}", paused_session.display());
 
     // 4. plan.md exists and has the initial prompt
     let plan_md = std::fs::read_to_string(wt.join("plan.md")).unwrap();
     assert!(plan_md.contains("noop"), "plan.md missing initial prompt: {}", plan_md);
 
     // 5. Re-open the chat, send @programmer, then /quit.
+    //    v1.2: must re-pass --roles manager,programmer because the
+    //    persisted session's roles vector is loaded into the
+    //    in-memory SessionManager only when the CLI flag matches the
+    //    stored record. Without this flag the session is loaded
+    //    with just [manager] and `programmer` inject queue never
+    //    exists.
     let script2 = b"@programmer check this\n/quit\n";
-    let out2 = latte(repo, &["chat", "--task-id", "e2e", "--initial-prompt", "noop"], Some(script2));
+    let out2 = latte(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script2));
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
     println!("[chat2 stdout]\n{}", stdout2);
-    println!("[chat2 stderr]\n{}", String::from_utf8_lossy(&out2.stderr));
+    println!("[chat2 stderr]\n{}", stderr2);
+    assert!(out2.status.success(), "chat2 exited non-zero: {}", stderr2);
     assert!(stdout2.contains("RESUMED") || stdout2.contains("session: e2e"),
         "expected resume banner, got: {}", stdout2);
     assert!(stdout2.contains("programmer queue: +1 message"),
