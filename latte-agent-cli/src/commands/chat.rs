@@ -5,7 +5,7 @@
 //! switch model tier, clear context, and save/load sessions.
 
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1592,6 +1592,39 @@ async fn run_hil_chat(
     // in phase 7) the per-role build_runner calls share the same arc.
     let session_arc: Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>> =
         Arc::new(tokio::sync::Mutex::new(mgr));
+
+    // Attach a JsonlSink + IndexSink fanout so the SessionManager's
+    // emit_round_started / emit_round_ended / emit_ask_human_event
+    // methods actually land in the trace JSONL (HIL v1.2 bug fix).
+    let latte_home: PathBuf = std::env::var_os("LATTE_HOME")
+        .map(PathBuf::from)
+        // v1: non-empty
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let cwd = std::env::current_dir().ok()?;
+            let cand = cwd.join(".latte");
+            if cand.exists() { Some(cand) } else { None }
+        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latte")))
+        .unwrap_or_else(|| PathBuf::from(".latte"));
+    let trace_path = latte_home.join("traces").join(format!("{}.jsonl", task_id));
+    let index_path = latte_home.join("sessions").join(format!("{}.idx", task_id));
+    let jsonl_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
+        latte_agent_core::trace::JsonlSink::new(trace_path),
+    );
+    let index_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
+        latte_agent_core::trace::IndexSink::new(index_path),
+    );
+    let fanout: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
+        latte_agent_core::trace::FanoutSink::new(vec![jsonl_sink, index_sink]),
+    );
+    let sink_arc = session_arc.clone();
+    tokio::task::spawn_blocking(move || {
+        sink_arc.blocking_lock().with_sink(fanout);
+    })
+    .await
+    .map_err(|e| format!("with_sink join error: {}", e))?;
+
     // Transition Created → Running (idempotent for Resumed/Running).
     // Must run on a blocking thread because tokio::sync::Mutex's
     // `blocking_lock` panics from within the runtime (same pattern
