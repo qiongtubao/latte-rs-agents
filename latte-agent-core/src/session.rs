@@ -223,11 +223,10 @@ impl SessionManager {
         Self { record, session_path, worktree_root, sink: None }
     }
 
-    /// Attach a trace sink. Used by the REPL driver in Phase 7 to
-    /// emit session lifecycle events.
-    pub fn with_sink(mut self, sink: Arc<dyn crate::trace::TraceSink>) -> Self {
+    /// Attach a trace sink. Used by the REPL driver to emit session
+    /// lifecycle events. Uses `&mut self` for use with `Arc<Mutex<S>>`.
+    pub fn with_sink(&mut self, sink: Arc<dyn crate::trace::TraceSink>) {
         self.sink = Some(sink);
-        self
     }
 
     pub fn sink(&self) -> Option<&Arc<dyn crate::trace::TraceSink>> {
