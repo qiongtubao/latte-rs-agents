@@ -5,12 +5,13 @@
 //! switch model tier, clear context, and save/load sessions.
 
 use std::io::{self, BufRead, BufWriter, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::time::timeout as tokio_timeout;
+use latte_agent_core::session::SessionManager;
 
 /// Max concurrent `delegate` tool calls per manager session.
 const DEFAULT_DELEGATE_CONCURRENCY: usize = 4;
@@ -1592,6 +1593,49 @@ async fn run_hil_chat(
     let session_arc: Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>> =
         Arc::new(tokio::sync::Mutex::new(mgr));
 
+    // Attach a JsonlSink + IndexSink fanout so the SessionManager's
+    // emit_round_started / emit_round_ended / emit_ask_human_event
+    // methods actually land in the trace JSONL (HIL v1.2 bug fix).
+    let latte_home: PathBuf = std::env::var_os("LATTE_HOME")
+        .map(PathBuf::from)
+        // v1: non-empty
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            let cwd = std::env::current_dir().ok()?;
+            let cand = cwd.join(".latte");
+            if cand.exists() { Some(cand) } else { None }
+        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latte")))
+        .unwrap_or_else(|| PathBuf::from(".latte"));
+    let trace_path = latte_home.join("traces").join(format!("{}.jsonl", task_id));
+    let index_path = latte_home.join("sessions").join(format!("{}.idx", task_id));
+    let jsonl_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
+        latte_agent_core::trace::JsonlSink::new(trace_path),
+    );
+    let index_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
+        latte_agent_core::trace::IndexSink::new(index_path),
+    );
+    let fanout: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
+        latte_agent_core::trace::FanoutSink::new(vec![jsonl_sink, index_sink]),
+    );
+    let sink_arc = session_arc.clone();
+    tokio::task::spawn_blocking(move || {
+        sink_arc.blocking_lock().with_sink(fanout);
+    })
+    .await
+    .map_err(|e| format!("with_sink join error: {}", e))?;
+
+    // Transition Created → Running (idempotent for Resumed/Running).
+    // Must run on a blocking thread because tokio::sync::Mutex's
+    // `blocking_lock` panics from within the runtime (same pattern
+    // as RoundScheduler::new below).
+    let start_arc = session_arc.clone();
+    tokio::task::spawn_blocking(move || {
+        start_arc.blocking_lock().start().ok();
+    })
+    .await
+    .map_err(|e| format!("start join error: {}", e))?;
+
     // 4. Build the round-robin scheduler (HIL v1.1 phase 7).
     // `RoundScheduler::new` uses `blocking_lock` internally to read the
     // role order from the manager, so we must run it on a blocking
@@ -1713,6 +1757,87 @@ async fn run_hil_repl(
     //        - feed the Supervisor; pause the session if it triggers
     //   4. emit RoundEnded and advance_turn again
     'rounds: for round_num in 1..=scheduler.max_rounds {
+        // === v1.3a full: ask_human resume ===
+        // If the session was paused by ask_human (the previous round's
+        // tool call triggered pause_with_reason), the human's reply
+        // resumes the session. Read the human's input from stdin, then
+        // call resume_with_message(role_id, reply) which appends a
+        // synthetic user message to the role's history and transitions
+        // Paused -> Resumed. Then call start() to transition
+        // Resumed -> Running so the rest of this round's role loop
+        // (and the inner `state() != Running` check) proceeds normally.
+        {
+            let mgr = session_arc.lock().await;
+            if mgr.state() == SessionState::Paused {
+                if let Some(role_id) = parse_ask_human_role(&mgr) {
+                    // Pause_reason format: "ask_human: <role> asked: <question>"
+                    let question = parse_ask_human_question(&mgr);
+                    println!(
+                        "\n\x1b[31m[ask_human] {} asked: {}\x1b[0m",
+                        role_id, question
+                    );
+                    println!("[ask_human] Type your reply and press Enter to resume the session:");
+                    print!("> ");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    drop(mgr);  // release lock before blocking on stdin
+
+                    let mut reply_line = String::new();
+                    let n = stdin.lock().read_line(&mut reply_line)?;
+                    if n == 0 {
+                        break 'rounds; // EOF
+                    }
+                    let reply = reply_line.trim().to_string();
+                    let reply = if reply.is_empty() {
+                        // Empty reply: still resume but with a placeholder
+                        // so the round can continue.
+                        "(no reply)".to_string()
+                    } else {
+                        reply
+                    };
+
+                    let mut mgr = session_arc.lock().await;
+                    mgr.resume_with_message(&role_id, &reply)?;
+                    // Resumed -> Running so the per-role `state() != Running`
+                    // check below lets the round proceed.
+                    let _ = mgr.start();
+                    println!(
+                        "[ask_human] session resumed with reply: {} chars",
+                        reply.len()
+                    );
+                    // Fall through: the for round_num loop continues. The
+                    // session is now Running, and on the next iteration
+                    // mgr.state() != Paused, so the rest of the loop runs.
+                } else {
+                    // Paused but not from ask_human (e.g. /pause or supervisor).
+                    // Treat as a manual-pause; the operator must /quit or
+                    // send another input to break the loop. Print a hint.
+                    println!("[session is Paused — type /quit to exit, or any input to continue from the manager turn]");
+                    print!("> ");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    drop(mgr);
+
+                    let mut reply_line = String::new();
+                    let n = stdin.lock().read_line(&mut reply_line)?;
+                    if n == 0 {
+                        break 'rounds;
+                    }
+                    let trimmed = reply_line.trim();
+                    if trimmed == "/quit" || trimmed == "q" {
+                        let mut mgr = session_arc.lock().await;
+                        let _ = mgr.resume();
+                        mgr.mark_done()?;
+                        break 'rounds;
+                    }
+                    // Any other input: just resume (the input is discarded
+                    // for this v1.3a; future versions may route it).
+                    let mut mgr = session_arc.lock().await;
+                    let _ = mgr.resume();
+                }
+            }
+        }
+
         // Read one line of user input per round.
         let mut line = String::new();
         let n = stdin.lock().read_line(&mut line)?;
@@ -1781,14 +1906,12 @@ async fn run_hil_repl(
             // see plan Phase 7 step 4.
             {
                 let mut mgr = session_arc.lock().await;
-                // The session is "active" when it's Created (initial state,
-                // not yet first round), Running (mid-round), or Resumed
-                // (post-pause). Any other state (Paused / Done / Failed)
-                // skips the round.
-                if !matches!(
-                    mgr.state(),
-                    SessionState::Created | SessionState::Running | SessionState::Resumed
-                ) {
+                // The session is "active" only when Running. Created
+                // and Resumed are auto-transitioned to Running by
+                // `SessionManager::start()` at session creation
+                // time (HIL v1.3). Any other state (Paused / Done /
+                // Failed) skips the round.
+                if mgr.state() != SessionState::Running {
                     println!("[session not running — current state: {:?}]", mgr.state());
                     continue 'rounds;
                 }
@@ -2024,4 +2147,30 @@ pub fn register_ask_human_tool(
     // mirror how `register_delegate_tool` tags the manager-only tool with
     // `Some("manager")`, so trace consumers can filter by namespace.
     tm.register(tool, Some("specialist"));
+}
+
+/// Parse the role_id out of a pause_reason of the form
+/// "ask_human: <role_id> asked: <question>". Returns None if the
+/// pause_reason does not match this format.
+fn parse_ask_human_role(mgr: &SessionManager) -> Option<String> {
+    let reason = mgr.record().pause_reason.as_deref()?;
+    let after = reason.strip_prefix("ask_human: ")?;
+    let role_end = after.find(" asked: ")?;
+    Some(after[..role_end].to_string())
+}
+
+/// Parse the question out of a pause_reason of the form
+/// "ask_human: <role_id> asked: <question>". Returns "" if the
+/// pause_reason does not match.
+fn parse_ask_human_question(mgr: &SessionManager) -> String {
+    let Some(reason) = mgr.record().pause_reason.as_deref() else {
+        return String::new();
+    };
+    let Some(after) = reason.strip_prefix("ask_human: ") else {
+        return String::new();
+    };
+    match after.find(" asked: ") {
+        Some(idx) => after[idx + " asked: ".len()..].to_string(),
+        None => String::new(),
+    }
 }
