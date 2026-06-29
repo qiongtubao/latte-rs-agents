@@ -221,6 +221,82 @@ impl Hook for RequireToolCall {
     }
 }
 
+// ─── ContextMonitor ─────────────────────────────────────────────────────
+
+/// Pre-call hook. Monitors the outgoing message list and aborts when
+/// estimated token usage exceeds the configured thresholds (as fractions
+/// of the session token budget).
+///
+/// `warn_at` / `abort_at` are fractions (0.0–1.0) of `token_budget`.
+/// When estimated tokens exceed `warn_at * token_budget`, a warning is
+/// logged via `eprintln!`. When they exceed `abort_at * token_budget`,
+/// the hook returns `Abort` so the caller can compact or escalate.
+pub struct ContextMonitor {
+    token_budget: usize,
+    warn_at: f64,
+    abort_at: f64,
+}
+
+impl ContextMonitor {
+    /// Create a new context monitor.
+    ///
+    /// # Panics
+    /// If `warn_at > abort_at` or either is outside `[0.0, 1.0]`.
+    pub fn new(token_budget: usize, warn_at: f64, abort_at: f64) -> Self {
+        assert!(
+            warn_at <= abort_at,
+            "ContextMonitor: warn_at ({}) must not exceed abort_at ({})",
+            warn_at,
+            abort_at
+        );
+        assert!(
+            (0.0..=1.0).contains(&warn_at),
+            "ContextMonitor: warn_at must be in [0.0, 1.0], got {}",
+            warn_at
+        );
+        assert!(
+            (0.0..=1.0).contains(&abort_at),
+            "ContextMonitor: abort_at must be in [0.0, 1.0], got {}",
+            abort_at
+        );
+        Self { token_budget, warn_at, abort_at }
+    }
+
+    fn estimated_tokens(messages: &[latte_ai::models::Message]) -> usize {
+        messages.iter().map(|m| m.content.len().div_ceil(4)).sum()
+    }
+}
+
+impl Hook for ContextMonitor {
+    fn name(&self) -> &str { "context_monitor" }
+
+    fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
+        let estimated = Self::estimated_tokens(ctx.messages);
+        let warn_threshold = (self.token_budget as f64 * self.warn_at) as usize;
+        let abort_threshold = (self.token_budget as f64 * self.abort_at) as usize;
+
+        if estimated >= abort_threshold {
+            return HookOutcome::Abort {
+                reason: format!(
+                    "context monitor: estimated {} tokens >= abort threshold {} (budget={}, abort_at={})",
+                    estimated, abort_threshold, self.token_budget, self.abort_at
+                ),
+            };
+        }
+
+        if estimated >= warn_threshold {
+            // Warning: emit to stderr (operators can see it without
+            // needing full trace mode). The hook continues.
+            eprintln!(
+                "[hook] context_monitor: estimated {} tokens >= warn threshold {} (budget={}, warn_at={})",
+                estimated, warn_threshold, self.token_budget, self.warn_at
+            );
+        }
+
+        HookOutcome::Continue
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

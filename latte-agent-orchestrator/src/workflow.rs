@@ -60,6 +60,23 @@ pub struct WorkflowStep {
     /// for use in subsequent steps.
     #[serde(default)]
     pub output_key: Option<String>,
+    /// Optional file contract for wave dependency analysis. `input`
+    /// declares a file this step reads (making it dependent on the
+    /// step that produces it); `output` declares a file this step
+    /// produces (making subsequent steps dependent on it).
+    #[serde(default)]
+    pub contract: Option<FileContract>,
+}
+
+/// File-based contract between workflow steps for dependency tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileContract {
+    /// File path this step consumes as input.
+    #[serde(default)]
+    pub input: Option<String>,
+    /// File path this step produces as output.
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 /// A hook that runs before or after a workflow step.

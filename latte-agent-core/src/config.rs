@@ -133,6 +133,47 @@ pub struct AgentConfig {
     pub roles: HashMap<String, RoleTemplate>,
 }
 
+/// Configuration for which hooks a role uses. Each variant selects a
+/// built-in hook by kind and optionally provides its parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookKindConfig {
+    /// No hook (default).
+    None,
+    /// Redact PII from outgoing messages.
+    RedactPii,
+    /// Enforce a tool allowlist (abort on disallowed calls).
+    EnforceToolAllowlist,
+    /// Require at least `min_words` in the model response.
+    RequireToolCall {
+        min_words: usize,
+    },
+    /// Monitor context token usage; abort or warn when approaching
+    /// the configured budget.
+    ContextMonitor {
+        /// Soft threshold (0.0–1.0 of budget). Emit warning above this.
+        warn_at: f64,
+        /// Hard threshold (0.0–1.0 of budget). Abort above this.
+        abort_at: f64,
+    },
+}
+
+impl Default for HookKindConfig {
+    fn default() -> Self { Self::None }
+}
+
+/// A single hook applied at a specific point in the workflow step
+/// lifecycle. Mirrors the gsd-core `StepHook` concept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepHookConfig {
+    /// Which hook kind to install.
+    pub kind: HookKindConfig,
+    /// Optional role filter — only apply when the current role matches.
+    /// Empty string or "*" means all roles.
+    #[serde(default)]
+    pub role_filter: String,
+ }
+
 impl AgentConfig {
     /// Load config from a path. If `path` is a directory, merge every
     /// `*.toml` inside (models and roles are concatenated). If it is a

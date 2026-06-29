@@ -1,0 +1,5 @@
+## orchestrator-controller-unification - 2026-06-29
+- [ ] Should `run_workflow_loop` be a standalone public function or a method on `ChatController`? Currently `run_multi_role_loop` is a private free fn in controller.rs. Following the same pattern keeps consistency.
+- [ ] Does `run_workflow_loop` need the full RoundScheduler/Supervisor machinery from `run_multi_role_loop`, or a simplified version? The workflow loop doesn't need RoundScheduler (step order is fixed by workflow), but Supervisor (token budget monitoring) is valuable.
+- [ ] The workflow loop is autonomous (no human input per round) but still should support pause/resume. The input channel auto-kickstarts — should it accept `/pause` mid-round or only between rounds?
+- [ ] Should `ChatEvent::RoleTurn` get `round` and `step_id` fields? This would let orchestrator reconstruct `TurnRecord` from events alone. Currently it has `role_id`, `content`, `is_complete`. Adding `round: u32` and `step_id: Option<String>` is backward-compatible.

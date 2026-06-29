@@ -227,6 +227,7 @@ impl DiscussCmd {
                     "You are discussing: {{topic}}. Share your perspective as a {}.",
                     role
                 ),
+                contract: None,
                 hooks: vec![],
                 output_key: None,
             })

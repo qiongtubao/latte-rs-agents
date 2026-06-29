@@ -228,6 +228,7 @@ impl Default for HookChain {
 }
 
 pub mod builtin;
+pub use builtin::ContextMonitor;
 
 #[cfg(test)]
 mod tests {

@@ -164,7 +164,6 @@ impl ChatController {
         config: ControllerConfig,
     ) -> broadcast::Receiver<ChatEvent> {
         let (new_tx, input_rx) = mpsc::unbounded_channel();
-        // Replace the channel — take the old sender created by `new()`.
         let _old = std::mem::replace(&mut *self.input_tx.lock().await, Some(new_tx));
         drop(_old);
 
@@ -228,6 +227,134 @@ impl ChatController {
         self.event_tx.subscribe()
     }
 }
+
+// ─── Wave config types ────────────────────────────────────────────
+
+/// Workflow step configuration, used for wave dependency analysis.
+/// Mirrors the gsd-core workflow step concept with optional input/output
+/// contract tracking via `FileContractConfig`.
+#[derive(Debug, Clone)]
+pub struct WorkflowStepConfig {
+    pub id: String,
+    pub speakers: Vec<String>,
+    pub prompt: String,
+    pub hooks: Vec<super::config::StepHookConfig>,
+    pub contract: Option<FileContractConfig>,
+}
+
+impl ContractAccess for WorkflowStepConfig {
+    fn contract_input(&self) -> Option<&str> {
+        self.contract.as_ref().and_then(|c| c.input.as_deref())
+    }
+    fn contract_output(&self) -> Option<&str> {
+        self.contract.as_ref().and_then(|c| c.output.as_deref())
+    }
+}
+
+/// File-based contract between workflow steps. `input` declares a file
+/// this step reads (making it dependent on the step that produces it);
+/// `output` declares a file this step produces (making later steps
+/// dependent on it).
+#[derive(Debug, Clone)]
+pub struct FileContractConfig {
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub placeholder: Option<String>,
+    pub extract_prompt: Option<String>,
+    pub required: bool,
+}
+
+/// Trait for types that can be used in wave dependency analysis.
+/// Implemented by any step type with optional input/output contracts.
+pub trait ContractAccess {
+    fn contract_input(&self) -> Option<&str>;
+    fn contract_output(&self) -> Option<&str>;
+}
+
+/// A group of workflow steps that execute concurrently within a single
+/// wave. Steps in the same wave have no inter-dependency on contract
+/// outputs.
+#[derive(Debug, Clone)]
+pub struct Wave {
+    pub index: usize,
+    pub steps: Vec<usize>,
+}
+
+/// Result of wave analysis: an ordered sequence of waves.
+#[derive(Debug, Clone, Default)]
+pub struct WavePlan {
+    pub waves: Vec<Wave>,
+}
+
+/// Compute the wave execution plan for a list of workflow steps.
+/// Steps that produce no output (contract_output is None) are treated
+/// as terminal steps — they can depend on prior outputs but no other
+/// step depends on them.
+pub fn compute_waves<S: ContractAccess>(steps: &[S]) -> WavePlan {
+    if steps.is_empty() {
+        return WavePlan::default();
+    }
+
+    // Build a map: output file → step index
+    let output_to_step: std::collections::HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.contract_output().map(|path| (path, i)))
+        .collect();
+
+    // Compute in-degree (number of dependencies) for each step
+    let mut in_degree: Vec<usize> = vec![0; steps.len()];
+    let mut depends_on: Vec<Vec<usize>> = vec![vec![]; steps.len()];
+
+    for (i, step) in steps.iter().enumerate() {
+        if let Some(input) = step.contract_input() {
+            if let Some(&producer) = output_to_step.get(input) {
+                in_degree[i] += 1;
+                depends_on[i].push(producer);
+            }
+        }
+    }
+
+    // Kahn's algorithm: topological sort into waves
+    let mut plan = WavePlan::default();
+    let mut remaining: std::collections::VecDeque<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| in_degree[*i] == 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut visited = 0;
+
+    while !remaining.is_empty() {
+        let wave_steps: Vec<usize> = remaining.drain(..).collect();
+        visited += wave_steps.len();
+        plan.waves.push(Wave { index: plan.waves.len(), steps: wave_steps });
+
+        for &wave_idx in plan.waves.last().unwrap().steps.iter() {
+            for (next_idx, deps) in depends_on.iter().enumerate() {
+                if deps.contains(&wave_idx) {
+                    in_degree[next_idx] = in_degree[next_idx].saturating_sub(1);
+                    if in_degree[next_idx] == 0 && !remaining.contains(&next_idx) {
+                        remaining.push_back(next_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    if visited < steps.len() {
+        let orphans: Vec<usize> = (0..steps.len())
+            .filter(|i| in_degree[*i] > 0)
+            .collect();
+        plan.waves.push(Wave { index: plan.waves.len(), steps: orphans });
+    }
+
+    plan
+}
+
+
+
 
 
 async fn run_driver(
@@ -705,11 +832,18 @@ async fn run_multi_role_loop(
                 drop(mgr);
             }
 
-            // Check supervisor
+            // ─── Context threshold check ──────────────────────────────
+            // Check accumulated token usage against the session token
+            // budget. Uses the runner's actual `total_usage` (not a
+            // hardcoded placeholder). If the budget is exceeded, the
+            // supervisor triggers an auto-pause and we skip remaining
+            // roles in this round.
+            let usage = runner.total_usage();
+            let tokens_used = usage.input_tokens + usage.output_tokens + usage.thinking_tokens;
             let decision_kind = runner.last_decision_kind();
             let pause_reason = scheduler
                 .supervisor
-                .observe(role_id, 100, &decision_kind);
+                .observe(role_id, tokens_used, &decision_kind);
             if let Some(reason) = pause_reason {
                 let mut mgr = session_arc.lock().await;
                 let _ = mgr.pause_with_reason(&reason);
@@ -724,7 +858,9 @@ async fn run_multi_role_loop(
             }
         }
 
+
         // Round ended
+
         {
             let mut mgr = session_arc.lock().await;
             mgr.emit_round_ended(round_num);
@@ -1264,4 +1400,170 @@ fn role_icon(role_id: &str) -> String {
         _ => "🤖",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_steps_returns_empty_plan() {
+        let plan = compute_waves::<WorkflowStepConfig>(&[]);
+        assert!(plan.waves.is_empty());
+    }
+
+    #[test]
+    fn single_step_one_wave() {
+        let steps = vec![WorkflowStepConfig {
+            id: "s1".into(),
+            speakers: vec!["a".into()],
+            prompt: "test".into(),
+            hooks: vec![],
+            contract: None,
+        }];
+        let plan = compute_waves(&steps);
+        assert_eq!(plan.waves.len(), 1);
+        assert_eq!(plan.waves[0].steps, vec![0]);
+    }
+
+    #[test]
+    fn two_independent_steps_one_wave() {
+        let steps = vec![
+            WorkflowStepConfig {
+                id: "s1".into(),
+                speakers: vec!["a".into()],
+                prompt: "test".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: None,
+                    output: Some("out1.md".into()),
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+            WorkflowStepConfig {
+                id: "s2".into(),
+                speakers: vec!["b".into()],
+                prompt: "test".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: None,
+                    output: Some("out2.md".into()),
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+        ];
+        let plan = compute_waves(&steps);
+        // Two independent producers → same wave
+        assert_eq!(plan.waves.len(), 1);
+        assert!(plan.waves[0].steps.contains(&0));
+        assert!(plan.waves[0].steps.contains(&1));
+    }
+
+    #[test]
+    fn dependent_steps_two_waves() {
+        let steps = vec![
+            WorkflowStepConfig {
+                id: "research".into(),
+                speakers: vec!["arch".into()],
+                prompt: "research".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: None,
+                    output: Some("summary.md".into()),
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+            WorkflowStepConfig {
+                id: "plan".into(),
+                speakers: vec!["pm".into()],
+                prompt: "plan: {{research_summary}}".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: Some("summary.md".into()),
+                    output: Some("plan.md".into()),
+                    placeholder: Some("research_summary".into()),
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+        ];
+        let plan = compute_waves(&steps);
+        assert_eq!(plan.waves.len(), 2, "research and plan should be in separate waves");
+        assert_eq!(plan.waves[0].steps, vec![0], "wave 0 should be research");
+        assert_eq!(plan.waves[1].steps, vec![1], "wave 1 should be plan");
+    }
+
+    #[test]
+    fn diamond_dependency() {
+        // research → review → plan
+        //         → test  → plan (test also depends on research)
+        let steps = vec![
+            WorkflowStepConfig {
+                id: "research".into(),
+                speakers: vec!["r".into()],
+                prompt: "r".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: None,
+                    output: Some("out.md".into()),
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+            WorkflowStepConfig {
+                id: "review".into(),
+                speakers: vec!["v".into()],
+                prompt: "v".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: Some("out.md".into()),
+                    output: Some("review.md".into()),
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+            WorkflowStepConfig {
+                id: "test".into(),
+                speakers: vec!["t".into()],
+                prompt: "t".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: Some("out.md".into()),
+                    output: Some("test.md".into()),
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+            WorkflowStepConfig {
+                id: "plan".into(),
+                speakers: vec!["p".into()],
+                prompt: "p".into(),
+                hooks: vec![],
+                contract: Some(FileContractConfig {
+                    input: Some("review.md".into()),
+                    output: None,
+                    placeholder: None,
+                    extract_prompt: None,
+                    required: true,
+                }),
+            },
+        ];
+        let plan = compute_waves(&steps);
+        assert_eq!(plan.waves.len(), 3, "diamond should be 3 waves");
+        assert_eq!(plan.waves[0].steps, vec![0], "wave 0 should be research");
+        // Wave 1: review + test (both depend on research, independent of each other)
+        assert_eq!(plan.waves[1].steps.len(), 2, "wave 1 should have 2 parallel steps");
+        assert!(plan.waves[1].steps.contains(&1));
+        assert!(plan.waves[1].steps.contains(&2));
+        assert_eq!(plan.waves[2].steps, vec![3], "wave 2 should be plan");
+    }
 }
