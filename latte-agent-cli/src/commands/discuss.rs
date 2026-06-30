@@ -62,7 +62,9 @@ pub struct DiscussCmd {
     pub model_overrides: Vec<String>,
 
     /// Enable full-chain observability (see `latte-agent chat --debug`).
-    #[arg(long)]
+    /// Default is enabled so the full discussion pipeline is visible;
+    /// pass `--debug false` to suppress per-turn event logs.
+    #[arg(long, default_value_t = true)]
     pub debug: bool,
 
     /// Format for the on-stdout debug stream.

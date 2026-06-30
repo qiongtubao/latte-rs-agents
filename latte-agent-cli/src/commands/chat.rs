@@ -85,10 +85,11 @@ pub struct ChatCmd {
 
     /// Enable full-chain observability (TraceSink + HookChain).
     /// Emits TraceEvents to stdout AND writes a complete trace to
-    /// `~/.latte/traces/<session-id>.jsonl`. Without this flag,
-    /// only the always-on `~/.latte/sessions/<id>.idx` metadata
-    /// index is written.
-    #[arg(long)]
+    /// `~/.latte/traces/<session-id>.jsonl`. Default is enabled so
+    /// the full request/response pipeline is visible during chat;
+    /// pass `--debug false` to suppress per-turn event logs and keep
+    /// only the always-on `~/.latte/sessions/<id>.idx` metadata index.
+    #[arg(long, default_value_t = true)]
     pub debug: bool,
 
     /// Format for the on-stdout debug stream when `--debug` is set.

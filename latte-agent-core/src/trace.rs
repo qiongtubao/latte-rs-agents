@@ -94,23 +94,6 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Truncate a string to `max` chars, appending a `+NB` indicator
-/// when trimmed. Used by `body_for_pretty` so ToolExec args and
-/// results stay readable but operators can see how much was cut.
-/// Operates on char boundaries (safe for non-ASCII) and on the
-/// raw string — for JSON we just count bytes since pretty-print
-/// is for human eyes, not for re-parsing.
-fn truncate_for_pretty(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut end = max;
-        while !s.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}…[+{}B]", &s[..end], s.len() - end)
-    }
-}
 /// payload that varies per variant. 9 variants cover the full
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
@@ -356,30 +339,22 @@ impl TraceEvent {
             TraceEvent::SessionStart { tier, model_chain, allowed_tools, .. } =>
                 format!("tier={} model_chain={:?} tools={:?}", tier, model_chain, allowed_tools),
             TraceEvent::PromptBuilt { est_input_tokens, history_len, user_input, .. } =>
-                format!("est_input={} history_len={} user_input={:?}",
-                    est_input_tokens, history_len,
-                    truncate_for_pretty(user_input, 60)),
+                format!("est_input={} history_len={} user_input={}",
+                    est_input_tokens, history_len, user_input),
             TraceEvent::ModelCall { model_id, latency_ms, finish_reason, .. } =>
                 format!("model={} latency={}ms finish={}", model_id, latency_ms, finish_reason),
             TraceEvent::ModelRawOut { raw_content, .. } =>
-                format!("{} chars: {}", raw_content.len(),
-                    truncate_for_pretty(raw_content, 80)),
+                format!("{}", raw_content),
             TraceEvent::ParseToolCalls { parsed, diagnostics, .. } =>
                 format!("parsed={} opens={} matched={} unmatched={}",
                     parsed.len(), diagnostics.opens_found, diagnostics.closes_matched, diagnostics.unmatched_opens.len()),
             TraceEvent::ToolExec { name, args_json, latency_ms, status, .. } => {
-                // Show args + result so the operator can see what
-                // the model asked the tool to do and what came
-                // back. Both are truncated to keep the pretty
-                // stream readable; the JSONL sink keeps the full
-                // event for post-mortem.
-                let args_short = truncate_for_pretty(args_json, 120);
-                let result_short = match status {
-                    ToolStatus::Ok(s) => format!("ok({} chars): {}", s.len(), truncate_for_pretty(s, 200)),
-                    ToolStatus::Err(s) => format!("err({} chars): {}", s.len(), truncate_for_pretty(s, 200)),
+                let result_str = match status {
+                    ToolStatus::Ok(s) => format!("ok: {}", s),
+                    ToolStatus::Err(s) => format!("err: {}", s),
                 };
                 format!("name={}\n  args:  {}\n  result: {}\n  latency: {}ms",
-                    name, args_short, result_short, latency_ms)
+                    name, args_json, result_str, latency_ms)
             }
             TraceEvent::HookFired { hook_name, point, outcome_kind, .. } =>
                 format!("{} {:?} {}", hook_name, point, outcome_kind),
