@@ -1172,7 +1172,38 @@ struct ToolCall {
 /// Close-tag variants accepted: `</tool_call>` (canonical prompt form)
 /// and `</tool_callNAME>` (XML-style match tag, what deepseek-v4-flash
 /// actually emits). The open prefix is always `<tool_call` (10 chars,
-/// no `>`); the name runs to the first non-`[A-Za-z0-9_]` char.
+
+/// Find the byte length of the first top-level JSON object starting
+/// at `s[0]` (which must be `{`). Returns the index past the closing
+/// `}`. Handles nested braces and string literals. Returns `None` if
+/// the object is unbalanced.
+fn find_matching_brace(s: &str) -> Option<usize> {
+    debug_assert!(s.starts_with('{'));
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escape = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + c.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract `<tool_call>name args</tool_call>` patterns from model output.
 
 fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut results = Vec::new();
@@ -1263,8 +1294,22 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
                 }
             },
         };
-
-        let args = after_name[..close_pos].trim().to_string();
+         let mut args = after_name[..close_pos].trim().to_string();
+        // Some models (observed with deepseek-v4-flash) occasionally
+        // emit `<tool_callNAME\n</tool_call>{...json...}` — the close
+        // tag immediately follows the name, with the args appearing
+        // AFTER the close. When we land here with empty args and
+        // the post-close content starts with `{`, treat the JSON
+        // object as the args. This rescues the model from a
+        // validation-error loop on the bash tool.
+        if args.is_empty() {
+            let rest = &after_name[close_pos + close_len..];
+            if let Some(brace_pos) = rest.find('{') {
+                if let Some(brace_end) = find_matching_brace(&rest[brace_pos..]) {
+                    args = rest[brace_pos..brace_pos + brace_end].trim().to_string();
+                }
+            }
+        }
         results.push(ToolCall { name, args });
         remaining = &after_name[close_pos + close_len..];
     }
@@ -1520,6 +1565,23 @@ End"#;
         assert_eq!(calls[0].name, "delegate");
         assert_eq!(calls[1].name, "bash");
         assert_eq!(calls[1].args, r#"{"command": "ls"}"#);
+    }
+    /// Regression: deepseek-v4-flash sometimes emits
+    /// `<tool_callbash\n</tool_call>{...json...}` — the close tag
+    /// immediately follows the name with the JSON args appearing
+    /// AFTER the close. Without recovery, the parser extracts an
+    /// empty-args call that the bash tool rejects with a validation
+    /// error, and the model loops. The recovery pulls the JSON object
+    /// from the post-close content into the args.
+    #[test]
+    fn test_extract_tool_calls_post_close_json_recovery() {
+        let text = r#"<tool_call>bash
+</tool_call>
+{"command": "pwd && ls"}"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "expected 1 recovered call, got {:?}", calls);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].args, r#"{"command": "pwd && ls"}"#);
     }
     #[test]
     fn test_extract_tool_calls_empty() {
