@@ -1207,16 +1207,60 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
             .strip_prefix('>')        // drop `>` from `<tool_callNAME>`
             .unwrap_or(after_name)
             .trim_start();
-
-        // Look for the close tag. Try the XML-style match tag first
-        // (what the model actually emits), then fall back to the
-        // canonical prompt form.
+        // Look for the close tag. Accept both:
+        //   1. XML-style match: `</tool_callNAME>` (deepseek-v4-flash)
+        //   2. Canonical prompt: `</tool_call>` (other models)
+        //
+        // The canonical fallback has a subtle hazard: when a model
+        // forgets the close tag for one call and the next call uses
+        // canonical `</tool_call>`, a naive `find` will swallow the
+        // entire rest of the model output as the first call's args.
+        // (Observed with MiniMax-M3 — `<tool_calldelegate>{"..."}`
+        // followed by `<tool_callbash>...</tool_call>` was being
+        // parsed as one giant delegate call.)
+        //
+        // Guard: only accept the canonical close when no other
+        // `<tool_call` appears between the open and the close. If
+        // there is one, treat the call as malformed and use the
+        // no-close recovery (everything up to the next `<tool_call`).
         let xml_close = format!("</tool_call{}>", name);
         let (close_pos, close_len) = match after_name.find(&xml_close) {
             Some(p) => (p, xml_close.len()),
             None => match after_name.find(CANONICAL_CLOSE) {
-                Some(p) => (p, CANONICAL_CLOSE.len()),
-                None => break, // malformed / truncated: give up
+                Some(p) => {
+                    let between = &after_name[..p];
+                    if between.find(OPEN).is_none() {
+                        (p, CANONICAL_CLOSE.len())
+                    } else {
+                        // Another `<tool_call` appeared before our
+                        // canonical close — the model forgot OUR
+                        // close. Recover via the no-close fallback.
+                        let next_open =
+                            after_name.find(OPEN).unwrap_or(after_name.len());
+                        let trimmed = after_name[..next_open].trim();
+                        if !trimmed.is_empty() {
+                            results.push(ToolCall {
+                                name,
+                                args: trimmed.to_string(),
+                            });
+                        }
+                        remaining = &after_name[next_open..];
+                        continue;
+                    }
+                }
+                None => {
+                    let next_open =
+                        after_name.find(OPEN).unwrap_or(after_name.len());
+                    let trimmed = after_name[..next_open].trim();
+                    if !trimmed.is_empty() {
+                        results.push(ToolCall {
+                            name,
+                            args: trimmed.to_string(),
+                        });
+                    }
+                    remaining = &after_name[next_open..];
+                    continue;
+                }
             },
         };
 
@@ -1451,6 +1495,32 @@ End"#;
         assert_eq!(calls[0].args, "");
     }
 
+    /// Regression: MiniMax-M3 sometimes omits the `</tool_call>` close
+    /// tag entirely (likely because the JSON args end in `}` which
+    /// resembles a tag boundary). The parser should still recover the
+    /// args — better to call a tool with malformed JSON than to silently
+    /// drop the dispatch and leave the manager spinning.
+    #[test]
+    fn test_extract_tool_calls_missing_close_tag() {
+        let text = r#"<tool_calldelegate> {"role": "programmer", "task": "read x.rs"}"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "expected 1 recovered call, got {:?}", calls);
+        assert_eq!(calls[0].name, "delegate");
+        assert_eq!(calls[0].args, r#"{"role": "programmer", "task": "read x.rs"}"#);
+    }
+    #[test]
+    fn test_extract_tool_calls_missing_close_then_well_formed() {
+        // First call is unclosed (no `</tool_call>` at all) — the
+        // parser must recover by stopping at the next `<tool_call`.
+        // Second call is well-formed.
+        let text = r#"<tool_calldelegate> {"role": "p", "task": "t1"}
+<tool_call>bash> {"command": "ls"}</tool_call>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 2, "expected 2 calls, got {:?}", calls);
+        assert_eq!(calls[0].name, "delegate");
+        assert_eq!(calls[1].name, "bash");
+        assert_eq!(calls[1].args, r#"{"command": "ls"}"#);
+    }
     #[test]
     fn test_extract_tool_calls_empty() {
         let calls = extract_tool_calls("Just a regular response, no tools.");
