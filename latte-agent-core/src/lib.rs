@@ -48,6 +48,7 @@ pub mod prompts;
 pub mod role;
 pub mod scheduler;
 pub mod session;
+pub mod session_store;
 pub mod supervisor;
 pub mod trace;
 pub mod workspace;
@@ -69,6 +70,7 @@ pub mod prelude {
     pub use crate::role::{Role, RoleCategory};
     pub use crate::scheduler::{plan_md_slice_for, AgentOutcome, RoundScheduler, RoundSchedulerConfig, RunSummary};
     pub use crate::session::{RoleHistory, SessionError, SessionManager, SessionRecord, SessionState};
+    pub use crate::session_store::{SessionStore, SessionStoreError, StoredMessage, StoredSession, SessionSummary};
     pub use crate::supervisor::{Supervisor, SupervisorConfig};
     pub use crate::trace::DiffSummary;
     pub use crate::workspace::{Blackboard, MergeMode, WorktreeSpec, WorkspaceError, WorkspaceState};

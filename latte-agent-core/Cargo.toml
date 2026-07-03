@@ -16,6 +16,7 @@ latte-rs-agent-tools = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+dirs = "6"
 
 # Used by config / role modules in the library
 serde = { workspace = true }
