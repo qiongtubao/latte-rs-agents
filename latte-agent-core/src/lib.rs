@@ -49,6 +49,7 @@ pub mod role;
 pub mod scheduler;
 pub mod session;
 pub mod supervisor;
+pub mod renderer;
 pub mod trace;
 pub mod workspace;
 

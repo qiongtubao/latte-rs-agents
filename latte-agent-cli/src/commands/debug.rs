@@ -37,6 +37,26 @@ impl DebugFormat {
     }
 }
 
+/// 输出格式选择：CLI（ANSI 彩色终端）或 JSON Lines（与前端 TS 协议层对齐）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Cli,
+    Json,
+}
+
+use latte_agent_core::renderer::ChatRenderer;
+
+impl OutputFormat {
+    /// 根据输出格式创建对应的渲染器。
+    pub fn renderer(&self) -> Box<dyn ChatRenderer> {
+        match self {
+            OutputFormat::Json => Box::new(super::json_renderer::JsonRenderer::stdout()),
+            OutputFormat::Cli => Box::new(super::cli_renderer::CliRenderer::stdout()),
+        }
+    }
+}
+
 
 /// `latte-agent debug` subcommand set. See spec §8.2.
 ///
