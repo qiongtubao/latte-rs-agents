@@ -1,2 +1,27 @@
 /target
-.latte/
+/vendor/rtk/target/
+# Runtime artifacts (auto-created, never commit)
+/.latte/sessions/
+/.latte/traces/
+/.latte/logs/
+/.latte/checkpoints/
+/.latte/worktrees/
+/.latte/chat-saves/
+/.latte/chat-sessions/
+.omc/
+# Project-level config (committed):
+#   .latte/agents/        — role TOML (id, tools, model_chain, etc.)
+#   .latte/agents.d/      — alt role dir (legacy / global-convention layout)
+#   .latte/prompts.d/     — system-prompt overrides
+#   .latte/models.toml    — project-local model catalog
+#   .latte/models.d/      — vendor-split model files
+#   .latte/workflows/     — workflow TOML
+# The two `!` lines below re-include these after the runtime
+# ignores above, so a fresh `git clone` gets the same role /
+# model config the project was developed with.
+!.latte/agents/
+!.latte/agents.d/
+!.latte/prompts.d/
+!.latte/models.toml
+!.latte/models.d/
+!.latte/workflows/

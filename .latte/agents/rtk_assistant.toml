@@ -1,0 +1,22 @@
+# RTK Assistant — RTK-aware minimal assistant.
+#
+# Use `latte-agent chat -r rtk_assistant` for dev questions where the
+# answer is best fetched from a CLI (ls, git status, cargo test, …) and
+# where you'd like the output to be RTK-compressed before it hits the
+# context. Same brevity contract as `quick`, but the model is told
+# to call `rtk <subcommand>` instead of `<subcommand>` so the wrapper
+# strips noise (git status noise, full test output, ls -la columns,
+# etc.) — typically -80% tokens.
+#
+# Tools: just `bash`. No `read`/`write`/`search` — RTK handles the
+# compression layer for everything else, and brevity means fewer
+# tools = fewer ways to over-spend the context.
+[roles.rtk_assistant]
+id = "rtk_assistant"
+name = "RTK Assistant"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/rtk_assistant.md"
+temperature = 0.2
+tools = ["bash"]
+icon = "🗜️"

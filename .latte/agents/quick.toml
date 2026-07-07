@@ -1,0 +1,20 @@
+# Quick Assistant — minimal, direct, no overhead.
+#
+# Use `latte-agent chat -r quick` for the kind of one-line questions
+# that `manager` and `programmer` would drown in auto-scout ladders,
+# project intros, and multi-delegate planning: "what's my cwd",
+# "is Cargo.lock present", "how many lines in main.rs". The whole
+# point is to *not* do the things `manager` is engineered to do.
+#
+# No `delegate`. No `read`/`write`/`search` — just `bash` for the
+# rare case the question needs a one-shot read. temperature 0.2
+# (low) keeps the model on-question instead of inventing.
+[roles.quick]
+id = "quick"
+name = "Quick Assistant"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/quick.md"
+temperature = 0.2
+tools = ["bash"]
+icon = "⚡"

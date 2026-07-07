@@ -36,9 +36,27 @@ impl ConfigLayer {
     }
 
     /// Return the agents directory for this layer.
-    /// Both project and global layers use `agents.d/`.
+    ///
+    /// The two layers use different layouts by convention:
+    /// - **Project** prefers `.latte/agents/` (no `.d` suffix — the
+    ///   layout this project ships), and falls back to
+    ///   `.latte/agents.d/` for projects that follow the global
+    ///   convention. The first directory that exists wins; if
+    ///   neither exists the `.d/` form is returned so callers can
+    ///   decide what to do with `None`.
+    /// - **Global** always uses `agents.d/`.
     pub fn agents_dir(&self) -> Option<PathBuf> {
-        self.root_dir().map(|d| d.join("agents.d"))
+        match self {
+            ConfigLayer::Project => {
+                let root = self.root_dir()?;
+                let no_d = root.join("agents");
+                if no_d.is_dir() {
+                    return Some(no_d);
+                }
+                Some(root.join("agents.d"))
+            }
+            ConfigLayer::Global => self.root_dir().map(|d| d.join("agents.d")),
+        }
     }
 
     /// Return the workflows directory for this layer.
@@ -203,8 +221,9 @@ impl AgentConfig {
     }
     /// Load project + global configs and merge them.
     ///
-    /// Both layers use the same layout via [`ConfigLayer`]:
-    /// - Project: `ConfigLayer::Project.agents_dir()` (`./.latte/agents.d/`)
+    /// The two layers use different layouts via [`ConfigLayer`]:
+    /// - Project: `ConfigLayer::Project.agents_dir()` — prefers
+    ///   `./.latte/agents/`, falls back to `./.latte/agents.d/`.
     /// - Global:  `ConfigLayer::Global.agents_dir()` (`$LATTE_HOME/agents.d/` or `~/.latte/agents.d/`)
     ///
     /// **Project-wins** per role id: the project's version replaces
@@ -804,5 +823,159 @@ icon = "G"
             assert_eq!(cfg.roles.len(), 1);
             assert_eq!(cfg.roles["pm"].name, "PM_global_only");
         });
+    }
+
+    // ── agents_dir layout fallback (.latte/agents vs .latte/agents.d) ─
+
+    /// Project `agents/` (no `.d`) is the layout this project ships.
+    /// When that directory exists, `ConfigLayer::Project.agents_dir()`
+    /// must return it directly so `load_with_global(None)` picks the
+    /// roles up automatically.
+    #[test]
+    fn test_project_agents_dir_prefers_no_d_layout() {
+        // Serialise on the same env lock `with_latte_home` uses, so
+        // our `set_current_dir` + `LATTE_HOME` mutations can't race
+        // with the other load_with_global tests.
+        let _env_guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let project = std::env::temp_dir().join("latte_agent_test_no_d_layout");
+        let _ = std::fs::remove_dir_all(&project);
+        let agents = project.join(".latte").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("quick.toml"),
+            r#"
+[roles.quick]
+id = "quick"
+name = "Quick"
+category = "execution"
+model_tier = "budget"
+icon = "Q"
+"#,
+        )
+        .unwrap();
+
+        // Cwd guard — restores cwd on Drop, even if assertions panic.
+        let prev_cwd = std::env::current_dir().unwrap();
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd_guard = CwdGuard(prev_cwd);
+        std::env::set_current_dir(&project).unwrap();
+
+        let resolved = ConfigLayer::Project.agents_dir()
+            .expect("project agents_dir should resolve");
+        assert!(
+            resolved.ends_with("agents"),
+            "expected no-`.d` layout, got {}",
+            resolved.display()
+        );
+        assert!(resolved.is_dir(), "{} should be a directory", resolved.display());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// When only `.latte/agents.d/` exists, `agents_dir()` must still
+    /// return that path so legacy projects keep working.
+    #[test]
+    fn test_project_agents_dir_falls_back_to_d_layout() {
+        let _env_guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let project = std::env::temp_dir().join("latte_agent_test_d_layout_only");
+        let _ = std::fs::remove_dir_all(&project);
+        let agents_d = project.join(".latte").join("agents.d");
+        std::fs::create_dir_all(&agents_d).unwrap();
+        std::fs::write(
+            agents_d.join("pm.toml"),
+            r#"
+[roles.pm]
+id = "pm"
+name = "PM"
+category = "planning"
+model_tier = "standard"
+icon = "P"
+"#,
+        )
+        .unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd_guard = CwdGuard(prev_cwd);
+        std::env::set_current_dir(&project).unwrap();
+
+        let resolved = ConfigLayer::Project.agents_dir()
+            .expect("project agents_dir should resolve");
+        assert!(
+            resolved.ends_with("agents.d"),
+            "expected `.d` fallback, got {}",
+            resolved.display()
+        );
+        assert!(resolved.is_dir(), "{} should be a directory", resolved.display());
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// End-to-end: with `.latte/agents/quick.toml` present, calling
+    /// `load_with_global(None)` from the project root must surface the
+    /// `quick` role — this is what `latte-agent chat -r quick` relies on.
+    #[test]
+    fn test_load_with_global_picks_up_no_d_project_layout() {
+        let _env_guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let project = std::env::temp_dir().join("latte_agent_test_no_d_load");
+        let _ = std::fs::remove_dir_all(&project);
+        let agents = project.join(".latte").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("quick.toml"),
+            r#"
+[roles.quick]
+id = "quick"
+name = "Quick"
+category = "execution"
+model_tier = "budget"
+icon = "Q"
+"#,
+        )
+        .unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd_guard = CwdGuard(prev_cwd);
+        std::env::set_current_dir(&project).unwrap();
+
+        // `None` forces the loader to use `ConfigLayer::Project.agents_dir()`.
+        let cfg = AgentConfig::load_with_global(None).unwrap();
+        assert!(
+            cfg.roles.contains_key("quick"),
+            "expected `quick` role from .latte/agents/ to be loaded; got: {:?}",
+            cfg.roles.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(cfg.roles["quick"].name, "Quick");
+        assert_eq!(cfg.roles["quick"].icon, "Q");
+
+        let _ = std::fs::remove_dir_all(&project);
     }
 }
