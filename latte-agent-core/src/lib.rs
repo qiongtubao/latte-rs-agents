@@ -48,6 +48,7 @@ pub mod prompts;
 pub mod role;
 pub mod scheduler;
 pub mod session;
+pub mod session_store;
 pub mod supervisor;
 pub mod trace;
 pub mod workspace;
