@@ -70,10 +70,10 @@ pub enum DebugAction {
         #[arg(long)]
         input: Option<String>,
         /// Path to agents config (file or directory).
-        #[arg(long, default_value = "config/agents")]
+        #[arg(long, default_value = ".latte/agents.d")]
         agents_config: String,
         /// Path to models config.
-        #[arg(long, default_value = "config/models.toml")]
+        #[arg(long, default_value = ".latte/models.d")]
         models_config: String,
     },
     /// Print a recorded session's events, optionally filtered by kind.

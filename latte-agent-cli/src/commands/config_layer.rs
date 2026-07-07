@@ -114,15 +114,22 @@ pub fn load(
             }
         }
     }
-
     // Layer 2: project (agents + models) merged with the global
     // `~/.latte/agents.d/` directory via `load_with_global` (project-wins
     // per role / model id; global fills in anything the project did not
     // declare). A missing project path is silently skipped so a bare
     // `~/.latte/agents.d` setup can drive the system end-to-end.
-    let mut project_cfg = AgentConfig::load_with_global(project_agents)?;
+    //
+    // Check if the project agents path exists first; if not, pass None
+    // so load_with_global cleanly falls back to global + built-in roles
+    // without producing a misleading error in the log.
+    let agents_path_exists = project_agents
+        .map(|p| std::fs::metadata(p).is_ok())
+        .unwrap_or(false);
+    let active_agents = if agents_path_exists { project_agents } else { None };
+    let mut project_cfg = AgentConfig::load_with_global(active_agents)?;
     if let Some(path) = project_agents {
-        if std::fs::metadata(path).is_ok() {
+        if agents_path_exists {
             sources.project_agents = Some(path.to_string());
         }
     }
