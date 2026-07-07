@@ -400,11 +400,12 @@ pub struct ModelCatalog {
 /// Compatible with `latte-rs-model-router/models.toml` format, extended with
 /// optional `tier`, `supports_thinking`, and `timeout_secs` fields.
 ///
-/// `timeout_secs` is used by the `delegate` tool to set the per-specialist
-/// wall-clock budget. Resolution order in the CLI:
+/// `timeout_secs` sets an optional per-turn wall-clock budget. Resolution
+/// order:
 /// 1. `model.timeout_secs` from this field (per-model override)
-/// 2. `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` env var
-/// 3. `DEFAULT_DELEGATE_TIMEOUT_SECS` (60s)
+/// 2. Controller-specific env var (`LATTE_AGENT_TURN_TIMEOUT_SECS` or
+///    `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`)
+/// 3. No controller-level timeout
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     /// Model identifier (e.g. "claude-sonnet-4-20250514").

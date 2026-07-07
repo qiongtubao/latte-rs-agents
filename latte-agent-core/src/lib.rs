@@ -50,6 +50,7 @@ pub mod scheduler;
 pub mod session;
 pub mod session_store;
 pub mod supervisor;
+pub mod renderer;
 pub mod trace;
 pub mod workspace;
 

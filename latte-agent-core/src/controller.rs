@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use latte_ai::models::{Message, Role as MsgRole};
 use latte_ai::params::GenerateParams;
@@ -29,6 +30,59 @@ use crate::session::{SessionManager, SessionRecord, SessionState};
 use crate::supervisor::{Supervisor, SupervisorConfig};
 use crate::workspace::WorkspaceManager;
 use crate::AgentResult;
+
+fn truncate_event_text(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    format!("{}...[+{}B]", &text[..end], text.len() - end)
+}
+
+struct ChatEventTraceSink {
+    event_tx: broadcast::Sender<ChatEvent>,
+}
+
+impl crate::trace::TraceSink for ChatEventTraceSink {
+    fn emit(&self, event: crate::trace::TraceEvent) {
+        match event {
+            crate::trace::TraceEvent::ParseToolCalls { meta, parsed, .. } => {
+                for call in parsed {
+                    let _ = self.event_tx.send(ChatEvent::ToolUse {
+                        role_id: meta.role.clone(),
+                        tool_name: call.name,
+                        args: truncate_event_text(&call.args, 1_200),
+                    });
+                }
+            }
+            crate::trace::TraceEvent::ToolExec {
+                meta,
+                name,
+                status,
+                ..
+            } => match status {
+                crate::trace::ToolStatus::Ok(result) => {
+                    let _ = self.event_tx.send(ChatEvent::ToolResult {
+                        role_id: meta.role,
+                        tool_name: name,
+                        result: truncate_event_text(&result, 1_500),
+                    });
+                }
+                crate::trace::ToolStatus::Err(error) => {
+                    let _ = self.event_tx.send(ChatEvent::ToolError {
+                        role_id: meta.role,
+                        tool_name: name,
+                        error: truncate_event_text(&error, 1_500),
+                    });
+                }
+            },
+            _ => {}
+        }
+    }
+}
 
 // ─── Events ──────────────────────────────────────────────────────
 
@@ -57,6 +111,10 @@ pub enum ChatEvent {
     RoundStarted { round: u32 },
     /// Round ended (multi-role mode).
     RoundEnded { round: u32 },
+    /// A role has started working.
+    RoleStarted { role_id: String, detail: String },
+    /// A role has finished working.
+    RoleFinished { role_id: String, detail: String },
     /// Session finished (aborted or quit).
     Done,
     /// Error message.
@@ -105,6 +163,12 @@ pub enum ChatEvent {
         to_role: String,
         status: String,
         summary: String,
+    },
+    /// Tool execution failed.
+    ToolError {
+        role_id: String,
+        tool_name: String,
+        error: String,
     },
 }
 
@@ -819,12 +883,26 @@ async fn run_multi_role_loop(
             let _ = event_tx.send(ChatEvent::Status {
                 message: format!("[{role_id} round {round_num}: calling LLM...]"),
             });
+            let _ = event_tx.send(ChatEvent::RoleStarted {
+                role_id: role_id.clone(),
+                detail: format!("round {round_num}: calling LLM"),
+            });
 
             let new_assistant_text = match runner.run_turn(&[], None).await {
-                Ok(text) => text,
+                Ok(text) => {
+                    let _ = event_tx.send(ChatEvent::RoleFinished {
+                        role_id: role_id.clone(),
+                        detail: format!("round {round_num}: ok, {} chars", text.len()),
+                    });
+                    text
+                }
                 Err(e) => {
                     let _ = event_tx.send(ChatEvent::Status {
                         message: format!("[{role_id} round {round_num}: error: {e}]"),
+                    });
+                    let _ = event_tx.send(ChatEvent::RoleFinished {
+                        role_id: role_id.clone(),
+                        detail: format!("round {round_num}: error: {e}"),
                     });
                     String::new()
                 }
@@ -978,7 +1056,7 @@ async fn run_single_role_loop(
 
     let mut current_role = canonical_id;
     let mut current_tier = tier;
-    let mut current_primary = config.primary_model_id.clone();
+    let current_primary = config.primary_model_id.clone();
 
     let icon = merged
         .roles
@@ -1089,7 +1167,7 @@ async fn run_single_role_loop(
                                     let _ = event_tx.send(ChatEvent::ContextCleared);
                                 }
                                 "/status" => {
-                                    let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
+                                    let _mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                     let chain_ids: Vec<String> = runner.agent().model_chain.iter().map(|mc| mc.model.id.clone()).collect();
                                     let usage = runner.total_usage();
                                     let _ = event_tx.send(ChatEvent::Status {
@@ -1121,8 +1199,37 @@ async fn run_single_role_loop(
 
                         // Run the turn
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
+                        let _ = event_tx.send(ChatEvent::RoleStarted {
+                            role_id: current_role.clone(),
+                            detail: "calling LLM".into(),
+                        });
                         let usage_before = runner.total_usage().clone();
-                        match runner.run_turn(&[Message { role: MsgRole::User, content: trimmed }], None).await {
+                        let turn_timeout_secs = active_model_timeout_secs(
+                            resolver,
+                            runner.agent().model_chain.first().map(|mc| mc.model.id.as_str()),
+                            "LATTE_AGENT_TURN_TIMEOUT_SECS",
+                        );
+                        let turn_result = if let Some(timeout_secs) = turn_timeout_secs {
+                            match tokio::time::timeout(
+                                Duration::from_secs(timeout_secs),
+                                runner.run_turn(&[Message { role: MsgRole::User, content: trimmed }], None),
+                            ).await {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    let _ = event_tx.send(ChatEvent::RoleFinished {
+                                        role_id: current_role.clone(),
+                                        detail: format!("timeout after {timeout_secs}s"),
+                                    });
+                                    let _ = event_tx.send(ChatEvent::Error {
+                                        message: format!("turn timed out after {timeout_secs}s"),
+                                    });
+                                    continue;
+                                }
+                            }
+                        } else {
+                            runner.run_turn(&[Message { role: MsgRole::User, content: trimmed }], None).await
+                        };
+                        match turn_result {
                             Ok(response) => {
                                 let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                 let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
@@ -1131,9 +1238,19 @@ async fn run_single_role_loop(
                                 let out_delta = usage_after.output_tokens - usage_before.output_tokens;
                                 let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: response.clone(), is_complete: true });
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("[{current_role} · {mid} · tokens: +{in_delta} in / +{out_delta} out]") });
+                                let _ = event_tx.send(ChatEvent::RoleFinished {
+                                    role_id: current_role.clone(),
+                                    detail: format!("ok, {} chars", response.len()),
+                                });
                                 let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                             }
-                            Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("turn failed: {e}") }); }
+                            Err(e) => {
+                                let _ = event_tx.send(ChatEvent::RoleFinished {
+                                    role_id: current_role.clone(),
+                                    detail: format!("error: {e}"),
+                                });
+                                let _ = event_tx.send(ChatEvent::Error { message: format!("turn failed: {e}") });
+                            }
                         }
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
@@ -1270,11 +1387,9 @@ async fn build_runner(
     }
 }
 
-// ─── Tool helpers ────────────────────────────────────────────────
-
 async fn build_tool_manager(
     allowed: &[String],
-) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error>> {
+) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error + Send + Sync>> {
     use latte_rs_agent_tools::prelude::*;
     let mgr = create_tool_manager();
     for p in builtin_tool_packages() {
@@ -1608,6 +1723,17 @@ async fn register_delegate_tool(
 
     tm.register(tool, Some("manager"));
     Ok(())
+}
+
+fn active_model_timeout_secs(
+    resolver: &ModelResolver,
+    model_id: Option<&str>,
+    env_var: &str,
+) -> Option<u64> {
+    model_id
+        .and_then(|id| resolver.get_def(id))
+        .and_then(|d| d.timeout_secs)
+        .or_else(|| std::env::var(env_var).ok().and_then(|s| s.parse().ok()))
 }
 
 #[allow(unused_variables)]

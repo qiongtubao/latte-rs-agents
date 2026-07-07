@@ -147,6 +147,11 @@ pub struct ChatCmd {
     /// roles. Escape hatch for users who don't want pauses.
     #[arg(long)]
     pub no_ask_human: bool,
+
+    /// Output format: cli (ANSI colors, default) or json (JSON Lines).
+    /// JSON format matches the TS ChatProtocolMessage interface.
+    #[arg(long, value_enum, default_value_t = super::debug::OutputFormat::Cli)]
+    pub output: super::debug::OutputFormat,
 }
 impl ChatCmd {
     pub async fn run(&self) -> AnyResult {
@@ -162,6 +167,7 @@ impl ChatCmd {
                 self.max_rounds,
                 self.session_token_budget,
                 self.no_ask_human,
+                self.output.renderer().as_ref(),
             )
             .await;
         }
@@ -291,6 +297,7 @@ impl ChatCmd {
             last_response: None,
             turn_count: 0,
             debug_flags: debug_flags.clone(),
+            renderer: self.output.renderer(),
         };
         // If --resume was passed, load the saved history into the
         // session context before the user starts chatting.
@@ -298,7 +305,7 @@ impl ChatCmd {
             let history = load_session(path)
                 .map_err(|e| format!("failed to load resume file '{}': {}", path, e))?;
             session.load_history(history);
-            eprintln!("[resume] loaded {} messages from {}", session.runner.context().messages().len(), path);
+            session.renderer.on_status(&format!("[resume] loaded {} messages from {}", session.runner.context().messages().len(), path)).await;
         }
         if !io::stdout().is_terminal() {
             // Non-interactive: read one message from stdin and reply once.
@@ -405,6 +412,9 @@ struct ChatSession {
     turn_count: u32,
     last_response: Option<String>,
     debug_flags: super::DebugFlags,
+    /// 渲染器：把事件转成 CLI 文本或 JSON Lines 输出。
+    /// 调用方决定使用哪个具体实现。
+    renderer: Box<dyn latte_agent_core::renderer::ChatRenderer>,
 }
 
 impl ChatSession {
@@ -417,6 +427,7 @@ impl ChatSession {
         tier: ModelTier,
         primary_id: Option<String>,
         debug_flags: super::DebugFlags,
+        renderer: Box<dyn latte_agent_core::renderer::ChatRenderer>,
     ) -> Self {
         Self {
             merged,
@@ -430,6 +441,7 @@ impl ChatSession {
             last_response: None,
             turn_count: 0,
             debug_flags,
+            renderer,
         }
     }
 
@@ -1538,6 +1550,7 @@ async fn run_hil_chat(
     max_rounds: u32,
     session_token_budget: u32,
     no_ask_human: bool,
+    renderer: &dyn latte_agent_core::renderer::ChatRenderer,
 ) -> AnyResult {
     use latte_agent_core::session::SessionManager;
 
@@ -1559,13 +1572,11 @@ async fn run_hil_chat(
         let raw = std::fs::read_to_string(mgr.session_path())?;
         let record: latte_agent_core::session::SessionRecord = serde_json::from_str(&raw)?;
         mgr = SessionManager::from_record(record, worktree_root.clone());
-        println!(
-            "[session: {}, state: {:?}, turn: {}]",
-            mgr.record().task_id, mgr.state(), mgr.record().current_turn
-        );
+        renderer.on_session_info(&mgr.record().task_id, &format!("{:?}", mgr.state()), mgr.record().current_turn).await;
         if mgr.state() == latte_agent_core::session::SessionState::Paused {
             mgr.resume()?;
-            println!("[RESUMED at {}]", mgr.record().updated_at);
+            renderer.on_resumed().await;
+            renderer.on_status(&format!("session timestamp: {}", mgr.record().updated_at)).await;
         }
     } else {
         // Fresh session: require --initial-prompt
@@ -1579,8 +1590,8 @@ async fn run_hil_chat(
         let bb = latte_agent_core::workspace::Blackboard::new(worktree_root.join("plan.md"));
         bb.write(&format!("# Task: {}\n\n## Initial prompt\n\n{}\n", task_id, prompt))?;
         mgr.persist()?;
-        println!("[session: {}, state: Created, turn: 0]", task_id);
-        println!("[roles: {}]", roles.join(", "));
+        renderer.on_session_info(&task_id, "Created", 0).await;
+        renderer.on_status(&format!("roles: {}", roles.join(", "))).await;
     }
     // 3. Build the shared `Arc<Mutex<SessionManager>>` (HIL v1.1 phase 6).
     // The `ask_human` tool handler needs a shared reference to the
@@ -1723,15 +1734,15 @@ async fn run_hil_chat(
         runners.push((role_id, runner));
     }
 
-    run_hil_repl(session_arc, runners, scheduler, task_id, no_ask_human).await
+    run_hil_repl(session_arc, runners, scheduler, no_ask_human, renderer).await
 }
 
 async fn run_hil_repl(
     session_arc: std::sync::Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>,
     mut runners: Vec<(String, AgentRunner)>,
     mut scheduler: RoundScheduler,
-    task_id: String,
     _no_ask_human: bool,
+    renderer: &dyn latte_agent_core::renderer::ChatRenderer,
 ) -> AnyResult {
     use crate::commands::repl::{parse_repl_line, ReplInput};
     use latte_agent_core::session::SessionState;
@@ -1769,11 +1780,8 @@ async fn run_hil_repl(
                 if let Some(role_id) = parse_ask_human_role(&mgr) {
                     // Pause_reason format: "ask_human: <role> asked: <question>"
                     let question = parse_ask_human_question(&mgr);
-                    println!(
-                        "\n\x1b[31m[ask_human] {} asked: {}\x1b[0m",
-                        role_id, question
-                    );
-                    println!("[ask_human] Type your reply and press Enter to resume the session:");
+                    renderer.on_status(&format!("[ask_human] {} asked: {}", role_id, question)).await;
+                    renderer.on_status("[ask_human] Type your reply and press Enter to resume the session:").await;
                     print!("> ");
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
@@ -1798,18 +1806,14 @@ async fn run_hil_repl(
                     // Resumed -> Running so the per-role `state() != Running`
                     // check below lets the round proceed.
                     let _ = mgr.start();
-                    println!(
-                        "[ask_human] session resumed with reply: {} chars",
-                        reply.len()
-                    );
+                    renderer.on_status(&format!("[ask_human] session resumed with reply: {} chars", reply.len())).await;
                     // Fall through: the for round_num loop continues. The
                     // session is now Running, and on the next iteration
                     // mgr.state() != Paused, so the rest of the loop runs.
                 } else {
                     // Paused but not from ask_human (e.g. /pause or supervisor).
                     // Treat as a manual-pause; the operator must /quit or
-                    // send another input to break the loop. Print a hint.
-                    println!("[session is Paused — type /quit to exit, or any input to continue from the manager turn]");
+                    renderer.on_status("[session is Paused — type /quit to exit, or any input to continue from the manager turn]").await;
                     print!("> ");
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
@@ -1848,7 +1852,7 @@ async fn run_hil_repl(
                 Ok(ReplInput::Cmd { name }) if name == "pause" => {
                     let mut mgr = session_arc.lock().await;
                     mgr.pause("user /pause")?;
-                    println!("[session paused]");
+                    renderer.on_status("[session paused]").await;
                     break 'rounds;
                 }
                 Ok(ReplInput::Cmd { name }) if name == "quit" => {
@@ -1864,30 +1868,30 @@ async fn run_hil_repl(
                     break 'rounds;
                 }
                 Ok(ReplInput::Cmd { name }) if name == "roles" => {
-                    println!("[roles: {}]", scheduler.order.join(", "));
+                    renderer.on_status(&format!("[roles: {}]", scheduler.order.join(", "))).await;
                 }
                 Ok(ReplInput::Cmd { name }) if name == "rounds" => {
                     let mgr = session_arc.lock().await;
-                    println!("[round: {} / {}]", mgr.record().current_turn, scheduler.max_rounds);
+                    renderer.on_status(&format!("[round: {} / {}]", mgr.record().current_turn, scheduler.max_rounds)).await;
                 }
                 Ok(ReplInput::Cmd { name }) => {
-                    println!("[unknown /{} — known: pause resume quit roles rounds]", name);
+                    renderer.on_status(&format!("[unknown /{} — known: pause resume quit roles rounds]", name)).await;
                 }
                 Ok(ReplInput::RoleInject { role_id, message }) => {
                     let mgr = session_arc.lock().await;
                     if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
-                        eprintln!("[error: unknown role '{}']", role_id);
+                        renderer.on_error(&format!("[error: unknown role '{}']", role_id)).await;
                     } else {
                         queue_inject(mgr.worktree_root(), &role_id, &message)?;
-                        println!("[{} queue: +1 message]", role_id);
+                        renderer.on_status(&format!("[{} queue: +1 message]", role_id)).await;
                     }
                 }
                 Ok(ReplInput::ManagerInput { message }) => {
                     let mut mgr = session_arc.lock().await;
                     mgr.append_to_role("manager", Message { role: MsgRole::User, content: message.clone() })?;
-                    println!("[manager turn enqueued: {} chars]", message.len());
+                    renderer.on_status(&format!("[manager turn enqueued: {} chars]", message.len())).await;
                 }
-                Err(e) => eprintln!("[parse error: {:?}]", e),
+                Err(e) => renderer.on_error(&format!("[parse error: {:?}]", e)).await,
             }
         }
 
@@ -1909,7 +1913,7 @@ async fn run_hil_repl(
                 // time (HIL v1.3). Any other state (Paused / Done /
                 // Failed) skips the round.
                 if mgr.state() != SessionState::Running {
-                    println!("[session not running — current state: {:?}]", mgr.state());
+                    renderer.on_status(&format!("[session not running — current state: {:?}]", mgr.state())).await;
                     continue 'rounds;
                 }
                 let queue_path = mgr.worktree_root().join(".latte").join("inject").join(format!("{}.txt", role_id));
@@ -1968,11 +1972,11 @@ async fn run_hil_repl(
 
             // Drive the LLM. We pass no new messages — everything
             // the model needs is in the replayed context.
-            println!("[{} round {}: calling LLM...]", role_id, round_num);
+            renderer.on_status(&format!("[{} round {}: calling LLM...]", role_id, round_num)).await;
             let turn_result = runner.run_turn(&[], None).await;
             let new_assistant_text = match turn_result {
                 Ok(text) => {
-                    println!("[{} round {}: ok, {} chars]", role_id, round_num, text.len());
+                    renderer.on_status(&format!("[{} round {}: ok, {} chars]", role_id, round_num, text.len())).await;
                     text
                 }
                 Err(e) => {
@@ -1983,7 +1987,7 @@ async fn run_hil_repl(
                     // operator sees what happened, and leave the
                     // assistant message empty so the role history
                     // doesn't grow on a hard failure.
-                    eprintln!("[{} round {}: error: {}]", role_id, round_num, e);
+                    renderer.on_error(&format!("[{} round {}: error: {}]", role_id, round_num, e)).await;
                     String::new()
                 }
             };
@@ -2001,10 +2005,7 @@ async fn run_hil_repl(
                         content: new_assistant_text,
                     };
                     if let Err(e) = mgr.append_to_role(&role_id, assistant_msg) {
-                        eprintln!(
-                            "[{} round {}: failed to append assistant turn: {}]",
-                            role_id, round_num, e
-                        );
+                        renderer.on_error(&format!("[{} round {}: failed to append assistant turn: {}]", role_id, round_num, e)).await;
                     }
                 }
             }
@@ -2017,7 +2018,7 @@ async fn run_hil_repl(
                 }
                 let mgr = session_arc.lock().await;
                 mgr.emit_round_ended(round_num);
-                println!("[supervisor pause: {}]", reason);
+                renderer.on_status(&format!("[supervisor pause: {}]", reason)).await;
                 continue 'rounds;
             }
         }
@@ -2032,7 +2033,6 @@ async fn run_hil_repl(
         stdout.flush()?;
     }
 
-    let _ = task_id; // currently informational; round-driven loop owns the lifecycle
     Ok(())
 }
 

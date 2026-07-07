@@ -14,6 +14,7 @@ latte-ai = { workspace = true }
 latte-rs-agent-tools = { workspace = true }
 
 tokio = { workspace = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 

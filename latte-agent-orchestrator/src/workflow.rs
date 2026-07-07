@@ -362,6 +362,7 @@ prompt = "Review the changes described above."
                 prompt: "test".into(),
                 hooks: vec![],
                 output_key: None,
+                contract: None,
             }],
             ..Default::default()
         };
@@ -380,6 +381,7 @@ prompt = "Review the changes described above."
             prompt: "Topic: {{topic}}, Sprint: {{sprint}}".into(),
             hooks: vec![],
             output_key: None,
+            contract: None,
         };
 
         let mut vars = std::collections::HashMap::new();
