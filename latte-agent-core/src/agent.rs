@@ -468,6 +468,14 @@ pub struct AgentRunner {
     /// turn and prepends a synthetic user message containing the
     /// queue's content.
     inject_worktree_root: Option<std::path::PathBuf>,
+    /// Working directory for tool invocations. When set, `run_turn`
+    /// injects it into every tool's `ToolExecutionContext.metadata.cwd`
+    /// so path-aware tools (`shell`, `read`, `write`, `search`, …) can
+    /// chdir to it. The Tauri runtime populates this from the
+    /// workspace's `project_root`; absent it, tools fall back to the
+    /// process cwd (which in Tauri dev is `src-tauri/`, not the
+    /// workspace the user opened — the bug that motivated this field).
+    cwd: Option<std::path::PathBuf>,
 }
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
@@ -483,6 +491,7 @@ impl AgentRunner {
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
+            cwd: None,
         }
     }
 
@@ -502,6 +511,7 @@ impl AgentRunner {
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
+            cwd: None,
         }
     }
 
@@ -517,6 +527,7 @@ impl AgentRunner {
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
+            cwd: None,
         }
     }
     /// Read and drain the per-role inject queue, if any. Prepends a
@@ -892,10 +903,23 @@ impl AgentRunner {
                     }
                     let input = mutable_input;
 
-                    let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
+                    let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
                         &resolved_name,
                         1,
                     );
+                    // Surface the runner's cwd to path-aware tools
+                    // (`shell.exec`, `file.read`, etc.) via the
+                    // `metadata.cwd` channel they already consult
+                    // (see `latte-rs-agent-tools/src/tools/shell.rs`
+                    // `cwd_from`). Absent here, tools fall back to
+                    // the process cwd — which in Tauri dev is
+                    // `src-tauri/`, not the workspace the user
+                    // opened, so `pwd` returned the wrong path.
+                    if let Some(cwd) = &self.cwd {
+                        ctx.metadata = Some(serde_json::json!({
+                            "cwd": cwd.display().to_string(),
+                        }));
+                    }
                     // Resolve the short name the model emits ("read")
                     // to the namespaced form the registry stores
                     // ("file.read"). We try the name as-is first, then
@@ -1075,12 +1099,21 @@ impl AgentRunner {
     /// Set the inject-queue worktree root. When set, `run_turn`
     /// prepends any pending `<root>/.latte/inject/<role_id>.txt`
     /// content to the conversation as a synthetic user message
-    /// before invoking the model.
     pub fn with_inject_worktree_root(mut self, root: std::path::PathBuf) -> Self {
         self.inject_worktree_root = Some(root);
         self
     }
 
+    /// Set the working directory tools see as their default cwd.
+    /// Threaded into every `ToolExecutionContext.metadata.cwd` by
+    /// `run_turn`; tools that read it (e.g. `shell.exec`) chdir
+    /// before executing. Caller is expected to have canonicalized
+    /// the path — we do not resolve `.` / `..` here, mirroring how
+    /// the CLI passes the project root verbatim.
+    pub fn with_cwd(mut self, cwd: std::path::PathBuf) -> Self {
+        self.cwd = Some(cwd);
+        self
+    }
     /// Set the session identifier. The id flows into every emitted
     /// `TraceMeta.session_id` so CLI tooling can correlate events
     /// with the matching `~/.latte/sessions/<id>.idx` /
@@ -2180,4 +2213,46 @@ End"#;
         let expected = format!("tool_call:write:{}", &short_hash(args_json)[..8]);
         assert_eq!(runner.last_decision_kind(), expected);
     }
+    // ─── cwd wiring ──────────────────────────────────────────
+    //
+    // Pins the builder contract for `with_cwd`. End-to-end
+    // (model → tool handler receives `ctx.metadata.cwd`) coverage
+    // lives in the Tauri integration tests; this asserts the
+    // field round-trips through the builder so a refactor can't
+    // silently drop the plumbing.
+    #[test]
+    fn with_cwd_starts_none_and_sets_some() {
+        let role = test_role();
+        let agent =
+            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
+                .unwrap();
+        // Default — no cwd wired.
+        let runner = AgentRunner::new(agent.clone());
+        assert!(runner.cwd.is_none(), "freshly-built runner must have cwd = None");
+        // After `with_cwd` the field is Some(path).
+        let cwd_path = std::path::PathBuf::from("/tmp/latte-cwd-test");
+        let runner = AgentRunner::new(agent).with_cwd(cwd_path.clone());
+        assert_eq!(runner.cwd.as_deref(), Some(cwd_path.as_path()));
+    }
+
+    #[test]
+    fn with_cwd_preserves_other_builder_state() {
+        // `with_cwd` must not clobber `role_id` / `session_id` set
+        // by earlier builders. Mirrors how `build_runner` composes
+        // `.with_role(role_id).with_cwd(cwd)` in
+        // `latte-agent-core/src/controller.rs`.
+        let role = test_role();
+        let agent =
+            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
+                .unwrap();
+        let cwd_path = std::path::PathBuf::from("/home/user/my-project");
+        let runner = AgentRunner::new(agent)
+            .with_role("manager")
+            .with_session_id("sess-42")
+            .with_cwd(cwd_path.clone());
+        assert_eq!(runner.role_id, "manager");
+        assert_eq!(runner.session_id, "sess-42");
+        assert_eq!(runner.cwd.as_deref(), Some(cwd_path.as_path()));
+    }
+
 }

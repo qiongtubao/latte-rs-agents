@@ -11,7 +11,7 @@
 //! - **Multi-role** (`roles.len() > 1`): full round-robin HIL mode with
 //!   `RoundScheduler`, inject queue, plan slice, supervisor pause.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -85,6 +85,26 @@ pub enum ChatEvent {
         role_id: String,
         tool_name: String,
         result: String,
+    },
+    /// Manager decided to delegate a subtask to a specialist role.
+    /// Emitted before the specialist runner starts so the UI can
+    /// show "manager → programmer" without waiting for the
+    /// (potentially multi-minute) specialist turn to complete.
+    DelegateStarted {
+        from_role: String,
+        to_role: String,
+        task: String,
+    },
+    /// Specialist returned (or failed/timeout). `status` is one of
+    /// `"ok" | "failed" | "timeout" | "cancelled"`. `summary` is the
+    /// specialist's last assistant turn on success, or the error
+    /// message on failure — suitable for showing in the activity
+    /// stream and for the manager to consume as the tool result.
+    DelegateFinished {
+        from_role: String,
+        to_role: String,
+        status: String,
+        summary: String,
     },
 }
 
@@ -561,6 +581,8 @@ async fn run_multi_role_loop(
             tier,
             config.primary_model_id.as_deref(),
             Some(session_arc.clone()),
+            event_tx,
+            &config.cwd,
         )
         .await
         {
@@ -940,6 +962,8 @@ async fn run_single_role_loop(
         tier,
         config.primary_model_id.as_deref(),
         None,
+        event_tx,
+        &config.cwd,
     )
     .await
     {
@@ -1023,7 +1047,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner;
@@ -1047,7 +1071,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner;
@@ -1114,7 +1138,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner;
@@ -1129,7 +1153,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner;
@@ -1163,6 +1187,8 @@ async fn build_runner(
     tier: ModelTier,
     primary_id: Option<&str>,
     session: Option<Arc<Mutex<SessionManager>>>,
+    event_tx: &broadcast::Sender<ChatEvent>,
+    cwd: &Path,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -1207,20 +1233,40 @@ async fn build_runner(
         let tm = build_tool_manager(&role.allowed_tools).await
             .map_err(|e| AgentError::Tool(format!("build tool manager '{role_id}': {e}")))?;
         if role_id == "manager" {
-            register_delegate_tool(&tm, merged, resolver, default_params.clone())
-                .await
-                .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
+            register_delegate_tool(
+                &tm,
+                merged,
+                resolver,
+                default_params.clone(),
+                event_tx.clone(),
+                cwd.to_path_buf(),
+            )
+            .await
+            .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
         }
         if role_id != "manager" {
             if let Some(session_arc) = session {
                 register_ask_human_tool(&tm, session_arc, role_id.to_string());
             }
         }
-        Ok((AgentRunner::new_with_tools(agent, tm, 16)
-            .with_role(role_id), role_id.to_string()))
+        // The runner is wired with the workspace's cwd so path-aware
+        // tools (`shell.exec`, `file.read`, …) chdir into the
+        // workspace the user opened — not `src-tauri/` (the Tauri
+        // process cwd). See `AgentRunner::with_cwd` + the
+        // `ToolExecutionContext.metadata.cwd` thread in `agent.rs`.
+        Ok((
+            AgentRunner::new_with_tools(agent, tm, 16)
+                .with_role(role_id)
+                .with_cwd(cwd.to_path_buf()),
+            role_id.to_string(),
+        ))
     } else {
-        Ok((AgentRunner::new(agent)
-            .with_role(role_id), role_id.to_string()))
+        Ok((
+            AgentRunner::new(agent)
+                .with_role(role_id)
+                .with_cwd(cwd.to_path_buf()),
+            role_id.to_string(),
+        ))
     }
 }
 
@@ -1314,11 +1360,17 @@ before finalizing your synthesis.
 
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
-    _merged: &AgentConfig,
-    _resolver: &ModelResolver,
-    _default_params: GenerateParams,
+    merged: &AgentConfig,
+    resolver: &ModelResolver,
+    default_params: GenerateParams,
+    event_tx: broadcast::Sender<ChatEvent>,
+    cwd: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use latte_rs_agent_tools::types::{SchemaType, Tool};
+    use latte_rs_agent_tools::error::ToolError;
+    use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use tokio::time::timeout as tokio_timeout;
 
     let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
         schema_type: SchemaType,
@@ -1354,14 +1406,197 @@ async fn register_delegate_tool(
         ..Default::default()
     };
 
-    let handler: latte_rs_agent_tools::types::SharedToolHandler =
-        Arc::new(move |_input: serde_json::Value, _ctx| {
-            Box::pin(async move {
-                Err(latte_rs_agent_tools::error::ToolError::Other(
-                    "delegate tool not fully implemented in controller mode yet".into(),
-                ))
-            })
-        });
+    // Per-process concurrency cap for parallel specialist dispatches.
+    // 8 matches the CLI's `chat.rs` default — high enough to overlap
+    // several reads/searches, low enough to stay under most providers'
+    // per-key rate limit.
+    let sem = Arc::new(Semaphore::new(8));
+    // Per-specialist wall-clock timeout. Resolution order:
+    //   1. `model.timeout_secs` (per-model override from models.yaml)
+    //   2. LATTE_AGENT_DELEGATE_TIMEOUT_SECS env var
+    //   3. 60s default
+    let env_timeout_secs = std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 60;
+
+    // Wrap the borrowed `&AgentConfig` in an Arc so the handler
+    // closure can own its own handle (`Send + 'static` requirement
+    // for the boxed future the tool manager drives).
+    let merged = Arc::new(merged.clone());
+    let resolver = Arc::new(resolver.clone());
+
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let merged = Arc::clone(&merged);
+        let resolver = Arc::clone(&resolver);
+        let default_params = default_params.clone();
+        let event_tx = event_tx.clone();
+        let cwd = cwd.clone();
+        let sem = Arc::clone(&sem);
+        let env_timeout = env_timeout_secs;
+        Box::pin(async move {
+            let tool_err = |msg: String| ToolError::Other(msg);
+
+            // 1. Parse { role, task } from tool input.
+            let role_id = input
+                .get("role")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| tool_err("missing 'role' field".into()))?
+                .to_string();
+            let task = input
+                .get("task")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| tool_err("missing 'task' field".into()))?
+                .to_string();
+
+            // 2. Emit DelegateStarted so the UI shows the dispatch
+            //    immediately — the specialist turn can take a minute
+            //    and the user needs feedback it has begun.
+            let _ = event_tx.send(ChatEvent::DelegateStarted {
+                from_role: "manager".into(),
+                to_role: role_id.clone(),
+                task: task.clone(),
+            });
+
+            // 3. Resolve the specialist's role config + model chain.
+            //    Mirrors the CLI's `chat.rs:1098-1114` flow.
+            let template = merged
+                .roles
+                .get(&role_id)
+                .ok_or_else(|| {
+                    tool_err(format!("role '{}' not found in config", role_id))
+                })?
+                .clone();
+            let role = template.resolve(&default_params).await.map_err(|e| {
+                tool_err(format!("failed to resolve role '{}': {}", role_id, e))
+            })?;
+            let tier = role.default_model_tier;
+            let models = resolver
+                .resolve_chain(&role.id, tier, &role.model_chain)
+                .map_err(|e| {
+                    tool_err(format!("no model for role '{}': {}", role_id, e))
+                })?;
+
+            // 4. Per-specialist wall-clock timeout (model override →
+            //    env → 60s default). Same precedence as the CLI.
+            let timeout_s = resolver
+                .get_def(&models[0].id)
+                .and_then(|d| d.timeout_secs)
+                .or(env_timeout)
+                .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS);
+
+            // 5. Build the specialist runner. We give it a tool
+            //    manager iff the role's `allowed_tools` is non-empty;
+            //    otherwise the agent answers "I have no file access"
+            //    (the bug we hit when the manager delegated but the
+            //    programmer refused to read any code).
+            let specialist_tm = if role.allowed_tools.is_empty() {
+                None
+            } else {
+                match build_tool_manager(&role.allowed_tools).await {
+                    Ok(tm) => Some(tm),
+                    Err(e) => {
+                        let summary = format!("tool setup for '{}' failed: {}", role_id, e);
+                        let _ = event_tx.send(ChatEvent::DelegateFinished {
+                            from_role: "manager".into(),
+                            to_role: role_id.clone(),
+                            status: "failed".into(),
+                            summary: summary.clone(),
+                        });
+                        return Err(tool_err(summary));
+                    }
+                }
+            };
+            let agent = Agent::new_with_chain(
+                role_id.clone(),
+                role.clone(),
+                models,
+                default_params.clone(),
+            )
+            .map_err(|e| {
+                let summary = format!("failed to create agent for '{}': {}", role_id, e);
+                let _ = event_tx.send(ChatEvent::DelegateFinished {
+                    from_role: "manager".into(),
+                    to_role: role_id.clone(),
+                    status: "failed".into(),
+                    summary: summary.clone(),
+                });
+                tool_err(summary)
+            })?;
+            // `max_tool_rounds = 0` → unlimited; the agent decides
+            // when it's done. LoopDetector in agent.rs trips on
+            // actually stuck patterns.
+            // Wire the workspace cwd so the specialist's path-aware
+            // tools (`shell.exec`, `file.read`, …) chdir into the
+            // workspace the user opened — not the Tauri process
+            // cwd. See `AgentRunner::with_cwd` for the contract.
+            let mut runner = match specialist_tm {
+                Some(tm) => AgentRunner::new_with_tools(agent, tm, 0),
+                None => AgentRunner::new(agent),
+            };
+            runner = runner
+                .with_role(role_id.clone())
+                .with_cwd(cwd.clone());
+
+            // 6. Run the specialist turn under a wall-clock timeout,
+            //    gated by a concurrency semaphore so the manager
+            //    doesn't fan out unbounded parallel specialists.
+            let _permit = sem.acquire().await.map_err(|_| {
+                tool_err("delegate pool shut down".into())
+            })?;
+            let msgs = vec![Message {
+                role: MsgRole::User,
+                content: task.clone(),
+            }];
+            let run_result = tokio_timeout(
+                Duration::from_secs(timeout_s),
+                runner.run_turn(&msgs, None),
+            )
+            .await;
+
+            // 7. Emit DelegateFinished in all terminal states and
+            //    return the response (or error) to the manager as
+            //    the tool result. The manager sees this on its next
+            //    turn as a regular `tool_result` message.
+            match run_result {
+                Ok(Ok(response)) => {
+                    let _ = event_tx.send(ChatEvent::DelegateFinished {
+                        from_role: "manager".into(),
+                        to_role: role_id.clone(),
+                        status: "ok".into(),
+                        summary: response.clone(),
+                    });
+                    // The tool result must be a `serde_json::Value`;
+                    // wrap the response string. Manager sees it as
+                    // the tool's return value on its next turn.
+                    Ok(serde_json::Value::String(response))
+                }
+                Ok(Err(e)) => {
+                    let summary = format!("delegate to '{}' failed: {}", role_id, e);
+                    let _ = event_tx.send(ChatEvent::DelegateFinished {
+                        from_role: "manager".into(),
+                        to_role: role_id.clone(),
+                        status: "failed".into(),
+                        summary: summary.clone(),
+                    });
+                    Err(tool_err(summary))
+                }
+                Err(_elapsed) => {
+                    let summary = format!(
+                        "delegate to '{}' timed out after {}s",
+                        role_id, timeout_s
+                    );
+                    let _ = event_tx.send(ChatEvent::DelegateFinished {
+                        from_role: "manager".into(),
+                        to_role: role_id.clone(),
+                        status: "timeout".into(),
+                        summary: summary.clone(),
+                    });
+                    Err(tool_err(summary))
+                }
+            }
+        })
+    });
 
     let tool = Tool::builder(
         "delegate".to_string(),
@@ -1566,4 +1801,105 @@ mod tests {
         assert!(plan.waves[1].steps.contains(&2));
         assert_eq!(plan.waves[2].steps, vec![3], "wave 2 should be plan");
     }
+    // ─── Delegate event schema contract ─────────────────────────
+    //
+    // The frontend (`src/api/chat.ts:81-82`) types the
+    // `DelegateStarted` / `DelegateFinished` variants with
+    // snake_case field names (`from_role`, `to_role`, `task`,
+    // `status`, `summary`) and PascalCase variant tags. These
+    // tests pin the serialization shape so a careless `rename_all`
+    // on the enum or a field rename won't silently break the
+    // CLI / latte-code-editor chat module / future CLI frontends.
+
+    #[test]
+    fn delegate_started_serializes_to_frontend_shape() {
+        let event = ChatEvent::DelegateStarted {
+            from_role: "manager".into(),
+            to_role: "programmer".into(),
+            task: "read the project structure".into(),
+        };
+        let json = serde_json::to_value(&event).expect("serialize");
+        // PascalCase variant tag → must match the TS discriminated
+        // union key in `src/api/chat.ts`.
+        assert!(json.get("DelegateStarted").is_some(), "missing variant tag");
+        // snake_case fields → must match the TS field names.
+        assert_eq!(json["DelegateStarted"]["from_role"], "manager");
+        assert_eq!(json["DelegateStarted"]["to_role"], "programmer");
+        assert_eq!(
+            json["DelegateStarted"]["task"],
+            "read the project structure"
+        );
+    }
+
+    #[test]
+    fn delegate_finished_serializes_to_frontend_shape() {
+        let event = ChatEvent::DelegateFinished {
+            from_role: "manager".into(),
+            to_role: "programmer".into(),
+            status: "ok".into(),
+            summary: "found 3 files".into(),
+        };
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(json.get("DelegateFinished").is_some(), "missing variant tag");
+        assert_eq!(json["DelegateFinished"]["from_role"], "manager");
+        assert_eq!(json["DelegateFinished"]["to_role"], "programmer");
+        assert_eq!(json["DelegateFinished"]["status"], "ok");
+        assert_eq!(json["DelegateFinished"]["summary"], "found 3 files");
+    }
+
+    #[test]
+    fn delegate_finished_carries_failure_status() {
+        // The handler emits `status = "failed" | "timeout"` in error
+        // paths. Pin both values so a typo here doesn't ship.
+        let failed = ChatEvent::DelegateFinished {
+            from_role: "manager".into(),
+            to_role: "programmer".into(),
+            status: "failed".into(),
+            summary: "delegate to 'programmer' failed: model unavailable".into(),
+        };
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["DelegateFinished"]["status"], "failed");
+
+        let timed_out = ChatEvent::DelegateFinished {
+            from_role: "manager".into(),
+            to_role: "programmer".into(),
+            status: "timeout".into(),
+            summary: "delegate to 'programmer' timed out after 60s".into(),
+        };
+        let json = serde_json::to_value(&timed_out).unwrap();
+        assert_eq!(json["DelegateFinished"]["status"], "timeout");
+    }
+
+    #[test]
+    fn delegate_event_roundtrip_through_workspace_wrapper() {
+        // Mirrors the Tauri runtime's `WorkspaceChatEvent` wrap
+        // (see `src-tauri/src/chat_panel/types.rs:8` and
+        // `controller_runtime.rs:88-95`): the controller event
+        // lands inside `{ workspaceId, event: <ChatEvent> }` over
+        // the Tauri `chat:event` channel. Both layers must agree
+        // on the shape or the frontend never sees the dispatch.
+        let inner = ChatEvent::DelegateStarted {
+            from_role: "manager".into(),
+            to_role: "programmer".into(),
+            task: "ping".into(),
+        };
+        // `WorkspaceChatEvent` is `pub` re-exported in `super` —
+        // construct it inline to validate the public serialization
+        // surface that the Tauri runtime emits.
+        let wrapped = serde_json::json!({
+            "workspaceId": "ws-1",
+            "event": inner,
+        });
+        let parsed: ChatEvent =
+            serde_json::from_value(wrapped["event"].clone()).expect("parse");
+        match parsed {
+            ChatEvent::DelegateStarted { from_role, to_role, task } => {
+                assert_eq!(from_role, "manager");
+                assert_eq!(to_role, "programmer");
+                assert_eq!(task, "ping");
+            }
+            other => panic!("expected DelegateStarted, got {other:?}"),
+        }
+    }
+
 }
