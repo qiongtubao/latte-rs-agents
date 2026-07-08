@@ -215,6 +215,19 @@ pub struct ControllerConfig {
     pub primary_model_id: Option<String>,
     /// Initial model tier override.
     pub initial_tier: Option<ModelTier>,
+    /// Pre-existing conversation history to seed the runner with
+    /// *before* the driver loop processes its first input. Used by
+    /// `controller_runtime::start` to resume a previously-paused
+    /// chat session from the SessionStore: the editor reads the
+    /// stored `ChatEvent` mirror, converts to `latte_ai::models::Message`,
+    /// and threads them through here so the next `run_turn` sees the
+    /// full prior context.
+    ///
+    /// Empty in the fresh-session path. Order matches the original
+    /// chat (oldest first). The driver does not re-emit these as
+    /// `RoleTurn` events — the editor's `useChatStore` already
+    /// has them locally.
+    pub initial_history: Vec<latte_ai::models::Message>,
     /// Current working directory (for worktree resolution).
     pub cwd: PathBuf,
 }
@@ -1054,6 +1067,14 @@ async fn run_single_role_loop(
         }
     };
 
+    // Seed the runner with any pre-existing history (e.g. when
+    // resuming a paused session from the SessionStore). Done
+    // before the first turn runs so the controller has full prior
+    // context. Tokens are re-counted lazily; budget enforcement
+    // happens on the next turn's start.
+    for msg in &config.initial_history {
+        runner.context_mut().push(msg.clone());
+    }
     let mut current_role = canonical_id;
     let mut current_tier = tier;
     let current_primary = config.primary_model_id.clone();
