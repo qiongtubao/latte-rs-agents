@@ -25,3 +25,4 @@
 !.latte/models.toml
 !.latte/models.d/
 !.latte/workflows/
+tests/.latte/
