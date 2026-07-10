@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use crate::context::ConversationContext;
 use crate::error::{AgentError, AgentResult};
 use crate::role::Role as RoleDef;
+use crate::trace::ParsedCall;
 
 // ─── WaitPolicy ───────────────────────────────────────────────────────────
 
@@ -334,6 +335,59 @@ impl std::fmt::Debug for Agent {
 fn log_hook_fire(name: &str, point: crate::trace::HookPoint, kind: &str) {
     eprintln!("[hook] {} {:?}: {}", name, point, kind);
 }
+
+// ─── dedupe_tool_calls ─────────────────────────────────────────────────────
+
+/// 同一响应内去掉完全相同的 `(name, args)` tool_call，保留首次出现的那
+/// 一条，后面的重复项直接丢弃（不抛错，不修改原顺序之外的位置）。
+///
+/// # 为什么需要
+///
+/// manager role 的 prompt 明确告诉模型"在一个响应里发出多个
+/// `tool_call` 块以并行执行"。部分模型（GLM 5.2 在 `delegate` 上尤其
+/// 明显）会把这个指令误解为"重复同一调用三次"——面对"我在哪个目录"
+/// 这类简单问题，模型可能直接吐出 3 个一模一样的 `delegate` 块。三
+/// 个完全相同的 `delegate` 调用会触发 `LoopDetector`，让用户看到
+/// "called 4 times in a row with identical args" 这种令人困惑的报错
+/// （实际是第 3 次触发 + 消息里多算了 1，详见 `LoopDetector::record`）。
+/// dedup 之后 agent 继续运行，用户拿到一次 specialist 的结果。
+///
+/// # 输入 / 输出
+///
+/// - 入参 `calls`：模型一次响应里提取出的 `<tool_call>` 列表，按模型输出
+///   顺序排列。
+/// - 出参：去重后的列表，长度 ≤ 入参，顺序与入参中首次出现的位置一致。
+///
+/// # 行为细节
+///
+/// - 比较的是 args 的**规范化 JSON 形式**（用 `serde_json::from_str` 解析
+///   后再 `to_string`），不是原始文本。这样 `{"path":"a"}` 和
+///   `{"path": "a"}`（不同空白）或 `{"a":1,"b":2}` 和 `{"b":2,"a":1}`
+///   （不同键顺序）都会被识别为同一调用，与 `LoopDetector` 对 args
+///   的 hash 方式保持一致。
+/// - args 不是合法 JSON 时回退到原始文本比较（用 `Value::String` 兜底
+///   编码），避免 panic。
+/// - 不同的 `(name, args)` 不会被合并 —— 用户或模型可能真的想并行
+///   调多次同一工具但参数不同（例如一次读 a.rs、一次读 b.rs），这种
+///   情况保留所有调用。
+fn dedupe_tool_calls(calls: Vec<ParsedCall>) -> Vec<ParsedCall> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut out: Vec<ParsedCall> = Vec::with_capacity(calls.len());
+    for tc in calls {
+        // 把 args 规范化成 JSON 字符串后再做 key，让"语义相同但文本不同"
+        // 的调用被识别成同一次。parse 失败时退回到原始文本，不抛错。
+        let canonical_args = serde_json::from_str::<serde_json::Value>(&tc.args)
+            .ok()
+            .and_then(|v| serde_json::to_string(&v).ok())
+            .unwrap_or_else(|| tc.args.clone());
+        let key = (tc.name.clone(), canonical_args);
+        if seen.insert(key) {
+            out.push(tc);
+        }
+    }
+    out
+}
 // ─── LoopDetector ─────────────────────────────────────────────────────────
 
 /// Detects when a model is stuck calling the same tool with the
@@ -376,7 +430,7 @@ impl LoopDetector {
                 return LoopDecision::Break(format!(
                     "'{}' called {} times in a row with identical args; \
                      the model is stuck. Breaking out so the user can intervene.",
-                    tool_name, self.streak + 1,
+                    tool_name, self.streak,
                 ));
             }
         } else {
@@ -743,14 +797,32 @@ impl AgentRunner {
         let mut total_output: u32 = 0;
         let mut total_thinking: u32 = 0;
 
-        // Detects "model is stuck" failure mode — same tool called
-        // with identical args `LOOP_STREAK_THRESHOLD+` times in a row.
-        // We break out of the tool-call loop early so the user can
-        // intervene (or the manager can escalate) instead of waiting
-        // for the full `max_rounds` cap to be exhausted.
-        let mut loop_detector = LoopDetector::default();
-
+        // Per-round "stuck" detector. Each round the model emits one
+        // or more tool calls; we want to catch the case where the
+        // SAME call is duplicated WITHIN that single response (which
+        // `dedupe_tool_calls` already collapses to 1) and the case
+        // where a single call is repeated 3+ times within the same
+        // response (the post-dedup streak).
+        //
+        // Cross-round "same call every round" is NOT this detector's
+        // job — it's the supervisor's `dead_loop_window = 3` (see
+        // `RoundScheduler::supervisor.observe(...)`), which pauses
+        // the session when `last_decision_kind()` is the same 3
+        // rounds in a row. The supervisor is the right place for
+        // across-round "manager keeps re-delegating the same task"
+        // because the manager's `run_turn` is called fresh per round
+        // and a fresh `LoopDetector` each round means we don't
+        // double-count legitimate "manager is making progress".
+        //
+        // The detector is constructed fresh INSIDE the `for round`
+        // loop (line below) so the streak doesn't bleed across
+        // rounds. The original code had `let mut loop_detector =
+        // LoopDetector::default()` here, which caused the 2026-07-10
+        // bug: a manager that delegated the same task 3 rounds in
+        // a row (legit retry pattern) tripped the within-round
+        // detector even though each round was internally fine.
         for round in 0..max_rounds {
+            let mut loop_detector = LoopDetector::default();
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
             let chat_start = Instant::now();
             let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
@@ -806,6 +878,12 @@ impl AgentRunner {
                 name: tc.name.clone(),
                 args: tc.args.clone(),
             }).collect();
+            // 同一响应内多个完全相同的 `tool_call` 块（典型场景：
+            // manager 把"并行调度多个 specialist"误读为"重复同一调
+            // 用"）只保留首次出现的那一条，避免触发 `LoopDetector`。
+            // 这一步放在 ParseToolCalls 事件之前，所以 trace 上看到的
+            // 列表就是实际会执行的那一份。
+            let parsed_calls = dedupe_tool_calls(parsed_calls);
             self.sink.emit(TraceEvent::ParseToolCalls {
                 meta: meta.clone(),
                 raw_in: final_response.clone(),
@@ -1241,16 +1319,23 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
             .unwrap_or(after_name)
             .trim_start();
 
-        // Look for the close tag. Try the XML-style match tag first
-        // (what the model actually emits), then fall back to the
-        // canonical prompt form.
+        // Look for the close tag. Three-stage fallback for model
+        // quirks: (1) XML-style `</tool_callNAME>` (what most models
+        // actually emit), (2) canonical `</tool_call>` (what the
+        // prompt says), (3) any well-formed `</X>` — GLM 5.2 in
+        // particular often emits `</arg_value>` for the closing
+        // tag, so accepting any valid XML closing tag keeps the
+        // parser robust to that family of model quirks.
         let xml_close = format!("</tool_call{}>", name);
-        let (close_pos, close_len) = match after_name.find(&xml_close) {
-            Some(p) => (p, xml_close.len()),
-            None => match after_name.find(CANONICAL_CLOSE) {
-                Some(p) => (p, CANONICAL_CLOSE.len()),
+        let (close_pos, close_len) = if let Some(p) = after_name.find(&xml_close) {
+            (p, xml_close.len())
+        } else if let Some(p) = after_name.find(CANONICAL_CLOSE) {
+            (p, CANONICAL_CLOSE.len())
+        } else {
+            match find_any_close_tag(after_name) {
+                Some((p, l)) => (p, l),
                 None => break, // malformed / truncated: give up
-            },
+            }
         };
 
         let args = after_name[..close_pos].trim().to_string();
@@ -1294,6 +1379,41 @@ pub fn parse_tool_calls(text: &str) -> (Vec<crate::trace::ParsedCall>, crate::tr
         }
     }
     (parsed, ParseDiag { opens_found, closes_matched, unmatched_opens })
+}
+
+/// 找 s 里第一个符合 `</X>` 形式的合法 closing tag（X 是字母 / 数字
+/// / 下划线 / 连字符，至少 1 个字符，后面紧跟 `>`）。返回
+/// `(start, len)` 让调用方能切出整段 closing tag。
+///
+/// 这个回退是给部分模型（GLM 5.2 经常）会吐非标准 closing tag 用的：
+/// 比如 `</arg_value>` 或 `</function>`，而不是 prompt 里写的
+/// `</tool_call>` 或 `</tool_callNAME>`。如果连一个像样的 closing
+/// tag 都没有，才放弃整个 tool call。
+fn find_any_close_tag(s: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find("</") {
+        let abs = search_from + rel;
+        let after_slash = abs + 2;
+        // Tag name 至少 1 个合法字符
+        let name_end = s[after_slash..]
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        if name_end == 0 {
+            // `</` 后面没有合法 tag name 字符，跳过去继续找
+            search_from = abs + 2;
+            continue;
+        }
+        // 必须紧跟一个 `>` 才算完整的 closing tag
+        if let Some(gt_rel) = s[after_slash + name_end..].find('>') {
+            let close_end = after_slash + name_end + gt_rel + 1;
+            return Some((abs, close_end - abs));
+        }
+        search_from = abs + 2;
+    }
+    None
 }
 
 
@@ -1472,6 +1592,69 @@ End"#;
         assert_eq!(calls[0].args, r#"{"role": "programmer", "task": "read chat.rs"}"#);
         assert_eq!(calls[1].name, "reviewer");
         assert_eq!(calls[1].args, r#"{"role": "reviewer", "task": "audit chat.rs"}"#);
+    }
+
+    #[test]
+    fn test_extract_tool_calls_glm_arg_value_close() {
+        // 复现 2026-07-10 UI 用户报告的真实 bug：GLM 5.2 吐
+        // `</arg_value>` 作为 closing tag，而不是 prompt 里教的
+        // `</tool_call>` 或模型自己应该匹配的 `</tool_calldelegate>`。
+        // parser 之前直接 break 不返回，manager 调不出 delegate，
+        // UI 看到的就是一行"裸 tool call 文本"然后卡住。
+        let text = r#"<tool_call>delegate {"role": "programmer", "task": "首先执行：bash {\"command\": \"pwd && ls\"} 以确认 cwd"}
+</arg_value>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "GLM 5.2 的 </arg_value> 应该被识别成合法 closing tag，got {:?}",
+            calls
+        );
+        assert_eq!(calls[0].name, "delegate");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].args).expect("args 必须是合法 JSON");
+        assert_eq!(parsed["role"], "programmer");
+        assert_eq!(
+            parsed["task"],
+            "首先执行：bash {\"command\": \"pwd && ls\"} 以确认 cwd"
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_calls_arbitrary_close_fallback() {
+        // 任何 well-formed `</X>` 都应该被 fallback 接受，不只是
+        // `</arg_value>`。比如 `</function>`、``</invoke>`` 之类。
+        let text = r#"<tool_call>delegate {"role": "pm", "task": "x"}
+</function>"#;
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "应该认 </function> 当 close，got {:?}", calls);
+        assert_eq!(calls[0].name, "delegate");
+    }
+
+    #[test]
+    fn test_extract_tool_calls_no_close_gives_up_cleanly() {
+        // 真的没有 closing tag 时（model 输出被截断），parser 应该
+        // 干净地放弃 —— 不能 panic，也不能吐半截 args。
+        let text = r#"<tool_call>delegate {"role": "programmer", "task": "run pwd"}"#;
+        let calls = extract_tool_calls(text);
+        assert!(
+            calls.is_empty(),
+            "没有 closing tag 应该放弃整个 tool call，不能返回半截，got {:?}",
+            calls
+        );
+    }
+
+    #[test]
+    fn test_find_any_close_tag_skips_non_tags() {
+        // `</` 后面不是合法 tag name 字符（连 `>` 都没有）的，要跳
+        // 过去继续找下一个，不能误判成 closing tag。
+        assert!(find_any_close_tag("hello </ world").is_none());
+        assert!(find_any_close_tag("nothing here").is_none());
+        // `</arg_value>` = `<` `/` `a` `r` `g` `_` `v` `a` `l` `u` `e` `>` = 12 字符
+        assert_eq!(
+            find_any_close_tag("prefix </arg_value> suffix"),
+            Some((7, 12))
+        );
     }
 
 
@@ -2255,4 +2438,213 @@ End"#;
         assert_eq!(runner.cwd.as_deref(), Some(cwd_path.as_path()));
     }
 
+    // ─── dedupe_tool_calls tests ────────────────────────────────────────
+    //
+    // 覆盖 dedupe 工具的几种关键行为：完全相同的调用合并、不同参数不
+    // 合并、JSON 文本形式不同但语义相同时合并、保留首次出现的位置、
+    // 空输入和非 JSON 输入也能正常工作。
+    // 每个测试都聚焦一个行为分支，方便定位回归。
+
+    #[test]
+    fn dedupe_drops_three_identical_delegate_calls() {
+        // 复现用户报告的 bug 场景：manager 在一次响应里吐出 3 个完
+        // 全相同的 `delegate` 调用。dedup 之后应该只剩 1 个，这样
+        // LoopDetector 就不会被"called 4 times in a row"误报打断。
+        let calls = vec![
+            ParsedCall {
+                name: "delegate".into(),
+                args: r#"{"role":"programmer","task":"run pwd"}"#.into(),
+            },
+            ParsedCall {
+                name: "delegate".into(),
+                args: r#"{"role":"programmer","task":"run pwd"}"#.into(),
+            },
+            ParsedCall {
+                name: "delegate".into(),
+                args: r#"{"role":"programmer","task":"run pwd"}"#.into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(deduped.len(), 1, "3 个相同 delegate 调用应合并为 1 个");
+        assert_eq!(deduped[0].name, "delegate");
+        assert_eq!(
+            deduped[0].args,
+            r#"{"role":"programmer","task":"run pwd"}"#
+        );
+    }
+
+    #[test]
+    fn dedupe_keeps_calls_with_different_args() {
+        // 并行读多个文件是 manager 推荐的合法场景，不能被误合并。
+        let calls = vec![
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a.rs"}"#.into(),
+            },
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"b.rs"}"#.into(),
+            },
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"c.rs"}"#.into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(deduped.len(), 3, "3 个不同 path 的 read 调用应全部保留");
+    }
+
+    #[test]
+    fn dedupe_treats_semantic_equivalent_args_as_duplicates() {
+        // 同一调用的两种 JSON 文本写法（带额外空格）应被识别为同一次
+        // 调用，这样和 LoopDetector 的 hash 方式保持一致 —— 同一个
+        // 调用不会因为多打了一个空格就"骗过" dedup。
+        let calls = vec![
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a.rs"}"#.into(),
+            },
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path": "a.rs"}"#.into(), // 多了个空格
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(
+            deduped.len(),
+            1,
+            "只是空白不同的 args 视为同一调用（与 LoopDetector 的 hash 一致）"
+        );
+    }
+
+    #[test]
+    fn dedupe_does_not_merge_args_that_differ_in_fields() {
+        // 多了一个字段就是不同的调用 —— 不能因为 JSON 解析成功就合
+        // 并掉合法但不同的请求。
+        let calls = vec![
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a.rs"}"#.into(),
+            },
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a.rs","limit":10}"#.into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(deduped.len(), 2, "args 含不同字段时不应合并");
+    }
+
+    #[test]
+    fn dedupe_preserves_first_occurrence_order() {
+        // 入参里 a.rs 在前、b.rs 居中、a.rs 重复出现在末尾 → 输出
+        // 应当是 [a.rs, b.rs]（首次出现位置 = 1，b.rs 位置 = 2）。
+        let calls = vec![
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a.rs"}"#.into(),
+            },
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"b.rs"}"#.into(),
+            },
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a.rs"}"#.into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].args, r#"{"path":"a.rs"}"#);
+        assert_eq!(deduped[1].args, r#"{"path":"b.rs"}"#);
+    }
+
+    #[test]
+    fn dedupe_handles_empty_input() {
+        // 空列表直接返回空列表，不应该 panic。
+        let deduped = dedupe_tool_calls(vec![]);
+        assert!(deduped.is_empty());
+    }
+
+    #[test]
+    fn dedupe_handles_malformed_json_args() {
+        // args 不是合法 JSON 时回退到原始文本比较，相同原始文本仍
+        // 应被识别为重复 —— 不能因为 parse 失败就放弃去重。
+        let calls = vec![
+            ParsedCall {
+                name: "bash".into(),
+                args: "pwd && ls".into(),
+            },
+            ParsedCall {
+                name: "bash".into(),
+                args: "pwd && ls".into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(deduped.len(), 1, "非 JSON args 的相同文本应被去重");
+    }
+
+    #[test]
+    fn dedupe_keeps_different_tools_with_same_args() {
+        // 工具名不同时即使 args 文本一致也不应合并 —— 比如 `read` 和
+        // `bash` 都可能用到 `path` 字段，但它们是不同工具。
+        let calls = vec![
+            ParsedCall {
+                name: "read".into(),
+                args: r#"{"path":"a"}"#.into(),
+            },
+            ParsedCall {
+                name: "bash".into(),
+                args: r#"{"path":"a"}"#.into(),
+            },
+        ];
+        let deduped = dedupe_tool_calls(calls);
+        assert_eq!(deduped.len(), 2, "不同工具名应保留");
+    }
+
+    // ─── LoopDetector 报数修正测试 ───────────────────────────────────
+    //
+    // 历史 bug：第 3 次相同调用触发 Break 时，错误消息里写成
+    // "called 4 times in a row"（`self.streak + 1` 多算了 1）。
+    // 修正后第 3 次触发应该是 "called 3 times in a row"。
+
+    #[test]
+    fn loop_detector_break_message_count_matches_actual_call() {
+        let mut d = LoopDetector::default();
+        let _ = d.record("delegate", r#"{"role":"programmer","task":"pwd"}"#);
+        let _ = d.record("delegate", r#"{"role":"programmer","task":"pwd"}"#);
+        let decision = d.record("delegate", r#"{"role":"programmer","task":"pwd"}"#);
+        match decision {
+            LoopDecision::Break(reason) => {
+                assert!(
+                    reason.contains("3 times in a row"),
+                    "第 3 次触发应报 '3 times in a row'，实际：{reason}"
+                );
+                assert!(
+                    !reason.contains("4 times"),
+                    "不应出现 '4 times'（off-by-one），实际：{reason}"
+                );
+            }
+            LoopDecision::Continue => panic!("第 3 次相同调用应该触发 Break"),
+        }
+    }
+
+    #[test]
+    fn loop_detector_per_round_does_not_accumulate_across_rounds() {
+        // 2026-07-10 修复：loop_detector 改为每个 round 重新构造。
+        // 这个测试把"每轮一个全新 detector"的契约钉死 —— 3 轮每轮
+        // 吐一个完全相同的 delegate 调用，每个 detector 各自看到
+        // streak=1，不 trip。跨 round 的"manager 一模一样地重试"
+        // 不归 in-round detector 管，那是 supervisor 的
+        // dead_loop_window 的活（见 RoundScheduler::supervisor）。
+        let payload = r#"{"role":"programmer","task":"pwd"}"#;
+        for _round in 0..3 {
+            let mut d = LoopDetector::default();
+            let r = d.record("delegate", payload);
+            assert!(
+                matches!(r, LoopDecision::Continue),
+                "每轮的全新 detector 不应被单次调用 trip"
+            );
+        }
+    }
 }
