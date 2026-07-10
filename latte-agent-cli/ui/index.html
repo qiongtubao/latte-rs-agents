@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>latte-agent UI</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-icon">☕</span>
+          <span class="brand-name">latte-agent</span>
+          <span class="brand-sub">UI</span>
+        </div>
+        <div class="topbar-status">
+          <span id="status-pill" class="status-pill connected">
+            <span class="status-label">已连接</span>
+            <span class="status-time"></span>
+          </span>
+          <span id="role-pill" class="pill"></span>
+          <span id="model-pill" class="pill"></span>
+        </div>
+        <div class="topbar-actions">
+          <select id="role-select" title="switch role"></select>
+          <button id="trace-toggle" type="button">Trace</button>
+          <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section id="chat-panel" class="panel chat-panel">
+          <div id="messages" class="messages" aria-live="polite"></div>
+          <form id="chat-form" class="chat-form">
+            <textarea
+              id="chat-input"
+              placeholder="向 latte-agent 提问…  (Enter 发送，Shift+Enter 换行，/ 命令)"
+              autocomplete="off"
+            ></textarea>
+            <div class="chat-form-actions">
+              <button id="chat-send" type="submit" class="primary">Send</button>
+              <button id="chat-clear" type="button">/clear</button>
+              <button id="chat-quit" type="button">/quit</button>
+            </div>
+          </form>
+        </section>
+
+        <aside id="trace-panel" class="panel trace-panel hidden">
+          <header class="panel-header">
+            <h2>Trace</h2>
+            <select id="trace-session-select"></select>
+            <button id="trace-refresh" type="button">↻</button>
+          </header>
+          <div id="trace-list" class="trace-list"></div>
+        </aside>
+
+        <aside id="self-loop-panel" class="panel self-loop-panel hidden">
+          <header class="panel-header">
+            <h2>AI Self-Debug Loop</h2>
+            <button id="self-loop-close" type="button">×</button>
+          </header>
+          <div class="self-loop-body">
+            <p class="hint">
+              Describe what to fix in the UI. The agent launches
+              <code>chrome --headless</code>, takes screenshots, reads the
+              console + trace events, modifies code, re-runs, repeats —
+              no human in the loop.
+            </p>
+            <form id="self-loop-form">
+              <input
+                id="self-loop-task"
+                type="text"
+                placeholder="e.g. make the chat input auto-resize and remember history"
+                required
+              />
+              <div class="self-loop-form-row">
+                <label>
+                  Max iterations
+                  <input id="self-loop-max" type="number" min="1" max="20" value="5" />
+                </label>
+                <button type="submit" class="primary">Start loop</button>
+              </div>
+            </form>
+            <div id="self-loop-progress" class="self-loop-progress"></div>
+            <div id="self-loop-screenshots" class="self-loop-screenshots"></div>
+          </div>
+        </aside>
+      </main>
+
+      <footer class="statusbar">
+        <span id="footer-msg">ready</span>
+      </footer>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

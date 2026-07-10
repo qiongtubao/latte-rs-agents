@@ -87,6 +87,19 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
 // ─── Events ──────────────────────────────────────────────────────
 
 /// Event emitted by the ChatController driver loop.
+///
+/// ## JSON wire format
+///
+/// Default serde representation (externally-tagged) is used:
+/// `{"Status":{"message":"..."}}`. This is the canonical contract
+/// consumed by `latte-code-editor` and the `chat --output json` JSONL
+/// stream; the variant name is the outer object key.
+///
+/// Other frontends (e.g. `latte-agent ui`) translate the externally-
+/// tagged shape into their own preferred discriminated-union form
+/// (`{type:"Status",...}`) at the transport boundary. Do **not** add
+/// `#[serde(tag = "type")]` here — it would break the existing
+/// Tauri / CLI consumers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ChatEvent {
     /// One role's completed turn.

@@ -15,6 +15,7 @@ pub mod resume;
 pub mod role_injector;
 pub mod run;
 pub mod style;
+pub mod ui;
 pub mod trace_store;
 pub mod workflow;
 

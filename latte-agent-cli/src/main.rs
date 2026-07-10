@@ -5,6 +5,7 @@
 //!   latte-agent list roles
 //!   latte-agent config show
 //!   latte-agent debug <subcommand>   # offline inspection of recorded sessions
+//!   latte-agent ui                   # launch the Web UI (axum + SSE + Vite/React)
 
 use clap::{Parser, Subcommand};
 
@@ -13,7 +14,7 @@ mod commands;
 use commands::{
     chat::ChatCmd, checkpoint::CheckpointCmd, config::ConfigCmd, debug::DebugCmd,
     discuss::DiscussCmd, inject::InjectCmd, list::ListCmd, pause::PauseCmd,
-    resume::ResumeCmd, run::RunCmd, workflow::WorkflowCmd,
+    resume::ResumeCmd, run::RunCmd, ui::UiCmd, workflow::WorkflowCmd,
 };
 
 #[derive(Parser)]
@@ -29,6 +30,11 @@ enum Command {
     Chat(ChatCmd),
     /// Run a multi-agent discussion using a named workflow
     Workflow(WorkflowCmd),
+    /// Launch the Web UI (axum + SSE + Vite/React frontend).
+    /// Runs a chat session through `ChatController` and exposes it via
+    /// HTTP/SSE; the frontend can also trigger AI self-debug loops
+    /// (Playwright + screencap) via `/api/self-loop/*`.
+    Ui(UiCmd),
     List(ListCmd),
     Config(ConfigCmd),
     /// Offline inspection of recorded sessions, prompts, parser, and hooks
@@ -59,6 +65,7 @@ async fn main() {
         Command::Discuss(cmd) => cmd.run().await,
         Command::Chat(cmd) => cmd.run().await,
         Command::Workflow(cmd) => cmd.run().await,
+        Command::Ui(cmd) => cmd.run().await,
         Command::List(cmd) => cmd.run().await,
         Command::Config(cmd) => cmd.run().await,
         Command::Debug(cmd) => cmd.run().await,
@@ -72,7 +79,6 @@ async fn main() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
-
 }
 
 /// 把 `build.rs` 编译到 `OUT_DIR/rtk` 的 rtk binary 路径 prepend 到

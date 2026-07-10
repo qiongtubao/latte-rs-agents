@@ -26,3 +26,18 @@
 !.latte/models.d/
 !.latte/workflows/
 tests/.latte/
+# Frontend (`latte-agent-cli/ui/`, Vite + React). Source-of-truth
+# is the `.ts` files; `tsc` emits `.js` alongside and `vite build`
+# produces `dist/`. `node_modules/` is npm install output.
+latte-agent-cli/ui/node_modules/
+latte-agent-cli/ui/dist/
+latte-agent-cli/ui/src/*.js
+latte-agent-cli/ui/self-loop/*.js
+latte-agent-cli/ui/self-loop/tests/*.js
+latte-agent-cli/ui/__tests__/*.js
+# AI self-loop debug outputs. Run outputs (screenshots, probe PNGs)
+# land inside any `**/.latte/self-loop/**` directory (root `.latte/`
+# self-loop or nested `latte-agent-cli/ui/.latte/self-loop/`). Pattern
+# is anchored to `.latte/` so it does NOT match the source dir
+# `latte-agent-cli/ui/self-loop/` (which has `runner.ts`, tests, etc.).
+**/.latte/self-loop/**

@@ -26,6 +26,14 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 mime_guess = "2"
 merge-rs = "0.2.0"
+# HTTP server for `latte-agent ui` (web frontend bridge).
+# `axum` + `tower-http` for static-file serving + SSE event stream.
+# `tokio-stream` needs the `sync` feature for `BroadcastStream`
+# (we use it to convert `broadcast::Receiver<ChatEvent>` into a Stream).
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
