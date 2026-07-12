@@ -1,0 +1,10 @@
+[roles.security_penetration]
+id = "security_penetration"
+name = "Penetration Tester"
+category = "verification"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/security_penetration.md"
+temperature = 0.4
+tools = ["read","bash","search","delegate"]
+icon = "🔪"

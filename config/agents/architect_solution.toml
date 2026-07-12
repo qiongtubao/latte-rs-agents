@@ -1,0 +1,10 @@
+[roles.architect_solution]
+id = "architect_solution"
+name = "Solution Architect"
+category = "planning"
+model_tier = "premium"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/architect_solution.md"
+temperature = 0.5
+tools = ["read","list","search","delegate"]
+icon = "🧩"

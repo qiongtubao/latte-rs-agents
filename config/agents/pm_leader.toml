@@ -1,0 +1,10 @@
+[roles.pm_leader]
+id = "pm_leader"
+name = "PM Lead"
+category = "planning"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/pm_leader.md"
+temperature = 0.7
+tools = ["delegate"]
+icon = "📋"

@@ -1,0 +1,10 @@
+[roles.devops_cicd]
+id = "devops_cicd"
+name = "CI/CD Engineer"
+category = "execution"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/devops_cicd.md"
+temperature = 0.3
+tools = ["read","bash","write","delegate"]
+icon = "🔄"
