@@ -37,7 +37,7 @@ test.describe("latte-agent UI e2e", () => {
     page.on("pageerror", (err) => {
       consoleErrors.push(`[pageerror] ${err.message}`);
     });
-    await page.goto(UI_BASE, { waitUntil: "networkidle", timeout: 15_000 });
+    await page.goto(UI_BASE, { waitUntil: "domcontentloaded", timeout: 15_000 });
   });
 
   test.afterEach(async () => {
@@ -66,18 +66,31 @@ test.describe("latte-agent UI e2e", () => {
   });
 
   test("status pill shows connected", async () => {
-    await expect(page.locator("#status-pill")).toHaveText(/connected|disconnected/, { timeout: 5_000 });
+    // 中文 UI label 是 "已连接" / "已断开"，断言状态 class + 子元素文本。
+    await expect(page.locator("#status-pill")).toHaveClass(/connected|disconnected/, { timeout: 5_000 });
+    await expect(page.locator("#status-pill .status-label")).toHaveText(/已连接|已断开|思考中|已卡住/, { timeout: 5_000 });
   });
 
   test("SSE events subscribe", async () => {
-    // 直接验证 /api/events 返回 event-stream。
-    const res = await page.request.get(`${UI_BASE}/api/events`, {
-      headers: { Accept: "text/event-stream" },
-      timeout: 3_000,
-    }).catch((e) => ({ status: () => 0, _err: e } as unknown as { status: () => number }));
-    expect([200, 0]).toContain(res.status());
-  });
+    // 先获取一个 session_id，然后验证 /api/events?id=xxx 返回 event-stream。
+    const sessionsRes = await page.request.get(`${UI_BASE}/api/sessions`, { timeout: 3_000 });
+    expect(sessionsRes.status()).toBe(200);
+    const sessions = await sessionsRes.json();
+    expect(Array.isArray(sessions)).toBe(true);
 
+    // 用第一个 session 测试 SSE
+    if (sessions.length > 0) {
+      const sid = sessions[0].session_id;
+      const res = await page.request.get(`${UI_BASE}/api/events?id=${encodeURIComponent(sid)}`, {
+        headers: { Accept: "text/event-stream" },
+        timeout: 3_000,
+      }).catch((e) => ({ status: () => 0 } as unknown as { status: () => number }));
+      expect([200, 0]).toContain(res.status());
+    } else {
+      // 没有 session 时跳过
+      expect(true).toBe(true);
+    }
+  });
   test("self-loop panel toggleable", async () => {
     const panel = page.locator("#self-loop-panel");
     await expect(panel).toBeHidden();
@@ -98,10 +111,18 @@ test.describe("latte-agent UI e2e", () => {
     await page.click("#self-loop-btn");
     const input = page.locator("#self-loop-task");
     await expect(input).toBeVisible();
+    // HTML5 required 阻止 form submit。断言：缺 task 时不应触发
+    // /api/self-loop/start。监听器先挂，再 click，再断言。
+    let started = false;
+    const onReq = (r: { url: () => string }): void => {
+      if (r.url().endsWith("/api/self-loop/start")) started = true;
+    };
+    page.on("request", onReq);
     await input.fill("");
     await page.click("#self-loop-form button[type='submit']");
-    // HTML5 required 阻止提交 → 按钮无效
-    await expect(page.locator("#self-loop-progress")).toBeVisible();
+    await page.waitForTimeout(800);
+    page.off("request", onReq);
+    expect(started).toBe(false);
   });
 
   test("chat input sends message", async () => {

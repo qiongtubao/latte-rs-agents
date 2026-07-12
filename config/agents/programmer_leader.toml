@@ -1,0 +1,23 @@
+# Role: Programmer Lead
+# =============================================================================
+# 程序员Leader，管理多个语言专精程序员团队。
+# 负责任务拆解、派发给对应语言的专精程序员、代码审查协调。
+#
+# 下属角色:
+#   programmer_rust  🦀 — Rust 专精
+#   programmer_python 🐍 — Python 专精
+#   programmer_go    🔷 — Go 专精
+#   programmer_cpp   ⚙️ — C++ 专精
+#   programmer_java  ☕ — Java 专精
+#   programmer_c     🔧 — C 专精
+
+[roles.programmer_leader]
+id = "programmer_leader"
+name = "Programmer Lead"
+category = "execution"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/programmer_leader.md"
+temperature = 0.3
+tools = ["delegate"]
+icon = "👨‍💻"

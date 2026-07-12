@@ -251,6 +251,36 @@ impl TraceSink for NullSink {
     fn emit(&self, _event: TraceEvent) {}
 }
 
+/// In-memory sink. Accumulates every `emit` into a `Vec<TraceEvent>`
+/// shared via `Arc<Mutex<_>>`. Used by the controller to record the
+/// full transcript of a per-task subsession so the UI can fetch it
+/// later via `/api/sessions/{id}/subsessions/{sub_id}`. Cheap to clone
+/// the handle so the runner, the controller, and HTTP handlers can
+/// each inspect the same buffer.
+#[derive(Default)]
+pub struct MemorySink {
+    events: parking_lot::Mutex<Vec<TraceEvent>>,
+}
+impl MemorySink {
+    pub fn new() -> Self {
+        Self {
+            events: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+    /// Returns a clone of the event log in the order they were emitted.
+    pub fn snapshot(&self) -> Vec<TraceEvent> {
+        self.events.lock().clone()
+    }
+    /// Number of captured events so far.
+    pub fn len(&self) -> usize {
+        self.events.lock().len()
+    }
+}
+impl TraceSink for MemorySink {
+    fn emit(&self, event: TraceEvent) {
+        self.events.lock().push(event);
+    }
+}
 /// Writes each event as one JSON object per line. Thread-safe; uses
 /// an internal Mutex<BufWriter> so concurrent emit() calls don't
 /// interleave bytes.

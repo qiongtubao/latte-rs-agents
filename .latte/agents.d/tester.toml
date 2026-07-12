@@ -1,0 +1,9 @@
+[roles.tester]
+id = "tester"
+name = "QA Engineer"
+category = "verification"
+model_tier = "budget"
+prompt_file = "prompts/tester.md"
+temperature = 0.4
+tools = ["read", "list", "bash", "search"]
+icon = "🧪"

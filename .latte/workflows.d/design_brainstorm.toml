@@ -1,0 +1,23 @@
+name = "design_brainstorm"
+description = "关于架构或特性设计的开放式创意讨论。"
+max_rounds = 2
+
+[[steps]]
+id = "context"
+speakers = ["pm"]
+prompt = "描述这个需求和目标：{{topic}}。我们要解决什么样的用户需求？"
+
+[[steps]]
+id = "brainstorm"
+speakers = ["architect", "programmer", "designer"]
+prompt = "头脑风暴各种方案。Architect：系统设计选项。Programmer：实现层面的实际考量。Designer：UX 影响。在彼此想法的基础上推进。"
+
+[[steps]]
+id = "evaluate"
+speakers = ["reviewer", "security", "devops"]
+prompt = "评估提出的方案。考虑：可维护性、安全性和运维成本。"
+
+[[steps]]
+id = "synthesize"
+speakers = ["architect", "pm"]
+prompt = "把讨论综合成一个推荐方案，权衡取舍有据可查。"

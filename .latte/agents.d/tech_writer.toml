@@ -1,0 +1,9 @@
+[roles.tech_writer]
+id = "tech_writer"
+name = "Technical Writer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/tech_writer.md"
+temperature = 0.5
+tools = ["read", "write"]
+icon = "📝"

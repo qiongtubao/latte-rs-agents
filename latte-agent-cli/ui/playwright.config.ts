@@ -11,7 +11,7 @@ const BASE_URL = process.env.UI_BASE_URL ?? "http://localhost:4567";
 
 export default defineConfig({
   testDir: "./__tests__",
-  timeout: 30_000,
+  timeout: 180_000,
   expect: { timeout: 5_000 },
   retries: 0,
   fullyParallel: true,

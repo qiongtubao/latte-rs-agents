@@ -1,12 +1,13 @@
-// 主入口：把 chat / trace / self-loop 三个面板粘到一起 + 启 SSE 订阅。
-
+import type { SessionInfo } from "./api";
 import {
-  getSession,
-  subscribeEvents,
+  ensureSession, getCurrentSessionId, listSessions, createSession,
+  switchSession, clearLocalSessionId, getSession, subscribeEvents, fetchSubsession,
 } from "./api";
-import { mountChat } from "./chat";
+import { mountChat } from "./chat_impl";
+import type { ChatController } from "./chat_impl";
 import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
+import { mountRoleGraph } from "./role_graph";
 
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -14,23 +15,46 @@ function $(id: string): HTMLElement {
   return el;
 }
 
+async function refreshSessionSelect(
+  select: HTMLSelectElement,
+  currentId: string,
+): Promise<void> {
+  const sessions = await listSessions();
+  select.innerHTML = "";
+  for (const s of sessions) {
+    const opt = document.createElement("option");
+    opt.value = s.session_id;
+    const label =
+      s.preview && s.preview !== "(new)"
+        ? `${s.preview.slice(0, 40)}${s.preview.length > 40 ? "…" : ""} (${s.initial_role})`
+        : `(${s.initial_role}, ${s.session_id.slice(0, 12)}…)`;
+    opt.textContent = label;
+    if (s.session_id === currentId) opt.selected = true;
+    select.appendChild(opt);
+  }
+}
+
 async function main(): Promise<void> {
-  // 1. 拉初始 session。
-  let session;
+  let currentId: string;
+  try {
+    currentId = await ensureSession();
+  } catch (e) {
+    showFatal(`failed to create/load session: ${String(e)}`);
+    return;
+  }
+  let session: SessionInfo;
   try {
     session = await getSession();
   } catch (e) {
-    showFatal(`failed to reach /api/session: ${String(e)}`);
+    showFatal(`failed to load session: ${String(e)}`);
     return;
   }
+  console.log(`[ui] session_id=${currentId}, role=${session.role}`);
 
-  // 2. 起 chat 面板。onReconnect 是占位 —— subscribeEvents 要到下
-  //    面才调，那时才能拿到真的 reconnect()。所以这里用一个
-  //    reconnectRef 闭包：mountChat 内部点击药丸会调
-  //    opts.onReconnect()，而 opts.onReconnect 通过 reconnectRef
-  //    间接找到最新的 reconnect。
-  let reconnectRef: () => void = () => {};
-  const chat = mountChat({
+  let sseDisconnector: () => void = () => {};
+  let sseConnector: () => void = () => {};
+
+  const chat: ChatController = mountChat({
     container: {
       messagesEl: $("messages"),
       formEl: $("chat-form") as HTMLFormElement,
@@ -46,18 +70,41 @@ async function main(): Promise<void> {
     },
     initialRole: session.role,
     initialModel: session.model ?? undefined,
-    onRoleSwitch: async (roleId) => {
-      chat.setRoleSelected(roleId);
+    onRoleSwitch: async (roleId) => { chat.setRoleSelected(roleId); },
+    onReconnect: () => sseConnector(),
+    onShowSubsession: async (subId, label) => {
+      $("subsession-label").textContent = label;
+      const body = $("subsession-body");
+      body.textContent = "fetching…";
+      $("subsession-panel").classList.remove("hidden");
+      try {
+        const events = await fetchSubsession(subId);
+        body.innerHTML = "";
+        if (events.length === 0) { body.textContent = "(no events captured)"; return; }
+        for (const ev of events) {
+          const d = document.createElement("div");
+          d.className = "sub-event";
+          const meta = document.createElement("div");
+          meta.className = "ev-meta";
+          meta.textContent = (ev as Record<string, unknown>).type as string ?? "?";
+          d.appendChild(meta);
+          const data = document.createElement("div");
+          data.className = "ev-data";
+          data.textContent = safeJSON(ev as Record<string, unknown>);
+          d.appendChild(data);
+          body.appendChild(d);
+        }
+      } catch (e) { body.textContent = `error: ${String(e)}`; }
     },
-    onReconnect: () => reconnectRef(),
   });
   chat.refreshRoles(session.available_roles, session.role);
+  $("subsession-close").addEventListener("click", () => {
+    $("subsession-panel").classList.add("hidden");
+  });
 
-  // 3. 起 trace 面板。
   const trace = mountTrace({
     container: {
-      panelEl: $("trace-panel"),
-      listEl: $("trace-list"),
+      panelEl: $("trace-panel"), listEl: $("trace-list"),
       sessionSelectEl: $("trace-session-select") as HTMLSelectElement,
       refreshBtn: $("trace-refresh") as HTMLButtonElement,
       toggleBtn: $("trace-toggle") as HTMLButtonElement,
@@ -66,11 +113,9 @@ async function main(): Promise<void> {
   });
   await trace.refresh();
 
-  // 4. 起 self-loop 面板。
   const selfLoop = mountSelfLoop({
     container: {
-      panelEl: $("self-loop-panel"),
-      openBtn: $("self-loop-btn") as HTMLButtonElement,
+      panelEl: $("self-loop-panel"), openBtn: $("self-loop-btn") as HTMLButtonElement,
       closeBtn: $("self-loop-close") as HTMLButtonElement,
       formEl: $("self-loop-form") as HTMLFormElement,
       taskInputEl: $("self-loop-task") as HTMLInputElement,
@@ -81,31 +126,67 @@ async function main(): Promise<void> {
     },
   });
 
-  // 5. 订阅 SSE。subscribeEvents 现在管 EventSource 生命周期：
-  //    错误时主动 close（停掉浏览器自带的 auto-reconnect），把
-  //    状态变成 "disconnected"；用户点药丸就调 reconnect() 重建。
-  const { reconnect } = subscribeEvents(
-    (ev) => {
-      chat.handleEvent(ev);
+  const roleGraph = mountRoleGraph({
+    container: {
+      panelEl: $("role-graph-panel"), openBtn: $("role-graph-btn") as HTMLButtonElement,
+      closeBtn: $("role-graph-close") as HTMLButtonElement,
+      refreshBtn: $("role-graph-refresh") as HTMLButtonElement,
+      statsEl: $("role-graph-stats"), bodyEl: $("role-graph-body"),
     },
-    (status) => {
-      chat.setStatus(status);
-    },
-  );
-  reconnectRef = reconnect;
+  });
 
-  chat.setFooter(`ready · role=${session.role} · session=${session.session_id}`);
-  console.log("[ui] mounted; self-loop panel", selfLoop.isOpen() ? "open" : "closed");
+  await trace.refresh();
+
+  const sessionSelect = $("session-select") as HTMLSelectElement;
+  const newSessionBtn = $("session-new-btn") as HTMLButtonElement;
+
+  function openSse(): void {
+    sseDisconnector();
+    const { disconnect, reconnect } = subscribeEvents(
+      (ev) => chat.handleEvent(ev),
+      (status) => chat.setStatus(status),
+    );
+    sseDisconnector = disconnect;
+    sseConnector = reconnect;
+  }
+  openSse();
+
+  newSessionBtn.addEventListener("click", async () => {
+    try {
+      const id = await createSession();
+      window.localStorage.setItem("latte-agent-ui-session-id", id);
+      await refreshSessionSelect(sessionSelect, id);
+      sessionSelect.value = id;
+      chat.clear();
+      const info = await getSession();
+      chat.setRoleSelected(info.role);
+      chat.refreshRoles(info.available_roles, info.role);
+      openSse();
+      chat.setFooter(`new session ${id.slice(0, 12)}… · ${info.role}`);
+    } catch (e) { chat.setFooter(`new session failed: ${String(e)}`); }
+  });
+
+  chat.setFooter(`ready · role=${session.role} · session=${currentId}`);
+  console.log(`[ui] mounted; self-loop panel`, selfLoop.isOpen() ? "open" : "closed");
+}
+
+function safeJSON(obj: Record<string, unknown>): string {
+  try {
+    const seen = new Set<unknown>();
+    const txt = JSON.stringify(obj, (_k, v) => {
+      if (typeof v === "object" && v !== null) { if (seen.has(v)) return; seen.add(v); }
+      return v;
+    }, 2);
+    if (!txt) return String(obj);
+    return txt.length > 5000 ? txt.slice(0, 5000) + "…" : txt;
+  } catch { return String(obj); }
 }
 
 function showFatal(msg: string): void {
   const el = document.createElement("div");
   el.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0e1117;color:#f85149;font-family:sans-serif;padding:2rem;text-align:center;";
-  el.textContent = msg;
+  el.innerHTML = `<pre style="white-space:pre-wrap;">${msg}</pre>`;
   document.body.appendChild(el);
 }
 
-main().catch((e) => {
-  console.error("[ui] fatal", e);
-  showFatal(`fatal: ${String(e)}`);
-});
+main().catch((e) => { console.error("[fatal]", e); showFatal(String(e)); });

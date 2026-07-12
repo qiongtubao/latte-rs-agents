@@ -1,0 +1,9 @@
+[roles.devops]
+id = "devops"
+name = "DevOps Engineer"
+category = "execution"
+model_tier = "budget"
+prompt_file = "prompts/devops.md"
+temperature = 0.3
+tools = ["read", "bash", "write"]
+icon = "🚀"

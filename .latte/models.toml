@@ -32,6 +32,12 @@ premium = "glm-5.2"
 standard = "glm-5.2"
 budget = "glm-5.2"
 
+# MCP Agent — use deepseek-v4-flash (has real API key in global config)
+[models.role_tiers.mcp_agent]
+premium = "deepseek-v4-flash"
+standard = "deepseek-v4-flash"
+budget = "deepseek-v4-flash"
+
 # ─── Model Definitions ───────────────────────────────────────────────────────
 
 [[models.models]]

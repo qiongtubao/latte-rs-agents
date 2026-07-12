@@ -94,10 +94,10 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::RoleFinished { role_id, detail } => {
                 self.on_status(&format!("{role_id} finished: {detail}")).await;
             }
-            ChatEvent::DelegateStarted { from_role, to_role, task } => {
+            ChatEvent::DelegateStarted { from_role, to_role, task, .. } => {
                 self.on_status(&format!("{from_role} delegated to {to_role}: {task}")).await;
             }
-            ChatEvent::DelegateFinished { from_role, to_role, status, summary } => {
+            ChatEvent::DelegateFinished { from_role, to_role, status, summary, .. } => {
                 self.on_status(&format!("{from_role} delegate {to_role} {status}: {summary}")).await;
             }
             ChatEvent::Done => self.on_done().await,

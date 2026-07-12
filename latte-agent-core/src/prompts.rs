@@ -32,9 +32,22 @@ pub const SECURITY: &str = include_str!("../../prompts/security.md");
 pub const DESIGNER: &str = include_str!("../../prompts/designer.md");
 /// Technical Writer
 pub const TECH_WRITER: &str = include_str!("../../prompts/tech_writer.md");
+/// Screenshot testing skill
+pub const SCREENSHOT_SKILL: &str = include_str!("../../prompts/screenshot_skill.md");
 /// Engineering Manager
 pub const MANAGER: &str = include_str!("../../prompts/manager.md");
+/// MCP Agent
+pub const MCP_AGENT: &str = include_str!("../../prompts/mcp_agent.md");
 
+/// Look up a skill by name from built-in prompts.
+pub fn for_skill(name: &str) -> Option<&'static str> {
+    match name {
+        "screenshot_skill" => Some(SCREENSHOT_SKILL),
+        _ => None,
+    }
+}
+
+/// Look up a default role prompt by its id (e.g. `"pm"`, `"architect"`).
 /// Look up a default role prompt by its id (e.g. `"pm"`, `"architect"`).
 ///
 /// Returns `None` for unknown roles — callers should fall back to
@@ -51,10 +64,10 @@ pub fn for_role(id: &str) -> Option<&'static str> {
         "designer" => DESIGNER,
         "tech_writer" => TECH_WRITER,
         "manager" => MANAGER,
+        "mcp_agent" => MCP_AGENT,
         _ => return None,
     })
 }
-
 /// Default role template factory for built-in roles. Returns `Some`
 /// only for the 10 hard-coded roles below; callers use this when no
 /// project config and no global config is present so the binary can
@@ -73,11 +86,11 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             category: "planning".into(),
             model_tier: "standard".into(),
             model_chain: vec![],
-            prompt_file: None, // built-in; RoleTemplate::resolve will
-                               // fall through to `for_role`.
+            prompt_file: None,
             temperature: Some(0.7),
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "📋".into(),
+            skills: vec![],
         },
         "architect" => RoleTemplate {
             id: "architect".into(),
@@ -89,6 +102,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.5),
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🏗️".into(),
+            skills: vec![],
         },
         "programmer" => RoleTemplate {
             id: "programmer".into(),
@@ -105,6 +119,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
                 "search".into(),
             ],
             icon: "💻".into(),
+            skills: vec![],
         },
         "tester" => RoleTemplate {
             id: "tester".into(),
@@ -121,6 +136,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
                 "search".into(),
             ],
             icon: "🧪".into(),
+            skills: vec![],
         },
         "reviewer" => RoleTemplate {
             id: "reviewer".into(),
@@ -132,6 +148,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.4),
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🔍".into(),
+            skills: vec![],
         },
         "devops" => RoleTemplate {
             id: "devops".into(),
@@ -143,6 +160,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.3),
             tools: vec!["read".into(), "bash".into(), "write".into()],
             icon: "🚀".into(),
+            skills: vec![],
         },
         "security" => RoleTemplate {
             id: "security".into(),
@@ -154,6 +172,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.4),
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🛡️".into(),
+            skills: vec![],
         },
         "designer" => RoleTemplate {
             id: "designer".into(),
@@ -165,6 +184,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.7),
             tools: vec!["read".into()],
             icon: "🎨".into(),
+            skills: vec![],
         },
         "tech_writer" => RoleTemplate {
             id: "tech_writer".into(),
@@ -176,6 +196,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.5),
             tools: vec!["read".into(), "write".into()],
             icon: "📝".into(),
+            skills: vec![],
         },
         "manager" => RoleTemplate {
             id: "manager".into(),
@@ -187,12 +208,23 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.5),
             tools: vec!["read".into()],
             icon: "👔".into(),
+            skills: vec![],
+        },
+        "mcp_agent" => RoleTemplate {
+            id: "mcp_agent".into(),
+            name: "MCP Agent".into(),
+            category: "execution".into(),
+            model_tier: "budget".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.3),
+            tools: vec!["mcp".into(), "bash".into(), "read".into(), "list".into()],
+            icon: "🔌".into(),
+            skills: vec![],
         },
         _ => return None,
     })
 }
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

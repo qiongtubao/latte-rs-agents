@@ -18,12 +18,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use clap::Args;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
+use std::collections::HashMap;
+use std::time::Instant;
 use axum::{Json, Router};
-use clap::Args;
 use futures_util::stream::Stream;
 use latte_agent_core::config::AgentConfig;
 use latte_agent_core::controller::{ChatController, ControllerConfig, RoleInfo};
@@ -130,26 +132,41 @@ impl UiCmd {
         // RoleTurn 这些事件，"讨论感"是 manager ↔ 单一 specialist
         // 之间的，不是 10 个 role 一起瞎答。
         let cwd = std::env::current_dir()?;
-        let cfg = ControllerConfig {
-            task_id: None,
-            roles: vec![initial_role.clone()],
-            initial_prompt: None,
-            max_rounds: 0,
-            session_token_budget: 0,
-            agent_config: merged.clone(),
-            model_resolver: resolver.clone(),
-            default_params: GenerateParams::default(),
-            primary_model_id: self.model_id.clone(),
-            initial_tier,
-            initial_history: vec![],
-            cwd: cwd.clone(),
-        };
 
-        // 4. 起 ChatController。
-        let controller = Arc::new(ChatController::new(256));
-        let _events_rx = controller.spawn(cfg).await;
+        // 4. Build a per-tab session map. Each browser tab will get its
+        // own ChatController on first POST /api/sessions so that
+        // concurrent tabs do not see each other's events.
+        //
+        // We also bootstrap ONE default session tied to the launch
+        // time, so old single-tab clients that don't yet POST
+        // /api/sessions can still /api/session?id=<default> and route
+        // traffic.
+        let sessions: Arc<SessionMap> =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let default_session_id =
+            format!("ui-{}-{}", std::process::id(), unix_ts_millis());
+        // Process-wide subsession store (used before sessions).
+        let subsession_store: Arc<latte_agent_core::subsession::SubsessionStore> =
+            Arc::new(latte_agent_core::subsession::SubsessionStore::new());
+        let default_handle = create_session_handle(
+            default_session_id.clone(),
+            &initial_role,
+            &merged,
+            &resolver,
+            &cwd,
+            self.model_id.clone(),
+            initial_tier.clone(),
+            256,
+            &subsession_store,
+        )
+        .await?;
 
-        // 5. 解析静态文件目录。
+        // Also bootstrap a default session so early HTTP calls that
+        // don't create their own still work.
+        sessions.write().insert(
+            default_session_id.clone(),
+            Arc::new(default_handle),
+        );
         let static_dir = resolve_static_dir(self);
 
         // 6. spawn vite dev server（仅 dev 模式）。
@@ -159,15 +176,16 @@ impl UiCmd {
 
         // 7. 起 axum server。
         let state = AppState {
-            controller: controller.clone(),
+            sessions: sessions.clone(),
             merged: merged.clone(),
+            resolver: resolver.clone(),
+            cwd: cwd.clone(),
             initial_role: initial_role.clone(),
             static_dir: static_dir.clone(),
             self_loop: Arc::new(SelfLoopState::default()),
+            subsession_store: subsession_store.clone(),
         };
-
         let app = build_router(state);
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         eprintln!(
             "[ui] latte-agent UI server listening on http://localhost:{}",
             self.port
@@ -187,6 +205,7 @@ impl UiCmd {
             );
         }
 
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
         Ok(())
@@ -197,24 +216,117 @@ impl UiCmd {
 
 #[derive(Clone)]
 struct AppState {
-    controller: Arc<ChatController>,
+    /// One entry per browser tab. Each `SessionHandle` owns its own
+    /// ChatController + ChatEvent broadcast channel, so chats across
+    /// tabs don't pollute each other.
+    sessions: Arc<SessionMap>,
     merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    cwd: PathBuf,
     initial_role: String,
     static_dir: Option<PathBuf>,
     self_loop: Arc<SelfLoopState>,
+    /// Process-wide store of per-task subsession event logs. Each
+    /// delegate call allocates an entry; the UI's right-click →
+    /// "show contents" reads from this same store via
+    /// `/api/sessions/{id}/subsessions/{sub_id}`. Shared across all
+    /// tabs so a tab-A subsession can never accidentally read
+    /// tab-B's events (the (session_id, sub_id) key keeps them apart
+    /// even when the store is process-wide).
+    subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
 }
 
-#[derive(Default)]
-struct SelfLoopState {
-    /// Latest self-loop progress event sender (broadcast for multiple SSE subscribers).
-    progress: parking_lot::Mutex<Option<broadcast::Sender<SelfLoopEvent>>>,
+/// Per-tab state. Holds the controller and the broadcast channel the
+/// SSE stream subscribes to. Two handles never share a controller, so
+/// `/api/chat/send` on tab A is invisible to tab B's SSE stream.
+struct SessionHandle {
+    session_id: String,
+    /// controller that runs the actual chat loop and owns history.
+    controller: Arc<ChatController>,
+    /// Preview copy of the first user message — used by `/api/sessions`
+    /// to render a sidebar entry without re-reading the controller.
+    first_user_msg: parking_lot::Mutex<Option<String>>,
+    created_at: Instant,
+    last_activity: Arc<parking_lot::Mutex<Instant>>,
+    initial_role: String,
 }
 
-// ─── Router ───────────────────────────────────────────────────────
+impl SessionHandle {
+    fn touch(&self) {
+        *self.last_activity.lock() = Instant::now();
+    }
+}
+
+/// Process-wide map of active session IDs to their per-tab handle.
+/// `parking_lot::RwLock` because reads (every chat/SSE request) dominate.
+type SessionMap = parking_lot::RwLock<HashMap<String, Arc<SessionHandle>>>;
+
+fn unix_ts_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Construct a fresh `SessionHandle` whose controller is already
+/// `spawn`ed and owns its own broadcast channel. The caller inserts
+/// the handle into `SessionMap`; failure to spawn the controller is
+/// propagated to the HTTP caller via a 500.
+async fn create_session_handle(
+    session_id: String,
+    initial_role: &str,
+    merged: &Arc<AgentConfig>,
+    resolver: &Arc<ModelResolver>,
+    cwd: &std::path::Path,
+    primary_model_id: Option<String>,
+    initial_tier: Option<ModelTier>,
+    broadcast_capacity: usize,
+    // Process-wide subsession store. The `ControllerConfig`
+    // field is shared by reference; when the manager delegates
+    // inside this controller, `register_delegate_tool` carves a
+    // fresh `MemorySink` out of this store and emits the
+    // specialist's full event log there for the UI to fetch.
+    subsession_store: &Arc<latte_agent_core::subsession::SubsessionStore>,
+) -> Result<SessionHandle, String> {
+    let cfg = ControllerConfig {
+        task_id: None,
+        roles: vec![initial_role.to_string()],
+        initial_prompt: None,
+        max_rounds: 0,
+        session_token_budget: 0,
+        agent_config: merged.clone(),
+        model_resolver: resolver.clone(),
+        default_params: GenerateParams::default(),
+        primary_model_id,
+        initial_tier,
+        initial_history: vec![],
+        cwd: cwd.to_path_buf(),
+        subsession_store: subsession_store.clone(),
+    };
+    let controller = Arc::new(ChatController::new(broadcast_capacity));
+    // `spawn` returns a broadcast::Receiver (events consumer); the
+    // controller runs in the background. We don't keep the receiver
+    // here — the per-tab SSE subscriber is what reads events.
+    let _rx = controller.spawn(cfg).await;
+    let now = Instant::now();
+    Ok(SessionHandle {
+        session_id,
+        controller,
+        first_user_msg: parking_lot::Mutex::new(None),
+        created_at: now,
+        last_activity: Arc::new(parking_lot::Mutex::new(now)),
+        initial_role: initial_role.to_string(),
+    })
+}
 
 fn build_router(state: AppState) -> Router {
     // /health 在根路径（liveness probe），其它走 /api
+    //
+    // Multi-session: tabs call POST /api/sessions on first mount to
+    // create their own session_id; thereafter every chat/event call
+    // carries `session_id` so the server stays tab-scoped.
     let api = Router::new()
+        .route("/sessions", get(list_sessions).post(create_session))
         .route("/session", get(get_session))
         .route("/roles", get(list_roles))
         .route("/chat/send", post(chat_send))
@@ -226,8 +338,9 @@ fn build_router(state: AppState) -> Router {
         .route("/self-loop/start", post(self_loop_start))
         .route("/self-loop/events", get(self_loop_events_sse))
         .route("/self-loop/stop", post(self_loop_stop))
-        .with_state(state.clone());
-
+        .route("/role-graph", get(role_graph_get))
+        .route("/subsessions", get(get_subsession))
+         .with_state(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);
@@ -245,23 +358,161 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Returned by `GET /api/session?id=...` and `POST /api/sessions`.
+/// Frontend uses `session_id` as its localStorage key.
 #[derive(Serialize)]
 struct SessionInfo {
     session_id: String,
     role: String,
     model: Option<String>,
     tier: String,
+    /// All sessions the caller could switch to (sidebar).
+    available_sessions: Vec<SessionSummary>,
     available_roles: Vec<RoleInfo>,
 }
 
-async fn get_session(State(state): State<AppState>) -> Json<SessionInfo> {
-    Json(SessionInfo {
-        session_id: format!("ui-{}", std::process::id()),
-        role: state.initial_role.clone(),
-        model: None, // 前端订阅 /api/events 后从 ChatEvent::SessionInfo 取
+/// Lightweight session entry for the sidebar — returned by
+/// `GET /api/sessions` and embedded in `SessionInfo`.
+#[derive(Serialize)]
+struct SessionSummary {
+    session_id: String,
+    /// First user message, truncated, used as the human label.
+    preview: String,
+    initial_role: String,
+    created_at_unix_ms: u64,
+    last_activity_unix_ms: u64,
+}
+
+async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
+    let map = state.sessions.read();
+    let now = Instant::now();
+    let mut out: Vec<SessionSummary> = map
+        .values()
+        .map(|h| SessionSummary {
+            session_id: h.session_id.clone(),
+            preview: h
+                .first_user_msg
+                .lock()
+                .clone()
+                .unwrap_or_else(|| "(no user message yet)".into()),
+            initial_role: h.initial_role.clone(),
+            created_at_unix_ms: millis_from_now(now, h.created_at),
+            last_activity_unix_ms: millis_from_now(now, *h.last_activity.lock()),
+        })
+        .collect();
+    out.sort_by(|a, b| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms));
+    Json(out)
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    // Empty body extractor — POST /api/sessions just allocates a session.
+    _body: axum::Json<serde_json::Value>,
+) -> Result<Json<SessionInfo>, (StatusCode, String)> {
+    let session_id =
+        format!("ui-{}-{}", std::process::id(), unix_ts_millis());
+    let handle = create_session_handle(
+        session_id.clone(),
+        &state.initial_role,
+        &state.merged,
+        &state.resolver,
+        &state.cwd,
+        None,
+        None,
+        256,
+        &state.subsession_store,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("spawn controller: {e}"),
+        )
+    })?;
+    let h = Arc::new(handle);
+    let resp = SessionInfo {
+        session_id: h.session_id.clone(),
+        role: h.initial_role.clone(),
+        model: None,
         tier: "auto".into(),
+        available_sessions: vec![SessionSummary {
+            session_id: h.session_id.clone(),
+            preview: "(new)".into(),
+            initial_role: h.initial_role.clone(),
+            created_at_unix_ms: 0,
+            last_activity_unix_ms: 0,
+        }],
         available_roles: build_role_info(&state.merged),
-    })
+    };
+    state.sessions.write().insert(h.session_id.clone(), h);
+    Ok(Json(resp))
+}
+
+/// Helper: turns `now - earlier` into a unix-millis duration, useful
+
+fn millis_from_now(now: Instant, earlier: Instant) -> u64 {
+    // `Duration` doesn't expose `.map`. Compute ms in one shot and
+    // saturate on the unwrap (`Instant::duration_since` only fails
+    // when `earlier > now` because the system clock jumped back).
+    let d = now.saturating_duration_since(earlier);
+    d.as_millis() as u64
+}
+
+/// Lookup the SessionHandle for a request, or return 404.
+///
+async fn resolve_session(
+    state: &AppState,
+    body_id: Option<&str>,
+    query_id: Option<&str>,
+) -> Result<Arc<SessionHandle>, (StatusCode, String)> {
+    let id = body_id
+        .or(query_id)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing session_id".into()))?;
+    let map = state.sessions.read();
+    map.get(id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("session_id {id:?} not found"),
+            )
+        })
+}
+
+async fn get_session(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<Json<SessionInfo>, (StatusCode, String)> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing id".into()))?;
+    let h: Arc<SessionHandle> = {
+        let map = state.sessions.read();
+        map.get(id).cloned()
+    }
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session {id} unknown")))?;
+    Ok(Json(SessionInfo {
+        session_id: h.session_id.clone(),
+        role: h.initial_role.clone(),
+        model: None,
+        tier: "auto".into(),
+        available_sessions: vec![SessionSummary {
+            session_id: h.session_id.clone(),
+            preview: {
+                let g = h.first_user_msg.lock();
+                g.clone().unwrap_or_default()
+            },
+            initial_role: h.initial_role.clone(),
+            created_at_unix_ms: millis_from_now(Instant::now(), h.created_at),
+            last_activity_unix_ms: {
+                let g = h.last_activity.lock();
+                millis_from_now(Instant::now(), *g)
+            },
+        }],
+        available_roles: build_role_info(&state.merged),
+    }))
 }
 
 async fn list_roles(State(state): State<AppState>) -> Json<Vec<RoleInfo>> {
@@ -286,6 +537,10 @@ fn build_role_info(cfg: &AgentConfig) -> Vec<RoleInfo> {
 
 #[derive(Deserialize)]
 struct SendRequest {
+    /// First field so `session_id` presence in body doesn't surprise
+    /// legacy clients; the frontend always sends both.
+    #[serde(default)]
+    session_id: Option<String>,
     message: String,
 }
 
@@ -293,13 +548,30 @@ async fn chat_send(
     State(state): State<AppState>,
     Json(req): Json<SendRequest>,
 ) -> StatusCode {
-    state.controller.submit_input(&req.message).await;
+    let h = match resolve_session(
+        &state,
+        req.session_id.as_deref(),
+        None,
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(_) => return StatusCode::NOT_FOUND,
+    };
+    h.touch();
+    // First-message preview for the sidebar entry. Cheap + bounded.
+    if h.first_user_msg.lock().is_none() {
+        let preview = req.message.chars().take(80).collect::<String>();
+        *h.first_user_msg.lock() = Some(preview);
+    }
+    h.controller.submit_input(&req.message).await;
     StatusCode::ACCEPTED
 }
 
 #[derive(Deserialize)]
 struct CommandRequest {
-    /// 形如 "/clear"、"/quit"、"/save <path>" 的 REPL 命令。
+    #[serde(default)]
+    session_id: Option<String>,
     command: String,
 }
 
@@ -307,13 +579,18 @@ async fn chat_command(
     State(state): State<AppState>,
     Json(req): Json<CommandRequest>,
 ) -> StatusCode {
-    // controller 内部对 '/' 前缀有 REPL 处理（看 controller.rs ControllerInput）。
-    state.controller.submit_input(&req.command).await;
+    let Ok(h) = resolve_session(&state, req.session_id.as_deref(), None).await else {
+        return StatusCode::NOT_FOUND;
+    };
+    h.touch();
+    h.controller.submit_input(&req.command).await;
     StatusCode::ACCEPTED
 }
 
 #[derive(Deserialize)]
 struct SwitchRoleRequest {
+    #[serde(default)]
+    session_id: Option<String>,
     role_id: String,
 }
 
@@ -321,40 +598,59 @@ async fn switch_role(
     State(state): State<AppState>,
     Json(req): Json<SwitchRoleRequest>,
 ) -> StatusCode {
-    state.controller.switch_role(&req.role_id).await;
+    let Ok(h) = resolve_session(&state, req.session_id.as_deref(), None).await else {
+        return StatusCode::NOT_FOUND;
+    };
+    h.touch();
+    h.controller.switch_role(&req.role_id).await;
     StatusCode::ACCEPTED
 }
 
 async fn events_sse(
     State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
-    let rx = state.controller.subscribe();
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<
+    Sse<impl Stream<Item = Result<Event, axum::Error>>>,
+    (StatusCode, String),
+> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing ?id=".into()))?;
+    let map = state.sessions.read();
+    let h = map
+        .get(id)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("session {id} not found"),
+            )
+        })?;
+    // Each SessionHandle owns its own ChatController (and therefore
+    // its own broadcast channel). Subscribing to `h.controller`
+    // guarantees the SSE stream sees only events for THIS tab — the
+    // server is no longer broadcasting the single shared controller's
+    // events to every connected tab.
+    drop(map);
+    let rx = h.controller.subscribe();
     let stream = BroadcastStream::new(rx).map(|item| match item {
-        Ok(ev) => {
-            // Convert ChatEvent (externally-tagged JSON, e.g.
-            // `{"Status":{"message":"..."}}`) into the discriminated
-            // union the latte-agent-ui frontend expects:
-            // `{"type":"Status","message":"..."}`.
-            //
-            // The conversion preserves every field; we just flatten
-            // the outer variant tag into a `type` discriminator. The
-            // shape matches `api.ts ChatEvent` exactly, so the
-            // front-end `switch (e.type)` hits the right branch and
-            // the user sees the response.
-            match chat_event_to_frontend_json(&ev) {
-                Ok(json) => Ok(Event::default()
-                    .event("chat_event")
-                    .data(json)),
-                Err(e) => Ok(Event::default()
-                    .event("error")
-                    .data(format!("chat_event convert failed: {}", e))),
-            }
-        }
+        Ok(ev) => match chat_event_to_frontend_json(&ev) {
+            Ok(json) => Ok(Event::default()
+                .event("chat_event")
+                .data(json)),
+            Err(e) => Ok(Event::default()
+                .event("error")
+                .data(format!("chat_event convert failed: {}", e))),
+        },
         Err(e) => Ok(Event::default()
             .event("error")
             .data(format!("broadcast lag: {}", e))),
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    ))
 }
 
 /// Convert a `ChatEvent` (externally-tagged JSON object) into the
@@ -488,8 +784,13 @@ async fn read_trace(
     })))
 }
 
-// ─── Self-Loop API ────────────────────────────────────────────────
+#[derive(Default)]
+struct SelfLoopState {
+    /// Latest self-loop progress event sender (broadcast for multiple SSE subscribers).
+    progress: parking_lot::Mutex<Option<broadcast::Sender<SelfLoopEvent>>>,
+}
 
+// ─── Self-Loop API ────────────────────────────────────────────────
 #[derive(Deserialize)]
 struct SelfLoopStartRequest {
     /// 给 AI 的任务描述（如"fix the chat panel layout"）。
@@ -688,7 +989,9 @@ async fn self_loop_events_sse(
             .data(serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into()))),
         Err(_) => Ok(Event::default().event("ping").data("")),
     });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10)))
+    Sse::new(stream).keep_alive(
+        KeepAlive::new().interval(std::time::Duration::from_secs(10)),
+    )
 }
 
 async fn self_loop_stop(State(state): State<AppState>) -> StatusCode {
@@ -696,8 +999,43 @@ async fn self_loop_stop(State(state): State<AppState>) -> StatusCode {
     *guard = None;
     StatusCode::OK
 }
+/// GET /api/role-graph — build + serve the "role × tool" code-graph.
+///
+/// Combines the project's `.latte/agents.d/*.toml` (which lists each
+/// role's declared tools) with a TreeSitterEngine scan of the project
+/// root for `register_*_tool` call-sites. The result is JSON-friendly
+/// and consumed by the UI's Graph panel.
+async fn role_graph_get(
+    State(state): State<AppState>,
+) -> Result<Json<super::role_graph::RoleGraph>, (StatusCode, String)> {
+    match super::role_graph::build(&state.cwd, &state.cwd).await {
+        Ok(g) => Ok(Json(g)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
 
-// ─── Helpers ──────────────────────────────────────────────────────
+/// GET /api/subsessions?id=<sub_id> — fetch the subsession transcript.
+async fn get_subsession(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing id".into()))?;
+    let snapshot = state.subsession_store.snapshot("default", id);
+    match snapshot {
+        Some(events) => {
+            let vals: Vec<serde_json::Value> = events
+                .into_iter()
+                .filter_map(|e| serde_json::to_value(e).ok())
+                .collect();
+            Ok(Json(vals))
+        }
+        None => Ok(Json(vec![])),
+    }
+}
 
 fn parse_tier_str(s: &str) -> Result<ModelTier, Box<dyn std::error::Error>> {
     ModelTier::parse(s).map_err(|e| e.into())
@@ -912,9 +1250,8 @@ mod tests {
             ("ToolError", ChatEvent::ToolError { role_id: "m".into(), tool_name: "read".into(), error: "fail".into() }),
             ("RoleStarted", ChatEvent::RoleStarted { role_id: "m".into(), detail: "calling LLM".into() }),
             ("RoleFinished", ChatEvent::RoleFinished { role_id: "m".into(), detail: "ok".into() }),
-            ("DelegateStarted", ChatEvent::DelegateStarted { from_role: "manager".into(), to_role: "programmer".into(), task: "ping".into() }),
-            ("DelegateFinished", ChatEvent::DelegateFinished { from_role: "manager".into(), to_role: "programmer".into(), status: "ok".into(), summary: "done".into() }),
-            ("Prompt", ChatEvent::Prompt { icon: "[m]".into(), role_id: "manager".into(), model_id: "glm-5.2".into() }),
+            ("DelegateStarted", ChatEvent::DelegateStarted { from_role: "manager".into(), to_role: "programmer".into(), task: "ping".into(), sub_id: "x".into() }),
+            ("DelegateFinished", ChatEvent::DelegateFinished { from_role: "manager".into(), to_role: "programmer".into(), status: "ok".into(), summary: "done".into(), sub_id: "x".into() }),
             ("SessionInfo", ChatEvent::SessionInfo { task_id: "ui-1".into(), state: "running".into(), turn: 0, roles: vec![RoleInfo { id: "manager".into(), name: "Manager".into(), icon: "[m]".into() }] }),
         ];
         for (expected_type, ev) in cases {
@@ -923,29 +1260,35 @@ mod tests {
             assert_eq!(v["type"], expected_type, "type mismatch for variant {}: {}", expected_type, v);
         }
     }
-
-    /// 端到端测试：起一个真实 axum server (随机端口)，验证
-    /// `/health` + `/api/session` + `/api/roles` + `/api/traces` 都能正常响应。
-    ///
-    /// 这个测试是 self-debug loop 的基础前提：必须确认 HTTP
-    /// 服务端可被前端代码调用，否则前端 / Playwright 一打开
-    /// 就看到 CORS / 404 错误，self-debug 失去依据。
     #[tokio::test]
-    async fn e2e_http_routes_respond() {
-        // 用空闲端口 (0) 让 OS 自动分配。
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // 构造最小 AppState：agent_config 留默认，controller 用 ChatController::new 不 spawn。
-        let controller = Arc::new(ChatController::new(8));
+    async fn real_axum_server_serves_health_session_roles_traces() {
+        /// 端到端测试：起一个真实 axum server (随机端口)，验证
+        /// `/health` + `/api/session` + `/api/roles` + `/api/traces` 都能正常响应。
+        ///
+        // 构造最小 AppState：agent_config 留默认，sessions map 留空，controller 用 ChatController::new 不 spawn。
+        let _ = controller;
         let state = AppState {
-            controller,
+            sessions: Arc::new(SessionMap::default()),
             merged: Arc::new(AgentConfig::default()),
+            resolver: Arc::new(ModelResolver::default()),
+            cwd: std::env::temp_dir(),
+            initial_role: "manager".into(),
+            static_dir: None,
+            self_loop: Arc::new(SelfLoopState::default()),
+            subsession_store: Arc::new(
+                latte_agent_core::subsession::SubsessionStore::new(),
+            ),
+        };
+
+        let state = AppState {
+            sessions: Arc::new(SessionMap::default()),
+            merged: Arc::new(AgentConfig::default()),
+            resolver: Arc::new(ModelResolver::default()),
+            cwd: std::env::temp_dir(),
             initial_role: "manager".into(),
             static_dir: None,
             self_loop: Arc::new(SelfLoopState::default()),
         };
-        let app = build_router(state);
 
         // spawn server。
         tokio::spawn(async move {
@@ -1006,3 +1349,5 @@ mod tests {
         assert_eq!(status, 200);
     }
 }
+
+ // ── EOF ──

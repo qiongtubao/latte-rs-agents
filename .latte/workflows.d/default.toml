@@ -1,0 +1,41 @@
+# 默认 workflow：标准软件开发讨论
+name = "standard-software-discussion"
+description = "标准软件开发讨论：需求 → 设计 → 估算 → 评审 → 决策"
+max_rounds = 3
+context_token_budget = 32000
+
+[[steps]]
+id = "requirements"
+description = "PM 阐述需求和目标"
+speakers = ["pm"]
+prompt = "为 {{topic}} 阐明需求。包括：用户故事、验收标准、范围边界和优先级。"
+
+[[steps]]
+id = "architecture"
+description = "架构师审查可行性并提出设计"
+speakers = ["architect"]
+prompt = "从技术角度审查上述需求。建议架构方案，识别风险，讨论权衡。"
+
+[[steps]]
+id = "implementation"
+description = "程序员估算实现方法和工期"
+speakers = ["programmer"]
+prompt = "根据上述需求和架构，估算实现方案。识别关键模块、数据流和复杂度。"
+
+[[steps]]
+id = "quality"
+description = "测试员识别测试策略和边界用例"
+speakers = ["tester"]
+prompt = "审查上述需求和实现计划。识别测试策略、边界用例和验收标准缺口。"
+
+[[steps]]
+id = "review"
+description = "审查员检查质量和安全问题"
+speakers = ["reviewer", "security"]
+prompt = "审查上面的完整讨论。Reviewer：代码质量和模式问题。Security：漏洞和威胁考虑。"
+
+[[steps]]
+id = "decide"
+description = "经理对范围和时间线做最终决策"
+speakers = ["pm", "manager"]
+prompt = "基于上面的完整讨论，最终确定范围、优先级和时间线。Manager：评估风险和资源约束。"

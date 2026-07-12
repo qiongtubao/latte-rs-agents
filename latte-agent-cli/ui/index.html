@@ -24,11 +24,13 @@
         </div>
         <div class="topbar-actions">
           <select id="role-select" title="switch role"></select>
+          <select id="session-select" title="session"></select>
+          <button id="session-new-btn" type="button" title="new session">+ Session</button>
+          <button id="role-graph-btn" type="button">Role Graph</button>
           <button id="trace-toggle" type="button">Trace</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
         </div>
       </header>
-
       <main class="layout">
         <section id="chat-panel" class="panel chat-panel">
           <div id="messages" class="messages" aria-live="polite"></div>
@@ -84,9 +86,25 @@
             </form>
             <div id="self-loop-progress" class="self-loop-progress"></div>
             <div id="self-loop-screenshots" class="self-loop-screenshots"></div>
-          </div>
         </aside>
-      </main>
+        <aside id="role-graph-panel" class="panel role-graph-panel hidden">
+          <header class="panel-header">
+            <h2>Role × Tool Graph</h2>
+            <button id="role-graph-close" type="button">×</button>
+            <button id="role-graph-refresh" type="button">↻</button>
+          </header>
+          <div class="role-graph-stats" id="role-graph-stats">loading…</div>
+          <div class="role-graph-body" id="role-graph-body"></div>
+        </aside>
+
+        <aside id="subsession-panel" class="panel subsession-panel hidden">
+          <header class="panel-header">
+            <h2>Subsession</h2>
+            <button id="subsession-close" type="button">×</button>
+            <span class="subsession-label" id="subsession-label"></span>
+          </header>
+          <div class="subsession-body" id="subsession-body">loading…</div>
+        </aside>
 
       <footer class="statusbar">
         <span id="footer-msg">ready</span>

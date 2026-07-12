@@ -1,35 +1,74 @@
 # latte-agent
 
-A multi-role agent CLI that runs single-role REPL chats (`chat`) and
-multi-role discussions (`discuss`) over a configurable set of models
-(Anthropic, OpenAI, DeepSeek, Ollama, …).
+多角色 AI Agent 运行时，支持单角色 REPL 聊天（`chat`）、多角色讨论（`discuss`）、
+Web UI 界面（`ui`）、以及 AI 自调试（self-loop），兼容多种后端模型
+（Anthropic、OpenAI、DeepSeek、Ollama、Google Gemini 等）。
 
-## Quick start
+---
+
+## 快速开始
 
 ```bash
-# Resolve deps and build
+# 编译
 cargo build --release
 
-# Single-role chat
+# 单角色聊天
 latte-agent chat -r manager -t standard
 
-# Multi-role discussion
-latte-agent discuss --topic "Design REST API" \
+# 多角色讨论
+latte-agent discuss --topic "设计 REST API" \
     --roles pm,architect,programmer,reviewer
 
-# Run a specific workflow from config/workflows/
+# 运行工作流
 latte-agent workflow design-review --input docs/design.md
 ```
 
-## Configuration
+---
 
-Three-layer config: **CLI flags** > **project** (`config/agents.toml`,
-`config/models.toml`) > **global** (`~/.latte/models.yaml`).
-Identical `model.id` entries merge by filling empty fields — the
-project wins on `api_key` when both layers define one.
+## Web UI
+
+```bash
+# 生产模式（先构建前端）
+cd latte-agent-cli/ui && pnpm build && cd ../..
+latte-agent ui
+
+# 开发模式（hot-reload）
+latte-agent ui --dev
+```
+
+默认地址：`http://localhost:4567`。
+
+### UI 面板
+
+| 面板 | 功能 |
+|---|---|
+| Chat | 对话界面，支持角色切换、多角色委派、子会话查看 |
+| Trace | 调试事件查看器，浏览 `$LATTE_HOME/traces/` 下的 JSONL 日志 |
+| Self-Loop | AI 自调试循环：输入任务描述，AI 自动截图、修改、验证 |
+| Role Graph | 角色 × 工具代码关系图 |
+
+### UI 测试
+
+```bash
+# 先启动服务
+cd ~/Documents/latte/latte-code-editor
+LATTE_AGENT_DELEGATE_TIMEOUT_SECS=600 ../latte-rs-agents/target/debug/latte-agent ui
+
+# 另一个终端运行测试
+cd latte-rs-agents/latte-agent-cli/ui
+pnpm exec playwright test                     # 全部 13 个 e2e 测试
+pnpm exec playwright test --grep "TDD"        # 仅 TDD 测试
+UI_BASE_URL=http://localhost:5173 pnpm exec playwright test  # vite 开发模式
+```
+
+## 配置
+
+三层配置：**CLI 参数** > **项目配置**（`config/agents.toml` + `config/models.toml`） > **全局配置**（`~/.latte/models.yaml`）。
+
+### 模型配置
 
 ```toml
-# config/models.toml — tier→model mapping + role overrides
+# config/models.toml
 [models.tiers]
 premium  = "claude-opus-4-20250514"
 standard = "claude-sonnet-4-20250514"
@@ -41,103 +80,137 @@ standard = "deepseek-v4-flash"
 budget   = "deepseek-chat"
 ```
 
+### 角色配置
+
 ```toml
-# config/agents.toml — role definitions
+# config/agents/manager.toml
 [roles.manager]
 id = "manager"
+name = "Engineering Manager"
 category = "planning"
 model_tier = "premium"
 prompt_file = "prompts/manager.md"
-temperature = 0.5
-tools = ["read", "list", "search"]
+temperature = 0.2
+tools = ["delegate"]
 icon = "👔"
-model_chain = ["deepseek-v4-flash"]   # fallbacks appended after this
+model_chain = ["deepseek-v4-flash"]
+skills = []  # 可添加 screenshot_skill 等
 ```
 
-The `manager` role delegates to specialists via the `delegate` tool —
-programmer, architect, reviewer, tester, security, devops, designer,
-tech_writer, pm — each configured in the same `agents.toml`.
+`manager` 角色通过 `delegate` 工具派发任务给专业角色——
+programmer、architect、reviewer、tester、security、devops、designer、tech_writer、pm。
 
-## Debugging & observability
+## Skill 系统
 
-`latte-agent` ships a full-chain observability layer. Enable on any
-chat or discuss run with `--debug`:
+Skill 是扩展 Agent 能力的指令模块。在角色 TOML 中声明，运行时追加到 system prompt。
+
+```toml
+# 在角色配置中启用 skill
+[roles.programmer]
+skills = ["screenshot_skill"]
+```
+
+### 内建角色
 
 ```bash
-latte-agent chat --debug                                   # pretty on tty, jsonl when piped
-latte-agent chat --debug --debug-format jsonl              # force jsonl
-latte-agent chat --debug --debug-hooks redact_pii,enforce_tool_allowlist
-latte-agent chat --no-session-index                        # skip the always-on index sink
+latte-agent chat -r manager          # 工程经理（PM 驱动多角色）
+latte-agent chat -r programmer       # 软件工程师
+latte-agent chat -r architect        # 系统架构师
+latte-agent chat -r reviewer         # 代码审查
+latte-agent chat -r tester           # 测试工程师
+latte-agent chat -r security         # 安全审计
+latte-agent chat -r devops           # DevOps
+latte-agent chat -r designer         # UI/UX 设计师
+latte-agent chat -r tech_writer      # 技术文档撰写
+latte-agent chat -r pm               # 产品经理
+latte-agent chat -r mcp_agent        # MCP 协议 Agent
 ```
 
-When `--debug` is on, every chat writes:
+---
 
-- A **pretty** event stream to **stdout** (or jsonl with `--debug-format jsonl`)
-- A **full JSONL trace** to `~/.latte/traces/<role>.jsonl`
-- A **metadata-only index** to `~/.latte/sessions/<role>.idx` (always
-  on, unless `--no-session-index` is set)
+## API 参考
 
-The always-on index is small (one line per event, no content fields)
-and gives `latte-agent debug` retroactive visibility into sessions
-even when they were run without `--debug`.
+Web UI 提供完整的 REST + SSE API，详情见 `docs/api-reference.md`。
 
-### Built-in hooks
-
-Three hooks ship in v1, registered via `--debug-hooks`:
-
-| Hook | Point | Behavior |
+| 端点 | 方法 | 说明 |
 |---|---|---|
-| `redact_pii` | `PreCall` | Replaces phone numbers, emails, AWS keys, and OpenAI keys in outgoing messages with `<REDACTED:type>` placeholders. Hand-rolled regex; no external crate. |
-| `enforce_tool_allowlist` | `PostParse` | Aborts the turn if any parsed tool call names a tool outside the role's allowed list. |
-| `require_tool_call` | `PostResponse` | Aborts if the model emitted neither a `<tool_call` marker nor a substantive response (≥ 20 words by default). |
+| `/health` | GET | 健康检查 |
+| `/api/sessions` | GET | 列出活跃会话 |
+| `/api/sessions` | POST | 创建新会话 |
+| `/api/session` | GET | 获取会话详情 |
+| `/api/roles` | GET | 列出角色 |
+| `/api/chat/send` | POST | 发送消息 |
+| `/api/chat/command` | POST | 斜杠命令 |
+| `/api/chat/role` | POST | 切换角色 |
+| `/api/events` | GET | SSE 事件流 |
+| `/api/traces` | GET | 列出 trace |
+| `/api/traces/:id` | GET | 读取 trace |
+| `/api/subsessions` | GET | 子会话日志 |
+| `/api/self-loop/start` | POST | 启动自调试 |
+| `/api/self-loop/events` | GET | 自调试 SSE |
+| `/api/self-loop/stop` | POST | 停止自调试 |
+| `/api/role-graph` | GET | 角色工具关系图 |
+
+---
+
+## 调试与可观测
+
+```bash
+# 启用调试追踪
+latte-agent chat --debug
+latte-agent chat --debug --debug-format jsonl
+
+# 调试子命令（只读，不调用模型 API）
+latte-agent debug sessions                       # 列出所有会话
+latte-agent debug parse "<tool_callbash/>"       # 重解析器
+latte-agent debug prompt --role manager          # 构建 system prompt
+latte-agent debug session <id>                   # 打印所有事件
+latte-agent debug trace <id>                     # 时间线 + 时延
+latte-agent debug tokens <id>                    # Token 用量汇总
+latte-agent debug replay <id>                    # 重放历史解析
+```
+
+### 调试 Hook
 
 ```bash
 latte-agent chat --debug --debug-hooks redact_pii,enforce_tool_allowlist,require_tool_call
 ```
 
-### `latte-agent debug` subcommand set
+| Hook | 作用点 | 行为 |
+|---|---|---|
+| `redact_pii` | PreCall | 替换出站消息中的手机号、邮箱、API key |
+| `enforce_tool_allowlist` | PostParse | 仅允许角色白名单中的工具调用 |
+| `require_tool_call` | PostResponse | 如果模型没有实质性输出则中止 |
 
-The `debug` subcommands are **read-only** against the on-disk trace
-store and **never call any model API**. They take seconds, not
-minutes, so iteration is fast:
+---
 
-```bash
-latte-agent debug sessions                       # list all known sessions
-latte-agent debug parse "<tool_callbash/>"       # re-run the parser on text
-latte-agent debug prompt --role manager         # build the system prompt
-latte-agent debug session <session-id>          # print all events for a session
-latte-agent debug session <id> --kind model     # filter by event kind
-latte-agent debug tokens <id>                   # token usage summary
-latte-agent debug trace <id>                    # timeline with latencies
-latte-agent debug replay <id>                    # re-parse stored raw outputs
+## 架构
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    latte-agent-cli                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐  │
+│  │ chat     │  │ discuss  │  │ ui (axum + SSE)      │  │
+│  └────┬─────┘  └────┬─────┘  └──────────┬───────────┘  │
+│       │              │                   │              │
+├───────┴──────────────┴───────────────────┴──────────────┤
+│                  latte-agent-core                        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐  │
+│  │ ChatCon  │  │ Agent    │  │ Config (TOML)        │  │
+│  │ troller  │  │ Runner   │  │ prompts, models      │  │
+│  ├──────────┤  ├──────────┤  ├──────────────────────┤  │
+│  │ Session  │  │ Trace    │  │ HookChain            │  │
+│  │ Manager  │  │ Sink     │  │ (redact, allowlist)  │  │
+│  └──────────┘  └──────────┘  └──────────────────────┘  │
+├────────────────────────────────────────────────────────┤
+│  latte-agent-orchestrator                               │
+│  (多角色调度、RoundScheduler、Supervisor)              │
+└────────────────────────────────────────────────────────┘
 ```
 
-Use `debug replay` to iterate on hook strategies against historical
-traces before deploying them to a live session.
+### 运行流程
 
-### What gets traced
-
-Every `TraceEvent` carries a `TraceMeta` (turn, role, ts, session_id)
-plus a payload. Nine variants cover the run_turn lifecycle:
-
-| Event | When | Payload |
-|---|---|---|
-| `SessionStart` / `SessionEnd` | lifecycle | tier, model chain, allowed tools / totals |
-| `PromptBuilt` | before model call | system prompt (full), user input, est tokens |
-| `ModelCall` / `ModelRawOut` | model round-trip | model id, latency, params json, finish reason / raw content (full) |
-| `ParseToolCalls` | after extract_tool_calls | raw slice, parsed calls, diagnostics |
-| `ToolExec` | around `tm.execute` | resolved name, args json, latency, status (ok/err) |
-| `HookFired` | every hook invocation | hook name, point, outcome kind |
-| `TurnEnd` | exit | total input/output/thinking tokens, elapsed ms |
-
-Specialist runs (manager → programmer/architect/etc.) inherit the
-manager's sink via `ScopedSink`, which overrides `meta.role` on every
-emitted event so manager and specialist events are distinguishable in
-the same trace file.
-
-## Architecture
-
-```text
+```
 AgentConfig (TOML) ──▶ ModelResolver ──▶ Agent ──▶ AgentRunner
         │                    │                │            │
    roles + models      tier→model       client+tools   run_turn()
@@ -151,130 +224,73 @@ AgentConfig (TOML) ──▶ ModelResolver ──▶ Agent ──▶ AgentRunner
                                               PreTool, PostTool)
 ```
 
-`AgentRunner::run_turn` emits `TraceEvent` at 5 sites and runs the
-`HookChain` at 5 points. `HookOutcome::Abort` surfaces as
-`AgentError::HookAborted`.
+## 移植（latte-code-editor）
 
-## Workspace layout
+详情见 `docs/porting-guide.md`。`latte-code-editor` 通过 Cargo path 依赖引入 `latte-agent-core`，
+用 Tauri IPC 替代 axum SSE，React 替代 vanilla DOM 渲染。
+
+```bash
+# latte-code-editor Cargo.toml
+latte-agent-core = { path = "../../latte-rs-agents/latte-agent-core" }
+```
+
+---
+
+## 工作区结构
 
 ```
 latte-rs-agents/
-├── Cargo.toml                       workspace root
+├── Cargo.toml                      # workspace root
 ├── config/
-│   ├── agents.toml                  roles + tools + prompts
-│   ├── models.toml                  tier mappings + model catalog
-│   ├── workflows/                   discussion workflow templates
-│   └── README.md                    per-file format docs
-├── prompts/                         system prompt templates (one per role)
-├── latte-agent-core/                 runtime: agent, runner, hooks, trace
-├── latte-agent-orchestrator/        multi-role discussion logic
-├── latte-agent-cli/                  `latte-agent` binary
-└── latte-rs-model-router/            (legacy) provider clients
+│   ├── agents/                     # 角色 TOML 配置（每个角色一个文件）
+│   ├── models.toml                 # 模型层映射
+│   └── workflows/                  # 讨论工作流模板
+├── prompts/                        # 角色 prompt + skill 文件
+├── latte-agent-core/               # 核心运行时
+├── latte-agent-orchestrator/       # 多角色调度逻辑
+├── latte-agent-cli/                # CLI 二进制 + Web UI 入口
+│   └── ui/                         # 前端（Vanilla TS + Vite）
+│       ├── src/                    # TypeScript 源码
+│       └── __tests__/              # Playwright e2e 测试
+├── docs/
+│   ├── api-reference.md            # API 文档
+│   ├── porting-guide.md            # latte-code-editor 移植指南
+│   └── skill-system.md             # Skill 系统文档
+└── .latte/                         # 项目级配置（可选）
 ```
 
-## Status
+---
 
-This project has completed:
+## 状态
 
-- **Tasks 1-8** (commit `8c2f2b1`): `TraceSink` infrastructure
-  (`NullSink`, `JsonlSink`, `StdoutSink`, `IndexSink`, `FanoutSink`,
-  `ScopedSink`), full `TraceEvent` enum (9 variants), `Hook` trait +
-  `HookChain`, three built-in hooks (`RedactPii`, `EnforceToolAllowlist`,
-  `RequireToolCall`).
-- **Task 9** (commit `a6e3503`): `AgentRunner` gained `sink`,
-  `hooks`, `role_id` fields with builder methods.
-- **Tasks 10-11** (commit `1d9fb65`): `run_turn` emits at 5 sites and
-  runs hooks at 5 points; `delegate` tool wraps manager sink in
-  `ScopedSink` so specialist events appear under their own role.
-- **Task 12** (commit `e6f1163` + closeout `eddca2a`): `latte-agent
-  debug` subcommand set (7 subcommands) + `--debug*` flag wiring on
-  `chat` and `discuss`.
-- **Task 13** (commit `b9ef153`): `--debug` wiring on `discuss`.
+已完成的里程碑：
 
-The end-to-end loop (`DISCOVER → PLAN → EXECUTE → VERIFY → ITERATE`)
-that this plan enables is exercised by running the system against a
-real workload and inspecting `~/.latte/traces/*.jsonl` with
-`latte-agent debug trace <id>`.
+- **基础 CLI**：单角色 `chat` + 多角色 `discuss`
+- **Web UI**：axum HTTP server + SSE 事件流 + Chat/Trace/Self-Loop/RoleGraph 面板
+- **Trace 系统**：`TraceSink`（NullSink / JsonlSink / StdoutSink / IndexSink / FanoutSink）
+- **调试子命令**：7 个 `latte-agent debug *` 子命令
+- **HookChain**：3 个内建 hook（redact_pii / enforce_tool_allowlist / require_tool_call）
+- **HIL Blackboard**：git worktree + plan.md 的多角色 HIL 会话
+- **AI Self-Loop**：AI 自动截图 → 修改 → 验证的闭环
+- **Skill 系统**：基于 TOML 配置的 skill 加载框架
+- **Porting Bridge**：`latte-code-editor` 的 Tauri 集成接口
 
-## HIL Blackboard (v1)
+---
 
-Run a multi-role agent session inside a git worktree with a `plan.md` blackboard, support for `/pause` + `/resume`, and `@<role>` injection routed to a specific specialist:
+## 构建说明
 
 ```bash
-# Start a session (auto-creates the worktree + plan.md)
-latte-agent run --task-id fix-redis-bug --initial-prompt "Redis pool doesn't recycle after 5xx"
+# 完整构建
+cargo build --release
 
-# Open the HIL REPL
-latte-agent chat --task-id fix-redis-bug --roles manager,programmer,reviewer
+# 仅核心库（用于 latte-code-editor 等下游）
+cargo build -p latte-agent-core
 
-# In the REPL:
-#   > look at the redis pool
-#   > /pause                  # exits; state persisted to .latte/sessions/<id>.json
-#   > @programmer check this  # queues a message for programmer's next turn
-#   > /resume                 # (only valid if state is Paused)
-#   > /quit                   # marks the session Done
+# 前端构建
+cd latte-agent-cli/ui
+pnpm install
+pnpm build
 
-# Resume from outside the REPL
-latte-agent chat --task-id fix-redis-bug
-
-# Inject from another terminal
-latte-agent inject --task-id fix-redis-bug --role programmer --message "..."
-
-# Pause / resume from outside the REPL
-latte-agent pause  --task-id fix-redis-bug
-latte-agent resume --task-id fix-redis-bug
-
-# Surgical rollback: reset the worktree code, keep plan.md and trace
-latte-agent checkpoint rollback --task-id fix-redis-bug --id 3
-
-# Archive + cleanup
-latte-agent run --task-id fix-redis-bug --archive --cleanup
+# 运行全部测试
+cd latte-agent-cli/ui && pnpm exec playwright test
 ```
-
-The worktree lives at `<repo>/.latte/worktrees/<task-id>/`; the base
-branch HEAD stays clean for the entire session. Session state is
-persisted atomically to `<worktree>/.latte/sessions/<id>.json` and is
-human-readable / hand-editable (operators can delete "毒药消息" while
-paused). Six new `TraceEvent` variants (`SessionStarted`, `SessionPaused`,
-`SessionResumed`, `RoleInjected`, plus the inherited `CheckpointCreated` and
-`CheckpointRolledBack` from the `WorkspaceManager`/`CheckpointEngine`
-modules) land in `~/.latte/traces/<id>.jsonl`.
-
-See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v1-design.md`
-for the design and `docs/superpowers/plans/2026-06-28-latte-hil-blackboard-v1-impl.md`
-for the implementation plan.
-
-## HIL Blackboard v1.1 (peer discussion)
-
-v1.1 extends `chat --task-id` with a round-robin peer discussion scheduler. Each round, every role speaks once (alphabetical order, with manager last as the natural summary position). Specialists see only their own H2-tagged slice of `plan.md` plus the initial-prompt header (selective injection — saves tokens as the discussion grows).
-
-```bash
-# Round-robin mode (default: 10 rounds, 50K token budget)
-latte-agent chat --task-id fix-redis-bug --roles manager,programmer,reviewer \
-    --initial-prompt "Redis pool doesn't recycle after 5xx"
-
-# v1-compat manager-dispatch-only mode
-latte-agent chat --task-id fix-redis-bug --max-rounds 0
-
-# Disable ask_human (escape hatch for users who don't want pauses)
-latte-agent chat --task-id fix-redis-bug --no-ask-human
-
-# Tighten the token budget
-latte-agent chat --task-id fix-redis-bug --session-token-budget 10000
-```
-
-New in v1.1:
-- `ask_human` tool — a specialist that needs clarification calls it; the session auto-pauses, the REPL shows the question, the human's reply is appended to that role's history
-- Session-level Supervisor — auto-pauses on token-budget exceeded or dead-loop (same role, same decision, 3 turns in a row)
-- 3 new `TraceEvent` variants: `AskHuman`, `RoundStarted`, `RoundEnded`
-
-See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v11-design.md` for the design and `docs/superpowers/plans/2026-06-28-latte-hil-blackboard-v11-impl.md` for the implementation plan.
-
-## Roadmap
-
-Per spec `docs/superpowers/specs/2026-06-25-latte-agent-debug-observability-design.md` §3:
-
-- **Checkpoint / node-level retry** — the v1 of the HIL Blackboard
-  system ships in this release (see the "HIL Blackboard (v1)"
-  section above). The v2 spec will add full state serialization,
-  restore-from-snapshot, retry budget, and a real `SessionManager`.

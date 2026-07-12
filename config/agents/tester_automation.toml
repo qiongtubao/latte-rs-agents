@@ -1,0 +1,10 @@
+[roles.tester_automation]
+id = "tester_automation"
+name = "Test Automation Engineer"
+category = "verification"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/tester_automation.md"
+temperature = 0.3
+tools = ["read", "list", "bash", "search", "playwright", "delegate"]
+icon = "🤖"

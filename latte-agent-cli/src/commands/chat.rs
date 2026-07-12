@@ -16,7 +16,7 @@ use latte_agent_core::session::SessionManager;
 /// Max concurrent `delegate` tool calls per manager session.
 const DEFAULT_DELEGATE_CONCURRENCY: usize = 4;
 /// Per-specialist wall-clock timeout in seconds.
-const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 300;
 
 use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
@@ -256,6 +256,7 @@ impl ChatCmd {
             &debug_flags,
             // Legacy single-role REPL — no HIL session.
             None,
+            &std::env::current_dir()?,
         )
         .await
         {
@@ -602,6 +603,7 @@ impl ChatSession {
                     &self.debug_flags,
                     // Legacy /role switch — no HIL session.
                     None,
+                    &std::env::current_dir()?,
                 )
                 .await
                 {
@@ -660,6 +662,7 @@ impl ChatSession {
                             &self.debug_flags,
                             // Legacy /model switch — no HIL session.
                             None,
+                            &std::env::current_dir()?,
                         )
                         .await
                         {
@@ -824,13 +827,16 @@ async fn build_runner(
     // a HIL-only feature (manager doesn't need it; it delegates
     // instead).
     session: Option<Arc<tokio::sync::Mutex<latte_agent_core::session::SessionManager>>>,
+    // Working directory the runner should treat as ground truth for
+    // system-prompt env injection (matches the process's actual cwd).
+    cwd: &std::path::Path,
 ) -> AnyResult<(AgentRunner, String)> {
     let template = merged
         .roles
         .get(role_id)
         .ok_or_else(|| format!("role '{}' not found", role_id))?
         .clone();
-    let role = template.resolve(default_params).await?;
+    let mut role = template.resolve(default_params).await?;
      let models = if let Some(id) = primary_id {
         // `-m` flag: pin the head of the chain to a specific model
         // (matched by `id` first, then by `name` case-insensitive, so
@@ -865,8 +871,6 @@ async fn build_runner(
         )
         .into());
     }
-    let mut role = role;
-
     if !role.allowed_tools.is_empty() {
         // Append a tool-usage section to the system prompt so the
         // model knows it can call tools and how. The model emits
@@ -878,8 +882,14 @@ async fn build_runner(
         if role_id == "manager" {
             prompt.push_str(&DELEGATE_TOOL_HINT);
         }
-
+        prompt.push_str(&latte_agent_core::ground_truth::ground_truth_block(cwd));
         role.system_prompt.push_str(&prompt);
+    } else {
+        // No tools but still inject the env so the model sees real cwd
+        // / host and doesn't hallucinate paths on direct-answer turns.
+        role.system_prompt.push_str(
+            &latte_agent_core::ground_truth::ground_truth_block(cwd),
+        );
     }
     let agent = Agent::new_with_chain(
         role_id.to_string(),
@@ -1722,6 +1732,7 @@ async fn run_hil_chat(
             cmd.model_id.as_deref(),
             &debug_flags,
             session_arg,
+            &std::env::current_dir()?,
         )
         .await?;
         // Wire the per-role inject queue drain path. With

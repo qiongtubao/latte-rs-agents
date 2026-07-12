@@ -1,0 +1,18 @@
+name = "code_review"
+description = "多角度代码审查：覆盖安全、风格与逻辑。"
+max_rounds = 1
+
+[[steps]]
+id = "explain"
+speakers = ["programmer"]
+prompt = "解释 {{code_path}} 处的代码变更。改了什么，为什么改？"
+
+[[steps]]
+id = "review"
+speakers = ["reviewer", "security", "tester"]
+prompt = "审查上面描述的代码变更。Reviewer：模式与代码质量。Security：漏洞。Tester：边界用例和测试覆盖缺口。"
+
+[[steps]]
+id = "respond"
+speakers = ["programmer"]
+prompt = "回应审查反馈。对每一条意见，要么接受并解释修复方案，要么讲清楚理由反驳。"

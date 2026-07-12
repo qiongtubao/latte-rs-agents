@@ -75,6 +75,7 @@ pub struct Resolved {
     pub config: AgentConfig,
     pub resolver: ModelResolver,
     pub sources: ResolvedSources,
+    pub discussion: DiscussionConfig,
 }
 
 /// Load the merged config and build a `ModelResolver` from it.
@@ -86,6 +87,52 @@ pub struct Resolved {
 /// [`AgentConfig::load_with_global`].
 ///
 /// The CLI overrides are applied last and on top of everything.
+
+/// 项目讨论配置，从 `.latte/discussion.toml` 自动加载。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct DiscussionConfig {
+    pub default_workflow: Option<WorkflowDef>,
+    #[serde(default)]
+    pub default_roles: Vec<String>,
+    #[serde(default)]
+    pub steps: Vec<StepDef>,
+    #[serde(default)]
+    pub role_hierarchy: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkflowDef {
+    pub name: String,
+    pub description: Option<String>,
+    pub max_rounds: Option<u32>,
+    pub context_token_budget: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StepDef {
+    pub id: String,
+    pub speakers: Vec<String>,
+    pub prompt: String,
+}
+
+/// 自动加载项目目录下的 `.latte/discussion.toml`。
+pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig {
+    let path = project_dir.join(".latte/discussion.toml");
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match toml::from_str(&content) {
+                Ok(cfg) => {
+                    eprintln!("[config] loaded discussion config from {}", path.display());
+                    return cfg;
+                }
+                Err(e) => eprintln!("[config] failed to parse {}: {e}", path.display()),
+            },
+            Err(e) => eprintln!("[config] failed to read {}: {e}", path.display()),
+        }
+    }
+    DiscussionConfig::default()
+}
+
 pub fn load(
     project_agents: Option<&str>,
     project_models: Option<&str>,
@@ -194,10 +241,14 @@ pub fn load(
 
     let resolver = ModelResolver::from_config(&merged)?;
 
+    // Load project discussion config
+    let discussion = load_discussion_config(project_agents.map(|p| std::path::Path::new(p).parent().unwrap_or(std::path::Path::new("."))).unwrap_or(std::path::Path::new(".")));
+
     Ok(Resolved {
         config: merged,
         resolver,
         sources,
+        discussion,
     })
 }
 

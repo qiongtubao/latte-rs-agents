@@ -105,6 +105,11 @@ pub struct RoleTemplate {
     pub tools: Vec<String>,
     #[serde(default)]
     pub icon: String,
+    /// Additional skill files (*.md) loaded on top of the main prompt.
+    /// Each skill file is appended to the system prompt with a heading.
+    /// Example: `skills = ["screenshot_skill"]` loads `prompts/screenshot_skill.md`.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 impl RoleTemplate {
@@ -175,6 +180,18 @@ impl RoleTemplate {
                 ),
             },
         };
+
+        // Load skills: append each skill file content to system prompt
+        let mut system_prompt = system_prompt;
+        for skill_name in &self.skills {
+            let skill_paths = [
+                format!("prompts/{skill_name}.md"),
+                format!("{}/prompts/{skill_name}.md", std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default()),
+            ];
+            let skill_content = skill_paths.iter()
+                .find_map(|p| std::fs::read_to_string(p).ok())
+                .or_else(|| crate::prompts::for_skill(skill_name).map(String::from));
+        }
 
         Ok(Role {
             id: self.id.clone(),

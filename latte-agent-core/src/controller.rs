@@ -27,10 +27,11 @@ use crate::error::AgentError;
 use crate::model_resolver::{ModelResolver, ModelTier};
 use crate::scheduler::{plan_md_slice_for, RoundScheduler};
 use crate::session::{SessionManager, SessionRecord, SessionState};
+use crate::subsession::SubsessionStore;
 use crate::supervisor::{Supervisor, SupervisorConfig};
+use crate::trace::FanoutSink;
 use crate::workspace::WorkspaceManager;
 use crate::AgentResult;
-
 fn truncate_event_text(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -161,23 +162,30 @@ pub enum ChatEvent {
     /// Emitted before the specialist runner starts so the UI can
     /// show "manager → programmer" without waiting for the
     /// (potentially multi-minute) specialist turn to complete.
+    /// `sub_id` is a unique id for the subsession; the UI can
+    /// `GET /api/sessions/{id}/subsessions/{sub_id}` to fetch the
+    /// specialist's full internal transcript (tool calls, intermediate
+    /// replies) — main chat only sees the final summary.
     DelegateStarted {
         from_role: String,
         to_role: String,
         task: String,
+        sub_id: String,
     },
     /// Specialist returned (or failed/timeout). `status` is one of
     /// `"ok" | "failed" | "timeout" | "cancelled"`. `summary` is the
     /// specialist's last assistant turn on success, or the error
     /// message on failure — suitable for showing in the activity
     /// stream and for the manager to consume as the tool result.
+    /// `sub_id` matches the `DelegateStarted.sub_id` so the UI can
+    /// look up the full subsession transcript via `/api/sessions/...`.
     DelegateFinished {
         from_role: String,
         to_role: String,
         status: String,
         summary: String,
+        sub_id: String,
     },
-    /// Tool execution failed.
     ToolError {
         role_id: String,
         tool_name: String,
@@ -243,6 +251,13 @@ pub struct ControllerConfig {
     pub initial_history: Vec<latte_ai::models::Message>,
     /// Current working directory (for worktree resolution).
     pub cwd: PathBuf,
+    /// Shared store for per-task subsessions. Each delegate tool call
+    /// allocates one entry under `(cwd_session, sub_id)` and stores
+    /// the specialist's full TraceEvent stream so the UI can fetch it
+    /// for "show contents". Owned by the caller (e.g. UiCmd::run);
+    /// a single Arc is shared across all controllers regardless of
+    /// tab/session, so GC works uniformly per process.
+    pub subsession_store: Arc<SubsessionStore>,
 }
 
 // ─── Controller ──────────────────────────────────────────────────
@@ -673,6 +688,7 @@ async fn run_multi_role_loop(
             Some(session_arc.clone()),
             event_tx,
             &config.cwd,
+            config.subsession_store.clone(),
         )
         .await
         {
@@ -1066,10 +1082,11 @@ async fn run_single_role_loop(
         tier,
         config.primary_model_id.as_deref(),
         None,
-        event_tx,
-        &config.cwd,
-    )
-    .await
+            event_tx,
+            &config.cwd,
+            config.subsession_store.clone(),
+        )
+        .await
     {
         Ok(r) => r,
         Err(e) => {
@@ -1129,10 +1146,10 @@ async fn run_single_role_loop(
         tokio::select! {
             input = input_rx.recv() => {
                 match input {
+                    None => break,
                     Some(ControllerInput::Input(text)) => {
                         let trimmed = text.trim().to_string();
                         if trimmed.is_empty() {
-                            continue;
                         }
 
                         if trimmed.starts_with('/') {
@@ -1159,16 +1176,14 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner;
                                             current_role = rid.clone();
-                                            let _ = event_tx.send(ChatEvent::Status {
-                                                message: format!("Switched to role '{rid}' (tier {})", current_tier.label()),
-                                            });
                                             let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                             let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                                            let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
                                             let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                                         }
                                         Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("switch role failed: {e}") }); }
@@ -1183,7 +1198,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner;
@@ -1193,28 +1208,8 @@ async fn run_single_role_loop(
                                                 Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("switch model failed: {e}") }); }
                                             }
                                         }
-                                        Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("invalid tier: {e}") }); }
+                                        Err(e) => { let _ = event_tx.send(ChatEvent::Status { message: format!("invalid tier: {e}") }); }
                                     }
-                                }
-                                "/clear" => {
-                                    runner.context_mut().clear();
-                                    let _ = event_tx.send(ChatEvent::ContextCleared);
-                                }
-                                "/status" => {
-                                    let _mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
-                                    let chain_ids: Vec<String> = runner.agent().model_chain.iter().map(|mc| mc.model.id.clone()).collect();
-                                    let usage = runner.total_usage();
-                                    let _ = event_tx.send(ChatEvent::Status {
-                                        message: format!("role: {} | tier: {} | chain: {} | tokens: in={} out={} ctx={}",
-                                            current_role, current_tier.label(), chain_ids.join(" → "),
-                                            usage.input_tokens, usage.output_tokens, runner.context().messages().len()),
-                                    });
-                                }
-                                "/tools" => {
-                                    let allowed = &runner.agent().role.allowed_tools;
-                                    let _ = event_tx.send(ChatEvent::Status {
-                                        message: if allowed.is_empty() { "no tools configured for this role".into() } else { format!("allowed tools: {}", allowed.join(", ")) },
-                                    });
                                 }
                                 "/history" => {
                                     let msgs = runner.context().messages();
@@ -1230,7 +1225,7 @@ async fn run_single_role_loop(
                             }
                             continue;
                         }
-
+                    
                         // Run the turn
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
@@ -1289,7 +1284,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner;
@@ -1304,7 +1299,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner;
@@ -1323,12 +1318,9 @@ async fn run_single_role_loop(
                     Some(ControllerInput::Abort) | None => break,
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
         }
     }
 }
-
-// ─── Runner builder ──────────────────────────────────────────────
 
 async fn build_runner(
     merged: &AgentConfig,
@@ -1340,6 +1332,9 @@ async fn build_runner(
     session: Option<Arc<Mutex<SessionManager>>>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cwd: &Path,
+    // Process-wide subsession store. Arc'd so the caller can pass a
+    // clone to register_delegate_tool without lifetime headaches.
+    subsession_store: Arc<SubsessionStore>,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -1370,20 +1365,33 @@ async fn build_runner(
     }
     let mut role = role;
 
+    // Append the tool-call protocol + (for manager) the delegate hints.
+    let mut prompt = String::new();
     if !role.allowed_tools.is_empty() {
-        let mut prompt = tool_usage_prompt(&role.allowed_tools);
-        if role_id == "manager" {
+        prompt.push_str(&tool_usage_prompt(&role.allowed_tools));
+        // Any role with "delegate" in its tools gets the delegation capability
+        if role.allowed_tools.iter().any(|t| t == "delegate") {
             prompt.push_str(DELEGATE_TOOL_HINT);
         }
-        role.system_prompt.push_str(&prompt);
     }
+    // Every role — tools or no tools — gets the system ground truth
+    // (cwd, host, time). When the user asks about runtime state
+    // ("current directory?", "pwd?", …) the model sees real values
+    // instead of guessing from training data. This is structural
+    // ground-truth injection: we *give* the model the fact, we don't
+    // *forbid* hallucinations.
+    prompt.push_str(&crate::ground_truth::ground_truth_block(cwd));
+    role.system_prompt.push_str(&prompt);
 
     let agent = Agent::new_with_chain(role_id.to_string(), role.clone(), models, default_params.clone())?;
 
     if !role.allowed_tools.is_empty() {
         let tm = build_tool_manager(&role.allowed_tools).await
             .map_err(|e| AgentError::Tool(format!("build tool manager '{role_id}': {e}")))?;
-        if role_id == "manager" {
+        // Any role with "delegate" in allowed_tools gets the delegate tool registered,
+        // enabling nested subsessions (roleA delegates to roleB, roleB can also delegate)
+        if role.allowed_tools.iter().any(|t| t == "delegate") {
+            let sid = cwd.to_string_lossy().into_owned();
             register_delegate_tool(
                 &tm,
                 merged,
@@ -1391,20 +1399,12 @@ async fn build_runner(
                 default_params.clone(),
                 event_tx.clone(),
                 cwd.to_path_buf(),
+                subsession_store.clone(),
+                sid,
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
         }
-        if role_id != "manager" {
-            if let Some(session_arc) = session {
-                register_ask_human_tool(&tm, session_arc, role_id.to_string());
-            }
-        }
-        // The runner is wired with the workspace's cwd so path-aware
-        // tools (`shell.exec`, `file.read`, …) chdir into the
-        // workspace the user opened — not `src-tauri/` (the Tauri
-        // process cwd). See `AgentRunner::with_cwd` + the
-        // `ToolExecutionContext.metadata.cwd` thread in `agent.rs`.
         Ok((
             AgentRunner::new_with_tools(agent, tm, 16)
                 .with_role(role_id)
@@ -1434,10 +1434,17 @@ async fn build_tool_manager(
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
+    // bash → exec alias
     for alias in &["bash"] {
         if keep.contains(*alias) || keep.contains(&alias.to_lowercase()) {
             keep.insert("exec".to_string());
         }
+    }
+    // mcp → mcp_* tool aliases
+    if keep.contains("mcp") || keep.contains("mcp_connect") {
+        keep.insert("mcp_connect".to_string());
+        keep.insert("mcp_list".to_string());
+        keep.insert("mcp_call".to_string());
     }
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
@@ -1452,61 +1459,50 @@ async fn build_tool_manager(
 }
 
 fn tool_usage_prompt(allowed: &[String]) -> String {
-    let real_names: Vec<String> = allowed
-        .iter()
+    let real_names: Vec<String> = allowed.iter()
         .map(|s| match s.as_str() {
             "bash" => "exec".to_string(),
+            "playwright" => "playwright_screenshot".to_string(),
+            "mcp" => "mcp_connect".to_string(),
             other => other.to_string(),
         })
         .collect();
-    let tool_list = real_names.join(", ");
+    let names_str = real_names.join(", ");
     format!(
         r#"
 ## Tool calling protocol
 
-When you need to use a tool, emit EXACTLY this format on its own line
-(no markdown, no code fences, no backticks — the raw markers below are
-parsed verbatim by the host):
+You have access to the following tools: {names_str}.
+When you call a tool you MUST output a single line of this exact XML form:
 
 <tool_call>NAME {{"arg": "value"}}</tool_call>
 
-Rules you MUST follow:
-  1. Start with the literal text <tool_call> (no spaces, no backticks).
-  2. Then the tool name and a single space, then a JSON object of args.
-  3. Close with the literal text </tool_call>.
-  4. Do NOT wrap the line in markdown code blocks (```...```) or indent
-     it as a code block — the parser will not see the markers.
-  5. You may emit multiple <tool_call> lines in one response; the host
-     runs them and feeds results back as the next turn.
-  6. When you have enough information to answer, respond in plain text
-     with NO <tool_call> block and the loop ends.
-
-Allowed tool names for this role: {tool_list}.
-
-Examples (raw, copy the format exactly):
+Examples:
 
 <tool_call>read {{"path": "README.md"}}</tool_call>
 <tool_call>search {{"path": "src", "pattern": "TODO", "max_results": 20}}</tool_call>
 "#
     )
 }
-
 const DELEGATE_TOOL_HINT: &str = r#"
+### 关键规则：你必须使用 delegate 工具
 
-### Delegating to specialists
+你**必须**使用 `delegate` 工具来完成任务，**绝不能**直接输出计划而不执行。
 
-For substantive tasks you SHOULD fan out to specialists and
-synthesize. Available specialist roles:
-- `programmer` — code analysis, reading code, understanding
-- `architect` — module structure, dependency graph, design overview
-- (plus the roles from your config)
+正确的流程：
+1. 分析任务 → 决定需要哪些专家
+2. **立即**调用 delegate 工具派发任务
+3. 等专家返回结果
+4. 综合所有结果输出最终答案
 
-### Layered review protocol
+可用专家：programmer(读代码), architect(架构), reviewer(审查), tester(测试), security(安全), designer(设计)
 
-After you receive a specialist's report, run a layered review
-before finalizing your synthesis.
+**错误流程（禁止）：**
+- 只输出计划而不调用 delegate ← 这是最常见的错误！不要这样做！
+- 自己分析而不派发给专家
+
+调用格式：<tool_call>delegate {"role": "programmer", "task": "读取 src/main.ts 的内容"}</tool_call>
 "#;
-
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -1514,8 +1510,9 @@ async fn register_delegate_tool(
     default_params: GenerateParams,
     event_tx: broadcast::Sender<ChatEvent>,
     cwd: PathBuf,
+    subsession_store: Arc<SubsessionStore>,
+    session_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use latte_rs_agent_tools::error::ToolError;
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use std::time::Duration;
     use tokio::sync::Semaphore;
@@ -1524,30 +1521,24 @@ async fn register_delegate_tool(
     let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
-            (
-                "role".into(),
-                ToolInputProperty {
-                    property_type: PropertyType::String,
-                    description: Some("Specialist role id".into()),
-                    enum_values: None,
-                    minimum: None,
-                    maximum: None,
-                    min_length: None,
-                    max_length: None,
-                },
-            ),
-            (
-                "task".into(),
-                ToolInputProperty {
-                    property_type: PropertyType::String,
-                    description: Some("Natural-language task for the specialist".into()),
-                    enum_values: None,
-                    minimum: None,
-                    maximum: None,
-                    min_length: None,
-                    max_length: None,
-                },
-            ),
+            ("role".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("Specialist role id".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+            ("task".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("Natural-language task for the specialist".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
         ]
         .into_iter()
         .collect(),
@@ -1555,36 +1546,27 @@ async fn register_delegate_tool(
         ..Default::default()
     };
 
-    // Per-process concurrency cap for parallel specialist dispatches.
-    // 8 matches the CLI's `chat.rs` default — high enough to overlap
-    // several reads/searches, low enough to stay under most providers'
-    // per-key rate limit.
     let sem = Arc::new(Semaphore::new(8));
-    // Per-specialist wall-clock timeout. Resolution order:
-    //   1. `model.timeout_secs` (per-model override from models.yaml)
-    //   2. LATTE_AGENT_DELEGATE_TIMEOUT_SECS env var
-    //   3. 60s default
     let env_timeout_secs = std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
-    const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 60;
-
-    // Wrap the borrowed `&AgentConfig` in an Arc so the handler
-    // closure can own its own handle (`Send + 'static` requirement
-    // for the boxed future the tool manager drives).
-    let merged = Arc::new(merged.clone());
-    let resolver = Arc::new(resolver.clone());
+    const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 300;
+    let _ = DEFAULT_DELEGATE_TIMEOUT_SECS;
+    let merged_owned = Arc::new(merged.clone());
+    let resolver_owned = Arc::new(resolver.clone());
 
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
-        let merged = Arc::clone(&merged);
-        let resolver = Arc::clone(&resolver);
+        let merged = Arc::clone(&merged_owned);
+        let resolver = Arc::clone(&resolver_owned);
         let default_params = default_params.clone();
         let event_tx = event_tx.clone();
         let cwd = cwd.clone();
         let sem = Arc::clone(&sem);
         let env_timeout = env_timeout_secs;
+        let subsession_store = subsession_store.clone();
+        let session_id = session_id.clone();
         Box::pin(async move {
-            let tool_err = |msg: String| ToolError::Other(msg);
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
             // 1. Parse { role, task } from tool input.
             let role_id = input
@@ -1598,17 +1580,20 @@ async fn register_delegate_tool(
                 .ok_or_else(|| tool_err("missing 'task' field".into()))?
                 .to_string();
 
-            // 2. Emit DelegateStarted so the UI shows the dispatch
-            //    immediately — the specialist turn can take a minute
-            //    and the user needs feedback it has begun.
+            // 2. Allocate a subsession so the specialist's full event
+            //    log is captured. The main chat SSE stream sees only
+            //    DelegateStarted/Finished (the summary); the UI can
+            //    right-click on those events and fetch the
+            //    transcript via /api/sessions/.../subsessions/{sub_id}.
+            let (sub_id, sub_sink) =
+                subsession_store.create(session_id.as_str(), &role_id);
             let _ = event_tx.send(ChatEvent::DelegateStarted {
                 from_role: "manager".into(),
                 to_role: role_id.clone(),
                 task: task.clone(),
+                sub_id: sub_id.clone(),
             });
-
-            // 3. Resolve the specialist's role config + model chain.
-            //    Mirrors the CLI's `chat.rs:1098-1114` flow.
+            let subsession_fanout = FanoutSink::new(vec![sub_sink.clone() as Arc<dyn crate::trace::TraceSink>]);
             let template = merged
                 .roles
                 .get(&role_id)
@@ -1651,6 +1636,7 @@ async fn register_delegate_tool(
                             to_role: role_id.clone(),
                             status: "failed".into(),
                             summary: summary.clone(),
+                            sub_id: sub_id.clone(),
                         });
                         return Err(tool_err(summary));
                     }
@@ -1669,6 +1655,7 @@ async fn register_delegate_tool(
                     to_role: role_id.clone(),
                     status: "failed".into(),
                     summary: summary.clone(),
+                    sub_id: sub_id.clone(),
                 });
                 tool_err(summary)
             })?;
@@ -1707,6 +1694,12 @@ async fn register_delegate_tool(
             //    return the response (or error) to the manager as
             //    the tool result. The manager sees this on its next
             //    turn as a regular `tool_result` message.
+            // 7. Emit DelegateFinished in all terminal states and
+            //    return the response (or error) to the manager as
+            //    the tool result. The manager sees this on its next
+            //    turn as a regular `tool_result` message. The
+            //    `sub_id` is the same handle that was advertised in
+            //    DelegateStarted so the UI can fetch the transcript.
             match run_result {
                 Ok(Ok(response)) => {
                     let _ = event_tx.send(ChatEvent::DelegateFinished {
@@ -1714,6 +1707,7 @@ async fn register_delegate_tool(
                         to_role: role_id.clone(),
                         status: "ok".into(),
                         summary: response.clone(),
+                        sub_id: sub_id.clone(),
                     });
                     // The tool result must be a `serde_json::Value`;
                     // wrap the response string. Manager sees it as
@@ -1727,6 +1721,7 @@ async fn register_delegate_tool(
                         to_role: role_id.clone(),
                         status: "failed".into(),
                         summary: summary.clone(),
+                        sub_id: sub_id.clone(),
                     });
                     Err(tool_err(summary))
                 }
@@ -1740,6 +1735,7 @@ async fn register_delegate_tool(
                         to_role: role_id.clone(),
                         status: "timeout".into(),
                         summary: summary.clone(),
+                        sub_id: sub_id.clone(),
                     });
                     Err(tool_err(summary))
                 }
@@ -1977,6 +1973,7 @@ mod tests {
             from_role: "manager".into(),
             to_role: "programmer".into(),
             task: "read the project structure".into(),
+            sub_id: "programmer-sub-1".into(),
         };
         let json = serde_json::to_value(&event).expect("serialize");
         // PascalCase variant tag → must match the TS discriminated
@@ -1989,6 +1986,7 @@ mod tests {
             json["DelegateStarted"]["task"],
             "read the project structure"
         );
+        assert_eq!(json["DelegateStarted"]["sub_id"], "programmer-sub-1");
     }
 
     #[test]
@@ -1998,6 +1996,7 @@ mod tests {
             to_role: "programmer".into(),
             status: "ok".into(),
             summary: "found 3 files".into(),
+            sub_id: "programmer-sub-1".into(),
         };
         let json = serde_json::to_value(&event).expect("serialize");
         assert!(json.get("DelegateFinished").is_some(), "missing variant tag");
@@ -2005,6 +2004,7 @@ mod tests {
         assert_eq!(json["DelegateFinished"]["to_role"], "programmer");
         assert_eq!(json["DelegateFinished"]["status"], "ok");
         assert_eq!(json["DelegateFinished"]["summary"], "found 3 files");
+        assert_eq!(json["DelegateFinished"]["sub_id"], "programmer-sub-1");
     }
 
     #[test]
@@ -2016,18 +2016,22 @@ mod tests {
             to_role: "programmer".into(),
             status: "failed".into(),
             summary: "delegate to 'programmer' failed: model unavailable".into(),
+            sub_id: "programmer-sub-2".into(),
         };
         let json = serde_json::to_value(&failed).unwrap();
         assert_eq!(json["DelegateFinished"]["status"], "failed");
+        assert_eq!(json["DelegateFinished"]["sub_id"], "programmer-sub-2");
 
         let timed_out = ChatEvent::DelegateFinished {
             from_role: "manager".into(),
             to_role: "programmer".into(),
             status: "timeout".into(),
             summary: "delegate to 'programmer' timed out after 60s".into(),
+            sub_id: "programmer-sub-3".into(),
         };
         let json = serde_json::to_value(&timed_out).unwrap();
         assert_eq!(json["DelegateFinished"]["status"], "timeout");
+        assert_eq!(json["DelegateFinished"]["sub_id"], "programmer-sub-3");
     }
 
     #[test]
@@ -2042,10 +2046,8 @@ mod tests {
             from_role: "manager".into(),
             to_role: "programmer".into(),
             task: "ping".into(),
+            sub_id: "programmer-sub-4".into(),
         };
-        // `WorkspaceChatEvent` is `pub` re-exported in `super` —
-        // construct it inline to validate the public serialization
-        // surface that the Tauri runtime emits.
         let wrapped = serde_json::json!({
             "workspaceId": "ws-1",
             "event": inner,
@@ -2053,10 +2055,11 @@ mod tests {
         let parsed: ChatEvent =
             serde_json::from_value(wrapped["event"].clone()).expect("parse");
         match parsed {
-            ChatEvent::DelegateStarted { from_role, to_role, task } => {
+            ChatEvent::DelegateStarted { from_role, to_role, task, sub_id } => {
                 assert_eq!(from_role, "manager");
                 assert_eq!(to_role, "programmer");
                 assert_eq!(task, "ping");
+                assert_eq!(sub_id, "programmer-sub-4");
             }
             other => panic!("expected DelegateStarted, got {other:?}"),
         }

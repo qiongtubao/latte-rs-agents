@@ -1,4 +1,8 @@
-// API client + ChatEvent 类型 — 与 Rust 端 `controller.rs::ChatEvent` 字段对齐。
+// REST + SSE client for latte-agent-ui. All chat endpoints now require a
+// per-tab `session_id`; this module owns a module-level `currentSessionId`
+// and attaches it to every request automatically. The session itself is
+// persisted in localStorage so a tab refresh reattaches to the same
+// chat history without a server roundtrip.
 
 export interface RoleInfo {
   id: string;
@@ -11,7 +15,17 @@ export interface SessionInfo {
   role: string;
   model: string | null;
   tier: string;
+  available_sessions: SessionSummary[];
   available_roles: RoleInfo[];
+}
+
+export interface SessionSummary {
+  session_id: string;
+  /** First user message, truncated; "(no user message yet)" before first send. */
+  preview: string;
+  initial_role: string;
+  created_at_unix_ms: number;
+  last_activity_unix_ms: number;
 }
 
 export interface TraceSummary {
@@ -21,13 +35,8 @@ export interface TraceSummary {
   modified_unix: number;
 }
 
-// ChatEvent —— Rust enum ChatEvent 的 JSON 表示。
-// 后端用 `serde_json::to_string(&event)` 序列化，前端按 `type` 字段 dispatch。
-//
-// 注意：字段是 snake_case 还是 camelCase？查 controller.rs `ChatEvent::RoleTurn`
-// 字段是 `role_id, content, is_complete`。serde 默认 snake_case，所以前端读
-// `event.role_id` 而不是 `event.roleId`。这点和 latte-ts-models 的前端约定不同
-// （那边是 camelCase），本 UI 单独约定 snake_case 与 Rust 字段一致。
+// ChatEvent —— Rust enum ChatEvent 的 JSON 表示（discriminated union）。
+// 字段命名沿用 Rust（snake_case）。
 export type ChatEvent =
   | { type: "RoleTurn"; role_id: string; content: string; is_complete: boolean }
   | { type: "Status"; message: string }
@@ -44,13 +53,20 @@ export type ChatEvent =
   | { type: "ContextCleared" }
   | { type: "SessionInfo"; task_id: string; state: string; turn: number; roles: RoleInfo[] }
   | { type: "ToolUse"; role_id: string; tool_name: string; args: string }
+  | { type: "ToolError"; role_id: string; tool_name: string; error: string }
   | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
-  | { type: "DelegateStarted"; from_role: string; to_role: string; task: string }
-  | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string }
-  // 自定义 SelfLoopEvent（不是 ChatEvent，是 /api/self-loop/events 的 payload）
-  | { type: "SelfLoopEvent"; kind: string; iteration: number; message: string; screenshot?: string; data?: unknown; timestamp_unix_ms: number };
+  | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
+  | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
+  | {
+      type: "SelfLoopEvent";
+      kind: string;
+      iteration: number;
+      message: string;
+      screenshot?: string;
+      data?: unknown;
+      timestamp_unix_ms: number;
+    };
 
-// SelfLoopEvent — 与 Rust 端 ui.rs::SelfLoopEvent 字段对齐。
 export interface SelfLoopEvent {
   kind: "started" | "iteration" | "log" | "screenshot" | "done" | "error";
   iteration: number;
@@ -60,10 +76,90 @@ export interface SelfLoopEvent {
   timestamp_unix_ms: number;
 }
 
-// ─── REST helpers ────────────────────────────────────────────────
+// ─── Session-id plumbing ───────────────────────────────────────────────
+//
+// Each browser tab mints a `session_id`, persists it in localStorage,
+// and attaches it to every fetch + EventSource. Two tabs in the same
+// browser are independent browsing contexts — different localStorage
+// entries — but every tab talks to one logical session at the server.
+
+const SESSION_STORAGE_KEY = "latte-agent-ui-session-id";
+let currentSessionId: string | null = null;
+
+export function getCurrentSessionId(): string | null {
+  return currentSessionId;
+}
+
+export async function listSessions(): Promise<SessionSummary[]> {
+  const r = await fetch("/api/sessions");
+  if (!r.ok) throw new Error(`GET /api/sessions ${r.status}`);
+  return r.json();
+}
+
+export async function createSession(): Promise<string> {
+  const r = await fetch("/api/sessions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  if (!r.ok) throw new Error(`POST /api/sessions ${r.status}`);
+  const info: SessionInfo = await r.json();
+  currentSessionId = info.session_id;
+  return info.session_id;
+}
+
+export function switchSession(sessionId: string): void {
+  currentSessionId = sessionId;
+}
+
+/**
+ * First-mount hook: reuse a previously persisted session id if the
+ * server still knows it; otherwise mint a new one and persist it.
+ * Idempotent — safe to call on every reload.
+ */
+export async function ensureSession(): Promise<string> {
+  const ls = typeof window !== "undefined" ? window.localStorage : null;
+  const persisted = ls?.getItem(SESSION_STORAGE_KEY) ?? null;
+  if (persisted) {
+    const r = await fetch(
+      `/api/session?id=${encodeURIComponent(persisted)}`,
+    );
+    if (r.ok) {
+      currentSessionId = persisted;
+      return persisted;
+    }
+    ls?.removeItem(SESSION_STORAGE_KEY);
+  }
+  const id = await createSession();
+  ls?.setItem(SESSION_STORAGE_KEY, id);
+  return id;
+}
+
+/** Forget the current session id locally — used when the user clicks
+ * "New Session". Server-side sessions persist until reload. */
+export function clearLocalSessionId(): void {
+  currentSessionId = null;
+  if (typeof window !== "undefined") {
+    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+  }
+}
+
+// ─── REST helpers ──────────────────────────────────────────────────────
+
+function chatBody(extra: Record<string, unknown>): Record<string, unknown> {
+  // Always stamp session_id; backend uses it to route to the right
+  // ChatController. If somehow null the backend falls back to a 400
+  // and the caller (the chat panel) surfaces it.
+  return currentSessionId
+    ? { session_id: currentSessionId, ...extra }
+    : extra;
+}
 
 export async function getSession(): Promise<SessionInfo> {
-  const r = await fetch("/api/session");
+  if (!currentSessionId) throw new Error("no session id; call ensureSession() first");
+  const r = await fetch(
+    `/api/session?id=${encodeURIComponent(currentSessionId)}`,
+  );
   if (!r.ok) throw new Error(`GET /api/session ${r.status}`);
   return r.json();
 }
@@ -78,7 +174,7 @@ export async function sendMessage(message: string): Promise<void> {
   await fetch("/api/chat/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify(chatBody({ message })),
   });
 }
 
@@ -86,7 +182,7 @@ export async function sendCommand(command: string): Promise<void> {
   await fetch("/api/chat/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command }),
+    body: JSON.stringify(chatBody({ command })),
   });
 }
 
@@ -94,7 +190,7 @@ export async function switchRole(role_id: string): Promise<void> {
   await fetch("/api/chat/role", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ role_id }),
+    body: JSON.stringify(chatBody({ role_id })),
   });
 }
 
@@ -110,19 +206,25 @@ export async function readTrace(session_id: string): Promise<{ session_id: strin
   return r.json();
 }
 
-// ─── SSE ─────────────────────────────────────────────────────────
+// ─── SSE ────────────────────────────────────────────────────────────────
 
 export function subscribeEvents(
   onEvent: (e: ChatEvent) => void,
-  // SSE 连接状态变化（开 / 关）的回调。第一次连接成功 = "connected"，
-  // 服务端关闭或网络断开 = "disconnected"（此时 EventSource 已经被
-  // 我们关掉，不会再 auto-reconnect，要重连请调返回的 `reconnect`）。
   onConnectionStatus: (status: "connected" | "disconnected") => void,
 ): { disconnect: () => void; reconnect: () => void } {
   let es: EventSource | null = null;
 
   const connect = (): void => {
-    es = new EventSource("/api/events");
+    if (!currentSessionId) {
+      // Caller forgot to ensureSession() — surface as "disconnected" so
+      // the UI pill asks the user to reload. Better than silently
+      // subscribing to the wrong tab's events.
+      onConnectionStatus("disconnected");
+      return;
+    }
+    es = new EventSource(
+      `/api/events?id=${encodeURIComponent(currentSessionId)}`,
+    );
     es.addEventListener("chat_event", (e) => {
       try {
         const data = JSON.parse((e as MessageEvent).data) as ChatEvent;
@@ -131,13 +233,10 @@ export function subscribeEvents(
         console.error("[sse] failed to parse chat_event", err, e);
       }
     });
-    es.addEventListener("open", () => {
-      onConnectionStatus("connected");
-    });
+    es.addEventListener("open", () => onConnectionStatus("connected"));
     es.addEventListener("error", () => {
-      // 关键：error 时主动 close()，停掉浏览器自带的 auto-reconnect。
-      // 之前这里只发了个 "retrying…" 消息但 EventSource 仍在反复
-      // 重连 —— 用户关掉 UI 服务端后页面就一直挂着不释放。
+      // error 时主动 close() — 浏览器 EventSource 自带重连但那会让关
+      // 掉 UI 后页面挂着不释放。
       if (es) {
         es.close();
         es = null;
@@ -156,7 +255,7 @@ export function subscribeEvents(
       }
     },
     reconnect: () => {
-      if (es) return; // 已经连着就别重复建
+      if (es) return;
       connect();
     },
   };
@@ -182,6 +281,14 @@ export async function startSelfLoop(task: string, max_iterations: number): Promi
     body: JSON.stringify({ task, max_iterations }),
   });
 }
+
+/** Fetch the subsession event log for a delegate call. */
+export async function fetchSubsession(subId: string): Promise<unknown[]> {
+  const r = await fetch(`/api/subsessions?id=${encodeURIComponent(subId)}`);
+  if (!r.ok) throw new Error(`GET /api/subsessions?${subId} ${r.status}`);
+  return r.json();
+}
+
 
 export async function stopSelfLoop(): Promise<void> {
   await fetch("/api/self-loop/stop", { method: "POST" });
