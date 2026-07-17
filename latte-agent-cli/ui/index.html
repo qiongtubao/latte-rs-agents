@@ -46,6 +46,25 @@
               <button id="chat-quit" type="button">/quit</button>
             </div>
           </form>
+
+      <!-- 右键菜单 -->
+      <div class="context-menu" id="contextMenu">
+        <button class="menu-item" data-action="edit">✏️ 编辑消息</button>
+        <button class="menu-item danger" data-action="delete">🗑️ 删除消息</button>
+        <div class="menu-divider"></div>
+        <button class="menu-item" data-action="view-subagent">🔍 查看 subagent 过程</button>
+      </div>
+
+      <!-- subagent 详情浮层 -->
+      <div class="subagent-overlay" id="subagentOverlay">
+        <div class="subagent-panel">
+          <h3>
+            <span>🧩 Subagent 执行过程</span>
+            <button class="close-btn" id="closeSubagent">关闭</button>
+          </h3>
+          <div class="subagent-log" id="subagentLog">加载中…</div>
+        </div>
+      </div>
         </section>
 
         <aside id="trace-panel" class="panel trace-panel hidden">

@@ -47,30 +47,108 @@ export function mountChat(opts: {
   let delegationTargetRole = "";
   // Capture tool events for @role delegation subsession
   let capturedTools: { tool: string; args: string; result?: string }[] = [];
+  let pendingSubagentDetail: string | null = null; // captured from RoleStarted for next RoleTurn
 
   function nextId(): string { return `m${++msgCounter}`; }
 
-  function addMessage(opts2: { kind: "user"|"role"|"tool"|"status"|"system"|"error"; content: string; meta?: string; subId?: string; icon?: string; }): HTMLElement {
+  // ── Message store (for references & context menu) ──
+  interface MsgRecord {
+    id: string;
+    kind: string;
+    content: string;
+    meta?: string;
+    icon?: string;
+    reference?: { refId: string; preview: string };
+    subagent?: { detail: string } | null;
+    timestamp: string;
+    el: HTMLElement;
+  }
+  const messageStore: MsgRecord[] = [];
+
+  function getMsgById(id: string): MsgRecord | undefined {
+    return messageStore.find(m => m.id === id);
+  }
+
+  function fmtDisplayTime(): string {
+    return new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function avatarInitial(roleId: string): string {
+    if (roleId === 'manager') return 'M';
+    if (roleId === 'programmer') return 'P';
+    if (roleId === 'architect') return 'A';
+    if (roleId === 'reviewer') return 'R';
+    if (roleId === 'tester') return 'T';
+    if (roleId === 'security') return 'S';
+    if (roleId === 'devops') return 'D';
+    if (roleId === 'designer') return 'Ds';
+    if (roleId === 'tech_writer') return 'W';
+    if (roleId === 'pm') return 'Pm';
+    return roleId.charAt(0).toUpperCase();
+  }
+
+  // ── addMessage: render a message into the chat ──
+  function addMessage(opts2: {
+    kind: "user"|"role"|"tool"|"status"|"system"|"error";
+    content: string;
+    meta?: string;
+    subId?: string;
+    icon?: string;
+    reference?: { refId: string; preview: string };
+    subagent?: { detail: string } | null;
+    timestamp?: string;
+  }): HTMLElement {
     const kind = opts2.kind;
-    const withAvatar = kind === "role" || kind === "tool" || kind === "error";
-    if (withAvatar && opts2.icon) {
-      const row = document.createElement("div");
-      row.className = `message-row ${kind}`;
-      row.dataset.messageId = nextId();
-      if (opts2.subId) row.dataset.subId = opts2.subId;
+    const ts = opts2.timestamp || fmtDisplayTime();
+    const isSelf = kind === "user";
+    const withAvatar = isSelf || kind === "role" || kind === "tool" || kind === "error";
+    const id = nextId();
+
+    // Resolve avatar class & text
+    let avatarCss = "";
+    let avatarText = "?";
+    let metaName = "";
+    if (isSelf) {
+      avatarCss = "self-avatar";
+      avatarText = "我";
+      metaName = "我";
+    } else if (kind === "role" || kind === "tool" || kind === "error") {
+      const roleId = opts2.meta || "";
+      avatarCss = roleId;
+      avatarText = avatarInitial(roleId);
+      metaName = opts2.icon ? `${opts2.icon} ${roleId}` : roleId;
+    }
+
+    const row = document.createElement("div");
+    row.className = `message-row ${isSelf ? "self" : kind}`;
+    row.dataset.messageId = id;
+    if (opts2.subId) row.dataset.subId = opts2.subId;
+
+    if (withAvatar) {
+      // ── Avatar + bubble layout ──
       const avatar = document.createElement("div");
-      avatar.className = "msg-avatar";
-      avatar.textContent = opts2.icon;
+      avatar.className = `msg-avatar${avatarCss ? " " + avatarCss : ""}`;
+      avatar.textContent = avatarText;
+
       const bubble = document.createElement("div");
       bubble.className = "msg-bubble";
-      if (opts2.meta) {
-        const meta = document.createElement("div");
-        meta.className = "msg-meta";
-        meta.textContent = opts2.meta;
-        bubble.appendChild(meta);
-      }
+
+      // Meta: name + timestamp
+      const meta = document.createElement("div");
+      meta.className = "msg-meta";
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = metaName || avatarText;
+      const timeSpan = document.createElement("span");
+      timeSpan.className = "msg-time";
+      timeSpan.textContent = ts;
+      meta.appendChild(nameSpan);
+      meta.appendChild(timeSpan);
+      bubble.appendChild(meta);
+
+      // Content
       const content = document.createElement("div");
       content.className = "msg-content";
+
       if (kind === "tool") {
         content.classList.add("collapsible", "collapsed");
         content.dataset.full = opts2.content;
@@ -99,89 +177,74 @@ export function mountChat(opts: {
         content.textContent = opts2.content;
       }
       bubble.appendChild(content);
+
+      // ── Quote block ──
+      if (opts2.reference) {
+        const ref = opts2.reference;
+        const refMsg = getMsgById(ref.refId);
+        const previewText = ref.preview || (refMsg ? refMsg.content.substring(0, 30) : "(引用消息)");
+        const quoteDiv = document.createElement("div");
+        quoteDiv.className = "quote-block";
+        quoteDiv.innerHTML = `
+          <div class="quote-preview">
+            <span class="ref-icon">↩️ 引用</span>
+            <span>${previewText.length > 30 ? previewText.substring(0, 30) + "…" : previewText}</span>
+          </div>
+          <div class="clickable-ref" data-refid="${ref.refId}">📎 跳转到引用</div>
+        `;
+        quoteDiv.addEventListener("click", (e) => {
+          e.stopPropagation();
+          jumpToMessage(ref.refId);
+        });
+        bubble.appendChild(quoteDiv);
+      }
+
+      // ── Subagent badge ──
+      if (opts2.subagent) {
+        const badge = document.createElement("div");
+        badge.className = "subagent-badge";
+        badge.textContent = "🔍 subagent 过程";
+        badge.dataset.msgId = id;
+        badge.addEventListener("click", (e) => {
+          e.stopPropagation();
+          showSubagentOverlay(id);
+        });
+        bubble.appendChild(badge);
+      }
+
       row.appendChild(avatar);
       row.appendChild(bubble);
-      // For @role replies: right-click to show subsession tool calls
-      if (delegationTargetRole && kind === "role" && opts2.meta) {
-        attachToolPopup(row, opts2.meta);
-      }
-      container.messagesEl.appendChild(row);
-      return row;
-    }
-    const div = document.createElement("div");
-    div.className = `message ${kind}`;
-    div.dataset.messageId = nextId();
-    if (opts2.subId) div.dataset.subId = opts2.subId;
-    if (opts2.meta) {
-      const meta = document.createElement("span");
-      meta.className = "meta";
-      meta.textContent = `${opts2.icon ?? ""} ${opts2.meta}`;
-      div.appendChild(meta);
-    }
-    const content = document.createElement("div");
-    content.className = "content";
-    content.textContent = opts2.content;
-    div.appendChild(content);
-    container.messagesEl.appendChild(div);
-    return div;
-  }
-
-  function attachToolPopup(el: HTMLElement, label: string): void {
-    el.style.cursor = "pointer";
-    el.title = "右键查看执行过程";
-    el.addEventListener("contextmenu", (ev) => {
-      ev.preventDefault();
-      showToolPopup(label);
-    });
-    el.addEventListener("click", (ev) => {
-      if (ev.button === 0) showToolPopup(label);
-    });
-  }
-
-  function showToolPopup(label: string): void {
-    // Remove existing popup
-    document.querySelectorAll(".subsession-overlay").forEach(e => e.remove());
-
-    const overlay = document.createElement("div");
-    overlay.className = "subsession-overlay";
-
-    const popup = document.createElement("div");
-    popup.className = "subsession-popup";
-
-    const header = document.createElement("div");
-    header.className = "subsession-popup-header";
-    header.innerHTML = `<span>🔍 ${label} 执行过程</span>`;
-
-    const close = document.createElement("button");
-    close.textContent = "×";
-    close.className = "subsession-popup-close";
-    close.addEventListener("click", () => overlay.remove());
-    header.appendChild(close);
-    popup.appendChild(header);
-
-    const body = document.createElement("div");
-    body.className = "subsession-popup-body";
-
-    if (capturedTools.length === 0) {
-      body.innerHTML = '<div class="subsession-empty">(无工具调用)</div>';
     } else {
-      for (const ct of capturedTools) {
-        const item = document.createElement("div");
-        item.className = "subsession-item";
-        const argsBrief = ct.args.length > 80 ? ct.args.substring(0, 80) + "…" : ct.args;
-        item.innerHTML = `<div class="subsession-tool">🔧 ${ct.tool} ${argsBrief}</div>`;
-        if (ct.result) {
-          const resBrief = ct.result.length > 200 ? ct.result.substring(0, 200) + "…" : ct.result;
-          item.innerHTML += `<div class="subsession-result">${resBrief}</div>`;
-        }
-        body.appendChild(item);
+      // ── Status / system (no avatar) ──
+      const div = document.createElement("div");
+      div.className = `message ${kind}`;
+      div.dataset.messageId = id;
+      if (opts2.subId) div.dataset.subId = opts2.subId;
+      if (opts2.meta) {
+        const meta = document.createElement("span");
+        meta.className = "meta";
+        meta.textContent = `${opts2.icon ?? ""} ${opts2.meta}`;
+        div.appendChild(meta);
       }
+      const content = document.createElement("div");
+      content.className = "content";
+      content.textContent = opts2.content;
+      div.appendChild(content);
+      row.appendChild(div);
     }
 
-    popup.appendChild(body);
-    overlay.appendChild(popup);
-    document.body.appendChild(overlay);
+    container.messagesEl.appendChild(row);
+
+    // Store record
+    messageStore.push({
+      id, kind, content: opts2.content, meta: opts2.meta, icon: opts2.icon,
+      reference: opts2.reference, subagent: opts2.subagent, timestamp: ts, el: row,
+    });
+
+    container.messagesEl.scrollTop = container.messagesEl.scrollHeight;
+    return row;
   }
+
 
   container.formEl.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -335,11 +398,106 @@ export function mountChat(opts: {
     return lnk;
   }
 
+  // ── Jump to referenced message ──
+  function jumpToMessage(refId: string): void {
+    const row = container.messagesEl.querySelector(`.message-row[data-message-id="${refId}"], .message[data-message-id="${refId}"]`) as HTMLElement | null;
+    if (!row) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
+    row.classList.add("highlight-flash");
+    setTimeout(() => row.classList.remove("highlight-flash"), 1200);
+  }
+
+  // ── Context menu (right-click) ──
+  let selectedMsgId: string | null = null;
+
+  container.messagesEl.addEventListener("contextmenu", (e) => {
+    const row = (e.target as HTMLElement).closest(".message-row") as HTMLElement | null;
+    if (!row || !row.dataset.messageId) return;
+    e.preventDefault();
+    selectedMsgId = row.dataset.messageId;
+    const menu = document.getElementById("contextMenu")!;
+    menu.style.display = "block";
+    menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
+    menu.style.top = Math.min(e.clientY, window.innerHeight - 180) + "px";
+  });
+
+  document.addEventListener("click", (e) => {
+    const menu = document.getElementById("contextMenu")!;
+    if (!menu.contains(e.target as Node)) menu.style.display = "none";
+  });
+
+  document.getElementById("contextMenu")!.addEventListener("click", (e) => {
+    const action = (e.target as HTMLElement).closest(".menu-item")?.getAttribute("data-action");
+    const menu = document.getElementById("contextMenu")!;
+    if (!action || !selectedMsgId) { menu.style.display = "none"; return; }
+    const record = getMsgById(selectedMsgId);
+    if (!record) { menu.style.display = "none"; return; }
+    switch (action) {
+      case "edit": {
+        const newContent = prompt("编辑消息内容:", record.content);
+        if (newContent !== null && newContent.trim() !== "") {
+          record.content = newContent.trim();
+          const contentEl = record.el.querySelector(".msg-content")!;
+          if (contentEl) contentEl.textContent = newContent.trim();
+        }
+        break;
+      }
+      case "delete": {
+        if (confirm("确定删除这条消息吗？")) {
+          const idx = messageStore.indexOf(record);
+          if (idx >= 0) messageStore.splice(idx, 1);
+          record.el.remove();
+        }
+        break;
+      }
+      case "view-subagent": {
+        if (record.subagent) {
+          showSubagentOverlay(record.id);
+        } else {
+          alert("该消息没有关联 subagent 过程");
+        }
+        break;
+      }
+    }
+    menu.style.display = "none";
+  });
+
+  // ── Subagent detail overlay ──
+  function showSubagentOverlay(msgId: string): void {
+    const record = getMsgById(msgId);
+    if (!record || !record.subagent) return;
+    const logEl = document.getElementById("subagentLog")!;
+    logEl.textContent = record.subagent.detail || "无详细信息";
+    const overlay = document.getElementById("subagentOverlay")!;
+    overlay.style.display = "flex";
+  }
+
+  document.getElementById("closeSubagent")!.addEventListener("click", () => {
+    document.getElementById("subagentOverlay")!.style.display = "none";
+  });
+  document.getElementById("subagentOverlay")!.addEventListener("click", (e) => {
+    if (e.target === document.getElementById("subagentOverlay")!) {
+      document.getElementById("subagentOverlay")!.style.display = "none";
+    }
+  });
+
   function handleEvent(e: ChatEvent): void {
     switch (e.type) {
+      case "RoleStarted": {
+        pendingSubagentDetail = e.detail;
+        addMessage({ kind:"status", content:`🧠 ${e.role_id} 开始执行…` });
+        break;
+      }
+      case "RoleFinished": {
+        if (e.detail && !pendingSubagentDetail) pendingSubagentDetail = e.detail;
+        addMessage({ kind:"status", content:`✅ ${e.role_id} 完成` });
+        break;
+      }
       case "RoleTurn": {
         const icon = resolveIcon(e.role_id);
-        addMessage({ kind:"role", content:e.content, meta:e.role_id, icon });
+        const subagent = pendingSubagentDetail ? { detail: pendingSubagentDetail } : undefined;
+        addMessage({ kind:"role", content:e.content, meta:e.role_id, icon, subagent });
+        pendingSubagentDetail = null;
         currentToolCall=""; currentActivity=""; updateFooter();
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
@@ -440,7 +598,7 @@ export function mountChat(opts: {
     container.roleSelect.innerHTML = "";
     for (const r of roles) { const opt = document.createElement("option"); opt.value=r.id; opt.innerHTML=`${r.icon??""} ${r.id}`; if (r.id===selected) opt.selected=true; container.roleSelect.appendChild(opt); }
   }
-  function clear(): void { container.messagesEl.innerHTML=""; msgCounter=0; currentToolCall=""; currentActivity=""; currentDelegate=""; delegateRunning=false; updateFooter(); }
+  function clear(): void { container.messagesEl.innerHTML=""; msgCounter=0; messageStore.length=0; currentToolCall=""; currentActivity=""; currentDelegate=""; delegateRunning=false; updateFooter(); }
   return { appendUser, handleEvent, setFooter, setRoleSelected, refreshRoles, setStatus, clear };
 }
 
