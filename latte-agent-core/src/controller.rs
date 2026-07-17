@@ -297,7 +297,7 @@ impl ChatController {
         let pause_flag = self.pause_requested.clone();
 
         tokio::spawn(async move {
-            run_driver(config, input_rx, &event_tx, &cancel_flag, &pause_flag).await;
+            run_driver(config, input_rx, &event_tx, cancel_flag, pause_flag).await;
         });
 
         self.event_tx.subscribe()
@@ -486,13 +486,13 @@ async fn run_driver(
     config: ControllerConfig,
     mut input_rx: mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
-    cancel_flag: &AtomicBool,
-    pause_flag: &AtomicBool,
+    cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
     if is_multi {
-        run_multi_role_loop(config, &mut input_rx, event_tx, cancel_flag, pause_flag).await;
+        run_multi_role_loop(config, &mut input_rx, event_tx, cancel_flag, &*pause_flag).await;
     } else {
         run_single_role_loop(config, &mut input_rx, event_tx, cancel_flag).await;
     }
@@ -506,7 +506,7 @@ async fn run_multi_role_loop(
     config: ControllerConfig,
     input_rx: &mut mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
-    cancel_flag: &AtomicBool,
+    cancel_flag: Arc<AtomicBool>,
     pause_flag: &AtomicBool,
 ) {
     // Resolve worktree root
@@ -689,6 +689,7 @@ async fn run_multi_role_loop(
             event_tx,
             &config.cwd,
             config.subsession_store.clone(),
+            cancel_flag.clone(),
         )
         .await
         {
@@ -1057,7 +1058,7 @@ async fn run_single_role_loop(
     config: ControllerConfig,
     input_rx: &mut mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
-    cancel_flag: &AtomicBool,
+    cancel_flag: Arc<AtomicBool>,
 ) {
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
@@ -1085,6 +1086,7 @@ async fn run_single_role_loop(
             event_tx,
             &config.cwd,
             config.subsession_store.clone(),
+            cancel_flag.clone(),
         )
         .await
     {
@@ -1176,7 +1178,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner;
@@ -1198,7 +1200,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner;
@@ -1284,7 +1286,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner;
@@ -1299,7 +1301,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner;
@@ -1332,9 +1334,8 @@ async fn build_runner(
     session: Option<Arc<Mutex<SessionManager>>>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cwd: &Path,
-    // Process-wide subsession store. Arc'd so the caller can pass a
-    // clone to register_delegate_tool without lifetime headaches.
     subsession_store: Arc<SubsessionStore>,
+    cancel_flag: Arc<AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -1401,6 +1402,7 @@ async fn build_runner(
                 cwd.to_path_buf(),
                 subsession_store.clone(),
                 sid,
+                cancel_flag.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -1512,11 +1514,10 @@ async fn register_delegate_tool(
     cwd: PathBuf,
     subsession_store: Arc<SubsessionStore>,
     session_id: String,
+    cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
-    use std::time::Duration;
     use tokio::sync::Semaphore;
-    use tokio::time::timeout as tokio_timeout;
 
     let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
         schema_type: SchemaType,
@@ -1547,13 +1548,9 @@ async fn register_delegate_tool(
     };
 
     let sem = Arc::new(Semaphore::new(8));
-    let env_timeout_secs = std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 300;
-    let _ = DEFAULT_DELEGATE_TIMEOUT_SECS;
     let merged_owned = Arc::new(merged.clone());
     let resolver_owned = Arc::new(resolver.clone());
+    let cancel_flag_owned = Arc::clone(&cancel_flag);
 
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
@@ -1562,7 +1559,7 @@ async fn register_delegate_tool(
         let event_tx = event_tx.clone();
         let cwd = cwd.clone();
         let sem = Arc::clone(&sem);
-        let env_timeout = env_timeout_secs;
+        let cancel_flag = Arc::clone(&cancel_flag_owned);
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
         Box::pin(async move {
@@ -1611,15 +1608,7 @@ async fn register_delegate_tool(
                     tool_err(format!("no model for role '{}': {}", role_id, e))
                 })?;
 
-            // 4. Per-specialist wall-clock timeout (model override →
-            //    env → 60s default). Same precedence as the CLI.
-            let timeout_s = resolver
-                .get_def(&models[0].id)
-                .and_then(|d| d.timeout_secs)
-                .or(env_timeout)
-                .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS);
-
-            // 5. Build the specialist runner. We give it a tool
+            // 4. Build the specialist runner. We give it a tool
             //    manager iff the role's `allowed_tools` is non-empty;
             //    otherwise the agent answers "I have no file access"
             //    (the bug we hit when the manager delegated but the
@@ -1674,9 +1663,9 @@ async fn register_delegate_tool(
                 .with_role(role_id.clone())
                 .with_cwd(cwd.clone());
 
-            // 6. Run the specialist turn under a wall-clock timeout,
-            //    gated by a concurrency semaphore so the manager
-            //    doesn't fan out unbounded parallel specialists.
+            // 5. Run the specialist. No wall-clock timeout — the
+            //    subagent runs until completion or explicit cancellation
+            //    via the session's cancel_flag. Check periodically.
             let _permit = sem.acquire().await.map_err(|_| {
                 tool_err("delegate pool shut down".into())
             })?;
@@ -1684,24 +1673,52 @@ async fn register_delegate_tool(
                 role: MsgRole::User,
                 content: task.clone(),
             }];
-            let run_result = tokio_timeout(
-                Duration::from_secs(timeout_s),
-                runner.run_turn(&msgs, None),
-            )
-            .await;
+            // Move runner + messages into a spawned task so we can
+            // cancel it from the select! loop. The task owns everything.
+            let task_content = task.clone();
+            let mut run_handle = tokio::spawn(async move {
+                runner.run_turn(&[Message {
+                    role: MsgRole::User,
+                    content: task_content,
+                }], None).await
+            });
+            let result: Result<String, latte_rs_agent_tools::error::ToolError>;
+            loop {
+                tokio::select! {
+                    r = &mut run_handle => {
+                        match r {
+                            Ok(Ok(response)) => { result = Ok(response); break; }
+                            Ok(Err(e)) => {
+                                result = Err(tool_err(format!("subagent failed: {e}")));
+                                break;
+                            }
+                            Err(e) => {
+                                result = Err(tool_err(format!("task join failed: {e}")));
+                                break;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            run_handle.abort();
+                            let summary = String::from("delegate cancelled by user");
+                            let _ = event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "cancelled".into(),
+                                summary: summary.clone(),
+                                sub_id: sub_id.clone(),
+                            });
+                            return Err(tool_err(summary));
+                        }
+                    }
+                }
+            }
+            let run_result = result;
 
-            // 7. Emit DelegateFinished in all terminal states and
-            //    return the response (or error) to the manager as
-            //    the tool result. The manager sees this on its next
-            //    turn as a regular `tool_result` message.
-            // 7. Emit DelegateFinished in all terminal states and
-            //    return the response (or error) to the manager as
-            //    the tool result. The manager sees this on its next
-            //    turn as a regular `tool_result` message. The
-            //    `sub_id` is the same handle that was advertised in
-            //    DelegateStarted so the UI can fetch the transcript.
+            // 6. Emit DelegateFinished and return result.
             match run_result {
-                Ok(Ok(response)) => {
+                Ok(response) => {
                     let _ = event_tx.send(ChatEvent::DelegateFinished {
                         from_role: "manager".into(),
                         to_role: role_id.clone(),
@@ -1709,31 +1726,14 @@ async fn register_delegate_tool(
                         summary: response.clone(),
                         sub_id: sub_id.clone(),
                     });
-                    // The tool result must be a `serde_json::Value`;
-                    // wrap the response string. Manager sees it as
-                    // the tool's return value on its next turn.
                     Ok(serde_json::Value::String(response))
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     let summary = format!("delegate to '{}' failed: {}", role_id, e);
                     let _ = event_tx.send(ChatEvent::DelegateFinished {
                         from_role: "manager".into(),
                         to_role: role_id.clone(),
                         status: "failed".into(),
-                        summary: summary.clone(),
-                        sub_id: sub_id.clone(),
-                    });
-                    Err(tool_err(summary))
-                }
-                Err(_elapsed) => {
-                    let summary = format!(
-                        "delegate to '{}' timed out after {}s",
-                        role_id, timeout_s
-                    );
-                    let _ = event_tx.send(ChatEvent::DelegateFinished {
-                        from_role: "manager".into(),
-                        to_role: role_id.clone(),
-                        status: "timeout".into(),
                         summary: summary.clone(),
                         sub_id: sub_id.clone(),
                     });
