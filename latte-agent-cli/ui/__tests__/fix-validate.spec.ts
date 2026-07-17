@@ -51,7 +51,7 @@ test.describe("Delegate no-timeout fix validation", () => {
         const msgs = Array.from(document.querySelectorAll(".message-row, .message"));
         const finished = msgs.some(
           (m) =>
-            m.textContent?.includes("💻") &&
+            m.textContent?.includes("P") &&
             (m.textContent?.includes("✅") || m.textContent?.includes("Done"))
         );
         const status = document.querySelector(".status-label")?.textContent;
@@ -66,7 +66,7 @@ test.describe("Delegate no-timeout fix validation", () => {
     const state = await page.evaluate(() => {
       const msgs = Array.from(document.querySelectorAll(".message, .message-row, .message"));
       const programmerMsg = Array.from(document.querySelectorAll(".message-row")).find(
-        (m) => m.querySelector(".msg-avatar")?.textContent === "💻"
+        (m) => m.querySelector(".msg-avatar")?.textContent === "P"
       );
       return {
         hasProgrammerReply: !!programmerMsg,

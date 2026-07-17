@@ -46,7 +46,7 @@ test.describe("latte-agent UI self-debug loop", () => {
     }
     const state = await page.evaluate(() => {
       const msgs = Array.from(document.querySelectorAll(".message, .message-row, .message"));
-      const lastRole = Array.from(document.querySelectorAll(".message-row")).pop();
+      const lastRole = Array.from(document.querySelectorAll(".message-row.role, .message-row.self, .message-row.tool, .message-row.error")).pop();
       return {
         msgCount: msgs.length,
         hasAvatar: !!lastRole?.querySelector(".msg-avatar"),
@@ -78,12 +78,12 @@ test.describe("latte-agent UI self-debug loop", () => {
     const state = await page.evaluate(() => {
       const msgs = Array.from(document.querySelectorAll(".message, .message-row, .message"));
       const programmer = Array.from(document.querySelectorAll(".message-row")).find(
-        m => m.querySelector(".msg-avatar")?.textContent === "💻"
+        m => m.querySelector(".msg-avatar")?.textContent === "P"
       );
       return {
         delegated: msgs.some(m => m.textContent?.includes("🤝 @manager → @programmer")),
         replied: !!programmer,
-        clickable: programmer?.style?.cursor === "pointer",
+        clickable: programmer?.hasAttribute("data-sub-id") || programmer?.style?.cursor === "pointer",
         rolePill: document.getElementById("role-pill")?.textContent || "",
         hasTime: msgs.some(m => m.textContent?.includes("⏱")),
       };

@@ -129,6 +129,6 @@ test.describe("latte-agent UI e2e", () => {
     await page.locator("#chat-input").fill("hello");
     await page.locator("#chat-send").click();
     // 等 user 消息出现
-    await expect(page.locator(".message.user").first()).toContainText("hello", { timeout: 3_000 });
+    await expect(page.locator(".message-row.self").first()).toContainText("hello", { timeout: 3_000 });
   });
 });

@@ -47,6 +47,7 @@ export function mountChat(opts: {
   let delegationTargetRole = "";
   // Capture tool events for @role delegation subsession
   let capturedTools: { tool: string; args: string; result?: string }[] = [];
+  let delegationSubId = "";
   let pendingSubagentDetail: string | null = null; // captured from RoleStarted for next RoleTurn
 
   function nextId(): string { return `m${++msgCounter}`; }
@@ -233,13 +234,22 @@ export function mountChat(opts: {
       row.appendChild(div);
     }
 
-    container.messagesEl.appendChild(row);
 
-    // Store record
-    messageStore.push({
-      id, kind, content: opts2.content, meta: opts2.meta, icon: opts2.icon,
-      reference: opts2.reference, subagent: opts2.subagent, timestamp: ts, el: row,
-    });
+
+    // For @role delegated messages: click shows subsession
+    if (delegationTargetRole && kind === "role" && opts2.meta) {
+      const roleName = opts2.meta;
+      row.style.cursor = "pointer";
+      row.title = "点击查看执行过程";
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (opts2.subId && onShowSubsession) {
+          const label = (roleIcon(roleName) || "") + " " + roleName;
+          onShowSubsession(opts2.subId, label);
+        }
+      });
+    }
+    container.messagesEl.appendChild(row);
 
     container.messagesEl.scrollTop = container.messagesEl.scrollHeight;
     return row;
@@ -270,6 +280,7 @@ export function mountChat(opts: {
       } catch (err) {
         addMessage({ kind: "error", content: `派发给 @${targetRole} 失败: ${String(err)}` });
         delegationTargetRole = "";
+        delegationSubId = "";
       }
       startWaitTimer();
     } else if (rawText.startsWith("/")) {
@@ -496,13 +507,15 @@ export function mountChat(opts: {
       case "RoleTurn": {
         const icon = resolveIcon(e.role_id);
         const subagent = pendingSubagentDetail ? { detail: pendingSubagentDetail } : undefined;
-        addMessage({ kind:"role", content:e.content, meta:e.role_id, icon, subagent });
+        const roleSubId = delegationTargetRole ? delegationSubId : undefined;
+        addMessage({ kind:"role", content:e.content, meta:e.role_id, icon, subagent, subId: roleSubId });
         pendingSubagentDetail = null;
         currentToolCall=""; currentActivity=""; updateFooter();
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
           if (delegationTargetRole) {
             delegationTargetRole = "";
+            delegationSubId = "";
             switchRole("manager").catch(() => {});
             container.rolePill.textContent = `${roleIcon("manager")} manager`;
           }
@@ -552,16 +565,15 @@ export function mountChat(opts: {
         break;
       }
       case "ToolError": {
-        addMessage({ kind:"error", content:`${e.tool_name} failed: ${truncate(e.error,200)}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
-        currentToolCall=""; currentActivity=`${e.tool_name} 出错`;
         updateFooter(); resetWaitTimer(); break;
       }
       case "DelegateStarted": {
         const t = truncate(e.task,60);
-        addMessage({ kind:"system", content:`🤝 ${e.from_role} → ${e.to_role}`, subId:e.sub_id });
+        addMessage({ kind:"system", content:`🤝 @${e.from_role} → @${e.to_role}`, subId:e.sub_id });
         delegateRunning=true; currentDelegate=`${e.from_role} → ${e.to_role}`;
         currentToolCall=""; currentActivity=`等待 ${e.to_role}`;
         const icon=currentRoleIcon||"🧠"; updateFooter(); updateStatusPillLabel(`⏳ ${icon} → ${e.to_role}`);
+        if (delegationTargetRole) delegationSubId = e.sub_id;
         container.rolePill.textContent = `⏳ ${roleIcon(e.to_role)} ${e.to_role}`;
         resetWaitTimer(); break;
       }

@@ -283,9 +283,15 @@ select {
   align-self: flex-end;
   flex-direction: row-reverse;
 }
-.message-row.role { align-self: flex-start; }
+.message-row.role { align-self: flex-start; cursor: pointer; }
 .message-row.tool { align-self: flex-start; }
 .message-row.error { align-self: flex-start; }
+.message-row.status,
+.message-row.system {
+  max-width: 100%;
+  align-self: center;
+  justify-content: center;
+}
 
 .msg-avatar {
   width: 36px;

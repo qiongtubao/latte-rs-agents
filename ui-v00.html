@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>数据结构A · 改造协作</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    body {
+      background: #eaeef1;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    .app {
+      max-width: 520px;
+      width: 100%;
+      background: #ffffff;
+      border-radius: 28px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.12);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 90vh;
+      max-height: 780px;
+    }
+    /* 头部 */
+    .chat-header {
+      padding: 16px 20px;
+      background: #f7f9fc;
+      border-bottom: 1px solid #e9edf2;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .chat-header h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #1e2a3a;
+      letter-spacing: 0.3px;
+    }
+    .chat-header .badge {
+      background: #d0d9e6;
+      color: #1e2a3a;
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 40px;
+      font-weight: 500;
+    }
+    /* 消息流 */
+    .message-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 12px 8px 12px;
+      background: #f7f9fc;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    /* 消息卡片 */
+    .message {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      max-width: 100%;
+      animation: fadeIn 0.2s ease;
+      position: relative;
+      cursor: default;
+    }
+    .message.self {
+      flex-direction: row-reverse;
+    }
+    .avatar {
+      width: 38px;
+      height: 38px;
+      border-radius: 40px;
+      background: #cbd5e1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      color: #1e2a3a;
+      font-size: 15px;
+      flex-shrink: 0;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+      background: #d9e2ec;
+    }
+    .avatar.self-avatar {
+      background: #3b7cff;
+      color: white;
+    }
+    .bubble-wrapper {
+      display: flex;
+      flex-direction: column;
+      max-width: 82%;
+    }
+    .bubble {
+      background: white;
+      padding: 10px 14px;
+      border-radius: 18px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+      word-break: break-word;
+      line-height: 1.5;
+      font-size: 15px;
+      border: 1px solid #eef2f6;
+      transition: 0.1s ease;
+    }
+    .message.self .bubble {
+      background: #3b7cff;
+      color: white;
+      border-color: #3b7cff;
+    }
+    .bubble .msg-text {
+      white-space: pre-wrap;
+    }
+    .bubble .msg-text .mention {
+      color: #3b7cff;
+      font-weight: 500;
+      background: #eef4ff;
+      padding: 0 4px;
+      border-radius: 6px;
+    }
+    .message.self .bubble .msg-text .mention {
+      color: #d0e0ff;
+      background: rgba(255,255,255,0.15);
+    }
+    /* 引用样式 */
+    .quote-block {
+      margin-top: 8px;
+      padding: 8px 12px;
+      background: #f0f4fa;
+      border-left: 4px solid #8aa3c9;
+      border-radius: 10px;
+      font-size: 14px;
+      color: #1e2a3a;
+      background: #ecf1f7;
+      cursor: pointer;
+      transition: 0.1s;
+    }
+    .message.self .quote-block {
+      background: rgba(255,255,255,0.12);
+      border-left-color: #b6ccff;
+      color: #eef4ff;
+    }
+    .quote-block .quote-preview {
+      display: flex;
+      gap: 6px;
+      align-items: baseline;
+      flex-wrap: wrap;
+    }
+    .quote-block .quote-preview .q-icon {
+      font-size: 13px;
+      opacity: 0.7;
+    }
+    .quote-block .quote-preview .q-content {
+      opacity: 0.9;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 220px;
+    }
+    .message .subagent-badge {
+      display: inline-block;
+      margin-top: 4px;
+      font-size: 11px;
+      color: #5b6f87;
+      background: #eef2f6;
+      padding: 2px 12px 2px 8px;
+      border-radius: 40px;
+      width: fit-content;
+      font-weight: 500;
+      letter-spacing: 0.3px;
+      border: 1px solid #dbe1e9;
+      cursor: pointer;
+    }
+    .message.self .subagent-badge {
+      background: rgba(255,255,255,0.15);
+      color: #d0dff5;
+      border-color: rgba(255,255,255,0.2);
+    }
+    .time {
+      font-size: 11px;
+      color: #8697ad;
+      margin: 2px 6px 0 6px;
+      opacity: 0.7;
+    }
+    /* 右键菜单 */
+    .context-menu {
+      position: fixed;
+      background: #ffffff;
+      border-radius: 16px;
+      box-shadow: 0 8px 28px rgba(0,0,0,0.15);
+      padding: 6px 0;
+      min-width: 180px;
+      z-index: 999;
+      border: 1px solid #e9edf2;
+      backdrop-filter: blur(4px);
+      display: none;
+    }
+    .context-menu .menu-item {
+      padding: 8px 20px;
+      font-size: 14px;
+      color: #1e2a3a;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      transition: 0.05s;
+      border: none;
+      background: transparent;
+      width: 100%;
+      text-align: left;
+    }
+    .context-menu .menu-item:hover {
+      background: #f0f5fe;
+    }
+    .context-menu .menu-item.danger {
+      color: #c53e3e;
+    }
+    .context-menu .menu-item.danger:hover {
+      background: #ffe9e9;
+    }
+    .context-menu .menu-divider {
+      height: 1px;
+      background: #e9edf2;
+      margin: 4px 12px;
+    }
+    /* 底部操作 */
+    .chat-footer {
+      padding: 12px 16px;
+      background: #f7f9fc;
+      border-top: 1px solid #e9edf2;
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .chat-footer input {
+      flex: 1;
+      border: 1px solid #d9e2ec;
+      border-radius: 30px;
+      padding: 10px 16px;
+      font-size: 15px;
+      background: white;
+      outline: none;
+      transition: 0.15s;
+    }
+    .chat-footer input:focus {
+      border-color: #3b7cff;
+      box-shadow: 0 0 0 3px rgba(59,124,255,0.1);
+    }
+    .chat-footer button {
+      background: #3b7cff;
+      border: none;
+      color: white;
+      font-weight: 500;
+      padding: 0 22px;
+      border-radius: 40px;
+      font-size: 15px;
+      cursor: pointer;
+      transition: 0.1s;
+      letter-spacing: 0.3px;
+    }
+    .chat-footer button:active {
+      background: #2a5fcc;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0.6; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    /* 模拟引用跳转高亮 */
+    .highlight-flash {
+      background: #ffecbb !important;
+      transition: 0.1s;
+    }
+  </style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="chat-header">
+    <h2>📋 数据结构A · 改造</h2>
+    <span class="badge">3 成员</span>
+  </div>
+  <div class="message-list" id="messageList"></div>
+  <div class="chat-footer">
+    <input type="text" id="newMessageInput" placeholder="输入新消息… 或 @提及" />
+    <button id="sendBtn">发送</button>
+  </div>
+</div>
+
+<!-- 右键菜单 -->
+<div class="context-menu" id="contextMenu">
+  <button class="menu-item" data-action="viewSubagent">🔍 查看子代理过程</button>
+  <button class="menu-item" data-action="edit">✏️ 修改对话</button>
+  <button class="menu-item danger" data-action="delete">🗑️ 删除对话</button>
+  <div class="menu-divider"></div>
+  <button class="menu-item" data-action="reprocess">🔄 让 AI 重新处理</button>
+</div>
+
+<script>
+  (function() {
+    // ---------- 数据结构 ----------
+    // 消息模型： id, role: 'self'|'manager'|'programmer'|'architect', name, text, quote?: { refId, preview }, subagent?: boolean, timestamp
+    let messages = [];
+    let nextId = 1000;
+
+    // 初始数据 (完全按照题面)
+    function buildInitialMessages() {
+      return [
+        { id: nextId++, role: 'self', name: '我', text: '查看代码分析一下把数据结构 A 从list 改成环形数组', timestamp: '10:23' },
+        { id: nextId++, role: 'manager', name: 'manager', text: '@programmer 查找数据A的定义和实现', timestamp: '10:24', subagent: false },
+        { id: nextId++, role: 'manager', name: 'manager', text: '@architect 分析数据A数据结构使用的上下文', timestamp: '10:25', subagent: false },
+        { id: nextId++, role: 'programmer', name: 'programmer', text: '查到定义和实现 \n```\nclass A {\n    list* l; \n};\n```', timestamp: '10:27', subagent: true, quote: { refId: 1001, preview: '@programmer 查找数据A的定义和实现' } },
+        { id: nextId++, role: 'architect', name: 'architect', text: '数据A 使用的上下文\n```\nA* a;\n//添加数据\na->add(new object()); \n```', timestamp: '10:28', subagent: true, quote: { refId: 1002, preview: '@architect 分析数据A数据结构使用的上下文' } },
+        { id: nextId++, role: 'manager', name: 'manager', text: '方案1 修改代码只要改A里面的list 换成array\n方案2 xxxx', timestamp: '10:30', quote: { refId: 1000, preview: '查看代码分析一下把数据结构 A 从list 改成环形数组' } }
+      ];
+    }
+
+    messages = buildInitialMessages();
+
+    // 渲染
+    const listEl = document.getElementById('messageList');
+    const contextMenu = document.getElementById('contextMenu');
+    let selectedMsgId = null;
+
+    function render() {
+      listEl.innerHTML = '';
+      messages.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = `message ${msg.role === 'self' ? 'self' : ''}`;
+        div.dataset.id = msg.id;
+
+        // avatar
+        const avatar = document.createElement('div');
+        avatar.className = `avatar ${msg.role === 'self' ? 'self-avatar' : ''}`;
+        const initial = msg.role === 'self' ? '我' : (msg.name ? msg.name.charAt(0).toUpperCase() : '?');
+        avatar.textContent = initial;
+        div.appendChild(avatar);
+
+        // bubble wrapper
+        const wrapper = document.createElement('div');
+        wrapper.className = 'bubble-wrapper';
+
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        // 文本
+        const textSpan = document.createElement('div');
+        textSpan.className = 'msg-text';
+        // 简单替换 @ 为高亮
+        let formattedText = msg.text;
+        // 检测 @ 提及
+        formattedText = formattedText.replace(/@(\w+)/g, '<span class="mention">@$1</span>');
+        textSpan.innerHTML = formattedText;
+        bubble.appendChild(textSpan);
+
+        // 如果有引用
+        if (msg.quote) {
+          const quoteDiv = document.createElement('div');
+          quoteDiv.className = 'quote-block';
+          const preview = msg.quote.preview || '引用内容';
+          quoteDiv.innerHTML = `
+            <div class="quote-preview">
+              <span class="q-icon">↩️</span>
+              <span class="q-content">${preview}</span>
+            </div>
+          `;
+          // 点击引用跳转
+          quoteDiv.addEventListener('click', (e) => {
+            e.stopPropagation();
+            jumpToMessage(msg.quote.refId);
+          });
+          bubble.appendChild(quoteDiv);
+        }
+
+        wrapper.appendChild(bubble);
+
+        // subagent 标记
+        if (msg.subagent) {
+          const badge = document.createElement('div');
+          badge.className = 'subagent-badge';
+          badge.textContent = '⚙️ subagent';
+          wrapper.appendChild(badge);
+        }
+
+        // 时间
+        const time = document.createElement('div');
+        time.className = 'time';
+        time.textContent = msg.timestamp || '--:--';
+        wrapper.appendChild(time);
+
+        div.appendChild(wrapper);
+
+        // 右键事件
+        div.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          selectedMsgId = msg.id;
+          showContextMenu(e.clientX, e.clientY);
+        });
+
+        // 单击可取消菜单
+        div.addEventListener('click', () => {
+          hideContextMenu();
+        });
+
+        listEl.appendChild(div);
+      });
+      // 滚动到底部
+      listEl.scrollTop = listEl.scrollHeight;
+    }
+
+    // 跳转引用
+    function jumpToMessage(refId) {
+      const target = document.querySelector(`.message[data-id="${refId}"]`);
+      if (!target) return;
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.classList.add('highlight-flash');
+      setTimeout(() => target.classList.remove('highlight-flash'), 1200);
+      hideContextMenu();
+    }
+
+    // ---------- 右键菜单 ----------
+    function showContextMenu(x, y) {
+      const menu = contextMenu;
+      menu.style.display = 'block';
+      // 边界检测
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      let left = x;
+      let top = y;
+      if (x + 200 > w) left = w - 210;
+      if (y + 180 > h) top = h - 190;
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+    }
+
+    function hideContextMenu() {
+      contextMenu.style.display = 'none';
+    }
+    document.addEventListener('click', (e) => {
+      if (!contextMenu.contains(e.target)) hideContextMenu();
+    });
+
+    // 菜单动作
+    document.querySelectorAll('.menu-item').forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const action = item.dataset.action;
+        if (!selectedMsgId) return;
+        const msg = messages.find(m => m.id === selectedMsgId);
+        if (!msg) { hideContextMenu(); return; }
+
+        switch (action) {
+          case 'viewSubagent':
+            // 模拟查看子代理过程 (嵌套)
+            alert(`🔍 查看子代理过程 (模拟)\n角色: ${msg.name}\n内容: ${msg.text.substring(0, 40)}...\n(可嵌套分派其他角色)`);
+            break;
+          case 'edit':
+            const newText = prompt('修改这条消息:', msg.text);
+            if (newText !== null && newText.trim() !== '') {
+              msg.text = newText.trim();
+              render();
+            }
+            break;
+          case 'delete':
+            if (confirm('删除这条消息？')) {
+              messages = messages.filter(m => m.id !== msg.id);
+              render();
+            }
+            break;
+          case 'reprocess':
+            // 模拟 AI 重新处理：在原消息后追加一条 “重新处理” 消息
+            const newMsg = {
+              id: nextId++,
+              role: 'manager',
+              name: 'AI',
+              text: `🔄 已重新处理 (针对: ${msg.text.substring(0, 20)}...)`,
+              timestamp: new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'}),
+              subagent: true,
+              quote: { refId: msg.id, preview: msg.text.substring(0, 24) + '…' }
+            };
+            messages.push(newMsg);
+            render();
+            break;
+          default: break;
+        }
+        hideContextMenu();
+      });
+    });
+
+    // 发送新消息 (用于扩展)
+    document.getElementById('sendBtn').addEventListener('click', () => {
+      const input = document.getElementById('newMessageInput');
+      const text = input.value.trim();
+      if (!text) return;
+      const newMsg = {
+        id: nextId++,
+        role: 'self',
+        name: '我',
+        text: text,
+        timestamp: new Date().toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit'}),
+      };
+      messages.push(newMsg);
+      render();
+      input.value = '';
+    });
+    document.getElementById('newMessageInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') document.getElementById('sendBtn').click();
+    });
+
+    // 点击空白取消菜单
+    document.addEventListener('click', () => hideContextMenu());
+
+    // 初始渲染
+    render();
+
+    // 暴露给外部调试 (可选)
+    window.__messages = messages;
+  })();
+</script>
+</body>
+</html>

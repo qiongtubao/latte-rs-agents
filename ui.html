@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>团队协作 · 环形数组重构</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    }
+
+    body {
+      background: #eaeef3;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    /* 主卡片 —— 类似微信对话窗 */
+    .chat-container {
+      width: 100%;
+      max-width: 680px;
+      background: #f8fafc;
+      border-radius: 28px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      height: 90vh;
+      max-height: 820px;
+      transition: box-shadow 0.2s;
+    }
+
+    /* 聊天头部 */
+    .chat-header {
+      padding: 18px 24px;
+      background: #ffffff;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.04);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .chat-header h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #1e293b;
+      letter-spacing: -0.3px;
+    }
+    .chat-header .badge {
+      background: #dbeafe;
+      color: #1e4f8a;
+      font-size: 12px;
+      padding: 4px 12px;
+      border-radius: 40px;
+      font-weight: 500;
+    }
+
+    /* 消息列表 */
+    .message-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 18px 16px 10px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      background: #f2f6fa;
+      scroll-behavior: smooth;
+    }
+
+    /* 消息行 */
+    .message-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      max-width: 92%;
+      animation: fadeIn 0.2s ease;
+    }
+
+    .message-row.self {
+      align-self: flex-end;
+      flex-direction: row-reverse;
+    }
+
+    /* 头像 */
+    .avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 40px;
+      background: #cbd5e1;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      font-size: 16px;
+      color: #0f172a;
+      background: #e2e8f0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+      user-select: none;
+    }
+    .avatar.self-avatar {
+      background: #3b82f6;
+      color: white;
+    }
+    .avatar.manager { background: #facc15; color: #422b00; }
+    .avatar.programmer { background: #a7f3d0; color: #064e3b; }
+    .avatar.architect { background: #f9a8d4; color: #831843; }
+
+    /* 气泡 */
+    .bubble {
+      background: white;
+      padding: 12px 16px;
+      border-radius: 20px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+      line-height: 1.5;
+      font-size: 15px;
+      color: #0f172a;
+      word-break: break-word;
+      position: relative;
+      transition: background 0.1s;
+      border: 1px solid rgba(0,0,0,0.02);
+    }
+
+    .message-row.self .bubble {
+      background: #dbeafe;
+      border-color: #bfdbfe;
+    }
+
+    .bubble .msg-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 6px 12px;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: #475569;
+    }
+    .bubble .msg-meta .role-tag {
+      font-weight: 500;
+      color: #1e293b;
+    }
+    .bubble .msg-meta .time {
+      color: #94a3b8;
+      font-size: 11px;
+    }
+
+    .bubble .msg-content {
+      margin: 4px 0 2px 0;
+      white-space: pre-wrap;
+    }
+
+    /* 引用块 */
+    .quote-block {
+      background: #f1f5f9;
+      border-left: 4px solid #94a3b8;
+      padding: 8px 12px;
+      border-radius: 10px;
+      margin: 10px 0 6px 0;
+      font-size: 14px;
+      color: #1e293b;
+      opacity: 0.9;
+      position: relative;
+      word-break: break-word;
+    }
+    .quote-block .quote-preview {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      color: #475569;
+      font-size: 13px;
+    }
+    .quote-block .quote-preview .ref-icon {
+      background: #cbd5e1;
+      border-radius: 12px;
+      padding: 0 8px;
+      font-size: 11px;
+      color: #1e293b;
+      font-weight: 500;
+    }
+    .quote-block .quote-text {
+      margin-top: 4px;
+      color: #0f172a;
+    }
+    .quote-block .quote-text .clickable-ref {
+      color: #2563eb;
+      text-decoration: underline dotted;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    .quote-block .quote-text .clickable-ref:hover {
+      color: #1d4ed8;
+    }
+
+    /* 右键菜单 (隐藏) */
+    .context-menu {
+      display: none;
+      position: fixed;
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.18);
+      padding: 8px 0;
+      min-width: 180px;
+      z-index: 999;
+      border: 1px solid rgba(0,0,0,0.04);
+      backdrop-filter: blur(4px);
+    }
+    .context-menu .menu-item {
+      padding: 10px 20px;
+      font-size: 14px;
+      color: #1e293b;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      transition: background 0.1s;
+      border: none;
+      background: transparent;
+      width: 100%;
+      text-align: left;
+    }
+    .context-menu .menu-item:hover {
+      background: #f1f5f9;
+    }
+    .context-menu .menu-item.danger {
+      color: #b91c1c;
+    }
+    .context-menu .menu-divider {
+      height: 1px;
+      background: #e2e8f0;
+      margin: 6px 12px;
+    }
+
+    /* 底部输入 */
+    .input-area {
+      padding: 14px 18px 18px 18px;
+      background: white;
+      border-top: 1px solid rgba(0, 0, 0, 0.03);
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    .input-area textarea {
+      flex: 1;
+      border: 1px solid #e2e8f0;
+      border-radius: 24px;
+      padding: 12px 16px;
+      font-size: 15px;
+      resize: none;
+      height: 50px;
+      max-height: 100px;
+      background: #f8fafc;
+      transition: border 0.2s;
+      line-height: 1.4;
+      font-family: inherit;
+    }
+    .input-area textarea:focus {
+      outline: none;
+      border-color: #3b82f6;
+      background: white;
+    }
+    .input-area .send-btn {
+      background: #3b82f6;
+      border: none;
+      color: white;
+      padding: 12px 22px;
+      border-radius: 40px;
+      font-weight: 500;
+      font-size: 15px;
+      cursor: pointer;
+      transition: background 0.15s;
+      height: 50px;
+      display: flex;
+      align-items: center;
+      white-space: nowrap;
+    }
+    .input-area .send-btn:hover {
+      background: #2563eb;
+    }
+
+    /* 子代理详情浮层 (简约) */
+    .subagent-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.5);
+      backdrop-filter: blur(3px);
+      justify-content: center;
+      align-items: center;
+      z-index: 1000;
+    }
+    .subagent-panel {
+      background: white;
+      border-radius: 32px;
+      max-width: 500px;
+      width: 90%;
+      max-height: 70vh;
+      padding: 24px 28px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.3);
+      overflow-y: auto;
+    }
+    .subagent-panel h3 {
+      font-weight: 600;
+      font-size: 18px;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .subagent-panel .close-btn {
+      background: #e2e8f0;
+      border: none;
+      border-radius: 40px;
+      padding: 6px 16px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .subagent-panel .subagent-log {
+      background: #f1f5f9;
+      border-radius: 16px;
+      padding: 16px;
+      font-size: 14px;
+      white-space: pre-wrap;
+      color: #1e293b;
+      margin-top: 6px;
+      max-height: 300px;
+      overflow-y: auto;
+    }
+
+    /* 动画 */
+    @keyframes fadeIn {
+      from { opacity: 0.5; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* 滚动条 */
+    .message-list::-webkit-scrollbar {
+      width: 4px;
+    }
+    .message-list::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    .message-list::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="chat-container">
+  <div class="chat-header">
+    <h2>💬 团队重构 · 环形数组</h2>
+    <span class="badge">subagent ⚡</span>
+  </div>
+
+  <!-- 消息列表 -->
+  <div class="message-list" id="messageList"></div>
+
+  <!-- 底部输入 -->
+  <div class="input-area">
+    <textarea id="msgInput" rows="1" placeholder="输入消息… (引用用 [数字])"></textarea>
+    <button class="send-btn" id="sendBtn">发送</button>
+  </div>
+</div>
+
+<!-- 右键菜单 -->
+<div class="context-menu" id="contextMenu">
+  <button class="menu-item" data-action="edit">✏️ 编辑消息</button>
+  <button class="menu-item danger" data-action="delete">🗑️ 删除消息</button>
+  <div class="menu-divider"></div>
+  <button class="menu-item" data-action="view-subagent">🔍 查看 subagent 过程</button>
+</div>
+
+<!-- 子代理浮层 -->
+<div class="subagent-overlay" id="subagentOverlay">
+  <div class="subagent-panel">
+    <h3>
+      <span>🧩 子代理详情</span>
+      <button class="close-btn" id="closeSubagent">关闭</button>
+    </h3>
+    <div class="subagent-log" id="subagentLog">加载中…</div>
+  </div>
+</div>
+
+<script>
+  (function() {
+    // ------------------ 初始数据 (包含引用关系) --------------------
+    const initialMessages = [
+      {
+        id: 'm1',
+        sender: 'user',
+        name: '我',
+        avatar: 'self',
+        content: '查看代码分析一下把数据结构 A 从list 改成环形数组',
+        timestamp: '10:23',
+        references: [],
+        subagent: null, 
+      },
+      {
+        id: 'm2',
+        sender: 'manager',
+        name: 'manager',
+        avatar: 'manager',
+        content: '@programmer 查找数据A的定义和实现',
+        timestamp: '10:25',
+        references: [],
+        subagent: null,
+      },
+      {
+        id: 'm3',
+        sender: 'manager',
+        name: 'manager',
+        avatar: 'manager',
+        content: '@architect 分析数据A数据结构使用的上下文',
+        timestamp: '10:26',
+        references: [],
+        subagent: null,
+      },
+      {
+        id: 'm4',
+        sender: 'programmer',
+        name: 'programmer',
+        avatar: 'programmer',
+        content: '查到定义和实现 \n```\nclass A {\n    list* l; \n};\n```',
+        timestamp: '10:28',
+        references: [{ refId: 'm2', preview: '@programmer 查找数据A的定义和实现' }],
+        subagent: {
+          role: 'programmer',
+          detail: '📁 搜索代码库...\n✅ 找到定义: class A { list* l; };\n📌 实现位于 src/core/A.cpp:12\n🔁 子任务: 调用 linter 检查依赖 (完成)',
+        }
+      },
+      {
+        id: 'm5',
+        sender: 'architect',
+        name: 'architect',
+        avatar: 'architect',
+        content: '数据A 使用的上下文\n```\nA* a;\n//添加数据\na->add(new object()); \n```',
+        timestamp: '10:30',
+        references: [{ refId: 'm3', preview: '@architect 分析数据A数据结构使用的上下文' }],
+        subagent: {
+          role: 'architect',
+          detail: '📐 分析调用图...\n🔍 发现 A::add() 被 6 处调用\n🧩 推荐使用环形数组 (circular buffer) 替代 list\n📎 评估: 内存局部性提升 ~40%',
+        }
+      },
+      {
+        id: 'm6',
+        sender: 'manager',
+        name: 'manager',
+        avatar: 'manager',
+        content: '方案1 修改代码只要改A里面的list 换成array\n方案2 xxxx',
+        timestamp: '10:32',
+        references: [{ refId: 'm1', preview: '查看代码分析一下把数据结构 A 从list 改成环形数组' }],
+        subagent: null,
+      }
+    ];
+
+    // 状态
+    let messages = JSON.parse(JSON.stringify(initialMessages));
+    let selectedMessageId = null;
+    let contextTarget = null; // 右键点击的元素
+
+    // DOM 元素
+    const messageListEl = document.getElementById('messageList');
+    const contextMenu = document.getElementById('contextMenu');
+    const msgInput = document.getElementById('msgInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const subagentOverlay = document.getElementById('subagentOverlay');
+    const subagentLog = document.getElementById('subagentLog');
+    const closeSubagentBtn = document.getElementById('closeSubagent');
+
+    // 辅助：获取消息通过id
+    function getMessageById(id) {
+      return messages.find(m => m.id === id);
+    }
+
+    // 生成短id (模拟)
+    function generateId() {
+      return 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    }
+
+    // 渲染所有消息
+    function renderMessages() {
+      messageListEl.innerHTML = '';
+      messages.forEach(msg => {
+        const row = document.createElement('div');
+        row.className = `message-row ${msg.sender === 'user' ? 'self' : ''}`;
+        row.dataset.msgId = msg.id;
+
+        // 头像
+        const avatarDiv = document.createElement('div');
+        avatarDiv.className = `avatar ${msg.sender === 'user' ? 'self-avatar' : msg.avatar}`;
+        avatarDiv.textContent = msg.sender === 'user' ? '我' : (msg.name ? msg.name[0].toUpperCase() : '?');
+        if (msg.sender === 'user') avatarDiv.textContent = '我';
+        else if (msg.avatar === 'manager') avatarDiv.textContent = 'M';
+        else if (msg.avatar === 'programmer') avatarDiv.textContent = 'P';
+        else if (msg.avatar === 'architect') avatarDiv.textContent = 'A';
+
+        // 气泡
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+
+        // meta
+        const meta = document.createElement('div');
+        meta.className = 'msg-meta';
+        const roleSpan = document.createElement('span');
+        roleSpan.className = 'role-tag';
+        roleSpan.textContent = msg.sender === 'user' ? '我' : msg.name;
+        const timeSpan = document.createElement('span');
+        timeSpan.className = 'time';
+        timeSpan.textContent = msg.timestamp || '刚刚';
+        meta.appendChild(roleSpan);
+        meta.appendChild(timeSpan);
+        bubble.appendChild(meta);
+
+        // content
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'msg-content';
+        contentDiv.textContent = msg.content;
+        bubble.appendChild(contentDiv);
+
+        // 引用块
+        if (msg.references && msg.references.length > 0) {
+          const quoteBlock = document.createElement('div');
+          quoteBlock.className = 'quote-block';
+          msg.references.forEach(ref => {
+            const refMsg = getMessageById(ref.refId);
+            const previewText = ref.preview || (refMsg ? refMsg.content.slice(0, 20) : '引用消息');
+            const quoteInner = document.createElement('div');
+            quoteInner.className = 'quote-text';
+            quoteInner.innerHTML = `
+              <span class="quote-preview">
+                <span class="ref-icon">↩️ 引用</span>
+                <span>${previewText.length > 24 ? previewText.slice(0, 24)+'…' : previewText}</span>
+              </span>
+              <div style="margin-top:4px; color:#2563eb; font-size:13px; cursor:pointer;" class="clickable-ref" data-refid="${ref.refId}">📎 跳转到引用</div>
+            `;
+            quoteBlock.appendChild(quoteInner);
+          });
+          bubble.appendChild(quoteBlock);
+        }
+
+        // 添加subagent 标记
+        if (msg.subagent) {
+          const subTag = document.createElement('div');
+          subTag.style.cssText = 'margin-top:8px; font-size:12px; background:#eef2ff; padding:4px 12px; border-radius:40px; color:#1e3a8a; display:inline-block; cursor:pointer;';
+          subTag.textContent = '🔍 subagent 过程';
+          subTag.dataset.subagent = 'true';
+          subTag.dataset.msgId = msg.id;
+          bubble.appendChild(subTag);
+        }
+
+        row.appendChild(avatarDiv);
+        row.appendChild(bubble);
+        messageListEl.appendChild(row);
+      });
+
+      // 绑定引用点击跳转
+      document.querySelectorAll('.clickable-ref').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const refId = el.dataset.refid;
+          const target = document.querySelector(`.message-row[data-msg-id="${refId}"]`);
+          if (target) {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            target.style.background = '#fef9c3';
+            setTimeout(() => target.style.background = '', 1200);
+          }
+        });
+      });
+
+      // 绑定 subagent 标签点击
+      document.querySelectorAll('[data-subagent="true"]').forEach(el => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const msgId = el.dataset.msgId;
+          const msg = getMessageById(msgId);
+          if (msg && msg.subagent) {
+            subagentLog.textContent = msg.subagent.detail || '无详细信息';
+            subagentOverlay.style.display = 'flex';
+          }
+        });
+      });
+    }
+
+    // 添加新消息
+    function addMessage(sender, name, avatar, content, references = [], subagent = null) {
+      const newMsg = {
+        id: generateId(),
+        sender,
+        name,
+        avatar,
+        content,
+        timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+        references: references.map(r => ({ refId: r.refId, preview: r.preview || '' })),
+        subagent: subagent,
+      };
+      messages.push(newMsg);
+      renderMessages();
+      messageListEl.scrollTop = messageListEl.scrollHeight;
+      return newMsg;
+    }
+
+    // 删除消息
+    function deleteMessage(msgId) {
+      messages = messages.filter(m => m.id !== msgId);
+      renderMessages();
+      closeContextMenu();
+    }
+
+    // 编辑消息 (简单弹窗)
+    function editMessage(msgId) {
+      const msg = getMessageById(msgId);
+      if (!msg) return;
+      const newContent = prompt('编辑消息内容:', msg.content);
+      if (newContent !== null && newContent.trim() !== '') {
+        msg.content = newContent.trim();
+        renderMessages();
+      }
+      closeContextMenu();
+    }
+
+    // 处理引用: 从输入中提取 [数字] 或者通过上下文
+    function parseReferences(inputText) {
+      const refs = [];
+      // 简单匹配 [数字] 或者 [msg_id] 
+      const regex = /\[(\w+)\]/g;
+      let match;
+      while ((match = regex.exec(inputText)) !== null) {
+        const refId = match[1];
+        const refMsg = getMessageById(refId);
+        if (refMsg) {
+          refs.push({ refId: refId, preview: refMsg.content.slice(0, 20) });
+        }
+      }
+      // 如果没匹配到但是有常见引用如 @xxx 我们手动加一个? 但不做复杂处理。
+      return refs;
+    }
+
+    // 右键菜单处理
+    function showContextMenu(e, msgId) {
+      e.preventDefault();
+      selectedMessageId = msgId;
+      contextMenu.style.display = 'block';
+      contextMenu.style.left = Math.min(e.clientX, window.innerWidth - 220) + 'px';
+      contextMenu.style.top = Math.min(e.clientY, window.innerHeight - 180) + 'px';
+      contextTarget = e.target;
+    }
+
+    function closeContextMenu() {
+      contextMenu.style.display = 'none';
+      selectedMessageId = null;
+    }
+
+    // 事件绑定：右键消息
+    messageListEl.addEventListener('contextmenu', (e) => {
+      const row = e.target.closest('.message-row');
+      if (!row) return;
+      const msgId = row.dataset.msgId;
+      if (!msgId) return;
+      showContextMenu(e, msgId);
+    });
+
+    // 菜单点击
+    contextMenu.addEventListener('click', (e) => {
+      const action = e.target.closest('.menu-item')?.dataset.action;
+      if (!action) return;
+      if (selectedMessageId) {
+        if (action === 'delete') {
+          if (confirm('确定删除这条消息吗？')) deleteMessage(selectedMessageId);
+        } else if (action === 'edit') {
+          editMessage(selectedMessageId);
+        } else if (action === 'view-subagent') {
+          const msg = getMessageById(selectedMessageId);
+          if (msg && msg.subagent) {
+            subagentLog.textContent = msg.subagent.detail || '无 subagent 日志';
+            subagentOverlay.style.display = 'flex';
+          } else {
+            alert('该消息没有关联 subagent 过程');
+          }
+          closeContextMenu();
+        }
+      }
+      closeContextMenu();
+    });
+
+    // 点击其他区域关闭右键菜单
+    document.addEventListener('click', (e) => {
+      if (!contextMenu.contains(e.target)) closeContextMenu();
+    });
+
+    // 关闭子代理浮层
+    closeSubagentBtn.addEventListener('click', () => {
+      subagentOverlay.style.display = 'none';
+    });
+    subagentOverlay.addEventListener('click', (e) => {
+      if (e.target === subagentOverlay) subagentOverlay.style.display = 'none';
+    });
+
+    // 发送消息
+    function handleSend() {
+      const raw = msgInput.value.trim();
+      if (!raw) return;
+      // 解析引用
+      const refs = parseReferences(raw);
+      // 清除引用标记 [xxx] 保留内容
+      let cleanContent = raw.replace(/\[(\w+)\]/g, '').trim();
+      if (!cleanContent) cleanContent = raw;
+
+      // 添加为 "我" 的消息
+      addMessage('user', '我', 'self', cleanContent, refs, null);
+      msgInput.value = '';
+      msgInput.style.height = 'auto';
+    }
+
+    sendBtn.addEventListener('click', handleSend);
+    msgInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
+    });
+
+    // 初始渲染
+    renderMessages();
+    messageListEl.scrollTop = messageListEl.scrollHeight;
+
+    // 示例: 点击引用跳转 (已经用事件代理)
+    // 额外: 让引用可点击跳转
+
+    // 扩展: 双击消息可编辑 (辅助)
+    messageListEl.addEventListener('dblclick', (e) => {
+      const row = e.target.closest('.message-row');
+      if (!row) return;
+      const msgId = row.dataset.msgId;
+      if (msgId) editMessage(msgId);
+    });
+
+    console.log('✅ 团队对话已启动。引用格式: [消息id] 例如 [m1]');
+  })();
+</script>
+
+</body>
+</html>

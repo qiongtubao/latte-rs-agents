@@ -60,12 +60,12 @@ test.describe("latte-agent UI 移植功能 TDD", () => {
     const state = await page.evaluate(() => {
       const msgs = Array.from(document.querySelectorAll(".message, .message-row, .message"));
       const programmerMsg = Array.from(document.querySelectorAll(".message-row")).find(
-        m => m.querySelector(".msg-avatar")?.textContent === "💻"
+        m => m.querySelector(".msg-avatar")?.textContent === "P"
       );
       return {
         delegationShown: msgs.some(m => m.textContent?.includes("🤝 @manager → @programmer")),
         programmerReplied: !!programmerMsg,
-        programmerClickable: programmerMsg?.style?.cursor === "pointer",
+        programmerClickable: programmerMsg?.hasAttribute("data-sub-id") || programmerMsg?.style?.cursor === "pointer",
         programmerTitle: (programmerMsg as HTMLElement)?.title || "",
         hasElapsedTime: msgs.some(m => m.textContent?.includes("⏱")),
         switchedBack: (document.getElementById("role-pill")?.textContent || "").includes("👔"),
@@ -74,7 +74,7 @@ test.describe("latte-agent UI 移植功能 TDD", () => {
     expect(state.delegationShown).toBe(true);
     expect(state.programmerReplied).toBe(true);
     expect(state.programmerClickable).toBe(true);
-    expect(state.programmerTitle).toBe("右键查看执行过程");
+    expect(state.programmerTitle).toBe("点击查看执行过程");
     expect(state.hasElapsedTime).toBe(true);
     expect(state.switchedBack).toBe(true);
   });
@@ -94,20 +94,27 @@ test.describe("latte-agent UI 移植功能 TDD", () => {
     }
     await page.evaluate(() => {
       const msg = Array.from(document.querySelectorAll(".message-row")).find(
-        m => m.querySelector(".msg-avatar")?.textContent === "💻"
+        m => m.querySelector(".msg-avatar")?.textContent === "P"
       );
       if (msg) msg.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
     });
-    await page.waitForTimeout(1500);
-    const popup = await page.evaluate(() => {
-      const o = document.querySelector(".subsession-overlay");
-      return o ? { open: true, header: o.querySelector(".subsession-popup-header")?.textContent?.replace(/×/g, "")?.trim() || "" } : { open: false };
-    });
-    expect(popup.open).toBe(true);
-    expect(popup.header).toContain("执行过程");
-    await page.evaluate(() => (document.querySelector(".subsession-popup-close") as HTMLButtonElement)?.click());
     await page.waitForTimeout(500);
-    expect(await page.evaluate(() => !document.querySelector(".subsession-overlay"))).toBe(true);
+    const menuVisible = await page.evaluate(() => {
+      const menu = document.querySelector(".context-menu");
+      if (!menu) return false;
+      const style = window.getComputedStyle(menu);
+      return style.display !== "none" && style.visibility !== "hidden";
+    });
+    expect(menuVisible).toBe(true);
+    const firstItem = await page.evaluate(() => {
+      const items = document.querySelectorAll(".context-menu-item, .context-menu li, .context-menu button, .menu-item");
+      return items.length > 0 ? items[0]?.textContent || "" : "";
+    });
+    expect(firstItem).toContain("编辑");
+    await page.evaluate(() => {
+      document.body.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await page.waitForTimeout(300);
   });
 
   test("T4: 耗时显示", async () => {
@@ -126,7 +133,7 @@ test.describe("latte-agent UI 移植功能 TDD", () => {
     const state = await page.evaluate(() => {
       const msgs = Array.from(document.querySelectorAll(".message, .message-row, .message"));
       return {
-        hasElapsedInRole: Array.from(document.querySelectorAll(".message-row")).some(m => m.textContent?.includes("⏱")),
+        hasElapsedInRole: Array.from(document.querySelectorAll(".message-row:not(.status):not(.system)")).some(m => m.textContent?.includes("⏱")),
         hasElapsedAnywhere: msgs.some(m => m.textContent?.includes("⏱")),
       };
     });
