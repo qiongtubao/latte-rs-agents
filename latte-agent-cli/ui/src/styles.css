@@ -1254,3 +1254,45 @@ select {
   margin-left: auto;
 }
 .input-area.position-relative { position: relative; }
+
+/* ── code-ref chips (linkifier, design doc §5.2) ── */
+.code-ref-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.code-ref {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--accent);
+  font-family: var(--mono-font);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+.code-ref:hover {
+  background: var(--bg-2);
+  border-color: var(--accent);
+}
+.code-ref-graph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  transition: background 0.12s;
+}
+.code-ref-graph:hover {
+  background: var(--bg-3);
+}

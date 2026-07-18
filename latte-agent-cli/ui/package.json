@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port ${VITE_PORT:-5173}",
-    "build": "tsc && vite build",
+    "clean": "node -e \"const fs=require('fs'),path=require('path');(function walk(d){for(const f of fs.readdirSync(d)){const p=path.join(d,f);if(fs.statSync(p).isDirectory())walk(p);else if(p.endsWith('.js')&&fs.existsSync(p.slice(0,-3)+'.ts'))fs.unlinkSync(p);}})('src')\"",
+    "build": "npm run clean --silent && tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",

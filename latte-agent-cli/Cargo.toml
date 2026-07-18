@@ -11,15 +11,14 @@ path = "src/main.rs"
 latte-ai = { path = "../../latte-rs-model-router/latte-ai" }
 latte-agent-core = { path = "../latte-agent-core" }
 latte-agent-orchestrator = { path = "../latte-agent-orchestrator" }
+# `latte-agent ui` 的 server 实现（axum + SSE + 静态文件），
+# 供 CLI 薄壳与 Tauri 编辑器内嵌共用。
+latte-agent-ui-server = { path = "../latte-agent-ui-server" }
 latte-rs-agent-tools = { path = "../../latte-rs-agent-tools" }
-latte-rs-graph = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-# toml_edit：角色编辑器保存时重写 .latte/agents.d/<id>.toml，
-# 保留原文件的字段顺序与格式（toml::Value 默认 BTreeMap 会重排 key）。
-toml_edit = "0.22"
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 clap = { workspace = true }
@@ -29,14 +28,6 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 mime_guess = "2"
 merge-rs = "0.2.0"
-# HTTP server for `latte-agent ui` (web frontend bridge).
-# `axum` + `tower-http` for static-file serving + SSE event stream.
-# `tokio-stream` needs the `sync` feature for `BroadcastStream`
-# (we use it to convert `broadcast::Receiver<ChatEvent>` into a Stream).
-axum = { version = "0.7", features = ["macros"] }
-tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
-futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

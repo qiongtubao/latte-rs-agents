@@ -1169,15 +1169,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
  "chrono",
  "clap",
- "futures-util",
  "latte-agent-core",
  "latte-agent-orchestrator",
+ "latte-agent-ui-server",
  "latte-ai",
  "latte-rs-agent-tools",
- "latte-rs-graph",
  "merge-rs",
  "mime_guess",
  "parking_lot",
@@ -1185,10 +1183,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-stream",
  "toml",
- "toml_edit",
- "tower-http 0.5.2",
  "tracing-subscriber",
  "uuid",
 ]
@@ -1225,6 +1220,26 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "latte-agent-ui-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures-util",
+ "latte-agent-core",
+ "latte-ai",
+ "latte-rs-agent-tools",
+ "latte-rs-graph",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml_edit",
+ "tower-http 0.5.2",
 ]
 
 [[package]]

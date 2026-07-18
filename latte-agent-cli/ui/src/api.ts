@@ -4,6 +4,8 @@
 // persisted in localStorage so a tab refresh reattaches to the same
 // chat history without a server roundtrip.
 
+import { getHost } from "./host";
+
 export interface RoleInfo {
   id: string;
   name: string;
@@ -146,7 +148,13 @@ export interface SelfLoopEvent {
 // browser are independent browsing contexts — different localStorage
 // entries — but every tab talks to one logical session at the server.
 
-const SESSION_STORAGE_KEY = "latte-agent-ui-session-id";
+// When running inside the editor host, the session is persisted under a
+// host-provided per-workspace key (design doc §5.4); CLI browser mode
+// keeps the original bare key.
+const DEFAULT_SESSION_STORAGE_KEY = "latte-agent-ui-session-id";
+function sessionStorageKey(): string {
+  return getHost()?.sessionKey ?? DEFAULT_SESSION_STORAGE_KEY;
+}
 let currentSessionId: string | null = null;
 
 export function getCurrentSessionId(): string | null {
@@ -202,7 +210,7 @@ export async function deleteSession(sessionId: string): Promise<void> {
 export function persistSessionId(sessionId: string): void {
   currentSessionId = sessionId;
   if (typeof window !== "undefined") {
-    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    window.localStorage.setItem(sessionStorageKey(), sessionId);
   }
 }
 
@@ -213,7 +221,7 @@ export function persistSessionId(sessionId: string): void {
  */
 export async function ensureSession(): Promise<string> {
   const ls = typeof window !== "undefined" ? window.localStorage : null;
-  const persisted = ls?.getItem(SESSION_STORAGE_KEY) ?? null;
+  const persisted = ls?.getItem(sessionStorageKey()) ?? null;
   if (persisted) {
     const r = await fetch(
       `/api/session?id=${encodeURIComponent(persisted)}`,
@@ -222,7 +230,7 @@ export async function ensureSession(): Promise<string> {
       currentSessionId = persisted;
       return persisted;
     }
-    ls?.removeItem(SESSION_STORAGE_KEY);
+    ls?.removeItem(sessionStorageKey());
   }
   const id = await createSession();
   persistSessionId(id);
@@ -234,7 +242,7 @@ export async function ensureSession(): Promise<string> {
 export function clearLocalSessionId(): void {
   currentSessionId = null;
   if (typeof window !== "undefined") {
-    window.localStorage.removeItem(SESSION_STORAGE_KEY);
+    window.localStorage.removeItem(sessionStorageKey());
   }
 }
 

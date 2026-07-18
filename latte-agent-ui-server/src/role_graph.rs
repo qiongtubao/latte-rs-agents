@@ -23,10 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
+use latte_agent_core::config::AgentConfig;
 use latte_rs_graph::prelude::*;
 use serde::{Deserialize, Serialize};
-
-use super::config_layer;
 
 /// JSON wire shape returned to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +61,35 @@ pub struct RoleGraphStats {
     pub registrations: usize,
 }
 
+/// Load the merged agent config for the role graph.
+///
+/// 与原 CLI `config_layer::load(agents, models, 空 CliOverrides)` 对
+/// **roles** 的语义等价：`AgentConfig::load_with_global` 已经合并项目
+/// `agents.d` + 全局 `~/.latte/agents.d` + 内建角色，这里再把
+/// `models.d` 里可能定义的角色并进来。原 loader 里的 GlobalConfig
+/// 模型合并（`merge_into_project`）只改写 `models` 不动 `roles`，
+/// 而本模块只读 `roles`（name / model_tier / tools / prompt_file），
+/// 所以从略。
+fn load_agent_config(agents_dir: &Path, models_dir: &Path) -> Result<AgentConfig> {
+    let agents = agents_dir
+        .to_str()
+        .ok_or_else(|| anyhow!("agents path contains non-utf8"))?;
+    let mut cfg = AgentConfig::load_with_global(Some(agents))
+        .map_err(|e| anyhow!("load agent config: {e}"))?;
+    if models_dir.exists() {
+        let models = models_dir
+            .to_str()
+            .ok_or_else(|| anyhow!("models path contains non-utf8"))?;
+        let part =
+            AgentConfig::load(models).map_err(|e| anyhow!("load models config: {e}"))?;
+        cfg.roles.extend(part.roles);
+    }
+    Ok(cfg)
+}
+
 /// Build the role-graph for a project rooted at `cwd`.
 ///
-/// - Loads `.latte/agents.d/*.toml` via the CLI's config loader.
+/// - Loads `.latte/agents.d/*.toml` via the agent config loader.
 /// - Uses TreeSitterEngine to scan `project_root` (the latte-agents repo)
 ///   for `register_*_tool` call sites — these are the code-level evidence
 ///   that a role wires its tools in.
@@ -75,21 +100,7 @@ pub async fn build(cwd: &Path, project_root: &Path) -> Result<RoleGraph> {
     // 1. Load agent config from `.latte/agents.d/`.
     let agents_cfg_dir = cwd.join(".latte/agents.d");
     let models_cfg_dir = cwd.join(".latte/models.d");
-    let resolved = config_layer::load(
-        Some(agents_cfg_dir.to_str().ok_or_else(|| {
-            anyhow!("agents path contains non-utf8")
-        })?),
-        Some(models_cfg_dir.to_str().ok_or_else(|| {
-            anyhow!("models path contains non-utf8")
-        })?),
-        config_layer::CliOverrides {
-            api_key: None,
-            api_key_target: None,
-            field_overrides: vec![],
-        },
-    )
-    .map_err(|e| anyhow!("load agent config: {e}"))?;
-    let cfg = resolved.config;
+    let cfg = load_agent_config(&agents_cfg_dir, &models_cfg_dir)?;
 
     // 2. Build the code graph via TreeSitterEngine over a SQLite DB in
     //    $TMPDIR. TreeSitterEngine currently requires SqliteStorage.
@@ -197,12 +208,14 @@ struct ToolRegistration {
 
 /// A deterministic palette used by the UI to color nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // 预留给前端配色的公开 wire 类型，当前无 Rust 调用方
 pub struct NodePalette {
     pub role: String,
     pub tool: String,
     pub registration: String,
 }
 
+#[allow(dead_code)] // 同上：随 role_graph 一并搬入，暂无 Rust 调用方
 pub fn palette() -> NodePalette {
     NodePalette {
         role: "#4f46e5".into(),

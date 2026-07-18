@@ -98,7 +98,10 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
 ///
 /// Other frontends (e.g. `latte-agent ui`) translate the externally-
 /// tagged shape into their own preferred discriminated-union form
-/// (`{type:"Status",...}`) at the transport boundary. Do **not** add
+/// (`{type:"Status",...}`) at the transport boundary — the single
+/// implementation of that translation is
+/// [`crate::event_json::chat_event_to_frontend_json`] (contract C2),
+/// shared by the axum UI server and the Tauri adapter. Do **not** add
 /// `#[serde(tag = "type")]` here — it would break the existing
 /// Tauri / CLI consumers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

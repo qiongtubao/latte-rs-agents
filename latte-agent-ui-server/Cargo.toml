@@ -1,0 +1,31 @@
+[package]
+name = "latte-agent-ui-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable axum HTTP+SSE server that bridges ChatController to the latte-agent web UI"
+
+[lib]
+name = "latte_agent_ui_server"
+path = "src/lib.rs"
+
+[dependencies]
+latte-ai = { workspace = true }
+latte-agent-core = { path = "../latte-agent-core" }
+latte-rs-agent-tools = { workspace = true }
+latte-rs-graph = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = "1"
+# toml_edit：角色编辑器保存时重写 .latte/agents.d/<id>.toml，
+# 保留原文件的字段顺序与格式（toml::Value 默认 BTreeMap 会重排 key）。
+toml_edit = "0.22"
+# HTTP server: `axum` + `tower-http` for static-file serving + SSE event
+# stream. `tokio-stream` needs the `sync` feature for `BroadcastStream`
+# (converts `broadcast::Receiver<ChatEvent>` into a Stream).
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"

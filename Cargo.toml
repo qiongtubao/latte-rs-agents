@@ -2,6 +2,7 @@
 members = [
     "latte-agent-core",
     "latte-agent-orchestrator",
+    "latte-agent-ui-server",
     "latte-agent-cli",
 ]
 # Force resolver = "2" because latte-rs-graph (a path dep) is

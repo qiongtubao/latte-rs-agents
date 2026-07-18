@@ -11,6 +11,8 @@ import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
 import { mountRoleGraph } from "./role_graph";
 import { mountRoleEditor } from "./role_editor";
+import { waitForHost, setUiApi } from "./host";
+import { extractCodeRefs, makeRefChips } from "./linkify";
 
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -45,6 +47,11 @@ async function refreshSessionSelect(
 }
 
 async function main(): Promise<void> {
+  // Host handshake (design doc §5): resolves instantly when the editor
+  // already injected __LATTE_HOST__, otherwise waits ≤250ms and falls
+  // back to plain browser/CLI mode. Everything host-side is
+  // feature-detected, so behavior is unchanged without a host.
+  await waitForHost();
   let currentId: string;
   try {
     currentId = await ensureSession();
@@ -244,6 +251,11 @@ async function main(): Promise<void> {
   });
 
   chat.setFooter(`ready · role=${session.role} · session=${currentId}`);
+  // Mount complete — expose the UI api to the host (editor) page.
+  setUiApi({
+    focus: () => chat.focus(),
+    insertContext: (ref) => chat.insertContext(ref),
+  });
   console.log(`[ui] mounted; self-loop panel`, selfLoop.isOpen() ? "open" : "closed");
 }
 
@@ -275,15 +287,20 @@ function renderSubsessionEvent(ev: Record<string, unknown>): HTMLElement {
   switch (variant) {
     case "ToolExec": {
       const name = String(payload.name ?? "?");
-      const args = truncateText(String(payload.args_json ?? ""), 200);
+      const argsJson = String(payload.args_json ?? "");
+      const args = truncateText(argsJson, 200);
       const status = payload.status as Record<string, unknown> | undefined;
       let statusText = "";
+      let resultText = "";
       if (status) {
-        if ("Ok" in status) statusText = `✅ ${truncateText(String(status.Ok), 400)}`;
-        else if ("Err" in status) statusText = `❌ ${truncateText(String(status.Err), 400)}`;
+        if ("Ok" in status) { resultText = String(status.Ok); statusText = `✅ ${truncateText(resultText, 400)}`; }
+        else if ("Err" in status) { resultText = String(status.Err); statusText = `❌ ${truncateText(resultText, 400)}`; }
       }
       const latency = payload.latency_ms ? ` · ${payload.latency_ms}ms` : "";
       body.textContent = `🔧 ${name}(${args})${latency}${statusText ? "\n" + statusText : ""}`;
+      // Linkify: subagent 读代码的路径渲染为可点击 chip（§5.2）。
+      const chips = makeRefChips(extractCodeRefs(name, argsJson, resultText));
+      if (chips) body.appendChild(chips);
       break;
     }
     case "ParseToolCalls": {
@@ -292,6 +309,12 @@ function renderSubsessionEvent(ev: Record<string, unknown>): HTMLElement {
         parsed && parsed.length > 0
           ? parsed.map((c) => `→ ${c.name}(${truncateText(String(c.args), 150)})`).join("\n")
           : "(no tool calls parsed)";
+      if (parsed && parsed.length > 0) {
+        const refs = parsed.flatMap((c) =>
+          extractCodeRefs(String(c.name ?? ""), String(c.args ?? "")));
+        const chips = makeRefChips(refs);
+        if (chips) body.appendChild(chips);
+      }
       break;
     }
     case "PromptBuilt":

@@ -41,6 +41,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod event_json;
 pub mod global_config;
 pub mod hooks;
 pub mod model_resolver;

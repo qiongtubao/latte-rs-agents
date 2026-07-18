@@ -1,4 +1,6 @@
 import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole } from "./api";
+import { extractCodeRefs, makeRefChips } from "./linkify";
+import type { CodeRef } from "./host";
 
 interface UIBinding {
   messagesEl: HTMLElement; formEl: HTMLFormElement; inputEl: HTMLTextAreaElement;
@@ -19,6 +21,11 @@ export interface ChatController {
   refreshRoles(roles: RoleInfo[], selected: string): void;
   setStatus(s: "connected" | "disconnected" | "thinking" | "stalled"): void;
   clear(): void;
+  /** Focus the chat input (exposed to the host as `__LATTE_UI__.focus`). */
+  focus(): void;
+  /** Insert a code reference (and optional quote block) at the input
+   * cursor — the host calls this via `__LATTE_UI__.insertContext`. */
+  insertContext(ref: CodeRef & { quote?: string }): void;
 }
 
 const ROLE_ICONS: Record<string, string> = {
@@ -682,7 +689,9 @@ export function mountChat(opts: {
       case "ToolUse": {
         const t = truncate(e.args, 100);
         subagentTools.push(`🔧 ${e.tool_name}(${t})`);
-        addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        const useChips = makeRefChips(extractCodeRefs(e.tool_name, e.args));
+        if (useChips) toolRow.querySelector(".msg-bubble")?.appendChild(useChips);
         currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
         updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
         // Attribute by role so parallel delegates each collect their own tools.
@@ -694,7 +703,9 @@ export function mountChat(opts: {
       case "ToolResult": {
         const short = truncate(e.result, 80);
         subagentTools.push(`✅ ${e.tool_name} → ${short}`);
-        addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        const resultChips = makeRefChips(extractCodeRefs(e.tool_name, "", e.result));
+        if (resultChips) resultRow.querySelector(".msg-bubble")?.appendChild(resultChips);
         updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
         const resultSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
         const di2 = activeDelegates.get(resultSubId);
@@ -895,6 +906,27 @@ export function mountChat(opts: {
     lastUserMsgId = node.dataset.messageId!;
     return node.dataset.messageId!;
   }
+  function focus(): void { container.inputEl.focus(); }
+  /** Host → UI (`__LATTE_UI__.insertContext`, design doc §5.4): insert
+   * `参考 path:start-end (symbol) ` at the input cursor, with the
+   * optional quote rendered as a `> ` block above it. */
+  function insertContext(ref: CodeRef & { quote?: string }): void {
+    const ta = container.inputEl;
+    let text = "";
+    if (ref.quote?.trim()) {
+      text += ref.quote.trim().split("\n").map((l) => `> ${l}`).join("\n") + "\n";
+    }
+    let range = "";
+    if (ref.startLine !== undefined) {
+      range = `:${ref.startLine}`;
+      if (ref.endLine !== undefined && ref.endLine !== ref.startLine) range += `-${ref.endLine}`;
+    }
+    text += `参考 ${ref.path}${range}${ref.symbol ? ` (${ref.symbol})` : ""} `;
+    const pos = ta.selectionStart ?? ta.value.length;
+    ta.value = ta.value.slice(0, pos) + text + ta.value.slice(pos);
+    ta.selectionStart = ta.selectionEnd = pos + text.length;
+    focus();
+  }
   function setFooter(msg: string): void { container.footerMsg.textContent = msg; }
   function setRoleSelected(roleId: string): void { container.rolePill.textContent = roleId; container.roleSelect.value = roleId; }
   function refreshRoles(roles: RoleInfo[], selected: string): void {
@@ -928,7 +960,7 @@ export function mountChat(opts: {
       setStatus("connected");
     }
   }
-  return { appendUser, handleEvent, replayEvents, setFooter, setRoleSelected, refreshRoles, setStatus, clear };
+  return { appendUser, handleEvent, replayEvents, setFooter, setRoleSelected, refreshRoles, setStatus, clear, focus, insertContext };
 }
 
 function truncate(s: string, max: number): string { if (s.length<=max) return s; return s.slice(0,max)+"…"; }

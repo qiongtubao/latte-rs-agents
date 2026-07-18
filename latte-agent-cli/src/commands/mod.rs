@@ -13,7 +13,6 @@ pub mod pause;
 pub mod repl;
 pub mod resume;
 pub mod role_injector;
-pub mod role_graph;
 pub mod run;
 pub mod style;
 pub mod ui;
