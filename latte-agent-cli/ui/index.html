@@ -35,15 +35,19 @@
         <section id="chat-panel" class="panel chat-panel">
           <div id="messages" class="messages" aria-live="polite"></div>
           <form id="chat-form" class="chat-form">
-            <textarea
-              id="chat-input"
-              placeholder="向 latte-agent 提问…  (Enter 发送，Shift+Enter 换行，/ 命令)"
-              autocomplete="off"
-            ></textarea>
-            <div class="chat-form-actions">
-              <button id="chat-send" type="submit" class="primary">Send</button>
-              <button id="chat-clear" type="button">/clear</button>
-              <button id="chat-quit" type="button">/quit</button>
+            <div class="input-bar">
+              <textarea
+                id="chat-input"
+                class="input-bar-textarea"
+                placeholder="向 latte-agent 提问… (Enter 发送，Shift+Enter 换行)"
+                autocomplete="off"
+                rows="1"
+              ></textarea>
+              <button id="chat-send" type="submit" class="input-bar-btn">发送</button>
+            </div>
+            <div class="input-bar-actions">
+              <button id="chat-clear" type="button" class="input-bar-action">/clear</button>
+              <button id="chat-quit" type="button" class="input-bar-action">/quit</button>
             </div>
           </form>
 

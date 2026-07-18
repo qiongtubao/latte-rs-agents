@@ -372,6 +372,9 @@ select {
 }
 .message-row.error .msg-content {
   border-left: 3px solid rgba(248, 81, 73, 0.7);
+  border-color: rgba(248, 81, 73, 0.5);
+  padding-left: 0.6rem;
+}
 
 /* ─── fail-flash pulse animation ─────────────────────────────── */
 @keyframes fail-pulse {
@@ -383,35 +386,94 @@ select {
   animation: fail-pulse 0.8s ease-out 3;
 }
 
-/* ─── chat form ───────────────────────────────────────────────── */
+/* ─── input bar ───────────────────────────────────────────────── */
 
 .chat-form {
   border-top: 1px solid var(--border);
-  padding: 0.7rem;
+  padding: 0.7rem 0.8rem 0.6rem;
   background: var(--bg-2);
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-}
-.chat-form textarea {
-  width: 100%;
-  min-height: 60px;
-  max-height: 200px;
-  padding: 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-  resize: vertical;
-}
-.chat-form textarea:focus { outline: none; border-color: var(--accent); }
-.chat-form-actions {
-  display: flex;
-  gap: 0.5rem;
-  justify-content: flex-end;
+  gap: 0.4rem;
 }
 
+.input-bar {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 0.3rem 0.3rem 0.3rem 1rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.input-bar:focus-within {
+  border-color: #1f6feb;
+  box-shadow: 0 0 0 3px rgba(31, 111, 235, 0.15);
+  background: var(--bg);
+}
+
+.input-bar-textarea {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  resize: none;
+  padding: 0.5rem 0;
+  min-height: 1.5em;
+  max-height: 120px;
+  outline: none;
+}
+.input-bar-textarea::placeholder {
+  color: var(--fg-2);
+  opacity: 0.5;
+}
+
+.input-bar-btn {
+  background: #1f6feb;
+  color: #fff;
+  border: none;
+  border-radius: 40px;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.1s;
+  font-family: inherit;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.input-bar-btn:hover {
+  background: #388bfd;
+}
+.input-bar-btn:active {
+  background: #1f6feb;
+  transform: scale(0.97);
+}
+
+.input-bar-actions {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0 0.2rem;
+}
+.input-bar-action {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 40px;
+  padding: 0.2rem 0.7rem;
+  font-size: 0.72rem;
+  color: var(--fg-2);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.1s, color 0.1s;
+}
+.input-bar-action:hover {
+  background: rgba(110, 118, 129, 0.15);
+  color: var(--fg);
+}
 /* ─── trace panel ─────────────────────────────────────────────── */
 
 .trace-list {
