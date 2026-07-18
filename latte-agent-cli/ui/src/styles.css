@@ -715,6 +715,9 @@ select {
   margin-top: 0.2rem;
   padding-top: 0.2rem;
   border-top: 1px solid var(--border);
+}
+/* ─── quote / reference block ─────────────────────────────────── */
+
 .quote-block {
   background: rgba(110, 118, 129, 0.12);
   border-left: 4px solid var(--accent);
