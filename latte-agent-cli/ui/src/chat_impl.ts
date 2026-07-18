@@ -349,22 +349,98 @@ export function mountChat(opts: {
     container.sendBtn.disabled = false;
   });
 
-  container.inputEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); container.sendBtn.click(); }
-  });
-  container.inputEl.addEventListener("input", () => {
-    container.inputEl.style.height = "auto";
-    container.inputEl.style.height = Math.min(container.inputEl.scrollHeight, 140) + "px";
-  });
+  // ── @role autocomplete ──
+  const acBox = document.getElementById("role-autocomplete")!;
+  const ROLE_HINTS: Record<string, { icon: string; desc: string }> = {
+    programmer: { icon: "💻", desc: "读代码、分析实现" },
+    architect: { icon: "🏗️", desc: "架构评估、模块分析" },
+    reviewer: { icon: "🔍", desc: "代码审查、质量" },
+    tester: { icon: "🧪", desc: "测试策略、边界" },
+    security: { icon: "🛡️", desc: "安全审计" },
+    devops: { icon: "⚙️", desc: "构建部署" },
+    designer: { icon: "🎨", desc: "UI/UX 设计" },
+    tech_writer: { icon: "📝", desc: "文档写作" },
+    pm: { icon: "📋", desc: "需求分析" },
+  };
+  let acFilter = "";
+  let acIdx = -1;
 
-  // Escape closes any open overlay / menu.
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      document.getElementById("contextMenu")!.style.display = "none";
-      document.getElementById("subagentOverlay")!.style.display = "none";
+  function showAutocomplete(filter: string): void {
+    acFilter = filter;
+    acIdx = -1;
+    const entries = Object.entries(ROLE_HINTS)
+      .filter(([k]) => k.startsWith(filter.toLowerCase()));
+    if (entries.length === 0) { acBox.style.display = "none"; return; }
+    acBox.innerHTML = entries.map(([k, v], i) =>
+      `<div class="role-autocomplete-item${i===0?' active':''}" data-role="${k}">
+        <span class="ra-icon">${v.icon}</span>
+        <span class="ra-name">@${k}</span>
+        <span class="ra-desc">${v.desc}</span>
+      </div>`
+    ).join("");
+    acBox.style.display = "block";
+    acIdx = 0;
+  }
+
+  function hideAutocomplete(): void { acBox.style.display = "none"; acFilter = ""; acIdx = -1; }
+
+  function selectAutocompleteItem(role: string): void {
+    const input = container.inputEl;
+    const before = input.value.substring(0, input.selectionStart);
+    const after = input.value.substring(input.selectionStart);
+    const atIdx = before.lastIndexOf("@");
+    if (atIdx === -1) return;
+    input.value = before.substring(0, atIdx) + "@" + role + " " + after;
+    hideAutocomplete();
+    input.focus();
+  }
+
+  container.inputEl.addEventListener("keydown", (e) => {
+    if (acBox.style.display !== "none") {
+      const items = acBox.querySelectorAll(".role-autocomplete-item");
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        acIdx = Math.min(acIdx + 1, items.length - 1);
+        items.forEach((el, i) => el.classList.toggle("active", i === acIdx));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        acIdx = Math.max(acIdx - 1, 0);
+        items.forEach((el, i) => el.classList.toggle("active", i === acIdx));
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        const active = items[acIdx] as HTMLElement | undefined;
+        if (active) selectAutocompleteItem(active.dataset.role!);
+        return;
+      }
+      if (e.key === "Escape") { hideAutocomplete(); e.stopPropagation(); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey && acBox.style.display === "none") {
+      e.preventDefault(); container.sendBtn.click();
     }
   });
 
+  container.inputEl.addEventListener("input", () => {
+    container.inputEl.style.height = "auto";
+    container.inputEl.style.height = Math.min(container.inputEl.scrollHeight, 140) + "px";
+    const input = container.inputEl;
+    const pos = input.selectionStart;
+    const before = input.value.substring(0, pos);
+    const atMatch = before.match(/@([a-z_]*)$/i);
+    if (atMatch) {
+      showAutocomplete(atMatch[1]);
+    } else {
+      hideAutocomplete();
+    }
+  });
+
+  acBox.addEventListener("click", (e) => {
+    const item = (e.target as HTMLElement).closest(".role-autocomplete-item") as HTMLElement | null;
+    if (item) selectAutocompleteItem(item.dataset.role!);
+  });
   // Double-click a message row to edit (same as context-menu edit).
   container.messagesEl.addEventListener("dblclick", (e) => {
     const row = (e.target as HTMLElement).closest(".message-row") as HTMLElement | null;

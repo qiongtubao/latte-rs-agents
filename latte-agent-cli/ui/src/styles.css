@@ -461,6 +461,7 @@ select {
   gap: 10px;
   align-items: flex-end;
   flex-shrink: 0;
+  position: relative;
 }
 .chat-input {
   flex: 1;
@@ -1069,3 +1070,45 @@ select {
     transition-duration: 0.01ms !important;
   }
 }
+.role-autocomplete {
+  position: absolute;
+  bottom: 100%;
+  left: 18px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+  min-width: 180px;
+  max-height: 240px;
+  overflow-y: auto;
+  z-index: 100;
+  padding: 6px 0;
+}
+.role-autocomplete-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.1s;
+  color: var(--fg);
+}
+.role-autocomplete-item:hover,
+.role-autocomplete-item.active {
+  background: #f1f5f9;
+}
+.role-autocomplete-item .ra-icon {
+  font-size: 16px;
+  width: 24px;
+  text-align: center;
+}
+.role-autocomplete-item .ra-name {
+  font-weight: 500;
+}
+.role-autocomplete-item .ra-desc {
+  font-size: 12px;
+  color: #94a3b8;
+  margin-left: auto;
+}
+.input-area.position-relative { position: relative; }

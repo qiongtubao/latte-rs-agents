@@ -1452,6 +1452,11 @@ async fn build_tool_manager(
         keep.insert("mcp_list".to_string());
         keep.insert("mcp_call".to_string());
     }
+    // Register code_graph tool if allowed
+    if keep.contains("code_graph") || keep.contains("code-graph") {
+        let cg = code_graph_tool();
+        mgr.register(cg, None);
+    }
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -1462,6 +1467,78 @@ async fn build_tool_manager(
         }
     }
     Ok(mgr)
+}
+
+fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
+    use latte_rs_agent_tools::types::*;
+    use latte_rs_agent_tools::error::ToolError;
+    use std::sync::Arc;
+    use serde_json::json;
+
+    fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
+        ToolInputProperty {
+            property_type: ty,
+            description: Some(desc.into()),
+            enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+        }
+    }
+    fn optional_schema(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
+        let mut p = std::collections::BTreeMap::new();
+        for (name, ty, desc) in props {
+            p.insert(name.to_string(), prop(ty, desc));
+        }
+        ToolInputSchema {
+            schema_type: SchemaType::default(),
+            properties: p,
+            required: None,
+            additional_properties: None,
+        }
+    }
+
+    let handler: SharedToolHandler = Arc::new(|input: serde_json::Value, _ctx| {
+        Box::pin(async move {
+            let pattern = input.get("pattern")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::other("pattern is required"))?;
+            let path = input.get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            let kind = input.get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("function");
+            let query = match kind {
+                "function" => format!("fn $NAME($$$PARAMS) -> $RET {{ $$$BODY }}"),
+                "struct" => format!("struct $NAME {{ $$$FIELDS }}"),
+                "class" => format!("class $NAME {{ $$$BODY }}"),
+                "import" => format!("import {{ $$$IMPORTS }} from \"$SRC\""),
+                "interface" => format!("interface $NAME {{ $$$BODY }}"),
+                "trait" => format!("trait $NAME {{ $$$BODY }}"),
+                "impl" => format!("impl $NAME {{ $$$BODY }}"),
+                "call" => format!("$CALLEE($$$ARGS)"),
+                _ => pattern.to_string(),
+            };
+            let output = tokio::process::Command::new("sg")
+                .args(["-p", &query, path])
+                .output().await
+                .map_err(|e| ToolError::execution_str("code_graph", format!("sg failed: {e}")))?;
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let mut result = serde_json::Map::new();
+            result.insert("matches".into(), serde_json::Value::String(stdout));
+            if !stderr.is_empty() {
+                result.insert("stderr".into(), serde_json::Value::String(stderr));
+            }
+            Ok(serde_json::Value::Object(result))
+        })
+    });
+    let schema = optional_schema(vec![
+        ("pattern", PropertyType::String, "AST 模式，如 fn $NAME($$$PARAMS) -> $RET { $$$BODY }"),
+        ("path", PropertyType::String, "搜索路径，默认当前目录"),
+        ("kind", PropertyType::String, "查询类型: function/struct/class/import/interface/trait/impl/call"),
+    ]);
+    Tool::builder("code_graph", "用 AST 模式查询代码结构，比 grep 更精准。支持多种结构类型查询", schema, handler)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
 }
 
 fn tool_usage_prompt(allowed: &[String]) -> String {
@@ -1490,6 +1567,7 @@ Examples:
 "#
     )
 }
+
 const DELEGATE_TOOL_HINT: &str = r#"
 ### 关键规则：你必须使用 delegate 工具
 
