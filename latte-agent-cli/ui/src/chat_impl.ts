@@ -296,7 +296,7 @@ export function mountChat(opts: {
       subagentTools = [];
       try {
         await switchRole(targetRole);
-        await sendMessage(msgText);
+        await sendMessage(rawText);
       } catch (err) {
         addMessage({ kind: "error", content: `派发给 @${targetRole} 失败: ${String(err)}` });
         delegationTargetRole = "";

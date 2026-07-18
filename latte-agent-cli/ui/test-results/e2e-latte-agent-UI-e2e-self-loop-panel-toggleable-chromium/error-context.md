@@ -6,23 +6,23 @@
 
 # Test info
 
-- Name: e2e.spec.ts >> latte-agent UI e2e >> self-loop form requires task
-- Location: __tests__/e2e.spec.ts:110:3
+- Name: e2e.spec.ts >> latte-agent UI e2e >> self-loop panel toggleable
+- Location: __tests__/e2e.spec.ts:94:3
 
 # Error details
 
 ```
 Error: expect(locator).toBeVisible() failed
 
-Locator:  locator('#self-loop-task')
+Locator:  locator('#self-loop-panel')
 Expected: visible
 Received: hidden
 Timeout:  5000ms
 
 Call log:
   - Expect "toBeVisible" with timeout 5000ms
-  - waiting for locator('#self-loop-task')
-    14 × locator resolved to <input type="text" required="" id="self-loop-task" placeholder="e.g. make the chat input auto-resize and remember history"/>
+  - waiting for locator('#self-loop-panel')
+    14 × locator resolved to <aside id="self-loop-panel" class="panel self-loop-panel hidden">…</aside>
        - unexpected value "hidden"
 
 ```
@@ -54,12 +54,24 @@ Call log:
   - heading "🧩 Subagent 执行过程 关闭" [level=3]:
     - text: 🧩 Subagent 执行过程
     - button "关闭"
-  - text: 加载中… ready · role=manager · session=ui-2026298-1784351772238
+  - text: 加载中… ready · role=manager · session=ui-2026298-1784351765484
 ```
 
 # Test source
 
 ```ts
+  1   | /**
+  2   |  * Playwright e2e 测试：验证 latte-agent UI 端到端工作。
+  3   |  *
+  4   |  * 这些测试是 self-debug loop 的"验收基线"：
+  5   |  *   - self-loop 修改 ui/src/*.ts 后，**必须**通过这些测试才算"没改坏"。
+  6   |  *   - 如果这些测试失败，runner.ts 会自动让 AI 回滚 / 重写。
+  7   |  *
+  8   |  * 测试覆盖：
+  9   |  *   1. 页面加载无 console error
+  10  |  *   2. Chat 面板 + role selector + 状态 pill 渲染
+  11  |  *   3. /api/roles 返回角色列表
+  12  |  *   4. SSE /api/events 至少能订阅上
   13  |  *   5. Self-loop 面板打开/关闭
   14  |  */
   15  | 
@@ -145,7 +157,8 @@ Call log:
   95  |     const panel = page.locator("#self-loop-panel");
   96  |     await expect(panel).toBeHidden();
   97  |     await page.click("#self-loop-btn");
-  98  |     await expect(panel).toBeVisible();
+> 98  |     await expect(panel).toBeVisible();
+      |                         ^ Error: expect(locator).toBeVisible() failed
   99  |     await page.click("#self-loop-close");
   100 |     await expect(panel).toBeHidden();
   101 |   });
@@ -160,8 +173,7 @@ Call log:
   110 |   test("self-loop form requires task", async () => {
   111 |     await page.click("#self-loop-btn");
   112 |     const input = page.locator("#self-loop-task");
-> 113 |     await expect(input).toBeVisible();
-      |                         ^ Error: expect(locator).toBeVisible() failed
+  113 |     await expect(input).toBeVisible();
   114 |     // HTML5 required 阻止 form submit。断言：缺 task 时不应触发
   115 |     // /api/self-loop/start。监听器先挂，再 click，再断言。
   116 |     let started = false;
