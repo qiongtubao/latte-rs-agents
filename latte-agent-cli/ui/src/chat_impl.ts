@@ -48,7 +48,6 @@ export function mountChat(opts: {
   // Capture tool events for @role delegation subsession
   let capturedTools: { tool: string; args: string; result?: string }[] = [];
   let delegationSubId = "";
-  let pendingSubagentDetail: string | null = null; // captured from RoleStarted for next RoleTurn
 
   function nextId(): string { return `m${++msgCounter}`; }
 
@@ -487,25 +486,55 @@ export function mountChat(opts: {
       document.getElementById("subagentOverlay")!.style.display = "none";
     }
   });
+  // ── Subagent detail: collect tool events for current role ──
+  let subagentTools: string[] = [];
+
+  function buildSubagentDetail(): string {
+    if (subagentTools.length === 0) return "没有工具调用日志";
+    return subagentTools.map((line, i) => `[${i + 1}] ${line}`).join("\n");
+  }
 
   function handleEvent(e: ChatEvent): void {
     switch (e.type) {
       case "RoleStarted": {
-        pendingSubagentDetail = e.detail;
+        subagentTools = [];
         addMessage({ kind:"status", content:`🧠 ${e.role_id} 开始执行…` });
         break;
       }
       case "RoleFinished": {
-        if (e.detail && !pendingSubagentDetail) pendingSubagentDetail = e.detail;
         addMessage({ kind:"status", content:`✅ ${e.role_id} 完成` });
         break;
       }
+      case "ToolUse": {
+        const t = truncate(e.args, 100);
+        subagentTools.push(`🔧 ${e.tool_name}(${t})`);
+        addMessage({ kind:"tool", content:`${e.tool_name} ${t}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
+        currentToolCall=`🔧 ${e.tool_name}`; currentActivity=`正在调用 ${e.tool_name}…`;
+        updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
+        if (delegationTargetRole) capturedTools.push({ tool: e.tool_name, args: e.args });
+        break;
+      }
+      case "ToolResult": {
+        const short = truncate(e.result, 80);
+        subagentTools.push(`✅ ${e.tool_name} → ${short}`);
+        addMessage({ kind:"tool", content:`${e.tool_name} → ${truncate(e.result,200)}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
+        currentToolCall=""; currentActivity=`${e.tool_name} 完成`;
+        updateFooter(); updateStatusPillLabel(`${currentRoleIcon||resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
+        if (delegationTargetRole && capturedTools.length > 0) {
+          const last = capturedTools[capturedTools.length - 1];
+          if (last.tool === e.tool_name) last.result = e.result;
+        }
+        break;
+      }
+      case "ToolError": {
+        subagentTools.push(`❌ ${e.tool_name}: ${truncate(e.error, 100)}`);
+        updateFooter(); resetWaitTimer(); break;
+      }
       case "RoleTurn": {
         const icon = resolveIcon(e.role_id);
-        const subagent = pendingSubagentDetail ? { detail: pendingSubagentDetail } : undefined;
+        const subagent = subagentTools.length > 0 ? { detail: buildSubagentDetail() } : undefined;
         const roleSubId = delegationTargetRole ? delegationSubId : undefined;
         addMessage({ kind:"role", content:e.content, meta:e.role_id, icon, subagent, subId: roleSubId });
-        pendingSubagentDetail = null;
         currentToolCall=""; currentActivity=""; updateFooter();
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
@@ -540,29 +569,6 @@ export function mountChat(opts: {
         addMessage({ kind:"system", content:`[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
         resetWaitTimer(); currentToolCall=""; currentDelegate=""; updateFooter(); break;
       case "RoundEnded": addMessage({ kind:"system", content:`[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
-      case "ToolUse": {
-        const t = truncate(e.args,150);
-        addMessage({ kind:"tool", content:`${e.tool_name} ${t}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
-        currentToolCall=`🔧 ${e.tool_name}`; currentActivity=`正在调用 ${e.tool_name}…`;
-        updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
-        // Capture for @role delegation popup
-        if (delegationTargetRole) capturedTools.push({ tool: e.tool_name, args: e.args });
-        break;
-      }
-      case "ToolResult": {
-        addMessage({ kind:"tool", content:`${e.tool_name} → ${truncate(e.result,200)}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
-        currentToolCall=""; currentActivity=`${e.tool_name} 完成`;
-        updateFooter(); updateStatusPillLabel(`${currentRoleIcon||resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
-        // Capture result for @role delegation popup
-        if (delegationTargetRole && capturedTools.length > 0) {
-          const last = capturedTools[capturedTools.length - 1];
-          if (last.tool === e.tool_name) last.result = e.result;
-        }
-        break;
-      }
-      case "ToolError": {
-        updateFooter(); resetWaitTimer(); break;
-      }
       case "DelegateStarted": {
         const t = truncate(e.task,60);
         addMessage({ kind:"system", content:`🤝 @${e.from_role} → @${e.to_role}`, subId:e.sub_id });
