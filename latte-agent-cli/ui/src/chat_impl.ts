@@ -304,8 +304,20 @@ export function mountChat(opts: {
         }
       });
     }
-    container.messagesEl.appendChild(row);
 
+    // ── Store record for context menu & reference lookup ──
+    messageStore.push({
+      id,
+      kind,
+      content: opts2.content,
+      meta: opts2.meta,
+      icon: opts2.icon,
+      reference: opts2.reference,
+      subagent: opts2.subagent ?? null,
+      timestamp: ts,
+      el: row,
+    });
+    container.messagesEl.appendChild(row);
     if (isNearBottom()) scrollToBottom();
     return row;
   }
