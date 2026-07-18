@@ -101,7 +101,8 @@ impl UiCmd {
             cli_overrides,
         )
         .map_err(|e| format!("failed to load configuration: {}", e))?;
-        let merged: Arc<AgentConfig> = Arc::new(resolved.config);
+        let merged: Arc<parking_lot::RwLock<AgentConfig>> =
+            Arc::new(parking_lot::RwLock::new(resolved.config));
         let resolver: Arc<ModelResolver> = Arc::new(resolved.resolver);
 
         // 2. 决定初始 role 和 tier。
@@ -113,6 +114,7 @@ impl UiCmd {
             Some(parse_tier_str(t)?)
         } else {
             merged
+                .read()
                 .roles
                 .get(&initial_role)
                 .map(|tpl| parse_tier_str(&tpl.model_tier).unwrap_or(ModelTier::Standard))
@@ -184,6 +186,7 @@ impl UiCmd {
             static_dir: static_dir.clone(),
             self_loop: Arc::new(SelfLoopState::default()),
             subsession_store: subsession_store.clone(),
+            agents_config: self.agents_config.clone(),
         };
         let app = build_router(state);
         eprintln!(
@@ -220,7 +223,9 @@ struct AppState {
     /// ChatController + ChatEvent broadcast channel, so chats across
     /// tabs don't pollute each other.
     sessions: Arc<SessionMap>,
-    merged: Arc<AgentConfig>,
+    /// RwLock：角色编辑器（POST /api/roles/config）保存后直接改写内存
+    /// 配置，新 session 立即用新配置，无需重启 server。
+    merged: Arc<parking_lot::RwLock<AgentConfig>>,
     resolver: Arc<ModelResolver>,
     cwd: PathBuf,
     initial_role: String,
@@ -234,6 +239,9 @@ struct AppState {
     /// tab-B's events (the (session_id, sub_id) key keeps them apart
     /// even when the store is process-wide).
     subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
+    /// UiCmd `--agents-config` 原值（文件或目录），角色编辑器保存时
+    /// 用它定位 `.latte/agents.d/<id>.toml`。
+    agents_config: String,
 }
 
 /// Per-tab state. Holds the controller and the broadcast channel the
@@ -246,6 +254,13 @@ struct SessionHandle {
     /// Preview copy of the first user message — used by `/api/sessions`
     /// to render a sidebar entry without re-reading the controller.
     first_user_msg: parking_lot::Mutex<Option<String>>,
+    /// User-assigned display name (via POST /api/session/label). When
+    /// set it takes precedence over `first_user_msg` in the sidebar.
+    label: parking_lot::Mutex<Option<String>>,
+    /// Frontend-JSON `ChatEvent`s captured for this session. `GET
+    /// /api/session/history` replays these so the chat panel restores
+    /// its content when the user switches back to this session.
+    event_log: Arc<parking_lot::RwLock<Vec<String>>>,
     created_at: Instant,
     last_activity: Arc<parking_lot::Mutex<Instant>>,
     initial_role: String,
@@ -275,7 +290,7 @@ fn unix_ts_millis() -> u64 {
 async fn create_session_handle(
     session_id: String,
     initial_role: &str,
-    merged: &Arc<AgentConfig>,
+    merged: &Arc<parking_lot::RwLock<AgentConfig>>,
     resolver: &Arc<ModelResolver>,
     cwd: &std::path::Path,
     primary_model_id: Option<String>,
@@ -294,7 +309,9 @@ async fn create_session_handle(
         initial_prompt: None,
         max_rounds: 0,
         session_token_budget: 0,
-        agent_config: merged.clone(),
+        // snapshot 一份当前配置：session 固化创建时刻的配置，
+        // 之后的角色编辑只影响新建的 session。
+        agent_config: Arc::new(merged.read().clone()),
         model_resolver: resolver.clone(),
         default_params: GenerateParams::default(),
         primary_model_id,
@@ -308,11 +325,34 @@ async fn create_session_handle(
     // controller runs in the background. We don't keep the receiver
     // here — the per-tab SSE subscriber is what reads events.
     let _rx = controller.spawn(cfg).await;
+    // Archive every ChatEvent as frontend-shaped JSON so a tab that
+    // switches away and back can restore the chat contents. Bounded
+    // to MAX_LOG entries (oldest dropped) to keep memory flat.
+    let event_log: Arc<parking_lot::RwLock<Vec<String>>> =
+        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    {
+        let log = event_log.clone();
+        let mut archive_rx = controller.subscribe();
+        tokio::spawn(async move {
+            const MAX_LOG: usize = 5000;
+            while let Ok(ev) = archive_rx.recv().await {
+                if let Ok(json) = chat_event_to_frontend_json(&ev) {
+                    let mut g = log.write();
+                    if g.len() >= MAX_LOG {
+                        g.remove(0);
+                    }
+                    g.push(json);
+                }
+            }
+        });
+    }
     let now = Instant::now();
     Ok(SessionHandle {
         session_id,
         controller,
         first_user_msg: parking_lot::Mutex::new(None),
+        label: parking_lot::Mutex::new(None),
+        event_log,
         created_at: now,
         last_activity: Arc::new(parking_lot::Mutex::new(now)),
         initial_role: initial_role.to_string(),
@@ -326,9 +366,18 @@ fn build_router(state: AppState) -> Router {
     // create their own session_id; thereafter every chat/event call
     // carries `session_id` so the server stays tab-scoped.
     let api = Router::new()
-        .route("/sessions", get(list_sessions).post(create_session))
+        .route(
+            "/sessions",
+            get(list_sessions).post(create_session).delete(delete_session),
+        )
         .route("/session", get(get_session))
+        .route("/session/label", post(set_session_label))
+        .route("/session/history", get(get_session_history))
         .route("/roles", get(list_roles))
+        .route(
+            "/roles/config",
+            get(get_roles_config).post(save_role_config),
+        )
         .route("/chat/send", post(chat_send))
         .route("/chat/command", post(chat_command))
         .route("/chat/role", post(switch_role))
@@ -378,6 +427,9 @@ struct SessionSummary {
     session_id: String,
     /// First user message, truncated, used as the human label.
     preview: String,
+    /// User-assigned display name (POST /api/session/label). `None`
+    /// until the user renames the session.
+    label: Option<String>,
     initial_role: String,
     created_at_unix_ms: u64,
     last_activity_unix_ms: u64,
@@ -395,12 +447,15 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary
                 .lock()
                 .clone()
                 .unwrap_or_else(|| "(no user message yet)".into()),
+            label: h.label.lock().clone(),
             initial_role: h.initial_role.clone(),
             created_at_unix_ms: millis_from_now(now, h.created_at),
             last_activity_unix_ms: millis_from_now(now, *h.last_activity.lock()),
         })
         .collect();
-    out.sort_by(|a, b| b.last_activity_unix_ms.cmp(&a.last_activity_unix_ms));
+    // last_activity_unix_ms 存的是"距上次活动的毫秒数"（age），越小越
+    // 新。按 age 升序排，最近活跃的 session 排最前。
+    out.sort_by(|a, b| a.last_activity_unix_ms.cmp(&b.last_activity_unix_ms));
     Json(out)
 }
 
@@ -438,11 +493,12 @@ async fn create_session(
         available_sessions: vec![SessionSummary {
             session_id: h.session_id.clone(),
             preview: "(new)".into(),
+            label: None,
             initial_role: h.initial_role.clone(),
             created_at_unix_ms: 0,
             last_activity_unix_ms: 0,
         }],
-        available_roles: build_role_info(&state.merged),
+        available_roles: build_role_info(&state.merged.read()),
     };
     state.sessions.write().insert(h.session_id.clone(), h);
     Ok(Json(resp))
@@ -493,6 +549,7 @@ async fn get_session(
         map.get(id).cloned()
     }
     .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session {id} unknown")))?;
+    let label = h.label.lock().clone();
     Ok(Json(SessionInfo {
         session_id: h.session_id.clone(),
         role: h.initial_role.clone(),
@@ -504,6 +561,7 @@ async fn get_session(
                 let g = h.first_user_msg.lock();
                 g.clone().unwrap_or_default()
             },
+            label,
             initial_role: h.initial_role.clone(),
             created_at_unix_ms: millis_from_now(Instant::now(), h.created_at),
             last_activity_unix_ms: {
@@ -511,12 +569,87 @@ async fn get_session(
                 millis_from_now(Instant::now(), *g)
             },
         }],
-        available_roles: build_role_info(&state.merged),
+        available_roles: build_role_info(&state.merged.read()),
     }))
 }
 
+/// GET /api/session/history?id=... — return the archived ChatEvent log
+/// for a session so the UI can restore chat contents after a switch.
+async fn get_session_history(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing id".into()))?;
+    let h: Arc<SessionHandle> = {
+        let map = state.sessions.read();
+        map.get(id).cloned()
+    }
+    .ok_or_else(|| (StatusCode::NOT_FOUND, format!("session {id} unknown")))?;
+    let events: Vec<serde_json::Value> = h
+        .event_log
+        .read()
+        .iter()
+        .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .collect();
+    Ok(Json(events))
+}
+
+/// DELETE /api/sessions?id=... — remove a session and stop its
+/// controller. The UI switches to another session (or creates a new
+/// one) before calling this when deleting the active session.
+async fn delete_session(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing id".into()))?;
+    let removed = state.sessions.write().remove(id);
+    match removed {
+        Some(h) => {
+            h.controller.abort().await;
+            Ok(StatusCode::OK)
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("session {id} unknown"),
+        )),
+    }
+}
+
+#[derive(Deserialize)]
+struct LabelRequest {
+    session_id: String,
+    label: String,
+}
+
+/// POST /api/session/label — rename a session. An empty/whitespace
+/// label clears the custom name and falls back to the preview.
+async fn set_session_label(
+    State(state): State<AppState>,
+    Json(req): Json<LabelRequest>,
+) -> StatusCode {
+    let Ok(h) = resolve_session(&state, Some(req.session_id.as_str()), None).await else {
+        return StatusCode::NOT_FOUND;
+    };
+    let trimmed = req.label.trim();
+    *h.label.lock() = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(60).collect())
+    };
+    h.touch();
+    StatusCode::OK
+}
+
 async fn list_roles(State(state): State<AppState>) -> Json<Vec<RoleInfo>> {
-    Json(build_role_info(&state.merged))
+    Json(build_role_info(&state.merged.read()))
 }
 
 fn build_role_info(cfg: &AgentConfig) -> Vec<RoleInfo> {
@@ -533,6 +666,283 @@ fn build_role_info(cfg: &AgentConfig) -> Vec<RoleInfo> {
         }
     }
     out
+}
+
+// ─── Role Config API（角色编辑器） ────────────────────────────────
+
+/// `GET /api/roles/config` 返回的单个角色条目。
+#[derive(Serialize)]
+struct RoleConfigEntry {
+    id: String,
+    name: String,
+    category: String,
+    icon: String,
+    model_tier: String,
+    model_chain: Vec<String>,
+    temperature: Option<f64>,
+    tools: Vec<String>,
+    skills: Vec<String>,
+    prompt_file: Option<String>,
+    /// 当前生效的 system prompt 文本（编辑器里直接改它）。
+    prompt: String,
+}
+
+#[derive(Serialize)]
+struct RolesConfigResponse {
+    roles: Vec<RoleConfigEntry>,
+    available_tools: Vec<String>,
+    tiers: Vec<String>,
+}
+
+/// 读取角色当前 prompt：优先 `prompt_file`（相对 state.cwd），读不到
+/// 或 None 时回退内嵌兜底 prompt，再不行空串。
+fn read_role_prompt(
+    cwd: &std::path::Path,
+    tpl: &latte_agent_core::role::RoleTemplate,
+) -> String {
+    if let Some(f) = &tpl.prompt_file {
+        if let Ok(s) = std::fs::read_to_string(cwd.join(f)) {
+            return s;
+        }
+    }
+    latte_agent_core::prompts::for_role(&tpl.id)
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
+fn role_config_entry(
+    cwd: &std::path::Path,
+    tpl: &latte_agent_core::role::RoleTemplate,
+) -> RoleConfigEntry {
+    RoleConfigEntry {
+        id: tpl.id.clone(),
+        name: tpl.name.clone(),
+        category: tpl.category.clone(),
+        icon: tpl.icon.clone(),
+        model_tier: tpl.model_tier.clone(),
+        model_chain: tpl.model_chain.clone(),
+        temperature: tpl.temperature,
+        tools: tpl.tools.clone(),
+        skills: tpl.skills.clone(),
+        prompt_file: tpl.prompt_file.clone(),
+        prompt: read_role_prompt(cwd, tpl),
+    }
+}
+
+/// 枚举全部可用工具的 short name：注册全部 builtin packages 后取
+/// `get_tool_names()` 的最后一段，去重排序，再补上 `delegate` 和
+/// `workflow`（这两个由 controller 动态注册，不在 builtin packages 里）。
+async fn enumerate_available_tools() -> Result<Vec<String>, (StatusCode, String)> {
+    use latte_rs_agent_tools::prelude::*;
+    let mgr = create_tool_manager();
+    for p in builtin_tool_packages() {
+        mgr.register_package(p).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("register_package: {e}"),
+            )
+        })?;
+    }
+    let mut names: std::collections::BTreeSet<String> = mgr
+        .get_tool_names()
+        .into_iter()
+        .map(|n| n.rsplit('.').next().unwrap_or(&n).to_string())
+        .collect();
+    names.insert("delegate".to_string());
+    names.insert("workflow".to_string());
+    Ok(names.into_iter().collect())
+}
+
+async fn get_roles_config(
+    State(state): State<AppState>,
+) -> Result<Json<RolesConfigResponse>, (StatusCode, String)> {
+    let roles = {
+        let cfg = state.merged.read();
+        let mut ids: Vec<&String> = cfg.roles.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| cfg.roles.get(id))
+            .map(|tpl| role_config_entry(&state.cwd, tpl))
+            .collect()
+    };
+    let available_tools = enumerate_available_tools().await?;
+    Ok(Json(RolesConfigResponse {
+        roles,
+        available_tools,
+        tiers: vec!["premium".into(), "standard".into(), "budget".into()],
+    }))
+}
+
+/// `POST /api/roles/config` 的请求体。`category` / `prompt_file` /
+/// `skills` 不在其中 —— 保存时保持原值不变。
+#[derive(Deserialize)]
+struct SaveRoleConfigRequest {
+    id: String,
+    name: String,
+    icon: String,
+    model_tier: String,
+    #[serde(default)]
+    model_chain: Vec<String>,
+    temperature: Option<f64>,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    prompt: String,
+}
+
+/// 由 UiCmd `--agents-config`（文件或目录）定位角色 TOML 所在目录；
+/// 指向文件时取其父目录，空值兜底 `.latte/agents.d`。
+fn agents_config_dir(agents_config: &str) -> PathBuf {
+    let p = PathBuf::from(agents_config);
+    if p.is_file() {
+        return p
+            .parent()
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".latte/agents.d"));
+    }
+    if agents_config.trim().is_empty() {
+        return PathBuf::from(".latte/agents.d");
+    }
+    p
+}
+
+fn str_array(items: &[String]) -> toml_edit::Array {
+    items.iter().map(String::as_str).collect()
+}
+
+/// 重写 `.latte/agents.d/<id>.toml`。已有文件用 toml_edit 原地改值，
+/// 保持原有字段顺序/格式；新文件按项目现有风格（参考 manager.toml）
+/// 排字段顺序。`category` / `prompt_file` / `skills` 保持原值。
+fn write_role_toml(
+    path: &std::path::Path,
+    tpl: &latte_agent_core::role::RoleTemplate,
+    req: &SaveRoleConfigRequest,
+) -> Result<(), String> {
+    use toml_edit::{value, DocumentMut, Item, Table};
+    let mut doc: DocumentMut = match std::fs::read_to_string(path) {
+        Ok(content) => content
+            .parse()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?,
+        Err(_) => DocumentMut::new(),
+    };
+    let role_exists = doc
+        .get("roles")
+        .and_then(|r| r.get(req.id.as_str()))
+        .and_then(|r| r.as_table())
+        .is_some();
+    if role_exists {
+        let t = doc["roles"][req.id.as_str()].as_table_mut().unwrap();
+        t["name"] = value(req.name.clone());
+        t["icon"] = value(req.icon.clone());
+        t["model_tier"] = value(req.model_tier.clone());
+        t["model_chain"] = value(str_array(&req.model_chain));
+        t["tools"] = value(str_array(&req.tools));
+        match req.temperature {
+            Some(temp) => {
+                t["temperature"] = value(temp);
+            }
+            None => {
+                t.remove("temperature");
+            }
+        }
+    } else {
+        let mut t = Table::new();
+        t["id"] = value(req.id.clone());
+        t["name"] = value(req.name.clone());
+        t["category"] = value(tpl.category.clone());
+        t["model_tier"] = value(req.model_tier.clone());
+        if let Some(pf) = &tpl.prompt_file {
+            t["prompt_file"] = value(pf.clone());
+        }
+        if let Some(temp) = req.temperature {
+            t["temperature"] = value(temp);
+        }
+        if !req.model_chain.is_empty() {
+            t["model_chain"] = value(str_array(&req.model_chain));
+        }
+        t["icon"] = value(req.icon.clone());
+        t["tools"] = value(str_array(&req.tools));
+        if !tpl.skills.is_empty() {
+            t["skills"] = value(str_array(&tpl.skills));
+        }
+        doc["roles"][req.id.as_str()] = Item::Table(t);
+    }
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+async fn save_role_config(
+    State(state): State<AppState>,
+    Json(req): Json<SaveRoleConfigRequest>,
+) -> Result<Json<RoleConfigEntry>, (StatusCode, String)> {
+    let tpl = {
+        let cfg = state.merged.read();
+        cfg.roles.get(&req.id).cloned()
+    };
+    let tpl = tpl.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("role {:?} not found", req.id),
+        )
+    })?;
+
+    // 1. 重写 .latte/agents.d/<id>.toml。
+    let dir = agents_config_dir(&state.agents_config);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create {}: {e}", dir.display()),
+        )
+    })?;
+    let path = dir.join(format!("{}.toml", req.id));
+    write_role_toml(&path, &tpl, &req)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // 2. prompt 非空 → 写到该角色的 prompt_file（None → prompts/<id>.md）。
+    if !req.prompt.is_empty() {
+        let rel = tpl
+            .prompt_file
+            .clone()
+            .unwrap_or_else(|| format!("prompts/{}.md", req.id));
+        let p = state.cwd.join(&rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("create {}: {e}", parent.display()),
+                )
+            })?;
+        }
+        std::fs::write(&p, &req.prompt).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write {}: {e}", p.display()),
+            )
+        })?;
+    }
+
+    // 3. 更新内存中的 merged —— 新 session 即刻生效。
+    let entry = {
+        let mut cfg = state.merged.write();
+        match cfg.roles.get_mut(&req.id) {
+            Some(t) => {
+                t.name = req.name.clone();
+                t.icon = req.icon.clone();
+                t.model_tier = req.model_tier.clone();
+                t.model_chain = req.model_chain.clone();
+                t.temperature = req.temperature;
+                t.tools = req.tools.clone();
+                role_config_entry(&state.cwd, t)
+            }
+            None => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    format!("role {:?} not found", req.id),
+                ))
+            }
+        }
+    };
+    Ok(Json(entry))
 }
 
 #[derive(Deserialize)]
@@ -1024,7 +1434,7 @@ async fn get_subsession(
     let id = params
         .get("id")
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing id".into()))?;
-    let snapshot = state.subsession_store.snapshot("default", id);
+    let snapshot = state.subsession_store.snapshot_any(id);
     match snapshot {
         Some(events) => {
             let vals: Vec<serde_json::Value> = events
@@ -1269,7 +1679,7 @@ mod tests {
         let _ = controller;
         let state = AppState {
             sessions: Arc::new(SessionMap::default()),
-            merged: Arc::new(AgentConfig::default()),
+            merged: Arc::new(parking_lot::RwLock::new(AgentConfig::default())),
             resolver: Arc::new(ModelResolver::default()),
             cwd: std::env::temp_dir(),
             initial_role: "manager".into(),
@@ -1278,16 +1688,18 @@ mod tests {
             subsession_store: Arc::new(
                 latte_agent_core::subsession::SubsessionStore::new(),
             ),
+            agents_config: ".latte/agents.d".into(),
         };
 
         let state = AppState {
             sessions: Arc::new(SessionMap::default()),
-            merged: Arc::new(AgentConfig::default()),
+            merged: Arc::new(parking_lot::RwLock::new(AgentConfig::default())),
             resolver: Arc::new(ModelResolver::default()),
             cwd: std::env::temp_dir(),
             initial_role: "manager".into(),
             static_dir: None,
             self_loop: Arc::new(SelfLoopState::default()),
+            agents_config: ".latte/agents.d".into(),
         };
 
         // spawn server。

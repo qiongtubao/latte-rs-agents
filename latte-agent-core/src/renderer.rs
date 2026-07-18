@@ -116,6 +116,23 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::ToolError { role_id, tool_name, error } => {
                 self.on_tool_result(role_id, tool_name, error).await;
             }
+            ChatEvent::WorkflowStarted { name, topic, .. } => {
+                self.on_status(&format!("workflow {name} started: {topic}")).await;
+            }
+            ChatEvent::WorkflowStep { step_id, index, total, .. } => {
+                self.on_status(&format!("workflow step {index}/{total}: {step_id}")).await;
+            }
+            ChatEvent::WorkflowTurn { role_id, content, .. } => {
+                self.on_role_turn(&ChatEventMetadata {
+                    role_id: role_id.clone(),
+                    content: content.clone(),
+                    is_complete: true,
+                })
+                .await;
+            }
+            ChatEvent::WorkflowFinished { name, status, summary, .. } => {
+                self.on_status(&format!("workflow {name} {status}: {summary}")).await;
+            }
         }
     }
 }

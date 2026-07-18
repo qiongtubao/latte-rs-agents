@@ -10,6 +10,10 @@ interface UIBinding {
 export interface ChatController {
   appendUser(content: string): string;
   handleEvent(e: ChatEvent): void;
+  /** Replay archived events when switching back to a session.
+   * Renders messages but suppresses network side effects (role
+   * switching) and resets status/timers afterwards. */
+  replayEvents(events: ChatEvent[]): void;
   setFooter(msg: string): void;
   setRoleSelected(roleId: string): void;
   refreshRoles(roles: RoleInfo[], selected: string): void;
@@ -69,9 +73,10 @@ export function mountChat(opts: {
   container: UIBinding; initialRole: string; initialModel?: string;
   onRoleSwitch?: (roleId: string) => Promise<void>;
   onShowSubsession?: (subId: string, label: string) => void;
+  onEditRole?: (roleId: string) => void;
   onReconnect?: () => void;
 }): ChatController {
-  const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession } = opts;
+  const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onEditRole } = opts;
   let msgCounter = 0;
   let turnStartTime = 0;
 
@@ -81,9 +86,76 @@ export function mountChat(opts: {
     taskText: string;
     delegateMsgId: string;
     capturedTools: { tool: string; args: string; result?: string }[];
+    /** "⏳ 执行中…" badge on the DelegateStarted bubble. */
+    stateEl?: HTMLElement;
+    /** Watchdog: flags the delegate as timed-out when silent for too long. */
+    timeoutId?: number;
   }
   const activeDelegates = new Map<string, DelegateInfo>();
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
+  /** wf_id → pending badge element on the WorkflowStarted bubble. */
+  const workflowStates = new Map<string, HTMLElement>();
+
+  /** Find the (most recent) pending delegate targeting `roleId` —
+   *  tool events carry role_id but no sub_id, so parallel delegates
+   *  are attributed by role. */
+  function findDelegateSubByRole(roleId: string): string {
+    let found = "";
+    for (const [subId, di] of activeDelegates) {
+      if (di.targetRole === roleId) found = subId;
+    }
+    return found;
+  }
+
+  function clearDelegateWatchdog(subId: string): void {
+    const di = activeDelegates.get(subId);
+    if (di?.timeoutId !== undefined) {
+      window.clearTimeout(di.timeoutId);
+      di.timeoutId = undefined;
+    }
+  }
+
+  function startDelegateWatchdog(subId: string, roleId: string): void {
+    clearDelegateWatchdog(subId);
+    const di = activeDelegates.get(subId);
+    if (!di) return;
+    di.timeoutId = window.setTimeout(() => {
+      if (!activeDelegates.has(subId)) return;
+      const taskText = di.taskText;
+      activeDelegates.delete(subId);
+      const label = `⏱ ${roleId}`;
+      const msg = addMessage({
+        kind: "error",
+        content: `⏱ 委托超时：@${roleId} 任务「${truncate(taskText, 60)}」${Math.floor(WAIT_TIMEOUT_MS / 1000)}秒无响应`,
+        meta: roleId,
+        icon: roleIcon(roleId),
+        subId,
+      });
+      msg.appendChild(makeSubsessionBtn(subId, label));
+      msg.style.cursor = "pointer";
+      msg.addEventListener("click", () => { if (onShowSubsession) onShowSubsession(subId, label); });
+      if (currentDelegateSubId === subId) {
+        currentDelegateSubId = "";
+        delegateRunning = false;
+        currentDelegate = "";
+        updateFooter();
+      }
+    }, WAIT_TIMEOUT_MS);
+  }
+
+  function resetDelegateWatchdog(subId: string): void {
+    const di = activeDelegates.get(subId);
+    if (di?.timeoutId !== undefined) startDelegateWatchdog(subId, di.targetRole);
+  }
+
+  function clearAllDelegates(): void {
+    for (const [, di] of activeDelegates) {
+      if (di.timeoutId !== undefined) window.clearTimeout(di.timeoutId);
+    }
+    activeDelegates.clear();
+    currentDelegateSubId = "";
+    workflowStates.clear();
+  }
 
   // ── Reference tracking ──
   let lastUserMsgId = "";
@@ -351,108 +423,95 @@ export function mountChat(opts: {
 
   // ── @role autocomplete ──
   const acBox = document.getElementById("role-autocomplete")!;
-  const ROLE_HINTS: Record<string, { icon: string; desc: string }> = {
-    programmer: { icon: "💻", desc: "读代码、分析实现" },
-    architect: { icon: "🏗️", desc: "架构评估、模块分析" },
-    reviewer: { icon: "🔍", desc: "代码审查、质量" },
-    tester: { icon: "🧪", desc: "测试策略、边界" },
-    security: { icon: "🛡️", desc: "安全审计" },
-    devops: { icon: "⚙️", desc: "构建部署" },
-    designer: { icon: "🎨", desc: "UI/UX 设计" },
-    tech_writer: { icon: "📝", desc: "文档写作" },
-    pm: { icon: "📋", desc: "需求分析" },
-  };
-  let acFilter = "";
+  const ROLE_HINTS = [
+    {id:"programmer",icon:"💻",desc:"读代码、分析实现"},
+    {id:"architect",icon:"🏗️",desc:"架构评估、模块分析"},
+    {id:"reviewer",icon:"🔍",desc:"代码审查、质量"},
+    {id:"tester",icon:"🧪",desc:"测试策略、边界"},
+    {id:"security",icon:"🛡️",desc:"安全审计"},
+    {id:"devops",icon:"⚙️",desc:"构建部署"},
+    {id:"designer",icon:"🎨",desc:"UI/UX 设计"},
+    {id:"tech_writer",icon:"📝",desc:"文档写作"},
+    {id:"pm",icon:"📋",desc:"需求分析"},
+  ];
   let acIdx = -1;
-
-  function showAutocomplete(filter: string): void {
-    acFilter = filter;
-    acIdx = -1;
-    const entries = Object.entries(ROLE_HINTS)
-      .filter(([k]) => k.startsWith(filter.toLowerCase()));
-    if (entries.length === 0) { acBox.style.display = "none"; return; }
-    acBox.innerHTML = entries.map(([k, v], i) =>
-      `<div class="role-autocomplete-item${i===0?' active':''}" data-role="${k}">
-        <span class="ra-icon">${v.icon}</span>
-        <span class="ra-name">@${k}</span>
-        <span class="ra-desc">${v.desc}</span>
-      </div>`
-    ).join("");
-    acBox.style.display = "block";
-    acIdx = 0;
-  }
-
-  function hideAutocomplete(): void { acBox.style.display = "none"; acFilter = ""; acIdx = -1; }
-
-  function selectAutocompleteItem(role: string): void {
-    const input = container.inputEl;
-    const before = input.value.substring(0, input.selectionStart);
-    const after = input.value.substring(input.selectionStart);
-    const atIdx = before.lastIndexOf("@");
-    if (atIdx === -1) return;
-    input.value = before.substring(0, atIdx) + "@" + role + " " + after;
-    hideAutocomplete();
-    input.focus();
-  }
-
-  container.inputEl.addEventListener("keydown", (e) => {
+  container.inputEl.addEventListener("keydown", function(e) {
     if (acBox.style.display !== "none") {
       const items = acBox.querySelectorAll(".role-autocomplete-item");
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        acIdx = Math.min(acIdx + 1, items.length - 1);
-        items.forEach((el, i) => el.classList.toggle("active", i === acIdx));
-        return;
-      }
-      if (e.key === "ArrowUp") {
-        e.preventDefault();
-        acIdx = Math.max(acIdx - 1, 0);
-        items.forEach((el, i) => el.classList.toggle("active", i === acIdx));
-        return;
-      }
-      if (e.key === "Enter" || e.key === "Tab") {
-        e.preventDefault();
-        const active = items[acIdx] as HTMLElement | undefined;
-        if (active) selectAutocompleteItem(active.dataset.role!);
-        return;
-      }
-      if (e.key === "Escape") { hideAutocomplete(); e.stopPropagation(); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); acIdx = Math.min(acIdx+1, items.length-1); items.forEach((el,i)=>el.classList.toggle("active",i===acIdx)); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); acIdx = Math.max(acIdx-1, 0); items.forEach((el,i)=>el.classList.toggle("active",i===acIdx)); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); const el=items[acIdx] as HTMLElement | undefined; if(el&&el.dataset){const ta=container.inputEl,pos=ta.selectionStart,b=ta.value.substring(0,pos),a=ta.value.substring(pos),ai=b.lastIndexOf("@");if(ai>=0){ta.value=b.substring(0,ai)+"@"+el.dataset.role+" "+a;acBox.style.display="none";ta.focus();}} return; }
+      if (e.key === "Escape") { acBox.style.display="none"; e.stopPropagation(); return; }
     }
-    if (e.key === "Enter" && !e.shiftKey && acBox.style.display === "none") {
-      e.preventDefault(); container.sendBtn.click();
-    }
+    if (e.key === "Enter" && !e.shiftKey && acBox.style.display === "none") { e.preventDefault(); container.sendBtn.click(); }
   });
-
-  container.inputEl.addEventListener("input", () => {
-    container.inputEl.style.height = "auto";
-    container.inputEl.style.height = Math.min(container.inputEl.scrollHeight, 140) + "px";
-    const input = container.inputEl;
-    const pos = input.selectionStart;
-    const before = input.value.substring(0, pos);
-    const atMatch = before.match(/@([a-z_]*)$/i);
-    if (atMatch) {
-      showAutocomplete(atMatch[1]);
-    } else {
-      hideAutocomplete();
-    }
+  container.inputEl.addEventListener("input", function() {
+    this.style.height = "auto";
+    this.style.height = Math.min(this.scrollHeight, 140) + "px";
+    const p = this.selectionStart, b = this.value.substring(0, p), m = b.match(/@([a-z_]*)$/i);
+    if (!m) { acBox.style.display="none"; return; }
+    const f = m[1].toLowerCase();
+    const entries = ROLE_HINTS.filter(r => r.id.startsWith(f));
+    if (entries.length === 0) { acBox.style.display="none"; return; }
+    acIdx = -1;
+    acBox.innerHTML = entries.map((r,i)=>`<div class="role-autocomplete-item${i===0?' active':''}" data-role="${r.id}"><span class="ra-icon">${r.icon}</span><span class="ra-name">@${r.id}</span><span class="ra-desc">${r.desc}</span></div>`).join("");
+    acBox.style.display = "block";
+    acIdx = 0;
   });
-
-  acBox.addEventListener("click", (e) => {
+  acBox.addEventListener("click", function(e) {
     const item = (e.target as HTMLElement).closest(".role-autocomplete-item") as HTMLElement | null;
-    if (item) selectAutocompleteItem(item.dataset.role!);
+    if (item && item.dataset) { const ta=container.inputEl,pos=ta.selectionStart,b=ta.value.substring(0,pos),a=ta.value.substring(pos),ai=b.lastIndexOf("@");if(ai>=0){ta.value=b.substring(0,ai)+"@"+item.dataset.role+" "+a;acBox.style.display="none";ta.focus();} }
   });
+  // 点击输入框/下拉框以外区域时关闭角色选择下拉
+  document.addEventListener("mousedown", (e) => {
+    if (acBox.style.display === "none") return;
+    const target = e.target as Node;
+    if (!acBox.contains(target) && target !== container.inputEl) {
+      acBox.style.display = "none";
+    }
+  });
+  // ── Edit message modal ──
+  const editOverlay = document.getElementById("editOverlay")!;
+  const editTextarea = document.getElementById("editTextarea") as HTMLTextAreaElement;
+  let editingRecord: MsgRecord | null = null;
+
+  function openEditModal(record: MsgRecord): void {
+    editingRecord = record;
+    editTextarea.value = record.content;
+    editOverlay.style.display = "flex";
+    editTextarea.focus();
+    editTextarea.setSelectionRange(editTextarea.value.length, editTextarea.value.length);
+  }
+  function closeEditModal(): void {
+    editingRecord = null;
+    editOverlay.style.display = "none";
+  }
+  function saveEditModal(): void {
+    if (!editingRecord) return;
+    const v = editTextarea.value.trim();
+    if (v) {
+      editingRecord.content = v;
+      const contentEl = editingRecord.el.querySelector(".msg-content") as HTMLElement | null;
+      if (contentEl) contentEl.innerHTML = renderContentWithCode(v);
+    }
+    closeEditModal();
+  }
+  document.getElementById("editSave")!.addEventListener("click", saveEditModal);
+  document.getElementById("editCancel")!.addEventListener("click", closeEditModal);
+  document.getElementById("editCancelTop")!.addEventListener("click", closeEditModal);
+  editOverlay.addEventListener("click", (e) => { if (e.target === editOverlay) closeEditModal(); });
+  editTextarea.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.stopPropagation(); closeEditModal(); }
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); saveEditModal(); }
+  });
+
   // Double-click a message row to edit (same as context-menu edit).
   container.messagesEl.addEventListener("dblclick", (e) => {
     const row = (e.target as HTMLElement).closest(".message-row") as HTMLElement | null;
     if (!row || !row.dataset.messageId) return;
     const record = getMsgById(row.dataset.messageId);
     if (!record) return;
-    const newContent = prompt("编辑消息内容:", record.content);
-    if (newContent !== null && newContent.trim() !== "") {
-      record.content = newContent.trim();
-      const contentEl = record.el.querySelector(".msg-content") as HTMLElement | null;
-      if (contentEl) contentEl.innerHTML = renderContentWithCode(newContent.trim());
-    }
+    openEditModal(record);
   });
   container.clearBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /clear" }); await sendCommand("/clear"); });
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
@@ -484,6 +543,9 @@ export function mountChat(opts: {
   let currentToolCall = "";
   let delegateRunning = false;
   let currentRoleIcon = "";
+  // When true, handleEvent is replaying archived history for a
+  // session switch — suppress network side effects (switchRole).
+  let replaying = false;
 
   function resolveIcon(roleId: string): string {
     return currentRoleIcon || roleIcon(roleId);
@@ -573,7 +635,21 @@ export function mountChat(opts: {
   // ── Context menu (right-click) ──
   let selectedMsgId: string | null = null;
 
+  // 右键角色头像 → 打开角色编辑器。头像 class 形如
+  // `msg-avatar <roleId>`（用户自己的是 `msg-avatar self-avatar`，忽略）。
   container.messagesEl.addEventListener("contextmenu", (e) => {
+    if (!onEditRole) return;
+    const avatar = (e.target as HTMLElement).closest(".msg-avatar") as HTMLElement | null;
+    if (!avatar) return;
+    const roleId = avatar.classList[1];
+    if (!roleId || roleId === "self-avatar") return;
+    e.preventDefault();
+    onEditRole(roleId);
+  });
+
+  container.messagesEl.addEventListener("contextmenu", (e) => {
+    // 头像右键走上面的角色编辑器分支，不弹消息菜单。
+    if ((e.target as HTMLElement).closest(".msg-avatar")) return;
     const row = (e.target as HTMLElement).closest(".message-row") as HTMLElement | null;
     if (!row || !row.dataset.messageId) return;
     e.preventDefault();
@@ -597,12 +673,7 @@ export function mountChat(opts: {
     if (!record) { menu.style.display = "none"; return; }
     switch (action) {
       case "edit": {
-        const newContent = prompt("编辑消息内容:", record.content);
-        if (newContent !== null && newContent.trim() !== "") {
-          record.content = newContent.trim();
-          const contentEl = record.el.querySelector(".msg-content") as HTMLElement | null;
-          if (contentEl) contentEl.innerHTML = renderContentWithCode(newContent.trim());
-        }
+        openEditModal(record);
         break;
       }
       case "delete": {
@@ -655,8 +726,13 @@ export function mountChat(opts: {
         addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
         currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
         updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
-        const di = activeDelegates.get(currentDelegateSubId);
-        if (di) di.capturedTools.push({ tool: e.tool_name, args: e.args });
+        // Attribute by role so parallel delegates each collect their own tools.
+        const toolSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
+        const di = activeDelegates.get(toolSubId);
+        if (di) {
+          di.capturedTools.push({ tool: e.tool_name, args: e.args });
+          resetDelegateWatchdog(toolSubId);
+        }
         break;
       }
       case "ToolResult": {
@@ -664,10 +740,12 @@ export function mountChat(opts: {
         subagentTools.push(`✅ ${e.tool_name} → ${short}`);
         addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
         updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
-        const di2 = activeDelegates.get(currentDelegateSubId);
+        const resultSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
+        const di2 = activeDelegates.get(resultSubId);
         if (di2 && di2.capturedTools.length > 0) {
           const last = di2.capturedTools[di2.capturedTools.length - 1];
           if (last.tool === e.tool_name) last.result = e.result;
+          resetDelegateWatchdog(resultSubId);
         }
         break;
       }
@@ -684,10 +762,12 @@ export function mountChat(opts: {
         const di = activeDelegates.get(subId);
         const roleSubId = di ? subId : undefined;
 
-        // Build reference: subagent reply → delegation task; manager summary → user request
+        // Build reference: subagent reply → delegation task; manager summary → user request.
+        // 不再要求 activeDelegates 为空 —— 如果有委托一直没完成（卡住/超时），
+        // manager 的总结仍然应该引用最开始的用户任务。
         const ref = di
           ? { refId: di.delegateMsgId, preview: `@${di.targetRole}: ${di.taskText.slice(0, 30)}` }
-          : (!activeDelegates.size && lastUserMsgId && e.role_id === "manager" && e.is_complete
+          : (lastUserMsgId && e.role_id === "manager" && e.is_complete
             ? (() => {
                 const userMsg = getMsgById(lastUserMsgId);
                 return { refId: lastUserMsgId, preview: (userMsg?.content || "用户消息").slice(0, 30) };
@@ -699,13 +779,15 @@ export function mountChat(opts: {
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
           if (di) {
+            clearDelegateWatchdog(subId);
             activeDelegates.delete(subId);
             if (activeDelegates.size === 0) {
-              switchRole("manager").catch(() => {});
+              if (!replaying) switchRole("manager").catch(() => {});
               container.rolePill.textContent = `${roleIcon("manager")} manager`;
             }
           }
         } else {
+          if (di) resetDelegateWatchdog(subId);
           updateStatusPillLabel(`${icon} 模型输入中…`);
           resetWaitTimer();
         }
@@ -726,6 +808,11 @@ export function mountChat(opts: {
         updateRoleDisplay(e.role_id, e.icon);
         container.modelPill.textContent = e.model_id;
         break;
+      case "SessionInfo":
+        // Server greets each new SSE subscription with the current
+        // session snapshot; roles/model are already loaded via
+        // getSession, so nothing to render here.
+        break;
       case "Paused": addMessage({ kind: "status", content: `[paused] ${e.reason}` }); break;
       case "Resumed": addMessage({ kind: "status", content: "[resumed]" }); break;
       case "RoundStarted":
@@ -742,12 +829,20 @@ export function mountChat(opts: {
           subId: e.sub_id,
         });
         const msgId = delegateMsg.dataset.messageId || "";
+        // Pending-state badge on the delegate bubble — flipped to
+        // ✅/❌ by DelegateFinished, or to a timeout error by the watchdog.
+        const stateEl = document.createElement("span");
+        stateEl.className = "delegate-state pending";
+        stateEl.textContent = "⏳ 执行中…";
+        delegateMsg.querySelector(".msg-bubble")?.appendChild(stateEl);
         activeDelegates.set(e.sub_id, {
           targetRole: e.to_role,
           taskText,
           delegateMsgId: msgId,
           capturedTools: [],
+          stateEl,
         });
+        startDelegateWatchdog(e.sub_id, e.to_role);
         currentDelegateSubId = e.sub_id;
         subagentTools = [];
 
@@ -761,13 +856,22 @@ export function mountChat(opts: {
         delegateRunning = false;
         const fi = roleIcon(e.from_role), ti = roleIcon(e.to_role);
         const label = `${fi} ${e.from_role} → ${ti} ${e.to_role}`;
-        const isFail = e.status === "failed" || e.status === "timeout";
+        const isFail = e.status !== "ok";
         const kind = isFail ? "error" : "system";
         const prefix = isFail ? "❌" : "✅";
         const statusText = isFail ? `失败(${e.status})` : "ok";
-        const msg = addMessage({ kind, content: `${prefix} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})`, subId: e.sub_id });
+        // summary 是专家返回/失败原因的正文，失败时尤其要看，拼进消息里。
+        const summary = e.summary?.trim() ? `\n${truncate(e.summary, 300)}` : "";
+        const msg = addMessage({ kind, content: `${prefix} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})${summary}`, subId: e.sub_id });
         msg.appendChild(makeSubsessionBtn(e.sub_id, label));
         if (isFail) msg.classList.add("fail-flash");
+        // Flip the pending badge on the DelegateStarted bubble.
+        clearDelegateWatchdog(e.sub_id);
+        const finishedDi = activeDelegates.get(e.sub_id);
+        if (finishedDi?.stateEl) {
+          finishedDi.stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
+          finishedDi.stateEl.className = `delegate-state ${isFail ? "failed" : "done"}`;
+        }
         msg.style.cursor = "pointer";
         msg.addEventListener("click", () => { if (onShowSubsession) onShowSubsession(e.sub_id, label); });
         msg.addEventListener("contextmenu", (ev) => { ev.preventDefault(); if (onShowSubsession) onShowSubsession(e.sub_id, label); });
@@ -780,6 +884,56 @@ export function mountChat(opts: {
         resetWaitTimer(); break;
       }
       case "Done": setStatus("connected"); clearWaitTimer(); addMessage({ kind: "system", content: "[会话结束]" }); setFooter("会话结束"); break;
+      case "WorkflowStarted": {
+        const msg = addMessage({
+          kind: "role",
+          content: `🔀 工作流「${e.name}」启动\n${truncate(e.topic, 200)}`,
+          meta: "manager",
+          icon: roleIcon("manager"),
+        });
+        const stateEl = document.createElement("span");
+        stateEl.className = "delegate-state pending";
+        stateEl.textContent = "⏳ 工作流执行中…";
+        msg.querySelector(".msg-bubble")?.appendChild(stateEl);
+        workflowStates.set(e.wf_id, stateEl);
+        setFooter(`workflow ${e.name} 运行中…`);
+        resetWaitTimer();
+        break;
+      }
+      case "WorkflowStep": {
+        const desc = e.description?.trim() || e.step_id;
+        addMessage({ kind: "status", content: `▶️ 步骤 ${e.index}/${e.total} · ${desc}` });
+        resetWaitTimer();
+        break;
+      }
+      case "WorkflowTurn": {
+        const icon = roleIcon(e.role_id);
+        addMessage({
+          kind: "role",
+          content: e.content,
+          meta: e.role_id,
+          icon,
+        });
+        resetWaitTimer();
+        break;
+      }
+      case "WorkflowFinished": {
+        const isFail = e.status !== "ok";
+        const stateEl = workflowStates.get(e.wf_id);
+        if (stateEl) {
+          stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
+          stateEl.className = `delegate-state ${isFail ? "failed" : "done"}`;
+          workflowStates.delete(e.wf_id);
+        }
+        const summary = e.summary?.trim() ? `\n${truncate(e.summary, 300)}` : "";
+        addMessage({
+          kind: isFail ? "error" : "system",
+          content: `${isFail ? "❌" : "✅"} 工作流「${e.name}」${isFail ? `失败(${e.status})` : "完成"}${summary}`,
+        });
+        setFooter(`workflow ${e.name} ${e.status}`);
+        resetWaitTimer();
+        break;
+      }
       case "Error": setStatus("connected"); clearWaitTimer(); addMessage({ kind: "error", content: e.message, meta: "error" }); setFooter(`错误: ${truncate(e.message, 80)}`); break;
       default: console.warn("[chat] unknown event", e);
     }
@@ -796,8 +950,34 @@ export function mountChat(opts: {
     container.roleSelect.innerHTML = "";
     for (const r of roles) { const opt = document.createElement("option"); opt.value=r.id; opt.innerHTML=`${r.icon??""} ${r.id}`; if (r.id===selected) opt.selected=true; container.roleSelect.appendChild(opt); }
   }
-  function clear(): void { container.messagesEl.innerHTML=""; msgCounter=0; messageStore.length=0; currentToolCall=""; currentActivity=""; currentDelegate=""; delegateRunning=false; updateFooter(); }
-  return { appendUser, handleEvent, setFooter, setRoleSelected, refreshRoles, setStatus, clear };
+  function clear(): void {
+    container.messagesEl.innerHTML="";
+    msgCounter=0;
+    messageStore.length=0;
+    clearAllDelegates();
+    subagentTools.length = 0;
+    lastUserMsgId = "";
+    lastRoleStarted = "";
+    currentToolCall="";
+    currentActivity="";
+    currentDelegate="";
+    delegateRunning=false;
+    updateFooter();
+  }
+  function replayEvents(events: ChatEvent[]): void {
+    replaying = true;
+    try {
+      for (const e of events) handleEvent(e);
+    } finally {
+      replaying = false;
+      // History replay leaves no in-flight delegate/timer state.
+      clearAllDelegates();
+      subagentTools.length = 0;
+      clearWaitTimer();
+      setStatus("connected");
+    }
+  }
+  return { appendUser, handleEvent, replayEvents, setFooter, setRoleSelected, refreshRoles, setStatus, clear };
 }
 
 function truncate(s: string, max: number): string { if (s.length<=max) return s; return s.slice(0,max)+"…"; }

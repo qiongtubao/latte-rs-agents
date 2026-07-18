@@ -1,0 +1,23 @@
+# Workflow: implementation_plan — 实现计划/plan
+name = "implementation_plan"
+description = "实现计划流水线：架构拆解 → 工程排期 → Advisor 终审"
+max_rounds = 1
+
+[[steps]]
+id = "breakdown"
+description = "架构师拆解实现步骤"
+speakers = ["architect"]
+prompt = "把以下任务拆解成可执行的实现步骤：{{topic}}。标注每步的依赖关系、涉及模块与风险点。"
+output_key = "plan"
+
+[[steps]]
+id = "estimate"
+description = "工程师评估工作量与顺序"
+speakers = ["programmer"]
+prompt = "基于上面的拆解，评估每一步的工作量、实现顺序和可能的技术难点，给出排期建议。"
+
+[[steps]]
+id = "advisor_verdict"
+description = "Advisor 终审计划"
+speakers = ["advisor"]
+prompt = "你现在是终审顾问。通读上面的计划，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

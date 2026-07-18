@@ -81,6 +81,18 @@ impl SubsessionStore {
             .map(|(_, e)| e.sink.snapshot())
     }
 
+    /// Snapshot by `sub_id` alone, ignoring the session component.
+    /// `sub_id`s are globally unique (role + unix micros), and the
+    /// session component is the workspace cwd (not something the web
+    /// UI knows), so this is the lookup the HTTP layer actually uses.
+    pub fn snapshot_any(&self, sub_id: &str) -> Option<Vec<TraceEvent>> {
+        self.sweep();
+        let mut g = self.inner.lock();
+        g.iter_mut()
+            .find(|((_, sid), _)| sid == sub_id)
+            .map(|(_, e)| e.sink.snapshot())
+    }
+
     /// Lazy sweep: drop any sub-session entries older than `MAX_AGE`.
     /// Called opportunistically before each `snapshot`; O(n) but n is
     /// bounded by user activity, not chat volume.
@@ -93,5 +105,37 @@ impl SubsessionStore {
     /// Number of live entries (handy for tests / debug endpoints).
     pub fn len(&self) -> usize {
         self.inner.lock().len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::{TraceMeta, TraceSink, ToolStatus};
+
+    fn tool_exec_ok() -> TraceEvent {
+        TraceEvent::ToolExec {
+            meta: TraceMeta::now(1, "programmer", "test"),
+            name: "file.read".into(),
+            args_json: "{}".into(),
+            latency_ms: 3,
+            status: ToolStatus::Ok("ok".into()),
+        }
+    }
+
+    #[test]
+    fn snapshot_any_finds_by_sub_id_regardless_of_session_key() {
+        // Regression: the delegate tool stores subsessions under the
+        // workspace cwd, but the web UI only knows the sub_id — the
+        // lookup must not depend on the session component.
+        let store = SubsessionStore::new();
+        let (sub_id, sink) = store.create("/workspace/cwd/path", "programmer");
+        sink.emit(tool_exec_ok());
+
+        assert!(store.snapshot("/workspace/cwd/path", &sub_id).is_some());
+        assert!(store.snapshot("default", &sub_id).is_none());
+        let events = store.snapshot_any(&sub_id).expect("snapshot_any");
+        assert_eq!(events.len(), 1);
+        assert!(store.snapshot_any("no-such-sub").is_none());
     }
 }

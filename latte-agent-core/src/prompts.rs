@@ -38,6 +38,8 @@ pub const SCREENSHOT_SKILL: &str = include_str!("../../prompts/screenshot_skill.
 pub const MANAGER: &str = include_str!("../../prompts/manager.md");
 /// MCP Agent
 pub const MCP_AGENT: &str = include_str!("../../prompts/mcp_agent.md");
+/// Senior Advisor / final reviewer
+pub const ADVISOR: &str = include_str!("../../prompts/advisor.md");
 
 /// Look up a skill by name from built-in prompts.
 pub fn for_skill(name: &str) -> Option<&'static str> {
@@ -65,6 +67,7 @@ pub fn for_role(id: &str) -> Option<&'static str> {
         "tech_writer" => TECH_WRITER,
         "manager" => MANAGER,
         "mcp_agent" => MCP_AGENT,
+        "advisor" => ADVISOR,
         _ => return None,
     })
 }
@@ -206,7 +209,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             model_chain: vec![],
             prompt_file: None,
             temperature: Some(0.5),
-            tools: vec!["read".into()],
+            tools: vec!["delegate".into(), "workflow".into()],
             icon: "👔".into(),
             skills: vec![],
         },
@@ -220,6 +223,18 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             temperature: Some(0.3),
             tools: vec!["mcp".into(), "bash".into(), "read".into(), "list".into()],
             icon: "🔌".into(),
+            skills: vec![],
+        },
+        "advisor" => RoleTemplate {
+            id: "advisor".into(),
+            name: "Senior Advisor".into(),
+            category: "verification".into(),
+            model_tier: "premium".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: Some(0.4),
+            tools: vec!["read".into(), "list".into(), "search".into()],
+            icon: "🦉".into(),
             skills: vec![],
         },
         _ => return None,
@@ -245,6 +260,7 @@ mod tests {
             "designer",
             "tech_writer",
             "manager",
+            "advisor",
         ] {
             assert!(
                 for_role(id).is_some(),

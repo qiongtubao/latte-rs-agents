@@ -194,6 +194,37 @@ pub enum ChatEvent {
         tool_name: String,
         error: String,
     },
+    /// Manager triggered a multi-role workflow (设计/plan/TDD/文档/图谱…).
+    /// `wf_id` links all events of this run; the UI groups them.
+    WorkflowStarted {
+        name: String,
+        topic: String,
+        wf_id: String,
+    },
+    /// A workflow step is about to run (`index`/`total` are 1-based).
+    WorkflowStep {
+        wf_id: String,
+        step_id: String,
+        description: String,
+        index: usize,
+        total: usize,
+    },
+    /// One speaker's completed turn inside a workflow step.
+    WorkflowTurn {
+        wf_id: String,
+        step_id: String,
+        role_id: String,
+        content: String,
+        round: usize,
+    },
+    /// Workflow run finished. `status`: "ok" | "failed" | "cancelled".
+    /// `summary` is the last turn's output (or the error message).
+    WorkflowFinished {
+        name: String,
+        wf_id: String,
+        status: String,
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1378,6 +1409,10 @@ async fn build_runner(
         if role.allowed_tools.iter().any(|t| t == "delegate") {
             prompt.push_str(DELEGATE_TOOL_HINT);
         }
+        // Any role with "workflow" in its tools gets the workflow hint.
+        if role.allowed_tools.iter().any(|t| t == "workflow") {
+            prompt.push_str(WORKFLOW_TOOL_HINT);
+        }
     }
     // Every role — tools or no tools — gets the system ground truth
     // (cwd, host, time). When the user asks about runtime state
@@ -1410,6 +1445,21 @@ async fn build_runner(
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
+        }
+        // Any role with "workflow" in allowed_tools gets the workflow
+        // tool: trigger a named multi-role workflow by name + topic.
+        if role.allowed_tools.iter().any(|t| t == "workflow") {
+            register_workflow_tool(
+                &tm,
+                merged,
+                resolver,
+                default_params.clone(),
+                event_tx.clone(),
+                cwd.to_path_buf(),
+                cancel_flag.clone(),
+            )
+            .await
+            .map_err(|e| AgentError::Tool(format!("register workflow: {e}")))?;
         }
         Ok((
             AgentRunner::new_with_tools(agent, tm, 16)
@@ -1587,6 +1637,25 @@ const DELEGATE_TOOL_HINT: &str = r#"
 
 调用格式：<tool_call>delegate {"role": "programmer", "task": "读取 src/main.ts 的内容"}</tool_call>
 "#;
+
+const WORKFLOW_TOOL_HINT: &str = r#"
+### 你还可以用 workflow 工具触发多角色工作流
+
+当任务适合**固定的多角色流水线**时，调用 `workflow` 而不是逐个 delegate：
+
+- 设计功能 / 方案讨论 → `feature_design`（PM → 架构 → 终审顾问）
+- 实现计划 / plan → `implementation_plan`（架构 → 工程 → 终审顾问）
+- TDD 开发 → `tdd_development`（测试先行 → 实现 → 验证 → 终审顾问）
+- 更新文档 → `update_docs`（分析变更 → 写文档 → 终审顾问）
+- 更新图谱 → `update_graph`（结构分析 → 更新图谱 → 终审顾问）
+
+调用格式：<tool_call>workflow {"name": "feature_design", "topic": "为 UI 增加 session 管理"}</tool_call>
+
+判断标准：
+- 单点问题（读代码、改文件、审查某个具体实现）→ delegate
+- 需要多个角色按固定流程协作的完整任务（设计/plan/TDD/文档/图谱）→ workflow
+- workflow 会跑完整条流水线并把终审结论返回给你；你综合后再回复用户。
+"#;
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -1672,7 +1741,17 @@ async fn register_delegate_tool(
                 task: task.clone(),
                 sub_id: sub_id.clone(),
             });
-            let subsession_fanout = FanoutSink::new(vec![sub_sink.clone() as Arc<dyn crate::trace::TraceSink>]);
+            // Fan out to BOTH the subsession memory sink (for the
+            // "📋 详情" transcript viewer) and the main chat SSE
+            // stream (so the specialist's tool calls show up live in
+            // the chat as ToolUse/ToolResult events, attributed to
+            // the specialist's role id).
+            let subsession_fanout = FanoutSink::new(vec![
+                sub_sink.clone() as Arc<dyn crate::trace::TraceSink>,
+                Arc::new(ChatEventTraceSink {
+                    event_tx: event_tx.clone(),
+                }) as Arc<dyn crate::trace::TraceSink>,
+            ]);
             let template = merged
                 .roles
                 .get(&role_id)
@@ -1862,6 +1941,262 @@ async fn register_delegate_tool(
     let tool = Tool::builder(
         "delegate".to_string(),
         "Delegate a subtask to a specialist agent.".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm.register(tool, Some("manager"));
+    Ok(())
+}
+
+/// Register the `workflow` tool: the manager can trigger a named
+/// multi-role workflow (设计/plan/TDD/文档/图谱…). Each step's speakers
+/// run as specialist turns with persistent per-role runners, so later
+/// speakers see the earlier discussion in the same run. Progress is
+/// streamed as WorkflowStarted/Step/Turn/Finished events.
+///
+/// `latte-agent-core` implements its own tiny engine here (see
+/// `crate::workflow`) instead of reusing `latte-agent-orchestrator`,
+/// because the orchestrator depends on core — a dependency cycle.
+async fn register_workflow_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    merged: &AgentConfig,
+    resolver: &ModelResolver,
+    default_params: GenerateParams,
+    event_tx: broadcast::Sender<ChatEvent>,
+    cwd: PathBuf,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
+
+    let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
+        schema_type: SchemaType,
+        properties: vec![
+            ("name".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("Workflow name, e.g. feature_design / implementation_plan / tdd_development / update_docs / update_graph".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+            ("topic".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("The task/topic the workflow should work on".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+        ]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["name".into(), "topic".into()]),
+        ..Default::default()
+    };
+
+    let merged_owned = Arc::new(merged.clone());
+    let resolver_owned = Arc::new(resolver.clone());
+
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let merged = Arc::clone(&merged_owned);
+        let resolver = Arc::clone(&resolver_owned);
+        let default_params = default_params.clone();
+        let event_tx = event_tx.clone();
+        let cwd = cwd.clone();
+        let cancel_flag = Arc::clone(&cancel_flag);
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| tool_err("missing 'name' field".into()))?
+                .to_string();
+            let topic = input
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| tool_err("missing 'topic' field".into()))?
+                .to_string();
+
+            let wf = crate::workflow::load_workflow(&name, &cwd).map_err(|e| {
+                let available = crate::workflow::list_workflows(&cwd)
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tool_err(format!("{e}. available workflows: {available}"))
+            })?;
+
+            let wf_id = format!(
+                "wf-{}-{}",
+                name,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros())
+                    .unwrap_or(0)
+            );
+            let _ = event_tx.send(ChatEvent::WorkflowStarted {
+                name: name.clone(),
+                topic: topic.clone(),
+                wf_id: wf_id.clone(),
+            });
+
+            // One runner per speaker role, persistent across steps so
+            // each role sees the preceding discussion in its context.
+            let mut runners: std::collections::HashMap<String, AgentRunner> =
+                std::collections::HashMap::new();
+            for role_id in wf.speaker_roles() {
+                let template = merged
+                    .roles
+                    .get(&role_id)
+                    .ok_or_else(|| tool_err(format!("role '{role_id}' not found in config")))?
+                    .clone();
+                let role = template
+                    .resolve(&default_params)
+                    .await
+                    .map_err(|e| tool_err(format!("resolve role '{role_id}': {e}")))?;
+                let tier = role.default_model_tier;
+                let models = resolver
+                    .resolve_chain(&role.id, tier, &role.model_chain)
+                    .map_err(|e| tool_err(format!("no model for role '{role_id}': {e}")))?;
+                let agent = Agent::new_with_chain(
+                    role_id.clone(),
+                    role.clone(),
+                    models,
+                    default_params.clone(),
+                )
+                .map_err(|e| tool_err(format!("create agent '{role_id}': {e}")))?;
+                let runner = if role.allowed_tools.is_empty() {
+                    AgentRunner::new(agent)
+                } else {
+                    let rtm = build_tool_manager(&role.allowed_tools)
+                        .await
+                        .map_err(|e| tool_err(format!("tools for '{role_id}': {e}")))?;
+                    AgentRunner::new_with_tools(agent, rtm, 0)
+                };
+                runners.insert(
+                    role_id.clone(),
+                    runner.with_role(role_id).with_cwd(cwd.clone()),
+                );
+            }
+
+            let mut vars: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            vars.insert("topic".into(), topic.clone());
+            let total = wf.steps.len();
+            let mut last_output = String::new();
+            let mut status = "ok";
+            let mut error_msg = String::new();
+
+            'rounds: for round in 0..wf.effective_max_rounds() {
+                for (idx, step) in wf.steps.iter().enumerate() {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        status = "cancelled";
+                        break 'rounds;
+                    }
+                    let _ = event_tx.send(ChatEvent::WorkflowStep {
+                        wf_id: wf_id.clone(),
+                        step_id: step.id.clone(),
+                        description: step.description.clone(),
+                        index: idx + 1,
+                        total,
+                    });
+                    let mut step_transcript = String::new();
+                    for speaker in &step.speakers {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            status = "cancelled";
+                            break 'rounds;
+                        }
+                        let runner = match runners.get_mut(speaker) {
+                            Some(r) => r,
+                            None => {
+                                status = "failed";
+                                error_msg = format!("role '{speaker}' not instantiated");
+                                break 'rounds;
+                            }
+                        };
+                        let mut step_vars = vars.clone();
+                        step_vars.insert("step_id".into(), step.id.clone());
+                        step_vars.insert("speaker".into(), speaker.clone());
+                        let base_prompt = wf.render_prompt(step, &step_vars);
+                        let prompt = if step_transcript.is_empty() {
+                            base_prompt
+                        } else {
+                            format!(
+                                "{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}"
+                            )
+                        };
+                        match runner
+                            .run_turn(
+                                &[Message {
+                                    role: MsgRole::User,
+                                    content: prompt,
+                                }],
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(response) => {
+                                let _ = event_tx.send(ChatEvent::WorkflowTurn {
+                                    wf_id: wf_id.clone(),
+                                    step_id: step.id.clone(),
+                                    role_id: speaker.clone(),
+                                    content: response.clone(),
+                                    round,
+                                });
+                                step_transcript
+                                    .push_str(&format!("[{speaker}]: {response}\n"));
+                                last_output = response;
+                            }
+                            Err(e) => {
+                                status = "failed";
+                                error_msg =
+                                    format!("step '{}' speaker '{}': {e}", step.id, speaker);
+                                break 'rounds;
+                            }
+                        }
+                    }
+                    if let Some(key) = &step.output_key {
+                        vars.insert(key.clone(), last_output.clone());
+                    }
+                }
+            }
+
+            match status {
+                "ok" => {
+                    let _ = event_tx.send(ChatEvent::WorkflowFinished {
+                        name,
+                        wf_id,
+                        status: "ok".into(),
+                        summary: last_output.clone(),
+                    });
+                    Ok(serde_json::Value::String(last_output))
+                }
+                s => {
+                    let summary = if s == "cancelled" {
+                        "workflow cancelled by user".to_string()
+                    } else {
+                        error_msg
+                    };
+                    let _ = event_tx.send(ChatEvent::WorkflowFinished {
+                        name,
+                        wf_id,
+                        status: s.into(),
+                        summary: summary.clone(),
+                    });
+                    Err(tool_err(summary))
+                }
+            }
+        })
+    });
+
+    let tool = Tool::builder(
+        "workflow".to_string(),
+        "Run a named multi-role workflow (feature_design, implementation_plan, tdd_development, update_docs, update_graph).".to_string(),
         input_schema,
         handler,
     )

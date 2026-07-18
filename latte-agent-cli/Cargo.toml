@@ -17,6 +17,9 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# toml_edit：角色编辑器保存时重写 .latte/agents.d/<id>.toml，
+# 保留原文件的字段顺序与格式（toml::Value 默认 BTreeMap 会重排 key）。
+toml_edit = "0.22"
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 clap = { workspace = true }

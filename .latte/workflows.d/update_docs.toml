@@ -1,0 +1,23 @@
+# Workflow: update_docs — 更新文档
+name = "update_docs"
+description = "文档更新流水线：变更分析 → 文档撰写 → Advisor 终审"
+max_rounds = 1
+
+[[steps]]
+id = "analyze"
+description = "工程师分析需要文档化的变更"
+speakers = ["programmer"]
+prompt = "分析以下主题涉及的代码/功能现状：{{topic}}。列出需要在文档中体现的行为、接口与注意事项。"
+output_key = "facts"
+
+[[steps]]
+id = "write"
+description = "技术写作者产出文档"
+speakers = ["tech_writer"]
+prompt = "基于上面的事实清单，为「{{topic}}」撰写/更新文档：结构清晰、示例准确、与代码行为一致。"
+
+[[steps]]
+id = "advisor_verdict"
+description = "Advisor 终审文档"
+speakers = ["advisor"]
+prompt = "你现在是终审顾问。检查上面的文档是否与事实清单一致、是否完整准确，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

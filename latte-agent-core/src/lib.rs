@@ -47,6 +47,7 @@ pub mod model_resolver;
 pub mod prompts;
 pub mod role;
 pub mod ground_truth;
+pub mod workflow;
 pub mod scheduler;
 pub mod session;
 pub mod session_store;

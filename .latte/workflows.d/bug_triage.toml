@@ -21,3 +21,9 @@ prompt = "评估这个 bug 的影响。Security：有没有安全相关的影响
 id = "plan"
 speakers = ["programmer", "manager"]
 prompt = "提出修复计划。Programmer：修复方案和工期估算。Manager：优先级和排期。"
+[[steps]]
+# 终审：Advisor 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
+id = "advisor_verdict"
+description = "Advisor reviews all outputs and gives the final verdict"
+speakers = ["advisor"]
+prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"

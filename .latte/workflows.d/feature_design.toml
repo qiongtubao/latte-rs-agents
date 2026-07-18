@@ -1,0 +1,23 @@
+# Workflow: feature_design — 设计功能/方案讨论
+name = "feature_design"
+description = "功能设计流水线：PM 需求 → 架构师方案 → Advisor 终审"
+max_rounds = 1
+
+[[steps]]
+id = "requirements"
+description = "PM 梳理需求与验收标准"
+speakers = ["pm"]
+prompt = "为以下功能梳理需求：{{topic}}。覆盖：用户故事、验收标准、范围边界、优先级。"
+output_key = "requirements"
+
+[[steps]]
+id = "design"
+description = "架构师给出技术方案"
+speakers = ["architect"]
+prompt = "基于上面的需求，为「{{topic}}」给出技术方案：模块划分、数据流、关键接口、风险与取舍。"
+
+[[steps]]
+id = "advisor_verdict"
+description = "Advisor 终审方案"
+speakers = ["advisor"]
+prompt = "你现在是终审顾问。通读上面的需求与方案，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

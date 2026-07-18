@@ -170,3 +170,10 @@ prompt = "Based on the full discussion above, finalize scope, priorities, and ti
 # Output key — save this step's output as a named variable for later steps.
 # Optional; when set, later steps can reference this output via {{key}}.
 # output_key = "<key>"
+
+[[steps]]
+# 终审：Advisor 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
+id = "advisor_verdict"
+description = "Advisor reviews all outputs and gives the final verdict"
+speakers = ["advisor"]
+prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"

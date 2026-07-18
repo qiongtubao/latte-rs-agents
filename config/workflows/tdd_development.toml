@@ -1,0 +1,29 @@
+# Workflow: tdd_development — TDD 开发
+name = "tdd_development"
+description = "TDD 流水线：测试先行 → 实现 → 验证 → Advisor 终审"
+max_rounds = 1
+
+[[steps]]
+id = "tests_first"
+description = "测试工程师先写失败测试"
+speakers = ["tester"]
+prompt = "针对以下需求设计测试用例（TDD 先行）：{{topic}}。列出测试清单：正常路径、边界、异常路径，并给出每个用例的预期行为。"
+output_key = "test_plan"
+
+[[steps]]
+id = "implement"
+description = "工程师按测试实现"
+speakers = ["programmer"]
+prompt = "基于上面的测试清单，给出「{{topic}}」的实现方案与关键代码结构，说明每条测试如何被满足。"
+
+[[steps]]
+id = "verify"
+description = "测试工程师验证覆盖"
+speakers = ["tester"]
+prompt = "检查上面的实现是否覆盖所有测试用例，指出遗漏的边界与潜在回归点。"
+
+[[steps]]
+id = "advisor_verdict"
+description = "Advisor 终审"
+speakers = ["advisor"]
+prompt = "你现在是终审顾问。通读上面的测试与实现讨论，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

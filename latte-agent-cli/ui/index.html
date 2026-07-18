@@ -26,7 +26,10 @@
           <select id="role-select" title="switch role"></select>
           <select id="session-select" title="session"></select>
           <button id="session-new-btn" type="button" title="new session">+ Session</button>
+          <button id="session-rename-btn" type="button" title="rename session">✏️</button>
+          <button id="session-del-btn" type="button" title="delete session">🗑️</button>
           <button id="role-graph-btn" type="button">Role Graph</button>
+          <button id="role-editor-btn" type="button">⚙️ Roles</button>
           <button id="trace-toggle" type="button">Trace</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
         </div>
@@ -35,11 +38,6 @@
       <!-- 主内容区：居中聊天卡片 -->
       <main class="main-area">
         <div class="chat-container">
-          <div class="chat-header">
-            <h2>☕ latte-agent</h2>
-            <span class="badge">subagent ⚡</span>
-          </div>
-
           <div id="messages" class="message-list" aria-live="polite"></div>
 
           <form id="chat-form" class="chat-form">
@@ -76,6 +74,22 @@
                 <button class="close-btn" id="closeSubagent">关闭</button>
               </h3>
               <div class="subagent-log" id="subagentLog">加载中…</div>
+            </div>
+          </div>
+
+          <!-- 编辑消息浮层 -->
+          <div class="edit-overlay" id="editOverlay">
+            <div class="edit-panel">
+              <h3>
+                <span>✏️ 编辑消息</span>
+                <button class="close-btn" id="editCancelTop">关闭</button>
+              </h3>
+              <textarea id="editTextarea" class="edit-textarea" spellcheck="false"></textarea>
+              <div class="edit-actions">
+                <span class="edit-hint">Esc 取消 · Ctrl+Enter 保存</span>
+                <button id="editCancel" type="button">取消</button>
+                <button id="editSave" type="button" class="primary">保存</button>
+              </div>
             </div>
           </div>
         </div>
@@ -141,6 +155,52 @@
           <span class="subsession-label" id="subsession-label"></span>
         </header>
         <div class="subsession-body" id="subsession-body">loading…</div>
+      </aside>
+
+      <aside id="role-editor-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>角色编辑器</h2>
+          <select id="role-editor-role-select"></select>
+          <button id="role-editor-refresh" type="button">↻</button>
+          <button id="role-editor-close" type="button" class="panel-close">×</button>
+        </header>
+        <div class="role-editor-body">
+          <p class="hint">修改会写入 .latte/agents.d/&lt;id&gt;.toml 与对应 prompt 文件，对新 session 生效。右键聊天消息里的角色头像可直接跳到该角色。</p>
+          <form id="role-editor-form">
+            <label class="role-editor-field">
+              名称
+              <input id="role-editor-name" type="text" required />
+            </label>
+            <label class="role-editor-field">
+              图标
+              <input id="role-editor-icon" type="text" />
+            </label>
+            <label class="role-editor-field">
+              模型档位
+              <select id="role-editor-tier"></select>
+            </label>
+            <label class="role-editor-field">
+              模型链（逗号分隔）
+              <input id="role-editor-chain" type="text" placeholder="model-a, model-b" />
+            </label>
+            <label class="role-editor-field">
+              temperature（留空 = 默认）
+              <input id="role-editor-temperature" type="number" step="0.1" min="0" max="2" />
+            </label>
+            <div class="role-editor-field">
+              工具
+              <div id="role-editor-tools" class="role-editor-tools"></div>
+            </div>
+            <label class="role-editor-field">
+              System Prompt
+              <textarea id="role-editor-prompt" rows="16" spellcheck="false"></textarea>
+            </label>
+            <div class="role-editor-actions">
+              <button id="role-editor-save" type="submit" class="primary">保存</button>
+              <span id="role-editor-status" class="role-editor-status"></span>
+            </div>
+          </form>
+        </div>
       </aside>
 
       <footer class="statusbar">

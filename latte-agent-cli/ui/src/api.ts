@@ -23,6 +23,8 @@ export interface SessionSummary {
   session_id: string;
   /** First user message, truncated; "(no user message yet)" before first send. */
   preview: string;
+  /** User-assigned display name; falls back to preview when absent. */
+  label?: string | null;
   initial_role: string;
   created_at_unix_ms: number;
   last_activity_unix_ms: number;
@@ -33,6 +35,63 @@ export interface TraceSummary {
   path: string;
   size_bytes: number;
   modified_unix: number;
+}
+
+// ─── Role editor（角色编辑器） ──────────────────────────────────────
+
+/** `GET /api/roles/config` 返回的单个角色条目。 */
+export interface RoleConfigEntry {
+  id: string;
+  name: string;
+  category: string;
+  icon: string;
+  model_tier: string;
+  model_chain: string[];
+  temperature: number | null;
+  tools: string[];
+  skills: string[];
+  prompt_file: string | null;
+  /** 当前生效的 system prompt 文本。 */
+  prompt: string;
+}
+
+export interface RolesConfig {
+  roles: RoleConfigEntry[];
+  available_tools: string[];
+  tiers: string[];
+}
+
+/** `POST /api/roles/config` 请求体（category/prompt_file/skills 不可改）。 */
+export interface RoleConfigSave {
+  id: string;
+  name: string;
+  icon: string;
+  model_tier: string;
+  model_chain: string[];
+  temperature: number | null;
+  tools: string[];
+  prompt: string;
+}
+
+export async function getRolesConfig(): Promise<RolesConfig> {
+  const r = await fetch("/api/roles/config");
+  if (!r.ok) throw new Error(`GET /api/roles/config ${r.status}`);
+  return r.json();
+}
+
+export async function saveRoleConfig(
+  body: RoleConfigSave,
+): Promise<RoleConfigEntry> {
+  const r = await fetch("/api/roles/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const msg = await r.text().catch(() => "");
+    throw new Error(`POST /api/roles/config ${r.status}${msg ? `: ${msg}` : ""}`);
+  }
+  return r.json();
 }
 
 // ChatEvent —— Rust enum ChatEvent 的 JSON 表示（discriminated union）。
@@ -57,6 +116,10 @@ export type ChatEvent =
   | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
+  | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
+  | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number }
+  | { type: "WorkflowTurn"; wf_id: string; step_id: string; role_id: string; content: string; round: number }
+  | { type: "WorkflowFinished"; name: string; wf_id: string; status: string; summary: string }
   | {
       type: "SelfLoopEvent";
       kind: string;
@@ -104,12 +167,43 @@ export async function createSession(): Promise<string> {
   });
   if (!r.ok) throw new Error(`POST /api/sessions ${r.status}`);
   const info: SessionInfo = await r.json();
-  currentSessionId = info.session_id;
+  persistSessionId(info.session_id);
   return info.session_id;
 }
 
 export function switchSession(sessionId: string): void {
   currentSessionId = sessionId;
+}
+
+/** Rename a session (empty label clears the custom name). */
+export async function renameSession(
+  sessionId: string,
+  label: string,
+): Promise<void> {
+  const r = await fetch("/api/session/label", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, label }),
+  });
+  if (!r.ok) throw new Error(`POST /api/session/label ${r.status}`);
+}
+
+/** Delete a session server-side (its controller is aborted). */
+export async function deleteSession(sessionId: string): Promise<void> {
+  const r = await fetch(
+    `/api/sessions?id=${encodeURIComponent(sessionId)}`,
+    { method: "DELETE" },
+  );
+  if (!r.ok) throw new Error(`DELETE /api/sessions ${r.status}`);
+}
+
+/** Persist the active session id both in module state and localStorage
+ * so a reload reattaches to the same session. */
+export function persistSessionId(sessionId: string): void {
+  currentSessionId = sessionId;
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  }
 }
 
 /**
@@ -131,7 +225,7 @@ export async function ensureSession(): Promise<string> {
     ls?.removeItem(SESSION_STORAGE_KEY);
   }
   const id = await createSession();
-  ls?.setItem(SESSION_STORAGE_KEY, id);
+  persistSessionId(id);
   return id;
 }
 
@@ -161,6 +255,16 @@ export async function getSession(): Promise<SessionInfo> {
     `/api/session?id=${encodeURIComponent(currentSessionId)}`,
   );
   if (!r.ok) throw new Error(`GET /api/session ${r.status}`);
+  return r.json();
+}
+
+/** Fetch the archived ChatEvent log for a session — used to restore
+ * the chat panel contents after switching sessions. */
+export async function getSessionHistory(sessionId: string): Promise<ChatEvent[]> {
+  const r = await fetch(
+    `/api/session/history?id=${encodeURIComponent(sessionId)}`,
+  );
+  if (!r.ok) throw new Error(`GET /api/session/history ${r.status}`);
   return r.json();
 }
 
