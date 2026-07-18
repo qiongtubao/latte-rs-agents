@@ -45,9 +45,19 @@ export function mountChat(opts: {
   let msgCounter = 0;
   let turnStartTime = 0;
   let delegationTargetRole = "";
-  // Capture tool events for @role delegation subsession
   let capturedTools: { tool: string; args: string; result?: string }[] = [];
   let delegationSubId = "";
+
+  // ── Reference tracking ──
+  let lastUserMsgId = "";
+  let lastDelegateMsgId = "";
+  let lastRoleStarted = "";
+  let subagentTools: string[] = [];
+
+  function buildSubagentDetail(): string {
+    if (subagentTools.length === 0) return "没有工具调用日志";
+    return subagentTools.map((l, i) => `[${i + 1}] ${l}`).join("\n");
+  }
 
   function nextId(): string { return `m${++msgCounter}`; }
 
@@ -268,13 +278,22 @@ export function mountChat(opts: {
     if (atMatch) {
       const targetRole = atMatch[1];
       const msgText = atMatch[2].trim() || "(empty)";
-      addMessage({ kind: "system", content: `🤝 @manager → @${targetRole}: ${msgText}` });
+
+      const userNode = addMessage({ kind: "user", content: rawText });
+      lastUserMsgId = userNode.dataset.messageId || "";
+
+      // 2) Show the manager delegation as a role message with reference to user
+      const ref = lastUserMsgId ? { refId: lastUserMsgId, preview: rawText.substring(0, 24) } : undefined;
+      const userMsg = addMessage({ kind: "role", content: `🤝 → @${targetRole}: ${msgText}`, meta: "manager", icon: "👔", reference: ref });
+      lastDelegateMsgId = userMsg.dataset.messageId || "";
+
       setStatus("thinking");
       updateStatusPillLabel(`→ @${targetRole}`);
       container.footerMsg.textContent = `⏳ 派发给 @${targetRole}: ${msgText.substring(0, 60)}…`;
       turnStartTime = Date.now();
       delegationTargetRole = targetRole;
-      capturedTools = []; // reset tool capture
+      capturedTools = [];
+      subagentTools = [];
       try {
         await switchRole(targetRole);
         await sendMessage(msgText);
@@ -288,7 +307,9 @@ export function mountChat(opts: {
       addMessage({ kind: "system", content: `→ ${rawText}` });
       await sendCommand(rawText);
     } else {
-      addMessage({ kind: "user", content: rawText });
+      // Plain user message
+      const node = addMessage({ kind: "user", content: rawText });
+      lastUserMsgId = node.dataset.messageId || "";
       setStatus("thinking");
       updateStatusPillLabel("正在调用 LLM…");
       container.footerMsg.textContent = "⟳ 等待模型响应…";
@@ -486,30 +507,23 @@ export function mountChat(opts: {
       document.getElementById("subagentOverlay")!.style.display = "none";
     }
   });
-  // ── Subagent detail: collect tool events for current role ──
-  let subagentTools: string[] = [];
-
-  function buildSubagentDetail(): string {
-    if (subagentTools.length === 0) return "没有工具调用日志";
-    return subagentTools.map((line, i) => `[${i + 1}] ${line}`).join("\n");
-  }
-
   function handleEvent(e: ChatEvent): void {
     switch (e.type) {
       case "RoleStarted": {
         subagentTools = [];
-        addMessage({ kind:"status", content:`🧠 ${e.role_id} 开始执行…` });
+        addMessage({ kind: "status", content: `🧠 ${e.role_id} 开始执行…` });
+        lastRoleStarted = e.role_id;
         break;
       }
       case "RoleFinished": {
-        addMessage({ kind:"status", content:`✅ ${e.role_id} 完成` });
+        addMessage({ kind: "status", content: `✅ ${e.role_id} 完成` });
         break;
       }
       case "ToolUse": {
         const t = truncate(e.args, 100);
         subagentTools.push(`🔧 ${e.tool_name}(${t})`);
-        addMessage({ kind:"tool", content:`${e.tool_name} ${t}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
-        currentToolCall=`🔧 ${e.tool_name}`; currentActivity=`正在调用 ${e.tool_name}…`;
+        addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
         updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
         if (delegationTargetRole) capturedTools.push({ tool: e.tool_name, args: e.args });
         break;
@@ -517,9 +531,9 @@ export function mountChat(opts: {
       case "ToolResult": {
         const short = truncate(e.result, 80);
         subagentTools.push(`✅ ${e.tool_name} → ${short}`);
-        addMessage({ kind:"tool", content:`${e.tool_name} → ${truncate(e.result,200)}`, meta:e.role_id, icon:resolveIcon(e.role_id) });
-        currentToolCall=""; currentActivity=`${e.tool_name} 完成`;
-        updateFooter(); updateStatusPillLabel(`${currentRoleIcon||resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
+        addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        currentToolCall = ""; currentActivity = `${e.tool_name} 完成`;
+        updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
         if (delegationTargetRole && capturedTools.length > 0) {
           const last = capturedTools[capturedTools.length - 1];
           if (last.tool === e.tool_name) last.result = e.result;
@@ -534,8 +548,14 @@ export function mountChat(opts: {
         const icon = resolveIcon(e.role_id);
         const subagent = subagentTools.length > 0 ? { detail: buildSubagentDetail() } : undefined;
         const roleSubId = delegationTargetRole ? delegationSubId : undefined;
-        addMessage({ kind:"role", content:e.content, meta:e.role_id, icon, subagent, subId: roleSubId });
-        currentToolCall=""; currentActivity=""; updateFooter();
+
+        // Build reference: point to the last delegation message if this is a delegated role reply
+        const ref = delegationTargetRole && lastDelegateMsgId
+          ? { refId: lastDelegateMsgId, preview: `@${delegationTargetRole}: …` }
+          : undefined;
+
+        addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref });
+        currentToolCall = ""; currentActivity = ""; updateFooter();
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
           if (delegationTargetRole) {
@@ -544,8 +564,10 @@ export function mountChat(opts: {
             switchRole("manager").catch(() => {});
             container.rolePill.textContent = `${roleIcon("manager")} manager`;
           }
+        } else {
+          updateStatusPillLabel(`${icon} 模型输入中…`);
+          resetWaitTimer();
         }
-        else { updateStatusPillLabel(`${icon} 模型输入中…`); resetWaitTimer(); }
         break;
       }
       case "Status": {
@@ -554,8 +576,8 @@ export function mountChat(opts: {
           msg = msg + ` · ⏱ ${fmtTime(Date.now() - turnStartTime)}`;
           turnStartTime = 0;
         }
-        addMessage({ kind:"status", content:msg });
-        if (!currentToolCall&&!delegateRunning) container.footerMsg.textContent = `⟳ ${currentRoleIcon||"🧠"} ${e.message}`;
+        addMessage({ kind: "status", content: msg });
+        if (!currentToolCall && !delegateRunning) container.footerMsg.textContent = `⟳ ${currentRoleIcon || "🧠"} ${e.message}`;
         resetWaitTimer();
         break;
       }
@@ -563,49 +585,53 @@ export function mountChat(opts: {
         updateRoleDisplay(e.role_id, e.icon);
         container.modelPill.textContent = e.model_id;
         break;
-      case "Paused": addMessage({ kind:"status", content:`[paused] ${e.reason}` }); break;
-      case "Resumed": addMessage({ kind:"status", content:"[resumed]" }); break;
+      case "Paused": addMessage({ kind: "status", content: `[paused] ${e.reason}` }); break;
+      case "Resumed": addMessage({ kind: "status", content: "[resumed]" }); break;
       case "RoundStarted":
-        addMessage({ kind:"system", content:`[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
-        resetWaitTimer(); currentToolCall=""; currentDelegate=""; updateFooter(); break;
-      case "RoundEnded": addMessage({ kind:"system", content:`[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
+        addMessage({ kind: "system", content: `[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
+        resetWaitTimer(); currentToolCall = ""; currentDelegate = ""; updateFooter(); break;
+      case "RoundEnded": addMessage({ kind: "system", content: `[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
       case "DelegateStarted": {
-        const t = truncate(e.task,60);
-        addMessage({ kind:"system", content:`🤝 @${e.from_role} → @${e.to_role}`, subId:e.sub_id });
-        delegateRunning=true; currentDelegate=`${e.from_role} → ${e.to_role}`;
-        currentToolCall=""; currentActivity=`等待 ${e.to_role}`;
-        const icon=currentRoleIcon||"🧠"; updateFooter(); updateStatusPillLabel(`⏳ ${icon} → ${e.to_role}`);
+        const t = truncate(e.task, 60);
+        addMessage({ kind: "system", content: `🤝 @${e.from_role} → @${e.to_role}`, subId: e.sub_id });
+        delegateRunning = true; currentDelegate = `${e.from_role} → ${e.to_role}`;
+        currentToolCall = ""; currentActivity = `等待 ${e.to_role}`;
+        const icon = currentRoleIcon || "🧠"; updateFooter(); updateStatusPillLabel(`⏳ ${icon} → ${e.to_role}`);
         if (delegationTargetRole) delegationSubId = e.sub_id;
         container.rolePill.textContent = `⏳ ${roleIcon(e.to_role)} ${e.to_role}`;
         resetWaitTimer(); break;
       }
       case "DelegateFinished": {
-        delegateRunning=false;
-        const fi=roleIcon(e.from_role), ti=roleIcon(e.to_role);
-        const label=`${fi} ${e.from_role} → ${ti} ${e.to_role}`;
+        delegateRunning = false;
+        const fi = roleIcon(e.from_role), ti = roleIcon(e.to_role);
+        const label = `${fi} ${e.from_role} → ${ti} ${e.to_role}`;
         const isFail = e.status === "failed" || e.status === "timeout";
         const kind = isFail ? "error" : "system";
         const prefix = isFail ? "❌" : "✅";
         const statusText = isFail ? `失败(${e.status})` : "ok";
-        const msg = addMessage({ kind, content:`${prefix} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})`, subId:e.sub_id });
+        const msg = addMessage({ kind, content: `${prefix} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})`, subId: e.sub_id });
         msg.appendChild(makeSubsessionBtn(e.sub_id, label));
         if (isFail) msg.classList.add("fail-flash");
-        msg.style.cursor="pointer";
+        msg.style.cursor = "pointer";
         msg.addEventListener("click", () => { if (onShowSubsession) onShowSubsession(e.sub_id, label); });
         msg.addEventListener("contextmenu", (ev) => { ev.preventDefault(); if (onShowSubsession) onShowSubsession(e.sub_id, label); });
-        currentDelegate=""; currentActivity="";
-        const icon=currentRoleIcon||resolveIcon(e.from_role);
+        currentDelegate = ""; currentActivity = "";
+        const icon = currentRoleIcon || resolveIcon(e.from_role);
         updateFooter(); updateStatusPillLabel(`${icon} 思考中…`);
         container.rolePill.textContent = `${icon} ${e.from_role}`;
         resetWaitTimer(); break;
       }
-      case "Done": setStatus("connected"); clearWaitTimer(); addMessage({ kind:"system", content:"[会话结束]" }); setFooter("会话结束"); break;
-      case "Error": setStatus("connected"); clearWaitTimer(); addMessage({ kind:"error", content:e.message, meta:"error" }); setFooter(`错误: ${truncate(e.message,80)}`); break;
+      case "Done": setStatus("connected"); clearWaitTimer(); addMessage({ kind: "system", content: "[会话结束]" }); setFooter("会话结束"); break;
+      case "Error": setStatus("connected"); clearWaitTimer(); addMessage({ kind: "error", content: e.message, meta: "error" }); setFooter(`错误: ${truncate(e.message, 80)}`); break;
       default: console.warn("[chat] unknown event", e);
     }
   }
 
-  function appendUser(content: string): string { const node = addMessage({ kind:"user", content }); return node.dataset.messageId!; }
+  function appendUser(content: string): string {
+    const node = addMessage({ kind:"user", content });
+    lastUserMsgId = node.dataset.messageId!;
+    return node.dataset.messageId!;
+  }
   function setFooter(msg: string): void { container.footerMsg.textContent = msg; }
   function setRoleSelected(roleId: string): void { container.rolePill.textContent = roleId; container.roleSelect.value = roleId; }
   function refreshRoles(roles: RoleInfo[], selected: string): void {
