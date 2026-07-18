@@ -72,7 +72,7 @@ pub trait ChatRenderer: Send + Sync {
     /// 便捷方法：把一个完整的 `ChatEvent` 派发到对应的方法。
     async fn dispatch_event(&self, event: &ChatEvent) {
         match event {
-            ChatEvent::RoleTurn { role_id, content, is_complete } => {
+            ChatEvent::RoleTurn { role_id, content, is_complete, .. } => {
                 self.on_role_turn(&ChatEventMetadata {
                     role_id: role_id.clone(),
                     content: content.clone(),

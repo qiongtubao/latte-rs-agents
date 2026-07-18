@@ -360,6 +360,7 @@ mod tests {
             temperature: None,
             tools: vec![],
             icon: "".into(),
+            skills: vec![],
         }
     }
 

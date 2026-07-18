@@ -104,10 +104,13 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ChatEvent {
     /// One role's completed turn.
+    /// `sub_id` (optional) links this turn to a specific delegate subsession.
     RoleTurn {
         role_id: String,
         content: String,
         is_complete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
     },
     /// Informational / status message (replaces `eprintln!` / `println!`).
     Status { message: String },
@@ -960,6 +963,7 @@ async fn run_multi_role_loop(
                     role_id: role_id.clone(),
                     content: new_assistant_text.clone(),
                     is_complete: true,
+                    sub_id: None,
                 });
 
                 let mut mgr = session_arc.lock().await;
@@ -1267,7 +1271,7 @@ async fn run_single_role_loop(
                                 let usage_after = runner.total_usage();
                                 let in_delta = usage_after.input_tokens - usage_before.input_tokens;
                                 let out_delta = usage_after.output_tokens - usage_before.output_tokens;
-                                let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: response.clone(), is_complete: true });
+                                let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: response.clone(), is_complete: true, sub_id: None });
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("[{current_role} · {mid} · tokens: +{in_delta} in / +{out_delta} out]") });
                                 let _ = event_tx.send(ChatEvent::RoleFinished {
                                     role_id: current_role.clone(),
@@ -1661,7 +1665,17 @@ async fn register_delegate_tool(
             };
             runner = runner
                 .with_role(role_id.clone())
-                .with_cwd(cwd.clone());
+                .with_cwd(cwd.clone())
+                .with_sink(std::sync::Arc::new(subsession_fanout));
+
+            // Emit RoleStarted so the UI shows the specialist is working
+            let task_clone = task.clone();
+            let role_id_clone = role_id.clone();
+            let event_tx_clone = event_tx.clone();
+            let _ = event_tx_clone.send(ChatEvent::RoleStarted {
+                role_id: role_id_clone.clone(),
+                detail: format!("delegated: {}", task_clone),
+            });
 
             // 5. Run the specialist. No wall-clock timeout — the
             //    subagent runs until completion or explicit cancellation
@@ -1669,10 +1683,6 @@ async fn register_delegate_tool(
             let _permit = sem.acquire().await.map_err(|_| {
                 tool_err("delegate pool shut down".into())
             })?;
-            let msgs = vec![Message {
-                role: MsgRole::User,
-                content: task.clone(),
-            }];
             // Move runner + messages into a spawned task so we can
             // cancel it from the select! loop. The task owns everything.
             let task_content = task.clone();
@@ -1701,6 +1711,10 @@ async fn register_delegate_tool(
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         if cancel_flag.load(Ordering::SeqCst) {
                             run_handle.abort();
+                            let _ = event_tx.send(ChatEvent::RoleFinished {
+                                role_id: role_id.clone(),
+                                detail: "cancelled by user".into(),
+                            });
                             let summary = String::from("delegate cancelled by user");
                             let _ = event_tx.send(ChatEvent::DelegateFinished {
                                 from_role: "manager".into(),
@@ -1716,7 +1730,31 @@ async fn register_delegate_tool(
             }
             let run_result = result;
 
-            // 6. Emit DelegateFinished and return result.
+            // 6. Emit specialist's RoleTurn + RoleFinished so the UI
+            //    can show the subagent reply with a reference back to
+            //    the DelegateStarted message (@role task).
+            match &run_result {
+                Ok(response) => {
+                    let _ = event_tx.send(ChatEvent::RoleTurn {
+                        role_id: role_id.clone(),
+                        content: response.clone(),
+                        is_complete: true,
+                        sub_id: Some(sub_id.clone()),
+                    });
+                    let _ = event_tx.send(ChatEvent::RoleFinished {
+                        role_id: role_id.clone(),
+                        detail: format!("ok, {} chars", response.len()),
+                    });
+                }
+                Err(e) => {
+                    let _ = event_tx.send(ChatEvent::RoleFinished {
+                        role_id: role_id.clone(),
+                        detail: format!("error: {}", e),
+                    });
+                }
+            }
+
+            // 7. Emit DelegateFinished and return result.
             match run_result {
                 Ok(response) => {
                     let _ = event_tx.send(ChatEvent::DelegateFinished {

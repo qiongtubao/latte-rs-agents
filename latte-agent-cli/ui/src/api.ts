@@ -38,7 +38,7 @@ export interface TraceSummary {
 // ChatEvent —— Rust enum ChatEvent 的 JSON 表示（discriminated union）。
 // 字段命名沿用 Rust（snake_case）。
 export type ChatEvent =
-  | { type: "RoleTurn"; role_id: string; content: string; is_complete: boolean }
+  | { type: "RoleTurn"; role_id: string; content: string; is_complete: boolean; sub_id?: string }
   | { type: "Status"; message: string }
   | { type: "Prompt"; icon: string; role_id: string; model_id: string }
   | { type: "Paused"; reason: string }
