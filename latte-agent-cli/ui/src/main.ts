@@ -108,7 +108,7 @@ async function main(): Promise<void> {
       sessionSelectEl: $("trace-session-select") as HTMLSelectElement,
       refreshBtn: $("trace-refresh") as HTMLButtonElement,
       toggleBtn: $("trace-toggle") as HTMLButtonElement,
-      layoutEl: document.querySelector(".layout") as HTMLElement,
+      closeBtn: $("trace-close") as HTMLButtonElement,
     },
   });
   await trace.refresh();
@@ -122,7 +122,6 @@ async function main(): Promise<void> {
       maxInputEl: $("self-loop-max") as HTMLInputElement,
       progressEl: $("self-loop-progress"),
       screenshotsEl: $("self-loop-screenshots"),
-      layoutEl: document.querySelector(".layout") as HTMLElement,
     },
   });
 
@@ -184,8 +183,8 @@ function safeJSON(obj: Record<string, unknown>): string {
 
 function showFatal(msg: string): void {
   const el = document.createElement("div");
-  el.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0e1117;color:#f85149;font-family:sans-serif;padding:2rem;text-align:center;";
-  el.innerHTML = `<pre style="white-space:pre-wrap;">${msg}</pre>`;
+  el.style.cssText = "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#eaeef3;color:#dc2626;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica Neue,sans-serif;padding:2rem;text-align:center;";
+  el.innerHTML = `<pre style="white-space:pre-wrap;background:#ffffff;padding:2rem;border-radius:20px;box-shadow:0 12px 40px rgba(0,0,0,0.12);color:#0f172a;">${msg}</pre>`;
   document.body.appendChild(el);
 }
 

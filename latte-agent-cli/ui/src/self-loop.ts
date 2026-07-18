@@ -32,7 +32,6 @@ interface UIBinding {
   maxInputEl: HTMLInputElement;
   progressEl: HTMLElement;
   screenshotsEl: HTMLElement;
-  layoutEl: HTMLElement;
 }
 
 export interface SelfLoopController {
@@ -46,11 +45,9 @@ export function mountSelfLoop(opts: { container: UIBinding }): SelfLoopControlle
 
   container.openBtn.addEventListener("click", () => {
     container.panelEl.classList.remove("hidden");
-    container.layoutEl.classList.add("with-self-loop");
   });
   container.closeBtn.addEventListener("click", () => {
     container.panelEl.classList.add("hidden");
-    container.layoutEl.classList.remove("with-self-loop");
   });
 
   container.formEl.addEventListener("submit", async (e) => {

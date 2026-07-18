@@ -8,11 +8,11 @@
   </head>
   <body>
     <div id="app">
+      <!-- 顶部极简工具条 -->
       <header class="topbar">
         <div class="brand">
           <span class="brand-icon">☕</span>
           <span class="brand-name">latte-agent</span>
-          <span class="brand-sub">UI</span>
         </div>
         <div class="topbar-status">
           <span id="status-pill" class="status-pill connected">
@@ -31,19 +31,27 @@
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
         </div>
       </header>
-      <main class="layout">
-        <section id="chat-panel" class="panel chat-panel">
-          <div id="messages" class="messages" aria-live="polite"></div>
+
+      <!-- 主内容区：居中聊天卡片 -->
+      <main class="main-area">
+        <div class="chat-container">
+          <div class="chat-header">
+            <h2>☕ latte-agent</h2>
+            <span class="badge">subagent ⚡</span>
+          </div>
+
+          <div id="messages" class="message-list" aria-live="polite"></div>
+
           <form id="chat-form" class="chat-form">
-            <div class="input-bar">
+            <div class="input-area">
               <textarea
                 id="chat-input"
-                class="input-bar-textarea"
-                placeholder="向 latte-agent 提问… (Enter 发送，Shift+Enter 换行)"
+                class="chat-input"
+                placeholder="输入消息…（默认发给 manager；@role 可提示委派方向，[消息id] 引用）"
                 autocomplete="off"
                 rows="1"
               ></textarea>
-              <button id="chat-send" type="submit" class="input-bar-btn">发送</button>
+              <button id="chat-send" type="submit" class="send-btn">发送</button>
             </div>
             <div class="input-bar-actions">
               <button id="chat-clear" type="button" class="input-bar-action">/clear</button>
@@ -51,83 +59,88 @@
             </div>
           </form>
 
-      <!-- 右键菜单 -->
-      <div class="context-menu" id="contextMenu">
-        <button class="menu-item" data-action="edit">✏️ 编辑消息</button>
-        <button class="menu-item danger" data-action="delete">🗑️ 删除消息</button>
-        <div class="menu-divider"></div>
-        <button class="menu-item" data-action="view-subagent">🔍 查看 subagent 过程</button>
-      </div>
+          <!-- 右键菜单 -->
+          <div class="context-menu" id="contextMenu">
+            <button class="menu-item" data-action="edit">✏️ 编辑消息</button>
+            <button class="menu-item danger" data-action="delete">🗑️ 删除消息</button>
+            <div class="menu-divider"></div>
+            <button class="menu-item" data-action="view-subagent">🔍 查看 subagent 过程</button>
+          </div>
 
-      <!-- subagent 详情浮层 -->
-      <div class="subagent-overlay" id="subagentOverlay">
-        <div class="subagent-panel">
-          <h3>
-            <span>🧩 Subagent 执行过程</span>
-            <button class="close-btn" id="closeSubagent">关闭</button>
-          </h3>
-          <div class="subagent-log" id="subagentLog">加载中…</div>
+          <!-- subagent 详情浮层 -->
+          <div class="subagent-overlay" id="subagentOverlay">
+            <div class="subagent-panel">
+              <h3>
+                <span>🧩 子代理详情</span>
+                <button class="close-btn" id="closeSubagent">关闭</button>
+              </h3>
+              <div class="subagent-log" id="subagentLog">加载中…</div>
+            </div>
+          </div>
         </div>
-      </div>
-        </section>
+      </main>
 
-        <aside id="trace-panel" class="panel trace-panel hidden">
-          <header class="panel-header">
-            <h2>Trace</h2>
-            <select id="trace-session-select"></select>
-            <button id="trace-refresh" type="button">↻</button>
-          </header>
-          <div id="trace-list" class="trace-list"></div>
-        </aside>
+      <!-- 侧边浮层面板 -->
+      <aside id="trace-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>Trace</h2>
+          <select id="trace-session-select"></select>
+          <button id="trace-refresh" type="button">↻</button>
+          <button id="trace-close" type="button" class="panel-close">×</button>
+        </header>
+        <div id="trace-list" class="trace-list"></div>
+      </aside>
 
-        <aside id="self-loop-panel" class="panel self-loop-panel hidden">
-          <header class="panel-header">
-            <h2>AI Self-Debug Loop</h2>
-            <button id="self-loop-close" type="button">×</button>
-          </header>
-          <div class="self-loop-body">
-            <p class="hint">
-              Describe what to fix in the UI. The agent launches
-              <code>chrome --headless</code>, takes screenshots, reads the
-              console + trace events, modifies code, re-runs, repeats —
-              no human in the loop.
-            </p>
-            <form id="self-loop-form">
-              <input
-                id="self-loop-task"
-                type="text"
-                placeholder="e.g. make the chat input auto-resize and remember history"
-                required
-              />
-              <div class="self-loop-form-row">
-                <label>
-                  Max iterations
-                  <input id="self-loop-max" type="number" min="1" max="20" value="5" />
-                </label>
-                <button type="submit" class="primary">Start loop</button>
-              </div>
-            </form>
-            <div id="self-loop-progress" class="self-loop-progress"></div>
-            <div id="self-loop-screenshots" class="self-loop-screenshots"></div>
-        </aside>
-        <aside id="role-graph-panel" class="panel role-graph-panel hidden">
-          <header class="panel-header">
-            <h2>Role × Tool Graph</h2>
-            <button id="role-graph-close" type="button">×</button>
-            <button id="role-graph-refresh" type="button">↻</button>
-          </header>
-          <div class="role-graph-stats" id="role-graph-stats">loading…</div>
-          <div class="role-graph-body" id="role-graph-body"></div>
-        </aside>
+      <aside id="self-loop-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>AI Self-Debug Loop</h2>
+          <button id="self-loop-close" type="button" class="panel-close">×</button>
+        </header>
+        <div class="self-loop-body">
+          <p class="hint">
+            Describe what to fix in the UI. The agent launches
+            <code>chrome --headless</code>, takes screenshots, reads the
+            console + trace events, modifies code, re-runs, repeats —
+            no human in the loop.
+          </p>
+          <form id="self-loop-form">
+            <input
+              id="self-loop-task"
+              type="text"
+              placeholder="e.g. make the chat input auto-resize and remember history"
+              required
+            />
+            <div class="self-loop-form-row">
+              <label>
+                Max iterations
+                <input id="self-loop-max" type="number" min="1" max="20" value="5" />
+              </label>
+              <button type="submit" class="primary">Start loop</button>
+            </div>
+          </form>
+          <div id="self-loop-progress" class="self-loop-progress"></div>
+          <div id="self-loop-screenshots" class="self-loop-screenshots"></div>
+        </div>
+      </aside>
 
-        <aside id="subsession-panel" class="panel subsession-panel hidden">
-          <header class="panel-header">
-            <h2>Subsession</h2>
-            <button id="subsession-close" type="button">×</button>
-            <span class="subsession-label" id="subsession-label"></span>
-          </header>
-          <div class="subsession-body" id="subsession-body">loading…</div>
-        </aside>
+      <aside id="role-graph-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>Role × Tool Graph</h2>
+          <button id="role-graph-close" type="button" class="panel-close">×</button>
+          <button id="role-graph-refresh" type="button">↻</button>
+        </header>
+        <div class="role-graph-stats" id="role-graph-stats">loading…</div>
+        <div class="role-graph-body" id="role-graph-body"></div>
+      </aside>
+
+      <aside id="subsession-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>Subsession</h2>
+          <button id="subsession-close" type="button" class="panel-close">×</button>
+          <span class="subsession-label" id="subsession-label"></span>
+        </header>
+        <div class="subsession-body" id="subsession-body">loading…</div>
+      </aside>
 
       <footer class="statusbar">
         <span id="footer-msg">ready</span>

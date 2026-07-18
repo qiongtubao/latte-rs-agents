@@ -14,7 +14,7 @@ interface UIBinding {
   sessionSelectEl: HTMLSelectElement;
   refreshBtn: HTMLButtonElement;
   toggleBtn: HTMLButtonElement;
-  layoutEl: HTMLElement;
+  closeBtn?: HTMLButtonElement;
 }
 
 export interface TraceController {
@@ -36,8 +36,13 @@ export function mountTrace(opts: { container: UIBinding }): TraceController {
 
   container.toggleBtn.addEventListener("click", () => {
     container.panelEl.classList.toggle("hidden");
-    container.layoutEl.classList.toggle("with-trace");
   });
+
+  if (container.closeBtn) {
+    container.closeBtn.addEventListener("click", () => {
+      container.panelEl.classList.add("hidden");
+    });
+  }
 
   async function refresh(): Promise<void> {
     let traces: TraceSummary[] = [];

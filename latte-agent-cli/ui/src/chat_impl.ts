@@ -35,6 +35,36 @@ function fmtTime(ms: number): string {
   return `${Math.floor(s/60)}分${s%60}秒`;
 }
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function renderContentWithCode(text: string): string {
+  if (!text.includes("```")) return escapeHtml(text);
+  const parts: string[] = [];
+  let remaining = text;
+  while (true) {
+    const start = remaining.indexOf("```");
+    if (start === -1) { parts.push(escapeHtml(remaining)); break; }
+    parts.push(escapeHtml(remaining.slice(0, start)));
+    const after = remaining.slice(start + 3);
+    const end = after.indexOf("```");
+    if (end === -1) { parts.push(escapeHtml(remaining)); break; }
+    const langAndCode = after.slice(0, end);
+    const newline = langAndCode.indexOf("\n");
+    const lang = newline === -1 ? "" : langAndCode.slice(0, newline).trim();
+    const code = newline === -1 ? langAndCode : langAndCode.slice(newline + 1);
+    parts.push(`<pre><code${lang ? ` class="language-${lang}"` : ""}>${escapeHtml(code)}</code></pre>`);
+    remaining = after.slice(end + 3);
+  }
+  return parts.join("");
+}
+
 export function mountChat(opts: {
   container: UIBinding; initialRole: string; initialModel?: string;
   onRoleSwitch?: (roleId: string) => Promise<void>;
@@ -95,6 +125,15 @@ export function mountChat(opts: {
     if (roleId === 'tech_writer') return 'W';
     if (roleId === 'pm') return 'Pm';
     return roleId.charAt(0).toUpperCase();
+  }
+
+  // ── smart scroll: only auto-scroll if user is near the bottom ──
+  function isNearBottom(): boolean {
+    const el = container.messagesEl;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
+  function scrollToBottom(): void {
+    container.messagesEl.scrollTop = container.messagesEl.scrollHeight;
   }
 
   // ── addMessage: render a message into the chat ──
@@ -184,7 +223,7 @@ export function mountChat(opts: {
           content.appendChild(ind);
         });
       } else {
-        content.textContent = opts2.content;
+        content.innerHTML = renderContentWithCode(opts2.content);
       }
       bubble.appendChild(content);
 
@@ -262,7 +301,7 @@ export function mountChat(opts: {
     }
     container.messagesEl.appendChild(row);
 
-    container.messagesEl.scrollTop = container.messagesEl.scrollHeight;
+    if (isNearBottom()) scrollToBottom();
     return row;
   }
 
@@ -274,47 +313,20 @@ export function mountChat(opts: {
     container.inputEl.value = "";
     container.sendBtn.disabled = true;
 
-    const atMatch = rawText.match(/^@(\w+)\s+(.*)/s);
-    if (atMatch) {
-      const targetRole = atMatch[1];
-      const msgText = atMatch[2].trim() || "(empty)";
-
-      const userNode = addMessage({ kind: "user", content: rawText });
-      lastUserMsgId = userNode.dataset.messageId || "";
-
-      // 2) Show the manager delegation as a role message with reference to user
-      const ref = lastUserMsgId ? { refId: lastUserMsgId, preview: rawText.substring(0, 24) } : undefined;
-      const userMsg = addMessage({ kind: "role", content: `🤝 → @${targetRole}: ${msgText}`, meta: "manager", icon: "👔", reference: ref });
-      lastDelegateMsgId = userMsg.dataset.messageId || "";
-
-      setStatus("thinking");
-      updateStatusPillLabel(`→ @${targetRole}`);
-      container.footerMsg.textContent = `⏳ 派发给 @${targetRole}: ${msgText.substring(0, 60)}…`;
-      turnStartTime = Date.now();
-      delegationTargetRole = targetRole;
-      capturedTools = [];
-      subagentTools = [];
-      try {
-        await switchRole(targetRole);
-        await sendMessage(rawText);
-      } catch (err) {
-        addMessage({ kind: "error", content: `派发给 @${targetRole} 失败: ${String(err)}` });
-        delegationTargetRole = "";
-        delegationSubId = "";
-      }
-      startWaitTimer();
-    } else if (rawText.startsWith("/")) {
+    if (rawText.startsWith("/")) {
       addMessage({ kind: "system", content: `→ ${rawText}` });
       await sendCommand(rawText);
     } else {
-      // Plain user message
-      const node = addMessage({ kind: "user", content: rawText });
+      // 所有用户输入都交给 manager；@manager 等价于不指定角色
+      const messageText = rawText.replace(/^@manager\s+/i, "").trim();
+      const displayText = messageText || rawText;
+      const node = addMessage({ kind: "user", content: displayText });
       lastUserMsgId = node.dataset.messageId || "";
       setStatus("thinking");
       updateStatusPillLabel("正在调用 LLM…");
-      container.footerMsg.textContent = "⟳ 等待模型响应…";
+      container.footerMsg.textContent = "⟳ 等待 manager 响应…";
       turnStartTime = Date.now();
-      await sendMessage(rawText);
+      await sendMessage(messageText || rawText);
       startWaitTimer();
     }
     container.sendBtn.disabled = false;
@@ -322,6 +334,32 @@ export function mountChat(opts: {
 
   container.inputEl.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); container.sendBtn.click(); }
+  });
+  container.inputEl.addEventListener("input", () => {
+    container.inputEl.style.height = "auto";
+    container.inputEl.style.height = Math.min(container.inputEl.scrollHeight, 140) + "px";
+  });
+
+  // Escape closes any open overlay / menu.
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      document.getElementById("contextMenu")!.style.display = "none";
+      document.getElementById("subagentOverlay")!.style.display = "none";
+    }
+  });
+
+  // Double-click a message row to edit (same as context-menu edit).
+  container.messagesEl.addEventListener("dblclick", (e) => {
+    const row = (e.target as HTMLElement).closest(".message-row") as HTMLElement | null;
+    if (!row || !row.dataset.messageId) return;
+    const record = getMsgById(row.dataset.messageId);
+    if (!record) return;
+    const newContent = prompt("编辑消息内容:", record.content);
+    if (newContent !== null && newContent.trim() !== "") {
+      record.content = newContent.trim();
+      const contentEl = record.el.querySelector(".msg-content") as HTMLElement | null;
+      if (contentEl) contentEl.innerHTML = renderContentWithCode(newContent.trim());
+    }
   });
   container.clearBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /clear" }); await sendCommand("/clear"); });
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
@@ -470,8 +508,8 @@ export function mountChat(opts: {
         const newContent = prompt("编辑消息内容:", record.content);
         if (newContent !== null && newContent.trim() !== "") {
           record.content = newContent.trim();
-          const contentEl = record.el.querySelector(".msg-content")!;
-          if (contentEl) contentEl.textContent = newContent.trim();
+          const contentEl = record.el.querySelector(".msg-content") as HTMLElement | null;
+          if (contentEl) contentEl.innerHTML = renderContentWithCode(newContent.trim());
         }
         break;
       }
@@ -592,12 +630,24 @@ export function mountChat(opts: {
         resetWaitTimer(); currentToolCall = ""; currentDelegate = ""; updateFooter(); break;
       case "RoundEnded": addMessage({ kind: "system", content: `[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
       case "DelegateStarted": {
-        const t = truncate(e.task, 60);
-        addMessage({ kind: "system", content: `🤝 @${e.from_role} → @${e.to_role}`, subId: e.sub_id });
+        // 与 ui.html 一致：把 manager 的委派显示为 manager 角色消息
+        const taskText = e.task.trim() || "(empty)";
+        const delegateMsg = addMessage({
+          kind: "role",
+          content: `@${e.to_role} ${taskText}`,
+          meta: e.from_role || "manager",
+          icon: roleIcon(e.from_role || "manager"),
+          subId: e.sub_id,
+        });
+        lastDelegateMsgId = delegateMsg.dataset.messageId || "";
+        delegationTargetRole = e.to_role;
+        delegationSubId = e.sub_id;
+        capturedTools = [];
+        subagentTools = [];
+
         delegateRunning = true; currentDelegate = `${e.from_role} → ${e.to_role}`;
         currentToolCall = ""; currentActivity = `等待 ${e.to_role}`;
         const icon = currentRoleIcon || "🧠"; updateFooter(); updateStatusPillLabel(`⏳ ${icon} → ${e.to_role}`);
-        if (delegationTargetRole) delegationSubId = e.sub_id;
         container.rolePill.textContent = `⏳ ${roleIcon(e.to_role)} ${e.to_role}`;
         resetWaitTimer(); break;
       }
