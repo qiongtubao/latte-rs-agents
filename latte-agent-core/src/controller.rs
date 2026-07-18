@@ -1741,16 +1741,12 @@ async fn register_delegate_tool(
                 task: task.clone(),
                 sub_id: sub_id.clone(),
             });
-            // Fan out to BOTH the subsession memory sink (for the
-            // "📋 详情" transcript viewer) and the main chat SSE
-            // stream (so the specialist's tool calls show up live in
-            // the chat as ToolUse/ToolResult events, attributed to
-            // the specialist's role id).
+            // Fan out ONLY to the subsession memory sink: the
+            // specialist's tool calls are part of the subagent
+            // transcript (viewable via "📋 详情" / 右键 → 查看
+            // subagent 过程), not of the main chat stream.
             let subsession_fanout = FanoutSink::new(vec![
                 sub_sink.clone() as Arc<dyn crate::trace::TraceSink>,
-                Arc::new(ChatEventTraceSink {
-                    event_tx: event_tx.clone(),
-                }) as Arc<dyn crate::trace::TraceSink>,
             ]);
             let template = merged
                 .roles

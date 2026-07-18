@@ -88,8 +88,6 @@ export function mountChat(opts: {
     capturedTools: { tool: string; args: string; result?: string }[];
     /** "⏳ 执行中…" badge on the DelegateStarted bubble. */
     stateEl?: HTMLElement;
-    /** Watchdog: flags the delegate as timed-out when silent for too long. */
-    timeoutId?: number;
   }
   const activeDelegates = new Map<string, DelegateInfo>();
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
@@ -107,51 +105,7 @@ export function mountChat(opts: {
     return found;
   }
 
-  function clearDelegateWatchdog(subId: string): void {
-    const di = activeDelegates.get(subId);
-    if (di?.timeoutId !== undefined) {
-      window.clearTimeout(di.timeoutId);
-      di.timeoutId = undefined;
-    }
-  }
-
-  function startDelegateWatchdog(subId: string, roleId: string): void {
-    clearDelegateWatchdog(subId);
-    const di = activeDelegates.get(subId);
-    if (!di) return;
-    di.timeoutId = window.setTimeout(() => {
-      if (!activeDelegates.has(subId)) return;
-      const taskText = di.taskText;
-      activeDelegates.delete(subId);
-      const label = `⏱ ${roleId}`;
-      const msg = addMessage({
-        kind: "error",
-        content: `⏱ 委托超时：@${roleId} 任务「${truncate(taskText, 60)}」${Math.floor(WAIT_TIMEOUT_MS / 1000)}秒无响应`,
-        meta: roleId,
-        icon: roleIcon(roleId),
-        subId,
-      });
-      msg.appendChild(makeSubsessionBtn(subId, label));
-      msg.style.cursor = "pointer";
-      msg.addEventListener("click", () => { if (onShowSubsession) onShowSubsession(subId, label); });
-      if (currentDelegateSubId === subId) {
-        currentDelegateSubId = "";
-        delegateRunning = false;
-        currentDelegate = "";
-        updateFooter();
-      }
-    }, WAIT_TIMEOUT_MS);
-  }
-
-  function resetDelegateWatchdog(subId: string): void {
-    const di = activeDelegates.get(subId);
-    if (di?.timeoutId !== undefined) startDelegateWatchdog(subId, di.targetRole);
-  }
-
   function clearAllDelegates(): void {
-    for (const [, di] of activeDelegates) {
-      if (di.timeoutId !== undefined) window.clearTimeout(di.timeoutId);
-    }
     activeDelegates.clear();
     currentDelegateSubId = "";
     workflowStates.clear();
@@ -686,7 +640,12 @@ export function mountChat(opts: {
       }
       case "view-subagent": {
         const record = getMsgById(selectedMsgId!);
-        if (record && record.subagent) {
+        const subId = record?.el.dataset.subId;
+        if (subId && onShowSubsession) {
+          // 有子会话：打开完整过程（含工具调用/bash 日志）
+          const label = record.meta ? `${roleIcon(record.meta)} ${record.meta}` : "subagent";
+          onShowSubsession(subId, label);
+        } else if (record && record.subagent) {
           const logEl = document.getElementById("subagentLog")!;
           logEl.textContent = record.subagent.detail || "无详细信息";
           document.getElementById("subagentOverlay")!.style.display = "flex";
@@ -729,10 +688,7 @@ export function mountChat(opts: {
         // Attribute by role so parallel delegates each collect their own tools.
         const toolSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
         const di = activeDelegates.get(toolSubId);
-        if (di) {
-          di.capturedTools.push({ tool: e.tool_name, args: e.args });
-          resetDelegateWatchdog(toolSubId);
-        }
+        if (di) di.capturedTools.push({ tool: e.tool_name, args: e.args });
         break;
       }
       case "ToolResult": {
@@ -745,7 +701,6 @@ export function mountChat(opts: {
         if (di2 && di2.capturedTools.length > 0) {
           const last = di2.capturedTools[di2.capturedTools.length - 1];
           if (last.tool === e.tool_name) last.result = e.result;
-          resetDelegateWatchdog(resultSubId);
         }
         break;
       }
@@ -779,7 +734,6 @@ export function mountChat(opts: {
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
           if (di) {
-            clearDelegateWatchdog(subId);
             activeDelegates.delete(subId);
             if (activeDelegates.size === 0) {
               if (!replaying) switchRole("manager").catch(() => {});
@@ -787,7 +741,6 @@ export function mountChat(opts: {
             }
           }
         } else {
-          if (di) resetDelegateWatchdog(subId);
           updateStatusPillLabel(`${icon} 模型输入中…`);
           resetWaitTimer();
         }
@@ -842,7 +795,6 @@ export function mountChat(opts: {
           capturedTools: [],
           stateEl,
         });
-        startDelegateWatchdog(e.sub_id, e.to_role);
         currentDelegateSubId = e.sub_id;
         subagentTools = [];
 
@@ -866,7 +818,6 @@ export function mountChat(opts: {
         msg.appendChild(makeSubsessionBtn(e.sub_id, label));
         if (isFail) msg.classList.add("fail-flash");
         // Flip the pending badge on the DelegateStarted bubble.
-        clearDelegateWatchdog(e.sub_id);
         const finishedDi = activeDelegates.get(e.sub_id);
         if (finishedDi?.stateEl) {
           finishedDi.stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
