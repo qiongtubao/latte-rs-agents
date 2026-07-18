@@ -205,10 +205,12 @@ export function mountChat(opts: {
         const badge = document.createElement("div");
         badge.className = "subagent-badge";
         badge.textContent = "🔍 subagent 过程";
-        badge.dataset.msgId = id;
         badge.addEventListener("click", (e) => {
           e.stopPropagation();
-          showSubagentOverlay(id);
+          const logEl = document.getElementById("subagentLog")!;
+          logEl.textContent = (opts2.subagent?.detail) || "[subagent 日志]";
+          const overlay = document.getElementById("subagentOverlay")!;
+          overlay.style.display = "flex";
         });
         bubble.appendChild(badge);
       }
@@ -462,8 +464,11 @@ export function mountChat(opts: {
         break;
       }
       case "view-subagent": {
-        if (record.subagent) {
-          showSubagentOverlay(record.id);
+        const record = getMsgById(selectedMsgId!);
+        if (record && record.subagent) {
+          const logEl = document.getElementById("subagentLog")!;
+          logEl.textContent = record.subagent.detail || "无详细信息";
+          document.getElementById("subagentOverlay")!.style.display = "flex";
         } else {
           alert("该消息没有关联 subagent 过程");
         }
@@ -473,15 +478,6 @@ export function mountChat(opts: {
     menu.style.display = "none";
   });
 
-  // ── Subagent detail overlay ──
-  function showSubagentOverlay(msgId: string): void {
-    const record = getMsgById(msgId);
-    if (!record || !record.subagent) return;
-    const logEl = document.getElementById("subagentLog")!;
-    logEl.textContent = record.subagent.detail || "无详细信息";
-    const overlay = document.getElementById("subagentOverlay")!;
-    overlay.style.display = "flex";
-  }
 
   document.getElementById("closeSubagent")!.addEventListener("click", () => {
     document.getElementById("subagentOverlay")!.style.display = "none";
