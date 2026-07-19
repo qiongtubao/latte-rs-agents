@@ -186,9 +186,10 @@ async function main(): Promise<void> {
     sseDisconnector = disconnect;
     sseConnector = reconnect;
   }
-  openSse();
-
-  await refreshSessionSelect(sessionSelect, currentId);
+  // 首次激活 = 完整走一遍 activateSession：拉历史回放（live 与落盘
+  // 恢复的 session 都覆盖）+ 订阅 SSE + 刷新会话列表。没有这一步，
+  // 启动后聊天区永远空白（此前只靠切 session 才回放）。
+  await activateSession(currentId);
 
   /** Make `id` the active session: disconnect old SSE, restore its
    * archived chat history, refresh role chrome, subscribe new SSE. */

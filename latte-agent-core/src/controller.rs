@@ -118,6 +118,10 @@ pub enum ChatEvent {
     },
     /// Informational / status message (replaces `eprintln!` / `println!`).
     Status { message: String },
+    /// 用户发出的一条消息（send 路径；`/` 开头的斜杠命令不产生此事件）。
+    /// 回放（UI 的 event_log / ui-sessions 落盘）靠它恢复用户气泡——
+    /// 此前全部变体都是 agent 侧产出，回放里看不到用户自己发的内容。
+    UserMessage { text: String },
     /// Prompt indicator (replaces `"👔 manager · deepseek-v4-flash › "`).
     Prompt {
         icon: String,
@@ -1350,7 +1354,12 @@ async fn run_single_role_loop(
                             }
                             continue;
                         }
-                    
+
+                        // 走到这里的非斜杠输入才是真正的用户消息（斜杠
+                        // 命令已在上面的分支 continue）——先广播用户气泡
+                        // 事件，再跑 turn。回放/落盘靠它恢复用户输入。
+                        let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
+
                         // Run the turn
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
@@ -2744,6 +2753,140 @@ mod tests {
         assert!(body2.contains("改用 src/lib.rs 路径"), "hint text: {body2}");
         // …and the user question was recorded for the monitor.
         assert_eq!(controller.last_user_input(), "第二问");
+
+        controller.abort().await;
+    }
+
+    // ─── UserMessage 事件 ─────────────────────────────────────────
+    //
+    // 回放里要能看到用户自己发的内容：driver 收到非斜杠 Input 时先广播
+    // UserMessage 再跑 turn；斜杠命令（/roles 等）不产生该事件。
+
+    #[tokio::test]
+    async fn user_message_emitted_for_input_but_not_slash_command() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "plain reply" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    id: "stub-standard".into(),
+                    name: "Stub".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "Manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+        };
+
+        async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>) -> ChatEvent {
+            tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("recv")
+        }
+
+        let controller = ChatController::new(64);
+        let mut rx = controller.spawn(cfg).await;
+
+        // 1) 普通输入 → 必须先出现 UserMessage（且 text 与输入一致），
+        //    且它先于本 turn 的 RoleTurn。
+        controller.submit_input("你好，世界").await;
+        let mut saw_user_message = false;
+        loop {
+            match next_event(&mut rx).await {
+                ChatEvent::UserMessage { text } => {
+                    assert_eq!(text, "你好，世界");
+                    saw_user_message = true;
+                }
+                ChatEvent::RoleTurn { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_user_message, "send 路径必须广播 UserMessage");
+
+        // 2) 斜杠命令 → RoleList 返回，但绝不能出现 UserMessage。
+        controller.submit_input("/roles").await;
+        loop {
+            match next_event(&mut rx).await {
+                um @ ChatEvent::UserMessage { .. } => {
+                    panic!("slash command must not emit UserMessage: {um:?}")
+                }
+                ChatEvent::RoleList { .. } => break,
+                _ => {}
+            }
+        }
 
         controller.abort().await;
     }

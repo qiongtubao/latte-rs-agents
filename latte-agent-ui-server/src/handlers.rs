@@ -196,7 +196,7 @@ pub(crate) async fn events_sse(
     let id = params
         .get("id")
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing ?id=".into()))?;
-    let rx = api::subscribe_session(&state.backend, id).map_err(|e| {
+    let rx = api::subscribe_session(&state.backend, id).await.map_err(|e| {
         (
             StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             // events_sse 原来的错误消息带 "session ... not found"（不带

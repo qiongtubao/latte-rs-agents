@@ -95,6 +95,18 @@ mod tests {
     }
 
     #[test]
+    fn chat_event_to_frontend_json_handles_user_message() {
+        let ev = ChatEvent::UserMessage { text: "分析一下 Cargo.toml".into() };
+        let json = chat_event_to_frontend_json(&ev).expect("convert");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["type"], "UserMessage");
+        assert_eq!(v["text"], "分析一下 Cargo.toml");
+        assert!(v.get("UserMessage").is_none());
+        // roundtrip：转出的 JSON 再 parse 回来字段不丢
+        assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
     fn chat_event_to_frontend_json_handles_unit_variant() {
         let ev = ChatEvent::Done;
         let json = chat_event_to_frontend_json(&ev).expect("convert");
@@ -130,6 +142,7 @@ mod tests {
     fn chat_event_to_frontend_json_every_variant_has_type_field() {
         let cases: Vec<(&str, ChatEvent)> = vec![
             ("Status", ChatEvent::Status { message: "x".into() }),
+            ("UserMessage", ChatEvent::UserMessage { text: "hi".into() }),
             ("Paused", ChatEvent::Paused { reason: "ask_human".into() }),
             ("Resumed", ChatEvent::Resumed),
             ("RoundStarted", ChatEvent::RoundStarted { round: 1 }),

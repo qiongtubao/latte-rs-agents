@@ -82,6 +82,10 @@ pub struct SessionSummary {
     pub initial_role: String,
     pub created_at_unix_ms: u64,
     pub last_activity_unix_ms: u64,
+    /// true = 本 session 是从 ui-sessions 落盘恢复的（可见历史早于
+    /// 本次进程启动；agent 上下文从空开始，首个 chat/subscribe 时
+    /// 懒 spawn controller）。
+    pub restored: bool,
 }
 
 pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
@@ -100,6 +104,7 @@ pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
             initial_role: h.initial_role.clone(),
             created_at_unix_ms: millis_from_now(now, h.created_at),
             last_activity_unix_ms: millis_from_now(now, *h.last_activity.lock()),
+            restored: h.restored,
         })
         .collect();
     // last_activity_unix_ms 存的是"距上次活动的毫秒数"（age），越小越
@@ -121,7 +126,6 @@ pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
         &b.cwd,
         None,
         None,
-        256,
         &b.subsession_store,
     )
     .await
@@ -139,6 +143,7 @@ pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
             initial_role: h.initial_role.clone(),
             created_at_unix_ms: 0,
             last_activity_unix_ms: 0,
+            restored: h.restored,
         }],
         available_roles: build_role_info(&b.merged.read()),
     };
@@ -192,6 +197,7 @@ pub fn get_session(b: &UiBackend, id: &str) -> Result<SessionInfo, ApiError> {
                 let g = h.last_activity.lock();
                 millis_from_now(Instant::now(), *g)
             },
+            restored: h.restored,
         }],
         available_roles: build_role_info(&b.merged.read()),
     })
@@ -214,13 +220,15 @@ pub fn session_history(b: &UiBackend, id: &str) -> Result<Vec<serde_json::Value>
     Ok(events)
 }
 
-/// 删除 session 并停掉它的 controller。UI 在删除当前活跃 session
-/// 之前会先切到别的 session（或新建一个）。
+/// 删除 session：停掉它的 controller（恢复未激活的 no-op）并删
+/// 落盘文件。UI 在删除当前活跃 session 之前会先切到别的 session
+/// （或新建一个）。
 pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
     let removed = b.sessions.write().remove(id);
     match removed {
         Some(h) => {
-            h.controller.abort().await;
+            h.abort_if_spawned().await;
+            h.delete_files();
             Ok(())
         }
         None => Err(ApiError::not_found(format!("session {id} unknown"))),
@@ -228,28 +236,35 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
 }
 
 /// 重命名 session。空/纯空白 label 清除自定义名，回退到 preview。
+/// 同时尾加一条 meta 覆盖行落盘（恢复时最后一条 meta 生效）。
 pub fn set_session_label(b: &UiBackend, session_id: &str, label: &str) -> Result<(), ApiError> {
     let h = resolve_session(b, Some(session_id))?;
     let trimmed = label.trim();
-    *h.label.lock() = if trimmed.is_empty() {
+    let new_label = if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.chars().take(60).collect())
     };
+    h.set_label(new_label);
     h.touch();
     Ok(())
 }
 
-/// 订阅某 session 的 ChatEvent broadcast（只拿得到订阅之后的事件）。
-/// Tauri 适配器用它把事件转发成 `ui:chat_event`；HTTP 的 SSE handler
-/// 走的是同一通道。事件转前端 JSON 用
+/// 订阅某 session 的 ChatEvent broadcast（只拿得到订阅之后的事件；
+/// 恢复 session 在此时懒 spawn controller）。Tauri 适配器用它把事件
+/// 转发成 `ui:chat_event`；HTTP 的 SSE handler 走的是同一通道。事件
+/// 转前端 JSON 用
 /// `latte_agent_core::event_json::chat_event_to_frontend_json`（契约 C2）。
-pub fn subscribe_session(
+pub async fn subscribe_session(
     b: &UiBackend,
     id: &str,
 ) -> Result<broadcast::Receiver<ChatEvent>, ApiError> {
     let h = resolve_session(b, Some(id))?;
-    Ok(h.controller.subscribe())
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    Ok(controller.subscribe())
 }
 
 // ─── Roles ────────────────────────────────────────────────────────
@@ -530,8 +545,9 @@ pub fn save_role_config(
 
 // ─── Chat ─────────────────────────────────────────────────────────
 
-/// `POST /api/chat/send`：向 session 的 controller 提交一条用户消息。
-/// 立即返回（"已受理"语义）；产出走 [`subscribe_session`] 的事件流。
+/// `POST /api/chat/send`：向 session 的 controller 提交一条用户消息
+/// （恢复 session 此时懒 spawn controller）。立即返回（"已受理"语
+/// 义）；产出走 [`subscribe_session`] 的事件流。
 pub async fn chat_send(
     b: &UiBackend,
     session_id: Option<&str>,
@@ -544,7 +560,11 @@ pub async fn chat_send(
         let preview = message.chars().take(80).collect::<String>();
         *h.first_user_msg.lock() = Some(preview);
     }
-    h.controller.submit_input(message).await;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.submit_input(message).await;
     Ok(())
 }
 
@@ -556,7 +576,11 @@ pub async fn chat_command(
 ) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
-    h.controller.submit_input(command).await;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.submit_input(command).await;
     Ok(())
 }
 
@@ -568,7 +592,11 @@ pub async fn chat_switch_role(
 ) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
-    h.controller.switch_role(role_id).await;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.switch_role(role_id).await;
     Ok(())
 }
 

@@ -137,9 +137,10 @@ pub struct UiBackend {
 }
 
 impl UiBackend {
-    /// 构造容器（不创建任何 session；随后调
-    /// [`UiBackend::bootstrap_default_session`] 或
-    /// [`api::create_session`]）。
+    /// 构造容器：先扫描 `<cwd>/.latte/ui-sessions/` 恢复落盘 session
+    /// （元数据 + event_log 载入，**不** spawn controller——首个
+    /// chat_send/subscribe 懒 spawn）；不新建任何 session，新建走
+    /// [`UiBackend::bootstrap_default_session`] / [`api::create_session`]。
     pub fn new(config: UiBackendConfig) -> anyhow::Result<Self> {
         let UiBackendConfig {
             agent_config,
@@ -166,7 +167,7 @@ impl UiBackend {
         // 的工作区根（Tauri 内嵌场景）。
         let cwd = cwd.map(Ok).unwrap_or_else(std::env::current_dir)?;
 
-        Ok(Self {
+        let backend = Self {
             sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             merged,
             resolver: Arc::new(model_resolver),
@@ -177,7 +178,27 @@ impl UiBackend {
             self_loop: Arc::new(self_loop::SelfLoopState::default()),
             subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::new()),
             agents_config,
-        })
+        };
+
+        // 恢复落盘的 ui-sessions（`<cwd>/.latte/ui-sessions/*.jsonl`）：
+        // 元数据 + event_log 载入内存，list/get/history 立即可用；不
+        // spawn controller（首个 chat_send/subscribe 懒 spawn）。
+        let restore_base = sessions::SessionSpawnParams {
+            merged: backend.merged.clone(),
+            resolver: backend.resolver.clone(),
+            cwd: backend.cwd.clone(),
+            primary_model_id: None,
+            initial_tier: None,
+            subsession_store: backend.subsession_store.clone(),
+        };
+        for h in sessions::restore_sessions(&backend.cwd, &restore_base) {
+            backend
+                .sessions
+                .write()
+                .insert(h.session_id.clone(), Arc::new(h));
+        }
+
+        Ok(backend)
     }
 
     /// Bootstrap ONE default session tied to "launch" time, so old
@@ -199,7 +220,6 @@ impl UiBackend {
             &self.cwd,
             self.primary_model_id.clone(),
             self.initial_tier.clone(),
-            256,
             &self.subsession_store,
         )
         .await?;
@@ -550,5 +570,151 @@ mod tests {
 
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&ws_root);
+    }
+
+    /// ui-sessions 落盘端到端：backend A（tmp cwd）建 session、发一条
+    /// 真实用户消息（模型指向死端口，turn 必失败但 UserMessage 已先
+    /// 广播）→ drop A → 新 backend B（同 cwd）恢复：list 可见且带
+    /// restored/label/preview，history 与 A 逐字节一致（含
+    /// UserMessage）→ delete 后文件消失。
+    #[tokio::test]
+    async fn persistence_restore_list_history_label_and_delete() {
+        use latte_agent_core::config::{AgentConfig, ModelCatalog, ModelDef};
+        use latte_agent_core::role::RoleTemplate;
+
+        let ws = std::env::temp_dir().join(format!(
+            "ui-server-persist-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+        // 一个"能 build_runner、但 turn 必失败"的配置：模型存在但
+        // base_url 是死端口（连接立即被拒）。这样 UserMessage 与后续
+        // Error 都会进 event_log 并落盘。
+        let make_config = || AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    id: "dead-model".into(),
+                    name: "Dead".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "k".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: Some(2),
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "Manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "[m]".into(),
+                    skills: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let make_backend = || {
+            let agent_config = make_config();
+            let resolver = ModelResolver::from_config(&agent_config).expect("resolver");
+            UiBackend::new(UiBackendConfig {
+                agent_config,
+                model_resolver: resolver,
+                role: None,
+                tier: None,
+                model_id: None,
+                cwd: Some(ws.clone()),
+                agents_config: ".latte/agents.d".into(),
+            })
+        };
+
+        // ── 进程 A：建 session → chat_send → set_label ──
+        let backend_a = make_backend().expect("backend A");
+        let info = crate::api::create_session(&backend_a)
+            .await
+            .expect("create session");
+        let sid = info.session_id.clone();
+        crate::api::chat_send(&backend_a, Some(&sid), "你好，持久化")
+            .await
+            .expect("chat send");
+        // 等 turn 结束（Error 事件落进 event_log）且内容稳定。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let history_a = loop {
+            let h = crate::api::session_history(&backend_a, &sid).expect("history poll");
+            let has_user = h.iter().any(|v| v["type"] == "UserMessage");
+            let has_turn_end = h
+                .iter()
+                .any(|v| v["type"] == "Error" || v["type"] == "RoleTurn");
+            if has_user && has_turn_end {
+                // 再稳一拍，等 archiver tee 完落盘。
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let h2 = crate::api::session_history(&backend_a, &sid).expect("history settle");
+                if h2.len() == h.len() {
+                    break h2;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for turn events: {h:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        crate::api::set_session_label(&backend_a, &sid, "测试会话").expect("set label");
+        // label 覆盖行也是异步无关的同步写，这里已是落盘状态。
+        let file = ws
+            .join(".latte")
+            .join("ui-sessions")
+            .join(format!("{sid}.jsonl"));
+        assert!(file.exists(), "session 文件应已落盘: {}", file.display());
+        drop(backend_a); // 模拟进程退出
+
+        // ── 进程 B：同 cwd 新 backend → 恢复 ──
+        let backend_b = make_backend().expect("backend B");
+        let list = crate::api::list_sessions(&backend_b);
+        assert_eq!(list.len(), 1, "恢复后应只有这一个 session");
+        assert_eq!(list[0].session_id, sid);
+        assert!(list[0].restored, "恢复的 session 必须带 restored 标记");
+        assert_eq!(list[0].label.as_deref(), Some("测试会话"), "label 应保留");
+        assert_eq!(
+            list[0].preview, "你好，持久化",
+            "preview 应从第一条 UserMessage 推导"
+        );
+        let history_b = crate::api::session_history(&backend_b, &sid).expect("history B");
+        assert_eq!(
+            serde_json::to_string(&history_a).unwrap(),
+            serde_json::to_string(&history_b).unwrap(),
+            "history 恢复后必须逐字节一致"
+        );
+        assert!(
+            history_b
+                .iter()
+                .any(|v| v["type"] == "UserMessage" && v["text"] == "你好，持久化"),
+            "回放里必须含 UserMessage: {history_b:?}"
+        );
+
+        // ── delete → 文件消失 ──
+        crate::api::delete_session(&backend_b, &sid)
+            .await
+            .expect("delete");
+        assert!(crate::api::list_sessions(&backend_b).is_empty());
+        assert!(!file.exists(), "delete 后落盘文件应删除");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -81,6 +81,11 @@ pub trait ChatRenderer: Send + Sync {
                 .await;
             }
             ChatEvent::Status { message } => self.on_status(message).await,
+            ChatEvent::UserMessage { .. } => {
+                // 用户输入在 CLI 里本来就是本地 echo，无需渲染器再画
+                // 一遍；该事件主要供 UI 回放（event_log / 落盘）恢复
+                // 用户气泡。
+            }
             ChatEvent::Prompt { .. } => {
                 // prompt 是同步格式化的事件，没有专门的 on_prompt 方法
             }

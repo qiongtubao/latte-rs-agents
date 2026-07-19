@@ -8,6 +8,7 @@
 /.latte/worktrees/
 /.latte/chat-saves/
 /.latte/chat-sessions/
+/.latte/ui-sessions/
 .omc/
 # Project-level config (committed):
 #   .latte/agents/        — role TOML (id, tools, model_chain, etc.)

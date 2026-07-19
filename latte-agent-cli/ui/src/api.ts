@@ -122,6 +122,7 @@ export type ChatEvent =
   | { type: "RoleList"; roles: RoleInfo[] }
   | { type: "ContextCleared" }
   | { type: "SessionInfo"; task_id: string; state: string; turn: number; roles: RoleInfo[] }
+  | { type: "UserMessage"; text: string }
   | { type: "ToolUse"; role_id: string; tool_name: string; args: string }
   | { type: "ToolError"; role_id: string; tool_name: string; error: string }
   | { type: "ToolResult"; role_id: string; tool_name: string; result: string }

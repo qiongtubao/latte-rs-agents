@@ -367,11 +367,10 @@ export function mountChat(opts: {
       addMessage({ kind: "system", content: `→ ${rawText}` });
       await sendCommand(rawText);
     } else {
-      // 所有用户输入都交给 manager；@manager 等价于不指定角色
+      // 所有用户输入都交给 manager；@manager 等价于不指定角色。
+      // 用户气泡不做本地乐观渲染 —— 等后端 UserMessage 事件回显，
+      // 实时与回放走同一路径，不会双份。
       const messageText = rawText.replace(/^@manager\s+/i, "").trim();
-      const displayText = messageText || rawText;
-      const node = addMessage({ kind: "user", content: displayText });
-      lastUserMsgId = node.dataset.messageId || "";
       setStatus("thinking");
       updateStatusPillLabel("正在调用 LLM…");
       container.footerMsg.textContent = "⟳ 等待 manager 响应…";
@@ -684,6 +683,12 @@ export function mountChat(opts: {
       }
       case "RoleFinished": {
         addMessage({ kind: "status", content: `✅ ${e.role_id} 完成` });
+        break;
+      }
+      case "UserMessage": {
+        // 后端回显的用户消息（发送、回放同一路径，UI 不做本地乐观渲染）。
+        const node = addMessage({ kind: "user", content: e.text });
+        lastUserMsgId = node.dataset.messageId || "";
         break;
       }
       case "ToolUse": {
