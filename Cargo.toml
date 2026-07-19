@@ -40,6 +40,9 @@ handlebars = "6"
 # Error handling
 thiserror = "2"
 
+# Logging facade (advisor monitor degradation warnings, etc.)
+tracing = "0.1"
+
 # CLI
 # Sync primitives (used by agent cooldown map for non-blocking &self access)
 parking_lot = "0.12"

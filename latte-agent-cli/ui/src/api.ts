@@ -3,8 +3,28 @@
 // and attaches it to every request automatically. The session itself is
 // persisted in localStorage so a tab refresh reattaches to the same
 // chat history without a server roundtrip.
+//
+// All backend access goes through the active ChatTransport (contract C1,
+// see transport.ts) — this module is the only facade UI code calls.
 
 import { getHost } from "./host";
+import { getTransport, HttpSseTransport, HttpError } from "./transport";
+
+/** Realm-agnostic HttpError check: the editor's TauriIpcTransport runs in
+ * the host page's JS realm, so errors it throws are never `instanceof`
+ * this module's HttpError class. Accept the duck-typed shape
+ * (`name === "HttpError"` + numeric `status`) that transport throws for
+ * HTTP-style failures (e.g. session not found → 404). Behavior in plain
+ * browser/CLI mode is unchanged. */
+function isHttpError(e: unknown): e is HttpError {
+  return (
+    e instanceof HttpError ||
+    (typeof e === "object" &&
+      e !== null &&
+      (e as { name?: unknown }).name === "HttpError" &&
+      typeof (e as { status?: unknown }).status === "number")
+  );
+}
 
 export interface RoleInfo {
   id: string;
@@ -76,24 +96,13 @@ export interface RoleConfigSave {
 }
 
 export async function getRolesConfig(): Promise<RolesConfig> {
-  const r = await fetch("/api/roles/config");
-  if (!r.ok) throw new Error(`GET /api/roles/config ${r.status}`);
-  return r.json();
+  return getTransport().request("GET", "/api/roles/config");
 }
 
 export async function saveRoleConfig(
   body: RoleConfigSave,
 ): Promise<RoleConfigEntry> {
-  const r = await fetch("/api/roles/config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const msg = await r.text().catch(() => "");
-    throw new Error(`POST /api/roles/config ${r.status}${msg ? `: ${msg}` : ""}`);
-  }
-  return r.json();
+  return getTransport().request("POST", "/api/roles/config", body);
 }
 
 // ChatEvent —— Rust enum ChatEvent 的 JSON 表示（discriminated union）。
@@ -162,19 +171,11 @@ export function getCurrentSessionId(): string | null {
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {
-  const r = await fetch("/api/sessions");
-  if (!r.ok) throw new Error(`GET /api/sessions ${r.status}`);
-  return r.json();
+  return getTransport().request("GET", "/api/sessions");
 }
 
 export async function createSession(): Promise<string> {
-  const r = await fetch("/api/sessions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  });
-  if (!r.ok) throw new Error(`POST /api/sessions ${r.status}`);
-  const info: SessionInfo = await r.json();
+  const info = await getTransport().request<SessionInfo>("POST", "/api/sessions", {});
   persistSessionId(info.session_id);
   return info.session_id;
 }
@@ -188,21 +189,18 @@ export async function renameSession(
   sessionId: string,
   label: string,
 ): Promise<void> {
-  const r = await fetch("/api/session/label", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, label }),
+  await getTransport().request("POST", "/api/session/label", {
+    session_id: sessionId,
+    label,
   });
-  if (!r.ok) throw new Error(`POST /api/session/label ${r.status}`);
 }
 
 /** Delete a session server-side (its controller is aborted). */
 export async function deleteSession(sessionId: string): Promise<void> {
-  const r = await fetch(
+  await getTransport().request(
+    "DELETE",
     `/api/sessions?id=${encodeURIComponent(sessionId)}`,
-    { method: "DELETE" },
   );
-  if (!r.ok) throw new Error(`DELETE /api/sessions ${r.status}`);
 }
 
 /** Persist the active session id both in module state and localStorage
@@ -223,14 +221,19 @@ export async function ensureSession(): Promise<string> {
   const ls = typeof window !== "undefined" ? window.localStorage : null;
   const persisted = ls?.getItem(sessionStorageKey()) ?? null;
   if (persisted) {
-    const r = await fetch(
-      `/api/session?id=${encodeURIComponent(persisted)}`,
-    );
-    if (r.ok) {
+    try {
+      await getTransport().request(
+        "GET",
+        `/api/session?id=${encodeURIComponent(persisted)}`,
+      );
       currentSessionId = persisted;
       return persisted;
+    } catch (e) {
+      // Only an HTTP error means "server forgot the session"; network
+      // failures propagate like before (main shows fatal).
+      if (!isHttpError(e)) throw e;
+      ls?.removeItem(sessionStorageKey());
     }
-    ls?.removeItem(sessionStorageKey());
   }
   const id = await createSession();
   persistSessionId(id);
@@ -259,63 +262,43 @@ function chatBody(extra: Record<string, unknown>): Record<string, unknown> {
 
 export async function getSession(): Promise<SessionInfo> {
   if (!currentSessionId) throw new Error("no session id; call ensureSession() first");
-  const r = await fetch(
+  return getTransport().request(
+    "GET",
     `/api/session?id=${encodeURIComponent(currentSessionId)}`,
   );
-  if (!r.ok) throw new Error(`GET /api/session ${r.status}`);
-  return r.json();
 }
 
 /** Fetch the archived ChatEvent log for a session — used to restore
  * the chat panel contents after switching sessions. */
 export async function getSessionHistory(sessionId: string): Promise<ChatEvent[]> {
-  const r = await fetch(
+  return getTransport().request(
+    "GET",
     `/api/session/history?id=${encodeURIComponent(sessionId)}`,
   );
-  if (!r.ok) throw new Error(`GET /api/session/history ${r.status}`);
-  return r.json();
 }
 
 export async function getRoles(): Promise<RoleInfo[]> {
-  const r = await fetch("/api/roles");
-  if (!r.ok) throw new Error(`GET /api/roles ${r.status}`);
-  return r.json();
+  return getTransport().request("GET", "/api/roles");
 }
 
 export async function sendMessage(message: string): Promise<void> {
-  await fetch("/api/chat/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(chatBody({ message })),
-  });
+  await getTransport().request("POST", "/api/chat/send", chatBody({ message }));
 }
 
 export async function sendCommand(command: string): Promise<void> {
-  await fetch("/api/chat/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(chatBody({ command })),
-  });
+  await getTransport().request("POST", "/api/chat/command", chatBody({ command }));
 }
 
 export async function switchRole(role_id: string): Promise<void> {
-  await fetch("/api/chat/role", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(chatBody({ role_id })),
-  });
+  await getTransport().request("POST", "/api/chat/role", chatBody({ role_id }));
 }
 
 export async function listTraces(): Promise<TraceSummary[]> {
-  const r = await fetch("/api/traces");
-  if (!r.ok) throw new Error(`GET /api/traces ${r.status}`);
-  return r.json();
+  return getTransport().request("GET", "/api/traces");
 }
 
 export async function readTrace(session_id: string): Promise<{ session_id: string; events: unknown[] }> {
-  const r = await fetch(`/api/traces/${encodeURIComponent(session_id)}`);
-  if (!r.ok) throw new Error(`GET /api/traces/${session_id} ${r.status}`);
-  return r.json();
+  return getTransport().request("GET", `/api/traces/${encodeURIComponent(session_id)}`);
 }
 
 // ─── SSE ────────────────────────────────────────────────────────────────
@@ -324,7 +307,8 @@ export function subscribeEvents(
   onEvent: (e: ChatEvent) => void,
   onConnectionStatus: (status: "connected" | "disconnected") => void,
 ): { disconnect: () => void; reconnect: () => void } {
-  let es: EventSource | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let subscribed = false;
 
   const connect = (): void => {
     if (!currentSessionId) {
@@ -334,74 +318,54 @@ export function subscribeEvents(
       onConnectionStatus("disconnected");
       return;
     }
-    es = new EventSource(
-      `/api/events?id=${encodeURIComponent(currentSessionId)}`,
-    );
-    es.addEventListener("chat_event", (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as ChatEvent;
-        onEvent(data);
-      } catch (err) {
-        console.error("[sse] failed to parse chat_event", err, e);
-      }
-    });
-    es.addEventListener("open", () => onConnectionStatus("connected"));
-    es.addEventListener("error", () => {
-      // error 时主动 close() — 浏览器 EventSource 自带重连但那会让关
-      // 掉 UI 后页面挂着不释放。
-      if (es) {
-        es.close();
-        es = null;
-      }
-      onConnectionStatus("disconnected");
-    });
+    const t = getTransport();
+    if (t instanceof HttpSseTransport) {
+      // Keep the status pill semantics of the old inline EventSource
+      // code: "connected" on open, "disconnected" on error.
+      t.onConnectionStatus = (s) => {
+        if (s === "disconnected") subscribed = false;
+        onConnectionStatus(s);
+      };
+    } else {
+      // Contract C1 has no status channel; once a custom transport
+      // accepted the subscription we consider it connected.
+      onConnectionStatus("connected");
+    }
+    unsubscribe = t.subscribeEvents(currentSessionId, onEvent);
+    subscribed = true;
   };
 
   connect();
 
   return {
     disconnect: () => {
-      if (es) {
-        es.close();
-        es = null;
+      if (unsubscribe) {
+        unsubscribe();
+        unsubscribe = null;
       }
+      subscribed = false;
     },
     reconnect: () => {
-      if (es) return;
+      if (subscribed) return;
       connect();
     },
   };
 }
 
 export function subscribeSelfLoop(onEvent: (e: SelfLoopEvent) => void): () => void {
-  const es = new EventSource("/api/self-loop/events");
-  es.addEventListener("self_loop_event", (e) => {
-    try {
-      const data = JSON.parse((e as MessageEvent).data) as SelfLoopEvent;
-      onEvent(data);
-    } catch (err) {
-      console.error("[sse] failed to parse self_loop_event", err, e);
-    }
-  });
-  return () => es.close();
+  return getTransport().subscribeSelfLoop(onEvent);
 }
 
 export async function startSelfLoop(task: string, max_iterations: number): Promise<void> {
-  await fetch("/api/self-loop/start", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task, max_iterations }),
-  });
+  await getTransport().request("POST", "/api/self-loop/start", { task, max_iterations });
 }
 
 /** Fetch the subsession event log for a delegate call. */
 export async function fetchSubsession(subId: string): Promise<unknown[]> {
-  const r = await fetch(`/api/subsessions?id=${encodeURIComponent(subId)}`);
-  if (!r.ok) throw new Error(`GET /api/subsessions?${subId} ${r.status}`);
-  return r.json();
+  return getTransport().request("GET", `/api/subsessions?id=${encodeURIComponent(subId)}`);
 }
 
 
 export async function stopSelfLoop(): Promise<void> {
-  await fetch("/api/self-loop/stop", { method: "POST" });
+  await getTransport().request("POST", "/api/self-loop/stop");
 }

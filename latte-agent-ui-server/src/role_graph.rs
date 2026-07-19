@@ -208,14 +208,12 @@ struct ToolRegistration {
 
 /// A deterministic palette used by the UI to color nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)] // 预留给前端配色的公开 wire 类型，当前无 Rust 调用方
 pub struct NodePalette {
     pub role: String,
     pub tool: String,
     pub registration: String,
 }
 
-#[allow(dead_code)] // 同上：随 role_graph 一并搬入，暂无 Rust 调用方
 pub fn palette() -> NodePalette {
     NodePalette {
         role: "#4f46e5".into(),

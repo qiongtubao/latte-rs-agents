@@ -109,6 +109,8 @@ impl UiCmd {
             role: self.role.clone(),
             tier,
             model_id: self.model_id.clone(),
+            // CLI 现状：agent 工作目录 = 进程 cwd（用户从哪启动就是哪）。
+            cwd: None,
             agents_config: self.agents_config.clone(),
         })
         .await?;

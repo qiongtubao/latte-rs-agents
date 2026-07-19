@@ -33,6 +33,9 @@
 //!     role: None,
 //!     tier: None,
 //!     model_id: None,
+//!     // Tauri 内嵌：注入编辑器工作区根，agent 的工具调用（read/write/bash）
+//!     // 与 prompt_file 等相对路径都相对它解析；CLI 传 None（= 进程 cwd）。
+//!     cwd: Some(std::path::PathBuf::from("/path/to/user/workspace")),
 //!     agents_config: ".latte/agents.d".into(),
 //! })
 //! .await?;
@@ -41,8 +44,9 @@
 //! # }
 //! ```
 
+pub mod api;
 mod handlers;
-mod role_graph;
+pub mod role_graph;
 mod self_loop;
 mod sessions;
 
@@ -57,6 +61,154 @@ use latte_agent_core::model_resolver::{ModelResolver, ModelTier};
 
 use handlers::*;
 use sessions::SessionMap;
+
+/// [`UiBackend`] 的构造配置（= [`UiServerConfig`] 去掉 `bind` /
+/// `static_dir` 这两个 HTTP 关切）。配置加载（agents/models TOML 三层
+/// 合并）是调用方的责任：CLI 用 `commands::config_layer::load`，编辑
+/// 器用 `controller_runtime::load_cli_like_agent_config`。
+pub struct UiBackendConfig {
+    /// 合并后的 agent 配置（roles + models）。
+    pub agent_config: AgentConfig,
+    /// 与 `agent_config` 配套的 model resolver。
+    pub model_resolver: ModelResolver,
+    /// 初始角色 id（单角色模式），`None` → `"manager"`。
+    pub role: Option<String>,
+    /// 初始模型 tier；`None` → 从初始角色的 `model_tier` 模板推导。
+    pub tier: Option<ModelTier>,
+    /// 固定模型 id（覆盖 tier 解析），同 `chat --model-id`。
+    pub model_id: Option<String>,
+    /// agent 工作目录：每个 session 的 `ControllerConfig.cwd`（工具调用、
+    /// `prompt_file` 等相对路径都相对它解析），也用于 role graph 与角色
+    /// 编辑器读 prompt。`None` = 进程当前目录（CLI 现状）；Tauri 内嵌
+    /// 必须显式传用户工作区根，否则 agent 会落到 `app_data_dir` 之类
+    /// 的宿主进程 cwd。
+    pub cwd: Option<PathBuf>,
+    /// agents 配置路径原值（文件或目录），角色编辑器保存时用它定位
+    /// `.latte/agents.d/<id>.toml`。
+    pub agents_config: String,
+}
+
+/// 一个工作区一份的 UI 后端容器：per-tab SessionMap（每 session 一个
+/// ChatController + event_log 环形缓冲）+ 共享配置/resolver/subsession
+/// store/self-loop 状态。协议无关，HTTP server（[`spawn`]）与 Tauri
+/// 适配器（latte-code-editor `chat_panel/ui_adapter.rs`）共用。
+///
+/// 编辑器的典型用法（按工作区 get-or-spawn，配合双重检查锁）：
+///
+/// ```text
+/// map<workspace_root, Arc<UiBackend>>
+/// get-or-spawn(key):
+///   let (cfg, resolver) = load_cli_like_agent_config(root/.latte/agents.d, ...)?;
+///   let backend = UiBackend::new(UiBackendConfig { agent_config: cfg, model_resolver: resolver,
+///                     role: None, tier: None, model_id: None,
+///                     cwd: Some(root), agents_config: ".../agents.d".into() })?;
+///   let sid = backend.bootstrap_default_session().await?;
+///   // 事件转发：api::subscribe_session(&backend, &sid) → emit
+/// ```
+///
+/// 之后所有操作走 [`crate::api`]（sessions/roles/chat/traces/
+/// subsessions/role_graph/self_loop + 事件订阅）。
+#[derive(Clone)]
+pub struct UiBackend {
+    /// One entry per browser tab. Each `SessionHandle` owns its own
+    /// ChatController + ChatEvent broadcast channel, so chats across
+    /// tabs don't pollute each other.
+    pub(crate) sessions: Arc<SessionMap>,
+    /// RwLock：角色编辑器（POST /api/roles/config）保存后直接改写内存
+    /// 配置，新 session 立即用新配置，无需重启 server。
+    pub(crate) merged: Arc<parking_lot::RwLock<AgentConfig>>,
+    pub(crate) resolver: Arc<ModelResolver>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) initial_role: String,
+    pub(crate) initial_tier: Option<ModelTier>,
+    pub(crate) primary_model_id: Option<String>,
+    pub(crate) self_loop: Arc<self_loop::SelfLoopState>,
+    /// Process-wide store of per-task subsession event logs. Each
+    /// delegate call allocates an entry; the UI's right-click →
+    /// "show contents" reads from this same store via
+    /// `/api/sessions/{id}/subsessions/{sub_id}`. Shared across all
+    /// tabs so a tab-A subsession can never accidentally read
+    /// tab-B's events (the (session_id, sub_id) key keeps them apart
+    /// even when the store is process-wide).
+    pub(crate) subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
+    /// agents 配置路径原值（文件或目录），角色编辑器保存时
+    /// 用它定位 `.latte/agents.d/<id>.toml`。
+    pub(crate) agents_config: String,
+}
+
+impl UiBackend {
+    /// 构造容器（不创建任何 session；随后调
+    /// [`UiBackend::bootstrap_default_session`] 或
+    /// [`api::create_session`]）。
+    pub fn new(config: UiBackendConfig) -> anyhow::Result<Self> {
+        let UiBackendConfig {
+            agent_config,
+            model_resolver,
+            role,
+            tier,
+            model_id,
+            cwd,
+            agents_config,
+        } = config;
+
+        let merged: Arc<parking_lot::RwLock<AgentConfig>> =
+            Arc::new(parking_lot::RwLock::new(agent_config));
+        // 决定初始 role 和 tier。
+        let initial_role = role.unwrap_or_else(|| "manager".to_string());
+        let initial_tier: Option<ModelTier> = tier.or_else(|| {
+            merged
+                .read()
+                .roles
+                .get(&initial_role)
+                .map(|tpl| ModelTier::parse(&tpl.model_tier).unwrap_or(ModelTier::Standard))
+        });
+        // cwd：None = 进程当前目录（CLI 现状）；Some(dir) = 调用方注入
+        // 的工作区根（Tauri 内嵌场景）。
+        let cwd = cwd.map(Ok).unwrap_or_else(std::env::current_dir)?;
+
+        Ok(Self {
+            sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            merged,
+            resolver: Arc::new(model_resolver),
+            cwd,
+            initial_role,
+            initial_tier,
+            primary_model_id: model_id,
+            self_loop: Arc::new(self_loop::SelfLoopState::default()),
+            subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::new()),
+            agents_config,
+        })
+    }
+
+    /// Bootstrap ONE default session tied to "launch" time, so old
+    /// single-tab clients that don't yet create their own session can
+    /// still get/history/subscribe with the default id. ControllerConfig
+    /// 保持单角色模式（原 UiCmd::run 的关键洞察）：chat 命令本质就是
+    /// 单角色（manager），由 manager 通过 `delegate` 工具去调其他
+    /// specialist；用户输入只到 manager 一人手里。
+    ///
+    /// 返回新 session 的 id。失败（controller spawn 失败）时不留半成品。
+    pub async fn bootstrap_default_session(&self) -> Result<String, String> {
+        let session_id =
+            format!("ui-{}-{}", std::process::id(), unix_ts_millis());
+        let handle = sessions::create_session_handle(
+            session_id.clone(),
+            &self.initial_role,
+            &self.merged,
+            &self.resolver,
+            &self.cwd,
+            self.primary_model_id.clone(),
+            self.initial_tier.clone(),
+            256,
+            &self.subsession_store,
+        )
+        .await?;
+        self.sessions
+            .write()
+            .insert(session_id.clone(), Arc::new(handle));
+        Ok(session_id)
+    }
+}
 
 /// UI server 启动配置。
 ///
@@ -81,6 +233,12 @@ pub struct UiServerConfig {
     pub tier: Option<ModelTier>,
     /// 固定模型 id（覆盖 tier 解析），同 `chat --model-id`。
     pub model_id: Option<String>,
+    /// agent 工作目录：每个 session 的 `ControllerConfig.cwd`（工具调用、
+    /// `prompt_file` 等相对路径都相对它解析），也用于 `/api/role-graph`
+    /// 与角色编辑器读 prompt。`None` = 进程当前目录（CLI 现状）；
+    /// Tauri 内嵌必须显式传用户工作区根，否则 agent 会落到
+    /// `app_data_dir` 之类的宿主进程 cwd。
+    pub cwd: Option<PathBuf>,
     /// agents 配置路径原值（文件或目录），角色编辑器
     /// （POST /api/roles/config）保存时用它定位 `.latte/agents.d/<id>.toml`。
     pub agents_config: String,
@@ -126,74 +284,30 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         role,
         tier,
         model_id,
+        cwd,
         agents_config,
     } = config;
 
-    let merged: Arc<parking_lot::RwLock<AgentConfig>> =
-        Arc::new(parking_lot::RwLock::new(agent_config));
-    let resolver: Arc<ModelResolver> = Arc::new(model_resolver);
-
-    // 决定初始 role 和 tier。
-    let initial_role = role.unwrap_or_else(|| "manager".to_string());
-    let initial_tier: Option<ModelTier> = tier.or_else(|| {
-        merged
-            .read()
-            .roles
-            .get(&initial_role)
-            .map(|tpl| ModelTier::parse(&tpl.model_tier).unwrap_or(ModelTier::Standard))
-    });
-
-    // ControllerConfig 保持单角色模式（原 UiCmd::run 的关键洞察）：
-    // chat 命令本质就是单角色（manager），让 manager 通过 `delegate`
-    // 工具去调其他 specialist；用户输入只到 manager 一人手里。
-    let cwd = std::env::current_dir()?;
-
-    // Build a per-tab session map. Each browser tab will get its
-    // own ChatController on first POST /api/sessions so that
-    // concurrent tabs do not see each other's events.
-    //
-    // We also bootstrap ONE default session tied to the launch
-    // time, so old single-tab clients that don't yet POST
-    // /api/sessions can still /api/session?id=<default> and route
-    // traffic.
-    let sessions: Arc<SessionMap> =
-        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
-    let default_session_id =
-        format!("ui-{}-{}", std::process::id(), unix_ts_millis());
-    // Process-wide subsession store (used before sessions).
-    let subsession_store: Arc<latte_agent_core::subsession::SubsessionStore> =
-        Arc::new(latte_agent_core::subsession::SubsessionStore::new());
-    let default_handle = sessions::create_session_handle(
-        default_session_id.clone(),
-        &initial_role,
-        &merged,
-        &resolver,
-        &cwd,
+    let backend = UiBackend::new(UiBackendConfig {
+        agent_config,
+        model_resolver,
+        role,
+        tier,
         model_id,
-        initial_tier,
-        256,
-        &subsession_store,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("spawn default session controller: {e}"))?;
-
-    // Also bootstrap a default session so early HTTP calls that
-    // don't create their own still work.
-    sessions
-        .write()
-        .insert(default_session_id.clone(), Arc::new(default_handle));
+        cwd,
+        agents_config,
+    })?;
+    // Bootstrap ONE default session so early HTTP calls that don't
+    // create their own still work.
+    backend
+        .bootstrap_default_session()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn default session controller: {e}"))?;
     let static_dir = resolve_static_dir(static_dir);
 
     let state = AppState {
-        sessions,
-        merged,
-        resolver,
-        cwd,
-        initial_role,
+        backend: Arc::new(backend),
         static_dir: static_dir.clone(),
-        self_loop: Arc::new(self_loop::SelfLoopState::default()),
-        subsession_store,
-        agents_config,
     };
     let app = build_router(state);
 
@@ -219,31 +333,13 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
 
 // ─── State ────────────────────────────────────────────────────────
 
+/// axum 侧状态：协议无关逻辑全在 [`UiBackend`]（`crate::api` 直接操作
+/// 它）；axum 只多出 `static_dir`（静态文件是 HTTP  serving 的关切，
+/// Tauri 适配器没有也不需要）。
 #[derive(Clone)]
 pub(crate) struct AppState {
-    /// One entry per browser tab. Each `SessionHandle` owns its own
-    /// ChatController + ChatEvent broadcast channel, so chats across
-    /// tabs don't pollute each other.
-    sessions: Arc<SessionMap>,
-    /// RwLock：角色编辑器（POST /api/roles/config）保存后直接改写内存
-    /// 配置，新 session 立即用新配置，无需重启 server。
-    merged: Arc<parking_lot::RwLock<AgentConfig>>,
-    resolver: Arc<ModelResolver>,
-    cwd: PathBuf,
-    initial_role: String,
+    backend: Arc<UiBackend>,
     static_dir: Option<PathBuf>,
-    self_loop: Arc<self_loop::SelfLoopState>,
-    /// Process-wide store of per-task subsession event logs. Each
-    /// delegate call allocates an entry; the UI's right-click →
-    /// "show contents" reads from this same store via
-    /// `/api/sessions/{id}/subsessions/{sub_id}`. Shared across all
-    /// tabs so a tab-A subsession can never accidentally read
-    /// tab-B's events (the (session_id, sub_id) key keeps them apart
-    /// even when the store is process-wide).
-    subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
-    /// agents 配置路径原值（文件或目录），角色编辑器保存时
-    /// 用它定位 `.latte/agents.d/<id>.toml`。
-    agents_config: String,
 }
 
 pub(crate) fn unix_ts_millis() -> u64 {
@@ -278,9 +374,9 @@ fn build_router(state: AppState) -> Router {
         .route("/events", get(events_sse))
         .route("/traces", get(list_traces))
         .route("/traces/:session_id", get(read_trace))
-        .route("/self-loop/start", post(self_loop::self_loop_start))
-        .route("/self-loop/events", get(self_loop::self_loop_events_sse))
-        .route("/self-loop/stop", post(self_loop::self_loop_stop))
+        .route("/self-loop/start", post(self_loop_start))
+        .route("/self-loop/events", get(self_loop_events_sse))
+        .route("/self-loop/stop", post(self_loop_stop))
         .route("/role-graph", get(role_graph_get))
         .route("/subsessions", get(get_subsession))
          .with_state(state.clone());
@@ -336,9 +432,38 @@ mod tests {
     /// `UiServerHandle::addr` 必须是 OS 分配的真实端口，且
     /// `/health`、`/api/sessions`、`/api/roles`、`/api/traces`
     /// 都正常响应。编辑器内嵌（阶段 0）依赖这个行为。
+    ///
+    /// 同时验证 `UiServerConfig::cwd` 注入：放一个只在临时工作区根里
+    /// 存在的 `prompts/manager.md`，`/api/roles/config` 读角色 prompt
+    /// 走的是 `AppState.cwd`（= 注入的 cwd），命中即证明生效。
     #[tokio::test]
     async fn spawn_binds_ephemeral_port_and_serves() {
-        let agent_config = AgentConfig::default();
+        // 注入的工作区根：agent 相对路径（prompt_file 等）应相对它解析。
+        let ws_root = std::env::temp_dir().join(format!(
+            "ui-server-cwd-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(ws_root.join("prompts")).expect("mkdir prompts");
+        const MARKER: &str = "CUSTOM PROMPT FROM INJECTED CWD 注入工作区";
+        std::fs::write(ws_root.join("prompts").join("manager.md"), MARKER)
+            .expect("write prompt");
+
+        let mut agent_config = AgentConfig::default();
+        agent_config.roles.insert(
+            "manager".to_string(),
+            latte_agent_core::role::RoleTemplate {
+                id: "manager".into(),
+                name: "Manager".into(),
+                category: "management".into(),
+                model_tier: "standard".into(),
+                model_chain: vec![],
+                prompt_file: Some("prompts/manager.md".into()),
+                temperature: None,
+                tools: vec![],
+                icon: "[m]".into(),
+                skills: vec![],
+            },
+        );
         let resolver = ModelResolver::from_config(&agent_config).expect("resolver");
         let handle = spawn(UiServerConfig {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -348,6 +473,7 @@ mod tests {
             role: None,
             tier: None,
             model_id: None,
+            cwd: Some(ws_root.clone()),
             agents_config: ".latte/agents.d".into(),
         })
         .await
@@ -409,6 +535,20 @@ mod tests {
         let (status, _) = http_get(&format!("http://127.0.0.1:{}/api/traces", port)).await;
         assert_eq!(status, 200);
 
+        // /api/roles/config：角色 prompt 必须读自注入的 cwd
+        // （<ws_root>/prompts/manager.md），证明 UiServerConfig::cwd 生效。
+        let (status, body) =
+            http_get(&format!("http://127.0.0.1:{}/api/roles/config", port)).await;
+        assert_eq!(status, 200, "/api/roles/config body: {}", body);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("roles config json");
+        let prompt = v["roles"]
+            .as_array()
+            .and_then(|roles| roles.iter().find(|r| r["id"] == "manager"))
+            .and_then(|r| r["prompt"].as_str())
+            .expect("manager entry with prompt");
+        assert_eq!(prompt, MARKER, "prompt 应来自注入的 cwd，而非进程 cwd");
+
         handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&ws_root);
     }
 }

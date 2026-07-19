@@ -522,13 +522,22 @@ pub struct AgentRunner {
     /// turn and prepends a synthetic user message containing the
     /// queue's content.
     inject_worktree_root: Option<std::path::PathBuf>,
+    /// Shared in-memory advisor hint queue (see
+    /// `crate::advisor_monitor`). The producer (advisor monitor via
+    /// `ChatController::advisor_hint`) pushes correction hints while
+    /// this runner is mid-turn; `run_turn` drains them at turn start
+    /// and at every tool-round boundary so the next model call in the
+    /// current tool loop already carries the hint. `None` = no
+    /// advisor wired.
+    advisor_hints: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
     /// Working directory for tool invocations. When set, `run_turn`
-    /// injects it into every tool's `ToolExecutionContext.metadata.cwd`
-    /// so path-aware tools (`shell`, `read`, `write`, `search`, …) can
-    /// chdir to it. The Tauri runtime populates this from the
-    /// workspace's `project_root`; absent it, tools fall back to the
-    /// process cwd (which in Tauri dev is `src-tauri/`, not the
-    /// workspace the user opened — the bug that motivated this field).
+    /// rewrites relative filesystem paths in tool inputs to resolve
+    /// against it (see `resolve_tool_input_against_cwd`) and also
+    /// surfaces it via `ToolExecutionContext.metadata.cwd` (advisory).
+    /// Embedding runtimes (Tauri) populate this from the workspace's
+    /// `project_root`; absent it, tools fall back to the process cwd
+    /// (which in Tauri is the app data dir, not the workspace the user
+    /// opened — the bug that motivated this field).
     cwd: Option<std::path::PathBuf>,
 }
 impl AgentRunner {
@@ -545,6 +554,7 @@ impl AgentRunner {
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
+            advisor_hints: None,
             cwd: None,
         }
     }
@@ -565,6 +575,7 @@ impl AgentRunner {
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
+            advisor_hints: None,
             cwd: None,
         }
     }
@@ -581,6 +592,7 @@ impl AgentRunner {
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
+            advisor_hints: None,
             cwd: None,
         }
     }
@@ -625,6 +637,41 @@ impl AgentRunner {
             self.context.push(m);
         }
         let _ = std::fs::remove_file(&queue_path);
+    }
+
+    /// Drain all pending advisor hints from the shared in-memory
+    /// queue. Each drained hint is recorded in the conversation
+    /// context as a synthetic `Role::User` message prefixed with
+    /// `🦉 advisor 监察：` and also returned, so an in-flight
+    /// `run_turn` can additionally append it to the working message
+    /// list of the *current* tool loop (the context alone only
+    /// reaches the model on the next turn).
+    ///
+    /// Called at turn start (before the working list is built, so the
+    /// context copy suffices) and at every tool-round boundary.
+    fn drain_advisor_hints(&mut self) -> Vec<String> {
+        let Some(queue) = self.advisor_hints.clone() else {
+            return Vec::new();
+        };
+        let pending: Vec<String> = queue.lock().drain(..).collect();
+        for hint in &pending {
+            self.context.push(latte_ai::models::Message {
+                role: latte_ai::models::Role::User,
+                content: format!("🦉 advisor 监察：\n{hint}"),
+            });
+        }
+        pending
+    }
+
+    /// Attach the shared advisor hint queue. The same `Arc` is held
+    /// by the `ChatController` (producer side: `advisor_hint`) and by
+    /// every runner the driver builds (consumer side: drained here).
+    pub fn with_advisor_hints(
+        mut self,
+        queue: Arc<Mutex<std::collections::VecDeque<String>>>,
+    ) -> Self {
+        self.advisor_hints = Some(queue);
+        self
     }
 
     /// Set the max tool-call round trips per turn.
@@ -720,6 +767,10 @@ impl AgentRunner {
     ) -> AgentResult<String> {
         // HIL blackboard: drain per-role inject queue.
         self.drain_inject_queue();
+        // Advisor monitor: drain pending hints into the context
+        // *before* the working message list is built below, so the
+        // first model call of this turn already sees them.
+        self.drain_advisor_hints();
         use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
@@ -823,6 +874,20 @@ impl AgentRunner {
         // detector even though each round was internally fine.
         for round in 0..max_rounds {
             let mut loop_detector = LoopDetector::default();
+            // Advisor monitor (tool-round boundary): hints that landed
+            // while the previous round's tools were executing are
+            // appended to the working message list, so the model call
+            // below — mid tool loop — already carries the correction.
+            // (`drain_advisor_hints` also records them in the context;
+            // round 0 is covered by the turn-start drain above.)
+            if round > 0 {
+                for hint in self.drain_advisor_hints() {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: format!("🦉 advisor 监察：\n{hint}"),
+                    });
+                }
+            }
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
             let chat_start = Instant::now();
             let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
@@ -942,8 +1007,34 @@ impl AgentRunner {
                          "bash" => "exec".to_string(),
                          n => n.to_string(),
                      };
-                     let input: serde_json::Value = serde_json::from_str(&tc.args)
-                         .unwrap_or(serde_json::Value::String(tc.args.clone()));
+                     let input: serde_json::Value = match serde_json::from_str(&tc.args) {
+                         Ok(v) => v,
+                         Err(e) => {
+                             // The model emitted args that are not valid
+                             // JSON (e.g. XML arg_key/arg_value blocks).
+                             // Don't hand the tool a bare string (it would
+                             // fail with a confusing "xx is required");
+                             // feed a clear format error straight back so
+                             // the model can re-issue in the right shape.
+                             let msg = format!(
+                                 "tool args are not valid JSON ({e}). Re-issue as a single line \
+                                  `<tool_call>{} {{\"arg\": \"value\"}}</tool_call>` with a JSON object as args.",
+                                 tc.name
+                             );
+                             self.sink.emit(TraceEvent::ToolExec {
+                                 meta: meta.clone(),
+                                 name: tc.name.clone(),
+                                 args_json: tc.args.clone(),
+                                 latency_ms: 0,
+                                 status: ToolStatus::Err(msg.clone()),
+                             });
+                             messages.push(Message {
+                                 role: Role::User,
+                                 content: format!("[tool_error for {}]\n{}", tc.name, msg),
+                             });
+                             continue;
+                         }
+                     };
 
                     // 4a. Run PreToolHook (can abort or mutate args).
                     // The hook gets a mutable copy of the parsed input;
@@ -981,18 +1072,24 @@ impl AgentRunner {
                     }
                     let input = mutable_input;
 
+                    // Resolve relative filesystem paths in the tool input
+                    // against the runner's workspace cwd (when set), so the
+                    // packaged tools — which resolve relative paths against
+                    // the PROCESS cwd — still land in the user's workspace
+                    // when embedded (Tauri: process cwd = app data dir).
+                    // The `metadata.cwd` channel below is advisory and no
+                    // packaged tool consults it today, hence this rewrite.
+                    let input = match &self.cwd {
+                        Some(cwd) => resolve_tool_input_against_cwd(input, cwd),
+                        None => input,
+                    };
+
                     let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
                         &resolved_name,
                         1,
                     );
-                    // Surface the runner's cwd to path-aware tools
-                    // (`shell.exec`, `file.read`, etc.) via the
-                    // `metadata.cwd` channel they already consult
-                    // (see `latte-rs-agent-tools/src/tools/shell.rs`
-                    // `cwd_from`). Absent here, tools fall back to
-                    // the process cwd — which in Tauri dev is
-                    // `src-tauri/`, not the workspace the user
-                    // opened, so `pwd` returned the wrong path.
+                    // Advisory channel for future path-aware tools; the
+                    // authoritative mechanism is the input rewrite above.
                     if let Some(cwd) = &self.cwd {
                         ctx.metadata = Some(serde_json::json!({
                             "cwd": cwd.display().to_string(),
@@ -1183,11 +1280,11 @@ impl AgentRunner {
     }
 
     /// Set the working directory tools see as their default cwd.
-    /// Threaded into every `ToolExecutionContext.metadata.cwd` by
-    /// `run_turn`; tools that read it (e.g. `shell.exec`) chdir
-    /// before executing. Caller is expected to have canonicalized
-    /// the path — we do not resolve `.` / `..` here, mirroring how
-    /// the CLI passes the project root verbatim.
+    /// `run_turn` rewrites relative paths in tool inputs against it
+    /// (`resolve_tool_input_against_cwd`) and passes it along as
+    /// advisory `metadata.cwd`. Caller is expected to have
+    /// canonicalized the path — we do not resolve `.` / `..` here,
+    /// mirroring how the CLI passes the project root verbatim.
     pub fn with_cwd(mut self, cwd: std::path::PathBuf) -> Self {
         self.cwd = Some(cwd);
         self
@@ -1298,6 +1395,11 @@ fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
         // char right after `<tool_call` is `>`, skip it before parsing
         // the name. This lets one parser accept all three formats.
         let after_open = after_open.strip_prefix('>').unwrap_or(after_open);
+        // Tolerate whitespace/newlines between the open tag and the tool
+        // name (`<tool_call>\nNAME {…}`) — previously the name scan
+        // stopped at the first non-alphanumeric char and the whole call
+        // was silently dropped (name_len == 0).
+        let after_open = after_open.trim_start();
         let name_len = after_open
             .char_indices()
             .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
@@ -1437,6 +1539,61 @@ impl From<GenerateParams> for AgentParams {
     }
 }
 
+/// Rewrite `input` so relative filesystem paths resolve against the
+/// runner's workspace `cwd` instead of the process cwd.
+///
+/// Background: `ToolExecutionContext.metadata.cwd` is advisory and none of
+/// the packaged tools (`file.*`, `shell.*`) consult it — they resolve
+/// relative paths against the process cwd, which inside a Tauri host is
+/// the app data dir, not the user's workspace. Rather than touching every
+/// tool handler, the two path-carrying shapes are rewritten here, once:
+///
+/// - any top-level `"path": "<relative>"` arg (file.read/write/list/
+///   delete/search) is joined onto `cwd`;
+/// - any input carrying `"command"` without an explicit `"cwd"` arg
+///   (shell.exec/spawn) gets `cwd` injected.
+fn resolve_tool_input_against_cwd(
+    mut input: serde_json::Value,
+    cwd: &std::path::Path,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    if let Some(v) = obj.get_mut("path") {
+        if let Some(s) = v.as_str() {
+            if is_relative_fs_path(s) {
+                *v = Value::String(cwd.join(s).display().to_string());
+            }
+        }
+    }
+    if obj.contains_key("command") {
+        obj.entry("cwd".to_string())
+            .or_insert_with(|| Value::String(cwd.display().to_string()));
+    }
+    input
+}
+
+/// True when `s` looks like a relative filesystem path: not absolute, not
+/// a URL, not an env-var/`~` reference, not a Windows drive path.
+fn is_relative_fs_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    if s.is_empty()
+        || s.starts_with('/')
+        || s.starts_with('~')
+        || s.starts_with('$')
+        || s.contains("://")
+    {
+        return false;
+    }
+    // Windows drive: "C:\" / "C:/"
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1475,6 +1632,53 @@ mod tests {
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
+    }
+
+    // ── resolve_tool_input_against_cwd / is_relative_fs_path ─────────────
+
+    #[test]
+    fn relative_path_args_are_joined_onto_cwd() {
+        let cwd = std::path::Path::new("/ws/root");
+        let out = resolve_tool_input_against_cwd(serde_json::json!({"path": "src/foo.rs"}), cwd);
+        assert_eq!(out["path"], "/ws/root/src/foo.rs");
+    }
+
+    #[test]
+    fn absolute_url_env_and_drive_paths_are_untouched() {
+        let cwd = std::path::Path::new("/ws/root");
+        for p in [
+            "/abs/x.rs",
+            "~/x.rs",
+            "$HOME/x.rs",
+            "${HOME}/x.rs",
+            "http://example.com/x",
+            "C:\\win\\x.rs",
+            "C:/win/x.rs",
+        ] {
+            let out = resolve_tool_input_against_cwd(serde_json::json!({"path": p}), cwd);
+            assert_eq!(out["path"], p, "path should pass through: {p}");
+        }
+    }
+
+    #[test]
+    fn shell_command_gets_cwd_injected_but_explicit_cwd_wins() {
+        let cwd = std::path::Path::new("/ws/root");
+        let out = resolve_tool_input_against_cwd(serde_json::json!({"command": "ls"}), cwd);
+        assert_eq!(out["cwd"], "/ws/root");
+        let explicit = resolve_tool_input_against_cwd(
+            serde_json::json!({"command": "ls", "cwd": "/elsewhere"}),
+            cwd,
+        );
+        assert_eq!(explicit["cwd"], "/elsewhere");
+    }
+
+    #[test]
+    fn non_object_and_pathless_inputs_pass_through() {
+        let cwd = std::path::Path::new("/ws/root");
+        let s = resolve_tool_input_against_cwd(serde_json::json!("plain string"), cwd);
+        assert_eq!(s, serde_json::json!("plain string"));
+        let obj = resolve_tool_input_against_cwd(serde_json::json!({"pattern": "foo"}), cwd);
+        assert_eq!(obj, serde_json::json!({"pattern": "foo"}));
     }
 
     #[test]
@@ -1592,6 +1796,27 @@ End"#;
         assert_eq!(calls[0].args, r#"{"role": "programmer", "task": "read chat.rs"}"#);
         assert_eq!(calls[1].name, "reviewer");
         assert_eq!(calls[1].args, r#"{"role": "reviewer", "task": "audit chat.rs"}"#);
+    }
+
+    #[test]
+    fn test_extract_tool_calls_whitespace_before_name() {
+        // 复现 2026-07-19 用户报告的格式：`<tool_call>` 与工具名之间有
+        // 换行/空格。之前名字扫描在第一个非字母数字字符（\n）处停止，
+        // name_len == 0 → 整个调用被静默丢弃（opens_found=1,
+        // closes_matched=0），UI 表现就是"XML 解析有问题/工具没执行"。
+        let text = "<tool_call>\ndelegate {\"role\": \"programmer\", \"task\": \"pwd 确认目录\"}\n</tool_call>";
+        let calls = extract_tool_calls(text);
+        assert_eq!(calls.len(), 1, "换行分隔的工具名必须被解析，got {:?}", calls);
+        assert_eq!(calls[0].name, "delegate");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&calls[0].args).expect("args 必须是合法 JSON");
+        assert_eq!(parsed["role"], "programmer");
+
+        // 空格分隔同理
+        let text2 = r#"<tool_call> read {"path": "src/a.rs"}</tool_call>"#;
+        let calls2 = extract_tool_calls(text2);
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(calls2[0].name, "read");
     }
 
     #[test]
@@ -2361,6 +2586,257 @@ End"#;
         assert_eq!(first.role, MsgRole::User);
         assert_eq!(first.content, "[INJECTED]\nlook at foo.rs\n");
         assert!(!queue.exists());
+    }
+
+    // ─── Advisor hint queue ────────────────────────────────────────
+    //
+    // The advisor monitor pushes correction hints into a shared
+    // `Arc<Mutex<VecDeque<String>>>` while a turn is running; the
+    // runner drains them at turn start and at every tool-round
+    // boundary, prepending a synthetic `🦉 advisor 监察：` user
+    // message. These tests pin both drain points.
+
+    #[tokio::test]
+    async fn advisor_hints_drained_at_turn_start() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("done")),
+                    ),
+            )
+            .await;
+
+        let hints: Arc<Mutex<std::collections::VecDeque<String>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        hints.lock().push_back("注意：src/main.rs 已改名为 src/lib.rs".to_string());
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent).with_advisor_hints(hints.clone());
+
+        let resp = runner
+            .run_turn(
+                &[Message {
+                    role: MsgRole::User,
+                    content: "继续".into(),
+                }],
+                None,
+            )
+            .await
+            .expect("run_turn against wiremock");
+        assert_eq!(resp, "done");
+        assert!(hints.lock().is_empty(), "queue drained");
+
+        // Recorded in the persistent context…
+        let msgs = runner.context().messages();
+        assert!(
+            msgs.iter()
+                .any(|m| m.content.contains("🦉 advisor 监察") && m.content.contains("已改名")),
+            "hint recorded in context: {msgs:?}"
+        );
+        // …and visible to the model in the very first request.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(body.contains("🦉 advisor 监察"), "model saw the hint: {body}");
+    }
+
+    #[tokio::test]
+    async fn advisor_hints_drained_mid_tool_loop() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+
+        let hints: Arc<Mutex<std::collections::VecDeque<String>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
+        // The tool handler simulates the advisor: every execution
+        // pushes a fresh hint into the shared queue.
+        let hints_in_tool = hints.clone();
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            let hints = hints_in_tool.clone();
+            Box::pin(async move {
+                hints.lock().push_back("停止重试，换个思路".to_string());
+                Ok(serde_json::json!({ "ok": true }))
+            })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tool = Tool::builder("ping", "test ping", schema, handler).build();
+        let tm = create_tool_manager();
+        tm.register(tool, None);
+
+        // The stub model always answers with the same tool call, so
+        // the turn ping-pongs through tool rounds. Note: the
+        // LoopDetector is constructed fresh *per round* (see the
+        // 2026-07-10 fix in run_turn), so cross-round repetition is
+        // NOT broken by it — the turn ends via MaxToolRoundsExceeded.
+        // That still gives us several round-boundary drains to
+        // observe.
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("<tool_call>ping {}</tool_call>"),
+                    )),
+            )
+            .await;
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm, 4).with_advisor_hints(hints);
+
+        let err = runner
+            .run_turn(
+                &[Message {
+                    role: MsgRole::User,
+                    content: "go".into(),
+                }],
+                None,
+            )
+            .await
+            .expect_err("repeated tool calls hit the round cap");
+        assert!(
+            matches!(err, AgentError::MaxToolRoundsExceeded(4)),
+            "got {err:?}"
+        );
+
+        // Round 0 produced request #1 and executed the tool (which
+        // pushed a hint); the round-1 boundary drain must make
+        // request #2 carry that hint — i.e. the correction reached
+        // the model MID tool loop, before the turn ended.
+        let reqs = server.received_requests().await.unwrap();
+        assert!(reqs.len() >= 2, "expected ≥2 model calls, got {}", reqs.len());
+        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        assert!(
+            body2.contains("🦉 advisor 监察"),
+            "second request carries the drained hint: {body2}"
+        );
+        assert!(body2.contains("停止重试"), "hint text present: {body2}");
+        // First request predates any hint.
+        let body1 = String::from_utf8_lossy(&reqs[0].body);
+        assert!(!body1.contains("🦉 advisor 监察"));
+    }
+
+    #[tokio::test]
+    async fn non_json_tool_args_feed_back_format_error_without_executing() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The tool must NEVER run: args are XML, not JSON.
+        let executed = Arc::new(AtomicBool::new(false));
+        let executed_in_tool = executed.clone();
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            let executed = executed_in_tool.clone();
+            Box::pin(async move {
+                executed.store(true, Ordering::SeqCst);
+                Ok(serde_json::json!({ "ok": true }))
+            })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tool = Tool::builder("ping", "test ping", schema, handler).build();
+        let tm = create_tool_manager();
+        tm.register(tool, None);
+
+        let server = wiremock::MockServer::start().await;
+        // Round 0（先注册先匹配，只生效一次）：模型吐出 args 为 XML 块的调用。
+        struct FirstOnly(std::sync::atomic::AtomicUsize);
+        impl wiremock::Match for FirstOnly {
+            fn matches(&self, _req: &wiremock::Request) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst) == 0
+            }
+        }
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body(
+                            "<tool_call>ping <arg_key>x</arg_key></tool_call>",
+                        ),
+                    )),
+            )
+            .await;
+        // 兜底：round 1 起一律 finish。
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_string(openai_completion_body("done")),
+                    ),
+            )
+            .await;
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm, 4);
+
+        let resp = runner
+            .run_turn(
+                &[Message {
+                    role: MsgRole::User,
+                    content: "go".into(),
+                }],
+                None,
+            )
+            .await
+            .expect("turn completes after the format error feedback");
+        assert_eq!(resp, "done");
+        assert!(!executed.load(Ordering::SeqCst), "tool must not execute on non-JSON args");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        assert!(
+            body2.contains("[tool_error for ping]") && body2.contains("not valid JSON"),
+            "model got the explicit format error: {body2}"
+        );
     }
 
     #[test]

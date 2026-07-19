@@ -126,3 +126,98 @@ describe("waitForHost", () => {
     expect(await mod.waitForHost(30)).toBeNull();
   });
 });
+
+describe("installUiCallListener", () => {
+  function mockApi() {
+    return {
+      focus: vi.fn(),
+      insertContext: vi.fn(),
+    };
+  }
+
+  it("dispatches latte:ui-call messages onto the api", async () => {
+    const fake = installFakeWindow();
+    const mod = await importFreshHost();
+    const api = mockApi();
+    mod.installUiCallListener(api);
+
+    fake.emit("message", {
+      type: "latte:ui-call",
+      method: "insertContext",
+      args: [{ path: "src/foo.rs", startLine: 10, endLine: 20, symbol: "bar" }],
+    });
+    expect(api.insertContext).toHaveBeenCalledWith({
+      path: "src/foo.rs",
+      startLine: 10,
+      endLine: 20,
+      symbol: "bar",
+    });
+
+    fake.emit("message", { type: "latte:ui-call", method: "focus", args: [] });
+    expect(api.focus).toHaveBeenCalledTimes(1);
+  });
+
+  it("defaults missing args to []", async () => {
+    const fake = installFakeWindow();
+    const mod = await importFreshHost();
+    const api = mockApi();
+    mod.installUiCallListener(api);
+    fake.emit("message", { type: "latte:ui-call", method: "focus" });
+    expect(api.focus).toHaveBeenCalledWith();
+  });
+
+  it("ignores unknown methods and non latte:ui-call messages", async () => {
+    const fake = installFakeWindow();
+    const mod = await importFreshHost();
+    const api = mockApi();
+    mod.installUiCallListener(api);
+
+    fake.emit("message", { type: "latte:ui-call", method: "eval", args: ["alert(1)"] });
+    fake.emit("message", { type: "latte:ui-call", method: "__proto__", args: [] });
+    fake.emit("message", { type: "latte:call", method: "focus", args: [] });
+    fake.emit("message", null);
+    fake.emit("message", "latte:ui-call");
+    expect(api.focus).not.toHaveBeenCalled();
+    expect(api.insertContext).not.toHaveBeenCalled();
+  });
+
+  it("catches handler exceptions without breaking the listener", async () => {
+    const fake = installFakeWindow();
+    const mod = await importFreshHost();
+    const api = {
+      focus: vi.fn(() => {
+        throw new Error("boom");
+      }),
+      insertContext: vi.fn(),
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mod.installUiCallListener(api);
+    fake.emit("message", { type: "latte:ui-call", method: "focus", args: [] });
+    expect(warn).toHaveBeenCalled();
+    // listener still alive after the failure
+    fake.emit("message", { type: "latte:ui-call", method: "insertContext", args: [{ path: "a.ts" }] });
+    expect(api.insertContext).toHaveBeenCalledWith({ path: "a.ts" });
+    warn.mockRestore();
+  });
+
+  it("uninstall stops dispatching; re-install replaces the old listener", async () => {
+    const fake = installFakeWindow();
+    const mod = await importFreshHost();
+    const first = mockApi();
+    const uninstall = mod.installUiCallListener(first);
+    // re-install is idempotent: the old listener is removed first
+    const second = mockApi();
+    const uninstallSecond = mod.installUiCallListener(second);
+    fake.emit("message", { type: "latte:ui-call", method: "focus", args: [] });
+    expect(first.focus).not.toHaveBeenCalled();
+    expect(second.focus).toHaveBeenCalledTimes(1);
+
+    uninstall(); // stale handle: must not remove the current listener
+    fake.emit("message", { type: "latte:ui-call", method: "focus", args: [] });
+    expect(second.focus).toHaveBeenCalledTimes(2);
+
+    uninstallSecond(); // real uninstall: no more dispatch
+    fake.emit("message", { type: "latte:ui-call", method: "focus", args: [] });
+    expect(second.focus).toHaveBeenCalledTimes(2);
+  });
+});

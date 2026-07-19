@@ -17,6 +17,7 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+tracing = { workspace = true }
 
 # Used by config / role modules in the library
 serde = { workspace = true }

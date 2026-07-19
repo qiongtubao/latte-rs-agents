@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 //   1. UI 收到 latte:init 后完成握手（__LATTE_UI__ 挂载 = waitForHost 已解析）
 //   2. host.sessionKey 生效（session_id 写到宿主给的 localStorage 键）
 //   3. UI → 父页面的 latte:call 能被收到且 origin 可校验（编辑器侧 openLocation 的依据）
+//   4. 父页面 → UI 的反向通道 latte:ui-call（insertContext 进输入框、focus 聚焦）
 //
 // 需要已构建的 debug 二进制（target/debug/latte-agent）与最新 ui/dist。
 // 跑法：UI_NO_WEBSERVER=1 pnpm exec playwright test __tests__/host-bridge.spec.ts
@@ -119,4 +120,79 @@ test("cross-origin host bridge: init handshake + sessionKey + latte:call", async
     method: "openLocation",
     args: [{ path: "src/foo.rs", startLine: 42 }],
   });
+});
+
+test("cross-origin host bridge: reverse channel latte:ui-call (insertContext + focus)", async ({
+  page,
+}) => {
+  // 反向通道：父页面（跨域）经 postMessage 调用 UI 暴露的能力。
+  await page.route(PARENT_URL, (route) =>
+    route.fulfill({
+      contentType: "text/html",
+      body: `<!doctype html><html><body>
+        <iframe id="f" src="${FRAME_ORIGIN}/" style="width:1200px;height:700px"></iframe>
+        <script>
+          const ORIGIN = ${JSON.stringify(FRAME_ORIGIN)};
+          const f = document.getElementById("f");
+          f.addEventListener("load", () => {
+            f.contentWindow.postMessage({
+              type: "latte:init",
+              host: { platform: "tauri", sessionKey: "test-session-key-456", capabilities: [] },
+            }, ORIGIN);
+          });
+          window.__uiCall = (msg) => f.contentWindow.postMessage(msg, ORIGIN);
+        </script></body></html>`,
+    }),
+  );
+
+  await page.goto(PARENT_URL);
+  const frame = page.frames().find((fr) => fr.url().startsWith(FRAME_ORIGIN));
+  expect(frame, "chat UI iframe loaded").toBeTruthy();
+
+  // mount 完成（setUiApi + installUiCallListener 同步执行，UI 就绪即监听就绪）
+  await frame!.waitForFunction(() => !!(window as any).__LATTE_UI__, undefined, {
+    timeout: 10_000,
+  });
+
+  // insertContext：引用 + quote 进入聊天输入框
+  await page.evaluate(() =>
+    (window as any).__uiCall({
+      type: "latte:ui-call",
+      method: "insertContext",
+      args: [
+        {
+          path: "src/foo.rs",
+          startLine: 10,
+          endLine: 20,
+          symbol: "bar",
+          quote: "fn bar() {}",
+        },
+      ],
+    }),
+  );
+  await expect
+    .poll(
+      () =>
+        frame!.evaluate(
+          () => (document.getElementById("chat-input") as HTMLTextAreaElement).value,
+        ),
+      { timeout: 5_000 },
+    )
+    .toContain("src/foo.rs:10-20");
+  const inputValue = await frame!.evaluate(
+    () => (document.getElementById("chat-input") as HTMLTextAreaElement).value,
+  );
+  expect(inputValue).toContain("bar");
+  expect(inputValue).toContain("fn bar() {}");
+
+  // focus：activeElement 切到聊天输入框
+  await page.evaluate(() =>
+    (window as any).__uiCall({ type: "latte:ui-call", method: "focus", args: [] }),
+  );
+  await expect
+    .poll(
+      () => frame!.evaluate(() => document.activeElement?.id),
+      { timeout: 5_000 },
+    )
+    .toBe("chat-input");
 });

@@ -21,6 +21,7 @@ use latte_ai::params::GenerateParams;
 use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+use crate::advisor_monitor::AdvisorMonitorConfig;
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
@@ -246,6 +247,17 @@ enum ControllerInput {
     SwitchRole(String),
     SwitchModel(ModelTier),
     Abort,
+    /// Advisor monitor correction hint. The driver pushes it into the
+    /// current runners' shared in-memory hint queue (see
+    /// `AgentRunner::with_advisor_hints`); it is NOT a new user
+    /// question and never triggers a turn on its own.
+    ///
+    /// Note: `ChatController::advisor_hint` pushes into the shared
+    /// queue *directly* (synchronous, mid-turn delivery); this
+    /// variant exists so embedders that only hold the input channel
+    /// can still route hints through the driver.
+    #[allow(dead_code)] // constructed by embedders holding the raw input channel
+    AdvisorHint(String),
 }
 
 // ─── Configuration ───────────────────────────────────────────────
@@ -295,6 +307,10 @@ pub struct ControllerConfig {
     /// a single Arc is shared across all controllers regardless of
     /// tab/session, so GC works uniformly per process.
     pub subsession_store: Arc<SubsessionStore>,
+    /// Advisor monitor (旁路监察者) settings. Default: enabled with
+    /// `OnAnomaly` LLM review. The session creator (e.g. ui-server's
+    /// `create_session_handle`) spawns the monitor when enabled.
+    pub advisor_monitor: AdvisorMonitorConfig,
 }
 
 // ─── Controller ──────────────────────────────────────────────────
@@ -305,6 +321,20 @@ pub struct ChatController {
     event_tx: broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     pause_requested: Arc<AtomicBool>,
+    /// Shared advisor hint queue. The producer side is
+    /// `advisor_hint()` (called by the AdvisorMonitor); the consumer
+    /// side is every runner the driver builds
+    /// (`AgentRunner::with_advisor_hints`), drained at turn start and
+    /// at every tool-round boundary. Direct push (not the mpsc input
+    /// channel) is what makes *mid-turn* delivery possible: in
+    /// single-role mode the driver awaits `run_turn` and would not
+    /// see an mpsc message until the turn finished.
+    advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
+    /// Most recent non-command user input, recorded by
+    /// `submit_input`. The AdvisorMonitor reads it to give the LLM
+    /// review the user's current question (user input is not part of
+    /// the `ChatEvent` broadcast stream).
+    last_user_input: Arc<parking_lot::Mutex<String>>,
 }
 
 impl ChatController {
@@ -317,6 +347,8 @@ impl ChatController {
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pause_requested: Arc::new(AtomicBool::new(false)),
+            advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
+            last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
         }
     }
 
@@ -332,9 +364,10 @@ impl ChatController {
         let event_tx = self.event_tx.clone();
         let cancel_flag = self.cancel_flag.clone();
         let pause_flag = self.pause_requested.clone();
+        let advisor_hints = self.advisor_hints.clone();
 
         tokio::spawn(async move {
-            run_driver(config, input_rx, &event_tx, cancel_flag, pause_flag).await;
+            run_driver(config, input_rx, &event_tx, cancel_flag, pause_flag, advisor_hints).await;
         });
 
         self.event_tx.subscribe()
@@ -342,9 +375,48 @@ impl ChatController {
 
     /// Submit a line of user input.
     pub async fn submit_input(&self, text: &str) {
+        // Record the latest genuine question for the advisor monitor's
+        // LLM review input (slash commands are not questions).
+        if !text.trim_start().starts_with('/') {
+            *self.last_user_input.lock() = text.to_string();
+        }
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
             let _ = tx.send(ControllerInput::Input(text.to_string()));
         }
+    }
+
+    /// Push an advisor correction hint into the shared runner hint
+    /// queue. Synchronous, lock-only — safe to call while a turn is
+    /// running; the current runner drains it at the next tool-round
+    /// boundary (or turn start when idle). Never triggers a turn.
+    pub fn advisor_hint(&self, text: &str) {
+        const MAX_PENDING_HINTS: usize = 16;
+        let mut q = self.advisor_hints.lock();
+        // Bound the backlog so a pathological monitor can't grow the
+        // queue without limit; oldest hints are the least relevant.
+        while q.len() >= MAX_PENDING_HINTS {
+            q.pop_front();
+        }
+        q.push_back(text.to_string());
+    }
+
+    /// The shared advisor hint queue (driver wiring + tests).
+    pub fn advisor_hint_queue(
+        &self,
+    ) -> Arc<parking_lot::Mutex<std::collections::VecDeque<String>>> {
+        self.advisor_hints.clone()
+    }
+
+    /// The most recent user question recorded by `submit_input`.
+    pub fn last_user_input(&self) -> String {
+        self.last_user_input.lock().clone()
+    }
+
+    /// Clone of the event broadcast sender. Used by the AdvisorMonitor
+    /// to publish its own `RoleTurn { role_id: "advisor" }` bubbles
+    /// (channel B) into the same stream the UI consumes.
+    pub fn event_sender(&self) -> broadcast::Sender<ChatEvent> {
+        self.event_tx.clone()
     }
 
     /// Request pause after the current round completes.
@@ -525,13 +597,14 @@ async fn run_driver(
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
+    advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
     if is_multi {
-        run_multi_role_loop(config, &mut input_rx, event_tx, cancel_flag, &*pause_flag).await;
+        run_multi_role_loop(config, &mut input_rx, event_tx, cancel_flag, &*pause_flag, advisor_hints).await;
     } else {
-        run_single_role_loop(config, &mut input_rx, event_tx, cancel_flag).await;
+        run_single_role_loop(config, &mut input_rx, event_tx, cancel_flag, advisor_hints).await;
     }
 
     let _ = event_tx.send(ChatEvent::Done);
@@ -545,6 +618,7 @@ async fn run_multi_role_loop(
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     pause_flag: &AtomicBool,
+    advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
 ) {
     // Resolve worktree root
     let repo_root = match WorkspaceManager::resolve_repo_root(&config.cwd) {
@@ -732,6 +806,7 @@ async fn run_multi_role_loop(
         {
             Ok((mut runner, _canonical_id)) => {
                 runner = runner.with_inject_worktree_root(worktree_root.clone());
+                runner = runner.with_advisor_hints(advisor_hints.clone());
                 runners.push((role_id.clone(), runner));
             }
             Err(e) => {
@@ -771,6 +846,9 @@ async fn run_multi_role_loop(
                 }
                 Some(ControllerInput::Abort) => break 'rounds,
                 Some(ControllerInput::Resume) => {}
+                Some(ControllerInput::AdvisorHint(text)) => {
+                    advisor_hints.lock().push_back(text);
+                }
                 Some(ControllerInput::SwitchRole(_)) | Some(ControllerInput::SwitchModel(_)) => {
                     let _ = event_tx.send(ChatEvent::Status {
                         message: "multi-role 模式不支持 /role 或 /model 命令".into(),
@@ -1074,6 +1152,11 @@ async fn run_multi_role_loop(
                         break 'pause;
                     }
                     Some(ControllerInput::Abort) | None => break 'rounds,
+                    Some(ControllerInput::AdvisorHint(text)) => {
+                        // Paused: park the hint; the runner drains it
+                        // when the session resumes.
+                        advisor_hints.lock().push_back(text);
+                    }
                     _ => {}
                 }
             }
@@ -1097,6 +1180,7 @@ async fn run_single_role_loop(
     input_rx: &mut mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
+    advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
 ) {
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
@@ -1113,7 +1197,7 @@ async fn run_single_role_loop(
         })
         .unwrap_or(ModelTier::Standard);
 
-    let (mut runner, canonical_id) = match build_runner(
+    let (runner, canonical_id) = match build_runner(
         merged,
         resolver,
         default_params,
@@ -1136,6 +1220,7 @@ async fn run_single_role_loop(
             return;
         }
     };
+    let mut runner = runner.with_advisor_hints(advisor_hints.clone());
 
     // Seed the runner with any pre-existing history (e.g. when
     // resuming a paused session from the SessionStore). Done
@@ -1219,7 +1304,7 @@ async fn run_single_role_loop(
                                     match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
-                                            runner = new_runner;
+                                            runner = new_runner.with_advisor_hints(advisor_hints.clone());
                                             current_role = rid.clone();
                                             let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                             let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
@@ -1241,7 +1326,7 @@ async fn run_single_role_loop(
                                             match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
-                                                    runner = new_runner;
+                                                    runner = new_runner.with_advisor_hints(advisor_hints.clone());
                                                     current_tier = new_tier;
                                                     let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                                                 }
@@ -1327,7 +1412,7 @@ async fn run_single_role_loop(
                         match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
-                                runner = new_runner;
+                                runner = new_runner.with_advisor_hints(advisor_hints.clone());
                                 current_role = rid.clone();
                                 let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                 let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
@@ -1342,7 +1427,7 @@ async fn run_single_role_loop(
                         match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
-                                runner = new_runner;
+                                runner = new_runner.with_advisor_hints(advisor_hints.clone());
                                 current_tier = new_tier;
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                             }
@@ -1354,6 +1439,14 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::Resume) => {
                         let _ = event_tx.send(ChatEvent::Resumed);
+                    }
+                    Some(ControllerInput::AdvisorHint(text)) => {
+                        // Idle-side delivery: park the hint in the
+                        // shared queue; the runner drains it at the
+                        // next turn start. (Mid-turn delivery happens
+                        // via the direct `advisor_hint()` push, not
+                        // this channel.)
+                        advisor_hints.lock().push_back(text);
                     }
                     Some(ControllerInput::Abort) | None => break,
                 }
@@ -1632,7 +1725,9 @@ const DELEGATE_TOOL_HINT: &str = r#"
 3. 等专家返回结果
 4. 综合所有结果输出最终答案
 
-可用专家：programmer(读代码), architect(架构), reviewer(审查), tester(测试), security(安全), designer(设计)
+可用专家：programmer(读代码), architect(架构), reviewer(审查), tester(测试), security(安全), designer(设计), advisor(资深顾问：失败诊断/根因分析/方案裁决)
+
+失败升级：工具调用连续失败、专家报错且原因不明、或需要在多个方案间取舍时 → 派 advisor 诊断；诊断清楚之前不要直接回答用户，更不要重复回答旧问题。
 
 **错误流程（禁止）：**
 - 只输出计划而不调用 delegate ← 这是最常见的错误！不要这样做！
@@ -2513,6 +2608,144 @@ mod tests {
             }
             other => panic!("expected DelegateStarted, got {other:?}"),
         }
+    }
+
+    // ─── AdvisorHint driver plumbing ──────────────────────────────
+    //
+    // Driver-level test for the advisor injection channel (design
+    // §7): a hint pushed while the driver is idle must (a) NOT
+    // trigger a turn on its own, and (b) ride along with the next
+    // user input's context as a synthetic `🦉 advisor 监察：` message.
+
+    #[tokio::test]
+    async fn advisor_hint_enters_context_without_triggering_turn() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "plain reply" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    id: "stub-standard".into(),
+                    name: "Stub".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "Manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+        };
+
+        async fn wait_request_count(server: &wiremock::MockServer, n: usize) {
+            for _ in 0..150 {
+                let got = server.received_requests().await.map(|r| r.len()).unwrap_or(0);
+                if got >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("timed out waiting for {n} model requests");
+        }
+
+        let controller = ChatController::new(64);
+        let _rx = controller.spawn(cfg).await;
+
+        // Turn 1 runs normally.
+        controller.submit_input("第一问").await;
+        wait_request_count(&server, 1).await;
+
+        // A hint pushed while idle must not trigger a new turn.
+        controller.advisor_hint("改用 src/lib.rs 路径");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "advisor hint must not trigger a turn on its own"
+        );
+
+        // The hint rides along with the next user input's context.
+        controller.submit_input("第二问").await;
+        wait_request_count(&server, 2).await;
+        let reqs = server.received_requests().await.unwrap();
+        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        assert!(
+            body2.contains("🦉 advisor 监察"),
+            "second turn's request carries the hint: {body2}"
+        );
+        assert!(body2.contains("改用 src/lib.rs 路径"), "hint text: {body2}");
+        // …and the user question was recorded for the monitor.
+        assert_eq!(controller.last_user_input(), "第二问");
+
+        controller.abort().await;
     }
 
 }

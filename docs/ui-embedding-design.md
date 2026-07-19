@@ -224,6 +224,20 @@ workspace 为 cwd（阶段一内嵌 server / 阶段二 ui_adapter 均如此）�
 阶段 0 可选：若想一步到位可直接从阶段 1 开始；阶段 0 的价值是立刻验证"嵌入 + 换肤"
 链路，且内嵌 server 代码在阶段 2 之前都可复用。
 
+**进度（2026-07-19，更新 2）**：阶段 0/1/2/3a/3b 已完成。**阶段 2 落地后内嵌 HTTP
+server 路径已被 IPC 取代**：编辑器侧 `ui_server.rs` 删除 → `ui_adapter.rs`
+（18 条 `ui_*` 命令 + `ui:chat_event`/`ui:self_loop_event`，协议无关逻辑复用
+`latte-agent-ui-server::api`）；前端 `ChatAgentPanel` 改为同源 iframe
+`/chat-ui/index.html` + `__LATTE_HOST__` 直注入 `TauriIpcTransport`
+（函数引用过不了 postMessage，直注入是 transport 的唯一通道），`latte:init`/
+`latte:call` 跨源通道随之退役，`latte:ui-call` 反向通道保留。配套要点：
+UI dist 以 `base: "./"` 构建（挂 /chat-ui/ 子路径资产可解析）；`ensureSession`
+的"404 → 新建 session"语义跨 JS realm 保持——IPC 侧把 "not found" 类错误包装成
+与 `HttpError` 同 shape，`api.ts` 改用 duck-type 判定（`instanceof` 跨 realm 失效）。
+阶段 3c 大部分完成（按工作区多后端 + cwd 注入 + sessionKey 隔离 + 选区注入），
+剩 `openDoc`。内嵌 HTTP server（`latte-agent-ui-server` crate）继续服务 CLI
+`latte-agent ui` 模式，不受影响。
+
 ---
 
 ## 7. 编辑器现有 chat 模块的处置

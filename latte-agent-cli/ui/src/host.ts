@@ -10,6 +10,8 @@
 // browser/CLI mode neither exists and every host capability must be
 // feature-detected (`if (host.openLocation)`).
 
+import type { ChatTransport } from "./transport";
+
 export interface CodeRef {
   /** Path relative to the workspace root. */
   path: string;
@@ -22,6 +24,11 @@ export interface CodeRef {
 
 export interface LatteHost {
   platform?: "tauri" | "web";
+  /** Phase-2 IPC transport (contract C1). Only injectable via
+   * same-origin `__LATTE_HOST__` — the postMessage `latte:init`
+   * channel cannot carry functions, so a message-born host never has
+   * this field (feature-detect as usual). */
+  transport?: ChatTransport;
   /** Absolute path of the active workspace. */
   workspaceRoot?: string;
   /** Session persistence key, isolated per workspace (replaces the bare
@@ -133,4 +140,48 @@ export function getHost(): LatteHost | null {
 export function setUiApi(api: LatteUiApi): void {
   if (typeof window === "undefined") return;
   window.__LATTE_UI__ = api;
+}
+
+/** Methods callable over the `latte:ui-call` postMessage channel
+ * (whitelist — never index the api with arbitrary message strings). */
+const UI_CALL_METHODS = ["focus", "insertContext"] as const;
+
+let uiCallUninstall: (() => void) | null = null;
+
+/** Reverse host bridge: listen for cross-origin
+ * `{ type: "latte:ui-call", method, args }` messages from the parent
+ * page and dispatch them onto the given api (the message-based twin of
+ * `setUiApi`, for when the parent cannot write `contentWindow.__LATTE_UI__`
+ * directly). Only whitelisted methods are dispatched, args are spread
+ * (`[]` when missing), and handler exceptions are caught and logged.
+ * Idempotent: re-installing first removes the previous listener.
+ * Returns the uninstall function. */
+export function installUiCallListener(api: LatteUiApi): () => void {
+  uiCallUninstall?.();
+  uiCallUninstall = null;
+  if (typeof window === "undefined") return () => {};
+  const onMessage = (event: MessageEvent): void => {
+    const data = event.data as
+      | { type?: unknown; method?: unknown; args?: unknown }
+      | null
+      | undefined;
+    if (!data || typeof data !== "object" || data.type !== "latte:ui-call") return;
+    if (typeof data.method !== "string") return;
+    if (!(UI_CALL_METHODS as readonly string[]).includes(data.method)) return;
+    const fn = api[data.method as (typeof UI_CALL_METHODS)[number]];
+    if (typeof fn !== "function") return;
+    const args = Array.isArray(data.args) ? data.args : [];
+    try {
+      (fn as (...a: unknown[]) => void)(...args);
+    } catch (e) {
+      console.warn("[host] latte:ui-call failed:", data.method, e);
+    }
+  };
+  window.addEventListener("message", onMessage);
+  const uninstall = (): void => {
+    window.removeEventListener("message", onMessage);
+    if (uiCallUninstall === uninstall) uiCallUninstall = null;
+  };
+  uiCallUninstall = uninstall;
+  return uninstall;
 }

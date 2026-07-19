@@ -29,6 +29,10 @@ html, body, #app {
   font-size: 14px;
   line-height: 1.5;
 }
+body {
+  /* 兜底：任何子元素（如 topbar 按钮行）超出窄视口时不产生横向滚动 */
+  overflow-x: hidden;
+}
 
 #app {
   display: flex;
@@ -72,6 +76,7 @@ html, body, #app {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex-wrap: wrap;
 }
 
 .status-pill {
@@ -1202,6 +1207,24 @@ select {
   }
   .context-menu {
     min-width: 160px;
+  }
+}
+
+@media (max-width: 480px) {
+  /* 嵌入编辑器侧栏等极窄场景：收紧输入区 */
+  .input-area {
+    padding: 10px 10px 12px;
+    gap: 8px;
+  }
+  .chat-form {
+    padding: 0 10px 10px;
+  }
+  .chat-input {
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+  .send-btn {
+    padding: 12px 14px;
   }
 }
 

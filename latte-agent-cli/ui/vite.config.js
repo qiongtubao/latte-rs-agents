@@ -7,6 +7,9 @@ import { defineConfig } from 'vite';
 // `latte-agent ui` 命令直接 serve 这个 dist/。
 const backend = process.env.VITE_BACKEND ?? 'http://localhost:4567';
 export default defineConfig({
+    // 相对 base：dist 挂在编辑器 /chat-ui/ 子路径（同源 iframe，阶段 2）
+    // 与 server 根路径（latte-agent ui）下都能解析资产 URL。
+    base: './',
     server: {
         host: '0.0.0.0',
         port: Number(process.env.VITE_PORT ?? 5173),

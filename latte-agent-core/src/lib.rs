@@ -14,6 +14,7 @@
 //!
 //! ```rust,no_run
 //! use latte_agent_core::prelude::*;
+//! use latte_agent_core::{ModelResolver, ModelTier};
 //! use latte_ai::models::{Message, Role};
 //!
 //! # async fn example() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -36,6 +37,7 @@
 //! ```
 
 pub mod agent;
+pub mod advisor_monitor;
 pub mod controller;
 pub mod checkpoint;
 pub mod config;
@@ -66,6 +68,9 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 
 /// Convenience re-exports.
 pub mod prelude {
+    pub use crate::advisor_monitor::{
+        AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine, AdvisorReviewMode, Verdict,
+    };
     pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
     pub use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointTrigger, RollbackMode};
     pub use crate::config::{AgentConfig, ConfigLayer};

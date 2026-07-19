@@ -1,19 +1,11 @@
-//! Self-Loop API：spawn 本地 node 子进程跑 Playwright + screencap 的
-//! AI 自调试闭环，进度事件经 SSE 推给前端。
+//! Self-Loop 支撑：spawn 本地 node 子进程跑 Playwright + screencap 的
+//! AI 自调试闭环。协议层入口在 `crate::api`（start/stop/subscribe），
+//! HTTP SSE 壳在 `crate::handlers`。
 
 use std::path::PathBuf;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::Json;
-use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
-
-use crate::AppState;
 
 #[derive(Default)]
 pub(crate) struct SelfLoopState {
@@ -21,73 +13,45 @@ pub(crate) struct SelfLoopState {
     progress: parking_lot::Mutex<Option<broadcast::Sender<SelfLoopEvent>>>,
 }
 
-#[derive(Deserialize)]
-pub(crate) struct SelfLoopStartRequest {
-    /// 给 AI 的任务描述（如"fix the chat panel layout"）。
-    task: String,
-    /// 最大迭代轮数（防止死循环）。默认 5。
-    #[serde(default)]
-    max_iterations: Option<u32>,
+impl SelfLoopState {
+    /// start 时登记新一轮的事件 sender。
+    pub(crate) fn set_progress(&self, tx: broadcast::Sender<SelfLoopEvent>) {
+        *self.progress.lock() = Some(tx);
+    }
+
+    /// stop：清掉 sender（已有 receiver 会因 channel 关闭而结束）。
+    pub(crate) fn clear(&self) {
+        *self.progress.lock() = None;
+    }
+
+    /// 订阅进度事件。没有在跑的 self-loop 时返回一个 1-容量空
+    /// channel 的 receiver —— 前端发 start 后会重新订阅。
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<SelfLoopEvent> {
+        let guard = self.progress.lock();
+        match guard.as_ref() {
+            Some(t) => t.subscribe(),
+            None => broadcast::channel::<SelfLoopEvent>(1).1,
+        }
+    }
 }
 
+/// Self-loop 进度事件（SSE / Tauri `ui:self_loop_event` 的载荷）。
+/// `kind`: "started" | "iteration" | "log" | "screenshot" | "done" | "error"
 #[derive(Serialize, Clone, Deserialize)]
-pub(crate) struct SelfLoopEvent {
-    /// "started" | "iteration" | "log" | "screenshot" | "done" | "error"
-    kind: String,
-    iteration: u32,
-    message: String,
+pub struct SelfLoopEvent {
+    pub kind: String,
+    pub iteration: u32,
+    pub message: String,
     /// base64 PNG（仅 kind == "screenshot"）
     #[serde(skip_serializing_if = "Option::is_none")]
-    screenshot: Option<String>,
+    pub screenshot: Option<String>,
     /// 自由扩展字段
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
-    timestamp_unix_ms: u64,
+    pub data: Option<serde_json::Value>,
+    pub timestamp_unix_ms: u64,
 }
 
-pub(crate) async fn self_loop_start(
-    State(state): State<AppState>,
-    Json(req): Json<SelfLoopStartRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let max = req.max_iterations.unwrap_or(5);
-    if req.task.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "task is required".into()));
-    }
-
-    // 起 broadcast channel。
-    let (tx, _) = broadcast::channel::<SelfLoopEvent>(64);
-    {
-        let mut guard = state.self_loop.progress.lock();
-        *guard = Some(tx.clone());
-    }
-
-    // 找 self-loop 脚本。
-    let self_loop_dir = self_loop_dir()?;
-    if !self_loop_dir.exists() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!(
-                "self-loop runner not found at {}. Run `pnpm --dir latte-agent-cli/ui install` first.",
-                self_loop_dir.display()
-            ),
-        ));
-    }
-
-    // spawn node 子进程跑 self-loop/runner.ts。
-    let task = req.task.clone();
-    let self_loop_dir_clone = self_loop_dir.clone();
-    tokio::spawn(async move {
-        run_self_loop_node(task, max, self_loop_dir_clone, tx).await;
-    });
-
-    Ok(Json(serde_json::json!({
-        "started": true,
-        "task": req.task,
-        "max_iterations": max,
-    })))
-}
-
-async fn run_self_loop_node(
+pub(crate) async fn run_self_loop_node(
     task: String,
     max_iterations: u32,
     self_loop_dir: PathBuf,
@@ -198,42 +162,10 @@ async fn run_self_loop_node(
     });
 }
 
-pub(crate) async fn self_loop_events_sse(
-    State(state): State<AppState>,
-) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
-    let rx = {
-        let guard = state.self_loop.progress.lock();
-        match guard.as_ref() {
-            Some(t) => t.subscribe(),
-            None => {
-                // 没有正在跑 self-loop —— 返回一个 1-容量的空 channel，
-                // 前端发 start 后会重新订阅。
-                let (_tx, rx) = broadcast::channel::<SelfLoopEvent>(1);
-                rx
-            }
-        }
-    };
-    let stream = BroadcastStream::new(rx).map(|item| match item {
-        Ok(ev) => Ok(Event::default()
-            .event("self_loop_event")
-            .data(serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into()))),
-        Err(_) => Ok(Event::default().event("ping").data("")),
-    });
-    Sse::new(stream).keep_alive(
-        KeepAlive::new().interval(std::time::Duration::from_secs(10)),
-    )
-}
-
-pub(crate) async fn self_loop_stop(State(state): State<AppState>) -> StatusCode {
-    let mut guard = state.self_loop.progress.lock();
-    *guard = None;
-    StatusCode::OK
-}
-
 /// 定位 `latte-agent-cli/ui/self-loop` 目录：以本 crate 的
 /// `CARGO_MANIFEST_DIR` 向上一级锚定 workspace 根，再 fallback 到相对
 /// cwd 的路径。
-fn self_loop_dir() -> Result<PathBuf, (StatusCode, String)> {
+pub(crate) fn self_loop_dir() -> Result<PathBuf, String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut candidates = Vec::with_capacity(2);
     if let Some(ws_root) = manifest_dir.parent() {
@@ -246,8 +178,5 @@ fn self_loop_dir() -> Result<PathBuf, (StatusCode, String)> {
         }
     }
     let first = &candidates[0];
-    Err((
-        StatusCode::NOT_FOUND,
-        format!("self-loop dir not found: tried {}", first.display()),
-    ))
+    Err(format!("self-loop dir not found: tried {}", first.display()))
 }

@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use latte_agent_core::advisor_monitor::{
+    AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine,
+};
 use latte_agent_core::config::AgentConfig;
 use latte_agent_core::controller::{ChatController, ControllerConfig};
 use latte_agent_core::event_json::chat_event_to_frontend_json;
@@ -63,6 +66,9 @@ pub(crate) async fn create_session_handle(
     // specialist's full event log there for the UI to fetch.
     subsession_store: &Arc<latte_agent_core::subsession::SubsessionStore>,
 ) -> Result<SessionHandle, String> {
+    let agent_config_snapshot = Arc::new(merged.read().clone());
+    let default_params = GenerateParams::default();
+    let advisor_monitor_cfg = AdvisorMonitorConfig::default();
     let cfg = ControllerConfig {
         task_id: None,
         roles: vec![initial_role.to_string()],
@@ -71,20 +77,39 @@ pub(crate) async fn create_session_handle(
         session_token_budget: 0,
         // snapshot 一份当前配置：session 固化创建时刻的配置，
         // 之后的角色编辑只影响新建的 session。
-        agent_config: Arc::new(merged.read().clone()),
+        agent_config: agent_config_snapshot.clone(),
         model_resolver: resolver.clone(),
-        default_params: GenerateParams::default(),
+        default_params: default_params.clone(),
         primary_model_id,
         initial_tier,
         initial_history: vec![],
         cwd: cwd.to_path_buf(),
         subsession_store: subsession_store.clone(),
+        advisor_monitor: advisor_monitor_cfg.clone(),
     };
     let controller = Arc::new(ChatController::new(broadcast_capacity));
     // `spawn` returns a broadcast::Receiver (events consumer); the
     // controller runs in the background. We don't keep the receiver
     // here — the per-tab SSE subscriber is what reads events.
     let _rx = controller.spawn(cfg).await;
+    // Advisor 监察者：旁路订阅该 session 的事件流，发现异常时经
+    // controller 的 hint 队列纠偏（通道 A）并广播 🦉 气泡（通道 B）。
+    // 任务 detach 与下方 archive 任务同生命周期：ChatEvent::Done 或
+    // controller drop 后自动退出。
+    if advisor_monitor_cfg.enabled {
+        let engine = AdvisorReviewEngine::new(
+            agent_config_snapshot,
+            resolver.clone(),
+            default_params,
+        )
+        .with_watchdog_notes(cwd.to_path_buf(), advisor_monitor_cfg.watchdog_notes);
+        AdvisorMonitor::spawn(
+            controller.clone(),
+            advisor_monitor_cfg,
+            engine,
+            initial_role.to_string(),
+        );
+    }
     // Archive every ChatEvent as frontend-shaped JSON so a tab that
     // switches away and back can restore the chat contents. Bounded
     // to MAX_LOG entries (oldest dropped) to keep memory flat.

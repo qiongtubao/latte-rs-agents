@@ -11,7 +11,9 @@ import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
 import { mountRoleGraph } from "./role_graph";
 import { mountRoleEditor } from "./role_editor";
-import { waitForHost, setUiApi } from "./host";
+import { waitForHost, setUiApi, installUiCallListener } from "./host";
+import type { LatteUiApi } from "./host";
+import { initTransport } from "./transport";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 
 function $(id: string): HTMLElement {
@@ -51,7 +53,11 @@ async function main(): Promise<void> {
   // already injected __LATTE_HOST__, otherwise waits ≤250ms and falls
   // back to plain browser/CLI mode. Everything host-side is
   // feature-detected, so behavior is unchanged without a host.
-  await waitForHost();
+  const host = await waitForHost();
+  // Phase 2: the editor may inject an IPC transport (contract C1) —
+  // only possible via same-origin __LATTE_HOST__. Without one the
+  // transport lazily defaults to HttpSseTransport (web mode 无感).
+  if (host?.transport) initTransport(host.transport);
   let currentId: string;
   try {
     currentId = await ensureSession();
@@ -251,11 +257,14 @@ async function main(): Promise<void> {
   });
 
   chat.setFooter(`ready · role=${session.role} · session=${currentId}`);
-  // Mount complete — expose the UI api to the host (editor) page.
-  setUiApi({
+  // Mount complete — expose the UI api to the host (editor) page, both
+  // same-origin (`__LATTE_UI__`) and cross-origin (postMessage channel).
+  const uiApi: LatteUiApi = {
     focus: () => chat.focus(),
     insertContext: (ref) => chat.insertContext(ref),
-  });
+  };
+  setUiApi(uiApi);
+  installUiCallListener(uiApi);
   console.log(`[ui] mounted; self-loop panel`, selfLoop.isOpen() ? "open" : "closed");
 }
 
