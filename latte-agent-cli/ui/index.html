@@ -168,6 +168,7 @@
           <button id="role-editor-close" type="button" class="panel-close">×</button>
         </header>
         <div class="role-editor-body">
+        <div id="role-editor-paths" class="role-editor-paths"></div>
           <p class="hint">修改会写入 .latte/agents.d/&lt;id&gt;.toml 与对应 prompt 文件，对新 session 生效。右键聊天消息里的角色头像可直接跳到该角色。</p>
           <form id="role-editor-form">
             <label class="role-editor-field">
@@ -182,10 +183,11 @@
               模型档位
               <select id="role-editor-tier"></select>
             </label>
-            <label class="role-editor-field">
-              模型链（逗号分隔）
-              <input id="role-editor-chain" type="text" placeholder="model-a, model-b" />
-            </label>
+            <div class="role-editor-field">
+              模型链（按优先级排列）
+              <div id="role-editor-chain" class="role-editor-chain"></div>
+              <span class="hint">上方模型不可用时按顺序尝试下方模型。</span>
+            </div>
             <label class="role-editor-field">
               temperature（留空 = 默认）
               <input id="role-editor-temperature" type="number" step="0.1" min="0" max="2" />

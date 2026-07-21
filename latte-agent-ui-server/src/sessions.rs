@@ -58,7 +58,7 @@ pub(crate) struct SessionPersist {
 }
 
 impl SessionPersist {
-    fn dir_for(cwd: &Path) -> PathBuf {
+    pub(crate) fn dir_for(cwd: &Path) -> PathBuf {
         cwd.join(".latte").join("ui-sessions")
     }
 
