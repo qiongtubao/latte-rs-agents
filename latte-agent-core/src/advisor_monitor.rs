@@ -472,10 +472,7 @@ impl AdvisorReviewEngine {
             String::new()
         };
         let sys = agent.system_message(&serde_json::json!({}))?;
-        let user = Message {
-            role: latte_ai::models::Role::User,
-            content: build_review_prompt(user_question, transcript, trigger, &notes),
-        };
+        let user = Message::user(build_review_prompt(user_question, transcript, trigger, &notes));
         let completion = agent
             .chat(&[sys, user], None, WaitPolicy::NoWait)
             .await?;

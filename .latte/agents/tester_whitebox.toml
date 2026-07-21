@@ -1,0 +1,10 @@
+[roles.tester_whitebox]
+id = "tester_whitebox"
+name = "White-Box Tester"
+category = "verification"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/tester_whitebox.md"
+temperature = 0.3
+tools = ["read", "list", "bash", "search", "playwright", "delegate"]
+icon = "🔳"

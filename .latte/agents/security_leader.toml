@@ -1,0 +1,10 @@
+[roles.security_leader]
+id = "security_leader"
+name = "Security Lead"
+category = "verification"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/security_leader.md"
+temperature = 0.4
+tools = ["delegate"]
+icon = "🛡️"

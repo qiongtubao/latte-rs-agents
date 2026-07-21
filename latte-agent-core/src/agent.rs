@@ -295,10 +295,7 @@ impl Agent {
     /// Build the system message for this agent.
     pub fn system_message(&self, vars: &serde_json::Value) -> AgentResult<Message> {
         let content = self.role.render_prompt(vars)?;
-        Ok(Message {
-            role: Role::System,
-            content,
-        })
+        Ok(Message::system(content))
     }
 }
 
@@ -619,10 +616,7 @@ impl AgentRunner {
             let _ = std::fs::remove_file(&queue_path);
             return;
         }
-        let synthetic = latte_ai::models::Message {
-            role: latte_ai::models::Role::User,
-            content: format!("[INJECTED]\n{}", content),
-        };
+        let synthetic = latte_ai::models::Message::user(format!("[INJECTED]\n{}", content));
         // Prepend the synthetic message. `messages_mut()` returns a
         // `&mut [Message]` slice which has no `insert(0, _)`, and
         // there's no `Vec`-level accessor on `ConversationContext`
@@ -655,10 +649,7 @@ impl AgentRunner {
         };
         let pending: Vec<String> = queue.lock().drain(..).collect();
         for hint in &pending {
-            self.context.push(latte_ai::models::Message {
-                role: latte_ai::models::Role::User,
-                content: format!("🦉 advisor 监察：\n{hint}"),
-            });
+            self.context.push(latte_ai::models::Message::user(format!("🦉 advisor 监察：\n{hint}")));
         }
         pending
     }
@@ -779,7 +770,7 @@ impl AgentRunner {
         let vars = system_vars.unwrap_or(&default_vars);
 
         let sys_msg = self.agent.system_message(vars)?;
-        let system_rendered = sys_msg.content.clone();
+        let system_rendered = sys_msg.as_text();
         let mut messages: Vec<Message> = Vec::new();
         messages.push(sys_msg);
         messages.extend_from_slice(self.context.messages());
@@ -818,13 +809,13 @@ impl AgentRunner {
         let n_new = new_messages.len();
         let user_input: String = messages[messages.len() - n_new..]
             .iter()
-            .map(|m| m.content.as_str())
+            .map(|m| m.as_text())
             .collect::<Vec<_>>()
             .join("\n");
         let model_id = self.agent.model_chain.first()
             .map(|mc| mc.model.id.clone())
             .unwrap_or_default();
-        let est_input_tokens = (messages.iter().map(|m| m.content.len()).sum::<usize>() / 4) as u32;
+        let est_input_tokens = (messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4) as u32;
         self.sink.emit(TraceEvent::PromptBuilt {
             meta: meta.clone(),
             system_rendered,
@@ -882,10 +873,7 @@ impl AgentRunner {
             // round 0 is covered by the turn-start drain above.)
             if round > 0 {
                 for hint in self.drain_advisor_hints() {
-                    messages.push(Message {
-                        role: Role::User,
-                        content: format!("🦉 advisor 监察：\n{hint}"),
-                    });
+                    messages.push(Message::user(format!("🦉 advisor 监察：\n{hint}")));
                 }
             }
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
@@ -993,10 +981,7 @@ impl AgentRunner {
 
             if let Some(tm) = &self.tool_manager {
                 // Append assistant message with tool calls
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: final_response.clone(),
-                });
+                messages.push(Message::assistant(final_response.clone()));
                 // Execute each tool call
                 for tc in &post_parse_calls {
                      // Map friendly config aliases ("bash") to the real
@@ -1028,10 +1013,7 @@ impl AgentRunner {
                                  latency_ms: 0,
                                  status: ToolStatus::Err(msg.clone()),
                              });
-                             messages.push(Message {
-                                 role: Role::User,
-                                 content: format!("[tool_error for {}]\n{}", tc.name, msg),
-                             });
+                             messages.push(Message::user(format!("[tool_error for {}]\n{}", tc.name, msg)));
                              continue;
                          }
                      };
@@ -1172,14 +1154,11 @@ impl AgentRunner {
                                     _ => {}
                                 }
                             }
-                            messages.push(Message {
-                                role: Role::User,
-                                content: format!(
-                                    "[tool_result for {}]\n{}",
-                                    tc.name,
-                                    result_str,
-                                ),
-                            });
+                            messages.push(Message::user(format!(
+                                "[tool_result for {}]\n{}",
+                                tc.name,
+                                result_str,
+                            )));
                         }
                         Err(e) => {
                             self.sink.emit(TraceEvent::ToolExec {
@@ -1189,10 +1168,7 @@ impl AgentRunner {
                                 latency_ms: tool_latency,
                                 status: ToolStatus::Err(e.to_string()),
                             });
-                            messages.push(Message {
-                                role: Role::User,
-                                content: format!("[tool_error for {}]\n{}", tc.name, e),
-                            });
+                            messages.push(Message::user(format!("[tool_error for {}]\n{}", tc.name, e)));
                         }
                     }
                 }
@@ -1217,10 +1193,7 @@ impl AgentRunner {
         for msg in new_messages {
             self.context.push(msg.clone());
         }
-        self.context.push(Message {
-            role: Role::Assistant,
-            content: final_response.clone(),
-        });
+        self.context.push(Message::assistant(final_response.clone()));
 
         Ok(final_response)
     }
@@ -1324,7 +1297,7 @@ impl AgentRunner {
         use crate::checkpoint::short_hash;
         let Some(last) = self.context.messages().last() else { return "text".to_string(); };
         if last.role != MsgRole::Assistant { return "text".to_string(); }
-        let content = &last.content;
+        let content = last.as_text();
         // Order matters: more specific tool tags (delegate, ask_human)
         // win over the generic `<tool_callNAME>` extraction below.
         if content.contains("<tool_calldelegate>") { return "delegate".to_string(); }
@@ -1722,10 +1695,7 @@ mod tests {
             Agent::new("test-agent".into(), role, test_model(), GenerateParams::default()).unwrap();
         let mut runner = AgentRunner::new(agent);
 
-        runner.context_mut().push(Message {
-            role: MsgRole::User,
-            content: "Hello".to_string(),
-        });
+        runner.context_mut().push(Message::user("Hello"));
         assert_eq!(runner.context().messages().len(), 1);
     }
 
@@ -1737,10 +1707,7 @@ mod tests {
         let mut runner = AgentRunner::new(agent);
 
         runner.context_mut().set_token_budget(10);
-        runner.context_mut().push(Message {
-            role: MsgRole::User,
-            content: "a".repeat(200),
-        });
+        runner.context_mut().push(Message::user("a".repeat(200)));
 
         runner.prune_context(1);
         assert!(runner.context().messages().len() <= 1);
@@ -2108,10 +2075,7 @@ End"#;
 
         let resp = agent
             .chat(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "hi".to_string(),
-                }],
+                &[Message::user("hi")],
                 None,
                 WaitPolicy::NoWait,
             )
@@ -2155,10 +2119,7 @@ End"#;
 
         let err = agent
             .chat(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "hi".to_string(),
-                }],
+                &[Message::user("hi")],
                 None,
                 WaitPolicy::NoWait,
             )
@@ -2210,10 +2171,7 @@ End"#;
 
         let err = agent
             .chat(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "hi".to_string(),
-                }],
+                &[Message::user("hi")],
                 None,
                 WaitPolicy::NoWait,
             )
@@ -2270,10 +2228,7 @@ End"#;
         .unwrap();
         let err = agent
             .chat(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "hi".to_string(),
-                }],
+                &[Message::user("hi")],
                 None,
                 WaitPolicy::NoWait,
             )
@@ -2348,10 +2303,7 @@ End"#;
         let start = std::time::Instant::now();
         let resp = agent
             .chat(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "hi".to_string(),
-                }],
+                &[Message::user("hi")],
                 None,
                 WaitPolicy::WaitAndRetry,
             )
@@ -2459,10 +2411,7 @@ End"#;
         // 2. Run a turn with PII in the input; redact hook should
         //    mutate it, and PromptBuilt.user_input should reflect
         //    the post-hook state.
-        let msgs = vec![Message {
-            role: MsgRole::User,
-            content: "call me at 13812345678 about it".to_string(),
-        }];
+        let msgs = vec![Message::user("call me at 13812345678 about it")];
         let resp = runner.run_turn(&msgs, None).await
             .expect("run_turn should succeed against wiremock");
         assert_eq!(resp, "plain text reply");
@@ -2629,10 +2578,7 @@ End"#;
 
         let resp = runner
             .run_turn(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "继续".into(),
-                }],
+                &[Message::user("继续")],
                 None,
             )
             .await
@@ -2716,10 +2662,7 @@ End"#;
 
         let err = runner
             .run_turn(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "go".into(),
-                }],
+                &[Message::user("go")],
                 None,
             )
             .await
@@ -2819,10 +2762,7 @@ End"#;
 
         let resp = runner
             .run_turn(
-                &[Message {
-                    role: MsgRole::User,
-                    content: "go".into(),
-                }],
+                &[Message::user("go")],
                 None,
             )
             .await
@@ -2847,10 +2787,7 @@ End"#;
             Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
                 .unwrap();
         let mut runner = AgentRunner::new(agent);
-        runner.context_mut().push(Message {
-            role: MsgRole::Assistant,
-            content: "no tools here".to_string(),
-        });
+        runner.context_mut().push(Message::assistant("no tools here"));
         assert_eq!(runner.last_decision_kind(), "text");
     }
 
@@ -2865,10 +2802,7 @@ End"#;
         let mut runner = AgentRunner::new(agent);
         let args_json = r#"{"path":"/tmp/x"}"#;
         // Canonical open tag + close tag the v1 parser uses.
-        runner.context_mut().push(Message {
-            role: MsgRole::Assistant,
-            content: format!("<tool_callwrite> {}</tool_call>", args_json),
-        });
+        runner.context_mut().push(Message::assistant(format!("<tool_callwrite> {}</tool_call>", args_json)));
         let expected = format!("tool_call:write:{}", &short_hash(args_json)[..8]);
         assert_eq!(runner.last_decision_kind(), expected);
     }

@@ -1,0 +1,10 @@
+[roles.reviewer_style]
+id = "reviewer_style"
+name = "Code Style Reviewer"
+category = "verification"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/reviewer_style.md"
+temperature = 0.3
+tools = ["read", "list", "search", "delegate"]
+icon = "🎯"

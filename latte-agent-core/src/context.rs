@@ -66,7 +66,7 @@ impl ConversationContext {
 
     /// Add a message to the context with default `Normal` importance.
     pub fn push(&mut self, message: Message) {
-        let tokens = estimate_tokens(&message.content);
+        let tokens = estimate_tokens_for_msg(&message);
         self.messages.push(message);
         self.importance.push(Importance::Normal);
         self.token_count += tokens;
@@ -77,7 +77,7 @@ impl ConversationContext {
     /// Use this when you know a message should be preserved
     /// (`High`/`Critical`) or is expendable (`Low`) at compaction time.
     pub fn push_with_importance(&mut self, message: Message, importance: Importance) {
-        let tokens = estimate_tokens(&message.content);
+        let tokens = estimate_tokens_for_msg(&message);
         self.messages.push(message);
         self.importance.push(importance);
         self.token_count += tokens;
@@ -153,7 +153,7 @@ impl ConversationContext {
         }
         self.token_count = self
             .token_count
-            .saturating_sub(estimate_tokens(&self.messages[idx].content));
+            .saturating_sub(estimate_tokens(&self.messages[idx].as_text()));
         self.importance.remove(idx);
         Some(self.messages.remove(idx))
     }
@@ -165,8 +165,8 @@ impl ConversationContext {
         if idx >= self.messages.len() {
             return None;
         }
-        let old_tokens = estimate_tokens(&self.messages[idx].content);
-        let new_tokens = estimate_tokens(&new.content);
+        let old_tokens = estimate_tokens(&self.messages[idx].as_text());
+        let new_tokens = estimate_tokens(&new.as_text());
         self.token_count = self
             .token_count
             .saturating_sub(old_tokens)
@@ -200,9 +200,9 @@ impl ConversationContext {
         let Some(msg) = self.messages.get_mut(idx) else {
             return false;
         };
-        let old_tokens = estimate_tokens(&msg.content);
+        let old_tokens = estimate_tokens_for_msg(msg);
         f(msg);
-        let new_tokens = estimate_tokens(&msg.content);
+        let new_tokens = estimate_tokens_for_msg(msg);
         self.token_count = self
             .token_count
             .saturating_sub(old_tokens)
@@ -221,7 +221,7 @@ impl ConversationContext {
         }
         let removed_tokens: usize = self.messages[start..end]
             .iter()
-            .map(|m| estimate_tokens(&m.content))
+            .map(|m| estimate_tokens_for_msg(m))
             .sum();
         self.messages.drain(start..end);
         self.importance.drain(start..end);
@@ -241,7 +241,7 @@ impl ConversationContext {
         // Walk back-to-front so removals don't shift indices.
         for i in (0..self.messages.len()).rev() {
             if pred(&self.messages[i]) {
-                removed_tokens += estimate_tokens(&self.messages[i].content);
+                removed_tokens += estimate_tokens_for_msg(&self.messages[i]);
                 self.messages.remove(i);
                 self.importance.remove(i);
                 removed += 1;
@@ -264,8 +264,8 @@ impl ConversationContext {
         for i in 0..self.messages.len() {
             if pred(&self.messages[i]) {
                 let new_msg = build(&self.messages[i]);
-                let old_tokens = estimate_tokens(&self.messages[i].content);
-                let new_tokens = estimate_tokens(&new_msg.content);
+                let old_tokens = estimate_tokens_for_msg(&self.messages[i]);
+                let new_tokens = estimate_tokens_for_msg(&new_msg);
                 self.token_count = self
                     .token_count
                     .saturating_sub(old_tokens)
@@ -304,7 +304,7 @@ impl ConversationContext {
         self.token_count = self
             .messages
             .iter()
-            .map(|m| estimate_tokens(&m.content))
+            .map(|m| estimate_tokens_for_msg(m))
             .sum();
     }
 
@@ -387,7 +387,7 @@ impl ConversationContext {
             if running <= self.token_budget {
                 break;
             }
-            let t = estimate_tokens(&self.messages[*idx].content);
+            let t = estimate_tokens_for_msg(&self.messages[*idx]);
             running -= t;
             to_drop.push(*idx);
         }
@@ -421,10 +421,7 @@ impl ConversationContext {
     pub fn summarize_with(&mut self, summary: &str) {
         self.clear();
         self.push_with_importance(
-            Message {
-                role: latte_ai::models::Role::System,
-                content: format!("[Previous conversation summary]\n{}", summary),
-            },
+            Message::system(format!("[Previous conversation summary]\n{}", summary)),
             Importance::High,
         );
     }
@@ -442,16 +439,16 @@ fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(4)
 }
 
+/// 计算消息的 token 估计值（从 Vec<ContentPart> 版本）
+fn estimate_tokens_for_msg(msg: &Message) -> usize {
+    estimate_tokens(&msg.as_text())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use latte_ai::models::Role;
-
     fn make_msg(content: &str) -> Message {
-        Message {
-            role: Role::User,
-            content: content.to_string(),
-        }
+        Message::user(content)
     }
 
     #[test]

@@ -1,0 +1,10 @@
+[roles.devops_leader]
+id = "devops_leader"
+name = "DevOps Lead"
+category = "execution"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/devops_leader.md"
+temperature = 0.3
+tools = ["delegate"]
+icon = "🚀"

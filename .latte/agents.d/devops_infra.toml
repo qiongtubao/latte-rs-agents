@@ -1,0 +1,10 @@
+[roles.devops_infra]
+id = "devops_infra"
+name = "Infrastructure Engineer"
+category = "execution"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/devops_infra.md"
+temperature = 0.3
+tools = ["read","bash","search","delegate"]
+icon = "☁️"

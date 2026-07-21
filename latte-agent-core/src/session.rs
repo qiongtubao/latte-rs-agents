@@ -150,10 +150,7 @@ impl SessionManager {
         self.record.paused_at = None;
         self.record.pause_reason = None;
         let now = crate::trace::iso8601_utc_now();
-        let synthetic = latte_ai::models::Message {
-            role: latte_ai::models::Role::User,
-            content: format!("[HUMAN @ {}]\n{}", now, message),
-        };
+        let synthetic = latte_ai::models::Message::user(format!("[HUMAN @ {}]\n{}", now, message));
         self.append_to_role(role_id, synthetic)?;
         Ok(())
     }
@@ -400,22 +397,16 @@ mod tests {
     #[test]
     fn append_to_role_grows_history() {
         let (_dir, mut mgr) = make_mgr();
-        mgr.append_to_role("programmer", Message {
-            role: MsgRole::User,
-            content: "hello".into(),
-        }).unwrap();
+        mgr.append_to_role("programmer", Message::user("hello")).unwrap();
         let history = mgr.role_history("programmer");
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].content, "hello");
+        assert_eq!(history[0].as_text(), "hello");
     }
 
     #[test]
     fn unknown_role_returns_error() {
         let (_dir, mut mgr) = make_mgr();
-        let res = mgr.append_to_role("ghost", Message {
-            role: MsgRole::User,
-            content: "x".into(),
-        });
+        let res = mgr.append_to_role("ghost", Message::user("x"));
         assert!(matches!(res, Err(SessionError::UnknownRole(_))));
     }
 

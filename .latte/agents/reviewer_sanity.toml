@@ -1,0 +1,59 @@
+# Role: Sanity Reviewer
+# =============================================================================
+# Fast first-pass fact-checker used as Layer 1 of the manager's review
+# chain. Verifies file references, syntax sanity, and internal
+# consistency in a report from another specialist. Read-only by design:
+# this role never edits code, it only flags issues.
+#
+# Triggered by the manager immediately after `programmer` or
+# `architect` returns. Cheap (budget model, no write/bash) so it can
+# be run on every specialist output without ceremony.
+
+[roles.reviewer_sanity]
+# Unique identifier — used in CLI flags, workflow steps, and tier mappings.
+id = "reviewer_sanity"
+
+# Human-readable display name — shown in logs and discussion transcripts.
+name = "Sanity Reviewer"
+
+# Lifecycle category: verification roles check the work of execution /
+# planning roles. Same category as the existing `reviewer` role.
+category = "verification"
+
+# Default model tier — budget. The whole point of this role is that
+# it's cheap enough to run on every specialist output. Pinned via
+# model_chain to qwen2.5-coder-32b-instruct (the budget default);
+# operators with a working Ollama server can flip to that model
+# directly via `--model-override`.
+# Switched from "budget" to "standard" (2026-06-26) so the
+# default head model is deepseek-v4-flash via the role_tiers
+# mapping, instead of qwen2.5-coder-32b-instruct via Ollama
+# (which timed out at 30s on machines without a local server).
+# The "cheap fast fact-check" rationale was sound in theory
+# but the Ollama dependency made it unreliable in practice.
+model_tier = "standard"
+
+# Fallback model chain — deepseek-v4-flash only (was:
+# qwen2.5-coder-32b-instruct first, deepseek-v4-flash second).
+model_chain = ["deepseek-v4-flash"]
+
+# Path to the system prompt markdown file (relative to project root).
+# This file defines the agent's personality, expertise, and behavioral rules.
+prompt_file = "prompts/reviewer_sanity.md"
+
+# Generation temperature (0.0–1.0).
+#   Lower (0.1–0.3) = more deterministic, consistent — good for code, analysis
+#   Higher (0.5–0.8) = more creative, varied — good for brainstorming, design
+#   Default: 0.7 (if omitted)
+# 0.1 — fact-checking wants the same verdict on the same input, not
+# a re-roll of "looks fine, ship it".
+temperature = 0.1
+
+# Allowed tools — read + list ONLY. No writes, no bash, no search.
+# The sanity reviewer must never modify the project; it only reads.
+# This is the cheapest possible tool surface and reinforces the
+# "this role is read-only by design" guarantee for downstream consumers.
+tools = ["read", "list"]
+
+# Display emoji shown next to the role name in logs and transcripts.
+icon = "🔍"

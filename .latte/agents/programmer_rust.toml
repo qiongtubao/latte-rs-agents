@@ -1,0 +1,10 @@
+[roles.programmer_rust]
+id = "programmer_rust"
+name = "RUST Engineer"
+category = "execution"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/programmer_rust.md"
+temperature = 0.3
+tools = ["read", "write", "bash", "search", "delegate"]
+icon = "🦀"

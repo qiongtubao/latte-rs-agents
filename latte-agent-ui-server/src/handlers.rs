@@ -306,3 +306,18 @@ pub(crate) async fn self_loop_stop(State(state): State<AppState>) -> StatusCode 
     api::self_loop_stop(&state.backend);
     StatusCode::OK
 }
+
+// ─── Logs ────────────────────────────────────────────────────────
+
+/// `GET /api/logs` — 列出或读取 ui-sessions 日志。
+/// 参数：`?file=<name>&tail=30`
+pub(crate) async fn get_logs(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Result<Json<Vec<api::LogEntry>>, (StatusCode, String)> {
+    let file = params.get("file").map(|s| s.as_str());
+    let tail = params.get("tail").and_then(|s| s.parse::<usize>().ok());
+    api::list_logs(&state.backend, file, tail)
+        .map(Json)
+        .map_err(|e| (StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), e.message))
+}

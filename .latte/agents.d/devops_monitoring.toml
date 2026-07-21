@@ -1,0 +1,10 @@
+[roles.devops_monitoring]
+id = "devops_monitoring"
+name = "Monitoring Engineer"
+category = "execution"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/devops_monitoring.md"
+temperature = 0.3
+tools = ["read","bash","search","delegate"]
+icon = "📈"

@@ -9,6 +9,7 @@
 
 import { getHost } from "./host";
 import { getTransport, HttpSseTransport, HttpError } from "./transport";
+import { stageStore } from "./stages/stageStore";
 
 /** Realm-agnostic HttpError check: the editor's TauriIpcTransport runs in
  * the host page's JS realm, so errors it throws are never `instanceof`
@@ -302,6 +303,20 @@ export async function readTrace(session_id: string): Promise<{ session_id: strin
   return getTransport().request("GET", `/api/traces/${encodeURIComponent(session_id)}`);
 }
 
+// ─── Logs ────────────────────────────────────────────────────────────────
+export interface LogFile {
+  file: string;
+  size: number;
+  modified: number;
+  lines: string[];
+}
+
+/** GET /api/logs — 列出 cwd/.latte/ui-sessions/ 下所有日志文件。 */
+export async function listLogs(): Promise<LogFile[]> {
+  return getTransport().request("GET", "/api/logs");
+}
+// (读取指定日志文件直接调用 getTransport().request，无需单独包装：避免 1 行 wrapper)
+
 // ─── SSE ────────────────────────────────────────────────────────────────
 
 export function subscribeEvents(
@@ -332,7 +347,19 @@ export function subscribeEvents(
       // accepted the subscription we consider it connected.
       onConnectionStatus("connected");
     }
-    unsubscribe = t.subscribeEvents(currentSessionId, onEvent);
+    // conversation-stage-logs: fan the same ChatEvent stream into the
+    // Stage store so <StageList/> can render the stage tree, WITHOUT
+    // disturbing the existing consumer (chat.handleEvent). Guarded so a
+    // reducer error can never break the legacy chat handler.
+    const routedOnEvent = (ev: ChatEvent): void => {
+      try {
+        stageStore.getState().applyEvent(ev);
+      } catch (err) {
+        console.error("[stageStore] applyEvent failed", err);
+      }
+      onEvent(ev);
+    };
+    unsubscribe = t.subscribeEvents(currentSessionId, routedOnEvent);
     subscribed = true;
   };
 

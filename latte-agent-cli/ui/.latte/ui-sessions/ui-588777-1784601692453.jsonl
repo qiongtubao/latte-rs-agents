@@ -1,0 +1,3 @@
+{"type":"__meta__","session_id":"ui-588777-1784601692453","label":null,"initial_role":"manager","created_at_unix_ms":1784601692453}
+{"type":"Prompt","icon":"👔","role_id":"manager","model_id":"glm-5.2"}
+{"type":"SessionInfo","task_id":"single-role","state":"Running","turn":0,"roles":[{"id":"manager","name":"manager","icon":"👔"}]}

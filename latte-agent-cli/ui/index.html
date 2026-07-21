@@ -35,6 +35,7 @@
           <button id="role-editor-btn" type="button">⚙️ Roles</button>
           <button id="trace-toggle" type="button">Trace</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
+          <button id="log-btn" type="button" title="查看日志">📋 日志</button>
         </div>
       </header>
 
@@ -206,6 +207,25 @@
         </div>
       </aside>
 
+
+      <!-- 日志查看器面板 -->
+      <aside id="log-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>日志查看器</h2>
+          <button id="log-refresh" type="button">↻</button>
+          <button id="log-close" type="button" class="panel-close">×</button>
+        </header>
+        <div class="log-panel-body">
+          <div class="log-sidebar">
+            <div class="log-list-header">日志文件</div>
+            <div id="log-file-list" class="log-file-list"></div>
+          </div>
+          <div class="log-content-area">
+            <div class="log-status" id="log-status">就绪</div>
+            <div id="log-content" class="log-content"></div>
+          </div>
+        </div>
+      </aside>
       <footer class="statusbar">
         <span id="footer-msg">ready</span>
       </footer>

@@ -446,6 +446,10 @@ pub struct ModelDef {
     /// Whether the model supports thinking/reasoning.
     #[serde(default)]
     pub supports_thinking: bool,
+    /// Whether the model can accept image inputs. Defaults to `false`
+    /// so existing configs work without changes.
+    #[serde(default)]
+    pub supports_vision: bool,
     /// Cost per million input tokens (USD). Optional for local models.
     #[serde(default)]
     pub cost_per_million_input: Option<f64>,

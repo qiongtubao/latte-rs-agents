@@ -1,0 +1,10 @@
+[roles.tech_writer_api]
+id = "tech_writer_api"
+name = "API Documenter"
+category = "execution"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/tech_writer_api.md"
+temperature = 0.5
+tools = ["read","write","list","delegate"]
+icon = "🔌"

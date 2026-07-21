@@ -11,10 +11,12 @@ import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
 import { mountRoleGraph } from "./role_graph";
 import { mountRoleEditor } from "./role_editor";
+import { mountLogPanel } from "./log";
 import { waitForHost, setUiApi, installUiCallListener } from "./host";
 import type { LatteUiApi } from "./host";
 import { initTransport } from "./transport";
 import { extractCodeRefs, makeRefChips } from "./linkify";
+import { mountStageList } from "./components/StageList";
 
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -77,9 +79,22 @@ async function main(): Promise<void> {
   let sseDisconnector: () => void = () => {};
   let sseConnector: () => void = () => {};
 
+  // conversation-stage-logs: the visible conversation is now the React
+  // <StageList/> mounted onto the existing #messages container (driven by
+  // stageStore, fed from the same ChatEvent stream in api.ts). The legacy
+  // flat message list keeps powering the chat controller lifecycle
+  // (send / replay / status / roles) but renders into a hidden, detached
+  // element so it is visually replaced without ripping out chat_impl.
+  const conversationEl = $("messages");
+  const legacyMessagesEl = document.createElement("div");
+  legacyMessagesEl.className = "message-list message-list--legacy";
+  legacyMessagesEl.style.display = "none";
+  conversationEl.parentElement?.appendChild(legacyMessagesEl);
+  mountStageList(conversationEl);
+
   const chat: ChatController = mountChat({
     container: {
-      messagesEl: $("messages"),
+      messagesEl: legacyMessagesEl,
       formEl: $("chat-form") as HTMLFormElement,
       inputEl: $("chat-input") as HTMLTextAreaElement,
       sendBtn: $("chat-send") as HTMLButtonElement,
@@ -169,6 +184,19 @@ async function main(): Promise<void> {
     },
   });
   $("role-editor-btn").addEventListener("click", () => roleEditor.open());
+
+  // 挂载日志面板：方便排查页面无响应等问题
+  mountLogPanel({
+    container: {
+      panelEl: $("log-panel"),
+      openBtn: $("log-btn") as HTMLButtonElement,
+      closeBtn: $("log-close") as HTMLButtonElement,
+      refreshBtn: $("log-refresh") as HTMLButtonElement,
+      logListEl: $("log-file-list"),
+      logContentEl: $("log-content"),
+      statusEl: $("log-status"),
+    },
+  });
 
   await trace.refresh();
 

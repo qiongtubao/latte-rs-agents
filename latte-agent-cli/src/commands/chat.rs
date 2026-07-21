@@ -519,7 +519,7 @@ impl ChatSession {
         }
         let msgs = vec![Message {
             role: MsgRole::User,
-            content: user_input.to_string(),
+            content: vec![latte_ai::models::ContentPart::text(user_input)],
         }];
         // Show a braille spinner while the model is generating. The
         // spinner writes to stderr with `\r` so it doesn't fight
@@ -746,7 +746,7 @@ impl ChatSession {
                     println!("(no messages)");
                 } else {
                     for (i, m) in msgs.iter().enumerate() {
-                        let preview: String = m.content.chars().take(80).collect();
+                        let preview: String = m.as_text().chars().take(80).collect();
                         println!("{:>3} [{:?}] {}", i, m.role, preview);
                     }
                 }
@@ -1200,7 +1200,7 @@ async fn register_delegate_tool(
                 };
                 let msgs = vec![Message {
                     role: MsgRole::User,
-                    content: task,
+                    content: vec![latte_ai::models::ContentPart::text(task)],
                 }];
                 // Acquire concurrency permit (blocks if too many
                 // specialists are already running).
@@ -1899,7 +1899,7 @@ async fn run_hil_repl(
                 }
                 Ok(ReplInput::ManagerInput { message }) => {
                     let mut mgr = session_arc.lock().await;
-                    mgr.append_to_role("manager", Message { role: MsgRole::User, content: message.clone() })?;
+                    mgr.append_to_role("manager", Message::user(message.clone()))?;
                     renderer.on_status(&format!("[manager turn enqueued: {} chars]", message.len())).await;
                 }
                 Err(e) => renderer.on_error(&format!("[parse error: {:?}]", e)).await,
@@ -1933,7 +1933,7 @@ async fn run_hil_repl(
                         if !content.trim().is_empty() {
                             let synth = Message {
                                 role: MsgRole::User,
-                                content: format!("[INJECTED]\n{}", content),
+                                content: vec![latte_ai::models::ContentPart::text(format!("[INJECTED]\n{}", content))],
                             };
                             mgr.append_to_role(&role_id, synth).ok();
                         }
@@ -1945,7 +1945,7 @@ async fn run_hil_repl(
                 if !plan_slice.is_empty() {
                     let synth = Message {
                         role: MsgRole::User,
-                        content: format!("[PLAN SLICE]\n{}", plan_slice),
+                            content: vec![latte_ai::models::ContentPart::text(format!("[PLAN SLICE]\n{}", plan_slice))],
                     };
                     mgr.append_to_role(&role_id, synth).ok();
                 }
@@ -2013,7 +2013,7 @@ async fn run_hil_repl(
                 if !new_assistant_text.is_empty() {
                     let assistant_msg = Message {
                         role: MsgRole::Assistant,
-                        content: new_assistant_text,
+                        content: vec![latte_ai::models::ContentPart::text(new_assistant_text)],
                     };
                     if let Err(e) = mgr.append_to_role(&role_id, assistant_msg) {
                         renderer.on_error(&format!("[{} round {}: failed to append assistant turn: {}]", role_id, round_num, e)).await;

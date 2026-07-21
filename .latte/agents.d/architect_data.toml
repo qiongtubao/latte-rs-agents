@@ -1,0 +1,10 @@
+[roles.architect_data]
+id = "architect_data"
+name = "Data Architect"
+category = "planning"
+model_tier = "premium"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/architect_data.md"
+temperature = 0.5
+tools = ["read","list","search","bash","delegate"]
+icon = "📊"

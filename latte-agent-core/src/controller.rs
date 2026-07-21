@@ -951,10 +951,7 @@ async fn run_multi_role_loop(
             let mut mgr = session_arc.lock().await;
             mgr.append_to_role(
                 "manager",
-                Message {
-                    role: MsgRole::User,
-                    content: line.clone(),
-                },
+                Message::user(line.clone()),
             )
             .ok();
             let _ = event_tx.send(ChatEvent::Status {
@@ -999,10 +996,7 @@ async fn run_multi_role_loop(
                 if inject_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&inject_path) {
                         if !content.trim().is_empty() {
-                            let synth = Message {
-                                role: MsgRole::User,
-                                content: format!("[INJECTED]\n{}", content),
-                            };
+                            let synth = Message::user(format!("[INJECTED]\n{}", content));
                             mgr.append_to_role(role_id, synth).ok();
                         }
                         let _ = std::fs::remove_file(&inject_path);
@@ -1011,10 +1005,7 @@ async fn run_multi_role_loop(
                 // Slice plan.md for this role
                 let plan_slice = plan_md_slice_for(&mgr.record().plan_md, role_id);
                 if !plan_slice.is_empty() {
-                    let synth = Message {
-                        role: MsgRole::User,
-                        content: format!("[PLAN SLICE]\n{}", plan_slice),
-                    };
+                    let synth = Message::user(format!("[PLAN SLICE]\n{}", plan_slice));
                     mgr.append_to_role(role_id, synth).ok();
                 }
                 mgr.advance_turn().ok();
@@ -1083,10 +1074,7 @@ async fn run_multi_role_loop(
                 });
 
                 let mut mgr = session_arc.lock().await;
-                let assistant_msg = Message {
-                    role: MsgRole::Assistant,
-                    content: new_assistant_text,
-                };
+                let assistant_msg = Message::assistant(new_assistant_text);
                 if let Err(e) = mgr.append_to_role(role_id, assistant_msg) {
                     let _ = event_tx.send(ChatEvent::Status {
                         message: format!("[{role_id} round {round_num}: failed to append: {e}]"),
@@ -1344,7 +1332,7 @@ async fn run_single_role_loop(
                                     let msgs = runner.context().messages();
                                     let _ = event_tx.send(ChatEvent::Status { message: format!("history ({} messages):", msgs.len()) });
                                     for (i, m) in msgs.iter().enumerate() {
-                                        let preview = if m.content.len() > 200 { format!("{}...", &m.content[..200]) } else { m.content.clone() };
+                                        let preview = if m.content.len() > 200 { format!("{}...", &m.as_text()[..200]) } else { m.as_text() };
                                         let _ = event_tx.send(ChatEvent::Status { message: format!("  {i} [{:?}] {preview}", m.role) });
                                     }
                                 }
@@ -1375,7 +1363,7 @@ async fn run_single_role_loop(
                         let turn_result = if let Some(timeout_secs) = turn_timeout_secs {
                             match tokio::time::timeout(
                                 Duration::from_secs(timeout_secs),
-                                runner.run_turn(&[Message { role: MsgRole::User, content: trimmed }], None),
+                                runner.run_turn(&[Message::user(trimmed)], None),
                             ).await {
                                 Ok(result) => result,
                                 Err(_) => {
@@ -1390,7 +1378,7 @@ async fn run_single_role_loop(
                                 }
                             }
                         } else {
-                            runner.run_turn(&[Message { role: MsgRole::User, content: trimmed }], None).await
+                            runner.run_turn(&[Message::user(trimmed)], None).await
                         };
                         match turn_result {
                             Ok(response) => {
@@ -1947,10 +1935,7 @@ async fn register_delegate_tool(
             // cancel it from the select! loop. The task owns everything.
             let task_content = task.clone();
             let mut run_handle = tokio::spawn(async move {
-                runner.run_turn(&[Message {
-                    role: MsgRole::User,
-                    content: task_content,
-                }], None).await
+                runner.run_turn(&[Message::user(task_content)], None).await
             });
             let result: Result<String, latte_rs_agent_tools::error::ToolError>;
             loop {
@@ -2235,10 +2220,7 @@ async fn register_workflow_tool(
                         };
                         match runner
                             .run_turn(
-                                &[Message {
-                                    role: MsgRole::User,
-                                    content: prompt,
-                                }],
+                                &[Message::user(prompt)],
                                 None,
                             )
                             .await
@@ -2309,6 +2291,11 @@ async fn register_workflow_tool(
     Ok(())
 }
 
+/// 默认 turn 超时：模型和 env var 都没设置时使用。
+/// 120 秒足以覆盖绝大多数 LLM 响应（包括网络慢的），又能在 LLM
+/// 卡住时及时释放资源（用户不会被 5 分钟的"已卡住"提示久等）。
+const DEFAULT_TURN_TIMEOUT_SECS: u64 = 120;
+
 fn active_model_timeout_secs(
     resolver: &ModelResolver,
     model_id: Option<&str>,
@@ -2318,6 +2305,7 @@ fn active_model_timeout_secs(
         .and_then(|id| resolver.get_def(id))
         .and_then(|d| d.timeout_secs)
         .or_else(|| std::env::var(env_var).ok().and_then(|s| s.parse().ok()))
+        .or(Some(DEFAULT_TURN_TIMEOUT_SECS))
 }
 
 #[allow(unused_variables)]

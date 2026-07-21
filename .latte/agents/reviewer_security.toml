@@ -1,0 +1,57 @@
+# Role: Security Reviewer
+# =============================================================================
+# Layer-3 deep audit covering security, performance bottlenecks, and
+# tricky edge cases. Triggered rarely — only on high-risk code paths
+# (auth, user data, network) or when the manager escalates after
+# Layer 1+2 surface something worrying.
+#
+# Read-only by design — never edits code. Has the same tool surface
+# as architecture (read+search+list) but reserves the premium tier
+# so a heavyweight model does the deep analysis.
+
+[roles.reviewer_security]
+# Unique identifier — used in CLI flags, workflow steps, and tier mappings.
+id = "reviewer_security"
+
+# Human-readable display name — shown in logs and discussion transcripts.
+name = "Security Reviewer"
+
+# Lifecycle category: verification. The existing `security` role
+# (config/agents/security.toml) is already in this category; this
+# role is the manager-chain counterpart that runs in chat mode
+# with read-only tools.
+category = "verification"
+
+# Default model tier — premium. Security audits need a heavyweight
+# model to catch subtle issues (off-by-one in input validation,
+# subtle timing leaks, etc). Worth the cost because this role is
+# invoked rarely.
+model_tier = "premium"
+
+# Fallback model chain — claude-sonnet-4-20250514 pinned. This is
+# the deepseek-v4-flash fallback path so the chain always resolves
+# to a working model; if a real ANTHROPIC_API_KEY is configured
+# globally, the per-role tier in models.toml will reroute the
+# premium tier to claude-opus-4.
+model_chain = ["claude-sonnet-4-20250514", "deepseek-v4-flash"]
+
+# Path to the system prompt markdown file (relative to project root).
+# This file defines the agent's personality, expertise, and behavioral rules.
+prompt_file = "prompts/reviewer_security.md"
+
+# Generation temperature (0.0–1.0).
+#   Lower (0.1–0.3) = more deterministic, consistent — good for code, analysis
+#   Higher (0.5–0.8) = more creative, varied — good for brainstorming, design
+#   Default: 0.7 (if omitted)
+# 0.1 — security audits want the same verdict on the same input.
+# No creativity here, please.
+temperature = 0.1
+
+# Allowed tools — read + search + list. No writes, no bash.
+# Same surface as architecture; the difference is the model and
+# the prompt (security-focused lens). Read-only by design: this
+# role reports findings, never fixes them.
+tools = ["read", "list", "search"]
+
+# Display emoji shown next to the role name in logs and transcripts.
+icon = "🛡️"

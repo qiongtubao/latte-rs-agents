@@ -1,0 +1,34 @@
+# Role: MCP Agent
+# =============================================================================
+# This role connects to MCP (Model Context Protocol) servers and uses
+# their tools. MCP is an open standard for AI-tool interoperability.
+#
+# The MCP agent can:
+#   1. Connect to MCP servers via `mcp_connect`
+#   2. List available MCP tools via `mcp_list`
+#   3. Call MCP tools via `mcp_call`
+#
+# Typical MCP servers:
+#   - filesystem: npx @modelcontextprotocol/server-filesystem <path>
+#   - github: npx @modelcontextprotocol/server-github
+#   - postgres: npx @modelcontextprotocol/server-postgres <connection-string>
+#   - puppeteer: npx @modelcontextprotocol/server-puppeteer
+
+[roles.mcp_agent]
+id = "mcp_agent"
+name = "MCP Agent"
+category = "execution"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+
+# System prompt path
+prompt_file = "prompts/mcp_agent.md"
+
+# Generation temperature
+temperature = 0.3
+
+# Allowed tools: MCP tools + basic utilities
+tools = ["mcp", "bash", "read", "list"]
+
+# Display emoji
+icon = "🔌"

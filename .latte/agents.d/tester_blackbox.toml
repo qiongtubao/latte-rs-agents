@@ -1,0 +1,10 @@
+[roles.tester_blackbox]
+id = "tester_blackbox"
+name = "Black-Box Tester"
+category = "verification"
+model_tier = "budget"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/tester_blackbox.md"
+temperature = 0.3
+tools = ["read", "list", "bash", "search", "playwright", "delegate"]
+icon = "🔲"

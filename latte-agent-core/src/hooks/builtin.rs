@@ -37,7 +37,10 @@ impl Hook for RedactPii {
 
     fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
         for m in ctx.messages.iter_mut() {
-            m.content = redact_text(&m.content);
+            // 提取文本内容，脱敏，再写回
+            let text = m.as_text();
+            let redacted = redact_text(&text);
+            m.content = vec![latte_ai::models::ContentPart::text(redacted)];
         }
         HookOutcome::Continue
     }
@@ -263,7 +266,7 @@ impl ContextMonitor {
     }
 
     fn estimated_tokens(messages: &[latte_ai::models::Message]) -> usize {
-        messages.iter().map(|m| m.content.len().div_ceil(4)).sum()
+        messages.iter().map(|m| m.as_text().len().div_ceil(4)).sum()
     }
 }
 
@@ -305,7 +308,7 @@ mod tests {
     use latte_ai::models::Role as MsgRole;
 
     fn msgs_with(text: &str) -> Vec<Message> {
-        vec![Message { role: MsgRole::User, content: text.into() }]
+        vec![Message::user(text)]
     }
 
     // ─── RedactPii tests ────────────────────────────────────────────
@@ -381,19 +384,19 @@ mod tests {
         let mut msgs = msgs_with("the quick brown fox jumps over 13 lazy dogs");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert_eq!(msgs[0].content, "the quick brown fox jumps over 13 lazy dogs");
+        assert_eq!(msgs[0].as_text(), "the quick brown fox jumps over 13 lazy dogs");
     }
 
     #[test]
-    fn redacts_in_multiple_messages() {
+    fn redact_pii_on_call() {
         let mut msgs = vec![
-            Message { role: MsgRole::User, content: "call 13812345678".into() },
-            Message { role: MsgRole::Assistant, content: "AKIAIOSFODNN7EXAMPLE leaked".into() },
+            Message::user("call 13812345678"),
+            Message::assistant("AKIAIOSFODNN7EXAMPLE leaked"),
         ];
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:phone>"));
-        assert!(msgs[1].content.contains("<REDACTED:aws_key>"));
+        assert!(msgs[0].as_text().contains("<REDACTED:phone>"));
+        assert!(msgs[1].as_text().contains("<REDACTED:aws_key>"));
     }
 
     // ─── EnforceToolAllowlist tests ─────────────────────────────────

@@ -770,3 +770,95 @@ mod tests {
         assert!(v.is_empty());
     }
 }
+
+// ─── Logs ────────────────────────────────────────────────────────
+
+/// 日志条目：一行 ui-session 日志文件的内容。
+#[derive(Serialize)]
+pub struct LogEntry {
+    /// 日志文件名（如 `ui-536900-1784574560320.jsonl`）
+    pub file: String,
+    /// 日志文件大小（字节）
+    pub size: u64,
+    /// 日志文件修改时间（unix 毫秒）
+    pub modified: u64,
+    /// 日志内容行（最多返回 last_n 行）
+    pub lines: Vec<String>,
+}
+
+/// `GET /api/logs` — 列出 `<cwd>/.latte/ui-sessions/` 下的日志文件。
+/// 支持 `?file=<name>&tail=30` 参数读取指定文件尾部。
+pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Result<Vec<LogEntry>, ApiError> {
+    let sessions_dir = b.cwd.join(".latte").join("ui-sessions");
+    if !sessions_dir.exists() {
+        return Ok(vec![]);
+    }
+    let tail_n = tail.unwrap_or(20);
+    let mut entries: Vec<LogEntry> = Vec::new();
+
+    let mut dir_entries: Vec<_> = match std::fs::read_dir(&sessions_dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return Ok(vec![]),
+    };
+    dir_entries.sort_by_key(|e| e.path().to_string_lossy().to_string());
+
+    for entry in dir_entries {
+        let path = entry.path();
+        if path.extension().map_or(true, |ext| ext != "jsonl") {
+            continue;
+        }
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // 如果指定了具体文件，只读取那个文件
+        if let Some(target) = file {
+            if file_name != target {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let all_lines: Vec<&str> = content.lines().collect();
+            let total = all_lines.len();
+            let start = if total > tail_n { total - tail_n } else { 0 };
+            let lines: Vec<String> = all_lines[start..]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let line_num = start + i + 1;
+                    format!("{line_num}: {l}")
+                })
+                .collect();
+            let modified = meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            return Ok(vec![LogEntry {
+                file: file_name,
+                size: meta.len(),
+                modified,
+                lines,
+            }]);
+        }
+
+        // 否则只列出文件元信息（不读内容）
+        let modified = meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        entries.push(LogEntry {
+            file: file_name,
+            size: meta.len(),
+            modified,
+            lines: vec![],
+        });
+    }
+
+    Ok(entries)
+}

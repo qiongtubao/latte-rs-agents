@@ -1,0 +1,5 @@
+node_modules
+dist
+# bindings 由 latte-agent-bridge build.rs 生成，不提交副本
+# 通过 scripts/sync-bindings.sh 或 latte-rs-agents 根目录的 Makefile 同步
+src/bindings/

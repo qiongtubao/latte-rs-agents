@@ -375,6 +375,7 @@ impl ModelResolver {
             context_window: def.context_window,
             max_tokens: def.max_tokens,
             supports_thinking: def.supports_thinking,
+            supports_vision: def.supports_vision,
             cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
             cost_per_million_output: def.cost_per_million_output.unwrap_or(0.0),
         })

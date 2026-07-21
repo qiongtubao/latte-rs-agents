@@ -1,0 +1,10 @@
+[roles.designer_ux]
+id = "designer_ux"
+name = "UX Researcher"
+category = "planning"
+model_tier = "standard"
+model_chain = ["deepseek-v4-flash"]
+prompt_file = "prompts/designer_ux.md"
+temperature = 0.7
+tools = ["read","list","search","delegate"]
+icon = "🔬"

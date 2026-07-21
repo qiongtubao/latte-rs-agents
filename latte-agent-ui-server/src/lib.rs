@@ -399,6 +399,7 @@ fn build_router(state: AppState) -> Router {
         .route("/self-loop/stop", post(self_loop_stop))
         .route("/role-graph", get(role_graph_get))
         .route("/subsessions", get(get_subsession))
+        .route("/logs", get(get_logs))
          .with_state(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
