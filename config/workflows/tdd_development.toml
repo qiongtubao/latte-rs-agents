@@ -1,6 +1,6 @@
 # Workflow: tdd_development — TDD 开发
 name = "tdd_development"
-description = "TDD 流水线：测试先行 → 实现 → 验证 → Advisor 终审"
+description = "TDD 流水线：测试先行 → 实现 → 验证 → Reviewer 终审"
 max_rounds = 1
 
 [[steps]]
@@ -24,6 +24,6 @@ prompt = "检查上面的实现是否覆盖所有测试用例，指出遗漏的�
 
 [[steps]]
 id = "advisor_verdict"
-description = "Advisor 终审"
-speakers = ["advisor"]
+description = "Reviewer 终审"
+speakers = ["reviewer"]
 prompt = "你现在是终审顾问。通读上面的测试与实现讨论，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

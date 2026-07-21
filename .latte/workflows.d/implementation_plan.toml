@@ -1,6 +1,6 @@
 # Workflow: implementation_plan — 实现计划/plan
 name = "implementation_plan"
-description = "实现计划流水线：架构拆解 → 工程排期 → Advisor 终审"
+description = "实现计划流水线：架构拆解 → 工程排期 → Reviewer 终审"
 max_rounds = 1
 
 [[steps]]
@@ -18,6 +18,6 @@ prompt = "基于上面的拆解，评估每一步的工作量、实现顺序和�
 
 [[steps]]
 id = "advisor_verdict"
-description = "Advisor 终审计划"
-speakers = ["advisor"]
+description = "Reviewer 终审计划"
+speakers = ["reviewer"]
 prompt = "你现在是终审顾问。通读上面的计划，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

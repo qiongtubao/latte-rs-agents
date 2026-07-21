@@ -1,6 +1,6 @@
 # Workflow: update_graph — 更新图谱
 name = "update_graph"
-description = "图谱更新流水线：结构分析 → 图谱更新 → Advisor 终审"
+description = "图谱更新流水线：结构分析 → 图谱更新 → Reviewer 终审"
 max_rounds = 1
 
 [[steps]]
@@ -18,6 +18,6 @@ prompt = "基于上面的结构分析，给出「{{topic}}」的图谱更新内�
 
 [[steps]]
 id = "advisor_verdict"
-description = "Advisor 终审图谱"
-speakers = ["advisor"]
+description = "Reviewer 终审图谱"
+speakers = ["reviewer"]
 prompt = "你现在是终审顾问。检查上面的图谱更新是否完整、一致，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

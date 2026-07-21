@@ -1,6 +1,6 @@
 # Workflow: update_docs — 更新文档
 name = "update_docs"
-description = "文档更新流水线：变更分析 → 文档撰写 → Advisor 终审"
+description = "文档更新流水线：变更分析 → 文档撰写 → Reviewer 终审"
 max_rounds = 1
 
 [[steps]]
@@ -18,6 +18,6 @@ prompt = "基于上面的事实清单，为「{{topic}}」撰写/更新文档：
 
 [[steps]]
 id = "advisor_verdict"
-description = "Advisor 终审文档"
-speakers = ["advisor"]
+description = "Reviewer 终审文档"
+speakers = ["reviewer"]
 prompt = "你现在是终审顾问。检查上面的文档是否与事实清单一致、是否完整准确，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"

@@ -149,8 +149,8 @@ PM 说：
 整条答复控制在 400 字以内。不要含糊 —— 给一个真实的决策，而不是选项列表。"""
 output_key = "final"
 [[steps]]
-# 终审：Advisor 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
+# 终审：Reviewer 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
 id = "advisor_verdict"
-description = "Advisor reviews all outputs and gives the final verdict"
-speakers = ["advisor"]
+description = "Reviewer reviews all outputs and gives the final verdict"
+speakers = ["reviewer"]
 prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"

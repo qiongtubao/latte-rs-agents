@@ -31,12 +31,35 @@ pub struct WorkflowStepDef {
     pub id: String,
     #[serde(default)]
     pub description: String,
+    /// New single-role task form. `speakers` remains accepted for legacy workflows.
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub task: String,
     #[serde(default)]
     pub speakers: Vec<String>,
     #[serde(default)]
     pub prompt: String,
     #[serde(default)]
     pub output_key: Option<String>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub max_retries: u32,
+    #[serde(default)]
+    pub loop_until: Option<String>,
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+}
+
+impl WorkflowStepDef {
+    pub fn roles(&self) -> Vec<String> {
+        if let Some(role) = &self.role { vec![role.clone()] } else { self.speakers.clone() }
+    }
+
+    pub fn task_text(&self) -> &str {
+        if self.task.is_empty() { &self.prompt } else { &self.task }
+    }
 }
 
 impl WorkflowDef {
@@ -44,33 +67,34 @@ impl WorkflowDef {
         self.max_rounds.unwrap_or(1).max(1)
     }
 
-    /// All speaker role ids referenced by this workflow, deduped,
-    /// in first-appearance order.
     pub fn speaker_roles(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+        let mut out = Vec::new();
         for step in &self.steps {
-            for s in &step.speakers {
-                if !out.contains(s) {
-                    out.push(s.clone());
-                }
+            for role in step.roles() {
+                if !out.contains(&role) { out.push(role); }
             }
         }
         out
     }
 
-    /// Render a step's prompt with `{{var}}` substitution (topic,
-    /// step outputs, speaker/step_id). Unknown variables are left
-    /// as-is, matching the orchestrator's `build_step_prompt`.
+    pub fn render_task(
+        &self,
+        step: &WorkflowStepDef,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> String {
+        let mut out = step.task_text().to_string();
+        for (key, value) in vars {
+            out = out.replace(&format!("{{{{{key}}}}}"), value);
+        }
+        out
+    }
+
     pub fn render_prompt(
         &self,
         step: &WorkflowStepDef,
         vars: &std::collections::HashMap<String, String>,
     ) -> String {
-        let mut out = step.prompt.clone();
-        for (k, v) in vars {
-            out = out.replace(&format!("{{{{{k}}}}}", k = k), v);
-        }
-        out
+        self.render_task(step, vars)
     }
 }
 
@@ -169,5 +193,46 @@ prompt = "review"
         assert_eq!(wf.speaker_roles(), vec!["pm", "architect", "advisor"]);
         let vars = std::collections::HashMap::from([("topic".to_string(), "X".to_string())]);
         assert_eq!(wf.render_prompt(&wf.steps[0], &vars), "do X");
+    }
+}
+
+#[cfg(test)]
+mod task_schema_tests {
+    use super::*;
+
+    #[test]
+    fn single_role_task_supports_dependencies_and_loop() {
+        let raw = r#"
+name = "custom"
+[[steps]]
+id = "implement"
+role = "programmer"
+task = "implement {{topic}}"
+depends_on = ["tests"]
+max_retries = 2
+loop_until = "tests_pass"
+max_iterations = 3
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        let step = &wf.steps[0];
+        assert_eq!(step.roles(), vec!["programmer"]);
+        assert_eq!(step.task_text(), "implement {{topic}}");
+        assert_eq!(step.depends_on, vec!["tests"]);
+        assert_eq!(step.max_retries, 2);
+        assert_eq!(step.max_iterations, Some(3));
+    }
+
+    #[test]
+    fn legacy_speakers_and_prompt_remain_supported() {
+        let raw = r#"
+name = "legacy"
+[[steps]]
+id = "review"
+speakers = ["reviewer"]
+prompt = "review it"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        assert_eq!(wf.steps[0].roles(), vec!["reviewer"]);
+        assert_eq!(wf.steps[0].task_text(), "review it");
     }
 }

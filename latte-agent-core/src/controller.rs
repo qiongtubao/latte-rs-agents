@@ -2133,11 +2133,13 @@ async fn register_workflow_tool(
                 wf_id: wf_id.clone(),
             });
 
-            // One runner per speaker role, persistent across steps so
-            // each role sees the preceding discussion in its context.
+            // One runner per scheduled role; advisor is an internal monitor only.
             let mut runners: std::collections::HashMap<String, AgentRunner> =
                 std::collections::HashMap::new();
             for role_id in wf.speaker_roles() {
+                if role_id == "advisor" {
+                    return Err(tool_err("advisor is monitor-only; use reviewer for workflow tasks".into()));
+                }
                 let template = merged
                     .roles
                     .get(&role_id)
@@ -2147,17 +2149,11 @@ async fn register_workflow_tool(
                     .resolve(&default_params)
                     .await
                     .map_err(|e| tool_err(format!("resolve role '{role_id}': {e}")))?;
-                let tier = role.default_model_tier;
                 let models = resolver
-                    .resolve_chain(&role.id, tier, &role.model_chain)
+                    .resolve_chain(&role.id, role.default_model_tier, &role.model_chain)
                     .map_err(|e| tool_err(format!("no model for role '{role_id}': {e}")))?;
-                let agent = Agent::new_with_chain(
-                    role_id.clone(),
-                    role.clone(),
-                    models,
-                    default_params.clone(),
-                )
-                .map_err(|e| tool_err(format!("create agent '{role_id}': {e}")))?;
+                let agent = Agent::new_with_chain(role_id.clone(), role.clone(), models, default_params.clone())
+                    .map_err(|e| tool_err(format!("create agent '{role_id}': {e}")))?;
                 let runner = if role.allowed_tools.is_empty() {
                     AgentRunner::new(agent)
                 } else {
@@ -2166,10 +2162,7 @@ async fn register_workflow_tool(
                         .map_err(|e| tool_err(format!("tools for '{role_id}': {e}")))?;
                     AgentRunner::new_with_tools(agent, rtm, 0)
                 };
-                runners.insert(
-                    role_id.clone(),
-                    runner.with_role(role_id).with_cwd(cwd.clone()),
-                );
+                runners.insert(role_id.clone(), runner.with_role(role_id).with_cwd(cwd.clone()));
             }
 
             let mut vars: std::collections::HashMap<String, String> =
@@ -2194,12 +2187,17 @@ async fn register_workflow_tool(
                         total,
                     });
                     let mut step_transcript = String::new();
-                    for speaker in &step.speakers {
+                    for speaker in step.roles() {
+                        if speaker == "advisor" {
+                            status = "failed";
+                            error_msg = "advisor is monitor-only; use reviewer".into();
+                            break 'rounds;
+                        }
                         if cancel_flag.load(Ordering::SeqCst) {
                             status = "cancelled";
                             break 'rounds;
                         }
-                        let runner = match runners.get_mut(speaker) {
+                        let runner = match runners.get_mut(&speaker) {
                             Some(r) => r,
                             None => {
                                 status = "failed";
@@ -2210,15 +2208,13 @@ async fn register_workflow_tool(
                         let mut step_vars = vars.clone();
                         step_vars.insert("step_id".into(), step.id.clone());
                         step_vars.insert("speaker".into(), speaker.clone());
-                        let base_prompt = wf.render_prompt(step, &step_vars);
+                        let base_prompt = wf.render_task(step, &step_vars);
                         let prompt = if step_transcript.is_empty() {
                             base_prompt
                         } else {
-                            format!(
-                                "{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}"
-                            )
+                            format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
                         };
-                        match runner
+match runner
                             .run_turn(
                                 &[Message::user(prompt)],
                                 None,
@@ -2233,14 +2229,12 @@ async fn register_workflow_tool(
                                     content: response.clone(),
                                     round,
                                 });
-                                step_transcript
-                                    .push_str(&format!("[{speaker}]: {response}\n"));
+                                step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
                                 last_output = response;
                             }
                             Err(e) => {
                                 status = "failed";
-                                error_msg =
-                                    format!("step '{}' speaker '{}': {e}", step.id, speaker);
+                                error_msg = format!("step '{}' speaker '{}': {e}", step.id, speaker);
                                 break 'rounds;
                             }
                         }

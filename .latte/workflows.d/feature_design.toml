@@ -1,6 +1,6 @@
 # Workflow: feature_design — 设计功能/方案讨论
 name = "feature_design"
-description = "功能设计流水线：PM 需求 → 架构师方案 → Advisor 终审"
+description = "功能设计流水线：PM 需求 → 架构师方案 → Reviewer 终审"
 max_rounds = 1
 
 [[steps]]
@@ -18,6 +18,6 @@ prompt = "基于上面的需求，为「{{topic}}」给出技术方案：模块�
 
 [[steps]]
 id = "advisor_verdict"
-description = "Advisor 终审方案"
-speakers = ["advisor"]
+description = "Reviewer 终审方案"
+speakers = ["reviewer"]
 prompt = "你现在是终审顾问。通读上面的需求与方案，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
