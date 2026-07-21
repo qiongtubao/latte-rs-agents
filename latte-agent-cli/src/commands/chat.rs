@@ -213,10 +213,15 @@ impl ChatCmd {
             log.error("config load failed", &[("error", e.to_string())]);
             format!("failed to load configuration: {}", e)
         })?;
+        // Emit the "config loaded" block BEFORE moving the fields
+        // out of `resolved`. The block lists every file the loader
+        // touched, then the per-role / per-model reverse map so the
+        // operator can see "this role came from this file" without
+        // digging through the agent TOML.
+        emit_config_loaded(&log, &resolved.sources);
         let merged = resolved.config;
         let resolver = resolved.resolver;
         let default_params = GenerateParams::default();
-
         let initial_role = self.role.clone().unwrap_or_else(|| "manager".into());
         // Tier resolution: explicit --tier flag wins, otherwise the
         // role's `model_tier` from its TOML config. This is the
@@ -1451,6 +1456,97 @@ fn truncate(s: &str, max: usize) -> String {
     out.push_str(&(s.len() - end).to_string());
     out.push_str("B]");
     out
+}
+
+/// Emit the "config loaded" block to the chat log. The block has:
+///
+/// - a one-line header with summary counts (so `grep`/`rg` on the
+///   log file can land on the right event without parsing the body)
+/// - the project + global file paths that the loader actually
+///   consulted, with `(none)` markers when a layer is empty
+/// - the per-role reverse map (`role_id <- file`)
+/// - the per-model reverse map (`model_id <- file`)
+///
+/// Duplicate entries (project overrides global) are kept in load
+/// order — the **first** entry per id is the effective source.
+/// This matches `config_layer::ResolvedSources` semantics, so
+/// "what would the loader actually use" can be derived by taking
+/// the head of each list.
+fn emit_config_loaded(log: &super::chatlog::ChatLog, sources: &config_layer::ResolvedSources) {
+    let mut body: Vec<String> = Vec::new();
+
+    body.push(format!(
+        "project_agents = {}",
+        sources
+            .project_agents
+            .as_deref()
+            .unwrap_or("(none)")
+    ));
+    body.push(format!(
+        "project_models = {}",
+        sources
+            .project_models
+            .as_deref()
+            .unwrap_or("(none)")
+    ));
+    body.push(format!(
+        "global[{}]",
+        sources.global.len()
+    ));
+    if sources.global.is_empty() {
+        body.push("  (none found; checked ~/.latte/models.{yaml,yml,toml} and ~/.latte/models.d/)".into());
+    } else {
+        for src in &sources.global {
+            body.push(format!("  {src}"));
+        }
+    }
+
+    if !sources.cli_overrides.is_empty() {
+        body.push(format!("cli_overrides[{}]", sources.cli_overrides.len()));
+        for ov in &sources.cli_overrides {
+            body.push(format!("  {ov}"));
+        }
+    }
+
+    body.push(format!(
+        "roles[{}] -> file",
+        sources.role_files.len()
+    ));
+    if sources.role_files.is_empty() {
+        body.push("  (no role declared in any scanned file; using built-in defaults)".into());
+    } else {
+        for (id, files) in &sources.role_files {
+            body.push(format!("  {id} <- {}", files.join(", ")));
+        }
+    }
+
+    body.push(format!(
+        "models[{}] -> file",
+        sources.model_files.len()
+    ));
+    if sources.model_files.is_empty() {
+        body.push("  (no model id extracted from any scanned file; YAML global models listed above)".into());
+    } else {
+        for (id, files) in &sources.model_files {
+            body.push(format!("  {id} <- {}", files.join(", ")));
+        }
+    }
+
+    let header = [
+        (
+            "roles",
+            sources.role_files.len().to_string(),
+        ),
+        (
+            "models",
+            sources.model_files.len().to_string(),
+        ),
+        (
+            "global",
+            sources.global.len().to_string(),
+        ),
+    ];
+    log.block("info", "config loaded", &header, &body);
 }
 fn parse_tier(s: &str) -> AnyResult<ModelTier> {
     ModelTier::parse(s).map_err(|e| -> Box<dyn std::error::Error> { e.into() })

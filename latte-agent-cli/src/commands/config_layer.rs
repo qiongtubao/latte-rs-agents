@@ -60,13 +60,23 @@ impl CliOverrides {
     }
 }
 
-/// Locations that contributed to the merged config (for `config show`).
+/// Locations that contributed to the merged config (for `config show`
+/// and for the chat log's "config loaded" block).
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSources {
     pub global: Vec<String>,
     pub project_models: Option<String>,
     pub project_agents: Option<String>,
     pub cli_overrides: Vec<String>,
+    /// Reverse map: `role_id -> [file, ...]`. Every file that declared
+    /// the role under `[roles.<id>]` is recorded in load order, so the
+    /// operator can see where a given role came from — useful when a
+    /// project overrides a global role.
+    pub role_files: std::collections::BTreeMap<String, Vec<String>>,
+    /// Reverse map: `model_id -> [file, ...]`. Same semantics as
+    /// `role_files` but for the model catalog (`[models]`,
+    /// `[[models.models]]`, or router-style top-level `models:` list).
+    pub model_files: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Final, fully-merged configuration along with the resolver and the
@@ -133,76 +143,100 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
     DiscussionConfig::default()
 }
 
-pub fn load(
-    project_agents: Option<&str>,
-    project_models: Option<&str>,
-    cli: CliOverrides,
-) -> AgentResult<Resolved> {
-    // Layer 3 (lowest): global ~/.latte/models.{yaml,toml} + ~/.latte/models.d/
-    let global = GlobalConfig::load_default()?;
-    let mut sources = ResolvedSources {
-        global: GlobalConfig::default_candidates()
-            .into_iter()
-            .filter(|p| p.exists())
-            .map(|p| p.display().to_string())
-            .collect(),
-        ..Default::default()
-    };
+ pub fn load(
+     project_agents: Option<&str>,
+     project_models: Option<&str>,
+     cli: CliOverrides,
+ ) -> AgentResult<Resolved> {
+     // Layer 3 (lowest): global ~/.latte/models.{yaml,toml} + ~/.latte/models.d/
+     let global = GlobalConfig::load_default()?;
+     let mut sources = ResolvedSources {
+         global: GlobalConfig::default_candidates()
+             .into_iter()
+             .filter(|p| p.exists())
+             .map(|p| p.display().to_string())
+             .collect(),
+         ..Default::default()
+     };
+     if let Some(dir) = GlobalConfig::global_dir() {
+         let d = dir.join("models.d");
+         if d.is_dir() {
+             if let Ok(read) = std::fs::read_dir(&d) {
+                 for entry in read.flatten() {
+                     let p = entry.path();
+                     if p.is_file() {
+                         sources.global.push(p.display().to_string());
+                     }
+                 }
+             }
+         }
+     }
+    // Per-file reverse map: every agent file under project/global
+    // agents.d → list of role ids declared. Populated by
+    // `scan_role_files_in_dir` below. Project wins over global, but
+    // both are recorded so the operator can see "this role was
+    // overridden in the project" at a glance.
+    if let Some(agents) = project_agents {
+        if std::fs::metadata(agents).is_ok() {
+            scan_role_files_in_dir(std::path::Path::new(agents), &mut sources.role_files);
+        }
+    }
     if let Some(dir) = GlobalConfig::global_dir() {
-        let d = dir.join("models.d");
+        let d = dir.join("agents.d");
         if d.is_dir() {
-            if let Ok(read) = std::fs::read_dir(&d) {
-                for entry in read.flatten() {
-                    let p = entry.path();
-                    if p.is_file() {
-                        sources.global.push(p.display().to_string());
-                    }
-                }
+            scan_role_files_in_dir(&d, &mut sources.role_files);
+        }
+    }
+     // Layer 2: project (agents + models) merged with the global
+     // `~/.latte/agents.d/` directory via `load_with_global` (project-wins
+     // per role / model id; global fills in anything the project did not
+     // declare). A missing project path is silently skipped so a bare
+     // `~/.latte/agents.d` setup can drive the system end-to-end.
+     //
+     // Check if the project agents path exists first; if not, pass None
+     // so load_with_global cleanly falls back to global + built-in roles
+     // without producing a misleading error in the log.
+     let agents_path_exists = project_agents
+         .map(|p| std::fs::metadata(p).is_ok())
+         .unwrap_or(false);
+     let active_agents = if agents_path_exists { project_agents } else { None };
+     let mut project_cfg = AgentConfig::load_with_global(active_agents)?;
+     if let Some(path) = project_agents {
+         if agents_path_exists {
+             sources.project_agents = Some(path.to_string());
+         }
+     }
+     // Models: project wins, but the global `models.{yaml,toml}` /
+     // `models.d/*.yaml` is still merged on top below. We do NOT call
+     // `load_with_global` for models here because the global *models*
+     // layer is merged in a separate step (`global.merge_into_project`)
+     // that already implements id-based field-filling semantics.
+     if let Some(path) = project_models {
+         if std::fs::metadata(path).is_ok() {
+             let part = AgentConfig::load(path)?;
+             merge_into(&mut project_cfg, &part);
+             sources.project_models = Some(path.to_string());
+            // Track per-model origin for the model file the user
+            // pointed at. When the path is a directory (default
+            // `.latte/models.d`), we walk the dir below; when it's
+            // a single file, we just scan that file.
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                scan_model_files_in_dir(p, &mut sources.model_files);
+            } else if p.is_file() {
+                scan_model_file(p, &mut sources.model_files);
             }
+         }
+     }
+    // Global models: same scan for the layered global locations
+    // already enumerated into `sources.global`. We re-walk the
+    // directory tree (cheap; just metadata) so the YAML files
+    // contribute model ids too.
+    for src in &sources.global {
+        let p = std::path::Path::new(src);
+        if p.is_file() {
+            scan_model_file(p, &mut sources.model_files);
         }
-    }
-    // Layer 2: project (agents + models) merged with the global
-    // `~/.latte/agents.d/` directory via `load_with_global` (project-wins
-    // per role / model id; global fills in anything the project did not
-    // declare). A missing project path is silently skipped so a bare
-    // `~/.latte/agents.d` setup can drive the system end-to-end.
-    //
-    // Check if the project agents path exists first; if not, pass None
-    // so load_with_global cleanly falls back to global + built-in roles
-    // without producing a misleading error in the log.
-    let agents_path_exists = project_agents
-        .map(|p| std::fs::metadata(p).is_ok())
-        .unwrap_or(false);
-    let active_agents = if agents_path_exists { project_agents } else { None };
-    let mut project_cfg = AgentConfig::load_with_global(active_agents)?;
-    if let Some(path) = project_agents {
-        if agents_path_exists {
-            sources.project_agents = Some(path.to_string());
-        }
-    }
-    // Models: project wins, but the global `models.{yaml,toml}` /
-    // `models.d/*.yaml` is still merged on top below. We do NOT call
-    // `load_with_global` for models here because the global *models*
-    // layer is merged in a separate step (`global.merge_into_project`)
-    // that already implements id-based field-filling semantics.
-    if let Some(path) = project_models {
-        if std::fs::metadata(path).is_ok() {
-            let part = AgentConfig::load(path)?;
-            merge_into(&mut project_cfg, &part);
-            sources.project_models = Some(path.to_string());
-        }
-    }
-
-    // Layer 1 (highest): CLI overrides.
-    let all_ids: Vec<String> = project_cfg.models.models.iter().map(|m| m.id.clone()).collect();
-    let flat_overrides = cli.into_field_overrides(&all_ids);
-    if !flat_overrides.is_empty() {
-        for (id, field, value) in &flat_overrides {
-            sources
-                .cli_overrides
-                .push(format!("{id}.{field}={}", redact(value)));
-        }
-        GlobalConfig::apply_field_overrides(&mut project_cfg.models, &flat_overrides)?;
     }
 
     // Compute the set of model ids that the global config contributed
@@ -277,6 +311,141 @@ fn merge_into(dst: &mut AgentConfig, src: &AgentConfig) {
     }
 }
 
+
+/// Walk an agents directory and record every role id found in each
+/// `.toml` file into the `role_files` reverse map. Files are scanned
+/// in sorted order so the recorded list is deterministic across
+/// runs; project entries are scanned before global ones by the
+/// caller, so the **first** entry per role id is the effective
+/// source (later entries still recorded for audit, not stripped).
+///
+/// Note: only TOML is scanned. The chat log already lists every
+/// contributing file under `sources.global` / `sources.project_agents`,
+/// so a missing per-file reverse map for an unrecognised format
+/// (e.g. a future YAML agent file) is still visible — the operator
+/// can correlate by hand.
+fn scan_role_files_in_dir(
+    dir: &std::path::Path,
+    role_files: &mut std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension().and_then(|s| s.to_str()) == Some("toml")
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        scan_role_file(&path, role_files);
+    }
+}
+
+fn scan_role_file(
+    path: &std::path::Path,
+    role_files: &mut std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return;
+    };
+    let Some(roles) = value.get("roles").and_then(|v| v.as_table()) else {
+        return;
+    };
+    let path_str = path.display().to_string();
+    for (id, _) in roles {
+        role_files.entry(id.clone()).or_default().push(path_str.clone());
+    }
+}
+
+/// Walk a models directory and record every model id found in each
+/// TOML / YAML file into the `model_files` reverse map. YAML files
+/// in the global layer (`~/.latte/models.d/*.yaml`) are listed in
+/// `sources.global` but the per-model id extraction is skipped
+/// there (YAML parsing lives in `latte-agent-core`, and duplicating
+/// `serde_yaml` in the CLI just for log cosmetics is not worth it).
+fn scan_model_files_in_dir(
+    dir: &std::path::Path,
+    model_files: &mut std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && matches!(
+                    p.extension().and_then(|s| s.to_str()),
+                    Some("toml") | Some("yaml") | Some("yml")
+                )
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        scan_model_file(&path, model_files);
+    }
+}
+
+/// Scan a single model file. TOML files: extract `[[models.models]]`
+/// array entries (project-style) AND top-level `models` array
+/// (router-style). YAML/other: no-op (YAML scan skipped, see
+/// `scan_model_files_in_dir`).
+fn scan_model_file(
+    path: &std::path::Path,
+    model_files: &mut std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if ext != "toml" {
+        return;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(value) = content.parse::<toml::Value>() else {
+        return;
+    };
+    let path_str = path.display().to_string();
+
+    // Project-style: `[[models.models]]` array.
+    if let Some(models) = value
+        .get("models")
+        .and_then(|m| m.get("models"))
+        .and_then(|v| v.as_array())
+    {
+        for entry in models {
+            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                model_files
+                    .entry(id.to_string())
+                    .or_default()
+                    .push(path_str.clone());
+            }
+        }
+    }
+
+    // Router-style: top-level `[[models]]` array (also accepted by
+    // GlobalConfig::parse_toml for the global layer).
+    if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
+        for entry in models {
+            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+                model_files
+                    .entry(id.to_string())
+                    .or_default()
+                    .push(path_str.clone());
+            }
+        }
+    }
+}
 /// Redact a value that looks like a secret: keep the first 4 and last 2
 /// characters, replace the middle with `***`. Short values become `***`.
 fn redact(s: &str) -> String {

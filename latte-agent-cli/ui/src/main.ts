@@ -176,11 +176,12 @@ async function main(): Promise<void> {
       nameInput: $("role-editor-name") as HTMLInputElement,
       iconInput: $("role-editor-icon") as HTMLInputElement,
       tierSelect: $("role-editor-tier") as HTMLSelectElement,
-      chainInput: $("role-editor-chain") as HTMLInputElement,
+      chainEl: $("role-editor-chain"),
       temperatureInput: $("role-editor-temperature") as HTMLInputElement,
       toolsEl: $("role-editor-tools"),
       promptInput: $("role-editor-prompt") as HTMLTextAreaElement,
       statusEl: $("role-editor-status"),
+      pathsEl: $("role-editor-paths"),
     },
   });
   $("role-editor-btn").addEventListener("click", () => roleEditor.open());

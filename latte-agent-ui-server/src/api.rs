@@ -8,7 +8,7 @@
 //!
 //! 所有函数都操作 [`crate::UiBackend`]（一个工作区一个容器）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -304,7 +304,8 @@ pub struct RoleConfigEntry {
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub prompt_file: Option<String>,
-    /// 当前生效的 system prompt 文本（编辑器里直接改它）。
+    pub prompt_path: Option<String>,
+    pub config_path: String,
     pub prompt: String,
 }
 
@@ -313,6 +314,9 @@ pub struct RolesConfigResponse {
     pub roles: Vec<RoleConfigEntry>,
     pub available_tools: Vec<String>,
     pub tiers: Vec<String>,
+    pub workspace_path: String,
+    pub agents_config_path: String,
+    pub sessions_path: String,
 }
 
 /// 读取角色当前 prompt：优先 `prompt_file`（相对 backend cwd），读不到
@@ -321,9 +325,9 @@ fn read_role_prompt(
     cwd: &std::path::Path,
     tpl: &latte_agent_core::role::RoleTemplate,
 ) -> String {
-    if let Some(f) = &tpl.prompt_file {
-        if let Ok(s) = std::fs::read_to_string(cwd.join(f)) {
-            return s;
+    if let Some(file) = &tpl.prompt_file {
+        if let Ok(content) = std::fs::read_to_string(cwd.join(file)) {
+            return content;
         }
     }
     latte_agent_core::prompts::for_role(&tpl.id)
@@ -333,8 +337,11 @@ fn read_role_prompt(
 
 fn role_config_entry(
     cwd: &std::path::Path,
+    agents_dir: &std::path::Path,
     tpl: &latte_agent_core::role::RoleTemplate,
 ) -> RoleConfigEntry {
+    let config_path = agents_dir.join(format!("{}.toml", tpl.id));
+    let prompt_path = tpl.prompt_file.as_ref().map(|file| cwd.join(file).display().to_string());
     RoleConfigEntry {
         id: tpl.id.clone(),
         name: tpl.name.clone(),
@@ -346,6 +353,8 @@ fn role_config_entry(
         tools: tpl.tools.clone(),
         skills: tpl.skills.clone(),
         prompt_file: tpl.prompt_file.clone(),
+        prompt_path,
+        config_path: config_path.display().to_string(),
         prompt: read_role_prompt(cwd, tpl),
     }
 }
@@ -372,13 +381,14 @@ async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
 }
 
 pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiError> {
+    let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
     let roles = {
         let cfg = b.merged.read();
         let mut ids: Vec<&String> = cfg.roles.keys().collect();
         ids.sort();
         ids.into_iter()
             .filter_map(|id| cfg.roles.get(id))
-            .map(|tpl| role_config_entry(&b.cwd, tpl))
+            .map(|tpl| role_config_entry(&b.cwd, &agents_dir, tpl))
             .collect()
     };
     let available_tools = enumerate_available_tools().await?;
@@ -386,6 +396,9 @@ pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiE
         roles,
         available_tools,
         tiers: vec!["premium".into(), "standard".into(), "budget".into()],
+        workspace_path: b.cwd.display().to_string(),
+        agents_config_path: agents_dir.display().to_string(),
+        sessions_path: crate::sessions::SessionPersist::dir_for(&b.cwd).display().to_string(),
     })
 }
 
@@ -406,19 +419,14 @@ pub struct SaveRoleConfigRequest {
     #[serde(default)]
     pub prompt: String,
 }
-
-/// 由 agents 配置路径（文件或目录）定位角色 TOML 所在目录；
-/// 指向文件时取其父目录，空值兜底 `.latte/agents.d`。
-fn agents_config_dir(agents_config: &str) -> PathBuf {
-    let p = PathBuf::from(agents_config);
+fn agents_config_dir(cwd: &std::path::Path, agents_config: &str) -> PathBuf {
+    let raw = PathBuf::from(agents_config);
+    let p = if raw.is_absolute() { raw } else { cwd.join(raw) };
     if p.is_file() {
-        return p
-            .parent()
-            .map(|d| d.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".latte/agents.d"));
+        return p.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.join(".latte/agents.d"));
     }
     if agents_config.trim().is_empty() {
-        return PathBuf::from(".latte/agents.d");
+        return cwd.join(".latte/agents.d");
     }
     p
 }
@@ -501,7 +509,7 @@ pub fn save_role_config(
     let tpl = tpl.ok_or_else(|| ApiError::not_found(format!("role {:?} not found", req.id)))?;
 
     // 1. 重写 .latte/agents.d/<id>.toml。
-    let dir = agents_config_dir(&b.agents_config);
+    let dir = agents_config_dir(&b.cwd, &b.agents_config);
     std::fs::create_dir_all(&dir)
         .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
     let path = dir.join(format!("{}.toml", req.id));
@@ -533,7 +541,7 @@ pub fn save_role_config(
                 t.model_chain = req.model_chain.clone();
                 t.temperature = req.temperature;
                 t.tools = req.tools.clone();
-                role_config_entry(&b.cwd, t)
+                role_config_entry(&b.cwd, &agents_config_dir(&b.cwd, &b.agents_config), t)
             }
             None => {
                 return Err(ApiError::not_found(format!("role {:?} not found", req.id)))

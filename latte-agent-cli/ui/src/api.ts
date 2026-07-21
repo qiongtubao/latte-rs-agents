@@ -74,7 +74,8 @@ export interface RoleConfigEntry {
   tools: string[];
   skills: string[];
   prompt_file: string | null;
-  /** 当前生效的 system prompt 文本。 */
+  prompt_path: string | null;
+  config_path: string;
   prompt: string;
 }
 
@@ -82,9 +83,12 @@ export interface RolesConfig {
   roles: RoleConfigEntry[];
   available_tools: string[];
   tiers: string[];
+  workspace_path: string;
+  agents_config_path: string;
+  sessions_path: string;
 }
 
-/** `POST /api/roles/config` 请求体（category/prompt_file/skills 不可改）。 */
+/** `POST /api/roles/config` 请求体。 */
 export interface RoleConfigSave {
   id: string;
   name: string;
@@ -95,6 +99,7 @@ export interface RoleConfigSave {
   tools: string[];
   prompt: string;
 }
+
 
 export async function getRolesConfig(): Promise<RolesConfig> {
   return getTransport().request("GET", "/api/roles/config");

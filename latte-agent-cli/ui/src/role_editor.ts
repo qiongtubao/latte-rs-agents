@@ -1,16 +1,6 @@
-// 角色编辑器面板 —— fetch /api/roles/config 渲染表单，保存时 POST
-// 回后端（重写 .latte/agents.d/<id>.toml + prompt 文件）。打开方式：
-// 顶栏「⚙️ Roles」按钮，或在聊天消息的角色头像上右键（chat_impl.ts
-// 的 onEditRole 回调）。
-
-import {
-  getRolesConfig,
-  saveRoleConfig,
-} from "./api";
-import type {
-  RoleConfigEntry,
-  RolesConfig,
-} from "./api";
+// 角色编辑器面板 —— fetch /api/roles/config 渲染表单，保存时 POST。
+import { getRolesConfig, saveRoleConfig } from "./api";
+import type { RoleConfigEntry, RolesConfig } from "./api";
 
 interface UIBinding {
   panelEl: HTMLElement;
@@ -21,53 +11,115 @@ interface UIBinding {
   nameInput: HTMLInputElement;
   iconInput: HTMLInputElement;
   tierSelect: HTMLSelectElement;
-  chainInput: HTMLInputElement;
+  chainEl: HTMLElement;
   temperatureInput: HTMLInputElement;
   toolsEl: HTMLElement;
   promptInput: HTMLTextAreaElement;
   statusEl: HTMLElement;
+  pathsEl: HTMLElement;
 }
 
 export interface RoleEditorController {
   isOpen(): boolean;
-  /** 打开面板；带 roleId 时直接跳到该角色。 */
   open(roleId?: string): void;
 }
 
-export function mountRoleEditor(opts: {
-  container: UIBinding;
-}): RoleEditorController {
+export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorController {
   const { container } = opts;
   let config: RolesConfig | null = null;
   let isLoading = false;
   let isSaving = false;
 
-  container.closeBtn.addEventListener("click", () => {
-    container.panelEl.classList.add("hidden");
-  });
-  container.refreshBtn.addEventListener("click", () => {
-    void refresh(currentRoleId());
-  });
-  container.roleSelect.addEventListener("change", () => {
-    fillForm(currentRoleId());
-  });
-  container.formEl.addEventListener("submit", (e) => {
-    e.preventDefault();
+  container.closeBtn.addEventListener("click", () => container.panelEl.classList.add("hidden"));
+  container.refreshBtn.addEventListener("click", () => void refresh(container.roleSelect.value));
+  container.roleSelect.addEventListener("change", () => fillForm(container.roleSelect.value));
+  container.formEl.addEventListener("submit", (event) => {
+    event.preventDefault();
     void save();
   });
 
-  function currentRoleId(): string {
-    return container.roleSelect.value;
+  const setStatus = (message: string, error = false) => {
+    container.statusEl.textContent = message;
+    container.statusEl.classList.toggle("error", error);
+  };
+
+  const chainValues = () => Array.from(container.chainEl.querySelectorAll<HTMLInputElement>("input"))
+    .map((input) => input.value.trim())
+    .filter(Boolean);
+
+  function renderChain(models: string[]): void {
+    container.chainEl.replaceChildren();
+    const values = models.length ? models : [""];
+    values.forEach((model, index) => {
+      const row = document.createElement("div");
+      row.className = "role-editor-chain-row";
+      const order = document.createElement("span");
+      order.className = "role-editor-chain-order";
+      order.textContent = `${index + 1}.`;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = model;
+      input.placeholder = "model-id";
+      const button = (label: string, title: string, action: () => void) => {
+        const el = document.createElement("button");
+        el.type = "button";
+        el.textContent = label;
+        el.title = title;
+        el.addEventListener("click", action);
+        return el;
+      };
+      row.append(
+        order,
+        input,
+        button("↑", "提高优先级", () => {
+          const next = chainValues();
+          if (index > 0) [next[index - 1], next[index]] = [next[index], next[index - 1]];
+          renderChain(next);
+        }),
+        button("↓", "降低优先级", () => {
+          const next = chainValues();
+          if (index < next.length - 1) [next[index], next[index + 1]] = [next[index + 1], next[index]];
+          renderChain(next);
+        }),
+        button("×", "删除模型", () => {
+          const next = chainValues();
+          next.splice(index, 1);
+          renderChain(next);
+        }),
+      );
+      container.chainEl.appendChild(row);
+    });
+    const add = document.createElement("button");
+    add.type = "button";
+    add.className = "role-editor-chain-add";
+    add.textContent = "+ 添加模型";
+    add.addEventListener("click", () => renderChain([...chainValues(), ""]));
+    container.chainEl.appendChild(add);
   }
 
-  function currentEntry(): RoleConfigEntry | null {
-    if (!config) return null;
-    return config.roles.find((r) => r.id === currentRoleId()) ?? null;
-  }
-
-  function setStatus(msg: string, isError = false): void {
-    container.statusEl.textContent = msg;
-    container.statusEl.classList.toggle("error", isError);
+  function fillForm(roleId: string): void {
+    const entry = config?.roles.find((role) => role.id === roleId);
+    if (!entry) return;
+    container.nameInput.value = entry.name;
+    container.iconInput.value = entry.icon;
+    container.tierSelect.value = entry.model_tier;
+    renderChain(entry.model_chain);
+    container.temperatureInput.value = entry.temperature === null ? "" : String(entry.temperature);
+    container.promptInput.value = entry.prompt;
+    container.pathsEl.textContent = `配置文件：${entry.config_path}${entry.prompt_path ? ` · Prompt：${entry.prompt_path}` : ""}`;
+    container.toolsEl.replaceChildren();
+    const selected = new Set(entry.tools);
+    for (const name of config?.available_tools ?? []) {
+      const label = document.createElement("label");
+      label.className = "role-editor-tool";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = name;
+      checkbox.checked = selected.has(name);
+      label.append(checkbox, document.createTextNode(name));
+      container.toolsEl.appendChild(label);
+    }
+    setStatus("");
   }
 
   async function refresh(preferRoleId?: string): Promise<void> {
@@ -76,114 +128,58 @@ export function mountRoleEditor(opts: {
     setStatus("加载中…");
     try {
       config = await getRolesConfig();
-      renderRoleSelect(preferRoleId);
-      renderTierSelect();
-      fillForm(currentRoleId());
-      setStatus("");
-    } catch (e) {
-      setStatus(`加载失败: ${(e as Error).message}`, true);
+      container.roleSelect.replaceChildren();
+      for (const role of config.roles) {
+        const option = document.createElement("option");
+        option.value = role.id;
+        option.textContent = `${role.icon} ${role.id} — ${role.name}`;
+        container.roleSelect.appendChild(option);
+      }
+      if (preferRoleId && config.roles.some((role) => role.id === preferRoleId)) {
+        container.roleSelect.value = preferRoleId;
+      }
+      container.tierSelect.replaceChildren();
+      for (const tier of config.tiers) {
+        const option = document.createElement("option");
+        option.value = tier;
+        option.textContent = tier;
+        container.tierSelect.appendChild(option);
+      }
+      fillForm(container.roleSelect.value);
+    } catch (error) {
+      setStatus(`加载失败: ${(error as Error).message}`, true);
     } finally {
       isLoading = false;
     }
   }
 
-  function renderRoleSelect(preferRoleId?: string): void {
-    container.roleSelect.innerHTML = "";
-    for (const r of config?.roles ?? []) {
-      const opt = document.createElement("option");
-      opt.value = r.id;
-      opt.textContent = `${r.icon} ${r.id} — ${r.name}`;
-      container.roleSelect.appendChild(opt);
-    }
-    if (
-      preferRoleId &&
-      config?.roles.some((r) => r.id === preferRoleId)
-    ) {
-      container.roleSelect.value = preferRoleId;
-    }
-  }
-
-  function renderTierSelect(): void {
-    container.tierSelect.innerHTML = "";
-    for (const t of config?.tiers ?? []) {
-      const opt = document.createElement("option");
-      opt.value = t;
-      opt.textContent = t;
-      container.tierSelect.appendChild(opt);
-    }
-  }
-
-  function fillForm(roleId: string): void {
-    const entry = config?.roles.find((r) => r.id === roleId);
-    if (!entry) return;
-    container.nameInput.value = entry.name;
-    container.iconInput.value = entry.icon;
-    container.tierSelect.value = entry.model_tier;
-    container.chainInput.value = entry.model_chain.join(", ");
-    container.temperatureInput.value =
-      entry.temperature === null ? "" : String(entry.temperature);
-    container.promptInput.value = entry.prompt;
-    renderTools(entry);
-    setStatus("");
-  }
-
-  function renderTools(entry: RoleConfigEntry): void {
-    container.toolsEl.innerHTML = "";
-    const selected = new Set(entry.tools);
-    for (const name of config?.available_tools ?? []) {
-      const label = document.createElement("label");
-      label.className = "role-editor-tool";
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.value = name;
-      cb.checked = selected.has(name);
-      label.appendChild(cb);
-      label.appendChild(document.createTextNode(name));
-      container.toolsEl.appendChild(label);
-    }
-  }
-
-  function checkedTools(): string[] {
-    const out: string[] = [];
-    for (const cb of container.toolsEl.querySelectorAll(
-      'input[type="checkbox"]',
-    )) {
-      const input = cb as HTMLInputElement;
-      if (input.checked) out.push(input.value);
-    }
-    return out;
-  }
-
   async function save(): Promise<void> {
-    const entry = currentEntry();
+    const entry = config?.roles.find((role) => role.id === container.roleSelect.value);
     if (!entry || isSaving) return;
     isSaving = true;
     setStatus("保存中…");
     try {
-      const temperature = container.temperatureInput.value.trim();
+      const rawTemperature = container.temperatureInput.value.trim();
       const updated = await saveRoleConfig({
         id: entry.id,
         name: container.nameInput.value.trim(),
         icon: container.iconInput.value.trim(),
         model_tier: container.tierSelect.value,
-        model_chain: container.chainInput.value
-          .split(",")
-          .map((s) => s.trim())
-          .filter((s) => s.length > 0),
-        temperature: temperature === "" ? null : Number(temperature),
-        tools: checkedTools(),
+        model_chain: chainValues(),
+        temperature: rawTemperature === "" ? null : Number(rawTemperature),
+        tools: Array.from(container.toolsEl.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'))
+          .filter((input) => input.checked)
+          .map((input) => input.value),
         prompt: container.promptInput.value,
       });
-      // 更新本地缓存，保持 select 里显示的名称同步。
       if (config) {
-        const idx = config.roles.findIndex((r) => r.id === updated.id);
-        if (idx >= 0) config.roles[idx] = updated;
+        const index = config.roles.findIndex((role) => role.id === updated.id);
+        if (index >= 0) config.roles[index] = updated;
       }
-      renderRoleSelect(updated.id);
       fillForm(updated.id);
-      setStatus("✅ 已保存（新 session 生效）");
-    } catch (e) {
-      setStatus(`保存失败: ${(e as Error).message}`, true);
+      setStatus("✅ 已保存到配置；新 session 生效");
+    } catch (error) {
+      setStatus(`保存失败: ${(error as Error).message}`, true);
     } finally {
       isSaving = false;
     }
