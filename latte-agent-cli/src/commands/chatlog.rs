@@ -93,6 +93,46 @@ impl ChatLog {
         self.event("error", msg, fields);
     }
 
+    /// Emit a multi-line log block. The first line is formatted like
+    /// `event()` (`[iso] [level] <msg> key=value ...`). Subsequent
+    /// lines are indented with `│ ` so a tail-friendly log viewer
+    /// can group them. Used for the "config loaded" reverse map —
+    /// role/model → file — so a single event carries the full
+    /// provenance instead of one noisy line per role.
+    ///
+    /// `header_fields` are appended to the first line as
+    /// `key=value` pairs (same quoting as `event`). `body_lines`
+    /// are emitted as-is — no quoting.
+    pub fn block(
+        &self,
+        level: &str,
+        msg: &str,
+        header_fields: &[(&str, String)],
+        body_lines: &[String],
+    ) {
+        let stamp = iso_utc();
+        let mut head = format!("[{}] [{}] {}", stamp, level, msg);
+        for (k, v) in header_fields {
+            let v_quoted = if v.contains(char::is_whitespace) {
+                format!("\"{}\"", v.replace('"', "\\\""))
+            } else {
+                v.clone()
+            };
+            head.push(' ');
+            head.push_str(k);
+            head.push('=');
+            head.push_str(&v_quoted);
+        }
+        head.push('\n');
+        let mut body = String::new();
+        for line in body_lines {
+            body.push_str("│ ");
+            body.push_str(line);
+            body.push('\n');
+        }
+        self.write(&format!("{head}{body}"));
+    }
+
     fn write(&self, line: &str) {
         if let Some(file) = &self.file {
             if let Ok(mut f) = file.lock() {
