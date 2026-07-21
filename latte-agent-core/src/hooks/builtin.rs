@@ -318,8 +318,8 @@ mod tests {
         let mut msgs = msgs_with("call me at 13812345678 today");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:phone>"), "got: {}", msgs[0].content);
-        assert!(!msgs[0].content.contains("13812345678"), "phone leaked: {}", msgs[0].content);
+        assert!(msgs[0].as_text().contains("<REDACTED:phone>"), "got: {}", msgs[0].as_text());
+        assert!(!msgs[0].as_text().contains("13812345678"), "phone leaked: {}", msgs[0].as_text());
     }
 
     #[test]
@@ -327,8 +327,8 @@ mod tests {
         let mut msgs = msgs_with("call +8613812345678 today");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:phone>"), "got: {}", msgs[0].content);
-        assert!(!msgs[0].content.contains("13812345678"), "phone leaked: {}", msgs[0].content);
+        assert!(msgs[0].as_text().contains("<REDACTED:phone>"), "got: {}", msgs[0].as_text());
+        assert!(!msgs[0].as_text().contains("13812345678"), "phone leaked: {}", msgs[0].as_text());
     }
 
     #[test]
@@ -336,8 +336,8 @@ mod tests {
         let mut msgs = msgs_with("ping alice@example.com about it");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:email>"), "got: {}", msgs[0].content);
-        assert!(!msgs[0].content.contains("alice@example.com"), "email leaked: {}", msgs[0].content);
+        assert!(msgs[0].as_text().contains("<REDACTED:email>"), "got: {}", msgs[0].as_text());
+        assert!(!msgs[0].as_text().contains("alice@example.com"), "email leaked: {}", msgs[0].as_text());
     }
 
     #[test]
@@ -345,8 +345,8 @@ mod tests {
         let mut msgs = msgs_with("AKIAIOSFODNN7EXAMPLE was the key");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:aws_key>"), "got: {}", msgs[0].content);
-        assert!(!msgs[0].content.contains("AKIAIOSFODNN7EXAMPLE"), "key leaked: {}", msgs[0].content);
+        assert!(msgs[0].as_text().contains("<REDACTED:aws_key>"), "got: {}", msgs[0].as_text());
+        assert!(!msgs[0].as_text().contains("AKIAIOSFODNN7EXAMPLE"), "key leaked: {}", msgs[0].as_text());
     }
 
     #[test]
@@ -354,8 +354,8 @@ mod tests {
         let mut msgs = msgs_with("use sk-abcdef1234567890abcdef1234567890abcdef for auth");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:api_key>"), "got: {}", msgs[0].content);
-        assert!(!msgs[0].content.contains("sk-abcdef"), "key leaked: {}", msgs[0].content);
+        assert!(msgs[0].as_text().contains("<REDACTED:api_key>"), "got: {}", msgs[0].as_text());
+        assert!(!msgs[0].as_text().contains("sk-abcdef"), "key leaked: {}", msgs[0].as_text());
     }
 
     #[test]
@@ -363,8 +363,8 @@ mod tests {
         let mut msgs = msgs_with("use sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890ABCD for auth");
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].content.contains("<REDACTED:api_key>"), "got: {}", msgs[0].content);
-        assert!(!msgs[0].content.contains("sk-ant-api03"), "ant key leaked: {}", msgs[0].content);
+        assert!(msgs[0].as_text().contains("<REDACTED:api_key>"), "got: {}", msgs[0].as_text());
+        assert!(!msgs[0].as_text().contains("sk-ant-api03"), "ant key leaked: {}", msgs[0].as_text());
     }
 
     #[test]
@@ -374,7 +374,7 @@ mod tests {
         );
         let mut ctx = PreCallCtx { messages: &mut msgs };
         let _ = RedactPii.pre_call(&mut ctx);
-        let s = &msgs[0].content;
+        let s = msgs[0].as_text();
         let count = s.matches("<REDACTED:").count();
         assert_eq!(count, 4, "expected 4 redactions (email, phone, aws, key) in: {}", s);
     }

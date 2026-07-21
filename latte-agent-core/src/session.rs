@@ -438,8 +438,8 @@ mod tests {
         assert_eq!(mgr.state(), SessionState::Resumed);
         assert!(mgr.record().paused_at.is_none());
         let history = mgr.role_history("programmer");
-        assert!(history.last().unwrap().content.contains("[HUMAN @"));
-        assert!(history.last().unwrap().content.contains("use serde"));
+        assert!(history.last().unwrap().as_text().contains("[HUMAN @"));
+        assert!(history.last().unwrap().as_text().contains("use serde"));
     }
 
     #[test]

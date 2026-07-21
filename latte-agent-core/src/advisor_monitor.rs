@@ -1134,6 +1134,7 @@ mod tests {
                     context_window: 32000,
                     max_tokens: 4096,
                     supports_thinking: false,
+                    supports_vision: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
                     tier: Some("premium".into()),

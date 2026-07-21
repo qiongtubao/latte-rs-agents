@@ -137,13 +137,20 @@ fn specialist_output_written_back_to_history() {
     let mut found_assistant = false;
     for role in roles {
         for msg in role["messages"].as_array().unwrap() {
-            if msg["role"].as_str() == Some("assistant") {
-                if let Some(content) = msg["content"].as_str() {
-                    if !content.is_empty() {
-                        found_assistant = true;
-                        break;
-                    }
-                }
+            if msg["role"].as_str() != Some("assistant") {
+                continue;
+            }
+            // Content is Vec<ContentPart> after the multimodal Message
+            // refactor; a message counts as non-empty when at least one
+            // text part carries any bytes.
+            let has_text = msg["content"].as_array().map_or(false, |parts| {
+                parts.iter().any(|p| {
+                    p.get("text").and_then(|t| t.as_str()).map_or(false, |s| !s.is_empty())
+                })
+            });
+            if has_text {
+                found_assistant = true;
+                break;
             }
         }
         if found_assistant { break; }

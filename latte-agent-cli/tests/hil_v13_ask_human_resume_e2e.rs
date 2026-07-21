@@ -270,11 +270,21 @@ async fn ask_human_full_pause_resume_done_cycle() {
         .find(|r| r["role_id"].as_str() == Some("programmer"))
         .expect("programmer role");
     let messages = programmer["messages"].as_array().expect("messages array");
+    // Concatenate all text parts of a message (Vec<ContentPart> shape).
+    let text_of = |m: &serde_json::Value| -> String {
+        m["content"].as_array()
+            .map(|parts| parts.iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""))
+            .unwrap_or_default()
+    };
     let has_human_reply = messages.iter().any(|m| {
         m["role"].as_str() == Some("user")
-            && m["content"].as_str()
-                .map(|c| c.contains("[HUMAN @") && c.contains("yes, refactor first"))
-                .unwrap_or(false)
+            && {
+                let c = text_of(m);
+                c.contains("[HUMAN @") && c.contains("yes, refactor first")
+            }
     });
     assert!(has_human_reply,
         "programmer's history should contain the human's reply with [HUMAN @ ...] prefix; \

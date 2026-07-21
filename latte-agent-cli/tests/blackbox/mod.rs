@@ -655,9 +655,12 @@ fn session_resume() {
     let _ = out.exit_code();
 
     // Stderr should show the "loaded N messages from <path>" line.
+    // Renderer status messages go to stdout (JSONL events in --debug mode,
+    // bracketed lines in plain mode). Either way the substring is the same.
     assert!(
-        out.stderr.contains("[resume] loaded"),
-        "no '[resume] loaded' message in stderr; got:\n{}",
+        out.stdout.contains("[resume] loaded"),
+        "no '[resume] loaded' message in stdout; got:\nstdout:{}\nstderr:{}",
+        out.stdout,
         out.stderr
     );
 

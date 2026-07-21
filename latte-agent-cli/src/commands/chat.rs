@@ -1590,9 +1590,10 @@ mod tests {
     use latte_ai::models::Role as MsgRole;
 
     fn msg(role: MsgRole, content: &str) -> Message {
-        Message {
-            role,
-            content: content.to_string(),
+        match role {
+            MsgRole::System => Message::system(content),
+            MsgRole::User => Message::user(content),
+            MsgRole::Assistant => Message::assistant(content),
         }
     }
 
@@ -1609,8 +1610,8 @@ mod tests {
         save_session(path.to_str().unwrap(), &original).unwrap();
         let restored = load_session(path.to_str().unwrap()).unwrap();
         assert_eq!(restored.len(), 3);
-        assert_eq!(restored[0].content, "you are helpful");
-        assert_eq!(restored[2].content, "hello");
+        assert_eq!(restored[0].as_text(), "you are helpful");
+        assert_eq!(restored[2].as_text(), "hello");
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1721,7 +1722,7 @@ async fn run_hil_chat(
         })
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latte")))
         .unwrap_or_else(|| PathBuf::from(".latte"));
-    let trace_path = latte_home.join("traces").join(format!("{}.jsonl", task_id));
+    let trace_path = latte_home.join("traces").join(format!("hil-{}.jsonl", task_id));
     let index_path = latte_home.join("sessions").join(format!("{}.idx", task_id));
     let jsonl_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
         latte_agent_core::trace::JsonlSink::new(trace_path),

@@ -238,7 +238,9 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     //    --debug: required to make the chat command emit the full
     //             JSONL trace to `<LATTE_HOME>/traces/<session_id>.jsonl`
     //             (without it, only the index is written).
-    let script = b"first task\nyes, refactor first\n/quit\n";
+    // Stdin order: round 1 prompt → round 2 ask_human reply → empty
+    // line (lets round 2's role loop run before /quit) → /quit.
+    let script = b"first task\nyes, refactor first\n\n/quit\n";
     let mut chat_cmd = Command::new(bin());
     chat_cmd.arg("chat")
         .arg("--task-id").arg(&task_id)

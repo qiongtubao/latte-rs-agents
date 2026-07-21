@@ -1573,7 +1573,7 @@ mod tests {
     use crate::model_resolver::ModelTier;
     use crate::role::Role as AgentRole;
     use crate::role::RoleCategory;
-    use latte_ai::models::Model;
+    use latte_ai::models::{ContentPart, Model};
     use latte_ai::models::Role as MsgRole;
     use std::time::Duration;
 
@@ -1602,6 +1602,7 @@ mod tests {
             context_window: 32000,
             max_tokens: 4096,
             supports_thinking: false,
+            supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
@@ -1673,8 +1674,8 @@ mod tests {
         });
 
         let msg = agent.system_message(&vars).unwrap();
-        assert!(msg.content.contains("Tester"));
-        assert!(msg.content.contains("Auth module"));
+        assert!(msg.as_text().contains("Tester"));
+        assert!(msg.as_text().contains("Auth module"));
         assert!(matches!(msg.role, MsgRole::System));
     }
 
@@ -2035,6 +2036,7 @@ End"#;
             context_window: 32000,
             max_tokens: 4096,
             supports_thinking: false,
+            supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
@@ -2365,7 +2367,7 @@ End"#;
             fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
                 for m in ctx.messages.iter_mut() {
                     if m.role == MsgRole::User {
-                        m.content = m.content.replace("13812345678", "<REDACTED>");
+                        m.content = vec![ContentPart::text(m.as_text().replace("13812345678", "<REDACTED>"))];
                     }
                 }
                 HookOutcome::Continue
@@ -2533,7 +2535,7 @@ End"#;
         assert!(!runner.context.messages().is_empty());
         let first = &runner.context.messages()[0];
         assert_eq!(first.role, MsgRole::User);
-        assert_eq!(first.content, "[INJECTED]\nlook at foo.rs\n");
+        assert_eq!(first.as_text(), "[INJECTED]\nlook at foo.rs\n");
         assert!(!queue.exists());
     }
 
@@ -2590,7 +2592,7 @@ End"#;
         let msgs = runner.context().messages();
         assert!(
             msgs.iter()
-                .any(|m| m.content.contains("🦉 advisor 监察") && m.content.contains("已改名")),
+                .any(|m| m.as_text().contains("🦉 advisor 监察") && m.as_text().contains("已改名")),
             "hint recorded in context: {msgs:?}"
         );
         // …and visible to the model in the very first request.

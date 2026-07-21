@@ -28,7 +28,7 @@
 //!
 //! let mut runner = AgentRunner::new(agent);
 //! let response = runner.run_turn(
-//!     &[Message { role: Role::User, content: "Features for MVP?".to_string() }],
+//!     &[Message::user("Features for MVP?")],
 //!     None,
 //! ).await?;
 //! println!("{}", response);

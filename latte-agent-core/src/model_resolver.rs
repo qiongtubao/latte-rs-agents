@@ -461,6 +461,7 @@ mod tests {
             context_window: 32000,
             max_tokens: 4096,
             supports_thinking: false,
+            supports_vision: false,
             cost_per_million_input: Some(0.0),
             cost_per_million_output: Some(0.0),
             tier: tier.map(|s| s.into()),

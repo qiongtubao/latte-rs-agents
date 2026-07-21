@@ -255,11 +255,21 @@ async fn at_role_inject_lands_in_specialist_history() {
         .find(|r| r["role_id"].as_str() == Some("programmer"))
         .expect("programmer role");
     let messages = programmer["messages"].as_array().expect("messages array");
+    // Concatenate all text parts of a message (Vec<ContentPart> shape).
+    let text_of = |m: &serde_json::Value| -> String {
+        m["content"].as_array()
+            .map(|parts| parts.iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(""))
+            .unwrap_or_default()
+    };
     let has_inject = messages.iter().any(|m| {
         m["role"].as_str() == Some("user")
-            && m["content"].as_str()
-                .map(|c| c.contains("[INJECTED]") && c.contains("check this"))
-                .unwrap_or(false)
+            && {
+                let c = text_of(m);
+                c.contains("[INJECTED]") && c.contains("check this")
+            }
     });
     assert!(has_inject,
         "programmer's history should contain the injected message with [INJECTED] sentinel \

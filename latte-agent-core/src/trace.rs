@@ -4,6 +4,7 @@
 //! for the design.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Per-event metadata. Carried on every `TraceEvent`.
@@ -281,32 +282,67 @@ impl TraceSink for MemorySink {
         self.events.lock().push(event);
     }
 }
-/// Writes each event as one JSON object per line. Thread-safe; uses
-/// an internal Mutex<BufWriter> so concurrent emit() calls don't
-/// interleave bytes.
+/// Writes each event as one JSON object per line. Thread-safe.
+///
+/// Multiple `JsonlSink` instances pointing at the same `path` share a
+/// single underlying `BufWriter<File>` keyed by that path. This is
+/// load-bearing: callers (e.g. `build_debug_sink` invoked once per role)
+/// construct several sinks per session, and without sharing the writers
+/// each `BufWriter` flushes independently — losing `\n` separators
+/// between events written by different sinks. The trace file then
+/// becomes un-parseable as line-delimited JSON.
 pub struct JsonlSink {
-    inner: parking_lot::Mutex<std::io::BufWriter<std::fs::File>>,
+    inner: Arc<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>>,
     path: PathBuf,
 }
 
 impl JsonlSink {
     pub fn new(path: PathBuf) -> Self {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                panic!("JsonlSink: failed to create parent dir {}: {}", parent.display(), e);
-            }
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .expect("JsonlSink: failed to open trace file");
         Self {
-            inner: parking_lot::Mutex::new(std::io::BufWriter::new(file)),
+            inner: shared_writer_for(path.clone()),
             path,
         }
     }
     pub fn path(&self) -> &PathBuf { &self.path }
+}
+/// Per-process registry of `Weak<Mutex<BufWriter<File>>>` keyed by path.
+/// `JsonlSink::new` looks up the existing writer here; if absent, it
+/// creates a fresh one and inserts it. Sinks own the writer via a
+/// strong `Arc`; the registry only keeps a weak handle so it doesn't
+/// keep the writer alive past the last sink's drop.
+///
+/// Without sharing the writer, multiple `JsonlSink` instances opening
+/// the same path each hold an independent `BufWriter`, and `\n`
+/// boundaries between events emitted by different sinks get lost.
+fn shared_writer_for(
+    path: PathBuf,
+) -> Arc<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>> {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Weak};
+    static REGISTRY: LazyLock<
+        parking_lot::Mutex<HashMap<PathBuf, Weak<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>>>>
+    > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    {
+        let mut map = REGISTRY.lock();
+        // Prune stale weak refs and look up the live one.
+        map.retain(|_, w| w.strong_count() > 0);
+        if let Some(weak) = map.get(&path) {
+            if let Some(arc) = weak.upgrade() {
+                return arc;
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("JsonlSink: failed to open trace file");
+    let writer = Arc::new(parking_lot::Mutex::new(std::io::BufWriter::new(file)));
+    REGISTRY.lock().insert(path, Arc::downgrade(&writer));
+    writer
 }
 
 impl TraceSink for JsonlSink {

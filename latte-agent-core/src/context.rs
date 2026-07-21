@@ -531,9 +531,9 @@ mod tests {
         ctx.push(make_msg("b"));
         let before = ctx.token_count();
         let removed = ctx.remove(0);
-        assert_eq!(removed.unwrap().content, "a");
+        assert_eq!(removed.unwrap().as_text(), "a");
         assert_eq!(ctx.messages().len(), 1);
-        assert_eq!(ctx.messages()[0].content, "b");
+        assert_eq!(ctx.messages()[0].as_text(), "b");
         assert!(ctx.token_count() < before);
     }
 
@@ -548,7 +548,7 @@ mod tests {
         let mut ctx = ConversationContext::default();
         ctx.push_with_importance(make_msg("a"), Importance::High);
         let old = ctx.replace(0, make_msg("aaaaa"));
-        assert_eq!(old.unwrap().content, "a");
+        assert_eq!(old.unwrap().as_text(), "a");
         assert_eq!(ctx.importance(0), Some(Importance::Normal));
         assert!(ctx.token_count() > 0);
     }
@@ -557,9 +557,9 @@ mod tests {
     fn test_mutate_runs_closure_in_place() {
         let mut ctx = ConversationContext::default();
         ctx.push(make_msg("hello world"));
-        let ok = ctx.mutate(0, |m| m.content = m.content.replace("world", "rust"));
+        let ok = ctx.mutate(0, |m| *m = make_msg(&m.as_text().replace("world", "rust")));
         assert!(ok);
-        assert_eq!(ctx.messages()[0].content, "hello rust");
+        assert_eq!(ctx.messages()[0].as_text(), "hello rust");
     }
 
     #[test]
@@ -567,7 +567,7 @@ mod tests {
         let mut ctx = ConversationContext::default();
         ctx.push(make_msg("hi"));
         let before = ctx.token_count();
-        ctx.mutate_with_recompute(0, |m| m.content = m.content.repeat(100));
+        ctx.mutate_with_recompute(0, |m| *m = make_msg(&m.as_text().repeat(100)));
         let after = ctx.token_count();
         assert!(after > before * 10);
     }
@@ -581,8 +581,8 @@ mod tests {
         let removed = ctx.clear_range(1..3);
         assert_eq!(removed, 2);
         assert_eq!(ctx.messages().len(), 2);
-        assert_eq!(ctx.messages()[0].content, "a");
-        assert_eq!(ctx.messages()[1].content, "d");
+        assert_eq!(ctx.messages()[0].as_text(), "a");
+        assert_eq!(ctx.messages()[1].as_text(), "d");
         assert_eq!(ctx.importance(0), Some(Importance::Normal));
         assert_eq!(ctx.importance(1), Some(Importance::Normal));
     }
@@ -606,10 +606,10 @@ mod tests {
         ctx.push(make_msg("drop me"));
         ctx.push(make_msg("keep"));
         ctx.push(make_msg("drop me too"));
-        let n = ctx.remove_where(|m| m.content.contains("drop"));
+        let n = ctx.remove_where(|m| m.as_text().contains("drop"));
         assert_eq!(n, 2);
         assert_eq!(ctx.messages().len(), 2);
-        assert!(ctx.messages().iter().all(|m| !m.content.contains("drop")));
+        assert!(ctx.messages().iter().all(|m| !m.as_text().contains("drop")));
         assert_eq!(ctx.importances().len(), 2);
     }
 
@@ -620,13 +620,13 @@ mod tests {
         ctx.push(make_msg("foo baz"));
         ctx.push(make_msg("qux"));
         let n = ctx.replace_where(
-            |m| m.content.starts_with("foo"),
-            |old| make_msg(&old.content.replace("foo", "FOO")),
+            |m| m.as_text().starts_with("foo"),
+            |old| make_msg(&old.as_text().replace("foo", "FOO")),
         );
         assert_eq!(n, 2);
-        assert_eq!(ctx.messages()[0].content, "FOO bar");
-        assert_eq!(ctx.messages()[1].content, "FOO baz");
-        assert_eq!(ctx.messages()[2].content, "qux");
+        assert_eq!(ctx.messages()[0].as_text(), "FOO bar");
+        assert_eq!(ctx.messages()[1].as_text(), "FOO baz");
+        assert_eq!(ctx.messages()[2].as_text(), "qux");
     }
 
     // ─── Mutation: direct ─────────────────────────────────────────────
@@ -636,7 +636,7 @@ mod tests {
         let mut ctx = ConversationContext::default();
         ctx.push(make_msg("hi"));
         ctx.push(make_msg("there"));
-        ctx.messages_mut()[0].content = "x".repeat(400);
+        ctx.messages_mut()[0] = make_msg(&"x".repeat(400));
         ctx.recompute_token_count();
         assert!(ctx.token_count() >= 100);
     }
@@ -649,7 +649,7 @@ mod tests {
         ctx.push(make_msg("system prompt"));
         ctx.push(make_msg("user chat"));
         ctx.push(make_msg("user chat"));
-        let n = ctx.set_importance_where(|m| m.content == "user chat", Importance::Low);
+        let n = ctx.set_importance_where(|m| m.as_text() == "user chat", Importance::Low);
         assert_eq!(n, 2);
         assert_eq!(ctx.importance(0), Some(Importance::Normal));
         assert_eq!(ctx.importance(1), Some(Importance::Low));
@@ -668,8 +668,7 @@ mod tests {
         ctx.push_with_importance(make_msg(&"c".repeat(200)), Importance::Normal);
         ctx.prune_to_budget(0);
 
-        let remaining: Vec<&str> =
-            ctx.messages().iter().map(|m| m.content.as_str()).collect();
+        let remaining: Vec<String> = ctx.messages().iter().map(Message::as_text).collect();
         assert_eq!(remaining.len(), 2, "expected 2 kept, got {remaining:?}");
         assert!(
             remaining.iter().all(|m| !m.starts_with('b')),
