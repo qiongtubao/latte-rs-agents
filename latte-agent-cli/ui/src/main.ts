@@ -16,7 +16,6 @@ import { waitForHost, setUiApi, installUiCallListener } from "./host";
 import type { LatteUiApi } from "./host";
 import { initTransport } from "./transport";
 import { extractCodeRefs, makeRefChips } from "./linkify";
-import { mountStageList } from "./components/StageList";
 
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -79,22 +78,9 @@ async function main(): Promise<void> {
   let sseDisconnector: () => void = () => {};
   let sseConnector: () => void = () => {};
 
-  // conversation-stage-logs: the visible conversation is now the React
-  // <StageList/> mounted onto the existing #messages container (driven by
-  // stageStore, fed from the same ChatEvent stream in api.ts). The legacy
-  // flat message list keeps powering the chat controller lifecycle
-  // (send / replay / status / roles) but renders into a hidden, detached
-  // element so it is visually replaced without ripping out chat_impl.
-  const conversationEl = $("messages");
-  const legacyMessagesEl = document.createElement("div");
-  legacyMessagesEl.className = "message-list message-list--legacy";
-  legacyMessagesEl.style.display = "none";
-  conversationEl.parentElement?.appendChild(legacyMessagesEl);
-  mountStageList(conversationEl);
-
   const chat: ChatController = mountChat({
     container: {
-      messagesEl: legacyMessagesEl,
+      messagesEl: $("messages"),
       formEl: $("chat-form") as HTMLFormElement,
       inputEl: $("chat-input") as HTMLTextAreaElement,
       sendBtn: $("chat-send") as HTMLButtonElement,
