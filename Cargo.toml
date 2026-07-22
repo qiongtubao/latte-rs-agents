@@ -47,3 +47,5 @@ tracing = "0.1"
 # Sync primitives (used by agent cooldown map for non-blocking &self access)
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
+# HTTP client (used by `latte-agent test --raw` for raw request debugging).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

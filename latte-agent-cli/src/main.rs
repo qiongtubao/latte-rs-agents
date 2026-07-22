@@ -14,7 +14,7 @@ mod commands;
 use commands::{
     chat::ChatCmd, checkpoint::CheckpointCmd, config::ConfigCmd, debug::DebugCmd,
     discuss::DiscussCmd, inject::InjectCmd, list::ListCmd, pause::PauseCmd,
-    resume::ResumeCmd, run::RunCmd, ui::UiCmd, workflow::WorkflowCmd,
+    resume::ResumeCmd, run::RunCmd, test::TestCmd, ui::UiCmd, workflow::WorkflowCmd,
 };
 
 #[derive(Parser)]
@@ -47,6 +47,9 @@ enum Command {
     Pause(PauseCmd),
     /// Resume a paused task
     Resume(ResumeCmd),
+    /// Quick one-shot model test: `latte-agent test -m <model> 'hi'`.
+    /// 不进入 REPL，不写 session/trace，立刻返回响应或结构化错误。
+    Test(TestCmd),
     /// Manage checkpoints (create / list / rollback)
     Checkpoint(CheckpointCmd),
 }
@@ -74,6 +77,11 @@ async fn main() {
         Command::Pause(cmd) => cmd.run().map_err(Into::into),
         Command::Resume(cmd) => cmd.run().map_err(Into::into),
         Command::Checkpoint(cmd) => cmd.run().map_err(Into::into),
+        // `TestCmd::run` 内部直接 `std::process::exit`，返回类型是 `!`。
+        // 把它当表达式放在 match arm 里靠 `!` 的 never-typed 行为。
+        Command::Test(cmd) => {
+            cmd.run().await;
+        }
     };
     if let Err(e) = result {
         eprintln!("Error: {}", e);
