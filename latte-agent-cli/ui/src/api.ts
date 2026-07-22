@@ -124,7 +124,7 @@ export type ChatEvent =
   | { type: "RoleStarted"; role_id: string; detail: string }
   | { type: "RoleFinished"; role_id: string; detail: string }
   | { type: "Done" }
-  | { type: "Error"; message: string }
+  | { type: "Error"; kind?: unknown; message: string; sub_id?: string }
   | { type: "RoleList"; roles: RoleInfo[] }
   | { type: "ContextCleared" }
   | { type: "SessionInfo"; task_id: string; state: string; turn: number; roles: RoleInfo[] }

@@ -80,10 +80,14 @@ export function mountChat(opts: {
   container: UIBinding; initialRole: string; initialModel?: string;
   onRoleSwitch?: (roleId: string) => Promise<void>;
   onShowSubsession?: (subId: string, label: string) => void;
+
+  /** 状态行（status）右键「查看本次执行日志」的回调 —— 主 turn 没
+   *  有 subId 时用 session 全量历史代替 subsession 详情面板。 */
+  onShowSessionLog?: () => Promise<void> | void;
   onEditRole?: (roleId: string) => void;
   onReconnect?: () => void;
 }): ChatController {
-  const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onEditRole } = opts;
+  const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onShowSessionLog, onEditRole } = opts;
   let msgCounter = 0;
   let turnStartTime = 0;
 
@@ -118,10 +122,15 @@ export function mountChat(opts: {
     workflowStates.clear();
   }
 
-  // ── Reference tracking ──
   let lastUserMsgId = "";
   let lastRoleStarted = "";
   let subagentTools: string[] = [];
+  /** role_id → RoleStarted 时插入的 executing 状态行；用于
+   *  RoleFinished / Error 把同一行切到 .done / .error，而不是再插一行。
+   *  同时记录对应的 subId（manager 主 turn 时为空；delegate 跑这个
+   *  role 时是 delegate 的 sub_id），让右键「查看日志」能直接命中。 */
+  const executingRowByRole = new Map<string, HTMLElement>();
+  const executingSubIdByRole = new Map<string, string>();
 
   function buildSubagentDetail(): string {
     if (subagentTools.length === 0) return "没有工具调用日志";
@@ -184,6 +193,9 @@ export function mountChat(opts: {
     reference?: { refId: string; preview: string };
     subagent?: { detail: string } | null;
     timestamp?: string;
+    /** 状态行（status）专用：'executing' | 'done' | 'error'，决定
+     *  CSS 颜色 + 图标。仅 status / system 行生效。 */
+    state?: "executing" | "done" | "error";
   }): HTMLElement {
     const kind = opts2.kind;
     const ts = opts2.timestamp || fmtDisplayTime();
@@ -305,10 +317,17 @@ export function mountChat(opts: {
       row.appendChild(bubble);
     } else {
       // ── Status / system (no avatar) ──
+      // Status 行有「执行中 → 完成 / 失败」三态生命周期：RoleStarted
+      // 时落库为 .executing, RoleFinished 切到 .done, Error 切到
+      // .error。CSS 颜色 / 图标随 state 变。subId 提到 row 上以便
+      // 右键「查看日志」能命中 subsession 面板。
       const div = document.createElement("div");
       div.className = `message ${kind}`;
       div.dataset.messageId = id;
-      if (opts2.subId) div.dataset.subId = opts2.subId;
+      if (opts2.subId) {
+        div.dataset.subId = opts2.subId;
+        row.dataset.subId = opts2.subId;
+      }
       if (opts2.meta) {
         const meta = document.createElement("span");
         meta.className = "meta";
@@ -319,6 +338,9 @@ export function mountChat(opts: {
       content.className = "content";
       content.textContent = opts2.content;
       div.appendChild(content);
+      // 状态初始 = executing（默认由 RoleStarted 调用）。新加的
+      // status / system 行不会被自动标记 —— 它们没有生命周期。
+      if (opts2.state) div.classList.add(opts2.state);
       row.appendChild(div);
     }
 
@@ -615,9 +637,33 @@ export function mountChat(opts: {
     e.preventDefault();
     selectedMsgId = row.dataset.messageId;
     const menu = document.getElementById("contextMenu")!;
+    // 按 row 类型隐藏不适用的菜单项 —— status / system 行没有可
+    // 编辑内容（执行中/完成/失败三态，编辑了也没意义），所以
+    // edit / delete 隐藏；view-subagent 仅在 row 关联了 subId 时
+    // 出现（delegate 的角色行才有 subId，主 turn 没有）。
+    const record = getMsgById(row.dataset.messageId);
+    const isStatus = !!row.querySelector(".message.status, .message.system");
+    const hasSubId = !!row.dataset.subId;
+    menu.querySelectorAll<HTMLElement>(".menu-item").forEach((el) => {
+      const act = el.getAttribute("data-action");
+      if (isStatus && (act === "edit" || act === "delete")) {
+        el.style.display = "none";
+      } else if (act === "view-subagent" && !hasSubId) {
+        el.style.display = "none";
+      } else if (act === "view-execution-log" && (isStatus === false || hasSubId)) {
+        // 仅「主 turn 的 status 行」显示本次执行日志入口（无 subId
+        // 但又是执行类行）；其他行隐藏。
+        el.style.display = "none";
+      } else {
+        el.style.display = "";
+      }
+    });
     menu.style.display = "block";
     menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
     menu.style.top = Math.min(e.clientY, window.innerHeight - 180) + "px";
+    if (record === undefined) {
+      // 抑制 TS6133 unused
+    }
   });
 
   document.addEventListener("click", (e) => {
@@ -660,13 +706,18 @@ export function mountChat(opts: {
         }
         break;
       }
+      case "view-execution-log": {
+        // 主 turn 的 status 行（无 subId）：跳到本次 session 全量
+        // 历史 —— 上面有 ToolUse / RoleTurn / Status 等完整流水。
+        if (onShowSessionLog) {
+          void onShowSessionLog();
+        } else {
+          alert("查看本次执行日志回调未注册");
+        }
+        break;
+      }
     }
     menu.style.display = "none";
-  });
-
-
-  document.getElementById("closeSubagent")!.addEventListener("click", () => {
-    document.getElementById("subagentOverlay")!.style.display = "none";
   });
   document.getElementById("subagentOverlay")!.addEventListener("click", (e) => {
     if (e.target === document.getElementById("subagentOverlay")!) {
@@ -677,12 +728,39 @@ export function mountChat(opts: {
     switch (e.type) {
       case "RoleStarted": {
         subagentTools = [];
-        addMessage({ kind: "status", content: `🧠 ${e.role_id} 开始执行…` });
+        // 该 role 可能在某个 active delegate subsession 里跑
+        // (manager @programmer ...)，找一下 subId 让右键能跳日志。
+        const startedSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId || undefined;
+        const node = addMessage({
+          kind: "status",
+          content: `🧠 ${e.role_id} 开始执行…`,
+          meta: e.role_id,
+          subId: startedSubId,
+          state: "executing",
+        });
+        executingRowByRole.set(e.role_id, node);
+        executingSubIdByRole.set(e.role_id, startedSubId ?? "");
         lastRoleStarted = e.role_id;
         break;
       }
       case "RoleFinished": {
-        addMessage({ kind: "status", content: `✅ ${e.role_id} 完成` });
+        // 找到 RoleStarted 时插入的 executing 行，原地切到 .done，
+        // 不再插一行。失败也走这条 — "error" 状态单独在 Error event 里设。
+        const row = executingRowByRole.get(e.role_id);
+        if (row) {
+          const inner = row.querySelector(".message.status") as HTMLElement | null;
+          if (inner) {
+            inner.classList.remove("executing");
+            inner.classList.add("done");
+            const content = inner.querySelector(".content");
+            if (content) content.textContent = `✅ ${e.role_id} 完成`;
+          }
+          executingRowByRole.delete(e.role_id);
+          executingSubIdByRole.delete(e.role_id);
+        } else {
+          // 没有匹配的 executing 行（边角事件）—— 退回老行为
+          addMessage({ kind: "status", content: `✅ ${e.role_id} 完成`, meta: e.role_id, state: "done" });
+        }
         break;
       }
       case "UserMessage": {
@@ -901,7 +979,43 @@ export function mountChat(opts: {
         resetWaitTimer();
         break;
       }
-      case "Error": setStatus("connected"); clearWaitTimer(); addMessage({ kind: "error", content: e.message, meta: "error" }); setFooter(`错误: ${truncate(e.message, 80)}`); break;
+      case "Error": {
+        setStatus("connected");
+        clearWaitTimer();
+        // 优先把现有 executing 状态行切到 .error（保留上下文，能
+        // 右键「查看日志」直接命中 subagent 过程）；找不到再新插
+        // 一条 error 行。
+        const errSubId = e.sub_id;
+        const targetRole = lastRoleStarted;
+        const row = targetRole ? executingRowByRole.get(targetRole) : undefined;
+        if (row) {
+          const inner = row.querySelector(".message.status") as HTMLElement | null;
+          if (inner) {
+            inner.classList.remove("executing");
+            inner.classList.add("error");
+            const content = inner.querySelector(".content");
+            if (content) content.textContent = `❌ ${targetRole} 失败: ${e.message}`;
+            // 关联到具体 subagent (delegate 失败时后端带 sub_id；
+            // 主 turn 错误继承最近 RoleStarted 的 subId，可能是 undefined)
+            if (errSubId) {
+              inner.dataset.subId = errSubId;
+              row.dataset.subId = errSubId;
+            } else {
+              const inherited = executingSubIdByRole.get(targetRole);
+              if (inherited) {
+                inner.dataset.subId = inherited;
+                row.dataset.subId = inherited;
+              }
+            }
+          }
+          executingRowByRole.delete(targetRole);
+          executingSubIdByRole.delete(targetRole);
+        } else {
+          addMessage({ kind: "error", content: e.message, meta: "error", subId: errSubId, state: "error" });
+        }
+        setFooter(`错误: ${truncate(e.message, 80)}`);
+        break;
+      }
       default: console.warn("[chat] unknown event", e);
     }
   }

@@ -148,7 +148,7 @@ mod tests {
             ("RoundStarted", ChatEvent::RoundStarted { round: 1 }),
             ("RoundEnded", ChatEvent::RoundEnded { round: 1 }),
             ("Done", ChatEvent::Done),
-            ("Error", ChatEvent::Error { message: "boom".into() }),
+            ("Error", ChatEvent::Error { kind: None, message: "boom".into(), sub_id: None }),
             ("ContextCleared", ChatEvent::ContextCleared),
             ("ToolUse", ChatEvent::ToolUse { role_id: "m".into(), tool_name: "read".into(), args: "{}".into() }),
             ("ToolResult", ChatEvent::ToolResult { role_id: "m".into(), tool_name: "read".into(), result: "ok".into() }),
@@ -164,5 +164,27 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
             assert_eq!(v["type"], expected_type, "type mismatch for variant {}: {}", expected_type, v);
         }
+    }
+    /// Error 事件携带 sub_id 是 UI 右键「查看日志」的关键字段。
+    /// 验证：sub_id 必须出现在前端 wire JSON 里（不要被 serde
+    /// 误标 skip_serializing_if 而丢掉）。
+    #[test]
+    fn chat_event_to_frontend_json_preserves_error_sub_id() {
+        let ev = ChatEvent::Error {
+            kind: Some(crate::trace::ModelErrorKind::Other { message: "boom".into() }),
+            message: "delegate programmer failed: timeout".into(),
+            sub_id: Some("sub-42".into()),
+        };
+        let json = chat_event_to_frontend_json(&ev).expect("convert");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["type"], "Error");
+        assert_eq!(v["message"], "delegate programmer failed: timeout");
+        assert_eq!(v["sub_id"], "sub-42", "sub_id must reach frontend");
+        // 没 sub_id 的 Error 不应该泄漏空字符串字段
+        let no_sub = ChatEvent::Error { kind: None, message: "main turn failed".into(), sub_id: None };
+        let v2: serde_json::Value = serde_json::from_str(
+            &chat_event_to_frontend_json(&no_sub).expect("convert")
+        ).expect("parse");
+        assert!(v2.get("sub_id").is_none(), "sub_id must be skipped when None");
     }
 }

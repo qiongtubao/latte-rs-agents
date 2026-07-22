@@ -3,9 +3,11 @@ import { describe, it, expect } from "vitest";
 import type { ChatEvent } from "../api";
 import {
   createStageStore,
+  replayStageHistory,
   selectStageById,
   selectStageLog,
   selectTopLevelStages,
+  stageStore,
 } from "./stageStore";
 
 // 固定时钟，保证 TraceRecord.timestampMs 可预期。
@@ -91,6 +93,39 @@ describe("createStageStore — seed", () => {
     store.getState().applyEvent({ type: "RoleStarted", role_id: "programmer", detail: "" });
     state = store.getState();
     expect(state.order).toHaveLength(2);
+  });
+
+  it("replaces the visible stage list when restoring another session", () => {
+    // 先放入旧 session 的可见内容，模拟用户从一个会话切到另一个会话。
+    stageStore.getState().applyEvent({ type: "RoleStarted", role_id: "stale", detail: "" });
+
+    replayStageHistory([
+      { type: "RoleStarted", role_id: "manager", detail: "calling LLM" },
+      { type: "RoleTurn", role_id: "manager", content: "restored answer", is_complete: true },
+    ]);
+
+    const state = stageStore.getState();
+    expect(state.order).toHaveLength(1);
+    const restored = state.byId[state.order[0]];
+    expect(restored.roleId).toBe("manager");
+    expect(restored.content).toBe("restored answer");
+
+    // 共享单例必须复位，避免影响同进程中的其他测试。
+    stageStore.getState().seed([]);
+  });
+
+  it("clears stale stages and log selection when restored history is empty", () => {
+    // 空 session 也必须替换可见状态，不能残留上一个 session 的内容。
+    stageStore.getState().applyEvent({ type: "RoleStarted", role_id: "stale", detail: "" });
+    const staleId = stageStore.getState().order[0];
+    stageStore.getState().openLog(staleId);
+
+    replayStageHistory([]);
+
+    const state = stageStore.getState();
+    expect(state.order).toEqual([]);
+    expect(state.byId).toEqual({});
+    expect(state.activeLogStageId).toBeNull();
   });
 });
 

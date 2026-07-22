@@ -378,6 +378,45 @@ select {
   display: inline;
 }
 
+/* ─── status row lifecycle (RoleStarted → RoleFinished / Error) ── */
+/* executing: 蓝紫渐变 + 旋转图标，表示该角色正在调用 LLM /
+   跑工具；用户可右键「查看 subagent 过程」或「查看本次执行日志」。 */
+.message.status.executing {
+  background: linear-gradient(90deg, #ede9fe 0%, #ddd6fe 100%);
+  border-left-color: #7c3aed;
+  color: #4c1d95;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+/* shimmer 高亮带，让 executing 视觉上是「活的」 */
+.message.status.executing::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(124, 58, 237, 0.18), transparent);
+  animation: status-shimmer 1.6s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes status-shimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+/* done: 绿色 — 角色已成功完成；left bar 与文字变绿，背景淡绿 */
+.message.status.done {
+  background: #ecfdf5;
+  border-left-color: #10b981;
+  color: #065f46;
+  opacity: 0.85;
+}
+/* error: 红色 — 角色失败 / 工具报错 / 超时；left bar 红字红背景 */
+.message.status.error {
+  background: #fef2f2;
+  border-left-color: #ef4444;
+  color: #991b1b;
+  font-weight: 500;
+}
+
 /* ─── code blocks inside messages ─────────────────────────────── */
 
 .msg-content pre {

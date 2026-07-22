@@ -72,10 +72,13 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
 /// 把任意 `AgentError` + 上下文 prefix 打包成 `ChatEvent::Error`，
 /// 让 controller 端的 5 处 Error 构造点（turn failed / switch role /
 /// switch model 等）走同一投影，UI/CLI 拿到一致的 `kind`。
-fn error_event(e: &AgentError, prefix: &str) -> ChatEvent {
+/// `sub_id` 在错误来自某个 delegate subsession 时填入，让 UI
+/// 右键「查看日志」能跳到具体 subagent 过程。
+fn error_event(e: &AgentError, prefix: &str, sub_id: Option<String>) -> ChatEvent {
     ChatEvent::Error {
         kind: Some(agent_error_to_kind(e)),
         message: format!("{prefix}: {e}"),
+        sub_id,
     }
 }
 fn truncate_event_text(text: &str, max: usize) -> String {
@@ -149,10 +152,16 @@ pub enum ChatEvent {
     /// 桌面端能基于**分类**做事（着色、自动建议、统计）。`message`
     /// 保留为人类可读原文。`kind` 是 `Option`，让旧 consumer 反
     /// 序列化旧 JSON（缺 kind 字段）时不报错；新构造点应填。
+    ///
+    /// `sub_id` (optional) 链接到产生此错误的 delegate subsession：
+    /// UI 右键「查看日志」即可定位到该 subagent 的完整工具调用/
+    /// bash 日志，而不是只看主 turn。主 turn 自身的错误保持 `None`。
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<ModelErrorKind>,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
     },
     /// `sub_id` (optional) links this turn to a specific delegate subsession.
     RoleTurn {
@@ -672,9 +681,10 @@ async fn run_multi_role_loop(
         Ok(root) => root,
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: format!("无法解析仓库根目录: {e}"),
-            });
+                            kind: None,
+                            message: format!("无法解析仓库根目录: {e}"),
+                            sub_id: None,
+                        });
             return;
         }
     };
@@ -682,9 +692,10 @@ async fn run_multi_role_loop(
         Some(id) => id.clone(),
         None => {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: "multi-role 模式需要 task_id".into(),
-            });
+                            kind: None,
+                            message: "multi-role 模式需要 task_id".into(),
+                            sub_id: None,
+                        });
             return;
         }
     };
@@ -698,9 +709,10 @@ async fn run_multi_role_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("读取 session 文件失败: {e}"),
-                });
+                                kind: None,
+                                message: format!("读取 session 文件失败: {e}"),
+                                sub_id: None,
+                            });
                 return;
             }
         };
@@ -708,9 +720,10 @@ async fn run_multi_role_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("解析 session JSON 失败: {e}"),
-                });
+                                kind: None,
+                                message: format!("解析 session JSON 失败: {e}"),
+                                sub_id: None,
+                            });
                 return;
             }
         };
@@ -726,9 +739,10 @@ async fn run_multi_role_loop(
         if session_mgr.state() == SessionState::Paused {
             if let Err(e) = session_mgr.resume() {
                 let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("resume 失败: {e}"),
-                });
+                                kind: None,
+                                message: format!("resume 失败: {e}"),
+                                sub_id: None,
+                            });
                 return;
             }
             let _ = event_tx.send(ChatEvent::Status {
@@ -740,25 +754,28 @@ async fn run_multi_role_loop(
             Some(p) => p.clone(),
             None => {
                 let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("task '{task_id}' 无 session，需要 initial_prompt"),
-                });
+                                kind: None,
+                                message: format!("task '{task_id}' 无 session，需要 initial_prompt"),
+                                sub_id: None,
+                            });
                 return;
             }
         };
         let bb = crate::workspace::Blackboard::new(worktree_root.join("plan.md"));
         if let Err(e) = bb.write(&format!("# {task_id}\n\n{prompt}")) {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: format!("写入 plan.md 失败: {e}"),
-            });
+                            kind: None,
+                            message: format!("写入 plan.md 失败: {e}"),
+                            sub_id: None,
+                        });
             return;
         }
         if let Err(e) = session_mgr.persist() {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: format!("持久化 session 失败: {e}"),
-            });
+                            kind: None,
+                            message: format!("持久化 session 失败: {e}"),
+                            sub_id: None,
+                        });
             return;
         }
         let _ = event_tx.send(ChatEvent::Status {
@@ -782,16 +799,18 @@ async fn run_multi_role_loop(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: format!("scheduler init error: {e}"),
-            });
+                            kind: None,
+                            message: format!("scheduler init error: {e}"),
+                            sub_id: None,
+                        });
             return;
         }
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: format!("scheduler join error: {e}"),
-            });
+                            kind: None,
+                            message: format!("scheduler join error: {e}"),
+                            sub_id: None,
+                        });
             return;
         }
     };
@@ -866,9 +885,10 @@ async fn run_multi_role_loop(
             }
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("构建 role '{role_id}' runner 失败: {e}"),
-                });
+                                kind: None,
+                                message: format!("构建 role '{role_id}' runner 失败: {e}"),
+                                sub_id: None,
+                            });
                 return;
             }
         }
@@ -1259,9 +1279,10 @@ async fn run_single_role_loop(
         Ok(r) => r,
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
-                kind: None,
-                message: format!("构建 runner 失败: {e}"),
-            });
+                            kind: None,
+                            message: format!("构建 runner 失败: {e}"),
+                            sub_id: None,
+                        });
             return;
         }
     };
@@ -1356,7 +1377,7 @@ async fn run_single_role_loop(
                                             let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
                                             let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                                         }
-                                        Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed")); }
+                                        Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed", None)); }
                                     }
                                 }
                                 "/model" => {
@@ -1375,7 +1396,7 @@ async fn run_single_role_loop(
                                                     current_tier = new_tier;
                                                     let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                                                 }
-                                                Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed")); }
+                                                Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed", None)); }
                                             }
                                         }
                                         Err(e) => { let _ = event_tx.send(ChatEvent::Status { message: format!("invalid tier: {e}") }); }
@@ -1427,6 +1448,7 @@ async fn run_single_role_loop(
                                     let _ = event_tx.send(ChatEvent::Error {
                                         kind: Some(ModelErrorKind::Other { message: format!("turn-level timeout after {timeout_secs}s") }),
                                         message: format!("turn timed out after {timeout_secs}s"),
+                                        sub_id: None,
                                     });
                                     continue;
                                 }
@@ -1454,7 +1476,7 @@ async fn run_single_role_loop(
                                     role_id: current_role.clone(),
                                     detail: format!("error: {e}"),
                                 });
-                                let _ = event_tx.send(error_event(&e, "turn failed"));
+                                let _ = event_tx.send(error_event(&e, "turn failed", None));
                             }
                         }
                     }
@@ -1470,7 +1492,7 @@ async fn run_single_role_loop(
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
                                 let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                             }
-                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed")); }
+                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed", None)); }
                         }
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
@@ -1482,7 +1504,7 @@ async fn run_single_role_loop(
                                 current_tier = new_tier;
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                             }
-                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed")); }
+                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed", None)); }
                         }
                     }
                     Some(ControllerInput::Pause) => {
@@ -2049,6 +2071,16 @@ async fn register_delegate_tool(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("error: {}", e),
+                    });
+                    // 让 UI 右键「查看日志」能定位到该 subagent 的完整
+                    // 工具调用记录 —— 没这条事件，delegate 失败时
+                    // 状态栏只剩 RoleFinished，UI 拿不到任何日志入口。
+                    let _ = event_tx.send(ChatEvent::Error {
+                        kind: Some(crate::trace::ModelErrorKind::Other {
+                            message: format!("delegate {role_id} failed: {e}"),
+                        }),
+                        message: format!("delegate {role_id} failed: {e}"),
+                        sub_id: Some(sub_id.clone()),
                     });
                 }
             }

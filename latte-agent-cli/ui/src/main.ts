@@ -114,6 +114,27 @@ async function main(): Promise<void> {
         }
       } catch (e) { body.textContent = `error: ${String(e)}`; }
     },
+    onShowSessionLog: async () => {
+      // 主 turn status 行右键 → 把整个 session 的 ChatEvent 历史
+      // 拉回来渲染在 subsession 详情面板里。这是给「manager 开
+      // 始执行 / 完成 / 失败」一类行用的：它们没有 subId，但
+      // 上下文里有完整 ToolUse / RoleTurn 流水。
+      $("subsession-label").textContent = "本次执行日志";
+      const body = $("subsession-body");
+      body.textContent = "fetching…";
+      $("subsession-panel").classList.remove("hidden");
+      try {
+        const events = await getSessionHistory(getCurrentSessionId() || currentId);
+        body.innerHTML = "";
+        if (events.length === 0) {
+          body.textContent = "(本次 session 还没有事件)";
+          return;
+        }
+        for (const ev of events) {
+          body.appendChild(renderSubsessionEvent(ev as Record<string, unknown>));
+        }
+      } catch (e) { body.textContent = `error: ${String(e)}`; }
+    },
   });
   chat.refreshRoles(session.available_roles, session.role);
   $("subsession-close").addEventListener("click", () => {

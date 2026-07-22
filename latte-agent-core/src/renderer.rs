@@ -106,7 +106,7 @@ pub trait ChatRenderer: Send + Sync {
                 self.on_status(&format!("{from_role} delegate {to_role} {status}: {summary}")).await;
             }
             ChatEvent::Done => self.on_done().await,
-            ChatEvent::Error { message } => self.on_error(message).await,
+            ChatEvent::Error { message, .. } => self.on_error(message).await,
             ChatEvent::RoleList { roles } => self.on_role_list(roles).await,
             ChatEvent::ContextCleared => self.on_context_cleared().await,
             ChatEvent::SessionInfo { task_id, state, turn, .. } => {
