@@ -5,9 +5,141 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-/// Per-event metadata. Carried on every `TraceEvent`.
+use latte_ai::error::AiError;
+
+/// 统一的错误分类标签。把 `latte_ai::error::AiError`、`AgentError`、
+/// `reqwest::Error` 等异构错误源投影成一个稳定的小枚举，让 trace.jsonl
+/// 上的 `ModelCallFailed.error_kind`、`ChatEvent::Error.kind`、CLI/UI
+/// 错误展示都能基于 **结构化** 分类做事（着色、统计、自动建议），
+/// 不再依赖 `format!("{e}")` 解析。
+///
+/// 设计原则：
+/// - 标签 **有限且互斥**，每个 kind 都有清晰的处置策略（"可以重试"
+///   / "应该换模型" / "用户需要修配置"）
+/// - 不携带可执行的元信息（不暴露 api_key、URL 含 key 等敏感字段）
+/// - 错误原文仍放在 `error_message: String` 里供离线诊断
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]  // no Eq: f64 fields
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelErrorKind {
+    /// HTTP 请求整体超时（reqwest `is_timeout()`）。
+    Timeout,
+    /// TCP/TLS 连接失败（reqwest `is_connect()`）— 不是超时但同样卡死。
+    ConnectFailed,
+    /// HTTP 429 / vendor `Retry-After`。`retry_after_secs` 是 vendor
+    /// 建议等的时间（秒）；0 表示 vendor 没给。
+    RateLimited { retry_after_secs: f64 },
+    /// 任意 HTTP 状态码（4xx/5xx 中除已分类的）。
+    Http { status: u16, message: String },
+    /// 鉴权失败（401/403）。需要用户修 api_key。
+    Auth,
+    /// 模型不存在（404）。需要用户修 model id。
+    ModelNotFound,
+    /// SSE / 流式连接异常。
+    Stream { message: String },
+    /// 响应体解析失败。
+    Serde { message: String },
+    /// 配置错误（api_key 空、base_url 拼写错等）。
+    Config { message: String },
+    /// 模型在 cooldown 窗口内，跳过本次调用。
+    /// 这是**跳过的原因**，不是 chat 调用本身失败。
+    CooldownHit { cooldown_remaining_secs: f64 },
+    /// 其他 / 未分类 / vendor 私有错误信息。
+    Other { message: String },
+}
+
+impl ModelErrorKind {
+    /// 稳定的小写标签，便于日志 grep / 统计。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ConnectFailed => "connect_failed",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Http { .. } => "http_error",
+            Self::Auth => "auth",
+            Self::ModelNotFound => "model_not_found",
+            Self::Stream { .. } => "stream",
+            Self::Serde { .. } => "serde",
+            Self::Config { .. } => "config",
+            Self::CooldownHit { .. } => "cooldown_hit",
+            Self::Other { .. } => "other",
+        }
+    }
+
+    /// 该错误是否建议直接重试同一个模型（即"非可重试"语义，
+    /// fall back 到下一个模型）。
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Auth / 404 / serde / config 这些永久错：重试同一个会
+            // 100% 失败，应该立刻 fallback。
+            Self::Auth | Self::ModelNotFound | Self::Serde { .. } | Self::Config { .. } => false,
+            _ => true,
+        }
+    }
+
+    /// 用户侧建议的简短描述（不是修复指引，只标"问题类型"）。
+    pub fn user_hint(&self) -> &'static str {
+        match self {
+            Self::Timeout => "model took too long to respond",
+            Self::ConnectFailed => "couldn't reach the model endpoint",
+            Self::RateLimited { .. } => "rate limited by vendor",
+            Self::Http { status, .. } => match status {
+                &s if s >= 500 => "vendor server error",
+                _ => "request rejected by vendor",
+            },
+            Self::Auth => "auth failed — check api_key",
+            Self::ModelNotFound => "model id not recognized by vendor",
+            Self::Stream { .. } => "response stream interrupted",
+            Self::Serde { .. } => "vendor returned unparseable response",
+            Self::Config { .. } => "local config error",
+            Self::CooldownHit { .. } => "model still on cooldown from earlier failure",
+            Self::Other { .. } => "uncategorized error",
+        }
+    }
+}
+
+/// 把 `AiError` 投影成 `ModelErrorKind`。
+///
+/// 关键设计点：
+/// - `AiError::Http(reqwest::Error)` 内部其实封装了 timeout / connect /
+///   其它 — 用 `reqwest::Error::is_timeout` / `is_connect` 区分，否则
+///   会全部坍缩到 "Other" 标签里（这正是当前 `chat_openai` 路径已经踩过的坑）。
+/// - 4xx/5xx HTTP 错误（`AiError::Api`）也单独分类，因为"404"和"503"
+///   排查方向截然不同。
+impl From<&AiError> for ModelErrorKind {
+    fn from(e: &AiError) -> Self {
+        match e {
+            AiError::Http(req) => {
+                if req.is_timeout() {
+                    Self::Timeout
+                } else if req.is_connect() {
+                    Self::ConnectFailed
+                } else {
+                    Self::Other { message: format!("http: {req}") }
+                }
+            }
+            AiError::Api { status, message } => match *status {
+                401 | 403 => Self::Auth,
+                404 => Self::ModelNotFound,
+                429 => Self::RateLimited { retry_after_secs: 0.0 },
+                other => Self::Http { status: other, message: message.clone() },
+            }
+            AiError::RateLimited { retry_after, .. } =>
+                Self::RateLimited { retry_after_secs: *retry_after },
+            AiError::Auth(_) => Self::Auth,
+            AiError::ModelNotFound(_) => Self::ModelNotFound,
+            AiError::Stream(s) => Self::Stream { message: s.clone() },
+            AiError::Serde(err) => Self::Serde { message: err.to_string() },
+            AiError::Config(s) => Self::Config { message: s.clone() },
+            AiError::UnsupportedProvider(s) => Self::Config { message: format!("unsupported provider: {s}") },
+            AiError::Io(err) => Self::Other { message: format!("io: {err}") },
+            AiError::Other(s) => Self::Other { message: s.clone() },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraceMeta {
     pub turn: u32,
@@ -208,8 +340,198 @@ SessionStarted {
         task_id: String,
         round: u32,
     },
+    /// 模型调用失败。这是 trace 黑洞修复的核心：之前失败路径只
+    /// 是 trace 流上一个**空洞**，现在每次失败都留一条结构化
+    /// 记录，让 `~/.latte/traces/<id>.jsonl` 能离线追查"超时 /
+    /// 限流 / 404"等不同原因。
+    ///
+    /// 注意：即便上层走了 fallback 链命中了下一个模型，每次失败
+    /// 都会单独 emit 一条 `ModelCallFailed`，最终 `ModelCall`
+    /// （成功）也会再 emit 一次。所以"成功 + N 次失败"会留下
+    /// 完整链条。
+    ModelCallFailed {
+        meta: TraceMeta,
+        /// 调用的模型 id（catalog 中的）
+        model_id: String,
+        /// 第几次尝试（0-based，对应 `model_chain` 中的位置）
+        attempt_index: u32,
+        /// 从发起请求到收到错误响应的毫秒数
+        latency_ms: u64,
+        /// 错误分类（统一标签，给前端/统计用）
+        error_kind: ModelErrorKind,
+        /// 错误原文（截断到 800 字符；含 url/body 等诊断信息，
+        /// **不含 api_key** —— 见 ModelErrorKind 设计原则）
+        error_message: String,
+        /// 如果设置了 cooldown，这是 cooldown 秒数；None 表示不可重试
+        cooldown_secs: Option<u32>,
+    },
+    /// 某模型进入 cooldown 窗口。
+    ///
+    /// 与 `ModelCallFailed.cooldown_secs` 互补：前者记录**触发的
+    /// 一次性事件**（"模型 X 因为 5xx 进入 30s cooldown"），后者记
+    /// 录**结果**（"调用失败 / 设了 30s cooldown"）。让 trace 上
+    /// 时间线可以反推 N 秒前模型 X 进入了什么状态的 cooldown。
+    ModelCooldownEntered {
+        meta: TraceMeta,
+        model_id: String,
+        cooldown_secs: u32,
+        /// Unix epoch 秒 — 客户端无需自行计算"还剩多久 cooldown"
+        cooldown_until_unix_secs: u64,
+        /// 触发进入 cooldown 的错误分类
+        trigger_kind: ModelErrorKind,
+    },
+    /// 跳过当前模型，准备试下一个（fallback）。`reason` 是结构
+    /// 化标签（不是 message），方便统计"为什么跳过"。
+    FallbackTriggered {
+        meta: TraceMeta,
+        from_model: String,
+        /// `None` 表示 fallback 链已走到尽头、整体失败
+        to_model: Option<String>,
+        reason: FallbackReason,
+        /// 触发这次 fallback 的错误分类；如果是 `OnCooldown` 跳过则
+        /// 为 `Some(ModelErrorKind::CooldownHit { ... })`
+        cause_kind: Option<ModelErrorKind>,
+    },
 }
 
+/// 为什么跳过当前模型、试下一个。**枚举**值，不是字符串 ——
+/// 让 trace 消费方能基于语义做聚合统计（"今天 30 次 OnCooldown,
+/// 5 次 RateLimited"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum FallbackReason {
+    /// 当前模型在 cooldown 窗口内
+    OnCooldown,
+    /// 当前模型失败且错误可重试 → 下一个模型接手
+    RetryableFailure,
+    /// 链已经走到尽头 → 整体失败（`ModelsUnavailable`）
+    NoMoreModels,
+    /// `WaitAndRetry` 策略：sleep 过后再次尝试 head 模型，第二次
+    /// 仍失败 → 进入 NoMoreModels
+    RetryExhausted,
+}
+
+/// `Agent::chat()` 内部在每个"不可重试 / 进入 cooldown / 跳 fallback"事件点
+/// 上调用的回调。实现类是 `TraceEventProgressSink`（默认实现：把回调翻成
+/// 上面 3 个 `TraceEvent` 变体），让 trace 黑洞被堵上又**不**让 `Agent`
+/// 直接依赖 `TraceSink`（trace 是 agent 的可选观察层，agent 本身不关心
+/// 任何"事件"）。
+///
+/// 设计点：
+/// - 每个回调都是 `&self` + 不可变（事件已经被构造好），没有"agent 等
+pub trait ChatProgressSink: Send + Sync {
+    fn on_model_call_failed(&self, meta: &TraceMeta, info: ModelCallAttemptInfo);
+    /// 进入 cooldown：失败可重试 + 对应时长。与 on_model_call_failed
+    /// 是先后两个事件，先触发的失败、再 cooldown，不要漏发任何一个
+    fn on_model_cooldown_set(&self, meta: &TraceMeta, info: ModelCooldownInfo);
+    /// 跳过当前模型试下一个：包括 OnCooldown 跳过和 Retryable 跳过
+    fn on_fallback_triggered(&self, meta: &TraceMeta, info: FallbackInfo);
+}
+
+/// 单次失败：模型返回了任何错误（5xx / 404 / timeout / 限流...）。
+#[derive(Debug, Clone)]
+pub struct ModelCallAttemptInfo {
+    pub model_id: String,
+    /// 第几个 model_chain（0-based）
+    pub attempt_index: u32,
+    /// 调用到失败经过的毫秒数
+    pub latency_ms: u64,
+    pub error_kind: ModelErrorKind,
+    /// 错误原文（截断到 800 字符）
+    pub error_message: String,
+    /// Some(N) = 失败可重试，已设置 cooldown N 秒；None = 不可重试
+    pub cooldown_secs: Option<u32>,
+    /// 接下来要试的模型 id（fallback）。链尾为 None
+    pub next_model_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelCooldownInfo {
+    pub model_id: String,
+    pub cooldown_secs: u32,
+    /// Unix epoch 秒。客户端无需自行算剩余时间
+    pub cooldown_until_unix_secs: u64,
+    /// 触发该 cooldown 的错误分类
+    pub trigger_kind: ModelErrorKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct FallbackInfo {
+    pub from_model: String,
+    pub to_model: Option<String>,
+    pub reason: FallbackReason,
+    pub cause_kind: Option<ModelErrorKind>,
+}
+/// `ChatProgressSink` 的默认实现：把每次回调一对一地翻译成上面 3 个
+/// `TraceEvent` 变体。让 runner 只需要把 `self.sink` 包成这个，
+/// 不必自己写 if/else 分流。
+///
+/// `meta` 是一次 chat 的"运行时上下文"（turn / role / session_id），
+/// 由 runner 构造一次后复用。`Agent::chat_with_progress` 的每个事件
+/// 点都拿同一个 meta，让 trace 上同一 turn 的失败事件能被 grep 到。
+/// `ChatProgressSink` 的默认实现：把每次回调一对一地翻译成上面 3 个
+/// `TraceEvent` 变体。让 runner 只需要把 `self.sink` 包成这个，
+/// 不必自己写 if/else 分流。
+///
+/// 与 trait 同步要求：每个回调都接受 `meta: &TraceMeta`，因为 `Agent`
+/// 内部不知道 caller 的 turn/role/session_id，由 caller（runner）注入。
+pub struct TraceEventProgressSink {
+    /// 底层 trace sink。meta 不在此处保存 ——
+    /// `Agent::chat_with_progress` 每次回调把 meta 作为参数传入，
+    /// sink 透传给 TraceEvent。
+    inner: std::sync::Arc<dyn TraceSink>,
+}
+
+impl TraceEventProgressSink {
+    pub fn new(inner: std::sync::Arc<dyn TraceSink>) -> Self {
+        Self { inner }
+    }
+}
+
+impl ChatProgressSink for TraceEventProgressSink {
+    fn on_model_call_failed(&self, meta: &TraceMeta, info: ModelCallAttemptInfo) {
+        let msg = if info.error_message.len() > 800 {
+            format!("{}…", &info.error_message[..800])
+        } else {
+            info.error_message.clone()
+        };
+        self.inner.emit(TraceEvent::ModelCallFailed {
+            meta: meta.clone(),
+            model_id: info.model_id.clone(),
+            attempt_index: info.attempt_index,
+            latency_ms: info.latency_ms,
+            error_kind: info.error_kind.clone(),
+            error_message: msg,
+            cooldown_secs: info.cooldown_secs,
+        });
+    }
+    fn on_model_cooldown_set(&self, meta: &TraceMeta, info: ModelCooldownInfo) {
+        self.inner.emit(TraceEvent::ModelCooldownEntered {
+            meta: meta.clone(),
+            model_id: info.model_id.clone(),
+            cooldown_secs: info.cooldown_secs,
+            cooldown_until_unix_secs: info.cooldown_until_unix_secs,
+            trigger_kind: info.trigger_kind.clone(),
+        });
+    }
+    fn on_fallback_triggered(&self, meta: &TraceMeta, info: FallbackInfo) {
+        self.inner.emit(TraceEvent::FallbackTriggered {
+            meta: meta.clone(),
+            from_model: info.from_model.clone(),
+            to_model: info.to_model.clone(),
+            reason: info.reason,
+            cause_kind: info.cause_kind.clone(),
+        });
+    }
+}
+
+/// No-op sink。`Agent::chat_with_progress(.., None, ..)` 用，对
+/// 那些不需要 trace 的 caller（tests / cold-path）零开销。
+impl ChatProgressSink for () {
+    fn on_model_call_failed(&self, _meta: &TraceMeta, _info: ModelCallAttemptInfo) {}
+    fn on_model_cooldown_set(&self, _meta: &TraceMeta, _info: ModelCooldownInfo) {}
+    fn on_fallback_triggered(&self, _meta: &TraceMeta, _info: FallbackInfo) {}
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedCall {
     pub name: String,
@@ -375,7 +697,10 @@ impl TraceEvent {
             | TraceEvent::RoundStarted { meta, .. }
             | TraceEvent::RoundEnded { meta, .. }
             | TraceEvent::CheckpointCreated { meta, .. }
-            | TraceEvent::CheckpointRolledBack { meta, .. } => meta,
+            | TraceEvent::CheckpointRolledBack { meta, .. }
+            | TraceEvent::ModelCallFailed { meta, .. }
+            | TraceEvent::ModelCooldownEntered { meta, .. }
+            | TraceEvent::FallbackTriggered { meta, .. } => meta,
         }
     }
     pub fn variant_name(&self) -> &'static str {
@@ -398,6 +723,9 @@ impl TraceEvent {
             TraceEvent::RoundEnded { .. } => "RoundEnded",
             TraceEvent::CheckpointCreated { .. } => "CheckpointCreated",
             TraceEvent::CheckpointRolledBack { .. } => "CheckpointRolledBack",
+            TraceEvent::ModelCallFailed { .. } => "ModelCallFailed",
+            TraceEvent::ModelCooldownEntered { .. } => "ModelCooldownEntered",
+            TraceEvent::FallbackTriggered { .. } => "FallbackTriggered",
         }
     }
     pub fn body_for_pretty(&self) -> String {
@@ -449,7 +777,29 @@ impl TraceEvent {
                     diff_summary.files_changed, diff_summary.insertions, diff_summary.deletions),
             TraceEvent::CheckpointRolledBack { checkpoint_id, mode, rolled_back_to, .. } =>
                 format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
-        }
+            TraceEvent::ModelCallFailed { model_id, attempt_index, latency_ms, error_kind, cooldown_secs, error_message, .. } => {
+                let cooldown_str = match cooldown_secs {
+                    Some(s) => format!("{}s", s),
+                    None => "n/a".into(),
+                };
+                // 截断避免 trace 行无界增长；保留尾部 … 标记
+                let msg = if error_message.len() > 200 {
+                    format!("{}…", &error_message[..200])
+                } else {
+                    error_message.clone()
+                };
+                format!("model={} attempt={} latency={}ms kind={} cooldown={} message={:?}",
+                    model_id, attempt_index, latency_ms, error_kind.label(),
+                    cooldown_str, msg)
+            }
+            TraceEvent::ModelCooldownEntered { model_id, cooldown_secs, trigger_kind, .. } =>
+                format!("model={} cooldown={}s trigger={} hint=\"{}\"",
+                    model_id, cooldown_secs, trigger_kind.label(), trigger_kind.user_hint()),
+            TraceEvent::FallbackTriggered { from_model, to_model, reason, cause_kind, .. } => {
+                let cause = cause_kind.as_ref().map(|k| format!("cause={}", k.label())).unwrap_or_default();
+                format!("from={} -> to={:?} reason={:?} {}", from_model, to_model, reason, cause)
+            }
+         }
     }
     /// Metadata-only projection for IndexSink. Returns None for
     /// events that have no indexable information.
@@ -570,7 +920,32 @@ impl TraceEvent {
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
             },
-        })
+            TraceEvent::ModelCallFailed { model_id, attempt_index, latency_ms, error_kind, cooldown_secs, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ModelCallFailed".into(),
+                model_id: Some(model_id.clone()), latency_ms: Some(*latency_ms),
+                tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("attempt={} kind={} hint=\"{}\" cooldown={}",
+                    attempt_index, error_kind.label(), error_kind.user_hint(),
+                    match cooldown_secs { Some(s) => format!("{}s", s), None => "n/a".into() }),
+            },
+            TraceEvent::ModelCooldownEntered { model_id, cooldown_secs, trigger_kind, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ModelCooldownEntered".into(),
+                model_id: Some(model_id.clone()), latency_ms: None,
+                tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("{}s trigger={}", cooldown_secs, trigger_kind.label()),
+            },
+            TraceEvent::FallbackTriggered { from_model, to_model, reason, cause_kind, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "FallbackTriggered".into(),
+                model_id: Some(from_model.clone()), latency_ms: None,
+                tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("-> {:?} reason={:?} cause={}",
+                    to_model, reason,
+                    cause_kind.as_ref().map(|k| k.label()).unwrap_or("none")),
+            },
+         })
     }
 }
 
@@ -702,7 +1077,6 @@ pub struct FanoutSink { sinks: Vec<std::sync::Arc<dyn TraceSink>> }
 impl FanoutSink {
     pub fn new(sinks: Vec<std::sync::Arc<dyn TraceSink>>) -> Self { Self { sinks } }
     pub fn push(&mut self, s: std::sync::Arc<dyn TraceSink>) { self.sinks.push(s); }
-    pub fn children(&self) -> &[std::sync::Arc<dyn TraceSink>] { &self.sinks }
 }
 
 impl TraceSink for FanoutSink {
@@ -752,7 +1126,10 @@ impl TraceSink for ScopedSink {
             | TraceEvent::RoundStarted { meta, .. }
             | TraceEvent::RoundEnded { meta, .. }
             | TraceEvent::CheckpointCreated { meta, .. }
-            | TraceEvent::CheckpointRolledBack { meta, .. } => {
+            | TraceEvent::CheckpointRolledBack { meta, .. }
+            | TraceEvent::ModelCallFailed { meta, .. }
+            | TraceEvent::ModelCooldownEntered { meta, .. }
+            | TraceEvent::FallbackTriggered { meta, .. } => {
                 meta.role = self.role.clone();
             }
         }
@@ -896,6 +1273,96 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert!(v.get("SessionEnd").is_some(), "line missing SessionEnd: {}", line);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: 之前 `ModelErrorKind::Other(String)` 是 tagged newtype variant，
+    /// `#[serde(tag = "kind")]` 模式不支持 newtype，导致 `JsonlSink::emit`
+    /// 在 `serde_json::to_string` 处 panic（"cannot serialize tagged newtype
+    /// variant ... containing a string"），整条 trace 写不进去。
+    /// 同样的坑也存在于 Stream/Serde/Config（newtype variants），全
+    /// 改成 `{ message: String }` 后必须都能 round-trip。
+    /// 这个测试同时覆盖了"kind 字段是 snake_case" 和 "message 字段被保留"。
+    #[test]
+    fn model_error_kind_struct_variants_serialize() {
+        let cases = vec![
+            (ModelErrorKind::Timeout, r#"{"kind":"timeout"}"#),
+            (ModelErrorKind::ConnectFailed, r#"{"kind":"connect_failed"}"#),
+            (ModelErrorKind::Auth, r#"{"kind":"auth"}"#),
+            (ModelErrorKind::ModelNotFound, r#"{"kind":"model_not_found"}"#),
+            (
+                ModelErrorKind::RateLimited { retry_after_secs: 1.5 },
+                r#"{"kind":"rate_limited","retry_after_secs":1.5}"#,
+            ),
+            (
+                ModelErrorKind::Http { status: 503, message: "down".into() },
+                r#"{"kind":"http","status":503,"message":"down"}"#,
+            ),
+            (
+                ModelErrorKind::Stream { message: "sse died".into() },
+                r#"{"kind":"stream","message":"sse died"}"#,
+            ),
+            (
+                ModelErrorKind::Serde { message: "bad json".into() },
+                r#"{"kind":"serde","message":"bad json"}"#,
+            ),
+            (
+                ModelErrorKind::Config { message: "no api_key".into() },
+                r#"{"kind":"config","message":"no api_key"}"#,
+            ),
+            (
+                ModelErrorKind::CooldownHit { cooldown_remaining_secs: 10.0 },
+                r#"{"kind":"cooldown_hit","cooldown_remaining_secs":10.0}"#,
+            ),
+            (
+                ModelErrorKind::Other { message: "http: error decoding response body".into() },
+                r#"{"kind":"other","message":"http: error decoding response body"}"#,
+            ),
+        ];
+        for (kind, expected_json) in cases {
+            let json = serde_json::to_string(&kind)
+                .unwrap_or_else(|e| panic!("serialize {:?} failed: {}", kind, e));
+            // 精确匹配 JSON 输出：确保字段名是 snake_case 且 message 保留，
+            // 不允许 silently 改成其他表示。
+            assert_eq!(json, expected_json, "unexpected JSON for {:?}", kind);
+            // 反过来也要能解出来：保证反序列化路径不会因为字段缺失而 panic。
+            let back: ModelErrorKind = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("deserialize {} failed: {}", json, e));
+            assert_eq!(back, kind, "round-trip mismatch for {:?}", kind);
+        }
+    }
+
+    /// 直接打 JsonlSink：保证 "Other" 事件能完整写进文件，
+    /// 不再让 trace 写盘 panic 蔓延到上层。
+    #[test]
+    fn jsonl_sink_handles_other_kind_without_panic() {
+        let dir = std::env::temp_dir().join(format!("latte-test-other-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trace.jsonl");
+        let sink = JsonlSink::new(path.clone());
+        sink.emit(TraceEvent::ModelCallFailed {
+            meta: TraceMeta::test_default(),
+            model_id: "MiniMax-M3".into(),
+            attempt_index: 0,
+            latency_ms: 18936,
+            error_kind: ModelErrorKind::Other {
+                message: "HTTP error: error decoding response body".into(),
+            },
+            error_message: "HTTP error: error decoding response body".into(),
+            cooldown_secs: Some(10),
+        });
+        drop(sink);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let line = content.lines().next().expect("trace file empty");
+        let v: serde_json::Value = serde_json::from_str(line)
+ .unwrap_or_else(|e| panic!("trace jsonl unreadable: {} -- line: {}", e, line));
+        // 关键不变量：error_kind.kind 字段是 "other"，message 字段保留原文，
+        // 防止 someone 重新把 Other 改回 newtype variant 又 panic 一次。
+        assert_eq!(v["ModelCallFailed"]["error_kind"]["kind"], "other");
+        assert_eq!(
+            v["ModelCallFailed"]["error_kind"]["message"],
+            "HTTP error: error decoding response body"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

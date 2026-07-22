@@ -30,9 +30,54 @@ use crate::scheduler::{plan_md_slice_for, RoundScheduler};
 use crate::session::{SessionManager, SessionRecord, SessionState};
 use crate::subsession::SubsessionStore;
 use crate::supervisor::{Supervisor, SupervisorConfig};
-use crate::trace::FanoutSink;
+use crate::trace::{FanoutSink, ModelErrorKind};
 use crate::workspace::WorkspaceManager;
 use crate::AgentResult;
+
+/// 把 `AgentError` 投影成 `ModelErrorKind`。`Controller` 端
+/// 收到 `turn failed: {AgentError}` 时，把 e 转成 kind 写进
+/// `ChatEvent::Error.kind`，让消费方拿到结构化分类。
+///
+/// 设计原则：**保真**优先于**聚合**——不同 AgentError 投影到
+/// 不同 ModelErrorKind，缺口的走 `Other`。后续可以扩展 matches。
+fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
+    match e {
+        // Config 系：user 可修
+        AgentError::Config(s) => ModelErrorKind::Config { message: s.clone() },
+        AgentError::Template(role, _) => ModelErrorKind::Config { message: format!("template render: {role}") },
+        AgentError::TemplateNotFound(p) => ModelErrorKind::Config { message: format!("template not found: {p}") },
+        AgentError::RoleNotFound(r) => ModelErrorKind::Config { message: format!("role not found: {r}") },
+        AgentError::ModelNotFound(m) => ModelErrorKind::Config { message: format!("model not found: {m}") },
+        AgentError::ModelResolutionFailed { role, tier, reason } => {
+            ModelErrorKind::Config { message: format!("resolution failed for {role}/{tier}: {reason}") }
+        }
+        AgentError::InvalidParam(s) => ModelErrorKind::Config { message: s.clone() },
+        // AI client：转发 helper 的分类
+        AgentError::AiClient(ai_err) => ModelErrorKind::from(ai_err),
+        // 工具 / 上层
+        AgentError::Tool(s) => ModelErrorKind::Other { message: format!("tool: {s}") },
+        AgentError::TokenBudgetExceeded { .. } => ModelErrorKind::Config { message: "token budget exceeded".into() },
+        AgentError::MaxToolRoundsExceeded(_) => ModelErrorKind::Other { message: "max tool rounds exceeded".into() },
+        AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other { message: format!("tool loop: {tool}") },
+        AgentError::Orchestration(s) => ModelErrorKind::Other { message: format!("orchestration: {s}") },
+        AgentError::ModelsUnavailable { tried, .. } => {
+            // 告诉前端这是"全部模型都不可用"，已不是单点错误
+            ModelErrorKind::Other { message: format!("all models unavailable (tried {})", tried.len()) }
+        }
+        AgentError::HookAborted { hook, .. } => ModelErrorKind::Other { message: format!("hook aborted: {hook}") },
+        AgentError::Io(io) => ModelErrorKind::Other { message: format!("io: {io}") },
+    }
+}
+
+/// 把任意 `AgentError` + 上下文 prefix 打包成 `ChatEvent::Error`，
+/// 让 controller 端的 5 处 Error 构造点（turn failed / switch role /
+/// switch model 等）走同一投影，UI/CLI 拿到一致的 `kind`。
+fn error_event(e: &AgentError, prefix: &str) -> ChatEvent {
+    ChatEvent::Error {
+        kind: Some(agent_error_to_kind(e)),
+        message: format!("{prefix}: {e}"),
+    }
+}
 fn truncate_event_text(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -96,18 +141,19 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
 /// `{"Status":{"message":"..."}}`. This is the canonical contract
 /// consumed by `latte-code-editor` and the `chat --output json` JSONL
 /// stream; the variant name is the outer object key.
-///
-/// Other frontends (e.g. `latte-agent ui`) translate the externally-
-/// tagged shape into their own preferred discriminated-union form
-/// (`{type:"Status",...}`) at the transport boundary — the single
-/// implementation of that translation is
-/// [`crate::event_json::chat_event_to_frontend_json`] (contract C2),
-/// shared by the axum UI server and the Tauri adapter. Do **not** add
-/// `#[serde(tag = "type")]` here — it would break the existing
-/// Tauri / CLI consumers.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ChatEvent {
-    /// One role's completed turn.
+    /// Error message.
+    ///
+    /// `kind` 是结构化的错误分类（ModelErrorKind）—— 让 CLI / UI /
+    /// 桌面端能基于**分类**做事（着色、自动建议、统计）。`message`
+    /// 保留为人类可读原文。`kind` 是 `Option`，让旧 consumer 反
+    /// 序列化旧 JSON（缺 kind 字段）时不报错；新构造点应填。
+    Error {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ModelErrorKind>,
+        message: String,
+    },
     /// `sub_id` (optional) links this turn to a specific delegate subsession.
     RoleTurn {
         role_id: String,
@@ -142,9 +188,6 @@ pub enum ChatEvent {
     RoleFinished { role_id: String, detail: String },
     /// Session finished (aborted or quit).
     Done,
-    /// Error message.
-    Error { message: String },
-    /// List of available roles (response to `/roles`).
     RoleList {
         roles: Vec<RoleInfo>,
     },
@@ -629,6 +672,7 @@ async fn run_multi_role_loop(
         Ok(root) => root,
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: format!("无法解析仓库根目录: {e}"),
             });
             return;
@@ -638,6 +682,7 @@ async fn run_multi_role_loop(
         Some(id) => id.clone(),
         None => {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: "multi-role 模式需要 task_id".into(),
             });
             return;
@@ -653,6 +698,7 @@ async fn run_multi_role_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
                     message: format!("读取 session 文件失败: {e}"),
                 });
                 return;
@@ -662,6 +708,7 @@ async fn run_multi_role_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
                     message: format!("解析 session JSON 失败: {e}"),
                 });
                 return;
@@ -679,6 +726,7 @@ async fn run_multi_role_loop(
         if session_mgr.state() == SessionState::Paused {
             if let Err(e) = session_mgr.resume() {
                 let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
                     message: format!("resume 失败: {e}"),
                 });
                 return;
@@ -692,22 +740,23 @@ async fn run_multi_role_loop(
             Some(p) => p.clone(),
             None => {
                 let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
                     message: format!("task '{task_id}' 无 session，需要 initial_prompt"),
                 });
                 return;
             }
         };
         let bb = crate::workspace::Blackboard::new(worktree_root.join("plan.md"));
-        if let Err(e) = bb.write(&format!(
-            "# Task: {task_id}\n\n## Initial prompt\n\n{prompt}\n"
-        )) {
+        if let Err(e) = bb.write(&format!("# {task_id}\n\n{prompt}")) {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: format!("写入 plan.md 失败: {e}"),
             });
             return;
         }
         if let Err(e) = session_mgr.persist() {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: format!("持久化 session 失败: {e}"),
             });
             return;
@@ -733,12 +782,14 @@ async fn run_multi_role_loop(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: format!("scheduler init error: {e}"),
             });
             return;
         }
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: format!("scheduler join error: {e}"),
             });
             return;
@@ -815,6 +866,7 @@ async fn run_multi_role_loop(
             }
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
                     message: format!("构建 role '{role_id}' runner 失败: {e}"),
                 });
                 return;
@@ -1207,6 +1259,7 @@ async fn run_single_role_loop(
         Ok(r) => r,
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
+                kind: None,
                 message: format!("构建 runner 失败: {e}"),
             });
             return;
@@ -1303,7 +1356,7 @@ async fn run_single_role_loop(
                                             let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
                                             let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                                         }
-                                        Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("switch role failed: {e}") }); }
+                                        Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed")); }
                                     }
                                 }
                                 "/model" => {
@@ -1322,7 +1375,7 @@ async fn run_single_role_loop(
                                                     current_tier = new_tier;
                                                     let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                                                 }
-                                                Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("switch model failed: {e}") }); }
+                                                Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed")); }
                                             }
                                         }
                                         Err(e) => { let _ = event_tx.send(ChatEvent::Status { message: format!("invalid tier: {e}") }); }
@@ -1372,6 +1425,7 @@ async fn run_single_role_loop(
                                         detail: format!("timeout after {timeout_secs}s"),
                                     });
                                     let _ = event_tx.send(ChatEvent::Error {
+                                        kind: Some(ModelErrorKind::Other { message: format!("turn-level timeout after {timeout_secs}s") }),
                                         message: format!("turn timed out after {timeout_secs}s"),
                                     });
                                     continue;
@@ -1400,7 +1454,7 @@ async fn run_single_role_loop(
                                     role_id: current_role.clone(),
                                     detail: format!("error: {e}"),
                                 });
-                                let _ = event_tx.send(ChatEvent::Error { message: format!("turn failed: {e}") });
+                                let _ = event_tx.send(error_event(&e, "turn failed"));
                             }
                         }
                     }
@@ -1416,7 +1470,7 @@ async fn run_single_role_loop(
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
                                 let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                             }
-                            Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("switch role failed: {e}") }); }
+                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed")); }
                         }
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
@@ -1428,7 +1482,7 @@ async fn run_single_role_loop(
                                 current_tier = new_tier;
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                             }
-                            Err(e) => { let _ = event_tx.send(ChatEvent::Error { message: format!("switch model failed: {e}") }); }
+                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed")); }
                         }
                     }
                     Some(ControllerInput::Pause) => {
