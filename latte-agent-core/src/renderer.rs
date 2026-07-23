@@ -138,6 +138,22 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::WorkflowFinished { name, status, summary, .. } => {
                 self.on_status(&format!("workflow {name} {status}: {summary}")).await;
             }
+            // Soft-timeout warning: turn is still alive at this point — the
+            // UI side turns it into a "continue / cancel" prompt. The CLI
+            // just surfaces it as a status line so the operator can see
+            // the budget has been blown.
+            ChatEvent::TimeoutWarning {
+                role_id,
+                elapsed_secs,
+                soft_timeout_secs,
+                hard_timeout_secs,
+                ..
+            } => {
+                self.on_status(&format!(
+                    "[{role_id} soft-timeout: {elapsed_secs}s ≥ {soft_timeout_secs}s (hard kill at {hard_timeout_secs}s)]"
+                ))
+                .await;
+            }
         }
     }
 }

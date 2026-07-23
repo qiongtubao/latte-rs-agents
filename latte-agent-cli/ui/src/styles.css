@@ -1482,3 +1482,70 @@ select {
   flex: 1;
   white-space: pre-wrap;
 }
+
+/* ─── timeout-prompt (TimeoutWarning banner) ────────────────── */
+.timeout-prompt {
+  position: relative;
+  background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+  border: 1px solid #f59e0b;
+  border-left: 4px solid #f59e0b;
+  border-radius: 10px;
+  padding: 12px 14px 12px 16px;
+  margin: 12px 0;
+  font-size: 0.9em;
+  color: #78350f;
+  box-shadow: 0 2px 6px rgba(245, 158, 11, 0.15);
+  /* 与左右聊天气泡视觉上保持一定距离，看起来像"系统提示" */
+  max-width: 92%;
+  margin-left: auto;
+  margin-right: auto;
+}
+.timeout-prompt__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 0.95em;
+}
+.timeout-prompt__icon {
+  font-size: 1.2em;
+  line-height: 1;
+}
+.timeout-prompt__body {
+  margin: 4px 0 10px;
+  line-height: 1.5;
+  color: #92400e;
+}
+.timeout-prompt__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.timeout-prompt__btn {
+  border: 1px solid #d97706;
+  background: #fffbeb;
+  color: #78350f;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.88em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+}
+.timeout-prompt__btn:hover {
+  background: #fde68a;
+  border-color: #b45309;
+}
+.timeout-prompt__btn:active {
+  transform: translateY(1px);
+}
+.timeout-prompt__btn--cancel {
+  background: #fef2f2;
+  border-color: #dc2626;
+  color: #991b1b;
+}
+.timeout-prompt__btn--cancel:hover {
+  background: #fecaca;
+  border-color: #b91c1c;
+}

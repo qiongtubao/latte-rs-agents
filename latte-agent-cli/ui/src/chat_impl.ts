@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn } from "./api";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import type { CodeRef } from "./host";
 
@@ -90,6 +90,10 @@ export function mountChat(opts: {
   const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onShowSessionLog, onEditRole } = opts;
   let msgCounter = 0;
   let turnStartTime = 0;
+  /** 当前显示的「超时询问」条；同一 role 重复触发替换之，
+   *  跨 role 的并行执行按 role 维度分别保留。 */
+  let timeoutPromptEl: HTMLElement | null = null;
+  let timeoutPromptRole: string | null = null;
 
   // ── Delegate tracking (keyed by sub_id for parallel delegates) ──
   interface DelegateInfo {
@@ -724,6 +728,67 @@ export function mountChat(opts: {
       document.getElementById("subagentOverlay")!.style.display = "none";
     }
   });
+  // ── Timeout prompt ──────────────────────────────────────────────
+  //
+  // 后端在 turn 跑过 soft_timeout_secs 时推 `TimeoutWarning` 上来，
+  // 我们渲染一条「继续等待 / 终止当前任务」询问条挂在消息流最
+  // 顶端。同 role 再次触发替换；turn 自然结束（RoleTurn / RoleFinished
+  // / Error 之一到达）时移除。硬超时兜底由后端 hard_timeout_secs
+  // 触发，到时 Error 事件把执行状态行切到 .error。
+  function hideTimeoutPrompt(roleId: string): void {
+    if (timeoutPromptRole === roleId && timeoutPromptEl) {
+      timeoutPromptEl.remove();
+      timeoutPromptEl = null;
+      timeoutPromptRole = null;
+    }
+  }
+  function showTimeoutPrompt(ev: Extract<ChatEvent, { type: "TimeoutWarning" }>): void {
+    // 同一 role 已经在显示 prompt → 替换；不同 role 串行覆盖（不
+    // 维护 per-role map —— 现阶段单 turn 一次只跑一个 role，
+    // 真正的并行来自 delegate（不带 TimeoutWarning，交给 delegate
+    // 的 cancel_flag 路径），所以覆盖式就够）。
+    if (timeoutPromptEl && timeoutPromptRole !== ev.role_id) {
+      // 另一条 prompt 还在：旧的关掉，新的替上来。
+      timeoutPromptEl.remove();
+      timeoutPromptEl = null;
+    }
+    if (timeoutPromptEl) timeoutPromptEl.remove();
+
+    const node = document.createElement("div");
+    node.className = "timeout-prompt";
+    node.dataset.roleId = ev.role_id;
+    node.innerHTML = `
+      <div class="timeout-prompt__head">
+        <span class="timeout-prompt__icon">⏳</span>
+        <strong>${roleIcon(ev.role_id)} ${ev.role_id} 已运行 ${ev.elapsed_secs}s</strong>
+      </div>
+      <div class="timeout-prompt__body">
+        超过设定的 ${ev.soft_timeout_secs}s 软超时（硬超时将在 ${ev.hard_timeout_secs}s 强制终止）。
+        是否继续等待？
+      </div>
+      <div class="timeout-prompt__actions">
+        <button class="timeout-prompt__btn timeout-prompt__btn--continue" data-act="continue">继续等待</button>
+        <button class="timeout-prompt__btn timeout-prompt__btn--cancel" data-act="cancel">终止当前任务</button>
+      </div>
+    `;
+    // 「继续等待」只关掉 banner，不动后端（turn 继续跑）。
+    node.querySelector('[data-act="continue"]')!.addEventListener("click", () => {
+      hideTimeoutPrompt(ev.role_id);
+    });
+    // 「终止当前任务」发 cancel-turn + 关 banner。后端会立刻丢掉
+    // run_turn future，session 继续接收新输入。
+    node.querySelector('[data-act="cancel"]')!.addEventListener("click", () => {
+      hideTimeoutPrompt(ev.role_id);
+      void cancelTurn().catch((e) => {
+        console.error("[chat] cancelTurn failed", e);
+      });
+    });
+    // 插到 messages 流的最顶端（在 user / role / tool 消息之前），
+    // 让用户一眼就能看到。
+    container.messagesEl.insertBefore(node, container.messagesEl.firstChild);
+    timeoutPromptEl = node;
+    timeoutPromptRole = ev.role_id;
+  }
   function handleEvent(e: ChatEvent): void {
     switch (e.type) {
       case "RoleStarted": {
@@ -761,6 +826,10 @@ export function mountChat(opts: {
           // 没有匹配的 executing 行（边角事件）—— 退回老行为
           addMessage({ kind: "status", content: `✅ ${e.role_id} 完成`, meta: e.role_id, state: "done" });
         }
+        // turn 结束（不论 ok / failed）就把这条 role 的 timeout
+        // prompt 收起来 —— 后端不会再推 TimeoutWarning，下一次
+        // Warning 出现时再重新展示。
+        hideTimeoutPrompt(e.role_id);
         break;
       }
       case "UserMessage": {
@@ -979,6 +1048,16 @@ export function mountChat(opts: {
         resetWaitTimer();
         break;
       }
+      case "TimeoutWarning": {
+        // 后端报告：当前 turn 跑过 soft timeout 但仍在跑。后端
+        // 不会自动终止 —— 弹出「继续等待 / 终止当前任务」让用户
+        // 决定，硬超时（hard_timeout_secs）才会兜底强杀。
+        //
+        // 多次 TimeoutWarning 进来时替换之前那条（同一 role 继续
+        // 跑就会有）；不同 role 的同时执行则按 role 维度跟踪。
+        showTimeoutPrompt(e);
+        break;
+      }
       case "Error": {
         setStatus("connected");
         clearWaitTimer();
@@ -1010,10 +1089,12 @@ export function mountChat(opts: {
           }
           executingRowByRole.delete(targetRole);
           executingSubIdByRole.delete(targetRole);
-        } else {
-          addMessage({ kind: "error", content: e.message, meta: "error", subId: errSubId, state: "error" });
+         } else {
         }
         setFooter(`错误: ${truncate(e.message, 80)}`);
+        // turn 失败 —— TimeoutWarning 失去意义（后端不会再有新
+        // warning），把 banner 收掉。
+        if (targetRole) hideTimeoutPrompt(targetRole);
         break;
       }
       default: console.warn("[chat] unknown event", e);
@@ -1064,6 +1145,12 @@ export function mountChat(opts: {
     currentActivity="";
     currentDelegate="";
     delegateRunning=false;
+    // 清掉残留的 timeout 询问条（切 session / 强制 clear 都用）。
+    if (timeoutPromptEl) {
+      timeoutPromptEl.remove();
+      timeoutPromptEl = null;
+      timeoutPromptRole = null;
+    }
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {
@@ -1075,6 +1162,14 @@ export function mountChat(opts: {
       // History replay leaves no in-flight delegate/timer state.
       clearAllDelegates();
       subagentTools.length = 0;
+      // Replay 完发现 banner 还在（说明后端当时正在跑 turn）→
+      // 关掉 —— replay 表达的是"已经发生过的历史"，不应该有
+      // 正在等的 prompt。
+      if (timeoutPromptEl) {
+        timeoutPromptEl.remove();
+        timeoutPromptEl = null;
+        timeoutPromptRole = null;
+      }
       clearWaitTimer();
       setStatus("connected");
     }

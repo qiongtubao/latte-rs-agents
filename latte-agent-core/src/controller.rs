@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use latte_ai::models::{Message, Role as MsgRole};
 use latte_ai::params::GenerateParams;
@@ -285,6 +286,25 @@ pub enum ChatEvent {
         status: String,
         summary: String,
     },
+    /// Turn soft-timeout warning: the current turn has been running
+    /// longer than the configured soft timeout but is still alive.
+    /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
+    /// instead of silently killing the turn. The hard kill fires at
+    /// `hard_timeout_secs` if the user does not act.
+    ///
+    /// `role_id` identifies which role's turn is over-budget; for the
+    /// main single-role loop this is the active role, for multi-role
+    /// it is the role currently speaking. `sub_id` is set when the
+    /// over-budget turn is a delegate subsession, so the UI's
+    /// "查看日志" action can jump straight to the subagent transcript.
+    TimeoutWarning {
+        role_id: String,
+        elapsed_secs: u64,
+        soft_timeout_secs: u64,
+        hard_timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -303,6 +323,13 @@ enum ControllerInput {
     SwitchRole(String),
     SwitchModel(ModelTier),
     Abort,
+    /// Cancel only the in-flight turn (the one currently waiting on
+    /// the LLM). Distinct from `Abort`, which tears down the entire
+    /// session. The UI sends this when the user picks "终止当前任务"
+    /// from a `TimeoutWarning` prompt. The driver flips a per-turn
+    /// flag, the run_turn future is dropped, and the session loop
+    /// moves on to the next user input.
+    CancelTurn,
     /// Advisor monitor correction hint. The driver pushes it into the
     /// current runners' shared in-memory hint queue (see
     /// `AgentRunner::with_advisor_hints`); it is NOT a new user
@@ -377,6 +404,13 @@ pub struct ChatController {
     event_tx: broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     pause_requested: Arc<AtomicBool>,
+    /// Per-turn cancellation flag, distinct from `cancel_flag`
+    /// (which aborts the whole session). The driver arms it before
+    /// awaiting `run_turn` and clears it after the turn resolves; the
+    /// UI sends `CancelTurn` to flip it. Lets the user abort just the
+    /// currently-running turn (e.g. from a `TimeoutWarning` prompt)
+    /// without losing the rest of the session.
+    turn_cancel_flag: Arc<AtomicBool>,
     /// Shared advisor hint queue. The producer side is
     /// `advisor_hint()` (called by the AdvisorMonitor); the consumer
     /// side is every runner the driver builds
@@ -403,6 +437,7 @@ impl ChatController {
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pause_requested: Arc::new(AtomicBool::new(false)),
+            turn_cancel_flag: Arc::new(AtomicBool::new(false)),
             advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
         }
@@ -420,10 +455,20 @@ impl ChatController {
         let event_tx = self.event_tx.clone();
         let cancel_flag = self.cancel_flag.clone();
         let pause_flag = self.pause_requested.clone();
+        let turn_cancel_flag = self.turn_cancel_flag.clone();
         let advisor_hints = self.advisor_hints.clone();
 
         tokio::spawn(async move {
-            run_driver(config, input_rx, &event_tx, cancel_flag, pause_flag, advisor_hints).await;
+            run_driver(
+                config,
+                input_rx,
+                &event_tx,
+                cancel_flag,
+                pause_flag,
+                turn_cancel_flag,
+                advisor_hints,
+            )
+            .await;
         });
 
         self.event_tx.subscribe()
@@ -510,6 +555,15 @@ impl ChatController {
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
             let _ = tx.send(ControllerInput::Abort);
         }
+    }
+    /// Cancel only the in-flight turn (the one currently awaiting
+    /// the LLM). Distinct from `abort`, which tears down the whole
+    /// session. The driver flips `turn_cancel_flag`, aborts the
+    /// `run_turn` JoinHandle, and the session loop moves on to
+    /// the next user input. UI sends this when the user picks
+    /// "终止当前任务" from a `TimeoutWarning` prompt.
+    pub fn cancel_turn(&self) {
+        self.turn_cancel_flag.store(true, Ordering::SeqCst);
     }
 
     /// Get a subscriber that receives all future events.
@@ -653,14 +707,32 @@ async fn run_driver(
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
     if is_multi {
-        run_multi_role_loop(config, &mut input_rx, event_tx, cancel_flag, &*pause_flag, advisor_hints).await;
+        run_multi_role_loop(
+            config,
+            &mut input_rx,
+            event_tx,
+            cancel_flag,
+            &*pause_flag,
+            turn_cancel_flag,
+            advisor_hints,
+        )
+        .await;
     } else {
-        run_single_role_loop(config, &mut input_rx, event_tx, cancel_flag, advisor_hints).await;
+        run_single_role_loop(
+            config,
+            &mut input_rx,
+            event_tx,
+            cancel_flag,
+            turn_cancel_flag,
+            advisor_hints,
+        )
+        .await;
     }
 
     let _ = event_tx.send(ChatEvent::Done);
@@ -674,6 +746,7 @@ async fn run_multi_role_loop(
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     pause_flag: &AtomicBool,
+    turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
 ) {
     // Resolve worktree root
@@ -921,6 +994,13 @@ async fn run_multi_role_loop(
                     break 'rounds;
                 }
                 Some(ControllerInput::Abort) => break 'rounds,
+                // 取消当前 turn：仅打断正在跑的 run_turn，不退出
+                // 整个 round 循环。turn_cancel_flag 会被 run_turn
+                // 的 select! 循环检测到，丢弃该轮结果；下一轮用户
+                // 输入照常接收。
+                Some(ControllerInput::CancelTurn) => {
+                    turn_cancel_flag.store(true, Ordering::SeqCst);
+                }
                 Some(ControllerInput::Resume) => {}
                 Some(ControllerInput::AdvisorHint(text)) => {
                     advisor_hints.lock().push_back(text);
@@ -1244,6 +1324,7 @@ async fn run_single_role_loop(
     input_rx: &mut mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
 ) {
     let merged = &config.agent_config;
@@ -1434,20 +1515,110 @@ async fn run_single_role_loop(
                             runner.agent().model_chain.first().map(|mc| mc.model.id.as_str()),
                             "LATTE_AGENT_TURN_TIMEOUT_SECS",
                         );
-                        let turn_result = if let Some(timeout_secs) = turn_timeout_secs {
-                            match tokio::time::timeout(
-                                Duration::from_secs(timeout_secs),
-                                runner.run_turn(&[Message::user(trimmed)], None),
-                            ).await {
-                                Ok(result) => result,
-                                Err(_) => {
+                        // Run the turn with soft-warning + hard-kill semantics:
+                        //   * the soft timeout fires at `soft_secs` and emits
+                        //     a `TimeoutWarning` event; the turn is NOT
+                        //     killed — the UI shows a "继续等待 / 终止" prompt
+                        //     and the user decides.
+                        //   * the hard timeout fires at `hard_secs` (soft * mult,
+                        //     default 3) and force-kills the turn; this is a
+                        //     safety net for runaway cases where the user
+                        //     doesn't act on the warning.
+                        //   * `turn_cancel_flag` flips when the user picks
+                        //     "终止当前任务" — the in-flight run_turn future is
+                        //     dropped, the underlying LLM call is cancelled,
+                        //     and the session loop moves on.
+                        let turn_result = if let Some(soft_secs) = turn_timeout_secs {
+                            let hard_mult: u64 = std::env::var("LATTE_AGENT_TURN_HARD_TIMEOUT_MULT")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(3);
+                            let hard_secs = soft_secs.saturating_mul(hard_mult);
+                            let turn_started = Instant::now();
+                            // Clear any stale flag from a prior turn (the flag
+                            // is per-controller; defensive reset here keeps
+                            // turn boundaries clean).
+                            turn_cancel_flag.store(false, Ordering::SeqCst);
+                            // Pin the future on the heap so we can `select!`
+                            // between it and a 500ms ticker. `Box::pin` keeps
+                            // the borrowed `runner` alive across the loop and
+                            // dropping the box (when we `break`) cancels the
+                            // in-flight LLM call.
+                            // Bind both the message and the slice to locals
+                            // so they outlive every poll of the run_turn
+                            // future. `&[user_msg]` would otherwise be a
+                            // temporary that's freed at the end of this
+                            // statement, leaving the future with a dangling
+                            // borrow.
+                            let user_msg = [Message::user(trimmed.clone())];
+                            let mut turn_fut = Box::pin(runner.run_turn(
+                                &user_msg,
+                                None,
+                            ));
+                            let mut soft_warning_sent = false;
+                            let outcome: Result<String, &'static str> = loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                                        if cancel_flag.load(Ordering::SeqCst) {
+                                            break Err("session_cancelled");
+                                        }
+                                        if turn_cancel_flag.load(Ordering::SeqCst) {
+                                            break Err("turn_cancelled");
+                                        }
+                                        let elapsed = turn_started.elapsed();
+                                        if !soft_warning_sent
+                                            && elapsed >= Duration::from_secs(soft_secs)
+                                        {
+                                            soft_warning_sent = true;
+                                            let _ = event_tx.send(ChatEvent::TimeoutWarning {
+                                                role_id: current_role.clone(),
+                                                elapsed_secs: elapsed.as_secs(),
+                                                soft_timeout_secs: soft_secs,
+                                                hard_timeout_secs: hard_secs,
+                                                sub_id: None,
+                                            });
+                                        }
+                                        if elapsed >= Duration::from_secs(hard_secs) {
+                                            break Err("hard_timeout");
+                                        }
+                                    }
+                                    r = turn_fut.as_mut() => {
+                                        // r is the inner Result; preserve it.
+                                        // We map it through unchanged — error
+                                        // strings come from the original
+                                        // AgentError path on the consumer side.
+                                        break r.map(|s| s).map_err(|_| "turn_failed");
+                                    }
+                                }
+                            };
+                            // Drop turn_fut by exiting this `if let` branch
+                            // (the binding goes out of scope at the end of
+                            // the block; cancellation propagates through
+                            // Drop on the inner future).
+                            drop(turn_fut);
+                            match outcome {
+                                Ok(resp) => Ok(resp),
+                                Err(reason) => {
+                                    // 取消 / 硬超时 / session 取消都从这里
+                                    // 走：发 RoleFinished + Error（让 UI 能
+                                    // 着色、统计），然后 continue 跳过本 turn
+                                    // 的 response 渲染。
+                                    let detail = match reason {
+                                        "turn_cancelled" => "cancelled by user".to_string(),
+                                        "hard_timeout" => format!("hard-killed after {hard_secs}s"),
+                                        "session_cancelled" => "session cancelled".to_string(),
+                                        _ => "turn failed".to_string(),
+                                    };
                                     let _ = event_tx.send(ChatEvent::RoleFinished {
                                         role_id: current_role.clone(),
-                                        detail: format!("timeout after {timeout_secs}s"),
+                                        detail: detail.clone(),
                                     });
                                     let _ = event_tx.send(ChatEvent::Error {
-                                        kind: Some(ModelErrorKind::Other { message: format!("turn-level timeout after {timeout_secs}s") }),
-                                        message: format!("turn timed out after {timeout_secs}s"),
+                                        kind: Some(ModelErrorKind::Other {
+                                            message: detail.clone(),
+                                        }),
+                                        message: format!("turn {detail}"),
                                         sub_id: None,
                                     });
                                     continue;
@@ -1520,6 +1691,13 @@ async fn run_single_role_loop(
                         // via the direct `advisor_hint()` push, not
                         // this channel.)
                         advisor_hints.lock().push_back(text);
+                    }
+                    // 取消当前 turn：仅打断正在跑的 run_turn，不退出
+                    // 整个 session。run_single_role_loop 的 select! 循环
+                    // 会检测 turn_cancel_flag 并在下一个 500ms tick
+                    // 丢弃 run_turn future。
+                    Some(ControllerInput::CancelTurn) => {
+                        turn_cancel_flag.store(true, Ordering::SeqCst);
                     }
                     Some(ControllerInput::Abort) | None => break,
                 }
@@ -2686,6 +2864,52 @@ mod tests {
             other => panic!("expected DelegateStarted, got {other:?}"),
         }
     }
+    // ─── TimeoutWarning wire shape ─────────────────────────────
+    //
+    // The soft-timeout path emits this when a turn has been
+    // running past `soft_timeout_secs` but the user has not yet
+    // decided whether to cancel. The frontend surfaces a
+    // "继续等待 / 终止" prompt; the backend's hard-kill at
+    // `hard_timeout_secs` is the safety net. Pin the field names
+    // so a rename here doesn't silently break the UI.
+    #[test]
+    fn timeout_warning_serializes_to_frontend_shape() {
+        let event = ChatEvent::TimeoutWarning {
+            role_id: "programmer".into(),
+            elapsed_secs: 130,
+            soft_timeout_secs: 120,
+            hard_timeout_secs: 360,
+            sub_id: None,
+        };
+        let json = serde_json::to_value(&event).expect("serialize");
+        assert!(json.get("TimeoutWarning").is_some(), "missing variant tag");
+        assert_eq!(json["TimeoutWarning"]["role_id"], "programmer");
+        assert_eq!(json["TimeoutWarning"]["elapsed_secs"], 130);
+        assert_eq!(json["TimeoutWarning"]["soft_timeout_secs"], 120);
+        assert_eq!(json["TimeoutWarning"]["hard_timeout_secs"], 360);
+        // sub_id is None → must be skipped (not serialized as null)
+        // to keep wire shape lean.
+        assert!(
+            json["TimeoutWarning"].get("sub_id").is_none(),
+            "sub_id must be skipped when None"
+        );
+    }
+
+    #[test]
+    fn timeout_warning_carries_sub_id_for_delegate_subsession() {
+        // When a *delegate* subsession is the one over budget, the
+        // UI's "查看日志" action needs the sub_id to land on the
+        // subagent transcript directly.
+        let event = ChatEvent::TimeoutWarning {
+            role_id: "programmer".into(),
+            elapsed_secs: 150,
+            soft_timeout_secs: 120,
+            hard_timeout_secs: 360,
+            sub_id: Some("programmer-sub-99".into()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["TimeoutWarning"]["sub_id"], "programmer-sub-99");
+    }
 
     // ─── AdvisorHint driver plumbing ──────────────────────────────
     //
@@ -2825,6 +3049,165 @@ mod tests {
 
         controller.abort().await;
     }
+    // ─── Soft-timeout warning plumbing ───────────────────────────
+    //
+    // 验证 soft timeout → TimeoutWarning + turn 仍能完成的契约。
+    // Mock server 2s 响应 + model.timeout_secs=1s → 第 1s 触发软
+    // 警告，第 2s 拿到响应跑完；硬超时 3s 永远不到。
+    #[tokio::test]
+    async fn soft_timeout_emits_warning_then_completes_normally() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(Duration::from_millis(2_000))
+                            .set_body_string(
+                                serde_json::json!({
+                                    "id": "chatcmpl-test",
+                                    "object": "chat.completion",
+                                    "created": 0,
+                                    "model": "test",
+                                    "choices": [{
+                                        "index": 0,
+                                        "message": { "role": "assistant", "content": "slow but successful" },
+                                        "finish_reason": "stop"
+                                    }],
+                                    "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                                })
+                                .to_string(),
+                            ),
+                    ),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    id: "stub-slow".into(),
+                    name: "Stub Slow".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: Some(1),
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "programmer".to_string(),
+                RoleTemplate {
+                    id: "programmer".into(),
+                    name: "Programmer".into(),
+                    category: "execution".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "💻".into(),
+                    skills: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["programmer".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+        };
+
+        let controller = ChatController::new(64);
+        let mut rx = controller.spawn(cfg).await;
+
+        controller.submit_input("请分析这个慢请求").await;
+
+        // 收事件：期待 TimeoutWarning 在 t≈1s 到达；t≈2s 时 turn
+        // 拿到响应，RoleTurn + RoleFinished 收尾。
+        let mut saw_warning = false;
+        let mut soft_secs_observed = 0u64;
+        let mut hard_secs_observed = 0u64;
+        let mut saw_role_turn = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(ChatEvent::TimeoutWarning {
+                    role_id,
+                    elapsed_secs: _,
+                    soft_timeout_secs,
+                    hard_timeout_secs,
+                    sub_id,
+                })) => {
+                    assert_eq!(role_id, "programmer");
+                    assert_eq!(soft_timeout_secs, 1, "soft timeout must match model.timeout_secs");
+                    soft_secs_observed = soft_timeout_secs;
+                    hard_secs_observed = hard_timeout_secs;
+                    assert!(sub_id.is_none(), "single-role loop has no sub_id");
+                    saw_warning = true;
+                }
+                Ok(Ok(ChatEvent::RoleTurn { content, is_complete: true, .. })) => {
+                    if content.contains("slow but successful") {
+                        saw_role_turn = true;
+                    }
+                }
+                Ok(Ok(ChatEvent::RoleFinished { detail, .. })) => {
+                    assert!(
+                        !detail.contains("timeout"),
+                        "turn must not be reported as timed out: {detail}"
+                    );
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("recv error: {e}"),
+                Err(_) => continue,
+            }
+        }
+
+        assert!(saw_warning, "soft timeout must emit a TimeoutWarning event");
+        assert_eq!(soft_secs_observed, 1);
+        assert_eq!(
+            hard_secs_observed, 3,
+            "hard timeout must default to soft * 3 = 3s"
+        );
+        assert!(
+            saw_role_turn,
+            "the turn must still complete normally after the warning"
+        );
+
+        controller.abort().await;
+    }
+
 
     // ─── UserMessage 事件 ─────────────────────────────────────────
     //

@@ -138,6 +138,19 @@ export type ChatEvent =
   | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number }
   | { type: "WorkflowTurn"; wf_id: string; step_id: string; role_id: string; content: string; round: number }
   | { type: "WorkflowFinished"; name: string; wf_id: string; status: string; summary: string }
+  // Turn soft-timeout warning. The driver emits this when a turn
+  // has been running past its `soft_timeout_secs` but is still
+  // alive — the UI shows a "继续等待 / 终止当前任务" prompt and
+  // flips `turn_cancel_flag` server-side on the second choice. The
+  // hard kill fires at `hard_timeout_secs` as a safety net.
+  | {
+      type: "TimeoutWarning";
+      role_id: string;
+      elapsed_secs: number;
+      soft_timeout_secs: number;
+      hard_timeout_secs: number;
+      sub_id?: string;
+    }
   | {
       type: "SelfLoopEvent";
       kind: string;
@@ -147,7 +160,6 @@ export type ChatEvent =
       data?: unknown;
       timestamp_unix_ms: number;
     };
-
 export interface SelfLoopEvent {
   kind: "started" | "iteration" | "log" | "screenshot" | "done" | "error";
   iteration: number;
@@ -294,6 +306,15 @@ export async function sendMessage(message: string): Promise<void> {
 
 export async function sendCommand(command: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/command", chatBody({ command }));
+}
+
+/** Cancel only the in-flight turn (the one currently waiting on the
+ *  LLM). Distinct from deleting the session: cancel preserves the
+ *  session and history, just drops the current run_turn future and
+ *  lets the user type a new message. Wired to the
+ *  `TimeoutWarning` prompt's "终止当前任务" button. */
+export async function cancelTurn(): Promise<void> {
+  await getTransport().request("POST", "/api/chat/cancel-turn", chatBody({}));
 }
 
 export async function switchRole(role_id: string): Promise<void> {

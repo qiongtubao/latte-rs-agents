@@ -304,6 +304,13 @@ impl SessionHandle {
         *self.controller.lock() = Some(c.clone());
         Ok(c)
     }
+    /// Try to grab the controller without spawning. Returns None when
+    /// the session is still in the "restored from disk, no chat yet"
+    /// state. Used by per-turn operations like `cancel_turn` that
+    /// must NOT lazily spawn a controller just to no-op it.
+    pub(crate) fn try_controller(&self) -> Option<Arc<ChatController>> {
+        self.controller.lock().clone()
+    }
 
     /// delete 路径：起过 controller 才 abort（恢复未激活的 no-op）。
     pub(crate) async fn abort_if_spawned(&self) {
