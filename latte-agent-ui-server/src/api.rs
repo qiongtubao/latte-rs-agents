@@ -615,26 +615,36 @@ pub async fn chat_switch_role(
 /// 与 `DELETE /api/sessions` 不同：后者是整个 session abort + 落盘
 /// 删除（`chat_controller_abort` 语义），这里是 per-turn cancel。
 /// 名字上的区分很重要 —— cancel 暗示"这个 turn 不要了，但 session
-/// 继续"；abort 暗示"整个 session 都没了"。
 pub async fn chat_cancel_turn(
     b: &UiBackend,
     session_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
-    // 不需要 lazy spawn —— 没在跑的 controller 上调 cancel_turn 是
-    // no-op（flag 被忽略），也不该去 spawn 一个新的只为了一次 cancel。
     if let Some(controller) = h.try_controller() {
-        controller.cancel_turn();
+        controller.cancel_turn().await;
         Ok(())
     } else {
-        // 没有 controller 在跑：等同 no-op，UI 收到 200 即可
-        // 关掉 banner。
         Ok(())
     }
 }
 
-// ─── Traces ───────────────────────────────────────────────────────
+/// `POST /api/chat/abort` — 终止整个 session（所有 in-flight
+/// subagent / workflow / multi-role 全部停止）。不删 session，
+/// 归档事件保留。
+pub async fn chat_abort(
+    b: &UiBackend,
+    session_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.abort().await;
+    Ok(())
+}
 
 #[derive(Serialize)]
 pub struct TraceSummary {

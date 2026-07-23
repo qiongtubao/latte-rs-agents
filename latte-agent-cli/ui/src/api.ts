@@ -317,6 +317,13 @@ export async function cancelTurn(): Promise<void> {
   await getTransport().request("POST", "/api/chat/cancel-turn", chatBody({}));
 }
 
+/** Abort the entire session immediately (all in-flight turns, all
+ *  subagents, all workflows). The session is torn down and cannot
+ *  be resumed. Equivalent to clicking "delete session" but without
+ *  removing the archived logs. Wired to the "⏹ 终止" button. */
+export async function abortSession(): Promise<void> {
+  await getTransport().request("POST", "/api/chat/abort", chatBody({}));
+}
 export async function switchRole(role_id: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/role", chatBody({ role_id }));
 }

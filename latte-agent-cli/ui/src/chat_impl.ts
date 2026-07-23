@@ -1,10 +1,9 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession } from "./api";
 import { extractCodeRefs, makeRefChips } from "./linkify";
-import type { CodeRef } from "./host";
-
 interface UIBinding {
   messagesEl: HTMLElement; formEl: HTMLFormElement; inputEl: HTMLTextAreaElement;
   sendBtn: HTMLButtonElement; clearBtn: HTMLButtonElement; quitBtn: HTMLButtonElement;
+  abortBtn: HTMLButtonElement;
   statusPill: HTMLElement; roleSelect: HTMLSelectElement; rolePill: HTMLElement;
   modelPill: HTMLElement; footerMsg: HTMLElement;
 }
@@ -388,6 +387,7 @@ export function mountChat(opts: {
     if (!rawText) return;
     container.inputEl.value = "";
     container.sendBtn.disabled = true;
+    container.abortBtn.style.display = "inline-block";
 
     if (rawText.startsWith("/")) {
       addMessage({ kind: "system", content: `→ ${rawText}` });
@@ -405,6 +405,7 @@ export function mountChat(opts: {
       startWaitTimer();
     }
     container.sendBtn.disabled = false;
+    container.abortBtn.style.display = "none";
   });
 
   // ── @role autocomplete ──
@@ -501,6 +502,21 @@ export function mountChat(opts: {
   });
   container.clearBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /clear" }); await sendCommand("/clear"); });
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
+  // Abort button: kills all in-flight turns + subagents + workflows.
+  // Shown only when the controller is busy (sendBtn disabled).
+  container.abortBtn.addEventListener("click", async () => {
+    container.abortBtn.disabled = true;
+    container.abortBtn.textContent = "⏹ 终止中…";
+    try {
+      await abortSession();
+    } catch (e) {
+      console.error("[chat] abortSession failed", e);
+    } finally {
+      container.abortBtn.disabled = false;
+      container.abortBtn.textContent = "⏹ 终止";
+      container.abortBtn.style.display = "none";
+    }
+  });
   container.roleSelect.addEventListener("change", async () => {
     const roleId = container.roleSelect.value;
     if (onRoleSwitch) { await onRoleSwitch(roleId); } else { await switchRole(roleId); }

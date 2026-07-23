@@ -562,8 +562,14 @@ impl ChatController {
     /// `run_turn` JoinHandle, and the session loop moves on to
     /// the next user input. UI sends this when the user picks
     /// "终止当前任务" from a `TimeoutWarning` prompt.
-    pub fn cancel_turn(&self) {
+    pub async fn cancel_turn(&self) {
         self.turn_cancel_flag.store(true, Ordering::SeqCst);
+        // Also send CancelTurn input so that loops blocked on
+        // input_rx.recv() (multi-role, single-role while idle)
+        // see the signal and can break out.
+        if let Some(tx) = self.input_tx.lock().await.as_ref() {
+            let _ = tx.send(ControllerInput::CancelTurn);
+        }
     }
 
     /// Get a subscriber that receives all future events.
@@ -700,6 +706,45 @@ pub fn compute_waves<S: ContractAccess>(steps: &[S]) -> WavePlan {
 
 
 
+
+/// Run a turn with cancellation support. Polls `run_turn` at 500ms ticks
+/// and checks `cancel_flag` (session abort) + `turn_cancel_flag` (current
+/// turn cancel). On cancellation the in-flight LLM call is dropped via
+/// the future's Drop impl. Returns `Ok(response)` or `Err(AgentError)`.
+/// No timeout — the user must cancel explicitly.
+async fn run_turn_cancellable(
+    runner: &mut AgentRunner,
+    msgs: &[Message],
+    cancel_flag: &AtomicBool,
+    turn_cancel_flag: &AtomicBool,
+) -> Result<String, AgentError> {
+    turn_cancel_flag.store(false, Ordering::SeqCst);
+    let mut fut = Box::pin(runner.run_turn(msgs, None));
+    let result: Result<String, &'static str> = loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    break Err("session_cancelled");
+                }
+                if turn_cancel_flag.load(Ordering::SeqCst) {
+                    break Err("turn_cancelled");
+                }
+            }
+            r = fut.as_mut() => {
+                break r.map(|s| s).map_err(|_| "turn_failed");
+            }
+        }
+    };
+    drop(fut);
+    match result {
+        Ok(resp) => Ok(resp),
+        Err("session_cancelled") => Err(AgentError::Orchestration("session cancelled by user".into())),
+        Err("turn_cancelled") => Err(AgentError::Orchestration("turn cancelled by user".into())),
+        Err("turn_failed") => Err(AgentError::Orchestration("turn failed".into())),
+        Err(e) => Err(AgentError::Orchestration(format!("turn error: {e}"))),
+    }
+}
 
 async fn run_driver(
     config: ControllerConfig,
@@ -948,6 +993,7 @@ async fn run_multi_role_loop(
             &config.cwd,
             config.subsession_store.clone(),
             cancel_flag.clone(),
+            turn_cancel_flag.clone(),
         )
         .await
         {
@@ -1193,7 +1239,12 @@ async fn run_multi_role_loop(
                 detail: format!("round {round_num}: calling LLM"),
             });
 
-            let new_assistant_text = match runner.run_turn(&[], None).await {
+            let new_assistant_text = match run_turn_cancellable(
+                runner,
+                &[],
+                &cancel_flag,
+                &turn_cancel_flag,
+            ).await {
                 Ok(text) => {
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
@@ -1354,6 +1405,7 @@ async fn run_single_role_loop(
             &config.cwd,
             config.subsession_store.clone(),
             cancel_flag.clone(),
+            turn_cancel_flag.clone(),
         )
         .await
     {
@@ -1448,7 +1500,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1470,7 +1522,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1509,124 +1561,17 @@ async fn run_single_role_loop(
                             role_id: current_role.clone(),
                             detail: "calling LLM".into(),
                         });
-                        let usage_before = runner.total_usage().clone();
-                        let turn_timeout_secs = active_model_timeout_secs(
-                            resolver,
-                            runner.agent().model_chain.first().map(|mc| mc.model.id.as_str()),
-                            "LATTE_AGENT_TURN_TIMEOUT_SECS",
-                        );
-                        // Run the turn with soft-warning + hard-kill semantics:
-                        //   * the soft timeout fires at `soft_secs` and emits
-                        //     a `TimeoutWarning` event; the turn is NOT
-                        //     killed — the UI shows a "继续等待 / 终止" prompt
-                        //     and the user decides.
-                        //   * the hard timeout fires at `hard_secs` (soft * mult,
-                        //     default 3) and force-kills the turn; this is a
-                        //     safety net for runaway cases where the user
-                        //     doesn't act on the warning.
-                        //   * `turn_cancel_flag` flips when the user picks
-                        //     "终止当前任务" — the in-flight run_turn future is
-                        //     dropped, the underlying LLM call is cancelled,
-                        //     and the session loop moves on.
-                        let turn_result = if let Some(soft_secs) = turn_timeout_secs {
-                            let hard_mult: u64 = std::env::var("LATTE_AGENT_TURN_HARD_TIMEOUT_MULT")
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(3);
-                            let hard_secs = soft_secs.saturating_mul(hard_mult);
-                            let turn_started = Instant::now();
-                            // Clear any stale flag from a prior turn (the flag
-                            // is per-controller; defensive reset here keeps
-                            // turn boundaries clean).
-                            turn_cancel_flag.store(false, Ordering::SeqCst);
-                            // Pin the future on the heap so we can `select!`
-                            // between it and a 500ms ticker. `Box::pin` keeps
-                            // the borrowed `runner` alive across the loop and
-                            // dropping the box (when we `break`) cancels the
-                            // in-flight LLM call.
-                            // Bind both the message and the slice to locals
-                            // so they outlive every poll of the run_turn
-                            // future. `&[user_msg]` would otherwise be a
-                            // temporary that's freed at the end of this
-                            // statement, leaving the future with a dangling
-                            // borrow.
-                            let user_msg = [Message::user(trimmed.clone())];
-                            let mut turn_fut = Box::pin(runner.run_turn(
-                                &user_msg,
-                                None,
-                            ));
-                            let mut soft_warning_sent = false;
-                            let outcome: Result<String, &'static str> = loop {
-                                tokio::select! {
-                                    biased;
-                                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                                        if cancel_flag.load(Ordering::SeqCst) {
-                                            break Err("session_cancelled");
-                                        }
-                                        if turn_cancel_flag.load(Ordering::SeqCst) {
-                                            break Err("turn_cancelled");
-                                        }
-                                        let elapsed = turn_started.elapsed();
-                                        if !soft_warning_sent
-                                            && elapsed >= Duration::from_secs(soft_secs)
-                                        {
-                                            soft_warning_sent = true;
-                                            let _ = event_tx.send(ChatEvent::TimeoutWarning {
-                                                role_id: current_role.clone(),
-                                                elapsed_secs: elapsed.as_secs(),
-                                                soft_timeout_secs: soft_secs,
-                                                hard_timeout_secs: hard_secs,
-                                                sub_id: None,
-                                            });
-                                        }
-                                        if elapsed >= Duration::from_secs(hard_secs) {
-                                            break Err("hard_timeout");
-                                        }
-                                    }
-                                    r = turn_fut.as_mut() => {
-                                        // r is the inner Result; preserve it.
-                                        // We map it through unchanged — error
-                                        // strings come from the original
-                                        // AgentError path on the consumer side.
-                                        break r.map(|s| s).map_err(|_| "turn_failed");
-                                    }
-                                }
-                            };
-                            // Drop turn_fut by exiting this `if let` branch
-                            // (the binding goes out of scope at the end of
-                            // the block; cancellation propagates through
-                            // Drop on the inner future).
-                            drop(turn_fut);
-                            match outcome {
-                                Ok(resp) => Ok(resp),
-                                Err(reason) => {
-                                    // 取消 / 硬超时 / session 取消都从这里
-                                    // 走：发 RoleFinished + Error（让 UI 能
-                                    // 着色、统计），然后 continue 跳过本 turn
-                                    // 的 response 渲染。
-                                    let detail = match reason {
-                                        "turn_cancelled" => "cancelled by user".to_string(),
-                                        "hard_timeout" => format!("hard-killed after {hard_secs}s"),
-                                        "session_cancelled" => "session cancelled".to_string(),
-                                        _ => "turn failed".to_string(),
-                                    };
-                                    let _ = event_tx.send(ChatEvent::RoleFinished {
-                                        role_id: current_role.clone(),
-                                        detail: detail.clone(),
-                                    });
-                                    let _ = event_tx.send(ChatEvent::Error {
-                                        kind: Some(ModelErrorKind::Other {
-                                            message: detail.clone(),
-                                        }),
-                                        message: format!("turn {detail}"),
-                                        sub_id: None,
-                                    });
-                                    continue;
-                                }
-                            }
-                        } else {
-                            runner.run_turn(&[Message::user(trimmed)], None).await
-                        };
+let usage_before = runner.total_usage().clone();
+                        // Run the turn with cancellation support (no
+                        // auto-timeout — user hits the stop button).
+                        let user_msg = [Message::user(trimmed.clone())];
+                        let turn_result = run_turn_cancellable(
+                            &mut runner,
+                            &user_msg,
+                            &cancel_flag,
+                            &turn_cancel_flag,
+                        )
+                        .await;
                         match turn_result {
                             Ok(response) => {
                                 let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
@@ -1653,7 +1598,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1668,7 +1613,7 @@ async fn run_single_role_loop(
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1718,6 +1663,7 @@ async fn build_runner(
     cwd: &Path,
     subsession_store: Arc<SubsessionStore>,
     cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -1789,6 +1735,7 @@ async fn build_runner(
                 subsession_store.clone(),
                 sid,
                 cancel_flag.clone(),
+                turn_cancel_flag.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -1804,6 +1751,7 @@ async fn build_runner(
                 event_tx.clone(),
                 cwd.to_path_buf(),
                 cancel_flag.clone(),
+                turn_cancel_flag.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register workflow: {e}")))?;
@@ -2015,6 +1963,7 @@ async fn register_delegate_tool(
     subsession_store: Arc<SubsessionStore>,
     session_id: String,
     cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -2051,7 +2000,7 @@ async fn register_delegate_tool(
     let merged_owned = Arc::new(merged.clone());
     let resolver_owned = Arc::new(resolver.clone());
     let cancel_flag_owned = Arc::clone(&cancel_flag);
-
+    let turn_cancel_flag_owned = turn_cancel_flag.clone();
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
         let resolver = Arc::clone(&resolver_owned);
@@ -2060,12 +2009,12 @@ async fn register_delegate_tool(
         let cwd = cwd.clone();
         let sem = Arc::clone(&sem);
         let cancel_flag = Arc::clone(&cancel_flag_owned);
+        let turn_cancel_flag = Arc::clone(&turn_cancel_flag_owned);
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
-            // 1. Parse { role, task } from tool input.
             let role_id = input
                 .get("role")
                 .and_then(|v| v.as_str())
@@ -2224,6 +2173,22 @@ async fn register_delegate_tool(
                             });
                             return Err(tool_err(summary));
                         }
+                        if turn_cancel_flag.load(Ordering::SeqCst) {
+                            run_handle.abort();
+                            let _ = event_tx.send(ChatEvent::RoleFinished {
+                                role_id: role_id.clone(),
+                                detail: "cancelled by user".into(),
+                            });
+                            let summary = String::from("delegate cancelled by user");
+                            let _ = event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "cancelled".into(),
+                                summary: summary.clone(),
+                                sub_id: sub_id.clone(),
+                            });
+                            return Err(tool_err(summary));
+                        }
                     }
                 }
             }
@@ -2319,6 +2284,7 @@ async fn register_workflow_tool(
     event_tx: broadcast::Sender<ChatEvent>,
     cwd: PathBuf,
     cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
 
@@ -2360,6 +2326,7 @@ async fn register_workflow_tool(
         let event_tx = event_tx.clone();
         let cwd = cwd.clone();
         let cancel_flag = Arc::clone(&cancel_flag);
+        let turn_cancel_flag = turn_cancel_flag.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -2547,31 +2514,6 @@ match runner
 
     tm.register(tool, Some("manager"));
     Ok(())
-}
-
-/// 默认 turn 超时：模型和 env var 都没设置时使用。
-/// 120 秒足以覆盖绝大多数 LLM 响应（包括网络慢的），又能在 LLM
-/// 卡住时及时释放资源（用户不会被 5 分钟的"已卡住"提示久等）。
-const DEFAULT_TURN_TIMEOUT_SECS: u64 = 120;
-
-fn active_model_timeout_secs(
-    resolver: &ModelResolver,
-    model_id: Option<&str>,
-    env_var: &str,
-) -> Option<u64> {
-    model_id
-        .and_then(|id| resolver.get_def(id))
-        .and_then(|d| d.timeout_secs)
-        .or_else(|| std::env::var(env_var).ok().and_then(|s| s.parse().ok()))
-        .or(Some(DEFAULT_TURN_TIMEOUT_SECS))
-}
-
-#[allow(unused_variables)]
-fn register_ask_human_tool(
-    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
-    session: Arc<Mutex<SessionManager>>,
-    role_id: String,
-) {
 }
 
 fn role_icon(role_id: &str) -> String {
@@ -3055,7 +2997,7 @@ mod tests {
     // Mock server 2s 响应 + model.timeout_secs=1s → 第 1s 触发软
     // 警告，第 2s 拿到响应跑完；硬超时 3s 永远不到。
     #[tokio::test]
-    async fn soft_timeout_emits_warning_then_completes_normally() {
+    async fn cancellable_turn_can_be_cancelled() {
         use crate::config::{ModelCatalog, ModelDef};
         use crate::role::RoleTemplate;
         use std::time::Duration;
@@ -3069,7 +3011,7 @@ mod tests {
                     .and(path("/chat/completions"))
                     .respond_with(
                         ResponseTemplate::new(200)
-                            .set_delay(Duration::from_millis(2_000))
+                            .set_delay(Duration::from_millis(5_000))
                             .set_body_string(
                                 serde_json::json!({
                                     "id": "chatcmpl-test",
@@ -3078,7 +3020,7 @@ mod tests {
                                     "model": "test",
                                     "choices": [{
                                         "index": 0,
-                                        "message": { "role": "assistant", "content": "slow but successful" },
+                                        "message": { "role": "assistant", "content": "slow reply" },
                                         "finish_reason": "stop"
                                     }],
                                     "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
@@ -3151,63 +3093,35 @@ mod tests {
         let controller = ChatController::new(64);
         let mut rx = controller.spawn(cfg).await;
 
+        // 发一条慢请求（5s 响应），然后在 1s 后 cancel_turn。
         controller.submit_input("请分析这个慢请求").await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        controller.cancel_turn().await;
 
-        // 收事件：期待 TimeoutWarning 在 t≈1s 到达；t≈2s 时 turn
-        // 拿到响应，RoleTurn + RoleFinished 收尾。
-        let mut saw_warning = false;
-        let mut soft_secs_observed = 0u64;
-        let mut hard_secs_observed = 0u64;
-        let mut saw_role_turn = false;
+        // 收事件：期待 Error 事件描述 turn cancelled，而不是
+        // 看到 "slow reply" 的 RoleTurn。
+        let mut saw_cancelled = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(ChatEvent::TimeoutWarning {
-                    role_id,
-                    elapsed_secs: _,
-                    soft_timeout_secs,
-                    hard_timeout_secs,
-                    sub_id,
-                })) => {
-                    assert_eq!(role_id, "programmer");
-                    assert_eq!(soft_timeout_secs, 1, "soft timeout must match model.timeout_secs");
-                    soft_secs_observed = soft_timeout_secs;
-                    hard_secs_observed = hard_timeout_secs;
-                    assert!(sub_id.is_none(), "single-role loop has no sub_id");
-                    saw_warning = true;
+                Ok(Ok(ChatEvent::RoleTurn { content, .. })) => {
+                    panic!("turn should be cancelled, not complete: {content}");
                 }
-                Ok(Ok(ChatEvent::RoleTurn { content, is_complete: true, .. })) => {
-                    if content.contains("slow but successful") {
-                        saw_role_turn = true;
+                Ok(Ok(ChatEvent::Error { message, .. })) => {
+                    if message.contains("cancelled") {
+                        saw_cancelled = true;
+                        break;
                     }
-                }
-                Ok(Ok(ChatEvent::RoleFinished { detail, .. })) => {
-                    assert!(
-                        !detail.contains("timeout"),
-                        "turn must not be reported as timed out: {detail}"
-                    );
-                    break;
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => panic!("recv error: {e}"),
                 Err(_) => continue,
             }
         }
-
-        assert!(saw_warning, "soft timeout must emit a TimeoutWarning event");
-        assert_eq!(soft_secs_observed, 1);
-        assert_eq!(
-            hard_secs_observed, 3,
-            "hard timeout must default to soft * 3 = 3s"
-        );
-        assert!(
-            saw_role_turn,
-            "the turn must still complete normally after the warning"
-        );
+        assert!(saw_cancelled, "turn must be cancelled by cancel_turn()");
 
         controller.abort().await;
     }
-
 
     // ─── UserMessage 事件 ─────────────────────────────────────────
     //

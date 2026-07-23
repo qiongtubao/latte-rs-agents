@@ -1549,3 +1549,25 @@ select {
   background: #fecaca;
   border-color: #b91c1c;
 }
+
+/* abort button */
+.abort-btn {
+  background: #fef2f2;
+  border: 1px solid #dc2626;
+  color: #991b1b;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.88em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.abort-btn:hover {
+  background: #fecaca;
+  border-color: #b91c1c;
+}
+.abort-btn:active {
+  transform: translateY(1px);
+}

@@ -392,7 +392,7 @@ fn build_router(state: AppState) -> Router {
         .route("/chat/command", post(chat_command))
         .route("/chat/role", post(switch_role))
         .route("/chat/cancel-turn", post(chat_cancel_turn))
-        .route("/events", get(events_sse))
+        .route("/chat/abort", post(chat_abort))
         .route("/traces", get(list_traces))
         .route("/traces/:session_id", get(read_trace))
         .route("/self-loop/start", post(self_loop_start))

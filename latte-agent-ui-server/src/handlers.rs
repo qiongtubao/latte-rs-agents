@@ -184,12 +184,6 @@ pub(crate) async fn switch_role(
     }
 }
 
-/// `POST /api/chat/cancel-turn` body 只需要 `session_id`（与
-/// `/api/chat/role` 一致）。UI 在用户从 `TimeoutWarning` 弹窗点
-/// 「终止当前任务」时调用 —— 后端把 `turn_cancel_flag` 置位，
-/// driver 的 select! 循环下一个 500ms tick 看到就丢弃 run_turn
-/// future。`200 OK` 表示 cancel 已被受理，不保证 turn 一定
-/// 在这个 RTT 内被取消（异步信号）。
 pub(crate) async fn chat_cancel_turn(
     State(state): State<AppState>,
     Json(req): Json<SwitchRoleRequest>,
@@ -200,6 +194,16 @@ pub(crate) async fn chat_cancel_turn(
     }
 }
 
+/// `POST /api/chat/abort` — 终止整个 session。
+pub(crate) async fn chat_abort(
+    State(state): State<AppState>,
+    Json(req): Json<SwitchRoleRequest>,
+) -> StatusCode {
+    match api::chat_abort(&state.backend, req.session_id.as_deref()).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
 // ─── SSE（HTTP 特有） ─────────────────────────────────────────────
 
 pub(crate) async fn events_sse(
