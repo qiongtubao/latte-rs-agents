@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use latte_agent_core::config::AgentConfig;
+use latte_agent_core::config::{AgentConfig, ConfigLayer};
 use latte_agent_core::controller::{ChatEvent, RoleInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -444,18 +444,22 @@ fn write_role_toml(
     req: &SaveRoleConfigRequest,
 ) -> Result<(), String> {
     use toml_edit::{value, DocumentMut, Item, Table};
-    let mut doc: DocumentMut = match std::fs::read_to_string(path) {
-        Ok(content) => content
-            .parse()
-            .map_err(|e| format!("parse {}: {e}", path.display()))?,
-        Err(_) => DocumentMut::new(),
+    let content = std::fs::read_to_string(path).ok();
+    let mut doc: DocumentMut = match &content {
+        Some(c) => c.parse().map_err(|e| format!("parse {}: {e}", path.display()))?,
+        None => DocumentMut::new(),
     };
     let role_exists = doc
         .get("roles")
         .and_then(|r| r.get(req.id.as_str()))
         .and_then(|r| r.as_table())
         .is_some();
-    if role_exists {
+
+    // 如果 roles 存在但 role_exists 为 false（如 `roles = {}` inline table），
+    // toml_edit 无法向 inline table 追加 key，需要重建 roles 表。
+    let roles_is_inline = doc.get("roles").map_or(false, |r| !r.is_table());
+
+    if role_exists && !roles_is_inline {
         let t = doc["roles"][req.id.as_str()].as_table_mut().unwrap();
         t["name"] = value(req.name.clone());
         t["icon"] = value(req.icon.clone());
@@ -471,6 +475,10 @@ fn write_role_toml(
             }
         }
     } else {
+        // toml_edit 无法覆盖已有的 inline table key（如 `roles = {}`），
+        // 需要先删除再重建。
+        doc.remove("roles");
+        let mut roles = Table::new();
         let mut t = Table::new();
         t["id"] = value(req.id.clone());
         t["name"] = value(req.name.clone());
@@ -490,14 +498,19 @@ fn write_role_toml(
         if !tpl.skills.is_empty() {
             t["skills"] = value(str_array(&tpl.skills));
         }
-        doc["roles"][req.id.as_str()] = Item::Table(t);
+        roles[req.id.as_str()] = Item::Table(t);
+        doc["roles"] = Item::Table(roles);
     }
-    std::fs::write(path, doc.to_string())
+    let output = doc.to_string();
+    std::fs::write(path, &output)
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// 保存角色配置：重写 agents.d TOML → 写 prompt_file → 更新内存配置
 /// （新 session 即刻生效）。三步全量落盘，与 HTTP 版语义一致。
+///
+/// 写入路径策略：如果项目 agents.d 下已有该角色的文件则写项目目录，
+/// 否则写全局 `~/.latte/agents.d/`（角色从全局加载时）。prompt 文件同理。
 pub fn save_role_config(
     b: &UiBackend,
     req: SaveRoleConfigRequest,
@@ -508,8 +521,31 @@ pub fn save_role_config(
     };
     let tpl = tpl.ok_or_else(|| ApiError::not_found(format!("role {:?} not found", req.id)))?;
 
-    // 1. 重写 .latte/agents.d/<id>.toml。
-    let dir = agents_config_dir(&b.cwd, &b.agents_config);
+    // 1. 确定写入目录：项目目录有该角色文件 → 项目目录；否则 → 全局目录
+    let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
+    let global_dir = ConfigLayer::Global
+        .agents_dir()
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".latte/agents.d")
+        });
+    // 检查项目目录下该角色的 toml 文件是否包含有效的 [roles.<id>] 节。
+    // 仅文件存在但内容为 `roles = {}` 之类的空壳不算"项目有该角色"。
+    let project_path = project_dir.join(format!("{}.toml", req.id));
+    let project_has_role = project_path.exists()
+        && std::fs::read_to_string(&project_path)
+            .ok()
+            .and_then(|content| content.parse::<toml_edit::DocumentMut>().ok())
+            .map(|doc| {
+                doc.get("roles")
+                    .and_then(|r| r.get(req.id.as_str()))
+                    .and_then(|r| r.as_table())
+                    .is_some()
+            })
+            .unwrap_or(false);
+    let dir = if project_has_role { project_dir.clone() } else { global_dir };
     std::fs::create_dir_all(&dir)
         .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
     let path = dir.join(format!("{}.toml", req.id));
@@ -521,7 +557,9 @@ pub fn save_role_config(
             .prompt_file
             .clone()
             .unwrap_or_else(|| format!("prompts/{}.md", req.id));
-        let p = b.cwd.join(&rel);
+        // prompt 文件路径跟随 agents.d 目录：项目/全局目录的父级 .latte/
+        let base = dir.parent().unwrap_or(&b.cwd);
+        let p = base.join(&rel);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ApiError::internal(format!("create {}: {e}", parent.display())))?;
