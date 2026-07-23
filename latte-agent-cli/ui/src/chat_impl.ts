@@ -1,13 +1,15 @@
 import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession } from "./api";
 import { extractCodeRefs, makeRefChips } from "./linkify";
+import type { CodeRef } from "./host";
 interface UIBinding {
+
   messagesEl: HTMLElement; formEl: HTMLFormElement; inputEl: HTMLTextAreaElement;
   sendBtn: HTMLButtonElement; clearBtn: HTMLButtonElement; quitBtn: HTMLButtonElement;
+  /** Abort button — required for the runtime abort flow. */
   abortBtn: HTMLButtonElement;
   statusPill: HTMLElement; roleSelect: HTMLSelectElement; rolePill: HTMLElement;
   modelPill: HTMLElement; footerMsg: HTMLElement;
 }
-
 export interface ChatController {
   appendUser(content: string): string;
   handleEvent(e: ChatEvent): void;
