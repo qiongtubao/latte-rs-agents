@@ -66,6 +66,15 @@ export function createStageStore(now = Date.now) {
 }
 /** 应用共享的默认 StageStore 单例。 */
 export const stageStore = createStageStore();
+/**
+ * 用指定 session 的归档事件替换当前可见 Stage 列表。
+ *
+ * @param events 后端按时间顺序返回的完整 ChatEvent 历史。
+ * @returns 无返回值；共享 store 更新后由 StageList 订阅并重新渲染。
+ */
+export function replayStageHistory(events) {
+    stageStore.getState().seed(events);
+}
 // ── 选择器（selectors） ────────────────────────────────────────────
 //
 // 选择器是纯函数 state -> 派生值，便于视图层做最小化订阅，也便于测试。
