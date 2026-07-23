@@ -267,6 +267,14 @@ pub enum TraceEvent {
         latency_ms: u64,
         status: ToolStatus,
     },
+    ToolRetry {
+        meta: TraceMeta,
+        name: String,
+        attempt: u32,
+        kind: String,
+        reason: String,
+        recovered: bool,
+    },
     HookFired {
         meta: TraceMeta,
         hook_name: String,
@@ -287,7 +295,7 @@ pub enum TraceEvent {
         total_output: u32,
         total_thinking: u32,
     },
-SessionStarted {
+    SessionStarted {
         meta: TraceMeta,
         task_id: String,
         roles: Vec<String>,
@@ -686,6 +694,7 @@ impl TraceEvent {
             | TraceEvent::ModelRawOut { meta, .. }
             | TraceEvent::ParseToolCalls { meta, .. }
             | TraceEvent::ToolExec { meta, .. }
+            | TraceEvent::ToolRetry { meta, .. }
             | TraceEvent::HookFired { meta, .. }
             | TraceEvent::TurnEnd { meta, .. }
             | TraceEvent::SessionEnd { meta, .. }
@@ -711,6 +720,7 @@ impl TraceEvent {
             TraceEvent::ModelRawOut { .. } => "ModelRawOut",
             TraceEvent::ParseToolCalls { .. } => "ParseToolCalls",
             TraceEvent::ToolExec { .. } => "ToolExec",
+            TraceEvent::ToolRetry { .. } => "ToolRetry",
             TraceEvent::HookFired { .. } => "HookFired",
             TraceEvent::TurnEnd { .. } => "TurnEnd",
             TraceEvent::SessionEnd { .. } => "SessionEnd",
@@ -750,6 +760,9 @@ impl TraceEvent {
                 format!("name={}\n  args:  {}\n  result: {}\n  latency: {}ms",
                     name, args_json, result_str, latency_ms)
             }
+            TraceEvent::ToolRetry { name, attempt, kind, reason, recovered, .. } =>
+                format!("name={} attempt={} kind={} recovered={} reason={}",
+                    name, attempt, kind, recovered, reason),
             TraceEvent::HookFired { hook_name, point, outcome_kind, .. } =>
                 format!("{} {:?} {}", hook_name, point, outcome_kind),
             TraceEvent::TurnEnd { total_input, total_output, total_thinking, elapsed_ms, .. } =>
@@ -843,6 +856,12 @@ impl TraceEvent {
                 kind: "ToolExec".into(),
                 model_id: None, latency_ms: Some(*latency_ms), tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: format!("name={} status={}", name, match status { ToolStatus::Ok(_) => "ok", ToolStatus::Err(_) => "err" }),
+            },
+            TraceEvent::ToolRetry { name, attempt, kind, recovered, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ToolRetry".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("name={} attempt={} kind={} recovered={}", name, attempt, kind, recovered),
             },
             TraceEvent::HookFired { hook_name, point, outcome_kind, .. } => IndexLine {
                 turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
@@ -1115,6 +1134,7 @@ impl TraceSink for ScopedSink {
             | TraceEvent::ModelRawOut { meta, .. }
             | TraceEvent::ParseToolCalls { meta, .. }
             | TraceEvent::ToolExec { meta, .. }
+            | TraceEvent::ToolRetry { meta, .. }
             | TraceEvent::HookFired { meta, .. }
             | TraceEvent::TurnEnd { meta, .. }
             | TraceEvent::SessionEnd { meta, .. }

@@ -23,7 +23,114 @@ use parking_lot::Mutex;
 use crate::context::ConversationContext;
 use crate::error::{AgentError, AgentResult};
 use crate::role::Role as RoleDef;
+// ─── Tool call error classification + retry policy ────────────────────
+//
+// 任何把 tool_call 弄坏的错误都进同一个 pipeline：
+//   1. classify 成 `ToolCallErrorKind`（增加 variant 不影响 retry 逻辑）
+//   2. 问 `RetryPolicy` 要不要 retry
+//   3. retry 就再来一次，发 `ToolRetry { attempt, kind, recovered: false }`
+//   4. 终态发 `ToolExec { status: Err }` + `ToolRetry { recovered: true|false }`
+//   5. 按 `should_loopback_to_model(&kind)` 决定要不要把错误喂回 messages
+//
+// 加新错误类型 = 加 variant + 在 `DefaultRetryPolicy::retryable()` 加一行。
+// UI / 调度逻辑不需要改。
+
+/// Tool 调用失败的分类。trace 上发出去的 `kind: String` 字段就是
+/// `serde_json::to_string(&kind).unwrap_or_default()` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallErrorKind {
+    /// Model 输出的 args 不是合法 JSON。最常见：shell regex 元字符
+    /// (`|` `*` `?`) 在字符串里忘了 escape。`serde_err` 记录具体哪条 escape
+    /// 炸了，方便 trace 排查。
+    MalformedArgs { serde_err: String },
+    /// 工具名 model 写了"read"但 registry 只有"file.read" —— alias
+    /// 后备也没救回来。说明 model 用了我们不认识的工具名。
+    ToolNotFound { tried_aliases: Vec<String> },
+    /// PreTool / PostTool hook 主动拒绝（一般是 EnforceToolAllowlist
+    /// 之类的策略 hook）。这是有意的，不该 retry。
+    HookAborted { hook: String, reason: String },
+    /// `tm.execute()` 抛错 —— 网络 5xx / 模型返回奇怪结构 / 反序列化
+    /// 失败 / 业务错误。重试一次可能好。
+    Execution { reason: String },
+    /// 工具内部 timeout。瞬时错误，重试一次。
+    Timeout,
+}
+
+impl ToolCallErrorKind {
+    /// 短 label，给 trace 字段用。
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::MalformedArgs { .. } => "MalformedArgs",
+            Self::ToolNotFound { .. } => "ToolNotFound",
+            Self::HookAborted { .. } => "HookAborted",
+            Self::Execution { .. } => "Execution",
+            Self::Timeout => "Timeout",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolCallErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MalformedArgs { serde_err } => write!(f, "malformed args: {serde_err}"),
+            Self::ToolNotFound { tried_aliases } => {
+                write!(f, "tool not found (tried: {})", tried_aliases.join(", "))
+            }
+            Self::HookAborted { hook, reason } => {
+                write!(f, "hook '{hook}' aborted: {reason}")
+            }
+            Self::Execution { reason } => write!(f, "execution failed: {reason}"),
+            Self::Timeout => write!(f, "tool timeout"),
+        }
+    }
+}
+
+/// 决定某个错误值不值得再试一次的策略。trait 而不是 enum match，
+/// 是为了让上层（CLI / Tauri / 测试）能注入自己的"更激进"或"更保守"
+/// 策略而不动 agent 核心。
+pub trait RetryPolicy: Send + Sync {
+    /// `true` → 立刻用相同 args 再调一次 tool（pre-process 类的 hint
+    /// 比如 escape 已经发生在上一层了，这里只是简单的"再执行一次"）。
+    /// `false` → 走最终失败路径，emit ToolExec { Err }。
+    fn retryable(&self, kind: &ToolCallErrorKind) -> bool;
+
+    /// 该错误要不要把详细原因喂回 model（追加到 `messages` 里，
+    /// 让 model 在下一轮看到 tool_result 一样的位置）。
+    ///
+    /// 默认策略：
+    /// - `MalformedArgs` / `ToolNotFound` → **不喂回**。model 看自己上
+    ///   一轮的输出"修正"通常产出更多错误（形成死循环）。
+    /// - `HookAborted` / `Execution` / `Timeout` → 喂回。model 知道
+    ///   hook 拒绝或网络挂了，决策树会换路径。
+    fn loopback_to_model(&self, kind: &ToolCallErrorKind) -> bool;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DefaultRetryPolicy;
+
+impl RetryPolicy for DefaultRetryPolicy {
+    fn retryable(&self, kind: &ToolCallErrorKind) -> bool {
+        match kind {
+            // 瞬时错误：HTTP 5xx、timeout、shell escape 漏掉的常见修正一次就够
+            ToolCallErrorKind::MalformedArgs { .. }
+            | ToolCallErrorKind::Execution { .. }
+            | ToolCallErrorKind::Timeout => true,
+            // 名字错 / hook 故意拒绝 → 再试也不会好
+            ToolCallErrorKind::ToolNotFound { .. }
+            | ToolCallErrorKind::HookAborted { .. } => false,
+        }
+    }
+    fn loopback_to_model(&self, kind: &ToolCallErrorKind) -> bool {
+        matches!(
+            kind,
+            ToolCallErrorKind::HookAborted { .. }
+                | ToolCallErrorKind::Execution { .. }
+                | ToolCallErrorKind::Timeout
+        )
+    }
+}
 use crate::trace::ParsedCall;
+use latte_rs_agent_tools::error::ToolError;
 
 // ─── WaitPolicy ───────────────────────────────────────────────────────────
 
@@ -505,7 +612,11 @@ pub struct AgentRunner {
     sink: Arc<dyn crate::trace::TraceSink>,
     /// Hook chain for pre/post processing.
     hooks: Arc<crate::hooks::HookChain>,
-    /// Role identifier for this runner.
+    /// Strategy for retrying failed tool calls (MalformedArgs /
+    /// Execution / Timeout by default). Arc<dyn> so callers (CLI /
+    /// Tauri) can inject a more aggressive or conservative policy
+    /// without touching agent core.
+    retry_policy: Arc<dyn RetryPolicy>,
     role_id: String,
     /// Session id for this runner. Filled in by the CLI so events
     /// emitted by this runner can be cross-referenced with the
@@ -537,6 +648,62 @@ pub struct AgentRunner {
     /// opened — the bug that motivated this field).
     cwd: Option<std::path::PathBuf>,
 }
+
+/// 把 ToolError 归类到 `ToolCallErrorKind`。
+/// 这里不细分 HTTP 错误码：调用方（retry loop）只关心"能不能重试"，
+/// ToolError::ToolExecution 永远是瞬时执行错误，归 Execution。
+fn classify_tool_execution_error(
+    e: &latte_rs_agent_tools::error::ToolError,
+) -> ToolCallErrorKind {
+    // ToolError 没有独立的 Timeout variant；timeout 由工具
+    // 在 ToolExecution.source_string 里描述。我们统一归 Execution，
+    // DefaultRetryPolicy 把 Execution 标记为可重试一次。
+    ToolCallErrorKind::Execution {
+        reason: e.to_string(),
+    }
+}
+
+/// Best-effort recovery for shell-metachar-in-JSON: model emits
+/// `\|` inside a JSON string which serde rejects. Pre-process the
+/// raw string to escape bare backslash + metachar sequences, then
+/// re-parse. If still invalid, return the original serde error.
+fn recover_malformed_tool_args(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    let metachars: &[u8] = b"|*?[]()&;<>";
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Preserve valid JSON escapes: \\ \" \/ \u \b \f \n \r \t
+        if b == b'\\' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            if matches!(next, b'\\' | b'"' | b'/' | b'u' | b'b' | b'f' | b'n' | b'r' | b't') {
+                out.push(b as char);
+                out.push(next as char);
+                i += 2;
+                continue;
+            }
+        }
+        if metachars.contains(&b) {
+            out.push('\\');
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+fn parse_tool_args_with_recovery(raw: &str) -> Result<serde_json::Value, String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            let recovered = recover_malformed_tool_args(raw);
+            serde_json::from_str::<serde_json::Value>(&recovered)
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
     pub fn new(agent: Agent) -> Self {
@@ -548,7 +715,8 @@ impl AgentRunner {
             total_usage: TokenUsage::default(),
             sink: Arc::new(crate::trace::NullSink),
             hooks: Arc::new(crate::hooks::HookChain::empty()),
-            role_id: "default".to_string(),
+            retry_policy: Arc::new(DefaultRetryPolicy),
+            role_id: String::new(),
             session_id: String::new(),
             inject_worktree_root: None,
             advisor_hints: None,
@@ -569,7 +737,8 @@ impl AgentRunner {
             total_usage: TokenUsage::default(),
             sink: Arc::new(crate::trace::NullSink),
             hooks: Arc::new(crate::hooks::HookChain::empty()),
-            role_id: "default".to_string(),
+            retry_policy: Arc::new(DefaultRetryPolicy),
+            role_id: String::new(),
             session_id: String::new(),
             inject_worktree_root: None,
             advisor_hints: None,
@@ -586,6 +755,7 @@ impl AgentRunner {
             total_usage: TokenUsage::default(),
             sink: Arc::new(crate::trace::NullSink),
             hooks: Arc::new(crate::hooks::HookChain::empty()),
+            retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: "default".to_string(),
             session_id: String::new(),
             inject_worktree_root: None,
@@ -744,13 +914,7 @@ impl AgentRunner {
         });
     }
 
-    /// Run one turn: process a user message and return the assistant's response.
-    ///
-    /// The turn builds a complete message list:
-    ///   [system_prompt, ...history, new_user_messages...]
-    ///
-    /// If tools are configured, enters a tool-call loop:
-    ///   request → response → parse tool_calls → execute → append result → repeat
+
     pub async fn run_turn(
         &mut self,
         new_messages: &[Message],
@@ -984,106 +1148,19 @@ impl AgentRunner {
                 messages.push(Message::assistant(final_response.clone()));
                 // Execute each tool call
                 for tc in &post_parse_calls {
-                     // Map friendly config aliases ("bash") to the real
-                     // builtin tool names ("exec"). Without this, model
-                     // outputs trained as `bash` get "tool not found"
-                     // because the registry stores it as `shell.exec`.
-                     let resolved_name: String = match tc.name.as_str() {
-                         "bash" => "exec".to_string(),
-                         n => n.to_string(),
-                     };
-                     let input: serde_json::Value = match serde_json::from_str(&tc.args) {
-                         Ok(v) => v,
-                         Err(e) => {
-                             // The model emitted args that are not valid
-                             // JSON (e.g. XML arg_key/arg_value blocks).
-                             // Don't hand the tool a bare string (it would
-                             // fail with a confusing "xx is required");
-                             // feed a clear format error straight back so
-                             // the model can re-issue in the right shape.
-                             let msg = format!(
-                                 "tool args are not valid JSON ({e}). Re-issue as a single line \
-                                  `<tool_call>{} {{\"arg\": \"value\"}}</tool_call>` with a JSON object as args.",
-                                 tc.name
-                             );
-                             self.sink.emit(TraceEvent::ToolExec {
-                                 meta: meta.clone(),
-                                 name: tc.name.clone(),
-                                 args_json: tc.args.clone(),
-                                 latency_ms: 0,
-                                 status: ToolStatus::Err(msg.clone()),
-                             });
-                             messages.push(Message::user(format!("[tool_error for {}]\n{}", tc.name, msg)));
-                             continue;
-                         }
-                     };
-
-                    // 4a. Run PreToolHook (can abort or mutate args).
-                    // The hook gets a mutable copy of the parsed input;
-                    // on `Mutate` we shadow `input` so the tool sees the
-                    // mutated args and the ToolExec event records them.
-                    let mut mutable_input = input.clone();
-                    {
-                        let mut pre_ctx = crate::hooks::PreToolCtx {
-                            name: &resolved_name,
-                            args: &mut mutable_input,
-                        };
-                        let outcome = self.hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
-                            self.sink.emit(TraceEvent::HookFired {
-                                meta: meta.clone(),
-                                hook_name: hook_name.to_string(),
-                                point,
-                                outcome_kind: kind.to_string(),
-                            });
-                            log_hook_fire(hook_name, point, kind);
-                        });
-                        match outcome {
-                            crate::hooks::HookOutcome::Abort { reason } => {
-                                return Err(AgentError::HookAborted {
-                                    hook: "PreTool".into(),
-                                    reason,
-                                });
-                            }
-                            // Continue + Mutate both leave `mutable_input`
-                            // holding the (possibly mutated) value we want
-                            // to forward to the tool. The Mutate variant
-                            // has already updated `*ctx.args` inside the
-                            // chain, so no further action is needed.
-                            _ => {}
-                        }
-                    }
-                    let input = mutable_input;
-
-                    // Resolve relative filesystem paths in the tool input
-                    // against the runner's workspace cwd (when set), so the
-                    // packaged tools — which resolve relative paths against
-                    // the PROCESS cwd — still land in the user's workspace
-                    // when embedded (Tauri: process cwd = app data dir).
-                    // The `metadata.cwd` channel below is advisory and no
-                    // packaged tool consults it today, hence this rewrite.
-                    let input = match &self.cwd {
-                        Some(cwd) => resolve_tool_input_against_cwd(input, cwd),
-                        None => input,
+                    // Map friendly config aliases ("bash") to the real
+                    // builtin tool names ("exec"). Without this, model
+                    // outputs trained as `bash` get "tool not found"
+                    // because the registry stores it as `shell.exec`.
+                    let resolved_name: String = match tc.name.as_str() {
+                        "bash" => "exec".to_string(),
+                        n => n.to_string(),
                     };
-
-                    let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
-                        &resolved_name,
-                        1,
-                    );
-                    // Advisory channel for future path-aware tools; the
-                    // authoritative mechanism is the input rewrite above.
-                    if let Some(cwd) = &self.cwd {
-                        ctx.metadata = Some(serde_json::json!({
-                            "cwd": cwd.display().to_string(),
-                        }));
-                    }
                     // Resolve the short name the model emits ("read")
                     // to the namespaced form the registry stores
-                    // ("file.read"). We try the name as-is first, then
-                    // fall back to any registered tool whose short
-                    // suffix matches. This lets role.allowed_tools
-                    // list `["read", "list", "search"]` while the
-                    // registry stores them under their package prefix.
+                    // ("file.read") once — the resolved name is the
+                    // same across retries so we don't redo the lookup
+                    // for nothing.
                     let full_name = tm
                         .get_tool(&resolved_name)
                         .map(|_| resolved_name.clone())
@@ -1094,85 +1171,227 @@ impl AgentRunner {
                         })
                         .unwrap_or_else(|| resolved_name.clone());
 
-                    // 4b. Execute tool + emit ToolExec
-                    let tool_start = Instant::now();
-                    let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
-                    let tool_latency = tool_start.elapsed().as_millis() as u64;
+                    // ── Per-tool-call retry loop ───────────────────────
+                    //
+                    // 默认 `DefaultRetryPolicy`：
+                    //   MalformedArgs / Execution / Timeout → 重试一次
+                    //   ToolNotFound / HookAborted           → 不重试
+                    //
+                    // 重试 ≠ 重新问 model。本层自动 reparse / reexecute，
+                    // model 只在 *最终失败 + 错误该让 model 知道时* 才
+                    // 看到 [tool_error]。避免"看自己错误输出又产出
+                    // 同样错误"的死循环。
+                    let policy = self.retry_policy.clone();
+                    let mut attempt: u32 = 0;
+                    let max_attempts: u32 = 2;
+                    // 终止态：Ok(result_str) or Err((kind, detail_str))
+                    let mut final_outcome: Result<String, (ToolCallErrorKind, String)> =
+                        Err((ToolCallErrorKind::ToolNotFound { tried_aliases: vec![] }, "init".into()));
+                    let mut final_args_json = tc.args.clone();
 
-                    let args_json = serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
+                    while attempt < max_attempts {
+                        attempt += 1;
+                        // 1. parse args（带 shell-metachar escape 自动恢复）
+                        let input: serde_json::Value = match parse_tool_args_with_recovery(&tc.args) {
+                            Ok(v) => v,
+                            Err(serde_err) => {
+                                let detail = format!("invalid JSON: {serde_err}");
+                                final_outcome = Err((
+                                    ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
+                                    detail,
+                                ));
+                                break;
+                            }
+                        };
+                        // cwd rewrite
+                        let input = match &self.cwd {
+                            Some(cwd) => resolve_tool_input_against_cwd(input, cwd),
+                            None => input,
+                        };
+                        let final_input = input; // capture for the Ok arm
 
-                    // 4b-extra. Loop detection: if the model is
-                    // stuck calling the same tool with the same args
-                    // repeatedly, bail out before `max_tool_rounds`
-                    // is exhausted. We use `tc.name` (the name the
-                    // model emitted) rather than `full_name` (the
-                    // resolved one) so that the loop key matches what
-                    // the model is reasoning about — if a model
-                    // switches between emitting "read" and "file.read"
-                    // that should count as a fresh call, not a
-                    // continuation of the streak.
-                    if let LoopDecision::Break(reason) = loop_detector.record(&tc.name, &args_json) {
-                        return Err(AgentError::ToolLoopDetected {
-                            tool: tc.name.clone(),
-                            reason,
-                        });
-                    }
+                        // 2. PreToolHook
+                        let mut mutable_input = final_input.clone();
+                        let pre_aborted: Option<String> = {
+                            let mut pre_ctx = crate::hooks::PreToolCtx {
+                                name: &resolved_name,
+                                args: &mut mutable_input,
+                            };
+                            let outcome = self.hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
+                                self.sink.emit(TraceEvent::HookFired {
+                                    meta: meta.clone(),
+                                    hook_name: hook_name.to_string(),
+                                    point,
+                                    outcome_kind: kind.to_string(),
+                                });
+                                log_hook_fire(hook_name, point, kind);
+                            });
+                            if let crate::hooks::HookOutcome::Abort { reason } = outcome {
+                                Some(reason)
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(reason) = pre_aborted {
+                            final_outcome = Err((
+                                ToolCallErrorKind::HookAborted {
+                                    hook: "PreTool".into(),
+                                    reason: reason.clone(),
+                                },
+                                reason,
+                            ));
+                            break;
+                        }
+                        let input = mutable_input;
 
-                    match exec_result {
-                        Ok(result) => {
-                            self.sink.emit(TraceEvent::ToolExec {
+                        // 3. Execute
+                        let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(
+                            &resolved_name,
+                            1,
+                        );
+                        if let Some(cwd) = &self.cwd {
+                            ctx.metadata = Some(serde_json::json!({
+                                "cwd": cwd.display().to_string(),
+                            }));
+                        }
+                        let tool_start = Instant::now();
+                        let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
+                        let tool_latency = tool_start.elapsed().as_millis() as u64;
+                        let args_json = serde_json::to_string(&input)
+                            .unwrap_or_else(|_| tc.args.clone());
+                        final_args_json = args_json.clone();
+
+                        // 4. Loop detection（per-args 哈希，与 retry 无关）
+                        if let LoopDecision::Break(reason) = loop_detector.record(&tc.name, &args_json) {
+                            return Err(AgentError::ToolLoopDetected {
+                                tool: tc.name.clone(),
+                                reason,
+                            });
+                        }
+
+                        match exec_result {
+                            Ok(result) => {
+                                // 5. PostToolHook
+                                let mut result_str = serde_json::to_string_pretty(&result)
+                                    .unwrap_or_else(|_| format!("{:?}", result));
+                                let post_aborted: Option<String> = {
+                                    let mut post_ctx = crate::hooks::PostToolCtx {
+                                        name: &resolved_name,
+                                        result: &mut result_str,
+                                    };
+                                    let outcome = self.hooks.run_post_tool(
+                                        &mut post_ctx,
+                                        |hook_name, point, kind| {
+                                            self.sink.emit(TraceEvent::HookFired {
+                                                meta: meta.clone(),
+                                                hook_name: hook_name.to_string(),
+                                                point,
+                                                outcome_kind: kind.to_string(),
+                                            });
+                                            log_hook_fire(hook_name, point, kind);
+                                        },
+                                    );
+                                    if let crate::hooks::HookOutcome::Abort { reason } = outcome {
+                                        Some(reason)
+                                    } else if let crate::hooks::HookOutcome::Mutate(ref mutated) = outcome {
+                                        result_str = mutated.clone();
+                                        None
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(reason) = post_aborted {
+                                    final_outcome = Err((
+                                        ToolCallErrorKind::HookAborted {
+                                            hook: "PostTool".into(),
+                                            reason: reason.clone(),
+                                        },
+                                        reason,
+                                    ));
+                                    break;
+                                }
+                                // success
+                                self.sink.emit(TraceEvent::ToolExec {
+                                    meta: meta.clone(),
+                                    name: tc.name.clone(),
+                                    args_json: args_json.clone(),
+                                    latency_ms: tool_latency,
+                                    status: ToolStatus::Ok(
+                                        serde_json::to_string(&result).unwrap_or_default()
+                                    ),
+                                });
+                                final_outcome = Ok(result_str);
+                                break;
+                            }
+                            Err(e) => {
+                                let kind = classify_tool_execution_error(&e);
+                                let detail = e.to_string();
+                                self.sink.emit(TraceEvent::ToolExec {
+                                    meta: meta.clone(),
+                                    name: tc.name.clone(),
+                                    args_json: args_json.clone(),
+                                    latency_ms: tool_latency,
+                                    status: ToolStatus::Err(detail.clone()),
+                                });
+                                final_outcome = Err((kind, detail));
+                                // 不 break —— 让 retry 决策在循环底决定
+                            }
+                        }
+
+                        // Retry decision
+                        let current_kind = match &final_outcome {
+                            Ok(_) => break, // success path（不应该到这里）
+                            Err((k, _)) => k.clone(),
+                        };
+                        if policy.retryable(&current_kind) && attempt < max_attempts {
+                            self.sink.emit(TraceEvent::ToolRetry {
                                 meta: meta.clone(),
                                 name: tc.name.clone(),
-                                args_json: args_json.clone(),
-                                latency_ms: tool_latency,
-                                status: ToolStatus::Ok(serde_json::to_string(&result).unwrap_or_default()),
+                                attempt,
+                                kind: current_kind.label().to_string(),
+                                reason: current_kind.to_string(),
+                                recovered: false,
                             });
-                            // 4c. Run PostToolHook
-                            let mut result_str = serde_json::to_string_pretty(&result)
-                                .unwrap_or_else(|_| format!("{:?}", result));
-                            {
-                                let mut post_ctx = crate::hooks::PostToolCtx { name: &resolved_name, result: &mut result_str };
-                                let outcome = self.hooks.run_post_tool(&mut post_ctx, |hook_name, point, kind| {
-                                    self.sink.emit(TraceEvent::HookFired {
-                                        meta: meta.clone(),
-                                        hook_name: hook_name.to_string(),
-                                        point,
-                                        outcome_kind: kind.to_string(),
-                                    });
-                                    log_hook_fire(hook_name, point, kind);
-                                });
-                                match outcome {
-                                    crate::hooks::HookOutcome::Abort { reason } => {
-                                        return Err(AgentError::HookAborted {
-                                            hook: "PostTool".into(),
-                                            reason,
-                                        });
-                                    }
-                                    crate::hooks::HookOutcome::Mutate(ref mutated) => {
-                                        result_str = mutated.clone();
-                                    }
-                                    _ => {}
-                                }
-                            }
+                            continue;
+                        } else {
+                            // 最后一次失败 / 不可重试：结束循环
+                            self.sink.emit(TraceEvent::ToolRetry {
+                                meta: meta.clone(),
+                                name: tc.name.clone(),
+                                attempt,
+                                kind: current_kind.label().to_string(),
+                                reason: current_kind.to_string(),
+                                recovered: false,
+                            });
+                            break;
+                        }
+                    }
+
+                    // ── 终止态：决定要不要把错误喂回 model ──────────────
+                    match final_outcome {
+                        Ok(result_str) => {
                             messages.push(Message::user(format!(
                                 "[tool_result for {}]\n{}",
                                 tc.name,
                                 result_str,
                             )));
                         }
-                        Err(e) => {
-                            self.sink.emit(TraceEvent::ToolExec {
-                                meta: meta.clone(),
-                                name: tc.name.clone(),
-                                args_json,
-                                latency_ms: tool_latency,
-                                status: ToolStatus::Err(e.to_string()),
-                            });
-                            messages.push(Message::user(format!("[tool_error for {}]\n{}", tc.name, e)));
+                        Err((kind, detail)) => {
+                            // kind.label() 一致 → trace 上是同一类
+                            // 不把错误消息喂回 model 的 kind（MalformedArgs /
+                            // ToolNotFound）会形成死循环（model 看自己上
+                            // 一轮的输出"修正"通常产出更多错误）。
+                            if policy.loopback_to_model(&kind) {
+                                messages.push(Message::user(format!(
+                                    "[tool_error for {}]\n{}",
+                                    tc.name, detail
+                                )));
+                            }
+                            // 不喂回的：错误已经在 trace 里，UI 也能看；
+                            // model 不需要知道（"它自己改不对"）。
                         }
                     }
-                }
-            }
+                }            }
 
             if round + 1 >= max_rounds {
                 return Err(AgentError::MaxToolRoundsExceeded(max_rounds));
@@ -2773,11 +2992,13 @@ End"#;
         assert!(!executed.load(Ordering::SeqCst), "tool must not execute on non-JSON args");
 
         let reqs = server.received_requests().await.unwrap();
-        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs.len(), 2, "should still make round-2 call after parse failure");
         let body2 = String::from_utf8_lossy(&reqs[1].body);
+        // 新行为：MalformedArgs 不回喂 model —— 第 2 轮请求里不含任何
+        // [tool_error] 内容，避免 model 看自己上一轮错误输出循环恶化。
         assert!(
-            body2.contains("[tool_error for ping]") && body2.contains("not valid JSON"),
-            "model got the explicit format error: {body2}"
+            !body2.contains("[tool_error for ping]"),
+            "MalformedArgs must NOT loopback to model: {body2}"
         );
     }
 
