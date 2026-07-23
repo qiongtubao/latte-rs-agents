@@ -393,8 +393,11 @@ fn build_router(state: AppState) -> Router {
         .route("/chat/role", post(switch_role))
         .route("/chat/cancel-turn", post(chat_cancel_turn))
         .route("/chat/abort", post(chat_abort))
+        // SSE event stream for the main chat. UI subscribes via
+        // `EventSource('/api/events?id=<session>')` and drains
+        // events as they arrive.
+        .route("/events", get(events_sse))
         .route("/traces", get(list_traces))
-        .route("/traces/:session_id", get(read_trace))
         .route("/self-loop/start", post(self_loop_start))
         .route("/self-loop/events", get(self_loop_events_sse))
         .route("/self-loop/stop", post(self_loop_stop))
