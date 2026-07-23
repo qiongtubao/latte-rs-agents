@@ -388,11 +388,9 @@ export function mountChat(opts: {
     const rawText = container.inputEl.value.trim();
     if (!rawText) return;
     container.inputEl.value = "";
+    // 发送期间禁用 send 按钮防双击；abort 按钮保持可用 —— 用户
+    // 可能想把刚发的卡住 turn 中途打断。
     container.sendBtn.disabled = true;
-    // 中止按钮常驻可见：发送时禁用（避免重复 click）；空闲时可用，
-    // 此时点击会发 /api/chat/abort —— controller abort() 仍是 no-op，
-    // 但能用来强行打断一个卡住的 turn。
-    container.abortBtn.disabled = true;
 
     if (rawText.startsWith("/")) {
       addMessage({ kind: "system", content: `→ ${rawText}` });
@@ -410,7 +408,8 @@ export function mountChat(opts: {
       startWaitTimer();
     }
     container.sendBtn.disabled = false;
-    container.abortBtn.disabled = false;
+    // 注：abortBtn 不在这里重置 disable 状态 —— abort 按钮自带
+    // 独立的 disabled 跟踪（click handler finally 里设回 false）。
   });
 
   // ── @role autocomplete ──
@@ -509,6 +508,12 @@ export function mountChat(opts: {
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
   // Abort button: kills all in-flight turns + subagents + workflows.
   // 默认常驻可见。点击禁用自己 + 改 label，直到 server 响应回来。
+  // 防御策略：
+  //  - 双击防 race 用 disabled + early-return guard
+  //  - 网络 / RPC 错误：try/catch 兜底，finally 一定能恢复 UI
+  //  - DOM 操作不抛：button 是静态 HTML，不会 null；textContent 不会抛
+  //  - abortSession 内部其他错误（404 等）被 fetch 包装成 Promise reject，
+  //    也走 catch 分支
   container.abortBtn.addEventListener("click", async () => {
     if (container.abortBtn.disabled) return;
     container.abortBtn.disabled = true;
@@ -516,8 +521,10 @@ export function mountChat(opts: {
     try {
       await abortSession();
     } catch (e) {
-      console.error("[chat] abortSession failed", e);
+      // 任何错误（网络、404、5xx、JS 异常）都不让按钮卡死。
+      console.error("[chat] abortSession failed:", e);
     } finally {
+      // 无论 try/catch 走哪条都要恢复 UI，否则按钮会一直 disabled。
       container.abortBtn.disabled = false;
       container.abortBtn.textContent = "⏹ 终止";
     }
