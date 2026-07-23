@@ -86,6 +86,7 @@ async function main(): Promise<void> {
       sendBtn: $("chat-send") as HTMLButtonElement,
       clearBtn: $("chat-clear") as HTMLButtonElement,
       quitBtn: $("chat-quit") as HTMLButtonElement,
+      abortBtn: $("chat-abort") as HTMLButtonElement,
       statusPill: $("status-pill"),
       roleSelect: $("role-select") as HTMLSelectElement,
       rolePill: $("role-pill"),
