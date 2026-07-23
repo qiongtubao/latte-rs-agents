@@ -389,7 +389,10 @@ export function mountChat(opts: {
     if (!rawText) return;
     container.inputEl.value = "";
     container.sendBtn.disabled = true;
-    container.abortBtn.style.display = "inline-block";
+    // 中止按钮常驻可见：发送时禁用（避免重复 click）；空闲时可用，
+    // 此时点击会发 /api/chat/abort —— controller abort() 仍是 no-op，
+    // 但能用来强行打断一个卡住的 turn。
+    container.abortBtn.disabled = true;
 
     if (rawText.startsWith("/")) {
       addMessage({ kind: "system", content: `→ ${rawText}` });
@@ -407,7 +410,7 @@ export function mountChat(opts: {
       startWaitTimer();
     }
     container.sendBtn.disabled = false;
-    container.abortBtn.style.display = "none";
+    container.abortBtn.disabled = false;
   });
 
   // ── @role autocomplete ──
@@ -505,8 +508,9 @@ export function mountChat(opts: {
   container.clearBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /clear" }); await sendCommand("/clear"); });
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
   // Abort button: kills all in-flight turns + subagents + workflows.
-  // Shown only when the controller is busy (sendBtn disabled).
+  // 默认常驻可见。点击禁用自己 + 改 label，直到 server 响应回来。
   container.abortBtn.addEventListener("click", async () => {
+    if (container.abortBtn.disabled) return;
     container.abortBtn.disabled = true;
     container.abortBtn.textContent = "⏹ 终止中…";
     try {
@@ -516,7 +520,6 @@ export function mountChat(opts: {
     } finally {
       container.abortBtn.disabled = false;
       container.abortBtn.textContent = "⏹ 终止";
-      container.abortBtn.style.display = "none";
     }
   });
   container.roleSelect.addEventListener("change", async () => {
