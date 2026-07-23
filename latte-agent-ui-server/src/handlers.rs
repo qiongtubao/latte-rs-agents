@@ -149,6 +149,12 @@ pub(crate) async fn chat_send(
         Err(_) => StatusCode::NOT_FOUND,
     }
 }
+/// Only carries `session_id`, used for endpoints that need no other params.
+#[derive(Deserialize)]
+pub(crate) struct SessionOnlyRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub(crate) struct CommandRequest {
@@ -186,7 +192,7 @@ pub(crate) async fn switch_role(
 
 pub(crate) async fn chat_cancel_turn(
     State(state): State<AppState>,
-    Json(req): Json<SwitchRoleRequest>,
+    Json(req): Json<SessionOnlyRequest>,
 ) -> StatusCode {
     match api::chat_cancel_turn(&state.backend, req.session_id.as_deref()).await {
         Ok(()) => StatusCode::OK,
@@ -194,10 +200,10 @@ pub(crate) async fn chat_cancel_turn(
     }
 }
 
-/// `POST /api/chat/abort` — 终止整个 session。
+/// `POST /api/chat/abort` — 终止整个 session，body 只需 session_id。
 pub(crate) async fn chat_abort(
     State(state): State<AppState>,
-    Json(req): Json<SwitchRoleRequest>,
+    Json(req): Json<SessionOnlyRequest>,
 ) -> StatusCode {
     match api::chat_abort(&state.backend, req.session_id.as_deref()).await {
         Ok(()) => StatusCode::OK,
