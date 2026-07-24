@@ -424,9 +424,9 @@ fn scan_model_file(
         .and_then(|v| v.as_array())
     {
         for entry in models {
-            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+            if let Some(id) = model_entry_key(entry) {
                 model_files
-                    .entry(id.to_string())
+                    .entry(id)
                     .or_default()
                     .push(path_str.clone());
             }
@@ -437,13 +437,35 @@ fn scan_model_file(
     // GlobalConfig::parse_toml for the global layer).
     if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
         for entry in models {
-            if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
+            if let Some(id) = model_entry_key(entry) {
                 model_files
-                    .entry(id.to_string())
+                    .entry(id)
                     .or_default()
                     .push(path_str.clone());
             }
         }
+    }
+}
+
+/// 返回模型来源索引使用的规范键。
+///
+/// 新配置以 `provider/model_name` 作为模型唯一标识；保留 `id` 回退以便
+/// 日志扫描旧版项目配置时仍能显示来源，而不影响运行时模型解析。
+fn model_entry_key(entry: &toml::Value) -> Option<String> {
+    let table = entry.as_table()?;
+    match (
+        table.get("provider").and_then(toml::Value::as_str),
+        table.get("model_name").and_then(toml::Value::as_str),
+    ) {
+        (Some(provider), Some(model_name))
+            if !provider.is_empty() && !model_name.is_empty() =>
+        {
+            Some(format!("{provider}/{model_name}"))
+        }
+        _ => table
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned),
     }
 }
 /// Redact a value that looks like a secret: keep the first 4 and last 2
@@ -455,4 +477,40 @@ fn redact(s: &str) -> String {
     let head = &s[..4];
     let tail = &s[s.len() - 2..];
     format!("{head}***{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scans_router_models_by_composite_key() {
+        // 验证全局层 [[models]] 使用 model_name 时能登记 provider/model_name 来源。
+        let path = std::env::temp_dir().join(format!(
+            "latte_config_layer_model_{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[[models]]
+name = "MiniMax-M3"
+model_name = "MiniMax-M3"
+api = "openai"
+provider = "minimax"
+base_url = "https://api.minimaxi.com/v1"
+api_key = "test-key"
+context_window = 1000000
+max_tokens = 384000
+"#,
+        )
+        .unwrap();
+
+        let mut model_files = std::collections::BTreeMap::new();
+        scan_model_file(&path, &mut model_files);
+
+        assert_eq!(model_files.len(), 1);
+        assert_eq!(model_files["minimax/MiniMax-M3"], vec![path.display().to_string()]);
+        let _ = std::fs::remove_file(path);
+    }
 }

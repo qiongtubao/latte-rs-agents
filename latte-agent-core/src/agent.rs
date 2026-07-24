@@ -314,10 +314,10 @@ impl Agent {
     /// Send a single chat completion request (one-turn, no context).
     ///
     /// Walks `model_chain` in priority order, skipping models on cooldown.
-    /// On a retryable failure (rate-limited, 5xx, transient HTTP error),
-    /// the failing model is put on cooldown and the next model in the
-    /// chain is tried. Non-retryable errors (auth, config, serialization)
-    /// surface immediately without walking the rest of the chain.
+    /// On a model-local failure that can be bypassed (rate limit, 4xx, 5xx,
+    /// transport-level HTTP error, or authentication failure), the failing
+    /// model is put on cooldown and the next model in the chain is tried.
+    /// Local configuration and serialization errors still surface immediately.
     ///
     /// If every model is on cooldown:
     /// - [`WaitPolicy::WaitAndRetry`] (default) sleeps until the
@@ -347,10 +347,9 @@ impl Agent {
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
                     } else {
-                        // Non-retryable: surface immediately, don't keep
-                        // walking the chain (e.g. Auth errors mean the
-                        // vendor is misconfigured and other models in
-                        // the same vendor would fail the same way).
+                        // Only local errors that cannot be bypassed by switching
+                        // models surface immediately. Auth failures receive a short
+                        // cooldown so one bad credential cannot block other vendors.
                         return Err(e.into());
                     }
                 }
@@ -588,8 +587,10 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
             _ => Some(Duration::from_secs(30)),
         },
         AiError::Http(_) => Some(Duration::from_secs(10)),
-        // Everything else is non-retryable: vendor config, serde,
-        // auth, unsupported provider, etc.
+        // 认证失败只说明当前模型的凭证不可用。短暂冷却当前模型并继续
+        // fallback，后续模型可能使用不同厂商或不同凭证。
+        AiError::Auth(_) => Some(Duration::from_secs(5)),
+        // 其余为无法通过切换模型可靠规避的本地错误。
         _ => None,
     }
 }
