@@ -337,7 +337,15 @@ impl AgentConfig {
                     e
                 ))
             })?;
-            let part = Self::parse(&content)?;
+            let mut part = Self::parse(&content)?;
+
+            // 如果标准解析没得到 model，尝试作为裸 ModelDef 解析
+            // （write_project 写入的格式：直接是 name/providr/base_url 等字段）
+            if part.models.models.is_empty() && part.roles.is_empty() {
+                if let Ok(bare_def) = toml::from_str::<ModelDef>(&content) {
+                    part.models.models.push(bare_def);
+                }
+            }
 
             // Roles: detect duplicate IDs.
             for id in part.roles.keys() {
