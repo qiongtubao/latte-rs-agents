@@ -347,3 +347,92 @@ pub(crate) async fn get_logs(
         .map(Json)
         .map_err(|e| (StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), e.message))
 }
+
+// ─── Models ─────────────────────────────────────────────────────
+
+/// `GET /api/models` — 列出合并后的 model catalog。
+///
+/// 数据源：`UiBackend.merged: Arc<RwLock<AgentConfig>>`，已经走过
+/// `config_layer::load` 的三层合并（含 `~/.latte/models.d/*.toml`
+/// 按厂商拆分）。这里直接透传，不再二次扫描磁盘 —— 这样 UI 看到的
+/// 列表与运行时 `ModelResolver` 实际能解析到的 model 集合保持一致。
+pub(crate) async fn list_models(
+    State(state): State<AppState>,
+) -> Result<Json<api::ModelsListResponse>, (StatusCode, String)> {
+    api::list_models(&state.backend)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `PATCH /api/models/:key` —— 保存单个 model 到项目目录。
+///
+/// URL `:key` 用 `provider/id` 形式，与 `list_models` 返回的 `key` 一致。
+/// 请求 body 是 `ModelDef` 全量字段（partial update 未实现 —— UI
+/// 层总是把整个 form 序列化好再发，对应需求「改完点保存」）。
+pub(crate) async fn update_model(
+    axum::extract::Path(key): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<api::UpdateModelRequest>,
+) -> Result<Json<api::ModelWithSource>, (StatusCode, String)> {
+    api::update_model(&state.backend, &key, &req.target, req.def)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `POST /api/models/test` —— 跑一次连通性 / 简单 chat 测试。
+///
+/// 详见 `crate::test::run_test` 的 doc。body 是 `TestModelRequest`，
+/// 完整 model 定义（不是 catalog 里的 —— 改完没保存的也能直接测）。
+pub(crate) async fn test_model(
+    Json(req): Json<crate::test::TestModelRequest>,
+) -> Result<Json<crate::test::TestModelResponse>, (StatusCode, String)> {
+    let resp = crate::test::run_test(req).await;
+    Ok(Json(resp))
+}
+
+/// `GET /api/models/:key/capabilities` —— image input / image generation
+/// 能力探测。当前是启发式（看 supports_vision + model id pattern），
+/// 之后可以做一次真请求探测。
+pub(crate) async fn model_capabilities(
+    axum::extract::Path(key): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::test::ModelCapabilities>, (StatusCode, String)> {
+    // key 是 `provider/name`；从 catalog 里找 def，找不到就回 404。
+    let def = {
+        let cfg = state.backend.merged.read();
+        let (provider, id) = key
+            .split_once('/')
+            .map(|(p, n)| (p.to_string(), n.to_string()))
+            .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("bad key {key:?}")))?;
+        cfg.models
+            .models
+            .iter()
+            .find(|m| m.provider == provider && m.name == id)
+            .cloned()
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("model {key:?} not in catalog"),
+                )
+            })?
+    };
+    // 能力探测不依赖 mode / prompt —— 直接构造 request。
+    let req = crate::test::TestModelRequest {
+        def,
+        mode: crate::test::TestMode::Connectivity,
+        prompt: String::new(),
+        images: Vec::new(),
+        probe_path: None,
+    };
+    Ok(Json(crate::test::probe_capabilities(&req).await))
+}

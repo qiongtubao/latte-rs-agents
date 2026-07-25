@@ -1,0 +1,397 @@
+// 模型管理面板：下拉菜单选中一个 model → 表单展示所有字段（含 api_key）
+// → 点保存写回项目目录 `<cwd>/.latte/models.d/<provider>__<id>.toml`。
+//
+// 历史：早期版本是 `<table>` 列出所有 model，但 model 字段很多（11 个 +
+// 4 个可空数字），单行 table 信息密度太低、key 显示省略号、编辑要走
+// "edit" 弹窗 → UX 不友好。改成 dropdown + form 一对一编辑。
+//
+// 数据契约：见 `api.ts` 的 `ModelsListResponse` / `ModelWithSource`。
+// `file_path` 字段是后端独立扫盘拿到的真实绝对路径，UI 直接展示给用户。
+import { listModels, updateModel } from "./api";
+import type { ModelDef, ModelWithSource } from "./api";
+
+interface UIBinding {
+  panelEl: HTMLElement;
+  openBtn: HTMLButtonElement;
+  closeBtn: HTMLButtonElement;
+  refreshBtn: HTMLButtonElement;
+  newBtn: HTMLButtonElement;
+  bodyEl: HTMLElement;
+  statusEl: HTMLElement;
+  pathsEl: HTMLElement;
+  /** model 选择下拉框（脚本挂载时由调用者提供，避免硬编码 ID）。 */
+  selectEl: HTMLSelectElement;
+  /**
+   * 「测试」按钮的回调：传当前表单的 def（可能是新建未保存的）与
+   * 对应 key（已存在的 model 才有，null 表示新建）。main.ts 注入一个
+   * 直接打开测试弹层的闭包。
+   */
+  onTestClick: (opts: { def: ModelDef; key: string | null }) => void;
+}
+export interface ModelsPanelController {
+  isOpen(): boolean;
+  open(): void;
+}
+
+/** 字段渲染顺序：表单 label 列表，按"基本 → 网络 → 计费 → 行为"分组。 */
+type FieldKind = "text" | "longtext" | "number" | "checkbox" | "select";
+
+interface FieldSpec {
+  key: keyof ModelDef;
+  label: string;
+  kind: FieldKind;
+  placeholder?: string;
+  options?: readonly string[];
+}
+
+const FIELDS: ReadonlyArray<FieldSpec> = [
+  // 基本
+  { key: "id", label: "id", kind: "text", placeholder: "deepseek-v4-pro" },
+  { key: "name", label: "显示名", kind: "text", placeholder: "DeepSeek V4 Pro" },
+  { key: "provider", label: "provider", kind: "text", placeholder: "deepseek" },
+  { key: "api", label: "api 协议", kind: "select", options: ["openai", "anthropic", "google"] },
+  // 网络
+  { key: "base_url", label: "base_url", kind: "longtext", placeholder: "https://api.deepseek.com" },
+  { key: "api_key", label: "api_key（支持 ${ENV} 引用环境变量）", kind: "longtext", placeholder: "${DEEPSEEK_API_KEY}" },
+  // 容量
+  { key: "context_window", label: "context_window（tokens）", kind: "number" },
+  { key: "max_tokens", label: "max_tokens（tokens）", kind: "number" },
+  { key: "timeout_secs", label: "timeout_secs（per-turn）", kind: "number" },
+  // 能力开关
+  { key: "supports_thinking", label: "supports_thinking", kind: "checkbox" },
+  { key: "supports_vision", label: "supports_vision", kind: "checkbox" },
+  // 计费
+  { key: "cost_per_million_input", label: "cost / 1M input (USD)", kind: "number" },
+  { key: "cost_per_million_output", label: "cost / 1M output (USD)", kind: "number" },
+  { key: "tier", label: "tier", kind: "select", options: ["premium", "standard", "budget"] },
+];
+
+/** `<select>` 的 `valueAsNumber` / `checked` / `value` 三种访问方式
+ * 收敛到一个函数，避免散落在渲染 + 收集两处分别断言。
+ */
+type FormInput = HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+
+function readInput(inp: FormInput, kind: FieldKind): string | number | boolean {
+  if (kind === "checkbox") {
+    return (inp as HTMLInputElement).checked;
+  }
+  const raw = inp.value.trim();
+  if (kind === "number") {
+    if (raw === "") return "";
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : "";
+  }
+  return raw;
+}
+
+export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelController {
+  const { container } = opts;
+  let items: ModelWithSource[] = [];
+  let currentKey: string | null = null;
+  let isLoading = false;
+  let isSaving = false;
+
+  container.openBtn.addEventListener("click", () => {
+    container.panelEl.classList.remove("hidden");
+    void refresh();
+  });
+  container.closeBtn.addEventListener("click", () => container.panelEl.classList.add("hidden"));
+  container.refreshBtn.addEventListener("click", () => void refresh());
+  container.newBtn.addEventListener("click", () => selectNewBlank());
+
+  container.selectEl.addEventListener("change", () => {
+    currentKey = container.selectEl.value || null;
+    renderForm();
+  });
+
+  function setStatus(msg: string, error = false): void {
+    container.statusEl.textContent = msg;
+    container.statusEl.classList.toggle("error", error);
+  }
+
+  async function refresh(): Promise<void> {
+    if (isLoading) return;
+    isLoading = true;
+    setStatus("加载中…");
+    try {
+      const resp = await listModels();
+      items = resp.models;
+      container.pathsEl.textContent =
+        `项目: ${resp.project_models_dir} · 全局: ${resp.global_models_dir}`;
+      populateSelect();
+      const keep = currentKey !== null && items.some(m => m.key === currentKey);
+      if (keep && currentKey !== null) {
+        container.selectEl.value = currentKey;
+      } else if (items.length > 0) {
+        currentKey = items[0].key;
+        container.selectEl.value = currentKey;
+      } else {
+        currentKey = null;
+        container.selectEl.value = "";
+      }
+      setStatus(`已加载 ${items.length} 个 model`);
+      renderForm();
+    } catch (e) {
+      setStatus(`加载失败: ${(e as Error).message}`, true);
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  /** 新建：清空 currentKey + form，呈现空白模板。 */
+  function selectNewBlank(): void {
+    currentKey = null;
+    container.selectEl.value = "";
+    renderForm();
+  }
+
+  function populateSelect(): void {
+    container.selectEl.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = items.length === 0
+      ? "（暂无 model，点击 + 新建）"
+      : "（选择一个 model，或点 + 新建）";
+    container.selectEl.appendChild(placeholder);
+    for (const m of items) {
+      const opt = document.createElement("option");
+      opt.value = m.key;
+      opt.textContent = `${m.key}${m.name && m.name !== m.id ? `  —  ${m.name}` : ""}`;
+      container.selectEl.appendChild(opt);
+    }
+  }
+
+  /** 根据 currentKey 渲染表单。无 currentKey → 空白模板供新建。
+   *  返回 inputs Map 让 onSave 取值时不再绕 form 属性。
+   */
+  function renderForm(): { inputs: Map<keyof ModelDef, FormInput> } {
+    container.bodyEl.replaceChildren();
+    const current = currentKey
+      ? items.find(m => m.key === currentKey) ?? null
+      : null;
+
+    if (current) {
+      const meta = document.createElement("div");
+      meta.className = "models-meta";
+      const sourceBadge = document.createElement("span");
+      sourceBadge.className = `models-source-${current.source}`;
+      sourceBadge.textContent = current.source;
+      meta.appendChild(document.createTextNode("文件位置: "));
+      meta.appendChild(sourceBadge);
+      meta.appendChild(document.createTextNode(" "));
+      const pathCode = document.createElement("code");
+      pathCode.className = "models-path-code";
+      pathCode.textContent = current.file_path || "（仅内存，未落盘）";
+      pathCode.title = current.file_path;
+      meta.appendChild(pathCode);
+      container.bodyEl.appendChild(meta);
+    }
+
+    const form = document.createElement("form");
+    form.className = "models-form";
+
+    const inputs = new Map<keyof ModelDef, FormInput>();
+    for (const f of FIELDS) {
+      const wrap = document.createElement("label");
+      wrap.className = `models-form-row models-form-${f.kind}`;
+      const lab = document.createElement("span");
+      lab.className = "models-form-label";
+      lab.textContent = f.label;
+      wrap.appendChild(lab);
+
+      let input: FormInput;
+      if (f.kind === "select") {
+        const sel = document.createElement("select");
+        for (const opt of f.options ?? []) {
+          const o = document.createElement("option");
+          o.value = opt;
+          o.textContent = opt;
+          sel.appendChild(o);
+        }
+        input = sel;
+      } else if (f.kind === "checkbox") {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        input = cb;
+      } else if (f.kind === "number") {
+        const num = document.createElement("input");
+        num.type = "number";
+        num.step = "any";
+        if (f.placeholder) num.placeholder = f.placeholder;
+        input = num;
+      } else if (f.kind === "longtext") {
+        const ta = document.createElement("textarea");
+        ta.rows = 2;
+        if (f.placeholder) ta.placeholder = f.placeholder;
+        input = ta;
+      } else {
+        const t = document.createElement("input");
+        t.type = "text";
+        if (f.placeholder) t.placeholder = f.placeholder;
+        input = t;
+      }
+
+      // 用现有值填充
+      const v = current ? current[f.key] : undefined;
+      input.value = ""; // 先清空（checkbox / number 用 .checked）
+      if (f.kind === "checkbox") {
+        (input as HTMLInputElement).checked = Boolean(v);
+      } else if (f.kind === "number") {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          (input as HTMLInputElement).value = String(v);
+        }
+      } else if (typeof v === "string") {
+        input.value = v;
+      }
+
+      wrap.appendChild(input);
+      form.appendChild(wrap);
+      inputs.set(f.key, input);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "models-form-actions";
+    // 两个写盘按钮：「保存到项目」与「保存到全局」对应后端 PATCH 的
+    // `target` 字段（默认 project）。新建时隐藏全局按钮 —— 没源文件可改。
+    const saveProject = document.createElement("button");
+    saveProject.type = "button";
+    saveProject.className = "primary";
+    saveProject.dataset.target = "project";
+    saveProject.textContent = current ? "保存到项目" : "创建到项目";
+    if (isSaving) saveProject.disabled = true;
+    actions.appendChild(saveProject);
+    if (current) {
+      // 「保存到全局」：编辑已存在的 model 时允许把改动写到 `~/.latte/models.d/`。
+      const saveGlobal = document.createElement("button");
+      saveGlobal.type = "button";
+      saveGlobal.dataset.target = "global";
+      saveGlobal.textContent = "保存到全局";
+      if (isSaving) saveGlobal.disabled = true;
+      actions.appendChild(saveGlobal);
+      // 「测试」按钮：触发 connectivity + 简单 chat 测试，结果弹窗显示。
+      // 完整测试页（包含 image input / image generation 检查）放到
+      // follow-up：当前只暴露入口，按钮先连上。
+      const testBtn = document.createElement("button");
+      testBtn.type = "button";
+      testBtn.className = "models-test-btn";
+      testBtn.textContent = "测试";
+      actions.appendChild(testBtn);
+      testBtn.addEventListener("click", () => {
+        // 用当前表单的 def（可能是新建未保存的）+ 当前 key（已存在时
+        // 用于后端 /capabilities 探测）打开测试弹层。表单校验失败时
+        // 仍允许打开 —— 用户可能想先连通后改。
+        const def = collectDef(inputs);
+        if (!def) {
+          setStatus("测试失败：必填字段缺失（id / provider / api）", true);
+          return;
+        }
+        container.onTestClick({ def, key: currentKey });
+      });
+    }
+    if (current && current.source === "global") {
+      const note = document.createElement("span");
+      note.className = "models-form-note";
+      note.textContent = "保存到项目：相当于把全局 model 复制到项目层";
+      actions.appendChild(note);
+    }
+    form.appendChild(actions);
+
+    // 提交 handler：根据触发按钮的 data-target 决定写盘目录。
+    // 默认 project，两个按钮共用同一条 handler。
+    const submitSave = (target: "project" | "global"): void => {
+      void onSave(inputs, target);
+    };
+    saveProject.addEventListener("click", () => submitSave("project"));
+    if (current) {
+      // 上面的 if 块保证了 saveGlobal 与 testBtn 都已 append
+      const saveGlobalBtn = actions.querySelector<HTMLButtonElement>(
+        'button[data-target="global"]',
+      );
+      saveGlobalBtn?.addEventListener("click", () => submitSave("global"));
+    }
+
+    container.bodyEl.appendChild(form);
+    return { inputs };
+  }
+
+  async function onSave(
+    inputs: Map<keyof ModelDef, FormInput>,
+    target: "project" | "global",
+  ): Promise<void> {
+    if (isSaving) return;
+    isSaving = true;
+    setStatus(target === "global" ? "保存到全局…" : "保存到项目…");
+    try {
+      const def = collectDef(inputs);
+      if (!def) {
+        setStatus("保存失败：必填字段缺失（id / provider / api）", true);
+        return;
+      }
+      const isNew = currentKey === null;
+      const targetKey = isNew ? `${def.provider}/${def.id}` : currentKey!;
+      const updated = await updateModel(targetKey, def, target);
+      setStatus(`✅ 已保存 ${updated.key}（${updated.source}）`);
+      await refresh();
+      // refresh 内部会基于 currentKey 重选；这里强制把 updated.key 设为新 currentKey
+      // （即使刷新时 currentKey 仍指向旧 key，会被 refresh 中的 keep 逻辑兜住）。
+      currentKey = updated.key;
+      container.selectEl.value = updated.key;
+      renderForm();
+    } catch (err) {
+      setStatus(`保存失败: ${(err as Error).message}`, true);
+    } finally {
+      isSaving = false;
+      const save = container.bodyEl.querySelector("button.primary") as HTMLButtonElement | null;
+      if (save) save.disabled = false;
+    }
+  }
+
+  return {
+    isOpen: () => !container.panelEl.classList.contains("hidden"),
+    open: () => {
+      container.panelEl.classList.remove("hidden");
+      void refresh();
+    },
+  };
+}
+/** 从表单 inputs 收集成 ModelDef。空数字字段留 null（保留 Rust 侧
+ * 的 Option<...> 语义）。必填字段缺失 → 返回 null。
+ */
+function collectDef(inputs: Map<keyof ModelDef, FormInput>): ModelDef | null {
+  const text = (k: keyof ModelDef): string => {
+    const inp = inputs.get(k);
+    return inp ? inp.value.trim() : "";
+  };
+  const num = (k: keyof ModelDef): number | null => {
+    const v = readInput(inputs.get(k)!, "number");
+    if (v === "") return null;
+    return v as number;
+  };
+  const bool = (k: keyof ModelDef): boolean => {
+    const inp = inputs.get(k);
+    return inp ? (inp as HTMLInputElement).checked : false;
+  };
+
+  const id = text("id");
+  const provider = text("provider");
+  const api = text("api") || "openai";
+  if (!id || !provider || !api) {
+    return null;
+  }
+  return {
+    id,
+    name: text("name") || `${provider}/${id}`,
+    provider,
+    api,
+    base_url: text("base_url") || "",
+    api_key: text("api_key") || "",
+    context_window: num("context_window") ?? 0,
+    max_tokens: num("max_tokens") ?? 0,
+    supports_thinking: bool("supports_thinking"),
+    supports_vision: bool("supports_vision"),
+    cost_per_million_input: num("cost_per_million_input"),
+    cost_per_million_output: num("cost_per_million_output"),
+    tier: text("tier") || null,
+    timeout_secs: num("timeout_secs"),
+  };
+}

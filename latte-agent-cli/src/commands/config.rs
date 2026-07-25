@@ -80,7 +80,7 @@ impl ConfigShow {
             let key = classify_key(&m.api_key);
             println!(
                 "  {:<35} provider={} base_url={} api_key={}",
-                m.id, m.provider, m.base_url, key
+                m.name, m.provider, m.base_url, key
             );
         }
 

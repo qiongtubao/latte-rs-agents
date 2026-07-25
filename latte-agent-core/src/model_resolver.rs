@@ -79,7 +79,7 @@ impl ModelResolver {
             .models
             .models
             .iter()
-            .map(|m| (m.id.clone(), m.clone()))
+            .map(|m| (m.name.clone(), m.clone()))
             .collect();
 
         let tier_defaults = config
@@ -193,10 +193,10 @@ impl ModelResolver {
                 .and_then(|t| ModelTier::parse(t).ok())
                 == Some(tier)
         }) {
-            push(&def.id);
+            push(&def.name);
         }
         if let Some(def) = self.models.values().next() {
-            push(&def.id);
+            push(&def.name);
         }
         out
     }
@@ -227,7 +227,7 @@ impl ModelResolver {
             // model_chain is set: use chain[0] as primary,
             // then append remaining chain ids as fallbacks.
             for id in chain_ids {
-                if out.iter().any(|m| &m.id == id) {
+                if out.iter().any(|m| &m.name == id) {
                     continue;
                 }
                 if let Ok(m) = self.build_model(id) {
@@ -249,7 +249,7 @@ impl ModelResolver {
         // as additional fallbacks (only when chain was used).
         if !chain_ids.is_empty() {
             if let Ok(primary) = self.resolve(role_id, tier) {
-                if !out.iter().any(|m| &m.id == &primary.id) {
+                if !out.iter().any(|m| &m.name == &primary.name) {
                     out.push(primary);
                 }
             }
@@ -259,7 +259,7 @@ impl ModelResolver {
         // with a valid `api_key`.
         if out.is_empty() {
             for def in self.models.values() {
-                if let Ok(m) = self.build_model(&def.id) {
+                if let Ok(m) = self.build_model(&def.name) {
                     if !m.api_key.trim().is_empty() {
                         out.push(m);
                         break;
@@ -317,7 +317,7 @@ impl ModelResolver {
             .models
             .values()
             .filter(|m| m.name.to_lowercase() == q)
-            .map(|m| m.id.as_str())
+            .map(|m| m.name.as_str())
             .collect();
         if hits.len() == 1 {
             return self.build_model(&hits.remove(0));
@@ -333,7 +333,7 @@ impl ModelResolver {
         let known: Vec<String> = self
             .models
             .values()
-            .map(|m| format!("{} ({})", m.id, m.name))
+            .map(|m| m.name.clone())
             .collect();
         Err(AgentError::Config(format!(
             "--model-id {}: no such id or display name. Available: [{}]",
@@ -354,7 +354,7 @@ impl ModelResolver {
             other => {
                 return Err(AgentError::Config(format!(
                     "unsupported API type '{}' for model '{}'",
-                    other, def.id
+                    other, def.name
                 )))
             }
         };
@@ -366,7 +366,7 @@ impl ModelResolver {
         let api_key = resolve_env_vars(&def.api_key);
 
         Ok(Model {
-            id: def.id.clone(),
+            id: def.name.clone(),
             name: def.name.clone(),
             api: api_type,
             provider: def.provider.clone(),
@@ -451,9 +451,9 @@ mod tests {
     use crate::config::ModelDef;
 
     fn test_model_def(id: &str, tier: Option<&str>) -> ModelDef {
+        // 用 `id` 作为 API 标识（即 `name` 字段），display name 用 human-friendly 形式。
         ModelDef {
-            id: id.into(),
-            name: format!("Model {}", id),
+            name: id.into(),
             api: "openai".into(),
             provider: "test".into(),
             base_url: "http://localhost".into(),
@@ -513,7 +513,7 @@ mod tests {
         let resolver = ModelResolver::from_config(&config).unwrap();
 
         let model = resolver.resolve("any_role", ModelTier::Standard).unwrap();
-        assert_eq!(model.id, "standard-model");
+        assert_eq!(model.name, "standard-model");
     }
 
     #[test]
@@ -529,7 +529,7 @@ mod tests {
 
         let resolver = ModelResolver::from_config(&config).unwrap();
         let model = resolver.resolve("any_role", ModelTier::Budget).unwrap();
-        assert_eq!(model.id, "only-model");
+        assert_eq!(model.name, "only-model");
     }
 
     #[test]
@@ -546,9 +546,9 @@ mod tests {
         };
         let resolver = ModelResolver::from_config(&config).unwrap();
         let m = resolver.resolve_id_or_name("deepseek-v4-flash").unwrap();
-        assert_eq!(m.id, "deepseek-v4-flash");
+        assert_eq!(m.name, "DeepSeek-v4-flash");
+        let _ = m;
     }
-
     #[test]
     fn test_resolve_id_or_name_by_case_insensitive_name() {
         let mut def = test_model_def("deepseek-v4-flash", None);
@@ -564,10 +564,10 @@ mod tests {
         let resolver = ModelResolver::from_config(&config).unwrap();
         // Display name with original casing should match.
         let m = resolver.resolve_id_or_name("DeepSeek-v4-flash").unwrap();
-        assert_eq!(m.id, "deepseek-v4-flash");
+        assert_eq!(m.name, "DeepSeek-v4-flash");
         // And a lowercased form should also match.
         let m = resolver.resolve_id_or_name("deepseek-v4-flash").unwrap();
-        assert_eq!(m.id, "deepseek-v4-flash");
+        assert_eq!(m.name, "DeepSeek-v4-flash");
     }
 
     #[test]
@@ -588,7 +588,6 @@ mod tests {
             .expect_err("should miss");
         let msg = format!("{}", err);
         assert!(msg.contains("nope"), "msg should contain query: {msg}");
-        assert!(msg.contains("real-id"), "msg should list real id: {msg}");
         assert!(msg.contains("Real Name"), "msg should list real name: {msg}");
     }
     fn test_env_var_resolution() {
@@ -636,8 +635,8 @@ mod tests {
             .resolve_chain("any", ModelTier::Premium, &["standard".into()])
             .unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].id, "standard");
-        assert_eq!(chain[1].id, "premium");
+        assert_eq!(chain[0].name, "standard");
+        assert_eq!(chain[1].name, "premium");
     }
 
     #[test]
@@ -648,7 +647,7 @@ mod tests {
             .resolve_chain("any", ModelTier::Premium, &["budget".into(), "standard".into()])
             .unwrap();
         assert_eq!(
-            chain.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            chain.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
             vec!["budget", "standard", "premium"],
             "chain order must be preserved, tier-based fallback appended"
         );
@@ -663,8 +662,8 @@ mod tests {
             .resolve_chain("any", ModelTier::Premium, &["premium".into(), "budget".into()])
             .unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].id, "premium");
-        assert_eq!(chain[1].id, "budget");
+        assert_eq!(chain[0].name, "premium");
+        assert_eq!(chain[1].name, "budget");
     }
 
     #[test]
@@ -680,8 +679,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].id, "budget");
-        assert_eq!(chain[1].id, "premium");
+        assert_eq!(chain[0].name, "budget");
+        assert_eq!(chain[1].name, "premium");
     }
 
     #[test]
@@ -691,7 +690,7 @@ mod tests {
             .resolve_chain("any", ModelTier::Premium, &[])
             .unwrap();
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].id, "premium");
+        assert_eq!(chain[0].name, "premium");
     }
 
     #[test]

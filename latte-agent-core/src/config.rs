@@ -107,8 +107,11 @@ fn merge_global_into(dst: &mut HashMap<String, RoleTemplate>, src: &HashMap<Stri
 }
 
 fn merge_models_or_insert(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
+    // 按 (provider, name) 复合键去重 —— 历史上用 `id`，但 ModelDef 已经
+    // 去掉 `id` 字段，`name` 接管 API id 的语义；`provider` 仍是区分
+    // 同名 model 的关键（"gpt-4"@openai vs "gpt-4"@azure 是不同的）。
     for m in src {
-        if !dst.iter().any(|e| e.id == m.id) {
+        if !dst.iter().any(|e| e.provider == m.provider && e.name == m.name) {
             dst.push(m.clone());
         }
     }
@@ -251,7 +254,7 @@ impl AgentConfig {
             if let Ok(part) = Self::load(&path) {
                 merged.roles.extend(part.roles);
                 for m in part.models.models {
-                    if !merged.models.models.iter().any(|e| e.id == m.id) {
+                    if !merged.models.models.iter().any(|e| e.provider == m.provider && e.name == m.name) {
                         merged.models.models.push(m);
                     }
                 }
@@ -427,13 +430,16 @@ pub struct ModelCatalog {
 /// 3. No controller-level timeout
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
-    /// Model identifier (e.g. "claude-sonnet-4-20250514").
-    pub id: String,
-    /// Human-readable name.
+    /// Model identifier — 同时是 API 请求里的 `model` 字段与 UI 显示名。
+    /// 在用户实际配置里，`name` 与历史的 `model_name` 是同一个值（API id）；
+    /// 直接合并：`name` 即是 API id 也是显示名。
+    /// 历史 `model_name = "..."` 的字段作为未知字段被 serde 静默忽略
+    /// （用户实际配置文件里 `name` 与 `model_name` 同时存在但值相同，
+    /// 不能用 `alias = "model_name"`，否则会触发 duplicate field 错误）。
     pub name: String,
-    /// API type: "openai" or "anthropic".
     pub api: String,
-    /// Provider name.
+    /// Provider name. 与 `name` 一起组成 composite_key `provider/name`，
+    /// 避免同名 model 在不同厂商下冲突。
     pub provider: String,
     /// Base URL for API requests.
     pub base_url: String,
@@ -478,8 +484,7 @@ mod tests {
 tiers = { premium = "claude-opus", standard = "claude-sonnet" }
 
 [[models.models]]
-id = "claude-opus"
-name = "Claude Opus"
+name = "claude-opus"
 api = "anthropic"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -488,8 +493,7 @@ context_window = 200000
 max_tokens = 8192
 
 [[models.models]]
-id = "claude-sonnet"
-name = "Claude Sonnet"
+name = "claude-sonnet"
 api = "anthropic"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -499,7 +503,7 @@ max_tokens = 8192
 
 [roles.pm]
 id = "pm"
-name = "Product Manager"
+name = "pm"
 category = "planning"
 model_tier = "standard"
 icon = "📋"
@@ -509,12 +513,33 @@ icon = "📋"
         assert_eq!(config.models.models.len(), 2);
         assert_eq!(config.roles.len(), 1);
     }
+    /// 旧 schema `model_name` 字段必须仍能通过 `#[serde(alias)]` 解析为 `id`：
+    /// 用户实际目录 `~/.latte/models.d/*.toml` 普遍用 `model_name = "..."` + `provider = "..."`
+    /// 两字段配合，如果 alias 丢了 → load 失败 → UI "暂无 model"。
+    #[test]
+    fn test_legacy_model_name_alias() {
+        let toml = r#"
+model_name = "deepseek-v4-pro"
+api = "openai"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "sk-test"
+context_window = 1000000
+max_tokens = 384000
+tier = "budget"
+timeout_secs = 300
+"#;
+        let def: ModelDef = toml::from_str(toml)
+            .expect("legacy `model_name` field must deserialize via alias");
+        assert_eq!(def.name, "deepseek-v4-pro");
+        assert_eq!(def.provider, "deepseek");
+        assert_eq!(def.context_window, 1_000_000);
+    }
 
     #[test]
     fn test_parse_model_def() {
         let toml = r#"
-id = "test-model"
-name = "Test Model"
+name = "test-model"
 api = "openai"
 provider = "test"
 base_url = "http://localhost"
@@ -526,7 +551,7 @@ tier = "budget"
 "#;
 
         let def: ModelDef = toml::from_str(toml).unwrap();
-        assert_eq!(def.id, "test-model");
+        assert_eq!(def.name, "test-model");
         assert_eq!(def.api, "openai");
         assert_eq!(def.tier, Some("budget".into()));
     }

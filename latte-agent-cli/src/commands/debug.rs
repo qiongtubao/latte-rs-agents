@@ -350,6 +350,8 @@ fn run_replay(
                     let mut msgs = vec![latte_ai::models::Message {
                         role: latte_ai::models::Role::User,
                         content: vec![latte_ai::models::ContentPart::text(raw_content.clone())],
+                        tool_call_id: None,
+                        tool_calls: None,
                     }];
                     let mut ctx = latte_agent_core::hooks::PreCallCtx { messages: &mut msgs };
                     let _ = chain.run_pre_call(&mut ctx, |_, _, _| {});

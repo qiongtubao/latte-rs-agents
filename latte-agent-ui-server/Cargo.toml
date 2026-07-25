@@ -17,6 +17,8 @@ latte-rs-graph = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = "0.8"
 parking_lot = { workspace = true }
 anyhow = "1"
 # toml_edit：角色编辑器保存时重写 .latte/agents.d/<id>.toml，
@@ -29,3 +31,5 @@ axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+reqwest = { workspace = true }
+base64 = "0.22"

@@ -430,3 +430,156 @@ export async function fetchSubsession(subId: string): Promise<unknown[]> {
 export async function stopSelfLoop(): Promise<void> {
   await getTransport().request("POST", "/api/self-loop/stop");
 }
+
+// ─── Tools ───────────────────────────────────────────────────────────
+export interface ToolEntry {
+  id: string;
+  kind: string;
+  enabled: boolean;
+  /** 工具描述，渲染时作为 tooltip。 */
+  description?: string;
+  /** 工具被哪些 agent 注册（角色 slug 列表）。 */
+  registered_by?: string[];
+}
+
+/** GET /api/tools 返回 `{tools: ToolEntry[]}` 形状（旧 schema 也兼容裸数组）。 */
+export interface ToolsListResponse {
+  tools: ToolEntry[];
+}
+
+/** GET /api/tools：列出所有可用工具 + enabled 状态。 */
+export async function listTools(): Promise<ToolEntry[]> {
+  const resp = await getTransport().request<ToolEntry[] | ToolsListResponse>(
+    "GET",
+    "/api/tools",
+  );
+  // 兼容两种返回形态
+  return Array.isArray(resp) ? resp : resp.tools;
+}
+
+/** PATCH /api/tools/:id：切换工具启用状态。 */
+export async function setToolEnabled(id: string, enabled: boolean): Promise<void> {
+  await getTransport().request(
+    "PATCH",
+    `/api/tools/${encodeURIComponent(id)}`,
+    { enabled },
+  );
+}
+
+// ─── Models ──────────────────────────────────────────────────────────
+//
+// `ModelDef` 字段跟后端 `latte-agent-core::config::ModelDef` 一一对应（snake_case）。
+// `model_name` 字段已被 core 移除（合并进 `id`）；面板渲染和编辑表单用 `id` 即可。
+
+export interface ModelDef {
+  id: string;
+  name: string;
+  api: string;
+  provider: string;
+  base_url: string;
+  api_key: string;
+  context_window: number;
+  max_tokens: number;
+  supports_thinking?: boolean;
+  supports_vision?: boolean;
+  cost_per_million_input?: number | null;
+  cost_per_million_output?: number | null;
+  tier?: string | null;
+  timeout_secs?: number | null;
+}
+
+/** `ModelWithSource` = `ModelDef` + 主键 + 来源标识 + 文件位置。
+ * `source` 是 `"project"`（项目 `.latte/models.d/`）、`"global"`（全局
+ * `~/.latte/models.d/`）或 `"catalog"`（只在内存，未落盘）。
+ * `file_path` 是 disk 扫描拿到的实际绝对路径；空串表示 model 只在
+ * 内存 catalog 里（创建后未保存）。
+ */
+export interface ModelWithSource extends ModelDef {
+  key: string;
+  source: "project" | "global" | "catalog";
+  file_path: string;
+}
+
+export interface ModelsListResponse {
+  models: ModelWithSource[];
+  tiers: Record<string, string>;
+  project_models_dir: string;
+  global_models_dir: string;
+}
+
+/** GET /api/models：列出所有 model。 */
+export async function listModels(): Promise<ModelsListResponse> {
+  return getTransport().request("GET", "/api/models");
+}
+export async function createModel(def: ModelDef): Promise<ModelWithSource> {
+  return getTransport().request("POST", "/api/models", def);
+}
+
+export async function updateModel(
+  key: string,
+  def: ModelDef,
+  target: "project" | "global" = "project",
+): Promise<ModelWithSource> {
+  return getTransport().request(
+    "PATCH",
+    `/api/models/${encodeURIComponent(key)}`,
+    { target, ...def },
+  );
+}
+/** DELETE /api/models/:key：删除 model。 */
+export async function deleteModel(key: string): Promise<void> {
+  await getTransport().request("DELETE", `/api/models/${encodeURIComponent(key)}`);
+}
+
+// ─── Model test (后端 test.rs) ─────────────────────────────────────
+//
+// 详见后端 `latte-agent-ui-server/src/test.rs`。前端只发请求 + 渲染
+// 结果，逻辑全部在 Rust 侧。返回的 `TestModelResponse` 字段全可选
+// —— connectivity / aiclient / http 三种模式返回的字段子集不一样
+// （只有 connectivity 才有 `available_models`），所以前端按需读取。
+
+export type TestMode = "connectivity" | "aiclient" | "http";
+
+export interface TestModelRequest {
+  def: ModelDef;
+  mode: TestMode;
+  prompt?: string;
+  /** base64 data URL 列表（"data:image/png;base64,..."），仅图片输入模式用。 */
+  images?: string[];
+  probe_path?: string;
+}
+
+export interface TestModelResponse {
+  ok: boolean;
+  mode: string;
+  latency_ms: number;
+  response?: string;
+  error?: string;
+  status?: number;
+  available_models?: string[];
+}
+
+export interface ModelCapabilities {
+  supports_image_input: boolean;
+  supports_image_generation: boolean;
+  latency_ms: number;
+}
+
+/** POST /api/models/test —— 跑一次连通 / chat 测试。 */
+export async function testModel(
+  req: TestModelRequest,
+): Promise<TestModelResponse> {
+  return getTransport().request("POST", "/api/models/test", req);
+}
+
+/** GET /api/models/:key/capabilities —— image input / image generation 探测。 */
+export async function getModelCapabilities(
+  key: string,
+): Promise<ModelCapabilities> {
+  return getTransport().request(
+    "GET",
+    `/api/models/${encodeURIComponent(key)}/capabilities`,
+  );
+}
+
+

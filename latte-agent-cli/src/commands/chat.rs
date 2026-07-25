@@ -525,6 +525,8 @@ impl ChatSession {
         let msgs = vec![Message {
             role: MsgRole::User,
             content: vec![latte_ai::models::ContentPart::text(user_input)],
+            tool_call_id: None,
+            tool_calls: None
         }];
         // Show a braille spinner while the model is generating. The
         // spinner writes to stderr with `\r` so it doesn't fight
@@ -857,7 +859,7 @@ async fn build_runner(
         // includes any global-only models injected by
         // `config_layer::load`).
         for cid in &role.model_chain {
-            if chain.iter().any(|m| m.id == *cid) {
+            if chain.iter().any(|m| m.name == *cid) {
                 continue;
             }
             if let Ok(m) = resolver.build_model(cid) {
@@ -1206,8 +1208,9 @@ async fn register_delegate_tool(
                 let msgs = vec![Message {
                     role: MsgRole::User,
                     content: vec![latte_ai::models::ContentPart::text(task)],
+                    tool_call_id: None,
+            tool_calls: None
                 }];
-                // Acquire concurrency permit (blocks if too many
                 // specialists are already running).
                 let _permit = sem.acquire().await.map_err(|_| {
                     tool_err("delegate pool shut down".into())
@@ -2027,13 +2030,12 @@ async fn run_hil_repl(
                 let queue_path = mgr.worktree_root().join(".latte").join("inject").join(format!("{}.txt", role_id));
                 if queue_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&queue_path) {
-                        if !content.trim().is_empty() {
-                            let synth = Message {
-                                role: MsgRole::User,
-                                content: vec![latte_ai::models::ContentPart::text(format!("[INJECTED]\n{}", content))],
-                            };
-                            mgr.append_to_role(&role_id, synth).ok();
-                        }
+                        let synth = Message {
+                            role: MsgRole::User,
+                            content: vec![latte_ai::models::ContentPart::text(format!("[INJECTED]\n{}", content))],
+                            tool_call_id: None,
+                            tool_calls: None
+                        };
                         let _ = std::fs::remove_file(&queue_path);
                     }
                 }
@@ -2043,6 +2045,8 @@ async fn run_hil_repl(
                     let synth = Message {
                         role: MsgRole::User,
                             content: vec![latte_ai::models::ContentPart::text(format!("[PLAN SLICE]\n{}", plan_slice))],
+                            tool_call_id: None,
+                            tool_calls: None
                     };
                     mgr.append_to_role(&role_id, synth).ok();
                 }
@@ -2111,6 +2115,8 @@ async fn run_hil_repl(
                     let assistant_msg = Message {
                         role: MsgRole::Assistant,
                         content: vec![latte_ai::models::ContentPart::text(new_assistant_text)],
+                        tool_call_id: None,
+            tool_calls: None
                     };
                     if let Err(e) = mgr.append_to_role(&role_id, assistant_msg) {
                         renderer.on_error(&format!("[{} round {}: failed to append assistant turn: {}]", role_id, round_num, e)).await;

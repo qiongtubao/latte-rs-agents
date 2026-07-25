@@ -303,7 +303,7 @@ impl GlobalConfig {
             let model = catalog
                 .models
                 .iter_mut()
-                .find(|m| &m.id == model_id)
+                .find(|m| &m.name == model_id)
                 .ok_or_else(|| {
                     AgentError::Config(format!(
                         "CLI override targets unknown model '{}'",
@@ -352,7 +352,7 @@ fn merge_models(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
     // Callers that want to accumulate (e.g. `merge_from` reading
     // multiple global config files) use [`append_models`] instead.
     for new_model in src {
-        if let Some(existing) = dst.iter_mut().find(|m| m.id == new_model.id) {
+        if let Some(existing) = dst.iter_mut().find(|m| m.provider == new_model.provider && m.name == new_model.name) {
             if is_unset(&existing.api_key) && !is_unset(&new_model.api_key) {
                 existing.api_key = new_model.api_key.clone();
             }
@@ -390,7 +390,7 @@ fn merge_models(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
 /// files (single-file + `models.d/*.yaml`) without losing any.
 fn append_models(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
     for new_model in src {
-        if !dst.iter().any(|m| m.id == new_model.id) {
+        if !dst.iter().any(|m| m.provider == new_model.provider && m.name == new_model.name) {
             dst.push(new_model.clone());
         }
     }
@@ -437,8 +437,7 @@ mod tests {
             "router.yaml",
             r#"
 models:
-  - id: deepseek-v4-flash
-    name: DeepSeek-v4-flash
+  - name: deepseek-v4-flash
     api: openai
     provider: deepseek
     base_url: https://api.deepseek.com
@@ -450,7 +449,7 @@ models:
         );
         let cfg = GlobalConfig::load_file(&path).unwrap();
         assert_eq!(cfg.models.len(), 1);
-        assert_eq!(cfg.models[0].id, "deepseek-v4-flash");
+        assert_eq!(cfg.models[0].name, "deepseek-v4-flash");
         assert_eq!(cfg.models[0].api_key, "sk-direct");
         let _ = std::fs::remove_file(&path);
     }
@@ -461,8 +460,7 @@ models:
             "router.toml",
             r#"
 [[models]]
-id = "m1"
-name = "M1"
+name = "m1"
 api = "openai"
 provider = "p"
 base_url = "http://x"
@@ -473,7 +471,7 @@ max_tokens = 256
         );
         let cfg = GlobalConfig::load_file(&path).unwrap();
         assert_eq!(cfg.models.len(), 1);
-        assert_eq!(cfg.models[0].id, "m1");
+        assert_eq!(cfg.models[0].name, "m1");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -486,8 +484,7 @@ max_tokens = 256
 tiers = { standard = "claude-sonnet" }
 
 [[models.models]]
-id = "claude-sonnet"
-name = "Sonnet"
+name = "claude-sonnet"
 api = "anthropic"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
@@ -510,8 +507,7 @@ max_tokens = 8192
             r#"
 models:
   models:
-    - id: y1
-      name: Y1
+    - name: y1
       api: openai
       provider: p
       base_url: http://x
@@ -524,7 +520,7 @@ models:
         );
         let cfg = GlobalConfig::load_file(&path).unwrap();
         assert_eq!(cfg.models.len(), 1);
-        assert_eq!(cfg.models[0].id, "y1");
+        assert_eq!(cfg.models[0].name, "y1");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -536,8 +532,7 @@ models:
         let project = AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "shared".into(),
-                    name: "Shared".into(),
+                    name: "shared".into(),
                     api: "openai".into(),
                     provider: "p".into(),
                     base_url: "http://x".into(),
@@ -558,8 +553,7 @@ models:
         };
         let global = GlobalConfig {
             models: vec![ModelDef {
-                id: "shared".into(),
-                name: "Shared".into(),
+                name: "shared".into(),
                 api: "openai".into(),
                 provider: "p".into(),
                 base_url: "http://x".into(),
@@ -588,8 +582,7 @@ models:
         let project = AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "shared".into(),
-                    name: "Shared".into(),
+                    name: "shared".into(),
                     api: "openai".into(),
                     provider: "p".into(),
                     base_url: "http://x".into(),
@@ -610,8 +603,7 @@ models:
         };
         let global = GlobalConfig {
             models: vec![ModelDef {
-                id: "shared".into(),
-                name: "Shared".into(),
+                name: "shared".into(),
                 api: "openai".into(),
                 provider: "p".into(),
                 base_url: "http://x".into(),
@@ -641,8 +633,7 @@ models:
         let project = AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "deepseek-chat".into(),
-                    name: "DeepSeek Chat".into(),
+                    name: "deepseek-chat".into(),
                     api: "openai".into(),
                     provider: "deepseek".into(),
                     base_url: "https://api.deepseek.com".into(),
@@ -663,8 +654,7 @@ models:
         };
         let global = GlobalConfig {
             models: vec![ModelDef {
-                id: "deepseek-v4-flash".into(),
-                name: "DeepSeek-v4-flash".into(),
+                name: "deepseek-v4-flash".into(),
                 api: "openai".into(),
                 provider: "deepseek".into(),
                 base_url: "https://api.deepseek.com".into(),
@@ -689,8 +679,7 @@ models:
     fn field_override_changes_api_key() {
         let mut catalog = ModelCatalog {
             models: vec![ModelDef {
-                id: "m".into(),
-                name: "M".into(),
+                name: "m".into(),
                 api: "openai".into(),
                 provider: "p".into(),
                 base_url: "http://x".into(),
@@ -730,8 +719,7 @@ models:
     fn field_override_unknown_field_errors() {
         let mut catalog = ModelCatalog {
             models: vec![ModelDef {
-                id: "m".into(),
-                name: "M".into(),
+                name: "m".into(),
                 api: "openai".into(),
                 provider: "p".into(),
                 base_url: "http://x".into(),

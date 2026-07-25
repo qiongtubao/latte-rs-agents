@@ -1125,7 +1125,6 @@ mod tests {
         Arc::new(AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "advisor-premium".into(),
                     name: "Advisor Premium".into(),
                     api: "openai".into(),
                     provider: "test".into(),

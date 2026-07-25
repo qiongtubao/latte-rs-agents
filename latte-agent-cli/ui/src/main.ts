@@ -11,9 +11,12 @@ import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
 import { mountRoleGraph } from "./role_graph";
 import { mountRoleEditor } from "./role_editor";
+import { mountToolsPanel } from "./tools_panel";
+import { mountModelsPanel } from "./models_panel";
+import { mountTestDialog } from "./test_panel";
 import { mountLogPanel } from "./log";
-import { waitForHost, setUiApi, installUiCallListener } from "./host";
 import type { LatteUiApi } from "./host";
+import { waitForHost, setUiApi, installUiCallListener } from "./host";
 import { initTransport } from "./transport";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 
@@ -193,6 +196,61 @@ async function main(): Promise<void> {
     },
   });
   $("role-editor-btn").addEventListener("click", () => roleEditor.open());
+
+  // 工具管理面板：列出所有工具 + 切换启用状态
+  mountToolsPanel({
+    container: {
+      panelEl: $("tools-panel"),
+      openBtn: $("tools-btn") as HTMLButtonElement,
+      closeBtn: $("tools-close") as HTMLButtonElement,
+      refreshBtn: $("tools-refresh") as HTMLButtonElement,
+      bodyEl: $("tools-body"),
+      statusEl: $("tools-status"),
+      filterEl: $("tools-filter") as HTMLInputElement,
+    },
+  });
+  // 模型管理面板：下拉菜单 + 表单编辑器
+  const modelsItems: ModelWithSource[] = [];  // shared ref for test dialog
+  mountModelsPanel({
+    container: {
+      panelEl: $("models-panel"),
+      openBtn: $("models-btn") as HTMLButtonElement,
+      closeBtn: $("models-close") as HTMLButtonElement,
+      refreshBtn: $("models-refresh") as HTMLButtonElement,
+      newBtn: $("models-new") as HTMLButtonElement,
+      bodyEl: $("models-body"),
+      statusEl: $("models-status"),
+      pathsEl: $("models-paths"),
+      selectEl: $("model-select") as HTMLSelectElement,
+      onTestClick: (opts) => testDialog.open(opts),
+    },
+  });
+
+  // 测试弹层（singleton，由 models 面板的「测试」按钮触发）。
+  const testDialog = mountTestDialog({
+    container: {
+      overlayEl: $("test-modal"),
+      closeBtn: $("test-close-btn") as HTMLButtonElement,
+      modelSelect: $("test-model-select") as HTMLSelectElement,
+      capabilitiesBtn: $("test-capabilities-btn") as HTMLButtonElement,
+      capabilityBadgesEl: $("test-capability-badges"),
+      tabBtns: document.querySelectorAll<HTMLButtonElement>(".test-tab"),
+      tabPanes: document.querySelectorAll<HTMLElement>(".test-pane"),
+      promptInput: $("test-prompt") as HTMLTextAreaElement,
+      imageFileInput: $("test-image-input") as HTMLInputElement,
+      imagePreviewEl: $("test-image-preview"),
+      imageClearBtn: $("test-image-clear") as HTMLButtonElement,
+      runConnectivityBtn: $("test-run-connectivity") as HTMLButtonElement,
+      runAiclientBtn: $("test-run-aiclient") as HTMLButtonElement,
+      runHttpBtn: $("test-run-http") as HTMLButtonElement,
+      runImageBtn: $("test-run-image") as HTMLButtonElement,
+      resultStatusEl: $("test-result-status"),
+      resultLatencyEl: $("test-result-latency"),
+      resultBodyEl: $("test-result-body"),
+      resultAvailableModelsEl: $("test-result-available"),
+    },
+    getModels: () => modelsItems,
+  });
 
   // 挂载日志面板：方便排查页面无响应等问题
   mountLogPanel({

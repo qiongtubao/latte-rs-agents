@@ -49,6 +49,8 @@ mod handlers;
 pub mod role_graph;
 mod self_loop;
 mod sessions;
+mod models;
+mod test;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -66,6 +68,7 @@ use sessions::SessionMap;
 /// `static_dir` 这两个 HTTP 关切）。配置加载（agents/models TOML 三层
 /// 合并）是调用方的责任：CLI 用 `commands::config_layer::load`，编辑
 /// 器用 `controller_runtime::load_cli_like_agent_config`。
+#[derive(Clone)]
 pub struct UiBackendConfig {
     /// 合并后的 agent 配置（roles + models）。
     pub agent_config: AgentConfig,
@@ -403,8 +406,13 @@ fn build_router(state: AppState) -> Router {
         .route("/self-loop/stop", post(self_loop_stop))
         .route("/role-graph", get(role_graph_get))
         .route("/subsessions", get(get_subsession))
-        .route("/logs", get(get_logs))
-         .with_state(state.clone());
+        // 模型管理面板：列出合并后的 catalog（项目层覆盖后）；
+        // 数据源是 `UiBackend.merged`（已经走过 `config_layer::load`
+        .route("/models", get(list_models))
+        .route("/models/:key", axum::routing::patch(update_model))
+        .route("/models/test", axum::routing::post(test_model))
+        .route("/models/:key/capabilities", get(model_capabilities))
+    .route("/health", get(health));
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);
@@ -413,7 +421,7 @@ fn build_router(state: AppState) -> Router {
         app = app.fallback_service(serve);
     }
 
-    app
+    app.with_state(state)
 }
 
 /// 决定静态前端目录。

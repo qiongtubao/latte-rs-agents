@@ -32,8 +32,10 @@
           <button id="session-rename-btn" type="button" title="rename session">✏️</button>
           <button id="session-del-btn" type="button" title="delete session">🗑️</button>
           <button id="role-graph-btn" type="button">Role Graph</button>
-          <button id="role-editor-btn" type="button">⚙️ Roles</button>
           <button id="trace-toggle" type="button">Trace</button>
+          <button id="role-editor-btn" type="button">⚙️ Roles</button>
+          <button id="tools-btn" type="button" title="工具管理">🔧 Tools</button>
+          <button id="models-btn" type="button" title="模型管理">📦 Models</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
           <button id="log-btn" type="button" title="查看日志">📋 日志</button>
         </div>
@@ -212,6 +214,34 @@
       </aside>
 
 
+      <!-- 工具管理面板 -->
+      <aside id="tools-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>工具管理</h2>
+          <input id="tools-filter" type="text" placeholder="过滤…" />
+          <button id="tools-refresh" type="button">↻</button>
+          <button id="tools-close" type="button" class="panel-close">×</button>
+        </header>
+        <div class="tools-body" id="tools-body">loading…</div>
+        <div class="tools-status" id="tools-status"></div>
+      </aside>
+
+      <!-- 模型管理面板 -->
+      <aside id="models-panel" class="side-panel hidden">
+        <header class="panel-header">
+          <h2>模型管理</h2>
+          <button id="models-new" type="button" class="primary">+ 新建</button>
+          <button id="models-refresh" type="button">↻</button>
+          <button id="models-close" type="button" class="panel-close">×</button>
+        </header>
+        <div class="models-paths" id="models-paths"></div>
+        <div class="models-select-row">
+          <label for="model-select" class="models-select-label">选择模型：</label>
+          <select id="model-select" class="models-select"><option value="">（加载中…）</option></select>
+        </div>
+        <div class="models-body" id="models-body">loading…</div>
+        <div class="models-status" id="models-status"></div>
+      </aside>
       <!-- 日志查看器面板 -->
       <aside id="log-panel" class="side-panel hidden">
         <header class="panel-header">
@@ -230,6 +260,77 @@
           </div>
         </div>
       </aside>
+
+      <!-- 模型测试弹层（详见 ui/src/test_panel.ts） -->
+      <div id="test-modal" class="modal-overlay hidden">
+        <div class="modal test-modal">
+          <header class="modal-header">
+            <h2>模型测试</h2>
+            <button id="test-close-btn" type="button" class="modal-close-btn">×</button>
+          </header>
+          <div class="modal-body">
+            <div class="test-model-row">
+              <label for="test-model-select">Model:</label>
+              <select id="test-model-select" class="test-model-select">
+                <option value="">（加载中…）</option>
+              </select>
+              <button id="test-capabilities-btn" type="button" class="test-cap-btn">查看能力</button>
+              <div id="test-capability-badges" class="test-cap-badges"></div>
+            </div>
+            <div class="test-tab-bar">
+              <button class="test-tab active" type="button" data-tab="connectivity">连通测试</button>
+              <button class="test-tab" type="button" data-tab="aiclient">AiClient</button>
+              <button class="test-tab" type="button" data-tab="http">raw HTTP</button>
+              <button class="test-tab" type="button" data-tab="image">图片输入</button>
+              <button class="test-tab" type="button" data-tab="image-gen">图片生成</button>
+            </div>
+
+            <div class="test-pane active" data-pane="connectivity">
+              <p class="test-pane-hint">只测试连通性：HTTP GET <code>&lt;base_url&gt;/v1/models</code>，不发 chat 请求。</p>
+              <button id="test-run-connectivity" type="button" class="test-run-btn">运行连通测试</button>
+            </div>
+            <div class="test-pane" data-pane="aiclient">
+              <p class="test-pane-hint">走 <code>latte_ai::client::AiClient::chat</code>（latte-agent 实际生产代码）。</p>
+              <textarea id="test-prompt" class="test-prompt" rows="4"
+                placeholder="用户 prompt（必填）"></textarea>
+              <button id="test-run-aiclient" type="button" class="test-run-btn">运行 AiClient 测试</button>
+            </div>
+            <div class="test-pane" data-pane="http">
+              <p class="test-pane-hint">用 <code>reqwest</code> 直接 POST，绕过 AiClient 中间处理。诊断「请求是否到了对的地方」。</p>
+              <textarea id="test-prompt-http" class="test-prompt" rows="4"
+                placeholder="用户 prompt（必填）"></textarea>
+              <button id="test-run-http" type="button" class="test-run-btn">运行 raw HTTP 测试</button>
+            </div>
+            <div class="test-pane" data-pane="image">
+              <p class="test-pane-hint">上传图片 + 文本 prompt，验证 model 能否处理 multimodal 输入。</p>
+              <textarea id="test-prompt-image" class="test-prompt" rows="3"
+                placeholder="图片说明文本（必填）"></textarea>
+              <div class="test-image-row">
+                <input id="test-image-input" type="file" accept="image/*" class="test-image-input" />
+                <button id="test-image-clear" type="button" class="test-image-clear">清空</button>
+                <div id="test-image-preview" class="test-image-preview">
+                  <span class="image-preview-empty">未选图片</span>
+                </div>
+              </div>
+              <button id="test-run-image" type="button" class="test-run-btn">运行图片输入测试</button>
+            </div>
+            <div class="test-pane" data-pane="image-gen">
+              <p class="test-pane-hint">标准 chat completion API 不支持生成图片（<code>dall-e</code> / <code>stable-diffusion</code> 等独立 endpoint 才行）。下面展示后端 <code>/capabilities</code> 探测结果：</p>
+              <div id="test-capability-badges-detail" class="test-capability-detail"></div>
+            </div>
+
+            <div class="test-result">
+              <div class="test-result-row">
+                <span id="test-result-status" class="test-result-status"></span>
+                <span id="test-result-latency" class="test-result-latency"></span>
+              </div>
+              <pre id="test-result-body" class="test-result-body"></pre>
+              <div id="test-result-available" class="test-result-available"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <footer class="statusbar">
         <span id="footer-msg">ready</span>
       </footer>

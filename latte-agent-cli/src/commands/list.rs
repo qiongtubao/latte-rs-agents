@@ -92,7 +92,7 @@ impl ListCmd {
         for model in &config.models.models {
             println!(
                 "{:<35} {:<12} {:<10} {:>10}",
-                model.id,
+                model.name,
                 model.provider,
                 model.tier.as_deref().unwrap_or("-"),
                 model.context_window

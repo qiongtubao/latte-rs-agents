@@ -249,12 +249,12 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
         .models
         .models
         .iter()
-        .map(|m| m.id.as_str())
+        .map(|m| m.name.as_str())
         .collect();
     let extra_ids: Vec<String> = global
         .models
         .iter()
-        .map(|m| m.id.as_str())
+        .map(|m| m.name.as_str())
         .filter(|id| !project_ids.contains(id))
         .map(str::to_string)
         .collect();

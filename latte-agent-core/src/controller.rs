@@ -2893,8 +2893,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "stub-standard".into(),
-                    name: "Stub".into(),
+                    name: "stub-standard".into(),
                     api: "openai".into(),
                     provider: "test".into(),
                     base_url: server.uri(),
@@ -2915,7 +2914,7 @@ mod tests {
                 "manager".to_string(),
                 RoleTemplate {
                     id: "manager".into(),
-                    name: "Manager".into(),
+                    name: "manager".into(),
                     category: "planning".into(),
                     model_tier: "standard".into(),
                     model_chain: vec![],
@@ -3034,8 +3033,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "stub-slow".into(),
-                    name: "Stub Slow".into(),
+                    name: "stub-slow".into(),
                     api: "openai".into(),
                     provider: "test".into(),
                     base_url: server.uri(),
@@ -3056,7 +3054,7 @@ mod tests {
                 "programmer".to_string(),
                 RoleTemplate {
                     id: "programmer".into(),
-                    name: "Programmer".into(),
+                    name: "programmer".into(),
                     category: "execution".into(),
                     model_tier: "standard".into(),
                     model_chain: vec![],
@@ -3161,8 +3159,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "stub-standard".into(),
-                    name: "Stub".into(),
+                    name: "stub-standard".into(),
                     api: "openai".into(),
                     provider: "test".into(),
                     base_url: server.uri(),
@@ -3183,7 +3180,7 @@ mod tests {
                 "manager".to_string(),
                 RoleTemplate {
                     id: "manager".into(),
-                    name: "Manager".into(),
+                    name: "manager".into(),
                     category: "planning".into(),
                     model_tier: "standard".into(),
                     model_chain: vec![],

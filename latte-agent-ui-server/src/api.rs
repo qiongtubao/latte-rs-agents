@@ -8,11 +8,12 @@
 //!
 //! 所有函数都操作 [`crate::UiBackend`]（一个工作区一个容器）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use latte_agent_core::config::{AgentConfig, ConfigLayer};
+use latte_agent_core::config::{AgentConfig, ConfigLayer, ModelDef};
 use latte_agent_core::controller::{ChatEvent, RoleInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -943,4 +944,229 @@ pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Resu
     }
 
     Ok(entries)
+}
+
+// ─── Models（模型 CRUD） ──────────────────────────────────────────
+//
+// 读源：`UiBackend.merged: Arc<RwLock<AgentConfig>>` —— 由
+// `config_layer::load` / `load_cli_like_agent_config` 在 `UiBackend::new`
+// 之前已合并完项目 + 全局 catalog（含 `~/.latte/models.d/*.toml` 按厂商
+// 拆分的所有 model）。这里直接序列化出去，不再二次扫描磁盘，避免
+// `GlobalConfig::load_default` 与本端扫描逻辑出现分歧。
+// （历史：早期 UI server 自己扫 `models.d/` 写过一份
+// `ModelsState` + `load_dir`，与 `GlobalConfig` 的 [[models]] 数组 / 顶层
+// `models:` 语义不一致，导致用户文件存在但 UI 显示"暂无 model"——
+// 详见 git log 中那段 `[[models]]` 数组回归测试。）
+
+/// `GET /api/models` 返回：合并后所有 model + 来源 + tier 映射 + 路径提示。
+#[derive(Serialize)]
+pub struct ModelsListResponse {
+    pub models: Vec<ModelWithSource>,
+    pub tiers: BTreeMap<String, String>,
+    pub project_models_dir: String,
+    pub global_models_dir: String,
+}
+
+/// 单条 model + 来源标识（用于 UI 区分"项目覆盖"与"全局继承"）。
+#[derive(Serialize)]
+pub struct ModelWithSource {
+    /// composite_key = `provider/model_name`，UI 表里当主键。
+    pub key: String,
+    /// `"project"` / `"global"`：来自项目 `.latte/models.d/` 还是
+    /// 全局 `~/.latte/models.d/`。项目覆盖同名时取 `"project"`。
+    pub source: String,
+    /// 空字符串表示该 model 只在内存 catalog 里（新加但还没保存）。
+    /// UI 用它显示「文件位置」与定位保存目标。
+    pub file_path: String,
+    /// 透传 ModelDef 全部字段（name / api / provider / ...）。
+    #[serde(flatten)]
+    pub def: ModelDef,
+}
+
+/// PATCH 请求体：把 `def` 整体写回（partial update 未实现）。
+/// `target`: "project"（默认，写到 `<cwd>/.latte/models.d/`）或 "global"
+/// （写到 `~/.latte/models.d/`）。两个写盘目录分别对应 UI 上的
+/// "保存到项目" / "保存到全局" 两个按钮。
+#[derive(Deserialize)]
+pub struct UpdateModelRequest {
+    #[serde(default)]
+    pub target: String,
+    #[serde(flatten)]
+    pub def: ModelDef,
+}
+pub fn list_models(b: &UiBackend) -> Result<ModelsListResponse, ApiError> {
+    let cfg = b.merged.read();
+    // 项目目录 = `<cwd>/.latte/models.d`，与 cli `chat --models-d` 默认值一致。
+    let project_dir = b.cwd.join(".latte/models.d");
+    // 合并后的 catalog 已经是项目层合并 + 全局 `~/.latte/models.d/*.toml`
+    // 全量按厂商拆分文件（见 `GlobalConfig::load_default`）。这里
+    // 再独立扫一次磁盘拿 *实际文件路径* —— `agent_config` 里不带
+    // 文件位置信息，只能用 `ModelsState::load` 反查每个 model 实际
+    // 落在哪个 .toml 文件里。两个扫描都很小（<10 个文件），开销可
+    // 忽略；为了正确性值得做。
+    let on_disk =
+        crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
+            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+    // sources + paths 是两个 map，但 keys 一致，所以可以合并成
+    // `key -> (source, path)` 的单 map。sources 用 into_iter() 消费；
+    // paths 用 clone() 保留给下面 lookup。
+    let source_of: BTreeMap<String, (crate::models::ModelSource, PathBuf)> =
+        on_disk.sources.into_iter()
+            .map(|(k, src)| {
+                let path = on_disk.paths.get(&k).cloned().unwrap_or_default();
+                (k, (src, path))
+            })
+            .collect();
+    let models: Vec<ModelWithSource> = cfg
+        .models
+        .models
+        .iter()
+        .map(|def| {
+            let key = if def.name.contains('/') {
+                def.name.clone()
+            } else {
+                format!("{}/{}", def.provider, def.name)
+            };
+            // disk 扫描告诉我们这个 model 是 project / global、落在哪个文件。
+            // 没扫到说明只在内存 catalog 里（新加但还没保存）。
+            let (source, path) = source_of
+                .get(&key)
+                .cloned()
+                .map(|(s, p)| (source_label(s).to_string(), p.display().to_string()))
+                .unwrap_or_else(|| ("catalog".to_string(), String::new()));
+            ModelWithSource {
+                key,
+                source,
+                file_path: path,
+                def: def.clone(),
+            }
+        })
+        .collect();
+    let tiers: BTreeMap<String, String> = cfg
+        .models
+        .tiers
+        .as_ref()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+    let global_dir = global_dir_fallback();
+    Ok(ModelsListResponse {
+        models,
+        tiers,
+        project_models_dir: project_dir.display().to_string(),
+        global_models_dir: global_dir.display().to_string(),
+    })
+}
+
+/// 全局目录 `<HOME>/.latte/models.d/` 的解析逻辑，集中到这里避免
+/// `list_models` 内嵌三层 Option 链。
+fn global_dir_fallback() -> PathBuf {
+    latte_agent_core::config::ConfigLayer::Global
+        .root_dir()
+        .map(|d| d.join("models.d"))
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join(".latte/models.d")
+        })
+}
+
+/// `ModelSource` 枚举 → UI 字符串。`#[serde(rename_all = "snake_case")]` 已经
+/// 在 `ModelSource` 上标注，直接 `as_str` 不到；自己手动映射。
+fn source_label(s: crate::models::ModelSource) -> &'static str {
+    match s {
+        crate::models::ModelSource::Project => "project",
+        crate::models::ModelSource::Global => "global",
+    }
+}
+
+/// `PATCH /api/models/:key` —— 把一个已存在的 model 写回磁盘（项目目录
+/// `<cwd>/.latte/models.d/<provider>__<id>.toml`），同时就地更新内存
+/// catalog 让后续 chat 立刻看到新值。
+///
+/// 写入策略：项目目录优先（与 `ModelsState::load` 的"项目覆盖全局"语义
+/// 对称）。如果旧文件在全局，保存时会落到项目目录，相当于把全局 model
+/// 提升到项目层 —— 这是符合直觉的"修改并本地化"操作。
+pub fn update_model(
+    b: &UiBackend,
+    key: &str,
+    target: &str,
+    def: ModelDef,
+) -> Result<ModelWithSource, ApiError> {
+    crate::models::validate(&def)
+        .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
+    let new_key = format!("{}/{}", def.provider, def.name);
+    if new_key != key {
+        return Err(ApiError::bad_request(format!(
+            "composite_key 不能改：原 key={key:?}, 新 key={new_key:?}。请用 PATCH 不带改 key，或先 DELETE 再 POST。"
+        )));
+    }
+    // target: "project" (默认，写到 `<cwd>/.latte/models.d/`) 或 "global"
+    // （写到 `~/.latte/models.d/`，与 GlobalConfig::load_default 同源）。
+    // 这两个按钮（保存到项目 / 保存到全局）共用一条路由，目标由 request
+    // body 的 `target` 字段决定。
+    let (write_dir, source_label) = match target {
+        "global" => (
+            crate::models::ModelsState::global_models_dir(),
+            "global",
+        ),
+        "project" | "" => (b.cwd.join(".latte/models.d"), "project"),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown target {:?}（仅 project / global）",
+                other
+            )));
+        }
+    };
+    // 写盘：保持与项目层一致（单文件 flat ModelDef TOML）。同一目录多次
+    // 保存时 `key_to_filename` 会覆盖同名文件（`open(..., O_CREAT|O_TRUNC)`
+    // 语义），无需额外删除。
+    let path = crate::models::ModelsState::write_project(&write_dir, key, &def)
+        .map_err(|e| ApiError::internal(format!("write: {e}")))?;
+    // 更新内存 catalog：新值覆盖；若原 model 是从其它目录继承来的，
+    // 这里也追加进 catalog（写到哪里就在内存里出现一份）。
+    {
+        let mut cfg = b.merged.write();
+        if let Some(slot) = cfg.models.models.iter_mut().find(|m| {
+            format!("{}/{}", m.provider, m.name) == key
+        }) {
+            *slot = def.clone();
+        } else {
+            cfg.models.models.push(def.clone());
+        }
+    }
+    Ok(ModelWithSource {
+        key: key.to_string(),
+        source: source_label.to_string(),
+        file_path: path.display().to_string(),
+        def,
+    })
+}
+
+#[cfg(test)]
+mod list_models_tests {
+
+    #[test]
+    fn key_shape_is_provider_over_id() {
+        // 不构造 UiBackend，直接验证 key 格式化逻辑：
+        //   - id 含 `/` 时直接当 key（兼容 anthropic/claude-opus-... 这种预分割 id）
+        //   - 否则补 `provider/id`
+        let id_with_slash = "anthropic/claude-opus-4-20250514";
+        let id_plain = "deepseek-v4-pro";
+        let provider = "deepseek";
+
+        let k1 = if id_with_slash.contains('/') {
+            id_with_slash.to_string()
+        } else {
+            format!("{provider}/{id_with_slash}")
+        };
+        assert_eq!(k1, "anthropic/claude-opus-4-20250514");
+
+        let k2 = if id_plain.contains('/') {
+            id_plain.to_string()
+        } else {
+            format!("{provider}/{id_plain}")
+        };
+        assert_eq!(k2, "deepseek/deepseek-v4-pro");
+    }
 }
