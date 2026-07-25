@@ -177,7 +177,7 @@ pub async fn enumerate() -> Result<Vec<ToolEntry>> {
     }
 
     // 2. controller 动态 register 的工具
-    for reg_fn in dynamic_registrations() {
+    for reg_fn in dynamic_registrations().await {
         let id = reg_fn_to_id(&reg_fn);
         by_id.entry(id.clone()).or_insert(ToolEntry {
             id,
@@ -230,7 +230,7 @@ fn reg_fn_to_id(reg_fn: &str) -> String {
 /// 扫描 `latte-agent-core/src/` 找 `register_*_tool` 调用点。
 ///
 /// 复用 `latte-rs-graph` TreeSitterEngine，结果与 `role_graph` 共享。
-fn dynamic_registrations() -> Vec<String> {
+async fn dynamic_registrations() -> Vec<String> {
     use latte_rs_graph::prelude::*;
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = manifest
@@ -246,14 +246,14 @@ fn dynamic_registrations() -> Vec<String> {
         Err(_) => return Vec::new(),
     };
     let engine = TreeSitterEngine::new(storage);
-    let result = futures::executor::block_on(async {
-        engine
-            .build(&project_root, &BuildOptions::default())
-            .await?;
-        let g = engine.graph_data().await?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(g)
-    });
-    let graph_data = match result {
+    if engine
+        .build(&project_root, &BuildOptions::default())
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let graph_data = match engine.graph_data().await {
         Ok(g) => g,
         Err(_) => return Vec::new(),
     };

@@ -436,3 +436,113 @@ pub(crate) async fn model_capabilities(
     };
     Ok(Json(crate::test::probe_capabilities(&req).await))
 }
+
+// ─── Models CRUD 扩展 ──────────────────────────────────────────────
+
+/// `DELETE /api/models/:key` —— 删除 model 文件并从内存 catalog 移除。
+pub(crate) async fn delete_model(
+    axum::extract::Path(key): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::delete_model(&state.backend, &key)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `POST /api/models` —— 创建新 model 并写入项目目录 + 更新内存 catalog。
+pub(crate) async fn create_model(
+    State(state): State<AppState>,
+    Json(req): Json<api::CreateModelRequest>,
+) -> Result<Json<api::ModelWithSource>, (StatusCode, String)> {
+    api::create_model(&state.backend, req)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+// ─── Tools ─────────────────────────────────────────────────────────
+
+/// `GET /api/tools` —— 列出所有工具及其启用/禁用状态。
+pub(crate) async fn list_tools(
+    State(state): State<AppState>,
+) -> Result<Json<api::ToolsListResponse>, (StatusCode, String)> {
+    api::list_tools(&state.backend)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `POST /api/tools/:id/toggle` —— 切换工具启用/禁用状态。
+/// body: `{"enabled": true}` 或 `{"enabled": false}`。
+#[derive(Deserialize)]
+pub(crate) struct ToggleToolBody {
+    pub enabled: bool,
+}
+
+pub(crate) async fn toggle_tool(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    Json(body): Json<ToggleToolBody>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::toggle_tool(&state.backend, &id, body.enabled)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+// ─── Roles CRUD 扩展 ───────────────────────────────────────────────
+
+/// `POST /api/roles` 请求体：role_id + role_name。
+#[derive(Deserialize)]
+pub(crate) struct CreateRoleBody {
+    pub role_id: String,
+    pub role_name: String,
+}
+
+/// `POST /api/roles` —— 新建角色（写入 agents.d 配置 + 更新内存）。
+pub(crate) async fn create_role(
+    State(state): State<AppState>,
+    Json(req): Json<CreateRoleBody>,
+) -> Result<Json<api::RoleConfigEntry>, (StatusCode, String)> {
+    api::create_role(&state.backend, &req.role_id, &req.role_name)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `DELETE /api/roles/:id` —— 删除角色（删 agents.d 文件 + 更新内存）。
+pub(crate) async fn delete_role(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::delete_role(&state.backend, &id)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}

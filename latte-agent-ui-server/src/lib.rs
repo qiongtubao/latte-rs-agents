@@ -50,6 +50,7 @@ pub mod role_graph;
 mod self_loop;
 mod sessions;
 mod models;
+pub mod tools;
 mod test;
 
 use std::net::SocketAddr;
@@ -386,7 +387,6 @@ fn build_router(state: AppState) -> Router {
         .route("/session", get(get_session))
         .route("/session/label", post(set_session_label))
         .route("/session/history", get(get_session_history))
-        .route("/roles", get(list_roles))
         .route(
             "/roles/config",
             get(get_roles_config).post(save_role_config),
@@ -408,10 +408,19 @@ fn build_router(state: AppState) -> Router {
         .route("/subsessions", get(get_subsession))
         // 模型管理面板：列出合并后的 catalog（项目层覆盖后）；
         // 数据源是 `UiBackend.merged`（已经走过 `config_layer::load`
-        .route("/models", get(list_models))
-        .route("/models/:key", axum::routing::patch(update_model))
+        .route("/models", get(list_models).post(create_model))
+        .route(
+            "/models/:key",
+            axum::routing::patch(update_model).delete(delete_model),
+        )
         .route("/models/test", axum::routing::post(test_model))
         .route("/models/:key/capabilities", get(model_capabilities))
+        // 工具管理
+        .route("/tools", get(list_tools))
+        .route("/tools/:id/toggle", axum::routing::post(toggle_tool))
+        // 角色管理（新建/删除）
+        .route("/roles", get(list_roles).post(create_role))
+        .route("/roles/:id", axum::routing::delete(delete_role))
     .route("/health", get(health));
     let mut app = Router::new()
         .route("/health", get(health))
@@ -608,8 +617,7 @@ mod tests {
         let make_config = || AgentConfig {
             models: ModelCatalog {
                 models: vec![ModelDef {
-                    id: "dead-model".into(),
-                    name: "Dead".into(),
+                    name: "dead-model".into(),
                     api: "openai".into(),
                     provider: "test".into(),
                     base_url: "http://127.0.0.1:1".into(),

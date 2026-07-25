@@ -354,8 +354,7 @@ mod tests {
             glob.join("deepseek.toml"),
             "\
 [[models]]\n\
-name = \"DeepSeek V4 Flash\"\n\
-model_name = \"deepseek-v4-flash\"\n\
+name = \"deepseek-v4-flash\"\n\
 api = \"openai\"\n\
 provider = \"deepseek\"\n\
 base_url = \"https://api.deepseek.com\"\n\
@@ -364,8 +363,7 @@ context_window = 1000000\n\
 max_tokens = 384000\n\
 \n\
 [[models]]\n\
-name = \"DeepSeek Chat\"\n\
-model_name = \"deepseek-chat\"\n\
+name = \"deepseek-chat\"\n\
 api = \"openai\"\n\
 provider = \"deepseek\"\n\
 base_url = \"https://api.deepseek.com\"\n\
@@ -416,8 +414,7 @@ max_tokens = 8192\n\
 premium = \"anthropic/claude-opus-4-20250514\"\n\
 \n\
 [[models.models]]\n\
-model_name = \"claude-opus-4-20250514\"\n\
-name = \"Claude Opus 4\"\n\
+name = \"claude-opus-4-20250514\"\n\
 api = \"anthropic\"\n\
 provider = \"anthropic\"\n\
 base_url = \"https://api.anthropic.com\"\n\
@@ -444,8 +441,7 @@ max_tokens = 8192\n\
 
     fn sample_def() -> ModelDef {
         ModelDef {
-            name: "GPT-4o".into(),
-            id: "gpt-4o".into(),
+            name: "gpt-4o".into(),
             api: "openai".into(),
             provider: "openai".into(),
             base_url: "https://api.openai.com".into(),

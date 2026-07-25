@@ -111,6 +111,18 @@ export async function saveRoleConfig(
   return getTransport().request("POST", "/api/roles/config", body);
 }
 
+/** POST /api/roles — 创建新角色。返回新建的 RoleConfigEntry。 */
+export async function createRole(
+  body: { id: string; name: string },
+): Promise<RoleConfigEntry> {
+  return getTransport().request("POST", "/api/roles", body);
+}
+
+/** DELETE /api/roles/:id — 删除角色。 */
+export async function deleteRole(id: string): Promise<void> {
+  await getTransport().request("DELETE", `/api/roles/${encodeURIComponent(id)}`);
+}
+
 // ChatEvent —— Rust enum ChatEvent 的 JSON 表示（discriminated union）。
 // 字段命名沿用 Rust（snake_case）。
 export type ChatEvent =

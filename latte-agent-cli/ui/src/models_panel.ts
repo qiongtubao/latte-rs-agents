@@ -7,7 +7,7 @@
 //
 // 数据契约：见 `api.ts` 的 `ModelsListResponse` / `ModelWithSource`。
 // `file_path` 字段是后端独立扫盘拿到的真实绝对路径，UI 直接展示给用户。
-import { listModels, updateModel } from "./api";
+import { listModels, updateModel, deleteModel } from "./api";
 import type { ModelDef, ModelWithSource } from "./api";
 
 interface UIBinding {
@@ -287,6 +287,15 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
         }
         container.onTestClick({ def, key: currentKey });
       });
+      // 「删除」按钮：二次确认后删除 model 文件并从内存移除。
+      const deleteBtn = document.createElement("button");
+      deleteBtn.type = "button";
+      deleteBtn.className = "danger";
+      deleteBtn.textContent = "删除";
+      actions.appendChild(deleteBtn);
+      deleteBtn.addEventListener("click", () => {
+        void onDelete(currentKey!);
+      });
     }
     if (current && current.source === "global") {
       const note = document.createElement("span");
@@ -305,6 +314,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     if (current) {
       // 上面的 if 块保证了 saveGlobal 与 testBtn 都已 append
       const saveGlobalBtn = actions.querySelector<HTMLButtonElement>(
+
         'button[data-target="global"]',
       );
       saveGlobalBtn?.addEventListener("click", () => submitSave("global"));
@@ -314,6 +324,29 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     return { inputs };
   }
 
+
+  /** 删除 model：二次确认 → 调 API → 刷新列表。 */
+  async function onDelete(key: string): Promise<void> {
+    if (isSaving) return;
+    const def = items.find(m => m.key === key);
+    const label = def ? `${def.provider}/${def.id}` : key;
+    if (!confirm(`确定删除 model "${label}"？此操作不可撤销。`)) return;
+    isSaving = true;
+    setStatus("删除中…");
+    try {
+      await deleteModel(key);
+      setStatus(`已删除 ${label}`);
+      // 从本地列表移除，避免 refresh 前 UI 残留
+      items = items.filter(m => m.key !== key);
+      if (currentKey === key) currentKey = null;
+      populateSelect();
+      renderForm();
+    } catch (err) {
+      setStatus(`删除失败: ${(err as Error).message}`, true);
+    } finally {
+      isSaving = false;
+    }
+  }
   async function onSave(
     inputs: Map<keyof ModelDef, FormInput>,
     target: "project" | "global",

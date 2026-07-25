@@ -1,4 +1,4 @@
-import type { SessionInfo } from "./api";
+import type { SessionInfo, ModelWithSource } from "./api";
 import {
   ensureSession, listSessions, createSession,
   switchSession, getSession, subscribeEvents, fetchSubsession,
@@ -183,6 +183,8 @@ async function main(): Promise<void> {
       roleSelect: $("role-editor-role-select") as HTMLSelectElement,
       closeBtn: $("role-editor-close") as HTMLButtonElement,
       refreshBtn: $("role-editor-refresh") as HTMLButtonElement,
+      newBtn: $("role-editor-new") as HTMLButtonElement,
+      deleteBtn: $("role-editor-delete") as HTMLButtonElement,
       formEl: $("role-editor-form") as HTMLFormElement,
       nameInput: $("role-editor-name") as HTMLInputElement,
       iconInput: $("role-editor-icon") as HTMLInputElement,

@@ -1,12 +1,13 @@
 // 角色编辑器面板 —— fetch /api/roles/config 渲染表单，保存时 POST。
-import { getRolesConfig, saveRoleConfig } from "./api";
+import { getRolesConfig, saveRoleConfig, createRole, deleteRole } from "./api";
 import type { RoleConfigEntry, RolesConfig } from "./api";
-
 interface UIBinding {
   panelEl: HTMLElement;
   roleSelect: HTMLSelectElement;
   closeBtn: HTMLButtonElement;
   refreshBtn: HTMLButtonElement;
+  newBtn: HTMLButtonElement;
+  deleteBtn: HTMLButtonElement;
   formEl: HTMLFormElement;
   nameInput: HTMLInputElement;
   iconInput: HTMLInputElement;
@@ -37,6 +38,8 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     event.preventDefault();
     void save();
   });
+  container.newBtn.addEventListener("click", () => void onCreate());
+  container.deleteBtn.addEventListener("click", () => void onDelete());
 
   const setStatus = (message: string, error = false) => {
     container.statusEl.textContent = message;
@@ -182,6 +185,61 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
       setStatus(`保存失败: ${(error as Error).message}`, true);
     } finally {
       isSaving = false;
+    }
+  }
+
+  /** 新建角色：弹出 prompt 输入 id，POST /api/roles 后刷新列表。 */
+  async function onCreate(): Promise<void> {
+    const roleId = prompt("新角色 ID（字母/数字/下划线）：");
+    if (!roleId) return;
+    if (!/^[a-zA-Z0-9_]+$/.test(roleId)) {
+      setStatus("角色 ID 只能包含字母/数字/下划线", true);
+      return;
+    }
+    const name = prompt("角色显示名：", roleId);
+    if (!name) return;
+    try {
+      setStatus("创建中…");
+      const entry = await createRole({ id: roleId, name });
+      // 追加到本地 config 并刷新下拉菜单
+      if (config) {
+        config.roles.push(entry);
+      }
+      await refresh(roleId);
+      setStatus(`已创建角色 "${entry.id}"`);
+    } catch (err) {
+      setStatus(`创建失败: ${(err as Error).message}`, true);
+    }
+  }
+
+  /** 删除角色：二次确认后 DELETE /api/roles/:id，刷新列表。 */
+  async function onDelete(): Promise<void> {
+    const roleId = container.roleSelect.value;
+    if (!roleId) return;
+    if (!confirm(`确定删除角色 "${roleId}"？此操作不可撤销，且会删除对应 agents.d 文件。`)) return;
+    try {
+      setStatus("删除中…");
+      await deleteRole(roleId);
+      if (config) {
+        config.roles = config.roles.filter(r => r.id !== roleId);
+      }
+      setStatus(`已删除角色 "${roleId}"`);
+      // 重建下拉菜单，跳到下一个可用角色
+      container.roleSelect.replaceChildren();
+      for (const role of config?.roles ?? []) {
+        const option = document.createElement("option");
+        option.value = role.id;
+        option.textContent = `${role.icon} ${role.id} — ${role.name}`;
+        container.roleSelect.appendChild(option);
+      }
+      if (container.roleSelect.options.length > 0) {
+        container.roleSelect.selectedIndex = 0;
+        fillForm(container.roleSelect.value);
+      } else {
+        container.formEl.classList.add("hidden");
+      }
+    } catch (err) {
+      setStatus(`删除失败: ${(err as Error).message}`, true);
     }
   }
 

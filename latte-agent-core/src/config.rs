@@ -431,11 +431,8 @@ pub struct ModelCatalog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     /// Model identifier — 同时是 API 请求里的 `model` 字段与 UI 显示名。
-    /// 在用户实际配置里，`name` 与历史的 `model_name` 是同一个值（API id）；
-    /// 直接合并：`name` 即是 API id 也是显示名。
-    /// 历史 `model_name = "..."` 的字段作为未知字段被 serde 静默忽略
-    /// （用户实际配置文件里 `name` 与 `model_name` 同时存在但值相同，
-    /// 不能用 `alias = "model_name"`，否则会触发 duplicate field 错误）。
+    /// `model_name` 旧字段通过 serde alias 反向兼容。
+    #[serde(alias = "model_name")]
     pub name: String,
     pub api: String,
     /// Provider name. 与 `name` 一起组成 composite_key `provider/name`，

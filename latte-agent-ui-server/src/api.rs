@@ -590,6 +590,93 @@ pub fn save_role_config(
     Ok(entry)
 }
 
+/// `POST /api/roles` — 创建新角色：生成默认 RoleTemplate，写入
+/// `<agents.d>/<role_id>.toml`，并加入内存配置。
+pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<RoleConfigEntry, ApiError> {
+    // 检查是否已存在
+    {
+        let cfg = b.merged.read();
+        if cfg.roles.contains_key(role_id) {
+            return Err(ApiError::bad_request(format!("role {:?} already exists", role_id)));
+        }
+    }
+    let tpl = latte_agent_core::role::RoleTemplate {
+        id: role_id.to_string(),
+        name: role_name.to_string(),
+        category: "custom".to_string(),
+        model_tier: "standard".to_string(),
+        model_chain: vec![],
+        prompt_file: None,
+        temperature: None,
+        tools: vec![],
+        icon: String::new(),
+        skills: vec![],
+    };
+    let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
+    std::fs::create_dir_all(&agents_dir)
+        .map_err(|e| ApiError::internal(format!("create {}: {e}", agents_dir.display())))?;
+    let path = agents_dir.join(format!("{}.toml", role_id));
+    // 序列化为 toml：`[roles.<role_id>]` 节。
+    {
+        use toml_edit::{value, DocumentMut, Table, Item};
+        let mut doc = DocumentMut::new();
+        let mut roles = Table::new();
+        let mut t = Table::new();
+        t["id"] = value(role_id.to_string());
+        t["name"] = value(role_name.to_string());
+        t["category"] = value("custom");
+        t["model_tier"] = value("standard");
+        t["icon"] = value("");
+        t["model_chain"] = value(toml_edit::Array::new());
+        t["tools"] = value(toml_edit::Array::new());
+        roles[role_id] = Item::Table(t);
+        doc["roles"] = Item::Table(roles);
+        std::fs::write(&path, doc.to_string())
+            .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+    }
+    // 加入内存配置
+    {
+        let mut cfg = b.merged.write();
+        cfg.roles.insert(role_id.to_string(), tpl.clone());
+    }
+    Ok(role_config_entry(&b.cwd, &agents_dir, &tpl))
+}
+
+/// `DELETE /api/roles/:id` — 删除角色：移除 agents.d 文件（项目 +
+/// 全局目录）并从内存配置移除。文件不存在但内存中有角色时仍可删除。
+pub fn delete_role(b: &UiBackend, role_id: &str) -> Result<(), ApiError> {
+    // 检查内存中是否存在
+    {
+        let cfg = b.merged.read();
+        if !cfg.roles.contains_key(role_id) {
+            return Err(ApiError::not_found(format!("role {:?} not found", role_id)));
+        }
+    }
+    // 尝试从项目目录和全局目录删除 toml 文件
+    let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
+    let global_dir = latte_agent_core::config::ConfigLayer::Global
+        .agents_dir()
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".latte/agents.d")
+        });
+    for dir in &[&agents_dir, &global_dir] {
+        let path = dir.join(format!("{}.toml", role_id));
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| ApiError::internal(format!("remove {}: {e}", path.display())))?;
+        }
+    }
+    // 从内存配置移除
+    {
+        let mut cfg = b.merged.write();
+        cfg.roles.remove(role_id);
+    }
+    Ok(())
+}
+
 // ─── Chat ─────────────────────────────────────────────────────────
 
 /// `POST /api/chat/send`：向 session 的 controller 提交一条用户消息
@@ -946,6 +1033,38 @@ pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Resu
     Ok(entries)
 }
 
+
+// ─── Tools（工具管理） ─────────────────────────────────────────────
+
+/// `GET /api/tools` 的返回：所有工具及其启用/禁用状态。
+#[derive(Serialize)]
+pub struct ToolsListResponse {
+    pub tools: Vec<crate::tools::ToolEntry>,
+    /// 当前被禁用的工具 ID 列表（方便 UI 快速判断全选状态）。
+    pub disabled: Vec<String>,
+}
+
+/// `GET /api/tools` — 列出所有可用工具，标记每个工具的启用/禁用状态。
+pub async fn list_tools(b: &UiBackend) -> Result<ToolsListResponse, ApiError> {
+    let mut tools = crate::tools::enumerate()
+        .await
+        .map_err(|e| ApiError::internal(format!("enumerate tools: {e}")))?;
+    let store = crate::tools::ToolsStore::new(&b.cwd);
+    for t in &mut tools {
+        t.enabled = store.is_enabled(&t.id);
+    }
+    let disabled: Vec<String> = store.disabled_ids().map(|s| s.to_string()).collect();
+    Ok(ToolsListResponse { tools, disabled })
+}
+
+/// `POST /api/tools/:id/toggle` — 切换工具的启用/禁用状态。
+/// 返回切换后的 enabled 值。
+pub fn toggle_tool(b: &UiBackend, id: &str, enabled: bool) -> Result<bool, ApiError> {
+    let mut store = crate::tools::ToolsStore::new(&b.cwd);
+    store
+        .set_enabled(id, enabled)
+        .map_err(|e| ApiError::internal(format!("toggle tool: {e}")))
+}
 // ─── Models（模型 CRUD） ──────────────────────────────────────────
 //
 // 读源：`UiBackend.merged: Arc<RwLock<AgentConfig>>` —— 由
@@ -989,6 +1108,17 @@ pub struct ModelWithSource {
 /// "保存到项目" / "保存到全局" 两个按钮。
 #[derive(Deserialize)]
 pub struct UpdateModelRequest {
+    #[serde(default)]
+    pub target: String,
+    #[serde(flatten)]
+    pub def: ModelDef,
+}
+
+/// `POST /api/models` 的请求体：新建 model 并写盘。
+/// `target`: "project"（默认，写到 `<cwd>/.latte/models.d/`）或 "global"
+/// （写到 `~/.latte/models.d/`），与 UpdateModelRequest 语义一致。
+#[derive(Deserialize)]
+pub struct CreateModelRequest {
     #[serde(default)]
     pub target: String,
     #[serde(flatten)]
@@ -1140,6 +1270,69 @@ pub fn update_model(
         source: source_label.to_string(),
         file_path: path.display().to_string(),
         def,
+    })
+}
+
+/// `DELETE /api/models/:key` — 删除 model 文件（项目目录 + 全局目录）
+/// 并从内存 catalog 移除。两个目录都尝试删除；至少一个找到才算成功。
+pub fn delete_model(b: &UiBackend, key: &str) -> Result<(), ApiError> {
+    let project_dir = b.cwd.join(".latte/models.d");
+    let global_dir = crate::models::ModelsState::global_models_dir();
+    let deleted_project = crate::models::ModelsState::delete_project(&project_dir, key)
+        .map_err(|e| ApiError::internal(format!("delete project model: {e}")))?;
+    let deleted_global = crate::models::ModelsState::delete_project(&global_dir, key)
+        .map_err(|e| ApiError::internal(format!("delete global model: {e}")))?;
+    if !deleted_project && !deleted_global {
+        return Err(ApiError::not_found(format!("model {key:?} not found")));
+    }
+    // 从内存 catalog 移除（按 composite_key 匹配 provider/name）。
+    {
+        let mut cfg = b.merged.write();
+        cfg.models.models.retain(|m| {
+            format!("{}/{}", m.provider, m.name) != key
+        });
+    }
+    Ok(())
+}
+
+/// `POST /api/models` — 创建新 model，写盘到项目或全局目录并加入内存 catalog。
+/// 同名 key 已存在时覆盖旧值（与 update_model 的 append-or-overwrite 语义一致）。
+pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithSource, ApiError> {
+    crate::models::validate(&req.def)
+        .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
+    let key = format!("{}/{}", req.def.provider, req.def.name);
+    let (write_dir, src_label) = match req.target.as_str() {
+        "global" => (
+            crate::models::ModelsState::global_models_dir(),
+            "global",
+        ),
+        "project" | "" => (b.cwd.join(".latte/models.d"), "project"),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "unknown target {:?}（仅 project / global）",
+                other
+            )));
+        }
+    };
+    // 写盘：与 update_model 一致，始终用 write_project（传入已解析的目录）。
+    let path = crate::models::ModelsState::write_project(&write_dir, &key, &req.def)
+        .map_err(|e| ApiError::internal(format!("write: {e}")))?;
+    // 加入内存 catalog：同名 key 覆盖；不存在则追加。
+    {
+        let mut cfg = b.merged.write();
+        if let Some(slot) = cfg.models.models.iter_mut().find(|m| {
+            format!("{}/{}", m.provider, m.name) == key
+        }) {
+            *slot = req.def.clone();
+        } else {
+            cfg.models.models.push(req.def.clone());
+        }
+    }
+    Ok(ModelWithSource {
+        key,
+        source: src_label.to_string(),
+        file_path: path.display().to_string(),
+        def: req.def,
     })
 }
 
