@@ -27,7 +27,6 @@ pub enum TestMode {
 
 #[derive(Debug, Deserialize)]
 pub struct TestModelRequest {
-    #[serde(flatten)]
     pub def: ModelDef,
     #[serde(default)]
     pub mode: TestMode,

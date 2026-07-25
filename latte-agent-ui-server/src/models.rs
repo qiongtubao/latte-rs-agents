@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 /// `composite_key` 路径安全转换：`openai/gpt-4o` → `openai__gpt-4o.toml`。
 pub fn key_to_filename(key: &str) -> String {
     let safe = key.replace(['/', '\\', ':'], "__");
-    if std::path::Path::new(&safe).extension().is_none() {
-        format!("{safe}.toml")
-    } else {
+    // 检查是否以 .toml 结尾（有些 key 如 "glm-5.2" 自带的 `.2` 不是扩展名）
+    if safe.ends_with(".toml") {
         safe
+    } else {
+        format!("{safe}.toml")
     }
 }
 

@@ -46,8 +46,7 @@ interface FieldSpec {
 
 const FIELDS: ReadonlyArray<FieldSpec> = [
   // 基本
-  { key: "id", label: "id", kind: "text", placeholder: "deepseek-v4-pro" },
-  { key: "name", label: "显示名", kind: "text", placeholder: "DeepSeek V4 Pro" },
+  { key: "name", label: "id", kind: "text", placeholder: "deepseek-v4-pro" },
   { key: "provider", label: "provider", kind: "text", placeholder: "deepseek" },
   { key: "api", label: "api 协议", kind: "select", options: ["openai", "anthropic", "google"] },
   // 网络
@@ -156,7 +155,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     for (const m of items) {
       const opt = document.createElement("option");
       opt.value = m.key;
-      opt.textContent = `${m.key}${m.name && m.name !== m.id ? `  —  ${m.name}` : ""}`;
+      opt.textContent = `${m.key}${m.name !== m.key ? `  —  ${m.name}` : ""}`;
       container.selectEl.appendChild(opt);
     }
   }
@@ -329,7 +328,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   async function onDelete(key: string): Promise<void> {
     if (isSaving) return;
     const def = items.find(m => m.key === key);
-    const label = def ? `${def.provider}/${def.id}` : key;
+    const label = def ? `${def.provider}/${def.name}` : key;
     if (!confirm(`确定删除 model "${label}"？此操作不可撤销。`)) return;
     isSaving = true;
     setStatus("删除中…");
@@ -361,10 +360,11 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
         return;
       }
       const isNew = currentKey === null;
-      const targetKey = isNew ? `${def.provider}/${def.id}` : currentKey!;
+      const targetKey = isNew ? `${def.provider}/${def.name}` : currentKey!;
       const updated = await updateModel(targetKey, def, target);
-      setStatus(`✅ 已保存 ${updated.key}（${updated.source}）`);
       await refresh();
+      // refresh 内部会覆盖 status，保存成功后重新设回成功消息
+      setStatus(`✅ 已保存 ${updated.key}（${updated.source}）`);
       // refresh 内部会基于 currentKey 重选；这里强制把 updated.key 设为新 currentKey
       // （即使刷新时 currentKey 仍指向旧 key，会被 refresh 中的 keep 逻辑兜住）。
       currentKey = updated.key;
@@ -405,15 +405,14 @@ function collectDef(inputs: Map<keyof ModelDef, FormInput>): ModelDef | null {
     return inp ? (inp as HTMLInputElement).checked : false;
   };
 
-  const id = text("id");
+  const name = text("name");
   const provider = text("provider");
   const api = text("api") || "openai";
-  if (!id || !provider || !api) {
+  if (!name || !provider || !api) {
     return null;
   }
   return {
-    id,
-    name: text("name") || `${provider}/${id}`,
+    name: name,
     provider,
     api,
     base_url: text("base_url") || "",

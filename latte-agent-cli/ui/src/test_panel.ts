@@ -196,7 +196,7 @@ export function mountTestDialog(opts: {
     for (const m of models) {
       const opt = document.createElement("option");
       opt.value = m.key;
-      opt.textContent = `${m.key}${m.name && m.name !== m.id ? `  —  ${m.name}` : ""}`;
+      opt.textContent = `${m.key}${m.name !== m.key ? `  —  ${m.name}` : ""}`;
       container.modelSelect.appendChild(opt);
     }
   }

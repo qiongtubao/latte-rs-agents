@@ -71,6 +71,11 @@ pub struct UiCmd {
     /// 静态前端目录。默认 `latte-agent-cli/ui/dist`（生产模式）。
     #[arg(long)]
     pub static_dir: Option<String>,
+
+    /// agent 工作目录（工具调用、prompt_file 等相对路径的根目录）。
+    /// 默认：进程当前目录。
+    #[arg(long)]
+    pub cwd: Option<String>,
 }
 
 impl UiCmd {
@@ -101,6 +106,12 @@ impl UiCmd {
         }
 
         // 4. 起 server（库里完成 bind，端口 0 时 handle.addr 是真实端口）。
+        // 解析 cwd：--cwd 参数优先，否则取进程当前目录
+        let cwd = self.cwd.as_ref().map(|s| {
+            let p = PathBuf::from(s);
+            if p.is_absolute() { p } else { std::env::current_dir().unwrap().join(p) }
+        });
+        // 4. 起 server（库里完成 bind，端口 0 时 handle.addr 是真实端口）。
         let handle = latte_agent_ui_server::spawn(UiServerConfig {
             bind: SocketAddr::from(([0, 0, 0, 0], self.port)),
             static_dir: self.static_dir.as_ref().map(PathBuf::from),
@@ -109,8 +120,7 @@ impl UiCmd {
             role: self.role.clone(),
             tier,
             model_id: self.model_id.clone(),
-            // CLI 现状：agent 工作目录 = 进程 cwd（用户从哪启动就是哪）。
-            cwd: None,
+            cwd,
             agents_config: self.agents_config.clone(),
         })
         .await?;

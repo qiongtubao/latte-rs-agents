@@ -484,7 +484,6 @@ export async function setToolEnabled(id: string, enabled: boolean): Promise<void
 // `model_name` 字段已被 core 移除（合并进 `id`）；面板渲染和编辑表单用 `id` 即可。
 
 export interface ModelDef {
-  id: string;
   name: string;
   api: string;
   provider: string;

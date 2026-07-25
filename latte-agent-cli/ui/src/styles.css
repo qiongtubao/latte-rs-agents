@@ -1661,6 +1661,13 @@ select {
   padding-top: 8px;
   word-break: break-word;
 }
+
+.models-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+
 .models-form-text input,
 .models-form-longtext textarea,
 .models-form-number input,
