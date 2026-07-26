@@ -165,14 +165,14 @@
         <div class="subsession-body" id="subsession-body">loading…</div>
       </aside>
 
-      <aside id="role-editor-panel" class="side-panel hidden">
+      <aside id="role-editor-panel" class="side-panel tools-page hidden">
         <header class="panel-header">
           <h2>角色编辑器</h2>
           <select id="role-editor-role-select"></select>
           <button id="role-editor-new" type="button" class="primary">新建</button>
           <button id="role-editor-delete" type="button" class="danger">删除</button>
           <button id="role-editor-refresh" type="button">↻</button>
-          <button id="role-editor-close" type="button" class="panel-close">×</button>
+          <button id="role-editor-close" type="button" class="panel-close" title="关闭">✕</button>
         </header>
         <div class="role-editor-body">
         <div id="role-editor-paths" class="role-editor-paths"></div>
@@ -216,20 +216,31 @@
       </aside>
 
 
-      <!-- 工具管理面板 -->
-      <aside id="tools-panel" class="side-panel hidden">
+      <!-- 工具管理页面（全功能管理） -->
+      <aside id="tools-panel" class="side-panel tools-page hidden">
         <header class="panel-header">
-          <h2>工具管理</h2>
-          <input id="tools-filter" type="text" placeholder="过滤…" />
-          <button id="tools-refresh" type="button">↻</button>
+          <h2>🔧 工具管理</h2>
+          <input id="tools-filter" type="text" placeholder="搜索工具名称/描述…" />
+          <button id="tools-refresh" type="button" title="刷新">↻</button>
           <button id="tools-close" type="button" class="panel-close">×</button>
         </header>
-        <div class="tools-body" id="tools-body">loading…</div>
-        <div class="tools-status" id="tools-status"></div>
+        <div class="tools-page-body" id="tools-body">loading…</div>
+        <div class="tools-page-status" id="tools-status"></div>
       </aside>
 
+      <!-- 工具详情弹层 -->
+      <div id="tool-detail-overlay" class="modal-overlay hidden">
+        <div class="modal">
+          <header class="modal-header">
+            <h2 id="tool-detail-title">工具详情</h2>
+            <button id="tool-detail-close" type="button" class="modal-close-btn">×</button>
+          </header>
+          <div class="modal-body" id="tool-detail-body"></div>
+        </div>
+      </div>
+
       <!-- 模型管理面板 -->
-      <aside id="models-panel" class="side-panel hidden">
+      <aside id="models-panel" class="side-panel tools-page hidden">
         <header class="panel-header">
           <h2>模型管理</h2>
           <button id="models-new" type="button" class="primary">+ 新建</button>
