@@ -1852,6 +1852,135 @@ select {
   border-radius: 4px;
 }
 
+/* ─── Workflows 面板（详见 ui/src/workflows_panel.ts） ─────────────── */
+
+.workflow-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 12px 0 4px;
+}
+.workflow-step-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #f8fafc;
+}
+.workflow-step-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.workflow-step-title {
+  font-weight: 600;
+  font-size: 0.85em;
+  color: #1e293b;
+}
+.workflow-step-btns {
+  display: flex;
+  gap: 6px;
+}
+.workflow-step-btns button {
+  font-size: 0.78em;
+  padding: 2px 8px;
+}
+.workflow-speakers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+.workflow-speakers label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85em;
+  font-weight: 400;
+}
+.workflow-speakers-empty {
+  font-size: 0.82em;
+  color: var(--fg-2);
+}
+.workflow-add-step {
+  margin: 4px 0 12px;
+}
+.workflow-validate-results {
+  margin-top: 10px;
+  font-size: 0.85em;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.workflow-validate-error { color: var(--err); }
+.workflow-validate-warning { color: #d97706; }
+.workflow-validate-ok { color: var(--ok); }
+
+/* Workflow 试运行弹层 */
+.workflow-run-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.workflow-run-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85em;
+  color: #334155;
+}
+.workflow-run-textarea {
+  padding: 6px 10px;
+  font-size: 0.9em;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-family: inherit;
+  resize: vertical;
+}
+.workflow-run-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.workflow-run-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.workflow-run-status {
+  font-size: 0.85em;
+  color: var(--fg-2);
+}
+.workflow-run-status.error { color: var(--err); }
+.workflow-run-transcript {
+  border-top: 1px solid #e5e7eb;
+  padding-top: 10px;
+  font-size: 0.88em;
+}
+.wf-run-line { padding: 4px 0; }
+.wf-run-step-divider {
+  font-weight: 600;
+  border-left: 3px solid var(--accent);
+  padding-left: 8px;
+  margin: 10px 0 4px;
+}
+.wf-run-turn { margin: 6px 0; }
+.wf-run-turn-role {
+  font-weight: 600;
+  font-size: 0.82em;
+  color: var(--fg-2);
+}
+.wf-run-turn-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 2px 0 0;
+}
+.wf-run-finished {
+  font-weight: 600;
+  margin-top: 10px;
+  white-space: pre-wrap;
+}
+.wf-run-finished.ok { color: var(--ok); }
+.wf-run-finished.failed { color: var(--err); }
+
 /* ─── Model test modal（详见 ui/src/test_panel.ts） ─────────────── */
 
 .modal-overlay {

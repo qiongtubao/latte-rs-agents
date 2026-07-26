@@ -1,4 +1,4 @@
-// 回归测试：index.html 中各侧边面板（tools/models/log）必须与
+// 回归测试：index.html 中各侧边面板（tools/models/log/workflows）必须与
 // role-editor-panel 平级，不能被嵌套在 role-editor-panel 内部。
 //
 // 历史 bug：role-editor-panel 的 `</aside>` 漏写，导致 tools-panel /
@@ -32,7 +32,7 @@ describe("index.html 侧边面板结构", () => {
       const itFn = exists ? it : it.skip;
       const reason = exists ? "" : "（文件不存在，跳过）";
 
-      itFn(`role-editor-panel 已正确闭合，tools/models/log-panel 不嵌套于其中 ${reason}`, () => {
+      itFn(`role-editor-panel 已正确闭合，tools/models/log/workflows-panel 不嵌套于其中 ${reason}`, () => {
         const html = readFileSync(targetPath, "utf8");
         const doc = new JSDOM(html).window.document;
 
@@ -40,12 +40,16 @@ describe("index.html 侧边面板结构", () => {
         const tools = doc.getElementById("tools-panel");
         const models = doc.getElementById("models-panel");
         const log = doc.getElementById("log-panel");
+        const workflows = doc.getElementById("workflows-panel");
+        const workflowRunModal = doc.getElementById("workflow-run-modal");
 
         // 必须存在
         expect(roleEditor).not.toBeNull();
         expect(tools).not.toBeNull();
         expect(models).not.toBeNull();
         expect(log).not.toBeNull();
+        expect(workflows).not.toBeNull();
+        expect(workflowRunModal).not.toBeNull();
 
         // 关键回归断言：兄弟面板不能嵌套在 role-editor-panel 之下。
         // role-editor-panel!.contains(child) === true 表示 child 是
@@ -53,6 +57,11 @@ describe("index.html 侧边面板结构", () => {
         expect(roleEditor!.contains(tools!)).toBe(false);
         expect(roleEditor!.contains(models!)).toBe(false);
         expect(roleEditor!.contains(log!)).toBe(false);
+        expect(roleEditor!.contains(workflows!)).toBe(false);
+        expect(roleEditor!.contains(workflowRunModal!)).toBe(false);
+        // workflows-panel 自身也必须正确闭合：试运行弹层不能嵌套在其中，
+        // 否则面板关闭（.hidden）时弹层也一起被隐藏。
+        expect(workflows!.contains(workflowRunModal!)).toBe(false);
       });
     });
   }

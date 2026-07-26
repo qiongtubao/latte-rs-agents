@@ -1772,7 +1772,7 @@ async fn build_runner(
     }
 }
 
-async fn build_tool_manager(
+pub(crate) async fn build_tool_manager(
     allowed: &[String],
 ) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error + Send + Sync>> {
     use latte_rs_agent_tools::prelude::*;
@@ -2268,12 +2268,11 @@ async fn register_delegate_tool(
 }
 
 /// Register the `workflow` tool: the manager can trigger a named
-/// multi-role workflow (设计/plan/TDD/文档/图谱…). Each step's speakers
-/// run as specialist turns with persistent per-role runners, so later
-/// speakers see the earlier discussion in the same run. Progress is
-/// streamed as WorkflowStarted/Step/Turn/Finished events.
+/// multi-role workflow (设计/plan/TDD/文档/图谱…). The handler is a thin
+/// shell: parse name/topic → `load_workflow` → [`crate::workflow::run_workflow`]
+/// (the engine lives in `crate::workflow` so the UI server can reuse it).
 ///
-/// `latte-agent-core` implements its own tiny engine here (see
+/// `latte-agent-core` implements its own tiny engine (see
 /// `crate::workflow`) instead of reusing `latte-agent-orchestrator`,
 /// because the orchestrator depends on core — a dependency cycle.
 async fn register_workflow_tool(
@@ -2284,7 +2283,7 @@ async fn register_workflow_tool(
     event_tx: broadcast::Sender<ChatEvent>,
     cwd: PathBuf,
     cancel_flag: Arc<AtomicBool>,
-    turn_cancel_flag: Arc<AtomicBool>,
+    _turn_cancel_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
 
@@ -2326,7 +2325,6 @@ async fn register_workflow_tool(
         let event_tx = event_tx.clone();
         let cwd = cwd.clone();
         let cancel_flag = Arc::clone(&cancel_flag);
-        let turn_cancel_flag = turn_cancel_flag.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -2350,157 +2348,18 @@ async fn register_workflow_tool(
                 tool_err(format!("{e}. available workflows: {available}"))
             })?;
 
-            let wf_id = format!(
-                "wf-{}-{}",
-                name,
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_micros())
-                    .unwrap_or(0)
-            );
-            let _ = event_tx.send(ChatEvent::WorkflowStarted {
-                name: name.clone(),
-                topic: topic.clone(),
-                wf_id: wf_id.clone(),
-            });
-
-            // One runner per scheduled role; advisor is an internal monitor only.
-            let mut runners: std::collections::HashMap<String, AgentRunner> =
-                std::collections::HashMap::new();
-            for role_id in wf.speaker_roles() {
-                if role_id == "advisor" {
-                    return Err(tool_err("advisor is monitor-only; use reviewer for workflow tasks".into()));
-                }
-                let template = merged
-                    .roles
-                    .get(&role_id)
-                    .ok_or_else(|| tool_err(format!("role '{role_id}' not found in config")))?
-                    .clone();
-                let role = template
-                    .resolve(&default_params)
-                    .await
-                    .map_err(|e| tool_err(format!("resolve role '{role_id}': {e}")))?;
-                let models = resolver
-                    .resolve_chain(&role.id, role.default_model_tier, &role.model_chain)
-                    .map_err(|e| tool_err(format!("no model for role '{role_id}': {e}")))?;
-                let agent = Agent::new_with_chain(role_id.clone(), role.clone(), models, default_params.clone())
-                    .map_err(|e| tool_err(format!("create agent '{role_id}': {e}")))?;
-                let runner = if role.allowed_tools.is_empty() {
-                    AgentRunner::new(agent)
-                } else {
-                    let rtm = build_tool_manager(&role.allowed_tools)
-                        .await
-                        .map_err(|e| tool_err(format!("tools for '{role_id}': {e}")))?;
-                    AgentRunner::new_with_tools(agent, rtm, 0)
-                };
-                runners.insert(role_id.clone(), runner.with_role(role_id).with_cwd(cwd.clone()));
-            }
-
-            let mut vars: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            vars.insert("topic".into(), topic.clone());
-            let total = wf.steps.len();
-            let mut last_output = String::new();
-            let mut status = "ok";
-            let mut error_msg = String::new();
-
-            'rounds: for round in 0..wf.effective_max_rounds() {
-                for (idx, step) in wf.steps.iter().enumerate() {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        status = "cancelled";
-                        break 'rounds;
-                    }
-                    let _ = event_tx.send(ChatEvent::WorkflowStep {
-                        wf_id: wf_id.clone(),
-                        step_id: step.id.clone(),
-                        description: step.description.clone(),
-                        index: idx + 1,
-                        total,
-                    });
-                    let mut step_transcript = String::new();
-                    for speaker in step.roles() {
-                        if speaker == "advisor" {
-                            status = "failed";
-                            error_msg = "advisor is monitor-only; use reviewer".into();
-                            break 'rounds;
-                        }
-                        if cancel_flag.load(Ordering::SeqCst) {
-                            status = "cancelled";
-                            break 'rounds;
-                        }
-                        let runner = match runners.get_mut(&speaker) {
-                            Some(r) => r,
-                            None => {
-                                status = "failed";
-                                error_msg = format!("role '{speaker}' not instantiated");
-                                break 'rounds;
-                            }
-                        };
-                        let mut step_vars = vars.clone();
-                        step_vars.insert("step_id".into(), step.id.clone());
-                        step_vars.insert("speaker".into(), speaker.clone());
-                        let base_prompt = wf.render_task(step, &step_vars);
-                        let prompt = if step_transcript.is_empty() {
-                            base_prompt
-                        } else {
-                            format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
-                        };
-match runner
-                            .run_turn(
-                                &[Message::user(prompt)],
-                                None,
-                            )
-                            .await
-                        {
-                            Ok(response) => {
-                                let _ = event_tx.send(ChatEvent::WorkflowTurn {
-                                    wf_id: wf_id.clone(),
-                                    step_id: step.id.clone(),
-                                    role_id: speaker.clone(),
-                                    content: response.clone(),
-                                    round,
-                                });
-                                step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
-                                last_output = response;
-                            }
-                            Err(e) => {
-                                status = "failed";
-                                error_msg = format!("step '{}' speaker '{}': {e}", step.id, speaker);
-                                break 'rounds;
-                            }
-                        }
-                    }
-                    if let Some(key) = &step.output_key {
-                        vars.insert(key.clone(), last_output.clone());
-                    }
-                }
-            }
-
-            match status {
-                "ok" => {
-                    let _ = event_tx.send(ChatEvent::WorkflowFinished {
-                        name,
-                        wf_id,
-                        status: "ok".into(),
-                        summary: last_output.clone(),
-                    });
-                    Ok(serde_json::Value::String(last_output))
-                }
-                s => {
-                    let summary = if s == "cancelled" {
-                        "workflow cancelled by user".to_string()
-                    } else {
-                        error_msg
-                    };
-                    let _ = event_tx.send(ChatEvent::WorkflowFinished {
-                        name,
-                        wf_id,
-                        status: s.into(),
-                        summary: summary.clone(),
-                    });
-                    Err(tool_err(summary))
-                }
-            }
+            let ctx = crate::workflow::WorkflowRunContext {
+                merged,
+                resolver,
+                default_params,
+                cwd,
+                event_tx,
+                cancel_flag,
+            };
+            crate::workflow::run_workflow(&wf, &topic, &ctx)
+                .await
+                .map(serde_json::Value::String)
+                .map_err(tool_err)
         })
     });
 

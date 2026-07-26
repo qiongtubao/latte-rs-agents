@@ -52,6 +52,7 @@ mod sessions;
 mod models;
 pub mod tasks;
 pub mod tools;
+pub mod workflows;
 mod test;
 
 use std::net::SocketAddr;
@@ -128,6 +129,9 @@ pub struct UiBackend {
     pub(crate) initial_tier: Option<ModelTier>,
     pub(crate) primary_model_id: Option<String>,
     pub(crate) self_loop: Arc<self_loop::SelfLoopState>,
+    /// Workflow 测试运行的全局状态（一个 backend 同时只允许一个 run）；
+    /// HTTP 走 `/api/workflows/run*`，事件走 SSE。
+    pub(crate) workflow_run: Arc<workflows::WorkflowRunState>,
     /// Process-wide store of per-task subsession event logs. Each
     /// delegate call allocates an entry; the UI's right-click →
     /// "show contents" reads from this same store via
@@ -184,6 +188,7 @@ impl UiBackend {
             initial_tier,
             primary_model_id: model_id,
             self_loop: Arc::new(self_loop::SelfLoopState::default()),
+            workflow_run: Arc::new(workflows::WorkflowRunState::default()),
             subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::new()),
             agents_config,
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
@@ -457,7 +462,17 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/tasks/:id/dispatch", post(dispatch_task))
         .route("/tasks/:id/abort", post(abort_task))
-        .route("/tasks/:id/report", post(report_task));
+        .route("/tasks/:id/report", post(report_task))
+        // 工作流管理（编辑器 CRUD + 校验 + 测试运行）
+        .route("/workflows", get(list_workflows_h).post(create_workflow_h))
+        .route("/workflows/validate", post(validate_workflow_h))
+        .route("/workflows/run", post(workflow_run_start_h))
+        .route("/workflows/run/events", get(workflow_run_events_sse))
+        .route("/workflows/run/stop", post(workflow_run_stop_h))
+        .route(
+            "/workflows/:name",
+            get(get_workflow_h).put(update_workflow_h).delete(delete_workflow_h),
+        );
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);
