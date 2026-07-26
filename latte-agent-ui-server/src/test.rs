@@ -1,7 +1,8 @@
 //! Model test endpoint —— UI 上「测试」按钮的后端。
 //!
 //! 三种模式：
-//!   - `connectivity`：GET `<base_url>/v1/models`，检查连通性 + 凭证
+//!   - `connectivity`：GET `<base_url>/models`（base_url 不含版本段时自动
+//!     补 `/v1`），检查连通性 + 凭证
 //!   - `aiclient`：走 `latte_ai::client::AiClient::chat`，贴近生产语义
 //!   - `http`：用 `reqwest` 直接 POST，绕过 AiClient 的中间处理
 //!
@@ -21,6 +22,8 @@ use serde::{Deserialize, Serialize};
 pub enum TestMode {
     #[default]
     Connectivity,
+    /// 前端发送的是 `aiclient`（无下划线），alias 保持兼容。
+    #[serde(alias = "aiclient")]
     AiClient,
     Http,
 }
@@ -72,15 +75,13 @@ pub async fn run_test(req: TestModelRequest) -> TestModelResponse {
 }
 
 async fn test_connectivity(req: &TestModelRequest, started: Instant) -> TestModelResponse {
-    let probe_path = req
-        .probe_path
-        .clone()
-        .unwrap_or_else(|| "/v1/models".to_string());
-    let url = format!(
-        "{}{}",
-        req.def.base_url.trim_end_matches('/'),
-        probe_path
-    );
+    let base = req.def.base_url.trim_end_matches('/');
+    // 显式 probe_path 按字面拼接（用户明确意图）；默认走智能拼接，
+    // base_url 已含 /v1 时不再重复。
+    let url = match &req.probe_path {
+        Some(p) => format!("{base}{p}"),
+        None => join_endpoint(base, "/models"),
+    };
     let client = match reqwest_client() {
         Ok(c) => c,
         Err(e) => return err_response(started, e),
@@ -172,15 +173,12 @@ async fn test_via_raw_http(req: &TestModelRequest, started: Instant) -> TestMode
         Ok(c) => c,
         Err(e) => return err_response(started, e),
     };
-    let url = format!(
-        "{}{}",
-        req.def.base_url.trim_end_matches('/'),
-        if req.def.api.eq_ignore_ascii_case("anthropic") {
-            "/v1/messages"
-        } else {
-            "/v1/chat/completions"
-        }
-    );
+    let base = req.def.base_url.trim_end_matches('/');
+    let url = if req.def.api.eq_ignore_ascii_case("anthropic") {
+        join_endpoint(base, "/messages")
+    } else {
+        join_endpoint(base, "/chat/completions")
+    };
     let model_id = if req.def.name.is_empty() {
         "test-model"
     } else {
@@ -271,6 +269,23 @@ pub async fn probe_capabilities(req: &TestModelRequest) -> ModelCapabilities {
 }
 
 // ─── helpers ───────────────────────────────────────────────────
+
+/// 拼接 API endpoint：base_url 的最后一段已是版本号（`v1`、`v1beta`、
+/// `v2`…）时直接拼资源路径，否则补 `/v1` 再拼。兼容两种配置习惯：
+/// `https://api.deepseek.com` 与 `https://yuanyuaicloud.cn/v1`。
+fn join_endpoint(base_url: &str, resource: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let last = base.rsplit('/').next().unwrap_or("");
+    let has_version = {
+        let l = last.to_ascii_lowercase();
+        l.len() > 1 && l.starts_with('v') && l.as_bytes()[1].is_ascii_digit()
+    };
+    if has_version {
+        format!("{base}{resource}")
+    } else {
+        format!("{base}/v1{resource}")
+    }
+}
 
 fn reqwest_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -666,5 +681,60 @@ pub async fn run_role_test(
             response: None,
             error: Some(format!("{e}")),
         },
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_endpoint_avoids_double_version_segment() {
+        // base_url 已含 /v1 → 不重复
+        assert_eq!(
+            join_endpoint("https://yuanyuaicloud.cn/v1", "/chat/completions"),
+            "https://yuanyuaicloud.cn/v1/chat/completions"
+        );
+        assert_eq!(
+            join_endpoint("https://api.kimi.com/coding/v1", "/models"),
+            "https://api.kimi.com/coding/v1/models"
+        );
+        // base_url 不含版本段 → 补 /v1
+        assert_eq!(
+            join_endpoint("https://api.deepseek.com", "/chat/completions"),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_endpoint("https://api.anthropic.com", "/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            join_endpoint("http://localhost:11434", "/models"),
+            "http://localhost:11434/v1/models"
+        );
+        // 尾部斜杠 / 其它版本号形式
+        assert_eq!(
+            join_endpoint("https://example.com/v2/", "/models"),
+            "https://example.com/v2/models"
+        );
+        // 非版本号结尾路径段不误判
+        assert_eq!(
+            join_endpoint("https://example.com/api", "/models"),
+            "https://example.com/api/v1/models"
+        );
+    }
+
+    #[test]
+    fn test_mode_deserializes_frontend_spellings() {
+        let m: TestMode = serde_json::from_str("\"aiclient\"").unwrap();
+        assert!(matches!(m, TestMode::AiClient));
+        let m: TestMode = serde_json::from_str("\"ai_client\"").unwrap();
+        assert!(matches!(m, TestMode::AiClient));
+        let m: TestMode = serde_json::from_str("\"http\"").unwrap();
+        assert!(matches!(m, TestMode::Http));
+        let m: TestMode = serde_json::from_str("\"connectivity\"").unwrap();
+        assert!(matches!(m, TestMode::Connectivity));
     }
 }
