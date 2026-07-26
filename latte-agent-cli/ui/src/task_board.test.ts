@@ -6,7 +6,7 @@
 import { describe, it, expect } from "vitest";
 import {
   STATES, STATE_ACTIONS, COLUMN_ORDER,
-  effectiveActions, lastSessionId, actionRequest, actionToast,
+  effectiveActions, lastSessionId, actionRequest, actionToast, actionLabel,
 } from "./task_board";
 import type { TaskView } from "./api";
 
@@ -98,6 +98,24 @@ describe("lastSessionId（查看对话按钮的 session 来源）", () => {
       { session_id: "ui-bbb", started_at: 3, ended_at: null, result: null },
     ];
     expect(lastSessionId({ runs })).toBe("ui-bbb");
+  });
+});
+
+describe("actionLabel（workflow 绑定任务的执行按钮文案）", () => {
+  it("run_now + 已绑定 workflow → 「▶ 运行 <workflow>」", () => {
+    const a = STATE_ACTIONS.todo.find((x) => x.key === "run_now")!;
+    expect(actionLabel({ workflow: "discussion" }, a)).toBe("▶ 运行 discussion");
+  });
+
+  it("run_now + 未绑定 workflow → 保持原 label", () => {
+    const a = STATE_ACTIONS.todo.find((x) => x.key === "run_now")!;
+    expect(actionLabel({ workflow: null }, a)).toBe(a.label);
+    expect(actionLabel({ workflow: null }, a)).toBe("▶ 立即执行");
+  });
+
+  it("非 run_now 动作不受 workflow 影响", () => {
+    const a = STATE_ACTIONS.todo.find((x) => x.key === "schedule")!;
+    expect(actionLabel({ workflow: "discussion" }, a)).toBe(a.label);
   });
 });
 

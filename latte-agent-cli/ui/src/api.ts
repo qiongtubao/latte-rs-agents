@@ -73,6 +73,7 @@ export interface RoleConfigEntry {
   temperature: number | null;
   tools: string[];
   skills: string[];
+  code_paths: string[];
   prompt_file: string | null;
   prompt_path: string | null;
   config_path: string;
@@ -97,6 +98,7 @@ export interface RoleConfigSave {
   model_chain: string[];
   temperature: number | null;
   tools: string[];
+  code_paths: string[];
   prompt: string;
 }
 
@@ -144,6 +146,7 @@ export type ChatEvent =
   | { type: "ToolUse"; role_id: string; tool_name: string; args: string }
   | { type: "ToolError"; role_id: string; tool_name: string; error: string }
   | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
+  | { type: "ImageGenerated"; role_id: string; path: string; prompt: string }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
@@ -493,6 +496,7 @@ export interface ModelDef {
   max_tokens: number;
   supports_thinking?: boolean;
   supports_vision?: boolean;
+  supports_image_generation?: boolean;
   cost_per_million_input?: number | null;
   cost_per_million_output?: number | null;
   tier?: string | null;
@@ -745,6 +749,8 @@ export interface TaskView {
   created_at: number;
   updated_at: number;
   history: TaskHistoryEntry[];
+  /** 绑定的 workflow 名；null = 未绑定（派发时走默认 manager 流程）。 */
+  workflow: string | null;
   /** 子任务聚合（父任务用）：总数 / 终态数 / 各状态计数。 */
   sub_total: number;
   sub_done: number;
@@ -758,6 +764,8 @@ export interface TaskCreateBody {
   parent_id?: string;
   labels?: string[];
   scheduled_at?: number | null;
+  /** 可选：创建时绑定 workflow（派发时直接运行该 workflow）。 */
+  workflow?: string;
 }
 
 export interface TaskPatchBody {
@@ -767,6 +775,18 @@ export interface TaskPatchBody {
   state?: TaskState;
   scheduled_at?: number | null;
   labels?: string[];
+  /** 可选：缺省 = 不变；null = 清除绑定；字符串 = 绑定该 workflow。 */
+  workflow?: string | null;
+}
+
+/** POST /api/tasks/import 的单个任务项（支持嵌套 subtasks）。 */
+export interface ImportTask {
+  title: string;
+  description?: string;
+  priority?: number;
+  labels?: string[];
+  workflow?: string;
+  subtasks?: ImportTask[];
 }
 
 /** GET /api/tasks：列出全部任务。 */
@@ -818,6 +838,14 @@ export async function deleteTask(id: string): Promise<void> {
     "DELETE",
     `/api/tasks/${encodeURIComponent(id)}`,
   );
+}
+
+/** POST /api/tasks/import：批量导入任务（进 backlog），返回新建任务 id 列表。
+ *  校验失败时后端返回 400 + 纯文本错误信息。 */
+export async function importTasks(
+  tasks: ImportTask[],
+): Promise<{ created: string[] }> {
+  return getTransport().request("POST", "/api/tasks/import", { tasks });
 }
 
 

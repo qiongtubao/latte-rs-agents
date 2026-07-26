@@ -1,4 +1,5 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession, importTasks } from "./api";
+import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import type { CodeRef } from "./host";
 interface UIBinding {
@@ -109,6 +110,8 @@ export function mountChat(opts: {
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
   /** wf_id → pending badge element on the WorkflowStarted bubble. */
   const workflowStates = new Map<string, HTMLElement>();
+  /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
+  const workflowTranscripts = new Map<string, string>();
 
   /** Find the (most recent) pending delegate targeting `roleId` —
    *  tool events carry role_id but no sub_id, so parallel delegates
@@ -125,6 +128,7 @@ export function mountChat(opts: {
     activeDelegates.clear();
     currentDelegateSubId = "";
     workflowStates.clear();
+    workflowTranscripts.clear();
   }
 
   let lastUserMsgId = "";
@@ -899,6 +903,30 @@ export function mountChat(opts: {
         subagentTools.push(`❌ ${e.tool_name}: ${truncate(e.error, 100)}`);
         updateFooter(); resetWaitTimer(); break;
       }
+      case "ImageGenerated": {
+        // generate_image 工具产出：角色气泡 + 图片 + 截断的 prompt 说明。
+        // prompt 走 addMessage 的 escapeHtml 路径（纯文本），<img> 用
+        // createElement 构建 —— 绝不 innerHTML 拼接用户/模型内容。
+        const icon = resolveIcon(e.role_id);
+        const imgMsg = addMessage({
+          kind: "role",
+          content: `🖼 ${truncate(e.prompt, 120)}`,
+          meta: e.role_id,
+          icon,
+        });
+        const link = document.createElement("a");
+        link.href = e.path;
+        link.target = "_blank";
+        link.rel = "noopener";
+        const img = document.createElement("img");
+        img.className = "msg-img";
+        img.src = e.path;
+        img.alt = truncate(e.prompt, 120);
+        link.appendChild(img);
+        imgMsg.querySelector(".msg-bubble")?.appendChild(link);
+        updateFooter(); resetWaitTimer();
+        break;
+      }
       case "RoleTurn": {
         const icon = resolveIcon(e.role_id);
         const subagent = subagentTools.length > 0 ? { detail: buildSubagentDetail() } : undefined;
@@ -1056,6 +1084,10 @@ export function mountChat(opts: {
           meta: e.role_id,
           icon,
         });
+        workflowTranscripts.set(
+          e.wf_id,
+          (workflowTranscripts.get(e.wf_id) ?? "") + "\n" + e.content,
+        );
         resetWaitTimer();
         break;
       }
@@ -1072,6 +1104,31 @@ export function mountChat(opts: {
           kind: isFail ? "error" : "system",
           content: `${isFail ? "❌" : "✅"} 工作流「${e.name}」${isFail ? `失败(${e.status})` : "完成"}${summary}`,
         });
+        // plan 类 workflow 完成后：扫描 transcript 里的任务 JSON，
+        // 给「导入任务看板」按钮（与 workflows 面板同一提取逻辑）。
+        if (!isFail) {
+          const transcript = workflowTranscripts.get(e.wf_id) ?? "";
+          const found = extractImportableTasks(transcript);
+          if (found) {
+            const msg = addMessage({ kind: "system", content: `📋 检测到 ${found.length} 个可导入任务` });
+            const btn = document.createElement("button");
+            btn.className = "workflow-import-btn";
+            btn.textContent = `📥 导入任务看板（${found.length} 个任务）`;
+            btn.addEventListener("click", async () => {
+              if (!confirm(`导入 ${found.length} 个任务到看板（backlog）？`)) return;
+              btn.disabled = true;
+              try {
+                const resp = await importTasks(found);
+                btn.textContent = `✅ 已创建 ${resp.created.length} 个任务，请到任务看板查看`;
+              } catch (err) {
+                btn.disabled = false;
+                btn.textContent = `导入失败: ${(err as Error).message}`;
+              }
+            });
+            msg.querySelector(".msg-bubble")?.appendChild(btn);
+          }
+        }
+        workflowTranscripts.delete(e.wf_id);
         setFooter(`workflow ${e.name} ${e.status}`);
         resetWaitTimer();
         break;

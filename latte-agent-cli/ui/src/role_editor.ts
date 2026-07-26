@@ -19,6 +19,7 @@ interface UIBinding {
   chainBrowseBtn: HTMLButtonElement;
   temperatureInput: HTMLInputElement;
   toolsEl: HTMLElement;
+  codePathsInput: HTMLTextAreaElement;
   promptInput: HTMLTextAreaElement;
   statusEl: HTMLElement;
   testRoleBtn: HTMLButtonElement;
@@ -101,6 +102,12 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     .map((input) => input.value.trim())
     .filter(Boolean);
 
+  // 代码/文档路径：textarea 每行一条，忽略空行。
+  const codePathValues = () => container.codePathsInput.value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
   function renderChain(models: string[]): void {
     container.chainEl.replaceChildren();
     const values = models.length ? models : [""];
@@ -168,6 +175,7 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     container.tierSelect.value = entry.model_tier;
     renderChain(entry.model_chain);
     container.temperatureInput.value = entry.temperature === null ? "" : String(entry.temperature);
+    container.codePathsInput.value = (entry.code_paths ?? []).join("\n");
     container.promptInput.value = entry.prompt;
     container.pathsEl.textContent = `配置文件：${entry.config_path}${entry.prompt_path ? ` · Prompt：${entry.prompt_path}` : ""}`;
     container.toolsEl.replaceChildren();
@@ -283,6 +291,7 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
         tools: Array.from(container.toolsEl.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'))
           .filter((input) => input.checked)
           .map((input) => input.value),
+        code_paths: codePathValues(),
         prompt: container.promptInput.value,
       });
       if (config) {
@@ -319,6 +328,7 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
           tools: Array.from(container.toolsEl.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'))
             .filter((input) => input.checked)
             .map((input) => input.value),
+          code_paths: codePathValues(),
           prompt: container.promptInput.value,
         },
       });

@@ -195,6 +195,7 @@ async function main(): Promise<void> {
       chainBrowseBtn: $("role-editor-chain-browse") as HTMLButtonElement,
       temperatureInput: $("role-editor-temperature") as HTMLInputElement,
       toolsEl: $("role-editor-tools"),
+      codePathsInput: $("role-editor-code-paths") as HTMLTextAreaElement,
       promptInput: $("role-editor-prompt") as HTMLTextAreaElement,
       statusEl: $("role-editor-status"),
       testRoleBtn: $("role-editor-test-role") as HTMLButtonElement,

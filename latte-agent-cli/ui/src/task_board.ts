@@ -10,8 +10,9 @@
 // 动作，其余进右侧详情抽屉。
 import {
   listTasks, createTask, updateTask, dispatchTask, abortTask,
+  listWorkflows,
 } from "./api";
-import type { TaskView, TaskState } from "./api";
+import type { TaskView, TaskState, WorkflowSummary } from "./api";
 
 // ─── 状态机定义（纯数据/纯函数，单独可测） ─────────────────────────
 
@@ -96,6 +97,16 @@ export function effectiveActions(
     return STATE_ACTIONS.todo_scheduled;
   }
   return STATE_ACTIONS[task.state] ?? [];
+}
+
+/** 动作按钮文案：绑定了 workflow 的任务，「立即执行 / 重新派发」按钮
+ *  直接标出将运行的 workflow（派发时后端会直接运行它）。 */
+export function actionLabel(
+  task: Pick<TaskView, "workflow">,
+  a: TaskAction,
+): string {
+  if (a.key === "run_now" && task.workflow) return `▶ 运行 ${task.workflow}`;
+  return a.label;
 }
 
 /** 「查看对话」用的 session：runs 最后一个元素；没有则 null（按钮禁用）。 */
@@ -293,6 +304,9 @@ export function mountTaskBoard(opts: {
     const propSec = el("div", "tb-drawer-section");
     propSec.appendChild(el("div", "tb-label", "属性"));
     propSec.appendChild(kv("优先级", `P${task.priority}`));
+    if (task.workflow) {
+      propSec.appendChild(kv("Workflow", `🔀 ${task.workflow}（派发时直接运行该 workflow）`));
+    }
     propSec.appendChild(kv("创建时间", fmtTime(task.created_at)));
     if (task.scheduled_at != null && task.state === "todo") {
       propSec.appendChild(kv("排期时间", `🕐 ${fmtTime(task.scheduled_at)}（到点自动交给 manager）`));
@@ -405,7 +419,7 @@ export function mountTaskBoard(opts: {
   // ── 动作按钮 ──
   function actionButton(task: TaskView, a: TaskAction, small: boolean): HTMLButtonElement {
     const cls = a.kind === "primary" ? "tb-btn-primary" : a.kind === "danger" ? "tb-btn-danger" : "tb-btn-ghost";
-    const btn = el("button", `tb-btn ${cls}${small ? " tb-btn-sm" : ""}`, a.label) as HTMLButtonElement;
+    const btn = el("button", `tb-btn ${cls}${small ? " tb-btn-sm" : ""}`, actionLabel(task, a)) as HTMLButtonElement;
     // 「查看对话」没有 run 时禁用。
     if (a.key === "open_session" && !lastSessionId(task)) {
       btn.disabled = true;
@@ -544,7 +558,11 @@ export function mountTaskBoard(opts: {
   const parentLabel = el("label", "tb-field", "父任务（可选）");
   const parentSelect = document.createElement("select");
   parentLabel.appendChild(parentSelect);
-  row.append(prioLabel, parentLabel);
+
+  const wfLabel = el("label", "tb-field", "Workflow（可选）");
+  const wfSelect = document.createElement("select");
+  wfLabel.appendChild(wfSelect);
+  row.append(prioLabel, parentLabel, wfLabel);
 
   const formActions = el("div", "tb-modal-actions");
   const formCancel = el("button", "tb-btn tb-btn-ghost", "取消") as HTMLButtonElement;
@@ -563,6 +581,29 @@ export function mountTaskBoard(opts: {
     e.preventDefault();
     void submitTaskForm();
   });
+
+  /** 用当前可选 workflow 列表填充下拉框；首项是「不绑定」。 */
+  function populateWorkflowSelect(wfs: WorkflowSummary[], selected: string): void {
+    wfSelect.replaceChildren();
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "不绑定 workflow";
+    wfSelect.appendChild(none);
+    for (const w of wfs) {
+      const opt = document.createElement("option");
+      opt.value = w.name;
+      opt.textContent = w.description ? `${w.name}（${w.description}）` : w.name;
+      wfSelect.appendChild(opt);
+    }
+    // 绑定的 workflow 可能已被删除：保留一个占位项让当前值可见。
+    if (selected && !wfs.some((w) => w.name === selected)) {
+      const opt = document.createElement("option");
+      opt.value = selected;
+      opt.textContent = `${selected}（已不存在）`;
+      wfSelect.appendChild(opt);
+    }
+    wfSelect.value = selected;
+  }
 
   function openTaskModal(opts2: { parentId?: string; edit?: TaskView } = {}): void {
     editingTaskId = opts2.edit?.id ?? null;
@@ -589,6 +630,19 @@ export function mountTaskBoard(opts: {
     parentSelect.value = opts2.parentId ?? opts2.edit?.parent_id ?? "";
     // 拆分子任务入口进来时父任务固定，不允许改。
     parentSelect.disabled = !!opts2.parentId;
+
+    // workflow 下拉：先按编辑值/空值放好占位，再异步拉最新列表填充。
+    const wfSelected = opts2.edit?.workflow ?? "";
+    populateWorkflowSelect([], wfSelected);
+    void listWorkflows()
+      .catch(() => [] as WorkflowSummary[])
+      .then((wfs) => {
+        // 弹窗仍开着才回填（避免关掉后改到无关状态）。
+        if (taskMask.classList.contains("open")) {
+          populateWorkflowSelect(wfs, wfSelect.value || wfSelected);
+        }
+      });
+
     taskMask.classList.add("open");
     titleInput.focus();
   }
@@ -601,9 +655,14 @@ export function mountTaskBoard(opts: {
     if (!title) { toast("请填写标题"); return; }
     const description = descInput.value.trim();
     const priority = Number(prioSelect.value);
+    const workflow = wfSelect.value;
     try {
       if (editingTaskId) {
-        await updateTask(editingTaskId, { title, description, priority });
+        // PATCH 语义：workflow 缺省 = 不变，null = 清除绑定。
+        await updateTask(editingTaskId, {
+          title, description, priority,
+          workflow: workflow || null,
+        });
         toast(`${editingTaskId} 已保存`);
       } else {
         const parentId = parentSelect.value || undefined;
@@ -612,6 +671,7 @@ export function mountTaskBoard(opts: {
           description: description || undefined,
           priority,
           parent_id: parentId,
+          workflow: workflow || undefined,
         });
         toast(`${created.id} 已创建${parentId ? `（${parentId} 的子任务）` : ""}`);
       }
@@ -662,6 +722,9 @@ export function mountTaskBoard(opts: {
     card.appendChild(el("div", "tb-title", task.title));
 
     const meta = el("div", "tb-meta");
+    if (task.workflow) {
+      meta.appendChild(el("span", "tb-chip tb-chip-workflow", `🔀 ${task.workflow}`));
+    }
     if (task.scheduled_at != null && task.state === "todo") {
       const due = task.scheduled_at <= Date.now();
       meta.appendChild(el("span", `tb-chip tb-chip-sched${due ? " due" : ""}`,

@@ -17,6 +17,7 @@ import {
   runWorkflow,
   stopWorkflowRun,
   getRoles,
+  importTasks,
 } from "./api";
 import type {
   WorkflowSummary,
@@ -25,6 +26,7 @@ import type {
   StepForm,
   RoleInfo,
   ValidateResponse,
+  ImportTask,
 } from "./api";
 import { HttpError } from "./transport";
 
@@ -81,6 +83,36 @@ function httpStatusOf(e: unknown): number | null {
  *  speakers 数组要保持用户的勾选顺序（= 发言顺序），所以单独维护。 */
 const speakerOrder = new WeakMap<HTMLElement, string[]>();
 
+/** 从试运行 transcript 文本里提取可导入的任务列表：扫描 ```json 围栏块，
+ *  第一个能 JSON.parse 成 `{tasks: [...]}` 且每项都是带 string title 的
+ *  对象的块获胜；找不到返回 null。 */
+export function extractImportableTasks(text: string): ImportTask[] | null {
+  // 先剥 <think> 块：带思考的模型会在里面复述指令文本（含 ```json
+  // 字样），产生假 fence（自优化实测中真实遇到）。
+  const cleaned = text.replace(/<think>[\s\S]*?(<\/think>|$)/g, "");
+  const fenceRe = /```json[^\S\n]*\n([\s\S]*?)```/g;
+  for (const m of cleaned.matchAll(fenceRe)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(m[1]);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const tasks = (parsed as { tasks?: unknown }).tasks;
+    if (!Array.isArray(tasks) || tasks.length === 0) continue;
+    const allValid = tasks.every(
+      (t) =>
+        typeof t === "object" &&
+        t !== null &&
+        typeof (t as { title?: unknown }).title === "string" &&
+        (t as { title: string }).title.trim() !== "",
+    );
+    if (allValid) return tasks as ImportTask[];
+  }
+  return null;
+}
+
 export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPanelController {
   const { container } = opts;
   let items: WorkflowSummary[] = [];
@@ -92,6 +124,42 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
   // 试运行状态
   let runSource: EventSource | null = null;
   let runActive = false;
+  // 本轮 run 的纯文本 transcript（WorkflowTurn.content 累加），
+  // 供 run 结束后扫描 ```json 任务列表做「导入任务看板」。
+  let runTranscriptText = "";
+
+  // 「📥 导入任务看板」按钮：动态创建，放在运行控制行（status 左侧），
+  // 只在 run 成功结束且 transcript 里能解析出任务列表时出现。
+  const importBtn = document.createElement("button");
+  importBtn.type = "button";
+  importBtn.textContent = "📥 导入任务看板";
+  importBtn.classList.add("hidden");
+  container.runStatusEl.parentElement?.insertBefore(importBtn, container.runStatusEl);
+  let importableTasks: ImportTask[] | null = null;
+
+  function hideImportBtn(): void {
+    importableTasks = null;
+    importBtn.classList.add("hidden");
+  }
+
+  importBtn.addEventListener("click", () => void onImportTasks());
+
+  async function onImportTasks(): Promise<void> {
+    const tasks = importableTasks;
+    if (!tasks || runActive) return;
+    if (!confirm(`导入 ${tasks.length} 个任务到看板（backlog）？`)) return;
+    importBtn.disabled = true;
+    try {
+      const resp = await importTasks(tasks);
+      setRunStatus(`✅ 已创建 ${resp.created.length} 个任务，请到任务看板查看`);
+      hideImportBtn();
+    } catch (e) {
+      // 后端 400 返回纯文本错误信息，直接透出。
+      setRunStatus(`导入失败: ${(e as Error).message}`, true);
+    } finally {
+      importBtn.disabled = false;
+    }
+  }
 
   container.openBtn.addEventListener("click", () => {
     container.panelEl.classList.remove("hidden");
@@ -675,6 +743,8 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
     }
     const vars = parseVars(container.runVarsInput.value);
     container.runTranscriptEl.replaceChildren();
+    runTranscriptText = "";
+    hideImportBtn();
     setRunStatus("启动中…");
     container.runStartBtn.disabled = true;
     try {
@@ -767,6 +837,7 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
         break;
       }
       case "WorkflowTurn": {
+        runTranscriptText += ev.content + "\n";
         const turn = document.createElement("div");
         turn.className = "wf-run-turn";
         const head = document.createElement("div");
@@ -789,6 +860,16 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
         appendTranscript(line);
         setRunStatus(label, !ok);
         finishRun();
+        // 成功结束：扫描 transcript 里的 ```json 任务列表，
+        // 能解析出来就亮出「导入任务看板」按钮。
+        if (ok) {
+          const found = extractImportableTasks(runTranscriptText);
+          if (found) {
+            importableTasks = found;
+            importBtn.textContent = `📥 导入任务看板（${found.length} 个任务）`;
+            importBtn.classList.remove("hidden");
+          }
+        }
         break;
       }
     }

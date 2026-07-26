@@ -329,6 +329,15 @@ select {
   border-color: #bfdbfe;
   color: #0f172a;
 }
+
+/* generate_image 产出图（ImageGenerated 事件）：角色气泡下方的图片。 */
+.msg-img {
+  max-width: 100%;
+  border-radius: 8px;
+  display: block;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: var(--bubble-shadow);
+}
 .message-row.tool .msg-content {
   background: #f8fafc;
   border-left: 4px solid var(--tool-bubble);
@@ -1135,6 +1144,29 @@ select {
 .delegate-state.failed {
   color: #b91c1c;
   background: rgba(239, 68, 68, 0.12);
+}
+
+/* chat 气泡里的「导入任务看板」按钮（plan workflow 完成后出现） */
+.workflow-import-btn {
+  display: block;
+  margin-top: 8px;
+  padding: 4px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent-2);
+  font-size: 13px;
+  cursor: pointer;
+  width: fit-content;
+}
+.workflow-import-btn:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.08);
+}
+.workflow-import-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  border-color: var(--border);
+  color: var(--fg-2);
 }
 
 /* ─── context menu (right-click) ───────────────────────────────── */
@@ -2825,6 +2857,7 @@ select {
 .tb-chip-session { background: #e0f2fe; color: #0369a1; cursor: pointer; }
 .tb-chip-session:hover { text-decoration: underline; }
 .tb-chip-rounds { background: #f1f5f9; color: #64748b; }
+.tb-chip-workflow { background: #fef3c7; color: #92400e; }
 
 /* 卡片上的快捷动作 */
 .tb-card .tb-quick-actions {
