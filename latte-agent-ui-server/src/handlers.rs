@@ -546,3 +546,86 @@ pub(crate) async fn delete_role(
             )
         })
 }
+
+// ─── Tasks（任务看板，薄壳 → crate::tasks） ──────────────────────
+
+/// `GET /api/tasks` —— 全量列表（含子任务聚合进度）。
+pub(crate) async fn list_tasks(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::tasks::TaskView>> {
+    Json(crate::tasks::list_tasks(&state.backend))
+}
+
+/// `POST /api/tasks` —— 新建（可带 parent_id）。
+pub(crate) async fn create_task(
+    State(state): State<AppState>,
+    Json(req): Json<crate::tasks::CreateTaskRequest>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::create_task(&state.backend, req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `GET /api/tasks/:id` —— 详情。
+pub(crate) async fn get_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::get_task(&state.backend, &id)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `PATCH /api/tasks/:id` —— 改标题/描述/优先级/状态/排期/标签。
+pub(crate) async fn update_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    Json(patch): Json<crate::tasks::TaskPatch>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::update_task(&state.backend, &id, patch)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `POST /api/tasks/:id/dispatch` —— 立即执行（或 rework 重新派发）。
+pub(crate) async fn dispatch_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::dispatch_task(&state.backend, &id, "user")
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `POST /api/tasks/:id/abort` —— 中止执行（走现有 chat/abort 机制）。
+pub(crate) async fn abort_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::abort_task(&state.backend, &id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `POST /api/tasks/:id/report` —— manager 回报完成（设计 §5.1 方案 A 的接口半区）。
+pub(crate) async fn report_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    Json(req): Json<crate::tasks::ReportTaskRequest>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::report_task(&state.backend, &id, &req.summary, &req.result)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `DELETE /api/tasks/:id` —— 删除（文件移入 archive/）。
+pub(crate) async fn delete_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    crate::tasks::delete_task(&state.backend, &id)
+        .map(|_| StatusCode::OK)
+        .map_err(Into::into)
+}

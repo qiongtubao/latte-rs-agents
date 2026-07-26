@@ -15,6 +15,7 @@ import { mountToolsPanel } from "./tools_panel";
 import { mountModelsPanel } from "./models_panel";
 import { mountTestDialog } from "./test_panel";
 import { mountLogPanel } from "./log";
+import { mountTaskBoard } from "./task_board";
 import type { LatteUiApi } from "./host";
 import { waitForHost, setUiApi, installUiCallListener } from "./host";
 import { initTransport } from "./transport";
@@ -264,6 +265,29 @@ async function main(): Promise<void> {
       logListEl: $("log-file-list"),
       logContentEl: $("log-content"),
       statusEl: $("log-status"),
+    },
+  });
+
+  // 任务看板面板：任务状态机可视化管理（/api/tasks）。
+  // 「查看对话」复用下方的 activateSession 切到执行该任务的 session；
+  // 即使该 session 不在当前会话列表（server 重启后恢复的）也照常尝试切换。
+  const taskBoard = mountTaskBoard({
+    container: {
+      panelEl: $("task-board-panel"),
+      openBtn: $("task-board-btn") as HTMLButtonElement,
+      closeBtn: $("task-board-close") as HTMLButtonElement,
+      newBtn: $("task-board-new") as HTMLButtonElement,
+      statRunningEl: $("tb-stat-running"),
+      statScheduledEl: $("tb-stat-scheduled"),
+      statReviewEl: $("tb-stat-review"),
+      statusEl: $("task-board-status"),
+      boardEl: $("tb-board"),
+    },
+    onOpenSession: (sessionId) => {
+      taskBoard.close();
+      activateSession(sessionId).catch((e) => {
+        chat.setFooter(`switch session failed: ${String(e)}`);
+      });
     },
   });
 

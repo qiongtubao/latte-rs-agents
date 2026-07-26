@@ -593,4 +593,124 @@ export async function getModelCapabilities(
   );
 }
 
+// ─── Tasks（任务看板） ───────────────────────────────────────────
+//
+// 对应后端 task tracker（/api/tasks）。字段 snake_case，时间戳为
+// epoch ms（number | null）。状态机见 ui/src/task_board.ts。
+
+export type TaskState =
+  | "backlog"
+  | "todo"
+  | "in_progress"
+  | "human_review"
+  | "rework"
+  | "merging"
+  | "done"
+  | "cancelled";
+
+export interface TaskRun {
+  session_id: string;
+  started_at: number;
+  ended_at: number | null;
+  result: string | null;
+}
+
+export interface TaskHistoryEntry {
+  at: number;
+  from: string | null;
+  to: string;
+  actor: string;
+  note: string | null;
+}
+
+export interface TaskView {
+  schema: string;
+  id: string;
+  title: string;
+  description: string;
+  priority: 1 | 2 | 3 | 4;
+  state: TaskState;
+  labels: string[];
+  parent_id: string | null;
+  sub_order: number;
+  scheduled_at: number | null;
+  runs: TaskRun[];
+  created_at: number;
+  updated_at: number;
+  history: TaskHistoryEntry[];
+  /** 子任务聚合（父任务用）：总数 / 终态数 / 各状态计数。 */
+  sub_total: number;
+  sub_done: number;
+  sub_state_counts: Record<string, number>;
+}
+
+export interface TaskCreateBody {
+  title: string;
+  description?: string;
+  priority?: number;
+  parent_id?: string;
+  labels?: string[];
+  scheduled_at?: number | null;
+}
+
+export interface TaskPatchBody {
+  title?: string;
+  description?: string;
+  priority?: number;
+  state?: TaskState;
+  scheduled_at?: number | null;
+  labels?: string[];
+}
+
+/** GET /api/tasks：列出全部任务。 */
+export async function listTasks(): Promise<TaskView[]> {
+  return getTransport().request("GET", "/api/tasks");
+}
+
+/** POST /api/tasks：新建任务（可带 parent_id 拆分子任务）。 */
+export async function createTask(body: TaskCreateBody): Promise<TaskView> {
+  return getTransport().request("POST", "/api/tasks", body);
+}
+
+/** GET /api/tasks/:id。 */
+export async function getTask(id: string): Promise<TaskView> {
+  return getTransport().request("GET", `/api/tasks/${encodeURIComponent(id)}`);
+}
+
+/** PATCH /api/tasks/:id：全可选字段更新。 */
+export async function updateTask(
+  id: string,
+  body: TaskPatchBody,
+): Promise<TaskView> {
+  return getTransport().request(
+    "PATCH",
+    `/api/tasks/${encodeURIComponent(id)}`,
+    body,
+  );
+}
+
+/** POST /api/tasks/:id/dispatch：立即执行（建 manager session 并发送任务）。 */
+export async function dispatchTask(id: string): Promise<TaskView> {
+  return getTransport().request(
+    "POST",
+    `/api/tasks/${encodeURIComponent(id)}/dispatch`,
+  );
+}
+
+/** POST /api/tasks/:id/abort：中止执行，任务回到 todo。 */
+export async function abortTask(id: string): Promise<TaskView> {
+  return getTransport().request(
+    "POST",
+    `/api/tasks/${encodeURIComponent(id)}/abort`,
+  );
+}
+
+/** DELETE /api/tasks/:id → 204。 */
+export async function deleteTask(id: string): Promise<void> {
+  await getTransport().request(
+    "DELETE",
+    `/api/tasks/${encodeURIComponent(id)}`,
+  );
+}
+
 
