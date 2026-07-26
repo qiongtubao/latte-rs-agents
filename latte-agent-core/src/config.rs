@@ -461,6 +461,9 @@ pub struct ModelDef {
     /// so existing configs work without changes.
     #[serde(default)]
     pub supports_vision: bool,
+    /// Whether the model can generate images (image generation API, not chat completion).
+    #[serde(default)]
+    pub supports_image_generation: bool,
     /// Cost per million input tokens (USD). Optional for local models.
     #[serde(default)]
     pub cost_per_million_input: Option<f64>,

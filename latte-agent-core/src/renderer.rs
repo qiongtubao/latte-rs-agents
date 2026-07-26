@@ -138,6 +138,11 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::WorkflowFinished { name, status, summary, .. } => {
                 self.on_status(&format!("workflow {name} {status}: {summary}")).await;
             }
+            // 生成的图片：CLI 无法渲染 <img>，提示落盘路径即可（web UI
+            // 走 /api/images/<file> 直接渲染）。
+            ChatEvent::ImageGenerated { role_id, path, .. } => {
+                self.on_status(&format!("{role_id} generated image: {path}")).await;
+            }
             // Soft-timeout warning: turn is still alive at this point — the
             // UI side turns it into a "continue / cancel" prompt. The CLI
             // just surfaces it as a status line so the operator can see

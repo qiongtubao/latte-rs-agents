@@ -1314,11 +1314,13 @@ name = "latte-agent-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "handlebars",
  "latte-ai",
  "latte-rs-agent-tools",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",

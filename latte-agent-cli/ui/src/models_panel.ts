@@ -62,6 +62,7 @@ const FIELDS: ReadonlyArray<FieldSpec> = [
   // 能力开关
   { key: "supports_thinking", label: "supports_thinking", kind: "checkbox" },
   { key: "supports_vision", label: "supports_vision", kind: "checkbox" },
+  { key: "supports_image_generation", label: "supports_image_generation", kind: "checkbox" },
   // 计费
   { key: "cost_per_million_input", label: "cost / 1M input (USD)", kind: "number" },
   { key: "cost_per_million_output", label: "cost / 1M output (USD)", kind: "number" },
@@ -454,6 +455,7 @@ function collectDef(inputs: Map<keyof ModelDef, FormInput>): ModelDef | null {
     max_tokens: num("max_tokens") ?? 0,
     supports_thinking: bool("supports_thinking"),
     supports_vision: bool("supports_vision"),
+    supports_image_generation: bool("supports_image_generation"),
     cost_per_million_input: num("cost_per_million_input"),
     cost_per_million_output: num("cost_per_million_output"),
     tier: text("tier") || null,

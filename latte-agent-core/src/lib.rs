@@ -46,6 +46,7 @@ pub mod error;
 pub mod event_json;
 pub mod global_config;
 pub mod hooks;
+pub mod image_gen;
 pub mod model_resolver;
 pub mod prompts;
 pub mod role;
