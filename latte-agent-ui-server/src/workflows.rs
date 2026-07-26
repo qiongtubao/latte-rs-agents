@@ -550,6 +550,7 @@ mod tests {
                     tools: vec![],
                     icon: "[t]".into(),
                     skills: vec![],
+            code_paths: vec![],
                 },
             );
         }

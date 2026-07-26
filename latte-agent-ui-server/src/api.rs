@@ -272,6 +272,22 @@ pub async fn subscribe_session(
     Ok(controller.subscribe())
 }
 
+/// 拿 session controller 的事件 broadcast **sender**（懒 spawn 同
+/// [`subscribe_session`]）。任务看板把绑定 workflow 的 run 直接跑在
+/// session 的事件流上：`run_workflow` 的 WorkflowStarted/Step/Turn/
+/// Finished 经它进入该 session 的 SSE 与 event_log 归档。
+pub async fn session_event_sender(
+    b: &UiBackend,
+    id: &str,
+) -> Result<broadcast::Sender<ChatEvent>, ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    Ok(controller.event_sender())
+}
+
 // ─── Roles ────────────────────────────────────────────────────────
 
 pub fn list_roles(b: &UiBackend) -> Vec<RoleInfo> {
@@ -308,6 +324,8 @@ pub struct RoleConfigEntry {
     pub temperature: Option<f64>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
+    /// 领域代码/文档路径（注入角色系统提示，见 core `RoleTemplate::code_paths`）。
+    pub code_paths: Vec<String>,
     pub prompt_file: Option<String>,
     pub prompt_path: Option<String>,
     pub config_path: String,
@@ -459,6 +477,7 @@ fn role_config_entry(
         temperature: tpl.temperature,
         tools: tpl.tools.clone(),
         skills: tpl.skills.clone(),
+        code_paths: tpl.code_paths.clone(),
         prompt_file: tpl.prompt_file.clone(),
         prompt_path,
         config_path: toml_path.display().to_string(),
@@ -484,6 +503,7 @@ async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
         .collect();
     names.insert("delegate".to_string());
     names.insert("workflow".to_string());
+    names.insert("generate_image".to_string());
     Ok(names.into_iter().collect())
 }
 
@@ -583,6 +603,9 @@ pub struct SaveRoleConfigRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// 领域代码/文档路径（空数组 = 清空）。
+    #[serde(default)]
+    pub code_paths: Vec<String>,
     #[serde(default)]
     pub prompt: String,
 }
@@ -633,6 +656,7 @@ fn write_role_toml(
         t["model_tier"] = value(req.model_tier.clone());
         t["model_chain"] = value(str_array(&req.model_chain));
         t["tools"] = value(str_array(&req.tools));
+        t["code_paths"] = value(str_array(&req.code_paths));
         match req.temperature {
             Some(temp) => {
                 t["temperature"] = value(temp);
@@ -662,6 +686,9 @@ fn write_role_toml(
         }
         t["icon"] = value(req.icon.clone());
         t["tools"] = value(str_array(&req.tools));
+        if !req.code_paths.is_empty() {
+            t["code_paths"] = value(str_array(&req.code_paths));
+        }
         if !tpl.skills.is_empty() {
             t["skills"] = value(str_array(&tpl.skills));
         }
@@ -728,6 +755,7 @@ pub fn save_role_config(
                 t.model_chain = req.model_chain.clone();
                 t.temperature = req.temperature;
                 t.tools = req.tools.clone();
+                t.code_paths = req.code_paths.clone();
                 role_config_entry(b, t)
             }
             None => {
@@ -759,6 +787,7 @@ pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<Role
         tools: vec![],
         icon: String::new(),
         skills: vec![],
+            code_paths: vec![],
     };
     let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
     std::fs::create_dir_all(&agents_dir)
@@ -1363,6 +1392,7 @@ mod tests {
             tools: vec![],
             icon: String::new(),
             skills: vec![],
+            code_paths: vec![],
         };
         // cwd 下没有文件 → 读全局 prompts.d
         assert_eq!(
@@ -1394,6 +1424,7 @@ mod tests {
                 tools: vec![],
                 icon: String::new(),
                 skills: vec![],
+            code_paths: vec![],
             },
         );
         let resolver = latte_agent_core::model_resolver::ModelResolver::from_config(&cfg)

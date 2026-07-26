@@ -13,7 +13,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use latte_agent_core::workflow::{load_workflow, run_workflow, WorkflowRunContext};
+use latte_ai::params::GenerateParams;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{self, ApiError};
@@ -98,6 +102,10 @@ pub struct Task {
     /// 排期只是 `todo` 上的属性，不单独设 `scheduled` 状态。
     #[serde(default)]
     pub scheduled_at: Option<i64>,
+    /// 绑定的 workflow 名：派发时直接跑该 workflow（不走 manager 派发）。
+    /// 旧落盘文件无此字段 → `None`。
+    #[serde(default)]
+    pub workflow: Option<String>,
     #[serde(default)]
     pub runs: Vec<TaskRun>,
     pub created_at: i64,
@@ -212,6 +220,10 @@ pub struct TaskStore {
     dir: PathBuf,
     meta: BoardMeta,
     tasks: HashMap<String, Task>,
+    /// 进行中的 workflow run 的取消旗标（纯内存态，不落盘）：dispatch
+    /// 绑定 workflow 的任务时登记，run 结束或 abort 时清除。abort_task
+    /// 置位后 `run_workflow` 在下一个 step/speaker 边界退出。
+    workflow_cancels: HashMap<String, Arc<AtomicBool>>,
 }
 
 impl TaskStore {
@@ -251,7 +263,7 @@ impl TaskStore {
                 }
             }
         }
-        Ok(Self { dir, meta, tasks })
+        Ok(Self { dir, meta, tasks, workflow_cancels: HashMap::new() })
     }
 
     pub fn meta(&self) -> &BoardMeta {
@@ -298,7 +310,8 @@ impl TaskStore {
     }
 
     /// 新建任务：分配 id = `{id_prefix}-{next_seq}`（board.json 同样
-    /// 原子写），记创建 history（actor=user），原子写任务文件。
+    /// 原子写），记创建 history（actor 由调用方给：user / import /
+    /// scheduler），原子写任务文件。
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &mut self,
@@ -308,6 +321,8 @@ impl TaskStore {
         labels: Vec<String>,
         parent_id: Option<String>,
         scheduled_at: Option<i64>,
+        workflow: Option<String>,
+        actor: &str,
     ) -> Result<Task, String> {
         if title.trim().is_empty() {
             return Err("title 不能为空".into());
@@ -350,6 +365,7 @@ impl TaskStore {
             parent_id,
             sub_order,
             scheduled_at,
+            workflow,
             runs: vec![],
             created_at: now,
             updated_at: now,
@@ -357,7 +373,7 @@ impl TaskStore {
                 at: now,
                 from: None,
                 to: "backlog".to_string(),
-                actor: "user".to_string(),
+                actor: actor.to_string(),
                 note: Some("任务创建".to_string()),
             }],
         };
@@ -400,6 +416,18 @@ impl TaskStore {
                 .map_err(|e| format!("archive {}: {e}", src.display()))?;
         }
         Ok(())
+    }
+
+    /// 登记一个进行中 workflow run 的取消旗标（dispatch 绑定
+    /// workflow 的任务时调用）。
+    pub fn register_workflow_cancel(&mut self, id: &str, flag: Arc<AtomicBool>) {
+        self.workflow_cancels.insert(id.to_string(), flag);
+    }
+
+    /// 取出并移除某任务的 workflow 取消旗标（abort / run 结束清理）。
+    /// `None` = 该任务当前没有进行中的 workflow run。
+    pub fn take_workflow_cancel(&mut self, id: &str) -> Option<Arc<AtomicBool>> {
+        self.workflow_cancels.remove(id)
     }
 
     /// 给已有任务设置 parent 时的校验（v1 的 update 不改 parent，仅
@@ -472,6 +500,9 @@ pub struct CreateTaskRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub scheduled_at: Option<i64>,
+    /// 绑定的 workflow 名（必须存在于 `.latte/workflows.d`，否则 400）。
+    #[serde(default)]
+    pub workflow: Option<String>,
 }
 
 /// `PATCH /api/tasks/:id` 请求体：全 Option，缺省字段不变。
@@ -490,6 +521,49 @@ pub struct TaskPatch {
     pub scheduled_at: Option<Option<i64>>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// 双层 Option：缺省 = 不变；`null` = 解绑 workflow；字符串 = 绑定。
+    /// （plain `#[serde(default)]` 会把显式 `null` 折叠成"缺省"，
+    /// 必须自定义 deserialize_with 才能区分三者。）
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    pub workflow: Option<Option<String>>,
+}
+
+/// 双层 Option 字段的反序列化：键存在即 `Some(值或null)`，缺失时由
+/// `#[serde(default)]` 给 `None`。
+fn deserialize_nullable<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// `POST /api/tasks/import` 请求体。
+#[derive(Deserialize)]
+pub struct ImportTasksRequest {
+    pub tasks: Vec<ImportTask>,
+}
+
+/// 导入的单个任务：除 `title` 外全部可选；`subtasks` 最多一层。
+#[derive(Deserialize)]
+pub struct ImportTask {
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub workflow: Option<String>,
+    #[serde(default)]
+    pub subtasks: Vec<ImportTask>,
+}
+
+/// `POST /api/tasks/import` 响应：按创建顺序（父先于子）的任务 id。
+#[derive(Serialize)]
+pub struct ImportTasksResponse {
+    pub created: Vec<String>,
 }
 
 /// `POST /api/tasks/:id/report` 请求体（manager 回报）。
@@ -529,6 +603,7 @@ pub fn get_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
 }
 
 pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, ApiError> {
+    validate_workflow_name(&b.cwd, req.workflow.as_deref())?;
     let mut store = b.tasks.write();
     let t = store
         .create(
@@ -538,12 +613,123 @@ pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, Ap
             req.labels,
             req.parent_id,
             req.scheduled_at,
+            req.workflow,
+            "user",
         )
         .map_err(map_store_err)?;
     Ok(store.view(&t))
 }
 
+/// 校验 workflow 名：`Some(name)` 时必须能在项目/全局
+/// `workflows.d` 里找到，否则 400。
+fn validate_workflow_name(cwd: &Path, name: Option<&str>) -> Result<(), ApiError> {
+    if let Some(n) = name {
+        if !crate::workflows::exists(cwd, n) {
+            return Err(ApiError::bad_request(format!("unknown workflow '{n}'")));
+        }
+    }
+    Ok(())
+}
+
+/// 导入单个任务（含一层子任务）的校验 + 落库。返回新建 id（父先于子）。
+fn import_one(
+    store: &mut TaskStore,
+    cwd: &Path,
+    item: &ImportTask,
+    created: &mut Vec<String>,
+) -> Result<(), String> {
+    let title = item.title.trim();
+    if title.is_empty() {
+        return Err("title 不能为空".to_string());
+    }
+    // 标题上限 80 字符（截断而非报错）。
+    let title: String = title.chars().take(80).collect();
+    if let Some(p) = item.priority {
+        if !(1..=4).contains(&p) {
+            return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
+        }
+    }
+    if item.subtasks.iter().any(|s| !s.subtasks.is_empty()) {
+        return Err("subtasks nested deeper than one level".to_string());
+    }
+    if let Some(wf) = &item.workflow {
+        if !crate::workflows::exists(cwd, wf) {
+            return Err(format!("unknown workflow '{wf}'"));
+        }
+    }
+    let parent = store.create(
+        &title,
+        &item.description,
+        item.priority.unwrap_or(3),
+        item.labels.clone(),
+        None,
+        None,
+        item.workflow.clone(),
+        "import",
+    )?;
+    created.push(parent.id.clone());
+    for sub in &item.subtasks {
+        let stitle = sub.title.trim();
+        if stitle.is_empty() {
+            return Err(format!("子任务 title 不能为空（父任务 '{title}'）"));
+        }
+        let stitle: String = stitle.chars().take(80).collect();
+        if let Some(p) = sub.priority {
+            if !(1..=4).contains(&p) {
+                return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
+            }
+        }
+        if let Some(wf) = &sub.workflow {
+            if !crate::workflows::exists(cwd, wf) {
+                return Err(format!("unknown workflow '{wf}'"));
+            }
+        }
+        let child = store.create(
+            &stitle,
+            &sub.description,
+            sub.priority.unwrap_or(3),
+            sub.labels.clone(),
+            Some(parent.id.clone()),
+            None,
+            sub.workflow.clone(),
+            "import",
+        )?;
+        created.push(child.id.clone());
+    }
+    Ok(())
+}
+
+/// `POST /api/tasks/import` 的核心逻辑（可测）：顺序创建，首个失败即
+/// 返回 400 语义的错误（消息含失败任务的 title 与已创建的 id）。
+fn import_tasks_into(
+    store: &mut TaskStore,
+    cwd: &Path,
+    req: &ImportTasksRequest,
+) -> Result<Vec<String>, String> {
+    let mut created: Vec<String> = Vec::new();
+    for item in &req.tasks {
+        if let Err(e) = import_one(store, cwd, item, &mut created) {
+            return Err(format!(
+                "导入任务 {:?} 失败：{e}（已创建：{created:?}）",
+                item.title.trim()
+            ));
+        }
+    }
+    Ok(created)
+}
+
+pub fn import_tasks(
+    b: &UiBackend,
+    req: ImportTasksRequest,
+) -> Result<ImportTasksResponse, ApiError> {
+    let mut store = b.tasks.write();
+    let created = import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
+    Ok(ImportTasksResponse { created })
+}
+
 pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView, ApiError> {
+    let mut hook: Option<&str> = None;
+    let mut hook_topic: Option<String> = None;
     let mut store = b.tasks.write();
     let now = now_ms();
     {
@@ -573,22 +759,162 @@ pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView
         if let Some(sched) = patch.scheduled_at {
             t.scheduled_at = sched;
         }
+        if let Some(wf) = patch.workflow {
+            if let Some(name) = &wf {
+                if !crate::workflows::exists(&b.cwd, name) {
+                    return Err(ApiError::bad_request(format!("unknown workflow '{name}'")));
+                }
+            }
+            t.workflow = wf;
+        }
         if let Some(state) = patch.state {
             if !Task::is_known_state(&state) {
                 return Err(ApiError::bad_request(format!("未知状态 {state:?}")));
             }
             // 手动改状态放宽（不做严格流转白名单），但必须记 history。
+            let prev = t.state.clone();
             t.set_state(&state, "user", None, now);
             // 改 state 为非 todo 时清排期。
             if t.state != "todo" {
                 t.scheduled_at = None;
             }
+            // 生命周期钩子：进入 merging/done 时自动执行对应 workflow。
+            if state != prev {
+                match state.as_str() {
+                    "merging" => hook = Some("merge"),
+                    "done" => hook = Some("task_archive"),
+                    _ => {}
+                }
+            }
         }
         t.updated_at = now;
+        if hook.is_some() {
+            hook_topic = Some(build_hook_topic(t));
+        }
     }
     store.persist(id).map_err(ApiError::internal)?;
+    // 父子联动：本次变更若使子任务全部 done，父任务自动完成。
+    {
+        let snap = store.get(id).expect("刚 persist 的任务必然存在").clone();
+        maybe_complete_parent(&mut store, &snap, now);
+    }
     let t = store.get(id).expect("刚 persist 的任务必然存在");
-    Ok(store.view(t))
+    let view = store.view(t);
+    drop(store);
+    if let (Some(wf_name), Some(topic)) = (hook, hook_topic) {
+        spawn_lifecycle_hook(b, id, wf_name, topic);
+    }
+    Ok(view)
+}
+
+/// 钩子工作流的 topic：任务本体 + 最近的审查/回报记录（取末尾控制长度）。
+fn build_hook_topic(t: &Task) -> String {
+    let mut topic = format!("[任务 {}] {}\n描述：{}\n", t.id, t.title, t.description);
+    let notes: Vec<String> = t
+        .history
+        .iter()
+        .rev()
+        .filter_map(|h| h.note.clone())
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if !notes.is_empty() {
+        topic.push_str(&format!("\n【执行与审查记录】\n{}", notes.join("\n---\n")));
+    }
+    tail_chars(&topic, 4000)
+}
+
+/// 进入 merging/done 时后台执行对应 workflow（merge / task_archive）。
+/// 结果记入任务历史（actor=workflow 名），**不改变状态**——merging→done
+/// 的推进与 commit 动作仍由人完成。task_archive 额外把产出写入
+/// `.latte/tasks/archive/<id>.md`。
+fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
+    let b = b.clone();
+    let id = id.to_string();
+    let wf_name = wf_name.to_string();
+    tokio::spawn(async move {
+        let wf = match load_workflow(&wf_name, &b.cwd) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[tasks] lifecycle hook load {wf_name}: {e}");
+                return;
+            }
+        };
+        // 事件通道：复用最后一次 run 的 session（对话里连续可见），
+        // 没有则新建一个观察 session。
+        let last_session = {
+            let store = b.tasks.read();
+            store
+                .get(&id)
+                .and_then(|t| t.runs.last().map(|r| r.session_id.clone()))
+        };
+        let event_tx = match &last_session {
+            Some(sid) => match api::session_event_sender(&b, sid).await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    eprintln!("[tasks] hook session sender {sid}: {}", e.message);
+                    return;
+                }
+            },
+            None => {
+                let info = match api::create_session(&b).await {
+                    Ok(i) => i,
+                    Err(e) => {
+                        eprintln!("[tasks] hook create session: {}", e.message);
+                        return;
+                    }
+                };
+                let _ = api::set_session_label(&b, &info.session_id, &format!("[{id}] {wf_name}"));
+                match api::session_event_sender(&b, &info.session_id).await {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        eprintln!("[tasks] hook new session sender: {}", e.message);
+                        return;
+                    }
+                }
+            }
+        };
+        let ctx = WorkflowRunContext {
+            merged: Arc::new(b.merged.read().clone()),
+            resolver: b.resolver.clone(),
+            default_params: GenerateParams::default(),
+            cwd: b.cwd.clone(),
+            event_tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        };
+        let result = run_workflow(&wf, &topic, &ctx).await;
+        let mut store = b.tasks.write();
+        if let Some(t) = store.get_mut(&id) {
+            let note = match &result {
+                Ok(s) => format!("{wf_name}：{}", tail_chars(s, 500)),
+                Err(e) => format!("{wf_name} 未完成：{}", tail_chars(e, 300)),
+            };
+            let now = now_ms();
+            t.history.push(HistoryEntry {
+                at: now,
+                from: None,
+                to: t.state.clone(),
+                actor: wf_name.clone(),
+                note: Some(note),
+            });
+            t.updated_at = now;
+        }
+        if wf_name == "task_archive" {
+            if let Ok(record) = &result {
+                let adir = store.dir.join("archive");
+                if let Err(e) = std::fs::create_dir_all(&adir)
+                    .and_then(|_| std::fs::write(adir.join(format!("{id}.md")), record))
+                {
+                    eprintln!("[tasks] write archive {id}.md: {e}");
+                }
+            }
+        }
+        if let Err(e) = store.persist(&id) {
+            eprintln!("[tasks] persist {id} after hook {wf_name}: {e}");
+        }
+    });
 }
 
 /// 派发消息模板（中文；文档 §5 以本函数为准）。
@@ -613,9 +939,14 @@ fn build_dispatch_message(
 /// `POST /api/tasks/:id/dispatch` — 立即执行（或 rework 重新派发）：
 /// 新建 ui-session → 打 label → 发首条消息给 manager →
 /// state → in_progress，runs 追加一条。`actor` ∈ `user` / `scheduler`。
+///
+/// 绑定了 workflow 的任务（`task.workflow = Some`）不发 manager 消息：
+/// 直接在该 session 上跑 `run_workflow`（事件进 session 的 broadcast，
+/// SSE/归档照常可见），后台跑完后按 report 语义自动迁移状态
+/// （actor=workflow，见 [`apply_workflow_finish`]）。
 pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskView, ApiError> {
     // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
-    let (title, priority, description, children) = {
+    let (title, priority, description, children, workflow, prev_state, recent_notes) = {
         let store = b.tasks.read();
         let t = store
             .get(id)
@@ -626,22 +957,70 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
                 t.state
             )));
         }
+        // 同家族（父 + 兄弟）互斥：plan 拆出的兄弟任务常改同一批文件，
+        // 并行执行会互相覆盖（自优化实测发现的问题 3）。
+        if let Some(running_id) = family_running_conflict(&store, id) {
+            return Err(ApiError {
+                status: 409,
+                message: format!(
+                    "同族任务 {running_id} 正在执行中，为避免冲突请等它完成后再派发"
+                ),
+            });
+        }
+        // 最近的反馈记录（code_review 终审 / workflow 回报），rework 时喂给返工流。
+        let notes: Vec<String> = t
+            .history
+            .iter()
+            .rev()
+            .filter_map(|h| h.note.clone())
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         (
             t.title.clone(),
             t.priority,
             t.description.clone(),
             store.children_of(id),
+            t.workflow.clone(),
+            t.state.clone(),
+            notes,
         )
     };
 
-    // 2. 建 session + label + 首条消息。任何一步失败都不改任务状态。
+    // 2. 建 session + label。任何一步失败都不改任务状态。
     let info = api::create_session(b).await?;
     let label = format!("[{id}] {}", title.chars().take(20).collect::<String>());
     api::set_session_label(b, &info.session_id, &label)?;
-    let msg = build_dispatch_message(id, &title, priority, &description, &children);
-    api::chat_send(b, Some(&info.session_id), &msg).await?;
+    let base_msg = build_dispatch_message(id, &title, priority, &description, &children);
 
-    // 3. 写锁更新状态（任务可能已被并发删除 → 404，session 留着无害）。
+    // 3. workflow 绑定分支：加载 workflow 并准备运行上下文；加载失败
+    //    → 400（不回退到 manager 派发，也不改任务状态）。非绑定任务
+    //    走经典路径：发首条消息给 manager。
+    //    rework 状态改用 rework 返工流（带审查反馈），而不是原样重跑开发流。
+    let wf_run = if let Some(bound_name) = &workflow {
+        let (wf_name, msg) = if prev_state == "rework" {
+            let feedback = if recent_notes.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n【审查反馈与执行历史】\n{}", recent_notes.join("\n---\n"))
+            };
+            ("rework".to_string(), format!("{base_msg}{feedback}"))
+        } else {
+            (bound_name.clone(), base_msg.clone())
+        };
+        let wf = load_workflow(&wf_name, &b.cwd).map_err(|e| {
+            ApiError::bad_request(format!("workflow '{wf_name}' 加载失败：{e}"))
+        })?;
+        let event_tx = api::session_event_sender(b, &info.session_id).await?;
+        Some((wf, event_tx, Arc::new(AtomicBool::new(false)), msg))
+    } else {
+        api::chat_send(b, Some(&info.session_id), &base_msg).await?;
+        None
+    };
+
+    // 4. 写锁更新状态（任务可能已被并发删除 → 404，session 留着无害）。
     let now = now_ms();
     let mut store = b.tasks.write();
     {
@@ -658,9 +1037,220 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
         });
         t.updated_at = now;
     }
+    // 取消旗标与状态迁移同一把写锁登记：abort 永远不会先于登记看到
+    // in_progress。
+    if let Some((_, _, cancel, _)) = &wf_run {
+        store.register_workflow_cancel(id, cancel.clone());
+    }
     store.persist(id).map_err(ApiError::internal)?;
-    let t = store.get(id).expect("刚 persist 的任务必然存在");
-    Ok(store.view(t))
+    let view = store.view(store.get(id).expect("刚 persist 的任务必然存在"));
+    drop(store);
+
+    // 5. 后台跑 workflow（不阻塞 HTTP 响应），跑完自动回报。
+    if let Some((wf, event_tx, cancel, msg)) = wf_run {
+        let b2 = b.clone();
+        let task_id = id.to_string();
+        let msg2 = msg.clone();
+        tokio::spawn(async move {
+            let ctx = WorkflowRunContext {
+                merged: Arc::new(b2.merged.read().clone()),
+                resolver: b2.resolver.clone(),
+                default_params: GenerateParams::default(),
+                cwd: b2.cwd.clone(),
+                event_tx: event_tx.clone(),
+                cancel_flag: cancel.clone(),
+            };
+            let result = run_workflow(&wf, &msg2, &ctx).await;
+            // 开发流跑完（非 code_review 本身）→ 链式自动审查。
+            let chain_review = result.is_ok() && wf.name != "code_review";
+            let dev_summary = result.as_ref().ok().cloned().unwrap_or_default();
+            finish_workflow_run(&b2, &task_id, result, &cancel);
+            if chain_review {
+                chain_code_review(&b2, &task_id, msg2, dev_summary, event_tx).await;
+            }
+        });
+    }
+    Ok(view)
+}
+
+/// 开发 workflow 跑完（→ human_review）后，在同一 session 自动执行
+/// code_review 审查流：机器审查在人工把关之前给出终审意见。
+/// 审查结果只记入任务历史（actor=code_review），**不改变状态**——
+/// 最终 approve/reject 仍由人做。任务已被人工移出 human_review 时
+/// 跳过审查。
+async fn chain_code_review(
+    b: &UiBackend,
+    id: &str,
+    dispatch_msg: String,
+    dev_summary: String,
+    event_tx: tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent>,
+) {
+    let in_review = {
+        let store = b.tasks.read();
+        store.get(id).map(|t| t.state == "human_review").unwrap_or(false)
+    };
+    if !in_review {
+        return;
+    }
+    let wf = match load_workflow("code_review", &b.cwd) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[tasks] chain code_review load: {e}");
+            return;
+        }
+    };
+    let topic = format!(
+        "{dispatch_msg}\n\n【执行摘要】\n{}",
+        tail_chars(&dev_summary, 1500)
+    );
+    let ctx = WorkflowRunContext {
+        merged: Arc::new(b.merged.read().clone()),
+        resolver: b.resolver.clone(),
+        default_params: GenerateParams::default(),
+        cwd: b.cwd.clone(),
+        event_tx,
+        cancel_flag: Arc::new(AtomicBool::new(false)),
+    };
+    let result = run_workflow(&wf, &topic, &ctx).await;
+    let mut store = b.tasks.write();
+    if let Some(t) = store.get_mut(id) {
+        let note = match &result {
+            Ok(s) => format!("code_review 终审：{}", tail_chars(s, 500)),
+            Err(e) => format!("code_review 未完成：{}", tail_chars(e, 300)),
+        };
+        let now = now_ms();
+        // 终审 ❌（不通过）且任务仍在 human_review → 自动打回 rework，
+        // 带着审查反馈；✅/⚠️ 保持 human_review 由人把关。
+        let auto_rework = matches!(&result, Ok(s) if verdict_is_reject(s))
+            && t.state == "human_review";
+        if auto_rework {
+            t.set_state("rework", "code_review", Some(note), now);
+        } else {
+            t.history.push(HistoryEntry {
+                at: now,
+                from: None,
+                to: t.state.clone(),
+                actor: "code_review".into(),
+                note: Some(note),
+            });
+        }
+        t.updated_at = now;
+        if let Err(e) = store.persist(id) {
+            eprintln!("[tasks] persist {id} after code_review: {e}");
+        }
+    }
+}
+
+/// 判定 code_review 终审结论是否为"不通过"（❌）。
+/// 终审 prompt 约定裁决在输出开头（✅/⚠️/❌），只看前 200 字符——
+/// 避免意见表格里出现的 ❌ 误触发（⚠️ 有条件通过不打回）。
+fn verdict_is_reject(summary: &str) -> bool {
+    summary.chars().take(200).collect::<String>().contains('❌')
+}
+
+/// 状态变更后的家族联动：子任务全部 done → 父任务自动 done
+/// （actor=workflow，附说明）。有子任务 cancelled 或仍非 done → 不动，
+/// 由人决定。父子最多一层嵌套，不会递归。
+fn maybe_complete_parent(store: &mut TaskStore, child: &Task, now: i64) {
+    let Some(parent_id) = child.parent_id.clone() else {
+        return;
+    };
+    let children = store.children_of(&parent_id);
+    if children.is_empty() || !children.iter().all(|c| c.state == "done") {
+        return;
+    }
+    if let Some(p) = store.get_mut(&parent_id) {
+        if p.state != "done" {
+            p.set_state("done", "workflow", Some("全部子任务已完成".into()), now);
+            p.updated_at = now;
+            if let Err(e) = store.persist(&parent_id) {
+                eprintln!("[tasks] persist parent {parent_id}: {e}");
+            }
+        }
+    }
+}
+
+/// 同家族互斥检查：plan 拆出的兄弟任务常改同一批文件，并行执行会
+/// 互相覆盖。家族 = 父任务 + 其全部子任务。返回冲突中的 in_progress
+/// 任务 id（无冲突 → None）。
+fn family_running_conflict(store: &TaskStore, id: &str) -> Option<String> {
+    let t = store.get(id)?;
+    let family_ids: Vec<String> = match &t.parent_id {
+        Some(pid) => {
+            let mut v: Vec<String> = store.children_of(pid).into_iter().map(|c| c.id).collect();
+            v.push(pid.clone());
+            v
+        }
+        None => store.children_of(id).into_iter().map(|c| c.id).collect(),
+    };
+    family_ids.into_iter().find(|fid| {
+        fid != id && store.get(fid).map(|c| c.state == "in_progress").unwrap_or(false)
+    })
+}
+
+/// 截取尾部至多 n 个字符（workflow 摘要取末尾：结论通常在最后）。
+fn tail_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.len().saturating_sub(n);
+    chars[start..].iter().collect()
+}
+
+/// workflow run 结束时的任务状态迁移（actor=workflow）：
+/// Ok → completed → human_review（摘要取末尾 500 字符）；Err →
+/// failed → todo；观察到 cancel → aborted → todo。run 已被
+/// abort_task 收尾（ended_at 已填）时不动状态（返回 Ok 让调用方
+/// 照常清理取消旗标）。
+fn apply_workflow_finish(
+    store: &mut TaskStore,
+    id: &str,
+    result: Result<String, String>,
+    cancelled: bool,
+    now: i64,
+) -> Result<(), String> {
+    let t = store.get_mut(id).ok_or_else(|| format!("task {id:?} 不存在"))?;
+    if t.runs.last().filter(|r| r.ended_at.is_none()).is_none() {
+        return Ok(());
+    }
+    let (res, summary) = match (result, cancelled) {
+        (Ok(s), false) => ("completed", tail_chars(&s, 500)),
+        (Ok(_), true) => ("aborted", String::new()),
+        (Err(e), false) => ("failed", tail_chars(&e, 500)),
+        (Err(e), true) => ("aborted", tail_chars(&e, 500)),
+    };
+    {
+        let run = t.runs.last_mut().expect("刚校验过有未结束 run");
+        run.ended_at = Some(now);
+        run.result = Some(res.to_string());
+    }
+    let next = if res == "completed" { "human_review" } else { "todo" };
+    let note = if summary.trim().is_empty() {
+        None
+    } else {
+        Some(summary)
+    };
+    t.set_state(next, "workflow", note, now);
+    t.updated_at = now;
+    Ok(())
+}
+
+/// 后台 workflow 跑完后的收尾：迁移状态 + 落盘 + 清取消旗标。
+/// 任务已被删 / persist 失败只记日志（都是正常竞态或锦上添花）。
+fn finish_workflow_run(
+    b: &UiBackend,
+    id: &str,
+    result: Result<String, String>,
+    cancel: &Arc<AtomicBool>,
+) {
+    let cancelled = cancel.load(Ordering::SeqCst);
+    let mut store = b.tasks.write();
+    store.take_workflow_cancel(id);
+    if let Err(e) = apply_workflow_finish(&mut store, id, result, cancelled, now_ms()) {
+        eprintln!("[tasks] workflow finish {id}: {e}");
+        return;
+    }
+    if let Err(e) = store.persist(id) {
+        eprintln!("[tasks] persist {id} after workflow finish: {e}");
+    }
 }
 
 /// `POST /api/tasks/:id/abort` — 中止执行：对当前 run 的 session 调
@@ -684,8 +1274,17 @@ pub async fn abort_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
             .ok_or_else(|| ApiError::bad_request("没有进行中的 run"))?
     };
 
-    // session 可能已被用户删掉：中止失败不阻塞任务状态回退。
-    let _ = api::chat_abort(b, Some(&session_id)).await;
+    // workflow run：置取消旗标（run_workflow 在下一个 step/speaker
+    // 边界退出，随后 finish_workflow_run 看到 run 已被下方收尾便不再
+    // 重复迁移）。workflow 不占 chat turn，chat_abort 只会误杀托管
+    // session 的 controller，故跳过。经典 run 维持原语义：session
+    // 可能已被用户删掉，中止失败不阻塞任务状态回退。
+    let wf_cancel = b.tasks.write().take_workflow_cancel(id);
+    if let Some(flag) = wf_cancel {
+        flag.store(true, Ordering::SeqCst);
+    } else {
+        let _ = api::chat_abort(b, Some(&session_id)).await;
+    }
 
     let now = now_ms();
     let mut store = b.tasks.write();
@@ -817,7 +1416,7 @@ mod tests {
 
     fn make_task(store: &mut TaskStore, title: &str) -> Task {
         store
-            .create(title, "desc", 2, vec![], None, None)
+            .create(title, "desc", 2, vec![], None, None, None, "user")
             .expect("create")
     }
 
@@ -872,18 +1471,18 @@ mod tests {
         let (_dir, mut store) = tmp_store();
         let parent = make_task(&mut store, "父");
         let child = store
-            .create("子", "", 3, vec![], Some(parent.id.clone()), None)
+            .create("子", "", 3, vec![], Some(parent.id.clone()), None, None, "user")
             .expect("create child");
         assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
         assert_eq!(child.sub_order, 0);
         // parent 必须存在。
         let err = store
-            .create("孤儿", "", 3, vec![], Some("LAT-999".into()), None)
+            .create("孤儿", "", 3, vec![], Some("LAT-999".into()), None, None, "user")
             .unwrap_err();
         assert!(err.contains("不存在"), "{err}");
         // 拒绝第二层嵌套：parent_id 指向本身也是子任务的任务。
         let err = store
-            .create("孙", "", 3, vec![], Some(child.id.clone()), None)
+            .create("孙", "", 3, vec![], Some(child.id.clone()), None, None, "user")
             .unwrap_err();
         assert!(err.contains("最多一层"), "{err}");
         // 拒绝给已有子任务的任务设 parent。
@@ -892,7 +1491,7 @@ mod tests {
         assert!(err.is_err(), "已有子任务的任务不能再设 parent: {err:?}");
         // sub_order 递增。
         let child2 = store
-            .create("子2", "", 3, vec![], Some(parent.id.clone()), None)
+            .create("子2", "", 3, vec![], Some(parent.id.clone()), None, None, "user")
             .expect("child2");
         assert_eq!(child2.sub_order, 1);
         // 聚合。
@@ -931,17 +1530,17 @@ mod tests {
         let now = now_ms();
         // 到期 todo
         let due = store
-            .create("到期", "", 3, vec![], None, Some(now - 1000))
+            .create("到期", "", 3, vec![], None, Some(now - 1000), None, "user")
             .unwrap();
         store.get_mut(&due.id).unwrap().set_state("todo", "user", None, now);
         // 未到期 todo
         let future = store
-            .create("未到期", "", 3, vec![], None, Some(now + 60_000))
+            .create("未到期", "", 3, vec![], None, Some(now + 60_000), None, "user")
             .unwrap();
         store.get_mut(&future.id).unwrap().set_state("todo", "user", None, now);
         // backlog 且已到期（不应选出：只派 todo）
         store
-            .create("backlog到期", "", 3, vec![], None, Some(now - 1000))
+            .create("backlog到期", "", 3, vec![], None, Some(now - 1000), None, "user")
             .unwrap();
         store.persist(&due.id).unwrap();
         store.persist(&future.id).unwrap();
@@ -968,5 +1567,352 @@ mod tests {
         // 重新加载不应恢复已归档任务。
         let store2 = TaskStore::load(dir.path()).expect("reload");
         assert!(store2.get(&t.id).is_none());
+    }
+
+    // ─── workflow 绑定 + 导入 ──────────────────────────────────────
+
+    /// 旧落盘文件（无 `workflow` 字段）必须能反序列化 → None。
+    #[test]
+    fn task_without_workflow_field_deserializes() {
+        let raw = r#"{
+            "schema": 1,
+            "id": "LAT-100",
+            "title": "旧任务",
+            "priority": 3,
+            "state": "backlog",
+            "created_at": 1,
+            "updated_at": 1
+        }"#;
+        let t: Task = serde_json::from_str(raw).expect("parse old task json");
+        assert_eq!(t.workflow, None);
+        assert_eq!(t.description, "");
+        assert!(t.labels.is_empty());
+    }
+
+    /// TaskPatch.workflow 双层 Option：缺省 = 不变，null = 解绑，字符串 = 绑定。
+    #[test]
+    fn patch_workflow_double_option_semantics() {
+        let p: TaskPatch = serde_json::from_str("{}").expect("empty patch");
+        assert!(p.workflow.is_none(), "缺省 = 不变");
+        let p: TaskPatch = serde_json::from_str(r#"{"workflow": null}"#).expect("null patch");
+        assert_eq!(p.workflow, Some(None), "null = 解绑");
+        let p: TaskPatch =
+            serde_json::from_str(r#"{"workflow": "tdd_development"}"#).expect("set patch");
+        assert_eq!(
+            p.workflow,
+            Some(Some("tdd_development".to_string())),
+            "字符串 = 绑定"
+        );
+    }
+
+    /// 项目 `.latte/workflows.d/<name>.toml` fixture（名字必须满足
+    /// workflow 命名规则，内容是合法 WorkflowDef）。
+    fn write_workflow_fixture(cwd: &Path, name: &str) {
+        let dir = cwd.join(".latte/workflows.d");
+        std::fs::create_dir_all(&dir).expect("mkdir workflows.d");
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\ndescription = \"test\"\n[[steps]]\nid = \"s\"\nspeakers = [\"pm\"]\nprompt = \"do {{{{topic}}}}\"\n"
+            ),
+        )
+        .expect("write workflow fixture");
+    }
+
+    #[test]
+    fn import_creates_parents_and_children() {
+        let (dir, mut store) = tmp_store();
+        write_workflow_fixture(dir.path(), "tdd_development");
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                {
+                    "title": "父任务",
+                    "description": "d",
+                    "priority": 1,
+                    "labels": ["a", "b"],
+                    "workflow": "tdd_development",
+                    "subtasks": [
+                        { "title": "子一" },
+                        { "title": "子二", "priority": 4 }
+                    ]
+                },
+                { "title": "独立任务" }
+            ]
+        }))
+        .expect("parse import request");
+        let created =
+            import_tasks_into(&mut store, dir.path(), &req).expect("import should succeed");
+        assert_eq!(created, vec!["LAT-100", "LAT-101", "LAT-102", "LAT-103"]);
+        let parent = store.get("LAT-100").expect("parent");
+        assert_eq!(parent.state, "backlog");
+        assert_eq!(parent.priority, 1);
+        assert_eq!(parent.labels, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(parent.workflow.as_deref(), Some("tdd_development"));
+        assert_eq!(parent.history[0].actor, "import");
+        let c1 = store.get("LAT-101").expect("child1");
+        let c2 = store.get("LAT-102").expect("child2");
+        assert_eq!(c1.parent_id.as_deref(), Some("LAT-100"));
+        assert_eq!(c1.sub_order, 0);
+        assert_eq!(c2.parent_id.as_deref(), Some("LAT-100"));
+        assert_eq!(c2.sub_order, 1);
+        assert_eq!(c2.priority, 4);
+        assert_eq!(c1.state, "backlog");
+        // 缺省字段：priority 3、无 workflow、无 labels。
+        let solo = store.get("LAT-103").expect("solo");
+        assert_eq!(solo.priority, 3);
+        assert_eq!(solo.workflow, None);
+    }
+
+    #[test]
+    fn import_rejects_empty_title() {
+        let (dir, mut store) = tmp_store();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": "  " }]
+        }))
+        .expect("parse");
+        let err = import_tasks_into(&mut store, dir.path(), &req).unwrap_err();
+        assert!(err.contains("title 不能为空"), "{err}");
+        assert!(store.list().is_empty(), "失败不应留下任务");
+    }
+
+    #[test]
+    fn import_rejects_bad_priority() {
+        let (dir, mut store) = tmp_store();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": "ok" }, { "title": "坏优先级", "priority": 9 }]
+        }))
+        .expect("parse");
+        let err = import_tasks_into(&mut store, dir.path(), &req).unwrap_err();
+        assert!(err.contains("坏优先级"), "{err}");
+        assert!(err.contains("priority"), "{err}");
+        // 已创建的 id 要出现在错误消息里（部分导入可见）。
+        assert!(err.contains("LAT-100"), "{err}");
+        assert!(store.get("LAT-100").is_some(), "第一个任务已创建");
+        assert!(store.get("LAT-101").is_none(), "失败的任务未创建");
+    }
+
+    #[test]
+    fn import_rejects_two_level_nesting() {
+        let (dir, mut store) = tmp_store();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{
+                "title": "父",
+                "subtasks": [{ "title": "子", "subtasks": [{ "title": "孙" }] }]
+            }]
+        }))
+        .expect("parse");
+        let err = import_tasks_into(&mut store, dir.path(), &req).unwrap_err();
+        assert!(
+            err.contains("subtasks nested deeper than one level"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn import_rejects_unknown_workflow() {
+        let (dir, mut store) = tmp_store();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": "x", "workflow": "no_such_wf_xyz" }]
+        }))
+        .expect("parse");
+        let err = import_tasks_into(&mut store, dir.path(), &req).unwrap_err();
+        assert!(err.contains("unknown workflow 'no_such_wf_xyz'"), "{err}");
+    }
+
+    /// 标题超过 80 字符截断而非报错。
+    #[test]
+    fn import_truncates_long_title() {
+        let (dir, mut store) = tmp_store();
+        let long = "题".repeat(100);
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": long }]
+        }))
+        .expect("parse");
+        let created = import_tasks_into(&mut store, dir.path(), &req).expect("import");
+        let t = store.get(&created[0]).expect("task");
+        assert_eq!(t.title.chars().count(), 80);
+    }
+
+    // ─── workflow 跑完后的自动状态迁移（apply_workflow_finish） ──────
+
+    /// 造一个 in_progress、带一条未结束 run 的任务。
+    fn make_running_task(store: &mut TaskStore, title: &str) -> Task {
+        let t = make_task(store, title);
+        let now = now_ms();
+        {
+            let t = store.get_mut(&t.id).unwrap();
+            t.set_state("in_progress", "user", None, now);
+            t.runs.push(TaskRun {
+                session_id: "ui-test".into(),
+                started_at: now,
+                ended_at: None,
+                result: None,
+            });
+        }
+        store.persist(&t.id).unwrap();
+        store.get(&t.id).unwrap().clone()
+    }
+
+    #[test]
+    fn workflow_finish_ok_moves_to_human_review() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_running_task(&mut store, "wf 成功");
+        let summary = format!("{}结论", "x".repeat(600));
+        apply_workflow_finish(&mut store, &t.id, Ok(summary), false, now_ms()).expect("finish");
+        let t = store.get(&t.id).unwrap();
+        assert_eq!(t.state, "human_review");
+        let run = t.runs.last().unwrap();
+        assert!(run.ended_at.is_some());
+        assert_eq!(run.result.as_deref(), Some("completed"));
+        // 摘要取末尾 500 字符，history actor = workflow。
+        let h = t.history.last().unwrap();
+        assert_eq!(h.actor, "workflow");
+        assert_eq!(h.to, "human_review");
+        let note = h.note.as_deref().expect("note");
+        assert_eq!(note.chars().count(), 500);
+        assert!(note.ends_with("结论"));
+    }
+
+    #[test]
+    fn workflow_finish_err_moves_back_to_todo() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_running_task(&mut store, "wf 失败");
+        apply_workflow_finish(&mut store, &t.id, Err("boom".into()), false, now_ms())
+            .expect("finish");
+        let t = store.get(&t.id).unwrap();
+        assert_eq!(t.state, "todo");
+        let run = t.runs.last().unwrap();
+        assert!(run.ended_at.is_some());
+        assert_eq!(run.result.as_deref(), Some("failed"));
+        let h = t.history.last().unwrap();
+        assert_eq!(h.actor, "workflow");
+        assert_eq!(h.note.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn workflow_finish_cancelled_marks_aborted() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_running_task(&mut store, "wf 取消");
+        apply_workflow_finish(&mut store, &t.id, Err("cancelled".into()), true, now_ms())
+            .expect("finish");
+        let t = store.get(&t.id).unwrap();
+        assert_eq!(t.state, "todo");
+        assert_eq!(t.runs.last().unwrap().result.as_deref(), Some("aborted"));
+    }
+
+    /// abort_task 已先收尾（run 已 ended、state 已回 todo）时，
+    /// finish 不得再次迁移状态。
+    // ─── 父子联动 + 家族互斥 ─────────────────────────────────────
+
+    fn make_child(store: &mut TaskStore, parent: &Task, title: &str) -> Task {
+        store
+            .create(title, "desc", 2, vec![], Some(parent.id.clone()), None, None, "user")
+            .expect("create child")
+    }
+
+    #[test]
+    fn parent_completes_when_all_children_done() {
+        let (_dir, mut store) = tmp_store();
+        let p = make_task(&mut store, "父任务");
+        let c1 = make_child(&mut store, &p, "子1");
+        let c2 = make_child(&mut store, &p, "子2");
+        let now = now_ms();
+        for c in [&c1, &c2] {
+            store
+                .get_mut(&c.id)
+                .unwrap()
+                .set_state("done", "user", None, now);
+            let snap = store.get(&c.id).unwrap().clone();
+            maybe_complete_parent(&mut store, &snap, now);
+        }
+        let p = store.get(&p.id).unwrap();
+        assert_eq!(p.state, "done", "全部子任务 done 后父任务应自动完成");
+        assert_eq!(p.history.last().unwrap().actor, "workflow");
+    }
+
+    #[test]
+    fn parent_stays_when_child_cancelled_or_pending() {
+        let (_dir, mut store) = tmp_store();
+        let p = make_task(&mut store, "父任务");
+        let c1 = make_child(&mut store, &p, "子1");
+        let c2 = make_child(&mut store, &p, "子2");
+        let now = now_ms();
+        store
+            .get_mut(&c1.id)
+            .unwrap()
+            .set_state("done", "user", None, now);
+        store
+            .get_mut(&c2.id)
+            .unwrap()
+            .set_state("cancelled", "user", None, now);
+        let snap = store.get(&c2.id).unwrap().clone();
+        maybe_complete_parent(&mut store, &snap, now);
+        assert_eq!(store.get(&p.id).unwrap().state, "backlog", "有 cancelled 子任务不得自动完成");
+    }
+
+    #[test]
+    fn family_conflict_detects_running_sibling_and_parent() {
+        let (_dir, mut store) = tmp_store();
+        let p = make_task(&mut store, "父任务");
+        let c1 = make_child(&mut store, &p, "子1");
+        let c2 = make_child(&mut store, &p, "子2");
+        // 兄弟 in_progress → c2 冲突
+        store
+            .get_mut(&c1.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert_eq!(family_running_conflict(&store, &c2.id).as_deref(), Some(c1.id.as_str()));
+        // 兄弟空闲 → 无冲突
+        store
+            .get_mut(&c1.id)
+            .unwrap()
+            .set_state("todo", "user", None, now_ms());
+        assert!(family_running_conflict(&store, &c2.id).is_none());
+        // 父 in_progress → 子也冲突；子在跑 → 父 dispatch 也冲突
+        store
+            .get_mut(&p.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert_eq!(family_running_conflict(&store, &c2.id).as_deref(), Some(p.id.as_str()));
+        store
+            .get_mut(&p.id)
+            .unwrap()
+            .set_state("todo", "user", None, now_ms());
+        store
+            .get_mut(&c1.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert_eq!(family_running_conflict(&store, &p.id).as_deref(), Some(c1.id.as_str()));
+    }
+
+    #[test]
+    fn verdict_is_reject_checks_head_only() {
+        assert!(verdict_is_reject("## 裁决\n\n❌ 不通过\n\n## 理由\n…"));
+        assert!(!verdict_is_reject("## 裁决\n\n✅ 通过"));
+        assert!(!verdict_is_reject("## 裁决\n\n⚠️ 有条件通过"));
+        // 意见表格里的 ❌ 出现在 200 字符之后 → 不误判
+        let head = "## 裁决\n\n⚠️ 有条件通过\n".to_string() + &"x".repeat(300);
+        assert!(!verdict_is_reject(&format!("{head}\n| 问题 | ❌ |")));
+    }
+
+    #[test]
+    fn workflow_finish_after_abort_is_noop() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_running_task(&mut store, "wf 竞态");
+        let now = now_ms();
+        {
+            let t = store.get_mut(&t.id).unwrap();
+            let run = t.runs.last_mut().unwrap();
+            run.ended_at = Some(now);
+            run.result = Some("aborted".into());
+            t.set_state("todo", "user", Some("中止执行".into()), now);
+        }
+        let history_len = store.get(&t.id).unwrap().history.len();
+        apply_workflow_finish(&mut store, &t.id, Ok("late success".into()), false, now_ms())
+            .expect("finish");
+        let t = store.get(&t.id).unwrap();
+        assert_eq!(t.state, "todo", "不得覆盖 abort 的回退");
+        assert_eq!(t.runs.last().unwrap().result.as_deref(), Some("aborted"));
+        assert_eq!(t.history.len(), history_len, "不得追加 history");
     }
 }

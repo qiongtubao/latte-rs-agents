@@ -451,6 +451,7 @@ max_tokens = 8192\n\
             max_tokens: 4096,
             supports_thinking: false,
             supports_vision: true,
+            supports_image_generation: false,
             cost_per_million_input: Some(2.5),
             cost_per_million_output: Some(10.0),
             tier: Some("premium".into()),

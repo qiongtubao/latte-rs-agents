@@ -747,6 +747,16 @@ pub(crate) async fn create_task(
         .map_err(Into::into)
 }
 
+/// `POST /api/tasks/import` —— 批量导入（含一层子任务）。
+pub(crate) async fn import_tasks(
+    State(state): State<AppState>,
+    Json(req): Json<crate::tasks::ImportTasksRequest>,
+) -> Result<Json<crate::tasks::ImportTasksResponse>, (StatusCode, String)> {
+    crate::tasks::import_tasks(&state.backend, req)
+        .map(Json)
+        .map_err(Into::into)
+}
+
 /// `GET /api/tasks/:id` —— 详情。
 pub(crate) async fn get_task(
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -809,4 +819,38 @@ pub(crate) async fn delete_task(
     crate::tasks::delete_task(&state.backend, &id)
         .map(|_| StatusCode::OK)
         .map_err(Into::into)
+}
+
+// ─── Images（generate_image 工具产物，HTTP 特有：直接吐字节） ─────
+
+/// `GET /api/images/:file` —— 伺服 `<cwd>/.latte/images/<file>`。
+///
+/// generate_image 工具把图落盘到该目录并通过
+/// `ChatEvent::ImageGenerated { path: "/api/images/<file>" }` 通知 UI；
+/// web UI 直接 `<img src>` 渲染。防目录穿越：拒绝任何含 `/`、`\`、
+/// `..` 的文件名（路由参数本身不含 `/`，这里是纵深防御）。
+pub(crate) async fn get_image(
+    axum::extract::Path(file): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    if file.contains('/') || file.contains('\\') || file.contains("..") {
+        return Err((StatusCode::BAD_REQUEST, "invalid image name".to_string()));
+    }
+    let path = state.backend.cwd.join(".latte/images").join(&file);
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "image not found".to_string()))?;
+    let content_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    };
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], bytes))
 }

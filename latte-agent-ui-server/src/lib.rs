@@ -454,6 +454,7 @@ fn build_router(state: AppState) -> Router {
         .route("/roles/:id/toml", get(get_role_toml).put(put_role_toml))
         // 任务看板（docs/task-board-design.md §6）
         .route("/tasks", get(list_tasks).post(create_task))
+        .route("/tasks/import", post(import_tasks))
         .route(
             "/tasks/:id",
             get(get_task)
@@ -472,7 +473,9 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/workflows/:name",
             get(get_workflow_h).put(update_workflow_h).delete(delete_workflow_h),
-        );
+        )
+        // generate_image 工具产物：.latte/images/<file> 的字节伺服。
+        .route("/images/:file", get(get_image));
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);
@@ -555,6 +558,7 @@ mod tests {
                 tools: vec![],
                 icon: "[m]".into(),
                 skills: vec![],
+            code_paths: vec![],
             },
         );
         let resolver = ModelResolver::from_config(&agent_config).expect("resolver");
@@ -677,6 +681,7 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
                     tier: Some("standard".into()),
@@ -698,6 +703,7 @@ mod tests {
                     tools: vec![],
                     icon: "[m]".into(),
                     skills: vec![],
+            code_paths: vec![],
                 },
             )]
             .into_iter()
