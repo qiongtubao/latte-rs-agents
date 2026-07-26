@@ -1,24 +1,35 @@
+# Workflow: code_review
+# 代码审查：变更说明 → 审查 → 回应 → 终审。
+# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
+# 也是任务看板 human_review 阶段自动执行的审查流程。
+
 name = "code_review"
-description = "多角度代码审查：覆盖安全、风格与逻辑。"
+description = "代码审查：变更说明 → 多角度审查 → 回应 → 终审"
 max_rounds = 1
 
 [[steps]]
 id = "explain"
+description = "变更说明"
 speakers = ["programmer"]
-prompt = "解释 {{code_path}} 处的代码变更。改了什么，为什么改？"
+output_key = "changes"
+prompt = "说明这次变更：{{topic}}。用工具读相关代码，禁止凭记忆。输出：1) 改了什么（文件/逻辑）；2) 为什么这样改；3) 爆炸半径（受影响的调用方/行为）。"
 
 [[steps]]
 id = "review"
-speakers = ["reviewer", "security", "tester"]
-prompt = "审查上面描述的代码变更。Reviewer：模式与代码质量。Security：漏洞。Tester：边界用例和测试覆盖缺口。"
+description = "多角度审查"
+speakers = ["reviewer", "tester"]
+output_key = "feedback"
+prompt = "审查这次变更：\n{{changes}}\nReviewer：设计、模式、代码质量（按 blocking/important/nit 分级）。Tester：边界用例与测试覆盖缺口。各自输出编号意见清单，每条附证据（file:line）。"
 
 [[steps]]
 id = "respond"
+description = "逐条回应"
 speakers = ["programmer"]
-prompt = "回应审查反馈。对每一条意见，要么接受并解释修复方案，要么讲清楚理由反驳。"
+output_key = "response"
+prompt = "回应审查意见：\n【变更说明】{{changes}}\n【审查意见】{{feedback}}\n对每一条意见：接受（给修复方案）或反驳（给理由）。输出逐条对应表。"
+
 [[steps]]
-# 终审：Reviewer 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
-id = "advisor_verdict"
-description = "Reviewer reviews all outputs and gives the final verdict"
+id = "verdict"
+description = "终审裁决"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"
+prompt = "终审这次变更审查：\n【变更】{{changes}}\n【意见】{{feedback}}\n【回应】{{response}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。只报告有证据、可行动的问题。"

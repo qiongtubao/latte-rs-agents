@@ -1,29 +1,34 @@
-# Workflow: tdd_development — TDD 开发
+# Workflow: tdd_development
+# TDD 开发流：测试先行 → 实现 → 验证 → 终审。
+# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
+
 name = "tdd_development"
-description = "TDD 流水线：测试先行 → 实现 → 验证 → Reviewer 终审"
+description = "TDD 开发：测试先行 → 实现 → 验证 → 终审"
 max_rounds = 1
 
 [[steps]]
 id = "tests_first"
-description = "测试工程师先写失败测试"
+description = "测试先行"
 speakers = ["tester"]
-prompt = "针对以下需求设计测试用例（TDD 先行）：{{topic}}。列出测试清单：正常路径、边界、异常路径，并给出每个用例的预期行为。"
 output_key = "test_plan"
+prompt = "为以下开发任务设计测试：{{topic}}。先读相关代码了解现状。输出：1) 测试清单（每条：场景 → 预期行为 → 为什么必须有它）；2) 关键用例的具体写法（表驱动/边界/错误路径）；3) 哪些现有测试会受影响。"
 
 [[steps]]
 id = "implement"
-description = "工程师按测试实现"
+description = "实现"
 speakers = ["programmer"]
-prompt = "基于上面的测试清单，给出「{{topic}}」的实现方案与关键代码结构，说明每条测试如何被满足。"
+output_key = "impl"
+prompt = "按测试计划实现：\n{{test_plan}}\n任务：{{topic}}。要求：1) 最小实现让测试通过，不做计划外的扩展；2) 改动说明（改了哪些文件、为什么）；3) 实现与测试计划有出入时明确说明原因。"
 
 [[steps]]
 id = "verify"
-description = "测试工程师验证覆盖"
+description = "验证"
 speakers = ["tester"]
-prompt = "检查上面的实现是否覆盖所有测试用例，指出遗漏的边界与潜在回归点。"
+output_key = "verify"
+prompt = "核验实现是否满足测试计划：\n【测试计划】{{test_plan}}\n【实现说明】{{impl}}\n逐条核验：每个计划中的测试是否真正覆盖了声称的场景？有没有漏掉的边界？输出：通过项清单 / 缺口清单（缺口 → 影响 → 补救建议）。"
 
 [[steps]]
-id = "advisor_verdict"
-description = "Reviewer 终审"
+id = "verdict"
+description = "终审"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的测试与实现讨论，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
+prompt = "终审这次 TDD 开发：\n【测试计划】{{test_plan}}\n【实现】{{impl}}\n【验证】{{verify}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。"

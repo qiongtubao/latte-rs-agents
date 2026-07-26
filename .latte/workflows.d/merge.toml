@@ -1,0 +1,28 @@
+# Workflow: merge
+# 合并准备：最终验证 → 提交包 → 终审。
+# 任务进入 merging（人工 approve）时自动执行，产出供人使用的提交包；
+# 合并动作本身由人完成。
+
+name = "merge"
+description = "合并准备：最终验证 → 提交包 → 终审"
+max_rounds = 1
+
+[[steps]]
+id = "final_check"
+description = "最终验证（跑真实测试）"
+speakers = ["tester"]
+output_key = "check"
+prompt = "合并前最终验证：{{topic}}。要求：1) 用工具跑项目的测试套件/构建命令，报告真实结果（不许声称\"应该能过\"）；2) 检查变更完整性（无 TODO/调试残留/临时文件）；3) 输出：可合并 / 不可合并 + 证据。"
+
+[[steps]]
+id = "commit_msg"
+description = "生成提交包"
+speakers = ["programmer"]
+output_key = "commit"
+prompt = "为这次变更生成提交包：\n【任务】{{topic}}\n【验证结果】{{check}}\n输出：1) commit message（遵循仓库 git log 风格：type(scope): 中文描述）；2) 变更摘要（改了什么、为什么，3-5 句）；3) 需要人注意的风险点。"
+
+[[steps]]
+id = "verdict"
+description = "终审"
+speakers = ["reviewer"]
+prompt = "终审合并准备：\n【验证】{{check}}\n【提交包】{{commit}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。重点：验证证据是否充分、提交信息是否准确反映变更。"

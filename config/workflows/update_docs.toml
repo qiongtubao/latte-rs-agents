@@ -1,23 +1,27 @@
-# Workflow: update_docs — 更新文档
+# Workflow: update_docs
+# 看代码写文档：取证分析 → 文档撰写 → 终审。
+# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
+
 name = "update_docs"
-description = "文档更新流水线：变更分析 → 文档撰写 → Reviewer 终审"
+description = "看代码写文档：取证分析 → 文档撰写 → 终审"
 max_rounds = 1
 
 [[steps]]
 id = "analyze"
-description = "工程师分析需要文档化的变更"
+description = "读代码取证"
 speakers = ["programmer"]
-prompt = "分析以下主题涉及的代码/功能现状：{{topic}}。列出需要在文档中体现的行为、接口与注意事项。"
 output_key = "facts"
+prompt = "分析主题：{{topic}}。必须用工具读相关代码/文件取证，禁止凭记忆。输出：1) 现状事实清单（每条附 file:line 证据）；2) 与文档相关的接口/行为/配置要点；3) 你不确定、需要读者注意的点。"
 
 [[steps]]
 id = "write"
-description = "技术写作者产出文档"
+description = "撰写文档"
 speakers = ["tech_writer"]
-prompt = "基于上面的事实清单，为「{{topic}}」撰写/更新文档：结构清晰、示例准确、与代码行为一致。"
+output_key = "doc"
+prompt = "基于事实材料撰写文档：\n{{facts}}\n主题：{{topic}}。要求：1) 只写材料里有证据的内容，不确定的明确标注；2) 结构：概述 → 细节 → 示例（示例取自真实代码）；3) 输出完整 markdown 文档正文。"
 
 [[steps]]
-id = "advisor_verdict"
-description = "Reviewer 终审文档"
+id = "verdict"
+description = "终审"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。检查上面的文档是否与事实清单一致、是否完整准确，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
+prompt = "终审这份文档：\n【事实材料】{{facts}}\n【文档】{{doc}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。重点核对：文档陈述是否与事实材料一致、有无无证据的断言。"

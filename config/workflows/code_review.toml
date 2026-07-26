@@ -1,106 +1,35 @@
 # Workflow: code_review
-# =============================================================================
-# A workflow defines a structured multi-agent discussion — a sequence of steps
-# where specific roles speak in order, each building on the previous output.
-#
-# Fields explained in detail below.
+# 代码审查：变更说明 → 审查 → 回应 → 终审。
+# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
+# 也是任务看板 human_review 阶段自动执行的审查流程。
 
-# Unique workflow identifier — used in CLI: `latte-agent workflow run <name>`
 name = "code_review"
-
-# Human-readable description — shown in `latte-agent list workflows`
-description = "Multi-perspective code review with security, style, and logic checks."
-
-# Maximum discussion rounds — how many times the full step sequence repeats.
-# Each round, agents can refine their answers based on the previous round.
-#   max_rounds = 1  → single pass (e.g., code review)
-#   max_rounds = 2  → two passes (e.g., brainstorm then refine)
-#   max_rounds = 3  → three passes (e.g., requirements → design → estimate)
+description = "代码审查：变更说明 → 多角度审查 → 回应 → 终审"
 max_rounds = 1
 
-# Context token budget — max tokens for the shared discussion context.
-# Older messages are summarized/truncated when the budget is exceeded.
-# Optional; defaults to a reasonable value if omitted.
-# context_token_budget = 32000
-
-# ─── Steps ───────────────────────────────────────────────────────────────────
-# Each [[steps]] block defines one turn in the discussion.
-# Steps execute in order; each step's output is visible to subsequent steps.
-
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "explain"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "变更说明"
 speakers = ["programmer"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Explain the changes in the code at: {{code_path}}. What was changed and why?"
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
+output_key = "changes"
+prompt = "说明这次变更：{{topic}}。用工具读相关代码，禁止凭记忆。输出：1) 改了什么（文件/逻辑）；2) 为什么这样改；3) 爆炸半径（受影响的调用方/行为）。"
 
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "review"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
-speakers = ["reviewer", "security", "tester"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Review the code changes described above. Reviewer: patterns and code quality. Security: vulnerabilities. Tester: edge cases and test coverage gaps."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
+description = "多角度审查"
+speakers = ["reviewer", "tester"]
+output_key = "feedback"
+prompt = "审查这次变更：\n{{changes}}\nReviewer：设计、模式、代码质量（按 blocking/important/nit 分级）。Tester：边界用例与测试覆盖缺口。各自输出编号意见清单，每条附证据（file:line）。"
 
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "respond"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "逐条回应"
 speakers = ["programmer"]
+output_key = "response"
+prompt = "回应审查意见：\n【变更说明】{{changes}}\n【审查意见】{{feedback}}\n对每一条意见：接受（给修复方案）或反驳（给理由）。输出逐条对应表。"
 
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Address the review feedback. For each point, either accept and explain the fix, or push back with reasoning."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
 [[steps]]
-# 终审：Reviewer 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
-id = "advisor_verdict"
-description = "Reviewer reviews all outputs and gives the final verdict"
+id = "verdict"
+description = "终审裁决"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"
+prompt = "终审这次变更审查：\n【变更】{{changes}}\n【意见】{{feedback}}\n【回应】{{response}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。只报告有证据、可行动的问题。"

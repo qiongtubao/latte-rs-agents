@@ -1,130 +1,34 @@
 # Workflow: bug_triage
-# =============================================================================
-# A workflow defines a structured multi-agent discussion — a sequence of steps
-# where specific roles speak in order, each building on the previous output.
-#
-# Fields explained in detail below.
+# Bug 分诊流水线：复现定界 → 根因诊断 → 修复方案 → 终审裁决。
+# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
 
-# Unique workflow identifier — used in CLI: `latte-agent workflow run <name>`
 name = "bug_triage"
-
-# Human-readable description — shown in `latte-agent list workflows`
-description = "Triage a bug report with multi-role analysis."
-
-# Maximum discussion rounds — how many times the full step sequence repeats.
-# Each round, agents can refine their answers based on the previous round.
-#   max_rounds = 1  → single pass (e.g., code review)
-#   max_rounds = 2  → two passes (e.g., brainstorm then refine)
-#   max_rounds = 3  → three passes (e.g., requirements → design → estimate)
-max_rounds = 2
-
-# Context token budget — max tokens for the shared discussion context.
-# Older messages are summarized/truncated when the budget is exceeded.
-# Optional; defaults to a reasonable value if omitted.
-# context_token_budget = 32000
-
-# ─── Steps ───────────────────────────────────────────────────────────────────
-# Each [[steps]] block defines one turn in the discussion.
-# Steps execute in order; each step's output is visible to subsequent steps.
+description = "Bug 分诊：复现定界 → 根因诊断 → 修复方案 → 终审裁决"
+max_rounds = 1
 
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
-id = "describe"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+id = "reproduce"
+description = "复现与定界"
 speakers = ["tester"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Describe the bug: {{topic}}. Include reproduction steps, expected vs actual behavior, and severity."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
+output_key = "repro"
+prompt = "分诊这个 bug：{{topic}}。输出（严格按此结构）：1) 复现步骤（可直接执行的最小序列）；2) 期望行为 vs 实际行为；3) 最小触发输入；4) 初步定级（Critical/High/Medium/Low，按爆炸半径，附一句理由）；5) 你无法复现时的不确定项。只写可验证的事实。"
 
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "diagnose"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "根因诊断（读代码取证）"
 speakers = ["programmer"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Analyze the bug described above. What is the likely root cause? What area of the code is affected?"
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
+output_key = "diagnosis"
+prompt = "根因诊断。bug 现象与复现：\n{{repro}}\n要求：必须用工具读相关代码取证，禁止凭空猜测。输出：1) 最可能的根因（附代码证据 file:line）；2) 备选根因（如无法排除，说明还缺什么证据）；3) 影响面（受影响的模块/调用方）。"
 
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
-id = "impact"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
-speakers = ["security", "devops"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Assess the impact of this bug. Security: any security implications? DevOps: any operational impact?"
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
+id = "fix_plan"
+description = "修复方案 + 回归测试"
+speakers = ["programmer"]
+output_key = "plan"
+prompt = "基于诊断提出修复方案：\n{{diagnosis}}\n输出：1) 最小修复思路（改哪个文件哪段逻辑，为什么这样改）；2) 回归测试用例（在旧代码失败、新代码通过的那个测试）；3) 风险与回滚（改坏了怎么退）。"
 
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
-id = "plan"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-# description = "<what this step does>"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
-speakers = ["programmer", "manager"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Propose a fix plan. Programmer: fix approach and estimate. Manager: priority and scheduling."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-[[steps]]
-# 终审：Reviewer 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
-id = "advisor_verdict"
-description = "Reviewer reviews all outputs and gives the final verdict"
+id = "verdict"
+description = "终审裁决"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"
+prompt = "你是终审。通读分诊全过程：\n【复现】{{repro}}\n【诊断】{{diagnosis}}\n【方案】{{plan}}\n按裁决格式输出：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需引用证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（含优先级建议）。只报告有证据、可行动的问题。"

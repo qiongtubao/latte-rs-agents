@@ -1,23 +1,32 @@
-# Workflow: implementation_plan — 实现计划/plan
+# Workflow: implementation_plan
+# 实现规划：架构拆解 → 任务清单(JSON，可导入任务看板) → 终审。
+# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
+
 name = "implementation_plan"
-description = "实现计划流水线：架构拆解 → 工程排期 → Reviewer 终审"
+description = "实现规划：架构拆解 → 任务清单(JSON) → 终审"
 max_rounds = 1
 
 [[steps]]
 id = "breakdown"
-description = "架构师拆解实现步骤"
+description = "架构拆解"
 speakers = ["architect"]
-prompt = "把以下任务拆解成可执行的实现步骤：{{topic}}。标注每步的依赖关系、涉及模块与风险点。"
 output_key = "plan"
+prompt = "为以下目标做实现拆解：{{topic}}。先读代码了解现状再拆。输出：1) 方案概述（为什么这样拆）；2) 工作分解（每项：做什么、改动范围、依赖关系、验收标准）；3) 风险与未知项。"
 
 [[steps]]
-id = "estimate"
-description = "工程师评估工作量与顺序"
-speakers = ["programmer"]
-prompt = "基于上面的拆解，评估每一步的工作量、实现顺序和可能的技术难点，给出排期建议。"
+id = "tasks_json"
+description = "生成任务看板数据结构"
+speakers = ["architect"]
+output_key = "tasks"
+prompt = """把拆解转成任务看板数据结构：
+{{plan}}
+严格输出一个 ```json 代码块。**JSON 代码块之外不写任何文字——不写思考过程、不写说明、不写前后缀。**
+schema：
+{"tasks": [{"title": "必填，一句话", "description": "做什么+验收标准", "priority": 1-4（1最高）, "labels": ["可选"], "workflow": "执行该任务的 workflow：开发类 tdd_development，修 bug bug_triage，文档类 update_docs；轻量微调/探索类任务可不填（走 manager 直接执行）", "subtasks": [同构，最多一层]}]}
+要求：任务粒度 0.5-2 天；有依赖的排好序（先做的事情在前）；每个任务都能独立验收。"""
 
 [[steps]]
-id = "advisor_verdict"
-description = "Reviewer 终审计划"
+id = "verdict"
+description = "终审"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的计划，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
+prompt = "终审这份实现规划：\n【拆解】{{plan}}\n【任务清单】{{tasks}}\n按裁决格式输出。重点：任务是否覆盖目标、粒度是否合理、依赖顺序是否正确、JSON 是否合法可导入。"

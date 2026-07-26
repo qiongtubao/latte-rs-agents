@@ -1,0 +1,35 @@
+# Workflow: rework
+# 返工：理解反馈 → 定点修复 → 验证 → 终审。
+# 任务从 human_review 被打回（rework）后，dispatch 自动使用本流程
+# 而不是重跑开发流——topic 里带审查反馈和前次产出摘要。
+
+name = "rework"
+description = "返工：理解反馈 → 定点修复 → 验证 → 终审"
+max_rounds = 1
+
+[[steps]]
+id = "understand"
+description = "理解反馈，定点定位"
+speakers = ["programmer"]
+output_key = "fix_plan"
+prompt = "这是返工任务。原始任务与审查反馈：\n{{topic}}\n要求：1) 逐条理解反馈意见的意图；2) 用工具定位每个反馈点对应的代码取证；3) 输出定点修复计划：每条反馈 → 改哪里 → 怎么改 → 如何验证修复有效。不解决的反馈点要说明理由。"
+
+[[steps]]
+id = "fix"
+description = "定点修复"
+speakers = ["programmer"]
+output_key = "fix"
+prompt = "按修复计划执行定点修复：\n{{fix_plan}}\n要求：只改反馈涉及的点，不做计划外扩展。输出：改动清单（文件 + 内容摘要 + 对应哪条反馈）。"
+
+[[steps]]
+id = "verify"
+description = "验证"
+speakers = ["tester"]
+output_key = "verify"
+prompt = "核验返工是否解决了全部反馈：\n【修复计划】{{fix_plan}}\n【改动】{{fix}}\n逐条核对：每条反馈意见是否已被解决？有没有引入新问题？输出：已解决清单 / 未解决或新引入问题清单。"
+
+[[steps]]
+id = "verdict"
+description = "终审"
+speakers = ["reviewer"]
+prompt = "终审这次返工：\n【计划】{{fix_plan}}\n【改动】{{fix}}\n【核验】{{verify}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。"

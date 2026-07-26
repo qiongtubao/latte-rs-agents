@@ -1,0 +1,21 @@
+# Workflow: task_archive
+# 任务存档：全生命周期整理 → 归档记录。
+# 任务进入 done 时自动执行，产出写入 .latte/tasks/archive/<id>.md。
+
+name = "task_archive"
+description = "任务存档：全生命周期整理 → 归档记录"
+max_rounds = 1
+
+[[steps]]
+id = "collect"
+description = "整理生命周期"
+speakers = ["programmer"]
+output_key = "timeline"
+prompt = "整理这个任务的全生命周期：{{topic}}。输出时间线：计划 → 执行 → 审查 → 结果，每个阶段的关键结论（各一句话，引用真实产出）。"
+
+[[steps]]
+id = "record"
+description = "撰写归档记录"
+speakers = ["tech_writer"]
+output_key = "record"
+prompt = "把任务时间线写成归档记录：\n{{timeline}}\n格式：\n# 任务存档\n## 背景与目标\n## 实施摘要\n## 审查结论\n## 经验教训（如有）\n控制在 30 行以内，只写有证据的内容。"

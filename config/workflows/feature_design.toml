@@ -14,10 +14,11 @@ output_key = "requirements"
 id = "design"
 description = "架构师给出技术方案"
 speakers = ["architect"]
-prompt = "基于上面的需求，为「{{topic}}」给出技术方案：模块划分、数据流、关键接口、风险与取舍。"
+prompt = "基于 {{requirements}}，为「{{topic}}」给出技术方案：模块划分、数据流、关键接口、风险与取舍。"
+output_key = "design"
 
 [[steps]]
 id = "advisor_verdict"
 description = "Reviewer 终审方案"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的需求与方案，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
+prompt = "你现在是终审顾问。通读 {{requirements}} 与 {{design}}，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
