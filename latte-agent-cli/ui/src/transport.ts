@@ -8,10 +8,13 @@ import type { ChatEvent, SelfLoopEvent } from "./api";
 
 export interface ChatTransport {
   request<T>(method: string, path: string, body?: unknown): Promise<T>;
+  /** 同 request，但返回原始文本（不 JSON.parse）。用于 TOML 等纯文本内容。 */
+  requestText(method: string, path: string, body?: unknown): Promise<string>;
   /** Subscribe to the chat event stream of a session. Returns an
    * unsubscribe function. */
   subscribeEvents(sessionId: string, onEvent: (ev: ChatEvent) => void): () => void;
   subscribeSelfLoop(onEvent: (ev: SelfLoopEvent) => void): () => void;
+  onConnectionStatus?: (status: "connected" | "disconnected") => void;
 }
 
 /** HTTP failure raised by `HttpSseTransport.request` on non-2xx
@@ -33,25 +36,49 @@ export class HttpError extends Error {
 }
 
 export class HttpSseTransport implements ChatTransport {
-  /** NOT part of contract C1: connection-status hook the api.ts facade
-   * uses to keep the UI status pill behavior identical to the
-   * pre-transport EventSource code. Other transports simply don't set
-   * it (the facade then reports "connected" once subscribed). */
   onConnectionStatus?: (status: "connected" | "disconnected") => void;
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, timeoutMs = 60_000): Promise<T> {
     const init: RequestInit = { method };
     if (body !== undefined) {
       init.headers = { "Content-Type": "application/json" };
       init.body = typeof body === "string" ? body : JSON.stringify(body);
     }
-    const r = await fetch(path, init);
-    if (!r.ok) {
-      const text = await r.text().catch(() => "");
-      throw new HttpError(method, path, r.status, text);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    init.signal = controller.signal;
+    try {
+      const r = await fetch(path, init);
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new HttpError(method, path, r.status, text);
+      }
+      const text = await r.text();
+      return (text ? JSON.parse(text) : undefined) as T;
+    } finally {
+      clearTimeout(timer);
     }
-    const text = await r.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+  }
+
+  async requestText(method: string, path: string, body?: unknown): Promise<string> {
+    const init: RequestInit = { method };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = typeof body === "string" ? body : JSON.stringify(body);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 60_000);
+    init.signal = controller.signal;
+    try {
+      const r = await fetch(path, init);
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        throw new HttpError(method, path, r.status, text);
+      }
+      return r.text();
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   subscribeEvents(sessionId: string, onEvent: (ev: ChatEvent) => void): () => void {
@@ -66,8 +93,6 @@ export class HttpSseTransport implements ChatTransport {
     });
     es.addEventListener("open", () => this.onConnectionStatus?.("connected"));
     es.addEventListener("error", () => {
-      // error 时主动 close() — 浏览器 EventSource 自带重连但那会让关
-      // 掉 UI 后页面挂着不释放。
       es.close();
       this.onConnectionStatus?.("disconnected");
     });
@@ -87,11 +112,8 @@ export class HttpSseTransport implements ChatTransport {
     return () => es.close();
   }
 }
-
 let currentTransport: ChatTransport | null = null;
 
-/** Inject a host-provided transport (e.g. the editor's
- * TauriIpcTransport). Must run before any api.ts call. */
 export function initTransport(t: ChatTransport): void {
   currentTransport = t;
 }

@@ -508,7 +508,51 @@ pub(crate) async fn toggle_tool(
         })
 }
 
-// ─── Roles CRUD 扩展 ───────────────────────────────────────────────
+/// `POST /api/tools/test` —— 测试工具是否能正常执行。
+#[derive(Deserialize)]
+pub(crate) struct TestToolRequest {
+    pub tool_id: String,
+    pub args: serde_json::Value,
+}
+
+pub(crate) async fn test_tool(
+    State(state): State<AppState>,
+    Json(req): Json<TestToolRequest>,
+) -> Json<crate::test::TestToolResponse> {
+    let resp = crate::test::run_tool_test(
+        crate::test::TestToolRequest {
+            tool_id: req.tool_id,
+            args: req.args,
+        },
+        &state.backend.cwd,
+    )
+    .await;
+    Json(resp)
+}
+
+/// `POST /api/roles/test` —— 测试角色配置是否能正常与模型对话。
+#[derive(Deserialize)]
+pub(crate) struct TestRoleBody {
+    pub role_id: String,
+    pub config: crate::api::SaveRoleConfigRequest,
+}
+
+pub(crate) async fn test_role(
+    State(state): State<AppState>,
+    Json(req): Json<TestRoleBody>,
+) -> Json<crate::test::TestRoleResponse> {
+    let resp = crate::test::run_role_test(
+        crate::test::TestRoleRequest {
+            role_id: req.role_id,
+            config: req.config,
+        },
+        &state.backend.resolver,
+        &state.backend.cwd,
+    )
+    .await;
+    Json(resp)
+}
+
 
 /// `POST /api/roles` 请求体：role_id + role_name。
 #[derive(Deserialize)]
@@ -538,6 +582,36 @@ pub(crate) async fn delete_role(
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     api::delete_role(&state.backend, &id)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `GET /api/roles/:id/toml` — 读取角色 TOML 源文件原始内容。
+pub(crate) async fn get_role_toml(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<String, (StatusCode, String)> {
+    api::get_role_toml(&state.backend, &id)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `PUT /api/roles/:id/toml` — 直接写入角色 TOML 源文件原始内容。
+pub(crate) async fn put_role_toml(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    body: String,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::put_role_toml(&state.backend, &id, &body)
         .map(|_| StatusCode::OK)
         .map_err(|e| {
             (

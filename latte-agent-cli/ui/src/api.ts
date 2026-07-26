@@ -450,8 +450,8 @@ export interface ToolEntry {
   enabled: boolean;
   /** 工具描述，渲染时作为 tooltip。 */
   description?: string;
-  /** 工具被哪些 agent 注册（角色 slug 列表）。 */
-  registered_by?: string[];
+  /** 注册点（dynamic 工具的函数名）。 */
+  registered_by?: string;
 }
 
 /** GET /api/tools 返回 `{tools: ToolEntry[]}` 形状（旧 schema 也兼容裸数组）。 */
@@ -594,3 +594,53 @@ export async function getModelCapabilities(
 }
 
 
+
+// ─── Tool test ─────────────────────────────────────────────────────
+
+export interface TestToolRequest {
+  tool_id: string;
+  args: Record<string, unknown>;
+}
+
+export interface TestToolResponse {
+  ok: boolean;
+  tool_id: string;
+  latency_ms: number;
+  response?: string;
+  error?: string;
+}
+
+/** POST /api/tools/test —— 测试工具是否能正常执行。 */
+export async function testTool(req: TestToolRequest): Promise<TestToolResponse> {
+  return getTransport().request("POST", "/api/tools/test", req);
+}
+
+// ─── Role test ─────────────────────────────────────────────────────
+
+export interface TestRoleRequest {
+  role_id: string;
+  config: RoleConfigSave;
+}
+
+export interface TestRoleResponse {
+  ok: boolean;
+  role_id: string;
+  latency_ms: number;
+  response?: string;
+  error?: string;
+}
+
+/** POST /api/roles/test —— 测试角色配置是否能正常与模型对话。 */
+export async function testRole(req: TestRoleRequest): Promise<TestRoleResponse> {
+  return getTransport().request("POST", "/api/roles/test", req);
+}
+
+/** GET /api/roles/:id/toml —— 读取角色 TOML 源文件原始内容。 */
+export async function getRoleToml(roleId: string): Promise<string> {
+  return getTransport().requestText("GET", `/api/roles/${encodeURIComponent(roleId)}/toml`);
+}
+
+/** PUT /api/roles/:id/toml —— 直接写入角色 TOML 源文件原始内容。 */
+export async function putRoleToml(roleId: string, raw: string): Promise<void> {
+  await getTransport().request("PUT", `/api/roles/${encodeURIComponent(roleId)}/toml`, raw);
+}

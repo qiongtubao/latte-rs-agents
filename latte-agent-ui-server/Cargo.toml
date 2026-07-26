@@ -33,3 +33,6 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 reqwest = { workspace = true }
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

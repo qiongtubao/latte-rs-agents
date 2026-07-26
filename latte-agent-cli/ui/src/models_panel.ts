@@ -31,6 +31,9 @@ interface UIBinding {
 export interface ModelsPanelController {
   isOpen(): boolean;
   open(): void;
+  /** 打开面板并选中指定 model。接受 `provider/name` 全键或裸 name
+   * （角色 model_chain 里的写法，按 name 匹配）。 */
+  selectModel(key: string): void;
 }
 
 /** 字段渲染顺序：表单 label 列表，按"基本 → 网络 → 计费 → 行为"分组。 */
@@ -379,11 +382,41 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     }
   }
 
+  function trySelect(key: string): void {
+    // key 可能是 `provider/name` 全键，也可能是角色 model_chain 里的裸
+    // name（runtime ModelResolver 按 name 匹配模型）。按 name 匹配时优先
+    // 非 catalog 来源（catalog 是内置占位，真实配置在 project/global）。
+    let found = items.find(m => m.key === key);
+    if (!found) {
+      const byName = items.filter(m => m.name === key);
+      found = byName.find(m => m.source !== "catalog") ?? byName[0];
+    }
+    if (found) {
+      currentKey = found.key;
+      container.selectEl.value = found.key;
+      renderForm();
+    } else {
+      setStatus(`未找到 model「${key}」`, true);
+    }
+  }
+
   return {
     isOpen: () => !container.panelEl.classList.contains("hidden"),
     open: () => {
       container.panelEl.classList.remove("hidden");
       void refresh();
+    },
+    selectModel: (key: string) => {
+      container.panelEl.classList.remove("hidden");
+      // 如果 items 还没加载，先 refresh
+      if (items.length === 0) {
+        void (async () => {
+          await refresh();
+          trySelect(key);
+        })();
+      } else {
+        trySelect(key);
+      }
     },
   };
 }

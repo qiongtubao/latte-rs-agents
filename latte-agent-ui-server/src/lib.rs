@@ -57,7 +57,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 use latte_agent_core::config::AgentConfig;
 use latte_agent_core::model_resolver::{ModelResolver, ModelTier};
@@ -327,6 +327,17 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         .bootstrap_default_session()
         .await
         .map_err(|e| anyhow::anyhow!("spawn default session controller: {e}"))?;
+
+    // 在 bind HTTP 之前先完成工具枚举，确保服务启动后所有 HTTP 请求
+    // 都能立即拿到完整的工具列表（而非 fallback）。
+    match crate::tools::enumerate_inner().await {
+        Ok(list) => {
+            crate::tools::set_enumerate_cache(list.clone());
+            eprintln!("[boot] tools enumeration: {} tools", list.len());
+        }
+        Err(e) => eprintln!("[boot] tools enumeration failed: {e}"),
+    }
+
     let static_dir = resolve_static_dir(static_dir);
 
     let state = AppState {
@@ -417,11 +428,14 @@ fn build_router(state: AppState) -> Router {
         .route("/models/:key/capabilities", get(model_capabilities))
         // 工具管理
         .route("/tools", get(list_tools))
+        .route("/tools/test", axum::routing::post(test_tool))
         .route("/tools/:id/toggle", axum::routing::post(toggle_tool))
-        // 角色管理（新建/删除）
+        // 角色管理（新建/删除/测试）
         .route("/roles", get(list_roles).post(create_role))
+        .route("/roles/test", axum::routing::post(test_role))
         .route("/roles/:id", axum::routing::delete(delete_role))
-    .route("/health", get(health));
+        // 角色 TOML 源文件编辑
+        .route("/roles/:id/toml", get(get_role_toml).put(put_role_toml));
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);

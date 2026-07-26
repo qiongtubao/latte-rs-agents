@@ -857,6 +857,19 @@ select {
   color: var(--fg);
   white-space: nowrap;
 }
+/* 角色编辑器 - 工具跳转按钮（联动工具管理页面） */
+.role-editor-tool-jump {
+  padding: 0 0.1rem;
+  font-size: 0.68rem;
+  line-height: 1.2;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.5;
+}
+.role-editor-tool-jump:hover {
+  opacity: 1;
+}
 .role-editor-actions {
   display: flex;
   align-items: center;
@@ -872,10 +885,107 @@ select {
 }
 .role-editor-status.error { color: var(--err); }
 
+/* 角色编辑器 - 浏览模型按钮 */
+.role-editor-browse-btn {
+  font-size: 0.75rem;
+  padding: 0.3rem 0.5rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* 角色编辑器 - 测试角色按钮 */
+.role-editor-test-btn {
+  font-size: 0.82rem;
+  padding: 0.35rem 0.7rem;
+  background: #e8f5e9;
+  border: 1px solid #a5d6a7;
+  color: #2e7d32;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.role-editor-test-btn:hover {
+  background: #c8e6c9;
+}
+.role-editor-test-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 工具管理 - 测试按钮 */
+.tools-card-test-btn {
+  font-size: 0.72rem;
+  padding: 0.2rem 0.45rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg-2);
+  cursor: pointer;
+  margin-left: auto;
+  align-self: center;
+}
+.tools-card-test-btn:hover {
+  background: #e3f2fd;
+  border-color: #90caf9;
+  color: #1565c0;
+}
+
 #role-editor-close {
   flex-shrink: 0;
   font-size: 1.1rem;
   line-height: 1;
+}
+
+
+/* ─── 角色编辑器 tab 切换 ────────────────────────────────── */
+.role-editor-tab-bar {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.6rem;
+}
+.role-editor-tab {
+  padding: 6px 14px;
+  font-size: 0.82em;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--fg-2);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.role-editor-tab:hover {
+  color: var(--fg);
+}
+.role-editor-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 500;
+}
+.role-editor-pane {
+  display: none;
+}
+.role-editor-pane.active {
+  display: block;
+}
+
+/* ─── TOML 源文件编辑器 ─────────────────────────────────── */
+.role-editor-toml-editor {
+  width: 100%;
+  font-family: var(--mono-font);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+  background: #f8fafc;
+  color: var(--fg);
+  tab-size: 2;
+}
+.role-editor-toml-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
 }
 
 /* ─── statusbar ───────────────────────────────────────────────── */

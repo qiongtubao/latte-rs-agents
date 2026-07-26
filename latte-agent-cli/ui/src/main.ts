@@ -190,17 +190,29 @@ async function main(): Promise<void> {
       iconInput: $("role-editor-icon") as HTMLInputElement,
       tierSelect: $("role-editor-tier") as HTMLSelectElement,
       chainEl: $("role-editor-chain"),
+      chainBrowseBtn: $("role-editor-chain-browse") as HTMLButtonElement,
       temperatureInput: $("role-editor-temperature") as HTMLInputElement,
       toolsEl: $("role-editor-tools"),
       promptInput: $("role-editor-prompt") as HTMLTextAreaElement,
       statusEl: $("role-editor-status"),
+      testRoleBtn: $("role-editor-test-role") as HTMLButtonElement,
       pathsEl: $("role-editor-paths"),
+      // TOML 源文件编辑
+      tabBarEl: $("role-editor-tab-bar"),
+      tabBtns: document.querySelectorAll<HTMLButtonElement>(".role-editor-tab"),
+      formPane: $("role-editor-form"),
+      tomlPane: $("role-editor-toml-pane"),
+      tomlEditor: $("role-editor-toml-editor") as HTMLTextAreaElement,
+      tomlSaveBtn: $("role-editor-toml-save") as HTMLButtonElement,
+      tomlReloadBtn: $("role-editor-toml-reload") as HTMLButtonElement,
+      tomlStatusEl: $("role-editor-toml-status"),
     },
   });
   $("role-editor-btn").addEventListener("click", () => roleEditor.open());
 
   // 工具管理面板：列出所有工具 + 切换启用状态
-  mountToolsPanel({
+  // 工具管理页面：全功能管理（搜索 / 过滤 / 批量操作 / 自动刷新）
+  const toolsPage = mountToolsPanel({
     container: {
       panelEl: $("tools-panel"),
       openBtn: $("tools-btn") as HTMLButtonElement,
@@ -213,7 +225,7 @@ async function main(): Promise<void> {
   });
   // 模型管理面板：下拉菜单 + 表单编辑器
   const modelsItems: ModelWithSource[] = [];  // shared ref for test dialog
-  mountModelsPanel({
+  const modelsPanel = mountModelsPanel({
     container: {
       panelEl: $("models-panel"),
       openBtn: $("models-btn") as HTMLButtonElement,
@@ -228,6 +240,19 @@ async function main(): Promise<void> {
     },
   });
 
+  // 模型链浏览 → 联动模型管理面板
+  // 点击「浏览模型」按钮 → 打开面板
+  $("role-editor-chain-browse").addEventListener("click", () => {
+    modelsPanel.open();
+  });
+  // 点击每行模型旁的 🔍 按钮 → 打开面板并选中该模型
+  $("role-editor-chain-browse").addEventListener("select-model", ((e: CustomEvent) => {
+    modelsPanel.selectModel(e.detail.modelId);
+  }) as EventListener);
+  // 点击工具旁的 🔍 按钮 → 打开工具管理页面并定位该工具
+  $("role-editor-tools").addEventListener("select-tool", ((e: CustomEvent) => {
+    toolsPage.selectTool(e.detail.toolId);
+  }) as EventListener);
   // 测试弹层（singleton，由 models 面板的「测试」按钮触发）。
   const testDialog = mountTestDialog({
     container: {

@@ -1,6 +1,9 @@
 // 角色编辑器面板 —— fetch /api/roles/config 渲染表单，保存时 POST。
-import { getRolesConfig, saveRoleConfig, createRole, deleteRole } from "./api";
-import type { RoleConfigEntry, RolesConfig } from "./api";
+// 支持两种编辑方式：表单编辑（结构化）和源文件编辑（TOML 原始内容）。
+// 支持模型链浏览（联动模型管理面板）、工具跳转（联动工具管理页面）和角色测试。
+import { getRolesConfig, saveRoleConfig, createRole, deleteRole, testRole, getRoleToml, putRoleToml } from "./api";
+import type { RoleConfigEntry, RolesConfig, TestRoleResponse } from "./api";
+
 interface UIBinding {
   panelEl: HTMLElement;
   roleSelect: HTMLSelectElement;
@@ -13,11 +16,22 @@ interface UIBinding {
   iconInput: HTMLInputElement;
   tierSelect: HTMLSelectElement;
   chainEl: HTMLElement;
+  chainBrowseBtn: HTMLButtonElement;
   temperatureInput: HTMLInputElement;
   toolsEl: HTMLElement;
   promptInput: HTMLTextAreaElement;
   statusEl: HTMLElement;
+  testRoleBtn: HTMLButtonElement;
   pathsEl: HTMLElement;
+  // TOML 源文件编辑
+  tabBarEl: HTMLElement;
+  tabBtns: NodeListOf<HTMLButtonElement>;
+  formPane: HTMLElement;
+  tomlPane: HTMLElement;
+  tomlEditor: HTMLTextAreaElement;
+  tomlSaveBtn: HTMLButtonElement;
+  tomlReloadBtn: HTMLButtonElement;
+  tomlStatusEl: HTMLElement;
 }
 
 export interface RoleEditorController {
@@ -30,20 +44,57 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
   let config: RolesConfig | null = null;
   let isLoading = false;
   let isSaving = false;
+  // 当前选中的角色 id（可能和 roleSelect.value 不同步——TOML tab 切换不触发 fillForm）
+  let currentRoleId = "";
 
+  // ── 表单编辑事件 ──
   container.closeBtn.addEventListener("click", () => container.panelEl.classList.add("hidden"));
   container.refreshBtn.addEventListener("click", () => void refresh(container.roleSelect.value));
-  container.roleSelect.addEventListener("change", () => fillForm(container.roleSelect.value));
+  container.roleSelect.addEventListener("change", () => {
+    currentRoleId = container.roleSelect.value;
+    // 切到表单 tab 时填充；在 TOML tab 时只更新 currentRoleId
+    if (container.formPane.classList.contains("active")) {
+      fillForm(currentRoleId);
+    }
+  });
   container.formEl.addEventListener("submit", (event) => {
     event.preventDefault();
     void save();
   });
   container.newBtn.addEventListener("click", () => void onCreate());
   container.deleteBtn.addEventListener("click", () => void onDelete());
+  container.testRoleBtn.addEventListener("click", () => void onTestRole());
 
+  // ── tab 切换 ──
+  const tabBtns = Array.from(container.tabBtns);
+  tabBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+      if (!target) return;
+      tabBtns.forEach((b) => b.classList.toggle("active", b === btn));
+      container.formPane.classList.toggle("active", target === "form");
+      container.tomlPane.classList.toggle("active", target === "toml");
+      // 切到 TOML tab 时加载当前角色的源文件
+      if (target === "toml" && currentRoleId) {
+        void loadToml(currentRoleId);
+      }
+    });
+  });
+
+  // ── TOML 编辑事件 ──
+  container.tomlSaveBtn.addEventListener("click", () => void saveToml());
+  container.tomlReloadBtn.addEventListener("click", () => {
+    if (currentRoleId) void loadToml(currentRoleId);
+  });
+
+  // ── 状态提示 ──
   const setStatus = (message: string, error = false) => {
     container.statusEl.textContent = message;
     container.statusEl.classList.toggle("error", error);
+  };
+  const setTomlStatus = (message: string, error = false) => {
+    container.tomlStatusEl.textContent = message;
+    container.tomlStatusEl.classList.toggle("error", error);
   };
 
   const chainValues = () => Array.from(container.chainEl.querySelectorAll<HTMLInputElement>("input"))
@@ -74,6 +125,14 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
       row.append(
         order,
         input,
+        button("🔍", "在模型管理中查看此模型", () => {
+          const modelId = input.value.trim();
+          if (modelId) {
+            container.chainBrowseBtn.dispatchEvent(
+              new CustomEvent("select-model", { bubbles: true, detail: { modelId } })
+            );
+          }
+        }),
         button("↑", "提高优先级", () => {
           const next = chainValues();
           if (index > 0) [next[index - 1], next[index]] = [next[index], next[index - 1]];
@@ -103,6 +162,7 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
   function fillForm(roleId: string): void {
     const entry = config?.roles.find((role) => role.id === roleId);
     if (!entry) return;
+    currentRoleId = roleId;
     container.nameInput.value = entry.name;
     container.iconInput.value = entry.icon;
     container.tierSelect.value = entry.model_tier;
@@ -119,10 +179,55 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
       checkbox.type = "checkbox";
       checkbox.value = name;
       checkbox.checked = selected.has(name);
-      label.append(checkbox, document.createTextNode(name));
+      const jump = document.createElement("button");
+      jump.type = "button";
+      jump.className = "role-editor-tool-jump";
+      jump.textContent = "🔍";
+      jump.title = "在工具管理中查看此工具";
+      jump.addEventListener("click", (event) => {
+        event.preventDefault(); // 避免触发 label 默认勾选 checkbox
+        container.toolsEl.dispatchEvent(
+          new CustomEvent("select-tool", { bubbles: true, detail: { toolId: name } })
+        );
+      });
+      label.append(checkbox, document.createTextNode(name), jump);
       container.toolsEl.appendChild(label);
     }
     setStatus("");
+  }
+
+  /** 加载角色 TOML 源文件到编辑器。 */
+  async function loadToml(roleId: string): Promise<void> {
+    setTomlStatus("加载中…");
+    container.tomlEditor.disabled = true;
+    try {
+      const raw = await getRoleToml(roleId);
+      container.tomlEditor.value = raw;
+      setTomlStatus("（只读加载，修改后点「保存 TOML」写盘）");
+    } catch (err) {
+      setTomlStatus(`加载失败: ${(err as Error).message}`, true);
+    } finally {
+      container.tomlEditor.disabled = false;
+    }
+  }
+
+  /** 保存 TOML 源文件。 */
+  async function saveToml(): Promise<void> {
+    if (isSaving || !currentRoleId) return;
+    isSaving = true;
+    setTomlStatus("保存中…");
+    container.tomlSaveBtn.disabled = true;
+    try {
+      await putRoleToml(currentRoleId, container.tomlEditor.value);
+      setTomlStatus("✅ TOML 已保存；新 session 生效");
+      // 刷新 config 和表单
+      await refresh(currentRoleId);
+    } catch (err) {
+      setTomlStatus(`保存失败: ${(err as Error).message}`, true);
+    } finally {
+      isSaving = false;
+      container.tomlSaveBtn.disabled = false;
+    }
   }
 
   async function refresh(preferRoleId?: string): Promise<void> {
@@ -141,6 +246,7 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
       if (preferRoleId && config.roles.some((role) => role.id === preferRoleId)) {
         container.roleSelect.value = preferRoleId;
       }
+      currentRoleId = container.roleSelect.value;
       container.tierSelect.replaceChildren();
       for (const tier of config.tiers) {
         const option = document.createElement("option");
@@ -148,7 +254,11 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
         option.textContent = tier;
         container.tierSelect.appendChild(option);
       }
-      fillForm(container.roleSelect.value);
+      fillForm(currentRoleId);
+      // 如果当前在 TOML tab，重新加载 TOML
+      if (container.tomlPane.classList.contains("active") && currentRoleId) {
+        void loadToml(currentRoleId);
+      }
     } catch (error) {
       setStatus(`加载失败: ${(error as Error).message}`, true);
     } finally {
@@ -188,7 +298,38 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     }
   }
 
-  /** 新建角色：弹出 prompt 输入 id，POST /api/roles 后刷新列表。 */
+  async function onTestRole(): Promise<void> {
+    const entry = config?.roles.find((role) => role.id === container.roleSelect.value);
+    if (!entry) {
+      setStatus("请先选择一个角色", true);
+      return;
+    }
+    setStatus("测试中…");
+    container.testRoleBtn.disabled = true;
+    try {
+      const resp = await testRole({
+        role_id: entry.id,
+        config: {
+          id: entry.id,
+          name: container.nameInput.value.trim(),
+          icon: container.iconInput.value.trim(),
+          model_tier: container.tierSelect.value,
+          model_chain: chainValues(),
+          temperature: container.temperatureInput.value.trim() === "" ? null : Number(container.temperatureInput.value.trim()),
+          tools: Array.from(container.toolsEl.querySelectorAll<HTMLInputElement>('input[type="checkbox"]'))
+            .filter((input) => input.checked)
+            .map((input) => input.value),
+          prompt: container.promptInput.value,
+        },
+      });
+      setStatus(resp.ok ? `✅ 角色测试通过 (${resp.latency_ms}ms)` : `✗ 角色测试失败: ${resp.error ?? "未知错误"}`, !resp.ok);
+    } catch (err) {
+      setStatus(`测试失败: ${(err as Error).message}`, true);
+    } finally {
+      container.testRoleBtn.disabled = false;
+    }
+  }
+
   async function onCreate(): Promise<void> {
     const roleId = prompt("新角色 ID（字母/数字/下划线）：");
     if (!roleId) return;
@@ -201,7 +342,6 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     try {
       setStatus("创建中…");
       const entry = await createRole({ id: roleId, name });
-      // 追加到本地 config 并刷新下拉菜单
       if (config) {
         config.roles.push(entry);
       }
@@ -212,7 +352,6 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     }
   }
 
-  /** 删除角色：二次确认后 DELETE /api/roles/:id，刷新列表。 */
   async function onDelete(): Promise<void> {
     const roleId = container.roleSelect.value;
     if (!roleId) return;
@@ -224,7 +363,6 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
         config.roles = config.roles.filter(r => r.id !== roleId);
       }
       setStatus(`已删除角色 "${roleId}"`);
-      // 重建下拉菜单，跳到下一个可用角色
       container.roleSelect.replaceChildren();
       for (const role of config?.roles ?? []) {
         const option = document.createElement("option");
@@ -234,7 +372,8 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
       }
       if (container.roleSelect.options.length > 0) {
         container.roleSelect.selectedIndex = 0;
-        fillForm(container.roleSelect.value);
+        currentRoleId = container.roleSelect.value;
+        fillForm(currentRoleId);
       } else {
         container.formEl.classList.add("hidden");
       }

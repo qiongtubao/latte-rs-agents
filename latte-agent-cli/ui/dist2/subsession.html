@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>latte-agent · Subsession</title>
+    <link rel="icon" href="/favicon.ico" />
+    <style>
+      :root {
+        --bg: #0e1117;
+        --bg-2: #161b22;
+        --fg: #e6edf3;
+        --fg-2: #8b949e;
+        --border: #30363d;
+        --accent: #58a6ff;
+        --err: #f85149;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { height: 100%; background: var(--bg); color: var(--fg);
+        font-family: -apple-system, "Segoe UI", "Noto Sans SC", Helvetica, Arial, sans-serif;
+        font-size: 14px; line-height: 1.5; }
+      .topbar { padding: 12px 24px; background: var(--bg-2);
+        border-bottom: 1px solid var(--border);
+        display: flex; align-items: center; gap: 12px; }
+      .topbar h1 { font-size: 16px; font-weight: 600; }
+      .topbar .meta { color: var(--fg-2); font-size: 13px; }
+      main { padding: 24px; max-width: 1000px; margin: 0 auto; }
+      .status { padding: 24px; text-align: center; color: var(--fg-2); }
+      .status.error { color: var(--err); }
+      ul.events { list-style: none; }
+      ul.events li {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        margin-bottom: 10px;
+        padding: 10px 14px;
+      }
+      ul.events li .ev-meta {
+        font-weight: 600; color: var(--accent); font-size: 13px;
+        margin-bottom: 6px;
+      }
+      ul.events li .ev-data {
+        font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+        font-size: 12.5px;
+        color: var(--fg);
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-height: 400px;
+        overflow: auto;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 8px;
+      }
+      ul.events li .ev-data.collapsed { max-height: 100px; }
+      .toggle { float: right; cursor: pointer; color: var(--fg-2); font-size: 12px;
+        border: 1px solid var(--border); padding: 2px 8px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <div class="topbar">
+      <h1>🔍 <span id="label">Subsession</span></h1>
+      <span class="meta">
+        sub_id=<code id="sub-id">?</code>
+        · session_id=<code id="session-id">?</code>
+      </span>
+    </div>
+    <main>
+      <div id="status" class="status">fetching…</div>
+      <ul class="events" id="events"></ul>
+    </main>
+    <script>
+      // Standalone subsession viewer. Opened in a new window via
+      // `window.open("/subsession.html?id=...&session_id=...&label=...")`
+      // from the main chat. Reads everything it needs from the URL
+      // because each popup tab gets its own JS context that doesn't
+      // share `currentSessionId` from the opener.
+
+      const params = new URLSearchParams(window.location.search);
+      const subId = params.get("id") ?? "";
+      const sessionId = params.get("session_id") ?? "";
+      const label = params.get("label") ?? "Subsession";
+      document.getElementById("label").textContent = label;
+      document.getElementById("sub-id").textContent = subId || "(none)";
+      document.getElementById("session-id").textContent = sessionId || "(none)";
+
+      const statusEl = document.getElementById("status");
+      const eventsEl = document.getElementById("events");
+
+      function setError(msg) {
+        statusEl.classList.add("error");
+        statusEl.textContent = `error: ${msg}`;
+      }
+
+      async function load() {
+        if (!subId) { setError("missing id"); return; }
+        if (!sessionId) { setError("missing session_id"); return; }
+        const url = `/api/subsessions?id=${encodeURIComponent(subId)}&session_id=${encodeURIComponent(sessionId)}`;
+        try {
+          const r = await fetch(url);
+          if (!r.ok) {
+            setError(`GET /api/subsessions?id=${subId}&session_id=${sessionId} ${r.status}`);
+            return;
+          }
+          const events = await r.json();
+          statusEl.remove();
+          if (events.length === 0) {
+            const li = document.createElement("li");
+            li.textContent = "(no events captured)";
+            eventsEl.appendChild(li);
+            return;
+          }
+          for (const ev of events) {
+            eventsEl.appendChild(renderEvent(ev));
+          }
+        } catch (e) {
+          setError(String(e));
+        }
+      }
+
+      function renderEvent(ev) {
+        const li = document.createElement("li");
+        const meta = document.createElement("div");
+        meta.className = "ev-meta";
+        const evType = (ev && (ev.type ?? Object.keys(ev)[0])) || "?";
+        const stamp = (ev && (ev.timestamp_unix_ms ?? ev.ts)) ?? "";
+        meta.textContent = stamp ? `${evType} · ${new Date(stamp).toISOString()}` : evType;
+        li.appendChild(meta);
+
+        const data = document.createElement("div");
+        data.className = "ev-data collapsed";
+        data.textContent = JSON.stringify(ev, null, 2);
+        li.appendChild(data);
+
+        const toggle = document.createElement("span");
+        toggle.className = "toggle";
+        toggle.textContent = "展开";
+        toggle.addEventListener("click", () => {
+          const c = data.classList.toggle("collapsed");
+          toggle.textContent = c ? "展开" : "收起";
+        });
+        meta.appendChild(toggle);
+        return li;
+      }
+
+      load();
+    </script>
+  </body>
+</html>

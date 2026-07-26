@@ -9,9 +9,13 @@
 //!
 //! 启用状态用 `.latte/tools.yaml`（项目）和 `~/.latte/tools.yaml`（全局）存：
 //! 仅记录用户**关闭**的工具（默认全开）。项目优先于全局。
+//!
+//! 枚举结果缓存由服务启动时的预热线程填充（见 `lib.rs` 的 `spawn`），
+//! 预热完成前 HTTP 请求返回硬编码 fallback 列表，保证首次请求也立即响应。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -110,30 +114,20 @@ impl ToolsStore {
     /// 切换启用状态，写到项目级（若无项目级配置文件路径能力则全局）。
     /// 返回新的 enabled 状态。
     pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<bool> {
-        // 先 reload 确保不丢已有状态
         self.reload();
         if enabled {
             self.disabled.remove(id);
         } else {
             self.disabled.insert(id.to_string());
         }
-        // 写到项目级；如果项目级目录不可写则回退全局。
         let mut project = ToolsState::load(&self.project_path);
         if enabled {
             project.disabled.remove(id);
         } else {
             project.disabled.insert(id.to_string());
         }
-        // 与全局合并：项目优先
-        let mut global = ToolsState::load(&self.global_path);
-        if !enabled {
-            // 如果全局也禁用，保留；否则只项目级禁用
-        }
-        // 简化：把合并后的 disabled 拆分为 project+global
-        // 策略：只在 project 写"被本 store 禁用"的差集
-        let _ = &mut global;
+        let _ = &mut ToolsState::load(&self.global_path);
         project.save(&self.project_path)?;
-        // 全局级文件保持不动（project 优先）
         self.reload();
         Ok(enabled)
     }
@@ -144,10 +138,62 @@ impl ToolsStore {
     }
 }
 
+// ─── 枚举缓存 ────────────────────────────────────────────────────────
+//
+// 预热（服务启动时 spawn）填充此缓存。预热完成前 HTTP 请求返回 fallback。
+// 预热完成后 `set_enumerate_cache` 被调用，后续请求走快速路径。
+
+static ENUMERATE_CACHE: std::sync::RwLock<Option<Vec<ToolEntry>>> = std::sync::RwLock::new(None);
+
+/// 设置缓存（预热完成后调用）。
+pub fn set_enumerate_cache(tools: Vec<ToolEntry>) {
+    if let Ok(mut cache) = ENUMERATE_CACHE.write() {
+        *cache = Some(tools);
+    }
+}
+
+/// 清空缓存（测试用）。
+pub fn clear_cache() {
+    if let Ok(mut cache) = ENUMERATE_CACHE.write() {
+        *cache = None;
+    }
+}
+
 /// 枚举所有可用工具（含 builtin + dynamic + 已知别名）。
 ///
 /// 不做 enable/disable 过滤；调用方用 `ToolsStore::is_enabled` 自行判断。
+/// 结果由服务启动时的预热线程填充，预热完成前返回硬编码 fallback 列表，
+/// 保证第一次 HTTP 请求也立即返回（毫秒级）。
 pub async fn enumerate() -> Result<Vec<ToolEntry>> {
+    // 快速路径：缓存已就绪
+    if let Ok(cache) = ENUMERATE_CACHE.read() {
+        if let Some(tools) = &*cache {
+            return Ok(tools.clone());
+        }
+    }
+    // 缓存未就绪（预热尚未完成），返回 fallback 列表
+    Ok(fallback_tools())
+}
+
+/// 硬编码的核心工具回退列表（`enumerate()` 预热未完成时使用）。
+fn fallback_tools() -> Vec<ToolEntry> {
+    vec![
+        ToolEntry { id: "read".into(), kind: "builtin".into(), description: "读取文件或目录内容".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "write".into(), kind: "builtin".into(), description: "写入或覆盖文件".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "edit".into(), kind: "builtin".into(), description: "对文件做精确的替换/插入/删除编辑".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "exec".into(), kind: "builtin".into(), description: "执行 shell 命令".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "bash".into(), kind: "package_alias".into(), description: "exec alias".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "git".into(), kind: "package_alias".into(), description: "git.* (package alias)".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "search".into(), kind: "builtin".into(), description: "搜索文件内容（正则 + glob）".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "grep".into(), kind: "builtin".into(), description: "全局正则搜索".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "delegate".into(), kind: "dynamic".into(), description: "delegate tool registered by controller".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "workflow".into(), kind: "dynamic".into(), description: "workflow tool registered by controller".into(), enabled: true, registered_by: None },
+        ToolEntry { id: "mcp".into(), kind: "package_alias".into(), description: "mcp_connect (package alias)".into(), enabled: true, registered_by: None },
+    ]
+}
+
+/// 完整枚举（含 TreeSitter 解析），由预热线程调用，结果写入 `ENUMERATE_CACHE`。
+pub(crate) async fn enumerate_inner() -> Result<Vec<ToolEntry>> {
     use latte_rs_agent_tools::prelude::*;
 
     let mgr = create_tool_manager();
@@ -158,18 +204,16 @@ pub async fn enumerate() -> Result<Vec<ToolEntry>> {
 
     let mut by_id: BTreeMap<String, ToolEntry> = BTreeMap::new();
 
-    // 1. builtin packages 注册的工具（包含 git.*, exec, read, write, search 等）
+    // 1. builtin packages 注册的工具
     for tool_id in mgr.get_tool_names() {
-        // 短名（去 package 前缀）
         let short = tool_id
             .rsplit_once('.')
             .map(|(_, s)| s.to_string())
             .unwrap_or_else(|| tool_id.clone());
-        // 描述：尝试从 schema 提取（ToolManager 没暴露 schema getter，跳过详细描述）
         let description = format!("builtin tool: {tool_id}");
         by_id.entry(short.clone()).or_insert(ToolEntry {
             id: short,
-            kind: if tool_id.starts_with("git.") { "builtin".into() } else { "builtin".into() },
+            kind: "builtin".into(),
             description,
             enabled: true,
             registered_by: None,
@@ -188,7 +232,7 @@ pub async fn enumerate() -> Result<Vec<ToolEntry>> {
         });
     }
 
-    // 3. 已知包级别别名（`git` 是 git.* 的别名；`bash` 是 exec 的别名）
+    // 3. 已知包级别别名
     for (alias, target) in [
         ("git", "git.* (package alias)"),
         ("bash", "exec alias"),
@@ -203,7 +247,7 @@ pub async fn enumerate() -> Result<Vec<ToolEntry>> {
         });
     }
 
-    // 4. delegate / workflow（controller 动态注册，需要时存在）
+    // 4. delegate / workflow
     for id in ["delegate", "workflow"] {
         by_id.entry(id.to_string()).or_insert(ToolEntry {
             id: id.to_string(),
@@ -298,14 +342,14 @@ mod tests {
 
     #[tokio::test]
     async fn enumerate_returns_known_ids() {
-        let tools = enumerate().await.expect("enumerate");
+        // enumerate() 现在返回 fallback 列表（缓存未填充），
+        // 需要测试 enumerate_inner() 来验证完整枚举。
+        let tools = enumerate_inner().await.expect("enumerate_inner");
         let ids: Vec<&str> = tools.iter().map(|t| t.id.as_str()).collect();
-        // 必有：核心 builtin 别名
         assert!(ids.contains(&"read"), "read missing: {ids:?}");
         assert!(ids.contains(&"write"), "write missing: {ids:?}");
         assert!(ids.contains(&"git"), "git alias missing: {ids:?}");
         assert!(ids.contains(&"bash"), "bash alias missing: {ids:?}");
-        // 至少有一个 builtin 短名
         assert!(tools.iter().any(|t| t.id == "exec" || t.id == "search"),
                 "expected exec/search: {ids:?}");
     }

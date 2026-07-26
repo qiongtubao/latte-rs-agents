@@ -1,0 +1,4 @@
+/* 占位：宿主皮肤会覆盖此文件（design doc §4）。
+ * CLI 浏览器模式下此文件为空，UI 使用 styles.css 的默认浅色主题；
+ * 嵌入 latte-code-editor 时，同步脚本把编辑器深色皮肤拷为
+ * public/chat-ui/skin.css，只重新定义 :root CSS 变量值。 */

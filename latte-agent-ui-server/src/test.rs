@@ -453,3 +453,218 @@ fn err_response<E: std::fmt::Display>(started: Instant, e: E) -> TestModelRespon
         available_models: None,
     }
 }
+
+// ─── Tool test ─────────────────────────────────────────────────────
+
+/// `POST /api/tools/test` 的请求体。
+#[derive(Debug, Deserialize)]
+pub struct TestToolRequest {
+    /// 工具 ID（如 `read`、`exec`、`write` 等）。
+    pub tool_id: String,
+    /// 测试参数（JSON 格式）。不同工具预期不同形状：
+    /// - `read`：`{"path": "Cargo.toml"}`
+    /// - `exec`：`{"command": "echo hello"}`
+    /// - `write`：`{"path": "/tmp/test.txt", "content": "hello"}`
+    pub args: serde_json::Value,
+}
+
+/// `POST /api/tools/test` 的响应体。
+#[derive(Debug, Serialize)]
+pub struct TestToolResponse {
+    pub ok: bool,
+    pub tool_id: String,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 运行一次工具测试：创建完整 tool manager，注册全部 builtin 包，
+/// 执行指定工具，返回结果。不走 ChatController，不维护 context。
+pub async fn run_tool_test(req: TestToolRequest, cwd: &std::path::Path) -> TestToolResponse {
+    use latte_rs_agent_tools::types::ToolManager as _;
+    let started = Instant::now();
+    let tool_id = &req.tool_id;
+
+    // 1. 创建 tool manager + 注册全部 builtin 包
+    let mgr = {
+        use latte_rs_agent_tools::prelude::*;
+        let mgr = create_tool_manager();
+        for p in builtin_tool_packages() {
+            if let Err(e) = mgr.register_package(p).await {
+                return TestToolResponse {
+                    ok: false,
+                    tool_id: tool_id.clone(),
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    response: None,
+                    error: Some(format!("注册 builtin package 失败: {e}")),
+                };
+            }
+        }
+        mgr
+    };
+
+    // 2. 别名解析：bash → exec
+    let resolved = match tool_id.as_str() {
+        "bash" => "exec".to_string(),
+        id => id.to_string(),
+    };
+
+    // 3. 查找工具
+    let full_name = mgr
+        .get_tool(&resolved)
+        .map(|_| resolved.clone())
+        .or_else(|| {
+            mgr.get_tool_names().into_iter().find(|n| {
+                n.rsplit_once('.').map(|(_, s)| s) == Some(resolved.as_str())
+            })
+        });
+
+    let Some(full_name) = full_name else {
+        let all = mgr.get_tool_names();
+        let err = format!("未找到工具「{tool_id}」。可用工具: {}", all.join(", "));
+        return TestToolResponse {
+            ok: false,
+            tool_id: tool_id.clone(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            response: None,
+            error: Some(err),
+        };
+    };
+
+    // 4. 构造 test context
+    let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(&full_name, 1);
+    ctx.metadata = Some(serde_json::json!({
+        "cwd": cwd.display().to_string(),
+    }));
+
+    // 5. 执行
+    match mgr.execute(&full_name, req.args, Some(ctx)).await {
+        Ok(val) => {
+            let text = serde_json::to_string_pretty(&val).unwrap_or_else(|_| format!("{val:?}"));
+            TestToolResponse {
+                ok: true,
+                tool_id: tool_id.clone(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                response: Some(text),
+                error: None,
+            }
+        }
+        Err(e) => TestToolResponse {
+            ok: false,
+            tool_id: tool_id.clone(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            response: None,
+            error: Some(format!("{e}")),
+        },
+    }
+}
+// ─── Role test ─────────────────────────────────────────────────────
+
+/// `POST /api/roles/test` 的请求体。
+#[derive(Deserialize)]
+pub struct TestRoleRequest {
+    /// 角色 ID。
+    pub role_id: String,
+    /// 角色配置（完整的角色定义）。
+    pub config: crate::api::SaveRoleConfigRequest,
+}
+
+/// `POST /api/roles/test` 的响应体。
+#[derive(Debug, Serialize)]
+pub struct TestRoleResponse {
+    pub ok: bool,
+    pub role_id: String,
+    pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+pub async fn run_role_test(
+    req: TestRoleRequest,
+    resolver: &latte_agent_core::model_resolver::ModelResolver,
+    cwd: &std::path::Path,
+) -> TestRoleResponse {
+    let started = Instant::now();
+    let role_id = req.role_id.clone();
+    let config = req.config;
+
+    // 1. 选择 model：优先用 model_chain 的第一个，否则按 tier 解析
+    let model_id = config
+        .model_chain
+        .first()
+        .cloned()
+        .unwrap_or_default();
+    let tier = latte_agent_core::model_resolver::ModelTier::parse(&config.model_tier)
+        .unwrap_or(latte_agent_core::model_resolver::ModelTier::Standard);
+
+    let resolved = if !model_id.is_empty() {
+        resolver.resolve_id_or_name(&model_id)
+    } else {
+        resolver.resolve(&role_id, tier)
+    };
+
+    let resolved = match resolved {
+        Ok(m) => m,
+        Err(e) => {
+            return TestRoleResponse {
+                ok: false,
+                role_id,
+                latency_ms: started.elapsed().as_millis() as u64,
+                response: None,
+                error: Some(format!("无法解析 model: {e}")),
+            };
+        }
+    };
+
+    // 2. 构造 AiClient（直接传入 Model）
+    let client = match latte_ai::client::AiClient::new(resolved) {
+        Ok(client) => client,
+        Err(e) => {
+            return TestRoleResponse {
+                ok: false,
+                role_id,
+                latency_ms: started.elapsed().as_millis() as u64,
+                response: None,
+                error: Some(format!("创建 AiClient 失败: {e}")),
+            };
+        }
+    };
+
+    // 3. 发一条测试消息
+    let messages = vec![
+        latte_ai::models::Message::system(config.prompt.clone()),
+        latte_ai::models::Message::user("你好，请用一句话介绍你自己。"),
+    ];
+    let params = latte_ai::params::GenerateParams {
+        temperature: config.temperature,
+        max_tokens: Some(150),
+        ..Default::default()
+    };
+
+    match client.chat(&messages, &params).await {
+        Ok(response) => {
+            let text = if response.content.is_empty() {
+                "（无返回内容）".to_string()
+            } else {
+                response.content
+            };
+            TestRoleResponse {
+                ok: true,
+                role_id,
+                latency_ms: started.elapsed().as_millis() as u64,
+                response: Some(excerpt(&text, 500)),
+                error: None,
+            }
+        }
+        Err(e) => TestRoleResponse {
+            ok: false,
+            role_id,
+            latency_ms: started.elapsed().as_millis() as u64,
+            response: None,
+            error: Some(format!("{e}")),
+        },
+    }
+}

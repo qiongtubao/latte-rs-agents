@@ -320,15 +320,111 @@ pub struct RolesConfigResponse {
     pub sessions_path: String,
 }
 
-/// 读取角色当前 prompt：优先 `prompt_file`（相对 backend cwd），读不到
-/// 或 None 时回退内嵌兜底 prompt，再不行空串。
+/// 全局配置根目录（`$LATTE_HOME` 或 `~/.latte`）。None = 无 HOME。
+fn global_root_dir() -> Option<PathBuf> {
+    latte_agent_core::global_config::GlobalConfig::global_dir()
+}
+
+/// 全局 agents.d 目录。
+fn global_agents_dir() -> PathBuf {
+    ConfigLayer::Global
+        .agents_dir()
+        .unwrap_or_else(|| global_root_dir().unwrap_or_default().join("agents.d"))
+}
+
+/// 文件存在且包含 `[roles.<role_id>]` 表（`roles = {}` 之类的空壳不算）。
+fn role_file_has_section(path: &std::path::Path, role_id: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.parse::<toml_edit::DocumentMut>().ok())
+        .map(|doc| {
+            doc.get("roles")
+                .and_then(|r| r.get(role_id))
+                .and_then(|r| r.as_table())
+                .is_some()
+        })
+        .unwrap_or(false)
+}
+
+/// 角色 TOML 的有效路径（显示 / 读取 / 写入共用，保证三处一致）：
+/// 1. 项目 agents 目录下的文件含 `[roles.<id>]` 节 → 项目路径；
+/// 2. 否则 → 全局 `agents.d/<id>.toml`（文件可能尚不存在，此时即保存目标，
+///    写入时创建）。
+/// 返回 `(路径, 是否项目层)`。
+fn resolve_role_toml_path(
+    project_agents_dir: &std::path::Path,
+    global_agents_dir: &std::path::Path,
+    role_id: &str,
+) -> (PathBuf, bool) {
+    let project_path = project_agents_dir.join(format!("{role_id}.toml"));
+    if role_file_has_section(&project_path, role_id) {
+        return (project_path, true);
+    }
+    (global_agents_dir.join(format!("{role_id}.toml")), false)
+}
+
+/// 角色 prompt 的有效路径，镜像 runtime `RoleTemplate::resolve` 的读取顺序：
+/// 1. `<cwd>/<prompt_file>` 存在 → 项目 prompt；
+/// 2. `<global_root>/prompts.d/<basename>` 存在 → 全局覆盖；
+/// 3. 都不存在 → 保存目标：项目角色走路径 1，全局角色走路径 2。
+/// 绝对路径 / `~` 前缀 / 含 `..` 的路径不做全局回退（与 runtime 一致），
+/// 直接按字面路径使用。
+fn resolve_prompt_path(
+    cwd: &std::path::Path,
+    global_root: Option<&std::path::Path>,
+    prompt_file: &str,
+    project_role: bool,
+) -> PathBuf {
+    let direct = cwd.join(prompt_file);
+    let skip_global = prompt_file.starts_with('/')
+        || prompt_file.starts_with('~')
+        || prompt_file.contains("..");
+    if skip_global {
+        return direct;
+    }
+    if direct.is_file() {
+        return direct;
+    }
+    let global = global_root.and_then(|root| {
+        std::path::Path::new(prompt_file)
+            .file_name()
+            .map(|b| root.join("prompts.d").join(b))
+    });
+    if let Some(g) = &global {
+        if g.is_file() {
+            return g.clone();
+        }
+    }
+    match (project_role, global) {
+        (true, _) => direct,
+        (false, Some(g)) => g,
+        (false, None) => direct,
+    }
+}
+
+/// 读取角色当前 prompt，镜像 runtime 的解析顺序：`cwd.join(prompt_file)`
+/// → 全局 `prompts.d/<basename>` → 内嵌兜底 prompt → 空串。
 fn read_role_prompt(
     cwd: &std::path::Path,
+    global_root: Option<&std::path::Path>,
     tpl: &latte_agent_core::role::RoleTemplate,
 ) -> String {
     if let Some(file) = &tpl.prompt_file {
+        let skip_global =
+            file.starts_with('/') || file.starts_with('~') || file.contains("..");
         if let Ok(content) = std::fs::read_to_string(cwd.join(file)) {
             return content;
+        }
+        if !skip_global {
+            if let Some(basename) = std::path::Path::new(file).file_name() {
+                if let Some(root) = global_root {
+                    if let Ok(content) =
+                        std::fs::read_to_string(root.join("prompts.d").join(basename))
+                    {
+                        return content;
+                    }
+                }
+            }
         }
     }
     latte_agent_core::prompts::for_role(&tpl.id)
@@ -337,12 +433,18 @@ fn read_role_prompt(
 }
 
 fn role_config_entry(
-    cwd: &std::path::Path,
-    agents_dir: &std::path::Path,
+    b: &UiBackend,
     tpl: &latte_agent_core::role::RoleTemplate,
 ) -> RoleConfigEntry {
-    let config_path = agents_dir.join(format!("{}.toml", tpl.id));
-    let prompt_path = tpl.prompt_file.as_ref().map(|file| cwd.join(file).display().to_string());
+    let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
+    let (toml_path, project_role) =
+        resolve_role_toml_path(&project_dir, &global_agents_dir(), &tpl.id);
+    let global_root = global_root_dir();
+    let prompt_path = tpl.prompt_file.as_ref().map(|file| {
+        resolve_prompt_path(&b.cwd, global_root.as_deref(), file, project_role)
+            .display()
+            .to_string()
+    });
     RoleConfigEntry {
         id: tpl.id.clone(),
         name: tpl.name.clone(),
@@ -355,8 +457,8 @@ fn role_config_entry(
         skills: tpl.skills.clone(),
         prompt_file: tpl.prompt_file.clone(),
         prompt_path,
-        config_path: config_path.display().to_string(),
-        prompt: read_role_prompt(cwd, tpl),
+        config_path: toml_path.display().to_string(),
+        prompt: read_role_prompt(&b.cwd, global_root.as_deref(), tpl),
     }
 }
 
@@ -381,7 +483,67 @@ async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
     Ok(names.into_iter().collect())
 }
 
+/// 从磁盘重新加载角色分层配置，整体替换内存中的 roles。
+///
+/// 背景：merged 只在 server 启动时加载一次，而角色 TOML 可能被外部
+/// 编辑器改动——角色编辑器「表单编辑」读内存、「源文件编辑」读磁盘，
+/// 两边会不一致。每次 `GET /api/roles/config` 前调用本函数，让表单
+/// 始终反映磁盘上的有效配置（之后新 session 也直接用新配置）。
+///
+/// 分层语义与 core `load_with_global` / `merge_global_into` 一致：
+/// 项目层优先；全局层只贡献项目未声明的 id，并为已声明的角色补空字段
+/// （`model_chain` / `icon` / `temperature`）。磁盘两层都没有任何角色
+/// 时保持内存现状（嵌入式/测试注入的纯内存配置不被清空）。
+fn reload_roles_from_disk(b: &UiBackend) {
+    reload_roles_from_disk_with(b, &global_agents_dir());
+}
+
+fn reload_roles_from_disk_with(b: &UiBackend, global_dir: &Path) {
+    use latte_agent_core::role::RoleTemplate;
+    let mut roles: std::collections::HashMap<String, RoleTemplate> = Default::default();
+    // 项目层：agents_config 原值（相对 b.cwd 解析），文件或目录模式均可。
+    let raw = PathBuf::from(&b.agents_config);
+    let abs = if raw.is_absolute() { raw } else { b.cwd.join(raw) };
+    if std::fs::metadata(&abs).is_ok() {
+        if let Some(p) = abs.to_str() {
+            if let Ok(part) = AgentConfig::load(p) {
+                roles.extend(part.roles);
+            }
+        }
+    }
+    // 全局层：项目未声明的 id 直接插入；已声明的只补空字段。
+    if global_dir.is_dir() {
+        if let Some(g) = global_dir.to_str().and_then(|p| AgentConfig::load(p).ok()) {
+            for (id, role) in g.roles {
+                match roles.entry(id) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(role);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let existing = e.get_mut();
+                        if existing.model_chain.is_empty() && !role.model_chain.is_empty() {
+                            existing.model_chain = role.model_chain;
+                        }
+                        if existing.icon.is_empty() && !role.icon.is_empty() {
+                            existing.icon = role.icon;
+                        }
+                        if existing.temperature.is_none() && role.temperature.is_some() {
+                            existing.temperature = role.temperature;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if roles.is_empty() {
+        return;
+    }
+    b.merged.write().roles = roles;
+}
+
 pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiError> {
+    // 表单数据与源文件 tab 同源：先从磁盘重载，再读内存。
+    reload_roles_from_disk(b);
     let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
     let roles = {
         let cfg = b.merged.read();
@@ -389,7 +551,7 @@ pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiE
         ids.sort();
         ids.into_iter()
             .filter_map(|id| cfg.roles.get(id))
-            .map(|tpl| role_config_entry(&b.cwd, &agents_dir, tpl))
+            .map(|tpl| role_config_entry(b, tpl))
             .collect()
     };
     let available_tools = enumerate_available_tools().await?;
@@ -507,11 +669,13 @@ fn write_role_toml(
         .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-/// 保存角色配置：重写 agents.d TOML → 写 prompt_file → 更新内存配置
+/// 保存角色配置：重写角色 TOML → 写 prompt 文件 → 更新内存配置
 /// （新 session 即刻生效）。三步全量落盘，与 HTTP 版语义一致。
 ///
-/// 写入路径策略：如果项目 agents.d 下已有该角色的文件则写项目目录，
-/// 否则写全局 `~/.latte/agents.d/`（角色从全局加载时）。prompt 文件同理。
+/// 写入路径由 [`resolve_role_toml_path`] / [`resolve_prompt_path`] 决定，
+/// 与 GET 展示的有效路径一致：项目层已有该角色 → 写项目；否则写全局。
+/// prompt 写入 runtime 实际读取的位置（项目 `<cwd>/<prompt_file>` 或全局
+/// `~/.latte/prompts.d/<basename>`）。
 pub fn save_role_config(
     b: &UiBackend,
     req: SaveRoleConfigRequest,
@@ -522,45 +686,25 @@ pub fn save_role_config(
     };
     let tpl = tpl.ok_or_else(|| ApiError::not_found(format!("role {:?} not found", req.id)))?;
 
-    // 1. 确定写入目录：项目目录有该角色文件 → 项目目录；否则 → 全局目录
+    // 1. 确定写入路径并重写 TOML（项目已有该角色 → 项目，否则 → 全局）
     let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
-    let global_dir = ConfigLayer::Global
-        .agents_dir()
-        .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(".latte/agents.d")
-        });
-    // 检查项目目录下该角色的 toml 文件是否包含有效的 [roles.<id>] 节。
-    // 仅文件存在但内容为 `roles = {}` 之类的空壳不算"项目有该角色"。
-    let project_path = project_dir.join(format!("{}.toml", req.id));
-    let project_has_role = project_path.exists()
-        && std::fs::read_to_string(&project_path)
-            .ok()
-            .and_then(|content| content.parse::<toml_edit::DocumentMut>().ok())
-            .map(|doc| {
-                doc.get("roles")
-                    .and_then(|r| r.get(req.id.as_str()))
-                    .and_then(|r| r.as_table())
-                    .is_some()
-            })
-            .unwrap_or(false);
-    let dir = if project_has_role { project_dir.clone() } else { global_dir };
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
-    let path = dir.join(format!("{}.toml", req.id));
+    let (path, project_role) =
+        resolve_role_toml_path(&project_dir, &global_agents_dir(), &req.id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    }
     write_role_toml(&path, &tpl, &req).map_err(ApiError::internal)?;
 
-    // 2. prompt 非空 → 写到该角色的 prompt_file（None → prompts/<id>.md）。
+    // 2. prompt 非空 → 写到 runtime 实际读取的有效路径（项目
+    // `<cwd>/<prompt_file>` 或全局 `prompts.d/<basename>`；prompt_file
+    // 为 None 时用 `prompts/<id>.md`）。
     if !req.prompt.is_empty() {
         let rel = tpl
             .prompt_file
             .clone()
             .unwrap_or_else(|| format!("prompts/{}.md", req.id));
-        // prompt 文件路径跟随 agents.d 目录：项目/全局目录的父级 .latte/
-        let base = dir.parent().unwrap_or(&b.cwd);
-        let p = base.join(&rel);
+        let p = resolve_prompt_path(&b.cwd, global_root_dir().as_deref(), &rel, project_role);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| ApiError::internal(format!("create {}: {e}", parent.display())))?;
@@ -580,7 +724,7 @@ pub fn save_role_config(
                 t.model_chain = req.model_chain.clone();
                 t.temperature = req.temperature;
                 t.tools = req.tools.clone();
-                role_config_entry(&b.cwd, &agents_config_dir(&b.cwd, &b.agents_config), t)
+                role_config_entry(b, t)
             }
             None => {
                 return Err(ApiError::not_found(format!("role {:?} not found", req.id)))
@@ -639,7 +783,7 @@ pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<Role
         let mut cfg = b.merged.write();
         cfg.roles.insert(role_id.to_string(), tpl.clone());
     }
-    Ok(role_config_entry(&b.cwd, &agents_dir, &tpl))
+    Ok(role_config_entry(b, &tpl))
 }
 
 /// `DELETE /api/roles/:id` — 删除角色：移除 agents.d 文件（项目 +
@@ -654,14 +798,7 @@ pub fn delete_role(b: &UiBackend, role_id: &str) -> Result<(), ApiError> {
     }
     // 尝试从项目目录和全局目录删除 toml 文件
     let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
-    let global_dir = latte_agent_core::config::ConfigLayer::Global
-        .agents_dir()
-        .unwrap_or_else(|| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(".latte/agents.d")
-        });
+    let global_dir = global_agents_dir();
     for dir in &[&agents_dir, &global_dir] {
         let path = dir.join(format!("{}.toml", role_id));
         if path.exists() {
@@ -939,6 +1076,213 @@ mod tests {
         let v = build_role_info(&cfg);
         assert!(v.is_empty());
     }
+
+    /// 写一个 `[roles.<id>]` TOML 文件到 `<dir>/<id>.toml`。
+    fn write_role_file(dir: &std::path::Path, id: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{id}.toml"));
+        std::fs::write(&path, format!("[roles.{id}]\nid = \"{id}\"\nname = \"N\"\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn resolve_role_toml_prefers_project_when_section_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project_agents");
+        let global = tmp.path().join("global_agents");
+        let pp = write_role_file(&project, "pm");
+        let gp = write_role_file(&global, "pm");
+        let (path, is_project) = resolve_role_toml_path(&project, &global, "pm");
+        assert!(is_project);
+        assert_eq!(path, pp);
+        // 项目文件存在但不含 [roles.pm] 节 → 落全局
+        std::fs::write(&pp, "roles = {}\n").unwrap();
+        let (path, is_project) = resolve_role_toml_path(&project, &global, "pm");
+        assert!(!is_project);
+        assert_eq!(path, gp);
+        // 两边都没有 → 全局保存目标
+        let (path, is_project) = resolve_role_toml_path(&project, &global, "ghost");
+        assert!(!is_project);
+        assert_eq!(path, global.join("ghost.toml"));
+    }
+
+    #[test]
+    fn resolve_prompt_path_mirrors_runtime_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        let global_root = tmp.path().join("global");
+        // 1. 项目 prompt 存在 → 项目路径
+        std::fs::create_dir_all(cwd.join("prompts")).unwrap();
+        let project_prompt = cwd.join("prompts/pm.md");
+        std::fs::write(&project_prompt, "project").unwrap();
+        assert_eq!(
+            resolve_prompt_path(&cwd, Some(&global_root), "prompts/pm.md", false),
+            project_prompt
+        );
+        // 2. 项目没有、全局 prompts.d 有 → 全局路径（即使角色在项目层）
+        std::fs::remove_file(&project_prompt).unwrap();
+        std::fs::create_dir_all(global_root.join("prompts.d")).unwrap();
+        let global_prompt = global_root.join("prompts.d/pm.md");
+        std::fs::write(&global_prompt, "global").unwrap();
+        assert_eq!(
+            resolve_prompt_path(&cwd, Some(&global_root), "prompts/pm.md", true),
+            global_prompt
+        );
+        // 3. 都没有 → 项目角色给项目保存目标，全局角色给全局保存目标
+        std::fs::remove_file(&global_prompt).unwrap();
+        assert_eq!(
+            resolve_prompt_path(&cwd, Some(&global_root), "prompts/pm.md", true),
+            project_prompt
+        );
+        assert_eq!(
+            resolve_prompt_path(&cwd, Some(&global_root), "prompts/pm.md", false),
+            global_prompt
+        );
+        // 4. 绝对路径不做全局回退
+        let abs = tmp.path().join("abs.md");
+        assert_eq!(
+            resolve_prompt_path(&cwd, Some(&global_root), abs.to_str().unwrap(), false),
+            abs
+        );
+    }
+
+    #[test]
+    fn read_role_prompt_falls_back_to_global_prompts_d() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        let global_root = tmp.path().join("global");
+        std::fs::create_dir_all(global_root.join("prompts.d")).unwrap();
+        std::fs::write(global_root.join("prompts.d/custom_role.md"), "global prompt").unwrap();
+        let tpl = latte_agent_core::role::RoleTemplate {
+            id: "custom_role".into(),
+            name: "Custom".into(),
+            category: "custom".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: Some("prompts/custom_role.md".into()),
+            temperature: None,
+            tools: vec![],
+            icon: String::new(),
+            skills: vec![],
+        };
+        // cwd 下没有文件 → 读全局 prompts.d
+        assert_eq!(
+            read_role_prompt(&cwd, Some(&global_root), &tpl),
+            "global prompt"
+        );
+        // cwd 下有了 → 项目优先
+        std::fs::create_dir_all(cwd.join("prompts")).unwrap();
+        std::fs::write(cwd.join("prompts/custom_role.md"), "project prompt").unwrap();
+        assert_eq!(
+            read_role_prompt(&cwd, Some(&global_root), &tpl),
+            "project prompt"
+        );
+    }
+
+    /// 构造一个只含注入角色（无磁盘层）的测试 backend。
+    fn test_backend(cwd: &Path) -> UiBackend {
+        let mut cfg = AgentConfig::default();
+        cfg.roles.insert(
+            "reload_ghost_9f3b".to_string(),
+            latte_agent_core::role::RoleTemplate {
+                id: "reload_ghost_9f3b".into(),
+                name: "Ghost".into(),
+                category: "custom".into(),
+                model_tier: "standard".into(),
+                model_chain: vec!["stale-model".into()],
+                prompt_file: None,
+                temperature: None,
+                tools: vec![],
+                icon: String::new(),
+                skills: vec![],
+            },
+        );
+        let resolver = latte_agent_core::model_resolver::ModelResolver::from_config(&cfg)
+            .expect("resolver");
+        UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(cwd.to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend")
+    }
+
+    #[test]
+    fn reload_roles_picks_up_external_file_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        let agents = cwd.join(".latte/agents.d");
+        std::fs::create_dir_all(&agents).unwrap();
+        let role_file = agents.join("pm.toml");
+        std::fs::write(
+            &role_file,
+            "[roles.pm]\nid = \"pm\"\nname = \"PM\"\ncategory = \"management\"\nmodel_tier = \"standard\"\nmodel_chain = [\"a\", \"b\"]\n",
+        )
+        .unwrap();
+        let b = test_backend(&cwd);
+        let no_global = tmp.path().join("no-such-global");
+
+        // 首次重载：磁盘角色替换内存注入角色
+        reload_roles_from_disk_with(&b, &no_global);
+        {
+            let cfg = b.merged.read();
+            assert_eq!(cfg.roles["pm"].model_chain, vec!["a", "b"]);
+            assert!(!cfg.roles.contains_key("reload_ghost_9f3b"));
+        }
+        // 外部编辑器改了文件 → 再次重载后表单数据随之更新
+        std::fs::write(
+            &role_file,
+            "[roles.pm]\nid = \"pm\"\nname = \"PM\"\ncategory = \"management\"\nmodel_tier = \"standard\"\nmodel_chain = [\"c\"]\n",
+        )
+        .unwrap();
+        reload_roles_from_disk_with(&b, &no_global);
+        assert_eq!(b.merged.read().roles["pm"].model_chain, vec!["c"]);
+    }
+
+    #[test]
+    fn reload_roles_keeps_memory_when_no_disk_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let b = test_backend(&cwd);
+        reload_roles_from_disk_with(&b, &tmp.path().join("no-such-global"));
+        // 磁盘两层都没有角色 → 内存配置原样保留
+        assert!(b.merged.read().roles.contains_key("reload_ghost_9f3b"));
+    }
+
+    #[test]
+    fn reload_roles_global_fills_empty_project_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        let agents = cwd.join(".latte/agents.d");
+        std::fs::create_dir_all(&agents).unwrap();
+        // 项目层有 pm 但 model_chain 为空
+        std::fs::write(
+            agents.join("pm.toml"),
+            "[roles.pm]\nid = \"pm\"\nname = \"PM\"\ncategory = \"management\"\nmodel_tier = \"standard\"\n",
+        )
+        .unwrap();
+        // 全局层同 id 带 model_chain → 应补齐
+        let global = tmp.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(
+            global.join("pm.toml"),
+            "[roles.pm]\nid = \"pm\"\nname = \"PM Global\"\ncategory = \"management\"\nmodel_tier = \"standard\"\nmodel_chain = [\"g1\"]\nicon = \"📋\"\n",
+        )
+        .unwrap();
+        let b = test_backend(&cwd);
+        reload_roles_from_disk_with(&b, &global);
+        let cfg = b.merged.read();
+        let pm = &cfg.roles["pm"];
+        assert_eq!(pm.model_chain, vec!["g1"]);
+        assert_eq!(pm.icon, "📋");
+        // 项目层已声明的字段不被全局覆盖
+        assert_eq!(pm.name, "PM");
+    }
 }
 
 // ─── Logs ────────────────────────────────────────────────────────
@@ -1045,15 +1389,19 @@ pub struct ToolsListResponse {
 }
 
 /// `GET /api/tools` — 列出所有可用工具，标记每个工具的启用/禁用状态。
+/// `enumerate()` 总是立即返回（预热完成前返回 fallback 列表），不阻塞。
 pub async fn list_tools(b: &UiBackend) -> Result<ToolsListResponse, ApiError> {
     let mut tools = crate::tools::enumerate()
         .await
         .map_err(|e| ApiError::internal(format!("enumerate tools: {e}")))?;
     let store = crate::tools::ToolsStore::new(&b.cwd);
-    for t in &mut tools {
-        t.enabled = store.is_enabled(&t.id);
+    for tool in &mut tools {
+        tool.enabled = store.is_enabled(&tool.id);
     }
-    let disabled: Vec<String> = store.disabled_ids().map(|s| s.to_string()).collect();
+    let disabled: Vec<String> = tools.iter()
+        .filter(|t| !t.enabled)
+        .map(|t| t.id.clone())
+        .collect();
     Ok(ToolsListResponse { tools, disabled })
 }
 
@@ -1362,4 +1710,69 @@ mod list_models_tests {
         };
         assert_eq!(k2, "deepseek/deepseek-v4-pro");
     }
+}
+
+/// `GET /api/roles/:id/toml` — 读取角色 TOML 源文件原始内容。
+/// 路径走 [`resolve_role_toml_path`]：项目层有该角色读项目文件，否则读全局文件。
+pub fn get_role_toml(b: &UiBackend, role_id: &str) -> Result<String, ApiError> {
+    let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
+    let (path, _) = resolve_role_toml_path(&project_dir, &global_agents_dir(), role_id);
+    if !path.exists() {
+        return Err(ApiError::not_found(format!(
+            "role {role_id:?} toml not found (looked at {})",
+            path.display()
+        )));
+    }
+    std::fs::read_to_string(&path)
+        .map_err(|e| ApiError::internal(format!("read {}: {e}", path.display())))
+}
+
+/// `PUT /api/roles/:id/toml` — 直接写入角色 TOML 源文件原始内容。
+/// 写入后更新内存中的 merged 配置，使新 session 生效。
+pub fn put_role_toml(b: &UiBackend, role_id: &str, raw: &str) -> Result<(), ApiError> {
+    // 1. 校验 TOML 可解析
+    let doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| ApiError::bad_request(format!("TOML 解析失败: {e}")))?;
+    // 校验存在 [roles.<id>] 节
+    let role_table = doc
+        .get("roles")
+        .and_then(|r| r.get(role_id))
+        .and_then(|r| r.as_table())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("TOML 中缺少 [roles.{role_id}] 节"))
+        })?;
+    // 可选：校验 id 字段匹配
+    if let Some(v) = role_table.get("id") {
+        if v.as_str() != Some(role_id) {
+            return Err(ApiError::bad_request(format!(
+                "TOML 中 id 字段为 {:?}，与请求角色 {role_id:?} 不匹配",
+                v.as_str().unwrap_or("?"),
+            )));
+        }
+    }
+
+    // 2. 确定写入路径（与 GET / 表单保存共用同一套有效路径解析）
+    let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
+    let (path, _) = resolve_role_toml_path(&project_dir, &global_agents_dir(), role_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    }
+    std::fs::write(&path, raw)
+        .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+
+    let file_cfg = latte_agent_core::config::AgentConfig::load(
+        path.to_str().ok_or_else(|| ApiError::internal("path not UTF-8".to_string()))?,
+    )
+    .map_err(|e| ApiError::internal(format!("reload {role_id}: {e}")))?;
+    if let Some(tpl) = file_cfg.roles.into_iter().next().map(|(_, v)| v) {
+        let mut cfg = b.merged.write();
+        cfg.roles.insert(role_id.to_string(), tpl);
+    } else {
+        return Err(ApiError::bad_request(format!(
+            "TOML 中未找到角色 {role_id:?}"
+        )));
+    }
+    Ok(())
 }
