@@ -3,9 +3,11 @@
 //! 工具发现分两层：
 //! 1. **builtin_tool_packages**：`create_tool_manager()` + `register_package(builtin_*)`
 //!    拿到所有 `git.*` / `exec` / `read` / `write` 等 Rust 内置工具。
-//! 2. **register_*_tool 调用点**：用 TreeSitterEngine 扫描 `latte-agent-core/src/`
-//!    找 `register_*_tool(...)` 函数（如 `register_delegate_tool`、`register_workflow_tool`），
+//! 2. **register_*_tool 调用点**：轻量文本扫描 `latte-agent-core/src/**/*.rs`
+//!    找 `register_*_tool` 标识符（如 `register_delegate_tool`、`register_workflow_tool`），
 //!    这些是 controller 在运行时动态注册的工具。
+//!    （原实现用 TreeSitterEngine 对整个 crate 建代码图，单次 >60s，
+//!    只为提取两个函数名——文本匹配毫秒级，结果等价。）
 //!
 //! 启用状态用 `.latte/tools.yaml`（项目）和 `~/.latte/tools.yaml`（全局）存：
 //! 仅记录用户**关闭**的工具（默认全开）。项目优先于全局。
@@ -271,48 +273,45 @@ fn reg_fn_to_id(reg_fn: &str) -> String {
     stem.to_string()
 }
 
-/// 扫描 `latte-agent-core/src/` 找 `register_*_tool` 调用点。
+/// 扫描 `latte-agent-core/src/**/*.rs` 找 `register_*_tool` 标识符。
 ///
-/// 复用 `latte-rs-graph` TreeSitterEngine，结果与 `role_graph` 共享。
+/// 轻量文本扫描：这里只需要函数名集合，文本匹配与建图结果等价。
+/// （原实现用 latte-rs-graph TreeSitterEngine 全量建图 + SQLite，
+/// 单次 >60s，曾把 server 启动拖到 ~65s。）
 async fn dynamic_registrations() -> Vec<String> {
-    use latte_rs_graph::prelude::*;
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = manifest
         .parent()
         .map(|p| p.join("latte-agent-core"))
         .unwrap_or_else(|| manifest.clone());
-    if !project_root.exists() {
-        return Vec::new();
-    }
-    let db_path = std::env::temp_dir().join("latte-tools-list.db");
-    let storage = match SqliteStorage::open(&db_path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    let engine = TreeSitterEngine::new(storage);
-    if engine
-        .build(&project_root, &BuildOptions::default())
-        .await
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let graph_data = match engine.graph_data().await {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
-    };
-    graph_data
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            let nm = n.name.as_str();
-            if nm.starts_with("register_") && nm.ends_with("_tool") {
-                Some(nm.to_string())
-            } else {
-                None
+    let mut found = BTreeSet::new();
+    let mut stack = vec![project_root.join("src")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
             }
-        })
-        .collect()
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let mut rest = text.as_str();
+            while let Some(pos) = rest.find("register_") {
+                let name: String = rest[pos..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if name.len() > "register_".len() && name.ends_with("_tool") {
+                    found.insert(name);
+                }
+                rest = &rest[pos + "register_".len()..];
+            }
+        }
+    }
+    found.into_iter().collect()
 }
 
 #[cfg(test)]

@@ -333,18 +333,17 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         .await
         .map_err(|e| anyhow::anyhow!("spawn default session controller: {e}"))?;
 
-    // 工具枚举预热：后台任务填充缓存（tools.rs 模块文档的设计），
-    // 完成前 HTTP 请求返回硬编码 fallback 列表。enumerate_inner 在本机
-    // 实测可达 ~65s，绝不能阻塞 bind。
-    tokio::spawn(async {
-        match crate::tools::enumerate_inner().await {
-            Ok(list) => {
-                crate::tools::set_enumerate_cache(list.clone());
-                eprintln!("[boot] tools enumeration: {} tools", list.len());
-            }
-            Err(e) => eprintln!("[boot] tools enumeration failed: {e}"),
+    // 在 bind HTTP 之前先完成工具枚举，确保服务启动后所有 HTTP 请求
+    // 都能立即拿到完整的工具列表（而非 fallback）。枚举本身已是毫秒级
+    // （dynamic_registrations 从 TreeSitter 全量建图改为文本扫描），
+    // 阻塞 bind 无感；失败时仍有 fallback 兜底。
+    match crate::tools::enumerate_inner().await {
+        Ok(list) => {
+            crate::tools::set_enumerate_cache(list.clone());
+            eprintln!("[boot] tools enumeration: {} tools", list.len());
         }
-    });
+        Err(e) => eprintln!("[boot] tools enumeration failed: {e}"),
+    }
 
     let static_dir = resolve_static_dir(static_dir);
 
