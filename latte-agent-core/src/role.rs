@@ -110,6 +110,11 @@ pub struct RoleTemplate {
     /// Example: `skills = ["screenshot_skill"]` loads `prompts/screenshot_skill.md`.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// 领域代码/文档路径（相对工作目录或绝对路径）。角色实例化时
+    /// **确定性注入**系统提示：文件直接内联内容（≤ 8KB），目录注入
+    /// 树状清单 —— 不依赖模型自觉去读。角色编辑器可编辑。
+    #[serde(default)]
+    pub code_paths: Vec<String>,
 }
 
 impl RoleTemplate {
@@ -193,6 +198,25 @@ impl RoleTemplate {
                 .or_else(|| crate::prompts::for_skill(skill_name).map(String::from));
         }
 
+        // code_paths：领域代码/文档资料，实例化时**确定性注入**——
+        // 文件直接内联内容、目录注入树状清单，不依赖模型自觉去读。
+        // 预算：单文件 ≤ 8KB（超出截断）、目录树深度 ≤ 3 / ≤ 200 条、
+        // 总量 ≤ 32KB。深入阅读仍靠 read/search 工具（prompt 装不下
+        // 整个代码库，这部分结构上绕不开）。
+        if !self.code_paths.is_empty() {
+            system_prompt.push_str("\n\n### 你的领域代码/文档资料\n\n以下内容来自你配置的领域路径，已直接载入，无需再读取；目录类路径只列出结构，文件内容用 read 工具按需查看：\n");
+            let mut budget: usize = 32 * 1024;
+            for p in &self.code_paths {
+                if budget == 0 {
+                    system_prompt.push_str("\n（已达注入上限，其余路径省略；可用工具自行查看）\n");
+                    break;
+                }
+                let rendered = render_code_path(p, budget);
+                budget -= rendered.len();
+                system_prompt.push_str(&rendered);
+            }
+        }
+
         Ok(Role {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -224,6 +248,110 @@ fn default_icon(role_id: &str) -> String {
         "tech_writer" => "📝".into(),
         "manager" => "👔".into(),
         _ => "🤖".into(),
+    }
+}
+
+// ─── code_paths 确定性注入 ────────────────────────────────────────
+
+/// 单文件内联上限（字节）。
+const CODE_PATH_FILE_CAP: usize = 8 * 1024;
+/// 目录树最大条目数。
+const CODE_PATH_TREE_CAP: usize = 200;
+/// 目录树最大深度。
+const CODE_PATH_TREE_DEPTH: usize = 3;
+/// 目录遍历时跳过的目录名。
+const CODE_PATH_SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", "__pycache__"];
+
+/// 把一条 code path 渲染成注入文本（长度 ≤ budget）：
+/// - 文件 → 内联内容（≤ 8KB，超出截断标注）
+/// - 目录 → 树状清单（深度 ≤ 3、≤ 200 条，跳过 .git/target 等）
+/// - 不存在 → 明确标注（确定性反馈，不静默）
+fn render_code_path(path: &str, budget: usize) -> String {
+    let p = std::path::Path::new(path);
+    let body = match std::fs::metadata(p) {
+        Err(_) => format!("\n#### `{path}`\n\n（路径不存在——请检查角色配置）\n"),
+        Ok(m) if m.is_file() => render_code_file(p, path),
+        Ok(_) => render_code_dir(p, path),
+    };
+    if body.len() > budget {
+        let mut cut: String = body.chars().take(budget).collect();
+        cut.push_str("\n…（超出注入预算，截断）\n");
+        cut
+    } else {
+        body
+    }
+}
+
+fn render_code_file(p: &std::path::Path, display: &str) -> String {
+    match std::fs::read(p) {
+        Err(e) => format!("\n#### `{display}`\n\n（读取失败：{e}）\n"),
+        Ok(bytes) => {
+            let (slice, truncated) = if bytes.len() > CODE_PATH_FILE_CAP {
+                (&bytes[..CODE_PATH_FILE_CAP], true)
+            } else {
+                (&bytes[..], false)
+            };
+            let text = String::from_utf8_lossy(slice);
+            let note = if truncated { "\n…（超过 8KB，截断）" } else { "" };
+            format!("\n#### `{display}`\n\n```\n{text}{note}\n```\n")
+        }
+    }
+}
+
+fn render_code_dir(p: &std::path::Path, display: &str) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    walk_code_dir(p, p, 0, &mut entries);
+    if entries.is_empty() {
+        return format!("\n#### `{display}/`\n\n（空目录或全部条目被过滤）\n");
+    }
+    entries.sort();
+    let total = entries.len();
+    let listing = entries
+        .into_iter()
+        .take(CODE_PATH_TREE_CAP)
+        .map(|e| format!("- {e}\n"))
+        .collect::<String>();
+    let note = if total > CODE_PATH_TREE_CAP {
+        format!("…（共 {total} 条，只列前 {CODE_PATH_TREE_CAP} 条）\n")
+    } else {
+        String::new()
+    };
+    format!("\n#### `{display}/`（目录结构）\n\n{listing}{note}")
+}
+
+fn walk_code_dir(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    if depth >= CODE_PATH_TREE_DEPTH || out.len() >= CODE_PATH_TREE_CAP {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for entry in rd.flatten() {
+        if out.len() >= CODE_PATH_TREE_CAP {
+            return;
+        }
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        if path.is_dir() {
+            if CODE_PATH_SKIP_DIRS.contains(&name.as_str()) || name.starts_with('.') {
+                continue;
+            }
+            out.push(format!("{rel}/"));
+            walk_code_dir(root, &path, depth + 1, out);
+        } else {
+            out.push(rel);
+        }
     }
 }
 
@@ -361,7 +489,67 @@ mod tests {
             tools: vec![],
             icon: "".into(),
             skills: vec![],
+            code_paths: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_injects_code_paths() {
+        // 真实临时夹具：一个文件 + 一个目录 + 一个不存在路径
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("notes.md"), "# 领域笔记\n要点一二三").unwrap();
+        std::fs::create_dir_all(root.join("src/inner")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn lib() {}").unwrap();
+        std::fs::write(root.join("src/inner/deep.rs"), "fn deep() {}").unwrap();
+
+        let mut tpl = make_template(None);
+        tpl.code_paths = vec![
+            root.join("notes.md").to_string_lossy().into_owned(),
+            root.join("src").to_string_lossy().into_owned(),
+            root.join("missing").to_string_lossy().into_owned(),
+        ];
+        let role = tpl.resolve(&Default::default()).await.unwrap();
+        let sp = &role.system_prompt;
+        assert!(sp.contains("你的领域代码/文档资料"), "prompt: {sp}");
+        // 文件内容被确定性内联
+        assert!(sp.contains("要点一二三"), "prompt: {sp}");
+        // 目录树条目
+        assert!(sp.contains("lib.rs"), "prompt: {sp}");
+        assert!(sp.contains("inner/"), "prompt: {sp}");
+        // 不存在路径明确标注
+        assert!(sp.contains("路径不存在"), "prompt: {sp}");
+        // 空 code_paths 不注入
+        let role2 = make_template(None).resolve(&Default::default()).await.unwrap();
+        assert!(!role2.system_prompt.contains("你的领域代码/文档资料"));
+    }
+
+    #[test]
+    fn test_render_code_file_truncates_over_8kb() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.txt");
+        std::fs::write(&f, "x".repeat(10 * 1024)).unwrap();
+        let out = render_code_path(&f.to_string_lossy(), 32 * 1024);
+        assert!(out.contains("超过 8KB，截断"), "out: {}", &out[..200]);
+        assert!(out.len() < 9 * 1024);
+    }
+
+    #[test]
+    fn test_render_code_dir_skips_hidden_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/config"), "x").unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/out.o"), "x").unwrap();
+        std::fs::write(root.join("keep.rs"), "x").unwrap();
+        let out = render_code_path(&root.to_string_lossy(), 32 * 1024);
+        assert!(out.contains("keep.rs"), "out: {out}");
+        assert!(!out.contains(".git"), "out: {out}");
+        assert!(!out.contains("target"), "out: {out}");
+        // 超预算截断
+        let tiny = render_code_path(&root.to_string_lossy(), 50);
+        assert!(tiny.contains("超出注入预算，截断"), "tiny: {tiny}");
     }
 
     #[tokio::test]

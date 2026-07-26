@@ -94,6 +94,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "📋".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "architect" => RoleTemplate {
             id: "architect".into(),
@@ -106,6 +107,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🏗️".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "programmer" => RoleTemplate {
             id: "programmer".into(),
@@ -123,6 +125,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             ],
             icon: "💻".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "tester" => RoleTemplate {
             id: "tester".into(),
@@ -140,6 +143,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             ],
             icon: "🧪".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "reviewer" => RoleTemplate {
             id: "reviewer".into(),
@@ -152,6 +156,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🔍".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "devops" => RoleTemplate {
             id: "devops".into(),
@@ -164,6 +169,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "bash".into(), "write".into()],
             icon: "🚀".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "security" => RoleTemplate {
             id: "security".into(),
@@ -176,6 +182,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🛡️".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "designer" => RoleTemplate {
             id: "designer".into(),
@@ -188,6 +195,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into()],
             icon: "🎨".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "tech_writer" => RoleTemplate {
             id: "tech_writer".into(),
@@ -200,6 +208,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "write".into()],
             icon: "📝".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "manager" => RoleTemplate {
             id: "manager".into(),
@@ -212,6 +221,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["delegate".into(), "workflow".into()],
             icon: "👔".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "mcp_agent" => RoleTemplate {
             id: "mcp_agent".into(),
@@ -224,6 +234,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["mcp".into(), "bash".into(), "read".into(), "list".into()],
             icon: "🔌".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         "advisor" => RoleTemplate {
             id: "advisor".into(),
@@ -236,6 +247,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             tools: vec!["read".into(), "list".into(), "search".into()],
             icon: "🦉".into(),
             skills: vec![],
+            code_paths: vec![],
         },
         _ => return None,
     })

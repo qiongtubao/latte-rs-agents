@@ -26,6 +26,12 @@ use crate::config::AgentConfig;
 use crate::controller::{build_tool_manager, ChatEvent};
 use crate::model_resolver::ModelResolver;
 
+/// Names that the runner injects into `vars` itself (`topic` from the
+/// user-provided topic, `step_id` / `speaker` per step). Declaring any
+/// of these as a step's `output_key` would silently overwrite the
+/// reserved value, corrupting downstream `{{…}}` substitutions.
+pub const RESERVED_OUTPUT_KEYS: &[&str] = &["topic", "step_id", "speaker"];
+
 /// One parsed workflow file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowDef {
@@ -39,6 +45,7 @@ pub struct WorkflowDef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowStepDef {
     pub id: String,
     #[serde(default)]
@@ -52,6 +59,10 @@ pub struct WorkflowStepDef {
     pub speakers: Vec<String>,
     #[serde(default)]
     pub prompt: String,
+    /// Key under which this step's last output is stored in the shared
+    /// `vars` map for downstream `{{key}}` substitution. Must be
+    /// non-empty and not collide with [`RESERVED_OUTPUT_KEYS`] — see
+    /// [`WorkflowDef::validate`].
     #[serde(default)]
     pub output_key: Option<String>,
     #[serde(default)]
@@ -108,6 +119,34 @@ impl WorkflowDef {
     ) -> String {
         self.render_task(step, vars)
     }
+
+    /// Validate `output_key` values before the workflow runs.
+    /// Rejects empty keys and keys that collide with
+    /// [`RESERVED_OUTPUT_KEYS`], which would silently corrupt
+    /// shared `vars`. Called at the start of [`run_workflow`]
+    /// and in [`load_workflow`] so that invalid TOML is caught
+    /// at parse time rather than during execution.
+    pub fn validate(&self) -> Result<(), String> {
+        for step in &self.steps {
+            if let Some(key) = &step.output_key {
+                if key.is_empty() {
+                    return Err(format!(
+                        "step '{}': output_key must not be empty",
+                        step.id
+                    ));
+                }
+                if RESERVED_OUTPUT_KEYS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "step '{}': output_key '{key}' is reserved \
+                         (used by the runner for topic / step context); \
+                         pick a non-reserved name",
+                        step.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn workflows_dirs(project_cwd: &Path) -> Vec<PathBuf> {
@@ -132,6 +171,7 @@ pub fn load_workflow(name: &str, project_cwd: &Path) -> Result<WorkflowDef, Stri
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             let wf: WorkflowDef = toml::from_str(&raw)
                 .map_err(|e| format!("invalid workflow {}: {e}", path.display()))?;
+            wf.validate()?;
             if wf.steps.is_empty() {
                 return Err(format!("workflow '{name}' has no steps"));
             }
@@ -210,6 +250,7 @@ pub async fn run_workflow(
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
+    wf.validate()?;
     let name = wf.name.clone();
     let wf_id = format!(
         "wf-{}-{}",
@@ -235,12 +276,27 @@ pub async fn run_workflow(
             .merged
             .roles
             .get(&role_id)
-            .ok_or_else(|| format!("role '{role_id}' not found in config"))?
+            .ok_or_else(|| {
+                format!(
+                    "role '{role_id}' not found in config. available roles: {}",
+                    crate::controller::role_roster_text(&ctx.merged)
+                )
+            })?
             .clone();
         let role = template
             .resolve(&ctx.default_params)
             .await
             .map_err(|e| format!("resolve role '{role_id}': {e}"))?;
+        // 与 chat 的 build_runner 一致：带工具的角色必须拿到工具调用协议
+        // 提示 + 系统 ground truth（cwd 等），否则模型不知道该用工具，
+        // 会回答"我没有文件访问权限"。
+        let mut role = role;
+        if !role.allowed_tools.is_empty() {
+            role.system_prompt
+                .push_str(&crate::controller::tool_usage_prompt(&role.allowed_tools));
+        }
+        role.system_prompt
+            .push_str(&crate::ground_truth::ground_truth_block(&ctx.cwd));
         let models = ctx
             .resolver
             .resolve_chain(&role.id, role.default_model_tier, &role.model_chain)
@@ -389,6 +445,148 @@ prompt = "review"
         assert_eq!(wf.speaker_roles(), vec!["pm", "architect", "advisor"]);
         let vars = std::collections::HashMap::from([("topic".to_string(), "X".to_string())]);
         assert_eq!(wf.render_prompt(&wf.steps[0], &vars), "do X");
+    }
+
+    /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
+    /// 使用 include_str! 直接引用真文件，确保 TOML 编辑后测试立即红。
+    #[test]
+    fn feature_design_design_step_has_output_key() {
+        let raw = include_str!("../../config/workflows/feature_design.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let design = wf.steps.iter().find(|s| s.id == "design")
+            .expect("step 'design' must exist");
+        assert_eq!(
+            design.output_key,
+            Some("design".to_string()),
+            "step 'design' missing output_key=\"design\" — required by LAT-106"
+        );
+    }
+
+    /// 验收：所有 step 的 prompt 中不包含"上面的"模糊引用。
+    /// 表驱动：未来新增 step 或 forbidden phrase 时无需改测试逻辑。
+    #[test]
+    fn no_vague_references_in_prompts() {
+        let raw = include_str!("../../config/workflows/feature_design.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let forbidden = ["上面的"];
+        for step in &wf.steps {
+            for phrase in &forbidden {
+                assert!(
+                    !step.prompt.contains(phrase),
+                    "step '{}' prompt contains forbidden vague reference '{}': {}",
+                    step.id, phrase, step.prompt
+                );
+            }
+        }
+    }
+
+    /// 集成行为验证：design step 的 prompt 渲染时正确注入 {{requirements}} 和 {{topic}}。
+    #[test]
+    fn design_step_prompt_renders_with_requirements_var() {
+        let raw = include_str!("../../config/workflows/feature_design.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let design = wf.steps.iter().find(|s| s.id == "design").unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("topic".into(), "AI 助手".into());
+        vars.insert("requirements".into(), "用户能创建笔记".into());
+        let rendered = wf.render_prompt(design, &vars);
+        assert!(rendered.contains("用户能创建笔记"), "must inject {{requirements}}: {rendered}");
+        assert!(rendered.contains("AI 助手"), "must inject {{topic}}: {rendered}");
+        // 确保没有残留的未替换模板语法
+        assert!(!rendered.contains("{{{"), "no unsubstituted template vars: {rendered}");
+    }
+
+    /// advisor_verdict 的 prompt 必须引用 {{requirements}} 和 {{design}} 两个 output_key。
+    #[test]
+    fn advisor_verdict_prompt_uses_named_vars() {
+        let raw = include_str!("../../config/workflows/feature_design.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let verdict = wf.steps.iter().find(|s| s.id == "advisor_verdict")
+            .expect("step 'advisor_verdict' must exist");
+        assert!(
+            verdict.prompt.contains("{{requirements}}"),
+            "advisor_verdict prompt must reference {{requirements}}"
+        );
+        assert!(
+            verdict.prompt.contains("{{design}}"),
+            "advisor_verdict prompt must reference {{design}} (from step 'design' output_key)"
+        );
+    }
+
+    /// Reserved `output_key` names (`topic`, `step_id`, `speaker`) must be rejected.
+    #[test]
+    fn reject_reserved_output_key() {
+        for reserved in ["topic", "step_id", "speaker"] {
+            let raw = format!(
+                r#"
+name = "bad"
+[[steps]]
+id = "s"
+speakers = ["pm"]
+prompt = "do {{}}"
+output_key = "{reserved}"
+"#
+            );
+            let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+            let err = wf.validate().expect_err("reserved key must be rejected");
+            assert!(err.contains("reserved"), "got: {err}");
+        }
+    }
+
+    /// Empty `output_key` must be rejected.
+    #[test]
+    fn reject_empty_output_key() {
+        let raw = r#"
+name = "bad"
+[[steps]]
+id = "s"
+speakers = ["pm"]
+prompt = "p"
+output_key = ""
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let err = wf.validate().expect_err("empty key must be rejected");
+        assert!(err.contains("empty"), "got: {err}");
+    }
+
+    /// Normal non-reserved, non-empty keys pass validation.
+    #[test]
+    fn validate_accepts_legitimate_output_keys() {
+        let raw = r#"
+name = "ok"
+[[steps]]
+id = "design"
+speakers = ["architect"]
+prompt = "do {{requirements}}"
+output_key = "design"
+[[steps]]
+id = "review"
+speakers = ["reviewer"]
+prompt = "review {{design}}"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        wf.validate().expect("non-reserved, non-empty keys must validate");
+    }
+
+    /// Typo `ouput_key` (missing 't') must be rejected at parse time by
+    /// `#[serde(deny_unknown_fields)]`, not silently treated as missing.
+    #[test]
+    fn reject_typo_ouput_key() {
+        let raw = r#"
+name = "typo"
+[[steps]]
+id = "s"
+speakers = ["pm"]
+prompt = "p"
+ouput_key = "design"
+"#;
+        let result: Result<WorkflowDef, _> = toml::from_str(raw);
+        assert!(
+            result.is_err(),
+            "typo 'ouput_key' must be rejected at parse time"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("ouput_key"), "error should mention the unknown field: {msg}");
     }
 }
 

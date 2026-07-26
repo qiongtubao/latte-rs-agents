@@ -286,6 +286,9 @@ pub enum ChatEvent {
         status: String,
         summary: String,
     },
+    /// 角色调用 generate_image 生成的图片。path 是 UI server 的
+    /// `/api/images/<file>` URL（web UI 直接渲染 <img>）。
+    ImageGenerated { role_id: String, path: String, prompt: String },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -1700,11 +1703,11 @@ async fn build_runner(
         prompt.push_str(&tool_usage_prompt(&role.allowed_tools));
         // Any role with "delegate" in its tools gets the delegation capability
         if role.allowed_tools.iter().any(|t| t == "delegate") {
-            prompt.push_str(DELEGATE_TOOL_HINT);
+            prompt.push_str(&delegate_tool_hint(merged));
         }
         // Any role with "workflow" in its tools gets the workflow hint.
         if role.allowed_tools.iter().any(|t| t == "workflow") {
-            prompt.push_str(WORKFLOW_TOOL_HINT);
+            prompt.push_str(&workflow_tool_hint(cwd));
         }
     }
     // Every role — tools or no tools — gets the system ground truth
@@ -1755,6 +1758,18 @@ async fn build_runner(
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register workflow: {e}")))?;
+        }
+        // Any role with "generate_image" in allowed_tools gets the image
+        // generation tool (OpenAI-compatible /v1/images/generations).
+        if role.allowed_tools.iter().any(|t| t == "generate_image") {
+            crate::image_gen::register_generate_image_tool(
+                &tm,
+                merged,
+                event_tx.clone(),
+                cwd.to_path_buf(),
+                role_id.to_string(),
+            )
+            .map_err(|e| AgentError::Tool(format!("register generate_image: {e}")))?;
         }
         Ok((
             AgentRunner::new_with_tools(agent, tm, 16)
@@ -1886,7 +1901,7 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         .build()
 }
 
-fn tool_usage_prompt(allowed: &[String]) -> String {
+pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
     let real_names: Vec<String> = allowed.iter()
         .map(|s| match s.as_str() {
             "bash" => "exec".to_string(),
@@ -1913,7 +1928,36 @@ Examples:
     )
 }
 
-const DELEGATE_TOOL_HINT: &str = r#"
+/// 当前配置里的角色花名册：`id(Name)` 排序拼接。delegate 工具的
+/// description/schema 和系统提示共用这一份 —— 角色编辑器新建/改名的
+/// 角色下个 session 自动出现，不靠静态列表。
+pub(crate) fn role_roster_text(merged: &AgentConfig) -> String {
+    let mut entries: Vec<String> = merged
+        .roles
+        .values()
+        .map(|t| {
+            if t.name.is_empty() || t.name == t.id {
+                t.id.clone()
+            } else {
+                format!("{}({})", t.id, t.name)
+            }
+        })
+        .collect();
+    entries.sort();
+    entries.join(", ")
+}
+
+/// delegate 工具提示：可用专家列表来自 `merged.roles` 动态生成
+/// （与角色编辑器同源），不再硬编码 7 个基础角色。
+fn delegate_tool_hint(merged: &AgentConfig) -> String {
+    let roster = role_roster_text(merged);
+    let roster_line = if roster.is_empty() {
+        "（当前配置里没有任何角色）".to_string()
+    } else {
+        roster
+    };
+    format!(
+        r#"
 ### 关键规则：你必须使用 delegate 工具
 
 你**必须**使用 `delegate` 工具来完成任务，**绝不能**直接输出计划而不执行。
@@ -1924,7 +1968,7 @@ const DELEGATE_TOOL_HINT: &str = r#"
 3. 等专家返回结果
 4. 综合所有结果输出最终答案
 
-可用专家：programmer(读代码), architect(架构), reviewer(审查), tester(测试), security(安全), designer(设计), advisor(资深顾问：失败诊断/根因分析/方案裁决)
+可用专家（来自角色配置，含角色编辑器新建的自定义角色）：{roster_line}
 
 失败升级：工具调用连续失败、专家报错且原因不明、或需要在多个方案间取舍时 → 派 advisor 诊断；诊断清楚之前不要直接回答用户，更不要重复回答旧问题。
 
@@ -1932,27 +1976,48 @@ const DELEGATE_TOOL_HINT: &str = r#"
 - 只输出计划而不调用 delegate ← 这是最常见的错误！不要这样做！
 - 自己分析而不派发给专家
 
-调用格式：<tool_call>delegate {"role": "programmer", "task": "读取 src/main.ts 的内容"}</tool_call>
-"#;
+调用格式：<tool_call>delegate {{"role": "programmer", "task": "读取 src/main.ts 的内容"}}</tool_call>
+"#
+    )
+}
 
-const WORKFLOW_TOOL_HINT: &str = r#"
+/// workflow 工具提示：动态列出 `.latte/workflows.d`（项目 + 全局）里
+/// 实际可用的 workflow —— UI 管理界面新建的自定义流程会出现在这里，
+/// 模型不需要靠猜。清单为空时退化成不带列表的通用提示。
+fn workflow_tool_hint(cwd: &std::path::Path) -> String {
+    let available = crate::workflow::list_workflows(cwd);
+    let list = if available.is_empty() {
+        "（当前 .latte/workflows.d 里没有可用 workflow，只能 delegate）\n".to_string()
+    } else {
+        available
+            .iter()
+            .map(|(n, d)| {
+                if d.is_empty() {
+                    format!("- `{n}`\n")
+                } else {
+                    format!("- `{n}` — {d}\n")
+                }
+            })
+            .collect()
+    };
+    format!(
+        r#"
 ### 你还可以用 workflow 工具触发多角色工作流
 
-当任务适合**固定的多角色流水线**时，调用 `workflow` 而不是逐个 delegate：
+当任务适合**固定的多角色流水线**时，调用 `workflow` 而不是逐个 delegate。
+当前可用的 workflow（含 UI 管理界面新建的自定义流程）：
 
-- 设计功能 / 方案讨论 → `feature_design`（PM → 架构 → 终审顾问）
-- 实现计划 / plan → `implementation_plan`（架构 → 工程 → 终审顾问）
-- TDD 开发 → `tdd_development`（测试先行 → 实现 → 验证 → 终审顾问）
-- 更新文档 → `update_docs`（分析变更 → 写文档 → 终审顾问）
-- 更新图谱 → `update_graph`（结构分析 → 更新图谱 → 终审顾问）
+{list}
+调用格式：<tool_call>workflow {{"name": "<name>", "topic": "为 UI 增加 session 管理"}}</tool_call>
 
-调用格式：<tool_call>workflow {"name": "feature_design", "topic": "为 UI 增加 session 管理"}</tool_call>
-
-判断标准：
+判断标准（分派前先想流程）：
 - 单点问题（读代码、改文件、审查某个具体实现）→ delegate
-- 需要多个角色按固定流程协作的完整任务（设计/plan/TDD/文档/图谱）→ workflow
-- workflow 会跑完整条流水线并把终审结论返回给你；你综合后再回复用户。
-"#;
+- 需要多个角色按固定流程协作的完整任务 → workflow，从上面清单里选最贴合的
+- 调用 workflow 前先用一句话说明：选哪个、为什么、预期拿到什么结论
+- workflow 会跑完整条流水线并把结论返回给你；你综合后再回复用户。
+"#
+    )
+}
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -1968,12 +2033,17 @@ async fn register_delegate_tool(
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
 
+    // 注册时把 merged.roles 的角色花名册写进 description/schema ——
+    // 角色编辑器新建/改名的角色对模型立刻可见（与系统提示同源：
+    // role_roster_text）。
+    let roster = role_roster_text(merged);
+
     let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
             ("role".into(), ToolInputProperty {
                 property_type: PropertyType::String,
-                description: Some("Specialist role id".into()),
+                description: Some(format!("Specialist role id. Available roles: {roster}")),
                 enum_values: None,
                 minimum: None,
                 maximum: None,
@@ -2050,7 +2120,11 @@ async fn register_delegate_tool(
                 .roles
                 .get(&role_id)
                 .ok_or_else(|| {
-                    tool_err(format!("role '{}' not found in config", role_id))
+                    tool_err(format!(
+                        "role '{}' not found in config. available roles: {}",
+                        role_id,
+                        role_roster_text(&merged)
+                    ))
                 })?
                 .clone();
             let role = template.resolve(&default_params).await.map_err(|e| {
@@ -2257,7 +2331,7 @@ async fn register_delegate_tool(
 
     let tool = Tool::builder(
         "delegate".to_string(),
-        "Delegate a subtask to a specialist agent.".to_string(),
+        format!("Delegate a subtask to a specialist agent. Available roles: {roster}"),
         input_schema,
         handler,
     )
@@ -2287,12 +2361,28 @@ async fn register_workflow_tool(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
 
+    // 注册时动态枚举 .latte/workflows.d（项目 + 全局）里的可用
+    // workflow，写进 schema/description —— UI 管理界面新建的自定义
+    // workflow 对模型立刻可见，不再靠静态样例列表。
+    let available = crate::workflow::list_workflows(&cwd);
+    let available_text = if available.is_empty() {
+        "none found in .latte/workflows.d".to_string()
+    } else {
+        available
+            .iter()
+            .map(|(n, d)| {
+                if d.is_empty() { n.clone() } else { format!("{n} — {d}") }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
     let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
             ("name".into(), ToolInputProperty {
                 property_type: PropertyType::String,
-                description: Some("Workflow name, e.g. feature_design / implementation_plan / tdd_development / update_docs / update_graph".into()),
+                description: Some(format!("Workflow name. Available: {available_text}")),
                 enum_values: None,
                 minimum: None,
                 maximum: None,
@@ -2365,7 +2455,7 @@ async fn register_workflow_tool(
 
     let tool = Tool::builder(
         "workflow".to_string(),
-        "Run a named multi-role workflow (feature_design, implementation_plan, tdd_development, update_docs, update_graph).".to_string(),
+        format!("Run a named multi-role workflow. Available workflows: {available_text}"),
         input_schema,
         handler,
     )
@@ -2397,6 +2487,71 @@ fn role_icon(role_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegate_hint_lists_roles_from_config() {
+        let mut cfg = AgentConfig::default();
+        for (id, name) in [("programmer", "Software Engineer"), ("my_custom_role", "")] {
+            cfg.roles.insert(
+                id.to_string(),
+                crate::role::RoleTemplate {
+                    id: id.into(),
+                    name: name.into(),
+                    category: "engineering".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+            code_paths: vec![],
+                },
+            );
+        }
+        let hint = delegate_tool_hint(&cfg);
+        assert!(hint.contains("programmer(Software Engineer)"), "hint: {hint}");
+        assert!(hint.contains("my_custom_role"), "hint: {hint}");
+        // 花名册排序：my_custom_role 在 programmer 前
+        let roster = role_roster_text(&cfg);
+        assert!(roster.find("my_custom_role").unwrap() < roster.find("programmer").unwrap());
+    }
+
+    #[test]
+    fn workflow_hint_lists_available_workflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("my_custom.toml"),
+            "name = \"my_custom\"\ndescription = \"自定义流程\"\n[[steps]]\nid = \"a\"\nspeakers = [\"tester\"]\nprompt = \"{{topic}}\"\n",
+        )
+        .unwrap();
+        let hint = workflow_tool_hint(dir.path());
+        assert!(hint.contains("`my_custom` — 自定义流程"), "hint: {hint}");
+        assert!(hint.contains("分派前先想流程"), "hint: {hint}");
+    }
+
+    #[test]
+    fn workflow_hint_empty_dir_degrades_gracefully() {
+        // list_workflows 会回退到全局 $LATTE_HOME/workflows.d —— 用
+        // ENV_LOCK + 空的 LATTE_HOME 隔离本机全局目录。
+        let guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("LATTE_HOME");
+        std::env::set_var("LATTE_HOME", home.path());
+        let hint = workflow_tool_hint(project.path());
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+        drop(guard);
+        assert!(hint.contains("没有可用 workflow"), "hint: {hint}");
+    }
 
     #[test]
     fn no_steps_returns_empty_plan() {
@@ -2761,6 +2916,7 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
                     tier: Some("standard".into()),
@@ -2782,6 +2938,7 @@ mod tests {
                     tools: vec![],
                     icon: "👔".into(),
                     skills: vec![],
+            code_paths: vec![],
                 },
             )]
             .into_iter()
@@ -2901,6 +3058,7 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
                     tier: Some("standard".into()),
@@ -2922,6 +3080,7 @@ mod tests {
                     tools: vec![],
                     icon: "💻".into(),
                     skills: vec![],
+            code_paths: vec![],
                 },
             )]
             .into_iter()
@@ -3027,6 +3186,7 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
                     tier: Some("standard".into()),
@@ -3048,6 +3208,7 @@ mod tests {
                     tools: vec![],
                     icon: "👔".into(),
                     skills: vec![],
+            code_paths: vec![],
                 },
             )]
             .into_iter()
