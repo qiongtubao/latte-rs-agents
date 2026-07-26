@@ -333,6 +333,113 @@ pub(crate) async fn self_loop_stop(State(state): State<AppState>) -> StatusCode 
     StatusCode::OK
 }
 
+// ─── Workflows（CRUD/validate/run 是薄壳；run/events 是 SSE） ─────
+
+pub(crate) async fn list_workflows_h(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::workflows::WorkflowSummary>>, (StatusCode, String)> {
+    api::list_workflows(&state.backend)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn get_workflow_h(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<crate::workflows::WorkflowDetail>, (StatusCode, String)> {
+    api::get_workflow(&state.backend, &name)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn create_workflow_h(
+    State(state): State<AppState>,
+    Json(form): Json<crate::workflows::WorkflowForm>,
+) -> Result<Json<crate::workflows::WorkflowDetail>, (StatusCode, String)> {
+    api::create_workflow(&state.backend, form)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn update_workflow_h(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(form): Json<crate::workflows::WorkflowForm>,
+) -> Result<Json<crate::workflows::WorkflowDetail>, (StatusCode, String)> {
+    api::update_workflow(&state.backend, &name, form)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn delete_workflow_h(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::delete_workflow(&state.backend, &name)
+        .map(|_| StatusCode::OK)
+        .map_err(Into::into)
+}
+
+pub(crate) async fn validate_workflow_h(
+    State(state): State<AppState>,
+    Json(form): Json<crate::workflows::WorkflowForm>,
+) -> Json<crate::workflows::ValidateResponse> {
+    Json(api::validate_workflow_form(&state.backend, &form))
+}
+
+pub(crate) async fn workflow_run_start_h(
+    State(state): State<AppState>,
+    Json(req): Json<api::WorkflowRunRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    api::workflow_run_start(&state.backend, req)
+        .map(|(resp, _rx)| Json(resp))
+        .map_err(Into::into)
+}
+
+pub(crate) async fn workflow_run_stop_h(State(state): State<AppState>) -> StatusCode {
+    api::workflow_run_stop(&state.backend);
+    StatusCode::OK
+}
+
+/// `GET /api/workflows/run/events` — 测试运行事件流，只转发
+/// Workflow* 事件（Started/Step/Turn/Finished），JSON 由
+/// `chat_event_to_frontend_json` 序列化（契约与 chat events 一致）。
+/// 开头先补发回放缓冲（前端 POST run 之后才连 SSE，Started/Step
+/// 可能已经在连接建立前发出）。
+pub(crate) async fn workflow_run_events_sse(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+    use latte_agent_core::controller::ChatEvent;
+    let (history, rx) = api::workflow_run_subscribe(&state.backend);
+    fn to_sse(ev: ChatEvent) -> Option<Result<Event, axum::Error>> {
+        if !matches!(
+            ev,
+            ChatEvent::WorkflowStarted { .. }
+                | ChatEvent::WorkflowStep { .. }
+                | ChatEvent::WorkflowTurn { .. }
+                | ChatEvent::WorkflowFinished { .. }
+        ) {
+            return None;
+        }
+        Some(match chat_event_to_frontend_json(&ev) {
+            Ok(json) => Ok(Event::default().event("chat_event").data(json)),
+            Err(e) => Ok(Event::default()
+                .event("error")
+                .data(format!("chat_event convert failed: {}", e))),
+        })
+    }
+    let replay = futures_util::stream::iter(history.into_iter().filter_map(to_sse));
+    let live = BroadcastStream::new(rx).filter_map(|item| match item {
+        Ok(ev) => to_sse(ev),
+        Err(e) => Some(Ok(Event::default()
+            .event("error")
+            .data(format!("broadcast lag: {}", e)))),
+    });
+    Sse::new(replay.chain(live)).keep_alive(
+        KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    )
+}
+
 // ─── Logs ────────────────────────────────────────────────────────
 
 /// `GET /api/logs` — 列出或读取 ui-sessions 日志。

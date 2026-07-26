@@ -13,6 +13,7 @@ import { mountRoleGraph } from "./role_graph";
 import { mountRoleEditor } from "./role_editor";
 import { mountToolsPanel } from "./tools_panel";
 import { mountModelsPanel } from "./models_panel";
+import { mountWorkflowsPanel } from "./workflows_panel";
 import { mountTestDialog } from "./test_panel";
 import { mountLogPanel } from "./log";
 import type { LatteUiApi } from "./host";
@@ -264,6 +265,29 @@ async function main(): Promise<void> {
       logListEl: $("log-file-list"),
       logContentEl: $("log-content"),
       statusEl: $("log-status"),
+    },
+  });
+
+  // Workflow 管理面板：下拉菜单 + 表单编辑器 + 试运行弹层
+  mountWorkflowsPanel({
+    container: {
+      panelEl: $("workflows-panel"),
+      openBtn: $("workflows-btn") as HTMLButtonElement,
+      closeBtn: $("workflows-close-btn") as HTMLButtonElement,
+      refreshBtn: $("workflows-refresh-btn") as HTMLButtonElement,
+      newBtn: $("workflows-new-btn") as HTMLButtonElement,
+      bodyEl: $("workflows-body"),
+      statusEl: $("workflows-status"),
+      pathsEl: $("workflows-paths"),
+      selectEl: $("workflows-select") as HTMLSelectElement,
+      runOverlayEl: $("workflow-run-modal"),
+      runCloseBtn: $("workflow-run-close") as HTMLButtonElement,
+      runTopicInput: $("workflow-run-topic") as HTMLTextAreaElement,
+      runVarsInput: $("workflow-run-vars") as HTMLTextAreaElement,
+      runStartBtn: $("workflow-run-start") as HTMLButtonElement,
+      runStopBtn: $("workflow-run-stop") as HTMLButtonElement,
+      runStatusEl: $("workflow-run-status"),
+      runTranscriptEl: $("workflow-run-transcript"),
     },
   });
 

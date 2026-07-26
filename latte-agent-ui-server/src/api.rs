@@ -8,18 +8,22 @@
 //!
 //! 所有函数都操作 [`crate::UiBackend`]（一个工作区一个容器）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
 use latte_agent_core::config::{AgentConfig, ConfigLayer, ModelDef};
 use latte_agent_core::controller::{ChatEvent, RoleInfo};
+use latte_agent_core::workflow::{load_workflow, run_workflow, WorkflowRunContext};
+use latte_ai::params::GenerateParams;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::role_graph::RoleGraph;
 use crate::sessions::{create_session_handle, SessionHandle};
+use crate::workflows::{self, ValidateResponse, WorkflowDetail, WorkflowForm, WorkflowSummary};
 use crate::UiBackend;
 
 pub use crate::self_loop::SelfLoopEvent;
@@ -927,6 +931,201 @@ pub fn self_loop_stop(b: &UiBackend) {
 /// 空 channel 的 receiver（前端 start 后重新订阅）。
 pub fn self_loop_subscribe(b: &UiBackend) -> broadcast::Receiver<SelfLoopEvent> {
     b.self_loop.subscribe()
+}
+
+// ─── Workflows ────────────────────────────────────────────────────
+
+/// `GET /api/workflows`。
+pub fn list_workflows(b: &UiBackend) -> Result<Vec<WorkflowSummary>, ApiError> {
+    Ok(workflows::list(&b.cwd))
+}
+
+/// `GET /api/workflows/:name`。
+pub fn get_workflow(b: &UiBackend, name: &str) -> Result<WorkflowDetail, ApiError> {
+    workflows::get(&b.cwd, name).map_err(ApiError::not_found)
+}
+
+/// 校验表单；errors 非空 → 400（消息为 join 后的全部错误）。
+fn validate_form_or_400(b: &UiBackend, form: &WorkflowForm) -> Result<(), ApiError> {
+    let v = workflows::validate(form, &b.merged.read());
+    if v.ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(v.errors.join("; ")))
+    }
+}
+
+/// `POST /api/workflows`：先校验，重名（项目或全局）→ 409。
+pub fn create_workflow(b: &UiBackend, form: WorkflowForm) -> Result<WorkflowDetail, ApiError> {
+    validate_form_or_400(b, &form)?;
+    if workflows::exists(&b.cwd, &form.name) {
+        return Err(ApiError {
+            status: 409,
+            message: format!("workflow '{}' already exists", form.name),
+        });
+    }
+    workflows::create(&b.cwd, &form).map_err(ApiError::internal)
+}
+
+/// `PUT /api/workflows/:name`：先校验；项目副本原地更新，只有全局
+/// 副本时生成项目遮蔽副本；`form.name != name` 即重命名。
+pub fn update_workflow(
+    b: &UiBackend,
+    name: &str,
+    form: WorkflowForm,
+) -> Result<WorkflowDetail, ApiError> {
+    validate_form_or_400(b, &form)?;
+    if !workflows::exists(&b.cwd, name) {
+        return Err(ApiError::not_found(format!("workflow '{name}' not found")));
+    }
+    workflows::update(&b.cwd, name, &form).map_err(ApiError::internal)
+}
+
+/// `DELETE /api/workflows/:name`：只删项目副本；只有全局副本 → 400。
+pub fn delete_workflow(b: &UiBackend, name: &str) -> Result<(), ApiError> {
+    workflows::delete(&b.cwd, name).map_err(|e| {
+        if e.contains("not found") {
+            ApiError::not_found(e)
+        } else {
+            ApiError::bad_request(e)
+        }
+    })
+}
+
+/// `POST /api/workflows/validate`：只校验，不落盘。
+pub fn validate_workflow_form(b: &UiBackend, form: &WorkflowForm) -> ValidateResponse {
+    workflows::validate(form, &b.merged.read())
+}
+
+/// `POST /api/workflows/run` 的请求体。`name`（跑已保存的 workflow）
+/// 与 `workflow`（跑编辑器里未保存的表单）必须且只能给一个。
+#[derive(Debug, Deserialize)]
+pub struct WorkflowRunRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub workflow: Option<WorkflowForm>,
+    pub topic: String,
+    /// 额外的 `{{var}}` 替换（在 `topic`/output_key 之外，运行前直接
+    /// 替换到各 step 的 prompt/task 文本里）。
+    #[serde(default)]
+    pub vars: Option<HashMap<String, String>>,
+}
+
+/// `POST /api/workflows/run`：校验 → 建 broadcast + cancel flag →
+/// spawn `run_workflow`。返回 `(响应 JSON, 事件订阅)`，语义同
+/// [`self_loop_start`]：Tauri 适配器需要订阅句柄在 spawn 前就绪，
+/// HTTP 壳只用响应 JSON，事件走 `GET /api/workflows/run/events`。
+pub fn workflow_run_start(
+    b: &UiBackend,
+    req: WorkflowRunRequest,
+) -> Result<(serde_json::Value, broadcast::Receiver<ChatEvent>), ApiError> {
+    if req.name.is_some() == req.workflow.is_some() {
+        return Err(ApiError::bad_request(
+            "exactly one of 'name' or 'workflow' is required",
+        ));
+    }
+    if req.topic.trim().is_empty() {
+        return Err(ApiError::bad_request("topic is required"));
+    }
+
+    // 解析 def：内联表单 → 直接构造（允许测试未保存的编辑）；
+    // name → 从 workflows.d 加载。两条路都先跑 validate。
+    let (wf, form) = match (&req.name, &req.workflow) {
+        (Some(name), None) => {
+            let wf = load_workflow(name, &b.cwd).map_err(ApiError::not_found)?;
+            let form = workflows::form_from_def(&wf);
+            (wf, form)
+        }
+        (None, Some(form)) => (workflows::def_from_form(form), form.clone()),
+        _ => unreachable!(),
+    };
+    validate_form_or_400(b, &form)?;
+
+    if b.workflow_run.is_active() {
+        return Err(ApiError {
+            status: 409,
+            message: "a workflow test run is already active".into(),
+        });
+    }
+
+    let (tx, rx) = broadcast::channel::<ChatEvent>(64);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let run_id = format!(
+        "wfui-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0)
+    );
+    b.workflow_run.start(tx.clone(), cancel.clone(), run_id.clone());
+
+    // 与 sessions.rs 的 ControllerConfig 一致：default_params 用
+    // GenerateParams::default()（session spawn 路径同款，也是
+    // controller 里 workflow 工具收到的值）。
+    let state = b.workflow_run.clone();
+    let merged = Arc::new(b.merged.read().clone());
+    let resolver = b.resolver.clone();
+    let cwd = b.cwd.clone();
+    let topic = req.topic.clone();
+    let vars = req.vars.clone();
+    let wf_name = wf.name.clone();
+    tokio::spawn(async move {
+        let mut wf = wf;
+        // vars 预替换：直接改各 step 的 prompt/task 文本（engine 只做
+        // topic/output_key 替换，不扩展它的签名）。
+        if let Some(vars) = vars {
+            for step in &mut wf.steps {
+                for (k, v) in &vars {
+                    step.prompt = step.prompt.replace(&format!("{{{{{k}}}}}"), v);
+                    step.task = step.task.replace(&format!("{{{{{k}}}}}"), v);
+                }
+            }
+        }
+        // engine 发到内部 channel，forwarder 经 state.broadcast 转发：
+        // 同一把锁内记录回放缓冲 + 广播，晚连接的 SSE 客户端能补到
+        // 开头的事件（见 WorkflowRunState::broadcast）。
+        let (tx_inner, mut rx_inner) = broadcast::channel::<ChatEvent>(64);
+        let fwd_state = state.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Ok(ev) = rx_inner.recv().await {
+                fwd_state.broadcast(ev);
+            }
+        });
+        let ctx = WorkflowRunContext {
+            merged,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd,
+            event_tx: tx_inner,
+            cancel_flag: cancel,
+        };
+        let _ = run_workflow(&wf, &topic, &ctx).await;
+        // engine 返回后丢掉 tx_inner 关闭内部 channel，forwarder 排空后退出。
+        drop(ctx);
+        let _ = forwarder.await;
+        state.clear();
+    });
+
+    Ok((
+        serde_json::json!({
+            "started": true,
+            "run_id": run_id,
+            "name": wf_name,
+        }),
+        rx,
+    ))
+}
+
+/// `POST /api/workflows/run/stop`。
+pub fn workflow_run_stop(b: &UiBackend) {
+    b.workflow_run.cancel();
+}
+
+/// 订阅测试运行事件并带回放缓冲（订阅前已发出的事件）。没有在跑的
+/// run 时返回空 history + 1-容量空 channel 的 receiver。
+pub fn workflow_run_subscribe(b: &UiBackend) -> (Vec<ChatEvent>, broadcast::Receiver<ChatEvent>) {
+    b.workflow_run.subscribe_with_history()
 }
 
 #[cfg(test)]

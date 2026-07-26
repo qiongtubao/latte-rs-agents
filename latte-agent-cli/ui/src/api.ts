@@ -593,4 +593,111 @@ export async function getModelCapabilities(
   );
 }
 
+// ─── Workflows ───────────────────────────────────────────────────────
+//
+// `WorkflowForm` / `StepForm` 与后端 `latte-agent-ui-server` 的 workflow
+// 管理接口一一对应（snake_case）。`source` 只有 project / global 两种：
+// 全局 workflow 只读，「保存」等价于复制一份到项目层（POST create）。
+
+export interface WorkflowSummary {
+  name: string;
+  description: string;
+  steps_count: number;
+  source: "project" | "global";
+  file_path: string;
+}
+
+export interface StepForm {
+  id: string;
+  description: string;
+  speakers: string[];
+  prompt: string;
+  output_key: string | null;
+}
+
+export interface WorkflowForm {
+  name: string;
+  description: string;
+  max_rounds: number | null;
+  steps: StepForm[];
+}
+
+export interface WorkflowDetail {
+  name: string;
+  description: string;
+  max_rounds: number | null;
+  steps: StepForm[];
+  source: "project" | "global";
+  file_path: string;
+  raw_toml: string;
+}
+
+export interface ValidateResponse {
+  ok: boolean;
+  errors: string[];
+  warnings: string[];
+}
+
+export interface WorkflowRunRequest {
+  name?: string;
+  workflow?: WorkflowForm;
+  topic: string;
+  vars?: Record<string, string>;
+}
+
+/** GET /api/workflows：列出所有 workflow（项目 + 全局）。 */
+export async function listWorkflows(): Promise<WorkflowSummary[]> {
+  return getTransport().request("GET", "/api/workflows");
+}
+
+/** GET /api/workflows/:name：取单个 workflow 详情（含 raw_toml）。 */
+export async function getWorkflow(name: string): Promise<WorkflowDetail> {
+  return getTransport().request(
+    "GET",
+    `/api/workflows/${encodeURIComponent(name)}`,
+  );
+}
+
+/** POST /api/workflows：新建 workflow（409 = 同名已存在）。 */
+export async function createWorkflow(form: WorkflowForm): Promise<WorkflowDetail> {
+  return getTransport().request("POST", "/api/workflows", form);
+}
+
+/** PUT /api/workflows/:name：更新 workflow；form.name 可与路径名不同（重命名）。 */
+export async function updateWorkflow(
+  name: string,
+  form: WorkflowForm,
+): Promise<WorkflowDetail> {
+  return getTransport().request(
+    "PUT",
+    `/api/workflows/${encodeURIComponent(name)}`,
+    form,
+  );
+}
+
+/** DELETE /api/workflows/:name：删除项目层 workflow（全局不可删）。 */
+export async function deleteWorkflow(name: string): Promise<void> {
+  await getTransport().request(
+    "DELETE",
+    `/api/workflows/${encodeURIComponent(name)}`,
+  );
+}
+
+/** POST /api/workflows/validate：校验表单，不落盘。 */
+export async function validateWorkflow(form: WorkflowForm): Promise<ValidateResponse> {
+  return getTransport().request("POST", "/api/workflows/validate", form);
+}
+
+/** POST /api/workflows/run：启动一次试运行（409 = 已有运行中的 run）。 */
+export async function runWorkflow(
+  req: WorkflowRunRequest,
+): Promise<{ run_id: string; started: true }> {
+  return getTransport().request("POST", "/api/workflows/run", req);
+}
+
+/** POST /api/workflows/run/stop：停止当前运行中的 workflow。 */
+export async function stopWorkflowRun(): Promise<void> {
+  await getTransport().request("POST", "/api/workflows/run/stop");
+}
+
 

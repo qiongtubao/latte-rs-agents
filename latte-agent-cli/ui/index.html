@@ -36,6 +36,7 @@
           <button id="role-editor-btn" type="button">⚙️ Roles</button>
           <button id="tools-btn" type="button" title="工具管理">🔧 Tools</button>
           <button id="models-btn" type="button" title="模型管理">📦 Models</button>
+          <button id="workflows-btn" type="button" title="Workflow 管理">🔀 Workflows</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
           <button id="log-btn" type="button" title="查看日志">📋 日志</button>
         </div>
@@ -255,6 +256,53 @@
         <div class="models-body" id="models-body">loading…</div>
         <div class="models-status" id="models-status"></div>
       </aside>
+
+      <!-- Workflow 管理面板（详见 ui/src/workflows_panel.ts） -->
+      <aside id="workflows-panel" class="side-panel tools-page hidden">
+        <header class="panel-header">
+          <h2>🔀 Workflows</h2>
+          <button id="workflows-new-btn" type="button" class="primary">＋ 新建</button>
+          <button id="workflows-refresh-btn" type="button" title="刷新">↻</button>
+          <button id="workflows-close-btn" type="button" class="panel-close">×</button>
+        </header>
+        <div class="models-paths" id="workflows-paths"></div>
+        <div class="models-select-row">
+          <label for="workflows-select" class="models-select-label">选择 workflow：</label>
+          <select id="workflows-select" class="models-select"><option value="">（加载中…）</option></select>
+        </div>
+        <div class="models-body" id="workflows-body">loading…</div>
+        <div class="models-status" id="workflows-status"></div>
+      </aside>
+
+      <!-- Workflow 试运行弹层（详见 ui/src/workflows_panel.ts） -->
+      <div id="workflow-run-modal" class="modal-overlay hidden">
+        <div class="modal workflow-run-modal">
+          <header class="modal-header">
+            <h2>Workflow 试运行</h2>
+            <button id="workflow-run-close" type="button" class="modal-close-btn">×</button>
+          </header>
+          <div class="modal-body">
+            <div class="workflow-run-form">
+              <label class="workflow-run-field">
+                主题（topic，替换 prompt 里的 {{topic}}）
+                <textarea id="workflow-run-topic" class="workflow-run-textarea" rows="3"
+                  placeholder="例如：为登录页补一组单元测试"></textarea>
+              </label>
+              <label class="workflow-run-field">
+                变量（vars，每行一个 key=value，空行忽略）
+                <textarea id="workflow-run-vars" class="workflow-run-textarea" rows="3"
+                  placeholder="lang=zh"></textarea>
+              </label>
+              <div class="workflow-run-actions">
+                <button id="workflow-run-start" type="button" class="primary">▶ 运行</button>
+                <button id="workflow-run-stop" type="button" class="danger">⏹ 停止</button>
+                <span id="workflow-run-status" class="workflow-run-status"></span>
+              </div>
+            </div>
+            <div id="workflow-run-transcript" class="workflow-run-transcript"></div>
+          </div>
+        </div>
+      </div>
       <!-- 日志查看器面板 -->
       <aside id="log-panel" class="side-panel hidden">
         <header class="panel-header">
