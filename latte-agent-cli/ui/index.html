@@ -38,6 +38,7 @@
           <button id="models-btn" type="button" title="模型管理">📦 Models</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
           <button id="log-btn" type="button" title="查看日志">📋 日志</button>
+          <button id="task-board-btn" type="button" title="任务看板">🗂 任务看板</button>
         </div>
       </header>
 
@@ -293,6 +294,22 @@
             <div id="log-content" class="log-content"></div>
           </div>
         </div>
+      </aside>
+
+      <!-- 任务看板面板（全屏覆盖层，详见 ui/src/task_board.ts） -->
+      <aside id="task-board-panel" class="tb-panel hidden">
+        <div class="tb-topbar">
+          <h1>任务看板</h1>
+          <span class="tb-sub">项目管理 · 任务状态机</span>
+          <div class="tb-spacer"></div>
+          <div class="tb-stat-chip"><span class="tb-dot" style="background:#3b82f6"></span>执行中 <b id="tb-stat-running">0</b></div>
+          <div class="tb-stat-chip"><span class="tb-dot" style="background:#8b5cf6"></span>已排期 <b id="tb-stat-scheduled">0</b></div>
+          <div class="tb-stat-chip"><span class="tb-dot" style="background:#f59e0b"></span>待评审 <b id="tb-stat-review">0</b></div>
+          <button id="task-board-new" type="button" class="tb-btn tb-btn-primary">＋ 新建任务</button>
+          <button id="task-board-close" type="button" class="panel-close" title="关闭">×</button>
+        </div>
+        <div id="task-board-status" class="tb-status"></div>
+        <div class="tb-board" id="tb-board">加载中…</div>
       </aside>
 
       <!-- 模型测试弹层（详见 ui/src/test_panel.ts） -->

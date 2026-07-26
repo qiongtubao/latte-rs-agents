@@ -50,6 +50,7 @@ pub mod role_graph;
 mod self_loop;
 mod sessions;
 mod models;
+pub mod tasks;
 pub mod tools;
 mod test;
 
@@ -138,6 +139,9 @@ pub struct UiBackend {
     /// agents 配置路径原值（文件或目录），角色编辑器保存时
     /// 用它定位 `.latte/agents.d/<id>.toml`。
     pub(crate) agents_config: String,
+    /// 任务看板：`<cwd>/.latte/tasks/` 的内存索引 + 原子写
+    /// （见 [`crate::tasks`]）。HTTP 路由与 scheduler 共用。
+    pub(crate) tasks: Arc<parking_lot::RwLock<tasks::TaskStore>>,
 }
 
 impl UiBackend {
@@ -175,13 +179,14 @@ impl UiBackend {
             sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             merged,
             resolver: Arc::new(model_resolver),
-            cwd,
+            cwd: cwd.clone(),
             initial_role,
             initial_tier,
             primary_model_id: model_id,
             self_loop: Arc::new(self_loop::SelfLoopState::default()),
             subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::new()),
             agents_config,
+            tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
         };
 
         // 恢复落盘的 ui-sessions（`<cwd>/.latte/ui-sessions/*.jsonl`）：
@@ -328,15 +333,18 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         .await
         .map_err(|e| anyhow::anyhow!("spawn default session controller: {e}"))?;
 
-    // 在 bind HTTP 之前先完成工具枚举，确保服务启动后所有 HTTP 请求
-    // 都能立即拿到完整的工具列表（而非 fallback）。
-    match crate::tools::enumerate_inner().await {
-        Ok(list) => {
-            crate::tools::set_enumerate_cache(list.clone());
-            eprintln!("[boot] tools enumeration: {} tools", list.len());
+    // 工具枚举预热：后台任务填充缓存（tools.rs 模块文档的设计），
+    // 完成前 HTTP 请求返回硬编码 fallback 列表。enumerate_inner 在本机
+    // 实测可达 ~65s，绝不能阻塞 bind。
+    tokio::spawn(async {
+        match crate::tools::enumerate_inner().await {
+            Ok(list) => {
+                crate::tools::set_enumerate_cache(list.clone());
+                eprintln!("[boot] tools enumeration: {} tools", list.len());
+            }
+            Err(e) => eprintln!("[boot] tools enumeration failed: {e}"),
         }
-        Err(e) => eprintln!("[boot] tools enumeration failed: {e}"),
-    }
+    });
 
     let static_dir = resolve_static_dir(static_dir);
 
@@ -344,7 +352,11 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         backend: Arc::new(backend),
         static_dir: static_dir.clone(),
     };
-    let app = build_router(state);
+    let app = build_router(state.clone());
+
+    // 任务看板 scheduler（§4）：启动时先立即扫一遍（补发关机期间
+    // 错过的排期），之后每 5s 扫描到期任务并派发给 manager。
+    tokio::spawn(tasks::scheduler_loop(state.backend.clone()));
 
     // 先 bind 再返回：端口 0 时把 OS 分配的真实端口带给调用方。
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -435,7 +447,18 @@ fn build_router(state: AppState) -> Router {
         .route("/roles/test", axum::routing::post(test_role))
         .route("/roles/:id", axum::routing::delete(delete_role))
         // 角色 TOML 源文件编辑
-        .route("/roles/:id/toml", get(get_role_toml).put(put_role_toml));
+        .route("/roles/:id/toml", get(get_role_toml).put(put_role_toml))
+        // 任务看板（docs/task-board-design.md §6）
+        .route("/tasks", get(list_tasks).post(create_task))
+        .route(
+            "/tasks/:id",
+            get(get_task)
+                .patch(update_task)
+                .delete(delete_task),
+        )
+        .route("/tasks/:id/dispatch", post(dispatch_task))
+        .route("/tasks/:id/abort", post(abort_task))
+        .route("/tasks/:id/report", post(report_task));
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);

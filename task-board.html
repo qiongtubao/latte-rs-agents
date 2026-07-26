@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>任务看板 · Latte 项目管理</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    }
+
+    body {
+      background: #eaeef3;
+      min-height: 100vh;
+      padding: 20px;
+      color: #1e293b;
+    }
+
+    /* ── 顶栏 ── */
+    .topbar {
+      max-width: 1600px;
+      margin: 0 auto 16px auto;
+      background: #ffffff;
+      border-radius: 20px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .topbar h1 {
+      font-size: 19px;
+      font-weight: 600;
+      letter-spacing: -0.3px;
+    }
+    .topbar .sub {
+      color: #64748b;
+      font-size: 13px;
+    }
+    .topbar .spacer { flex: 1; }
+
+    .stat-chip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12.5px;
+      padding: 6px 12px;
+      border-radius: 40px;
+      background: #f1f5f9;
+      color: #475569;
+      font-weight: 500;
+    }
+    .stat-chip .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .stat-chip b { color: #0f172a; }
+
+    .btn {
+      border: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      padding: 8px 16px;
+      border-radius: 12px;
+      transition: filter 0.15s, transform 0.05s;
+    }
+    .btn:hover { filter: brightness(0.96); }
+    .btn:active { transform: scale(0.97); }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-ghost { background: #f1f5f9; color: #334155; }
+    .btn-danger { background: #fee2e2; color: #b91c1c; }
+    .btn-sm { padding: 5px 10px; font-size: 12px; border-radius: 9px; }
+
+    /* ── 看板 ── */
+    .board {
+      max-width: 1600px;
+      margin: 0 auto;
+      display: flex;
+      gap: 14px;
+      overflow-x: auto;
+      padding-bottom: 16px;
+      align-items: flex-start;
+    }
+
+    .column {
+      flex: 0 0 262px;
+      background: #f4f7fa;
+      border-radius: 18px;
+      padding: 12px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
+    }
+    .column-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 6px 12px 6px;
+    }
+    .column-header .state-dot { width: 9px; height: 9px; border-radius: 50%; }
+    .column-header .state-name { font-size: 13.5px; font-weight: 600; }
+    .column-header .count {
+      font-size: 11.5px;
+      color: #64748b;
+      background: #e2e8f0;
+      padding: 1px 8px;
+      border-radius: 20px;
+      font-weight: 600;
+    }
+    .column-header .hint {
+      font-size: 11px;
+      color: #94a3b8;
+      width: 100%;
+      margin-top: 2px;
+    }
+    .column-header { flex-wrap: wrap; }
+
+    .column-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 60px;
+    }
+
+    /* ── 任务卡片 ── */
+    .card {
+      background: #ffffff;
+      border-radius: 14px;
+      padding: 12px 14px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.05);
+      cursor: pointer;
+      transition: box-shadow 0.15s, transform 0.1s;
+      border: 1px solid transparent;
+    }
+    .card:hover {
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.1);
+      transform: translateY(-1px);
+      border-color: #dbe4ee;
+    }
+    .card .card-top {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .card .task-id {
+      font-size: 11px;
+      font-weight: 700;
+      color: #64748b;
+      letter-spacing: 0.3px;
+    }
+    .prio {
+      font-size: 10.5px;
+      font-weight: 700;
+      padding: 1.5px 7px;
+      border-radius: 6px;
+    }
+    .prio.p1 { background: #fee2e2; color: #b91c1c; }
+    .prio.p2 { background: #ffedd5; color: #c2410c; }
+    .prio.p3 { background: #dbeafe; color: #1d4ed8; }
+    .prio.p4 { background: #f1f5f9; color: #64748b; }
+    .card .title {
+      font-size: 13.5px;
+      font-weight: 550;
+      line-height: 1.45;
+      margin-bottom: 8px;
+    }
+    .card .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 8px;
+      font-weight: 500;
+    }
+    .chip-sched { background: #ede9fe; color: #6d28d9; }
+    .chip-sched.due { background: #dcfce7; color: #15803d; }
+    .chip-session { background: #e0f2fe; color: #0369a1; }
+    .chip-session:hover { text-decoration: underline; }
+    .chip-rounds { background: #f1f5f9; color: #64748b; }
+
+    /* 卡片上的快捷动作 */
+    .card .quick-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px dashed #e8eef4;
+    }
+
+    /* ── 详情抽屉 ── */
+    .drawer-mask {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.25);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+      z-index: 40;
+    }
+    .drawer-mask.open { opacity: 1; pointer-events: auto; }
+    .drawer {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 440px;
+      max-width: 94vw;
+      height: 100vh;
+      background: #f8fafc;
+      box-shadow: -8px 0 32px rgba(0, 0, 0, 0.15);
+      transform: translateX(100%);
+      transition: transform 0.22s ease;
+      z-index: 50;
+      display: flex;
+      flex-direction: column;
+    }
+    .drawer.open { transform: translateX(0); }
+    .drawer-header {
+      background: #fff;
+      padding: 16px 20px;
+      border-bottom: 1px solid #eef2f6;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .drawer-header .task-id { font-size: 12px; font-weight: 700; color: #64748b; }
+    .drawer-header h3 { font-size: 15.5px; font-weight: 600; flex: 1; line-height: 1.4; }
+    .drawer-close {
+      border: none;
+      background: #f1f5f9;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      cursor: pointer;
+      font-size: 14px;
+      color: #475569;
+      flex-shrink: 0;
+    }
+    .drawer-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 18px 20px;
+    }
+    .drawer-section { margin-bottom: 20px; }
+    .drawer-section .label {
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #94a3b8;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+    .state-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 5px 12px;
+      border-radius: 40px;
+    }
+    .desc-box {
+      background: #fff;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 13.5px;
+      line-height: 1.6;
+      color: #334155;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      white-space: pre-wrap;
+    }
+    .kv { display: flex; font-size: 13px; padding: 5px 0; }
+    .kv .k { width: 88px; color: #94a3b8; flex-shrink: 0; }
+    .kv .v { color: #1e293b; font-weight: 500; }
+    .kv .v a { color: #2563eb; text-decoration: none; }
+    .kv .v a:hover { text-decoration: underline; }
+
+    /* 下一步动作区 —— 状态机核心 */
+    .next-step-box {
+      background: #fff;
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+      border: 1px solid #eef2f6;
+    }
+    .next-step-box .next-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #475569;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .next-step-box .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    /* 历史时间线 */
+    .timeline { position: relative; padding-left: 18px; }
+    .timeline::before {
+      content: '';
+      position: absolute;
+      left: 5px;
+      top: 6px;
+      bottom: 6px;
+      width: 2px;
+      background: #e2e8f0;
+      border-radius: 2px;
+    }
+    .tl-item { position: relative; padding: 0 0 14px 0; font-size: 12.5px; }
+    .tl-item:last-child { padding-bottom: 0; }
+    .tl-item::before {
+      content: '';
+      position: absolute;
+      left: -17px;
+      top: 4px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #cbd5e1;
+      border: 2px solid #f8fafc;
+    }
+    .tl-item.hl::before { background: #3b82f6; }
+    .tl-item .tl-text { color: #334155; font-weight: 500; }
+    .tl-item .tl-time { color: #94a3b8; font-size: 11.5px; margin-top: 1px; }
+
+    /* ── 定时弹窗 ── */
+    .modal-mask {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.35);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 60;
+    }
+    .modal-mask.open { display: flex; }
+    .modal {
+      background: #fff;
+      border-radius: 20px;
+      padding: 22px;
+      width: 360px;
+      box-shadow: 0 16px 48px rgba(0,0,0,0.2);
+      animation: pop 0.15s ease;
+    }
+    @keyframes pop { from { transform: scale(0.95); opacity: 0; } }
+    .modal h4 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+    .modal .modal-sub { font-size: 12.5px; color: #64748b; margin-bottom: 14px; }
+    .modal input[type="datetime-local"] {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 12px;
+      font-size: 13.5px;
+      font-family: inherit;
+      color: #1e293b;
+      outline: none;
+    }
+    .modal input[type="datetime-local"]:focus { border-color: #3b82f6; }
+    .modal .quick-times {
+      display: flex;
+      gap: 6px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .modal .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 18px;
+    }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: #0f172a;
+      color: #f1f5f9;
+      font-size: 13px;
+      padding: 10px 20px;
+      border-radius: 40px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.25);
+      opacity: 0;
+      transition: all 0.25s ease;
+      z-index: 100;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+
+  <!-- 顶栏 -->
+  <div class="topbar">
+    <h1>任务看板</h1>
+    <span class="sub">环形数组重构 · 项目管理</span>
+    <div class="spacer"></div>
+    <div class="stat-chip"><span class="dot" style="background:#3b82f6"></span>执行中 <b id="stat-running">0</b></div>
+    <div class="stat-chip"><span class="dot" style="background:#8b5cf6"></span>已排期 <b id="stat-scheduled">0</b></div>
+    <div class="stat-chip"><span class="dot" style="background:#f59e0b"></span>待评审 <b id="stat-review">0</b></div>
+    <button class="btn btn-primary" onclick="toast('打开新建任务弹窗（mock）')">＋ 新建任务</button>
+  </div>
+
+  <!-- 看板 -->
+  <div class="board" id="board"></div>
+
+  <!-- 详情抽屉 -->
+  <div class="drawer-mask" id="drawerMask" onclick="closeDrawer()"></div>
+  <div class="drawer" id="drawer"></div>
+
+  <!-- 定时弹窗 -->
+  <div class="modal-mask" id="scheduleModal">
+    <div class="modal">
+      <h4>指定时间执行</h4>
+      <div class="modal-sub" id="scheduleTaskTitle"></div>
+      <input type="datetime-local" id="scheduleInput">
+      <div class="quick-times">
+        <button class="btn btn-ghost btn-sm" onclick="setQuick(10)">10 分钟后</button>
+        <button class="btn btn-ghost btn-sm" onclick="setQuick(60)">1 小时后</button>
+        <button class="btn btn-ghost btn-sm" onclick="setQuickTonight()">今晚 20:00</button>
+        <button class="btn btn-ghost btn-sm" onclick="setQuickTomorrow()">明早 9:00</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" onclick="closeSchedule()">取消</button>
+        <button class="btn btn-primary" onclick="confirmSchedule()">确认排期</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    /* ─────────────────────────────────────────────
+       状态机定义（对齐 symphony tracker states）
+       active:    Todo / In Progress / Rework / Merging
+       非 active: Backlog / Human Review
+       terminal:  Done / Cancelled
+       每个状态声明自己的「下一步动作」
+    ───────────────────────────────────────────── */
+    const STATES = {
+      backlog:      { name: 'Backlog',      color: '#94a3b8', bg: '#f1f5f9', hint: '暂存区，不会被调度' },
+      todo:         { name: 'Todo',         color: '#3b82f6', bg: '#dbeafe', hint: '可立即执行，或指定时间执行' },
+      in_progress:  { name: 'In Progress',  color: '#22c55e', bg: '#dcfce7', hint: '已交给 manager 执行中' },
+      human_review: { name: 'Human Review', color: '#f59e0b', bg: '#fef3c7', hint: '执行完毕，等待人工确认' },
+      rework:       { name: 'Rework',       color: '#ef4444', bg: '#fee2e2', hint: '被打回，需重新派发' },
+      merging:      { name: 'Merging',      color: '#8b5cf6', bg: '#ede9fe', hint: '评审通过，合并收尾中' },
+      done:         { name: 'Done',         color: '#10b981', bg: '#d1fae5', hint: '已完成' },
+      cancelled:    { name: 'Cancelled',    color: '#64748b', bg: '#e2e8f0', hint: '已取消' },
+    };
+    const COLUMN_ORDER = ['backlog', 'todo', 'in_progress', 'human_review', 'rework', 'merging', 'done'];
+
+    /* 每个状态的「下一步」动作（状态机核心：状态 → 动作列表） */
+    const STATE_ACTIONS = {
+      backlog: [
+        { key: 'to_todo',    label: '→ 移到 Todo',  kind: 'primary' },
+        { key: 'edit',       label: '编辑',          kind: 'ghost' },
+        { key: 'cancel',     label: '取消任务',       kind: 'danger' },
+      ],
+      todo: [
+        { key: 'run_now',    label: '▶ 立即执行',    kind: 'primary' },
+        { key: 'schedule',   label: '🕐 指定时间执行', kind: 'ghost' },
+        { key: 'to_backlog', label: '移回 Backlog',  kind: 'ghost' },
+      ],
+      todo_scheduled: [
+        { key: 'run_now',       label: '▶ 立即执行',  kind: 'primary' },
+        { key: 'schedule',      label: '修改时间',     kind: 'ghost' },
+        { key: 'unschedule',    label: '取消排期',     kind: 'ghost' },
+      ],
+      in_progress: [
+        { key: 'open_session', label: '💬 查看对话',  kind: 'primary' },
+        { key: 'abort',        label: '中止执行',     kind: 'danger' },
+      ],
+      human_review: [
+        { key: 'open_session', label: '💬 查看对话',  kind: 'primary' },
+        { key: 'approve',      label: '✓ 确认通过',   kind: 'primary' },
+        { key: 'reject',       label: '↩ 打回重做',   kind: 'danger' },
+      ],
+      rework: [
+        { key: 'run_now', label: '▶ 重新派发', kind: 'primary' },
+        { key: 'edit',    label: '编辑补充要求', kind: 'ghost' },
+      ],
+      merging: [
+        { key: 'open_session', label: '💬 查看对话', kind: 'ghost' },
+        { key: 'mark_done',    label: '✓ 标记完成',  kind: 'primary' },
+      ],
+      done: [
+        { key: 'reopen', label: '重新打开', kind: 'ghost' },
+      ],
+      cancelled: [
+        { key: 'reopen', label: '重新打开', kind: 'ghost' },
+      ],
+    };
+
+    /* ── mock 数据 ── */
+    let seq = 108;
+    const tasks = [
+      {
+        id: 'LAT-101', title: '梳理 ringbuf 现有 API 与调用点', prio: 2,
+        state: 'backlog', desc: 'grep 全仓 ring buffer 的读写点，输出一份 API 清单与调用关系，作为重构输入。',
+        scheduledAt: null, sessionId: null, createdAt: '07-24 10:12',
+        history: [{ t: '07-24 10:12', text: '任务创建于 Backlog' }],
+      },
+      {
+        id: 'LAT-102', title: '设计无锁环形数组新结构', prio: 1,
+        state: 'todo', desc: '基于 Seqlock + CAS 设计 SPSC 无锁 ringbuf，写设计文档到 docs/，交给 manager 组织 architect 评审。',
+        scheduledAt: null, sessionId: null, createdAt: '07-24 11:03',
+        history: [
+          { t: '07-24 11:03', text: '任务创建于 Backlog' },
+          { t: '07-24 14:20', text: 'Backlog → Todo' },
+        ],
+      },
+      {
+        id: 'LAT-103', title: '跑一遍现有 benchmark 基线', prio: 3,
+        state: 'todo', desc: '执行 cargo bench 记录基线数据，供重构后对比。',
+        scheduledAt: Date.now() + 45 * 60 * 1000, sessionId: null, createdAt: '07-25 09:40',
+        history: [
+          { t: '07-25 09:40', text: '任务创建于 Todo' },
+          { t: '07-25 09:41', text: '排期：到点自动交给 manager' },
+        ],
+      },
+      {
+        id: 'LAT-104', title: '实现新 ringbuf 核心读写路径', prio: 1,
+        state: 'in_progress', desc: '按 LAT-102 的设计实现 push/pop，要求通过现有单测。交给 manager 后由 programmer 实施。',
+        scheduledAt: null, sessionId: 'ui-2048757-1784996775457', createdAt: '07-25 15:22',
+        history: [
+          { t: '07-25 15:22', text: '任务创建于 Todo' },
+          { t: '07-26 09:00', text: '排期到点，自动派发' },
+          { t: '07-26 09:00', text: 'Todo → In Progress，交给 manager（新 session）', hl: true },
+        ],
+      },
+      {
+        id: 'LAT-105', title: '补充并发压力测试', prio: 2,
+        state: 'human_review', desc: '多线程压测 push/pop 的正确性与吞吐，manager 已组织 tester 完成，等待人工确认结果。',
+        scheduledAt: null, sessionId: 'ui-2047297-1784996758053', createdAt: '07-25 16:10',
+        history: [
+          { t: '07-25 16:10', text: '任务创建于 Todo' },
+          { t: '07-25 16:30', text: '立即执行，交给 manager' },
+          { t: '07-25 18:02', text: 'manager 汇报完成 → Human Review', hl: true },
+        ],
+      },
+      {
+        id: 'LAT-106', title: '修复 reviewer 提出的边界条件', prio: 1,
+        state: 'rework', desc: 'reviewer 指出 wrap-around 时 size 计算有 off-by-one，需打回重做并补回归用例。',
+        scheduledAt: null, sessionId: 'ui-2048757-1784996776232', createdAt: '07-25 20:44',
+        history: [
+          { t: '07-25 20:44', text: '立即执行，交给 manager' },
+          { t: '07-25 22:10', text: '→ Human Review' },
+          { t: '07-26 08:55', text: '人工打回 → Rework：off-by-one 未修干净', hl: true },
+        ],
+      },
+      {
+        id: 'LAT-107', title: '迁移全部调用点到新 ringbuf', prio: 2,
+        state: 'merging', desc: '评审已通过，正在合并收尾：更新文档、清理旧实现。',
+        scheduledAt: null, sessionId: 'ui-2047428-1784996760093', createdAt: '07-23 13:00',
+        history: [
+          { t: '07-23 13:00', text: '任务创建并立即执行' },
+          { t: '07-24 17:30', text: 'Human Review 通过 → Merging', hl: true },
+        ],
+      },
+      {
+        id: 'LAT-108', title: '旧 ringbuf 代码下线', prio: 4,
+        state: 'done', desc: '删除旧实现与 feature flag。',
+        scheduledAt: null, sessionId: 'ui-2047297-1784996758851', createdAt: '07-22 10:00',
+        history: [
+          { t: '07-22 10:00', text: '任务创建并立即执行' },
+          { t: '07-22 15:40', text: 'Merging → Done ✓', hl: true },
+        ],
+      },
+    ];
+
+    /* ── 工具函数 ── */
+    function fmtTime(ts) {
+      const d = new Date(ts);
+      const pad = n => String(n).padStart(2, '0');
+      return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    function nowStr() { return fmtTime(Date.now()); }
+    function toast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.add('show');
+      clearTimeout(el._t);
+      el._t = setTimeout(() => el.classList.remove('show'), 2400);
+    }
+    function effectiveActions(task) {
+      if (task.state === 'todo' && task.scheduledAt) return STATE_ACTIONS.todo_scheduled;
+      return STATE_ACTIONS[task.state] || [];
+    }
+
+    /* ── 渲染看板 ── */
+    function render() {
+      const board = document.getElementById('board');
+      board.innerHTML = '';
+      for (const key of COLUMN_ORDER) {
+        const st = STATES[key];
+        const list = tasks.filter(t => t.state === key);
+        const col = document.createElement('div');
+        col.className = 'column';
+        col.innerHTML = `
+          <div class="column-header">
+            <span class="state-dot" style="background:${st.color}"></span>
+            <span class="state-name">${st.name}</span>
+            <span class="count">${list.length}</span>
+            <span class="hint">${st.hint}</span>
+          </div>
+          <div class="column-body"></div>`;
+        const body = col.querySelector('.column-body');
+        for (const task of list) body.appendChild(renderCard(task));
+        board.appendChild(col);
+      }
+      // 统计
+      document.getElementById('stat-running').textContent = tasks.filter(t => t.state === 'in_progress').length;
+      document.getElementById('stat-scheduled').textContent = tasks.filter(t => t.state === 'todo' && t.scheduledAt).length;
+      document.getElementById('stat-review').textContent = tasks.filter(t => t.state === 'human_review').length;
+    }
+
+    function renderCard(task) {
+      const el = document.createElement('div');
+      el.className = 'card';
+      el.onclick = () => openDrawer(task.id);
+
+      let meta = '';
+      if (task.scheduledAt && task.state === 'todo') {
+        const due = task.scheduledAt <= Date.now();
+        meta += `<span class="chip chip-sched ${due ? 'due' : ''}">🕐 ${due ? '到点待派发' : fmtTime(task.scheduledAt) + ' 执行'}</span>`;
+      }
+      if (task.sessionId) {
+        meta += `<span class="chip chip-session" onclick="event.stopPropagation();openSession('${task.id}')">💬 session</span>`;
+      }
+      if (task.state === 'in_progress') {
+        meta += `<span class="chip chip-rounds">manager · 3 delegates</span>`;
+      }
+
+      // 卡片快捷动作（只放主动作，其余进抽屉）
+      const primary = effectiveActions(task).find(a => a.kind === 'primary');
+      let quick = '';
+      if (primary) {
+        quick = `<div class="quick-actions">
+          <button class="btn btn-sm ${primary.kind === 'danger' ? 'btn-danger' : 'btn-primary'}"
+            onclick="event.stopPropagation();doAction('${task.id}','${primary.key}')">${primary.label}</button>
+        </div>`;
+      }
+
+      el.innerHTML = `
+        <div class="card-top">
+          <span class="task-id">${task.id}</span>
+          <span class="prio p${task.prio}">P${task.prio}</span>
+        </div>
+        <div class="title">${task.title}</div>
+        <div class="meta">${meta}</div>
+        ${quick}`;
+      return el;
+    }
+
+    /* ── 详情抽屉 ── */
+    let drawerTaskId = null;
+    function openDrawer(id) {
+      drawerTaskId = id;
+      const task = tasks.find(t => t.id === id);
+      const st = STATES[task.state];
+      const drawer = document.getElementById('drawer');
+
+      const actions = effectiveActions(task).map(a => {
+        const cls = a.kind === 'primary' ? 'btn-primary' : a.kind === 'danger' ? 'btn-danger' : 'btn-ghost';
+        return `<button class="btn ${cls}" onclick="doAction('${task.id}','${a.key}')">${a.label}</button>`;
+      }).join('');
+
+      const history = [...task.history].reverse().map(h =>
+        `<div class="tl-item ${h.hl ? 'hl' : ''}">
+           <div class="tl-text">${h.text}</div>
+           <div class="tl-time">${h.t}</div>
+         </div>`).join('');
+
+      drawer.innerHTML = `
+        <div class="drawer-header">
+          <span class="task-id">${task.id}</span>
+          <h3>${task.title}</h3>
+          <button class="drawer-close" onclick="closeDrawer()">✕</button>
+        </div>
+        <div class="drawer-body">
+          <div class="drawer-section">
+            <span class="state-badge" style="background:${st.bg};color:${st.color}">
+              <span style="width:8px;height:8px;border-radius:50%;background:${st.color}"></span>${st.name}
+            </span>
+          </div>
+
+          <div class="drawer-section">
+            <div class="label">下一步动作 · 当前状态可执行</div>
+            <div class="next-step-box">
+              <div class="next-title">⚡ ${st.name} 状态下可用</div>
+              <div class="actions">${actions}</div>
+            </div>
+          </div>
+
+          <div class="drawer-section">
+            <div class="label">任务描述</div>
+            <div class="desc-box">${task.desc}</div>
+          </div>
+
+          <div class="drawer-section">
+            <div class="label">属性</div>
+            <div class="kv"><span class="k">优先级</span><span class="v">P${task.prio}</span></div>
+            <div class="kv"><span class="k">创建时间</span><span class="v">${task.createdAt}</span></div>
+            ${task.scheduledAt && task.state === 'todo'
+              ? `<div class="kv"><span class="k">排期时间</span><span class="v">🕐 ${fmtTime(task.scheduledAt)}（到点自动交给 manager）</span></div>` : ''}
+            ${task.sessionId
+              ? `<div class="kv"><span class="k">执行会话</span><span class="v"><a href="#" onclick="openSession('${task.id}');return false">${task.sessionId} ↗</a></span></div>` : ''}
+          </div>
+
+          <div class="drawer-section">
+            <div class="label">状态历史</div>
+            <div class="timeline">${history}</div>
+          </div>
+        </div>`;
+
+      drawer.classList.add('open');
+      document.getElementById('drawerMask').classList.add('open');
+    }
+    function closeDrawer() {
+      drawerTaskId = null;
+      document.getElementById('drawer').classList.remove('open');
+      document.getElementById('drawerMask').classList.remove('open');
+    }
+
+    /* ── 动作处理（mock 状态机流转） ── */
+    function pushHistory(task, text, hl) {
+      task.history.push({ t: nowStr(), text, hl: !!hl });
+    }
+    function refresh() {
+      render();
+      if (drawerTaskId) openDrawer(drawerTaskId);
+    }
+
+    function doAction(id, key) {
+      const task = tasks.find(t => t.id === id);
+      switch (key) {
+        case 'to_todo':
+          task.state = 'todo';
+          pushHistory(task, 'Backlog → Todo');
+          toast(`${id} 已移到 Todo，可立即或定时执行`);
+          break;
+        case 'to_backlog':
+          task.state = 'backlog';
+          task.scheduledAt = null;
+          pushHistory(task, 'Todo → Backlog');
+          toast(`${id} 已移回 Backlog`);
+          break;
+        case 'run_now':
+          task.state = 'in_progress';
+          task.scheduledAt = null;
+          task.sessionId = `ui-${Math.floor(Math.random() * 9000000 + 1000000)}-${Date.now()}`;
+          pushHistory(task, `${STATES[tasks.find(t=>t.id===id).state === 'in_progress' ? 'todo' : 'rework'].name} → In Progress，交给 manager（新 session）`, true);
+          toast(`${id} 已交给 manager，新 session 已创建`);
+          break;
+        case 'schedule':
+          openSchedule(task);
+          return; // 弹窗确认后再 refresh
+        case 'unschedule':
+          task.scheduledAt = null;
+          pushHistory(task, '取消排期');
+          toast(`${id} 已取消排期`);
+          break;
+        case 'open_session':
+          openSession(id);
+          return;
+        case 'abort':
+          task.state = 'todo';
+          pushHistory(task, '中止执行 → Todo（session 保留）', true);
+          toast(`${id} 已中止，回到 Todo`);
+          break;
+        case 'approve':
+          task.state = 'merging';
+          pushHistory(task, 'Human Review 通过 → Merging', true);
+          toast(`${id} 评审通过，进入 Merging`);
+          break;
+        case 'reject':
+          task.state = 'rework';
+          pushHistory(task, '人工打回 → Rework', true);
+          toast(`${id} 已打回重做`);
+          break;
+        case 'mark_done':
+          task.state = 'done';
+          pushHistory(task, 'Merging → Done ✓', true);
+          toast(`${id} 已完成 🎉`);
+          break;
+        case 'reopen':
+          task.state = 'todo';
+          pushHistory(task, '重新打开 → Todo');
+          toast(`${id} 已重新打开`);
+          break;
+        case 'cancel':
+          task.state = 'cancelled';
+          task.scheduledAt = null;
+          pushHistory(task, '任务取消');
+          toast(`${id} 已取消`);
+          break;
+        case 'edit':
+          toast('打开编辑弹窗（mock）');
+          return;
+      }
+      refresh();
+    }
+
+    /* ── 跳转 ui-session 多角色对话页 ── */
+    function openSession(id) {
+      const task = tasks.find(t => t.id === id);
+      // 真实实现：跳转到现有 UI 的会话页，例如 /?session=<sessionId>
+      toast(`跳转到多角色对话页面：${task.sessionId}（mock）`);
+    }
+
+    /* ── 定时弹窗 ── */
+    let scheduleTaskId = null;
+    function openSchedule(task) {
+      scheduleTaskId = task.id;
+      document.getElementById('scheduleTaskTitle').textContent = `${task.id} · ${task.title}`;
+      const base = task.scheduledAt ? new Date(task.scheduledAt) : new Date(Date.now() + 3600_000);
+      document.getElementById('scheduleInput').value = toLocalInput(base);
+      document.getElementById('scheduleModal').classList.add('open');
+    }
+    function closeSchedule() {
+      scheduleTaskId = null;
+      document.getElementById('scheduleModal').classList.remove('open');
+    }
+    function toLocalInput(d) {
+      const pad = n => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+    function setQuick(min) {
+      document.getElementById('scheduleInput').value = toLocalInput(new Date(Date.now() + min * 60000));
+    }
+    function setQuickTonight() {
+      const d = new Date(); d.setHours(20, 0, 0, 0);
+      document.getElementById('scheduleInput').value = toLocalInput(d);
+    }
+    function setQuickTomorrow() {
+      const d = new Date(Date.now() + 86400_000); d.setHours(9, 0, 0, 0);
+      document.getElementById('scheduleInput').value = toLocalInput(d);
+    }
+    function confirmSchedule() {
+      const v = document.getElementById('scheduleInput').value;
+      if (!v) { toast('请先选择时间'); return; }
+      const task = tasks.find(t => t.id === scheduleTaskId);
+      task.scheduledAt = new Date(v).getTime();
+      pushHistory(task, `排期：${fmtTime(task.scheduledAt)} 自动交给 manager`);
+      closeSchedule();
+      refresh();
+      toast(`${task.id} 已排期，到点自动执行`);
+    }
+
+    /* ── mock 调度器：每 10s 检查到点的排期任务 ── */
+    setInterval(() => {
+      let fired = false;
+      for (const task of tasks) {
+        if (task.state === 'todo' && task.scheduledAt && task.scheduledAt <= Date.now()) {
+          task.state = 'in_progress';
+          task.scheduledAt = null;
+          task.sessionId = `ui-${Math.floor(Math.random() * 9000000 + 1000000)}-${Date.now()}`;
+          pushHistory(task, '排期到点，自动交给 manager（新 session）', true);
+          toast(`⏰ ${task.id} 排期到点，已自动交给 manager`);
+          fired = true;
+        }
+      }
+      if (fired) refresh();
+    }, 10_000);
+
+    render();
+  </script>
+</body>
+</html>

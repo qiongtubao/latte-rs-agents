@@ -35,4 +35,5 @@ reqwest = { workspace = true }
 base64 = "0.22"
 
 [dev-dependencies]
+# tasks.rs 单测：临时 cwd 下的 TaskStore 落盘/恢复。
 tempfile = "3"
