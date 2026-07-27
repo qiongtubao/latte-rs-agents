@@ -193,6 +193,8 @@ impl UiBackend {
             agents_config,
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
         };
+        // 清理上次残留的 `.latte/tmp/`（重启时确保不遗留空 session 文件）。
+        sessions::clean_tmp(&cwd);
 
         // 恢复落盘的 ui-sessions（`<cwd>/.latte/ui-sessions/*.jsonl`）：
         // 元数据 + event_log 载入内存，list/get/history 立即可用；不
@@ -307,7 +309,8 @@ impl UiServerHandle {
 /// 起 UI server：bind 后立即返回，实际服务在后台 tokio task 里跑。
 ///
 /// 流程同原 `UiCmd::run` 的 axum 部分：决定初始 role/tier → 建
-/// per-tab SessionMap + 默认 session → 解析静态目录 → build_router →
+/// per-tab SessionMap（不建默认 session，前端 `ensureSession` 会
+/// 通过 `POST /api/sessions` 创建）→ 解析静态目录 → build_router →
 /// bind → serve（带优雅停机）。
 pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
     let UiServerConfig {
@@ -331,12 +334,9 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         cwd,
         agents_config,
     })?;
-    // Bootstrap ONE default session so early HTTP calls that don't
-    // create their own still work.
-    backend
-        .bootstrap_default_session()
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn default session controller: {e}"))?;
+    // 不再 bootstrap 默认 session——前端 `ensureSession` 会调用
+    // `createSession` 创建唯一 session，避免每次页面加载多出来一个
+    // 空白 session。
 
     // 在 bind HTTP 之前先完成工具枚举，确保服务启动后所有 HTTP 请求
     // 都能立即拿到完整的工具列表（而非 fallback）。枚举本身已是毫秒级
@@ -621,11 +621,11 @@ mod tests {
         assert_eq!(status, 200, "/health body: {}", body);
         assert_eq!(body, "ok");
 
-        // /api/sessions（spawn 自带一个默认 session）
+        // /api/sessions（无默认 session，前端 `ensureSession` 才会创建）
         let (status, body) = http_get(&format!("http://127.0.0.1:{}/api/sessions", port)).await;
         assert_eq!(status, 200, "/api/sessions body: {}", body);
         let v: serde_json::Value = serde_json::from_str(&body).expect("sessions json");
-        assert_eq!(v.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(v.as_array().map(|a| a.len()), Some(0));
 
         // /api/roles
         let (status, body) = http_get(&format!("http://127.0.0.1:{}/api/roles", port)).await;
@@ -780,10 +780,18 @@ mod tests {
             "preview 应从第一条 UserMessage 推导"
         );
         let history_b = crate::api::session_history(&backend_b, &sid).expect("history B");
+        // `Prompt`/`SessionInfo` 是初始化事件，发文消息的空 session 不
+        // 落盘。恢复后 history_b 不含 init 事件；history_a 含（内存全量）。
+        // 断言：过滤掉 init 事件后两侧一致。
+        let history_a_no_init: Vec<&serde_json::Value> = history_a
+            .iter()
+            .filter(|v| v["type"] != "Prompt" && v["type"] != "SessionInfo")
+            .collect();
+        let history_b_refs: Vec<&serde_json::Value> = history_b.iter().collect();
         assert_eq!(
-            serde_json::to_string(&history_a).unwrap(),
-            serde_json::to_string(&history_b).unwrap(),
-            "history 恢复后必须逐字节一致"
+            serde_json::to_string(&history_a_no_init).unwrap(),
+            serde_json::to_string(&history_b_refs).unwrap(),
+            "history 恢复后（不含 init 事件）必须逐字节一致"
         );
         assert!(
             history_b

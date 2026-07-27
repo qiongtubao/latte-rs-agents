@@ -1,9 +1,13 @@
-//! Per-tab session 状态 + `ui-sessions` 落盘持久化。
+//! Per-tab session 状态 + 落盘持久化。
 //!
 //! 每个浏览器 tab 一个 `ChatController`，互不串事件；event_log 环形
 //! 缓冲（切 tab 回来时的 replay）。
 //!
-//! 落盘（`<backend cwd>/.latte/ui-sessions/<session_id>.jsonl`）：
+//! 新 session 先暂存到 `.latte/tmp/<session_id>.jsonl`，首个 ChatEvent
+//! 到达时 promote 到 `<cwd>/.latte/ui-sessions/<session_id>.jsonl`。
+//! 不发消息的空 session 永不落盘。重启时自动清空 `.latte/tmp/`。
+//!
+//! 落盘文件格式（`.latte/ui-sessions/<session_id>.jsonl`）：
 //!   - 首行 meta：`{"type":"__meta__","session_id",...,"label",...,
 //!     "initial_role",...,"created_at_unix_ms",...}`；改 label 时尾加
 //!     一条新的 meta 行（恢复时最后一条 meta 生效，选简单正确的方案）。
@@ -11,10 +15,10 @@
 //!     逐字一致，恢复后 history 输出逐字节相同）。
 //!   - 文件 >5000 行或 >2MB 时 compaction：重写为 meta + 内存中
 //!     event_log 的尾部窗口（≤5000 条）。
-//!   - `UiBackend::new` 扫描目录恢复元数据 + event_log（list/get/
-//!     history 立即可用），**不** spawn controller；首个 chat_send /
-//!     subscribe 落到恢复 session 时懒 spawn（agent 上下文从空开始，
-//!     本轮只要显示连续性，handle 上 `restored: true` 标记）。
+//!   - `UiBackend::new` 扫描 `ui-sessions/` 目录恢复元数据 + event_log
+//!     （list/get/history 立即可用），**不** spawn controller；首个
+//!     chat_send / subscribe 落到恢复 session 时懒 spawn（agent 上下文
+//!     从空开始，本轮只要显示连续性，handle 上 `restored: true` 标记）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +29,7 @@ use latte_agent_core::advisor_monitor::{
     AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine,
 };
 use latte_agent_core::config::AgentConfig;
-use latte_agent_core::controller::{ChatController, ControllerConfig};
+use latte_agent_core::controller::{ChatController, ChatEvent, ControllerConfig};
 use latte_agent_core::event_json::chat_event_to_frontend_json;
 use latte_agent_core::model_resolver::{ModelResolver, ModelTier};
 use latte_ai::params::GenerateParams;
@@ -44,7 +48,11 @@ const META_TYPE: &str = "__meta__";
 /// 不一致。行数/字节数是近似计数（仅做 compaction 阈值，不精确）。
 #[derive(Debug)]
 pub(crate) struct SessionPersist {
+    /// 当前文件路径。创建时指向 `.latte/tmp/<id>.jsonl`，
+    /// promote 后指向 `.latte/ui-sessions/<id>.jsonl`。
     path: PathBuf,
+    /// 最终目标路径（ui-sessions 下的固定位置）。
+    final_path: PathBuf,
     session_id: String,
     initial_role: String,
     /// 原始创建时刻（unix ms 墙钟；恢复时用它近似 created_at /
@@ -62,8 +70,16 @@ impl SessionPersist {
         cwd.join(".latte").join("ui-sessions")
     }
 
+    fn tmp_dir(cwd: &Path) -> PathBuf {
+        cwd.join(".latte").join("tmp")
+    }
+
     fn path_for(cwd: &Path, session_id: &str) -> PathBuf {
         Self::dir_for(cwd).join(format!("{session_id}.jsonl"))
+    }
+
+    fn tmp_path_for(cwd: &Path, session_id: &str) -> PathBuf {
+        Self::tmp_dir(cwd).join(format!("{session_id}.jsonl"))
     }
 
     fn meta_line(&self) -> String {
@@ -77,35 +93,52 @@ impl SessionPersist {
         .to_string()
     }
 
-    /// 新建文件并写首行 meta。
+    /// 新建 session：存在 `.latte/tmp/` 目录下，不碰 ui-sessions。
+    /// 首个事件到达时由 [`append_event`] 做 promote 到 ui-sessions。
     fn create(cwd: &Path, session_id: &str, initial_role: &str) -> std::io::Result<Self> {
-        let dir = Self::dir_for(cwd);
-        std::fs::create_dir_all(&dir)?;
-        let mut p = Self {
-            path: Self::path_for(cwd, session_id),
+        Ok(Self {
+            path: Self::tmp_path_for(cwd, session_id),
+            final_path: Self::path_for(cwd, session_id),
             session_id: session_id.to_string(),
             initial_role: initial_role.to_string(),
             created_at_unix_ms: crate::unix_ts_millis(),
             last_label: None,
             lines: 0,
             bytes: 0,
-        };
-        let line = p.meta_line();
-        p.append_raw(&line)?;
-        Ok(p)
+        })
     }
 
+    /// 追加一行到文件。首次追加时在 `.latte/tmp/` 创建文件；
+    /// 写完后 promote 到 `.latte/ui-sessions/`（无事不移），确保
+    /// 不发消息的空 session 不产生痕迹。
     fn append_raw(&mut self, line: &str) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
-        self.lines += 1;
-        self.bytes += line.len() as u64 + 1;
-        Ok(())
+        if !self.path.exists() {
+            std::fs::create_dir_all(self.path.parent().expect("dir_for 确保有父目录"))?;
+            let mut f = std::fs::File::create(&self.path)?;
+            use std::io::Write;
+            let meta = self.meta_line();
+            f.write_all(meta.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+            // ── promote：移到 ui-sessions/ ──
+            std::fs::create_dir_all(self.final_path.parent().expect("dir_for 确保有父目录"))?;
+            std::fs::rename(&self.path, &self.final_path)?;
+            self.path = self.final_path.clone();
+            self.lines = 2;
+            self.bytes = (meta.len() + 1 + line.len() + 1) as u64;
+            Ok(())
+        } else {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.path)?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+            self.lines += 1;
+            self.bytes += line.len() as u64 + 1;
+            Ok(())
+        }
     }
 
     /// archiver 每归档一个事件调一次：追加 + 按需 compaction。
@@ -126,13 +159,16 @@ impl SessionPersist {
         }
     }
 
-    /// 改 label：更新缓存 + 尾加一条 meta 覆盖行（恢复时最后一条
-    /// meta 生效）。
+    /// 改 label：更新缓存；文件已落盘时尾加一条 meta 覆盖行（恢复时
+    /// 最后一条 meta 生效）。文件尚未落盘时只更新内存中的
+    /// `last_label`——首个事件会带着正确 label 写 meta。
     fn set_label(&mut self, label: &Option<String>) {
         self.last_label = label.clone();
-        let line = self.meta_line();
-        if let Err(e) = self.append_raw(&line) {
-            eprintln!("[ui-sessions] write label {}: {e}", self.path.display());
+        if self.path.exists() {
+            let line = self.meta_line();
+            if let Err(e) = self.append_raw(&line) {
+                eprintln!("[ui-sessions] write label {}: {e}", self.path.display());
+            }
         }
     }
 
@@ -162,6 +198,10 @@ impl SessionPersist {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => eprintln!("[ui-sessions] remove {}: {e}", self.path.display()),
+        }
+        // 如果文件还在 tmp 路径（从未 promote），也删残余。
+        if self.path != self.final_path {
+            let _ = std::fs::remove_file(&self.final_path);
         }
     }
 }
@@ -224,6 +264,7 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
     let bytes = raw.len() as u64;
     Some(LoadedSession {
         persist: SessionPersist {
+            final_path: path.clone(),
             path,
             session_id,
             initial_role,
@@ -390,12 +431,19 @@ impl SessionHandle {
         // switches away and back can restore the chat contents. Bounded
         // to MAX_LOG entries (oldest dropped) to keep memory flat.
         // 同时 tee 写 ui-sessions 落盘（每行与 event_log 字符串一致）。
+        // `Prompt`/`SessionInfo` 是启动时的初始化事件，不发消息的空
+        // session 不应该因此落盘——先 skip persist，等有真实对话时才
+        // 创建文件。
         {
             let log = self.event_log.clone();
             let persist = self.persist.clone();
             let mut archive_rx = controller.subscribe();
             tokio::spawn(async move {
                 while let Ok(ev) = archive_rx.recv().await {
+                    let is_init = matches!(
+                        &ev,
+                        ChatEvent::Prompt { .. } | ChatEvent::SessionInfo { .. }
+                    );
                     if let Ok(json) = chat_event_to_frontend_json(&ev) {
                         {
                             let mut g = log.write();
@@ -404,8 +452,10 @@ impl SessionHandle {
                             }
                             g.push(json.clone());
                         }
-                        if let Some(p) = &persist {
-                            p.lock().append_event(&json, &log);
+                        if !is_init {
+                            if let Some(p) = &persist {
+                                p.lock().append_event(&json, &log);
+                            }
                         }
                     }
                 }
@@ -517,4 +567,20 @@ pub(crate) fn restore_sessions(cwd: &Path, spawn: &SessionSpawnParams) -> Vec<Se
     // 只保证恢复确定性。
     out.sort_by_key(|h| h.created_at);
     out
+}
+
+/// 清理 `<cwd>/.latte/tmp/` 下所有残留文件。服务器启动时调用，
+/// 确保上次异常退出遗留的暂存 session 文件不会堆积。
+pub fn clean_tmp(cwd: &Path) {
+    let dir = SessionPersist::tmp_dir(cwd);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
