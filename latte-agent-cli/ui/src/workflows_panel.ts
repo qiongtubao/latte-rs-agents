@@ -217,6 +217,16 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
     if (currentName) void loadToml(currentName);
   });
 
+  function closePanel(): void {
+    closeRunModal();
+    container.panelEl.classList.add("hidden");
+  }
+
+  function setStatus(msg: string, error = false): void {
+    container.statusEl.textContent = msg;
+    container.statusEl.classList.toggle("error", error);
+  }
+
   function showTab(tab: "form" | "toml"): void {
     tabBtns.forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
     container.bodyEl.classList.toggle("hidden", tab !== "form");
