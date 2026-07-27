@@ -802,8 +802,8 @@ select {
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
+/* 用 class 控制显隐；避免 ID 选择器 display 覆盖 pane 的 hidden 规则 */
 #role-editor-form {
-  display: flex;
   flex-direction: column;
   gap: 0.6rem;
 }
@@ -974,7 +974,8 @@ select {
   display: none;
 }
 .role-editor-pane.active {
-  display: block;
+  display: flex;
+  flex-direction: column;
 }
 
 /* ─── TOML 源文件编辑器 ─────────────────────────────────── */
@@ -1823,6 +1824,9 @@ select {
   flex: 1;
   overflow-y: auto;
   padding: 0;
+}
+.models-body.hidden {
+  display: none;
 }
 
 .models-form-text input,

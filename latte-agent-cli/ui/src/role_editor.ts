@@ -53,9 +53,10 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
   container.refreshBtn.addEventListener("click", () => void refresh(container.roleSelect.value));
   container.roleSelect.addEventListener("change", () => {
     currentRoleId = container.roleSelect.value;
-    // 切到表单 tab 时填充；在 TOML tab 时只更新 currentRoleId
     if (container.formPane.classList.contains("active")) {
       fillForm(currentRoleId);
+    } else if (container.tomlPane.classList.contains("active") && currentRoleId) {
+      void loadToml(currentRoleId);
     }
   });
   container.formEl.addEventListener("submit", (event) => {
