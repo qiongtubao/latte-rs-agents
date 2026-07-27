@@ -2006,3 +2006,73 @@ pub fn put_role_toml(b: &UiBackend, role_id: &str, raw: &str) -> Result<(), ApiE
     }
     Ok(())
 }
+
+// ─── Models TOML 源文件编辑 ──────────────────────────────────────
+
+/// `GET /api/models/:key/toml` — 读取模型 TOML 源文件原始内容。
+/// 路径复用 `list_models` 中的 `ModelsState::load` 扫描结果，先找到
+/// 文件路径再读取。只在内存中（catalog）未落盘的 model 返回 404。
+pub fn get_model_toml(b: &UiBackend, key: &str) -> Result<String, ApiError> {
+    let project_dir = b.cwd.join(".latte/models.d");
+    let global_dir = global_dir_fallback();
+    let on_disk =
+        crate::models::ModelsState::load(&project_dir, &global_dir)
+            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+    let path = on_disk.paths.get(key).cloned().unwrap_or_default();
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Err(ApiError::not_found(format!(
+            "model {key:?} toml not found on disk"
+        )));
+    }
+    std::fs::read_to_string(&path)
+        .map_err(|e| ApiError::internal(format!("read {}: {e}", path.display())))
+}
+
+/// `PUT /api/models/:key/toml` — 直接写入模型 TOML 源文件原始内容。
+/// 先校验 TOML 可解析且 key 匹配，然后写回原文件并更新内存 catalog。
+pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiError> {
+    // 1. 校验 TOML 可解析，且 provider/name 与请求 key 匹配
+    let _doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| ApiError::bad_request(format!("TOML 解析失败: {e}")))?;
+    let def: ModelDef = toml::from_str(raw)
+        .map_err(|e| ApiError::bad_request(format!("TOML 不是合法的 ModelDef: {e}")))?;
+    let file_key = format!("{}/{}", def.provider, def.name);
+    if file_key != key {
+        return Err(ApiError::bad_request(format!(
+            "TOML 中的 provider/name ({file_key:?}) 与请求 key ({key:?}) 不匹配"
+        )));
+    }
+
+    // 2. 找到当前 model 文件路径
+    let project_dir = b.cwd.join(".latte/models.d");
+    let global_dir = global_dir_fallback();
+    let on_disk =
+        crate::models::ModelsState::load(&project_dir, &global_dir)
+            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+    let path = on_disk.paths.get(key).cloned().unwrap_or_default();
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Err(ApiError::not_found(format!(
+            "model {key:?} toml not found on disk"
+        )));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    }
+    std::fs::write(&path, raw)
+        .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+
+    // 3. 更新内存 catalog
+    {
+        let mut cfg = b.merged.write();
+        if let Some(slot) = cfg.models.models.iter_mut().find(|m| {
+            format!("{}/{}", m.provider, m.name) == key
+        }) {
+            *slot = def;
+        } else {
+            cfg.models.models.push(def);
+        }
+    }
+    Ok(())
+}

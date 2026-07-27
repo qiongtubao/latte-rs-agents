@@ -15,6 +15,7 @@
 use std::time::Instant;
 
 use latte_agent_core::config::ModelDef;
+use latte_agent_core::model_resolver::resolve_env_vars;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, Default)]
@@ -88,7 +89,7 @@ async fn test_connectivity(req: &TestModelRequest, started: Instant) -> TestMode
     };
     let resp = match client
         .get(&url)
-        .bearer_auth(&req.def.api_key)
+        .bearer_auth(resolve_env_vars(&req.def.api_key))
         .send()
         .await
     {
@@ -204,7 +205,7 @@ async fn test_via_raw_http(req: &TestModelRequest, started: Instant) -> TestMode
     };
     let resp = match client
         .post(&url)
-        .bearer_auth(&req.def.api_key)
+        .bearer_auth(resolve_env_vars(&req.def.api_key))
         .header("content-type", "application/json")
         .json(&body)
         .send()
@@ -312,7 +313,7 @@ fn build_latte_ai_model(def: &ModelDef) -> anyhow::Result<latte_ai::models::Mode
         api,
         provider: def.provider.clone(),
         base_url: def.base_url.clone(),
-        api_key: def.api_key.clone(),
+        api_key: resolve_env_vars(&def.api_key),
         context_window: def.context_window,
         max_tokens: def.max_tokens,
         supports_thinking: def.supports_thinking,

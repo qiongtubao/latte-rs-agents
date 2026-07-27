@@ -7,9 +7,8 @@
 //
 // 数据契约：见 `api.ts` 的 `ModelsListResponse` / `ModelWithSource`。
 // `file_path` 字段是后端独立扫盘拿到的真实绝对路径，UI 直接展示给用户。
-import { listModels, updateModel, deleteModel } from "./api";
+import { listModels, updateModel, deleteModel, getModelToml, putModelToml } from "./api";
 import type { ModelDef, ModelWithSource } from "./api";
-
 interface UIBinding {
   panelEl: HTMLElement;
   openBtn: HTMLButtonElement;
@@ -94,22 +93,104 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   let isLoading = false;
   let isSaving = false;
 
+  // TOML 源文件编辑元素
+  const tabBarEl = document.getElementById("models-tab-bar")!;
+  const tabBtns = tabBarEl?.querySelectorAll<HTMLButtonElement>(".role-editor-tab") ?? [];
+  const tomlPane = document.getElementById("models-toml-pane")!;
+  const tomlEditor = document.getElementById("models-toml-editor") as HTMLTextAreaElement | null;
+  const tomlSaveBtn = document.getElementById("models-toml-save") as HTMLButtonElement | null;
+  const tomlReloadBtn = document.getElementById("models-toml-reload") as HTMLButtonElement | null;
+  const tomlStatusEl = document.getElementById("models-toml-status") as HTMLElement | null;
+
   container.openBtn.addEventListener("click", () => {
     container.panelEl.classList.remove("hidden");
+    showTab("form");
     void refresh();
   });
   container.closeBtn.addEventListener("click", () => container.panelEl.classList.add("hidden"));
-  container.refreshBtn.addEventListener("click", () => void refresh());
-  container.newBtn.addEventListener("click", () => selectNewBlank());
+  container.refreshBtn.addEventListener("click", () => {
+    showTab("form");
+    void refresh();
+  });
+  container.newBtn.addEventListener("click", () => {
+    showTab("form");
+    selectNewBlank();
+  });
 
   container.selectEl.addEventListener("change", () => {
     currentKey = container.selectEl.value || null;
+    const activeTab = tabBarEl?.querySelector(".role-editor-tab.active")?.getAttribute("data-tab");
     renderForm();
+    if (activeTab === "toml" && currentKey) {
+      void loadToml(currentKey);
+    }
   });
 
   function setStatus(msg: string, error = false): void {
     container.statusEl.textContent = msg;
     container.statusEl.classList.toggle("error", error);
+  }
+
+  function setTomlStatus(msg: string, error = false): void {
+    if (tomlStatusEl) {
+      tomlStatusEl.textContent = msg;
+      tomlStatusEl.classList.toggle("error", error);
+    }
+  }
+
+  function showTab(tab: "form" | "toml"): void {
+    tabBtns.forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    container.bodyEl.classList.toggle("hidden", tab !== "form");
+    if (tomlPane) tomlPane.classList.toggle("hidden", tab !== "toml");
+  }
+
+  // ── tab 切换 ──
+  Array.from(tabBtns).forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+      if (!target) return;
+      showTab(target as "form" | "toml");
+      if (target === "toml" && currentKey) {
+        void loadToml(currentKey);
+      }
+    });
+  });
+
+  // ── TOML 编辑事件 ──
+  tomlSaveBtn?.addEventListener("click", () => void saveToml());
+  tomlReloadBtn?.addEventListener("click", () => {
+    if (currentKey) void loadToml(currentKey);
+  });
+
+  /** 加载当前 model 的 TOML 源文件到编辑器。 */
+  async function loadToml(key: string): Promise<void> {
+    if (!tomlEditor || !tomlStatusEl) return;
+    setTomlStatus("加载中…");
+    tomlEditor.disabled = true;
+    try {
+      const raw = await getModelToml(key);
+      tomlEditor.value = raw;
+      tomlEditor.disabled = false;
+      setTomlStatus(`已加载 ${key}`);
+    } catch (e) {
+      setTomlStatus(`加载失败: ${(e as Error).message}`, true);
+    }
+  }
+
+  /** 保存 TOML 源文件。 */
+  async function saveToml(): Promise<void> {
+    if (isSaving || !currentKey || !tomlEditor) return;
+    isSaving = true;
+    setTomlStatus("保存中…");
+    try {
+      await putModelToml(currentKey, tomlEditor.value);
+      setTomlStatus("✅ 已保存");
+      await refresh();
+    } catch (e) {
+      setTomlStatus(`保存失败: ${(e as Error).message}`, true);
+    } finally {
+      isSaving = false;
+    }
   }
 
   async function refresh(): Promise<void> {
@@ -127,7 +208,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
         container.selectEl.value = currentKey;
       } else if (items.length > 0) {
         currentKey = items[0].key;
-        container.selectEl.value = currentKey;
+        container.selectEl.value = currentKey!;
       } else {
         currentKey = null;
         container.selectEl.value = "";
@@ -141,7 +222,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     }
   }
 
-  /** 新建：清空 currentKey + form，呈现空白模板。 */
   function selectNewBlank(): void {
     currentKey = null;
     container.selectEl.value = "";
@@ -164,9 +244,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     }
   }
 
-  /** 根据 currentKey 渲染表单。无 currentKey → 空白模板供新建。
-   *  返回 inputs Map 让 onSave 取值时不再绕 form 属性。
-   */
   function renderForm(): { inputs: Map<keyof ModelDef, FormInput> } {
     container.bodyEl.replaceChildren();
     const current = currentKey
@@ -234,9 +311,8 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
         input = t;
       }
 
-      // 用现有值填充
       const v = current ? current[f.key] : undefined;
-      input.value = ""; // 先清空（checkbox / number 用 .checked）
+      input.value = "";
       if (f.kind === "checkbox") {
         (input as HTMLInputElement).checked = Boolean(v);
       } else if (f.kind === "number") {
@@ -254,8 +330,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
 
     const actions = document.createElement("div");
     actions.className = "models-form-actions";
-    // 两个写盘按钮：「保存到项目」与「保存到全局」对应后端 PATCH 的
-    // `target` 字段（默认 project）。新建时隐藏全局按钮 —— 没源文件可改。
     const saveProject = document.createElement("button");
     saveProject.type = "button";
     saveProject.className = "primary";
@@ -264,25 +338,18 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     if (isSaving) saveProject.disabled = true;
     actions.appendChild(saveProject);
     if (current) {
-      // 「保存到全局」：编辑已存在的 model 时允许把改动写到 `~/.latte/models.d/`。
       const saveGlobal = document.createElement("button");
       saveGlobal.type = "button";
       saveGlobal.dataset.target = "global";
       saveGlobal.textContent = "保存到全局";
       if (isSaving) saveGlobal.disabled = true;
       actions.appendChild(saveGlobal);
-      // 「测试」按钮：触发 connectivity + 简单 chat 测试，结果弹窗显示。
-      // 完整测试页（包含 image input / image generation 检查）放到
-      // follow-up：当前只暴露入口，按钮先连上。
       const testBtn = document.createElement("button");
       testBtn.type = "button";
       testBtn.className = "models-test-btn";
       testBtn.textContent = "测试";
       actions.appendChild(testBtn);
       testBtn.addEventListener("click", () => {
-        // 用当前表单的 def（可能是新建未保存的）+ 当前 key（已存在时
-        // 用于后端 /capabilities 探测）打开测试弹层。表单校验失败时
-        // 仍允许打开 —— 用户可能想先连通后改。
         const def = collectDef(inputs);
         if (!def) {
           setStatus("测试失败：必填字段缺失（id / provider / api）", true);
@@ -290,7 +357,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
         }
         container.onTestClick({ def, key: currentKey });
       });
-      // 「删除」按钮：二次确认后删除 model 文件并从内存移除。
       const deleteBtn = document.createElement("button");
       deleteBtn.type = "button";
       deleteBtn.className = "danger";
@@ -308,16 +374,12 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     }
     form.appendChild(actions);
 
-    // 提交 handler：根据触发按钮的 data-target 决定写盘目录。
-    // 默认 project，两个按钮共用同一条 handler。
     const submitSave = (target: "project" | "global"): void => {
       void onSave(inputs, target);
     };
     saveProject.addEventListener("click", () => submitSave("project"));
     if (current) {
-      // 上面的 if 块保证了 saveGlobal 与 testBtn 都已 append
       const saveGlobalBtn = actions.querySelector<HTMLButtonElement>(
-
         'button[data-target="global"]',
       );
       saveGlobalBtn?.addEventListener("click", () => submitSave("global"));
@@ -327,8 +389,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     return { inputs };
   }
 
-
-  /** 删除 model：二次确认 → 调 API → 刷新列表。 */
   async function onDelete(key: string): Promise<void> {
     if (isSaving) return;
     const def = items.find(m => m.key === key);
@@ -339,7 +399,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     try {
       await deleteModel(key);
       setStatus(`已删除 ${label}`);
-      // 从本地列表移除，避免 refresh 前 UI 残留
       items = items.filter(m => m.key !== key);
       if (currentKey === key) currentKey = null;
       populateSelect();
@@ -367,10 +426,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
       const targetKey = isNew ? `${def.provider}/${def.name}` : currentKey!;
       const updated = await updateModel(targetKey, def, target);
       await refresh();
-      // refresh 内部会覆盖 status，保存成功后重新设回成功消息
       setStatus(`✅ 已保存 ${updated.key}（${updated.source}）`);
-      // refresh 内部会基于 currentKey 重选；这里强制把 updated.key 设为新 currentKey
-      // （即使刷新时 currentKey 仍指向旧 key，会被 refresh 中的 keep 逻辑兜住）。
       currentKey = updated.key;
       container.selectEl.value = updated.key;
       renderForm();
@@ -384,9 +440,6 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   }
 
   function trySelect(key: string): void {
-    // key 可能是 `provider/name` 全键，也可能是角色 model_chain 里的裸
-    // name（runtime ModelResolver 按 name 匹配模型）。按 name 匹配时优先
-    // 非 catalog 来源（catalog 是内置占位，真实配置在 project/global）。
     let found = items.find(m => m.key === key);
     if (!found) {
       const byName = items.filter(m => m.name === key);
@@ -405,11 +458,12 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     isOpen: () => !container.panelEl.classList.contains("hidden"),
     open: () => {
       container.panelEl.classList.remove("hidden");
+      showTab("form");
       void refresh();
     },
     selectModel: (key: string) => {
       container.panelEl.classList.remove("hidden");
-      // 如果 items 还没加载，先 refresh
+      showTab("form");
       if (items.length === 0) {
         void (async () => {
           await refresh();

@@ -576,6 +576,38 @@ pub(crate) async fn create_model(
         })
 }
 
+// ─── Models TOML 源文件编辑 ──────────────────────────────────────
+
+/// `GET /api/models/:key/toml` — 读取模型 TOML 源文件原始内容。
+pub(crate) async fn get_model_toml(
+    axum::extract::Path(key): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<String, (StatusCode, String)> {
+    api::get_model_toml(&state.backend, &key)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `PUT /api/models/:key/toml` — 直接写入模型 TOML 源文件原始内容。
+pub(crate) async fn put_model_toml(
+    axum::extract::Path(key): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    body: String,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::put_model_toml(&state.backend, &key, &body)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
 // ─── Tools ─────────────────────────────────────────────────────────
 
 /// `GET /api/tools` —— 列出所有工具及其启用/禁用状态。

@@ -546,6 +546,16 @@ export async function deleteModel(key: string): Promise<void> {
   await getTransport().request("DELETE", `/api/models/${encodeURIComponent(key)}`);
 }
 
+/** GET /api/models/:key/toml：读取模型 TOML 源文件原始内容。 */
+export async function getModelToml(key: string): Promise<string> {
+  return getTransport().requestText("GET", `/api/models/${encodeURIComponent(key)}/toml`);
+}
+
+/** PUT /api/models/:key/toml：直接写入模型 TOML 源文件原始内容。 */
+export async function putModelToml(key: string, raw: string): Promise<void> {
+  await getTransport().request("PUT", `/api/models/${encodeURIComponent(key)}/toml`, raw);
+}
+
 // ─── Model test (后端 test.rs) ─────────────────────────────────────
 //
 // 详见后端 `latte-agent-ui-server/src/test.rs`。前端只发请求 + 渲染

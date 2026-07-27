@@ -442,6 +442,8 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/models/test", axum::routing::post(test_model))
         .route("/models/:key/capabilities", get(model_capabilities))
+        // 模型 TOML 源文件编辑
+        .route("/models/:key/toml", get(get_model_toml).put(put_model_toml))
         // 工具管理
         .route("/tools", get(list_tools))
         .route("/tools/test", axum::routing::post(test_tool))

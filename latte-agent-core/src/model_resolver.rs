@@ -399,7 +399,7 @@ impl ModelResolver {
 /// acceptable in context; for `api_key` the three-layer config merge
 /// resolves that and `AiClient::check_api_key` produces a final error
 /// if all layers were blank.
-pub(crate) fn resolve_env_vars(s: &str) -> String {
+pub fn resolve_env_vars(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 

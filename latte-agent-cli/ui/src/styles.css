@@ -991,6 +991,15 @@ select {
   color: var(--fg);
   tab-size: 2;
 }
+
+/* ─── 模型管理 TOML 源文件面板 ─────────────────────────── */
+.models-toml-pane {
+  padding: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+.models-toml-pane.hidden {
+  display: none;
+}
 .role-editor-toml-editor:focus {
   outline: none;
   border-color: var(--accent);
