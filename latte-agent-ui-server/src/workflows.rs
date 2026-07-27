@@ -90,7 +90,7 @@ pub struct ValidateResponse {
 
 // ─── Dirs ─────────────────────────────────────────────────────────
 
-fn project_dir(cwd: &Path) -> PathBuf {
+pub fn project_dir(cwd: &Path) -> PathBuf {
     cwd.join(".latte").join("workflows.d")
 }
 

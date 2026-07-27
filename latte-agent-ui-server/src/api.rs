@@ -1163,6 +1163,36 @@ pub fn validate_workflow_form(b: &UiBackend, form: &WorkflowForm) -> ValidateRes
     workflows::validate(form, &b.merged.read())
 }
 
+/// `GET /api/workflows/:name/toml` — 读取 workflow TOML 源文件原始内容。
+pub fn get_workflow_toml(b: &UiBackend, name: &str) -> Result<String, ApiError> {
+    get_workflow(b, name).map(|d| d.raw_toml)
+}
+
+/// `PUT /api/workflows/:name/toml` — 直接写入 workflow TOML 源文件。
+/// 项目副本存在 → 写项目；只有全局副本 → 在项目层生成遮蔽副本。
+pub fn put_workflow_toml(b: &UiBackend, name: &str, raw: &str) -> Result<(), ApiError> {
+    // 校验 TOML 可解析且 name 匹配
+    let doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| ApiError::bad_request(format!("TOML 解析失败: {e}")))?;
+    if doc.get("name").and_then(|v| v.as_str()) != Some(name) {
+        return Err(ApiError::bad_request(format!(
+            "TOML 中 name 为 {:?}，与请求名称 {name:?} 不匹配",
+            doc.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+        )));
+    }
+    if !workflows::exists(&b.cwd, name) {
+        return Err(ApiError::not_found(format!("workflow '{name}' not found")));
+    }
+    let dir = workflows::project_dir(&b.cwd);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    let path = dir.join(format!("{name}.toml"));
+    std::fs::write(&path, raw)
+        .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+    Ok(())
+}
+
 /// `POST /api/workflows/run` 的请求体。`name`（跑已保存的 workflow）
 /// 与 `workflow`（跑编辑器里未保存的表单）必须且只能给一个。
 #[derive(Debug, Deserialize)]

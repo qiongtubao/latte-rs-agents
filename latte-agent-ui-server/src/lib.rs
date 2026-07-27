@@ -476,7 +476,10 @@ fn build_router(state: AppState) -> Router {
             "/workflows/:name",
             get(get_workflow_h).put(update_workflow_h).delete(delete_workflow_h),
         )
-        // generate_image 工具产物：.latte/images/<file> 的字节伺服。
+        .route(
+            "/workflows/:name/toml",
+            get(get_workflow_toml_h).put(put_workflow_toml_h),
+        )
         .route("/images/:file", get(get_image));
     let mut app = Router::new()
         .route("/health", get(health))

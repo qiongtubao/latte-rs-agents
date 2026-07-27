@@ -401,6 +401,34 @@ pub(crate) async fn workflow_run_stop_h(State(state): State<AppState>) -> Status
     StatusCode::OK
 }
 
+pub(crate) async fn get_workflow_toml_h(
+    axum::extract::Path(name): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<String, (StatusCode, String)> {
+    api::get_workflow_toml(&state.backend, &name)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+pub(crate) async fn put_workflow_toml_h(
+    axum::extract::Path(name): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    body: String,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::put_workflow_toml(&state.backend, &name, &body)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
 /// `GET /api/workflows/run/events` — 测试运行事件流，只转发
 /// Workflow* 事件（Started/Step/Turn/Finished），JSON 由
 /// `chat_event_to_frontend_json` 序列化（契约与 chat events 一致）。

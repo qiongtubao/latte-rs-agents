@@ -18,6 +18,8 @@ import {
   stopWorkflowRun,
   getRoles,
   importTasks,
+  getWorkflowToml,
+  putWorkflowToml,
 } from "./api";
 import type {
   WorkflowSummary,
@@ -39,7 +41,6 @@ interface UIBinding {
   bodyEl: HTMLElement;
   statusEl: HTMLElement;
   pathsEl: HTMLElement;
-  /** workflow 选择下拉框（脚本挂载时由调用者提供，避免硬编码 ID）。 */
   selectEl: HTMLSelectElement;
   // ─── 试运行弹层 ───
   runOverlayEl: HTMLElement;
@@ -50,6 +51,14 @@ interface UIBinding {
   runStopBtn: HTMLButtonElement;
   runStatusEl: HTMLElement;
   runTranscriptEl: HTMLElement;
+  // TOML 源文件编辑
+  tabBarEl: HTMLElement;
+  tabBtns: NodeListOf<HTMLButtonElement>;
+  tomlPane: HTMLElement;
+  tomlEditor: HTMLTextAreaElement;
+  tomlSaveBtn: HTMLButtonElement;
+  tomlReloadBtn: HTMLButtonElement;
+  tomlStatusEl: HTMLElement;
 }
 
 export interface WorkflowsPanelController {
@@ -191,14 +200,27 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
   container.runStartBtn.addEventListener("click", () => void startRun());
   container.runStopBtn.addEventListener("click", () => void stopRun());
 
-  function closePanel(): void {
-    closeRunModal();
-    container.panelEl.classList.add("hidden");
-  }
+  // ── TOML tab 切换 ──
+  const tabBtns = Array.from(container.tabBtns);
+  tabBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+      if (!target) return;
+      showTab(target as "form" | "toml");
+      if (target === "toml" && currentName) {
+        void loadToml(currentName);
+      }
+    });
+  });
+  container.tomlSaveBtn.addEventListener("click", () => void saveToml());
+  container.tomlReloadBtn.addEventListener("click", () => {
+    if (currentName) void loadToml(currentName);
+  });
 
-  function setStatus(msg: string, error = false): void {
-    container.statusEl.textContent = msg;
-    container.statusEl.classList.toggle("error", error);
+  function showTab(tab: "form" | "toml"): void {
+    tabBtns.forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    container.bodyEl.classList.toggle("hidden", tab !== "form");
+    container.tomlPane.classList.toggle("hidden", tab !== "toml");
   }
 
   async function refresh(): Promise<void> {
@@ -206,7 +228,6 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
     isLoading = true;
     setStatus("加载中…");
     try {
-      // roles 只在首次加载时拉取（speakers 勾选框用）
       if (roles.length === 0) {
         roles = await getRoles().catch(() => []);
       }
@@ -227,6 +248,9 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
       }
       setStatus(`已加载 ${items.length} 个 workflow`);
       renderForm();
+      if (container.tomlPane.classList.contains("hidden") === false && currentName) {
+        void loadToml(currentName);
+      }
     } catch (e) {
       setStatus(`加载失败: ${(e as Error).message}`, true);
     } finally {
@@ -241,6 +265,10 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
       await loadDetail(name);
       setStatus("");
       renderForm();
+      // 如果在 TOML tab，同步加载 TOML 内容
+      if (container.tomlPane.classList.contains("hidden") === false) {
+        void loadToml(name);
+      }
     } catch (e) {
       currentDetail = null;
       setStatus(`加载失败: ${(e as Error).message}`, true);
@@ -250,6 +278,40 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
 
   async function loadDetail(name: string): Promise<void> {
     currentDetail = await getWorkflow(name);
+  }
+
+  async function loadToml(name: string): Promise<void> {
+    container.tomlEditor.disabled = true;
+    container.tomlStatusEl.textContent = "加载中…";
+    try {
+      const raw = await getWorkflowToml(name);
+      container.tomlEditor.value = raw;
+      container.tomlStatusEl.textContent = "（只读加载，修改后点「保存 TOML」写盘）";
+    } catch (err) {
+      container.tomlStatusEl.textContent = `加载失败: ${(err as Error).message}`;
+      container.tomlStatusEl.classList.add("error");
+    } finally {
+      container.tomlEditor.disabled = false;
+    }
+  }
+
+  async function saveToml(): Promise<void> {
+    if (isSaving || !currentName) return;
+    isSaving = true;
+    container.tomlStatusEl.textContent = "保存中…";
+    container.tomlSaveBtn.disabled = true;
+    try {
+      await putWorkflowToml(currentName, container.tomlEditor.value);
+      container.tomlStatusEl.textContent = "✅ TOML 已保存；新 session 生效";
+      container.tomlStatusEl.classList.remove("error");
+      await refresh();
+    } catch (err) {
+      container.tomlStatusEl.textContent = `保存失败: ${(err as Error).message}`;
+      container.tomlStatusEl.classList.add("error");
+    } finally {
+      isSaving = false;
+      container.tomlSaveBtn.disabled = false;
+    }
   }
 
   /** 新建：清空 currentName + detail，呈现空白模板。 */

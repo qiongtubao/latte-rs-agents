@@ -202,7 +202,7 @@ async function main(): Promise<void> {
       pathsEl: $("role-editor-paths"),
       // TOML 源文件编辑
       tabBarEl: $("role-editor-tab-bar"),
-      tabBtns: document.querySelectorAll<HTMLButtonElement>(".role-editor-tab"),
+      tabBtns: document.querySelector("#role-editor-tab-bar")!.querySelectorAll<HTMLButtonElement>(".role-editor-tab"),
       formPane: $("role-editor-form"),
       tomlPane: $("role-editor-toml-pane"),
       tomlEditor: $("role-editor-toml-editor") as HTMLTextAreaElement,
@@ -338,6 +338,14 @@ async function main(): Promise<void> {
       runStopBtn: $("workflow-run-stop") as HTMLButtonElement,
       runStatusEl: $("workflow-run-status"),
       runTranscriptEl: $("workflow-run-transcript"),
+      // TOML 源文件编辑
+      tabBarEl: $("workflows-tab-bar"),
+      tabBtns: document.querySelector("#workflows-tab-bar")!.querySelectorAll<HTMLButtonElement>(".role-editor-tab"),
+      tomlPane: $("workflows-toml-pane"),
+      tomlEditor: $("workflows-toml-editor") as HTMLTextAreaElement,
+      tomlSaveBtn: $("workflows-toml-save") as HTMLButtonElement,
+      tomlReloadBtn: $("workflows-toml-reload") as HTMLButtonElement,
+      tomlStatusEl: $("workflows-toml-status") as HTMLElement,
     },
   });
 

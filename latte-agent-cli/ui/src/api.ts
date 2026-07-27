@@ -909,3 +909,13 @@ export async function getRoleToml(roleId: string): Promise<string> {
 export async function putRoleToml(roleId: string, raw: string): Promise<void> {
   await getTransport().request("PUT", `/api/roles/${encodeURIComponent(roleId)}/toml`, raw);
 }
+
+/** GET /api/workflows/:name/toml —— 读取 workflow TOML 源文件原始内容。 */
+export async function getWorkflowToml(name: string): Promise<string> {
+  return getTransport().requestText("GET", `/api/workflows/${encodeURIComponent(name)}/toml`);
+}
+
+/** PUT /api/workflows/:name/toml —— 直接写入 workflow TOML 源文件原始内容。 */
+export async function putWorkflowToml(name: string, raw: string): Promise<void> {
+  await getTransport().request("PUT", `/api/workflows/${encodeURIComponent(name)}/toml`, raw);
+}

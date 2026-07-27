@@ -313,10 +313,26 @@
           <label for="workflows-select" class="models-select-label">选择 workflow：</label>
           <select id="workflows-select" class="models-select"><option value="">（加载中…）</option></select>
         </div>
+        <!-- tab 切换：表单编辑 / 源文件编辑 -->
+        <div id="workflows-tab-bar" class="role-editor-tab-bar">
+          <button type="button" class="role-editor-tab active" data-tab="form">表单编辑</button>
+          <button type="button" class="role-editor-tab" data-tab="toml">源文件编辑</button>
+        </div>
         <div class="models-body" id="workflows-body">loading…</div>
+        <!-- TOML 源文件编辑 pane -->
+        <div id="workflows-toml-pane" class="models-toml-pane hidden">
+          <div class="role-editor-field">
+            源文件（.toml）
+            <textarea id="workflows-toml-editor" rows="20" spellcheck="false" class="role-editor-toml-editor"></textarea>
+          </div>
+          <div class="role-editor-actions">
+            <button id="workflows-toml-save" type="button" class="primary">保存 TOML</button>
+            <button id="workflows-toml-reload" type="button">重新加载</button>
+            <span id="workflows-toml-status" class="role-editor-status"></span>
+          </div>
+        </div>
         <div class="models-status" id="workflows-status"></div>
       </aside>
-
       <!-- Workflow 试运行弹层（详见 ui/src/workflows_panel.ts） -->
       <div id="workflow-run-modal" class="modal-overlay hidden">
         <div class="modal workflow-run-modal">
