@@ -191,6 +191,35 @@ impl SubsessionStore {
         (sub_id, fanout)
     }
 
+    /// 复用已有 subsession 或新建。用于主角色 runner（manager 等）--
+    /// `/role switch` 重建 runner 时不会每次都新建空文件，而是复用
+    /// 同一角色的已有 subsession（如果还在内存 1h 窗口内）。
+    ///
+    /// delegate 路径继续用 [`create`]（每次新建，因为每次委派是独立
+    /// 的子会话）。
+    pub fn get_or_create(
+        &self,
+        session_id: &str,
+        role_name: &str,
+    ) -> (SubId, Arc<dyn TraceSink>) {
+        self.sweep();
+        let key_prefix = format!("{role_name}-");
+        let mut g = self.inner.lock();
+        for ((sid, sub_id), entry) in g.iter().rev() {
+            if sid == session_id && sub_id.starts_with(&key_prefix) {
+                let mut sinks: Vec<Arc<dyn TraceSink>> =
+                    vec![entry.sink.clone() as Arc<dyn TraceSink>];
+                if let Some(d) = entry._disk_sink.as_ref() {
+                    sinks.push(d.clone() as Arc<dyn TraceSink>);
+                }
+                let fanout = Arc::new(FanoutSink::new(sinks));
+                return (sub_id.clone(), fanout);
+            }
+        }
+        drop(g);
+        self.create(session_id, role_name)
+    }
+
     /// 内存里的实时快照。None = 已被 GC 或从未存在。
     pub fn snapshot(&self, session_id: &str, sub_id: &str) -> Option<Vec<TraceEvent>> {
         self.sweep();

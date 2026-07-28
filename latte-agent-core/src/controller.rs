@@ -1817,7 +1817,7 @@ async fn build_runner(
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
             None
         } else {
-            let (_sub_id, sink) = subsession_store.create(session_id, role_id);
+            let (_sub_id, sink) = subsession_store.get_or_create(session_id, role_id);
             Some(sink)
         };
         let mut runner = AgentRunner::new_with_tools(agent, tm, 16)
@@ -1832,7 +1832,7 @@ async fn build_runner(
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
             None
         } else {
-            let (_sub_id, sink) = subsession_store.create(session_id, role_id);
+            let (_sub_id, sink) = subsession_store.get_or_create(session_id, role_id);
             Some(sink)
         };
         let mut runner = AgentRunner::new(agent)
