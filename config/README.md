@@ -1,20 +1,38 @@
 # Config layout
 
+## 同步包（给其他机器）
+
+`config/` 是**跨机器同步的权威源**。同步内容：
+
+| 目录 | 内容 | 同步目标 |
+| ---- | ---- | -------- |
+| `config/workflows/` | 全部 workflow 定义（精致化中文版本，与 `.latte/workflows.d/` 内容一致） | 目标机 `.latte/workflows.d/` |
+| `config/agents/` | 全部角色配置（含注释的权威版；`archive/` 是已归档的冗余角色） | 目标机 `.latte/agents.d/` |
+| `prompts/`（仓库根） | 全部角色 prompt（精致化中文版本） | 目标机 `prompts/` |
+
+**不同步**：`config/models.toml` 与 `~/.latte/models.d/`——`api_key`
+等机密留在各机器本地，模型编目由每台机器自行维护。`.latte/agents.d/`
+里的 `model_chain`/`temperature` 也是**本机调优值**，不回灌 `config/`
+（权威版固定 `deepseek-v4-flash` 链以保证可移植的确定性解析）。
+
+同步脚本：`scripts/sync-config.sh [目标项目路径]`（推 config/agents +
+prompts 到目标项目的 `.latte/`）。
+
+## 运行时分层
+
 > **What this directory is**: `config/` is a **reference / template**
 > bundle for new projects. It is **not** read by `latte-agent` at
 > runtime in the `latte-rs-agents` repo itself.
 >
 > At runtime, `latte-agent` reads from the **project root**:
 >
-> - `.latte/agents/` (per-role TOML files)
-> - `.latte/models.toml` (model catalog)
-> - `.latte/workflows/` (per-workflow TOML files)
-> - `.latte/logs/` (chat session logs)
+> - `.latte/agents.d/` (per-role TOML files)
+> - `.latte/models.d/` (model catalog)
+> - `.latte/workflows.d/` (per-workflow TOML files)
+> - `prompts/` (per-role prompt markdown)
+> - `.latte/ui-sessions/` (chat session logs)
 >
-> - `agents/`, `models/`, `workflows/`, `prompts/`, `logs/` (same layout as project)
-> - `logs/agents/` (per-agent session logs, separated by agent id)
->
-> The actual config files at runtime live in `.latte/`. `config/`
+> The actual config files at runtime live in `.latte/` 与 `prompts/`。`config/`
 > is here so contributors can copy it as a starting point for a new
 > project, and so the binary's built-in defaults (compiled in via
 > `prompts.rs::template_for`) match a checked-in example.

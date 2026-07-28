@@ -1,178 +1,42 @@
-# Workflow: standard-software-discussion
-# =============================================================================
-# A workflow defines a structured multi-agent discussion — a sequence of steps
-# where specific roles speak in order, each building on the previous output.
-#
-# Fields explained in detail below.
+# Workflow: default
+# 注意：本流程尚未按精致化模式重构（缺 output_key 穿线），见看板任务。
+# 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
-# Unique workflow identifier — used in CLI: `latte-agent workflow run <name>`
 name = "standard-software-discussion"
-
-# Human-readable description — shown in `latte-agent list workflows`
-description = "Standard software development discussion: requirements → design → estimate → review → decide"
-
-# Maximum discussion rounds — how many times the full step sequence repeats.
-# Each round, agents can refine their answers based on the previous round.
-#   max_rounds = 1  → single pass (e.g., code review)
-#   max_rounds = 2  → two passes (e.g., brainstorm then refine)
-#   max_rounds = 3  → three passes (e.g., requirements → design → estimate)
+description = "标准软件开发讨论：需求 → 设计 → 估算 → 评审 → 决策"
 max_rounds = 3
-
-# Context token budget — max tokens for the shared discussion context.
-# Older messages are summarized/truncated when the budget is exceeded.
-# Optional; defaults to a reasonable value if omitted.
 context_token_budget = 32000
-
-# ─── Steps ───────────────────────────────────────────────────────────────────
-# Each [[steps]] block defines one turn in the discussion.
-# Steps execute in order; each step's output is visible to subsequent steps.
-
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "requirements"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-description = "PM presents the requirements and goals"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "PM 阐述需求和目标"
 speakers = ["pm"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Present the requirements for: {{topic}}. Cover: user story, acceptance criteria, scope boundaries, and priority."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-
+prompt = "为 {{topic}} 阐明需求。包括：用户故事、验收标准、范围边界和优先级。"
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "architecture"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-description = "Architect reviews feasibility and suggests design"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "架构师审查可行性并提出设计"
 speakers = ["architect"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Review the requirements above from a technical perspective. Suggest architecture, identify risks, and discuss tradeoffs."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-
+prompt = "从技术角度审查上述需求。建议架构方案，识别风险，讨论权衡。"
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "implementation"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-description = "Programmer estimates effort and implementation approach"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "程序员估算实现方法和工期"
 speakers = ["programmer"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Given the requirements and architecture above, estimate the implementation approach. Identify key modules, data flow, and complexity."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-
+prompt = "根据上述需求和架构，估算实现方案。识别关键模块、数据流和复杂度。"
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "quality"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-description = "Tester identifies test strategy and edge cases"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "测试员识别测试策略和边界用例"
 speakers = ["tester"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Review the requirements and implementation plan above. Identify testing strategy, edge cases, and acceptance criteria gaps."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-
+prompt = "审查上述需求和实现计划。识别测试策略、边界用例和验收标准缺口。"
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "review"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-description = "Reviewer checks quality and security concerns"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "审查员检查质量和安全问题"
 speakers = ["reviewer", "security"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Review the full discussion above. Reviewer: code quality and patterns concerns. Security: vulnerability and threat considerations."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-
+prompt = "审查上面的完整讨论。Reviewer：代码质量和模式问题。Security：漏洞和威胁考虑。"
 [[steps]]
-# Step identifier — unique within this workflow, used for output_key references.
 id = "decide"
-
-# Human-readable step description — shown in progress logs.
-# Optional; defaults to the id if omitted.
-description = "Manager makes final decision on scope and timeline"
-
-# Speakers — which roles speak in this step (by role id).
-# Multiple speakers means a round-robin: each speaks in turn, seeing the
-# previous speaker's output. Order matters.
+description = "经理对范围和时间线做最终决策"
 speakers = ["pm", "manager"]
-
-# Prompt template — what to ask the speaker(s).
-# Supports {{variable}} substitution from:
-#   - CLI flags: --var key=value
-#   - Previous step outputs: {{output_key}} (when a step sets output_key)
-#   - Built-in variables: {{topic}} (the discussion topic)
-prompt = "Based on the full discussion above, finalize scope, priorities, and timeline. Manager: assess risk and resource constraints."
-
-# Output key — save this step's output as a named variable for later steps.
-# Optional; when set, later steps can reference this output via {{key}}.
-# output_key = "<key>"
-
+prompt = "基于上面的完整讨论，最终确定范围、优先级和时间线。Manager：评估风险和资源约束。"
 [[steps]]
-# 终审：Reviewer 对整场讨论/全部产出做最终把关，输出 ✅/⚠️/❌ 裁决。
 id = "advisor_verdict"
 description = "Reviewer reviews all outputs and gives the final verdict"
 speakers = ["reviewer"]
