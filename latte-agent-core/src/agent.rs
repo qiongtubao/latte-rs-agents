@@ -648,6 +648,16 @@ pub struct AgentRunner {
     /// (which in Tauri is the app data dir, not the workspace the user
     /// opened — the bug that motivated this field).
     cwd: Option<std::path::PathBuf>,
+    /// 本轮 turn 实际执行成功的工具调用次数。D6 ToolCallEcho
+    /// 需要这个数判断"response 含 `<read>` 但 tool_use_count=0"
+    /// 的回声模式。run_turn 结束时设置，run_turn_gated 据此
+    /// 跑 check_response_gates。
+    last_turn_tool_count: usize,
+    /// Pre-persistence gate 配置。None = 不 gate（向后兼容老调用方）。
+    /// Some(_) = run_turn 自动按 GateConfig 跑 D5/D6 检查，命中
+    /// 时通过 advisor_hints 队列注入 hint 并触发同 turn 重跑
+    /// （最多 config.max_retries 次）。
+    gate_config: Option<crate::advisor_monitor::GateConfig>,
 }
 
 /// 把 ToolError 归类到 `ToolCallErrorKind`。
@@ -722,9 +732,10 @@ impl AgentRunner {
             inject_worktree_root: None,
             advisor_hints: None,
             cwd: None,
+            last_turn_tool_count: 0,
+            gate_config: None,
         }
     }
-
     pub fn new_with_tools(
         agent: Agent,
         tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
@@ -744,9 +755,10 @@ impl AgentRunner {
             inject_worktree_root: None,
             advisor_hints: None,
             cwd: None,
+            last_turn_tool_count: 0,
+            gate_config: None,
         }
     }
-
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
         Self {
             agent,
@@ -762,9 +774,21 @@ impl AgentRunner {
             inject_worktree_root: None,
             advisor_hints: None,
             cwd: None,
+            last_turn_tool_count: 0,
+            gate_config: None,
         }
     }
-    /// Read and drain the per-role inject queue, if any. Prepends a
+
+    /// Enable pre-persistence gate (D5/D6) with the given config.
+    /// When set, [`AgentRunner::run_turn_gated`] becomes the entry
+    /// point — it wraps `run_turn` and retries the same turn up to
+    /// `config.max_retries` times when the gate fails. By default
+    /// (no `with_gate_config` call) `run_turn` keeps its current
+    /// pass-through behavior, so existing call sites are unaffected.
+    pub fn with_gate_config(mut self, cfg: crate::advisor_monitor::GateConfig) -> Self {
+        self.gate_config = Some(cfg);
+        self
+    }
     /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
     /// to `self.context.messages`. Deletes the queue file. This is
     /// called at the start of `run_turn` and can also be called
@@ -927,9 +951,13 @@ impl AgentRunner {
         // *before* the working message list is built below, so the
         // first model call of this turn already sees them.
         self.drain_advisor_hints();
-        use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
-        let turn_start = Instant::now();
-        let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
+        // Pre-persistence gate: 每次 turn 开始清零 tool 计数器，
+        // run_turn 内部每次成功执行一个工具就 +1；run_turn 结束时
+        // run_turn_gated 据此跑 D6 ToolCallEcho 检查。
+        self.last_turn_tool_count = 0;
+        // *before* the working message list is built below, so the
+        // first model call of this turn already sees them.
+        self.drain_advisor_hints();
 
         let default_vars = serde_json::json!({});
         let vars = system_vars.unwrap_or(&default_vars);
@@ -1269,9 +1297,11 @@ impl AgentRunner {
                                 reason,
                             });
                         }
-
                         match exec_result {
                             Ok(result) => {
+                                // Pre-persistence gate: D6 需要 tool
+                                // 实际执行计数。失败的工具不计入。
+                                self.last_turn_tool_count += 1;
                                 // 5. PostToolHook
                                 let mut result_str = serde_json::to_string_pretty(&result)
                                     .unwrap_or_else(|_| format!("{:?}", result));
@@ -1416,6 +1446,80 @@ impl AgentRunner {
         self.context.push(Message::assistant(final_response.clone()));
 
         Ok(final_response)
+    }
+
+    /// Pre-persistence gate 版 run_turn。在 `run_turn` 拿到
+    /// final_response **之后**、返回给 controller **之前**，跑
+    /// `check_response_gates`：
+    /// - Pass：照常返回。
+    /// - Fail：把 hint 推到 advisor_hints 队列（同 turn 重跑时
+    ///   `run_turn` 入口的 `drain_advisor_hints` 会自动注入到
+    ///   context），再调一次 `run_turn`（用空 new_messages，避免
+    ///   重复 user 输入），用新响应再跑 gate。最多 `config.max_retries`
+    ///   次。
+    /// - 全部重试仍 Fail：tracing::warn + 强制 pass 当前响应
+    ///   （避免无限循环）。
+    ///
+    /// 用法：builder 模式 `runner.with_gate_config(GateConfig::default())`，
+    /// 然后调 `runner.run_turn_gated(...)`；没 set config 时
+    /// `run_turn_gated` 等价于 `run_turn`（保持向后兼容）。
+    pub async fn run_turn_gated(
+        &mut self,
+        new_messages: &[Message],
+        system_vars: Option<&serde_json::Value>,
+    ) -> AgentResult<String> {
+        let cfg = match self.gate_config.clone() {
+            Some(c) => c,
+            None => return self.run_turn(new_messages, system_vars).await,
+        };
+        let max_retries = cfg.max_retries;
+        // 第 1 次：跑原 turn
+        let mut response = self.run_turn(new_messages, system_vars).await?;
+        let mut tool_count = self.last_turn_tool_count;
+        for attempt in 0..=max_retries {
+            let verdict =
+                crate::advisor_monitor::check_response_gates(&response, tool_count, &cfg);
+            match verdict {
+                crate::advisor_monitor::GateVerdict::Pass => return Ok(response),
+                crate::advisor_monitor::GateVerdict::Fail {
+                    detector,
+                    hint,
+                    evidence,
+                } => {
+                    if attempt >= max_retries {
+                        // 重试耗尽：**终止** turn 而非强制 pass。
+                        // controller 接住 Err(AdvisorTerminated) 后会
+                        // 发 ChatEvent::AdvisorTerminated 取代 RoleTurn，
+                        // 坏答案不落盘，driver 回到 input_rx.recv()
+                        // 等用户输入。
+                        tracing::warn!(
+                            "advisor gate {} still firing after {} retries ({}); terminating",
+                            detector.label(),
+                            max_retries,
+                            evidence
+                        );
+                        return Err(AgentError::AdvisorTerminated {
+                            reason: format!(
+                                "{} 连续 {} 次未通过 gate: {}。请检查输入或换思路",
+                                detector.label(),
+                                max_retries + 1,
+                                evidence
+                            ),
+                            detector: detector.label().to_string(),
+                        });
+                    }
+                    // 注入 hint 到 advisor 队列，下一次 run_turn
+                    // 入口的 drain_advisor_hints 会自动加进 context
+                    if let Some(q) = &self.advisor_hints {
+                        q.lock().push_back(hint);
+                    }
+                    // 重跑：空 new_messages，让 hint 自然落到 context
+                    response = self.run_turn(&[], system_vars).await?;
+                    tool_count = self.last_turn_tool_count;
+                }
+            }
+        }
+        Ok(response)
     }
 
     /// Run a turn without recording in history (useful for side queries).

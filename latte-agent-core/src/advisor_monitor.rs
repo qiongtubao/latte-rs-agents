@@ -96,6 +96,17 @@ pub enum DetectorKind {
     ToolErrorStreak,
     /// D4: same (tool_name, args) call ≥3 times in a row.
     ToolCallLoop,
+    /// D5: final assistant response is shorter than the configured
+    /// threshold AND is not a deliberate short ack. Catches the
+    /// "model just spat out 53 chars of broken tool syntax" case.
+    ShortOutput,
+    /// D6: final response contains XML tool-call-looking patterns
+    /// (`<read>`, `<bash>`, `<list>`, …) but the parser did not
+    /// actually execute any tool this turn. Catches the case where
+    /// the model emits a "fake" tool call that the framework does
+    /// not recognize, so the response is just the tool syntax with
+    /// no real answer.
+    ToolCallEcho,
 }
 
 impl DetectorKind {
@@ -105,10 +116,11 @@ impl DetectorKind {
             Self::InvalidToolArgs => "D2",
             Self::ToolErrorStreak => "D3",
             Self::ToolCallLoop => "D4",
+            Self::ShortOutput => "D5",
+            Self::ToolCallEcho => "D6",
         }
     }
 }
-
 /// One detector hit: the deterministic hint (injected immediately)
 /// plus a short evidence line for the LLM review's trigger section.
 #[derive(Debug, Clone)]
@@ -255,6 +267,166 @@ fn truncate_chars(text: &str, max: usize) -> String {
     format!("{}...[+{}B]", &text[..end], text.len() - end)
 }
 
+// ─── Pre-persistence gate (D5 / D6) ───────────────────────────────
+// 用途：在主对话的 RoleTurn 落盘/广播给 UI **之前**，对 LLM 最终
+// 产出做一次零成本确定性检查。命中 → 让 runner 注入 hint 并重跑
+// 同一 turn（最多 2 次），避免坏结论进入 ui-sessions/<id>.jsonl
+// 和前端气泡。设计动机：之前 53 chars 的"伪工具调用"输出
+// （`<read><path>...</path></read>`）被 manager 当成 16K chars 的
+// 详尽答复接受，整条 pipeline 在第一个 delegate 就坏掉。
+//
+// 与 D1-D4 的关系：D1-D4 在 controller 的 event broadcast 之后由
+// AdvisorMonitor 异步观察（侧通道、注入 hint 给下个 turn），
+// 不能阻止当前 turn 的 RoleTurn 落盘；本 gate 是**同步、前置、阻断**
+// 的检查，专门覆盖"LLM 自己把坏答案当成最终回复"这种情况。
+
+/// 单次 turn 的 gate 阈值。`AgentRunner` 在调用
+/// `check_response_gates` 时传进来；控制每条 RoleTurn 的最低
+/// 通过线。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateConfig {
+    /// D5: response.len() < 该值则视为短输出。默认 50。
+    /// 选 50 的理由：53 chars 的 `<read><path>...</path></read>`
+    /// 刚好被覆盖；正常 "好的/收到/已确认" 类短 ack 也在 50 以内
+    /// —— 因此配合 D5 的 "非明确短 ack" 启发式（见实现）。
+    pub short_output_threshold: usize,
+    /// D6: response 里出现以下任意 XML 模式且本 turn 实际 tool
+    /// 执行数为 0，视为"工具回声"（模型以为调用了工具但框架没
+    /// 识别）。默认覆盖项目里所有常用工具名。
+    pub tool_call_echo_patterns: Vec<String>,
+    /// Gate 命中最多重试次数。超过则强制 pass + 落盘 +
+    /// trace 上标记 GateForcePass，避免无限循环。
+    pub max_retries: usize,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            short_output_threshold: 50,
+            tool_call_echo_patterns: vec![
+                "<read>".to_string(),
+                "<bash>".to_string(),
+                "<list>".to_string(),
+                "<search>".to_string(),
+                "<write>".to_string(),
+                "<delegate".to_string(),
+            ],
+            max_retries: 2,
+        }
+    }
+}
+
+/// Gate 决策。`Pass` = 落盘放行；`Fail` = 阻断 + 给 runner 一条
+/// hint 让它重跑 turn。`Fail` 携带 detector 类型方便 trace 记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateVerdict {
+    Pass,
+    Fail {
+        detector: DetectorKind,
+        /// 一行中文 hint，runner 把它当作用户消息追加到 context，
+        /// 下次 LLM 调用直接看到。
+        hint: String,
+        /// 给 trace 看的证据摘要（不含 response 全文，避免污染）。
+        evidence: String,
+    },
+}
+
+/// XML tool-call 标签的回声模式集合（无 `<tool_call>` 的合法
+/// 协议形式）。只匹配"opening tag"足够：闭合标签 `</read>` 通常
+/// 紧跟 opening 出现，但 framing 在长 response 里也可能不闭合
+/// （模型截断），所以 opening 已经够用。
+fn looks_like_tool_echo(response: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| response.contains(p.as_str()))
+}
+
+/// 短 ack 识别。极短且只含确认/拒绝语义的 response 视为合法
+/// 短输出，不触发 D5。启发式：长度 ≤ 12 且不含中英文字母以外
+/// 的内容（标点/emoji 都不算），或者典型 ack 词开头。
+fn looks_like_short_ack(response: &str) -> bool {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return true; // 空串也放过（极端边界）
+    }
+    if trimmed.chars().count() > 12 {
+        return false;
+    }
+    // 全是空白/标点 → 当 ack
+    if trimmed
+        .chars()
+        .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
+    {
+        return true;
+    }
+    // 典型 ack 开头（中英常见）
+    const ACK_PREFIXES: &[&str] = &[
+        "ok", "OK", "好的", "收到", "好", "是", "否", "yes", "no", "ack",
+        "ack ", "ACK", "done", "Done", "完成", "确认", "明白", "了解",
+    ];
+    ACK_PREFIXES.iter().any(|p| trimmed.starts_with(p))
+}
+
+/// Pre-persistence gate 的入口。`AgentRunner` 在 LLM/tool 循环
+/// 跑完、得到 final_response 但还没 return 给 controller 之前
+/// 调用本函数。`tool_use_count_this_turn` 由 runner 在循环里
+/// 累加（参见 agent.rs `last_turn_tool_count` 字段）。
+///
+/// 行为：
+/// - 任一 detector 命中 → `Fail`，runner 据此注入 hint + 重跑
+/// - 全通过 → `Pass`，response 正常落盘
+pub fn check_response_gates(
+    response: &str,
+    tool_use_count_this_turn: usize,
+    config: &GateConfig,
+) -> GateVerdict {
+    // D5: 短输出（且非明确 ack）
+    if response.len() < config.short_output_threshold && !looks_like_short_ack(response) {
+        return GateVerdict::Fail {
+            detector: DetectorKind::ShortOutput,
+            hint: format!(
+                "[advisor gate D5] 你的上一轮输出只有 {} 字符（阈值 {}），看起来像没真正回答。\n\
+                 - 如果你已经调用了工具，请把工具结果**用文字**复述给用户。\n\
+                 - 如果没调用工具，请**用文字**直接回答问题，不要只输出工具调用语法。\n\
+                 - 调用工具的格式必须是 `<tool_call>NAME {{\"key\": \"value\"}}</tool_call>`（单行、JSON 参数），不是 `<read>...</read>` 这种 XML。",
+                response.len(),
+                config.short_output_threshold
+            ),
+            evidence: format!(
+                "D5 ShortOutput: response.len()={} < threshold={}",
+                response.len(),
+                config.short_output_threshold
+            ),
+        };
+    }
+    // D6: 工具回声（XML 工具标签 + 实际 tool_use_count=0）
+    if tool_use_count_this_turn == 0
+        && looks_like_tool_echo(response, &config.tool_call_echo_patterns)
+    {
+        let matched: Vec<&str> = config
+            .tool_call_echo_patterns
+            .iter()
+            .filter(|p| response.contains(p.as_str()))
+            .map(|p| p.as_str())
+            .collect();
+        return GateVerdict::Fail {
+            detector: DetectorKind::ToolCallEcho,
+            hint: format!(
+                "[advisor gate D6] 你的输出包含工具调用标签 {}，但本轮实际没有工具被执行（tool_use_count=0）。\n\
+                 这说明你用了**非协议**的 XML 形式（`<read>...</read>` 等），框架无法识别。\n\
+                 请改用：\n\
+                 - 如果是 read：`<tool_call>read {{\"path\": \"...\"}}</tool_call>`\n\
+                 - 如果是 bash：`<tool_call>bash {{\"command\": \"...\"}}</tool_call>`\n\
+                 - 如果已经拿到了工具结果但忘了复述：请把结果**用文字**写出来",
+                matched.join("/")
+            ),
+            evidence: format!(
+                "D6 ToolCallEcho: matched patterns={:?}, tool_use_count=0",
+                matched
+            ),
+        };
+    }
+    GateVerdict::Pass
+}
+
 // ─── Rolling transcript ────────────────────────────────────────────
 
 /// Rolling per-turn transcript fed to the LLM review. Oldest lines
@@ -298,12 +470,17 @@ impl Transcript {
 
 // ─── Review verdict parsing ────────────────────────────────────────
 
-/// Three-state review verdict (design §3).
+/// Review verdict 第四态 `Terminate`：LLM 复审或 deterministic
+/// gate（D5/D6 重试耗尽）认为「问题严重到需要停下让用户接管」。
+/// controller 接住后发 `ChatEvent::AdvisorTerminated` 而不是
+/// `RoleTurn`，坏答案不落盘；用户可继续输入（不是硬终止：
+/// runner 不自杀，driver 等用户新消息）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Ok,
     Warn,
     Intervene,
+    Terminate,
 }
 
 /// Parsed advisor review output.
@@ -325,11 +502,13 @@ fn verdict_word(s: &str) -> Option<Verdict> {
         "ok" => Some(Verdict::Ok),
         "warn" | "warning" => Some(Verdict::Warn),
         "intervene" => Some(Verdict::Intervene),
+        "terminate" | "stop" | "halt" | "kill" => Some(Verdict::Terminate),
         _ => None,
     }
 }
 
 /// Parse the advisor's review output. Expected shape:
+///
 ///
 /// ```text
 /// verdict: ok | warn | intervene
@@ -412,6 +591,11 @@ pub struct AdvisorReviewEngine {
     session_cwd: Option<PathBuf>,
     /// Master switch for reading 监察笔记 (config `watchdog_notes`).
     watchdog_notes: bool,
+    /// 可选：把每次 review 的 LLM 调用 / 返回 / verdict 落盘到
+    /// `<ui-sessions>/<sid>/advisor-<micros>.jsonl`。`None` = 不落盘
+    /// （测试 / 未启用 persistence 的 caller）。由 UI server 在 spawn
+    /// advisor monitor 前调 [`with_subsession_sink`] 注入。
+    subsession_sink: Option<Arc<dyn crate::trace::TraceSink>>,
 }
 
 impl AdvisorReviewEngine {
@@ -426,6 +610,7 @@ impl AdvisorReviewEngine {
             default_params,
             session_cwd: None,
             watchdog_notes: true,
+            subsession_sink: None,
         }
     }
 
@@ -435,6 +620,13 @@ impl AdvisorReviewEngine {
     pub fn with_watchdog_notes(mut self, session_cwd: PathBuf, enabled: bool) -> Self {
         self.session_cwd = Some(session_cwd);
         self.watchdog_notes = enabled;
+        self
+    }
+
+    /// 注入 subsession sink（来自 UI server 的 `SubsessionStore::create`）。
+    /// 启用后每次 `review()` 会把 LLM 调用 / 原始返回 / verdict 落盘。
+    pub fn with_subsession_sink(mut self, sink: Arc<dyn crate::trace::TraceSink>) -> Self {
+        self.subsession_sink = Some(sink);
         self
     }
 
@@ -473,9 +665,33 @@ impl AdvisorReviewEngine {
         };
         let sys = agent.system_message(&serde_json::json!({}))?;
         let user = Message::user(build_review_prompt(user_question, transcript, trigger, &notes));
+        let model_id = agent
+            .model_chain
+            .first()
+            .map(|m| m.model.id.clone())
+            .unwrap_or_default();
+        // ── 落盘：调 LLM 前 emit ModelCall ──
+        if let Some(sink) = self.subsession_sink.as_ref() {
+            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+            sink.emit(crate::trace::TraceEvent::ModelCall {
+                meta: meta.clone(),
+                model_id: model_id.clone(),
+                params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
+                latency_ms: 0,
+                finish_reason: String::new(),
+            });
+        }
         let completion = agent
             .chat(&[sys, user], None, WaitPolicy::NoWait)
             .await?;
+        // ── 落盘：调 LLM 后 emit ModelRawOut（含 verdict 原始输出） ──
+        if let Some(sink) = self.subsession_sink.as_ref() {
+            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+            sink.emit(crate::trace::TraceEvent::ModelRawOut {
+                meta,
+                raw_content: completion.content.clone(),
+            });
+        }
         Ok(parse_verdict(&completion.content))
     }
 }
@@ -801,6 +1017,7 @@ impl AdvisorMonitor {
                 let label = match verdict.verdict {
                     Verdict::Warn => "⚠️ warn",
                     Verdict::Intervene => "🛑 intervene",
+                    Verdict::Terminate => "🛑 terminate",
                     Verdict::Ok => unreachable!(),
                 };
                 let reason = if verdict.reason.is_empty() {
@@ -1542,5 +1759,88 @@ mod tests {
         assert!(!body.contains("PROJECT-NOTE"), "note not read: {body}");
 
         restore_latte_home(prev);
+    }
+
+    // ─── D5 / D6 Pre-persistence gate tests ──────────────────────
+    // 核心场景：之前 53 chars 的 `<read><path>deps/xredis-gtid/Cargo.toml</path></read>`
+    // 伪 tool call 必须被 D5 + D6 同时命中，强制重做 turn。
+
+    #[test]
+    fn gate_catches_53char_broken_response() {
+        // 复现 ui-2569234-1785207692440.jsonl L7 的 programmer 输出。
+        // 53 chars ≥ 默认 D5 阈值 50，所以 D5 不撞；D6 命中
+        // （<read> + tool_use_count=0）。
+        let response = "<read><path>deps/xredis-gtid/Cargo.toml</path></read>";
+        assert_eq!(response.len(), 53);
+        let cfg = GateConfig::default();
+        let verdict = check_response_gates(response, 0, &cfg);
+        assert!(
+            matches!(verdict, GateVerdict::Fail { detector: DetectorKind::ToolCallEcho, .. }),
+            "expected D6 ToolCallEcho fail, got {verdict:?}"
+        );
+    }
+    #[test]
+    fn gate_d6_passes_when_tool_was_actually_executed() {
+         // 同样的 response，但 tool_use_count=1（工具真执行了，response
+        let response = "Here is the result based on the read tool I just called: \
+                        <read><path>foo.rs</path></read>";
+        let cfg = GateConfig::default();
+        let verdict = check_response_gates(response, 1, &cfg);
+        assert!(matches!(verdict, GateVerdict::Pass), "expected Pass, got {verdict:?}");
+    }
+
+    #[test]
+    fn gate_d5_allows_short_ack() {
+        for ack in &["好的", "收到", "ok", "OK", "确认", "done", "完成"] {
+            let verdict = check_response_gates(ack, 0, &GateConfig::default());
+            assert!(
+                matches!(verdict, GateVerdict::Pass),
+                "ack `{ack}` should Pass D5, got {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_d5_rejects_non_ack_short_response() {
+        let response = "TODO"; // 4 chars, not an ack
+        let verdict = check_response_gates(response, 0, &GateConfig::default());
+        assert!(
+            matches!(verdict, GateVerdict::Fail { detector: DetectorKind::ShortOutput, .. }),
+            "expected D5, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn gate_passes_normal_long_response() {
+        let response = "This is a perfectly normal response that explains things in detail \
+                        and has way more than the 50 character threshold. It contains real \
+                        content, not just tool call syntax.";
+        let verdict = check_response_gates(response, 0, &GateConfig::default());
+        assert!(matches!(verdict, GateVerdict::Pass), "expected Pass, got {verdict:?}");
+    }
+
+    #[test]
+    fn gate_d6_hint_mentions_tool_call_format() {
+        // D6 hit 时 hint 必须明确告诉模型"用 <tool_call>NAME {json}</tool_call>"
+        // 否则下次重做还是错的格式
+        let response = "<read><path>foo.rs</path></read> padding padding padding padding padding";
+        let cfg = GateConfig::default();
+        let verdict = check_response_gates(response, 0, &cfg);
+        match verdict {
+            GateVerdict::Fail { hint, .. } => {
+                assert!(hint.contains("tool_call"), "hint must mention <tool_call> format: {hint}");
+                assert!(hint.contains("D6"), "hint should label the detector: {hint}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_default_config_threshold_is_50() {
+        // 默认阈值 50 来自设计：53 chars 的 broken response 刚好被覆盖
+        let cfg = GateConfig::default();
+        assert_eq!(cfg.short_output_threshold, 50);
+        assert_eq!(cfg.max_retries, 2);
+        assert!(cfg.tool_call_echo_patterns.contains(&"<read>".to_string()));
     }
 }

@@ -84,8 +84,18 @@ pub enum AgentError {
         tried: Vec<String>,
         next_retry_in: Option<std::time::Duration>,
     },
-
     /// A lifecycle hook aborted execution.
     #[error("hook '{hook}' aborted: {reason}")]
     HookAborted { hook: String, reason: String },
+
+    /// Pre-persistence gate 已重试 `max_retries` 次仍判定当前
+    /// turn 不合格（如 D5/D6 一直命中），advisor 选择**终止本次
+    /// turn 而非强制落盘坏答案**。`reason` 是给 UI 展示的终止
+    /// 原因，`detector` 是触发的 detector 标签（D1-D6）。
+    ///
+    /// 与 `HookAborted` 的区别：终止后 controller **不会**广播
+    /// `RoleTurn` 给 UI（坏答案不落盘），改为发
+    /// `ChatEvent::AdvisorTerminated` 让用户看到原因并继续对话。
+    #[error("advisor terminated: {reason} (detector: {detector})")]
+    AdvisorTerminated { reason: String, detector: String },
 }

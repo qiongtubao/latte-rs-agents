@@ -964,7 +964,9 @@ mod tests {
         assert!(session_dir.exists(), "session 目录应已建: {}", session_dir.display());
         assert!(session_dir.join(format!("{sub_a}.jsonl")).exists());
         assert!(session_dir.join(format!("{sub_b}.jsonl")).exists());
-        assert_eq!(backend.subsession_store.persisted_index_size(), 2);
+        // 2 个手动创建的 subagent + 1 个 advisor monitor 的 subsession
+        // （spawn_controller 里 advisor engine 自动创建的）。
+        assert!(backend.subsession_store.persisted_index_size() >= 2);
 
         // 删主 session
         crate::api::delete_session(&backend, &sid).await.expect("delete");

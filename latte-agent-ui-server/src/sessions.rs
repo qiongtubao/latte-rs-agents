@@ -424,6 +424,16 @@ impl SessionHandle {
                 self.spawn.cwd.clone(),
                 advisor_monitor_cfg.watchdog_notes,
             );
+            // 给 advisor 也分配一个 subsession sink：每次 review 的
+            // LLM 调用 / 返回会落盘到
+            // `<ui-sessions>/<sid>/advisor-<micros>.jsonl`，跟主角色
+            // 同目录，删主 session 时一并清掉。
+            let engine = if self.session_id.is_empty() {
+                engine
+            } else {
+                let (_sub_id, sink) = self.spawn.subsession_store.create(&self.session_id, "advisor");
+                engine.with_subsession_sink(sink)
+            };
             AdvisorMonitor::spawn(
                 controller.clone(),
                 advisor_monitor_cfg,

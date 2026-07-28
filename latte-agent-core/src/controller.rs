@@ -67,6 +67,10 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         }
         AgentError::HookAborted { hook, .. } => ModelErrorKind::Other { message: format!("hook aborted: {hook}") },
         AgentError::Io(io) => ModelErrorKind::Other { message: format!("io: {io}") },
+        // Advisor 终止（gate D5/D6 重试耗尽 或 LLM 复审返回 Terminate）。
+        AgentError::AdvisorTerminated { reason, detector } => {
+            ModelErrorKind::Other { message: format!("advisor terminated ({}): {}", detector, reason) }
+        }
     }
 }
 
@@ -305,6 +309,28 @@ pub enum ChatEvent {
         elapsed_secs: u64,
         soft_timeout_secs: u64,
         hard_timeout_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
+    },
+
+    /// Advisor 终止了一次 turn（**不**广播 `RoleTurn`，坏答案不
+    /// 落盘）。两类触发源：
+    /// 1. Pre-persistence gate（D5/D6）重试 `max_retries` 次仍命中
+    ///    → runner raise `AgentError::AdvisorTerminated`，
+    ///    `detector: Some("D6")` 等具体标签
+    /// 2. LLM 复审返回 `Verdict::Terminate`（语义层判定问题严重
+    ///    到需要停下让用户接管），`detector: Some("LLM")`
+    ///
+    /// UI 必须把它显示成"对话已暂停，请查看 advisor 反馈后继续"
+    /// 的明确状态；用户输入新消息后 controller 正常处理。runner
+    /// 不会自杀，driver 只是回到 `input_rx.recv()` 等用户输入。
+    /// `sub_id` 在 sub-session 终止时填上。
+    AdvisorTerminated {
+        role_id: String,
+        reason: String,
+        /// 触发的 detector 标签（"D5" / "D6" / "LLM" / "D3" / "D4"）；
+        /// `None` 表示来源未明确（例如 LLM 复审失败但降级返回时）
+        detector: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_id: Option<String>,
     },
@@ -1786,19 +1812,36 @@ async fn build_runner(
             )
             .map_err(|e| AgentError::Tool(format!("register generate_image: {e}")))?;
         }
-        Ok((
-            AgentRunner::new_with_tools(agent, tm, 16)
-                .with_role(role_id)
-                .with_cwd(cwd.to_path_buf()),
-            role_id.to_string(),
-        ))
+
+        // ── 给主 runner 分配 subsession sink（manager / 任何角色通用） ──
+        let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
+            None
+        } else {
+            let (_sub_id, sink) = subsession_store.create(session_id, role_id);
+            Some(sink)
+        };
+        let mut runner = AgentRunner::new_with_tools(agent, tm, 16)
+            .with_role(role_id)
+            .with_cwd(cwd.to_path_buf());
+        if let Some(sink) = subsession_sink.as_ref() {
+            runner = runner.with_sink(sink.clone());
+        }
+        Ok((runner, role_id.to_string()))
     } else {
-        Ok((
-            AgentRunner::new(agent)
-                .with_role(role_id)
-                .with_cwd(cwd.to_path_buf()),
-            role_id.to_string(),
-        ))
+        // ── 给主 runner 分配 subsession sink（同上） ──
+        let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
+            None
+        } else {
+            let (_sub_id, sink) = subsession_store.create(session_id, role_id);
+            Some(sink)
+        };
+        let mut runner = AgentRunner::new(agent)
+            .with_role(role_id)
+            .with_cwd(cwd.to_path_buf());
+        if let Some(sink) = subsession_sink.as_ref() {
+            runner = runner.with_sink(sink.clone());
+        }
+        Ok((runner, role_id.to_string()))
     }
 }
 
