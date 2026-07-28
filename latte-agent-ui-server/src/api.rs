@@ -332,10 +332,31 @@ pub struct RoleConfigEntry {
     pub prompt: String,
 }
 
+/// `GET /api/roles/config` 同时返回的可用模型清单，给角色编辑器的
+/// 「模型链」下拉框使用 —— 避免用户手敲 model id（容易打错或记错）。
+///
+/// 数据源：合并后的 `cfg.models.models`（已经走过项目 + 全局两层合并，
+/// 与 `GET /api/models` 同源）。`source` 字段供 UI 在 option 标签里
+/// 显示「项目 / 全局 / catalog」标签，让用户知道这条记录是否在磁盘上。
+#[derive(Serialize, Clone, Debug)]
+pub struct AvailableModel {
+    /// 模型 id（同时是 API 请求里的 `model` 字段，也是 `model_chain`
+    /// 里实际写入的字符串）。注意：后端 `ModelDef.name` 的别名是
+    /// `model_name`，与此刻的 `name` 字段语义一致。
+    pub name: String,
+    /// 厂商标识，与 `name` 一起组成 `provider/name` 全键。
+    pub provider: String,
+    /// "project" / "global" / "catalog"：UI 显示用标签。
+    pub source: String,
+}
+
 #[derive(Serialize)]
 pub struct RolesConfigResponse {
     pub roles: Vec<RoleConfigEntry>,
     pub available_tools: Vec<String>,
+    /// 合并后的可用模型清单（按 provider 排序后按 name 排序），供
+    /// 角色编辑器的「模型链」下拉框使用。
+    pub available_models: Vec<AvailableModel>,
     pub tiers: Vec<String>,
     pub workspace_path: String,
     pub agents_config_path: String,
@@ -569,24 +590,69 @@ pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiE
     // 表单数据与源文件 tab 同源：先从磁盘重载，再读内存。
     reload_roles_from_disk(b);
     let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
-    let roles = {
+    let (roles, available_models) = {
         let cfg = b.merged.read();
         let mut ids: Vec<&String> = cfg.roles.keys().collect();
         ids.sort();
-        ids.into_iter()
+        let roles: Vec<RoleConfigEntry> = ids
+            .into_iter()
             .filter_map(|id| cfg.roles.get(id))
             .map(|tpl| role_config_entry(b, tpl))
-            .collect()
+            .collect();
+        let available_models = enumerate_available_models(b);
+        (roles, available_models)
     };
     let available_tools = enumerate_available_tools().await?;
     Ok(RolesConfigResponse {
         roles,
+        available_models,
         available_tools,
         tiers: vec!["premium".into(), "standard".into(), "budget".into()],
         workspace_path: b.cwd.display().to_string(),
         agents_config_path: agents_dir.display().to_string(),
         sessions_path: crate::sessions::SessionPersist::dir_for(&b.cwd).display().to_string(),
     })
+}
+
+/// 枚举合并后的可用模型 —— 给角色编辑器的「模型链」下拉框使用。
+///
+/// 数据源：`cfg.models.models`（已经走过项目 + 全局两层合并），再用
+/// `ModelsState::load` 独立扫一次磁盘以拿到每个 model 的来源标签
+/// （项目 / 全局 / catalog —— catalog 表示该 model 只在内存 catalog 里，
+/// 还没落盘）。与 `list_models` 的数据流同源但更精简：只取 name /
+/// provider / source 三个字段，前端下拉框不需要完整 `ModelDef`。
+///
+/// 排序：先按 `provider` 再按 `name` 字典序，保证 UI 下拉框顺序稳定，
+/// 方便用户快速定位。
+fn enumerate_available_models(b: &UiBackend) -> Vec<AvailableModel> {
+    let cfg = b.merged.read();
+    let project_dir = b.cwd.join(".latte/models.d");
+    let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
+        .unwrap_or_default();
+    let mut out: Vec<AvailableModel> = cfg
+        .models
+        .models
+        .iter()
+        .map(|def| {
+            let key = if def.name.contains('/') {
+                def.name.clone()
+            } else {
+                format!("{}/{}", def.provider, def.name)
+            };
+            let source = on_disk
+                .sources
+                .get(&key)
+                .map(|s| source_label(*s).to_string())
+                .unwrap_or_else(|| "catalog".to_string());
+            AvailableModel {
+                name: def.name.clone(),
+                provider: def.provider.clone(),
+                source,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.provider.cmp(&b.provider).then_with(|| a.name.cmp(&b.name)));
+    out
 }
 
 /// `POST /api/roles/config` 的请求体；Tauri `ui_roles_config_save` 的
@@ -1542,6 +1608,120 @@ mod tests {
         assert_eq!(pm.icon, "📋");
         // 项目层已声明的字段不被全局覆盖
         assert_eq!(pm.name, "PM");
+    }
+    /// 角色编辑器接收的 `available_models` 应来自合并后的 catalog，
+    /// 排序按 (provider, name)，来源标签按磁盘扫描结果标注。
+    #[test]
+    fn enumerate_available_models_returns_sorted_merged_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let b = test_backend(&cwd);
+        // 注入三个 catalog model（无磁盘文件 → source = "catalog"）。
+        let new_models = vec![
+            ModelDef {
+                name: "zeta".into(),
+                api: "openai".into(),
+                provider: "openai".into(),
+                base_url: "https://x".into(),
+                api_key: "k".into(),
+                context_window: 1,
+                max_tokens: 1,
+                supports_thinking: false,
+                supports_vision: false,
+                supports_image_generation: false,
+                cost_per_million_input: None,
+                cost_per_million_output: None,
+                tier: None,
+                timeout_secs: None,
+            },
+            ModelDef {
+                name: "alpha".into(),
+                api: "anthropic".into(),
+                provider: "anthropic".into(),
+                base_url: "https://x".into(),
+                api_key: "k".into(),
+                context_window: 1,
+                max_tokens: 1,
+                supports_thinking: false,
+                supports_vision: false,
+                supports_image_generation: false,
+                cost_per_million_input: None,
+                cost_per_million_output: None,
+                tier: None,
+                timeout_secs: None,
+            },
+            ModelDef {
+                name: "beta".into(),
+                api: "openai".into(),
+                provider: "openai".into(),
+                base_url: "https://x".into(),
+                api_key: "k".into(),
+                context_window: 1,
+                max_tokens: 1,
+                supports_thinking: false,
+                supports_vision: false,
+                supports_image_generation: false,
+                cost_per_million_input: None,
+                cost_per_million_output: None,
+                tier: None,
+                timeout_secs: None,
+            },
+        ];
+        b.merged.write().models.models = new_models;
+        let out = enumerate_available_models(&b);
+        // 按 provider 后按 name 排序：anthropic/alpha 在最前（provider 字典序）
+        // openai 的 alpha (beta) 和 zeta 按字母序紧随其后。
+        let names: Vec<&str> = out.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+        // 全部 source = "catalog"（无磁盘文件）
+        for m in &out {
+            assert_eq!(m.source, "catalog", "{:?}", m);
+        }
+    }
+
+    /// 项目 `.latte/models.d/<provider>__<id>.toml` 存在时，对应 model
+    /// 的 source 标签应为 "project"。
+    #[test]
+    fn enumerate_available_models_labels_disk_source_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(cwd.join(".latte/models.d")).unwrap();
+        let project_path = cwd.join(".latte/models.d/openai__alpha.toml");
+        std::fs::write(
+            &project_path,
+            r#"name = "alpha"
+api = "openai"
+provider = "openai"
+base_url = "https://x"
+api_key = "k"
+context_window = 1
+max_tokens = 1
+"#,
+        )
+        .unwrap();
+        let b = test_backend(&cwd);
+        b.merged.write().models.models = vec![ModelDef {
+            name: "alpha".into(),
+            api: "openai".into(),
+            provider: "openai".into(),
+            base_url: "https://x".into(),
+            api_key: "k".into(),
+            context_window: 1,
+            max_tokens: 1,
+            supports_thinking: false,
+            supports_vision: false,
+            supports_image_generation: false,
+            cost_per_million_input: None,
+            cost_per_million_output: None,
+            tier: None,
+            timeout_secs: None,
+        }];
+        let out = enumerate_available_models(&b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "alpha");
+        assert_eq!(out[0].provider, "openai");
+        assert_eq!(out[0].source, "project");
     }
 }
 

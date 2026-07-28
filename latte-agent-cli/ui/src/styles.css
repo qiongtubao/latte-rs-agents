@@ -845,6 +845,16 @@ select {
 }
 .role-editor-chain-row input { min-width: 0; }
 .role-editor-chain-order { color: var(--fg-2); text-align: right; }
+/* 模型链下拉框行：cell 把 select 和 custom input 摞在同一个 grid 列里。
+ * 切到「自定义 ID」时显示文本输入框，否则隐藏 —— 保持单列 width = 1fr 的布局。 */
+.role-editor-chain-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+.role-editor-chain-select { width: 100%; min-width: 0; }
+.role-editor-chain-custom { width: 100%; min-width: 0; }
 .role-editor-chain-row button, .role-editor-chain-add { padding: 0.25rem 0.4rem; }
 .role-editor-chain-add { align-self: flex-start; }
 .role-editor-tools {

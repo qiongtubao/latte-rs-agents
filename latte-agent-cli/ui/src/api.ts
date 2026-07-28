@@ -83,10 +83,26 @@ export interface RoleConfigEntry {
 export interface RolesConfig {
   roles: RoleConfigEntry[];
   available_tools: string[];
+  /** 角色编辑器的「模型链」下拉框数据源。详见后端 `AvailableModel`。 */
+  available_models: AvailableModel[];
   tiers: string[];
   workspace_path: string;
   agents_config_path: string;
   sessions_path: string;
+}
+
+/** 角色编辑器「模型链」下拉框的单个选项。
+ * 后端与 `GET /api/models` 同源，但只取下拉框需要的三个字段
+ * （name / provider / source），不传完整 ModelDef。
+ * `source` 是 "project" / "global" / "catalog" 之一，UI 用它显示
+ * 「项目 / 全局 / catalog」标签，让用户知道这条记录是否在磁盘上。 */
+export interface AvailableModel {
+  /** 模型 id —— 选中后写入 `model_chain` 的字符串。 */
+  name: string;
+  /** 厂商标识。UI 用 `provider/name` 显示，比单 name 更易区分同名
+   * 模型在不同厂商下的实例。 */
+  provider: string;
+  source: string;
 }
 
 /** `POST /api/roles/config` 请求体。 */

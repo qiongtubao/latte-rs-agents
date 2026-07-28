@@ -3,6 +3,7 @@
 // 支持模型链浏览（联动模型管理面板）、工具跳转（联动工具管理页面）和角色测试。
 import { getRolesConfig, saveRoleConfig, createRole, deleteRole, testRole, getRoleToml, putRoleToml } from "./api";
 import type { RoleConfigEntry, RolesConfig, TestRoleResponse } from "./api";
+import { renderChain as chainRowRender, readChainValues as chainRowReadValues } from "./chain_row";
 
 interface UIBinding {
   panelEl: HTMLElement;
@@ -99,73 +100,28 @@ export function mountRoleEditor(opts: { container: UIBinding }): RoleEditorContr
     container.tomlStatusEl.classList.toggle("error", error);
   };
 
-  const chainValues = () => Array.from(container.chainEl.querySelectorAll<HTMLInputElement>("input"))
-    .map((input) => input.value.trim())
-    .filter(Boolean);
-
   // 代码/文档路径：textarea 每行一条，忽略空行。
   const codePathValues = () => container.codePathsInput.value
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
 
-  function renderChain(models: string[]): void {
-    container.chainEl.replaceChildren();
-    const values = models.length ? models : [""];
-    values.forEach((model, index) => {
-      const row = document.createElement("div");
-      row.className = "role-editor-chain-row";
-      const order = document.createElement("span");
-      order.className = "role-editor-chain-order";
-      order.textContent = `${index + 1}.`;
-      const input = document.createElement("input");
-      input.type = "text";
-      input.value = model;
-      input.placeholder = "model-id";
-      const button = (label: string, title: string, action: () => void) => {
-        const el = document.createElement("button");
-        el.type = "button";
-        el.textContent = label;
-        el.title = title;
-        el.addEventListener("click", action);
-        return el;
-      };
-      row.append(
-        order,
-        input,
-        button("🔍", "在模型管理中查看此模型", () => {
-          const modelId = input.value.trim();
-          if (modelId) {
-            container.chainBrowseBtn.dispatchEvent(
-              new CustomEvent("select-model", { bubbles: true, detail: { modelId } })
-            );
-          }
-        }),
-        button("↑", "提高优先级", () => {
-          const next = chainValues();
-          if (index > 0) [next[index - 1], next[index]] = [next[index], next[index - 1]];
-          renderChain(next);
-        }),
-        button("↓", "降低优先级", () => {
-          const next = chainValues();
-          if (index < next.length - 1) [next[index], next[index + 1]] = [next[index + 1], next[index]];
-          renderChain(next);
-        }),
-        button("×", "删除模型", () => {
-          const next = chainValues();
-          next.splice(index, 1);
-          renderChain(next);
-        }),
-      );
-      container.chainEl.appendChild(row);
+  // 模型链下拉框：所有 DOM 逻辑都在 `chain_row.ts`，这里只负责串接
+  // 当前 config（提供 available_models）+ UI 事件（🔍 跳模型管理）。
+  const renderChain = (models: string[]): void => {
+    chainRowRender({
+      container: container.chainEl,
+      models,
+      catalog: config?.available_models ?? [],
+      onBrowse: (modelId) => {
+        container.chainBrowseBtn.dispatchEvent(
+          new CustomEvent("select-model", { bubbles: true, detail: { modelId } })
+        );
+      },
+      renderNext: renderChain,
     });
-    const add = document.createElement("button");
-    add.type = "button";
-    add.className = "role-editor-chain-add";
-    add.textContent = "+ 添加模型";
-    add.addEventListener("click", () => renderChain([...chainValues(), ""]));
-    container.chainEl.appendChild(add);
-  }
+  };
+  const chainValues = () => chainRowReadValues(container.chainEl);
 
   function fillForm(roleId: string): void {
     const entry = config?.roles.find((role) => role.id === roleId);
