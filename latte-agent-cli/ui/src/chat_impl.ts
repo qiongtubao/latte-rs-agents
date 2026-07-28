@@ -25,6 +25,8 @@ export interface ChatController {
   clear(): void;
   /** Focus the chat input (exposed to the host as `__LATTE_UI__.focus`). */
   focus(): void;
+  /** Update role → file path map for filename display in bubbles. */
+  setRoleFilePaths(paths: Record<string, string>): void;
   /** Insert a code reference (and optional quote block) at the input
    * cursor — the host calls this via `__LATTE_UI__.insertContext`. */
   insertContext(ref: CodeRef & { quote?: string }): void;
@@ -112,6 +114,8 @@ export function mountChat(opts: {
   const workflowStates = new Map<string, HTMLElement>();
   /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
   const workflowTranscripts = new Map<string, string>();
+  /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
+  let roleFilePaths = new Map<string, string>();
 
   /** Find the (most recent) pending delegate targeting `roleId` —
    *  tool events carry role_id but no sub_id, so parallel delegates
@@ -122,6 +126,10 @@ export function mountChat(opts: {
       if (di.targetRole === roleId) found = subId;
     }
     return found;
+  }
+
+  function getFilePath(roleId: string): string | undefined {
+    return roleFilePaths.get(roleId);
   }
 
   function clearAllDelegates(): void {
@@ -205,6 +213,8 @@ export function mountChat(opts: {
     /** 状态行（status）专用：'executing' | 'done' | 'error'，决定
      *  CSS 颜色 + 图标。仅 status / system 行生效。 */
     state?: "executing" | "done" | "error";
+    /** 角色对应的配置文件路径（仅 role / tool / error 类消息生效） */
+    filePath?: string;
   }): HTMLElement {
     const kind = opts2.kind;
     const ts = opts2.timestamp || fmtDisplayTime();
@@ -286,6 +296,15 @@ export function mountChat(opts: {
       }
       bubble.appendChild(content);
 
+      // ── Filepath row (bottom of bubble) ──
+      if (opts2.filePath) {
+        const fpRow = document.createElement("div");
+        fpRow.className = "msg-filepath";
+        fpRow.textContent = opts2.filePath;
+        fpRow.title = "配置文件路径";
+        bubble.appendChild(fpRow);
+      }
+
       // ── Quote block ──
       if (opts2.reference) {
         const ref = opts2.reference;
@@ -355,19 +374,6 @@ export function mountChat(opts: {
 
 
 
-    // For @role delegated messages: click shows subsession via subId
-    if (opts2.subId && activeDelegates.has(opts2.subId) && kind === "role" && opts2.meta) {
-      const roleName = opts2.meta;
-      row.style.cursor = "pointer";
-      row.title = "点击查看执行过程";
-      row.addEventListener("click", (e) => {
-        e.stopPropagation();
-        if (opts2.subId && onShowSubsession) {
-          const label = (roleIcon(roleName) || "") + " " + roleName;
-          onShowSubsession(opts2.subId, label);
-        }
-      });
-    }
 
     // ── Store record for context menu & reference lookup ──
     messageStore.push({
@@ -500,14 +506,6 @@ export function mountChat(opts: {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); saveEditModal(); }
   });
 
-  // Double-click a message row to edit (same as context-menu edit).
-  container.messagesEl.addEventListener("dblclick", (e) => {
-    const row = (e.target as HTMLElement).closest(".message-row") as HTMLElement | null;
-    if (!row || !row.dataset.messageId) return;
-    const record = getMsgById(row.dataset.messageId);
-    if (!record) return;
-    openEditModal(record);
-  });
   container.clearBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /clear" }); await sendCommand("/clear"); });
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
   // Abort button: kills all in-flight turns + subagents + workflows.
@@ -873,7 +871,7 @@ export function mountChat(opts: {
       case "ToolUse": {
         const t = truncate(e.args, 100);
         subagentTools.push(`🔧 ${e.tool_name}(${t})`);
-        const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
         const useChips = makeRefChips(extractCodeRefs(e.tool_name, e.args));
         if (useChips) toolRow.querySelector(".msg-bubble")?.appendChild(useChips);
         currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
@@ -887,7 +885,7 @@ export function mountChat(opts: {
       case "ToolResult": {
         const short = truncate(e.result, 80);
         subagentTools.push(`✅ ${e.tool_name} → ${short}`);
-        const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id) });
+        const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
         const resultChips = makeRefChips(extractCodeRefs(e.tool_name, "", e.result));
         if (resultChips) resultRow.querySelector(".msg-bubble")?.appendChild(resultChips);
         updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
@@ -913,6 +911,7 @@ export function mountChat(opts: {
           content: `🖼 ${truncate(e.prompt, 120)}`,
           meta: e.role_id,
           icon,
+          filePath: getFilePath(e.role_id),
         });
         const link = document.createElement("a");
         link.href = e.path;
@@ -948,7 +947,7 @@ export function mountChat(opts: {
               })()
             : undefined);
 
-        addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref });
+        addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref, filePath: getFilePath(e.role_id) });
         currentToolCall = ""; currentActivity = ""; updateFooter();
         if (e.is_complete) {
           setStatus("connected"); clearWaitTimer();
@@ -999,6 +998,7 @@ export function mountChat(opts: {
           meta: e.from_role || "manager",
           icon: roleIcon(e.from_role || "manager"),
           subId: e.sub_id,
+          filePath: getFilePath(e.to_role),
         });
         const msgId = delegateMsg.dataset.messageId || "";
         // Pending-state badge on the delegate bubble — flipped to
@@ -1042,8 +1042,6 @@ export function mountChat(opts: {
           finishedDi.stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
           finishedDi.stateEl.className = `delegate-state ${isFail ? "failed" : "done"}`;
         }
-        msg.style.cursor = "pointer";
-        msg.addEventListener("click", () => { if (onShowSubsession) onShowSubsession(e.sub_id, label); });
         msg.addEventListener("contextmenu", (ev) => { ev.preventDefault(); if (onShowSubsession) onShowSubsession(e.sub_id, label); });
         currentDelegate = ""; currentActivity = "";
         const icon = currentRoleIcon || resolveIcon(e.from_role);
@@ -1060,6 +1058,7 @@ export function mountChat(opts: {
           content: `🔀 工作流「${e.name}」启动\n${truncate(e.topic, 200)}`,
           meta: "manager",
           icon: roleIcon("manager"),
+          filePath: getFilePath("manager"),
         });
         const stateEl = document.createElement("span");
         stateEl.className = "delegate-state pending";
@@ -1083,6 +1082,7 @@ export function mountChat(opts: {
           content: e.content,
           meta: e.role_id,
           icon,
+          filePath: getFilePath(e.role_id),
         });
         workflowTranscripts.set(
           e.wf_id,
@@ -1259,7 +1259,12 @@ export function mountChat(opts: {
       setStatus("connected");
     }
   }
-  return { appendUser, handleEvent, replayEvents, setFooter, setRoleSelected, refreshRoles, setStatus, clear, focus, insertContext };
+
+  function setRoleFilePaths(paths: Record<string, string>): void {
+    roleFilePaths = new Map(Object.entries(paths));
+  }
+
+  return { appendUser, handleEvent, replayEvents, setFooter, setRoleSelected, refreshRoles, setStatus, clear, focus, insertContext, setRoleFilePaths };
 }
 
 function truncate(s: string, max: number): string { if (s.length<=max) return s; return s.slice(0,max)+"…"; }

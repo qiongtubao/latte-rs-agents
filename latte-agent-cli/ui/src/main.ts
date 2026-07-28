@@ -4,6 +4,7 @@ import {
   switchSession, getSession, subscribeEvents, fetchSubsession,
   persistSessionId, getSessionHistory, getCurrentSessionId,
   renameSession, deleteSession,
+  getRolesConfig,
 } from "./api";
 import { mountChat } from "./chat_impl";
 import type { ChatController } from "./chat_impl";
@@ -141,6 +142,17 @@ async function main(): Promise<void> {
         }
       } catch (e) { body.textContent = `error: ${String(e)}`; }
     },
+  });
+
+  // 加载角色配置文件路径，用于聊天气泡第一行显示文件名
+  getRolesConfig().then(config => {
+    const paths: Record<string, string> = {};
+    for (const role of config.roles) {
+      paths[role.id] = role.config_path;
+    }
+    chat.setRoleFilePaths(paths);
+  }).catch(() => {
+    // 非关键功能，加载失败忽略
   });
   chat.refreshRoles(session.available_roles, session.role);
   $("subsession-close").addEventListener("click", () => {
