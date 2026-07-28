@@ -135,10 +135,14 @@ pub struct UiBackend {
     /// Process-wide store of per-task subsession event logs. Each
     /// delegate call allocates an entry; the UI's right-click →
     /// "show contents" reads from this same store via
-    /// `/api/sessions/{id}/subsessions/{sub_id}`. Shared across all
-    /// tabs so a tab-A subsession can never accidentally read
-    /// tab-B's events (the (session_id, sub_id) key keeps them apart
-    /// even when the store is process-wide).
+    /// `/api/subsessions?id=<sub_id>`. Shared across all tabs so a
+    /// tab-A subsession can never accidentally read tab-B's events
+    /// (the (session_id, sub_id) key keeps them apart even when the
+    /// store is process-wide).
+    ///
+    /// 两层存储：内存（活读）+ 磁盘（`with_persistence` 启用）。磁盘文件
+    /// 落 `<cwd>/.latte/ui-sessions/<sid>/<sub_id>.jsonl`，主 session 删
+    /// 时联删；服务器重启后磁盘回查仍能看到历史 subagent 过程（排查用）。
     pub(crate) subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
     /// agents 配置路径原值（文件或目录），角色编辑器保存时
     /// 用它定位 `.latte/agents.d/<id>.toml`。
@@ -189,7 +193,12 @@ impl UiBackend {
             primary_model_id: model_id,
             self_loop: Arc::new(self_loop::SelfLoopState::default()),
             workflow_run: Arc::new(workflows::WorkflowRunState::default()),
-            subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::new()),
+            // subagent 落盘用：与 ui-sessions/*.jsonl 共用 `<cwd>/.latte/ui-sessions`
+            // 作为根，subagent 文件落 `<sid>/<sub_id>.jsonl`，主 session 删时联删。
+            // with_persistence 启动时一次扫盘建 sub_id→session_id 索引。
+            subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::with_persistence(
+                cwd.join(".latte").join("ui-sessions"),
+            )),
             agents_config,
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
         };
@@ -806,6 +815,166 @@ mod tests {
             .expect("delete");
         assert!(crate::api::list_sessions(&backend_b).is_empty());
         assert!(!file.exists(), "delete 后落盘文件应删除");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// subagent 落盘跨 backend 重启：backend A create 一个 subagent
+    /// 事件，drop A；新 backend B（同 cwd）启动后通过 `get_subsession`
+    /// API 仍能拿到事件（磁盘回查路径）。
+    ///
+    /// 直接用 `subsession_store.create` 写事件，不走真实 chat 流——
+    /// 这条路径只验证"落盘 → 重启 → 读回"三步端到端正确，模型/LLM
+    /// 与它无关。
+    #[tokio::test]
+    async fn subsession_persists_across_backend_restart() {
+        use latte_agent_core::subsession::SubsessionStore;
+        use latte_agent_core::trace::{ToolStatus, TraceEvent, TraceMeta, TraceSink};
+
+        let ws = std::env::temp_dir().join(format!(
+            "ui-server-subs-persist-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+        let make_backend = || {
+            let resolver = ModelResolver::from_config(
+                &latte_agent_core::config::AgentConfig::default(),
+            )
+            .expect("resolver");
+            UiBackend::new(UiBackendConfig {
+                agent_config: latte_agent_core::config::AgentConfig::default(),
+                model_resolver: resolver,
+                role: None,
+                tier: None,
+                model_id: None,
+                cwd: Some(ws.clone()),
+                agents_config: ".latte/agents.d".into(),
+            })
+            .expect("backend")
+        };
+
+        // 进程 A：建一个 subagent，发 3 个事件
+        let backend_a = make_backend();
+        let (sub_id, sink) = backend_a
+            .subsession_store
+            .create("sid-A", "programmer");
+        for i in 0..3 {
+            sink.emit(TraceEvent::ToolExec {
+                meta: TraceMeta::now(i, "programmer", "sid-A"),
+                name: "file.read".into(),
+                args_json: "{}".into(),
+                latency_ms: 3,
+                status: ToolStatus::Ok("ok".into()),
+            });
+        }
+        drop(sink);
+        // 文件在 cwd/.latte/ui-sessions/sid-A/<sub_id>.jsonl
+        let file = ws
+            .join(".latte")
+            .join("ui-sessions")
+            .join("sid-A")
+            .join(format!("{sub_id}.jsonl"));
+        assert!(file.exists(), "subagent 落盘文件应存在: {}", file.display());
+        drop(backend_a);
+
+        // 进程 B：重启模拟，get_subsession API 应能拿回事件
+        let backend_b = make_backend();
+        // 内存空（重启后 in-memory cache 也清）
+        assert_eq!(backend_b.subsession_store.len(), 0);
+        // 但磁盘索引已建
+        assert_eq!(backend_b.subsession_store.persisted_index_size(), 1);
+        // API 路径读（先内存 miss → 回查磁盘）
+        let events = crate::api::get_subsession(&backend_b, &sub_id);
+        assert_eq!(events.len(), 3, "重启后从磁盘读出 3 个事件");
+        for (i, ev) in events.iter().enumerate() {
+            assert_eq!(
+                ev["ToolExec"]["meta"]["turn"].as_u64(),
+                Some(i as u64),
+                "事件内容应完整保序"
+            );
+        }
+
+        // 直接调 store 也能读（绕过 API）
+        let direct = backend_b
+            .subsession_store
+            .read_persisted(&sub_id)
+            .expect("read_persisted");
+        assert_eq!(direct.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 删主 session 联删 subagent 落盘：建一个真 session（进
+    /// SessionMap）+ 它的 subagent（落盘），调 `delete_session`，
+    /// 验证 subagent 目录被清。
+    #[tokio::test]
+    async fn delete_session_cascades_to_subsessions() {
+        use latte_agent_core::trace::{ToolStatus, TraceEvent, TraceMeta, TraceSink};
+
+        let ws = std::env::temp_dir().join(format!(
+            "ui-server-subs-delete-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+        let resolver = ModelResolver::from_config(
+            &latte_agent_core::config::AgentConfig::default(),
+        )
+        .expect("resolver");
+        let backend = UiBackend::new(UiBackendConfig {
+            agent_config: latte_agent_core::config::AgentConfig::default(),
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(ws.clone()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend");
+
+
+        // 建一个真 session（进 SessionMap，delete 不会 404）
+        let info = crate::api::create_session(&backend).await.expect("create session");
+        let sid = info.session_id;
+
+        // 给它两个 subagent
+        let (sub_a, sink_a) = backend.subsession_store.create(&sid, "programmer");
+        sink_a.emit(TraceEvent::ToolExec {
+            meta: TraceMeta::now(0, "programmer", &sid),
+            name: "file.read".into(),
+            args_json: "{}".into(),
+            latency_ms: 1,
+            status: ToolStatus::Ok("ok".into()),
+        });
+        let (sub_b, sink_b) = backend.subsession_store.create(&sid, "reviewer");
+        sink_b.emit(TraceEvent::ToolExec {
+            meta: TraceMeta::now(0, "reviewer", &sid),
+            name: "file.read".into(),
+            args_json: "{}".into(),
+            latency_ms: 1,
+            status: ToolStatus::Ok("ok".into()),
+        });
+        drop(sink_a);
+        drop(sink_b);
+
+        // 落盘文件应都在
+        let session_dir = ws.join(".latte").join("ui-sessions").join(&sid);
+        assert!(session_dir.exists(), "session 目录应已建: {}", session_dir.display());
+        assert!(session_dir.join(format!("{sub_a}.jsonl")).exists());
+        assert!(session_dir.join(format!("{sub_b}.jsonl")).exists());
+        assert_eq!(backend.subsession_store.persisted_index_size(), 2);
+
+        // 删主 session
+        crate::api::delete_session(&backend, &sid).await.expect("delete");
+
+        // 联删：session 整目录 + 索引 + 内存 entry 全清
+        assert!(!session_dir.exists(), "session 目录应被联删");
+        assert_eq!(backend.subsession_store.persisted_index_size(), 0);
+        assert_eq!(backend.subsession_store.len(), 0);
+        assert!(backend.subsession_store.read_persisted(&sub_a).is_none());
+        assert!(backend.subsession_store.read_persisted(&sub_b).is_none());
 
         let _ = std::fs::remove_dir_all(&ws);
     }

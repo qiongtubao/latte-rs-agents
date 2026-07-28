@@ -61,6 +61,7 @@ pub mod trace;
 pub mod subsession;
 pub mod bridge;
 pub mod workspace;
+mod subsession_disk;
 pub use config::{AgentConfig, ConfigLayer};
 pub use context::{ConversationContext, Importance};
 pub use error::{AgentError, AgentResult};
@@ -70,7 +71,8 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 /// Convenience re-exports.
 pub mod prelude {
     pub use crate::advisor_monitor::{
-        AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine, AdvisorReviewMode, Verdict,
+        AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine, AdvisorReviewMode, DetectorKind,
+        GateConfig, GateVerdict, Verdict, check_response_gates,
     };
     pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
     pub use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointTrigger, RollbackMode};

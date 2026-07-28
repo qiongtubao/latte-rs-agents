@@ -399,6 +399,10 @@ impl SessionHandle {
             initial_history: vec![],
             cwd: self.spawn.cwd.clone(),
             subsession_store: self.spawn.subsession_store.clone(),
+            // 透传 SessionHandle 自己的 session_id —— subsession_store
+            // 落盘用它当目录名，删 session 时联删。**不要**用
+            // `self.spawn.cwd` 凑数（绝对路径会被路径安全检查拒绝）。
+            session_id: self.session_id.clone(),
             advisor_monitor: advisor_monitor_cfg.clone(),
         };
         let controller = Arc::new(ChatController::new(256));

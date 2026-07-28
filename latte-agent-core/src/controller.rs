@@ -386,6 +386,12 @@ pub struct ControllerConfig {
     pub initial_history: Vec<latte_ai::models::Message>,
     /// Current working directory (for worktree resolution).
     pub cwd: PathBuf,
+    /// UI session id（= UI 侧 SessionHandle.session_id），用于
+    /// subsession_store 的落盘 key。**不要**用 `cwd` 凑数 —— cwd 是
+    /// 绝对路径，作为文件目录名是非法且不稳定的。
+    /// 不传：默认 empty（兼容老 caller；subsession 仍能跑但 cwd 路径
+    /// 会被 disk sink 拒绝并降级到内存）。
+    pub session_id: String,
     /// Shared store for per-task subsessions. Each delegate tool call
     /// allocates one entry under `(cwd_session, sub_id)` and stores
     /// the specialist's full TraceEvent stream so the UI can fetch it
@@ -995,6 +1001,7 @@ async fn run_multi_role_loop(
             event_tx,
             &config.cwd,
             config.subsession_store.clone(),
+            &config.session_id,
             cancel_flag.clone(),
             turn_cancel_flag.clone(),
         )
@@ -1404,12 +1411,13 @@ async fn run_single_role_loop(
         tier,
         config.primary_model_id.as_deref(),
         None,
-            event_tx,
-            &config.cwd,
-            config.subsession_store.clone(),
-            cancel_flag.clone(),
-            turn_cancel_flag.clone(),
-        )
+        event_tx,
+        &config.cwd,
+        config.subsession_store.clone(),
+        &config.session_id,
+        cancel_flag.clone(),
+        turn_cancel_flag.clone(),
+    )
         .await
     {
         Ok(r) => r,
@@ -1503,7 +1511,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1525,7 +1533,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1601,7 +1609,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1616,7 +1624,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1665,6 +1673,10 @@ async fn build_runner(
     event_tx: &broadcast::Sender<ChatEvent>,
     cwd: &Path,
     subsession_store: Arc<SubsessionStore>,
+    // UI session id —— 见 [`ControllerConfig::session_id`]。透传给
+    // `register_delegate_tool`，最终到 `subsession_store.create()`。
+    // 空串 → 旧行为（用 cwd 当 key，落盘会被拒绝）。
+    session_id: &str,
     cancel_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
@@ -1727,7 +1739,10 @@ async fn build_runner(
         // Any role with "delegate" in allowed_tools gets the delegate tool registered,
         // enabling nested subsessions (roleA delegates to roleB, roleB can also delegate)
         if role.allowed_tools.iter().any(|t| t == "delegate") {
-            let sid = cwd.to_string_lossy().into_owned();
+            // 必须是真 session_id —— subsession_store 用它当落盘目录名。
+            // 之前这里用 `cwd.to_string_lossy()` 凑数，cwd 含 `/` 会被
+            // 路径安全检查拒绝，整路 subagent 退化到内存。
+            let sid = session_id.to_string();
             register_delegate_tool(
                 &tm,
                 merged,
@@ -2110,12 +2125,11 @@ async fn register_delegate_tool(
                 sub_id: sub_id.clone(),
             });
             // Fan out ONLY to the subsession memory sink: the
-            // specialist's tool calls are part of the subagent
-            // transcript (viewable via "📋 详情" / 右键 → 查看
-            // subagent 过程), not of the main chat stream.
-            let subsession_fanout = FanoutSink::new(vec![
-                sub_sink.clone() as Arc<dyn crate::trace::TraceSink>,
-            ]);
+            // `sub_sink` is `Arc<dyn TraceSink>` returning from
+            // `SubsessionStore::create` —— 内部已 fanout 到
+            // MemorySink（实时读源）+ DiskSink（落盘备份，主
+            // session 删除时联删）。这里**不要**再包一层
+            // FanoutSink，否则事件会被写两份到内存。
             let template = merged
                 .roles
                 .get(&role_id)
@@ -2191,7 +2205,7 @@ async fn register_delegate_tool(
             runner = runner
                 .with_role(role_id.clone())
                 .with_cwd(cwd.clone())
-                .with_sink(std::sync::Arc::new(subsession_fanout));
+                .with_sink(sub_sink.clone());
 
             // Emit RoleStarted so the UI shows the specialist is working
             let task_clone = task.clone();
@@ -2962,6 +2976,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            session_id: String::new(),
         };
 
         async fn wait_request_count(server: &wiremock::MockServer, n: usize) {
@@ -3104,6 +3119,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            session_id: String::new(),
         };
 
         let controller = ChatController::new(64);
@@ -3232,6 +3248,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            session_id: String::new(),
         };
 
         async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>) -> ChatEvent {

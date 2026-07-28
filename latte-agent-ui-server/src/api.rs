@@ -234,6 +234,10 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
         Some(h) => {
             h.abort_if_spawned().await;
             h.delete_files();
+            // 联删 subagent 落盘文件（与主 session 文件同生命周期）：
+            // `<ui-sessions>/<sid>/` 整目录 rm + 索引清掉 + 内存
+            // entries 清掉。最佳努力，错误已在 store 内部 warn。
+            b.subsession_store.delete_for_session(id);
             Ok(())
         }
         None => Err(ApiError::not_found(format!("session {id} unknown"))),
@@ -1089,8 +1093,16 @@ fn latte_home() -> PathBuf {
 
 /// `GET /api/subsessions?id=<sub_id>` — 取 delegate 子会话的完整
 /// transcript（主聊天只见 summary）。不存在时返回空数组。
+///
+/// 读路径：先内存（活读，1h 内）→ 内存 miss 再回查磁盘
+///（`subsession_store.read_persisted`）。磁盘回查解决"UI server
+/// 重启 / 内存 1h GC 后还想看历史 subagent 过程"的排查场景。
 pub fn get_subsession(b: &UiBackend, id: &str) -> Vec<serde_json::Value> {
-    match b.subsession_store.snapshot_any(id) {
+    let events = b
+        .subsession_store
+        .snapshot_any(id)
+        .or_else(|| b.subsession_store.read_persisted(id));
+    match events {
         Some(events) => events
             .into_iter()
             .filter_map(|e| serde_json::to_value(e).ok())
