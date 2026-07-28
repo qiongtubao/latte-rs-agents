@@ -431,7 +431,7 @@ impl SessionHandle {
             let engine = if self.session_id.is_empty() {
                 engine
             } else {
-                let (_sub_id, sink) = self.spawn.subsession_store.get_or_create(&self.session_id, "advisor");
+                let (_sub_id, sink) = self.spawn.subsession_store.create(&self.session_id, "advisor");
                 engine.with_subsession_sink(sink)
             };
             AdvisorMonitor::spawn(
