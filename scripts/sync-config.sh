@@ -8,7 +8,7 @@
 #
 # 同步内容:
 #   - config/agents/*.toml  → .latte/agents.d/
-#   - prompts/*.md          → .latte/prompts/
+#   - config/prompts/*.md  → .latte/prompts/
 #   - .latte/*.toml         → .latte/
 
 set -euo pipefail
@@ -37,10 +37,10 @@ for f in "$SOURCE_DIR/config/agents/"*.toml; do
 done
 echo "  ✅ Agents: $count 个角色配置"
 
-# 2. 同步 prompts
+# 2. 同步 prompts（权威源：config/prompts/）
 mkdir -p "$TARGET_DIR/.latte/prompts"
 count=0
-for f in "$SOURCE_DIR/prompts/"*.md; do
+for f in "$SOURCE_DIR/config/prompts/"*.md; do
     cp "$f" "$TARGET_DIR/.latte/prompts/"
     count=$((count + 1))
 done

@@ -8,7 +8,11 @@
 | ---- | ---- | -------- |
 | `config/workflows/` | 全部 workflow 定义（精致化中文版本，与 `.latte/workflows.d/` 内容一致） | 目标机 `.latte/workflows.d/` |
 | `config/agents/` | 全部角色配置（含注释的权威版；`archive/` 是已归档的冗余角色） | 目标机 `.latte/agents.d/` |
-| `prompts/`（仓库根） | 全部角色 prompt（精致化中文版本） | 目标机 `prompts/` |
+| `config/prompts/` | 全部角色 prompt（精致化中文版本，与仓库根 `prompts/` 运行时副本一致） | 目标机 `prompts/` |
+
+**编辑约定**：改 prompt/workflow/角色配置时先改 `config/` 下的权威版，
+再复制到运行时副本（`prompts/`、`.latte/workflows.d/`、`.latte/agents.d/`），
+与 `scripts/sync-config.sh` 的推送方向保持一致。
 
 **不同步**：`config/models.toml` 与 `~/.latte/models.d/`——`api_key`
 等机密留在各机器本地，模型编目由每台机器自行维护。`.latte/agents.d/`
