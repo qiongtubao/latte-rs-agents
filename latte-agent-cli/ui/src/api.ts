@@ -163,6 +163,9 @@ export type ChatEvent =
   | { type: "ToolError"; role_id: string; tool_name: string; error: string }
   | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
   | { type: "ImageGenerated"; role_id: string; path: string; prompt: string }
+  // plan 工具提交的任务候选：manager 调 plan 后广播，UI 弹窗勾选导入
+  // 看板。tasks 与 POST /api/tasks/import 的 ImportTask 同构。
+  | { type: "PlanProposed"; role_id: string; plan_id: string; tasks: ImportTask[] }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }

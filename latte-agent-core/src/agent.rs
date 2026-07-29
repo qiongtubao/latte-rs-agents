@@ -439,51 +439,24 @@ fn log_hook_fire(name: &str, point: crate::trace::HookPoint, kind: &str) {
     eprintln!("[hook] {} {:?}: {}", name, point, kind);
 }
 
-// ─── dedupe_tool_calls ─────────────────────────────────────────────────────
+// ─── dedupe_native_tool_calls ─────────────────────────────────────────────
 
-/// 同一响应内去掉完全相同的 `(name, args)` tool_call，保留首次出现的那
-/// 一条，后面的重复项直接丢弃（不抛错，不修改原顺序之外的位置）。
+/// 同一响应内去掉完全相同的 `(name, arguments)` tool_call，保留首次出现
+/// 的那一条（含其 id），后面的重复项直接丢弃。native function-calling 下
+/// 模型偶尔会把"并行调度"误读为"重复同一调用"，dedup 后避免触发
+/// `LoopDetector` 的"连续相同调用"误报。
 ///
-/// # 为什么需要
-///
-/// manager role 的 prompt 明确告诉模型"在一个响应里发出多个
-/// `tool_call` 块以并行执行"。部分模型（GLM 5.2 在 `delegate` 上尤其
-/// 明显）会把这个指令误解为"重复同一调用三次"——面对"我在哪个目录"
-/// 这类简单问题，模型可能直接吐出 3 个一模一样的 `delegate` 块。三
-/// 个完全相同的 `delegate` 调用会触发 `LoopDetector`，让用户看到
-/// "called 4 times in a row with identical args" 这种令人困惑的报错
-/// （实际是第 3 次触发 + 消息里多算了 1，详见 `LoopDetector::record`）。
-/// dedup 之后 agent 继续运行，用户拿到一次 specialist 的结果。
-///
-/// # 输入 / 输出
-///
-/// - 入参 `calls`：模型一次响应里提取出的 `<tool_call>` 列表，按模型输出
-///   顺序排列。
-/// - 出参：去重后的列表，长度 ≤ 入参，顺序与入参中首次出现的位置一致。
-///
-/// # 行为细节
-///
-/// - 比较的是 args 的**规范化 JSON 形式**（用 `serde_json::from_str` 解析
-///   后再 `to_string`），不是原始文本。这样 `{"path":"a"}` 和
-///   `{"path": "a"}`（不同空白）或 `{"a":1,"b":2}` 和 `{"b":2,"a":1}`
-///   （不同键顺序）都会被识别为同一调用，与 `LoopDetector` 对 args
-///   的 hash 方式保持一致。
-/// - args 不是合法 JSON 时回退到原始文本比较（用 `Value::String` 兜底
-///   编码），避免 panic。
-/// - 不同的 `(name, args)` 不会被合并 —— 用户或模型可能真的想并行
-///   调多次同一工具但参数不同（例如一次读 a.rs、一次读 b.rs），这种
-///   情况保留所有调用。
-fn dedupe_tool_calls(calls: Vec<ParsedCall>) -> Vec<ParsedCall> {
+/// - 入参 `calls`：`completion.tool_calls`，按模型输出顺序排列。
+/// - 出参：去重后的列表，长度 ≤ 入参，顺序与首次出现位置一致。
+/// - 比较的是 arguments 的**规范化 JSON 形式**（`to_string` 后），让
+///   键顺序不同但语义相同的调用被识别为同一次。
+/// - 不同的 `(name, arguments)` 不合并 -- 并行读多个文件等场景保留全部。
+fn dedupe_native_tool_calls(calls: Vec<latte_ai::models::ToolCall>) -> Vec<latte_ai::models::ToolCall> {
     use std::collections::HashSet;
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    let mut out: Vec<ParsedCall> = Vec::with_capacity(calls.len());
+    let mut out: Vec<latte_ai::models::ToolCall> = Vec::with_capacity(calls.len());
     for tc in calls {
-        // 把 args 规范化成 JSON 字符串后再做 key，让"语义相同但文本不同"
-        // 的调用被识别成同一次。parse 失败时退回到原始文本，不抛错。
-        let canonical_args = serde_json::from_str::<serde_json::Value>(&tc.args)
-            .ok()
-            .and_then(|v| serde_json::to_string(&v).ok())
-            .unwrap_or_else(|| tc.args.clone());
+        let canonical_args = serde_json::to_string(&tc.arguments).unwrap_or_default();
         let key = (tc.name.clone(), canonical_args);
         if seen.insert(key) {
             out.push(tc);
@@ -587,9 +560,8 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
             _ => Some(Duration::from_secs(30)),
         },
         AiError::Http(_) => Some(Duration::from_secs(10)),
-        // 认证失败只说明当前模型的凭证不可用。短暂冷却当前模型并继续
-        // fallback，后续模型可能使用不同厂商或不同凭证。
-        AiError::Auth(_) => Some(Duration::from_secs(5)),
+        // 认证失败（凭证无效）是致命的，不冷却也不 fallback。
+        AiError::Auth(_) => None,
         // 其余为无法通过切换模型可靠规避的本地错误。
         _ => None,
     }
@@ -658,6 +630,10 @@ pub struct AgentRunner {
     /// 时通过 advisor_hints 队列注入 hint 并触发同 turn 重跑
     /// （最多 config.max_retries 次）。
     gate_config: Option<crate::advisor_monitor::GateConfig>,
+    // 强制 native function-calling：tool schema 经 GenerateParams.tools
+    // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
+    // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
+    // `tools` 字段。tool_choice 取自 `agent.params.tool_choice`（默认 Auto）。
 }
 
 /// 把 ToolError 归类到 `ToolCallErrorKind`。
@@ -674,46 +650,6 @@ fn classify_tool_execution_error(
     }
 }
 
-/// Best-effort recovery for shell-metachar-in-JSON: model emits
-/// `\|` inside a JSON string which serde rejects. Pre-process the
-/// raw string to escape bare backslash + metachar sequences, then
-/// re-parse. If still invalid, return the original serde error.
-fn recover_malformed_tool_args(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let bytes = raw.as_bytes();
-    let mut i = 0;
-    let metachars: &[u8] = b"|*?[]()&;<>";
-    while i < bytes.len() {
-        let b = bytes[i];
-        // Preserve valid JSON escapes: \\ \" \/ \u \b \f \n \r \t
-        if b == b'\\' && i + 1 < bytes.len() {
-            let next = bytes[i + 1];
-            if matches!(next, b'\\' | b'"' | b'/' | b'u' | b'b' | b'f' | b'n' | b'r' | b't') {
-                out.push(b as char);
-                out.push(next as char);
-                i += 2;
-                continue;
-            }
-        }
-        if metachars.contains(&b) {
-            out.push('\\');
-        }
-        out.push(b as char);
-        i += 1;
-    }
-    out
-}
-
-fn parse_tool_args_with_recovery(raw: &str) -> Result<serde_json::Value, String> {
-    match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            let recovered = recover_malformed_tool_args(raw);
-            serde_json::from_str::<serde_json::Value>(&recovered)
-                .map_err(|e| e.to_string())
-        }
-    }
-}
 
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
@@ -955,10 +891,9 @@ impl AgentRunner {
         // run_turn 内部每次成功执行一个工具就 +1；run_turn 结束时
         // run_turn_gated 据此跑 D6 ToolCallEcho 检查。
         self.last_turn_tool_count = 0;
-        // *before* the working message list is built below, so the
-        // first model call of this turn already sees them.
-        self.drain_advisor_hints();
-
+        use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
+        let turn_start = Instant::now();
+        let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
         let default_vars = serde_json::json!({});
         let vars = system_vars.unwrap_or(&default_vars);
 
@@ -1071,7 +1006,15 @@ impl AgentRunner {
             }
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
             let chat_start = Instant::now();
-            let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
+            // native function-calling：tool schema 经 GenerateParams.tools 下发。
+            // 文本 `<tool_call>` 协议已移除，不再有降级路径。
+            // tool_choice 取自 agent.params（默认 Auto，可经 with_tool_choice 覆盖）。
+            let chat_params: Option<GenerateParams> = self.tool_manager.as_ref().map(|tm| {
+                let mut p = self.agent.params.clone();
+                p.tools = build_tool_schemas(tm);
+                p
+            });
+            let completion = self.agent.chat(&messages, chat_params.as_ref(), WaitPolicy::WaitAndRetry).await?;
             let latency_ms = chat_start.elapsed().as_millis() as u64;
 
             self.total_usage.input_tokens += completion.usage.input_tokens;
@@ -1115,27 +1058,31 @@ impl AgentRunner {
                 }
             }
 
-            // Check for tool calls
-            let tool_calls = extract_tool_calls(&final_response);
+            // 工具调用来自 completion.tool_calls（native function-calling，
+            // 结构化 id+name+arguments）。同一响应内完全相同的
+            // (name, arguments) 只保留首次出现，避免模型把"并行调度"
+            // 误读为"重复同一调用"触发 LoopDetector。
+            let tool_calls: Vec<latte_ai::models::ToolCall> =
+                dedupe_native_tool_calls(completion.tool_calls.clone());
 
-            // 3a. Emit ParseToolCalls
-            let opens_found = final_response.matches("<tool_call").count() as u32;
+            // 3a. Emit ParseToolCalls。opens/closes 现在都等于结构化
+            // tool_calls 数量（不再有文本解析失配），保留字段是为了
+            // trace JSON 向后兼容。
             let parsed_calls: Vec<ParsedCall> = tool_calls.iter().map(|tc| ParsedCall {
+                id: tc.id.clone(),
                 name: tc.name.clone(),
-                args: tc.args.clone(),
+                // 优先用模型原始 JSON 串（arguments_raw）：合法时与
+                // arguments 等价；latte-ai 解析失败时保留坏串，让下面
+                // exec loop 的 from_str 失败归类为 MalformedArgs。
+                args: tc.arguments_raw.clone()
+                    .unwrap_or_else(|| tc.arguments.to_string()),
             }).collect();
-            // 同一响应内多个完全相同的 `tool_call` 块（典型场景：
-            // manager 把"并行调度多个 specialist"误读为"重复同一调
-            // 用"）只保留首次出现的那一条，避免触发 `LoopDetector`。
-            // 这一步放在 ParseToolCalls 事件之前，所以 trace 上看到的
-            // 列表就是实际会执行的那一份。
-            let parsed_calls = dedupe_tool_calls(parsed_calls);
             self.sink.emit(TraceEvent::ParseToolCalls {
                 meta: meta.clone(),
                 raw_in: final_response.clone(),
                 parsed: parsed_calls.clone(),
                 diagnostics: ParseDiag {
-                    opens_found,
+                    opens_found: tool_calls.len() as u32,
                     closes_matched: tool_calls.len() as u32,
                     unmatched_opens: Vec::new(),
                 },
@@ -1173,42 +1120,36 @@ impl AgentRunner {
             }
 
             if let Some(tm) = &self.tool_manager {
-                // Append assistant message with tool calls
-                messages.push(Message::assistant(final_response.clone()));
-                // Execute each tool call
+                // 追加 assistant 消息（带上它请求的 tool_calls）。native
+                // 协议要求：assistant 消息列出 tool_calls（含 id），随后每条
+                // tool_result 用 tool_call_id 引用回来，形成闭环。
+                messages.push(Message::assistant_with_tool_calls(
+                    final_response.clone(),
+                    tool_calls.clone(),
+                ));
+                // 逐个执行工具调用
                 for tc in &post_parse_calls {
-                    // Map friendly config aliases ("bash") to the real
-                    // builtin tool names ("exec"). Without this, model
-                    // outputs trained as `bash` get "tool not found"
-                    // because the registry stores it as `shell.exec`.
-                    let resolved_name: String = match tc.name.as_str() {
-                        "bash" => "exec".to_string(),
-                        n => n.to_string(),
+                    // 工具名已是扁平规范名（registry 注册名 == 模型看到的
+                    // 名字），直接查找，不再有 bash->shell.exec 之类的别名
+                    // 反向映射。保留短名兜底仅为 namespace 遗留工具兼容。
+                    let resolved_name = tc.name.clone();
+                    let full_name = if tm.has(&resolved_name) {
+                        resolved_name.clone()
+                    } else {
+                        tm.get_tool_names().into_iter()
+                            .find(|n| n.rsplit_once('.').map(|(_, s)| s) == Some(resolved_name.as_str()))
+                            .unwrap_or_else(|| resolved_name.clone())
                     };
-                    // Resolve the short name the model emits ("read")
-                    // to the namespaced form the registry stores
-                    // ("file.read") once — the resolved name is the
-                    // same across retries so we don't redo the lookup
-                    // for nothing.
-                    let full_name = tm
-                        .get_tool(&resolved_name)
-                        .map(|_| resolved_name.clone())
-                        .or_else(|| {
-                            tm.get_tool_names().into_iter().find(|n| {
-                                n.rsplit_once('.').map(|(_, s)| s) == Some(resolved_name.as_str())
-                            })
-                        })
-                        .unwrap_or_else(|| resolved_name.clone());
 
                     // ── Per-tool-call retry loop ───────────────────────
                     //
                     // 默认 `DefaultRetryPolicy`：
-                    //   MalformedArgs / Execution / Timeout → 重试一次
-                    //   ToolNotFound / HookAborted           → 不重试
+                    //   MalformedArgs / Execution / Timeout -> 重试一次
+                    //   ToolNotFound / HookAborted           -> 不重试
                     //
                     // 重试 ≠ 重新问 model。本层自动 reparse / reexecute，
                     // model 只在 *最终失败 + 错误该让 model 知道时* 才
-                    // 看到 [tool_error]。避免"看自己错误输出又产出
+                    // 看到 tool_result。避免"看自己错误输出又产出
                     // 同样错误"的死循环。
                     let policy = self.retry_policy.clone();
                     let mut attempt: u32 = 0;
@@ -1220,11 +1161,13 @@ impl AgentRunner {
 
                     while attempt < max_attempts {
                         attempt += 1;
-                        // 1. parse args（带 shell-metachar escape 自动恢复）
-                        let input: serde_json::Value = match parse_tool_args_with_recovery(&tc.args) {
+                        // 1. parse args。native 协议下模型输出的是合法 JSON；
+                        // 若 latte-ai 层解析失败，arguments_raw 保留原始坏串，
+                        // 这里 from_str 会失败并归类为 MalformedArgs。
+                        let input: serde_json::Value = match serde_json::from_str(&tc.args) {
                             Ok(v) => v,
-                            Err(serde_err) => {
-                                let detail = format!("invalid JSON: {serde_err}");
+                            Err(e) => {
+                                let detail = format!("invalid JSON: {e}");
                                 final_outcome = Err((
                                     ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
                                     detail,
@@ -1365,7 +1308,7 @@ impl AgentRunner {
                                     status: ToolStatus::Err(detail.clone()),
                                 });
                                 final_outcome = Err((kind, detail));
-                                // 不 break —— 让 retry 决策在循环底决定
+                                // 不 break -- 让 retry 决策在循环底决定
                             }
                         }
 
@@ -1398,31 +1341,26 @@ impl AgentRunner {
                         }
                     }
 
-                    // ── 终止态：决定要不要把错误喂回 model ──────────────
+                    // ── 终止态：用 tc.id 把结果回传给对应的 assistant
+                    //    tool_call，形成 tool_call_id 闭环。不再靠
+                    //    (name, args) 模糊匹配找 id。
                     match final_outcome {
                         Ok(result_str) => {
-                            messages.push(Message::user(format!(
-                                "[tool_result for {}]\n{}",
-                                tc.name,
-                                result_str,
-                            )));
+                            messages.push(Message::tool_result(tc.id.clone(), result_str));
                         }
                         Err((kind, detail)) => {
-                            // kind.label() 一致 → trace 上是同一类
                             // 不把错误消息喂回 model 的 kind（MalformedArgs /
                             // ToolNotFound）会形成死循环（model 看自己上
                             // 一轮的输出"修正"通常产出更多错误）。
                             if policy.loopback_to_model(&kind) {
-                                messages.push(Message::user(format!(
-                                    "[tool_error for {}]\n{}",
-                                    tc.name, detail
-                                )));
+                                messages.push(Message::tool_result(tc.id.clone(), detail));
                             }
                             // 不喂回的：错误已经在 trace 里，UI 也能看；
                             // model 不需要知道（"它自己改不对"）。
                         }
                     }
-                }            }
+                }
+            }
 
             if round + 1 >= max_rounds {
                 return Err(AgentError::MaxToolRoundsExceeded(max_rounds));
@@ -1586,6 +1524,13 @@ impl AgentRunner {
         self.cwd = Some(cwd);
         self
     }
+    /// 设置工具调用策略（`tool_choice`）。透传到 `agent.params.tool_choice`，
+    /// 经 `build_chat_params` 下发到 OpenAI/Anthropic wire 的 `tool_choice` 字段。
+    /// 默认 `Auto`；`Required` 强制模型至少调一次工具；`Specific(name)` 锁定工具。
+    pub fn with_tool_choice(mut self, choice: latte_ai::models::ToolChoice) -> Self {
+        self.agent.params.tool_choice = choice;
+        self
+    }
     /// Set the session identifier. The id flows into every emitted
     /// `TraceMeta.session_id` so CLI tooling can correlate events
     /// with the matching `~/.latte/sessions/<id>.idx` /
@@ -1616,40 +1561,24 @@ impl AgentRunner {
     /// Used by the Supervisor to detect dead loops.
     /// Possible values: `"text"` | `"tool_call:<name>:<args_hash>"` |
     ///                  `"delegate"` | `"ask_human"`
+    ///
+    /// native function-calling 下，assistant 消息的 `tool_calls` 字段携带
+    /// 结构化调用（id+name+arguments），直接读它而非解析 `<tool_call>` 文本。
     pub fn last_decision_kind(&self) -> String {
         use latte_ai::models::Role as MsgRole;
         use crate::checkpoint::short_hash;
         let Some(last) = self.context.messages().last() else { return "text".to_string(); };
         if last.role != MsgRole::Assistant { return "text".to_string(); }
-        let content = last.as_text();
-        // Order matters: more specific tool tags (delegate, ask_human)
-        // win over the generic `<tool_callNAME>` extraction below.
-        if content.contains("<tool_calldelegate>") { return "delegate".to_string(); }
-        if content.contains("<tool_callask_human>") { return "ask_human".to_string(); }
-        if let Some(open_idx) = content.find("<tool_call") {
-            let after_open = &content[open_idx + "<tool_call".len()..];
-            // Name runs from after_open[0] to the first char that is
-            // whitespace or `>` (same rule the parser uses).
-            let name_end = after_open
-                .find(|c: char| c.is_whitespace() || c == '>')
-                .unwrap_or(after_open.len());
-            let name = &after_open[..name_end];
-            // Args: the JSON between the tool name terminator and the
-            // canonical close tag; we hash the trimmed args so
-            // `decision_kind` collisions only happen on identical payloads.
-            let rest = &after_open[name_end..];
-            let close = rest.find("</tool_call>").unwrap_or(rest.len());
-            // Strip the optional `>` terminator after the tool name plus any
-            // surrounding whitespace, so the hash matches the raw args the
-            // caller passed in (no `>` or extra spaces leaking in).
-            let mut args_str = rest[..close].trim();
-            if let Some(stripped) = args_str.strip_prefix('>') {
-                args_str = stripped.trim_start();
-            }
-            let args_hash = short_hash(args_str);
-            return format!("tool_call:{}:{}", name, &args_hash[..8]);
+        let Some(calls) = &last.tool_calls else { return "text".to_string(); };
+        let Some(first) = calls.first() else { return "text".to_string(); };
+        // 优先识别 delegate / ask_human（更具体的决策标签）。
+        match first.name.as_str() {
+            "delegate" => return "delegate".to_string(),
+            "ask_human" => return "ask_human".to_string(),
+            _ => {}
         }
-        "text".to_string()
+        let args_hash = short_hash(&first.arguments.to_string());
+        format!("tool_call:{}:{}", first.name, &args_hash[..8])
     }
 }
 
@@ -1662,157 +1591,6 @@ impl std::fmt::Debug for AgentRunner {
             .field("tools", &self.tool_manager.is_some())
             .finish()
     }
-}
-
-// ─── Tool Call Parsing ────────────────────────────────────────────────────
-
-/// A parsed tool call from model output.
-#[derive(Debug, Clone)]
-struct ToolCall {
-    name: String,
-    args: String,
-}
-
-/// Extract `<tool_call>name args</tool_call>` patterns from model output.
-/// Close-tag variants accepted: `</tool_call>` (canonical prompt form)
-/// and `</tool_callNAME>` (XML-style match tag, what deepseek-v4-flash
-/// actually emits). The open prefix is always `<tool_call` (10 chars,
-/// no `>`); the name runs to the first non-`[A-Za-z0-9_]` char.
-
-fn extract_tool_calls(text: &str) -> Vec<ToolCall> {
-    let mut results = Vec::new();
-    let mut remaining = text;
-    const OPEN: &str = "<tool_call";
-    const CANONICAL_CLOSE: &str = "</tool_call>";
-
-    while let Some(start) = remaining.find(OPEN) {
-        let after_open = &remaining[start + OPEN.len()..];
-        // Legacy open was `<tool_call>NAME` (10+`>`+name), current XML
-        // open is `<tool_callNAME>` (10+name+`>`). Either way, if the
-        // char right after `<tool_call` is `>`, skip it before parsing
-        // the name. This lets one parser accept all three formats.
-        let after_open = after_open.strip_prefix('>').unwrap_or(after_open);
-        // Tolerate whitespace/newlines between the open tag and the tool
-        // name (`<tool_call>\nNAME {…}`) — previously the name scan
-        // stopped at the first non-alphanumeric char and the whole call
-        // was silently dropped (name_len == 0).
-        let after_open = after_open.trim_start();
-        let name_len = after_open
-            .char_indices()
-            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-
-        if name_len == 0 {
-            // `<tool_call` with no name following — skip past the
-            // prefix to avoid an infinite loop.
-            remaining = &remaining[start + OPEN.len()..];
-            continue;
-        }
-
-        let name = after_open[..name_len].to_string();
-        let after_name = &after_open[name_len..];
-        let after_name = after_name
-            .strip_prefix('>')        // drop `>` from `<tool_callNAME>`
-            .unwrap_or(after_name)
-            .trim_start();
-
-        // Look for the close tag. Three-stage fallback for model
-        // quirks: (1) XML-style `</tool_callNAME>` (what most models
-        // actually emit), (2) canonical `</tool_call>` (what the
-        // prompt says), (3) any well-formed `</X>` — GLM 5.2 in
-        // particular often emits `</arg_value>` for the closing
-        // tag, so accepting any valid XML closing tag keeps the
-        // parser robust to that family of model quirks.
-        let xml_close = format!("</tool_call{}>", name);
-        let (close_pos, close_len) = if let Some(p) = after_name.find(&xml_close) {
-            (p, xml_close.len())
-        } else if let Some(p) = after_name.find(CANONICAL_CLOSE) {
-            (p, CANONICAL_CLOSE.len())
-        } else {
-            match find_any_close_tag(after_name) {
-                Some((p, l)) => (p, l),
-                None => break, // malformed / truncated: give up
-            }
-        };
-
-        let args = after_name[..close_pos].trim().to_string();
-        results.push(ToolCall { name, args });
-        remaining = &after_name[close_pos + close_len..];
-    }
-
-    results
-}
-/// Public, structured wrapper around the private [`extract_tool_calls`].
-/// Returns the parsed calls together with parse diagnostics so the CLI
-/// `debug parse` / `debug replay` subcommands can report what the
-/// parser saw in a model output (or any other text).
-///
-/// `opens_found` is the count of `<tool_call` substrings in `text`.
-/// `closes_matched` is the number of well-formed calls the parser
-/// extracted. `opens_found - closes_matched` is the number of opens
-/// that had no matching close; their raw text is collected (up to
-/// 40 chars per slice) into `unmatched_opens` for diagnostic display.
-pub fn parse_tool_calls(text: &str) -> (Vec<crate::trace::ParsedCall>, crate::trace::ParseDiag) {
-    use crate::trace::{ParseDiag, ParsedCall};
-    let opens_found = text.matches("<tool_call").count() as u32;
-    let raw = extract_tool_calls(text);
-    let parsed: Vec<ParsedCall> = raw.iter()
-        .map(|tc| ParsedCall { name: tc.name.clone(), args: tc.args.clone() })
-        .collect();
-    let closes_matched = parsed.len() as u32;
-    let unmatched = opens_found.saturating_sub(closes_matched);
-    let mut unmatched_opens: Vec<String> = Vec::new();
-    if unmatched > 0 {
-        // Take the LAST `unmatched` opens — those are the ones
-        // `extract_tool_calls` couldn't close. Earlier opens were
-        // already paired with their close tag and consumed.
-        let positions: Vec<(usize, &str)> = text.match_indices("<tool_call").collect();
-        for &(pos, _) in positions.iter().rev().take(unmatched as usize) {
-            let end = text[pos..]
-                .find(|c: char| c.is_whitespace() || c == '>' || c == '\n')
-                .map(|p| pos + p)
-                .unwrap_or(text.len().min(pos + 40));
-            unmatched_opens.push(text[pos..end].to_string());
-        }
-    }
-    (parsed, ParseDiag { opens_found, closes_matched, unmatched_opens })
-}
-
-/// 找 s 里第一个符合 `</X>` 形式的合法 closing tag（X 是字母 / 数字
-/// / 下划线 / 连字符，至少 1 个字符，后面紧跟 `>`）。返回
-/// `(start, len)` 让调用方能切出整段 closing tag。
-///
-/// 这个回退是给部分模型（GLM 5.2 经常）会吐非标准 closing tag 用的：
-/// 比如 `</arg_value>` 或 `</function>`，而不是 prompt 里写的
-/// `</tool_call>` 或 `</tool_callNAME>`。如果连一个像样的 closing
-/// tag 都没有，才放弃整个 tool call。
-fn find_any_close_tag(s: &str) -> Option<(usize, usize)> {
-    let mut search_from = 0;
-    while let Some(rel) = s[search_from..].find("</") {
-        let abs = search_from + rel;
-        let after_slash = abs + 2;
-        // Tag name 至少 1 个合法字符
-        let name_end = s[after_slash..]
-            .char_indices()
-            .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        if name_end == 0 {
-            // `</` 后面没有合法 tag name 字符，跳过去继续找
-            search_from = abs + 2;
-            continue;
-        }
-        // 必须紧跟一个 `>` 才算完整的 closing tag
-        if let Some(gt_rel) = s[after_slash + name_end..].find('>') {
-            let close_end = after_slash + name_end + gt_rel + 1;
-            return Some((abs, close_end - abs));
-        }
-        search_from = abs + 2;
-    }
-    None
 }
 
 
@@ -1836,19 +1614,40 @@ impl From<GenerateParams> for AgentParams {
     }
 }
 
+/// 从 tool_manager 的工具定义构建 latte-ai 的 Tool 列表，下发到 LLM 请求的
+/// `tools` 字段。工具名直接用 registry 注册名（扁平规范名，== 模型看到的
+/// 名字），不再有 friendly_tool_name / namespace 别名转换。`strict` 透传
+/// `ToolDefinition.strict`（默认 None = 不开 OpenAI Structured Outputs）。
+/// `tool_choice` 不在此设置，取自 `agent.params.tool_choice`（默认 Auto）。
+fn build_tool_schemas(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+) -> Vec<latte_ai::models::Tool> {
+    tm.get_tool_definitions()
+        .iter()
+        .map(|td| latte_ai::models::Tool {
+            name: td.name.clone(),
+            description: Some(td.description.clone()),
+            parameters: serde_json::to_value(&td.input_schema)
+                .unwrap_or(serde_json::json!({})),
+            strict: td.strict,
+        })
+        .collect()
+}
+
 /// Rewrite `input` so relative filesystem paths resolve against the
 /// runner's workspace `cwd` instead of the process cwd.
 ///
 /// Background: `ToolExecutionContext.metadata.cwd` is advisory and none of
-/// the packaged tools (`file.*`, `shell.*`) consult it — they resolve
-/// relative paths against the process cwd, which inside a Tauri host is
-/// the app data dir, not the user's workspace. Rather than touching every
-/// tool handler, the two path-carrying shapes are rewritten here, once:
+/// the packaged tools consult it - they resolve relative paths against the
+/// process cwd, which inside a Tauri host is the app data dir, not the
+/// user's workspace. Rather than touching every tool handler, the two
+/// path-carrying shapes are rewritten here, once:
 ///
-/// - any top-level `"path": "<relative>"` arg (file.read/write/list/
-///   delete/search) is joined onto `cwd`;
+/// - any top-level `"path": "<relative>"` arg (read/write/list/delete/
+///   search/find) is joined onto `cwd`;
 /// - any input carrying `"command"` without an explicit `"cwd"` arg
-///   (shell.exec/spawn) gets `cwd` injected.
+///   (bash/spawn) gets `cwd` injected.
+
 fn resolve_tool_input_against_cwd(
     mut input: serde_json::Value,
     cwd: &std::path::Path,
@@ -2038,157 +1837,6 @@ mod tests {
         assert!(runner.context().messages().len() <= 1);
     }
 
-    #[test]
-    fn test_extract_tool_calls() {
-        let text = r#"Some text before
-<tool_call>read {"path": "src/main.rs"}</tool_call>
-More text
-<tool_call>search {"pattern": "TODO"}</tool_call>
-End"#;
-
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].args, r#"{"path": "src/main.rs"}"#);
-        assert_eq!(calls[1].name, "search");
-        assert_eq!(calls[1].args, r#"{"pattern": "TODO"}"#);
-    }
-
-    #[test]
-    fn test_extract_tool_calls_prompt_format_with_closing_gt() {
-        // The specialist prompts (programmer.md, architect.md, manager.md)
-        // teach the model to emit:
-        //   <tool_callbash> {"command": "pwd && ls"}</tool_call>
-        // — note the `>` between name and args. The parser must strip
-        // that `>` so the name is `bash` (not `bash>`) and the
-        // `bash → exec` alias in AgentRunner::run_turn actually fires.
-        let text = r#"<tool_callbash> {"command": "pwd && ls"}</tool_call>
-<tool_callread> {"path": "src/main.rs"}</tool_call>
-<tool_calldelegate> {"role": "programmer", "task": "read"}</tool_call>"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 3, "expected 3 tool calls, got {:?}", calls);
-        assert_eq!(calls[0].name, "bash");
-        assert_eq!(calls[0].args, r#"{"command": "pwd && ls"}"#);
-        assert_eq!(calls[1].name, "read");
-        assert_eq!(calls[1].args, r#"{"path": "src/main.rs"}"#);
-        assert_eq!(calls[2].name, "delegate");
-        assert_eq!(calls[2].args, r#"{"role": "programmer", "task": "read"}"#);
-    }
-    #[test]
-    fn test_extract_tool_calls_xml_style_close() {
-        // What deepseek-v4-flash actually emits in real chat sessions
-        // (observed 2026-06-25): the open and close are XML-style
-        // matching tags `<tool_callNAME>...</tool_callNAME>`, not the
-        // prompt-taught canonical form. The parser must accept this.
-        let text = r#"<tool_calldelegate> {"role": "programmer", "task": "read chat.rs"}</tool_calldelegate>
-<tool_callreviewer> {"role": "reviewer", "task": "audit chat.rs"}</tool_callreviewer>"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 2, "expected 2 calls, got {:?}", calls);
-        assert_eq!(calls[0].name, "delegate");
-        assert_eq!(calls[0].args, r#"{"role": "programmer", "task": "read chat.rs"}"#);
-        assert_eq!(calls[1].name, "reviewer");
-        assert_eq!(calls[1].args, r#"{"role": "reviewer", "task": "audit chat.rs"}"#);
-    }
-
-    #[test]
-    fn test_extract_tool_calls_whitespace_before_name() {
-        // 复现 2026-07-19 用户报告的格式：`<tool_call>` 与工具名之间有
-        // 换行/空格。之前名字扫描在第一个非字母数字字符（\n）处停止，
-        // name_len == 0 → 整个调用被静默丢弃（opens_found=1,
-        // closes_matched=0），UI 表现就是"XML 解析有问题/工具没执行"。
-        let text = "<tool_call>\ndelegate {\"role\": \"programmer\", \"task\": \"pwd 确认目录\"}\n</tool_call>";
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1, "换行分隔的工具名必须被解析，got {:?}", calls);
-        assert_eq!(calls[0].name, "delegate");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&calls[0].args).expect("args 必须是合法 JSON");
-        assert_eq!(parsed["role"], "programmer");
-
-        // 空格分隔同理
-        let text2 = r#"<tool_call> read {"path": "src/a.rs"}</tool_call>"#;
-        let calls2 = extract_tool_calls(text2);
-        assert_eq!(calls2.len(), 1);
-        assert_eq!(calls2[0].name, "read");
-    }
-
-    #[test]
-    fn test_extract_tool_calls_glm_arg_value_close() {
-        // 复现 2026-07-10 UI 用户报告的真实 bug：GLM 5.2 吐
-        // `</arg_value>` 作为 closing tag，而不是 prompt 里教的
-        // `</tool_call>` 或模型自己应该匹配的 `</tool_calldelegate>`。
-        // parser 之前直接 break 不返回，manager 调不出 delegate，
-        // UI 看到的就是一行"裸 tool call 文本"然后卡住。
-        let text = r#"<tool_call>delegate {"role": "programmer", "task": "首先执行：bash {\"command\": \"pwd && ls\"} 以确认 cwd"}
-</arg_value>"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(
-            calls.len(),
-            1,
-            "GLM 5.2 的 </arg_value> 应该被识别成合法 closing tag，got {:?}",
-            calls
-        );
-        assert_eq!(calls[0].name, "delegate");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&calls[0].args).expect("args 必须是合法 JSON");
-        assert_eq!(parsed["role"], "programmer");
-        assert_eq!(
-            parsed["task"],
-            "首先执行：bash {\"command\": \"pwd && ls\"} 以确认 cwd"
-        );
-    }
-
-    #[test]
-    fn test_extract_tool_calls_arbitrary_close_fallback() {
-        // 任何 well-formed `</X>` 都应该被 fallback 接受，不只是
-        // `</arg_value>`。比如 `</function>`、``</invoke>`` 之类。
-        let text = r#"<tool_call>delegate {"role": "pm", "task": "x"}
-</function>"#;
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1, "应该认 </function> 当 close，got {:?}", calls);
-        assert_eq!(calls[0].name, "delegate");
-    }
-
-    #[test]
-    fn test_extract_tool_calls_no_close_gives_up_cleanly() {
-        // 真的没有 closing tag 时（model 输出被截断），parser 应该
-        // 干净地放弃 —— 不能 panic，也不能吐半截 args。
-        let text = r#"<tool_call>delegate {"role": "programmer", "task": "run pwd"}"#;
-        let calls = extract_tool_calls(text);
-        assert!(
-            calls.is_empty(),
-            "没有 closing tag 应该放弃整个 tool call，不能返回半截，got {:?}",
-            calls
-        );
-    }
-
-    #[test]
-    fn test_find_any_close_tag_skips_non_tags() {
-        // `</` 后面不是合法 tag name 字符（连 `>` 都没有）的，要跳
-        // 过去继续找下一个，不能误判成 closing tag。
-        assert!(find_any_close_tag("hello </ world").is_none());
-        assert!(find_any_close_tag("nothing here").is_none());
-        // `</arg_value>` = `<` `/` `a` `r` `g` `_` `v` `a` `l` `u` `e` `>` = 12 字符
-        assert_eq!(
-            find_any_close_tag("prefix </arg_value> suffix"),
-            Some((7, 12))
-        );
-    }
-
-
-    #[test]
-    fn test_extract_tool_calls_no_args() {
-        let text = "<tool_call>list_models</tool_call>";
-        let calls = extract_tool_calls(text);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "list_models");
-        assert_eq!(calls[0].args, "");
-    }
-
-    #[test]
-    fn test_extract_tool_calls_empty() {
-        let calls = extract_tool_calls("Just a regular response, no tools.");
-        assert!(calls.is_empty());
-    }
     // ─── cooldown_for_error mapping ────────────────────────────────────
 
     #[test]
@@ -2249,7 +1897,6 @@ End"#;
         let d = cooldown_for_error(&AiError::Auth("bad key".into()));
         assert_eq!(d, None);
     }
-
     #[test]
     fn test_cooldown_for_config_error_is_none() {
         let d = cooldown_for_error(&AiError::Config("bad model".into()));
@@ -2328,7 +1975,17 @@ End"#;
     // ─── fallback behavior (integration via wiremock) ──────────────────
 
     /// OpenAI-compatible completion payload used by all mock endpoints.
-    fn openai_completion_body(content: &str) -> String {
+    /// `content` is the text response; pass `tool_calls` empty for text-only.
+    fn openai_completion_body(content: &str, tool_calls: Vec<serde_json::Value>) -> String {
+        let msg = if tool_calls.is_empty() {
+            serde_json::json!({ "role": "assistant", "content": content })
+        } else {
+            serde_json::json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": tool_calls,
+            })
+        };
         serde_json::json!({
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -2336,8 +1993,8 @@ End"#;
             "model": "test",
             "choices": [{
                 "index": 0,
-                "message": { "role": "assistant", "content": content },
-                "finish_reason": "stop"
+                "message": msg,
+                "finish_reason": if tool_calls.is_empty() { "stop" } else { "tool_calls" }
             }],
             "usage": {
                 "prompt_tokens": 10,
@@ -2386,7 +2043,7 @@ End"#;
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("fallback won"),
+                        openai_completion_body("fallback won", vec![]),
                     )),
             )
             .await;
@@ -2482,7 +2139,7 @@ End"#;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
-                    openai_completion_body("never reached"),
+                    openai_completion_body("never reached", vec![]),
                 )),
         )
         .await;
@@ -2579,7 +2236,7 @@ End"#;
                     .and(path("/chat/completions"))
                     .and(wiremock::matchers::header_exists("x-test-first"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("recovered"),
+                        openai_completion_body("recovered", vec![]),
                     )),
             )
             .await;
@@ -2611,7 +2268,7 @@ End"#;
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("after wait"),
+                        openai_completion_body("after wait", vec![]),
                     )),
             )
             .await;
@@ -2680,7 +2337,7 @@ End"#;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(200)
-                    .set_body_string(openai_completion_body("plain text reply"))),
+                    .set_body_string(openai_completion_body("plain text reply", vec![]))),
         )
         .await;
 
@@ -2883,7 +2540,7 @@ End"#;
                     .and(path("/chat/completions"))
                     .respond_with(
                         ResponseTemplate::new(200)
-                            .set_body_string(openai_completion_body("done")),
+                            .set_body_string(openai_completion_body("done", vec![])),
                     ),
             )
             .await;
@@ -2971,7 +2628,16 @@ End"#;
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("<tool_call>ping {}</tool_call>"),
+                        openai_completion_body("", vec![
+                            serde_json::json!({
+                                "id": "call_ping",
+                                "type": "function",
+                                "function": {
+                                    "name": "ping",
+                                    "arguments": "{}"
+                                }
+                            })
+                        ]),
                     )),
             )
             .await;
@@ -3059,19 +2725,28 @@ End"#;
                     .and(path("/chat/completions"))
                     .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body(
-                            "<tool_call>ping <arg_key>x</arg_key></tool_call>",
-                        ),
+                        openai_completion_body("", vec![
+                            serde_json::json!({
+                                "id": "call_ping",
+                                "type": "function",
+                                "function": {
+                                    // arguments 为非法 JSON 串 → latte-ai 层
+                                    // 解析失败，arguments=Null + arguments_parse_error=Some。
+                                    "name": "ping",
+                                    "arguments": "<arg_key>x</arg_key>"
+                                }
+                            })
+                        ]),
                     )),
-            )
-            .await;
+                )
+                .await;
         // 兜底：round 1 起一律 finish。
         server
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(
-                        ResponseTemplate::new(200).set_body_string(openai_completion_body("done")),
+                        ResponseTemplate::new(200).set_body_string(openai_completion_body("done", vec![])),
                     ),
             )
             .await;
@@ -3121,17 +2796,26 @@ End"#;
 
     #[test]
     fn last_decision_kind_returns_tool_call_for_write() {
-        use latte_ai::models::Role as MsgRole;
         use crate::checkpoint::short_hash;
         let role = test_role();
         let agent =
             Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
                 .unwrap();
         let mut runner = AgentRunner::new(agent);
-        let args_json = r#"{"path":"/tmp/x"}"#;
-        // Canonical open tag + close tag the v1 parser uses.
-        runner.context_mut().push(Message::assistant(format!("<tool_callwrite> {}</tool_call>", args_json)));
-        let expected = format!("tool_call:write:{}", &short_hash(args_json)[..8]);
+        let args = serde_json::json!({"path":"/tmp/x"});
+        // native function-calling: assistant 消息带 tool_calls 字段。
+        let tc = latte_ai::models::ToolCall {
+            id: "call_1".into(),
+            name: "write".into(),
+            arguments: args.clone(),
+            arguments_raw: None,
+            arguments_parse_error: None,
+        };
+        runner.context_mut().push(Message::assistant_with_tool_calls(
+            String::new(),
+            vec![tc],
+        ));
+        let expected = format!("tool_call:write:{}", &short_hash(&args.to_string())[..8]);
         assert_eq!(runner.last_decision_kind(), expected);
     }
     // ─── cwd wiring ──────────────────────────────────────────
@@ -3176,167 +2860,98 @@ End"#;
         assert_eq!(runner.cwd.as_deref(), Some(cwd_path.as_path()));
     }
 
-    // ─── dedupe_tool_calls tests ────────────────────────────────────────
+    // ─── dedupe_native_tool_calls tests ─────────────────────────────────
     //
-    // 覆盖 dedupe 工具的几种关键行为：完全相同的调用合并、不同参数不
-    // 合并、JSON 文本形式不同但语义相同时合并、保留首次出现的位置、
-    // 空输入和非 JSON 输入也能正常工作。
-    // 每个测试都聚焦一个行为分支，方便定位回归。
+    // 覆盖去重的几种关键行为：完全相同的调用合并、不同参数不合并、
+    // JSON 文本形式不同但语义相同时合并、保留首次出现的位置。
+    // 用 `latte_ai::models::ToolCall` 构造而非遗留 `ParsedCall`。
+
+    fn t(name: &str, args: serde_json::Value) -> latte_ai::models::ToolCall {
+        latte_ai::models::ToolCall {
+            id: "call".into(), name: name.into(), arguments: args,
+            arguments_raw: None, arguments_parse_error: None,
+        }
+    }
 
     #[test]
     fn dedupe_drops_three_identical_delegate_calls() {
-        // 复现用户报告的 bug 场景：manager 在一次响应里吐出 3 个完
-        // 全相同的 `delegate` 调用。dedup 之后应该只剩 1 个，这样
-        // LoopDetector 就不会被"called 4 times in a row"误报打断。
-        let calls = vec![
-            ParsedCall {
-                name: "delegate".into(),
-                args: r#"{"role":"programmer","task":"run pwd"}"#.into(),
-            },
-            ParsedCall {
-                name: "delegate".into(),
-                args: r#"{"role":"programmer","task":"run pwd"}"#.into(),
-            },
-            ParsedCall {
-                name: "delegate".into(),
-                args: r#"{"role":"programmer","task":"run pwd"}"#.into(),
-            },
-        ];
-        let deduped = dedupe_tool_calls(calls);
+        let args = serde_json::json!({"role":"programmer","task":"run pwd"});
+        let calls = vec![t("delegate", args.clone()), t("delegate", args.clone()), t("delegate", args.clone())];
+        let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 1, "3 个相同 delegate 调用应合并为 1 个");
         assert_eq!(deduped[0].name, "delegate");
-        assert_eq!(
-            deduped[0].args,
-            r#"{"role":"programmer","task":"run pwd"}"#
-        );
     }
 
     #[test]
     fn dedupe_keeps_calls_with_different_args() {
-        // 并行读多个文件是 manager 推荐的合法场景，不能被误合并。
         let calls = vec![
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a.rs"}"#.into(),
-            },
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"b.rs"}"#.into(),
-            },
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"c.rs"}"#.into(),
-            },
+            t("read", serde_json::json!({"path":"a.rs"})),
+            t("read", serde_json::json!({"path":"b.rs"})),
+            t("read", serde_json::json!({"path":"c.rs"})),
         ];
-        let deduped = dedupe_tool_calls(calls);
+        let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 3, "3 个不同 path 的 read 调用应全部保留");
     }
 
     #[test]
     fn dedupe_treats_semantic_equivalent_args_as_duplicates() {
-        // 同一调用的两种 JSON 文本写法（带额外空格）应被识别为同一次
-        // 调用，这样和 LoopDetector 的 hash 方式保持一致 —— 同一个
-        // 调用不会因为多打了一个空格就"骗过" dedup。
         let calls = vec![
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a.rs"}"#.into(),
-            },
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path": "a.rs"}"#.into(), // 多了个空格
-            },
+            t("read", serde_json::json!({"path":"a.rs"})),
+            t("read", serde_json::json!({"path": "a.rs"})), // 多了一个空格，语义等价
         ];
-        let deduped = dedupe_tool_calls(calls);
-        assert_eq!(
-            deduped.len(),
-            1,
-            "只是空白不同的 args 视为同一调用（与 LoopDetector 的 hash 一致）"
-        );
+        let deduped = dedupe_native_tool_calls(calls);
+        assert_eq!(deduped.len(), 1, "键序不同/空白不同视为同一次调用");
     }
 
     #[test]
     fn dedupe_does_not_merge_args_that_differ_in_fields() {
-        // 多了一个字段就是不同的调用 —— 不能因为 JSON 解析成功就合
-        // 并掉合法但不同的请求。
         let calls = vec![
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a.rs"}"#.into(),
-            },
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a.rs","limit":10}"#.into(),
-            },
+            t("read", serde_json::json!({"path":"a.rs"})),
+            t("read", serde_json::json!({"path":"a.rs","limit":10})),
         ];
-        let deduped = dedupe_tool_calls(calls);
+        let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 2, "args 含不同字段时不应合并");
     }
 
     #[test]
     fn dedupe_preserves_first_occurrence_order() {
-        // 入参里 a.rs 在前、b.rs 居中、a.rs 重复出现在末尾 → 输出
-        // 应当是 [a.rs, b.rs]（首次出现位置 = 1，b.rs 位置 = 2）。
         let calls = vec![
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a.rs"}"#.into(),
-            },
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"b.rs"}"#.into(),
-            },
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a.rs"}"#.into(),
-            },
+            t("read", serde_json::json!({"path":"a.rs"})),
+            t("read", serde_json::json!({"path":"b.rs"})),
+            t("read", serde_json::json!({"path":"a.rs"})),
         ];
-        let deduped = dedupe_tool_calls(calls);
+        let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 2);
-        assert_eq!(deduped[0].args, r#"{"path":"a.rs"}"#);
-        assert_eq!(deduped[1].args, r#"{"path":"b.rs"}"#);
+        assert_eq!(deduped[0].arguments["path"], "a.rs");
+        assert_eq!(deduped[1].arguments["path"], "b.rs");
     }
 
     #[test]
     fn dedupe_handles_empty_input() {
-        // 空列表直接返回空列表，不应该 panic。
-        let deduped = dedupe_tool_calls(vec![]);
+        let deduped = dedupe_native_tool_calls(vec![]);
         assert!(deduped.is_empty());
     }
 
     #[test]
-    fn dedupe_handles_malformed_json_args() {
-        // args 不是合法 JSON 时回退到原始文本比较，相同原始文本仍
-        // 应被识别为重复 —— 不能因为 parse 失败就放弃去重。
-        let calls = vec![
-            ParsedCall {
-                name: "bash".into(),
-                args: "pwd && ls".into(),
-            },
-            ParsedCall {
-                name: "bash".into(),
-                args: "pwd && ls".into(),
-            },
-        ];
-        let deduped = dedupe_tool_calls(calls);
-        assert_eq!(deduped.len(), 1, "非 JSON args 的相同文本应被去重");
+    fn dedupe_handles_malformed_arguments() {
+        // arguments_raw 传递原始坏串，arguments 为 Null；去重靠 to_string()。
+        // 两个相同 arguments_raw（如"pwd && ls"）应被识别为重复。
+        let make = |raw: &str| latte_ai::models::ToolCall {
+            id: "call".into(), name: "bash".into(),
+            arguments: serde_json::Value::Null,
+            arguments_raw: Some(raw.into()),
+            arguments_parse_error: Some("parse failed".into()),
+        };
+        let calls = vec![make("pwd && ls"), make("pwd && ls")];
+        let deduped = dedupe_native_tool_calls(calls);
+        assert_eq!(deduped.len(), 1, "相同 arguments_raw 的调用应去重");
     }
 
     #[test]
     fn dedupe_keeps_different_tools_with_same_args() {
-        // 工具名不同时即使 args 文本一致也不应合并 —— 比如 `read` 和
-        // `bash` 都可能用到 `path` 字段，但它们是不同工具。
-        let calls = vec![
-            ParsedCall {
-                name: "read".into(),
-                args: r#"{"path":"a"}"#.into(),
-            },
-            ParsedCall {
-                name: "bash".into(),
-                args: r#"{"path":"a"}"#.into(),
-            },
-        ];
-        let deduped = dedupe_tool_calls(calls);
+        let args = serde_json::json!({"path":"a"});
+        let calls = vec![t("read", args.clone()), t("bash", args)];
+        let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 2, "不同工具名应保留");
     }
 
@@ -3383,6 +2998,28 @@ End"#;
                 matches!(r, LoopDecision::Continue),
                 "每轮的全新 detector 不应被单次调用 trip"
             );
+        }
+    }
+    /// build_tool_schemas：工具名直接用扁平规范名（bash/read/edit），
+    /// 不再有 friendly_tool_name / namespace 转换。还验证 strict 字段
+    /// 透传（默认 None）。
+    #[tokio::test]
+    async fn build_tool_schemas_uses_flat_names() {
+        let mgr = crate::controller::build_tool_manager(
+            &["bash".into(), "read".into(), "search".into()],
+        )
+        .await
+        .unwrap();
+        let schemas = build_tool_schemas(&mgr);
+        let names: Vec<String> = schemas.iter().map(|t| t.name.clone()).collect();
+        assert!(names.contains(&"bash".to_string()), "应有 bash: {names:?}");
+        assert!(names.contains(&"read".to_string()), "应有 read: {names:?}");
+        assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
+        // 扁平命名下不应有点号（shell.exec 之类的 namespace 不复存在）。
+        assert!(!names.iter().any(|n| n.contains('.')), "不应有点号命名: {names:?}");
+        // strict 默认 None（不开 Structured Outputs）。
+        for t in &schemas {
+            assert!(t.strict.is_none(), "工具 {} 的 strict 应为 None，got {:?}", t.name, t.strict);
         }
     }
 }

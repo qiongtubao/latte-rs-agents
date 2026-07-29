@@ -3170,3 +3170,114 @@ select {
   pointer-events: none;
 }
 .tb-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ─── plan 导入弹窗（PlanProposed 事件 / 右键导入任务看板） ─────── */
+.plan-import-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 500;
+}
+.plan-import-box {
+  background: #ffffff;
+  border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
+  width: min(640px, 92vw);
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.plan-import-header {
+  padding: 16px 20px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #0f172a;
+  border-bottom: 1px solid #e2e8f0;
+}
+.plan-import-list {
+  overflow-y: auto;
+  padding: 12px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.plan-import-row {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.plan-import-row-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.plan-import-cb {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  accent-color: #3b82f6;
+  cursor: pointer;
+}
+.plan-import-title {
+  flex: 1;
+  font-size: 14px;
+  padding: 6px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  min-width: 0;
+}
+.plan-import-pri {
+  padding: 6px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #f8fafc;
+  flex-shrink: 0;
+}
+.plan-import-desc {
+  width: 100%;
+  font-size: 13px;
+  padding: 6px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  resize: vertical;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+.plan-import-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 20px;
+  border-top: 1px solid #e2e8f0;
+  background: #f8fafc;
+}
+.plan-import-bar button {
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  background: #ffffff;
+  font-size: 13px;
+  cursor: pointer;
+}
+.plan-import-bar button:hover {
+  background: #f1f5f9;
+}
+.plan-import-go {
+  margin-left: auto;
+  background: #3b82f6 !important;
+  color: #ffffff !important;
+  border-color: #3b82f6 !important;
+  font-weight: 600;
+}
+.plan-import-go:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

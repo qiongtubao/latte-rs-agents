@@ -218,7 +218,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             model_chain: vec![],
             prompt_file: None,
             temperature: Some(0.5),
-            tools: vec!["delegate".into(), "workflow".into()],
+            tools: vec!["delegate".into(), "workflow".into(), "plan".into()],
             icon: "👔".into(),
             skills: vec![],
             code_paths: vec![],

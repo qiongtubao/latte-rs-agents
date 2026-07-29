@@ -293,6 +293,17 @@ pub enum ChatEvent {
     /// 角色调用 generate_image 生成的图片。path 是 UI server 的
     /// `/api/images/<file>` URL（web UI 直接渲染 <img>）。
     ImageGenerated { role_id: String, path: String, prompt: String },
+    /// 角色调用 `plan` 工具提交的任务候选清单。manager 在
+    /// `implementation_plan` workflow 跑完（或手持一份具体任务清单）
+    /// 后调 `plan`，把结构化任务交给用户在弹窗里勾选导入任务看板。
+    /// `plan_id` 唯一标识本次提案，供 UI 去重与右键补救重开弹窗。
+    /// `tasks` 与 `POST /api/tasks/import` 的 `ImportTask`（tasks.rs）
+    /// 同构——前端选中后直接透传导入接口，无需文本解析。
+    PlanProposed {
+        role_id: String,
+        plan_id: String,
+        tasks: Vec<PlanTask>,
+    },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -341,6 +352,30 @@ pub struct RoleInfo {
     pub id: String,
     pub name: String,
     pub icon: String,
+}
+/// `plan` 工具提交的单个任务候选。字段与后端 `ImportTask`
+/// （`latte-agent-ui-server/src/tasks.rs`）及前端 `ImportTask`
+/// （`api.ts`）同构——前端勾选后可直接透传 `POST /api/tasks/import`。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanTask {
+    /// 任务标题，一句话，必填非空。
+    pub title: String,
+    /// 做什么 + 验收标准。空则不序列化（前端视作缺省）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// 优先级 1-4（1 最高）。空则不序列化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    /// 标签数组。空则不序列化。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// 执行该任务的 workflow 名（tdd_development/bug_triage/update_docs）。
+    /// 轻量任务可空。空则不序列化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// 子任务，同构，最多一层。空则不序列化。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtasks: Vec<PlanTask>,
 }
 
 // ─── Controller input ────────────────────────────────────────────
@@ -1812,6 +1847,13 @@ async fn build_runner(
             )
             .map_err(|e| AgentError::Tool(format!("register generate_image: {e}")))?;
         }
+        // Any role with "plan" in allowed_tools gets the plan tool:
+        // 把结构化任务清单提交给用户在弹窗里勾选导入任务看板。
+        // manager 在 implementation_plan workflow 跑完后调它。
+        if role.allowed_tools.iter().any(|t| t == "plan") {
+            register_plan_tool(&tm, event_tx.clone(), role_id.to_string())
+                .map_err(|e| AgentError::Tool(format!("register plan: {e}")))?;
+        }
 
         // ── 给主 runner 分配 subsession sink（manager / 任何角色通用） ──
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
@@ -1845,6 +1887,7 @@ async fn build_runner(
     }
 }
 
+
 pub(crate) async fn build_tool_manager(
     allowed: &[String],
 ) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error + Send + Sync>> {
@@ -1854,27 +1897,49 @@ pub(crate) async fn build_tool_manager(
         mgr.register_package(p).await
             .map_err(|e| format!("register_package: {e}"))?;
     }
+    // allowed 里的名字现在是扁平规范名（bash/read/edit/...），直接与
+    // registry 注册名匹配，不再有 bash->shell.exec 之类的别名反向映射。
     let mut keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
-    // bash → exec alias
-    for alias in &["bash"] {
-        if keep.contains(*alias) || keep.contains(&alias.to_lowercase()) {
-            keep.insert("exec".to_string());
+    // 配置层向后兼容映射：旧配置名 → 新扁平规范名。用户已有的
+    // `~/.latte/agents.d/*.toml` 里可能用 "exec"（现为 "bash"）、
+    // "diff"（现为 "git_diff"）、"playwright_screenshot"（现为 "screenshot"）
+    let compat_map: std::collections::HashMap<&str, &str> = [
+        ("exec", "bash"),
+        ("playwright_screenshot", "screenshot"),
+        // 旧 namespace 短名映射：git 系列现在用 "git_diff"/"git_log"/等。
+        ("diff", "git_diff"),
+        ("status", "git_status"),
+        ("log", "git_log"),
+        ("branch", "git_branch"),
+        ("commit", "git_commit"),
+        ("add", "git_add"),
+    ].into_iter().collect();
+    for (old, new) in &compat_map {
+        if keep.contains(*old) {
+            keep.insert(new.to_string());
         }
     }
-    // mcp → mcp_* tool aliases
+    // mcp 是配置层分组别名（一个名字展开成 3 个 mcp_* 工具），不是工具名别名。
     if keep.contains("mcp") || keep.contains("mcp_connect") {
         keep.insert("mcp_connect".to_string());
         keep.insert("mcp_list".to_string());
         keep.insert("mcp_call".to_string());
+    }
+    // playwright 同理：展开成 screenshot + playwright_script。
+    if keep.contains("playwright") {
+        keep.insert("screenshot".to_string());
+        keep.insert("playwright_script".to_string());
     }
     // Register code_graph tool if allowed
     if keep.contains("code_graph") || keep.contains("code-graph") {
         let cg = code_graph_tool();
         mgr.register(cg, None);
     }
+    // 工具名已是扁平（无点号），short == tool_id；保留 rsplit_once 兜底
+    // 仅为兼容可能遗留的 namespace 工具。
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -1960,28 +2025,16 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
 }
 
 pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
-    let real_names: Vec<String> = allowed.iter()
-        .map(|s| match s.as_str() {
-            "bash" => "exec".to_string(),
-            "playwright" => "playwright_screenshot".to_string(),
-            "mcp" => "mcp_connect".to_string(),
-            other => other.to_string(),
-        })
-        .collect();
-    let names_str = real_names.join(", ");
+    let names_str = allowed.join(", ");
     format!(
         r#"
-## Tool calling protocol
+## Tools
 
 You have access to the following tools: {names_str}.
-When you call a tool you MUST output a single line of this exact XML form:
-
-<tool_call>NAME {{"arg": "value"}}</tool_call>
-
-Examples:
-
-<tool_call>read {{"path": "README.md"}}</tool_call>
-<tool_call>search {{"path": "src", "pattern": "TODO", "max_results": 20}}</tool_call>
+Call tools via the native function-calling interface (the request `tools`
+field carries each tool's name, description, and JSON schema). Do NOT emit
+`<tool_call>` text blocks -- they are no longer parsed. Inspect each tool
+result and continue until the task is done.
 "#
     )
 }
@@ -2034,7 +2087,7 @@ fn delegate_tool_hint(merged: &AgentConfig) -> String {
 - 只输出计划而不调用 delegate ← 这是最常见的错误！不要这样做！
 - 自己分析而不派发给专家
 
-调用格式：<tool_call>delegate {{"role": "programmer", "task": "读取 src/main.ts 的内容"}}</tool_call>
+用 native function-calling 调 delegate 工具（参数 role + task）。
 "#
     )
 }
@@ -2066,7 +2119,7 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 当前可用的 workflow（含 UI 管理界面新建的自定义流程）：
 
 {list}
-调用格式：<tool_call>workflow {{"name": "<name>", "topic": "为 UI 增加 session 管理"}}</tool_call>
+用 native function-calling 调 workflow 工具（参数 name + topic）。
 
 判断标准（分派前先想流程）：
 - 单点问题（读代码、改文件、审查某个具体实现）→ delegate
@@ -2075,6 +2128,102 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 - workflow 会跑完整条流水线并把结论返回给你；你综合后再回复用户。
 "#
     )
+}
+/// 注册 `plan` 工具：把结构化任务清单提交给用户在弹窗里勾选导入
+/// 任务看板。manager 在 `implementation_plan` workflow 跑完（或手持
+/// 一份具体任务清单）后调它。与 `register_generate_image_tool` 同构
+/// （schema + 捕获 event_tx 的 SharedToolHandler），但更简单--不
+/// 调模型、不读写文件，只校验 tasks 并广播 `PlanProposed` 事件。
+///
+/// 工具返回立即（fire-and-forget）：发完事件就回"已提交 N 个候选"，
+/// LLM 的 turn 结束；弹窗是纯 UI 侧异步行为，用户何时导入都行。
+/// 若用户误关弹窗，可右键 PlanProposed 消息选「导入任务看板」补救
+/// （右键读消息上存的结构化 tasks，不靠文本解析）。
+fn register_plan_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    event_tx: broadcast::Sender<ChatEvent>,
+    role_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use latte_rs_agent_tools::types::{
+        PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // 进程级单调序号，保证 plan_id 全局唯一。
+    static PLAN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // tasks 是数组；ToolInputProperty 无嵌套 items schema，故用描述
+    // 把每项结构讲清（title/description/priority/labels/workflow/
+    // subtasks）。LLM 按描述产出，handler 逐项 serde 解析 + 校验。
+    let input_schema = ToolInputSchema {
+        schema_type: SchemaType,
+        properties: vec![
+            ("tasks".into(), ToolInputProperty {
+                property_type: PropertyType::Array,
+                description: Some(
+                    "任务候选清单。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs;轻量任务可空), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
+                ),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+        ].into_iter().collect(),
+        required: Some(vec!["tasks".into()]),
+        ..Default::default()
+    };
+
+    let handler_role_id = role_id.clone();
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let event_tx = event_tx.clone();
+        let role_id = handler_role_id.clone();
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+
+            let tasks_val = input
+                .get("tasks")
+                .ok_or_else(|| tool_err("missing 'tasks' field".into()))?;
+            let tasks_arr = tasks_val
+                .as_array()
+                .ok_or_else(|| tool_err("'tasks' must be an array".into()))?;
+            if tasks_arr.is_empty() {
+                return Err(tool_err("'tasks' must not be empty".into()));
+            }
+            // 逐项解析 + 校验 title 非空（与后端 import_tasks 的校验对齐）。
+            let mut tasks: Vec<PlanTask> = Vec::with_capacity(tasks_arr.len());
+            for (i, t) in tasks_arr.iter().enumerate() {
+                let pt: PlanTask = serde_json::from_value(t.clone())
+                    .map_err(|e| tool_err(format!("tasks[{i}] invalid: {e}")))?;
+                if pt.title.trim().is_empty() {
+                    return Err(tool_err(format!("tasks[{i}].title must not be empty")));
+                }
+                tasks.push(pt);
+            }
+
+            let plan_id = format!(
+                "plan-{}-{}",
+                role_id,
+                PLAN_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let n = tasks.len();
+            let _ = event_tx.send(ChatEvent::PlanProposed {
+                role_id: role_id.clone(),
+                plan_id: plan_id.clone(),
+                tasks,
+            });
+            Ok(serde_json::Value::String(format!(
+                "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。"
+            )))
+        })
+    });
+
+    let tool = Tool::builder(
+        "plan".to_string(),
+        "把一份结构化任务清单提交给用户，用户在弹窗里勾选后导入任务看板（backlog）。用于 implementation_plan workflow 跑完或手持具体任务清单时把任务交给看板。参数 tasks 是任务对象数组。".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm.register(tool, Some(&role_id));
+    Ok(())
 }
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
@@ -2819,6 +2968,51 @@ mod tests {
         assert_eq!(json["DelegateFinished"]["summary"], "found 3 files");
         assert_eq!(json["DelegateFinished"]["sub_id"], "programmer-sub-1");
     }
+    #[test]
+    fn plan_proposed_serializes_to_frontend_shape() {
+        // 验证 PlanProposed 事件经 chat_event_to_frontend_json 转成
+        // 前端 internally-tagged 形态：{"type":"PlanProposed",...}，
+        // 字段 snake_case；tasks 里空字段被 skip_serializing_if 省略。
+        let event = ChatEvent::PlanProposed {
+            role_id: "manager".into(),
+            plan_id: "plan-manager-0".into(),
+            tasks: vec![
+                PlanTask {
+                    title: "实现 ringbuf 核心读写".into(),
+                    description: "覆盖并发读写路径".into(),
+                    priority: Some(1),
+                    labels: vec!["core".into()],
+                    workflow: Some("tdd_development".into()),
+                    subtasks: vec![],
+                },
+                PlanTask {
+                    title: "补测试".into(),
+                    description: String::new(),
+                    priority: None,
+                    labels: vec![],
+                    workflow: None,
+                    subtasks: vec![],
+                },
+            ],
+        };
+        let wire = crate::event_json::chat_event_to_frontend_json(&event).expect("frontend json");
+        let v: serde_json::Value = serde_json::from_str(&wire).expect("parse wire");
+        // internally-tagged discriminator（与 api.ts 的 union key 对齐）。
+        assert_eq!(v["type"], "PlanProposed");
+        assert_eq!(v["role_id"], "manager");
+        assert_eq!(v["plan_id"], "plan-manager-0");
+        let tasks = v["tasks"].as_array().expect("tasks array");
+        assert_eq!(tasks.len(), 2);
+        // 第一项：全字段序列化。
+        assert_eq!(tasks[0]["title"], "实现 ringbuf 核心读写");
+        assert_eq!(tasks[0]["priority"], 1);
+        assert_eq!(tasks[0]["workflow"], "tdd_development");
+        // 第二项：空字段被 skip_serializing_if 省略（title 必留）。
+        assert_eq!(tasks[1]["title"], "补测试");
+        assert!(tasks[1].get("description").is_none(), "空 description 应省略");
+        assert!(tasks[1].get("priority").is_none(), "None priority 应省略");
+        assert!(tasks[1].get("labels").is_none(), "空 labels 应省略");
+    }
 
     #[test]
     fn delegate_finished_carries_failure_status() {
@@ -3335,4 +3529,22 @@ mod tests {
         controller.abort().await;
     }
 
+    /// 锁定 bash 工具的 schema 契约：allowed "bash" 直接保留 "bash" 工具
+    /// （扁平命名，无 alias），且接受 {command, cwd}（cwd 由
+    /// resolve_tool_input_against_cwd 注入）。
+    #[tokio::test]
+    async fn bash_tool_kept_and_accepts_cwd() {
+        let mgr = build_tool_manager(&["read".into(), "write".into(), "bash".into(), "search".into()])
+            .await
+            .expect("build_tool_manager");
+        // 扁平命名：allowed "bash" 直接保留 "bash" 工具。
+        let names: Vec<String> = mgr.get_tool_names();
+        assert!(names.contains(&"bash".to_string()), "bash 应被保留: {names:?}");
+        // bash 必须接受 {command, cwd}。
+        let args = serde_json::json!({"command":"pwd","cwd":"/tmp"});
+        let r = mgr.execute("bash", args, None).await;
+        assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
+        // eval 不在 allowed 里，被过滤掉；扁平命名下 bash/eval 不再碰撞。
+        assert!(!names.contains(&"eval".to_string()), "eval 不应被保留（不在 allowed）: {names:?}");
+    }
 }

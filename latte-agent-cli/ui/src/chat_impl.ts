@@ -1,6 +1,7 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession, importTasks } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession, importTasks, type ImportTask } from "./api";
 import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
+import { buildSelectedPlanTasks } from "./plan_import";
 import type { CodeRef } from "./host";
 interface UIBinding {
 
@@ -165,6 +166,8 @@ export function mountChat(opts: {
     reference?: { refId: string; preview: string };
     subagent?: { detail: string } | null;
     timestamp: string;
+    /** plan 工具提交的任务候选：右键「导入任务看板」读它重开弹窗。 */
+    planTasks?: ImportTask[];
     el: HTMLElement;
   }
   const messageStore: MsgRecord[] = [];
@@ -215,6 +218,8 @@ export function mountChat(opts: {
     state?: "executing" | "done" | "error";
     /** 角色对应的配置文件路径（仅 role / tool / error 类消息生效） */
     filePath?: string;
+    /** plan 工具提交的任务候选（PlanProposed 事件渲染的消息带它）。 */
+    planTasks?: ImportTask[];
   }): HTMLElement {
     const kind = opts2.kind;
     const ts = opts2.timestamp || fmtDisplayTime();
@@ -385,11 +390,119 @@ export function mountChat(opts: {
       reference: opts2.reference,
       subagent: opts2.subagent ?? null,
       timestamp: ts,
+      planTasks: opts2.planTasks,
       el: row,
     });
     container.messagesEl.appendChild(row);
     if (isNearBottom()) scrollToBottom();
     return row;
+  }
+  // ── plan 导入弹窗 ──
+  // PlanProposed 事件触发（主路径）或右键「导入任务看板」（补救路径）
+  // 调用。tasks 是结构化任务候选（来自 plan 工具，非文本解析），用户
+  // 勾选 + 可编辑 title/description/priority 后调 importTasks 进 backlog。
+  function openPlanImportModal(tasks: ImportTask[], planId?: string): void {
+    // 防重复弹窗：已存在则先移除再重建（同 planId 重开）。
+    document.getElementById("plan-import-modal")?.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "plan-import-modal";
+    overlay.className = "plan-import-overlay";
+
+    const box = document.createElement("div");
+    box.className = "plan-import-box";
+    const header = document.createElement("div");
+    header.className = "plan-import-header";
+    header.textContent = `导入任务看板 · ${tasks.length} 个候选${planId ? `（${planId}）` : ""}`;
+    box.appendChild(header);
+
+    // 每个任务一行：勾选框 + 可编辑 title/desc/priority。
+    const rows: { cb: HTMLInputElement; titleInp: HTMLInputElement; descInp: HTMLTextAreaElement; priSel: HTMLSelectElement; task: ImportTask }[] = [];
+    const list = document.createElement("div");
+    list.className = "plan-import-list";
+    for (const t of tasks) {
+      const row = document.createElement("div");
+      row.className = "plan-import-row";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = true;
+      cb.className = "plan-import-cb";
+      const titleInp = document.createElement("input");
+      titleInp.type = "text";
+      titleInp.value = t.title;
+      titleInp.className = "plan-import-title";
+      const descInp = document.createElement("textarea");
+      descInp.value = t.description ?? "";
+      descInp.rows = 2;
+      descInp.className = "plan-import-desc";
+      descInp.placeholder = "描述 + 验收标准";
+      const priSel = document.createElement("select");
+      for (const p of [1, 2, 3, 4]) {
+        const o = document.createElement("option");
+        o.value = String(p);
+        o.textContent = `P${p}`;
+        if (t.priority === p) o.selected = true;
+        priSel.appendChild(o);
+      }
+      // 无 priority 时默认 P2。
+      if (t.priority == null) priSel.value = "2";
+      priSel.className = "plan-import-pri";
+      const top = document.createElement("div");
+      top.className = "plan-import-row-top";
+      top.append(cb, titleInp, priSel);
+      row.append(top, descInp);
+      list.appendChild(row);
+      rows.push({ cb, titleInp, descInp, priSel, task: t });
+    }
+    box.appendChild(list);
+
+    // 底部操作栏：全选切换 + 导入 + 取消。
+    const bar = document.createElement("div");
+    bar.className = "plan-import-bar";
+    const toggleAll = document.createElement("button");
+    toggleAll.type = "button";
+    toggleAll.textContent = "全选/全不选";
+    toggleAll.addEventListener("click", () => {
+      const all = rows.every(r => r.cb.checked);
+      rows.forEach(r => { r.cb.checked = !all; });
+    });
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "取消";
+    cancelBtn.addEventListener("click", () => overlay.remove());
+    const importBtn = document.createElement("button");
+    importBtn.type = "button";
+    importBtn.className = "plan-import-go";
+    importBtn.textContent = "导入选中项";
+    bar.append(toggleAll, cancelBtn, importBtn);
+    box.appendChild(bar);
+
+    importBtn.addEventListener("click", async () => {
+      const selected = buildSelectedPlanTasks(rows.map(r => ({
+        checked: r.cb.checked,
+        title: r.titleInp.value,
+        description: r.descInp.value,
+        priority: Number(r.priSel.value),
+        task: r.task,
+      })));
+      if (selected.length === 0) { alert("未选择任何任务"); return; }
+      importBtn.disabled = true;
+      importBtn.textContent = "导入中…";
+      try {
+        const resp = await importTasks(selected);
+        addMessage({ kind: "system", content: `✅ 已导入 ${resp.created.length} 个任务到看板（backlog），请到任务看板查看` });
+        overlay.remove();
+      } catch (err) {
+        importBtn.disabled = false;
+        importBtn.textContent = "导入选中项";
+        alert(`导入失败: ${(err as Error).message}`);
+      }
+    });
+
+    overlay.appendChild(box);
+    // 点遮罩空白处关闭（补救路径下用户可随时重开）。
+    overlay.addEventListener("click", (ev) => { if (ev.target === overlay) overlay.remove(); });
+    document.body.appendChild(overlay);
   }
 
 
@@ -688,6 +801,9 @@ export function mountChat(opts: {
         // 仅「主 turn 的 status 行」显示本次执行日志入口（无 subId
         // 但又是执行类行）；其他行隐藏。
         el.style.display = "none";
+      } else if (act === "add-to-board" && !(record?.planTasks && record.planTasks.length > 0)) {
+        // 仅 plan 工具产出的消息（带 planTasks）显示「导入任务看板」。
+        el.style.display = "none";
       } else {
         el.style.display = "";
       }
@@ -747,6 +863,16 @@ export function mountChat(opts: {
           void onShowSessionLog();
         } else {
           alert("查看本次执行日志回调未注册");
+        }
+        break;
+      }
+      case "add-to-board": {
+        // 补救路径：从消息记录上存的结构化 planTasks 重开导入弹窗
+        // （不靠文本解析）。仅带 planTasks 的消息有此入口。
+        if (record.planTasks && record.planTasks.length > 0) {
+          openPlanImportModal(record.planTasks);
+        } else {
+          alert("该消息没有可导入的任务候选");
         }
         break;
       }
@@ -1130,6 +1256,26 @@ export function mountChat(opts: {
         }
         workflowTranscripts.delete(e.wf_id);
         setFooter(`workflow ${e.name} ${e.status}`);
+        resetWaitTimer();
+        break;
+      }
+      case "PlanProposed": {
+        // plan 工具提交的任务候选：渲染消息（存 planTasks 供右键补救）+ 自动弹窗。
+        const n = e.tasks.length;
+        const msg = addMessage({
+          kind: "system",
+          content: `📋 ${e.role_id} 提交了 ${n} 个任务候选（${e.plan_id}），请在弹窗勾选导入任务看板`,
+          planTasks: e.tasks,
+        });
+        // 气泡内附「导入任务看板」按钮，作为弹窗之外的再次入口。
+        const btn = document.createElement("button");
+        btn.className = "workflow-import-btn";
+        btn.textContent = `📥 导入任务看板（${n} 个）`;
+        btn.addEventListener("click", () => openPlanImportModal(e.tasks, e.plan_id));
+        msg.querySelector(".msg-bubble")?.appendChild(btn);
+        // 主路径：立即弹窗。
+        openPlanImportModal(e.tasks, e.plan_id);
+        setFooter(`${e.role_id} 提交 ${n} 个任务候选`);
         resetWaitTimer();
         break;
       }

@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use clap::{Args, Subcommand, ValueEnum};
-use latte_agent_core::agent::parse_tool_calls;
 use latte_agent_core::trace::TraceEvent;
 
 use super::config_layer::{self, CliOverrides};
@@ -73,11 +72,6 @@ pub struct DebugCmd {
 /// The seven sub-subcommands listed in spec §8.2.
 #[derive(Subcommand, Debug, Clone)]
 pub enum DebugAction {
-    /// Parse text through the tool-call parser. No model call.
-    Parse {
-        /// Text to feed to `extract_tool_calls`. Read from argv.
-        text: String,
-    },
     /// Build the real system prompt + history skeleton for a role.
     Prompt {
         /// Role id (e.g. "manager", "programmer").
@@ -132,7 +126,6 @@ pub enum DebugAction {
 impl DebugCmd {
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         match &self.action {
-            DebugAction::Parse { text } => run_parse(text),
             DebugAction::Prompt { role, tier, input, agents_config, models_config } => {
                 run_prompt(role, tier, input.as_deref(), agents_config, models_config).await
             }
@@ -149,25 +142,6 @@ impl DebugCmd {
 
 // ─── Subcommand implementations ───────────────────────────────────────────
 
-fn run_parse(text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let (parsed, diag) = parse_tool_calls(text);
-    println!("opens_found:    {}", diag.opens_found);
-    println!("closes_matched: {}", diag.closes_matched);
-    println!("unmatched:      {} ({} opens without close)",
-        diag.unmatched_opens.len(),
-        diag.opens_found.saturating_sub(diag.closes_matched));
-    if !diag.unmatched_opens.is_empty() {
-        println!("\nUnmatched opens (raw):");
-        for u in &diag.unmatched_opens {
-            println!("  {}", u);
-        }
-    }
-    println!("\nParsed calls ({}):", parsed.len());
-    for (i, c) in parsed.iter().enumerate() {
-        println!("  [{}] name={:<20} args={}", i, c.name, c.args);
-    }
-    Ok(())
-}
 
 async fn run_prompt(
     role: &str,
@@ -322,70 +296,38 @@ fn run_replay(
         .filter_map(|raw| resolve_hook_name(raw))
         .collect();
 
-    let mut re_parse_count = 0usize;
-    let mut re_parse_match = 0usize;
+    let mut tool_call_count = 0usize;
     let mut hook_runs = 0usize;
     let mut hook_aborts = 0usize;
     for ev in &events {
-        if let TraceEvent::ModelRawOut { raw_content, .. } = ev {
-            let (re_parsed, _diag) = parse_tool_calls(raw_content);
-            re_parse_count += 1;
-            // Find the matching ParseToolCalls event (typically the
-            // next event after this raw out) by walking forward.
-            if let Some(orig) = events.iter().find(|e| matches!(e, TraceEvent::ParseToolCalls { .. })) {
-                if let TraceEvent::ParseToolCalls { parsed, .. } = orig {
-                    if parsed_names(parsed) == parsed_names(&re_parsed) {
-                        re_parse_match += 1;
-                    } else {
-                        println!("DIFF: original parsed {:?} vs replay {:?}",
-                            parsed_names(parsed), parsed_names(&re_parsed));
-                    }
-                }
-            }
-            // Run hooks against the raw text (best-effort).
+        if let TraceEvent::ParseToolCalls { parsed, .. } = ev {
+            // native protocol：ParseToolCalls 的 parsed 就是实际的工具调用列表。
+            tool_call_count += 1;
+            // Run hooks against the parsed calls (best-effort).
             for h in &resolved_hooks {
-                if h.name() == "redact_pii" {
+                if h.name() == "enforce_tool_allowlist" {
                     let chain = HookChain::empty()
-                        .push(Arc::new(RedactPii));
-                    let mut msgs = vec![latte_ai::models::Message {
-                        role: latte_ai::models::Role::User,
-                        content: vec![latte_ai::models::ContentPart::text(raw_content.clone())],
-                        tool_call_id: None,
-                        tool_calls: None,
-                    }];
-                    let mut ctx = latte_agent_core::hooks::PreCallCtx { messages: &mut msgs };
-                    let _ = chain.run_pre_call(&mut ctx, |_, _, _| {});
-                    hook_runs += 1;
-                } else if h.name() == "enforce_tool_allowlist" {
-                    let chain = HookChain::empty()
-                        .push(Arc::new(EnforceToolAllowlist::from(vec!["read", "list", "search", "exec", "write", "delegate"])));
-                    let mut parsed = re_parsed.clone();
-                    let mut ctx = latte_agent_core::hooks::PostParseCtx { parsed: &mut parsed };
+                        .push(Arc::new(EnforceToolAllowlist::from(vec!["read", "list", "search", "bash", "write", "delegate"])));
+                    let mut p = parsed.clone();
+                    let mut ctx = latte_agent_core::hooks::PostParseCtx { parsed: &mut p };
                     let outcome = chain.run_post_parse(&mut ctx, |_, _, _| {});
                     hook_runs += 1;
                     if matches!(outcome, latte_agent_core::hooks::HookOutcome::Abort { .. }) {
                         hook_aborts += 1;
                     }
                 } else if h.name() == "require_tool_call" {
-                    let chain = HookChain::empty()
-                        .push(Arc::new(RequireToolCall::default()));
-                    let mut ctx = latte_agent_core::hooks::PostResponseCtx { raw: raw_content };
-                    let outcome = chain.run_post_response(&mut ctx, |_, _, _| {});
-                    hook_runs += 1;
-                    if matches!(outcome, latte_agent_core::hooks::HookOutcome::Abort { .. }) {
-                        hook_aborts += 1;
-                    }
+                    // require_tool_call 需要原始 model raw out，无 tool_calls 时跳过。
                 }
             }
         }
+        // redact_pii hook：需要 PreCall 级别的 raw text 才能运行。
+        // native 下 ModelRawOut 不再有 <tool_call> 文本，但 PreCall
+        // hook 仍然可用；这里留空因为 run_replay 没有完整的 message 上下文。
     }
-    println!("=== replay: session {} (parser={}, hooks=[{}]) ===",
-        id, parser_variant, hooks.join(","));
-    println!("ModelRawOut events:  {}", re_parse_count);
-    println!("Re-parse match:      {} / {} ({}%)",
-        re_parse_match, re_parse_count,
-        pct(re_parse_match, re_parse_count));
-    println!("Hook runs:           {} (aborts: {})", hook_runs, hook_aborts);
+    println!("=== replay: session {} (native tool calls, hooks=[{}]) ===",
+        id, hooks.join(","));
+    println!("ParseToolCalls events: {}", tool_call_count);
+    println!("Hook runs:            {} (aborts: {})", hook_runs, hook_aborts);
     Ok(())
 }
 
@@ -394,9 +336,6 @@ fn run_replay(
 fn yes_no(b: bool) -> &'static str { if b { "yes" } else { "no" } }
 fn pct(num: usize, denom: usize) -> usize {
     if denom == 0 { 0 } else { (num * 100) / denom }
-}
-fn parsed_names(parsed: &[latte_agent_core::trace::ParsedCall]) -> Vec<String> {
-    parsed.iter().map(|c| c.name.clone()).collect()
 }
 /// Map a CLI hook name to a built-in hook instance. Returns `None`
 /// for unknown names so `debug replay` reports them but continues

@@ -54,7 +54,7 @@ temperature = 0.2  # low: routing decisions should be deterministic, not creativ
 #   bash    — execute shell commands
 #   search  — regex search across files
 #   list    — list agents, workflows, config
-tools = ["delegate", "workflow", "read", "search", "list"]  # manager may inspect code/graph and delegate specialists
+tools = ["delegate", "workflow", "read", "search", "list", "plan"]  # manager may inspect code/graph, delegate specialists, and propose tasks to the board
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "👔"

@@ -143,6 +143,14 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::ImageGenerated { role_id, path, .. } => {
                 self.on_status(&format!("{role_id} generated image: {path}")).await;
             }
+            // plan 工具提交的任务候选：CLI 仅提示数量，web UI 弹窗勾选导入。
+            ChatEvent::PlanProposed { role_id, plan_id, tasks } => {
+                self.on_status(&format!(
+                    "📋 {role_id} 提交 {} 个任务候选（{plan_id}），请在 UI 弹窗勾选导入任务看板",
+                    tasks.len()
+                ))
+                .await;
+            }
             // Soft-timeout warning: turn is still alive at this point — the
             // UI side turns it into a "continue / cancel" prompt. The CLI
             // just surfaces it as a status line so the operator can see
@@ -158,6 +166,10 @@ pub trait ChatRenderer: Send + Sync {
                     "[{role_id} soft-timeout: {elapsed_secs}s ≥ {soft_timeout_secs}s (hard kill at {hard_timeout_secs}s)]"
                 ))
                 .await;
+            }
+            ChatEvent::AdvisorTerminated { role_id, reason, detector, .. } => {
+                let det = detector.as_deref().unwrap_or("?");
+                self.on_status(&format!("🛑 advisor terminated [{role_id}, {det}]: {reason}")).await;
             }
         }
     }

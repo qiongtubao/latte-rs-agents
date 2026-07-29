@@ -405,8 +405,8 @@ mod tests {
     fn enforce_allowlist_aborts_on_unknown_tool() {
         let h = EnforceToolAllowlist::new(vec!["read".into(), "exec".into()]);
         let mut parsed = vec![
-            ParsedCall { name: "read".into(), args: "{}".into() },
-            ParsedCall { name: "rm_rf".into(), args: "{}".into() },
+            ParsedCall { id: "".into(), name: "read".into(), args: "{}".into() },
+            ParsedCall { id: "".into(), name: "rm_rf".into(), args: "{}".into() },
         ];
         let mut ctx = PostParseCtx { parsed: &mut parsed };
         let outcome = h.post_parse(&mut ctx);
@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn enforce_allowlist_continues_when_all_known() {
         let h = EnforceToolAllowlist::new(vec!["read".into(), "exec".into()]);
-        let mut parsed = vec![ParsedCall { name: "read".into(), args: "{}".into() }];
+        let mut parsed = vec![ParsedCall { id: "".into(), name: "read".into(), args: "{}".into() }];
         let mut ctx = PostParseCtx { parsed: &mut parsed };
         let outcome = h.post_parse(&mut ctx);
         assert!(matches!(outcome, HookOutcome::Continue), "got {:?}", outcome);

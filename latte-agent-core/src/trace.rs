@@ -542,6 +542,11 @@ impl ChatProgressSink for () {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParsedCall {
+    /// 工具调用 id（native function-calling 协议下由模型/供应商生成，
+    /// 用于把工具结果回传给对应的 assistant tool_call，形成闭环。
+    /// 文本协议遗留路径已删除，此字段始终来自 `completion.tool_calls[i].id`）。
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub args: String,
 }
@@ -1614,7 +1619,7 @@ mod tests {
             TraceEvent::ParseToolCalls {
                 meta: meta.clone(),
                 raw_in: "<tool_callexec> {\"command\": \"pwd\"}</tool_call>".into(),
-                parsed: vec![ParsedCall { name: "exec".into(), args: "{}".into() }],
+                parsed: vec![ParsedCall { id: "".into(), name: "exec".into(), args: "{}".into() }],
                 diagnostics: ParseDiag { opens_found: 1, closes_matched: 1, unmatched_opens: vec![] },
             },
             TraceEvent::ToolExec {
