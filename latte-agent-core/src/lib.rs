@@ -72,7 +72,7 @@ pub use role::{Role, RoleCategory, RoleTemplate};
 pub mod prelude {
     pub use crate::advisor_monitor::{
         AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine, AdvisorReviewMode, DetectorKind,
-        GateConfig, GateVerdict, Verdict, check_response_gates,
+        Verdict,
     };
     pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
     pub use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointTrigger, RollbackMode};

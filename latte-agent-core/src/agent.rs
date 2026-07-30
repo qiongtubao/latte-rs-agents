@@ -1629,7 +1629,6 @@ fn build_tool_schemas(
             description: Some(td.description.clone()),
             parameters: serde_json::to_value(&td.input_schema)
                 .unwrap_or(serde_json::json!({})),
-            strict: td.strict,
         })
         .collect()
 }
@@ -3017,9 +3016,5 @@ mod tests {
         assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
         // 扁平命名下不应有点号（shell.exec 之类的 namespace 不复存在）。
         assert!(!names.iter().any(|n| n.contains('.')), "不应有点号命名: {names:?}");
-        // strict 默认 None（不开 Structured Outputs）。
-        for t in &schemas {
-            assert!(t.strict.is_none(), "工具 {} 的 strict 应为 None，got {:?}", t.name, t.strict);
-        }
     }
 }
