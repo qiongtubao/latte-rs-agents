@@ -7,8 +7,8 @@
     <!-- 宿主皮肤（design doc §4）：CLI 模式为占位空文件，编辑器宿主
          构建时以深色皮肤覆盖。须在 styles.css 之后加载。 -->
     <link rel="stylesheet" href="skin.css" />
-    <script type="module" crossorigin src="./assets/index-DrGVLtih.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-D7gJ8zKM.css">
+    <script type="module" crossorigin src="./assets/index-C8PIw_z4.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-BTBrQTrs.css">
   </head>
   <body>
     <div id="app">
@@ -37,8 +37,10 @@
           <button id="role-editor-btn" type="button">⚙️ Roles</button>
           <button id="tools-btn" type="button" title="工具管理">🔧 Tools</button>
           <button id="models-btn" type="button" title="模型管理">📦 Models</button>
+          <button id="workflows-btn" type="button" title="Workflow 管理">🔀 Workflows</button>
           <button id="self-loop-btn" type="button" class="primary">AI Fix</button>
           <button id="log-btn" type="button" title="查看日志">📋 日志</button>
+          <button id="task-board-btn" type="button" title="任务看板">🗂 任务看板</button>
         </div>
       </header>
 
@@ -56,6 +58,7 @@
                 autocomplete="off"
                 rows="1"
               ></textarea>
+              <div id="cmd-autocomplete" class="role-autocomplete cmd-autocomplete" style="display:none"></div>
               <div id="role-autocomplete" class="role-autocomplete" style="display:none"></div>
               <button id="chat-send" type="submit" class="send-btn">发送</button>
 <button id="chat-abort" type="button" class="abort-btn" title="终止所有正在执行的 agent（含 idle 之前的卡住 turn）">⏹ 终止</button>
@@ -73,6 +76,8 @@
             <div class="menu-divider"></div>
             <button class="menu-item" data-action="view-subagent">🔍 查看 subagent 过程</button>
             <button class="menu-item" data-action="view-execution-log">📜 查看本次执行日志</button>
+            <div class="menu-divider"></div>
+            <button class="menu-item" data-action="add-to-board">📥 导入任务看板</button>
           </div>
 
           <!-- subagent 详情浮层 -->
@@ -166,19 +171,24 @@
         <div class="subsession-body" id="subsession-body">loading…</div>
       </aside>
 
-      <aside id="role-editor-panel" class="side-panel hidden">
+      <aside id="role-editor-panel" class="side-panel tools-page hidden">
         <header class="panel-header">
           <h2>角色编辑器</h2>
           <select id="role-editor-role-select"></select>
           <button id="role-editor-new" type="button" class="primary">新建</button>
           <button id="role-editor-delete" type="button" class="danger">删除</button>
           <button id="role-editor-refresh" type="button">↻</button>
-          <button id="role-editor-close" type="button" class="panel-close">×</button>
+          <button id="role-editor-close" type="button" class="panel-close" title="关闭">✕</button>
         </header>
         <div class="role-editor-body">
-        <div id="role-editor-paths" class="role-editor-paths"></div>
+          <!-- tab 切换：表单编辑 / 源文件编辑 -->
+          <div id="role-editor-tab-bar" class="role-editor-tab-bar">
+            <button type="button" class="role-editor-tab active" data-tab="form">表单编辑</button>
+            <button type="button" class="role-editor-tab" data-tab="toml">源文件编辑</button>
+          </div>
+          <div id="role-editor-paths" class="role-editor-paths"></div>
           <p class="hint">修改会写入 .latte/agents.d/&lt;id&gt;.toml 与对应 prompt 文件，对新 session 生效。右键聊天消息里的角色头像可直接跳到该角色。</p>
-          <form id="role-editor-form">
+          <form id="role-editor-form" class="role-editor-pane active">
             <label class="role-editor-field">
               名称
               <input id="role-editor-name" type="text" required />
@@ -193,8 +203,11 @@
             </label>
             <div class="role-editor-field">
               模型链（按优先级排列）
-              <div id="role-editor-chain" class="role-editor-chain"></div>
-              <span class="hint">上方模型不可用时按顺序尝试下方模型。</span>
+              <div style="display:flex;gap:0.4rem;align-items:start">
+                <div id="role-editor-chain" class="role-editor-chain" style="flex:1"></div>
+                <button id="role-editor-chain-browse" type="button" class="role-editor-browse-btn" title="浏览可用模型">📋 浏览模型</button>
+              </div>
+              <span class="hint">上方模型不可用时按顺序尝试下方模型。点击「浏览模型」查看已配置的模型。</span>
             </div>
             <label class="role-editor-field">
               temperature（留空 = 默认）
@@ -205,14 +218,31 @@
               <div id="role-editor-tools" class="role-editor-tools"></div>
             </div>
             <label class="role-editor-field">
+              代码/文档路径（每行一条，相对工作目录或绝对路径；文件内容直接载入系统提示 ≤8KB，目录注入结构清单）
+              <textarea id="role-editor-code-paths" rows="4" spellcheck="false" placeholder="vendor/rtk/&#10;docs/"></textarea>
+            </label>
+            <label class="role-editor-field">
               System Prompt
               <textarea id="role-editor-prompt" rows="16" spellcheck="false"></textarea>
             </label>
             <div class="role-editor-actions">
               <button id="role-editor-save" type="submit" class="primary">保存</button>
+              <button id="role-editor-test-role" type="button" class="role-editor-test-btn">测试角色</button>
               <span id="role-editor-status" class="role-editor-status"></span>
             </div>
           </form>
+          <!-- TOML 源文件编辑 pane -->
+          <div id="role-editor-toml-pane" class="role-editor-pane">
+            <div class="role-editor-field">
+              源文件（.toml）
+              <textarea id="role-editor-toml-editor" rows="24" spellcheck="false" class="role-editor-toml-editor"></textarea>
+            </div>
+            <div class="role-editor-actions">
+              <button id="role-editor-toml-save" type="button" class="primary">保存 TOML</button>
+              <button id="role-editor-toml-reload" type="button">重新加载</button>
+              <span id="role-editor-toml-status" class="role-editor-status"></span>
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -229,8 +259,19 @@
         <div class="tools-page-status" id="tools-status"></div>
       </aside>
 
+      <!-- 工具详情弹层 -->
+      <div id="tool-detail-overlay" class="modal-overlay hidden">
+        <div class="modal">
+          <header class="modal-header">
+            <h2 id="tool-detail-title">工具详情</h2>
+            <button id="tool-detail-close" type="button" class="modal-close-btn">×</button>
+          </header>
+          <div class="modal-body" id="tool-detail-body"></div>
+        </div>
+      </div>
+
       <!-- 模型管理面板 -->
-      <aside id="models-panel" class="side-panel hidden">
+      <aside id="models-panel" class="side-panel tools-page hidden">
         <header class="panel-header">
           <h2>模型管理</h2>
           <button id="models-new" type="button" class="primary">+ 新建</button>
@@ -242,9 +283,89 @@
           <label for="model-select" class="models-select-label">选择模型：</label>
           <select id="model-select" class="models-select"><option value="">（加载中…）</option></select>
         </div>
+        <!-- tab 切换：表单编辑 / 源文件编辑 -->
+        <div id="models-tab-bar" class="role-editor-tab-bar">
+          <button type="button" class="role-editor-tab active" data-tab="form">表单编辑</button>
+          <button type="button" class="role-editor-tab" data-tab="toml">源文件编辑</button>
+        </div>
         <div class="models-body" id="models-body">loading…</div>
+        <!-- TOML 源文件编辑 pane -->
+        <div id="models-toml-pane" class="models-toml-pane hidden">
+          <div class="role-editor-field">
+            源文件（.toml）
+            <textarea id="models-toml-editor" rows="20" spellcheck="false" class="role-editor-toml-editor"></textarea>
+          </div>
+          <div class="role-editor-actions">
+            <button id="models-toml-save" type="button" class="primary">保存 TOML</button>
+            <button id="models-toml-reload" type="button">重新加载</button>
+            <span id="models-toml-status" class="role-editor-status"></span>
+          </div>
+        </div>
         <div class="models-status" id="models-status"></div>
       </aside>
+
+      <!-- Workflow 管理面板（详见 ui/src/workflows_panel.ts） -->
+      <aside id="workflows-panel" class="side-panel tools-page hidden">
+        <header class="panel-header">
+          <h2>🔀 Workflows</h2>
+          <button id="workflows-new-btn" type="button" class="primary">＋ 新建</button>
+          <button id="workflows-refresh-btn" type="button" title="刷新">↻</button>
+          <button id="workflows-close-btn" type="button" class="panel-close">×</button>
+        </header>
+        <div class="models-paths" id="workflows-paths"></div>
+        <div class="models-select-row">
+          <label for="workflows-select" class="models-select-label">选择 workflow：</label>
+          <select id="workflows-select" class="models-select"><option value="">（加载中…）</option></select>
+        </div>
+        <!-- tab 切换：表单编辑 / 源文件编辑 -->
+        <div id="workflows-tab-bar" class="role-editor-tab-bar">
+          <button type="button" class="role-editor-tab active" data-tab="form">表单编辑</button>
+          <button type="button" class="role-editor-tab" data-tab="toml">源文件编辑</button>
+        </div>
+        <div class="models-body" id="workflows-body">loading…</div>
+        <!-- TOML 源文件编辑 pane -->
+        <div id="workflows-toml-pane" class="models-toml-pane hidden">
+          <div class="role-editor-field">
+            源文件（.toml）
+            <textarea id="workflows-toml-editor" rows="20" spellcheck="false" class="role-editor-toml-editor"></textarea>
+          </div>
+          <div class="role-editor-actions">
+            <button id="workflows-toml-save" type="button" class="primary">保存 TOML</button>
+            <button id="workflows-toml-reload" type="button">重新加载</button>
+            <span id="workflows-toml-status" class="role-editor-status"></span>
+          </div>
+        </div>
+        <div class="models-status" id="workflows-status"></div>
+      </aside>
+      <!-- Workflow 试运行弹层（详见 ui/src/workflows_panel.ts） -->
+      <div id="workflow-run-modal" class="modal-overlay hidden">
+        <div class="modal workflow-run-modal">
+          <header class="modal-header">
+            <h2>Workflow 试运行</h2>
+            <button id="workflow-run-close" type="button" class="modal-close-btn">×</button>
+          </header>
+          <div class="modal-body">
+            <div class="workflow-run-form">
+              <label class="workflow-run-field">
+                主题（topic，替换 prompt 里的 {{topic}}）
+                <textarea id="workflow-run-topic" class="workflow-run-textarea" rows="3"
+                  placeholder="例如：为登录页补一组单元测试"></textarea>
+              </label>
+              <label class="workflow-run-field">
+                变量（vars，每行一个 key=value，空行忽略）
+                <textarea id="workflow-run-vars" class="workflow-run-textarea" rows="3"
+                  placeholder="lang=zh"></textarea>
+              </label>
+              <div class="workflow-run-actions">
+                <button id="workflow-run-start" type="button" class="primary">▶ 运行</button>
+                <button id="workflow-run-stop" type="button" class="danger">⏹ 停止</button>
+                <span id="workflow-run-status" class="workflow-run-status"></span>
+              </div>
+            </div>
+            <div id="workflow-run-transcript" class="workflow-run-transcript"></div>
+          </div>
+        </div>
+      </div>
       <!-- 日志查看器面板 -->
       <aside id="log-panel" class="side-panel hidden">
         <header class="panel-header">
@@ -262,6 +383,22 @@
             <div id="log-content" class="log-content"></div>
           </div>
         </div>
+      </aside>
+
+      <!-- 任务看板面板（全屏覆盖层，详见 ui/src/task_board.ts） -->
+      <aside id="task-board-panel" class="tb-panel hidden">
+        <div class="tb-topbar">
+          <h1>任务看板</h1>
+          <span class="tb-sub">项目管理 · 任务状态机</span>
+          <div class="tb-spacer"></div>
+          <div class="tb-stat-chip"><span class="tb-dot" style="background:#3b82f6"></span>执行中 <b id="tb-stat-running">0</b></div>
+          <div class="tb-stat-chip"><span class="tb-dot" style="background:#8b5cf6"></span>已排期 <b id="tb-stat-scheduled">0</b></div>
+          <div class="tb-stat-chip"><span class="tb-dot" style="background:#f59e0b"></span>待评审 <b id="tb-stat-review">0</b></div>
+          <button id="task-board-new" type="button" class="tb-btn tb-btn-primary">＋ 新建任务</button>
+          <button id="task-board-close" type="button" class="panel-close" title="关闭">×</button>
+        </div>
+        <div id="task-board-status" class="tb-status"></div>
+        <div class="tb-board" id="tb-board">加载中…</div>
       </aside>
 
       <!-- 模型测试弹层（详见 ui/src/test_panel.ts） -->
