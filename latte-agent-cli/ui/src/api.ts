@@ -169,7 +169,7 @@ export type ChatEvent =
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
-  | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number }
+  | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number; role_id: string; task: string }
   | { type: "WorkflowTurn"; wf_id: string; step_id: string; role_id: string; content: string; round: number }
   | { type: "WorkflowFinished"; name: string; wf_id: string; status: string; summary: string }
   // Turn soft-timeout warning. The driver emits this when a turn

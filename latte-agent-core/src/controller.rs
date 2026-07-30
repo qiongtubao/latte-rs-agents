@@ -267,12 +267,17 @@ pub enum ChatEvent {
         wf_id: String,
     },
     /// A workflow step is about to run (`index`/`total` are 1-based).
+    /// `role_id` 是该步骤的第一个 speaker（供前端显示 @role）。
     WorkflowStep {
         wf_id: String,
         step_id: String,
         description: String,
         index: usize,
         total: usize,
+        /// 该步骤的第一个 speaker（前端渲染为 @role）。
+        role_id: String,
+        /// 该步骤的任务描述（前端显示为 manager 的指派文本）。
+        task: String,
     },
     /// One speaker's completed turn inside a workflow step.
     WorkflowTurn {

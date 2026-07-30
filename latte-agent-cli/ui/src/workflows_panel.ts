@@ -69,7 +69,7 @@ export interface WorkflowsPanelController {
 /** SSE 事件（与后端 /api/workflows/run/events 推送的 JSON 一一对应）。 */
 type WorkflowRunEvent =
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
-  | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number }
+  | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number; role_id?: string; task?: string }
   | { type: "WorkflowTurn"; wf_id: string; step_id: string; role_id: string; content: string; round: number }
   | { type: "WorkflowFinished"; name: string; wf_id: string; status: string; summary: string };
 
