@@ -6,5 +6,5 @@ model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/tester_leader.md"
 temperature = 0.3
-tools = ["read", "list", "bash", "search", "playwright", "delegate"]
+tools = ["read", "bash", "search", "playwright", "delegate"]
 icon = "🧪"

@@ -2479,6 +2479,8 @@ async fn register_delegate_tool(
             //    the DelegateStarted message (@role task).
             match &run_result {
                 Ok(response) => {
+                    // 成功时 sub_sink 已由 runner 的 with_sink 写入全部事件，
+                    // 不再重复 emit RoleFinished —— 需要的话在 TurnEnd 里已有足够信息。
                     let _ = event_tx.send(ChatEvent::RoleTurn {
                         role_id: role_id.clone(),
                         content: response.clone(),
@@ -2491,13 +2493,20 @@ async fn register_delegate_tool(
                     });
                 }
                 Err(e) => {
+                    // 失败时 sub_sink 中的 trace 在 TurnEnd 前就断了（agent.chat?.await
+                    // 提前返回），导致右键「查看日志」看不到失败原因。
+                    // 这里写入 TurnEnd 作为 trace 终点事件，让子会话日志有明确结尾。
+                    sub_sink.emit(crate::trace::TraceEvent::TurnEnd {
+                        meta: crate::trace::TraceMeta::now(0, &role_id, &session_id),
+                        total_input: 0,
+                        total_output: 0,
+                        total_thinking: 0,
+                        elapsed_ms: 0,
+                    });
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("error: {}", e),
                     });
-                    // 让 UI 右键「查看日志」能定位到该 subagent 的完整
-                    // 工具调用记录 —— 没这条事件，delegate 失败时
-                    // 状态栏只剩 RoleFinished，UI 拿不到任何日志入口。
                     let _ = event_tx.send(ChatEvent::Error {
                         kind: Some(crate::trace::ModelErrorKind::Other {
                             message: format!("delegate {role_id} failed: {e}"),

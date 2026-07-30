@@ -5,5 +5,5 @@ category = "verification"
 model_tier = "standard"
 prompt_file = "prompts/security.md"
 temperature = 0.4
-tools = ["read", "list", "search"]
+tools = ["read", "search"]
 icon = "🛡️"

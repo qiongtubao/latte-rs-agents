@@ -1094,19 +1094,36 @@ fn latte_home() -> PathBuf {
 /// `GET /api/subsessions?id=<sub_id>` — 取 delegate 子会话的完整
 /// transcript（主聊天只见 summary）。不存在时返回空数组。
 ///
+/// 可选参数 `limit=N`（默认 0 = 全部）。`limit>0` 时走尾部有限读取
+/// `read_persisted_last_n`，只返回最近 N 个事件，避免 2.7GB 级超大
+/// subsession 文件炸内存 / 超时。
+///
 /// 读路径：先内存（活读，1h 内）→ 内存 miss 再回查磁盘
-///（`subsession_store.read_persisted`）。磁盘回查解决"UI server
-/// 重启 / 内存 1h GC 后还想看历史 subagent 过程"的排查场景。
-pub fn get_subsession(b: &UiBackend, id: &str) -> Vec<serde_json::Value> {
-    let events = b
-        .subsession_store
-        .snapshot_any(id)
-        .or_else(|| b.subsession_store.read_persisted(id));
-    match events {
-        Some(events) => events
-            .into_iter()
-            .filter_map(|e| serde_json::to_value(e).ok())
-            .collect(),
+///（`subsession_store.read_persisted`）。
+pub fn get_subsession(b: &UiBackend, id: &str, limit: usize) -> Vec<serde_json::Value> {
+    let result = b.subsession_store.snapshot_any(id).map(|evs| (evs, false)).or_else(|| {
+        if limit > 0 {
+            b.subsession_store
+                .read_persisted_last_n(id, limit, 5 * 1024 * 1024)
+        } else {
+            b.subsession_store.read_persisted(id).map(|evs| (evs, false))
+        }
+    });
+    match result {
+        Some((events, truncated)) => {
+            let mut v: Vec<serde_json::Value> = events
+                .into_iter()
+                .filter_map(|e| serde_json::to_value(e).ok())
+                .collect();
+            if truncated {
+                v.push(serde_json::json!({
+                    "__truncated__": true,
+                    "limit": limit,
+                    "note": format!("事件超过显示上限（{}），仅显示最后 {limit} 条。传 limit=0 获取全部。", limit)
+                }));
+            }
+            v
+        }
         None => vec![],
     }
 }

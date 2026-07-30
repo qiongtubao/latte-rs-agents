@@ -19,6 +19,9 @@
 //! 文件名 `<sub_id>.jsonl`：`sub_id` 已含 `role-micros`，UI server
 //! 单进程内唯一；跨进程撞名概率极低（约同微秒内同角色名），后果是
 //! 后写覆盖前写（接受——这是排查辅助，不是审计）。
+use std::fs::File;
+use std::io::{Read, SeekFrom};
+use std::io::Seek as _;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -204,7 +207,7 @@ impl SubsessionStore {
     ) -> (SubId, Arc<dyn TraceSink>) {
         self.sweep();
         let key_prefix = format!("{role_name}-");
-        let mut g = self.inner.lock();
+        let g = self.inner.lock();
         for ((sid, sub_id), entry) in g.iter().rev() {
             if sid == session_id && sub_id.starts_with(&key_prefix) {
                 let mut sinks: Vec<Arc<dyn TraceSink>> =
@@ -255,6 +258,111 @@ impl SubsessionStore {
         parse_persisted_file(&raw)
     }
 
+    /// 磁盘回查的尾部有限读取：只从文件末尾向前读最多 `n` 行事件
+    /// （环形缓冲），跳过过大（>= `max_line_size` 字节）的单行。
+    /// 用于 UI 端的分页/部分显示，避免一个 2.7GB 的 jsonl 文件
+    /// 一次性读爆内存。
+    ///
+    /// 返回顺排的事件（按 emit 顺序，不是反向），外加 `truncated`
+    /// 标记。
+    pub fn read_persisted_last_n(
+        &self,
+        sub_id: &str,
+        n: usize,
+        max_line_size: u64,
+    ) -> Option<(Vec<TraceEvent>, bool)> {
+        let persistence = self.persistence.as_ref()?;
+        let sid = persistence
+            .sub_to_session
+            .read()
+            .get(sub_id)
+            .cloned()?;
+        let path = persistence.base_dir.join(&sid).join(format!("{sub_id}.jsonl"));
+        let file = File::open(&path).ok()?;
+        let file_size = file.metadata().ok()?.len();
+        if file_size == 0 {
+            return None;
+        }
+
+        // 从尾部反向读取，收集最近的 N 个事件行。
+        let max_line = max_line_size.max(1024 * 1024); // 至少 1MB
+        let mut ring: Vec<TraceEvent> = Vec::with_capacity(n.min(1024));
+        let mut truncated = false;
+
+        let chunk_size: u64 = 64 * 1024; // 每次向前读 64KB
+        let mut pos = file_size;
+        let mut leftover = Vec::new();
+
+        while pos > 0 && ring.len() < n {
+            let read_start = pos.saturating_sub(chunk_size);
+            let read_len = pos - read_start;
+            let mut chunk = vec![0u8; read_len as usize];
+            if let Ok(mut f) = file.try_clone() {
+                if f.seek(SeekFrom::Start(read_start)).is_ok() {
+                    if f.read_exact(&mut chunk).is_err() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+
+            // 加上上次的 leftover 合并处理
+            let mut combined = chunk.to_vec();
+            if !leftover.is_empty() {
+                combined.extend_from_slice(&leftover);
+            }
+
+            // 从后往前拆行
+            let mut lines: Vec<&[u8]> = combined
+                .split(|&b| b == b'\n')
+                .collect();
+
+            // 第一个片段可能不完整（跨 chunk），留到下次
+            if read_start > 0 && !combined.is_empty() && combined.last() != Some(&b'\n') {
+                let first = lines.remove(0);
+                leftover = first.to_vec();
+            } else {
+                leftover.clear();
+            }
+
+            // 从后向前解析每一行
+            for line_bytes in lines.iter().rev() {
+                if line_bytes.is_empty() {
+                    continue;
+                }
+                // 跳过 meta 行
+                if line_bytes.starts_with(br#"{"type":"__meta__""#) {
+                    continue;
+                }
+                // 跳过超大的行
+                if line_bytes.len() > max_line as usize {
+                    truncated = true;
+                    continue;
+                }
+                if ring.len() >= n {
+                    break;
+                }
+                if let Ok(line_str) = std::str::from_utf8(line_bytes) {
+                    if let Ok(ev) = serde_json::from_str::<TraceEvent>(line_str) {
+                        // 插入 ring 前端保持 emit 顺序
+                        ring.insert(0, ev);
+                    }
+                }
+            }
+
+            pos = read_start;
+        }
+
+        if ring.is_empty() {
+            None
+        } else {
+            Some((ring, truncated))
+        }
+    }
+
     /// 删主 session 时联调：移除 `<base>/<sid>/` 整个目录 + 内存
     /// 里属于该 sid 的所有 entries + 索引。
     ///
@@ -273,39 +381,33 @@ impl SubsessionStore {
         let removed_sub_ids: Vec<SubId> = match self.persistence.as_ref() {
             Some(p) => {
                 let mut idx = p.sub_to_session.write();
-                let mut to_remove = Vec::new();
-                for (k, v) in idx.iter() {
-                    if v == session_id {
-                        to_remove.push(k.clone());
-                    }
-                }
-                for k in &to_remove {
-                    idx.remove(k);
+                let to_remove: Vec<SubId> = idx
+                    .iter()
+                    .filter(|(_, sid)| sid.as_str() == session_id)
+                    .map(|(sub_id, _)| sub_id.clone())
+                    .collect();
+                for sub_id in &to_remove {
+                    idx.remove(sub_id);
                 }
                 to_remove
             }
-            None => Vec::new(),
+            None => vec![],
         };
 
-        // 3) 磁盘：rm 整个子目录。rm 之后即便 sub_id 文件句柄还开着
-        //    也无影响（unlink 立即生效，下次 fd close 释放 inode）。
-        let Some(persistence) = self.persistence.as_ref() else {
-            return 0;
-        };
-        let session_dir = persistence.base_dir.join(session_id);
-        let count = removed_sub_ids.len();
-        match std::fs::remove_dir_all(&session_dir) {
-            Ok(()) => count,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(e) => {
-                eprintln!(
-                    "[subsession] delete_for_session({}): rm {}: {e}",
-                    session_id,
-                    session_dir.display()
-                );
-                0
+        // 3) 磁盘：移除 `<base>/<sid>/` 整个目录。
+        let removed_disk = match self.persistence.as_ref() {
+            Some(p) => {
+                let dir = p.base_dir.join(session_id);
+                let count = std::fs::read_dir(&dir)
+                    .map(|entries| entries.flatten().count())
+                    .unwrap_or(0);
+                let _ = std::fs::remove_dir_all(&dir);
+                count
             }
-        }
+            None => 0,
+        };
+
+        removed_sub_ids.len().max(removed_disk)
     }
 
     /// Lazy sweep: drop in-memory entries older than `MAX_AGE`. Called

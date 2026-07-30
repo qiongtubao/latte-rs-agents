@@ -53,7 +53,7 @@ temperature = 0.1
 # The sanity reviewer must never modify the project; it only reads.
 # This is the cheapest possible tool surface and reinforces the
 # "this role is read-only by design" guarantee for downstream consumers.
-tools = ["read", "list"]
+tools = ["read"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🔍"

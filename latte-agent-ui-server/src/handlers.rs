@@ -289,7 +289,11 @@ pub(crate) async fn get_subsession(
     let id = params
         .get("id")
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing id".into()))?;
-    Ok(Json(api::get_subsession(&state.backend, id)))
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100); // 默认只返回最近 100 条事件
+    Ok(Json(api::get_subsession(&state.backend, id, limit)))
 }
 
 // ─── Self-Loop（start/stop 是薄壳；events 是 SSE） ────────────────

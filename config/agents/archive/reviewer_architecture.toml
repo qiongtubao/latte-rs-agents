@@ -49,7 +49,7 @@ temperature = 0.2
 # questions need cross-file regex (e.g. "find every `use` of
 # module A in module B"). Still no writes — this role is a
 # reviewer, not an editor.
-tools = ["read", "list", "search"]
+tools = ["read", "search"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🏗️"

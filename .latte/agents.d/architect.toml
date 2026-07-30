@@ -5,6 +5,6 @@ category = "planning"
 model_tier = "premium"
 prompt_file = "prompts/architect.md"
 temperature = 0.5
-tools = ["list", "read", "search"]
+tools = ["read", "search"]
 icon = "🏗️"
 model_chain = ["glm-5.2", "MiniMax-M3", "deepseek-v4-flash"]

@@ -7,4 +7,4 @@ prompt_file = "prompts/advisor.md"
 temperature = 0.4
 model_chain = ["glm-5.2", "MiniMax-M3"]
 icon = "🦉"
-tools = ["list", "read", "search"]
+tools = ["read", "search"]

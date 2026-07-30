@@ -116,10 +116,37 @@ async function main(): Promise<void> {
           body.textContent = "(没有捕获到事件 — 该委托可能在启动专家前就失败了)";
           return;
         }
+        let truncated = false;
         for (const ev of events) {
-          body.appendChild(renderSubsessionEvent(ev as Record<string, unknown>));
+          const raw = ev as Record<string, unknown>;
+          // __truncated__ 是 API 返回的截断标记，不是 TraceEvent
+          if (raw.__truncated__) {
+            truncated = true;
+            // 渲染一条提示行 + 加载更多按钮
+            const note = document.createElement("div");
+            note.className = "subsession-truncated";
+            note.textContent = String(raw.note ?? "(事件过多，仅显示最近部分)");
+            body.appendChild(note);
+            const loadMore = document.createElement("button");
+            loadMore.className = "subsession-load-more";
+            loadMore.textContent = "加载全部";
+            loadMore.addEventListener("click", async () => {
+              body.innerHTML = "loading…";
+              try {
+                const all = await fetchSubsession(subId, 0);
+                body.innerHTML = "";
+                for (const aev of all) {
+                  if (!(aev as Record<string, unknown>).__truncated__) {
+                    body.appendChild(renderSubsessionEvent(aev as Record<string, unknown>));
+                  }
+                }
+              } catch (e2) { body.textContent = `error: ${String(e2)}`; }
+            });
+            body.appendChild(loadMore);
+          } else {
+            body.appendChild(renderSubsessionEvent(raw));
+          }
         }
-      } catch (e) { body.textContent = `error: ${String(e)}`; }
     },
     onShowSessionLog: async () => {
       // 主 turn status 行右键 → 把整个 session 的 ChatEvent 历史

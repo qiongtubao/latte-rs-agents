@@ -2475,7 +2475,7 @@ mod tests {
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
         // A different call resets the streak.
-        assert!(matches!(d.record("list", "{\"path\":\".\"}"), LoopDecision::Continue));
+        assert!(matches!(d.record("search", "{\"path\":\".\"}"), LoopDecision::Continue));
         // Now two `read` calls in a row — the counter starts at 1,
         // then 2; still below the threshold.
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));

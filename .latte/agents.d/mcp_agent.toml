@@ -28,7 +28,7 @@ prompt_file = "prompts/mcp_agent.md"
 temperature = 0.3
 
 # Allowed tools: MCP tools + basic utilities
-tools = ["mcp", "bash", "read", "list"]
+tools = ["mcp", "bash", "read"]
 
 # Display emoji
 icon = "🔌"

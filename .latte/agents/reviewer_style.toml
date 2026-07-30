@@ -6,5 +6,5 @@ model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/reviewer_style.md"
 temperature = 0.3
-tools = ["read", "list", "search", "delegate"]
+tools = ["read", "search", "delegate"]
 icon = "🎯"

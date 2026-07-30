@@ -6,5 +6,5 @@ model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/security_compliance.md"
 temperature = 0.4
-tools = ["read","list","search","delegate"]
+tools = ["read", "search", "delegate"]
 icon = "📋"

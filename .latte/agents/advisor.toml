@@ -7,4 +7,4 @@ prompt_file = "prompts/advisor.md"
 temperature = 0.4
 model_chain = []
 icon = "🦉"
-tools = ["read", "list", "search"]
+tools = ["read", "search"]

@@ -455,9 +455,12 @@ export async function startSelfLoop(task: string, max_iterations: number): Promi
   await getTransport().request("POST", "/api/self-loop/start", { task, max_iterations });
 }
 
-/** Fetch the subsession event log for a delegate call. */
-export async function fetchSubsession(subId: string): Promise<unknown[]> {
-  return getTransport().request("GET", `/api/subsessions?id=${encodeURIComponent(subId)}`);
+/** Fetch the subsession event log for a delegate call.
+ *  @param limit 最多返回 N 条事件（默认 100）；0 表示全部（慎用，可能超大）。
+ */
+export async function fetchSubsession(subId: string, limit = 100): Promise<unknown[]> {
+  const q = `?id=${encodeURIComponent(subId)}&limit=${limit}`;
+  return getTransport().request("GET", `/api/subsessions${q}`);
 }
 
 

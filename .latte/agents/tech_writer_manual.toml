@@ -6,5 +6,5 @@ model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/tech_writer_manual.md"
 temperature = 0.5
-tools = ["read","write","list","delegate"]
+tools = ["read", "write", "delegate"]
 icon = "📖"

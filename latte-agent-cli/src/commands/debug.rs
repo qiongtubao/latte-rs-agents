@@ -307,7 +307,7 @@ fn run_replay(
             for h in &resolved_hooks {
                 if h.name() == "enforce_tool_allowlist" {
                     let chain = HookChain::empty()
-                        .push(Arc::new(EnforceToolAllowlist::from(vec!["read", "list", "search", "bash", "write", "delegate"])));
+                        .push(Arc::new(EnforceToolAllowlist::from(vec!["read", "search", "bash", "write", "delegate"])));
                     let mut p = parsed.clone();
                     let mut ctx = latte_agent_core::hooks::PostParseCtx { parsed: &mut p };
                     let outcome = chain.run_post_parse(&mut ctx, |_, _, _| {});
@@ -347,7 +347,7 @@ pub fn resolve_hook_name(name: &str) -> Option<Arc<dyn latte_agent_core::hooks::
     match name.trim() {
         "redact_pii" => Some(Arc::new(RedactPii)),
         "enforce_tool_allowlist" => Some(Arc::new(EnforceToolAllowlist::from(
-            vec!["read", "list", "search", "exec", "write", "delegate"],
+            vec!["read", "search", "exec", "write", "delegate"],
         ))),
         "require_tool_call" => Some(Arc::new(RequireToolCall::default())),
         other if other.starts_with("no:") => None, // explicit disable, no-op
