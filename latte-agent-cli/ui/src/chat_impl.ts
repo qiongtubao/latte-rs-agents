@@ -607,7 +607,7 @@ export function mountChat(opts: {
       const items = cmdBox.querySelectorAll(".cmd-autocomplete-item");
       if (e.key === "ArrowDown") { e.preventDefault(); cmdIdx = Math.min(cmdIdx+1, items.length-1); items.forEach((el,i)=>el.classList.toggle("active",i===cmdIdx)); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); cmdIdx = Math.max(cmdIdx-1, 0); items.forEach((el,i)=>el.classList.toggle("active",i===cmdIdx)); return; }
-      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); const el=items[cmdIdx] as HTMLElement | undefined; if(el&&el.dataset){const ta=container.inputEl;const val=ta.value;const cursor=ta.selectionStart;const before=val.substring(0,cursor);const rest=val.substring(cursor);const m=before.match(/(^|\s)(\/[a-z]*)$/);if(m){const prefix=m[1];ta.value=prefix+el.dataset.cmd+" "+rest;const pos=prefix.length+el.dataset.cmd.length+1;ta.setSelectionRange(pos,pos);}cmdBox.style.display="none";ta.focus();} return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); const el=items[cmdIdx] as HTMLElement | undefined; if(el&&el.dataset){const ta=container.inputEl;const val=ta.value;const cursor=ta.selectionStart;const before=val.substring(0,cursor);const rest=val.substring(cursor);const m=before.match(/(^|\s)(\/[a-z]*)$/);if(m){const prefix=m[1];const cmd=(el.dataset as Record<string,string>).cmd||"";ta.value=prefix+cmd+" "+rest;const pos=prefix.length+cmd.length+1;ta.setSelectionRange(pos,pos);}cmdBox.style.display="none";ta.focus();} return; }
       if (e.key === "Escape") { cmdBox.style.display="none"; e.stopPropagation(); return; }
     }
     if (acBox.style.display !== "none") {
@@ -621,7 +621,7 @@ export function mountChat(opts: {
   });
   cmdBox.addEventListener("click", function(e) {
     const item = (e.target as HTMLElement).closest(".cmd-autocomplete-item") as HTMLElement | null;
-    if (item && item.dataset) { const ta=container.inputEl;const val=ta.value;const cursor=ta.selectionStart;const before=val.substring(0,cursor);const rest=val.substring(cursor);const m=before.match(/(^|\s)(\/[a-z]*)$/);if(m){const prefix=m[1];ta.value=prefix+item.dataset.cmd+" "+rest;const pos=prefix.length+item.dataset.cmd.length+1;ta.setSelectionRange(pos,pos);}cmdBox.style.display="none";ta.focus(); }
+    if (item && item.dataset) { const ta=container.inputEl;const val=ta.value;const cursor=ta.selectionStart;const before=val.substring(0,cursor);const rest=val.substring(cursor);const m=before.match(/(^|\s)(\/[a-z]*)$/);if(m){const prefix=m[1];const cmd=(item.dataset as Record<string,string>).cmd||"";ta.value=prefix+cmd+" "+rest;const pos=prefix.length+cmd.length+1;ta.setSelectionRange(pos,pos);}cmdBox.style.display="none";ta.focus(); }
   });
   acBox.addEventListener("click", function(e) {
     const item = (e.target as HTMLElement).closest(".role-autocomplete-item") as HTMLElement | null;

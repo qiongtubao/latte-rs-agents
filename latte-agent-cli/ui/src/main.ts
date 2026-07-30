@@ -147,6 +147,9 @@ async function main(): Promise<void> {
             body.appendChild(renderSubsessionEvent(raw));
           }
         }
+      } catch (e) {
+        body.textContent = `error: ${String(e)}`;
+      }
     },
     onShowSessionLog: async () => {
       // 主 turn status 行右键 → 把整个 session 的 ChatEvent 历史
