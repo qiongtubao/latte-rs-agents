@@ -632,6 +632,7 @@ fn validate_workflow_name(cwd: &Path, name: Option<&str>) -> Result<(), ApiError
 }
 
 /// 导入单个任务（含一层子任务）的校验 + 落库。返回新建 id（父先于子）。
+/// workflow 引用不存在时，静默降级为 null（不阻塞导入）。
 fn import_one(
     store: &mut TaskStore,
     cwd: &Path,
@@ -652,11 +653,14 @@ fn import_one(
     if item.subtasks.iter().any(|s| !s.subtasks.is_empty()) {
         return Err("subtasks nested deeper than one level".to_string());
     }
-    if let Some(wf) = &item.workflow {
-        if !crate::workflows::exists(cwd, wf) {
-            return Err(format!("unknown workflow '{wf}'"));
+    // workflow 引用不存在时静默降级为 null
+    let workflow = item.workflow.as_ref().and_then(|wf| {
+        if crate::workflows::exists(cwd, wf) {
+            Some(wf.clone())
+        } else {
+            None
         }
-    }
+    });
     let parent = store.create(
         &title,
         &item.description,
@@ -664,7 +668,7 @@ fn import_one(
         item.labels.clone(),
         None,
         None,
-        item.workflow.clone(),
+        workflow,
         "import",
     )?;
     created.push(parent.id.clone());
@@ -679,11 +683,14 @@ fn import_one(
                 return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
             }
         }
-        if let Some(wf) = &sub.workflow {
-            if !crate::workflows::exists(cwd, wf) {
-                return Err(format!("unknown workflow '{wf}'"));
+        // 子任务 workflow 引用不存在时同样降级
+        let sub_workflow = sub.workflow.as_ref().and_then(|wf| {
+            if crate::workflows::exists(cwd, wf) {
+                Some(wf.clone())
+            } else {
+                None
             }
-        }
+        });
         let child = store.create(
             &stitle,
             &sub.description,
@@ -691,7 +698,7 @@ fn import_one(
             sub.labels.clone(),
             Some(parent.id.clone()),
             None,
-            sub.workflow.clone(),
+            sub_workflow,
             "import",
         )?;
         created.push(child.id.clone());

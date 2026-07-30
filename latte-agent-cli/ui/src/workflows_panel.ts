@@ -344,7 +344,8 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
       const opt = document.createElement("option");
       opt.value = w.name;
       const badge = w.source === "project" ? "项目" : "全局";
-      opt.textContent = `${w.name}（${badge} · ${w.steps_count} 步）`;
+      const cmdTag = w.command ? ` [${w.command}]` : "";
+      opt.textContent = `${w.name}（${badge} · ${w.steps_count} 步${cmdTag}）`;
       container.selectEl.appendChild(opt);
     }
   }
@@ -392,6 +393,7 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
       "wf-max_rounds",
       current?.max_rounds != null ? String(current.max_rounds) : "",
     ));
+    form.appendChild(makeRow("command（斜杠命令，如 /plan）", "text", "wf-command", current?.command ?? "", "可选：触发该 workflow 的斜杠命令"));
 
     // 步骤编辑器
     const stepsWrap = document.createElement("div");
@@ -667,9 +669,11 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
     const roundsRaw = fieldValue(form, "wf-max_rounds");
     const roundsNum = roundsRaw === "" ? null : Number(roundsRaw);
     const stepsWrap = form.querySelector<HTMLElement>('[data-field="steps"]');
+    const cmdRaw = fieldValue(form, "wf-command");
     return {
       name,
       description: fieldValue(form, "wf-description"),
+      command: cmdRaw || null,
       max_rounds: roundsNum !== null && Number.isFinite(roundsNum) ? roundsNum : null,
       steps: stepsWrap ? collectSteps(stepsWrap) : [],
     };

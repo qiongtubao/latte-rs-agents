@@ -38,6 +38,9 @@ pub struct WorkflowSummary {
     pub steps_count: usize,
     pub source: WorkflowSource,
     pub file_path: String,
+    /// 触发该 workflow 的斜杠命令（如 `/plan`），无则为 null。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// UI 表单模型：统一成 `speakers` + `prompt` 形态。加载 `role`/`task`
@@ -62,6 +65,9 @@ pub struct WorkflowForm {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    /// 触发该 workflow 的斜杠命令（如 `/plan`）。
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub max_rounds: Option<usize>,
     #[serde(default)]
@@ -78,6 +84,9 @@ pub struct WorkflowDetail {
     pub source: WorkflowSource,
     pub file_path: String,
     pub raw_toml: String,
+    /// 触发该 workflow 的斜杠命令（如 `/plan`），无则为 null。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
 }
 
 /// `POST /api/workflows/validate` 的响应。
@@ -138,6 +147,7 @@ pub fn form_from_def(wf: &WorkflowDef) -> WorkflowForm {
         description: wf.description.clone(),
         max_rounds: wf.max_rounds,
         steps: wf.steps.iter().map(step_to_form).collect(),
+        command: wf.command.clone(),
     }
 }
 
@@ -145,6 +155,7 @@ pub fn form_from_def(wf: &WorkflowDef) -> WorkflowForm {
 pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
     WorkflowDef {
         name: form.name.clone(),
+        command: form.command.clone(),
         description: form.description.clone(),
         max_rounds: form.max_rounds,
         steps: form
@@ -188,24 +199,20 @@ pub fn list(cwd: &Path) -> Vec<WorkflowSummary> {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            if out.iter().any(|s| s.name == name) {
-                continue; // 项目副本遮蔽全局
-            }
-            let (description, steps_count) = std::fs::read_to_string(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|raw| {
-                    toml::from_str::<WorkflowDef>(&raw)
-                        .map(|wf| (wf.description, wf.steps.len()))
-                        .map_err(|e| e.to_string())
-                })
-                .map(|(d, n)| (d, n))
-                .unwrap_or_else(|e| (format!("(parse error: {e})"), 0));
+            let (description, steps_count, command) = match std::fs::read_to_string(&path) {
+                Ok(raw) => match toml::from_str::<WorkflowDef>(&raw) {
+                    Ok(wf) => (wf.description, wf.steps.len(), wf.command),
+                    Err(e) => (format!("(parse error: {e})"), 0, None),
+                },
+                Err(_) => (String::new(), 0, None),
+            };
             out.push(WorkflowSummary {
                 name,
                 description,
                 steps_count,
                 source,
                 file_path: path.display().to_string(),
+                command,
             });
         }
     }
@@ -233,6 +240,7 @@ pub fn get(cwd: &Path, name: &str) -> Result<WorkflowDetail, String> {
             source,
             file_path: path.display().to_string(),
             raw_toml: raw,
+            command: wf.command,
         });
     }
     Err(format!("workflow '{name}' not found"))
@@ -247,6 +255,10 @@ fn fill_doc(doc: &mut toml_edit::DocumentMut, form: &WorkflowForm) {
 
     doc["name"] = value(form.name.clone());
     doc["description"] = value(form.description.clone());
+    match &form.command {
+        Some(cmd) => { doc["command"] = value(cmd.clone()); }
+        None => { doc.remove("command"); }
+    }
     match form.max_rounds {
         Some(r) => {
             doc["max_rounds"] = value(r as i64);

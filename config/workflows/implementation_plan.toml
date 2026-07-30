@@ -3,6 +3,7 @@
 # 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
 
 name = "implementation_plan"
+command = "/plan"
 description = "实现规划：架构拆解 → 任务清单(JSON) → 终审"
 max_rounds = 1
 

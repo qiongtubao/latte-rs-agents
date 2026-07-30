@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
-use crate::controller::{build_tool_manager, ChatEvent};
+use crate::controller::{build_tool_manager, register_plan_tool, ChatEvent};
 use crate::model_resolver::ModelResolver;
 
 /// Names that the runner injects into `vars` itself (`topic` from the
@@ -37,11 +37,20 @@ pub const RESERVED_OUTPUT_KEYS: &[&str] = &["topic", "step_id", "speaker"];
 pub struct WorkflowDef {
     pub name: String,
     #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub max_rounds: Option<usize>,
     #[serde(default)]
     pub steps: Vec<WorkflowStepDef>,
+}
+
+impl WorkflowDef {
+    /// Check if the workflow has a command and it matches the given input.
+    pub fn matches_command(&self, cmd: &str) -> bool {
+        self.command.as_deref() == Some(cmd)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -220,6 +229,75 @@ pub fn list_workflows(project_cwd: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// List workflows that have a `command` field set, returning (command, name) pairs.
+pub fn list_workflow_commands(project_cwd: &Path) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for dir in workflows_dirs(project_cwd) {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if out.iter().any(|(_, n)| *n == name) {
+                continue;
+            }
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let wf: WorkflowDef = match toml::from_str(&raw) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            if let Some(cmd) = wf.command {
+                out.push((cmd, name));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Load a workflow by its command (e.g. "/plan").
+pub fn load_workflow_by_command(cmd: &str, project_cwd: &Path) -> Result<WorkflowDef, String> {
+    for dir in workflows_dirs(project_cwd) {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let wf: WorkflowDef = match toml::from_str(&raw) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            if wf.matches_command(cmd) {
+                wf.validate()?;
+                if wf.steps.is_empty() {
+                    return Err(format!("workflow '{}' (cmd {cmd}) has no steps", wf.name));
+                }
+                return Ok(wf);
+            }
+        }
+    }
+    Err(format!("no workflow found with command '{cmd}'"))
+}
+
 // ─── Reusable workflow runner ─────────────────────────────────────
 //
 // The engine behind the manager's `workflow` tool (see
@@ -309,6 +387,12 @@ pub async fn run_workflow(
             let rtm = build_tool_manager(&role.allowed_tools)
                 .await
                 .map_err(|e| format!("tools for '{role_id}': {e}"))?;
+            // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
+            // （与 controller::build_runner 对齐）
+            if role.allowed_tools.iter().any(|t| t == "plan") {
+                crate::controller::register_plan_tool(&rtm, ctx.event_tx.clone(), role_id.clone())
+                    .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
+            }
             AgentRunner::new_with_tools(agent, rtm, 0)
         };
         runners.insert(role_id.clone(), runner.with_role(role_id).with_cwd(ctx.cwd.clone()));
@@ -385,7 +469,7 @@ pub async fn run_workflow(
                         error_msg = format!("step '{}' speaker '{}': {e}", step.id, speaker);
                         break 'rounds;
                     }
-                }
+                    }
             }
             if let Some(key) = &step.output_key {
                 vars.insert(key.clone(), last_output.clone());

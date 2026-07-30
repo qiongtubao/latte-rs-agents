@@ -52,7 +52,24 @@ for f in "$SOURCE_DIR/.latte/"*.toml; do
 done
 echo "  ✅ Configs: 模型/讨论配置"
 
-# 4. 验证 TOML 文件
+# 4. 同步 workflow 模板
+mkdir -p "$TARGET_DIR/.latte/workflows.d"
+count=0
+for f in "$SOURCE_DIR/config/workflows/"*.toml; do
+    name="$(basename "$f")"
+    target="$TARGET_DIR/.latte/workflows.d/$name"
+    if [ ! -f "$target" ]; then
+        cp "$f" "$target"
+        count=$((count + 1))
+    fi
+done
+if [ "$count" -gt 0 ]; then
+    echo "  ✅ Workflows: $count 个新模板"
+else
+    echo "  ✅ Workflows: 已是最新"
+fi
+
+# 5. 验证 TOML 文件
 errors=0
 for f in "$TARGET_DIR/.latte/agents.d/"*.toml; do
     python3 -c "import tomllib; tomllib.load(open('$f','rb'))" 2>/dev/null || {
@@ -66,7 +83,7 @@ else
     echo "  ⚠️  $errors 个文件有问题"
 fi
 
-# 5. 统计
+# 6. 统计
 agent_count=$(ls "$TARGET_DIR/.latte/agents.d/"*.toml 2>/dev/null | wc -l)
 prompt_count=$(ls "$TARGET_DIR/.latte/prompts/"*.md 2>/dev/null | wc -l)
 echo ""

@@ -535,7 +535,18 @@ export function mountChat(opts: {
     // 独立的 disabled 跟踪（click handler finally 里设回 false）。
   });
 
-  // ── @role autocomplete ──
+  // ── /command autocomplete ──
+  const cmdBox: HTMLElement = document.getElementById("cmd-autocomplete")!;
+  const CMD_HINTS: Array<{ cmd: string; icon: string; desc: string }> = [
+    { cmd: "/plan", icon: "📋", desc: "运行实现规划 workflow" },
+    { cmd: "/clear", icon: "🗑️", desc: "清除对话历史" },
+    { cmd: "/quit", icon: "🚪", desc: "退出当前 session" },
+    { cmd: "/pause", icon: "⏸️", desc: "暂停当前 agent" },
+    { cmd: "/help", icon: "❓", desc: "显示帮助信息" },
+    { cmd: "/compact", icon: "📦", desc: "压缩历史（节省 tokens）" },
+  ];
+  let cmdIdx = -1;
+  // ── @role autocomplete data ──
   const acBox = document.getElementById("role-autocomplete")!;
   const ROLE_HINTS = [
     {id:"programmer",icon:"💻",desc:"读代码、分析实现"},
@@ -549,7 +560,56 @@ export function mountChat(opts: {
     {id:"pm",icon:"📋",desc:"需求分析"},
   ];
   let acIdx = -1;
+  // 统一 input handler：斜杠命令 / @角色 自动完成
+  container.inputEl.addEventListener("input", function() {
+    this.style.height = "auto";
+    this.style.height = Math.min(this.scrollHeight, 140) + "px";
+    const cursor = this.selectionStart;
+    const before = this.value.substring(0, cursor);
+    // /command 只匹配行首或空格后的 /xxx
+    const slashMatch = before.match(/(?:^|\s)(\/[a-z]*)$/i);
+    if (slashMatch) {
+      const partial = slashMatch[1].toLowerCase();
+      const entries = CMD_HINTS.filter(r => r.cmd.startsWith(partial));
+      if (entries.length > 0) {
+        cmdIdx = -1;
+        cmdBox.innerHTML = entries.map((r,i) =>
+          `<div class="cmd-autocomplete-item${i===0?' active':''}" data-cmd="${r.cmd}"><span class="ca-icon">${r.icon}</span><span class="ca-name">${r.cmd}</span><span class="ca-desc">${r.desc}</span></div>`
+        ).join("");
+        cmdBox.style.display = "block";
+        cmdIdx = 0;
+        acBox.style.display = "none";
+      } else {
+        cmdBox.style.display = "none";
+      }
+    } else {
+      cmdBox.style.display = "none";
+    }
+    // @role 自动完成
+    const roleMatch = before.match(/@([a-z_]*)$/i);
+    if (roleMatch && cmdBox.style.display === "none") {
+      const f = roleMatch[1].toLowerCase();
+      const entries = ROLE_HINTS.filter(r => r.id.startsWith(f));
+      if (entries.length > 0) {
+        acIdx = -1;
+        acBox.innerHTML = entries.map((r,i)=>`<div class="role-autocomplete-item${i===0?' active':''}" data-role="${r.id}"><span class="ra-icon">${r.icon}</span><span class="ra-name">@${r.id}</span><span class="ra-desc">${r.desc}</span></div>`).join("");
+        acBox.style.display = "block";
+        acIdx = 0;
+      } else {
+        acBox.style.display = "none";
+      }
+    } else {
+      if (cmdBox.style.display === "none") acBox.style.display = "none";
+    }
+  });
   container.inputEl.addEventListener("keydown", function(e) {
+    if (cmdBox.style.display !== "none") {
+      const items = cmdBox.querySelectorAll(".cmd-autocomplete-item");
+      if (e.key === "ArrowDown") { e.preventDefault(); cmdIdx = Math.min(cmdIdx+1, items.length-1); items.forEach((el,i)=>el.classList.toggle("active",i===cmdIdx)); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); cmdIdx = Math.max(cmdIdx-1, 0); items.forEach((el,i)=>el.classList.toggle("active",i===cmdIdx)); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); const el=items[cmdIdx] as HTMLElement | undefined; if(el&&el.dataset){const ta=container.inputEl;const val=ta.value;const cursor=ta.selectionStart;const before=val.substring(0,cursor);const rest=val.substring(cursor);const m=before.match(/(^|\s)(\/[a-z]*)$/);if(m){const prefix=m[1];ta.value=prefix+el.dataset.cmd+" "+rest;const pos=prefix.length+el.dataset.cmd.length+1;ta.setSelectionRange(pos,pos);}cmdBox.style.display="none";ta.focus();} return; }
+      if (e.key === "Escape") { cmdBox.style.display="none"; e.stopPropagation(); return; }
+    }
     if (acBox.style.display !== "none") {
       const items = acBox.querySelectorAll(".role-autocomplete-item");
       if (e.key === "ArrowDown") { e.preventDefault(); acIdx = Math.min(acIdx+1, items.length-1); items.forEach((el,i)=>el.classList.toggle("active",i===acIdx)); return; }
@@ -557,30 +617,23 @@ export function mountChat(opts: {
       if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); const el=items[acIdx] as HTMLElement | undefined; if(el&&el.dataset){const ta=container.inputEl,pos=ta.selectionStart,b=ta.value.substring(0,pos),a=ta.value.substring(pos),ai=b.lastIndexOf("@");if(ai>=0){ta.value=b.substring(0,ai)+"@"+el.dataset.role+" "+a;acBox.style.display="none";ta.focus();}} return; }
       if (e.key === "Escape") { acBox.style.display="none"; e.stopPropagation(); return; }
     }
-    if (e.key === "Enter" && !e.shiftKey && acBox.style.display === "none") { e.preventDefault(); container.sendBtn.click(); }
+    if (e.key === "Enter" && !e.shiftKey && cmdBox.style.display === "none" && acBox.style.display === "none") { e.preventDefault(); container.sendBtn.click(); }
   });
-  container.inputEl.addEventListener("input", function() {
-    this.style.height = "auto";
-    this.style.height = Math.min(this.scrollHeight, 140) + "px";
-    const p = this.selectionStart, b = this.value.substring(0, p), m = b.match(/@([a-z_]*)$/i);
-    if (!m) { acBox.style.display="none"; return; }
-    const f = m[1].toLowerCase();
-    const entries = ROLE_HINTS.filter(r => r.id.startsWith(f));
-    if (entries.length === 0) { acBox.style.display="none"; return; }
-    acIdx = -1;
-    acBox.innerHTML = entries.map((r,i)=>`<div class="role-autocomplete-item${i===0?' active':''}" data-role="${r.id}"><span class="ra-icon">${r.icon}</span><span class="ra-name">@${r.id}</span><span class="ra-desc">${r.desc}</span></div>`).join("");
-    acBox.style.display = "block";
-    acIdx = 0;
+  cmdBox.addEventListener("click", function(e) {
+    const item = (e.target as HTMLElement).closest(".cmd-autocomplete-item") as HTMLElement | null;
+    if (item && item.dataset) { const ta=container.inputEl;const val=ta.value;const cursor=ta.selectionStart;const before=val.substring(0,cursor);const rest=val.substring(cursor);const m=before.match(/(^|\s)(\/[a-z]*)$/);if(m){const prefix=m[1];ta.value=prefix+item.dataset.cmd+" "+rest;const pos=prefix.length+item.dataset.cmd.length+1;ta.setSelectionRange(pos,pos);}cmdBox.style.display="none";ta.focus(); }
   });
   acBox.addEventListener("click", function(e) {
     const item = (e.target as HTMLElement).closest(".role-autocomplete-item") as HTMLElement | null;
     if (item && item.dataset) { const ta=container.inputEl,pos=ta.selectionStart,b=ta.value.substring(0,pos),a=ta.value.substring(pos),ai=b.lastIndexOf("@");if(ai>=0){ta.value=b.substring(0,ai)+"@"+item.dataset.role+" "+a;acBox.style.display="none";ta.focus();} }
   });
-  // 点击输入框/下拉框以外区域时关闭角色选择下拉
+  // 点击输入框/下拉框以外区域时关闭所有下拉
   document.addEventListener("mousedown", (e) => {
-    if (acBox.style.display === "none") return;
     const target = e.target as Node;
-    if (!acBox.contains(target) && target !== container.inputEl) {
+    if (cmdBox.style.display !== "none" && !cmdBox.contains(target) && target !== container.inputEl) {
+      cmdBox.style.display = "none";
+    }
+    if (acBox.style.display !== "none" && !acBox.contains(target) && target !== container.inputEl) {
       acBox.style.display = "none";
     }
   });
@@ -1197,16 +1250,17 @@ export function mountChat(opts: {
       }
       case "WorkflowStep": {
         const desc = e.description?.trim() || e.step_id;
-        addMessage({ kind: "status", content: `▶️ 步骤 ${e.index}/${e.total} · ${desc}` });
+        addMessage({ kind: "status", content: `👔 → 步骤 ${e.index}/${e.total} · ${desc}` });
         resetWaitTimer();
         break;
       }
       case "WorkflowTurn": {
         const icon = roleIcon(e.role_id);
+        // 用 manager 委托样式显示：角色气泡内容前加 @role 前缀
         addMessage({
           kind: "role",
           content: e.content,
-          meta: e.role_id,
+          meta: `${e.role_id}（workflow）`,
           icon,
           filePath: getFilePath(e.role_id),
         });
@@ -1260,23 +1314,30 @@ export function mountChat(opts: {
         break;
       }
       case "PlanProposed": {
-        // plan 工具提交的任务候选：渲染消息（存 planTasks 供右键补救）+ 自动弹窗。
+        // plan 工具提交的任务候选：渲染消息 + 导入按钮。弹窗 debounce：
+        // 连续多个 plan 调用（如 LLM 先测试再提真实任务）只对最后一个弹窗
         const n = e.tasks.length;
         const msg = addMessage({
           kind: "system",
           content: `📋 ${e.role_id} 提交了 ${n} 个任务候选（${e.plan_id}），请在弹窗勾选导入任务看板`,
           planTasks: e.tasks,
         });
-        // 气泡内附「导入任务看板」按钮，作为弹窗之外的再次入口。
+        // 气泡内附「导入任务看板」按钮，作为弹窗入口。
         const btn = document.createElement("button");
         btn.className = "workflow-import-btn";
         btn.textContent = `📥 导入任务看板（${n} 个）`;
         btn.addEventListener("click", () => openPlanImportModal(e.tasks, e.plan_id));
         msg.querySelector(".msg-bubble")?.appendChild(btn);
-        // 主路径：立即弹窗。
-        openPlanImportModal(e.tasks, e.plan_id);
         setFooter(`${e.role_id} 提交 ${n} 个任务候选`);
         resetWaitTimer();
+        // 防抖弹窗：1.5 秒内无新 PlanProposed 才自动打开
+        if ((window as unknown as Record<string, unknown>).__planDebounceTimer) {
+          clearTimeout((window as unknown as Record<string, unknown>).__planDebounceTimer as number);
+        }
+        (window as unknown as Record<string, unknown>).__planDebounceTimer = setTimeout(() => {
+          openPlanImportModal(e.tasks, e.plan_id);
+          (window as unknown as Record<string, unknown>).__planDebounceTimer = undefined;
+        }, 1500);
         break;
       }
       case "TimeoutWarning": {

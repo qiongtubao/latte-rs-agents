@@ -1171,15 +1171,38 @@ async fn run_multi_role_loop(
                     });
                     continue 'rounds;
                 }
-                _ => {
+                cmd => {
                     let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                    let cmd = parts[0];
-                    let _ = event_tx.send(ChatEvent::Status {
-                        message: format!(
-                            "[unknown /{cmd} — known: pause resume quit roles rounds]"
-                        ),
-                    });
-                    continue 'rounds;
+                    let topic = parts.get(1).unwrap_or(&"").trim();
+                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone()).await {
+                        Ok(Some(summary)) => {
+                            let _ = event_tx.send(ChatEvent::Status {
+                                message: format!("Workflow '{cmd}' 完成。结果已交给 manager 处理。"),
+                            });
+                            let inject_dir = worktree_root.join(".latte").join("inject");
+                            let _ = std::fs::create_dir_all(&inject_dir);
+                            let inject_path = inject_dir.join("manager.txt");
+                            let mgr_text = format!(
+                                "Workflow '{cmd}' 已完成。用户请求：{topic}\n\n结果：\n{summary}\n\n请根据结果给出结论或下一步。"
+                            );
+                            let _ = std::fs::write(&inject_path, &mgr_text);
+                            continue 'rounds;
+                        }
+                        Ok(None) => {
+                            let _ = event_tx.send(ChatEvent::Status {
+                                message: format!(
+                                    "[unknown {cmd} — known: pause resume quit roles rounds, plus any workflow command]"
+                                ),
+                            });
+                            continue 'rounds;
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(ChatEvent::Status {
+                                message: format!("Workflow '{cmd}' 失败: {e}"),
+                            });
+                            continue 'rounds;
+                        }
+                    }
                 }
             }
         }
@@ -1615,20 +1638,34 @@ async fn run_single_role_loop(
                                         let _ = event_tx.send(ChatEvent::Status { message: format!("  {i} [{:?}] {preview}", m.role) });
                                     }
                                 }
-                                _ => {
-                                    let _ = event_tx.send(ChatEvent::Status { message: format!("[unknown /{cmd} — known: role model roles clear status tools history save load help exit quit]") });
+                                cmd => {
+                                    let topic = parts.get(1).unwrap_or(&"").trim();
+                                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone()).await {
+                                        Ok(Some(summary)) => {
+                                            let _ = event_tx.send(ChatEvent::Status {
+                                                message: format!("Workflow '{cmd}' 完成。\n{summary}"),
+                                            });
+                                        }
+                                        Ok(None) => {
+                                            let _ = event_tx.send(ChatEvent::Status {
+                                                message: format!(
+                                                    "[unknown {cmd} — known: role model roles clear status tools history save load help exit quit, plus any workflow command]"
+                                                ),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(ChatEvent::Status {
+                                                message: format!("Workflow '{cmd}' 失败: {e}"),
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             continue;
                         }
 
-                        // 走到这里的非斜杠输入才是真正的用户消息（斜杠
-                        // 命令已在上面的分支 continue）——先广播用户气泡
-                        // 事件，再跑 turn。回放/落盘靠它恢复用户输入。
-                        let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
-
-                        // Run the turn
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
+                        let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
                             role_id: current_role.clone(),
                             detail: "calling LLM".into(),
@@ -2139,7 +2176,7 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 /// LLM 的 turn 结束；弹窗是纯 UI 侧异步行为，用户何时导入都行。
 /// 若用户误关弹窗，可右键 PlanProposed 消息选「导入任务看板」补救
 /// （右键读消息上存的结构化 tasks，不靠文本解析）。
-fn register_plan_tool(
+pub(crate) fn register_plan_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
@@ -2678,6 +2715,35 @@ async fn register_workflow_tool(
 
     tm.register(tool, Some("manager"));
     Ok(())
+}
+
+/// Try to run a workflow by slash command (e.g. "/plan xxx").
+/// Returns `Ok(Some(summary))` if a workflow was found and ran,
+/// `Ok(None)` if no workflow matched the command (not an error),
+/// or `Err(msg)` if the workflow failed.
+async fn run_workflow_command(
+    cmd: &str,
+    topic: &str,
+    config: &ControllerConfig,
+    event_tx: &broadcast::Sender<ChatEvent>,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<Option<String>, String> {
+    let wf = match crate::workflow::load_workflow_by_command(cmd, &config.cwd) {
+        Ok(w) => w,
+        Err(_) => return Ok(None), // no workflow registered for this command
+    };
+
+    let ctx = crate::workflow::WorkflowRunContext {
+        merged: config.agent_config.clone(),
+        resolver: config.model_resolver.clone(),
+        default_params: config.default_params.clone(),
+        cwd: config.cwd.clone(),
+        event_tx: event_tx.clone(),
+        cancel_flag,
+    };
+
+    let summary = crate::workflow::run_workflow(&wf, topic, &ctx).await?;
+    Ok(Some(summary))
 }
 
 fn role_icon(role_id: &str) -> String {

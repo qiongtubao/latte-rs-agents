@@ -646,6 +646,7 @@ export interface WorkflowSummary {
   steps_count: number;
   source: "project" | "global";
   file_path: string;
+  command?: string | null;
 }
 
 export interface StepForm {
@@ -659,6 +660,7 @@ export interface StepForm {
 export interface WorkflowForm {
   name: string;
   description: string;
+  command?: string | null;
   max_rounds: number | null;
   steps: StepForm[];
 }
@@ -671,6 +673,7 @@ export interface WorkflowDetail {
   source: "project" | "global";
   file_path: string;
   raw_toml: string;
+  command?: string | null;
 }
 
 export interface ValidateResponse {
