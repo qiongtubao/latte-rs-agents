@@ -113,6 +113,8 @@ export function mountChat(opts: {
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
   /** wf_id → pending badge element on the WorkflowStarted bubble. */
   const workflowStates = new Map<string, HTMLElement>();
+  /** wf_id:step_id → pending badge element on WorkflowStep bubbles. */
+  const stepStates = new Map<string, HTMLElement>();
   /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
   const workflowTranscripts = new Map<string, string>();
   /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
@@ -1249,14 +1251,27 @@ export function mountChat(opts: {
         break;
       }
       case "WorkflowStep": {
-        const desc = e.description?.trim() || e.step_id;
-        addMessage({ kind: "status", content: `👔 → 步骤 ${e.index}/${e.total} · ${desc}` });
+        const icon = roleIcon("manager");
+        const taskText = e.task?.trim() || e.description?.trim() || e.step_id;
+        const delegateMsg = addMessage({
+          kind: "role",
+          content: `@${e.role_id} ${taskText}`,
+          meta: "manager",
+          icon,
+          filePath: getFilePath("manager"),
+        });
+        // Step pending state badge
+        const stateEl = document.createElement("span");
+        stateEl.className = "delegate-state pending";
+        stateEl.textContent = "⏳ 执行中…";
+        delegateMsg.querySelector(".msg-bubble")?.appendChild(stateEl);
+        // Track per-workflow step for completion update
+        stepStates.set(`${e.wf_id}:${e.step_id}`, stateEl);
         resetWaitTimer();
         break;
       }
       case "WorkflowTurn": {
         const icon = roleIcon(e.role_id);
-        // 用 manager 委托样式显示：角色气泡内容前加 @role 前缀
         addMessage({
           kind: "role",
           content: e.content,
@@ -1268,6 +1283,14 @@ export function mountChat(opts: {
           e.wf_id,
           (workflowTranscripts.get(e.wf_id) ?? "") + "\n" + e.content,
         );
+        // 标记该步骤为已完成（翻转 step badge）
+        const stepKey = `${e.wf_id}:${e.step_id}`;
+        const stepEl = stepStates.get(stepKey);
+        if (stepEl) {
+          stepEl.textContent = "✅ 完成";
+          stepEl.className = "delegate-state done";
+          stepStates.delete(stepKey);
+        }
         resetWaitTimer();
         break;
       }

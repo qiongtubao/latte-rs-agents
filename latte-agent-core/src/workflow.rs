@@ -411,12 +411,16 @@ pub async fn run_workflow(
                 status = "cancelled";
                 break 'rounds;
             }
+            let first_role = step.roles().first().cloned().unwrap_or_default();
+            let task_text = step.task_text().to_string();
             let _ = ctx.event_tx.send(ChatEvent::WorkflowStep {
                 wf_id: wf_id.clone(),
                 step_id: step.id.clone(),
                 description: step.description.clone(),
                 index: idx + 1,
                 total,
+                role_id: first_role,
+                task: task_text,
             });
             let mut step_transcript = String::new();
             for speaker in step.roles() {
