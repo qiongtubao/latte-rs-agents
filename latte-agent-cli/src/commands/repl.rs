@@ -9,7 +9,9 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplInput {
     Empty,
-    Cmd { name: String },
+    /// A built-in slash command. `arg` carries an optional operand,
+    /// e.g. `/pause programmer` → `Cmd { name: "pause", arg: Some("programmer") }`.
+    Cmd { name: String, arg: Option<String> },
     RoleInject { role_id: String, message: String },
     ManagerInput { message: String },
 }
@@ -54,11 +56,14 @@ pub fn parse_repl_line(line: &str) -> Result<ReplInput, ReplParseError> {
         return Ok(ReplInput::Empty);
     }
     if let Some(rest) = trimmed.strip_prefix('/') {
-        let name = rest.split_whitespace().next().unwrap_or("").to_string();
+        let mut parts = rest.split_whitespace();
+        let name = parts.next().unwrap_or("").to_string();
         if name.is_empty() || !is_valid_role_id(&name) {
             return Err(ReplParseError::MalformedAtLine);
         }
-        return Ok(ReplInput::Cmd { name });
+        // Optional operand, e.g. the target role for `/pause <role>`.
+        let arg = parts.next().map(|s| s.to_string());
+        return Ok(ReplInput::Cmd { name, arg });
     }
     if let Some(rest) = trimmed.strip_prefix('@') {
         let mut id_end = rest.len();
@@ -102,7 +107,7 @@ mod tests {
     fn slash_pause() {
         assert_eq!(
             parse_repl_line("/pause").unwrap(),
-            ReplInput::Cmd { name: "pause".to_string() }
+            ReplInput::Cmd { name: "pause".to_string(), arg: None }
         );
     }
 
@@ -110,7 +115,23 @@ mod tests {
     fn slash_resume() {
         assert_eq!(
             parse_repl_line("/resume").unwrap(),
-            ReplInput::Cmd { name: "resume".to_string() }
+            ReplInput::Cmd { name: "resume".to_string(), arg: None }
+        );
+    }
+
+    #[test]
+    fn slash_pause_with_role_arg() {
+        assert_eq!(
+            parse_repl_line("/pause programmer").unwrap(),
+            ReplInput::Cmd { name: "pause".to_string(), arg: Some("programmer".to_string()) }
+        );
+    }
+
+    #[test]
+    fn slash_resume_with_role_arg() {
+        assert_eq!(
+            parse_repl_line("/resume programmer").unwrap(),
+            ReplInput::Cmd { name: "resume".to_string(), arg: Some("programmer".to_string()) }
         );
     }
 

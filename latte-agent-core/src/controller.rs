@@ -1602,6 +1602,13 @@ async fn run_single_role_loop(
         }],
     });
 
+    // Global pause state for single-role mode. Unlike the multi-role
+    // loop (which gates on a shared `pause_flag` at round boundaries),
+    // the single-role loop runs turns inline in the `Input` arm, so we
+    // track pause locally and gate the next turn until Resume arrives.
+    // Pause/Resume both flow through `input_rx`, so ordering is stable.
+    let mut paused = false;
+
     loop {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
@@ -1709,6 +1716,45 @@ async fn run_single_role_loop(
                             continue;
                         }
 
+                        // Pause gate: if the session is paused, hold
+                        // this turn until the user resumes. Only
+                        // Resume / Abort / CancelTurn are honored while
+                        // parked; advisor hints are buffered. A
+                        // CancelTurn while parked discards this pending
+                        // input and returns to idle.
+                        if paused {
+                            let _ = event_tx.send(ChatEvent::Status {
+                                message: "[会话已暂停 — 恢复后执行本条输入]".into(),
+                            });
+                            let mut cancelled = false;
+                            loop {
+                                if cancel_flag.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                match input_rx.recv().await {
+                                    Some(ControllerInput::Resume) => {
+                                        paused = false;
+                                        let _ = event_tx.send(ChatEvent::Resumed);
+                                        break;
+                                    }
+                                    Some(ControllerInput::Abort) | None => return,
+                                    Some(ControllerInput::CancelTurn) => {
+                                        cancelled = true;
+                                        break;
+                                    }
+                                    Some(ControllerInput::AdvisorHint(t)) => {
+                                        advisor_hints.lock().push_back(t);
+                                    }
+                                    // Pause while already paused, or any
+                                    // other input, is ignored here.
+                                    _ => {}
+                                }
+                            }
+                            if cancelled {
+                                continue;
+                            }
+                        }
+
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
                         let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
@@ -1778,9 +1824,11 @@ let usage_before = runner.total_usage().clone();
                         }
                     }
                     Some(ControllerInput::Pause) => {
+                        paused = true;
                         let _ = event_tx.send(ChatEvent::Paused { reason: "用户暂停".into() });
                     }
                     Some(ControllerInput::Resume) => {
+                        paused = false;
                         let _ = event_tx.send(ChatEvent::Resumed);
                     }
                     Some(ControllerInput::AdvisorHint(text)) => {

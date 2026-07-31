@@ -9,6 +9,11 @@ pub struct PauseCmd {
     /// Pause reason; written to the session JSON.
     #[arg(long, default_value = "external: latte-agent pause")]
     pub reason: String,
+    /// Optional role id. When set, pauses only that role (leaving the
+    /// session running for the others). When absent, pauses the whole
+    /// session.
+    #[arg(long)]
+    pub role: Option<String>,
 }
 
 impl PauseCmd {
@@ -22,6 +27,18 @@ impl PauseCmd {
         }
         let session = find_latest_session(&worktree_root, &self.task_id)?;
         let mut mgr = SessionManager::from_record(session, worktree_root);
+
+        // Per-role pause: orthogonal to the global state machine, so it
+        // is legal in any non-terminal session state.
+        if let Some(role_id) = &self.role {
+            if !mgr.record().roles.iter().any(|r| &r.role_id == role_id) {
+                anyhow::bail!("role '{}' is not part of task '{}'", role_id, self.task_id);
+            }
+            mgr.pause_role(role_id, &self.reason)?;
+            println!("paused role {} of task {} (reason: {})", role_id, self.task_id, self.reason);
+            return Ok(());
+        }
+
         match mgr.state() {
             SessionState::Running | SessionState::Resumed | SessionState::Created => {
                 mgr.pause(&self.reason)?;

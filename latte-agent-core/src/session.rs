@@ -28,6 +28,18 @@ pub struct RoleHistory {
     pub role_id: String,
     pub messages: Vec<latte_ai::models::Message>,
     pub last_turn: u32,
+    /// Per-role pause flag (HIL v1.4). Orthogonal to the global
+    /// `SessionState`: when `true`, the scheduler skips this role's
+    /// turn but keeps driving the other roles in the round. Defaults
+    /// to `false` so pre-v1.4 session JSON deserializes unchanged.
+    #[serde(default)]
+    pub paused: bool,
+    /// Reason recorded when this role was individually paused.
+    #[serde(default)]
+    pub pause_reason: Option<String>,
+    /// ISO-8601 timestamp of the per-role pause.
+    #[serde(default)]
+    pub paused_at: Option<String>,
 }
 
 /// Per-session persisted record. Lives at
@@ -69,7 +81,14 @@ impl SessionManager {
             .join(format!("{}.json", session_id));
         let roles = roles
             .into_iter()
-            .map(|r| RoleHistory { role_id: r, messages: Vec::new(), last_turn: 0 })
+            .map(|r| RoleHistory {
+                role_id: r,
+                messages: Vec::new(),
+                last_turn: 0,
+                paused: false,
+                pause_reason: None,
+                paused_at: None,
+            })
             .collect();
         Self {
             record: SessionRecord {
@@ -202,6 +221,72 @@ impl SessionManager {
             .find(|r| r.role_id == role_id)
             .map(|r| r.messages.clone())
             .unwrap_or_default()
+    }
+
+    /// Pause a single role (HIL v1.4). Sets the role's `paused` flag +
+    /// `pause_reason` + `paused_at`, then persists. Does NOT touch the
+    /// global `SessionState` — the session keeps running for the other
+    /// roles; the scheduler skips only this role's turn.
+    pub fn pause_role(&mut self, role_id: &str, reason: &str) -> Result<(), SessionError> {
+        let now = crate::trace::iso8601_utc_now();
+        let role = self.record.roles.iter_mut()
+            .find(|r| r.role_id == role_id)
+            .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
+        role.paused = true;
+        role.pause_reason = Some(reason.to_string());
+        role.paused_at = Some(now);
+        self.persist()
+    }
+
+    /// Resume a single paused role (HIL v1.4). Clears the role's
+    /// `paused` flag + `pause_reason` + `paused_at`, then persists.
+    pub fn resume_role(&mut self, role_id: &str) -> Result<(), SessionError> {
+        let role = self.record.roles.iter_mut()
+            .find(|r| r.role_id == role_id)
+            .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
+        role.paused = false;
+        role.pause_reason = None;
+        role.paused_at = None;
+        self.persist()
+    }
+
+    /// Resume a single paused role and append a synthetic human
+    /// message to its history (HIL v1.4). Mirrors the global
+    /// `resume_with_message` but scoped to one role and without
+    /// touching the global `SessionState`.
+    pub fn resume_role_with_message(
+        &mut self,
+        role_id: &str,
+        message: &str,
+    ) -> Result<(), SessionError> {
+        let now = crate::trace::iso8601_utc_now();
+        {
+            let role = self.record.roles.iter_mut()
+                .find(|r| r.role_id == role_id)
+                .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
+            role.paused = false;
+            role.pause_reason = None;
+            role.paused_at = None;
+        }
+        let synthetic = latte_ai::models::Message::user(format!("[HUMAN @ {}]\n{}", now, message));
+        self.append_to_role(role_id, synthetic)
+    }
+
+    /// Whether the named role is individually paused. Unknown roles
+    /// report `false`.
+    pub fn is_role_paused(&self, role_id: &str) -> bool {
+        self.record.roles.iter()
+            .find(|r| r.role_id == role_id)
+            .map(|r| r.paused)
+            .unwrap_or(false)
+    }
+
+    /// List the role_ids that are currently individually paused.
+    pub fn paused_roles(&self) -> Vec<String> {
+        self.record.roles.iter()
+            .filter(|r| r.paused)
+            .map(|r| r.role_id.clone())
+            .collect()
     }
 
     /// Bump the current turn counter and persist.
@@ -474,5 +559,78 @@ mod tests {
         mgr.pause_with_reason("test").unwrap();
         let res = mgr.start();
         assert!(matches!(res, Err(SessionError::InvalidTransition { .. })));
+    }
+
+    #[test]
+    fn pause_role_sets_flag_without_touching_global_state() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.start().unwrap();
+        mgr.pause_role("programmer", "operator paused programmer").unwrap();
+        // Global state is untouched — session keeps running.
+        assert_eq!(mgr.state(), SessionState::Running);
+        assert!(mgr.is_role_paused("programmer"));
+        assert!(!mgr.is_role_paused("manager"));
+        assert_eq!(mgr.paused_roles(), vec!["programmer".to_string()]);
+    }
+
+    #[test]
+    fn pause_role_round_trips_through_json() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_role("programmer", "wait for review").unwrap();
+        let raw = std::fs::read_to_string(mgr.session_path()).unwrap();
+        let parsed: SessionRecord = serde_json::from_str(&raw).unwrap();
+        let role = parsed.roles.iter().find(|r| r.role_id == "programmer").unwrap();
+        assert!(role.paused);
+        assert_eq!(role.pause_reason.as_deref(), Some("wait for review"));
+        assert!(role.paused_at.is_some());
+    }
+
+    #[test]
+    fn resume_role_clears_flag() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_role("programmer", "r").unwrap();
+        assert!(mgr.is_role_paused("programmer"));
+        mgr.resume_role("programmer").unwrap();
+        assert!(!mgr.is_role_paused("programmer"));
+        assert!(mgr.paused_roles().is_empty());
+    }
+
+    #[test]
+    fn resume_role_with_message_appends_synthetic_message() {
+        let (_dir, mut mgr) = make_mgr();
+        mgr.pause_role("programmer", "r").unwrap();
+        mgr.resume_role_with_message("programmer", "carry on").unwrap();
+        assert!(!mgr.is_role_paused("programmer"));
+        let history = mgr.role_history("programmer");
+        assert!(history.last().unwrap().as_text().contains("[HUMAN @"));
+        assert!(history.last().unwrap().as_text().contains("carry on"));
+    }
+
+    #[test]
+    fn pause_unknown_role_errors() {
+        let (_dir, mut mgr) = make_mgr();
+        let res = mgr.pause_role("ghost", "x");
+        assert!(matches!(res, Err(SessionError::UnknownRole(_))));
+    }
+
+    #[test]
+    fn pre_v14_json_without_paused_field_deserializes() {
+        // Simulate an old session JSON lacking the per-role pause fields.
+        let raw = r#"{
+            "session_id": "t-1",
+            "task_id": "t",
+            "state": "Running",
+            "plan_md": "",
+            "active_checkpoint_id": 0,
+            "current_turn": 0,
+            "roles": [{ "role_id": "programmer", "messages": [], "last_turn": 0 }],
+            "paused_at": null,
+            "pause_reason": null,
+            "started_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let parsed: SessionRecord = serde_json::from_str(raw).unwrap();
+        assert!(!parsed.roles[0].paused);
+        assert!(parsed.roles[0].pause_reason.is_none());
     }
 }

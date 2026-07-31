@@ -366,9 +366,23 @@ export async function cancelTurn(): Promise<void> {
 /** Abort the entire session immediately (all in-flight turns, all
  *  subagents, all workflows). The session is torn down and cannot
  *  be resumed. Equivalent to clicking "delete session" but without
- *  removing the archived logs. Wired to the "⏹ 终止" button. */
+ *  removing the archived logs. Kept as a programmatic API; the chat
+ *  toolbar no longer surfaces a dedicated 终止 button (pause/resume
+ *  only). Still used by the delete-session flow server-side. */
 export async function abortSession(): Promise<void> {
   await getTransport().request("POST", "/api/chat/abort", chatBody({}));
+}
+
+/** Pause the session. The current session + history are preserved; the
+ *  next turn is held until `resumeSession()` is called. Wired to the
+ *  "⏸ 暂停" button. The backend echoes a `Paused` ChatEvent. */
+export async function pauseSession(): Promise<void> {
+  await getTransport().request("POST", "/api/chat/pause", chatBody({}));
+}
+
+/** Resume a paused session. The backend echoes a `Resumed` ChatEvent. */
+export async function resumeSession(): Promise<void> {
+  await getTransport().request("POST", "/api/chat/resume", chatBody({}));
 }
 export async function switchRole(role_id: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/role", chatBody({ role_id }));

@@ -1783,6 +1783,58 @@ select {
   transform: translateY(1px);
 }
 
+/* pause / resume toggle button */
+.pause-btn {
+  background: #fffbeb;
+  border: 1px solid #d97706;
+  color: #92400e;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.88em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.pause-btn:hover {
+  background: #fef3c7;
+  border-color: #b45309;
+}
+.pause-btn:active {
+  transform: translateY(1px);
+}
+.pause-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* resume button: green to signal "click to continue" */
+.resume-btn {
+  background: #ecfdf5;
+  border: 1px solid #059669;
+  color: #065f46;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 0.88em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.resume-btn:hover {
+  background: #d1fae5;
+  border-color: #047857;
+}
+.resume-btn:active {
+  transform: translateY(1px);
+}
+.resume-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ─── Models panel: 下拉菜单 + 表单编辑器 ─────────────────────── */
 
 .models-select-row {

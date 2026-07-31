@@ -210,6 +210,26 @@ pub(crate) async fn chat_abort(
         Err(_) => StatusCode::NOT_FOUND,
     }
 }
+
+pub(crate) async fn chat_pause(
+    State(state): State<AppState>,
+    Json(req): Json<SessionOnlyRequest>,
+) -> StatusCode {
+    match api::chat_pause(&state.backend, req.session_id.as_deref()).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
+pub(crate) async fn chat_resume(
+    State(state): State<AppState>,
+    Json(req): Json<SessionOnlyRequest>,
+) -> StatusCode {
+    match api::chat_resume(&state.backend, req.session_id.as_deref()).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
 // ─── SSE（HTTP 特有） ─────────────────────────────────────────────
 
 pub(crate) async fn events_sse(

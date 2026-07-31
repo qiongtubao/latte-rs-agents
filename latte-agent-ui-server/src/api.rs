@@ -1012,6 +1012,35 @@ pub async fn chat_abort(
     Ok(())
 }
 
+/// `POST /api/chat/pause` — 暂停当前 session。会话保留，正在等待
+/// 的下一个 turn 会被挂起，直到收到 resume。若 controller 尚未
+/// spawn（磁盘恢复但未激活），无操作。
+pub async fn chat_pause(
+    b: &UiBackend,
+    session_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    if let Some(controller) = h.try_controller() {
+        controller.pause().await;
+    }
+    Ok(())
+}
+
+/// `POST /api/chat/resume` — 恢复被 `chat_pause` 暂停的 session。
+/// 若 controller 尚未 spawn，无操作。
+pub async fn chat_resume(
+    b: &UiBackend,
+    session_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    if let Some(controller) = h.try_controller() {
+        controller.resume().await;
+    }
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct TraceSummary {
     pub session_id: String,

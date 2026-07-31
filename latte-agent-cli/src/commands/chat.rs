@@ -1960,13 +1960,52 @@ async fn run_hil_repl(
         if !trimmed.is_empty() {
             match parse_repl_line(trimmed) {
                 Ok(ReplInput::Empty) => {},
-                Ok(ReplInput::Cmd { name }) if name == "pause" => {
+                Ok(ReplInput::Cmd { name, arg }) if name == "pause" => {
                     let mut mgr = session_arc.lock().await;
-                    mgr.pause("user /pause")?;
-                    renderer.on_status("[session paused]").await;
-                    break 'rounds;
+                    match arg {
+                        Some(role_id) => {
+                            // Per-role pause (HIL v1.4): flag one role and
+                            // keep the session running for the others.
+                            if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
+                                renderer.on_error(&format!("[error: unknown role '{}']", role_id)).await;
+                            } else {
+                                mgr.pause_role(&role_id, &format!("user /pause {}", role_id))?;
+                                renderer.on_status(&format!("[role paused: {}]", role_id)).await;
+                            }
+                        }
+                        None => {
+                            // Global pause — halts the whole session.
+                            mgr.pause("user /pause")?;
+                            renderer.on_status("[session paused]").await;
+                            break 'rounds;
+                        }
+                    }
                 }
-                Ok(ReplInput::Cmd { name }) if name == "quit" => {
+                Ok(ReplInput::Cmd { name, arg }) if name == "resume" => {
+                    let mut mgr = session_arc.lock().await;
+                    match arg {
+                        Some(role_id) => {
+                            // Per-role resume (HIL v1.4).
+                            if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
+                                renderer.on_error(&format!("[error: unknown role '{}']", role_id)).await;
+                            } else if mgr.is_role_paused(&role_id) {
+                                mgr.resume_role(&role_id)?;
+                                renderer.on_status(&format!("[role resumed: {}]", role_id)).await;
+                            } else {
+                                renderer.on_status(&format!("[role '{}' is not paused]", role_id)).await;
+                            }
+                        }
+                        None => {
+                            let paused = mgr.paused_roles();
+                            if paused.is_empty() {
+                                renderer.on_status("[no individually-paused roles — use /resume <role>]").await;
+                            } else {
+                                renderer.on_status(&format!("[paused roles: {} — use /resume <role>]", paused.join(", "))).await;
+                            }
+                        }
+                    }
+                }
+                Ok(ReplInput::Cmd { name, arg: _ }) if name == "quit" => {
                     let mut mgr = session_arc.lock().await;
                     // If the session was paused (e.g. by the supervisor
                     // mid-round), resume first so the Paused -> Done
@@ -1978,15 +2017,21 @@ async fn run_hil_repl(
                     mgr.mark_done()?;
                     break 'rounds;
                 }
-                Ok(ReplInput::Cmd { name }) if name == "roles" => {
-                    renderer.on_status(&format!("[roles: {}]", scheduler.order.join(", "))).await;
+                Ok(ReplInput::Cmd { name, arg: _ }) if name == "roles" => {
+                    let mgr = session_arc.lock().await;
+                    let paused = mgr.paused_roles();
+                    if paused.is_empty() {
+                        renderer.on_status(&format!("[roles: {}]", scheduler.order.join(", "))).await;
+                    } else {
+                        renderer.on_status(&format!("[roles: {} | paused: {}]", scheduler.order.join(", "), paused.join(", "))).await;
+                    }
                 }
-                Ok(ReplInput::Cmd { name }) if name == "rounds" => {
+                Ok(ReplInput::Cmd { name, arg: _ }) if name == "rounds" => {
                     let mgr = session_arc.lock().await;
                     renderer.on_status(&format!("[round: {} / {}]", mgr.record().current_turn, scheduler.max_rounds)).await;
                 }
-                Ok(ReplInput::Cmd { name }) => {
-                    renderer.on_status(&format!("[unknown /{} — known: pause resume quit roles rounds]", name)).await;
+                Ok(ReplInput::Cmd { name, arg: _ }) => {
+                    renderer.on_status(&format!("[unknown /{} — known: pause [role], resume [role], quit, roles, rounds]", name)).await;
                 }
                 Ok(ReplInput::RoleInject { role_id, message }) => {
                     let mgr = session_arc.lock().await;
@@ -2026,6 +2071,14 @@ async fn run_hil_repl(
                 if mgr.state() != SessionState::Running {
                     renderer.on_status(&format!("[session not running — current state: {:?}]", mgr.state())).await;
                     continue 'rounds;
+                }
+                // Per-role pause (HIL v1.4): skip only this role's turn
+                // while the rest of the round proceeds. Orthogonal to
+                // the global state check above — `continue` (this role)
+                // rather than `continue 'rounds` (whole round).
+                if mgr.is_role_paused(&role_id) {
+                    renderer.on_status(&format!("[{} round {}: skipped — role paused]", role_id, round_num)).await;
+                    continue;
                 }
                 let queue_path = mgr.worktree_root().join(".latte").join("inject").join(format!("{}.txt", role_id));
                 if queue_path.exists() {

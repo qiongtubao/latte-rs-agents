@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession, importTasks, uploadImage, type ImportTask, type ChoiceOption } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSession, resumeSession, importTasks, uploadImage, type ImportTask, type ChoiceOption } from "./api";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
@@ -10,8 +10,10 @@ interface UIBinding {
 
   messagesEl: HTMLElement; formEl: HTMLFormElement; inputEl: HTMLTextAreaElement;
   sendBtn: HTMLButtonElement; clearBtn: HTMLButtonElement; quitBtn: HTMLButtonElement;
-  /** Abort button — required for the runtime abort flow. */
-  abortBtn: HTMLButtonElement;
+  /** Pause button. */
+  pauseBtn: HTMLButtonElement;
+  /** Resume button. */
+  resumeBtn: HTMLButtonElement;
   statusPill: HTMLElement; roleSelect: HTMLSelectElement; rolePill: HTMLElement;
   modelPill: HTMLElement; footerMsg: HTMLElement;
 }
@@ -731,8 +733,6 @@ const stepMsgIds = new Map<string, string>();
       startWaitTimer();
     }
     container.sendBtn.disabled = false;
-    // 注：abortBtn 不在这里重置 disable 状态 —— abort 按钮自带
-    // 独立的 disabled 跟踪（click handler finally 里设回 false）。
   });
 
   // ── /command autocomplete ──
@@ -874,27 +874,36 @@ const stepMsgIds = new Map<string, string>();
 
   container.clearBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /clear" }); await sendCommand("/clear"); });
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
-  // Abort button: kills all in-flight turns + subagents + workflows.
-  // 默认常驻可见。点击禁用自己 + 改 label，直到 server 响应回来。
-  // 防御策略：
-  //  - 双击防 race 用 disabled + early-return guard
-  //  - 网络 / RPC 错误：try/catch 兜底，finally 一定能恢复 UI
-  //  - DOM 操作不抛：button 是静态 HTML，不会 null；textContent 不会抛
-  //  - abortSession 内部其他错误（404 等）被 fetch 包装成 Promise reject，
-  //    也走 catch 分支
-  container.abortBtn.addEventListener("click", async () => {
-    if (container.abortBtn.disabled) return;
-    container.abortBtn.disabled = true;
-    container.abortBtn.textContent = "⏹ 终止中…";
+
+  // Two explicit buttons: 暂停 and 继续. Only one is active at a time —
+  // when running you can pause, when paused you can resume. The
+  // authoritative state is reconciled by the Paused/Resumed ChatEvents
+  // (see the event handler below), so a click/event race still
+  // converges to the correct enabled/disabled state.
+  let isPaused = false;
+  function renderPauseButtons() {
+    container.pauseBtn.disabled = isPaused;
+    container.resumeBtn.disabled = !isPaused;
+  }
+  renderPauseButtons();
+  container.pauseBtn.addEventListener("click", async () => {
+    if (container.pauseBtn.disabled) return;
+    container.pauseBtn.disabled = true;
     try {
-      await abortSession();
+      await pauseSession();
     } catch (e) {
-      // 任何错误（网络、404、5xx、JS 异常）都不让按钮卡死。
-      console.error("[chat] abortSession failed:", e);
-    } finally {
-      // 无论 try/catch 走哪条都要恢复 UI，否则按钮会一直 disabled。
-      container.abortBtn.disabled = false;
-      container.abortBtn.textContent = "⏹ 终止";
+      console.error("[chat] pause failed:", e);
+      container.pauseBtn.disabled = false; // re-enable on failure
+    }
+  });
+  container.resumeBtn.addEventListener("click", async () => {
+    if (container.resumeBtn.disabled) return;
+    container.resumeBtn.disabled = true;
+    try {
+      await resumeSession();
+    } catch (e) {
+      console.error("[chat] resume failed:", e);
+      container.resumeBtn.disabled = false; // re-enable on failure
     }
   });
   container.roleSelect.addEventListener("change", async () => {
@@ -1363,8 +1372,8 @@ const stepMsgIds = new Map<string, string>();
         // session snapshot; roles/model are already loaded via
         // getSession, so nothing to render here.
         break;
-      case "Paused": addMessage({ kind: "status", content: `[paused] ${e.reason}` }); break;
-      case "Resumed": addMessage({ kind: "status", content: "[resumed]" }); break;
+      case "Paused": isPaused = true; renderPauseButtons(); addMessage({ kind: "status", content: `[paused] ${e.reason}` }); break;
+      case "Resumed": isPaused = false; renderPauseButtons(); addMessage({ kind: "status", content: "[resumed]" }); break;
       case "RoundStarted":
         addMessage({ kind: "system", content: `[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
         resetWaitTimer(); currentToolCall = ""; currentDelegate = ""; updateFooter(); break;
