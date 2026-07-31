@@ -200,6 +200,14 @@ pub enum ChatEvent {
     RoleStarted { role_id: String, detail: String },
     /// A role has finished working.
     RoleFinished { role_id: String, detail: String },
+    /// A single role was individually paused (HIL v1.4, multi-role
+    /// mode). Distinct from `Paused`, which halts the whole session.
+    /// The paused role is skipped each round until `RoleResumed`.
+    /// Drives the UI's per-role paused badge / toggle button.
+    RolePaused { role_id: String },
+    /// A single individually-paused role was resumed. Counterpart to
+    /// `RolePaused`.
+    RoleResumed { role_id: String },
     /// Session finished (aborted or quit).
     Done,
     RoleList {
@@ -1188,6 +1196,58 @@ async fn run_multi_role_loop(
                     });
                     break 'rounds;
                 }
+                // Per-role pause (HIL v1.4): flag one role and keep the
+                // session running for the others. Orthogonal to the
+                // global `/pause` above.
+                line if line.starts_with("/pause ") => {
+                    let role_id = line["/pause ".len()..].trim().to_string();
+                    let mut mgr = session_arc.lock().await;
+                    if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: format!("[error: unknown role '{role_id}']"),
+                        });
+                    } else {
+                        let _ = mgr.pause_role(&role_id, &format!("user /pause {role_id}"));
+                        let _ = event_tx.send(ChatEvent::RolePaused {
+                            role_id: role_id.clone(),
+                        });
+                    }
+                    continue 'rounds;
+                }
+                // Per-role resume (HIL v1.4): clear one role's pause flag.
+                "/resume" => {
+                    let mgr = session_arc.lock().await;
+                    let paused = mgr.paused_roles();
+                    if paused.is_empty() {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: "[no individually-paused roles — use /resume <role>]".into(),
+                        });
+                    } else {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: format!("[paused roles: {} — use /resume <role>]", paused.join(", ")),
+                        });
+                    }
+                    continue 'rounds;
+                }
+                line if line.starts_with("/resume ") => {
+                    let role_id = line["/resume ".len()..].trim().to_string();
+                    let mut mgr = session_arc.lock().await;
+                    if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: format!("[error: unknown role '{role_id}']"),
+                        });
+                    } else if mgr.is_role_paused(&role_id) {
+                        let _ = mgr.resume_role(&role_id);
+                        let _ = event_tx.send(ChatEvent::RoleResumed {
+                            role_id: role_id.clone(),
+                        });
+                    } else {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: format!("[role '{role_id}' is not paused]"),
+                        });
+                    }
+                    continue 'rounds;
+                }
                 "/roles" => {
                     let mut roles_info: Vec<RoleInfo> = Vec::new();
                     for id in &order {
@@ -1322,6 +1382,19 @@ async fn run_multi_role_loop(
                         ),
                     });
                     continue 'rounds;
+                }
+
+                // Per-role pause (HIL v1.4): skip only this role's turn
+                // while the rest of the round proceeds. Orthogonal to
+                // the global state check above — `continue` (this role)
+                // rather than `continue 'rounds` (whole round).
+                if mgr.is_role_paused(role_id) {
+                    let _ = event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "[{role_id} round {round_num}: skipped — role paused]"
+                        ),
+                    });
+                    continue;
                 }
 
                 // Drain inject queue
@@ -3977,6 +4050,195 @@ mod tests {
                 _ => {}
             }
         }
+
+        controller.abort().await;
+    }
+
+    // 多角色 HIL：`/pause <role>` 让单个角色在轮次里被跳过（其余角色照
+    // 常跑），`/resume <role>` 恢复后该角色重新参与。锁定 controller
+    // 多角色路径的 per-role 暂停闸门 + slash 命令入口接线（此前只在
+    // CLI REPL 里有，controller 路径漏接）。
+    #[tokio::test]
+    async fn multi_role_pause_skips_only_that_role() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "ok" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let stub_role = |id: &str, icon: &str| {
+            (
+                id.to_string(),
+                RoleTemplate {
+                    id: id.into(),
+                    name: id.into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: icon.into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )
+        };
+
+        let agent_config = Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [stub_role("manager", "👔"), stub_role("programmer", "🧑‍💻")]
+                .into_iter()
+                .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+
+        // 多角色路径要求真实 git 仓库（WorkspaceManager::resolve_repo_root
+        // 走 `git rev-parse --show-toplevel`）。
+        let dir = tempfile::tempdir().unwrap();
+        let git_ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("skipping multi_role_pause_skips_only_that_role: git unavailable");
+            return;
+        }
+
+        let cfg = ControllerConfig {
+            task_id: Some("t-pause".to_string()),
+            roles: vec!["manager".to_string(), "programmer".to_string()],
+            initial_prompt: Some("do the thing".to_string()),
+            max_rounds: 20,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+            session_id: String::new(),
+        };
+
+        async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>) -> ChatEvent {
+            tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("recv")
+        }
+
+        let controller = ChatController::new(256);
+        let mut rx = controller.spawn(cfg).await;
+
+        // 1) 单独暂停 programmer → 必须收到结构化 RolePaused 事件。
+        controller.submit_input("/pause programmer").await;
+        loop {
+            if let ChatEvent::RolePaused { role_id } = next_event(&mut rx).await {
+                assert_eq!(role_id, "programmer");
+                break;
+            }
+        }
+
+        // 2) 触发一轮：programmer 应被跳过（不产生 RoleStarted），manager
+        //    照常起跑。收集到 RoundEnded 为止。
+        controller.submit_input("go").await;
+        let mut programmer_skipped = false;
+        let mut programmer_started = false;
+        let mut manager_started = false;
+        loop {
+            match next_event(&mut rx).await {
+                ChatEvent::Status { message } => {
+                    if message.contains("programmer") && message.contains("skipped — role paused") {
+                        programmer_skipped = true;
+                    }
+                }
+                ChatEvent::RoleStarted { role_id, .. } => {
+                    if role_id == "programmer" {
+                        programmer_started = true;
+                    }
+                    if role_id == "manager" {
+                        manager_started = true;
+                    }
+                }
+                ChatEvent::RoundEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(programmer_skipped, "paused role must emit the skip status");
+        assert!(!programmer_started, "paused role must NOT start a turn");
+        assert!(manager_started, "non-paused role must still run");
+
+        // 3) 恢复 programmer → 必须收到结构化 RoleResumed 事件。
+        controller.submit_input("/resume programmer").await;
+        loop {
+            if let ChatEvent::RoleResumed { role_id } = next_event(&mut rx).await {
+                assert_eq!(role_id, "programmer");
+                break;
+            }
+        }
+
+        // 4) 再触发一轮：programmer 这次应正常起跑。
+        controller.submit_input("go").await;
+        let mut programmer_started_after_resume = false;
+        loop {
+            match next_event(&mut rx).await {
+                ChatEvent::RoleStarted { role_id, .. } if role_id == "programmer" => {
+                    programmer_started_after_resume = true;
+                }
+                ChatEvent::RoundEnded { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            programmer_started_after_resume,
+            "resumed role must run again"
+        );
 
         controller.abort().await;
     }

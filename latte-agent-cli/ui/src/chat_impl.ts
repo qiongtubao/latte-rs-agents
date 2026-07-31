@@ -14,7 +14,10 @@ interface UIBinding {
   pauseBtn: HTMLButtonElement;
   /** Resume button. */
   resumeBtn: HTMLButtonElement;
-  statusPill: HTMLElement; roleSelect: HTMLSelectElement; rolePill: HTMLElement;
+  statusPill: HTMLElement; roleSelect: HTMLSelectElement;
+  /** Per-role pause/resume toggle (acts on the selected role). */
+  rolePauseToggle: HTMLButtonElement;
+  rolePill: HTMLElement;
   modelPill: HTMLElement; footerMsg: HTMLElement;
 }
 export interface ChatController {
@@ -929,6 +932,54 @@ const stepMsgIds = new Map<string, string>();
     const roleId = container.roleSelect.value;
     if (onRoleSwitch) { await onRoleSwitch(roleId); } else { await switchRole(roleId); }
     addMessage({ kind: "system", content: `→ switched to /role ${roleId}` });
+    updateRolePauseToggle();
+  });
+
+  // ── Per-role pause (多角色 HIL) ──────────────────────────────
+  // Roles individually paused via `/pause <role>`. Distinct from the
+  // global 暂停/继续 buttons above. Driven by the RolePaused /
+  // RoleResumed ChatEvents so a paused role is both visible (⏸ marker
+  // in the role dropdown + toggle button state) and controllable.
+  const pausedRoles = new Set<string>();
+  // Refresh the dropdown option labels: paused roles get a ⏸ prefix.
+  // Each option stores its base label in dataset.baseLabel so markers
+  // don't accumulate across re-renders.
+  function applyPausedMarkers(): void {
+    for (const opt of Array.from(container.roleSelect.options)) {
+      const base = opt.dataset.baseLabel ?? opt.textContent ?? opt.value;
+      opt.dataset.baseLabel = base;
+      opt.textContent = pausedRoles.has(opt.value) ? `⏸ ${base}` : base;
+    }
+  }
+  // Reflect the *selected* role's paused state on the toggle button.
+  function updateRolePauseToggle(): void {
+    const roleId = container.roleSelect.value;
+    const paused = pausedRoles.has(roleId);
+    container.rolePauseToggle.textContent = paused ? "▶ 角色" : "⏸ 角色";
+    container.rolePauseToggle.title = paused
+      ? `恢复角色 ${roleId}：重新参与每轮`
+      : `暂停角色 ${roleId}：该角色在每轮里被跳过，其余角色照常（多角色 HIL）`;
+    container.rolePauseToggle.classList.toggle("active", paused);
+  }
+  // Apply an incoming RolePaused / RoleResumed transition.
+  function setRolePaused(roleId: string, paused: boolean): void {
+    if (paused) pausedRoles.add(roleId); else pausedRoles.delete(roleId);
+    applyPausedMarkers();
+    updateRolePauseToggle();
+  }
+  container.rolePauseToggle.addEventListener("click", async () => {
+    const roleId = container.roleSelect.value;
+    if (!roleId) return;
+    const cmd = pausedRoles.has(roleId) ? `/resume ${roleId}` : `/pause ${roleId}`;
+    container.rolePauseToggle.disabled = true;
+    try {
+      addMessage({ kind: "system", content: `→ ${cmd}` });
+      await sendCommand(cmd);
+    } catch (e) {
+      console.error("[chat] role pause toggle failed:", e);
+    } finally {
+      container.rolePauseToggle.disabled = false;
+    }
   });
 
   const statusLabel = container.statusPill.querySelector(".status-label") as HTMLElement;
@@ -1296,6 +1347,16 @@ const stepMsgIds = new Map<string, string>();
         // prompt 收起来 —— 后端不会再推 TimeoutWarning，下一次
         // Warning 出现时再重新展示。
         hideTimeoutPrompt(e.role_id);
+        break;
+      }
+      case "RolePaused": {
+        setRolePaused(e.role_id, true);
+        addMessage({ kind: "system", content: `⏸ 角色已暂停：${e.role_id}` });
+        break;
+      }
+      case "RoleResumed": {
+        setRolePaused(e.role_id, false);
+        addMessage({ kind: "system", content: `▶ 角色已恢复：${e.role_id}` });
         break;
       }
       case "UserMessage": {
@@ -1723,7 +1784,9 @@ const stepMsgIds = new Map<string, string>();
   function setRoleSelected(roleId: string): void { container.rolePill.textContent = roleId; container.roleSelect.value = roleId; }
   function refreshRoles(roles: RoleInfo[], selected: string): void {
     container.roleSelect.innerHTML = "";
-    for (const r of roles) { const opt = document.createElement("option"); opt.value=r.id; opt.innerHTML=`${r.icon??""} ${r.id}`; if (r.id===selected) opt.selected=true; container.roleSelect.appendChild(opt); }
+    for (const r of roles) { const opt = document.createElement("option"); opt.value=r.id; opt.dataset.baseLabel=`${r.icon??""} ${r.id}`; if (r.id===selected) opt.selected=true; container.roleSelect.appendChild(opt); }
+    applyPausedMarkers();
+    updateRolePauseToggle();
   }
   function clear(): void {
     container.messagesEl.innerHTML="";

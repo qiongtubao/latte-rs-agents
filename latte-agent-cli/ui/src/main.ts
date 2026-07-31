@@ -96,6 +96,7 @@ async function main(): Promise<void> {
       resumeBtn: $("chat-resume") as HTMLButtonElement,
       statusPill: $("status-pill"),
       roleSelect: $("role-select") as HTMLSelectElement,
+      rolePauseToggle: $("role-pause-toggle") as HTMLButtonElement,
       rolePill: $("role-pill"),
       modelPill: $("model-pill"),
       footerMsg: $("footer-msg"),

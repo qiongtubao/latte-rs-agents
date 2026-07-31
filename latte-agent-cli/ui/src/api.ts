@@ -153,6 +153,10 @@ export type ChatEvent =
   | { type: "RoundEnded"; round: number }
   | { type: "RoleStarted"; role_id: string; detail: string }
   | { type: "RoleFinished"; role_id: string; detail: string }
+  // 单角色被单独暂停/恢复（多角色 HIL）。区别于 Paused/Resumed
+  // （整会话）。UI 据此渲染角色的「已暂停」标记与暂停/恢复切换。
+  | { type: "RolePaused"; role_id: string }
+  | { type: "RoleResumed"; role_id: string }
   | { type: "Done" }
   | { type: "Error"; kind?: unknown; message: string; sub_id?: string }
   | { type: "RoleList"; roles: RoleInfo[] }

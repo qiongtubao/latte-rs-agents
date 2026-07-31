@@ -155,6 +155,8 @@ mod tests {
             ("ToolError", ChatEvent::ToolError { role_id: "m".into(), tool_name: "read".into(), error: "fail".into() }),
             ("RoleStarted", ChatEvent::RoleStarted { role_id: "m".into(), detail: "calling LLM".into() }),
             ("RoleFinished", ChatEvent::RoleFinished { role_id: "m".into(), detail: "ok".into() }),
+            ("RolePaused", ChatEvent::RolePaused { role_id: "programmer".into() }),
+            ("RoleResumed", ChatEvent::RoleResumed { role_id: "programmer".into() }),
             ("DelegateStarted", ChatEvent::DelegateStarted { from_role: "manager".into(), to_role: "programmer".into(), task: "ping".into(), sub_id: "x".into() }),
             ("DelegateFinished", ChatEvent::DelegateFinished { from_role: "manager".into(), to_role: "programmer".into(), status: "ok".into(), summary: "done".into(), sub_id: "x".into() }),
             ("SessionInfo", ChatEvent::SessionInfo { task_id: "ui-1".into(), state: "running".into(), turn: 0, roles: vec![RoleInfo { id: "manager".into(), name: "Manager".into(), icon: "[m]".into() }] }),

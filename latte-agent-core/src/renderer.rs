@@ -99,6 +99,12 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::RoleFinished { role_id, detail } => {
                 self.on_status(&format!("{role_id} finished: {detail}")).await;
             }
+            ChatEvent::RolePaused { role_id } => {
+                self.on_status(&format!("[role paused: {role_id}]")).await;
+            }
+            ChatEvent::RoleResumed { role_id } => {
+                self.on_status(&format!("[role resumed: {role_id}]")).await;
+            }
             ChatEvent::DelegateStarted { from_role, to_role, task, .. } => {
                 self.on_status(&format!("{from_role} delegated to {to_role}: {task}")).await;
             }
