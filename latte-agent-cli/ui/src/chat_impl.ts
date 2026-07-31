@@ -115,6 +115,8 @@ export function mountChat(opts: {
   const workflowStates = new Map<string, HTMLElement>();
   /** wf_id:step_id → pending badge element on WorkflowStep bubbles. */
   const stepStates = new Map<string, HTMLElement>();
+  /** wf_id:step_id → WorkflowStep 消息的 msgId（WorkflowTurn 做引用用） */
+const stepMsgIds = new Map<string, string>();
   /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
   const workflowTranscripts = new Map<string, string>();
   /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
@@ -1260,31 +1262,41 @@ export function mountChat(opts: {
           icon,
           filePath: getFilePath("manager"),
         });
+        // 保存此 delegate 消息的 msgId，供 WorkflowTurn 做引用预览
+        const delegateMsgId = delegateMsg.dataset.messageId || "";
+        stepMsgIds.set(`${e.wf_id}:${e.step_id}`, delegateMsgId);
         // Step pending state badge
         const stateEl = document.createElement("span");
         stateEl.className = "delegate-state pending";
         stateEl.textContent = "⏳ 执行中…";
         delegateMsg.querySelector(".msg-bubble")?.appendChild(stateEl);
-        // Track per-workflow step for completion update
         stepStates.set(`${e.wf_id}:${e.step_id}`, stateEl);
+        // Step pending state badge
         resetWaitTimer();
         break;
       }
       case "WorkflowTurn": {
         const icon = roleIcon(e.role_id);
+        const stepKey = `${e.wf_id}:${e.step_id}`;
+        // 引用回 WorkflowStep 的 delegate 消息（显示"被分配了什么任务"）
+        const delegateMsgId = stepMsgIds.get(stepKey);
+        const taskPreview = delegateMsgId
+          ? (getMsgById(delegateMsgId)?.content ?? "").replace(/^@\S+\s+/, "").slice(0, 30)
+          : "workflow 任务";
+        const ref = delegateMsgId ? { refId: delegateMsgId, preview: taskPreview } : undefined;
         addMessage({
           kind: "role",
           content: e.content,
           meta: `${e.role_id}（workflow）`,
           icon,
           filePath: getFilePath(e.role_id),
+          reference: ref,
         });
         workflowTranscripts.set(
           e.wf_id,
           (workflowTranscripts.get(e.wf_id) ?? "") + "\n" + e.content,
         );
         // 标记该步骤为已完成（翻转 step badge）
-        const stepKey = `${e.wf_id}:${e.step_id}`;
         const stepEl = stepStates.get(stepKey);
         if (stepEl) {
           stepEl.textContent = "✅ 完成";
