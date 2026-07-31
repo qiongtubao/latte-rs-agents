@@ -679,6 +679,246 @@ fn classify_tool_execution_error(
     }
 }
 
+/// Short (namespace-stripped) tool name, e.g. `manager.delegate` → `delegate`.
+fn short_tool_name(name: &str) -> &str {
+    name.rsplit_once('.').map(|(_, s)| s).unwrap_or(name)
+}
+
+/// Whether `delegate` tool calls emitted in the *same* model response
+/// may run concurrently. **Default off** — the agent's tool loop stays
+/// strictly serial unless `LATTE_AGENT_DELEGATE_PARALLEL` is set to a
+/// truthy value (`1` / `true` / `yes` / `on`, case-insensitive).
+///
+/// When on, a batch of ≥2 delegate calls fans out via `tokio::task::
+/// JoinSet`; the actual specialist concurrency is still capped by the
+/// `Semaphore` inside the delegate tool handler (see
+/// `register_delegate_tool`, `LATTE_AGENT_DELEGATE_CONCURRENCY`). Non-
+/// delegate tools (file writes, bash, …) always run serially so this
+/// can't introduce write races.
+fn delegate_parallel_enabled() -> bool {
+    std::env::var("LATTE_AGENT_DELEGATE_PARALLEL")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+/// Outcome of running a single tool call through the full pipeline
+/// (parse → PreToolHook → execute+retry → PostToolHook). Returned by
+/// [`run_one_tool_call`] so the caller can apply the `&mut self`
+/// bookkeeping (loop detection, success count, message append) in the
+/// original call order — even when calls executed concurrently.
+struct OneCallResult {
+    /// `tool_call_id` to pair the result back to its assistant call.
+    id: String,
+    /// Terminal result: `Ok(result_str)` or `Err((kind, detail))`.
+    outcome: Result<String, (ToolCallErrorKind, String)>,
+    /// `(name, args_json)` recorded per execute attempt, in order.
+    /// Replayed into the shared `LoopDetector` by the caller so loop
+    /// detection keeps working without sharing `&mut` state across
+    /// concurrent tasks.
+    loop_records: Vec<(String, String)>,
+    /// `true` if at least one execute returned `Ok` (feeds
+    /// `last_turn_tool_count`).
+    executed_ok: bool,
+}
+
+/// Run one tool call end-to-end without touching `&mut self`, so it can
+/// be `tokio::spawn`ed for concurrent delegate execution. All inputs
+/// are owned/`Arc` clones. Mirrors the serial inline pipeline in
+/// [`AgentRunner::run_turn`]; the two must stay in sync.
+#[allow(clippy::too_many_arguments)]
+async fn run_one_tool_call(
+    tm: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    hooks: Arc<crate::hooks::HookChain>,
+    sink: Arc<dyn crate::trace::TraceSink>,
+    retry_policy: Arc<dyn RetryPolicy>,
+    cwd: Option<std::path::PathBuf>,
+    meta: crate::trace::TraceMeta,
+    tc: ParsedCall,
+) -> OneCallResult {
+    use crate::trace::{ToolStatus, TraceEvent};
+    let resolved_name = tc.name.clone();
+    let full_name = if tm.has(&resolved_name) {
+        resolved_name.clone()
+    } else {
+        tm.get_tool_names()
+            .into_iter()
+            .find(|n| short_tool_name(n) == resolved_name.as_str())
+            .unwrap_or_else(|| resolved_name.clone())
+    };
+
+    let mut attempt: u32 = 0;
+    let max_attempts: u32 = 2;
+    let mut final_outcome: Result<String, (ToolCallErrorKind, String)> = Err((
+        ToolCallErrorKind::ToolNotFound { tried_aliases: vec![] },
+        "init".into(),
+    ));
+    let mut loop_records: Vec<(String, String)> = Vec::new();
+    let mut executed_ok = false;
+
+    while attempt < max_attempts {
+        attempt += 1;
+        // 1. parse args
+        let input: serde_json::Value = match serde_json::from_str(&tc.args) {
+            Ok(v) => v,
+            Err(e) => {
+                let detail = format!("invalid JSON: {e}");
+                final_outcome = Err((
+                    ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
+                    detail,
+                ));
+                break;
+            }
+        };
+        let input = match &cwd {
+            Some(c) => resolve_tool_input_against_cwd(input, c),
+            None => input,
+        };
+
+        // 2. PreToolHook
+        let mut mutable_input = input;
+        let pre_aborted: Option<String> = {
+            let mut pre_ctx = crate::hooks::PreToolCtx {
+                name: &resolved_name,
+                args: &mut mutable_input,
+            };
+            let outcome = hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
+                sink.emit(TraceEvent::HookFired {
+                    meta: meta.clone(),
+                    hook_name: hook_name.to_string(),
+                    point,
+                    outcome_kind: kind.to_string(),
+                });
+                log_hook_fire(hook_name, point, kind);
+            });
+            if let crate::hooks::HookOutcome::Abort { reason } = outcome {
+                Some(reason)
+            } else {
+                None
+            }
+        };
+        if let Some(reason) = pre_aborted {
+            final_outcome = Err((
+                ToolCallErrorKind::HookAborted {
+                    hook: "PreTool".into(),
+                    reason: reason.clone(),
+                },
+                reason,
+            ));
+            break;
+        }
+        let input = mutable_input;
+
+        // 3. Execute
+        let mut ctx =
+            latte_rs_agent_tools::types::ToolExecutionContext::fresh(&resolved_name, 1);
+        if let Some(c) = &cwd {
+            ctx.metadata = Some(serde_json::json!({ "cwd": c.display().to_string() }));
+        }
+        let tool_start = Instant::now();
+        let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
+        let tool_latency = tool_start.elapsed().as_millis() as u64;
+        let args_json =
+            serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
+        loop_records.push((tc.name.clone(), args_json.clone()));
+
+        match exec_result {
+            Ok(result) => {
+                executed_ok = true;
+                // 5. PostToolHook
+                let mut result_str = serde_json::to_string_pretty(&result)
+                    .unwrap_or_else(|_| format!("{:?}", result));
+                let post_aborted: Option<String> = {
+                    let mut post_ctx = crate::hooks::PostToolCtx {
+                        name: &resolved_name,
+                        result: &mut result_str,
+                    };
+                    let outcome = hooks.run_post_tool(&mut post_ctx, |hook_name, point, kind| {
+                        sink.emit(TraceEvent::HookFired {
+                            meta: meta.clone(),
+                            hook_name: hook_name.to_string(),
+                            point,
+                            outcome_kind: kind.to_string(),
+                        });
+                        log_hook_fire(hook_name, point, kind);
+                    });
+                    if let crate::hooks::HookOutcome::Abort { reason } = outcome {
+                        Some(reason)
+                    } else if let crate::hooks::HookOutcome::Mutate(ref mutated) = outcome {
+                        result_str = mutated.clone();
+                        None
+                    } else {
+                        None
+                    }
+                };
+                if let Some(reason) = post_aborted {
+                    final_outcome = Err((
+                        ToolCallErrorKind::HookAborted {
+                            hook: "PostTool".into(),
+                            reason: reason.clone(),
+                        },
+                        reason,
+                    ));
+                    break;
+                }
+                sink.emit(TraceEvent::ToolExec {
+                    meta: meta.clone(),
+                    name: tc.name.clone(),
+                    args_json: args_json.clone(),
+                    latency_ms: tool_latency,
+                    status: ToolStatus::Ok(
+                        serde_json::to_string(&result).unwrap_or_default(),
+                    ),
+                });
+                final_outcome = Ok(result_str);
+                break;
+            }
+            Err(e) => {
+                let kind = classify_tool_execution_error(&e);
+                let detail = e.to_string();
+                sink.emit(TraceEvent::ToolExec {
+                    meta: meta.clone(),
+                    name: tc.name.clone(),
+                    args_json: args_json.clone(),
+                    latency_ms: tool_latency,
+                    status: ToolStatus::Err(detail.clone()),
+                });
+                final_outcome = Err((kind, detail));
+            }
+        }
+
+        // Retry decision (only reached on execute failure; Ok breaks above).
+        let current_kind = match &final_outcome {
+            Ok(_) => break,
+            Err((k, _)) => k.clone(),
+        };
+        let retrying = retry_policy.retryable(&current_kind) && attempt < max_attempts;
+        sink.emit(TraceEvent::ToolRetry {
+            meta: meta.clone(),
+            name: tc.name.clone(),
+            attempt,
+            kind: current_kind.label().to_string(),
+            reason: current_kind.to_string(),
+            recovered: false,
+        });
+        if retrying {
+            continue;
+        } else {
+            break;
+        }
+    }
+
+    OneCallResult {
+        id: tc.id.clone(),
+        outcome: final_outcome,
+        loop_records,
+        executed_ok,
+    }
+}
+
 
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
@@ -1161,6 +1401,129 @@ impl AgentRunner {
                     final_response.clone(),
                     tool_calls.clone(),
                 ));
+
+                // ── Concurrent delegate dispatch (opt-in) ──────────────
+                //
+                // When `LATTE_AGENT_DELEGATE_PARALLEL` is on AND this
+                // response batches ≥2 `delegate` calls, run those
+                // delegates concurrently on a `JoinSet` while any
+                // non-delegate calls in the same batch run serially
+                // inline. Results are collected by original index so the
+                // `&mut self` bookkeeping (loop detection, success count,
+                // tool_result append) happens in call order — identical
+                // to the serial path. Everything is capped downstream by
+                // the delegate tool's own `Semaphore`.
+                //
+                // Default off → falls through to the original strictly
+                // serial loop below (unchanged behavior).
+                let delegate_positions: Vec<usize> = post_parse_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tc)| short_tool_name(&tc.name) == "delegate")
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if delegate_parallel_enabled() && delegate_positions.len() >= 2 {
+                    use tokio::task::JoinSet;
+                    let is_delegate: std::collections::HashSet<usize> =
+                        delegate_positions.iter().copied().collect();
+                    let mut results: Vec<Option<OneCallResult>> =
+                        (0..post_parse_calls.len()).map(|_| None).collect();
+
+                    // Pass 1: spawn all delegate calls.
+                    let mut set: JoinSet<(usize, OneCallResult)> = JoinSet::new();
+                    for (i, tc) in post_parse_calls.iter().enumerate() {
+                        if !is_delegate.contains(&i) {
+                            continue;
+                        }
+                        let tm_c = tm.clone();
+                        let hooks_c = self.hooks.clone();
+                        let sink_c = self.sink.clone();
+                        let rp_c = self.retry_policy.clone();
+                        let cwd_c = self.cwd.clone();
+                        let meta_c = meta.clone();
+                        let tc_c = tc.clone();
+                        set.spawn(async move {
+                            (
+                                i,
+                                run_one_tool_call(
+                                    tm_c, hooks_c, sink_c, rp_c, cwd_c, meta_c, tc_c,
+                                )
+                                .await,
+                            )
+                        });
+                    }
+
+                    // Pass 2: run non-delegate calls inline (overlaps
+                    // with the spawned delegates).
+                    for (i, tc) in post_parse_calls.iter().enumerate() {
+                        if is_delegate.contains(&i) {
+                            continue;
+                        }
+                        results[i] = Some(
+                            run_one_tool_call(
+                                tm.clone(),
+                                self.hooks.clone(),
+                                self.sink.clone(),
+                                self.retry_policy.clone(),
+                                self.cwd.clone(),
+                                meta.clone(),
+                                tc.clone(),
+                            )
+                            .await,
+                        );
+                    }
+
+                    // Pass 3: join delegates.
+                    while let Some(joined) = set.join_next().await {
+                        match joined {
+                            Ok((i, r)) => results[i] = Some(r),
+                            Err(e) => {
+                                return Err(AgentError::Tool(format!(
+                                    "delegate task join failed: {e}"
+                                )))
+                            }
+                        }
+                    }
+
+                    // Pass 4: apply bookkeeping + append tool_results in
+                    // original call order.
+                    for slot in results.into_iter() {
+                        let r = match slot {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        for (name, args_json) in &r.loop_records {
+                            if let LoopDecision::Break(reason) =
+                                loop_detector.record(name, args_json)
+                            {
+                                return Err(AgentError::ToolLoopDetected {
+                                    tool: name.clone(),
+                                    reason,
+                                });
+                            }
+                        }
+                        if r.executed_ok {
+                            self.last_turn_tool_count += 1;
+                        }
+                        match r.outcome {
+                            Ok(result_str) => {
+                                messages.push(Message::tool_result(r.id, result_str));
+                            }
+                            Err((kind, detail)) => {
+                                if self.retry_policy.loopback_to_model(&kind) {
+                                    messages.push(Message::tool_result(r.id, detail));
+                                }
+                            }
+                        }
+                    }
+
+                    if round + 1 >= max_rounds {
+                        return Err(AgentError::MaxToolRoundsExceeded(max_rounds));
+                    }
+                    continue;
+                }
+
                 // 逐个执行工具调用
                 for tc in &post_parse_calls {
                     // 工具名已是扁平规范名（registry 注册名 == 模型看到的
@@ -2815,6 +3178,146 @@ mod tests {
             !body2.contains("[tool_error for ping]"),
             "MalformedArgs must NOT loopback to model: {body2}"
         );
+    }
+
+    #[test]
+    fn short_tool_name_strips_namespace() {
+        assert_eq!(short_tool_name("delegate"), "delegate");
+        assert_eq!(short_tool_name("manager.delegate"), "delegate");
+        assert_eq!(short_tool_name("a.b.delegate"), "delegate");
+        assert_eq!(short_tool_name("read"), "read");
+    }
+
+    /// End-to-end proof of the opt-in delegate concurrency:
+    ///   - `LATTE_AGENT_DELEGATE_PARALLEL` unset → the two delegate
+    ///     calls in one response run **serially** (max observed
+    ///     concurrency = 1) — the default, unchanged behavior.
+    ///   - flag on → they run **concurrently** (max observed
+    ///     concurrency = 2).
+    /// Both phases must still feed back both tool_results and finish
+    /// with the round-1 "done" reply. Env is mutated only by this test.
+    #[tokio::test]
+    async fn delegate_batch_runs_serial_by_default_concurrent_when_enabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // Runs one turn where round 0 emits two `delegate` calls and
+        // round 1 replies "done". Returns the max concurrency the tool
+        // handler observed. Each phase gets its own server / tm /
+        // counters so wiremock's one-shot matcher is fresh.
+        async fn run_phase() -> usize {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let total = Arc::new(AtomicUsize::new(0));
+            let active_h = active.clone();
+            let max_h = max_seen.clone();
+            let total_h = total.clone();
+            let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+                let active = active_h.clone();
+                let max_seen = max_h.clone();
+                let total = total_h.clone();
+                Box::pin(async move {
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(cur, Ordering::SeqCst);
+                    // Hold the "slot" long enough that a concurrent
+                    // sibling overlaps; short enough to keep the test fast.
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    total.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            });
+            let schema = ToolInputSchema {
+                schema_type: SchemaType,
+                properties: Default::default(),
+                required: None,
+                additional_properties: None,
+            };
+            let tool = Tool::builder("delegate", "test delegate", schema, handler).build();
+            let tm = create_tool_manager();
+            tm.register(tool, None);
+
+            let server = wiremock::MockServer::start().await;
+            struct FirstOnly(std::sync::atomic::AtomicUsize);
+            impl wiremock::Match for FirstOnly {
+                fn matches(&self, _req: &wiremock::Request) -> bool {
+                    self.0.fetch_add(1, Ordering::SeqCst) == 0
+                }
+            }
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body(
+                                "",
+                                vec![
+                                    serde_json::json!({
+                                        "id": "call_a",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "delegate",
+                                            "arguments": "{\"role\":\"programmer\",\"task\":\"a\"}"
+                                        }
+                                    }),
+                                    serde_json::json!({
+                                        "id": "call_b",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "delegate",
+                                            "arguments": "{\"role\":\"architect\",\"task\":\"b\"}"
+                                        }
+                                    }),
+                                ],
+                            ),
+                        )),
+                )
+                .await;
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body("done", vec![]),
+                        )),
+                )
+                .await;
+
+            let role = test_role();
+            let agent = Agent::new_with_chain(
+                "mgr".into(),
+                role,
+                vec![model_at(&server, "stub")],
+                GenerateParams::default(),
+            )
+            .unwrap();
+            let mut runner = AgentRunner::new_with_tools(agent, tm, 4);
+            let resp = runner
+                .run_turn(&[Message::user("go")], None)
+                .await
+                .expect("turn completes");
+            assert_eq!(resp, "done");
+            assert_eq!(total.load(Ordering::SeqCst), 2, "both delegates must run");
+            max_seen.load(Ordering::SeqCst)
+        }
+
+        // Phase 1: default (flag unset) → serial.
+        std::env::remove_var("LATTE_AGENT_DELEGATE_PARALLEL");
+        let serial_max = run_phase().await;
+        assert_eq!(serial_max, 1, "default must be serial (max concurrency 1)");
+
+        // Phase 2: flag on → concurrent.
+        std::env::set_var("LATTE_AGENT_DELEGATE_PARALLEL", "1");
+        let parallel_max = run_phase().await;
+        std::env::remove_var("LATTE_AGENT_DELEGATE_PARALLEL");
+        assert_eq!(parallel_max, 2, "flag on must run the two delegates concurrently");
     }
 
     #[test]

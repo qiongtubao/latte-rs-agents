@@ -74,6 +74,17 @@ pub struct WorkflowStepDef {
     /// [`WorkflowDef::validate`].
     #[serde(default)]
     pub output_key: Option<String>,
+    /// Ids of steps that must complete before this one runs.
+    ///
+    /// Declaring `depends_on` on **any** step switches the whole
+    /// workflow from implicit file-order serial execution to the
+    /// dependency-DAG scheduler: steps run in waves, and steps sharing
+    /// a wave (no unsatisfied deps between them) run **concurrently**.
+    /// Steps with the same `depends_on` fan out in parallel; a step
+    /// listing several deps fans in (waits for all of them).
+    ///
+    /// Leave empty on every step (the default) to keep the legacy
+    /// serial semantics — existing workflows are unaffected.
     #[serde(default)]
     pub depends_on: Vec<String>,
     #[serde(default)]
@@ -156,6 +167,94 @@ impl WorkflowDef {
         }
         Ok(())
     }
+
+    /// Whether this workflow uses explicit `depends_on` on any step.
+    /// When true, [`run_workflow`] switches from implicit file-order
+    /// serial execution to the dependency-DAG scheduler (independent
+    /// steps run concurrently; `depends_on` edges serialize). When
+    /// false, behavior is the legacy serial file-order loop so existing
+    /// workflows are byte-for-byte unchanged.
+    pub fn uses_dependency_dag(&self) -> bool {
+        self.steps.iter().any(|s| !s.depends_on.is_empty())
+    }
+
+    /// Validate the `depends_on` graph before running in DAG mode:
+    /// step ids are unique, every `depends_on` names an existing step,
+    /// no step depends on itself, and there are no cycles. Called from
+    /// [`run_workflow`] when [`Self::uses_dependency_dag`] is true.
+    pub fn validate_dag(&self) -> Result<(), String> {
+        use std::collections::HashSet;
+        let mut ids: HashSet<&str> = HashSet::new();
+        for step in &self.steps {
+            if !ids.insert(step.id.as_str()) {
+                return Err(format!("duplicate step id '{}'", step.id));
+            }
+        }
+        for step in &self.steps {
+            for dep in &step.depends_on {
+                if dep == &step.id {
+                    return Err(format!("step '{}' depends on itself", step.id));
+                }
+                if !ids.contains(dep.as_str()) {
+                    return Err(format!(
+                        "step '{}' depends_on unknown step '{}'",
+                        step.id, dep
+                    ));
+                }
+            }
+        }
+        // `compute_waves` returns Err on any unsatisfiable / cyclic graph.
+        compute_waves(&self.steps).map(|_| ())
+    }
+}
+
+/// Group steps into dependency "waves" for concurrent execution.
+///
+/// Wave 0 = all steps whose `depends_on` is empty (or already satisfied).
+/// Wave N = steps whose deps are all in waves `< N`. Steps within a
+/// wave have no ordering constraint between them and run concurrently;
+/// waves themselves run in order. File order is preserved within a wave
+/// for deterministic event/output ordering.
+///
+/// Returns `Err` if the graph is cyclic or references a missing step
+/// (a wave comes up empty while steps remain).
+fn compute_waves(steps: &[WorkflowStepDef]) -> Result<Vec<Vec<usize>>, String> {
+    let id_to_idx: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.id.as_str(), i))
+        .collect();
+    let mut done = vec![false; steps.len()];
+    let mut remaining = steps.len();
+    let mut waves: Vec<Vec<usize>> = Vec::new();
+    while remaining > 0 {
+        let mut wave = Vec::new();
+        for (i, s) in steps.iter().enumerate() {
+            if done[i] {
+                continue;
+            }
+            let ready = s.depends_on.iter().all(|dep| {
+                id_to_idx
+                    .get(dep.as_str())
+                    .map(|&j| done[j])
+                    .unwrap_or(false)
+            });
+            if ready {
+                wave.push(i);
+            }
+        }
+        if wave.is_empty() {
+            return Err(
+                "workflow has a dependency cycle or unsatisfiable depends_on".into(),
+            );
+        }
+        for &i in &wave {
+            done[i] = true;
+        }
+        remaining -= wave.len();
+        waves.push(wave);
+    }
+    Ok(waves)
 }
 
 fn workflows_dirs(project_cwd: &Path) -> Vec<PathBuf> {
@@ -320,15 +419,48 @@ pub struct WorkflowRunContext {
     pub cancel_flag: Arc<AtomicBool>,
 }
 
-/// Run a loaded workflow to completion. Returns the last speaker's
-/// output on success; on cancel/failure emits `WorkflowFinished` with
-/// the matching status and returns the summary as `Err`.
+/// Internal outcome of a workflow engine (serial or DAG), before the
+/// `WorkflowFinished` event is emitted by [`run_workflow`].
+enum WfOutcome {
+    Ok(String),
+    Cancelled,
+    Failed(String),
+}
+
+/// Max concurrent steps within a single dependency wave. Independent
+/// steps fan out via `tokio::task::JoinSet`; this caps how many
+/// specialists run at once so a wide wave can't exhaust models /
+/// sockets. Override with `LATTE_WORKFLOW_CONCURRENCY` (default 4).
+fn workflow_concurrency() -> usize {
+    std::env::var("LATTE_WORKFLOW_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4)
+}
+
+/// Run a loaded workflow to completion. Returns the last step's output
+/// on success; on cancel/failure emits `WorkflowFinished` with the
+/// matching status and returns the summary as `Err`.
+///
+/// Dispatches to one of two engines:
+///   - **serial** (default): steps run in file order with one
+///     persistent `AgentRunner` per role (conversation continuity
+///     across steps/rounds). Used when no step declares `depends_on`.
+///   - **DAG** (opt-in): when any step declares `depends_on`, steps run
+///     in dependency waves — independent steps concurrently, dependent
+///     steps serialized. Each step gets a fresh runner; data flows via
+///     `{{output_key}}` vars.
 pub async fn run_workflow(
     wf: &WorkflowDef,
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
     wf.validate()?;
+    let uses_dag = wf.uses_dependency_dag();
+    if uses_dag {
+        wf.validate_dag()?;
+    }
     let name = wf.name.clone();
     let wf_id = format!(
         "wf-{}-{}",
@@ -344,101 +476,171 @@ pub async fn run_workflow(
         wf_id: wf_id.clone(),
     });
 
+    let outcome = if uses_dag {
+        run_workflow_dag(wf, topic, ctx, &wf_id).await
+    } else {
+        run_workflow_serial(wf, topic, ctx, &wf_id).await
+    };
+
+    match outcome {
+        WfOutcome::Ok(last_output) => {
+            let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
+                name,
+                wf_id,
+                status: "ok".into(),
+                summary: last_output.clone(),
+            });
+            Ok(last_output)
+        }
+        WfOutcome::Cancelled => {
+            let summary = "workflow cancelled by user".to_string();
+            let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
+                name,
+                wf_id,
+                status: "cancelled".into(),
+                summary: summary.clone(),
+            });
+            Err(summary)
+        }
+        WfOutcome::Failed(msg) => {
+            let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
+                name,
+                wf_id,
+                status: "failed".into(),
+                summary: msg.clone(),
+            });
+            Err(msg)
+        }
+    }
+}
+
+/// Build a fresh `AgentRunner` for one role, wired exactly like the
+/// chat/controller `build_runner`: tool-capable roles get the tool-use
+/// protocol prompt + ground-truth block, plan tool registered when
+/// allowed. Shared by the serial engine (one per role) and the DAG
+/// engine (one per step invocation). `advisor` is rejected (monitor
+/// only).
+async fn build_role_runner(
+    role_id: &str,
+    merged: &Arc<AgentConfig>,
+    resolver: &Arc<ModelResolver>,
+    default_params: &GenerateParams,
+    cwd: &Path,
+    event_tx: &broadcast::Sender<ChatEvent>,
+) -> Result<AgentRunner, String> {
+    if role_id == "advisor" {
+        return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
+    }
+    let template = merged
+        .roles
+        .get(role_id)
+        .ok_or_else(|| {
+            format!(
+                "role '{role_id}' not found in config. available roles: {}",
+                crate::controller::role_roster_text(merged)
+            )
+        })?
+        .clone();
+    let mut role = template
+        .resolve(default_params)
+        .await
+        .map_err(|e| format!("resolve role '{role_id}': {e}"))?;
+    // 与 chat 的 build_runner 一致：带工具的角色必须拿到工具调用协议
+    // 提示 + 系统 ground truth（cwd 等），否则模型不知道该用工具，
+    // 会回答"我没有文件访问权限"。
+    if !role.allowed_tools.is_empty() {
+        role.system_prompt
+            .push_str(&crate::controller::tool_usage_prompt(&role.allowed_tools));
+    }
+    role.system_prompt
+        .push_str(&crate::ground_truth::ground_truth_block(cwd));
+    let models = resolver
+        .resolve_chain(&role.id, role.default_model_tier, &role.model_chain)
+        .map_err(|e| format!("no model for role '{role_id}': {e}"))?;
+    let agent = Agent::new_with_chain(
+        role_id.to_string(),
+        role.clone(),
+        models,
+        default_params.clone(),
+    )
+    .map_err(|e| format!("create agent '{role_id}': {e}"))?;
+    let runner = if role.allowed_tools.is_empty() {
+        AgentRunner::new(agent)
+    } else {
+        let rtm = build_tool_manager(&role.allowed_tools)
+            .await
+            .map_err(|e| format!("tools for '{role_id}': {e}"))?;
+        // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
+        // （与 controller::build_runner 对齐）
+        if role.allowed_tools.iter().any(|t| t == "plan") {
+            register_plan_tool(&rtm, event_tx.clone(), role_id.to_string())
+                .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
+        }
+        AgentRunner::new_with_tools(agent, rtm, 0)
+    };
+    Ok(runner.with_role(role_id.to_string()).with_cwd(cwd.to_path_buf()))
+}
+
+/// Legacy serial engine: file-order steps, one persistent runner per
+/// role (conversation continuity across steps/rounds). Behavior is
+/// unchanged from before the DAG scheduler was introduced.
+async fn run_workflow_serial(
+    wf: &WorkflowDef,
+    topic: &str,
+    ctx: &WorkflowRunContext,
+    wf_id: &str,
+) -> WfOutcome {
     // One runner per scheduled role; advisor is an internal monitor only.
     let mut runners: HashMap<String, AgentRunner> = HashMap::new();
     for role_id in wf.speaker_roles() {
-        if role_id == "advisor" {
-            return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
-        }
-        let template = ctx
-            .merged
-            .roles
-            .get(&role_id)
-            .ok_or_else(|| {
-                format!(
-                    "role '{role_id}' not found in config. available roles: {}",
-                    crate::controller::role_roster_text(&ctx.merged)
-                )
-            })?
-            .clone();
-        let role = template
-            .resolve(&ctx.default_params)
-            .await
-            .map_err(|e| format!("resolve role '{role_id}': {e}"))?;
-        // 与 chat 的 build_runner 一致：带工具的角色必须拿到工具调用协议
-        // 提示 + 系统 ground truth（cwd 等），否则模型不知道该用工具，
-        // 会回答"我没有文件访问权限"。
-        let mut role = role;
-        if !role.allowed_tools.is_empty() {
-            role.system_prompt
-                .push_str(&crate::controller::tool_usage_prompt(&role.allowed_tools));
-        }
-        role.system_prompt
-            .push_str(&crate::ground_truth::ground_truth_block(&ctx.cwd));
-        let models = ctx
-            .resolver
-            .resolve_chain(&role.id, role.default_model_tier, &role.model_chain)
-            .map_err(|e| format!("no model for role '{role_id}': {e}"))?;
-        let agent = Agent::new_with_chain(role_id.clone(), role.clone(), models, ctx.default_params.clone())
-            .map_err(|e| format!("create agent '{role_id}': {e}"))?;
-        let runner = if role.allowed_tools.is_empty() {
-            AgentRunner::new(agent)
-        } else {
-            let rtm = build_tool_manager(&role.allowed_tools)
-                .await
-                .map_err(|e| format!("tools for '{role_id}': {e}"))?;
-            // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
-            // （与 controller::build_runner 对齐）
-            if role.allowed_tools.iter().any(|t| t == "plan") {
-                crate::controller::register_plan_tool(&rtm, ctx.event_tx.clone(), role_id.clone())
-                    .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
+        match build_role_runner(
+            &role_id,
+            &ctx.merged,
+            &ctx.resolver,
+            &ctx.default_params,
+            &ctx.cwd,
+            &ctx.event_tx,
+        )
+        .await
+        {
+            Ok(runner) => {
+                runners.insert(role_id, runner);
             }
-            AgentRunner::new_with_tools(agent, rtm, 0)
-        };
-        runners.insert(role_id.clone(), runner.with_role(role_id).with_cwd(ctx.cwd.clone()));
+            Err(e) => return WfOutcome::Failed(e),
+        }
     }
 
     let mut vars: HashMap<String, String> = HashMap::new();
     vars.insert("topic".into(), topic.to_string());
     let total = wf.steps.len();
     let mut last_output = String::new();
-    let mut status = "ok";
-    let mut error_msg = String::new();
 
-    'rounds: for round in 0..wf.effective_max_rounds() {
+    for round in 0..wf.effective_max_rounds() {
         for (idx, step) in wf.steps.iter().enumerate() {
             if ctx.cancel_flag.load(Ordering::SeqCst) {
-                status = "cancelled";
-                break 'rounds;
+                return WfOutcome::Cancelled;
             }
             let first_role = step.roles().first().cloned().unwrap_or_default();
-            let task_text = step.task_text().to_string();
             let _ = ctx.event_tx.send(ChatEvent::WorkflowStep {
-                wf_id: wf_id.clone(),
+                wf_id: wf_id.to_string(),
                 step_id: step.id.clone(),
                 description: step.description.clone(),
                 index: idx + 1,
                 total,
                 role_id: first_role,
-                task: task_text,
+                task: step.task_text().to_string(),
             });
             let mut step_transcript = String::new();
             for speaker in step.roles() {
-                if speaker == "advisor" {
-                    status = "failed";
-                    error_msg = "advisor is monitor-only; use reviewer".into();
-                    break 'rounds;
-                }
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
-                    status = "cancelled";
-                    break 'rounds;
+                    return WfOutcome::Cancelled;
                 }
                 let runner = match runners.get_mut(&speaker) {
                     Some(r) => r,
                     None => {
-                        status = "failed";
-                        error_msg = format!("role '{speaker}' not instantiated");
-                        break 'rounds;
+                        return WfOutcome::Failed(format!(
+                            "role '{speaker}' not instantiated"
+                        ))
                     }
                 };
                 let mut step_vars = vars.clone();
@@ -450,16 +652,10 @@ pub async fn run_workflow(
                 } else {
                     format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
                 };
-                match runner
-                    .run_turn(
-                        &[Message::user(prompt)],
-                        None,
-                    )
-                    .await
-                {
+                match runner.run_turn(&[Message::user(prompt)], None).await {
                     Ok(response) => {
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
-                            wf_id: wf_id.clone(),
+                            wf_id: wf_id.to_string(),
                             step_id: step.id.clone(),
                             role_id: speaker.clone(),
                             content: response.clone(),
@@ -469,11 +665,12 @@ pub async fn run_workflow(
                         last_output = response;
                     }
                     Err(e) => {
-                        status = "failed";
-                        error_msg = format!("step '{}' speaker '{}': {e}", step.id, speaker);
-                        break 'rounds;
+                        return WfOutcome::Failed(format!(
+                            "step '{}' speaker '{}': {e}",
+                            step.id, speaker
+                        ))
                     }
-                    }
+                }
             }
             if let Some(key) = &step.output_key {
                 vars.insert(key.clone(), last_output.clone());
@@ -481,31 +678,206 @@ pub async fn run_workflow(
         }
     }
 
-    match status {
-        "ok" => {
-            let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
-                name,
-                wf_id,
-                status: "ok".into(),
-                summary: last_output.clone(),
-            });
-            Ok(last_output)
+    WfOutcome::Ok(last_output)
+}
+
+/// One step failure signal from a spawned DAG task.
+enum StepFail {
+    Cancelled,
+    Failed(String),
+}
+
+/// Everything a single DAG step task owns (spawned onto a `JoinSet`,
+/// so all fields are `Send + 'static` clones of the run context).
+struct DagStepInput {
+    wf: Arc<WorkflowDef>,
+    step_idx: usize,
+    total: usize,
+    round: usize,
+    /// Snapshot of shared `vars` taken before the wave started. Steps
+    /// in the same wave are independent, so they all read the same
+    /// pre-wave snapshot; outputs merge back only after the wave joins.
+    vars: HashMap<String, String>,
+    wf_id: String,
+    merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    default_params: GenerateParams,
+    cwd: PathBuf,
+    event_tx: broadcast::Sender<ChatEvent>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+/// Run one DAG step (all its speakers, serially) with a fresh runner
+/// per speaker. Returns `(step_id, output_key, last_output)` on success.
+async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, String), StepFail> {
+    let step = &inp.wf.steps[inp.step_idx];
+    if inp.cancel_flag.load(Ordering::SeqCst) {
+        return Err(StepFail::Cancelled);
+    }
+    let first_role = step.roles().first().cloned().unwrap_or_default();
+    let _ = inp.event_tx.send(ChatEvent::WorkflowStep {
+        wf_id: inp.wf_id.clone(),
+        step_id: step.id.clone(),
+        description: step.description.clone(),
+        index: inp.step_idx + 1,
+        total: inp.total,
+        role_id: first_role,
+        task: step.task_text().to_string(),
+    });
+
+    let mut step_transcript = String::new();
+    let mut last_output = String::new();
+    for speaker in step.roles() {
+        if inp.cancel_flag.load(Ordering::SeqCst) {
+            return Err(StepFail::Cancelled);
         }
-        s => {
-            let summary = if s == "cancelled" {
-                "workflow cancelled by user".to_string()
-            } else {
-                error_msg
-            };
-            let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
-                name,
-                wf_id,
-                status: s.into(),
-                summary: summary.clone(),
-            });
-            Err(summary)
+        let mut runner = build_role_runner(
+            &speaker,
+            &inp.merged,
+            &inp.resolver,
+            &inp.default_params,
+            &inp.cwd,
+            &inp.event_tx,
+        )
+        .await
+        .map_err(StepFail::Failed)?;
+
+        let mut step_vars = inp.vars.clone();
+        step_vars.insert("step_id".into(), step.id.clone());
+        step_vars.insert("speaker".into(), speaker.clone());
+        let base_prompt = inp.wf.render_task(step, &step_vars);
+        let prompt = if step_transcript.is_empty() {
+            base_prompt
+        } else {
+            format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
+        };
+        match runner.run_turn(&[Message::user(prompt)], None).await {
+            Ok(response) => {
+                let _ = inp.event_tx.send(ChatEvent::WorkflowTurn {
+                    wf_id: inp.wf_id.clone(),
+                    step_id: step.id.clone(),
+                    role_id: speaker.clone(),
+                    content: response.clone(),
+                    round: inp.round,
+                });
+                step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
+                last_output = response;
+            }
+            Err(e) => {
+                return Err(StepFail::Failed(format!(
+                    "step '{}' speaker '{}': {e}",
+                    step.id, speaker
+                )))
+            }
         }
     }
+    Ok((step.id.clone(), step.output_key.clone(), last_output))
+}
+
+/// DAG engine: schedule steps into dependency waves and run each wave's
+/// steps concurrently. Independent steps overlap; `depends_on` edges
+/// serialize. Each step gets a fresh runner (no shared conversation
+/// state), so data flows only through `{{output_key}}` vars — which is
+/// exactly how workflows already thread information between steps.
+async fn run_workflow_dag(
+    wf: &WorkflowDef,
+    topic: &str,
+    ctx: &WorkflowRunContext,
+    wf_id: &str,
+) -> WfOutcome {
+    use tokio::sync::Semaphore;
+    use tokio::task::JoinSet;
+
+    let waves = match compute_waves(&wf.steps) {
+        Ok(w) => w,
+        Err(e) => return WfOutcome::Failed(e),
+    };
+    let wf_arc = Arc::new(wf.clone());
+    let total = wf.steps.len();
+    let sem = Arc::new(Semaphore::new(workflow_concurrency()));
+
+    let mut vars: HashMap<String, String> = HashMap::new();
+    vars.insert("topic".into(), topic.to_string());
+    // step_id -> last_output, used to resolve the final return value.
+    let mut outputs: HashMap<String, String> = HashMap::new();
+
+    for round in 0..wf.effective_max_rounds() {
+        for wave in &waves {
+            if ctx.cancel_flag.load(Ordering::SeqCst) {
+                return WfOutcome::Cancelled;
+            }
+            let mut set: JoinSet<Result<(String, Option<String>, String), StepFail>> =
+                JoinSet::new();
+            for &idx in wave {
+                let inp = DagStepInput {
+                    wf: wf_arc.clone(),
+                    step_idx: idx,
+                    total,
+                    round,
+                    vars: vars.clone(),
+                    wf_id: wf_id.to_string(),
+                    merged: ctx.merged.clone(),
+                    resolver: ctx.resolver.clone(),
+                    default_params: ctx.default_params.clone(),
+                    cwd: ctx.cwd.clone(),
+                    event_tx: ctx.event_tx.clone(),
+                    cancel_flag: ctx.cancel_flag.clone(),
+                };
+                let sem = sem.clone();
+                set.spawn(async move {
+                    // Hold a permit for the whole step so a wide wave
+                    // can't launch more than `workflow_concurrency()`
+                    // specialists at once. Semaphore is never closed,
+                    // so `acquire_owned` only errors on shutdown — treat
+                    // that as "run anyway" rather than fail the step.
+                    let _permit = sem.acquire_owned().await.ok();
+                    run_dag_step(inp).await
+                });
+            }
+
+            // Collect the whole wave; merge outputs into `vars` only
+            // after every step in the wave has finished (they were all
+            // independent and read the same pre-wave snapshot).
+            let mut wave_updates: Vec<(Option<String>, String)> = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok((step_id, output_key, out))) => {
+                        outputs.insert(step_id, out.clone());
+                        wave_updates.push((output_key, out));
+                    }
+                    Ok(Err(StepFail::Cancelled)) => {
+                        set.abort_all();
+                        return WfOutcome::Cancelled;
+                    }
+                    Ok(Err(StepFail::Failed(msg))) => {
+                        set.abort_all();
+                        return WfOutcome::Failed(msg);
+                    }
+                    Err(join_err) => {
+                        set.abort_all();
+                        return WfOutcome::Failed(format!(
+                            "workflow step task failed: {join_err}"
+                        ));
+                    }
+                }
+            }
+            for (output_key, out) in wave_updates {
+                if let Some(key) = output_key {
+                    vars.insert(key, out);
+                }
+            }
+        }
+    }
+
+    // Final output = the file-order-last step's output (the natural
+    // "result" of the workflow, matching serial-mode semantics).
+    let final_out = wf
+        .steps
+        .last()
+        .and_then(|s| outputs.get(&s.id))
+        .cloned()
+        .unwrap_or_default();
+    WfOutcome::Ok(final_out)
 }
 
 #[cfg(test)]
@@ -675,6 +1047,228 @@ ouput_key = "design"
         );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("ouput_key"), "error should mention the unknown field: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod dag_tests {
+    use super::*;
+
+    fn wf_from(raw: &str) -> WorkflowDef {
+        toml::from_str(raw).expect("valid TOML")
+    }
+
+    /// No `depends_on` anywhere → serial mode (DAG scheduler off).
+    #[test]
+    fn no_depends_on_is_not_dag() {
+        let wf = wf_from(
+            r#"
+name = "serial"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+"#,
+        );
+        assert!(!wf.uses_dependency_dag());
+        // Serial mode = single wave per file order handled elsewhere;
+        // compute_waves on no-deps puts everything in wave 0.
+        let waves = compute_waves(&wf.steps).unwrap();
+        assert_eq!(waves, vec![vec![0, 1]]);
+    }
+
+    /// A step declaring `depends_on` flips the workflow into DAG mode.
+    #[test]
+    fn any_depends_on_enables_dag() {
+        let wf = wf_from(
+            r#"
+name = "dag"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+depends_on = ["a"]
+"#,
+        );
+        assert!(wf.uses_dependency_dag());
+        wf.validate_dag().expect("valid dag");
+    }
+
+    /// Linear chain a→b→c produces one step per wave (fully serial).
+    #[test]
+    fn linear_chain_is_serial_waves() {
+        let wf = wf_from(
+            r#"
+name = "chain"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+depends_on = ["a"]
+[[steps]]
+id = "c"
+role = "reviewer"
+task = "t"
+depends_on = ["b"]
+"#,
+        );
+        let waves = compute_waves(&wf.steps).unwrap();
+        assert_eq!(waves, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    /// Fan-out: b and c both depend on a → they share wave 1 (concurrent).
+    #[test]
+    fn fan_out_shares_a_wave() {
+        let wf = wf_from(
+            r#"
+name = "fanout"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+depends_on = ["a"]
+[[steps]]
+id = "c"
+role = "reviewer"
+task = "t"
+depends_on = ["a"]
+"#,
+        );
+        let waves = compute_waves(&wf.steps).unwrap();
+        assert_eq!(waves, vec![vec![0], vec![1, 2]]);
+    }
+
+    /// Fan-in: d waits for both b and c (from parallel wave) → own wave.
+    #[test]
+    fn fan_in_waits_for_all_deps() {
+        let wf = wf_from(
+            r#"
+name = "diamond"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+depends_on = ["a"]
+[[steps]]
+id = "c"
+role = "reviewer"
+task = "t"
+depends_on = ["a"]
+[[steps]]
+id = "d"
+role = "programmer"
+task = "t"
+depends_on = ["b", "c"]
+"#,
+        );
+        let waves = compute_waves(&wf.steps).unwrap();
+        assert_eq!(waves, vec![vec![0], vec![1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn cycle_is_rejected() {
+        let wf = wf_from(
+            r#"
+name = "cyclic"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+depends_on = ["b"]
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+depends_on = ["a"]
+"#,
+        );
+        let err = wf.validate_dag().expect_err("cycle must be rejected");
+        assert!(err.contains("cycle"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_dependency_is_rejected() {
+        let wf = wf_from(
+            r#"
+name = "bad-dep"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+depends_on = ["ghost"]
+"#,
+        );
+        let err = wf.validate_dag().expect_err("unknown dep must be rejected");
+        assert!(err.contains("ghost"), "got: {err}");
+    }
+
+    #[test]
+    fn self_dependency_is_rejected() {
+        let wf = wf_from(
+            r#"
+name = "self"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+depends_on = ["a"]
+"#,
+        );
+        let err = wf.validate_dag().expect_err("self dep must be rejected");
+        assert!(err.contains("itself"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_step_id_is_rejected() {
+        let wf = wf_from(
+            r#"
+name = "dup"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "a"
+role = "architect"
+task = "t"
+depends_on = []
+"#,
+        );
+        // Force DAG validation regardless of depends_on presence.
+        let err = wf.validate_dag().expect_err("duplicate id must be rejected");
+        assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn concurrency_env_override() {
+        // Default when unset/invalid.
+        std::env::remove_var("LATTE_WORKFLOW_CONCURRENCY");
+        assert_eq!(workflow_concurrency(), 4);
+        std::env::set_var("LATTE_WORKFLOW_CONCURRENCY", "7");
+        assert_eq!(workflow_concurrency(), 7);
+        std::env::set_var("LATTE_WORKFLOW_CONCURRENCY", "0");
+        assert_eq!(workflow_concurrency(), 4, "0 falls back to default");
+        std::env::remove_var("LATTE_WORKFLOW_CONCURRENCY");
     }
 }
 
