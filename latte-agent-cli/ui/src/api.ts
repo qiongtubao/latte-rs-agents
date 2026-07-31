@@ -166,6 +166,18 @@ export type ChatEvent =
   // plan 工具提交的任务候选：manager 调 plan 后广播，UI 弹窗勾选导入
   // 看板。tasks 与 POST /api/tasks/import 的 ImportTask 同构。
   | { type: "PlanProposed"; role_id: string; plan_id: string; tasks: ImportTask[] }
+  // ask 工具抛出的选择题：manager/角色调 ask 后广播，UI 弹出选择框；
+  // 用户提交后把选择结果作为下一条 user 消息（sendMessage）回喂角色。
+  | {
+      type: "ChoiceRequested";
+      role_id: string;
+      choice_id: string;
+      question: string;
+      multi?: boolean;
+      layout?: string; // "grid" | "" (list)
+      allow_upload?: boolean;
+      options: ChoiceOption[];
+    }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
@@ -822,6 +834,36 @@ export interface ImportTask {
   labels?: string[];
   workflow?: string;
   subtasks?: ImportTask[];
+}
+
+/** ChoiceRequested 事件里的单个选项（与后端 ChoiceOption 同构）。 */
+export interface ChoiceOption {
+  label: string;
+  description?: string;
+  /** 配图 URL，一般是 /api/images/<file>。 */
+  image?: string;
+  recommended?: boolean;
+}
+
+/** POST /api/images?ext=<ext>：上传原始图片字节，返回可访问的 URL。
+ * 用于选择框「上传自己的图片」——拿到 path 后既能预览也能回喂模型。
+ *
+ * 走裸 `fetch`（不经共享 transport）：body 是原始二进制，而 transport
+ * 的 request 会对非字符串 body 做 JSON.stringify，会破坏字节流。图片
+ * 上传是 web UI 专属能力，同源 fetch 足够。 */
+export async function uploadImage(file: File): Promise<{ path: string }> {
+  const dot = file.name.lastIndexOf(".");
+  const ext = (dot >= 0 ? file.name.slice(dot + 1) : "png").toLowerCase();
+  const buf = await file.arrayBuffer();
+  const r = await fetch(`/api/images?ext=${encodeURIComponent(ext)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: buf,
+  });
+  if (!r.ok) {
+    throw new Error(`upload image failed: ${r.status} ${await r.text().catch(() => "")}`);
+  }
+  return r.json();
 }
 
 /** GET /api/tasks：列出全部任务。 */

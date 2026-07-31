@@ -151,6 +151,14 @@ pub trait ChatRenderer: Send + Sync {
                 ))
                 .await;
             }
+            // ask 工具抛出的选择题：CLI 仅提示问题与选项数，web UI 弹窗选择。
+            ChatEvent::ChoiceRequested { role_id, question, options, .. } => {
+                self.on_status(&format!(
+                    "❓ {role_id} 请你选择（{} 个选项）：{question}",
+                    options.len()
+                ))
+                .await;
+            }
             // Soft-timeout warning: turn is still alive at this point — the
             // UI side turns it into a "continue / cancel" prompt. The CLI
             // just surfaces it as a status line so the operator can see

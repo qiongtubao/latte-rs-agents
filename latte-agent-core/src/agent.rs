@@ -1629,6 +1629,8 @@ fn build_tool_schemas(
             description: Some(td.description.clone()),
             parameters: serde_json::to_value(&td.input_schema)
                 .unwrap_or(serde_json::json!({})),
+            // 透传 ToolDefinition.strict（默认 None = 不开 OpenAI Structured Outputs）。
+            strict: td.strict,
         })
         .collect()
 }

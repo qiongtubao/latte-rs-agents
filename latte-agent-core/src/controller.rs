@@ -309,6 +309,28 @@ pub enum ChatEvent {
         plan_id: String,
         tasks: Vec<PlanTask>,
     },
+    /// 角色调用 `ask` 工具向用户抛出一道选择题（含可选图片 / 图片
+    /// 网格 / 允许上传自定义图片）。会话本轮 turn 就此结束，前端用
+    /// 本事件渲染选择弹框；用户提交后把选择结果作为下一条 user 消息
+    /// （经 `/chat/send`）回喂给角色，模型据此继续。
+    ///
+    /// `choice_id` 唯一标识本次提问，供前端去重与右键补救重开弹窗。
+    /// `multi` 为 true 时允许多选。`layout` = `"grid"` 时前端按图片
+    /// 网格渲染（否则列表）。`allow_upload` 为 true 时弹框提供上传
+    /// 自定义图片的入口（图片经 `POST /api/images` 落盘后以 URL 回传）。
+    ChoiceRequested {
+        role_id: String,
+        choice_id: String,
+        question: String,
+        #[serde(default)]
+        multi: bool,
+        /// `"list"`（默认）或 `"grid"`（图片网格选择）。
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        layout: String,
+        #[serde(default)]
+        allow_upload: bool,
+        options: Vec<ChoiceOption>,
+    },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -381,6 +403,24 @@ pub struct PlanTask {
     /// 子任务，同构，最多一层。空则不序列化。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtasks: Vec<PlanTask>,
+}
+
+/// `ask` 工具的单个选项。前端 `ChoiceRequested` 弹框逐项渲染。
+/// 字段与前端 `api.ts` 的 `ChoiceOption` 同构。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceOption {
+    /// 选项显示标签，必填非空。
+    pub label: String,
+    /// 可选补充说明，显示在标签下方。空则不序列化。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// 可选配图 URL（一般是 `/api/images/<file>`）。列表模式显示为
+    /// 缩略图，`layout="grid"` 时显示为大图卡片。空则不序列化。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image: String,
+    /// 标记为推荐项；前端加「推荐」角标。默认 false。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recommended: bool,
 }
 
 // ─── Controller input ────────────────────────────────────────────
@@ -1896,6 +1936,12 @@ async fn build_runner(
             register_plan_tool(&tm, event_tx.clone(), role_id.to_string())
                 .map_err(|e| AgentError::Tool(format!("register plan: {e}")))?;
         }
+        // Any role with "ask" in allowed_tools gets the ask tool:
+        // 向用户抛出一道选择题（含图片 / 图片网格 / 上传），弹出选择框。
+        if role.allowed_tools.iter().any(|t| t == "ask") {
+            register_ask_tool(&tm, event_tx.clone(), role_id.to_string())
+                .map_err(|e| AgentError::Tool(format!("register ask: {e}")))?;
+        }
 
         // ── 给主 runner 分配 subsession sink（manager / 任何角色通用） ──
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
@@ -2267,6 +2313,134 @@ pub(crate) fn register_plan_tool(
     tm.register(tool, Some(&role_id));
     Ok(())
 }
+
+/// 注册 `ask` 工具：角色向用户抛出一道**选择题**（可带图片、图片
+/// 网格、允许上传自定义图片），会话据此弹出选择框。
+///
+/// 语义（与 `plan` 一样是 UI 侧交互，不读写文件、不调模型）：校验
+/// 入参 → 广播 `ChatEvent::ChoiceRequested` → 返回一段“已展示选择题、
+/// 请简短引导后结束本轮”的指令串。工具返回 `Ok`（而非 `ask_human`
+/// 的 `Err`）：web 单角色 loop 无 SessionManager 可暂停，靠模型拿到
+/// 该结果后自然收尾本轮；用户在弹框里选完后，选择结果作为下一条
+/// user 消息（`/chat/send`）回喂角色，模型据此继续。
+pub(crate) fn register_ask_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    event_tx: broadcast::Sender<ChatEvent>,
+    role_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use latte_rs_agent_tools::types::{
+        PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // 进程级单调序号，保证 choice_id 全局唯一。
+    static CHOICE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let input_schema = ToolInputSchema {
+        schema_type: SchemaType,
+        properties: vec![
+            ("question".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("要向用户提出的问题（一句话）。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("options".into(), ToolInputProperty {
+                property_type: PropertyType::Array,
+                description: Some(
+                    "候选项数组，2-6 项。每项是对象：{label(必填,简短标签), description(可选,一行取舍说明), image(可选,配图URL,一般是 /api/images/<file>), recommended(可选,true 标记推荐项)}. 不要自己加“其他/Other”项——前端会自动附带“其他(自定义)”入口。".into()
+                ),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("multi".into(), ToolInputProperty {
+                property_type: PropertyType::Boolean,
+                description: Some("是否允许多选（默认 false = 单选）。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("layout".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("展示方式：\"list\"(默认) 或 \"grid\"(图片网格选择,适合每项都有 image 的视觉挑选)。".into()),
+                enum_values: Some(vec!["list".into(), "grid".into()]),
+                minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("allow_upload".into(), ToolInputProperty {
+                property_type: PropertyType::Boolean,
+                description: Some("是否允许用户上传自己的图片作为答案（默认 false）。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+        ].into_iter().collect(),
+        required: Some(vec!["question".into(), "options".into()]),
+        ..Default::default()
+    };
+
+    let handler_role_id = role_id.clone();
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let event_tx = event_tx.clone();
+        let role_id = handler_role_id.clone();
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+
+            let question = input
+                .get("question")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| tool_err("missing non-empty 'question' field".into()))?;
+
+            let opts_arr = input
+                .get("options")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| tool_err("'options' must be an array".into()))?;
+            if opts_arr.len() < 2 {
+                return Err(tool_err("'options' must have at least 2 entries".into()));
+            }
+            let mut options: Vec<ChoiceOption> = Vec::with_capacity(opts_arr.len());
+            for (i, o) in opts_arr.iter().enumerate() {
+                let opt: ChoiceOption = serde_json::from_value(o.clone())
+                    .map_err(|e| tool_err(format!("options[{i}] invalid: {e}")))?;
+                if opt.label.trim().is_empty() {
+                    return Err(tool_err(format!("options[{i}].label must not be empty")));
+                }
+                options.push(opt);
+            }
+
+            let multi = input.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
+            let allow_upload = input.get("allow_upload").and_then(|v| v.as_bool()).unwrap_or(false);
+            let layout = input
+                .get("layout")
+                .and_then(|v| v.as_str())
+                .filter(|s| *s == "grid")
+                .unwrap_or("")
+                .to_string();
+
+            let choice_id = format!("choice-{}-{}", role_id, CHOICE_SEQ.fetch_add(1, Ordering::Relaxed));
+            let n = options.len();
+            let _ = event_tx.send(ChatEvent::ChoiceRequested {
+                role_id: role_id.clone(),
+                choice_id: choice_id.clone(),
+                question,
+                multi,
+                layout,
+                allow_upload,
+                options,
+            });
+            Ok(serde_json::Value::String(format!(
+                "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
+            )))
+        })
+    });
+
+    let tool = Tool::builder(
+        "ask".to_string(),
+        "向用户抛出一道选择题并弹出选择框（支持单选/多选、每项可带配图、图片网格挑选、允许上传自定义图片）。当存在多个取舍明显不同、需要用户拍板的方案时使用；不要用于可自行决定的琐碎问题。参数：question(问题) + options(候选项数组) + 可选 multi/layout/allow_upload。".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm.register(tool, Some(&role_id));
+    Ok(())
+}
+
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -3092,6 +3266,56 @@ mod tests {
         assert!(tasks[1].get("description").is_none(), "空 description 应省略");
         assert!(tasks[1].get("priority").is_none(), "None priority 应省略");
         assert!(tasks[1].get("labels").is_none(), "空 labels 应省略");
+    }
+
+    #[test]
+    fn choice_requested_serializes_to_frontend_shape() {
+        // 验证 ChoiceRequested 经 chat_event_to_frontend_json 转成前端
+        // internally-tagged 形态：{"type":"ChoiceRequested",...}，字段
+        // snake_case；options 里空字段被 skip_serializing_if 省略。
+        let event = ChatEvent::ChoiceRequested {
+            role_id: "manager".into(),
+            choice_id: "choice-manager-0".into(),
+            question: "选哪种鉴权方式？".into(),
+            multi: false,
+            layout: "grid".into(),
+            allow_upload: true,
+            options: vec![
+                ChoiceOption {
+                    label: "JWT".into(),
+                    description: "无状态 Bearer token".into(),
+                    image: "/api/images/jwt.png".into(),
+                    recommended: true,
+                },
+                ChoiceOption {
+                    label: "OAuth2".into(),
+                    description: String::new(),
+                    image: String::new(),
+                    recommended: false,
+                },
+            ],
+        };
+        let wire = crate::event_json::chat_event_to_frontend_json(&event).expect("frontend json");
+        let v: serde_json::Value = serde_json::from_str(&wire).expect("parse wire");
+        assert_eq!(v["type"], "ChoiceRequested");
+        assert_eq!(v["role_id"], "manager");
+        assert_eq!(v["choice_id"], "choice-manager-0");
+        assert_eq!(v["question"], "选哪种鉴权方式？");
+        assert_eq!(v["multi"], false);
+        assert_eq!(v["layout"], "grid");
+        assert_eq!(v["allow_upload"], true);
+        let opts = v["options"].as_array().expect("options array");
+        assert_eq!(opts.len(), 2);
+        // 第一项：全字段序列化。
+        assert_eq!(opts[0]["label"], "JWT");
+        assert_eq!(opts[0]["description"], "无状态 Bearer token");
+        assert_eq!(opts[0]["image"], "/api/images/jwt.png");
+        assert_eq!(opts[0]["recommended"], true);
+        // 第二项：空 description/image + recommended=false 被省略。
+        assert_eq!(opts[1]["label"], "OAuth2");
+        assert!(opts[1].get("description").is_none(), "空 description 应省略");
+        assert!(opts[1].get("image").is_none(), "空 image 应省略");
+        assert!(opts[1].get("recommended").is_none(), "recommended=false 应省略");
     }
 
     #[test]

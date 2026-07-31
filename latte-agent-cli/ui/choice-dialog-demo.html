@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Choice Dialog — 前端流程 Demo</title>
+<style>
+  :root {
+    --bg: #eaeef3;
+    --bg-2: #f8fafc;
+    --bg-3: #f1f5f9;
+    --fg: #0f172a;
+    --fg-2: #475569;
+    --border: #e2e8f0;
+    --accent: #3b82f6;
+    --accent-2: #2563eb;
+    --ok: #22c55e;
+    --warn: #f59e0b;
+    --err: #ef4444;
+    --user-bubble: #dbeafe;
+    --bubble-bg: #ffffff;
+    --bubble-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+    --radius: 16px;
+    --mono: ui-monospace, "Cascadia Code", "Fira Code", monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    height: 100vh;
+  }
+
+  /* ─── left: flow explainer ─────────────────────────────── */
+  .side {
+    background: #0f172a;
+    color: #e2e8f0;
+    padding: 20px 18px;
+    overflow-y: auto;
+  }
+  .side h1 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  .side .sub { font-size: 12px; color: #94a3b8; margin-bottom: 18px; }
+  .flow-step {
+    position: relative;
+    padding: 10px 12px 12px 34px;
+    border-radius: 12px;
+    margin-bottom: 8px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid transparent;
+    transition: .2s;
+  }
+  .flow-step .n {
+    position: absolute; left: 10px; top: 11px;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #334155; color: #cbd5e1;
+    font-size: 11px; font-weight: 700;
+    display: grid; place-items: center;
+  }
+  .flow-step .t { font-size: 12.5px; font-weight: 600; }
+  .flow-step .d { font-size: 11.5px; color: #94a3b8; margin-top: 2px; }
+  .flow-step.active { background: rgba(59,130,246,0.14); border-color: var(--accent); }
+  .flow-step.active .n { background: var(--accent); color: #fff; }
+  .flow-step.done .n { background: var(--ok); color: #fff; }
+  .side code {
+    font-family: var(--mono); font-size: 11px;
+    background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 5px;
+  }
+
+  /* ─── right: chat surface ──────────────────────────────── */
+  .chat-wrap { display: flex; flex-direction: column; min-width: 0; }
+  .topbar {
+    background: #fff; padding: 10px 20px;
+    border-bottom: 1px solid rgba(0,0,0,0.05);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .brand { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); }
+  .spacer { flex: 1; }
+  .btn {
+    border: 1px solid var(--border); background: var(--bg-2);
+    padding: 6px 12px; border-radius: 9px; font-size: 12.5px;
+    cursor: pointer; color: var(--fg); transition: .15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent-2); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: var(--accent-2); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  .stream { flex: 1; overflow-y: auto; padding: 22px 26px; }
+  .msg { display: flex; gap: 10px; margin-bottom: 18px; max-width: 760px; }
+  .msg .avatar {
+    width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+    display: grid; place-items: center; font-size: 16px; background: var(--bg-3);
+  }
+  .msg .body { min-width: 0; flex: 1; }
+  .msg .who { font-size: 11.5px; color: var(--fg-2); margin-bottom: 4px; font-weight: 600; }
+  .bubble {
+    background: var(--bubble-bg); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 15px; box-shadow: var(--bubble-shadow);
+  }
+  .msg.user { flex-direction: row-reverse; margin-left: auto; }
+  .msg.user .bubble { background: var(--user-bubble); border-color: #bfdbfe; }
+  .msg.user .who { text-align: right; }
+
+  /* ─── the choice dialog card ───────────────────────────── */
+  .choice-card {
+    background: var(--bubble-bg);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    box-shadow: 0 6px 20px rgba(37,99,235,0.12);
+    overflow: hidden;
+  }
+  .choice-head {
+    padding: 12px 15px; background: linear-gradient(180deg,#eff6ff,#fff);
+    border-bottom: 1px solid var(--border);
+  }
+  .choice-head .chip {
+    display: inline-block; font-size: 10.5px; font-weight: 700;
+    color: var(--accent-2); background: #dbeafe; padding: 2px 8px;
+    border-radius: 20px; margin-bottom: 6px; letter-spacing: .3px;
+  }
+  .choice-head .q { font-size: 14.5px; font-weight: 600; }
+  .choice-head .hint { font-size: 11.5px; color: var(--fg-2); margin-top: 3px; }
+  .choice-opts { padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .opt {
+    display: flex; gap: 11px; align-items: flex-start;
+    padding: 10px 12px; border: 1px solid var(--border);
+    border-radius: 12px; cursor: pointer; transition: .12s; background: #fff;
+  }
+  .opt:hover { border-color: var(--accent); background: #f8fbff; }
+  .opt.sel { border-color: var(--accent); background: #eff6ff; box-shadow: inset 0 0 0 1px var(--accent); }
+  .opt .mark {
+    width: 18px; height: 18px; flex-shrink: 0; margin-top: 1px;
+    border: 2px solid #cbd5e1; display: grid; place-items: center;
+    color: #fff; font-size: 11px;
+  }
+  .opt.radio .mark { border-radius: 50%; }
+  .opt.check .mark { border-radius: 5px; }
+  .opt.sel .mark { background: var(--accent); border-color: var(--accent); }
+  .opt .thumb {
+    width: 54px; height: 54px; border-radius: 9px; object-fit: cover;
+    flex-shrink: 0; border: 1px solid var(--border); background: var(--bg-3);
+  }
+  .opt .txt { min-width: 0; flex: 1; }
+  .opt .label { font-weight: 600; font-size: 13.5px; }
+  .opt .rec { font-size: 10.5px; color: var(--ok); font-weight: 700; margin-left: 6px; }
+  .opt .desc { font-size: 12px; color: var(--fg-2); margin-top: 2px; }
+  .opt .other-input {
+    margin-top: 8px; width: 100%; border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; font-family: inherit;
+    display: none;
+  }
+  .opt.sel .other-input { display: block; }
+  .choice-foot {
+    padding: 10px 15px; border-top: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px; background: var(--bg-2);
+  }
+  .choice-foot .status { font-size: 11.5px; color: var(--fg-2); flex: 1; }
+
+  /* answered / collapsed summary */
+  .choice-card.answered { border-color: var(--border); box-shadow: var(--bubble-shadow); }
+  .choice-card.answered .choice-opts,
+  .choice-card.answered .choice-foot { display: none; }
+  .answer-summary { padding: 11px 15px; font-size: 12.5px; display: none; }
+  .choice-card.answered .answer-summary { display: block; }
+  .answer-summary .k { color: var(--fg-2); }
+  .answer-summary .v { font-weight: 600; color: var(--accent-2); }
+
+  .gallery { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .gallery img { width: 120px; height: 84px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); }
+  .composer { padding: 12px 20px; border-top: 1px solid rgba(0,0,0,0.05); background: #fff; display: flex; gap: 10px; }
+  .composer input { flex: 1; border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; font-size: 13.5px; }
+  pre.wire {
+    background: #0b1220; color: #93c5fd; font-family: var(--mono); font-size: 11px;
+    padding: 10px 12px; border-radius: 10px; margin-top: 10px; overflow-x: auto;
+    display: none;
+  }
+  .choice-card.show-wire pre.wire { display: block; }
+  .toggle-wire { font-size: 11px; color: var(--accent-2); cursor: pointer; background: none; border: none; }
+
+  /* ─── image-grid selection layout ──────────────────────── */
+  .choice-opts.grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 10px; padding: 12px;
+  }
+  .choice-opts.grid .opt {
+    flex-direction: column; align-items: stretch; padding: 0; overflow: hidden;
+    position: relative; gap: 0;
+  }
+  .choice-opts.grid .opt .mark {
+    position: absolute; top: 8px; right: 8px; margin: 0;
+    background: rgba(255,255,255,0.9); border-color: #cbd5e1; z-index: 2;
+  }
+  .choice-opts.grid .opt.sel .mark { background: var(--accent); border-color: var(--accent); }
+  .choice-opts.grid .opt .pic {
+    width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block;
+    background: var(--bg-3); border-bottom: 1px solid var(--border);
+  }
+  .choice-opts.grid .opt .txt { padding: 8px 10px 10px; }
+  .choice-opts.grid .opt.sel { box-shadow: inset 0 0 0 2px var(--accent); }
+
+  /* ─── upload / drop zone (user supplies their own image) ── */
+  .uploader {
+    border: 1.5px dashed #cbd5e1; border-radius: 12px; padding: 16px;
+    text-align: center; cursor: pointer; color: var(--fg-2); font-size: 12.5px;
+    transition: .15s; background: #fff; margin: 0 12px 8px;
+  }
+  .uploader:hover, .uploader.drag { border-color: var(--accent); background: #f8fbff; color: var(--accent-2); }
+  .uploader .up-icon { font-size: 22px; display: block; margin-bottom: 4px; }
+  .uploader.has-file { border-style: solid; border-color: var(--accent); }
+  .up-preview { display: none; gap: 10px; align-items: center; justify-content: center; }
+  .uploader.has-file .up-preview { display: flex; }
+  .uploader.has-file .up-prompt { display: none; }
+  .up-preview img { width: 72px; height: 54px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
+  .up-preview .name { font-size: 12px; color: var(--fg); font-weight: 600; }
+  .answer-summary img.ans-thumb { width: 96px; height: 68px; object-fit: cover; border-radius: 9px; border: 1px solid var(--border); vertical-align: middle; margin-left: 6px; }
+</style>
+</head>
+<body>
+  <aside class="side">
+    <h1>🥤 Choice Dialog 流程</h1>
+    <div class="sub">agent 向用户抛出选择 → 用户勾选 → 结果回喂给 agent</div>
+    <div id="flow"></div>
+    <div style="margin-top:18px;font-size:11.5px;color:#94a3b8;line-height:1.7">
+      对应后端事件：<br>
+      <code>ChatEvent::ChoiceRequested</code><br>
+      → SSE 推给前端渲染弹框<br>
+      → 用户提交 <code>POST /api/.../choice</code><br>
+      → <code>Resume</code> 把选择作为下一条输入回喂角色
+    </div>
+  </aside>
+
+  <div class="chat-wrap">
+    <div class="topbar">
+      <div class="brand"><span class="dot"></span> latte · choice demo</div>
+      <div class="spacer"></div>
+      <button class="btn" id="btn-single">▶ 单选</button>
+      <button class="btn" id="btn-multi">▶ 多选</button>
+      <button class="btn" id="btn-image">▶ 选项带图</button>
+      <button class="btn" id="btn-grid">▶ 图片选择</button>
+      <button class="btn" id="btn-reset">↺ 重置</button>
+    </div>
+    <div class="stream" id="stream"></div>
+    <div class="composer">
+      <input id="composer-input" placeholder="用户输入（demo 中由按钮驱动）" disabled />
+      <button class="btn primary" disabled>发送</button>
+    </div>
+  </div>
+
+<script>
+const FLOW = [
+  { t: "agent 调用 ask 工具", d: "携带 question + options(+image)" },
+  { t: "会话暂停，推送事件", d: "ChoiceRequested 经 SSE 到前端" },
+  { t: "前端渲染选择弹框", d: "单选/多选/图片网格 + Other/上传" },
+  { t: "用户提交选择", d: "POST 回后端；上传图落 /api/images" },
+  { t: "结果回喂 agent 继续", d: "Resume：选择(含图 URL)作为下一条消息" },
+];
+const flowEl = document.getElementById("flow");
+FLOW.forEach((s,i) => {
+  const d = document.createElement("div");
+  d.className = "flow-step"; d.id = "fs-" + i;
+  d.innerHTML = `<div class="n">${i+1}</div><div class="t">${s.t}</div><div class="d">${s.d}</div>`;
+  flowEl.appendChild(d);
+});
+function setFlow(active) {
+  FLOW.forEach((_,i) => {
+    const el = document.getElementById("fs-" + i);
+    el.classList.toggle("active", i === active);
+    el.classList.toggle("done", i < active);
+  });
+}
+
+const stream = document.getElementById("stream");
+function scroll() { stream.scrollTop = stream.scrollHeight; }
+function agentMsg(html) {
+  const m = document.createElement("div");
+  m.className = "msg";
+  m.innerHTML = `<div class="avatar">🧠</div><div class="body"><div class="who">manager · deepseek-v4</div><div class="bubble">${html}</div></div>`;
+  stream.appendChild(m); scroll(); return m;
+}
+function userMsg(text) {
+  const m = document.createElement("div");
+  m.className = "msg user";
+  m.innerHTML = `<div class="avatar">🧑</div><div class="body"><div class="who">你</div><div class="bubble">${text}</div></div>`;
+  stream.appendChild(m); scroll(); return m;
+}
+
+// placeholder svg thumbnails (no external assets)
+function thumb(color, label) {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='108' height='108'><rect width='108' height='108' fill='${color}'/><text x='54' y='58' font-size='13' fill='white' text-anchor='middle' font-family='sans-serif'>${label}</text></svg>`;
+  return "data:image/svg+xml;utf8," + encodeURIComponent(svg);
+}
+
+let seq = 0;
+function renderChoice(q) {
+  const id = "choice-" + (seq++);
+  const multi = !!q.multi;
+  const grid = q.layout === "grid";
+  const allowUpload = !!q.upload;
+  const wire = JSON.stringify({
+    type: "ChoiceRequested", choice_id: id, question: q.question, multi,
+    layout: grid ? "grid" : "list", allow_upload: allowUpload, options: q.options,
+  }, null, 2);
+
+  const optsHtml = q.options.map((o, i) => {
+    const isOther = o.other;
+    const rec = o.recommended ? `<span class="rec">✓ 推荐</span>` : "";
+    const desc = o.description ? `<div class="desc">${o.description}</div>` : "";
+    const otherInput = isOther ? `<input class="other-input" placeholder="输入自定义内容…">` : "";
+    if (grid) {
+      const pic = o.image ? `<img class="pic" src="${o.image}" alt="">` : `<div class="pic"></div>`;
+      return `<div class="opt ${multi ? "check" : "radio"}" data-i="${i}" data-other="${isOther?1:0}">
+        <div class="mark">${multi ? "✓" : "●"}</div>${pic}
+        <div class="txt"><div class="label">${o.label}${rec}</div>${desc}${otherInput}</div>
+      </div>`;
+    }
+    const img = o.image ? `<img class="thumb" src="${o.image}" alt="">` : "";
+    return `<div class="opt ${multi ? "check" : "radio"}" data-i="${i}" data-other="${isOther?1:0}">
+      <div class="mark">${multi ? "✓" : "●"}</div>${img}
+      <div class="txt"><div class="label">${o.label}${rec}</div>${desc}${otherInput}</div>
+    </div>`;
+  }).join("");
+
+  const uploaderHtml = allowUpload ? `
+    <div class="uploader" tabindex="0">
+      <div class="up-prompt"><span class="up-icon">🖼️</span>上传你自己的图片作为选择（点击或拖拽）</div>
+      <div class="up-preview"><img alt=""><span class="name"></span><span style="color:var(--fg-2);font-size:11px">（点此更换）</span></div>
+      <input type="file" accept="image/*" hidden>
+    </div>` : "";
+
+  const m = document.createElement("div");
+  m.className = "msg";
+  m.innerHTML = `<div class="avatar">🧠</div><div class="body"><div class="who">manager 请你选择</div>
+    <div class="choice-card" id="${id}">
+      <div class="choice-head">
+        <span class="chip">${grid ? "图片选择 · IMAGE" : (multi ? "多选 · MULTI" : "单选 · SINGLE")}</span>
+        <div class="q">${q.question}</div>
+        <div class="hint">${grid ? "点选一张图片" : (multi ? "可勾选多个" : "选择一项")}${allowUpload ? " · 也可上传自己的图片" : ""} · 然后提交</div>
+      </div>
+      <div class="choice-opts ${grid ? "grid" : ""}">${optsHtml}</div>
+      ${uploaderHtml}
+      <div class="answer-summary"></div>
+      <div class="choice-foot">
+        <span class="status">未选择</span>
+        <button class="toggle-wire">查看事件 JSON</button>
+        <button class="btn" data-act="cancel">忽略</button>
+        <button class="btn primary" data-act="submit" disabled>提交</button>
+      </div>
+      <pre class="wire">${wire.replace(/</g,"&lt;")}</pre>
+    </div></div>`;
+  stream.appendChild(m); scroll();
+
+  const card = m.querySelector(".choice-card");
+  const opts = [...card.querySelectorAll(".opt")];
+  const statusEl = card.querySelector(".status");
+  const submitBtn = card.querySelector('[data-act="submit"]');
+  const selected = new Set();
+  let uploaded = null; // { name, dataUrl }
+
+  function currentAnswers() {
+    const ans = [...selected].map(i => {
+      if (opts[i].dataset.other === "1") {
+        const v = opts[i].querySelector(".other-input").value.trim();
+        return { kind: "text", text: v ? `其他：${v}` : "其他（未填）" };
+      }
+      const o = q.options[i];
+      return { kind: o.image ? "image_option" : "text", text: o.label, image: o.image };
+    });
+    if (uploaded) ans.push({ kind: "upload", text: `上传图片：${uploaded.name}`, image: uploaded.dataUrl });
+    return ans;
+  }
+  function refresh() {
+    opts.forEach((o,i) => o.classList.toggle("sel", selected.has(i)));
+    const ans = currentAnswers();
+    statusEl.textContent = ans.length ? "已选：" + ans.map(a => a.text).join("、") : "未选择";
+    submitBtn.disabled = ans.length === 0;
+  }
+  opts.forEach((o,i) => {
+    o.addEventListener("click", (e) => {
+      if (e.target.classList.contains("other-input")) return;
+      if (multi) { selected.has(i) ? selected.delete(i) : selected.add(i); }
+      else { selected.clear(); selected.add(i); }
+      refresh();
+      const oi = o.querySelector(".other-input");
+      if (oi && selected.has(i)) setTimeout(() => oi.focus(), 30);
+    });
+    const oi = o.querySelector(".other-input");
+    if (oi) oi.addEventListener("input", refresh);
+  });
+
+  // ─── upload wiring (file picker + drag/drop) ───────────
+  const up = card.querySelector(".uploader");
+  if (up) {
+    const fileInput = up.querySelector("input[type=file]");
+    const setFile = (file) => {
+      if (!file || !file.type.startsWith("image/")) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        uploaded = { name: file.name, dataUrl: reader.result };
+        up.classList.add("has-file");
+        up.querySelector(".up-preview img").src = reader.result;
+        up.querySelector(".up-preview .name").textContent = file.name;
+        // in single-select an upload replaces option picks
+        if (!multi) { selected.clear(); }
+        refresh();
+      };
+      reader.readAsDataURL(file);
+    };
+    up.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
+    ["dragenter","dragover"].forEach(ev => up.addEventListener(ev, e => { e.preventDefault(); up.classList.add("drag"); }));
+    ["dragleave","drop"].forEach(ev => up.addEventListener(ev, e => { e.preventDefault(); up.classList.remove("drag"); }));
+    up.addEventListener("drop", e => setFile(e.dataTransfer.files[0]));
+  }
+
+  card.querySelector(".toggle-wire").addEventListener("click", () => card.classList.toggle("show-wire"));
+
+  card.querySelector('[data-act="cancel"]').addEventListener("click", () => {
+    card.classList.add("answered");
+    card.querySelector(".answer-summary").innerHTML = `<span class="k">已忽略此选择（agent 收到「用户跳过」）。</span>`;
+    setFlow(4);
+  });
+
+  submitBtn.addEventListener("click", () => {
+    setFlow(3);
+    const ans = currentAnswers();
+    const textPart = ans.map(a => a.text).join("、");
+    const imgPart = ans.filter(a => a.image).map(a => `<img class="ans-thumb" src="${a.image}">`).join("");
+    card.classList.add("answered");
+    card.querySelector(".answer-summary").innerHTML =
+      `<span class="k">你的选择：</span> <span class="v">${textPart}</span>${imgPart}`;
+    setTimeout(() => {
+      const hasImg = ans.some(a => a.image);
+      userMsg(`（选择结果）${textPart}` + (hasImg ? ans.filter(a=>a.image).map(a=>`<div><img class="ans-thumb" src="${a.image}"></div>`).join("") : ""));
+      setFlow(4);
+      setTimeout(() => {
+        agentMsg(`收到，按「<b>${textPart}</b>」继续执行。<div style="color:var(--fg-2);font-size:12px;margin-top:6px">▶ 后端：<code style="font-family:var(--mono)">Resume</code> 把选择（含图片引用）作为下一条 user 消息回喂角色历史。上传的图片走 <code style="font-family:var(--mono)">/api/images/</code> 落盘后以 URL 传给模型。</div>`);
+      }, 500);
+    }, 400);
+  });
+
+  setFlow(2);
+  return card;
+}
+
+// ─── scenarios ───────────────────────────────────────────
+function reset() { stream.innerHTML = ""; setFlow(-1); }
+
+document.getElementById("btn-single").onclick = () => {
+  reset();
+  agentMsg("我要给这个 API 加鉴权，有几种方案，取舍差别较大，需要你定一下。");
+  setFlow(0);
+  setTimeout(() => { setFlow(1);
+    setTimeout(() => renderChoice({
+      question: "这个 API 用哪种鉴权方式？",
+      multi: false,
+      options: [
+        { label: "JWT", description: "无状态 Bearer token，适合 API 客户端。", recommended: true },
+        { label: "OAuth2", description: "对接外部身份提供方的委托授权。" },
+        { label: "Session Cookie", description: "浏览器优先，服务端保存会话。" },
+        { label: "其他", other: true },
+      ],
+    }), 500);
+  }, 500);
+};
+
+document.getElementById("btn-multi").onclick = () => {
+  reset();
+  agentMsg("准备初始化项目，选一下要启用哪些能力（可多选）。");
+  setFlow(0);
+  setTimeout(() => { setFlow(1);
+    setTimeout(() => renderChoice({
+      question: "启用哪些模块？",
+      multi: true,
+      options: [
+        { label: "数据库迁移", description: "生成 migrations 目录与初始 schema。", recommended: true },
+        { label: "CI 流水线", description: "GitHub Actions：test + lint。" },
+        { label: "Docker 化", description: "Dockerfile + compose。" },
+        { label: "遥测 / 日志", description: "接入 tracing 与结构化日志。" },
+        { label: "其他", other: true },
+      ],
+    }), 500);
+  }, 500);
+};
+
+document.getElementById("btn-image").onclick = () => {
+  reset();
+  agentMsg("我生成了三个首页配色草图，你选一个方向我继续细化。");
+  setFlow(0);
+  setTimeout(() => { setFlow(1);
+    setTimeout(() => renderChoice({
+      question: "选择首页视觉方向：",
+      multi: false,
+      options: [
+        { label: "极简蓝", description: "留白 + 单一强调色。", image: thumb("#3b82f6","蓝"), recommended: true },
+        { label: "暖橙活力", description: "高对比、活泼。", image: thumb("#f59e0b","橙") },
+        { label: "森野绿", description: "沉稳、自然。", image: thumb("#16a34a","绿") },
+        { label: "其他", other: true },
+      ],
+    }), 500);
+  }, 500);
+};
+
+document.getElementById("btn-grid").onclick = () => {
+  reset();
+  agentMsg("我出了 4 张 Logo 候选，你挑一张；不满意也可以上传你自己的图。");
+  setFlow(0);
+  setTimeout(() => { setFlow(1);
+    setTimeout(() => renderChoice({
+      question: "选择一个 Logo 方案：",
+      multi: false,
+      layout: "grid",   // 图片网格选择
+      upload: true,     // 允许用户上传自己的图片作为答案
+      options: [
+        { label: "方案 A", description: "圆润 · 蓝", image: thumb("#2563eb","A"), recommended: true },
+        { label: "方案 B", description: "几何 · 紫", image: thumb("#7c3aed","B") },
+        { label: "方案 C", description: "手写 · 橙", image: thumb("#ea580c","C") },
+        { label: "方案 D", description: "极简 · 墨", image: thumb("#0f172a","D") },
+      ],
+    }), 500);
+  }, 500);
+};
+
+document.getElementById("btn-reset").onclick = reset;
+
+// boot
+document.getElementById("btn-grid").click();
+</script>
+</body>
+</html>
