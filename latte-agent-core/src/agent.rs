@@ -464,6 +464,35 @@ fn dedupe_native_tool_calls(calls: Vec<latte_ai::models::ToolCall>) -> Vec<latte
     }
     out
 }
+
+/// Ensure every tool call in a single assistant response has a unique,
+/// non-empty `id`.
+///
+/// Native function-calling pairs each `tool_result` back to its call by
+/// `tool_call_id`. Some providers hand parallel calls the *same* id (or
+/// an empty one); left as-is, multiple results collapse onto one id and
+/// the model only sees the last — e.g. two `delegate` calls to the same
+/// role would lose all but the final specialist's return. We rewrite any
+/// empty/duplicate id to a synthesized `call_<n>`, keeping the first
+/// occurrence of each distinct id. Applied *after* dedupe so genuinely
+/// identical calls are already collapsed.
+fn ensure_unique_tool_call_ids(calls: &mut [latte_ai::models::ToolCall]) {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, tc) in calls.iter_mut().enumerate() {
+        let needs_new = tc.id.trim().is_empty() || seen.contains(&tc.id);
+        if needs_new {
+            let mut n = i;
+            let mut candidate = format!("call_{n}");
+            while seen.contains(&candidate) {
+                n += 1;
+                candidate = format!("call_{n}");
+            }
+            tc.id = candidate;
+        }
+        seen.insert(tc.id.clone());
+    }
+}
 // ─── LoopDetector ─────────────────────────────────────────────────────────
 
 /// Detects when a model is stuck calling the same tool with the
@@ -1062,8 +1091,13 @@ impl AgentRunner {
             // 结构化 id+name+arguments）。同一响应内完全相同的
             // (name, arguments) 只保留首次出现，避免模型把"并行调度"
             // 误读为"重复同一调用"触发 LoopDetector。
-            let tool_calls: Vec<latte_ai::models::ToolCall> =
+            let mut tool_calls: Vec<latte_ai::models::ToolCall> =
                 dedupe_native_tool_calls(completion.tool_calls.clone());
+            // Guarantee unique, non-empty ids so each tool_result pairs
+            // back to its own call. Without this, parallel calls that
+            // share an id (e.g. two delegates to the same role) collapse
+            // to just the last result on the round-trip to the model.
+            ensure_unique_tool_call_ids(&mut tool_calls);
 
             // 3a. Emit ParseToolCalls。opens/closes 现在都等于结构化
             // tool_calls 数量（不再有文本解析失配），保留字段是为了
@@ -2954,6 +2988,76 @@ mod tests {
         let calls = vec![t("read", args.clone()), t("bash", args)];
         let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 2, "不同工具名应保留");
+    }
+
+    // ─── ensure_unique_tool_call_ids tests ──────────────────────────
+    //
+    // 回归：manager 并行委派同一角色的不同任务时，若 provider 给这些
+    // 并行调用相同/空的 id，两条 tool_result 会撞在同一 tool_call_id
+    // 上，模型只看到最后一个 → "只处理最后一个" bug。id 唯一化确保
+    // 每个返回都能配回自己的调用。
+
+    fn t_id(id: &str, name: &str, args: serde_json::Value) -> latte_ai::models::ToolCall {
+        latte_ai::models::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args,
+            arguments_raw: None,
+            arguments_parse_error: None,
+        }
+    }
+
+    #[test]
+    fn unique_ids_fixes_empty_ids_on_parallel_same_role_delegates() {
+        // 两次委派 programmer，不同任务，provider 给了空 id。
+        let mut calls = vec![
+            t_id("", "delegate", serde_json::json!({"role":"programmer","task":"A"})),
+            t_id("", "delegate", serde_json::json!({"role":"programmer","task":"B"})),
+        ];
+        // dedupe 不会合并（args 不同），随后 id 唯一化。
+        let mut deduped = dedupe_native_tool_calls(calls.drain(..).collect());
+        assert_eq!(deduped.len(), 2, "不同任务不应被去重");
+        ensure_unique_tool_call_ids(&mut deduped);
+        assert!(!deduped[0].id.trim().is_empty());
+        assert!(!deduped[1].id.trim().is_empty());
+        assert_ne!(deduped[0].id, deduped[1].id, "两个调用必须拿到不同 id");
+    }
+
+    #[test]
+    fn unique_ids_rewrites_duplicate_ids_keeping_first() {
+        let mut calls = vec![
+            t_id("dup", "delegate", serde_json::json!({"task":"A"})),
+            t_id("dup", "delegate", serde_json::json!({"task":"B"})),
+        ];
+        ensure_unique_tool_call_ids(&mut calls);
+        assert_eq!(calls[0].id, "dup", "首个保留原 id");
+        assert_ne!(calls[1].id, "dup", "重复的第二个应被改写");
+    }
+
+    #[test]
+    fn unique_ids_leaves_distinct_ids_untouched() {
+        let mut calls = vec![
+            t_id("call_a", "delegate", serde_json::json!({"task":"A"})),
+            t_id("call_b", "delegate", serde_json::json!({"task":"B"})),
+        ];
+        ensure_unique_tool_call_ids(&mut calls);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[1].id, "call_b");
+    }
+
+    #[test]
+    fn unique_ids_handles_synthesized_collision() {
+        // 已有一个真实 id 恰好等于合成候选 "call_1"，空 id 的那个
+        // 必须跳过它另取，不能撞车。
+        let mut calls = vec![
+            t_id("", "delegate", serde_json::json!({"task":"A"})),   // idx 0 → call_0
+            t_id("call_1", "delegate", serde_json::json!({"task":"B"})), // 保留
+            t_id("", "delegate", serde_json::json!({"task":"C"})),   // idx 2 → call_2 (不撞 call_1)
+        ];
+        ensure_unique_tool_call_ids(&mut calls);
+        let ids: std::collections::HashSet<_> = calls.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids.len(), 3, "三个 id 全部唯一: {:?}", calls.iter().map(|c| &c.id).collect::<Vec<_>>());
+        assert_eq!(calls[1].id, "call_1");
     }
 
     // ─── LoopDetector 报数修正测试 ───────────────────────────────────
