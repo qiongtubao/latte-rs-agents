@@ -22,7 +22,7 @@ use latte_ai::params::GenerateParams;
 use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use crate::advisor_monitor::AdvisorMonitorConfig;
+use crate::advisor_monitor::{AdvisorMonitorConfig, AdvisorReviewEngine};
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
@@ -2489,6 +2489,78 @@ pub(crate) fn register_ask_tool(
     Ok(())
 }
 
+/// Delegate-return gate: review a specialist's output before it flows
+/// back to the manager, checking (1) role-responsibility adherence and
+/// (2) whether the return actually answers the delegated task. Emits a
+/// 🦉 advisor bubble on any non-`ok` verdict; on `intervene`/`terminate`
+/// it also appends a review note to the payload the manager consumes.
+/// Degrades silently (returns `response` unchanged) when the advisor is
+/// unavailable or the review times out.
+async fn gate_delegate_return(
+    engine: &AdvisorReviewEngine,
+    event_tx: &broadcast::Sender<ChatEvent>,
+    role_id: &str,
+    role_responsibilities: &str,
+    task: &str,
+    response: String,
+) -> String {
+    use crate::advisor_monitor::Verdict;
+    // Bound the review so a slow/absent advisor model can't stall the
+    // delegate return (mirrors the monitor's REVIEW_TIMEOUT_SECS).
+    let review = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        engine.review_delegate(role_id, role_responsibilities, task, &response),
+    )
+    .await;
+    let verdict = match review {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!("delegate-return review failed (degraded): {e}");
+            return response;
+        }
+        Err(_) => {
+            tracing::warn!("delegate-return review timed out; passing through");
+            return response;
+        }
+    };
+    if verdict.verdict == Verdict::Ok {
+        return response;
+    }
+    let label = match verdict.verdict {
+        Verdict::Warn => "⚠️ warn",
+        _ => "🛑 intervene",
+    };
+    let reason = if verdict.reason.is_empty() {
+        "疑似偏离职责或未完全达成委派任务".to_string()
+    } else {
+        verdict.reason.clone()
+    };
+    let mut bubble = format!("{label}（{role_id} 委派返回审查）：{reason}");
+    if !verdict.hint.is_empty() {
+        bubble.push_str(&format!("\n\n> 建议：{}", verdict.hint));
+    }
+    let _ = event_tx.send(ChatEvent::RoleTurn {
+        role_id: "advisor".to_string(),
+        content: bubble,
+        is_complete: true,
+        sub_id: None,
+    });
+    // `warn` is human-visible only (bubble); `intervene`/`terminate`
+    // also annotate the payload so the manager sees the caveat inline.
+    if matches!(verdict.verdict, Verdict::Intervene | Verdict::Terminate) {
+        let hint_line = if verdict.hint.is_empty() {
+            String::new()
+        } else {
+            format!("\n处理建议：{}", verdict.hint)
+        };
+        format!(
+            "{response}\n\n---\n⚠️ [监察审查] 本返回可能偏离「{role_id}」职责或未完全达成委派任务：{reason}{hint_line}"
+        )
+    } else {
+        response
+    }
+}
+
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -2540,11 +2612,20 @@ async fn register_delegate_tool(
     let sem = Arc::new(Semaphore::new(8));
     let merged_owned = Arc::new(merged.clone());
     let resolver_owned = Arc::new(resolver.clone());
+    // Delegate-return gate: an advisor review engine that inspects each
+    // specialist's output before it flows back to the manager (role
+    // adherence + task-result relevance). Built once; cloned per call.
+    let review_engine = Arc::new(AdvisorReviewEngine::new(
+        merged_owned.clone(),
+        resolver_owned.clone(),
+        default_params.clone(),
+    ));
     let cancel_flag_owned = Arc::clone(&cancel_flag);
     let turn_cancel_flag_owned = turn_cancel_flag.clone();
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
         let resolver = Arc::clone(&resolver_owned);
+        let review_engine = Arc::clone(&review_engine);
         let default_params = default_params.clone();
         let event_tx = event_tx.clone();
         let cwd = cwd.clone();
@@ -2736,7 +2817,26 @@ async fn register_delegate_tool(
                     }
                 }
             }
-            let run_result = result;
+            // ── Delegate-return gate ──
+            // Before the specialist's result flows back to the manager,
+            // run an advisor review (role adherence + does it answer the
+            // task). On `intervene` the returned payload is annotated
+            // with a review note so the manager sees the caveat; a 🦉
+            // bubble is emitted for the human either way. Degrades
+            // silently (returns the output unchanged) if the advisor is
+            // unavailable or times out.
+            let run_result = match result {
+                Ok(response) => Ok(gate_delegate_return(
+                    &review_engine,
+                    &event_tx,
+                    &role_id,
+                    &role.system_prompt,
+                    &task,
+                    response,
+                )
+                .await),
+                Err(e) => Err(e),
+            };
 
             // 6. Emit specialist's RoleTurn + RoleFinished so the UI
             //    can show the subagent reply with a reference back to

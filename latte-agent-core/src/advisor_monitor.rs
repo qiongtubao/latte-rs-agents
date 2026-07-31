@@ -694,6 +694,73 @@ impl AdvisorReviewEngine {
         }
         Ok(parse_verdict(&completion.content))
     }
+
+    /// Review a specialist's delegate return **before** it flows back
+    /// into the manager's context. Judges two things:
+    ///   1. role adherence — did the specialist stay within its role's
+    ///      responsibilities?
+    ///   2. result relevance — does the return actually answer the
+    ///      delegated task / produce the expected result?
+    ///
+    /// Reuses the `advisor` role + `parse_verdict`. `Err` means the
+    /// advisor could not be reached/built — callers degrade silently
+    /// (return the specialist output unchanged).
+    pub async fn review_delegate(
+        &self,
+        role_id: &str,
+        role_responsibilities: &str,
+        task: &str,
+        response: &str,
+    ) -> AgentResult<ReviewVerdict> {
+        let template = self
+            .agent_config
+            .roles
+            .get("advisor")
+            .cloned()
+            .or_else(|| crate::prompts::template_for("advisor"))
+            .ok_or_else(|| AgentError::RoleNotFound("advisor".to_string()))?;
+        let role = template.resolve(&self.default_params).await?;
+        let models =
+            self.resolver
+                .resolve_chain("advisor", ModelTier::Premium, &role.model_chain)?;
+        let agent = Agent::new_with_chain(
+            "advisor".to_string(),
+            role,
+            models,
+            self.default_params.clone(),
+        )?;
+        let sys = agent.system_message(&serde_json::json!({}))?;
+        let user = Message::user(build_delegate_review_prompt(
+            role_id,
+            role_responsibilities,
+            task,
+            response,
+        ));
+        let model_id = agent
+            .model_chain
+            .first()
+            .map(|m| m.model.id.clone())
+            .unwrap_or_default();
+        if let Some(sink) = self.subsession_sink.as_ref() {
+            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+            sink.emit(crate::trace::TraceEvent::ModelCall {
+                meta,
+                model_id,
+                params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
+                latency_ms: 0,
+                finish_reason: String::new(),
+            });
+        }
+        let completion = agent.chat(&[sys, user], None, WaitPolicy::NoWait).await?;
+        if let Some(sink) = self.subsession_sink.as_ref() {
+            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+            sink.emit(crate::trace::TraceEvent::ModelRawOut {
+                meta,
+                raw_content: completion.content.clone(),
+            });
+        }
+        Ok(parse_verdict(&completion.content))
+    }
 }
 
 // ─── 项目监察笔记 (advisor-watchdog.md) ────────────────────────────
@@ -757,6 +824,10 @@ fn build_review_prompt(
 2. **工具误用**：调用格式错误、参数不合法、无意义的重复调用。
 3. **思路跑偏**：偏离用户问题、在错误方向上持续投入。
 4. **异常循环**：同一失败模式反复重试。
+5. **分派路由是否合理**（manager 的核心职责）：
+   - **简单任务**（一两步就能答/改的）应当**直接完成**，不该动辄开 workflow 或委派角色（过度编排 → 建议 intervene 让它直接做）。
+   - **复杂任务**应当**优先尝试匹配已有 workflow**；若选了 workflow，核查所选 workflow 与任务是否对得上（选错/硬套 → 建议纠正）。
+   - **确无合适 workflow** 时，manager 自行判断**委派角色**：核查委派的角色是否对口、任务拆分是否合理（把实现派给 reviewer、把审查派给 programmer 这类错配 → 建议纠正）。
 {attention_block}
 # 触发原因
 
@@ -783,12 +854,72 @@ hint: <给 manager 的一句话纠正提示，具体可执行；仅 intervene �
     )
 }
 
+/// Review prompt for a specialist's delegate return, checked before it
+/// flows back to the manager. The advisor's own role prompt is the
+/// system message; this is the user message. Focuses on two axes:
+/// role-responsibility adherence and task-result relevance.
+fn build_delegate_review_prompt(
+    role_id: &str,
+    role_responsibilities: &str,
+    task: &str,
+    response: &str,
+) -> String {
+    // Bound the injected sections so a huge system prompt / response
+    // doesn't blow the review context.
+    let duties = truncate_chars(role_responsibilities, 2_000);
+    let task_s = truncate_chars(task, 1_500);
+    let resp_s = truncate_chars(response, 6_000);
+    format!(
+        r#"# 委派返回审查任务
+
+专家角色「{role_id}」刚完成一次被委派的子任务，其结果**即将返回给 manager 合并进主会话**。请在返回前做一次把关。
+
+# 该角色的职责范围（其系统提示，可能截断）
+
+<duties>
+{duties}
+</duties>
+
+# 委派给它的任务
+
+{task_s}
+
+# 它返回的结果
+
+<response>
+{resp_s}
+</response>
+
+逐项检查：
+1. **偏离职责 / 越权**：是否做了超出「{role_id}」职责范围的事，或没有以该角色应有的专业方式完成（比如让 reviewer 去写实现、让 programmer 只空谈不给代码）。
+2. **答非所问 / 未达结果**：返回是否真正回答了委派任务、产出了任务预期的结果——有无跑题、空泛套话、遗漏关键要求，或声称完成但实际没做（幻觉式交付）。
+
+# 输出格式（严格遵守，键名小写英文，不要输出其他键）
+
+verdict: ok | warn | intervene
+reason: <1-3 句给用户看的裁决理由；verdict 为 ok 时留空>
+hint: <给 manager 的一句话提示，说明该返回的问题以及应如何处理（打回重做 / 补充哪部分）；仅 intervene 时必填，其余留空>
+
+判定标准：
+- 切题、在职责内、达成了任务 → ok
+- 有瑕疵但基本可用（略不完整 / 轻微偏移）→ warn：只给用户看气泡，不改返回内容
+- 明显越权、答非所问、或未达成任务 → intervene：会在返回给 manager 的内容后追加审查提示"#
+    )
+}
+
 // ─── Monitor state machine ─────────────────────────────────────────
 
 /// Outcome of feeding one event to the monitor state.
 struct StepOutcome {
     findings: Vec<Finding>,
     turn_ended: bool,
+    /// The manager just made a task-routing decision (invoked the
+    /// `workflow` tool, or delegated to a role). Triggers an LLM review
+    /// of the routing choice — even with no deterministic anomaly — so
+    /// the advisor can judge whether the dispatch is reasonable. Unlike
+    /// a `Finding`, this does NOT auto-inject a corrective hint; the
+    /// review only nudges the manager if it actually finds a problem.
+    review_requested: bool,
 }
 
 struct MonitorState {
@@ -811,6 +942,7 @@ impl MonitorState {
     fn observe(&mut self, ev: &ChatEvent) -> StepOutcome {
         let mut findings = Vec::new();
         let mut turn_ended = false;
+        let mut review_requested = false;
         match ev {
             ChatEvent::RoleTurn {
                 role_id,
@@ -849,6 +981,11 @@ impl MonitorState {
             } if role_id == &self.watched_role => {
                 self.transcript.push(format!("[tool_use] {tool_name} {args}"));
                 findings.extend(self.detectors.observe_tool_use(tool_name, args));
+                // Manager invoking the `workflow` tool is a routing
+                // decision — review whether the chosen workflow fits.
+                if tool_name == "workflow" {
+                    review_requested = true;
+                }
             }
             ChatEvent::ToolResult {
                 role_id,
@@ -880,6 +1017,9 @@ impl MonitorState {
                     "[delegate → {to_role}] {}",
                     truncate_chars(task, 500)
                 ));
+                // Manager delegating to a role is a routing decision —
+                // review whether the target role + task split is sound.
+                review_requested = true;
             }
             ChatEvent::DelegateFinished {
                 from_role,
@@ -910,6 +1050,7 @@ impl MonitorState {
         StepOutcome {
             findings,
             turn_ended,
+            review_requested,
         }
     }
 }
@@ -963,8 +1104,14 @@ impl AdvisorMonitor {
 
                 let should_review = match config.review_mode {
                     AdvisorReviewMode::Off => false,
-                    AdvisorReviewMode::OnAnomaly => !outcome.findings.is_empty(),
-                    AdvisorReviewMode::EveryTurn => outcome.turn_ended,
+                    // Routing decisions (workflow / delegate) request a
+                    // review even without a deterministic anomaly.
+                    AdvisorReviewMode::OnAnomaly => {
+                        !outcome.findings.is_empty() || outcome.review_requested
+                    }
+                    AdvisorReviewMode::EveryTurn => {
+                        outcome.turn_ended || outcome.review_requested
+                    }
                 };
                 if !should_review {
                     continue;
@@ -978,14 +1125,21 @@ impl AdvisorMonitor {
                 }
                 state.reviews_this_turn += 1;
 
-                let trigger = if outcome.findings.is_empty() {
-                    "例行审查（every_turn 模式）：本 turn 未命中确定性检测器".to_string()
-                } else {
+                let trigger = if !outcome.findings.is_empty() {
                     let mut s = "命中确定性检测器：".to_string();
                     for f in &outcome.findings {
                         s.push_str(&format!("\n- {} {:?}：{}", f.kind.label(), f.kind, f.evidence));
                     }
                     s
+                } else if outcome.review_requested {
+                    "manager 刚做出任务分派决策（调用 workflow 或委派角色）。\
+                     请重点核查第 5 项【分派路由是否合理】：\n\
+                     - 简单任务是否被过度编排（本可直接完成）？\n\
+                     - 复杂任务是否优先尝试匹配 workflow？所选 workflow 是否对口？\n\
+                     - 无合适 workflow 而自行委派时，目标角色与任务拆分是否合理？"
+                        .to_string()
+                } else {
+                    "例行审查（every_turn 模式）：本 turn 未命中确定性检测器".to_string()
                 };
                 let question = controller.last_user_input();
                 let transcript = state.transcript.render();
