@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSession, resumeSession, importTasks, uploadImage, type ImportTask, type ChoiceOption } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSession, resumeSession, pauseRole, resumeRole, importTasks, uploadImage, type ImportTask, type ChoiceOption } from "./api";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
@@ -967,16 +967,26 @@ const stepMsgIds = new Map<string, string>();
     applyPausedMarkers();
     updateRolePauseToggle();
   }
+  // Toggle a single role's paused state through the dedicated per-role
+  // endpoints (`pauseRole` / `resumeRole`). Shared by the toolbar toggle
+  // button and the avatar right-click menu. The optimistic ⏸ marker is
+  // driven by the RolePaused / RoleResumed ChatEvent the backend echoes.
+  async function toggleRolePause(roleId: string): Promise<void> {
+    if (!roleId) return;
+    const willPause = !pausedRoles.has(roleId);
+    try {
+      addMessage({ kind: "system", content: `→ ${willPause ? "暂停" : "恢复"}角色 ${roleId}` });
+      if (willPause) { await pauseRole(roleId); } else { await resumeRole(roleId); }
+    } catch (e) {
+      console.error("[chat] role pause toggle failed:", e);
+    }
+  }
   container.rolePauseToggle.addEventListener("click", async () => {
     const roleId = container.roleSelect.value;
     if (!roleId) return;
-    const cmd = pausedRoles.has(roleId) ? `/resume ${roleId}` : `/pause ${roleId}`;
     container.rolePauseToggle.disabled = true;
     try {
-      addMessage({ kind: "system", content: `→ ${cmd}` });
-      await sendCommand(cmd);
-    } catch (e) {
-      console.error("[chat] role pause toggle failed:", e);
+      await toggleRolePause(roleId);
     } finally {
       container.rolePauseToggle.disabled = false;
     }
@@ -1096,16 +1106,47 @@ const stepMsgIds = new Map<string, string>();
   // ── Context menu (right-click) ──
   let selectedMsgId: string | null = null;
 
-  // 右键角色头像 → 打开角色编辑器。头像 class 形如
-  // `msg-avatar <roleId>`（用户自己的是 `msg-avatar self-avatar`，忽略）。
+  // 右键角色头像 → 弹出小菜单：暂停/恢复该角色（多角色 HIL）+
+  // 编辑角色。头像 class 形如 `msg-avatar <roleId>`（用户自己的是
+  // `msg-avatar self-avatar`，忽略）。菜单是一个独立浮层，与消息
+  // 右键菜单（#contextMenu）互不干扰。
+  let avatarMenu: HTMLElement | null = null;
+  function closeAvatarMenu(): void {
+    if (avatarMenu) { avatarMenu.remove(); avatarMenu = null; }
+  }
   container.messagesEl.addEventListener("contextmenu", (e) => {
-    if (!onEditRole) return;
     const avatar = (e.target as HTMLElement).closest(".msg-avatar") as HTMLElement | null;
     if (!avatar) return;
     const roleId = avatar.classList[1];
     if (!roleId || roleId === "self-avatar") return;
     e.preventDefault();
-    onEditRole(roleId);
+    closeAvatarMenu();
+    const menu = document.createElement("div");
+    menu.className = "context-menu avatar-menu";
+    menu.style.display = "block";
+    const paused = pausedRoles.has(roleId);
+    const pauseItem = document.createElement("div");
+    pauseItem.className = "menu-item";
+    pauseItem.textContent = paused ? `▶ 恢复角色「${roleId}」` : `⏸ 暂停角色「${roleId}」`;
+    pauseItem.title = paused
+      ? `恢复角色 ${roleId}：重新参与每轮`
+      : `暂停角色 ${roleId}：该角色在每轮里被跳过，其余角色照常（多角色 HIL）`;
+    pauseItem.addEventListener("click", () => { closeAvatarMenu(); void toggleRolePause(roleId); });
+    menu.appendChild(pauseItem);
+    if (onEditRole) {
+      const editItem = document.createElement("div");
+      editItem.className = "menu-item";
+      editItem.textContent = "✎ 编辑角色";
+      editItem.addEventListener("click", () => { closeAvatarMenu(); onEditRole!(roleId); });
+      menu.appendChild(editItem);
+    }
+    document.body.appendChild(menu);
+    menu.style.left = Math.min(e.clientX, window.innerWidth - 200) + "px";
+    menu.style.top = Math.min(e.clientY, window.innerHeight - 100) + "px";
+    avatarMenu = menu;
+  });
+  document.addEventListener("click", (e) => {
+    if (avatarMenu && !avatarMenu.contains(e.target as Node)) closeAvatarMenu();
   });
 
   container.messagesEl.addEventListener("contextmenu", (e) => {

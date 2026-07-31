@@ -1143,6 +1143,44 @@ pub async fn chat_resume(
     Ok(())
 }
 
+/// `POST /api/chat/pause-role` — 单独暂停一个角色（多角色 HIL v1.4）。
+/// 与整会话的 [`chat_pause`] 正交：被暂停的角色在每轮里被 scheduler
+/// 跳过，其余角色照常推进，全局 `SessionState` 不变。底层复用
+/// controller 的 `/pause <role>` 输入通道；controller 校验角色是否
+/// 存在后，会回发结构化的 `RolePaused` ChatEvent 驱动前端标记。
+pub async fn chat_pause_role(
+    b: &UiBackend,
+    session_id: Option<&str>,
+    role_id: &str,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.submit_input(&format!("/pause {role_id}")).await;
+    Ok(())
+}
+
+/// `POST /api/chat/resume-role` — 恢复被 [`chat_pause_role`] 单独暂停
+/// 的角色。controller 校验角色处于暂停态后回发 `RoleResumed`
+/// ChatEvent。与整会话的 [`chat_resume`] 正交。
+pub async fn chat_resume_role(
+    b: &UiBackend,
+    session_id: Option<&str>,
+    role_id: &str,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.submit_input(&format!("/resume {role_id}")).await;
+    Ok(())
+}
+
 #[derive(Serialize)]
 pub struct TraceSummary {
     pub session_id: String,

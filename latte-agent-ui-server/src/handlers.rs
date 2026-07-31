@@ -251,6 +251,35 @@ pub(crate) async fn chat_resume(
         Err(_) => StatusCode::NOT_FOUND,
     }
 }
+
+/// Body for per-role pause/resume: carries the target `role_id` plus the
+/// usual optional `session_id`. Shared by both endpoints.
+#[derive(Deserialize)]
+pub(crate) struct RolePauseRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    role_id: String,
+}
+
+pub(crate) async fn chat_pause_role(
+    State(state): State<AppState>,
+    Json(req): Json<RolePauseRequest>,
+) -> StatusCode {
+    match api::chat_pause_role(&state.backend, req.session_id.as_deref(), &req.role_id).await {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
+pub(crate) async fn chat_resume_role(
+    State(state): State<AppState>,
+    Json(req): Json<RolePauseRequest>,
+) -> StatusCode {
+    match api::chat_resume_role(&state.backend, req.session_id.as_deref(), &req.role_id).await {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
 // ─── SSE（HTTP 特有） ─────────────────────────────────────────────
 
 pub(crate) async fn events_sse(

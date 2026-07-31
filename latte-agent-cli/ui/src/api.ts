@@ -406,6 +406,20 @@ export async function pauseSession(): Promise<void> {
 export async function resumeSession(): Promise<void> {
   await getTransport().request("POST", "/api/chat/resume", chatBody({}));
 }
+
+/** Pause a single role (multi-role HIL). Orthogonal to `pauseSession()`:
+ *  the paused role is skipped each round while the others keep running.
+ *  The backend echoes a `RolePaused` ChatEvent. */
+export async function pauseRole(role_id: string): Promise<void> {
+  await getTransport().request("POST", "/api/chat/pause-role", chatBody({ role_id }));
+}
+
+/** Resume a single individually-paused role. Counterpart to `pauseRole()`.
+ *  The backend echoes a `RoleResumed` ChatEvent. */
+export async function resumeRole(role_id: string): Promise<void> {
+  await getTransport().request("POST", "/api/chat/resume-role", chatBody({ role_id }));
+}
+
 export async function switchRole(role_id: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/role", chatBody({ role_id }));
 }
