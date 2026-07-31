@@ -95,11 +95,26 @@ export function mountChat(opts: {
    *  有 subId 时用 session 全量历史代替 subsession 详情面板。 */
   onShowSessionLog?: () => Promise<void> | void;
   onEditRole?: (roleId: string) => void;
+
+  /** Fork a new session from the given event prefix (the source
+   *  session's visible history up to and including the right-clicked
+   *  message). main.ts wires this to forkSession() + activateSession(). */
+  onFork?: (events: ChatEvent[]) => Promise<void> | void;
+
   onReconnect?: () => void;
 }): ChatController {
-  const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onShowSessionLog, onEditRole } = opts;
+  const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onShowSessionLog, onEditRole, onFork } = opts;
   let msgCounter = 0;
   let turnStartTime = 0;
+  // ── Fork support: mirror the ordered ChatEvent stream this session
+  // has processed (replay + live), so a right-click can fork the
+  // discussion up to a chosen message. `currentEventIdx` is the index
+  // (into `allEvents`) of the event currently being handled; message
+  // rows are tagged with it so the context menu can map a clicked row
+  // back to an event-stream position. -1 = not inside handleEvent
+  // (synthetic local rows like "→ /clear" stay untagged, no fork).
+  const allEvents: ChatEvent[] = [];
+  let currentEventIdx = -1;
   /** 当前显示的「超时询问」条；同一 role 重复触发替换之，
    *  跨 role 的并行执行按 role 维度分别保留。 */
   let timeoutPromptEl: HTMLElement | null = null;
@@ -255,6 +270,10 @@ const stepMsgIds = new Map<string, string>();
     row.className = `message-row ${isSelf ? "self" : kind}`;
     row.dataset.messageId = id;
     if (opts2.subId) row.dataset.subId = opts2.subId;
+    // Tag with the event-stream index so a right-click can fork the
+    // discussion up to this message. Only rows produced while handling
+    // a real ChatEvent get a valid index; synthetic local rows don't.
+    if (currentEventIdx >= 0) row.dataset.eventSeq = String(currentEventIdx);
 
     if (withAvatar) {
       // ── Avatar + bubble layout ──
@@ -1066,6 +1085,10 @@ const stepMsgIds = new Map<string, string>();
       } else if (act === "add-to-board" && !(record?.planTasks && record.planTasks.length > 0)) {
         // 仅 plan 工具产出的消息（带 planTasks）显示「导入任务看板」。
         el.style.display = "none";
+      } else if (act === "fork" && (!onFork || row.dataset.eventSeq === undefined)) {
+        // 「从此处分叉」仅在有 fork 回调、且该行能映射到事件流位置
+        // 时显示（合成的本地系统行没有 eventSeq，不可分叉）。
+        el.style.display = "none";
       } else {
         el.style.display = "";
       }
@@ -1138,6 +1161,19 @@ const stepMsgIds = new Map<string, string>();
         }
         break;
       }
+      case "fork": {
+        // 从被点的这条消息处分叉：把事件流前缀（含该事件）交给
+        // main.ts 去建新 session 并切过去。
+        const seqRaw = record.el.dataset.eventSeq;
+        const seq = seqRaw === undefined ? -1 : Number(seqRaw);
+        if (!onFork || !Number.isInteger(seq) || seq < 0) {
+          alert("该消息无法作为分叉点");
+          break;
+        }
+        const prefix = allEvents.slice(0, seq + 1);
+        void onFork(prefix);
+        break;
+      }
     }
     menu.style.display = "none";
   });
@@ -1208,6 +1244,18 @@ const stepMsgIds = new Map<string, string>();
     timeoutPromptRole = ev.role_id;
   }
   function handleEvent(e: ChatEvent): void {
+    // Record the event in the fork mirror and expose its index to
+    // addMessage (so rows created for this event are tagged). Reset to
+    // -1 after dispatch so synthetic local rows stay untagged.
+    allEvents.push(e);
+    currentEventIdx = allEvents.length - 1;
+    try {
+      dispatchEvent(e);
+    } finally {
+      currentEventIdx = -1;
+    }
+  }
+  function dispatchEvent(e: ChatEvent): void {
     switch (e.type) {
       case "RoleStarted": {
         subagentTools = [];
@@ -1681,6 +1729,8 @@ const stepMsgIds = new Map<string, string>();
     container.messagesEl.innerHTML="";
     msgCounter=0;
     messageStore.length=0;
+    allEvents.length=0;
+    currentEventIdx=-1;
     clearAllDelegates();
     subagentTools.length = 0;
     lastUserMsgId = "";

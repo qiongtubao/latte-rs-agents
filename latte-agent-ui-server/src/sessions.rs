@@ -291,6 +291,13 @@ pub(crate) struct SessionSpawnParams {
     pub(crate) primary_model_id: Option<String>,
     pub(crate) initial_tier: Option<ModelTier>,
     pub(crate) subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
+    /// Pre-existing conversation history to seed the controller with
+    /// before the first user turn. Empty for fresh/restored sessions;
+    /// populated for forked sessions (reconstructed from the source
+    /// session's event prefix) so the fork's agent remembers the
+    /// discussion it branched from. Threaded into
+    /// `ControllerConfig.initial_history` (single-role path).
+    pub(crate) initial_history: Vec<latte_ai::models::Message>,
 }
 
 /// Per-tab state. Holds the controller (restored sessions spawn it
@@ -396,7 +403,7 @@ impl SessionHandle {
             default_params: default_params.clone(),
             primary_model_id: self.spawn.primary_model_id.clone(),
             initial_tier: self.spawn.initial_tier.clone(),
-            initial_history: vec![],
+            initial_history: self.spawn.initial_history.clone(),
             cwd: self.spawn.cwd.clone(),
             subsession_store: self.spawn.subsession_store.clone(),
             // 透传 SessionHandle 自己的 session_id —— subsession_store
@@ -520,6 +527,7 @@ pub(crate) async fn create_session_handle(
             primary_model_id,
             initial_tier,
             subsession_store: subsession_store.clone(),
+            initial_history: Vec::new(),
         },
         first_user_msg: parking_lot::Mutex::new(None),
         label: parking_lot::Mutex::new(None),
@@ -531,6 +539,75 @@ pub(crate) async fn create_session_handle(
         persist,
     };
     // 新 session eagerly spawn（行为同改造前）。
+    handle.controller_or_spawn().await?;
+    Ok(handle)
+}
+
+/// Construct a forked `SessionHandle`: a brand-new session pre-seeded
+/// with a cloned discussion prefix (`event_lines`, already frontend-JSON
+/// strings) for visible history, and `initial_history` (reconstructed
+/// LLM messages) so the fork's agent remembers the branch point. The
+/// prefix is written to disk up front so the fork survives a restart;
+/// the eagerly-spawned controller's archiver then appends any new turns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_forked_handle(
+    session_id: String,
+    initial_role: &str,
+    merged: &Arc<parking_lot::RwLock<AgentConfig>>,
+    resolver: &Arc<ModelResolver>,
+    cwd: &std::path::Path,
+    subsession_store: &Arc<latte_agent_core::subsession::SubsessionStore>,
+    event_lines: Vec<String>,
+    initial_history: Vec<latte_ai::models::Message>,
+    first_user_msg: Option<String>,
+    label: Option<String>,
+) -> Result<SessionHandle, String> {
+    let persist = match SessionPersist::create(cwd, &session_id, initial_role) {
+        Ok(mut p) => {
+            // Seed the label into the meta line, then write the cloned
+            // prefix so the fork is durable before any new turn.
+            p.last_label = label.clone();
+            for line in &event_lines {
+                if let Err(e) = p.append_raw(line) {
+                    eprintln!("[ui-sessions] fork persist {}: {e}", p.path.display());
+                    break;
+                }
+            }
+            Some(Arc::new(parking_lot::Mutex::new(p)))
+        }
+        Err(e) => {
+            eprintln!(
+                "[ui-sessions] fork create {}: {e} (session 不持久化)",
+                SessionPersist::path_for(cwd, &session_id).display()
+            );
+            None
+        }
+    };
+    let now = Instant::now();
+    let handle = SessionHandle {
+        session_id,
+        controller: parking_lot::Mutex::new(None),
+        spawn_lock: tokio::sync::Mutex::new(()),
+        spawn: SessionSpawnParams {
+            merged: merged.clone(),
+            resolver: resolver.clone(),
+            cwd: cwd.to_path_buf(),
+            primary_model_id: None,
+            initial_tier: None,
+            subsession_store: subsession_store.clone(),
+            initial_history,
+        },
+        first_user_msg: parking_lot::Mutex::new(first_user_msg),
+        label: parking_lot::Mutex::new(label),
+        event_log: Arc::new(parking_lot::RwLock::new(event_lines)),
+        created_at: now,
+        last_activity: Arc::new(parking_lot::Mutex::new(now)),
+        initial_role: initial_role.to_string(),
+        restored: false,
+        persist,
+    };
+    // Eager spawn so the seeded `initial_history` is loaded into the
+    // controller's context immediately (single-role path).
     handle.controller_or_spawn().await?;
     Ok(handle)
 }

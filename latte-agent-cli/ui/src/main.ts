@@ -2,7 +2,7 @@ import type { SessionInfo, ModelWithSource } from "./api";
 import {
   ensureSession, listSessions, createSession,
   switchSession, getSession, subscribeEvents, fetchSubsession,
-  persistSessionId, getSessionHistory, getCurrentSessionId,
+  persistSessionId, getSessionHistory, getCurrentSessionId, forkSession,
   renameSession, deleteSession,
   getRolesConfig,
 } from "./api";
@@ -172,6 +172,18 @@ async function main(): Promise<void> {
           body.appendChild(renderSubsessionEvent(ev as Record<string, unknown>));
         }
       } catch (e) { body.textContent = `error: ${String(e)}`; }
+    },
+    onFork: async (events) => {
+      // 从当前 session 的这段历史前缀分叉出新 session，然后切过去。
+      const sourceId = getCurrentSessionId() || currentId;
+      if (!sourceId) return;
+      try {
+        const newId = await forkSession(sourceId, events);
+        await activateSession(newId, { created: true });
+        chat.setFooter(`🍴 已分叉 ${events.length} 个事件 → ${newId.slice(0, 12)}…`);
+      } catch (e) {
+        chat.setFooter(`fork failed: ${String(e)}`);
+      }
     },
   });
 

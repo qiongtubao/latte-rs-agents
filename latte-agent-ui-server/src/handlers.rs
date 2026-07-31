@@ -55,6 +55,27 @@ pub(crate) async fn get_session(
         .map_err(Into::into)
 }
 
+/// POST /api/sessions/fork — fork a new session from a prefix of a
+/// source session's visible history (up to a right-clicked message).
+#[derive(Deserialize)]
+pub(crate) struct ForkRequest {
+    source_session_id: String,
+    /// Frontend-JSON ChatEvents from the source session, in order,
+    /// up to and including the fork point.
+    #[serde(default)]
+    events: Vec<serde_json::Value>,
+}
+
+pub(crate) async fn fork_session(
+    State(state): State<AppState>,
+    Json(req): Json<ForkRequest>,
+) -> Result<Json<api::SessionInfo>, (StatusCode, String)> {
+    api::fork_session(&state.backend, &req.source_session_id, req.events)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 /// GET /api/session/history?id=... — return the archived ChatEvent log
 /// for a session so the UI can restore chat contents after a switch.
 pub(crate) async fn get_session_history(

@@ -215,6 +215,7 @@ impl UiBackend {
             primary_model_id: None,
             initial_tier: None,
             subsession_store: backend.subsession_store.clone(),
+            initial_history: Vec::new(),
         };
         for h in sessions::restore_sessions(&backend.cwd, &restore_base) {
             backend
@@ -420,6 +421,7 @@ fn build_router(state: AppState) -> Router {
             "/sessions",
             get(list_sessions).post(create_session).delete(delete_session),
         )
+        .route("/sessions/fork", post(fork_session))
         .route("/session", get(get_session))
         .route("/session/label", post(set_session_label))
         .route("/session/history", get(get_session_history))

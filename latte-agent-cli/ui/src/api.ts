@@ -249,6 +249,24 @@ export function switchSession(sessionId: string): void {
   currentSessionId = sessionId;
 }
 
+/** Fork a new session from a prefix of `sourceSessionId`'s visible
+ * history. `events` is the ordered ChatEvent stream up to and including
+ * the message the user right-clicked. The server clones this prefix as
+ * the new session's visible history and reconstructs the agent context
+ * from it. Returns the new session id (also persisted to localStorage). */
+export async function forkSession(
+  sourceSessionId: string,
+  events: ChatEvent[],
+): Promise<string> {
+  const info = await getTransport().request<SessionInfo>(
+    "POST",
+    "/api/sessions/fork",
+    { source_session_id: sourceSessionId, events },
+  );
+  persistSessionId(info.session_id);
+  return info.session_id;
+}
+
 /** Rename a session (empty label clears the custom name). */
 export async function renameSession(
   sessionId: string,

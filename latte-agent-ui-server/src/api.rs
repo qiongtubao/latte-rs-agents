@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::role_graph::RoleGraph;
-use crate::sessions::{create_session_handle, SessionHandle};
+use crate::sessions::{create_forked_handle, create_session_handle, SessionHandle};
 use crate::workflows::{self, ValidateResponse, WorkflowDetail, WorkflowForm, WorkflowSummary};
 use crate::UiBackend;
 
@@ -149,6 +149,108 @@ pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
             created_at_unix_ms: 0,
             last_activity_unix_ms: 0,
             restored: h.restored,
+        }],
+        available_roles: build_role_info(&b.merged.read()),
+    };
+    b.sessions.write().insert(h.session_id.clone(), h);
+    Ok(resp)
+}
+
+/// `POST /api/sessions/fork` — 从某个 session 的对话某一点分叉出一个
+/// 新 session。`events` 是源 session 可见历史的前缀（前端 JSON 的
+/// ChatEvent，含被右键那条消息为止），既作为新 session 的可见历史
+/// （写内存 event_log + 落盘），又用来重建 agent 上下文
+/// （UserMessage → user、完成的 RoleTurn → assistant），让分叉出来的
+/// 会话记得分叉点之前的讨论。用于"探索项目后分叉去做不同功能"。
+pub async fn fork_session(
+    b: &UiBackend,
+    source_session_id: &str,
+    events: Vec<serde_json::Value>,
+) -> Result<SessionInfo, ApiError> {
+    // 源 session 必须存在（拿 initial_role + label 派生）。
+    let src = resolve_session(b, Some(source_session_id))?;
+    let initial_role = src.initial_role.clone();
+
+    // 可见历史：每个事件序列化成一行（与 event_log 落盘格式一致）。
+    let event_lines: Vec<String> = events.iter().map(|v| v.to_string()).collect();
+
+    // agent 上下文重建：只取用户/助手的文本回合（工具/委派/工作流
+    // 事件对单角色续聊的上下文价值有限，从简）。
+    let mut initial_history: Vec<latte_ai::models::Message> = Vec::new();
+    for v in &events {
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("UserMessage") => {
+                if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
+                    if !t.is_empty() {
+                        initial_history.push(latte_ai::models::Message::user(t));
+                    }
+                }
+            }
+            Some("RoleTurn") => {
+                let complete = v
+                    .get("is_complete")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
+                if complete {
+                    if let Some(c) = v.get("content").and_then(|x| x.as_str()) {
+                        if !c.is_empty() {
+                            initial_history.push(latte_ai::models::Message::assistant(c));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 侧栏预览：第一条 UserMessage 的前 80 字符（与 chat_send 一致）。
+    let first_user_msg = events.iter().find_map(|v| {
+        if v.get("type").and_then(|t| t.as_str()) != Some("UserMessage") {
+            return None;
+        }
+        let t = v.get("text").and_then(|x| x.as_str())?;
+        Some(t.chars().take(80).collect::<String>())
+    });
+
+    // 标签：🍴 + 源 session 的标签/预览，方便在侧栏识别分叉。
+    let src_base = src
+        .label
+        .lock()
+        .clone()
+        .or_else(|| src.first_user_msg.lock().clone())
+        .unwrap_or_else(|| initial_role.clone());
+    let label = Some(format!("🍴 {}", src_base.chars().take(40).collect::<String>()));
+
+    let new_id = format!("ui-{}-{}", std::process::id(), crate::unix_ts_millis());
+    let handle = create_forked_handle(
+        new_id.clone(),
+        &initial_role,
+        &b.merged,
+        &b.resolver,
+        &b.cwd,
+        &b.subsession_store,
+        event_lines,
+        initial_history,
+        first_user_msg.clone(),
+        label.clone(),
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("fork spawn controller: {e}")))?;
+
+    let h = Arc::new(handle);
+    let resp = SessionInfo {
+        session_id: h.session_id.clone(),
+        role: h.initial_role.clone(),
+        model: None,
+        tier: "auto".into(),
+        available_sessions: vec![SessionSummary {
+            session_id: h.session_id.clone(),
+            preview: first_user_msg.unwrap_or_default(),
+            label,
+            initial_role: h.initial_role.clone(),
+            created_at_unix_ms: 0,
+            last_activity_unix_ms: 0,
+            restored: false,
         }],
         available_roles: build_role_info(&b.merged.read()),
     };
