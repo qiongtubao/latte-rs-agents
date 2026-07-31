@@ -489,6 +489,7 @@ fn build_router(state: AppState) -> Router {
             "/workflows/:name/toml",
             get(get_workflow_toml_h).put(put_workflow_toml_h),
         )
+        .route("/images", post(upload_image))
         .route("/images/:file", get(get_image));
     let mut app = Router::new()
         .route("/health", get(health))

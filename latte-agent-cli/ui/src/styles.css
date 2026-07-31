@@ -3313,3 +3313,101 @@ select {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+/* ─── ask 选择框（ChoiceRequested 事件内联渲染）──────────────── */
+.choice-card {
+  margin-top: 10px;
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  background: var(--bubble-bg);
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.1);
+  overflow: hidden;
+}
+.choice-card.answered {
+  border-color: var(--border);
+  box-shadow: none;
+}
+.choice-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+}
+.choice-opts.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+  padding: 10px;
+}
+.choice-opt {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  background: #fff;
+  transition: 0.12s;
+}
+.choice-opt:hover { border-color: var(--accent); background: var(--bg-2); }
+.choice-opt.sel { border-color: var(--accent); background: #eff6ff; box-shadow: inset 0 0 0 1px var(--accent); }
+.choice-opt .choice-mark {
+  width: 18px; height: 18px; flex-shrink: 0; margin-top: 1px;
+  border: 2px solid #cbd5e1; display: grid; place-items: center;
+  color: #fff; font-size: 11px;
+}
+.choice-opt.radio .choice-mark { border-radius: 50%; }
+.choice-opt.check .choice-mark { border-radius: 5px; }
+.choice-opt.sel .choice-mark { background: var(--accent); border-color: var(--accent); }
+.choice-thumb {
+  width: 52px; height: 52px; border-radius: 8px; object-fit: cover;
+  flex-shrink: 0; border: 1px solid var(--border);
+}
+.choice-txt { min-width: 0; flex: 1; }
+.choice-label { font-weight: 600; font-size: 13.5px; }
+.choice-rec { font-size: 10.5px; color: var(--ok); font-weight: 700; }
+.choice-desc { font-size: 12px; color: var(--fg-2); margin-top: 2px; }
+.choice-other-input {
+  margin-top: 8px; width: 100%; border: 1px solid var(--border);
+  border-radius: 8px; padding: 6px 9px; font-size: 13px; font-family: inherit;
+}
+/* grid（图片选择）模式：整格为图片卡片 */
+.choice-opts.grid .choice-opt {
+  flex-direction: column; align-items: stretch; padding: 0; gap: 0;
+  position: relative; overflow: hidden;
+}
+.choice-opts.grid .choice-mark {
+  position: absolute; top: 8px; right: 8px; margin: 0; z-index: 2;
+  background: rgba(255, 255, 255, 0.9);
+}
+.choice-opts.grid .choice-opt.sel .choice-mark { background: var(--accent); }
+.choice-pic {
+  width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block;
+  background: var(--bg-3); border-bottom: 1px solid var(--border);
+}
+.choice-opts.grid .choice-txt { padding: 8px 10px 10px; }
+.choice-opts.grid .choice-opt.sel { box-shadow: inset 0 0 0 2px var(--accent); }
+/* 上传区 */
+.choice-uploader {
+  margin: 0 8px 8px; padding: 14px; border: 1.5px dashed #cbd5e1;
+  border-radius: 10px; text-align: center; cursor: pointer;
+  color: var(--fg-2); font-size: 12.5px; transition: 0.15s;
+}
+.choice-uploader:hover { border-color: var(--accent); background: var(--bg-2); }
+.choice-uploader.has-file { border-style: solid; border-color: var(--accent); }
+.choice-up-preview { max-width: 120px; max-height: 90px; border-radius: 8px; margin: 8px auto 0; border: 1px solid var(--border); }
+/* footer */
+.choice-foot {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-top: 1px solid var(--border); background: var(--bg-2);
+}
+.choice-status { flex: 1; font-size: 11.5px; color: var(--fg-2); }
+.choice-submit, .choice-skip {
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px;
+  font-size: 12.5px; cursor: pointer; background: #fff; color: var(--fg);
+}
+.choice-submit { background: var(--accent); border-color: var(--accent); color: #fff; }
+.choice-submit:disabled { opacity: 0.5; cursor: not-allowed; }
+.choice-skip:hover { border-color: var(--fg-2); }
+.choice-answer { padding: 11px 13px; font-size: 12.5px; color: var(--accent-2); font-weight: 600; }

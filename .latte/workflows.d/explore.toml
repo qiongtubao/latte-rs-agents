@@ -1,0 +1,23 @@
+# Workflow: explore
+# 探索项目：当 manager 遇到不懂的名词 / 不清楚的项目背景时先跑它，
+# 派专家通读本仓库真实代码与文档，弄清结构、术语、现有约定与不确定点，
+# 产出可供后续 ask 提问 / 决策的背景说明。格式见 .latte/workflows.d/bug_triage.toml。
+
+name = "explore"
+command = "/explore"
+description = "探索项目：派专家通读相关代码/文档，弄清项目结构与陌生名词，产出可供决策的背景说明"
+max_rounds = 1
+
+[[steps]]
+id = "survey"
+description = "程序员通读相关代码与文档，摸清结构与陌生概念"
+role = "programmer"
+task = "围绕「{{topic}}」了解本项目：定位相关模块/文件，阅读关键实现与文档，弄清其中涉及的陌生名词、术语和现有约定。产出：1) 相关代码/模块清单与各自职责；2) 关键名词/术语的准确解释（必须基于本仓库真实代码，不要臆测）；3) 现有实现方式与约定；4) 仍不明确、需要用户确认的点。"
+output_key = "exploration"
+
+[[steps]]
+id = "synthesize"
+description = "架构师综合探索结论，提炼决策所需要点"
+role = "architect"
+task = "基于下面的探索结论：\n{{exploration}}\n\n围绕「{{topic}}」，提炼出做决策所需的背景要点：1) 可选的技术方向及其取舍；2) 与现有架构/约定的契合度；3) 仍需用户拍板的关键分叉（列成清单，供后续用 ask 向用户提问）。"
+output_key = "explore_summary"

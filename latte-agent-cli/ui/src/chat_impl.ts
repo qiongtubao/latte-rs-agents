@@ -1,4 +1,7 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession, importTasks, type ImportTask } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, abortSession, importTasks, uploadImage, type ImportTask, type ChoiceOption } from "./api";
+
+/** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
+type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
 import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { buildSelectedPlanTasks } from "./plan_import";
@@ -399,6 +402,199 @@ export function mountChat(opts: {
     if (isNearBottom()) scrollToBottom();
     return row;
   }
+  // ── ask 选择框（内联渲染在系统消息气泡里）──
+  // ChoiceRequested 事件触发。选项/说明/图片来自模型（不可信），一律
+  // 用 textContent / img.src 构建，绝不 innerHTML 拼接。用户选择/上传
+  // 后，把结果拼成一条 user 消息经 sendMessage 回喂角色（后端会 echo
+  // 一条 UserMessage 事件渲染用户气泡，这里不手动补）。
+  function renderChoiceDialog(bubble: HTMLElement, e: ChoiceRequestedEvent): void {
+    const multi = !!e.multi;
+    const grid = e.layout === "grid";
+    const card = document.createElement("div");
+    card.className = "choice-card" + (grid ? " grid" : "");
+    card.dataset.choiceId = e.choice_id;
+
+    const optsWrap = document.createElement("div");
+    optsWrap.className = "choice-opts" + (grid ? " grid" : "");
+    card.appendChild(optsWrap);
+
+    // 选择状态：普通选项按 index，"其他" 特殊项，上传项。
+    const selected = new Set<number>();
+    let otherSelected = false;
+    let uploaded: { path: string; name: string } | null = null;
+    let otherText = "";
+
+    const OTHER_IDX = e.options.length; // 伪索引：其他（自定义）
+
+    const submitBtn = document.createElement("button");
+    submitBtn.className = "choice-submit";
+    submitBtn.textContent = "提交";
+    submitBtn.disabled = true;
+
+    const statusLine = document.createElement("div");
+    statusLine.className = "choice-status";
+    statusLine.textContent = "未选择";
+
+    function answersText(): string[] {
+      const out: string[] = [];
+      for (const i of selected) {
+        const o = e.options[i];
+        out.push(o.image ? `${o.label}（图片：${o.image}）` : o.label);
+      }
+      if (otherSelected) out.push(otherText.trim() ? `其他：${otherText.trim()}` : "其他（未填）");
+      if (uploaded) out.push(`上传图片：${uploaded.path}`);
+      return out;
+    }
+    function refresh(): void {
+      [...optsWrap.querySelectorAll(".choice-opt")].forEach((el) => {
+        const idx = Number((el as HTMLElement).dataset.idx);
+        const sel = idx === OTHER_IDX ? otherSelected : selected.has(idx);
+        el.classList.toggle("sel", sel);
+      });
+      const ans = answersText();
+      statusLine.textContent = ans.length ? "已选：" + ans.join("、") : "未选择";
+      submitBtn.disabled = ans.length === 0;
+    }
+    function pick(idx: number): void {
+      const isOther = idx === OTHER_IDX;
+      if (multi) {
+        if (isOther) otherSelected = !otherSelected;
+        else if (selected.has(idx)) selected.delete(idx);
+        else selected.add(idx);
+      } else {
+        selected.clear(); otherSelected = false; uploaded = null;
+        if (isOther) otherSelected = true; else selected.add(idx);
+      }
+      refresh();
+    }
+
+    // 渲染一个选项行/格。
+    const buildOpt = (o: ChoiceOption | null, idx: number, isOther: boolean): HTMLElement => {
+      const opt = document.createElement("div");
+      opt.className = "choice-opt" + (multi ? " check" : " radio");
+      opt.dataset.idx = String(idx);
+      const mark = document.createElement("div");
+      mark.className = "choice-mark";
+      mark.textContent = multi ? "✓" : "●";
+      opt.appendChild(mark);
+      if (o?.image) {
+        const img = document.createElement("img");
+        img.className = grid ? "choice-pic" : "choice-thumb";
+        img.src = o.image;
+        img.alt = "";
+        opt.appendChild(img);
+      }
+      const txt = document.createElement("div");
+      txt.className = "choice-txt";
+      const label = document.createElement("div");
+      label.className = "choice-label";
+      label.textContent = isOther ? "其他（自定义）" : (o?.label ?? "");
+      if (o?.recommended) {
+        const rec = document.createElement("span");
+        rec.className = "choice-rec";
+        rec.textContent = " ✓ 推荐";
+        label.appendChild(rec);
+      }
+      txt.appendChild(label);
+      if (o?.description) {
+        const desc = document.createElement("div");
+        desc.className = "choice-desc";
+        desc.textContent = o.description;
+        txt.appendChild(desc);
+      }
+      if (isOther) {
+        const inp = document.createElement("input");
+        inp.className = "choice-other-input";
+        inp.placeholder = "输入自定义内容…";
+        inp.addEventListener("input", () => { otherText = inp.value; refresh(); });
+        inp.addEventListener("click", (ev) => ev.stopPropagation());
+        txt.appendChild(inp);
+      }
+      opt.appendChild(txt);
+      opt.addEventListener("click", () => {
+        pick(idx);
+        if (isOther && otherSelected) setTimeout(() => opt.querySelector<HTMLInputElement>(".choice-other-input")?.focus(), 20);
+      });
+      return opt;
+    };
+
+    e.options.forEach((o, i) => optsWrap.appendChild(buildOpt(o, i, false)));
+    // 始终附带「其他（自定义）」——与 oh-my-pi 约定一致，模型不需自己加。
+    optsWrap.appendChild(buildOpt(null, OTHER_IDX, true));
+
+    // 上传自定义图片。
+    if (e.allow_upload) {
+      const up = document.createElement("div");
+      up.className = "choice-uploader";
+      const prompt = document.createElement("div");
+      prompt.className = "choice-up-prompt";
+      prompt.textContent = "🖼️ 上传你自己的图片作为选择（点击选择）";
+      up.appendChild(prompt);
+      const fileInput = document.createElement("input");
+      fileInput.type = "file";
+      fileInput.accept = "image/*";
+      fileInput.style.display = "none";
+      up.appendChild(fileInput);
+      const preview = document.createElement("img");
+      preview.className = "choice-up-preview";
+      preview.style.display = "none";
+      up.appendChild(preview);
+      up.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", async () => {
+        const f = fileInput.files?.[0];
+        if (!f) return;
+        prompt.textContent = "上传中…";
+        try {
+          const res = await uploadImage(f);
+          uploaded = { path: res.path, name: f.name };
+          preview.src = res.path;
+          preview.style.display = "block";
+          prompt.textContent = `已上传：${f.name}（点此更换）`;
+          up.classList.add("has-file");
+          if (!multi) { selected.clear(); otherSelected = false; }
+          refresh();
+        } catch (err) {
+          prompt.textContent = `上传失败：${err instanceof Error ? err.message : String(err)}`;
+        }
+      });
+      card.appendChild(up);
+    }
+
+    const foot = document.createElement("div");
+    foot.className = "choice-foot";
+    foot.appendChild(statusLine);
+    const skipBtn = document.createElement("button");
+    skipBtn.className = "choice-skip";
+    skipBtn.textContent = "跳过";
+    foot.appendChild(skipBtn);
+    foot.appendChild(submitBtn);
+    card.appendChild(foot);
+
+    function finish(summary: string, sendText: string | null): void {
+      card.classList.add("answered");
+      optsWrap.style.display = "none";
+      foot.style.display = "none";
+      card.querySelector(".choice-uploader")?.remove();
+      const done = document.createElement("div");
+      done.className = "choice-answer";
+      done.textContent = summary;
+      card.appendChild(done);
+      if (sendText !== null) sendMessage(sendText).catch(() => {});
+    }
+
+    submitBtn.addEventListener("click", () => {
+      const ans = answersText();
+      if (ans.length === 0) return;
+      const joined = ans.join("、");
+      finish(`你的选择：${joined}`, `我的选择：${joined}`);
+    });
+    skipBtn.addEventListener("click", () => {
+      finish("已跳过此选择。", "我先跳过这个选择，你按最合理的默认继续。");
+    });
+
+    bubble.appendChild(card);
+  }
+
   // ── plan 导入弹窗 ──
   // PlanProposed 事件触发（主路径）或右键「导入任务看板」（补救路径）
   // 调用。tasks 是结构化任务候选（来自 plan 工具，非文本解析），用户
@@ -1361,6 +1557,19 @@ export function mountChat(opts: {
           openPlanImportModal(e.tasks, e.plan_id);
           (window as unknown as Record<string, unknown>).__planDebounceTimer = undefined;
         }, 1500);
+        break;
+      }
+      case "ChoiceRequested": {
+        // ask 工具抛出的选择题：渲染一条系统消息 + 内联选择卡片。
+        // 用户在卡片里选择/上传后，选择结果作为下一条 user 消息回喂角色。
+        const msg = addMessage({
+          kind: "system",
+          content: `❓ ${e.role_id} 请你选择：${e.question}`,
+        });
+        const bubble = msg.querySelector(".msg-bubble") as HTMLElement | null;
+        if (bubble) renderChoiceDialog(bubble, e);
+        setFooter(`${e.role_id} 等待你的选择`);
+        resetWaitTimer();
         break;
       }
       case "TimeoutWarning": {

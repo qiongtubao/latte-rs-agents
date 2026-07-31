@@ -918,3 +918,46 @@ pub(crate) async fn get_image(
     };
     Ok(([(axum::http::header::CONTENT_TYPE, content_type)], bytes))
 }
+
+/// `POST /api/images?ext=png` —— 用户在选择框里上传自定义图片时用。
+///
+/// Body 是**原始图片字节**（前端把 `File` 直接当 body 发，不做
+/// base64，省一个依赖）。`ext` 查询参数给出扩展名（png/jpg/…）。
+/// 落盘到 `<cwd>/.latte/images/upload-<ts>.<ext>`，返回
+/// `{ "path": "/api/images/<file>" }` —— 与 `ImageGenerated.path`
+/// 同构，前端拿到后既可 `<img src>` 预览，也可把 URL 放进选择结果
+/// 回喂给模型。防穿越：ext 白名单校验，文件名由服务端生成。
+pub(crate) async fn upload_image(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty image body".to_string()));
+    }
+    // 上限 10 MiB，避免超大 body 打爆内存 / 磁盘。
+    const MAX_BYTES: usize = 10 * 1024 * 1024;
+    if body.len() > MAX_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "image exceeds 10 MiB".to_string()));
+    }
+    let ext = params
+        .get("ext")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "png".to_string());
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        return Err((StatusCode::BAD_REQUEST, format!("unsupported image ext: {ext}")));
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0);
+    let file = format!("upload-{ts}.{ext}");
+    let dir = state.backend.cwd.join(".latte/images");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir images: {e}")))?;
+    tokio::fs::write(dir.join(&file), &body)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write image: {e}")))?;
+    Ok(Json(serde_json::json!({ "path": format!("/api/images/{file}") })))
+}
