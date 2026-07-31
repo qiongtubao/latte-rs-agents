@@ -23,6 +23,24 @@ pub fn key_to_filename(key: &str) -> String {
     }
 }
 
+/// 原子写文件：先写同目录的 `<path>.tmp`，再 `rename` 到目标路径。
+/// `rename` 在同一文件系统上是原子的，避免并发/崩溃时读到半截文件
+/// —— 语义对齐 oh-my-pi `writeMCPConfigFile`（write tmp → rename）。
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    // tmp 必须与目标同目录，rename 才是同一文件系统内的原子操作。
+    let mut tmp_os = path.as_os_str().to_os_string();
+    tmp_os.push(".tmp");
+    let tmp = PathBuf::from(tmp_os);
+    std::fs::write(&tmp, content)
+        .map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        // rename 失败时尽量清掉临时文件，别在目录里留垃圾。
+        let _ = std::fs::remove_file(&tmp);
+        anyhow!("rename {} -> {}: {e}", tmp.display(), path.display())
+    })?;
+    Ok(())
+}
+
 /// `openai__gpt-4o.toml` → `openai/gpt-4o`。
 pub fn filename_to_key(filename: &str) -> Option<String> {
     let stem = std::path::Path::new(filename).file_stem()?.to_str()?;
@@ -127,7 +145,7 @@ impl ModelsState {
         self.merged.values().cloned().collect()
     }
 
-    /// 写一个 ModelDef 到项目目录（覆盖同名文件）。
+    /// 写一个 ModelDef 到项目目录（覆盖同名文件，原子写）。
     pub fn write_project(
         project_models_dir: &Path,
         key: &str,
@@ -138,8 +156,7 @@ impl ModelsState {
         let path = project_models_dir.join(key_to_filename(key));
         let content = toml::to_string_pretty(def)
             .map_err(|e| anyhow!("serialize {key}: {e}"))?;
-        std::fs::write(&path, content)
-            .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+        atomic_write(&path, &content)?;
         Ok(path)
     }
 
@@ -168,8 +185,7 @@ impl ModelsState {
         let path = global_models_dir.join(key_to_filename(key));
         let content = toml::to_string_pretty(def)
             .map_err(|e| anyhow!("serialize {}: {}", key, e))?;
-        std::fs::write(&path, content)
-            .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+        atomic_write(&path, &content)?;
         Ok(path)
     }
 
@@ -306,6 +322,28 @@ mod tests {
     #[test]
     fn validate_accepts_valid_def() {
         assert!(validate(&sample_def()).is_ok());
+    }
+
+    #[test]
+    fn write_project_round_trips_and_leaves_no_tmp() {
+        let tmp = std::env::temp_dir()
+            .join(format!("latte-models-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let def = sample_def();
+        let path = ModelsState::write_project(&tmp, "openai/gpt-4o", &def).unwrap();
+        assert_eq!(path.file_name().unwrap(), "openai__gpt-4o.toml");
+        assert!(path.exists(), "final file must exist");
+
+        // 原子写不能在目录里留下 `.tmp` 残留。
+        let tmp_leftover = tmp.join("openai__gpt-4o.toml.tmp");
+        assert!(!tmp_leftover.exists(), "temp file must be renamed away");
+
+        // 内容可回读为同一个 ModelDef。
+        let back = ModelsState::load(&tmp, &tmp.join("nonexistent")).unwrap();
+        assert_eq!(back.merged.get("openai/gpt-4o").unwrap().api_key, def.api_key);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

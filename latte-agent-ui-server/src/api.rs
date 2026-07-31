@@ -2050,16 +2050,108 @@ pub struct ModelWithSource {
     pub def: ModelDef,
 }
 
-/// PATCH 请求体：把 `def` 整体写回（partial update 未实现）。
+/// PATCH 请求体（partial update）：只把 body 里**出现**的字段合并进已有
+/// model，缺省字段保持磁盘/catalog 现值不变 —— 语义对齐 oh-my-pi
+/// `writeMCPConfigFile` 的 `{ ...existing, ...updates }` 合并 + 原子写。
+/// UI 现在既可以整表提交（改完点保存，所有字段都在），也可以只 PATCH
+/// 单个字段（如仅改 `base_url` / `api_key`）而不必回传其它字段。
+///
 /// `target`: "project"（默认，写到 `<cwd>/.latte/models.d/`）或 "global"
 /// （写到 `~/.latte/models.d/`）。两个写盘目录分别对应 UI 上的
 /// "保存到项目" / "保存到全局" 两个按钮。
-#[derive(Deserialize)]
+///
+/// 说明：可选字段（cost / tier / timeout_secs）只支持“设新值”，不支持通过
+/// PATCH 显式清空回 `null`（缺省即保持原值）。需要清空这些字段时走整表
+/// 重写：`POST /api/models`。
+#[derive(Debug, Default, Deserialize)]
 pub struct UpdateModelRequest {
     #[serde(default)]
     pub target: String,
     #[serde(flatten)]
-    pub def: ModelDef,
+    pub patch: ModelPatch,
+}
+
+/// 单个 model 的部分字段补丁：全字段 `Option`，`Some` 覆盖、`None` 保持。
+/// 字段名 / alias 与 [`ModelDef`] 一一对应，所以整表提交也能无损落进来。
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelPatch {
+    #[serde(default, alias = "model_name")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub api: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub supports_thinking: Option<bool>,
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
+    #[serde(default)]
+    pub supports_image_generation: Option<bool>,
+    #[serde(default)]
+    pub cost_per_million_input: Option<f64>,
+    #[serde(default)]
+    pub cost_per_million_output: Option<f64>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+impl ModelPatch {
+    /// 把补丁里 `Some` 的字段合并进 `def`（`None` 字段保持不变）。
+    /// 对应 oh-my-pi `{ ...existing, ...updates }`：只覆盖显式给出的键。
+    fn apply_to(self, def: &mut ModelDef) {
+        if let Some(v) = self.name {
+            def.name = v;
+        }
+        if let Some(v) = self.api {
+            def.api = v;
+        }
+        if let Some(v) = self.provider {
+            def.provider = v;
+        }
+        if let Some(v) = self.base_url {
+            def.base_url = v;
+        }
+        if let Some(v) = self.api_key {
+            def.api_key = v;
+        }
+        if let Some(v) = self.context_window {
+            def.context_window = v;
+        }
+        if let Some(v) = self.max_tokens {
+            def.max_tokens = v;
+        }
+        if let Some(v) = self.supports_thinking {
+            def.supports_thinking = v;
+        }
+        if let Some(v) = self.supports_vision {
+            def.supports_vision = v;
+        }
+        if let Some(v) = self.supports_image_generation {
+            def.supports_image_generation = v;
+        }
+        if let Some(v) = self.cost_per_million_input {
+            def.cost_per_million_input = Some(v);
+        }
+        if let Some(v) = self.cost_per_million_output {
+            def.cost_per_million_output = Some(v);
+        }
+        if let Some(v) = self.tier {
+            def.tier = Some(v);
+        }
+        if let Some(v) = self.timeout_secs {
+            def.timeout_secs = Some(v);
+        }
+    }
 }
 
 /// `POST /api/models` 的请求体：新建 model 并写盘。
@@ -2158,9 +2250,17 @@ fn source_label(s: crate::models::ModelSource) -> &'static str {
     }
 }
 
-/// `PATCH /api/models/:key` —— 把一个已存在的 model 写回磁盘（项目目录
+/// `PATCH /api/models/:key` —— **部分更新**一个已存在的 model：以 catalog
+/// 里的现值为基准，只覆盖补丁里显式给出的字段，再写回磁盘（项目目录
 /// `<cwd>/.latte/models.d/<provider>__<id>.toml`），同时就地更新内存
 /// catalog 让后续 chat 立刻看到新值。
+///
+/// 合并语义参考 oh-my-pi 的 `updateMCPServer`：先读现有配置，`{ ...existing,
+/// ...updates }` 合并，再原子写回（写 `.tmp` 后 `rename`，见
+/// [`ModelsState::write_project`]）。
+///
+/// 只能改**已存在**的 model（不在 catalog 里返回 404）；新建走
+/// `POST /api/models`。
 ///
 /// 写入策略：项目目录优先（与 `ModelsState::load` 的"项目覆盖全局"语义
 /// 对称）。如果旧文件在全局，保存时会落到项目目录，相当于把全局 model
@@ -2169,8 +2269,26 @@ pub fn update_model(
     b: &UiBackend,
     key: &str,
     target: &str,
-    def: ModelDef,
+    patch: ModelPatch,
 ) -> Result<ModelWithSource, ApiError> {
+    // 以 catalog 现值为基准（catalog 已是项目层合并 + 全局的最终生效值）。
+    // PATCH 只能改已存在的 model —— 找不到就 404，让 UI 走 POST 新建。
+    let mut def = {
+        let cfg = b.merged.read();
+        cfg.models
+            .models
+            .iter()
+            .find(|m| format!("{}/{}", m.provider, m.name) == key)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "model {key:?} 不在 catalog 里；PATCH 只能改已存在的 model，新建请用 POST /api/models"
+                ))
+            })?
+    };
+    // 合并补丁：只覆盖显式给出的字段（None 保持原值）。
+    patch.apply_to(&mut def);
+    // 合并后再整体校验，保证落盘的一定是一份完整合法的 ModelDef。
     crate::models::validate(&def)
         .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
     let new_key = format!("{}/{}", def.provider, def.name);
@@ -2309,6 +2427,104 @@ mod list_models_tests {
             format!("{provider}/{id_plain}")
         };
         assert_eq!(k2, "deepseek/deepseek-v4-pro");
+    }
+}
+
+#[cfg(test)]
+mod model_patch_tests {
+    use super::*;
+
+    fn base_def() -> ModelDef {
+        ModelDef {
+            name: "gpt-4o".into(),
+            api: "openai".into(),
+            provider: "openai".into(),
+            base_url: "https://api.openai.com".into(),
+            api_key: "sk-old".into(),
+            context_window: 128_000,
+            max_tokens: 4096,
+            supports_thinking: false,
+            supports_vision: true,
+            supports_image_generation: false,
+            cost_per_million_input: Some(2.5),
+            cost_per_million_output: Some(10.0),
+            tier: Some("standard".into()),
+            timeout_secs: Some(60),
+        }
+    }
+
+    #[test]
+    fn patch_only_touches_present_fields() {
+        // 只 PATCH base_url + api_key，其它字段必须原样保留。
+        let mut def = base_def();
+        let patch = ModelPatch {
+            base_url: Some("https://proxy.local".into()),
+            api_key: Some("sk-new".into()),
+            ..Default::default()
+        };
+        patch.apply_to(&mut def);
+
+        assert_eq!(def.base_url, "https://proxy.local");
+        assert_eq!(def.api_key, "sk-new");
+        // 未提及的字段保持不变。
+        assert_eq!(def.name, "gpt-4o");
+        assert_eq!(def.context_window, 128_000);
+        assert_eq!(def.max_tokens, 4096);
+        assert_eq!(def.supports_vision, true);
+        assert_eq!(def.cost_per_million_input, Some(2.5));
+        assert_eq!(def.tier.as_deref(), Some("standard"));
+        assert_eq!(def.timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn empty_patch_is_a_noop() {
+        let mut def = base_def();
+        let before = def.clone();
+        ModelPatch::default().apply_to(&mut def);
+        assert_eq!(def.base_url, before.base_url);
+        assert_eq!(def.api_key, before.api_key);
+        assert_eq!(def.timeout_secs, before.timeout_secs);
+    }
+
+    #[test]
+    fn full_form_submit_deserializes_via_flatten() {
+        // 整表提交（所有字段 + target）必须仍能落进 UpdateModelRequest。
+        let json = serde_json::json!({
+            "target": "project",
+            "model_name": "gpt-4o",
+            "api": "openai",
+            "provider": "openai",
+            "base_url": "https://api.openai.com",
+            "api_key": "sk-x",
+            "context_window": 128000,
+            "max_tokens": 4096,
+            "supports_vision": true,
+            "tier": "standard",
+            "timeout_secs": 90
+        });
+        let req: UpdateModelRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(req.target, "project");
+        // `model_name` alias 落到 name。
+        assert_eq!(req.patch.name.as_deref(), Some("gpt-4o"));
+        assert_eq!(req.patch.timeout_secs, Some(90));
+
+        // 应用到一个 base，验证整表提交等价于全字段覆盖。
+        let mut def = base_def();
+        def.name = "old".into();
+        req.patch.apply_to(&mut def);
+        assert_eq!(def.name, "gpt-4o");
+        assert_eq!(def.timeout_secs, Some(90));
+    }
+
+    #[test]
+    fn partial_patch_body_only_has_changed_field() {
+        // 真·partial：body 里只有一个字段。
+        let json = serde_json::json!({ "base_url": "https://only.this" });
+        let req: UpdateModelRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(req.target, ""); // 缺省 target
+        assert_eq!(req.patch.base_url.as_deref(), Some("https://only.this"));
+        assert!(req.patch.api_key.is_none());
+        assert!(req.patch.name.is_none());
     }
 }
 

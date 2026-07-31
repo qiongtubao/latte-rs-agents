@@ -890,7 +890,7 @@ mod tests {
         // 但磁盘索引已建
         assert_eq!(backend_b.subsession_store.persisted_index_size(), 1);
         // API 路径读（先内存 miss → 回查磁盘）
-        let events = crate::api::get_subsession(&backend_b, &sub_id);
+        let events = crate::api::get_subsession(&backend_b, &sub_id, 0);
         assert_eq!(events.len(), 3, "重启后从磁盘读出 3 个事件");
         for (i, ev) in events.iter().enumerate() {
             assert_eq!(

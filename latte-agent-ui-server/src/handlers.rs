@@ -549,17 +549,17 @@ pub(crate) async fn list_models(
         })
 }
 
-/// `PATCH /api/models/:key` —— 保存单个 model 到项目目录。
+/// `PATCH /api/models/:key` —— 部分更新单个 model（partial update）。
 ///
 /// URL `:key` 用 `provider/id` 形式，与 `list_models` 返回的 `key` 一致。
-/// 请求 body 是 `ModelDef` 全量字段（partial update 未实现 —— UI
-/// 层总是把整个 form 序列化好再发，对应需求「改完点保存」）。
+/// 请求 body 只需带**要改的字段**（缺省字段保持现值）；整表提交也兼容
+/// （所有字段都在）。合并 + 原子写细节见 [`api::update_model`]。
 pub(crate) async fn update_model(
     axum::extract::Path(key): axum::extract::Path<String>,
     State(state): State<AppState>,
     Json(req): Json<api::UpdateModelRequest>,
 ) -> Result<Json<api::ModelWithSource>, (StatusCode, String)> {
-    api::update_model(&state.backend, &key, &req.target, req.def)
+    api::update_model(&state.backend, &key, &req.target, req.patch)
         .map(Json)
         .map_err(|e| {
             (

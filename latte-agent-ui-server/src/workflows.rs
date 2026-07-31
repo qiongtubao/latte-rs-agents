@@ -581,6 +581,7 @@ mod tests {
                 prompt: prompt.into(),
                 output_key: None,
             }],
+            command: None,
         }
     }
 
@@ -641,6 +642,7 @@ mod tests {
                     output_key: Some("draft".into()),
                 },
             ],
+            command: None,
         };
         let v = validate(&form, &merged);
         assert!(v.ok, "errors: {:?}", v.errors);
