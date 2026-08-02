@@ -1254,6 +1254,26 @@ output_key = "exploration"
         assert!(wave_of("brainstorm") < wave_of("req_review"));
     }
 
+    #[test]
+    fn tdd_development_has_four_state_and_two_stage_review() {
+        let raw = include_str!("../../config/workflows/tdd_development.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("tdd_development should validate");
+        // 实现 step：四态报告契约
+        let implement = wf.steps.iter().find(|s| s.id == "implement").unwrap();
+        assert!(implement.output_contract.require.iter().any(|r| r == "STATUS:"));
+        assert!(implement.task_text().contains("DONE_WITH_CONCERNS"));
+        assert!(implement.task_text().contains("BLOCKED"));
+        assert!(implement.task_text().contains("NEEDS_CONTEXT"));
+        // 规格审查：不要相信实现报告 + VERDICT 契约
+        let spec = wf.steps.iter().find(|s| s.id == "spec_review").unwrap();
+        assert!(spec.task_text().contains("不要相信实现报告"));
+        assert!(spec.output_contract.require.iter().any(|r| r == "VERDICT:"));
+        // 质量审查在规格审查之后
+        let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["tests_first", "implement", "spec_review", "quality_review"]);
+    }
+
     /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
     /// 使用 include_str! 直接引用真文件，确保 TOML 编辑后测试立即红。
     #[test]

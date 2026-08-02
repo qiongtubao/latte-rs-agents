@@ -1,9 +1,13 @@
 # Workflow: tdd_development
-# TDD 开发流：测试先行 → 实现 → 验证 → 终审。
-# 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
+# TDD 开发流：测试先行 → 实现（四态报告）→ 规格符合性审查 → 代码质量审查。
+# 借鉴 superpowers subagent-driven-development：
+#   - 实现者必须输出四态报告（DONE/DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT）
+#   - 审查两阶段：先规格符合性（"不要相信实现报告"，独立读代码核对），
+#     过了才做代码质量审查
+# 步骤间用 output_key 显式穿线（跨步骤只传 output_key 变量）。
 
 name = "tdd_development"
-description = "TDD 开发：测试先行 → 实现 → 验证 → 终审"
+description = "TDD 开发：测试先行 → 实现（四态报告）→ 规格审查 → 质量审查"
 max_rounds = 1
 
 [[steps]]
@@ -11,24 +15,89 @@ id = "tests_first"
 description = "测试先行"
 speakers = ["tester"]
 output_key = "test_plan"
+max_retries = 1
 prompt = "为以下开发任务设计测试：{{topic}}。先读相关代码了解现状。输出：1) 测试清单（每条：场景 → 预期行为 → 为什么必须有它）；2) 关键用例的具体写法（表驱动/边界/错误路径）；3) 哪些现有测试会受影响。"
+
+[steps.output_contract]
+min_chars = 150
+forbid = ["TBD", "待补充", "占位符"]
 
 [[steps]]
 id = "implement"
-description = "实现"
+description = "实现并输出四态报告"
 speakers = ["programmer"]
 output_key = "impl"
-prompt = "按测试计划实现：\n{{test_plan}}\n任务：{{topic}}。要求：1) 最小实现让测试通过，不做计划外的扩展；2) 改动说明（改了哪些文件、为什么）；3) 实现与测试计划有出入时明确说明原因。"
+max_retries = 1
+prompt = """按测试计划实现：
+{{test_plan}}
+任务：{{topic}}。
+
+要求：
+1) 最小实现让测试通过，不做计划外的扩展；
+2) 实现与测试计划有出入时必须在 DEVIATIONS 节说明原因；
+3) 完成后**实际运行测试命令**确认结果，不许声称"应该能过"。
+
+【输出格式——四态报告，第一行必须是状态行】
+STATUS: DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+
+FILES: 改了哪些文件（逐一列出）
+NOTES: 实现说明（怎么实现的、关键决策）
+DEVIATIONS: 与测试计划的出入及原因（无则写"无"）
+CONCERNS: 遗留顾虑（仅 DONE_WITH_CONCERNS/BLOCKED 时必填，否则写"无"）
+
+状态语义：DONE=全部完成且测试通过；DONE_WITH_CONCERNS=完成但有遗留顾虑；BLOCKED=被卡住（说明缺什么）；NEEDS_CONTEXT=信息不足（列出需要澄清的问题）。"""
+
+[steps.output_contract]
+min_chars = 100
+require = ["STATUS:", "FILES:", "NOTES:"]
+forbid = ["TBD", "待补充", "占位符"]
 
 [[steps]]
-id = "verify"
-description = "验证"
+id = "spec_review"
+description = "规格符合性审查：不要相信实现报告"
 speakers = ["tester"]
-output_key = "verify"
-prompt = "核验实现是否满足测试计划：\n【测试计划】{{test_plan}}\n【实现说明】{{impl}}\n逐条核验：每个计划中的测试是否真正覆盖了声称的场景？有没有漏掉的边界？输出：通过项清单 / 缺口清单（缺口 → 影响 → 补救建议）。"
+output_key = "spec_review"
+max_retries = 1
+prompt = """【不要相信实现报告】你的任务不是复述它说了什么，而是**独立验证**。
+
+【测试计划】{{test_plan}}
+【实现者自称】{{impl}}
+
+要求：
+1) **亲自读实现者列出的每个文件的最终代码**（不是读他的 NOTES），逐行对照测试计划中的每条场景；
+2) **亲自运行测试命令**，记录真实输出（通过几、失败几），不接受"应该能过"；
+3) 逐条判定：计划中每条测试是否真实存在、真实覆盖声称的场景、真实通过；
+4) 实现者 DEVIATIONS 里声明的偏差，判断是否合理。
+
+【输出格式】
+VERDICT: PASS | FAIL
+EVIDENCE: 逐条核对结果（计划条目 → 代码位置 → 运行结果）
+GAPS: 缺口清单（缺口 → 影响 → 补救建议；无则写"无"）
+
+FAIL 时 GAPS 必须非空。"""
+
+[steps.output_contract]
+min_chars = 100
+require = ["VERDICT:"]
 
 [[steps]]
-id = "verdict"
-description = "终审"
+id = "quality_review"
+description = "代码质量审查（规格过了才轮到质量）"
 speakers = ["reviewer"]
-prompt = "终审这次 TDD 开发：\n【测试计划】{{test_plan}}\n【实现】{{impl}}\n【验证】{{verify}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。"
+prompt = """对这次 TDD 开发做最终代码质量审查。
+
+【测试计划】{{test_plan}}
+【实现】{{impl}}
+【规格审查结论】{{spec_review}}
+
+前提：若规格审查是 FAIL，你的任务是确认缺口并给出返工清单，不必做全面质量审查。
+
+质量审查要点：命名与可读性、错误处理完备性、与项目既有约定的一致性（先读 prompts/project.md 与 prompts/overlays/programmer.md，存在则以它们为准）、潜在 bug 与边界遗漏。
+
+【输出格式】
+STRENGTHS: 做得好的地方（简短）
+ISSUES:
+- Critical: 必须修复才能合入的问题（含文件与位置）
+- Important: 应当修复的问题
+- Minor: 可选改进
+ASSESSMENT: ✅ 可合入 / ⚠️ 修复 Important 后可合入 / ❌ 必须返工（附返工清单）"""
