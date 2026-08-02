@@ -2141,6 +2141,7 @@ async fn build_runner(
     if models.is_empty() {
         return Err(AgentError::ModelsUnavailable {
             tried: vec![role_id.to_string()],
+            failures: vec![],
             next_retry_in: None,
         });
     }

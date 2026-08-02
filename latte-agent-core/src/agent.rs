@@ -335,6 +335,7 @@ impl Agent {
     ) -> AgentResult<Completion> {
         let p = params.unwrap_or(&self.params);
         let mut tried: Vec<String> = Vec::with_capacity(self.model_chain.len());
+        let mut failures: Vec<(String, String)> = Vec::with_capacity(self.model_chain.len());
 
         for mc in &self.model_chain {
             if !mc.is_available() {
@@ -344,6 +345,7 @@ impl Agent {
                 Ok(c) => return Ok(c),
                 Err(e) => {
                     tried.push(mc.model.id.clone());
+                    failures.push((mc.model.id.clone(), brief_model_error(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
                     } else {
@@ -377,6 +379,7 @@ impl Agent {
                                 mc.set_cooldown(cd);
                             }
                             tried.push(mc.model.id.clone());
+                            failures.push((mc.model.id.clone(), brief_model_error(&e)));
                         }
                     }
                 }
@@ -387,6 +390,7 @@ impl Agent {
                     .min();
                 return Err(AgentError::ModelsUnavailable {
                     tried,
+                    failures,
                     next_retry_in: new_earliest,
                 });
             }
@@ -394,6 +398,7 @@ impl Agent {
 
         Err(AgentError::ModelsUnavailable {
             tried,
+            failures,
             next_retry_in: earliest,
         })
     }
@@ -566,8 +571,20 @@ enum LoopDecision {
     Break(String),
 }
 
-fn cooldown_for_error(e: &AiError) -> Option<Duration> {
-    match e {
+/// 模型底层错误的紧凑摘要（≤120 字符）：塞进
+/// `AgentError::ModelsUnavailable.failures`，让"all models
+/// unavailable"能直接看出每个模型死于什么（限流/鉴权/网络）。
+fn brief_model_error(e: &AiError) -> String {
+    const CAP: usize = 120;
+    let s = e.to_string();
+    if s.chars().count() <= CAP {
+        return s;
+    }
+    let cut: String = s.chars().take(CAP).collect();
+    format!("{cut}…")
+}
+
+fn cooldown_for_error(e: &AiError) -> Option<Duration> {    match e {
         // Vendor told us how long to wait — respect it (floor 1s).
         AiError::RateLimited { retry_after, .. } => {
             let secs = retry_after.max(1.0);
@@ -2510,9 +2527,18 @@ mod tests {
             .await
             .expect_err("all models should fail");
         match err {
-            AgentError::ModelsUnavailable { tried, next_retry_in } => {
+            AgentError::ModelsUnavailable {
+                tried,
+                failures,
+                next_retry_in,
+            } => {
                 assert_eq!(tried, vec!["m1".to_string(), "m2".to_string()]);
                 assert!(next_retry_in.is_some(), "should report a retry window");
+                // 每个失败模型都带底层错误摘要（可据此确诊限流/鉴权）
+                assert_eq!(failures.len(), 2);
+                assert_eq!(failures[0].0, "m1");
+                assert!(!failures[0].1.is_empty());
+                assert_eq!(failures[1].0, "m2");
             }
             other => panic!("expected ModelsUnavailable, got {other:?}"),
         }

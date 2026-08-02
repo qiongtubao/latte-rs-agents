@@ -79,9 +79,13 @@ pub enum AgentError {
     ///                  exits cooldown. `None` if no model has a future
     ///                  cooldown (i.e. the failures were non-retryable but
     ///                  were swallowed by the fallback loop — caller's hint
-    #[error("all models unavailable (tried: {tried:?}); next retry in {next_retry_in:?}")]
+    #[error("all models unavailable (tried: {tried:?}); failures: {failures:?}; next retry in {next_retry_in:?}")]
     ModelsUnavailable {
         tried: Vec<String>,
+        /// 每个失败模型的底层错误摘要（model_id, 截断后的错误），
+        /// 让"all models unavailable"不再是黑盒——限流/鉴权/网络
+        /// 问题可以直接从错误消息与会话日志里确诊。
+        failures: Vec<(String, String)>,
         next_retry_in: Option<std::time::Duration>,
     },
     /// A lifecycle hook aborted execution.
