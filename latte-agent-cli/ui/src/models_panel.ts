@@ -90,6 +90,10 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   const { container } = opts;
   let items: ModelWithSource[] = [];
   let currentKey: string | null = null;
+  /** 当前选中条目在 `items[]` 里的索引。同一 key 可能有多条磁盘记录
+   * （项目层 + 全局层各一个文件），`currentKey` 只能定位到 key，
+   * 区分同名多条必须靠条目身份（key + source + file_path）。 */
+  let currentEntryIdx = -1;
   let isLoading = false;
   let isSaving = false;
 
@@ -101,6 +105,28 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   const tomlSaveBtn = document.getElementById("models-toml-save") as HTMLButtonElement | null;
   const tomlReloadBtn = document.getElementById("models-toml-reload") as HTMLButtonElement | null;
   const tomlStatusEl = document.getElementById("models-toml-status") as HTMLElement | null;
+
+  /** 按条目身份（key + source + file_path）在 `items[]` 里定位索引。 */
+  function itemIndex(m: ModelWithSource | null): number {
+    if (!m) return -1;
+    return items.findIndex(
+      x => x.key === m.key && x.source === m.source && x.file_path === m.file_path,
+    );
+  }
+
+  /** 选中一条记录：更新 currentKey + 条目索引 + 下拉框位置。 */
+  function selectEntry(m: ModelWithSource | null): void {
+    const idx = m ? itemIndex(m) : -1;
+    if (idx >= 0) {
+      currentEntryIdx = idx;
+      currentKey = items[idx].key;
+      container.selectEl.selectedIndex = idx + 1; // +1 跳过 placeholder
+    } else {
+      currentEntryIdx = -1;
+      currentKey = null;
+      container.selectEl.selectedIndex = 0;
+    }
+  }
 
   container.openBtn.addEventListener("click", () => {
     container.panelEl.classList.remove("hidden");
@@ -118,7 +144,16 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   });
 
   container.selectEl.addEventListener("change", () => {
-    currentKey = container.selectEl.value || null;
+    // 下拉框 option 的 value 是 key（可能有重复 value），不能靠
+    // `selectEl.value` 区分同名条目 —— 用 selectedIndex 反查 items。
+    const idx = container.selectEl.selectedIndex - 1; // 0 是 placeholder
+    if (idx >= 0 && idx < items.length) {
+      currentEntryIdx = idx;
+      currentKey = items[idx].key;
+    } else {
+      currentEntryIdx = -1;
+      currentKey = null;
+    }
     const activeTab = tabBarEl?.querySelector(".role-editor-tab.active")?.getAttribute("data-tab");
     renderForm();
     if (activeTab === "toml" && currentKey) {
@@ -202,16 +237,28 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
       items = resp.models;
       container.pathsEl.textContent =
         `项目: ${resp.project_models_dir} · 全局: ${resp.global_models_dir}`;
+      // 保存当前选中条目的身份（key + source + file_path），刷新后
+      // 按身份找回 —— 同名多条记录时 key 不够，必须精确到条目。
+      const prev = currentEntryIdx >= 0 && currentEntryIdx < items.length
+        ? items[currentEntryIdx]
+        : null;
+      const prevIdentity = prev
+        ? { key: prev.key, source: prev.source, file_path: prev.file_path }
+        : null;
       populateSelect();
-      const keep = currentKey !== null && items.some(m => m.key === currentKey);
-      if (keep && currentKey !== null) {
-        container.selectEl.value = currentKey;
+      const next = prevIdentity
+        ? items.find(
+            m => m.key === prevIdentity.key
+              && m.source === prevIdentity.source
+              && m.file_path === prevIdentity.file_path,
+          ) ?? null
+        : null;
+      if (next) {
+        selectEntry(next);
       } else if (items.length > 0) {
-        currentKey = items[0].key;
-        container.selectEl.value = currentKey!;
+        selectEntry(items[0]);
       } else {
-        currentKey = null;
-        container.selectEl.value = "";
+        selectEntry(null);
       }
       setStatus(`已加载 ${items.length} 个 model`);
       renderForm();
@@ -223,10 +270,12 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   }
 
   function selectNewBlank(): void {
+    currentEntryIdx = -1;
     currentKey = null;
-    container.selectEl.value = "";
+    container.selectEl.selectedIndex = 0;
     renderForm();
   }
+
 
   function populateSelect(): void {
     container.selectEl.replaceChildren();
@@ -236,18 +285,27 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
       ? "（暂无 model，点击 + 新建）"
       : "（选择一个 model，或点 + 新建）";
     container.selectEl.appendChild(placeholder);
+    // 同一 key 可能对应多条磁盘记录（项目层 + 全局层各一个文件，
+    // 见 `list_models` 的 entries 语义）。option value 仍是 key ——
+    // 重复 value 的 option 浏览器仍可分别选中（`selectEl.value` 取
+    // 第一个匹配，但表单用 `currentKey` 索引，不受影响）；文本里
+    // 追加来源标签，用户能区分编辑的是哪一份。
     for (const m of items) {
       const opt = document.createElement("option");
       opt.value = m.key;
-      opt.textContent = `${m.key}${m.name !== m.key ? `  —  ${m.name}` : ""}`;
+      const sameKey = items.filter(x => x.key === m.key);
+      opt.textContent = sameKey.length > 1
+        ? `${m.key}  [${m.source}]${m.file_path ? `  ${m.file_path}` : ""}`
+        : `${m.key}${m.name !== m.key ? `  —  ${m.name}` : ""}`;
       container.selectEl.appendChild(opt);
     }
   }
 
   function renderForm(): { inputs: Map<keyof ModelDef, FormInput> } {
     container.bodyEl.replaceChildren();
-    const current = currentKey
-      ? items.find(m => m.key === currentKey) ?? null
+    // 用条目索引定位当前选中的记录（同名多条时 key 不够用）。
+    const current = currentEntryIdx >= 0 && currentEntryIdx < items.length
+      ? items[currentEntryIdx]
       : null;
 
     if (current) {
@@ -391,17 +449,30 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
 
   async function onDelete(key: string): Promise<void> {
     if (isSaving) return;
-    const def = items.find(m => m.key === key);
+    // 当前选中的条目（同名多条时必须是这一条，不能只靠 key）。
+    const removed = currentEntryIdx >= 0 && currentEntryIdx < items.length
+      ? items[currentEntryIdx]
+      : null;
+    const def = removed ?? items.find(m => m.key === key) ?? null;
     const label = def ? `${def.provider}/${def.name}` : key;
-    if (!confirm(`确定删除 model "${label}"？此操作不可撤销。`)) return;
+    if (!confirm(`确定删除 model "${label}"（${removed?.source ?? "?"}）？此操作不可撤销。`)) return;
     isSaving = true;
     setStatus("删除中…");
     try {
-      await deleteModel(key);
+      // 精确删当前条目的层：同名多条时只删这一份，另一层保留。
+      await deleteModel(key, removed?.source === "global" ? "global" : "project");
       setStatus(`已删除 ${label}`);
-      items = items.filter(m => m.key !== key);
-      if (currentKey === key) currentKey = null;
+      if (removed) {
+        items = items.filter(m =>
+          !(m.key === removed.key && m.source === removed.source && m.file_path === removed.file_path)
+        );
+      }
+      currentEntryIdx = -1;
+      currentKey = null;
       populateSelect();
+      if (currentKey === null && items.length > 0) {
+        selectEntry(items[0]);
+      }
       renderForm();
     } catch (err) {
       setStatus(`删除失败: ${(err as Error).message}`, true);
@@ -427,8 +498,14 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
       const updated = await updateModel(targetKey, def, target);
       await refresh();
       setStatus(`✅ 已保存 ${updated.key}（${updated.source}）`);
-      currentKey = updated.key;
-      container.selectEl.value = updated.key;
+      // refresh 后按 (key, source, file_path) 身份重新选中刚保存的这条
+      // —— 同名多条记录时 key 定位不到具体条目。
+      const saved = items.find(
+        m => m.key === updated.key
+          && m.source === updated.source
+          && m.file_path === updated.file_path,
+      ) ?? null;
+      selectEntry(saved ?? items[0] ?? null);
       renderForm();
     } catch (err) {
       setStatus(`保存失败: ${(err as Error).message}`, true);
@@ -446,8 +523,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
       found = byName.find(m => m.source !== "catalog") ?? byName[0];
     }
     if (found) {
-      currentKey = found.key;
-      container.selectEl.value = found.key;
+      selectEntry(found);
       renderForm();
     } else {
       setStatus(`未找到 model「${key}」`, true);

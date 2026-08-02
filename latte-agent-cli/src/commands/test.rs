@@ -426,6 +426,8 @@ mod tests {
     fn success_line_includes_usage_and_model_id() {
         let c = Completion {
             content: "hello".into(),
+            content_parts: vec![],
+            tool_calls: vec![],
             stop_reason: "end_turn".into(),
             usage: TokenUsage {
                 input_tokens: 5,

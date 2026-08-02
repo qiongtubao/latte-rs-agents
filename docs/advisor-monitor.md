@@ -126,10 +126,15 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 
 ## 5. 配置与成本控制
 
-- `AdvisorMonitorConfig { enabled: bool = true, review_mode: AdvisorReviewMode = OnAnomaly, max_reviews_per_turn: u32 = 2, watchdog_notes: bool = true }`
+- `AdvisorMonitorConfig { enabled: bool = true, review_mode: AdvisorReviewMode = OnAnomaly, max_reviews_per_turn: u32 = 2, watchdog_notes: bool = true, gate: GateConfig }`
   （`AdvisorReviewMode::{Off, OnAnomaly, EveryTurn}`；防异常风暴反复烧 premium）。
   `Default` 实现即开启；本 workspace 唯一的 `ControllerConfig` 构造点
   （ui-server `create_session_handle`）使用 Default——默认开。
+  `gate`（D5/D6 阈值 + `max_retries = 2`）经 `runner_gate()` 传给 driver：
+  advisor 启用时 driver 给每个 runner（含 delegate specialist）装
+  `with_gate_config`，`run_turn_gated` 在产出被接受前跑
+  `check_response_gates`；未启用时 runner 不带 gate，
+  `run_turn_gated` 等价 `run_turn`。
 - 确定性提示每 turn 每种检测器最多一次（`fired` 集合去重，turn 结束重置）。
 - 每 turn LLM 审查次数 ≤ `max_reviews_per_turn`，超限 `tracing::warn` 跳过。
 - hint 队列积压上限 16 条（`advisor_hint` 超限时丢弃最旧），防止异常风暴
@@ -142,8 +147,19 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 **v1（本次）**：monitor 框架 + D1–D4 + OnAnomaly LLM 审查 + 两条介入通道 +
 项目监察笔记（advisor-watchdog.md）+ warn/intervene 分级 + 单测。
 **v2**：EveryTurn 审查 UI 开关（topbar 🦉 toggle）；advisor 专用气泡样式（区别普通消息）。
-**v3**：intervene 裁决可**暂停 manager**（pause gate），等用户/advisor 放行；
-幻觉检测增强（ToolUse 历史 vs 结论交叉验证）。
+**v3（已落地）**：
+- LLM 复审 `Verdict::Terminate` → monitor 调 `ChatController::cancel_turn()`
+  取消 manager 的 in-flight turn（**软终止**：driver 回到等用户输入，不是
+  abort session），并广播 `ChatEvent::AdvisorTerminated { detector: Some("LLM") }`。
+- D5/D6 pre-persistence gate 接入生产 driver：`build_runner` 按
+  `AdvisorMonitorConfig::runner_gate()` 给 manager / 多角色 / delegate
+  specialist runner 装 `with_gate_config`；gate 命中 → 带批注重试（最多
+  `max_retries` 次）→ 重试通过 = 纠偏成功正常继续；重试耗尽 →
+  `AgentError::AdvisorTerminated` 上抛，driver 发
+  `ChatEvent::AdvisorTerminated`（`detector: Some("D5"/"D6")`，subsession
+  带 `sub_id`）而不是 RoleTurn，坏答案不落盘。
+
+**后续**：幻觉检测增强（ToolUse 历史 vs 结论交叉验证）。
 
 ## 7. 测试
 

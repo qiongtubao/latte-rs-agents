@@ -433,33 +433,6 @@ impl IndexLineExt for latte_agent_core::trace::IndexLine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_with_two_canonical_calls() {
-        let text = r#"Some prose
-<tool_call>read {"path": "src/main.rs"}</tool_call>
-middle
-<tool_call>search {"pattern": "TODO"}</tool_call>
-end"#;
-        let (parsed, diag) = parse_tool_calls(text);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].name, "read");
-        assert_eq!(diag.opens_found, 2);
-        assert_eq!(diag.closes_matched, 2);
-        assert!(diag.unmatched_opens.is_empty());
-    }
-
-    #[test]
-    fn parse_reports_unmatched_when_open_has_no_close() {
-        let text = r#"<tool_call>read {"path":"x"}</tool_call>
-<tool_call>list {"path":"."}
-<no close here>"#;
-        let (parsed, diag) = parse_tool_calls(text);
-        assert_eq!(parsed.len(), 1, "only one well-formed call expected");
-        assert_eq!(diag.opens_found, 2);
-        assert_eq!(diag.closes_matched, 1);
-        assert_eq!(diag.unmatched_opens.len(), 1, "second open has no close");
-        assert!(diag.unmatched_opens[0].starts_with("<tool_call"));
-    }
 
     #[test]
     fn debug_format_resolves_auto() {

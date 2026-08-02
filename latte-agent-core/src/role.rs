@@ -33,6 +33,58 @@ impl RoleCategory {
     }
 }
 
+/// Append the project-level layers (`prompts/project.md` shared
+/// context, `prompts/overlays/<role>.md` role-specific delta) onto a
+/// resolved base prompt. Pure function so tests don't have to touch
+/// the filesystem. Layers are additive — they never replace the base;
+/// empty layers and layers identical to the base (synced copies) are
+/// skipped.
+fn append_project_layers(
+    base: String,
+    project_ctx: Option<&str>,
+    overlay: Option<&str>,
+) -> String {
+    let mut out = base;
+    for (content, tag) in [(project_ctx, "project_context"), (overlay, "project_rules")] {
+        if let Some(c) = content {
+            let trimmed = c.trim();
+            if !trimmed.is_empty() && trimmed != out.trim() {
+                out.push_str(&format!("\n\n<{tag}>\n{c}\n</{tag}>"));
+            }
+        }
+    }
+    out
+}
+
+/// Infrastructure roles: their prompts are coupled to code — manager's
+/// prompt describes tool contracts (delegate/workflow/plan/ask) that the
+/// controller registers, advisor's prompt must emit verdicts that
+/// `advisor_monitor::parse_verdict` machine-parses. For these roles the
+/// built-in prompt is ALWAYS the base of the system prompt; user prompt
+/// files only append a customization section, never replace it (a stale
+/// override can no longer silently drop core behavior).
+pub fn is_infrastructure_role(id: &str) -> bool {
+    matches!(id, "manager" | "advisor")
+}
+
+/// Tools always granted to an infrastructure role, unioned with the
+/// user's configured `tools` — user config can add tools but never
+/// remove these. Mirrors the tool-registration gates in
+/// `controller::build_runner` (workflow/ask/plan) and the delegate
+/// registration.
+pub fn system_tools_for(id: &str) -> &'static [&'static str] {
+    match id {
+        // delegate/workflow/plan/ask 是调度契约；read/search/write/bash
+        // 支撑"简单任务 manager 亲手做"的三档分流（见内置 prompt 的
+        // 任务启动决策流程第 0 档）。
+        "manager" => &[
+            "delegate", "workflow", "plan", "ask", "read", "search", "write", "bash",
+        ],
+        "advisor" => &["read", "search"],
+        _ => &[],
+    }
+}
+
 /// A role template — defines the identity, behavior, and defaults for an agent role.
 ///
 /// Loaded from TOML config + markdown prompt files. Supports `{{variable}}` template
@@ -138,7 +190,29 @@ impl RoleTemplate {
             params.temperature = Some(t);
         }
 
-        let system_prompt = match &self.prompt_file {
+        // Infrastructure roles (manager, advisor): built-in prompt is the
+        // always-present base; a user prompt file only appends a
+        // <project_rules> customization section (skipped when identical
+        // to the base, e.g. a synced copy). Escape hatch: an absolute or
+        // `~`-prefixed prompt_file keeps full-replace semantics
+        // (deliberate user intent, handled by the branch below).
+        let system_prompt = if is_infrastructure_role(&self.id)
+            && !matches!(&self.prompt_file, Some(p) if p.starts_with('/') || p.starts_with('~'))
+        {
+            let base = crate::prompts::for_role(&self.id)
+                .expect("infrastructure roles always have a built-in prompt");
+            let user = match &self.prompt_file {
+                Some(path) => match tokio::fs::read_to_string(path).await {
+                    Ok(content) => Some(content),
+                    Err(_) => resolve_global_prompt(path, &self.id).await,
+                },
+                None => None,
+            };
+            match user.filter(|c| !c.trim().is_empty() && c.trim() != base.trim()) {
+                Some(custom) => format!("{base}\n\n<project_rules>\n{custom}\n</project_rules>"),
+                None => base.to_string(),
+            }
+        } else { match &self.prompt_file {
             Some(path) => match tokio::fs::read_to_string(path).await {
                 Ok(content) => content,
                 Err(primary_err) => {
@@ -184,18 +258,46 @@ impl RoleTemplate {
                     self.name, self.name
                 ),
             },
-        };
+        } };
 
-        // Load skills: append each skill file content to system prompt
+        // ── 项目级注入（init_project workflow 生成，对全角色生效）──
+        // `prompts/project.md`：全角色共享的项目上下文（项目定位、技术
+        // 栈、目录结构、构建/测试命令、代码规范总纲）。
+        // `prompts/overlays/<role>.md`：该角色在本项目的专属增量（程序
+        // 员→语言与代码规范、PM→项目定位……）。
+        // 两者都是**追加**，不覆盖基座；与基座内容相同的同步拷贝和空
+        // 文件跳过（去重）。
+        let project_ctx = tokio::fs::read_to_string("prompts/project.md")
+            .await
+            .ok();
+        let overlay = tokio::fs::read_to_string(format!("prompts/overlays/{}.md", self.id))
+            .await
+            .ok();
+        let system_prompt = append_project_layers(
+            system_prompt,
+            project_ctx.as_deref(),
+            overlay.as_deref(),
+        );
+
+        // Load skills: append each skill file content to system prompt.
+        // (Previously the content was loaded and then dropped — the
+        // loop never appended it, so `skills = [...]` was a no-op.)
         let mut system_prompt = system_prompt;
         for skill_name in &self.skills {
             let skill_paths = [
                 format!("prompts/{skill_name}.md"),
                 format!("{}/prompts/{skill_name}.md", std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default()),
             ];
-            let skill_content = skill_paths.iter()
+            if let Some(skill_content) = skill_paths
+                .iter()
                 .find_map(|p| std::fs::read_to_string(p).ok())
-                .or_else(|| crate::prompts::for_skill(skill_name).map(String::from));
+                .or_else(|| crate::prompts::for_skill(skill_name).map(String::from))
+            {
+                let trimmed = skill_content.trim();
+                if !trimmed.is_empty() {
+                    system_prompt.push_str(&format!("\n\n### 技能：{skill_name}\n\n{trimmed}\n"));
+                }
+            }
         }
 
         // code_paths：领域代码/文档资料，实例化时**确定性注入**——
@@ -217,6 +319,18 @@ impl RoleTemplate {
             }
         }
 
+        // System tools are always granted to infrastructure roles; the
+        // user's configured `tools` union on top (add-only, never remove).
+        let mut allowed_tools: Vec<String> = system_tools_for(&self.id)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for t in &self.tools {
+            if !allowed_tools.contains(t) {
+                allowed_tools.push(t.clone());
+            }
+        }
+
         Ok(Role {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -225,7 +339,7 @@ impl RoleTemplate {
             default_model_tier: model_tier,
             model_chain: self.model_chain.clone(),
             default_params: params,
-            allowed_tools: self.tools.clone(),
+            allowed_tools,
             icon: if self.icon.is_empty() {
                 default_icon(&self.id)
             } else {
@@ -247,6 +361,7 @@ fn default_icon(role_id: &str) -> String {
         "designer" => "🎨".into(),
         "tech_writer" => "📝".into(),
         "manager" => "👔".into(),
+        "advisor" => "🦉".into(),
         _ => "🤖".into(),
     }
 }
@@ -384,6 +499,128 @@ mod tests {
     fn test_default_icon() {
         assert_eq!(default_icon("pm"), "📋");
         assert_eq!(default_icon("unknown_role"), "🤖");
+    }
+
+    #[test]
+    fn test_append_project_layers() {
+        let base = "BASE".to_string();
+        // 两层都追加
+        let out = append_project_layers(base.clone(), Some("项目上下文"), Some("角色增量"));
+        assert!(out.starts_with("BASE"));
+        assert!(out.contains("<project_context>\n项目上下文\n</project_context>"));
+        assert!(out.contains("<project_rules>\n角色增量\n</project_rules>"));
+        // 缺省/空白跳过
+        let out = append_project_layers(base.clone(), None, Some("   "));
+        assert_eq!(out, "BASE");
+        // 与基座相同的同步拷贝去重
+        let out = append_project_layers(base.clone(), Some("BASE"), None);
+        assert_eq!(out, "BASE");
+        // 第二层与"基座+第一层"不同才追加（overlay 与 base 相同但被
+        // project_context 改变后的整体不同——仍按内容相同去重）
+        let out = append_project_layers(base.clone(), Some("CTX"), Some("CTX"));
+        assert!(out.contains("<project_context>"));
+        assert!(out.contains("<project_rules>"));
+    }
+
+    fn infra_template(id: &str, prompt_file: Option<String>, tools: Vec<String>) -> RoleTemplate {
+        RoleTemplate {
+            id: id.into(),
+            name: id.into(),
+            category: "planning".into(),
+            model_tier: "premium".into(),
+            model_chain: vec![],
+            prompt_file,
+            temperature: None,
+            tools,
+            icon: String::new(),
+            skills: vec![],
+            code_paths: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_infrastructure_prompt_appends_user_customization() {
+        // Must be a cwd-relative path — absolute paths are the escape
+        // hatch with full-replace semantics.
+        let rel = format!("test_custom_manager_prompt_{}.md", std::process::id());
+        std::fs::write(&rel, "本项目约定：优先用 Rust。").unwrap();
+        let tmpl = infra_template("manager", Some(rel.clone()), vec![]);
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        let _ = std::fs::remove_file(&rel);
+        // Built-in base is present …
+        assert!(role.system_prompt.contains("任务启动决策流程"));
+        // … and the user file was appended, not replaced.
+        assert!(role.system_prompt.contains("<project_rules>"));
+        assert!(role.system_prompt.contains("本项目约定：优先用 Rust。"));
+    }
+
+    #[tokio::test]
+    async fn test_infrastructure_prompt_skips_identical_user_copy() {
+        // A synced copy identical to the built-in must not be duplicated.
+        let base = crate::prompts::for_role("manager").unwrap();
+        let rel = format!("test_synced_manager_prompt_{}.md", std::process::id());
+        std::fs::write(&rel, base).unwrap();
+        let tmpl = infra_template("manager", Some(rel.clone()), vec![]);
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        let _ = std::fs::remove_file(&rel);
+        assert_eq!(role.system_prompt, base);
+        assert!(!role.system_prompt.contains("<project_rules>"));
+    }
+
+    #[tokio::test]
+    async fn test_infrastructure_absolute_path_keeps_full_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("custom_manager.md");
+        std::fs::write(&abs, "完全自定义的 manager。").unwrap();
+        let abs_str = abs.to_str().unwrap().to_string();
+        assert!(abs_str.starts_with('/'));
+        let tmpl = infra_template("manager", Some(abs_str), vec![]);
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        assert_eq!(role.system_prompt, "完全自定义的 manager。");
+    }
+
+    #[tokio::test]
+    async fn test_system_tools_union_never_removed() {
+        // User config drops everything but "read" — system tools survive.
+        let tmpl = infra_template("manager", None, vec!["read".into()]);
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        for t in ["delegate", "workflow", "plan", "ask", "read"] {
+            assert!(role.allowed_tools.iter().any(|x| x == t), "missing {t}");
+        }
+        // No duplicates.
+        let mut sorted = role.allowed_tools.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), role.allowed_tools.len());
+
+        let advisor = infra_template("advisor", None, vec![])
+            .resolve(&GenerateParams::default())
+            .await
+            .unwrap();
+        assert!(advisor.allowed_tools.iter().any(|x| x == "read"));
+        assert!(advisor.allowed_tools.iter().any(|x| x == "search"));
+    }
+
+    #[tokio::test]
+    async fn test_specialist_prompt_still_full_replace() {
+        // Non-infrastructure roles keep the old replace semantics.
+        let dir = tempfile::tempdir().unwrap();
+        let rel = format!("{}/programmer.md", dir.path().display());
+        std::fs::write(&rel, "自定义 programmer。").unwrap();
+        let tmpl = infra_template("programmer", Some(rel), vec!["write".into()]);
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        assert_eq!(role.system_prompt, "自定义 programmer。");
+        assert_eq!(role.allowed_tools, vec!["write".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_skills_are_appended_to_prompt() {
+        // Regression: the skills loop used to load content and drop it.
+        let mut tmpl = infra_template("tester", None, vec![]);
+        tmpl.skills = vec!["screenshot_skill".into()];
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        assert!(role.system_prompt.contains("### 技能：screenshot_skill"));
+        assert!(role.system_prompt.contains("Screenshot Skill"));
     }
 
     #[test]

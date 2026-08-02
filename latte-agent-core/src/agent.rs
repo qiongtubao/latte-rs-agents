@@ -589,8 +589,12 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
             _ => Some(Duration::from_secs(30)),
         },
         AiError::Http(_) => Some(Duration::from_secs(10)),
-        // 认证失败（凭证无效）是致命的，不冷却也不 fallback。
-        AiError::Auth(_) => None,
+        // 认证失败：本系统里每个模型有**各自的 key/厂商**（deepseek
+        // 官方、kimi、minimax、glm 中转……），一个模型 token 失效并不
+        // 意味着整链都坏——glm 中转 key 过期时 deepseek 官方可能健
+        // 在。短冷却让链落到下一个模型；若全链都 auth 失败，最终以
+        // ModelsUnavailable 报错，信息同样明确。
+        AiError::Auth(_) => Some(Duration::from_secs(5)),
         // 其余为无法通过切换模型可靠规避的本地错误。
         _ => None,
     }
@@ -2013,8 +2017,7 @@ impl From<GenerateParams> for AgentParams {
 
 /// 从 tool_manager 的工具定义构建 latte-ai 的 Tool 列表，下发到 LLM 请求的
 /// `tools` 字段。工具名直接用 registry 注册名（扁平规范名，== 模型看到的
-/// 名字），不再有 friendly_tool_name / namespace 别名转换。`strict` 透传
-/// `ToolDefinition.strict`（默认 None = 不开 OpenAI Structured Outputs）。
+/// 名字），不再有 friendly_tool_name / namespace 别名转换。
 /// `tool_choice` 不在此设置，取自 `agent.params.tool_choice`（默认 Auto）。
 fn build_tool_schemas(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
@@ -2026,8 +2029,6 @@ fn build_tool_schemas(
             description: Some(td.description.clone()),
             parameters: serde_json::to_value(&td.input_schema)
                 .unwrap_or(serde_json::json!({})),
-            // 透传 ToolDefinition.strict（默认 None = 不开 OpenAI Structured Outputs）。
-            strict: td.strict,
         })
         .collect()
 }
@@ -2291,9 +2292,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cooldown_for_auth_error_is_none() {
+    fn test_cooldown_for_auth_error_falls_through_quickly() {
+        // 模型各自的 key 失效是模型局部问题：短冷却后链落到下一个
+        // 模型，而不是整链陪葬（glm 中转 key 过期 ≠ deepseek 也坏）。
         let d = cooldown_for_error(&AiError::Auth("bad key".into()));
-        assert_eq!(d, None);
+        assert_eq!(d, Some(Duration::from_secs(5)));
     }
     #[test]
     fn test_cooldown_for_config_error_is_none() {
@@ -2516,14 +2519,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chat_returns_immediately_for_non_retryable_auth() {
-        // Auth errors should NOT walk the chain — same vendor is
-        // misconfigured and the second model will hit the same wall.
+    async fn test_chat_falls_through_to_next_model_on_auth_error() {
+        // Auth errors DO walk the chain: each model has its own
+        // key/vendor, so one model's bad token says nothing about the
+        // next model's health (glm relay key expired ≠ deepseek key
+        // bad). The dead model is cooled down and the chain continues.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
         let s1 = wiremock::MockServer::start().await;
-        // wiremock returns 401, which latte-ai surfaces as Api{status: 401}.
+        // wiremock returns 401, which latte-ai surfaces as Auth.
         s1.register(
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
@@ -2531,13 +2536,11 @@ mod tests {
         )
         .await;
         let s2 = wiremock::MockServer::start().await;
-        // We expect s2 to NOT be called; if it is, the test will hang
-        // on the future and we'll see extra requests in logs.
         s2.register(
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
-                    openai_completion_body("never reached", vec![]),
+                    openai_completion_body("reached via fallback", vec![]),
                 )),
         )
         .await;
@@ -2550,20 +2553,14 @@ mod tests {
         )
         .unwrap();
 
-        let err = agent
-            .chat(
-                &[Message::user("hi")],
-                None,
-                WaitPolicy::NoWait,
-            )
+        let completion = agent
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
             .await
-            .expect_err("auth error should surface");
-        assert!(
-            matches!(err, AgentError::AiClient(AiError::Auth(_))),
-            "expected 401 to surface as AiClient(Auth), got {err:?}"
-        );
-        // s2 should have zero received requests.
-        assert_eq!(s2.received_requests().await.unwrap().len(), 0);
+            .expect("chain should fall through to the healthy model");
+        assert!(completion.content.contains("reached via fallback"));
+        // m1 got exactly one attempt, then the chain moved on.
+        assert_eq!(s1.received_requests().await.unwrap().len(), 1);
+        assert_eq!(s2.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3180,6 +3177,154 @@ mod tests {
         );
     }
 
+    // ─── run_turn_gated：advisor pre-persistence gate 重试链路 ──────
+
+    /// Gate 命中 → hint 注入 → 重跑通过 = 纠偏成功，流程正常继续。
+    #[tokio::test]
+    async fn run_turn_gated_retries_with_hint_then_passes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // Round 0（先注册先匹配，只生效一次）：短输出，撞 D5
+        // （4 chars < 阈值 50，且不是明确的短 ack）。
+        struct FirstOnly(std::sync::atomic::AtomicUsize);
+        impl wiremock::Match for FirstOnly {
+            fn matches(&self, _req: &wiremock::Request) -> bool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            }
+        }
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
+                    .respond_with(ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body("TODO", vec![]))),
+            )
+            .await;
+        // 兜底：纠偏后的正常长回答。
+        let good = "这是纠偏后的完整回答：逐条说明结论、依据和后续步骤，长度远超五十字符的 D5 阈值。";
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body(good, vec![]))),
+            )
+            .await;
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let hints = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let mut runner = AgentRunner::new(agent)
+            .with_advisor_hints(hints.clone())
+            .with_gate_config(crate::advisor_monitor::GateConfig::default());
+
+        let resp = runner
+            .run_turn_gated(&[Message::user("go")], None)
+            .await
+            .expect("gate retry should pass on the corrected response");
+        assert_eq!(resp, good, "纠偏后的回答被接受，流程正常继续（继续语义）");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "1 failed attempt + 1 retry: {}", reqs.len());
+        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        assert!(
+            body2.contains("[advisor gate D5]"),
+            "retry request carries the gate annotation hint: {body2}"
+        );
+        assert!(hints.lock().is_empty(), "hint drained into the retry context");
+    }
+
+    /// Gate 重试耗尽 → AgentError::AdvisorTerminated 向上传播。
+    #[tokio::test]
+    async fn run_turn_gated_exhausts_retries_raises_advisor_terminated() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // 所有响应都撞 D5：模型屡教不改。
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body("TODO", vec![]))),
+            )
+            .await;
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let hints = Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new()));
+        let mut runner = AgentRunner::new(agent)
+            .with_advisor_hints(hints)
+            .with_gate_config(crate::advisor_monitor::GateConfig::default());
+
+        let err = runner
+            .run_turn_gated(&[Message::user("go")], None)
+            .await
+            .expect_err("retries exhausted must raise AdvisorTerminated");
+        match err {
+            AgentError::AdvisorTerminated { reason, detector } => {
+                assert_eq!(detector, "D5", "detector label propagates");
+                assert!(reason.contains("D5"), "reason names the detector: {reason}");
+            }
+            other => panic!("expected AdvisorTerminated, got {other:?}"),
+        }
+        // 默认 max_retries=2：首次 + 2 次重试 = 3 次模型调用。
+        let n = server.received_requests().await.unwrap().len();
+        assert_eq!(n, 3, "1 initial + max_retries(2) retries, got {n}");
+    }
+
+    /// 未装 gate_config 时 run_turn_gated 等价 run_turn（向后兼容：
+    /// 未启用 advisor 的场景行为不变，短输出照样接受、不重试）。
+    #[tokio::test]
+    async fn run_turn_gated_without_config_behaves_like_run_turn() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body("TODO", vec![]))),
+            )
+            .await;
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent); // no with_gate_config
+
+        let resp = runner
+            .run_turn_gated(&[Message::user("go")], None)
+            .await
+            .expect("no gate → plain run_turn behavior");
+        assert_eq!(resp, "TODO", "short output accepted without a gate");
+        let n = server.received_requests().await.unwrap().len();
+        assert_eq!(n, 1, "no gate → no retry, got {n}");
+    }
+
     #[test]
     fn short_tool_name_strips_namespace() {
         assert_eq!(short_tool_name("delegate"), "delegate");
@@ -3608,9 +3753,8 @@ mod tests {
             );
         }
     }
-    /// build_tool_schemas：工具名直接用扁平规范名（bash/read/edit），
-    /// 不再有 friendly_tool_name / namespace 转换。还验证 strict 字段
-    /// 透传（默认 None）。
+    /// build_tool_schemas：配置层扁平名（bash/read/search）映射到
+    /// registry 的 namespace 注册名（shell.exec/file.read/file.search）。
     #[tokio::test]
     async fn build_tool_schemas_uses_flat_names() {
         let mgr = crate::controller::build_tool_manager(
@@ -3620,10 +3764,8 @@ mod tests {
         .unwrap();
         let schemas = build_tool_schemas(&mgr);
         let names: Vec<String> = schemas.iter().map(|t| t.name.clone()).collect();
-        assert!(names.contains(&"bash".to_string()), "应有 bash: {names:?}");
-        assert!(names.contains(&"read".to_string()), "应有 read: {names:?}");
-        assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
-        // 扁平命名下不应有点号（shell.exec 之类的 namespace 不复存在）。
-        assert!(!names.iter().any(|n| n.contains('.')), "不应有点号命名: {names:?}");
+        assert!(names.contains(&"shell.exec".to_string()), "应有 shell.exec: {names:?}");
+        assert!(names.contains(&"file.read".to_string()), "应有 file.read: {names:?}");
+        assert!(names.contains(&"file.search".to_string()), "应有 file.search: {names:?}");
     }
 }

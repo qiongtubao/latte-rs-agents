@@ -653,14 +653,14 @@ fn import_one(
     if item.subtasks.iter().any(|s| !s.subtasks.is_empty()) {
         return Err("subtasks nested deeper than one level".to_string());
     }
-    // workflow 引用不存在时静默降级为 null
-    let workflow = item.workflow.as_ref().and_then(|wf| {
-        if crate::workflows::exists(cwd, wf) {
-            Some(wf.clone())
-        } else {
-            None
+    // workflow 引用必须存在：静默降级会让任务丢掉绑定的流程而无人
+    // 察觉——拒绝并报错，让提交方（manager/用户）修正后重试。
+    let workflow = match item.workflow.as_ref() {
+        Some(wf) if !crate::workflows::exists(cwd, wf) => {
+            return Err(format!("unknown workflow '{wf}'"));
         }
-    });
+        other => other.cloned(),
+    };
     let parent = store.create(
         &title,
         &item.description,
@@ -890,6 +890,7 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             cwd: b.cwd.clone(),
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            depth: 0,
         };
         let result = run_workflow(&wf, &topic, &ctx).await;
         let mut store = b.tasks.write();
@@ -1066,6 +1067,7 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
                 cwd: b2.cwd.clone(),
                 event_tx: event_tx.clone(),
                 cancel_flag: cancel.clone(),
+                depth: 0,
             };
             let result = run_workflow(&wf, &msg2, &ctx).await;
             // 开发流跑完（非 code_review 本身）→ 链式自动审查。
@@ -1117,6 +1119,7 @@ async fn chain_code_review(
         cwd: b.cwd.clone(),
         event_tx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        depth: 0,
     };
     let result = run_workflow(&wf, &topic, &ctx).await;
     let mut store = b.tasks.write();

@@ -92,10 +92,10 @@ export interface RolesConfig {
 }
 
 /** 角色编辑器「模型链」下拉框的单个选项。
- * 后端与 `GET /api/models` 同源，但只取下拉框需要的三个字段
- * （name / provider / source），不传完整 ModelDef。
- * `source` 是 "project" / "global" / "catalog" 之一，UI 用它显示
- * 「项目 / 全局 / catalog」标签，让用户知道这条记录是否在磁盘上。 */
+ * 后端与 `GET /api/models` 同源（磁盘 entries，不去重），只取下拉框
+ * 需要的字段。`source` 是 "project" / "global" / "catalog" 之一。
+ * `key`（provider/name）用于区分同名多条 —— 项目层与全局层各有一份
+ * 文件时，两条 `name` 相同但 `key + source` 不同。 */
 export interface AvailableModel {
   /** 模型 id —— 选中后写入 `model_chain` 的字符串。 */
   name: string;
@@ -103,6 +103,8 @@ export interface AvailableModel {
    * 模型在不同厂商下的实例。 */
   provider: string;
   source: string;
+  /** 复合键 `provider/name`。 */
+  key: string;
 }
 
 /** `POST /api/roles/config` 请求体。 */
@@ -625,9 +627,17 @@ export async function updateModel(
     { target, ...def },
   );
 }
-/** DELETE /api/models/:key：删除 model。 */
-export async function deleteModel(key: string): Promise<void> {
-  await getTransport().request("DELETE", `/api/models/${encodeURIComponent(key)}`);
+/** DELETE /api/models/:key?source=…：删除指定层的 model 文件。
+ * 同一 key 可能项目/全局各一份（同名多条），`source` 精确指定删哪层，
+ * 只删当前条目这份，另一层保留。 */
+export async function deleteModel(
+  key: string,
+  source: "project" | "global" = "project",
+): Promise<void> {
+  await getTransport().request(
+    "DELETE",
+    `/api/models/${encodeURIComponent(key)}?source=${source}`,
+  );
 }
 
 /** GET /api/models/:key/toml：读取模型 TOML 源文件原始内容。 */

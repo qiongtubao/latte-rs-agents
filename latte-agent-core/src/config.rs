@@ -302,6 +302,7 @@ impl AgentConfig {
                 "designer",
                 "tech_writer",
                 "manager",
+                "advisor",
             ] {
                 if let Some(tmpl) = crate::prompts::template_for(id) {
                     merged.roles.insert(id.to_string(), tmpl);
@@ -789,7 +790,7 @@ icon = "G"
                 "/tmp/__definitely_nonexistent_for_builtin_test__",
             ))
             .unwrap();
-            // We expect at minimum the 10 built-ins.
+            // We expect at minimum the 11 built-ins.
             for id in [
                 "pm",
                 "architect",
@@ -801,6 +802,7 @@ icon = "G"
                 "designer",
                 "tech_writer",
                 "manager",
+                "advisor",
             ] {
                 assert!(
                     cfg.roles.contains_key(id),

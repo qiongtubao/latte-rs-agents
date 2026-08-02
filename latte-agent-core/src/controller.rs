@@ -22,7 +22,7 @@ use latte_ai::params::GenerateParams;
 use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use crate::advisor_monitor::{AdvisorMonitorConfig, AdvisorReviewEngine};
+use crate::advisor_monitor::{AdvisorMonitorConfig, AdvisorReviewEngine, GateConfig};
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
@@ -95,6 +95,39 @@ fn truncate_event_text(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}...[+{}B]", &text[..end], text.len() - end)
+}
+
+/// Strip `<think>…</think>` reasoning blocks from content surfaced to
+/// the main session (RoleTurn bubbles, delegate/workflow returns to the
+/// manager). The raw content stays in the subsession trace logs; this
+/// only affects what humans and the manager see. An unclosed block
+/// (model truncated mid-reasoning) is dropped to end-of-string. If
+/// stripping would leave nothing, the original is returned so callers
+/// never receive an empty payload.
+pub(crate) fn strip_think_blocks(content: &str) -> String {
+    if !content.contains("<think>") {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + "<think>".len()..];
+        match after_open.find("</think>") {
+            Some(end) => rest = &after_open[end + "</think>".len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    let stripped = out.trim();
+    if stripped.is_empty() {
+        content.to_string()
+    } else {
+        stripped.to_string()
+    }
 }
 
 struct ChatEventTraceSink {
@@ -684,7 +717,8 @@ impl ChatController {
     /// session. The driver flips `turn_cancel_flag`, aborts the
     /// `run_turn` JoinHandle, and the session loop moves on to
     /// the next user input. UI sends this when the user picks
-    /// "终止当前任务" from a `TimeoutWarning` prompt.
+    /// "终止当前任务" from a `TimeoutWarning` prompt; the
+    /// AdvisorMonitor calls it on `Verdict::Terminate`.
     pub async fn cancel_turn(&self) {
         self.turn_cancel_flag.store(true, Ordering::SeqCst);
         // Also send CancelTurn input so that loops blocked on
@@ -693,6 +727,13 @@ impl ChatController {
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
             let _ = tx.send(ControllerInput::CancelTurn);
         }
+    }
+
+    /// Whether the per-turn cancel flag is currently set. Exposed
+    /// for tests and for embedders asserting advisor-terminate
+    /// behavior; the driver clears the flag at each turn entry.
+    pub fn turn_cancel_requested(&self) -> bool {
+        self.turn_cancel_flag.load(Ordering::SeqCst)
     }
 
     /// Get a subscriber that receives all future events.
@@ -830,10 +871,14 @@ pub fn compute_waves<S: ContractAccess>(steps: &[S]) -> WavePlan {
 
 
 
-/// Run a turn with cancellation support. Polls `run_turn` at 500ms ticks
-/// and checks `cancel_flag` (session abort) + `turn_cancel_flag` (current
-/// turn cancel). On cancellation the in-flight LLM call is dropped via
-/// the future's Drop impl. Returns `Ok(response)` or `Err(AgentError)`.
+/// Run a turn with cancellation support. Polls `run_turn_gated` at 500ms
+/// ticks and checks `cancel_flag` (session abort) + `turn_cancel_flag`
+/// (current turn cancel). On cancellation the in-flight LLM call is
+/// dropped via the future's Drop impl. Returns `Ok(response)` or the
+/// runner's real `Err(AgentError)` — in particular
+/// `AgentError::AdvisorTerminated` from the pre-persistence gate
+/// propagates unchanged so the driver can emit
+/// `ChatEvent::AdvisorTerminated` instead of a generic failure.
 /// No timeout — the user must cancel explicitly.
 async fn run_turn_cancellable(
     runner: &mut AgentRunner,
@@ -842,30 +887,39 @@ async fn run_turn_cancellable(
     turn_cancel_flag: &AtomicBool,
 ) -> Result<String, AgentError> {
     turn_cancel_flag.store(false, Ordering::SeqCst);
-    let mut fut = Box::pin(runner.run_turn(msgs, None));
-    let result: Result<String, &'static str> = loop {
+    // run_turn_gated 在 runner 未装 gate_config 时等价于 run_turn，
+    // 未启用 advisor 的场景行为不变。
+    let mut fut = Box::pin(runner.run_turn_gated(msgs, None));
+    enum TurnOutcome {
+        Done(Result<String, AgentError>),
+        SessionCancelled,
+        TurnCancelled,
+    }
+    let outcome = loop {
         tokio::select! {
             biased;
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 if cancel_flag.load(Ordering::SeqCst) {
-                    break Err("session_cancelled");
+                    break TurnOutcome::SessionCancelled;
                 }
                 if turn_cancel_flag.load(Ordering::SeqCst) {
-                    break Err("turn_cancelled");
+                    break TurnOutcome::TurnCancelled;
                 }
             }
             r = fut.as_mut() => {
-                break r.map(|s| s).map_err(|_| "turn_failed");
+                break TurnOutcome::Done(r);
             }
         }
     };
     drop(fut);
-    match result {
-        Ok(resp) => Ok(resp),
-        Err("session_cancelled") => Err(AgentError::Orchestration("session cancelled by user".into())),
-        Err("turn_cancelled") => Err(AgentError::Orchestration("turn cancelled by user".into())),
-        Err("turn_failed") => Err(AgentError::Orchestration("turn failed".into())),
-        Err(e) => Err(AgentError::Orchestration(format!("turn error: {e}"))),
+    match outcome {
+        TurnOutcome::Done(r) => r,
+        TurnOutcome::SessionCancelled => {
+            Err(AgentError::Orchestration("session cancelled by user".into()))
+        }
+        TurnOutcome::TurnCancelled => {
+            Err(AgentError::Orchestration("turn cancelled by user".into()))
+        }
     }
 }
 
@@ -1118,6 +1172,7 @@ async fn run_multi_role_loop(
             &config.session_id,
             cancel_flag.clone(),
             turn_cancel_flag.clone(),
+            config.advisor_monitor.runner_gate(),
         )
         .await
         {
@@ -1472,6 +1527,16 @@ async fn run_multi_role_loop(
                         role_id: role_id.clone(),
                         detail: format!("round {round_num}: error: {e}"),
                     });
+                    // Advisor gate 重试耗尽：发 AdvisorTerminated，
+                    // 本轮不产出 RoleTurn（String::new() 下方跳过）。
+                    if let AgentError::AdvisorTerminated { reason, detector } = &e {
+                        let _ = event_tx.send(ChatEvent::AdvisorTerminated {
+                            role_id: role_id.clone(),
+                            reason: reason.clone(),
+                            detector: Some(detector.clone()),
+                            sub_id: None,
+                        });
+                    }
                     String::new()
                 }
             };
@@ -1483,7 +1548,7 @@ async fn run_multi_role_loop(
 
                 let _ = event_tx.send(ChatEvent::RoleTurn {
                     role_id: role_id.clone(),
-                    content: new_assistant_text.clone(),
+                    content: strip_think_blocks(&new_assistant_text),
                     is_complete: true,
                     sub_id: None,
                 });
@@ -1619,6 +1684,7 @@ async fn run_single_role_loop(
         &config.session_id,
         cancel_flag.clone(),
         turn_cancel_flag.clone(),
+        config.advisor_monitor.runner_gate(),
     )
         .await
     {
@@ -1720,7 +1786,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1742,7 +1808,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1852,7 +1918,7 @@ let usage_before = runner.total_usage().clone();
                                 let usage_after = runner.total_usage();
                                 let in_delta = usage_after.input_tokens - usage_before.input_tokens;
                                 let out_delta = usage_after.output_tokens - usage_before.output_tokens;
-                                let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: response.clone(), is_complete: true, sub_id: None });
+                                let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: strip_think_blocks(&response), is_complete: true, sub_id: None });
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("[{current_role} · {mid} · tokens: +{in_delta} in / +{out_delta} out]") });
                                 let _ = event_tx.send(ChatEvent::RoleFinished {
                                     role_id: current_role.clone(),
@@ -1865,13 +1931,26 @@ let usage_before = runner.total_usage().clone();
                                     role_id: current_role.clone(),
                                     detail: format!("error: {e}"),
                                 });
-                                let _ = event_tx.send(error_event(&e, "turn failed", None));
+                                // Advisor gate 重试耗尽：发
+                                // AdvisorTerminated 而不是普通 Error —
+                                // 坏答案不落盘成 RoleTurn，driver 回到
+                                // 等用户输入（不是 session 终止）。
+                                if let AgentError::AdvisorTerminated { reason, detector } = &e {
+                                    let _ = event_tx.send(ChatEvent::AdvisorTerminated {
+                                        role_id: current_role.clone(),
+                                        reason: reason.clone(),
+                                        detector: Some(detector.clone()),
+                                        sub_id: None,
+                                    });
+                                } else {
+                                    let _ = event_tx.send(error_event(&e, "turn failed", None));
+                                }
                             }
                         }
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1886,7 +1965,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1943,6 +2022,11 @@ async fn build_runner(
     session_id: &str,
     cancel_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
+    // Advisor pre-persistence gate（D5/D6）。`Some` 时装到本 runner
+    // 及 delegate specialist runner 上（`with_gate_config`），
+    // `run_turn_gated` 在产出被接受前先过 `check_response_gates`；
+    // `None` 时 gate 缺省，`run_turn_gated` 等价 `run_turn`。
+    advisor_gate: Option<GateConfig>,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -2018,6 +2102,7 @@ async fn build_runner(
                 sid,
                 cancel_flag.clone(),
                 turn_cancel_flag.clone(),
+                advisor_gate.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -2071,11 +2156,23 @@ async fn build_runner(
             let (_sub_id, sink) = subsession_store.create(session_id, role_id);
             Some(sink)
         };
+        // 同时挂上 ChatEventTraceSink：把 ParseToolCalls/ToolExec 转成
+        // ToolUse/ToolResult/ToolError 广播到 session channel——advisor
+        // monitor 靠这些事件观察工具行为（路由审查、D2-D4 异常检测），
+        // 没有它 monitor 的 Tool* 分支永远收不到事件。
+        let chat_sink: Arc<dyn crate::trace::TraceSink> = Arc::new(ChatEventTraceSink {
+            event_tx: event_tx.clone(),
+        });
+        let runner_sink: Arc<dyn crate::trace::TraceSink> = match subsession_sink {
+            Some(sub) => Arc::new(crate::trace::FanOutSink::new(vec![sub, chat_sink])),
+            None => chat_sink,
+        };
         let mut runner = AgentRunner::new_with_tools(agent, tm, 16)
             .with_role(role_id)
             .with_cwd(cwd.to_path_buf());
-        if let Some(sink) = subsession_sink.as_ref() {
-            runner = runner.with_sink(sink.clone());
+        runner = runner.with_sink(runner_sink);
+        if let Some(gate) = advisor_gate.clone() {
+            runner = runner.with_gate_config(gate);
         }
         Ok((runner, role_id.to_string()))
     } else {
@@ -2086,11 +2183,19 @@ async fn build_runner(
             let (_sub_id, sink) = subsession_store.create(session_id, role_id);
             Some(sink)
         };
+        let chat_sink: Arc<dyn crate::trace::TraceSink> = Arc::new(ChatEventTraceSink {
+            event_tx: event_tx.clone(),
+        });
+        let runner_sink: Arc<dyn crate::trace::TraceSink> = match subsession_sink {
+            Some(sub) => Arc::new(crate::trace::FanOutSink::new(vec![sub, chat_sink])),
+            None => chat_sink,
+        };
         let mut runner = AgentRunner::new(agent)
             .with_role(role_id)
             .with_cwd(cwd.to_path_buf());
-        if let Some(sink) = subsession_sink.as_ref() {
-            runner = runner.with_sink(sink.clone());
+        runner = runner.with_sink(runner_sink);
+        if let Some(gate) = advisor_gate {
+            runner = runner.with_gate_config(gate);
         }
         Ok((runner, role_id.to_string()))
     }
@@ -2106,40 +2211,68 @@ pub(crate) async fn build_tool_manager(
         mgr.register_package(p).await
             .map_err(|e| format!("register_package: {e}"))?;
     }
-    // allowed 里的名字现在是扁平规范名（bash/read/edit/...），直接与
-    // registry 注册名匹配，不再有 bash->shell.exec 之类的别名反向映射。
+    // allowed 里是配置层扁平名（bash/read/edit/...），而 registry 里的
+    // 工具名带 namespace 前缀（shell.exec/file.read/...）。这里先把
+    // 配置名展开成它可能对应的注册名（含 namespace），过滤时按注册名
+    // 或短名匹配，保证 allowed "bash" 能保留 "shell.exec"。
     let mut keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
-    // 配置层向后兼容映射：旧配置名 → 新扁平规范名。用户已有的
-    // `~/.latte/agents.d/*.toml` 里可能用 "exec"（现为 "bash"）、
-    // "diff"（现为 "git_diff"）、"playwright_screenshot"（现为 "screenshot"）
-    let compat_map: std::collections::HashMap<&str, &str> = [
-        ("exec", "bash"),
-        ("playwright_screenshot", "screenshot"),
-        // 旧 namespace 短名映射：git 系列现在用 "git_diff"/"git_log"/等。
-        ("diff", "git_diff"),
-        ("status", "git_status"),
-        ("log", "git_log"),
-        ("branch", "git_branch"),
-        ("commit", "git_commit"),
-        ("add", "git_add"),
+    // 配置层扁平名 → registry 注册名（namespace 前缀）正向映射。
+    // registry 侧没有 "bash"，它是 "shell.exec" 的配置层名字。
+    let flat_to_registry: std::collections::HashMap<&str, &str> = [
+        ("bash", "shell.exec"),
+        ("exec", "shell.exec"),
+        ("spawn", "shell.spawn"),
+        ("read", "file.read"),
+        ("write", "file.write"),
+        ("list", "file.list"),
+        ("delete", "file.delete"),
+        ("search", "file.search"),
+        ("find", "file.find"),
+        ("edit", "file.edit"),
+        ("grep", "ast.grep"),
+        ("ast_edit", "ast.edit"),
+        ("eval", "eval.exec"),
+        ("fetch", "http.fetch"),
+        ("todo", "todo.todo"),
+        ("git_status", "git.status"),
+        ("git_diff", "git.diff"),
+        ("git_log", "git.log"),
+        ("git_branch", "git.branch"),
+        ("git_commit", "git.commit"),
+        ("git_add", "git.add"),
+        // git 短名：老配置可能直接用 "diff"/"log" 等，展开成 git.*。
+        ("diff", "git.diff"),
+        ("status", "git.status"),
+        ("log", "git.log"),
+        ("branch", "git.branch"),
+        ("commit", "git.commit"),
+        ("add", "git.add"),
+        ("mcp_list", "mcp.mcp_list"),
+        ("mcp_connect", "mcp.mcp_connect"),
+        ("mcp_call", "mcp.mcp_call"),
+        ("playwright_screenshot", "playwright.playwright_screenshot"),
+        ("playwright_script", "playwright.playwright_script"),
+        // browser 包只有一个工具，namespace 前缀与短名相同。
+        ("browser", "browser.browser"),
     ].into_iter().collect();
-    for (old, new) in &compat_map {
-        if keep.contains(*old) {
-            keep.insert(new.to_string());
+    for (flat, registry) in &flat_to_registry {
+        if keep.contains(*flat) {
+            keep.insert(registry.to_string());
+            // 注册名本身进 keep，直接匹配 registry 名。
         }
     }
     // mcp 是配置层分组别名（一个名字展开成 3 个 mcp_* 工具），不是工具名别名。
-    if keep.contains("mcp") || keep.contains("mcp_connect") {
+    if keep.contains("mcp") {
         keep.insert("mcp_connect".to_string());
         keep.insert("mcp_list".to_string());
         keep.insert("mcp_call".to_string());
     }
-    // playwright 同理：展开成 screenshot + playwright_script。
+    // playwright 同理：展开成 playwright_screenshot + playwright_script。
     if keep.contains("playwright") {
-        keep.insert("screenshot".to_string());
+        keep.insert("playwright_screenshot".to_string());
         keep.insert("playwright_script".to_string());
     }
     // Register code_graph tool if allowed
@@ -2147,8 +2280,8 @@ pub(crate) async fn build_tool_manager(
         let cg = code_graph_tool();
         mgr.register(cg, None);
     }
-    // 工具名已是扁平（无点号），short == tool_id；保留 rsplit_once 兜底
-    // 仅为兼容可能遗留的 namespace 工具。
+    // 过滤：注册名全名或短名（namespace 后缀）命中 keep 就保留。
+    // 短名兜底兼容没有 namespace 前缀的工具（screenshot/plan/ask/...）。
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -2645,6 +2778,9 @@ async fn register_delegate_tool(
     session_id: String,
     cancel_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
+    // Advisor pre-persistence gate，透传自 build_runner；`Some` 时
+    // specialist runner 的产出也先过 D5/D6 gate 再返回给 manager。
+    advisor_gate: Option<GateConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -2705,6 +2841,7 @@ async fn register_delegate_tool(
         let sem = Arc::clone(&sem);
         let cancel_flag = Arc::clone(&cancel_flag_owned);
         let turn_cancel_flag = Arc::clone(&turn_cancel_flag_owned);
+        let advisor_gate = advisor_gate.clone();
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
         Box::pin(async move {
@@ -2812,10 +2949,23 @@ async fn register_delegate_tool(
                 Some(tm) => AgentRunner::new_with_tools(agent, tm, 0),
                 None => AgentRunner::new(agent),
             };
+            // Fan-out：子会话 JSONL 日志 + ChatEventTraceSink——专家的
+            // 工具错误由此广播到 session channel，advisor monitor 的
+            // specialist-error 检测（连续出错 → 提示修正分派）依赖它。
+            let specialist_sink: Arc<dyn crate::trace::TraceSink> =
+                Arc::new(crate::trace::FanOutSink::new(vec![
+                    sub_sink.clone(),
+                    Arc::new(ChatEventTraceSink {
+                        event_tx: event_tx.clone(),
+                    }),
+                ]));
             runner = runner
                 .with_role(role_id.clone())
                 .with_cwd(cwd.clone())
-                .with_sink(sub_sink.clone());
+                .with_sink(specialist_sink);
+            if let Some(gate) = advisor_gate.clone() {
+                runner = runner.with_gate_config(gate);
+            }
 
             // Emit RoleStarted so the UI shows the specialist is working
             let task_clone = task.clone();
@@ -2836,15 +2986,32 @@ async fn register_delegate_tool(
             // cancel it from the select! loop. The task owns everything.
             let task_content = task.clone();
             let mut run_handle = tokio::spawn(async move {
-                runner.run_turn(&[Message::user(task_content)], None).await
+                // gated 版：装了 gate_config 时产出先过 D5/D6；
+                // 没装时等价 run_turn。
+                runner.run_turn_gated(&[Message::user(task_content)], None).await
             });
             let result: Result<String, latte_rs_agent_tools::error::ToolError>;
             loop {
                 tokio::select! {
                     r = &mut run_handle => {
                         match r {
-                            Ok(Ok(response)) => { result = Ok(response); break; }
+                            // 剥掉 <think> 推理块：主 session 的气泡、
+                            // DelegateFinished 摘要和回喂 manager 的工具
+                            // 结果都只保留正式回答；原文留在子会话 trace。
+                            Ok(Ok(response)) => { result = Ok(strip_think_blocks(&response)); break; }
                             Ok(Err(e)) => {
+                                // Gate 重试耗尽 → subsession 被 advisor
+                                // 终止：发 AdvisorTerminated（带 sub_id）
+                                // 让 UI 显示"已暂停"状态，再把错误
+                                // 作为 tool error 回喂 manager。
+                                if let AgentError::AdvisorTerminated { reason, detector } = &e {
+                                    let _ = event_tx.send(ChatEvent::AdvisorTerminated {
+                                        role_id: role_id.clone(),
+                                        reason: reason.clone(),
+                                        detector: Some(detector.clone()),
+                                        sub_id: Some(sub_id.clone()),
+                                    });
+                                }
                                 result = Err(tool_err(format!("subagent failed: {e}")));
                                 break;
                             }
@@ -3097,10 +3264,11 @@ async fn register_workflow_tool(
                 cwd,
                 event_tx,
                 cancel_flag,
+                depth: 0,
             };
             crate::workflow::run_workflow(&wf, &topic, &ctx)
                 .await
-                .map(serde_json::Value::String)
+                .map(|summary| serde_json::Value::String(strip_think_blocks(&summary)))
                 .map_err(tool_err)
         })
     });
@@ -3140,6 +3308,7 @@ async fn run_workflow_command(
         cwd: config.cwd.clone(),
         event_tx: event_tx.clone(),
         cancel_flag,
+        depth: 0,
     };
 
     let summary = crate::workflow::run_workflow(&wf, topic, &ctx).await?;
@@ -3168,6 +3337,79 @@ fn role_icon(role_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_think_blocks_cases() {
+        // 无 think：原样返回
+        assert_eq!(strip_think_blocks("正式回答"), "正式回答");
+        // 单个块：剥掉并 trim
+        assert_eq!(
+            strip_think_blocks("<think>推理过程</think>\n\n正式回答"),
+            "正式回答"
+        );
+        // 多个块 + 中间内容保留
+        assert_eq!(
+            strip_think_blocks("<think>a</think>第一部分<think>b</think>第二部分"),
+            "第一部分第二部分"
+        );
+        // 未闭合块：丢弃到结尾（仅剩 think → 回退原文）
+        assert_eq!(strip_think_blocks("<think>推理中断"), "<think>推理中断");
+        // 只有 think（被截断）：回退原文，避免空负载
+        assert_eq!(
+            strip_think_blocks("<think>只有推理</think>"),
+            "<think>只有推理</think>"
+        );
+    }
+
+    #[test]
+    fn chat_event_trace_sink_broadcasts_tool_events() {
+        use crate::trace::TraceSink as _;
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let sink = ChatEventTraceSink { event_tx: tx };
+
+        // ParseToolCalls → one ToolUse per parsed call (this is what
+        // lets the advisor monitor see routing decisions like the
+        // manager invoking the `workflow` tool).
+        sink.emit(crate::trace::TraceEvent::ParseToolCalls {
+            meta: crate::trace::TraceMeta::test_default(),
+            raw_in: String::new(),
+            parsed: vec![crate::trace::ParsedCall {
+                id: String::new(),
+                name: "workflow".into(),
+                args: "{\"name\":\"design_brainstorm\"}".into(),
+            }],
+            diagnostics: crate::trace::ParseDiag {
+                opens_found: 1,
+                closes_matched: 1,
+                unmatched_opens: vec![],
+            },
+        });
+        // ToolExec Err → ToolError (this is what lets the advisor see
+        // a failed workflow run).
+        sink.emit(crate::trace::TraceEvent::ToolExec {
+            meta: crate::trace::TraceMeta::test_default(),
+            name: "workflow".into(),
+            args_json: "{}".into(),
+            latency_ms: 1,
+            status: crate::trace::ToolStatus::Err("all models unavailable".into()),
+        });
+
+        match rx.try_recv().unwrap() {
+            ChatEvent::ToolUse { tool_name, args, .. } => {
+                assert_eq!(tool_name, "workflow");
+                assert!(args.contains("design_brainstorm"));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            ChatEvent::ToolError { tool_name, error, .. } => {
+                assert_eq!(tool_name, "workflow");
+                assert!(error.contains("all models unavailable"));
+            }
+            other => panic!("expected ToolError, got {other:?}"),
+        }
+    }
 
     #[test]
     fn delegate_hint_lists_roles_from_config() {
@@ -3670,7 +3912,7 @@ mod tests {
                             "model": "test",
                             "choices": [{
                                 "index": 0,
-                                "message": { "role": "assistant", "content": "plain reply" },
+                                "message": { "role": "assistant", "content": "plain reply（占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰）" },
                                 "finish_reason": "stop"
                             }],
                             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
@@ -3942,7 +4184,7 @@ mod tests {
                             "model": "test",
                             "choices": [{
                                 "index": 0,
-                                "message": { "role": "assistant", "content": "plain reply" },
+                                "message": { "role": "assistant", "content": "plain reply（占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰）" },
                                 "finish_reason": "stop"
                             }],
                             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
@@ -4243,22 +4485,181 @@ mod tests {
         controller.abort().await;
     }
 
-    /// 锁定 bash 工具的 schema 契约：allowed "bash" 直接保留 "bash" 工具
-    /// （扁平命名，无 alias），且接受 {command, cwd}（cwd 由
-    /// resolve_tool_input_against_cwd 注入）。
+    /// 锁定 bash 工具的 schema 契约：allowed "bash"（配置层扁平名）映射到
+    /// registry 的 "shell.exec"（namespace 注册名），且接受 {command, cwd}
+    /// （cwd 由 resolve_tool_input_against_cwd 注入）。
     #[tokio::test]
     async fn bash_tool_kept_and_accepts_cwd() {
         let mgr = build_tool_manager(&["read".into(), "write".into(), "bash".into(), "search".into()])
             .await
             .expect("build_tool_manager");
-        // 扁平命名：allowed "bash" 直接保留 "bash" 工具。
+        // 配置层 "bash" 应保留注册名 "shell.exec"。
         let names: Vec<String> = mgr.get_tool_names();
-        assert!(names.contains(&"bash".to_string()), "bash 应被保留: {names:?}");
+        assert!(names.contains(&"shell.exec".to_string()), "bash 应映射到 shell.exec: {names:?}");
         // bash 必须接受 {command, cwd}。
         let args = serde_json::json!({"command":"pwd","cwd":"/tmp"});
-        let r = mgr.execute("bash", args, None).await;
-        assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
-        // eval 不在 allowed 里，被过滤掉；扁平命名下 bash/eval 不再碰撞。
-        assert!(!names.contains(&"eval".to_string()), "eval 不应被保留（不在 allowed）: {names:?}");
+        let r = mgr.execute("shell.exec", args, None).await;
+        assert!(r.is_ok(), "shell.exec 应接受 {{command,cwd}}，却失败: {:?}", r.err());
+        // eval 不在 allowed 里，被过滤掉；bash/shell.exec 与 eval.exec 不碰撞。
+        assert!(!names.contains(&"eval.exec".to_string()), "eval 不应被保留（不在 allowed）: {names:?}");
+    }
+
+    /// Advisor gate 端到端（driver 级）：manager turn 产出连续撞 D5
+    /// → 重试耗尽 → run_turn_gated raise AdvisorTerminated → driver
+    /// 发 ChatEvent::AdvisorTerminated（坏答案不落盘为 RoleTurn）；
+    /// session 不终止，下一条用户输入照常跑通（继续语义）。
+    #[tokio::test]
+    async fn driver_emits_advisor_terminated_after_gate_retries_exhausted() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let openai_body = |content: &str| serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        }).to_string();
+
+        let server = wiremock::MockServer::start().await;
+        // 前 3 次请求（1 initial + max_retries(2)）都给撞 D5 的短输出；
+        // 之后的请求给正常长回答（第二问用）。
+        struct FirstN(std::sync::atomic::AtomicUsize, usize);
+        impl wiremock::Match for FirstN {
+            fn matches(&self, _req: &wiremock::Request) -> bool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < self.1
+            }
+        }
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .and(FirstN(std::sync::atomic::AtomicUsize::new(0), 3))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("TODO"))),
+            )
+            .await;
+        let good = "这是第二问的正常完整回答：逐条说明结论与依据，长度远超五十字符的 D5 阈值。";
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(good))),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+            code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            // enabled=true（默认）→ driver 给 manager runner 装 gate。
+            advisor_monitor: AdvisorMonitorConfig::default(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(64);
+        let mut rx = controller.spawn(cfg).await;
+
+        // 第一问：3 次产出都撞 D5 → AdvisorTerminated；途中任何
+        // RoleTurn 都不得携带坏答案 "TODO"。
+        controller.submit_input("第一问").await;
+        let (role_id, reason, detector, sub_id) = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("recv")
+            {
+                ChatEvent::RoleTurn { content, .. } => {
+                    assert!(
+                        !content.contains("TODO"),
+                        "bad answer must not be accepted as RoleTurn: {content}"
+                    );
+                }
+                ChatEvent::AdvisorTerminated { role_id, reason, detector, sub_id } => {
+                    break (role_id, reason, detector, sub_id);
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(role_id, "manager");
+        assert_eq!(detector.as_deref(), Some("D5"), "gate detector propagates");
+        assert!(reason.contains("D5"), "reason names the detector: {reason}");
+        assert!(sub_id.is_none());
+
+        // 软终止语义：session 没死，第二问照常跑通并落盘 RoleTurn。
+        controller.submit_input("第二问").await;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("recv")
+            {
+                ChatEvent::RoleTurn { role_id, content, .. } if role_id == "manager" => {
+                    assert_eq!(content, good, "session continues after termination");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        controller.abort().await;
     }
 }

@@ -131,6 +131,15 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
     `;
     container.bodyEl.appendChild(statsBar);
 
+    // ── 展示层提示：enable/disable 目前只影响本面板显示 ──
+    const notice = document.createElement("div");
+    notice.className = "tools-runtime-notice";
+    notice.style.cssText =
+      "margin:8px 0;padding:8px 12px;border:1px solid var(--warn,#a8832a);border-radius:6px;color:var(--warn,#a8832a);font-size:12px;line-height:1.5;";
+    notice.textContent =
+      "提示：此处的启用/禁用仅用于面板展示，不影响运行时——角色实际可用工具由各角色配置（agents.toml 的 tools 字段）决定，manager/advisor 的系统工具由代码兜底不可关闭。";
+    container.bodyEl.appendChild(notice);
+
     // ── 过滤工具栏 ──
     const toolbar = document.createElement("div");
     toolbar.className = "tools-toolbar";

@@ -648,12 +648,15 @@ pub(crate) async fn model_capabilities(
 
 // ─── Models CRUD 扩展 ──────────────────────────────────────────────
 
-/// `DELETE /api/models/:key` —— 删除 model 文件并从内存 catalog 移除。
+/// `DELETE /api/models/:key?source=project|global` —— 删除指定层的 model
+/// 文件并从内存 catalog 移除。`source` 缺省时向后兼容（项目优先）。
 pub(crate) async fn delete_model(
     axum::extract::Path(key): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    api::delete_model(&state.backend, &key)
+    let source = params.get("source").map(String::as_str);
+    api::delete_model(&state.backend, &key, source)
         .map(|_| StatusCode::OK)
         .map_err(|e| {
             (

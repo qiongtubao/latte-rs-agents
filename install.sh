@@ -12,7 +12,7 @@
 # What this installs:
 #   ~/.latte/
 #   ├── models.toml          # model catalog with tier mappings
-#   ├── agents/              # one file per role (10 roles)
+#   ├── agents.d/            # one file per role (11 roles)
 #   │   ├── pm.toml
 #   │   ├── architect.toml
 #   │   ├── programmer.toml
@@ -22,9 +22,10 @@
 #   │   ├── designer.toml
 #   │   ├── devops.toml
 #   │   ├── tech_writer.toml
-#   │   └── manager.toml
+#   │   ├── manager.toml
+#   │   └── advisor.toml
 #   ├── agents.toml          # merged single-file agent config
-#   ├── workflows/           # one file per workflow (6 workflows)
+#   ├── workflows.d/         # one file per workflow (6 workflows)
 #   │   ├── default.toml
 #   │   ├── code_review.toml
 #   │   ├── bug_triage.toml
@@ -171,6 +172,7 @@ for f in \
     "agents/devops.toml" \
     "agents/tech_writer.toml" \
     "agents/manager.toml" \
+    "agents/advisor.toml" \
     "workflows/default.toml" \
     "workflows/code_review.toml" \
     "workflows/bug_triage.toml" \
@@ -206,24 +208,25 @@ if $DRY_RUN; then
 fi
 
 # Install agent configs (one per file)
-install_file "$SOURCE_DIR/agents/pm.toml"            "$TARGET_DIR/agents/pm.toml"            "PM role"
-install_file "$SOURCE_DIR/agents/architect.toml"     "$TARGET_DIR/agents/architect.toml"     "Architect role"
-install_file "$SOURCE_DIR/agents/programmer.toml"    "$TARGET_DIR/agents/programmer.toml"    "Programmer role"
-install_file "$SOURCE_DIR/agents/tester.toml"        "$TARGET_DIR/agents/tester.toml"        "QA role"
-install_file "$SOURCE_DIR/agents/reviewer.toml"      "$TARGET_DIR/agents/reviewer.toml"      "Reviewer role"
-install_file "$SOURCE_DIR/agents/security.toml"      "$TARGET_DIR/agents/security.toml"      "Security role"
-install_file "$SOURCE_DIR/agents/designer.toml"      "$TARGET_DIR/agents/designer.toml"      "Designer role"
-install_file "$SOURCE_DIR/agents/devops.toml"        "$TARGET_DIR/agents/devops.toml"        "DevOps role"
-install_file "$SOURCE_DIR/agents/tech_writer.toml"   "$TARGET_DIR/agents/tech_writer.toml"   "Tech Writer role"
-install_file "$SOURCE_DIR/agents/manager.toml"       "$TARGET_DIR/agents/manager.toml"       "Manager role"
+install_file "$SOURCE_DIR/agents/pm.toml"            "$TARGET_DIR/agents.d/pm.toml"            "PM role"
+install_file "$SOURCE_DIR/agents/architect.toml"     "$TARGET_DIR/agents.d/architect.toml"     "Architect role"
+install_file "$SOURCE_DIR/agents/programmer.toml"    "$TARGET_DIR/agents.d/programmer.toml"    "Programmer role"
+install_file "$SOURCE_DIR/agents/tester.toml"        "$TARGET_DIR/agents.d/tester.toml"        "QA role"
+install_file "$SOURCE_DIR/agents/reviewer.toml"      "$TARGET_DIR/agents.d/reviewer.toml"      "Reviewer role"
+install_file "$SOURCE_DIR/agents/security.toml"      "$TARGET_DIR/agents.d/security.toml"      "Security role"
+install_file "$SOURCE_DIR/agents/designer.toml"      "$TARGET_DIR/agents.d/designer.toml"      "Designer role"
+install_file "$SOURCE_DIR/agents/devops.toml"        "$TARGET_DIR/agents.d/devops.toml"        "DevOps role"
+install_file "$SOURCE_DIR/agents/tech_writer.toml"   "$TARGET_DIR/agents.d/tech_writer.toml"   "Tech Writer role"
+install_file "$SOURCE_DIR/agents/manager.toml"       "$TARGET_DIR/agents.d/manager.toml"       "Manager role"
+install_file "$SOURCE_DIR/agents/advisor.toml"       "$TARGET_DIR/agents.d/advisor.toml"       "Advisor role"
 
 # Install workflow configs (one per file)
-install_file "$SOURCE_DIR/workflows/default.toml"                   "$TARGET_DIR/workflows/default.toml"                   "Default workflow"
-install_file "$SOURCE_DIR/workflows/code_review.toml"               "$TARGET_DIR/workflows/code_review.toml"               "Code Review workflow"
-install_file "$SOURCE_DIR/workflows/bug_triage.toml"                "$TARGET_DIR/workflows/bug_triage.toml"                "Bug Triage workflow"
-install_file "$SOURCE_DIR/workflows/design_brainstorm.toml"         "$TARGET_DIR/workflows/design_brainstorm.toml"         "Design Brainstorm workflow"
-install_file "$SOURCE_DIR/workflows/requirements_review.toml"       "$TARGET_DIR/workflows/requirements_review.toml"       "Requirements Review workflow"
-install_file "$SOURCE_DIR/workflows/tech_director_dispatch.toml"    "$TARGET_DIR/workflows/tech_director_dispatch.toml"    "Tech Director workflow"
+install_file "$SOURCE_DIR/workflows/default.toml"                   "$TARGET_DIR/workflows.d/default.toml"                   "Default workflow"
+install_file "$SOURCE_DIR/workflows/code_review.toml"               "$TARGET_DIR/workflows.d/code_review.toml"               "Code Review workflow"
+install_file "$SOURCE_DIR/workflows/bug_triage.toml"                "$TARGET_DIR/workflows.d/bug_triage.toml"                "Bug Triage workflow"
+install_file "$SOURCE_DIR/workflows/design_brainstorm.toml"         "$TARGET_DIR/workflows.d/design_brainstorm.toml"         "Design Brainstorm workflow"
+install_file "$SOURCE_DIR/workflows/requirements_review.toml"       "$TARGET_DIR/workflows.d/requirements_review.toml"       "Requirements Review workflow"
+install_file "$SOURCE_DIR/workflows/tech_director_dispatch.toml"    "$TARGET_DIR/workflows.d/tech_director_dispatch.toml"    "Tech Director workflow"
 
 # Install model catalog and merged single-file configs
 install_file "$SOURCE_DIR/models.toml"      "$TARGET_DIR/models.toml"      "Model catalog"

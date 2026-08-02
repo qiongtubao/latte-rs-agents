@@ -61,12 +61,20 @@ export function buildChainRow(params: {
   placeholder.textContent = CHAIN_ROW_PLACEHOLDER_LABEL;
   select.appendChild(placeholder);
 
+  // 同名多条（项目层 + 全局层各一个文件）时，option 的 value 用
+  // `key + source` 区分（`key` 相同但来源不同），value 里带上 source
+  // 否则浏览器对相同 value 的 option 无法分别选中。选中后写回
+  // `model_chain` 的仍是 `name`（协议限制：model_chain 只存 model id，
+  // 具体解析哪条由后端合并顺序决定）。
   for (const m of catalog) {
     const opt = document.createElement("option");
-    opt.value = m.name;
+    opt.value = `${m.key}__${m.source}`;
     const sourceLabel = CHAIN_ROW_SOURCE_LABEL[m.source] ?? m.source;
-    // 显示成 `provider/name · [源]`，让用户一眼能区分同名模型不同厂商。
-    opt.textContent = `${m.provider}/${m.name} · [${sourceLabel}]`;
+    // 同名多条时显示文件来源，用户能区分选的是哪份配置。
+    const dup = catalog.filter(x => x.key === m.key).length > 1;
+    opt.textContent = dup
+      ? `${m.provider}/${m.name} · [${sourceLabel}]`
+      : `${m.provider}/${m.name} · [${sourceLabel}]`;
     select.appendChild(opt);
   }
 
@@ -82,12 +90,15 @@ export function buildChainRow(params: {
   custom.hidden = true;
 
   // 初始状态：catalog 内 → 选对应项并隐藏 custom；catalog 外 → 选「自定义」并显示 custom。
+  // option value 是 `key__source`，回填时先按 name 找匹配项（同名多条
+  // 取第一条 —— model_chain 只存 name，无法精确到某层，这是协议限制）。
   const inCatalog = catalog.some((m) => m.name === model);
   if (model === "") {
     select.value = "";
     custom.value = "";
   } else if (inCatalog) {
-    select.value = model;
+    const match = catalog.find((m) => m.name === model);
+    select.value = match ? `${match.key}__${match.source}` : "";
     custom.value = "";
   } else {
     select.value = CHAIN_ROW_CUSTOM_VALUE;
@@ -117,9 +128,10 @@ export function buildChainRow(params: {
     order,
     cell,
     button("🔍", "在模型管理中查看此模型", () => {
+      const [key] = select.value.split("__");
       const modelId = select.value === CHAIN_ROW_CUSTOM_VALUE
         ? custom.value.trim()
-        : select.value.trim();
+        : key.split("/").slice(1).join("/") || key;
       if (modelId) onBrowse(modelId);
     }),
     button("↑", "提高优先级", () => onReorder(swapAdjacent(currentValues(row), modelIndex, -1))),
@@ -129,15 +141,18 @@ export function buildChainRow(params: {
   return row;
 }
 
-/** 读出当前 row 的 model id 字符串。select 选 catalog 模型时直接读 select.value；
- * 选「自定义」时读旁边的文本输入框。 */
+/** 读出当前 row 的 model id 字符串。select 选 catalog 模型时从
+ * `key__source` 还原出 model id（name）；选「自定义」时读旁边的
+ * 文本输入框。 */
 export function readRowValue(row: HTMLDivElement): string {
   const select = row.querySelector<HTMLSelectElement>("select.role-editor-chain-select");
   const custom = row.querySelector<HTMLInputElement>("input.role-editor-chain-custom");
   if (!select || !custom) return "";
-  return select.value === CHAIN_ROW_CUSTOM_VALUE
-    ? custom.value.trim()
-    : select.value.trim();
+  if (select.value === CHAIN_ROW_CUSTOM_VALUE) {
+    return custom.value.trim();
+  }
+  const [key] = select.value.split("__");
+  return key.split("/").slice(1).join("/") || key;
 }
 
 /** 读出所有 row 的 model id 列表（去掉空值）。 */

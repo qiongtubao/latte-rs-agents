@@ -55,14 +55,27 @@ pub fn filename_to_key(filename: &str) -> Option<String> {
 }
 
 /// 合并后的 models catalog 状态。
+///
+/// 同一 `provider/name` 复合键在项目层与全局层都可能各有一份配置
+/// （例如 `.latte/models.d/glm__glm-5.2.toml` 与 `~/.latte/models.d/glm__glm-5.2.toml`
+/// 是**两个不同文件**，参数可以不同）。`merged` 按"项目覆盖全局"语义
+/// 去重后只保留生效的那一份；`entries` 保留**全部**扫描到的文件记录
+/// （含被覆盖的全局副本），供 UI 展示「磁盘上真实存在的每个 model 文件」。
 #[derive(Default)]
 pub struct ModelsState {
-    /// `composite_key -> ModelDef`。项目优先：项目文件覆盖全局。
+    /// `composite_key -> ModelDef`（合并后生效值）。项目优先：项目文件覆盖全局。
     pub merged: BTreeMap<String, ModelDef>,
+    /// 全部扫描记录，**不去重**：`composite_key -> Vec<(source, file_path, def)>`。
+    /// 同 key 多条 = 项目层与全局层各有一个文件（或被覆盖的副本）。
+    /// `def` 是扫描时解析好的配置（多 model 文件里每条 model 对应
+    /// 各自的 def，不能按文件重读 —— 那会取到同文件第一条）。
+    pub entries: BTreeMap<String, Vec<(ModelSource, PathBuf, ModelDef)>>,
     /// 记录每个 key 来自哪个文件（项目 / 全局），用于 UI 提示。
+    /// 仅保留合并后生效的那一条（与 `merged` 对齐）。
     pub sources: BTreeMap<String, ModelSource>,
     /// 记录每个 key 实际所在的文件绝对路径（disk 扫描结果）。
-    /// UI 用它显示「文件位置」和定位保存目标。
+    /// UI 用它显示「文件位置」和定位保存目标。与 `merged` 对齐，
+    /// 只含生效值；完整文件清单见 [`Self::entries`]。
     pub paths: BTreeMap<String, PathBuf>,
     /// 全局 tier 映射：`tier -> composite_key`。
     /// Per-role tier 覆盖：`role_id -> (tier -> composite_key)`。
@@ -92,17 +105,6 @@ impl ModelsState {
         Ok(state)
     }
 
-    /// 扫描目录，读出所有 model 定义。可接受三种文件格式（按优先级尝试）：
-    ///   1. `Vec<ModelDef>`（TOML `[[models]]` 数组 / YAML 顶层列表，常见于
-    ///      `~/.latte/models.d/*.toml` 按厂商拆分的文件 —— 单文件可声明多个 model，
-    ///      model 的 `provider` / `model_name` 字段决定 composite_key）。
-    ///   2. `AgentConfig`（TOML `[[models.models]]` 嵌套在 `[models]` 下，
-    ///      或 YAML 等价的 `models: [...]` 嵌套格式 —— 复用了项目级配置 schema）。
-    ///   3. 单个 `ModelDef`（flat TOML / YAML，老的 per-model 单文件格式，
-    ///      `write_project` 仍按此格式写出，所以必须保留兼容）。
-    ///
-    /// 解析失败的扩展名/文件会静默跳过；其它错误通过 `?` 向上抛。
-    /// 找到的 model 通过 `def.composite_key()` 入库，不再依赖文件名命名约定。
     fn load_dir(dir: &Path, source: ModelSource, state: &mut Self) -> Result<()> {
         for entry in std::fs::read_dir(dir)
             .map_err(|e| anyhow!("read_dir {}: {e}", dir.display()))?
@@ -128,12 +130,23 @@ impl ModelsState {
                     // 避免污染 catalog。其它同文件 model 仍会入库。
                     continue;
                 }
+                // 完整文件清单（不去重）：同一 key 在项目层 + 全局层
+                // 各有一份文件时都保留，UI「模型管理」据此展示多条记录。
+                // def 直接带上 —— 多 model 文件（`[[models]]` 数组）里
+                // 每条 model 的配置不同，重读文件只会取到第一条。
+                let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+                state
+                    .entries
+                    .entry(key.clone())
+                    .or_default()
+                    .push((source, abs.clone(), def.clone()));
+                // 合并后生效值：项目覆盖全局（与 `config_layer::load`
+                // 的"项目优先"语义一致）。
                 state.merged.insert(key.clone(), def);
                 state.sources.insert(key.clone(), source);
                 // 记录文件绝对路径，UI「文件位置」展示用。`read_dir` 返回的
                 // path 在不同平台可能是相对路径，canonicalize 兜底拿绝对路径；
                 // 失败时退回原值（仍可显示，只是路径可能是相对的）。
-                let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
                 state.paths.insert(key, abs);
             }
         }
@@ -219,7 +232,7 @@ struct ModelsFile {
 /// `models: [...]`），再回退到 `AgentConfig`（`[models]` + `[[models.models]]`），
 /// 再回退到单条 `ModelDef`（legacy flat 格式 —— `write_project` 写出风格）。
 /// 返回 *去重前* 的原始列表，由调用方按 `composite_key()` 入库。
-fn parse_models_in_file(content: &str, ext: &str) -> Vec<ModelDef> {
+pub(crate) fn parse_models_in_file(content: &str, ext: &str) -> Vec<ModelDef> {
     match ext {
         "toml" => {
             // 1. TOML `[[models]]` 数组（global vendor-split 风格）

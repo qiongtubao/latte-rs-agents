@@ -950,6 +950,22 @@ async fn build_runner(
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
+        // Register the `workflow` tool for roles that declare it
+        // (manager). The controller/UI path already did this; the REPL
+        // path was missing it, so a REPL manager could never run named
+        // workflows even though its prompt told it to.
+        if role.allowed_tools.iter().any(|t| t == "workflow") {
+            register_workflow_tool(
+                &tm,
+                Arc::new(merged.clone()),
+                Arc::new(resolver.clone()),
+                default_params.clone(),
+                cwd,
+                role_id,
+            )
+            .await
+            .map_err(|e| format!("workflow tool setup failed: {}", e))?;
+        }
         // HIL v1.1 phase 6: wire the `ask_human` tool for every
         // non-manager role. The tool pauses the shared session
         // when a specialist needs clarification, surfacing the
@@ -1018,6 +1034,121 @@ pub async fn build_tool_manager(
         }
     }
     Ok(mgr)
+}
+
+/// Register the `workflow` tool so roles that declare it (manager) can
+/// run named multi-role workflows from the REPL. Mirrors the controller
+/// path (`latte_agent_core::controller::register_workflow_tool`), but
+/// the REPL has no UI event consumer, so the ChatEvents emitted during
+/// the run are dropped — the workflow summary comes back as the tool
+/// result.
+async fn register_workflow_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    default_params: GenerateParams,
+    cwd: &Path,
+    role_id: &str,
+) -> AnyResult {
+    use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputProperty, ToolInputSchema};
+
+    let available = latte_agent_core::workflow::list_workflows(cwd);
+    let available_text = if available.is_empty() {
+        "none found in .latte/workflows.d".to_string()
+    } else {
+        available
+            .iter()
+            .map(|(n, d)| {
+                if d.is_empty() { n.clone() } else { format!("{n} — {d}") }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    let input_schema = ToolInputSchema {
+        schema_type: latte_rs_agent_tools::types::SchemaType,
+        properties: vec![
+            ("name".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(format!("Workflow name. Available: {available_text}")),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+            ("topic".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("The task/topic the workflow should work on".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+        ]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["name".into(), "topic".into()]),
+        ..Default::default()
+    };
+
+    let cwd_owned = cwd.to_path_buf();
+    let handler: latte_rs_agent_tools::types::SharedToolHandler =
+        std::sync::Arc::new(move |input: serde_json::Value, _ctx| {
+            let merged = Arc::clone(&merged);
+            let resolver = Arc::clone(&resolver);
+            let default_params = default_params.clone();
+            let cwd = cwd_owned.clone();
+            Box::pin(async move {
+                let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+                let name = input
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| tool_err("missing 'name' field".into()))?
+                    .to_string();
+                let topic = input
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| tool_err("missing 'topic' field".into()))?
+                    .to_string();
+                let wf = latte_agent_core::workflow::load_workflow(&name, &cwd).map_err(|e| {
+                    let available = latte_agent_core::workflow::list_workflows(&cwd)
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tool_err(format!("{e}. available workflows: {available}"))
+                })?;
+                // No UI subscriber in the REPL: keep the receiver alive
+                // for the duration of the run and drop it afterwards.
+                let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+                let ctx = latte_agent_core::workflow::WorkflowRunContext {
+                    merged,
+                    resolver,
+                    default_params,
+                    cwd,
+                    event_tx,
+                    cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    depth: 0,
+                };
+                latte_agent_core::workflow::run_workflow(&wf, &topic, &ctx)
+                    .await
+                    .map(serde_json::Value::String)
+                    .map_err(tool_err)
+            })
+        });
+
+    let tool = Tool::builder(
+        "workflow".to_string(),
+        format!("Run a named multi-role workflow. Available workflows: {available_text}"),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm.register(tool, Some(role_id));
+    Ok(())
 }
 
 /// Register a `delegate` tool on the tool manager. The tool lets the
@@ -1597,6 +1728,7 @@ mod tests {
             MsgRole::System => Message::system(content),
             MsgRole::User => Message::user(content),
             MsgRole::Assistant => Message::assistant(content),
+            MsgRole::Tool => Message::tool_result("call_test", content),
         }
     }
 
@@ -1624,7 +1756,7 @@ mod tests {
         let path = std::env::temp_dir().join("latte_chat_session_blank.jsonl");
         let _ = std::fs::remove_file(&path);
 
-        let body = "{\"role\":\"user\",\"content\":\"a\"}\n\n{\"role\":\"assistant\",\"content\":\"b\"}\n";
+        let body = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"a\"}]}\n\n{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"b\"}]}\n";
         std::fs::write(&path, body).unwrap();
         let msgs = load_session(path.to_str().unwrap()).unwrap();
         assert_eq!(msgs.len(), 2);

@@ -454,6 +454,10 @@ pub struct AvailableModel {
     pub provider: String,
     /// "project" / "global" / "catalog"：UI 显示用标签。
     pub source: String,
+    /// 复合键 `provider/name`。同名多条（项目层 + 全局层各一个文件）
+    /// 时 UI 靠 `key + source` 区分选项；写入 `model_chain` 的仍是
+    /// `name`（协议限制：model_chain 只存 model id）。
+    pub key: String,
 }
 
 #[derive(Serialize)]
@@ -720,44 +724,56 @@ pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiE
     })
 }
 
-/// 枚举合并后的可用模型 —— 给角色编辑器的「模型链」下拉框使用。
+/// 枚举可用模型 —— 给角色编辑器的「模型链」下拉框使用。
 ///
-/// 数据源：`cfg.models.models`（已经走过项目 + 全局两层合并），再用
-/// `ModelsState::load` 独立扫一次磁盘以拿到每个 model 的来源标签
-/// （项目 / 全局 / catalog —— catalog 表示该 model 只在内存 catalog 里，
-/// 还没落盘）。与 `list_models` 的数据流同源但更精简：只取 name /
-/// provider / source 三个字段，前端下拉框不需要完整 `ModelDef`。
+/// 数据源与 [`list_models`] **完全同源**：磁盘扫描的 `ModelsState::entries`
+/// （不去重，每个 model 文件一条记录）+ 内存 catalog 里未落盘的补充。
+/// 这样角色编辑器看到的模型集合与模型管理面板一致 —— 同一
+/// `provider/name` 在项目层与全局层各有一个文件时，两边都列出两条，
+/// 且都带各自的 source 标签。
 ///
-/// 排序：先按 `provider` 再按 `name` 字典序，保证 UI 下拉框顺序稳定，
-/// 方便用户快速定位。
+/// 排序：provider → name → source → 无 path，保证 UI 下拉框顺序稳定。
 fn enumerate_available_models(b: &UiBackend) -> Vec<AvailableModel> {
     let cfg = b.merged.read();
     let project_dir = b.cwd.join(".latte/models.d");
     let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
         .unwrap_or_default();
-    let mut out: Vec<AvailableModel> = cfg
-        .models
-        .models
-        .iter()
-        .map(|def| {
-            let key = if def.name.contains('/') {
-                def.name.clone()
-            } else {
-                format!("{}/{}", def.provider, def.name)
-            };
-            let source = on_disk
-                .sources
-                .get(&key)
-                .map(|s| source_label(*s).to_string())
-                .unwrap_or_else(|| "catalog".to_string());
-            AvailableModel {
+    let mut out: Vec<AvailableModel> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, recs) in &on_disk.entries {
+        for (src, _path, def) in recs {
+            out.push(AvailableModel {
                 name: def.name.clone(),
                 provider: def.provider.clone(),
-                source,
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| a.provider.cmp(&b.provider).then_with(|| a.name.cmp(&b.name)));
+                source: source_label(*src).to_string(),
+                key: key.clone(),
+            });
+            seen_keys.insert(key.clone());
+        }
+    }
+    // 内存 catalog 里有但磁盘上不存在的（catalog 源）追加在末尾。
+    for def in &cfg.models.models {
+        let key = if def.name.contains('/') {
+            def.name.clone()
+        } else {
+            format!("{}/{}", def.provider, def.name)
+        };
+        if seen_keys.contains(&key) {
+            continue;
+        }
+        out.push(AvailableModel {
+            name: def.name.clone(),
+            provider: def.provider.clone(),
+            source: "catalog".to_string(),
+            key: key.clone(),
+        });
+    }
+    out.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.source.cmp(&b.source))
+    });
     out
 }
 
@@ -1559,6 +1575,7 @@ pub fn workflow_run_start(
             cwd,
             event_tx: tx_inner,
             cancel_flag: cancel,
+            depth: 0,
         };
         let _ = run_workflow(&wf, &topic, &ctx).await;
         // engine 返回后丢掉 tx_inner 关闭内部 channel，forwarder 排空后退出。
@@ -1591,6 +1608,26 @@ pub fn workflow_run_subscribe(b: &UiBackend) -> (Vec<ChatEvent>, broadcast::Rece
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 进程级 mutex，串行化测试里对 `LATTE_HOME` / `HOME` 的修改。
+    /// `cargo test` 多线程跑测试，env 变量是进程级的，不锁会互相踩。
+    static ENV_LOCK: std::sync::LazyLock<parking_lot::Mutex<()>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
+
+    /// 把 `LATTE_HOME` 重定向到临时目录跑 `f`，结束后恢复原值。
+    /// 防止测试环境真实的 `~/.latte/models.d` 全局层污染结果。
+    fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var("LATTE_HOME").ok();
+        std::env::set_var("LATTE_HOME", home.path());
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+        result
+    }
 
     #[test]
     fn build_role_info_is_sorted() {
@@ -1809,86 +1846,93 @@ mod tests {
     }
     /// 角色编辑器接收的 `available_models` 应来自合并后的 catalog，
     /// 排序按 (provider, name)，来源标签按磁盘扫描结果标注。
+    /// 用隔离的 LATTE_HOME，避免测试环境真实的 `~/.latte/models.d`
+    /// 全局层污染结果。
     #[test]
     fn enumerate_available_models_returns_sorted_merged_catalog() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().join("ws");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let b = test_backend(&cwd);
-        // 注入三个 catalog model（无磁盘文件 → source = "catalog"）。
-        let new_models = vec![
-            ModelDef {
-                name: "zeta".into(),
-                api: "openai".into(),
-                provider: "openai".into(),
-                base_url: "https://x".into(),
-                api_key: "k".into(),
-                context_window: 1,
-                max_tokens: 1,
-                supports_thinking: false,
-                supports_vision: false,
-                supports_image_generation: false,
-                cost_per_million_input: None,
-                cost_per_million_output: None,
-                tier: None,
-                timeout_secs: None,
-            },
-            ModelDef {
-                name: "alpha".into(),
-                api: "anthropic".into(),
-                provider: "anthropic".into(),
-                base_url: "https://x".into(),
-                api_key: "k".into(),
-                context_window: 1,
-                max_tokens: 1,
-                supports_thinking: false,
-                supports_vision: false,
-                supports_image_generation: false,
-                cost_per_million_input: None,
-                cost_per_million_output: None,
-                tier: None,
-                timeout_secs: None,
-            },
-            ModelDef {
-                name: "beta".into(),
-                api: "openai".into(),
-                provider: "openai".into(),
-                base_url: "https://x".into(),
-                api_key: "k".into(),
-                context_window: 1,
-                max_tokens: 1,
-                supports_thinking: false,
-                supports_vision: false,
-                supports_image_generation: false,
-                cost_per_million_input: None,
-                cost_per_million_output: None,
-                tier: None,
-                timeout_secs: None,
-            },
-        ];
-        b.merged.write().models.models = new_models;
-        let out = enumerate_available_models(&b);
-        // 按 provider 后按 name 排序：anthropic/alpha 在最前（provider 字典序）
-        // openai 的 alpha (beta) 和 zeta 按字母序紧随其后。
-        let names: Vec<&str> = out.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
-        // 全部 source = "catalog"（无磁盘文件）
-        for m in &out {
-            assert_eq!(m.source, "catalog", "{:?}", m);
-        }
+        with_isolated_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().join("ws");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let b = test_backend(&cwd);
+            // 注入三个 catalog model（无磁盘文件 → source = "catalog"）。
+            let new_models = vec![
+                ModelDef {
+                    name: "zeta".into(),
+                    api: "openai".into(),
+                    provider: "openai".into(),
+                    base_url: "https://x".into(),
+                    api_key: "k".into(),
+                    context_window: 1,
+                    max_tokens: 1,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: None,
+                    timeout_secs: None,
+                },
+                ModelDef {
+                    name: "alpha".into(),
+                    api: "anthropic".into(),
+                    provider: "anthropic".into(),
+                    base_url: "https://x".into(),
+                    api_key: "k".into(),
+                    context_window: 1,
+                    max_tokens: 1,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: None,
+                    timeout_secs: None,
+                },
+                ModelDef {
+                    name: "beta".into(),
+                    api: "openai".into(),
+                    provider: "openai".into(),
+                    base_url: "https://x".into(),
+                    api_key: "k".into(),
+                    context_window: 1,
+                    max_tokens: 1,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: None,
+                    timeout_secs: None,
+                },
+            ];
+            b.merged.write().models.models = new_models;
+            let out = enumerate_available_models(&b);
+            // 按 provider 后按 name 排序：anthropic/alpha 在最前（provider 字典序）
+            // openai 的 alpha (beta) 和 zeta 按字母序紧随其后。
+            let names: Vec<&str> = out.iter().map(|m| m.name.as_str()).collect();
+            assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+            // 全部 source = "catalog"（无磁盘文件），key = provider/name。
+            for m in &out {
+                assert_eq!(m.source, "catalog", "{:?}", m);
+                assert_eq!(m.key, format!("{}/{}", m.provider, m.name));
+            }
+        });
     }
 
     /// 项目 `.latte/models.d/<provider>__<id>.toml` 存在时，对应 model
-    /// 的 source 标签应为 "project"。
+    /// 的 source 标签应为 "project"。用隔离的 LATTE_HOME 避免真实
+    /// 全局层污染。
     #[test]
     fn enumerate_available_models_labels_disk_source_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().join("ws");
-        std::fs::create_dir_all(cwd.join(".latte/models.d")).unwrap();
-        let project_path = cwd.join(".latte/models.d/openai__alpha.toml");
-        std::fs::write(
-            &project_path,
-            r#"name = "alpha"
+        with_isolated_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().join("ws");
+            std::fs::create_dir_all(cwd.join(".latte/models.d")).unwrap();
+            let project_path = cwd.join(".latte/models.d/openai__alpha.toml");
+            std::fs::write(
+                &project_path,
+                r#"name = "alpha"
 api = "openai"
 provider = "openai"
 base_url = "https://x"
@@ -1896,30 +1940,32 @@ api_key = "k"
 context_window = 1
 max_tokens = 1
 "#,
-        )
-        .unwrap();
-        let b = test_backend(&cwd);
-        b.merged.write().models.models = vec![ModelDef {
-            name: "alpha".into(),
-            api: "openai".into(),
-            provider: "openai".into(),
-            base_url: "https://x".into(),
-            api_key: "k".into(),
-            context_window: 1,
-            max_tokens: 1,
-            supports_thinking: false,
-            supports_vision: false,
-            supports_image_generation: false,
-            cost_per_million_input: None,
-            cost_per_million_output: None,
-            tier: None,
-            timeout_secs: None,
-        }];
-        let out = enumerate_available_models(&b);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "alpha");
-        assert_eq!(out[0].provider, "openai");
-        assert_eq!(out[0].source, "project");
+            )
+            .unwrap();
+            let b = test_backend(&cwd);
+            b.merged.write().models.models = vec![ModelDef {
+                name: "alpha".into(),
+                api: "openai".into(),
+                provider: "openai".into(),
+                base_url: "https://x".into(),
+                api_key: "k".into(),
+                context_window: 1,
+                max_tokens: 1,
+                supports_thinking: false,
+                supports_vision: false,
+                supports_image_generation: false,
+                cost_per_million_input: None,
+                cost_per_million_output: None,
+                tier: None,
+                timeout_secs: None,
+            }];
+            let out = enumerate_available_models(&b);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].name, "alpha");
+            assert_eq!(out[0].provider, "openai");
+            assert_eq!(out[0].source, "project");
+            assert_eq!(out[0].key, "openai/alpha");
+        });
     }
 }
 
@@ -2215,41 +2261,43 @@ pub fn list_models(b: &UiBackend) -> Result<ModelsListResponse, ApiError> {
     let on_disk =
         crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
             .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
-    // sources + paths 是两个 map，但 keys 一致，所以可以合并成
-    // `key -> (source, path)` 的单 map。sources 用 into_iter() 消费；
-    // paths 用 clone() 保留给下面 lookup。
-    let source_of: BTreeMap<String, (crate::models::ModelSource, PathBuf)> =
-        on_disk.sources.into_iter()
-            .map(|(k, src)| {
-                let path = on_disk.paths.get(&k).cloned().unwrap_or_default();
-                (k, (src, path))
-            })
-            .collect();
-    let models: Vec<ModelWithSource> = cfg
-        .models
-        .models
-        .iter()
-        .map(|def| {
-            let key = if def.name.contains('/') {
-                def.name.clone()
-            } else {
-                format!("{}/{}", def.provider, def.name)
-            };
-            // disk 扫描告诉我们这个 model 是 project / global、落在哪个文件。
-            // 没扫到说明只在内存 catalog 里（新加但还没保存）。
-            let (source, path) = source_of
-                .get(&key)
-                .cloned()
-                .map(|(s, p)| (source_label(s).to_string(), p.display().to_string()))
-                .unwrap_or_else(|| ("catalog".to_string(), String::new()));
-            ModelWithSource {
-                key,
-                source,
-                file_path: path,
+    // 磁盘上每个 model 文件一条记录（不去重）：同一 `provider/name`
+    // 在项目层与全局层各有一个文件时，两条都展示（UI 能区分编辑）。
+    // 内存 catalog 里但磁盘上不存在的（catalog 源）追加在末尾。
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut models: Vec<ModelWithSource> = Vec::new();
+    for (key, recs) in &on_disk.entries {
+        for (src, path, def) in recs {
+            models.push(ModelWithSource {
+                key: key.clone(),
+                source: source_label(*src).to_string(),
+                file_path: path.display().to_string(),
                 def: def.clone(),
-            }
-        })
-        .collect();
+            });
+            seen_keys.insert(key.clone());
+        }
+    }
+    for def in &cfg.models.models {
+        let key = if def.name.contains('/') {
+            def.name.clone()
+        } else {
+            format!("{}/{}", def.provider, def.name)
+        };
+        if seen_keys.contains(&key) {
+            continue;
+        }
+        models.push(ModelWithSource {
+            key,
+            source: "catalog".to_string(),
+            file_path: String::new(),
+            def: def.clone(),
+        });
+    }
+    // 稳定排序：provider → name → source → path，保证 UI 下拉框顺序稳定。
+    models.sort_by(|a, b| {
+        (&a.def.provider, &a.def.name, &a.source, &a.file_path)
+            .cmp(&(&b.def.provider, &b.def.name, &b.source, &b.file_path))
+    });
     let tiers: BTreeMap<String, String> = cfg
         .models
         .tiers
@@ -2264,6 +2312,7 @@ pub fn list_models(b: &UiBackend) -> Result<ModelsListResponse, ApiError> {
         global_models_dir: global_dir.display().to_string(),
     })
 }
+
 
 /// 全局目录 `<HOME>/.latte/models.d/` 的解析逻辑，集中到这里避免
 /// `list_models` 内嵌三层 Option 链。
@@ -2377,19 +2426,51 @@ pub fn update_model(
     })
 }
 
-/// `DELETE /api/models/:key` — 删除 model 文件（项目目录 + 全局目录）
-/// 并从内存 catalog 移除。两个目录都尝试删除；至少一个找到才算成功。
-pub fn delete_model(b: &UiBackend, key: &str) -> Result<(), ApiError> {
+/// `DELETE /api/models/:key?source=project|global` — 删除 model 文件并从
+/// 内存 catalog 移除。
+///
+/// `source` 精确指定删除哪一层：同一 `provider/name` 在项目层与全局层
+/// 可能各有一个文件（同名多条），只删指定层的那份，另一层保留。
+/// 缺省时向后兼容旧行为：项目目录优先，只删项目层（不碰全局）——
+/// 全局模型如果项目层没有同名文件，则删全局那份。
+pub fn delete_model(b: &UiBackend, key: &str, source: Option<&str>) -> Result<(), ApiError> {
     let project_dir = b.cwd.join(".latte/models.d");
     let global_dir = crate::models::ModelsState::global_models_dir();
-    let deleted_project = crate::models::ModelsState::delete_project(&project_dir, key)
-        .map_err(|e| ApiError::internal(format!("delete project model: {e}")))?;
-    let deleted_global = crate::models::ModelsState::delete_project(&global_dir, key)
-        .map_err(|e| ApiError::internal(format!("delete global model: {e}")))?;
+    // 按 source 精确删一层；source 缺失时兼容旧语义：
+    // 先试项目，项目没有同名文件再试全局。
+    let mut deleted_project = false;
+    let mut deleted_global = false;
+    match source {
+        Some("project") => {
+            deleted_project = crate::models::ModelsState::delete_project(&project_dir, key)
+                .map_err(|e| ApiError::internal(format!("delete project model: {e}")))?;
+        }
+        Some("global") => {
+            deleted_global = crate::models::ModelsState::delete_project(&global_dir, key)
+                .map_err(|e| ApiError::internal(format!("delete global model: {e}")))?;
+        }
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown source {:?}（仅 project / global）",
+                other
+            )));
+        }
+        None => {
+            deleted_project = crate::models::ModelsState::delete_project(&project_dir, key)
+                .map_err(|e| ApiError::internal(format!("delete project model: {e}")))?;
+            if !deleted_project {
+                deleted_global = crate::models::ModelsState::delete_project(&global_dir, key)
+                    .map_err(|e| ApiError::internal(format!("delete global model: {e}")))?;
+            }
+        }
+    }
     if !deleted_project && !deleted_global {
         return Err(ApiError::not_found(format!("model {key:?} not found")));
     }
-    // 从内存 catalog 移除（按 composite_key 匹配 provider/name）。
+    // 从内存 catalog 移除：删项目层时移除 catalog 里的同名条目（项目层
+    // 是覆盖源，删掉后该 key 不应再以项目配置存在）；删全局层且项目层
+    // 无同名文件时同样移除。同名多条的其余记录（另一层文件）不在此
+    // 处处理 —— 磁盘扫描（`list_models` 的 entries）会如实反映剩余文件。
     {
         let mut cfg = b.merged.write();
         cfg.models.models.retain(|m| {

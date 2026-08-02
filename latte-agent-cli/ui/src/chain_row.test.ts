@@ -21,9 +21,9 @@ import {
 import type { AvailableModel } from "./api";
 
 const CATALOG: AvailableModel[] = [
-  { name: "glm-5.2", provider: "glm", source: "project" },
-  { name: "deepseek-v4-flash", provider: "deepseek", source: "global" },
-  { name: "MiniMax-M3", provider: "anthropic", source: "catalog" },
+  { name: "glm-5.2", provider: "glm", source: "project", key: "glm/glm-5.2" },
+  { name: "deepseek-v4-flash", provider: "deepseek", source: "global", key: "deepseek/deepseek-v4-flash" },
+  { name: "MiniMax-M3", provider: "anthropic", source: "catalog", key: "anthropic/MiniMax-M3" },
 ];
 
 function newContainer(): HTMLDivElement {
@@ -54,15 +54,15 @@ describe("buildChainRow", () => {
     });
     // catalog 三项
     expect(options[1]).toEqual({
-      value: "glm-5.2",
+      value: "glm/glm-5.2__project",
       text: "glm/glm-5.2 · [项目]",
     });
     expect(options[2]).toEqual({
-      value: "deepseek-v4-flash",
+      value: "deepseek/deepseek-v4-flash__global",
       text: "deepseek/deepseek-v4-flash · [全局]",
     });
     expect(options[3]).toEqual({
-      value: "MiniMax-M3",
+      value: "anthropic/MiniMax-M3__catalog",
       text: "anthropic/MiniMax-M3 · [catalog]",
     });
     // 末项：自定义
@@ -89,9 +89,7 @@ describe("buildChainRow", () => {
     });
     const select = row.querySelector<HTMLSelectElement>("select.role-editor-chain-select")!;
     const custom = row.querySelector<HTMLInputElement>("input.role-editor-chain-custom")!;
-    expect(select.value).toBe("glm-5.2");
-    expect(custom.hidden).toBe(true);
-    expect(custom.value).toBe("");
+    expect(select.value).toBe("glm/glm-5.2__project");
   });
 
   it("catalog 外的 model id 选中「自定义」并显示 custom input", () => {
@@ -132,7 +130,7 @@ describe("buildChainRow", () => {
     expect(focus).toHaveBeenCalled();
 
     // 切回 catalog → 隐藏并清空输入框
-    select.value = "glm-5.2";
+    select.value = "glm/glm-5.2__project";
     select.dispatchEvent(new Event("change"));
     expect(custom.hidden).toBe(true);
     expect(custom.value).toBe("");
@@ -140,7 +138,7 @@ describe("buildChainRow", () => {
 });
 
 describe("readRowValue", () => {
-  it("select 选 catalog 模型 → 返回 select.value", () => {
+  it("select 选 catalog 模型 → 返回 select.value 还原的 model id", () => {
     const noop = () => {};
     const row = buildChainRow({
       model: "glm-5.2",

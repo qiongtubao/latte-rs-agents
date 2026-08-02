@@ -63,12 +63,25 @@ pub struct AdvisorMonitorConfig {
     pub enabled: bool,
     /// LLM review trigger mode. Default `OnAnomaly`.
     pub review_mode: AdvisorReviewMode,
-    /// Circuit breaker: max LLM reviews per turn (cost control for
-    /// anomaly storms). Default 2.
+    /// Circuit breaker: max LLM reviews per sliding time window (cost
+    /// control for anomaly storms). Default 2. Was "per turn" — a
+    /// 20-minute manager turn would exhaust it in the first minute and
+    /// go blind for the rest, so the quota is time-based now.
     pub max_reviews_per_turn: u32,
+    /// Sliding window for the review quota, in seconds. Default 120.
+    #[serde(default = "default_review_window_secs")]
+    pub review_window_secs: u64,
     /// Read project/global 监察笔记 (`advisor-watchdog.md`) into the
     /// review prompt. Default true.
     pub watchdog_notes: bool,
+    /// Pre-persistence response gate（D5/D6）配置。controller 的
+    /// driver 在 advisor 启用时把它装到每个 runner 上
+    /// （`AgentRunner::with_gate_config`）：turn 产出被接受前先过
+    /// `check_response_gates`，命中 → 带批注重试（最多
+    /// `gate.max_retries` 次）→ 仍命中 →
+    /// `AgentError::AdvisorTerminated` 终止本 turn。
+    #[serde(default)]
+    pub gate: GateConfig,
 }
 
 impl Default for AdvisorMonitorConfig {
@@ -77,8 +90,23 @@ impl Default for AdvisorMonitorConfig {
             enabled: true,
             review_mode: AdvisorReviewMode::OnAnomaly,
             max_reviews_per_turn: 2,
+            review_window_secs: default_review_window_secs(),
             watchdog_notes: true,
+            gate: GateConfig::default(),
         }
+    }
+}
+
+fn default_review_window_secs() -> u64 {
+    120
+}
+
+impl AdvisorMonitorConfig {
+    /// 给 driver 构建 runner 时使用的 gate 配置。advisor 未启用时
+    /// 返回 `None`——runner 不带 gate，`run_turn_gated` 退化为
+    /// `run_turn`（不影响未启用 advisor 的场景）。
+    pub fn runner_gate(&self) -> Option<GateConfig> {
+        self.enabled.then(|| self.gate.clone())
     }
 }
 
@@ -107,6 +135,15 @@ pub enum DetectorKind {
     /// not recognize, so the response is just the tool syntax with
     /// no real answer.
     ToolCallEcho,
+    /// D7: a `WorkflowFinished` event arrived with status != "ok".
+    /// Catches the case where the manager's workflow died mid-run
+    /// and it silently falls back to manual delegates without
+    /// disclosing the failure to the user.
+    WorkflowFailed,
+    /// D8: ≥3 delegates dispatched strictly serially (each started
+    /// only after the previous finished). Independent specialist
+    /// tasks should be dispatched in one parallel batch.
+    SerialDelegates,
 }
 
 impl DetectorKind {
@@ -118,6 +155,8 @@ impl DetectorKind {
             Self::ToolCallLoop => "D4",
             Self::ShortOutput => "D5",
             Self::ToolCallEcho => "D6",
+            Self::WorkflowFailed => "D7",
+            Self::SerialDelegates => "D8",
         }
     }
 }
@@ -926,7 +965,18 @@ struct MonitorState {
     watched_role: String,
     transcript: Transcript,
     detectors: TurnDetectors,
-    reviews_this_turn: u32,
+    /// Timestamps of recent LLM reviews — the quota is a sliding
+    /// time window (`max_reviews_per_turn` per `review_window_secs`),
+    /// not per-turn, so a long-running turn can't go blind.
+    review_times: std::collections::VecDeque<std::time::Instant>,
+    /// D8 state: delegates currently in flight. A DelegateStarted
+    /// arriving while zero are open = another serial dispatch.
+    open_delegates: usize,
+    serial_delegate_streak: usize,
+    /// Specialist tool-error streak (non-watched roles): consecutive
+    /// errors without an intervening Ok result.
+    specialist_error_streak: usize,
+    specialist_streak_warned: bool,
 }
 
 impl MonitorState {
@@ -935,8 +985,39 @@ impl MonitorState {
             watched_role,
             transcript: Transcript::new(MAX_TRANSCRIPT_CHARS),
             detectors: TurnDetectors::default(),
-            reviews_this_turn: 0,
+            review_times: std::collections::VecDeque::new(),
+            open_delegates: 0,
+            serial_delegate_streak: 0,
+            specialist_error_streak: 0,
+            specialist_streak_warned: false,
         }
+    }
+
+    /// Per-turn reset (turn end of the watched role).
+    fn reset_turn_state(&mut self) {
+        self.detectors.reset();
+        self.review_times.clear();
+        self.serial_delegate_streak = 0;
+        self.specialist_error_streak = 0;
+        self.specialist_streak_warned = false;
+    }
+
+    /// Sliding-window quota check: at most `max` reviews within
+    /// `window`. Records the review on success.
+    fn allow_review(&mut self, max: u32, window: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        while let Some(t) = self.review_times.front() {
+            if now.duration_since(*t) > window {
+                self.review_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.review_times.len() >= max as usize {
+            return false;
+        }
+        self.review_times.push_back(now);
+        true
     }
 
     fn observe(&mut self, ev: &ChatEvent) -> StepOutcome {
@@ -969,8 +1050,7 @@ impl MonitorState {
                     if let Some(f) = self.detectors.finish_turn(content) {
                         findings.push(f);
                     }
-                    self.detectors.reset();
-                    self.reviews_this_turn = 0;
+                    self.reset_turn_state();
                     turn_ended = true;
                 }
             }
@@ -1017,6 +1097,23 @@ impl MonitorState {
                     "[delegate → {to_role}] {}",
                     truncate_chars(task, 500)
                 ));
+                // D8: serial dispatch streak — a delegate started while
+                // none are in flight means the previous one finished
+                // first. Independent tasks should be dispatched in one
+                // parallel batch instead.
+                if self.open_delegates == 0 {
+                    self.serial_delegate_streak += 1;
+                } else {
+                    self.serial_delegate_streak = 0;
+                }
+                self.open_delegates += 1;
+                if self.serial_delegate_streak == 3 {
+                    findings.push(Finding {
+                        kind: DetectorKind::SerialDelegates,
+                        hint: "你已连续 3 个 delegate 串行执行（等前一个返回才发下一个）。如果这些任务之间没有依赖关系，应在同一轮一次性批量发出并行执行，能显著节省时间；确有依赖才串行。".into(),
+                        evidence: format!("serial delegate streak ≥ 3 (latest → {to_role})"),
+                    });
+                }
                 // Manager delegating to a role is a routing decision —
                 // review whether the target role + task split is sound.
                 review_requested = true;
@@ -1028,10 +1125,45 @@ impl MonitorState {
                 summary,
                 ..
             } if from_role == &self.watched_role => {
+                self.open_delegates = self.open_delegates.saturating_sub(1);
                 self.transcript.push(format!(
                     "[delegate {to_role} {status}] {}",
                     truncate_chars(summary, 1_500)
                 ));
+            }
+            // Specialist (delegate subsession) tool events: the watched
+            // role's arms above don't match these. ToolUse/ToolResult
+            // would flood the transcript, so only errors are recorded —
+            // a consecutive-error streak means the dispatch itself
+            // (bad paths, wrong role, vague task) likely needs fixing.
+            ChatEvent::ToolResult { role_id, .. }
+                if role_id != &self.watched_role && role_id != "advisor" =>
+            {
+                self.specialist_error_streak = 0;
+            }
+            ChatEvent::ToolError {
+                role_id,
+                tool_name,
+                error,
+            } if role_id != &self.watched_role && role_id != "advisor" => {
+                self.transcript.push(format!(
+                    "[tool_error {role_id}] {tool_name} → {}",
+                    truncate_chars(error, 500)
+                ));
+                self.specialist_error_streak += 1;
+                if self.specialist_error_streak >= 2 && !self.specialist_streak_warned {
+                    self.specialist_streak_warned = true;
+                    findings.push(Finding {
+                        kind: DetectorKind::ToolErrorStreak,
+                        hint: format!(
+                            "专家 {role_id} 连续工具出错（最近：{tool_name} → {}）。如果是你的任务描述给了错误路径/背景，修正后重新派发；如果是角色选择不当，换更合适的角色。",
+                            truncate_chars(error, 200)
+                        ),
+                        evidence: format!(
+                            "specialist {role_id} tool error streak ≥ 2: {tool_name}"
+                        ),
+                    });
+                }
             }
             ChatEvent::RoleFinished { role_id, detail }
                 if role_id == &self.watched_role =>
@@ -1040,9 +1172,38 @@ impl MonitorState {
                 // reset per-turn state. D1 has no final text to
                 // reconcile, so nothing fires here.
                 if detail.contains("error") || detail.contains("timeout") {
-                    self.detectors.reset();
-                    self.reviews_this_turn = 0;
+                    self.reset_turn_state();
                     turn_ended = true;
+                }
+            }
+            ChatEvent::WorkflowStarted { name, topic, .. } => {
+                self.transcript.push(format!(
+                    "[workflow started] {name}: {}",
+                    truncate_chars(topic, 500)
+                ));
+            }
+            ChatEvent::WorkflowFinished {
+                name,
+                status,
+                summary,
+                ..
+            } => {
+                self.transcript.push(format!(
+                    "[workflow {name} {status}] {}",
+                    truncate_chars(summary, 1_000)
+                ));
+                // D7: workflow died — the manager is about to decide
+                // how to recover; make sure the failure is disclosed
+                // instead of silently papered over with delegates.
+                if status != "ok" {
+                    findings.push(Finding {
+                        kind: DetectorKind::WorkflowFailed,
+                        hint: format!(
+                            "workflow '{name}' {status}：{}。如果你打算降级为 delegate 手工继续，必须在最终答复中向用户明确披露该 workflow 失败及降级原因，不得静默略过。",
+                            truncate_chars(summary, 300)
+                        ),
+                        evidence: format!("WorkflowFinished name={name} status={status}"),
+                    });
                 }
             }
             _ => {}
@@ -1116,14 +1277,17 @@ impl AdvisorMonitor {
                 if !should_review {
                     continue;
                 }
-                if state.reviews_this_turn >= config.max_reviews_per_turn {
+                if !state.allow_review(
+                    config.max_reviews_per_turn,
+                    Duration::from_secs(config.review_window_secs),
+                ) {
                     tracing::warn!(
-                        "advisor monitor: review cap ({}/turn) reached; skipping",
-                        config.max_reviews_per_turn
+                        "advisor monitor: review cap ({}/{}s window) reached; skipping",
+                        config.max_reviews_per_turn,
+                        config.review_window_secs
                     );
                     continue;
                 }
-                state.reviews_this_turn += 1;
 
                 let trigger = if !outcome.findings.is_empty() {
                     let mut s = "命中确定性检测器：".to_string();
@@ -1196,6 +1360,23 @@ impl AdvisorMonitor {
                     is_complete: true,
                     sub_id: None,
                 });
+
+                if verdict.verdict == Verdict::Terminate {
+                    // 让 manager 真正停下来：取消当前 in-flight turn。
+                    // 这是 **软终止**——不是 abort 整个 session：
+                    // turn_cancel_flag 被 driver（run_turn_cancellable
+                    // 的 500ms tick）看到后 drop 掉 in-flight 的
+                    // run_turn future，driver 回到等用户输入；若 turn
+                    // 刚好已结束，flag 会在下个 turn 入口被清掉，不会
+                    // 误伤下一轮。语义见 ChatEvent::AdvisorTerminated。
+                    controller.cancel_turn().await;
+                    let _ = bubble_tx.send(ChatEvent::AdvisorTerminated {
+                        role_id: state.watched_role.clone(),
+                        reason: reason.clone(),
+                        detector: Some("LLM".to_string()),
+                        sub_id: None,
+                    });
+                }
             }
         })
     }
@@ -1243,6 +1424,149 @@ mod tests {
 
     fn state() -> MonitorState {
         MonitorState::new("manager".into())
+    }
+
+    // ── review quota: sliding time window ─────────────────────────
+
+    #[test]
+    fn review_quota_is_a_sliding_time_window() {
+        let mut s = state();
+        let window = std::time::Duration::from_millis(50);
+        assert!(s.allow_review(2, window));
+        assert!(s.allow_review(2, window));
+        assert!(!s.allow_review(2, window), "quota exhausted within window");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(s.allow_review(2, window), "window slid past — quota recovered");
+    }
+
+    // ── D8: serial delegate streak ─────────────────────────────────
+
+    fn delegate_started(to: &str) -> ChatEvent {
+        ChatEvent::DelegateStarted {
+            from_role: "manager".into(),
+            to_role: to.into(),
+            task: "task".into(),
+            sub_id: format!("{to}-1"),
+        }
+    }
+
+    fn delegate_finished(to: &str) -> ChatEvent {
+        ChatEvent::DelegateFinished {
+            from_role: "manager".into(),
+            to_role: to.into(),
+            status: "ok".into(),
+            summary: "summary".into(),
+            sub_id: format!("{to}-1"),
+        }
+    }
+
+    #[test]
+    fn d8_fires_on_three_serial_delegates() {
+        let mut s = state();
+        assert!(s.observe(&delegate_started("pm")).findings.is_empty());
+        s.observe(&delegate_finished("pm"));
+        assert!(s.observe(&delegate_started("designer")).findings.is_empty());
+        s.observe(&delegate_finished("designer"));
+        let out = s.observe(&delegate_started("programmer"));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::SerialDelegates);
+        // 只报一次（== 3 时才 fire）
+        let out = s.observe(&delegate_finished("programmer"));
+        assert!(out.findings.is_empty());
+        let out = s.observe(&delegate_started("tester"));
+        assert!(out.findings.is_empty());
+    }
+
+    #[test]
+    fn d8_silent_when_delegates_overlap() {
+        let mut s = state();
+        s.observe(&delegate_started("pm"));
+        // 第二个在第一个未结束时发出 = 并行，streak 重置
+        assert!(s.observe(&delegate_started("designer")).findings.is_empty());
+        s.observe(&delegate_finished("pm"));
+        // designer 仍在跑，再发一个也算并行
+        assert!(s.observe(&delegate_started("programmer")).findings.is_empty());
+    }
+
+    // ── specialist tool errors ─────────────────────────────────────
+
+    fn specialist_error(role: &str) -> ChatEvent {
+        ChatEvent::ToolError {
+            role_id: role.into(),
+            tool_name: "file.read".into(),
+            error: "no such file".into(),
+        }
+    }
+
+    #[test]
+    fn specialist_error_streak_fires_once_per_turn() {
+        let mut s = state();
+        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+        let out = s.observe(&specialist_error("programmer"));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
+        assert!(out.findings[0].hint.contains("programmer"));
+        // 第三次不重复报
+        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+    }
+
+    #[test]
+    fn specialist_ok_result_resets_streak() {
+        let mut s = state();
+        s.observe(&specialist_error("programmer"));
+        s.observe(&ChatEvent::ToolResult {
+            role_id: "programmer".into(),
+            tool_name: "file.read".into(),
+            result: "ok".into(),
+        });
+        // streak 被重置，单个错误不再触发
+        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+    }
+
+    #[test]
+    fn watched_role_tool_error_still_hits_d3_not_specialist_path() {
+        let mut s = state();
+        s.observe(&tool_error("file.read", "boom"));
+        let out = s.observe(&tool_error("file.read", "boom"));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
+        // 走的是 watched-role 检测器，不污染 specialist streak
+        assert_eq!(s.specialist_error_streak, 0);
+    }
+
+    // ── D7: workflow failed ────────────────────────────────────────
+    #[test]
+    fn d7_fires_on_workflow_finished_not_ok() {
+        let mut s = state();
+        let out = s.observe(&ChatEvent::WorkflowStarted {
+            name: "design_brainstorm".into(),
+            topic: "设计新功能".into(),
+            wf_id: "wf-1".into(),
+        });
+        assert!(out.findings.is_empty());
+
+        let out = s.observe(&ChatEvent::WorkflowFinished {
+            name: "design_brainstorm".into(),
+            wf_id: "wf-1".into(),
+            status: "failed".into(),
+            summary: "step 'evaluate': all models unavailable".into(),
+        });
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::WorkflowFailed);
+        assert!(out.findings[0].hint.contains("披露"));
+        assert!(out.findings[0].hint.contains("design_brainstorm"));
+    }
+
+    #[test]
+    fn d7_silent_on_workflow_ok() {
+        let mut s = state();
+        let out = s.observe(&ChatEvent::WorkflowFinished {
+            name: "design_brainstorm".into(),
+            wf_id: "wf-2".into(),
+            status: "ok".into(),
+            summary: "done".into(),
+        });
+        assert!(out.findings.is_empty());
     }
 
     // ── D1: dropped tool call ──────────────────────────────────────
@@ -1618,6 +1942,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_terminate_cancels_turn_and_broadcasts_event() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                        "verdict: terminate\nreason: 幻觉实锤，继续只会浪费\nhint:",
+                    ))),
+            )
+            .await;
+
+        let controller = Arc::new(ChatController::new(64));
+        let mut bubble_rx = controller.subscribe();
+        let engine = engine_for(advisor_config_at(&server.uri()));
+        let _handle = AdvisorMonitor::spawn(
+            controller.clone(),
+            AdvisorMonitorConfig::default(),
+            engine,
+            "manager".into(),
+        );
+        let tx = controller.event_sender();
+
+        // D3: two consecutive tool errors trigger the review.
+        tx.send(tool_error("exec", "boom1")).unwrap();
+        tx.send(tool_error("exec", "boom2")).unwrap();
+
+        // 1. 🛑 terminate 气泡 + AdvisorTerminated 事件都广播出来
+        //    （后者此前是死 variant，Terminate verdict 必须让它活过来）。
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut saw_bubble, mut saw_terminated) = (false, false);
+            loop {
+                match bubble_rx.recv().await {
+                    Ok(ChatEvent::RoleTurn { role_id, content, .. }) if role_id == "advisor" => {
+                        assert!(content.contains("🛑 terminate"), "label: {content}");
+                        assert!(content.contains("幻觉实锤"), "reason in bubble: {content}");
+                        saw_bubble = true;
+                    }
+                    Ok(ChatEvent::AdvisorTerminated { role_id, reason, detector, sub_id }) => {
+                        assert_eq!(role_id, "manager", "terminated role is the watched role");
+                        assert!(reason.contains("幻觉实锤"), "reason carried: {reason}");
+                        assert_eq!(detector.as_deref(), Some("LLM"), "LLM review source");
+                        assert!(sub_id.is_none());
+                        saw_terminated = true;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended before terminate events: {e}"),
+                }
+                if saw_bubble && saw_terminated {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("terminate bubble + AdvisorTerminated event should arrive");
+
+        // 2. 取消通道被触发：turn_cancel_flag 置位（软终止——driver
+        //    丢掉 in-flight turn 后回到等用户输入，不是 abort 整个
+        //    session；controller 未 spawn 时 input 通道缺省，只有
+        //    flag 这一侧生效）。
+        for _ in 0..100 {
+            if controller.turn_cancel_requested() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("turn_cancel_flag was not set by a Terminate verdict");
+    }
+
+    #[tokio::test]
     async fn monitor_warn_bubbles_without_hint_injection() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
@@ -1757,7 +2154,9 @@ mod tests {
                 enabled: true,
                 review_mode: AdvisorReviewMode::OnAnomaly,
                 max_reviews_per_turn: 1,
+                review_window_secs: 120,
                 watchdog_notes: false,
+                gate: GateConfig::default(),
             },
             engine,
             "manager".into(),

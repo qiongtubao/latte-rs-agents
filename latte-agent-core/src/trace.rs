@@ -587,6 +587,27 @@ impl TraceSink for NullSink {
     fn emit(&self, _event: TraceEvent) {}
 }
 
+/// Fan-out sink: forwards every event to each child sink, in order.
+/// Used when a runner's events must reach multiple consumers at once —
+/// e.g. the per-subsession JSONL log AND the `ChatEventTraceSink` that
+/// broadcasts tool events to the session channel for the advisor
+/// monitor.
+pub struct FanOutSink {
+    sinks: Vec<Arc<dyn TraceSink>>,
+}
+impl FanOutSink {
+    pub fn new(sinks: Vec<Arc<dyn TraceSink>>) -> Self {
+        Self { sinks }
+    }
+}
+impl TraceSink for FanOutSink {
+    fn emit(&self, event: TraceEvent) {
+        for s in &self.sinks {
+            s.emit(event.clone());
+        }
+    }
+}
+
 /// In-memory sink. Accumulates every `emit` into a `Vec<TraceEvent>`
 /// shared via `Arc<Mutex<_>>`. Used by the controller to record the
 /// full transcript of a per-task subsession so the UI can fetch it
@@ -1241,6 +1262,36 @@ mod tests {
         pub fn drain(&self) -> Vec<TraceEvent> {
             std::mem::take(&mut *self.0.lock())
         }
+    }
+
+    #[test]
+    fn fan_out_forwards_every_event_to_all_children() {
+        let a = Arc::new(MemorySink::new());
+        let b = Arc::new(MemorySink::new());
+        let fan = FanOutSink::new(vec![a.clone(), b.clone()]);
+        for i in 0..3u32 {
+            fan.emit(TraceEvent::SessionEnd {
+                meta: TraceMeta::test_default(),
+                total_turns: i,
+                total_input: 0,
+                total_output: 0,
+                total_thinking: 0,
+            });
+        }
+        assert_eq!(a.len(), 3);
+        assert_eq!(b.len(), 3);
+    }
+
+    #[test]
+    fn fan_out_with_no_children_is_a_noop() {
+        let fan = FanOutSink::new(vec![]);
+        fan.emit(TraceEvent::SessionEnd {
+            meta: TraceMeta::test_default(),
+            total_turns: 1,
+            total_input: 0,
+            total_output: 0,
+            total_thinking: 0,
+        });
     }
 
     #[test]

@@ -1,0 +1,51 @@
+# Workflow: design_and_plan
+# 组合示例：展示"workflow 由多个 workflow 组合"的两种形态——
+#   串行链：explore → design_brainstorm → implementation_plan
+#           （后者 depends_on 前者，前者的产出经 output_key 注入后者 topic）
+#   并行组：requirements_review 与 code_review 无依赖，同一 wave 并行
+#
+# 嵌套 step 不写 task 时，父 topic 原样透传；写 task 则可引用上游
+# output_key（如 {{design}}）做数据衔接。
+
+name = "design_and_plan"
+command = "/design-and-plan"
+description = "组合 workflow：探索→设计脑暴→实现计划串行链 + 评审并行组（嵌套组合示例）"
+max_rounds = 1
+
+# ── 串行链：探索 → 脑暴 → 计划 ────────────────────────────────────
+[[steps]]
+id = "explore"
+description = "嵌套 explore：摸清背景（空 task，topic 透传）"
+workflow = "explore"
+output_key = "exploration"
+
+[[steps]]
+id = "brainstorm"
+description = "嵌套 design_brainstorm：基于探索结论做设计脑暴"
+workflow = "design_brainstorm"
+depends_on = ["explore"]
+task = "{{topic}}\n\n背景探索结论：\n{{exploration}}"
+output_key = "design"
+
+[[steps]]
+id = "plan"
+description = "嵌套 implementation_plan：把设计方案拆成任务清单"
+workflow = "implementation_plan"
+depends_on = ["brainstorm"]
+task = "基于以下设计方案制定实现计划：\n{{design}}"
+output_key = "plan"
+
+# ── 并行组：两个评审互不依赖，同一 wave 并行 ──────────────────────
+[[steps]]
+id = "req_review"
+description = "嵌套 requirements_review（与 code_review 并行）"
+workflow = "requirements_review"
+depends_on = ["brainstorm"]
+task = "评审以下设计方案的需求合理性：\n{{design}}"
+
+[[steps]]
+id = "code_review"
+description = "嵌套 code_review（与 requirements_review 并行）"
+workflow = "code_review"
+depends_on = ["brainstorm"]
+task = "评审以下设计方案涉及代码区域的质量风险：\n{{design}}"

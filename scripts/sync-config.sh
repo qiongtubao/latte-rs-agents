@@ -7,8 +7,8 @@
 #   ./scripts/sync-config.sh /path/to/target/project  # 同步到指定项目
 #
 # 同步内容:
-#   - config/agents/*.toml  → .latte/agents.d/
-#   - config/prompts/*.md  → .latte/prompts/
+#   - config/agents/*.toml  → .latte/agents.d/ 和 .latte/agents/
+#   - config/prompts/*.md   → <目标项目根>/prompts/（运行时按 prompt_file 相对路径解析，只读这里；.latte/prompts/ 不被读取）
 #   - .latte/*.toml         → .latte/
 
 set -euo pipefail
@@ -38,13 +38,24 @@ done
 echo "  ✅ Agents: $count 个角色配置"
 
 # 2. 同步 prompts（权威源：config/prompts/）
-mkdir -p "$TARGET_DIR/.latte/prompts"
+#    运行时解析 prompt_file（如 "prompts/manager.md"）时按目标项目根目录的
+#    相对路径读取，因此必须同步到 <target>/prompts/，而不是 .latte/prompts/。
+#    例外：manager/advisor 是基础设施角色，prompt 由二进制内置基座兜底、
+#    用户文件只追加（见 role.rs is_infrastructure_role）——同步它们的拷贝
+#    只会在基座更新后变成陈旧追加，故跳过。
+mkdir -p "$TARGET_DIR/prompts"
 count=0
 for f in "$SOURCE_DIR/config/prompts/"*.md; do
-    cp "$f" "$TARGET_DIR/.latte/prompts/"
+    name="$(basename "$f")"
+    case "$name" in
+        manager.md|advisor.md) continue ;;
+    esac
+    cp "$f" "$TARGET_DIR/prompts/"
     count=$((count + 1))
 done
-echo "  ✅ Prompts: $count 个提示词文件"
+# 清理历史同步留下的基础设施角色拷贝（它们会被当作定制层整个追加）。
+rm -f "$TARGET_DIR/prompts/manager.md" "$TARGET_DIR/prompts/advisor.md"
+echo "  ✅ Prompts: $count 个提示词文件（跳过 manager/advisor，由内置基座兜底）"
 
 # 3. 同步模型和讨论配置
 for f in "$SOURCE_DIR/.latte/"*.toml; do
@@ -85,7 +96,7 @@ fi
 
 # 6. 统计
 agent_count=$(ls "$TARGET_DIR/.latte/agents.d/"*.toml 2>/dev/null | wc -l)
-prompt_count=$(ls "$TARGET_DIR/.latte/prompts/"*.md 2>/dev/null | wc -l)
+prompt_count=$(ls "$TARGET_DIR/prompts/"*.md 2>/dev/null | wc -l)
 echo ""
 echo "📊 目标项目配置状态:"
 echo "  角色配置: $agent_count 文件"

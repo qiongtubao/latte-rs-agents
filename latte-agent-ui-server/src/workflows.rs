@@ -173,6 +173,7 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 max_retries: 0,
                 loop_until: None,
                 max_iterations: None,
+                workflow: None,
             })
             .collect(),
     }

@@ -93,6 +93,17 @@ pub struct WorkflowStepDef {
     pub loop_until: Option<String>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
+    /// Nest another workflow as this step: the named workflow runs with
+    /// the rendered `task` as its topic (empty `task` passes the parent
+    /// topic through unchanged), and its final output binds to this
+    /// step's `output_key` when set (omit the key to discard the
+    /// output — normal for composition). Mutually exclusive with
+    /// `role`/`speakers` — see [`WorkflowDef::validate`]. Combine
+    /// several nested steps with `depends_on` to compose workflows
+    /// serially (chain) or in parallel (same wave). Nesting depth is
+    /// capped at [`MAX_WORKFLOW_DEPTH`] to prevent cycles.
+    #[serde(default)]
+    pub workflow: Option<String>,
 }
 
 impl WorkflowStepDef {
@@ -148,6 +159,26 @@ impl WorkflowDef {
     /// at parse time rather than during execution.
     pub fn validate(&self) -> Result<(), String> {
         for step in &self.steps {
+            if let Some(nested) = &step.workflow {
+                if nested.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': workflow name must not be empty",
+                        step.id
+                    ));
+                }
+                if nested == &self.name {
+                    return Err(format!(
+                        "step '{}': workflow '{}' must not nest itself",
+                        step.id, self.name
+                    ));
+                }
+                if step.role.is_some() || !step.speakers.is_empty() {
+                    return Err(format!(
+                        "step '{}': `workflow` (nested) is mutually exclusive with role/speakers",
+                        step.id
+                    ));
+                }
+            }
             if let Some(key) = &step.output_key {
                 if key.is_empty() {
                     return Err(format!(
@@ -409,6 +440,7 @@ pub fn load_workflow_by_command(cmd: &str, project_cwd: &Path) -> Result<Workflo
 
 /// Everything a workflow run needs from its host (controller tool
 /// handler, UI server test-run endpoint, ...).
+#[derive(Clone)]
 pub struct WorkflowRunContext {
     /// Merged agent config (roles). Cloned per run by the host.
     pub merged: Arc<AgentConfig>,
@@ -417,6 +449,56 @@ pub struct WorkflowRunContext {
     pub cwd: PathBuf,
     pub event_tx: broadcast::Sender<ChatEvent>,
     pub cancel_flag: Arc<AtomicBool>,
+    /// Nesting depth: 0 for a top-level run, +1 per nested workflow
+    /// step. Guarded against [`MAX_WORKFLOW_DEPTH`] to stop cycles.
+    pub depth: u8,
+}
+
+/// Maximum nesting depth for workflow steps that invoke another
+/// workflow (`workflow = "..."` on a step). Deeper nesting is rejected
+/// with an error — almost always a cycle or a design mistake.
+pub const MAX_WORKFLOW_DEPTH: u8 = 3;
+
+/// Run a nested workflow step: load the named workflow and run it with
+/// `topic`, sharing the parent's config / event channel / cancel flag.
+/// Events of the nested run stream under their own wf_id.
+///
+/// This is deliberately a **plain fn** returning a boxed `'static`
+/// future, not an `async fn`: nested steps re-enter `run_workflow`
+/// from inside both engines, and an `async fn` here would make the
+/// engines' opaque return types depend on `run_workflow`'s own opaque
+/// type — a cycle the compiler rejects. The explicit boxed type severs
+/// that dependency.
+fn run_nested_workflow(
+    name: String,
+    topic: String,
+    ctx: WorkflowRunContext,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
+    Box::pin(async move {
+        if ctx.depth >= MAX_WORKFLOW_DEPTH {
+            return Err(format!(
+                "nested workflow '{name}' exceeds max depth {MAX_WORKFLOW_DEPTH} (cycle?)"
+            ));
+        }
+        let wf = load_workflow(&name, &ctx.cwd).map_err(|e| {
+            let available = list_workflows(&ctx.cwd)
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("nested workflow '{name}': {e}. available workflows: {available}")
+        })?;
+        let nested_ctx = WorkflowRunContext {
+            merged: ctx.merged.clone(),
+            resolver: ctx.resolver.clone(),
+            default_params: ctx.default_params.clone(),
+            cwd: ctx.cwd.clone(),
+            event_tx: ctx.event_tx.clone(),
+            cancel_flag: ctx.cancel_flag.clone(),
+            depth: ctx.depth + 1,
+        };
+        run_workflow(&wf, &topic, &nested_ctx).await
+    })
 }
 
 /// Internal outcome of a workflow engine (serial or DAG), before the
@@ -631,6 +713,40 @@ async fn run_workflow_serial(
                 task: step.task_text().to_string(),
             });
             let mut step_transcript = String::new();
+            // Nested workflow step: run the named workflow with the
+            // rendered task as its topic; bind its final output.
+            if let Some(nested_name) = step.workflow.clone() {
+                let mut step_vars = vars.clone();
+                step_vars.insert("step_id".into(), step.id.clone());
+                // 空 task = 组合场景：把父 workflow 的 topic 原样透传。
+                let nested_topic = if step.task_text().trim().is_empty() {
+                    vars.get("topic").cloned().unwrap_or_default()
+                } else {
+                    wf.render_task(step, &step_vars)
+                };
+                match run_nested_workflow(nested_name.clone(), nested_topic, ctx.clone()).await {
+                    Ok(output) => {
+                        let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
+                            wf_id: wf_id.to_string(),
+                            step_id: step.id.clone(),
+                            role_id: format!("workflow:{nested_name}"),
+                            content: crate::controller::strip_think_blocks(&output),
+                            round,
+                        });
+                        last_output = output;
+                    }
+                    Err(e) => {
+                        return WfOutcome::Failed(format!(
+                            "step '{}' nested workflow '{nested_name}': {e}",
+                            step.id
+                        ))
+                    }
+                }
+                if let Some(key) = &step.output_key {
+                    vars.insert(key.clone(), last_output.clone());
+                }
+                continue;
+            }
             for speaker in step.roles() {
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
                     return WfOutcome::Cancelled;
@@ -654,11 +770,14 @@ async fn run_workflow_serial(
                 };
                 match runner.run_turn(&[Message::user(prompt)], None).await {
                     Ok(response) => {
+                        // 事件里剥离 <think>（主 session 展示用）；
+                        // step_transcript / last_output 保留原文供后续
+                        // speaker 与最终总结使用。
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
                             wf_id: wf_id.to_string(),
                             step_id: step.id.clone(),
                             role_id: speaker.clone(),
-                            content: response.clone(),
+                            content: crate::controller::strip_think_blocks(&response),
                             round,
                         });
                         step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
@@ -705,6 +824,7 @@ struct DagStepInput {
     cwd: PathBuf,
     event_tx: broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
+    depth: u8,
 }
 
 /// Run one DAG step (all its speakers, serially) with a fresh runner
@@ -724,6 +844,44 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
         role_id: first_role,
         task: step.task_text().to_string(),
     });
+
+    // Nested workflow step: run the named workflow with the rendered
+    // task as its topic; bind its final output to output_key.
+    if let Some(nested_name) = &step.workflow {
+        let mut step_vars = inp.vars.clone();
+        step_vars.insert("step_id".into(), step.id.clone());
+        // 空 task = 组合场景：把父 workflow 的 topic 原样透传。
+        let nested_topic = if step.task_text().trim().is_empty() {
+            inp.vars.get("topic").cloned().unwrap_or_default()
+        } else {
+            inp.wf.render_task(step, &step_vars)
+        };
+        let ctx = WorkflowRunContext {
+            merged: inp.merged.clone(),
+            resolver: inp.resolver.clone(),
+            default_params: inp.default_params.clone(),
+            cwd: inp.cwd.clone(),
+            event_tx: inp.event_tx.clone(),
+            cancel_flag: inp.cancel_flag.clone(),
+            depth: inp.depth,
+        };
+        let output = run_nested_workflow(nested_name.clone(), nested_topic, ctx)
+            .await
+            .map_err(|e| {
+                StepFail::Failed(format!(
+                    "step '{}' nested workflow '{nested_name}': {e}",
+                    step.id
+                ))
+            })?;
+        let _ = inp.event_tx.send(ChatEvent::WorkflowTurn {
+            wf_id: inp.wf_id.clone(),
+            step_id: step.id.clone(),
+            role_id: format!("workflow:{nested_name}"),
+            content: crate::controller::strip_think_blocks(&output),
+            round: inp.round,
+        });
+        return Ok((step.id.clone(), step.output_key.clone(), output));
+    }
 
     let mut step_transcript = String::new();
     let mut last_output = String::new();
@@ -757,7 +915,7 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
                     wf_id: inp.wf_id.clone(),
                     step_id: step.id.clone(),
                     role_id: speaker.clone(),
-                    content: response.clone(),
+                    content: crate::controller::strip_think_blocks(&response),
                     round: inp.round,
                 });
                 step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
@@ -822,6 +980,7 @@ async fn run_workflow_dag(
                     cwd: ctx.cwd.clone(),
                     event_tx: ctx.event_tx.clone(),
                     cancel_flag: ctx.cancel_flag.clone(),
+                    depth: ctx.depth,
                 };
                 let sem = sem.clone();
                 set.spawn(async move {
@@ -907,11 +1066,91 @@ prompt = "review"
         assert_eq!(wf.render_prompt(&wf.steps[0], &vars), "do X");
     }
 
+    #[test]
+    fn nested_workflow_step_validation() {
+        let ok = r#"
+name = "outer"
+[[steps]]
+id = "explore"
+workflow = "explore"
+task = "probe {{topic}}"
+output_key = "exploration"
+"#;
+        let wf: WorkflowDef = toml::from_str(ok).unwrap();
+        wf.validate().unwrap();
+        assert_eq!(wf.steps[0].workflow.as_deref(), Some("explore"));
+
+        // 缺 output_key → 允许（组合场景下产出可丢弃）
+        let missing_key = ok.replace("output_key = \"exploration\"\n", "");
+        let wf: WorkflowDef = toml::from_str(&missing_key).unwrap();
+        wf.validate().unwrap();
+
+        // 与 role/speakers 互斥
+        let with_role = ok.replace(
+            "workflow = \"explore\"",
+            "workflow = \"explore\"\nrole = \"pm\"",
+        );
+        let wf: WorkflowDef = toml::from_str(&with_role).unwrap();
+        assert!(wf.validate().unwrap_err().contains("mutually exclusive"));
+
+        // 自嵌套 → 拒绝
+        let self_nest = ok.replace("workflow = \"explore\"", "workflow = \"outer\"");
+        let wf: WorkflowDef = toml::from_str(&self_nest).unwrap();
+        assert!(wf.validate().unwrap_err().contains("must not nest itself"));
+    }
+
+    #[test]
+    fn init_project_workflow_parses_and_validates() {
+        let raw = include_str!("../../config/workflows/init_project.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("init_project should validate");
+        wf.validate_dag().expect("init_project DAG should validate");
+        assert!(wf.uses_dependency_dag());
+        // 第一步是嵌套 explore workflow
+        assert_eq!(wf.steps[0].workflow.as_deref(), Some("explore"));
+        // project_md 依赖 explore 的产出
+        let pmd = wf.steps.iter().find(|s| s.id == "project_md").unwrap();
+        assert!(pmd.depends_on.iter().any(|d| d == "explore"));
+        // verify 依赖全部 10 个 overlay step
+        let verify = wf.steps.iter().find(|s| s.id == "verify").unwrap();
+        assert_eq!(verify.depends_on.len(), 10);
+        // 全部 overlay step 都依赖 project_md
+        for s in wf.steps.iter().filter(|s| s.id.starts_with("overlay_")) {
+            assert!(
+                s.depends_on.iter().any(|d| d == "project_md"),
+                "{} must depend on project_md",
+                s.id
+            );
+        }
+    }
+
+    #[test]
+    fn design_and_plan_composes_workflows_serial_and_parallel() {
+        let raw = include_str!("../../config/workflows/design_and_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("design_and_plan should validate");
+        wf.validate_dag().expect("design_and_plan DAG should validate");
+
+        // 波浪调度：串行链分层、并行组同层
+        let waves = compute_waves(&wf.steps).unwrap();
+        let wave_of = |id: &str| {
+            waves
+                .iter()
+                .position(|w| w.iter().any(|&i| wf.steps[i].id == id))
+                .unwrap()
+        };
+        // 串行链 explore → brainstorm → plan 各占一层
+        assert!(wave_of("explore") < wave_of("brainstorm"));
+        assert!(wave_of("brainstorm") < wave_of("plan"));
+        // 并行组同一层
+        assert_eq!(wave_of("req_review"), wave_of("code_review"));
+        assert!(wave_of("brainstorm") < wave_of("req_review"));
+    }
+
     /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
     /// 使用 include_str! 直接引用真文件，确保 TOML 编辑后测试立即红。
     #[test]
-    fn feature_design_design_step_has_output_key() {
-        let raw = include_str!("../../config/workflows/feature_design.toml");
+    fn feature_design_design_step_has_output_key() {        let raw = include_str!("../../config/workflows/feature_design.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         let design = wf.steps.iter().find(|s| s.id == "design")
             .expect("step 'design' must exist");

@@ -1,0 +1,185 @@
+# Workflow: init_project
+# 初始化项目的 agent 配置：先嵌套 explore workflow 通读代码库，
+# 再生成全角色共享的 prompts/project.md（项目上下文），最后各角色
+# 并行生成自己的 prompts/overlays/<role>.md（项目专属 prompt 增量，
+# 角色实例化时以 <project_rules> 追加在内置基座之后，不覆盖基座）。
+#
+# 用法：manager 收到「初始化项目」「/init」时调用：
+#   workflow { name: "init_project", topic: "<项目一句话描述（可留空给探索步骤自行总结）>" }
+#
+# 产物：
+#   prompts/project.md            —— 全角色共享（定位/技术栈/结构/命令/规范总纲）
+#   prompts/overlays/<role>.md    —— 每角色一份项目专属增量
+# 重复运行 = 刷新这些文件（各步骤用 write 覆盖）。
+
+name = "init_project"
+command = "/init"
+description = "初始化项目 agent 配置：探索代码库 → 生成共享 project.md → 各角色并行生成专属 prompt 增量"
+max_rounds = 1
+
+# ── Wave 0：嵌套 explore workflow，通读代码库 ─────────────────────
+[[steps]]
+id = "explore"
+description = "嵌套 explore workflow：摸清项目结构、术语、约定"
+workflow = "explore"
+task = "全面了解本项目，为「生成项目级 agent 配置」做准备：1) 项目定位与目标用户（从 README/文档/代码推断）；2) 技术栈：语言、框架、关键依赖、构建/测试/lint 命令（必须来自仓库真实配置文件）；3) 目录结构与核心模块职责；4) 代码规范与约定（命名、错误处理、注释与提交风格）；5) 已有文档（AGENTS.md/README/docs）中的重要约定与坑。"
+output_key = "exploration"
+
+# ── Wave 1：PM + 架构师写全角色共享的 project.md ──────────────────
+[[steps]]
+id = "project_md"
+description = "撰写 prompts/project.md（全角色共享项目上下文）"
+role = "pm"
+depends_on = ["explore"]
+task = """基于探索结论：
+{{exploration}}
+
+用 write 工具写入 `prompts/project.md` —— 这是注入到**所有角色**系统提示的共享项目上下文，要求：
+1) 项目定位与目标用户（2-3 句话，产品经理视角）；
+2) 技术栈与关键依赖（语言/框架/版本，来自真实配置文件）；
+3) 目录结构导览（核心模块及各自职责）；
+4) 构建/测试/lint 命令（必须逐条来自仓库真实文件：Cargo.toml/package.json/Makefile/CI 配置，禁止臆造）；
+5) 代码规范总纲（命名、错误处理、注释风格）；
+6) 重要注意事项与坑。
+全文中文、≤150 行、只写事实（来自探索结论或你亲自读到的文件），禁止占位符。写完文件后，回复只输出该文件的内容摘要。"""
+output_key = "project_md_summary"
+
+# ── Wave 2：各角色并行生成自己的 overlay（先读 project.md）────────
+[[steps]]
+id = "overlay_pm"
+description = "PM 的项目专属增量：定位、用户、优先级"
+role = "pm"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，需要更多细节时可自行查阅仓库文件。然后用 write 工具写入 `prompts/overlays/pm.md` —— 你在本项目工作时的专属增量规则：
+1) 项目定位与目标用户画像（一句话 + 3 条特征）；
+2) 需求优先级判断标准（结合本项目定位：什么值得做、什么不该做）；
+3) 本项目的术语表（业务名词的准确含义）。
+≤40 行中文，只写本项目特有的内容，通用 PM 职责不要重复。写完回复一行确认。"""
+output_key = "ov_pm"
+
+[[steps]]
+id = "overlay_architect"
+description = "架构师增量：架构边界与模块契约"
+role = "architect"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，需要更多细节时可自行查阅仓库文件。然后用 write 工具写入 `prompts/overlays/architect.md` —— 你在本项目工作时的专属增量规则：
+1) 架构分层与模块边界（哪些模块之间允许依赖、哪些禁止）；
+2) 关键数据流/控制流（一句话路径图）；
+3) 修改某类模块时必须同步考虑的影响面；
+4) 本项目明确不采用的架构模式及原因（如可从文档得知）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_architect"
+
+[[steps]]
+id = "overlay_programmer"
+description = "程序员增量：语言、idioms、代码规范"
+role = "programmer"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，再抽查 2-3 个代表性源码文件确认实际风格。然后用 write 工具写入 `prompts/overlays/programmer.md` —— 你在本项目写代码时的专属增量规则：
+1) 语言与 idioms：本项目使用该语言的方式（如 Rust 的错误处理模式、async 约定、 unsafe 禁令等，以仓库真实代码为准）；
+2) 代码规范：命名、模块组织、注释/doc 要求（引用真实文件为例）；
+3) 改动前后必跑的命令（fmt/clippy/test 的具体形式，来自真实配置）；
+4) 本项目已有的可复用工具/宏/trait，避免重复造轮子。
+≤50 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_programmer"
+
+[[steps]]
+id = "overlay_tester"
+description = "测试工程师增量：测试框架与命令"
+role = "tester"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，并查看仓库现有测试目录/测试文件。然后用 write 工具写入 `prompts/overlays/tester.md` —— 你在本项目做测试时的专属增量规则：
+1) 测试框架与组织方式（单测/集成/黑盒各在哪里、怎么命名）；
+2) 跑测试的具体命令（含筛选单个测试的方式，来自真实配置）；
+3) 本项目测试的既有约定（fixture/mock 方式、哪些测试需要 API key 或环境变量）；
+4) 当前测试覆盖的薄弱区（如可从代码观察得知）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_tester"
+
+[[steps]]
+id = "overlay_reviewer"
+description = "审查员增量：本项目审查重点"
+role = "reviewer"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，并抽查 2-3 个代表性源码文件。然后用 write 工具写入 `prompts/overlays/reviewer.md` —— 你在本项目审查代码时的专属增量规则：
+1) 本项目的高发风险区（并发/unsafe/错误处理/安全边界，以代码实际情况为准）；
+2) 审查时必须检查的项（结合项目规范的 checklist）；
+3) 本项目允许的例外（哪些"坏味道"在这里是有意为之，如可从注释/文档得知）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_reviewer"
+
+[[steps]]
+id = "overlay_devops"
+description = "DevOps 增量：构建部署与 CI"
+role = "devops"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，并查看 CI/构建/部署相关配置。然后用 write 工具写入 `prompts/overlays/devops.md` —— 你在本项目做构建部署时的专属增量规则：
+1) 构建产物与构建命令（debug/release、交叉编译等）；
+2) CI 流水线结构与必过检查；
+3) 部署/分发方式与注意事项；
+4) 环境变量/密钥的使用约定（只写名称与用途，不写值）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_devops"
+
+[[steps]]
+id = "overlay_security"
+description = "安全审计增量：威胁面与敏感点"
+role = "security"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，并查看涉及网络/密钥/文件读写的代码。然后用 write 工具写入 `prompts/overlays/security.md` —— 你在本项目做安全审计时的专属增量规则：
+1) 主要威胁面（网络调用、用户输入、文件系统、密钥存储）；
+2) 敏感文件/目录清单（含密钥、token 的位置约定）；
+3) 审计时的重点检查项（结合本项目实际代码路径）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_security"
+
+[[steps]]
+id = "overlay_designer"
+description = "设计师增量：设计体系与 UI 栈"
+role = "designer"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，并查看前端/UI 相关代码与样式文件（无 UI 则写明"本项目无界面"并给出 CLI 输出风格约定）。然后用 write 工具写入 `prompts/overlays/designer.md` —— 你在本项目做设计时的专属增量规则：
+1) UI 技术栈与组件库（框架、版本、主题机制）；
+2) 既有设计语言（色彩/间距/字体/图标约定，引用真实文件）；
+3) 交互模式约定（弹窗/确认/错误提示的既有做法）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_designer"
+
+[[steps]]
+id = "overlay_tech_writer"
+description = "文档工程师增量：文档体系"
+role = "tech_writer"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`，并查看 docs/ 与 README 的结构与风格。然后用 write 工具写入 `prompts/overlays/tech_writer.md` —— 你在本项目写文档时的专属增量规则：
+1) 文档目录结构与各自定位（哪些内容写到哪里）；
+2) 文档风格约定（语言、格式、代码块/示例习惯）；
+3) 文档与代码的同步规则（改了什么必须更新哪份文档）。
+≤40 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_tech_writer"
+
+[[steps]]
+id = "overlay_manager"
+description = "manager 增量：本项目分派偏好（tech_writer 代笔）"
+role = "tech_writer"
+depends_on = ["project_md"]
+task = """先读 `prompts/project.md`。然后用 write 工具写入 `prompts/overlays/manager.md` —— 这是给 manager（调度者）在本项目工作时的专属增量规则，以第二人称写：
+1) 本项目常见任务类型与各类型推荐的处理路径（单点 delegate / 哪条 workflow）；
+2) 角色细分偏好（如存在 programmer_rust 等细分角色，什么任务派给谁）；
+3) 本项目特别容易踩的坑（从 project.md 的注意事项提炼成分派时的提醒）。
+≤30 行中文，只写本项目特有的内容。写完回复一行确认。"""
+output_key = "ov_manager"
+
+# ── Wave 3：校验产物 ───────────────────────────────────────────────
+[[steps]]
+id = "verify"
+description = "reviewer 校验产物质量与一致性，programmer 修正"
+speakers = ["reviewer", "programmer"]
+depends_on = ["overlay_pm", "overlay_architect", "overlay_programmer", "overlay_tester", "overlay_reviewer", "overlay_devops", "overlay_security", "overlay_designer", "overlay_tech_writer", "overlay_manager"]
+task = """校验 init_project 的产物（用 read 逐一检查）：
+1) `prompts/project.md` 与 `prompts/overlays/` 下 10 个文件（pm/architect/programmer/tester/reviewer/devops/security/designer/tech_writer/manager）都存在且非空；
+2) 无占位符（TBD/待补充/XXX 等）；
+3) 内容互相一致、与仓库事实一致（抽查 2-3 条关键断言，如构建命令）；
+4) 各 overlay 只含该角色相关内容，无越界。
+reviewer：只做检查，输出"通过"或逐条问题清单（文件 + 问题 + 建议改法）。
+programmer：若 reviewer 给出问题清单，用 write 逐条修正对应文件；若全部通过则不改动。回复最终校验结论。"""
+output_key = "verify_report"
