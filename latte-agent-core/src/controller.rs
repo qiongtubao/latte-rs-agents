@@ -441,6 +441,10 @@ pub struct PlanTask {
     /// 轻量任务可空。空则不序列化。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
+    /// 任务涉及的文件/目录前缀（相对项目根）：并行执行时范围重叠的
+    /// 任务会被任务看板拒绝派发（409）。空则不序列化（视作未声明）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     /// 子任务，同构，最多一层。空则不序列化。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtasks: Vec<PlanTask>,
@@ -2588,14 +2592,14 @@ pub(crate) fn register_plan_tool(
 
     // tasks 是数组；ToolInputProperty 无嵌套 items schema，故用描述
     // 把每项结构讲清（title/description/priority/labels/workflow/
-    // subtasks）。LLM 按描述产出，handler 逐项 serde 解析 + 校验。
+    // paths/subtasks）。LLM 按描述产出，handler 逐项 serde 解析 + 校验。
     let input_schema = ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
             ("tasks".into(), ToolInputProperty {
                 property_type: PropertyType::Array,
                 description: Some(
-                    "任务候选清单。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs;轻量任务可空), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
+                    "任务候选清单。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs;轻量任务可空), paths(可选,字符串数组,任务涉及的文件/目录前缀如\"src/ringbuf\";并行执行时范围重叠的任务会被拒绝派发,拆任务时让各任务范围互不重叠), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
             }),
@@ -3809,6 +3813,7 @@ mod tests {
                     priority: Some(1),
                     labels: vec!["core".into()],
                     workflow: Some("tdd_development".into()),
+                    paths: vec!["src/ringbuf".into()],
                     subtasks: vec![],
                 },
                 PlanTask {
@@ -3817,6 +3822,7 @@ mod tests {
                     priority: None,
                     labels: vec![],
                     workflow: None,
+                    paths: vec![],
                     subtasks: vec![],
                 },
             ],
@@ -3833,11 +3839,13 @@ mod tests {
         assert_eq!(tasks[0]["title"], "实现 ringbuf 核心读写");
         assert_eq!(tasks[0]["priority"], 1);
         assert_eq!(tasks[0]["workflow"], "tdd_development");
+        assert_eq!(tasks[0]["paths"], serde_json::json!(["src/ringbuf"]));
         // 第二项：空字段被 skip_serializing_if 省略（title 必留）。
         assert_eq!(tasks[1]["title"], "补测试");
         assert!(tasks[1].get("description").is_none(), "空 description 应省略");
         assert!(tasks[1].get("priority").is_none(), "None priority 应省略");
         assert!(tasks[1].get("labels").is_none(), "空 labels 应省略");
+        assert!(tasks[1].get("paths").is_none(), "空 paths 应省略");
     }
 
     // ─── plan 阶段门（PlanStage） ─────────────────────────────────

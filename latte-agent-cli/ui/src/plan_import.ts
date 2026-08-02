@@ -10,7 +10,7 @@ import type { ImportTask } from "./api";
  *
  * 输入 rows 是普通对象：checked（是否勾选）、title/description/priority
  * （用户可编辑的值）、task（原始 PlanProposed 任务，提供 labels/workflow/
- * subtasks）。未勾选或空标题（含纯空白）的行跳过；空描述输出 undefined
+ * paths/subtasks）。未勾选或空标题（含纯空白）的行跳过；空描述输出 undefined
  * （与 ImportTask 可选字段一致），非空描述 trim。
  *
  * 主路径（PlanProposed 弹窗点导入）与补救路径（右键重开弹窗）共用此逻辑。
@@ -29,6 +29,7 @@ export function buildSelectedPlanTasks(
       priority: r.priority,
       labels: r.task.labels,
       workflow: r.task.workflow,
+      paths: r.task.paths,
       subtasks: r.task.subtasks,
     });
   }

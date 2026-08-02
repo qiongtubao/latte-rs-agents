@@ -106,6 +106,11 @@ pub struct Task {
     /// 旧落盘文件无此字段 → `None`。
     #[serde(default)]
     pub workflow: Option<String>,
+    /// 任务声明涉及的文件/目录前缀（相对项目根），用于派发时的跨族
+    /// 文件范围互斥（见 [`path_running_conflict`]）。空 = 未声明，
+    /// 不参与互斥判定（无法证明冲突）。旧落盘文件无此字段 → 空。
+    #[serde(default)]
+    pub paths: Vec<String>,
     #[serde(default)]
     pub runs: Vec<TaskRun>,
     pub created_at: i64,
@@ -366,6 +371,7 @@ impl TaskStore {
             sub_order,
             scheduled_at,
             workflow,
+            paths: vec![],
             runs: vec![],
             created_at: now,
             updated_at: now,
@@ -561,6 +567,10 @@ pub struct ImportTask {
     pub labels: Vec<String>,
     #[serde(default)]
     pub workflow: Option<String>,
+    /// 任务涉及的文件/目录前缀（相对项目根）：派发时与在跑任务范围
+    /// 重叠会被拒绝（409）。空 = 未声明。
+    #[serde(default)]
+    pub paths: Vec<String>,
     #[serde(default)]
     pub subtasks: Vec<ImportTask>,
 }
@@ -676,6 +686,10 @@ fn import_one(
         workflow,
         "import",
     )?;
+    if !item.paths.is_empty() {
+        store.get_mut(&parent.id).expect("刚创建").paths = item.paths.clone();
+        store.persist(&parent.id)?;
+    }
     created.push(parent.id.clone());
     for sub in &item.subtasks {
         let stitle = sub.title.trim();
@@ -706,6 +720,10 @@ fn import_one(
             sub_workflow,
             "import",
         )?;
+        if !sub.paths.is_empty() {
+            store.get_mut(&child.id).expect("刚创建").paths = sub.paths.clone();
+            store.persist(&child.id)?;
+        }
         created.push(child.id.clone());
     }
     Ok(())
@@ -1008,6 +1026,16 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
                 ),
             });
         }
+        // 跨族文件范围互斥：本任务声明的 paths 与在跑任务重叠时拒绝，
+        // 防止两个无亲缘任务并行改同一批文件互相覆盖。
+        if let Some((running_id, (mine, theirs))) = path_running_conflict(&store, id) {
+            return Err(ApiError {
+                status: 409,
+                message: format!(
+                    "任务 {running_id} 正在执行中且文件范围重叠（本任务 {mine:?} 与对方 {theirs:?}），为避免互相覆盖请等它完成后再派发"
+                ),
+            });
+        }
         // 最近的反馈记录（code_review 终审 / workflow 回报），rework 时喂给返工流。
         let notes: Vec<String> = t
             .history
@@ -1228,6 +1256,71 @@ fn family_running_conflict(store: &TaskStore, id: &str) -> Option<String> {
     };
     family_ids.into_iter().find(|fid| {
         fid != id && store.get(fid).map(|c| c.state == "in_progress").unwrap_or(false)
+    })
+}
+
+/// 规范化声明的路径范围：去 `./` 前缀、去尾部 `/`，压掉中间重复的
+/// `/`（按路径段重组）。规范化后为空串（如 `"./"`、`"/"`）表示声明
+/// 无效，参与判定时被跳过。
+fn normalize_declared_path(p: &str) -> String {
+    let mut s = p.trim();
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s.split('/')
+        .filter(|seg| !seg.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// a 是否覆盖 b：按**路径段**比较，a == b 或 a 是 b 的祖先目录。
+/// `src/foo` 与 `src/foobar` 段不同，不算覆盖（字符串前缀判断会误判）。
+fn path_covers(a: &str, b: &str) -> bool {
+    let a_segs: Vec<&str> = a.split('/').filter(|s| !s.is_empty()).collect();
+    let b_segs: Vec<&str> = b.split('/').filter(|s| !s.is_empty()).collect();
+    a_segs.len() <= b_segs.len() && a_segs.iter().zip(&b_segs).all(|(x, y)| x == y)
+}
+
+/// 两个范围列表是否重叠：存在一对 (a, b) 满足 a 覆盖 b 或 b 覆盖 a。
+/// 任一方为空 → 不冲突（未声明范围，无法证明会互相覆盖）。
+fn paths_overlap(a: &[String], b: &[String]) -> bool {
+    first_path_overlap(a, b).is_some()
+}
+
+/// 返回第一对重叠路径（双方规范化后的 (a, b)）；无重叠 → None。
+fn first_path_overlap(a: &[String], b: &[String]) -> Option<(String, String)> {
+    for x in a {
+        let x = normalize_declared_path(x);
+        if x.is_empty() {
+            continue;
+        }
+        for y in b {
+            let y = normalize_declared_path(y);
+            if y.is_empty() {
+                continue;
+            }
+            if path_covers(&x, &y) || path_covers(&y, &x) {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+/// 跨族文件范围互斥：本任务声明的 paths 与任何 in_progress 任务的
+/// paths 重叠时，返回 (冲突任务 id, (本任务路径, 对方路径))。
+/// 与同族互斥互补：无亲缘关系的任务并行改同一批文件同样会互相
+/// 覆盖，靠显式声明的 paths 拦住。
+fn path_running_conflict(store: &TaskStore, id: &str) -> Option<(String, (String, String))> {
+    let t = store.get(id)?;
+    if t.paths.is_empty() {
+        return None;
+    }
+    store.list().into_iter().find_map(|other| {
+        if other.id == id || other.state != "in_progress" || other.paths.is_empty() {
+            return None;
+        }
+        first_path_overlap(&t.paths, &other.paths).map(|pair| (other.id.clone(), pair))
     })
 }
 
@@ -2005,6 +2098,173 @@ mod tests {
             .unwrap()
             .set_state("in_progress", "user", None, now_ms());
         assert_eq!(family_running_conflict(&store, &p.id).as_deref(), Some(c1.id.as_str()));
+    }
+
+    // ─── 跨族文件范围互斥（paths） ───────────────────────────────
+
+    #[test]
+    fn paths_overlap_prefix_and_segment_boundary() {
+        let a = || vec!["src/foo".to_string()];
+        // 目录覆盖文件 / 文件在目录内 / 完全相同 → 重叠
+        assert!(paths_overlap(&a(), &["src/foo/bar.rs".into()]));
+        assert!(paths_overlap(&["src/foo/bar.rs".into()], &a()));
+        assert!(paths_overlap(&a(), &a()));
+        // 路径段边界：src/foo 与 src/foobar 只是字符串前缀，不算重叠
+        assert!(!paths_overlap(&a(), &["src/foobar".into()]));
+        assert!(!paths_overlap(&a(), &["src/foobar/x.rs".into()]));
+        // 互不相关的路径
+        assert!(!paths_overlap(&a(), &["src/baz".into()]));
+        // 对称性：祖先/后代方向反过来同样算重叠。
+        assert!(paths_overlap(&a(), &["src".into()]));
+        assert!(paths_overlap(&["src".into()], &a()));
+    }
+
+    #[test]
+    fn paths_overlap_empty_never_conflicts() {
+        let a = vec!["src/foo".to_string()];
+        assert!(!paths_overlap(&[], &a));
+        assert!(!paths_overlap(&a, &[]));
+        assert!(!paths_overlap(&[], &[]));
+        // 规范化后为空的声明（"./"、"/"）视作未声明
+        assert!(!paths_overlap(&["./".into()], &a));
+        assert!(!paths_overlap(&a, &["/".into()]));
+    }
+
+    #[test]
+    fn paths_overlap_normalizes_dot_and_trailing_slash() {
+        let a = vec!["./src/foo/".to_string()];
+        assert!(paths_overlap(&a, &["src/foo".into()]));
+        assert!(paths_overlap(&a, &["src/foo/bar.rs".into()]));
+        assert_eq!(normalize_declared_path("./src//foo/"), "src/foo");
+    }
+
+    #[test]
+    fn path_conflict_cross_family() {
+        let (_dir, mut store) = tmp_store();
+        // 无亲缘关系的两个任务：a 在跑且声明了范围。
+        let a = make_task(&mut store, "改 ringbuf");
+        store.get_mut(&a.id).unwrap().paths = vec!["src/ringbuf".into()];
+        store
+            .get_mut(&a.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        let b = make_task(&mut store, "改 ringbuf 测试");
+        store.get_mut(&b.id).unwrap().paths = vec!["src/ringbuf/tests".into()];
+        // 范围重叠 → 冲突，返回在跑任务 id 与重叠路径对。
+        let (cid, (mine, theirs)) =
+            path_running_conflict(&store, &b.id).expect("重叠应冲突");
+        assert_eq!(cid, a.id);
+        assert_eq!(mine, "src/ringbuf/tests");
+        assert_eq!(theirs, "src/ringbuf");
+        // 反向（b 在跑，dispatch a）同样冲突。
+        store
+            .get_mut(&a.id)
+            .unwrap()
+            .set_state("todo", "user", None, now_ms());
+        store
+            .get_mut(&b.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert_eq!(
+            path_running_conflict(&store, &a.id).map(|(cid, _)| cid),
+            Some(b.id.clone())
+        );
+        // 不重叠 → 放行。
+        store.get_mut(&a.id).unwrap().paths = vec!["src/other".into()];
+        assert!(path_running_conflict(&store, &a.id).is_none());
+        // 在跑任务完成（非 in_progress）→ 不再拦截。
+        store.get_mut(&a.id).unwrap().paths = vec!["src/ringbuf".into()];
+        store
+            .get_mut(&b.id)
+            .unwrap()
+            .set_state("done", "user", None, now_ms());
+        assert!(path_running_conflict(&store, &a.id).is_none());
+        // 本任务未声明 paths → 永不冲突。
+        store
+            .get_mut(&b.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        let c = make_task(&mut store, "未声明范围");
+        assert!(path_running_conflict(&store, &c.id).is_none());
+    }
+
+    /// dispatch 层级：跨族 paths 重叠 → 409（在创建 session 之前被拦下）。
+    #[tokio::test]
+    async fn dispatch_rejects_cross_family_path_overlap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = latte_agent_core::AgentConfig::default();
+        let resolver = latte_agent_core::ModelResolver::from_config(&cfg).expect("resolver");
+        let b = UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(dir.path().to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend");
+
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                { "title": "改 ringbuf", "paths": ["src/ringbuf"] },
+                { "title": "改 ringbuf 测试", "paths": ["src/ringbuf/tests"] }
+            ]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).expect("import");
+        let [a, c] = &resp.created[..] else {
+            panic!("应创建 2 个任务");
+        };
+        {
+            let mut store = b.tasks.write();
+            let now = now_ms();
+            store.get_mut(a).unwrap().set_state("in_progress", "user", None, now);
+            store.get_mut(c).unwrap().set_state("todo", "user", None, now);
+        }
+        let err = dispatch_task(&b, c, "user").await.expect_err("重叠应 409");
+        assert_eq!(err.status, 409);
+        assert!(err.message.contains(a), "消息应列出冲突任务 id：{}", err.message);
+        assert!(err.message.contains("src/ringbuf"), "消息应列出重叠路径：{}", err.message);
+        // 被拒后任务状态不变。
+        assert_eq!(b.tasks.read().get(c).unwrap().state, "todo");
+    }
+
+    #[test]
+    fn import_persists_paths() {
+        let (dir, mut store) = tmp_store();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{
+                "title": "改 ringbuf",
+                "paths": ["src/ringbuf", "tests/ringbuf.rs"],
+                "subtasks": [{ "title": "补压测", "paths": ["benches"] }]
+            }]
+        }))
+        .expect("parse req");
+        let created = import_tasks_into(&mut store, dir.path(), &req).expect("import");
+        assert_eq!(created.len(), 2);
+        assert_eq!(
+            store.get(&created[0]).unwrap().paths,
+            vec!["src/ringbuf".to_string(), "tests/ringbuf.rs".to_string()]
+        );
+        assert_eq!(store.get(&created[1]).unwrap().paths, vec!["benches".to_string()]);
+        // 重新加载（落盘 → 读回）paths 仍在；旧数据无 paths 字段 → 空。
+        let store2 = TaskStore::load(dir.path()).expect("reload");
+        assert_eq!(
+            store2.get(&created[0]).unwrap().paths,
+            vec!["src/ringbuf".to_string(), "tests/ringbuf.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn task_json_without_paths_defaults_empty() {
+        // 旧落盘文件无 paths 字段 → serde default 给空 vec（向后兼容）。
+        let t: Task = serde_json::from_value(serde_json::json!({
+            "schema": 1, "id": "LAT-1", "title": "旧任务", "state": "backlog",
+            "created_at": 0, "updated_at": 0
+        }))
+        .expect("parse old task");
+        assert!(t.paths.is_empty());
     }
 
     #[test]

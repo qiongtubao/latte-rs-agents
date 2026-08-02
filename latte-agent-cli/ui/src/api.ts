@@ -893,6 +893,8 @@ export interface ImportTask {
   priority?: number;
   labels?: string[];
   workflow?: string;
+  /** 任务涉及的文件/目录前缀（相对项目根）；并行执行时范围重叠的任务会被拒绝派发（409）。 */
+  paths?: string[];
   subtasks?: ImportTask[];
 }
 

@@ -82,7 +82,7 @@ plan {
 ```
 
 - **硬规则**：`implementation_plan` workflow 跑完、拿到 tasks JSON 后，**必须**调 `plan` 提交任务，不要只把任务清单以 Markdown 列表贴在回复里--Markdown `- [ ]` 无法被任务看板识别。
-- `tasks` 每项字段：`title`（必填，一句话）、`description`（做什么+验收标准）、`priority`（1-4，1最高）、`labels`（数组）、`workflow`（tdd_development/bug_triage/update_docs，轻量任务可空）、`subtasks`（同构数组，最多一层）。
+- `tasks` 每项字段：`title`（必填，一句话）、`description`（做什么+验收标准）、`priority`（1-4，1最高）、`labels`（数组）、`workflow`（tdd_development/bug_triage/update_docs，轻量任务可空）、`paths`（数组，可选，任务涉及的文件/目录范围，如 `src/ringbuf`；并行执行时范围重叠的任务会被拒绝派发，拆任务时让各任务范围互不重叠）、`subtasks`（同构数组，最多一层）。
 - 工具立即返回"已提交 N 个候选"，用户在弹窗勾选导入。若用户误关弹窗，可右键该消息选「导入任务看板」补救（读结构化数据重开弹窗，不靠文本解析）。
 
 

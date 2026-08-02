@@ -35,7 +35,7 @@ describe("buildSelectedPlanTasks：plan 弹窗选择 -> ImportTask[]", () => {
         title: "实现 ringbuf",
         description: "并发读写",
         priority: 1,
-        task: { title: "实现 ringbuf", labels: ["core"], workflow: "tdd_development", subtasks: [{ title: "压测" }] },
+        task: { title: "实现 ringbuf", labels: ["core"], workflow: "tdd_development", paths: ["src/ringbuf"], subtasks: [{ title: "压测" }] },
       }),
     ]);
     expect(out).toHaveLength(1);
@@ -44,6 +44,7 @@ describe("buildSelectedPlanTasks：plan 弹窗选择 -> ImportTask[]", () => {
     expect(out[0].priority).toBe(1);
     expect(out[0].labels).toEqual(["core"]);
     expect(out[0].workflow).toBe("tdd_development");
+    expect(out[0].paths).toEqual(["src/ringbuf"]);
     expect(out[0].subtasks).toEqual([{ title: "压测" }]);
   });
 
