@@ -53,6 +53,47 @@ impl WorkflowDef {
     }
 }
 
+/// 专家产出契约：step 声明自己产出的最低质量门槛。speaker 产出后由
+/// 引擎用 [`check_output_contract`] 校验，不合格则带批注重试（最多
+/// `max_retries` 次），重试耗尽 → step 失败。全部默认（空契约）时
+/// 恒合格，等价于不校验。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputContract {
+    /// 产出最少字符数（防"一句话敷衍"）。
+    #[serde(default)]
+    pub min_chars: Option<usize>,
+    /// 禁止出现的子串（占位符等），命中即不合格。
+    #[serde(default)]
+    pub forbid: Vec<String>,
+    /// 必须全部出现的子串。
+    #[serde(default)]
+    pub require: Vec<String>,
+}
+
+/// 校验产出是否满足契约。按 min_chars → forbid → require 顺序检查，
+/// 第一个违规即返回中文原因（措辞可直接作为给模型的验收批注）。
+/// 空契约（全默认）恒 Ok。
+fn check_output_contract(contract: &OutputContract, output: &str) -> Result<(), String> {
+    if let Some(min) = contract.min_chars {
+        let n = output.chars().count();
+        if n < min {
+            return Err(format!("产出过短：{n} 字符，少于要求的 {min} 字符"));
+        }
+    }
+    for pat in &contract.forbid {
+        if output.contains(pat.as_str()) {
+            return Err(format!("产出包含禁止出现的内容「{pat}」"));
+        }
+    }
+    for pat in &contract.require {
+        if !output.contains(pat.as_str()) {
+            return Err(format!("产出缺少必须出现的内容「{pat}」"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStepDef {
@@ -89,6 +130,10 @@ pub struct WorkflowStepDef {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub max_retries: u32,
+    /// 产出契约：speaker 产出不合格时带批注重试（复用 `max_retries`
+    /// 作为重试上限），耗尽则 step 失败。默认空契约 = 不校验。
+    #[serde(default)]
+    pub output_contract: OutputContract,
     #[serde(default)]
     pub loop_until: Option<String>,
     #[serde(default)]
@@ -767,32 +812,61 @@ async fn run_workflow_serial(
                 step_vars.insert("step_id".into(), step.id.clone());
                 step_vars.insert("speaker".into(), speaker.clone());
                 let base_prompt = wf.render_task(step, &step_vars);
-                let prompt = if step_transcript.is_empty() {
+                let mut prompt = if step_transcript.is_empty() {
                     base_prompt
                 } else {
                     format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
                 };
-                match runner.run_turn(&[Message::user(prompt)], None).await {
-                    Ok(response) => {
-                        // 事件里剥离 <think>（主 session 展示用）；
-                        // step_transcript / last_output 保留原文供后续
-                        // speaker 与最终总结使用。
-                        let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
-                            wf_id: wf_id.to_string(),
-                            step_id: step.id.clone(),
-                            role_id: speaker.clone(),
-                            content: crate::controller::strip_think_blocks(&response),
-                            round,
-                        });
-                        step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
-                        last_output = response;
+                // 产出契约重试：runner 跨 turn 有对话记忆，重试只需把
+                // 验收批注作为新的 user 消息发过去；批注同时写进
+                // step_transcript，让同 step 的后续 speaker 看到返工。
+                let mut attempt: u32 = 0;
+                loop {
+                    let response = match runner.run_turn(&[Message::user(prompt.clone())], None).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return WfOutcome::Failed(format!(
+                                "step '{}' speaker '{}': {e}",
+                                step.id, speaker
+                            ))
+                        }
+                    };
+                    if let Err(reason) = check_output_contract(&step.output_contract, &response) {
+                        if attempt >= step.max_retries {
+                            return WfOutcome::Failed(format!(
+                                "step '{}' speaker '{}': 产出契约校验失败\
+                                 （重试 {attempt} 次后仍不合格）：{reason}",
+                                step.id, speaker
+                            ));
+                        }
+                        attempt += 1;
+                        tracing::warn!(
+                            step = %step.id,
+                            speaker = %speaker,
+                            attempt,
+                            reason = %reason,
+                            "workflow step output failed output_contract; retrying"
+                        );
+                        let annotation =
+                            format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
+                        step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                        prompt = annotation;
+                        continue;
                     }
-                    Err(e) => {
-                        return WfOutcome::Failed(format!(
-                            "step '{}' speaker '{}': {e}",
-                            step.id, speaker
-                        ))
-                    }
+                    // 契约合格的产出才发事件 / 进 transcript / last_output。
+                    // 事件里剥离 <think>（主 session 展示用）；
+                    // step_transcript / last_output 保留原文供后续
+                    // speaker 与最终总结使用。
+                    let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
+                        wf_id: wf_id.to_string(),
+                        step_id: step.id.clone(),
+                        role_id: speaker.clone(),
+                        content: crate::controller::strip_think_blocks(&response),
+                        round,
+                    });
+                    step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
+                    last_output = response;
+                    break;
                 }
             }
             if let Some(key) = &step.output_key {
@@ -908,29 +982,58 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
         step_vars.insert("step_id".into(), step.id.clone());
         step_vars.insert("speaker".into(), speaker.clone());
         let base_prompt = inp.wf.render_task(step, &step_vars);
-        let prompt = if step_transcript.is_empty() {
+        let full_prompt = if step_transcript.is_empty() {
             base_prompt
         } else {
             format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
         };
-        match runner.run_turn(&[Message::user(prompt)], None).await {
-            Ok(response) => {
-                let _ = inp.event_tx.send(ChatEvent::WorkflowTurn {
-                    wf_id: inp.wf_id.clone(),
-                    step_id: step.id.clone(),
-                    role_id: speaker.clone(),
-                    content: crate::controller::strip_think_blocks(&response),
-                    round: inp.round,
-                });
-                step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
-                last_output = response;
+        // 产出契约重试：DAG 引擎的 runner 无跨 step 记忆（每 speaker
+        // 新建），批注必须拼回完整 prompt，保证模型仍拿得到任务上下文。
+        let mut prompt = full_prompt.clone();
+        let mut attempt: u32 = 0;
+        loop {
+            let response = match runner.run_turn(&[Message::user(prompt.clone())], None).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(StepFail::Failed(format!(
+                        "step '{}' speaker '{}': {e}",
+                        step.id, speaker
+                    )))
+                }
+            };
+            if let Err(reason) = check_output_contract(&step.output_contract, &response) {
+                if attempt >= step.max_retries {
+                    return Err(StepFail::Failed(format!(
+                        "step '{}' speaker '{}': 产出契约校验失败\
+                         （重试 {attempt} 次后仍不合格）：{reason}",
+                        step.id, speaker
+                    )));
+                }
+                attempt += 1;
+                tracing::warn!(
+                    step = %step.id,
+                    speaker = %speaker,
+                    attempt,
+                    reason = %reason,
+                    "workflow step output failed output_contract; retrying"
+                );
+                let annotation =
+                    format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
+                step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                prompt = format!("{full_prompt}\n\n{annotation}");
+                continue;
             }
-            Err(e) => {
-                return Err(StepFail::Failed(format!(
-                    "step '{}' speaker '{}': {e}",
-                    step.id, speaker
-                )))
-            }
+            // 契约合格的产出才发事件 / 进 transcript / last_output。
+            let _ = inp.event_tx.send(ChatEvent::WorkflowTurn {
+                wf_id: inp.wf_id.clone(),
+                step_id: step.id.clone(),
+                role_id: speaker.clone(),
+                content: crate::controller::strip_think_blocks(&response),
+                round: inp.round,
+            });
+            step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
+            last_output = response;
+            break;
         }
     }
     Ok((step.id.clone(), step.output_key.clone(), last_output))
@@ -1553,5 +1656,306 @@ prompt = "review it"
         let wf: WorkflowDef = toml::from_str(raw).unwrap();
         assert_eq!(wf.steps[0].roles(), vec!["reviewer"]);
         assert_eq!(wf.steps[0].task_text(), "review it");
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn contract_min_chars() {
+        let c = OutputContract { min_chars: Some(5), ..Default::default() };
+        // 不足 → 报错，消息含实际/要求字符数
+        let err = check_output_contract(&c, "太短").unwrap_err();
+        assert!(err.contains('2') && err.contains('5'), "got: {err}");
+        // 达标与超出都通过（按字符数，不是字节数）
+        assert!(check_output_contract(&c, "刚刚好五个").is_ok());
+        assert!(check_output_contract(&c, "超过五个字符也没问题").is_ok());
+    }
+
+    #[test]
+    fn contract_forbid() {
+        let c = OutputContract {
+            forbid: vec!["TBD".into(), "待补充".into()],
+            ..Default::default()
+        };
+        // 命中 → 报错含命中的子串
+        let err = check_output_contract(&c, "这里留个 TBD 再说").unwrap_err();
+        assert!(err.contains("TBD"), "got: {err}");
+        // 未命中 → 通过
+        assert!(check_output_contract(&c, "完整产出，没有占位符字样").is_ok());
+    }
+
+    #[test]
+    fn contract_require() {
+        let c = OutputContract {
+            require: vec!["结论".into(), "风险".into()],
+            ..Default::default()
+        };
+        // 缺失 → 报错含缺失的子串（require 全部出现才合格）
+        let err = check_output_contract(&c, "只有结论没有别的").unwrap_err();
+        assert!(err.contains("风险"), "got: {err}");
+        // 齐全 → 通过
+        assert!(check_output_contract(&c, "结论：可行。风险：无。").is_ok());
+    }
+
+    #[test]
+    fn contract_empty_always_ok() {
+        let c = OutputContract::default();
+        assert!(check_output_contract(&c, "").is_ok());
+        assert!(check_output_contract(&c, "TBD 待补充 随便写").is_ok());
+    }
+
+    #[test]
+    fn output_contract_parses_from_step_toml() {
+        let raw = r#"
+name = "c"
+[[steps]]
+id = "s"
+role = "pm"
+task = "t"
+max_retries = 2
+
+[steps.output_contract]
+min_chars = 100
+forbid = ["TBD"]
+require = ["结论"]
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        let step = &wf.steps[0];
+        assert_eq!(step.max_retries, 2);
+        assert_eq!(step.output_contract.min_chars, Some(100));
+        assert_eq!(step.output_contract.forbid, vec!["TBD"]);
+        assert_eq!(step.output_contract.require, vec!["结论"]);
+    }
+
+    #[test]
+    fn output_contract_defaults_empty_when_omitted() {
+        let raw = r#"
+name = "c"
+[[steps]]
+id = "s"
+role = "pm"
+task = "t"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        let c = &wf.steps[0].output_contract;
+        assert_eq!(c.min_chars, None);
+        assert!(c.forbid.is_empty());
+        assert!(c.require.is_empty());
+        // 空契约 = 不校验
+        assert!(check_output_contract(c, "").is_ok());
+    }
+
+    /// 验收：implementation_plan 的 breakdown step（产出 plan）带产出契约。
+    #[test]
+    fn implementation_plan_breakdown_step_has_contract() {
+        let raw = include_str!("../../config/workflows/implementation_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("implementation_plan should validate");
+        let breakdown = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "breakdown")
+            .expect("step 'breakdown' must exist");
+        assert_eq!(breakdown.output_contract.min_chars, Some(200));
+        assert_eq!(
+            breakdown.output_contract.forbid,
+            vec!["TBD", "待补充", "占位符"]
+        );
+        assert!(breakdown.max_retries >= 1, "contract needs retry budget");
+    }
+
+    /// 验收：init_project 的 project_md step 带产出契约（任务要求文件名出现）。
+    #[test]
+    fn init_project_project_md_step_has_contract() {
+        let raw = include_str!("../../config/workflows/init_project.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("init_project should validate");
+        let pmd = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "project_md")
+            .expect("step 'project_md' must exist");
+        assert_eq!(pmd.output_contract.min_chars, Some(400));
+        assert_eq!(pmd.output_contract.require, vec!["prompts/project.md"]);
+        assert!(pmd.max_retries >= 1, "contract needs retry budget");
+    }
+}
+
+#[cfg(test)]
+mod contract_engine_tests {
+    use super::*;
+    use crate::config::{ModelCatalog, ModelDef};
+    use crate::role::RoleTemplate;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    fn openai_body(content: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    /// 单模型（premium tier 指向 wiremock）+ 单角色 "worker" 的测试配置。
+    fn test_config_at(base_url: &str) -> Arc<AgentConfig> {
+        let roles = HashMap::from([(
+            "worker".to_string(),
+            RoleTemplate {
+                id: "worker".into(),
+                name: "Worker".into(),
+                category: "execution".into(),
+                model_tier: "premium".into(),
+                model_chain: vec![],
+                prompt_file: None,
+                temperature: None,
+                tools: vec![],
+                icon: String::new(),
+                skills: vec![],
+                code_paths: vec![],
+            },
+        )]);
+        Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "Test Premium".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: base_url.into(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles,
+        })
+    }
+
+    fn test_ctx(config: Arc<AgentConfig>) -> (WorkflowRunContext, broadcast::Receiver<ChatEvent>) {
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, event_rx) = broadcast::channel(64);
+        (
+            WorkflowRunContext {
+                merged: config,
+                resolver,
+                default_params: GenerateParams::default(),
+                cwd: std::env::temp_dir(),
+                event_tx,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                depth: 0,
+            },
+            event_rx,
+        )
+    }
+
+    /// 串行 workflow：单 step 单 speaker，契约 min_chars=50 + forbid TBD。
+    fn contract_wf() -> WorkflowDef {
+        let raw = r#"
+name = "contract_demo"
+[[steps]]
+id = "draft"
+role = "worker"
+task = "写一份计划"
+output_key = "draft"
+max_retries = 1
+
+[steps.output_contract]
+min_chars = 50
+forbid = ["TBD"]
+"#;
+        toml::from_str(raw).expect("valid TOML")
+    }
+
+    fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, ChatEvent::WorkflowTurn { .. }) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 第一次产出不合格 → 带批注重试同一 speaker，第二次合格：
+    /// 最终成功、第二次请求带批注、WorkflowTurn 只发一次。
+    #[tokio::test]
+    async fn serial_contract_retry_passes_with_annotation() {
+        let server = wiremock::MockServer::start().await;
+        // 兜底 mock（后注册但先匹配耗尽前的兜底）：合格产出。
+        let good = "这是一份足够详实的实现计划，覆盖方案概述、工作分解、依赖关系与风险分析，每一项都给出了明确的验收标准，没有任何占位内容。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("未通过验收"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(good)))
+            .mount(&server)
+            .await;
+        // 首次请求（不含批注）→ 不合格产出，只生效一次。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("TBD")))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        let result = run_workflow(&contract_wf(), "测试主题", &ctx).await;
+        let out = result.expect("retry 后应成功");
+        assert_eq!(out, good);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "首发 + 一次重试: {}", requests.len());
+        let second = String::from_utf8_lossy(&requests[1].body);
+        assert!(second.contains("上次产出未通过验收"), "重试 prompt 带批注: {second}");
+        assert!(second.contains("产出过短"), "批注含违规原因: {second}");
+        assert_eq!(
+            count_workflow_turns(&mut rx),
+            1,
+            "失败尝试不发 WorkflowTurn，只有合格产出发一次"
+        );
+    }
+
+    /// 重试耗尽（max_retries=1，两次产出都不合格）→ step 失败，
+    /// 错误消息含 step id、speaker、最后一次违规原因。
+    #[tokio::test]
+    async fn serial_contract_retry_exhausted_fails_step() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("TBD")))
+            .mount(&server)
+            .await;
+
+        let (ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        let err = run_workflow(&contract_wf(), "测试主题", &ctx)
+            .await
+            .expect_err("重试耗尽必须失败");
+        assert!(err.contains("draft"), "错误含 step id: {err}");
+        assert!(err.contains("worker"), "错误含 speaker: {err}");
+        assert!(err.contains("产出过短"), "错误含最后一次违规原因: {err}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "首发 + max_retries=1 次重试: {}", requests.len());
+        assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
     }
 }

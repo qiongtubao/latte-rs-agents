@@ -43,6 +43,11 @@ task = """基于探索结论：
 6) 重要注意事项与坑。
 全文中文、≤150 行、只写事实（来自探索结论或你亲自读到的文件），禁止占位符。写完文件后，回复只输出该文件的内容摘要。"""
 output_key = "project_md_summary"
+max_retries = 1
+
+[steps.output_contract]
+min_chars = 400
+require = ["prompts/project.md"]
 
 # ── Wave 2：各角色并行生成自己的 overlay（先读 project.md）────────
 [[steps]]

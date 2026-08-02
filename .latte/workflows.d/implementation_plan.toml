@@ -3,8 +3,8 @@
 # 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
 
 name = "implementation_plan"
-description = "实现规划：架构拆解 → 任务清单(JSON) → 终审"
 command = "/plan"
+description = "实现规划：架构拆解 → 任务清单(JSON) → 终审"
 max_rounds = 1
 
 [[steps]]
@@ -12,7 +12,12 @@ id = "breakdown"
 description = "架构拆解"
 speakers = ["architect"]
 output_key = "plan"
+max_retries = 1
 prompt = "为以下目标做实现拆解：{{topic}}。先读代码了解现状再拆。输出：1) 方案概述（为什么这样拆）；2) 工作分解（每项：做什么、改动范围、依赖关系、验收标准）；3) 风险与未知项。"
+
+[steps.output_contract]
+min_chars = 200
+forbid = ["TBD", "待补充", "占位符"]
 
 [[steps]]
 id = "tasks_json"
