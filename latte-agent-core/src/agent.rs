@@ -680,6 +680,12 @@ pub struct AgentRunner {
     /// 时通过 advisor_hints 队列注入 hint 并触发同 turn 重跑
     /// （最多 config.max_retries 次）。
     gate_config: Option<crate::advisor_monitor::GateConfig>,
+    /// Advisor v3 pause gate（intervene 暂停门）。Some(_) 时
+    /// `run_turn` 在每个 tool-round 边界（drain advisor hint 的
+    /// 同一位置）调 `wait_if_requested()`：monitor 判 Intervene
+    /// 置位后 runner 挂起等用户拍板。只装到 watched role 的主
+    /// runner（driver 单角色 loop）；delegate specialist 不带。
+    pause_gate: Option<crate::advisor_monitor::AdvisorPauseGate>,
     // 强制 native function-calling：tool schema 经 GenerateParams.tools
     // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
     // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
@@ -960,6 +966,7 @@ impl AgentRunner {
             cwd: None,
             last_turn_tool_count: 0,
             gate_config: None,
+            pause_gate: None,
         }
     }
     pub fn new_with_tools(
@@ -983,6 +990,7 @@ impl AgentRunner {
             cwd: None,
             last_turn_tool_count: 0,
             gate_config: None,
+            pause_gate: None,
         }
     }
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
@@ -1002,6 +1010,7 @@ impl AgentRunner {
             cwd: None,
             last_turn_tool_count: 0,
             gate_config: None,
+            pause_gate: None,
         }
     }
 
@@ -1013,6 +1022,17 @@ impl AgentRunner {
     /// pass-through behavior, so existing call sites are unaffected.
     pub fn with_gate_config(mut self, cfg: crate::advisor_monitor::GateConfig) -> Self {
         self.gate_config = Some(cfg);
+        self
+    }
+
+    /// Attach the advisor v3 pause gate（intervene 暂停门）. The same
+    /// handle is held by the `ChatController`（monitor 经
+    /// `request_pause()` 置位；`submit_input` resolve）；本 runner
+    /// 在每个 tool-round 边界 `wait_if_requested()`。只应装到
+    /// watched role 的主 runner——advisor 自身与 delegate
+    /// specialist 不装。
+    pub fn with_pause_gate(mut self, gate: crate::advisor_monitor::AdvisorPauseGate) -> Self {
+        self.pause_gate = Some(gate);
         self
     }
     /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
@@ -1290,6 +1310,14 @@ impl AgentRunner {
             // (`drain_advisor_hints` also records them in the context;
             // round 0 is covered by the turn-start drain above.)
             if round > 0 {
+                // Advisor v3 pause gate：monitor 判 Intervene 置位后，
+                // 本 runner 在此挂起，直到用户拍板（下一条用户输入
+                // resolve）或 gate 超时自动恢复。恢复后照常 drain
+                // hint——advisor 的纠正提示与用户的拍板决定一起进入
+                // 下一次模型调用。
+                if let Some(gate) = self.pause_gate.clone() {
+                    gate.wait_if_requested().await;
+                }
                 for hint in self.drain_advisor_hints() {
                     messages.push(Message::user(format!("🦉 advisor 监察：\n{hint}")));
                 }
@@ -3100,6 +3128,116 @@ mod tests {
         // First request predates any hint.
         let body1 = String::from_utf8_lossy(&reqs[0].body);
         assert!(!body1.contains("🦉 advisor 监察"));
+    }
+
+    /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板
+    /// （resolve）才继续。模拟链路：工具 handler 扮演 monitor 置位
+    /// pause gate → 下一轮边界 runner 挂起 → 外部任务（扮演用户
+    /// 输入）resolve → turn 继续跑完。
+    #[tokio::test]
+    async fn pause_gate_suspends_tool_loop_until_resolved() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+
+        let gate = crate::advisor_monitor::AdvisorPauseGate::with_timeout(
+            std::time::Duration::from_secs(30),
+        );
+
+        // 工具 handler 扮演 advisor monitor：首次执行时请求暂停
+        // （只置位一次——否则恢复后每轮工具又置位，turn 会再次挂起）。
+        let gate_in_tool = gate.clone();
+        let requested_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            let gate = gate_in_tool.clone();
+            let requested_once = requested_once.clone();
+            Box::pin(async move {
+                if !requested_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    gate.request();
+                }
+                Ok(serde_json::json!({ "ok": true }))
+            })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tool = Tool::builder("ping", "test ping", schema, handler).build();
+        let tm = create_tool_manager();
+        tm.register(tool, None);
+
+        // 恒定返回同一 tool call，turn 在工具循环里打乒乓；若 pause
+        // gate 不生效，turn 会迅速撞 MaxToolRoundsExceeded(4)。
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("", vec![
+                            serde_json::json!({
+                                "id": "call_ping",
+                                "type": "function",
+                                "function": {
+                                    "name": "ping",
+                                    "arguments": "{}"
+                                }
+                            })
+                        ]),
+                    )),
+            )
+            .await;
+
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm, 4).with_pause_gate(gate.clone());
+
+        let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
+
+        // 等 pause 置位（第一轮工具执行后）。
+        for _ in 0..100 {
+            if gate.is_requested() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gate.is_requested(), "tool handler requested the pause");
+        // runner 应在 round-1 边界挂起：给足够时间它也不该完成
+        // （没有 gate 时 4 轮乒乓远早于 300ms 撞上限）。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!turn.is_finished(), "runner suspended at the tool-round boundary");
+        assert!(
+            server.received_requests().await.unwrap().len() == 1,
+            "no second model call while paused: {}",
+            server.received_requests().await.unwrap().len()
+        );
+
+        // 用户拍板（继续）→ resolve → turn 恢复并跑完（撞 round 上限）。
+        gate.resolve();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), turn)
+            .await
+            .expect("turn resumes after resolve")
+            .unwrap()
+            .expect_err("repeated tool calls hit the round cap");
+        assert!(
+            matches!(err, AgentError::MaxToolRoundsExceeded(4)),
+            "got {err:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().len() >= 2,
+            "tool loop continued after resume"
+        );
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use latte_ai::params::GenerateParams;
 use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use crate::advisor_monitor::{AdvisorMonitorConfig, AdvisorReviewEngine, GateConfig};
+use crate::advisor_monitor::{AdvisorMonitorConfig, AdvisorPauseGate, AdvisorReviewEngine, GateConfig};
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
@@ -640,6 +640,12 @@ pub struct ChatController {
     /// `PendingApproval`，ui-server 的任务导入置 `Approved`，driver
     /// 收到下一条用户消息复位 `Normal`。
     plan_stage: SharedPlanStage,
+    /// Advisor v3 pause gate（intervene 暂停门）：monitor 判
+    /// `Verdict::Intervene` 时经 `request_pause()` 置位；driver 给
+    /// watched role 的主 runner 装配同一句柄
+    /// （`AgentRunner::with_pause_gate`），runner 在 tool-round
+    /// 边界挂起；任何用户输入到达（`submit_input`）即 resolve。
+    advisor_pause: AdvisorPauseGate,
 }
 
 impl ChatController {
@@ -656,6 +662,7 @@ impl ChatController {
             advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
             plan_stage: Arc::new(parking_lot::RwLock::new(PlanStage::Normal)),
+            advisor_pause: AdvisorPauseGate::new(),
         }
     }
 
@@ -674,6 +681,7 @@ impl ChatController {
         let turn_cancel_flag = self.turn_cancel_flag.clone();
         let advisor_hints = self.advisor_hints.clone();
         let plan_stage = self.plan_stage.clone();
+        let advisor_pause = self.advisor_pause.clone();
 
         tokio::spawn(async move {
             run_driver(
@@ -685,6 +693,7 @@ impl ChatController {
                 turn_cancel_flag,
                 advisor_hints,
                 plan_stage,
+                advisor_pause,
             )
             .await;
         });
@@ -698,6 +707,21 @@ impl ChatController {
         // LLM review input (slash commands are not questions).
         if !text.trim_start().starts_with('/') {
             *self.last_user_input.lock() = text.to_string();
+        }
+        // Advisor v3 pause gate：暂停期间任何用户输入都算拍板（选择
+        // 弹窗的回答也作为普通用户消息回传）——先 resolve 唤醒挂起
+        // 的 runner；文本命中"终止/stop/取消/别继续"时同时软终止
+        // 当前 turn（turn_cancel_flag 由 run_turn_cancellable 的
+        // 500ms tick 看到，driver 丢掉 in-flight turn 回到等输入）。
+        if self.pause_requested() {
+            let lower = text.to_lowercase();
+            let stop = ["终止", "stop", "取消", "别继续"]
+                .iter()
+                .any(|k| lower.contains(k));
+            self.advisor_pause.resolve();
+            if stop {
+                self.cancel_turn().await;
+            }
         }
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
             let _ = tx.send(ControllerInput::Input(text.to_string()));
@@ -759,9 +783,29 @@ impl ChatController {
     /// Resume from paused state.
     pub async fn resume(&self) {
         self.pause_requested.store(false, Ordering::SeqCst);
+        // 用户显式恢复也算对 advisor pause gate 拍板。
+        self.advisor_pause.resolve();
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
             let _ = tx.send(ControllerInput::Resume);
         }
+    }
+
+    /// Advisor v3 pause gate：请求暂停 watched role 的主 runner。
+    /// 由 AdvisorMonitor 在 `Verdict::Intervene` 时调用；runner 在
+    /// 下一个 tool-round 边界挂起，直到用户拍板（`submit_input` /
+    /// `resume` → resolve）或 10 分钟超时自动恢复。
+    pub fn request_pause(&self) {
+        self.advisor_pause.request();
+    }
+
+    /// 当前是否有未拍板的 advisor 暂停请求（测试与嵌入方断言用）。
+    pub fn pause_requested(&self) -> bool {
+        self.advisor_pause.is_requested()
+    }
+
+    /// pause gate 共享句柄（driver 给主 runner 装配用）。
+    pub fn advisor_pause_gate(&self) -> AdvisorPauseGate {
+        self.advisor_pause.clone()
     }
 
     /// Switch to a different role (single-role mode only).
@@ -1005,6 +1049,7 @@ async fn run_driver(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    advisor_pause: AdvisorPauseGate,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
@@ -1029,6 +1074,7 @@ async fn run_driver(
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
+            advisor_pause,
         )
         .await;
     }
@@ -1736,6 +1782,7 @@ async fn run_single_role_loop(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    advisor_pause: AdvisorPauseGate,
 ) {
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
@@ -1782,6 +1829,18 @@ async fn run_single_role_loop(
         }
     };
     let mut runner = runner.with_advisor_hints(advisor_hints.clone());
+    // Advisor v3 pause gate：只装到本 loop 的主 runner（watched
+    // role）上；delegate specialist 由工具 handler 另建 runner，
+    // 不经过这里，不会被 pause。advisor 未启用时不装（门也不会
+    // 被置位，等价无门）。
+    let attach_pause_gate = |r: AgentRunner| {
+        if config.advisor_monitor.enabled {
+            r.with_pause_gate(advisor_pause.clone())
+        } else {
+            r
+        }
+    };
+    runner = attach_pause_gate(runner);
 
     // Seed the runner with any pre-existing history (e.g. when
     // resuming a paused session from the SessionStore). Done
@@ -1872,7 +1931,7 @@ async fn run_single_role_loop(
                                     match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
-                                            runner = new_runner.with_advisor_hints(advisor_hints.clone());
+                                            runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
                                             current_role = rid.clone();
                                             let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                             let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
@@ -1894,7 +1953,7 @@ async fn run_single_role_loop(
                                             match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
-                                                    runner = new_runner.with_advisor_hints(advisor_hints.clone());
+                                                    runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
                                                     current_tier = new_tier;
                                                     let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                                                 }
@@ -2039,7 +2098,7 @@ let usage_before = runner.total_usage().clone();
                         match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
-                                runner = new_runner.with_advisor_hints(advisor_hints.clone());
+                                runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
                                 current_role = rid.clone();
                                 let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                 let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
@@ -2054,7 +2113,7 @@ let usage_before = runner.total_usage().clone();
                         match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
-                                runner = new_runner.with_advisor_hints(advisor_hints.clone());
+                                runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
                                 current_tier = new_tier;
                                 let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
                             }
@@ -3474,6 +3533,38 @@ fn role_icon(role_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Advisor v3 pause gate（controller 侧）─────────────────────
+
+    #[tokio::test]
+    async fn advisor_pause_resolves_on_any_user_input() {
+        let c = ChatController::new(8);
+        assert!(!c.pause_requested());
+        c.request_pause();
+        assert!(c.pause_requested());
+        // 任何用户输入都算拍板（继续）：清旗，不取消 turn。
+        c.submit_input("继续").await;
+        assert!(!c.pause_requested());
+        assert!(!c.turn_cancel_requested());
+    }
+
+    #[tokio::test]
+    async fn advisor_pause_stop_keyword_cancels_turn() {
+        let c = ChatController::new(8);
+        c.request_pause();
+        // 命中"终止"关键词：resolve + 软终止当前 turn 同时发生。
+        c.submit_input("终止本轮吧").await;
+        assert!(!c.pause_requested());
+        assert!(c.turn_cancel_requested());
+    }
+
+    #[tokio::test]
+    async fn advisor_resume_also_resolves_pause_gate() {
+        let c = ChatController::new(8);
+        c.request_pause();
+        c.resume().await;
+        assert!(!c.pause_requested());
+    }
 
     #[test]
     fn strip_think_blocks_cases() {

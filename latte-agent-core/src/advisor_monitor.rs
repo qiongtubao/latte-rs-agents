@@ -110,6 +110,96 @@ impl AdvisorMonitorConfig {
     }
 }
 
+// ─── v3 pause gate（intervene 暂停门）───────────────────────────────
+
+/// Intervene 暂停门：LLM 复审判 `Verdict::Intervene` 时，monitor 调
+/// `request()` 置位；watched role 的主 runner 在 tool-round 边界
+/// （drain advisor hint 的同一位置）调 `wait_if_requested()` 挂起，
+/// 直到用户拍板（`resolve()`，任何用户输入都算）或超时自动恢复。
+/// 只有 watched role 的主 runner 装配这门（driver 经
+/// `AgentRunner::with_pause_gate`）；advisor 自身与 delegate
+/// specialist 不带，不受影响。
+#[derive(Debug, Clone)]
+pub struct AdvisorPauseGate {
+    requested: Arc<std::sync::atomic::AtomicBool>,
+    resume: Arc<tokio::sync::Notify>,
+    timeout: Duration,
+}
+
+impl Default for AdvisorPauseGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdvisorPauseGate {
+    /// 防死锁上限（秒）：用户迟迟不拍板时自动恢复继续（warn）。
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+    pub fn new() -> Self {
+        Self::with_timeout(Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
+    }
+
+    /// 自定义超时（测试用短超时验证自动恢复）。
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume: Arc::new(tokio::sync::Notify::new()),
+            timeout,
+        }
+    }
+
+    /// monitor 侧：Intervene 时请求暂停。幂等。
+    pub fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 当前是否有未拍板的暂停请求。
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 拍板侧：清旗并唤醒挂起的 runner。controller 在任何用户输入
+    /// 到达时调用（选择弹窗的回答也作为普通用户消息回传）。
+    pub fn resolve(&self) {
+        if self
+            .requested
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.resume.notify_waiters();
+        }
+    }
+
+    /// runner 侧（tool-round 边界）：未置位立即返回；置位则挂起
+    /// 直到 `resolve()` 或超时（超时自动清旗恢复 + warn，防死锁）。
+    pub async fn wait_if_requested(&self) {
+        if !self.is_requested() {
+            return;
+        }
+        let wait = async {
+            while self.is_requested() {
+                // Notify 丢唤醒（resolve 发生在 notified() 注册之前）
+                // 由 100ms 复查兜底：最坏多等 100ms，绝不会死锁。
+                tokio::select! {
+                    _ = self.resume.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        };
+        if tokio::time::timeout(self.timeout, wait).await.is_err()
+            && self
+                .requested
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!(
+                "advisor pause gate: 用户 {}s 未拍板，超时自动恢复",
+                self.timeout.as_secs()
+            );
+        }
+    }
+}
+
 // ─── Deterministic detectors (D1–D4) ───────────────────────────────
 
 /// Which detector fired. Labels match the design doc table.
@@ -1361,6 +1451,52 @@ impl AdvisorMonitor {
                     sub_id: None,
                 });
 
+                if verdict.verdict == Verdict::Intervene {
+                    // v3 pause gate：不止气泡+hint——置位暂停门，
+                    // watched role 的主 runner 会在下一个 tool-round
+                    // 边界挂起；同时弹选择窗请用户拍板。用户的选择
+                    // 作为下一条普通用户消息回传（无结构化回答通道），
+                    // controller 在任何用户输入到达时 resolve；
+                    // 命中"终止"类关键词还会 cancel_turn。
+                    controller.request_pause();
+                    let micros = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_micros())
+                        .unwrap_or(0);
+                    let _ = bubble_tx.send(ChatEvent::ChoiceRequested {
+                        role_id: "advisor".to_string(),
+                        choice_id: format!("advisor-pause-{micros}"),
+                        question: format!(
+                            "🦉 advisor 介入：{reason}。继续执行还是终止本轮？"
+                        ),
+                        multi: false,
+                        layout: String::new(),
+                        allow_upload: false,
+                        options: vec![
+                            crate::controller::ChoiceOption {
+                                label: "继续".to_string(),
+                                description:
+                                    "advisor 的纠正提示已注入，manager 继续执行"
+                                        .to_string(),
+                                image: String::new(),
+                                recommended: true,
+                            },
+                            crate::controller::ChoiceOption {
+                                label: "终止本轮".to_string(),
+                                description:
+                                    "取消 manager 当前 turn，回到等待输入"
+                                        .to_string(),
+                                image: String::new(),
+                                recommended: false,
+                            },
+                        ],
+                    });
+                    let _ = bubble_tx.send(ChatEvent::Status {
+                        message: "⏸ advisor 已暂停 manager 执行，等待用户拍板（继续 / 终止本轮）"
+                            .to_string(),
+                    });
+                }
+
                 if verdict.verdict == Verdict::Terminate {
                     // 让 manager 真正停下来：取消当前 in-flight turn。
                     // 这是 **软终止**——不是 abort 整个 session：
@@ -2012,6 +2148,140 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("turn_cancel_flag was not set by a Terminate verdict");
+    }
+
+    #[tokio::test]
+    async fn monitor_intervene_requests_pause_and_offers_choice() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                        "verdict: intervene\nreason: 方向可疑，继续只会浪费\nhint: 先停下来读报错",
+                    ))),
+            )
+            .await;
+
+        let controller = Arc::new(ChatController::new(64));
+        let mut bubble_rx = controller.subscribe();
+        let engine = engine_for(advisor_config_at(&server.uri()));
+        let _handle = AdvisorMonitor::spawn(
+            controller.clone(),
+            AdvisorMonitorConfig::default(),
+            engine,
+            "manager".into(),
+        );
+        let tx = controller.event_sender();
+
+        // D3: two consecutive tool errors trigger the review.
+        tx.send(tool_error("exec", "boom1")).unwrap();
+        tx.send(tool_error("exec", "boom2")).unwrap();
+
+        // 1. v3 pause gate：intervene 判出 → pause_requested 置位，
+        //    并广播 ChoiceRequested（继续=推荐 / 终止本轮）+ 暂停
+        //    Status。
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut saw_choice, mut saw_status) = (false, false);
+            loop {
+                match bubble_rx.recv().await {
+                    Ok(ChatEvent::ChoiceRequested {
+                        role_id,
+                        question,
+                        multi,
+                        options,
+                        ..
+                    }) => {
+                        assert_eq!(role_id, "advisor");
+                        assert!(
+                            question.contains("继续执行还是终止本轮"),
+                            "question: {question}"
+                        );
+                        assert!(question.contains("方向可疑"), "reason in question");
+                        assert!(!multi);
+                        assert_eq!(options.len(), 2, "options: {options:?}");
+                        assert_eq!(options[0].label, "继续");
+                        assert!(options[0].recommended, "继续 is the recommended option");
+                        assert_eq!(options[1].label, "终止本轮");
+                        assert!(!options[1].recommended);
+                        saw_choice = true;
+                    }
+                    Ok(ChatEvent::Status { message }) if message.contains("等待用户拍板") => {
+                        saw_status = true;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended before pause events: {e}"),
+                }
+                if saw_choice && saw_status {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("ChoiceRequested + pause Status should arrive");
+
+        for _ in 0..100 {
+            if controller.pause_requested() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            controller.pause_requested(),
+            "intervene must set the pause gate"
+        );
+
+        // 2. 用户拍板（任何输入）→ 恢复。选择"终止本轮"还会软终止
+        //    当前 turn。
+        controller.submit_input("终止本轮").await;
+        assert!(!controller.pause_requested(), "user input resolves the pause");
+        assert!(
+            controller.turn_cancel_requested(),
+            "stop keyword also cancels the in-flight turn"
+        );
+    }
+
+    // ─── AdvisorPauseGate 单测 ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn pause_gate_waits_until_resolved() {
+        let gate = AdvisorPauseGate::with_timeout(Duration::from_secs(30));
+        // 未置位：立即返回。
+        gate.wait_if_requested().await;
+
+        gate.request();
+        let waiter = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.wait_if_requested().await })
+        };
+        // 挂起中：resolve 前 waiter 不应完成。
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!waiter.is_finished(), "gate holds the runner suspended");
+        gate.resolve();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter wakes on resolve")
+            .unwrap();
+        assert!(!gate.is_requested());
+    }
+
+    #[tokio::test]
+    async fn pause_gate_timeout_auto_resumes() {
+        let gate = AdvisorPauseGate::with_timeout(Duration::from_millis(50));
+        gate.request();
+        let start = std::time::Instant::now();
+        gate.wait_if_requested().await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(50),
+            "waited out the timeout"
+        );
+        assert!(
+            !gate.is_requested(),
+            "timeout auto-resume clears the flag (防死锁)"
+        );
     }
 
     #[tokio::test]

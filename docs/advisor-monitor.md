@@ -151,6 +151,14 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 - LLM 复审 `Verdict::Terminate` → monitor 调 `ChatController::cancel_turn()`
   取消 manager 的 in-flight turn（**软终止**：driver 回到等用户输入，不是
   abort session），并广播 `ChatEvent::AdvisorTerminated { detector: Some("LLM") }`。
+- LLM 复审 `Verdict::Intervene` → **pause gate 暂停门**：monitor 在气泡+hint
+  之外调 `ChatController::request_pause()` 置位共享 `AdvisorPauseGate`，并广播
+  `ChatEvent::ChoiceRequested`（继续=推荐 / 终止本轮）+ 暂停 Status；watched role
+  的主 runner 在下一个 **tool-round 边界**（drain hint 的同一位置）挂起等用户拍板。
+  任何用户输入（选择弹窗的回答也作为普通用户消息回传）经 `submit_input` resolve
+  恢复；文本命中"终止/stop/取消/别继续"时同时 `cancel_turn()`。10 分钟未拍板
+  超时自动恢复（warn，防死锁）。只装 watched role 的主 runner——advisor 自身与
+  delegate specialist 不暂停。
 - D5/D6 pre-persistence gate 接入生产 driver：`build_runner` 按
   `AdvisorMonitorConfig::runner_gate()` 给 manager / 多角色 / delegate
   specialist runner 装 `with_gate_config`；gate 命中 → 带批注重试（最多
@@ -186,3 +194,12 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   文件缺失 → 无 attention 区块且审查照常；`watchdog_notes=false` → 不读文件。
 - monitor 容错：空 model catalog（resolve 失败）→ 确定性 hint 照发、无气泡、
   monitor 存活继续检测（后续 D4 正常触发）。
+- v3 pause gate：
+  - monitor 级（wiremock 裁决 intervene）→ `pause_requested` 置位 +
+    `ChoiceRequested`（继续=推荐/终止本轮）+ 暂停 Status 广播；用户回"终止本轮"
+    → resolve + `turn_cancel_flag` 置位。
+  - gate 单测：未置位立即返回；置位挂起直到 resolve；短超时自动恢复并清旗。
+  - runner 级（`agent::tests`，wiremock 恒定 tool_call + 工具 handler 置位
+    gate）：挂起期间无第二次模型调用，resolve 后 tool 循环继续。
+  - controller 级：任何用户输入 resolve；命中"终止"关键词同时 `cancel_turn`；
+    `resume()` 也算拍板。
