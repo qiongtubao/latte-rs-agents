@@ -11,7 +11,7 @@
 //!   1. `<project>/.latte/workflows.d/<name>.toml`
 //!   2. `$LATTE_HOME/workflows.d/<name>.toml` (or `~/.latte/workflows.d/`)
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -554,6 +554,178 @@ enum WfOutcome {
     Failed(String),
 }
 
+// ─── Checkpoint（断点续跑）────────────────────────────────────────
+//
+// 每完成一个 step，把产出追加写入 `<cwd>/.latte/workflow-runs/<wf_id>.jsonl`
+// （首行 meta，之后一行一个 step 记录）。step 失败时已完成成果不丢：
+// [`run_workflow_resume`] 读取 checkpoint、把已完成 step 的
+// output_key→output 注入 `vars` 并跳过这些 step，从断点继续。
+// 写盘失败只 warn，绝不影响执行；跑完的 checkpoint 保留（不做自动清理）。
+
+/// One line in a workflow-run checkpoint file (JSONL).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CheckpointRecord {
+    /// First line of every checkpoint file: run identity.
+    Meta {
+        wf_id: String,
+        workflow_name: String,
+        topic: String,
+        started_at: u64,
+    },
+    /// One completed step.
+    Step {
+        wf_id: String,
+        workflow_name: String,
+        topic: String,
+        step_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_key: Option<String>,
+        output: String,
+        finished_at: u64,
+    },
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn checkpoint_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".latte").join("workflow-runs")
+}
+
+fn checkpoint_path(cwd: &Path, wf_id: &str) -> PathBuf {
+    checkpoint_dir(cwd).join(format!("{wf_id}.jsonl"))
+}
+
+/// Append one record to the run's checkpoint file (creating the
+/// directory on first use). Failures only warn — a checkpoint is a
+/// recovery aid, never a reason to fail the run.
+fn append_checkpoint(cwd: &Path, wf_id: &str, record: &CheckpointRecord) {
+    let write = || -> std::io::Result<()> {
+        let line = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::create_dir_all(checkpoint_dir(cwd))?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(checkpoint_path(cwd, wf_id))?;
+        use std::io::Write as _;
+        writeln!(f, "{line}")
+    };
+    if let Err(e) = write() {
+        tracing::warn!(wf_id, error = %e, "workflow checkpoint write failed (run continues)");
+    }
+}
+
+/// State recovered from a checkpoint file for [`run_workflow_resume`].
+struct CheckpointState {
+    workflow_name: String,
+    topic: String,
+    /// Completed steps in completion order: (step_id, output_key, output).
+    completed: Vec<(String, Option<String>, String)>,
+}
+
+/// Load and validate a checkpoint file for resume. `wf_id` comes from
+/// tool input, so reject anything that isn't a plain file name.
+fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, String> {
+    if wf_id.is_empty()
+        || wf_id.contains('/')
+        || wf_id.contains('\\')
+        || wf_id.contains("..")
+    {
+        return Err(format!("invalid resume wf_id '{wf_id}'"));
+    }
+    let path = checkpoint_path(cwd, wf_id);
+    let raw = std::fs::read_to_string(&path).map_err(|_| {
+        format!("resume checkpoint '{wf_id}' not found at {}", path.display())
+    })?;
+    let mut meta: Option<(String, String)> = None;
+    let mut completed = Vec::new();
+    for (lineno, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let rec: CheckpointRecord = serde_json::from_str(line)
+            .map_err(|e| format!("checkpoint '{wf_id}' line {}: invalid JSON: {e}", lineno + 1))?;
+        match rec {
+            CheckpointRecord::Meta { workflow_name, topic, .. } => {
+                if meta.is_none() {
+                    meta = Some((workflow_name, topic));
+                }
+            }
+            CheckpointRecord::Step { step_id, output_key, output, .. } => {
+                completed.push((step_id, output_key, output));
+            }
+        }
+    }
+    let (workflow_name, topic) =
+        meta.ok_or_else(|| format!("checkpoint '{wf_id}' has no meta line (corrupt?)"))?;
+    Ok(CheckpointState { workflow_name, topic, completed })
+}
+
+/// Per-run checkpoint writer shared by both engines. Bundles the file
+/// identity with a completed-step counter (seeded with the resumed
+/// count) used to enrich failure messages ("已完成 N/M 步，可 resume")。
+struct CheckpointLog {
+    cwd: PathBuf,
+    wf_id: String,
+    workflow_name: String,
+    topic: String,
+    completed: std::sync::atomic::AtomicUsize,
+}
+
+impl CheckpointLog {
+    /// Start a new checkpoint file (writes the meta line). `resumed`
+    /// seeds the completed counter with steps carried over from a
+    /// previous run's checkpoint.
+    fn new(cwd: &Path, wf_id: &str, workflow_name: &str, topic: &str, resumed: usize) -> Self {
+        append_checkpoint(
+            cwd,
+            wf_id,
+            &CheckpointRecord::Meta {
+                wf_id: wf_id.to_string(),
+                workflow_name: workflow_name.to_string(),
+                topic: topic.to_string(),
+                started_at: now_secs(),
+            },
+        );
+        Self {
+            cwd: cwd.to_path_buf(),
+            wf_id: wf_id.to_string(),
+            workflow_name: workflow_name.to_string(),
+            topic: topic.to_string(),
+            completed: std::sync::atomic::AtomicUsize::new(resumed),
+        }
+    }
+
+    /// Persist one completed step's output and bump the counter.
+    fn record_step(&self, step_id: &str, output_key: Option<&str>, output: &str) {
+        append_checkpoint(
+            &self.cwd,
+            &self.wf_id,
+            &CheckpointRecord::Step {
+                wf_id: self.wf_id.clone(),
+                workflow_name: self.workflow_name.clone(),
+                topic: self.topic.clone(),
+                step_id: step_id.to_string(),
+                output_key: output_key.map(|s| s.to_string()),
+                output: output.to_string(),
+                finished_at: now_secs(),
+            },
+        );
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn completed(&self) -> usize {
+        self.completed.load(Ordering::Relaxed)
+    }
+}
+
 /// Max concurrent steps within a single dependency wave. Independent
 /// steps fan out via `tokio::task::JoinSet`; this caps how many
 /// specialists run at once so a wide wave can't exhaust models /
@@ -570,6 +742,11 @@ fn workflow_concurrency() -> usize {
 /// on success; on cancel/failure emits `WorkflowFinished` with the
 /// matching status and returns the summary as `Err`.
 ///
+/// Every completed step is checkpointed to
+/// `<cwd>/.latte/workflow-runs/<wf_id>.jsonl`; on failure the error
+/// message carries the `wf_id` so the run can be continued with
+/// [`run_workflow_resume`] instead of starting over.
+///
 /// Dispatches to one of two engines:
 ///   - **serial** (default): steps run in file order with one
 ///     persistent `AgentRunner` per role (conversation continuity
@@ -583,11 +760,58 @@ pub async fn run_workflow(
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
+    run_workflow_inner(wf, topic, ctx, None).await
+}
+
+/// Resume a previously interrupted workflow run from its checkpoint
+/// (`resume_wf_id` is the `wf_id` reported in the failed run's error
+/// message). The checkpoint must belong to the same workflow
+/// (`wf.name`) — a mismatch is an error. Completed steps are skipped
+/// (no model calls, no WorkflowStep/Turn events re-emitted); their
+/// `output_key` outputs are injected into `vars` so downstream
+/// `{{key}}` substitution works unchanged. An empty `topic` falls back
+/// to the checkpointed topic. The resumed run gets a fresh `wf_id` and
+/// its own checkpoint file (seeded with the carried-over steps), so a
+/// second failure is resumable again.
+pub async fn run_workflow_resume(
+    wf: &WorkflowDef,
+    topic: &str,
+    ctx: &WorkflowRunContext,
+    resume_wf_id: &str,
+) -> Result<String, String> {
+    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id)).await
+}
+
+async fn run_workflow_inner(
+    wf: &WorkflowDef,
+    topic: &str,
+    ctx: &WorkflowRunContext,
+    resume_wf_id: Option<&str>,
+) -> Result<String, String> {
     wf.validate()?;
     let uses_dag = wf.uses_dependency_dag();
     if uses_dag {
         wf.validate_dag()?;
     }
+
+    // Resume: load the previous run's checkpoint, verify it belongs to
+    // the same workflow, and carry over its completed steps.
+    let mut resume: Option<CheckpointState> = None;
+    let mut topic = topic.to_string();
+    if let Some(rid) = resume_wf_id {
+        let state = load_checkpoint(&ctx.cwd, rid)?;
+        if state.workflow_name != wf.name {
+            return Err(format!(
+                "resume checkpoint '{rid}' belongs to workflow '{}', not '{}'",
+                state.workflow_name, wf.name
+            ));
+        }
+        if topic.trim().is_empty() {
+            topic = state.topic.clone();
+        }
+        resume = Some(state);
+    }
+
     let name = wf.name.clone();
     let wf_id = format!(
         "wf-{}-{}",
@@ -597,16 +821,50 @@ pub async fn run_workflow(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
+    let ckpt = CheckpointLog::new(
+        &ctx.cwd,
+        &wf_id,
+        &name,
+        &topic,
+        resume.as_ref().map_or(0, |s| s.completed.len()),
+    );
+    // Copy the carried-over step records into the new run's checkpoint
+    // file so it stays self-contained (a second resume needs only the
+    // new wf_id).
+    if let Some(state) = &resume {
+        for (step_id, output_key, output) in &state.completed {
+            append_checkpoint(
+                &ctx.cwd,
+                &wf_id,
+                &CheckpointRecord::Step {
+                    wf_id: wf_id.clone(),
+                    workflow_name: name.clone(),
+                    topic: topic.clone(),
+                    step_id: step_id.clone(),
+                    output_key: output_key.clone(),
+                    output: output.clone(),
+                    finished_at: now_secs(),
+                },
+            );
+        }
+        let _ = ctx.event_tx.send(ChatEvent::Status {
+            message: format!(
+                "workflow '{name}' 从断点续跑（checkpoint {}）：跳过已完成的 {} 步",
+                resume_wf_id.unwrap_or_default(),
+                state.completed.len()
+            ),
+        });
+    }
     let _ = ctx.event_tx.send(ChatEvent::WorkflowStarted {
         name: name.clone(),
-        topic: topic.to_string(),
+        topic: topic.clone(),
         wf_id: wf_id.clone(),
     });
 
     let outcome = if uses_dag {
-        run_workflow_dag(wf, topic, ctx, &wf_id).await
+        run_workflow_dag(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref()).await
     } else {
-        run_workflow_serial(wf, topic, ctx, &wf_id).await
+        run_workflow_serial(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref()).await
     };
 
     match outcome {
@@ -630,6 +888,13 @@ pub async fn run_workflow(
             Err(summary)
         }
         WfOutcome::Failed(msg) => {
+            // 失败不丢成果：已完成 step 都落了 checkpoint，消息尾部
+            // 带上进度与 wf_id，manager 可直接用 resume 续跑。
+            let total = wf.steps.len() * wf.effective_max_rounds();
+            let msg = format!(
+                "{msg}（已完成 {}/{total} 步，可用 resume 从断点续跑：wf_id={wf_id}）",
+                ckpt.completed()
+            );
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
                 name,
                 wf_id,
@@ -720,6 +985,8 @@ async fn run_workflow_serial(
     topic: &str,
     ctx: &WorkflowRunContext,
     wf_id: &str,
+    ckpt: &CheckpointLog,
+    resume: Option<&CheckpointState>,
 ) -> WfOutcome {
     // One runner per scheduled role; advisor is an internal monitor only.
     let mut runners: HashMap<String, AgentRunner> = HashMap::new();
@@ -745,11 +1012,26 @@ async fn run_workflow_serial(
     vars.insert("topic".into(), topic.to_string());
     let total = wf.steps.len();
     let mut last_output = String::new();
+    // 断点续跑：已完成 step 的产出直接注入 vars，step 本体跳过
+    // （不重跑、不重发 WorkflowStep/Turn 事件）。
+    let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if let Some(state) = resume {
+        for (step_id, output_key, output) in &state.completed {
+            done_steps.insert(step_id.as_str());
+            if let Some(key) = output_key {
+                vars.insert(key.clone(), output.clone());
+            }
+            last_output = output.clone();
+        }
+    }
 
     for round in 0..wf.effective_max_rounds() {
         for (idx, step) in wf.steps.iter().enumerate() {
             if ctx.cancel_flag.load(Ordering::SeqCst) {
                 return WfOutcome::Cancelled;
+            }
+            if done_steps.contains(step.id.as_str()) {
+                continue;
             }
             let first_role = step.roles().first().cloned().unwrap_or_default();
             let _ = ctx.event_tx.send(ChatEvent::WorkflowStep {
@@ -794,6 +1076,7 @@ async fn run_workflow_serial(
                 if let Some(key) = &step.output_key {
                     vars.insert(key.clone(), last_output.clone());
                 }
+                ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
                 continue;
             }
             for speaker in step.roles() {
@@ -872,6 +1155,7 @@ async fn run_workflow_serial(
             if let Some(key) = &step.output_key {
                 vars.insert(key.clone(), last_output.clone());
             }
+            ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
         }
     }
 
@@ -1049,6 +1333,8 @@ async fn run_workflow_dag(
     topic: &str,
     ctx: &WorkflowRunContext,
     wf_id: &str,
+    ckpt: &CheckpointLog,
+    resume: Option<&CheckpointState>,
 ) -> WfOutcome {
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
@@ -1065,6 +1351,18 @@ async fn run_workflow_dag(
     vars.insert("topic".into(), topic.to_string());
     // step_id -> last_output, used to resolve the final return value.
     let mut outputs: HashMap<String, String> = HashMap::new();
+    // 断点续跑：已完成 step 预填 outputs/vars（视为依赖已满足），
+    // wave 调度时跳过，不再 spawn。
+    let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    if let Some(state) = resume {
+        for (step_id, output_key, output) in &state.completed {
+            done_steps.insert(step_id.as_str());
+            outputs.insert(step_id.clone(), output.clone());
+            if let Some(key) = output_key {
+                vars.insert(key.clone(), output.clone());
+            }
+        }
+    }
 
     for round in 0..wf.effective_max_rounds() {
         for wave in &waves {
@@ -1074,6 +1372,9 @@ async fn run_workflow_dag(
             let mut set: JoinSet<Result<(String, Option<String>, String), StepFail>> =
                 JoinSet::new();
             for &idx in wave {
+                if done_steps.contains(wf.steps[idx].id.as_str()) {
+                    continue;
+                }
                 let inp = DagStepInput {
                     wf: wf_arc.clone(),
                     step_idx: idx,
@@ -1108,6 +1409,7 @@ async fn run_workflow_dag(
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(Ok((step_id, output_key, out))) => {
+                        ckpt.record_step(&step_id, output_key.as_deref(), &out);
                         outputs.insert(step_id, out.clone());
                         wave_updates.push((output_key, out));
                     }
@@ -1977,5 +2279,388 @@ forbid = ["TBD"]
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "首发 + max_retries=1 次重试: {}", requests.len());
         assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::config::{ModelCatalog, ModelDef};
+    use crate::role::RoleTemplate;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    fn openai_body(content: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    /// 单模型（premium tier 指向 wiremock）+ 单角色 "worker" 的测试配置。
+    fn test_config_at(base_url: &str) -> Arc<AgentConfig> {
+        let roles = HashMap::from([(
+            "worker".to_string(),
+            RoleTemplate {
+                id: "worker".into(),
+                name: "Worker".into(),
+                category: "execution".into(),
+                model_tier: "premium".into(),
+                model_chain: vec![],
+                prompt_file: None,
+                temperature: None,
+                tools: vec![],
+                icon: String::new(),
+                skills: vec![],
+                code_paths: vec![],
+            },
+        )]);
+        Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "Test Premium".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: base_url.into(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles,
+        })
+    }
+
+    fn test_ctx_at(
+        config: Arc<AgentConfig>,
+        cwd: PathBuf,
+    ) -> (WorkflowRunContext, broadcast::Receiver<ChatEvent>) {
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, event_rx) = broadcast::channel(64);
+        (
+            WorkflowRunContext {
+                merged: config,
+                resolver,
+                default_params: GenerateParams::default(),
+                cwd,
+                event_tx,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                depth: 0,
+            },
+            event_rx,
+        )
+    }
+
+    /// 3-step 串行 workflow：b 带不可能通过的产出契约（require 一个
+    /// 永远不会出现的字符串），max_retries=1 —— 用于制造"第 2 步失败"。
+    /// 用契约失败而不是 HTTP 500：确定性强、无模型冷却/重试带来的
+    /// 额外请求与等待。
+    fn three_step_wf() -> WorkflowDef {
+        let raw = r#"
+name = "resume_demo"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务A：分析 {{topic}}"
+output_key = "out_a"
+[[steps]]
+id = "b"
+role = "worker"
+task = "任务B：基于 {{out_a}} 设计 {{topic}}"
+output_key = "out_b"
+max_retries = 1
+[steps.output_contract]
+require = ["永远不可能出现的验收字符串"]
+[[steps]]
+id = "c"
+role = "worker"
+task = "任务C：汇总 {{out_b}}"
+output_key = "out_c"
+"#;
+        toml::from_str(raw).expect("valid TOML")
+    }
+
+    /// 从失败消息尾部解析 wf_id（格式："...wf_id=xxx）"）。
+    fn extract_wf_id(err: &str) -> String {
+        let pos = err.rfind("wf_id=").expect("错误消息应带 wf_id");
+        err[pos + "wf_id=".len()..]
+            .trim_end_matches('）')
+            .to_string()
+    }
+
+    fn read_checkpoint(cwd: &Path, wf_id: &str) -> Vec<serde_json::Value> {
+        let raw = std::fs::read_to_string(checkpoint_path(cwd, wf_id))
+            .expect("checkpoint 文件应存在");
+        raw.lines()
+            .map(|l| serde_json::from_str(l).expect("每行都是合法 JSON"))
+            .collect()
+    }
+
+    /// checkpoint 写入：2-step workflow 跑完 → jsonl = meta + 2 条 step 记录，
+    /// 字段齐全（workflow_name/topic/step_id/output_key/output/finished_at）。
+    #[tokio::test]
+    async fn checkpoint_written_per_step() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("产出内容")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "ckpt_demo"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务A"
+output_key = "out_a"
+[[steps]]
+id = "b"
+role = "worker"
+task = "任务B {{out_a}}"
+output_key = "out_b"
+"#,
+        )
+        .unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&wf, "主题", &ctx).await.expect("应成功");
+
+        let runs_dir = dir.path().join(".latte").join("workflow-runs");
+        let files: Vec<_> = std::fs::read_dir(&runs_dir)
+            .expect("workflow-runs 目录应被创建")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1, "一次运行一个 checkpoint 文件");
+        let raw = std::fs::read_to_string(files[0].path()).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 3, "meta + 2 条 step 记录: {raw}");
+
+        let meta: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta["type"], "meta");
+        assert_eq!(meta["workflow_name"], "ckpt_demo");
+        assert_eq!(meta["topic"], "主题");
+        assert!(meta["wf_id"].as_str().unwrap().starts_with("wf-ckpt_demo-"));
+
+        let s1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(s1["type"], "step");
+        assert_eq!(s1["step_id"], "a");
+        assert_eq!(s1["output_key"], "out_a");
+        assert_eq!(s1["output"], "产出内容");
+        assert!(s1["finished_at"].is_number());
+
+        let s2: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(s2["step_id"], "b");
+        assert_eq!(s2["output_key"], "out_b");
+    }
+
+    /// resume 串行：3-step workflow 第 2 步失败（契约不可能通过）→
+    /// 错误消息带进度与 wf_id；resume（topic 传空，用 checkpoint 的）
+    /// 后第 1 步不再请求模型、{{out_a}} 与 {{topic}} 正常注入、最终成功。
+    #[tokio::test]
+    async fn resume_skips_completed_steps_serial() {
+        // 第一次运行：模型产出永远不含验收字符串 → step b 契约失败。
+        let server1 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("步骤产出")))
+            .mount(&server1)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let wf = three_step_wf();
+        let (ctx1, _rx1) = test_ctx_at(test_config_at(&server1.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "测试主题", &ctx1)
+            .await
+            .expect_err("step b 契约不可能通过，必须失败");
+        assert!(err.contains("已完成 1/3 步"), "失败消息带进度: {err}");
+        assert!(err.contains("从断点续跑"), "失败消息带 resume 提示: {err}");
+        let wf_id = extract_wf_id(&err);
+
+        // checkpoint：meta + step a 一条记录。
+        let lines = read_checkpoint(dir.path(), &wf_id);
+        assert_eq!(lines.len(), 2, "meta + 已完成的 step a: {lines:?}");
+        assert_eq!(lines[1]["step_id"], "a");
+        assert_eq!(lines[1]["output"], "步骤产出");
+
+        // Resume：新 mock server（若 step a 重跑会向它多发请求）。
+        // 模型这次产出含验收字符串 → b、c 都能过。
+        let server2 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "包含永远不可能出现的验收字符串的合格产出",
+            )))
+            .mount(&server2)
+            .await;
+        let (ctx2, mut rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
+        // topic 传空 → 用 checkpoint 里的 "测试主题"。
+        let out = run_workflow_resume(&wf, "", &ctx2, &wf_id)
+            .await
+            .expect("resume 应成功");
+        assert_eq!(out, "包含永远不可能出现的验收字符串的合格产出");
+
+        let requests = server2.received_requests().await.unwrap();
+        // b 第一次不合格（mock 恒定返回…… 不对，这次返回含验收串，
+        // 一次就过）→ b=1、c=1 共 2 个请求；若 step a 重跑则是 3 个。
+        assert_eq!(requests.len(), 2, "只跑 b、c 两步: {}", requests.len());
+        for req in &requests {
+            let body = String::from_utf8_lossy(&req.body);
+            assert!(!body.contains("任务A"), "step a 不应重跑: {body}");
+        }
+        let first = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            first.contains("基于 步骤产出 设计 测试主题"),
+            "out_a 从 checkpoint 注入、topic 用 checkpoint 的: {first}"
+        );
+
+        // 事件：不重发 step a 的 WorkflowStep，有一条断点续跑 Status。
+        let mut step_events: Vec<String> = Vec::new();
+        let mut status_msgs: Vec<String> = Vec::new();
+        while let Ok(ev) = rx2.try_recv() {
+            match ev {
+                ChatEvent::WorkflowStep { step_id, .. } => step_events.push(step_id),
+                ChatEvent::Status { message } => status_msgs.push(message),
+                _ => {}
+            }
+        }
+        assert_eq!(step_events, vec!["b".to_string(), "c".to_string()]);
+        assert!(
+            status_msgs.iter().any(|m| m.contains("断点续跑") && m.contains("跳过已完成的 1 步")),
+            "应有断点续跑 Status: {status_msgs:?}"
+        );
+
+        // resume 运行的 checkpoint 自包含：copy-forward 的 a + 新完成的 b、c。
+        let files: Vec<_> = std::fs::read_dir(dir.path().join(".latte").join("workflow-runs"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 2, "resume 运行有自己的 checkpoint 文件");
+    }
+
+    /// resume DAG：depends_on 链 a→b→c，同样在第 2 步失败后续跑，
+    /// 验证 DAG 引擎的跳过与 outputs 预填。
+    #[tokio::test]
+    async fn resume_skips_completed_steps_dag() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "resume_dag"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务A：分析 {{topic}}"
+output_key = "out_a"
+[[steps]]
+id = "b"
+role = "worker"
+task = "任务B：基于 {{out_a}} 设计"
+output_key = "out_b"
+depends_on = ["a"]
+max_retries = 1
+[steps.output_contract]
+require = ["永远不可能出现的验收字符串"]
+[[steps]]
+id = "c"
+role = "worker"
+task = "任务C：汇总 {{out_b}}"
+output_key = "out_c"
+depends_on = ["b"]
+"#,
+        )
+        .unwrap();
+
+        let server1 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("步骤产出")))
+            .mount(&server1)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx1, _rx1) = test_ctx_at(test_config_at(&server1.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "测试主题", &ctx1)
+            .await
+            .expect_err("step b 必须失败");
+        assert!(err.contains("已完成 1/3 步"), "失败消息带进度: {err}");
+        let wf_id = extract_wf_id(&err);
+
+        let server2 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "包含永远不可能出现的验收字符串的合格产出",
+            )))
+            .mount(&server2)
+            .await;
+        let (ctx2, _rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
+        let out = run_workflow_resume(&wf, "测试主题", &ctx2, &wf_id)
+            .await
+            .expect("DAG resume 应成功");
+        assert_eq!(out, "包含永远不可能出现的验收字符串的合格产出");
+
+        let requests = server2.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "只跑 b、c: {}", requests.len());
+        for req in &requests {
+            let body = String::from_utf8_lossy(&req.body);
+            assert!(!body.contains("任务A"), "step a 不应重跑: {body}");
+        }
+    }
+
+    /// resume 校验：wf_id 不存在 / workflow_name 不匹配 / 非法 wf_id →
+    /// 明确报错（且不发任何模型请求）。
+    #[tokio::test]
+    async fn resume_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = three_step_wf();
+        let (ctx, _rx) = test_ctx_at(
+            test_config_at("http://127.0.0.1:1"),
+            dir.path().to_path_buf(),
+        );
+
+        // wf_id 不存在
+        let err = run_workflow_resume(&wf, "t", &ctx, "wf-ghost-123")
+            .await
+            .expect_err("不存在的 checkpoint 必须报错");
+        assert!(err.contains("not found"), "got: {err}");
+
+        // 非法 wf_id（路径穿越）
+        let err = run_workflow_resume(&wf, "t", &ctx, "../etc/passwd")
+            .await
+            .expect_err("非法 wf_id 必须报错");
+        assert!(err.contains("invalid resume wf_id"), "got: {err}");
+
+        // workflow_name 不匹配：手工写一个属于别的 workflow 的 checkpoint。
+        let runs_dir = dir.path().join(".latte").join("workflow-runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::write(
+            runs_dir.join("wf-other-1.jsonl"),
+            "{\"type\":\"meta\",\"wf_id\":\"wf-other-1\",\"workflow_name\":\"other_wf\",\
+             \"topic\":\"t\",\"started_at\":0}\n",
+        )
+        .unwrap();
+        let err = run_workflow_resume(&wf, "t", &ctx, "wf-other-1")
+            .await
+            .expect_err("workflow 不匹配必须报错");
+        assert!(
+            err.contains("belongs to workflow 'other_wf'"),
+            "got: {err}"
+        );
     }
 }

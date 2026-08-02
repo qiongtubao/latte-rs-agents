@@ -2552,6 +2552,7 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 
 {list}
 用 native function-calling 调 workflow 工具（参数 name + topic）。
+若 workflow 失败，错误信息会带 wf_id——用 name + resume=<wf_id> 从断点续跑，不要从头重跑。
 
 判断标准（分派前先想流程）：
 - 单点问题（读代码、改文件、审查某个具体实现）→ delegate
@@ -3323,7 +3324,16 @@ async fn register_workflow_tool(
             }),
             ("topic".into(), ToolInputProperty {
                 property_type: PropertyType::String,
-                description: Some("The task/topic the workflow should work on".into()),
+                description: Some("The task/topic the workflow should work on. May be omitted/empty when 'resume' is given (falls back to the checkpointed topic)".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }),
+            ("resume".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("Optional wf_id of a previous failed/interrupted run (shown in its error message as 'wf_id=...'). When given, completed steps are loaded from its checkpoint and skipped — the workflow continues from where it stopped instead of starting over".into()),
                 enum_values: None,
                 minimum: None,
                 maximum: None,
@@ -3333,7 +3343,7 @@ async fn register_workflow_tool(
         ]
         .into_iter()
         .collect(),
-        required: Some(vec!["name".into(), "topic".into()]),
+        required: Some(vec!["name".into()]),
         ..Default::default()
     };
 
@@ -3358,8 +3368,18 @@ async fn register_workflow_tool(
             let topic = input
                 .get("topic")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| tool_err("missing 'topic' field".into()))?
+                .unwrap_or_default()
                 .to_string();
+            let resume = input
+                .get("resume")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if resume.is_none() && topic.trim().is_empty() {
+                return Err(tool_err(
+                    "missing 'topic' field (required unless 'resume' is given)".into(),
+                ));
+            }
 
             let wf = crate::workflow::load_workflow(&name, &cwd).map_err(|e| {
                 let available = crate::workflow::list_workflows(&cwd)
@@ -3379,8 +3399,11 @@ async fn register_workflow_tool(
                 cancel_flag,
                 depth: 0,
             };
-            crate::workflow::run_workflow(&wf, &topic, &ctx)
-                .await
+            let result = match &resume {
+                Some(rid) => crate::workflow::run_workflow_resume(&wf, &topic, &ctx, rid).await,
+                None => crate::workflow::run_workflow(&wf, &topic, &ctx).await,
+            };
+            result
                 .map(|summary| serde_json::Value::String(strip_think_blocks(&summary)))
                 .map_err(tool_err)
         })
@@ -3587,6 +3610,52 @@ mod tests {
         }
         drop(guard);
         assert!(hint.contains("没有可用 workflow"), "hint: {hint}");
+    }
+
+    /// workflow 工具 schema 必须暴露可选的 `resume` 参数（断点续跑
+    /// 入口），且 `topic` 不再必填（resume 时用 checkpoint 的 topic）。
+    #[tokio::test]
+    async fn workflow_tool_schema_exposes_resume_param() {
+        let tm = build_tool_manager(&["workflow".to_string()])
+            .await
+            .expect("tool manager");
+        let merged = AgentConfig {
+            models: crate::config::ModelCatalog {
+                models: vec![],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: std::collections::HashMap::new(),
+        };
+        let resolver = crate::model_resolver::ModelResolver::from_config(&merged)
+            .expect("resolver from empty config");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let dir = tempfile::tempdir().unwrap();
+        register_workflow_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            dir.path().to_path_buf(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("register workflow tool");
+
+        let tool = tm.get_tool("workflow").expect("workflow tool registered");
+        assert!(
+            tool.input_schema.properties.contains_key("resume"),
+            "schema must expose resume: {:?}",
+            tool.input_schema.properties.keys().collect::<Vec<_>>()
+        );
+        let required = tool.input_schema.required.clone().unwrap_or_default();
+        assert!(required.iter().any(|r| r == "name"), "name stays required");
+        assert!(
+            !required.iter().any(|r| r == "topic"),
+            "topic optional (checkpoint supplies it on resume)"
+        );
     }
 
     #[test]
