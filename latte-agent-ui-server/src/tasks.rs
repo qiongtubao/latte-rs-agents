@@ -542,6 +542,11 @@ where
 #[derive(Deserialize)]
 pub struct ImportTasksRequest {
     pub tasks: Vec<ImportTask>,
+    /// 来源 plan 提案 id（PlanProposed 事件携带）。`Some` 时导入成功
+    /// 即视为用户批准该任务清单：对应 session 的 plan 阶段门从
+    /// `PendingApproval` 置为 `Approved`，解除实现类 delegate 拦截。
+    #[serde(default)]
+    pub plan_id: Option<String>,
 }
 
 /// 导入的单个任务：除 `title` 外全部可选；`subtasks` 最多一层。
@@ -731,7 +736,35 @@ pub fn import_tasks(
 ) -> Result<ImportTasksResponse, ApiError> {
     let mut store = b.tasks.write();
     let created = import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
+    drop(store);
+    // plan 阶段门：带 plan_id 的导入 = 用户批准该任务清单。找到持有
+    // 该 PendingApproval 的 session（plan 弹窗属于某个 session，stage
+    // 按 session 存），置 Approved 解除实现类 delegate 拦截。
+    if let Some(plan_id) = &req.plan_id {
+        approve_plan_stage(b, plan_id);
+    }
     Ok(ImportTasksResponse { created })
+}
+
+/// 把持有 `PendingApproval { plan_id }` 的 session 的 plan 阶段门置为
+/// `Approved`。只迁移精确匹配该 plan_id 且仍在等批准的 session——
+/// 已被下一条用户消息复位（Normal）或批准的是别的 plan 的不动。
+fn approve_plan_stage(b: &UiBackend, plan_id: &str) {
+    use latte_agent_core::controller::PlanStage;
+    for handle in b.sessions.read().values() {
+        let Some(controller) = handle.try_controller() else {
+            continue;
+        };
+        if controller.plan_stage()
+            == (PlanStage::PendingApproval {
+                plan_id: plan_id.to_string(),
+            })
+        {
+            controller.set_plan_stage(PlanStage::Approved {
+                plan_id: plan_id.to_string(),
+            });
+        }
+    }
 }
 
 pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView, ApiError> {
@@ -1428,6 +1461,85 @@ mod tests {
         store
             .create(title, "desc", 2, vec![], None, None, None, "user")
             .expect("create")
+    }
+
+    /// plan 阶段门：import 带 plan_id 时，持有对应 PendingApproval 的
+    /// session 的 controller 被置 Approved；不带 plan_id 不动 stage。
+    #[tokio::test]
+    async fn import_with_plan_id_approves_plan_stage() {
+        use latte_agent_core::controller::PlanStage;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = latte_agent_core::AgentConfig::default();
+        let resolver = latte_agent_core::ModelResolver::from_config(&cfg).expect("resolver");
+        let b = UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(dir.path().to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend");
+
+        // 两个 session：s1 持有 plan-manager-1 的 PendingApproval；
+        // s2 等的是另一个 plan（不应被动）。
+        let mut controllers = Vec::new();
+        for sid in ["ui-s1", "ui-s2"] {
+            let h = crate::sessions::create_session_handle(
+                sid.into(),
+                "manager",
+                &b.merged,
+                &b.resolver,
+                &b.cwd,
+                None,
+                None,
+                &b.subsession_store,
+            )
+            .await
+            .expect("session handle");
+            let c = h.try_controller().expect("spawned controller");
+            b.sessions.write().insert(sid.to_string(), Arc::new(h));
+            controllers.push(c);
+        }
+        controllers[0].set_plan_stage(PlanStage::PendingApproval {
+            plan_id: "plan-manager-1".into(),
+        });
+        controllers[1].set_plan_stage(PlanStage::PendingApproval {
+            plan_id: "plan-manager-2".into(),
+        });
+
+        // 带 plan_id 导入 → 仅 s1 被批准。
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "plan_id": "plan-manager-1",
+            "tasks": [{ "title": "实现 ringbuf" }]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).expect("import");
+        assert_eq!(resp.created.len(), 1);
+        assert_eq!(
+            controllers[0].plan_stage(),
+            PlanStage::Approved {
+                plan_id: "plan-manager-1".into()
+            }
+        );
+        assert_eq!(
+            controllers[1].plan_stage(),
+            PlanStage::PendingApproval {
+                plan_id: "plan-manager-2".into()
+            },
+            "别的 plan 的 session 不应被批准"
+        );
+
+        // 不带 plan_id 导入 → stage 不动。
+        controllers[1].set_plan_stage(PlanStage::Normal);
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": "无 plan 来源的手动导入" }]
+        }))
+        .expect("parse req");
+        import_tasks(&b, req).expect("import");
+        assert_eq!(controllers[1].plan_stage(), PlanStage::Normal);
     }
 
     #[test]

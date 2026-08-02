@@ -195,6 +195,9 @@ const stepMsgIds = new Map<string, string>();
     timestamp: string;
     /** plan 工具提交的任务候选：右键「导入任务看板」读它重开弹窗。 */
     planTasks?: ImportTask[];
+    /** PlanProposed 事件的 plan_id：补救路径重开弹窗时随导入请求带上，
+     *  让后端把对应 session 的 plan 阶段门置为 Approved。 */
+    planId?: string;
     el: HTMLElement;
   }
   const messageStore: MsgRecord[] = [];
@@ -247,6 +250,8 @@ const stepMsgIds = new Map<string, string>();
     filePath?: string;
     /** plan 工具提交的任务候选（PlanProposed 事件渲染的消息带它）。 */
     planTasks?: ImportTask[];
+    /** PlanProposed 事件的 plan_id（与 planTasks 配套，导入时透传后端）。 */
+    planId?: string;
   }): HTMLElement {
     const kind = opts2.kind;
     const ts = opts2.timestamp || fmtDisplayTime();
@@ -422,6 +427,7 @@ const stepMsgIds = new Map<string, string>();
       subagent: opts2.subagent ?? null,
       timestamp: ts,
       planTasks: opts2.planTasks,
+      planId: opts2.planId,
       el: row,
     });
     container.messagesEl.appendChild(row);
@@ -713,7 +719,7 @@ const stepMsgIds = new Map<string, string>();
       importBtn.disabled = true;
       importBtn.textContent = "导入中…";
       try {
-        const resp = await importTasks(selected);
+        const resp = await importTasks(selected, planId);
         addMessage({ kind: "system", content: `✅ 已导入 ${resp.created.length} 个任务到看板（backlog），请到任务看板查看` });
         overlay.remove();
       } catch (err) {
@@ -1247,7 +1253,7 @@ const stepMsgIds = new Map<string, string>();
         // 补救路径：从消息记录上存的结构化 planTasks 重开导入弹窗
         // （不靠文本解析）。仅带 planTasks 的消息有此入口。
         if (record.planTasks && record.planTasks.length > 0) {
-          openPlanImportModal(record.planTasks);
+          openPlanImportModal(record.planTasks, record.planId);
         } else {
           alert("该消息没有可导入的任务候选");
         }
@@ -1710,6 +1716,7 @@ const stepMsgIds = new Map<string, string>();
           kind: "system",
           content: `📋 ${e.role_id} 提交了 ${n} 个任务候选（${e.plan_id}），请在弹窗勾选导入任务看板`,
           planTasks: e.tasks,
+          planId: e.plan_id,
         });
         // 气泡内附「导入任务看板」按钮，作为弹窗入口。
         const btn = document.createElement("button");

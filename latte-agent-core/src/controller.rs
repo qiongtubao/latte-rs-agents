@@ -446,6 +446,57 @@ pub struct PlanTask {
     pub subtasks: Vec<PlanTask>,
 }
 
+/// plan 阶段门（oh-my-pi plan-mode 写门禁在 delegate 层的等价物）：
+/// manager 调 `plan` 工具提交任务清单后、用户在弹窗导入任务看板前，
+/// 禁止 delegate 派发实现类角色（programmer*/devops*）。
+/// 每个 [`ChatController`] session 一份，经 [`SharedPlanStage`] 共享给
+/// plan/delegate 工具 handler 与 driver。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanStage {
+    /// 初始 / 新决策周期：不拦截任何 delegate。
+    Normal,
+    /// `plan` 工具已提交任务清单（记录 plan_id），等待用户在弹窗导入。
+    /// 此状态下实现类角色的 delegate 调用被工具层拒绝。
+    PendingApproval { plan_id: String },
+    /// 用户已通过 `POST /api/tasks/import` 导入该 plan 的任务
+    /// （语义等同 Normal，不再拦截；记下被批准的 plan_id）。
+    Approved { plan_id: String },
+}
+
+impl Default for PlanStage {
+    fn default() -> Self {
+        PlanStage::Normal
+    }
+}
+
+/// session 内共享的 plan 阶段门状态（controller / 工具 handler / driver
+/// 三方读写，锁内无 await，parking_lot 即可）。
+pub type SharedPlanStage = Arc<parking_lot::RwLock<PlanStage>>;
+
+/// 实现类角色判定：`programmer` / `programmer_*` / `devops` / `devops_*`。
+/// 分析/设计/审查类（pm、architect、designer、reviewer、tester、
+/// security、tech_writer 及其细分）不在此列。
+fn is_implementation_role(role_id: &str) -> bool {
+    role_id == "programmer"
+        || role_id.starts_with("programmer_")
+        || role_id == "devops"
+        || role_id.starts_with("devops_")
+}
+
+/// plan 阶段门检查：`PendingApproval` 且目标是实现类角色时返回拒绝
+/// 消息（含 plan_id）；其余情况放行（`None`）。
+fn plan_gate_rejection(stage: &SharedPlanStage, role_id: &str) -> Option<String> {
+    let guard = stage.read();
+    match &*guard {
+        PlanStage::PendingApproval { plan_id } if is_implementation_role(role_id) => {
+            Some(format!(
+                "任务清单尚未获用户批准（plan_id={plan_id}），请等待用户在弹窗导入任务看板，或先询问用户确认后再派发实现类任务（'{role_id}' 属于实现类角色）。"
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// `ask` 工具的单个选项。前端 `ChoiceRequested` 弹框逐项渲染。
 /// 字段与前端 `api.ts` 的 `ChoiceOption` 同构。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -581,6 +632,10 @@ pub struct ChatController {
     /// review the user's current question (user input is not part of
     /// the `ChatEvent` broadcast stream).
     last_user_input: Arc<parking_lot::Mutex<String>>,
+    /// plan 阶段门（见 [`PlanStage`]）：plan 工具 handler 置
+    /// `PendingApproval`，ui-server 的任务导入置 `Approved`，driver
+    /// 收到下一条用户消息复位 `Normal`。
+    plan_stage: SharedPlanStage,
 }
 
 impl ChatController {
@@ -596,6 +651,7 @@ impl ChatController {
             turn_cancel_flag: Arc::new(AtomicBool::new(false)),
             advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
+            plan_stage: Arc::new(parking_lot::RwLock::new(PlanStage::Normal)),
         }
     }
 
@@ -613,6 +669,7 @@ impl ChatController {
         let pause_flag = self.pause_requested.clone();
         let turn_cancel_flag = self.turn_cancel_flag.clone();
         let advisor_hints = self.advisor_hints.clone();
+        let plan_stage = self.plan_stage.clone();
 
         tokio::spawn(async move {
             run_driver(
@@ -623,6 +680,7 @@ impl ChatController {
                 pause_flag,
                 turn_cancel_flag,
                 advisor_hints,
+                plan_stage,
             )
             .await;
         });
@@ -667,6 +725,17 @@ impl ChatController {
     /// The most recent user question recorded by `submit_input`.
     pub fn last_user_input(&self) -> String {
         self.last_user_input.lock().clone()
+    }
+
+    /// 当前 plan 阶段门状态（见 [`PlanStage`]）。
+    pub fn plan_stage(&self) -> PlanStage {
+        self.plan_stage.read().clone()
+    }
+
+    /// 设置 plan 阶段门状态。调用方：`POST /api/tasks/import`
+    /// （置 `Approved`）；driver / 工具 handler 走内部共享句柄直接写。
+    pub fn set_plan_stage(&self, stage: PlanStage) {
+        *self.plan_stage.write() = stage;
     }
 
     /// Clone of the event broadcast sender. Used by the AdvisorMonitor
@@ -931,6 +1000,7 @@ async fn run_driver(
     pause_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
+    plan_stage: SharedPlanStage,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
@@ -943,6 +1013,7 @@ async fn run_driver(
             &*pause_flag,
             turn_cancel_flag,
             advisor_hints,
+            plan_stage,
         )
         .await;
     } else {
@@ -953,6 +1024,7 @@ async fn run_driver(
             cancel_flag,
             turn_cancel_flag,
             advisor_hints,
+            plan_stage,
         )
         .await;
     }
@@ -970,6 +1042,7 @@ async fn run_multi_role_loop(
     pause_flag: &AtomicBool,
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
+    plan_stage: SharedPlanStage,
 ) {
     // Resolve worktree root
     let repo_root = match WorkspaceManager::resolve_repo_root(&config.cwd) {
@@ -1173,6 +1246,7 @@ async fn run_multi_role_loop(
             cancel_flag.clone(),
             turn_cancel_flag.clone(),
             config.advisor_monitor.runner_gate(),
+            &plan_stage,
         )
         .await
         {
@@ -1400,6 +1474,9 @@ async fn run_multi_role_loop(
 
         // Plain text = manager input
         {
+            // plan 阶段门复位：新的用户消息 = 新的决策周期，上一轮
+            // 未批准的 plan 不再约束 delegate。
+            *plan_stage.write() = PlanStage::Normal;
             let mut mgr = session_arc.lock().await;
             mgr.append_to_role(
                 "manager",
@@ -1654,6 +1731,7 @@ async fn run_single_role_loop(
     cancel_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
+    plan_stage: SharedPlanStage,
 ) {
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
@@ -1685,6 +1763,7 @@ async fn run_single_role_loop(
         cancel_flag.clone(),
         turn_cancel_flag.clone(),
         config.advisor_monitor.runner_gate(),
+        &plan_stage,
     )
         .await
     {
@@ -1786,7 +1865,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1808,7 +1887,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1895,6 +1974,9 @@ async fn run_single_role_loop(
                         }
 
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
+                        // plan 阶段门复位：新的用户消息 = 新的决策周期，
+                        // 上一轮未批准的 plan 不再约束 delegate。
+                        *plan_stage.write() = PlanStage::Normal;
                         let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
                             role_id: current_role.clone(),
@@ -1950,7 +2032,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -1965,7 +2047,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = new_runner.with_advisor_hints(advisor_hints.clone());
@@ -2027,6 +2109,9 @@ async fn build_runner(
     // `run_turn_gated` 在产出被接受前先过 `check_response_gates`；
     // `None` 时 gate 缺省，`run_turn_gated` 等价 `run_turn`。
     advisor_gate: Option<GateConfig>,
+    // plan 阶段门共享句柄：透传给 `register_plan_tool`（置
+    // PendingApproval）与 `register_delegate_tool`（拦截实现类角色）。
+    plan_stage: &SharedPlanStage,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -2103,6 +2188,7 @@ async fn build_runner(
                 cancel_flag.clone(),
                 turn_cancel_flag.clone(),
                 advisor_gate.clone(),
+                plan_stage.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -2139,7 +2225,7 @@ async fn build_runner(
         // 把结构化任务清单提交给用户在弹窗里勾选导入任务看板。
         // manager 在 implementation_plan workflow 跑完后调它。
         if role.allowed_tools.iter().any(|t| t == "plan") {
-            register_plan_tool(&tm, event_tx.clone(), role_id.to_string())
+            register_plan_tool(&tm, event_tx.clone(), role_id.to_string(), plan_stage.clone())
                 .map_err(|e| AgentError::Tool(format!("register plan: {e}")))?;
         }
         // Any role with "ask" in allowed_tools gets the ask tool:
@@ -2481,10 +2567,16 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 /// LLM 的 turn 结束；弹窗是纯 UI 侧异步行为，用户何时导入都行。
 /// 若用户误关弹窗，可右键 PlanProposed 消息选「导入任务看板」补救
 /// （右键读消息上存的结构化 tasks，不靠文本解析）。
+///
+/// plan 阶段门：发出 PlanProposed 后把 `plan_stage` 置为
+/// [`PlanStage::PendingApproval`]——用户导入任务看板（置 Approved）
+/// 或发下一条消息（复位 Normal）之前，`register_delegate_tool` 的
+/// handler 会拒绝派发实现类角色（programmer*/devops*）。
 pub(crate) fn register_plan_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
+    plan_stage: SharedPlanStage,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
@@ -2516,6 +2608,7 @@ pub(crate) fn register_plan_tool(
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let event_tx = event_tx.clone();
         let role_id = handler_role_id.clone();
+        let plan_stage = plan_stage.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -2550,6 +2643,11 @@ pub(crate) fn register_plan_tool(
                 plan_id: plan_id.clone(),
                 tasks,
             });
+            // plan 阶段门：任务清单已提交，等用户在弹窗导入任务看板；
+            // 批准前 delegate 实现类角色会被工具层拒绝。
+            *plan_stage.write() = PlanStage::PendingApproval {
+                plan_id: plan_id.clone(),
+            };
             Ok(serde_json::Value::String(format!(
                 "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。"
             )))
@@ -2781,6 +2879,8 @@ async fn register_delegate_tool(
     // Advisor pre-persistence gate，透传自 build_runner；`Some` 时
     // specialist runner 的产出也先过 D5/D6 gate 再返回给 manager。
     advisor_gate: Option<GateConfig>,
+    // plan 阶段门共享句柄：`PendingApproval` 时拒绝派发实现类角色。
+    plan_stage: SharedPlanStage,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -2844,6 +2944,7 @@ async fn register_delegate_tool(
         let advisor_gate = advisor_gate.clone();
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
+        let plan_stage = plan_stage.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -2857,6 +2958,14 @@ async fn register_delegate_tool(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| tool_err("missing 'task' field".into()))?
                 .to_string();
+
+            // plan 阶段门：任务清单已提交但未获用户批准时，禁止派发
+            // 实现类角色（programmer*/devops*）；分析/设计/审查类放行。
+            // 在分配 subsession / 发 DelegateStarted 之前拦截，拒绝
+            // 不留任何副作用。
+            if let Some(msg) = plan_gate_rejection(&plan_stage, &role_id) {
+                return Err(tool_err(msg));
+            }
 
             // 2. Allocate a subsession so the specialist's full event
             //    log is captured. The main chat SSE stream sees only
@@ -3729,6 +3838,303 @@ mod tests {
         assert!(tasks[1].get("description").is_none(), "空 description 应省略");
         assert!(tasks[1].get("priority").is_none(), "None priority 应省略");
         assert!(tasks[1].get("labels").is_none(), "空 labels 应省略");
+    }
+
+    // ─── plan 阶段门（PlanStage） ─────────────────────────────────
+    //
+    // manager 调 plan 工具 → PendingApproval；用户导入任务看板 →
+    // Approved；下一条用户消息 → Normal。PendingApproval 期间
+    // delegate 实现类角色（programmer*/devops*）被工具层拒绝。
+
+    /// 造一个共享阶段门句柄。
+    fn fresh_plan_stage() -> SharedPlanStage {
+        Arc::new(parking_lot::RwLock::new(PlanStage::Normal))
+    }
+
+    #[test]
+    fn plan_gate_rejects_implementation_roles_allows_analysis() {
+        let stage = fresh_plan_stage();
+        // Normal：一切放行。
+        assert!(plan_gate_rejection(&stage, "programmer").is_none());
+        assert!(plan_gate_rejection(&stage, "devops").is_none());
+
+        *stage.write() = PlanStage::PendingApproval {
+            plan_id: "plan-manager-7".into(),
+        };
+        // 实现类角色被拒（含细分前缀），消息带 plan_id。
+        for rid in ["programmer", "programmer_backend", "devops", "devops_k8s"] {
+            let msg = plan_gate_rejection(&stage, rid)
+                .unwrap_or_else(|| panic!("{rid} 应被阶段门拒绝"));
+            assert!(msg.contains("plan-manager-7"), "{msg}");
+            assert!(msg.contains("尚未获用户批准"), "{msg}");
+        }
+        // 分析/设计/审查类角色放行。
+        for rid in ["pm", "architect", "architect_system", "designer_ui", "reviewer", "tester", "security", "tech_writer"] {
+            assert!(
+                plan_gate_rejection(&stage, rid).is_none(),
+                "{rid} 不应被阶段门拦截"
+            );
+        }
+
+        // Approved：等同 Normal，不再拦截。
+        *stage.write() = PlanStage::Approved {
+            plan_id: "plan-manager-7".into(),
+        };
+        assert!(plan_gate_rejection(&stage, "programmer").is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_tool_call_sets_pending_approval_stage() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone())
+            .expect("register plan");
+
+        let out = tm
+            .execute(
+                "plan",
+                serde_json::json!({
+                    "tasks": [{ "title": "实现 ringbuf 核心读写" }]
+                }),
+                None,
+            )
+            .await
+            .expect("plan tool call");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("plan_id=plan-manager-"), "{text}");
+
+        // 事件与阶段门一致：同一 plan_id。
+        let ev = rx.try_recv().expect("PlanProposed event");
+        let ChatEvent::PlanProposed { plan_id, .. } = ev else {
+            panic!("expected PlanProposed, got {ev:?}");
+        };
+        assert_eq!(
+            stage.read().clone(),
+            PlanStage::PendingApproval {
+                plan_id: plan_id.clone()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_tool_gate_blocks_programmer_allows_pm() {
+        use crate::config::ModelCatalog;
+        use crate::role::RoleTemplate;
+
+        let mk_role = |id: &str| RoleTemplate {
+            id: id.into(),
+            name: id.into(),
+            category: "engineering".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: None,
+            tools: vec![],
+            icon: String::new(),
+            skills: vec![],
+            code_paths: vec![],
+        };
+        let merged = AgentConfig {
+            models: ModelCatalog {
+                models: vec![],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [
+                ("programmer".to_string(), mk_role("programmer")),
+                ("pm".to_string(), mk_role("pm")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        *stage.write() = PlanStage::PendingApproval {
+            plan_id: "plan-manager-3".into(),
+        };
+        register_delegate_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "ui-test".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            stage.clone(),
+        )
+        .await
+        .expect("register delegate");
+
+        // 实现类角色：被阶段门拒绝（中文错误 + plan_id），且拒绝发生在
+        // 模型解析之前（配置里没有任何模型，若穿透门禁会先报模型错误）。
+        let err = tm
+            .execute(
+                "delegate",
+                serde_json::json!({ "role": "programmer", "task": "改代码" }),
+                None,
+            )
+            .await
+            .expect_err("programmer 应被门禁拒绝");
+        let msg = err.to_string();
+        assert!(msg.contains("尚未获用户批准"), "{msg}");
+        assert!(msg.contains("plan-manager-3"), "{msg}");
+
+        // 分析类角色：穿透门禁（后续因无模型而失败，但绝不是门禁错误）。
+        let err = tm
+            .execute(
+                "delegate",
+                serde_json::json!({ "role": "pm", "task": "写 PRD" }),
+                None,
+            )
+            .await
+            .expect_err("无模型时 pm 也会在后续步骤失败");
+        assert!(
+            !err.to_string().contains("尚未获用户批准"),
+            "pm 不应被阶段门拦截: {err}"
+        );
+
+        // 批准后实现类同样穿透门禁（失败于模型解析而非门禁）。
+        *stage.write() = PlanStage::Approved {
+            plan_id: "plan-manager-3".into(),
+        };
+        let err = tm
+            .execute(
+                "delegate",
+                serde_json::json!({ "role": "programmer", "task": "改代码" }),
+                None,
+            )
+            .await
+            .expect_err("无模型时 programmer 也会在后续步骤失败");
+        assert!(
+            !err.to_string().contains("尚未获用户批准"),
+            "Approved 后不应再拦截: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_message_resets_plan_stage_to_normal() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "plain reply（占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰）" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+            code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(64);
+        // 新 controller 默认 Normal。
+        assert_eq!(controller.plan_stage(), PlanStage::Normal);
+        let mut rx = controller.spawn(cfg).await;
+
+        // 模拟 plan 已提交待批准；下一条用户消息应复位 Normal。
+        controller.set_plan_stage(PlanStage::PendingApproval {
+            plan_id: "plan-manager-9".into(),
+        });
+        controller.submit_input("继续").await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("recv");
+            if matches!(ev, ChatEvent::UserMessage { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.plan_stage(),
+            PlanStage::Normal,
+            "driver 收到用户消息后阶段门必须复位 Normal"
+        );
+
+        controller.abort().await;
     }
 
     #[test]

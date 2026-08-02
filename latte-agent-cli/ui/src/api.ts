@@ -978,11 +978,15 @@ export async function deleteTask(id: string): Promise<void> {
 }
 
 /** POST /api/tasks/import：批量导入任务（进 backlog），返回新建任务 id 列表。
- *  校验失败时后端返回 400 + 纯文本错误信息。 */
+ *  校验失败时后端返回 400 + 纯文本错误信息。
+ *  planId 来自 PlanProposed 事件：带上即视为用户批准该任务清单，
+ *  后端会把对应 session 的 plan 阶段门置为 Approved（解除实现类
+ *  delegate 拦截）。 */
 export async function importTasks(
   tasks: ImportTask[],
+  planId?: string,
 ): Promise<{ created: string[] }> {
-  return getTransport().request("POST", "/api/tasks/import", { tasks });
+  return getTransport().request("POST", "/api/tasks/import", { tasks, plan_id: planId });
 }
 
 

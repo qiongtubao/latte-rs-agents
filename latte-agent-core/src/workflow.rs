@@ -653,9 +653,13 @@ async fn build_role_runner(
             .await
             .map_err(|e| format!("tools for '{role_id}': {e}"))?;
         // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
-        // （与 controller::build_runner 对齐）
+        // （与 controller::build_runner 对齐）。workflow 引擎不走
+        // delegate 工具，阶段门无人消费——给一个私有句柄即可（plan
+        // 提案仍会广播 PlanProposed 事件，只是不驱动 delegate 门禁）。
         if role.allowed_tools.iter().any(|t| t == "plan") {
-            register_plan_tool(&rtm, event_tx.clone(), role_id.to_string())
+            let plan_stage: crate::controller::SharedPlanStage =
+                Arc::new(parking_lot::RwLock::new(crate::controller::PlanStage::Normal));
+            register_plan_tool(&rtm, event_tx.clone(), role_id.to_string(), plan_stage)
                 .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
         }
         AgentRunner::new_with_tools(agent, rtm, 0)
