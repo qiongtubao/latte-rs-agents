@@ -234,6 +234,11 @@ pub enum DetectorKind {
     /// only after the previous finished). Independent specialist
     /// tasks should be dispatched in one parallel batch.
     SerialDelegates,
+    /// D9: watched role ended a turn with zero tool calls after a
+    /// substantial user message. Might be a legit direct answer, but
+    /// for complex tasks the correct path is explore→ask→plan——the
+    /// hint reminds the manager of the flow (advisory, not blocking).
+    NoToolTurn,
 }
 
 impl DetectorKind {
@@ -247,6 +252,7 @@ impl DetectorKind {
             Self::ToolCallEcho => "D6",
             Self::WorkflowFailed => "D7",
             Self::SerialDelegates => "D8",
+            Self::NoToolTurn => "D9",
         }
     }
 }
@@ -1067,6 +1073,9 @@ struct MonitorState {
     /// errors without an intervening Ok result.
     specialist_error_streak: usize,
     specialist_streak_warned: bool,
+    /// D9: the most recent user message, used to judge whether a
+    /// zero-tool turn is suspicious (only substantial requests count).
+    last_user_text: String,
 }
 
 impl MonitorState {
@@ -1080,6 +1089,7 @@ impl MonitorState {
             serial_delegate_streak: 0,
             specialist_error_streak: 0,
             specialist_streak_warned: false,
+            last_user_text: String::new(),
         }
     }
 
@@ -1140,9 +1150,28 @@ impl MonitorState {
                     if let Some(f) = self.detectors.finish_turn(content) {
                         findings.push(f);
                     }
+                    // D9: 整轮零工具调用就收尾。对复杂任务来说正确
+                    // 路径是 explore→ask→plan；只在用户消息有实质
+                    // 内容（≥20 字符，中文一句话的量级）时提醒，
+                    // 闲聊/简短问答不误报。
+                    if self.detectors.tool_use_count == 0
+                        && self.last_user_text.chars().count() >= 20
+                    {
+                        findings.push(Finding {
+                            kind: DetectorKind::NoToolTurn,
+                            hint: "你这一轮没有调用任何工具就结束了。如果这是复杂任务（多文件/多步骤/有取舍分叉），正确路径是 explore → ask → implementation_plan → plan 提交；如果是简单任务且已答完，或信息确实只够直接回答，忽略本提醒。".into(),
+                            evidence: format!(
+                                "zero-tool turn after user message ({} chars)",
+                                self.last_user_text.chars().count()
+                            ),
+                        });
+                    }
                     self.reset_turn_state();
                     turn_ended = true;
                 }
+            }
+            ChatEvent::UserMessage { text } => {
+                self.last_user_text = text.clone();
             }
             ChatEvent::ToolUse {
                 role_id,
@@ -1668,6 +1697,37 @@ mod tests {
         assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
         // 走的是 watched-role 检测器，不污染 specialist streak
         assert_eq!(s.specialist_error_streak, 0);
+    }
+
+    // ── D9: zero-tool turn after substantial user message ─────────
+
+    #[test]
+    fn d9_fires_on_zero_tool_turn_after_substantial_request() {
+        let mut s = state();
+        s.observe(&ChatEvent::UserMessage {
+            text: "帮我分析一下这个项目的架构并给出三个可落地的重构建议".into(),
+        });
+        let out = s.observe(&role_turn("这个项目架构不错，建议如下：……"));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::NoToolTurn);
+        assert!(out.findings[0].hint.contains("没有调用任何工具"));
+        assert!(out.turn_ended);
+    }
+
+    #[test]
+    fn d9_silent_with_short_message_or_tool_use() {
+        // 短消息（闲聊）不报
+        let mut s = state();
+        s.observe(&ChatEvent::UserMessage { text: "你好".into() });
+        assert!(s.observe(&role_turn("你好！有什么可以帮你？")).findings.is_empty());
+
+        // 用了工具不报
+        let mut s = state();
+        s.observe(&ChatEvent::UserMessage {
+            text: "帮我分析一下这个项目的架构并给出三个可落地的重构建议".into(),
+        });
+        s.observe(&tool_use("search", "{\"q\":\"arch\"}"));
+        assert!(s.observe(&role_turn("查完了，结论如下：……")).findings.is_empty());
     }
 
     // ── D7: workflow failed ────────────────────────────────────────
