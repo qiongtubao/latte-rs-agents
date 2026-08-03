@@ -1662,6 +1662,31 @@ output_key = "exploration"
         assert_eq!(ids, ["tests_first", "implement", "spec_review", "quality_review"]);
     }
 
+    #[test]
+    fn learn_workflow_structure() {
+        let raw = include_str!("../../config/workflows/learn.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("learn should validate");
+        let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["investigate", "structure", "write", "verify"]);
+        // investigate：防幻觉——要求行号锚点
+        assert!(wf.steps[0].task_text().contains("行号"));
+        // structure：六层骨架契约
+        let structure = &wf.steps[1];
+        for layer in ["L0", "L1", "L2", "L3", "L4", "L5", "L6"] {
+            assert!(
+                structure.output_contract.require.iter().any(|r| r == layer),
+                "structure contract missing {layer}"
+            );
+        }
+        // write：必须产出 Mermaid 图与名词解释
+        let write = &wf.steps[2];
+        assert!(write.output_contract.require.iter().any(|r| r == "```mermaid"));
+        assert!(write.output_contract.require.iter().any(|r| r == "名词解释"));
+        // verify：reviewer + programmer 接力（校对 + 修正）
+        assert_eq!(wf.steps[3].roles(), vec!["reviewer", "programmer"]);
+    }
+
     /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
     /// 使用 include_str! 直接引用真文件，确保 TOML 编辑后测试立即红。
     #[test]
