@@ -134,8 +134,16 @@ pub struct WorkflowStepDef {
     /// 作为重试上限），耗尽则 step 失败。默认空契约 = 不校验。
     #[serde(default)]
     pub output_contract: OutputContract,
+    /// 跨 step 循环条件（仅串行引擎）：本 step 完成后检查产出是否包含
+    /// 该子串，包含 = 通过继续；不包含则跳回 `loop_back_to` 指定的 step
+    /// 重做（缺省 = 自己），并把本 step 产出作为"上轮审查反馈"批注预置
+    /// 进跳回目标的 prompt。迭代上限 `max_iterations`（缺省 3，硬上限
+    /// 10），耗尽仍不满足 → workflow 失败。
     #[serde(default)]
     pub loop_until: Option<String>,
+    /// `loop_until` 不满足时跳回的 step id（缺省 = 本 step 自己）。
+    #[serde(default)]
+    pub loop_back_to: Option<String>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
     /// Nest another workflow as this step: the named workflow runs with
@@ -203,6 +211,9 @@ impl WorkflowDef {
     /// and in [`load_workflow`] so that invalid TOML is caught
     /// at parse time rather than during execution.
     pub fn validate(&self) -> Result<(), String> {
+        let uses_dag = self.uses_dependency_dag();
+        let step_ids: std::collections::HashSet<&str> =
+            self.steps.iter().map(|s| s.id.as_str()).collect();
         for step in &self.steps {
             if let Some(nested) = &step.workflow {
                 if nested.trim().is_empty() {
@@ -220,6 +231,26 @@ impl WorkflowDef {
                 if step.role.is_some() || !step.speakers.is_empty() {
                     return Err(format!(
                         "step '{}': `workflow` (nested) is mutually exclusive with role/speakers",
+                        step.id
+                    ));
+                }
+                if step.loop_until.is_some() {
+                    return Err(format!(
+                        "step '{}': `loop_until` 与嵌套 workflow 互斥（嵌套 step 不参与循环）",
+                        step.id
+                    ));
+                }
+            }
+            if step.loop_until.is_some() && uses_dag {
+                return Err(format!(
+                    "step '{}': `loop_until` 循环仅支持串行 workflow（存在 depends_on 的 DAG 调度不支持循环）",
+                    step.id
+                ));
+            }
+            if let Some(target) = &step.loop_back_to {
+                if !step_ids.contains(target.as_str()) {
+                    return Err(format!(
+                        "step '{}': loop_back_to 指向不存在的 step '{target}'",
                         step.id
                     ));
                 }
@@ -1026,11 +1057,19 @@ async fn run_workflow_serial(
     }
 
     for round in 0..wf.effective_max_rounds() {
-        for (idx, step) in wf.steps.iter().enumerate() {
+        // 跨 step 循环（loop_until）的每轮状态：迭代计数按 loop_until
+        // 所在 step 的完成次数计（key = step 下标）；pending_feedback
+        // 是跳回时预置进目标 step prompt 的"上轮审查反馈"批注。
+        let mut loop_iters: HashMap<usize, usize> = HashMap::new();
+        let mut pending_feedback: Option<String> = None;
+        let mut idx = 0;
+        while idx < wf.steps.len() {
+            let step = &wf.steps[idx];
             if ctx.cancel_flag.load(Ordering::SeqCst) {
                 return WfOutcome::Cancelled;
             }
             if done_steps.contains(step.id.as_str()) {
+                idx += 1;
                 continue;
             }
             let first_role = step.roles().first().cloned().unwrap_or_default();
@@ -1077,6 +1116,7 @@ async fn run_workflow_serial(
                     vars.insert(key.clone(), last_output.clone());
                 }
                 ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
+                idx += 1;
                 continue;
             }
             for speaker in step.roles() {
@@ -1094,7 +1134,15 @@ async fn run_workflow_serial(
                 let mut step_vars = vars.clone();
                 step_vars.insert("step_id".into(), step.id.clone());
                 step_vars.insert("speaker".into(), speaker.clone());
-                let base_prompt = wf.render_task(step, &step_vars);
+                let mut base_prompt = wf.render_task(step, &step_vars);
+                // 循环返工批注：跳回目标 step 的第一个 speaker 的 prompt
+                // = 渲染后的 task + 上轮审查反馈（loop step 的产出）。
+                if step_transcript.is_empty() {
+                    if let Some(feedback) = pending_feedback.take() {
+                        base_prompt =
+                            format!("{base_prompt}\n\n【上轮审查反馈】\n{feedback}");
+                    }
+                }
                 let mut prompt = if step_transcript.is_empty() {
                     base_prompt
                 } else {
@@ -1156,6 +1204,44 @@ async fn run_workflow_serial(
                 vars.insert(key.clone(), last_output.clone());
             }
             ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
+            // 跨 step 循环：产出不含 loop_until 子串 → 跳回 loop_back_to
+            // （缺省 = 自己）重做，本 step 产出作为批注预置进目标 prompt；
+            // 迭代上限 max_iterations（缺省 3，硬上限 10），耗尽即失败。
+            if let Some(cond) = &step.loop_until {
+                if !last_output.contains(cond.as_str()) {
+                    let count = {
+                        let c = loop_iters.entry(idx).or_insert(0);
+                        *c += 1;
+                        *c
+                    };
+                    let max = step.max_iterations.unwrap_or(3).min(10);
+                    if count >= max {
+                        let summary: String = last_output.chars().take(200).collect();
+                        return WfOutcome::Failed(format!(
+                            "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                             （已达 max_iterations={max}），最后一次产出摘要：{summary}",
+                            step.id
+                        ));
+                    }
+                    let target_id = step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
+                    let target_idx = wf
+                        .steps
+                        .iter()
+                        .position(|s| s.id == target_id)
+                        .expect("validate 已保证 loop_back_to 指向存在的 step");
+                    let _ = ctx.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "↩ 第 {count} 轮返工：step '{}' 产出未满足循环条件\
+                             「{cond}」，跳回 '{target_id}' 重做",
+                            step.id
+                        ),
+                    });
+                    pending_feedback = Some(last_output.clone());
+                    idx = target_idx;
+                    continue;
+                }
+            }
+            idx += 1;
         }
     }
 
@@ -2662,5 +2748,324 @@ depends_on = ["b"]
             err.contains("belongs to workflow 'other_wf'"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    use crate::config::{ModelCatalog, ModelDef};
+    use crate::role::RoleTemplate;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    fn openai_body(content: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    /// 单模型（premium tier 指向 wiremock）+ 三角色的测试配置。
+    fn test_config_at(base_url: &str) -> Arc<AgentConfig> {
+        let role = |id: &str| RoleTemplate {
+            id: id.into(),
+            name: id.into(),
+            category: "execution".into(),
+            model_tier: "premium".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: None,
+            tools: vec![],
+            icon: String::new(),
+            skills: vec![],
+            code_paths: vec![],
+        };
+        let roles = HashMap::from([
+            ("programmer".to_string(), role("programmer")),
+            ("tester".to_string(), role("tester")),
+            ("reviewer".to_string(), role("reviewer")),
+        ]);
+        Arc::new(AgentConfig {
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "Test Premium".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: base_url.into(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles,
+        })
+    }
+
+    fn test_ctx(config: Arc<AgentConfig>) -> (WorkflowRunContext, broadcast::Receiver<ChatEvent>) {
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, event_rx) = broadcast::channel(64);
+        (
+            WorkflowRunContext {
+                merged: config,
+                resolver,
+                default_params: GenerateParams::default(),
+                cwd: std::env::temp_dir(),
+                event_tx,
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                depth: 0,
+            },
+            event_rx,
+        )
+    }
+
+    /// implement → spec_review（loop_until=PASS, 跳回 implement）→ quality_review。
+    fn loop_wf(max_iterations: usize) -> WorkflowDef {
+        let raw = format!(
+            r#"
+name = "loop_demo"
+[[steps]]
+id = "implement"
+role = "programmer"
+task = "实现任务：{{{{topic}}}}"
+output_key = "impl"
+[[steps]]
+id = "spec_review"
+role = "tester"
+task = "审查规格：{{{{impl}}}}"
+output_key = "review"
+loop_until = "VERDICT: PASS"
+loop_back_to = "implement"
+max_iterations = {max_iterations}
+[[steps]]
+id = "quality_review"
+role = "reviewer"
+task = "质量审查：{{{{review}}}}"
+output_key = "quality"
+"#
+        );
+        toml::from_str(&raw).expect("valid TOML")
+    }
+
+    fn bodies_containing(requests: &[wiremock::Request], pat: &str) -> Vec<String> {
+        requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .filter(|b| b.contains(pat))
+            .collect()
+    }
+
+    /// 审查 FAIL → 自动跳回 implement 返工（模型调 2 次、第二次请求带
+    /// "上轮审查反馈"批注与 FAIL 内容）→ 第二次审查 PASS → 流程继续到
+    /// quality_review 完成。
+    #[tokio::test]
+    async fn serial_loop_rework_then_pass() {
+        let server = wiremock::MockServer::start().await;
+        // wiremock 0.6 按挂载顺序取第一个命中的 mock：具体的审查 mock
+        // 先挂，通用兜底最后挂。
+        // 首次审查（只生效一次）→ FAIL。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("审查规格"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: FAIL\nGAPS: 缺少边界测试",
+            )))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("审查规格"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: PASS\nEVIDENCE: 逐条核对全部通过",
+            )))
+            .mount(&server)
+            .await;
+        // 兜底：implement / quality 通用产出。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("通用产出")))
+            .mount(&server)
+            .await;
+
+        let (ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        let out = run_workflow(&loop_wf(3), "测试主题", &ctx)
+            .await
+            .expect("返工后 PASS 应成功");
+        assert_eq!(out, "通用产出", "最后一步 quality_review 的产出");
+
+        let requests = server.received_requests().await.unwrap();
+        let impl_reqs = bodies_containing(&requests, "实现任务");
+        assert_eq!(impl_reqs.len(), 2, "implement 的模型被调 2 次: {}", requests.len());
+        assert!(
+            impl_reqs[1].contains("【上轮审查反馈】"),
+            "返工 prompt 带审查反馈批注: {}",
+            impl_reqs[1]
+        );
+        assert!(
+            impl_reqs[1].contains("缺少边界测试"),
+            "批注含 FAIL 审查内容: {}",
+            impl_reqs[1]
+        );
+        let review_reqs = bodies_containing(&requests, "审查规格");
+        assert_eq!(review_reqs.len(), 2, "spec_review 跑 2 次: {}", requests.len());
+
+        // 返工 Status 事件。
+        let mut status_msgs: Vec<String> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::Status { message } = ev {
+                status_msgs.push(message);
+            }
+        }
+        assert!(
+            status_msgs
+                .iter()
+                .any(|m| m.contains("第 1 轮返工") && m.contains("implement")),
+            "应有返工 Status: {status_msgs:?}"
+        );
+    }
+
+    /// 循环耗尽：审查恒 FAIL，max_iterations=2 → Failed，消息含循环条件、
+    /// 迭代次数与最后一次产出摘要；implement / spec_review 各跑 2 次。
+    #[tokio::test]
+    async fn serial_loop_exhausted_fails() {
+        let server = wiremock::MockServer::start().await;
+        // 审查恒 FAIL（先挂具体 mock，兜底最后）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("审查规格"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: FAIL\nGAPS: 缺少边界测试",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("通用产出")))
+            .mount(&server)
+            .await;
+
+        let (ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        let err = run_workflow(&loop_wf(2), "测试主题", &ctx)
+            .await
+            .expect_err("迭代耗尽必须失败");
+        assert!(err.contains("VERDICT: PASS"), "错误含循环条件: {err}");
+        assert!(err.contains("2 次迭代"), "错误含迭代次数: {err}");
+        assert!(err.contains("缺少边界测试"), "错误含最后产出摘要: {err}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            bodies_containing(&requests, "实现任务").len(),
+            2,
+            "implement 跑 2 次: {}",
+            requests.len()
+        );
+        assert_eq!(
+            bodies_containing(&requests, "审查规格").len(),
+            2,
+            "spec_review 跑 2 次: {}",
+            requests.len()
+        );
+        assert!(
+            bodies_containing(&requests, "质量审查").is_empty(),
+            "失败后不继续 quality_review"
+        );
+    }
+
+    /// validate：loop_back_to 指向不存在的 step → 报错。
+    #[test]
+    fn validate_loop_back_to_unknown_step() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "bad_loop"
+[[steps]]
+id = "review"
+role = "tester"
+task = "审查"
+loop_until = "VERDICT: PASS"
+loop_back_to = "ghost"
+"#,
+        )
+        .unwrap();
+        let err = wf.validate().expect_err("loop_back_to 不存在必须报错");
+        assert!(err.contains("loop_back_to"), "got: {err}");
+        assert!(err.contains("ghost"), "got: {err}");
+    }
+
+    /// validate：DAG（任何 step 有 depends_on）中出现 loop_until → 报错。
+    #[test]
+    fn validate_loop_until_rejected_in_dag() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_loop"
+[[steps]]
+id = "a"
+role = "programmer"
+task = "实现"
+[[steps]]
+id = "b"
+role = "tester"
+task = "审查"
+depends_on = ["a"]
+loop_until = "VERDICT: PASS"
+"#,
+        )
+        .unwrap();
+        let err = wf.validate().expect_err("DAG 中的 loop_until 必须报错");
+        assert!(err.contains("串行"), "got: {err}");
+    }
+
+    /// validate：loop_until 与嵌套 workflow 互斥 → 报错。
+    #[test]
+    fn validate_loop_until_rejected_on_nested() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "nested_loop"
+[[steps]]
+id = "sub"
+workflow = "other_wf"
+task = "子流程"
+loop_until = "VERDICT: PASS"
+"#,
+        )
+        .unwrap();
+        let err = wf.validate().expect_err("嵌套 step 的 loop_until 必须报错");
+        assert!(err.contains("嵌套"), "got: {err}");
+    }
+
+    /// tdd_development.toml：spec_review 带 loop_until/loop_back_to/max_iterations，
+    /// FAIL 时跳回 implement 返工。
+    #[test]
+    fn tdd_development_spec_review_loops_back_to_implement() {
+        let raw = include_str!("../../config/workflows/tdd_development.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("tdd_development should validate");
+        let spec = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "spec_review")
+            .expect("step 'spec_review' must exist");
+        assert_eq!(spec.loop_until.as_deref(), Some("VERDICT: PASS"));
+        assert_eq!(spec.loop_back_to.as_deref(), Some("implement"));
+        assert_eq!(spec.max_iterations, Some(3));
     }
 }

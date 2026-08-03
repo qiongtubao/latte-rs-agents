@@ -172,6 +172,7 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 depends_on: vec![],
                 max_retries: 0,
                 loop_until: None,
+                loop_back_to: None,
                 max_iterations: None,
                 workflow: None,
                 output_contract: Default::default(),

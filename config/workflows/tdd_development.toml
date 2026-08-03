@@ -58,6 +58,10 @@ description = "规格符合性审查：不要相信实现报告"
 speakers = ["tester"]
 output_key = "spec_review"
 max_retries = 1
+# 审查 FAIL → 自动跳回 implement 返工（带本轮审查反馈），直到 PASS 或 3 次迭代耗尽
+loop_until = "VERDICT: PASS"
+loop_back_to = "implement"
+max_iterations = 3
 prompt = """【不要相信实现报告】你的任务不是复述它说了什么，而是**独立验证**。
 
 【测试计划】{{test_plan}}
