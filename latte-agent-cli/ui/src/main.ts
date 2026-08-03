@@ -360,6 +360,7 @@ async function main(): Promise<void> {
       openBtn: $("task-board-btn") as HTMLButtonElement,
       closeBtn: $("task-board-close") as HTMLButtonElement,
       newBtn: $("task-board-new") as HTMLButtonElement,
+      dispatchAllBtn: $("task-board-dispatch-all") as HTMLButtonElement,
       statRunningEl: $("tb-stat-running"),
       statScheduledEl: $("tb-stat-scheduled"),
       statReviewEl: $("tb-stat-review"),

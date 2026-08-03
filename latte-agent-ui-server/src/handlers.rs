@@ -890,8 +890,17 @@ pub(crate) async fn import_tasks(
     Json(req): Json<crate::tasks::ImportTasksRequest>,
 ) -> Result<Json<crate::tasks::ImportTasksResponse>, (StatusCode, String)> {
     crate::tasks::import_tasks(&state.backend, req)
+        .await
         .map(Json)
         .map_err(Into::into)
+}
+
+/// `POST /api/tasks/dispatch-ready` —— 一键批量派发全部 todo 任务
+/// （按优先级升序，遵守并发上限与同族/paths 互斥）。
+pub(crate) async fn dispatch_ready(
+    State(state): State<AppState>,
+) -> Json<crate::tasks::DispatchReadyResponse> {
+    Json(crate::tasks::dispatch_ready(&state.backend, "user", None).await)
 }
 
 /// `GET /api/tasks/:id` —— 详情。

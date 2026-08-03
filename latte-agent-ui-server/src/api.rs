@@ -121,8 +121,14 @@ pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
 /// 分配一个新 session（含专属 ChatController）。调用方（HTTP 壳 /
 /// Tauri 适配器）拿到返回后通常还要接事件转发（[`subscribe_session`]）。
 pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
-    let session_id =
-        format!("ui-{}-{}", std::process::id(), crate::unix_ts_millis());
+    // 批量派发等场景同一毫秒可能建多个 session：加进程内序号兜底唯一性。
+    static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let session_id = format!(
+        "ui-{}-{}-{}",
+        std::process::id(),
+        crate::unix_ts_millis(),
+        SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let handle = create_session_handle(
         session_id.clone(),
         &b.initial_role,

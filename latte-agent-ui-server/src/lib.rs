@@ -472,6 +472,7 @@ fn build_router(state: AppState) -> Router {
         // 任务看板（docs/task-board-design.md §6）
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/import", post(import_tasks))
+        .route("/tasks/dispatch-ready", post(dispatch_ready))
         .route(
             "/tasks/:id",
             get(get_task)

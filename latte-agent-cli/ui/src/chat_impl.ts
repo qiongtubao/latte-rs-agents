@@ -720,7 +720,13 @@ const stepMsgIds = new Map<string, string>();
       importBtn.textContent = "导入中…";
       try {
         const resp = await importTasks(selected, planId);
-        addMessage({ kind: "system", content: `✅ 已导入 ${resp.created.length} 个任务到看板（backlog），请到任务看板查看` });
+        // plan 批准的导入后端会自动批量派发（批准计划 = 按计划开工）。
+        const ad = resp.auto_dispatch;
+        const content = ad
+          ? `✅ 已导入 ${resp.created.length} 个任务，已自动派发 ${ad.dispatched.length} 个任务` +
+            (ad.skipped.length > 0 ? `，${ad.skipped.length} 个跳过等位` : "")
+          : `✅ 已导入 ${resp.created.length} 个任务到看板（backlog），请到任务看板查看`;
+        addMessage({ kind: "system", content });
         overlay.remove();
       } catch (err) {
         importBtn.disabled = false;

@@ -579,6 +579,11 @@ pub struct ImportTask {
 #[derive(Serialize)]
 pub struct ImportTasksResponse {
     pub created: Vec<String>,
+    /// 带 `plan_id` 的导入（= 用户批准计划）成功后自动跑一轮
+    /// [`dispatch_ready`] 的结果；不带 plan_id 时为 None（不序列化，
+    /// 旧前端无感）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_dispatch: Option<DispatchReadyResponse>,
 }
 
 /// `POST /api/tasks/:id/report` 请求体（manager 回报）。
@@ -748,20 +753,43 @@ fn import_tasks_into(
     Ok(created)
 }
 
-pub fn import_tasks(
+pub async fn import_tasks(
     b: &UiBackend,
     req: ImportTasksRequest,
 ) -> Result<ImportTasksResponse, ApiError> {
-    let mut store = b.tasks.write();
-    let created = import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
-    drop(store);
+    // 写锁作用域收口在块内：guard 不 Send，不能活过下面的 .await。
+    let created = {
+        let mut store = b.tasks.write();
+        let created =
+            import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
+        // plan 批准的导入 = 开工：新建任务直接置 todo（默认进 backlog，
+        // 而 dispatch_ready 只派 todo），让紧随其后的自动调度能派到它们。
+        if req.plan_id.is_some() {
+            let now = now_ms();
+            for id in &created {
+                if let Some(t) = store.get_mut(id) {
+                    t.set_state("todo", "import", Some("计划已批准，待自动调度".into()), now);
+                }
+                if let Err(e) = store.persist(id) {
+                    eprintln!("[tasks] persist {id} after plan approve: {e}");
+                }
+            }
+        }
+        created
+    };
     // plan 阶段门：带 plan_id 的导入 = 用户批准该任务清单。找到持有
     // 该 PendingApproval 的 session（plan 弹窗属于某个 session，stage
     // 按 session 存），置 Approved 解除实现类 delegate 拦截。
+    // 批准后自动跑一轮批量派发——批准计划的语义就是"按这个计划开工"。
+    let mut auto_dispatch = None;
     if let Some(plan_id) = &req.plan_id {
         approve_plan_stage(b, plan_id);
+        auto_dispatch = Some(dispatch_ready(b, "user", None).await);
     }
-    Ok(ImportTasksResponse { created })
+    Ok(ImportTasksResponse {
+        created,
+        auto_dispatch,
+    })
 }
 
 /// 把持有 `PendingApproval { plan_id }` 的 session 的 plan 阶段门置为
@@ -1141,6 +1169,94 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
         });
     }
     Ok(view)
+}
+
+/// `POST /api/tasks/dispatch-ready` 响应。
+#[derive(Serialize, Clone, Debug)]
+pub struct DispatchReadyResponse {
+    /// 成功派发：(task_id, session_id)。
+    pub dispatched: Vec<(String, String)>,
+    /// 跳过（任务留原状态等位）：(task_id, 原因)。
+    pub skipped: Vec<(String, String)>,
+}
+
+/// 批量派发的默认并发上限（同时 in_progress 的任务数），可用
+/// `LATTE_DISPATCH_MAX_CONCURRENT` 环境变量覆盖。
+pub const DEFAULT_DISPATCH_MAX_CONCURRENT: usize = 3;
+
+fn dispatch_max_concurrent_from_env() -> usize {
+    std::env::var("LATTE_DISPATCH_MAX_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_DISPATCH_MAX_CONCURRENT)
+}
+
+/// `POST /api/tasks/dispatch-ready` — 一键/自动批量派发：全部 todo 任务
+/// 按 priority 升序（1 最高，同级按 id 保证确定性）逐个调 [`dispatch_task`]：
+///
+/// - 当前 in_progress 数已达 `max_concurrent`（None = 读
+///   `LATTE_DISPATCH_MAX_CONCURRENT`，缺省 3）→ 该任务及剩余任务全部
+///   跳过（reason=并发上限），留 todo 等下一轮；
+/// - `dispatch_task` 返回 409（同族/paths 冲突）→ 跳过记原因，任务留
+///   todo 等在跑任务完成；
+/// - 其他错误 → 记原因继续。
+///
+/// 每成功派发一个任务即置 in_progress，因此下一轮迭代的并发计数与
+/// paths/同族冲突判断读的都是最新 store，自然生效。`actor` ∈
+/// `user`（一键派发）/ `scheduler`。
+pub async fn dispatch_ready(
+    b: &UiBackend,
+    actor: &str,
+    max_concurrent: Option<usize>,
+) -> DispatchReadyResponse {
+    let max = max_concurrent.unwrap_or_else(dispatch_max_concurrent_from_env);
+    // 候选快照：todo 任务按 (priority, id) 升序。快照后状态被并发改掉
+    // 的任务由 dispatch_task 内部的状态校验兜底（400 → 记原因跳过）。
+    let ready: Vec<String> = {
+        let store = b.tasks.read();
+        let mut v: Vec<(i64, String)> = store
+            .list()
+            .into_iter()
+            .filter(|t| t.state == "todo")
+            .map(|t| (t.priority, t.id.clone()))
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, id)| id).collect()
+    };
+    let mut resp = DispatchReadyResponse {
+        dispatched: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for id in ready {
+        let running = b
+            .tasks
+            .read()
+            .list()
+            .iter()
+            .filter(|t| t.state == "in_progress")
+            .count();
+        if running >= max {
+            resp.skipped
+                .push((id, format!("并发上限：已有 {running} 个任务在跑（上限 {max}），等位")));
+            continue;
+        }
+        match dispatch_task(b, &id, actor).await {
+            Ok(view) => {
+                let session_id = view
+                    .task
+                    .runs
+                    .last()
+                    .map(|r| r.session_id.clone())
+                    .unwrap_or_default();
+                resp.dispatched.push((id, session_id));
+            }
+            Err(e) => {
+                resp.skipped.push((id, e.message));
+            }
+        }
+    }
+    resp
 }
 
 /// 开发 workflow 跑完（→ human_review）后，在同一 session 自动执行
@@ -1609,7 +1725,7 @@ mod tests {
             "tasks": [{ "title": "实现 ringbuf" }]
         }))
         .expect("parse req");
-        let resp = import_tasks(&b, req).expect("import");
+        let resp = import_tasks(&b, req).await.expect("import");
         assert_eq!(resp.created.len(), 1);
         assert_eq!(
             controllers[0].plan_stage(),
@@ -1631,7 +1747,7 @@ mod tests {
             "tasks": [{ "title": "无 plan 来源的手动导入" }]
         }))
         .expect("parse req");
-        import_tasks(&b, req).expect("import");
+        import_tasks(&b, req).await.expect("import");
         assert_eq!(controllers[1].plan_stage(), PlanStage::Normal);
     }
 
@@ -2212,7 +2328,7 @@ mod tests {
             ]
         }))
         .expect("parse req");
-        let resp = import_tasks(&b, req).expect("import");
+        let resp = import_tasks(&b, req).await.expect("import");
         let [a, c] = &resp.created[..] else {
             panic!("应创建 2 个任务");
         };
@@ -2228,6 +2344,204 @@ mod tests {
         assert!(err.message.contains("src/ringbuf"), "消息应列出重叠路径：{}", err.message);
         // 被拒后任务状态不变。
         assert_eq!(b.tasks.read().get(c).unwrap().state, "todo");
+    }
+
+    // ─── 批量派发（dispatch_ready） ──────────────────────────────
+
+    /// 造一个带 tempdir 的 UiBackend。dispatch 成功路径会真建 session：
+    /// 未绑 workflow 的任务发消息给 manager——默认配置无可用模型，turn
+    /// 在后台失败但不回写任务状态，任务稳定停在 in_progress。
+    fn test_backend(dir: &tempfile::TempDir) -> UiBackend {
+        let cfg = latte_agent_core::AgentConfig::default();
+        let resolver = latte_agent_core::ModelResolver::from_config(&cfg).expect("resolver");
+        UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(dir.path().to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend")
+    }
+
+    /// 导入一批任务并全部置 todo（无 plan_id，不触发自动调度），返回 id。
+    async fn import_as_todo(b: &UiBackend, req: serde_json::Value) -> Vec<String> {
+        let req: ImportTasksRequest = serde_json::from_value(req).expect("parse req");
+        let resp = import_tasks(b, req).await.expect("import");
+        let now = now_ms();
+        let mut store = b.tasks.write();
+        for id in &resp.created {
+            store.get_mut(id).unwrap().set_state("todo", "user", None, now);
+        }
+        resp.created
+    }
+
+    /// 批量派发：3 个 todo（不同 paths）全部派出、状态 in_progress，
+    /// 且按 priority 升序（1 最高）的顺序派发。
+    #[tokio::test]
+    async fn dispatch_ready_dispatches_all_todo_in_priority_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [
+                { "title": "低优先", "priority": 3, "paths": ["src/a"] },
+                { "title": "高优先", "priority": 1, "paths": ["src/b"] },
+                { "title": "中优先", "priority": 2, "paths": ["src/c"] }
+            ]}),
+        )
+        .await;
+
+        let resp = dispatch_ready(&b, "user", Some(3)).await;
+        assert!(resp.skipped.is_empty(), "不应有跳过：{:?}", resp.skipped);
+        assert_eq!(
+            resp.dispatched.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![ids[1].as_str(), ids[2].as_str(), ids[0].as_str()],
+            "派发顺序应按 priority 升序（1 → 2 → 3）"
+        );
+        // 每个任务各拿到一个互不相同的 session。
+        let mut sids: Vec<&str> = resp.dispatched.iter().map(|(_, s)| s.as_str()).collect();
+        sids.sort();
+        sids.dedup();
+        assert_eq!(sids.len(), 3, "session id 不得重复");
+        let store = b.tasks.read();
+        for id in &ids {
+            assert_eq!(store.get(id).unwrap().state, "in_progress");
+        }
+    }
+
+    /// 并发上限：max=2 时 3 个任务派出 2 个，第 3 个 skipped 留 todo。
+    #[tokio::test]
+    async fn dispatch_ready_respects_concurrency_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [
+                { "title": "甲", "paths": ["src/a"] },
+                { "title": "乙", "paths": ["src/b"] },
+                { "title": "丙", "paths": ["src/c"] }
+            ]}),
+        )
+        .await;
+
+        let resp = dispatch_ready(&b, "user", Some(2)).await;
+        assert_eq!(resp.dispatched.len(), 2);
+        assert_eq!(resp.skipped.len(), 1);
+        assert_eq!(resp.skipped[0].0, ids[2]);
+        assert!(resp.skipped[0].1.contains("并发上限"), "{}", resp.skipped[0].1);
+        let store = b.tasks.read();
+        assert_eq!(store.get(&ids[2]).unwrap().state, "todo", "被限流的任务留 todo 等位");
+        assert_eq!(store.get(&ids[0]).unwrap().state, "in_progress");
+        assert_eq!(store.get(&ids[1]).unwrap().state, "in_progress");
+    }
+
+    /// paths 冲突：A 在跑，B 与 A 范围重叠 → B skipped 留 todo；
+    /// C 不冲突 → 派出。
+    #[tokio::test]
+    async fn dispatch_ready_skips_path_conflicts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [
+                { "title": "改 ringbuf", "paths": ["src/ringbuf"] },
+                { "title": "改 ringbuf 测试", "paths": ["src/ringbuf/tests"] },
+                { "title": "改无关模块", "paths": ["src/other"] }
+            ]}),
+        )
+        .await;
+        // A 已在跑（不占用 dispatch_ready 的派发名额之外的上限：上限给 3）。
+        b.tasks
+            .write()
+            .get_mut(&ids[0])
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+
+        let resp = dispatch_ready(&b, "user", Some(3)).await;
+        assert_eq!(
+            resp.dispatched.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec![ids[2].as_str()],
+            "只有不冲突的 C 应被派出"
+        );
+        assert_eq!(resp.skipped.len(), 1);
+        assert_eq!(resp.skipped[0].0, ids[1]);
+        assert!(resp.skipped[0].1.contains(&ids[0]), "原因应指出冲突对象：{}", resp.skipped[0].1);
+        assert_eq!(
+            b.tasks.read().get(&ids[1]).unwrap().state,
+            "todo",
+            "冲突任务留 todo 等 A 完成"
+        );
+    }
+
+    /// 优先级顺序：上限 1 时只有 priority 1 被派出，priority 3 等位。
+    #[tokio::test]
+    async fn dispatch_ready_priority_wins_under_tight_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [
+                { "title": "后建但急", "priority": 3, "paths": ["src/a"] },
+                { "title": "最高优先", "priority": 1, "paths": ["src/b"] }
+            ]}),
+        )
+        .await;
+
+        let resp = dispatch_ready(&b, "user", Some(1)).await;
+        assert_eq!(resp.dispatched.len(), 1);
+        assert_eq!(resp.dispatched[0].0, ids[1], "priority 1 应先于 3 被派出");
+        assert_eq!(resp.skipped.len(), 1);
+        assert_eq!(resp.skipped[0].0, ids[0]);
+        assert!(resp.skipped[0].1.contains("并发上限"), "{}", resp.skipped[0].1);
+        let store = b.tasks.read();
+        assert_eq!(store.get(&ids[1]).unwrap().state, "in_progress");
+        assert_eq!(store.get(&ids[0]).unwrap().state, "todo");
+    }
+
+    /// import 带 plan_id（= 用户批准计划）：响应含 auto_dispatch，
+    /// 新建任务直接置 todo 并被自动派出（真建 session）。
+    #[tokio::test]
+    async fn import_with_plan_id_auto_dispatches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "plan_id": "plan-auto-1",
+            "tasks": [
+                { "title": "开工甲", "paths": ["src/a"] },
+                { "title": "开工乙", "paths": ["src/b"] }
+            ]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).await.expect("import");
+        assert_eq!(resp.created.len(), 2);
+        let auto = resp.auto_dispatch.expect("带 plan_id 的导入应自动调度");
+        assert!(auto.skipped.is_empty(), "不应有跳过：{:?}", auto.skipped);
+        assert_eq!(
+            auto.dispatched.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            resp.created.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            "两个新任务都应被自动派出"
+        );
+        let store = b.tasks.read();
+        for id in &resp.created {
+            assert_eq!(store.get(id).unwrap().state, "in_progress");
+        }
+    }
+
+    /// 不带 plan_id 的导入不触发自动调度，任务留 backlog。
+    #[tokio::test]
+    async fn import_without_plan_id_does_not_auto_dispatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": "手动导入" }]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).await.expect("import");
+        assert!(resp.auto_dispatch.is_none());
+        assert_eq!(b.tasks.read().get(&resp.created[0]).unwrap().state, "backlog");
     }
 
     #[test]

@@ -10,9 +10,9 @@
 // 动作，其余进右侧详情抽屉。
 import {
   listTasks, createTask, updateTask, dispatchTask, abortTask,
-  listWorkflows,
+  dispatchReady, listWorkflows,
 } from "./api";
-import type { TaskView, TaskState, WorkflowSummary } from "./api";
+import type { TaskView, TaskState, WorkflowSummary, DispatchReadyResponse } from "./api";
 
 // ─── 状态机定义（纯数据/纯函数，单独可测） ─────────────────────────
 
@@ -164,6 +164,21 @@ export function actionToast(key: string, taskId: string): string {
   }
 }
 
+/** 「派发全部」结果提示：派了 N 个、跳过 M 个（附前几条原因）。 */
+export function dispatchReadyToast(resp: DispatchReadyResponse): string {
+  const n = resp.dispatched.length;
+  const m = resp.skipped.length;
+  let msg = `已派发 ${n} 个任务`;
+  if (m > 0) {
+    const reasons = resp.skipped
+      .slice(0, 3)
+      .map(([id, reason]) => `${id}: ${reason}`)
+      .join("；");
+    msg += `，跳过 ${m} 个（${reasons}${m > 3 ? "；…" : ""}）`;
+  }
+  return msg;
+}
+
 // ─── 工具函数 ────────────────────────────────────────────────────
 
 function fmtTime(ts: number): string {
@@ -193,6 +208,7 @@ export interface TaskBoardContainer {
   openBtn: HTMLButtonElement;
   closeBtn: HTMLButtonElement;
   newBtn: HTMLButtonElement;
+  dispatchAllBtn: HTMLButtonElement;
   statRunningEl: HTMLElement;
   statScheduledEl: HTMLElement;
   statReviewEl: HTMLElement;
@@ -805,6 +821,21 @@ export function mountTaskBoard(opts: {
   container.openBtn.addEventListener("click", open);
   container.closeBtn.addEventListener("click", close);
   container.newBtn.addEventListener("click", () => openTaskModal());
+  container.dispatchAllBtn.addEventListener("click", () => void dispatchAll());
+
+  /** 「派发全部」：后端按优先级批量派发 todo，冲突/超限的留 todo 等位。 */
+  async function dispatchAll(): Promise<void> {
+    container.dispatchAllBtn.disabled = true;
+    try {
+      const resp = await dispatchReady();
+      toast(dispatchReadyToast(resp));
+    } catch (e) {
+      toast(`派发失败: ${(e as Error).message}`);
+    } finally {
+      container.dispatchAllBtn.disabled = false;
+    }
+    await refresh({ silent: true });
+  }
 
   return {
     isOpen: () => !container.panelEl.classList.contains("hidden"),

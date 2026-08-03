@@ -963,6 +963,20 @@ export async function dispatchTask(id: string): Promise<TaskView> {
   );
 }
 
+/** POST /api/tasks/dispatch-ready 的响应：批量派发结果。 */
+export interface DispatchReadyResponse {
+  /** 成功派发：[task_id, session_id]。 */
+  dispatched: [string, string][];
+  /** 跳过（任务留 todo 等位）：[task_id, 原因]。 */
+  skipped: [string, string][];
+}
+
+/** POST /api/tasks/dispatch-ready：按优先级批量派发全部 todo 任务
+ *  （后端遵守并发上限与同族/paths 互斥，冲突/超限任务留 todo 等位）。 */
+export async function dispatchReady(): Promise<DispatchReadyResponse> {
+  return getTransport().request("POST", "/api/tasks/dispatch-ready");
+}
+
 /** POST /api/tasks/:id/abort：中止执行，任务回到 todo。 */
 export async function abortTask(id: string): Promise<TaskView> {
   return getTransport().request(
@@ -983,11 +997,11 @@ export async function deleteTask(id: string): Promise<void> {
  *  校验失败时后端返回 400 + 纯文本错误信息。
  *  planId 来自 PlanProposed 事件：带上即视为用户批准该任务清单，
  *  后端会把对应 session 的 plan 阶段门置为 Approved（解除实现类
- *  delegate 拦截）。 */
+ *  delegate 拦截），并自动跑一轮批量派发（结果在 auto_dispatch）。 */
 export async function importTasks(
   tasks: ImportTask[],
   planId?: string,
-): Promise<{ created: string[] }> {
+): Promise<{ created: string[]; auto_dispatch?: DispatchReadyResponse }> {
   return getTransport().request("POST", "/api/tasks/import", { tasks, plan_id: planId });
 }
 

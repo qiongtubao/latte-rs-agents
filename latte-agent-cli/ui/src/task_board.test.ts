@@ -7,6 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   STATES, STATE_ACTIONS, COLUMN_ORDER,
   effectiveActions, lastSessionId, actionRequest, actionToast, actionLabel,
+  dispatchReadyToast,
 } from "./task_board";
 import type { TaskView } from "./api";
 
@@ -134,5 +135,32 @@ describe("actionRequest / actionToast", () => {
         expect(msg).toContain("LAT-1");
       }
     }
+  });
+});
+
+describe("dispatchReadyToast（派发全部结果提示）", () => {
+  it("全部派出：只报派发数", () => {
+    expect(dispatchReadyToast({ dispatched: [["LAT-1", "ui-a"]], skipped: [] }))
+      .toBe("已派发 1 个任务");
+  });
+
+  it("有跳过：报跳过数并附原因", () => {
+    const msg = dispatchReadyToast({
+      dispatched: [["LAT-1", "ui-a"]],
+      skipped: [["LAT-2", "并发上限：已有 3 个任务在跑（上限 3），等位"]],
+    });
+    expect(msg).toContain("已派发 1 个任务");
+    expect(msg).toContain("跳过 1 个");
+    expect(msg).toContain("LAT-2");
+    expect(msg).toContain("并发上限");
+  });
+
+  it("跳过超过 3 条时截断原因列表", () => {
+    const skipped: [string, string][] = ["LAT-1", "LAT-2", "LAT-3", "LAT-4"]
+      .map((id) => [id, "r"]);
+    const msg = dispatchReadyToast({ dispatched: [], skipped });
+    expect(msg).toContain("跳过 4 个");
+    expect(msg).toContain("…");
+    expect(msg).not.toContain("LAT-4:");
   });
 });
