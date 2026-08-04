@@ -426,6 +426,20 @@ select {
   font-weight: 500;
 }
 
+/* delegate 角色（manager @programmer 子会话）—— 略深左边框 + 淡背景，
+   与主 chat 流顶级角色行视觉区分。 */
+.message.status.is-delegate-role.executing {
+  border-left-color: #6366f1;
+  background: linear-gradient(90deg, #eef2ff 0%, #e0e7ff 100%);
+}
+.message.status.is-delegate-role.done {
+  border-left-color: #818cf8;
+  background: #eef2ff;
+}
+.message.status.is-delegate-role.error {
+  border-left-color: #f43f5e;
+}
+
 /* ─── code blocks inside messages ─────────────────────────────── */
 
 .msg-content pre {
@@ -469,6 +483,62 @@ select {
   opacity: 0.7;
   user-select: none;
 }
+
+/* ─── tool-log inside executing status row ─────────────────────── */
+/* 把"工具调用"折叠进 RoleStarted 的 executing 状态行：默认折叠（节省垂直空间），
+   用户点 header 展开/折叠。整段左侧色条对齐 .message.status 的 left bar。 */
+.tool-log {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: stretch;
+  margin: 6px 0 2px 0;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  max-width: 100%;
+  vertical-align: top;
+}
+.tool-log-header {
+  cursor: pointer;
+  padding: 4px 10px;
+  font-weight: 600;
+  color: var(--fg-2, #475569);
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(241, 245, 249, 0.6);
+  border-radius: 6px 6px 0 0;
+}
+.tool-log-header:hover { background: rgba(241, 245, 249, 0.9); }
+.tool-log-count {
+  font-weight: 400;
+  color: var(--fg-3, #64748b);
+  font-size: 0.7rem;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 1px 6px;
+  border-radius: 9px;
+}
+.tool-log-body {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.tool-log.collapsed .tool-log-body { display: none; }
+.tool-log.collapsed { border-radius: 6px; }
+.tool-log.collapsed .tool-log-header { border-radius: 6px; }
+.tool-log-line {
+  padding: 2px 12px;
+  font-family: var(--mono-font, ui-monospace, monospace);
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.4;
+}
+.tool-log-line:hover { background: rgba(0, 0, 0, 0.03); }
 
 /* ─── fail-flash pulse animation ─────────────────────────────── */
 @keyframes fail-pulse {

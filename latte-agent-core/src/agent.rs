@@ -1799,7 +1799,18 @@ impl AgentRunner {
                             // ToolNotFound）会形成死循环（model 看自己上
                             // 一轮的输出"修正"通常产出更多错误）。
                             if policy.loopback_to_model(&kind) {
-                                messages.push(Message::tool_result(tc.id.clone(), detail));
+                                // 截断错误消息：长 payload（write/edit 类的大内容）
+                                // 不截断会 echo 回 model 变成巨大 tool_result。
+                                const MAX_ERR_CHARS: usize = 256;
+                                let truncated = if detail.len() > MAX_ERR_CHARS {
+                                    format!("{}...\n[error truncated - {} chars]",
+                                        &detail[..MAX_ERR_CHARS],
+                                        detail.len() - MAX_ERR_CHARS,
+                                    )
+                                } else {
+                                    detail
+                                };
+                                messages.push(Message::tool_result(tc.id.clone(), truncated));
                             }
                             // 不喂回的：错误已经在 trace 里，UI 也能看；
                             // model 不需要知道（"它自己改不对"）。
@@ -2072,6 +2083,7 @@ fn build_tool_schemas(
         .map(|td| latte_ai::models::Tool {
             name: td.name.clone(),
             description: Some(td.description.clone()),
+            strict: None,
             parameters: serde_json::to_value(&td.input_schema)
                 .unwrap_or(serde_json::json!({})),
         })

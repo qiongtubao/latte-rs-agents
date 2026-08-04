@@ -1,4 +1,5 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSession, resumeSession, pauseRole, resumeRole, importTasks, uploadImage, type ImportTask, type ChoiceOption } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSession, resumeSession, pauseRole, resumeRole, importTasks, uploadImage, listWorkflows, type ImportTask, type ChoiceOption } from "./api";
+import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
@@ -176,6 +177,50 @@ const stepMsgIds = new Map<string, string>();
    *  role 时是 delegate 的 sub_id），让右键「查看日志」能直接命中。 */
   const executingRowByRole = new Map<string, HTMLElement>();
   const executingSubIdByRole = new Map<string, string>();
+
+  // 把工具调用折叠进 role 的 executing 状态行（而不是独立气泡）。
+  // - 第一次调用时在状态行内创建一个 .tool-log 子元素并折叠状态。
+  // - 同一 role 后续的工具调用追加在 .tool-log 内。
+  // - 返回 true 表示已折叠，false 表示需要降级为独立气泡。
+  function appendToolToExecutingRow(roleId: string, line: string): boolean {
+    const row = executingRowByRole.get(roleId);
+    if (!row) return false;
+    const inner = row.querySelector(".message.status") as HTMLElement | null;
+    if (!inner) return false;
+    let log = inner.querySelector(".tool-log") as HTMLElement | null;
+    if (!log) {
+      log = document.createElement("div");
+      log.className = "tool-log collapsed";
+      log.dataset.full = "";
+      const header = document.createElement("div");
+      header.className = "tool-log-header";
+      header.textContent = "🧰 工具调用";
+      header.addEventListener("click", (e) => {
+        e.stopPropagation();
+        log!.classList.toggle("collapsed");
+      });
+      log.appendChild(header);
+      const body = document.createElement("div");
+      body.className = "tool-log-body";
+      log.appendChild(body);
+      // 计数徽章，跟在 header 末尾
+      const count = document.createElement("span");
+      count.className = "tool-log-count";
+      body.dataset.count = "0";
+      header.appendChild(count);
+      inner.appendChild(log);
+    }
+    const body = log.querySelector(".tool-log-body") as HTMLElement;
+    const entry = document.createElement("div");
+    entry.className = "tool-log-line";
+    entry.textContent = line;
+    body.appendChild(entry);
+    const c = body.dataset.count ? parseInt(body.dataset.count, 10) + 1 : 1;
+    body.dataset.count = String(c);
+    const countBadge = log.querySelector(".tool-log-count") as HTMLElement;
+    countBadge.textContent = ` (${c})`;
+    return true;
+  }
 
   function buildSubagentDetail(): string {
     if (subagentTools.length === 0) return "没有工具调用日志";
@@ -770,15 +815,19 @@ const stepMsgIds = new Map<string, string>();
   });
 
   // ── /command autocomplete ──
+  // 内建命令固定；workflow 的斜杠命令（/plan /learn 等）启动时从
+  // GET /api/workflows 拉取合并进来，让自定义 workflow 也能被补全。
   const cmdBox: HTMLElement = document.getElementById("cmd-autocomplete")!;
-  const CMD_HINTS: Array<{ cmd: string; icon: string; desc: string }> = [
-    { cmd: "/plan", icon: "📋", desc: "运行实现规划 workflow" },
-    { cmd: "/clear", icon: "🗑️", desc: "清除对话历史" },
-    { cmd: "/quit", icon: "🚪", desc: "退出当前 session" },
-    { cmd: "/pause", icon: "⏸️", desc: "暂停当前 agent" },
-    { cmd: "/help", icon: "❓", desc: "显示帮助信息" },
-    { cmd: "/compact", icon: "📦", desc: "压缩历史（节省 tokens）" },
-  ];
+  const CMD_HINTS: CmdHint[] = [...BUILTIN_CMD_HINTS];
+  // 拉取 workflow 命令并入提示；失败静默（不阻塞输入，仅补全减少）。
+  listWorkflows()
+    .then((workflows) => {
+      const merged = mergeWorkflowCommands(CMD_HINTS, workflows);
+      CMD_HINTS.splice(0, CMD_HINTS.length, ...merged);
+    })
+    .catch(() => {
+      /* 拉取失败：仅使用内建命令，不打扰用户 */
+    });
   let cmdIdx = -1;
   // ── @role autocomplete data ──
   const acBox = document.getElementById("role-autocomplete")!;
@@ -1366,6 +1415,7 @@ const stepMsgIds = new Map<string, string>();
         // 该 role 可能在某个 active delegate subsession 里跑
         // (manager @programmer ...)，找一下 subId 让右键能跳日志。
         const startedSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId || undefined;
+        const isDelegate = !!startedSubId;
         const node = addMessage({
           kind: "status",
           content: `🧠 ${e.role_id} 开始执行…`,
@@ -1373,6 +1423,11 @@ const stepMsgIds = new Map<string, string>();
           subId: startedSubId,
           state: "executing",
         });
+        if (isDelegate) {
+          // 标记 delegate 角色供 CSS/查询区分（主 chat 流无标记）
+          node.classList.add("is-delegate-role");
+          node.dataset.delegate = "true";
+        }
         executingRowByRole.set(e.role_id, node);
         executingSubIdByRole.set(e.role_id, startedSubId ?? "");
         lastRoleStarted = e.role_id;
@@ -1418,39 +1473,6 @@ const stepMsgIds = new Map<string, string>();
         lastUserMsgId = node.dataset.messageId || "";
         break;
       }
-      case "ToolUse": {
-        const t = truncate(e.args, 100);
-        subagentTools.push(`🔧 ${e.tool_name}(${t})`);
-        const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
-        const useChips = makeRefChips(extractCodeRefs(e.tool_name, e.args));
-        if (useChips) toolRow.querySelector(".msg-bubble")?.appendChild(useChips);
-        currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
-        updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
-        // Attribute by role so parallel delegates each collect their own tools.
-        const toolSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
-        const di = activeDelegates.get(toolSubId);
-        if (di) di.capturedTools.push({ tool: e.tool_name, args: e.args });
-        break;
-      }
-      case "ToolResult": {
-        const short = truncate(e.result, 80);
-        subagentTools.push(`✅ ${e.tool_name} → ${short}`);
-        const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
-        const resultChips = makeRefChips(extractCodeRefs(e.tool_name, "", e.result));
-        if (resultChips) resultRow.querySelector(".msg-bubble")?.appendChild(resultChips);
-        updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
-        const resultSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
-        const di2 = activeDelegates.get(resultSubId);
-        if (di2 && di2.capturedTools.length > 0) {
-          const last = di2.capturedTools[di2.capturedTools.length - 1];
-          if (last.tool === e.tool_name) last.result = e.result;
-        }
-        break;
-      }
-      case "ToolError": {
-        subagentTools.push(`❌ ${e.tool_name}: ${truncate(e.error, 100)}`);
-        updateFooter(); resetWaitTimer(); break;
-      }
       case "ImageGenerated": {
         // generate_image 工具产出：角色气泡 + 图片 + 截断的 prompt 说明。
         // prompt 走 addMessage 的 escapeHtml 路径（纯文本），<img> 用
@@ -1476,6 +1498,64 @@ const stepMsgIds = new Map<string, string>();
         updateFooter(); resetWaitTimer();
         break;
       }
+      case "ToolUse": {
+        const t = truncate(e.args, 100);
+        subagentTools.push(`🔧 ${e.tool_name}(${t})`);
+        currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
+        updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
+        // Attribute by role so parallel delegates each collect their own tools.
+        const toolSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
+        const di = activeDelegates.get(toolSubId);
+        // 折叠进 role 的 executing 状态行（不是独立气泡）。
+        // 主 chat 流（manager 等顶级角色）和 delegate 下属 subagent role
+        // 走同一个 RoleStarted 分支，都会入 executingRowByRole —— 所以
+        // appendToolToExecutingRow 同时覆盖主/从两条路径。
+        if (!appendToolToExecutingRow(e.role_id, `🔧 ${e.tool_name}(${t})`)) {
+          const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
+          const useChips = makeRefChips(extractCodeRefs(e.tool_name, e.args));
+          if (useChips) toolRow.querySelector(".msg-bubble")?.appendChild(useChips);
+        }
+        break;
+      }
+      case "ToolResult": {
+        const short = truncate(e.result, 80);
+        subagentTools.push(`✅ ${e.tool_name} → ${short}`);
+        updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
+        const resultSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
+        const di2 = activeDelegates.get(resultSubId);
+        if (di2 && di2.capturedTools.length > 0) {
+          const last = di2.capturedTools[di2.capturedTools.length - 1];
+          if (last.tool === e.tool_name) last.result = e.result;
+        }
+        const resultLine = e.result.toLowerCase().startsWith("error")
+          ? `❌ ${e.tool_name} → ${short}`
+          : `✅ ${e.tool_name} → ${short}`;
+        if (!appendToolToExecutingRow(e.role_id, resultLine)) {
+          const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
+          const resultChips = makeRefChips(extractCodeRefs(e.tool_name, "", e.result));
+          if (resultChips) resultRow.querySelector(".msg-bubble")?.appendChild(resultChips);
+        }
+        break;
+      }
+      case "ToolError": {
+        subagentTools.push(`❌ ${e.tool_name}: ${truncate(e.error, 100)}`);
+        updateFooter(); resetWaitTimer();
+        // 折叠进 executing 行（之前根本没 addMessage，行为退化为 footer-only）；
+        // 现在写入 .tool-log 让用户在状态行直接看到错误。
+        if (!appendToolToExecutingRow(e.role_id, `❌ ${e.tool_name}: ${truncate(e.error, 120)}`)) {
+          // race: RoleFinished 已到（executingRowByRole.delete），或 delegate 下属 role
+          // 没进 executingRowByRole。此时不应静默吞掉——至少写到 footer + 上报 trace 一行。
+          console.warn("[chat] late ToolError (no executing row):", e.tool_name, e.error);
+          if (currentDelegateSubId) {
+            // delegate subsession 上下文，把错误注入 subagent badge（detail 已经有 subagentTools）
+            // ——subagentTools 已经 push 上面那一行，UI 通过右键「查看 subagent 过程」可见。
+          } else {
+            setFooter(`❌ ${e.tool_name}: ${truncate(e.error, 80)}`);
+          }
+          break;
+        }
+        break;
+      }
       case "RoleTurn": {
         const icon = resolveIcon(e.role_id);
         const subagent = subagentTools.length > 0 ? { detail: buildSubagentDetail() } : undefined;
@@ -1486,8 +1566,6 @@ const stepMsgIds = new Map<string, string>();
         const roleSubId = di ? subId : undefined;
 
         // Build reference: subagent reply → delegation task; manager summary → user request.
-        // 不再要求 activeDelegates 为空 —— 如果有委托一直没完成（卡住/超时），
-        // manager 的总结仍然应该引用最开始的用户任务。
         const ref = di
           ? { refId: di.delegateMsgId, preview: `@${di.targetRole}: ${di.taskText.slice(0, 30)}` }
           : (lastUserMsgId && e.role_id === "manager" && e.is_complete
