@@ -25,7 +25,7 @@
 #   │   ├── manager.toml
 #   │   └── advisor.toml
 #   ├── agents.toml          # merged single-file agent config
-#   ├── workflows.d/         # one file per workflow (6 workflows)
+#   ├── workflows.d/         # one file per workflow（全部，glob 安装）
 #   │   ├── default.toml
 #   │   ├── code_review.toml
 #   │   ├── bug_triage.toml
@@ -173,12 +173,7 @@ for f in \
     "agents/tech_writer.toml" \
     "agents/manager.toml" \
     "agents/advisor.toml" \
-    "workflows/default.toml" \
-    "workflows/code_review.toml" \
-    "workflows/bug_triage.toml" \
-    "workflows/design_brainstorm.toml" \
-    "workflows/requirements_review.toml" \
-    "workflows/tech_director_dispatch.toml" \
+    "workflows" \
     "models.toml" \
     "agents.toml" \
     "discussion.toml"; do
@@ -220,13 +215,11 @@ install_file "$SOURCE_DIR/agents/tech_writer.toml"   "$TARGET_DIR/agents.d/tech_
 install_file "$SOURCE_DIR/agents/manager.toml"       "$TARGET_DIR/agents.d/manager.toml"       "Manager role"
 install_file "$SOURCE_DIR/agents/advisor.toml"       "$TARGET_DIR/agents.d/advisor.toml"       "Advisor role"
 
-# Install workflow configs (one per file)
-install_file "$SOURCE_DIR/workflows/default.toml"                   "$TARGET_DIR/workflows.d/default.toml"                   "Default workflow"
-install_file "$SOURCE_DIR/workflows/code_review.toml"               "$TARGET_DIR/workflows.d/code_review.toml"               "Code Review workflow"
-install_file "$SOURCE_DIR/workflows/bug_triage.toml"                "$TARGET_DIR/workflows.d/bug_triage.toml"                "Bug Triage workflow"
-install_file "$SOURCE_DIR/workflows/design_brainstorm.toml"         "$TARGET_DIR/workflows.d/design_brainstorm.toml"         "Design Brainstorm workflow"
-install_file "$SOURCE_DIR/workflows/requirements_review.toml"       "$TARGET_DIR/workflows.d/requirements_review.toml"       "Requirements Review workflow"
-install_file "$SOURCE_DIR/workflows/tech_director_dispatch.toml"    "$TARGET_DIR/workflows.d/tech_director_dispatch.toml"    "Tech Director workflow"
+# Install workflow configs (one per file, glob — 新增 workflow 自动纳入)
+for f in "$SOURCE_DIR/workflows/"*.toml; do
+    name="$(basename "$f")"
+    install_file "$f" "$TARGET_DIR/workflows.d/$name" "Workflow: $name"
+done
 
 # Install model catalog and merged single-file configs
 install_file "$SOURCE_DIR/models.toml"      "$TARGET_DIR/models.toml"      "Model catalog"
