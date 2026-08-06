@@ -525,6 +525,10 @@ pub struct WorkflowRunContext {
     pub cwd: PathBuf,
     pub event_tx: broadcast::Sender<ChatEvent>,
     pub cancel_flag: Arc<AtomicBool>,
+    /// Session-level 暂停门。workflow 的 role runner 也 attach 这个
+    /// gate —— 用户按 ⏸ 时 workflow 流水线一起冻结（下个 boundary
+    /// park）。None（独立测试/无 session 的 run）跳过。
+    pub agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
     /// Nesting depth: 0 for a top-level run, +1 per nested workflow
     /// step. Guarded against [`MAX_WORKFLOW_DEPTH`] to stop cycles.
     pub depth: u8,
@@ -571,6 +575,7 @@ fn run_nested_workflow(
             cwd: ctx.cwd.clone(),
             event_tx: ctx.event_tx.clone(),
             cancel_flag: ctx.cancel_flag.clone(),
+            agent_pause_gate: ctx.agent_pause_gate.clone(),
             depth: ctx.depth + 1,
         };
         run_workflow(&wf, &topic, &nested_ctx).await
@@ -950,6 +955,7 @@ async fn build_role_runner(
     default_params: &GenerateParams,
     cwd: &Path,
     event_tx: &broadcast::Sender<ChatEvent>,
+    agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
 ) -> Result<AgentRunner, String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
@@ -1005,7 +1011,13 @@ async fn build_role_runner(
         }
         AgentRunner::new_with_tools(agent, rtm, 0)
     };
-    Ok(runner.with_role(role_id.to_string()).with_cwd(cwd.to_path_buf()))
+    let mut r = runner
+        .with_role(role_id.to_string())
+        .with_cwd(cwd.to_path_buf());
+    if let Some(gate) = agent_pause_gate {
+        r = r.with_agent_pause_gate(gate);
+    }
+    Ok(r)
 }
 
 /// Legacy serial engine: file-order steps, one persistent runner per
@@ -1029,6 +1041,7 @@ async fn run_workflow_serial(
             &ctx.default_params,
             &ctx.cwd,
             &ctx.event_tx,
+            ctx.agent_pause_gate.clone(),
         )
         .await
         {
@@ -1272,6 +1285,7 @@ struct DagStepInput {
     cwd: PathBuf,
     event_tx: broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
+    agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
     depth: u8,
 }
 
@@ -1311,6 +1325,7 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             cwd: inp.cwd.clone(),
             event_tx: inp.event_tx.clone(),
             cancel_flag: inp.cancel_flag.clone(),
+            agent_pause_gate: inp.agent_pause_gate.clone(),
             depth: inp.depth,
         };
         let output = run_nested_workflow(nested_name.clone(), nested_topic, ctx)
@@ -1344,6 +1359,7 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             &inp.default_params,
             &inp.cwd,
             &inp.event_tx,
+            inp.agent_pause_gate.clone(),
         )
         .await
         .map_err(StepFail::Failed)?;
@@ -1474,6 +1490,7 @@ async fn run_workflow_dag(
                     cwd: ctx.cwd.clone(),
                     event_tx: ctx.event_tx.clone(),
                     cancel_flag: ctx.cancel_flag.clone(),
+                    agent_pause_gate: ctx.agent_pause_gate.clone(),
                     depth: ctx.depth,
                 };
                 let sem = sem.clone();
@@ -2295,7 +2312,7 @@ mod contract_engine_tests {
                 cwd: std::env::temp_dir(),
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
-                depth: 0,
+                agent_pause_gate: None, depth: 0,
             },
             event_rx,
         )
@@ -2391,6 +2408,43 @@ forbid = ["TBD"]
         assert_eq!(requests.len(), 2, "首发 + max_retries=1 次重试: {}", requests.len());
         assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
     }
+
+    /// P0-2：workflow 运行时若 session gate 已 paused，role runner 应
+    /// 在第一个 model call 边界 park —— 流水线不前进。
+    #[tokio::test]
+    async fn paused_session_gate_parks_workflow_at_first_turn() {
+        let gate = crate::pause_gate::AgentPauseGate::new("test-session");
+        // Pre-pause（模拟用户先按 ⏸ 才触发 workflow）。
+        gate.pause();
+        let server = wiremock::MockServer::start().await;
+        let good = "这是一份足够详实的实现计划，覆盖方案概述、工作分解、依赖关系与风险分析，每一项都给出了明确的验收标准，没有任何占位内容。";
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                        good,
+                    ))),
+            )
+            .await;
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.agent_pause_gate = Some(gate.clone());
+        let cwd_tmp = ctx.cwd.clone();
+        let _ = cwd_tmp;
+        let spawned = tokio::spawn(async move {
+            run_workflow(&contract_wf(), "测试主题", &ctx).await
+        });
+        // 200ms 后应仍挂起（第一个 model call 边界 park）。
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!spawned.is_finished(), "gate paused → workflow 应 park");
+        // Resume → 流水线继续，跑完。
+        gate.resume();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), spawned)
+            .await
+            .expect("workflow resumes after gate resume")
+            .expect("run ok");
+        assert!(r.is_ok(), "resume 后 workflow 成功: {:?}", r);
+    }
 }
 
 #[cfg(test)]
@@ -2474,7 +2528,7 @@ mod resume_tests {
                 cwd,
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
-                depth: 0,
+                agent_pause_gate: None, depth: 0,
             },
             event_rx,
         )
@@ -2856,7 +2910,7 @@ mod loop_tests {
                 cwd: std::env::temp_dir(),
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
-                depth: 0,
+                agent_pause_gate: None, depth: 0,
             },
             event_rx,
         )

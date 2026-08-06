@@ -49,6 +49,9 @@ async function refreshSessionSelect(
         ? `${truncateLabel(s.preview)} (${s.initial_role})`
         : `(${s.initial_role}, ${s.session_id.slice(0, 12)}…)`;
     opt.textContent = label;
+    // 暂停状态徽章：⏸ 前缀。option 里没有独立 badge DOM，直接用
+    // 文本标记，下拉框当前选中时也能看到。
+    if (s.is_paused) opt.textContent = `⏸ ${label}`;
     opt.title = s.session_id;
     if (s.session_id === currentId) opt.selected = true;
     select.appendChild(opt);

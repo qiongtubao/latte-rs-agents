@@ -252,6 +252,25 @@ pub(crate) async fn chat_resume(
     }
 }
 
+pub(crate) async fn chat_pause_session(
+    State(state): State<AppState>,
+    Json(req): Json<SessionOnlyRequest>,
+) -> StatusCode {
+    match api::chat_pause_session(&state.backend, req.session_id.as_deref()).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
+pub(crate) async fn chat_resume_session(
+    State(state): State<AppState>,
+    Json(req): Json<SessionOnlyRequest>,
+) -> StatusCode {
+    match api::chat_resume_session(&state.backend, req.session_id.as_deref()).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
 /// Body for per-role pause/resume: carries the target `role_id` plus the
 /// usual optional `session_id`. Shared by both endpoints.
 #[derive(Deserialize)]

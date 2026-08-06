@@ -29,7 +29,7 @@ use latte_agent_core::advisor_monitor::{
     AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine,
 };
 use latte_agent_core::config::AgentConfig;
-use latte_agent_core::controller::{ChatController, ChatEvent, ControllerConfig};
+use latte_agent_core::controller::{ChatController, ChatEvent, ControllerConfig, FailedWorkflow};
 use latte_agent_core::event_json::chat_event_to_frontend_json;
 use latte_agent_core::model_resolver::{ModelResolver, ModelTier};
 use latte_ai::params::GenerateParams;
@@ -279,6 +279,65 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
     })
 }
 
+/// 反向扫描 session event_log 找最近一条 `status != "ok"` 的
+/// `WorkflowFinished`，组装成 [`FailedWorkflow`] 快照。
+///
+/// 与 controller 内部订阅者（spawn 时挂的那个）维护的 state 字段同
+/// 语义 —— 但这里是 cold-start 救场：恢复 session 首次 spawn
+/// controller 时，controller 还没收到任何实时事件，需要从落盘历史
+/// 里捞最近一次失败，避免用户重启 process 后必须手动传 wf_id 才能
+/// 续跑。
+///
+/// 返回 `Some(_)` = 找到了；checkpoint 文件是否还在由调用方
+/// （`spawn_controller`）另查，避免这里多 IO 依赖。
+fn last_failed_workflow_from_log(
+    event_log: &Arc<parking_lot::RwLock<Vec<String>>>,
+) -> Option<FailedWorkflow> {
+    let log = event_log.read();
+    for line in log.iter().rev() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("WorkflowFinished") {
+            continue;
+        }
+        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if status == "ok" {
+            continue;
+        }
+        // `?` 会让函数 return None，跳过前面的失败事件 —— 改成
+        // continue，让 reverse scan 继续往更早的事件找。真实场景
+        // 中 ui-sessions 尾部可能恰好是一行半截损坏事件。
+        let wf_id = match v.get("wf_id").and_then(|s| s.as_str()) {
+            Some(id) => id,
+            None => continue,
+        };
+        if wf_id.is_empty() {
+            continue;
+        }
+        let name = v
+            .get("name")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let summary = v
+            .get("summary")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(FailedWorkflow {
+            name,
+            wf_id: wf_id.to_string(),
+            summary,
+            failed_at_unix_ms: 0, // cold-start 不知道精确时间；
+                                  // UI 主要用 wf_id 决策，0 表示"非实时"
+        });
+    }
+    None
+}
+
+
 // ─── Session 状态 ─────────────────────────────────────────────────
 
 /// 懒 spawn 所需的全部输入（恢复 session 首个 chat/subscribe 时才
@@ -417,6 +476,37 @@ impl SessionHandle {
         // controller runs in the background. We don't keep the receiver
         // here — the per-tab SSE subscriber is what reads events.
         let _rx = controller.spawn(cfg).await;
+
+        // ── Cold-start seed ──
+        // 恢复 session 首次 spawn controller 时，把 event_log 历史里最近
+        // 一条 status != "ok" 的 WorkflowFinished 写进 controller
+        // `last_failed_workflow` 状态，让"重启后点继续"无需显式传
+        // wf_id。Checkpoint 文件丢失则跳过（保留 API 容错：用户
+        // 手动清理过 workflow-runs/ 的场景）。
+        //
+        // 时序：controller.spawn() 内部已经把内部订阅者挂上了，但
+        // driver 还没收到任何 ControllerInput、没有 send 任何
+        // WorkflowFinished；后续用户发消息触发的新事件会经内部订阅
+        // 者覆盖 seed —— 这是正确语义（用户重启后若主动跑了别的
+        // workflow，再点"继续"应当续跑那个新的失败，不是历史
+        // 那个）。
+        if let Some(failed) = last_failed_workflow_from_log(&self.event_log) {
+            let ckpt_path = self
+                .spawn
+                .cwd
+                .join(".latte/workflow-runs")
+                .join(format!("{}.jsonl", failed.wf_id));
+            // wf_id 路径安全（恢复路径不会遇到恶意输入，但仍守一道）：
+            // 拒绝任何带 `/`/`\`/`..` 的串。
+            let safe = !failed.wf_id.is_empty()
+                && !failed.wf_id.contains('/')
+                && !failed.wf_id.contains('\\')
+                && !failed.wf_id.contains("..");
+            if safe && ckpt_path.exists() {
+                controller.set_last_failed_workflow(failed);
+            }
+        }
+
         // Advisor 监察者：旁路订阅该 session 的事件流，发现异常时经
         // controller 的 hint 队列纠偏（通道 A）并广播 🦉 气泡（通道 B）。
         // 任务 detach 与下方 archive 任务同生命周期：ChatEvent::Done 或
@@ -673,5 +763,87 @@ pub fn clean_tmp(cwd: &Path) {
         if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个 event_log（Vec<String>）装进 Arc<RwLock<...>>，
+    /// 供 helper 单元测试用。
+    fn make_log(lines: &[&str]) -> Arc<parking_lot::RwLock<Vec<String>>> {
+        let log: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        Arc::new(parking_lot::RwLock::new(log))
+    }
+
+    /// 正常路径：log 末尾有一条 status != "ok" 的 WorkflowFinished，
+    /// 反向扫描应找到它并组装成 FailedWorkflow。
+    #[test]
+    fn last_failed_workflow_from_log_finds_last_non_ok() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"ok","summary":"done"}"#,
+            r#"{"type":"WorkflowFinished","name":"b","wf_id":"wf-b","status":"failed","summary":"boom"}"#,
+            r#"{"type":"WorkflowFinished","name":"c","wf_id":"wf-c","status":"failed","summary":"again"}"#,
+        ]);
+        let got = last_failed_workflow_from_log(&log).unwrap();
+        assert_eq!(got.wf_id, "wf-c", "应取最末一条失败的（reverse scan）");
+        assert_eq!(got.name, "c");
+        assert_eq!(got.summary, "again");
+    }
+
+    /// 全 ok → 返回 None。冷启动 session 没有可续跑的失败 workflow。
+    #[test]
+    fn last_failed_workflow_from_log_returns_none_when_all_ok() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"ok","summary":"done"}"#,
+        ]);
+        assert!(last_failed_workflow_from_log(&log).is_none());
+    }
+
+    /// 空 log → None。
+    #[test]
+    fn last_failed_workflow_from_log_returns_none_when_empty() {
+        let log = make_log(&[]);
+        assert!(last_failed_workflow_from_log(&log).is_none());
+    }
+
+    /// 损坏的 JSON 行应当被跳过 —— 真实 ui-sessions/*.jsonl 在
+    /// 进程异常退出时可能截断，不能让单行坏数据导致整个 cold-start
+    /// 失败。
+    #[test]
+    fn last_failed_workflow_from_log_skips_corrupt_lines() {
+        let log = make_log(&[
+            "not json",
+            r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"failed"}"#,
+            r#"{"type":"WorkflowFinished"}"#, // 缺 wf_id
+        ]);
+        let got = last_failed_workflow_from_log(&log).unwrap();
+        assert_eq!(got.wf_id, "wf-a");
+    }
+
+    /// 缺字段的 WorkflowFinished（无 wf_id）→ 跳过；不能把空串当
+    /// wf_id 写进 state（否则 resume API 会拿空串去拼 checkpoint 路径）。
+    #[test]
+    fn last_failed_workflow_from_log_skips_missing_wf_id() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowFinished","status":"failed"}"#,
+        ]);
+        assert!(last_failed_workflow_from_log(&log).is_none());
+    }
+
+    /// 多个 status=failed 事件混合 status=ok：reverse scan 应找到
+    /// log 末尾**最近的**失败。中间的 ok 不应"清空"前面的失败
+    /// （success wipe 是 controller 内部订阅者的语义，仅适用于
+    /// 实时事件流；冷启动 scan 保留 reverse 顺序原始语义）。
+    #[test]
+    fn last_failed_workflow_from_log_mixed_ok_failed() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"failed","summary":"old"}"#,
+            r#"{"type":"WorkflowFinished","name":"b","wf_id":"wf-b","status":"ok","summary":"middle"}"#,
+            r#"{"type":"WorkflowFinished","name":"c","wf_id":"wf-c","status":"failed","summary":"new"}"#,
+        ]);
+        let got = last_failed_workflow_from_log(&log).unwrap();
+        assert_eq!(got.wf_id, "wf-c", "末尾的 failed 覆盖前序的语义");
     }
 }

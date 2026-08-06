@@ -646,6 +646,23 @@ pub struct ChatController {
     /// （`AgentRunner::with_pause_gate`），runner 在 tool-round
     /// 边界挂起；任何用户输入到达（`submit_input`）即 resolve。
     advisor_pause: AdvisorPauseGate,
+    /// 最近一次失败的 workflow 快照 —— UI-server 的
+    /// `/api/workflows/resume` 直接读这个字段判断是否可续跑。
+    last_failed_workflow: Arc<parking_lot::RwLock<Option<FailedWorkflow>>>,
+    /// Session-level 暂停门（用户按 ⏸ 触发）。`Arc` 让 main driver
+    /// + delegate 出去的 specialist 共享同一个 gate —— 用户暂停时
+    /// 全部一起冻结。
+    agent_pause_gate: Arc<crate::pause_gate::AgentPauseGate>,
+}
+
+/// 最近一次失败 workflow 的快照。`wf_id` 对应
+/// `<cwd>/.latte/workflow-runs/<wf_id>.jsonl` checkpoint 文件。
+#[derive(Debug, Clone)]
+pub struct FailedWorkflow {
+    pub name: String,
+    pub wf_id: String,
+    pub summary: String,
+    pub failed_at_unix_ms: u64,
 }
 
 impl ChatController {
@@ -663,6 +680,8 @@ impl ChatController {
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
             plan_stage: Arc::new(parking_lot::RwLock::new(PlanStage::Normal)),
             advisor_pause: AdvisorPauseGate::new(),
+            last_failed_workflow: Arc::new(parking_lot::RwLock::new(None)),
+            agent_pause_gate: crate::pause_gate::AgentPauseGate::new("session"),
         }
     }
 
@@ -682,6 +701,33 @@ impl ChatController {
         let advisor_hints = self.advisor_hints.clone();
         let plan_stage = self.plan_stage.clone();
         let advisor_pause = self.advisor_pause.clone();
+        let agent_pause_gate = self.agent_pause_gate.clone();
+
+        // 内部订阅者：跟踪 WorkflowFinished 事件，维护
+        // last_failed_workflow 状态。
+        let state_slot = self.last_failed_workflow.clone();
+        let mut state_rx = self.event_tx.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = state_rx.recv().await {
+                if let ChatEvent::WorkflowFinished { name, wf_id, status, summary } = ev {
+                    let mut slot = state_slot.write();
+                    if status == "ok" {
+                        *slot = None;
+                    } else if !wf_id.is_empty() {
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        *slot = Some(FailedWorkflow {
+                            name,
+                            wf_id,
+                            summary,
+                            failed_at_unix_ms: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0),
+                        });
+                    }
+                }
+            }
+        });
 
         tokio::spawn(async move {
             run_driver(
@@ -694,6 +740,7 @@ impl ChatController {
                 advisor_hints,
                 plan_stage,
                 advisor_pause,
+                agent_pause_gate,
             )
             .await;
         });
@@ -773,6 +820,15 @@ impl ChatController {
         self.event_tx.clone()
     }
 
+    /// 返回当前 session 的暂停门共享句柄。
+    pub fn session_pause_gate(&self) -> Arc<crate::pause_gate::AgentPauseGate> {
+        self.agent_pause_gate.clone()
+    }
+
+    /// 当前 session 是否处于用户手动暂停状态。
+    pub fn is_session_paused(&self) -> bool {
+        self.agent_pause_gate.is_paused()
+    }
     /// Request pause after the current round completes.
     pub async fn pause(&self) {
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
@@ -798,6 +854,27 @@ impl ChatController {
         self.advisor_pause.request();
     }
 
+    /// engage —— turn / tool / round 边界一起冻结。返回是否"新"
+    /// 进入暂停（幂等）。
+    pub fn pause_session(&self) -> bool {
+        let newly = self.agent_pause_gate.pause();
+        if newly {
+            let _ = self.event_tx.send(ChatEvent::Paused {
+                reason: "用户暂停 session".into(),
+            });
+        }
+        newly
+    }
+    /// Session-level 恢复（与 [`pause_session`] 配对）。返回 paused
+    /// 时长 ms；若本来就没 paused 返回 `None`。
+    pub fn resume_session(&self) -> Option<u128> {
+        let elapsed = self.agent_pause_gate.resume();
+        if elapsed.is_some() {
+            let _ = self.event_tx.send(ChatEvent::Resumed);
+        }
+        elapsed
+    }
+
     /// 当前是否有未拍板的 advisor 暂停请求（测试与嵌入方断言用）。
     pub fn pause_requested(&self) -> bool {
         self.advisor_pause.is_requested()
@@ -806,6 +883,19 @@ impl ChatController {
     /// pause gate 共享句柄（driver 给主 runner 装配用）。
     pub fn advisor_pause_gate(&self) -> AdvisorPauseGate {
         self.advisor_pause.clone()
+    }
+
+    /// 当前 session 最近一次失败的 workflow 快照。详见
+    /// [`FailedWorkflow`]。UI-server 的 `/api/workflows/resume`
+    /// 直接读这个字段判断"该不该续跑"，不扫 event_log。
+    pub fn last_failed_workflow(&self) -> Option<FailedWorkflow> {
+        self.last_failed_workflow.read().clone()
+    }
+
+    /// 直接写入"最近失败 workflow"快照 —— 仅供恢复路径（cold-start
+    /// seed）使用。实时事件流维护走 controller 内部订阅者。
+    pub fn set_last_failed_workflow(&self, fw: FailedWorkflow) {
+        *self.last_failed_workflow.write() = Some(fw);
     }
 
     /// Switch to a different role (single-role mode only).
@@ -1050,6 +1140,7 @@ async fn run_driver(
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
     advisor_pause: AdvisorPauseGate,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
@@ -1063,6 +1154,7 @@ async fn run_driver(
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
+            agent_pause_gate,
         )
         .await;
     } else {
@@ -1075,6 +1167,7 @@ async fn run_driver(
             advisor_hints,
             plan_stage,
             advisor_pause,
+            agent_pause_gate,
         )
         .await;
     }
@@ -1093,8 +1186,8 @@ async fn run_multi_role_loop(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) {
-    // Resolve worktree root
     let repo_root = match WorkspaceManager::resolve_repo_root(&config.cwd) {
         Ok(root) => root,
         Err(e) => {
@@ -1297,6 +1390,7 @@ async fn run_multi_role_loop(
             turn_cancel_flag.clone(),
             config.advisor_monitor.runner_gate(),
             &plan_stage,
+            agent_pause_gate.clone(),
         )
         .await
         {
@@ -1458,7 +1552,7 @@ async fn run_multi_role_loop(
                 cmd => {
                     let parts: Vec<&str> = line.splitn(2, ' ').collect();
                     let topic = parts.get(1).unwrap_or(&"").trim();
-                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone()).await {
+                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone()).await {
                         Ok(Some(summary)) => {
                             let _ = event_tx.send(ChatEvent::Status {
                                 message: format!("Workflow '{cmd}' 完成。结果已交给 manager 处理。"),
@@ -1783,6 +1877,7 @@ async fn run_single_role_loop(
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
     advisor_pause: AdvisorPauseGate,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) {
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
@@ -1815,6 +1910,7 @@ async fn run_single_role_loop(
         turn_cancel_flag.clone(),
         config.advisor_monitor.runner_gate(),
         &plan_stage,
+        agent_pause_gate.clone(),
     )
         .await
     {
@@ -1928,7 +2024,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -1950,7 +2046,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -1973,7 +2069,7 @@ async fn run_single_role_loop(
                                 }
                                 cmd => {
                                     let topic = parts.get(1).unwrap_or(&"").trim();
-                                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone()).await {
+                                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone()).await {
                                         Ok(Some(summary)) => {
                                             let _ = event_tx.send(ChatEvent::Status {
                                                 message: format!("Workflow '{cmd}' 完成。\n{summary}"),
@@ -2095,7 +2191,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2110,7 +2206,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2175,6 +2271,7 @@ async fn build_runner(
     // plan 阶段门共享句柄：透传给 `register_plan_tool`（置
     // PendingApproval）与 `register_delegate_tool`（拦截实现类角色）。
     plan_stage: &SharedPlanStage,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -2253,6 +2350,7 @@ async fn build_runner(
                 turn_cancel_flag.clone(),
                 advisor_gate.clone(),
                 plan_stage.clone(),
+                agent_pause_gate.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -2269,6 +2367,7 @@ async fn build_runner(
                 cwd.to_path_buf(),
                 cancel_flag.clone(),
                 turn_cancel_flag.clone(),
+                agent_pause_gate.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register workflow: {e}")))?;
@@ -2324,6 +2423,7 @@ async fn build_runner(
         if let Some(gate) = advisor_gate.clone() {
             runner = runner.with_gate_config(gate);
         }
+        runner = runner.with_agent_pause_gate(agent_pause_gate);
         Ok((runner, role_id.to_string()))
     } else {
         // ── 给主 runner 分配 subsession sink（同上） ──
@@ -2343,10 +2443,10 @@ async fn build_runner(
         let mut runner = AgentRunner::new(agent)
             .with_role(role_id)
             .with_cwd(cwd.to_path_buf());
-        runner = runner.with_sink(runner_sink);
         if let Some(gate) = advisor_gate {
             runner = runner.with_gate_config(gate);
         }
+        runner = runner.with_agent_pause_gate(agent_pause_gate);
         Ok((runner, role_id.to_string()))
     }
 }
@@ -2946,6 +3046,9 @@ async fn register_delegate_tool(
     advisor_gate: Option<GateConfig>,
     // plan 阶段门共享句柄：`PendingApproval` 时拒绝派发实现类角色。
     plan_stage: SharedPlanStage,
+    // Session-level 暂停门 —— specialist runner 也装上，用户按 ⏸
+    // 时 subagent 一起冻结。
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -3010,6 +3113,9 @@ async fn register_delegate_tool(
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
         let plan_stage = plan_stage.clone();
+        // 闭包是 `Fn`（可能多调用），clone 一份 agent_pause_gate 供
+        // 每次 specialist 创建时 attach。
+        let agent_pause_gate = agent_pause_gate.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -3140,6 +3246,9 @@ async fn register_delegate_tool(
             if let Some(gate) = advisor_gate.clone() {
                 runner = runner.with_gate_config(gate);
             }
+            // Session-level 暂停门：subagent 也共享 —— 用户按 ⏸ 时
+            // specialist 在下一个 turn/tool 边界一起 park。
+            runner = runner.with_agent_pause_gate(agent_pause_gate.clone());
 
             // Emit RoleStarted so the UI shows the specialist is working
             let task_clone = task.clone();
@@ -3322,6 +3431,7 @@ async fn register_delegate_tool(
         })
     });
 
+
     let tool = Tool::builder(
         "delegate".to_string(),
         format!("Delegate a subtask to a specialist agent. Available roles: {roster}"),
@@ -3351,9 +3461,9 @@ async fn register_workflow_tool(
     cwd: PathBuf,
     cancel_flag: Arc<AtomicBool>,
     _turn_cancel_flag: Arc<AtomicBool>,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
-
     // 注册时动态枚举 .latte/workflows.d（项目 + 全局）里的可用
     // workflow，写进 schema/description —— UI 管理界面新建的自定义
     // workflow 对模型立刻可见，不再靠静态样例列表。
@@ -3409,17 +3519,18 @@ async fn register_workflow_tool(
 
     let merged_owned = Arc::new(merged.clone());
     let resolver_owned = Arc::new(resolver.clone());
+    let agent_pause_gate_owned = agent_pause_gate.clone();
 
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
         let resolver = Arc::clone(&resolver_owned);
         let default_params = default_params.clone();
         let event_tx = event_tx.clone();
-        let cwd = cwd.clone();
         let cancel_flag = Arc::clone(&cancel_flag);
+        let agent_pause_gate = agent_pause_gate_owned.clone();
+        let cwd = cwd.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
-
             let name = input
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -3457,6 +3568,7 @@ async fn register_workflow_tool(
                 cwd,
                 event_tx,
                 cancel_flag,
+                agent_pause_gate: Some(agent_pause_gate),
                 depth: 0,
             };
             let result = match &resume {
@@ -3491,6 +3603,7 @@ async fn run_workflow_command(
     config: &ControllerConfig,
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
 ) -> Result<Option<String>, String> {
     let wf = match crate::workflow::load_workflow_by_command(cmd, &config.cwd) {
         Ok(w) => w,
@@ -3504,6 +3617,7 @@ async fn run_workflow_command(
         cwd: config.cwd.clone(),
         event_tx: event_tx.clone(),
         cancel_flag,
+        agent_pause_gate: Some(agent_pause_gate),
         depth: 0,
     };
 
@@ -3732,6 +3846,7 @@ mod tests {
             dir.path().to_path_buf(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            crate::pause_gate::AgentPauseGate::new("test"),
         )
         .await
         .expect("register workflow tool");
@@ -4137,6 +4252,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             None,
             stage.clone(),
+            crate::pause_gate::AgentPauseGate::new("test"),
         )
         .await
         .expect("register delegate");

@@ -40,7 +40,10 @@ export interface SessionInfo {
   tier: string;
   available_sessions: SessionSummary[];
   available_roles: RoleInfo[];
+  /** true when the user pressed ⏸ and the session is frozen. */
+  is_paused: boolean;
 }
+
 
 export interface SessionSummary {
   session_id: string;
@@ -51,8 +54,10 @@ export interface SessionSummary {
   initial_role: string;
   created_at_unix_ms: number;
   last_activity_unix_ms: number;
+  restored?: boolean;
+  /** true when the user pressed ⏸ and the session is frozen. */
+  is_paused: boolean;
 }
-
 export interface TraceSummary {
   session_id: string;
   path: string;
@@ -407,6 +412,19 @@ export async function pauseSession(): Promise<void> {
 /** Resume a paused session. The backend echoes a `Resumed` ChatEvent. */
 export async function resumeSession(): Promise<void> {
   await getTransport().request("POST", "/api/chat/resume", chatBody({}));
+}
+
+/** Session-level 暂停（用户按 ⏸）：全 session 冻结（turn / tool /
+ *  subagent 一起停，对齐 oh-my-pi 的 agentPauseGate）。区别于
+ *  `pauseSession()`（legacy flag-based，只停 driver loop 的下个
+ *  turn）。后端广播 `Paused` 事件驱动 UI 按钮态。 */
+export async function pauseSessionV2(): Promise<void> {
+  await getTransport().request("POST", "/api/chat/pause-session", chatBody({}));
+}
+
+/** Session-level 恢复，与 `pauseSessionV2` 配对。广播 `Resumed`。 */
+export async function resumeSessionV2(): Promise<void> {
+  await getTransport().request("POST", "/api/chat/resume-session", chatBody({}));
 }
 
 /** Pause a single role (multi-role HIL). Orthogonal to `pauseSession()`:
@@ -814,6 +832,24 @@ export async function runWorkflow(
 /** POST /api/workflows/run/stop：停止当前运行中的 workflow。 */
 export async function stopWorkflowRun(): Promise<void> {
   await getTransport().request("POST", "/api/workflows/run/stop");
+}
+
+/** `POST /api/workflows/resume` —— 从断点续跑一个失败的 workflow。
+ *  body: `{ session_id, wf_id? }`。
+ *  `wf_id` 缺省 → 后端反向扫该 session 的 event_log 找最后一条失败的
+ *  `WorkflowFinished`（最常见的"点击继续"场景，前端不用关心 wf_id）。
+ *  显式 `wf_id` → 续跑指定的那一次（高级用例）。
+ *  立即返回 `{ started, wf_id, name }`；续跑产生的 WorkflowStarted /
+ *  Step / Turn / Finished 事件经该 session 的 SSE 流回，前端无需额外
+ *  订阅。 */
+export async function resumeWorkflow(
+  sessionId: string,
+  wfId?: string,
+): Promise<{ started: true; wf_id: string; name: string }> {
+  return getTransport().request("POST", "/api/workflows/resume", {
+    session_id: sessionId,
+    ...(wfId ? { wf_id: wfId } : {}),
+  });
 }
 
 export type TaskState =

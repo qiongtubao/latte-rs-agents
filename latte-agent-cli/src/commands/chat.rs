@@ -1130,6 +1130,7 @@ async fn register_workflow_tool(
                     cwd,
                     event_tx,
                     cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    agent_pause_gate: None, // CLI REPL workflow：无 session agent gate
                     depth: 0,
                 };
                 latte_agent_core::workflow::run_workflow(&wf, &topic, &ctx)

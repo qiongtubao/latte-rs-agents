@@ -378,6 +378,7 @@ impl ModelResolver {
             supports_vision: def.supports_vision,
             cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
             cost_per_million_output: def.cost_per_million_output.unwrap_or(0.0),
+            timeout_secs: def.timeout_secs,
         })
     }
     /// Look up the raw `ModelDef` for a model id, returning the catalog
@@ -488,6 +489,34 @@ mod tests {
         assert_eq!(ModelTier::Premium.escalate(), None);
     }
 
+    /// P1-3：timeout_secs 从 ModelDef 传递到 latte_ai::Model。
+    /// 用户配置 architect 角色的模型 timeout_secs = 600 时，构建出
+    /// 的 Model 携带该值，AiClient::new 用它覆盖默认 300s。
+    #[test]
+    fn test_build_model_carries_timeout_secs() {
+        let config = AgentConfig {
+            models: crate::config::ModelCatalog {
+                models: vec![
+                    ModelDef {
+                        timeout_secs: Some(600),
+                        ..test_model_def("timeout-test", None)
+                    },
+                    ModelDef {
+                        timeout_secs: None,
+                        ..test_model_def("no-timeout", None)
+                    },
+                ],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        let m = resolver.build_model("timeout-test").expect("build");
+        assert_eq!(m.timeout_secs, Some(600), "timeout_secs propagated");
+        let m2 = resolver.build_model("no-timeout").expect("build");
+        assert_eq!(m2.timeout_secs, None, "不设 timeout 时保持 None");
+    }
     #[test]
     fn test_resolve_via_tier_defaults() {
         let config = AgentConfig {

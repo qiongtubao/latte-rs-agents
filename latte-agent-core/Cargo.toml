@@ -14,6 +14,7 @@ latte-ai = { workspace = true }
 latte-rs-agent-tools = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = "0.7"
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
@@ -27,7 +28,7 @@ serde_yaml = { workspace = true }
 handlebars = { workspace = true }
 
 # HTTP client + base64 for the image-generation tool (OpenAI-compatible
-# /v1/images/generations endpoint, b64_json responses).
+# /v1/images/generations endpoint, b64_json response).
 reqwest = { workspace = true }
 base64 = "0.22"
 

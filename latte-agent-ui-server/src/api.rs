@@ -73,6 +73,9 @@ pub struct SessionInfo {
     /// All sessions the caller could switch to (sidebar).
     pub available_sessions: Vec<SessionSummary>,
     pub available_roles: Vec<RoleInfo>,
+    /// true = 当前 session 处于用户按 ⏸ 的暂停状态。
+    #[serde(default)]
+    pub is_paused: bool,
 }
 
 /// 侧栏轻量条目 — `GET /api/sessions` 返回，也内嵌在 [`SessionInfo`]。
@@ -91,6 +94,10 @@ pub struct SessionSummary {
     /// 本次进程启动；agent 上下文从空开始，首个 chat/subscribe 时
     /// 懒 spawn controller）。
     pub restored: bool,
+    /// true = 该 session 处于用户按 ⏸ 的暂停状态（未暂停 / controller
+    /// 尚未 spawn / 侧栏未显示暂停 badge）。
+    #[serde(default)]
+    pub is_paused: bool,
 }
 
 pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
@@ -110,6 +117,7 @@ pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
             created_at_unix_ms: millis_from_now(now, h.created_at),
             last_activity_unix_ms: millis_from_now(now, *h.last_activity.lock()),
             restored: h.restored,
+            is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
         })
         .collect();
     // last_activity_unix_ms 存的是"距上次活动的毫秒数"（age），越小越
@@ -155,8 +163,10 @@ pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
             created_at_unix_ms: 0,
             last_activity_unix_ms: 0,
             restored: h.restored,
+            is_paused: false,
         }],
         available_roles: build_role_info(&b.merged.read()),
+        is_paused: false,
     };
     b.sessions.write().insert(h.session_id.clone(), h);
     Ok(resp)
@@ -257,8 +267,10 @@ pub async fn fork_session(
             created_at_unix_ms: 0,
             last_activity_unix_ms: 0,
             restored: false,
+            is_paused: false,
         }],
         available_roles: build_role_info(&b.merged.read()),
+        is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
     };
     b.sessions.write().insert(h.session_id.clone(), h);
     Ok(resp)
@@ -311,8 +323,10 @@ pub fn get_session(b: &UiBackend, id: &str) -> Result<SessionInfo, ApiError> {
                 millis_from_now(Instant::now(), *g)
             },
             restored: h.restored,
+            is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
         }],
         available_roles: build_role_info(&b.merged.read()),
+        is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
     })
 }
 
@@ -400,6 +414,20 @@ pub async fn session_event_sender(
     Ok(controller.event_sender())
 }
 
+/// 拿 session controller 的 session-level 暂停门（`Arc<AgentPauseGate>`）。
+/// 任务看板把绑定 workflow 的 run 也用**同一个** gate —— 用户 ⏸ 时
+/// 看板派的 workflow 也一起停；▶ 一起恢复。
+pub async fn session_pause_gate(
+    b: &UiBackend,
+    id: &str,
+) -> Result<Arc<latte_agent_core::pause_gate::AgentPauseGate>, ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    Ok(controller.session_pause_gate())
+}
 // ─── Roles ────────────────────────────────────────────────────────
 
 pub fn list_roles(b: &UiBackend) -> Vec<RoleInfo> {
@@ -1165,6 +1193,32 @@ pub async fn chat_resume(
     Ok(())
 }
 
+/// `POST /api/chat/pause-session` — 用户按 ⏸ 触发全 session 冻结。
+pub async fn chat_pause_session(
+    b: &UiBackend,
+    session_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    if let Some(controller) = h.try_controller() {
+        controller.pause_session();
+    }
+    Ok(())
+}
+
+/// `POST /api/chat/resume-session` — 与 [`chat_pause_session`] 配对。
+pub async fn chat_resume_session(
+    b: &UiBackend,
+    session_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    if let Some(controller) = h.try_controller() {
+        let _elapsed = controller.resume_session();
+    }
+    Ok(())
+}
+
 /// `POST /api/chat/pause-role` — 单独暂停一个角色（多角色 HIL v1.4）。
 /// 与整会话的 [`chat_pause`] 正交：被暂停的角色在每轮里被 scheduler
 /// 跳过，其余角色照常推进，全局 `SessionState` 不变。底层复用
@@ -1581,6 +1635,7 @@ pub fn workflow_run_start(
             cwd,
             event_tx: tx_inner,
             cancel_flag: cancel,
+            agent_pause_gate: None, // 独立测试 run：无 session gate
             depth: 0,
         };
         let _ = run_workflow(&wf, &topic, &ctx).await;

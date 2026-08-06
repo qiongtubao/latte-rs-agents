@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSession, resumeSession, pauseRole, resumeRole, importTasks, uploadImage, listWorkflows, type ImportTask, type ChoiceOption } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, uploadImage, listWorkflows, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
@@ -973,7 +973,9 @@ const stepMsgIds = new Map<string, string>();
     if (container.pauseBtn.disabled) return;
     container.pauseBtn.disabled = true;
     try {
-      await pauseSession();
+      // 全 session 冻结（对齐 oh-my-pi agentPauseGate）：turn / tool /
+      // subagent 一起停，后端广播 Paused 驱动按钮复位。
+      await pauseSessionV2();
     } catch (e) {
       console.error("[chat] pause failed:", e);
       container.pauseBtn.disabled = false; // re-enable on failure
@@ -983,7 +985,7 @@ const stepMsgIds = new Map<string, string>();
     if (container.resumeBtn.disabled) return;
     container.resumeBtn.disabled = true;
     try {
-      await resumeSession();
+      await resumeSessionV2();
     } catch (e) {
       console.error("[chat] resume failed:", e);
       container.resumeBtn.disabled = false; // re-enable on failure
@@ -1692,6 +1694,29 @@ const stepMsgIds = new Map<string, string>();
         stateEl.className = "delegate-state pending";
         stateEl.textContent = "⏳ 工作流执行中…";
         msg.querySelector(".msg-bubble")?.appendChild(stateEl);
+        // 运行态控制按钮：暂停 / 继续（全 session 级）
+        const pauseBtn = document.createElement("button");
+        pauseBtn.className = "wf-run-control-btn";
+        pauseBtn.textContent = "⏸ 暂停";
+        pauseBtn.title = "暂停整个 session（workflow 会在下个 step/model 边界 park）";
+        pauseBtn.addEventListener("click", async () => {
+          pauseBtn.disabled = true;
+          try {
+            await pauseSessionV2();
+            pauseBtn.textContent = "▶ 继续";
+            pauseBtn.title = "恢复整个 session（workflow 继续）";
+            pauseBtn.onclick = async () => {
+              pauseBtn.disabled = true;
+              try {
+                await resumeSessionV2();
+                pauseBtn.textContent = "⏸ 暂停";
+                pauseBtn.title = "暂停整个 session";
+                pauseBtn.onclick = null; // 恢复原事件
+              } catch { pauseBtn.disabled = false; }
+            };
+          } catch { pauseBtn.disabled = false; }
+        });
+        msg.querySelector(".msg-bubble")?.appendChild(pauseBtn);
         workflowStates.set(e.wf_id, stateEl);
         setFooter(`workflow ${e.name} 运行中…`);
         resetWaitTimer();
@@ -1759,10 +1784,44 @@ const stepMsgIds = new Map<string, string>();
           workflowStates.delete(e.wf_id);
         }
         const summary = e.summary?.trim() ? `\n${truncate(e.summary, 300)}` : "";
-        addMessage({
+        const msg = addMessage({
           kind: isFail ? "error" : "system",
           content: `${isFail ? "❌" : "✅"} 工作流「${e.name}」${isFail ? `失败(${e.status})` : "完成"}${summary}`,
         });
+        // 失败时给一个「🔄 续跑」按钮：调后端 /api/workflows/resume
+        // 从 checkpoint 续跑这条失败工作流。`wf_id` 显式带过去更确定
+        // （若不传，后端反向扫 event_log 也行，但当前消息里的 wf_id
+        // 就是失败那条本身，最准确）。点击后按钮禁用 + 反馈状态。
+        if (isFail) {
+          const resumeBtn = document.createElement("button");
+          resumeBtn.className = "wf-resume-btn";
+          resumeBtn.textContent = `🔄 续跑（wf_id=${e.wf_id}）`;
+          resumeBtn.title = "从断点续跑这个失败的工作流（已完成步骤会自动跳过）";
+          resumeBtn.addEventListener("click", async () => {
+            const sid = getCurrentSessionId();
+            if (!sid) {
+              resumeBtn.textContent = "❌ 无 session_id";
+              resumeBtn.disabled = true;
+              return;
+            }
+            resumeBtn.disabled = true;
+            const orig = resumeBtn.textContent;
+            resumeBtn.textContent = "⏳ 续跑中…";
+            try {
+              const resp = await resumeWorkflow(sid, e.wf_id);
+              resumeBtn.textContent = `✅ 已发起续跑（${resp.name}）`;
+              // 续跑产生的 WorkflowStarted/Step/Turn/Finished 事件会经
+              // 该 session 的 SSE 流回 → 自然出现在聊天面板，无需额外
+              // 订阅。按钮保持禁用状态，避免重复点击。
+            } catch (err) {
+              resumeBtn.textContent = `❌ ${(err as Error).message}`;
+              // 失败可重试：把按钮恢复成可点击。
+              resumeBtn.disabled = false;
+              setTimeout(() => { resumeBtn.textContent = orig; }, 4000);
+            }
+          });
+          msg.querySelector(".msg-bubble")?.appendChild(resumeBtn);
+        }
         // plan 类 workflow 完成后：扫描 transcript 里的任务 JSON，
         // 给「导入任务看板」按钮（与 workflows 面板同一提取逻辑）。
         if (!isFail) {

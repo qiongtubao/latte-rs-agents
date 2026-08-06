@@ -1268,8 +1268,70 @@ select {
   cursor: default;
   border-color: var(--border);
   color: var(--fg-2);
+.workflow-import-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
+/* 工作流失败气泡里的「🔄 续跑」按钮 —— 从断点续跑失败的 workflow。
+ * 视觉与 workflow-import-btn 一致但用绿色调（与 .resume-btn 同语义：
+ * "click to continue"），并加左边色条强调「恢复」语义。 */
+.wf-resume-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0 0;
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #065f46;
+  background: #ecfdf5;
+  border: 1px solid #059669;
+  border-left-width: 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+.wf-resume-btn:hover:not(:disabled) {
+  background: #d1fae5;
+  border-color: #047857;
+}
+.wf-resume-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.wf-resume-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 运行中 workflow 气泡里的「⏸ 暂停 / ▶ 继续」按钮 —— 全 session 级
+ * 控制（下个 step / model 边界 park）。琥珀色调区别于失败续跑的绿。 */
+.wf-run-control-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 8px 8px 0 0;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #92400e;
+  background: #fffbeb;
+  border: 1px solid #f59e0b;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+.wf-run-control-btn:hover:not(:disabled) {
+  background: #fef3c7;
+  border-color: #d97706;
+}
+.wf-run-control-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.wf-run-control-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 /* ─── context menu (right-click) ───────────────────────────────── */
 
 .context-menu {

@@ -320,6 +320,7 @@ fn build_latte_ai_model(def: &ModelDef) -> anyhow::Result<latte_ai::models::Mode
         supports_vision: def.supports_vision,
         cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
         cost_per_million_output: def.cost_per_million_output.unwrap_or(0.0),
+        timeout_secs: def.timeout_secs,
     })
 }
 

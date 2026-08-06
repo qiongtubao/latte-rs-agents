@@ -686,6 +686,8 @@ pub struct AgentRunner {
     /// 置位后 runner 挂起等用户拍板。只装到 watched role 的主
     /// runner（driver 单角色 loop）；delegate specialist 不带。
     pause_gate: Option<crate::advisor_monitor::AdvisorPauseGate>,
+    /// Session-level 暂停门（用户按 ⏸ 触发），与 advisor `pause_gate` 正交。
+    agent_pause_gate: Option<std::sync::Arc<crate::pause_gate::AgentPauseGate>>,
     // 强制 native function-calling：tool schema 经 GenerateParams.tools
     // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
     // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
@@ -967,6 +969,7 @@ impl AgentRunner {
             last_turn_tool_count: 0,
             gate_config: None,
             pause_gate: None,
+            agent_pause_gate: None,
         }
     }
     pub fn new_with_tools(
@@ -991,6 +994,7 @@ impl AgentRunner {
             last_turn_tool_count: 0,
             gate_config: None,
             pause_gate: None,
+            agent_pause_gate: None,
         }
     }
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
@@ -1011,6 +1015,7 @@ impl AgentRunner {
             last_turn_tool_count: 0,
             gate_config: None,
             pause_gate: None,
+            agent_pause_gate: None,
         }
     }
 
@@ -1029,10 +1034,19 @@ impl AgentRunner {
     /// handle is held by the `ChatController`（monitor 经
     /// `request_pause()` 置位；`submit_input` resolve）；本 runner
     /// 在每个 tool-round 边界 `wait_if_requested()`。只应装到
-    /// watched role 的主 runner——advisor 自身与 delegate
-    /// specialist 不装。
     pub fn with_pause_gate(mut self, gate: crate::advisor_monitor::AdvisorPauseGate) -> Self {
         self.pause_gate = Some(gate);
+        self
+    }
+    /// Attach session-level pause gate（用户按 ⏸ 触发），与 [`with_pause_gate`]
+    /// （advisor monitor 的细粒度干预门）正交共存。
+    /// Clone `Arc<AgentPauseGate>`：同一 session 的 main driver + subagent
+    /// + tool runner 共享同一 gate —— 用户按暂停时全部一起冻结。
+    pub fn with_agent_pause_gate(
+        mut self,
+        gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    ) -> Self {
+        self.agent_pause_gate = Some(gate);
         self
     }
     /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
@@ -1191,8 +1205,11 @@ impl AgentRunner {
         new_messages: &[Message],
         system_vars: Option<&serde_json::Value>,
     ) -> AgentResult<String> {
+        // Session-level 暂停：用户按 ⏸ 时 run_turn 入口 park。
+        if let Some(gate) = self.agent_pause_gate.clone() {
+            let _ = gate.wait_until_resumed(None).await;
+        }
         // HIL blackboard: drain per-role inject queue.
-        self.drain_inject_queue();
         // Advisor monitor: drain pending hints into the context
         // *before* the working message list is built below, so the
         // first model call of this turn already sees them.
@@ -1317,6 +1334,13 @@ impl AgentRunner {
                 // 下一次模型调用。
                 if let Some(gate) = self.pause_gate.clone() {
                     gate.wait_if_requested().await;
+                }
+                // Session-level 暂停（用户按 ⏸）：每个 model call 之前
+                // park —— 与 entry + tool-exec 边界一起，构成"任何
+                // 状态都能暂停"的完整覆盖。in-flight model stream
+                // 跑完，下个 round 才停。
+                if let Some(gate) = self.agent_pause_gate.clone() {
+                    let _ = gate.wait_until_resumed(None).await;
                 }
                 for hint in self.drain_advisor_hints() {
                     messages.push(Message::user(format!("🦉 advisor 监察：\n{hint}")));
@@ -1607,6 +1631,11 @@ impl AgentRunner {
 
                     while attempt < max_attempts {
                         attempt += 1;
+                        // Session-level 暂停：tool 启动前 park（in-flight
+                        // tool 跑完才停，下一个 tool 启动前才看 gate）。
+                        if let Some(gate) = self.agent_pause_gate.clone() {
+                            let _ = gate.wait_until_resumed(None).await;
+                        }
                         // 1. parse args。native 协议下模型输出的是合法 JSON；
                         // 若 latte-ai 层解析失败，arguments_raw 保留原始坏串，
                         // 这里 from_str 会失败并归类为 MalformedArgs。
@@ -2184,6 +2213,7 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
+            timeout_secs: None,
         }
     }
 
@@ -2478,6 +2508,7 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
+            timeout_secs: None,
         }
     }
 
@@ -3249,6 +3280,146 @@ mod tests {
         assert!(
             server.received_requests().await.unwrap().len() >= 2,
             "tool loop continued after resume"
+        );
+    }
+
+    /// Session-level pause gate（用户按 ⏸ 触发）：run_turn 入口
+    /// park、tool 启动前 park。测试：pause 后 run_turn 永远不
+    /// 完成；resolve 后才走完。
+    #[tokio::test]
+    async fn agent_pause_gate_suspends_run_turn_entry_until_resumed() {
+        use crate::pause_gate::AgentPauseGate;
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_completion_body("hi", vec![])))
+            .mount(&server)
+            .await;
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let tm = create_tool_manager();
+        let gate = AgentPauseGate::new("test");
+        // Pre-pause（模拟用户先按 ⏸ 后才发消息）。
+        gate.pause();
+        let mut runner =
+            AgentRunner::new_with_tools(agent, tm, 4).with_agent_pause_gate(gate.clone());
+        let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
+        // 200ms 后仍不完成（gate 在 park）。
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!turn.is_finished(), "run_turn parked at entry on pre-paused gate");
+        // resolve → 跑完。
+        gate.resume();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("turn resumes after gate resume")
+            .expect("turn join ok");
+        assert_eq!(r.unwrap(), "hi");
+    }
+
+    /// 用户在 tool exec 期间按 ⏸：当前 tool 跑完（in-flight 不打断），
+    /// 下一个 model call 之前在 gate 处 park；resume 后继续。
+    #[tokio::test]
+    async fn agent_pause_gate_lets_in_flight_tool_finish() {
+        use crate::pause_gate::AgentPauseGate;
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let gate = AgentPauseGate::new("test");
+        // 工具 handler 扮演"用户按暂停"：第一个 tool 执行时 engage
+        // gate（in-flight tool 已启动、会跑完），turn 在下一轮
+        // model call 边界 park。
+        let gate_in_tool = gate.clone();
+        let requested_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            let gate = gate_in_tool.clone();
+            let once = requested_once.clone();
+            Box::pin(async move {
+                if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    gate.pause();
+                }
+                Ok(serde_json::json!({ "ok": true }))
+            })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tool = Tool::builder("ping", "test ping", schema, handler).build();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_completion_body(
+                "",
+                vec![serde_json::json!({
+                    "id": "call_ping",
+                    "type": "function",
+                    "function": {"name": "ping", "arguments": "{}"}
+                })],
+            )))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_completion_body("done", vec![])))
+            .mount(&server)
+            .await;
+        let tm = create_tool_manager();
+        tm.register(tool, None);
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            role,
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner =
+            AgentRunner::new_with_tools(agent, tm, 4).with_agent_pause_gate(gate.clone());
+        let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
+        // 第一个 tool 已启动、in-flight 会跑完，但 tool 内部 engage
+        // 了 gate → 下个 model call 边界 park。
+        for _ in 0..100 {
+            if gate.is_paused() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gate.is_paused(), "tool handler engaged the gate");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!turn.is_finished(), "in-flight tool 跑完，但下个 model call park");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "in-flight tool 跑完但没有第二次模型请求（parked）"
+        );
+        // Resume → 第二次模型请求 → 返回 text。
+        gate.resume();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("turn resumes")
+            .expect("turn join ok")
+            .expect("run ok");
+        assert_eq!(r, "done");
+        assert!(
+            server.received_requests().await.unwrap().len() >= 2,
+            "resume 后跑了第二次模型请求"
         );
     }
 

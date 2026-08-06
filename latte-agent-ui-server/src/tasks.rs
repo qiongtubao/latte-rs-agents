@@ -936,9 +936,9 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
                 .get(&id)
                 .and_then(|t| t.runs.last().map(|r| r.session_id.clone()))
         };
-        let event_tx = match &last_session {
+        let (event_tx, session_id) = match &last_session {
             Some(sid) => match api::session_event_sender(&b, sid).await {
-                Ok(tx) => tx,
+                Ok(tx) => (tx, sid.clone()),
                 Err(e) => {
                     eprintln!("[tasks] hook session sender {sid}: {}", e.message);
                     return;
@@ -954,7 +954,7 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
                 };
                 let _ = api::set_session_label(&b, &info.session_id, &format!("[{id}] {wf_name}"));
                 match api::session_event_sender(&b, &info.session_id).await {
-                    Ok(tx) => tx,
+                    Ok(tx) => (tx, info.session_id.clone()),
                     Err(e) => {
                         eprintln!("[tasks] hook new session sender: {}", e.message);
                         return;
@@ -962,6 +962,8 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
                 }
             }
         };
+        // 复用该 session 的暂停门：用户 ⏸ 时看板派的 workflow 也一起停。
+        let agent_pause_gate = api::session_pause_gate(&b, &session_id).await.ok();
         let ctx = WorkflowRunContext {
             merged: Arc::new(b.merged.read().clone()),
             resolver: b.resolver.clone(),
@@ -970,6 +972,7 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             depth: 0,
+            agent_pause_gate,
         };
         let result = run_workflow(&wf, &topic, &ctx).await;
         let mut store = b.tasks.write();
@@ -1149,6 +1152,9 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
         let task_id = id.to_string();
         let msg2 = msg.clone();
         tokio::spawn(async move {
+            // 复用该 session 的暂停门：用户 ⏸ 时这个看板 workflow 也一起停。
+            let agent_pause_gate =
+                api::session_pause_gate(&b2, &info.session_id).await.ok();
             let ctx = WorkflowRunContext {
                 merged: Arc::new(b2.merged.read().clone()),
                 resolver: b2.resolver.clone(),
@@ -1157,6 +1163,7 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
                 event_tx: event_tx.clone(),
                 cancel_flag: cancel.clone(),
                 depth: 0,
+                agent_pause_gate: agent_pause_gate.clone(),
             };
             let result = run_workflow(&wf, &msg2, &ctx).await;
             // 开发流跑完（非 code_review 本身）→ 链式自动审查。
@@ -1164,7 +1171,7 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
             let dev_summary = result.as_ref().ok().cloned().unwrap_or_default();
             finish_workflow_run(&b2, &task_id, result, &cancel);
             if chain_review {
-                chain_code_review(&b2, &task_id, msg2, dev_summary, event_tx).await;
+                chain_code_review(&b2, &task_id, msg2, dev_summary, event_tx, agent_pause_gate.clone()).await;
             }
         });
     }
@@ -1270,6 +1277,7 @@ async fn chain_code_review(
     dispatch_msg: String,
     dev_summary: String,
     event_tx: tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent>,
+    agent_pause_gate: Option<Arc<latte_agent_core::pause_gate::AgentPauseGate>>,
 ) {
     let in_review = {
         let store = b.tasks.read();
@@ -1297,6 +1305,7 @@ async fn chain_code_review(
         event_tx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
         depth: 0,
+        agent_pause_gate,
     };
     let result = run_workflow(&wf, &topic, &ctx).await;
     let mut store = b.tasks.write();
