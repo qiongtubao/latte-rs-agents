@@ -6,6 +6,7 @@ import {
   renameSession, deleteSession,
   getRolesConfig,
 } from "./api";
+import { setStreamMode } from "./api";
 import { mountChat } from "./chat_impl";
 import type { ChatController } from "./chat_impl";
 import { mountTrace } from "./trace";
@@ -415,6 +416,26 @@ async function main(): Promise<void> {
   const newSessionBtn = $("session-new-btn") as HTMLButtonElement;
   const renameSessionBtn = $("session-rename-btn") as HTMLButtonElement;
   const delSessionBtn = $("session-del-btn") as HTMLButtonElement;
+
+  // ── Stream 模式开关 ──
+  // 运行时切换 stream/non-stream：按钮点击 → setStreamMode API →
+  // SessionHandle.stream_mode → AgentRunner，对当前 session 立即生效。
+  const streamToggleBtn = $("stream-toggle") as HTMLButtonElement;
+  let streamOn = false;
+  streamToggleBtn.classList.add("off");
+  streamToggleBtn.addEventListener("click", async () => {
+    streamOn = !streamOn;
+    streamToggleBtn.classList.toggle("off", !streamOn);
+    streamToggleBtn.classList.toggle("on", streamOn);
+    try {
+      await setStreamMode(streamOn);
+    } catch {
+      // 切换失败时回滚按钮态，避免 UI 与后端不一致
+      streamOn = !streamOn;
+      streamToggleBtn.classList.toggle("off", !streamOn);
+      streamToggleBtn.classList.toggle("on", streamOn);
+    }
+  });
 
   function openSse(): void {
     sseDisconnector();

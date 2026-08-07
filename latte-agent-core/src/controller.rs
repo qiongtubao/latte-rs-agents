@@ -146,6 +146,16 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                     });
                 }
             }
+            crate::trace::TraceEvent::ModelDelta { meta, delta } => {
+                if !delta.is_empty() {
+                    let _ = self.event_tx.send(ChatEvent::RoleTurn {
+                        role_id: meta.role,
+                        content: delta,
+                        is_complete: false,
+                        sub_id: None,
+                    });
+                }
+            }
             crate::trace::TraceEvent::ToolExec {
                 meta,
                 name,
@@ -605,6 +615,10 @@ pub struct ControllerConfig {
     /// `OnAnomaly` LLM review. The session creator (e.g. ui-server's
     /// `create_session_handle`) spawns the monitor when enabled.
     pub advisor_monitor: AdvisorMonitorConfig,
+    /// 流式模式开关（运行时可切换）。`Arc<AtomicBool>` 让 UI/session 层
+    /// 实时切换无需重建 controller。`load(true)` 时 run_turn 走流式
+    /// 逐 Delta 渲染；`load(false)` 时走非流式（默认）。
+    pub stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ─── Controller ──────────────────────────────────────────────────
@@ -1391,6 +1405,7 @@ async fn run_multi_role_loop(
             config.advisor_monitor.runner_gate(),
             &plan_stage,
             agent_pause_gate.clone(),
+            config.stream_mode.clone(),
         )
         .await
         {
@@ -1911,6 +1926,7 @@ async fn run_single_role_loop(
         config.advisor_monitor.runner_gate(),
         &plan_stage,
         agent_pause_gate.clone(),
+        config.stream_mode.clone(),
     )
         .await
     {
@@ -2024,7 +2040,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2046,7 +2062,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2191,7 +2207,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2206,7 +2222,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2272,6 +2288,7 @@ async fn build_runner(
     // PendingApproval）与 `register_delegate_tool`（拦截实现类角色）。
     plan_stage: &SharedPlanStage,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -2424,6 +2441,7 @@ async fn build_runner(
             runner = runner.with_gate_config(gate);
         }
         runner = runner.with_agent_pause_gate(agent_pause_gate);
+        runner = runner.with_stream_mode(stream_mode);
         Ok((runner, role_id.to_string()))
     } else {
         // ── 给主 runner 分配 subsession sink（同上） ──
@@ -2447,6 +2465,7 @@ async fn build_runner(
             runner = runner.with_gate_config(gate);
         }
         runner = runner.with_agent_pause_gate(agent_pause_gate);
+        runner = runner.with_stream_mode(stream_mode);
         Ok((runner, role_id.to_string()))
     }
 }
@@ -4391,6 +4410,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_id: String::new(),
         };
 
@@ -4671,6 +4691,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_id: String::new(),
         };
 
@@ -4814,6 +4835,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_id: String::new(),
         };
 
@@ -4943,6 +4965,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_id: String::new(),
         };
 
@@ -5096,6 +5119,7 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_id: String::new(),
         };
 
@@ -5303,6 +5327,7 @@ mod tests {
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             // enabled=true（默认）→ driver 给 manager runner 装 gate。
             advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_id: String::new(),
         };
 

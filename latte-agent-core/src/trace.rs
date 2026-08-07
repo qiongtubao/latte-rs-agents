@@ -254,6 +254,12 @@ pub enum TraceEvent {
         meta: TraceMeta,
         raw_content: String,
     },
+    /// 流式增量：模型正在生成，逐 token 推送。仅在 stream 模式下发射。
+    /// `ChatEventTraceSink` 映射为 `RoleTurn { is_complete: false }`。
+    ModelDelta {
+        meta: TraceMeta,
+        delta: String,
+    },
     ParseToolCalls {
         meta: TraceMeta,
         raw_in: String,
@@ -718,6 +724,7 @@ impl TraceEvent {
             | TraceEvent::PromptBuilt { meta, .. }
             | TraceEvent::ModelCall { meta, .. }
             | TraceEvent::ModelRawOut { meta, .. }
+            | TraceEvent::ModelDelta { meta, .. }
             | TraceEvent::ParseToolCalls { meta, .. }
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::ToolRetry { meta, .. }
@@ -744,6 +751,7 @@ impl TraceEvent {
             TraceEvent::PromptBuilt { .. } => "PromptBuilt",
             TraceEvent::ModelCall { .. } => "ModelCall",
             TraceEvent::ModelRawOut { .. } => "ModelRawOut",
+            TraceEvent::ModelDelta { .. } => "ModelDelta",
             TraceEvent::ParseToolCalls { .. } => "ParseToolCalls",
             TraceEvent::ToolExec { .. } => "ToolExec",
             TraceEvent::ToolRetry { .. } => "ToolRetry",
@@ -775,6 +783,8 @@ impl TraceEvent {
                 format!("model={} latency={}ms finish={}", model_id, latency_ms, finish_reason),
             TraceEvent::ModelRawOut { raw_content, .. } =>
                 format!("{}", raw_content),
+            TraceEvent::ModelDelta { delta, .. } =>
+                format!("delta: {}", delta),
             TraceEvent::ParseToolCalls { parsed, diagnostics, .. } =>
                 format!("parsed={} opens={} matched={} unmatched={}",
                     parsed.len(), diagnostics.opens_found, diagnostics.closes_matched, diagnostics.unmatched_opens.len()),
@@ -868,6 +878,12 @@ impl TraceEvent {
             TraceEvent::ModelRawOut { .. } => IndexLine {
                 turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
                 kind: "ModelRawOut".into(),
+                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: String::new(),
+            },
+            TraceEvent::ModelDelta { .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ModelDelta".into(),
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: String::new(),
             },
@@ -1158,6 +1174,7 @@ impl TraceSink for ScopedSink {
             | TraceEvent::PromptBuilt { meta, .. }
             | TraceEvent::ModelCall { meta, .. }
             | TraceEvent::ModelRawOut { meta, .. }
+            | TraceEvent::ModelDelta { meta, .. }
             | TraceEvent::ParseToolCalls { meta, .. }
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::ToolRetry { meta, .. }

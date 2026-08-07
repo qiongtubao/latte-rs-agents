@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use latte_ai::client::AiClient;
 use latte_ai::error::AiError;
-use latte_ai::models::{Completion, Message, Role, TokenUsage};
+use latte_ai::models::{Completion, ContentPart, Message, Role, StreamEvent, TokenUsage};
 use latte_ai::params::GenerateParams;
 use parking_lot::Mutex;
 
@@ -403,6 +403,52 @@ impl Agent {
         })
     }
 
+    /// 流式聊天完成请求。返回 [`StreamEvent`] 通道，调用方逐事件消费。
+    ///
+    /// 与 [`Agent::chat`] 的区别：`chat` 内部把 Delta 塌缩成一个 `Completion`；
+    /// `chat_stream` 把 Delta 通道直接交给调用方，让 UI 逐 token 渲染。
+    ///
+    /// model chain fallback 只在**连接建立阶段**生效（`chat_stream` 返回 Err）。
+    /// 一旦 rx 交给调用方，后续错误以 `StreamEvent::Error` / `HttpError` 推送。
+    /// 不做 `WaitPolicy::WaitAndRetry`：流式下重试会重复发请求、产生不连贯 Delta。
+    pub async fn chat_stream(
+        &self,
+        messages: &[Message],
+        params: Option<&GenerateParams>,
+    ) -> AgentResult<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        let p = params.unwrap_or(&self.params);
+        let mut tried: Vec<String> = Vec::with_capacity(self.model_chain.len());
+        let mut failures: Vec<(String, String)> = Vec::with_capacity(self.model_chain.len());
+
+        for mc in &self.model_chain {
+            if !mc.is_available() {
+                continue;
+            }
+            match mc.client.chat_stream(messages, p).await {
+                Ok(rx) => return Ok(rx),
+                Err(e) => {
+                    tried.push(mc.model.id.clone());
+                    failures.push((mc.model.id.clone(), brief_model_error(&e)));
+                    if let Some(cd) = cooldown_for_error(&e) {
+                        mc.set_cooldown(cd);
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        Err(AgentError::ModelsUnavailable {
+            tried,
+            failures,
+            next_retry_in: self
+                .model_chain
+                .iter()
+                .filter_map(|mc| mc.cooldown_remaining())
+                .min(),
+        })
+    }
+
     /// Build the system message for this agent.
     pub fn system_message(&self, vars: &serde_json::Value) -> AgentResult<Message> {
         let content = self.role.render_prompt(vars)?;
@@ -688,6 +734,10 @@ pub struct AgentRunner {
     pause_gate: Option<crate::advisor_monitor::AdvisorPauseGate>,
     /// Session-level 暂停门（用户按 ⏸ 触发），与 advisor `pause_gate` 正交。
     agent_pause_gate: Option<std::sync::Arc<crate::pause_gate::AgentPauseGate>>,
+    /// 流式模式开关（运行时可切换）。`load(true)` 时 `run_turn` 用
+    /// `Agent::chat_stream` 消费 Delta 事件，UI 逐 token 渲染；
+    /// `None` / `load(false)` 时走非流式 `Agent::chat`（默认）。
+    stream_mode: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     // 强制 native function-calling：tool schema 经 GenerateParams.tools
     // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
     // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
@@ -970,6 +1020,7 @@ impl AgentRunner {
             gate_config: None,
             pause_gate: None,
             agent_pause_gate: None,
+            stream_mode: None,
         }
     }
     pub fn new_with_tools(
@@ -995,6 +1046,7 @@ impl AgentRunner {
             gate_config: None,
             pause_gate: None,
             agent_pause_gate: None,
+            stream_mode: None,
         }
     }
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
@@ -1016,6 +1068,7 @@ impl AgentRunner {
             gate_config: None,
             pause_gate: None,
             agent_pause_gate: None,
+            stream_mode: None,
         }
     }
 
@@ -1048,6 +1101,23 @@ impl AgentRunner {
     ) -> Self {
         self.agent_pause_gate = Some(gate);
         self
+    }
+
+    /// 设置流式模式开关（运行时可切换）。
+    ///
+    /// `stream_mode.load(true)` 时 `run_turn` 走 `Agent::chat_stream`，
+    /// 逐 Delta 发 `TraceEvent::ModelDelta`，UI 逐 token 渲染。
+    /// `load(false)` 或未设置时走非流式 `Agent::chat`（默认）。
+    /// 用 `Arc<AtomicBool>` 让 UI/session 层实时切换无需重建 runner。
+    pub fn with_stream_mode(mut self, stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.stream_mode = Some(stream_mode);
+        self
+    }
+
+    /// 当前是否处于流式模式。`stream_mode` 未设置或 `load(false)` 时返回 false。
+    fn is_stream_mode(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.stream_mode.as_ref().map_or(false, |m| m.load(Ordering::SeqCst))
     }
     /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
     /// to `self.context.messages`. Deletes the queue file. This is
@@ -1356,7 +1426,60 @@ impl AgentRunner {
                 p.tools = build_tool_schemas(tm);
                 p
             });
-            let completion = self.agent.chat(&messages, chat_params.as_ref(), WaitPolicy::WaitAndRetry).await?;
+            let completion = if self.is_stream_mode() {
+                // Stream 模式：逐 Delta 消费，发 ModelDelta trace 让 UI 逐 token 渲染。
+                // Done 携带完整 tool_calls + usage，组装成 Completion 后下游工具循环零改动。
+                let mut rx = self.agent.chat_stream(&messages, chat_params.as_ref()).await?;
+                loop {
+                    match rx.recv().await {
+                        Some(StreamEvent::Delta { content, .. }) => {
+                            let delta_text: String = content.iter()
+                                .filter_map(|p| match p {
+                                    ContentPart::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            if !delta_text.is_empty() {
+                                self.sink.emit(TraceEvent::ModelDelta {
+                                    meta: meta.clone(),
+                                    delta: delta_text,
+                                });
+                            }
+                        }
+                        Some(StreamEvent::Done { content, tool_calls, usage, stop_reason }) => {
+                            let text = content.iter()
+                                .filter_map(|p| match p {
+                                    ContentPart::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            break Completion {
+                                content: text,
+                                content_parts: content,
+                                tool_calls,
+                                stop_reason,
+                                usage,
+                            };
+                        }
+                        Some(StreamEvent::HttpError { status, message }) => {
+                            return Err(AgentError::from(AiError::Api { status, message }));
+                        }
+                        Some(StreamEvent::Error(e)) => {
+                            return Err(AgentError::from(AiError::Stream(e)));
+                        }
+                        None => {
+                            return Err(AgentError::from(AiError::Stream(
+                                "stream closed before Done".into(),
+                            )));
+                        }
+                    }
+                }
+            } else {
+                // 非流式模式（默认）：chat() 内部走流式传输 + idle watchdog，对外返回完整 Completion。
+                self.agent.chat(&messages, chat_params.as_ref(), WaitPolicy::WaitAndRetry).await?
+            };
             let latency_ms = chat_start.elapsed().as_millis() as u64;
 
             self.total_usage.input_tokens += completion.usage.input_tokens;
@@ -2493,6 +2616,44 @@ mod tests {
         .to_string()
     }
 
+    /// 构造 OpenAI streaming SSE 响应体（多个 delta chunk + [DONE]）。
+    /// `chunks` 按序拼成独立 SSE event，模拟模型逐 token 输出。
+    fn openai_sse_body(chunks: &[&str]) -> String {
+        let mut out = String::new();
+        for c in chunks {
+            out.push_str("data: ");
+            out.push_str(&serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": c },
+                    "finish_reason": None::<String>
+                }]
+            }).to_string());
+            out.push_str("\n\n");
+        }
+        // 末尾 chunk：finish_reason + usage
+        out.push_str("data: ");
+        out.push_str(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        }).to_string());
+        out.push_str("\n\n");
+        out.push_str("data: [DONE]\n\n");
+        out
+    }
+
     /// Build a Model whose `base_url` points at the given wiremock server.
     fn model_at(server: &wiremock::MockServer, id: &str) -> Model {
         Model {
@@ -2937,6 +3098,97 @@ mod tests {
 
     // ─── LoopDetector tests ──────────────────────────────────────────────
     //
+
+    // ─── Stream 模式测试 ──────────────────────────────────────────────
+    //
+    // stream 模式：runner 装了 with_stream_mode(true) 时，run_turn 走
+    // Agent::chat_stream 消费 SSE Delta 事件，逐 chunk 发 TraceEvent::ModelDelta，
+    // Done 时组装完整 Completion。此测试用 wiremock 返回 SSE 流验证：
+    //   1. run_turn 返回拼好的完整文本（跨多个 delta chunk）。
+    //   2. sink 收到 ≥1 个 ModelDelta 增量事件。
+    //   3. non-stream（默认）时 sink 收到 0 个 ModelDelta（走 chat() 聚合路径）。
+    #[tokio::test]
+    async fn stream_mode_run_turn_emits_deltas_and_assembles() {
+        use crate::trace::{TraceEvent, TraceSink};
+        use std::sync::Arc;
+        #[derive(Clone)]
+        struct StreamVecSink(Arc<parking_lot::Mutex<Vec<TraceEvent>>>);
+        impl TraceSink for StreamVecSink {
+            fn emit(&self, e: TraceEvent) {
+                self.0.lock().push(e);
+            }
+        }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let s = wiremock::MockServer::start().await;
+        s.register(
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(openai_sse_body(&["Hello", ", ", "stream", " mode!"])),
+                ),
+        )
+        .await;
+
+        let sink = Arc::new(StreamVecSink(Arc::new(parking_lot::Mutex::new(vec![]))));
+        let role = test_role();
+        let agent = Agent::new_with_chain(
+            "stream-test".into(),
+            role,
+            vec![model_at(&s, "stream-model")],
+            GenerateParams::default(),
+        ).unwrap();
+        let mut runner = AgentRunner::new(agent)
+            .with_sink(sink.clone() as Arc<dyn TraceSink>)
+            .with_role("stream-test".to_string())
+            .with_stream_mode(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+
+        let resp = runner
+            .run_turn(&[Message::user("hi")], None)
+            .await
+            .expect("stream run_turn should succeed");
+        assert_eq!(resp, "Hello, stream mode!", "stream 模式应拼出完整文本");
+
+        // stream 模式应发出 ≥1 个 ModelDelta 增量事件。
+        let events = sink.0.lock().clone();
+        let delta_count = events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::ModelDelta { .. }))
+            .count();
+        assert!(delta_count > 0, "stream 模式应发出 ModelDelta，但收到 {delta_count} 个");
+
+        // non-stream（默认，不装 stream_mode）时不应发 ModelDelta，走 chat() 聚合。
+        let s2 = wiremock::MockServer::start().await;
+        s2.register(
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200)
+                    .set_body_string(openai_completion_body("plain", vec![])),
+                ),
+        )
+        .await;
+        let sink2 = Arc::new(StreamVecSink(Arc::new(parking_lot::Mutex::new(vec![]))));
+        let agent2 = Agent::new_with_chain(
+            "nostream-test".into(),
+            test_role(),
+            vec![model_at(&s2, "nostream-model")],
+            GenerateParams::default(),
+        ).unwrap();
+        let mut runner2 = AgentRunner::new(agent2)
+            .with_sink(sink2.clone() as Arc<dyn TraceSink>)
+            .with_role("nostream-test".to_string());
+        let resp2 = runner2
+            .run_turn(&[Message::user("hi")], None)
+            .await
+            .expect("non-stream run_turn should succeed");
+        assert_eq!(resp2, "plain", "non-stream 模式返回完整文本");
+        let events2 = sink2.0.lock().clone();
+        assert!(
+            !events2.iter().any(|e| matches!(e, TraceEvent::ModelDelta { .. })),
+            "non-stream 模式不应发 ModelDelta（走 chat() 聚合路径）"
+        );
+    }
     // The detector is the agent's safety net against the "model is
     // stuck" failure mode: it watches for repeated identical tool
     // calls and breaks the loop early. These tests pin down the

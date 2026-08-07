@@ -444,6 +444,13 @@ export async function switchRole(role_id: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/role", chatBody({ role_id }));
 }
 
+/** 切换 stream/non-stream 模式。`stream=true` 时模型逐 token 推送
+ *  RoleTurn{is_complete:false} 增量事件；`false` 时走非流式（整段返回）。
+ *  运行时切换，对当前 session 立即生效。 */
+export async function setStreamMode(stream: boolean): Promise<void> {
+  await getTransport().request("POST", "/api/chat/stream-mode", chatBody({ stream }));
+}
+
 export async function listTraces(): Promise<TraceSummary[]> {
   return getTransport().request("GET", "/api/traces");
 }

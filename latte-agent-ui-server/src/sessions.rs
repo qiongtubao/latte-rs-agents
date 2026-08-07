@@ -390,6 +390,9 @@ pub(crate) struct SessionHandle {
     /// 落盘状态（Arc 共享给 archiver 任务）；`None` = 文件创建失败
     /// （只告警，聊天照常）。
     persist: Option<Arc<parking_lot::Mutex<SessionPersist>>>,
+    /// 流式模式开关（运行时可切换）。UI toggle -> POST /api/chat/stream-mode
+    /// -> `self.stream_mode.store(bool)` -> ControllerConfig -> AgentRunner。
+    pub(crate) stream_mode: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionHandle {
@@ -465,11 +468,12 @@ impl SessionHandle {
             initial_history: self.spawn.initial_history.clone(),
             cwd: self.spawn.cwd.clone(),
             subsession_store: self.spawn.subsession_store.clone(),
-            // 透传 SessionHandle 自己的 session_id —— subsession_store
+            // 透传 SessionHandle 自己的 session_id -- subsession_store
             // 落盘用它当目录名，删 session 时联删。**不要**用
             // `self.spawn.cwd` 凑数（绝对路径会被路径安全检查拒绝）。
             session_id: self.session_id.clone(),
             advisor_monitor: advisor_monitor_cfg.clone(),
+            stream_mode: self.stream_mode.clone(),
         };
         let controller = Arc::new(ChatController::new(256));
         // `spawn` returns a broadcast::Receiver (events consumer); the
@@ -627,6 +631,7 @@ pub(crate) async fn create_session_handle(
         initial_role: initial_role.to_string(),
         restored: false,
         persist,
+        stream_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     // 新 session eagerly spawn（行为同改造前）。
     handle.controller_or_spawn().await?;
@@ -695,6 +700,7 @@ pub(crate) async fn create_forked_handle(
         initial_role: initial_role.to_string(),
         restored: false,
         persist,
+        stream_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     // Eager spawn so the seeded `initial_history` is loaded into the
     // controller's context immediately (single-role path).
@@ -742,6 +748,7 @@ pub(crate) fn restore_sessions(cwd: &Path, spawn: &SessionSpawnParams) -> Vec<Se
             initial_role,
             restored: true,
             persist: Some(Arc::new(parking_lot::Mutex::new(loaded.persist))),
+            stream_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
     // 稳定顺序（按创建时间，旧的在前）——list 排序在 api 层做，这里

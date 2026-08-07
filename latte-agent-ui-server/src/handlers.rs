@@ -177,6 +177,25 @@ pub(crate) struct SessionOnlyRequest {
     session_id: Option<String>,
 }
 
+/// 设置 session 的流式模式开关。
+#[derive(Deserialize)]
+pub(crate) struct StreamModeRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    stream: bool,
+}
+
+/// `POST /api/chat/stream-mode` -- 运行时切换 stream/non-stream 模式。
+pub(crate) async fn chat_stream_mode(
+    State(state): State<AppState>,
+    Json(req): Json<StreamModeRequest>,
+) -> StatusCode {
+    match api::set_stream_mode(&state.backend, req.session_id.as_deref(), req.stream).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct CommandRequest {
     #[serde(default)]

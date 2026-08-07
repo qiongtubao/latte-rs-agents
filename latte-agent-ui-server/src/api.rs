@@ -1219,6 +1219,21 @@ pub async fn chat_resume_session(
     Ok(())
 }
 
+/// `POST /api/chat/stream-mode` -- 运行时切换 stream/non-stream 模式。
+///
+/// 设置 `SessionHandle.stream_mode` 的 `Arc<AtomicBool>`，AgentRunner
+/// 的 `run_turn` 在下一次模型调用时读取该值决定走 stream 还是 non-stream 路径。
+pub async fn set_stream_mode(
+    b: &UiBackend,
+    session_id: Option<&str>,
+    stream: bool,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    h.stream_mode.store(stream, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
 /// `POST /api/chat/pause-role` — 单独暂停一个角色（多角色 HIL v1.4）。
 /// 与整会话的 [`chat_pause`] 正交：被暂停的角色在每轮里被 scheduler
 /// 跳过，其余角色照常推进，全局 `SessionState` 不变。底层复用

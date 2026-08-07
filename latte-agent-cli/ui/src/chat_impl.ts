@@ -139,6 +139,10 @@ export function mountChat(opts: {
   const workflowStates = new Map<string, HTMLElement>();
   /** wf_id:step_id → pending badge element on WorkflowStep bubbles. */
   const stepStates = new Map<string, HTMLElement>();
+  /** 当前流式渲染中的气泡（`RoleTurn{is_complete:false}` 增量追加到它）。
+   *  收到 `is_complete:true` 时清空。跨 role 的并行输出按 role 维度
+   *  分别保留，这里存 role_id → 气泡元素。 */
+  const streamingEl = new Map<string, HTMLElement>();
   /** wf_id:step_id → WorkflowStep 消息的 msgId（WorkflowTurn 做引用用） */
 const stepMsgIds = new Map<string, string>();
   /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
@@ -1577,9 +1581,24 @@ const stepMsgIds = new Map<string, string>();
               })()
             : undefined);
 
-        addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref, filePath: getFilePath(e.role_id) });
-        currentToolCall = ""; currentActivity = ""; updateFooter();
+        // ── 流式增量渲染 ──
+        // `is_complete:false` 的事件携带模型逐 token 生成的增量片段。
+        // 首个 delta 创建气泡，后续 delta 追加到同一气泡（按 role 追踪）。
+        const streamRow = streamingEl.get(e.role_id);
         if (e.is_complete) {
+          // 终态：若之前有流式气泡，把终态 content 追加进去/结束；否则整段加新泡。
+          if (streamRow) {
+            const contentEl = streamRow.querySelector<HTMLElement>(".msg-content");
+            if (contentEl) {
+              // 终态 content 是完整文本——直接用 innerHTML 替换（避免与
+              // 已追加的 delta 拼接误差）。仅当 content 与已显示不一致时。
+              contentEl.innerHTML = renderContentWithCode(e.content);
+            }
+            streamingEl.delete(e.role_id);
+          } else {
+            addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref, filePath: getFilePath(e.role_id) });
+          }
+          currentToolCall = ""; currentActivity = ""; updateFooter();
           setStatus("connected"); clearWaitTimer();
           if (di) {
             activeDelegates.delete(subId);
@@ -1589,7 +1608,15 @@ const stepMsgIds = new Map<string, string>();
             }
           }
         } else {
-          updateStatusPillLabel(`${icon} 模型输入中…`);
+          // 增量 delta：已有流式气泡则追加，否则新建。
+          if (streamRow) {
+            const contentEl = streamRow.querySelector<HTMLElement>(".msg-content");
+            if (contentEl) contentEl.innerHTML += renderContentWithCode(e.content);
+          } else {
+            const row = addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: undefined, filePath: getFilePath(e.role_id) });
+            streamingEl.set(e.role_id, row);
+          }
+          updateStatusPillLabel(`${icon} 模型输出中…`);
           resetWaitTimer();
         }
         break;
