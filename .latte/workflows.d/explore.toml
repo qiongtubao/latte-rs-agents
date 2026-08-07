@@ -1,7 +1,7 @@
 # Workflow: explore
 # 探索项目：当 manager 遇到不懂的名词 / 不清楚的项目背景时先跑它，
 # 派专家通读本仓库真实代码与文档，弄清结构、术语、现有约定与不确定点，
-# 产出可供后续 ask 提问 / 决策的背景说明。格式见 .latte/workflows.d/bug_triage.toml。
+# 产出可供后续 ask 提问 / 决策的背景说明。格式见 config/workflows/bug_triage.toml。
 
 name = "explore"
 command = "/explore"
