@@ -347,15 +347,40 @@ pub(crate) async fn events_sse(
     // stream sees only events for THIS tab — the server is no longer
     // broadcasting the single shared controller's events to every
     // connected tab.
-    let stream = BroadcastStream::new(rx).map(|item| match item {
-        Ok(ev) => match chat_event_to_frontend_json(&ev) {
-            Ok(json) => Ok(Event::default()
-                .event("chat_event")
-                .data(json)),
-            Err(e) => Ok(Event::default()
-                .event("error")
-                .data(format!("chat_event convert failed: {}", e))),
-        },
+    // Each SessionHandle owns its own ChatController (and therefore
+    // its own broadcast channel). Subscribing guarantees the SSE
+    // stream sees only events for THIS tab — the server is no longer
+    // broadcasting the single shared controller's events to every
+    // connected tab.
+    let backend = state.backend.clone();
+    let stream = BroadcastStream::new(rx).map(move |item| match item {
+        Ok(ev) => {
+            // P0-2: 工具层 task_report → ChatEvent::TaskReport →
+            // ui-server 桥接 → POST /api/tasks/:id/report，
+            // 把任务推进到 human_review（completed）或 todo（其他）。
+            // 调用是 fire-and-forget，失败只 eprintln（与其它 archiver
+            // 失败处理一致——不打断聊天）。
+            if let latte_agent_core::controller::ChatEvent::TaskReport {
+                task_id, summary, result, ..
+            } = &ev
+            {
+                match crate::tasks::report_task(&backend, task_id, summary, result) {
+                    Ok(_) => {}
+                    Err(e) => eprintln!(
+                        "[ui-sse] task_report bridge {task_id} failed: {}",
+                        e.message
+                    ),
+                }
+            }
+            match chat_event_to_frontend_json(&ev) {
+                Ok(json) => Ok(Event::default()
+                    .event("chat_event")
+                    .data(json)),
+                Err(e) => Ok(Event::default()
+                    .event("error")
+                    .data(format!("chat_event convert failed: {}", e))),
+            }
+        }
         Err(e) => Ok(Event::default()
             .event("error")
             .data(format!("broadcast lag: {}", e))),

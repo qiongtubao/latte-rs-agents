@@ -382,6 +382,19 @@ pub enum ChatEvent {
         allow_upload: bool,
         options: Vec<ChoiceOption>,
     },
+    /// 角色调用 `task_report` 工具回报任务执行结果（任务看板闭环）。
+    /// 广播后由 ui-server 侧 `events_sse` 订阅器拦截，调内部
+    /// `POST /api/tasks/:id/report`，把任务推进到 human_review
+    /// （completed）或 todo（aborted/failed/timeout）。
+    ///
+    /// `result` 是 `completed` / `aborted` / `failed` / `timeout` 之一，
+    /// 与后端 `tasks::report_task` 的入参对齐。
+    TaskReport {
+        role_id: String,
+        task_id: String,
+        summary: String,
+        result: String,
+    },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -2414,7 +2427,13 @@ async fn build_runner(
             register_ask_tool(&tm, event_tx.clone(), role_id.to_string())
                 .map_err(|e| AgentError::Tool(format!("register ask: {e}")))?;
         }
-
+        // Any role with "task_report" in allowed_tools gets the task_report
+        // tool: 任务看板闭环——manager 完成任务后调它广播 ChatEvent::TaskReport，
+        // ui-server 侧 events_sse 订阅器把它转成 POST /api/tasks/:id/report。
+        if role.allowed_tools.iter().any(|t| t == "task_report") {
+            register_task_report_tool(&tm, event_tx.clone(), role_id.to_string())
+                .map_err(|e| AgentError::Tool(format!("register task_report: {e}")))?;
+        }
         // ── 给主 runner 分配 subsession sink（manager / 任何角色通用） ──
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
             None
@@ -2944,6 +2963,116 @@ pub(crate) fn register_ask_tool(
     tm.register(tool, Some(&role_id));
     Ok(())
 }
+
+/// 注册 `task_report` 工具：角色向任务看板回报任务执行结果。任务看板
+/// 通过 ui-server 侧 SSE 订阅识别 `ChatEvent::TaskReport` 事件
+/// 调内部 `POST /api/tasks/:id/report` 完成状态推进（completed →
+/// human_review，其他 → todo）。工具本身只做入参校验 + 广播事件，
+/// 不调 HTTP——与 `plan`/`ask` 工具同款（ui-server 侧做事件→API 桥接）。
+///
+/// `result` 必须是 `completed` / `aborted` / `failed` / `timeout` 之一，
+/// 与后端 `tasks::report_task` 的入参和 `tasks::RESULTS` 数组对齐。
+pub(crate) fn register_task_report_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    event_tx: broadcast::Sender<ChatEvent>,
+    role_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use latte_rs_agent_tools::types::{
+        PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
+    };
+
+    const VALID_RESULTS: [&str; 4] = ["completed", "aborted", "failed", "timeout"];
+
+    let input_schema = ToolInputSchema {
+        schema_type: SchemaType,
+        properties: vec![
+            ("task_id".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "要回报的任务 ID（如 LAT-100）；来自任务看板派发时的初始消息。必填。".into(),
+                ),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("summary".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "完成情况摘要（1-3 句中文，写到任务 history note）。".into(),
+                ),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("result".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some(
+                    "执行结果枚举。completed → human_review，其他 → todo。".into(),
+                ),
+                enum_values: Some(VALID_RESULTS.iter().map(|s| serde_json::Value::String(s.to_string())).collect()),
+                minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+        ].into_iter().collect(),
+        required: Some(vec![
+            "task_id".into(),
+            "summary".into(),
+            "result".into(),
+        ]),
+        ..Default::default()
+    };
+
+    let handler_role_id = role_id.clone();
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let event_tx = event_tx.clone();
+        let role_id = handler_role_id.clone();
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+
+            let task_id = input
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| tool_err("missing non-empty 'task_id' field".into()))?;
+
+            let summary = input
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            let result = input
+                .get("result")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| VALID_RESULTS.contains(&s.as_str()))
+                .ok_or_else(|| {
+                    tool_err(format!(
+                        "result must be one of {VALID_RESULTS:?}"
+                    ))
+                })?;
+
+            let _ = event_tx.send(ChatEvent::TaskReport {
+                role_id: role_id.clone(),
+                task_id: task_id.clone(),
+                summary: summary.clone(),
+                result: result.clone(),
+            });
+            Ok(serde_json::Value::String(format!(
+                "已向任务看板报告 {task_id}（{result}）。任务进入 {} 状态。",
+                if result == "completed" { "human_review" } else { "todo" }
+            )))
+        })
+    });
+
+    let tool = Tool::builder(
+        "task_report".to_string(),
+        "向任务看板回报任务执行结果。在派发你执行的任务完成后调用，把任务推进到 human_review 状态。参数：task_id(任务ID, 必填) + summary(完成情况摘要) + result(completed/aborted/failed/timeout 之一)。只在确认任务执行完成时调用——不要重复调用，不要在用户问询阶段调用。".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm.register(tool, Some(&role_id));
+    Ok(())
+}
+
 
 /// Delegate-return gate: review a specialist's output before it flows
 /// back to the manager, checking (1) role-responsibility adherence and
@@ -5344,6 +5473,122 @@ mod tests {
         }
 
         controller.abort().await;
+    }
+
+    // ─── task_report tool (P0-2) ───────────────────────────────────
+    //
+    // 任务报告闭环：manager 调 `task_report` 工具 → 广播
+    // `ChatEvent::TaskReport { task_id, summary, result }` → ui-server
+    // SSE 订阅时识别此事件并调 POST /api/tasks/:id/report（已存在的
+    // 后端路由 handlers.rs:998）。这样 manager 完成任务后能自动把
+    // 任务推进到 human_review 状态，避免永远停在 in_progress。
+    //
+    // 本文件测试只覆盖 controller 侧的事件语义（注册工具 + 工具调用
+    // 产生事件 + 事件序列化）。ui-server 侧的事件→HTTP 桥接在
+    // latte-agent-ui-server/src/handlers.rs 的 events_sse 里。
+
+    #[test]
+    fn task_report_serializes_to_frontend_shape() {
+        // 锁定 wire shape：与 api.ts union 配对。
+        let event = ChatEvent::TaskReport {
+            role_id: "manager".into(),
+            task_id: "LAT-100".into(),
+            summary: "实现 ringbuf 核心读写".into(),
+            result: "completed".into(),
+        };
+        let wire = crate::event_json::chat_event_to_frontend_json(&event).expect("frontend json");
+        let v: serde_json::Value = serde_json::from_str(&wire).expect("parse wire");
+        assert_eq!(v["type"], "TaskReport");
+        assert_eq!(v["role_id"], "manager");
+        assert_eq!(v["task_id"], "LAT-100");
+        assert_eq!(v["summary"], "实现 ringbuf 核心读写");
+        assert_eq!(v["result"], "completed");
+    }
+
+    #[tokio::test]
+    async fn task_report_tool_call_emits_chat_event() {
+        // 工具层：调 `task_report` 工具 → 必须广播 ChatEvent::TaskReport。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_task_report_tool(&tm, event_tx, "manager".into())
+            .expect("register task_report");
+
+        let out = tm
+            .execute(
+                "task_report",
+                serde_json::json!({
+                    "task_id": "LAT-100",
+                    "summary": "实现 ringbuf 核心读写",
+                    "result": "completed"
+                }),
+                None,
+            )
+            .await
+            .expect("task_report tool call");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("LAT-100"), "tool result names the task: {text}");
+
+        let ev = rx.try_recv().expect("TaskReport event");
+        match ev {
+            ChatEvent::TaskReport { task_id, summary, result, .. } => {
+                assert_eq!(task_id, "LAT-100");
+                assert_eq!(summary, "实现 ringbuf 核心读写");
+                assert_eq!(result, "completed");
+            }
+            other => panic!("expected TaskReport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_report_tool_rejects_bad_result() {
+        // 校验：result 必须是 completed/aborted/failed/timeout 之一。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        register_task_report_tool(&tm, event_tx, "manager".into())
+            .expect("register task_report");
+
+        let err = tm
+            .execute(
+                "task_report",
+                serde_json::json!({
+                    "task_id": "LAT-100",
+                    "summary": "x",
+                    "result": "succeeded"  // 不是合法 enum
+                }),
+                None,
+            )
+            .await
+            .expect_err("bad result must be rejected");
+        // schema 层 enum_values 校验在 handler 之前生效（model
+        // provider 也会先看 schema），错误信息不必列出合法值；
+        // 只断言"被拒"即可。
+        let msg = err.to_string();
+        assert!(
+            msg.contains("schema") || msg.contains("validation") || msg.contains("completed"),
+            "error should mention schema/validation/allowed values: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_report_tool_requires_task_id() {
+        // 校验：task_id 非空。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        register_task_report_tool(&tm, event_tx, "manager".into())
+            .expect("register task_report");
+
+        let err = tm
+            .execute(
+                "task_report",
+                serde_json::json!({"task_id": "", "summary": "x", "result": "completed"}),
+                None,
+            )
+            .await
+            .expect_err("empty task_id must be rejected");
+        assert!(
+            err.to_string().contains("task_id"),
+            "error should mention task_id: {err}"
+        );
     }
 }
 

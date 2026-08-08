@@ -185,6 +185,14 @@ pub trait ChatRenderer: Send + Sync {
                 let det = detector.as_deref().unwrap_or("?");
                 self.on_status(&format!("🛑 advisor terminated [{role_id}, {det}]: {reason}")).await;
             }
+            // task_report 工具汇报：CLI 仅打印状态行，web UI 走事件→
+            // POST /api/tasks/:id/report 桥接完成实际的状态推进。
+            ChatEvent::TaskReport { task_id, result, summary, .. } => {
+                self.on_status(&format!(
+                    "📊 task_report: {task_id} {result} — {summary}"
+                ))
+                .await;
+            }
         }
     }
 }
