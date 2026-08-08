@@ -1,5 +1,11 @@
 # 诊断报告：LLM 工具调用上下文撑爆问题
 
+> **状态：大部分已闭环（2026-08-08 核对）**。参数层预防已落地于
+> latte-rs-agent-tools `f2ff70c`（schema 补全 + describe 警告 + per-file limit）。
+> 残留风险：search 默认 `hidden=true` 仍会遍历 `.latte/`（schema 描述已警告
+> LLM 用 `paths` 限制范围）；无总输出字节上限。如需彻底收口，在工具仓库做
+> 「默认排除 `.latte/`」+「总字节上限」两个增强。
+
 ## 1. 根因诊断
 
 ### 现场还原

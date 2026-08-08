@@ -43,8 +43,8 @@ pub enum ToolCallErrorKind {
     /// (`|` `*` `?`) 在字符串里忘了 escape。`serde_err` 记录具体哪条 escape
     /// 炸了，方便 trace 排查。
     MalformedArgs { serde_err: String },
-    /// 工具名 model 写了"read"但 registry 只有"file.read" —— alias
-    /// 后备也没救回来。说明 model 用了我们不认识的工具名。
+    /// 工具名 model 写了我们不认识的名字（registry 扁平名之后的
+    /// 名字与配置层一致，一般不该发生）—— alias 后备也没救回来。
     ToolNotFound { tried_aliases: Vec<String> },
     /// PreTool / PostTool hook 主动拒绝（一般是 EnforceToolAllowlist
     /// 之类的策略 hook）。这是有意的，不该 retry。
@@ -572,7 +572,7 @@ impl LoopDetector {
     /// Record a tool call and decide whether to continue or break.
     ///
     /// `tool_name` is the name emitted by the model (e.g. `"read"`,
-    /// `"list"`, or the resolved name like `"file.read"`).
+    /// `"list"` — registry 扁平化后与配置层名字一致).
     /// `args_json` is the JSON-serialized args that will be passed
     /// to the tool. We compare on the serialized form because the
     /// model may emit semantically equivalent but textually distinct
@@ -1447,7 +1447,7 @@ impl AgentRunner {
                                 });
                             }
                         }
-                        Some(StreamEvent::Done { content, tool_calls, usage, stop_reason }) => {
+                        Some(StreamEvent::Done { content, tool_calls, usage }) => {
                             let text = content.iter()
                                 .filter_map(|p| match p {
                                     ContentPart::Text { text } => Some(text.as_str()),
@@ -1459,12 +1459,9 @@ impl AgentRunner {
                                 content: text,
                                 content_parts: content,
                                 tool_calls,
-                                stop_reason,
+                                stop_reason: "stop".into(),
                                 usage,
                             };
-                        }
-                        Some(StreamEvent::HttpError { status, message }) => {
-                            return Err(AgentError::from(AiError::Api { status, message }));
                         }
                         Some(StreamEvent::Error(e)) => {
                             return Err(AgentError::from(AiError::Stream(e)));
@@ -2235,7 +2232,6 @@ fn build_tool_schemas(
         .map(|td| latte_ai::models::Tool {
             name: td.name.clone(),
             description: Some(td.description.clone()),
-            strict: None,
             parameters: serde_json::to_value(&td.input_schema)
                 .unwrap_or(serde_json::json!({})),
         })
@@ -2336,7 +2332,6 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
-            timeout_secs: None,
         }
     }
 
@@ -2669,7 +2664,6 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
-            timeout_secs: None,
         }
     }
 
@@ -4352,8 +4346,8 @@ mod tests {
             );
         }
     }
-    /// build_tool_schemas：配置层扁平名（bash/read/search）映射到
-    /// registry 的 namespace 注册名（shell.exec/file.read/file.search）。
+    /// build_tool_schemas：配置层扁平名（bash/read/search）与 registry
+    /// 注册名一致（latte-rs-agent-tools 已扁平化命名空间，不再有点号前缀）。
     #[tokio::test]
     async fn build_tool_schemas_uses_flat_names() {
         let mgr = crate::controller::build_tool_manager(
@@ -4363,8 +4357,8 @@ mod tests {
         .unwrap();
         let schemas = build_tool_schemas(&mgr);
         let names: Vec<String> = schemas.iter().map(|t| t.name.clone()).collect();
-        assert!(names.contains(&"shell.exec".to_string()), "应有 shell.exec: {names:?}");
-        assert!(names.contains(&"file.read".to_string()), "应有 file.read: {names:?}");
-        assert!(names.contains(&"file.search".to_string()), "应有 file.search: {names:?}");
+        assert!(names.contains(&"bash".to_string()), "应有 bash: {names:?}");
+        assert!(names.contains(&"read".to_string()), "应有 read: {names:?}");
+        assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
     }
 }

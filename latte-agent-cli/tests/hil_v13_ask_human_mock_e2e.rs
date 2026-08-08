@@ -3,7 +3,7 @@
 //! Spins up a local HTTP server that simulates an OpenAI-compatible
 //! LLM endpoint. The server returns a canned `chat/completions`
 //! response whose assistant message contains a
-//! `<tool_callask_human>{"question": "..."}</tool_call>` block. The
+//! structured `tool_calls` response. The
 //! binary parses the tool call, invokes the `ask_human` tool
 //! closure, the closure calls `SessionManager::pause_with_reason`,
 //! and the REPL breaks the round. The test asserts the on-disk
@@ -36,7 +36,7 @@ fn bin() -> PathBuf {
 }
 
 /// Mock OpenAI chat/completions server. Returns a canned response
-/// with a `<tool_callask_human>` body on the first request. Stops
+/// with a structured `tool_calls` (ask_human) body on the first request. Stops
 /// after one response.
 struct MockOpenAIServer {
     addr: SocketAddr,
@@ -87,12 +87,17 @@ impl MockOpenAIServer {
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": format!(
-                                "I need to ask the human a question before proceeding.\n<tool_callask_human> {{\"question\": \"{}\"}}</tool_callask_human>",
-                                question_text
-                            ),
+                            "content": "I need to ask the human a question before proceeding.",
+                            "tool_calls": [{
+                                "id": "call_ask_human_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "ask_human",
+                                    "arguments": format!("{{\"question\": \"{}\"}}", question_text),
+                                },
+                            }],
                         },
-                        "finish_reason": "stop",
+                        "finish_reason": "tool_calls",
                     }],
                     "usage": {
                         "prompt_tokens": 100,

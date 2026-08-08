@@ -1,5 +1,10 @@
 # 根本分析：LLM 工具调用参数错误的问题本质
 
+> **状态：核心已闭环（2026-08-08 核对）**。latte-rs-agent-tools `f2ff70c` 已补全
+> search schema（`paths`/`i`/`skip`/`limit` + 默认值警告）、参数归一化、错误信息
+> 256 截断；search 有 per-file limit（默认 100 / 上限 500 + `truncated` 标志）。
+> 未做项：search 默认仍扫隐藏目录（含 `.latte/`）、无总输出字节上限——见 §后续。
+
 > 不是"输出太大要截断"，而是**LLM 调用了错误的参数**（search 没限制 paths 扫全项目），
 > 应该在**参数层面预防 LLM 犯错**，而不是等大结果出来再截断。
 

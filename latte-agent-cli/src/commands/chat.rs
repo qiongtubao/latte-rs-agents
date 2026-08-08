@@ -1700,11 +1700,31 @@ fn save_session(path: &str, msgs: &[Message]) -> AnyResult {
 fn load_session(path: &str) -> AnyResult<Vec<Message>> {
     let content = std::fs::read_to_string(path)?;
     let mut msgs = Vec::new();
-    for line in content.lines() {
+    for (lineno, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let m: Message = serde_json::from_str(line)?;
+        let m: Message = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(e) => {
+                // 旧格式存档：content 是裸 string（latte-ai 把 Message.content
+                // 改成 Vec<ContentPart> 之前 save_session 写出的文件）。
+                // 包一层 Text part 兼容载入，否则老存档永远 resume 不了。
+                #[derive(serde::Deserialize)]
+                struct LegacyMessage {
+                    role: MsgRole,
+                    content: String,
+                }
+                let legacy: LegacyMessage = serde_json::from_str(line)
+                    .map_err(|_| format!("{} line {}: {e}", path, lineno + 1))?;
+                Message {
+                    role: legacy.role,
+                    content: vec![latte_ai::models::ContentPart::text(&legacy.content)],
+                    tool_call_id: None,
+                    tool_calls: None,
+                }
+            }
+        };
         msgs.push(m);
     }
     Ok(msgs)
@@ -2223,6 +2243,7 @@ async fn run_hil_repl(
                             tool_calls: None
                         };
                         let _ = std::fs::remove_file(&queue_path);
+                        mgr.append_to_role(&role_id, synth).ok();
                     }
                 }
                 // Slice plan.md for this role (H2-tagged section + initial-prompt).

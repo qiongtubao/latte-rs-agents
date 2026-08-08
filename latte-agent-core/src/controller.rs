@@ -2480,51 +2480,17 @@ pub(crate) async fn build_tool_manager(
         mgr.register_package(p).await
             .map_err(|e| format!("register_package: {e}"))?;
     }
-    // allowed 里是配置层扁平名（bash/read/edit/...），而 registry 里的
-    // 工具名带 namespace 前缀（shell.exec/file.read/...）。这里先把
-    // 配置名展开成它可能对应的注册名（含 namespace），过滤时按注册名
-    // 或短名匹配，保证 allowed "bash" 能保留 "shell.exec"。
+    // allowed 里是配置层扁平名（bash/read/edit/...）。latte-rs-agent-tools
+    // 扁平化之后 registry 名与配置名一致（"bash"/"read"/"git_status"/...），
+    // 直接进 keep；仅个别工具仍带点号注册名，需要补一条映射。
     let mut keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
-    // 配置层扁平名 → registry 注册名（namespace 前缀）正向映射。
-    // registry 侧没有 "bash"，它是 "shell.exec" 的配置层名字。
+    // 配置层扁平名 → registry 注册名。只剩 browser/todo 两个包仍用
+    // 点号注册名（browser.browser / todo.todo）。
     let flat_to_registry: std::collections::HashMap<&str, &str> = [
-        ("bash", "shell.exec"),
-        ("exec", "shell.exec"),
-        ("spawn", "shell.spawn"),
-        ("read", "file.read"),
-        ("write", "file.write"),
-        ("list", "file.list"),
-        ("delete", "file.delete"),
-        ("search", "file.search"),
-        ("find", "file.find"),
-        ("edit", "file.edit"),
-        ("grep", "ast.grep"),
-        ("ast_edit", "ast.edit"),
-        ("eval", "eval.exec"),
-        ("fetch", "http.fetch"),
         ("todo", "todo.todo"),
-        ("git_status", "git.status"),
-        ("git_diff", "git.diff"),
-        ("git_log", "git.log"),
-        ("git_branch", "git.branch"),
-        ("git_commit", "git.commit"),
-        ("git_add", "git.add"),
-        // git 短名：老配置可能直接用 "diff"/"log" 等，展开成 git.*。
-        ("diff", "git.diff"),
-        ("status", "git.status"),
-        ("log", "git.log"),
-        ("branch", "git.branch"),
-        ("commit", "git.commit"),
-        ("add", "git.add"),
-        ("mcp_list", "mcp.mcp_list"),
-        ("mcp_connect", "mcp.mcp_connect"),
-        ("mcp_call", "mcp.mcp_call"),
-        ("playwright_screenshot", "playwright.playwright_screenshot"),
-        ("playwright_script", "playwright.playwright_script"),
-        // browser 包只有一个工具，namespace 前缀与短名相同。
         ("browser", "browser.browser"),
     ].into_iter().collect();
     for (flat, registry) in &flat_to_registry {
@@ -2539,18 +2505,20 @@ pub(crate) async fn build_tool_manager(
         keep.insert("mcp_list".to_string());
         keep.insert("mcp_call".to_string());
     }
-    // playwright 同理：展开成 playwright_screenshot + playwright_script。
+    // playwright 同理：展开成 playwright_script + screenshot（扁平化后
+    // 截图工具独立注册为 "screenshot"，原 playwright_screenshot 已不存在）。
     if keep.contains("playwright") {
-        keep.insert("playwright_screenshot".to_string());
         keep.insert("playwright_script".to_string());
+        keep.insert("screenshot".to_string());
     }
     // Register code_graph tool if allowed
     if keep.contains("code_graph") || keep.contains("code-graph") {
         let cg = code_graph_tool();
         mgr.register(cg, None);
     }
-    // 过滤：注册名全名或短名（namespace 后缀）命中 keep 就保留。
-    // 短名兜底兼容没有 namespace 前缀的工具（screenshot/plan/ask/...）。
+    // 过滤：注册名全名或短名（点号后缀）命中 keep 就保留。
+    // 短名兜底兼容仍带点号注册名的工具（browser.browser/todo.todo）
+    // 以及无点号的扁平名工具（short == 全名）。
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -5200,23 +5168,22 @@ mod tests {
         controller.abort().await;
     }
 
-    /// 锁定 bash 工具的 schema 契约：allowed "bash"（配置层扁平名）映射到
-    /// registry 的 "shell.exec"（namespace 注册名），且接受 {command, cwd}
+    /// 锁定 bash 工具的 schema 契约：allowed "bash" 保留 registry 的
+    /// "bash" 工具（命名空间已扁平化），且接受 {command, cwd}
     /// （cwd 由 resolve_tool_input_against_cwd 注入）。
     #[tokio::test]
     async fn bash_tool_kept_and_accepts_cwd() {
         let mgr = build_tool_manager(&["read".into(), "write".into(), "bash".into(), "search".into()])
             .await
             .expect("build_tool_manager");
-        // 配置层 "bash" 应保留注册名 "shell.exec"。
         let names: Vec<String> = mgr.get_tool_names();
-        assert!(names.contains(&"shell.exec".to_string()), "bash 应映射到 shell.exec: {names:?}");
+        assert!(names.contains(&"bash".to_string()), "bash 应被保留: {names:?}");
         // bash 必须接受 {command, cwd}。
         let args = serde_json::json!({"command":"pwd","cwd":"/tmp"});
-        let r = mgr.execute("shell.exec", args, None).await;
-        assert!(r.is_ok(), "shell.exec 应接受 {{command,cwd}}，却失败: {:?}", r.err());
-        // eval 不在 allowed 里，被过滤掉；bash/shell.exec 与 eval.exec 不碰撞。
-        assert!(!names.contains(&"eval.exec".to_string()), "eval 不应被保留（不在 allowed）: {names:?}");
+        let r = mgr.execute("bash", args, None).await;
+        assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
+        // eval 不在 allowed 里，被过滤掉。
+        assert!(!names.contains(&"eval".to_string()), "eval 不应被保留（不在 allowed）: {names:?}");
     }
 
     /// Advisor gate 端到端（driver 级）：manager turn 产出连续撞 D5
@@ -5379,3 +5346,4 @@ mod tests {
         controller.abort().await;
     }
 }
+

@@ -4,7 +4,7 @@
 //!
 //! Spins up a local HTTP server that simulates an OpenAI-compatible
 //! LLM endpoint. The server returns a canned
-//! `<tool_callask_human>{"question": "..."}</tool_call></tool_callask_human>`
+//! structured `tool_calls` (ask_human) response
 //! body on the first call (so the role's LLM response fires the
 //! `ask_human` tool, which emits a `TraceEvent::AskHuman` and pauses
 //! the session) and a plain text body on the second call (so the
@@ -47,7 +47,7 @@ fn bin() -> PathBuf {
 }
 
 /// Mock OpenAI chat/completions server. Returns a canned
-/// `<tool_callask_human>` body on the first request and a plain text
+/// structured `tool_calls` (ask_human) body on the first request and a plain text
 /// body on the second request. Stops after the configured number of
 /// responses.
 struct MockOpenAIServer {
@@ -111,12 +111,17 @@ impl MockOpenAIServer {
                             "index": 0,
                             "message": {
                                 "role": "assistant",
-                                "content": format!(
-                                    "I need to ask the human a question before proceeding.\n<tool_callask_human> {{\"question\": \"{}\"}}</tool_callask_human>",
-                                    question_text
-                                ),
+                                "content": "I need to ask the human a question before proceeding.",
+                                "tool_calls": [{
+                                    "id": "call_ask_human_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "ask_human",
+                                        "arguments": format!("{{\"question\": \"{}\"}}", question_text),
+                                    },
+                                }],
                             },
-                            "finish_reason": "stop",
+                            "finish_reason": "tool_calls",
                         }],
                         "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
                     })

@@ -1,5 +1,11 @@
 # Tool / Role / Model 管理重整
 
+> **状态：已完成（2026-08-08 核对）**。角色 CRUD（`POST/DELETE /api/roles`）、
+> 工具列表 + 启停（`GET /api/tools`、`POST /api/tools/:id/toggle`）、
+> 模型 CRUD（`POST/PATCH/DELETE /api/models`）后端均已落地；前端
+> `tools_panel.ts`、`models_panel.ts`、`role_editor.ts`（含新建/删除）齐备。
+> 本文档仅作历史背景保留。
+
 ## 现状
 - 角色编辑（`role_editor.ts`）：可选/编辑已有角色，没有"创建"或"删除"入口
 - 工具管理：无独立面板，仅 `RoleTemplate.tools: Vec<String>`，是字符串数组
