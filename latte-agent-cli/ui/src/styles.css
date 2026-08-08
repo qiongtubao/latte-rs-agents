@@ -473,6 +473,48 @@ select {
   background: rgba(255, 255, 255, 0.45);
 }
 
+/* ─── markdown blocks inside messages ─────────────────────────── */
+/* 全局 reset 把 p/h/list 的 margin 都清掉了，这里补回气泡内排版。 */
+
+.msg-content p {
+  margin: 0;
+}
+.msg-content p + p,
+.msg-content p + ul,
+.msg-content p + ol,
+.msg-content ul + p,
+.msg-content ol + p {
+  margin-top: 6px;
+}
+.msg-content h3,
+.msg-content h4,
+.msg-content h5 {
+  margin: 10px 0 4px;
+  line-height: 1.35;
+  color: #1e293b;
+}
+.msg-content h3:first-child,
+.msg-content h4:first-child,
+.msg-content h5:first-child {
+  margin-top: 0;
+}
+.msg-content h3 { font-size: 1.1em; }
+.msg-content h4 { font-size: 1.02em; }
+.msg-content h5 { font-size: 0.95em; }
+.msg-content ul,
+.msg-content ol {
+  margin: 4px 0;
+  padding-left: 1.4em;
+}
+.msg-content li + li {
+  margin-top: 2px;
+}
+.msg-content a {
+  color: var(--accent-2);
+  text-decoration: underline;
+  word-break: break-all;
+}
+
 /* ─── collapsible tool messages ───────────────────────────────── */
 
 .collapse-indicator {

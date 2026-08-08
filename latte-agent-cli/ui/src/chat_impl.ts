@@ -69,17 +69,92 @@ function escapeHtml(text: string): string {
     .replace(/'/g, "&#039;");
 }
 
-function renderContentWithCode(text: string): string {
-  if (!text.includes("```")) return escapeHtml(text);
+// ─── Markdown 渲染 ──────────────────────────────────────────────
+// 模型输出是 Markdown，但内容不可信：所有文本先 escapeHtml，再在
+// 转义后的文本上做块级/行内转换，因此任何原始 HTML 都会被转义，
+// 不存在注入面。覆盖聊天消息常用语法：围栏代码块、标题、无序/
+// 有序列表、行内 code、粗体、斜体、http(s) 链接。
+
+/** 行内转换。输入必须是已 escapeHtml 的文本。 */
+function renderInline(escaped: string): string {
+  // 行内 code 先抽出来占位，避免其中的 `*` 等被后续规则误转。
+  const codes: string[] = [];
+  let s = escaped.replace(/`([^`\n]+)`/g, (_m, c: string) => {
+    codes.push(c);
+    return "\u0000" + (codes.length - 1) + "\u0000";
+  });
+  // 链接 [text](url) —— 仅放行 http(s)，其余按原文显示。
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text: string, url: string) =>
+    /^https?:\/\//i.test(url)
+      ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`
+      : m);
+  // 粗体先于斜体（否则 ** 会被 * 规则吃掉）。
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  // 还原行内 code（内容已转义，不再做任何转换）。
+  s = s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => `<code>${codes[Number(i)]}</code>`);
+  return s;
+}
+
+/** 块级转换：标题、列表、空行分段。输入必须是已 escapeHtml 的文本。 */
+function renderBlocks(escaped: string): string {
+  const lines = escaped.split("\n");
+  const out: string[] = [];
+  let para: string[] = [];
+  let list: { type: "ul" | "ol"; items: string[] } | null = null;
+
+  const flushPara = () => {
+    if (para.length) {
+      out.push(`<p>${renderInline(para.join("\n"))}</p>`);
+      para = [];
+    }
+  };
+  const flushList = () => {
+    if (list) {
+      out.push(`<${list.type}>${list.items.map((i) => `<li>${renderInline(i)}</li>`).join("")}</${list.type}>`);
+      list = null;
+    }
+  };
+
+  for (const line of lines) {
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    const ul = line.match(/^\s*[-*]\s+(.*)$/);
+    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (h) {
+      flushPara(); flushList();
+      // # → h3、## → h4、### → h5：气泡内标题不宜比正文大太多。
+      const tag = `h${Math.min(h[1].length + 2, 5)}`;
+      out.push(`<${tag}>${renderInline(h[2])}</${tag}>`);
+    } else if (ul) {
+      flushPara();
+      if (!list || list.type !== "ul") { flushList(); list = { type: "ul", items: [] }; }
+      list.items.push(ul[1]);
+    } else if (ol) {
+      flushPara();
+      if (!list || list.type !== "ol") { flushList(); list = { type: "ol", items: [] }; }
+      list.items.push(ol[1]);
+    } else if (line.trim() === "") {
+      flushPara(); flushList();
+    } else {
+      flushList();
+      para.push(line);
+    }
+  }
+  flushPara(); flushList();
+  return out.join("");
+}
+
+export function renderMarkdown(text: string): string {
+  if (!text.includes("```")) return renderBlocks(escapeHtml(text));
   const parts: string[] = [];
   let remaining = text;
   while (true) {
     const start = remaining.indexOf("```");
-    if (start === -1) { parts.push(escapeHtml(remaining)); break; }
-    parts.push(escapeHtml(remaining.slice(0, start)));
+    if (start === -1) { parts.push(renderBlocks(escapeHtml(remaining))); break; }
+    parts.push(renderBlocks(escapeHtml(remaining.slice(0, start))));
     const after = remaining.slice(start + 3);
     const end = after.indexOf("```");
-    if (end === -1) { parts.push(escapeHtml(remaining)); break; }
+    if (end === -1) { parts.push(renderBlocks(escapeHtml(remaining))); break; }
     const langAndCode = after.slice(0, end);
     const newline = langAndCode.indexOf("\n");
     const lang = newline === -1 ? "" : langAndCode.slice(0, newline).trim();
@@ -143,6 +218,10 @@ export function mountChat(opts: {
    *  收到 `is_complete:true` 时清空。跨 role 的并行输出按 role 维度
    *  分别保留，这里存 role_id → 气泡元素。 */
   const streamingEl = new Map<string, HTMLElement>();
+  /** role_id → 该 role 流式输出的累积原始文本。delta 到达时对累积
+   *  文本整体重渲染——逐段 innerHTML += 会让跨 chunk 的 Markdown
+   *  标记（如 `**粗体` 分两段到达）永远无法解析。 */
+  const streamingRaw = new Map<string, string>();
   /** wf_id:step_id → WorkflowStep 消息的 msgId（WorkflowTurn 做引用用） */
 const stepMsgIds = new Map<string, string>();
   /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
@@ -382,7 +461,7 @@ const stepMsgIds = new Map<string, string>();
           content.appendChild(ind);
         });
       } else {
-        content.innerHTML = renderContentWithCode(opts2.content);
+        content.innerHTML = renderMarkdown(opts2.content);
       }
       bubble.appendChild(content);
 
@@ -946,7 +1025,7 @@ const stepMsgIds = new Map<string, string>();
     if (v) {
       editingRecord.content = v;
       const contentEl = editingRecord.el.querySelector(".msg-content") as HTMLElement | null;
-      if (contentEl) contentEl.innerHTML = renderContentWithCode(v);
+      if (contentEl) contentEl.innerHTML = renderMarkdown(v);
     }
     closeEditModal();
   }
@@ -1592,9 +1671,10 @@ const stepMsgIds = new Map<string, string>();
             if (contentEl) {
               // 终态 content 是完整文本——直接用 innerHTML 替换（避免与
               // 已追加的 delta 拼接误差）。仅当 content 与已显示不一致时。
-              contentEl.innerHTML = renderContentWithCode(e.content);
+              contentEl.innerHTML = renderMarkdown(e.content);
             }
             streamingEl.delete(e.role_id);
+            streamingRaw.delete(e.role_id);
           } else {
             addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref, filePath: getFilePath(e.role_id) });
           }
@@ -1608,13 +1688,16 @@ const stepMsgIds = new Map<string, string>();
             }
           }
         } else {
-          // 增量 delta：已有流式气泡则追加，否则新建。
+          // 增量 delta：已有流式气泡则累积重渲染，否则新建。
           if (streamRow) {
             const contentEl = streamRow.querySelector<HTMLElement>(".msg-content");
-            if (contentEl) contentEl.innerHTML += renderContentWithCode(e.content);
+            const raw = (streamingRaw.get(e.role_id) ?? "") + e.content;
+            streamingRaw.set(e.role_id, raw);
+            if (contentEl) contentEl.innerHTML = renderMarkdown(raw);
           } else {
             const row = addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: undefined, filePath: getFilePath(e.role_id) });
             streamingEl.set(e.role_id, row);
+            streamingRaw.set(e.role_id, e.content);
           }
           updateStatusPillLabel(`${icon} 模型输出中…`);
           resetWaitTimer();
@@ -2012,6 +2095,8 @@ const stepMsgIds = new Map<string, string>();
     messageStore.length=0;
     allEvents.length=0;
     currentEventIdx=-1;
+    streamingEl.clear();
+    streamingRaw.clear();
     clearAllDelegates();
     subagentTools.length = 0;
     lastUserMsgId = "";
