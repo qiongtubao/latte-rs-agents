@@ -229,6 +229,10 @@ pub struct TaskStore {
     /// 绑定 workflow 的任务时登记，run 结束或 abort 时清除。abort_task
     /// 置位后 `run_workflow` 在下一个 step/speaker 边界退出。
     workflow_cancels: HashMap<String, Arc<AtomicBool>>,
+    /// Notion 同步的 dirty 集合：每次 persist 末尾 mark 任务 id，
+    /// notion_sync 后台定时任务取走并 PUT。内存态，不落盘（重启即
+    /// 清空；用户须重做变更触发重新 sync）。详见 `crate::notion_sync`。
+    notion_dirty: crate::notion_sync::DirtySet,
 }
 
 impl TaskStore {
@@ -268,7 +272,7 @@ impl TaskStore {
                 }
             }
         }
-        Ok(Self { dir, meta, tasks, workflow_cancels: HashMap::new() })
+        Ok(Self { dir, meta, tasks, workflow_cancels: HashMap::new(), notion_dirty: Default::default() })
     }
 
     pub fn meta(&self) -> &BoardMeta {
@@ -386,6 +390,7 @@ impl TaskStore {
         self.tasks.insert(id.clone(), task.clone());
         self.save_task(&task)?;
         self.save_meta()?;
+        self.notion_dirty.mark(&id);
         Ok(task)
     }
 
@@ -395,12 +400,33 @@ impl TaskStore {
     }
 
     /// 内存里的 `id` 当前值落盘（配合 `get_mut` 原地改后用）。
-    pub fn persist(&self, id: &str) -> Result<(), String> {
+    /// 同时把任务 id 推入 Notion 同步的 dirty 集合（纯内存态，不
+    /// 落盘——重启即清空，sync no-op）。
+    pub fn persist(&mut self, id: &str) -> Result<(), String> {
         let t = self
             .tasks
             .get(id)
             .ok_or_else(|| format!("task {id:?} 不存在"))?;
-        self.save_task(t)
+        self.save_task(t)?;
+        self.notion_dirty.mark(id);
+        Ok(())
+    }
+
+    /// 手动把任务 id 标记为待同步（`create` / `delete` 路径不走
+    /// `persist`，需要调用方显式标 dirty）。`delete` 路径在
+    /// `crate::api::delete_task` 处统一调。
+    pub fn mark_notion_dirty(&mut self, id: &str) {
+        self.notion_dirty.mark(id);
+    }
+
+    /// 取出当前 dirty 集合（清空），返回 id 列表。
+    pub fn take_notion_dirty(&mut self) -> Vec<String> {
+        self.notion_dirty.take_dirty()
+    }
+
+    /// 当前 dirty 数量（用于监控/测试）。
+    pub fn notion_dirty_count(&self) -> usize {
+        self.notion_dirty.dirty_count()
     }
 
     fn save_meta(&self) -> Result<(), String> {
@@ -1611,9 +1637,15 @@ pub fn report_task(
 }
 
 /// `DELETE /api/tasks/:id` — 文件移入 `archive/` 并从内存移除。
+/// 删除本身不再走 persist 路径，这里显式 mark notion dirty，让
+/// 下轮 sync 检测到「本应在 Notion 删除」（由 sync 端实现）。
+/// 简化：当前只把 id 推 dirty，sync 端判断本地已无该任务则发 DELETE
+/// — 见 notion_sync 的 hook（v1 暂只做 upsert；DELETE 留待 v2）。
 pub fn delete_task(b: &UiBackend, id: &str) -> Result<(), ApiError> {
     let mut store = b.tasks.write();
-    store.delete(id).map_err(map_store_err)
+    store.delete(id).map_err(map_store_err)?;
+    store.mark_notion_dirty(id);
+    Ok(())
 }
 
 // ─── Scheduler ────────────────────────────────────────────────────

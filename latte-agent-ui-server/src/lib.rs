@@ -50,6 +50,7 @@ pub mod role_graph;
 mod self_loop;
 mod sessions;
 mod models;
+pub mod notion_sync;
 pub mod tasks;
 pub mod tools;
 pub mod workflows;
@@ -156,6 +157,12 @@ pub struct UiBackend {
     /// 时连带取消。run 结束时从 map 移除。
     pub(crate) session_workflows:
         Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Notion 同步的共享 reqwest::Client 与配置。后台循环 5s 跑一轮
+    /// `notion_sync::sync_dirty_tasks`，从 `tasks::TaskStore` 拉 dirty
+    /// 任务推送到 latte-rs-notion-client。`None` 时禁用（缺 env）。
+    /// 启动时由 `spawn` 设置；用户在进程内改 env 需重启才生效。
+    pub(crate) notion_http: Arc<parking_lot::Mutex<Option<Arc<reqwest::Client>>>>,
+    pub(crate) notion_cfg: Arc<parking_lot::Mutex<Option<Arc<notion_sync::NotionSyncConfig>>>>,
 }
 
 impl UiBackend {
@@ -205,9 +212,11 @@ impl UiBackend {
             subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::with_persistence(
                 cwd.join(".latte").join("ui-sessions"),
             )),
-            agents_config,
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
             session_workflows: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            agents_config: agents_config.clone(),
+            notion_http: Arc::new(parking_lot::Mutex::new(None)),
+            notion_cfg: Arc::new(parking_lot::Mutex::new(None)),
         };
         // 清理上次残留的 `.latte/tmp/`（重启时确保不遗留空 session 文件）。
         sessions::clean_tmp(&cwd);
@@ -378,6 +387,20 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
     // 任务看板 scheduler（§4）：启动时先立即扫一遍（补发关机期间
     // 错过的排期），之后每 5s 扫描到期任务并派发给 manager。
     tokio::spawn(tasks::scheduler_loop(state.backend.clone()));
+
+    // Notion 同步器握手：从 env 读配置，挂 reqwest client，
+    // 后台每 5s 跑一轮 sync_dirty_tasks。配置缺失（token 空）则
+    // loop 内部 cfg.enabled=false 直接 no-op，不影响 server 启动。
+    let notion_http = Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client"),
+    );
+    let notion_cfg = Arc::new(notion_sync::NotionSyncConfig::from_env());
+    *state.backend.notion_http.lock() = Some(notion_http.clone());
+    *state.backend.notion_cfg.lock() = Some(notion_cfg.clone());
+    tokio::spawn(notion_sync::notion_sync_loop(state.backend.clone()));
 
     // 先 bind 再返回：端口 0 时把 OS 分配的真实端口带给调用方。
     let listener = tokio::net::TcpListener::bind(bind).await?;

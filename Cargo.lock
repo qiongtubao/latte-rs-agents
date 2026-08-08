@@ -1370,6 +1370,7 @@ dependencies = [
  "toml",
  "toml_edit 0.22.27",
  "tower-http 0.5.2",
+ "wiremock",
 ]
 
 [[package]]

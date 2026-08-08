@@ -37,3 +37,5 @@ base64 = "0.22"
 [dev-dependencies]
 # tasks.rs 单测：临时 cwd 下的 TaskStore 落盘/恢复。
 tempfile = "3"
+# notion_sync 集成测试：HTTP mock 验证 PUT 4xx/5xx/2xx 与重试。
+wiremock = "0.6"
