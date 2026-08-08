@@ -1,5 +1,14 @@
 # Workflow Resume 后端链路设计
 
+> **状态：已实现（2026-08-08）**。最终实现与本文档两处出入：
+> 1. 端点路径为 `POST /api/workflows/resume`（非 `:name/resume`）——workflow 名从
+>    checkpoint meta 读取，不需要 URL 携带；请求体 `{ session_id, wf_id?, topic? }`，
+>    `wf_id` 缺省时回退到 controller 的 `last_failed_workflow` 快照（冷启动由
+>    sessions.rs 从 event_log 反向扫描 seed）。
+> 2. 前端已先行就绪（`api.ts: resumeWorkflow` + `chat_impl.ts` 失败气泡的「🔄 续跑」
+>    按钮），本次只补后端：`api.rs: workflow_resume`、`handlers.rs: workflow_resume_h`、
+>    `lib.rs` 路由、`UiBackend.session_workflows` 并发 guard（409 + chat_abort 连带取消）。
+
 ## 1. 背景
 
 Workflow 失败时，`run_workflow_inner` 会把已完成步骤写入 checkpoint (`<cwd>/.latte/workflow-runs/<wf_id>.jsonl`)。

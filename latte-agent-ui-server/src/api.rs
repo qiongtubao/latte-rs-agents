@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use latte_agent_core::config::{AgentConfig, ConfigLayer, ModelDef};
 use latte_agent_core::controller::{ChatEvent, RoleInfo};
-use latte_agent_core::workflow::{load_workflow, run_workflow, WorkflowRunContext};
+use latte_agent_core::workflow::{load_checkpoint, load_workflow, run_workflow, run_workflow_resume, WorkflowRunContext};
 use latte_ai::params::GenerateParams;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -1161,6 +1161,11 @@ pub async fn chat_abort(
         .await
         .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
     controller.abort().await;
+    // 连带取消该 session 事件流上正在跑的 workflow（如 resume 续
+    // 跑的）——它不走 controller 的 cancel_flag，有自己的句柄。
+    if let Some(flag) = b.session_workflows.write().remove(h.session_id.as_str()) {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -1679,6 +1684,112 @@ pub fn workflow_run_stop(b: &UiBackend) {
 /// run 时返回空 history + 1-容量空 channel 的 receiver。
 pub fn workflow_run_subscribe(b: &UiBackend) -> (Vec<ChatEvent>, broadcast::Receiver<ChatEvent>) {
     b.workflow_run.subscribe_with_history()
+}
+
+/// `POST /api/workflows/resume` 的请求体。
+#[derive(Debug, Deserialize)]
+pub struct WorkflowResumeRequest {
+    /// 哪个 session 的事件流上跑续跑（事件回该 session 的 SSE / event_log）。
+    pub session_id: String,
+    /// 显式指定失败 run 的 checkpoint wf_id。缺省 → 读 controller 的
+    /// `last_failed_workflow` 快照（冷启动 session 由 sessions.rs 从
+    /// event_log 反向扫描 seed），即「续跑最近一次失败」。
+    #[serde(default)]
+    pub wf_id: Option<String>,
+    /// 可选 topic 覆盖；空/缺省回退到 checkpoint 里的 topic。
+    #[serde(default)]
+    pub topic: Option<String>,
+}
+
+/// `POST /api/workflows/resume`：校验 → 注册 cancel 句柄 → spawn
+/// `run_workflow_resume`。与 [`workflow_run_start`] 不同，续跑复用
+/// **session 的** event broadcast（不是独立测试 run 的 channel），
+/// 前端无需新建 SSE 连接，事件自然出现在聊天面板。
+pub async fn workflow_resume(
+    b: &UiBackend,
+    req: WorkflowResumeRequest,
+) -> Result<serde_json::Value, ApiError> {
+    let h = resolve_session(b, Some(&req.session_id))?;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+
+    // 续跑目标：显式 wf_id 优先；缺省 = 该 session 最近一次失败的
+    // workflow（实时事件流由 controller 内部订阅者维护；冷启动由
+    // sessions.rs 从 event_log seed）。
+    let wf_id = match &req.wf_id {
+        Some(id) => id.clone(),
+        None => {
+            controller
+                .last_failed_workflow()
+                .ok_or_else(|| {
+                    ApiError::not_found("this session has no failed workflow to resume")
+                })?
+                .wf_id
+        }
+    };
+
+    // at-most-one-per-session guard：同一 session 事件流上同时跑两个
+    // workflow 会让 WorkflowStarted/Step/Finished 事件交错无法分辨。
+    // 先于 checkpoint 校验注册：409（已在跑）优先于 404（目标无效）。
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut runs = b.session_workflows.write();
+        if let Some(flag) = runs.get(&req.session_id) {
+            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(ApiError {
+                    status: 409,
+                    message: "a workflow is already running on this session".into(),
+                });
+            }
+        }
+        runs.insert(req.session_id.clone(), cancel.clone());
+    }
+
+    // 启动前校验：checkpoint 存在（load_checkpoint 内含 wf_id 安全
+    // 检查：拒绝空 / 含路径分隔符 / `..`），workflow 定义可加载。
+    // 校验失败要释放刚注册的 guard，否则会永久堵住这个 session。
+    let validated = (|| -> Result<_, ApiError> {
+        let ckpt = load_checkpoint(&b.cwd, &wf_id).map_err(ApiError::not_found)?;
+        let wf = load_workflow(&ckpt.workflow_name, &b.cwd).map_err(ApiError::not_found)?;
+        Ok(wf)
+    })();
+    let wf = match validated {
+        Ok(wf) => wf,
+        Err(e) => {
+            b.session_workflows.write().remove(&req.session_id);
+            return Err(e);
+        }
+    };
+
+    let ctx = WorkflowRunContext {
+        merged: Arc::new(b.merged.read().clone()),
+        resolver: b.resolver.clone(),
+        default_params: GenerateParams::default(),
+        cwd: b.cwd.clone(),
+        event_tx: controller.event_sender(),
+        cancel_flag: cancel,
+        // 与任务看板派发的 run 同款：用户 ⏸ 时续跑也一起冻结。
+        agent_pause_gate: Some(controller.session_pause_gate()),
+        depth: 0,
+    };
+    let wf_name = wf.name.clone();
+    let resp_wf_id = wf_id.clone();
+    let topic = req.topic.clone().unwrap_or_default();
+    let runs = b.session_workflows.clone();
+    let sid = req.session_id.clone();
+    tokio::spawn(async move {
+        let _ = run_workflow_resume(&wf, &topic, &ctx, &wf_id).await;
+        // run 结束（无论成败）释放 guard；失败事件里的新 wf_id 可再续跑。
+        runs.write().remove(&sid);
+    });
+
+    Ok(serde_json::json!({
+        "started": true,
+        "wf_id": resp_wf_id,
+        "name": wf_name,
+    }))
 }
 
 #[cfg(test)]
@@ -2856,4 +2967,239 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
         }
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod workflow_resume_tests {
+    use super::*;
+
+    /// 与 tasks.rs 测试同款：临时 cwd + 默认空配置构造 UiBackend。
+    fn make_backend(dir: &std::path::Path) -> UiBackend {
+        let cfg = latte_agent_core::AgentConfig::default();
+        let resolver = latte_agent_core::ModelResolver::from_config(&cfg).expect("resolver");
+        UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(dir.to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend")
+    }
+
+    /// 建一个 session 并插进 backend 的 session map，返回 session_id。
+    async fn add_session(b: &UiBackend, sid: &str) -> String {
+        let h = crate::sessions::create_session_handle(
+            sid.into(),
+            "manager",
+            &b.merged,
+            &b.resolver,
+            &b.cwd,
+            None,
+            None,
+            &b.subsession_store,
+        )
+        .await
+        .expect("session handle");
+        b.sessions.write().insert(sid.to_string(), Arc::new(h));
+        sid.to_string()
+    }
+
+    /// 写一份合法 checkpoint（meta + 一个已完成 step）到
+    /// `<cwd>/.latte/workflow-runs/<wf_id>.jsonl`。
+    fn write_checkpoint(cwd: &std::path::Path, wf_id: &str, workflow_name: &str) {
+        let dir = cwd.join(".latte/workflow-runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{wf_id}.jsonl")),
+            format!(
+                "{{\"type\":\"meta\",\"wf_id\":\"{wf_id}\",\"workflow_name\":\"{workflow_name}\",\"topic\":\"t\",\"started_at\":1}}\n\
+                 {{\"type\":\"step\",\"wf_id\":\"{wf_id}\",\"workflow_name\":\"{workflow_name}\",\"topic\":\"t\",\"step_id\":\"s1\",\"output_key\":\"o1\",\"output\":\"done\",\"finished_at\":2}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// 写一份最小 workflow 定义到 `<cwd>/.latte/workflows.d/<name>.toml`。
+    fn write_workflow(cwd: &std::path::Path, name: &str) {
+        let dir = cwd.join(".latte/workflows.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\nmax_rounds = 1\n\n[[steps]]\nid = \"s1\"\nspeakers = [\"manager\"]\nprompt = \"hi {{{{topic}}}}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// session 不存在 → 404。
+    #[tokio::test]
+    async fn resume_unknown_session_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let err = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: "ui-ghost".into(),
+            wf_id: Some("wf-x".into()),
+            topic: None,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404);
+    }
+
+    /// wf_id 缺省且 session 没有失败快照 → 404。
+    #[tokio::test]
+    async fn resume_no_failed_workflow_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        let err = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid,
+            wf_id: None,
+            topic: None,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404);
+        assert!(err.message.contains("no failed workflow"));
+    }
+
+    /// 显式 wf_id 含路径穿越 → 404（load_checkpoint 的安全检查）。
+    #[tokio::test]
+    async fn resume_invalid_wf_id_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        let err = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid,
+            wf_id: Some("../etc/passwd".into()),
+            topic: None,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404);
+    }
+
+    /// checkpoint 文件不存在 → 404。
+    #[tokio::test]
+    async fn resume_missing_checkpoint_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        let err = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid,
+            wf_id: Some("wf-ghost".into()),
+            topic: None,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404);
+    }
+
+    /// checkpoint 有、workflow 定义没有 → 404。
+    #[tokio::test]
+    async fn resume_missing_workflow_def_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-a", "learn-ghost");
+        let err = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid,
+            wf_id: Some("wf-a".into()),
+            topic: None,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 404);
+    }
+
+    /// 同 session 已有在跑的 workflow（guard flag 未置位）→ 409。
+    #[tokio::test]
+    async fn resume_conflict_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        b.session_workflows
+            .write()
+            .insert(sid.clone(), Arc::new(AtomicBool::new(false)));
+        let err = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid,
+            wf_id: Some("wf-a".into()),
+            topic: None,
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, 409);
+    }
+
+    /// 完整启动路径：checkpoint + workflow 定义齐全 → started=true，
+    /// 响应带回 checkpoint 的 wf_id 与 workflow 名；guard 已注册。
+    /// （spawn 出去的 run 没有可用模型会随即失败，不影响响应断言。）
+    #[tokio::test]
+    async fn resume_starts_and_registers_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-a", "learn");
+        write_workflow(dir.path(), "learn");
+        let resp = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid.clone(),
+            wf_id: Some("wf-a".into()),
+            topic: None,
+        })
+        .await
+        .expect("resume should start");
+        assert_eq!(resp["started"], serde_json::json!(true));
+        assert_eq!(resp["wf_id"], serde_json::json!("wf-a"));
+        assert_eq!(resp["name"], serde_json::json!("learn"));
+        assert!(
+            b.session_workflows.read().contains_key(&sid),
+            "guard 应在 spawn 前注册"
+        );
+    }
+
+    /// wf_id 缺省 → 回退到 controller 的 last_failed_workflow 快照。
+    #[tokio::test]
+    async fn resume_falls_back_to_last_failed_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-snap", "learn");
+        write_workflow(dir.path(), "learn");
+        let h = resolve_session(&b, Some(&sid)).unwrap();
+        h.try_controller()
+            .expect("spawned")
+            .set_last_failed_workflow(latte_agent_core::controller::FailedWorkflow {
+                name: "learn".into(),
+                wf_id: "wf-snap".into(),
+                summary: "boom".into(),
+                failed_at_unix_ms: 1,
+            });
+        let resp = workflow_resume(&b, WorkflowResumeRequest {
+            session_id: sid,
+            wf_id: None,
+            topic: None,
+        })
+        .await
+        .expect("resume via snapshot should start");
+        assert_eq!(resp["wf_id"], serde_json::json!("wf-snap"));
+    }
+
+    /// chat_abort 连带取消该 session 事件流上的 workflow：flag 置位 +
+    /// 从 guard map 移除。
+    #[tokio::test]
+    async fn chat_abort_cancels_session_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        let flag = Arc::new(AtomicBool::new(false));
+        b.session_workflows.write().insert(sid.clone(), flag.clone());
+        chat_abort(&b, Some(&sid)).await.expect("abort");
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(b.session_workflows.read().is_empty());
+    }
 }

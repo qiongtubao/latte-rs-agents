@@ -513,6 +513,16 @@ pub(crate) async fn workflow_run_stop_h(State(state): State<AppState>) -> Status
     StatusCode::OK
 }
 
+pub(crate) async fn workflow_resume_h(
+    State(state): State<AppState>,
+    Json(req): Json<api::WorkflowResumeRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    api::workflow_resume(&state.backend, req)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 pub(crate) async fn get_workflow_toml_h(
     axum::extract::Path(name): axum::extract::Path<String>,
     State(state): State<AppState>,

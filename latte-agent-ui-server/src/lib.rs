@@ -150,6 +150,12 @@ pub struct UiBackend {
     /// 任务看板：`<cwd>/.latte/tasks/` 的内存索引 + 原子写
     /// （见 [`crate::tasks`]）。HTTP 路由与 scheduler 共用。
     pub(crate) tasks: Arc<parking_lot::RwLock<tasks::TaskStore>>,
+    /// session_id → 该 session 事件流上正在跑的 workflow 的 cancel
+    /// 句柄（`/api/workflows/resume` 注册）。用于两事：
+    /// at-most-one-per-session 并发 guard（409），以及 `chat_abort`
+    /// 时连带取消。run 结束时从 map 移除。
+    pub(crate) session_workflows:
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 impl UiBackend {
@@ -201,6 +207,7 @@ impl UiBackend {
             )),
             agents_config,
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
+            session_workflows: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         };
         // 清理上次残留的 `.latte/tmp/`（重启时确保不遗留空 session 文件）。
         sessions::clean_tmp(&cwd);
@@ -490,6 +497,7 @@ fn build_router(state: AppState) -> Router {
         .route("/workflows/run", post(workflow_run_start_h))
         .route("/workflows/run/events", get(workflow_run_events_sse))
         .route("/workflows/run/stop", post(workflow_run_stop_h))
+        .route("/workflows/resume", post(workflow_resume_h))
         .route(
             "/workflows/:name",
             get(get_workflow_h).put(update_workflow_h).delete(delete_workflow_h),

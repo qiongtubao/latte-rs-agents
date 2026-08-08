@@ -658,16 +658,18 @@ fn append_checkpoint(cwd: &Path, wf_id: &str, record: &CheckpointRecord) {
 }
 
 /// State recovered from a checkpoint file for [`run_workflow_resume`].
-struct CheckpointState {
-    workflow_name: String,
-    topic: String,
+/// pub 是给 UI-server 的 `POST /api/workflows/resume` 做启动前校验
+/// （404 检查 + 读 workflow 名）用；`completed` 仅引擎内部使用。
+pub struct CheckpointState {
+    pub workflow_name: String,
+    pub topic: String,
     /// Completed steps in completion order: (step_id, output_key, output).
     completed: Vec<(String, Option<String>, String)>,
 }
 
 /// Load and validate a checkpoint file for resume. `wf_id` comes from
 /// tool input, so reject anything that isn't a plain file name.
-fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, String> {
+pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, String> {
     if wf_id.is_empty()
         || wf_id.contains('/')
         || wf_id.contains('\\')
