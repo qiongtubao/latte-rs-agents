@@ -1,16 +1,31 @@
 # API 参考文档
 
 > latte-rs-agents Web UI 的 HTTP + SSE API。服务默认运行在 `http://localhost:4567`。
+>
+> **维护说明**：本文档由 `tests/api_reference_integrity_test.rs` 校验：扫 `latte-agent-ui-server/src/lib.rs` 的所有 `route(...)` 调用，断言每个路径至少出现在本章 `## N. xxx` 章节标题中。增删端点后必须同步本文档。
 
 ---
 
-## 总览
+## 端点索引（按域分组）
 
-所有 API 路径以 `/api/` 为前缀。身份认证：无（开发工具，仅绑定 localhost）。
+> 完整路径都在 `/api/` 前缀下（`/health` 在根路径）。
 
-- **REST 端点**：聊天命令、会话管理、角色查询、trace 查看
-- **SSE 端点**：实时事件流（ChatEvent、SelfLoopEvent）
-- **静态文件**：生产模式下 `/` 提供 `latte-agent-cli/ui/dist/` 静态资源
+| 域 | 端点数 | 章节 |
+|---|---|---|
+| 健康检查 | 1 | §1 |
+| 会话管理 | 6 | §2 |
+| 角色查询 | 3 | §3 |
+| 角色配置（编辑器） | 2 | §3.5 |
+| 聊天命令 | 11 | §4 |
+| SSE 事件流 | 1 | §5 |
+| Trace / 调试 | 3 | §6 |
+| Self-Loop | 3 | §7 |
+| 角色-工具关系图 | 1 | §8 |
+| 模型管理 | 5 | §9 |
+| 工具管理 | 3 | §10 |
+| 任务看板 | 9 | §11 |
+| 工作流管理 | 8 | §12 |
+| 文档图像上传 | 2 | §13 |
 
 ---
 
@@ -20,10 +35,7 @@
 
 存活探针。返回 `"ok"`。
 
-**响应：**
-```
-ok
-```
+**响应 `200`：** `ok`
 
 ---
 
@@ -33,60 +45,59 @@ ok
 
 列出当前所有活跃会话。
 
-**响应 `200`：**
-```json
-[
-  {
-    "session_id": "abc123",
-    "preview": "hello world",
-    "initial_role": "manager",
-    "created_at_unix_ms": 1747000000000,
-    "last_activity_unix_ms": 1747000010000
-  }
-]
-```
+**响应 `200`：** 数组，元素是 `SessionSummary`（`session_id` / `preview` / `initial_role` / `created_at_unix_ms` / `last_activity_unix_ms` / `is_paused` / `label`）。
 
 ### `POST /api/sessions`
 
-创建新会话。分配一个新的 `ChatController` 实例。
+创建新会话，分配一个 `ChatController` 实例。
 
-**请求体：** `{}`
+**请求体：** `{ "session_id": "<可选，从已有恢复>" }`（任意内容均可）
 
-**响应 `200`：**
+**响应 `200`：** `SessionInfo` JSON（含 `session_id` / `role` / `model` / `tier` / `available_sessions` / `available_roles` / `is_paused`）。
+
+### `DELETE /api/sessions?id=<sid>`
+
+删除会话并停止其 controller。删除活跃会话前客户端应切换到另一个会话。
+
+**响应 `200`**
+
+### `POST /api/sessions/fork`
+
+从源会话的事件前缀 fork 出新会话（按右键消息向上复制）。
+
+**请求体：**
 ```json
 {
-  "session_id": "def456",
-  "role": "manager",
-  "model": "deepseek-v4-flash",
-  "tier": "premium",
-  "available_sessions": [
-    { "session_id": "abc123", "preview": "hello world", "initial_role": "manager", "created_at_unix_ms": 1747000000000, "last_activity_unix_ms": 1747000010000 }
-  ],
-  "available_roles": [
-    { "id": "manager", "name": "Engineering Manager", "icon": "👔" }
-  ]
+  "source_session_id": "abc123",
+  "events": [ ... 源会话前缀的 ChatEvent 数组（按时间顺序）... ]
 }
 ```
 
-### `GET /api/session`
+**响应 `200`：** 新 `SessionInfo`。
 
-获取指定会话的详情。
+### `GET /api/session?id=<sid>`
 
-**查询参数：** `id`（会话 ID）
+获取指定会话详情。
 
-**响应 `200`：**
+**响应 `200`：** `SessionInfo`。  
+**响应 `404`：** `"session <sid> not found"`
+
+### `GET /api/session/history?id=<sid>`
+
+返回该会话的归档 ChatEvent 列表（用于切换 tab 后恢复聊天内容）。
+
+**响应 `200`：** ChatEvent 数组（按时间顺序）。
+
+### `POST /api/session/label`
+
+重命名会话（空字符串清除自定义名，回退到 preview）。
+
+**请求体：**
 ```json
-{
-  "session_id": "abc123",
-  "role": "manager",
-  "model": "deepseek-v4-flash",
-  "tier": "premium",
-  "available_sessions": [],
-  "available_roles": []
-}
+{ "session_id": "abc123", "label": "重构 auth" }
 ```
 
-**响应 `404`：** `"session not found"`
+**响应 `200`**
 
 ---
 
@@ -94,150 +105,214 @@ ok
 
 ### `GET /api/roles`
 
-列出所有可用的 Agent 角色。
+返回所有可用角色（简版 `RoleInfo[]`，含 `id` / `name` / `icon`）。
 
-**响应 `200`：**
-```json
-[
-  { "id": "manager",     "name": "Engineering Manager",   "icon": "👔" },
-  { "id": "programmer",  "name": "Software Engineer",      "icon": "💻" },
-  { "id": "architect",   "name": "System Architect",       "icon": "🏗️" },
-  { "id": "reviewer",    "name": "Code Reviewer",          "icon": "🔍" },
-  { "id": "tester",      "name": "QA Engineer",            "icon": "🧪" },
-  { "id": "security",    "name": "Security Auditor",       "icon": "🛡️" },
-  { "id": "devops",      "name": "DevOps Engineer",        "icon": "⚙️" },
-  { "id": "designer",    "name": "UI/UX Designer",          "icon": "🎨" },
-  { "id": "tech_writer", "name": "Technical Writer",       "icon": "📝" },
-  { "id": "pm",          "name": "Product Manager",        "icon": "📋" }
-]
-```
+**响应 `200`：** `RoleInfo[]`
+
+### `POST /api/roles`
+
+创建新角色（写 `.latte/agents.d/<id>.toml`）。
+
+**请求体：** `RoleConfigEntry`（含 `id` / `name` / `model_tier` / `model_chain` / `temperature` / `tools` / `icon` 等）。
+
+**响应 `200`：** `RoleConfigEntry`
+
+### `DELETE /api/roles/:id`
+
+删除角色（删 `.latte/agents.d/<id>.toml`）。
+
+**响应 `200`**
+
+---
+
+## 3.5. 角色配置（编辑器）
+
+> 与 §3「角色查询」分开：本节是编辑器的完整角色视图，含 `category` / `defaultModelTier` / `modelChain` / `prompt` / `code_paths` / `allowed_tools` 等。
+
+### `GET /api/roles/config`
+
+返回完整角色配置（含每个角色的系统 prompt、tools 列表等）。
+
+**响应 `200`：** `RolesConfigResponse`（含 `roles: RoleConfigEntry[]`）。
+
+### `POST /api/roles/config`
+
+保存完整角色配置（编辑器批量保存场景）。
+
+**请求体：** `RolesConfigResponse`
+
+**响应 `200`**
+
+### `GET /api/roles/:id/toml`
+
+读取角色的 TOML 源文件（`.latte/agents.d/<id>.toml`）。
+
+**响应 `200`：** `{ "toml": "..." }`
+
+### `PUT /api/roles/:id/toml`
+
+保存角色 TOML 源文件（保留原字段顺序）。
+
+**响应 `200`**
+
+### `POST /api/roles/test`
+
+测试单角色（独立 ChatController 跑一轮）。
+
+**请求体：** `{ "role_id": "...", "tier": "standard", "model_id": "..." }`
+
+**响应 `200`**
 
 ---
 
 ## 4. 聊天命令
 
+> 所有聊天端点都接收 `application/json`，body 含 `session_id`（可选，省略时使用最近活跃会话）。`POST /api/chat/{send,command,role}` 返回 `202 Accepted`（消息入队，结果通过 SSE 推送）；控制类（pause/resume/abort/cancel）返回 `200 OK` 或 `404 Not Found`。
+
 ### `POST /api/chat/send`
 
-发送一条用户消息到当前会话。
+发送用户消息。
 
-**请求体：**
-```json
-{
-  "session_id": "abc123",
-  "message": "分析一下这个代码库的结构"
-}
-```
+**请求体：** `{ "session_id": "abc123", "message": "..." }`
 
-`session_id` 可选：省略时使用最近活跃的会话。
-
-**响应 `202 Accepted`：** 消息已入队，结果通过 SSE 推送。
+**响应 `202`**
 
 ### `POST /api/chat/command`
 
-发送一个斜杠命令。
+发送斜杠命令（`/role <id>` / `/model <id>` / `/clear` / `/save` / `/tier <tier>` 等）。
 
-**请求体：**
-```json
-{
-  "session_id": "abc123",
-  "command": "/clear"
-}
-```
+**请求体：** `{ "session_id": "abc123", "command": "/clear" }`
 
-支持的命令：
-| 命令 | 效果 |
-|---|---|
-| `/role <id>` | 切换当前角色 |
-| `/model <id>` | 切换模型 |
-| `/clear` | 清除对话上下文 |
-| `/save` | 保存当前会话 |
-| `/tier <tier>` | 切换模型层级（premium/standard/budget） |
-
-**响应 `202 Accepted`**
+**响应 `202`**
 
 ### `POST /api/chat/role`
 
 切换当前会话的角色。
 
-**请求体：**
-```json
-{
-  "session_id": "abc123",
-  "role_id": "programmer"
-}
-```
+**请求体：** `{ "session_id": "abc123", "role_id": "programmer" }`
 
-**响应 `202 Accepted`**
+**响应 `202`**
+
+### `POST /api/chat/cancel-turn`
+
+取消当前 turn（不退出 session）。等当前 round 的 LLM 流返回后丢弃。
+
+**请求体：** `{ "session_id": "abc123" }`
+
+**响应 `200`**
+
+### `POST /api/chat/abort`
+
+终止整个 session（所有 in-flight subagent / workflow / multi-role 全部停止）。**同时连带取消**该 session 事件流上的 workflow resume（`session_workflows` 取消旗标）。
+
+**请求体：** `{ "session_id": "abc123" }`
+
+**响应 `200`**
+
+### `POST /api/chat/pause`
+
+暂停当前 turn（暂停门）：等用户在 tool 调后决策时用。
+
+**请求体：** `{ "session_id": "abc123" }`
+
+**响应 `200`**
+
+### `POST /api/chat/resume`
+
+恢复被 pause 的 turn。
+
+**请求体：** `{ "session_id": "abc123" }`
+
+**响应 `200`**
+
+### `POST /api/chat/pause-session`
+
+用户按 ⏸ 触发全 session 冻结（让所有 in-flight 与后续 turn 挂起）。
+
+**请求体：** `{ "session_id": "abc123" }`
+
+**响应 `200`**
+
+### `POST /api/chat/resume-session`
+
+恢复全 session 冻结。
+
+**请求体：** `{ "session_id": "abc123" }`
+
+**响应 `200`**
+
+### `POST /api/chat/resume-role`
+
+恢复单个角色（多角色 HIL）。与 `pause-role` 配对。
+
+**请求体：** `{ "session_id": "abc123", "role_id": "programmer" }`
+
+**响应 `202`**
+
+### `POST /api/chat/stream-mode`
+
+运行时切换流式/非流式输出模式。
+
+**请求体：** `{ "session_id": "abc123", "stream": true }`
+
+**响应 `200`**
 
 ---
 
 ## 5. SSE 事件流
 
-### `GET /api/events`
+### `GET /api/events?id=<sid>`
 
-ChatController 的实时事件流。每个会话独立推送。
-
-**查询参数：** `id`（会话 ID，必填）
+ChatController 实时事件流。每个会话独立推送。
 
 **协议：** Server-Sent Events（`text/event-stream`）
 
-**事件类型：**
+**事件类型：** `chat_event`（payload 是 internally-tagged JSON，`type` 字段标明变体）。
 
-#### `chat_event`
+**事件清单：**
 
-Payload 是一个 internally-tagged JSON（`type` 字段标明变体类型）：
+| 变体 | 字段 | 说明 |
+|---|---|---|
+| `RoleTurn` | `role_id` / `content` / `is_complete` / `sub_id?` | 角色发言 |
+| `Status` | `message` | 状态提示 |
+| `Prompt` | `icon` / `role_id` / `model_id` | 正在输入提示 |
+| `Paused` | `reason` | session 暂停 |
+| `Resumed` | — | session 恢复 |
+| `RoundStarted` | `round` | 多角色轮次开始 |
+| `RoundEnded` | `round` | 多角色轮次结束 |
+| `RoleStarted` | `role_id` / `detail` | 角色生命周期 |
+| `RoleFinished` | `role_id` / `detail` | 角色生命周期 |
+| `RolePaused` | `role_id` | HIL 单角色暂停 |
+| `RoleResumed` | `role_id` | HIL 单角色恢复 |
+| `Done` | — | session 结束 |
+| `Error` | `kind?` / `message` / `sub_id?` | 错误 |
+| `RoleList` | `roles` | 角色列表 |
+| `ContextCleared` | — | 上下文清除 |
+| `SessionInfo` | `task_id` / `state` / `turn` / `roles` | 会话信息 |
+| `ToolUse` | `role_id` / `tool_name` / `args` | 工具调用 |
+| `ToolResult` | `role_id` / `tool_name` / `result` | 工具结果 |
+| `ToolError` | `role_id` / `tool_name` / `error` | 工具错误 |
+| `DelegateStarted` | `from_role` / `to_role` / `task` / `sub_id` | 委派 |
+| `DelegateFinished` | `from_role` / `to_role` / `status` / `summary` / `sub_id` | 委派完成 |
+| `WorkflowStarted` | `name` / `topic` / `wf_id` | workflow 开始 |
+| `WorkflowStep` | `wf_id` / `step_id` / `description` / `index` / `total` / `role_id` / `task` | workflow 步骤 |
+| `WorkflowTurn` | `wf_id` / `step_id` / `role_id` / `content` / `round` | workflow 轮次 |
+| `WorkflowFinished` | `name` / `wf_id` / `status` / `summary` | workflow 结束 |
+| `ImageGenerated` | `role_id` / `path` / `prompt` | generate_image 产物 |
+| `PlanProposed` | `role_id` / `plan_id` / `tasks` | plan 工具提交 |
+| `ChoiceRequested` | `role_id` / `choice_id` / `question` / `multi` / `layout` / `allow_upload` / `options` | ask 工具弹框 |
+| `TimeoutWarning` | `role_id` / `elapsed_secs` / `soft_timeout_secs` / `hard_timeout_secs` / `sub_id?` | 软超时 |
+| `AdvisorTerminated` | `role_id` / `reason` / `detector?` / `sub_id?` | advisor 终止 |
+| `UserMessage` | `text` | 客户端回放用 |
+| `ContextCleared` | — | 上下文清除 |
+| `TaskReport` | `role_id` / `task_id` / `summary` / `result` | manager 任务报告（事件 → ui-server → POST /api/tasks/:id/report） |
 
-```json
-// 角色发言
-{ "type": "RoleTurn", "role_id": "programmer", "content": "代码库结构如下...", "is_complete": true }
-
-// 状态提示
-{ "type": "Status", "message": "programmer 正在分析代码库..." }
-
-// 正在输入提示
-{ "type": "Prompt", "icon": "💻", "role_id": "programmer", "model_id": "deepseek-v4-flash" }
-
-// 暂停/继续
-{ "type": "Paused", "reason": "等待用户决策" }
-{ "type": "Resumed" }
-
-// 多角色轮次
-{ "type": "RoundStarted", "round": 1 }
-{ "type": "RoundEnded", "round": 1 }
-
-// 角色生命周期
-{ "type": "RoleStarted", "role_id": "programmer", "detail": "开始分析..." }
-{ "type": "RoleFinished", "role_id": "programmer", "detail": "分析完成，耗时 12.3秒" }
-
-// 工具调用
-{ "type": "ToolUse", "role_id": "programmer", "tool_name": "read", "args": "src/main.rs" }
-{ "type": "ToolResult", "role_id": "programmer", "tool_name": "read", "result": "fn main() { ... }" }
-{ "type": "ToolError", "role_id": "programmer", "tool_name": "bash", "error": "command not found" }
-
-// 代理委派
-{ "type": "DelegateStarted", "from_role": "manager", "to_role": "programmer", "task": "实现用户登录模块", "sub_id": "sub_001" }
-{ "type": "DelegateFinished", "from_role": "manager", "to_role": "programmer", "status": "ok", "summary": "登录模块已实现...", "sub_id": "sub_001" }
-
-// 会话结束
-{ "type": "Done" }
-
-// 错误
-{ "type": "Error", "message": "API key 未配置" }
-
-// 角色列表 / 上下文清除
-{ "type": "RoleList", "roles": [ { "id": "programmer", "name": "Software Engineer", "icon": "💻" } ] }
-{ "type": "ContextCleared" }
-
-// 会话信息
-{ "type": "SessionInfo", "task_id": "fix-bug", "state": "Active", "turn": 5, "roles": [...] }
-```
-
-**Keepalive：** 每 15 秒发送一个注释行（`:`）保持连接。
+**Keepalive：** 每 15 秒发送一个注释行（`:`）。
 
 **TypeScript 类型定义：**
 ```typescript
 export type ChatEvent =
-  | { type: "RoleTurn"; role_id: string; content: string; is_complete: boolean }
+  | { type: "RoleTurn"; role_id: string; content: string; is_complete: boolean; sub_id?: string }
   | { type: "Status"; message: string }
   | { type: "Prompt"; icon: string; role_id: string; model_id: string }
   | { type: "Paused"; reason: string }
@@ -246,76 +321,52 @@ export type ChatEvent =
   | { type: "RoundEnded"; round: number }
   | { type: "RoleStarted"; role_id: string; detail: string }
   | { type: "RoleFinished"; role_id: string; detail: string }
+  | { type: "RolePaused"; role_id: string }
+  | { type: "RoleResumed"; role_id: string }
   | { type: "Done" }
-  | { type: "Error"; message: string }
+  | { type: "Error"; kind?: string; message: string; sub_id?: string }
   | { type: "RoleList"; roles: RoleInfo[] }
   | { type: "ContextCleared" }
   | { type: "SessionInfo"; task_id: string; state: string; turn: number; roles: RoleInfo[] }
   | { type: "ToolUse"; role_id: string; tool_name: string; args: string }
-  | { type: "ToolError"; role_id: string; tool_name: string; error: string }
   | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
+  | { type: "ToolError"; role_id: string; tool_name: string; error: string }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
-  | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string };
-
-export interface RoleInfo {
-  id: string;
-  name: string;
-  icon: string;
-}
+  | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
+  | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
+  | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number; role_id: string; task: string }
+  | { type: "WorkflowTurn"; wf_id: string; step_id: string; role_id: string; content: string; round: number }
+  | { type: "WorkflowFinished"; name: string; wf_id: string; status: string; summary: string }
+  | { type: "ImageGenerated"; role_id: string; path: string; prompt: string }
+  | { type: "PlanProposed"; role_id: string; plan_id: string; tasks: ImportTask[] }
+  | { type: "ChoiceRequested"; role_id: string; choice_id: string; question: string; multi: boolean; layout: string; allow_upload: boolean; options: ChoiceOption[] }
+  | { type: "TimeoutWarning"; role_id: string; elapsed_secs: number; soft_timeout_secs: number; hard_timeout_secs: number; sub_id?: string }
+  | { type: "AdvisorTerminated"; role_id: string; reason: string; detector?: string; sub_id?: string }
+  | { type: "UserMessage"; text: string }
+  | { type: "TaskReport"; role_id: string; task_id: string; summary: string; result: string };
 ```
 
 ---
 
-## 6. Trace（调试事件追踪）
+## 6. Trace / 调试
 
 ### `GET /api/traces`
 
 列出 `$LATTE_HOME/traces/` 目录下的所有 JSONL trace 文件。
 
-**响应 `200`：**
-```json
-[
-  {
-    "session_id": "fix-bug-001",
-    "path": "/home/user/.latte/traces/fix-bug-001.jsonl",
-    "size_bytes": 45920,
-    "modified_unix": 1747000010000
-  }
-]
-```
+**响应 `200`：** `TraceSummary[]`（含 `session_id` / `path` / `size_bytes` / `modified_unix`）。
 
-### `GET /api/traces/:session_id`
+### `GET /api/traces/<session_id>`
 
-读取指定会话的完整 trace 事件列表。
+读取指定会话的完整 trace 事件列表（路径参数是 trace 文件名，不含 `.jsonl`）。
 
-**路径参数：** `session_id`（trace 文件名，不含 `.jsonl`）
+**响应 `200`：** `{ "session_id": "...", "events": [...] }`
 
-**响应 `200`：**
-```json
-{
-  "session_id": "fix-bug-001",
-  "events": [
-    { "turn": 1, "role": "manager", "kind": "SessionStart", ... },
-    { "turn": 1, "role": "manager", "kind": "ModelCall", ... },
-    { "turn": 1, "role": "manager", "kind": "TurnEnd", ... }
-  ]
-}
-```
+### `GET /api/subsessions?id=<sub_id>`
 
-### `GET /api/subsessions`
+获取委派子会话的完整事件日志（对应 `DelegateStarted.sub_id`）。
 
-获取委派子会话的完整事件日志。
-
-**查询参数：** `id`（子会话 ID，对应 `DelegateStarted.sub_id`）
-
-**响应 `200`：**
-```json
-[
-  { "type": "RoleTurn", "role_id": "programmer", ... },
-  { "type": "ToolUse", "role_id": "programmer", ... },
-  ...
-]
-```
+**响应 `200`：** ChatEvent 数组。
 
 ---
 
@@ -323,55 +374,28 @@ export interface RoleInfo {
 
 ### `POST /api/self-loop/start`
 
-启动 AI 自调试循环。后台 spawn 一个 `tsx self-loop/runner.ts` 进程。
+启动 AI 自调试循环（后台 spawn `tsx self-loop/runner.ts`）。
 
 **请求体：**
 ```json
-{
-  "task": "让聊天输入框支持自动调整高度",
-  "max_iterations": 5
-}
+{ "task": "让聊天输入框支持自动调整高度", "max_iterations": 5 }
 ```
 
-**响应 `200`：**
-```json
-{
-  "started": true,
-  "task": "让聊天输入框支持自动调整高度",
-  "max_iterations": 5
-}
-```
-
+**响应 `200`：** `{ "started": true, "task": "...", "max_iterations": 5 }`  
 **响应 `409`：** `"self-loop already running"`
 
 ### `GET /api/self-loop/events`
 
 Self-loop 进度 SSE 流。
 
-**事件类型：**
-
-```
-event: self_loop_event
-data: {"kind":"iteration","iteration":1,"message":"第1轮：截图并分析布局","screenshot":"data:image/png;base64,...","timestamp_unix_ms":1747000010000}
-```
-
-```json
-{ "kind": "iteration",    "iteration": 1, "message": "分析布局",     "screenshot": "base64...", "timestamp_unix_ms": 1747000010000 }
-{ "kind": "edit",         "iteration": 1, "message": "修改 CSS",     "screenshot": "base64...", "timestamp_unix_ms": 1747000010000 }
-{ "kind": "build",        "iteration": 1, "message": "构建项目",     "data": { "exit_code": 0 }, "timestamp_unix_ms": 1747000010000 }
-{ "kind": "test",         "iteration": 1, "message": "跑测试",        "data": { "passed": 13, "failed": 0 }, "timestamp_unix_ms": 1747000010000 }
-{ "kind": "complete",     "iteration": 2, "message": "修改完成",     "data": { "diff_path": "/tmp/diff.patch" }, "timestamp_unix_ms": 1747000010000 }
-{ "kind": "error",        "iteration": 1, "message": "编译错误",     "data": { "error": "..." }, "timestamp_unix_ms": 1747000010000 }
-```
-
-**Keepalive：** 每 10 秒一个 `event: ping` / `data:`。
+**事件类型：** `self_loop_event`（payload 含 `kind` / `iteration` / `message` / `screenshot` / `data` / `timestamp_unix_ms`）。  
+**Ping：** 每 10 秒一个 `event: ping` / `data: ""`。
 
 ### `POST /api/self-loop/stop`
 
 停止当前运行的 self-loop。
 
-**请求体：** 无
-
+**请求体：** 无  
 **响应 `200`**
 
 ---
@@ -380,54 +404,277 @@ data: {"kind":"iteration","iteration":1,"message":"第1轮：截图并分析布�
 
 ### `GET /api/role-graph`
 
-获取角色 × 工具的代码关系图。结合 TOML 配置中的 tool 声明与 TreeSitter 扫描到的 `register_*_tool` 调用点。
+获取角色 × 工具的代码关系图（结合 TOML 配置的 tool 声明 + TreeSitter 扫 `register_*_tool` 调用点）。
 
-**响应 `200`：**
-```json
-{
-  "nodes": [
-    { "id": "manager", "kind": "Role", "label": "Engineering Manager" },
-    { "id": "delegate", "kind": "Tool", "label": "delegate" },
-    { "id": "read", "kind": "Tool", "label": "read" },
-    { "id": "register_delegate_tool:42", "kind": "ToolRegistration", "label": "register_delegate_tool", "detail": "latte-agent-core/src/controller.rs:42" }
-  ],
-  "edges": [
-    { "source": "manager", "target": "delegate", "kind": "USES_TOOL" },
-    { "source": "register_delegate_tool:42", "target": "delegate", "kind": "REGISTERED_BY" }
-  ],
-  "stats": { "roles": 14, "tools": 5, "registrations": 8 },
-  "project_root": "/home/user/project"
-}
-```
+**响应 `200`：** `RoleGraph`（含 `nodes` / `edges` / `stats` / `project_root`）。
 
 ---
 
-## 9. 会话 ID 管理
+## 9. 模型管理
 
-每个浏览器标签页独立维护一个 `session_id`：
+### `GET /api/models`
 
-- 首次加载时通过 `POST /api/sessions` 创建
-- 存储在 `localStorage` 的 `latte-agent-ui-session-id` 键下
-- 页面刷新时自动重用：调用 `GET /api/session?id=<stored>` 确认服务端仍存在
-- "New Session" 按钮清理本地存储并创建新会话
+列出合并后的模型 catalog（项目层覆盖后）。
 
-**JavaScript 使用示例：**
+**响应 `200`：** `ModelDef[]`
 
-```typescript
-// 创建/恢复会话
-const sessionId = await ensureSession();
+### `POST /api/models`
 
-// 发送消息
-await fetch("/api/chat/send", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ message: "你好" }),
-});
+创建新模型（写 `.latte/models.d/<key>.toml`）。
 
-// 订阅 SSE 事件流
-const es = new EventSource(`/api/events?id=${sessionId}`);
-es.addEventListener("chat_event", (e) => {
-  const event = JSON.parse(e.data);
-  console.log(event.type, event);
-});
-```
+**请求体：** `ModelDef`
+
+**响应 `200`**
+
+### `PATCH /api/models/<key>`
+
+更新模型字段（合并到现有 TOML，保留其他字段）。
+
+**请求体：** `ModelDef`（部分字段）
+
+**响应 `200`**
+
+### `DELETE /api/models/<key>`
+
+删除模型（删 `.latte/models.d/<key>.toml`）。
+
+**响应 `200`**
+
+### `POST /api/models/test`
+
+测试单模型（独立 ChatController 跑一轮，跳过 cooldown）。
+
+**请求体：** `{ "model_id": "...", "tier": "standard" }`
+
+**响应 `200`**
+
+### `GET /api/models/<key>/capabilities`
+
+读取模型能力（vision / image_generation / thinking / cost_per_million / timeout_secs）。
+
+**响应 `200`：** `ModelCapabilities`
+
+### `GET /api/models/<key>/toml`
+
+读取模型 TOML 源文件。
+
+**响应 `200`：** `{ "toml": "..." }`
+
+### `PUT /api/models/<key>/toml`
+
+保存模型 TOML 源文件（保留字段顺序）。
+
+**响应 `200`**
+
+---
+
+## 10. 工具管理
+
+### `GET /api/tools`
+
+列出所有已注册工具（短名 + git.* 展开 + delegate/workflow 等）。
+
+**响应 `200`：** `ToolEntry[]`（含 `id` / `kind` / `description` / `enabled` / `registered_by`）
+
+### `POST /api/tools/test`
+
+测试单工具（独立执行一次）。
+
+**请求体：** `{ "tool_id": "read", "args": { "path": "README.md" } }`
+
+**响应 `200`**
+
+### `POST /api/tools/:id/toggle`
+
+启用/禁用工具（更新 `.latte/tools.yaml`）。
+
+**请求体：** `{ "enabled": false }`
+
+**响应 `200`**
+
+---
+
+## 11. 任务看板
+
+> 设计文档：`docs/task-board-design.md`。存储：`<cwd>/.latte/tasks/{board.json, LAT-*.json, archive/}`。
+
+### `GET /api/tasks`
+
+列出所有任务（含子任务聚合进度）。
+
+**响应 `200`：** `TaskView[]`（含 `actions` / `sub_total` / `sub_done` / `sub_state_counts`）
+
+### `POST /api/tasks`
+
+新建任务。
+
+**请求体：** `CreateTaskRequest`（title / description / priority / labels / parent_id / scheduled_at / workflow / paths）
+
+**响应 `200`：** `TaskView`
+
+### `GET /api/tasks/<id>`
+
+获取任务详情。
+
+**响应 `200`：** `TaskView`
+
+### `PATCH /api/tasks/<id>`
+
+修改任务字段（partial patch）。
+
+**请求体：** `TaskPatch`（与 `create` 相同字段）
+
+**响应 `200`：** `TaskView`
+
+### `DELETE /api/tasks/<id>`
+
+删除任务（文件移入 `archive/`）。
+
+**响应 `200`**
+
+### `POST /api/tasks/import`
+
+批量导入任务（plan 工具批准后调用）。
+
+**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?`）
+
+**响应 `200`：** `ImportTasksResponse`（含 `created` / `auto_dispatch?`）
+
+### `POST /api/tasks/dispatch-ready`
+
+一键批量派发所有 `todo` 任务（按 priority 排序）。
+
+**请求体：** `{ "max_concurrent": 3 }`
+
+**响应 `200`：** `DispatchReadyResponse`（`dispatched` / `skipped`）
+
+### `POST /api/tasks/<id>/dispatch`
+
+派发单个任务（manager 走 task 调度 / workflow 绑定的任务直接跑 workflow）。
+
+**请求体：** `{}`
+
+**响应 `200`：** `TaskView`
+
+### `POST /api/tasks/<id>/abort`
+
+中止任务执行（取消旗标 + chat_abort）。
+
+**响应 `200`：** `TaskView`
+
+### `POST /api/tasks/<id>/report`
+
+manager 回报任务完成（state → human_review）。
+
+**请求体：** `ReportTaskRequest`（`summary` / `result`：`completed`/`aborted`/`failed`/`timeout`）
+
+**响应 `200`：** `TaskView`
+
+---
+
+## 12. 工作流管理
+
+> 文件：`workflows.d/<name>.toml`（项目层）或 `~/.latte/workflows.d/`（全局）。引擎：`latte-agent-core/src/workflow.rs`（serial + DAG 双引擎）。
+
+### `GET /api/workflows`
+
+列出所有 workflow（项目 + 全局）。
+
+**响应 `200`：** `WorkflowSummary[]`（含 `name` / `description` / `steps_count` / `source` / `file_path` / `command`）
+
+### `POST /api/workflows`
+
+新建 workflow（写 TOML）。
+
+**请求体：** `WorkflowForm`（name / description / command / max_rounds / steps）
+
+**响应 `200`**
+
+### `GET /api/workflows/<name>`
+
+读 workflow 详情（含原始 TOML）。
+
+**响应 `200`：** `WorkflowDetail`
+
+### `PUT /api/workflows/<name>`
+
+更新 workflow（用 toml_edit 保留字段顺序）。
+
+**请求体：** `WorkflowForm`
+
+**响应 `200`**
+
+### `DELETE /api/workflows/<name>`
+
+删除 workflow（项目层）。
+
+**响应 `200`**
+
+### `POST /api/workflows/validate`
+
+校验 workflow TOML 合法性与 DAG 连通性。
+
+**请求体：** `WorkflowForm`
+
+**响应 `200`：** `ValidateResponse`（`ok` / `errors` / `warnings`）
+
+### `POST /api/workflows/run`
+
+启动 workflow 测试运行（独立 session，事件走 `/api/workflows/run/events` SSE）。
+
+**请求体：** `{ "name": "learn", "topic": "..." }`
+
+**响应 `200`：** `{ "run_id": "wf-..." }`
+
+### `GET /api/workflows/run/events`
+
+workflow run 进度 SSE 流（独立 session，与主 events 隔离）。
+
+### `POST /api/workflows/run/stop`
+
+停止当前 workflow run。
+
+**请求体：** `{}`
+
+**响应 `200`**
+
+### `POST /api/workflows/resume`
+
+从 checkpoint 续跑失败的 workflow（用 checkpoint 的 `wf_id` 定位，跑出新 run）。
+
+**请求体：** `{ "session_id": "...", "wf_id": "...", "topic": "可选" }`
+
+**响应 `202`**
+
+### `GET /api/workflows/<name>/toml`
+
+读取 workflow TOML 源文件。
+
+**响应 `200`：** `{ "toml": "..." }`
+
+### `PUT /api/workflows/<name>/toml`
+
+保存 workflow TOML 源文件。
+
+**响应 `200`**
+
+---
+
+## 13. 文档图像上传
+
+> gen-image 工具（`generate_image`）的产物 + markdown 内引用的图片上传。
+
+### `POST /api/images`
+
+上传图片（multipart/form-data 或 raw body），存 `<cwd>/.latte/images/upload-<ts>.<ext>`。
+
+**支持扩展：** `png` / `jpg` / `jpeg` / `gif` / `webp`  
+**上限：** 10 MiB
+
+**响应 `200`：** `{ "path": "/api/images/upload-1747000010000.png" }`
+
+### `GET /api/images/<file>`
+
+下载图片（相对 `.latte/images/` 路径）。
+
+**响应 `200`：** image/* 内容

@@ -2,44 +2,46 @@
 // latte-agent-ui ↔ latte-code-editor API 桥接映射
 // ============================================================================
 //
-// 本文件记录了两个代码库之间的 API 对应关系：
+// 本文件记录两个代码库之间的 API 对应关系：
 //
-//   latte-agent-ui (HTTP/SSE)          → HTTP REST + Server-Sent Events
+//   latte-agent-ui (HTTP/SSE)             → HTTP REST + Server-Sent Events
 //     └─ latte-rs-agents/latte-agent-cli/ui/src/api.ts
 //     └─ latte-rs-agents/latte-agent-cli/src/commands/ui.rs
 //
-//   latte-code-editor (Tauri invoke)   → Tauri IPC invoke + event listen
+//   latte-code-editor (Tauri invoke)      → Tauri IPC invoke + event listen
 //     └─ latte-code-editor/src/api/chat.ts
 //     └─ latte-code-editor/src-tauri/src/chat_panel/commands.rs
 //
-// 当需要将 latte-agent-ui 的功能移植到 latte-code-editor 中时，用此文件
-// 查找对应的 Tauri 命令/事件。
+// 完整 agent-ui 端点列表见 `docs/api-reference.md`（由
+// `latte-agent-ui-server/src/api_reference_integrity.rs` 校验一致性）。
 //
-// 版本: 1.0
-// 日期: 2026-07-12
+// 本文件**只整理跨端映射**——明确哪些功能在 code-editor 已有对应 invoke，
+// 哪些只有 agent-ui 端点（code-editor 暂未实现）。
+//
+// 版本: 2.0
+// 日期: 2026-08-09
 // ============================================================================
 
-// ─── 类型映射 ────────────────────────────────────────────────────────────
+// ─── 类型映射 ─────────────────────────────────────────────────────────────
 
 /**
- * latte-agent-ui: 通过 HTTP GET /api/sessions 返回的会话摘要。
- * latte-code-editor: chat_session_list (invoke → SessionSummary[])
+ * agent-ui: GET /api/sessions 返回的会话摘要。
+ * code-editor: chat_session_list (invoke → SessionSummary[])
  */
 export interface BridgeSessionSummary {
-  // agent-ui 字段                                      // code-editor 等效字段
-  session_id: string;                                  //  sessionId
-  preview: string;                                     //  (从 messages 推断)
-  initial_role: string;                                //  roleIds[0]
-  created_at_unix_ms: number;                          //  createdAt
-  last_activity_unix_ms: number;                       //  updatedAt
+  // agent-ui 字段                                  // code-editor 等效字段
+  session_id: string;                              //  sessionId
+  preview: string;                                 //  (从 messages 推断)
+  initial_role: string;                            //  roleIds[0]
+  created_at_unix_ms: number;                      //  createdAt
+  last_activity_unix_ms: number;                   //  updatedAt
+  is_paused?: boolean;                             //  Paused
+  label?: string | null;                           //  label
 }
 
 /**
- * latte-agent-ui: GET /api/roles 返回的角色信息。
- * latte-code-editor: chat_list_roles → RoleInfo[]
- *
- * agent-ui 返回较简（仅有 id/name/icon），
- * code-editor 返回更多字段 (category/modelChain/defaultModelTier)。
+ * agent-ui: GET /api/roles 返回的角色信息。
+ * code-editor: chat_list_roles → RoleInfo[]
  */
 export interface BridgeRoleInfo {
   id: string;
@@ -52,820 +54,589 @@ export interface BridgeRoleInfo {
 }
 
 /**
- * latte-agent-ui: GET /api/session?id=... 返回的当前会话信息。
- * latte-code-editor: 无直接等效 — 由 Controller 内部管理。
+ * agent-ui: GET /api/session?id=... 返回的当前会话详情。
+ * code-editor: 无直接对应——code-editor 由客户端管理 sessionId。
  */
 export interface BridgeSessionInfo {
   session_id: string;
   role: string;
   model: string | null;
   tier: string;
+  is_paused: boolean;
   available_sessions: BridgeSessionSummary[];
   available_roles: BridgeRoleInfo[];
 }
 
-// ─── API 端点映射表 ───────────────────────────────────────────────────────
+/**
+ * ChatEvent 双端事件类型共用的字段子集（agent-ui 与 code-editor 字段名一致）。
+ */
+export interface BridgeChatEventCommon {
+  type: string;
+  role_id?: string;
+  content?: string;
+  is_complete?: boolean;
+  sub_id?: string;
+  message?: string;
+  icon?: string;
+  model_id?: string;
+  reason?: string;
+  round?: number;
+  task_id?: string;
+  state?: string;
+  turn?: number;
+  roles?: BridgeRoleInfo[];
+  tool_name?: string;
+  args?: string;
+  result?: string;
+  error?: string;
+  from_role?: string;
+  to_role?: string;
+  status?: string;
+  summary?: string;
+  detail?: string;
+  choices?: ChoiceOption[];
+  multi?: boolean;
+  layout?: string;
+  allow_upload?: boolean;
+  options?: ChoiceOption[];
+  iteration?: number;
+  elapsed_secs?: number;
+  soft_timeout_secs?: number;
+  hard_timeout_secs?: number;
+  detector?: string;
+  text?: string;
+  choice_id?: string;
+  question?: string;
+  path?: string;
+  prompt?: string;
+  plan_id?: string;
+  tasks?: BridgeTask[];
+  wf_id?: string;
+  step_id?: string;
+  description?: string;
+  index?: number;
+  total?: number;
+  name?: string;
+  topic?: string;
+}
+
+export interface ChoiceOption {
+  label: string;
+  description?: string;
+  image?: string;
+  recommended?: boolean;
+}
+
+export interface BridgeTask {
+  title: string;
+  description?: string;
+  priority?: number;
+  labels?: string[];
+  workflow?: string;
+  paths?: string[];
+  subtasks?: BridgeTask[];
+}
+
+// ─── 命名空间：每个端点的代码-editor 映射 ──────────────────────────────────
 //
-// 以下是完整的端点级映射。每个条目包含:
-//   agent-ui  → HTTP 方法/路径           (来自 api.ts)
-//   code-editor → Tauri invoke 命令        (来自 chat.ts + commands.rs)
-//   说明         → 语义差异 / 注意事项
-
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 1. 会话管理 (Session Management)                                        │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
+// 标注规则：
+//   "agent-ui HTTP 路径" : "agent-ui 端点描述 + 调用方式"
+//   "code-editor"        : 已知 invoke / 已知 SSE event / (暂未实现)
+//
+// 设计原则：bridge-api 只记录**真实存在**的代码-editor 接口。
+// 注释 // 后面是端口迁移建议（怎么把 agent-ui 行为包到 code-editor）。
+// 对于 code-editor 没有对应功能的 agent-ui 端点，标 "（code-editor 暂未实现）"。
 
 /**
- * agent-ui:  GET  /api/sessions
- *   返回所有活跃会话的摘要列表（无详细消息）。
- *   → listSessions() → SessionSummary[]
+ * §1. 健康检查
  *
+ * agent-ui:  GET /health
+ *   liveness 探针，返回 "ok"。
+ * code-editor: (无对应——Tauri 进程由 OS 管理，无需外部探针)
+ */
+export function mapHealth() {
+  // agent-ui:  GET /health → "ok"
+  // code-editor: (none)
+}
+
+/**
+ * §2. 会话管理
+ *
+ * agent-ui:  GET /api/sessions
+ *   → listSessions() → BridgeSessionSummary[]
  * code-editor:  invoke("chat_session_list") → SessionSummary[]
- *   返回 ~/.latte/chat-sessions/*.json 中持久化的会话摘要。
  *
- * 映射关系：
- *   agent-ui.session_id      ↔ code-editor.SessionSummary.sessionId
- *   agent-ui.preview         ↔ (从 messages[0] 推断)
- *   agent-ui.initial_role    ↔ code-editor.SessionSummary.roleIds[0]
- *   agent-ui.created_at_unix_ms ↔ code-editor.SessionSummary.createdAt
- *   agent-ui.last_activity_unix_ms ↔ code-editor.SessionSummary.updatedAt
- */
-export function mapSessionList() {
-  // agent-ui:   GET /api/sessions          → fetch
-  // code-editor: invoke("chat_session_list") → Tauri invoke
-}
-
-/**
- * agent-ui:  POST /api/sessions (body: {})
- *   创建一个新会话，返回 SessionInfo（含 session_id）。
- *   → createSession() → string (session_id)
+ * agent-ui:  POST /api/sessions
+ *   → createSession() → BridgeSessionInfo
+ * code-editor:  invoke("chat_controller_spawn") (client chooses sessionId)
  *
- * code-editor:  invoke("chat_controller_spawn", { request: ControllerSpawnRequest })
- *   spawn 一个 ChatController 会话。code-editor 由调用方自行生成 sessionId，
- *   而非从服务端获取。需要同时提供 roles/initialPrompt 等完整参数。
+ * agent-ui:  DELETE /api/sessions?id=<sid>
+ *   → deleteSession() → void
+ * code-editor:  invoke("chat_session_delete", { sessionId }) → void
  *
- * 对应关系:
- *   agent-ui "POST /api/sessions"   → 分配 session_id + 单角色 ChatController
- *   code-editor "chat_controller_spawn" → 分配 sessionId + roles + 完整配置
- */
-export function mapCreateSession() {
-  // agent-ui:   POST /api/sessions  (body: {}) → { session_id, role, ... }
-  // code-editor: invoke("chat_controller_spawn", { request: {
-  //               sessionId: string,
-  //               roles: string[],
-  //               initialPrompt?: string,
-  //               maxRounds?: number,
-  //               ...
-  //             }})
-}
-
-/**
- * agent-ui:  GET /api/session?id=<session_id>
- *   获取指定会话的详细信息（含可用角色列表）。
- *   → getSession() → SessionInfo
+ * agent-ui:  POST /api/sessions/fork
+ *   从源会话的事件前缀 fork 新会话。
+ *   → forkSession(sourceId, events) → BridgeSessionInfo
+ * code-editor:  (暂未实现——建议: 在 spawn 后手动 replay ChatEvent 历史)
  *
+ * agent-ui:  GET /api/session?id=<sid>
+ *   → getSession(id) → BridgeSessionInfo
  * code-editor:  invoke("chat_session_get", { sessionId }) → StoredSession
- *   返回持久化会话的完整记录，包含消息列表。
- *   对于活跃的 Controller 会话，可通过 "chat_controller_spawn" 时记录的
- *   sessionId 追踪。
+ *
+ * agent-ui:  GET /api/session/history?id=<sid>
+ *   → sessionHistory(id) → ChatEvent[]
+ * code-editor:  invoke("chat_session_get", { sessionId }).messages
+ *   （data 格式需转换：code-editor 的 messages vs agent-ui 的 ChatEvent 流）
+ *
+ * agent-ui:  POST /api/session/label
+ *   重命名会话。
+ *   → setSessionLabel(id, label) → void
+ * code-editor:  (暂未实现——建议: 在 StorageSession 上扩展 label 字段)
  */
-export function mapGetSession() {
-  // agent-ui:   GET /api/session?id=xxx → { session_id, role, ... }
-  // code-editor: invoke("chat_session_get", { sessionId }) → { messages, ... }
+export function mapSessions() {
+  // 端口时：GET → invoke("chat_session_list"); POST → invoke("chat_controller_spawn")
+  //         DELETE → invoke("chat_session_delete"); GET(id) → invoke("chat_session_get")
+  //         history 与 label 暂无可直接复用。
 }
 
 /**
- * agent-ui:  不单独暴露删除接口（会话在进程内存中，进程退出即释放）
+ * §3. 角色查询
  *
- * code-editor:  invoke("chat_session_delete", { sessionId })
- *   删除持久化的会话 JSON。
- */
-export function mapDeleteSession() {
-  // agent-ui:   (none — 无持久化存储)
-  // code-editor: invoke("chat_session_delete", { sessionId })
-}
-
-/**
- * agent-ui:  不暴露编辑已发送消息的接口
+ * agent-ui:  GET /api/roles
+ *   → getRoles() → BridgeRoleInfo[]
+ * code-editor:  invoke("chat_list_roles") → RoleInfo[] (含更多字段)
  *
- * code-editor:  invoke("chat_session_edit_message", { sessionId, index, newContent })
- *   允许编辑历史消息（仅供 assistant/user 类型）。
- */
-export function mapEditSessionMessage() {
-  // agent-ui:   (none)
-  // code-editor: invoke("chat_session_edit_message", {
-  //               sessionId, index, newContent
-  //             })
-}
-
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 2. 角色和模型配置 (Role & Model Configuration)                           │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  GET  /api/roles
- *   返回所有可用角色列表（简略：id/name/icon）。
- *   → getRoles() → RoleInfo[]
- *
- * code-editor:  invoke("chat_list_roles") → RoleInfo[]
- *   返回更丰富的角色信息（含 modelChain、defaultModelTier、category）。
- *   数据源：~/.latte-code-editor/roles.yaml
- *
+ * agent-ui:  GET /api/roles/config
+ *   → getRolesConfig() → RolesConfigResponse
  * code-editor:  invoke("chat_get_role_config") → RoleConfigResponse
- *   返回完整的角色配置，包含 defaultModel、workflows、roles。
+ *
+ * agent-ui:  POST /api/roles
+ *   → createRole(req) → RoleConfigEntry
+ * code-editor:  (暂未实现独立入口——直接写 ~/.latte/agents.d/<id>.toml)
+ *
+ * agent-ui:  DELETE /api/roles/:id
+ *   → deleteRole(id) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  GET /api/roles/:id/toml
+ *   → getRoleToml(id) → {toml: string}
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  PUT /api/roles/:id/toml
+ *   → putRoleToml(id, toml) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/roles/test
+ *   单角色测试运行。
+ *   → testRole(req) → void
+ * code-editor:  (暂未实现)
  */
-export function mapListRoles() {
-  // agent-ui:   GET /api/roles → [{ id, name, icon }]
-  // code-editor: invoke("chat_list_roles") → [{ id, name, icon, category, modelChain, ... }]
-  // code-editor: invoke("chat_get_role_config") → { defaultModel, roles: [], workflows: [] }
+export function mapRoles() {
+  // 端口时：GET /api/roles → invoke("chat_list_roles")
+  //         GET /api/roles/config → invoke("chat_get_role_config")
+  //         其余 CRUD 与 TOML 写入需新加 Tauri command。
 }
 
 /**
- * agent-ui:  (无直接等效 — 模型列表通过角色隐式暴露)
+ * §4. 聊天命令
  *
- * code-editor:  invoke("chat_list_models") → ModelInfo[]
- *   返回 ~/.latte/models.yaml 中所有可用模型的详细列表。
- *   ModelInfo 包含: id, name, provider, maxTokens, contextWindow, supportsVision, supportsThinking
- */
-export function mapListModels() {
-  // agent-ui:   (none)
-  // code-editor: invoke("chat_list_models") → [{ id, name, provider, maxTokens, ... }]
-}
-
-/**
- * agent-ui:  (无直接等效 — 模型选择在启动时由 --model 标志决定)
- *
- * code-editor:  invoke("chat_set_role_model", { roleId, modelId })
- *   为指定角色设置模型。实际委托给 chat_set_role_model_chain([modelId])。
- *
- * code-editor:  invoke("chat_set_role_model_chain", { roleId, chain })
- *   为指定角色设置优先级排序的模型链。chain[0] 为主模型，后续为回退。
- *
- * code-editor:  invoke("chat_set_default_model", { modelId })
- *   设置全局默认模型。
- */
-export function mapSetModel() {
-  // agent-ui:   (none — 模型在服务启动时固定)
-  // code-editor: invoke("chat_set_role_model", { roleId, modelId })
-  // code-editor: invoke("chat_set_role_model_chain", { roleId, chain: string[] })
-  // code-editor: invoke("chat_set_default_model", { modelId })
-}
-
-/**
- * agent-ui:  (无直接等效)
- *
- * code-editor:  invoke("chat_open_config", { configType })
- *   在系统编辑器中打开配置文件。
- *   configType 可以是: "models" | "roles" | "workflow:<id>" | "role:<id>"
- *   返回文件路径字符串。
- */
-export function mapOpenConfig() {
-  // agent-ui:   (none — 编辑器在浏览器中)
-  // code-editor: invoke("chat_open_config", { configType: "models" | "roles" | "workflow:<id>" | "role:<id>" })
-}
-
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 3. 聊天 (Chat — 单角色/多角色)                                          │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  POST /api/chat/send (body: { session_id, message })
- *   向当前角色发送一条消息。控制器消耗消息并生成 ChatEvent 流。
- *   → sendMessage(message) → void (202 ACCEPTED)
- *
+ * agent-ui:  POST /api/chat/send
+ *   → sendMessage(req) → 202 ACCEPTED
  * code-editor:  invoke("chat_controller_submit", { sessionId, text })
- *   为 Controller 驱动的会话提交用户文本输入。等效于 agent-ui 的 sendMessage。
  *
- * 注意：
- *   - agent-ui 接受后立即返回 202，事件通过 SSE 推送。
- *   - code-editor 同样异步，事件通过 Tauri "chat:controller_event" 事件推送。
- */
-export function mapSendMessage() {
-  // agent-ui:   POST /api/chat/send  { session_id, message } → 202
-  // code-editor: invoke("chat_controller_submit", { sessionId, text })
-}
-
-/**
- * agent-ui:  POST /api/chat/command (body: { session_id, command })
- *   向控制器发送特殊命令（如 @role 切换、系统指令）。
- *   → sendCommand(command) → void
- *
- * code-editor:  (无独立命令端点 — 所有输入统一走 chat_controller_submit)
- *   agent-ui 的 POST /api/chat/command 本质与 send 相同
- *   （调用 controller.submit_input），区别仅在于前端标签。端口时
- *   可将 command 视为普通文本输入提交。
- */
-export function mapSendCommand() {
-  // agent-ui:   POST /api/chat/command  { session_id, command } → 202
-  // code-editor: invoke("chat_controller_submit", { sessionId, text }) — 统一处理
-}
-
-/**
- * agent-ui:  POST /api/chat/role (body: { session_id, role_id })
- *   切换当前会话的活动角色。控制器调用 switch_role 让新角色成为发言人。
- *   → switchRole(role_id) → void
- *
- * code-editor:  (切换角色由 Controller 在 spawn 时通过 roles 数组固定，
- *   或通过后续 submitInput 的上下文隐式切换。无独立切换命令。)
- *
- * 移植要点：
- *   如需在 code-editor 中切换角色，可终止当前 Controller 并重新 spawn
- *   新角色集合，或在 spawn 时指定所有需要的角色，让 Controller 自动轮换。
- */
-export function mapSwitchRole() {
-  // agent-ui:   POST /api/chat/role  { session_id, role_id } → 202
-  // code-editor: (通过 ControllerSpawnRequest.roles 预配置)
-}
-
-/**
- * agent-ui:  POST /api/chat/send + 控制器自动流转
- *   单角色模式下，agent-ui 使用单一角色回复。如需开始完整的多角色讨论
- *   （含工作流），需要手动管理。
- *
- * code-editor:  invoke("chat_start_discussion", { request: StartDiscussionRequest })
- *   StartDiscussionRequest 包含 topic, workflow, customRoles, maxRounds。
- *
- * code-editor:  invoke("chat_continue", { request: ContinueDiscussionRequest })
- *   为已存在的讨论追加后续消息。
- *
- * code-editor:  invoke("chat_cancel", { sessionId })
- *   取消进行中的讨论。
- *
- * code-editor:  invoke("chat_cancel_workspace", { workspaceId })
- *   按工作区取消讨论。
- */
-export function mapDiscussion() {
-  // agent-ui:   (通过 sendMessage + SSE 手动管理多角色会话)
-  // code-editor: invoke("chat_start_discussion", { request: { topic, workflow, ... } })
-  // code-editor: invoke("chat_continue", { request: { sessionId, message } })
-  // code-editor: invoke("chat_cancel", { sessionId })
-  // code-editor: invoke("chat_cancel_workspace", { workspaceId })
-}
-
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 4. 控制器会话 (ChatController — 事件驱动多角色)                          │
- * └─────────────────────────────────────────────────────────────────────────┘
- *
- * latte-code-editor 的核心新增能力。Controller 是一个事件驱动的多角色会话
- * 管理器。每个会话通过 client-chosen sessionId 标识，事件通过 Tauri 事件
- * "chat:controller_event" 推送。
- */
-
-/**
- * code-editor:  invoke("chat_controller_spawn", { request: ControllerSpawnRequest })
- *   创建一个新的 ChatController 会话。
- *   ControllerSpawnRequest: { sessionId, taskId?, roles[], initialPrompt?,
- *                             maxRounds?, sessionTokenBudget?, primaryModelId?, ... }
- *
+ * agent-ui:  POST /api/chat/command
+ *   → sendCommand(req) → 202 ACCEPTED
  * code-editor:  invoke("chat_controller_submit", { sessionId, text })
- *   向 Controller 提交用户输入。
+ *   （code-editor 无独立 command 端点；统一走 submit，command 视作普通文本）
  *
- * code-editor:  invoke("chat_controller_pause", { sessionId })
- *   暂停进行中的 Controller 会话。
+ * agent-ui:  POST /api/chat/role
+ *   切换当前会话角色。
+ *   → switchRole(req) → 202 ACCEPTED
+ * code-editor:  (切角色由 spawn 时 roles 数组固定；动态切换需 abort + respawn)
  *
+ * agent-ui:  POST /api/chat/cancel-turn
+ *   取消当前 turn（不退出 session）。
+ *   → cancelTurn(req) → 200 OK
+ * code-editor:  invoke("chat_controller_submit", { sessionId, "" })（弱等效——不一定中断 in-flight）
+ *
+ * agent-ui:  POST /api/chat/abort
+ *   终止整个 session（同时连带取消 workflow resume）。
+ *   → abortSession(req) → 200 OK
+ * code-editor:  invoke("chat_controller_abort", { sessionId }) → void
+ *
+ * agent-ui:  POST /api/chat/pause
+ *   暂停当前 turn。
+ *   → pauseSession(req) → 200 OK
+ * code-editor:  invoke("chat_controller_pause", { sessionId }) → void
+ *
+ * agent-ui:  POST /api/chat/resume
+ *   恢复暂停的 turn。
+ *   → resumeSession(req) → 200 OK
+ * code-editor:  invoke("chat_controller_resume", { sessionId }) → void
+ *
+ * agent-ui:  POST /api/chat/pause-session
+ *   全 session 冻结。
+ *   → pauseSession(req) → 200 OK
+ * code-editor:  invoke("chat_controller_pause", { sessionId })（复用同一命令）
+ *
+ * agent-ui:  POST /api/chat/resume-session
+ *   全 session 恢复。
+ *   → resumeSession(req) → 200 OK
  * code-editor:  invoke("chat_controller_resume", { sessionId })
- *   恢复已暂停的 Controller 会话。
  *
- * code-editor:  invoke("chat_controller_abort", { sessionId })
- *   中止 Controller 会话。
+ * agent-ui:  POST /api/chat/resume-role
+ *   HIL 单角色恢复。
+ *   → resumeRole(req) → 202 ACCEPTED
+ * code-editor:  (暂未实现——agent-ui 特有：per-role pause HIL)
  *
- * 映射关系:
- *   agent-ui "POST /api/chat/send"        → chat_controller_submit
- *   agent-ui SSE "/api/events"            → Tauri "chat:controller_event"
- *   agent-ui 无暂停/恢复/中止             → chat_controller_{pause,resume,abort}
+ * agent-ui:  POST /api/chat/stream-mode
+ *   切换流式/非流式输出。
+ *   → setStreamMode(req) → 200 OK
+ * code-editor:  (由 chat_stream 一次性同步决定)
  */
-export function mapController() {
-  // agent-ui:   通过 POST /api/chat/send + SSE 订阅实现相近行为
-  // code-editor: 5 个 invoke 命令 + "chat:controller_event" 事件
+export function mapChat() {
+  // 端口时：submit/abort/pause/resume 一一对应 invoke；role/command 需视为
+  // 普通文本（"/role xxx"）；cancel-turn 与 pause-session 暂无可用 invoke。
 }
 
 /**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 5. 单角色流式聊天 (Single-role Stream Chat)                              │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  POST /api/chat/send → SSE 接收 ChatEvent (RoleTurn)
- *   单角色模式下，agent-ui 发送消息后通过 SSE 接收流式回复。
+ * §5. SSE 事件流
  *
- * code-editor:  invoke("chat_stream", { request: StreamRequest }) → StreamReply
- *   一个 invoke 调用即完成单次往返。返回完整回复内容。
- *   StreamRequest: { roleId, content, sessionId?, tier?, primaryModelId?, history? }
- *   StreamReply:   { role_id, session_id, model_id, tier, content }
+ * agent-ui:  GET /api/events?id=<sid>
+ *   → subscribeEvents(onEvent) → unsubscribe
+ * code-editor:  listen("chat:controller_event", (event) => { ... })
  *
- * 移植要点：
- *   agent-ui 的流式体验通过 SSE 分片推送 RoleTurn（is_complete 区分中间/最终）。
- *   code-editor 的 chat_stream 是一次性同步返回，适合简单的单轮对话。
- *   如需流式体验，应改用 Controller 模式 + "chat:controller_event"。
- */
-export function mapStreamChat() {
-  // agent-ui:   POST /api/chat/send + SSE streaming (ChatEvent.RoleTurn)
-  // code-editor: invoke("chat_stream", { request }) → StreamReply
-}
-
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 6. 工作流管理 (Workflow Management)                                     │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  (无工作流UI — 角色在 server 启动时固定)
- *
- * code-editor:  invoke("chat_list_workflows") → WorkflowInfo[]
- *   返回摘要信息（含 kind: planned|swarm|manager_led）。
- *
- * code-editor:  invoke("chat_list_workflows_full") → WorkflowPayload[]
- *   返回完整工作流负载（含每个 step 的详情）。
- *
- * code-editor:  invoke("chat_get_workflow_full", { id }) → WorkflowPayload
- *   获取单个工作流的完整配置。
- *
- * code-editor:  invoke("chat_save_workflow", { payload }) → WorkflowMutationResult
- *   保存/更新工作流。
- *
- * code-editor:  invoke("chat_delete_workflow", { id }) → WorkflowMutationResult
- *   删除工作流（内置预设不可删除）。
- */
-export function mapWorkflow() {
-  // agent-ui:   (none)
-  // code-editor: invoke("chat_list_workflows")
-  // code-editor: invoke("chat_list_workflows_full")
-  // code-editor: invoke("chat_get_workflow_full", { id })
-  // code-editor: invoke("chat_save_workflow", { payload })
-  // code-editor: invoke("chat_delete_workflow", { id })
-  // code-editor: invoke("chat_reset_roles_to_defaults")
-}
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 7. 追踪和调试 (Traces & Debugging)                                      │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  GET  /api/traces
- *   列出 ~/.latte/traces/ 下所有 .jsonl 追踪文件。
- *   → listTraces() → TraceSummary[]
- *
- * agent-ui:  GET  /api/traces/:session_id
- *   读取指定追踪文件的内容（JSON 事件数组）。
- *   → readTrace(session_id) → { session_id, events: unknown[] }
- *
- * code-editor:  (目前无等效的独立命令。追踪数据通过 chat_session_get 暴露。)
- *
- * 移植要点：
- *   code-editor 的 SessionStore 提供 chat_session_list/get/delete/editMessage，
- *   与 agent-ui 的 traces 功能重叠但数据格式不同。
- *   .jsonl 追踪格式需转换为 StoredSession 格式。
- */
-export function mapTraces() {
-  // agent-ui:   GET /api/traces           → listTraces()
-  // agent-ui:   GET /api/traces/{id}      → readTrace(session_id)
-  // code-editor: invoke("chat_session_list")  — 部分等效
-  // code-editor: invoke("chat_session_get", { sessionId })  — 部分等效
-}
-
-/**
- * agent-ui:  GET  /api/subsessions?id=<sub_id>
- *   获取委派调用的完整子会话事件日志。
- *   → fetchSubsession(subId) → unknown[]
- *
- * code-editor:  (无等效命令 — subsession 是 agent-ui 特定的 HTTP 端点)
- */
-export function mapSubsession() {
-  // agent-ui:   GET /api/subsessions?id=xxx → events[]
-  // code-editor: (none — DelegateStarted/Finished 事件携带摘要信息)
-}
-
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 8. SSH 事件流 (SSE — Server-Sent Events)                               │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  GET  /api/events?id=<session_id>  (SSE)
- *   订阅 ChatEvent 流。服务端推送 "chat_event" 命名事件。
- *   → subscribeEvents(onEvent, onConnectionStatus) → { disconnect, reconnect }
- *
- * code-editor:  @tauri-apps/api/event.listen("chat:controller_event", callback)
- *   通过 Tauri 事件系统订阅控制器事件。
- *   ControllerEventPayload: { sessionId, kind: ControllerEventKind, ... }
- *
- * 事件映射细节见下方 ChatEvent 映射表。
+ * agent-ui:  GET /api/self-loop/events
+ *   → subscribeSelfLoop(onEvent) → unsubscribe
+ * code-editor:  (暂未实现——Self-Loop 是 agent-ui 特有功能)
  */
 export function mapEventsSSE() {
-  // agent-ui:   EventSource("/api/events?id=xxx") → "chat_event" events
-  // code-editor: listen("chat:controller_event", callback)
+  // 端口时：用 Tauri event.listen 替换 SSE EventSource；事件类型与 ChatEvent
+  // 同构但字段在 agent-ui / code-editor 之间 PascalCase ↔ camelCase 转换。
 }
 
 /**
- * agent-ui:  GET  /api/self-loop/events  (SSE)
- *   订阅 Self-Loop 进度事件。推送 "self_loop_event" 命名事件。
- *   → subscribeSelfLoop(onEvent) → unsubscribe function
+ * §6. Trace / 调试
  *
- * code-editor:  (无等效功能 — Self-Loop 是 agent-ui 特有的 AI 测试功能)
+ * agent-ui:  GET /api/traces
+ *   → listTraces() → TraceSummary[]
+ * code-editor:  (暂未实现——建议: 复用 chat_session_list 跨语义)
+ *
+ * agent-ui:  GET /api/traces/<session_id>
+ *   → readTrace(sessionId) → {events: TraceEvent[]}
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  GET /api/subsessions?id=<sub_id>
+ *   → fetchSubsession(subId) → ChatEvent[]
+ * code-editor:  (暂未实现——agent-ui 特有的委派子会话)
  */
-export function mapSelfLoopEvents() {
-  // agent-ui:   EventSource("/api/self-loop/events") → "self_loop_event" events
-  // code-editor: (none)
+export function mapTraces() {
+  // 暂未实现。
 }
 
 /**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 9. Self-Loop 自主调试                                                   │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  POST /api/self-loop/start (body: { task, max_iterations })
- *   启动 AI 自主调试循环。
- *   → startSelfLoop(task, max_iterations) → void
+ * §7. Self-Loop（AI 自调试）
+ *
+ * agent-ui:  POST /api/self-loop/start
+ *   → startSelfLoop(task, maxIter) → void
+ * code-editor:  (暂未实现)
  *
  * agent-ui:  POST /api/self-loop/stop
- *   停止正在进行的 self-loop。
  *   → stopSelfLoop() → void
- *
- * agent-ui:  GET  /api/self-loop/events (SSE)
- *   订阅 self-loop 进度（详见 mapSelfLoopEvents）。
- *
- * code-editor:  (无等效功能 — Self-Loop 是 agent-ui 特有的功能，
- *   在端口时可根据需要实现为独立的 Tauri 命令。)
+ * code-editor:  (暂未实现)
  */
 export function mapSelfLoop() {
-  // agent-ui:   POST /api/self-loop/start  → startSelfLoop
-  // agent-ui:   POST /api/self-loop/stop   → stopSelfLoop
-  // agent-ui:   GET  /api/self-loop/events → subscribeSelfLoop (SSE)
-  // code-editor: (none)
+  // 暂未实现。
 }
 
-
 /**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 10. 角色图谱 (Role Graph)                                               │
- * └─────────────────────────────────────────────────────────────────────────┘
- */
-
-/**
- * agent-ui:  GET  /api/role-graph
- *   获取角色 × 工具代码关系图谱。
+ * §8. 角色-工具关系图
+ *
+ * agent-ui:  GET /api/role-graph
  *   → fetchRoleGraph() → RoleGraph
- *
- * code-editor:  (通过 latte-rs-graph 的 build_code_graph 命令提供类似功能，
- *   但接口不同。code-editor 的图谱绑定到当前 workspace。)
- *
- * 移植要点：
- *   agent-ui 的 /api/role-graph 在服务器启动时基于当前项目生成。
- *   code-editor 的 build_code_graph 在 Tauri 命令中调用，参数更复杂。
+ * code-editor:  invoke("build_code_graph", { ... }) (不同签名——基于 workspace)
  */
 export function mapRoleGraph() {
-  // agent-ui:   GET /api/role-graph → RoleGraph
-  // code-editor: invoke("build_code_graph", ...) — 不同的命令签名
+  // 端点语义不同：agent-ui 在 server 启动时基于 cwd 固定生成；
+  // code-editor 在 Tauri 命令调用时基于当前 workspace 动态生成。
 }
 
-
 /**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 11. HIL (Human-In-Loop) 可编辑会话                                      │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * §9. 模型管理
+ *
+ * agent-ui:  GET /api/models
+ *   → listModels() → ModelDef[]
+ * code-editor:  invoke("chat_list_models") → ModelInfo[]
+ *
+ * agent-ui:  POST /api/models
+ *   → createModel(req) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  PATCH /api/models/<key>
+ *   → updateModel(key, req) → void
+ * code-editor:  invoke("chat_set_role_model_chain", { roleId, chain: [key] })
+ *   （间接：通过角色 model_chain）
+ *
+ * agent-ui:  DELETE /api/models/<key>
+ *   → deleteModel(key) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/models/test
+ *   → testModel(req) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  GET /api/models/<key>/capabilities
+ *   → modelCapabilities(key) → ModelCapabilities
+ * code-editor:  (暂未实现——chat_list_models 已含 capabilities 字段)
+ *
+ * agent-ui:  GET  /api/models/<key>/toml
+ * agent-ui:  PUT  /api/models/<key>/toml
+ * code-editor:  (暂未实现)
  */
-
-/**
- * agent-ui:  (无等效功能 — agent-ui 的会话不可编辑)
- *
- * code-editor:  HIL 会话是可暂停/编辑/继续的持久化会话，用于"可修改聊天内容继续"
- *   场景。会话状态存储在 .latte/sessions/<id>.json。
- *
- * 相关命令:
- *   chat_hil_start       → 创建新 HIL 会话，返回初始快照
- *   chat_hil_send        → 追加消息
- *   chat_hil_edit_message → 编辑或删除历史消息（暂停时可修改）
- *   chat_hil_inject      → 从外部向指定角色注入消息
- *   chat_hil_continue    → 恢复 + 发送（空 content 仅恢复）
- *   chat_hil_transition  → 暂停/恢复/中止状态转换
- *   chat_hil_get_state   → 获取会话完整状态
- *   chat_hil_list_sessions → 列出所有磁盘上的 HIL 会话
- *
- * 这是 code-editor 相对于 agent-ui 的重要增强。agent-ui 的 sendMessage/SSE
- * 模式不可编辑；端口时如需编辑能力，应使用 HIL。
- */
-export function mapHIL() {
-  // agent-ui:   (none — 发送后不可修改)
-  // code-editor: 9 个 chat_hil_* invoke 命令
+export function mapModels() {
+  // 端口时：GET → invoke("chat_list_models")；
+  // PATCH role_chain 是间接路径；其他写操作暂无。
 }
 
-
 /**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 12. 管理者工作流 (Manager-led Workflow)                                 │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * §10. 工具管理
+ *
+ * agent-ui:  GET /api/tools
+ *   → listTools() → ToolEntry[]
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tools/test
+ *   → testTool(req) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tools/<id>/toggle
+ *   → toggleTool(req) → void
+ * code-editor:  (暂未实现)
  */
-
-/**
- * agent-ui:  (无等效功能 — 所有会话由单一 ChatController 管理)
- *
- * code-editor:  Manager 模式使用一个管理者角色来协调多个子角色。
- *
- * 相关命令:
- *   chat_start_manager_session → 启动管理者会话，返回 sessionId（number）
- *   chat_submit_user_decision  → 提交用户在决策面板中的选择
- *   chat_submit_user_continue  → 推进一步（可选附带自由文本消息）
- *
- * 注意: 以上命令在 chat.ts 中有前端绑定，但 Tauri command 注册中未找到
- * 对应的 Rust #[tauri::command] 实现，可能尚未完成或已移除。
- */
-export function mapManagerSession() {
-  // agent-ui:   (none)
-  // code-editor: invoke("chat_start_manager_session", { topic, workflow }) → number
-  // code-editor: invoke("chat_submit_user_decision", { request })
-  // code-editor: invoke("chat_submit_user_continue", { sessionId, message })
+export function mapTools() {
+  // 暂未实现。
 }
 
-
 /**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ 13. Swarm 模式 (Planner-driven Multi-agent)                             │
- * └─────────────────────────────────────────────────────────────────────────┘
+ * §11. 任务看板
+ *
+ * agent-ui:  GET /api/tasks
+ *   → listTasks() → TaskView[]
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tasks
+ *   → createTask(req) → TaskView
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  GET    /api/tasks/<id>
+ * agent-ui:  PATCH  /api/tasks/<id>
+ * agent-ui:  DELETE /api/tasks/<id>
+ *   → getTask/updateTask/deleteTask
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tasks/import
+ *   → importTasks(req) → ImportTasksResponse
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tasks/dispatch-ready
+ *   → dispatchReady(req) → DispatchReadyResponse
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tasks/<id>/dispatch
+ *   → dispatchTask(id) → TaskView
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tasks/<id>/abort
+ *   → abortTask(id) → TaskView
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/tasks/<id>/report
+ *   → reportTask(id, summary, result) → TaskView
+ * code-editor:  (暂未实现)
  */
-
-/**
- * agent-ui:  (无等效功能)
- *
- * code-editor:  Swarm 模式让规划者(planner)角色将任务分解为步骤，
- *   分派给工人(worker)角色执行，最终汇总结果。
- *
- * 相关命令:
- *   chat_start_swarm → 启动 swarm，返回 sessionId（number）
- *   进度通过 Tauri "chat:swarm_event" 事件推送。
- *   SwarmEvent: { kind: "plan" | "step" | "summary" | "file" | "complete" | "error", ... }
- *
- * 注意: chat_start_swarm 在 chat.ts 中有前端绑定，但 Tauri command 注册
- * 中未找到对应的 Rust 实现。
- */
-export function mapSwarmSession() {
-  // agent-ui:   (none)
-  // code-editor: invoke("chat_start_swarm", { request }) → number
-  //              + Tauri event "chat:swarm_event"
+export function mapTasks() {
+  // 任务看板是 agent-ui 特有功能；code-editor 暂未实现对应管理界面。
 }
 
+/**
+ * §12. 工作流管理
+ *
+ * agent-ui:  GET /api/workflows
+ *   → listWorkflows() → WorkflowSummary[]
+ * code-editor:  invoke("chat_list_workflows") → WorkflowInfo[]
+ *
+ * agent-ui:  POST /api/workflows
+ *   → createWorkflow(req) → WorkflowDetail
+ * code-editor:  invoke("chat_save_workflow", { payload }) → WorkflowMutationResult
+ *
+ * agent-ui:  GET /api/workflows/<name>
+ *   → getWorkflow(name) → WorkflowDetail
+ * code-editor:  invoke("chat_get_workflow_full", { id }) → WorkflowPayload
+ *
+ * agent-ui:  PUT /api/workflows/<name>
+ *   → updateWorkflow(name, req) → void
+ * code-editor:  invoke("chat_save_workflow", { payload }) → WorkflowMutationResult
+ *
+ * agent-ui:  DELETE /api/workflows/<name>
+ *   → deleteWorkflow(name) → void
+ * code-editor:  invoke("chat_delete_workflow", { id }) → WorkflowMutationResult
+ *
+ * agent-ui:  POST /api/workflows/validate
+ *   → validateWorkflow(req) → ValidateResponse
+ * code-editor:  (暂未实现独立入口)
+ *
+ * agent-ui:  POST /api/workflows/run
+ *   → workflowRunStart(req) → {run_id}
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  GET /api/workflows/run/events (SSE)
+ *   → workflowRunSubscribe(onEvent) → unsubscribe
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/workflows/run/stop
+ *   → workflowRunStop() → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  POST /api/workflows/resume
+ *   从 checkpoint 续跑失败 workflow。
+ *   → workflowResume(req) → void
+ * code-editor:  (暂未实现)
+ *
+ * agent-ui:  GET /api/workflows/<name>/toml
+ * agent-ui:  PUT /api/workflows/<name>/toml
+ *   → getWorkflowToml/putWorkflowToml
+ * code-editor:  (暂未实现)
+ */
+export function mapWorkflows() {
+  // 端口时：list/get/save/delete 已有 invoke；validate/run/resume/toml 暂未实现。
+}
 
-// ─── ChatEvent 类型映射 (双向) ─────────────────────────────────────────────
+/**
+ * §13. 文档图像上传
+ *
+ * agent-ui:  POST /api/images
+ *   multipart/form-data 或 raw body → <cwd>/.latte/images/upload-<ts>.<ext>
+ * code-editor:  (暂未实现——浏览器内 upload 通过 fetch 直传)
+ *
+ * agent-ui:  GET /api/images/<file>
+ *   → 静态图片字节
+ * code-editor:  (暂未实现)
+ */
+export function mapImages() {
+  // 暂未实现。
+}
+
+/**
+ * HIL / Manager / Swarm：code-editor 独有功能。
+ *
+ * agent-ui:  (无直接对应；agent-ui 转发 ChatEvent 给前端，
+ *   UI 弹出暂停门 / 决策面板 / ChoiceRequested 弹框自己实现)
+ *
+ * code-editor:  9 × chat_hil_* + 3 × chat_manager_* + 1 × chat_swarm_*
+ *   （详见 mapController / mapHIL / mapManagerSession / mapSwarmSession）
+ */
+export function mapEditorOnly() {
+  // 这三类是 code-editor 独有的多角色控制能力。
+  // agent-ui 端通过 §4 聊天命令 + §5 SSE 事件 + UI 自行实现等价功能。
+}
+
+// ─── ChatEvent 双向映射 ─────────────────────────────────────────────────────
 //
-// latte-agent-ui 使用 SSE 推送 "chat_event" 事件，载荷为 internally-tagged
-// JSON（{ type: "VariantName", field1: value1, ... }）。
+// 完整列表见 `docs/api-reference.md` §5 与
+// `latte-agent-core/src/event_json.rs` 中 `chat_event_to_frontend_json`。
 //
-// latte-code-editor 使用 Tauri "chat:controller_event" 事件，载荷为
-// ControllerEventPayload（{ sessionId, kind: "camelCaseKind", ... }）。
+// agent-ui 用 internally-tagged JSON（{ type: "VariantName", field1, ... }）；
+// code-editor 用 Tauri 事件（{ sessionId, kind: "camelCaseKind", ... }）。
 //
-// 以下是完整的事件类型映射。
-// agent-ui 的 ChatEvent 更多（如 RoleStarted/DelegateStarted/DelegateFinished/
-// ToolError），而 code-editor 的 ControllerEventPayload 用 ControllerEventKind
-// 枚举了主要事件类别。
+// PascalCase ↔ camelCase 转换。
 
-/**
- * ChatEvent 双向映射表。
- *
- * latte-agent-ui ChatEvent (SSE "chat_event" 事件)
- *   类型: type 字段（PascalCase 变体名）
- *   来源: latte-rs-agents/latte-agent-cli/ui/src/api.ts:40-68
- *   后端: latte-rs-agents/latte-agent-cli/src/commands/ui.rs
- *         chat_event_to_frontend_json() 转换函数
- *
- * latte-code-editor ControllerEventPayload (Tauri "chat:controller_event" 事件)
- *   类型: kind 字段（camelCase 枚举值）
- *   来源: latte-code-editor/src/api/chat.ts:632-638
- */
-export const CHAT_EVENT_MAPPING = {
-  // ────────── agent-ui 变体 ────────────  →  ───── code-editor kind  ─────
-  //
-  // 角色轮次回复（流式内容）
-  "RoleTurn":        "roleTurn",         // 两者都有，字段结构一致
-  //
-  // 状态消息
-  "Status":          "status",           // 都有
-  //
-  // 提示谁在发言
-  "Prompt":          "prompt",           // 都有
-  //
-  // 会话暂停
-  "Paused":          "paused",           // 都有
-  //
-  // 会话恢复
-  "Resumed":         "resumed",          // 都有
-  //
-  // 轮次开始
-  "RoundStarted":    "roundStarted",     // 都有
-  //
-  // 轮次结束
-  "RoundEnded":      "roundEnded",       // 都有
-  //
-  // 会话完成
-  "Done":            "done",             // 都有
-  //
-  // 错误
-  "Error":           "error",            // 都有
-  //
-  // 角色列表
-  "RoleList":        "roleList",         // 都有
-  //
-  // 上下文清除
-  "ContextCleared":  "contextCleared",   // 都有
-  //
-  // 会话信息
-  "SessionInfo":     "sessionInfo",      // 都有
-  //
-  // 工具调用
-  "ToolUse":         "toolUse",          // agent-ui: tool_name + args
-  //                                        code-editor: 同字段
-  //
-  // 工具结果
-  "ToolResult":      "toolResult",       // agent-ui: tool_name + result
-  //                                        code-editor: 同字段
-  //
-  // ⚠ 以下变体仅存在于 agent-ui（无 code-editor 等效）
-  //
-  "RoleStarted":     null,               // 角色开始发言
-  "RoleFinished":    null,               // 角色结束发言
-  "DelegateStarted": null,               // 委派开始 (from_role, to_role, task, sub_id)
-  "DelegateFinished": null,              // 委派结束 (from_role, to_role, status, summary, sub_id)
-  "ToolError":       null,               // 工具错误
-  "SelfLoopEvent":   null,               // Self-loop 进度事件（独立 SSE）
+export const CHAT_EVENT_MAPPING: Record<string, string | null> = {
+  // ··· 1:1 映射 ···
+  RoleTurn: "roleTurn",
+  Status: "status",
+  Prompt: "prompt",
+  Paused: "paused",
+  Resumed: "resumed",
+  RoundStarted: "roundStarted",
+  RoundEnded: "roundEnded",
+  Done: "done",
+  Error: "error",
+  RoleList: "roleList",
+  ContextCleared: "contextCleared",
+  SessionInfo: "sessionInfo",
+  ToolUse: "toolUse",
+  ToolResult: "toolResult",
+  // ··· agent-ui 额外（code-editor 暂无对应）···
+  RoleStarted: null,
+  RoleFinished: null,
+  RolePaused: null, // HIL per-role
+  RoleResumed: null,
+  DelegateStarted: null,
+  DelegateFinished: null,
+  ToolError: null,
+  ImageGenerated: null,
+  PlanProposed: null,
+  ChoiceRequested: null,
+  TimeoutWarning: null,
+  AdvisorTerminated: null,
+  UserMessage: null,
+  TaskReport: null,
+  WorkflowStarted: null,
+  WorkflowStep: null,
+  WorkflowTurn: null,
+  WorkflowFinished: null,
 };
 
-/**
- * 反向映射: code-editor kind → agent-ui 变体名
- */
-export const CHAT_EVENT_MAPPING_REVERSE: Record<string, string | null> = {
-  "roleTurn":        "RoleTurn",
-  "status":          "Status",
-  "prompt":          "Prompt",
-  "paused":          "Paused",
-  "resumed":         "Resumed",
-  "roundStarted":    "RoundStarted",
-  "roundEnded":      "RoundEnded",
-  "done":            "Done",
-  "error":           "Error",
-  "roleList":        "RoleList",
-  "contextCleared":  "ContextCleared",
-  "sessionInfo":     "SessionInfo",
-  "toolUse":         "ToolUse",
-  "toolResult":      "ToolResult",
-};
-
-/**
- * 字段名映射:
- * agent-ui 使用 snake_case（如 role_id, is_complete, session_id），
- * code-editor 的 ControllerEventPayload 使用原样字段名（snake_case 通过 serde 保持）。
- * 实际上 code-editor 的 ChatEvent 联合类型也使用 snake_case 字段。
- *
- * 因此，字段名在跨端口时基本无需转换。
- *
- * 唯一差异: code-editor 的 ChatEvent 在 RoleTurn 中省略了 role_id 字段名差异，
- * 两者一致。agent-ui ChatEvent 中多出的字段（detail, sub_id 等）在端口时
- * 可忽略或通过额外字段携带。
- */
-export const FIELD_MAPPING_SNAKE_CASE = {
-  // agent-ui 字段  ↔  code-editor 字段 (两者一致)
-  // role_id, content, is_complete, message, icon, model_id, reason,
-  // round, task_id, state, turn, tool_name, args, result, error,
-  // from_role, to_role, status, summary, sub_id, detail
-  //
-  // ⚠ agent-ui 额外字段: detail (RoleStarted/RoleFinished 中携带)
-  // ⚠ code-editor 额外字段: (ControllerEventPayload 通过 [key: string]: unknown 扩展)
-};
-
-
-// ─── 完整 API 端点汇总 ─────────────────────────────────────────────────────
-//
-// 以下表格以 Markdown 格式汇总了所有端点和映射关系。
-// 在 IDE 中可折叠查看。
-
-/**
- * ┌─────────────────────────────────────────────────────────────────────────┐
- * │ latte-agent-ui HTTP/SSE              │ latte-code-editor Tauri invoke   │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ GET  /api/sessions                   │ invoke("chat_session_list")      │
- * │ POST /api/sessions                   │ invoke("chat_controller_spawn")  │
- * │ GET  /api/session?id=xxx             │ invoke("chat_session_get")       │
- * │                                      │ invoke("chat_session_delete")    │
- * │                                      │ invoke("chat_session_edit_msg")  │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ GET  /api/roles                      │ invoke("chat_list_roles")        │
- * │                                      │ invoke("chat_get_role_config")   │
- * │                                      │ invoke("chat_list_models")       │
- * │                                      │ invoke("chat_set_role_model")    │
- * │                                      │ invoke("chat_set_role_model_chain")│
- * │                                      │ invoke("chat_set_default_model") │
- * │                                      │ invoke("chat_open_config")       │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ POST /api/chat/send                  │ invoke("chat_controller_submit") │
- * │ POST /api/chat/command               │ invoke("chat_controller_submit") │
- * │ POST /api/chat/role                  │ (通过 spawn roles 预配置)        │
- * │                                      │ invoke("chat_controller_spawn")  │
- * │                                      │ invoke("chat_controller_pause")  │
- * │                                      │ invoke("chat_controller_resume") │
- * │                                      │ invoke("chat_controller_abort")  │
- * │                                      │ invoke("chat_start_discussion")  │
- * │                                      │ invoke("chat_continue")          │
- * │                                      │ invoke("chat_cancel")            │
- * │                                      │ invoke("chat_cancel_workspace")  │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │                                      │ invoke("chat_stream")            │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │                                      │ invoke("chat_list_workflows")    │
- * │                                      │ invoke("chat_list_workflows_full")│
- * │                                      │ invoke("chat_get_workflow_full") │
- * │                                      │ invoke("chat_save_workflow")     │
- * │                                      │ invoke("chat_delete_workflow")   │
- * │                                      │ invoke("chat_reset_roles")       │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ GET  /api/traces                     │ (partially: chat_session_list)   │
- * │ GET  /api/traces/{session_id}        │ (partially: chat_session_get)    │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ GET  /api/subsessions?id=xxx         │ (none)                          │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ GET  /api/events?id=xxx (SSE)        │ listen("chat:controller_event")  │
- * │ GET  /api/self-loop/events (SSE)     │ (none)                          │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ POST /api/self-loop/start            │ (none)                          │
- * │ POST /api/self-loop/stop             │ (none)                          │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │ GET  /api/role-graph                 │ invoke("build_code_graph")       │
- * ├──────────────────────────────────────┼─────────────────────────────────┤
- * │                                      │ 9 × chat_hil_* commands         │
- * │                                      │ invoke("chat_start_manager_session") │
- * │                                      │ invoke("chat_submit_user_decision") │
- * │                                      │ invoke("chat_submit_user_continue") │
- * │                                      │ invoke("chat_start_swarm")       │
- * └──────────────────────────────────────┴─────────────────────────────────┘
- *
- * 总计:
- *   latte-agent-ui: 14 个 HTTP/SSE 端点
- *   latte-code-editor: 30+ 个 Tauri invoke 命令 + 多个 Tauri 事件
- */
-
+export const CHAT_EVENT_MAPPING_REVERSE: Record<string, string | null> = Object.fromEntries(
+  Object.entries(CHAT_EVENT_MAPPING)
+    .filter(([, v]) => v !== null)
+    .map(([k, v]) => [v as string, k])
+);
 
 // ─── 端口指南 ──────────────────────────────────────────────────────────────
 //
-// 从 agent-ui 到 code-editor 的基本端口步骤:
+// 从 agent-ui 到 code-editor 的基本端口步骤：
 //
 // 1. 会话创建
-//    agent-ui:  POST /api/sessions → 获取 session_id
+//    agent-ui:  POST /api/sessions → 服务端分配 session_id
 //    code-editor: invoke("chat_controller_spawn", { request: { sessionId, roles, ... } })
-//    需要提前生成唯一的 sessionId（如 crypto.randomUUID()）。
+//    注意：code-editor 需客户端生成 sessionId（如 crypto.randomUUID()）。
 //
 // 2. 发送消息
-//    agent-ui:  POST /api/chat/send (body: { session_id, message })
+//    agent-ui:  POST /api/chat/send { session_id, message }
 //    code-editor: invoke("chat_controller_submit", { sessionId, text })
 //
 // 3. 接收事件
-//    agent-ui:  EventSource("/api/events?id=xxx") → 解析 "chat_event" 事件
+//    agent-ui:  EventSource("/api/events?id=xxx") → 解析 "chat_event" event.data
 //    code-editor: import { listen } from "@tauri-apps/api/event";
 //                listen("chat:controller_event", (event) => {
 //                  const payload = event.payload as ControllerEventPayload;
-//                  // payload.kind 对应 agent-ui 的 e.type
+//                  // payload.kind 用 CHAT_EVENT_MAPPING_REVERSE[k] 还原
 //                });
 //
 // 4. 角色切换
-//    agent-ui:  POST /api/chat/role (body: { session_id, role_id })
+//    agent-ui:  POST /api/chat/role { session_id, role_id } → 202
 //    code-editor: 在 spawn 时指定 roles: ["role1", "role2", ...]，
 //                Controller 自动管理角色轮换。
-//    如需动态切换，可 abort 后重新 spawn。
+//    如需动态切换，abort 后重新 spawn。
 //
 // 5. 事件类型转换
 //    agent-ui SSE event.data.type (PascalCase) ↔ code-editor event.payload.kind (camelCase)
-//    使用 CHAT_EVENT_MAPPING / CHAT_EVENT_MAPPING_REVERSE 进行转换。
+//    使用 CHAT_EVENT_MAPPING / CHAT_EVENT_MAPPING_REVERSE。
 //
-// 6. 会话管理
-//    agent-ui 的会话在服务器内存中，进程退出即释放。
-//    code-editor 提供持久化存储（~/.latte/chat-sessions/*.json），
-//    可通过 chat_session_list/get/delete 管理。
+// 6. 暂停/恢复/中止
+//    agent-ui:  POST /api/chat/{pause,resume,abort} { session_id }
+//    code-editor: invoke("chat_controller_{pause,resume,abort}", { sessionId })
 //
-// 7. 配置管理
-//    agent-ui 在启动时从 ~/.latte/config.yaml / roles.yaml 加载配置。
-//    code-editor 提供 chat_list_models/chat_get_role_config 等命令查看配置，
-//    以及 chat_set_role_model/chat_save_workflow 等命令修改配置。
+// 7. 任务看板 / 工具管理 / 模型 CRUD / 工作流 CRUD
+//    agent-ui 有完整面板，code-editor 暂未实现这些管理界面。
+//    端口时需新增 Tauri command（chat_list_tasks / chat_save_role_toml 等）。
 //
-// 8. 工作流
-//    agent-ui 没有工作流 UI，角色在启动时固定。
-//    code-editor 有完整的工作流编辑器（CRUD + 分步编辑）。
+// 8. HIL 会话
+//    code-editor 独有功能（chat_hil_* 9 个命令）。agent-ui 没有"可修改聊天内容继续"语义。
 //
-// 9. HIL 会话
-//    code-editor 独有功能。agent-ui 的项目若需要"可修改聊天内容继续"，
-//    应使用 HIL API 而不是普通的 Controller。
+// 9. 自适应
+//    agent-ui 的 hot-path 端点已通过 `latte-agent-ui-server/src/api_reference_integrity.rs`
+//    自动校验：所有 lib.rs 路由必须在 docs/api-reference.md 章节里覆盖。
+//    增减路由时同步该测试 + bridge-api 分组。
 export {};
