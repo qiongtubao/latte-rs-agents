@@ -43,6 +43,7 @@ pub mod controller;
 pub mod checkpoint;
 pub mod config;
 pub mod context;
+pub mod doc_graph_tools;
 pub mod error;
 pub mod event_json;
 pub mod global_config;

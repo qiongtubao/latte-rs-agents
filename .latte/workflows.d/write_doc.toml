@@ -1,0 +1,102 @@
+# Workflow: write_doc — 写一篇 doc-graph 文档并更新索引/Notion 镜像
+#
+# 用法：manager 收到「把这个模块/概念写成文档」任务时调用：
+#   workflow { name: "write_doc", topic: "<要写什么文档>" }
+#
+# 流程：
+#   plan    → tech_writer 分析 topic + doc_graph_context 预读已有相关文档，
+#             产出「doc_write 参数」（title/doc_type/sources/tags/body）
+#   write   → tech_writer 用 `doc_write` 工具落盘到 .latte-review/docs/，
+#             （doc_write 内部已重建图索引 + 标 Notion dirty）
+#   index   → tech_writer 用 `doc_index` 生成 docs/index.md
+#   verify  → reviewer 终审文档质量与一致性，不合格回 write（loop_until）
+#   report  → tech_writer 用 `task_report`（若来自任务看板）或直接总结
+#
+# 产物：本地 .latte-review/docs/{type}/{slug}.md + .latte-review/docs/index.md
+# Notion：doc_write 标 .latte/.docs-dirty/ → latte-agent-ui-server 后台推 agents-docs
+#
+# 注意：doc_write/doc_index 需要其角色（tech_writer）allowed_tools 含这两个工具
+# （config/agents/tech_writer.toml 已配）。
+
+name = "write_doc"
+description = "写一篇 doc-graph 文档：预读相关 → 写正文 → 重建索引 → 终审"
+max_rounds = 1
+
+# ── plan：分析 + 预读，产出 doc_write 参数 ─────────────────────────
+[[steps]]
+id = "plan"
+description = "分析要写的文档并预读已有上下文"
+role = "tech_writer"
+output_key = "doc_plan"
+task = """分析这个文档写作主题：{{topic}}。
+
+先调用 `doc_graph_context` 工具预读图谱中已有的相关文档（query 取主题关键词），再视需要读代码/文件取证。
+
+产出（作为本步输出，结构化）：
+1) `title` — 文档标题（简短，将生成文件名 slug，如「Auth Service」）；
+2) `doc_type` — entity / concept / feature / spec / task / bug / component（选最贴合）；
+3) `sources` — 依据的代码/文件路径数组（如 ["src/auth.rs"]）；
+4) `tags` — 2-5 个标签；
+5) `body` — 完整 Markdown 正文（含 frontmatter 之后的内容；用 `[[id|别名]]` 引用图谱中已有文档以建立边）。
+
+要求正文：概述 → 核心细节 → 示例（示例须来自真实代码或预读到的文档，禁止凭空编造）。不确定的标注【待核实】。"""
+max_retries = 1
+
+[steps.output_contract]
+min_chars = 200
+require = ["title", "body"]
+
+# ── write：doc_write 落盘 ─────────────────────────────────────────
+[[steps]]
+id = "write"
+description = "用 doc_write 工具写入文档"
+role = "tech_writer"
+depends_on = ["plan"]
+task = """根据上面分析产出的 doc_write 参数，调用 `doc_write` 工具把文档写入图谱：
+
+```
+doc_write {
+  title: "<title>",
+  doc_type: "<doc_type>",
+  sources: [...],
+  tags: [...],
+  body: "..."
+}
+```
+
+把 `{{doc_plan}}` 里的 title/doc_type/sources/tags/body 填进参数。doc_write 完成后本地文档已落盘到 .latte-review/docs/、图索引已重建、并标了 Notion dirty。
+
+回复工具返回的结果摘要（path + node_count/edge_count）。"""
+output_key = "write_result"
+max_retries = 1
+
+[steps.output_contract]
+min_chars = 50
+require = ["path"]
+
+# ── index：生成索引页（可选，若已 doc_index 可跳过） ──────────────
+[[steps]]
+id = "index"
+description = "生成/更新文档索引 docs/index.md"
+role = "tech_writer"
+depends_on = ["write"]
+task = """调用 `doc_index` 工具生成/更新文档索引页 `docs/index.md`（读取 graph.json 按 doc_type 分组的目录表）。
+
+回复索引生成结果（doc_count + index_path）。"""
+max_retries = 1
+
+# ── verify：reviewer 终审 ──────────────────────────────────────────
+[[steps]]
+id = "verify"
+description = "reviewer 终审文档质量"
+role = "reviewer"
+depends_on = ["index"]
+task = """用 read 工具读刚写入的文档（从 {{write_result}} 的 path），终审：
+1) frontmatter 是否完整（type/title/created/updated/sources/tags）；
+2) 正文是否与 topic（{{topic}}）及预读相关文档/代码事实一致、无编造断言；
+3) 结构是否清晰（概述→细节→示例）；
+4) wikilink 引用是否指向存在的文档 id。
+
+按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题（如有）、后续建议。
+裁决 ⚠️/❌ 时给出具体可修改建议。"""
+output_key = "review"

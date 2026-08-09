@@ -2434,6 +2434,17 @@ async fn build_runner(
             register_task_report_tool(&tm, event_tx.clone(), role_id.to_string())
                 .map_err(|e| AgentError::Tool(format!("register task_report: {e}")))?;
         }
+        // Any role with doc-graph tools in allowed_tools gets the 4 doc-graph
+        // tools（scan/context/write/index）。cwd 是 agent 工作目录。
+        {
+            let has = ["doc_graph_scan", "doc_graph_context", "doc_write", "doc_index"]
+                .iter()
+                .any(|t| role.allowed_tools.iter().any(|a| a == t));
+            if has {
+                crate::doc_graph_tools::register_doc_graph_tools(&tm, cwd.to_path_buf())
+                    .map_err(|e| AgentError::Tool(format!("register doc_graph tools: {e}")))?;
+            }
+        }
         // ── 给主 runner 分配 subsession sink（manager / 任何角色通用） ──
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
             None

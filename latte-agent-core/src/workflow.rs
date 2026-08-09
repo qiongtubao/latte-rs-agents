@@ -1011,6 +1011,17 @@ async fn build_role_runner(
             register_plan_tool(&rtm, event_tx.clone(), role_id.to_string(), plan_stage)
                 .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
         }
+        // doc-graph 工具（scan/context/write/index）：与 controller::build_runner
+        // 对齐，让带 doc_graph_* 工具的角色在 workflow 里也能维护图谱。
+        {
+            let has = ["doc_graph_scan", "doc_graph_context", "doc_write", "doc_index"]
+                .iter()
+                .any(|t| role.allowed_tools.iter().any(|a| a == t));
+            if has {
+                crate::doc_graph_tools::register_doc_graph_tools(&rtm, cwd.to_path_buf())
+                    .map_err(|e| format!("register doc_graph tools for '{role_id}': {e}"))?;
+            }
+        }
         AgentRunner::new_with_tools(agent, rtm, 0)
     };
     let mut r = runner

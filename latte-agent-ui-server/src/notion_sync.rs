@@ -65,6 +65,121 @@ pub struct SyncSummary {
     pub skipped_missing: usize,
 }
 
+/// 文档镜像同步轮汇总（供测试与日志）。
+#[derive(Debug, Default, PartialEq)]
+pub struct DocSyncSummary {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failed_client: usize,
+    pub failed_server: usize,
+    pub skipped_missing: usize,
+}
+
+/// 从一篇 doc-graph 文档（含 frontmatter）构建 Notion record body。
+/// `rel_path` 形如 "entities/auth-service.md"。
+pub fn build_doc_record_body(content: &str, rel_path: &str) -> serde_json::Value {
+    // 提取 frontmatter 的 type/tags（宽松解析：取 `type: X` 和 `tags:` 下一行 list）。
+    let mut doc_type = String::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut in_tags = false;
+    for line in content.lines().take(30) {
+        let t = line.trim();
+        if t.starts_with("type:") {
+            doc_type = t.trim_start_matches("type:").trim().to_string();
+        } else if t == "tags:" {
+            in_tags = true;
+        } else if in_tags {
+            if t.starts_with('-') {
+                tags.push(t.trim_start_matches('-').trim().to_string());
+            } else {
+                in_tags = false; // 遇到非 list 行结束 tags
+            }
+        }
+    }
+    let title = std::path::Path::new(rel_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| rel_path.to_string());
+    serde_json::json!({
+        "title": title,
+        "props": {
+            "doc_type": doc_type,
+            "tags": tags,
+            "path": rel_path,
+        },
+        "content_md": content,
+    })
+}
+
+/// 同步一篇 doc dirty：读 `.latte-review/docs/{rel}` 内容 → PUT agents-docs。
+/// 成功删标记，5xx 保留标记（下轮再试），4xx 删标记（数据错不重试）。
+async fn sync_one_doc_dirty(
+    http: &reqwest::Client,
+    cfg: &NotionSyncConfig,
+    cwd: &std::path::Path,
+    marker: &str,
+    rel_path: &str,
+) -> SyncResult {
+    let full = cwd.join(".latte-review").join("docs").join(rel_path);
+    let content = match std::fs::read_to_string(&full) {
+        Ok(c) => c,
+        Err(_) => return SyncResult::ClientError(404, format!("missing doc file: {rel_path}")),
+    };
+    let body = build_doc_record_body(&content, rel_path);
+    // 命名空间 agents-docs（doc 不覆盖任务命名空间）。
+    let url = record_url(&cfg.base_url, "agents-docs", rel_path);
+    let mut doc_cfg = cfg.clone();
+    doc_cfg.namespace = "agents-docs".to_string();
+    upsert_with_retry(http, &doc_cfg, rel_path, &body).await
+}
+
+/// 同步所有 `.latte/.docs-dirty/` 标记的文档到 Notion（agents-docs）。
+/// 返回完成后是否应删标记（成功 / 4xx）。
+pub async fn sync_doc_dirty(
+    http: &reqwest::Client,
+    cfg: &NotionSyncConfig,
+    cwd: &std::path::Path,
+) -> DocSyncSummary {
+    let mut summary = DocSyncSummary::default();
+    if !cfg.enabled {
+        return summary;
+    }
+    let dirty_dir = cwd.join(".latte").join(".docs-dirty");
+    let Ok(entries) = std::fs::read_dir(&dirty_dir) else {
+        return summary;
+    };
+    let mut to_remove: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let marker = e.file_name().to_string_lossy().to_string();
+        let rel_path = std::fs::read_to_string(e.path())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if rel_path.is_empty() {
+            to_remove.push(marker);
+            continue;
+        }
+        summary.attempted += 1;
+        match sync_one_doc_dirty(http, cfg, cwd, &marker, &rel_path).await {
+            SyncResult::Ok => {
+                summary.succeeded += 1;
+                to_remove.push(marker);
+            }
+            SyncResult::ClientError(_, _) => {
+                summary.failed_client += 1;
+                to_remove.push(marker);
+            }
+            SyncResult::RetriesExhausted(_) => {
+                summary.failed_server += 1;
+            }
+        }
+    }
+    for marker in to_remove {
+        let _ = std::fs::remove_file(dirty_dir.join(marker));
+    }
+    summary
+}
+
 /// 构造 PUT 请求 URL：`{base}/api/ext/{ns}/records/{id}`。
 pub fn record_url(base: &str, ns: &str, id: &str) -> String {
     format!("{base}/api/ext/{ns}/records/{id}")
@@ -154,6 +269,7 @@ impl DirtySet {
         self.ids.len()
     }
 }
+
 
 /// 把一个任务序列化为 Notion `/api/ext/{ns}/records` PUT 请求体。
 /// - `title` = 任务 title（必填）。
@@ -282,9 +398,6 @@ async fn sync_once(b: &crate::UiBackend) {
     // guard 不 Send，跨 .await 持锁会编译失败（future not Send）。
     // 单 id 同步逻辑另抽到 sync_task_id（不再持 store 锁）。
     let dirty = b.tasks.write().take_notion_dirty();
-    if dirty.is_empty() {
-        return;
-    }
     let mut summary = SyncSummary {
         attempted: dirty.len(),
         ..SyncSummary::default()
@@ -321,6 +434,18 @@ async fn sync_once(b: &crate::UiBackend) {
             "[notion-sync] attempted={} ok={} 4xx={} 5xx={} missing={}",
             summary.attempted, summary.succeeded, summary.failed_client,
             summary.failed_server, summary.skipped_missing
+        );
+    }
+
+    // 文档镜像（agents-docs）：读 .latte/.docs-dirty/ 标记，PUT 到
+    // notion-client。与任务 dirty 独立（doc_write 写标记文件）。
+    let cwd = b.cwd.clone();
+    let doc_summary = sync_doc_dirty(&http, &cfg, &cwd).await;
+    if doc_summary.attempted > 0 {
+        eprintln!(
+            "[notion-sync] docs attempted={} ok={} 4xx={} 5xx={} missing={}",
+            doc_summary.attempted, doc_summary.succeeded, doc_summary.failed_client,
+            doc_summary.failed_server, doc_summary.skipped_missing
         );
     }
 }
@@ -627,5 +752,120 @@ mod tests {
         let summary = sync_dirty_tasks(&http, &cfg, &mut store).await;
         assert_eq!(summary.attempted, 0);
         assert_eq!(store.notion_dirty_count(), 1, "disabled 不消费 dirty");
+    }
+    // ─── doc 镜像（agents-docs） ────────────────────────────────────
+
+    #[test]
+    fn build_doc_record_body_extracts_frontmatter() {
+        let content = "---\ntype: entity\ntitle: Auth Service\nsources:\n  - src/auth.rs\ntags:\n  - rust\n  - auth\ncreated: 2026-08-09\nupdated: 2026-08-09\n---\n\n# Auth Service\n\n正文";
+        let body = build_doc_record_body(content, "entities/auth-service.md");
+        assert_eq!(body["title"], "auth-service");
+        assert_eq!(body["props"]["doc_type"], "entity");
+        assert_eq!(body["props"]["tags"], serde_json::json!(["rust", "auth"]));
+        assert_eq!(body["props"]["path"], "entities/auth-service.md");
+        let content_md = body["content_md"].as_str().unwrap();
+        assert!(content_md.starts_with("---\n"), "保留完整 frontmatter + 正文");
+    }
+
+    /// sync_doc_dirty：成功 PUT 到 agents-docs 并删标记。
+    #[tokio::test]
+    async fn sync_doc_dirty_pushes_and_clears_marker() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let doc_rel = "entities/auth-service.md";
+        let doc_path = dir.path().join(".latte-review/docs/entities");
+        std::fs::create_dir_all(&doc_path).unwrap();
+        std::fs::write(
+            doc_path.join("auth-service.md"),
+            "---\ntype: entity\ntitle: Auth Service\ntags:\n  - rust\n---\n\nbody",
+        )
+        .unwrap();
+        let dirty_dir = dir.path().join(".latte/.docs-dirty");
+        std::fs::create_dir_all(&dirty_dir).unwrap();
+        std::fs::write(dirty_dir.join("entities.auth-service.md"), doc_rel).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/ext/agents-docs/records/entities/auth-service.md"))
+            .and(header("authorization", "Bearer secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let cfg = NotionSyncConfig {
+            enabled: true,
+            base_url: server.uri(),
+            token: "secret".into(),
+            namespace: "agents-tasks".into(),
+        };
+        let http = reqwest::Client::new();
+        let s = sync_doc_dirty(&http, &cfg, dir.path()).await;
+        assert_eq!(s.attempted, 1);
+        assert_eq!(s.succeeded, 1);
+        assert_eq!(
+            std::fs::read_dir(dirty_dir).unwrap().count(),
+            0,
+            "成功后删除 dirty 标记"
+        );
+    }
+
+    /// sync_doc_dirty：5xx 保留标记。
+    #[tokio::test]
+    async fn sync_doc_dirty_keeps_marker_on_5xx() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let doc_path = dir.path().join(".latte-review/docs/entities");
+        std::fs::create_dir_all(&doc_path).unwrap();
+        std::fs::write(doc_path.join("a.md"), "---\ntype: entity\ntitle: A\n---\n\nx").unwrap();
+        let dirty_dir = dir.path().join(".latte/.docs-dirty");
+        std::fs::create_dir_all(&dirty_dir).unwrap();
+        std::fs::write(dirty_dir.join("entities.a.md"), "entities/a.md").unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let cfg = NotionSyncConfig {
+            enabled: true,
+            base_url: server.uri(),
+            token: "t".into(),
+            namespace: "agents-tasks".into(),
+        };
+        let http = reqwest::Client::new();
+        let s = sync_doc_dirty(&http, &cfg, dir.path()).await;
+        assert_eq!(s.failed_server, 1);
+        assert_eq!(
+            std::fs::read_dir(dirty_dir).unwrap().count(),
+            1,
+            "5xx 保留标记"
+        );
+    }
+
+    /// sync_doc_dirty：disabled 是 no-op。
+    #[tokio::test]
+    async fn sync_doc_dirty_disabled_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirty_dir = dir.path().join(".latte/.docs-dirty");
+        std::fs::create_dir_all(&dirty_dir).unwrap();
+        std::fs::write(dirty_dir.join("a.md"), "entities/a.md").unwrap();
+        let cfg = NotionSyncConfig {
+            enabled: false,
+            base_url: "http://127.0.0.1:1".into(),
+            token: String::new(),
+            namespace: "agents-tasks".into(),
+        };
+        let http = reqwest::Client::new();
+        let s = sync_doc_dirty(&http, &cfg, dir.path()).await;
+        assert_eq!(s.attempted, 0);
+        assert_eq!(
+            std::fs::read_dir(dirty_dir).unwrap().count(),
+            1,
+            "disabled 不消费标记"
+        );
     }
 }

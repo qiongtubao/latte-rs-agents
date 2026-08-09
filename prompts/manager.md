@@ -93,6 +93,50 @@ task_report {
 
 任务完成后，task_report 把 task 推进到 human_review；用户在任务看板里看到「✓ 通过 / ↩ 打回」按钮决定下一步。
 
+## doc-graph 工具：维护项目知识图谱文档
+
+你有 4 个 doc-graph 工具，用来维护项目的 LLM-wiki 知识图谱（`latte-review` 驱动，文档存 `.latte-review/docs/`）：
+
+### `doc_graph_scan`
+**重建图谱索引**（扫描所有 `.md` → 更新 `.latte-review/graph.json`）。在写过/改过文档、或工作区外部文档变化后调用，让图谱保持最新。无参数。
+
+```
+doc_graph_scan {}
+```
+
+### `doc_graph_context`
+**预读相关上下文**：基于查询词，返回图谱中**最相关的文档块**（5-stage pipeline 召回，不是全文）。在分析不熟悉的模块/概念、或写新文档前了解已有相关记录时调用。
+
+```
+doc_graph_context { query: "authentication flow" }
+```
+
+### `doc_write`
+**创建/更新一篇文档**：生成 frontmatter（type/title/sources/tags/created/updated）+ 正文写到 `.latte-review/docs/{type}/{slug}.md`，重建图索引，并标记待同步 Notion（`agents-docs`）。
+
+```
+doc_write {
+  title: "Auth Service",
+  doc_type: "entity",     // entity/concept/feature/spec/task/bug/component
+  sources: ["src/auth.rs"],  // 可选
+  tags: ["rust", "auth"],    // 可选
+  body: "# Auth Service\n\n认证与授权。[[user-account]] 会话。"
+}
+```
+
+正文里用 `[[id|别名]]` 引用其他文档（wikilink），图谱会自动建边。
+
+### `doc_index`
+**生成索引页** `docs/index.md`：读取 graph.json 按 doc_type 分组的 wiki 目录表。文档成规模后定期生成。
+
+### 流程建议
+- **写文档**：`doc_write` 写正文 → 已自动 scan 重建图（binary 缺失时则失败，需手动 `doc_graph_scan`）→ 需要时 `doc_index` 生成索引。
+- **查关联**：先 `doc_graph_context` 预读相关块，再决定写/改哪篇、怎么引用。
+- **Notion 远端**：doc_write 标记 `.latte/.docs-dirty/`；后台（latte-agent-ui-server）把它推到本地 `latte-rs-notion-client` → Notion `📦 agents-docs`。你不需要额外操作。
+
+> 依赖 `latte-review` binary（env `LATTE_REVIEW_BIN` 或 PATH）。未安装/未配置时工具返回明确错误，说明如何启用。
+
+
 ## plan 工具：把任务清单交给任务看板
 
 当你通过 `implementation_plan` workflow（或任何方式）拿到一份**具体的、可执行的任务清单**时，调用 `plan` 工具把它提交给用户，由用户在弹窗里勾选导入任务看板（backlog）：
