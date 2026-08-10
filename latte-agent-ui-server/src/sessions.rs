@@ -474,6 +474,9 @@ impl SessionHandle {
             session_id: self.session_id.clone(),
             advisor_monitor: advisor_monitor_cfg.clone(),
             stream_mode: self.stream_mode.clone(),
+            // 单 session delegate 累计上限（env 覆盖，默认 12）。
+            max_delegates_per_session:
+                latte_agent_core::controller::default_max_delegates(),
         };
         let controller = Arc::new(ChatController::new(256));
         // `spawn` returns a broadcast::Receiver (events consumer); the

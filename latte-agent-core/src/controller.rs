@@ -12,7 +12,7 @@
 //!   `RoundScheduler`, inject queue, plan slice, supervisor pause.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -632,6 +632,13 @@ pub struct ControllerConfig {
     /// 实时切换无需重建 controller。`load(true)` 时 run_turn 走流式
     /// 逐 Delta 渲染；`load(false)` 时走非流式（默认）。
     pub stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// 单 session 内 manager/delegate 工具累计调用上限。超过后
+    /// delegate 工具直接返回 `ClientError(\"delegate limit reached\")`。
+    /// 0 = 禁用。默认 12（实测 §perf/diagnose-latency.md §1：
+    /// manager 一次响应中重复 4 次 +0 资源的 delegate 拉低 50% 时长）。
+    /// env `LATTE_MAX_DELEGATES_PER_SESSION` 覆盖；进程内 UI / workflow
+    /// 路径都可读。
+    pub max_delegates_per_session: u32,
 }
 
 // ─── Controller ──────────────────────────────────────────────────
@@ -2381,6 +2388,11 @@ async fn build_runner(
                 advisor_gate.clone(),
                 plan_stage.clone(),
                 agent_pause_gate.clone(),
+                // 单 session delegate 累计计数器（fresh controller 时为 0）。
+                // counter 与 controller 同生命周期，session 结束 / 重启
+                // 自动归零。`default_max_delegates` 从 env 读，默认 12。
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                default_max_delegates(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -2667,6 +2679,17 @@ pub(crate) fn role_roster_text(merged: &AgentConfig) -> String {
     entries.join(", ")
 }
 
+
+/// 单 session 累计 delegate 工具调用上限（默认 12）。env `LATTE_MAX_DELEGATES_PER_SESSION`
+/// 覆盖；非法值回退到默认。0 = 禁用限制（保留字段 compatibility）。
+/// 详见 `docs/perf/diagnose-latency.md` §5（#1-A 方案）。
+pub fn default_max_delegates() -> u32 {
+    let raw = std::env::var("LATTE_MAX_DELEGATES_PER_SESSION").ok();
+    match raw.and_then(|s| s.parse::<u32>().ok()) {
+        Some(n) => n,
+        None => 12,
+    }
+}
 /// delegate 工具提示：可用专家列表来自 `merged.roles` 动态生成
 /// （与角色编辑器同源），不再硬编码 7 个基础角色。
 fn delegate_tool_hint(merged: &AgentConfig) -> String {
@@ -3176,6 +3199,13 @@ async fn register_delegate_tool(
     // Session-level 暂停门 —— specialist runner 也装上，用户按 ⏸
     // 时 subagent 一起冻结。
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    // 单 session 内 delegate 工具调用累计计数器（与 session 同生命周期）。
+    // 0 = 禁用限制（向后兼容）。`max_delegates == 0` 时 handler 跳过计数。
+    delegate_counter: Arc<AtomicU32>,
+    // 单 session 累计 delegate 工具调用上限。`register_delegate_tool` 在
+    // 每次 invocation 入口 fetch_add 后检查；超限返回 ClientError。
+    // 0 = 禁用（保留字段供 future 配置）。
+    max_delegates: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -3226,6 +3256,8 @@ async fn register_delegate_tool(
     ));
     let cancel_flag_owned = Arc::clone(&cancel_flag);
     let turn_cancel_flag_owned = turn_cancel_flag.clone();
+    let delegate_counter_owned = Arc::clone(&delegate_counter);
+    let max_delegates_owned = max_delegates;
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
         let resolver = Arc::clone(&resolver_owned);
@@ -3240,7 +3272,8 @@ async fn register_delegate_tool(
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
         let plan_stage = plan_stage.clone();
-        // 闭包是 `Fn`（可能多调用），clone 一份 agent_pause_gate 供
+        let delegate_counter = Arc::clone(&delegate_counter_owned);
+        let max_delegates = max_delegates_owned;
         // 每次 specialist 创建时 attach。
         let agent_pause_gate = agent_pause_gate.clone();
         Box::pin(async move {
@@ -3260,6 +3293,22 @@ async fn register_delegate_tool(
             // plan 阶段门：任务清单已提交但未获用户批准时，禁止派发
             // 实现类角色（programmer*/devops*）；分析/设计/审查类放行。
             // 在分配 subsession / 发 DelegateStarted 之前拦截，拒绝
+            // 不留任何副作用。
+            if let Some(msg) = plan_gate_rejection(&plan_stage, &role_id) {
+                return Err(tool_err(msg));
+            }
+
+            // 单 session 内 delegate 计数检查：超过 max_delegates 直接拒。
+            // `max_delegates == 0` 时关闭此功能（向后兼容）。fetch_add
+            // 返回旧值；新值 > limit 即超限。
+            if max_delegates > 0 {
+                let used = delegate_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if used > max_delegates {
+                    return Err(tool_err(format!(
+                        "本 session 已用尽 {max_delegates} 次 delegate（当前 {used}）—— 请综合上述 specialist 结论直接回复用户，不要再派发"
+                    )));
+                }
+            }
             // 不留任何副作用。
             if let Some(msg) = plan_gate_rejection(&plan_stage, &role_id) {
                 return Err(tool_err(msg));
@@ -4257,9 +4306,50 @@ mod tests {
     // Approved；下一条用户消息 → Normal。PendingApproval 期间
     // delegate 实现类角色（programmer*/devops*）被工具层拒绝。
 
+    /// env 测试串行锁（避免并行 cargo test 污染 env）。
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
     /// 造一个共享阶段门句柄。
     fn fresh_plan_stage() -> SharedPlanStage {
         Arc::new(parking_lot::RwLock::new(PlanStage::Normal))
+    }
+
+    #[test]
+    fn default_max_delegates_respects_env_and_default() {
+        // env 缺失 → 默认 12。
+        let _g = lock_env();
+        std::env::remove_var("LATTE_MAX_DELEGATES_PER_SESSION");
+        assert_eq!(default_max_delegates(), 12);
+        // env 非法 → 回退默认。
+        std::env::set_var("LATTE_MAX_DELEGATES_PER_SESSION", "abc");
+        assert_eq!(default_max_delegates(), 12);
+        // env 合法 → 用之。
+        std::env::set_var("LATTE_MAX_DELEGATES_PER_SESSION", "5");
+        assert_eq!(default_max_delegates(), 5);
+        std::env::remove_var("LATTE_MAX_DELEGATES_PER_SESSION");
+    }
+
+    /// 计数器：超限时 handler 应拒绝；`max_delegates == 0` 关闭。
+    #[test]
+    fn delegate_counter_rejects_over_limit() {
+        // 镜像 register_delegate_tool handler 入口的计数检查逻辑。
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let max = 2u32;
+        let check = |c: &std::sync::atomic::AtomicU32| -> Result<(), String> {
+            let used = c.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if max > 0 && used > max {
+                Err(format!("本 session 已用尽 {max} 次 delegate（当前 {used}）"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(check(&counter).is_ok(), "第1次应通过");
+        assert!(check(&counter).is_ok(), "第2次应通过");
+        let err = check(&counter).unwrap_err();
+        assert!(err.contains("已用尽"), "{err}");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -4380,6 +4470,9 @@ mod tests {
             None,
             stage.clone(),
             crate::pause_gate::AgentPauseGate::new("test"),
+            // fresh counter + max=0（本测试只验阶段门，无 delegate 计数）。
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
         )
         .await
         .expect("register delegate");
@@ -4519,6 +4612,7 @@ mod tests {
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
             stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
             session_id: String::new(),
         };
 
@@ -4800,6 +4894,7 @@ mod tests {
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
             stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
             session_id: String::new(),
         };
 
@@ -4944,6 +5039,7 @@ mod tests {
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
             stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
             session_id: String::new(),
         };
 
@@ -5074,6 +5170,7 @@ mod tests {
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
             stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
             session_id: String::new(),
         };
 
@@ -5228,6 +5325,7 @@ mod tests {
             subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
             advisor_monitor: AdvisorMonitorConfig::default(),
             stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
             session_id: String::new(),
         };
 
@@ -5435,6 +5533,7 @@ mod tests {
             // enabled=true（默认）→ driver 给 manager runner 装 gate。
             advisor_monitor: AdvisorMonitorConfig::default(),
             stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
             session_id: String::new(),
         };
 
