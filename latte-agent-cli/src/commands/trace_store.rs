@@ -261,8 +261,12 @@ pub fn session_id_from_log_path(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// `LATTE_HOME` 是进程级全局状态；所有改它的测试必须串行，否则并行跑会互相踩。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn list_sessions_returns_empty_when_dirs_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Force a non-existent home for the test.
         let prev = std::env::var("LATTE_HOME").ok();
         std::env::set_var("LATTE_HOME", "/nonexistent/path/latte-test");
@@ -277,6 +281,7 @@ mod tests {
 
     #[test]
     fn list_sessions_finds_files_across_all_three_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap();
         use std::fs;
         let dir = std::env::temp_dir().join(format!("latte-trace-store-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -334,6 +339,7 @@ mod tests {
 
     #[test]
     fn load_trace_missing_file_returns_not_found() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("LATTE_HOME").ok();
         std::env::set_var("LATTE_HOME", "/nonexistent/path/latte-test");
         let err = load_trace("chat-missing").unwrap_err();
