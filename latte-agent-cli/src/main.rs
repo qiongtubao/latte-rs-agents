@@ -61,6 +61,7 @@ async fn main() {
     // `build.rs` 在 submodule 没 init / 用户 opt-out 时不会创建 rtk binary,
     // 这里同样 no-op, rtk_assistant role 走 fallback 路径.
     init_rtk_path();
+    init_tracing();
 
     let cli = Cli::parse();
 
@@ -126,4 +127,21 @@ fn init_rtk_path() {
         std::env::set_var("PATH", new_path);
     }
     let _ = iter; // keep iter alive until after join_paths consumes it
+}
+
+/// 初始化 tracing 输出。
+///
+/// 之前没 init,`latte-agent-core` 里的 `tracing::warn!` / `error!` / `info!`
+/// 全进黑洞 —— 卡住 / 失败时只能看到 session JSONL,看不到 stderr,
+/// 排查 workflow runner / pause gate / model retry 等路径的盲区。
+/// 现在统一按 `RUST_LOG` 过滤,默认 `info`;用户想看更细就 `RUST_LOG=debug`。
+/// `try_init` 防止测试或库调用方已经装过 subscriber 时 panic。
+fn init_tracing() {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(std::io::stderr))
+        .try_init();
 }
