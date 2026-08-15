@@ -1310,6 +1310,7 @@ select {
   cursor: default;
   border-color: var(--border);
   color: var(--fg-2);
+}
 .workflow-import-btn:disabled {
   opacity: 0.5;
   cursor: default;
