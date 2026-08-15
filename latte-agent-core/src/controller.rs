@@ -138,6 +138,17 @@ pub(crate) fn is_empty_output(s: &str) -> bool {
     t.is_empty() || t == "<response></response>"
 }
 
+/// 剥掉 `gate_delegate_return` 追加的监察批注尾段
+/// （"\n\n---\n⚠️ [监察审查]…"）。批注给人和 manager 看；写进
+/// workflow 的 vars / 嵌套 topic 会污染下游 prompt（日志事故：
+/// 「打回重做」批注原样成为 3 个子 workflow 的输入 topic）。
+pub(crate) fn strip_review_annotation(s: &str) -> String {
+    match s.find("\n\n---\n⚠️ [监察审查]") {
+        Some(idx) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
 pub(crate) struct ChatEventTraceSink {
     pub(crate) event_tx: broadcast::Sender<ChatEvent>,
 }
@@ -2249,6 +2260,16 @@ let usage_before = runner.total_usage().clone();
                         }
                     }
                     Some(ControllerInput::SwitchRole(new_role)) => {
+                        // 重复"切换"到当前角色（UI 重连/刷新会重复发
+                        // SwitchRole，日志里曾一次连发 6 条相同的
+                        // Switched Status）：不重建 runner、不发 Status
+                        // 噪声；仍发 Prompt 让 UI 同步当前角色显示。
+                        if new_role == current_role {
+                            let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
+                            let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                            let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                            continue;
+                        }
                         let history: Vec<Message> = runner.context().messages().to_vec();
                         match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, rid)) => {
@@ -3291,11 +3312,21 @@ async fn register_delegate_tool(
     // Delegate-return gate: an advisor review engine that inspects each
     // specialist's output before it flows back to the manager (role
     // adherence + task-result relevance). Built once; cloned per call.
-    let review_engine = Arc::new(AdvisorReviewEngine::new(
+    let review_engine = AdvisorReviewEngine::new(
         merged_owned.clone(),
         resolver_owned.clone(),
         default_params.clone(),
-    ));
+    );
+    // 审查的 LLM 调用也落 subsession trace（与 ui-server 的 monitor
+    // 同款）：此前 delegate-return 审查每次 33–45s 却不进任何日志，
+    // 是观测盲区。
+    let review_engine = if session_id.is_empty() {
+        review_engine
+    } else {
+        let (_sub_id, sink) = subsession_store.create(&session_id, "advisor");
+        review_engine.with_subsession_sink(sink)
+    };
+    let review_engine = Arc::new(review_engine);
     let cancel_flag_owned = Arc::clone(&cancel_flag);
     let turn_cancel_flag_owned = turn_cancel_flag.clone();
     let delegate_counter_owned = Arc::clone(&delegate_counter);

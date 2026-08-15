@@ -1367,13 +1367,22 @@ async fn run_workflow_serial(
     resume: Option<&CheckpointState>,
 ) -> WfOutcome {
     // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
-    // 一个，仿 controller 的 register_delegate_tool）。
+    // 一个，仿 controller 的 register_delegate_tool）。有 session
+    // 时挂 subsession sink：审查的 LLM 调用也落日志（观测盲区修复）。
     let review_engine = ctx.advisor_gate.as_ref().map(|_| {
-        Arc::new(crate::advisor_monitor::AdvisorReviewEngine::new(
+        let engine = crate::advisor_monitor::AdvisorReviewEngine::new(
             ctx.merged.clone(),
             ctx.resolver.clone(),
             ctx.default_params.clone(),
-        ))
+        );
+        let engine = match (&ctx.subsession_store, &ctx.session_id) {
+            (Some(store), Some(sid)) if !sid.is_empty() => {
+                let (_id, sink) = store.create(sid, "advisor");
+                engine.with_subsession_sink(sink)
+            }
+            _ => engine,
+        };
+        Arc::new(engine)
     });
 
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -1387,7 +1396,7 @@ async fn run_workflow_serial(
         for (step_id, output_key, output) in &state.completed {
             done_steps.insert(step_id.as_str());
             if let Some(key) = output_key {
-                vars.insert(key.clone(), output.clone());
+                vars.insert(key.clone(), crate::controller::strip_review_annotation(output));
             }
             last_output = output.clone();
         }
@@ -1450,7 +1459,8 @@ async fn run_workflow_serial(
                     }
                 }
                 if let Some(key) = &step.output_key {
-                    vars.insert(key.clone(), last_output.clone());
+                    // 监察批注不进 vars（同主路径）。
+                    vars.insert(key.clone(), crate::controller::strip_review_annotation(&last_output));
                 }
                 ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
                 idx += 1;
@@ -1540,7 +1550,9 @@ async fn run_workflow_serial(
                 }
             }
             if let Some(key) = &step.output_key {
-                vars.insert(key.clone(), last_output.clone());
+                // 监察批注（⚠️ [监察审查]…）不进 vars：它给人看，
+                // 穿给下游 step / 嵌套 workflow 是污染。
+                vars.insert(key.clone(), crate::controller::strip_review_annotation(&last_output));
             }
             ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
             // 跨 step 循环：产出不含 loop_until 子串 → 跳回 loop_back_to
@@ -1793,13 +1805,22 @@ async fn run_workflow_dag(
     let total = wf.steps.len();
     let sem = Arc::new(Semaphore::new(workflow_concurrency()));
     // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
-    // 一个，仿 controller 的 register_delegate_tool）。
+    // 一个，仿 controller 的 register_delegate_tool）。有 session
+    // 时挂 subsession sink：审查的 LLM 调用也落日志（观测盲区修复）。
     let review_engine = ctx.advisor_gate.as_ref().map(|_| {
-        Arc::new(crate::advisor_monitor::AdvisorReviewEngine::new(
+        let engine = crate::advisor_monitor::AdvisorReviewEngine::new(
             ctx.merged.clone(),
             ctx.resolver.clone(),
             ctx.default_params.clone(),
-        ))
+        );
+        let engine = match (&ctx.subsession_store, &ctx.session_id) {
+            (Some(store), Some(sid)) if !sid.is_empty() => {
+                let (_id, sink) = store.create(sid, "advisor");
+                engine.with_subsession_sink(sink)
+            }
+            _ => engine,
+        };
+        Arc::new(engine)
     });
 
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -1814,7 +1835,7 @@ async fn run_workflow_dag(
             done_steps.insert(step_id.as_str());
             outputs.insert(step_id.clone(), output.clone());
             if let Some(key) = output_key {
-                vars.insert(key.clone(), output.clone());
+                vars.insert(key.clone(), crate::controller::strip_review_annotation(output));
             }
         }
     }
@@ -1892,7 +1913,8 @@ async fn run_workflow_dag(
             }
             for (output_key, out) in wave_updates {
                 if let Some(key) = output_key {
-                    vars.insert(key, out);
+                    // 监察批注不进 vars（同串行引擎）。
+                    vars.insert(key, crate::controller::strip_review_annotation(&out));
                 }
             }
         }
