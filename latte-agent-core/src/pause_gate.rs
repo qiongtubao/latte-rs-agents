@@ -45,12 +45,15 @@ use tokio_util::sync::CancellationToken;
 
 /// 暂停状态。`None` = running；`Some` = paused（含起始时刻用于
 /// "paused for 0:07" 之类的 UI 显示）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PausedState {
     /// wall-clock epoch millis —— 给 UI 排序 / 序列化用
     paused_at_unix_ms: u64,
     /// monotonic instant —— 给 [`resume`](Self::resume) 计算持续时间
     paused_at_instant: Instant,
+    /// 暂停原因（用户手动 / 模型不可用自动暂停…），随 Paused 事件
+    /// 广播给 UI 展示。
+    reason: String,
 }
 
 /// 进程内可克隆、可共享的暂停门。`Arc<Self>` 是常见形态，gate 本身
@@ -95,6 +98,12 @@ impl AgentPauseGate {
     /// Engage the gate. 已暂停时返回 `false`（幂等），首次 pause 返
     /// 回 `true`。调用后所有**后续**`wait_until_resumed` 都会 park。
     pub fn pause(&self) -> bool {
+        self.pause_with_reason("")
+    }
+
+    /// 带原因 engage（如「模型不可用，自动暂停」）。原因随 gate 状态
+    /// 保存，listener / UI 经 [`pause_reason`](Self::pause_reason) 读取。
+    pub fn pause_with_reason(&self, reason: impl Into<String>) -> bool {
         let mut state = self.state.lock();
         if state.is_some() {
             return false; // 幂等：已经在 paused
@@ -105,6 +114,7 @@ impl AgentPauseGate {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             paused_at_instant: Instant::now(),
+            reason: reason.into(),
         });
         // 唤醒所有当前 waiter —— 它们检查 `state` 后会看到 paused
         // 并重新 await。但这要它们先检查状态，否则会 race。
@@ -145,6 +155,13 @@ impl AgentPauseGate {
     /// 排序、序列化用。
     pub fn paused_since_unix_ms(&self) -> Option<u64> {
         self.state.lock().as_ref().map(|s| s.paused_at_unix_ms)
+    }
+
+    /// 暂停原因（`pause_with_reason` 存入）；未暂停或原因为空返回
+    /// `None`/空串。controller 的 on_change listener 把它放进
+    /// `ChatEvent::Paused` 广播给 UI。
+    pub fn pause_reason(&self) -> Option<String> {
+        self.state.lock().as_ref().map(|s| s.reason.clone())
     }
 
     /// 注册 listener，每次 pause / resume 切换时被回调（参数 = 新
@@ -246,6 +263,20 @@ mod tests {
         let g = AgentPauseGate::new("t");
         assert!(!g.is_paused());
         assert!(g.paused_since_unix_ms().is_none());
+    }
+
+    #[test]
+    fn pause_with_reason_stores_and_clears_reason() {
+        let g = AgentPauseGate::new("t");
+        assert!(g.pause_reason().is_none());
+        assert!(g.pause_with_reason("模型不可用，自动暂停"));
+        assert_eq!(g.pause_reason().as_deref(), Some("模型不可用，自动暂停"));
+        // 幂等：已暂停时再次 pause 不覆盖原因。
+        assert!(!g.pause_with_reason("别的原因"));
+        assert_eq!(g.pause_reason().as_deref(), Some("模型不可用，自动暂停"));
+        // resume 清空。
+        g.resume();
+        assert!(g.pause_reason().is_none());
     }
 
     #[test]

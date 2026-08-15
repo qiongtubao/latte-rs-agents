@@ -28,11 +28,38 @@ prompt = """把拆解转成任务看板数据结构：
 {{plan}}
 严格输出一个 ```json 代码块。**JSON 代码块之外不写任何文字——不写思考过程、不写说明、不写前后缀。**
 schema：
-{"tasks": [{"title": "必填，一句话", "description": "做什么+验收标准", "priority": 1-4（1最高）, "labels": ["可选"], "workflow": "执行该任务的 workflow：开发类 tdd_development，修 bug bug_triage，文档类 update_docs；轻量微调/探索类任务可不填（走 manager 直接执行）", "subtasks": [同构，最多一层]}]}
+{"tasks": [{"title": "必填，一句话", "description": "做什么+验收标准", "priority": 1-4（1最高）, "labels": ["可选"], "workflow": "执行该任务的 workflow：开发类 tdd_development，修 bug bug_triage，文档类 update_docs，代码注释 annotate_code；没有贴合的必须留空（走 manager 直接执行），禁止硬绑不相关的 workflow", "subtasks": [同构，最多一层]}]}
 要求：任务粒度 0.5-2 天；有依赖的排好序（先做的事情在前）；每个任务都能独立验收。"""
 
 [[steps]]
 id = "verdict"
 description = "终审"
 speakers = ["reviewer"]
+output_key = "verdict"
 prompt = "终审这份实现规划：\n【拆解】{{plan}}\n【任务清单】{{tasks}}\n按裁决格式输出。重点：任务是否覆盖目标、粒度是否合理、依赖顺序是否正确、JSON 是否合法可导入。"
+
+# ── gate：终审门 ─────────────────────────────────────────────────
+# verdict 不通过（❌/changes-requested/阻断问题）→ 产出契约失败 →
+# 整个 workflow 以 failed 收场，manager 拿到错误（带 wf_id 可 resume），
+# 不会把有阻断问题的任务清单提交给用户导入看板。
+# 通过时原样带上任务清单，workflow 的最终产出仍是计划本身。
+[[steps]]
+id = "gate"
+description = "终审门：verdict 不通过则 workflow 失败"
+speakers = ["reviewer"]
+max_retries = 0
+prompt = """根据以下终审结论判定放行与否：
+
+【终审结论】
+{{verdict}}
+
+规则：
+- 终审为 ✅ 通过 / ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后**原样完整附上**下面的任务清单（不得增删改任务）：
+
+【任务清单】
+{{tasks}}
+
+- 终审为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句），**不要**附任务清单。"""
+
+[steps.output_contract]
+require = ["VERDICT: PASS"]

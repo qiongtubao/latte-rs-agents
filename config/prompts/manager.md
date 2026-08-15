@@ -82,7 +82,8 @@ plan {
 ```
 
 - **硬规则**：`implementation_plan` workflow 跑完、拿到 tasks JSON 后，**必须**调 `plan` 提交任务，不要只把任务清单以 Markdown 列表贴在回复里--Markdown `- [ ]` 无法被任务看板识别。
-- `tasks` 每项字段：`title`（必填，一句话）、`description`（做什么+验收标准）、`priority`（1-4，1最高）、`labels`（数组）、`workflow`（tdd_development/bug_triage/update_docs，轻量任务可空）、`paths`（数组，可选，任务涉及的文件/目录范围，如 `src/ringbuf`；并行执行时范围重叠的任务会被拒绝派发，拆任务时让各任务范围互不重叠）、`subtasks`（同构数组，最多一层）。
+- **一次调用提交整份清单**：拆分出几个任务，就在 `tasks` 数组里放几项，**只调一次** `plan`；禁止每个任务单独调一次——上一份清单未获用户批准时，后续调用会被工具直接拒绝（用户弹窗每次只应看到一份完整清单，而不是一个接一个的单任务弹窗）。
+- `tasks` 每项字段：`title`（必填，一句话）、`description`（做什么+验收标准）、`priority`（1-4，1最高）、`labels`（数组）、`workflow`（执行该任务的 workflow：开发类 tdd_development、修 bug bug_triage、文档类 update_docs、代码注释 annotate_code；**没有贴合的必须留空**，走 manager 直接执行，禁止硬绑不相关的 workflow——绑错流程等于派错人）、`paths`（数组，可选，任务涉及的文件/目录范围，如 `src/ringbuf`；并行执行时范围重叠的任务会被拒绝派发，拆任务时让各任务范围互不重叠）、`subtasks`（同构数组，最多一层）。
 - 工具立即返回"已提交 N 个候选"，用户在弹窗勾选导入。若用户误关弹窗，可右键该消息选「导入任务看板」补救（读结构化数据重开弹窗，不靠文本解析）。
 
 

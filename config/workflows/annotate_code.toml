@@ -1,0 +1,59 @@
+# Workflow: annotate_code — 给指定流程/模块的代码加注释
+#
+# 用法：任务看板/管理器收到「给某段代码/某个流程加注释」任务时绑定：
+#   workflow { name: "annotate_code", topic: "<要注释的流程/模块>" }
+#
+# 流程：
+#   locate   → architect 读代码取证，定位要注释的函数/文件（file:line 锚点）+ 术语表
+#   annotate → programmer 按定位清单加注释（只加注释，不改逻辑）
+#   verify   → reviewer 独立核验：注释与代码是否一致、有无误改逻辑
+#
+# 步骤间用 output_key 显式穿线（引擎跨步骤只传 output_key 变量）。
+
+name = "annotate_code"
+description = "代码注释流水线：定位流程代码 → 加注释 → 独立核验注释准确性"
+max_rounds = 1
+
+[[steps]]
+id = "locate"
+description = "定位目标流程涉及的代码"
+role = "architect"
+output_key = "targets"
+max_retries = 1
+task = "围绕「{{topic}}」定位需要加注释的代码：先用工具读代码取证（禁止凭记忆）。产出：1) 涉及的函数/文件清单（每条带 file:line 锚点）；2) 每个点的执行逻辑一句话说明；3) 关键术语表（术语 → 准确解释，基于真实代码）。"
+
+[steps.output_contract]
+min_chars = 200
+
+[[steps]]
+id = "annotate"
+description = "programmer 给代码加中文注释"
+role = "programmer"
+output_key = "annotated"
+task = """给以下代码位置加中文注释：
+
+{{targets}}
+
+要求：
+1) 注释解释「做什么 / 为什么」，不复述代码本身；
+2) 术语与上文术语表保持一致；
+3) 只加/改注释，**不改任何代码逻辑**；
+4) 注释风格与所在文件已有注释一致。
+
+产出：改动文件清单 + 每处注释的一句话摘要。"""
+
+[[steps]]
+id = "verify"
+description = "reviewer 独立核验注释"
+role = "reviewer"
+output_key = "verdict"
+task = """核验这次注释工作（不要相信下面的报告，用工具读被改文件、用 git diff 独立取证）：
+
+【定位清单】
+{{targets}}
+
+【注释改动报告】
+{{annotated}}
+
+核查：1) 注释与代码实际逻辑是否一致；2) 关键点有无遗漏；3) 是否误改了代码逻辑。
+按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用 file:line）、阻断问题（如有）、后续建议。"""

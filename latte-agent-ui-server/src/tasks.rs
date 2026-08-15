@@ -990,6 +990,8 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
         };
         // 复用该 session 的暂停门：用户 ⏸ 时看板派的 workflow 也一起停。
         let agent_pause_gate = api::session_pause_gate(&b, &session_id).await.ok();
+        // advisor intervene 暂停门同理：判「等待用户拍板」时流水线 park。
+        let advisor_pause = api::session_advisor_pause_gate(&b, &session_id).await.ok();
         let ctx = WorkflowRunContext {
             merged: Arc::new(b.merged.read().clone()),
             resolver: b.resolver.clone(),
@@ -999,6 +1001,13 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             depth: 0,
             agent_pause_gate,
+            // 跑在真实 session 事件流上：分派建 subsession、过
+            // advisor gate，与 manager 的 delegate 一致。
+            subsession_store: Some(b.subsession_store.clone()),
+            session_id: Some(session_id.clone()),
+            advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+                .runner_gate(),
+            advisor_pause,
         };
         let result = run_workflow(&wf, &topic, &ctx).await;
         let mut store = b.tasks.write();
@@ -1181,6 +1190,10 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
             // 复用该 session 的暂停门：用户 ⏸ 时这个看板 workflow 也一起停。
             let agent_pause_gate =
                 api::session_pause_gate(&b2, &info.session_id).await.ok();
+            let session_id = info.session_id.clone();
+            // advisor intervene 暂停门：判「等待用户拍板」时流水线 park。
+            let advisor_pause =
+                api::session_advisor_pause_gate(&b2, &session_id).await.ok();
             let ctx = WorkflowRunContext {
                 merged: Arc::new(b2.merged.read().clone()),
                 resolver: b2.resolver.clone(),
@@ -1190,6 +1203,13 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
                 cancel_flag: cancel.clone(),
                 depth: 0,
                 agent_pause_gate: agent_pause_gate.clone(),
+                // 跑在真实 session 事件流上：分派建 subsession、过
+                // advisor gate，与 manager 的 delegate 一致。
+                subsession_store: Some(b2.subsession_store.clone()),
+                session_id: Some(session_id.clone()),
+                advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+                    .runner_gate(),
+                advisor_pause: advisor_pause.clone(),
             };
             let result = run_workflow(&wf, &msg2, &ctx).await;
             // 开发流跑完（非 code_review 本身）→ 链式自动审查。
@@ -1197,7 +1217,7 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
             let dev_summary = result.as_ref().ok().cloned().unwrap_or_default();
             finish_workflow_run(&b2, &task_id, result, &cancel);
             if chain_review {
-                chain_code_review(&b2, &task_id, msg2, dev_summary, event_tx, agent_pause_gate.clone()).await;
+                chain_code_review(&b2, &task_id, msg2, dev_summary, event_tx, agent_pause_gate.clone(), session_id).await;
             }
         });
     }
@@ -1304,6 +1324,7 @@ async fn chain_code_review(
     dev_summary: String,
     event_tx: tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent>,
     agent_pause_gate: Option<Arc<latte_agent_core::pause_gate::AgentPauseGate>>,
+    session_id: String,
 ) {
     let in_review = {
         let store = b.tasks.read();
@@ -1323,6 +1344,7 @@ async fn chain_code_review(
         "{dispatch_msg}\n\n【执行摘要】\n{}",
         tail_chars(&dev_summary, 1500)
     );
+    let advisor_pause = api::session_advisor_pause_gate(b, &session_id).await.ok();
     let ctx = WorkflowRunContext {
         merged: Arc::new(b.merged.read().clone()),
         resolver: b.resolver.clone(),
@@ -1332,6 +1354,12 @@ async fn chain_code_review(
         cancel_flag: Arc::new(AtomicBool::new(false)),
         depth: 0,
         agent_pause_gate,
+        // 与派发 run 同源：分派建 subsession、过 advisor gate。
+        subsession_store: Some(b.subsession_store.clone()),
+        session_id: Some(session_id),
+        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+            .runner_gate(),
+        advisor_pause,
     };
     let result = run_workflow(&wf, &topic, &ctx).await;
     let mut store = b.tasks.write();

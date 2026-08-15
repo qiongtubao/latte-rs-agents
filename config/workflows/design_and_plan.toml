@@ -42,6 +42,7 @@ description = "嵌套 requirements_review（与 code_review 并行）"
 workflow = "requirements_review"
 depends_on = ["brainstorm"]
 task = "评审以下设计方案的需求合理性：\n{{design}}"
+output_key = "req_verdict"
 
 [[steps]]
 id = "code_review"
@@ -49,3 +50,33 @@ description = "嵌套 code_review（与 requirements_review 并行）"
 workflow = "code_review"
 depends_on = ["brainstorm"]
 task = "评审以下设计方案涉及代码区域的质量风险：\n{{design}}"
+output_key = "code_verdict"
+
+# ── gate：总终审门 ────────────────────────────────────────────────
+# 任一评审 ❌/有阻断问题 → 产出契约失败 → 整个 workflow 以 failed
+# 收场（manager 拿到错误与 wf_id，不会把未过审的计划提交看板）。
+# 通过时原样带上实现计划，workflow 最终产出仍是计划本身。
+[[steps]]
+id = "gate"
+description = "总终审门：任一评审不通过则 workflow 失败"
+role = "reviewer"
+depends_on = ["plan", "req_review", "code_review"]
+max_retries = 0
+task = """根据以下两份评审结论判定放行与否：
+
+【需求评审】
+{{req_verdict}}
+
+【代码评审】
+{{code_verdict}}
+
+规则：
+- 两份评审均为 ✅ 通过 / ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后**原样完整附上**下面的实现计划（不得增删改）：
+
+【实现计划】
+{{plan}}
+
+- 任一份为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句），**不要**附实现计划。"""
+
+[steps.output_contract]
+require = ["VERDICT: PASS"]

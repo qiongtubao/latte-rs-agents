@@ -1,28 +1,55 @@
 # Workflow: requirements_review
-# 注意：本流程尚未按精致化模式重构（缺 output_key 穿线），见看板任务。
+# 需求评审：PM 阐述需求 → 架构可行性 → 工期/风险估算 → 范围拍板 → 终审。
+# 步骤间用 output_key 显式穿线（引擎跨步骤只传 output_key 变量 +
+# step 内 transcript；"上述需求"这类隐式引用拿不到任何上下文）。
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "requirements_review"
 description = "PM 阐述需求，团队讨论可行性和范围。"
-max_rounds = 2
+max_rounds = 1
+
 [[steps]]
 id = "present"
+description = "PM 阐明需求"
 speakers = ["pm"]
+output_key = "requirements"
 prompt = "为 {{topic}} 阐明需求。包含带验收标准的用户故事。"
+
 [[steps]]
 id = "architecture"
+description = "架构可行性"
 speakers = ["architect"]
-prompt = "审查技术可行性并为上述需求建议架构。"
+output_key = "arch_review"
+prompt = "需求如下：\n{{requirements}}\n\n审查技术可行性并为这些需求建议架构。"
+
 [[steps]]
 id = "estimate"
+description = "工期与风险估算"
 speakers = ["programmer", "tester"]
-prompt = "估算工期和风险。Programmer：实现复杂度和大致时间线。Tester：测试面和边界用例。"
+output_key = "estimate"
+prompt = "【需求】\n{{requirements}}\n\n【架构建议】\n{{arch_review}}\n\n估算工期和风险。Programmer：实现复杂度和大致时间线。Tester：测试面和边界用例。"
+
 [[steps]]
 id = "decide"
+description = "范围与优先级拍板"
 speakers = ["manager", "pm"]
-prompt = "基于讨论最终确定范围和优先级。Manager：评估风险和时间线可行性。"
+output_key = "scope"
+prompt = "基于以下讨论最终确定范围和优先级。\n【需求】\n{{requirements}}\n\n【架构建议】\n{{arch_review}}\n\n【估算】\n{{estimate}}\n\nManager：评估风险和时间线可行性。PM：从用户价值角度权衡取舍。"
+
 [[steps]]
 id = "advisor_verdict"
 description = "Reviewer reviews all outputs and gives the final verdict"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"
+prompt = """你现在是终审顾问。通读以下全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。
+
+【需求】
+{{requirements}}
+
+【架构建议】
+{{arch_review}}
+
+【估算】
+{{estimate}}
+
+【范围决定】
+{{scope}}"""

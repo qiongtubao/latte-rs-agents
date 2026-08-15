@@ -428,6 +428,22 @@ pub async fn session_pause_gate(
         .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
     Ok(controller.session_pause_gate())
 }
+
+/// 拿 session controller 的 advisor intervene 暂停门
+/// （`AdvisorPauseGate`）。任务看板/续跑的 workflow 分派共用同一个
+/// gate——advisor 判 Intervene「等待用户拍板」时，workflow 流水线
+/// 也一起 park（此前只对 watched role 的主 runner 生效）。
+pub async fn session_advisor_pause_gate(
+    b: &UiBackend,
+    id: &str,
+) -> Result<latte_agent_core::advisor_monitor::AdvisorPauseGate, ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    Ok(controller.advisor_pause_gate())
+}
 // ─── Roles ────────────────────────────────────────────────────────
 
 pub fn list_roles(b: &UiBackend) -> Vec<RoleInfo> {
@@ -1657,6 +1673,11 @@ pub fn workflow_run_start(
             cancel_flag: cancel,
             agent_pause_gate: None, // 独立测试 run：无 session gate
             depth: 0,
+            // 独立测试 run 无 session：不建 subsession、不走 advisor。
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
         };
         let _ = run_workflow(&wf, &topic, &ctx).await;
         // engine 返回后丢掉 tx_inner 关闭内部 channel，forwarder 排空后退出。
@@ -1773,6 +1794,14 @@ pub async fn workflow_resume(
         // 与任务看板派发的 run 同款：用户 ⏸ 时续跑也一起冻结。
         agent_pause_gate: Some(controller.session_pause_gate()),
         depth: 0,
+        // 续跑跑在真实 session 事件流上：分派建 subsession（UI 右键
+        // 可查日志）、过 advisor gate + 返回审查，与 manager 的
+        // delegate / workflow 工具一致。
+        subsession_store: Some(b.subsession_store.clone()),
+        session_id: Some(req.session_id.clone()),
+        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+            .runner_gate(),
+        advisor_pause: Some(controller.advisor_pause_gate()),
     };
     let wf_name = wf.name.clone();
     let resp_wf_id = wf_id.clone();

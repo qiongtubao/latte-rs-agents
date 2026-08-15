@@ -52,6 +52,11 @@ pub enum ToolCallErrorKind {
     /// `tm.execute()` 抛错 —— 网络 5xx / 模型返回奇怪结构 / 反序列化
     /// 失败 / 业务错误。重试一次可能好。
     Execution { reason: String },
+    /// 永久性执行错误（文件不存在、缺必填参数、路径非法、权限拒绝
+    /// 等）——原样重试必然再失败：不 retry，但要喂回 model 让它换
+    /// 路径/换参数。（日志事故：ENOENT、Tool not found 这类错误被
+    /// 原样重试一次再失败，96 次 ToolRetry 0 次恢复。）
+    PermanentExec { reason: String },
     /// 工具内部 timeout。瞬时错误，重试一次。
     Timeout,
 }
@@ -64,6 +69,7 @@ impl ToolCallErrorKind {
             Self::ToolNotFound { .. } => "ToolNotFound",
             Self::HookAborted { .. } => "HookAborted",
             Self::Execution { .. } => "Execution",
+            Self::PermanentExec { .. } => "PermanentExec",
             Self::Timeout => "Timeout",
         }
     }
@@ -80,6 +86,7 @@ impl std::fmt::Display for ToolCallErrorKind {
                 write!(f, "hook '{hook}' aborted: {reason}")
             }
             Self::Execution { reason } => write!(f, "execution failed: {reason}"),
+            Self::PermanentExec { reason } => write!(f, "permanent error: {reason}"),
             Self::Timeout => write!(f, "tool timeout"),
         }
     }
@@ -115,9 +122,10 @@ impl RetryPolicy for DefaultRetryPolicy {
             ToolCallErrorKind::MalformedArgs { .. }
             | ToolCallErrorKind::Execution { .. }
             | ToolCallErrorKind::Timeout => true,
-            // 名字错 / hook 故意拒绝 → 再试也不会好
+            // 名字错 / hook 故意拒绝 / 永久性执行错误 → 再试也不会好
             ToolCallErrorKind::ToolNotFound { .. }
-            | ToolCallErrorKind::HookAborted { .. } => false,
+            | ToolCallErrorKind::HookAborted { .. }
+            | ToolCallErrorKind::PermanentExec { .. } => false,
         }
     }
     fn loopback_to_model(&self, kind: &ToolCallErrorKind) -> bool {
@@ -125,6 +133,7 @@ impl RetryPolicy for DefaultRetryPolicy {
             kind,
             ToolCallErrorKind::HookAborted { .. }
                 | ToolCallErrorKind::Execution { .. }
+                | ToolCallErrorKind::PermanentExec { .. }
                 | ToolCallErrorKind::Timeout
         )
     }
@@ -745,22 +754,64 @@ pub struct AgentRunner {
 }
 
 /// 把 ToolError 归类到 `ToolCallErrorKind`。
-/// 这里不细分 HTTP 错误码：调用方（retry loop）只关心"能不能重试"，
-/// ToolError::ToolExecution 永远是瞬时执行错误，归 Execution。
+/// 调用方（retry loop）只关心"能不能重试"：
+/// - `ToolError::ToolNotFound` → ToolNotFound（永久，不重试）；
+/// - 消息匹配参数/路径类永久模式（ENOENT、缺必填、非法路径等）→
+///   PermanentExec（不重试，但喂回 model 换路径）；
+/// - 其余 ToolExecution 视为瞬时执行错误 → Execution（重试一次）。
 fn classify_tool_execution_error(
     e: &latte_rs_agent_tools::error::ToolError,
 ) -> ToolCallErrorKind {
-    // ToolError 没有独立的 Timeout variant；timeout 由工具
-    // 在 ToolExecution.source_string 里描述。我们统一归 Execution，
-    // DefaultRetryPolicy 把 Execution 标记为可重试一次。
-    ToolCallErrorKind::Execution {
-        reason: e.to_string(),
+    if let ToolError::ToolNotFound(name) = e {
+        return ToolCallErrorKind::ToolNotFound {
+            tried_aliases: vec![name.clone()],
+        };
+    }
+    let msg = e.to_string();
+    const PERMANENT: &[&str] = &[
+        "No such file or directory",
+        "Path not found",
+        "Not a file",
+        "is required",
+        "must be",
+        "must not",
+        "invalid",
+        "Permission denied",
+        "系统运行时内部文件",
+    ];
+    if PERMANENT.iter().any(|p| msg.contains(p)) {
+        ToolCallErrorKind::PermanentExec { reason: msg }
+    } else {
+        ToolCallErrorKind::Execution { reason: msg }
     }
 }
 
 /// Short (namespace-stripped) tool name, e.g. `manager.delegate` → `delegate`.
 fn short_tool_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, s)| s).unwrap_or(name)
+}
+
+/// `ModelsUnavailable` 的人类可读摘要：tried/failures + 最近可重试
+/// 时间。给自动暂停的 Paused 事件原因用。
+fn model_failures_summary(e: &AgentError) -> String {
+    match e {
+        AgentError::ModelsUnavailable {
+            failures,
+            next_retry_in,
+            ..
+        } => {
+            let f = failures
+                .iter()
+                .map(|(id, err)| format!("{id}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            match next_retry_in {
+                Some(d) => format!("{f}（{}s 后可自动重试）", d.as_secs()),
+                None => f,
+            }
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Whether `delegate` tool calls emitted in the *same* model response
@@ -1103,6 +1154,37 @@ impl AgentRunner {
         self
     }
 
+    /// 模型全链不可用（`ModelsUnavailable`）时的「自动暂停等人」：
+    /// 挂了 session 暂停门 → engage 门（带原因，controller 的
+    /// on_change listener 会广播 `ChatEvent::Paused`，UI 弹出
+    /// 「已暂停 + ▶ 继续」），park 到用户恢复；恢复后返回 true，
+    /// 调用方重试模型调用。无门 → false，调用方原样抛错。
+    ///
+    /// 语义对齐用户手动 ⏸：in-flight 的本次 model call 已经失败
+    /// 落定，重试从下一次调用开始，不打断任何进行中的流。
+    async fn pause_wait_model_unavailable(&self, e: &AgentError) -> bool {
+        let Some(gate) = self.agent_pause_gate.clone() else {
+            return false;
+        };
+        let summary = model_failures_summary(e);
+        gate.pause_with_reason(format!(
+            "模型不可用（{summary}），已自动暂停——点 ▶ 继续会自动重试"
+        ));
+        self.sink.emit(crate::trace::TraceEvent::SessionPaused {
+            meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
+            task_id: String::new(),
+            reason: format!("models unavailable: {summary}"),
+            turn: 0,
+        });
+        let r = gate.wait_until_resumed(None).await;
+        self.sink.emit(crate::trace::TraceEvent::SessionResumed {
+            meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
+            task_id: String::new(),
+            turn: 0,
+        });
+        matches!(r, crate::pause_gate::WaitResult::Ok)
+    }
+
     /// 设置流式模式开关（运行时可切换）。
     ///
     /// `stream_mode.load(true)` 时 `run_turn` 走 `Agent::chat_stream`，
@@ -1429,7 +1511,18 @@ impl AgentRunner {
             let completion = if self.is_stream_mode() {
                 // Stream 模式：逐 Delta 消费，发 ModelDelta trace 让 UI 逐 token 渲染。
                 // Done 携带完整 tool_calls + usage，组装成 Completion 后下游工具循环零改动。
-                let mut rx = self.agent.chat_stream(&messages, chat_params.as_ref()).await?;
+                // 模型全链不可用 → 自动暂停 session 门，等用户「继续」后重试。
+                let mut rx = loop {
+                    match self.agent.chat_stream(&messages, chat_params.as_ref()).await {
+                        Ok(rx) => break rx,
+                        Err(e @ AgentError::ModelsUnavailable { .. }) => {
+                            if !self.pause_wait_model_unavailable(&e).await {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                };
                 loop {
                     match rx.recv().await {
                         Some(StreamEvent::Delta { content, .. }) => {
@@ -1475,7 +1568,22 @@ impl AgentRunner {
                 }
             } else {
                 // 非流式模式（默认）：chat() 内部走流式传输 + idle watchdog，对外返回完整 Completion。
-                self.agent.chat(&messages, chat_params.as_ref(), WaitPolicy::WaitAndRetry).await?
+                // 模型全链不可用 → 自动暂停 session 门，等用户「继续」后重试。
+                loop {
+                    match self
+                        .agent
+                        .chat(&messages, chat_params.as_ref(), WaitPolicy::WaitAndRetry)
+                        .await
+                    {
+                        Ok(c) => break c,
+                        Err(e @ AgentError::ModelsUnavailable { .. }) => {
+                            if !self.pause_wait_model_unavailable(&e).await {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             };
             let latency_ms = chat_start.elapsed().as_millis() as u64;
 
@@ -1987,7 +2095,14 @@ impl AgentRunner {
         for msg in new_messages {
             self.context.push(msg.clone());
         }
-        self.context.push(Message::assistant(final_response.clone()));
+        // 空响应不入 context：部分 API（deepseek 系）对 text 为空的
+        // assistant 消息直接 400（"text content is empty"）——一旦入
+        // context，后续每个请求都带着它，这个 turn 就永久卡死。
+        // （日志事故：reviewer 空响应入 context 后 gate 重试全 400，
+        // 整个 workflow 被拖垮。）
+        if !final_response.trim().is_empty() {
+            self.context.push(Message::assistant(final_response.clone()));
+        }
 
         Ok(final_response)
     }
@@ -2316,6 +2431,31 @@ mod tests {
             allowed_tools: vec![],
             icon: "🧪".into(),
         }
+    }
+
+    /// 永久性错误（工具不存在 / ENOENT / 参数非法）不重试；瞬时错误
+    /// 重试一次。所有 permanent 错误仍喂回 model 让它换路径。
+    #[test]
+    fn permanent_tool_errors_are_not_retried() {
+        let policy = DefaultRetryPolicy;
+        // 工具不存在 → ToolNotFound，不重试
+        let kind = classify_tool_execution_error(&ToolError::ToolNotFound("bash".into()));
+        assert!(matches!(kind, ToolCallErrorKind::ToolNotFound { .. }));
+        assert!(!policy.retryable(&kind));
+        // ENOENT → PermanentExec，不重试但喂回 model
+        let kind = classify_tool_execution_error(&ToolError::other(
+            "stat: No such file or directory (os error 2)",
+        ));
+        assert!(matches!(kind, ToolCallErrorKind::PermanentExec { .. }));
+        assert!(!policy.retryable(&kind));
+        assert!(policy.loopback_to_model(&kind));
+        // 缺必填参数 → PermanentExec
+        let kind = classify_tool_execution_error(&ToolError::other("path is required"));
+        assert!(!policy.retryable(&kind));
+        // 普通执行错误（网络/5xx 类）→ Execution，重试一次
+        let kind = classify_tool_execution_error(&ToolError::other("connection reset by peer"));
+        assert!(matches!(kind, ToolCallErrorKind::Execution { .. }));
+        assert!(policy.retryable(&kind));
     }
 
     fn test_model() -> Model {
@@ -2665,6 +2805,86 @@ mod tests {
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
+    }
+
+    /// 模型全链不可用 + 挂了 session 暂停门 → 自动暂停（带原因），
+    /// 用户「继续」（resume）后返回 true 让调用方重试。
+    #[tokio::test]
+    async fn models_unavailable_auto_pauses_and_resumes_for_retry() {
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = crate::pause_gate::AgentPauseGate::new("session");
+        let runner = AgentRunner::new(agent).with_agent_pause_gate(gate.clone());
+        let err = AgentError::ModelsUnavailable {
+            tried: vec!["m1".into()],
+            failures: vec![("m1".into(), "429 rate limited".into())],
+            next_retry_in: None,
+        };
+
+        // 80ms 后模拟用户点「继续」。
+        let g2 = gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            g2.resume();
+        });
+        let retry = runner.pause_wait_model_unavailable(&err).await;
+        assert!(retry, "resume 后应返回 true（重试）");
+        assert!(!gate.is_paused(), "resume 后门已放开");
+    }
+
+    /// 无暂停门 → 不等人，直接 false（调用方原样抛错，保持旧行为）。
+    #[tokio::test]
+    async fn models_unavailable_without_gate_fails_fast() {
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let runner = AgentRunner::new(agent);
+        let err = AgentError::ModelsUnavailable {
+            tried: vec!["m1".into()],
+            failures: vec![],
+            next_retry_in: None,
+        };
+        assert!(!runner.pause_wait_model_unavailable(&err).await);
+    }
+
+    /// 自动暂停期间原因可读（Paused 事件的数据源）。
+    #[tokio::test]
+    async fn models_unavailable_pause_carries_reason() {
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = crate::pause_gate::AgentPauseGate::new("session");
+        let runner = AgentRunner::new(agent).with_agent_pause_gate(gate.clone());
+        let err = AgentError::ModelsUnavailable {
+            tried: vec!["m1".into()],
+            failures: vec![("m1".into(), "500 oops".into())],
+            next_retry_in: None,
+        };
+        let g2 = gate.clone();
+        tokio::spawn(async move {
+            // 等 gate 被 engage 后断言原因，再 resume 放行。
+            while !g2.is_paused() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let reason = g2.pause_reason().unwrap_or_default();
+            assert!(reason.contains("模型不可用"), "{reason}");
+            assert!(reason.contains("m1"), "{reason}");
+            g2.resume();
+        });
+        assert!(runner.pause_wait_model_unavailable(&err).await);
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 # Workflow: update_graph — 更新图谱
+# 步骤间用 output_key 显式穿线（引擎跨步骤只传 output_key 变量）。
 name = "update_graph"
 description = "图谱更新流水线：结构分析 → 图谱更新 → Reviewer 终审"
 max_rounds = 1
@@ -14,10 +15,11 @@ output_key = "structure"
 id = "update"
 description = "工程师更新图谱"
 speakers = ["programmer"]
-prompt = "基于上面的结构分析，给出「{{topic}}」的图谱更新内容：节点、边、标签，以及需要淘汰的旧条目。"
+output_key = "update"
+prompt = "基于下面的结构分析，给出「{{topic}}」的图谱更新内容：节点、边、标签，以及需要淘汰的旧条目。\n\n【结构分析】\n{{structure}}"
 
 [[steps]]
 id = "advisor_verdict"
 description = "Reviewer 终审图谱"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。检查上面的图谱更新是否完整、一致，按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。"
+prompt = "你现在是终审顾问。检查下面的图谱更新是否完整、一致（结构分析附后供核对），按裁决格式给出结论：裁决（✅/⚠️/❌）、理由、阻断问题（如有）、条件或建议（如有）。\n\n【图谱更新】\n{{update}}\n\n【结构分析】\n{{structure}}"

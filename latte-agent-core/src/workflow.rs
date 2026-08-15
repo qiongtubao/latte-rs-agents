@@ -509,9 +509,11 @@ pub fn load_workflow_by_command(cmd: &str, project_cwd: &Path) -> Result<Workflo
 // The engine behind the manager's `workflow` tool (see
 // `controller::register_workflow_tool`, now a thin wrapper over
 // [`run_workflow`]) and the UI server's workflow test-run endpoint.
-// Semantics: one persistent `AgentRunner` per speaker role, rounds ×
-// steps × speakers loop, `{{var}}` substitution (`topic` + step
-// `output_key`s), progress streamed as
+// Semantics: every step dispatch runs as a **fresh subagent** via
+// [`run_step_speaker`] — isolated context, own subsession log,
+// advisor gate + return review, mirroring the manager's `delegate`
+// tool; rounds × steps × speakers loop, `{{var}}` substitution
+// (`topic` + step `output_key`s), progress streamed as
 // WorkflowStarted/Step/Turn/Finished events on `event_tx`.
 
 /// Everything a workflow run needs from its host (controller tool
@@ -532,6 +534,24 @@ pub struct WorkflowRunContext {
     /// Nesting depth: 0 for a top-level run, +1 per nested workflow
     /// step. Guarded against [`MAX_WORKFLOW_DEPTH`] to stop cycles.
     pub depth: u8,
+    /// 有 Some 时每次 step 分派都为专家建 subsession（独立子会话
+    /// 日志，UI 右键「查看日志」可读）——与普通流程 delegate 一致。
+    /// None（独立测试 run / CLI REPL）时跳过，专家过程不可追溯。
+    pub subsession_store: Option<Arc<crate::subsession::SubsessionStore>>,
+    /// subsession_store 的落盘 key（UI session id）。空/None 时
+    /// subsession 退化到内存。与 store 配对使用。
+    pub session_id: Option<String>,
+    /// Advisor 产出门禁（D5/D6）+ 返回审查开关。Some 时专家 runner
+    /// 走 `run_turn_gated`，产出回写 vars 前过
+    /// `controller::gate_delegate_return` 审查——与普通流程 delegate
+    /// 一致。None 时等价裸 `run_turn`、不做返回审查。
+    pub advisor_gate: Option<crate::advisor_monitor::GateConfig>,
+    /// Advisor intervene 暂停门（v3）：monitor 判 Intervene 时置位，
+    /// workflow 的分派在派发前 wait、运行中的专家 runner 在
+    /// tool-round 边界 park——advisor 的「已暂停，等待用户拍板」对
+    /// workflow 真实生效（此前只对 watched role 的主 runner 生效，
+    /// workflow 照跑不误）。None（CLI/独立 run）跳过。
+    pub advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
 }
 
 /// Maximum nesting depth for workflow steps that invoke another
@@ -577,6 +597,10 @@ fn run_nested_workflow(
             cancel_flag: ctx.cancel_flag.clone(),
             agent_pause_gate: ctx.agent_pause_gate.clone(),
             depth: ctx.depth + 1,
+            subsession_store: ctx.subsession_store.clone(),
+            session_id: ctx.session_id.clone(),
+            advisor_gate: ctx.advisor_gate.clone(),
+            advisor_pause: ctx.advisor_pause.clone(),
         };
         run_workflow(&wf, &topic, &nested_ctx).await
     })
@@ -947,9 +971,13 @@ async fn run_workflow_inner(
 /// Build a fresh `AgentRunner` for one role, wired exactly like the
 /// chat/controller `build_runner`: tool-capable roles get the tool-use
 /// protocol prompt + ground-truth block, plan tool registered when
-/// allowed. Shared by the serial engine (one per role) and the DAG
-/// engine (one per step invocation). `advisor` is rejected (monitor
-/// only).
+/// allowed. Used by [`run_step_speaker`] (one fresh runner per
+/// dispatch). `advisor` is rejected (monitor only).
+///
+/// Returns the runner plus the role's **base** system prompt (before
+/// the tool-protocol / ground-truth appends) — the delegate-return
+/// review uses it as the role-responsibilities reference, mirroring
+/// the controller's delegate path.
 async fn build_role_runner(
     role_id: &str,
     merged: &Arc<AgentConfig>,
@@ -958,7 +986,7 @@ async fn build_role_runner(
     cwd: &Path,
     event_tx: &broadcast::Sender<ChatEvent>,
     agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
-) -> Result<AgentRunner, String> {
+) -> Result<(AgentRunner, String), String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
     }
@@ -976,6 +1004,9 @@ async fn build_role_runner(
         .resolve(default_params)
         .await
         .map_err(|e| format!("resolve role '{role_id}': {e}"))?;
+    // delegate-return 审查的"职责"参照：追加工具协议/ground truth
+    // 之前的角色本体 prompt（与 controller delegate 路径一致）。
+    let role_responsibilities = role.system_prompt.clone();
     // 与 chat 的 build_runner 一致：带工具的角色必须拿到工具调用协议
     // 提示 + 系统 ground truth（cwd 等），否则模型不知道该用工具，
     // 会回答"我没有文件访问权限"。
@@ -1011,6 +1042,23 @@ async fn build_role_runner(
             register_plan_tool(&rtm, event_tx.clone(), role_id.to_string(), plan_stage)
                 .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
         }
+        // ask / task_report：与 controller::build_runner 对齐——manager
+        // 在 workflow step 里也要能向用户抛选择题（ask 是其 prompt 指定
+        // 的唯一提问通道）和回报任务看板；缺失时模型调用得到
+        // Tool not found（jemalloc 日志实锤：manager 在 decide 步调
+        // ask 失败，选择框永远没弹出）。
+        if role.allowed_tools.iter().any(|t| t == "ask") {
+            crate::controller::register_ask_tool(&rtm, event_tx.clone(), role_id.to_string())
+                .map_err(|e| format!("register ask for '{role_id}': {e}"))?;
+        }
+        if role.allowed_tools.iter().any(|t| t == "task_report") {
+            crate::controller::register_task_report_tool(
+                &rtm,
+                event_tx.clone(),
+                role_id.to_string(),
+            )
+            .map_err(|e| format!("register task_report for '{role_id}': {e}"))?;
+        }
         // doc-graph 工具（scan/context/write/index）：与 controller::build_runner
         // 对齐，让带 doc_graph_* 工具的角色在 workflow 里也能维护图谱。
         {
@@ -1030,12 +1078,286 @@ async fn build_role_runner(
     if let Some(gate) = agent_pause_gate {
         r = r.with_agent_pause_gate(gate);
     }
-    Ok(r)
+    Ok((r, role_responsibilities))
 }
 
-/// Legacy serial engine: file-order steps, one persistent runner per
-/// role (conversation continuity across steps/rounds). Behavior is
-/// unchanged from before the DAG scheduler was introduced.
+/// 一次 step 分派的完整输入。每次分派 = 一个全新 subagent（与普通
+/// 流程 manager 的 `delegate` 工具一致）：新建 runner、独立
+/// subsession 日志、trace fan-out、advisor gate + 返回审查、
+/// 运行中可取消。字段均为 `Send + 'static` clone，DAG 引擎可直接
+/// move 进 spawned task。
+struct SpeakerDispatch {
+    speaker: String,
+    step_id: String,
+    prompt: String,
+    wf_id: String,
+    merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    default_params: GenerateParams,
+    cwd: PathBuf,
+    event_tx: broadcast::Sender<ChatEvent>,
+    cancel_flag: Arc<AtomicBool>,
+    agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
+    subsession_store: Option<Arc<crate::subsession::SubsessionStore>>,
+    session_id: Option<String>,
+    advisor_gate: Option<crate::advisor_monitor::GateConfig>,
+    review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
+    advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
+}
+
+impl SpeakerDispatch {
+    fn from_ctx(
+        ctx: &WorkflowRunContext,
+        review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
+        wf_id: &str,
+        step_id: &str,
+        speaker: String,
+        prompt: String,
+    ) -> Self {
+        Self {
+            speaker,
+            step_id: step_id.to_string(),
+            prompt,
+            wf_id: wf_id.to_string(),
+            merged: ctx.merged.clone(),
+            resolver: ctx.resolver.clone(),
+            default_params: ctx.default_params.clone(),
+            cwd: ctx.cwd.clone(),
+            event_tx: ctx.event_tx.clone(),
+            cancel_flag: ctx.cancel_flag.clone(),
+            agent_pause_gate: ctx.agent_pause_gate.clone(),
+            subsession_store: ctx.subsession_store.clone(),
+            session_id: ctx.session_id.clone(),
+            advisor_gate: ctx.advisor_gate.clone(),
+            review_engine,
+            advisor_pause: ctx.advisor_pause.clone(),
+        }
+    }
+}
+
+/// Run one dispatched speaker as a full subagent, mirroring the
+/// manager's `delegate` tool path (`controller::register_delegate_tool`):
+///
+/// 1. allocate a subsession (`DelegateStarted` with `sub_id`) so the
+///    specialist's full trace is viewable from the UI;
+/// 2. build a **fresh** runner (isolated context per dispatch) with a
+///    fan-out sink (subsession log + `ChatEventTraceSink` for the
+///    advisor monitor) and the advisor gate when enabled;
+/// 3. run gated in a spawned task, polling `cancel_flag` every 500 ms
+///    so a running dispatch can be aborted mid-turn;
+/// 4. on success pass the output through `gate_delegate_return`
+///    (advisor review) before handing it back to the engine.
+///
+/// The engines still own `WorkflowTurn` events and output-contract
+/// retries; this function owns the delegate-style events and the
+/// subsession lifecycle.
+async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
+    let speaker = inp.speaker.clone();
+    // Advisor intervene 暂停门：派发前先等用户拍板（此前 advisor 的
+    // 「已暂停」对 workflow 不生效，流水线照跑）。
+    if let Some(gate) = &inp.advisor_pause {
+        gate.wait_if_requested().await;
+    }
+    // 1. Subsession：与普通流程一致，主事件流只看到
+    //    DelegateStarted/Finished（摘要），专家完整 trace 落
+    //    subsession，UI 右键「查看日志」经 /api/subsessions 读取。
+    //    无 store/session_id（独立测试 run、CLI REPL）时退化为不发。
+    let (sub_id, sub_sink) = match (&inp.subsession_store, &inp.session_id) {
+        (Some(store), Some(sid)) => {
+            let (id, sink) = store.create(sid, &speaker);
+            (Some(id), Some(sink))
+        }
+        _ => (None, None),
+    };
+    if let Some(id) = &sub_id {
+        let _ = inp.event_tx.send(ChatEvent::DelegateStarted {
+            from_role: "workflow".into(),
+            to_role: speaker.clone(),
+            task: inp.prompt.clone(),
+            sub_id: id.clone(),
+        });
+    }
+
+    // 2. Fresh runner + sink + gate。
+    let (mut runner, role_responsibilities) = build_role_runner(
+        &speaker,
+        &inp.merged,
+        &inp.resolver,
+        &inp.default_params,
+        &inp.cwd,
+        &inp.event_tx,
+        inp.agent_pause_gate.clone(),
+    )
+    .await
+    .map_err(StepFail::Failed)?;
+    if let Some(sink) = &sub_sink {
+        // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
+        // 由此广播到 session channel，advisor monitor 的
+        // specialist-error 检测依赖它（与 delegate 路径一致）。
+        let specialist_sink: Arc<dyn crate::trace::TraceSink> =
+            Arc::new(crate::trace::FanOutSink::new(vec![
+                sink.clone(),
+                Arc::new(crate::controller::ChatEventTraceSink {
+                    event_tx: inp.event_tx.clone(),
+                }),
+            ]));
+        runner = runner.with_sink(specialist_sink);
+    }
+    if let Some(gate) = inp.advisor_gate.clone() {
+        runner = runner.with_gate_config(gate);
+    }
+    // intervene 暂停门也装到专家 runner：运行中判 Intervene 时在
+    // tool-round 边界 park，直到用户拍板（或超时自动恢复）。
+    if let Some(gate) = &inp.advisor_pause {
+        runner = runner.with_pause_gate(gate.clone());
+    }
+    let _ = inp.event_tx.send(ChatEvent::RoleStarted {
+        role_id: speaker.clone(),
+        detail: format!("workflow step '{}'", inp.step_id),
+    });
+
+    // 3. Spawn + 500ms 轮询 cancel：运行中的分派可中途 abort
+    //    （对齐 controller.rs delegate 的取消语义）。
+    let prompt = inp.prompt.clone();
+    let cancel = inp.cancel_flag.clone();
+    let mut run_handle = tokio::spawn(async move {
+        runner.run_turn_gated(&[Message::user(prompt)], None).await
+    });
+    let result: Result<String, StepFail>;
+    loop {
+        tokio::select! {
+            r = &mut run_handle => {
+                match r {
+                    // 剥 <think>：主 session 展示与后续 speaker 的
+                    // transcript 只保留正式回答；原文留在子会话 trace。
+                    Ok(Ok(response)) => {
+                        let stripped = crate::controller::strip_think_blocks(&response);
+                        // 空产出不算成功：判失败让引擎重试/失败，
+                        // 而不是把空串写进 vars 穿给下游。
+                        if crate::controller::is_empty_output(&stripped) {
+                            result = Err(StepFail::Failed(format!(
+                                "subagent '{speaker}' 返回了空内容"
+                            )));
+                        } else {
+                            result = Ok(stripped);
+                        }
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        // Gate 重试耗尽 → 被 advisor 终止：发
+                        // AdvisorTerminated（带 sub_id）让 UI 显示
+                        // 「已暂停」状态。
+                        if let crate::error::AgentError::AdvisorTerminated { reason, detector } = &e {
+                            let _ = inp.event_tx.send(ChatEvent::AdvisorTerminated {
+                                role_id: speaker.clone(),
+                                reason: reason.clone(),
+                                detector: Some(detector.clone()),
+                                sub_id: sub_id.clone(),
+                            });
+                        }
+                        result = Err(StepFail::Failed(format!("subagent failed: {e}")));
+                        break;
+                    }
+                    Err(e) => {
+                        result = Err(StepFail::Failed(format!("task join failed: {e}")));
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if cancel.load(Ordering::SeqCst) {
+                    run_handle.abort();
+                    let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                        role_id: speaker.clone(),
+                        detail: "cancelled by user".into(),
+                    });
+                    if let Some(id) = &sub_id {
+                        let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                            from_role: "workflow".into(),
+                            to_role: speaker.clone(),
+                            status: "cancelled".into(),
+                            summary: "workflow step cancelled by user".into(),
+                            sub_id: id.clone(),
+                        });
+                    }
+                    return Err(StepFail::Cancelled);
+                }
+            }
+        }
+    }
+
+    // 4. Delegate-return 审查：advisor 启用（gate Some ⇒ review_engine
+    //    Some）时产出先过 gate_delegate_return 再回写引擎。
+    let result = match (result, &inp.review_engine) {
+        (Ok(response), Some(engine)) => Ok(crate::controller::gate_delegate_return(
+            engine,
+            &inp.event_tx,
+            &speaker,
+            &role_responsibilities,
+            &inp.prompt,
+            response,
+        )
+        .await),
+        (other, _) => other,
+    };
+
+    // 5. 收尾事件（RoleTurn 由引擎的 WorkflowTurn 承担，不重复发）。
+    match &result {
+        Ok(response) => {
+            let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                role_id: speaker.clone(),
+                detail: format!("ok, {} chars", response.len()),
+            });
+            if let Some(id) = &sub_id {
+                let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                    from_role: "workflow".into(),
+                    to_role: speaker.clone(),
+                    status: "ok".into(),
+                    summary: response.clone(),
+                    sub_id: id.clone(),
+                });
+            }
+        }
+        Err(StepFail::Failed(msg)) => {
+            // 失败时 sub_sink 的 trace 在 TurnEnd 前断了——补写终结
+            // 事件，让子会话日志有明确结尾（同 delegate 路径）。
+            if let Some(sink) = &sub_sink {
+                sink.emit(crate::trace::TraceEvent::TurnEnd {
+                    meta: crate::trace::TraceMeta::now(
+                        0,
+                        &speaker,
+                        &inp.session_id.clone().unwrap_or_default(),
+                    ),
+                    total_input: 0,
+                    total_output: 0,
+                    total_thinking: 0,
+                    elapsed_ms: 0,
+                });
+            }
+            let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                role_id: speaker.clone(),
+                detail: format!("error: {msg}"),
+            });
+            if let Some(id) = &sub_id {
+                let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                    from_role: "workflow".into(),
+                    to_role: speaker.clone(),
+                    status: "failed".into(),
+                    summary: msg.clone(),
+                    sub_id: id.clone(),
+                });
+            }
+        }
+        // 取消分支已发齐事件。
+        Err(StepFail::Cancelled) => {}
+    }
+    result
+}
+
+/// Serial engine: file-order steps. Every step dispatch runs as a
+/// fresh subagent via [`run_step_speaker`] (no shared conversation
+/// state — same as the manager's `delegate`); data flows between
+/// steps only through `{{output_key}}` vars.
 async fn run_workflow_serial(
     wf: &WorkflowDef,
     topic: &str,
@@ -1044,26 +1366,15 @@ async fn run_workflow_serial(
     ckpt: &CheckpointLog,
     resume: Option<&CheckpointState>,
 ) -> WfOutcome {
-    // One runner per scheduled role; advisor is an internal monitor only.
-    let mut runners: HashMap<String, AgentRunner> = HashMap::new();
-    for role_id in wf.speaker_roles() {
-        match build_role_runner(
-            &role_id,
-            &ctx.merged,
-            &ctx.resolver,
-            &ctx.default_params,
-            &ctx.cwd,
-            &ctx.event_tx,
-            ctx.agent_pause_gate.clone(),
-        )
-        .await
-        {
-            Ok(runner) => {
-                runners.insert(role_id, runner);
-            }
-            Err(e) => return WfOutcome::Failed(e),
-        }
-    }
+    // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
+    // 一个，仿 controller 的 register_delegate_tool）。
+    let review_engine = ctx.advisor_gate.as_ref().map(|_| {
+        Arc::new(crate::advisor_monitor::AdvisorReviewEngine::new(
+            ctx.merged.clone(),
+            ctx.resolver.clone(),
+            ctx.default_params.clone(),
+        ))
+    });
 
     let mut vars: HashMap<String, String> = HashMap::new();
     vars.insert("topic".into(), topic.to_string());
@@ -1149,14 +1460,6 @@ async fn run_workflow_serial(
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
                     return WfOutcome::Cancelled;
                 }
-                let runner = match runners.get_mut(&speaker) {
-                    Some(r) => r,
-                    None => {
-                        return WfOutcome::Failed(format!(
-                            "role '{speaker}' not instantiated"
-                        ))
-                    }
-                };
                 let mut step_vars = vars.clone();
                 step_vars.insert("step_id".into(), step.id.clone());
                 step_vars.insert("speaker".into(), speaker.clone());
@@ -1169,19 +1472,30 @@ async fn run_workflow_serial(
                             format!("{base_prompt}\n\n【上轮审查反馈】\n{feedback}");
                     }
                 }
-                let mut prompt = if step_transcript.is_empty() {
+                let full_prompt = if step_transcript.is_empty() {
                     base_prompt
                 } else {
                     format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
                 };
-                // 产出契约重试：runner 跨 turn 有对话记忆，重试只需把
-                // 验收批注作为新的 user 消息发过去；批注同时写进
+                // 产出契约重试：每次分派都是全新 subagent（无跨分派
+                // 记忆），重试必须把验收批注拼回完整 prompt，保证模型
+                // 仍拿得到任务上下文（与 DAG 引擎一致）。批注同时写进
                 // step_transcript，让同 step 的后续 speaker 看到返工。
+                let mut prompt = full_prompt.clone();
                 let mut attempt: u32 = 0;
                 loop {
-                    let response = match runner.run_turn(&[Message::user(prompt.clone())], None).await {
+                    let dispatch = SpeakerDispatch::from_ctx(
+                        ctx,
+                        review_engine.clone(),
+                        wf_id,
+                        &step.id,
+                        speaker.clone(),
+                        prompt.clone(),
+                    );
+                    let response = match run_step_speaker(dispatch).await {
                         Ok(r) => r,
-                        Err(e) => {
+                        Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
+                        Err(StepFail::Failed(e)) => {
                             return WfOutcome::Failed(format!(
                                 "step '{}' speaker '{}': {e}",
                                 step.id, speaker
@@ -1207,18 +1521,17 @@ async fn run_workflow_serial(
                         let annotation =
                             format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
                         step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
-                        prompt = annotation;
+                        prompt = format!("{full_prompt}\n\n{annotation}");
                         continue;
                     }
                     // 契约合格的产出才发事件 / 进 transcript / last_output。
-                    // 事件里剥离 <think>（主 session 展示用）；
-                    // step_transcript / last_output 保留原文供后续
-                    // speaker 与最终总结使用。
+                    // （run_step_speaker 已剥离 <think>；step_transcript /
+                    // last_output 保留原文供后续 speaker 与最终总结使用。）
                     let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
                         wf_id: wf_id.to_string(),
                         step_id: step.id.clone(),
                         role_id: speaker.clone(),
-                        content: crate::controller::strip_think_blocks(&response),
+                        content: response.clone(),
                         round,
                     });
                     step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
@@ -1300,6 +1613,11 @@ struct DagStepInput {
     cancel_flag: Arc<AtomicBool>,
     agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
     depth: u8,
+    subsession_store: Option<Arc<crate::subsession::SubsessionStore>>,
+    session_id: Option<String>,
+    advisor_gate: Option<crate::advisor_monitor::GateConfig>,
+    review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
+    advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
 }
 
 /// Run one DAG step (all its speakers, serially) with a fresh runner
@@ -1340,6 +1658,10 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             cancel_flag: inp.cancel_flag.clone(),
             agent_pause_gate: inp.agent_pause_gate.clone(),
             depth: inp.depth,
+            subsession_store: inp.subsession_store.clone(),
+            session_id: inp.session_id.clone(),
+            advisor_gate: inp.advisor_gate.clone(),
+            advisor_pause: inp.advisor_pause.clone(),
         };
         let output = run_nested_workflow(nested_name.clone(), nested_topic, ctx)
             .await
@@ -1365,18 +1687,6 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
         if inp.cancel_flag.load(Ordering::SeqCst) {
             return Err(StepFail::Cancelled);
         }
-        let mut runner = build_role_runner(
-            &speaker,
-            &inp.merged,
-            &inp.resolver,
-            &inp.default_params,
-            &inp.cwd,
-            &inp.event_tx,
-            inp.agent_pause_gate.clone(),
-        )
-        .await
-        .map_err(StepFail::Failed)?;
-
         let mut step_vars = inp.vars.clone();
         step_vars.insert("step_id".into(), step.id.clone());
         step_vars.insert("speaker".into(), speaker.clone());
@@ -1386,18 +1696,39 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
         } else {
             format!("{base_prompt}\n\n--- Preceding discussion in this step ---\n{step_transcript}")
         };
-        // 产出契约重试：DAG 引擎的 runner 无跨 step 记忆（每 speaker
-        // 新建），批注必须拼回完整 prompt，保证模型仍拿得到任务上下文。
+        // 产出契约重试：每次分派都是全新 subagent（无跨分派记忆），
+        // 批注必须拼回完整 prompt，保证模型仍拿得到任务上下文。
         let mut prompt = full_prompt.clone();
         let mut attempt: u32 = 0;
         loop {
-            let response = match runner.run_turn(&[Message::user(prompt.clone())], None).await {
+            let dispatch = SpeakerDispatch {
+                speaker: speaker.clone(),
+                step_id: step.id.clone(),
+                prompt: prompt.clone(),
+                wf_id: inp.wf_id.clone(),
+                merged: inp.merged.clone(),
+                resolver: inp.resolver.clone(),
+                default_params: inp.default_params.clone(),
+                cwd: inp.cwd.clone(),
+                event_tx: inp.event_tx.clone(),
+                cancel_flag: inp.cancel_flag.clone(),
+                agent_pause_gate: inp.agent_pause_gate.clone(),
+                subsession_store: inp.subsession_store.clone(),
+                session_id: inp.session_id.clone(),
+                advisor_gate: inp.advisor_gate.clone(),
+                review_engine: inp.review_engine.clone(),
+                advisor_pause: inp.advisor_pause.clone(),
+            };
+            let response = match run_step_speaker(dispatch).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(StepFail::Failed(format!(
-                        "step '{}' speaker '{}': {e}",
-                        step.id, speaker
-                    )))
+                    return Err(match e {
+                        StepFail::Cancelled => StepFail::Cancelled,
+                        StepFail::Failed(msg) => StepFail::Failed(format!(
+                            "step '{}' speaker '{}': {msg}",
+                            step.id, speaker
+                        )),
+                    })
                 }
             };
             if let Err(reason) = check_output_contract(&step.output_contract, &response) {
@@ -1427,7 +1758,7 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
                 wf_id: inp.wf_id.clone(),
                 step_id: step.id.clone(),
                 role_id: speaker.clone(),
-                content: crate::controller::strip_think_blocks(&response),
+                content: response.clone(),
                 round: inp.round,
             });
             step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
@@ -1461,6 +1792,15 @@ async fn run_workflow_dag(
     let wf_arc = Arc::new(wf.clone());
     let total = wf.steps.len();
     let sem = Arc::new(Semaphore::new(workflow_concurrency()));
+    // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
+    // 一个，仿 controller 的 register_delegate_tool）。
+    let review_engine = ctx.advisor_gate.as_ref().map(|_| {
+        Arc::new(crate::advisor_monitor::AdvisorReviewEngine::new(
+            ctx.merged.clone(),
+            ctx.resolver.clone(),
+            ctx.default_params.clone(),
+        ))
+    });
 
     let mut vars: HashMap<String, String> = HashMap::new();
     vars.insert("topic".into(), topic.to_string());
@@ -1505,6 +1845,11 @@ async fn run_workflow_dag(
                     cancel_flag: ctx.cancel_flag.clone(),
                     agent_pause_gate: ctx.agent_pause_gate.clone(),
                     depth: ctx.depth,
+                    subsession_store: ctx.subsession_store.clone(),
+                    session_id: ctx.session_id.clone(),
+                    advisor_gate: ctx.advisor_gate.clone(),
+                    review_engine: review_engine.clone(),
+                    advisor_pause: ctx.advisor_pause.clone(),
                 };
                 let sem = sem.clone();
                 set.spawn(async move {
@@ -2326,6 +2671,10 @@ mod contract_engine_tests {
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 agent_pause_gate: None, depth: 0,
+                subsession_store: None,
+                session_id: None,
+                advisor_gate: None,
+                advisor_pause: None,
             },
             event_rx,
         )
@@ -2420,6 +2769,68 @@ forbid = ["TBD"]
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "首发 + max_retries=1 次重试: {}", requests.len());
         assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
+    }
+
+    /// 分派 = 完整 subagent（与普通流程 delegate 一致）：ctx 带
+    /// subsession_store + session_id 时，每个 step 分派建独立
+    /// subsession，并发 DelegateStarted/Finished（带 sub_id）；
+    /// subsession 里有真实 trace（UI 右键「查看日志」的数据源）。
+    #[tokio::test]
+    async fn dispatch_creates_subsession_and_delegate_events() {
+        let server = wiremock::MockServer::start().await;
+        let good = "这是一份足够详实的产出，覆盖方案概述、工作分解与风险分析。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(good)))
+            .mount(&server)
+            .await;
+
+        let (mut ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        let store = Arc::new(crate::subsession::SubsessionStore::new());
+        ctx.subsession_store = Some(store.clone());
+        ctx.session_id = Some("test-session".into());
+
+        // 两步串行 workflow → 两次分派 → 两个独立 subsession。
+        let raw = r#"
+name = "sub_demo"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务A：{{topic}}"
+output_key = "out_a"
+[[steps]]
+id = "b"
+role = "worker"
+task = "任务B：{{out_a}}"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        run_workflow(&wf, "主题", &ctx).await.expect("两步都应成功");
+
+        let mut started = 0;
+        let mut finished_ok = 0;
+        let mut sub_ids = std::collections::HashSet::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ChatEvent::DelegateStarted { from_role, sub_id, .. } => {
+                    assert_eq!(from_role, "workflow");
+                    started += 1;
+                    sub_ids.insert(sub_id);
+                }
+                ChatEvent::DelegateFinished { status, .. } if status == "ok" => {
+                    finished_ok += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(started, 2, "两次分派各发一次 DelegateStarted");
+        assert_eq!(finished_ok, 2, "两次分派各发一次 DelegateFinished(ok)");
+        assert_eq!(sub_ids.len(), 2, "每次分派都是独立 subsession");
+        for id in &sub_ids {
+            let events = store
+                .snapshot_any(id)
+                .unwrap_or_else(|| panic!("subsession {id} 应有 trace"));
+            assert!(!events.is_empty(), "subsession {id} 的 trace 不应为空");
+        }
     }
 
     /// P0-2：workflow 运行时若 session gate 已 paused，role runner 应
@@ -2542,6 +2953,10 @@ mod resume_tests {
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 agent_pause_gate: None, depth: 0,
+                subsession_store: None,
+                session_id: None,
+                advisor_gate: None,
+                advisor_pause: None,
             },
             event_rx,
         )
@@ -2924,6 +3339,10 @@ mod loop_tests {
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 agent_pause_gate: None, depth: 0,
+                subsession_store: None,
+                session_id: None,
+                advisor_gate: None,
+                advisor_pause: None,
             },
             event_rx,
         )

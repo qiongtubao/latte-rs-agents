@@ -47,6 +47,9 @@ const ROLE_ICONS: Record<string, string> = {
   reviewer_sanity: "🔍", reviewer_architecture: "📐", reviewer_security: "🔒",
   tester: "🧪", security: "🛡️", devops: "⚙️", designer: "🎨",
   tech_writer: "📝", pm: "📋",
+  // workflow 不是角色（是固定流水线发起方）：不给角色头像，只用图标
+  // 标记分派来源。
+  workflow: "🔀",
 };
 
 function roleIcon(roleId: string): string {
@@ -1732,21 +1735,35 @@ const stepMsgIds = new Map<string, string>();
       case "RoundEnded": addMessage({ kind: "system", content: `[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
       case "DelegateStarted": {
         const taskText = e.task.trim() || "(empty)";
-        const delegateMsg = addMessage({
-          kind: "role",
-          content: `@${e.to_role} ${taskText}`,
-          meta: e.from_role || "manager",
-          icon: roleIcon(e.from_role || "manager"),
-          subId: e.sub_id,
-          filePath: getFilePath(e.to_role),
-        });
+        // workflow 发起的分派：workflow 是固定流水线、不是角色，
+        // 不渲染角色头像——用无头像的 status 行（🔀 标记来源）。
+        const fromWorkflow = (e.from_role || "") === "workflow";
+        const delegateMsg = fromWorkflow
+          ? addMessage({
+              kind: "status",
+              content: `@${e.to_role} ${taskText}`,
+              meta: "workflow 分派",
+              icon: roleIcon("workflow"),
+              subId: e.sub_id,
+            })
+          : addMessage({
+              kind: "role",
+              content: `@${e.to_role} ${taskText}`,
+              meta: e.from_role || "manager",
+              icon: roleIcon(e.from_role || "manager"),
+              subId: e.sub_id,
+              filePath: getFilePath(e.to_role),
+            });
         const msgId = delegateMsg.dataset.messageId || "";
         // Pending-state badge on the delegate bubble — flipped to
         // ✅/❌ by DelegateFinished, or to a timeout error by the watchdog.
         const stateEl = document.createElement("span");
         stateEl.className = "delegate-state pending";
         stateEl.textContent = "⏳ 执行中…";
-        delegateMsg.querySelector(".msg-bubble")?.appendChild(stateEl);
+        // status 行没有 .msg-bubble，徽章挂到内层 .message 上。
+        const badgeHost = delegateMsg.querySelector(".msg-bubble")
+          ?? delegateMsg.querySelector(".message");
+        badgeHost?.appendChild(stateEl);
         activeDelegates.set(e.sub_id, {
           targetRole: e.to_role,
           taskText,

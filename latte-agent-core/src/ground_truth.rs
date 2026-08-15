@@ -59,6 +59,11 @@ architecture, etc. — the answer is right above in `<system_environment>`.
 Read it directly; don't delegate to a specialist, don't run any tool,
 don't reason from training data. The fields are guaranteed to match
 the runtime that is actually serving this conversation.
+
+`.latte/` 是 latte 系统的运行时内部目录（会话日志 ui-sessions/、
+workflow 断点 workflow-runs/、任务看板数据 tasks/ 等）。不要用任何
+工具（read/search/bash grep/find）去读或扫它——那里有系统自己的
+日志，扫它只会把无关内容灌进上下文；除非用户明确要求排查系统本身。
 "#
     )
 }
