@@ -12,17 +12,25 @@ prompt = "描述这个需求和目标：{{topic}}。我们要解决什么样的�
 [[steps]]
 id = "brainstorm"
 speakers = ["architect", "programmer", "designer"]
-prompt = "头脑风暴各种方案。Architect：系统设计选项。Programmer：实现层面的实际考量。Designer：UX 影响。在彼此想法的基础上推进。"
+prompt = """主题：{{topic}}
+
+头脑风暴各种方案。Architect：系统设计选项。Programmer：实现层面的实际考量。Designer：UX 影响。在彼此想法的基础上推进。"""
 [[steps]]
 id = "evaluate"
 speakers = ["reviewer", "security", "devops"]
-prompt = "评估提出的方案。考虑：可维护性、安全性和运维成本。"
+prompt = """主题：{{topic}}
+
+评估上面 brainstorm 提出的方案。考虑：可维护性、安全性和运维成本。"""
 [[steps]]
 id = "synthesize"
 speakers = ["architect", "pm"]
-prompt = "把讨论综合成一个推荐方案，权衡取舍有据可查。"
+prompt = """主题：{{topic}}
+
+把上面的讨论综合成一个推荐方案，权衡取舍有据可查。"""
 [[steps]]
 id = "advisor_verdict"
 description = "Reviewer reviews all outputs and gives the final verdict"
 speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"
+prompt = """主题：{{topic}}
+
+你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"""
