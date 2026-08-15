@@ -1179,7 +1179,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
     }
 
     // 2. Fresh runner + sink + gate。
-    let (mut runner, role_responsibilities) = build_role_runner(
+    let (mut runner, role_responsibilities) = match build_role_runner(
         &speaker,
         &inp.merged,
         &inp.resolver,
@@ -1189,7 +1189,23 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         inp.agent_pause_gate.clone(),
     )
     .await
-    .map_err(StepFail::Failed)?;
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // 构建失败也要补 DelegateFinished——否则 UI 上的分派
+            // 气泡永远停在「⏳ 执行中…」。
+            if let Some(id) = &sub_id {
+                let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                    from_role: "workflow".into(),
+                    to_role: speaker.clone(),
+                    status: "failed".into(),
+                    summary: e.clone(),
+                    sub_id: id.clone(),
+                });
+            }
+            return Err(StepFail::Failed(e));
+        }
+    };
     if let Some(sink) = &sub_sink {
         // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
         // 由此广播到 session channel，advisor monitor 的

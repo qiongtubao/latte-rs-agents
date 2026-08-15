@@ -3387,25 +3387,10 @@ async fn register_delegate_tool(
                 return Err(tool_err(msg));
             }
 
-            // 2. Allocate a subsession so the specialist's full event
-            //    log is captured. The main chat SSE stream sees only
-            //    DelegateStarted/Finished (the summary); the UI can
-            //    right-click on those events and fetch the
-            //    transcript via /api/sessions/.../subsessions/{sub_id}.
-            let (sub_id, sub_sink) =
-                subsession_store.create(session_id.as_str(), &role_id);
-            let _ = event_tx.send(ChatEvent::DelegateStarted {
-                from_role: "manager".into(),
-                to_role: role_id.clone(),
-                task: task.clone(),
-                sub_id: sub_id.clone(),
-            });
-            // Fan out ONLY to the subsession memory sink: the
-            // `sub_sink` is `Arc<dyn TraceSink>` returning from
-            // `SubsessionStore::create` —— 内部已 fanout 到
-            // MemorySink（实时读源）+ DiskSink（落盘备份，主
-            // session 删除时联删）。这里**不要**再包一层
-            // FanoutSink，否则事件会被写两份到内存。
+            // 先解析角色与模型链，成功后再分配 subsession / 发
+            // DelegateStarted——这些 `?` 失败路径若发生在
+            // DelegateStarted 之后，会留下永远「⏳ 执行中…」的分派
+            // 气泡（没有配对的 DelegateFinished）。
             let template = merged
                 .roles
                 .get(&role_id)
@@ -3426,6 +3411,26 @@ async fn register_delegate_tool(
                 .map_err(|e| {
                     tool_err(format!("no model for role '{}': {}", role_id, e))
                 })?;
+
+            // 2. Allocate a subsession so the specialist's full event
+            //    log is captured. The main chat SSE stream sees only
+            //    DelegateStarted/Finished (the summary); the UI can
+            //    right-click on those events and fetch the
+            //    transcript via /api/sessions/.../subsessions/{sub_id}.
+            let (sub_id, sub_sink) =
+                subsession_store.create(session_id.as_str(), &role_id);
+            let _ = event_tx.send(ChatEvent::DelegateStarted {
+                from_role: "manager".into(),
+                to_role: role_id.clone(),
+                task: task.clone(),
+                sub_id: sub_id.clone(),
+            });
+            // Fan out ONLY to the subsession memory sink: the
+            // `sub_sink` is `Arc<dyn TraceSink>` returning from
+            // `SubsessionStore::create` —— 内部已 fanout 到
+            // MemorySink（实时读源）+ DiskSink（落盘备份，主
+            // session 删除时联删）。这里**不要**再包一层
+            // FanoutSink，否则事件会被写两份到内存。
 
             // 4. Build the specialist runner. We give it a tool
             //    manager iff the role's `allowed_tools` is non-empty;
