@@ -175,6 +175,7 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 loop_back_to: None,
                 max_iterations: None,
                 workflow: None,
+                output_from: None,
                 output_contract: Default::default(),
             })
             .collect(),

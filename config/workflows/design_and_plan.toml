@@ -25,6 +25,10 @@ description = "嵌套 design_brainstorm：基于探索结论做设计脑暴"
 workflow = "design_brainstorm"
 depends_on = ["explore"]
 task = "{{topic}}\n\n背景探索结论：\n{{exploration}}"
+# 子 workflow 最后一步是 advisor_verdict（评审裁决），父级要的是
+# synthesize 的方案本体 —— 否则下游拿到的是「裁决：✅ 通过…」评审
+# 文本而不是方案（jemalloc 现场实锤：plan/评审步骤全被喂了 verdict）。
+output_from = "proposal"
 output_key = "design"
 
 [[steps]]

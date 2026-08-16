@@ -157,6 +157,14 @@ pub struct WorkflowStepDef {
     /// capped at [`MAX_WORKFLOW_DEPTH`] to prevent cycles.
     #[serde(default)]
     pub workflow: Option<String>,
+    /// 嵌套 workflow step 专用：默认把子 workflow 的**最后一步输出**
+    /// 绑到本 step 的 `output_key`；子 workflow 末尾常是评审/裁决步骤
+    /// （如 design_brainstorm 的 advisor_verdict），父级真正想要的往往
+    /// 是中间产物（如 proposal）。设置后改取子 workflow 中该
+    /// `output_key` 对应的 step 产出。仅对嵌套 step 有效——见
+    /// [`WorkflowDef::validate`]。
+    #[serde(default)]
+    pub output_from: Option<String>,
 }
 
 impl WorkflowStepDef {
@@ -237,6 +245,20 @@ impl WorkflowDef {
                 if step.loop_until.is_some() {
                     return Err(format!(
                         "step '{}': `loop_until` 与嵌套 workflow 互斥（嵌套 step 不参与循环）",
+                        step.id
+                    ));
+                }
+            }
+            if step.output_from.is_some() && step.workflow.is_none() {
+                return Err(format!(
+                    "step '{}': `output_from` 仅对嵌套 workflow step 有效（该 step 没有 workflow 字段）",
+                    step.id
+                ));
+            }
+            if let Some(of) = &step.output_from {
+                if of.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': output_from must not be empty",
                         step.id
                     ));
                 }
@@ -573,6 +595,7 @@ fn run_nested_workflow(
     name: String,
     topic: String,
     ctx: WorkflowRunContext,
+    output_from: Option<String>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
     Box::pin(async move {
         if ctx.depth >= MAX_WORKFLOW_DEPTH {
@@ -602,14 +625,28 @@ fn run_nested_workflow(
             advisor_gate: ctx.advisor_gate.clone(),
             advisor_pause: ctx.advisor_pause.clone(),
         };
-        run_workflow(&wf, &topic, &nested_ctx).await
+        let (last, keyed) = run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
+        // output_from：取子 workflow 指定 output_key 的产出（如
+        // proposal），而非默认的最后一步输出（常是评审 verdict）。
+        match output_from {
+            Some(key) => keyed.get(&key).cloned().ok_or_else(|| {
+                let available = keyed.keys().cloned().collect::<Vec<_>>().join(", ");
+                format!(
+                    "nested workflow '{name}' 没有 output_key '{key}' 的产出（可用：{available}）"
+                )
+            }),
+            None => Ok(last),
+        }
     })
 }
 
 /// Internal outcome of a workflow engine (serial or DAG), before the
 /// `WorkflowFinished` event is emitted by [`run_workflow`].
 enum WfOutcome {
-    Ok(String),
+    /// (最后一步输出, output_key → 各 step 产出)。后者供嵌套 step 的
+    /// `output_from` 取子 workflow 的中间产物（如 proposal 而非末尾
+    /// 的评审 verdict）。
+    Ok(String, std::collections::HashMap<String, String>),
     Cancelled,
     Failed(String),
 }
@@ -822,7 +859,9 @@ pub async fn run_workflow(
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, None).await
+    run_workflow_inner(wf, topic, ctx, None)
+        .await
+        .map(|(out, _)| out)
 }
 
 /// Resume a previously interrupted workflow run from its checkpoint
@@ -841,15 +880,19 @@ pub async fn run_workflow_resume(
     ctx: &WorkflowRunContext,
     resume_wf_id: &str,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id)).await
+    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id))
+        .await
+        .map(|(out, _)| out)
 }
 
+/// 返回值：(最终输出, output_key → 各 step 产出)。后者供嵌套 step 的
+/// `output_from` 选取子 workflow 的中间产物。
 async fn run_workflow_inner(
     wf: &WorkflowDef,
     topic: &str,
     ctx: &WorkflowRunContext,
     resume_wf_id: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, std::collections::HashMap<String, String>), String> {
     wf.validate()?;
     let uses_dag = wf.uses_dependency_dag();
     if uses_dag {
@@ -930,14 +973,14 @@ async fn run_workflow_inner(
     };
 
     match outcome {
-        WfOutcome::Ok(last_output) => {
+        WfOutcome::Ok(last_output, keyed_outputs) => {
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
                 name,
                 wf_id,
                 status: "ok".into(),
                 summary: last_output.clone(),
             });
-            Ok(last_output)
+            Ok((last_output, keyed_outputs))
         }
         WfOutcome::Cancelled => {
             let summary = "workflow cancelled by user".to_string();
@@ -1424,6 +1467,8 @@ async fn run_workflow_serial(
     vars.insert("topic".into(), topic.to_string());
     let total = wf.steps.len();
     let mut last_output = String::new();
+    // output_key → 产出（原始文本），供嵌套调用方的 output_from 选取。
+    let mut keyed: HashMap<String, String> = HashMap::new();
     // 断点续跑：已完成 step 的产出直接注入 vars，step 本体跳过
     // （不重跑、不重发 WorkflowStep/Turn 事件）。
     let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1432,6 +1477,7 @@ async fn run_workflow_serial(
             done_steps.insert(step_id.as_str());
             if let Some(key) = output_key {
                 vars.insert(key.clone(), crate::controller::strip_review_annotation(output));
+                keyed.insert(key.clone(), output.clone());
             }
             last_output = output.clone();
         }
@@ -1475,7 +1521,14 @@ async fn run_workflow_serial(
                 } else {
                     wf.render_task(step, &step_vars)
                 };
-                match run_nested_workflow(nested_name.clone(), nested_topic, ctx.clone()).await {
+                match run_nested_workflow(
+                    nested_name.clone(),
+                    nested_topic,
+                    ctx.clone(),
+                    step.output_from.clone(),
+                )
+                .await
+                {
                     Ok(output) => {
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
                             wf_id: wf_id.to_string(),
@@ -1496,6 +1549,7 @@ async fn run_workflow_serial(
                 if let Some(key) = &step.output_key {
                     // 监察批注不进 vars（同主路径）。
                     vars.insert(key.clone(), crate::controller::strip_review_annotation(&last_output));
+                    keyed.insert(key.clone(), last_output.clone());
                 }
                 ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
                 idx += 1;
@@ -1588,6 +1642,7 @@ async fn run_workflow_serial(
                 // 监察批注（⚠️ [监察审查]…）不进 vars：它给人看，
                 // 穿给下游 step / 嵌套 workflow 是污染。
                 vars.insert(key.clone(), crate::controller::strip_review_annotation(&last_output));
+                keyed.insert(key.clone(), last_output.clone());
             }
             ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
             // 跨 step 循环：产出不含 loop_until 子串 → 跳回 loop_back_to
@@ -1631,7 +1686,7 @@ async fn run_workflow_serial(
         }
     }
 
-    WfOutcome::Ok(last_output)
+    WfOutcome::Ok(last_output, keyed)
 }
 
 /// One step failure signal from a spawned DAG task.
@@ -1710,14 +1765,19 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             advisor_gate: inp.advisor_gate.clone(),
             advisor_pause: inp.advisor_pause.clone(),
         };
-        let output = run_nested_workflow(nested_name.clone(), nested_topic, ctx)
-            .await
-            .map_err(|e| {
-                StepFail::Failed(format!(
-                    "step '{}' nested workflow '{nested_name}': {e}",
-                    step.id
-                ))
-            })?;
+        let output = run_nested_workflow(
+            nested_name.clone(),
+            nested_topic,
+            ctx,
+            step.output_from.clone(),
+        )
+        .await
+        .map_err(|e| {
+            StepFail::Failed(format!(
+                "step '{}' nested workflow '{nested_name}': {e}",
+                step.id
+            ))
+        })?;
         let _ = inp.event_tx.send(ChatEvent::WorkflowTurn {
             wf_id: inp.wf_id.clone(),
             step_id: step.id.clone(),
@@ -1862,6 +1922,8 @@ async fn run_workflow_dag(
     vars.insert("topic".into(), topic.to_string());
     // step_id -> last_output, used to resolve the final return value.
     let mut outputs: HashMap<String, String> = HashMap::new();
+    // output_key → 产出（原始文本），供嵌套调用方的 output_from 选取。
+    let mut keyed: HashMap<String, String> = HashMap::new();
     // 断点续跑：已完成 step 预填 outputs/vars（视为依赖已满足），
     // wave 调度时跳过，不再 spawn。
     let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1871,6 +1933,7 @@ async fn run_workflow_dag(
             outputs.insert(step_id.clone(), output.clone());
             if let Some(key) = output_key {
                 vars.insert(key.clone(), crate::controller::strip_review_annotation(output));
+                keyed.insert(key.clone(), output.clone());
             }
         }
     }
@@ -1949,7 +2012,8 @@ async fn run_workflow_dag(
             for (output_key, out) in wave_updates {
                 if let Some(key) = output_key {
                     // 监察批注不进 vars（同串行引擎）。
-                    vars.insert(key, crate::controller::strip_review_annotation(&out));
+                    vars.insert(key.clone(), crate::controller::strip_review_annotation(&out));
+                    keyed.insert(key, out);
                 }
             }
         }
@@ -1963,7 +2027,7 @@ async fn run_workflow_dag(
         .and_then(|s| outputs.get(&s.id))
         .cloned()
         .unwrap_or_default();
-    WfOutcome::Ok(final_out)
+    WfOutcome::Ok(final_out, keyed)
 }
 
 #[cfg(test)]
@@ -3337,6 +3401,148 @@ depends_on = ["b"]
             "got: {err}"
         );
     }
+
+    /// output_from 端到端：子 workflow 末步是评审 verdict，父级用
+    /// output_from 取中间 step（synthesize，output_key=proposal）的
+    /// 方案本体。回归 jemalloc 现场：design_and_plan 的 {{design}}
+    /// 被绑成 advisor_verdict 的裁决文本，下游 plan/评审全部跑偏。
+    #[tokio::test]
+    async fn nested_output_from_selects_intermediate_output() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出方案"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "方案本体：先做 X 再做 Y",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("终审"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: PASS 裁决文本",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("下游产出")))
+            .mount(&server)
+            .await;
+
+        // 内层 workflow 落盘到临时项目的 .latte/workflows.d/。
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner.toml"),
+            r#"
+name = "inner"
+[[steps]]
+id = "synthesize"
+role = "worker"
+task = "产出方案 {{topic}}"
+output_key = "proposal"
+[[steps]]
+id = "verdict"
+role = "worker"
+task = "终审 {{proposal}}"
+output_key = "verdict"
+"#,
+        )
+        .unwrap();
+
+        let outer: WorkflowDef = toml::from_str(
+            r#"
+name = "outer"
+[[steps]]
+id = "brainstorm"
+workflow = "inner"
+task = "主题"
+output_from = "proposal"
+output_key = "design"
+[[steps]]
+id = "downstream"
+role = "worker"
+task = "下游消费：{{design}}"
+output_key = "final"
+"#,
+        )
+        .unwrap();
+        outer.validate().unwrap();
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let out = run_workflow(&outer, "主题", &ctx).await.expect("应成功");
+        assert_eq!(out, "下游产出");
+
+        let requests = server.received_requests().await.unwrap();
+        let downstream: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .filter(|b| b.contains("下游消费"))
+            .collect();
+        assert_eq!(downstream.len(), 1);
+        assert!(
+            downstream[0].contains("方案本体：先做 X 再做 Y"),
+            "{{design}} 必须是 proposal 而非 verdict: {}",
+            downstream[0]
+        );
+        assert!(
+            !downstream[0].contains("VERDICT: PASS 裁决文本"),
+            "{{design}} 不得是末步 verdict: {}",
+            downstream[0]
+        );
+    }
+
+    /// output_from 指向子 workflow 不存在的 output_key → 步骤失败，
+    /// 错误列出可用的 key。
+    #[tokio::test]
+    async fn nested_output_from_unknown_key_errors() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("产出")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner.toml"),
+            r#"
+name = "inner"
+[[steps]]
+id = "only"
+role = "worker"
+task = "干活 {{topic}}"
+output_key = "result"
+"#,
+        )
+        .unwrap();
+
+        let outer: WorkflowDef = toml::from_str(
+            r#"
+name = "outer"
+[[steps]]
+id = "sub"
+workflow = "inner"
+task = "主题"
+output_from = "ghost"
+output_key = "design"
+"#,
+        )
+        .unwrap();
+        outer.validate().unwrap();
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&outer, "主题", &ctx)
+            .await
+            .expect_err("ghost key 必须失败");
+        assert!(err.contains("ghost"), "got: {err}");
+        assert!(err.contains("result"), "错误应列出可用 key: {err}");
+    }
 }
 
 #[cfg(test)]
@@ -3659,5 +3865,31 @@ loop_until = "VERDICT: PASS"
         assert_eq!(spec.loop_until.as_deref(), Some("VERDICT: PASS"));
         assert_eq!(spec.loop_back_to.as_deref(), Some("implement"));
         assert_eq!(spec.max_iterations, Some(3));
+    }
+
+    /// validate：output_from 仅对嵌套 step 有效；空串拒绝。
+    #[test]
+    fn validate_output_from_requires_nested_workflow() {
+        let not_nested = r#"
+name = "bad_of"
+[[steps]]
+id = "a"
+role = "worker"
+task = "干活"
+output_from = "proposal"
+"#;
+        let wf: WorkflowDef = toml::from_str(not_nested).unwrap();
+        let err = wf.validate().expect_err("非嵌套 step 带 output_from 必须报错");
+        assert!(err.contains("output_from"), "got: {err}");
+
+        let empty = r#"
+name = "bad_of2"
+[[steps]]
+id = "sub"
+workflow = "inner"
+output_from = "  "
+"#;
+        let wf: WorkflowDef = toml::from_str(empty).unwrap();
+        assert!(wf.validate().is_err(), "空 output_from 必须报错");
     }
 }
