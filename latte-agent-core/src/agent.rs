@@ -1650,7 +1650,7 @@ impl AgentRunner {
                                 });
                             }
                         }
-                        Some(StreamEvent::Done { content, tool_calls, usage }) => {
+                        Some(StreamEvent::Done { content, tool_calls, usage, stop_reason }) => {
                             let text = content.iter()
                                 .filter_map(|p| match p {
                                     ContentPart::Text { text } => Some(text.as_str()),
@@ -1662,12 +1662,15 @@ impl AgentRunner {
                                 content: text,
                                 content_parts: content,
                                 tool_calls,
-                                stop_reason: "stop".into(),
+                                stop_reason: if stop_reason.is_empty() { "stop".into() } else { stop_reason },
                                 usage,
                             };
                         }
                         Some(StreamEvent::Error(e)) => {
                             return Err(AgentError::from(AiError::Stream(e)));
+                        }
+                        Some(StreamEvent::HttpError { status, message }) => {
+                            return Err(AgentError::from(AiError::Api { status, message }));
                         }
                         None => {
                             return Err(AgentError::from(AiError::Stream(
@@ -2463,6 +2466,7 @@ fn build_tool_schemas(
             description: Some(td.description.clone()),
             parameters: serde_json::to_value(&td.input_schema)
                 .unwrap_or(serde_json::json!({})),
+            strict: None,
         })
         .collect()
 }
@@ -2585,6 +2589,7 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
+            timeout_secs: None,
         }
     }
 
@@ -2917,6 +2922,7 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
+            timeout_secs: None,
         }
     }
 
