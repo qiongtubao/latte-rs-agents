@@ -2376,7 +2376,21 @@ async fn build_runner(
         }
         chain
     } else {
-        resolver.resolve_chain(&role.id, tier, &role.model_chain)?
+        // 角色模型指派优先取 resolver 最新快照：角色编辑器保存后，
+        // 旧 session 重建 runner（SwitchRole 等）也能用上新指派——
+        // merged 是 session 创建时的固化快照，可能已过时。
+        let (chain_ids, tier) = match resolver.role_model_assignment(&role.id) {
+            Some((chain, t)) => (
+                if chain.is_empty() {
+                    role.model_chain.clone()
+                } else {
+                    chain
+                },
+                t.unwrap_or(tier),
+            ),
+            None => (role.model_chain.clone(), tier),
+        };
+        resolver.resolve_chain(&role.id, tier, &chain_ids)?
     };
     if models.is_empty() {
         return Err(AgentError::ModelsUnavailable {
@@ -3417,9 +3431,21 @@ async fn register_delegate_tool(
             let role = template.resolve(&default_params).await.map_err(|e| {
                 tool_err(format!("failed to resolve role '{}': {}", role_id, e))
             })?;
-            let tier = role.default_model_tier;
+            // 角色模型指派优先取 resolver 最新快照：角色编辑器保存后
+            // 新分派立即生效（merged 是 session 创建时的固化快照）。
+            let (chain_ids, tier) = match resolver.role_model_assignment(&role.id) {
+                Some((chain, t)) => (
+                    if chain.is_empty() {
+                        role.model_chain.clone()
+                    } else {
+                        chain
+                    },
+                    t.unwrap_or(role.default_model_tier),
+                ),
+                None => (role.model_chain.clone(), role.default_model_tier),
+            };
             let models = resolver
-                .resolve_chain(&role.id, tier, &role.model_chain)
+                .resolve_chain(&role.id, tier, &chain_ids)
                 .map_err(|e| {
                     tool_err(format!("no model for role '{}': {}", role_id, e))
                 })?;

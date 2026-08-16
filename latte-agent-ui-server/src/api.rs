@@ -744,6 +744,9 @@ fn reload_roles_from_disk_with(b: &UiBackend, global_dir: &Path) {
         return;
     }
     b.merged.write().roles = roles;
+    // 磁盘上的角色编辑（外部改文件）同样触发热替换，运行中的
+    // session / workflow 分派用上新模型指派。
+    hot_reload_resolver(b);
 }
 
 pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiError> {
@@ -1001,6 +1004,9 @@ pub fn save_role_config(
             }
         }
     };
+    // 角色模型指派（model_chain/model_tier）热生效：已加载 session
+    // 的 runner 在下一个 turn 边界 / 暂停恢复重试时自动换链。
+    hot_reload_resolver(b);
     Ok(entry)
 }
 
@@ -1054,6 +1060,7 @@ pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<Role
         let mut cfg = b.merged.write();
         cfg.roles.insert(role_id.to_string(), tpl.clone());
     }
+    hot_reload_resolver(b);
     Ok(role_config_entry(b, &tpl))
 }
 
@@ -1082,6 +1089,7 @@ pub fn delete_role(b: &UiBackend, role_id: &str) -> Result<(), ApiError> {
         let mut cfg = b.merged.write();
         cfg.roles.remove(role_id);
     }
+    hot_reload_resolver(b);
     Ok(())
 }
 
@@ -2593,11 +2601,12 @@ fn source_label(s: crate::models::ModelSource) -> &'static str {
 
 /// `PATCH /api/models/:key` —— **部分更新**一个已存在的 model：以 catalog
 /// 里的现值为基准，只覆盖补丁里显式给出的字段，再写回磁盘（项目目录
-/// 模型配置变更（create/update/delete/put_toml）落盘并更新 `merged`
-/// 后调用：把新配置热替换进共享 `ModelResolver`（代际 +1）。之后
-/// 新 session、下一个 workflow step 分派、下一次 delegate、长存
-/// runner 的 turn 边界自查都会自动用新配置——无需重启 server。
-fn reload_models_resolver(b: &UiBackend) {
+/// 模型/角色配置变更（models 的 create/update/delete/put_toml、roles
+/// 的保存/新建/删除/磁盘重载）落盘并更新 `merged` 后调用：把新配置
+/// 热替换进共享 `ModelResolver`（代际 +1）。之后新 session、下一个
+/// workflow step 分派、下一次 delegate、长存 runner 的 turn 边界
+/// 自查都会自动用新配置——无需重启 server。
+fn hot_reload_resolver(b: &UiBackend) {
     let cfg = b.merged.read().clone();
     if let Err(e) = b.resolver.reload_from_config(&cfg) {
         eprintln!("[models] reload resolver after config save failed: {e}");
@@ -2683,7 +2692,7 @@ pub fn update_model(
             cfg.models.models.push(def.clone());
         }
     }
-    reload_models_resolver(b);
+    hot_reload_resolver(b);
     Ok(ModelWithSource {
         key: key.to_string(),
         source: source_label.to_string(),
@@ -2743,7 +2752,7 @@ pub fn delete_model(b: &UiBackend, key: &str, source: Option<&str>) -> Result<()
             format!("{}/{}", m.provider, m.name) != key
         });
     }
-    reload_models_resolver(b);
+    hot_reload_resolver(b);
     Ok(())
 }
 
@@ -2780,7 +2789,7 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
             cfg.models.models.push(req.def.clone());
         }
     }
-    reload_models_resolver(b);
+    hot_reload_resolver(b);
     Ok(ModelWithSource {
         key,
         source: src_label.to_string(),
@@ -2977,6 +2986,7 @@ pub fn put_role_toml(b: &UiBackend, role_id: &str, raw: &str) -> Result<(), ApiE
             "TOML 中未找到角色 {role_id:?}"
         )));
     }
+    hot_reload_resolver(b);
     Ok(())
 }
 
@@ -3047,7 +3057,7 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
             cfg.models.models.push(def);
         }
     }
-    reload_models_resolver(b);
+    hot_reload_resolver(b);
     Ok(())
 }
 
@@ -3334,5 +3344,91 @@ mod workflow_resume_tests {
         chat_abort(&b, Some(&sid)).await.expect("abort");
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(b.session_workflows.read().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::*;
+
+    fn make_backend(dir: &std::path::Path) -> UiBackend {
+        let cfg = latte_agent_core::AgentConfig::default();
+        let resolver = latte_agent_core::ModelResolver::from_config(&cfg).expect("resolver");
+        UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(dir.to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend")
+    }
+
+    /// 角色编辑器保存（create/save）必须推进共享 resolver 代际并让
+    /// 角色模型指派即刻可读——运行中 session 的热重载依赖这个信号。
+    #[test]
+    fn role_save_bumps_resolver_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let g0 = b.resolver.generation();
+
+        create_role(&b, "architect", "Architect").expect("create role");
+        assert_eq!(b.resolver.generation(), g0 + 1, "create_role 推进代际");
+
+        save_role_config(&b, SaveRoleConfigRequest {
+            id: "architect".into(),
+            name: "Architect".into(),
+            icon: String::new(),
+            model_tier: "premium".into(),
+            model_chain: vec!["m1".into()],
+            temperature: None,
+            tools: vec![],
+            code_paths: vec![],
+            prompt: String::new(),
+        })
+        .expect("save role");
+        assert_eq!(b.resolver.generation(), g0 + 2, "save_role_config 推进代际");
+        let (chain, tier) = b
+            .resolver
+            .role_model_assignment("architect")
+            .expect("assignment");
+        assert_eq!(chain, vec!["m1".to_string()]);
+        assert_eq!(
+            tier,
+            Some(latte_agent_core::model_resolver::ModelTier::Premium)
+        );
+    }
+
+    /// 模型保存（create_model）推进代际（回归：此前只改 merged 不动
+    /// resolver，新值对任何 session 都不生效）。
+    #[test]
+    fn model_save_bumps_resolver_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let g0 = b.resolver.generation();
+        create_model(&b, CreateModelRequest {
+            target: "project".into(),
+            def: ModelDef {
+                name: "m1".into(),
+                api: "openai".into(),
+                provider: "test".into(),
+                base_url: "http://localhost:1".into(),
+                api_key: "k".into(),
+                context_window: 32000,
+                max_tokens: 4096,
+                supports_thinking: false,
+                supports_vision: false,
+                supports_image_generation: false,
+                cost_per_million_input: None,
+                cost_per_million_output: None,
+                tier: None,
+                timeout_secs: None,
+            },
+        })
+        .expect("create model");
+        assert_eq!(b.resolver.generation(), g0 + 1);
+        assert!(b.resolver.build_model("m1").is_ok(), "新模型即刻可解析");
     }
 }

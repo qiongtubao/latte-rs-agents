@@ -1253,8 +1253,19 @@ impl AgentRunner {
             return;
         }
         let resolver = src.resolver.clone();
-        let tier = src.tier;
-        let chain_ids = src.chain_ids.clone();
+        // 角色编辑器保存的模型指派优先于 runner 构建时的快照——
+        // 「角色模型修改 → 保存 → 已加载 session 热生效」走这里。
+        let (chain_ids, tier) = match resolver.role_model_assignment(&self.role_id) {
+            Some((chain, t)) => (
+                if chain.is_empty() {
+                    src.chain_ids.clone()
+                } else {
+                    chain
+                },
+                t.unwrap_or(src.tier),
+            ),
+            None => (src.chain_ids.clone(), src.tier),
+        };
         match resolver.resolve_chain(&self.role_id, tier, &chain_ids) {
             Ok(models) if !models.is_empty() => {
                 let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
@@ -2957,6 +2968,81 @@ mod tests {
         runner.maybe_reload_models();
         assert_eq!(runner.agent.model_id, "m-new");
         // 再次调用：代际已同步，不重复重建。
+        runner.maybe_reload_models();
+        assert_eq!(runner.agent.model_id, "m-new");
+    }
+
+    /// 角色编辑器保存新 model_chain：resolver 快照里的角色指派优先于
+    /// runner 构建时固化的 chain_ids。
+    #[test]
+    fn hot_reload_prefers_role_assignment_from_resolver() {
+        use crate::config::{AgentConfig, ModelCatalog, ModelDef};
+        fn model_def(id: &str) -> ModelDef {
+            ModelDef {
+                name: id.into(),
+                api: "openai".into(),
+                provider: "test".into(),
+                base_url: "http://localhost:1".into(),
+                api_key: "k".into(),
+                context_window: 32000,
+                max_tokens: 4096,
+                supports_thinking: false,
+                supports_vision: false,
+                supports_image_generation: false,
+                cost_per_million_input: Some(0.0),
+                cost_per_million_output: Some(0.0),
+                tier: None,
+                timeout_secs: None,
+            }
+        }
+        fn cfg(model_id: &str, role_chain: Vec<&str>) -> AgentConfig {
+            let mut roles = std::collections::HashMap::new();
+            roles.insert(
+                "t".to_string(),
+                crate::role::RoleTemplate {
+                    id: "t".into(),
+                    name: "t".into(),
+                    category: "engineering".into(),
+                    model_tier: "standard".into(),
+                    model_chain: role_chain.into_iter().map(|s| s.to_string()).collect(),
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            );
+            AgentConfig {
+                models: ModelCatalog {
+                    models: vec![model_def(model_id)],
+                    tiers: None,
+                    role_tiers: None,
+                },
+                roles,
+            }
+        }
+        let resolver = std::sync::Arc::new(
+            crate::model_resolver::ModelResolver::from_config(&cfg("m-old", vec!["m-old"]))
+                .unwrap(),
+        );
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent).with_model_hot_reload(
+            resolver.clone(),
+            ModelTier::Standard,
+            vec!["m-old".to_string()],
+        );
+        // 角色编辑器保存：chain 换成 m-new。runner 的 chain_ids 还是
+        // 构建时的 ["m-old"]，但 reload 必须采用 resolver 里的新指派。
+        resolver
+            .reload_from_config(&cfg("m-new", vec!["m-new"]))
+            .unwrap();
         runner.maybe_reload_models();
         assert_eq!(runner.agent.model_id, "m-new");
     }

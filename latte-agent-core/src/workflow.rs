@@ -1016,8 +1016,22 @@ async fn build_role_runner(
     }
     role.system_prompt
         .push_str(&crate::ground_truth::ground_truth_block(cwd));
+    // 角色模型指派优先取 resolver 的最新快照：角色编辑器保存后，
+    // 进行中的 workflow 的后续分派也能用上新模型（merged 是 workflow
+    // 启动时的固化快照，可能已过时）。
+    let (chain_ids, tier) = match resolver.role_model_assignment(&role.id) {
+        Some((chain, t)) => (
+            if chain.is_empty() {
+                role.model_chain.clone()
+            } else {
+                chain
+            },
+            t.unwrap_or(role.default_model_tier),
+        ),
+        None => (role.model_chain.clone(), role.default_model_tier),
+    };
     let models = resolver
-        .resolve_chain(&role.id, role.default_model_tier, &role.model_chain)
+        .resolve_chain(&role.id, tier, &chain_ids)
         .map_err(|e| format!("no model for role '{role_id}': {e}"))?;
     let agent = Agent::new_with_chain(
         role_id.to_string(),

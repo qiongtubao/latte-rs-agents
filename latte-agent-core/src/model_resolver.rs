@@ -84,6 +84,14 @@ struct ResolverSnapshot {
     tier_defaults: std::collections::HashMap<ModelTier, String>,
     /// Per-role tier overrides: role_id → (tier → model_id).
     role_tiers: std::collections::HashMap<String, std::collections::HashMap<ModelTier, String>>,
+    /// 角色编辑器保存的 model_chain（`[roles.<id>].model_chain`）。
+    /// 放进 resolver 快照是为了让运行中的 runner / workflow 分派在
+    /// 「角色模型修改 → 保存」后热生效——它们都持有 resolver，而
+    /// AgentConfig 在 session/workflow 启动时已固化快照。
+    role_model_chains: std::collections::HashMap<String, Vec<String>>,
+    /// 角色编辑器保存的 model_tier（解析失败的项跳过，调用方回退
+    /// 到自己构建时的 tier）。
+    role_model_tiers: std::collections::HashMap<String, ModelTier>,
 }
 
 impl ResolverSnapshot {
@@ -127,10 +135,27 @@ impl ResolverSnapshot {
             })
             .unwrap_or_else(|| Ok(std::collections::HashMap::new()))?;
 
+        let role_model_chains = config
+            .roles
+            .iter()
+            .map(|(id, tpl)| (id.clone(), tpl.model_chain.clone()))
+            .collect();
+        let role_model_tiers = config
+            .roles
+            .iter()
+            .filter_map(|(id, tpl)| {
+                ModelTier::parse(&tpl.model_tier)
+                    .ok()
+                    .map(|t| (id.clone(), t))
+            })
+            .collect();
+
         Ok(Self {
             models,
             tier_defaults,
             role_tiers,
+            role_model_chains,
+            role_model_tiers,
         })
     }
 }
@@ -202,6 +227,19 @@ impl ModelResolver {
     /// 热替换，借用无法安全返回）。
     pub fn get_def(&self, model_id: &str) -> Option<ModelDef> {
         self.snapshot().get_def(model_id).cloned()
+    }
+
+    /// 角色的模型指派（model_chain + model_tier），来自最新配置快照。
+    /// 角色编辑器保存后，运行中的 runner（turn 边界自查）与 workflow
+    /// 分派（每次分派重新解析）据此热生效。角色未知 → None。
+    pub fn role_model_assignment(
+        &self,
+        role_id: &str,
+    ) -> Option<(Vec<String>, Option<ModelTier>)> {
+        let snap = self.snapshot();
+        snap.role_model_chains
+            .get(role_id)
+            .map(|chain| (chain.clone(), snap.role_model_tiers.get(role_id).copied()))
     }
 }
 
@@ -743,6 +781,41 @@ mod tests {
         assert!(resolver.reload_from_config(&bad).is_err());
         assert_eq!(resolver.generation(), 0, "失败不推进代际");
         assert!(resolver.build_model("m1").is_ok(), "旧快照保留");
+    }
+
+    fn role_tpl(id: &str, tier: &str, chain: Vec<&str>) -> crate::role::RoleTemplate {
+        crate::role::RoleTemplate {
+            id: id.into(),
+            name: id.into(),
+            category: "engineering".into(),
+            model_tier: tier.into(),
+            model_chain: chain.into_iter().map(|s| s.to_string()).collect(),
+            prompt_file: None,
+            temperature: None,
+            tools: vec![],
+            icon: String::new(),
+            skills: vec![],
+            code_paths: vec![],
+        }
+    }
+
+    /// 角色模型指派进快照并随 reload 热更新（角色编辑器保存场景）。
+    #[test]
+    fn role_model_assignment_hot_updates_on_reload() {
+        let mut cfg = catalog_with(vec![test_model_def("m1", None)]);
+        cfg.roles.insert("architect".into(), role_tpl("architect", "standard", vec!["m1"]));
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+        let (chain, tier) = resolver.role_model_assignment("architect").unwrap();
+        assert_eq!(chain, vec!["m1".to_string()]);
+        assert_eq!(tier, Some(ModelTier::Standard));
+        assert!(resolver.role_model_assignment("ghost").is_none());
+
+        // 角色编辑器保存：换 chain + tier → reload 后读到新值。
+        cfg.roles.insert("architect".into(), role_tpl("architect", "premium", vec![]));
+        resolver.reload_from_config(&cfg).unwrap();
+        let (chain, tier) = resolver.role_model_assignment("architect").unwrap();
+        assert!(chain.is_empty(), "空 chain 原样透出（调用方回退旧链）");
+        assert_eq!(tier, Some(ModelTier::Premium));
     }
 
     // ─── resolve_chain tests ───────────────────────────────────────────
