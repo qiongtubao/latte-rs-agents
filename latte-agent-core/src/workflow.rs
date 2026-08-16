@@ -1092,6 +1092,11 @@ async fn build_role_runner(
     if let Some(gate) = agent_pause_gate {
         r = r.with_agent_pause_gate(gate);
     }
+    // 模型热更新：与 chat 的 build_runner 对齐。workflow step 的 runner
+    // 在「模型不可用暂停 → 用户 ▶ 恢复」重试前会自查 resolver 代际——
+    // 用户在 UI 改了角色模型指派并保存后，续跑用新链重试，而不是拿
+    // 构建时的旧链重放同一个必挂请求。
+    r = r.with_model_hot_reload(resolver.clone(), tier, chain_ids.clone());
     Ok((r, role_responsibilities))
 }
 
@@ -2750,9 +2755,33 @@ forbid = ["TBD"]
         toml::from_str(raw).expect("valid TOML")
     }
 
+    /// workflow step 的 runner 必须挂模型热更新源——否则「模型不可用
+    /// 暂停 → 用户在 UI 改配置保存 → ▶ 恢复」的重试仍拿构建时的旧链
+    /// 重放同一个必挂请求（jemalloc tester 卡 k3 400 的实锤路径）。
+    #[tokio::test]
+    async fn build_role_runner_attaches_model_hot_reload() {
+        let config = test_config_at("http://127.0.0.1:1");
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(64);
+        let (runner, _resp) = build_role_runner(
+            "worker",
+            &config,
+            &resolver,
+            &GenerateParams::default(),
+            std::env::temp_dir().as_path(),
+            &event_tx,
+            None,
+        )
+        .await
+        .expect("worker runner");
+        assert!(
+            runner.has_model_hot_reload(),
+            "workflow step runner must hot-reload model chain on resume"
+        );
+    }
+
     fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {
-        let mut n = 0;
-        while let Ok(ev) = rx.try_recv() {
+        let mut n = 0;        while let Ok(ev) = rx.try_recv() {
             if matches!(ev, ChatEvent::WorkflowTurn { .. }) {
                 n += 1;
             }

@@ -1299,6 +1299,13 @@ impl AgentRunner {
         use std::sync::atomic::Ordering;
         self.stream_mode.as_ref().map_or(false, |m| m.load(Ordering::SeqCst))
     }
+
+    /// 测试用：是否挂了模型热更新源（workflow / delegate 路径的接线
+    /// 回归测试据此断言，不漏挂）。
+    #[cfg(test)]
+    pub(crate) fn has_model_hot_reload(&self) -> bool {
+        self.model_source.is_some()
+    }
     /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
     /// to `self.context.messages`. Deletes the queue file. This is
     /// called at the start of `run_turn` and can also be called

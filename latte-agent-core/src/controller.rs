@@ -3541,6 +3541,14 @@ async fn register_delegate_tool(
             // Session-level 暂停门：subagent 也共享 —— 用户按 ⏸ 时
             // specialist 在下一个 turn/tool 边界一起 park。
             runner = runner.with_agent_pause_gate(agent_pause_gate.clone());
+            // 模型热更新：与主 runner / workflow step runner 对齐——
+            // 「模型不可用暂停 → 用户 ▶ 恢复」重试前按 resolver 最新
+            // 代际重建 model chain，用户在 UI 改的指派即刻生效。
+            runner = runner.with_model_hot_reload(
+                resolver.clone(),
+                tier,
+                chain_ids.clone(),
+            );
 
             // Emit RoleStarted so the UI shows the specialist is working
             let task_clone = task.clone();
