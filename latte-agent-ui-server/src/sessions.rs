@@ -279,62 +279,104 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
     })
 }
 
-/// 反向扫描 session event_log 找最近一条 `status != "ok"` 的
-/// `WorkflowFinished`，组装成 [`FailedWorkflow`] 快照。
+/// 正向扫描 session event_log，找「最近可续跑」的 workflow，组装成
+/// [`FailedWorkflow`] 快照。两类候选：
 ///
-/// 与 controller 内部订阅者（spawn 时挂的那个）维护的 state 字段同
-/// 语义 —— 但这里是 cold-start 救场：恢复 session 首次 spawn
-/// controller 时，controller 还没收到任何实时事件，需要从落盘历史
-/// 里捞最近一次失败，避免用户重启 process 后必须手动传 wf_id 才能
-/// 续跑。
+/// 1. **被中断的**（有 `WorkflowStarted` 无 `WorkflowFinished`，且未被
+///    后续 resume 取代）——server 重启 / 进程崩溃时 workflow task 直接
+///    消亡，永远等不到 Finished。取**最早 Started** 的那条：嵌套
+///    workflow 的 Started 总在父之后，最早的一定是最外层，续跑它会
+///    从 checkpoint 跳过已完成 step、自动重驱内层。
+/// 2. 没有中断候选时退化为**最近一条 `status != "ok"` 的
+///    `WorkflowFinished`**（原失败扫描语义）。
+///
+/// resume 续跑会为旧 run 生成新 wf_id，旧 run 永远停在「未完成」
+/// 状态 —— 靠续跑时发的 `Status` 事件（"从断点续跑（checkpoint
+/// <旧 wf_id>）"）把旧 wf_id 标记为已取代，避免重复 seed。
 ///
 /// 返回 `Some(_)` = 找到了；checkpoint 文件是否还在由调用方
 /// （`spawn_controller`）另查，避免这里多 IO 依赖。
-fn last_failed_workflow_from_log(
+fn last_resumable_workflow_from_log(
     event_log: &Arc<parking_lot::RwLock<Vec<String>>>,
 ) -> Option<FailedWorkflow> {
     let log = event_log.read();
-    for line in log.iter().rev() {
+    // wf_id → (起始 idx, name)
+    let mut started: Vec<(usize, String, String)> = Vec::new();
+    // wf_id → (结束 idx, status, name, summary)
+    let mut finished: HashMap<String, (usize, String, String, String)> = HashMap::new();
+    // 已被续跑新 run 取代的旧 wf_id
+    let mut superseded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (idx, line) in log.iter().enumerate() {
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => continue, // 坏行跳过（进程异常退出可能截断尾部）
         };
-        if v.get("type").and_then(|t| t.as_str()) != Some("WorkflowFinished") {
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let wf_id = v.get("wf_id").and_then(|s| s.as_str()).unwrap_or("");
+        match ty {
+            "WorkflowStarted" if !wf_id.is_empty() => {
+                let name = v
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                started.push((idx, wf_id.to_string(), name));
+            }
+            "WorkflowFinished" if !wf_id.is_empty() => {
+                let status = v
+                    .get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = v
+                    .get("name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let summary = v
+                    .get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                finished.insert(wf_id.to_string(), (idx, status, name, summary));
+            }
+            "Status" => {
+                if let Some(msg) = v.get("message").and_then(|s| s.as_str()) {
+                    if let Some(rest) = msg.split("从断点续跑（checkpoint ").nth(1) {
+                        let old: String =
+                            rest.chars().take_while(|c| *c != '）').collect();
+                        if !old.is_empty() {
+                            superseded.insert(old);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // 中断候选：started 顺序即外层优先（嵌套的 Started 更晚）。
+    for (_, wf_id, name) in &started {
+        if finished.contains_key(wf_id) || superseded.contains(wf_id) {
             continue;
         }
-        let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
-        if status == "ok" {
-            continue;
-        }
-        // `?` 会让函数 return None，跳过前面的失败事件 —— 改成
-        // continue，让 reverse scan 继续往更早的事件找。真实场景
-        // 中 ui-sessions 尾部可能恰好是一行半截损坏事件。
-        let wf_id = match v.get("wf_id").and_then(|s| s.as_str()) {
-            Some(id) => id,
-            None => continue,
-        };
-        if wf_id.is_empty() {
-            continue;
-        }
-        let name = v
-            .get("name")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let summary = v
-            .get("summary")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
         return Some(FailedWorkflow {
-            name,
-            wf_id: wf_id.to_string(),
-            summary,
-            failed_at_unix_ms: 0, // cold-start 不知道精确时间；
-                                  // UI 主要用 wf_id 决策，0 表示"非实时"
+            name: name.clone(),
+            wf_id: wf_id.clone(),
+            summary: String::new(),
+            failed_at_unix_ms: 0, // cold-start 不知道精确时间；0 表示"非实时"
         });
     }
-    None
+    // 无中断：最近一条失败的 Finished。
+    finished
+        .into_iter()
+        .filter(|(_, (_, status, _, _))| status != "ok")
+        .max_by_key(|(_, (idx, _, _, _))| *idx)
+        .map(|(wf_id, (_, _, name, summary))| FailedWorkflow {
+            name,
+            wf_id,
+            summary,
+            failed_at_unix_ms: 0,
+        })
 }
 
 
@@ -485,10 +527,10 @@ impl SessionHandle {
         let _rx = controller.spawn(cfg).await;
 
         // ── Cold-start seed ──
-        // 恢复 session 首次 spawn controller 时，把 event_log 历史里最近
-        // 一条 status != "ok" 的 WorkflowFinished 写进 controller
-        // `last_failed_workflow` 状态，让"重启后点继续"无需显式传
-        // wf_id。Checkpoint 文件丢失则跳过（保留 API 容错：用户
+        // 恢复 session 首次 spawn controller 时，把 event_log 历史里
+        // 「最近可续跑」的 workflow（被中断的优先，否则最近失败的）写进
+        // controller `last_failed_workflow` 状态，让"重启后点继续"无需
+        // 显式传 wf_id。Checkpoint 文件丢失则跳过（保留 API 容错：用户
         // 手动清理过 workflow-runs/ 的场景）。
         //
         // 时序：controller.spawn() 内部已经把内部订阅者挂上了，但
@@ -497,7 +539,7 @@ impl SessionHandle {
         // 者覆盖 seed —— 这是正确语义（用户重启后若主动跑了别的
         // workflow，再点"继续"应当续跑那个新的失败，不是历史
         // 那个）。
-        if let Some(failed) = last_failed_workflow_from_log(&self.event_log) {
+        if let Some(failed) = last_resumable_workflow_from_log(&self.event_log) {
             let ckpt_path = self
                 .spawn
                 .cwd
@@ -790,13 +832,13 @@ mod tests {
     /// 正常路径：log 末尾有一条 status != "ok" 的 WorkflowFinished，
     /// 反向扫描应找到它并组装成 FailedWorkflow。
     #[test]
-    fn last_failed_workflow_from_log_finds_last_non_ok() {
+    fn last_resumable_workflow_from_log_finds_last_non_ok() {
         let log = make_log(&[
             r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"ok","summary":"done"}"#,
             r#"{"type":"WorkflowFinished","name":"b","wf_id":"wf-b","status":"failed","summary":"boom"}"#,
             r#"{"type":"WorkflowFinished","name":"c","wf_id":"wf-c","status":"failed","summary":"again"}"#,
         ]);
-        let got = last_failed_workflow_from_log(&log).unwrap();
+        let got = last_resumable_workflow_from_log(&log).unwrap();
         assert_eq!(got.wf_id, "wf-c", "应取最末一条失败的（reverse scan）");
         assert_eq!(got.name, "c");
         assert_eq!(got.summary, "again");
@@ -804,42 +846,42 @@ mod tests {
 
     /// 全 ok → 返回 None。冷启动 session 没有可续跑的失败 workflow。
     #[test]
-    fn last_failed_workflow_from_log_returns_none_when_all_ok() {
+    fn last_resumable_workflow_from_log_returns_none_when_all_ok() {
         let log = make_log(&[
             r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"ok","summary":"done"}"#,
         ]);
-        assert!(last_failed_workflow_from_log(&log).is_none());
+        assert!(last_resumable_workflow_from_log(&log).is_none());
     }
 
     /// 空 log → None。
     #[test]
-    fn last_failed_workflow_from_log_returns_none_when_empty() {
+    fn last_resumable_workflow_from_log_returns_none_when_empty() {
         let log = make_log(&[]);
-        assert!(last_failed_workflow_from_log(&log).is_none());
+        assert!(last_resumable_workflow_from_log(&log).is_none());
     }
 
     /// 损坏的 JSON 行应当被跳过 —— 真实 ui-sessions/*.jsonl 在
     /// 进程异常退出时可能截断，不能让单行坏数据导致整个 cold-start
     /// 失败。
     #[test]
-    fn last_failed_workflow_from_log_skips_corrupt_lines() {
+    fn last_resumable_workflow_from_log_skips_corrupt_lines() {
         let log = make_log(&[
             "not json",
             r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"failed"}"#,
             r#"{"type":"WorkflowFinished"}"#, // 缺 wf_id
         ]);
-        let got = last_failed_workflow_from_log(&log).unwrap();
+        let got = last_resumable_workflow_from_log(&log).unwrap();
         assert_eq!(got.wf_id, "wf-a");
     }
 
     /// 缺字段的 WorkflowFinished（无 wf_id）→ 跳过；不能把空串当
     /// wf_id 写进 state（否则 resume API 会拿空串去拼 checkpoint 路径）。
     #[test]
-    fn last_failed_workflow_from_log_skips_missing_wf_id() {
+    fn last_resumable_workflow_from_log_skips_missing_wf_id() {
         let log = make_log(&[
             r#"{"type":"WorkflowFinished","status":"failed"}"#,
         ]);
-        assert!(last_failed_workflow_from_log(&log).is_none());
+        assert!(last_resumable_workflow_from_log(&log).is_none());
     }
 
     /// 多个 status=failed 事件混合 status=ok：reverse scan 应找到
@@ -847,13 +889,57 @@ mod tests {
     /// （success wipe 是 controller 内部订阅者的语义，仅适用于
     /// 实时事件流；冷启动 scan 保留 reverse 顺序原始语义）。
     #[test]
-    fn last_failed_workflow_from_log_mixed_ok_failed() {
+    fn last_resumable_workflow_from_log_mixed_ok_failed() {
         let log = make_log(&[
             r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-a","status":"failed","summary":"old"}"#,
             r#"{"type":"WorkflowFinished","name":"b","wf_id":"wf-b","status":"ok","summary":"middle"}"#,
             r#"{"type":"WorkflowFinished","name":"c","wf_id":"wf-c","status":"failed","summary":"new"}"#,
         ]);
-        let got = last_failed_workflow_from_log(&log).unwrap();
+        let got = last_resumable_workflow_from_log(&log).unwrap();
         assert_eq!(got.wf_id, "wf-c", "末尾的 failed 覆盖前序的语义");
+    }
+
+    /// 中断场景（jemalloc 事故）：workflow 被 Paused 后进程重启，
+    /// 永远等不到 WorkflowFinished。扫描应挑出最外层未完成的 run
+    /// （嵌套 workflow 的 Started 更晚，最早 Started = 最外层）。
+    #[test]
+    fn last_resumable_workflow_from_log_finds_interrupted_outermost() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowStarted","name":"design_and_plan","wf_id":"wf-parent","topic":"t"}"#,
+            r#"{"type":"WorkflowStarted","name":"explore","wf_id":"wf-nested","topic":"t"}"#,
+            r#"{"type":"WorkflowFinished","name":"explore","wf_id":"wf-nested","status":"ok","summary":"s"}"#,
+            r#"{"type":"WorkflowStarted","name":"code_review","wf_id":"wf-nested2","topic":"t"}"#,
+            r#"{"type":"Paused","reason":"模型不可用"}"#,
+        ]);
+        let got = last_resumable_workflow_from_log(&log).unwrap();
+        assert_eq!(got.wf_id, "wf-parent", "最外层未完成 run 优先于嵌套未完成 run");
+        assert_eq!(got.name, "design_and_plan");
+    }
+
+    /// 中断的旧 run 已被续跑（新 wf_id 的 run 发出带旧 wf_id 的
+    /// Status 事件）→ 旧 run 不再是候选；新 run ok 后无可续跑目标。
+    #[test]
+    fn last_resumable_workflow_from_log_superseded_by_resume() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowStarted","name":"a","wf_id":"wf-old","topic":"t"}"#,
+            r#"{"type":"Paused","reason":"模型不可用"}"#,
+            r#"{"type":"Status","message":"workflow 'a' 从断点续跑（checkpoint wf-old）：跳过已完成的 2 步"}"#,
+            r#"{"type":"WorkflowStarted","name":"a","wf_id":"wf-new","topic":"t"}"#,
+            r#"{"type":"WorkflowFinished","name":"a","wf_id":"wf-new","status":"ok","summary":"done"}"#,
+        ]);
+        assert!(last_resumable_workflow_from_log(&log).is_none());
+    }
+
+    /// 续跑的新 run 也中断 → 候选是新 run 的 wf_id（旧 run 已取代）。
+    #[test]
+    fn last_resumable_workflow_from_log_resumed_run_interrupted_again() {
+        let log = make_log(&[
+            r#"{"type":"WorkflowStarted","name":"a","wf_id":"wf-old","topic":"t"}"#,
+            r#"{"type":"Status","message":"workflow 'a' 从断点续跑（checkpoint wf-old）：跳过已完成的 2 步"}"#,
+            r#"{"type":"WorkflowStarted","name":"a","wf_id":"wf-new","topic":"t"}"#,
+            r#"{"type":"Paused","reason":"模型不可用"}"#,
+        ]);
+        let got = last_resumable_workflow_from_log(&log).unwrap();
+        assert_eq!(got.wf_id, "wf-new");
     }
 }

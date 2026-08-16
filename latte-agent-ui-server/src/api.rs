@@ -1228,14 +1228,40 @@ pub async fn chat_pause_session(
 }
 
 /// `POST /api/chat/resume-session` — 与 [`chat_pause_session`] 配对。
+///
+/// 重启兜底：gate 并未暂停（session 从磁盘恢复、controller 未 spawn
+/// 或新 gate 从未 engage）时，旧进程的 workflow task 已随进程消亡，
+/// resume 本身是空操作 —— 此时 ▶ 的语义升级为「从 checkpoint 续跑
+/// 中断的 workflow」，并补发一条 `Resumed` 同步 UI 暂停态（replay
+/// 会把历史 Paused 恢复成 isPaused=true，而本进程 gate 未 engage，
+/// 不会有 listener 发 Resumed）。
 pub async fn chat_resume_session(
     b: &UiBackend,
     session_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
-    if let Some(controller) = h.try_controller() {
-        let _elapsed = controller.resume_session();
+    let resumed_live = match h.try_controller() {
+        Some(controller) => controller.resume_session().is_some(),
+        None => false,
+    };
+    if resumed_live {
+        return Ok(());
+    }
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    let _ = controller.event_sender().send(ChatEvent::Resumed);
+    // spawn 时已从 event_log seed 最近可续跑的 workflow；有才续跑，
+    // 没有则只是解除 UI 暂停态（幂等 no-op）。404（checkpoint 已删）
+    // 与 409（已在跑，用户连点）都按成功处理。
+    if controller.last_failed_workflow().is_some() {
+        match spawn_workflow_resume(b, &h.session_id, None, None).await {
+            Ok(_) => {}
+            Err(e) if e.status == 404 || e.status == 409 => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }
@@ -1730,17 +1756,29 @@ pub async fn workflow_resume(
     b: &UiBackend,
     req: WorkflowResumeRequest,
 ) -> Result<serde_json::Value, ApiError> {
-    let h = resolve_session(b, Some(&req.session_id))?;
+    spawn_workflow_resume(b, &req.session_id, req.wf_id, req.topic).await
+}
+
+/// 续跑共享实现：`workflow_resume` 与 `chat_resume_session` 的
+/// 重启兜底共用。`wf_id` 缺省 = 该 session 最近可续跑的 workflow
+/// （实时事件流由 controller 内部订阅者维护；冷启动由 sessions.rs
+/// 从 event_log seed，含「中断未完成」的 run）。
+async fn spawn_workflow_resume(
+    b: &UiBackend,
+    session_id: &str,
+    wf_id: Option<String>,
+    topic: Option<String>,
+) -> Result<serde_json::Value, ApiError> {
+    let h = resolve_session(b, Some(session_id))?;
     let controller = h
         .controller_or_spawn()
         .await
         .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
 
-    // 续跑目标：显式 wf_id 优先；缺省 = 该 session 最近一次失败的
-    // workflow（实时事件流由 controller 内部订阅者维护；冷启动由
-    // sessions.rs 从 event_log seed）。
-    let wf_id = match &req.wf_id {
-        Some(id) => id.clone(),
+    // 续跑目标：显式 wf_id 优先；缺省 = 该 session 最近可续跑的
+    // workflow。
+    let wf_id = match wf_id {
+        Some(id) => id,
         None => {
             controller
                 .last_failed_workflow()
@@ -1757,7 +1795,7 @@ pub async fn workflow_resume(
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut runs = b.session_workflows.write();
-        if let Some(flag) = runs.get(&req.session_id) {
+        if let Some(flag) = runs.get(session_id) {
             if !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(ApiError {
                     status: 409,
@@ -1765,7 +1803,7 @@ pub async fn workflow_resume(
                 });
             }
         }
-        runs.insert(req.session_id.clone(), cancel.clone());
+        runs.insert(session_id.to_string(), cancel.clone());
     }
 
     // 启动前校验：checkpoint 存在（load_checkpoint 内含 wf_id 安全
@@ -1779,7 +1817,7 @@ pub async fn workflow_resume(
     let wf = match validated {
         Ok(wf) => wf,
         Err(e) => {
-            b.session_workflows.write().remove(&req.session_id);
+            b.session_workflows.write().remove(session_id);
             return Err(e);
         }
     };
@@ -1798,16 +1836,16 @@ pub async fn workflow_resume(
         // 可查日志）、过 advisor gate + 返回审查，与 manager 的
         // delegate / workflow 工具一致。
         subsession_store: Some(b.subsession_store.clone()),
-        session_id: Some(req.session_id.clone()),
+        session_id: Some(session_id.to_string()),
         advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
             .runner_gate(),
         advisor_pause: Some(controller.advisor_pause_gate()),
     };
     let wf_name = wf.name.clone();
     let resp_wf_id = wf_id.clone();
-    let topic = req.topic.clone().unwrap_or_default();
+    let topic = topic.unwrap_or_default();
     let runs = b.session_workflows.clone();
-    let sid = req.session_id.clone();
+    let sid = session_id.to_string();
     tokio::spawn(async move {
         let _ = run_workflow_resume(&wf, &topic, &ctx, &wf_id).await;
         // run 结束（无论成败）释放 guard；失败事件里的新 wf_id 可再续跑。
@@ -2555,6 +2593,17 @@ fn source_label(s: crate::models::ModelSource) -> &'static str {
 
 /// `PATCH /api/models/:key` —— **部分更新**一个已存在的 model：以 catalog
 /// 里的现值为基准，只覆盖补丁里显式给出的字段，再写回磁盘（项目目录
+/// 模型配置变更（create/update/delete/put_toml）落盘并更新 `merged`
+/// 后调用：把新配置热替换进共享 `ModelResolver`（代际 +1）。之后
+/// 新 session、下一个 workflow step 分派、下一次 delegate、长存
+/// runner 的 turn 边界自查都会自动用新配置——无需重启 server。
+fn reload_models_resolver(b: &UiBackend) {
+    let cfg = b.merged.read().clone();
+    if let Err(e) = b.resolver.reload_from_config(&cfg) {
+        eprintln!("[models] reload resolver after config save failed: {e}");
+    }
+}
+
 /// `<cwd>/.latte/models.d/<provider>__<id>.toml`），同时就地更新内存
 /// catalog 让后续 chat 立刻看到新值。
 ///
@@ -2634,6 +2683,7 @@ pub fn update_model(
             cfg.models.models.push(def.clone());
         }
     }
+    reload_models_resolver(b);
     Ok(ModelWithSource {
         key: key.to_string(),
         source: source_label.to_string(),
@@ -2693,6 +2743,7 @@ pub fn delete_model(b: &UiBackend, key: &str, source: Option<&str>) -> Result<()
             format!("{}/{}", m.provider, m.name) != key
         });
     }
+    reload_models_resolver(b);
     Ok(())
 }
 
@@ -2729,6 +2780,7 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
             cfg.models.models.push(req.def.clone());
         }
     }
+    reload_models_resolver(b);
     Ok(ModelWithSource {
         key,
         source: src_label.to_string(),
@@ -2995,6 +3047,7 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
             cfg.models.models.push(def);
         }
     }
+    reload_models_resolver(b);
     Ok(())
 }
 
@@ -3216,6 +3269,57 @@ mod workflow_resume_tests {
         .await
         .expect("resume via snapshot should start");
         assert_eq!(resp["wf_id"], serde_json::json!("wf-snap"));
+    }
+
+    /// ▶ 重启兜底：gate 未暂停（模拟 server 重启后新 spawn 的
+    /// controller，旧 workflow task 已消亡），但有可续跑的快照 →
+    /// chat_resume_session 从 checkpoint 拉起续跑。
+    #[tokio::test]
+    async fn chat_resume_session_falls_back_to_workflow_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-paused", "learn");
+        write_workflow(dir.path(), "learn");
+        let h = resolve_session(&b, Some(&sid)).unwrap();
+        h.try_controller()
+            .expect("spawned")
+            .set_last_failed_workflow(latte_agent_core::controller::FailedWorkflow {
+                name: "learn".into(),
+                wf_id: "wf-paused".into(),
+                summary: String::new(),
+                failed_at_unix_ms: 0,
+            });
+        chat_resume_session(&b, Some(&sid)).await.expect("resume ok");
+        assert!(
+            b.session_workflows.read().contains_key(&sid),
+            "兜底应注册续跑 guard（workflow 从 checkpoint 拉起）"
+        );
+    }
+
+    /// gate 真的暂停着（进程内暂停）→ 走 live resume 释放 gate，
+    /// 不得重复触发 checkpoint 续跑（否则同一会话跑两份 workflow）。
+    #[tokio::test]
+    async fn chat_resume_session_live_pause_does_not_spawn_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-paused", "learn");
+        write_workflow(dir.path(), "learn");
+        let h = resolve_session(&b, Some(&sid)).unwrap();
+        let c = h.try_controller().expect("spawned");
+        c.set_last_failed_workflow(latte_agent_core::controller::FailedWorkflow {
+            name: "learn".into(),
+            wf_id: "wf-paused".into(),
+            summary: String::new(),
+            failed_at_unix_ms: 0,
+        });
+        c.pause_session();
+        chat_resume_session(&b, Some(&sid)).await.expect("resume ok");
+        assert!(
+            b.session_workflows.read().get(&sid).is_none(),
+            "live 恢复只释放 gate，不该再起一份续跑"
+        );
     }
 
     /// chat_abort 连带取消该 session 事件流上的 workflow：flag 置位 +

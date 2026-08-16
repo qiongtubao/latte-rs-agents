@@ -62,8 +62,22 @@ impl ModelTier {
 /// 1. Per-role tier override in config (`role_tiers.<role>.<tier>`)
 /// 2. Global tier default (`tiers.<tier>`)
 /// 3. Model's own `tier` field in catalog
+///
+/// 内部状态是 `Arc<Snapshot>` 整体替换（`reload_from_config`）：UI 保存
+/// 模型配置后换入新快照，正在解析的调用方仍持旧快照完成当次解析，
+/// 下一次解析自动看到新值——运行中的 session 无需重启即可热更新模型
+/// 配置。读路径只克隆一次 Arc，没有锁递归问题。
 #[derive(Clone)]
 pub struct ModelResolver {
+    inner: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<ResolverSnapshot>>>,
+    /// 配置代际：`reload_from_config` 每次 +1。长存 runner 据此判断
+    /// 要不要重建自己的 model chain（见 `AgentRunner::maybe_reload_models`）。
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// 解析器内部状态的一次性快照。
+#[derive(Debug, Clone)]
+struct ResolverSnapshot {
     /// All known models indexed by id.
     models: std::collections::HashMap<String, ModelDef>,
     /// Global tier → model_id mapping.
@@ -72,9 +86,8 @@ pub struct ModelResolver {
     role_tiers: std::collections::HashMap<String, std::collections::HashMap<ModelTier, String>>,
 }
 
-impl ModelResolver {
-    /// Build a resolver from an `AgentConfig`.
-    pub fn from_config(config: &AgentConfig) -> AgentResult<Self> {
+impl ResolverSnapshot {
+    fn from_config(config: &AgentConfig) -> AgentResult<Self> {
         let models: std::collections::HashMap<String, ModelDef> = config
             .models
             .models
@@ -120,6 +133,79 @@ impl ModelResolver {
             role_tiers,
         })
     }
+}
+
+impl ModelResolver {
+    /// Build a resolver from an `AgentConfig`.
+    pub fn from_config(config: &AgentConfig) -> AgentResult<Self> {
+        Ok(Self {
+            inner: std::sync::Arc::new(parking_lot::RwLock::new(std::sync::Arc::new(
+                ResolverSnapshot::from_config(config)?,
+            ))),
+            generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        })
+    }
+
+    /// 用热更新后的 config 整体替换内部快照，代际 +1。已持有旧快照的
+    /// 解析不受影响；下一次解析（新 session / 下一个 workflow step
+    /// 分派 / 下一次 delegate / 长存 runner 的 turn 边界自查）自动
+    /// 生效。
+    pub fn reload_from_config(&self, config: &AgentConfig) -> AgentResult<()> {
+        let snap = ResolverSnapshot::from_config(config)?;
+        *self.inner.write() = std::sync::Arc::new(snap);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 当前配置代际（每次 `reload_from_config` 递增）。
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 拿当前快照（O(1) Arc clone，拿完即放锁）。
+    fn snapshot(&self) -> std::sync::Arc<ResolverSnapshot> {
+        self.inner.read().clone()
+    }
+
+    /// 见 [`ResolverSnapshot::resolve`]。
+    pub fn resolve(&self, role_id: &str, tier: ModelTier) -> AgentResult<Model> {
+        self.snapshot().resolve(role_id, tier)
+    }
+
+    /// 见 [`ResolverSnapshot::resolve_chain`]。
+    pub fn resolve_chain(
+        &self,
+        role_id: &str,
+        tier: ModelTier,
+        chain_ids: &[String],
+    ) -> AgentResult<Vec<Model>> {
+        self.snapshot().resolve_chain(role_id, tier, chain_ids)
+    }
+
+    /// 见 [`ResolverSnapshot::available_tiers`]。
+    pub fn available_tiers(&self, role_id: &str) -> Vec<ModelTier> {
+        self.snapshot().available_tiers(role_id)
+    }
+
+    /// 见 [`ResolverSnapshot::resolve_id_or_name`]。
+    pub fn resolve_id_or_name(&self, query: &str) -> AgentResult<Model> {
+        self.snapshot().resolve_id_or_name(query)
+    }
+
+    /// 见 [`ResolverSnapshot::build_model`]。
+    pub fn build_model(&self, model_id: &str) -> AgentResult<Model> {
+        self.snapshot().build_model(model_id)
+    }
+
+    /// 见 [`ResolverSnapshot::get_def`]（返回克隆值——快照随时可能被
+    /// 热替换，借用无法安全返回）。
+    pub fn get_def(&self, model_id: &str) -> Option<ModelDef> {
+        self.snapshot().get_def(model_id).cloned()
+    }
+}
+
+impl ResolverSnapshot {
     ///
     /// Lookup order: role_tiers override → tier_defaults → model's own tier
     /// field → first model in catalog. If the chosen model has no
@@ -437,10 +523,12 @@ fn extract_env_var(s: &str) -> Option<String> {
 }
 impl std::fmt::Debug for ModelResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snap = self.snapshot();
         f.debug_struct("ModelResolver")
-            .field("models", &self.models.len())
-            .field("tier_defaults", &self.tier_defaults)
-            .field("role_tiers", &self.role_tiers)
+            .field("models", &snap.models.len())
+            .field("tier_defaults", &snap.tier_defaults)
+            .field("role_tiers", &snap.role_tiers)
+            .field("generation", &self.generation())
             .finish()
     }
 }
@@ -603,6 +691,60 @@ mod tests {
         std::env::remove_var("TEST_KEY");
         assert_eq!(resolve_env_vars("${DEFINITELY_UNSET}"), "");
     }
+
+    // ─── 热更新（reload_from_config / generation） ─────────────────────
+
+    fn catalog_with(models: Vec<ModelDef>) -> AgentConfig {
+        AgentConfig {
+            models: crate::config::ModelCatalog {
+                models,
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        }
+    }
+
+    /// reload 后代际递增，且后续解析看到新配置（改 api_key 场景：
+    /// 旧 resolver 对象不用替换，内容热更新）。
+    #[test]
+    fn reload_from_config_bumps_generation_and_swaps_snapshot() {
+        let resolver =
+            ModelResolver::from_config(&catalog_with(vec![test_model_def("m1", None)])).unwrap();
+        assert_eq!(resolver.generation(), 0);
+        assert_eq!(resolver.build_model("m1").unwrap().api_key, "test-key");
+
+        let mut def = test_model_def("m1", None);
+        def.api_key = "new-key".into();
+        resolver
+            .reload_from_config(&catalog_with(vec![def]))
+            .unwrap();
+        assert_eq!(resolver.generation(), 1);
+        assert_eq!(resolver.build_model("m1").unwrap().api_key, "new-key");
+
+        // clone 共享内部状态：ui-server 各处持有的 resolver clone
+        // 必须看到同一次热更新。
+        let clone = resolver.clone();
+        assert_eq!(clone.generation(), 1);
+        assert_eq!(clone.build_model("m1").unwrap().api_key, "new-key");
+    }
+
+    /// reload 出非法配置（坏 tier 字符串）→ 报错且旧快照保留。
+    #[test]
+    fn reload_from_config_rejects_bad_config_and_keeps_old_snapshot() {
+        let resolver =
+            ModelResolver::from_config(&catalog_with(vec![test_model_def("m1", None)])).unwrap();
+        let mut bad = catalog_with(vec![test_model_def("m1", None)]);
+        bad.models.tiers = Some(
+            [("not-a-tier".to_string(), "m1".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(resolver.reload_from_config(&bad).is_err());
+        assert_eq!(resolver.generation(), 0, "失败不推进代际");
+        assert!(resolver.build_model("m1").is_ok(), "旧快照保留");
+    }
+
     // ─── resolve_chain tests ───────────────────────────────────────────
 
     fn catalog_with_three() -> AgentConfig {

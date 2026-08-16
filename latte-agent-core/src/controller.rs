@@ -2537,6 +2537,13 @@ async fn build_runner(
         }
         runner = runner.with_agent_pause_gate(agent_pause_gate);
         runner = runner.with_stream_mode(stream_mode);
+        // 模型配置热更新：UI 保存 models 配置后，本 runner 在下一个
+        // turn 边界自动重建 model chain，无需重启 session。
+        runner = runner.with_model_hot_reload(
+            std::sync::Arc::new(resolver.clone()),
+            tier,
+            role.model_chain.clone(),
+        );
         Ok((runner, role_id.to_string()))
     } else {
         // ── 给主 runner 分配 subsession sink（同上） ──
@@ -2561,6 +2568,11 @@ async fn build_runner(
         }
         runner = runner.with_agent_pause_gate(agent_pause_gate);
         runner = runner.with_stream_mode(stream_mode);
+        runner = runner.with_model_hot_reload(
+            std::sync::Arc::new(resolver.clone()),
+            tier,
+            role.model_chain.clone(),
+        );
         Ok((runner, role_id.to_string()))
     }
 }

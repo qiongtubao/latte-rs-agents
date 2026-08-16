@@ -2168,6 +2168,23 @@ const stepMsgIds = new Map<string, string>();
         timeoutPromptRole = null;
       }
       clearWaitTimer();
+      // 冷启动重播：若历史停在 Paused（server 重启前 workflow 被暂停/
+      // 进程崩溃），残留的运行中徽章永远等不到完成事件——标注「已中断」，
+      // 避免误导；▶ 会触发后端从 checkpoint 续跑（chat_resume_session
+      // 兜底逻辑）。仍在实时运行的 workflow（无尾随 Paused）不受影响：
+      // 后续 live 事件会正常翻转这些徽章。
+      if (isPaused) {
+        for (const el of workflowStates.values()) {
+          el.textContent = "⚠️ 已中断（点 ▶ 从断点续跑）";
+          el.className = "delegate-state failed";
+        }
+        for (const el of stepStates.values()) {
+          el.textContent = "⚠️ 已中断";
+          el.className = "delegate-state failed";
+        }
+        workflowStates.clear();
+        stepStates.clear();
+      }
       setStatus("connected");
     }
   }

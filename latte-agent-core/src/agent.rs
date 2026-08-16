@@ -30,7 +30,10 @@ use crate::role::Role as RoleDef;
 //   2. 问 `RetryPolicy` 要不要 retry
 //   3. retry 就再来一次，发 `ToolRetry { attempt, kind, recovered: false }`
 //   4. 终态发 `ToolExec { status: Err }` + `ToolRetry { recovered: true|false }`
-//   5. 按 `should_loopback_to_model(&kind)` 决定要不要把错误喂回 messages
+//   5. 终态（成功或失败）都以 `tool_result` 喂回 messages——native 协议
+//      要求每个 tool_call_id 都有对应 tool 消息闭环，缺一条下游 API
+//      直接 400（"tool_calls must be followed by tool messages"），
+//      整个会话卡死。防死循环靠 LoopDetector，不靠断链。
 //
 // 加新错误类型 = 加 variant + 在 `DefaultRetryPolicy::retryable()` 加一行。
 // UI / 调度逻辑不需要改。
@@ -100,16 +103,6 @@ pub trait RetryPolicy: Send + Sync {
     /// 比如 escape 已经发生在上一层了，这里只是简单的"再执行一次"）。
     /// `false` → 走最终失败路径，emit ToolExec { Err }。
     fn retryable(&self, kind: &ToolCallErrorKind) -> bool;
-
-    /// 该错误要不要把详细原因喂回 model（追加到 `messages` 里，
-    /// 让 model 在下一轮看到 tool_result 一样的位置）。
-    ///
-    /// 默认策略：
-    /// - `MalformedArgs` / `ToolNotFound` → **不喂回**。model 看自己上
-    ///   一轮的输出"修正"通常产出更多错误（形成死循环）。
-    /// - `HookAborted` / `Execution` / `Timeout` → 喂回。model 知道
-    ///   hook 拒绝或网络挂了，决策树会换路径。
-    fn loopback_to_model(&self, kind: &ToolCallErrorKind) -> bool;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,15 +120,6 @@ impl RetryPolicy for DefaultRetryPolicy {
             | ToolCallErrorKind::HookAborted { .. }
             | ToolCallErrorKind::PermanentExec { .. } => false,
         }
-    }
-    fn loopback_to_model(&self, kind: &ToolCallErrorKind) -> bool {
-        matches!(
-            kind,
-            ToolCallErrorKind::HookAborted { .. }
-                | ToolCallErrorKind::Execution { .. }
-                | ToolCallErrorKind::PermanentExec { .. }
-                | ToolCallErrorKind::Timeout
-        )
     }
 }
 use crate::trace::ParsedCall;
@@ -317,6 +301,28 @@ impl Agent {
             model_chain,
             params,
         })
+    }
+
+    /// 热替换整条 model chain（UI 保存模型配置后由
+    /// `AgentRunner::maybe_reload_models` 调用）。重建所有 client
+    /// （api_key/base_url 烘焙在 client 里，必须重建才能生效），
+    /// 同步 `client`/`model_id` 快捷字段；cooldown 随旧 client 丢弃
+    /// （新配置重新计冷却，语义正确——换 key 后旧冷却不该沿用）。
+    /// 会话 context 不受影响。
+    pub fn reload_models(&mut self, models: Vec<latte_ai::models::Model>) -> AgentResult<()> {
+        if models.is_empty() {
+            return Err(AgentError::InvalidParam(
+                "model chain must contain at least one model".into(),
+            ));
+        }
+        let model_chain: Vec<ModelClient> = models
+            .into_iter()
+            .map(ModelClient::new)
+            .collect::<AgentResult<Vec<_>>>()?;
+        self.model_id = model_chain[0].model.id.clone();
+        self.client = model_chain[0].client.clone();
+        self.model_chain = model_chain;
+        Ok(())
     }
 
 
@@ -747,10 +753,26 @@ pub struct AgentRunner {
     /// `Agent::chat_stream` 消费 Delta 事件，UI 逐 token 渲染；
     /// `None` / `load(false)` 时走非流式 `Agent::chat`（默认）。
     stream_mode: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 模型热更新源：Some(_) 时 `run_turn` 入口与「模型不可用暂停→
+    /// 恢复重试」点会比对 resolver 代际，配置变了就用
+    /// `Agent::reload_models` 重建 model chain——UI 保存模型配置后
+    /// 运行中的 session 不用重启即可生效。None = 不热更新（测试/
+    /// 嵌入方自建 runner 的默认）。
+    model_source: Option<RunnerModelSource>,
     // 强制 native function-calling：tool schema 经 GenerateParams.tools
     // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
     // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
     // `tools` 字段。tool_choice 取自 `agent.params.tool_choice`（默认 Auto）。
+}
+
+/// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
+/// 来的，以及构建时的配置代际。
+#[derive(Clone)]
+struct RunnerModelSource {
+    resolver: std::sync::Arc<crate::model_resolver::ModelResolver>,
+    tier: crate::model_resolver::ModelTier,
+    chain_ids: Vec<String>,
+    applied_generation: u64,
 }
 
 /// 把 ToolError 归类到 `ToolCallErrorKind`。
@@ -1072,6 +1094,7 @@ impl AgentRunner {
             pause_gate: None,
             agent_pause_gate: None,
             stream_mode: None,
+            model_source: None,
         }
     }
     pub fn new_with_tools(
@@ -1098,6 +1121,7 @@ impl AgentRunner {
             pause_gate: None,
             agent_pause_gate: None,
             stream_mode: None,
+            model_source: None,
         }
     }
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
@@ -1120,6 +1144,7 @@ impl AgentRunner {
             pause_gate: None,
             agent_pause_gate: None,
             stream_mode: None,
+            model_source: None,
         }
     }
 
@@ -1194,6 +1219,68 @@ impl AgentRunner {
     pub fn with_stream_mode(mut self, stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.stream_mode = Some(stream_mode);
         self
+    }
+
+    /// 挂上模型热更新源。`chain_ids` 应为构建本 runner 时使用的
+    /// `role.model_chain`（解析参数原样保留，重载时按新配置重新解析）。
+    pub fn with_model_hot_reload(
+        mut self,
+        resolver: std::sync::Arc<crate::model_resolver::ModelResolver>,
+        tier: crate::model_resolver::ModelTier,
+        chain_ids: Vec<String>,
+    ) -> Self {
+        let applied_generation = resolver.generation();
+        self.model_source = Some(RunnerModelSource {
+            resolver,
+            tier,
+            chain_ids,
+            applied_generation,
+        });
+        self
+    }
+
+    /// 配置代际变了就重新解析并替换 model chain。调用点：`run_turn`
+    /// 入口、「模型不可用暂停 → 用户 ▶ 恢复」的重试前——后者正是
+    /// 「模型挂了 → 用户在 UI 改配置 → 点继续」的救命路径。解析失败
+    /// 或空链时保留旧链（配置可能处于中间态），代际照样推进避免每个
+    /// turn 重复解析。
+    fn maybe_reload_models(&mut self) {
+        let Some(src) = self.model_source.as_ref() else {
+            return;
+        };
+        let gen = src.resolver.generation();
+        if gen == src.applied_generation {
+            return;
+        }
+        let resolver = src.resolver.clone();
+        let tier = src.tier;
+        let chain_ids = src.chain_ids.clone();
+        match resolver.resolve_chain(&self.role_id, tier, &chain_ids) {
+            Ok(models) if !models.is_empty() => {
+                let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+                match self.agent.reload_models(models) {
+                    Ok(()) => {
+                        tracing::info!(
+                            role = %self.role_id,
+                            chain = ?ids,
+                            "model config changed (gen {gen}), model chain reloaded"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(role = %self.role_id, "model chain reload failed: {e}; keeping old chain");
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    role = %self.role_id,
+                    "model config changed (gen {gen}) but re-resolve yielded no usable model; keeping old chain"
+                );
+            }
+        }
+        if let Some(src) = self.model_source.as_mut() {
+            src.applied_generation = gen;
+        }
     }
 
     /// 当前是否处于流式模式。`stream_mode` 未设置或 `load(false)` 时返回 false。
@@ -1361,6 +1448,8 @@ impl AgentRunner {
         if let Some(gate) = self.agent_pause_gate.clone() {
             let _ = gate.wait_until_resumed(None).await;
         }
+        // 模型配置热更新：turn 边界比对配置代际，变了就重建 model chain。
+        self.maybe_reload_models();
         // HIL blackboard: drain per-role inject queue.
         // Advisor monitor: drain pending hints into the context
         // *before* the working message list is built below, so the
@@ -1519,6 +1608,9 @@ impl AgentRunner {
                             if !self.pause_wait_model_unavailable(&e).await {
                                 return Err(e);
                             }
+                            // 用户在暂停期间可能已在 UI 改了模型配置：
+                            // 重试前先热更新 chain。
+                            self.maybe_reload_models();
                         }
                         Err(e) => return Err(e),
                     }
@@ -1580,6 +1672,9 @@ impl AgentRunner {
                             if !self.pause_wait_model_unavailable(&e).await {
                                 return Err(e);
                             }
+                            // 用户在暂停期间可能已在 UI 改了模型配置：
+                            // 重试前先热更新 chain。
+                            self.maybe_reload_models();
                         }
                         Err(e) => return Err(e),
                     }
@@ -1811,10 +1906,10 @@ impl AgentRunner {
                             Ok(result_str) => {
                                 messages.push(Message::tool_result(r.id, result_str));
                             }
-                            Err((kind, detail)) => {
-                                if self.retry_policy.loopback_to_model(&kind) {
-                                    messages.push(Message::tool_result(r.id, detail));
-                                }
+                            Err((_kind, detail)) => {
+                                // 协议闭环：每个 tool_call_id 都必须有对应
+                                // tool 消息，否则下一轮请求 400。
+                                messages.push(Message::tool_result(r.id, detail));
                             }
                         }
                     }
@@ -1845,10 +1940,9 @@ impl AgentRunner {
                     //   MalformedArgs / Execution / Timeout -> 重试一次
                     //   ToolNotFound / HookAborted           -> 不重试
                     //
-                    // 重试 ≠ 重新问 model。本层自动 reparse / reexecute，
-                    // model 只在 *最终失败 + 错误该让 model 知道时* 才
-                    // 看到 tool_result。避免"看自己错误输出又产出
-                    // 同样错误"的死循环。
+                    // 重试 ≠ 重新问 model。本层自动 reparse / reexecute；
+                    // 终态无论成败都会以 tool_result 喂回 model（协议闭环
+                    // 要求），死循环防护由 LoopDetector 承担。
                     let policy = self.retry_policy.clone();
                     let mut attempt: u32 = 0;
                     let max_attempts: u32 = 2;
@@ -2051,26 +2145,28 @@ impl AgentRunner {
                         Ok(result_str) => {
                             messages.push(Message::tool_result(tc.id.clone(), result_str));
                         }
-                        Err((kind, detail)) => {
-                            // 不把错误消息喂回 model 的 kind（MalformedArgs /
-                            // ToolNotFound）会形成死循环（model 看自己上
-                            // 一轮的输出"修正"通常产出更多错误）。
-                            if policy.loopback_to_model(&kind) {
-                                // 截断错误消息：长 payload（write/edit 类的大内容）
-                                // 不截断会 echo 回 model 变成巨大 tool_result。
-                                const MAX_ERR_CHARS: usize = 256;
-                                let truncated = if detail.len() > MAX_ERR_CHARS {
-                                    format!("{}...\n[error truncated - {} chars]",
-                                        &detail[..MAX_ERR_CHARS],
-                                        detail.len() - MAX_ERR_CHARS,
-                                    )
-                                } else {
-                                    detail
-                                };
-                                messages.push(Message::tool_result(tc.id.clone(), truncated));
-                            }
-                            // 不喂回的：错误已经在 trace 里，UI 也能看；
-                            // model 不需要知道（"它自己改不对"）。
+                        Err((_kind, detail)) => {
+                            // 成功失败都必须回填 tool_result：native 协议要求
+                            // 每个 tool_call_id 都有对应 tool 消息，缺一条
+                            // deepseek 系 API 下一轮直接 400（"tool_calls
+                            // must be followed by tool messages"），整个会话
+                            // 卡死（jemalloc 日志事故：architect 调了未授权的
+                            // bash，ToolNotFound 不回填 → 历史破损 → 模型
+                            // 链全灭 → 会话永久暂停）。防"模型看自己错误
+                            // 输出循环恶化"靠 LoopDetector，不靠断链。
+                            //
+                            // 截断错误消息：长 payload（write/edit 类的大内容）
+                            // 不截断会 echo 回 model 变成巨大 tool_result。
+                            const MAX_ERR_CHARS: usize = 256;
+                            let truncated = if detail.len() > MAX_ERR_CHARS {
+                                format!("{}...\n[error truncated - {} chars]",
+                                    &detail[..MAX_ERR_CHARS],
+                                    detail.len() - MAX_ERR_CHARS,
+                                )
+                            } else {
+                                detail
+                            };
+                            messages.push(Message::tool_result(tc.id.clone(), truncated));
                         }
                     }
                 }
@@ -2434,7 +2530,7 @@ mod tests {
     }
 
     /// 永久性错误（工具不存在 / ENOENT / 参数非法）不重试；瞬时错误
-    /// 重试一次。所有 permanent 错误仍喂回 model 让它换路径。
+    /// 重试一次。所有错误终态都以 tool_result 回填（协议闭环）。
     #[test]
     fn permanent_tool_errors_are_not_retried() {
         let policy = DefaultRetryPolicy;
@@ -2442,13 +2538,12 @@ mod tests {
         let kind = classify_tool_execution_error(&ToolError::ToolNotFound("bash".into()));
         assert!(matches!(kind, ToolCallErrorKind::ToolNotFound { .. }));
         assert!(!policy.retryable(&kind));
-        // ENOENT → PermanentExec，不重试但喂回 model
+        // ENOENT → PermanentExec，不重试
         let kind = classify_tool_execution_error(&ToolError::other(
             "stat: No such file or directory (os error 2)",
         ));
         assert!(matches!(kind, ToolCallErrorKind::PermanentExec { .. }));
         assert!(!policy.retryable(&kind));
-        assert!(policy.loopback_to_model(&kind));
         // 缺必填参数 → PermanentExec
         let kind = classify_tool_execution_error(&ToolError::other("path is required"));
         assert!(!policy.retryable(&kind));
@@ -2805,6 +2900,65 @@ mod tests {
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
+    }
+
+    /// 模型热更新：resolver 代际变了以后，maybe_reload_models 重建
+    /// model chain（run_turn 入口与「模型不可用暂停→恢复」重试前都调）。
+    #[test]
+    fn hot_reload_swaps_model_chain_on_generation_bump() {
+        use crate::config::{AgentConfig, ModelCatalog, ModelDef};
+        fn cfg_with(id: &str) -> AgentConfig {
+            AgentConfig {
+                models: ModelCatalog {
+                    models: vec![ModelDef {
+                        name: id.into(),
+                        api: "openai".into(),
+                        provider: "test".into(),
+                        base_url: "http://localhost:1".into(),
+                        api_key: "k".into(),
+                        context_window: 32000,
+                        max_tokens: 4096,
+                        supports_thinking: false,
+                        supports_vision: false,
+                        supports_image_generation: false,
+                        cost_per_million_input: Some(0.0),
+                        cost_per_million_output: Some(0.0),
+                        tier: None,
+                        timeout_secs: None,
+                    }],
+                    tiers: None,
+                    role_tiers: None,
+                },
+                roles: Default::default(),
+            }
+        }
+        let resolver = std::sync::Arc::new(
+            crate::model_resolver::ModelResolver::from_config(&cfg_with("m-old")).unwrap(),
+        );
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent).with_model_hot_reload(
+            resolver.clone(),
+            ModelTier::Standard,
+            vec!["m-old".to_string()],
+        );
+        // 代际未变：不动（test_model 的 id 与 m-old 不同，正好用来区分
+        // 「没重建」和「重建了」）。
+        runner.maybe_reload_models();
+        assert_eq!(runner.agent.model_id, "test-model");
+        // 代际变了：按新配置重新解析（chain 里的 m-old 已不存在 →
+        // 回退 tier 解析到 m-new），链重建。
+        resolver.reload_from_config(&cfg_with("m-new")).unwrap();
+        runner.maybe_reload_models();
+        assert_eq!(runner.agent.model_id, "m-new");
+        // 再次调用：代际已同步，不重复重建。
+        runner.maybe_reload_models();
+        assert_eq!(runner.agent.model_id, "m-new");
     }
 
     /// 模型全链不可用 + 挂了 session 暂停门 → 自动暂停（带原因），
@@ -3982,11 +4136,15 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 2, "should still make round-2 call after parse failure");
         let body2 = String::from_utf8_lossy(&reqs[1].body);
-        // 新行为：MalformedArgs 不回喂 model —— 第 2 轮请求里不含任何
-        // [tool_error] 内容，避免 model 看自己上一轮错误输出循环恶化。
+        // 协议闭环：MalformedArgs 也以 tool 消息回填 call_ping，否则
+        // assistant 的 tool_calls 没有对应 tool 消息，下游 API 直接 400。
         assert!(
-            !body2.contains("[tool_error for ping]"),
-            "MalformedArgs must NOT loopback to model: {body2}"
+            body2.contains("\"tool_call_id\":\"call_ping\""),
+            "MalformedArgs must still close the tool_call_id loop: {body2}"
+        );
+        assert!(
+            body2.contains("invalid JSON"),
+            "error detail should be fed back so the model stops retrying: {body2}"
         );
     }
 
