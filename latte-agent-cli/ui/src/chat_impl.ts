@@ -227,6 +227,10 @@ export function mountChat(opts: {
   const streamingRaw = new Map<string, string>();
   /** wf_id:step_id → WorkflowStep 消息的 msgId（WorkflowTurn 做引用用） */
 const stepMsgIds = new Map<string, string>();
+  /** 最近渲染过的 WorkflowTurn 正文（去重用）。嵌套 workflow 结束时，
+   *  父引擎会把内层产出以 role_id="workflow:X" 再发一遍，内容与内层
+   *  最后一个 turn 完全相同；原样渲染会在聊天里重复一遍全文。 */
+  const recentTurnContents: string[] = [];
   /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
   const workflowTranscripts = new Map<string, string>();
   /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
@@ -1880,14 +1884,30 @@ const stepMsgIds = new Map<string, string>();
           ? (getMsgById(delegateMsgId)?.content ?? "").replace(/^@\S+\s+/, "").slice(0, 30)
           : "workflow 任务";
         const ref = delegateMsgId ? { refId: delegateMsgId, preview: taskPreview } : undefined;
-        addMessage({
-          kind: "role",
-          content: e.content,
-          meta: `${e.role_id}（workflow）`,
-          icon,
-          filePath: getFilePath(e.role_id),
-          reference: ref,
-        });
+        // 嵌套 workflow 回声去重：父 step 的 WorkflowTurn（role_id 为
+        // "workflow:X"）携带的是内层 workflow 的整份产出，与刚渲染过
+        // 的内层 turn 正文相同；此时只留一条引用提示，不重复贴全文。
+        const trimmed = e.content.trim();
+        const isNestedEcho =
+          e.role_id.startsWith("workflow:") && recentTurnContents.includes(trimmed);
+        if (isNestedEcho) {
+          addMessage({
+            kind: "system",
+            content: `↩ ${e.role_id} 步产出与上方内容相同，不再重复展示`,
+            reference: ref,
+          });
+        } else {
+          addMessage({
+            kind: "role",
+            content: e.content,
+            meta: `${e.role_id}（workflow）`,
+            icon,
+            filePath: getFilePath(e.role_id),
+            reference: ref,
+          });
+          recentTurnContents.push(trimmed);
+          if (recentTurnContents.length > 20) recentTurnContents.shift();
+        }
         workflowTranscripts.set(
           e.wf_id,
           (workflowTranscripts.get(e.wf_id) ?? "") + "\n" + e.content,
