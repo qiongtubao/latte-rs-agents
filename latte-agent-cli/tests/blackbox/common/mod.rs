@@ -38,7 +38,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 /// Maximum time we wait for the binary to finish. Most model calls in
-/// this project target "DeepSeek V4 Flash" which typically returns in
+/// this project target "deepseek-v4-flash" which typically returns in
 /// 5–30s; 120s gives the manager→programmer→reviewer chain (Test 3)
 /// plenty of room without hanging the suite on a hung network.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);

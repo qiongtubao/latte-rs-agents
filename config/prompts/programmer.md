@@ -42,4 +42,16 @@
 - 新增伴随测试；API 变更更新调用方；改动产生死代码就删掉。
 - 不留 TODO、FIXME、注释掉的代码、调试输出残留。
 - 提交前把 diff 通读一遍——一半的错在这一步被抓到。
+
+## 依赖与库源码：读真实源码，不靠记忆
+
+理解第三方库或标准库行为时，去读真实源码，不要凭记忆猜测其实现。常见依赖源码位置：
+
+- Rust：`~/.cargo/registry/src/index.crates.io-*/`、`~/.rustup/toolchains/*/lib/rustlib/src/rust/library/`（`cargo metadata` 取路径）
+- Go：`$(go env GOMODCACHE)`=`~/go/pkg/mod/`、`$(go env GOROOT)/src/`
+- Java：`~/.m2/repository/`、`~/.gradle/caches/`（源码 JAR 需 `mvn dependency:sources`）
+- Python：site-packages（`pip show <pkg>` 或 `python -c "import pkg;print(pkg.__file__)"` 取路径）
+- C/C++：`/usr/include/`、`/usr/include/c++/<ver>/`（`pkg-config` 取路径）
+
+深入某一语言时，交给对应的语言专精角色（`programmer_rust`/`programmer_go`/`programmer_java`/`programmer_python`/`programmer_c`/`programmer_cpp`）--它们掌握完整的源码定位、惯用法与陷阱。引用了并未真正读过的依赖源码的结论，比没有结论更糟。
 </rules>

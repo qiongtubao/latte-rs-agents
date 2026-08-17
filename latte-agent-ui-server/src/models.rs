@@ -185,6 +185,139 @@ impl ModelsState {
         }
     }
 
+    /// 把 ModelDef 写回它在该层目录里**实际所在的文件**。
+    ///
+    /// 写入策略（修复「保存时新建 `<provider>__<id>.toml` 而不更新源文件」）：
+    /// 1. 扫描 `dir`，找到包含 `key` 的文件，原地更新：
+    ///    - `[[models]]` 厂商拆分文件（如 `glm.toml` 含多条 model）只替换
+    ///      对应条目，**保留同文件其它 model**；
+    ///    - `[models]` + `[[models.models]]` 项目 schema 文件替换
+    ///      `models.models` 里的条目，tiers 等其余字段随整体序列化保留；
+    ///    - flat 单 ModelDef 文件直接覆盖。
+    /// 2. 该层没有任何文件包含 `key` 时，才新建 `<provider>__<id>.toml`
+    ///    （flat 单条格式，与旧行为一致）。
+    ///
+    /// 注意：原地更新按 serde 整体重新序列化，原文件里的注释/排版会丢失，
+    /// 但所有配置项（含同文件其它 model）都会保留。
+    pub fn write_to_layer(dir: &Path, key: &str, def: &ModelDef) -> Result<PathBuf> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow!("mkdir {}: {e}", dir.display()))?;
+        if let Some(path) = Self::find_file_containing(dir, key) {
+            Self::update_entry_in_file(&path, key, def)?;
+            return Ok(path);
+        }
+        let path = dir.join(key_to_filename(key));
+        let content = toml::to_string_pretty(def)
+            .map_err(|e| anyhow!("serialize {key}: {e}"))?;
+        atomic_write(&path, &content)?;
+        Ok(path)
+    }
+
+    /// 在 `dir` 下找到包含 `key`（`provider/name`）的 model 文件。
+    fn find_file_containing(dir: &Path, key: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = match p.extension().and_then(|s| s.to_str()) {
+                Some(e) if matches!(e, "toml" | "yaml" | "yml") => e,
+                _ => continue,
+            };
+            let content = match std::fs::read_to_string(&p) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let hit = parse_models_in_file(&content, ext)
+                .iter()
+                .any(|m| format!("{}/{}", m.provider, m.name) == key);
+            if hit {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    /// 原地更新文件里 `key` 对应的条目，保留文件内其它内容对应的配置。
+    /// 三种 schema 分别处理（与 [`parse_models_in_file`] 的解析顺序对称）。
+    fn update_entry_in_file(path: &Path, key: &str, def: &ModelDef) -> Result<()> {
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("toml");
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+        let matches_key = |m: &ModelDef| format!("{}/{}", m.provider, m.name) == key;
+        let out = match ext {
+            "yaml" | "yml" => {
+                if let Ok(mut doc) = serde_yaml::from_str::<ModelsFile>(&content) {
+                    if !doc.models.is_empty() {
+                        for m in doc.models.iter_mut().filter(|m| matches_key(m)) {
+                            *m = def.clone();
+                        }
+                        serde_yaml::to_string(&doc)
+                            .map_err(|e| anyhow!("serialize {}: {e}", path.display()))?
+                    } else {
+                        Self::update_entry_in_file_agent_config_yaml(&content, def, matches_key)?
+                    }
+                } else {
+                    Self::update_entry_in_file_agent_config_yaml(&content, def, matches_key)?
+                }
+            }
+            _ => {
+                if let Ok(mut doc) = toml::from_str::<ModelsFile>(&content) {
+                    if !doc.models.is_empty() {
+                        for m in doc.models.iter_mut().filter(|m| matches_key(m)) {
+                            *m = def.clone();
+                        }
+                        toml::to_string_pretty(&doc)
+                            .map_err(|e| anyhow!("serialize {}: {e}", path.display()))?
+                    } else {
+                        Self::update_entry_in_file_agent_config_toml(&content, def, matches_key)?
+                    }
+                } else {
+                    Self::update_entry_in_file_agent_config_toml(&content, def, matches_key)?
+                }
+            }
+        };
+        atomic_write(path, &out)
+    }
+
+    /// TOML 的 `[models]` + `[[models.models]]`（AgentConfig schema）或
+    /// flat 单条格式的原地更新。
+    fn update_entry_in_file_agent_config_toml(
+        content: &str,
+        def: &ModelDef,
+        matches_key: impl Fn(&ModelDef) -> bool,
+    ) -> Result<String> {
+        if let Ok(mut cfg) = toml::from_str::<AgentConfig>(content) {
+            if !cfg.models.models.is_empty() {
+                for m in cfg.models.models.iter_mut().filter(|m| matches_key(m)) {
+                    *m = def.clone();
+                }
+                return toml::to_string_pretty(&cfg)
+                    .map_err(|e| anyhow!("serialize AgentConfig: {e}"));
+            }
+        }
+        // flat 单 ModelDef：直接覆盖为单条。
+        toml::to_string_pretty(def).map_err(|e| anyhow!("serialize ModelDef: {e}"))
+    }
+
+    /// YAML 版 [`Self::update_entry_in_file_agent_config_toml`]。
+    fn update_entry_in_file_agent_config_yaml(
+        content: &str,
+        def: &ModelDef,
+        matches_key: impl Fn(&ModelDef) -> bool,
+    ) -> Result<String> {
+        if let Ok(mut cfg) = serde_yaml::from_str::<AgentConfig>(content) {
+            if !cfg.models.models.is_empty() {
+                for m in cfg.models.models.iter_mut().filter(|m| matches_key(m)) {
+                    *m = def.clone();
+                }
+                return serde_yaml::to_string(&cfg)
+                    .map_err(|e| anyhow!("serialize AgentConfig: {e}"));
+            }
+        }
+        serde_yaml::to_string(def).map_err(|e| anyhow!("serialize ModelDef: {e}"))
+    }
+
     /// 写一个 ModelDef 到全局目录 `~/.latte/models.d/<provider>__<id>.toml`。
     /// 用于「保存到全局」按钮 —— 把当前 model 配置提升到全局层，
     /// 与 `GlobalConfig::load_default` 后续加载行为一致。
@@ -221,7 +354,7 @@ impl ModelsState {
 /// 字段名 = `models` 的父 struct 来接住 `[[models]]` 这层命名。
 /// 这是 `GlobalConfig::RouterStyleDoc` 的最小复刻 —— 那个 struct 是
 /// private，所以这里本地定义一份（YAML 同理）。
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ModelsFile {
     #[serde(default)]
     models: Vec<ModelDef>,
@@ -487,6 +620,128 @@ max_tokens = 8192\n\
             state.sources["anthropic/claude-opus-4-20250514"],
             ModelSource::Project
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 回归：model 来自全局 `~/.latte/models.d/glm.toml`（厂商拆分、
+    /// 单文件多 model）时，「保存到全局」必须**原地更新 glm.toml 里
+    /// 对应的条目**，而不是新建 `glm__glm-5.2.toml`（旧行为会把配置
+    /// 写成一个新 flat 文件，源文件里的旧值继续生效，且多 model 文件
+    /// 被绕过）。
+    #[test]
+    fn write_to_layer_updates_entry_in_vendor_split_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "latte-models-inplace-{}",
+            std::process::id()
+        ));
+        let glob = tmp.join("global");
+        std::fs::create_dir_all(&glob).unwrap();
+
+        std::fs::write(
+            glob.join("glm.toml"),
+            "\
+[[models]]\n\
+name = \"glm-5.2\"\n\
+api = \"openai\"\n\
+provider = \"glm\"\n\
+base_url = \"https://open.bigmodel.cn/api/paas/v4\"\n\
+api_key = \"sk-old\"\n\
+context_window = 200000\n\
+max_tokens = 8192\n\
+\n\
+[[models]]\n\
+name = \"glm-4.5\"\n\
+api = \"openai\"\n\
+provider = \"glm\"\n\
+base_url = \"https://open.bigmodel.cn/api/paas/v4\"\n\
+api_key = \"sk-keep\"\n\
+context_window = 131072\n\
+max_tokens = 4096\n\
+",
+        )
+        .unwrap();
+
+        let mut def = sample_def();
+        def.provider = "glm".into();
+        def.name = "glm-5.2".into();
+        def.api_key = "sk-new".into();
+
+        let path = ModelsState::write_to_layer(&glob, "glm/glm-5.2", &def).unwrap();
+        // 写回原文件，而不是新建 key 命名的文件。
+        assert_eq!(path.file_name().unwrap(), "glm.toml");
+        assert!(!glob.join("glm__glm-5.2.toml").exists());
+
+        let state = ModelsState::load(&tmp.join("proj-none"), &glob).unwrap();
+        assert_eq!(state.merged["glm/glm-5.2"].api_key, "sk-new");
+        // 同文件其它 model 必须原样保留。
+        assert_eq!(state.merged["glm/glm-4.5"].api_key, "sk-keep");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `[models]` + `[[models.models]]`（AgentConfig schema）文件原地更新时，
+    /// tiers 等其余配置必须随整体序列化保留。
+    #[test]
+    fn write_to_layer_preserves_tiers_in_agent_config_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "latte-models-inplace-cfg-{}",
+            std::process::id()
+        ));
+        let proj = tmp.join("project");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        std::fs::write(
+            proj.join("shared.toml"),
+            "\
+[models.tiers]\n\
+premium = \"openai/gpt-4o\"\n\
+\n\
+[[models.models]]\n\
+name = \"gpt-4o\"\n\
+api = \"openai\"\n\
+provider = \"openai\"\n\
+base_url = \"https://api.openai.com\"\n\
+api_key = \"sk-old\"\n\
+context_window = 128000\n\
+max_tokens = 4096\n\
+",
+        )
+        .unwrap();
+
+        let mut def = sample_def();
+        def.api_key = "sk-new".into();
+        let path = ModelsState::write_to_layer(&proj, "openai/gpt-4o", &def).unwrap();
+        assert_eq!(path.file_name().unwrap(), "shared.toml");
+
+        // tiers 映射不能丢。
+        let content = std::fs::read_to_string(&path).unwrap();
+        let cfg: AgentConfig = toml::from_str(&content).unwrap();
+        assert_eq!(
+            cfg.models.tiers.as_ref().unwrap()["premium"],
+            "openai/gpt-4o"
+        );
+        assert_eq!(cfg.models.models[0].api_key, "sk-new");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 目标层没有任何文件包含该 key 时，退回旧行为：新建
+    /// `<provider>__<id>.toml` flat 单条文件。
+    #[test]
+    fn write_to_layer_creates_flat_file_when_key_absent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "latte-models-inplace-new-{}",
+            std::process::id()
+        ));
+        let dir = tmp.join("layer");
+        let def = sample_def();
+        let path = ModelsState::write_to_layer(&dir, "openai/gpt-4o", &def).unwrap();
+        assert_eq!(path.file_name().unwrap(), "openai__gpt-4o.toml");
+        assert!(path.exists());
+
+        let state = ModelsState::load(&dir, &tmp.join("none")).unwrap();
+        assert_eq!(state.merged["openai/gpt-4o"].api_key, "sk-test");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

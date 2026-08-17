@@ -936,6 +936,10 @@ impl ChatController {
     /// 时长 ms；若本来就没 paused 返回 `None`。Resumed 事件同样由
     /// on_change listener 统一广播。
     pub fn resume_session(&self) -> Option<u128> {
+        // 与 `resume()` 对齐：用户点「继续」同样算对 advisor pause gate
+        // 拍板，否则 advisor 暂停（只置 advisor 门，不 engage
+        // agent_pause_gate）永远无法通过 resume-session 解除。
+        self.advisor_pause.resolve();
         self.agent_pause_gate.resume()
     }
 
@@ -2601,18 +2605,20 @@ pub(crate) async fn build_tool_manager(
         mgr.register_package(p).await
             .map_err(|e| format!("register_package: {e}"))?;
     }
-    // allowed 里是配置层扁平名（bash/read/edit/...）。latte-rs-agent-tools
-    // 扁平化之后 registry 名与配置名一致（"bash"/"read"/"git_status"/...），
-    // 直接进 keep；仅个别工具仍带点号注册名，需要补一条映射。
+    // allowed 里是配置层扁平名（bash/read/edit/...）。大多数注册名的
+    // 点号短名与配置名一致（file.read→read、shell.exec→exec），直接进
+    // keep；个别名字对不上的靠下面的 flat_to_registry 补映射。
     let mut keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
-    // 配置层扁平名 → registry 注册名。只剩 browser/todo 两个包仍用
-    // 点号注册名（browser.browser / todo.todo）。
+    // 配置层扁平名 → registry 注册名。browser/todo 两个包仍用
+    // 点号注册名（browser.browser / todo.todo）；bash 是 shell.exec
+    // 的历史别名（其点号短名是 exec，不映射会被静默丢弃）。
     let flat_to_registry: std::collections::HashMap<&str, &str> = [
         ("todo", "todo.todo"),
         ("browser", "browser.browser"),
+        ("bash", "shell.exec"),
     ].into_iter().collect();
     for (flat, registry) in &flat_to_registry {
         if keep.contains(*flat) {
@@ -2724,19 +2730,19 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         .build()
 }
 
-pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
-    let names_str = allowed.join(", ");
-    format!(
-        r#"
+pub(crate) fn tool_usage_prompt(_allowed: &[String]) -> String {
+    // 不在 prompt 里枚举工具名：可用工具完全由请求 `tools` 字段的
+    // schema 决定（"一切按照工具选择来"）。配置层别名（如 bash）与
+    // 注册表名字一旦漂移，枚举出来的清单就是在对模型撒谎。
+    r#"
 ## Tools
 
-You have access to the following tools: {names_str}.
 Call tools via the native function-calling interface (the request `tools`
 field carries each tool's name, description, and JSON schema). Do NOT emit
 `<tool_call>` text blocks -- they are no longer parsed. Inspect each tool
 result and continue until the task is done.
 "#
-    )
+    .to_string()
 }
 
 /// 当前配置里的角色花名册：`id(Name)` 排序拼接。delegate 工具的
@@ -5620,8 +5626,8 @@ mod tests {
         controller.abort().await;
     }
 
-    /// 锁定 bash 工具的 schema 契约：allowed "bash" 保留 registry 的
-    /// "bash" 工具（命名空间已扁平化），且接受 {command, cwd}
+    /// 锁定 bash 别名的契约：allowed "bash" 通过 flat_to_registry 映射
+    /// 保留 registry 的 "shell.exec" 工具，且接受 {command, cwd}
     /// （cwd 由 resolve_tool_input_against_cwd 注入）。
     #[tokio::test]
     async fn bash_tool_kept_and_accepts_cwd() {
@@ -5629,13 +5635,13 @@ mod tests {
             .await
             .expect("build_tool_manager");
         let names: Vec<String> = mgr.get_tool_names();
-        assert!(names.contains(&"bash".to_string()), "bash 应被保留: {names:?}");
-        // bash 必须接受 {command, cwd}。
+        assert!(names.contains(&"shell.exec".to_string()), "bash 别名应保留 shell.exec: {names:?}");
+        // shell.exec 必须接受 {command, cwd}。
         let args = serde_json::json!({"command":"pwd","cwd":"/tmp"});
-        let r = mgr.execute("bash", args, None).await;
-        assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
+        let r = mgr.execute("shell.exec", args, None).await;
+        assert!(r.is_ok(), "shell.exec 应接受 {{command,cwd}}，却失败: {:?}", r.err());
         // eval 不在 allowed 里，被过滤掉。
-        assert!(!names.contains(&"eval".to_string()), "eval 不应被保留（不在 allowed）: {names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("eval.")), "eval 不应被保留（不在 allowed）: {names:?}");
     }
 
     /// Advisor gate 端到端（driver 级）：manager turn 产出连续撞 D5

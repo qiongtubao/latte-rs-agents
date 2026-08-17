@@ -1,8 +1,8 @@
 # Screenshot Skill — 使用 Playwright 截取 UI 截图并分析
 
-## 工具：screenshot
+## 概述
 
-通过 `bash` 工具调用 Playwright/Chromium 截取页面截图。
+使用 Playwright/Chromium 截取页面截图。
 
 ### 基本用法
 
@@ -49,7 +49,7 @@ data:image/png;base64,iVBORw0KGgo...
 ### 工作流示例
 
 ```
-1. bash {"command": "cd /home/dong/Documents/latte/latte-rs-agents/latte-agent-cli/ui && node screenshot.mjs"}
-2. bash {"command": "base64 -w0 /tmp/latte-shot.png"} → 获取 data URI
+1. 运行 `cd /home/dong/Documents/latte/latte-rs-agents/latte-agent-cli/ui && node screenshot.mjs`
+2. 运行 `base64 -w0 /tmp/latte-shot.png` → 获取 data URI
 3. 将 data URI 作为图片消息发给 vision 模型分析
 ```

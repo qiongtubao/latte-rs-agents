@@ -11,8 +11,15 @@
 #   2. Project config  (this file, typically config/models.toml)
 #   3. CLI overrides   (--api-key, --model-override id.field=value)
 #
-# Within each layer, identical model.id entries merge by filling empty fields
-# (a project model with a real api_key is not clobbered by a global entry).
+# Within each layer, identical provider/name entries merge by filling empty
+# fields (a project model with a real api_key is not clobbered by a global
+# entry).
+#
+# ⚠️ `ModelDef` 没有独立的 `id` 字段：`name` 就是 model id（同时是 API 请求
+# 里的 `model` 字段和 tier 映射引用的键）。历史上这里写过
+# `id = "claude-opus-4-20250514"` + `name = "Claude Opus 4"`（展示名），
+# serde 静默丢弃 `id`，导致 catalog 里出现 `anthropic/Claude Opus 4`
+# 这种无法解析的脏条目 —— 不要这么写。
 
 # ─── Tier Mappings ───────────────────────────────────────────────────────────
 # Global tier → model_id. These are the defaults used when a role has no
@@ -20,10 +27,13 @@
 #   premium  — best available model (highest quality, highest cost)
 #   standard — balanced quality/cost
 #   budget   — fast/cheap model (lowest cost, acceptable quality)
+#
+# 2026-08-17: 移除 anthropic/openai/ollama 条目（无 API key、qwen2.5-coder
+# 未拉取），tier 默认全部落到有 key 的 deepseek。
 
 [models.tiers]  # was: [tiers] (top-level) — serde ignored it; must nest under [models] for AgentConfig::parse
-premium = "claude-opus-4-20250514"
-standard = "claude-sonnet-4-20250514"
+premium = "deepseek-v4-flash"
+standard = "deepseek-v4-flash"
 budget = "deepseek-chat"
 
 # ─── Per-Role Tier Overrides (optional) ─────────────────────────────────────
@@ -41,25 +51,23 @@ budget = "deepseek-chat"
 # If a tier is not specified for a role, that tier falls back to the global tier.
 
 [models.role_tiers.pm]  # was: [role_tiers.pm] (top-level)
-premium = "claude-opus-4-20250514"
+premium = "deepseek-v4-flash"  # was: claude-opus (no API key)
 standard = "deepseek-v4-flash"  # was: claude-sonnet (no API key) — fallthrough to deepseek-chat hallucinates
 budget = "deepseek-chat"
 
 [models.role_tiers.architect]  # was: [role_tiers.architect] (top-level)
-premium = "claude-opus-4-20250514"
+premium = "deepseek-v4-flash"  # was: claude-opus (no API key)
 standard = "deepseek-v4-flash"  # was: claude-sonnet (no API key)
 budget = "deepseek-chat"
 
 [models.role_tiers.programmer]  # was: [role_tiers.programmer] (top-level)
-premium = "claude-sonnet-4-20250514"
+premium = "deepseek-v4-flash"  # was: claude-sonnet (no API key)
 standard = "deepseek-v4-flash"  # was: deepseek-chat (hallucinates instead of actually invoking tools)
 budget = "deepseek-v4-flash"  # was: qwen2.5-coder-32b-instruct (Ollama timed out at 30s)
 
 [models.role_tiers.manager]  # was: [role_tiers.manager] (top-level)
 # 2026-06-25: switched all three tiers to glm-5.2 (5h resource refresh,
-# user preference). Previously: premium=opus, standard=deepseek-v4-flash,
-# budget=deepseek-chat. Opus stays reachable via the global merged
-# catalog (provider=anthropic) for CLI override use.
+# user preference).
 premium = "glm-5.2"
 standard = "glm-5.2"
 budget = "glm-5.2"
@@ -75,26 +83,25 @@ standard = "deepseek-v4-flash"
 budget = "deepseek-v4-flash"
 
 [models.role_tiers.reviewer_architecture]  # Layer 2 — design/dependency check
-premium = "claude-sonnet-4-20250514"
+premium = "deepseek-v4-flash"  # was: claude-sonnet (no API key)
 standard = "deepseek-v4-flash"
 # deepseek-chat at the budget tier so this role still has a
 # working model even on machines without Ollama running.
 budget = "deepseek-chat"
 
 [models.role_tiers.reviewer_security]  # Layer 3 — deep security/audit
-# Premium goes to opus (full power) for deep audit. Standard is
-# sonnet so the role still works when no opus API key is set.
-# Budget falls back to deepseek-v4-flash.
-premium = "claude-opus-4-20250514"
-standard = "claude-sonnet-4-20250514"
+# was: premium=opus / standard=sonnet (no API key) — 全部落到有 key 的
+# deepseek-v4-flash。
+premium = "deepseek-v4-flash"
+standard = "deepseek-v4-flash"
 budget = "deepseek-v4-flash"
 
 # ─── Model Definitions ───────────────────────────────────────────────────────
 # Each [[models.models]] block defines one AI model.
 #
 # Required fields:
-#   id               — unique identifier, used in tier mappings and CLI flags
-#   name             — human-readable display name
+#   name             — model id：tier 映射/CLI 标志引用的键，同时是 API
+#                      请求里的 `model` 字段（不是展示名！）
 #   api              — API protocol: "anthropic" | "openai" | "google"
 #   provider         — provider slug: "anthropic" | "openai" | "deepseek" | "ollama" | "google"
 #   base_url         — API endpoint base URL
@@ -108,41 +115,10 @@ budget = "deepseek-v4-flash"
 #   cost_per_million_output — USD per 1M output tokens (for cost tracking)
 #   tier             — which tier this model belongs to (informational, not used for resolution)
 
-# ─── Anthropic Models ────────────────────────────────────────────────────────
-
-[[models.models]]
-id = "claude-opus-4-20250514"
-name = "Claude Opus 4"
-api = "anthropic"
-provider = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key = "${ANTHROPIC_API_KEY}"
-context_window = 200000
-max_tokens = 8192
-supports_thinking = true
-cost_per_million_input = 15.0
-cost_per_million_output = 75.0
-tier = "premium"
-
-[[models.models]]
-id = "claude-sonnet-4-20250514"
-name = "Claude Sonnet 4"
-api = "anthropic"
-provider = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key = "${ANTHROPIC_API_KEY}"
-context_window = 200000
-max_tokens = 8192
-supports_thinking = true
-cost_per_million_input = 3.0
-cost_per_million_output = 15.0
-tier = "standard"
-
 # ─── DeepSeek Models ─────────────────────────────────────────────────────────
 
 [[models.models]]
-id = "deepseek-chat"
-name = "DeepSeek Chat V3"
+name = "deepseek-chat"
 api = "openai"
 provider = "deepseek"
 base_url = "https://api.deepseek.com"
@@ -155,8 +131,7 @@ cost_per_million_output = 1.10
 tier = "budget"
 
 [[models.models]]
-id = "deepseek-v4-flash"
-name = "DeepSeek V4 Flash"
+name = "deepseek-v4-flash"
 api = "openai"
 provider = "deepseek"
 base_url = "https://api.deepseek.com"
@@ -167,35 +142,6 @@ supports_thinking = false
 cost_per_million_input = 0.14
 cost_per_million_output = 0.55
 tier = "budget"
-
-# ─── Ollama (Local) Models ───────────────────────────────────────────────────
-
-[[models.models]]
-id = "qwen2.5-coder-32b-instruct"
-name = "Qwen 2.5 Coder 32B"
-api = "openai"
-provider = "ollama"
-base_url = "http://localhost:11434"
-api_key = "ollama"
-context_window = 32768
-max_tokens = 4096
-supports_thinking = false
-tier = "budget"
-
-# ─── OpenAI Models ───────────────────────────────────────────────────────────
-
-[[models.models]]
-id = "gpt-4o"
-name = "GPT-4o"
-api = "openai"
-provider = "openai"
-base_url = "https://api.openai.com"
-api_key = "${OPENAI_API_KEY}"
-context_window = 128000
-max_tokens = 16384
-supports_thinking = false
-cost_per_million_input = 2.50
-cost_per_million_output = 10.0
 
 # ─── GLM Models ──────────────────────────────────────────────────────────────
 # GLM 5.2 (Zhipu/Z.AI). Per-model `timeout_secs = 120` because the model
@@ -210,8 +156,7 @@ cost_per_million_output = 10.0
 # ~/.latte/models.yaml (which is gitignored).
 
 [[models.models]]
-id = "glm-5.2"
-name = "GLM 5.2"
+name = "glm-5.2"
 api = "openai"
 provider = "glm"
 base_url = "https://yuanyuaicloud.cn/v1"

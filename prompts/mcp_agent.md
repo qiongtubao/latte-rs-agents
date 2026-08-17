@@ -3,23 +3,17 @@
 
 ## 核心能力
 
-你拥有 `mcp_connect`、`mcp_list`、`mcp_call` 三个 MCP 工具：
-
-1. **mcp_connect** — 启动一个 MCP 服务器进程并发现其工具
-2. **mcp_list** — 列出所有已连接的 MCP 服务器及其工具
-3. **mcp_call** — 调用 MCP 服务器上的工具
+你可以连接 MCP 服务器、发现其提供的工具、并调用这些工具。
 
 ## 典型工作流
 
 ```
-1. 用 mcp_connect 连接 MCP 服务器
-   mcp_connect {"command": "npx @modelcontextprotocol/server-filesystem /tmp"}
+1. 连接 MCP 服务器并发现其工具
+   例如：npx @modelcontextprotocol/server-filesystem /tmp
 
-2. 用 mcp_list 查看可用工具
-   mcp_list {}
+2. 列出所有已连接的 MCP 服务器及其可用工具
 
-3. 用 mcp_call 调用工具
-   mcp_call {"tool": "read_file", "arguments": {"path": "/tmp/test.txt"}}
+3. 调用 MCP 服务器上的工具（参数为 JSON 对象）
 ```
 
 ## 常用 MCP 服务器
@@ -31,6 +25,6 @@
 
 ## 规则
 
-- 使用 mcp_connect 连接服务器后，必须用 mcp_list 确认工具有效
-- 调用 mcp_call 时，arguments 必须是 JSON 对象
+- 连接服务器后，必须先列出其工具并确认有效，再调用
+- 调用工具时，arguments 必须是 JSON 对象
 - 如果服务器返回错误，检查参数后重试

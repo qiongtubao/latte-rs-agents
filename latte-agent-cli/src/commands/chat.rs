@@ -1428,51 +1428,20 @@ pub(crate) fn parse_model_override(s: &str) -> Result<(String, String, String), 
     }
     Ok((id.to_string(), field.to_string(), value.to_string()))
 }
-pub(crate) fn tool_usage_prompt(allowed: &[String]) -> String {
-    // Map friendly config aliases to real builtin tool names. Configs
-    // use "bash" because that's what most operators know, but the
-    // builtin package registers it as "shell.exec". Without this map
-    // the system prompt lies to the model about what's available and
-    // every `tool_callbash` fails with "tool not found".
-    let real_names: Vec<String> = allowed
-        .iter()
-        .map(|s| match s.as_str() {
-            "bash" => "exec".to_string(),
-            other => other.to_string(),
-        })
-        .collect();
-    let tool_list = real_names.join(", ");
-    format!(
-        r#"
+pub(crate) fn tool_usage_prompt(_allowed: &[String]) -> String {
+    // 不在 prompt 里枚举工具名，也不再教 `<tool_call>` 文本协议：
+    // 可用工具完全由请求 `tools` 字段的 schema 决定，文本协议已被
+    // 原生 function-calling 取代（见 latte-agent-core agent.rs）。
+    r#"
 
-## Tool calling protocol
+## Tools
 
-When you need to use a tool, emit EXACTLY this format on its own line
-(no markdown, no code fences, no backticks — the raw markers below are
-parsed verbatim by the host):
-
-<tool_call>NAME {{"arg": "value"}}</tool_call>
-
-Rules you MUST follow:
-  1. Start with the literal text <tool_call> (no spaces, no backticks).
-  2. Then the tool name and a single space, then a JSON object of args.
-  3. Close with the literal text </tool_call>.
-  4. Do NOT wrap the line in markdown code blocks (```...```) or indent
-     it as a code block — the parser will not see the markers.
-  5. You may emit multiple <tool_call> lines in one response; the host
-     runs them and feeds results back as the next turn.
-  6. When you have enough information to answer, respond in plain text
-     with NO <tool_call> block and the loop ends.
-
-Allowed tool names for this role: {tool_list}.
-
-Examples (raw, copy the format exactly):
-
-<tool_call>list {{"path": "."}}</tool_call>
-<tool_call>read {{"path": "README.md"}}</tool_call>
-<tool_call>search {{"path": "src", "pattern": "TODO", "max_results": 20}}</tool_call>
+Call tools via the native function-calling interface (the request `tools`
+field carries each tool's name, description, and JSON schema). Do NOT emit
+`<tool_call>` text blocks -- they are no longer parsed. Inspect each tool
+result and continue until the task is done.
 "#
-    )
+    .to_string()
 }
 
 /// System-prompt hint describing the `delegate` tool, appended for

@@ -201,6 +201,8 @@ export function mountChat(opts: {
    *  跨 role 的并行执行按 role 维度分别保留。 */
   let timeoutPromptEl: HTMLElement | null = null;
   let timeoutPromptRole: string | null = null;
+  /** advisor 暂停期间的「等待拍板」横幅；拍板或 Resumed 事件后清除。 */
+  let advisorPauseBannerEl: HTMLElement | null = null;
 
   // ── Delegate tracking (keyed by sub_id for parallel delegates) ──
   interface DelegateInfo {
@@ -746,7 +748,10 @@ const stepMsgIds = new Map<string, string>();
       done.className = "choice-answer";
       done.textContent = summary;
       card.appendChild(done);
-      if (sendText !== null) sendMessage(sendText).catch(() => {});
+      if (sendText !== null) sendMessage(sendText).catch((err) => {
+        console.error("[chat] choice submit failed:", err);
+        done.textContent = `${summary}（发送失败：${err instanceof Error ? err.message : String(err)}，请手动输入你的选择）`;
+      });
     }
 
     submitBtn.addEventListener("click", () => {
@@ -762,6 +767,78 @@ const stepMsgIds = new Map<string, string>();
     bubble.appendChild(card);
   }
 
+  // ── advisor 暂停拍板卡片 ──
+  // advisor monitor 判 intervene 时后端广播 ChoiceRequested
+  // （choice_id 以 "advisor-pause-" 开头）。此时 manager runner 被
+  // advisor 暂停门 park 住，只有两种解除方式：POST resume-session
+  // 或任意用户输入（含「终止」时后端会同时取消当前 turn）。所以
+  // 不走通用 select+提交卡片，直接给两个一键按钮。
+  function renderAdvisorPausePrompt(bubble: HTMLElement, e: ChoiceRequestedEvent): void {
+    const card = document.createElement("div");
+    card.className = "advisor-pause-card";
+
+    const head = document.createElement("div");
+    head.className = "advisor-pause-card__head";
+    head.textContent = "🦉 advisor 介入：已暂停 manager 执行，等待你拍板";
+    card.appendChild(head);
+
+    const body = document.createElement("div");
+    body.className = "advisor-pause-card__body";
+    body.textContent = e.question;
+    card.appendChild(body);
+
+    const actions = document.createElement("div");
+    actions.className = "advisor-pause-card__actions";
+    const continueBtn = document.createElement("button");
+    continueBtn.className = "advisor-pause-card__btn advisor-pause-card__btn--continue";
+    continueBtn.textContent = "▶ 继续";
+    continueBtn.title = "解除 advisor 暂停，workflow 继续执行";
+    const abortBtn = document.createElement("button");
+    abortBtn.className = "advisor-pause-card__btn advisor-pause-card__btn--abort";
+    abortBtn.textContent = "⏹ 终止本轮";
+    abortBtn.title = "解除 advisor 暂停并取消当前 turn";
+    actions.appendChild(continueBtn);
+    actions.appendChild(abortBtn);
+    card.appendChild(actions);
+
+    const statusLine = document.createElement("div");
+    statusLine.className = "advisor-pause-card__status";
+    card.appendChild(statusLine);
+
+    function finish(summary: string): void {
+      card.classList.add("answered");
+      actions.style.display = "none";
+      statusLine.textContent = summary;
+      hideAdvisorPauseBanner();
+    }
+    function fail(summary: string, err: unknown): void {
+      console.error(`[chat] advisor 拍板失败:`, err);
+      statusLine.textContent = `${summary}：${err instanceof Error ? err.message : String(err)}（可重试）`;
+      continueBtn.disabled = false;
+      abortBtn.disabled = false;
+    }
+
+    continueBtn.addEventListener("click", async () => {
+      continueBtn.disabled = true; abortBtn.disabled = true;
+      try {
+        await resumeSessionV2();
+        finish("✅ 已拍板：继续执行");
+      } catch (err) {
+        fail("❌ 继续失败", err);
+      }
+    });
+    abortBtn.addEventListener("click", async () => {
+      continueBtn.disabled = true; abortBtn.disabled = true;
+      try {
+        await sendMessage("终止本轮");
+        finish("🛑 已拍板：终止本轮");
+      } catch (err) {
+        fail("❌ 终止失败", err);
+      }
+    });
+
+    bubble.appendChild(card);
+  }
   // ── plan 导入弹窗 ──
   // PlanProposed 事件触发（主路径）或右键「导入任务看板」（补救路径）
   // 调用。tasks 是结构化任务候选（来自 plan 工具，非文本解析），用户
@@ -1441,6 +1518,34 @@ const stepMsgIds = new Map<string, string>();
       timeoutPromptRole = null;
     }
   }
+
+  // ── advisor 暂停横幅 ──────────────────────────────────────────
+  // advisor 暂停不发 Paused 事件（不同于用户手动 ⏸），所以单独维护
+  // 一条置顶横幅提示「已暂停，等待拍板」。由 advisor-pause 的
+  // ChoiceRequested 挂上，拍板（renderAdvisorPausePrompt.finish）或
+  // 收到 Resumed 事件后清除。
+  function hideAdvisorPauseBanner(): void {
+    if (advisorPauseBannerEl) {
+      advisorPauseBannerEl.remove();
+      advisorPauseBannerEl = null;
+    }
+  }
+  function showAdvisorPauseBanner(): void {
+    hideAdvisorPauseBanner();
+    const node = document.createElement("div");
+    node.className = "timeout-prompt advisor-pause-banner";
+    node.innerHTML = `
+      <div class="timeout-prompt__head">
+        <span class="timeout-prompt__icon">🦉</span>
+        <strong>advisor 已暂停 manager 执行，等待你拍板</strong>
+      </div>
+      <div class="timeout-prompt__body">
+        请在下方 advisor 介入卡片里点「▶ 继续」或「⏹ 终止本轮」；直接输入消息也会解除暂停。
+      </div>
+    `;
+    container.messagesEl.insertBefore(node, container.messagesEl.firstChild);
+    advisorPauseBannerEl = node;
+  }
   function showTimeoutPrompt(ev: Extract<ChatEvent, { type: "TimeoutWarning" }>): void {
     // 同一 role 已经在显示 prompt → 替换；不同 role 串行覆盖（不
     // 维护 per-role map —— 现阶段单 turn 一次只跑一个 role，
@@ -1732,7 +1837,7 @@ const stepMsgIds = new Map<string, string>();
         // getSession, so nothing to render here.
         break;
       case "Paused": isPaused = true; renderPauseButtons(); addMessage({ kind: "status", content: `[paused] ${e.reason}` }); break;
-      case "Resumed": isPaused = false; renderPauseButtons(); addMessage({ kind: "status", content: "[resumed]" }); break;
+      case "Resumed": isPaused = false; renderPauseButtons(); hideAdvisorPauseBanner(); addMessage({ kind: "status", content: "[resumed]" }); break;
       case "RoundStarted":
         addMessage({ kind: "system", content: `[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
         resetWaitTimer(); currentToolCall = ""; currentDelegate = ""; updateFooter(); break;
@@ -2027,6 +2132,20 @@ const stepMsgIds = new Map<string, string>();
         break;
       }
       case "ChoiceRequested": {
+        // advisor 暂停门（choice_id 前缀 "advisor-pause-"）：渲染专用
+        // 拍板卡片 + 置顶「已暂停」横幅，不走通用 select+提交流程。
+        if (e.choice_id.startsWith("advisor-pause-")) {
+          const msg = addMessage({
+            kind: "system",
+            content: `🦉 ${e.role_id} 介入：${e.question}`,
+          });
+          const bubble = msg.querySelector(".msg-bubble") as HTMLElement | null;
+          if (bubble) renderAdvisorPausePrompt(bubble, e);
+          showAdvisorPauseBanner();
+          setFooter("advisor 已暂停，等待拍板");
+          resetWaitTimer();
+          break;
+        }
         // ask 工具抛出的选择题：渲染一条系统消息 + 内联选择卡片。
         // 用户在卡片里选择/上传后，选择结果作为下一条 user 消息回喂角色。
         const msg = addMessage({
@@ -2148,6 +2267,7 @@ const stepMsgIds = new Map<string, string>();
       timeoutPromptEl = null;
       timeoutPromptRole = null;
     }
+    hideAdvisorPauseBanner();
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {
@@ -2167,6 +2287,7 @@ const stepMsgIds = new Map<string, string>();
         timeoutPromptEl = null;
         timeoutPromptRole = null;
       }
+      hideAdvisorPauseBanner();
       clearWaitTimer();
       // 冷启动重播：若历史停在 Paused（server 重启前 workflow 被暂停/
       // 进程崩溃），残留的运行中徽章永远等不到完成事件——标注「已中断」，

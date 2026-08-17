@@ -27,15 +27,36 @@ fi
 
 echo "🔄 同步配置: $SOURCE_DIR → $TARGET_DIR"
 
-# 1. 同步 agent 配置
+# 1. 同步 agent 配置（覆盖式，但保留目标机已有的 model_chain 本机调优值——
+#    config 权威版固定 deepseek-v4-flash 链，直接覆盖会冲掉目标机的模型调优）
 mkdir -p "$TARGET_DIR/.latte/agents.d" "$TARGET_DIR/.latte/agents"
 count=0
 for f in "$SOURCE_DIR/config/agents/"*.toml; do
-    cp "$f" "$TARGET_DIR/.latte/agents.d/"
-    cp "$f" "$TARGET_DIR/.latte/agents/"
+    name="$(basename "$f")"
+    for dir in agents.d agents; do
+        target="$TARGET_DIR/.latte/$dir/$name"
+        if [ -f "$target" ]; then
+            python3 - "$f" "$target" <<'PYEOF'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = open(dst).read()
+m = re.search(r'^model_chain *= *(\[[^\]]*\])', old, re.M)
+if m:
+    chain = m.group(1)
+    if re.search(r'^model_chain *= *\[[^\]]*\]', text, re.M):
+        text = re.sub(r'^model_chain *= *\[[^\]]*\]', f'model_chain = {chain}', text, count=1, flags=re.M)
+    else:
+        text = text.rstrip() + f'\nmodel_chain = {chain}\n'
+open(dst, 'w').write(text)
+PYEOF
+        else
+            cp "$f" "$target"
+        fi
+    done
     count=$((count + 1))
 done
-echo "  ✅ Agents: $count 个角色配置"
+echo "  ✅ Agents: $count 个角色配置（已有文件保留本机 model_chain）"
 
 # 2. 同步 prompts（权威源：config/prompts/）
 #    运行时解析 prompt_file（如 "prompts/manager.md"）时按目标项目根目录的
@@ -63,22 +84,15 @@ for f in "$SOURCE_DIR/.latte/"*.toml; do
 done
 echo "  ✅ Configs: 模型/讨论配置"
 
-# 4. 同步 workflow 模板
+# 4. 同步 workflow 模板（全量覆盖：config/workflows 是权威源，旧版
+#    残留会让 session 跑陈旧流程——jemalloc 现场实锤）
 mkdir -p "$TARGET_DIR/.latte/workflows.d"
 count=0
 for f in "$SOURCE_DIR/config/workflows/"*.toml; do
-    name="$(basename "$f")"
-    target="$TARGET_DIR/.latte/workflows.d/$name"
-    if [ ! -f "$target" ]; then
-        cp "$f" "$target"
-        count=$((count + 1))
-    fi
+    cp "$f" "$TARGET_DIR/.latte/workflows.d/"
+    count=$((count + 1))
 done
-if [ "$count" -gt 0 ]; then
-    echo "  ✅ Workflows: $count 个新模板"
-else
-    echo "  ✅ Workflows: 已是最新"
-fi
+echo "  ✅ Workflows: $count 个模板（全量覆盖）"
 
 # 5. 验证 TOML 文件
 errors=0

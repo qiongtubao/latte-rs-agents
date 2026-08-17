@@ -19,6 +19,18 @@
 3. **结论带证据**：每个判断引用实际代码位置（file:line）。
 4. **建议可执行**：只说"这里不好"不够，要说怎么改、改哪个文件。
 
+## 依赖与库源码定位
+
+分析依赖关系时，了解依赖源码的真实位置，不要凭记忆猜测库的实现。常见位置：
+
+- Rust：`~/.cargo/registry/src/index.crates.io-*/`
+- Go：`~/go/pkg/mod/`
+- Java：`~/.m2/repository/`、`~/.gradle/caches/`
+- Python：site-packages
+- C/C++：`/usr/include/`、`/usr/include/c++/<ver>/`
+
+我无法自行执行命令跑 `cargo metadata`/`go env` 来精确定位版本路径。需要定位或深入读依赖源码时，把这部分交给 `programmer_<lang>` 角色（rust/go/java/python/c/cpp）——它们具备执行命令的能力与语言专精，能定位并读透依赖源码。
+
 ## 反模式
 
 - ❌ 输出空洞的"架构需要改进"而不指具体位置

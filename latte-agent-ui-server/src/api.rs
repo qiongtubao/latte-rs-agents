@@ -2623,45 +2623,22 @@ fn hot_reload_resolver(b: &UiBackend) {
 /// 只能改**已存在**的 model（不在 catalog 里返回 404）；新建走
 /// `POST /api/models`。
 ///
-/// 写入策略：项目目录优先（与 `ModelsState::load` 的"项目覆盖全局"语义
-/// 对称）。如果旧文件在全局，保存时会落到项目目录，相当于把全局 model
-/// 提升到项目层 —— 这是符合直觉的"修改并本地化"操作。
+/// 写入策略：由 request 的 `target` 决定写到项目层还是全局层；在目标层
+/// 内优先**写回该 model 实际所在的文件**（例如全局 `glm.toml` 厂商拆分
+/// 文件只更新对应条目，保留同文件其它 model），目标层没有此 key 的
+/// 文件时才新建 `<provider>__<id>.toml`。见
+/// [`ModelsState::write_to_layer`]。旧文件只在全局而 target=project 时，
+/// 会落到项目目录，相当于把全局 model 提升到项目层。
 pub fn update_model(
     b: &UiBackend,
     key: &str,
     target: &str,
     patch: ModelPatch,
 ) -> Result<ModelWithSource, ApiError> {
-    // 以 catalog 现值为基准（catalog 已是项目层合并 + 全局的最终生效值）。
-    // PATCH 只能改已存在的 model —— 找不到就 404，让 UI 走 POST 新建。
-    let mut def = {
-        let cfg = b.merged.read();
-        cfg.models
-            .models
-            .iter()
-            .find(|m| format!("{}/{}", m.provider, m.name) == key)
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::not_found(format!(
-                    "model {key:?} 不在 catalog 里；PATCH 只能改已存在的 model，新建请用 POST /api/models"
-                ))
-            })?
-    };
-    // 合并补丁：只覆盖显式给出的字段（None 保持原值）。
-    patch.apply_to(&mut def);
-    // 合并后再整体校验，保证落盘的一定是一份完整合法的 ModelDef。
-    crate::models::validate(&def)
-        .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
-    let new_key = format!("{}/{}", def.provider, def.name);
-    if new_key != key {
-        return Err(ApiError::bad_request(format!(
-            "composite_key 不能改：原 key={key:?}, 新 key={new_key:?}。请用 PATCH 不带改 key，或先 DELETE 再 POST。"
-        )));
-    }
     // target: "project" (默认，写到 `<cwd>/.latte/models.d/`) 或 "global"
     // （写到 `~/.latte/models.d/`，与 GlobalConfig::load_default 同源）。
     // 这两个按钮（保存到项目 / 保存到全局）共用一条路由，目标由 request
-    // body 的 `target` 字段决定。
+    // body 的 `target` 字段决定。先解析 target，磁盘回退时要按层挑基准值。
     let (write_dir, source_label) = match target {
         "global" => (
             crate::models::ModelsState::global_models_dir(),
@@ -2675,10 +2652,56 @@ pub fn update_model(
             )));
         }
     };
-    // 写盘：保持与项目层一致（单文件 flat ModelDef TOML）。同一目录多次
-    // 保存时 `key_to_filename` 会覆盖同名文件（`open(..., O_CREAT|O_TRUNC)`
-    // 语义），无需额外删除。
-    let path = crate::models::ModelsState::write_project(&write_dir, key, &def)
+    // 以 catalog 现值为基准（catalog 已是项目层合并 + 全局的最终生效值）。
+    // 内存 catalog 是 server 启动/上次保存时的快照，磁盘上后加的文件
+    // （如用户手动写的 `~/.latte/models.d/glm.toml`）可能不在里面 ——
+    // 此时回退到磁盘扫描（与 `GET /api/models` 列表同源），按目标层
+    // 优先取该层的记录作基准。都找不到才 404，让 UI 走 POST 新建。
+    let mut def = {
+        let cfg = b.merged.read();
+        cfg.models
+            .models
+            .iter()
+            .find(|m| format!("{}/{}", m.provider, m.name) == key)
+            .cloned()
+    };
+    if def.is_none() {
+        let project_dir = b.cwd.join(".latte/models.d");
+        let on_disk =
+            crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
+                .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+        let prefer = if source_label == "global" {
+            crate::models::ModelSource::Global
+        } else {
+            crate::models::ModelSource::Project
+        };
+        def = on_disk.entries.get(key).and_then(|recs| {
+            recs.iter()
+                .find(|(s, _, _)| *s == prefer)
+                .or(recs.first())
+                .map(|(_, _, d)| d.clone())
+        });
+    }
+    let mut def = def.ok_or_else(|| {
+        ApiError::not_found(format!(
+            "model {key:?} 不在 catalog 里；PATCH 只能改已存在的 model，新建请用 POST /api/models"
+        ))
+    })?;
+    // 合并补丁：只覆盖显式给出的字段（None 保持原值）。
+    patch.apply_to(&mut def);
+    // 合并后再整体校验，保证落盘的一定是一份完整合法的 ModelDef。
+    crate::models::validate(&def)
+        .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
+    let new_key = format!("{}/{}", def.provider, def.name);
+    if new_key != key {
+        return Err(ApiError::bad_request(format!(
+            "composite_key 不能改：原 key={key:?}, 新 key={new_key:?}。请用 PATCH 不带改 key，或先 DELETE 再 POST。"
+        )));
+    }
+    // 写盘：优先写回该层里 model 实际所在的文件（如全局 `glm.toml`
+    // 厂商拆分文件只更新对应条目）；该层没有此 key 的文件时才新建
+    // `<provider>__<id>.toml`。见 [`ModelsState::write_to_layer`]。
+    let path = crate::models::ModelsState::write_to_layer(&write_dir, key, &def)
         .map_err(|e| ApiError::internal(format!("write: {e}")))?;
     // 更新内存 catalog：新值覆盖；若原 model 是从其它目录继承来的，
     // 这里也追加进 catalog（写到哪里就在内存里出现一份）。
@@ -2775,8 +2798,9 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
             )));
         }
     };
-    // 写盘：与 update_model 一致，始终用 write_project（传入已解析的目录）。
-    let path = crate::models::ModelsState::write_project(&write_dir, &key, &req.def)
+    // 写盘：与 update_model 一致 —— 该层已有包含此 key 的文件就原地
+    // 更新，否则新建 `<provider>__<id>.toml`。
+    let path = crate::models::ModelsState::write_to_layer(&write_dir, &key, &req.def)
         .map_err(|e| ApiError::internal(format!("write: {e}")))?;
     // 加入内存 catalog：同名 key 覆盖；不存在则追加。
     {
@@ -3430,5 +3454,48 @@ mod hot_reload_tests {
         .expect("create model");
         assert_eq!(b.resolver.generation(), g0 + 1);
         assert!(b.resolver.build_model("m1").is_ok(), "新模型即刻可解析");
+    }
+
+    /// 回归：model 只在磁盘上（server 启动后才写入的文件，如用户手动
+    /// 编辑的 `models.d/glm.toml`），内存 catalog 是旧快照没有它 ——
+    /// PATCH 必须回退磁盘扫描取基准值（与 `GET /api/models` 列表同源），
+    /// 而不是直接 404。
+    #[test]
+    fn update_model_falls_back_to_disk_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        // 磁盘上放一个 model 文件，内存 catalog 里没有它。
+        let models_d = dir.path().join(".latte/models.d");
+        std::fs::create_dir_all(&models_d).unwrap();
+        std::fs::write(
+            models_d.join("diskonly__m1.toml"),
+            "name = \"m1\"\n\
+             api = \"openai\"\n\
+             provider = \"diskonly\"\n\
+             base_url = \"http://localhost:1\"\n\
+             api_key = \"sk-old\"\n\
+             context_window = 32000\n\
+             max_tokens = 4096\n",
+        )
+        .unwrap();
+
+        let out = update_model(&b, "diskonly/m1", "project", ModelPatch {
+            api_key: Some("sk-new".into()),
+            ..Default::default()
+        })
+        .expect("PATCH 应回退磁盘扫描而不是 404");
+
+        // 补丁字段生效，未打补丁的字段保留磁盘现值。
+        assert_eq!(out.def.api_key, "sk-new");
+        assert_eq!(out.def.context_window, 32000);
+        // 落盘回原文件，而不是新建别的文件。
+        assert!(out.file_path.ends_with("diskonly__m1.toml"));
+        // 内存 catalog 同步补上，后续 PATCH 直接命中。
+        let cfg = b.merged.read();
+        assert!(cfg
+            .models
+            .models
+            .iter()
+            .any(|m| m.provider == "diskonly" && m.name == "m1" && m.api_key == "sk-new"));
     }
 }

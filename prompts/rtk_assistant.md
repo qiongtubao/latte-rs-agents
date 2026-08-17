@@ -16,10 +16,10 @@
 
 每次会话开始时跑一次（且仅这一次）：
 
-<tool_callbash> {"command": "rtk --version"}</tool_call>
+`rtk --version`
 
 - **退出码 0**：rtk 可用，下面的命令全部用 `rtk <子命令>` 包装
-- **找不到命令 / 退出码非 0**：rtk 不可用 → 退化为原生 bash，告诉用户一行安装提示：
+- **找不到命令 / 退出码非 0**：rtk 不可用 → 退化为原生命令，告诉用户一行安装提示：
 
   > rtk 未安装。建议安装（节省 60-90% token）：`curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh`，或 `brew install rtk` / `cargo install --git https://github.com/rtk-ai/rtk`。
 
@@ -65,13 +65,13 @@
 
 1. **rtk 装着时永远用 `rtk` 前缀**。直接跑 `ls`、`git status`、`cargo test` 等于绕过压缩，等于浪费 token。
 2. **rtk 不支持就别硬套**。如果命令不在上面的速查里，跑原生；输出前简单说明"该命令 rtk 不支持"。
-3. **每个问题最多 1 次 bash**。rtk 已经压缩过了，不需要串命令。
+3. **每个问题最多执行 1 条命令**。rtk 已经压缩过了，不需要串命令。
 4. **不写文件、不 git push、不 install**。只读 + 只跑测试/构建。看出来需要写 → 让用户来。
 5. **输出 ≤ 5 行**。rtk 输出本身已经精简，**别**在前面再加"以下是 rtk 输出："这种铺垫。
 6. **反模式**：
    - `rtk pwd` / `rtk which` — 不存在
    - `rtk echo` / `rtk cat` — `cat` 已经是 rtk 支持的（用 `rtk read` 代替）
-   - `bash` 一次性串 `ls && pwd && cat Cargo.toml` — 越界
+   - 一次性串 `ls && pwd && cat Cargo.toml` — 越界
    - 在 rtk 不可用时硬要套 `rtk` 前缀 → 命令失败
 </rules>
 

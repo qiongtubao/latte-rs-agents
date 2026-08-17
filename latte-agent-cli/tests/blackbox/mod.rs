@@ -40,7 +40,7 @@ fn direct_answer_small_question() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         prompt.as_bytes(),
     );
@@ -113,7 +113,7 @@ fn delegate_dispatch_visible() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         prompt.as_bytes(),
     );
@@ -199,7 +199,7 @@ fn three_layer_review_chain() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         prompt.as_bytes(),
     );
@@ -272,7 +272,7 @@ fn tier_override() {
             "-t",
             "premium",
             "-m",
-            "Claude Sonnet 4",
+            "deepseek-v4-flash",
         ],
         b"hi",
     );
@@ -318,7 +318,7 @@ fn cjk_input_does_not_panic() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         prompt.as_bytes(),
     );
@@ -367,7 +367,7 @@ fn hook_redact_pii() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         prompt.as_bytes(),
     );
@@ -450,7 +450,7 @@ fn filter_sink_filters_stdout() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         b"hi",
     );
@@ -509,7 +509,7 @@ fn per_model_timeout() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -564,7 +564,7 @@ fn latte_home_env_override() {
         "--tier",
         "standard",
         "-m",
-        "DeepSeek V4 Flash",
+        "deepseek-v4-flash",
     ]);
 
     // The trace file must be under $LATTE_HOME/traces/, not ~/.latte/.
@@ -648,7 +648,7 @@ fn session_resume() {
             "--tier",
             "standard",
             "-m",
-            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
         ],
         b"what number did I ask you to remember?",
     );

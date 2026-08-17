@@ -62,11 +62,11 @@ language, the layering is:
    `~/.latte/prompts/` (global) → `prompts::for_role` (compile-time).
 3. **Global runtime override** (per user, per machine):
    `~/.latte/prompts/` and `~/.latte/agents/`. Same fall-through rules.
-XML-tagged regions inside prompts (`<role>`, `<rules>`,
-`<tool_calldelegate>`) and tool names (`delegate`, `bash`, `read`,
-`write`, `list`, `search`, `deepseek-v4-flash`, etc.) are parsed
+XML-tagged regions inside prompts (`<role>`, `<rules>`) are parsed
 verbatim by the model and the runner — do **not** translate them,
-only the surrounding prose.
+only the surrounding prose. Prompts must NOT name agent tools: the
+available tool set is defined solely by each role's `tools` list and
+carried to the model via the request `tools` schema.
 
 Both **directory** layouts are supported by
 `AgentConfig::load` / `WorkflowRegistry::load` (single-file
@@ -115,12 +115,14 @@ latte-agent chat --role pm --tier budget \
 ```
 
 Global config files accept both **router-style** (matches
-`latte-rs-model-router/models.toml` and the original `~/.latte/models.yaml`):
+`latte-rs-model-router/models.toml` and the original `~/.latte/models.yaml`).
+注意 `ModelDef` 没有独立的 `id` 字段 —— `name` 就是 model id（tier 映射
+与 `--model` 引用的键，也是 API 请求里的 `model` 字段），不要把它写成
+展示名：
 
 ```yaml
 models:
-  - id: deepseek-v4-flash
-    name: DeepSeek-v4-flash
+  - name: deepseek-v4-flash
     api: openai
     provider: deepseek
     base_url: https://api.deepseek.com
@@ -137,6 +139,6 @@ and **project-style** (matches `config/models.toml`'s nested form):
 tiers = { budget = "deepseek-v4-flash" }
 
 [[models.models]]
-id = "deepseek-v4-flash"
+name = "deepseek-v4-flash"
 # ...
 ```
