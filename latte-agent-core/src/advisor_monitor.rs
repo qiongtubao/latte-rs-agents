@@ -644,6 +644,27 @@ fn verdict_word(s: &str) -> Option<Verdict> {
     }
 }
 
+/// Strip `<think>…</think>` blocks before verdict parsing. Reasoning
+/// models put draft `verdict:`/`reason:` lines inside the think block;
+/// scanning them would capture the draft plus mid-course corrections
+/// ("Actually let me think…") into the user-visible reason.
+fn strip_think_blocks(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    loop {
+        let Some(start) = rest.find("<think>") else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..start]);
+        rest = match rest[start + "<think>".len()..].find("</think>") {
+            Some(end) => &rest[start + "<think>".len() + end + "</think>".len()..],
+            // 未闭合的 think 块：视为一直延伸到末尾（截断的流式输出）。
+            None => return out,
+        };
+    }
+}
+
 /// Parse the advisor's review output. Expected shape:
 ///
 ///
@@ -657,6 +678,8 @@ fn verdict_word(s: &str) -> Option<Verdict> {
 /// reason/hint sections. Malformed output degrades to `Ok`
 /// (no action — an unreadable review must not inject noise).
 pub fn parse_verdict(raw: &str) -> ReviewVerdict {
+    let cleaned = strip_think_blocks(raw);
+    let raw = cleaned.as_str();
     let mut verdict: Option<Verdict> = None;
     let mut reason_lines: Vec<&str> = Vec::new();
     let mut hint_lines: Vec<&str> = Vec::new();
@@ -1083,6 +1106,10 @@ struct MonitorState {
     /// summary（同一次失败被上报两遍），contains 判定后折叠，
     /// 避免对同一根因连发审查/暂停。
     last_workflow_failure: Option<String>,
+    /// 在跑的 workflow 名栈（Started 入栈 / Finished 出栈）：transcript
+    /// 里给嵌套启动标注父 workflow，否则 advisor 看到多条平铺的
+    /// "[workflow started]" 会把嵌套步骤误读成重复派发（过度编排误报）。
+    workflow_stack: Vec<String>,
 }
 
 impl MonitorState {
@@ -1098,6 +1125,7 @@ impl MonitorState {
             specialist_streak_warned: false,
             last_user_text: String::new(),
             last_workflow_failure: None,
+            workflow_stack: Vec::new(),
         }
     }
 
@@ -1292,7 +1320,7 @@ impl MonitorState {
                     });
                 }
             }
-            ChatEvent::RoleFinished { role_id, detail }
+            ChatEvent::RoleFinished { role_id, detail, .. }
                 if role_id == &self.watched_role =>
             {
                 // Turn ended without a RoleTurn (error/timeout path):
@@ -1304,10 +1332,17 @@ impl MonitorState {
                 }
             }
             ChatEvent::WorkflowStarted { name, topic, .. } => {
+                // 嵌套标注：栈非空说明这是外层 workflow 的步骤里拉起的
+                // 子 workflow，不是又一次独立派发。
+                let nesting = match self.workflow_stack.last() {
+                    Some(parent) => format!(" (nested in {parent})"),
+                    None => String::new(),
+                };
                 self.transcript.push(format!(
-                    "[workflow started] {name}: {}",
+                    "[workflow started]{nesting} {name}: {}",
                     truncate_chars(topic, 500)
                 ));
+                self.workflow_stack.push(name.clone());
             }
             ChatEvent::WorkflowFinished {
                 name,
@@ -1319,6 +1354,10 @@ impl MonitorState {
                     "[workflow {name} {status}] {}",
                     truncate_chars(summary, 1_000)
                 ));
+                // 正常是 LIFO 出栈；容错起见移除栈中最后一个同名项。
+                if let Some(pos) = self.workflow_stack.iter().rposition(|n| n == name) {
+                    self.workflow_stack.remove(pos);
+                }
                 // D7: workflow died — the manager is about to decide
                 // how to recover; make sure the failure is disclosed
                 // instead of silently papered over with delegates.
@@ -1766,6 +1805,51 @@ mod tests {
 
     // ── D7: workflow failed ────────────────────────────────────────
     #[test]
+    fn workflow_started_marks_nesting_in_transcript() {
+        let mut s = state();
+        s.observe(&ChatEvent::WorkflowStarted {
+            name: "design_and_plan".into(),
+            topic: "t".into(),
+            wf_id: "wf-outer".into(),
+        });
+        s.observe(&ChatEvent::WorkflowStarted {
+            name: "explore".into(),
+            topic: "t".into(),
+            wf_id: "wf-inner".into(),
+        });
+        let rendered = s.transcript.render();
+        // 嵌套启动必须标注父 workflow，否则 advisor 会把嵌套步骤
+        // 误读成对同一请求的重复派发（过度编排误报）。
+        assert!(
+            rendered.contains("[workflow started] (nested in design_and_plan) explore"),
+            "transcript: {rendered}"
+        );
+        // 内层结束后回到平铺语义。
+        s.observe(&ChatEvent::WorkflowFinished {
+            name: "explore".into(),
+            wf_id: "wf-inner".into(),
+            status: "ok".into(),
+            summary: "done".into(),
+        });
+        s.observe(&ChatEvent::WorkflowFinished {
+            name: "design_and_plan".into(),
+            wf_id: "wf-outer".into(),
+            status: "ok".into(),
+            summary: "done".into(),
+        });
+        s.observe(&ChatEvent::WorkflowStarted {
+            name: "code_review".into(),
+            topic: "t".into(),
+            wf_id: "wf-next".into(),
+        });
+        let rendered = s.transcript.render();
+        assert!(
+            rendered.contains("[workflow started] code_review"),
+            "transcript: {rendered}"
+        );
+    }
+
+    #[test]
     fn d7_fires_on_workflow_finished_not_ok() {
         let mut s = state();
         let out = s.observe(&ChatEvent::WorkflowStarted {
@@ -1998,6 +2082,7 @@ mod tests {
         let out = s.observe(&ChatEvent::RoleFinished {
             role_id: "manager".into(),
             detail: "error: turn failed".into(),
+            sub_id: None,
         });
         assert!(out.turn_ended);
         assert!(out.findings.is_empty());
@@ -2050,6 +2135,23 @@ mod tests {
                 "malformed output must degrade to ok: {raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_verdict_strips_think_block_drafts() {
+        // 推理模型在 <think> 里打 verdict/reason 草稿并自我修正；
+        // 解析必须只看 think 块之后的正式输出，否则草稿与犹豫过程
+        // （"Actually let me think…"）会漏进用户可见的 reason。
+        let raw = "<think>Let me analyze.\nverdict: intervene\nreason: 草稿理由\n\
+                   Actually let me think more carefully. The transcript shows...\n</think>\n\
+                   verdict: warn\nreason: 正式理由\nhint: 正式提示";
+        let v = parse_verdict(raw);
+        assert_eq!(v.verdict, Verdict::Warn);
+        assert_eq!(v.reason, "正式理由");
+        assert_eq!(v.hint, "正式提示");
+        // 未闭合的 think 块（截断输出）剥到末尾，剩余部分照常解析。
+        let v2 = parse_verdict("verdict: ok\n<think>verdict: intervene\nreason: 草稿");
+        assert_eq!(v2.verdict, Verdict::Ok);
     }
 
     // ── transcript rolling ─────────────────────────────────────────

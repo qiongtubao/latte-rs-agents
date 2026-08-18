@@ -158,8 +158,11 @@ export type ChatEvent =
   | { type: "Resumed" }
   | { type: "RoundStarted"; round: number }
   | { type: "RoundEnded"; round: number }
-  | { type: "RoleStarted"; role_id: string; detail: string }
-  | { type: "RoleFinished"; role_id: string; detail: string }
+  // sub_id 标识本次运行所属的 subsession（delegate / workflow
+  // speaker）；同一 role 可被并行 workflow 步同时委派，起止事件
+  // 按 (role_id, sub_id) 配对。主 session 角色的 turn 不带 sub_id。
+  | { type: "RoleStarted"; role_id: string; detail: string; sub_id?: string | null }
+  | { type: "RoleFinished"; role_id: string; detail: string; sub_id?: string | null }
   // 单角色被单独暂停/恢复（多角色 HIL）。区别于 Paused/Resumed
   // （整会话）。UI 据此渲染角色的「已暂停」标记与暂停/恢复切换。
   | { type: "RolePaused"; role_id: string }

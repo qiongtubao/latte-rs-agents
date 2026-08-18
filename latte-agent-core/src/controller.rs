@@ -267,9 +267,14 @@ pub enum ChatEvent {
     /// Round ended (multi-role mode).
     RoundEnded { round: u32 },
     /// A role has started working.
-    RoleStarted { role_id: String, detail: String },
-    /// A role has finished working.
-    RoleFinished { role_id: String, detail: String },
+    /// `sub_id` 标识本次运行所属的 subsession（delegate / workflow
+    /// speaker 路径填真实值；主 session 角色的 turn 为 `None`）。
+    /// 同一 role 可被并行 workflow 步同时委派，前端按
+    /// `(role_id, sub_id)` 配对起止事件，不能只用 role_id。
+    RoleStarted { role_id: String, detail: String, sub_id: Option<String> },
+    /// A role has finished working. `sub_id` 与对应的
+    /// [`ChatEvent::RoleStarted`] 一致。
+    RoleFinished { role_id: String, detail: String, sub_id: Option<String> },
     /// A single role was individually paused (HIL v1.4, multi-role
     /// mode). Distinct from `Paused`, which halts the whole session.
     /// The paused role is skipped each round until `RoleResumed`.
@@ -693,7 +698,8 @@ pub struct ChatController {
     /// see an mpsc message until the turn finished.
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     /// Most recent non-command user input, recorded by
-    /// `submit_input`. The AdvisorMonitor reads it to give the LLM
+    /// `submit_input`（workflow slash 命令的 topic 由 driver 在
+    /// `run_single_role_loop` 里补记）. The AdvisorMonitor reads it to give the LLM
     /// review the user's current question (user input is not part of
     /// the `ChatEvent` broadcast stream).
     last_user_input: Arc<parking_lot::Mutex<String>>,
@@ -782,6 +788,7 @@ impl ChatController {
         let plan_stage = self.plan_stage.clone();
         let advisor_pause = self.advisor_pause.clone();
         let agent_pause_gate = self.agent_pause_gate.clone();
+        let last_user_input = self.last_user_input.clone();
 
         // 内部订阅者：跟踪 WorkflowFinished 事件，维护
         // last_failed_workflow 状态。
@@ -821,6 +828,7 @@ impl ChatController {
                 plan_stage,
                 advisor_pause,
                 agent_pause_gate,
+                last_user_input,
             )
             .await;
         });
@@ -880,6 +888,15 @@ impl ChatController {
     /// The most recent user question recorded by `submit_input`.
     pub fn last_user_input(&self) -> String {
         self.last_user_input.lock().clone()
+    }
+
+    /// Record what the user asked *without* submitting a chat message.
+    /// Entry points that drive the session directly (task-board
+    /// workflow dispatch runs the workflow on the session event stream
+    /// without `submit_input`) use this so the advisor monitor's LLM
+    /// review still sees the original request instead of a blank.
+    pub fn record_user_input(&self, text: &str) {
+        *self.last_user_input.lock() = text.to_string();
     }
 
     /// 当前 plan 阶段门状态（见 [`PlanStage`]）。
@@ -1217,6 +1234,7 @@ async fn run_driver(
     plan_stage: SharedPlanStage,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    last_user_input: Arc<parking_lot::Mutex<String>>,
 ) {
     let is_multi = config.roles.len() > 1 || config.task_id.is_some();
 
@@ -1245,6 +1263,7 @@ async fn run_driver(
             plan_stage,
             advisor_pause,
             agent_pause_gate,
+            last_user_input,
         )
         .await;
     }
@@ -1805,6 +1824,7 @@ async fn run_multi_role_loop(
             let _ = event_tx.send(ChatEvent::RoleStarted {
                 role_id: role_id.clone(),
                 detail: format!("round {round_num}: calling LLM"),
+                sub_id: None,
             });
 
             let new_assistant_text = match run_turn_cancellable(
@@ -1817,6 +1837,7 @@ async fn run_multi_role_loop(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("round {round_num}: ok, {} chars", text.len()),
+                        sub_id: None,
                     });
                     text
                 }
@@ -1827,6 +1848,7 @@ async fn run_multi_role_loop(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("round {round_num}: error: {e}"),
+                        sub_id: None,
                     });
                     // Advisor gate 重试耗尽：发 AdvisorTerminated，
                     // 本轮不产出 RoleTurn（String::new() 下方跳过）。
@@ -1958,6 +1980,7 @@ async fn run_single_role_loop(
     plan_stage: SharedPlanStage,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    last_user_input: Arc<parking_lot::Mutex<String>>,
 ) {
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
@@ -2151,6 +2174,21 @@ async fn run_single_role_loop(
                                 }
                                 cmd => {
                                     let topic = parts.get(1).unwrap_or(&"").trim();
+                                    // workflow 命令（如 /design-and-plan <topic>）按
+                                    // submit_input 的设计不记录用户诉求（斜杠命令
+                                    // 一律跳过）——确认是已注册 workflow 命令后把
+                                    // topic 补记进 last_user_input，否则 advisor
+                                    // 审查看到的「用户当前问题」是空串，会把正常的
+                                    // workflow 启动误判成"无目标编排"。
+                                    if !topic.is_empty()
+                                        && crate::workflow::load_workflow_by_command(
+                                            cmd,
+                                            &config.cwd,
+                                        )
+                                        .is_ok()
+                                    {
+                                        *last_user_input.lock() = topic.to_string();
+                                    }
                                     match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), advisor_pause.clone()).await {
                                         Ok(Some(summary)) => {
                                             let _ = event_tx.send(ChatEvent::Status {
@@ -2222,6 +2260,7 @@ async fn run_single_role_loop(
                         let _ = event_tx.send(ChatEvent::RoleStarted {
                             role_id: current_role.clone(),
                             detail: "calling LLM".into(),
+                            sub_id: None,
                         });
 let usage_before = runner.total_usage().clone();
                         // Run the turn with cancellation support (no
@@ -2246,6 +2285,7 @@ let usage_before = runner.total_usage().clone();
                                 let _ = event_tx.send(ChatEvent::RoleFinished {
                                     role_id: current_role.clone(),
                                     detail: format!("ok, {} chars", response.len()),
+                                    sub_id: None,
                                 });
                                 let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                             }
@@ -2253,6 +2293,7 @@ let usage_before = runner.total_usage().clone();
                                 let _ = event_tx.send(ChatEvent::RoleFinished {
                                     role_id: current_role.clone(),
                                     detail: format!("error: {e}"),
+                                    sub_id: None,
                                 });
                                 // Advisor gate 重试耗尽：发
                                 // AdvisorTerminated 而不是普通 Error —
@@ -3571,6 +3612,7 @@ async fn register_delegate_tool(
             let _ = event_tx_clone.send(ChatEvent::RoleStarted {
                 role_id: role_id_clone.clone(),
                 detail: format!("delegated: {}", task_clone),
+                sub_id: Some(sub_id.clone()),
             });
 
             // 5. Run the specialist. No wall-clock timeout — the
@@ -3636,6 +3678,7 @@ async fn register_delegate_tool(
                             let _ = event_tx.send(ChatEvent::RoleFinished {
                                 role_id: role_id.clone(),
                                 detail: "cancelled by user".into(),
+                                sub_id: Some(sub_id.clone()),
                             });
                             let summary = String::from("delegate cancelled by user");
                             let _ = event_tx.send(ChatEvent::DelegateFinished {
@@ -3652,6 +3695,7 @@ async fn register_delegate_tool(
                             let _ = event_tx.send(ChatEvent::RoleFinished {
                                 role_id: role_id.clone(),
                                 detail: "cancelled by user".into(),
+                                sub_id: Some(sub_id.clone()),
                             });
                             let summary = String::from("delegate cancelled by user");
                             let _ = event_tx.send(ChatEvent::DelegateFinished {
@@ -3703,6 +3747,7 @@ async fn register_delegate_tool(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("ok, {} chars", response.len()),
+                        sub_id: Some(sub_id.clone()),
                     });
                 }
                 Err(e) => {
@@ -3719,6 +3764,7 @@ async fn register_delegate_tool(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("error: {}", e),
+                        sub_id: Some(sub_id.clone()),
                     });
                     let _ = event_tx.send(ChatEvent::Error {
                         kind: Some(crate::trace::ModelErrorKind::Other {

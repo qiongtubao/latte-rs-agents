@@ -1292,6 +1292,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
     let _ = inp.event_tx.send(ChatEvent::RoleStarted {
         role_id: speaker.clone(),
         detail: format!("workflow step '{}'", inp.step_id),
+        sub_id: sub_id.clone(),
     });
 
     // 3. Spawn + 500ms 轮询 cancel：运行中的分派可中途 abort
@@ -1348,6 +1349,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                         role_id: speaker.clone(),
                         detail: "cancelled by user".into(),
+                        sub_id: sub_id.clone(),
                     });
                     if let Some(id) = &sub_id {
                         let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
@@ -1385,6 +1387,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                 role_id: speaker.clone(),
                 detail: format!("ok, {} chars", response.len()),
+                sub_id: sub_id.clone(),
             });
             if let Some(id) = &sub_id {
                 let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
@@ -1415,6 +1418,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                 role_id: speaker.clone(),
                 detail: format!("error: {msg}"),
+                sub_id: sub_id.clone(),
             });
             if let Some(id) = &sub_id {
                 let _ = inp.event_tx.send(ChatEvent::DelegateFinished {

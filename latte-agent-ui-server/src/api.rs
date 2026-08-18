@@ -414,6 +414,24 @@ pub async fn session_event_sender(
     Ok(controller.event_sender())
 }
 
+/// 把用户诉求写进 session controller 的 `last_user_input`（不发消息）。
+/// 任务看板派发绑定 workflow 的任务时直接在 session 事件流上跑
+/// workflow、不走 `submit_input`，不补这一笔 advisor 审查看到的
+/// 「用户当前问题」就是空串，无法判断分派是否合理。
+pub async fn session_record_user_input(
+    b: &UiBackend,
+    id: &str,
+    text: &str,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.record_user_input(text);
+    Ok(())
+}
+
 /// 拿 session controller 的 session-level 暂停门（`Arc<AgentPauseGate>`）。
 /// 任务看板把绑定 workflow 的 run 也用**同一个** gate —— 用户 ⏸ 时
 /// 看板派的 workflow 也一起停；▶ 一起恢复。

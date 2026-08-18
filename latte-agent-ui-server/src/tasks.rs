@@ -1149,6 +1149,9 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
             ApiError::bad_request(format!("workflow '{wf_name}' 加载失败：{e}"))
         })?;
         let event_tx = api::session_event_sender(b, &info.session_id).await?;
+        // workflow 绑定分支不走 chat_send/submit_input，这里把派发消息
+        // 显式记为 session 的用户诉求，否则 advisor 审查拿到空问题。
+        api::session_record_user_input(b, &info.session_id, &msg).await?;
         Some((wf, event_tx, Arc::new(AtomicBool::new(false)), msg))
     } else {
         api::chat_send(b, Some(&info.session_id), &base_msg).await?;

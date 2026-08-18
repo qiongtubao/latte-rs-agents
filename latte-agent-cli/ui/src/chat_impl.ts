@@ -263,19 +263,52 @@ const stepMsgIds = new Map<string, string>();
   let lastUserMsgId = "";
   let lastRoleStarted = "";
   let subagentTools: string[] = [];
-  /** role_id → RoleStarted 时插入的 executing 状态行；用于
-   *  RoleFinished / Error 把同一行切到 .done / .error，而不是再插一行。
-   *  同时记录对应的 subId（manager 主 turn 时为空；delegate 跑这个
-   *  role 时是 delegate 的 sub_id），让右键「查看日志」能直接命中。 */
-  const executingRowByRole = new Map<string, HTMLElement>();
-  const executingSubIdByRole = new Map<string, string>();
+  /** role_id → 执行中状态行**队列**。同一 role 可被并行 workflow 步
+   *  同时委派（日志事故：tester 同时跑 code_review/review 与
+   *  requirements_review/estimate），每个 RoleStarted 独立一行，
+   *  否则后来的 start 覆盖 Map 条目、先启动的行永远转圈。
+   *  队列项带 subId（主 session 角色 turn 为空），既用于
+   *  RoleFinished/Error 精确配对，也让右键「查看日志」直接命中。 */
+  const executingRowsByRole = new Map<string, Array<{ row: HTMLElement; subId: string }>>();
+
+  function pushExecutingRow(roleId: string, row: HTMLElement, subId: string): void {
+    const q = executingRowsByRole.get(roleId) ?? [];
+    q.push({ row, subId });
+    executingRowsByRole.set(roleId, q);
+  }
+
+  /** 工具调用/结果的折叠落点：该 role 最近一条未结行（并行同角色
+   *  的工具事件不带 sub_id，无法精确归属，取最新行是最佳猜测）。 */
+  function latestExecutingRow(roleId: string): { row: HTMLElement; subId: string } | undefined {
+    const q = executingRowsByRole.get(roleId);
+    return q && q.length > 0 ? q[q.length - 1] : undefined;
+  }
+
+  /** RoleFinished/Error 配对取出并移除一条未结行：优先 sub_id 精确
+   *  命中；事件不带 sub_id（主角色 turn、旧归档回放）或未命中时
+   *  退化为该 role 最早的未结行——不变量是「每个 finish 清一行」，
+   *  不留孤儿行。 */
+  function takeExecutingRow(
+    roleId: string,
+    subId: string | null | undefined,
+  ): { row: HTMLElement; subId: string } | undefined {
+    const q = executingRowsByRole.get(roleId);
+    if (!q || q.length === 0) return undefined;
+    let idx = subId ? q.findIndex((e) => e.subId === subId) : -1;
+    if (idx < 0) idx = 0;
+    const [entry] = q.splice(idx, 1);
+    if (q.length === 0) executingRowsByRole.delete(roleId);
+    return entry;
+  }
 
   // 把工具调用折叠进 role 的 executing 状态行（而不是独立气泡）。
   // - 第一次调用时在状态行内创建一个 .tool-log 子元素并折叠状态。
   // - 同一 role 后续的工具调用追加在 .tool-log 内。
   // - 返回 true 表示已折叠，false 表示需要降级为独立气泡。
   function appendToolToExecutingRow(roleId: string, line: string): boolean {
-    const row = executingRowByRole.get(roleId);
+    const execEntry = latestExecutingRow(roleId);
+    if (!execEntry) return false;
+    const row = execEntry.row;
     if (!row) return false;
     const inner = row.querySelector(".message.status") as HTMLElement | null;
     if (!inner) return false;
@@ -1609,9 +1642,9 @@ const stepMsgIds = new Map<string, string>();
     switch (e.type) {
       case "RoleStarted": {
         subagentTools = [];
-        // 该 role 可能在某个 active delegate subsession 里跑
-        // (manager @programmer ...)，找一下 subId 让右键能跳日志。
-        const startedSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId || undefined;
+        // 后端在 delegate / workflow speaker 路径的 RoleStarted 上带
+        // sub_id；旧归档/直连接口可能缺省，退回 delegate 上下文猜测。
+        const startedSubId = e.sub_id || findDelegateSubByRole(e.role_id) || currentDelegateSubId || undefined;
         const isDelegate = !!startedSubId;
         const node = addMessage({
           kind: "status",
@@ -1625,25 +1658,23 @@ const stepMsgIds = new Map<string, string>();
           node.classList.add("is-delegate-role");
           node.dataset.delegate = "true";
         }
-        executingRowByRole.set(e.role_id, node);
-        executingSubIdByRole.set(e.role_id, startedSubId ?? "");
+        pushExecutingRow(e.role_id, node, startedSubId ?? "");
         lastRoleStarted = e.role_id;
         break;
       }
       case "RoleFinished": {
-        // 找到 RoleStarted 时插入的 executing 行，原地切到 .done，
-        // 不再插一行。失败也走这条 — "error" 状态单独在 Error event 里设。
-        const row = executingRowByRole.get(e.role_id);
-        if (row) {
-          const inner = row.querySelector(".message.status") as HTMLElement | null;
+        // 按 (role_id, sub_id) 精确配对 RoleStarted 时插入的
+        // executing 行，原地切到 .done；不带 sub_id 的旧事件退化
+        // 为清该 role 最早的未结行。找不到再新插一条完成行。
+        const entry = takeExecutingRow(e.role_id, e.sub_id);
+        if (entry) {
+          const inner = entry.row.querySelector(".message.status") as HTMLElement | null;
           if (inner) {
             inner.classList.remove("executing");
             inner.classList.add("done");
             const content = inner.querySelector(".content");
             if (content) content.textContent = `✅ ${e.role_id} 完成`;
           }
-          executingRowByRole.delete(e.role_id);
-          executingSubIdByRole.delete(e.role_id);
         } else {
           // 没有匹配的 executing 行（边角事件）—— 退回老行为
           addMessage({ kind: "status", content: `✅ ${e.role_id} 完成`, meta: e.role_id, state: "done" });
@@ -1705,7 +1736,7 @@ const stepMsgIds = new Map<string, string>();
         const di = activeDelegates.get(toolSubId);
         // 折叠进 role 的 executing 状态行（不是独立气泡）。
         // 主 chat 流（manager 等顶级角色）和 delegate 下属 subagent role
-        // 走同一个 RoleStarted 分支，都会入 executingRowByRole —— 所以
+        // 走同一个 RoleStarted 分支，都会入 executingRowsByRole 队列 —— 所以
         // appendToolToExecutingRow 同时覆盖主/从两条路径。
         if (!appendToolToExecutingRow(e.role_id, `🔧 ${e.tool_name}(${t})`)) {
           const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
@@ -1740,8 +1771,8 @@ const stepMsgIds = new Map<string, string>();
         // 折叠进 executing 行（之前根本没 addMessage，行为退化为 footer-only）；
         // 现在写入 .tool-log 让用户在状态行直接看到错误。
         if (!appendToolToExecutingRow(e.role_id, `❌ ${e.tool_name}: ${truncate(e.error, 120)}`)) {
-          // race: RoleFinished 已到（executingRowByRole.delete），或 delegate 下属 role
-          // 没进 executingRowByRole。此时不应静默吞掉——至少写到 footer + 上报 trace 一行。
+          // race: RoleFinished 已到（takeExecutingRow 弹空了队列），或 delegate 下属 role
+          // 没进 executingRowsByRole。此时不应静默吞掉——至少写到 footer + 上报 trace 一行。
           console.warn("[chat] late ToolError (no executing row):", e.tool_name, e.error);
           if (currentDelegateSubId) {
             // delegate subsession 上下文，把错误注入 subagent badge（detail 已经有 subagentTools）
@@ -2176,8 +2207,9 @@ const stepMsgIds = new Map<string, string>();
         // 一条 error 行。
         const errSubId = e.sub_id;
         const targetRole = lastRoleStarted;
-        const row = targetRole ? executingRowByRole.get(targetRole) : undefined;
-        if (row) {
+        const entry = targetRole ? takeExecutingRow(targetRole, errSubId) : undefined;
+        if (entry) {
+          const row = entry.row;
           const inner = row.querySelector(".message.status") as HTMLElement | null;
           if (inner) {
             inner.classList.remove("executing");
@@ -2185,20 +2217,13 @@ const stepMsgIds = new Map<string, string>();
             const content = inner.querySelector(".content");
             if (content) content.textContent = `❌ ${targetRole} 失败: ${e.message}`;
             // 关联到具体 subagent (delegate 失败时后端带 sub_id；
-            // 主 turn 错误继承最近 RoleStarted 的 subId，可能是 undefined)
-            if (errSubId) {
-              inner.dataset.subId = errSubId;
-              row.dataset.subId = errSubId;
-            } else {
-              const inherited = executingSubIdByRole.get(targetRole);
-              if (inherited) {
-                inner.dataset.subId = inherited;
-                row.dataset.subId = inherited;
-              }
+            // 缺失时继承配对行的 subId，可能是空串)
+            const linked = errSubId || entry.subId;
+            if (linked) {
+              inner.dataset.subId = linked;
+              row.dataset.subId = linked;
             }
           }
-          executingRowByRole.delete(targetRole);
-          executingSubIdByRole.delete(targetRole);
          } else {
         }
         setFooter(`错误: ${truncate(e.message, 80)}`);

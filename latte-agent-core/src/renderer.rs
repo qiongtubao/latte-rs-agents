@@ -93,10 +93,10 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::Resumed => self.on_resumed().await,
             ChatEvent::RoundStarted { round } => self.on_round_started(*round).await,
             ChatEvent::RoundEnded { round } => self.on_round_ended(*round).await,
-            ChatEvent::RoleStarted { role_id, detail } => {
+            ChatEvent::RoleStarted { role_id, detail, .. } => {
                 self.on_status(&format!("{role_id} started: {detail}")).await;
             }
-            ChatEvent::RoleFinished { role_id, detail } => {
+            ChatEvent::RoleFinished { role_id, detail, .. } => {
                 self.on_status(&format!("{role_id} finished: {detail}")).await;
             }
             ChatEvent::RolePaused { role_id } => {
