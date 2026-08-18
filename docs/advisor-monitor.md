@@ -52,6 +52,11 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   D2 校验，避免误报。
 - **D3 连续性定义**：只被 ToolResult（成功）打断；中间的 ToolUse 不打断（调用序列
   是 Use→Error→Use→Error，若以 Use 重置则 D3 永不触发）。
+- **D3 良性探测豁免**：错误文本含 `No such file or directory`（ENOENT）的 ToolError
+  不计入 streak，也不打断已有 streak（watched-role D3 与 specialist streak 同规）。
+  模型探索代码库时常按惯例猜文件名（README.md 等）与列目录同批发出，猜错即 ENOENT、
+  下一轮自愈——这是探索的正常成本而非失控信号（真实事故：两次 ENOENT 触发
+  intervene → 全 session 暂停）。
 - **幻觉/思路错误**无法规则检测 → 走 LLM 审查。
 
 ## 3. 触发式 LLM 审查（advisor 角色本体）

@@ -212,7 +212,8 @@ pub enum DetectorKind {
     DroppedToolCall,
     /// D2: ToolUse.args is not valid JSON.
     InvalidToolArgs,
-    /// D3: ≥2 consecutive ToolError events.
+    /// D3: ≥2 consecutive ToolError events (benign ENOENT probes
+    /// exempt — see `is_benign_probe_error`).
     ToolErrorStreak,
     /// D4: same (tool_name, args) call ≥3 times in a row.
     ToolCallLoop,
@@ -342,6 +343,11 @@ impl TurnDetectors {
     }
 
     fn observe_tool_error(&mut self, tool_name: &str, error: &str) -> Vec<Finding> {
+        // 良性探测错误（ENOENT）不计入 streak，也不打断已有的真实
+        // 错误 streak——它只是探索成本，不是失败信号。
+        if is_benign_probe_error(error) {
+            return Vec::new();
+        }
         self.consec_tool_errors += 1;
         if self.consec_tool_errors >= 2 {
             if let Some(f) = self.fire_once(
@@ -389,6 +395,16 @@ impl TurnDetectors {
 /// JSON-validated.
 fn args_look_truncated(args: &str) -> bool {
     args.ends_with("B]") && args.contains("...[+")
+}
+
+/// 良性探测错误：路径不存在（ENOENT）。模型探索代码库时常按惯例
+/// 猜文件名（README.md / CONTRIBUTING.md）与目录列表同批发出，
+/// 猜错就报这个错，下一轮看到列表后自行纠正。这是探索的正常
+/// 成本而非「agent 失控」，D3 与 specialist streak 都不应计数。
+/// 匹配 `std::io::Error` 的 Display 文案（工具层原样透传，如
+/// `stat: No such file or directory (os error 2)`）。
+fn is_benign_probe_error(error: &str) -> bool {
+    error.contains("No such file or directory")
 }
 
 /// Char-boundary-safe truncation with the same marker format the
@@ -1305,7 +1321,10 @@ impl MonitorState {
                     "[tool_error {role_id}] {tool_name} → {}",
                     truncate_chars(error, 500)
                 ));
-                self.specialist_error_streak += 1;
+                // 与 watched-role D3 同理：良性探测错误（ENOENT）不计数。
+                if !is_benign_probe_error(error) {
+                    self.specialist_error_streak += 1;
+                }
                 if self.specialist_error_streak >= 2 && !self.specialist_streak_warned {
                     self.specialist_streak_warned = true;
                     findings.push(Finding {
@@ -1732,7 +1751,7 @@ mod tests {
         ChatEvent::ToolError {
             role_id: role.into(),
             tool_name: "file.read".into(),
-            error: "no such file".into(),
+            error: "permission denied (os error 13)".into(),
         }
     }
 
@@ -1770,6 +1789,52 @@ mod tests {
         assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
         // 走的是 watched-role 检测器，不污染 specialist streak
         assert_eq!(s.specialist_error_streak, 0);
+    }
+
+    // ── D3: 良性探测错误（ENOENT）豁免 ────────────────────────────
+    // 复现自真实事故：programmer 与列目录同批猜读 README.md /
+    // CONTRIBUTING.md，两个 ENOENT 触发 D3 → advisor intervene →
+    // 全 session 暂停。探测性失败是正常探索成本，不应计数。
+
+    const ENOENT: &str =
+        "Tool execution failed: file.read (attempt 1): stat: No such file or directory (os error 2)";
+
+    #[test]
+    fn d3_ignores_benign_enoent_probes() {
+        let mut s = state();
+        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
+        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
+        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
+    }
+
+    #[test]
+    fn d3_enoent_neither_counts_nor_resets_streak() {
+        let mut s = state();
+        // 真实错误 → ENOENT 探测 → 真实错误：streak 延续，第二个
+        // 真实错误到达 ≥2 即触发。
+        assert!(s.observe(&tool_error("bash", "exit code 1")).findings.is_empty());
+        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
+        let out = s.observe(&tool_error("bash", "exit code 1"));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
+    }
+
+    #[test]
+    fn specialist_enoent_probes_do_not_fire_streak() {
+        let mut s = state();
+        let enoent = || ChatEvent::ToolError {
+            role_id: "programmer".into(),
+            tool_name: "file.read".into(),
+            error: ENOENT.into(),
+        };
+        assert!(s.observe(&enoent()).findings.is_empty());
+        assert!(s.observe(&enoent()).findings.is_empty());
+        assert_eq!(s.specialist_error_streak, 0);
+        // 之后真实错误仍从 0 开始累计，单个不触发。
+        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+        let out = s.observe(&specialist_error("programmer"));
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
     }
 
     // ── D9: zero-tool turn after substantial user message ─────────
