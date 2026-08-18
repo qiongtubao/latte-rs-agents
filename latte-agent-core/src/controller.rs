@@ -175,6 +175,14 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                     });
                 }
             }
+            crate::trace::TraceEvent::ModelCallSlow { meta, model_id, elapsed_secs } => {
+                let _ = self.event_tx.send(ChatEvent::Status {
+                    message: format!(
+                        "⏳ {} 的模型调用（{}）已超过 {}s 未返回——多为厂商慢速生成或大上下文，不是卡死，仍在等待",
+                        meta.role, model_id, elapsed_secs
+                    ),
+                });
+            }
             crate::trace::TraceEvent::ToolExec {
                 meta,
                 name,
@@ -2706,10 +2714,10 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 "call" => format!("$CALLEE($$$ARGS)"),
                 _ => pattern.to_string(),
             };
-            let output = tokio::process::Command::new("sg")
+            let output = tokio::process::Command::new("ast-grep")
                 .args(["-p", &query, path])
                 .output().await
-                .map_err(|e| ToolError::execution_str("code_graph", format!("sg failed: {e}")))?;
+                .map_err(|e| ToolError::execution_str("code_graph", format!("ast-grep failed: {e}")))?;
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let mut result = serde_json::Map::new();

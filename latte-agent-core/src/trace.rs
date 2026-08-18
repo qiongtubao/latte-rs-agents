@@ -260,6 +260,16 @@ pub enum TraceEvent {
         meta: TraceMeta,
         delta: String,
     },
+    /// 慢模型调用提示：非流式 `chat` 超过阈值未返回时发射一次——
+    /// 非流式下生成过程没有任何中间事件，慢速 trickle 在 UI 上与
+    /// 卡死无法区分（日志事故：glm 大上下文慢生成 8 分钟，叠加
+    /// advisor 暂停弹窗，看起来像假暂停）。
+    /// `ChatEventTraceSink` 映射为 `ChatEvent::Status`。
+    ModelCallSlow {
+        meta: TraceMeta,
+        model_id: String,
+        elapsed_secs: u64,
+    },
     ParseToolCalls {
         meta: TraceMeta,
         raw_in: String,
@@ -725,6 +735,7 @@ impl TraceEvent {
             | TraceEvent::ModelCall { meta, .. }
             | TraceEvent::ModelRawOut { meta, .. }
             | TraceEvent::ModelDelta { meta, .. }
+            | TraceEvent::ModelCallSlow { meta, .. }
             | TraceEvent::ParseToolCalls { meta, .. }
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::ToolRetry { meta, .. }
@@ -752,6 +763,7 @@ impl TraceEvent {
             TraceEvent::ModelCall { .. } => "ModelCall",
             TraceEvent::ModelRawOut { .. } => "ModelRawOut",
             TraceEvent::ModelDelta { .. } => "ModelDelta",
+            TraceEvent::ModelCallSlow { .. } => "ModelCallSlow",
             TraceEvent::ParseToolCalls { .. } => "ParseToolCalls",
             TraceEvent::ToolExec { .. } => "ToolExec",
             TraceEvent::ToolRetry { .. } => "ToolRetry",
@@ -785,6 +797,8 @@ impl TraceEvent {
                 format!("{}", raw_content),
             TraceEvent::ModelDelta { delta, .. } =>
                 format!("delta: {}", delta),
+            TraceEvent::ModelCallSlow { model_id, elapsed_secs, .. } =>
+                format!("model={} slow>{}s", model_id, elapsed_secs),
             TraceEvent::ParseToolCalls { parsed, diagnostics, .. } =>
                 format!("parsed={} opens={} matched={} unmatched={}",
                     parsed.len(), diagnostics.opens_found, diagnostics.closes_matched, diagnostics.unmatched_opens.len()),
@@ -886,6 +900,12 @@ impl TraceEvent {
                 kind: "ModelDelta".into(),
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: String::new(),
+            },
+            TraceEvent::ModelCallSlow { model_id, elapsed_secs, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ModelCallSlow".into(),
+                model_id: Some(model_id.clone()), latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                detail: format!("slow>{}s", elapsed_secs),
             },
             TraceEvent::ParseToolCalls { parsed, diagnostics, .. } => IndexLine {
                 turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
@@ -1175,6 +1195,7 @@ impl TraceSink for ScopedSink {
             | TraceEvent::ModelCall { meta, .. }
             | TraceEvent::ModelRawOut { meta, .. }
             | TraceEvent::ModelDelta { meta, .. }
+            | TraceEvent::ModelCallSlow { meta, .. }
             | TraceEvent::ParseToolCalls { meta, .. }
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::ToolRetry { meta, .. }

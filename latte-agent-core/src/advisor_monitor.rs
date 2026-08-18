@@ -113,12 +113,14 @@ impl AdvisorMonitorConfig {
 // ─── v3 pause gate（intervene 暂停门）───────────────────────────────
 
 /// Intervene 暂停门：LLM 复审判 `Verdict::Intervene` 时，monitor 调
-/// `request()` 置位；watched role 的主 runner 在 tool-round 边界
-/// （drain advisor hint 的同一位置）调 `wait_if_requested()` 挂起，
-/// 直到用户拍板（`resolve()`，任何用户输入都算）或超时自动恢复。
-/// 只有 watched role 的主 runner 装配这门（driver 经
-/// `AgentRunner::with_pause_gate`）；advisor 自身与 delegate
-/// specialist 不带，不受影响。
+/// `request()` 置位；runner 在 tool-round 边界（drain advisor hint
+/// 的同一位置）调 `wait_if_requested()` 挂起，直到用户拍板
+/// （`resolve()`，任何用户输入都算）或超时自动恢复。
+/// 主 runner（driver 经 `AgentRunner::with_pause_gate`）与 delegate /
+/// workflow 专家 runner（controller.rs / workflow.rs 装配）都带这门；
+/// advisor 自身不带。注意门只在各 runner 的边界生效——in-flight 的
+/// 模型调用与工具执行不会被打断；阻塞在长 delegate/workflow 调用里
+/// 的 manager 在其返回前也到不了边界。
 #[derive(Debug, Clone)]
 pub struct AdvisorPauseGate {
     requested: Arc<std::sync::atomic::AtomicBool>,
@@ -1076,6 +1078,11 @@ struct MonitorState {
     /// D9: the most recent user message, used to judge whether a
     /// zero-tool turn is suspicious (only substantial requests count).
     last_user_text: String,
+    /// D7 去重：最近一次上报过的失败 workflow 的 summary。嵌套
+    /// workflow 级联失败时，外层事件的 summary 完整内嵌内层的
+    /// summary（同一次失败被上报两遍），contains 判定后折叠，
+    /// 避免对同一根因连发审查/暂停。
+    last_workflow_failure: Option<String>,
 }
 
 impl MonitorState {
@@ -1090,6 +1097,7 @@ impl MonitorState {
             specialist_error_streak: 0,
             specialist_streak_warned: false,
             last_user_text: String::new(),
+            last_workflow_failure: None,
         }
     }
 
@@ -1315,14 +1323,26 @@ impl MonitorState {
                 // how to recover; make sure the failure is disclosed
                 // instead of silently papered over with delegates.
                 if status != "ok" {
-                    findings.push(Finding {
-                        kind: DetectorKind::WorkflowFailed,
-                        hint: format!(
-                            "workflow '{name}' {status}：{}。如果你打算降级为 delegate 手工继续，必须在最终答复中向用户明确披露该 workflow 失败及降级原因，不得静默略过。",
-                            truncate_chars(summary, 300)
-                        ),
-                        evidence: format!("WorkflowFinished name={name} status={status}"),
-                    });
+                    // 嵌套 workflow 级联失败折叠：外层 summary 完整内嵌
+                    // 内层 summary（或反之），同一次失败只报一次，
+                    // 否则 monitor 会对同一根因连发审查、连弹暂停。
+                    let nested_dup = self
+                        .last_workflow_failure
+                        .as_deref()
+                        .is_some_and(|prev| {
+                            summary.contains(prev) || prev.contains(summary.as_str())
+                        });
+                    self.last_workflow_failure = Some(summary.clone());
+                    if !nested_dup {
+                        findings.push(Finding {
+                            kind: DetectorKind::WorkflowFailed,
+                            hint: format!(
+                                "workflow '{name}' {status}：{}。如果你打算降级为 delegate 手工继续，必须在最终答复中向用户明确披露该 workflow 失败及降级原因，不得静默略过。",
+                                truncate_chars(summary, 300)
+                            ),
+                            evidence: format!("WorkflowFinished name={name} status={status}"),
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1487,6 +1507,15 @@ impl AdvisorMonitor {
                     // 作为下一条普通用户消息回传（无结构化回答通道），
                     // controller 在任何用户输入到达时 resolve；
                     // 命中"终止"类关键词还会 cancel_turn。
+                    //
+                    // 去重：上一次介入暂停还没拍板时，不再重复置门+
+                    // 弹窗（级联失败等场景会连发 intervene——日志事故：
+                    // 嵌套 workflow 失败 10 秒内连弹两个暂停，用户点
+                    // 「继续」立刻又被暂停）。气泡与纠正 hint 前面已
+                    // 照常发出，信息量不丢。
+                    if controller.pause_requested() {
+                        continue;
+                    }
                     controller.request_pause();
                     let micros = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -1521,7 +1550,12 @@ impl AdvisorMonitor {
                         ],
                     });
                     let _ = bubble_tx.send(ChatEvent::Status {
-                        message: "⏸ advisor 已暂停 manager 执行，等待用户拍板（继续 / 终止本轮）"
+                        // 请求 ≠ 已暂停：门只在各 runner 的 tool-round 边界
+                        // 生效，in-flight 的模型调用/工具执行跑完才挂起；
+                        // manager 若阻塞在长 workflow/delegate 调用里，
+                        // 在其返回前不会有任何边界。文案如实告知，避免
+                        // 「显示已暂停但子任务还在跑」的假象。
+                        message: "⏸ advisor 已请求暂停：进行中的模型调用/工具不会被打断，manager 与专家会在各自下一个执行边界挂起。等待用户拍板（继续 / 终止本轮）"
                             .to_string(),
                     });
                 }
@@ -1751,6 +1785,47 @@ mod tests {
         assert_eq!(out.findings[0].kind, DetectorKind::WorkflowFailed);
         assert!(out.findings[0].hint.contains("披露"));
         assert!(out.findings[0].hint.contains("design_brainstorm"));
+    }
+
+    /// 嵌套 workflow 级联失败：外层 summary 完整内嵌内层 summary，
+    /// 同一根因只报一次，避免连发审查/连弹暂停（日志事故：
+    /// architect 空返回 → explore 与 design_and_plan 双双重报 →
+    /// advisor 10 秒内连弹两个暂停）。
+    #[test]
+    fn d7_nested_cascade_reports_once() {
+        let mut s = state();
+        let inner = "step 'synthesize' speaker 'architect': subagent failed（已完成 1/2 步）";
+        let outer =
+            format!("step 'explore' nested workflow 'explore': {inner}（已完成 0/6 步）");
+
+        let out1 = s.observe(&ChatEvent::WorkflowFinished {
+            name: "explore".into(),
+            wf_id: "wf-1".into(),
+            status: "failed".into(),
+            summary: inner.into(),
+        });
+        assert_eq!(out1.findings.len(), 1);
+
+        let out2 = s.observe(&ChatEvent::WorkflowFinished {
+            name: "design_and_plan".into(),
+            wf_id: "wf-2".into(),
+            status: "failed".into(),
+            summary: outer,
+        });
+        assert!(
+            out2.findings.is_empty(),
+            "嵌套级联的重复失败不应再次上报: {:?}",
+            out2.findings
+        );
+
+        // 根因无关的新失败仍应正常上报。
+        let out3 = s.observe(&ChatEvent::WorkflowFinished {
+            name: "unrelated".into(),
+            wf_id: "wf-3".into(),
+            status: "failed".into(),
+            summary: "completely different root cause".into(),
+        });
+        assert_eq!(out3.findings.len(), 1);
     }
 
     #[test]
@@ -2302,6 +2377,91 @@ mod tests {
             controller.turn_cancel_requested(),
             "stop keyword also cancels the in-flight turn"
         );
+    }
+
+    /// 上一次介入暂停未拍板时，新的 intervene 只发气泡+hint，不重复
+    /// 置门/弹窗（日志事故：嵌套 workflow 失败 10 秒内连弹两个暂停，
+    /// 用户点「继续」立刻又被暂停）。
+    #[tokio::test]
+    async fn monitor_second_intervene_while_pause_pending_skips_repause() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                        "verdict: intervene\nreason: 方向可疑\nhint: 先停下来读报错",
+                    ))),
+            )
+            .await;
+
+        let controller = Arc::new(ChatController::new(64));
+        let mut bubble_rx = controller.subscribe();
+        let engine = engine_for(advisor_config_at(&server.uri()));
+        let _handle = AdvisorMonitor::spawn(
+            controller.clone(),
+            AdvisorMonitorConfig::default(),
+            engine,
+            "manager".into(),
+        );
+        let tx = controller.event_sender();
+
+        // 第一次介入：D3 两个连续工具错误。
+        tx.send(tool_error("exec", "boom1")).unwrap();
+        tx.send(tool_error("exec", "boom2")).unwrap();
+
+        // 等第一个 ChoiceRequested 到达。
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match bubble_rx.recv().await {
+                    Ok(ChatEvent::ChoiceRequested { .. }) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("first ChoiceRequested should arrive");
+        assert!(controller.pause_requested());
+
+        // 未拍板期间第二次介入触发：workflow 失败。
+        tx.send(ChatEvent::WorkflowFinished {
+            name: "explore".into(),
+            wf_id: "wf-1".into(),
+            status: "failed".into(),
+            summary: "step failed".into(),
+        })
+        .unwrap();
+
+        // 应收到第二个 advisor 气泡（intervene 信息不丢），但不应再有
+        // 第二个 ChoiceRequested。气泡与弹窗在同一轮迭代内先后发出，
+        // 气泡到达后再等 200ms 无弹窗即可确认被去重。
+        let mut second_bubble = false;
+        let mut second_choice = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), bubble_rx.recv()).await {
+                Ok(Ok(ChatEvent::RoleTurn { role_id, content, .. }))
+                    if role_id == "advisor" && content.contains("intervene") =>
+                {
+                    second_bubble = true;
+                }
+                Ok(Ok(ChatEvent::ChoiceRequested { .. })) => second_choice = true,
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if second_bubble {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(second_bubble, "第二次 intervene 的气泡应照常发出");
+        assert!(!second_choice, "未拍板期间不应再弹 ChoiceRequested");
+        assert!(controller.pause_requested(), "原暂停门应保持置位");
     }
 
     // ─── AdvisorPauseGate 单测 ─────────────────────────────────────

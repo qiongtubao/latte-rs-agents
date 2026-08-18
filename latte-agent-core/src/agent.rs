@@ -357,6 +357,18 @@ impl Agent {
                 continue;
             }
             match mc.client.chat(messages, p).await {
+                Ok(c) if is_empty_completion(&c) => {
+                    // 空 completion（无文本、无 tool_calls）是厂商侧抖动
+                    // （glm/deepseek 系偶发）：原样上交会让下游把空串当
+                    // 结论（日志事故：architect 空返回 → workflow 直接判死）。
+                    // 按模型局部失败处理：短冷却后跟链走。
+                    tried.push(mc.model.id.clone());
+                    failures.push((
+                        mc.model.id.clone(),
+                        "empty completion (no content, no tool_calls)".into(),
+                    ));
+                    mc.set_cooldown(Duration::from_secs(5));
+                }
                 Ok(c) => return Ok(c),
                 Err(e) => {
                     tried.push(mc.model.id.clone());
@@ -387,7 +399,16 @@ impl Agent {
                 // After waiting, retry the highest-priority model once.
                 if let Some(mc) = self.model_chain.first() {
                     match mc.client.chat(messages, p).await {
-                        Ok(c) => return Ok(c),
+                        Ok(c) if !is_empty_completion(&c) => return Ok(c),
+                        Ok(_) => {
+                            // 空 completion 同样按失败处理（见链式遍历分支）。
+                            mc.set_cooldown(Duration::from_secs(5));
+                            tried.push(mc.model.id.clone());
+                            failures.push((
+                                mc.model.id.clone(),
+                                "empty completion (no content, no tool_calls)".into(),
+                            ));
+                        }
                         Err(e) => {
                             // Refresh its cooldown if retryable.
                             if let Some(cd) = cooldown_for_error(&e) {
@@ -491,9 +512,10 @@ impl std::fmt::Debug for Agent {
 
 /// Map a `latte_ai::error::AiError` to a suggested cooldown duration.
 ///
-/// Returns `None` for non-retryable errors (auth, config, serialization,
-/// caller-fault 4xx other than 429). The agent should surface these
-/// immediately rather than walking the fallback chain.
+/// Returns `None` only for local errors that switching models cannot
+/// plausibly bypass (config, serialization). Retryable vendor-side
+/// failures — rate limits, 4xx/5xx, transport errors, auth failures,
+/// stream timeouts — get a cooldown and the chain falls through.
 /// Surface hook fires to stderr so the operator sees the hook
 /// chain in action without grepping the trace JSONL. One line
 /// per fire, easy to grep:
@@ -673,6 +695,11 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {    match e {
         // 在。短冷却让链落到下一个模型；若全链都 auth 失败，最终以
         // ModelsUnavailable 报错，信息同样明确。
         AiError::Auth(_) => Some(Duration::from_secs(5)),
+        // 流式超时/中断（TTFB 首事件超时、idle 超时、连接中断）：多为
+        // 厂商侧卡顿或 payload 过大处理慢，换链上下一个模型很可能立刻
+        // 能跑。短冷却后跟链走；全链都超时才以 ModelsUnavailable 进入
+        // 「自动暂停 → 用户继续 → 重试」路径，而不是整 turn 直接硬失败。
+        AiError::Stream(_) => Some(Duration::from_secs(10)),
         // 其余为无法通过切换模型可靠规避的本地错误。
         _ => None,
     }
@@ -834,6 +861,76 @@ fn model_failures_summary(e: &AgentError) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// 失败列表里是否包含「上下文超出模型窗口」类错误。这类失败靠原样
+/// 重试无法恢复（payload 不变），需要裁剪待发消息或换更大上下文的模型。
+fn failures_include_context_overflow(e: &AgentError) -> bool {
+    const PATTERNS: &[&str] = &[
+        "context window",
+        "context length",
+        "maximum context",
+        "prompt is too long",
+        "too many tokens",
+        "request too large",
+    ];
+    match e {
+        AgentError::ModelsUnavailable { failures, .. } => failures.iter().any(|(_, err)| {
+            let low = err.to_lowercase();
+            PATTERNS.iter().any(|p| low.contains(p))
+        }),
+        _ => false,
+    }
+}
+
+/// 单条待发消息的文本上限（字符）。成功的工具结果原样回填、不设上限，
+/// 一旦因此撑爆模型上下文，恢复重试前靠它把超长消息裁成头部 + 标记。
+const OVERSIZED_MSG_CHARS: usize = 8_000;
+
+/// 原地裁剪消息列表中超过 [`OVERSIZED_MSG_CHARS`] 的文本 part（system
+/// 消息除外），返回被裁剪的消息条数。只作用于本 turn 的待发
+/// payload——工具结果本就不入持久 context，会话记录不受损。
+fn slim_oversized_messages(messages: &mut [Message]) -> usize {
+    let mut slimmed = 0;
+    for m in messages.iter_mut() {
+        if m.role == Role::System {
+            continue;
+        }
+        let mut touched = false;
+        for part in m.content.iter_mut() {
+            if let ContentPart::Text { text } = part {
+                let n = text.chars().count();
+                if n > OVERSIZED_MSG_CHARS {
+                    let head: String = text.chars().take(OVERSIZED_MSG_CHARS).collect();
+                    *text = format!("{head}\n…[消息过长已裁剪，原 {n} 字符]");
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            slimmed += 1;
+        }
+    }
+    slimmed
+}
+
+/// 慢模型调用提示阈值：非流式 `chat` 超过该时长未返回时，向 UI 发
+/// 一次「仍在等待」状态（见 run_turn 非流式分支）。默认 120s；
+/// 测试可用 `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` 调小。
+fn slow_model_call_notice() -> Duration {
+    std::env::var("LATTE_AGENT_SLOW_CALL_NOTICE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(120))
+}
+
+/// 空 completion 判定：无有效文本且无任何 tool_calls。只有文本为空
+/// 但带 tool_calls 是正常的 tool round，不算空。空 completion 是厂商
+/// 侧抖动（空响应入历史会导致后续请求 400，见 run_turn 尾部注释），
+/// 调用方应把它当模型局部失败走 fallback，而不是当成功结果上交。
+fn is_empty_completion(c: &Completion) -> bool {
+    c.tool_calls.is_empty() && crate::controller::is_empty_output(&c.content)
 }
 
 /// Whether `delegate` tool calls emitted in the *same* model response
@@ -1192,9 +1289,12 @@ impl AgentRunner {
             return false;
         };
         let summary = model_failures_summary(e);
-        gate.pause_with_reason(format!(
-            "模型不可用（{summary}），已自动暂停——点 ▶ 继续会自动重试"
-        ));
+        let hint = if failures_include_context_overflow(e) {
+            "检测到上下文超出模型窗口——原样重试必败。点 ▶ 继续将自动裁剪本轮待发消息中的超长内容（多为工具结果）后重试；会话记录不受影响"
+        } else {
+            "点 ▶ 继续会自动重试"
+        };
+        gate.pause_with_reason(format!("模型不可用（{summary}），已自动暂停——{hint}"));
         self.sink.emit(crate::trace::TraceEvent::SessionPaused {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
             task_id: String::new(),
@@ -1619,83 +1719,133 @@ impl AgentRunner {
                 // Stream 模式：逐 Delta 消费，发 ModelDelta trace 让 UI 逐 token 渲染。
                 // Done 携带完整 tool_calls + usage，组装成 Completion 后下游工具循环零改动。
                 // 模型全链不可用 → 自动暂停 session 门，等用户「继续」后重试。
-                let mut rx = loop {
-                    match self.agent.chat_stream(&messages, chat_params.as_ref()).await {
-                        Ok(rx) => break rx,
-                        Err(e @ AgentError::ModelsUnavailable { .. }) => {
-                            if !self.pause_wait_model_unavailable(&e).await {
-                                return Err(e);
+                // 空 completion（无文本、无 tool_calls）多为厂商抖动：流式在连接
+                // 建立后无法链式 fallback，拿到空 Done 时整流重试，上限 2 次。
+                let mut empty_retries = 0u8;
+                'stream_attempt: loop {
+                    let mut rx = loop {
+                        match self.agent.chat_stream(&messages, chat_params.as_ref()).await {
+                            Ok(rx) => break rx,
+                            Err(e @ AgentError::ModelsUnavailable { .. }) => {
+                                let overflow = failures_include_context_overflow(&e);
+                                if !self.pause_wait_model_unavailable(&e).await {
+                                    return Err(e);
+                                }
+                                // 用户在暂停期间可能已在 UI 改了模型配置：
+                                // 重试前先热更新 chain。
+                                self.maybe_reload_models();
+                                if overflow {
+                                    // 上下文超窗：同一 payload 重试必败，
+                                    // 先瘦身本轮待发消息（只影响待发列表，
+                                    // 不动持久 context）。
+                                    slim_oversized_messages(&mut messages);
+                                }
                             }
-                            // 用户在暂停期间可能已在 UI 改了模型配置：
-                            // 重试前先热更新 chain。
-                            self.maybe_reload_models();
+                            Err(e) => return Err(e),
                         }
-                        Err(e) => return Err(e),
-                    }
-                };
-                loop {
-                    match rx.recv().await {
-                        Some(StreamEvent::Delta { content, .. }) => {
-                            let delta_text: String = content.iter()
-                                .filter_map(|p| match p {
-                                    ContentPart::Text { text } => Some(text.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("");
-                            if !delta_text.is_empty() {
-                                self.sink.emit(TraceEvent::ModelDelta {
-                                    meta: meta.clone(),
-                                    delta: delta_text,
-                                });
+                    };
+                    let c = loop {
+                        match rx.recv().await {
+                            Some(StreamEvent::Delta { content, .. }) => {
+                                let delta_text: String = content.iter()
+                                    .filter_map(|p| match p {
+                                        ContentPart::Text { text } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                if !delta_text.is_empty() {
+                                    self.sink.emit(TraceEvent::ModelDelta {
+                                        meta: meta.clone(),
+                                        delta: delta_text,
+                                    });
+                                }
+                            }
+                            Some(StreamEvent::Done { content, tool_calls, usage, stop_reason }) => {
+                                let text = content.iter()
+                                    .filter_map(|p| match p {
+                                        ContentPart::Text { text } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                break Completion {
+                                    content: text,
+                                    content_parts: content,
+                                    tool_calls,
+                                    stop_reason: if stop_reason.is_empty() { "stop".into() } else { stop_reason },
+                                    usage,
+                                };
+                            }
+                            Some(StreamEvent::Error(e)) => {
+                                return Err(AgentError::from(AiError::Stream(e)));
+                            }
+                            Some(StreamEvent::HttpError { status, message }) => {
+                                return Err(AgentError::from(AiError::Api { status, message }));
+                            }
+                            None => {
+                                return Err(AgentError::from(AiError::Stream(
+                                    "stream closed before Done".into(),
+                                )));
                             }
                         }
-                        Some(StreamEvent::Done { content, tool_calls, usage, stop_reason }) => {
-                            let text = content.iter()
-                                .filter_map(|p| match p {
-                                    ContentPart::Text { text } => Some(text.as_str()),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("");
-                            break Completion {
-                                content: text,
-                                content_parts: content,
-                                tool_calls,
-                                stop_reason: if stop_reason.is_empty() { "stop".into() } else { stop_reason },
-                                usage,
-                            };
-                        }
-                        Some(StreamEvent::Error(e)) => {
-                            return Err(AgentError::from(AiError::Stream(e)));
-                        }
-                        Some(StreamEvent::HttpError { status, message }) => {
-                            return Err(AgentError::from(AiError::Api { status, message }));
-                        }
-                        None => {
-                            return Err(AgentError::from(AiError::Stream(
-                                "stream closed before Done".into(),
-                            )));
-                        }
+                    };
+                    if is_empty_completion(&c) && empty_retries < 2 {
+                        empty_retries += 1;
+                        continue 'stream_attempt;
                     }
+                    break 'stream_attempt c;
                 }
             } else {
                 // 非流式模式（默认）：chat() 内部走流式传输 + idle watchdog，对外返回完整 Completion。
                 // 模型全链不可用 → 自动暂停 session 门，等用户「继续」后重试。
                 loop {
-                    match self
-                        .agent
-                        .chat(&messages, chat_params.as_ref(), WaitPolicy::WaitAndRetry)
-                        .await
-                    {
+                    // 慢调用可见性：非流式下生成过程没有任何中间事件，
+                    // 慢速 trickle 在 UI 上等同卡死（日志事故：glm 大
+                    // 上下文慢生成 8 分钟，叠加 advisor 暂停弹窗，看起来
+                    // 像假暂停）。超过阈值未返回发一次 ModelCallSlow，
+                    // 然后继续等——提示不是超时，不影响等待本身。
+                    let r = {
+                        let chat = self.agent.chat(
+                            &messages,
+                            chat_params.as_ref(),
+                            WaitPolicy::WaitAndRetry,
+                        );
+                        tokio::pin!(chat);
+                        let mut noticed = false;
+                        loop {
+                            match tokio::time::timeout(slow_model_call_notice(), &mut chat).await
+                            {
+                                Ok(r) => break r,
+                                Err(_) => {
+                                    if !noticed {
+                                        noticed = true;
+                                        self.sink.emit(TraceEvent::ModelCallSlow {
+                                            meta: meta.clone(),
+                                            model_id: model_id.clone(),
+                                            elapsed_secs: slow_model_call_notice().as_secs(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match r {
                         Ok(c) => break c,
                         Err(e @ AgentError::ModelsUnavailable { .. }) => {
+                            let overflow = failures_include_context_overflow(&e);
                             if !self.pause_wait_model_unavailable(&e).await {
                                 return Err(e);
                             }
                             // 用户在暂停期间可能已在 UI 改了模型配置：
                             // 重试前先热更新 chain。
                             self.maybe_reload_models();
+                            if overflow {
+                                // 上下文超窗：同一 payload 重试必败，
+                                // 先瘦身本轮待发消息（只影响待发列表，
+                                // 不动持久 context）。
+                                slim_oversized_messages(&mut messages);
+                            }
                         }
                         Err(e) => return Err(e),
                     }
@@ -2762,6 +2912,59 @@ mod tests {
         assert_eq!(d, Some(Duration::from_secs(5)));
     }
     #[test]
+    fn test_cooldown_for_stream_error_falls_through_chain() {
+        // TTFB 首事件超时 / idle 超时多为厂商侧卡顿：应冷却后跟链走，
+        // 而不是作为「本地不可规避错误」直接硬失败整个 turn。
+        let d = cooldown_for_error(&AiError::Stream("等待首个事件超时（100s 无响应）".into()));
+        assert_eq!(d, Some(Duration::from_secs(10)));
+    }
+
+    // ─── context overflow 检测与待发消息裁剪 ───────────────────────────
+
+    #[test]
+    fn test_context_overflow_detection() {
+        let overflow = AgentError::ModelsUnavailable {
+            tried: vec!["m1".into()],
+            failures: vec![
+                ("m1".into(), "API error: 400 - invalid params, context window exceeds limit".into()),
+            ],
+            next_retry_in: None,
+        };
+        assert!(failures_include_context_overflow(&overflow));
+
+        let plain_5xx = AgentError::ModelsUnavailable {
+            tried: vec!["m1".into()],
+            failures: vec![("m1".into(), "API error: 502 - Bad Gateway".into())],
+            next_retry_in: None,
+        };
+        assert!(!failures_include_context_overflow(&plain_5xx));
+
+        let other = AgentError::InvalidParam("context window".into());
+        assert!(!failures_include_context_overflow(&other));
+    }
+
+    #[test]
+    fn test_slim_oversized_messages() {
+        use latte_ai::models::Role as MsgRole;
+        let mut msgs = vec![
+            Message::system("sys".repeat(OVERSIZED_MSG_CHARS * 2)),
+            Message::user("short"),
+            Message::tool_result("t1", "x".repeat(OVERSIZED_MSG_CHARS * 3)),
+        ];
+        let n = slim_oversized_messages(&mut msgs);
+        assert_eq!(n, 1, "只有超长 tool 消息应被裁剪");
+        // system 消息不动
+        assert!(msgs[0].as_text().chars().count() > OVERSIZED_MSG_CHARS);
+        assert_eq!(msgs[0].role, MsgRole::System);
+        // 短消息不动
+        assert_eq!(msgs[1].as_text(), "short");
+        // 超长消息裁到上限附近并带标记
+        let slimmed = msgs[2].as_text();
+        assert!(slimmed.chars().count() <= OVERSIZED_MSG_CHARS + 40);
+        assert!(slimmed.contains("消息过长已裁剪"), "{slimmed}");
+    }
+
+    #[test]
     fn test_cooldown_for_config_error_is_none() {
         let d = cooldown_for_error(&AiError::Config("bad model".into()));
         assert_eq!(d, None);
@@ -3187,6 +3390,143 @@ mod tests {
         assert!(!agent.model_chain[0].is_available());
         // Fallback should still be available.
         assert!(agent.model_chain[1].is_available());
+    }
+
+    /// 空 completion（200 但无文本、无 tool_calls）按模型局部失败处理：
+    /// 短冷却 + 跟链走，而不是把空串当成功结果上交（日志事故：architect
+    /// 空返回 → workflow 直接判死）。
+    #[tokio::test]
+    async fn test_chat_falls_back_on_empty_completion() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let primary = wiremock::MockServer::start().await;
+        primary
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("", vec![])),
+                    ),
+            )
+            .await;
+        let fallback = wiremock::MockServer::start().await;
+        fallback
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("fallback won", vec![]),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![model_at(&primary, "primary"), model_at(&fallback, "fallback")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+
+        let resp = agent
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
+            .await
+            .expect("空 completion 应 fallback 到第二模型");
+        assert_eq!(resp.content, "fallback won");
+        assert!(
+            !agent.model_chain[0].is_available(),
+            "返回空 completion 的模型应被短冷却"
+        );
+    }
+
+    /// is_empty_completion：空文本 + 无 tool_calls 才算空；带 tool_calls
+    /// 的空文本是正常的 tool round。
+    #[test]
+    fn test_is_empty_completion() {
+        use latte_ai::models::ToolCall;
+        let empty = Completion {
+            content: String::new(),
+            content_parts: vec![],
+            tool_calls: vec![],
+            stop_reason: "stop".into(),
+            usage: TokenUsage::default(),
+        };
+        assert!(is_empty_completion(&empty));
+
+        let tool_round = Completion {
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "file.read".into(),
+                arguments: serde_json::json!({}),
+                arguments_raw: None,
+                arguments_parse_error: None,
+            }],
+            ..empty
+        };
+        assert!(!is_empty_completion(&tool_round));
+    }
+
+    /// 慢调用提示：非流式 chat 超过阈值未返回 → sink 恰好收到一次
+    /// ModelCallSlow；调用本身不被打断，慢响应最终正常返回。
+    #[tokio::test]
+    async fn test_slow_model_call_emits_notice() {
+        use crate::trace::{TraceEvent, TraceSink};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        struct LocalVecSink(parking_lot::Mutex<Vec<TraceEvent>>);
+        impl TraceSink for LocalVecSink {
+            fn emit(&self, e: TraceEvent) {
+                self.0.lock().push(e);
+            }
+        }
+
+        // 阈值缩到 1s（进程级 env，需串行）。
+        let _guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        std::env::set_var("LATTE_AGENT_SLOW_CALL_NOTICE_SECS", "1");
+
+        let s = wiremock::MockServer::start().await;
+        s.register(
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(2500))
+                        .set_body_string(openai_completion_body("slow reply", vec![])),
+                ),
+        )
+        .await;
+
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![model_at(&s, "slow-model")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let sink = Arc::new(LocalVecSink(parking_lot::Mutex::new(vec![])));
+        let mut runner = AgentRunner::new(agent).with_sink(sink.clone() as Arc<dyn TraceSink>);
+
+        let out = runner
+            .run_turn(&[Message::user("hi")], None)
+            .await
+            .unwrap();
+        std::env::remove_var("LATTE_AGENT_SLOW_CALL_NOTICE_SECS");
+        drop(_guard);
+
+        assert_eq!(out, "slow reply");
+        let events = sink.0.lock();
+        let slows = events
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::ModelCallSlow { .. }))
+            .count();
+        assert_eq!(slows, 1, "应恰好发一次慢调用提示，events: {}", events.len());
     }
 
     #[tokio::test]

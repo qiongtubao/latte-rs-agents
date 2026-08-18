@@ -795,7 +795,10 @@ mod tests {
             let has_user = h.iter().any(|v| v["type"] == "UserMessage");
             let has_turn_end = h
                 .iter()
-                .any(|v| v["type"] == "Error" || v["type"] == "RoleTurn");
+                // 终态事件：Error（快速失败）/ RoleTurn（正常回答）/
+                // Paused（dead-model 的连接错误属可重试分类——全链
+                // 不可用后自动暂停等人恢复，等不到 Error）。
+                .any(|v| v["type"] == "Error" || v["type"] == "RoleTurn" || v["type"] == "Paused");
             if has_user && has_turn_end {
                 // 再稳一拍，等 archiver tee 完落盘。
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;

@@ -685,6 +685,10 @@ async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
     names.insert("delegate".to_string());
     names.insert("workflow".to_string());
     names.insert("generate_image".to_string());
+    // code_graph 由 controller 按角色配置动态注册（controller.rs
+    // code_graph_tool()），不在 builtin packages——不补进枚举的话角色
+    // 编辑器永远看不到它，形成「没配上就不注册、不注册就配不上」的死锁。
+    names.insert("code_graph".to_string());
     Ok(names.into_iter().collect())
 }
 
