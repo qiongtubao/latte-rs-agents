@@ -7,8 +7,8 @@
 //
 // 数据契约：见 `api.ts` 的 `ModelsListResponse` / `ModelWithSource`。
 // `file_path` 字段是后端独立扫盘拿到的真实绝对路径，UI 直接展示给用户。
-import { listModels, updateModel, deleteModel, getModelToml, putModelToml } from "./api";
-import type { ModelDef, ModelWithSource } from "./api";
+import { listModels, updateModel, deleteModel, getModelToml, putModelToml, getAdvisor, putAdvisor } from "./api";
+import type { AdvisorState, ModelDef, ModelWithSource } from "./api";
 interface UIBinding {
   panelEl: HTMLElement;
   openBtn: HTMLButtonElement;
@@ -106,6 +106,45 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
   const tomlReloadBtn = document.getElementById("models-toml-reload") as HTMLButtonElement | null;
   const tomlStatusEl = document.getElementById("models-toml-status") as HTMLElement | null;
 
+  // ── advisor 全局开关（面板顶部的独立设置行） ──
+  const advisorCheckbox = document.getElementById("advisor-enabled") as HTMLInputElement | null;
+  const advisorStatusEl = document.getElementById("advisor-setting-status") as HTMLElement | null;
+
+  function renderAdvisorState(s: AdvisorState): void {
+    if (advisorCheckbox) advisorCheckbox.checked = s.enabled;
+    if (advisorStatusEl) {
+      advisorStatusEl.textContent =
+        s.project_override !== null
+          ? `⚠️ 本项目配置覆盖全局：advisor=${s.project_override ? "开" : "关"}（全局设置暂不生效）`
+          : s.enabled
+            ? "已开启（新 session 生效）"
+            : "已关闭（新 session 生效）";
+    }
+  }
+
+  async function refreshAdvisor(): Promise<void> {
+    if (!advisorCheckbox) return;
+    try {
+      renderAdvisorState(await getAdvisor());
+    } catch (err) {
+      if (advisorStatusEl) advisorStatusEl.textContent = `读取失败：${err}`;
+    }
+  }
+
+  advisorCheckbox?.addEventListener("change", async () => {
+    if (!advisorCheckbox) return;
+    const want = advisorCheckbox.checked;
+    advisorCheckbox.disabled = true;
+    try {
+      renderAdvisorState(await putAdvisor(want));
+    } catch (err) {
+      advisorCheckbox.checked = !want;
+      if (advisorStatusEl) advisorStatusEl.textContent = `保存失败：${err}`;
+    } finally {
+      advisorCheckbox.disabled = false;
+    }
+  });
+
   /** 按条目身份（key + source + file_path）在 `items[]` 里定位索引。 */
   function itemIndex(m: ModelWithSource | null): number {
     if (!m) return -1;
@@ -132,6 +171,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     container.panelEl.classList.remove("hidden");
     showTab("form");
     void refresh();
+    void refreshAdvisor();
   });
   container.closeBtn.addEventListener("click", () => container.panelEl.classList.add("hidden"));
   container.refreshBtn.addEventListener("click", () => {

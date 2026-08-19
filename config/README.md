@@ -73,6 +73,22 @@ Both **directory** layouts are supported by
 `agents.toml` / `discussion.toml` are still loadable by
 `load()` on the project layer, but the global layer uses
 `agents/` and `workflows/` directories only).
+
+## Advisor 总开关
+
+任意 agents 配置文件（项目 `.latte/agents.toml` / `agents.d/*.toml`，或
+全局 `~/.latte/agents.d/*.toml`）都可声明：
+
+```toml
+[advisor]
+enabled = false
+```
+
+`false` 关闭 advisor 的全部活动：事件流 monitor、D5/D6 产出门禁、
+delegate 返回审查（含 workflow 的审查重做）。缺省 `true`（开）。
+分层合并时 project 层的显式值覆盖 global 层；只在 global 层声明
+则对没有声明的所有项目生效。
+
 ## Global layer (~/.latte/)
 
 All subdirectories under `~/.latte/` (or `$LATTE_HOME`) use the same

@@ -516,7 +516,7 @@ mod tests {
     fn tool_exec_ok(role: &str) -> TraceEvent {
         TraceEvent::ToolExec {
             meta: TraceMeta::now(SEQ.fetch_add(1, Ordering::Relaxed), role, "test"),
-            name: "file.read".into(),
+            name: "read".into(),
             args_json: "{}".into(),
             latency_ms: 3,
             status: ToolStatus::Ok("ok".into()),

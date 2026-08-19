@@ -131,7 +131,7 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 
 ## 5. 配置与成本控制
 
-- `AdvisorMonitorConfig { enabled: bool = true, review_mode: AdvisorReviewMode = OnAnomaly, max_reviews_per_turn: u32 = 2, watchdog_notes: bool = true, gate: GateConfig }`
+- `AdvisorMonitorConfig { enabled: bool = true, review_mode: AdvisorReviewMode = OnAnomaly, max_reviews_per_turn: u32 = 2, watchdog_notes: bool = true, gate: GateConfig, review_settings: AdvisorReviewSettings }`
   （`AdvisorReviewMode::{Off, OnAnomaly, EveryTurn}`；防异常风暴反复烧 premium）。
   `Default` 实现即开启；本 workspace 唯一的 `ControllerConfig` 构造点
   （ui-server `create_session_handle`）使用 Default——默认开。
@@ -140,6 +140,12 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   `with_gate_config`，`run_turn_gated` 在产出被接受前跑
   `check_response_gates`；未启用时 runner 不带 gate，
   `run_turn_gated` 等价 `run_turn`。
+  `review_settings`（`delegate_review_timeout_secs = 90` +
+  `return_max_redo = 1`，硬上限 3）在 `runner_gate()` 注入 gate 副本，
+  随既有 plumbing 流到各 delegate-return 审查 engine：前者是
+  `gate_delegate_return` 的单次审查超时（jemalloc 实锤：45s 硬编码对
+  20–44s 延迟的慢审查模型太紧，频繁「未审直接放行」），后者是
+  workflow speaker 返回被判 intervene/terminate 时的重做上限。
 - 确定性提示每 turn 每种检测器最多一次（`fired` 集合去重，turn 结束重置）。
 - 每 turn LLM 审查次数 ≤ `max_reviews_per_turn`，超限 `tracing::warn` 跳过。
 - hint 队列积压上限 16 条（`advisor_hint` 超限时丢弃最旧），防止异常风暴
@@ -156,14 +162,16 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 - LLM 复审 `Verdict::Terminate` → monitor 调 `ChatController::cancel_turn()`
   取消 manager 的 in-flight turn（**软终止**：driver 回到等用户输入，不是
   abort session），并广播 `ChatEvent::AdvisorTerminated { detector: Some("LLM") }`。
-- LLM 复审 `Verdict::Intervene` → **pause gate 暂停门**：monitor 在气泡+hint
-  之外调 `ChatController::request_pause()` 置位共享 `AdvisorPauseGate`，并广播
-  `ChatEvent::ChoiceRequested`（继续=推荐 / 终止本轮）+ 暂停 Status；watched role
-  的主 runner 在下一个 **tool-round 边界**（drain hint 的同一位置）挂起等用户拍板。
-  任何用户输入（选择弹窗的回答也作为普通用户消息回传）经 `submit_input` resolve
-  恢复；文本命中"终止/stop/取消/别继续"时同时 `cancel_turn()`。10 分钟未拍板
-  超时自动恢复（warn，防死锁）。只装 watched role 的主 runner——advisor 自身与
-  delegate specialist 不暂停。
+- ~~LLM 复审 `Verdict::Intervene` → pause gate 暂停门~~（v4 移除，见下）。
+
+**v4（已落地）**：intervene 语义改为「**纠正并继续**」——只发气泡 + 注入纠正
+hint（manager 下一个 tool-round 边界 drain 后自愈），不再置位暂停门、不再弹
+ChoiceRequested 拍板窗、主会话全程不停。动机：v3 的暂停门多次打在健康运行上
+（良性工具报错 streak、gate 按设计拒绝 workflow 等），每次误停都要人工解锁，
+代价远大于收益。`AdvisorPauseGate` 结构与 runner 侧接线保留（休眠）；恢复暂停
+语义只需在 monitor 的 intervene 分支重新调 `request_pause()`。保留暂停能力的
+唯一路径是「模型不可用」自动暂停（`agent.rs pause_wait_model_unavailable`，走
+AgentPauseGate，与本 monitor 无关）。
 - D5/D6 pre-persistence gate 接入生产 driver：`build_runner` 按
   `AdvisorMonitorConfig::runner_gate()` 给 manager / 多角色 / delegate
   specialist runner 装 `with_gate_config`；gate 命中 → 带批注重试（最多
@@ -199,10 +207,10 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   文件缺失 → 无 attention 区块且审查照常；`watchdog_notes=false` → 不读文件。
 - monitor 容错：空 model catalog（resolve 失败）→ 确定性 hint 照发、无气泡、
   monitor 存活继续检测（后续 D4 正常触发）。
-- v3 pause gate：
-  - monitor 级（wiremock 裁决 intervene）→ `pause_requested` 置位 +
-    `ChoiceRequested`（继续=推荐/终止本轮）+ 暂停 Status 广播；用户回"终止本轮"
-    → resolve + `turn_cancel_flag` 置位。
+- v4 intervene 行为（`monitor_intervene_corrects_without_pausing`，wiremock
+  裁决 intervene）→ 🛑 气泡（含 hint）照发、纠正 hint 入共享队列，
+  且**不**置暂停门、**不**弹 ChoiceRequested、**不**发暂停 Status。
+- v3 pause gate（休眠中的基础设施，仅 gate 级单测）：
   - gate 单测：未置位立即返回；置位挂起直到 resolve；短超时自动恢复并清旗。
   - runner 级（`agent::tests`，wiremock 恒定 tool_call + 工具 handler 置位
     gate）：挂起期间无第二次模型调用，resolve 后 tool 循环继续。

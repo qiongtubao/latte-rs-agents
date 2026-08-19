@@ -618,6 +618,7 @@ mod tests {
     #[test]
     fn test_resolve_via_tier_defaults() {
         let config = AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium-model", Some("premium")),
@@ -647,6 +648,7 @@ mod tests {
     #[test]
     fn test_resolve_fallback() {
         let config = AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![test_model_def("only-model", None)],
                 tiers: None,
@@ -665,6 +667,7 @@ mod tests {
         let mut def = test_model_def("deepseek-v4-flash", None);
         def.name = "DeepSeek-v4-flash".into();
         let config = AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -682,6 +685,7 @@ mod tests {
         let mut def = test_model_def("deepseek-v4-flash", None);
         def.name = "DeepSeek-v4-flash".into();
         let config = AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -703,6 +707,7 @@ mod tests {
         let mut def = test_model_def("real-id", None);
         def.name = "Real Name".into();
         let config = AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -735,6 +740,7 @@ mod tests {
 
     fn catalog_with(models: Vec<ModelDef>) -> AgentConfig {
         AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models,
                 tiers: None,
@@ -823,6 +829,7 @@ mod tests {
 
     fn catalog_with_three() -> AgentConfig {
         AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium", Some("premium")),

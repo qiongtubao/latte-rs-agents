@@ -180,8 +180,10 @@ export type ChatEvent =
   // plan 工具提交的任务候选：manager 调 plan 后广播，UI 弹窗勾选导入
   // 看板。tasks 与 POST /api/tasks/import 的 ImportTask 同构。
   | { type: "PlanProposed"; role_id: string; plan_id: string; tasks: ImportTask[] }
-  // ask 工具抛出的选择题：manager/角色调 ask 后广播，UI 弹出选择框；
-  // 用户提交后把选择结果作为下一条 user 消息（sendMessage）回喂角色。
+  // ask 工具抛出的选择题：manager/角色调 ask 后广播，UI 弹出选择框。
+  // wait=false（顶层 turn）：用户提交后把选择结果作为下一条 user 消息
+  // （sendMessage）回喂角色；wait=true（workflow/delegate 子代理阻塞
+  // 等待）：答案 POST 到 /api/chat/choice-answer 直达等待方。
   | {
       type: "ChoiceRequested";
       role_id: string;
@@ -190,6 +192,7 @@ export type ChatEvent =
       multi?: boolean;
       layout?: string; // "grid" | "" (list)
       allow_upload?: boolean;
+      wait?: boolean;
       options: ChoiceOption[];
     }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
@@ -378,8 +381,43 @@ export async function getRoles(): Promise<RoleInfo[]> {
   return getTransport().request("GET", "/api/roles");
 }
 
+// ─── advisor 全局开关 ────────────────────────────────────────────
+
+export interface AdvisorState {
+  /** 生效值（project 层显式声明优先于全局层文件）。 */
+  enabled: boolean;
+  /** project 层显式声明值；非 null 时全局开关被项目覆盖。 */
+  project_override: boolean | null;
+  /** 全局开关的持久化文件路径。 */
+  file: string;
+}
+
+/** GET /api/advisor — advisor 全局开关状态。 */
+export async function getAdvisor(): Promise<AdvisorState> {
+  return getTransport().request("GET", "/api/advisor");
+}
+
+/** PUT /api/advisor — 设置 advisor 全局开关（写全局层 agents.d/advisor.toml）。 */
+export async function putAdvisor(enabled: boolean): Promise<AdvisorState> {
+  return getTransport().request("PUT", "/api/advisor", { enabled });
+}
+
 export async function sendMessage(message: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/send", chatBody({ message }));
+}
+
+/** 阻塞中的 ask（`ChoiceRequested.wait=true`，workflow/delegate 子代理
+ * 正挂起等回答）的答案直达通道：经后端 choice 路由直接交给等待方，
+ * 而不是另起一轮 user 消息。返回 false = 无匹配挂起项（已答/超时/
+ * 服务重启），调用方应降级为 `sendMessage` 回喂。 */
+export async function sendChoiceAnswer(choiceId: string, answer: string): Promise<boolean> {
+  try {
+    await getTransport().request("POST", "/api/chat/choice-answer", chatBody({ choice_id: choiceId, answer }));
+    return true;
+  } catch (err) {
+    if (err instanceof HttpError && err.status === 404) return false;
+    throw err;
+  }
 }
 
 export async function sendCommand(command: string): Promise<void> {

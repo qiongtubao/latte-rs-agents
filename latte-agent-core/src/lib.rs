@@ -39,6 +39,7 @@
 pub mod agent;
 pub mod advisor_monitor;
 pub mod pause_gate;
+pub mod choice;
 pub mod controller;
 pub mod checkpoint;
 pub mod config;
@@ -57,6 +58,7 @@ pub mod workflow;
 pub mod scheduler;
 pub mod session;
 pub mod session_store;
+pub mod staging;
 pub mod supervisor;
 pub mod renderer;
 pub mod trace;

@@ -170,6 +170,28 @@ pub(crate) async fn chat_send(
         Err(_) => StatusCode::NOT_FOUND,
     }
 }
+
+/// `POST /api/chat/choice-answer` —— 阻塞中的 ask（workflow/delegate
+/// 子代理，`ChoiceRequested.wait=true`）的回答直达通道。前端把用户在
+/// 选择框里的答案 POST 到这里，经 core 的 choice 路由送达等待方；
+/// 无匹配挂起项（已答/已超时/未知 id）时 404，前端据此降级为普通
+/// 消息回喂（fire-and-forget 路径）。
+#[derive(Deserialize)]
+pub(crate) struct ChoiceAnswerRequest {
+    choice_id: String,
+    answer: String,
+}
+
+pub(crate) async fn chat_choice_answer(
+    State(_state): State<AppState>,
+    Json(req): Json<ChoiceAnswerRequest>,
+) -> StatusCode {
+    if latte_agent_core::choice::resolve(&req.choice_id, req.answer) {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
 /// Only carries `session_id`, used for endpoints that need no other params.
 #[derive(Deserialize)]
 pub(crate) struct SessionOnlyRequest {
@@ -930,6 +952,35 @@ pub(crate) async fn put_role_toml(
 ) -> Result<StatusCode, (StatusCode, String)> {
     api::put_role_toml(&state.backend, &id, &body)
         .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+// ─── Advisor 全局开关 ────────────────────────────────────────────
+
+/// `GET /api/advisor` — advisor 全局开关状态。
+pub(crate) async fn get_advisor(State(state): State<AppState>) -> Json<api::AdvisorState> {
+    Json(api::get_advisor(&state.backend))
+}
+
+/// `PUT /api/advisor` 请求体。
+#[derive(serde::Deserialize)]
+pub(crate) struct PutAdvisorRequest {
+    enabled: bool,
+}
+
+/// `PUT /api/advisor` — 设置 advisor 全局开关（写全局层
+/// `agents.d/advisor.toml`，内存 merged 同步更新，新 session 生效）。
+pub(crate) async fn put_advisor(
+    State(state): State<AppState>,
+    Json(req): Json<PutAdvisorRequest>,
+) -> Result<Json<api::AdvisorState>, (StatusCode, String)> {
+    api::put_advisor(&state.backend, req.enabled)
+        .map(Json)
         .map_err(|e| {
             (
                 StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

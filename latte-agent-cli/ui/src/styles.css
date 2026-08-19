@@ -2093,6 +2093,28 @@ select {
 
 /* ─── Models panel: 下拉菜单 + 表单编辑器 ─────────────────────── */
 
+/* advisor 全局开关行（模型管理面板顶部） */
+.advisor-setting {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #e5e7eb;
+  background: #fdf9ec;
+}
+.advisor-setting-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.advisor-setting .hint {
+  font-size: 12px;
+  color: #6b7280;
+}
+
 .models-select-row {
   display: flex;
   align-items: center;

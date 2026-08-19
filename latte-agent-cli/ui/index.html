@@ -281,6 +281,14 @@
           <button id="models-refresh" type="button">↻</button>
           <button id="models-close" type="button" class="panel-close">×</button>
         </header>
+        <!-- advisor 全局开关：写全局层 agents.d/advisor.toml，新 session 生效 -->
+        <div class="advisor-setting">
+          <label class="advisor-setting-label" title="advisor 监察：delegate 返回审查、workflow 审查重做、事件流 monitor。关闭后全部停用（新 session 生效）。">
+            <input type="checkbox" id="advisor-enabled" />
+            🦉 advisor 监察（返回审查 · 重做 · monitor）
+          </label>
+          <span id="advisor-setting-status" class="hint"></span>
+        </div>
         <div class="models-paths" id="models-paths"></div>
         <div class="models-select-row">
           <label for="model-select" class="models-select-label">选择模型：</label>

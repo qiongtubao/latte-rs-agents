@@ -1,0 +1,15 @@
+
+[[models.models]]
+id = "mock"
+name = "Mock"
+api = "openai"
+provider = "mock"
+base_url = "http://127.0.0.1:53370"
+api_key = "PLACEHOLDER"
+context_window = 8192
+max_tokens = 4096
+
+[models.tiers]
+premium = "mock"
+standard = "mock"
+budget = "mock"

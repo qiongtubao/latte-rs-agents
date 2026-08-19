@@ -493,14 +493,27 @@ mod tests {
         }
     }
 
-    /// `list` 按 `updated_at` 倒序。先 create a，sleep 5ms 强制
-    /// 时间差，再 create b——这样 b.updated_at 一定严格大于 a。
+    /// `list` 按 `updated_at` 倒序。`updated_at` 是秒级精度
+    /// （`iso8601_utc_now`），固定 sleep 5ms 大概率落在同一秒 → 排序键
+    /// 相等、顺序取决于文件读取序（flaky 实锤）。所以这里等到秒翻转
+    /// 再 create b，保证 b.updated_at 严格大于 a。
     #[test]
     fn list_is_sorted_by_updated_at_desc() {
         let (_dir, store) = fresh_store();
         futures::executor::block_on(store.create("a", "single", vec![])).expect("create a");
-        // sleep 强制 b 的 updated_at 严格大于 a
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // 等秒翻转（最多 1s，平均 500ms），比固定 sleep 可靠
+        let sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        while std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            == sec
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         futures::executor::block_on(store.create("b", "single", vec![])).expect("create b");
         let list = futures::executor::block_on(store.list()).expect("list");
         assert_eq!(list.len(), 2);

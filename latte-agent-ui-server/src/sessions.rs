@@ -493,7 +493,13 @@ impl SessionHandle {
     async fn spawn_controller(&self) -> Result<Arc<ChatController>, String> {
         let agent_config_snapshot = Arc::new(self.spawn.merged.read().clone());
         let default_params = GenerateParams::default();
-        let advisor_monitor_cfg = AdvisorMonitorConfig::default();
+        // advisor 总开关来自 agents 配置（`[advisor] enabled`），不再是
+        // 硬编码 default（此前用户无法关闭 advisor——jemalloc 反馈
+        // 「advisor 总是卡/空喊」却无路可关）。
+        let advisor_monitor_cfg = AdvisorMonitorConfig {
+            enabled: agent_config_snapshot.advisor.enabled(),
+            ..AdvisorMonitorConfig::default()
+        };
         let cfg = ControllerConfig {
             task_id: None,
             roles: vec![self.initial_role.clone()],
@@ -569,7 +575,8 @@ impl SessionHandle {
             .with_watchdog_notes(
                 self.spawn.cwd.clone(),
                 advisor_monitor_cfg.watchdog_notes,
-            );
+            )
+            .with_review_settings(advisor_monitor_cfg.review_settings);
             // 给 advisor 也分配一个 subsession sink：每次 review 的
             // LLM 调用 / 返回会落盘到
             // `<ui-sessions>/<sid>/advisor-<micros>.jsonl`，跟主角色

@@ -1005,9 +1005,13 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             // advisor gate，与 manager 的 delegate 一致。
             subsession_store: Some(b.subsession_store.clone()),
             session_id: Some(session_id.clone()),
-            advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-                .runner_gate(),
+            advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+                enabled: b.merged.read().advisor.enabled(),
+                ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+            }
+            .runner_gate(),
             advisor_pause,
+            staging: None,
         };
         let result = run_workflow(&wf, &topic, &ctx).await;
         let mut store = b.tasks.write();
@@ -1210,9 +1214,13 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
                 // advisor gate，与 manager 的 delegate 一致。
                 subsession_store: Some(b2.subsession_store.clone()),
                 session_id: Some(session_id.clone()),
-                advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-                    .runner_gate(),
+                advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+                    enabled: b2.merged.read().advisor.enabled(),
+                    ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+                }
+                .runner_gate(),
                 advisor_pause: advisor_pause.clone(),
+                staging: None,
             };
             let result = run_workflow(&wf, &msg2, &ctx).await;
             // 开发流跑完（非 code_review 本身）→ 链式自动审查。
@@ -1360,9 +1368,13 @@ async fn chain_code_review(
         // 与派发 run 同源：分派建 subsession、过 advisor gate。
         subsession_store: Some(b.subsession_store.clone()),
         session_id: Some(session_id),
-        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-            .runner_gate(),
+        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+            enabled: b.merged.read().advisor.enabled(),
+            ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+        }
+        .runner_gate(),
         advisor_pause,
+        staging: None,
     };
     let result = run_workflow(&wf, &topic, &ctx).await;
     let mut store = b.tasks.write();

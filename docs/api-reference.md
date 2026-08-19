@@ -177,6 +177,14 @@
 
 **响应 `202`**
 
+### `POST /api/chat/choice-answer`
+
+阻塞中的 ask（`ChoiceRequested.wait=true`，workflow/delegate 子代理正挂起等回答）的答案直达通道：答案经后端 choice 路由直接交给等待的子代理，不另起一轮。
+
+**请求体：** `{ "choice_id": "choice-manager-3", "answer": "方案A" }`
+
+**响应 `200`**（已送达）/ **`404`**（无匹配挂起项：已回答/已超时/服务重启——前端应降级为 `POST /api/chat/send` 回喂）
+
 ### `POST /api/chat/command`
 
 发送斜杠命令（`/role <id>` / `/model <id>` / `/clear` / `/save` / `/tier <tier>` 等）。
@@ -299,8 +307,8 @@ ChatController 实时事件流。每个会话独立推送。
 | `WorkflowTurn` | `wf_id` / `step_id` / `role_id` / `content` / `round` | workflow 轮次 |
 | `WorkflowFinished` | `name` / `wf_id` / `status` / `summary` | workflow 结束 |
 | `ImageGenerated` | `role_id` / `path` / `prompt` | generate_image 产物 |
-| `PlanProposed` | `role_id` / `plan_id` / `tasks` | plan 工具提交 |
-| `ChoiceRequested` | `role_id` / `choice_id` / `question` / `multi` / `layout` / `allow_upload` / `options` | ask 工具弹框 |
+| `PlanProposed` | `role_id` / `plan_id` / `tasks` | plan 工具提交；slash 命令跑完的 workflow 产出含任务清单时也会代发 |
+| `ChoiceRequested` | `role_id` / `choice_id` / `question` / `multi` / `layout` / `allow_upload` / `wait` / `options` | ask 工具弹框（`wait=true` = 子代理阻塞等答，答案走 `/api/chat/choice-answer`） |
 | `TimeoutWarning` | `role_id` / `elapsed_secs` / `soft_timeout_secs` / `hard_timeout_secs` / `sub_id?` | 软超时 |
 | `AdvisorTerminated` | `role_id` / `reason` / `detector?` / `sub_id?` | advisor 终止 |
 | `UserMessage` | `text` | 客户端回放用 |
@@ -339,7 +347,7 @@ export type ChatEvent =
   | { type: "WorkflowFinished"; name: string; wf_id: string; status: string; summary: string }
   | { type: "ImageGenerated"; role_id: string; path: string; prompt: string }
   | { type: "PlanProposed"; role_id: string; plan_id: string; tasks: ImportTask[] }
-  | { type: "ChoiceRequested"; role_id: string; choice_id: string; question: string; multi: boolean; layout: string; allow_upload: boolean; options: ChoiceOption[] }
+  | { type: "ChoiceRequested"; role_id: string; choice_id: string; question: string; multi: boolean; layout: string; allow_upload: boolean; wait: boolean; options: ChoiceOption[] }
   | { type: "TimeoutWarning"; role_id: string; elapsed_secs: number; soft_timeout_secs: number; hard_timeout_secs: number; sub_id?: string }
   | { type: "AdvisorTerminated"; role_id: string; reason: string; detector?: string; sub_id?: string }
   | { type: "UserMessage"; text: string }

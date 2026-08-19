@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendCommand, switchRole, cancelTurn, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, uploadImage, listWorkflows, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, sendCommand, switchRole, cancelTurn, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, uploadImage, listWorkflows, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
@@ -606,9 +606,10 @@ const stepMsgIds = new Map<string, string>();
   }
   // ── ask 选择框（内联渲染在系统消息气泡里）──
   // ChoiceRequested 事件触发。选项/说明/图片来自模型（不可信），一律
-  // 用 textContent / img.src 构建，绝不 innerHTML 拼接。用户选择/上传
-  // 后，把结果拼成一条 user 消息经 sendMessage 回喂角色（后端会 echo
-  // 一条 UserMessage 事件渲染用户气泡，这里不手动补）。
+  // 用 textContent / img.src 构建，绝不 innerHTML 拼接。回传分两路：
+  // wait=true（子代理阻塞等答）→ POST choice-answer 直达等待方；
+  // wait=false/缺省（顶层 turn）→ 拼成 user 消息经 sendMessage 回喂
+  // （后端会 echo 一条 UserMessage 事件渲染用户气泡，这里不手动补）。
   function renderChoiceDialog(bubble: HTMLElement, e: ChoiceRequestedEvent): void {
     const multi = !!e.multi;
     const grid = e.layout === "grid";
@@ -781,10 +782,20 @@ const stepMsgIds = new Map<string, string>();
       done.className = "choice-answer";
       done.textContent = summary;
       card.appendChild(done);
-      if (sendText !== null) sendMessage(sendText).catch((err) => {
+      if (sendText === null) return;
+      const showError = (err: unknown) => {
         console.error("[chat] choice submit failed:", err);
         done.textContent = `${summary}（发送失败：${err instanceof Error ? err.message : String(err)}，请手动输入你的选择）`;
-      });
+      };
+      if (e.wait) {
+        // 阻塞中的子代理在等这个答案：直达 choice 路由；挂起项已消失
+        // （超时/服务重启）时降级为普通 user 消息回喂。
+        sendChoiceAnswer(e.choice_id, sendText)
+          .then((delivered) => (delivered ? Promise.resolve() : sendMessage(sendText)))
+          .catch(showError);
+      } else {
+        sendMessage(sendText).catch(showError);
+      }
     }
 
     submitBtn.addEventListener("click", () => {

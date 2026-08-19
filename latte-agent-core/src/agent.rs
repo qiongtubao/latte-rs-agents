@@ -827,6 +827,9 @@ fn classify_tool_execution_error(
         "invalid",
         "Permission denied",
         "系统运行时内部文件",
+        // ask_human 的"错误返回"是设计好的控制流（暂停会话），不是
+        // 执行失败——重试只会重复 pause + 重复发 AskHuman trace 事件。
+        "session paused",
     ];
     if PERMANENT.iter().any(|p| msg.contains(p)) {
         ToolCallErrorKind::PermanentExec { reason: msg }
@@ -836,6 +839,8 @@ fn classify_tool_execution_error(
 }
 
 /// Short (namespace-stripped) tool name, e.g. `manager.delegate` → `delegate`.
+/// 扁平化后内建工具注册名已无点号（恒等）；保留剥前缀逻辑用于 delegate
+/// 检测（`short_tool_name(&tc.name) == "delegate"`）及 namespace 遗留兼容。
 fn short_tool_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, s)| s).unwrap_or(name)
 }
@@ -931,6 +936,27 @@ fn slow_model_call_notice() -> Duration {
 /// 调用方应把它当模型局部失败走 fallback，而不是当成功结果上交。
 fn is_empty_completion(c: &Completion) -> bool {
     c.tool_calls.is_empty() && crate::controller::is_empty_output(&c.content)
+}
+
+/// 最终答复尾部带悬挂工具标记的判定。native function-calling 下，
+/// `</parameter>`/`</function>`/`<tool_call>` 这类文本协议标记只会是
+/// 模型泄漏的垃圾（glm-5.2 实锤：答复以 `</parameter> </function>`
+/// 收尾、正文断在半句）。只查尾部 400 字节窗口——正文里合法的
+/// XML/代码示例不触发；为兼容多字节字符，窗口起点对齐 char boundary。
+fn has_dangling_tool_markup_tail(text: &str) -> bool {
+    const MARKERS: [&str; 5] = [
+        "</parameter",
+        "</function",
+        "<function",
+        "<tool_call",
+        "</tool_call",
+    ];
+    let mut idx = text.len().saturating_sub(400);
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    let tail = &text[idx..];
+    MARKERS.iter().any(|m| tail.contains(m))
 }
 
 /// Whether `delegate` tool calls emitted in the *same* model response
@@ -1036,7 +1062,7 @@ async fn run_one_tool_call(
             };
             let outcome = hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
                 sink.emit(TraceEvent::HookFired {
-                    meta: meta.clone(),
+                    meta: meta.refreshed(),
                     hook_name: hook_name.to_string(),
                     point,
                     outcome_kind: kind.to_string(),
@@ -1087,7 +1113,7 @@ async fn run_one_tool_call(
                     };
                     let outcome = hooks.run_post_tool(&mut post_ctx, |hook_name, point, kind| {
                         sink.emit(TraceEvent::HookFired {
-                            meta: meta.clone(),
+                            meta: meta.refreshed(),
                             hook_name: hook_name.to_string(),
                             point,
                             outcome_kind: kind.to_string(),
@@ -1114,7 +1140,7 @@ async fn run_one_tool_call(
                     break;
                 }
                 sink.emit(TraceEvent::ToolExec {
-                    meta: meta.clone(),
+                    meta: meta.refreshed(),
                     name: tc.name.clone(),
                     args_json: args_json.clone(),
                     latency_ms: tool_latency,
@@ -1129,7 +1155,7 @@ async fn run_one_tool_call(
                 let kind = classify_tool_execution_error(&e);
                 let detail = e.to_string();
                 sink.emit(TraceEvent::ToolExec {
-                    meta: meta.clone(),
+                    meta: meta.refreshed(),
                     name: tc.name.clone(),
                     args_json: args_json.clone(),
                     latency_ms: tool_latency,
@@ -1146,7 +1172,7 @@ async fn run_one_tool_call(
         };
         let retrying = retry_policy.retryable(&current_kind) && attempt < max_attempts;
         sink.emit(TraceEvent::ToolRetry {
-            meta: meta.clone(),
+            meta: meta.refreshed(),
             name: tc.name.clone(),
             attempt,
             kind: current_kind.label().to_string(),
@@ -1599,7 +1625,7 @@ impl AgentRunner {
             let mut pre_call_ctx = crate::hooks::PreCallCtx { messages: &mut messages };
             let outcome = self.hooks.run_pre_call(&mut pre_call_ctx, |hook_name, point, kind| {
                 self.sink.emit(TraceEvent::HookFired {
-                    meta: meta.clone(),
+                    meta: meta.refreshed(),
                     hook_name: hook_name.to_string(),
                     point,
                     outcome_kind: kind.to_string(),
@@ -1631,7 +1657,7 @@ impl AgentRunner {
             .unwrap_or_default();
         let est_input_tokens = (messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4) as u32;
         self.sink.emit(TraceEvent::PromptBuilt {
-            meta: meta.clone(),
+            meta: meta.refreshed(),
             system_rendered,
             history_len: self.context.messages().len(),
             user_input: user_input.clone(),
@@ -1652,6 +1678,8 @@ impl AgentRunner {
         let mut total_input: u32 = 0;
         let mut total_output: u32 = 0;
         let mut total_thinking: u32 = 0;
+        // 悬挂工具标记的卫生重试计数（每 turn 至多 1 次）。
+        let mut markup_retried: u8 = 0;
 
         // Per-round "stuck" detector. Each round the model emits one
         // or more tool calls; we want to catch the case where the
@@ -1756,7 +1784,7 @@ impl AgentRunner {
                                     .join("");
                                 if !delta_text.is_empty() {
                                     self.sink.emit(TraceEvent::ModelDelta {
-                                        meta: meta.clone(),
+                                        meta: meta.refreshed(),
                                         delta: delta_text,
                                     });
                                 }
@@ -1821,7 +1849,7 @@ impl AgentRunner {
                                     if !noticed {
                                         noticed = true;
                                         self.sink.emit(TraceEvent::ModelCallSlow {
-                                            meta: meta.clone(),
+                                            meta: meta.refreshed(),
                                             model_id: model_id.clone(),
                                             elapsed_secs: slow_model_call_notice().as_secs(),
                                         });
@@ -1863,14 +1891,14 @@ impl AgentRunner {
             final_response = completion.content.clone();
 
             self.sink.emit(TraceEvent::ModelCall {
-                meta: meta.clone(),
+                meta: meta.refreshed(),
                 model_id: model_id.clone(),
                 params_json: serde_json::to_string(&self.agent.params).unwrap_or_default(),
                 latency_ms,
                 finish_reason: completion.stop_reason.clone(),
             });
             self.sink.emit(TraceEvent::ModelRawOut {
-                meta: meta.clone(),
+                meta: meta.refreshed(),
                 raw_content: final_response.clone(),
             });
 
@@ -1879,7 +1907,7 @@ impl AgentRunner {
                 let mut ctx = crate::hooks::PostResponseCtx { raw: &final_response };
                 let outcome = self.hooks.run_post_response(&mut ctx, |hook_name, point, kind| {
                     self.sink.emit(TraceEvent::HookFired {
-                        meta: meta.clone(),
+                        meta: meta.refreshed(),
                         hook_name: hook_name.to_string(),
                         point,
                         outcome_kind: kind.to_string(),
@@ -1919,7 +1947,7 @@ impl AgentRunner {
                     .unwrap_or_else(|| tc.arguments.to_string()),
             }).collect();
             self.sink.emit(TraceEvent::ParseToolCalls {
-                meta: meta.clone(),
+                meta: meta.refreshed(),
                 raw_in: final_response.clone(),
                 parsed: parsed_calls.clone(),
                 diagnostics: ParseDiag {
@@ -1930,6 +1958,24 @@ impl AgentRunner {
             });
 
             if tool_calls.is_empty() {
+                // 产出卫生：最终答复尾部带悬挂工具标记（native
+                // function-calling 下 `</parameter>`/`</function>` 等
+                // 只会是模型泄漏的垃圾，且正文常断在半句——glm-5.2 在
+                // jemalloc 现场的实锤形态）。重试一次让模型重出完整
+                // 答复，省一轮 advisor 打回；重试仍带标记则照收（避免
+                // 死循环）。
+                if markup_retried == 0 && has_dangling_tool_markup_tail(&final_response) {
+                    markup_retried += 1;
+                    tracing::warn!(
+                        "final response ends with dangling tool markup; retrying once"
+                    );
+                    messages.push(Message::assistant(final_response.clone()));
+                    messages.push(Message::user(
+                        "你上一条回复的尾部带有未完成的工具调用标记（如 </parameter>/</function>），回复疑似被截断。请重新输出完整答复；需要调用工具时用 native function-calling，正文里不要输出任何工具调用标记。"
+                            .to_string(),
+                    ));
+                    continue;
+                }
                 break;
             }
 
@@ -1939,7 +1985,7 @@ impl AgentRunner {
                 let mut ctx = crate::hooks::PostParseCtx { parsed: &mut post_parse_calls };
                 let outcome = self.hooks.run_post_parse(&mut ctx, |hook_name, point, kind| {
                     self.sink.emit(TraceEvent::HookFired {
-                        meta: meta.clone(),
+                        meta: meta.refreshed(),
                         hook_name: hook_name.to_string(),
                         point,
                         outcome_kind: kind.to_string(),
@@ -2094,8 +2140,8 @@ impl AgentRunner {
                 // 逐个执行工具调用
                 for tc in &post_parse_calls {
                     // 工具名已是扁平规范名（registry 注册名 == 模型看到的
-                    // 名字），直接查找，不再有 bash->shell.exec 之类的别名
-                    // 反向映射。保留短名兜底仅为 namespace 遗留工具兼容。
+                    // 名字），直接查找，不再有别名反向映射。保留短名兜底仅为
+                    // namespace 遗留工具兼容。
                     let resolved_name = tc.name.clone();
                     let full_name = if tm.has(&resolved_name) {
                         resolved_name.clone()
@@ -2159,7 +2205,7 @@ impl AgentRunner {
                             };
                             let outcome = self.hooks.run_pre_tool(&mut pre_ctx, |hook_name, point, kind| {
                                 self.sink.emit(TraceEvent::HookFired {
-                                    meta: meta.clone(),
+                                    meta: meta.refreshed(),
                                     hook_name: hook_name.to_string(),
                                     point,
                                     outcome_kind: kind.to_string(),
@@ -2225,7 +2271,7 @@ impl AgentRunner {
                                         &mut post_ctx,
                                         |hook_name, point, kind| {
                                             self.sink.emit(TraceEvent::HookFired {
-                                                meta: meta.clone(),
+                                                meta: meta.refreshed(),
                                                 hook_name: hook_name.to_string(),
                                                 point,
                                                 outcome_kind: kind.to_string(),
@@ -2254,7 +2300,7 @@ impl AgentRunner {
                                 }
                                 // success
                                 self.sink.emit(TraceEvent::ToolExec {
-                                    meta: meta.clone(),
+                                    meta: meta.refreshed(),
                                     name: tc.name.clone(),
                                     args_json: args_json.clone(),
                                     latency_ms: tool_latency,
@@ -2269,7 +2315,7 @@ impl AgentRunner {
                                 let kind = classify_tool_execution_error(&e);
                                 let detail = e.to_string();
                                 self.sink.emit(TraceEvent::ToolExec {
-                                    meta: meta.clone(),
+                                    meta: meta.refreshed(),
                                     name: tc.name.clone(),
                                     args_json: args_json.clone(),
                                     latency_ms: tool_latency,
@@ -2287,7 +2333,7 @@ impl AgentRunner {
                         };
                         if policy.retryable(&current_kind) && attempt < max_attempts {
                             self.sink.emit(TraceEvent::ToolRetry {
-                                meta: meta.clone(),
+                                meta: meta.refreshed(),
                                 name: tc.name.clone(),
                                 attempt,
                                 kind: current_kind.label().to_string(),
@@ -2298,7 +2344,7 @@ impl AgentRunner {
                         } else {
                             // 最后一次失败 / 不可重试：结束循环
                             self.sink.emit(TraceEvent::ToolRetry {
-                                meta: meta.clone(),
+                                meta: meta.refreshed(),
                                 name: tc.name.clone(),
                                 attempt,
                                 kind: current_kind.label().to_string(),
@@ -2701,6 +2747,28 @@ mod tests {
         }
     }
 
+    /// 悬挂工具标记只命中尾部窗口：glm 实锤形态（正文断在半句、
+    /// 以 </parameter></function> 收尾）触发；正文里的合法 XML 示例
+    /// 与干净答复不触发。
+    #[test]
+    fn dangling_tool_markup_tail_detection() {
+        // jemalloc 实锤样本形态：标记在末尾
+        let bad = "折中：同一函数内累计≥80，中间无≥5行纯代码的段落</parameter> </function>";
+        assert!(has_dangling_tool_markup_tail(bad));
+        let bad2 = "好的，我来处理<tool_call>";
+        assert!(has_dangling_tool_markup_tail(bad2));
+        // 干净答复
+        assert!(!has_dangling_tool_markup_tail("这是一段完整的中文答复，没有任何标记。"));
+        // 标记在正文前部（尾部窗口之外）→ 不误伤
+        let mut mid = "示例：`</function>` 是闭合标记。\n".to_string();
+        mid.push_str(&"后续正文。".repeat(100));
+        assert!(!has_dangling_tool_markup_tail(&mid));
+        // 空串 / 多字节字符边界不 panic
+        assert!(!has_dangling_tool_markup_tail(""));
+        let cjk = "汉字".repeat(300);
+        assert!(!has_dangling_tool_markup_tail(&cjk));
+    }
+
     /// 永久性错误（工具不存在 / ENOENT / 参数非法）不重试；瞬时错误
     /// 重试一次。所有错误终态都以 tool_result 回填（协议闭环）。
     #[test]
@@ -2718,6 +2786,12 @@ mod tests {
         assert!(!policy.retryable(&kind));
         // 缺必填参数 → PermanentExec
         let kind = classify_tool_execution_error(&ToolError::other("path is required"));
+        assert!(!policy.retryable(&kind));
+        // ask_human 的暂停控制流 → PermanentExec（重试会重复发 AskHuman 事件）
+        let kind = classify_tool_execution_error(&ToolError::other(
+            "session paused: ask_human from programmer",
+        ));
+        assert!(matches!(kind, ToolCallErrorKind::PermanentExec { .. }));
         assert!(!policy.retryable(&kind));
         // 普通执行错误（网络/5xx 类）→ Execution，重试一次
         let kind = classify_tool_execution_error(&ToolError::other("connection reset by peer"));
@@ -3136,6 +3210,7 @@ mod tests {
         use crate::config::{AgentConfig, ModelCatalog, ModelDef};
         fn cfg_with(id: &str) -> AgentConfig {
             AgentConfig {
+                advisor: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: id.into(),
@@ -3230,6 +3305,7 @@ mod tests {
                 },
             );
             AgentConfig {
+                advisor: Default::default(),
                 models: ModelCatalog {
                     models: vec![model_def(model_id)],
                     tiers: None,
@@ -3458,7 +3534,7 @@ mod tests {
         let tool_round = Completion {
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
-                name: "file.read".into(),
+                name: "read".into(),
                 arguments: serde_json::json!({}),
                 arguments_raw: None,
                 arguments_parse_error: None,

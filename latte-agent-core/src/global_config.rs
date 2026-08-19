@@ -530,6 +530,7 @@ models:
         // empty in the test env; the global has a real key. After merge the
         // project model gets the real key.
         let project = AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "shared".into(),
@@ -582,6 +583,7 @@ models:
     fn merge_into_project_keeps_existing_api_key() {
         // Project already has a real key — global must not clobber it.
         let project = AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "shared".into(),
@@ -635,6 +637,7 @@ models:
         // The heuristic pass should copy the key over.
         std::env::remove_var("DEFINITELY_UNSET_OVERRIDE_TEST");
         let project = AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "deepseek-chat".into(),

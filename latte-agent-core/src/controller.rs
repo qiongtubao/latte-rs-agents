@@ -401,6 +401,9 @@ pub enum ChatEvent {
     /// `multi` 为 true 时允许多选。`layout` = `"grid"` 时前端按图片
     /// 网格渲染（否则列表）。`allow_upload` 为 true 时弹框提供上传
     /// 自定义图片的入口（图片经 `POST /api/images` 落盘后以 URL 回传）。
+    /// `wait` 为 true 时表示提问方（workflow/delegate 子代理）正阻塞
+    /// 等待答案——前端必须把答案 POST 到 `/api/chat/choice-answer`
+    /// 直达等待方，而不是作为新 user 消息另起一轮。
     ChoiceRequested {
         role_id: String,
         choice_id: String,
@@ -412,6 +415,10 @@ pub enum ChatEvent {
         layout: String,
         #[serde(default)]
         allow_upload: bool,
+        /// true = 提问方正阻塞等回答（走 choice-answer 端点回传）；
+        /// false/缺省 = fire-and-forget（回答作为下一条 user 消息）。
+        #[serde(default)]
+        wait: bool,
         options: Vec<ChoiceOption>,
     },
     /// 角色调用 `task_report` 工具回报任务执行结果（任务看板闭环）。
@@ -1677,6 +1684,25 @@ async fn run_multi_role_loop(
                             let _ = event_tx.send(ChatEvent::Status {
                                 message: format!("Workflow '{cmd}' 失败: {e}"),
                             });
+                            // 失败也要注入 manager 善后输入（与成功路径
+                            // 同款 inject）。此前失败只发 Status 就回等
+                            // 输入——advisor 的纠正 hint 悬在队列里无人
+                            // 消费（jemalloc 实锤：gate 失败后 advisor
+                            // 的「过度编排」intervene 悬空，50 分钟零产出）。
+                            let hints: Vec<String> =
+                                advisor_hints.lock().drain(..).collect();
+                            let hints_text = if hints.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n\nadvisor 监察建议：\n- {}", hints.join("\n- "))
+                            };
+                            let inject_dir = worktree_root.join(".latte").join("inject");
+                            let _ = std::fs::create_dir_all(&inject_dir);
+                            let inject_path = inject_dir.join("manager.txt");
+                            let mgr_text = format!(
+                                "Workflow '{cmd}' 失败。用户请求：{topic}\n\n错误：\n{e}{hints_text}\n\n请善后：能修复的修复后用错误消息里的 wf_id resume 续跑，或按 advisor 建议换路径重做；无法继续则向用户说明失败原因。"
+                            );
+                            let _ = std::fs::write(&inject_path, &mgr_text);
                             continue 'rounds;
                         }
                     }
@@ -2105,6 +2131,11 @@ async fn run_single_role_loop(
                         if trimmed.is_empty() {
                         }
 
+                        // workflow slash 失败时合成的善后输入：Some 时不
+                        // continue，落到下面的正常 turn 路径直接开一轮
+                        // （jemalloc 实锤：失败只发 Status 回等输入，
+                        // advisor 的纠正 hint 悬空，50 分钟零产出）。
+                        let mut synthetic_followup: Option<String> = None;
                         if trimmed.starts_with('/') {
                             let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
                             let cmd = parts[0];
@@ -2194,6 +2225,20 @@ async fn run_single_role_loop(
                                             let _ = event_tx.send(ChatEvent::Status {
                                                 message: format!("Workflow '{cmd}' 完成。\n{summary}"),
                                             });
+                                            // slash 路径不经 manager 的 agent loop，没人会调
+                                            // `plan` 工具——产出里带任务清单时代 manager 广播
+                                            // PlanProposed，让「添加任务」弹窗与 manager 路径
+                                            // 一致弹出（并挂上 plan 阶段门）。
+                                            if propose_plan_from_summary(
+                                                &event_tx,
+                                                &plan_stage,
+                                                &current_role,
+                                                &summary,
+                                            ) {
+                                                let _ = event_tx.send(ChatEvent::Status {
+                                                    message: "检测到任务清单，已提交「添加任务」弹窗供勾选导入任务看板。".into(),
+                                                });
+                                            }
                                         }
                                         Ok(None) => {
                                             let _ = event_tx.send(ChatEvent::Status {
@@ -2206,12 +2251,28 @@ async fn run_single_role_loop(
                                             let _ = event_tx.send(ChatEvent::Status {
                                                 message: format!("Workflow '{cmd}' 失败: {e}"),
                                             });
+                                            // 自动善后：合成一条输入落到
+                                            // 下面的正常 turn 路径，带上失败
+                                            // 上下文 + advisor 积存的监察建议。
+                                            let hints: Vec<String> =
+                                                advisor_hints.lock().drain(..).collect();
+                                            let hints_text = if hints.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!("\n\nadvisor 监察建议：\n- {}", hints.join("\n- "))
+                                            };
+                                            synthetic_followup = Some(format!(
+                                                "[自动善后] Workflow '{cmd}' 失败。用户请求：{topic}\n\n错误：\n{e}{hints_text}\n\n请善后：能修复的修复后用错误消息里的 wf_id 以 resume 续跑，或按 advisor 建议换路径重做；无法继续则向用户说明失败原因。"
+                                            ));
                                         }
                                     }
                                 }
                             }
-                            continue;
+                            if synthetic_followup.is_none() {
+                                continue;
+                            }
                         }
+                        let trimmed = synthetic_followup.unwrap_or(trimmed);
 
                         // Pause gate: if the session is paused, hold
                         // this turn until the user resumes. Only
@@ -2555,8 +2616,9 @@ async fn build_runner(
         }
         // Any role with "ask" in allowed_tools gets the ask tool:
         // 向用户抛出一道选择题（含图片 / 图片网格 / 上传），弹出选择框。
+        // 顶层 turn 用 fire-and-forget（回答作为下一条 user 消息回喂）。
         if role.allowed_tools.iter().any(|t| t == "ask") {
-            register_ask_tool(&tm, event_tx.clone(), role_id.to_string())
+            register_ask_tool(&tm, event_tx.clone(), role_id.to_string(), None)
                 .map_err(|e| AgentError::Tool(format!("register ask: {e}")))?;
         }
         // Any role with "task_report" in allowed_tools gets the task_report
@@ -2654,27 +2716,12 @@ pub(crate) async fn build_tool_manager(
         mgr.register_package(p).await
             .map_err(|e| format!("register_package: {e}"))?;
     }
-    // allowed 里是配置层扁平名（bash/read/edit/...）。大多数注册名的
-    // 点号短名与配置名一致（file.read→read、shell.exec→exec），直接进
-    // keep；个别名字对不上的靠下面的 flat_to_registry 补映射。
+    // allowed 里是配置层扁平名（bash/read/edit/...）。tools crate 扁平化
+    // 后注册名 == 配置名 == 模型 schema 名，配置名直接进 keep 即可匹配。
     let mut keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
-    // 配置层扁平名 → registry 注册名。browser/todo 两个包仍用
-    // 点号注册名（browser.browser / todo.todo）；bash 是 shell.exec
-    // 的历史别名（其点号短名是 exec，不映射会被静默丢弃）。
-    let flat_to_registry: std::collections::HashMap<&str, &str> = [
-        ("todo", "todo.todo"),
-        ("browser", "browser.browser"),
-        ("bash", "shell.exec"),
-    ].into_iter().collect();
-    for (flat, registry) in &flat_to_registry {
-        if keep.contains(*flat) {
-            keep.insert(registry.to_string());
-            // 注册名本身进 keep，直接匹配 registry 名。
-        }
-    }
     // mcp 是配置层分组别名（一个名字展开成 3 个 mcp_* 工具），不是工具名别名。
     if keep.contains("mcp") {
         keep.insert("mcp_connect".to_string());
@@ -2693,8 +2740,8 @@ pub(crate) async fn build_tool_manager(
         mgr.register(cg, None);
     }
     // 过滤：注册名全名或短名（点号后缀）命中 keep 就保留。
-    // 短名兜底兼容仍带点号注册名的工具（browser.browser/todo.todo）
-    // 以及无点号的扁平名工具（short == 全名）。
+    // 扁平化后注册名已无点号，短名 == 全名（恒等）；短名兜底仅作
+    // 防御性保留，兼容未来可能带点号的注册名。
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -2891,11 +2938,89 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 判断标准（分派前先想流程）：
 - 单点问题（读代码、改文件、审查某个具体实现）→ delegate
 - 需要多个角色按固定流程协作的完整任务 → workflow，从上面清单里选最贴合的
+- 任务类型必须与 workflow 类型匹配：学习/调研/规划类诉求（不落地代码改动）选学习、探索、规划向的 workflow；不要把面向代码实现的评审/计划流水线套上去
 - 调用 workflow 前先用一句话说明：选哪个、为什么、预期拿到什么结论
 - workflow 会跑完整条流水线并把结论返回给你；你综合后再回复用户。
+
+workflow 失败时的兜底（必须遵守）：
+- 错误信息里带失败原因——gate 被拦时会附「不合格产出摘要」（REJECT 理由）。先读懂它。
+- 能修复的（方案有冲突、内容可调整）：修复后用 resume 续跑，或直接 delegate 重做失败的那一步。
+- 不能修复或需要用户拍板的：把失败原因、已完成的中间成果、可选的下一步向用户解释清楚，由用户决定。
+- 禁止不解释原因、不给出路，只把错误原样转述给用户就结束。
 "#
     )
 }
+// 进程级单调序号，保证 plan_id 全局唯一。
+static PLAN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 生成全局唯一的 plan_id（`plan` 工具与 slash 命令路径的自动提案共用）。
+fn next_plan_id(role_id: &str) -> String {
+    format!(
+        "plan-{}-{}",
+        role_id,
+        PLAN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// 从 workflow 产出文本里提取任务看板清单：找第一个内容为
+/// `{"tasks": [...]}` 的 ```json 代码块，逐项按 [`PlanTask`] 解析校验。
+/// 找不到/解析失败/空清单都返回 None（不提案）。
+fn extract_plan_tasks(summary: &str) -> Option<Vec<PlanTask>> {
+    let mut rest = summary;
+    while let Some(start) = rest.find("```json") {
+        let after = &rest[start + "```json".len()..];
+        let end = after.find("```")?;
+        let body = after[..end].trim();
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(arr) = val.get("tasks").and_then(|t| t.as_array()) {
+                if !arr.is_empty() {
+                    let mut tasks: Vec<PlanTask> = Vec::with_capacity(arr.len());
+                    let mut ok = true;
+                    for t in arr {
+                        match serde_json::from_value::<PlanTask>(t.clone()) {
+                            Ok(pt) if !pt.title.trim().is_empty() => tasks.push(pt),
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        return Some(tasks);
+                    }
+                }
+            }
+        }
+        rest = &after[end + 3..];
+    }
+    None
+}
+
+/// slash 命令路径的自动提案：workflow 成功且产出带任务清单时，代
+/// manager 广播 `PlanProposed`（slash 路径不经 manager 的 agent loop，
+/// 没人会调 `plan` 工具——jemalloc 现场实锤两次会话 0 次 PlanProposed，
+/// 「添加任务」弹窗从未弹出）。返回是否发出了提案。
+pub(crate) fn propose_plan_from_summary(
+    event_tx: &broadcast::Sender<ChatEvent>,
+    plan_stage: &SharedPlanStage,
+    role_id: &str,
+    summary: &str,
+) -> bool {
+    let Some(tasks) = extract_plan_tasks(summary) else {
+        return false;
+    };
+    let plan_id = next_plan_id(role_id);
+    *plan_stage.write() = PlanStage::PendingApproval {
+        plan_id: plan_id.clone(),
+    };
+    let _ = event_tx.send(ChatEvent::PlanProposed {
+        role_id: role_id.to_string(),
+        plan_id,
+        tasks,
+    });
+    true
+}
+
 /// 注册 `plan` 工具：把结构化任务清单提交给用户在弹窗里勾选导入
 /// 任务看板。manager 在 `implementation_plan` workflow 跑完（或手持
 /// 一份具体任务清单）后调它。与 `register_generate_image_tool` 同构
@@ -2920,10 +3045,6 @@ pub(crate) fn register_plan_tool(
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    // 进程级单调序号，保证 plan_id 全局唯一。
-    static PLAN_SEQ: AtomicU64 = AtomicU64::new(0);
 
     // tasks 是数组；ToolInputProperty 无嵌套 items schema，故用描述
     // 把每项结构讲清（title/description/priority/labels/workflow/
@@ -2981,11 +3102,7 @@ pub(crate) fn register_plan_tool(
                 tasks.push(pt);
             }
 
-            let plan_id = format!(
-                "plan-{}-{}",
-                role_id,
-                PLAN_SEQ.fetch_add(1, Ordering::Relaxed)
-            );
+            let plan_id = next_plan_id(&role_id);
             let n = tasks.len();
             let _ = event_tx.send(ChatEvent::PlanProposed {
                 role_id: role_id.clone(),
@@ -3015,19 +3132,45 @@ pub(crate) fn register_plan_tool(
     Ok(())
 }
 
+/// ask 工具的阻塞模式（workflow/delegate 子代理用）：广播选择题后
+/// 挂起，等用户在弹框里回答，答案直接作为工具结果返回给提问的子
+/// 代理。顶层 turn 不要用——顶层没有"等待方"，靠下一条 user 消息
+/// 回喂（fire-and-forget）。
+#[derive(Clone)]
+pub(crate) struct AskBlocking {
+    /// 等待上限：超时后工具返回"按默认继续"，避免 workflow 永远挂死。
+    pub timeout: std::time::Duration,
+    /// turn 取消旗标：等待期间被取消则工具报错，让 runner 尽快退出。
+    pub cancel_flag: Option<Arc<AtomicBool>>,
+}
+
+/// 阻塞 ask 的默认等待上限（30 分钟），env `LATTE_ASK_TIMEOUT_SECS`
+/// 覆盖；非法值回退默认。
+pub fn default_ask_timeout() -> std::time::Duration {
+    let raw = std::env::var("LATTE_ASK_TIMEOUT_SECS").ok();
+    match raw.and_then(|s| s.parse::<u64>().ok()) {
+        Some(n) if n > 0 => std::time::Duration::from_secs(n),
+        _ => std::time::Duration::from_secs(1800),
+    }
+}
+
 /// 注册 `ask` 工具：角色向用户抛出一道**选择题**（可带图片、图片
 /// 网格、允许上传自定义图片），会话据此弹出选择框。
 ///
-/// 语义（与 `plan` 一样是 UI 侧交互，不读写文件、不调模型）：校验
-/// 入参 → 广播 `ChatEvent::ChoiceRequested` → 返回一段“已展示选择题、
-/// 请简短引导后结束本轮”的指令串。工具返回 `Ok`（而非 `ask_human`
-/// 的 `Err`）：web 单角色 loop 无 SessionManager 可暂停，靠模型拿到
-/// 该结果后自然收尾本轮；用户在弹框里选完后，选择结果作为下一条
-/// user 消息（`/chat/send`）回喂角色，模型据此继续。
+/// 两种语义（由 `blocking` 决定）：
+/// - `None`（顶层 turn）：fire-and-forget。广播 `ChoiceRequested`
+///   （`wait=false`）→ 返回"已展示选择题、请简短引导后结束本轮"的
+///   指令串。用户在弹框里选完后，选择结果作为下一条 user 消息
+///   （`/chat/send`）回喂角色。
+/// - `Some(AskBlocking)`（workflow/delegate 子代理）：广播
+///   `ChoiceRequested`（`wait=true`）→ 挂起等待，UI 把答案 POST 到
+///   `/api/chat/choice-answer`（[`crate::choice`] 路由）后作为工具
+///   结果返回，子代理拿着答案继续干活。超时/取消有兜底。
 pub(crate) fn register_ask_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
+    blocking: Option<AskBlocking>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
@@ -3077,6 +3220,7 @@ pub(crate) fn register_ask_tool(
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let event_tx = event_tx.clone();
         let role_id = handler_role_id.clone();
+        let blocking = blocking.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -3118,15 +3262,62 @@ pub(crate) fn register_ask_tool(
             let _ = event_tx.send(ChatEvent::ChoiceRequested {
                 role_id: role_id.clone(),
                 choice_id: choice_id.clone(),
-                question,
+                question: question.clone(),
                 multi,
                 layout,
                 allow_upload,
+                wait: blocking.is_some(),
                 options,
             });
-            Ok(serde_json::Value::String(format!(
-                "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
-            )))
+            let Some(blk) = blocking else {
+                return Ok(serde_json::Value::String(format!(
+                    "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
+                )));
+            };
+
+            // 阻塞模式（workflow/delegate 子代理）：挂起等 UI 经
+            // `/api/chat/choice-answer` 把答案送进 choice 路由；
+            // 超时按默认继续，取消则报错退出。
+            let rx = crate::choice::register(&choice_id);
+            let cancel_watch = {
+                let cf = blk.cancel_flag.clone();
+                async move {
+                    match cf {
+                        Some(cf) => {
+                            loop {
+                                if cf.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                        // 无取消句柄：永不完成的 future（select! 里等效忽略）。
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+            };
+            let answered = tokio::select! {
+                a = rx => a.ok(),
+                _ = tokio::time::sleep(blk.timeout) => None,
+                _ = cancel_watch => {
+                    crate::choice::cancel(&choice_id);
+                    return Err(tool_err(format!(
+                        "等待用户回答期间 turn 被取消（choice_id={choice_id}）"
+                    )));
+                }
+            };
+            match answered {
+                Some(answer) => Ok(serde_json::Value::String(format!(
+                    "用户已回答你的问题「{question}」，选择：{answer}。请据此继续完成任务，不要重复提问同一个问题。"
+                ))),
+                None => {
+                    crate::choice::cancel(&choice_id);
+                    let mins = blk.timeout.as_secs() / 60;
+                    Ok(serde_json::Value::String(format!(
+                        "用户在 {mins} 分钟内未回答（choice_id={choice_id} 已超时）。不要重复提问——按最合理的默认选项继续，并在产出中明确注明这个假设。"
+                    )))
+                }
+            }
         })
     });
 
@@ -3266,12 +3457,15 @@ pub(crate) async fn gate_delegate_return(
     role_responsibilities: &str,
     task: &str,
     response: String,
-) -> String {
+) -> (String, Option<crate::advisor_monitor::ReviewVerdict>) {
     use crate::advisor_monitor::Verdict;
     // Bound the review so a slow/absent advisor model can't stall the
     // delegate return (mirrors the monitor's REVIEW_TIMEOUT_SECS).
+    // 预算可配（AdvisorMonitorConfig::review_settings）：jemalloc 实锤
+    // 45s 硬编码对 20–44s 延迟的慢审查模型太紧，频繁未审放行。
+    let timeout = engine.delegate_review_timeout();
     let review = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
+        timeout,
         engine.review_delegate(role_id, role_responsibilities, task, &response),
     )
     .await;
@@ -3279,15 +3473,26 @@ pub(crate) async fn gate_delegate_return(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!("delegate-return review failed (degraded): {e}");
-            return response;
+            // 降级可见化：审查失败静默放行会让 advisor 看起来「卡住/
+            // 消失」，发 Status 让用户知道这次返回没审。
+            let _ = event_tx.send(ChatEvent::Status {
+                message: format!("⚠️ advisor 审查失败（{role_id} 的返回降级放行）：{e}"),
+            });
+            return (response, None);
         }
         Err(_) => {
             tracing::warn!("delegate-return review timed out; passing through");
-            return response;
+            let _ = event_tx.send(ChatEvent::Status {
+                message: format!(
+                    "⏳ advisor 审查超时（{}s）：{role_id} 的返回未审直接放行",
+                    timeout.as_secs()
+                ),
+            });
+            return (response, None);
         }
     };
     if verdict.verdict == Verdict::Ok {
-        return response;
+        return (response, Some(verdict));
     }
     let label = match verdict.verdict {
         Verdict::Warn => "⚠️ warn",
@@ -3310,7 +3515,7 @@ pub(crate) async fn gate_delegate_return(
     });
     // `warn` is human-visible only (bubble); `intervene`/`terminate`
     // also annotate the payload so the manager sees the caveat inline.
-    if matches!(verdict.verdict, Verdict::Intervene | Verdict::Terminate) {
+    let out = if matches!(verdict.verdict, Verdict::Intervene | Verdict::Terminate) {
         let hint_line = if verdict.hint.is_empty() {
             String::new()
         } else {
@@ -3321,7 +3526,8 @@ pub(crate) async fn gate_delegate_return(
         )
     } else {
         response
-    }
+    };
+    (out, Some(verdict))
 }
 
 async fn register_delegate_tool(
@@ -3397,6 +3603,12 @@ async fn register_delegate_tool(
         merged_owned.clone(),
         resolver_owned.clone(),
         default_params.clone(),
+    )
+    .with_review_settings(
+        advisor_gate
+            .as_ref()
+            .map(|g| g.review_settings)
+            .unwrap_or_default(),
     );
     // 审查的 LLM 调用也落 subsession trace（与 ui-server 的 monitor
     // 同款）：此前 delegate-return 审查每次 33–45s 却不进任何日志，
@@ -3569,7 +3781,7 @@ async fn register_delegate_tool(
             // when it's done. LoopDetector in agent.rs trips on
             // actually stuck patterns.
             // Wire the workspace cwd so the specialist's path-aware
-            // tools (`shell.exec`, `file.read`, …) chdir into the
+            // tools (`bash`, `read`, …) chdir into the
             // workspace the user opened — not the Tauri process
             // cwd. See `AgentRunner::with_cwd` for the contract.
             let mut runner = match specialist_tm {
@@ -3719,7 +3931,10 @@ async fn register_delegate_tool(
             // silently (returns the output unchanged) if the advisor is
             // unavailable or times out.
             let run_result = match result {
-                Ok(response) => Ok(gate_delegate_return(
+                // manager delegate 路径保持「只批注不重做」——重做决策
+                // 是 manager 自己的事（它看得到批注，可自行再委派）。
+                // advisor 总开关关闭（advisor_gate None）时跳过审查。
+                Ok(response) if advisor_gate.is_some() => Ok(gate_delegate_return(
                     &review_engine,
                     &event_tx,
                     &role_id,
@@ -3727,8 +3942,9 @@ async fn register_delegate_tool(
                     &task,
                     response,
                 )
-                .await),
-                Err(e) => Err(e),
+                .await
+                .0),
+                other => other,
             };
 
             // 6. Emit specialist's RoleTurn + RoleFinished so the UI
@@ -3959,6 +4175,7 @@ async fn register_workflow_tool(
                 session_id: Some(session_id),
                 advisor_gate,
                 advisor_pause: Some(advisor_pause),
+                staging: None,
             };
             let result = match &resume {
                 Some(rid) => crate::workflow::run_workflow_resume(&wf, &topic, &ctx, rid).await,
@@ -3966,7 +4183,15 @@ async fn register_workflow_tool(
             };
             result
                 .map(|summary| serde_json::Value::String(strip_think_blocks(&summary)))
-                .map_err(tool_err)
+                .map_err(|e| {
+                    // 失败时给 manager 明确的善后指令——jemalloc 实锤：
+                    // 裸错误回 tool loop 后 manager 没有动作，流水线
+                    // 零产出收场。
+                    tool_err(format!(
+                        "{e}\n\n请善后：能修复的修复后用上面的 wf_id 以 resume 参数续跑，\
+                         或换路径重做；处理完向用户汇报结果，不要静默结束。"
+                    ))
+                })
         })
     });
 
@@ -4016,6 +4241,7 @@ async fn run_workflow_command(
         session_id: Some(config.session_id.clone()),
         advisor_gate: config.advisor_monitor.runner_gate(),
         advisor_pause: Some(advisor_pause),
+        staging: None,
     };
 
     let summary = crate::workflow::run_workflow(&wf, topic, &ctx).await?;
@@ -4223,6 +4449,7 @@ mod tests {
             .await
             .expect("tool manager");
         let merged = AgentConfig {
+            advisor: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![],
                 tiers: None,
@@ -4643,6 +4870,164 @@ mod tests {
         );
     }
 
+    // ─── slash 路径自动提案（extract_plan_tasks / propose_plan_from_summary）──
+
+    #[test]
+    fn extract_plan_tasks_reads_json_fence_with_surrounding_text() {
+        // gate 通过时的典型产出：VERDICT + 标题 + ```json 代码块。
+        let summary = "VERDICT: PASS\n\n【任务清单】\n```json\n{\n  \"tasks\": [\n    {\"title\": \"D1: 理解 stats_print\", \"description\": \"阅读\", \"priority\": 1, \"labels\": [\"jemalloc\"], \"workflow\": \"\", \"subtasks\": [{\"title\": \"D1.1\"}]}\n  ]\n}\n```\n";
+        let tasks = extract_plan_tasks(summary).expect("应提取到任务清单");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "D1: 理解 stats_print");
+        assert_eq!(tasks[0].subtasks.len(), 1);
+    }
+
+    #[test]
+    fn extract_plan_tasks_returns_none_without_valid_task_list() {
+        // 无代码块 / 非 tasks JSON / 空清单 / 空 title → 都不提案。
+        assert!(extract_plan_tasks("VERDICT: PASS，没有代码块").is_none());
+        assert!(extract_plan_tasks("```json\n{\"foo\": 1}\n```").is_none());
+        assert!(extract_plan_tasks("```json\n{\"tasks\": []}\n```").is_none());
+        assert!(extract_plan_tasks("```json\n{\"tasks\": [{\"title\": \"  \"}]}\n```").is_none());
+        assert!(extract_plan_tasks("```json\n这不是 JSON\n```").is_none());
+    }
+
+    #[tokio::test]
+    async fn propose_plan_from_summary_broadcasts_and_sets_stage() {
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let summary = "VERDICT: PASS\n```json\n{\"tasks\": [{\"title\": \"任务甲\"}, {\"title\": \"任务乙\"}]}\n```";
+        assert!(propose_plan_from_summary(&event_tx, &stage, "manager", summary));
+
+        let ev = rx.try_recv().expect("PlanProposed event");
+        let ChatEvent::PlanProposed { role_id, plan_id, tasks } = ev else {
+            panic!("expected PlanProposed, got {ev:?}");
+        };
+        assert_eq!(role_id, "manager");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            stage.read().clone(),
+            PlanStage::PendingApproval { plan_id }
+        );
+
+        // 无任务清单的产出：不提案、不动阶段门（复位后验证）。
+        *stage.write() = PlanStage::Normal;
+        assert!(!propose_plan_from_summary(&event_tx, &stage, "manager", "没有任何清单"));
+        assert!(rx.try_recv().is_err(), "不应再发事件");
+        assert_eq!(stage.read().clone(), PlanStage::Normal);
+    }
+
+    // ─── ask 阻塞模式（workflow/delegate 子代理）──
+
+    fn ask_input() -> serde_json::Value {
+        serde_json::json!({
+            "question": "选哪个方案？",
+            "options": [{"label": "方案A"}, {"label": "方案B"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn ask_fire_and_forget_returns_immediately_with_wait_false() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+
+        let out = tm.execute("ask", ask_input(), None).await.expect("ask call");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("结束本轮"), "{text}");
+
+        let ev = rx.try_recv().expect("ChoiceRequested event");
+        let ChatEvent::ChoiceRequested { wait, .. } = ev else {
+            panic!("expected ChoiceRequested, got {ev:?}");
+        };
+        assert!(!wait, "顶层 fire-and-forget 必须 wait=false");
+    }
+
+    #[tokio::test]
+    async fn ask_blocking_waits_and_returns_user_answer() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            Some(AskBlocking {
+                timeout: std::time::Duration::from_secs(30),
+                cancel_flag: None,
+            }),
+        )
+        .expect("register ask");
+
+        let tm2 = tm.clone();
+        let call = tokio::spawn(async move { tm2.execute("ask", ask_input(), None).await });
+
+        // 事件必须带 wait=true；拿到 choice_id 后模拟 UI 提交答案。
+        let choice_id = loop {
+            let ev = rx.recv().await.expect("event");
+            if let ChatEvent::ChoiceRequested { choice_id, wait, .. } = ev {
+                assert!(wait, "阻塞 ask 必须 wait=true");
+                break choice_id;
+            }
+        };
+        assert!(crate::choice::resolve(&choice_id, "方案A".to_string()));
+
+        let out = call.await.expect("join").expect("ask call");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("选择：方案A"), "{text}");
+        assert!(text.contains("不要重复提问"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ask_blocking_timeout_falls_back_to_default() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            Some(AskBlocking {
+                timeout: std::time::Duration::from_millis(50),
+                cancel_flag: None,
+            }),
+        )
+        .expect("register ask");
+
+        let out = tm.execute("ask", ask_input(), None).await.expect("ask call");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("已超时"), "{text}");
+        assert!(text.contains("不要重复提问"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn ask_blocking_cancel_flag_aborts_wait() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            Some(AskBlocking {
+                timeout: std::time::Duration::from_secs(60),
+                cancel_flag: Some(cancel.clone()),
+            }),
+        )
+        .expect("register ask");
+
+        let tm2 = tm.clone();
+        let call = tokio::spawn(async move { tm2.execute("ask", ask_input(), None).await });
+        // 等提问发出再取消。
+        loop {
+            let ev = rx.recv().await.expect("event");
+            if matches!(ev, ChatEvent::ChoiceRequested { .. }) {
+                break;
+            }
+        }
+        cancel.store(true, Ordering::SeqCst);
+        let err = call.await.expect("join").expect_err("取消必须报错");
+        assert!(err.to_string().contains("取消"), "{err}");
+    }
+
     /// 一次一清单防护：上一份清单 PendingApproval 期间，第二次 plan
     /// 调用被拒绝（提示合并到一次调用），且不重复发 PlanProposed。
     /// （坏行为样本：manager 把 11 个任务分 11 次调用，用户弹窗
@@ -4711,6 +5096,7 @@ mod tests {
             code_paths: vec![],
         };
         let merged = AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![],
                 tiers: None,
@@ -4828,6 +5214,7 @@ mod tests {
             .await;
 
         let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -4930,6 +5317,7 @@ mod tests {
             multi: false,
             layout: "grid".into(),
             allow_upload: true,
+            wait: false,
             options: vec![
                 ChoiceOption {
                     label: "JWT".into(),
@@ -5110,6 +5498,7 @@ mod tests {
             .await;
 
         let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -5214,6 +5603,154 @@ mod tests {
 
         controller.abort().await;
     }
+
+    // ─── workflow 失败自动善后 ───────────────────────────────────
+    //
+    // slash 路径 workflow 失败 → 不停在等输入：合成一条「[自动善后]」
+    // 输入立刻开一轮（jemalloc 实锤：gate 失败后 advisor hint 悬空、
+    // 无人动作，50 分钟流水线零产出）。
+    #[tokio::test]
+    async fn workflow_failure_triggers_auto_followup_turn() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "善后回复（占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰）" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        // 必败 workflow：单 step + 不可能通过的产出契约（max_retries
+        // 默认 0）。advisor 关闭，契约耗尽后直接失败。
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("failwf.toml"),
+            r#"
+name = "failwf"
+command = "/failwf"
+[[steps]]
+id = "only"
+role = "manager"
+task = "做点事"
+[steps.output_contract]
+require = ["永远不可能出现的验收字符串"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        async fn wait_request_count(server: &wiremock::MockServer, n: usize) {
+            for _ in 0..150 {
+                let got = server.received_requests().await.map(|r| r.len()).unwrap_or(0);
+                if got >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            panic!("timed out waiting for {n} model requests");
+        }
+
+        let controller = ChatController::new(64);
+        let _rx = controller.spawn(cfg).await;
+
+        controller.submit_input("/failwf 做点事").await;
+        // 请求 1 = workflow 的 worker step（契约失败）；请求 2 =
+        // 自动善后 turn（没有它就证明失败后停在了等输入）。
+        wait_request_count(&server, 2).await;
+        let reqs = server.received_requests().await.unwrap();
+        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        assert!(body2.contains("[自动善后]"), "第二轮是自动善后 turn: {body2}");
+        assert!(body2.contains("wf_id="), "善后输入带 wf_id: {body2}");
+        assert!(body2.contains("请善后"), "善后输入带处置指令: {body2}");
+
+        controller.abort().await;
+    }
+
     // ─── Soft-timeout warning plumbing ───────────────────────────
     //
     // 验证 soft timeout → TimeoutWarning + turn 仍能完成的契约。
@@ -5255,6 +5792,7 @@ mod tests {
             .await;
 
         let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-slow".into(),
@@ -5386,6 +5924,7 @@ mod tests {
             .await;
 
         let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -5543,6 +6082,7 @@ mod tests {
         };
 
         let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -5680,8 +6220,8 @@ mod tests {
         controller.abort().await;
     }
 
-    /// 锁定 bash 别名的契约：allowed "bash" 通过 flat_to_registry 映射
-    /// 保留 registry 的 "shell.exec" 工具，且接受 {command, cwd}
+    /// 锁定 bash 工具的契约：allowed "bash" 直接保留 registry 的
+    /// "bash" 工具（扁平化后注册名 == 配置名），且接受 {command, cwd}
     /// （cwd 由 resolve_tool_input_against_cwd 注入）。
     #[tokio::test]
     async fn bash_tool_kept_and_accepts_cwd() {
@@ -5689,13 +6229,13 @@ mod tests {
             .await
             .expect("build_tool_manager");
         let names: Vec<String> = mgr.get_tool_names();
-        assert!(names.contains(&"shell.exec".to_string()), "bash 别名应保留 shell.exec: {names:?}");
-        // shell.exec 必须接受 {command, cwd}。
+        assert!(names.contains(&"bash".to_string()), "allowed \"bash\" 应保留 bash 工具: {names:?}");
+        // bash 必须接受 {command, cwd}。
         let args = serde_json::json!({"command":"pwd","cwd":"/tmp"});
-        let r = mgr.execute("shell.exec", args, None).await;
-        assert!(r.is_ok(), "shell.exec 应接受 {{command,cwd}}，却失败: {:?}", r.err());
+        let r = mgr.execute("bash", args, None).await;
+        assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
         // eval 不在 allowed 里，被过滤掉。
-        assert!(!names.iter().any(|n| n.starts_with("eval.")), "eval 不应被保留（不在 allowed）: {names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("eval")), "eval 不应被保留（不在 allowed）: {names:?}");
     }
 
     /// Advisor gate 端到端（driver 级）：manager turn 产出连续撞 D5
@@ -5749,6 +6289,7 @@ mod tests {
             .await;
 
         let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),

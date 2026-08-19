@@ -158,6 +158,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
         command: form.command.clone(),
         description: form.description.clone(),
         max_rounds: form.max_rounds,
+        // 编辑器试运行不落暂存（保存走 toml 原文，不经此函数，
+        // 不会丢 toml 里的 staging = true）。
+        staging: false,
         steps: form
             .steps
             .iter()

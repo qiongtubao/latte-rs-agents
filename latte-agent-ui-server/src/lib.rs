@@ -461,6 +461,7 @@ fn build_router(state: AppState) -> Router {
             get(get_roles_config).post(save_role_config),
         )
         .route("/chat/send", post(chat_send))
+        .route("/chat/choice-answer", post(chat_choice_answer))
         .route("/chat/command", post(chat_command))
         .route("/chat/role", post(switch_role))
         .route("/chat/cancel-turn", post(chat_cancel_turn))
@@ -492,6 +493,8 @@ fn build_router(state: AppState) -> Router {
         .route("/models/:key/capabilities", get(model_capabilities))
         // 模型 TOML 源文件编辑
         .route("/models/:key/toml", get(get_model_toml).put(put_model_toml))
+        // advisor 全局开关（写全局层 agents.d/advisor.toml）
+        .route("/advisor", get(get_advisor).put(put_advisor))
         // 工具管理
         .route("/tools", get(list_tools))
         .route("/tools/test", axum::routing::post(test_tool))
@@ -726,6 +729,7 @@ mod tests {
         // base_url 是死端口（连接立即被拒）。这样 UserMessage 与后续
         // Error 都会进 event_log 并落盘。
         let make_config = || AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "dead-model".into(),
@@ -907,7 +911,7 @@ mod tests {
         for i in 0..3 {
             sink.emit(TraceEvent::ToolExec {
                 meta: TraceMeta::now(i, "programmer", "sid-A"),
-                name: "file.read".into(),
+                name: "read".into(),
                 args_json: "{}".into(),
                 latency_ms: 3,
                 status: ToolStatus::Ok("ok".into()),
@@ -988,7 +992,7 @@ mod tests {
         let (sub_a, sink_a) = backend.subsession_store.create(&sid, "programmer");
         sink_a.emit(TraceEvent::ToolExec {
             meta: TraceMeta::now(0, "programmer", &sid),
-            name: "file.read".into(),
+            name: "read".into(),
             args_json: "{}".into(),
             latency_ms: 1,
             status: ToolStatus::Ok("ok".into()),
@@ -996,7 +1000,7 @@ mod tests {
         let (sub_b, sink_b) = backend.subsession_store.create(&sid, "reviewer");
         sink_b.emit(TraceEvent::ToolExec {
             meta: TraceMeta::now(0, "reviewer", &sid),
-            name: "file.read".into(),
+            name: "read".into(),
             args_json: "{}".into(),
             latency_ms: 1,
             status: ToolStatus::Ok("ok".into()),

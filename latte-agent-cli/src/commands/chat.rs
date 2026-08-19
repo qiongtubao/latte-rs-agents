@@ -1010,20 +1010,13 @@ pub async fn build_tool_manager(
             .await
             .map_err(|e| format!("register_package: {}", e))?;
     }
-    // Allowlist filter: short name or namespaced id.
-    let mut keep: std::collections::HashSet<String> = allowed
+    // Allowlist filter: builtin tools register under flat names
+    // ("bash", "read", …) identical to the config names, so the
+    // config entries match the registry directly.
+    let keep: std::collections::HashSet<String> = allowed
         .iter()
         .flat_map(|s| vec![s.to_lowercase(), s.clone()])
         .collect();
-    // Alias mapping: configs use friendly names ("bash") but builtin
-    // tools register under different short names ("shell.exec",
-    // "shell.spawn"). Map the friendly name to the real one so
-    // specialist configs don't need to know internal tool names.
-    for alias in &["bash"] {
-        if keep.contains(*alias) || keep.contains(&alias.to_lowercase()) {
-            keep.insert("exec".to_string());
-        }
-    }
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
@@ -1137,11 +1130,19 @@ async fn register_workflow_tool(
                     session_id: None,
                     advisor_gate: None,
                     advisor_pause: None,
+                    staging: None,
                 };
                 latte_agent_core::workflow::run_workflow(&wf, &topic, &ctx)
                     .await
                     .map(serde_json::Value::String)
-                    .map_err(tool_err)
+                    .map_err(|e| {
+                        // 与 controller 的 workflow 工具一致：失败附善后
+                        // 指令，防止 agent 拿到裸错误后静默结束。
+                        tool_err(format!(
+                            "{e}\n\n请善后：能修复的修复后用上面的 wf_id 以 resume 参数续跑，\
+                             或换路径重做；处理完向用户汇报结果，不要静默结束。"
+                        ))
+                    })
             })
         });
 
@@ -2197,6 +2198,12 @@ async fn run_hil_repl(
                 // Failed) skips the round.
                 if mgr.state() != SessionState::Running {
                     renderer.on_status(&format!("[session not running — current state: {:?}]", mgr.state())).await;
+                    // RoundStarted 已在本轮开头发出：被暂停/终止打断的
+                    // 轮次也要补 RoundEnded，保持 trace 里两者成对
+                    // （v1.1 契约：每轮结束一次 + 每次中途暂停一次——
+                    // ask_human 在 turn 内 pause 会话后走的就是这条路，
+                    // 此前漏发导致 hil_v11_trace_events_e2e 失败）。
+                    mgr.emit_round_ended(round_num);
                     continue 'rounds;
                 }
                 // Per-role pause (HIL v1.4): skip only this role's turn

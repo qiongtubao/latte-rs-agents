@@ -42,6 +42,12 @@ pub struct WorkflowDef {
     pub description: String,
     #[serde(default)]
     pub max_rounds: Option<usize>,
+    /// 文档暂存模式：true 时本 run 内角色的 write 重定向到
+    /// `.latte/staging/<wf_id>/`（read overlay 优先读暂存副本），
+    /// workflow 整体 ok 才把草稿提升到目标路径——未终审的文档不再
+    /// 直接落进仓库。见 `crate::staging`。
+    #[serde(default)]
+    pub staging: bool,
     #[serde(default)]
     pub steps: Vec<WorkflowStepDef>,
 }
@@ -94,6 +100,60 @@ fn check_output_contract(contract: &OutputContract, output: &str) -> Result<(), 
     Ok(())
 }
 
+/// 契约校验最终失败时附进错误消息的产出摘要：取前 `max_chars` 个字符，
+/// 超长补「…」。目的：gate 类 step 判 REJECT 时，manager 拿到的错误
+/// 里能直接看到 REJECT 理由（而不是只有"缺少 VERDICT: PASS"），
+/// 才能向用户解释或修复后 resume。
+fn output_excerpt(output: &str, max_chars: usize) -> String {
+    let excerpt: String = output.chars().take(max_chars).collect();
+    if output.chars().count() > max_chars {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+/// 契约重试耗尽后的语义兜底裁决。纯字符串契约分不清「格式不合格
+/// 的坏产出」和「语义正确但没写约定标记的好产出」（jemalloc 实锤：
+/// gate 的合法 REJECT 缺「VERDICT: PASS」字样，被契约当成格式错误
+/// 判死）。耗尽前过一道 advisor 返回审查：
+/// - verdict ok → 带批注放行（下游与人都能看到契约被语义覆盖）；
+/// - warn/intervene/terminate/超时/无引擎 → `None`，维持原失败。
+async fn contract_last_resort_review(
+    review_engine: &Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
+    event_tx: &broadcast::Sender<ChatEvent>,
+    step_id: &str,
+    speaker: &str,
+    task: &str,
+    response: &str,
+    contract_reason: &str,
+) -> Option<String> {
+    let engine = review_engine.as_ref()?;
+    let (reviewed, verdict) = crate::controller::gate_delegate_return(
+        engine,
+        event_tx,
+        speaker,
+        "", // 此处拿不到角色职责全文，审查以任务+产出为基准
+        task,
+        response.to_string(),
+    )
+    .await;
+    let v = verdict?;
+    if v.verdict != crate::advisor_monitor::Verdict::Ok {
+        return None;
+    }
+    let _ = event_tx.send(ChatEvent::Status {
+        message: format!(
+            "⚠️ step '{step_id}' speaker '{speaker}' 的产出未通过契约（{contract_reason}），\
+             经 advisor 语义审查判定内容合格，放行"
+        ),
+    });
+    Some(format!(
+        "{reviewed}\n\n⚠️ [监察审查] 本产出未通过产出契约（{contract_reason}），\
+         经 advisor 语义审查判定内容合格后放行"
+    ))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStepDef {
@@ -134,14 +194,18 @@ pub struct WorkflowStepDef {
     /// 作为重试上限），耗尽则 step 失败。默认空契约 = 不校验。
     #[serde(default)]
     pub output_contract: OutputContract,
-    /// 跨 step 循环条件（仅串行引擎）：本 step 完成后检查产出是否包含
+    /// 跨 step 循环条件：本 step 完成后检查产出是否包含
     /// 该子串，包含 = 通过继续；不包含则跳回 `loop_back_to` 指定的 step
     /// 重做（缺省 = 自己），并把本 step 产出作为"上轮审查反馈"批注预置
     /// 进跳回目标的 prompt。迭代上限 `max_iterations`（缺省 3，硬上限
     /// 10），耗尽仍不满足 → workflow 失败。
+    /// 串行与 DAG 引擎都支持；DAG 下 `loop_back_to` 必须指向严格更早
+    /// wave 的 step（同 wave 自环请用 output_contract + max_retries），
+    /// 跳回时目标及其全部下游 step 作废重跑。
     #[serde(default)]
     pub loop_until: Option<String>,
-    /// `loop_until` 不满足时跳回的 step id（缺省 = 本 step 自己）。
+    /// `loop_until` 不满足时跳回的 step id（串行缺省 = 本 step 自己；
+    /// DAG 下必填且必须位于更早的 wave）。
     #[serde(default)]
     pub loop_back_to: Option<String>,
     #[serde(default)]
@@ -263,16 +327,36 @@ impl WorkflowDef {
                     ));
                 }
             }
-            if step.loop_until.is_some() && uses_dag {
-                return Err(format!(
-                    "step '{}': `loop_until` 循环仅支持串行 workflow（存在 depends_on 的 DAG 调度不支持循环）",
-                    step.id
-                ));
-            }
             if let Some(target) = &step.loop_back_to {
                 if !step_ids.contains(target.as_str()) {
                     return Err(format!(
                         "step '{}': loop_back_to 指向不存在的 step '{target}'",
+                        step.id
+                    ));
+                }
+            }
+            if step.loop_until.is_some() && uses_dag {
+                // DAG 返工环（jemalloc 实锤：gate 的合法 REJECT 被契约
+                // 判死，50 分钟流水线零产出）。约束：跳回目标必须在
+                // 严格更早的 wave——跳同 wave / 未来 wave 无法表达
+                // 「重跑上游再流到本 step」的语义。自环（loop_back_to
+                // 缺省 = 自己）在 DAG 下同属同 wave，同样拒绝；单步
+                // 重试用 output_contract + max_retries 表达。
+                let waves = compute_waves(&self.steps)?;
+                let wave_of = |id: &str| {
+                    waves
+                        .iter()
+                        .position(|w| w.iter().any(|&i| self.steps[i].id == id))
+                        .expect("compute_waves 覆盖全部 step")
+                };
+                let own_wave = wave_of(&step.id);
+                let target = step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
+                let target_wave = wave_of(target);
+                if target_wave >= own_wave {
+                    return Err(format!(
+                        "step '{}': DAG 模式下 loop_back_to '{target}' 必须位于严格更早的 wave \
+                         （目标 wave {target_wave}，本 step wave {own_wave}）；\
+                         同 wave 自环请改用 output_contract + max_retries",
                         step.id
                     ));
                 }
@@ -574,6 +658,10 @@ pub struct WorkflowRunContext {
     /// workflow 真实生效（此前只对 watched role 的主 runner 生效，
     /// workflow 照跑不误）。None（CLI/独立 run）跳过。
     pub advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
+    /// 文档暂存层（workflow toml `staging = true` 时由 run_workflow_inner
+    /// 在顶层 run 创建并挂到这里；嵌套 run 原样继承，共享同一暂存区，
+    /// 只由创建者在收尾时 promote）。None 时 write/read 直落真实 fs。
+    pub staging: Option<Arc<crate::staging::Staging>>,
 }
 
 /// Maximum nesting depth for workflow steps that invoke another
@@ -624,6 +712,7 @@ fn run_nested_workflow(
             session_id: ctx.session_id.clone(),
             advisor_gate: ctx.advisor_gate.clone(),
             advisor_pause: ctx.advisor_pause.clone(),
+            staging: ctx.staging.clone(),
         };
         let (last, keyed) = run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
         // output_from：取子 workflow 指定 output_key 的产出（如
@@ -926,6 +1015,33 @@ async fn run_workflow_inner(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
+    // 文档暂存：workflow 声明 staging=true 且上游还没有暂存区时，本
+    // run 是创建者/所有者——嵌套 run 继承同一个（见 nested_ctx），
+    // 只由所有者在收尾时 promote。用增强副本替换 ctx 引用，下游
+    // （SpeakerDispatch::from_ctx）透传到各 speaker 的 runner。
+    let created_staging = if wf.staging && ctx.staging.is_none() {
+        Some(crate::staging::Staging::new(&ctx.cwd, &wf_id))
+    } else {
+        None
+    };
+    let owned_ctx;
+    let ctx: &WorkflowRunContext = if let Some(st) = &created_staging {
+        owned_ctx = WorkflowRunContext {
+            staging: Some(st.clone()),
+            ..ctx.clone()
+        };
+        &owned_ctx
+    } else {
+        ctx
+    };
+    if let Some(st) = &created_staging {
+        let _ = ctx.event_tx.send(ChatEvent::Status {
+            message: format!(
+                "📦 staging 已启用：本 workflow 的文档写入先落到 {}，终审通过后自动提升到目标路径",
+                st.root().display()
+            ),
+        });
+    }
     let ckpt = CheckpointLog::new(
         &ctx.cwd,
         &wf_id,
@@ -974,6 +1090,29 @@ async fn run_workflow_inner(
 
     match outcome {
         WfOutcome::Ok(last_output, keyed_outputs) => {
+            // 暂存提升：只有创建者（顶层 run）在这里收尾；嵌套 run 的
+            // created_staging 是 None，草稿继续留给外层终审。
+            if let Some(st) = &created_staging {
+                let (promoted, errors) = st.promote();
+                let message = if errors.is_empty() {
+                    format!(
+                        "📦 staging 提升完成：{} 个文档已落到目标路径（{}）",
+                        promoted.len(),
+                        promoted
+                            .iter()
+                            .map(|(p, _)| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    format!(
+                        "⚠️ staging 部分提升失败（暂存区保留在 {}）：{}",
+                        st.root().display(),
+                        errors.join("; ")
+                    )
+                };
+                let _ = ctx.event_tx.send(ChatEvent::Status { message });
+            }
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
                 name,
                 wf_id,
@@ -983,6 +1122,15 @@ async fn run_workflow_inner(
             Ok((last_output, keyed_outputs))
         }
         WfOutcome::Cancelled => {
+            if let Some(st) = &created_staging {
+                let _ = ctx.event_tx.send(ChatEvent::Status {
+                    message: format!(
+                        "📦 workflow 已取消：{} 个暂存文档未提升，保留在 {}（可人工检查后 rm -rf 清理）",
+                        st.pending_count(),
+                        st.root().display()
+                    ),
+                });
+            }
             let summary = "workflow cancelled by user".to_string();
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
                 name,
@@ -993,6 +1141,15 @@ async fn run_workflow_inner(
             Err(summary)
         }
         WfOutcome::Failed(msg) => {
+            if let Some(st) = &created_staging {
+                let _ = ctx.event_tx.send(ChatEvent::Status {
+                    message: format!(
+                        "📦 workflow 失败：{} 个暂存文档未提升，保留在 {}（可人工检查后 rm -rf 清理；resume 续跑用新暂存区）",
+                        st.pending_count(),
+                        st.root().display()
+                    ),
+                });
+            }
             // 失败不丢成果：已完成 step 都落了 checkpoint，消息尾部
             // 带上进度与 wf_id，manager 可直接用 resume 续跑。
             let total = wf.steps.len() * wf.effective_max_rounds();
@@ -1029,6 +1186,10 @@ async fn build_role_runner(
     cwd: &Path,
     event_tx: &broadcast::Sender<ChatEvent>,
     agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
+    cancel_flag: Arc<AtomicBool>,
+    // 文档暂存层：Some 时把 runner 工具表里的 write/read 换成暂存
+    // 包装版（写重定向 + 读 overlay），见 crate::staging。
+    staging: Option<Arc<crate::staging::Staging>>,
 ) -> Result<(AgentRunner, String), String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
@@ -1089,6 +1250,12 @@ async fn build_role_runner(
         let rtm = build_tool_manager(&role.allowed_tools)
             .await
             .map_err(|e| format!("tools for '{role_id}': {e}"))?;
+        // 文档暂存：staging 启用时把 write/read 换成暂存包装版（写
+        // 重定向到 .latte/staging/<wf_id>/ + 读 overlay）。放在其它
+        // 工具注册之前，后续注册不受影响。
+        if let Some(st) = &staging {
+            st.wrap_tools(&rtm, role_id);
+        }
         // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
         // （与 controller::build_runner 对齐）。workflow 引擎不走
         // delegate 工具，阶段门无人消费——给一个私有句柄即可（plan
@@ -1104,9 +1271,22 @@ async fn build_role_runner(
         // 的唯一提问通道）和回报任务看板；缺失时模型调用得到
         // Tool not found（jemalloc 日志实锤：manager 在 decide 步调
         // ask 失败，选择框永远没弹出）。
+        // 注意：子代理没有"下一轮"，ask 必须是阻塞模式——挂起等用户
+        // 在弹框回答，答案经 /api/chat/choice-answer 直达本工具结果
+        // （jemalloc 日志实锤：fire-and-forget 的"结束本轮等回答"语义
+        // 让 decide 步产出变成「等待您回答」垃圾文本流进下游）。
         if role.allowed_tools.iter().any(|t| t == "ask") {
-            crate::controller::register_ask_tool(&rtm, event_tx.clone(), role_id.to_string())
-                .map_err(|e| format!("register ask for '{role_id}': {e}"))?;
+            let blocking = crate::controller::AskBlocking {
+                timeout: crate::controller::default_ask_timeout(),
+                cancel_flag: Some(cancel_flag.clone()),
+            };
+            crate::controller::register_ask_tool(
+                &rtm,
+                event_tx.clone(),
+                role_id.to_string(),
+                Some(blocking),
+            )
+            .map_err(|e| format!("register ask for '{role_id}': {e}"))?;
         }
         if role.allowed_tools.iter().any(|t| t == "task_report") {
             crate::controller::register_task_report_tool(
@@ -1165,6 +1345,7 @@ struct SpeakerDispatch {
     advisor_gate: Option<crate::advisor_monitor::GateConfig>,
     review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
     advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
+    staging: Option<Arc<crate::staging::Staging>>,
 }
 
 impl SpeakerDispatch {
@@ -1193,6 +1374,7 @@ impl SpeakerDispatch {
             advisor_gate: ctx.advisor_gate.clone(),
             review_engine,
             advisor_pause: ctx.advisor_pause.clone(),
+            staging: ctx.staging.clone(),
         }
     }
 }
@@ -1240,145 +1422,195 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         });
     }
 
-    // 2. Fresh runner + sink + gate。
-    let (mut runner, role_responsibilities) = match build_role_runner(
-        &speaker,
-        &inp.merged,
-        &inp.resolver,
-        &inp.default_params,
-        &inp.cwd,
-        &inp.event_tx,
-        inp.agent_pause_gate.clone(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            // 构建失败也要补 DelegateFinished——否则 UI 上的分派
-            // 气泡永远停在「⏳ 执行中…」。
-            if let Some(id) = &sub_id {
-                let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                    from_role: "workflow".into(),
-                    to_role: speaker.clone(),
-                    status: "failed".into(),
-                    summary: e.clone(),
-                    sub_id: id.clone(),
-                });
+    // 2-4. 执行 + advisor 返回审查的重做环：返回被判 intervene/terminate
+    //    时带【上轮审查反馈】重派——advisor 的「打回重做」不再只是批注
+    //    （jemalloc 实锤：reviewer 空转被 advisor 抓到、hint 要求重做，
+    //    流水线却照流不误）。上限可配（AdvisorMonitorConfig::
+    //    review_settings.return_max_redo，经 engine 注入），默认 1、
+    //    硬上限 MAX_RETURN_REDO。
+    let max_redo = inp
+        .review_engine
+        .as_ref()
+        .map(|e| e.return_max_redo())
+        .unwrap_or(crate::advisor_monitor::DEFAULT_RETURN_MAX_REDO);
+    let mut prompt_for_turn = inp.prompt.clone();
+    let mut redo: u8 = 0;
+    let result: Result<String, StepFail> = loop {
+        // 2. Fresh runner（每次尝试都是全新 subagent，无跨次记忆）
+        //    + sink + gate。
+        let (mut runner, role_responsibilities) = match build_role_runner(
+            &speaker,
+            &inp.merged,
+            &inp.resolver,
+            &inp.default_params,
+            &inp.cwd,
+            &inp.event_tx,
+            inp.agent_pause_gate.clone(),
+            inp.cancel_flag.clone(),
+            inp.staging.clone(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // 构建失败也要补 DelegateFinished——否则 UI 上的分派
+                // 气泡永远停在「⏳ 执行中…」。
+                if let Some(id) = &sub_id {
+                    let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                        from_role: "workflow".into(),
+                        to_role: speaker.clone(),
+                        status: "failed".into(),
+                        summary: e.clone(),
+                        sub_id: id.clone(),
+                    });
+                }
+                return Err(StepFail::Failed(e));
             }
-            return Err(StepFail::Failed(e));
+        };
+        if let Some(sink) = &sub_sink {
+            // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
+            // 由此广播到 session channel，advisor monitor 的
+            // specialist-error 检测依赖它（与 delegate 路径一致）。
+            let specialist_sink: Arc<dyn crate::trace::TraceSink> =
+                Arc::new(crate::trace::FanOutSink::new(vec![
+                    sink.clone(),
+                    Arc::new(crate::controller::ChatEventTraceSink {
+                        event_tx: inp.event_tx.clone(),
+                    }),
+                ]));
+            runner = runner.with_sink(specialist_sink);
         }
-    };
-    if let Some(sink) = &sub_sink {
-        // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
-        // 由此广播到 session channel，advisor monitor 的
-        // specialist-error 检测依赖它（与 delegate 路径一致）。
-        let specialist_sink: Arc<dyn crate::trace::TraceSink> =
-            Arc::new(crate::trace::FanOutSink::new(vec![
-                sink.clone(),
-                Arc::new(crate::controller::ChatEventTraceSink {
-                    event_tx: inp.event_tx.clone(),
-                }),
-            ]));
-        runner = runner.with_sink(specialist_sink);
-    }
-    if let Some(gate) = inp.advisor_gate.clone() {
-        runner = runner.with_gate_config(gate);
-    }
-    // intervene 暂停门也装到专家 runner：运行中判 Intervene 时在
-    // tool-round 边界 park，直到用户拍板（或超时自动恢复）。
-    if let Some(gate) = &inp.advisor_pause {
-        runner = runner.with_pause_gate(gate.clone());
-    }
-    let _ = inp.event_tx.send(ChatEvent::RoleStarted {
-        role_id: speaker.clone(),
-        detail: format!("workflow step '{}'", inp.step_id),
-        sub_id: sub_id.clone(),
-    });
+        if let Some(gate) = inp.advisor_gate.clone() {
+            runner = runner.with_gate_config(gate);
+        }
+        // intervene 暂停门也装到专家 runner：运行中判 Intervene 时在
+        // tool-round 边界 park，直到用户拍板（或超时自动恢复）。
+        if let Some(gate) = &inp.advisor_pause {
+            runner = runner.with_pause_gate(gate.clone());
+        }
+        let _ = inp.event_tx.send(ChatEvent::RoleStarted {
+            role_id: speaker.clone(),
+            detail: format!("workflow step '{}'", inp.step_id),
+            sub_id: sub_id.clone(),
+        });
 
-    // 3. Spawn + 500ms 轮询 cancel：运行中的分派可中途 abort
-    //    （对齐 controller.rs delegate 的取消语义）。
-    let prompt = inp.prompt.clone();
-    let cancel = inp.cancel_flag.clone();
-    let mut run_handle = tokio::spawn(async move {
-        runner.run_turn_gated(&[Message::user(prompt)], None).await
-    });
-    let result: Result<String, StepFail>;
-    loop {
-        tokio::select! {
-            r = &mut run_handle => {
-                match r {
-                    // 剥 <think>：主 session 展示与后续 speaker 的
-                    // transcript 只保留正式回答；原文留在子会话 trace。
-                    Ok(Ok(response)) => {
-                        let stripped = crate::controller::strip_think_blocks(&response);
-                        // 空产出不算成功：判失败让引擎重试/失败，
-                        // 而不是把空串写进 vars 穿给下游。
-                        if crate::controller::is_empty_output(&stripped) {
-                            result = Err(StepFail::Failed(format!(
-                                "subagent '{speaker}' 返回了空内容"
-                            )));
-                        } else {
-                            result = Ok(stripped);
+        // 3. Spawn + 500ms 轮询 cancel：运行中的分派可中途 abort
+        //    （对齐 controller.rs delegate 的取消语义）。
+        let prompt = prompt_for_turn.clone();
+        let cancel = inp.cancel_flag.clone();
+        let mut run_handle = tokio::spawn(async move {
+            runner.run_turn_gated(&[Message::user(prompt)], None).await
+        });
+        let attempt: Result<String, StepFail>;
+        loop {
+            tokio::select! {
+                r = &mut run_handle => {
+                    match r {
+                        // 剥 <think>：主 session 展示与后续 speaker 的
+                        // transcript 只保留正式回答；原文留在子会话 trace。
+                        Ok(Ok(response)) => {
+                            let stripped = crate::controller::strip_think_blocks(&response);
+                            // 空产出不算成功：判失败让引擎重试/失败，
+                            // 而不是把空串写进 vars 穿给下游。
+                            if crate::controller::is_empty_output(&stripped) {
+                                attempt = Err(StepFail::Failed(format!(
+                                    "subagent '{speaker}' 返回了空内容"
+                                )));
+                            } else {
+                                attempt = Ok(stripped);
+                            }
+                            break;
                         }
-                        break;
+                        Ok(Err(e)) => {
+                            // Gate 重试耗尽 → 被 advisor 终止：发
+                            // AdvisorTerminated（带 sub_id）让 UI 显示
+                            // 「已暂停」状态。
+                            if let crate::error::AgentError::AdvisorTerminated { reason, detector } = &e {
+                                let _ = inp.event_tx.send(ChatEvent::AdvisorTerminated {
+                                    role_id: speaker.clone(),
+                                    reason: reason.clone(),
+                                    detector: Some(detector.clone()),
+                                    sub_id: sub_id.clone(),
+                                });
+                            }
+                            attempt = Err(StepFail::Failed(format!("subagent failed: {e}")));
+                            break;
+                        }
+                        Err(e) => {
+                            attempt = Err(StepFail::Failed(format!("task join failed: {e}")));
+                            break;
+                        }
                     }
-                    Ok(Err(e)) => {
-                        // Gate 重试耗尽 → 被 advisor 终止：发
-                        // AdvisorTerminated（带 sub_id）让 UI 显示
-                        // 「已暂停」状态。
-                        if let crate::error::AgentError::AdvisorTerminated { reason, detector } = &e {
-                            let _ = inp.event_tx.send(ChatEvent::AdvisorTerminated {
-                                role_id: speaker.clone(),
-                                reason: reason.clone(),
-                                detector: Some(detector.clone()),
-                                sub_id: sub_id.clone(),
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        run_handle.abort();
+                        let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                            role_id: speaker.clone(),
+                            detail: "cancelled by user".into(),
+                            sub_id: sub_id.clone(),
+                        });
+                        if let Some(id) = &sub_id {
+                            let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "workflow".into(),
+                                to_role: speaker.clone(),
+                                status: "cancelled".into(),
+                                summary: "workflow step cancelled by user".into(),
+                                sub_id: id.clone(),
                             });
                         }
-                        result = Err(StepFail::Failed(format!("subagent failed: {e}")));
-                        break;
+                        return Err(StepFail::Cancelled);
                     }
-                    Err(e) => {
-                        result = Err(StepFail::Failed(format!("task join failed: {e}")));
-                        break;
-                    }
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                if cancel.load(Ordering::SeqCst) {
-                    run_handle.abort();
-                    let _ = inp.event_tx.send(ChatEvent::RoleFinished {
-                        role_id: speaker.clone(),
-                        detail: "cancelled by user".into(),
-                        sub_id: sub_id.clone(),
-                    });
-                    if let Some(id) = &sub_id {
-                        let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                            from_role: "workflow".into(),
-                            to_role: speaker.clone(),
-                            status: "cancelled".into(),
-                            summary: "workflow step cancelled by user".into(),
-                            sub_id: id.clone(),
-                        });
-                    }
-                    return Err(StepFail::Cancelled);
                 }
             }
         }
-    }
 
-    // 4. Delegate-return 审查：advisor 启用（gate Some ⇒ review_engine
-    //    Some）时产出先过 gate_delegate_return 再回写引擎。
-    let result = match (result, &inp.review_engine) {
-        (Ok(response), Some(engine)) => Ok(crate::controller::gate_delegate_return(
-            engine,
-            &inp.event_tx,
-            &speaker,
-            &role_responsibilities,
-            &inp.prompt,
-            response,
-        )
-        .await),
-        (other, _) => other,
+        // 4. Delegate-return 审查：advisor 启用（gate Some ⇒ review_engine
+        //    Some）时产出先过审查再回写引擎；intervene/terminate → 重做。
+        match (attempt, &inp.review_engine) {
+            (Ok(response), Some(engine)) => {
+                // 审查基准是原始任务（inp.prompt），不含重做批注。
+                let (annotated, verdict) = crate::controller::gate_delegate_return(
+                    engine,
+                    &inp.event_tx,
+                    &speaker,
+                    &role_responsibilities,
+                    &inp.prompt,
+                    response,
+                )
+                .await;
+                let intervene = matches!(
+                    verdict.as_ref().map(|v| &v.verdict),
+                    Some(crate::advisor_monitor::Verdict::Intervene)
+                        | Some(crate::advisor_monitor::Verdict::Terminate)
+                );
+                if intervene && redo < max_redo {
+                    redo += 1;
+                    let v = verdict.as_ref().expect("intervene 蕴含 verdict");
+                    let _ = inp.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "↩ advisor 判定 {speaker} 的返回未达标，带审查意见重做（第 {redo}/{max_redo} 次）"
+                        ),
+                    });
+                    // 与下一次派发的 RoleStarted 配平。
+                    let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                        role_id: speaker.clone(),
+                        detail: "advisor intervene：带审查意见重做".into(),
+                        sub_id: sub_id.clone(),
+                    });
+                    let feedback = if v.hint.is_empty() {
+                        v.reason.clone()
+                    } else {
+                        format!("{}\n处理建议：{}", v.reason, v.hint)
+                    };
+                    prompt_for_turn =
+                        format!("{}\n\n【上轮审查反馈】\n{}", inp.prompt, feedback);
+                    continue;
+                }
+                break Ok(annotated);
+            }
+            (other, _) => break other,
+        }
     };
 
     // 5. 收尾事件（RoleTurn 由引擎的 WorkflowTurn 承担，不重复发）。
@@ -1451,12 +1683,13 @@ async fn run_workflow_serial(
     // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
     // 一个，仿 controller 的 register_delegate_tool）。有 session
     // 时挂 subsession sink：审查的 LLM 调用也落日志（观测盲区修复）。
-    let review_engine = ctx.advisor_gate.as_ref().map(|_| {
+    let review_engine = ctx.advisor_gate.as_ref().map(|gate| {
         let engine = crate::advisor_monitor::AdvisorReviewEngine::new(
             ctx.merged.clone(),
             ctx.resolver.clone(),
             ctx.default_params.clone(),
-        );
+        )
+        .with_review_settings(gate.review_settings);
         let engine = match (&ctx.subsession_store, &ctx.session_id) {
             (Some(store), Some(sid)) if !sid.is_empty() => {
                 let (_id, sink) = store.create(sid, "advisor");
@@ -1595,7 +1828,7 @@ async fn run_workflow_serial(
                         speaker.clone(),
                         prompt.clone(),
                     );
-                    let response = match run_step_speaker(dispatch).await {
+                    let mut response = match run_step_speaker(dispatch).await {
                         Ok(r) => r,
                         Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
                         Err(StepFail::Failed(e)) => {
@@ -1607,25 +1840,47 @@ async fn run_workflow_serial(
                     };
                     if let Err(reason) = check_output_contract(&step.output_contract, &response) {
                         if attempt >= step.max_retries {
-                            return WfOutcome::Failed(format!(
-                                "step '{}' speaker '{}': 产出契约校验失败\
-                                 （重试 {attempt} 次后仍不合格）：{reason}",
-                                step.id, speaker
-                            ));
+                            // 重试耗尽：判死前过一道 advisor 语义兜底
+                            // （字符串契约分不清格式错误与合法但无标记
+                            // 的产出——jemalloc 实锤 gate REJECT 判死）。
+                            match contract_last_resort_review(
+                                &review_engine,
+                                &ctx.event_tx,
+                                &step.id,
+                                speaker.as_str(),
+                                &full_prompt,
+                                &response,
+                                &reason,
+                            )
+                            .await
+                            {
+                                Some(annotated) => response = annotated,
+                                None => {
+                                    return WfOutcome::Failed(format!(
+                                        "step '{}' speaker '{}': 产出契约校验失败\
+                                         （重试 {attempt} 次后仍不合格）：{reason}\
+                                         ；不合格产出摘要：{}",
+                                        step.id,
+                                        speaker,
+                                        output_excerpt(&response, 1200)
+                                    ))
+                                }
+                            }
+                        } else {
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id,
+                                speaker = %speaker,
+                                attempt,
+                                reason = %reason,
+                                "workflow step output failed output_contract; retrying"
+                            );
+                            let annotation =
+                                format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
                         }
-                        attempt += 1;
-                        tracing::warn!(
-                            step = %step.id,
-                            speaker = %speaker,
-                            attempt,
-                            reason = %reason,
-                            "workflow step output failed output_contract; retrying"
-                        );
-                        let annotation =
-                            format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
-                        step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
-                        prompt = format!("{full_prompt}\n\n{annotation}");
-                        continue;
                     }
                     // 契约合格的产出才发事件 / 进 transcript / last_output。
                     // （run_step_speaker 已剥离 <think>；step_transcript /
@@ -1724,11 +1979,18 @@ struct DagStepInput {
     advisor_gate: Option<crate::advisor_monitor::GateConfig>,
     review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
     advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
+    staging: Option<Arc<crate::staging::Staging>>,
+    /// loop_until 返工时由调度器预置的「上轮审查反馈」（未满足循环
+    /// 条件的那个 step 的产出），拼进本 step 的 prompt 后消费。
+    feedback: Option<String>,
 }
 
 /// Run one DAG step (all its speakers, serially) with a fresh runner
-/// per speaker. Returns `(step_id, output_key, last_output)` on success.
-async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, String), StepFail> {
+/// per speaker. Returns `(step_idx, step_id, output_key, last_output)`
+/// on success — `step_idx` 供调度器做 loop_until 返工判定。
+async fn run_dag_step(
+    inp: DagStepInput,
+) -> Result<(usize, String, Option<String>, String), StepFail> {
     let step = &inp.wf.steps[inp.step_idx];
     if inp.cancel_flag.load(Ordering::SeqCst) {
         return Err(StepFail::Cancelled);
@@ -1768,6 +2030,7 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             session_id: inp.session_id.clone(),
             advisor_gate: inp.advisor_gate.clone(),
             advisor_pause: inp.advisor_pause.clone(),
+            staging: inp.staging.clone(),
         };
         let output = run_nested_workflow(
             nested_name.clone(),
@@ -1789,7 +2052,12 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             content: crate::controller::strip_think_blocks(&output),
             round: inp.round,
         });
-        return Ok((step.id.clone(), step.output_key.clone(), output));
+        return Ok((
+            inp.step_idx,
+            step.id.clone(),
+            step.output_key.clone(),
+            output,
+        ));
     }
 
     let mut step_transcript = String::new();
@@ -1802,6 +2070,13 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
         step_vars.insert("step_id".into(), step.id.clone());
         step_vars.insert("speaker".into(), speaker.clone());
         let base_prompt = inp.wf.render_task(step, &step_vars);
+        // loop_until 返工反馈（调度器预置）：拼进 base prompt，本 step
+        // 内所有 speaker 与契约重试都看得到（对齐串行引擎
+        // pending_feedback 的语义）。
+        let base_prompt = match &inp.feedback {
+            Some(fb) => format!("{base_prompt}\n\n【上轮审查反馈】\n{fb}"),
+            None => base_prompt,
+        };
         let full_prompt = if step_transcript.is_empty() {
             base_prompt
         } else {
@@ -1829,8 +2104,9 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
                 advisor_gate: inp.advisor_gate.clone(),
                 review_engine: inp.review_engine.clone(),
                 advisor_pause: inp.advisor_pause.clone(),
+                staging: inp.staging.clone(),
             };
-            let response = match run_step_speaker(dispatch).await {
+            let mut response = match run_step_speaker(dispatch).await {
                 Ok(r) => r,
                 Err(e) => {
                     return Err(match e {
@@ -1844,25 +2120,46 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             };
             if let Err(reason) = check_output_contract(&step.output_contract, &response) {
                 if attempt >= step.max_retries {
-                    return Err(StepFail::Failed(format!(
-                        "step '{}' speaker '{}': 产出契约校验失败\
-                         （重试 {attempt} 次后仍不合格）：{reason}",
-                        step.id, speaker
-                    )));
-                }
-                attempt += 1;
-                tracing::warn!(
-                    step = %step.id,
-                    speaker = %speaker,
-                    attempt,
-                    reason = %reason,
+                    // 重试耗尽：判死前过一道 advisor 语义兜底（同串行
+                    // 引擎；jemalloc 实锤 gate REJECT 被契约判死）。
+                    match contract_last_resort_review(
+                        &inp.review_engine,
+                        &inp.event_tx,
+                        &step.id,
+                        speaker.as_str(),
+                        &full_prompt,
+                        &response,
+                        &reason,
+                    )
+                    .await
+                    {
+                        Some(annotated) => response = annotated,
+                        None => {
+                            return Err(StepFail::Failed(format!(
+                                "step '{}' speaker '{}': 产出契约校验失败\
+                                 （重试 {attempt} 次后仍不合格）：{reason}\
+                                 ；不合格产出摘要：{}",
+                                step.id,
+                                speaker,
+                                output_excerpt(&response, 1200)
+                            )))
+                        }
+                    }
+                } else {
+                    attempt += 1;
+                    tracing::warn!(
+                        step = %step.id,
+                        speaker = %speaker,
+                        attempt,
+                        reason = %reason,
                     "workflow step output failed output_contract; retrying"
                 );
-                let annotation =
-                    format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
-                step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
-                prompt = format!("{full_prompt}\n\n{annotation}");
-                continue;
+                    let annotation =
+                        format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
+                    step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                    prompt = format!("{full_prompt}\n\n{annotation}");
+                    continue;
+                }
             }
             // 契约合格的产出才发事件 / 进 transcript / last_output。
             let _ = inp.event_tx.send(ChatEvent::WorkflowTurn {
@@ -1877,7 +2174,12 @@ async fn run_dag_step(inp: DagStepInput) -> Result<(String, Option<String>, Stri
             break;
         }
     }
-    Ok((step.id.clone(), step.output_key.clone(), last_output))
+    Ok((
+        inp.step_idx,
+        step.id.clone(),
+        step.output_key.clone(),
+        last_output,
+    ))
 }
 
 /// DAG engine: schedule steps into dependency waves and run each wave's
@@ -1906,12 +2208,13 @@ async fn run_workflow_dag(
     // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
     // 一个，仿 controller 的 register_delegate_tool）。有 session
     // 时挂 subsession sink：审查的 LLM 调用也落日志（观测盲区修复）。
-    let review_engine = ctx.advisor_gate.as_ref().map(|_| {
+    let review_engine = ctx.advisor_gate.as_ref().map(|gate| {
         let engine = crate::advisor_monitor::AdvisorReviewEngine::new(
             ctx.merged.clone(),
             ctx.resolver.clone(),
             ctx.default_params.clone(),
-        );
+        )
+        .with_review_settings(gate.review_settings);
         let engine = match (&ctx.subsession_store, &ctx.session_id) {
             (Some(store), Some(sid)) if !sid.is_empty() => {
                 let (_id, sink) = store.create(sid, "advisor");
@@ -1943,11 +2246,19 @@ async fn run_workflow_dag(
     }
 
     for round in 0..wf.effective_max_rounds() {
-        for wave in &waves {
+        // loop_until 返工的每轮状态（对齐串行引擎）：迭代计数按
+        // loop_until 所在 step 的完成次数计（key = step 下标）；
+        // pending_feedback 是跳回时预置进目标 step prompt 的
+        // 「上轮审查反馈」（key = 目标 step id）。
+        let mut loop_iters: HashMap<usize, usize> = HashMap::new();
+        let mut pending_feedback: HashMap<String, String> = HashMap::new();
+        let mut wave_idx = 0;
+        while wave_idx < waves.len() {
+            let wave = &waves[wave_idx];
             if ctx.cancel_flag.load(Ordering::SeqCst) {
                 return WfOutcome::Cancelled;
             }
-            let mut set: JoinSet<Result<(String, Option<String>, String), StepFail>> =
+            let mut set: JoinSet<Result<(usize, String, Option<String>, String), StepFail>> =
                 JoinSet::new();
             for &idx in wave {
                 if done_steps.contains(wf.steps[idx].id.as_str()) {
@@ -1973,6 +2284,8 @@ async fn run_workflow_dag(
                     advisor_gate: ctx.advisor_gate.clone(),
                     review_engine: review_engine.clone(),
                     advisor_pause: ctx.advisor_pause.clone(),
+                    staging: ctx.staging.clone(),
+                    feedback: pending_feedback.remove(wf.steps[idx].id.as_str()),
                 };
                 let sem = sem.clone();
                 set.spawn(async move {
@@ -1989,13 +2302,13 @@ async fn run_workflow_dag(
             // Collect the whole wave; merge outputs into `vars` only
             // after every step in the wave has finished (they were all
             // independent and read the same pre-wave snapshot).
-            let mut wave_updates: Vec<(Option<String>, String)> = Vec::new();
+            let mut wave_results: Vec<(usize, Option<String>, String)> = Vec::new();
             while let Some(joined) = set.join_next().await {
                 match joined {
-                    Ok(Ok((step_id, output_key, out))) => {
+                    Ok(Ok((step_idx, step_id, output_key, out))) => {
                         ckpt.record_step(&step_id, output_key.as_deref(), &out);
                         outputs.insert(step_id, out.clone());
-                        wave_updates.push((output_key, out));
+                        wave_results.push((step_idx, output_key, out));
                     }
                     Ok(Err(StepFail::Cancelled)) => {
                         set.abort_all();
@@ -2013,13 +2326,78 @@ async fn run_workflow_dag(
                     }
                 }
             }
-            for (output_key, out) in wave_updates {
+            for (_sidx, output_key, out) in &wave_results {
                 if let Some(key) = output_key {
                     // 监察批注不进 vars（同串行引擎）。
-                    vars.insert(key.clone(), crate::controller::strip_review_annotation(&out));
-                    keyed.insert(key, out);
+                    vars.insert(key.clone(), crate::controller::strip_review_annotation(out));
+                    keyed.insert(key.clone(), out.clone());
                 }
             }
+
+            // loop_until 返工判定：wave 整体 join 后才评估（不打断同
+            // wave 仍在跑的兄弟 step）。产出不满足条件的 step 把产出
+            // 作为反馈预置给跳回目标，调度指针退回目标所在 wave，
+            // 目标及其全部下游作废重跑（迭代上限 max_iterations，缺省
+            // 3、硬上限 10，耗尽才 failed——jemalloc 实锤：gate 的
+            // 合法 REJECT 此前被契约直接判死，零返工）。
+            let mut jump_back: Option<usize> = None;
+            let mut rework_notes: Vec<String> = Vec::new();
+            for (sidx, _key, out) in &wave_results {
+                let step = &wf.steps[*sidx];
+                let Some(cond) = &step.loop_until else { continue };
+                if out.contains(cond.as_str()) {
+                    continue;
+                }
+                let count = {
+                    let c = loop_iters.entry(*sidx).or_insert(0);
+                    *c += 1;
+                    *c
+                };
+                let max = step.max_iterations.unwrap_or(3).min(10);
+                if count >= max {
+                    let summary: String = out.chars().take(200).collect();
+                    return WfOutcome::Failed(format!(
+                        "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                         （已达 max_iterations={max}），最后一次产出摘要：{summary}",
+                        step.id
+                    ));
+                }
+                let target_id = step.loop_back_to.clone().unwrap_or_else(|| step.id.clone());
+                let target_wave = waves
+                    .iter()
+                    .position(|w| w.iter().any(|&i| wf.steps[i].id == target_id))
+                    .expect("validate 已保证 loop_back_to 指向存在的 step");
+                pending_feedback.insert(target_id.clone(), out.clone());
+                rework_notes.push(format!(
+                    "step '{}' 未满足「{cond}」（第 {count}/{max} 轮），跳回 '{target_id}'",
+                    step.id
+                ));
+                jump_back = Some(match jump_back {
+                    Some(cur) => cur.min(target_wave),
+                    None => target_wave,
+                });
+            }
+            if let Some(target_wave) = jump_back {
+                let _ = ctx.event_tx.send(ChatEvent::Status {
+                    message: format!("↩ DAG 返工：{}", rework_notes.join("；")),
+                });
+                // 作废目标 wave 及之后全部 step 的产出（vars/keyed/
+                // outputs），让下游随重跑拿到返工后的新值而不是旧快照。
+                // checkpoint 只增不改：重跑会产生重复 step 记录，resume
+                // 预填是「后写覆盖」，最后一次产出生效，无需清理。
+                for w in &waves[target_wave..] {
+                    for &i in w {
+                        outputs.remove(wf.steps[i].id.as_str());
+                        if let Some(key) = &wf.steps[i].output_key {
+                            vars.remove(key);
+                            keyed.remove(key);
+                        }
+                    }
+                }
+                wave_idx = target_wave;
+                continue;
+            }
+            wave_idx += 1;
         }
     }
 
@@ -2381,6 +2759,101 @@ depends_on = ["a"]
         wf.validate_dag().expect("valid dag");
     }
 
+    /// DAG loop_until 校验：loop_back_to 指向严格更早 wave → 通过。
+    #[test]
+    fn dag_loop_back_to_earlier_wave_ok() {
+        let wf = wf_from(
+            r#"
+name = "dag_loop_ok"
+[[steps]]
+id = "design"
+role = "pm"
+task = "t"
+[[steps]]
+id = "gate"
+role = "architect"
+task = "t"
+depends_on = ["design"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "design"
+"#,
+        );
+        wf.validate().expect("指向更早 wave 的 loop_back_to 应合法");
+    }
+
+    /// DAG loop_until 校验：loop_back_to 缺省（= 自己，同 wave）→
+    /// 拒绝，并提示改用 output_contract。
+    #[test]
+    fn dag_loop_self_cycle_rejected() {
+        let wf = wf_from(
+            r#"
+name = "dag_loop_self"
+[[steps]]
+id = "design"
+role = "pm"
+task = "t"
+[[steps]]
+id = "gate"
+role = "architect"
+task = "t"
+depends_on = ["design"]
+loop_until = "VERDICT: PASS"
+"#,
+        );
+        let err = wf.validate().expect_err("同 wave 自环必须拒绝");
+        assert!(err.contains("严格更早的 wave"), "got: {err}");
+    }
+
+    /// DAG loop_until 校验：跳回同 wave 的兄弟 step → 拒绝。
+    #[test]
+    fn dag_loop_back_to_same_wave_rejected() {
+        let wf = wf_from(
+            r#"
+name = "dag_loop_same_wave"
+[[steps]]
+id = "design"
+role = "pm"
+task = "t"
+[[steps]]
+id = "review_a"
+role = "architect"
+task = "t"
+depends_on = ["design"]
+[[steps]]
+id = "review_b"
+role = "architect"
+task = "t"
+depends_on = ["design"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "review_a"
+"#,
+        );
+        let err = wf.validate().expect_err("同 wave 跳回必须拒绝");
+        assert!(err.contains("严格更早的 wave"), "got: {err}");
+    }
+
+    /// 串行引擎的 loop_until 自环不受影响（回归保护：新校验只
+    /// 约束 DAG）。
+    #[test]
+    fn serial_loop_self_cycle_still_ok() {
+        let wf = wf_from(
+            r#"
+name = "serial_loop"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+loop_until = "VERDICT: PASS"
+loop_back_to = "a"
+"#,
+        );
+        wf.validate().expect("串行 loop_until 应保持合法");
+    }
+
     /// Linear chain a→b→c produces one step per wave (fully serial).
     #[test]
     fn linear_chain_is_serial_waves() {
@@ -2641,6 +3114,17 @@ mod contract_tests {
     }
 
     #[test]
+    fn output_excerpt_truncates_with_ellipsis() {
+        // 短产出原样返回，不带省略号。
+        assert_eq!(output_excerpt("短产出", 10), "短产出");
+        // 超长截到 max_chars 并补「…」（按字符数，不是字节数）。
+        let long: String = "x".repeat(1500);
+        let e = output_excerpt(&long, 1200);
+        assert_eq!(e.chars().count(), 1201, "1200 字符 + 省略号: {}", e.len());
+        assert!(e.ends_with('…'));
+    }
+
+    #[test]
     fn output_contract_parses_from_step_toml() {
         let raw = r#"
 name = "c"
@@ -2700,6 +3184,123 @@ task = "t"
         assert!(breakdown.max_retries >= 1, "contract needs retry budget");
     }
 
+    /// 验收：两个 gate 的 prompt 必须守住「有条件通过不丢修正项」——
+    /// ⚠️ 有条件通过时 PASS 必须附「【通过条件/修正项】」，实测错误
+    /// 未吸收时必须 REJECT（jemalloc 实锤：4 处 stats.c 行号实测错误
+    /// 随裸 VERDICT: PASS 被放行，带错清单直接进了任务看板）。
+    #[test]
+    fn gate_prompts_keep_conditions_and_reject_unabsorbed_errors() {
+        let cases: [(&str, &str); 2] = [
+            (
+                include_str!("../../config/workflows/implementation_plan.toml"),
+                "implementation_plan",
+            ),
+            (
+                include_str!("../../config/workflows/design_and_plan.toml"),
+                "design_and_plan",
+            ),
+        ];
+        for (raw, wf_name) in cases {
+            let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+            wf.validate().expect("workflow should validate");
+            let gate = wf
+                .steps
+                .iter()
+                .find(|s| s.id == "gate")
+                .unwrap_or_else(|| panic!("{wf_name} must have a gate step"));
+            let prompt = gate.task_text();
+            assert!(
+                prompt.contains("【通过条件/修正项】"),
+                "{wf_name} gate 必须要求附条件/修正项"
+            );
+            assert!(
+                prompt.contains("实测错误"),
+                "{wf_name} gate 必须要求未吸收实测错误时 REJECT"
+            );
+            assert!(
+                prompt.contains("VERDICT: PASS") && prompt.contains("VERDICT: REJECT"),
+                "{wf_name} gate 必须保留双裁决"
+            );
+        }
+    }
+
+    /// 验收：implementation_plan 的 gate 必须把 REJECT 变成返工循环
+    /// （loop_until 跳回 breakdown），而不是契约判死整条流水线——
+    /// jemalloc 实锤：评审如实 REJECT（3 条实证阻断）导致 50 分钟
+    /// workflow 血本无归。契约只能卡「VERDICT:」格式，不能
+    /// require PASS（否则 REJECT 又变回契约失败）。
+    #[test]
+    fn implementation_plan_gate_reject_loops_back_for_rework() {
+        let raw = include_str!("../../config/workflows/implementation_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("implementation_plan should validate");
+        let gate = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "gate")
+            .expect("gate step");
+        assert_eq!(
+            gate.loop_until.as_deref(),
+            Some("VERDICT: PASS"),
+            "gate 必须用 loop_until 驱动 REJECT 返工"
+        );
+        assert_eq!(
+            gate.loop_back_to.as_deref(),
+            Some("breakdown"),
+            "REJECT 反馈必须回到拆解步让 architect 吸收"
+        );
+        assert!(
+            gate.max_iterations.unwrap_or(3) >= 2,
+            "至少给 2 轮返工机会"
+        );
+        assert!(
+            !gate.output_contract.require.iter().any(|r| r == "VERDICT: PASS"),
+            "契约 require PASS 会把 REJECT 判死，必须只卡格式"
+        );
+        assert!(
+            gate.output_contract.require.iter().any(|r| r == "VERDICT:"),
+            "契约应保留 VERDICT: 格式校验"
+        );
+    }
+
+    /// 验收：design_and_plan 的 gate 同样必须把 REJECT 变成返工循环
+    /// （DAG 引擎已支持 loop_until），跳回 brainstorm 重新生成设计——
+    /// jemalloc 实锤：gate 如实 REJECT（extent 状态数、LG_QUANTUM 等
+    /// 实测错误）被契约 require PASS 判死，50 分钟流水线零产出。
+    #[test]
+    fn design_and_plan_gate_reject_loops_back_for_rework() {
+        let raw = include_str!("../../config/workflows/design_and_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("design_and_plan should validate");
+        let gate = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "gate")
+            .expect("gate step");
+        assert_eq!(
+            gate.loop_until.as_deref(),
+            Some("VERDICT: PASS"),
+            "gate 必须用 loop_until 驱动 REJECT 返工"
+        );
+        assert_eq!(
+            gate.loop_back_to.as_deref(),
+            Some("brainstorm"),
+            "跨评审的结构性问题必须回到设计脑暴重做"
+        );
+        assert!(
+            gate.max_iterations.unwrap_or(3) >= 2,
+            "至少给 2 轮返工机会"
+        );
+        assert!(
+            !gate.output_contract.require.iter().any(|r| r == "VERDICT: PASS"),
+            "契约 require PASS 会把 REJECT 判死，必须只卡格式"
+        );
+        assert!(
+            gate.output_contract.require.iter().any(|r| r == "VERDICT:"),
+            "契约应保留 VERDICT: 格式校验"
+        );
+    }
+
     /// 验收：init_project 的 project_md step 带产出契约（任务要求文件名出现）。
     #[test]
     fn init_project_project_md_step_has_contract() {
@@ -2722,7 +3323,7 @@ mod contract_engine_tests {
     use super::*;
     use crate::config::{ModelCatalog, ModelDef};
     use crate::role::RoleTemplate;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     fn openai_body(content: &str) -> String {
@@ -2760,6 +3361,7 @@ mod contract_engine_tests {
             },
         )]);
         Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -2800,6 +3402,7 @@ mod contract_engine_tests {
                 session_id: None,
                 advisor_gate: None,
                 advisor_pause: None,
+                staging: None,
             },
             event_rx,
         )
@@ -2839,6 +3442,8 @@ forbid = ["TBD"]
             std::env::temp_dir().as_path(),
             &event_tx,
             None,
+            Arc::new(AtomicBool::new(false)),
+            None,
         )
         .await
         .expect("worker runner");
@@ -2866,7 +3471,7 @@ forbid = ["TBD"]
         let good = "这是一份足够详实的实现计划，覆盖方案概述、工作分解、依赖关系与风险分析，每一项都给出了明确的验收标准，没有任何占位内容。";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("未通过验收"))
+            .and(wiremock::matchers::body_string_contains("未通过验收"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(good)))
             .mount(&server)
             .await;
@@ -2918,6 +3523,160 @@ forbid = ["TBD"]
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "首发 + max_retries=1 次重试: {}", requests.len());
         assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
+    }
+
+    /// advisor 返回审查判 intervene → 同一 speaker 带【上轮审查反馈】
+    /// 重做一次，第二次审 ok → step 成功、产出是重做版（jemalloc 实锤：
+    /// reviewer 空转被 advisor 抓到「打回重做」，流水线却照流不误）。
+    #[tokio::test]
+    async fn advisor_intervene_triggers_redo_with_feedback() {
+        let server = wiremock::MockServer::start().await;
+        let v1 = "v1 产出：这份内容足够长，肯定超过五十个字符的短输出门禁阈值，不含工具回声。";
+        let v2 = "v2 产出：已吸收审查意见重写，同样超过五十个字符的短输出门禁阈值，不含工具回声。";
+        // wiremock 后挂载的优先匹配；逐个 up_to_n_times(1) 耗尽后落回
+        // 下一个。调用顺序：worker首发 → advisor审v1 → worker重做 →
+        // advisor审v2。判别子串：advisor 的审查 prompt 内嵌被审产出。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("v2 产出"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("【上轮审查反馈】"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(v2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("v1 产出"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 偏航未达标\nhint: 重写并紧扣任务",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(v1)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "redo_test"
+description = "advisor intervene redo"
+
+[[steps]]
+id = "only"
+description = "单步"
+speakers = ["worker"]
+output_key = "out"
+prompt = "围绕测试主题产出学习笔记。"
+"#,
+        )
+        .unwrap();
+        let (mut ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("重做后应成功");
+        assert_eq!(out, v2, "最终产出必须是重做版");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4, "worker×2 + advisor×2: {}", requests.len());
+        let redo_req = String::from_utf8_lossy(&requests[2].body);
+        assert!(redo_req.contains("【上轮审查反馈】"), "重做 prompt 带反馈批注: {redo_req}");
+        assert!(redo_req.contains("重写并紧扣任务"), "批注含 advisor hint: {redo_req}");
+
+        let events: Vec<ChatEvent> = {
+            let mut v = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                v.push(ev);
+            }
+            v
+        };
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                ChatEvent::Status { message } if message.contains("带审查意见重做")
+            )),
+            "应有重做 Status 事件: {events:?}"
+        );
+        // intervene 批注不污染最终产出（verdict ok 的第二次返回原样）。
+        assert!(!out.contains("监察审查"));
+    }
+
+    /// intervene 重做后仍被判 intervene → 不再无限重试：第二次产出
+    /// 带批注放行（重做上限取默认 return_max_redo=1）。
+    #[tokio::test]
+    async fn advisor_intervene_redo_exhausted_passes_annotated() {
+        let server = wiremock::MockServer::start().await;
+        let v1 = "v1 产出：这份内容足够长，肯定超过五十个字符的短输出门禁阈值，不含工具回声。";
+        let v2 = "v2 产出：重做版内容，同样超过五十个字符的短输出门禁阈值，不含工具回声。";
+        // 两次审查都 intervene：先审 v1、再审 v2。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("v2 产出"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 仍不达标\nhint: 再改",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("【上轮审查反馈】"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(v2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("v1 产出"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 偏航\nhint: 重写",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(v1)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "redo_cap_test"
+description = "advisor intervene redo cap"
+
+[[steps]]
+id = "only"
+description = "单步"
+speakers = ["worker"]
+output_key = "out"
+prompt = "围绕测试主题产出学习笔记。"
+"#,
+        )
+        .unwrap();
+        let (mut ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("重试耗尽后应带批注放行而不是失败");
+        assert!(out.contains("v2 产出"), "产出是重做版: {out}");
+        assert!(out.contains("监察审查"), "耗尽后批注随产出放行: {out}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4, "只重做一次: {}", requests.len());
     }
 
     /// 分派 = 完整 subagent（与普通流程 delegate 一致）：ctx 带
@@ -3018,6 +3777,172 @@ task = "任务B：{{out_a}}"
             .expect("run ok");
         assert!(r.is_ok(), "resume 后 workflow 成功: {:?}", r);
     }
+
+    /// C3 兜底（串行）：契约重试耗尽 → advisor 语义审查判 ok →
+    /// 带批注放行。jemalloc 实锤：gate 的合法 REJECT 没写契约要求的
+    /// 「VERDICT: PASS」字样，被字符串契约当格式错误判死。
+    #[tokio::test]
+    async fn contract_exhausted_advisor_ok_passes_with_annotation() {
+        let server = wiremock::MockServer::start().await;
+        // worker 产出：语义合格但没写契约要求的验收标记（长度过 D5）。
+        let no_mark = "这是一份语义合格但没有写约定验收标记的产出，长度足够超过五十个字符的短输出门禁阈值，内容完整覆盖任务要求。";
+        // wiremock 先挂载优先（FIFO 实测）：worker 首发命中通用 mock
+        // （仅 1 次）后耗尽；advisor 审查请求（内嵌被审产出文本）落到
+        // 第二个 mock → verdict ok。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(no_mark)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(
+                "没有写约定验收标记",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "last_resort_demo"
+[[steps]]
+id = "only"
+role = "worker"
+task = "围绕测试主题产出学习笔记"
+output_key = "out"
+[steps.output_contract]
+require = ["契约要求的验收标记字符串"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("advisor 语义兜底应放行");
+        assert!(out.contains("没有写约定验收标记"), "产出本体保留: {out}");
+        assert!(out.contains("监察审查"), "产出带兜底放行批注: {out}");
+    }
+
+    /// C3 兜底（串行）：advisor 判 intervene → 维持契约失败（兜底只
+    /// 救「内容合格」的产出，不救真不合格的）。
+    #[tokio::test]
+    async fn contract_exhausted_advisor_intervene_still_fails() {
+        let server = wiremock::MockServer::start().await;
+        let no_mark = "这是一份语义合格但没有写约定验收标记的产出，长度足够超过五十个字符的短输出门禁阈值，内容完整覆盖任务要求。";
+        // 请求序列（FIFO）：worker 首发 → advisor 返回审查 intervene
+        // → worker 带【上轮审查反馈】重做（返回审查重做环，上限 1）
+        // → advisor 复审 intervene → 重做耗尽放行 → 契约失败 →
+        // last-resort 审查 intervene → 维持失败。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(no_mark)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("【上轮审查反馈】"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(no_mark)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(
+                "没有写约定验收标记",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 内容与任务无关\nhint: 重写",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "last_resort_deny"
+[[steps]]
+id = "only"
+role = "worker"
+task = "围绕测试主题产出学习笔记"
+output_key = "out"
+[steps.output_contract]
+require = ["契约要求的验收标记字符串"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let err = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect_err("advisor 判 intervene 必须维持失败");
+        assert!(err.contains("产出契约校验失败"), "got: {err}");
+    }
+
+    /// C3 兜底（DAG 引擎同款路径）：b 步契约耗尽 → advisor 判 ok →
+    /// 放行，workflow 成功。
+    #[tokio::test]
+    async fn dag_contract_exhausted_advisor_ok_passes() {
+        let server = wiremock::MockServer::start().await;
+        let no_mark = "这是一份语义合格但没有写约定验收标记的产出，长度足够超过五十个字符的短输出门禁阈值，内容完整覆盖任务要求。";
+        // FIFO：a → 任务一 mock；b → 任务二 mock（仅 1 次）；advisor
+        // 审查请求（内嵌 b 的产出）落到最后一个 mock。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("任务一"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "甲步骤产出：一段足够长的占位内容，确保超过五十个字符的短输出门禁阈值。",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("任务二"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(no_mark)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(
+                "没有写约定验收标记",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_last_resort"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务一：{{topic}}"
+output_key = "out_a"
+[[steps]]
+id = "b"
+role = "worker"
+task = "任务二：{{out_a}}"
+output_key = "out_b"
+depends_on = ["a"]
+[steps.output_contract]
+require = ["契约要求的验收标记字符串"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("DAG advisor 语义兜底应放行");
+        assert!(out.contains("监察审查"), "产出带兜底放行批注: {out}");
+    }
 }
 
 #[cfg(test)]
@@ -3063,6 +3988,7 @@ mod resume_tests {
             },
         )]);
         Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -3106,6 +4032,7 @@ mod resume_tests {
                 session_id: None,
                 advisor_gate: None,
                 advisor_pause: None,
+                staging: None,
             },
             event_rx,
         )
@@ -3298,6 +4225,33 @@ output_key = "out_b"
         assert_eq!(files.len(), 2, "resume 运行有自己的 checkpoint 文件");
     }
 
+    /// 契约最终失败时，错误消息必须附「不合格产出摘要」——gate 判
+    /// REJECT 的场景里 manager 要能直接看到 REJECT 理由（jemalloc 现场：
+    /// 错误只有"缺少 VERDICT: PASS"，阻断原因被丢弃，manager 无从
+    /// 解释也无从修复，turn 以裸错误收场）。
+    #[tokio::test]
+    async fn contract_failure_error_includes_output_excerpt() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT\n\n阻断原因：方案违反红线 XYZ-001",
+            )))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let wf = three_step_wf();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect_err("step b 契约不可能通过，必须失败");
+        assert!(err.contains("产出契约校验失败"), "保留校验失败措辞: {err}");
+        assert!(
+            err.contains("阻断原因：方案违反红线 XYZ-001"),
+            "错误消息必须带被拦产出的摘要（REJECT 理由）: {err}"
+        );
+    }
+
     /// resume DAG：depends_on 链 a→b→c，同样在第 2 步失败后续跑，
     /// 验证 DAG 引擎的跳过与 outputs 预填。
     #[tokio::test]
@@ -3404,6 +4358,157 @@ depends_on = ["b"]
             err.contains("belongs to workflow 'other_wf'"),
             "got: {err}"
         );
+    }
+
+    /// DAG loop_until 端到端（jemalloc 事故回放）：gate 第一轮输出
+    /// REJECT → 跳回 design 重跑、下游 impl 一并作废重跑、design 的
+    /// prompt 带【上轮审查反馈】；第二轮 gate PASS → 放行。
+    #[tokio::test]
+    async fn dag_gate_reject_loops_back_and_passes() {
+        // 注意：本仓库 wiremock 0.6 实测为先挂载优先（FIFO），且各
+        // step 的判别子串必须互不重叠——gate 的 prompt 会内嵌上游
+        // 产出文本，用"实现"这类子串会误吸 gate 请求。
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_loop"
+[[steps]]
+id = "design"
+role = "worker"
+task = "产出设计稿 {{topic}}"
+output_key = "design"
+[[steps]]
+id = "impl"
+role = "worker"
+task = "编写实现 {{design}}"
+output_key = "impl"
+depends_on = ["design"]
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{impl}}"
+output_key = "verdict"
+depends_on = ["impl"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "design"
+max_iterations = 3
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("DAG loop_until 应通过校验");
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出设计稿"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("设计产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("编写实现"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("实现产出")))
+            .mount(&server)
+            .await;
+        // FIFO：先挂 REJECT（仅 1 次），第一次放行判定命中它，耗尽后
+        // 落回下面挂载的 PASS。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT 有阻断问题",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: PASS 终审通过",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let out = run_workflow(&wf, "主题", &ctx).await.expect("第二轮 PASS 应放行");
+        assert_eq!(out, "VERDICT: PASS 终审通过");
+
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let design_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("产出设计稿")).collect();
+        assert_eq!(design_reqs.len(), 2, "design 应重跑一次: {}", design_reqs.len());
+        assert!(
+            design_reqs[1].contains("【上轮审查反馈】")
+                && design_reqs[1].contains("VERDICT: REJECT"),
+            "重跑的 design prompt 必须带返工反馈: {}",
+            design_reqs[1]
+        );
+        let impl_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("编写实现")).collect();
+        assert_eq!(impl_reqs.len(), 2, "下游 impl 应随返工作废重跑: {}", impl_reqs.len());
+        let gate_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("放行判定")).collect();
+        assert_eq!(gate_reqs.len(), 2, "gate 应跑两轮: {}", gate_reqs.len());
+    }
+
+    /// DAG loop_until 迭代耗尽：gate 永远 REJECT，max_iterations=2 →
+    /// 第二轮仍未满足即 failed，错误消息带循环条件与迭代次数（不再
+    /// 是「契约校验失败」这种误导性措辞）。
+    #[tokio::test]
+    async fn dag_loop_until_exhausted_fails() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_loop_exhaust"
+[[steps]]
+id = "design"
+role = "worker"
+task = "产出设计稿 {{topic}}"
+output_key = "design"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{design}}"
+output_key = "verdict"
+depends_on = ["design"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "design"
+max_iterations = 2
+"#,
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出设计稿"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("设计产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT 仍有阻断",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("迭代耗尽必须失败");
+        assert!(err.contains("循环条件"), "应报循环条件未满足: {err}");
+        assert!(err.contains("max_iterations=2"), "应带迭代上限: {err}");
+
+        let requests = server.received_requests().await.unwrap();
+        let gate_reqs = requests
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("放行判定"))
+            .count();
+        assert_eq!(gate_reqs, 2, "gate 跑满 2 轮才判死: {gate_reqs}");
     }
 
     /// output_from 端到端：子 workflow 末步是评审 verdict，父级用
@@ -3554,7 +4659,7 @@ mod loop_tests {
     use super::*;
     use crate::config::{ModelCatalog, ModelDef};
     use crate::role::RoleTemplate;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
     fn openai_body(content: &str) -> String {
@@ -3594,6 +4699,7 @@ mod loop_tests {
             ("reviewer".to_string(), role("reviewer")),
         ]);
         Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -3634,6 +4740,7 @@ mod loop_tests {
                 session_id: None,
                 advisor_gate: None,
                 advisor_pause: None,
+                staging: None,
             },
             event_rx,
         )
@@ -3686,7 +4793,7 @@ output_key = "quality"
         // 首次审查（只生效一次）→ FAIL。
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("审查规格"))
+            .and(wiremock::matchers::body_string_contains("审查规格"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
                 "VERDICT: FAIL\nGAPS: 缺少边界测试",
             )))
@@ -3696,7 +4803,7 @@ output_key = "quality"
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("审查规格"))
+            .and(wiremock::matchers::body_string_contains("审查规格"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
                 "VERDICT: PASS\nEVIDENCE: 逐条核对全部通过",
             )))
@@ -3754,7 +4861,7 @@ output_key = "quality"
         // 审查恒 FAIL（先挂具体 mock，兜底最后）。
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("审查规格"))
+            .and(wiremock::matchers::body_string_contains("审查规格"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
                 "VERDICT: FAIL\nGAPS: 缺少边界测试",
             )))
@@ -3832,8 +4939,10 @@ loop_until = "VERDICT: PASS"
 "#,
         )
         .unwrap();
-        let err = wf.validate().expect_err("DAG 中的 loop_until 必须报错");
-        assert!(err.contains("串行"), "got: {err}");
+        // DAG 支持 loop_until 后，缺省 loop_back_to（= 自己）属同 wave
+        // 自环，仍必须报错——但措辞是 wave 约束而非「仅串行」。
+        let err = wf.validate().expect_err("DAG 同 wave 自环必须报错");
+        assert!(err.contains("严格更早的 wave"), "got: {err}");
     }
 
     /// validate：loop_until 与嵌套 workflow 互斥 → 报错。

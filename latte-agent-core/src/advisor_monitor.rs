@@ -41,8 +41,53 @@ const MAX_ENTRY_CHARS: usize = 6_000;
 /// monitor loop experiences when the advisor model is slow; the main
 /// session is unaffected either way.
 const REVIEW_TIMEOUT_SECS: u64 = 120;
+/// Char budget for the specialist response inside the delegate-return
+/// review prompt (~8K tokens at the 4-chars-per-token heuristic).
+/// Sized to fit real specialist reports whole (observed: 25.5K chars).
+const DELEGATE_REVIEW_RESPONSE_MAX_CHARS: usize = 32_000;
+
+/// 默认 delegate-return 审查超时（秒）。jemalloc 实锤：慢速审查模型
+/// （MiniMax-M3 单次 20–44s）在 45s 预算下频繁「未审直接放行」，
+/// 审查形同虚设；放宽到 90s 覆盖慢模型的 p95。
+pub const DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS: u64 = 90;
+/// 默认返回重做上限（次）。硬上限见 [`MAX_RETURN_REDO`]。
+pub const DEFAULT_RETURN_MAX_REDO: u8 = 1;
+/// 返回重做上限的硬天花板：防 intervene 判定抖动导致流水线空转。
+pub const MAX_RETURN_REDO: u8 = 3;
 
 // ─── Configuration ─────────────────────────────────────────────────
+
+/// delegate-return 审查与重做的可调参数，挂在
+/// [`AdvisorMonitorConfig`] 上随 engine / workflow ctx 下发。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct AdvisorReviewSettings {
+    /// `gate_delegate_return` 单次审查超时（秒）。超时/失败都降级
+    /// 放行（未审直接通过），所以这里是「审查值多少钱」的预算。
+    #[serde(default = "default_delegate_review_timeout_secs")]
+    pub delegate_review_timeout_secs: u64,
+    /// workflow speaker 返回被判 intervene/terminate 时的重做上限
+    /// （每次重做都是全新 subagent）。默认 1，硬上限
+    /// [`MAX_RETURN_REDO`]。
+    #[serde(default = "default_return_max_redo")]
+    pub return_max_redo: u8,
+}
+
+impl Default for AdvisorReviewSettings {
+    fn default() -> Self {
+        Self {
+            delegate_review_timeout_secs: DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS,
+            return_max_redo: DEFAULT_RETURN_MAX_REDO,
+        }
+    }
+}
+
+fn default_delegate_review_timeout_secs() -> u64 {
+    DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS
+}
+
+fn default_return_max_redo() -> u8 {
+    DEFAULT_RETURN_MAX_REDO
+}
 
 /// When the LLM review runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,6 +127,11 @@ pub struct AdvisorMonitorConfig {
     /// `AgentError::AdvisorTerminated` 终止本 turn。
     #[serde(default)]
     pub gate: GateConfig,
+    /// delegate-return 审查超时与返回重做上限（jemalloc 实锤：45s
+    /// 硬编码超时让慢审查模型频繁「未审直接放行」；重做上限此前是
+    /// workflow.rs 里的硬编码常量）。
+    #[serde(default)]
+    pub review_settings: AdvisorReviewSettings,
 }
 
 impl Default for AdvisorMonitorConfig {
@@ -93,6 +143,7 @@ impl Default for AdvisorMonitorConfig {
             review_window_secs: default_review_window_secs(),
             watchdog_notes: true,
             gate: GateConfig::default(),
+            review_settings: AdvisorReviewSettings::default(),
         }
     }
 }
@@ -105,17 +156,27 @@ impl AdvisorMonitorConfig {
     /// 给 driver 构建 runner 时使用的 gate 配置。advisor 未启用时
     /// 返回 `None`——runner 不带 gate，`run_turn_gated` 退化为
     /// `run_turn`（不影响未启用 advisor 的场景）。
+    /// `review_settings` 在此注入 gate 副本，随 `advisor_gate` 的
+    /// 既有 plumbing 流到各 advisor 审查 engine 的构建点。
     pub fn runner_gate(&self) -> Option<GateConfig> {
-        self.enabled.then(|| self.gate.clone())
+        self.enabled.then(|| {
+            let mut gate = self.gate.clone();
+            gate.review_settings = self.review_settings;
+            gate
+        })
     }
 }
 
-// ─── v3 pause gate（intervene 暂停门）───────────────────────────────
+// ─── v3 pause gate（intervene 暂停门，当前休眠）─────────────────────
 
-/// Intervene 暂停门：LLM 复审判 `Verdict::Intervene` 时，monitor 调
-/// `request()` 置位；runner 在 tool-round 边界（drain advisor hint
-/// 的同一位置）调 `wait_if_requested()` 挂起，直到用户拍板
-/// （`resolve()`，任何用户输入都算）或超时自动恢复。
+/// Intervene 暂停门（**当前休眠**）：v4 起 intervene 只注入纠正 hint
+/// 让 manager 自愈，monitor 不再调 `request()`，此门不会被置位。
+/// 结构与 runner 侧接线保留，以便未来需要时恢复暂停语义（在 monitor
+/// 的 intervene 分支重新调 `controller.request_pause()` 即可）。
+///
+/// 原始语义：monitor 调 `request()` 置位；runner 在 tool-round 边界
+/// （drain advisor hint 的同一位置）调 `wait_if_requested()` 挂起，
+/// 直到用户拍板（`resolve()`，任何用户输入都算）或超时自动恢复。
 /// 主 runner（driver 经 `AgentRunner::with_pause_gate`）与 delegate /
 /// workflow 专家 runner（controller.rs / workflow.rs 装配）都带这门；
 /// advisor 自身不带。注意门只在各 runner 的边界生效——in-flight 的
@@ -397,14 +458,17 @@ fn args_look_truncated(args: &str) -> bool {
     args.ends_with("B]") && args.contains("...[+")
 }
 
-/// 良性探测错误：路径不存在（ENOENT）。模型探索代码库时常按惯例
-/// 猜文件名（README.md / CONTRIBUTING.md）与目录列表同批发出，
-/// 猜错就报这个错，下一轮看到列表后自行纠正。这是探索的正常
-/// 成本而非「agent 失控」，D3 与 specialist streak 都不应计数。
-/// 匹配 `std::io::Error` 的 Display 文案（工具层原样透传，如
+/// 良性探测错误：探索期的自愈型失败，不等于「agent 失控」，D3 与
+/// specialist streak 都不应计数。两类：
+/// 1. 路径不存在（ENOENT）：模型按惯例猜文件名（README.md 等）与
+///    列目录同批发出，猜错即报，下一轮看到列表后自行纠正；
+/// 2. 行号越界（`start_line N exceeds file length M`）：模型拿着
+///    过期/估算的行号区间读文件（文件被并行修改后行号漂移），下
+///    一轮拿到正确范围后会自愈。
+/// 匹配工具层原样透传的错误文案（如
 /// `stat: No such file or directory (os error 2)`）。
 fn is_benign_probe_error(error: &str) -> bool {
-    error.contains("No such file or directory")
+    error.contains("No such file or directory") || error.contains("exceeds file length")
 }
 
 /// Char-boundary-safe truncation with the same marker format the
@@ -450,6 +514,12 @@ pub struct GateConfig {
     /// Gate 命中最多重试次数。超过则强制 pass + 落盘 +
     /// trace 上标记 GateForcePass，避免无限循环。
     pub max_retries: usize,
+    /// delegate-return 审查参数（超时 + 重做上限）。用户面配置在
+    /// `AdvisorMonitorConfig::review_settings`，`runner_gate()` 注入
+    /// 到这里随既有的 `advisor_gate` plumbing 下发到各 engine 构建
+    /// 点——不为它新拉一条参数链。
+    #[serde(default)]
+    pub review_settings: AdvisorReviewSettings,
 }
 
 impl Default for GateConfig {
@@ -465,6 +535,7 @@ impl Default for GateConfig {
                 "<delegate".to_string(),
             ],
             max_retries: 2,
+            review_settings: AdvisorReviewSettings::default(),
         }
     }
 }
@@ -772,6 +843,9 @@ pub struct AdvisorReviewEngine {
     /// （测试 / 未启用 persistence 的 caller）。由 UI server 在 spawn
     /// advisor monitor 前调 [`with_subsession_sink`] 注入。
     subsession_sink: Option<Arc<dyn crate::trace::TraceSink>>,
+    /// delegate-return 审查与重做参数（超时 + 重做上限），来自
+    /// `AdvisorMonitorConfig::review_settings`；未注入时用默认值。
+    review_settings: AdvisorReviewSettings,
 }
 
 impl AdvisorReviewEngine {
@@ -787,7 +861,24 @@ impl AdvisorReviewEngine {
             session_cwd: None,
             watchdog_notes: true,
             subsession_sink: None,
+            review_settings: AdvisorReviewSettings::default(),
         }
+    }
+
+    /// 注入 delegate-return 审查参数（`AdvisorMonitorConfig::review_settings`）。
+    pub fn with_review_settings(mut self, settings: AdvisorReviewSettings) -> Self {
+        self.review_settings = settings;
+        self
+    }
+
+    /// delegate-return 单次审查的超时预算。
+    pub fn delegate_review_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.review_settings.delegate_review_timeout_secs)
+    }
+
+    /// 返回被判 intervene/terminate 时的重做上限（钳到硬上限内）。
+    pub fn return_max_redo(&self) -> u8 {
+        self.review_settings.return_max_redo.min(MAX_RETURN_REDO)
     }
 
     /// Point the engine at the session workspace for project-level
@@ -846,23 +937,40 @@ impl AdvisorReviewEngine {
             .first()
             .map(|m| m.model.id.clone())
             .unwrap_or_default();
-        // ── 落盘：调 LLM 前 emit ModelCall ──
+        // ── 落盘：调 LLM 后 emit ModelCall（真实时延 + finish_reason。
+        // 此前在调用前记 latency=0/finish=''，审查耗时与成败全黑盒）──
+        let started = std::time::Instant::now();
+        let completion = agent
+            .chat(&[sys, user], None, WaitPolicy::NoWait)
+            .await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let completion = match completion {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(sink) = self.subsession_sink.as_ref() {
+                    let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+                    sink.emit(crate::trace::TraceEvent::ModelCall {
+                        meta,
+                        model_id: model_id.clone(),
+                        params_json: serde_json::to_string(&self.default_params)
+                            .unwrap_or_default(),
+                        latency_ms,
+                        finish_reason: format!("error: {e}"),
+                    });
+                }
+                return Err(e);
+            }
+        };
         if let Some(sink) = self.subsession_sink.as_ref() {
             let meta = crate::trace::TraceMeta::now(0, "advisor", "");
             sink.emit(crate::trace::TraceEvent::ModelCall {
                 meta: meta.clone(),
                 model_id: model_id.clone(),
                 params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
-                latency_ms: 0,
-                finish_reason: String::new(),
+                latency_ms,
+                finish_reason: completion.stop_reason.clone(),
             });
-        }
-        let completion = agent
-            .chat(&[sys, user], None, WaitPolicy::NoWait)
-            .await?;
-        // ── 落盘：调 LLM 后 emit ModelRawOut（含 verdict 原始输出） ──
-        if let Some(sink) = self.subsession_sink.as_ref() {
-            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+            // ── 落盘：emit ModelRawOut（含 verdict 原始输出） ──
             sink.emit(crate::trace::TraceEvent::ModelRawOut {
                 meta,
                 raw_content: completion.content.clone(),
@@ -917,19 +1025,36 @@ impl AdvisorReviewEngine {
             .first()
             .map(|m| m.model.id.clone())
             .unwrap_or_default();
+        // 同 review()：真实时延 + finish_reason 在调用完成后记录。
+        let started = std::time::Instant::now();
+        let completion = agent.chat(&[sys, user], None, WaitPolicy::NoWait).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let completion = match completion {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(sink) = self.subsession_sink.as_ref() {
+                    let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+                    sink.emit(crate::trace::TraceEvent::ModelCall {
+                        meta,
+                        model_id,
+                        params_json: serde_json::to_string(&self.default_params)
+                            .unwrap_or_default(),
+                        latency_ms,
+                        finish_reason: format!("error: {e}"),
+                    });
+                }
+                return Err(e);
+            }
+        };
         if let Some(sink) = self.subsession_sink.as_ref() {
             let meta = crate::trace::TraceMeta::now(0, "advisor", "");
             sink.emit(crate::trace::TraceEvent::ModelCall {
-                meta,
+                meta: meta.clone(),
                 model_id,
                 params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
-                latency_ms: 0,
-                finish_reason: String::new(),
+                latency_ms,
+                finish_reason: completion.stop_reason.clone(),
             });
-        }
-        let completion = agent.chat(&[sys, user], None, WaitPolicy::NoWait).await?;
-        if let Some(sink) = self.subsession_sink.as_ref() {
-            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
             sink.emit(crate::trace::TraceEvent::ModelRawOut {
                 meta,
                 raw_content: completion.content.clone(),
@@ -1041,10 +1166,25 @@ fn build_delegate_review_prompt(
     response: &str,
 ) -> String {
     // Bound the injected sections so a huge system prompt / response
-    // doesn't blow the review context.
+    // doesn't blow the review context. The response is the core
+    // evidence of this review: 6K chars truncates typical specialist
+    // reports (the observed case: 25.5K chars) to their first quarter
+    // and the reviewer ends up judging deliverables it can't see, so
+    // it gets a larger dedicated budget (~8K tokens); when even that
+    // is exceeded, the truncation note tells the reviewer to judge
+    // only what is visible.
     let duties = truncate_chars(role_responsibilities, 2_000);
     let task_s = truncate_chars(task, 1_500);
-    let resp_s = truncate_chars(response, 6_000);
+    let resp_s = truncate_chars(response, DELEGATE_REVIEW_RESPONSE_MAX_CHARS);
+    let truncation_note = if resp_s.len() < response.len() {
+        format!(
+            "\n（注意：结果共 {} 字符，超出审查预算被截断，上面只看到前 {} 字符。请仅依据可见内容裁决，不要臆测被截断部分。）",
+            response.len(),
+            resp_s.len()
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"# 委派返回审查任务
 
@@ -1065,7 +1205,7 @@ fn build_delegate_review_prompt(
 <response>
 {resp_s}
 </response>
-
+{truncation_note}
 逐项检查：
 1. **偏离职责 / 越权**：是否做了超出「{role_id}」职责范围的事，或没有以该角色应有的专业方式完成（比如让 reviewer 去写实现、让 programmer 只空谈不给代码）。
 2. **答非所问 / 未达结果**：返回是否真正回答了委派任务、产出了任务预期的结果——有无跑题、空泛套话、遗漏关键要求，或声称完成但实际没做（幻觉式交付）。
@@ -1558,65 +1698,20 @@ impl AdvisorMonitor {
                     sub_id: None,
                 });
 
-                if verdict.verdict == Verdict::Intervene {
-                    // v3 pause gate：不止气泡+hint——置位暂停门，
-                    // watched role 的主 runner 会在下一个 tool-round
-                    // 边界挂起；同时弹选择窗请用户拍板。用户的选择
-                    // 作为下一条普通用户消息回传（无结构化回答通道），
-                    // controller 在任何用户输入到达时 resolve；
-                    // 命中"终止"类关键词还会 cancel_turn。
-                    //
-                    // 去重：上一次介入暂停还没拍板时，不再重复置门+
-                    // 弹窗（级联失败等场景会连发 intervene——日志事故：
-                    // 嵌套 workflow 失败 10 秒内连弹两个暂停，用户点
-                    // 「继续」立刻又被暂停）。气泡与纠正 hint 前面已
-                    // 照常发出，信息量不丢。
-                    if controller.pause_requested() {
-                        continue;
-                    }
-                    controller.request_pause();
-                    let micros = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_micros())
-                        .unwrap_or(0);
-                    let _ = bubble_tx.send(ChatEvent::ChoiceRequested {
-                        role_id: "advisor".to_string(),
-                        choice_id: format!("advisor-pause-{micros}"),
-                        question: format!(
-                            "🦉 advisor 介入：{reason}。继续执行还是终止本轮？"
-                        ),
-                        multi: false,
-                        layout: String::new(),
-                        allow_upload: false,
-                        options: vec![
-                            crate::controller::ChoiceOption {
-                                label: "继续".to_string(),
-                                description:
-                                    "advisor 的纠正提示已注入，manager 继续执行"
-                                        .to_string(),
-                                image: String::new(),
-                                recommended: true,
-                            },
-                            crate::controller::ChoiceOption {
-                                label: "终止本轮".to_string(),
-                                description:
-                                    "取消 manager 当前 turn，回到等待输入"
-                                        .to_string(),
-                                image: String::new(),
-                                recommended: false,
-                            },
-                        ],
-                    });
-                    let _ = bubble_tx.send(ChatEvent::Status {
-                        // 请求 ≠ 已暂停：门只在各 runner 的 tool-round 边界
-                        // 生效，in-flight 的模型调用/工具执行跑完才挂起；
-                        // manager 若阻塞在长 workflow/delegate 调用里，
-                        // 在其返回前不会有任何边界。文案如实告知，避免
-                        // 「显示已暂停但子任务还在跑」的假象。
-                        message: "⏸ advisor 已请求暂停：进行中的模型调用/工具不会被打断，manager 与专家会在各自下一个执行边界挂起。等待用户拍板（继续 / 终止本轮）"
-                            .to_string(),
-                    });
-                }
+                // v4 行为变更（用户拍板）：`Verdict::Intervene` = **纠正并
+                // 继续**，不再置位暂停门/弹拍板窗。气泡与纠正 hint 已在
+                // 上面发出并注入 manager 的 hint 队列，manager 在下一个
+                // tool-round 边界 drain 到 hint 后自行纠偏，主会话全程
+                // 不停。保留暂停能力的唯一路径是「模型不可用」
+                // （agent.rs `pause_wait_model_unavailable`，走
+                // AgentPauseGate，与本 monitor 无关）。
+                //
+                // 历史：v3 曾在此 `request_pause()` + ChoiceRequested
+                // 等用户拍板。实践中 advisor 的 intervene 多次打在健康
+                // 运行上（良性工具报错、gate 按设计拒绝等），每次误停
+                // 都要人工解锁，代价远大于收益，故移除。AdvisorPauseGate
+                // 结构与 runner 侧接线保留（休眠），如需恢复暂停语义
+                // 只需在此重新调 request_pause()。
 
                 if verdict.verdict == Verdict::Terminate {
                     // 让 manager 真正停下来：取消当前 in-flight turn。
@@ -1750,7 +1845,7 @@ mod tests {
     fn specialist_error(role: &str) -> ChatEvent {
         ChatEvent::ToolError {
             role_id: role.into(),
-            tool_name: "file.read".into(),
+            tool_name: "read".into(),
             error: "permission denied (os error 13)".into(),
         }
     }
@@ -1773,7 +1868,7 @@ mod tests {
         s.observe(&specialist_error("programmer"));
         s.observe(&ChatEvent::ToolResult {
             role_id: "programmer".into(),
-            tool_name: "file.read".into(),
+            tool_name: "read".into(),
             result: "ok".into(),
         });
         // streak 被重置，单个错误不再触发
@@ -1783,12 +1878,31 @@ mod tests {
     #[test]
     fn watched_role_tool_error_still_hits_d3_not_specialist_path() {
         let mut s = state();
-        s.observe(&tool_error("file.read", "boom"));
-        let out = s.observe(&tool_error("file.read", "boom"));
+        s.observe(&tool_error("read", "boom"));
+        let out = s.observe(&tool_error("read", "boom"));
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
         // 走的是 watched-role 检测器，不污染 specialist streak
         assert_eq!(s.specialist_error_streak, 0);
+    }
+
+    // ── delegate 复审 prompt：response 预算与截断提示 ──────────────
+
+    #[test]
+    fn delegate_review_prompt_fits_typical_report_without_truncation() {
+        // 25K 字符的专家报告（本次事故的实际尺寸）应完整进入 prompt。
+        let report = "x".repeat(25_000);
+        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report);
+        assert!(p.contains(&report), "25K 报告不应被截断");
+        assert!(!p.contains("被截断"), "未截断时不应出现截断提示");
+    }
+
+    #[test]
+    fn delegate_review_prompt_notes_truncation_when_over_budget() {
+        let report = "x".repeat(DELEGATE_REVIEW_RESPONSE_MAX_CHARS + 10_000);
+        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report);
+        assert!(p.contains("被截断"), "超预算时必须显式告知复审模型");
+        assert!(p.contains("[+"), "保留截断标记");
     }
 
     // ── D3: 良性探测错误（ENOENT）豁免 ────────────────────────────
@@ -1797,14 +1911,28 @@ mod tests {
     // 全 session 暂停。探测性失败是正常探索成本，不应计数。
 
     const ENOENT: &str =
-        "Tool execution failed: file.read (attempt 1): stat: No such file or directory (os error 2)";
+        "Tool execution failed: read (attempt 1): stat: No such file or directory (os error 2)";
 
     #[test]
     fn d3_ignores_benign_enoent_probes() {
         let mut s = state();
-        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
-        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
-        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", ENOENT)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", ENOENT)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", ENOENT)).findings.is_empty());
+    }
+
+    #[test]
+    fn d3_ignores_stale_line_range_probes() {
+        // 过期行号越界读（真实事故：读 tcache.c:1660 但文件只有 1462
+        // 行，连续 4 次触发 D3 → advisor 暂停了健康会话）。与 ENOENT
+        // 同类豁免。
+        let mut s = state();
+        let e1 = "start_line 1660 exceeds file length 1462";
+        let e2 = "start_line 4920 exceeds file length 3459";
+        assert!(s.observe(&tool_error("read", e1)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", e1)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", e2)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", e2)).findings.is_empty());
     }
 
     #[test]
@@ -1813,7 +1941,7 @@ mod tests {
         // 真实错误 → ENOENT 探测 → 真实错误：streak 延续，第二个
         // 真实错误到达 ≥2 即触发。
         assert!(s.observe(&tool_error("bash", "exit code 1")).findings.is_empty());
-        assert!(s.observe(&tool_error("file.read", ENOENT)).findings.is_empty());
+        assert!(s.observe(&tool_error("read", ENOENT)).findings.is_empty());
         let out = s.observe(&tool_error("bash", "exit code 1"));
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
@@ -1824,7 +1952,7 @@ mod tests {
         let mut s = state();
         let enoent = || ChatEvent::ToolError {
             role_id: "programmer".into(),
-            tool_name: "file.read".into(),
+            tool_name: "read".into(),
             error: ENOENT.into(),
         };
         assert!(s.observe(&enoent()).findings.is_empty());
@@ -2256,6 +2384,7 @@ mod tests {
     /// template).
     fn advisor_config_at(base_url: &str) -> Arc<AgentConfig> {
         Arc::new(AgentConfig {
+            advisor: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Advisor Premium".into(),
@@ -2453,7 +2582,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_intervene_requests_pause_and_offers_choice() {
+    async fn monitor_intervene_corrects_without_pausing() {
+        // v4 行为（用户拍板）：intervene = 气泡 + 注入纠正 hint，
+        // 主会话继续跑——不置暂停门、不弹拍板窗、不发暂停 Status。
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -2483,152 +2614,53 @@ mod tests {
         tx.send(tool_error("exec", "boom1")).unwrap();
         tx.send(tool_error("exec", "boom2")).unwrap();
 
-        // 1. v3 pause gate：intervene 判出 → pause_requested 置位，
-        //    并广播 ChoiceRequested（继续=推荐 / 终止本轮）+ 暂停
-        //    Status。
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let (mut saw_choice, mut saw_status) = (false, false);
-            loop {
-                match bubble_rx.recv().await {
-                    Ok(ChatEvent::ChoiceRequested {
-                        role_id,
-                        question,
-                        multi,
-                        options,
-                        ..
-                    }) => {
-                        assert_eq!(role_id, "advisor");
-                        assert!(
-                            question.contains("继续执行还是终止本轮"),
-                            "question: {question}"
-                        );
-                        assert!(question.contains("方向可疑"), "reason in question");
-                        assert!(!multi);
-                        assert_eq!(options.len(), 2, "options: {options:?}");
-                        assert_eq!(options[0].label, "继续");
-                        assert!(options[0].recommended, "继续 is the recommended option");
-                        assert_eq!(options[1].label, "终止本轮");
-                        assert!(!options[1].recommended);
-                        saw_choice = true;
-                    }
-                    Ok(ChatEvent::Status { message }) if message.contains("等待用户拍板") => {
-                        saw_status = true;
-                    }
-                    Ok(_) => continue,
-                    Err(e) => panic!("event stream ended before pause events: {e}"),
-                }
-                if saw_choice && saw_status {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("ChoiceRequested + pause Status should arrive");
-
-        for _ in 0..100 {
-            if controller.pause_requested() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            controller.pause_requested(),
-            "intervene must set the pause gate"
-        );
-
-        // 2. 用户拍板（任何输入）→ 恢复。选择"终止本轮"还会软终止
-        //    当前 turn。
-        controller.submit_input("终止本轮").await;
-        assert!(!controller.pause_requested(), "user input resolves the pause");
-        assert!(
-            controller.turn_cancel_requested(),
-            "stop keyword also cancels the in-flight turn"
-        );
-    }
-
-    /// 上一次介入暂停未拍板时，新的 intervene 只发气泡+hint，不重复
-    /// 置门/弹窗（日志事故：嵌套 workflow 失败 10 秒内连弹两个暂停，
-    /// 用户点「继续」立刻又被暂停）。
-    #[tokio::test]
-    async fn monitor_second_intervene_while_pause_pending_skips_repause() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
-
-        let server = wiremock::MockServer::start().await;
-        server
-            .register(
-                Mock::given(method("POST"))
-                    .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                        "verdict: intervene\nreason: 方向可疑\nhint: 先停下来读报错",
-                    ))),
-            )
-            .await;
-
-        let controller = Arc::new(ChatController::new(64));
-        let mut bubble_rx = controller.subscribe();
-        let engine = engine_for(advisor_config_at(&server.uri()));
-        let _handle = AdvisorMonitor::spawn(
-            controller.clone(),
-            AdvisorMonitorConfig::default(),
-            engine,
-            "manager".into(),
-        );
-        let tx = controller.event_sender();
-
-        // 第一次介入：D3 两个连续工具错误。
-        tx.send(tool_error("exec", "boom1")).unwrap();
-        tx.send(tool_error("exec", "boom2")).unwrap();
-
-        // 等第一个 ChoiceRequested 到达。
+        // 1. intervene 气泡照常发出（含给 manager 的纠正提示）。
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match bubble_rx.recv().await {
-                    Ok(ChatEvent::ChoiceRequested { .. }) => break,
-                    Ok(_) => continue,
-                    Err(e) => panic!("event stream ended: {e}"),
-                }
-            }
-        })
-        .await
-        .expect("first ChoiceRequested should arrive");
-        assert!(controller.pause_requested());
-
-        // 未拍板期间第二次介入触发：workflow 失败。
-        tx.send(ChatEvent::WorkflowFinished {
-            name: "explore".into(),
-            wf_id: "wf-1".into(),
-            status: "failed".into(),
-            summary: "step failed".into(),
-        })
-        .unwrap();
-
-        // 应收到第二个 advisor 气泡（intervene 信息不丢），但不应再有
-        // 第二个 ChoiceRequested。气泡与弹窗在同一轮迭代内先后发出，
-        // 气泡到达后再等 200ms 无弹窗即可确认被去重。
-        let mut second_bubble = false;
-        let mut second_choice = false;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            match tokio::time::timeout(Duration::from_millis(200), bubble_rx.recv()).await {
-                Ok(Ok(ChatEvent::RoleTurn { role_id, content, .. }))
-                    if role_id == "advisor" && content.contains("intervene") =>
-                {
-                    second_bubble = true;
-                }
-                Ok(Ok(ChatEvent::ChoiceRequested { .. })) => second_choice = true,
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    if second_bubble {
+                    Ok(ChatEvent::RoleTurn {
+                        role_id, content, ..
+                    }) if role_id == "advisor" => {
+                        assert!(content.contains("intervene"), "bubble: {content}");
+                        assert!(content.contains("方向可疑"), "reason in bubble");
+                        assert!(content.contains("先停下来读报错"), "hint in bubble");
                         break;
                     }
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended before advisor bubble: {e}"),
                 }
             }
+        })
+        .await
+        .expect("advisor intervene bubble should arrive");
+
+        // 2. 纠正 hint 已注入共享队列（manager 下个边界 drain 后自愈）。
+        let queue = controller.advisor_hint_queue();
+        assert!(
+            queue.lock().iter().any(|h| h.contains("先停下来读报错")),
+            "intervene hint must be injected into the shared queue"
+        );
+
+        // 3. 不暂停、不弹窗：气泡到达后再等 300ms，确认无
+        //    ChoiceRequested / 暂停 Status，门始终未置位。
+        let mut saw_choice = false;
+        let mut saw_pause_status = false;
+        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), bubble_rx.recv()).await {
+                Ok(Ok(ChatEvent::ChoiceRequested { .. })) => saw_choice = true,
+                Ok(Ok(ChatEvent::Status { message })) if message.contains("等待用户拍板") => {
+                    saw_pause_status = true;
+                }
+                _ => {}
+            }
         }
-        assert!(second_bubble, "第二次 intervene 的气泡应照常发出");
-        assert!(!second_choice, "未拍板期间不应再弹 ChoiceRequested");
-        assert!(controller.pause_requested(), "原暂停门应保持置位");
+        assert!(!saw_choice, "v4: intervene 不再弹拍板窗");
+        assert!(!saw_pause_status, "v4: intervene 不再发暂停 Status");
+        assert!(
+            !controller.pause_requested(),
+            "v4: intervene 不置暂停门（纠正并继续）"
+        );
     }
 
     // ─── AdvisorPauseGate 单测 ─────────────────────────────────────
@@ -2814,6 +2846,7 @@ mod tests {
                 review_window_secs: 120,
                 watchdog_notes: false,
                 gate: GateConfig::default(),
+                review_settings: AdvisorReviewSettings::default(),
             },
             engine,
             "manager".into(),

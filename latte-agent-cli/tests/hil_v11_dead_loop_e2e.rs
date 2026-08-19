@@ -57,7 +57,7 @@ fn bin() -> PathBuf {
 /// Mock OpenAI chat/completions server. Returns the same canned
 /// `<tool_callwrite>{"path":"/tmp/x"}</tool_call></tool_callwrite>`
 /// body on every request. The tool name is `write` so it resolves
-/// to the registered `file.write` builtin; the args are missing
+/// to the registered `write` builtin; the args are missing
 /// the required `content` field, so the write tool returns an
 /// error, but the model still sees its own previous response in
 /// the next LLM call and emits the same call again. The
@@ -115,7 +115,7 @@ impl MockOpenAIServer {
                     }
                 }
                 // The same canned body on every call. The write tool
-                // is registered (file.write), the args are missing
+                // is registered (write), the args are missing
                 // the required `content` field so the tool errors
                 // out, but the model still sees the tool_error and
                 // emits the same call again. The in-run LoopDetector

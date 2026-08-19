@@ -39,27 +39,44 @@ output_key = "verdict"
 prompt = "终审这份实现规划：\n【拆解】{{plan}}\n【任务清单】{{tasks}}\n按裁决格式输出。重点：任务是否覆盖目标、粒度是否合理、依赖顺序是否正确、JSON 是否合法可导入。"
 
 # ── gate：终审门 ─────────────────────────────────────────────────
-# verdict 不通过（❌/changes-requested/阻断问题）→ 产出契约失败 →
-# 整个 workflow 以 failed 收场，manager 拿到错误（带 wf_id 可 resume），
-# 不会把有阻断问题的任务清单提交给用户导入看板。
-# 通过时原样带上任务清单，workflow 的最终产出仍是计划本身。
+# verdict 不通过（❌/changes-requested/阻断问题）→ gate 输出
+# VERDICT: REJECT → loop_until 不满足，自动跳回 breakdown 返工
+# （REJECT 原因作为【上轮审查反馈】预置进 architect 的 prompt），
+# 重拆 → 重生成清单 → 重审 → 重判，最多 max_iterations 轮；耗尽仍
+# REJECT 才以 failed 收场（带 wf_id 可 resume）。此前 REJECT 直接
+# 判死整个 workflow——评审尽职尽责找到真问题反而让 50 分钟流水线
+# 血本无归（jemalloc 实锤：B-1/B-2/B-3 三条实证阻断随 workflow
+# failed 被丢掉）。
+# ⚠️ 有条件通过 → PASS 但必须把条件/修正项随清单一并带上——否则
+# 修正项在 gate 被静默丢弃，带错的清单直接进看板（jemalloc 实锤：
+# 4 处 stats.c 行号实测错误随 VERDICT: PASS 被放行）。有实测错误
+# 且未吸收进清单时必须 REJECT。
 [[steps]]
 id = "gate"
-description = "终审门：verdict 不通过则 workflow 失败"
+description = "终审门：REJECT 自动返工，耗尽迭代才失败"
 speakers = ["reviewer"]
-max_retries = 0
+max_retries = 1
+# REJECT → 跳回 breakdown 重做（反馈随 prompt 注入），直到 PASS 或
+# 迭代耗尽。契约只卡格式（必须有 VERDICT: 标记），放行与否交给
+# loop_until——不能 require PASS，否则 REJECT 变成契约失败直接判死。
+loop_until = "VERDICT: PASS"
+loop_back_to = "breakdown"
+max_iterations = 3
 prompt = """根据以下终审结论判定放行与否：
 
 【终审结论】
 {{verdict}}
 
 规则：
-- 终审为 ✅ 通过 / ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后**原样完整附上**下面的任务清单（不得增删改任务）：
+- 终审为 ✅ 通过 → 第一行输出 `VERDICT: PASS`，然后**原样完整附上**下面的任务清单（不得增删改任务）：
 
 【任务清单】
 {{tasks}}
 
-- 终审为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句），**不要**附任务清单。"""
+- 终审为 ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后以「【通过条件/修正项】」为标题**原样附上终审列出的全部条件与修正项**（一条都不许丢），再原样完整附上任务清单。修正项必须随清单一并交付，禁止静默丢弃。
+- 终审（无论裁决为何）指出实测错误（行号/路径/事实核验不符）且这些修正未在任务清单中体现 → 必须输出 `VERDICT: REJECT`，理由列出未吸收的实测错误。
+- 终审为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句，写清每条阻断的 file:line 证据，返工要用），**不要**附任务清单。
+- 输出 REJECT 时，正文中不得再出现字符串「VERDICT: PASS」（会被循环条件误判为放行）。"""
 
 [steps.output_contract]
-require = ["VERDICT: PASS"]
+require = ["VERDICT:"]

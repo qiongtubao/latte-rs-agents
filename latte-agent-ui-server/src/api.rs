@@ -1734,6 +1734,7 @@ pub fn workflow_run_start(
             session_id: None,
             advisor_gate: None,
             advisor_pause: None,
+            staging: None,
         };
         let _ = run_workflow(&wf, &topic, &ctx).await;
         // engine 返回后丢掉 tx_inner 关闭内部 channel，forwarder 排空后退出。
@@ -1867,9 +1868,13 @@ async fn spawn_workflow_resume(
         // delegate / workflow 工具一致。
         subsession_store: Some(b.subsession_store.clone()),
         session_id: Some(session_id.to_string()),
-        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-            .runner_gate(),
+        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+            enabled: b.merged.read().advisor.enabled(),
+            ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+        }
+        .runner_gate(),
         advisor_pause: Some(controller.advisor_pause_gate()),
+        staging: None,
     };
     let wf_name = wf.name.clone();
     let resp_wf_id = wf_id.clone();
@@ -2097,6 +2102,62 @@ mod tests {
         reload_roles_from_disk_with(&b, &tmp.path().join("no-such-global"));
         // 磁盘两层都没有角色 → 内存配置原样保留
         assert!(b.merged.read().roles.contains_key("reload_ghost_9f3b"));
+    }
+
+    #[test]
+    fn advisor_put_writes_global_file_and_updates_merged() {
+        with_isolated_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().join("ws");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let b = test_backend(&cwd);
+
+            // 默认开、无 project 覆盖。
+            let s = get_advisor(&b);
+            assert!(s.enabled);
+            assert_eq!(s.project_override, None);
+
+            // PUT false → 全局文件落盘 + merged 同步。
+            let s = put_advisor(&b, false).expect("put false");
+            assert!(!s.enabled);
+            assert!(!b.merged.read().advisor.enabled());
+            let written = std::fs::read_to_string(&s.file).expect("advisor.toml written");
+            assert!(written.contains("[advisor]"), "{written}");
+            assert!(written.contains("enabled = false"), "{written}");
+            assert!(s.file.ends_with("agents.d/advisor.toml"), "{}", s.file);
+
+            // GET 回读一致；PUT true 恢复。
+            assert!(!get_advisor(&b).enabled);
+            let s = put_advisor(&b, true).expect("put true");
+            assert!(s.enabled);
+            assert!(b.merged.read().advisor.enabled());
+        });
+    }
+
+    #[test]
+    fn advisor_project_override_wins_over_global_put() {
+        with_isolated_home(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path().join("ws");
+            let agents = cwd.join(".latte/agents.d");
+            std::fs::create_dir_all(&agents).unwrap();
+            // project 层显式声明 enabled = true。
+            std::fs::write(
+                agents.join("advisor.toml"),
+                "[advisor]\nenabled = true\n",
+            )
+            .unwrap();
+            let b = test_backend(&cwd);
+
+            // PUT false 写全局层成功，但生效值仍以 project 为准。
+            let s = put_advisor(&b, false).expect("put false");
+            assert!(s.enabled, "project 覆盖时生效值不变");
+            assert_eq!(s.project_override, Some(true));
+            assert!(b.merged.read().advisor.enabled());
+            // 全局文件确实写了（等 project 覆盖移除后生效）。
+            let written = std::fs::read_to_string(&s.file).expect("advisor.toml written");
+            assert!(written.contains("enabled = false"), "{written}");
+        });
     }
 
     #[test]
@@ -3034,6 +3095,76 @@ pub fn put_role_toml(b: &UiBackend, role_id: &str, raw: &str) -> Result<(), ApiE
     }
     hot_reload_resolver(b);
     Ok(())
+}
+
+// ─── Advisor 全局开关 ────────────────────────────────────────────
+
+/// `GET /api/advisor` 的响应形状（PUT 复用同一形状回传最新状态）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdvisorState {
+    /// 生效值（project 层显式声明优先于全局层文件）。
+    pub enabled: bool,
+    /// project 层 `[advisor]` 显式声明的值。Some 时全局开关被它
+    /// 覆盖——UI 据此提示「本项目的配置覆盖了全局开关」。
+    pub project_override: Option<bool>,
+    /// 全局开关的持久化文件（PUT 的写入目标）。
+    pub file: String,
+}
+
+/// project 层 `[advisor] enabled` 显式声明（未声明/不可读 → None）。
+fn project_advisor_override(b: &UiBackend) -> Option<bool> {
+    let raw = std::path::PathBuf::from(&b.agents_config);
+    let p = if b.agents_config.trim().is_empty() {
+        b.cwd.join(".latte/agents.d")
+    } else if raw.is_absolute() {
+        raw
+    } else {
+        b.cwd.join(raw)
+    };
+    latte_agent_core::config::AgentConfig::load(p.to_str()?)
+        .ok()
+        .and_then(|c| c.advisor.enabled)
+}
+
+/// `GET /api/advisor` — advisor 全局开关状态。
+pub fn get_advisor(b: &UiBackend) -> AdvisorState {
+    AdvisorState {
+        enabled: b.merged.read().advisor.enabled(),
+        project_override: project_advisor_override(b),
+        file: global_agents_dir()
+            .join("advisor.toml")
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+/// `PUT /api/advisor` — 写全局层 `agents.d/advisor.toml` 并更新内存
+/// merged：新 session 立即生效，无需重启 server。project 层有显式
+/// 声明时生效值仍以 project 为准（经 project_override 回传给 UI）。
+pub fn put_advisor(b: &UiBackend, enabled: bool) -> Result<AdvisorState, ApiError> {
+    let path = global_agents_dir().join("advisor.toml");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    }
+    let raw = format!(
+        "# advisor 全局开关（UI 设置面板写入）。\n\
+         # 关闭后：事件流 monitor、D5/D6 产出门禁、delegate 返回审查\n\
+         # （含 workflow 审查重做）全部停用。项目层 .latte/agents*.toml\n\
+         # 如另有 [advisor] 声明，以项目层为准。\n\
+         [advisor]\n\
+         enabled = {enabled}\n"
+    );
+    std::fs::write(&path, raw)
+        .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+    let project_override = project_advisor_override(b);
+    let effective = project_override.unwrap_or(enabled);
+    b.merged.write().advisor.enabled = Some(effective);
+    Ok(AdvisorState {
+        enabled: effective,
+        project_override,
+        file: path.to_string_lossy().into_owned(),
+    })
 }
 
 // ─── Models TOML 源文件编辑 ──────────────────────────────────────

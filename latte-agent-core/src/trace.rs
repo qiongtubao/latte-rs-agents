@@ -172,6 +172,18 @@ impl TraceMeta {
             session_id: session_id.into(),
         }
     }
+
+    /// Same identity (turn/role/session) with the timestamp re-stamped
+    /// to now. Emit sites inside `run_turn` reuse one meta built at
+    /// turn start; without refreshing, every event of a long tool-loop
+    /// turn (specialist subsessions run 10+ minutes) shows the same
+    /// stale `ts`, making timeline reconstruction impossible.
+    pub fn refreshed(&self) -> Self {
+        Self {
+            ts: iso8601_utc_now(),
+            ..self.clone()
+        }
+    }
 }
 
 /// Format the current UTC time as `YYYY-MM-DDTHH:MM:SSZ`. Hand-rolled
@@ -1300,6 +1312,21 @@ mod tests {
         pub fn drain(&self) -> Vec<TraceEvent> {
             std::mem::take(&mut *self.0.lock())
         }
+    }
+
+    #[test]
+    fn refreshed_keeps_identity_and_restamps_ts() {
+        let meta = TraceMeta {
+            turn: 3,
+            role: "programmer".into(),
+            ts: "1970-01-01T00:00:00Z".into(),
+            session_id: "sid".into(),
+        };
+        let r = meta.refreshed();
+        assert_eq!(r.turn, 3);
+        assert_eq!(r.role, "programmer");
+        assert_eq!(r.session_id, "sid");
+        assert_ne!(r.ts, "1970-01-01T00:00:00Z", "ts 必须重打为当前时间");
     }
 
     #[test]

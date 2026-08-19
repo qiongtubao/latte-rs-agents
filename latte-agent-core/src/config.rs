@@ -152,6 +152,37 @@ pub struct AgentConfig {
     /// Role definitions.
     #[serde(default)]
     pub roles: HashMap<String, RoleTemplate>,
+    /// Advisor 总开关（`[advisor]` 段）。project 层覆盖 global 层。
+    #[serde(default)]
+    pub advisor: AdvisorSection,
+}
+
+/// `[advisor]` 配置段：advisor 监察的总开关。
+///
+/// 任意 agents 配置文件（project `.latte/agents*.toml`、`agents.d/*.toml`
+/// 或 global `~/.latte/agents.d/*.toml`）都可声明：
+///
+/// ```toml
+/// [advisor]
+/// enabled = false
+/// ```
+///
+/// `false` 关闭 advisor 的全部活动：事件流 monitor、D5/D6 产出门禁、
+/// delegate 返回审查（含 workflow 的审查重做）。模型不可达等降级路径
+/// 不受影响（本来就不审查）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdvisorSection {
+    /// 总开关（缺省 true）。`Option` 区分「未配置」与「显式 false」
+    /// ——分层合并时 project 层的 `Some` 覆盖 global 层。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+impl AdvisorSection {
+    /// 生效值：未配置 = 开。
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 /// Configuration for which hooks a role uses. Each variant selects a
@@ -253,6 +284,11 @@ impl AgentConfig {
         if let Some(path) = project_dir {
             if let Ok(part) = Self::load(&path) {
                 merged.roles.extend(part.roles);
+                // Advisor 开关：project 层声明了才覆盖（global 在后，
+                // 只填 project 没声明的空档）。
+                if part.advisor.enabled.is_some() {
+                    merged.advisor = part.advisor.clone();
+                }
                 for m in part.models.models {
                     if !merged.models.models.iter().any(|e| e.provider == m.provider && e.name == m.name) {
                         merged.models.models.push(m);
@@ -285,6 +321,10 @@ impl AgentConfig {
                     merge_models_or_insert(&mut merged.models.models, &global_part.models.models);
                     merge_tiers_or_insert(&mut merged.models.tiers, &global_part.models.tiers);
                     merge_role_tiers_or_insert(&mut merged.models.role_tiers, &global_part.models.role_tiers);
+                    // Advisor 开关：只填 project 未声明的空档（project 优先）。
+                    if merged.advisor.enabled.is_none() && global_part.advisor.enabled.is_some() {
+                        merged.advisor = global_part.advisor.clone();
+                    }
                 }
             }
         }
@@ -359,6 +399,11 @@ impl AgentConfig {
                 }
             }
             merged.roles.extend(part.roles);
+
+            // Advisor 开关：声明过的文件覆盖先前的（字母序后写赢）。
+            if part.advisor.enabled.is_some() {
+                merged.advisor = part.advisor.clone();
+            }
 
             // Models: append.
             merged.models.models.extend(part.models.models);
@@ -730,6 +775,57 @@ icon = "A"
             assert_eq!(cfg.roles["pm"].name, "PM_from_project");
             // Architect came from global.
             assert_eq!(cfg.roles["architect"].name, "Arch_from_global");
+        });
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn test_advisor_switch_parse_and_default() {
+        // 未声明 → 默认开。
+        let cfg = AgentConfig::parse("[roles.pm]\nid=\"pm\"\nname=\"P\"\ncategory=\"c\"\nmodel_tier=\"standard\"\n").unwrap();
+        assert!(cfg.advisor.enabled());
+        // 显式 false。
+        let cfg = AgentConfig::parse("[advisor]\nenabled = false\n").unwrap();
+        assert!(!cfg.advisor.enabled());
+        // 显式 true。
+        let cfg = AgentConfig::parse("[advisor]\nenabled = true\n").unwrap();
+        assert!(cfg.advisor.enabled());
+    }
+
+    #[test]
+    fn test_advisor_switch_project_overrides_global() {
+        let project = std::env::temp_dir().join("latte_agent_test_advisor_switch");
+        let _ = std::fs::remove_dir_all(&project);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pm.toml"),
+            "[advisor]\nenabled = false\n\n[roles.pm]\nid = \"pm\"\nname = \"P\"\ncategory = \"c\"\nmodel_tier = \"standard\"\n",
+        )
+        .unwrap();
+
+        with_latte_home(|home| {
+            let agents_dir = home.join("agents.d");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(agents_dir.join("advisor.toml"), "[advisor]\nenabled = true\n").unwrap();
+
+            // project false 覆盖 global true。
+            let cfg = AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            assert!(!cfg.advisor.enabled(), "project 层应覆盖 global 层");
+        });
+
+        // project 未声明 → global 生效（false 也能穿透）。
+        std::fs::write(
+            project.join("pm.toml"),
+            "[roles.pm]\nid = \"pm\"\nname = \"P\"\ncategory = \"c\"\nmodel_tier = \"standard\"\n",
+        )
+        .unwrap();
+        with_latte_home(|home| {
+            let agents_dir = home.join("agents.d");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(agents_dir.join("advisor.toml"), "[advisor]\nenabled = false\n").unwrap();
+
+            let cfg = AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            assert!(!cfg.advisor.enabled(), "project 未声明时 global 层应生效");
         });
         let _ = std::fs::remove_dir_all(&project);
     }
