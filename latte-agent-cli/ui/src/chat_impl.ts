@@ -217,6 +217,9 @@ export function mountChat(opts: {
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
   /** wf_id → pending badge element on the WorkflowStarted bubble. */
   const workflowStates = new Map<string, HTMLElement>();
+  /** wf_id → workflow 名（WorkflowStarted 时记录），用于给流程内
+   *  分派气泡打「🔀 工作流 <name>」标记。 */
+  const wfNames = new Map<string, string>();
   /** wf_id:step_id → pending badge element on WorkflowStep bubbles. */
   const stepStates = new Map<string, HTMLElement>();
   /** 当前流式渲染中的气泡（`RoleTurn{is_complete:false}` 增量追加到它）。
@@ -1927,10 +1930,14 @@ const stepMsgIds = new Map<string, string>();
       case "RoundEnded": addMessage({ kind: "system", content: `[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
       case "DelegateStarted": {
         const taskText = e.task.trim() || "(empty)";
-        // workflow 发起的分派：workflow 是固定流水线、不是角色，
-        // 不渲染角色头像——用无头像的 status 行（🔀 标记来源）。
-        const fromWorkflow = (e.from_role || "") === "workflow";
-        const delegateMsg = fromWorkflow
+        // workflow 流程内分派（wf_id 标记）：归属 manager 的气泡渲染，
+        // meta 上打「🔀 工作流 <name>」标记——workflow 默认由 manager
+        // 出面执行，不再显示为虚拟的 "workflow 分派" 来源。
+        // 旧日志回放（无 wf_id、from_role === "workflow"）仍走 status
+        // 行分支保持兼容。
+        const wfName = e.wf_id ? (wfNames.get(e.wf_id) ?? "workflow") : "";
+        const legacyWorkflow = !e.wf_id && (e.from_role || "") === "workflow";
+        const delegateMsg = legacyWorkflow
           ? addMessage({
               kind: "status",
               content: `@${e.to_role} ${taskText}`,
@@ -1941,7 +1948,7 @@ const stepMsgIds = new Map<string, string>();
           : addMessage({
               kind: "role",
               content: `@${e.to_role} ${taskText}`,
-              meta: e.from_role || "manager",
+              meta: wfName ? `manager · 🔀 ${wfName}` : (e.from_role || "manager"),
               icon: roleIcon(e.from_role || "manager"),
               subId: e.sub_id,
               filePath: getFilePath(e.to_role),
@@ -1975,6 +1982,7 @@ const stepMsgIds = new Map<string, string>();
       case "DelegateFinished": {
         delegateRunning = false;
         const fi = roleIcon(e.from_role), ti = roleIcon(e.to_role);
+        const wfTag = e.wf_id ? ` 🔀${wfNames.get(e.wf_id) ?? "workflow"}` : "";
         const label = `${fi} ${e.from_role} → ${ti} ${e.to_role}`;
         const isFail = e.status !== "ok";
         const kind = isFail ? "error" : "system";
@@ -1982,7 +1990,7 @@ const stepMsgIds = new Map<string, string>();
         const statusText = isFail ? `失败(${e.status})` : "ok";
         // summary 是专家返回/失败原因的正文，失败时尤其要看，拼进消息里。
         const summary = e.summary?.trim() ? `\n${truncate(e.summary, 300)}` : "";
-        const msg = addMessage({ kind, content: `${prefix} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})${summary}`, subId: e.sub_id });
+        const msg = addMessage({ kind, content: `${prefix}${wfTag} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})${summary}`, subId: e.sub_id });
         msg.appendChild(makeSubsessionBtn(e.sub_id, label));
         if (isFail) msg.classList.add("fail-flash");
         // Flip the pending badge on the DelegateStarted bubble.
@@ -2037,6 +2045,7 @@ const stepMsgIds = new Map<string, string>();
         });
         msg.querySelector(".msg-bubble")?.appendChild(pauseBtn);
         workflowStates.set(e.wf_id, stateEl);
+        wfNames.set(e.wf_id, e.name);
         setFooter(`workflow ${e.name} 运行中…`);
         resetWaitTimer();
         break;

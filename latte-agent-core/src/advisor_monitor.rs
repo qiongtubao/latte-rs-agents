@@ -1398,12 +1398,17 @@ impl MonitorState {
                     .push(format!("[tool_error] {tool_name} → {error}"));
                 findings.extend(self.detectors.observe_tool_error(tool_name, error));
             }
+            // wf_id.is_none() 守卫：workflow 流程内分派（from_role 也是
+            // manager，但带 wf_id 标记）不算 watched role 自己的委派决策
+            // —— D8 串行计数与路由评审不覆盖它们（返回审查由 workflow 引
+            // 擎的 gate_delegate_return 承担，避免双重审查）。
             ChatEvent::DelegateStarted {
                 from_role,
                 to_role,
                 task,
+                wf_id,
                 ..
-            } if from_role == &self.watched_role => {
+            } if from_role == &self.watched_role && wf_id.is_none() => {
                 self.transcript.push(format!(
                     "[delegate → {to_role}] {}",
                     truncate_chars(task, 500)
@@ -1434,8 +1439,9 @@ impl MonitorState {
                 to_role,
                 status,
                 summary,
+                wf_id,
                 ..
-            } if from_role == &self.watched_role => {
+            } if from_role == &self.watched_role && wf_id.is_none() => {
                 self.open_delegates = self.open_delegates.saturating_sub(1);
                 self.transcript.push(format!(
                     "[delegate {to_role} {status}] {}",
@@ -1802,6 +1808,7 @@ mod tests {
             to_role: to.into(),
             task: "task".into(),
             sub_id: format!("{to}-1"),
+            wf_id: None,
         }
     }
 
@@ -1812,6 +1819,7 @@ mod tests {
             status: "ok".into(),
             summary: "summary".into(),
             sub_id: format!("{to}-1"),
+            wf_id: None,
         }
     }
 

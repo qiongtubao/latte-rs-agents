@@ -1416,11 +1416,14 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         _ => (None, None),
     };
     if let Some(id) = &sub_id {
+        // from_role 统一归 manager：workflow 默认由 manager 出面执行，
+        // wf_id 标记「流程内分派」，UI 渲染为 manager 气泡 + 工作流徽章。
         let _ = inp.event_tx.send(ChatEvent::DelegateStarted {
-            from_role: "workflow".into(),
+            from_role: "manager".into(),
             to_role: speaker.clone(),
             task: inp.prompt.clone(),
             sub_id: id.clone(),
+            wf_id: Some(inp.wf_id.clone()),
         });
     }
 
@@ -1459,11 +1462,12 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                 // 气泡永远停在「⏳ 执行中…」。
                 if let Some(id) = &sub_id {
                     let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                        from_role: "workflow".into(),
+                        from_role: "manager".into(),
                         to_role: speaker.clone(),
                         status: "failed".into(),
                         summary: e.clone(),
                         sub_id: id.clone(),
+                        wf_id: Some(inp.wf_id.clone()),
                     });
                 }
                 return Err(StepFail::Failed(e));
@@ -1560,7 +1564,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     });
                     if let Some(id) = &sub_id {
                         let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                            from_role: "workflow".into(),
+                            from_role: "manager".into(),
                             to_role: speaker.clone(),
                             status: "timeout".into(),
                             summary: format!(
@@ -1568,6 +1572,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                                 inp.step_id, timeout_s
                             ),
                             sub_id: id.clone(),
+                            wf_id: Some(inp.wf_id.clone()),
                         });
                     }
                     attempt = Err(StepFail::Failed(format!(
@@ -1586,11 +1591,12 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                         });
                         if let Some(id) = &sub_id {
                             let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                                from_role: "workflow".into(),
+                                from_role: "manager".into(),
                                 to_role: speaker.clone(),
                                 status: "cancelled".into(),
                                 summary: "workflow step cancelled by user".into(),
                                 sub_id: id.clone(),
+                                wf_id: Some(inp.wf_id.clone()),
                             });
                         }
                         return Err(StepFail::Cancelled);
@@ -1657,11 +1663,12 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             });
             if let Some(id) = &sub_id {
                 let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                    from_role: "workflow".into(),
+                    from_role: "manager".into(),
                     to_role: speaker.clone(),
                     status: "ok".into(),
                     summary: response.clone(),
                     sub_id: id.clone(),
+                    wf_id: Some(inp.wf_id.clone()),
                 });
             }
         }
@@ -1688,11 +1695,12 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             });
             if let Some(id) = &sub_id {
                 let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                    from_role: "workflow".into(),
+                    from_role: "manager".into(),
                     to_role: speaker.clone(),
                     status: "failed".into(),
                     summary: msg.clone(),
                     sub_id: id.clone(),
+                    wf_id: Some(inp.wf_id.clone()),
                 });
             }
         }
@@ -3753,8 +3761,10 @@ task = "任务B：{{out_a}}"
         let mut sub_ids = std::collections::HashSet::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
-                ChatEvent::DelegateStarted { from_role, sub_id, .. } => {
-                    assert_eq!(from_role, "workflow");
+                ChatEvent::DelegateStarted { from_role, sub_id, wf_id, .. } => {
+                    // workflow 分派统一归属 manager，wf_id 标记「流程内」。
+                    assert_eq!(from_role, "manager");
+                    assert!(wf_id.is_some(), "workflow 分派必须带 wf_id 标记");
                     started += 1;
                     sub_ids.insert(sub_id);
                 }

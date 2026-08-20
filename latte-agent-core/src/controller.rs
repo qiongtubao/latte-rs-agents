@@ -322,6 +322,11 @@ pub enum ChatEvent {
         to_role: String,
         task: String,
         sub_id: String,
+        /// workflow 流程内分派时填 wf_id（None = 普通 chat 里 manager
+        /// delegate 工具发起）。UI 据此把分派归属 manager 并打上
+        /// 工作流标记；serde default 兼容旧 session jsonl 回放。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wf_id: Option<String>,
     },
     /// Specialist returned (or failed/timeout). `status` is one of
     /// `"ok" | "failed" | "timeout" | "cancelled"`. `summary` is the
@@ -336,6 +341,9 @@ pub enum ChatEvent {
         status: String,
         summary: String,
         sub_id: String,
+        /// 与 DelegateStarted.wf_id 一致：workflow 流程内分派的收尾。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wf_id: Option<String>,
     },
     ToolError {
         role_id: String,
@@ -3771,6 +3779,7 @@ async fn register_delegate_tool(
                 to_role: role_id.clone(),
                 task: task.clone(),
                 sub_id: sub_id.clone(),
+                wf_id: None,
             });
             // Fan out ONLY to the subsession memory sink: the
             // `sub_sink` is `Arc<dyn TraceSink>` returning from
@@ -3797,6 +3806,7 @@ async fn register_delegate_tool(
                             status: "failed".into(),
                             summary: summary.clone(),
                             sub_id: sub_id.clone(),
+                            wf_id: None,
                         });
                         return Err(tool_err(summary));
                     }
@@ -3816,6 +3826,7 @@ async fn register_delegate_tool(
                     status: "failed".into(),
                     summary: summary.clone(),
                     sub_id: sub_id.clone(),
+                    wf_id: None,
                 });
                 tool_err(summary)
             })?;
@@ -3949,6 +3960,7 @@ async fn register_delegate_tool(
                             status: "timeout".into(),
                             summary: summary.clone(),
                             sub_id: sub_id.clone(),
+                            wf_id: None,
                         });
                         return Err(tool_err(summary));
                     }
@@ -3967,6 +3979,7 @@ async fn register_delegate_tool(
                                 status: "cancelled".into(),
                                 summary: summary.clone(),
                                 sub_id: sub_id.clone(),
+                                wf_id: None,
                             });
                             return Err(tool_err(summary));
                         }
@@ -3984,6 +3997,7 @@ async fn register_delegate_tool(
                                 status: "cancelled".into(),
                                 summary: summary.clone(),
                                 sub_id: sub_id.clone(),
+                                wf_id: None,
                             });
                             return Err(tool_err(summary));
                         }
@@ -4069,6 +4083,7 @@ async fn register_delegate_tool(
                         status: "ok".into(),
                         summary: response.clone(),
                         sub_id: sub_id.clone(),
+                        wf_id: None,
                     });
                     Ok(serde_json::Value::String(response))
                 }
@@ -4080,6 +4095,7 @@ async fn register_delegate_tool(
                         status: "failed".into(),
                         summary: summary.clone(),
                         sub_id: sub_id.clone(),
+                        wf_id: None,
                     });
                     Err(tool_err(summary))
                 }
@@ -4738,6 +4754,7 @@ mod tests {
             to_role: "programmer".into(),
             task: "read the project structure".into(),
             sub_id: "programmer-sub-1".into(),
+            wf_id: None,
         };
         let json = serde_json::to_value(&event).expect("serialize");
         // PascalCase variant tag → must match the TS discriminated
@@ -4761,6 +4778,7 @@ mod tests {
             status: "ok".into(),
             summary: "found 3 files".into(),
             sub_id: "programmer-sub-1".into(),
+            wf_id: None,
         };
         let json = serde_json::to_value(&event).expect("serialize");
         assert!(json.get("DelegateFinished").is_some(), "missing variant tag");
@@ -5568,6 +5586,7 @@ mod tests {
             status: "failed".into(),
             summary: "delegate to 'programmer' failed: model unavailable".into(),
             sub_id: "programmer-sub-2".into(),
+            wf_id: None,
         };
         let json = serde_json::to_value(&failed).unwrap();
         assert_eq!(json["DelegateFinished"]["status"], "failed");
@@ -5579,6 +5598,7 @@ mod tests {
             status: "timeout".into(),
             summary: "delegate to 'programmer' timed out after 60s".into(),
             sub_id: "programmer-sub-3".into(),
+            wf_id: None,
         };
         let json = serde_json::to_value(&timed_out).unwrap();
         assert_eq!(json["DelegateFinished"]["status"], "timeout");
@@ -5598,6 +5618,7 @@ mod tests {
             to_role: "programmer".into(),
             task: "ping".into(),
             sub_id: "programmer-sub-4".into(),
+            wf_id: None,
         };
         let wrapped = serde_json::json!({
             "workspaceId": "ws-1",
@@ -5606,7 +5627,7 @@ mod tests {
         let parsed: ChatEvent =
             serde_json::from_value(wrapped["event"].clone()).expect("parse");
         match parsed {
-            ChatEvent::DelegateStarted { from_role, to_role, task, sub_id } => {
+            ChatEvent::DelegateStarted { from_role, to_role, task, sub_id, .. } => {
                 assert_eq!(from_role, "manager");
                 assert_eq!(to_role, "programmer");
                 assert_eq!(task, "ping");

@@ -195,8 +195,8 @@ export type ChatEvent =
       wait?: boolean;
       options: ChoiceOption[];
     }
-  | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
-  | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
+  | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string; wf_id?: string | null }
+  | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string; wf_id?: string | null }
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
   | { type: "WorkflowStep"; wf_id: string; step_id: string; description: string; index: number; total: number; role_id: string; task: string }
   | { type: "WorkflowTurn"; wf_id: string; step_id: string; role_id: string; content: string; round: number }
