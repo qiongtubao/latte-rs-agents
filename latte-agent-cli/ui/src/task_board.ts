@@ -10,7 +10,7 @@
 // 动作，其余进右侧详情抽屉。
 import {
   listTasks, createTask, updateTask, dispatchTask, abortTask,
-  dispatchReady, listWorkflows,
+  dispatchReady, listWorkflows, refineTask, setRefineParent,
 } from "./api";
 import type { TaskView, TaskState, WorkflowSummary, DispatchReadyResponse } from "./api";
 
@@ -56,11 +56,13 @@ export const STATE_ACTIONS: Record<string, TaskAction[]> = {
   ],
   todo: [
     { key: "run_now", label: "▶ 立即执行", kind: "primary" },
+    { key: "refine", label: "✂ 拆分子任务", kind: "ghost" },
     { key: "schedule", label: "🕐 指定时间执行", kind: "ghost" },
     { key: "to_backlog", label: "移回 Backlog", kind: "ghost" },
   ],
   todo_scheduled: [
     { key: "run_now", label: "▶ 立即执行", kind: "primary" },
+    { key: "refine", label: "✂ 拆分子任务", kind: "ghost" },
     { key: "schedule", label: "修改时间", kind: "ghost" },
     { key: "unschedule", label: "取消排期", kind: "ghost" },
   ],
@@ -115,8 +117,8 @@ export function lastSessionId(task: Pick<TaskView, "runs">): string | null {
   return last ? last.session_id : null;
 }
 
-/** 动作 key → 后端调用。schedule / edit / open_session 在前端处理，
- * 不走这里（返回 null 表示需要 UI 介入）。 */
+/** 动作 key → 后端调用。schedule / edit / open_session / refine 在前端
+ * 处理，不走这里（返回 null 表示需要 UI 介入）。 */
 export function actionRequest(
   key: string,
   taskId: string,
@@ -454,6 +456,20 @@ export function mountTaskBoard(opts: {
     if (key === "open_session") {
       const sid = lastSessionId(task);
       if (sid) onOpenSession(sid);
+      return;
+    }
+    if (key === "refine") {
+      // 拆分子任务：新建 session 跑 task_refine workflow，跳过去看
+      // 拆分过程；plan 弹窗导入时凭 refineParent 映射挂为该任务的子任务。
+      if (task.parent_id) { toast("子任务不能再拆（只支持一层父子）"); return; }
+      try {
+        const resp = await refineTask(task.id);
+        setRefineParent(resp.session_id, task.id);
+        toast(`${task.id} 已创建拆分会话，等待子任务清单`);
+        onOpenSession(resp.session_id);
+      } catch (e) {
+        toast(`拆分失败: ${(e as Error).message}`);
+      }
       return;
     }
     const req = actionRequest(key, task.id);

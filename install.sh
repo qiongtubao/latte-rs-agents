@@ -12,7 +12,7 @@
 # What this installs:
 #   ~/.latte/
 #   ├── models.toml          # model catalog with tier mappings
-#   ├── agents.d/            # one file per role (11 roles)
+#   ├── agents.d/            # one file per role (12 roles)
 #   │   ├── pm.toml
 #   │   ├── architect.toml
 #   │   ├── programmer.toml
@@ -213,6 +213,7 @@ install_file "$SOURCE_DIR/agents/designer.toml"      "$TARGET_DIR/agents.d/desig
 install_file "$SOURCE_DIR/agents/devops.toml"        "$TARGET_DIR/agents.d/devops.toml"        "DevOps role"
 install_file "$SOURCE_DIR/agents/tech_writer.toml"   "$TARGET_DIR/agents.d/tech_writer.toml"   "Tech Writer role"
 install_file "$SOURCE_DIR/agents/manager.toml"       "$TARGET_DIR/agents.d/manager.toml"       "Manager role"
+install_file "$SOURCE_DIR/agents/task_planner.toml"  "$TARGET_DIR/agents.d/task_planner.toml"  "Task Planner role"
 install_file "$SOURCE_DIR/agents/advisor.toml"       "$TARGET_DIR/agents.d/advisor.toml"       "Advisor role"
 
 # Install workflow configs (one per file, glob — 新增 workflow 自动纳入)

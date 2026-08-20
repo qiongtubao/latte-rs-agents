@@ -11,8 +11,10 @@ export interface ChatTransport {
   /** 同 request，但返回原始文本（不 JSON.parse）。用于 TOML 等纯文本内容。 */
   requestText(method: string, path: string, body?: unknown): Promise<string>;
   /** Subscribe to the chat event stream of a session. Returns an
-   * unsubscribe function. */
-  subscribeEvents(sessionId: string, onEvent: (ev: ChatEvent) => void): () => void;
+   * unsubscribe function. `onResync` 在事件流可能漏事件时触发
+   * （服务端广播 lag 通知 / 看门狗判定半开重建前）——调用方应拉
+   * 权威历史重放补齐。 */
+  subscribeEvents(sessionId: string, onEvent: (ev: ChatEvent) => void, onResync?: () => void): () => void;
   subscribeSelfLoop(onEvent: (ev: SelfLoopEvent) => void): () => void;
   onConnectionStatus?: (status: "connected" | "disconnected") => void;
 }
@@ -81,22 +83,76 @@ export class HttpSseTransport implements ChatTransport {
     }
   }
 
-  subscribeEvents(sessionId: string, onEvent: (ev: ChatEvent) => void): () => void {
-    const es = new EventSource(`/api/events?id=${encodeURIComponent(sessionId)}`);
-    es.addEventListener("chat_event", (e) => {
-      try {
-        const data = JSON.parse((e as MessageEvent).data) as ChatEvent;
-        onEvent(data);
-      } catch (err) {
-        console.error("[sse] failed to parse chat_event", err, e);
+  subscribeEvents(sessionId: string, onEvent: (ev: ChatEvent) => void, onResync?: () => void): () => void {
+    const url = `/api/events?id=${encodeURIComponent(sessionId)}`;
+    let es: EventSource | null = null;
+    let closed = false;
+    let lastEventAt = Date.now();
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const connect = (): void => {
+      if (closed) return;
+      lastEventAt = Date.now();
+      es = new EventSource(url);
+      es.addEventListener("chat_event", (e) => {
+        lastEventAt = Date.now();
+        try {
+          const data = JSON.parse((e as MessageEvent).data) as ChatEvent;
+          onEvent(data);
+        } catch (err) {
+          console.error("[sse] failed to parse chat_event", err, e);
+        }
+      });
+      // 服务端每 15s 的 ping（真实 SSE 事件；keep-alive 注释对 JS
+      // 不可见，看门狗只能靠真实事件判断连接还活着）。
+      es.addEventListener("ping", () => {
+        lastEventAt = Date.now();
+      });
+      es.addEventListener("open", () => {
+        lastEventAt = Date.now();
+        this.onConnectionStatus?.("connected");
+      });
+      es.addEventListener("error", (e) => {
+        // 服务端广播 lag 通知是带 data 的 MessageEvent：连接没断但
+        // 中间可能丢事件——触发全量重放补齐，不要断开。
+        if ((e as MessageEvent).data !== undefined) {
+          lastEventAt = Date.now();
+          onResync?.();
+          return;
+        }
+        // 连接错误：close 后 EventSource 不再自动重连，3s 后重建并
+        // 重放补齐断开期间的事件。
+        es?.close();
+        es = null;
+        this.onConnectionStatus?.("disconnected");
+        if (!closed && retryTimer === undefined) {
+          retryTimer = setTimeout(() => {
+            retryTimer = undefined;
+            onResync?.();
+            connect();
+          }, 3000);
+        }
+      });
+    };
+    connect();
+    // 看门狗：超过 60s 没有任何事件（含 ping）说明连接半开——机器
+    // 休眠/网络挂起时 EventSource 不报错也没数据，UI 会永久停在旧
+    // 状态（jemalloc 现场实锤）。只能主动断开重建。
+    const watchdog = setInterval(() => {
+      if (closed || !es) return;
+      if (Date.now() - lastEventAt > 60_000) {
+        es.close();
+        es = null;
+        onResync?.();
+        connect();
       }
-    });
-    es.addEventListener("open", () => this.onConnectionStatus?.("connected"));
-    es.addEventListener("error", () => {
-      es.close();
-      this.onConnectionStatus?.("disconnected");
-    });
-    return () => es.close();
+    }, 15_000);
+    return () => {
+      closed = true;
+      clearInterval(watchdog);
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      es?.close();
+    };
   }
 
   subscribeSelfLoop(onEvent: (ev: SelfLoopEvent) => void): () => void {

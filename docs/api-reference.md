@@ -542,11 +542,19 @@ Self-loop 进度 SSE 流。
 
 ### `POST /api/tasks/import`
 
-批量导入任务（plan 工具批准后调用）。
+批量导入任务（plan 工具批准后调用）。导入的任务一律进 `todo`，是否派发由用户在任务看板手动操作（不做自动调度）。
 
-**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?`）
+**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?`）。`parent_id` 三态：任务 id = 显式指定父任务（须为根任务，item 不得再嵌套 `subtasks`）；空串 = 显式「无父任务」；缺省 = 按 `session_id` 查拆分会话映射（`/api/tasks/<id>/refine` 登记，页面刷新不丢）
 
-**响应 `200`：** `ImportTasksResponse`（含 `created` / `auto_dispatch?`）
+**响应 `200`：** `ImportTasksResponse`（含 `created`）
+
+### `POST /api/tasks/<id>/refine`
+
+拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 角色用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。不改变任务状态、不记 run。仅根任务可拆；`in_progress`/`merging` 中的任务不可拆。
+
+**请求体：** `{}`
+
+**响应 `200`：** `{ "session_id": "..." }`
 
 ### `POST /api/tasks/dispatch-ready`
 

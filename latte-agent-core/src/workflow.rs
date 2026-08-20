@@ -1307,7 +1307,9 @@ async fn build_role_runner(
                     .map_err(|e| format!("register doc_graph tools for '{role_id}': {e}"))?;
             }
         }
-        AgentRunner::new_with_tools(agent, rtm, 0)
+        // 熔断：与 controller delegate 路径对齐，给 specialist
+        // runner 装工具轮次上限（jemalloc 事故前为 0 = 无限）。
+        AgentRunner::new_with_tools(agent, rtm, crate::controller::specialist_max_tool_rounds())
     };
     let mut r = runner
         .with_role(role_id.to_string())
@@ -1501,6 +1503,13 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         let mut run_handle = tokio::spawn(async move {
             runner.run_turn_gated(&[Message::user(prompt)], None).await
         });
+        // 熔断：wall-clock 超时（对齐 controller delegate；被 500ms
+        // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
+        // 超时走 StepFail::Failed → 引擎按 max_retries 重试/失败冒泡，
+        // 而不是无限挂起（jemalloc 事故：estimate 步挂 24min）。
+        let timeout_s = crate::controller::specialist_timeout_secs(None);
+        let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
+        tokio::pin!(timeout);
         let attempt: Result<String, StepFail>;
         loop {
             tokio::select! {
@@ -1541,6 +1550,31 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                             break;
                         }
                     }
+                }
+                _ = &mut timeout => {
+                    run_handle.abort();
+                    let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                        role_id: speaker.clone(),
+                        detail: format!("timed out after {timeout_s}s"),
+                        sub_id: sub_id.clone(),
+                    });
+                    if let Some(id) = &sub_id {
+                        let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                            from_role: "workflow".into(),
+                            to_role: speaker.clone(),
+                            status: "timeout".into(),
+                            summary: format!(
+                                "workflow step '{}' 超过 {}s 未返回，已中止",
+                                inp.step_id, timeout_s
+                            ),
+                            sub_id: id.clone(),
+                        });
+                    }
+                    attempt = Err(StepFail::Failed(format!(
+                        "step '{}' 超过 {}s 未返回（超时熔断，env LATTE_AGENT_DELEGATE_TIMEOUT_SECS 可调）",
+                        inp.step_id, timeout_s
+                    )));
+                    break;
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     if cancel.load(Ordering::SeqCst) {

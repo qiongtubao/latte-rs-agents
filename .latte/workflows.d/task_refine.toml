@@ -1,0 +1,23 @@
+# Workflow: task_refine
+# 任务细化：任务看板「拆分子任务」入口（POST /api/tasks/:id/refine）
+# 在独立 session 里跑——task_planner（任务拆分规划师）分析任务后用
+# plan 工具一次性提交子任务清单，用户在弹窗勾选导入（导入时前端带
+# parent_id，成为原任务的子任务）。只规划不实现：本 workflow 不派
+# worker、不改代码。
+
+name = "task_refine"
+command = "/task-refine"
+description = "任务细化：把看板任务拆分为可独立执行的子任务（plan 工具提交，用户勾选导入）"
+max_rounds = 1
+
+[[steps]]
+id = "refine"
+description = "task_planner 拆分任务并用 plan 工具一次性提交子任务清单"
+speakers = ["task_planner"]
+max_retries = 1
+# 拆分规则（粒度、paths、workflow 字段等）在 task_planner 角色 prompt
+# 里，这里只投递任务本体。
+prompt = """拆分下面这条看板任务：
+
+【看板任务】
+{{topic}}"""

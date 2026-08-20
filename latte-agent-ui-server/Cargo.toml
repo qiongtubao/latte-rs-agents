@@ -26,10 +26,11 @@ anyhow = "1"
 toml_edit = "0.22"
 # HTTP server: `axum` + `tower-http` for static-file serving + SSE event
 # stream. `tokio-stream` needs the `sync` feature for `BroadcastStream`
-# (converts `broadcast::Receiver<ChatEvent>` into a Stream).
+# (converts `broadcast::Receiver<ChatEvent>` into a Stream) and `time`
+# for `IntervalStream` (SSE ping 心跳事件，喂前端看门狗)。
 axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
 futures-util = "0.3"
 reqwest = { workspace = true }
 base64 = "0.22"

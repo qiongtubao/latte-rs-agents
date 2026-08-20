@@ -100,6 +100,15 @@ skills = []  # 可添加 screenshot_skill 等
 `manager` 角色通过 `delegate` 工具派发任务给专业角色——
 programmer、architect、reviewer、tester、security、devops、designer、tech_writer、pm。
 
+### 运行参数（环境变量）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | CLI 300s / UI 900s | specialist（delegate / workflow step）的 wall-clock 超时，超时即中止并回喂 manager 重派。模型目录里的 per-model `timeout_secs` 优先级最高 |
+| `LATTE_AGENT_MAX_TOOL_ROUNDS` | 100 | specialist 单次委派的工具轮次上限，超限报 `MaxToolRoundsExceeded`（0 = 不限） |
+| `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
+| `LATTE_MAX_DELEGATES_PER_SESSION` | — | 单 session delegate 调用次数上限（0 = 禁用） |
+
 ## Skill 系统
 
 Skill 是扩展 Agent 能力的指令模块。在角色 TOML 中声明，运行时追加到 system prompt。

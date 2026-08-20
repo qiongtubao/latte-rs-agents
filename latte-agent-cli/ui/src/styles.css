@@ -3613,6 +3613,26 @@ select {
   font-family: inherit;
   box-sizing: border-box;
 }
+.plan-import-parent {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  border-top: 1px solid #e2e8f0;
+  font-size: 13px;
+  color: #475569;
+}
+
+.plan-import-parent select {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+}
+
 .plan-import-bar {
   display: flex;
   align-items: center;

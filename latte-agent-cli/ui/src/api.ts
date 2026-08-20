@@ -519,6 +519,7 @@ export async function listLogs(): Promise<LogFile[]> {
 export function subscribeEvents(
   onEvent: (e: ChatEvent) => void,
   onConnectionStatus: (status: "connected" | "disconnected") => void,
+  onResync?: () => void,
 ): { disconnect: () => void; reconnect: () => void } {
   let unsubscribe: (() => void) | null = null;
   let subscribed = false;
@@ -556,7 +557,7 @@ export function subscribeEvents(
       }
       onEvent(ev);
     };
-    unsubscribe = t.subscribeEvents(currentSessionId, routedOnEvent);
+    unsubscribe = t.subscribeEvents(currentSessionId, routedOnEvent, onResync);
     subscribed = true;
   };
 
@@ -1077,16 +1078,42 @@ export async function deleteTask(id: string): Promise<void> {
   );
 }
 
-/** POST /api/tasks/import：批量导入任务（进 backlog），返回新建任务 id 列表。
- *  校验失败时后端返回 400 + 纯文本错误信息。
+/** POST /api/tasks/:id/refine：拆分子任务——新建 session 跑 task_refine
+ *  workflow，manager 用 plan 工具提交子任务清单，用户在弹窗勾选导入。
+ *  返回新 session id（前端随后 activateSession 跳过去）。 */
+export async function refineTask(id: string): Promise<{ session_id: string }> {
+  return getTransport().request(
+    "POST",
+    `/api/tasks/${encodeURIComponent(id)}/refine`,
+  );
+}
+
+/** 拆分会话 → 父任务 id 的映射：「拆分子任务」创建 session 时登记，
+ *  该 session 的 plan 导入弹窗据此把任务作为父任务的子任务导入。
+ *  纯内存（页面刷新后丢失，降级为根任务导入）。 */
+const refineParents = new Map<string, string>();
+export function setRefineParent(sessionId: string, taskId: string): void {
+  refineParents.set(sessionId, taskId);
+}
+export function refineParentFor(sessionId: string): string | undefined {
+  return refineParents.get(sessionId);
+}
+
+/** POST /api/tasks/import：批量导入任务（进 todo，由用户在看板手动派发），
+ *  返回新建任务 id 列表。校验失败时后端返回 400 + 纯文本错误信息。
  *  planId 来自 PlanProposed 事件：带上即视为用户批准该任务清单，
  *  后端会把对应 session 的 plan 阶段门置为 Approved（解除实现类
- *  delegate 拦截），并自动跑一轮批量派发（结果在 auto_dispatch）。 */
+ *  delegate 拦截）。
+ *  parentId 三态：任务 id = 显式指定父任务；"" = 显式「无父任务」
+ * （覆盖拆分会话映射）；undefined = 由后端按 sessionId 查拆分会话
+ *  映射（refine 登记，页面刷新不丢）。 */
 export async function importTasks(
   tasks: ImportTask[],
   planId?: string,
-): Promise<{ created: string[]; auto_dispatch?: DispatchReadyResponse }> {
-  return getTransport().request("POST", "/api/tasks/import", { tasks, plan_id: planId });
+  parentId?: string,
+  sessionId?: string,
+): Promise<{ created: string[] }> {
+  return getTransport().request("POST", "/api/tasks/import", { tasks, plan_id: planId, parent_id: parentId, session_id: sessionId });
 }
 
 

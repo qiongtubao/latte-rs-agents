@@ -442,9 +442,28 @@ async function main(): Promise<void> {
     const { disconnect, reconnect } = subscribeEvents(
       (ev) => chat.handleEvent(ev),
       (status) => chat.setStatus(status),
+      () => { void resyncHistory(); },
     );
     sseDisconnector = disconnect;
     sseConnector = reconnect;
+  }
+
+  /** SSE 断流/广播滞后后的补齐：拉服务端权威历史整体重放（等价于
+   * 刷新页面的恢复路径）。先清再播，不会重复渲染。并发触发去重。 */
+  let resyncing = false;
+  async function resyncHistory(): Promise<void> {
+    if (resyncing) return;
+    resyncing = true;
+    try {
+      const id = getCurrentSessionId();
+      if (!id) return;
+      const history = await getSessionHistory(id).catch(() => null);
+      if (!history) return;
+      chat.clear();
+      chat.replayEvents(history);
+    } finally {
+      resyncing = false;
+    }
   }
   // 首次激活 = 完整走一遍 activateSession：拉历史回放（live 与落盘
   // 恢复的 session 都覆盖）+ 订阅 SSE + 刷新会话列表。没有这一步，

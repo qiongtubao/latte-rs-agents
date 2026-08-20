@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, sendCommand, switchRole, cancelTurn, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, uploadImage, listWorkflows, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, sendCommand, switchRole, cancelTurn, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
@@ -885,11 +885,13 @@ const stepMsgIds = new Map<string, string>();
   }
   // ── plan 导入弹窗 ──
   // PlanProposed 事件触发（主路径）或右键「导入任务看板」（补救路径）
-  // 调用。tasks 是结构化任务候选（来自 plan 工具，非文本解析），用户
-  // 勾选 + 可编辑 title/description/priority 后调 importTasks 进 backlog。
+  // 勾选 + 可编辑 title/description/priority 后调 importTasks 进 todo。
   function openPlanImportModal(tasks: ImportTask[], planId?: string): void {
     // 防重复弹窗：已存在则先移除再重建（同 planId 重开）。
     document.getElementById("plan-import-modal")?.remove();
+    // 拆分会话（看板「拆分子任务」入口）的导入带 parent_id，成为父任务的子任务。
+    const sid = getCurrentSessionId();
+    const refineParent = sid ? refineParentFor(sid) : undefined;
 
     const overlay = document.createElement("div");
     overlay.id = "plan-import-modal";
@@ -899,7 +901,7 @@ const stepMsgIds = new Map<string, string>();
     box.className = "plan-import-box";
     const header = document.createElement("div");
     header.className = "plan-import-header";
-    header.textContent = `导入任务看板 · ${tasks.length} 个候选${planId ? `（${planId}）` : ""}`;
+    header.textContent = `导入任务看板 · ${tasks.length} 个候选${planId ? `（${planId}）` : ""}${refineParent ? `（作为 ${refineParent} 的子任务）` : ""}`;
     box.appendChild(header);
 
     // 每个任务一行：勾选框 + 可编辑 title/desc/priority。
@@ -942,6 +944,41 @@ const stepMsgIds = new Map<string, string>();
     }
     box.appendChild(list);
 
+    // 父任务下拉框：默认「自动」（拆分会话由后端 refine 映射解析，
+    // 页面刷新也不丢）；可人工改选具体根任务、或显式选「无（根任
+    // 务）」覆盖自动关联——防止父任务关联丢失时无法干预。
+    const parentRow = document.createElement("div");
+    parentRow.className = "plan-import-parent";
+    const parentLbl = document.createElement("span");
+    parentLbl.textContent = "父任务：";
+    const parentSel = document.createElement("select");
+    const autoOpt = document.createElement("option");
+    autoOpt.value = "";
+    autoOpt.textContent = refineParent ? `自动（拆分会话关联 → ${refineParent}）` : "自动（无关联则作为根任务）";
+    parentSel.appendChild(autoOpt);
+    const noneOpt = document.createElement("option");
+    noneOpt.value = "none";
+    noneOpt.textContent = "（无 — 作为根任务）";
+    parentSel.appendChild(noneOpt);
+    parentRow.append(parentLbl, parentSel);
+    box.appendChild(parentRow);
+    // 异步拉根任务列表填充候选；本地 refineParent 命中时预选。
+    void listTasks()
+      .catch(() => [] as TaskView[])
+      .then((all) => {
+        if (!document.getElementById("plan-import-modal")) return; // 弹窗已关
+        for (const t of all) {
+          if (t.parent_id) continue; // 父任务只能是根任务
+          const o = document.createElement("option");
+          o.value = t.id;
+          o.textContent = `${t.id} · ${t.title}`;
+          parentSel.appendChild(o);
+        }
+        if (refineParent && [...parentSel.options].some(o => o.value === refineParent)) {
+          parentSel.value = refineParent;
+        }
+      });
+
     // 底部操作栏：全选切换 + 导入 + 取消。
     const bar = document.createElement("div");
     bar.className = "plan-import-bar";
@@ -975,13 +1012,17 @@ const stepMsgIds = new Map<string, string>();
       importBtn.disabled = true;
       importBtn.textContent = "导入中…";
       try {
-        const resp = await importTasks(selected, planId);
-        // plan 批准的导入后端会自动批量派发（批准计划 = 按计划开工）。
-        const ad = resp.auto_dispatch;
-        const content = ad
-          ? `✅ 已导入 ${resp.created.length} 个任务，已自动派发 ${ad.dispatched.length} 个任务` +
-            (ad.skipped.length > 0 ? `，${ad.skipped.length} 个跳过等位` : "")
-          : `✅ 已导入 ${resp.created.length} 个任务到看板（backlog），请到任务看板查看`;
+        // 父任务三态：具体 id = 人工指定；none = 显式根任务（发 "" 覆盖
+        // 自动关联）；"" = 自动（不带 parent_id，后端按 session_id 查
+        // refine 映射）。
+        const pv = parentSel.value;
+        const parentId = pv === "" ? undefined : pv === "none" ? "" : pv;
+        const resp = await importTasks(selected, planId, parentId, sid ?? undefined);
+        // 导入即进 todo：执行由用户到任务看板手动派发（不自动调度）。
+        const effectiveParent = pv === "none" ? undefined : (parentId ?? refineParent);
+        const content = effectiveParent
+          ? `✅ 已导入 ${resp.created.length} 个子任务到 ${effectiveParent}（todo），请到任务看板派发执行`
+          : `✅ 已导入 ${resp.created.length} 个任务到看板（todo），请到任务看板派发执行`;
         addMessage({ kind: "system", content });
         overlay.remove();
       } catch (err) {

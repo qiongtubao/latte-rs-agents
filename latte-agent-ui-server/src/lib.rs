@@ -158,6 +158,12 @@ pub struct UiBackend {
     /// 时连带取消。run 结束时从 map 移除。
     pub(crate) session_workflows:
         Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// 拆分会话 → 父任务 id（`POST /api/tasks/:id/refine` 登记）。导入
+    /// 接口带 `session_id` 时从这里解析 parent_id——刷新页面也不丢
+    /// （进程内存，server 重启才丢，届时前端弹窗的父任务下拉框可人工
+    /// 指定）。
+    pub(crate) refine_parents:
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
     /// Notion 同步的共享 reqwest::Client 与配置。后台循环 5s 跑一轮
     /// `notion_sync::sync_dirty_tasks`，从 `tasks::TaskStore` 拉 dirty
     /// 任务推送到 latte-rs-notion-client。`None` 时禁用（缺 env）。
@@ -215,6 +221,7 @@ impl UiBackend {
             )),
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
             session_workflows: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            refine_parents: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             agents_config: agents_config.clone(),
             notion_http: Arc::new(parking_lot::Mutex::new(None)),
             notion_cfg: Arc::new(parking_lot::Mutex::new(None)),
@@ -516,6 +523,7 @@ fn build_router(state: AppState) -> Router {
                 .delete(delete_task),
         )
         .route("/tasks/:id/dispatch", post(dispatch_task))
+        .route("/tasks/:id/refine", post(refine_task))
         .route("/tasks/:id/abort", post(abort_task))
         .route("/tasks/:id/report", post(report_task))
         // 工作流管理（编辑器 CRUD + 校验 + 测试运行）

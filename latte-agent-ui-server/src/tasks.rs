@@ -571,7 +571,7 @@ where
 }
 
 /// `POST /api/tasks/import` 请求体。
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ImportTasksRequest {
     pub tasks: Vec<ImportTask>,
     /// 来源 plan 提案 id（PlanProposed 事件携带）。`Some` 时导入成功
@@ -579,10 +579,21 @@ pub struct ImportTasksRequest {
     /// `PendingApproval` 置为 `Approved`，解除实现类 delegate 拦截。
     #[serde(default)]
     pub plan_id: Option<String>,
+    /// 父任务指定：拆分导入时全部任务作为该父任务的子任务创建（父
+    /// 任务必须是根任务；带 parent_id 的导入不支持 item 再嵌套
+    /// subtasks）。三态：非空串 = 显式指定；空串 = 显式「无父任务」
+    /// （覆盖 session_id 解析，防止误挂）；缺省 = 按 session_id 查
+    /// 拆分会话映射（refine 登记）。
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    /// 导入发起方 session：parent_id 缺省时用它查 `refine_parents`
+    /// （看板「拆分子任务」创建的 session → 父任务）。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// 导入的单个任务：除 `title` 外全部可选；`subtasks` 最多一层。
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ImportTask {
     pub title: String,
     #[serde(default)]
@@ -602,14 +613,10 @@ pub struct ImportTask {
 }
 
 /// `POST /api/tasks/import` 响应：按创建顺序（父先于子）的任务 id。
-#[derive(Serialize)]
+/// 导入只进 todo，是否派发由用户在任务看板手动操作（不自动调度）。
+#[derive(Serialize, Debug)]
 pub struct ImportTasksResponse {
     pub created: Vec<String>,
-    /// 带 `plan_id` 的导入（= 用户批准计划）成功后自动跑一轮
-    /// [`dispatch_ready`] 的结果；不带 plan_id 时为 None（不序列化，
-    /// 旧前端无感）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_dispatch: Option<DispatchReadyResponse>,
 }
 
 /// `POST /api/tasks/:id/report` 请求体（manager 回报）。
@@ -679,10 +686,13 @@ fn validate_workflow_name(cwd: &Path, name: Option<&str>) -> Result<(), ApiError
 
 /// 导入单个任务（含一层子任务）的校验 + 落库。返回新建 id（父先于子）。
 /// workflow 引用不存在时，静默降级为 null（不阻塞导入）。
+/// `parent_id` 非空时任务作为该父任务的子任务创建（拆分导入），
+/// 此时 item 不得再嵌套 subtasks（只能一层父子）。
 fn import_one(
     store: &mut TaskStore,
     cwd: &Path,
     item: &ImportTask,
+    parent_id: Option<&str>,
     created: &mut Vec<String>,
 ) -> Result<(), String> {
     let title = item.title.trim();
@@ -699,20 +709,27 @@ fn import_one(
     if item.subtasks.iter().any(|s| !s.subtasks.is_empty()) {
         return Err("subtasks nested deeper than one level".to_string());
     }
+    if parent_id.is_some() && !item.subtasks.is_empty() {
+        return Err("拆分导入（带 parent_id）不支持再嵌套 subtasks".to_string());
+    }
     // workflow 引用必须存在：静默降级会让任务丢掉绑定的流程而无人
     // 察觉——拒绝并报错，让提交方（manager/用户）修正后重试。
-    let workflow = match item.workflow.as_ref() {
+    // 空串/空白 = 不绑定：plan 工具约定「没有贴合的必须留空」，产出
+    // 就是 workflow: ""，不能当成 workflow 名去校验（jemalloc 现场：
+    // 6 个任务全部 workflow:"" 导入被 400 整单拒绝）。
+    let workflow = match item.workflow.as_deref().map(str::trim) {
+        None | Some("") => None,
         Some(wf) if !crate::workflows::exists(cwd, wf) => {
             return Err(format!("unknown workflow '{wf}'"));
         }
-        other => other.cloned(),
+        Some(wf) => Some(wf.to_string()),
     };
     let parent = store.create(
         &title,
         &item.description,
         item.priority.unwrap_or(3),
         item.labels.clone(),
-        None,
+        parent_id.map(str::to_string),
         None,
         workflow,
         "import",
@@ -733,10 +750,10 @@ fn import_one(
                 return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
             }
         }
-        // 子任务 workflow 引用不存在时同样降级
-        let sub_workflow = sub.workflow.as_ref().and_then(|wf| {
-            if crate::workflows::exists(cwd, wf) {
-                Some(wf.clone())
+        // 子任务 workflow 引用不存在时同样降级；空串/空白 = 不绑定。
+        let sub_workflow = sub.workflow.as_deref().map(str::trim).and_then(|wf| {
+            if !wf.is_empty() && crate::workflows::exists(cwd, wf) {
+                Some(wf.to_string())
             } else {
                 None
             }
@@ -767,9 +784,19 @@ fn import_tasks_into(
     cwd: &Path,
     req: &ImportTasksRequest,
 ) -> Result<Vec<String>, String> {
+    // 拆分导入：父任务必须存在且是根任务（子任务不能再有子任务）。
+    if let Some(pid) = req.parent_id.as_deref() {
+        match store.get(pid) {
+            None => return Err(format!("父任务 {pid:?} 不存在")),
+            Some(p) if p.parent_id.is_some() => {
+                return Err(format!("父任务 {pid:?} 本身是子任务，不能再拆"))
+            }
+            _ => {}
+        }
+    }
     let mut created: Vec<String> = Vec::new();
     for item in &req.tasks {
-        if let Err(e) = import_one(store, cwd, item, &mut created) {
+        if let Err(e) = import_one(store, cwd, item, req.parent_id.as_deref(), &mut created) {
             return Err(format!(
                 "导入任务 {:?} 失败：{e}（已创建：{created:?}）",
                 item.title.trim()
@@ -783,22 +810,33 @@ pub async fn import_tasks(
     b: &UiBackend,
     req: ImportTasksRequest,
 ) -> Result<ImportTasksResponse, ApiError> {
+    // 父任务三态解析：显式 parent_id（含 ""=显式根任务）优先；
+    // 缺省时按 session_id 查拆分会话映射（refine 登记，页面刷新不丢）。
+    let mut req = req;
+    match req.parent_id.as_deref().map(str::trim) {
+        Some("") => req.parent_id = None, // 用户在弹窗显式选了「无父任务」
+        Some(_) => {}                     // 显式指定，原样校验使用
+        None => {
+            if let Some(sid) = req.session_id.as_deref() {
+                if let Some(pid) = b.refine_parents.read().get(sid) {
+                    req.parent_id = Some(pid.clone());
+                }
+            }
+        }
+    }
     // 写锁作用域收口在块内：guard 不 Send，不能活过下面的 .await。
     let created = {
         let mut store = b.tasks.write();
         let created =
             import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
-        // plan 批准的导入 = 开工：新建任务直接置 todo（默认进 backlog，
-        // 而 dispatch_ready 只派 todo），让紧随其后的自动调度能派到它们。
-        if req.plan_id.is_some() {
-            let now = now_ms();
-            for id in &created {
-                if let Some(t) = store.get_mut(id) {
-                    t.set_state("todo", "import", Some("计划已批准，待自动调度".into()), now);
-                }
-                if let Err(e) = store.persist(id) {
-                    eprintln!("[tasks] persist {id} after plan approve: {e}");
-                }
+        // 导入即进 todo：执行与否由用户在任务看板手动派发，不做自动调度。
+        let now = now_ms();
+        for id in &created {
+            if let Some(t) = store.get_mut(id) {
+                t.set_state("todo", "import", Some("已导入，待派发".into()), now);
+            }
+            if let Err(e) = store.persist(id) {
+                eprintln!("[tasks] persist {id} after import: {e}");
             }
         }
         created
@@ -806,16 +844,10 @@ pub async fn import_tasks(
     // plan 阶段门：带 plan_id 的导入 = 用户批准该任务清单。找到持有
     // 该 PendingApproval 的 session（plan 弹窗属于某个 session，stage
     // 按 session 存），置 Approved 解除实现类 delegate 拦截。
-    // 批准后自动跑一轮批量派发——批准计划的语义就是"按这个计划开工"。
-    let mut auto_dispatch = None;
     if let Some(plan_id) = &req.plan_id {
         approve_plan_stage(b, plan_id);
-        auto_dispatch = Some(dispatch_ready(b, "user", None).await);
     }
-    Ok(ImportTasksResponse {
-        created,
-        auto_dispatch,
-    })
+    Ok(ImportTasksResponse { created })
 }
 
 /// 把持有 `PendingApproval { plan_id }` 的 session 的 plan 阶段门置为
@@ -1233,6 +1265,109 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
         });
     }
     Ok(view)
+}
+
+/// `POST /api/tasks/:id/refine` 响应：拆分会话的 session id。
+#[derive(Serialize, Clone, Debug)]
+pub struct RefineTaskResponse {
+    pub session_id: String,
+}
+
+/// `POST /api/tasks/:id/refine` — 拆分子任务：新建 ui-session 跑
+/// `task_refine` workflow（manager 分析任务后用 plan 工具提交子任务
+/// 清单），用户在该 session 的弹窗里勾选导入。**不改变任务状态、不
+/// 记 run**——拆分是规划动作不是执行，任务留在原状态等子任务导入。
+///
+/// 只拆根任务（子任务不能再嵌套）；执行中（in_progress/merging）的
+/// 任务不可拆。
+pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, ApiError> {
+    // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
+    let (title, description) = {
+        let store = b.tasks.read();
+        let t = store
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        if t.parent_id.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "task {id:?} 本身是子任务，不能再拆（只支持一层父子）"
+            )));
+        }
+        if t.state == "in_progress" || t.state == "merging" {
+            return Err(ApiError::bad_request(format!(
+                "state {:?} 不可拆分（执行中的任务请先中止）",
+                t.state
+            )));
+        }
+        (t.title.clone(), t.description.clone())
+    };
+
+    // 2. workflow 必须在建 session 之前加载成功（失败不改任何状态）。
+    let wf = load_workflow("task_refine", &b.cwd)
+        .map_err(|e| ApiError::bad_request(format!("workflow 'task_refine' 加载失败：{e}")))?;
+
+    // 3. 建 session + label + 记录用户诉求（advisor 审查要非空问题）。
+    let info = api::create_session(b).await?;
+    let label = format!("[{id}] 拆分 {}", title.chars().take(20).collect::<String>());
+    api::set_session_label(b, &info.session_id, &label)?;
+    let msg = format!(
+        "[任务拆分 {id}] {title}\n描述：{description}\n请把该任务拆分为可独立执行、可独立验收的子任务，并用 plan 工具一次性提交完整清单（导入后它们将作为 {id} 的子任务出现在任务看板）。"
+    );
+    api::session_record_user_input(b, &info.session_id, &msg).await?;
+    let event_tx = api::session_event_sender(b, &info.session_id).await?;
+
+    // 4. 登记 拆分会话 → 父任务 映射（server 侧，页面刷新不丢）+ 任务
+    //    历史记一笔（不改状态），方便追溯拆分会话。
+    b.refine_parents
+        .write()
+        .insert(info.session_id.clone(), id.to_string());
+    {
+        let mut store = b.tasks.write();
+        if let Some(t) = store.get_mut(id) {
+            t.push_note(
+                "user",
+                format!("已发起拆分（session {}）", info.session_id),
+                now_ms(),
+            );
+            if let Err(e) = store.persist(id) {
+                eprintln!("[tasks] persist {id} after refine: {e}");
+            }
+        }
+    }
+
+    // 5. 后台跑 workflow（不阻塞 HTTP 响应）；plan 工具会在该 session
+    //    广播 PlanProposed，弹窗导入时前端带上 parent_id=id。
+    let b2 = b.clone();
+    let session_id = info.session_id.clone();
+    let task_id = id.to_string();
+    tokio::spawn(async move {
+        let agent_pause_gate = api::session_pause_gate(&b2, &session_id).await.ok();
+        let advisor_pause = api::session_advisor_pause_gate(&b2, &session_id).await.ok();
+        let ctx = WorkflowRunContext {
+            merged: Arc::new(b2.merged.read().clone()),
+            resolver: b2.resolver.clone(),
+            default_params: GenerateParams::default(),
+            cwd: b2.cwd.clone(),
+            event_tx: event_tx.clone(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            depth: 0,
+            agent_pause_gate: agent_pause_gate.clone(),
+            subsession_store: Some(b2.subsession_store.clone()),
+            session_id: Some(session_id.clone()),
+            advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+                enabled: b2.merged.read().advisor.enabled(),
+                ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+            }
+            .runner_gate(),
+            advisor_pause: advisor_pause.clone(),
+            staging: None,
+        };
+        if let Err(e) = run_workflow(&wf, &msg, &ctx).await {
+            eprintln!("[tasks] refine workflow for {task_id} failed: {e}");
+        }
+    });
+    Ok(RefineTaskResponse {
+        session_id: info.session_id,
+    })
 }
 
 /// `POST /api/tasks/dispatch-ready` 响应。
@@ -2134,6 +2269,31 @@ mod tests {
         assert!(err.contains("unknown workflow 'no_such_wf_xyz'"), "{err}");
     }
 
+    /// 回归：plan 工具约定「没有贴合的 workflow 必须留空」，产出就是
+    /// `workflow: ""`——空串/空白必须视为「不绑定」，整单 400 是 bug
+    /// （jemalloc 现场：6 个任务全部 workflow:"" 被 unknown workflow ''
+    /// 拒绝）。子任务同理。
+    #[test]
+    fn import_treats_empty_workflow_as_unbound() {
+        let (dir, mut store) = tmp_store();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{
+                "title": "父",
+                "workflow": "",
+                "subtasks": [{ "title": "子", "workflow": "  " }]
+            }]
+        }))
+        .expect("parse");
+        let created = import_tasks_into(&mut store, dir.path(), &req)
+            .expect("空 workflow 不应报错");
+        assert_eq!(created.len(), 2);
+        let parent = store.get(&created[0]).expect("parent");
+        assert_eq!(parent.workflow, None, "空串应归一化为不绑定");
+        let child = store.get(&created[1]).expect("child");
+        assert_eq!(child.workflow, None);
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    }
+
     /// 标题超过 80 字符截断而非报错。
     #[test]
     fn import_truncates_long_title() {
@@ -2585,10 +2745,10 @@ mod tests {
         assert_eq!(store.get(&ids[0]).unwrap().state, "todo");
     }
 
-    /// import 带 plan_id（= 用户批准计划）：响应含 auto_dispatch，
-    /// 新建任务直接置 todo 并被自动派出（真建 session）。
+    /// import 带 plan_id（= 用户批准计划）：新建任务直接置 todo，
+    /// 但不自动派发——执行由用户在任务看板手动操作。
     #[tokio::test]
-    async fn import_with_plan_id_auto_dispatches() {
+    async fn import_with_plan_id_lands_in_todo_without_dispatch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = test_backend(&dir);
         let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
@@ -2601,22 +2761,17 @@ mod tests {
         .expect("parse req");
         let resp = import_tasks(&b, req).await.expect("import");
         assert_eq!(resp.created.len(), 2);
-        let auto = resp.auto_dispatch.expect("带 plan_id 的导入应自动调度");
-        assert!(auto.skipped.is_empty(), "不应有跳过：{:?}", auto.skipped);
-        assert_eq!(
-            auto.dispatched.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            resp.created.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            "两个新任务都应被自动派出"
-        );
         let store = b.tasks.read();
         for id in &resp.created {
-            assert_eq!(store.get(id).unwrap().state, "in_progress");
+            let t = store.get(id).unwrap();
+            assert_eq!(t.state, "todo", "导入即进 todo，等用户手动派发");
+            assert!(t.runs.is_empty(), "不得自动派发（无 run）");
         }
     }
 
-    /// 不带 plan_id 的导入不触发自动调度，任务留 backlog。
+    /// 不带 plan_id 的导入同样直接进 todo（导入 = 待派发，不进 backlog）。
     #[tokio::test]
-    async fn import_without_plan_id_does_not_auto_dispatch() {
+    async fn import_without_plan_id_also_lands_in_todo() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = test_backend(&dir);
         let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
@@ -2624,8 +2779,198 @@ mod tests {
         }))
         .expect("parse req");
         let resp = import_tasks(&b, req).await.expect("import");
-        assert!(resp.auto_dispatch.is_none());
-        assert_eq!(b.tasks.read().get(&resp.created[0]).unwrap().state, "backlog");
+        assert_eq!(b.tasks.read().get(&resp.created[0]).unwrap().state, "todo");
+    }
+
+    /// 拆分导入：带 parent_id 的导入全部挂为该父任务的子任务。
+    #[tokio::test]
+    async fn import_with_parent_id_creates_children() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let parent = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "父任务"})).expect("parse"),
+        )
+        .expect("create parent");
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "parent_id": parent.task.id,
+            "tasks": [{ "title": "子甲" }, { "title": "子乙" }]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).await.expect("import");
+        assert_eq!(resp.created.len(), 2);
+        let store = b.tasks.read();
+        for id in &resp.created {
+            let t = store.get(id).unwrap();
+            assert_eq!(t.parent_id.as_deref(), Some(parent.task.id.as_str()));
+            assert_eq!(t.state, "todo");
+        }
+    }
+
+    /// 拆分会话映射：import 只带 session_id（parent_id 缺省）时，从
+    /// refine 登记的 server 侧映射解析出父任务——页面刷新后前端内存
+    /// 映射丢失也能正确挂父。
+    #[tokio::test]
+    async fn import_resolves_parent_from_refine_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let parent = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "父任务"})).expect("parse"),
+        )
+        .expect("create parent");
+        // 模拟 refine_task 登记。
+        b.refine_parents
+            .write()
+            .insert("sess-refine-1".to_string(), parent.task.id.clone());
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-refine-1",
+            "tasks": [{ "title": "子甲" }]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).await.expect("import");
+        let t = b.tasks.read().get(&resp.created[0]).unwrap().clone();
+        assert_eq!(t.parent_id.as_deref(), Some(parent.task.id.as_str()));
+    }
+
+    /// 显式空串 parent_id = 用户人工选了「无父任务」，覆盖 session
+    /// 映射（防止误挂）。
+    #[tokio::test]
+    async fn import_explicit_empty_parent_overrides_session_mapping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let parent = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "父任务"})).expect("parse"),
+        )
+        .expect("create parent");
+        b.refine_parents
+            .write()
+            .insert("sess-refine-1".to_string(), parent.task.id.clone());
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "sess-refine-1",
+            "parent_id": "",
+            "tasks": [{ "title": "根任务甲" }]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).await.expect("import");
+        let t = b.tasks.read().get(&resp.created[0]).unwrap().clone();
+        assert_eq!(t.parent_id, None, "显式空串 = 根任务，不得挂父");
+    }
+
+    /// 拆分导入校验：父任务不存在 / 父任务本身是子任务 / item 再嵌套
+    /// subtasks，都整单 400。
+    #[tokio::test]
+    async fn import_with_parent_id_validates_parent_and_nesting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        // 父任务不存在
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "parent_id": "T-999",
+            "tasks": [{ "title": "子甲" }]
+        }))
+        .expect("parse req");
+        let err = import_tasks(&b, req).await.expect_err("未知父任务应 400");
+        assert_eq!(err.status, 400);
+        assert!(err.message.contains("不存在"), "{}", err.message);
+
+        let parent = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "父任务"})).expect("parse"),
+        )
+        .expect("create parent");
+        // item 再嵌套 subtasks（会变成两层父子）
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "parent_id": parent.task.id,
+            "tasks": [{ "title": "子甲", "subtasks": [{ "title": "孙任务" }] }]
+        }))
+        .expect("parse req");
+        let err = import_tasks(&b, req).await.expect_err("嵌套 subtasks 应 400");
+        assert!(err.message.contains("subtasks"), "{}", err.message);
+
+        // 父任务本身是子任务：先给 parent 挂一个子任务，再拿子任务当父
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "parent_id": parent.task.id,
+            "tasks": [{ "title": "子甲" }]
+        }))
+        .expect("parse req");
+        let resp = import_tasks(&b, req).await.expect("import");
+        let child_id = resp.created[0].clone();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "parent_id": child_id,
+            "tasks": [{ "title": "孙任务" }]
+        }))
+        .expect("parse req");
+        let err = import_tasks(&b, req).await.expect_err("子任务不能再拆");
+        assert!(err.message.contains("不能再拆"), "{}", err.message);
+    }
+
+    /// 拆分子任务入口：建 session 跑 task_refine workflow，任务状态不变、
+    /// 不记 run，历史里留拆分会话备注。
+    #[tokio::test]
+    async fn refine_task_creates_session_without_state_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // refine 依赖 task_refine workflow：写进项目 workflows.d。
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir workflows.d");
+        std::fs::write(
+            wf_dir.join("task_refine.toml"),
+            "name = \"task_refine\"\nmax_rounds = 1\n[[steps]]\nid = \"refine\"\nspeakers = [\"manager\"]\nprompt = \"拆分\"\n",
+        )
+        .expect("write workflow");
+        let b = test_backend(&dir);
+        let parent = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "大任务"})).expect("parse"),
+        )
+        .expect("create parent");
+        b.tasks
+            .write()
+            .get_mut(&parent.task.id)
+            .unwrap()
+            .set_state("todo", "user", None, now_ms());
+
+        let resp = refine_task(&b, &parent.task.id).await.expect("refine");
+        assert!(!resp.session_id.is_empty());
+        let store = b.tasks.read();
+        let t = store.get(&parent.task.id).unwrap();
+        assert_eq!(t.state, "todo", "拆分不改变任务状态");
+        assert!(t.runs.is_empty(), "拆分不记 run");
+        assert!(
+            t.history
+                .iter()
+                .any(|h| h.note.as_deref().is_some_and(|n| n.contains(&resp.session_id))),
+            "历史应记录拆分会话"
+        );
+    }
+
+    /// 拆分入口校验：子任务不能再拆；执行中的任务不可拆。
+    #[tokio::test]
+    async fn refine_task_rejects_subtask_and_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let parent = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "父"})).expect("parse"),
+        )
+        .expect("create");
+        let child = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "子", "parent_id": parent.task.id}))
+                .expect("parse"),
+        )
+        .expect("create");
+        let err = refine_task(&b, &child.task.id).await.expect_err("子任务不能再拆");
+        assert_eq!(err.status, 400);
+        b.tasks
+            .write()
+            .get_mut(&parent.task.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        let err = refine_task(&b, &parent.task.id)
+            .await
+            .expect_err("执行中的任务不可拆");
+        assert_eq!(err.status, 400);
     }
 
     #[test]

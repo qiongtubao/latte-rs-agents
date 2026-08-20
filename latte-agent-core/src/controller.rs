@@ -3530,6 +3530,41 @@ pub(crate) async fn gate_delegate_return(
     (out, Some(verdict))
 }
 
+/// UI/controller 路径 delegate 的默认 wall-clock 超时（秒）。
+/// 比 CLI 的 300s（`DEFAULT_DELEGATE_TIMEOUT_SECS`）宽：UI 工作流里
+/// specialist 常写整套文档/脚本。解析顺序对齐 CLI（chat.rs）：
+/// `model.timeout_secs` > env `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` > 本值。
+pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
+
+/// Specialist 单次委派的工具轮次默认上限。jemalloc 事故：estimate
+/// 步骤的 programmer 子代理 24min/86 次模型调用盲改循环（配置漂移
+/// 丢了 bash → 无法验证 → 反复重写同一批文件），拖死整个 workflow——
+/// 当时这里写死 `max_tool_rounds = 0`（无限）。正常任务远低于 100 轮。
+pub(crate) const DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS: usize = 100;
+
+/// Specialist（delegate / workflow step）的工具轮次上限。
+/// env `LATTE_AGENT_MAX_TOOL_ROUNDS` 覆盖，默认
+/// [`DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS`]。每次调用读 env，
+/// 测试可直接 set_var。
+pub(crate) fn specialist_max_tool_rounds() -> usize {
+    std::env::var("LATTE_AGENT_MAX_TOOL_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS)
+}
+
+/// Specialist 的 wall-clock 超时（秒）。`model_timeout` 是模型目录里
+/// 的 per-model `timeout_secs`（workflow 路径拿不到模型 id，传 None）。
+pub(crate) fn specialist_timeout_secs(model_timeout: Option<u64>) -> u64 {
+    model_timeout
+        .or_else(|| {
+            std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(DEFAULT_UI_DELEGATE_TIMEOUT_SECS)
+}
+
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -3716,6 +3751,13 @@ async fn register_delegate_tool(
                 .map_err(|e| {
                     tool_err(format!("no model for role '{}': {}", role_id, e))
                 })?;
+            // 熔断：delegate wall-clock 超时。解析顺序对齐 CLI
+            // （chat.rs）：model.timeout_secs > env > UI 默认 900s。
+            // jemalloc 事故：无超时 → estimate 步骤的 programmer
+            // 盲改循环 24min，父 workflow 被无限期吊住。
+            let timeout_s = specialist_timeout_secs(
+                resolver.get_def(&models[0].id).and_then(|d| d.timeout_secs),
+            );
 
             // 2. Allocate a subsession so the specialist's full event
             //    log is captured. The main chat SSE stream sees only
@@ -3777,15 +3819,16 @@ async fn register_delegate_tool(
                 });
                 tool_err(summary)
             })?;
-            // `max_tool_rounds = 0` → unlimited; the agent decides
-            // when it's done. LoopDetector in agent.rs trips on
-            // actually stuck patterns.
+            // 工具轮次上限兜底盲改/跑偏循环（jemalloc 事故前写死
+            // 0 = 无限，靠 LoopDetector 抓「连续 3 次相同调用」，
+            // 对换着参数重写的循环无效）。正常任务远低于默认值，
+            // 超限冒泡 MaxToolRoundsExceeded → 回喂 manager 重派。
             // Wire the workspace cwd so the specialist's path-aware
             // tools (`bash`, `read`, …) chdir into the
             // workspace the user opened — not the Tauri process
             // cwd. See `AgentRunner::with_cwd` for the contract.
             let mut runner = match specialist_tm {
-                Some(tm) => AgentRunner::new_with_tools(agent, tm, 0),
+                Some(tm) => AgentRunner::new_with_tools(agent, tm, specialist_max_tool_rounds()),
                 None => AgentRunner::new(agent),
             };
             // Fan-out：子会话 JSONL 日志 + ChatEventTraceSink——专家的
@@ -3827,9 +3870,10 @@ async fn register_delegate_tool(
                 sub_id: Some(sub_id.clone()),
             });
 
-            // 5. Run the specialist. No wall-clock timeout — the
-            //    subagent runs until completion or explicit cancellation
-            //    via the session's cancel_flag. Check periodically.
+            // 5. Run the specialist with a wall-clock timeout
+            //    (`timeout_s`, resolved above) plus 500ms cancel_flag
+            //    polling. jemalloc 事故前无超时：子代理永不结束时
+            //    父方永远等待。
             let _permit = sem.acquire().await.map_err(|_| {
                 tool_err("delegate pool shut down".into())
             })?;
@@ -3841,6 +3885,10 @@ async fn register_delegate_tool(
                 // 没装时等价 run_turn。
                 runner.run_turn_gated(&[Message::user(task_content)], None).await
             });
+            // 超时被 500ms cancel 轮询每次 select! 重建会永远不响，
+            // 必须在循环外 pin 住。
+            let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
+            tokio::pin!(timeout);
             let result: Result<String, latte_rs_agent_tools::error::ToolError>;
             loop {
                 tokio::select! {
@@ -3883,6 +3931,26 @@ async fn register_delegate_tool(
                                 break;
                             }
                         }
+                    }
+                    _ = &mut timeout => {
+                        run_handle.abort();
+                        let _ = event_tx.send(ChatEvent::RoleFinished {
+                            role_id: role_id.clone(),
+                            detail: format!("timed out after {timeout_s}s"),
+                            sub_id: Some(sub_id.clone()),
+                        });
+                        let summary = format!(
+                            "delegate '{role_id}' 超过 {timeout_s}s 未返回，已中止；\
+                             请缩小任务范围或拆步后重派（env LATTE_AGENT_DELEGATE_TIMEOUT_SECS 可调）"
+                        );
+                        let _ = event_tx.send(ChatEvent::DelegateFinished {
+                            from_role: "manager".into(),
+                            to_role: role_id.clone(),
+                            status: "timeout".into(),
+                            summary: summary.clone(),
+                            sub_id: sub_id.clone(),
+                        });
+                        return Err(tool_err(summary));
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         if cancel_flag.load(Ordering::SeqCst) {
@@ -5181,6 +5249,140 @@ mod tests {
             !err.to_string().contains("尚未获用户批准"),
             "Approved 后不应再拦截: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn delegate_tool_aborts_runaway_specialist_on_timeout() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 模型端永不返回（30s 延迟），model.timeout_secs=1 → delegate
+        // 必须在 ~1s 被熔断：tool error + DelegateFinished status=timeout。
+        // 回归：jemalloc 事故前 controller delegate 无 wall-clock 超时，
+        // 失控子代理把父 workflow 吊死 24min。
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(std::time::Duration::from_secs(30))
+                            .set_body_string("{}"),
+                    ),
+            )
+            .await;
+
+        let merged = AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-slow".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: Some(1),
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "programmer".to_string(),
+                RoleTemplate {
+                    id: "programmer".into(),
+                    name: "programmer".into(),
+                    category: "execution".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(16);
+        register_delegate_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "ui-test".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            fresh_plan_stage(),
+            crate::pause_gate::AgentPauseGate::new("test"),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
+        )
+        .await
+        .expect("register delegate");
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tm.execute(
+                "delegate",
+                serde_json::json!({ "role": "programmer", "task": "写一份永远写不完的文档" }),
+                None,
+            ),
+        )
+        .await
+        .expect("delegate 必须在熔断后返回，而不是挂死")
+        .expect_err("超时熔断应返回 tool error");
+        assert!(
+            err.to_string().contains("未返回"),
+            "错误应说明超时中止: {err}"
+        );
+
+        // DelegateFinished status="timeout" 必须已广播（UI 依赖它收尾）。
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ChatEvent::DelegateFinished { status, .. }) => break status,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended before DelegateFinished: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("DelegateFinished timeout 事件");
+        assert_eq!(status, "timeout");
+    }
+
+    #[test]
+    fn specialist_circuit_breaker_defaults_and_env_override() {
+        // 默认上限；env 覆盖后恢复。
+        assert_eq!(
+            specialist_max_tool_rounds(),
+            DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS
+        );
+        assert_eq!(
+            specialist_timeout_secs(None),
+            DEFAULT_UI_DELEGATE_TIMEOUT_SECS
+        );
+        // per-model timeout_secs 优先级最高。
+        assert_eq!(specialist_timeout_secs(Some(120)), 120);
     }
 
     #[tokio::test]

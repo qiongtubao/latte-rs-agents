@@ -407,6 +407,15 @@ pub(crate) async fn events_sse(
             .event("error")
             .data(format!("broadcast lag: {}", e))),
     });
+    // JS 看不到 axum keep-alive 的注释心跳——前端看门狗需要真实事件
+    // 来判断连接死活（半开连接时 EventSource 不报错也不收数据，会
+    // 让 UI 永久停在旧状态；jemalloc 现场实锤）。每 15s 一个 ping
+    // 命名事件，前端 >60s 无任何事件即主动断开重建。
+    let ping = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
+        std::time::Duration::from_secs(15),
+    ))
+    .map(|_| Ok(Event::default().event("ping").data("1")));
+    let stream = stream.merge(ping);
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new().interval(std::time::Duration::from_secs(15)),
     ))
@@ -1054,6 +1063,18 @@ pub(crate) async fn dispatch_task(
     State(state): State<AppState>,
 ) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
     crate::tasks::dispatch_task(&state.backend, &id, "user")
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `POST /api/tasks/:id/refine` —— 拆分子任务：新建 session 跑
+/// task_refine workflow，plan 提案导入后成为该任务的子任务。
+pub(crate) async fn refine_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::tasks::RefineTaskResponse>, (StatusCode, String)> {
+    crate::tasks::refine_task(&state.backend, &id)
         .await
         .map(Json)
         .map_err(Into::into)

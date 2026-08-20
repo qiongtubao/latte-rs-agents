@@ -32,14 +32,14 @@ describe("任务看板状态机：状态 → 动作映射", () => {
       .toEqual(["to_todo", "edit", "cancel"]);
   });
 
-  it("todo 无排期：立即执行 / 指定时间执行 / 移回 Backlog", () => {
+  it("todo 无排期：立即执行 / 拆分子任务 / 指定时间执行 / 移回 Backlog", () => {
     expect(keysOf({ state: "todo", scheduled_at: null }))
-      .toEqual(["run_now", "schedule", "to_backlog"]);
+      .toEqual(["run_now", "refine", "schedule", "to_backlog"]);
   });
 
   it("todo 有排期：切换到 todo_scheduled 变体（修改时间 / 取消排期）", () => {
     expect(keysOf({ state: "todo", scheduled_at: Date.now() + 60_000 }))
-      .toEqual(["run_now", "schedule", "unschedule"]);
+      .toEqual(["run_now", "refine", "schedule", "unschedule"]);
     // 排期动作的 label 变为「修改时间」
     const sched = effectiveActions({ state: "todo", scheduled_at: 1 })
       .find(a => a.key === "schedule");
@@ -121,10 +121,11 @@ describe("actionLabel（workflow 绑定任务的执行按钮文案）", () => {
 });
 
 describe("actionRequest / actionToast", () => {
-  it("UI 侧处理的动作（schedule/edit/open_session）不发请求，返回 null", () => {
+  it("UI 侧处理的动作（schedule/edit/open_session/refine）不发请求，返回 null", () => {
     expect(actionRequest("schedule", "LAT-1")).toBeNull();
     expect(actionRequest("edit", "LAT-1")).toBeNull();
     expect(actionRequest("open_session", "LAT-1")).toBeNull();
+    expect(actionRequest("refine", "LAT-1")).toBeNull();
     expect(actionRequest("no-such-key", "LAT-1")).toBeNull();
   });
 

@@ -1681,10 +1681,13 @@ impl AdvisorMonitor {
                     verdict.reason.clone()
                 };
                 let mut bubble = format!("{label}：{reason}");
-                // Channel A is intervene-only: warn is a light touch
-                // (the user judges), intervene actively corrects the
-                // manager mid-loop.
-                if verdict.verdict == Verdict::Intervene && !verdict.hint.is_empty() {
+                // Channel A：warn 与 intervene 都把 hint 注入 manager 的
+                // hint 队列（下一 tool-round 边界生效）。jemalloc 事故前
+                // warn 只发气泡——advisor 警告「过度编排」时 manager 完全
+                // 收不到，继续狂奔。hint 为空时仍只发气泡。
+                if matches!(verdict.verdict, Verdict::Warn | Verdict::Intervene)
+                    && !verdict.hint.is_empty()
+                {
                     bubble.push_str(&format!(
                         "\n\n> 给 {} 的纠正提示：{}",
                         state.watched_role, verdict.hint
@@ -2704,7 +2707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_warn_bubbles_without_hint_injection() {
+    async fn monitor_warn_bubbles_and_injects_hint() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -2714,7 +2717,7 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                        "verdict: warn\nreason: 有点跑偏但可能自愈\nhint: 这句话绝不能进 manager 上下文",
+                        "verdict: warn\nreason: 有点跑偏但可能自愈\nhint: 收敛范围，先交付最小可用版",
                     ))),
             )
             .await;
@@ -2733,7 +2736,7 @@ mod tests {
         tx.send(tool_error("exec", "boom1")).unwrap();
         tx.send(tool_error("exec", "boom2")).unwrap();
 
-        // warn → bubble arrives…
+        // warn → bubble arrives, quoting the hint…
         let bubble = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match bubble_rx.recv().await {
@@ -2749,21 +2752,25 @@ mod tests {
         .expect("advisor bubble should arrive");
         assert!(bubble.contains("⚠️ warn"), "label: {bubble}");
         assert!(bubble.contains("有点跑偏"), "reason: {bubble}");
-        // …but the hint is NOT quoted in the bubble…
         assert!(
-            !bubble.contains("绝不能进"),
-            "warn bubble must not quote the hint: {bubble}"
+            bubble.contains("收敛范围"),
+            "warn bubble must quote the hint: {bubble}"
         );
 
-        // …and NOT injected: the queue holds only the deterministic
-        // D3 hint, even after the review completed.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let hints: Vec<String> = controller.advisor_hint_queue().lock().iter().cloned().collect();
-        assert_eq!(hints.len(), 1, "only the deterministic D3 hint: {hints:?}");
-        assert!(hints[0].contains("工具连续报错"));
+        // …and the hint IS injected into the manager's hint queue
+        // (jemalloc 事故：warn 只发气泡，「过度编排」警告 manager
+        // 完全收不到)。队列里同时有确定性 D3 hint 和 warn hint。
+        let hints = wait_for_hints(&controller, |h| {
+            h.iter().any(|x| x.contains("收敛范围"))
+        })
+        .await;
         assert!(
-            !hints.iter().any(|x| x.contains("绝不能进")),
-            "warn must not inject into the manager: {hints:?}"
+            hints.iter().any(|x| x.contains("工具连续报错")),
+            "deterministic D3 hint still injected: {hints:?}"
+        );
+        assert!(
+            hints.iter().any(|x| x.contains("收敛范围")),
+            "warn hint must be injected into the manager: {hints:?}"
         );
         assert_eq!(
             server.received_requests().await.unwrap().len(),

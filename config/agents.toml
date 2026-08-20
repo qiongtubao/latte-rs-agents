@@ -62,6 +62,17 @@ icon = "👔"
 # See config/agents/manager.toml for rationale.
 model_chain = ["deepseek-v4-flash"]
 
+[roles.task_planner]
+id = "task_planner"
+name = "Task Planner"
+category = "planning"
+model_tier = "standard"
+prompt_file = "prompts/task_planner.md"
+temperature = 0.3
+tools = ["read", "search", "plan"]
+icon = "🧩"
+model_chain = ["deepseek-v4-flash"]
+
 # ─── Execution Roles ─────────────────────────────────────────────────────
 
 [roles.programmer]
