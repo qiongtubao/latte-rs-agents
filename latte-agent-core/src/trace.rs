@@ -200,6 +200,38 @@ pub(crate) fn iso8601_utc_now() -> String {
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 
+/// UTF-8 安全的字节截断：`max_bytes` 是字节预算，直接 `&s[..max]`
+/// 在多字节字符中间会 panic（jemalloc 事故：中文工具校验错误在
+/// byte 256 处切断 '确'，整个 delegate task panic、workflow 失败、
+/// plan 弹窗从未出现）。回退到不超过预算的最近 char boundary。
+pub(crate) fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    &s[..end]
+}
+#[cfg(test)]
+mod utf8_prefix_tests {
+    use super::utf8_safe_prefix;
+
+    #[test]
+    fn prefix_never_slices_inside_multibyte_character() {
+        let input = "a确认结果";
+        assert_eq!(utf8_safe_prefix(input, 2), "a");
+        assert_eq!(utf8_safe_prefix(input, 4), "a确");
+        assert_eq!(utf8_safe_prefix(input, 256), input);
+    }
+
+    #[test]
+    fn zero_budget_returns_empty_prefix() {
+        assert_eq!(utf8_safe_prefix("中文", 0), "");
+    }
+}
+
 /// Convert a Unix-epoch second count to a `(year, month, day, h, m, s)`
 /// tuple in UTC. Proleptic-Gregorian, correct for every timestamp we
 /// care about in 2026.
@@ -527,7 +559,7 @@ impl TraceEventProgressSink {
 impl ChatProgressSink for TraceEventProgressSink {
     fn on_model_call_failed(&self, meta: &TraceMeta, info: ModelCallAttemptInfo) {
         let msg = if info.error_message.len() > 800 {
-            format!("{}…", &info.error_message[..800])
+            format!("{}…", utf8_safe_prefix(&info.error_message, 800))
         } else {
             info.error_message.clone()
         };
@@ -859,7 +891,7 @@ impl TraceEvent {
                 };
                 // 截断避免 trace 行无界增长；保留尾部 … 标记
                 let msg = if error_message.len() > 200 {
-                    format!("{}…", &error_message[..200])
+                    format!("{}…", utf8_safe_prefix(error_message, 200))
                 } else {
                     error_message.clone()
                 };

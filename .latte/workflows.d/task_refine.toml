@@ -1,23 +1,93 @@
 # Workflow: task_refine
 # 任务细化：任务看板「拆分子任务」入口（POST /api/tasks/:id/refine）
-# 在独立 session 里跑——task_planner（任务拆分规划师）分析任务后用
-# plan 工具一次性提交子任务清单，用户在弹窗勾选导入（导入时前端带
+# 在独立 session 里跑。四步串行：task_planner 出拆分草案 → reviewer
+# 评审（事实抽查）→ 终审门（REJECT 自动循环回 refine 返工）→ 过审后
+# task_planner 才调 plan 工具提交，用户在弹窗勾选导入（导入时前端带
 # parent_id，成为原任务的子任务）。只规划不实现：本 workflow 不派
 # worker、不改代码。
+#
+# 时序要点：评审通过后才调 plan 工具——弹窗里出现的只有过审清单。
+# 引擎事实：每个 step 的 speaker 是全新 runner，plan 工具挂私有
+# PlanStage（workflow.rs），跨 step 不受「一次一清单」门禁影响；
+# loop 返工时上轮产出自动以【上轮审查反馈】拼进 refine 的 prompt。
 
 name = "task_refine"
 command = "/task-refine"
-description = "任务细化：把看板任务拆分为可独立执行的子任务（plan 工具提交，用户勾选导入）"
+description = "任务细化：拆分草案 → reviewer 评审 → 终审门(REJECT 自动返工) → 过审后 plan 提交用户勾选"
 max_rounds = 1
 
 [[steps]]
 id = "refine"
-description = "task_planner 拆分任务并用 plan 工具一次性提交子任务清单"
+description = "task_planner 读代码摸底，输出结构化拆分草案（本步不调 plan 工具）"
 speakers = ["task_planner"]
+output_key = "draft"
 max_retries = 1
+# step 级工具过滤：本步硬性摘掉 plan 工具（引擎层 enforce，不靠
+# prompt 自觉）——草案必须先过 review/gate，submit 步才放行 plan。
+tools = ["read", "search"]
 # 拆分规则（粒度、paths、workflow 字段等）在 task_planner 角色 prompt
-# 里，这里只投递任务本体。
+# 里，这里只投递任务本体与产出格式。
 prompt = """拆分下面这条看板任务：
 
 【看板任务】
-{{topic}}"""
+{{topic}}
+
+先读代码/文档摸清现状再拆。**本步只输出草案，禁止调用 plan 工具**。输出格式：
+1) 拆分依据（每条引事实出处 file:line）；
+2) 子任务清单，每项含：title / description(做什么+验收标准) / priority(1-4，1最高) / labels / workflow(执行该任务的 workflow：tdd_development / bug_triage / update_docs / annotate_code；没有贴合的必须留空) / paths(涉及的文件/目录前缀，各任务互不重叠)。"""
+
+[steps.output_contract]
+min_chars = 200
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "review"
+description = "reviewer 评审拆分草案：覆盖度/粒度/依赖/paths/事实依据"
+speakers = ["reviewer"]
+output_key = "verdict"
+max_retries = 1
+prompt = """评审这份任务拆分草案：
+
+【原任务】
+{{topic}}
+
+【拆分草案】
+{{draft}}
+
+用 read/search 抽查事实依据（行号、文件路径、paths 前缀是否真实存在），然后按裁决格式输出：
+- ✅ 通过 / ⚠️ 有条件通过（列出修正项）/ ❌ 不通过（列出阻断问题，每条带证据）
+检查清单：① 子任务是否完整覆盖原任务目标；② 粒度是否半天到一天、各自可独立验收；③ 依赖顺序是否正确；④ paths 是否真实存在且互不重叠；⑤ 事实依据是否属实。"""
+
+[[steps]]
+id = "gate"
+description = "终审门：只裁决，不重写草案；REVISE 自动返工"
+speakers = ["reviewer"]
+output_key = "approved"
+# gate：只输出裁决与问题清单，不重写或复述完整草案。
+# ACCEPT 才进入 submit；REVISE 回到 refine；REJECT 终止 workflow。
+loop_until = "VERDICT: ACCEPT"
+loop_back_to = "refine"
+max_iterations = 2
+prompt = """根据以下评审结论判定下一步：
+
+【评审结论】
+{{verdict}}
+
+严格只输出以下三种裁决之一，并附必要的证据化问题清单：
+- `VERDICT: ACCEPT`：评审无 blocking/important 问题，当前 draft 可以直接进入 submit。
+- `VERDICT: REVISE`：存在需要 planner 修正的问题；列出每条问题的 severity、file:line 证据、影响和具体修正要求。该结果会回到 refine。
+- `VERDICT: REJECT`：输入缺失、关键事实无法核验或流程不可继续；列出阻断原因。该结果终止 workflow。
+
+不要重新生成、修改或复述完整拆分草案；不要使用 `VERDICT: PASS`。"""
+
+[steps.output_contract]
+require = ["VERDICT:"]
+
+[[steps]]
+id = "submit"
+description = "task_planner 把已通过审查的最新草案用 plan 工具一次性提交"
+speakers = ["task_planner"]
+max_retries = 1
+prompt = """下面这份拆分草案已经通过 gate 审查。请把最新 `draft` 原样转成 tasks 数组，**调用一次** plan 工具提交（禁止增删改任务内容）：
+
+{{draft}}"""

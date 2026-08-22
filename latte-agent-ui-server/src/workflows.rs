@@ -180,6 +180,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 workflow: None,
                 output_from: None,
                 output_contract: Default::default(),
+                // step 级工具过滤仅 TOML 权威版可配；表单编辑器不支持，
+                // 试运行给空（= 角色全集）。
+                tools: vec![],
             })
             .collect(),
     }

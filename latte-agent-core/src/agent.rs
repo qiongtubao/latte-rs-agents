@@ -827,6 +827,12 @@ fn classify_tool_execution_error(
         "invalid",
         "Permission denied",
         "系统运行时内部文件",
+        // plan 工具的确定性输入校验失败：原样重试只会再次被同一
+        // 份错误清单拒绝；应把错误喂回 model，让它修正 paths。
+        "paths 范围重叠",
+        "第一级目录在仓库里不存在",
+        "疑似幻觉路径",
+        "tasks[",
         // ask_human 的"错误返回"是设计好的控制流（暂停会话），不是
         // 执行失败——重试只会重复 pause + 重复发 AskHuman trace 事件。
         "session paused",
@@ -2374,11 +2380,11 @@ impl AgentRunner {
                             //
                             // 截断错误消息：长 payload（write/edit 类的大内容）
                             // 不截断会 echo 回 model 变成巨大 tool_result。
-                            const MAX_ERR_CHARS: usize = 256;
-                            let truncated = if detail.len() > MAX_ERR_CHARS {
-                                format!("{}...\n[error truncated - {} chars]",
-                                    &detail[..MAX_ERR_CHARS],
-                                    detail.len() - MAX_ERR_CHARS,
+                            const MAX_ERR_BYTES: usize = 256;
+                            let truncated = if detail.len() > MAX_ERR_BYTES {
+                                format!("{}...\n[error truncated - {} bytes]",
+                                    crate::trace::utf8_safe_prefix(&detail, MAX_ERR_BYTES),
+                                    detail.len() - MAX_ERR_BYTES,
                                 )
                             } else {
                                 detail
@@ -2769,8 +2775,8 @@ mod tests {
         assert!(!has_dangling_tool_markup_tail(&cjk));
     }
 
-    /// 永久性错误（工具不存在 / ENOENT / 参数非法）不重试；瞬时错误
-    /// 重试一次。所有错误终态都以 tool_result 回填（协议闭环）。
+    /// 永久性错误（工具不存在 / ENOENT / 参数非法 / plan 校验失败）不重试；
+    /// 瞬时错误重试一次。所有错误终态都以 tool_result 回填（协议闭环）。
     #[test]
     fn permanent_tool_errors_are_not_retried() {
         let policy = DefaultRetryPolicy;
@@ -2786,6 +2792,18 @@ mod tests {
         assert!(!policy.retryable(&kind));
         // 缺必填参数 → PermanentExec
         let kind = classify_tool_execution_error(&ToolError::other("path is required"));
+        assert!(!policy.retryable(&kind));
+        // plan 路径重叠 → PermanentExec，不能同参数重试
+        let kind = classify_tool_execution_error(&ToolError::other(
+            "以下任务的 paths 范围重叠，请调整使各任务范围互不重叠",
+        ));
+        assert!(matches!(kind, ToolCallErrorKind::PermanentExec { .. }));
+        assert!(!policy.retryable(&kind));
+        // plan 幻觉路径 → PermanentExec
+        let kind = classify_tool_execution_error(&ToolError::other(
+            "疑似幻觉路径，请用 read/search 核实后再提交",
+        ));
+        assert!(matches!(kind, ToolCallErrorKind::PermanentExec { .. }));
         assert!(!policy.retryable(&kind));
         // ask_human 的暂停控制流 → PermanentExec（重试会重复发 AskHuman 事件）
         let kind = classify_tool_execution_error(&ToolError::other(

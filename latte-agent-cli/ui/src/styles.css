@@ -881,6 +881,7 @@ select {
   font-family: var(--mono-font);
   font-size: 0.75rem;
 }
+
 .sub-event {
   border-left: 3px solid var(--accent);
   margin-bottom: 0.4rem;

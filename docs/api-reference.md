@@ -297,9 +297,9 @@ ChatController 实时事件流。每个会话独立推送。
 | `RoleList` | `roles` | 角色列表 |
 | `ContextCleared` | — | 上下文清除 |
 | `SessionInfo` | `task_id` / `state` / `turn` / `roles` | 会话信息 |
-| `ToolUse` | `role_id` / `tool_name` / `args` | 工具调用 |
-| `ToolResult` | `role_id` / `tool_name` / `result` | 工具结果 |
-| `ToolError` | `role_id` / `tool_name` / `error` | 工具错误 |
+| `ToolUse` | `role_id` / `tool_name` / `args` / `sub_id?` | 工具调用 |
+| `ToolResult` | `role_id` / `tool_name` / `result` / `sub_id?` | 工具结果 |
+| `ToolError` | `role_id` / `tool_name` / `error` / `sub_id?` | 工具错误 |
 | `DelegateStarted` | `from_role` / `to_role` / `task` / `sub_id` | 委派 |
 | `DelegateFinished` | `from_role` / `to_role` / `status` / `summary` / `sub_id` | 委派完成 |
 | `WorkflowStarted` | `name` / `topic` / `wf_id` | workflow 开始 |
@@ -336,9 +336,9 @@ export type ChatEvent =
   | { type: "RoleList"; roles: RoleInfo[] }
   | { type: "ContextCleared" }
   | { type: "SessionInfo"; task_id: string; state: string; turn: number; roles: RoleInfo[] }
-  | { type: "ToolUse"; role_id: string; tool_name: string; args: string }
-  | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
-  | { type: "ToolError"; role_id: string; tool_name: string; error: string }
+  | { type: "ToolUse"; role_id: string; tool_name: string; args: string; sub_id?: string | null }
+  | { type: "ToolResult"; role_id: string; tool_name: string; result: string; sub_id?: string | null }
+  | { type: "ToolError"; role_id: string; tool_name: string; error: string; sub_id?: string | null }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string }
   | { type: "WorkflowStarted"; name: string; topic: string; wf_id: string }
@@ -550,7 +550,7 @@ Self-loop 进度 SSE 流。
 
 ### `POST /api/tasks/<id>/refine`
 
-拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 角色用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。不改变任务状态、不记 run。仅根任务可拆；`in_progress`/`merging` 中的任务不可拆。
+拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 出拆分草案 → reviewer 评审 → 终审门 REJECT 自动返工 → 过审后用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。plan 提交前对 `paths` 做机械校验（路径前缀必须真实存在、清单内互不重叠），失败整单打回模型修正。不改变任务状态、不记 run。仅根任务可拆；`in_progress`/`merging` 中的任务不可拆。
 
 **请求体：** `{}`
 

@@ -85,6 +85,32 @@ async function main(): Promise<void> {
   }
   console.log(`[ui] session_id=${currentId}, role=${session.role}`);
 
+  async function showPanelEvents(
+    label: string,
+    load: () => Promise<Record<string, unknown>[]>,
+    render: (event: Record<string, unknown>) => HTMLElement = renderSubsessionEvent,
+  ): Promise<void> {
+    $("subsession-label").textContent = label;
+    const body = $("subsession-body");
+    body.textContent = "fetching…";
+    $("subsession-panel").classList.remove("hidden");
+    try {
+      const events = await load();
+      body.innerHTML = "";
+      if (events.length === 0) {
+        body.textContent = "(没有捕获到事件)";
+        return;
+      }
+      for (const event of events) {
+        if (!(event as Record<string, unknown>).__truncated__) {
+          body.appendChild(render(event));
+        }
+      }
+    } catch (e) {
+      body.textContent = `error: ${String(e)}`;
+    }
+  }
+
   let sseDisconnector: () => void = () => {};
   let sseConnector: () => void = () => {};
 
@@ -110,76 +136,20 @@ async function main(): Promise<void> {
     onRoleSwitch: async (roleId) => { chat.setRoleSelected(roleId); },
     onReconnect: () => sseConnector(),
     onEditRole: (roleId) => { roleEditor.open(roleId); },
-    onShowSubsession: async (subId, label) => {
-      $("subsession-label").textContent = label;
-      const body = $("subsession-body");
-      body.textContent = "fetching…";
-      $("subsession-panel").classList.remove("hidden");
-      try {
-        const events = await fetchSubsession(subId);
-        body.innerHTML = "";
-        if (events.length === 0) {
-          body.textContent = "(没有捕获到事件 — 该委托可能在启动专家前就失败了)";
-          return;
-        }
-        let truncated = false;
-        for (const ev of events) {
-          const raw = ev as Record<string, unknown>;
-          // __truncated__ 是 API 返回的截断标记，不是 TraceEvent
-          if (raw.__truncated__) {
-            truncated = true;
-            // 渲染一条提示行 + 加载更多按钮
-            const note = document.createElement("div");
-            note.className = "subsession-truncated";
-            note.textContent = String(raw.note ?? "(事件过多，仅显示最近部分)");
-            body.appendChild(note);
-            const loadMore = document.createElement("button");
-            loadMore.className = "subsession-load-more";
-            loadMore.textContent = "加载全部";
-            loadMore.addEventListener("click", async () => {
-              body.innerHTML = "loading…";
-              try {
-                const all = await fetchSubsession(subId, 0);
-                body.innerHTML = "";
-                for (const aev of all) {
-                  if (!(aev as Record<string, unknown>).__truncated__) {
-                    body.appendChild(renderSubsessionEvent(aev as Record<string, unknown>));
-                  }
-                }
-              } catch (e2) { body.textContent = `error: ${String(e2)}`; }
-            });
-            body.appendChild(loadMore);
-          } else {
-            body.appendChild(renderSubsessionEvent(raw));
-          }
-        }
-      } catch (e) {
-        body.textContent = `error: ${String(e)}`;
-      }
+    onShowSubsession: (subId, label) => {
+      void showPanelEvents(
+        label,
+        async () => (await fetchSubsession(subId)) as Record<string, unknown>[],
+      );
     },
-    onShowSessionLog: async () => {
-      // 主 turn status 行右键 → 把整个 session 的 ChatEvent 历史
-      // 拉回来渲染在 subsession 详情面板里。这是给「manager 开
-      // 始执行 / 完成 / 失败」一类行用的：它们没有 subId，但
-      // 上下文里有完整 ToolUse / RoleTurn 流水。
-      $("subsession-label").textContent = "本次执行日志";
-      const body = $("subsession-body");
-      body.textContent = "fetching…";
-      $("subsession-panel").classList.remove("hidden");
-      try {
-        const events = await getSessionHistory(getCurrentSessionId() || currentId);
-        body.innerHTML = "";
-        if (events.length === 0) {
-          body.textContent = "(本次 session 还没有事件)";
-          return;
-        }
-        for (const ev of events) {
-          body.appendChild(renderSubsessionEvent(ev as Record<string, unknown>));
-        }
-      } catch (e) { body.textContent = `error: ${String(e)}`; }
+    onShowSessionLog: () => {
+      void showPanelEvents(
+        "本次执行日志",
+        async () => (await getSessionHistory(getCurrentSessionId() || currentId)) as Record<string, unknown>[],
+        renderChatHistoryEvent,
+      );
     },
     onFork: async (events) => {
-      // 从当前 session 的这段历史前缀分叉出新 session，然后切过去。
       const sourceId = getCurrentSessionId() || currentId;
       if (!sourceId) return;
       try {
@@ -365,6 +335,7 @@ async function main(): Promise<void> {
       closeBtn: $("task-board-close") as HTMLButtonElement,
       newBtn: $("task-board-new") as HTMLButtonElement,
       dispatchAllBtn: $("task-board-dispatch-all") as HTMLButtonElement,
+      manageTypesBtn: $("task-board-manage-types") as HTMLButtonElement,
       statRunningEl: $("tb-stat-running"),
       statScheduledEl: $("tb-stat-scheduled"),
       statReviewEl: $("tb-stat-review"),
@@ -623,6 +594,43 @@ function renderSubsessionEvent(ev: Record<string, unknown>): HTMLElement {
       break;
     default:
       body.textContent = safeJSON(payload ?? ev);
+  }
+  d.appendChild(body);
+  return d;
+}
+
+function renderChatHistoryEvent(ev: Record<string, unknown>): HTMLElement {
+  const d = document.createElement("div");
+  d.className = "sub-event chat-history-event";
+  const type = String(ev.type ?? "event");
+  const head = document.createElement("div");
+  head.className = "ev-meta";
+  head.textContent = type;
+  d.appendChild(head);
+  const body = document.createElement("div");
+  body.className = "ev-data";
+  switch (type) {
+    case "RoleTurn":
+    case "WorkflowTurn":
+      body.textContent = `${String(ev.role_id ?? "")}：${String(ev.content ?? "")}`;
+      break;
+    case "Status":
+      body.textContent = String(ev.message ?? "");
+      break;
+    case "DelegateStarted":
+      body.textContent = `${String(ev.from_role ?? "manager")} → ${String(ev.to_role ?? "")}: ${String(ev.task ?? "")}`;
+      break;
+    case "DelegateFinished":
+      body.textContent = `${String(ev.to_role ?? "")} 返回（${String(ev.status ?? "")}）：${String(ev.summary ?? "")}`;
+      break;
+    case "ToolUse":
+      body.textContent = `🔧 ${String(ev.tool_name ?? "")} ${String(ev.args ?? "")}`;
+      break;
+    case "ToolResult":
+      body.textContent = `✅ ${String(ev.tool_name ?? "")} → ${String(ev.result ?? "")}`;
+      break;
+    default:
+      body.textContent = safeJSON(ev);
   }
   d.appendChild(body);
   return d;

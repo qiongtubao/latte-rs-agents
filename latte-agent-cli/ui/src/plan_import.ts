@@ -28,6 +28,7 @@ export function buildSelectedPlanTasks(
       description: r.description.trim() || undefined,
       priority: r.priority,
       labels: r.task.labels,
+      task_type: (r.task as any).task_type ?? (r.task as any).taskType,
       workflow: r.task.workflow,
       paths: r.task.paths,
       subtasks: r.task.subtasks,

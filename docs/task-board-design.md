@@ -1,8 +1,9 @@
 # 任务看板（Task Board）设计文档
 
-> 状态：草稿 · 分支 `latte/task-board` · 2026-07-26
+> 状态：v2 · 分支 `latte/task-board` · 2026-08-22
+> v2 新增：可配置 **任务类型 `task_type → 默认 workflow`**（`config/task_types.toml` / `.latte/task_types.toml`）
 > 参考：OpenAI Symphony（`/home/dong/Documents/github/symphony`，SPEC.md §4/§7/§8）
-> 原型：`task-board.html`（仓库根目录静态 mockup）
+> 原型：`task-board.html`（仓库根目录静态 mockup）+ `latte-agent-cli/ui/src/task_board.ts`
 
 ## 1. 目标
 
@@ -10,6 +11,9 @@
 不同状态提供不同的"下一步动作"；`todo` 状态可指定时间执行；
 执行 = 把任务交给 manager（新建一个 ui-session，多角色协作）；
 "查看执行详情"直接跳转到现有的 ui-session 多角色对话页面。
+
+v2 新增：**业务类型 `task_type`（可配置）→ 默认 workflow**，类型决定执行流水线；
+未指定类型与 workflow 时默认走普通 manager 会话（不绑死）。
 
 非目标（v1 不做）：
 
@@ -65,6 +69,27 @@
 | Merging | 💬 查看对话 · ✓ 标记完成（→ Done） |
 | Done / Cancelled | 重新打开（→ Todo） |
 
+## 2.2 任务类型 `task_type → 默认 workflow`
+
+可配置注册表：`config/task_types.toml`（权威默认，随包 `include_str!` 编进 binary）
++ 项目层覆盖 `.latte/task_types.toml`（同名覆盖，未声明的不动）。`GET /api/task-types` 暴露。
+
+| `task_type` | 名称 | `default_workflow` | 说明 |
+|---|---|---|---|
+| `feature` | 功能开发 | `tdd_development` | 需求→TDD实现→规格/质量双审 |
+| `bugfix` | 缺陷修复 | `bug_triage` | 复现定界→根因→修复方案→终审 |
+| `learn` | 学习任务 | `learn` | 六层图解教程 |
+| `research` | 探索调研 | `explore` | 通读代码/文档产出决策背景 |
+| `docs` | 文档写作 | `write_doc` | doc-graph 写文档 |
+| `chore` | 杂项/运维 | *(空)* | 不绑定，走普通 manager 会话 |
+
+派发规则（`tasks::dispatch_task`）：
+
+1. 显式 `workflow` 优先；
+2. 否则按 `task_type` 的 `default_workflow` 推导；
+3. 都为空 → 普通 manager 会话（`api::chat_send`）。
+`TaskView.effective_workflow` 供前端直接展示实际生效值。
+
 ## 3. 存储结构
 
 每个项目的数据放在项目根 `.latte/tasks/`（ui-server 的 cwd 即项目根，天然按项目隔离）：
@@ -108,10 +133,12 @@
   "priority": 1,
   "state": "todo",
   "labels": [],
+  "task_type": "feature",
   "parent_id": "LAT-100",
   "sub_order": 0,
 
   "scheduled_at": null,
+  "workflow": null,
 
   "runs": [
     {
@@ -131,105 +158,19 @@
 }
 ```
 
+- **`task_type`**：业务类型，可空（旧文件缺省 `null` 兼容）；派发时按注册表推导 `effective_workflow`
+- **`workflow`**：显式绑定；空表示未绑定（可被类型默认覆盖）
+- **`effective_workflow`**：仅视图字段（`TaskView`），不落盘
 - **`runs` 数组**：每次执行（含重跑、rework 再派发）新建 ui-session 并追加一条；
   `runs.last().session_id` 即"查看执行详情"跳转目标，
   对应 `.latte/ui-sessions/<session_id>.jsonl`
 - **`result` 枚举**：`completed` / `aborted` / `failed` / `timeout`
-- **`history` 内嵌**：事件量小不单独开 JSONL；`actor` ∈ `user` / `scheduler` / `manager`
+- **`history` 内嵌**：事件量小不单独开 JSONL；`actor` ∈ `user` / `scheduler` / `manager` / `code_review` / `workflow`
 
 ### 3.3 任务嵌套（父子）
 
 - 扁平文件 + `parent_id` 引用，**最多一层**（父任务不允许再有 `parent_id`）
-- 子任务是普通任务：独立状态机、独立排期/派发/ runs
+- 子任务是普通任务：独立状态机、独立排期/派发/ runs，独立 `task_type`
 - 父状态**手动控制，不自动级联**；父卡片显示聚合进度（`子任务 3/5`），
   全部子任务终态时抽屉给提示 + 一键确认完成
 - 派发父任务时把子任务清单拼进发给 manager 的消息（见 §5）
-
-## 4. Scheduler
-
-ui-server 内一个 tokio task（对齐 symphony 的 poll loop，大幅简化）：
-
-- 每 5s 扫一次 `.latte/tasks/`：`state == "todo" && scheduled_at != null && scheduled_at <= now` → 派发
-- 派发前重读文件再校验一次（symphony `dispatch_issue` 的 re-fetch 防 stale）
-- 服务重启后补偿：启动时扫一遍，已过点的排期任务立即派发
-- v1 不做并发上限/每状态配额（symphony 的 `max_concurrent_agents_by_state`），
-  需要时再加到 board.json
-
-## 5. 派发：任务 → manager
-
-`dispatch(task)`：
-
-1. 新建 ui-session（initial_role = `manager`），label = `[LAT-101] 任务标题`
-2. 把任务内容作为首条 user message 发给 manager：
-
-```
-[任务 LAT-101] 实现新 ringbuf 核心读写路径
-优先级：P1
-描述：……
-（若是父任务）子任务：
-  1. [LAT-102] 并发压测（todo）
-  2. [LAT-103] 迁移调用点（todo）
-完成后请汇报结果摘要。
-```
-
-3. 任务 → `in_progress`，`runs` 追加 `{session_id, started_at}`
-4. 之后走现有机制：manager delegate / workflow，多角色对话在 ui-session 页面可见
-
-### 5.1 状态回报（manager → 看板）— v1 已落地：C + /report 接口
-
-| 方案 | 做法 | 取舍 |
-|---|---|---|
-| A. 工具回报（推荐） | manager 增加 `task_report` 工具（或 prompt 约定调用 `POST /api/tasks/<id>/report`），完成时上报 summary → 任务进 `human_review` | 状态准确；要给 manager 注入 task_id 上下文 |
-| B. 会话侧监听 | ui-server 监听 session 的 turn 结束事件，超时无活动 → 自动进 `human_review` | 零侵入但不准（manager 可能多问几轮） |
-| C. 纯手动 | 用户看完对话手动拖状态 | 最简单，体验差 |
-
-**v1 落地（2026-07-26）**：**方案 C + `/report` 接口已备**——
-`POST /api/tasks/:id/report`（body `{summary, result}`）已实现并可用
-（`tasks::report_task`：completed → human_review，其他 → todo，history
-actor=manager），但 manager 侧的工具/prompt 注入（方案 A 完整版）留作
-后续；在此之前用户始终可以手动改状态（PATCH）。
-
-§5 的派发消息模板以实际代码为准（`tasks::build_dispatch_message`）。
-
-## 6. API（`latte-agent-ui-server/src/tasks.rs`）
-
-```
-GET    /api/tasks                     # 全量列表（含子任务聚合进度）
-POST   /api/tasks                     # 新建（可带 parent_id）
-GET    /api/tasks/<id>                # 详情
-PATCH  /api/tasks/<id>                # 改标题/描述/优先级/状态/排期
-POST   /api/tasks/<id>/dispatch       # 立即执行（或 rework 重新派发）
-POST   /api/tasks/<id>/abort          # 中止执行（走现有 chat/abort 机制）
-POST   /api/tasks/<id>/report         # manager 回报完成（方案 A）
-DELETE /api/tasks/<id>                # 删除（或进 archive/）
-```
-
-`TaskStore`：目录扫描 + 内存索引 + 原子写 + `next_seq` 分配，挂在 `UiBackend` 上。
-
-## 7. UI
-
-- mockup 先行：`task-board.html`（已完成，根目录），确认交互后移植为
-  `latte-agent-cli/ui` 的真实面板（与 traces / role editor 同级的 tab）
-- 看板 7 列 + 顶栏统计；卡片显示 id/优先级/排期 chip/session chip/子任务进度
-- 详情抽屉：状态徽章、**当前状态可用的下一步动作区**、描述、属性、
-  子任务列表（父任务）、状态历史时间线
-- "查看对话 / session 链接" → 跳转到现有 ui-session 对话页（按 session_id 定位 tab）
-
-## 8. 实施步骤
-
-1. `task-board.html` mockup 评审（本文档配套的视觉稿）✅
-2. `tasks.rs`：Task 模型 + TaskStore + 原子写 + 单测
-3. REST API 接入 `handlers.rs` / `lib.rs` 路由
-4. Scheduler tokio task + dispatch（建 session 发 manager）
-5. manager 回报链路（方案 A：prompt 注入 task_id + `/report` 接口）
-6. vite 真实面板移植，接真实 API
-7. 黑盒测试：`tests/blackbox/` 补任务生命周期用例
-
-## 9. 开放问题
-
-- **Q1 状态回报**：§5.1 方案 A/B/C，倾向 A+C 兜底，待确认
-- **Q2 中止语义**：abort 时是否同时 cancel session 里正在跑的 delegate/workflow？
-  （现有 `/chat/abort` 能力直接复用，但 task 侧回到 todo 还是 cancelled 需要定）
-- **Q3 排期任务与关机**：服务不在运行时错过的排期，启动时立即补发还是提示后人工确认？
-  （当前设计：立即补发）
-- **Q4 归档**：`archive/` 手动移入还是 Done 超过 N 天自动归档？（当前设计：手动）

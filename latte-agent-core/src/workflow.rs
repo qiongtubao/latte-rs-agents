@@ -190,6 +190,14 @@ pub struct WorkflowStepDef {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub max_retries: u32,
+    /// step 级工具过滤：非空时本 step 的 speaker 只能用
+    /// `role.allowed_tools ∩ tools`（保持角色配置里的顺序）；空 =
+    /// 角色全集（现状）。用途：同一角色在不同 step 的能力收紧——如
+    /// task_refine 的 refine 步禁 task_planner 调 plan（草案必须先过
+    /// 评审），submit 步才放开。请求了角色没有的工具名会在构建 runner
+    /// 时打 warning 并忽略（不过滤出不存在的工具）。
+    #[serde(default)]
+    pub tools: Vec<String>,
     /// 产出契约：speaker 产出不合格时带批注重试（复用 `max_retries`
     /// 作为重试上限），耗尽则 step 失败。默认空契约 = 不校验。
     #[serde(default)]
@@ -1168,11 +1176,37 @@ async fn run_workflow_inner(
     }
 }
 
+/// step 级工具过滤：`step_tools` 为空 → 角色全集；非空 → 求交集
+/// （保持角色配置的顺序）。返回 (有效工具, 被忽略的 step 请求项)——
+/// 忽略项是「角色本来就没有该工具」的请求（多为笔误），调用方打
+/// warning，不静默吞。
+fn effective_step_tools(
+    role_tools: &[String],
+    step_tools: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if step_tools.is_empty() {
+        return (role_tools.to_vec(), vec![]);
+    }
+    let effective: Vec<String> = role_tools
+        .iter()
+        .filter(|t| step_tools.iter().any(|s| s == *t))
+        .cloned()
+        .collect();
+    let ignored: Vec<String> = step_tools
+        .iter()
+        .filter(|s| !role_tools.iter().any(|t| t == *s))
+        .cloned()
+        .collect();
+    (effective, ignored)
+}
+
 /// Build a fresh `AgentRunner` for one role, wired exactly like the
 /// chat/controller `build_runner`: tool-capable roles get the tool-use
 /// protocol prompt + ground-truth block, plan tool registered when
 /// allowed. Used by [`run_step_speaker`] (one fresh runner per
 /// dispatch). `advisor` is rejected (monitor only).
+/// `step_tools` 非空时按 step 声明过滤角色工具（见
+/// [`effective_step_tools`]）。
 ///
 /// Returns the runner plus the role's **base** system prompt (before
 /// the tool-protocol / ground-truth appends) — the delegate-return
@@ -1190,6 +1224,7 @@ async fn build_role_runner(
     // 文档暂存层：Some 时把 runner 工具表里的 write/read 换成暂存
     // 包装版（写重定向 + 读 overlay），见 crate::staging。
     staging: Option<Arc<crate::staging::Staging>>,
+    step_tools: &[String],
 ) -> Result<(AgentRunner, String), String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
@@ -1211,6 +1246,17 @@ async fn build_role_runner(
     // delegate-return 审查的"职责"参照：追加工具协议/ground truth
     // 之前的角色本体 prompt（与 controller delegate 路径一致）。
     let role_responsibilities = role.system_prompt.clone();
+    // step 级工具过滤：非空时收紧到 role.allowed_tools ∩ step_tools。
+    // 请求了角色没有的工具名 → warning（多为笔误），不静默吞。
+    let (effective_tools, ignored) = effective_step_tools(&role.allowed_tools, step_tools);
+    if !ignored.is_empty() {
+        eprintln!(
+            "[workflow] step 请求了角色 '{role_id}' 没有的工具，已忽略：{}（角色可用：{}）",
+            ignored.join(", "),
+            role.allowed_tools.join(", ")
+        );
+    }
+    role.allowed_tools = effective_tools;
     // 与 chat 的 build_runner 一致：带工具的角色必须拿到工具调用协议
     // 提示 + 系统 ground truth（cwd 等），否则模型不知道该用工具，
     // 会回答"我没有文件访问权限"。
@@ -1263,7 +1309,7 @@ async fn build_role_runner(
         if role.allowed_tools.iter().any(|t| t == "plan") {
             let plan_stage: crate::controller::SharedPlanStage =
                 Arc::new(parking_lot::RwLock::new(crate::controller::PlanStage::Normal));
-            register_plan_tool(&rtm, event_tx.clone(), role_id.to_string(), plan_stage)
+            register_plan_tool(&rtm, event_tx.clone(), role_id.to_string(), plan_stage, &cwd)
                 .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
         }
         // ask / task_report：与 controller::build_runner 对齐——manager
@@ -1348,6 +1394,8 @@ struct SpeakerDispatch {
     review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
     advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
     staging: Option<Arc<crate::staging::Staging>>,
+    /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
+    step_tools: Vec<String>,
 }
 
 impl SpeakerDispatch {
@@ -1358,6 +1406,7 @@ impl SpeakerDispatch {
         step_id: &str,
         speaker: String,
         prompt: String,
+        step_tools: Vec<String>,
     ) -> Self {
         Self {
             speaker,
@@ -1377,6 +1426,7 @@ impl SpeakerDispatch {
             review_engine,
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
+            step_tools,
         }
     }
 }
@@ -1453,6 +1503,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             inp.agent_pause_gate.clone(),
             inp.cancel_flag.clone(),
             inp.staging.clone(),
+            &inp.step_tools,
         )
         .await
         {
@@ -1482,6 +1533,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     sink.clone(),
                     Arc::new(crate::controller::ChatEventTraceSink {
                         event_tx: inp.event_tx.clone(),
+                        sub_id: sub_id.clone(),
                     }),
                 ]));
             runner = runner.with_sink(specialist_sink);
@@ -1869,6 +1921,7 @@ async fn run_workflow_serial(
                         &step.id,
                         speaker.clone(),
                         prompt.clone(),
+                        step.tools.clone(),
                     );
                     let mut response = match run_step_speaker(dispatch).await {
                         Ok(r) => r,
@@ -1950,6 +2003,13 @@ async fn run_workflow_serial(
             // （缺省 = 自己）重做，本 step 产出作为批注预置进目标 prompt；
             // 迭代上限 max_iterations（缺省 3，硬上限 10），耗尽即失败。
             if let Some(cond) = &step.loop_until {
+                if last_output.contains("VERDICT: REJECT") {
+                    return WfOutcome::Failed(format!(
+                        "step '{}' 终止 workflow：{}",
+                        step.id,
+                        last_output.chars().take(500).collect::<String>()
+                    ));
+                }
                 if !last_output.contains(cond.as_str()) {
                     let count = {
                         let c = loop_iters.entry(idx).or_insert(0);
@@ -2147,6 +2207,7 @@ async fn run_dag_step(
                 review_engine: inp.review_engine.clone(),
                 advisor_pause: inp.advisor_pause.clone(),
                 staging: inp.staging.clone(),
+                step_tools: step.tools.clone(),
             };
             let mut response = match run_step_speaker(dispatch).await {
                 Ok(r) => r,
@@ -2386,6 +2447,13 @@ async fn run_workflow_dag(
             let mut rework_notes: Vec<String> = Vec::new();
             for (sidx, _key, out) in &wave_results {
                 let step = &wf.steps[*sidx];
+                if out.contains("VERDICT: REJECT") {
+                    return WfOutcome::Failed(format!(
+                        "step '{}' 终止 workflow：{}",
+                        step.id,
+                        out.chars().take(500).collect::<String>()
+                    ));
+                }
                 let Some(cond) = &step.loop_until else { continue };
                 if out.contains(cond.as_str()) {
                     continue;
@@ -3226,10 +3294,83 @@ task = "t"
         assert!(breakdown.max_retries >= 1, "contract needs retry budget");
     }
 
-    /// 验收：两个 gate 的 prompt 必须守住「有条件通过不丢修正项」——
-    /// ⚠️ 有条件通过时 PASS 必须附「【通过条件/修正项】」，实测错误
-    /// 未吸收时必须 REJECT（jemalloc 实锤：4 处 stats.c 行号实测错误
-    /// 随裸 VERDICT: PASS 被放行，带错清单直接进了任务看板）。
+    /// 验收：task_refine 是「草案 → 评审 → 终审门 → 过审后才 plan 提交」
+    /// 的四步评审流。gate 只输出裁决，submit 消费最新 draft。
+    #[test]
+    fn task_refine_is_reviewed_four_step_flow() {
+        let raw = include_str!("../../config/workflows/task_refine.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("task_refine should validate");
+
+        let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["refine", "review", "gate", "submit"]);
+
+        let refine = &wf.steps[0];
+        assert_eq!(refine.output_key.as_deref(), Some("draft"));
+        assert_eq!(refine.output_contract.min_chars, Some(200));
+        assert!(
+            refine.task_text().contains("禁止调用 plan"),
+            "refine 步必须禁止调 plan（草案先过评审）"
+        );
+
+        let review = &wf.steps[1];
+        assert_eq!(review.roles(), &["reviewer".to_string()]);
+        assert_eq!(review.output_key.as_deref(), Some("verdict"));
+
+        let gate = &wf.steps[2];
+        assert_eq!(gate.loop_until.as_deref(), Some("VERDICT: ACCEPT"));
+        assert_eq!(gate.loop_back_to.as_deref(), Some("refine"));
+        assert_eq!(gate.max_iterations, Some(2));
+        assert_eq!(gate.output_contract.require, vec!["VERDICT:"]);
+        assert!(gate.prompt.contains("VERDICT: ACCEPT"));
+        assert!(gate.prompt.contains("VERDICT: REVISE"));
+        assert!(gate.prompt.contains("VERDICT: REJECT"));
+        assert!(gate.prompt.contains("不要重新生成、修改或复述完整拆分草案"));
+        assert!(!gate.prompt.contains("原样完整附上拆分草案"));
+        assert_eq!(gate.output_key.as_deref(), Some("approved"));
+
+        let submit = &wf.steps[3];
+        assert_eq!(submit.roles(), &["task_planner".to_string()]);
+        assert!(
+            submit.task_text().contains("{{draft}}"),
+            "submit 步必须消费最新 draft，而不是 gate 裁决文本"
+        );
+        assert!(!submit.task_text().contains("{{approved}}"));
+
+        // step 级工具过滤：refine 步硬性摘掉 plan（引擎层 enforce，
+        // 不靠 prompt 自觉），submit 步不限制（需要 plan 提交）。
+        assert_eq!(refine.tools, vec!["read", "search"]);
+        assert!(review.tools.is_empty());
+        assert!(gate.tools.is_empty());
+        assert!(submit.tools.is_empty());
+    }
+
+    /// step 级工具过滤语义：空 = 角色全集；非空 = 交集（保持角色
+    /// 顺序），角色没有的请求项进 ignored（笔误预警），不静默吞。
+    #[test]
+    fn effective_step_tools_intersects_and_reports_ignored() {
+        let role = vec!["read".to_string(), "search".to_string(), "plan".to_string()];
+
+        // 空 = 全集
+        let (eff, ignored) = effective_step_tools(&role, &[]);
+        assert_eq!(eff, role);
+        assert!(ignored.is_empty());
+
+        // 交集 + 保序 + 忽略项上报
+        let (eff, ignored) = effective_step_tools(
+            &role,
+            &["serach".to_string(), "plan".to_string(), "read".to_string()],
+        );
+        assert_eq!(eff, vec!["read", "plan"]);
+        assert_eq!(ignored, vec!["serach"]);
+
+        // 全都不匹配 → 空工具表（合法：该 step 只用语言产出）
+        let (eff, _) = effective_step_tools(&role, &["nonexistent".to_string()]);
+        assert!(eff.is_empty());
+    }
+
+    /// implementation_plan 与 design_and_plan 仍使用旧 PASS 兼容契约；
+    /// task_refine 的 ACCEPT/REVISE/REJECT 契约由专门测试覆盖。
     #[test]
     fn gate_prompts_keep_conditions_and_reject_unabsorbed_errors() {
         let cases: [(&str, &str); 2] = [
@@ -3251,18 +3392,9 @@ task = "t"
                 .find(|s| s.id == "gate")
                 .unwrap_or_else(|| panic!("{wf_name} must have a gate step"));
             let prompt = gate.task_text();
-            assert!(
-                prompt.contains("【通过条件/修正项】"),
-                "{wf_name} gate 必须要求附条件/修正项"
-            );
-            assert!(
-                prompt.contains("实测错误"),
-                "{wf_name} gate 必须要求未吸收实测错误时 REJECT"
-            );
-            assert!(
-                prompt.contains("VERDICT: PASS") && prompt.contains("VERDICT: REJECT"),
-                "{wf_name} gate 必须保留双裁决"
-            );
+            assert!(prompt.contains("【通过条件/修正项】"));
+            assert!(prompt.contains("实测错误"));
+            assert!(prompt.contains("VERDICT: PASS") && prompt.contains("VERDICT: REJECT"));
         }
     }
 
@@ -3486,6 +3618,7 @@ forbid = ["TBD"]
             None,
             Arc::new(AtomicBool::new(false)),
             None,
+            &[],
         )
         .await
         .expect("worker runner");
@@ -4459,7 +4592,7 @@ max_iterations = 3
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REJECT 有阻断问题",
+                "VERDICT: REVISE 有阻断问题",
             )))
             .up_to_n_times(1)
             .mount(&server)
@@ -4487,7 +4620,7 @@ max_iterations = 3
         assert_eq!(design_reqs.len(), 2, "design 应重跑一次: {}", design_reqs.len());
         assert!(
             design_reqs[1].contains("【上轮审查反馈】")
-                && design_reqs[1].contains("VERDICT: REJECT"),
+                && design_reqs[1].contains("VERDICT: REVISE"),
             "重跑的 design prompt 必须带返工反馈: {}",
             design_reqs[1]
         );
@@ -4534,7 +4667,7 @@ max_iterations = 2
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REJECT 仍有阻断",
+                "VERDICT: REVISE 仍有阻断",
             )))
             .mount(&server)
             .await;
@@ -4826,6 +4959,57 @@ output_key = "quality"
             .collect()
     }
 
+    /// gate 明确返回 REJECT 时必须立即终止；只有 REVISE 才允许
+    /// 通过 loop_until 回到上游返工。
+    #[tokio::test]
+    async fn serial_loop_reject_is_terminal() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("实现任务"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("实现产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("终审判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT\nISSUES: 输入无法核验",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "reject_terminal"
+[[steps]]
+id = "implement"
+role = "programmer"
+task = "实现任务：{{topic}}"
+output_key = "impl"
+[[steps]]
+id = "gate"
+role = "reviewer"
+task = "终审判定：{{impl}}"
+output_key = "verdict"
+loop_until = "VERDICT: ACCEPT"
+loop_back_to = "implement"
+max_iterations = 2
+"#,
+        )
+        .expect("valid workflow");
+        wf.validate().expect("workflow must validate");
+
+        let (ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        let err = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect_err("REJECT 必须立即终止 workflow");
+        assert!(err.contains("VERDICT: REJECT"), "错误应保留 REJECT 理由: {err}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(bodies_containing(&requests, "实现任务").len(), 1);
+        assert_eq!(bodies_containing(&requests, "终审判定").len(), 1);
+    }
+
     /// 审查 FAIL → 自动跳回 implement 返工（模型调 2 次、第二次请求带
     /// "上轮审查反馈"批注与 FAIL 内容）→ 第二次审查 PASS → 流程继续到
     /// quality_review 完成。
@@ -5005,6 +5189,33 @@ loop_until = "VERDICT: PASS"
         .unwrap();
         let err = wf.validate().expect_err("嵌套 step 的 loop_until 必须报错");
         assert!(err.contains("嵌套"), "got: {err}");
+    }
+
+    /// task_refine 的 gate 必须用明确的 ACCEPT token 放行；REVISE/REJECT
+    /// 只能保留裁决与问题，不应要求 gate 复制完整 draft。
+    #[test]
+    fn task_refine_gate_contract() {
+        for raw in [
+            include_str!("../../.latte/workflows.d/task_refine.toml"),
+            include_str!("../../config/workflows/task_refine.toml"),
+        ] {
+            let wf: WorkflowDef = toml::from_str(raw).expect("task_refine TOML 必须有效");
+            wf.validate().expect("task_refine workflow 必须通过校验");
+            let gate = wf
+                .steps
+                .iter()
+                .find(|step| step.id == "gate")
+                .expect("task_refine 必须包含 gate step");
+            assert_eq!(gate.loop_until.as_deref(), Some("VERDICT: ACCEPT"));
+            assert_eq!(gate.loop_back_to.as_deref(), Some("refine"));
+            assert_eq!(gate.max_iterations, Some(2));
+            assert_eq!(gate.output_contract.require, vec!["VERDICT:"]);
+            assert!(gate.prompt.contains("VERDICT: ACCEPT"));
+            assert!(gate.prompt.contains("VERDICT: REVISE"));
+            assert!(gate.prompt.contains("VERDICT: REJECT"));
+            assert!(gate.prompt.contains("不要重新生成、修改或复述完整拆分草案"));
+            assert!(!gate.prompt.contains("原样完整附上拆分草案"));
+        }
     }
 
     /// tdd_development.toml：spec_review 带 loop_until/loop_back_to/max_iterations，

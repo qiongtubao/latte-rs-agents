@@ -24,22 +24,15 @@ interface UIBinding {
 export interface ChatController {
   appendUser(content: string): string;
   handleEvent(e: ChatEvent): void;
-  /** Replay archived events when switching back to a session.
-   * Renders messages but suppresses network side effects (role
-   * switching) and resets status/timers afterwards. */
   replayEvents(events: ChatEvent[]): void;
   setFooter(msg: string): void;
   setRoleSelected(roleId: string): void;
   refreshRoles(roles: RoleInfo[], selected: string): void;
-  setStatus(s: "connected" | "disconnected" | "thinking" | "stalled"): void;
+  setStatus(status: "connected" | "disconnected" | "thinking" | "stalled"): void;
   clear(): void;
-  /** Focus the chat input (exposed to the host as `__LATTE_UI__.focus`). */
   focus(): void;
-  /** Update role → file path map for filename display in bubbles. */
-  setRoleFilePaths(paths: Record<string, string>): void;
-  /** Insert a code reference (and optional quote block) at the input
-   * cursor — the host calls this via `__LATTE_UI__.insertContext`. */
   insertContext(ref: CodeRef & { quote?: string }): void;
+  setRoleFilePaths(paths: Record<string, string>): void;
 }
 
 const ROLE_ICONS: Record<string, string> = {
@@ -171,11 +164,8 @@ export function renderMarkdown(text: string): string {
 export function mountChat(opts: {
   container: UIBinding; initialRole: string; initialModel?: string;
   onRoleSwitch?: (roleId: string) => Promise<void>;
-  onShowSubsession?: (subId: string, label: string) => void;
-
-  /** 状态行（status）右键「查看本次执行日志」的回调 —— 主 turn 没
-   *  有 subId 时用 session 全量历史代替 subsession 详情面板。 */
-  onShowSessionLog?: () => Promise<void> | void;
+  onShowSubsession?: (subId: string, label: string, anchor?: HTMLElement) => void;
+  onShowSessionLog?: (anchor?: HTMLElement) => Promise<void> | void;
   onEditRole?: (roleId: string) => void;
 
   /** Fork a new session from the given event prefix (the source
@@ -204,6 +194,23 @@ export function mountChat(opts: {
   /** advisor 暂停期间的「等待拍板」横幅；拍板或 Resumed 事件后清除。 */
   let advisorPauseBannerEl: HTMLElement | null = null;
 
+  /** Last event identity rendered. SSE reconnects can replay the same
+   * persisted event immediately after live delivery; suppress only exact
+   * adjacent duplicates, preserving legitimate repeated turns. */
+  let lastEventIdentity = "";
+
+  function eventIdentity(e: ChatEvent): string {
+    switch (e.type) {
+      // Lifecycle events can legitimately repeat for the same role/detail
+      // (e.g. two archived turns), so they are not deduplicated.
+      case "RoleTurn": return `${e.type}|${e.role_id}|${e.sub_id ?? ""}|${e.is_complete}|${e.content}`;
+      case "WorkflowTurn": return `${e.type}|${e.wf_id}|${e.step_id}|${e.round}|${e.content}`;
+      case "ToolUse": return `${e.type}|${e.sub_id ?? ""}|${e.tool_name}|${e.args}`;
+      case "ToolResult": return `${e.type}|${e.sub_id ?? ""}|${e.tool_name}|${e.result}`;
+      case "ToolError": return `${e.type}|${e.sub_id ?? ""}|${e.tool_name}|${e.error}`;
+      default: return "";
+    }
+  }
   // ── Delegate tracking (keyed by sub_id for parallel delegates) ──
   interface DelegateInfo {
     targetRole: string;
@@ -215,35 +222,26 @@ export function mountChat(opts: {
   }
   const activeDelegates = new Map<string, DelegateInfo>();
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
-  /** wf_id → pending badge element on the WorkflowStarted bubble. */
+  /** wf_id → workflow run status and display name. */
   const workflowStates = new Map<string, HTMLElement>();
-  /** wf_id → workflow 名（WorkflowStarted 时记录），用于给流程内
-   *  分派气泡打「🔀 工作流 <name>」标记。 */
   const wfNames = new Map<string, string>();
-  /** wf_id:step_id → pending badge element on WorkflowStep bubbles. */
-  const stepStates = new Map<string, HTMLElement>();
-  /** 当前流式渲染中的气泡（`RoleTurn{is_complete:false}` 增量追加到它）。
-   *  收到 `is_complete:true` 时清空。跨 role 的并行输出按 role 维度
-   *  分别保留，这里存 role_id → 气泡元素。 */
+  /** WorkflowStep metadata is paired FIFO with the next DelegateStarted. */
+  const workflowStepQueues = new Map<string, Array<{ key: string; roleId: string; taskText: string }>>();
+  const workflowStepMsgIds = new Map<string, string>();
+  const workflowStepSubIds = new Map<string, string>();
+  /** role_id → active streaming response bubble. */
   const streamingEl = new Map<string, HTMLElement>();
-  /** role_id → 该 role 流式输出的累积原始文本。delta 到达时对累积
-   *  文本整体重渲染——逐段 innerHTML += 会让跨 chunk 的 Markdown
-   *  标记（如 `**粗体` 分两段到达）永远无法解析。 */
+  /** role_id → accumulated raw streaming text. */
   const streamingRaw = new Map<string, string>();
-  /** wf_id:step_id → WorkflowStep 消息的 msgId（WorkflowTurn 做引用用） */
-const stepMsgIds = new Map<string, string>();
-  /** 最近渲染过的 WorkflowTurn 正文（去重用）。嵌套 workflow 结束时，
-   *  父引擎会把内层产出以 role_id="workflow:X" 再发一遍，内容与内层
-   *  最后一个 turn 完全相同；原样渲染会在聊天里重复一遍全文。 */
-  const recentTurnContents: string[] = [];
-  /** wf_id → 该 workflow 各 turn 的文本累积（用于完成后扫描任务 JSON）。 */
+  /** wf_id → workflow output transcript used for plan import extraction. */
   const workflowTranscripts = new Map<string, string>();
   /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
   let roleFilePaths = new Map<string, string>();
 
   /** Find the (most recent) pending delegate targeting `roleId` —
-   *  tool events carry role_id but no sub_id, so parallel delegates
-   *  are attributed by role. */
+   *  fallback for tool events without sub_id (legacy archives / direct
+   *  feeds); current backend fills sub_id on delegate tool events, so
+   *  this only fires for old data. */
   function findDelegateSubByRole(roleId: string): string {
     let found = "";
     for (const [subId, di] of activeDelegates) {
@@ -262,29 +260,28 @@ const stepMsgIds = new Map<string, string>();
     workflowStates.clear();
     workflowTranscripts.clear();
   }
-
   let lastUserMsgId = "";
   let lastRoleStarted = "";
   let subagentTools: string[] = [];
-  /** role_id → 执行中状态行**队列**。同一 role 可被并行 workflow 步
-   *  同时委派（日志事故：tester 同时跑 code_review/review 与
-   *  requirements_review/estimate），每个 RoleStarted 独立一行，
-   *  否则后来的 start 覆盖 Map 条目、先启动的行永远转圈。
-   *  队列项带 subId（主 session 角色 turn 为空），既用于
-   *  RoleFinished/Error 精确配对，也让右键「查看日志」直接命中。 */
+  /** role_id → pending status rows; sub_id distinguishes parallel delegates. */
   const executingRowsByRole = new Map<string, Array<{ row: HTMLElement; subId: string }>>();
-
   function pushExecutingRow(roleId: string, row: HTMLElement, subId: string): void {
     const q = executingRowsByRole.get(roleId) ?? [];
     q.push({ row, subId });
     executingRowsByRole.set(roleId, q);
   }
 
-  /** 工具调用/结果的折叠落点：该 role 最近一条未结行（并行同角色
-   *  的工具事件不带 sub_id，无法精确归属，取最新行是最佳猜测）。 */
-  function latestExecutingRow(roleId: string): { row: HTMLElement; subId: string } | undefined {
+  /** 工具调用/结果的折叠落点：优先按 sub_id 精确命中该 subsession
+   *  的未结行（并行委派同一 role 时不会串行）；事件不带 sub_id
+   *  （主 session 角色、旧归档回放）时退回该 role 最近一条未结行。 */
+  function latestExecutingRow(roleId: string, subId?: string | null): { row: HTMLElement; subId: string } | undefined {
     const q = executingRowsByRole.get(roleId);
-    return q && q.length > 0 ? q[q.length - 1] : undefined;
+    if (!q || q.length === 0) return undefined;
+    if (subId) {
+      const hit = q.find((e) => e.subId === subId);
+      if (hit) return hit;
+    }
+    return q[q.length - 1];
   }
 
   /** RoleFinished/Error 配对取出并移除一条未结行：优先 sub_id 精确
@@ -308,8 +305,8 @@ const stepMsgIds = new Map<string, string>();
   // - 第一次调用时在状态行内创建一个 .tool-log 子元素并折叠状态。
   // - 同一 role 后续的工具调用追加在 .tool-log 内。
   // - 返回 true 表示已折叠，false 表示需要降级为独立气泡。
-  function appendToolToExecutingRow(roleId: string, line: string): boolean {
-    const execEntry = latestExecutingRow(roleId);
+  function appendToolToExecutingRow(roleId: string, line: string, subId?: string | null): boolean {
+    const execEntry = latestExecutingRow(roleId, subId);
     if (!execEntry) return false;
     const row = execEntry.row;
     if (!row) return false;
@@ -1404,11 +1401,11 @@ const stepMsgIds = new Map<string, string>();
 
   currentRoleIcon = roleIcon(initialRole);
   container.rolePill.textContent = `${currentRoleIcon} ${initialRole}`;
-  function makeSubsessionBtn(subId: string, label: string): HTMLElement {
+  function makeSubsessionBtn(subId: string, label: string, anchor?: HTMLElement): HTMLElement {
     const lnk = document.createElement("span");
     lnk.className = "subsession-link";
     lnk.textContent = "📋 详情";
-    lnk.addEventListener("click", (e) => { e.stopPropagation(); if (onShowSubsession) onShowSubsession(subId, label); });
+    lnk.addEventListener("click", (e) => { e.stopPropagation(); onShowSubsession?.(subId, label, anchor); });
     return lnk;
   }
 
@@ -1488,9 +1485,9 @@ const stepMsgIds = new Map<string, string>();
         el.style.display = "none";
       } else if (act === "view-subagent" && !hasSubId) {
         el.style.display = "none";
-      } else if (act === "view-execution-log" && (isStatus === false || hasSubId)) {
-        // 仅「主 turn 的 status 行」显示本次执行日志入口（无 subId
-        // 但又是执行类行）；其他行隐藏。
+      } else if (act === "view-execution-log" && hasSubId) {
+        // Subagent rows use the dedicated subsession action; all top-level
+        // messages, including advisor RoleTurn bubbles, use session history.
         el.style.display = "none";
       } else if (act === "add-to-board" && !(record?.planTasks && record.planTasks.length > 0)) {
         // 仅 plan 工具产出的消息（带 planTasks）显示「导入任务看板」。
@@ -1541,7 +1538,7 @@ const stepMsgIds = new Map<string, string>();
         if (subId && onShowSubsession) {
           // 有子会话：打开完整过程（含工具调用/bash 日志）
           const label = record.meta ? `${roleIcon(record.meta)} ${record.meta}` : "subagent";
-          onShowSubsession(subId, label);
+          onShowSubsession(subId, label, record.el);
         } else if (record && record.subagent) {
           const logEl = document.getElementById("subagentLog")!;
           logEl.textContent = record.subagent.detail || "无详细信息";
@@ -1555,7 +1552,7 @@ const stepMsgIds = new Map<string, string>();
         // 主 turn 的 status 行（无 subId）：跳到本次 session 全量
         // 历史 —— 上面有 ToolUse / RoleTurn / Status 等完整流水。
         if (onShowSessionLog) {
-          void onShowSessionLog();
+          void onShowSessionLog(record.el);
         } else {
           alert("查看本次执行日志回调未注册");
         }
@@ -1675,16 +1672,15 @@ const stepMsgIds = new Map<string, string>();
         console.error("[chat] cancelTurn failed", e);
       });
     });
-    // 插到 messages 流的最顶端（在 user / role / tool 消息之前），
-    // 让用户一眼就能看到。
+    // 插到 messages 流的最顶端，让用户一眼看到。
     container.messagesEl.insertBefore(node, container.messagesEl.firstChild);
     timeoutPromptEl = node;
     timeoutPromptRole = ev.role_id;
   }
   function handleEvent(e: ChatEvent): void {
-    // Record the event in the fork mirror and expose its index to
-    // addMessage (so rows created for this event are tagged). Reset to
-    // -1 after dispatch so synthetic local rows stay untagged.
+    const identity = eventIdentity(e);
+    if (identity && identity === lastEventIdentity) return;
+    lastEventIdentity = identity;
     allEvents.push(e);
     currentEventIdx = allEvents.length - 1;
     try {
@@ -1697,8 +1693,6 @@ const stepMsgIds = new Map<string, string>();
     switch (e.type) {
       case "RoleStarted": {
         subagentTools = [];
-        // 后端在 delegate / workflow speaker 路径的 RoleStarted 上带
-        // sub_id；旧归档/直连接口可能缺省，退回 delegate 上下文猜测。
         const startedSubId = e.sub_id || findDelegateSubByRole(e.role_id) || currentDelegateSubId || undefined;
         const isDelegate = !!startedSubId;
         const node = addMessage({
@@ -1709,18 +1703,24 @@ const stepMsgIds = new Map<string, string>();
           state: "executing",
         });
         if (isDelegate) {
-          // 标记 delegate 角色供 CSS/查询区分（主 chat 流无标记）
           node.classList.add("is-delegate-role");
           node.dataset.delegate = "true";
+          if (startedSubId) {
+            const detail = document.createElement("span");
+            detail.className = "subsession-link";
+            detail.textContent = "📋 详情";
+            detail.addEventListener("click", (event) => {
+              event.stopPropagation();
+              onShowSubsession?.(startedSubId, `${roleIcon(e.role_id)} ${e.role_id}`, node);
+            });
+            node.querySelector(".message.status")?.appendChild(detail);
+          }
         }
         pushExecutingRow(e.role_id, node, startedSubId ?? "");
         lastRoleStarted = e.role_id;
         break;
       }
       case "RoleFinished": {
-        // 按 (role_id, sub_id) 精确配对 RoleStarted 时插入的
-        // executing 行，原地切到 .done；不带 sub_id 的旧事件退化
-        // 为清该 role 最早的未结行。找不到再新插一条完成行。
         const entry = takeExecutingRow(e.role_id, e.sub_id);
         if (entry) {
           const inner = entry.row.querySelector(".message.status") as HTMLElement | null;
@@ -1731,12 +1731,8 @@ const stepMsgIds = new Map<string, string>();
             if (content) content.textContent = `✅ ${e.role_id} 完成`;
           }
         } else {
-          // 没有匹配的 executing 行（边角事件）—— 退回老行为
           addMessage({ kind: "status", content: `✅ ${e.role_id} 完成`, meta: e.role_id, state: "done" });
         }
-        // turn 结束（不论 ok / failed）就把这条 role 的 timeout
-        // prompt 收起来 —— 后端不会再推 TimeoutWarning，下一次
-        // Warning 出现时再重新展示。
         hideTimeoutPrompt(e.role_id);
         break;
       }
@@ -1758,8 +1754,6 @@ const stepMsgIds = new Map<string, string>();
       }
       case "ImageGenerated": {
         // generate_image 工具产出：角色气泡 + 图片 + 截断的 prompt 说明。
-        // prompt 走 addMessage 的 escapeHtml 路径（纯文本），<img> 用
-        // createElement 构建 —— 绝不 innerHTML 拼接用户/模型内容。
         const icon = resolveIcon(e.role_id);
         const imgMsg = addMessage({
           kind: "role",
@@ -1783,17 +1777,17 @@ const stepMsgIds = new Map<string, string>();
       }
       case "ToolUse": {
         const t = truncate(e.args, 100);
-        subagentTools.push(`🔧 ${e.tool_name}(${t})`);
+        const line = `🔧 ${e.tool_name}(${t})`;
+        subagentTools.push(line);
         currentToolCall = `🔧 ${e.tool_name}`; currentActivity = `正在调用 ${e.tool_name}…`;
         updateFooter(); updateStatusPillLabel(`🔧 ${resolveIcon(e.role_id)} ${e.tool_name}`); resetWaitTimer();
-        // Attribute by role so parallel delegates each collect their own tools.
-        const toolSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
-        const di = activeDelegates.get(toolSubId);
-        // 折叠进 role 的 executing 状态行（不是独立气泡）。
-        // 主 chat 流（manager 等顶级角色）和 delegate 下属 subagent role
-        // 走同一个 RoleStarted 分支，都会入 executingRowsByRole 队列 —— 所以
-        // appendToolToExecutingRow 同时覆盖主/从两条路径。
-        if (!appendToolToExecutingRow(e.role_id, `🔧 ${e.tool_name}(${t})`)) {
+        if (e.sub_id) {
+          // Subagent tools are persisted in the subsession trace. Keep them
+          // out of the top-level chat; the standard Subsession panel renders
+          // the complete event stream when the user opens Details.
+          break;
+        }
+        if (!appendToolToExecutingRow(e.role_id, line)) {
           const toolRow = addMessage({ kind: "tool", content: `${e.tool_name} ${t}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
           const useChips = makeRefChips(extractCodeRefs(e.tool_name, e.args));
           if (useChips) toolRow.querySelector(".msg-bubble")?.appendChild(useChips);
@@ -1802,17 +1796,16 @@ const stepMsgIds = new Map<string, string>();
       }
       case "ToolResult": {
         const short = truncate(e.result, 80);
-        subagentTools.push(`✅ ${e.tool_name} → ${short}`);
-        updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
-        const resultSubId = findDelegateSubByRole(e.role_id) || currentDelegateSubId;
-        const di2 = activeDelegates.get(resultSubId);
-        if (di2 && di2.capturedTools.length > 0) {
-          const last = di2.capturedTools[di2.capturedTools.length - 1];
-          if (last.tool === e.tool_name) last.result = e.result;
-        }
         const resultLine = e.result.toLowerCase().startsWith("error")
           ? `❌ ${e.tool_name} → ${short}`
           : `✅ ${e.tool_name} → ${short}`;
+        subagentTools.push(resultLine);
+        updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
+        if (e.sub_id) {
+          // Render through the same standard subsession view as every other
+          // delegate, rather than the legacy live overlay.
+          break;
+        }
         if (!appendToolToExecutingRow(e.role_id, resultLine)) {
           const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
           const resultChips = makeRefChips(extractCodeRefs(e.tool_name, "", e.result));
@@ -1821,21 +1814,16 @@ const stepMsgIds = new Map<string, string>();
         break;
       }
       case "ToolError": {
-        subagentTools.push(`❌ ${e.tool_name}: ${truncate(e.error, 100)}`);
+        const line = `❌ ${e.tool_name}: ${truncate(e.error, 120)}`;
+        subagentTools.push(line);
         updateFooter(); resetWaitTimer();
-        // 折叠进 executing 行（之前根本没 addMessage，行为退化为 footer-only）；
-        // 现在写入 .tool-log 让用户在状态行直接看到错误。
-        if (!appendToolToExecutingRow(e.role_id, `❌ ${e.tool_name}: ${truncate(e.error, 120)}`)) {
-          // race: RoleFinished 已到（takeExecutingRow 弹空了队列），或 delegate 下属 role
-          // 没进 executingRowsByRole。此时不应静默吞掉——至少写到 footer + 上报 trace 一行。
-          console.warn("[chat] late ToolError (no executing row):", e.tool_name, e.error);
-          if (currentDelegateSubId) {
-            // delegate subsession 上下文，把错误注入 subagent badge（detail 已经有 subagentTools）
-            // ——subagentTools 已经 push 上面那一行，UI 通过右键「查看 subagent 过程」可见。
-          } else {
-            setFooter(`❌ ${e.tool_name}: ${truncate(e.error, 80)}`);
-          }
+        if (e.sub_id) {
+          // The standard subsession view owns subagent tool errors too.
           break;
+        }
+        if (!appendToolToExecutingRow(e.role_id, line)) {
+          console.warn("[chat] late ToolError (no executing row):", e.tool_name, e.error);
+          setFooter(`❌ ${e.tool_name}: ${truncate(e.error, 80)}`);
         }
         break;
       }
@@ -1930,52 +1918,41 @@ const stepMsgIds = new Map<string, string>();
       case "RoundEnded": addMessage({ kind: "system", content: `[回合 ${e.round} 结束]` }); resetWaitTimer(); break;
       case "DelegateStarted": {
         const taskText = e.task.trim() || "(empty)";
-        // workflow 流程内分派（wf_id 标记）：归属 manager 的气泡渲染，
-        // meta 上打「🔀 工作流 <name>」标记——workflow 默认由 manager
-        // 出面执行，不再显示为虚拟的 "workflow 分派" 来源。
-        // 旧日志回放（无 wf_id、from_role === "workflow"）仍走 status
-        // 行分支保持兼容。
         const wfName = e.wf_id ? (wfNames.get(e.wf_id) ?? "workflow") : "";
-        const legacyWorkflow = !e.wf_id && (e.from_role || "") === "workflow";
-        const delegateMsg = legacyWorkflow
-          ? addMessage({
-              kind: "status",
-              content: `@${e.to_role} ${taskText}`,
-              meta: "workflow 分派",
-              icon: roleIcon("workflow"),
-              subId: e.sub_id,
-            })
-          : addMessage({
-              kind: "role",
-              content: `@${e.to_role} ${taskText}`,
-              meta: wfName ? `manager · 🔀 ${wfName}` : (e.from_role || "manager"),
-              icon: roleIcon(e.from_role || "manager"),
-              subId: e.sub_id,
-              filePath: getFilePath(e.to_role),
-            });
+        const queued = e.wf_id ? workflowStepQueues.get(e.wf_id) : undefined;
+        const step = queued?.find((candidate) => candidate.roleId === e.to_role);
+        if (step && queued) {
+          queued.splice(queued.indexOf(step), 1);
+          workflowStepSubIds.set(step.key, e.sub_id);
+        }
+        const displayTask = step?.taskText ?? taskText;
+        const delegateMsg = addMessage({
+          kind: "role",
+          content: `@${e.to_role} ${displayTask}`,
+          meta: wfName ? `manager · 🔀 ${wfName}` : (e.from_role || "manager"),
+          icon: roleIcon(e.from_role || "manager"),
+          subId: e.sub_id,
+          filePath: getFilePath(e.to_role),
+        });
         const msgId = delegateMsg.dataset.messageId || "";
-        // Pending-state badge on the delegate bubble — flipped to
-        // ✅/❌ by DelegateFinished, or to a timeout error by the watchdog.
+        if (step) workflowStepMsgIds.set(step.key, msgId);
         const stateEl = document.createElement("span");
         stateEl.className = "delegate-state pending";
         stateEl.textContent = "⏳ 执行中…";
-        // status 行没有 .msg-bubble，徽章挂到内层 .message 上。
-        const badgeHost = delegateMsg.querySelector(".msg-bubble")
-          ?? delegateMsg.querySelector(".message");
-        badgeHost?.appendChild(stateEl);
+        delegateMsg.querySelector(".msg-bubble")?.appendChild(stateEl);
         activeDelegates.set(e.sub_id, {
           targetRole: e.to_role,
-          taskText,
+          taskText: displayTask,
           delegateMsgId: msgId,
           capturedTools: [],
           stateEl,
         });
         currentDelegateSubId = e.sub_id;
         subagentTools = [];
-
         delegateRunning = true; currentDelegate = `${e.from_role} → ${e.to_role}`;
         currentToolCall = ""; currentActivity = `等待 ${e.to_role}`;
-        const icon = currentRoleIcon || "🧠"; updateFooter(); updateStatusPillLabel(`⏳ ${icon} → ${e.to_role}`);
+        const icon = currentRoleIcon || "🧠";
+        updateFooter(); updateStatusPillLabel(`⏳ ${icon} → ${e.to_role}`);
         container.rolePill.textContent = `⏳ ${roleIcon(e.to_role)} ${e.to_role}`;
         resetWaitTimer(); break;
       }
@@ -1991,7 +1968,7 @@ const stepMsgIds = new Map<string, string>();
         // summary 是专家返回/失败原因的正文，失败时尤其要看，拼进消息里。
         const summary = e.summary?.trim() ? `\n${truncate(e.summary, 300)}` : "";
         const msg = addMessage({ kind, content: `${prefix}${wfTag} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})${summary}`, subId: e.sub_id });
-        msg.appendChild(makeSubsessionBtn(e.sub_id, label));
+        msg.appendChild(makeSubsessionBtn(e.sub_id, label, msg));
         if (isFail) msg.classList.add("fail-flash");
         // Flip the pending badge on the DelegateStarted bubble.
         const finishedDi = activeDelegates.get(e.sub_id);
@@ -1999,7 +1976,7 @@ const stepMsgIds = new Map<string, string>();
           finishedDi.stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
           finishedDi.stateEl.className = `delegate-state ${isFail ? "failed" : "done"}`;
         }
-        msg.addEventListener("contextmenu", (ev) => { ev.preventDefault(); if (onShowSubsession) onShowSubsession(e.sub_id, label); });
+        msg.addEventListener("contextmenu", (ev) => { ev.preventDefault(); onShowSubsession?.(e.sub_id, label, msg); });
         currentDelegate = ""; currentActivity = "";
         const icon = currentRoleIcon || resolveIcon(e.from_role);
         updateFooter(); updateStatusPillLabel(`${icon} 思考中…`);
@@ -2051,71 +2028,35 @@ const stepMsgIds = new Map<string, string>();
         break;
       }
       case "WorkflowStep": {
-        const icon = roleIcon("manager");
-        const taskText = e.task?.trim() || e.description?.trim() || e.step_id;
-        const delegateMsg = addMessage({
-          kind: "role",
-          content: `@${e.role_id} ${taskText}`,
-          meta: "manager",
-          icon,
-          filePath: getFilePath("manager"),
+        const key = `${e.wf_id}:${e.step_id}`;
+        const queue = workflowStepQueues.get(e.wf_id) ?? [];
+        queue.push({
+          key,
+          roleId: e.role_id,
+          taskText: e.task?.trim() || e.description?.trim() || e.step_id,
         });
-        // 保存此 delegate 消息的 msgId，供 WorkflowTurn 做引用预览
-        const delegateMsgId = delegateMsg.dataset.messageId || "";
-        stepMsgIds.set(`${e.wf_id}:${e.step_id}`, delegateMsgId);
-        // Step pending state badge
-        const stateEl = document.createElement("span");
-        stateEl.className = "delegate-state pending";
-        stateEl.textContent = "⏳ 执行中…";
-        delegateMsg.querySelector(".msg-bubble")?.appendChild(stateEl);
-        stepStates.set(`${e.wf_id}:${e.step_id}`, stateEl);
+        workflowStepQueues.set(e.wf_id, queue);
         resetWaitTimer();
         break;
       }
       case "WorkflowTurn": {
-        const icon = roleIcon(e.role_id);
-        const stepKey = `${e.wf_id}:${e.step_id}`;
-        // 引用回 WorkflowStep 的 delegate 消息（显示"被分配了什么任务"）
-        const delegateMsgId = stepMsgIds.get(stepKey);
-        const taskPreview = delegateMsgId
-          ? (getMsgById(delegateMsgId)?.content ?? "").replace(/^@\S+\s+/, "").slice(0, 30)
-          : "workflow 任务";
-        const ref = delegateMsgId ? { refId: delegateMsgId, preview: taskPreview } : undefined;
-        // 嵌套 workflow 回声去重：父 step 的 WorkflowTurn（role_id 为
-        // "workflow:X"）携带的是内层 workflow 的整份产出，与刚渲染过
-        // 的内层 turn 正文相同；此时只留一条引用提示，不重复贴全文。
-        const trimmed = e.content.trim();
-        const isNestedEcho =
-          e.role_id.startsWith("workflow:") && recentTurnContents.includes(trimmed);
-        if (isNestedEcho) {
-          addMessage({
-            kind: "system",
-            content: `↩ ${e.role_id} 步产出与上方内容相同，不再重复展示`,
-            reference: ref,
-          });
-        } else {
-          addMessage({
-            kind: "role",
-            content: e.content,
-            meta: `${e.role_id}（workflow）`,
-            icon,
-            filePath: getFilePath(e.role_id),
-            reference: ref,
-          });
-          recentTurnContents.push(trimmed);
-          if (recentTurnContents.length > 20) recentTurnContents.shift();
-        }
+        const key = `${e.wf_id}:${e.step_id}`;
+        const dispatchId = workflowStepMsgIds.get(key);
+        const reference = dispatchId
+          ? { refId: dispatchId, preview: (getMsgById(dispatchId)?.content ?? "").slice(0, 60) }
+          : undefined;
+        addMessage({
+          kind: "role",
+          content: e.content,
+          meta: `${e.role_id}（workflow）`,
+          icon: roleIcon(e.role_id),
+          reference,
+          filePath: getFilePath(e.role_id),
+        });
         workflowTranscripts.set(
           e.wf_id,
           (workflowTranscripts.get(e.wf_id) ?? "") + "\n" + e.content,
         );
-        // 标记该步骤为已完成（翻转 step badge）
-        const stepEl = stepStates.get(stepKey);
-        if (stepEl) {
-          stepEl.textContent = "✅ 完成";
-          stepEl.className = "delegate-state done";
-          stepStates.delete(stepKey);
-        }
         resetWaitTimer();
         break;
       }
@@ -2385,12 +2326,7 @@ const stepMsgIds = new Map<string, string>();
           el.textContent = "⚠️ 已中断（点 ▶ 从断点续跑）";
           el.className = "delegate-state failed";
         }
-        for (const el of stepStates.values()) {
-          el.textContent = "⚠️ 已中断";
-          el.className = "delegate-state failed";
-        }
         workflowStates.clear();
-        stepStates.clear();
       }
       setStatus("connected");
     }

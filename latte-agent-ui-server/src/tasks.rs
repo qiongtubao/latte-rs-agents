@@ -94,6 +94,11 @@ pub struct Task {
     pub state: String,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// 业务类型：feature/bugfix/learn/research/docs/chore 等，
+    /// 可配置于 `config/task_types.toml` / `.latte/task_types.toml`。
+    /// 旧文件缺省 → None（兼容），未填时派发走普通 manager 会话。
+    #[serde(default)]
+    pub task_type: Option<String>,
     /// 最多一层嵌套：父任务不允许再有 `parent_id`。
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -103,7 +108,8 @@ pub struct Task {
     #[serde(default)]
     pub scheduled_at: Option<i64>,
     /// 绑定的 workflow 名：派发时直接跑该 workflow（不走 manager 派发）。
-    /// 旧落盘文件无此字段 → `None`。
+    /// 旧落盘文件无此字段 → `None`。为空/空白视为未绑定。
+    /// 若未显式绑定但 `task_type` 有默认 workflow，则按类型推导。
     #[serde(default)]
     pub workflow: Option<String>,
     /// 任务声明涉及的文件/目录前缀（相对项目根），用于派发时的跨族
@@ -208,6 +214,8 @@ impl BoardMeta {
 pub struct TaskView {
     #[serde(flatten)]
     pub task: Task,
+    /// 派发时实际生效的 workflow（显式 workflow 优先，否则按 task_type 默认推导；None=走 manager）。
+    pub effective_workflow: Option<String>,
     /// 子任务总数（非子任务本身也有，恒 0）。
     pub sub_total: usize,
     /// 子任务中已终态（done/cancelled）的数量。
@@ -328,6 +336,7 @@ impl TaskStore {
         description: &str,
         priority: i64,
         labels: Vec<String>,
+        task_type: Option<String>,
         parent_id: Option<String>,
         scheduled_at: Option<i64>,
         workflow: Option<String>,
@@ -339,6 +348,18 @@ impl TaskStore {
         if !(1..=4).contains(&priority) {
             return Err(format!("priority 必须在 1-4 之间，收到 {priority}"));
         }
+        // task_type 校验：为 Some 时必须在注册表已知（旧落盘 None 兼容）。
+        let task_type = match task_type.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(tt) => {
+                let cwd = self.dir.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new("."));
+                let reg = crate::task_types::TaskTypeRegistry::load(cwd);
+                if !reg.types.is_empty() && !reg.is_known(tt) {
+                    return Err(format!("unknown task_type '{tt}'"));
+                }
+                Some(tt.to_string())
+            }
+        };
         // 父子规则（§3.3，最多一层）。
         if let Some(pid) = &parent_id {
             let parent = self
@@ -371,6 +392,7 @@ impl TaskStore {
             priority,
             state: "backlog".to_string(),
             labels,
+            task_type,
             parent_id,
             sub_order,
             scheduled_at,
@@ -489,7 +511,12 @@ impl TaskStore {
                 done += 1;
             }
         }
+        // effective workflow 供前端直接展示（避免前端再拉注册表计算）
+        let cwd = self.dir.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new("."));
+        let reg = crate::task_types::TaskTypeRegistry::load(cwd);
+        let effective = crate::task_types::effective_workflow(task.task_type.as_deref(), task.workflow.as_deref(), &reg);
         TaskView {
+            effective_workflow: effective,
             actions: task.effective_actions(),
             task: task.clone(),
             sub_total: children.len(),
@@ -532,7 +559,12 @@ pub struct CreateTaskRequest {
     pub labels: Vec<String>,
     #[serde(default)]
     pub scheduled_at: Option<i64>,
+    /// 业务类型：feature/bugfix/learn/research/docs/chore 等，须在
+    /// `config/task_types.toml` 注册；未知类型 400（旧任务 None 兼容）。
+    #[serde(default)]
+    pub task_type: Option<String>,
     /// 绑定的 workflow 名（必须存在于 `.latte/workflows.d`，否则 400）。
+    /// 为空时按 `task_type` 的默认 workflow 推导；两者都为空 → 走 manager。
     #[serde(default)]
     pub workflow: Option<String>,
 }
@@ -553,6 +585,9 @@ pub struct TaskPatch {
     pub scheduled_at: Option<Option<i64>>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// 业务类型：三态（缺省不变 / null 清空 / 字符串设置），未知类型 400。
+    #[serde(default, deserialize_with = "deserialize_nullable")]
+    pub task_type: Option<Option<String>>,
     /// 双层 Option：缺省 = 不变；`null` = 解绑 workflow；字符串 = 绑定。
     /// （plain `#[serde(default)]` 会把显式 `null` 折叠成"缺省"，
     /// 必须自定义 deserialize_with 才能区分三者。）
@@ -602,6 +637,8 @@ pub struct ImportTask {
     pub priority: Option<i64>,
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default)]
+    pub task_type: Option<String>,
     #[serde(default)]
     pub workflow: Option<String>,
     /// 任务涉及的文件/目录前缀（相对项目根）：派发时与在跑任务范围
@@ -656,6 +693,7 @@ pub fn get_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
 }
 
 pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, ApiError> {
+    validate_task_type(&b.cwd, req.task_type.as_deref())?;
     validate_workflow_name(&b.cwd, req.workflow.as_deref())?;
     let mut store = b.tasks.write();
     let t = store
@@ -664,6 +702,7 @@ pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, Ap
             &req.description,
             req.priority.unwrap_or(3),
             req.labels,
+            req.task_type,
             req.parent_id,
             req.scheduled_at,
             req.workflow,
@@ -675,6 +714,16 @@ pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, Ap
 
 /// 校验 workflow 名：`Some(name)` 时必须能在项目/全局
 /// `workflows.d` 里找到，否则 400。
+fn validate_task_type(cwd: &Path, tt: Option<&str>) -> Result<(), ApiError> {
+    if let Some(name) = tt.map(str::trim).filter(|s| !s.is_empty()) {
+        let reg = crate::task_types::TaskTypeRegistry::load(cwd);
+        if !reg.is_known(name) {
+            return Err(ApiError::bad_request(format!("unknown task_type '{name}'")));
+        }
+    }
+    Ok(())
+}
+
 fn validate_workflow_name(cwd: &Path, name: Option<&str>) -> Result<(), ApiError> {
     if let Some(n) = name {
         if !crate::workflows::exists(cwd, n) {
@@ -724,14 +773,25 @@ fn import_one(
         }
         Some(wf) => Some(wf.to_string()),
     };
+    let task_type = match item.task_type.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(tt) => {
+            let reg = crate::task_types::TaskTypeRegistry::load(cwd);
+            if !reg.is_known(tt) {
+                return Err(format!("unknown task_type '{tt}'"));
+            }
+            Some(tt.to_string())
+        }
+    };
     let parent = store.create(
         &title,
         &item.description,
         item.priority.unwrap_or(3),
         item.labels.clone(),
+        task_type.clone(),
         parent_id.map(str::to_string),
         None,
-        workflow,
+        workflow.clone(),
         "import",
     )?;
     if !item.paths.is_empty() {
@@ -750,6 +810,15 @@ fn import_one(
                 return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
             }
         }
+        if let Some(tt) = sub.task_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let reg = crate::task_types::TaskTypeRegistry::load(cwd);
+            if !reg.is_known(tt) {
+                return Err(format!("unknown task_type '{tt}'（子任务 '{stitle}'）"));
+            }
+        }
+        let sub_task_type = sub.task_type.as_deref().map(str::trim).and_then(|tt| {
+            if tt.is_empty() { None } else { Some(tt.to_string()) }
+        });
         // 子任务 workflow 引用不存在时同样降级；空串/空白 = 不绑定。
         let sub_workflow = sub.workflow.as_deref().map(str::trim).and_then(|wf| {
             if !wf.is_empty() && crate::workflows::exists(cwd, wf) {
@@ -763,6 +832,7 @@ fn import_one(
             &sub.description,
             sub.priority.unwrap_or(3),
             sub.labels.clone(),
+            sub_task_type,
             Some(parent.id.clone()),
             None,
             sub_workflow,
@@ -902,6 +972,19 @@ pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView
         }
         if let Some(sched) = patch.scheduled_at {
             t.scheduled_at = sched;
+        }
+        if let Some(tt) = patch.task_type {
+            match tt.as_deref().map(str::trim) {
+                None => t.task_type = None,
+                Some("") => t.task_type = None,
+                Some(name) => {
+                    let reg = crate::task_types::TaskTypeRegistry::load(&b.cwd);
+                    if !reg.is_known(name) {
+                        return Err(ApiError::bad_request(format!("unknown task_type '{name}'")));
+                    }
+                    t.task_type = Some(name.to_string());
+                }
+            }
         }
         if let Some(wf) = patch.workflow {
             if let Some(name) = &wf {
@@ -1107,7 +1190,7 @@ fn build_dispatch_message(
 /// （actor=workflow，见 [`apply_workflow_finish`]）。
 pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskView, ApiError> {
     // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
-    let (title, priority, description, children, workflow, prev_state, recent_notes) = {
+    let (title, priority, description, children, task_type, workflow, prev_state, recent_notes) = {
         let store = b.tasks.read();
         let t = store
             .get(id)
@@ -1154,6 +1237,7 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
             t.priority,
             t.description.clone(),
             store.children_of(id),
+            t.task_type.clone(),
             t.workflow.clone(),
             t.state.clone(),
             notes,
@@ -1166,11 +1250,12 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
     api::set_session_label(b, &info.session_id, &label)?;
     let base_msg = build_dispatch_message(id, &title, priority, &description, &children);
 
-    // 3. workflow 绑定分支：加载 workflow 并准备运行上下文；加载失败
-    //    → 400（不回退到 manager 派发，也不改任务状态）。非绑定任务
-    //    走经典路径：发首条消息给 manager。
+    // 3. workflow 绑定分支：显式 workflow 优先，否则按 task_type 默认推导；
+    //    都为空 → 走普通 manager 会话（可配置注册表的"未指定即 manager"语义）。
     //    rework 状态改用 rework 返工流（带审查反馈），而不是原样重跑开发流。
-    let wf_run = if let Some(bound_name) = &workflow {
+    let reg = crate::task_types::TaskTypeRegistry::load(&b.cwd);
+    let effective = crate::task_types::effective_workflow(task_type.as_deref(), workflow.as_deref(), &reg);
+    let wf_run = if let Some(bound_name) = effective {
         let (wf_name, msg) = if prev_state == "rework" {
             let feedback = if recent_notes.is_empty() {
                 String::new()
@@ -1887,7 +1972,7 @@ mod tests {
 
     fn make_task(store: &mut TaskStore, title: &str) -> Task {
         store
-            .create(title, "desc", 2, vec![], None, None, None, "user")
+            .create(title, "desc", 2, vec![], None, None, None, None, "user")
             .expect("create")
     }
 
@@ -2021,18 +2106,18 @@ mod tests {
         let (_dir, mut store) = tmp_store();
         let parent = make_task(&mut store, "父");
         let child = store
-            .create("子", "", 3, vec![], Some(parent.id.clone()), None, None, "user")
+            .create("子", "", 3, vec![], None, Some(parent.id.clone()), None, None, "user")
             .expect("create child");
         assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
         assert_eq!(child.sub_order, 0);
         // parent 必须存在。
         let err = store
-            .create("孤儿", "", 3, vec![], Some("LAT-999".into()), None, None, "user")
+            .create("孤儿", "", 3, vec![], None, Some("LAT-999".into()), None, None, "user")
             .unwrap_err();
         assert!(err.contains("不存在"), "{err}");
         // 拒绝第二层嵌套：parent_id 指向本身也是子任务的任务。
         let err = store
-            .create("孙", "", 3, vec![], Some(child.id.clone()), None, None, "user")
+            .create("孙", "", 3, vec![], None, Some(child.id.clone()), None, None, "user")
             .unwrap_err();
         assert!(err.contains("最多一层"), "{err}");
         // 拒绝给已有子任务的任务设 parent。
@@ -2041,7 +2126,7 @@ mod tests {
         assert!(err.is_err(), "已有子任务的任务不能再设 parent: {err:?}");
         // sub_order 递增。
         let child2 = store
-            .create("子2", "", 3, vec![], Some(parent.id.clone()), None, None, "user")
+            .create("子2", "", 3, vec![], None, Some(parent.id.clone()), None, None, "user")
             .expect("child2");
         assert_eq!(child2.sub_order, 1);
         // 聚合。
@@ -2080,17 +2165,17 @@ mod tests {
         let now = now_ms();
         // 到期 todo
         let due = store
-            .create("到期", "", 3, vec![], None, Some(now - 1000), None, "user")
+            .create("到期", "", 3, vec![], None, None, Some(now - 1000), None, "user")
             .unwrap();
         store.get_mut(&due.id).unwrap().set_state("todo", "user", None, now);
         // 未到期 todo
         let future = store
-            .create("未到期", "", 3, vec![], None, Some(now + 60_000), None, "user")
+            .create("未到期", "", 3, vec![], None, None, Some(now + 60_000), None, "user")
             .unwrap();
         store.get_mut(&future.id).unwrap().set_state("todo", "user", None, now);
         // backlog 且已到期（不应选出：只派 todo）
         store
-            .create("backlog到期", "", 3, vec![], None, Some(now - 1000), None, "user")
+            .create("backlog到期", "", 3, vec![], None, None, Some(now - 1000), None, "user")
             .unwrap();
         store.persist(&due.id).unwrap();
         store.persist(&future.id).unwrap();
@@ -2381,7 +2466,7 @@ mod tests {
 
     fn make_child(store: &mut TaskStore, parent: &Task, title: &str) -> Task {
         store
-            .create(title, "desc", 2, vec![], Some(parent.id.clone()), None, None, "user")
+            .create(title, "desc", 2, vec![], None, Some(parent.id.clone()), None, None, "user")
             .expect("create child")
     }
 

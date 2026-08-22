@@ -64,8 +64,13 @@ describe("transport facade", () => {
       "DELETE",
       `/api/sessions?id=${encodeURIComponent("s 1")}`,
     );
-  });
 
+    await api.deleteTask("LAT 1");
+    expect(mock.request).toHaveBeenCalledWith(
+      "DELETE",
+      `/api/tasks/${encodeURIComponent("LAT 1")}`,
+    );
+  });
   it("chatBody stamps session_id once persisted", async () => {
     const { api, transport } = await importFresh();
     const mock = mockTransport();
@@ -177,5 +182,21 @@ describe("transport facade", () => {
     };
     mock2.request.mockRejectedValueOnce(new TypeError("fetch failed"));
     await expect(api2.ensureSession()).rejects.toThrow("fetch failed");
+  });
+  it("persists refine parent mapping across a page reload", async () => {
+    const store = new Map<string, string>();
+    (globalThis as Record<string, unknown>).window = {
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => void store.set(k, v),
+        removeItem: (k: string) => void store.delete(k),
+      },
+    };
+
+    const { api } = await importFresh();
+    api.setRefineParent("sess-refine-1", "LAT-106");
+
+    const { api: reloadedApi } = await importFresh();
+    expect(reloadedApi.refineParentFor("sess-refine-1")).toBe("LAT-106");
   });
 });

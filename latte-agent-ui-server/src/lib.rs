@@ -52,6 +52,7 @@ mod sessions;
 mod api_reference_integrity;
 pub mod models;
 pub mod notion_sync;
+pub mod task_types;
 pub mod tasks;
 pub mod tools;
 pub mod workflows;
@@ -512,6 +513,8 @@ fn build_router(state: AppState) -> Router {
         .route("/roles/:id", axum::routing::delete(delete_role))
         // 角色 TOML 源文件编辑
         .route("/roles/:id/toml", get(get_role_toml).put(put_role_toml))
+        .route("/task-types", get(list_task_types).post(create_task_type))
+        .route("/task-types/:id", get(get_task_type).put(put_task_type).delete(delete_task_type))
         // 任务看板（docs/task-board-design.md §6）
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/import", post(import_tasks))

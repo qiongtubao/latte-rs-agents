@@ -536,6 +536,7 @@ mod tests {
             priority: 1,
             state: "in_progress".into(),
             labels: vec!["core".into()],
+            task_type: Some("feature".into()),
             parent_id: None,
             sub_order: 0,
             scheduled_at: None,
@@ -661,6 +662,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 "user",
             )
             .expect("create");
@@ -703,6 +705,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 "user",
             )
             .expect("create");
@@ -736,6 +739,7 @@ mod tests {
                 "",
                 3,
                 vec![],
+                None,
                 None,
                 None,
                 None,

@@ -1369,6 +1369,7 @@ impl MonitorState {
                 role_id,
                 tool_name,
                 args,
+                ..
             } if role_id == &self.watched_role => {
                 self.transcript.push(format!("[tool_use] {tool_name} {args}"));
                 findings.extend(self.detectors.observe_tool_use(tool_name, args));
@@ -1382,6 +1383,7 @@ impl MonitorState {
                 role_id,
                 tool_name,
                 result,
+                ..
             } if role_id == &self.watched_role => {
                 self.transcript.push(format!(
                     "[tool_result] {tool_name} → {}",
@@ -1393,6 +1395,7 @@ impl MonitorState {
                 role_id,
                 tool_name,
                 error,
+                ..
             } if role_id == &self.watched_role => {
                 self.transcript
                     .push(format!("[tool_error] {tool_name} → {error}"));
@@ -1462,6 +1465,7 @@ impl MonitorState {
                 role_id,
                 tool_name,
                 error,
+                ..
             } if role_id != &self.watched_role && role_id != "advisor" => {
                 self.transcript.push(format!(
                     "[tool_error {role_id}] {tool_name} → {}",
@@ -1755,6 +1759,7 @@ mod tests {
             role_id: "manager".into(),
             tool_name: name.into(),
             args: args.into(),
+            sub_id: None,
         }
     }
 
@@ -1763,6 +1768,7 @@ mod tests {
             role_id: "manager".into(),
             tool_name: name.into(),
             result: result.into(),
+            sub_id: None,
         }
     }
 
@@ -1771,6 +1777,7 @@ mod tests {
             role_id: "manager".into(),
             tool_name: name.into(),
             error: error.into(),
+            sub_id: None,
         }
     }
 
@@ -1858,6 +1865,7 @@ mod tests {
             role_id: role.into(),
             tool_name: "read".into(),
             error: "permission denied (os error 13)".into(),
+            sub_id: None,
         }
     }
 
@@ -1881,6 +1889,7 @@ mod tests {
             role_id: "programmer".into(),
             tool_name: "read".into(),
             result: "ok".into(),
+            sub_id: None,
         });
         // streak 被重置，单个错误不再触发
         assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
@@ -1965,6 +1974,7 @@ mod tests {
             role_id: "programmer".into(),
             tool_name: "read".into(),
             error: ENOENT.into(),
+            sub_id: None,
         };
         assert!(s.observe(&enoent()).findings.is_empty());
         assert!(s.observe(&enoent()).findings.is_empty());
@@ -2244,11 +2254,13 @@ mod tests {
             role_id: "programmer".into(),
             tool_name: "exec".into(),
             error: "x".into(),
+            sub_id: None,
         });
         s.observe(&ChatEvent::ToolError {
             role_id: "advisor".into(),
             tool_name: "exec".into(),
             error: "y".into(),
+            sub_id: None,
         });
         assert!(s.observe(&tool_error("exec", "z")).findings.is_empty());
         // Advisor's own bubble does not end/reset the turn or enter

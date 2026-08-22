@@ -118,13 +118,13 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::SessionInfo { task_id, state, turn, .. } => {
                 self.on_session_info(task_id, state, *turn).await;
             }
-            ChatEvent::ToolUse { role_id, tool_name, args } => {
+            ChatEvent::ToolUse { role_id, tool_name, args, .. } => {
                 self.on_tool_use(role_id, tool_name, args).await;
             }
-            ChatEvent::ToolResult { role_id, tool_name, result } => {
+            ChatEvent::ToolResult { role_id, tool_name, result, .. } => {
                 self.on_tool_result(role_id, tool_name, result).await;
             }
-            ChatEvent::ToolError { role_id, tool_name, error } => {
+            ChatEvent::ToolError { role_id, tool_name, error, .. } => {
                 self.on_tool_result(role_id, tool_name, error).await;
             }
             ChatEvent::WorkflowStarted { name, topic, .. } => {

@@ -1102,6 +1102,59 @@ pub(crate) async fn report_task(
         .map_err(Into::into)
 }
 
+/// `GET /api/task-types` —— 列出任务类型注册表（可配置，项目层覆盖）。
+pub(crate) async fn list_task_types(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::task_types::TaskTypeEntry>> {
+    Json(crate::task_types::TaskTypeRegistry::load(&state.backend.cwd).entries())
+}
+
+/// `GET /api/task-types/:id` —— 单个类型详情
+pub(crate) async fn get_task_type(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<crate::task_types::TaskTypeEntry>, (StatusCode, String)> {
+    let reg = crate::task_types::TaskTypeRegistry::load(&state.backend.cwd);
+    let e = reg.types.get(&id).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, format!("task_type '{id}' 不存在")))?;
+    Ok(Json(crate::task_types::TaskTypeEntry { id, def: e }))
+}
+
+/// `POST /api/task-types` —— 新建任务类型
+pub(crate) async fn create_task_type(
+    State(state): State<AppState>,
+    Json(entry): Json<crate::task_types::TaskTypeEntry>,
+) -> Result<Json<crate::task_types::TaskTypeEntry>, (StatusCode, String)> {
+    crate::task_types::upsert_task_type(&state.backend.cwd, entry.clone())
+        .map(|e| Json(e))
+        .map_err(|m| (StatusCode::BAD_REQUEST, m))
+}
+
+/// `PUT /api/task-types/:id` —— 更新任务类型（id 来自路径，body 可含 def 字段）
+pub(crate) async fn put_task_type(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(mut entry): Json<crate::task_types::TaskTypeEntry>,
+) -> Result<Json<crate::task_types::TaskTypeEntry>, (StatusCode, String)> {
+    // 路径 id 优先，若 body 带有不同 id 则以路径为准
+    entry.id = id.clone();
+    crate::task_types::upsert_task_type(&state.backend.cwd, entry.clone())
+        .map(|e| Json(e))
+        .map_err(|m| (StatusCode::BAD_REQUEST, m))
+}
+
+/// `DELETE /api/task-types/:id` —— 删除任务类型（仅项目层自定义可删）
+pub(crate) async fn delete_task_type(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    crate::task_types::delete_task_type(&state.backend.cwd, &id)
+        .map(|_| StatusCode::OK)
+        .map_err(|m| {
+            let code = if m.contains("不存在") { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+            (code, m)
+        })
+}
+
 /// `DELETE /api/tasks/:id` —— 删除（文件移入 archive/）。
 pub(crate) async fn delete_task(
     axum::extract::Path(id): axum::extract::Path<String>,

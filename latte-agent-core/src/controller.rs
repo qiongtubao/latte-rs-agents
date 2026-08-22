@@ -151,6 +151,10 @@ pub(crate) fn strip_review_annotation(s: &str) -> String {
 
 pub(crate) struct ChatEventTraceSink {
     pub(crate) event_tx: broadcast::Sender<ChatEvent>,
+    /// 工具事件归属的 subsession：delegate / workflow speaker 的
+    /// runner 填真实 sub_id，主 session 角色填 `None`。没有它
+    /// ToolUse/ToolResult 泄进主 session 后前端只能按 role_id 猜。
+    pub(crate) sub_id: Option<String>,
 }
 
 impl crate::trace::TraceSink for ChatEventTraceSink {
@@ -162,6 +166,7 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                         role_id: meta.role.clone(),
                         tool_name: call.name,
                         args: truncate_event_text(&call.args, 1_200),
+                        sub_id: self.sub_id.clone(),
                     });
                 }
             }
@@ -194,6 +199,7 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                         role_id: meta.role,
                         tool_name: name,
                         result: truncate_event_text(&result, 1_500),
+                        sub_id: self.sub_id.clone(),
                     });
                 }
                 crate::trace::ToolStatus::Err(error) => {
@@ -201,6 +207,7 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                         role_id: meta.role,
                         tool_name: name,
                         error: truncate_event_text(&error, 1_500),
+                        sub_id: self.sub_id.clone(),
                     });
                 }
             },
@@ -298,16 +305,24 @@ pub enum ChatEvent {
         roles: Vec<RoleInfo>,
     },
     /// Tool usage (for display in the editor UI).
+    /// `sub_id` 标识工具调用所属的 subsession（delegate / workflow
+    /// speaker 路径填真实值；主 session 角色为 `None`）。前端据此把
+    /// 工具事件精确归属到 subagent，而不是按 role_id 猜。
     ToolUse {
         role_id: String,
         tool_name: String,
         args: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
     },
     /// Tool result (for display in the editor UI).
+    /// `sub_id` 与对应的 [`ChatEvent::ToolUse`] 一致。
     ToolResult {
         role_id: String,
         tool_name: String,
         result: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
     },
     /// Manager decided to delegate a subtask to a specialist role.
     /// Emitted before the specialist runner starts so the UI can
@@ -322,26 +337,17 @@ pub enum ChatEvent {
         to_role: String,
         task: String,
         sub_id: String,
-        /// workflow 流程内分派时填 wf_id（None = 普通 chat 里 manager
-        /// delegate 工具发起）。UI 据此把分派归属 manager 并打上
-        /// 工作流标记；serde default 兼容旧 session jsonl 回放。
+        /// Workflow marker; absent for ordinary manager delegation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wf_id: Option<String>,
     },
-    /// Specialist returned (or failed/timeout). `status` is one of
-    /// `"ok" | "failed" | "timeout" | "cancelled"`. `summary` is the
-    /// specialist's last assistant turn on success, or the error
-    /// message on failure — suitable for showing in the activity
-    /// stream and for the manager to consume as the tool result.
-    /// `sub_id` matches the `DelegateStarted.sub_id` so the UI can
-    /// look up the full subsession transcript via `/api/sessions/...`.
+    /// Specialist returned to the dispatching manager/workflow.
     DelegateFinished {
         from_role: String,
         to_role: String,
         status: String,
         summary: String,
         sub_id: String,
-        /// 与 DelegateStarted.wf_id 一致：workflow 流程内分派的收尾。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wf_id: Option<String>,
     },
@@ -349,6 +355,8 @@ pub enum ChatEvent {
         role_id: String,
         tool_name: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
     },
     /// Manager triggered a multi-role workflow (设计/plan/TDD/文档/图谱…).
     /// `wf_id` links all events of this run; the UI groups them.
@@ -2619,7 +2627,7 @@ async fn build_runner(
         // 把结构化任务清单提交给用户在弹窗里勾选导入任务看板。
         // manager 在 implementation_plan workflow 跑完后调它。
         if role.allowed_tools.iter().any(|t| t == "plan") {
-            register_plan_tool(&tm, event_tx.clone(), role_id.to_string(), plan_stage.clone())
+            register_plan_tool(&tm, event_tx.clone(), role_id.to_string(), plan_stage.clone(), cwd)
                 .map_err(|e| AgentError::Tool(format!("register plan: {e}")))?;
         }
         // Any role with "ask" in allowed_tools gets the ask tool:
@@ -2660,6 +2668,7 @@ async fn build_runner(
         // 没有它 monitor 的 Tool* 分支永远收不到事件。
         let chat_sink: Arc<dyn crate::trace::TraceSink> = Arc::new(ChatEventTraceSink {
             event_tx: event_tx.clone(),
+            sub_id: None,
         });
         let runner_sink: Arc<dyn crate::trace::TraceSink> = match subsession_sink {
             Some(sub) => Arc::new(crate::trace::FanOutSink::new(vec![sub, chat_sink])),
@@ -2692,6 +2701,7 @@ async fn build_runner(
         };
         let chat_sink: Arc<dyn crate::trace::TraceSink> = Arc::new(ChatEventTraceSink {
             event_tx: event_tx.clone(),
+            sub_id: None,
         });
         let runner_sink: Arc<dyn crate::trace::TraceSink> = match subsession_sink {
             Some(sub) => Arc::new(crate::trace::FanOutSink::new(vec![sub, chat_sink])),
@@ -3044,11 +3054,96 @@ pub(crate) fn propose_plan_from_summary(
 /// [`PlanStage::PendingApproval`]——用户导入任务看板（置 Approved）
 /// 或发下一条消息（复位 Normal）之前，`register_delegate_tool` 的
 /// handler 会拒绝派发实现类角色（programmer*/devops*）。
+/// plan 清单内 paths 的机械校验（提交前调用，失败则整单拒绝、不进
+/// PendingApproval，模型可修正后同轮重调）：
+/// - 存在性：路径逐级向上找已存在的祖先；第一级段都不存在 → 判定
+///   幻觉路径并拒绝（要新建的文件只要祖先目录存在即放行）。
+/// - 清单内重叠：两个任务的 paths 存在组件级前缀包含 → 拒绝
+///   （paths 互不重叠是并行派发不互踩的前提，靠 prompt 嘱咐不可靠）。
+/// paths 为空 = 未声明范围，跳过校验。
+fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), String> {
+    let normalize = |p: &str| -> String {
+        p.trim()
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string()
+    };
+    // ── 存在性 ──
+    let mut missing: Vec<String> = Vec::new();
+    let mut check_exists = |title: &str, raw: &str| {
+        let p = normalize(raw);
+        if p.is_empty() {
+            return;
+        }
+        let mut cur = cwd.to_path_buf();
+        let mut top_exists = false;
+        for (idx, comp) in std::path::Path::new(&p).components().enumerate() {
+            if matches!(comp, std::path::Component::CurDir) {
+                continue;
+            }
+            cur.push(comp.as_os_str());
+            if idx == 0 {
+                top_exists = cur.exists();
+            }
+            if !cur.exists() {
+                break;
+            }
+        }
+        if !top_exists {
+            missing.push(format!("任务「{title}」的 path「{p}」"));
+        }
+    };
+    for t in tasks {
+        for p in &t.paths {
+            check_exists(&t.title, p);
+        }
+        for s in &t.subtasks {
+            for p in &s.paths {
+                check_exists(&s.title, p);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "以下 paths 的第一级目录在仓库里不存在（疑似幻觉路径，请用 read/search 核实后再提交，或改为真实存在的路径前缀）：{}",
+            missing.join("；")
+        ));
+    }
+    // ── 清单内重叠（仅顶层任务两两比较；子任务继承父任务范围） ──
+    let mut conflicts: Vec<String> = Vec::new();
+    for i in 0..tasks.len() {
+        for j in (i + 1)..tasks.len() {
+            for a in tasks[i].paths.iter().map(|p| normalize(p)) {
+                for b in tasks[j].paths.iter().map(|p| normalize(p)) {
+                    if a.is_empty() || b.is_empty() {
+                        continue;
+                    }
+                    let (pa, pb) = (std::path::Path::new(&a), std::path::Path::new(&b));
+                    if pa == pb || pa.starts_with(pb) || pb.starts_with(pa) {
+                        conflicts.push(format!(
+                            "「{}」的「{a}」 与 「{}」的「{b}」",
+                            tasks[i].title, tasks[j].title
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "以下任务的 paths 范围重叠（并行执行会互相覆盖，派发时会被任务看板 409 拒绝），请调整使各任务范围互不重叠：{}",
+            conflicts.join("；")
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn register_plan_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
     plan_stage: SharedPlanStage,
+    cwd: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
@@ -3073,10 +3168,12 @@ pub(crate) fn register_plan_tool(
     };
 
     let handler_role_id = role_id.clone();
+    let handler_cwd = cwd.to_path_buf();
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let event_tx = event_tx.clone();
         let role_id = handler_role_id.clone();
         let plan_stage = plan_stage.clone();
+        let cwd = handler_cwd.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -3109,6 +3206,10 @@ pub(crate) fn register_plan_tool(
                 }
                 tasks.push(pt);
             }
+
+            // paths 机械校验（存在性 + 清单内重叠）：失败整单拒绝、
+            // 不进 PendingApproval——模型可修正后同轮重调。
+            validate_plan_paths(&cwd, &tasks).map_err(tool_err)?;
 
             let plan_id = next_plan_id(&role_id);
             let n = tasks.len();
@@ -3850,6 +3951,7 @@ async fn register_delegate_tool(
                     sub_sink.clone(),
                     Arc::new(ChatEventTraceSink {
                         event_tx: event_tx.clone(),
+                        sub_id: Some(sub_id.clone()),
                     }),
                 ]));
             runner = runner
@@ -4415,7 +4517,7 @@ mod tests {
         use crate::trace::TraceSink as _;
 
         let (tx, mut rx) = broadcast::channel(8);
-        let sink = ChatEventTraceSink { event_tx: tx };
+        let sink = ChatEventTraceSink { event_tx: tx, sub_id: None };
 
         // ParseToolCalls → one ToolUse per parsed call (this is what
         // lets the advisor monitor see routing decisions like the
@@ -4455,6 +4557,69 @@ mod tests {
             ChatEvent::ToolError { tool_name, error, .. } => {
                 assert_eq!(tool_name, "workflow");
                 assert!(error.contains("all models unavailable"));
+            }
+            other => panic!("expected ToolError, got {other:?}"),
+        }
+    }
+
+    /// delegate / workflow speaker 路径的 sink 带 sub_id：工具事件
+    /// 必须把它透传给 ChatEvent，前端才能按 subsession 精确归属，
+    /// 而不是泄进主 session 按 role_id 猜（jemalloc 日志事故：
+    /// task_planner 的 read 全显示在主 session）。
+    #[test]
+    fn chat_event_trace_sink_propagates_sub_id() {
+        use crate::trace::TraceSink as _;
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let sink = ChatEventTraceSink {
+            event_tx: tx,
+            sub_id: Some("task_planner-1".into()),
+        };
+
+        sink.emit(crate::trace::TraceEvent::ParseToolCalls {
+            meta: crate::trace::TraceMeta::test_default(),
+            raw_in: String::new(),
+            parsed: vec![crate::trace::ParsedCall {
+                id: String::new(),
+                name: "read".into(),
+                args: "{\"path\":\"a.md\"}".into(),
+            }],
+            diagnostics: crate::trace::ParseDiag {
+                opens_found: 1,
+                closes_matched: 1,
+                unmatched_opens: vec![],
+            },
+        });
+        sink.emit(crate::trace::TraceEvent::ToolExec {
+            meta: crate::trace::TraceMeta::test_default(),
+            name: "read".into(),
+            args_json: "{}".into(),
+            latency_ms: 1,
+            status: crate::trace::ToolStatus::Ok("file contents".into()),
+        });
+        sink.emit(crate::trace::TraceEvent::ToolExec {
+            meta: crate::trace::TraceMeta::test_default(),
+            name: "read".into(),
+            args_json: "{}".into(),
+            latency_ms: 1,
+            status: crate::trace::ToolStatus::Err("boom".into()),
+        });
+
+        match rx.try_recv().unwrap() {
+            ChatEvent::ToolUse { sub_id, .. } => {
+                assert_eq!(sub_id.as_deref(), Some("task_planner-1"));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            ChatEvent::ToolResult { sub_id, .. } => {
+                assert_eq!(sub_id.as_deref(), Some("task_planner-1"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        match rx.try_recv().unwrap() {
+            ChatEvent::ToolError { sub_id, .. } => {
+                assert_eq!(sub_id.as_deref(), Some("task_planner-1"));
             }
             other => panic!("expected ToolError, got {other:?}"),
         }
@@ -4927,7 +5092,7 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone())
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."))
             .expect("register plan");
 
         let out = tm
@@ -5123,7 +5288,7 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone())
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."))
             .expect("register plan");
 
         tm.execute(
@@ -5161,6 +5326,121 @@ mod tests {
         )
         .await
         .expect("复位后第二次调用应放行");
+    }
+
+    /// paths 机械校验：第一级段就不存在的路径判定为幻觉路径，整单
+    /// 拒绝且**不进** PendingApproval（模型可修正后同轮重调）。
+    #[tokio::test]
+    async fn plan_tool_rejects_hallucinated_paths_without_pending() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+            .expect("register plan");
+
+        let err = tm
+            .execute(
+                "plan",
+                serde_json::json!({ "tasks": [{ "title": "改缓存", "paths": ["hallucinated_dir/x.rs"] }] }),
+                None,
+            )
+            .await
+            .expect_err("幻觉路径必须被拒绝");
+        assert!(err.to_string().contains("hallucinated_dir"), "{err}");
+        // 校验失败不算提交：仍是 Normal，修正后可立即重调。
+        assert_eq!(stage.read().clone(), PlanStage::Normal);
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [{ "title": "改缓存", "paths": ["src/ringbuf/x.rs"] }] }),
+            None,
+        )
+        .await
+        .expect("修正后应放行");
+    }
+
+    /// 新建文件路径放行：叶子不存在但祖先目录存在（paths 指向要
+    /// 创建的新文件是合法场景）。
+    #[tokio::test]
+    async fn plan_tool_allows_new_file_under_existing_ancestor() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+            .expect("register plan");
+
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [{ "title": "新建模块", "paths": ["src/new_mod.rs"] }] }),
+            None,
+        )
+        .await
+        .expect("祖先存在的待新建路径应放行");
+        assert!(matches!(*stage.read(), PlanStage::PendingApproval { .. }));
+    }
+
+    /// 清单内 paths 前缀重叠（含相等）→ 整单拒绝并列出冲突对。
+    #[tokio::test]
+    async fn plan_tool_rejects_overlapping_paths_within_plan() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/cache")).unwrap();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+            .expect("register plan");
+
+        let err = tm
+            .execute(
+                "plan",
+                serde_json::json!({ "tasks": [
+                    { "title": "任务A", "paths": ["src/ringbuf"] },
+                    { "title": "任务B", "paths": ["src/ringbuf/read.rs"] },
+                    { "title": "任务C", "paths": ["src/cache"] }
+                ]}),
+                None,
+            )
+            .await
+            .expect_err("清单内重叠必须被拒绝");
+        let msg = err.to_string();
+        assert!(msg.contains("任务A") && msg.contains("任务B"), "{msg}");
+        assert!(!msg.contains("任务C」的"), "{msg}");
+        assert_eq!(stage.read().clone(), PlanStage::Normal);
+
+        // 互不重叠则放行。
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [
+                { "title": "任务A", "paths": ["src/ringbuf"] },
+                { "title": "任务C", "paths": ["src/cache"] }
+            ]}),
+            None,
+        )
+        .await
+        .expect("互不重叠应放行");
+    }
+
+    /// 空 paths = 未声明范围：不做校验直接过（与现状语义一致）。
+    #[tokio::test]
+    async fn plan_tool_skips_validation_for_undeclared_paths() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+            .expect("register plan");
+
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [{ "title": "无范围任务" }] }),
+            None,
+        )
+        .await
+        .expect("空 paths 不应触发校验");
     }
 
     #[tokio::test]

@@ -150,9 +150,9 @@ mod tests {
             ("Done", ChatEvent::Done),
             ("Error", ChatEvent::Error { kind: None, message: "boom".into(), sub_id: None }),
             ("ContextCleared", ChatEvent::ContextCleared),
-            ("ToolUse", ChatEvent::ToolUse { role_id: "m".into(), tool_name: "read".into(), args: "{}".into() }),
-            ("ToolResult", ChatEvent::ToolResult { role_id: "m".into(), tool_name: "read".into(), result: "ok".into() }),
-            ("ToolError", ChatEvent::ToolError { role_id: "m".into(), tool_name: "read".into(), error: "fail".into() }),
+            ("ToolUse", ChatEvent::ToolUse { role_id: "m".into(), tool_name: "read".into(), args: "{}".into(), sub_id: None }),
+            ("ToolResult", ChatEvent::ToolResult { role_id: "m".into(), tool_name: "read".into(), result: "ok".into(), sub_id: None }),
+            ("ToolError", ChatEvent::ToolError { role_id: "m".into(), tool_name: "read".into(), error: "fail".into(), sub_id: None }),
             ("RoleStarted", ChatEvent::RoleStarted { role_id: "m".into(), detail: "calling LLM".into(), sub_id: None }),
             ("RoleFinished", ChatEvent::RoleFinished { role_id: "m".into(), detail: "ok".into(), sub_id: None }),
             ("RolePaused", ChatEvent::RolePaused { role_id: "programmer".into() }),
@@ -185,6 +185,35 @@ mod tests {
         assert_eq!(v["sub_id"], "sub-42", "sub_id must reach frontend");
         // 没 sub_id 的 Error 不应该泄漏空字符串字段
         let no_sub = ChatEvent::Error { kind: None, message: "main turn failed".into(), sub_id: None };
+        let v2: serde_json::Value = serde_json::from_str(
+            &chat_event_to_frontend_json(&no_sub).expect("convert")
+        ).expect("parse");
+        assert!(v2.get("sub_id").is_none(), "sub_id must be skipped when None");
+    }
+
+    /// 工具事件携带 sub_id 是前端把 delegate/workflow 子代理的工具
+    /// 调用精确归属到 subsession（而不是泄进主 session 按 role 猜）
+    /// 的关键字段。验证：sub_id 出现在 wire JSON；None 时字段被跳过，
+    /// 旧前端/旧归档回放不受影响。
+    #[test]
+    fn chat_event_to_frontend_json_preserves_tool_sub_id() {
+        let ev = ChatEvent::ToolUse {
+            role_id: "task_planner".into(),
+            tool_name: "read".into(),
+            args: "{}".into(),
+            sub_id: Some("task_planner-1".into()),
+        };
+        let json = chat_event_to_frontend_json(&ev).expect("convert");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(v["type"], "ToolUse");
+        assert_eq!(v["sub_id"], "task_planner-1", "sub_id must reach frontend");
+
+        let no_sub = ChatEvent::ToolResult {
+            role_id: "manager".into(),
+            tool_name: "read".into(),
+            result: "ok".into(),
+            sub_id: None,
+        };
         let v2: serde_json::Value = serde_json::from_str(
             &chat_event_to_frontend_json(&no_sub).expect("convert")
         ).expect("parse");

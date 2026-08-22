@@ -14,6 +14,12 @@ import type { ChatEvent } from "./api";
 
 function makeBinding() {
   const el = <T extends HTMLElement>(tag: string) => document.createElement(tag) as unknown as T;
+  const statusPill = el<HTMLElement>("div");
+  const statusLabel = el<HTMLElement>("span");
+  statusLabel.className = "status-label";
+  const statusTime = el<HTMLElement>("span");
+  statusTime.className = "status-time";
+  statusPill.append(statusLabel, statusTime);
   return {
     messagesEl: el<HTMLElement>("div"),
     formEl: el<HTMLFormElement>("form"),
@@ -23,7 +29,7 @@ function makeBinding() {
     quitBtn: el<HTMLButtonElement>("button"),
     pauseBtn: el<HTMLButtonElement>("button"),
     resumeBtn: el<HTMLButtonElement>("button"),
-    statusPill: el<HTMLElement>("div"),
+    statusPill,
     roleSelect: el<HTMLSelectElement>("select"),
     rolePauseToggle: el<HTMLButtonElement>("button"),
     rolePill: el<HTMLElement>("div"),
@@ -32,7 +38,8 @@ function makeBinding() {
   };
 }
 
-function mount() {
+function mount(onShowSubsession?: (subId: string, label: string, anchor?: HTMLElement) => void) {
+  document.body.replaceChildren();
   const container = makeBinding();
   document.body.appendChild(container.messagesEl);
   // mountChat 还引用若干 document 级元素（命令补全 / 编辑弹窗 /
@@ -53,7 +60,7 @@ function mount() {
     el.id = id;
     document.body.appendChild(el);
   }
-  const chat = mountChat({ container, initialRole: "manager" });
+  const chat = mountChat({ container, initialRole: "manager", onShowSubsession });
   return { chat, messagesEl: container.messagesEl };
 }
 
@@ -107,4 +114,133 @@ describe("并行同角色委派的 executing 行配对", () => {
     const doneRows = messagesEl.querySelectorAll(".message.status.done");
     expect(doneRows.length).toBe(1);
   });
+  it("工具事件按 sub_id 不写入主 session", () => {
+    const { chat, messagesEl } = mount();
+    chat.handleEvent(started("tester-1"));
+    chat.handleEvent(started("tester-2"));
+    chat.handleEvent({ type: "ToolUse", role_id: "tester", tool_name: "read", args: "{}", sub_id: "tester-2" });
+    chat.handleEvent({ type: "ToolUse", role_id: "tester", tool_name: "search", args: "{}", sub_id: "tester-1" });
+    expect(messagesEl.querySelectorAll(".message.tool")).toHaveLength(0);
+    expect(messagesEl.querySelectorAll(".tool-log-line")).toHaveLength(0);
+  });
+
+  it("task_planner details use the standard subsession callback", () => {
+    let opened: { subId: string; label: string; anchor?: HTMLElement } | undefined;
+    const { chat, messagesEl } = mount((subId, label, anchor) => { opened = { subId, label, anchor }; });
+    chat.handleEvent({
+      type: "RoleStarted",
+      role_id: "task_planner",
+      detail: "workflow step 'submit'",
+      sub_id: "task_planner-submit",
+    });
+    chat.handleEvent({
+      type: "ToolUse",
+      role_id: "task_planner",
+      tool_name: "read",
+      args: '{"path":"lab/notes/baseline.md"}',
+      sub_id: "task_planner-submit",
+    });
+    expect(messagesEl.querySelectorAll(".message.tool")).toHaveLength(0);
+    expect(messagesEl.querySelectorAll(".tool-log-line")).toHaveLength(0);
+    const details = messagesEl.querySelector<HTMLElement>(".subsession-link");
+    expect(details).not.toBeNull();
+    details?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(opened?.subId).toBe("task_planner-submit");
+    expect(opened?.label).toBe("🤖 task_planner");
+    expect(opened?.anchor).toBeInstanceOf(HTMLElement);
+  });
+
+  it("workflow fixed-role execution uses the same delegate card projection", () => {
+    const { chat, messagesEl } = mount();
+    chat.handleEvent({
+      type: "WorkflowStarted",
+      name: "task_refine",
+      topic: "split task",
+      wf_id: "wf-1",
+    });
+    chat.handleEvent({
+      type: "WorkflowStep",
+      wf_id: "wf-1",
+      step_id: "refine",
+      description: "inspect and split",
+      index: 1,
+      total: 2,
+      role_id: "task_planner",
+      task: "inspect repository",
+    });
+    chat.handleEvent({
+      type: "DelegateStarted",
+      from_role: "manager",
+      to_role: "task_planner",
+      task: "inspect repository",
+      sub_id: "task-planner-1",
+      wf_id: "wf-1",
+    });
+    expect(messagesEl.querySelectorAll(".message-row.role")).toHaveLength(2);
+    expect(messagesEl.textContent).toContain("@task_planner inspect repository");
+    expect(messagesEl.textContent).not.toContain("workflow）");
+  });
+
+  it("task_planner workflow return is visible and references its dispatch", () => {
+    const { chat, messagesEl } = mount();
+    chat.handleEvent({ type: "WorkflowStarted", name: "task_refine", topic: "split", wf_id: "wf-2" });
+    chat.handleEvent({
+      type: "WorkflowStep",
+      wf_id: "wf-2",
+      step_id: "refine",
+      description: "",
+      index: 1,
+      total: 1,
+      role_id: "task_planner",
+      task: "inspect repository",
+    });
+    chat.handleEvent({
+      type: "DelegateStarted",
+      from_role: "manager",
+      to_role: "task_planner",
+      task: "inspect repository",
+      sub_id: "task-planner-2",
+      wf_id: "wf-2",
+    });
+    chat.handleEvent({
+      type: "WorkflowTurn",
+      wf_id: "wf-2",
+      step_id: "refine",
+      role_id: "task_planner",
+      content: "已完成仓库检查。",
+      round: 0,
+    });
+    const roles = messagesEl.querySelectorAll(".message-row.role");
+    expect(roles).toHaveLength(3);
+
+    expect(messagesEl.textContent).toContain("已完成仓库检查");
+    expect(messagesEl.querySelector(".quote-block")).not.toBeNull();
+  });
+
+  it("advisor top-level message keeps session log action visible", () => {
+    const { chat, messagesEl } = mount();
+    const menu = document.getElementById("contextMenu")!;
+    const item = document.createElement("button");
+    item.className = "menu-item";
+    item.dataset.action = "view-execution-log";
+    menu.appendChild(item);
+    chat.handleEvent({ type: "RoleTurn", role_id: "advisor", content: "🛑 intervene: 返回不完整", is_complete: true });
+    const row = messagesEl.querySelector<HTMLElement>(".message-row.role")!;
+    row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 10, clientY: 10 }));
+    expect(item.style.display).not.toBe("none");
+  });
 });
+
+  it("重复到达同一 advisor intervene 事件时只渲染一次", () => {
+    const { chat, messagesEl } = mount();
+    const event = {
+      type: "RoleTurn" as const,
+      role_id: "advisor",
+      content: "🛑 intervene（task_planner 委派返回审查）：返回内容被截断",
+      is_complete: true,
+    };
+    chat.handleEvent(event);
+    chat.handleEvent(event);
+    expect(messagesEl.textContent).toContain("返回内容被截断");
+    expect(messagesEl.querySelectorAll(".message-row.role")).toHaveLength(1);
+  });

@@ -1,0 +1,51 @@
+# 任务类型注册表（Task Types Registry）
+# 可配置：改这里即新增/删除类型与默认工作流；运行时同时支持项目层覆盖
+# `<cwd>/.latte/task_types.toml`（存在即覆盖本文件，仅覆盖声明的 type）。
+#
+# 规则：
+# - 未填 task_type 或 workflow 的任务 → 普通 manager 主导的 session（不走 workflow）
+# - 填 task_type 未填 workflow → 按本表 default_workflow 自动推导
+# - 显式填 workflow → 覆盖类型默认（以显式为准）
+# - default_workflow = "" 或缺省 → 不绑定 workflow，走 manager
+
+[types.feature]
+label = "功能开发"
+description = "新功能、迭代需求，测试先行 + 实现 + 双重审查"
+default_workflow = "tdd_development"
+color = "#3b82f6"
+icon = "✨"
+
+[types.bugfix]
+label = "缺陷修复"
+description = "Bug 分诊：复现 → 根因 → 修复方案 → 终审"
+default_workflow = "bug_triage"
+color = "#ef4444"
+icon = "🐛"
+
+[types.learn]
+label = "学习任务"
+description = "小白向深度讲解，产出六层图解教程"
+default_workflow = "learn"
+color = "#8b5cf6"
+icon = "📚"
+
+[types.research]
+label = "探索调研"
+description = "通读代码/文档，摸清结构与术语，产出决策背景"
+default_workflow = "explore"
+color = "#06b6d4"
+icon = "🔍"
+
+[types.docs]
+label = "文档写作"
+description = "写 doc-graph 文档并更新索引"
+default_workflow = "write_doc"
+color = "#10b981"
+icon = "📝"
+
+[types.chore]
+label = "杂项/运维"
+description = "不适合固定流水线的杂事，走普通 manager 会话"
+default_workflow = ""
+color = "#64748b"
+icon = "🔧"

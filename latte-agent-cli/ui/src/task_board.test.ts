@@ -29,17 +29,17 @@ describe("任务看板状态机：状态 → 动作映射", () => {
 
   it("backlog：移到 Todo / 编辑 / 取消", () => {
     expect(keysOf({ state: "backlog", scheduled_at: null }))
-      .toEqual(["to_todo", "edit", "cancel"]);
+      .toEqual(["to_todo", "edit", "cancel", "delete"]);
   });
 
   it("todo 无排期：立即执行 / 拆分子任务 / 指定时间执行 / 移回 Backlog", () => {
     expect(keysOf({ state: "todo", scheduled_at: null }))
-      .toEqual(["run_now", "refine", "schedule", "to_backlog"]);
+      .toEqual(["run_now", "refine", "schedule", "to_backlog", "delete"]);
   });
 
   it("todo 有排期：切换到 todo_scheduled 变体（修改时间 / 取消排期）", () => {
     expect(keysOf({ state: "todo", scheduled_at: Date.now() + 60_000 }))
-      .toEqual(["run_now", "refine", "schedule", "unschedule"]);
+      .toEqual(["run_now", "refine", "schedule", "unschedule", "delete"]);
     // 排期动作的 label 变为「修改时间」
     const sched = effectiveActions({ state: "todo", scheduled_at: 1 })
       .find(a => a.key === "schedule");
@@ -48,27 +48,27 @@ describe("任务看板状态机：状态 → 动作映射", () => {
 
   it("in_progress：查看对话 / 中止", () => {
     expect(keysOf({ state: "in_progress", scheduled_at: null }))
-      .toEqual(["open_session", "abort"]);
+      .toEqual(["open_session", "abort", "delete"]);
   });
 
   it("human_review：查看对话 / 通过 / 打回", () => {
     expect(keysOf({ state: "human_review", scheduled_at: null }))
-      .toEqual(["open_session", "approve", "reject"]);
+      .toEqual(["open_session", "approve", "reject", "delete"]);
   });
 
   it("rework：重新派发 / 编辑", () => {
     expect(keysOf({ state: "rework", scheduled_at: null }))
-      .toEqual(["run_now", "edit"]);
+      .toEqual(["run_now", "edit", "delete"]);
   });
 
   it("merging：查看对话 / 标记完成", () => {
     expect(keysOf({ state: "merging", scheduled_at: null }))
-      .toEqual(["open_session", "mark_done"]);
+      .toEqual(["open_session", "mark_done", "delete"]);
   });
 
-  it("done / cancelled：只能重新打开", () => {
-    expect(keysOf({ state: "done", scheduled_at: null })).toEqual(["reopen"]);
-    expect(keysOf({ state: "cancelled", scheduled_at: null })).toEqual(["reopen"]);
+  it("done / cancelled：重新打开或删除归档", () => {
+    expect(keysOf({ state: "done", scheduled_at: null })).toEqual(["reopen", "delete"]);
+    expect(keysOf({ state: "cancelled", scheduled_at: null })).toEqual(["reopen", "delete"]);
   });
 
   it("每个状态的动作都有 kind，且卡片快捷动作能找到 primary", () => {
@@ -136,6 +136,17 @@ describe("actionRequest / actionToast", () => {
         expect(msg).toContain("LAT-1");
       }
     }
+  });
+});
+describe("delete action", () => {
+  it("每个状态都提供危险删除动作", () => {
+    for (const list of Object.values(STATE_ACTIONS)) {
+      expect(list.find(a => a.key === "delete")?.kind).toBe("danger");
+    }
+  });
+
+  it("delete action 显示归档提示", () => {
+    expect(actionToast("delete", "LAT-1")).toContain("归档");
   });
 });
 

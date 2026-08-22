@@ -173,9 +173,13 @@ export type ChatEvent =
   | { type: "ContextCleared" }
   | { type: "SessionInfo"; task_id: string; state: string; turn: number; roles: RoleInfo[] }
   | { type: "UserMessage"; text: string }
-  | { type: "ToolUse"; role_id: string; tool_name: string; args: string }
-  | { type: "ToolError"; role_id: string; tool_name: string; error: string }
-  | { type: "ToolResult"; role_id: string; tool_name: string; result: string }
+  // 工具事件的 sub_id 标识调用所属的 subsession（delegate /
+  // workflow speaker 路径后端填真实值；主 session 角色不带）。
+  // 前端按 sub_id 精确归属到 subagent 的 executing 行，不再只按
+  // role_id 猜；旧归档/直连接口缺省时退回 role 归属。
+  | { type: "ToolUse"; role_id: string; tool_name: string; args: string; sub_id?: string | null }
+  | { type: "ToolError"; role_id: string; tool_name: string; error: string; sub_id?: string | null }
+  | { type: "ToolResult"; role_id: string; tool_name: string; result: string; sub_id?: string | null }
   | { type: "ImageGenerated"; role_id: string; path: string; prompt: string }
   // plan 工具提交的任务候选：manager 调 plan 后广播，UI 弹窗勾选导入
   // 看板。tasks 与 POST /api/tasks/import 的 ImportTask 同构。
@@ -934,6 +938,8 @@ export interface TaskView {
   priority: 1 | 2 | 3 | 4;
   state: TaskState;
   labels: string[];
+  /** 业务类型：feature/bugfix/learn/research/docs/chore 等，可配置于 config/task_types.toml */
+  task_type: string | null;
   parent_id: string | null;
   sub_order: number;
   scheduled_at: number | null;
@@ -941,8 +947,10 @@ export interface TaskView {
   created_at: number;
   updated_at: number;
   history: TaskHistoryEntry[];
-  /** 绑定的 workflow 名；null = 未绑定（派发时走默认 manager 流程）。 */
+  /** 绑定的 workflow 名；null = 未绑定 */
   workflow: string | null;
+  /** 派发时实际生效的 workflow（显式 workflow 优先，否则按 task_type 默认推导；null=走 manager） */
+  effective_workflow: string | null;
   /** 子任务聚合（父任务用）：总数 / 终态数 / 各状态计数。 */
   sub_total: number;
   sub_done: number;
@@ -956,6 +964,8 @@ export interface TaskCreateBody {
   parent_id?: string;
   labels?: string[];
   scheduled_at?: number | null;
+  /** 业务类型：feature/bugfix/learn/research/docs/chore 等 */
+  task_type?: string;
   /** 可选：创建时绑定 workflow（派发时直接运行该 workflow）。 */
   workflow?: string;
 }
@@ -967,6 +977,7 @@ export interface TaskPatchBody {
   state?: TaskState;
   scheduled_at?: number | null;
   labels?: string[];
+  task_type?: string | null;
   /** 可选：缺省 = 不变；null = 清除绑定；字符串 = 绑定该 workflow。 */
   workflow?: string | null;
 }
@@ -977,6 +988,7 @@ export interface ImportTask {
   description?: string;
   priority?: number;
   labels?: string[];
+  task_type?: string;
   workflow?: string;
   /** 任务涉及的文件/目录前缀（相对项目根）；并行执行时范围重叠的任务会被拒绝派发（409）。 */
   paths?: string[];
@@ -1056,6 +1068,36 @@ export interface DispatchReadyResponse {
   skipped: [string, string][];
 }
 
+export interface TaskTypeEntry {
+  id: string;
+  label: string;
+  description: string;
+  default_workflow: string;
+  color: string;
+  icon: string;
+}
+
+/** GET /api/task-types：列出任务类型注册表（可配置）。 */
+export async function listTaskTypes(): Promise<TaskTypeEntry[]> {
+  return getTransport().request("GET", "/api/task-types");
+}
+
+export async function getTaskType(id: string): Promise<TaskTypeEntry> {
+  return getTransport().request("GET", `/api/task-types/${encodeURIComponent(id)}`);
+}
+
+export async function createTaskType(entry: TaskTypeEntry): Promise<TaskTypeEntry> {
+  return getTransport().request("POST", "/api/task-types", entry);
+}
+
+export async function putTaskType(id: string, entry: TaskTypeEntry): Promise<TaskTypeEntry> {
+  return getTransport().request("PUT", `/api/task-types/${encodeURIComponent(id)}`, entry);
+}
+
+export async function deleteTaskType(id: string): Promise<void> {
+  await getTransport().request("DELETE", `/api/task-types/${encodeURIComponent(id)}`);
+}
+
 /** POST /api/tasks/dispatch-ready：按优先级批量派发全部 todo 任务
  *  （后端遵守并发上限与同族/paths 互斥，冲突/超限任务留 todo 等位）。 */
 export async function dispatchReady(): Promise<DispatchReadyResponse> {
@@ -1089,14 +1131,51 @@ export async function refineTask(id: string): Promise<{ session_id: string }> {
 }
 
 /** 拆分会话 → 父任务 id 的映射：「拆分子任务」创建 session 时登记，
- *  该 session 的 plan 导入弹窗据此把任务作为父任务的子任务导入。
- *  纯内存（页面刷新后丢失，降级为根任务导入）。 */
+ * 该 session 的 plan 导入弹窗据此把任务作为父任务的子任务导入。
+ * 内存缓存用于当前页面，localStorage 用于刷新后恢复；键沿用当前
+ * workspace 的 session storage key，避免不同项目互相串联。 */
+const REFINE_PARENTS_STORAGE_SUFFIX = ":refine-parents";
 const refineParents = new Map<string, string>();
+
+function refineParentsStorageKey(): string {
+  return `${sessionStorageKey()}${REFINE_PARENTS_STORAGE_SUFFIX}`;
+}
+
+function loadRefineParents(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const raw = window.localStorage.getItem(refineParentsStorageKey());
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([sessionId, taskId]) =>
+        sessionId.length > 0 && typeof taskId === "string" && taskId.length > 0,
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function saveRefineParent(sessionId: string, taskId: string): void {
+  if (typeof window === "undefined") return;
+  const mappings = loadRefineParents();
+  mappings[sessionId] = taskId;
+  window.localStorage.setItem(refineParentsStorageKey(), JSON.stringify(mappings));
+}
+
 export function setRefineParent(sessionId: string, taskId: string): void {
   refineParents.set(sessionId, taskId);
+  saveRefineParent(sessionId, taskId);
 }
+
 export function refineParentFor(sessionId: string): string | undefined {
-  return refineParents.get(sessionId);
+  const cached = refineParents.get(sessionId);
+  if (cached) return cached;
+  const persisted = loadRefineParents()[sessionId];
+  if (persisted) refineParents.set(sessionId, persisted);
+  return persisted;
 }
 
 /** POST /api/tasks/import：批量导入任务（进 todo，由用户在看板手动派发），

@@ -9,10 +9,10 @@
 // 每个状态声明自己的「下一步动作」（STATE_ACTIONS），卡片上只放主
 // 动作，其余进右侧详情抽屉。
 import {
-  listTasks, createTask, updateTask, dispatchTask, abortTask,
-  dispatchReady, listWorkflows, refineTask, setRefineParent,
+  listTasks, createTask, updateTask, dispatchTask, abortTask, deleteTask,
+  dispatchReady, listWorkflows, listTaskTypes, createTaskType, putTaskType, deleteTaskType, refineTask, setRefineParent,
 } from "./api";
-import type { TaskView, TaskState, WorkflowSummary, DispatchReadyResponse } from "./api";
+import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse } from "./api";
 
 // ─── 状态机定义（纯数据/纯函数，单独可测） ─────────────────────────
 
@@ -53,44 +53,52 @@ export const STATE_ACTIONS: Record<string, TaskAction[]> = {
     { key: "to_todo", label: "→ 移到 Todo", kind: "primary" },
     { key: "edit", label: "编辑", kind: "ghost" },
     { key: "cancel", label: "取消任务", kind: "danger" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   todo: [
     { key: "run_now", label: "▶ 立即执行", kind: "primary" },
     { key: "refine", label: "✂ 拆分子任务", kind: "ghost" },
     { key: "schedule", label: "🕐 指定时间执行", kind: "ghost" },
     { key: "to_backlog", label: "移回 Backlog", kind: "ghost" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   todo_scheduled: [
     { key: "run_now", label: "▶ 立即执行", kind: "primary" },
     { key: "refine", label: "✂ 拆分子任务", kind: "ghost" },
     { key: "schedule", label: "修改时间", kind: "ghost" },
     { key: "unschedule", label: "取消排期", kind: "ghost" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   in_progress: [
     { key: "open_session", label: "💬 查看对话", kind: "primary" },
     { key: "abort", label: "中止执行", kind: "danger" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   human_review: [
     { key: "open_session", label: "💬 查看对话", kind: "primary" },
     { key: "approve", label: "✓ 确认通过", kind: "primary" },
     { key: "reject", label: "↩ 打回重做", kind: "danger" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   rework: [
     { key: "run_now", label: "▶ 重新派发", kind: "primary" },
     { key: "edit", label: "编辑补充要求", kind: "ghost" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   merging: [
     { key: "open_session", label: "💬 查看对话", kind: "ghost" },
     { key: "mark_done", label: "✓ 标记完成", kind: "primary" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   done: [
     { key: "reopen", label: "重新打开", kind: "ghost" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
   cancelled: [
     { key: "reopen", label: "重新打开", kind: "ghost" },
+    { key: "delete", label: "删除任务", kind: "danger" },
   ],
 };
-
 /** todo + 已排期时动作列表切换到 todo_scheduled 变体。 */
 export function effectiveActions(
   task: Pick<TaskView, "state" | "scheduled_at">,
@@ -102,12 +110,13 @@ export function effectiveActions(
 }
 
 /** 动作按钮文案：绑定了 workflow 的任务，「立即执行 / 重新派发」按钮
- *  直接标出将运行的 workflow（派发时后端会直接运行它）。 */
+ *  直接标出将运行的 workflow（显式 workflow 优先，否则按 task_type 默认推导）。 */
 export function actionLabel(
-  task: Pick<TaskView, "workflow">,
+  task: { workflow?: string | null; effective_workflow?: string | null; task_type?: string | null },
   a: TaskAction,
 ): string {
-  if (a.key === "run_now" && task.workflow) return `▶ 运行 ${task.workflow}`;
+  const wf = (task as any).effective_workflow ?? task.workflow;
+  if (a.key === "run_now" && wf) return `▶ 运行 ${wf}`;
   return a.label;
 }
 
@@ -144,8 +153,10 @@ export function actionRequest(
       return updateTask(taskId, { state: "todo" });
     case "cancel":
       return updateTask(taskId, { state: "cancelled", scheduled_at: null });
+    case "delete":
+      return deleteTask(taskId);
     default:
-      return null; // schedule / edit / open_session：UI 侧处理
+      return null;
   }
 }
 
@@ -162,6 +173,7 @@ export function actionToast(key: string, taskId: string): string {
     case "mark_done": return `${taskId} 已完成 🎉`;
     case "reopen": return `${taskId} 已重新打开`;
     case "cancel": return `${taskId} 已取消`;
+    case "delete": return `${taskId} 已删除并归档`;
     default: return `${taskId} 已更新`;
   }
 }
@@ -211,6 +223,7 @@ export interface TaskBoardContainer {
   closeBtn: HTMLButtonElement;
   newBtn: HTMLButtonElement;
   dispatchAllBtn: HTMLButtonElement;
+  manageTypesBtn: HTMLButtonElement;
   statRunningEl: HTMLElement;
   statScheduledEl: HTMLElement;
   statReviewEl: HTMLElement;
@@ -322,6 +335,59 @@ export function mountTaskBoard(opts: {
     const propSec = el("div", "tb-drawer-section");
     propSec.appendChild(el("div", "tb-label", "属性"));
     propSec.appendChild(kv("优先级", `P${task.priority}`));
+    // 任务类型直改（看板内一键改类型）
+    {
+      const row = el("div", "tb-kv");
+      row.appendChild(el("span", "tb-k", "任务类型"));
+      const v = el("span", "tb-v");
+      const sel = document.createElement("select") as HTMLSelectElement;
+      sel.style.minWidth = "160px";
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "不指定（走 manager）";
+      sel.appendChild(none);
+      for (const tt of taskTypes) {
+        const o = document.createElement("option");
+        o.value = tt.id;
+        o.textContent = `${tt.icon} ${tt.label}（${tt.id}）`;
+        sel.appendChild(o);
+      }
+      if (task.task_type && !taskTypes.some(x => x.id === task.task_type)) {
+        const o = document.createElement("option");
+        o.value = task.task_type;
+        o.textContent = `${task.task_type}（已不存在）`;
+        sel.appendChild(o);
+      }
+      sel.value = task.task_type ?? "";
+      sel.addEventListener("change", async () => {
+        const nv = sel.value || null;
+        if ((task.task_type ?? null) === nv) return;
+        sel.disabled = true;
+        try {
+          await updateTask(task.id, { task_type: nv });
+          toast(`${task.id} 类型已改为 ${nv ?? "未指定"}`);
+          await refresh({ silent: true });
+        } catch (e) {
+          toast(`修改失败: ${(e as Error).message}`);
+          sel.value = task.task_type ?? "";
+        } finally {
+          sel.disabled = false;
+        }
+      });
+      v.appendChild(sel);
+      // 辅助：展示该类型绑定的 workflow
+      const tt = taskTypes.find(x => x.id === (sel.value || ""));
+      if (tt?.default_workflow) {
+        const hint = el("span");
+        hint.style.marginLeft = "8px";
+        hint.style.fontSize = "12px";
+        hint.style.color = "#64748b";
+        hint.textContent = `↳ ${tt.default_workflow}`;
+        v.appendChild(hint);
+      }
+      row.appendChild(v);
+      propSec.appendChild(row);
+    }
     if (task.workflow) {
       propSec.appendChild(kv("Workflow", `🔀 ${task.workflow}（派发时直接运行该 workflow）`));
     }
@@ -459,8 +525,6 @@ export function mountTaskBoard(opts: {
       return;
     }
     if (key === "refine") {
-      // 拆分子任务：新建 session 跑 task_refine workflow，跳过去看
-      // 拆分过程；plan 弹窗导入时凭 refineParent 映射挂为该任务的子任务。
       if (task.parent_id) { toast("子任务不能再拆（只支持一层父子）"); return; }
       try {
         const resp = await refineTask(task.id);
@@ -472,11 +536,15 @@ export function mountTaskBoard(opts: {
       }
       return;
     }
+    if (key === "delete" && !window.confirm(
+      `确认删除 ${task.id}？删除后将移入 archive，不能在看板中继续使用。`,
+    )) return;
     const req = actionRequest(key, task.id);
     if (!req) return;
     try {
       await req;
       toast(actionToast(key, task.id));
+      if (key === "delete") closeDrawer();
     } catch (e) {
       toast(`操作失败: ${(e as Error).message}`);
     }
@@ -550,6 +618,224 @@ export function mountTaskBoard(opts: {
     await refresh({ silent: true });
   }
 
+  // ── 任务类型管理弹窗（UI 可配 task_type ↔ workflow，支持新增/绑定/删除） ──
+  const typeMgrMask = el("div", "tb-modal-mask");
+  const typeMgrModal = el("div", "tb-modal");
+  // 放大一点以容纳表格
+  typeMgrModal.style.maxWidth = "640px";
+  typeMgrModal.style.width = "90vw";
+  typeMgrMask.appendChild(typeMgrModal);
+  document.body.appendChild(typeMgrMask);
+  let typeMgrEditingId: string | null = null;
+  function closeTypeManager(): void { typeMgrMask.classList.remove("open"); }
+  typeMgrMask.addEventListener("click", (e) => { if (e.target === typeMgrMask) closeTypeManager(); });
+  // Esc 关闭
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && typeMgrMask.classList.contains("open")) closeTypeManager(); });
+
+  function renderTypeManager(): void {
+    typeMgrModal.replaceChildren();
+    typeMgrModal.appendChild(el("h4", undefined, "任务类型管理"));
+    typeMgrModal.appendChild(el("div", "tb-modal-sub", "可视化配置 任务类型 ↔ Workflow。类型是可配注册表：内置类型可改默认 Workflow，自建类型可删。未指定类型/workflow 的任务走普通 manager。"));
+
+    // 列表
+    const listBox = el("div");
+    listBox.style.display = "flex";
+    listBox.style.flexDirection = "column";
+    listBox.style.gap = "8px";
+    listBox.style.margin = "12px 0";
+    listBox.style.maxHeight = "38vh";
+    listBox.style.overflowY = "auto";
+    for (const tt of taskTypes) {
+      const row = el("div");
+      row.style.display = "flex";
+      row.style.alignItems = "center";
+      row.style.gap = "8px";
+      row.style.padding = "8px 10px";
+      row.style.border = "1px solid #e2e8f0";
+      row.style.borderRadius = "10px";
+      row.style.background = "#f8fafc";
+      const icon = el("span", undefined, tt.icon || "🏷");
+      icon.style.fontSize = "16px";
+      const main = el("div");
+      main.style.flex = "1";
+      main.style.minWidth = "0";
+      const title = el("div");
+      title.style.fontWeight = "600";
+      title.style.fontSize = "13px";
+      title.textContent = `${tt.label}（${tt.id}）`;
+      const desc = el("div");
+      desc.style.fontSize = "12px";
+      desc.style.color = "#64748b";
+      const wfText = tt.default_workflow ? `↳ ${tt.default_workflow}` : "↳ 不绑定（走 manager）";
+      desc.textContent = `${tt.description ? tt.description + " · " : ""}${wfText}`;
+      main.append(title, desc);
+      const editBtn = el("button", "tb-btn tb-btn-ghost tb-btn-sm", "编辑") as HTMLButtonElement;
+      editBtn.type = "button";
+      editBtn.addEventListener("click", () => openTypeForm(tt.id));
+      const delBtn = el("button", "tb-btn tb-btn-danger tb-btn-sm", "删除") as HTMLButtonElement;
+      delBtn.type = "button";
+      delBtn.addEventListener("click", async () => {
+        if (!confirm(`删除类型 ${tt.id}（${tt.label}）？已有任务不会自动改类型，但派发时不再按此类型推导。`)) return;
+        delBtn.disabled = true;
+        try { await deleteTaskType(tt.id); await refreshTaskTypes(); renderTypeManager(); await refresh({ silent: true }); toast(`已删除 ${tt.id}`); }
+        catch (e) { toast(`删除失败: ${(e as Error).message}`); delBtn.disabled = false; }
+      });
+      row.append(icon, main, editBtn, delBtn);
+      listBox.appendChild(row);
+    }
+    if (taskTypes.length === 0) {
+      listBox.appendChild(el("div", "tb-hint", "（暂无类型）"));
+    }
+    typeMgrModal.appendChild(listBox);
+
+    // 新增/编辑表单
+    const formTitle = el("div", undefined, typeMgrEditingId ? `编辑 ${typeMgrEditingId}` : "新增任务类型");
+    formTitle.style.fontWeight = "600";
+    formTitle.style.marginTop = "8px";
+    typeMgrModal.appendChild(formTitle);
+    const form = document.createElement("form");
+    form.style.display = "flex";
+    form.style.flexDirection = "column";
+    form.style.gap = "8px";
+    form.style.marginTop = "8px";
+    const idInput = document.createElement("input");
+    idInput.type = "text";
+    idInput.placeholder = "id（如 feature_bugfix2），小写字母开头，仅 a-z 0-9 _ -";
+    idInput.style.padding = "6px 8px";
+    idInput.style.border = "1px solid #e2e8f0";
+    idInput.style.borderRadius = "8px";
+    const labelInput = document.createElement("input");
+    labelInput.type = "text";
+    labelInput.placeholder = "展示名（如 缺陷修复）";
+    labelInput.style.padding = "6px 8px";
+    labelInput.style.border = "1px solid #e2e8f0";
+    labelInput.style.borderRadius = "8px";
+    const iconInput = document.createElement("input");
+    iconInput.type = "text";
+    iconInput.placeholder = "图标 emoji（如 🐛）";
+    iconInput.style.padding = "6px 8px";
+    iconInput.style.border = "1px solid #e2e8f0";
+    iconInput.style.borderRadius = "8px";
+    const descInput = document.createElement("input");
+    descInput.type = "text";
+    descInput.placeholder = "说明（可选）";
+    descInput.style.padding = "6px 8px";
+    descInput.style.border = "1px solid #e2e8f0";
+    descInput.style.borderRadius = "8px";
+    const colorInput = document.createElement("input");
+    colorInput.type = "text";
+    colorInput.placeholder = "颜色 #RRGGBB（可选，如 #ef4444）";
+    colorInput.style.padding = "6px 8px";
+    colorInput.style.border = "1px solid #e2e8f0";
+    colorInput.style.borderRadius = "8px";
+    const wfSel = document.createElement("select") as HTMLSelectElement;
+    wfSel.style.padding = "6px 8px";
+    wfSel.style.border = "1px solid #e2e8f0";
+    wfSel.style.borderRadius = "8px";
+    const wfNone = document.createElement("option");
+    wfNone.value = "";
+    wfNone.textContent = "不绑定 workflow（走普通 manager）";
+    wfSel.appendChild(wfNone);
+    for (const w of workflowsCache) {
+      const o = document.createElement("option");
+      o.value = w.name;
+      o.textContent = w.description ? `${w.name}（${w.description}）` : w.name;
+      wfSel.appendChild(o);
+    }
+    // 若编辑对象的工作流已不存在，保留占位
+    if (typeMgrEditingId) {
+      const cur = taskTypes.find(x => x.id === typeMgrEditingId);
+      if (cur && cur.default_workflow && !workflowsCache.some(w => w.name === cur.default_workflow)) {
+        const o = document.createElement("option");
+        o.value = cur.default_workflow;
+        o.textContent = `${cur.default_workflow}（已不存在）`;
+        wfSel.appendChild(o);
+      }
+    }
+    // 回填编辑值
+    if (typeMgrEditingId) {
+      const cur = taskTypes.find(x => x.id === typeMgrEditingId);
+      if (cur) {
+        idInput.value = cur.id;
+        idInput.disabled = true;
+        labelInput.value = cur.label;
+        iconInput.value = cur.icon || "";
+        descInput.value = cur.description || "";
+        colorInput.value = cur.color || "";
+        wfSel.value = cur.default_workflow || "";
+      }
+    } else {
+      idInput.disabled = false;
+    }
+    const row1 = el("div"); row1.style.display = "flex"; row1.style.gap = "8px"; row1.append(idInput, labelInput, iconInput);
+    const row2 = el("div"); row2.style.display = "flex"; row2.style.gap = "8px"; row2.append(descInput, colorInput);
+    const wfRow = el("div"); wfRow.style.display = "flex"; wfRow.style.gap = "8px"; wfRow.style.alignItems = "center";
+    wfRow.append(el("span", undefined, "默认 Workflow"), wfSel);
+    form.append(row1, row2, wfRow);
+    const actions = el("div", "tb-modal-actions");
+    const cancelBtn = el("button", "tb-btn tb-btn-ghost", "取消") as HTMLButtonElement;
+    cancelBtn.type = "button";
+    cancelBtn.addEventListener("click", () => { typeMgrEditingId = null; renderTypeManager(); });
+    const saveBtn = el("button", "tb-btn tb-btn-primary", typeMgrEditingId ? "保存" : "创建") as HTMLButtonElement;
+    saveBtn.type = "submit";
+    const resetBtn = el("button", "tb-btn tb-btn-ghost tb-btn-sm", "清空表单") as HTMLButtonElement;
+    resetBtn.type = "button";
+    resetBtn.addEventListener("click", () => { typeMgrEditingId = null; renderTypeManager(); });
+    actions.append(resetBtn, cancelBtn, saveBtn);
+    form.appendChild(actions);
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const id = idInput.value.trim();
+      const label = labelInput.value.trim();
+      if (!id || !label) { toast("id 与展示名必填"); return; }
+      const entry = { id, label, icon: iconInput.value.trim() || "🏷", description: descInput.value.trim(), color: colorInput.value.trim() || "#64748b", default_workflow: wfSel.value.trim() } as TaskTypeEntry;
+      saveBtn.disabled = true;
+      try {
+        if (typeMgrEditingId) {
+          await putTaskType(typeMgrEditingId, entry);
+          toast(`已更新 ${id}`);
+        } else {
+          await createTaskType(entry);
+          toast(`已创建 ${id}`);
+        }
+        typeMgrEditingId = null;
+        await refreshTaskTypes();
+        renderTypeManager();
+        await refresh({ silent: true });
+      } catch (err) {
+        toast(`保存失败: ${(err as Error).message}`);
+        saveBtn.disabled = false;
+      }
+    });
+    typeMgrModal.appendChild(form);
+
+    const foot = el("div", "tb-modal-actions");
+    const closeBtn = el("button", "tb-btn tb-btn-ghost", "关闭") as HTMLButtonElement;
+    closeBtn.type = "button";
+    closeBtn.addEventListener("click", closeTypeManager);
+    foot.appendChild(closeBtn);
+    typeMgrModal.appendChild(foot);
+  }
+  function openTypeForm(id?: string): void { typeMgrEditingId = id ?? null; renderTypeManager(); }
+  async function openTypeManager(): Promise<void> {
+    await Promise.all([refreshTaskTypes(), refreshWorkflows()]);
+    typeMgrEditingId = null;
+    renderTypeManager();
+    typeMgrMask.classList.add("open");
+  }
+
+  // 任务类型注册表缓存（可配置：config/task_types.toml）
+  let taskTypes: TaskTypeEntry[] = [];
+  let workflowsCache: WorkflowSummary[] = [];
+  async function refreshTaskTypes(): Promise<void> {
+    try { taskTypes = await listTaskTypes(); } catch { /* keep old */ }
+  }
+  async function refreshWorkflows(): Promise<void> {
+    try { workflowsCache = await listWorkflows(); } catch { workflowsCache = []; }
+  }
+  void refreshTaskTypes();
+  void refreshWorkflows();
+
   // ── 新建 / 编辑任务弹窗 ──
   const taskMask = el("div", "tb-modal-mask");
   const taskModal = el("div", "tb-modal");
@@ -591,10 +877,15 @@ export function mountTaskBoard(opts: {
   const parentSelect = document.createElement("select");
   parentLabel.appendChild(parentSelect);
 
+  const typeLabel = el("label", "tb-field", "任务类型（可选）");
+  const typeSelect = document.createElement("select");
+  typeLabel.appendChild(typeSelect);
+  // 选项由 taskTypes 填充（见 populateTypeSelect）
+
   const wfLabel = el("label", "tb-field", "Workflow（可选）");
   const wfSelect = document.createElement("select");
   wfLabel.appendChild(wfSelect);
-  row.append(prioLabel, parentLabel, wfLabel);
+  row.append(prioLabel, typeLabel, parentLabel, wfLabel);
 
   const formActions = el("div", "tb-modal-actions");
   const formCancel = el("button", "tb-btn tb-btn-ghost", "取消") as HTMLButtonElement;
@@ -613,6 +904,28 @@ export function mountTaskBoard(opts: {
     e.preventDefault();
     void submitTaskForm();
   });
+
+  function populateTypeSelect(selected: string): void {
+    typeSelect.replaceChildren();
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "不指定类型（走普通 manager）";
+    typeSelect.appendChild(none);
+    for (const tt of taskTypes) {
+      const opt = document.createElement("option");
+      opt.value = tt.id;
+      opt.textContent = `${tt.icon} ${tt.label}（${tt.id}）`;
+      opt.title = tt.description;
+      typeSelect.appendChild(opt);
+    }
+    if (selected && !taskTypes.some(v => v.id === selected)) {
+      const opt = document.createElement("option");
+      opt.value = selected;
+      opt.textContent = `${selected}（已不存在）`;
+      typeSelect.appendChild(opt);
+    }
+    typeSelect.value = selected;
+  }
 
   /** 用当前可选 workflow 列表填充下拉框；首项是「不绑定」。 */
   function populateWorkflowSelect(wfs: WorkflowSummary[], selected: string): void {
@@ -663,6 +976,19 @@ export function mountTaskBoard(opts: {
     // 拆分子任务入口进来时父任务固定，不允许改。
     parentSelect.disabled = !!opts2.parentId;
 
+    // 任务类型下拉
+    const typeSelected = opts2.edit?.task_type ?? "";
+    populateTypeSelect(typeSelected);
+    // 类型变化时提示默认 workflow（显式 workflow 为空时有效）
+    typeSelect.onchange = () => {
+      if (wfSelect.value) return;
+      const tt = taskTypes.find(v => v.id === typeSelect.value);
+      if (tt?.default_workflow) {
+        wfSelect.title = `类型 ${tt.id} 的默认 workflow：${tt.default_workflow}（留空即按此推导）`;
+      } else {
+        wfSelect.title = "";
+      }
+    };
     // workflow 下拉：先按编辑值/空值放好占位，再异步拉最新列表填充。
     const wfSelected = opts2.edit?.workflow ?? "";
     populateWorkflowSelect([], wfSelected);
@@ -688,11 +1014,12 @@ export function mountTaskBoard(opts: {
     const description = descInput.value.trim();
     const priority = Number(prioSelect.value);
     const workflow = wfSelect.value;
+    const task_type = (typeSelect as HTMLSelectElement).value;
     try {
       if (editingTaskId) {
-        // PATCH 语义：workflow 缺省 = 不变，null = 清除绑定。
         await updateTask(editingTaskId, {
           title, description, priority,
+          task_type: task_type || null,
           workflow: workflow || null,
         });
         toast(`${editingTaskId} 已保存`);
@@ -703,6 +1030,7 @@ export function mountTaskBoard(opts: {
           description: description || undefined,
           priority,
           parent_id: parentId,
+          task_type: task_type || undefined,
           workflow: workflow || undefined,
         });
         toast(`${created.id} 已创建${parentId ? `（${parentId} 的子任务）` : ""}`);
@@ -754,8 +1082,18 @@ export function mountTaskBoard(opts: {
     card.appendChild(el("div", "tb-title", task.title));
 
     const meta = el("div", "tb-meta");
+    if (task.task_type) {
+      const tt = taskTypes.find(v => v.id === task.task_type);
+      const label = tt ? `${tt.icon} ${tt.label}` : task.task_type;
+      meta.appendChild(el("span", "tb-chip tb-chip-type", label));
+    }
     if (task.workflow) {
       meta.appendChild(el("span", "tb-chip tb-chip-workflow", `🔀 ${task.workflow}`));
+    } else if (task.task_type) {
+      const tt = taskTypes.find(v => v.id === task.task_type);
+      if (tt?.default_workflow) {
+        meta.appendChild(el("span", "tb-chip tb-chip-workflow hint", `↳ ${tt.default_workflow}`));
+      }
     }
     if (task.scheduled_at != null && task.state === "todo") {
       const due = task.scheduled_at <= Date.now();
@@ -838,6 +1176,7 @@ export function mountTaskBoard(opts: {
   container.closeBtn.addEventListener("click", close);
   container.newBtn.addEventListener("click", () => openTaskModal());
   container.dispatchAllBtn.addEventListener("click", () => void dispatchAll());
+  container.manageTypesBtn.addEventListener("click", () => void openTypeManager());
 
   /** 「派发全部」：后端按优先级批量派发 todo，冲突/超限的留 todo 等位。 */
   async function dispatchAll(): Promise<void> {
