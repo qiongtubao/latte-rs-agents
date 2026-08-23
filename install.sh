@@ -214,6 +214,7 @@ install_file "$SOURCE_DIR/agents/devops.toml"        "$TARGET_DIR/agents.d/devop
 install_file "$SOURCE_DIR/agents/tech_writer.toml"   "$TARGET_DIR/agents.d/tech_writer.toml"   "Tech Writer role"
 install_file "$SOURCE_DIR/agents/manager.toml"       "$TARGET_DIR/agents.d/manager.toml"       "Manager role"
 install_file "$SOURCE_DIR/agents/task_planner.toml"  "$TARGET_DIR/agents.d/task_planner.toml"  "Task Planner role"
+install_file "$SOURCE_DIR/agents/tutor.toml"        "$TARGET_DIR/agents.d/tutor.toml"        "Tutor role"
 install_file "$SOURCE_DIR/agents/advisor.toml"       "$TARGET_DIR/agents.d/advisor.toml"       "Advisor role"
 
 # Install workflow configs (one per file, glob — 新增 workflow 自动纳入)

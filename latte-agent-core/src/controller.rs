@@ -2558,6 +2558,10 @@ async fn build_runner(
     if !role.allowed_tools.is_empty() {
         let tm = build_tool_manager(&role.allowed_tools).await
             .map_err(|e| AgentError::Tool(format!("build tool manager '{role_id}': {e}")))?;
+        // request_tool：所有带工具的角色都可申请临时使用未授权工具
+        // （角色 prompt 与 allowed_tools 不对齐时的软拒绝 + 申请通道）。
+        register_request_tool(tm.clone())
+            .map_err(|e| AgentError::Tool(format!("register request_tool '{role_id}': {e}")))?;
         // Any role with "delegate" in allowed_tools gets the delegate tool registered,
         // enabling nested subsessions (roleA delegates to roleB, roleB can also delegate)
         if role.allowed_tools.iter().any(|t| t == "delegate") {
@@ -2724,7 +2728,6 @@ async fn build_runner(
     }
 }
 
-
 pub(crate) async fn build_tool_manager(
     allowed: &[String],
 ) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error + Send + Sync>> {
@@ -2734,6 +2737,16 @@ pub(crate) async fn build_tool_manager(
         mgr.register_package(p).await
             .map_err(|e| format!("register_package: {e}"))?;
     }
+    // 注册所有包后、过滤前，缓存完整工具池供 request_tool 使用。
+    FULL_TOOL_POOL.get_or_init(|| {
+        let mut pool = FullToolPool::new();
+        for name in mgr.get_tool_names() {
+            if let Some(tool) = mgr.get_tool(&name) {
+                pool.insert(name, tool);
+            }
+        }
+        pool
+    });
     // allowed 里是配置层扁平名（bash/read/edit/...）。tools crate 扁平化
     // 后注册名 == 配置名 == 模型 schema 名，配置名直接进 keep 即可匹配。
     let mut keep: std::collections::HashSet<String> = allowed
@@ -2771,6 +2784,121 @@ pub(crate) async fn build_tool_manager(
     }
     Ok(mgr)
 }
+
+// ─── Full tool pool: cached registry of all builtin tools ──────────────
+// Built once on first build_tool_manager call (after all packages
+// registered, before keep filtering). Used by request_tool to look up
+// tool definitions that were filtered out by the allowlist.
+// OnceLock is used because initialization requires an async context
+// (register_package flattens namespaces) — see rule
+// "Keep OnceLock when runtime input is required".
+use std::sync::OnceLock;
+type FullToolPool = std::collections::HashMap<String, latte_rs_agent_tools::types::Tool>;
+static FULL_TOOL_POOL: OnceLock<FullToolPool> = OnceLock::new();
+
+pub(crate) fn full_tool_pool() -> &'static FullToolPool {
+    FULL_TOOL_POOL.get().unwrap_or_else(|| {
+        // Should never happen: build_tool_manager always runs before
+        // register_request_tool. If it does, initialise with a synchronous
+        // best-effort pool (no namespace flattening, tools maintain their
+        // original name from the package definition).
+        use latte_rs_agent_tools::tools::builtin_tool_packages;
+        let mut pool = FullToolPool::new();
+        for pkg in builtin_tool_packages() {
+            for tool in pkg.tools {
+                pool.insert(tool.name.clone(), tool);
+            }
+        }
+        FULL_TOOL_POOL.get_or_init(|| pool)
+    })
+}
+
+/// Register `request_tool` on the given tool manager. `request_tool` lets
+/// a role ask for temporary access to a tool that is not in its allowed
+/// list. The tool is looked up from the full builtin tool pool and
+/// registered on the fly — no approval needed, but the grant is
+/// per-role-manager (i.e. per-runner, lasts for the session).
+pub(crate) fn register_request_tool(
+    tm: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use latte_rs_agent_tools::types::*;
+    use std::sync::Arc;
+
+    let pool = full_tool_pool().clone();
+
+    let input_schema = ToolInputSchema {
+        schema_type: SchemaType,
+        properties: vec![
+            ("tool_name".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("要申请使用的工具名称。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+            ("reason".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("申请使用该工具的原因（角色 prompt 的上下文或任务需求描述）。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            }),
+        ].into_iter().collect(),
+        required: Some(vec!["tool_name".into(), "reason".into()]),
+        ..Default::default()
+    };
+    let tm_for_register = tm.clone();
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let tm = tm.clone();  // Arc is cheap; keep a copy for the async block
+        let pool = pool.clone();
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+
+            let tool_name = input
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| tool_err("'tool_name' 不能为空".into()))?;
+
+            let reason = input
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| tool_err("'reason' 不能为空".into()))?;
+
+            // Look up in the full tool pool.
+            let tool = pool.get(&tool_name).ok_or_else(|| {
+                tool_err(format!("未知工具 '{tool_name}'，不在可用工具池中"))
+            })?;
+
+            // Check if already registered (idempotent).
+            if tm.has(&tool_name) {
+                return Ok(serde_json::Value::String(format!(
+                    "工具 '{tool_name}' 已授权，可以直接使用。"
+                )));
+            }
+
+            // Temporarily grant access: register the tool into the current
+            // manager. The tool will appear in the next model request's
+            // tool schemas automatically.
+            tm.register(tool.clone(), Some("requested"));
+
+            Ok(serde_json::Value::String(format!(
+                "工具 '{tool_name}' 已临时授权，可以在本轮对话中直接调用。原因已记录：{reason}"
+            )))
+        })
+    });
+
+    let tool = latte_rs_agent_tools::types::Tool::builder(
+        "request_tool".to_string(),
+        "向当前角色申请临时使用某个工具。当你的角色 prompt 或任务需要某个工具，但该工具不在你的可用工具列表中时，先用此工具申请。参数：tool_name(工具名) + reason(申请原因)。申请后自动批准，之后可直接调用该工具。".to_string(),
+        input_schema,
+        handler,
+    )
+    .build();
+
+    tm_for_register.register(tool, Some("request_tool"));
+    Ok(())
+}
+
 
 fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
     use latte_rs_agent_tools::types::*;
@@ -7018,5 +7146,45 @@ require = ["永远不可能出现的验收字符串"]
             "error should mention task_id: {err}"
         );
     }
-}
 
+    #[tokio::test]
+    async fn request_tool_grants_missing_tool() {
+        // build_tool_manager 会先注册所有包并填充 FULL_TOOL_POOL。
+        // 空 allowed → 除 request_tool 外全部被过滤掉。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        register_request_tool(tm.clone()).expect("register request_tool");
+
+        // request_tool 本身必须对所有角色可用。
+        let names = tm.get_tool_names();
+        assert!(names.contains(&"request_tool".to_string()),
+            "request_tool must be registered for all roles: {names:?}");
+
+        // 申请一个不存在的工具 → 拒绝。
+        let err = tm
+            .execute(
+                "request_tool",
+                serde_json::json!({"tool_name": "bogus_tool_999", "reason": "test"}),
+                None,
+            )
+            .await
+            .expect_err("bogus tool must be rejected");
+        assert!(err.to_string().contains("未知工具"), "error: {err}");
+
+        // 申请一个真实工具（read）→ 自动批准并注册。
+        let result = tm
+            .execute(
+                "request_tool",
+                serde_json::json!({"tool_name": "read", "reason": "need to read files for testing"}),
+                None,
+            )
+            .await
+            .expect("request_tool should succeed for 'read'");
+        let result_str = serde_json::to_string(&result).unwrap_or_default();
+        assert!(result_str.contains("已临时授权"), "expected 'granted', got: {result_str}");
+
+        // 申请后 read 应已注册。
+        let names_after = tm.get_tool_names();
+        assert!(names_after.contains(&"read".to_string()),
+            "read must be registered after request: {names_after:?}");
+    }
+}

@@ -700,17 +700,17 @@ async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
         .into_iter()
         .map(|n| n.rsplit('.').next().unwrap_or(&n).to_string())
         .collect();
+    names.insert("ask".to_string());
+    names.insert("plan".to_string());
+    names.insert("task_report".to_string());
+    names.insert("request_tool".to_string());
     names.insert("delegate".to_string());
     names.insert("workflow".to_string());
     names.insert("generate_image".to_string());
-    // code_graph 由 controller 按角色配置动态注册（controller.rs
-    // code_graph_tool()），不在 builtin packages——不补进枚举的话角色
-    // 编辑器永远看不到它，形成「没配上就不注册、不注册就配不上」的死锁。
     names.insert("code_graph".to_string());
     Ok(names.into_iter().collect())
 }
 
-/// 从磁盘重新加载角色分层配置，整体替换内存中的 roles。
 ///
 /// 背景：merged 只在 server 启动时加载一次，而角色 TOML 可能被外部
 /// 编辑器改动——角色编辑器「表单编辑」读内存、「源文件编辑」读磁盘，

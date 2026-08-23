@@ -1,0 +1,102 @@
+# Workflow: learn_loop
+# 交互式学习循环：知识点拆解 → 逐个教学 + 弹窗出题 → 掌握报告
+# 流水线：plan（拆解知识点+写账本）→ teach（循环教学+ask弹窗出题，每步fresh subagent）
+#         → report（输出掌握报告）
+#
+# 核心机制（A + C）：
+#   A - workflow 内循环，每步 fresh subagent，context 天然隔离不涨
+#   C - 文件账本（.latte/learn/<slug>/ledger.json），覆盖写，恒 O(N)
+#   ask 弹窗出题——答案经 choice-answer 直达，不入主 session 对话流
+#
+# 用法：manager 收到「帮我学习 XXX」时调用：
+#   workflow { name: "learn_loop", topic: "<主题>" }
+# 或 slash 命令：
+#   /learn_loop <主题>
+#
+# 产物：.latte/learn/<slug>/ledger.json（掌握进度）+ 最终报告
+
+name = "learn_loop"
+command = "/learn_loop"
+description = "交互式学习循环：知识点拆解 → 逐个教学+弹窗出题 → 掌握报告"
+max_rounds = 1
+
+# ── 1. 拆解知识点 ─────────────────────────────────────
+# tutor 角色分析主题，产出知识点清单 + 初始账本，输出 slug
+[[steps]]
+id = "plan"
+description = "拆解知识点并写入 plan.json / ledger.json"
+role = "tutor"
+output_key = "plan_out"
+max_retries = 1
+task = """围绕主题「{{topic}}」拆解知识点。你是课程设计师，不是老师——只产出知识点清单，不教学。
+
+1. 把主题拆成 3-6 个知识点，每个知识点涵盖一个独立概念/机制，互不重叠。
+2. 为每个知识点设计：id（短英文，如 ownership）、title（中文，如「所有权规则」）、**一道选择题**（含 question + 4 个选项，含正确答案标记 recommended）。
+3. 从主题推导 slug（小写英文 + 连字符，如 "rust-ownership"）。
+4. 用 write 工具写入 `.latte/learn/<slug>/plan.json`，格式：
+   ```json
+   {
+     "slug": "<slug>",
+     "topic": "{{topic}}",
+     "knowledge_points": [
+       {"id": "k1", "title": "所有权规则", "question": "…", "options": [{"label":"…","description":"…","recommended":true}, …]},
+       ...
+     ]
+   }
+   ```
+5. 写入初始 ledger.json（全部 pending）：
+   ```json
+   {"slug":"<slug>","knowledge_points":[{"id":"k1","title":"所有权规则","status":"pending"},…],"updated_at":"<now>"}
+   ```
+6. **最后一行输出 slug**（如 `rust-ownership`），不要包含其他内容。"""
+
+# ── 2. 循环教学 + 弹窗出题 ─────────────────────────────
+# 每轮 fresh subagent，读 plan.json + ledger.json，ASK 弹窗出题
+# 答案经 choice-answer 直达，不入主 session 对话流
+# 学完输出 STATUS_ALL_DONE，否则 STATUS_CONTINUE
+[[steps]]
+id = "teach"
+description = "逐个教学并用 ask 弹窗出题检验掌握程度"
+role = "tutor"
+output_key = "teach_out"
+max_retries = 1
+loop_until = "STATUS_ALL_DONE"
+max_iterations = 10
+task = """你是互动学习辅导员。当前主题 slug 由上一轮产出（plan 步的末行）指定：{{plan_out}}。
+
+读取 .latte/learn/{{plan_out}}/plan.json 和 .latte/learn/{{plan_out}}/ledger.json，找出第一个 status != "pass" 的知识点：
+
+1. **教学**：输出 3-8 句简短讲解，聚焦该知识点的一个关键理解点。
+2. **出题**：用 `ask` 工具弹出选择题——使用 plan.json 里该知识点预设的 question 和 options（含正确答案 recommended 标记）。支持图片展示在选项里。
+3. **评估**：用户答案（tool result）与正确答案对比——正确则 ledger 写 `pass`，错误写 `fail`。覆盖写 ledger.json。
+4. **循环控制**：最后一行输出——全部知识点为 `pass` 则输出 `STATUS_ALL_DONE`，否则输出 `STATUS_CONTINUE`。
+
+规则：
+- 每次只处理一个知识点（第一个未掌握的）。
+- 答错的知识点标 `fail`，本轮不再重教——下一轮迭代会再处理它。
+- 教学输出保持简短（3-8 句），详细内容放文档里不在这里铺开。
+- **最后一行必须且只能是 STATUS_ALL_DONE 或 STATUS_CONTINUE**，不要包含其他内容在最后一行。"""
+
+# ── 3. 输出掌握报告 ───────────────────────────────────
+[[steps]]
+id = "report"
+description = "输出最终掌握报告"
+role = "tutor"
+output_key = "report"
+max_retries = 1
+task = """读取 .latte/learn/{{plan_out}}/ledger.json，输出一份简洁的掌握报告。
+
+报告格式：
+```
+## 学习报告：{{topic}}
+
+**掌握进度**：X/Y（已通过 X 个，共 Y 个知识点）
+
+**未通过知识点**：
+- 知识点名（标题）
+- 知识点名（标题）
+
+**建议**：一句总结。
+```
+
+只输出报告文本，不要调用其他工具。"""

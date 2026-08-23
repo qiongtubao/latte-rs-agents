@@ -2674,6 +2674,28 @@ output_key = "exploration"
         // verify：reviewer + programmer 接力（校对 + 修正）
         assert_eq!(wf.steps[3].roles(), vec!["reviewer", "programmer"]);
     }
+    /// learn_loop：交互式学习循环——plan（拆解+写账本）→ teach（loop_until
+    /// 弹窗出题）→ report。核心：teach 必须是循环步（每轮 fresh subagent
+    /// context 隔离），且 tutor 配 ask 工具（弹窗出题，答案不入主 session）。
+    #[test]
+    fn learn_loop_workflow_structure() {
+        let raw = include_str!("../../config/workflows/learn_loop.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("learn_loop should validate");
+        let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["plan", "teach", "report"]);
+        // teach：跨 step 循环（A——每轮 fresh subagent，context 隔离）
+        let teach = &wf.steps[1];
+        assert_eq!(teach.loop_until.as_deref(), Some("STATUS_ALL_DONE"));
+        assert_eq!(teach.max_iterations, Some(10));
+        assert_eq!(teach.roles(), vec!["tutor"]);
+        // teach 必须产出循环状态标记（CONTINUE / ALL_DONE）
+        assert!(teach.task_text().contains("STATUS_CONTINUE"));
+        assert!(teach.task_text().contains("STATUS_ALL_DONE"));
+        // plan：先写账本再进循环；report：结尾收报告
+        assert!(wf.steps[0].task_text().contains("ledger.json"));
+        assert!(wf.steps[2].task_text().contains("ledger.json"));
+    }
 
     /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
     /// 使用 include_str! 直接引用真文件，确保 TOML 编辑后测试立即红。

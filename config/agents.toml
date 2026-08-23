@@ -105,6 +105,16 @@ temperature = 0.5
 tools = ["read", "write"]
 icon = "📝"
 
+
+[roles.tutor]
+id = "tutor"
+name = "Tutor"
+category = "execution"
+model_tier = "standard"
+prompt_file = "prompts/tutor.md"
+temperature = 0.5
+tools = ["read", "write", "ask"]
+icon = "🎓"
 # ─── Verification Roles ──────────────────────────────────────────────────
 
 [roles.tester]
