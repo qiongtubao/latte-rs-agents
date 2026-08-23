@@ -1057,12 +1057,21 @@ pub(crate) async fn update_task(
         .map_err(Into::into)
 }
 
-/// `POST /api/tasks/:id/dispatch` —— 立即执行（或 rework 重新派发）。
+/// `POST /api/tasks/:id/dispatch` — 立即执行（或 rework 重新派发）。
+/// body 可选：`{ "mode": "redo" | "rework" }`，缺省 `"redo"`。
+#[derive(Deserialize)]
+pub(crate) struct DispatchTaskBody {
+    #[serde(default)]
+    pub mode: String,
+}
+
 pub(crate) async fn dispatch_task(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(state): State<AppState>,
+    Json(body): Json<DispatchTaskBody>,
 ) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
-    crate::tasks::dispatch_task(&state.backend, &id, "user")
+    let mode = if body.mode == "rework" { "rework" } else { "redo" };
+    crate::tasks::dispatch_task(&state.backend, &id, "user", mode)
         .await
         .map(Json)
         .map_err(Into::into)

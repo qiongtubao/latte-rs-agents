@@ -1052,11 +1052,14 @@ export async function updateTask(
   );
 }
 
-/** POST /api/tasks/:id/dispatch：立即执行（建 manager session 并发送任务）。 */
-export async function dispatchTask(id: string): Promise<TaskView> {
+/** POST /api/tasks/:id/dispatch：立即执行（建 manager session 并发送任务）。
+ * mode="redo"（默认）：按 task_type/workflow 重跑，旧反馈仅作参考。
+ * mode="rework"：强制走返工流（定点修复），带审查反馈。 */
+export async function dispatchTask(id: string, mode?: string): Promise<TaskView> {
   return getTransport().request(
     "POST",
     `/api/tasks/${encodeURIComponent(id)}/dispatch`,
+    { mode: mode || "redo" },
   );
 }
 

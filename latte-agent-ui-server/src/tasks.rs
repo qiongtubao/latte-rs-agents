@@ -511,10 +511,10 @@ impl TaskStore {
                 done += 1;
             }
         }
-        // effective workflow 供前端直接展示（避免前端再拉注册表计算）
+        // effective workflow 供前端直接展示（类型优先，与 redo 默认模式一致）
         let cwd = self.dir.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new("."));
         let reg = crate::task_types::TaskTypeRegistry::load(cwd);
-        let effective = crate::task_types::effective_workflow(task.task_type.as_deref(), task.workflow.as_deref(), &reg);
+        let effective = crate::task_types::effective_workflow_type_first(task.task_type.as_deref(), task.workflow.as_deref(), &reg);
         TaskView {
             effective_workflow: effective,
             actions: task.effective_actions(),
@@ -1184,11 +1184,24 @@ fn build_dispatch_message(
 /// 新建 ui-session → 打 label → 发首条消息给 manager →
 /// state → in_progress，runs 追加一条。`actor` ∈ `user` / `scheduler`。
 ///
-/// 绑定了 workflow 的任务（`task.workflow = Some`）不发 manager 消息：
+/// `mode`：
+/// - `redo`（默认）：按任务自身的 workflow 绑定重跑——显式 workflow 优先，
+///   否则按 task_type 默认推导；rework 状态重派时保留原 workflow，旧审查
+///   反馈仅作为 topic 参考（不强制 rework 定点修复）。适合"改了类型/方向
+///   要按新要求重跑"的场景。
+/// - `rework`：强制走 `rework` 返工流（理解反馈→定点修复→验证→终审），
+///   带审查反馈。适合小修小补、反馈指向明确修复点的场景。
+///
+/// 绑定了 workflow 的任务（effective ≠ None）不发 manager 消息：
 /// 直接在该 session 上跑 `run_workflow`（事件进 session 的 broadcast，
 /// SSE/归档照常可见），后台跑完后按 report 语义自动迁移状态
 /// （actor=workflow，见 [`apply_workflow_finish`]）。
-pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskView, ApiError> {
+pub async fn dispatch_task(
+    b: &UiBackend,
+    id: &str,
+    actor: &str,
+    mode: &str,
+) -> Result<TaskView, ApiError> {
     // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
     let (title, priority, description, children, task_type, workflow, prev_state, recent_notes) = {
         let store = b.tasks.read();
@@ -1250,34 +1263,71 @@ pub async fn dispatch_task(b: &UiBackend, id: &str, actor: &str) -> Result<TaskV
     api::set_session_label(b, &info.session_id, &label)?;
     let base_msg = build_dispatch_message(id, &title, priority, &description, &children);
 
-    // 3. workflow 绑定分支：显式 workflow 优先，否则按 task_type 默认推导；
-    //    都为空 → 走普通 manager 会话（可配置注册表的"未指定即 manager"语义）。
-    //    rework 状态改用 rework 返工流（带审查反馈），而不是原样重跑开发流。
+    // 3. workflow 绑定分支：`mode` 决定重做方式。
+    //    - "redo"（默认）：**优先按 task_type 默认 workflow 推导**，显式 workflow
+    //      仅作兜底（task_type 无默认时才用）。用户改类型=希望跑该类型的流程。
+    //    - "rework"：强制走 rework 返工流（带审查反馈），适合小修小补的返工场景。
     let reg = crate::task_types::TaskTypeRegistry::load(&b.cwd);
-    let effective = crate::task_types::effective_workflow(task_type.as_deref(), workflow.as_deref(), &reg);
-    let wf_run = if let Some(bound_name) = effective {
-        let (wf_name, msg) = if prev_state == "rework" {
-            let feedback = if recent_notes.is_empty() {
-                String::new()
-            } else {
-                format!("\n\n【审查反馈与执行历史】\n{}", recent_notes.join("\n---\n"))
-            };
-            ("rework".to_string(), format!("{base_msg}{feedback}"))
-        } else {
-            (bound_name.clone(), base_msg.clone())
-        };
-        let wf = load_workflow(&wf_name, &b.cwd).map_err(|e| {
-            ApiError::bad_request(format!("workflow '{wf_name}' 加载失败：{e}"))
-        })?;
-        let event_tx = api::session_event_sender(b, &info.session_id).await?;
-        // workflow 绑定分支不走 chat_send/submit_input，这里把派发消息
-        // 显式记为 session 的用户诉求，否则 advisor 审查拿到空问题。
-        api::session_record_user_input(b, &info.session_id, &msg).await?;
-        Some((wf, event_tx, Arc::new(AtomicBool::new(false)), msg))
+    let effective = if mode == "redo" {
+        // redo：优先 task_type 默认，显式 workflow 仅作兜底
+        crate::task_types::effective_workflow_type_first(task_type.as_deref(), workflow.as_deref(), &reg)
     } else {
-        api::chat_send(b, Some(&info.session_id), &base_msg).await?;
-        None
+        crate::task_types::effective_workflow(task_type.as_deref(), workflow.as_deref(), &reg)
     };
+    let (wf_name, msg) = if mode == "rework" {
+        // 强制返工流：即使 task_type=learn 也走 rework.toml，带审查反馈
+        let feedback = if recent_notes.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n【审查反馈与执行历史】\n{}", recent_notes.join("\n---\n"))
+        };
+        ("rework".to_string(), format!("{base_msg}{feedback}"))
+    } else if let Some(bound) = effective {
+        // 按类型重跑（redo）：走 effective workflow，rework 状态时附加反馈参考
+        let feedback = if prev_state == "rework" && !recent_notes.is_empty() {
+            format!("\n\n【历史审查反馈（仅供参考，按新要求重做）】\n{}", recent_notes.join("\n---\n"))
+        } else {
+            String::new()
+        };
+        (bound.clone(), format!("{base_msg}{feedback}"))
+    } else {
+        // 无绑定 → 走普通 manager 会话
+        let feedback = if prev_state == "rework" && !recent_notes.is_empty() {
+            format!("\n\n【历史审查反馈（仅供参考，按新要求重做）】\n{}", recent_notes.join("\n---\n"))
+        } else {
+            String::new()
+        };
+        let msg = format!("{base_msg}{feedback}");
+        api::chat_send(b, Some(&info.session_id), &msg).await?;
+        // 无绑定路径：直接跳到状态更新（wf_run = None）
+        let now = now_ms();
+        let mut store = b.tasks.write();
+        {
+            let t = store
+                .get_mut(id)
+                .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+            t.set_state("in_progress", actor, None, now);
+            t.scheduled_at = None;
+            t.runs.push(TaskRun {
+                session_id: info.session_id.clone(),
+                started_at: now,
+                ended_at: None,
+                result: None,
+            });
+            t.updated_at = now;
+        }
+        store.persist(id).map_err(ApiError::internal)?;
+        let view = store.view(store.get(id).expect("刚 persist 的任务必然存在"));
+        return Ok(view);
+    };
+    let wf = load_workflow(&wf_name, &b.cwd).map_err(|e| {
+        ApiError::bad_request(format!("workflow '{wf_name}' 加载失败：{e}"))
+    })?;
+    let event_tx = api::session_event_sender(b, &info.session_id).await?;
+    // workflow 绑定分支不走 chat_send/submit_input，这里把派发消息
+    // 显式记为 session 的用户诉求，否则 advisor 审查拿到空问题。
+    api::session_record_user_input(b, &info.session_id, &msg).await?;
+    let wf_run = Some((wf, event_tx, Arc::new(AtomicBool::new(false)), msg));
 
     // 4. 写锁更新状态（任务可能已被并发删除 → 404，session 留着无害）。
     let now = now_ms();
@@ -1525,7 +1575,7 @@ pub async fn dispatch_ready(
                 .push((id, format!("并发上限：已有 {running} 个任务在跑（上限 {max}），等位")));
             continue;
         }
-        match dispatch_task(b, &id, actor).await {
+        match dispatch_task(b, &id, actor, "redo").await {
             Ok(view) => {
                 let session_id = view
                     .task
@@ -1938,7 +1988,7 @@ async fn scan_and_dispatch(b: &std::sync::Arc<UiBackend>) {
         if !still_due {
             continue;
         }
-        if let Err(e) = dispatch_task(b, &id, "scheduler").await {
+        if let Err(e) = dispatch_task(b, &id, "scheduler", "redo").await {
             eprintln!("[task-scheduler] dispatch {id} failed ({}): {}", e.status, e.message);
             // 失败防刷屏：清掉排期，否则每 5s 重试一次且每次新建 session。
             // 用户看到 history 备注后可重新排期或手动执行。
@@ -2667,7 +2717,7 @@ mod tests {
             store.get_mut(a).unwrap().set_state("in_progress", "user", None, now);
             store.get_mut(c).unwrap().set_state("todo", "user", None, now);
         }
-        let err = dispatch_task(&b, c, "user").await.expect_err("重叠应 409");
+        let err = dispatch_task(&b, c, "user", "redo").await.expect_err("重叠应 409");
         assert_eq!(err.status, 409);
         assert!(err.message.contains(a), "消息应列出冲突任务 id：{}", err.message);
         assert!(err.message.contains("src/ringbuf"), "消息应列出重叠路径：{}", err.message);

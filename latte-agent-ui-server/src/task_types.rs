@@ -185,8 +185,8 @@ pub fn delete_task_type(cwd: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 任务的实际执行工作流：显式 workflow 优先，否则按 task_type 的默认推导。
-/// 返回 `None` → 走普通 manager 会话。
+/// 任务的实际执行工作流（显式优先，用于 rework 强绑/兼容路径）：
+/// 显式 workflow 优先，否则按 task_type 的默认推导。返回 `None` → manager。
 pub fn effective_workflow(
     task_type: Option<&str>,
     explicit_workflow: Option<&str>,
@@ -197,6 +197,26 @@ pub fn effective_workflow(
     }
     let t = task_type.map(str::trim).filter(|s| !s.is_empty())?;
     registry.default_workflow(t)
+}
+
+/// 类型优先推导（redo/看板默认路径）：task_type 的默认 workflow 优先，
+/// 显式 workflow 仅作兜底（task_type 无默认时才用）。用户改类型=希望跑
+/// 该类型的流程，显式字段不应覆盖。返回 `None` → manager。
+pub fn effective_workflow_type_first(
+    task_type: Option<&str>,
+    explicit_workflow: Option<&str>,
+    registry: &TaskTypeRegistry,
+) -> Option<String> {
+    let t = task_type.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(t) = t {
+        if let Some(w) = registry.default_workflow(t) {
+            return Some(w);
+        }
+    }
+    explicit_workflow
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

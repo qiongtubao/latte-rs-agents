@@ -81,7 +81,8 @@ export const STATE_ACTIONS: Record<string, TaskAction[]> = {
     { key: "delete", label: "删除任务", kind: "danger" },
   ],
   rework: [
-    { key: "run_now", label: "▶ 重新派发", kind: "primary" },
+    { key: "run_now", label: "▶ 按类型重做", kind: "primary" },
+    { key: "run_rework", label: "↩ 返工（带反馈修复）", kind: "ghost" },
     { key: "edit", label: "编辑补充要求", kind: "ghost" },
     { key: "delete", label: "删除任务", kind: "danger" },
   ],
@@ -109,14 +110,11 @@ export function effectiveActions(
   return STATE_ACTIONS[task.state] ?? [];
 }
 
-/** 动作按钮文案：绑定了 workflow 的任务，「立即执行 / 重新派发」按钮
- *  直接标出将运行的 workflow（显式 workflow 优先，否则按 task_type 默认推导）。 */
+/** 动作按钮文案：始终显示任务动作本身（立即执行/重新派发），workflow 只作为芯片/提示展示，避免“运行 update_docs”被误读为任务名。 */
 export function actionLabel(
-  task: { workflow?: string | null; effective_workflow?: string | null; task_type?: string | null },
+  _task: { workflow?: string | null; effective_workflow?: string | null; task_type?: string | null },
   a: TaskAction,
 ): string {
-  const wf = (task as any).effective_workflow ?? task.workflow;
-  if (a.key === "run_now" && wf) return `▶ 运行 ${wf}`;
   return a.label;
 }
 
@@ -138,7 +136,9 @@ export function actionRequest(
     case "to_backlog":
       return updateTask(taskId, { state: "backlog", scheduled_at: null });
     case "run_now":
-      return dispatchTask(taskId);
+      return dispatchTask(taskId, "redo");
+    case "run_rework":
+      return dispatchTask(taskId, "rework");
     case "unschedule":
       return updateTask(taskId, { scheduled_at: null });
     case "abort":
@@ -165,7 +165,8 @@ export function actionToast(key: string, taskId: string): string {
   switch (key) {
     case "to_todo": return `${taskId} 已移到 Todo，可立即或定时执行`;
     case "to_backlog": return `${taskId} 已移回 Backlog`;
-    case "run_now": return `${taskId} 已交给 manager，新 session 已创建`;
+    case "run_now": return `${taskId} 已按类型重做，新 session 已创建`;
+    case "run_rework": return `${taskId} 已进入返工流程，新 session 已创建`;
     case "unschedule": return `${taskId} 已取消排期`;
     case "abort": return `${taskId} 已中止，回到 Todo`;
     case "approve": return `${taskId} 评审通过，进入 Merging`;

@@ -56,9 +56,9 @@ describe("任务看板状态机：状态 → 动作映射", () => {
       .toEqual(["open_session", "approve", "reject", "delete"]);
   });
 
-  it("rework：重新派发 / 编辑", () => {
+  it("rework：按类型重做 / 返工 / 编辑", () => {
     expect(keysOf({ state: "rework", scheduled_at: null }))
-      .toEqual(["run_now", "edit", "delete"]);
+      .toEqual(["run_now", "run_rework", "edit", "delete"]);
   });
 
   it("merging：查看对话 / 标记完成", () => {
@@ -102,16 +102,12 @@ describe("lastSessionId（查看对话按钮的 session 来源）", () => {
   });
 });
 
-describe("actionLabel（workflow 绑定任务的执行按钮文案）", () => {
-  it("run_now + 已绑定 workflow → 「▶ 运行 <workflow>」", () => {
+describe("actionLabel（执行按钮始终显示任务动作，不以 workflow 名覆盖）", () => {
+  it("run_now 始终显示「立即执行」，即使已绑定 workflow", () => {
     const a = STATE_ACTIONS.todo.find((x) => x.key === "run_now")!;
-    expect(actionLabel({ workflow: "discussion" }, a)).toBe("▶ 运行 discussion");
-  });
-
-  it("run_now + 未绑定 workflow → 保持原 label", () => {
-    const a = STATE_ACTIONS.todo.find((x) => x.key === "run_now")!;
+    expect(actionLabel({ workflow: "discussion" }, a)).toBe(a.label);
+    expect(actionLabel({ workflow: "discussion" }, a)).toBe("▶ 立即执行");
     expect(actionLabel({ workflow: null }, a)).toBe(a.label);
-    expect(actionLabel({ workflow: null }, a)).toBe("▶ 立即执行");
   });
 
   it("非 run_now 动作不受 workflow 影响", () => {
@@ -119,7 +115,6 @@ describe("actionLabel（workflow 绑定任务的执行按钮文案）", () => {
     expect(actionLabel({ workflow: "discussion" }, a)).toBe(a.label);
   });
 });
-
 describe("actionRequest / actionToast", () => {
   it("UI 侧处理的动作（schedule/edit/open_session/refine）不发请求，返回 null", () => {
     expect(actionRequest("schedule", "LAT-1")).toBeNull();
