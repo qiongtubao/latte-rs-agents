@@ -176,6 +176,7 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 max_retries: 0,
                 loop_until: None,
                 loop_back_to: None,
+                loop_abort_on: None,
                 max_iterations: None,
                 workflow: None,
                 output_from: None,

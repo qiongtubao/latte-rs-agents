@@ -217,6 +217,20 @@ pub struct WorkflowStepDef {
     /// DAG 下必填且必须位于更早的 wave）。
     #[serde(default)]
     pub loop_back_to: Option<String>,
+    /// 「不可返工」熔断标记：`loop_until` 未满足时，若产出还包含该子串
+    /// 则直接判 workflow 失败，不做返工。给 task_refine 这类三值裁决
+    /// （ACCEPT 继续 / REVISE 返工 / REJECT 终止）表达「输入缺失、事实
+    /// 无法核验、流程不可继续」的终局。
+    ///
+    /// **缺省 = 不熔断**：`loop_until` 未满足就一律返工。此前引擎把
+    /// `"VERDICT: REJECT"` 硬编码成无条件终局，导致 PASS/REJECT 两值
+    /// 词表的 gate（implementation_plan、design_and_plan）配了
+    /// `loop_until`/`loop_back_to` 也永远走不到返工分支——注释与配置
+    /// 写着「REJECT → 跳回重做」，实际是评审如实 REJECT 就判死整条
+    /// 流水线（jemalloc 实锤：唯一跑到 gate 的那次运行，44 分钟零产出）。
+    /// 熔断词表改为按 step 显式声明，引擎不再私藏 magic string。
+    #[serde(default)]
+    pub loop_abort_on: Option<String>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
     /// Nest another workflow as this step: the named workflow runs with
@@ -342,6 +356,33 @@ impl WorkflowDef {
                         "step '{}': loop_back_to 指向不存在的 step '{target}'",
                         step.id
                     ));
+                }
+            }
+            // loop_abort_on 只在返工判定里生效；没有 loop_until 的 step
+            // 写了它必然是笔误（会被静默忽略），直接拒。
+            if let Some(marker) = &step.loop_abort_on {
+                if step.loop_until.is_none() {
+                    return Err(format!(
+                        "step '{}': `loop_abort_on` 需要配合 `loop_until`（没有返工环时熔断标记无意义）",
+                        step.id
+                    ));
+                }
+                if marker.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': loop_abort_on must not be empty",
+                        step.id
+                    ));
+                }
+                // 熔断标记若同时满足 loop_until，条件永远先命中放行，
+                // 熔断成死代码——配置一定写错了。
+                if let Some(cond) = &step.loop_until {
+                    if marker.contains(cond.as_str()) {
+                        return Err(format!(
+                            "step '{}': loop_abort_on '{marker}' 包含 loop_until '{cond}'，\
+                             熔断永远不会触发（放行条件先命中）",
+                            step.id
+                        ));
+                    }
                 }
             }
             if step.loop_until.is_some() && uses_dag {
@@ -1996,6 +2037,14 @@ async fn run_workflow_serial(
                 } else {
                     wf.render_task(step, &step_vars)
                 };
+                // 返工反馈同样要喂进子流程的 topic（对齐 DAG 引擎）：
+                // 跳回目标是嵌套 step 时，不带反馈的重跑就是逐字重放，
+                // 评审证据全丢。take() 同时清掉批注，避免残留反馈错串
+                // 到后面某个角色 step 上。
+                let nested_topic = match pending_feedback.take() {
+                    Some(fb) => format!("{nested_topic}\n\n【上轮审查反馈】\n{fb}"),
+                    None => nested_topic,
+                };
                 match run_nested_workflow(
                     nested_name.clone(),
                     nested_topic,
@@ -2147,12 +2196,16 @@ async fn run_workflow_serial(
             // （缺省 = 自己）重做，本 step 产出作为批注预置进目标 prompt；
             // 迭代上限 max_iterations（缺省 3，硬上限 10），耗尽即失败。
             if let Some(cond) = &step.loop_until {
-                if last_output.contains("VERDICT: REJECT") {
-                    return WfOutcome::Failed(format!(
-                        "step '{}' 终止 workflow：{}",
-                        step.id,
-                        last_output.chars().take(500).collect::<String>()
-                    ));
+                // 显式声明了熔断标记的 step 才有「不可返工」终局；
+                // 缺省一律返工（见 `loop_abort_on` 文档）。
+                if let Some(marker) = &step.loop_abort_on {
+                    if last_output.contains(marker.as_str()) {
+                        return WfOutcome::Failed(format!(
+                            "step '{}' 终止 workflow：{}",
+                            step.id,
+                            last_output.chars().take(500).collect::<String>()
+                        ));
+                    }
                 }
                 if !last_output.contains(cond.as_str()) {
                     let count = {
@@ -2263,6 +2316,14 @@ async fn run_dag_step(
             inp.vars.get("topic").cloned().unwrap_or_default()
         } else {
             inp.wf.render_task(step, &step_vars)
+        };
+        // loop_until 返工反馈也要喂给嵌套 workflow —— 否则跳回一个嵌套
+        // step（design_and_plan 的 loop_back_to = "brainstorm" 就是）时
+        // 子流程拿到的 topic 与上一轮**逐字相同**，评审的 file:line 证据
+        // 被丢掉，返工退化成原地重摇骰子，白烧 max_iterations 轮。
+        let nested_topic = match &inp.feedback {
+            Some(fb) => format!("{nested_topic}\n\n【上轮审查反馈】\n{fb}"),
+            None => nested_topic,
         };
         let ctx = WorkflowRunContext {
             merged: inp.merged.clone(),
@@ -2595,14 +2656,20 @@ async fn run_workflow_dag(
             let mut rework_notes: Vec<String> = Vec::new();
             for (sidx, _key, out) in &wave_results {
                 let step = &wf.steps[*sidx];
-                if out.contains("VERDICT: REJECT") {
-                    return WfOutcome::Failed(format!(
-                        "step '{}' 终止 workflow：{}",
-                        step.id,
-                        out.chars().take(500).collect::<String>()
-                    ));
-                }
                 let Some(cond) = &step.loop_until else { continue };
+                // 熔断判定必须在 loop_until 保护内：此前它套在循环外、
+                // 对 wave 里**每个** step 生效，任何产出里出现该字符串
+                // 的无关 step（评审引用裁决原文就够）都能判死整条
+                // workflow。且缺省不再熔断（见 `loop_abort_on`）。
+                if let Some(marker) = &step.loop_abort_on {
+                    if out.contains(marker.as_str()) {
+                        return WfOutcome::Failed(format!(
+                            "step '{}' 终止 workflow：{}",
+                            step.id,
+                            out.chars().take(500).collect::<String>()
+                        ));
+                    }
+                }
                 if out.contains(cond.as_str()) {
                     continue;
                 }
@@ -3134,6 +3201,49 @@ loop_back_to = "a"
         wf.validate().expect("串行 loop_until 应保持合法");
     }
 
+    /// `loop_abort_on` 没有 `loop_until` 就毫无作用（会被静默忽略），
+    /// validate 必须拒绝而不是让它变成看不见的死配置。
+    #[test]
+    fn loop_abort_on_without_loop_until_rejected() {
+        let wf = wf_from(
+            r#"
+name = "abort_orphan"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+loop_abort_on = "VERDICT: REJECT"
+"#,
+        );
+        let err = wf.validate().expect_err("孤立的 loop_abort_on 必须报错");
+        assert!(err.contains("loop_abort_on"), "错误应点名字段: {err}");
+        assert!(err.contains("loop_until"), "错误应说明依赖: {err}");
+    }
+
+    /// 熔断标记若把放行条件当子串包含，放行判定永远先命中，熔断成
+    /// 死代码 —— 拒绝这种自相矛盾的配置。
+    #[test]
+    fn loop_abort_on_containing_loop_until_rejected() {
+        let wf = wf_from(
+            r#"
+name = "abort_shadowed"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+loop_until = "VERDICT:"
+loop_back_to = "a"
+loop_abort_on = "VERDICT: REJECT"
+"#,
+        );
+        let err = wf.validate().expect_err("被放行条件遮蔽的熔断标记必须报错");
+        assert!(err.contains("熔断永远不会触发"), "错误应解释原因: {err}");
+    }
+
     /// Linear chain a→b→c produces one step per wave (fully serial).
     #[test]
     fn linear_chain_is_serial_waves() {
@@ -3539,8 +3649,12 @@ task = "t"
         assert!(eff.is_empty());
     }
 
-    /// implementation_plan 与 design_and_plan 仍使用旧 PASS 兼容契约；
-    /// task_refine 的 ACCEPT/REVISE/REJECT 契约由专门测试覆盖。
+    /// implementation_plan 与 design_and_plan 用 PASS/REJECT 两值词表，
+    /// 其中 REJECT = 「返工」而非终局，所以这两个 gate **不得**声明
+    /// `loop_abort_on`——一旦声明，REJECT 又会像此前硬编码那样判死整条
+    /// 流水线，`loop_until`/`loop_back_to` 变回死配置（jemalloc 实锤：
+    /// 唯一跑到 gate 的运行 44 分钟零产出）。task_refine 的
+    /// ACCEPT/REVISE/REJECT 三值契约由专门测试覆盖。
     #[test]
     fn gate_prompts_keep_conditions_and_reject_unabsorbed_errors() {
         let cases: [(&str, &str); 2] = [
@@ -3565,6 +3679,13 @@ task = "t"
             assert!(prompt.contains("【通过条件/修正项】"));
             assert!(prompt.contains("实测错误"));
             assert!(prompt.contains("VERDICT: PASS") && prompt.contains("VERDICT: REJECT"));
+            // 返工环必须真的通电：REJECT 是返工信号，不能被熔断标记
+            // 提前判死。
+            assert_eq!(gate.loop_until.as_deref(), Some("VERDICT: PASS"), "{wf_name}");
+            assert!(
+                gate.loop_abort_on.is_none(),
+                "{wf_name} 的 gate 用 REJECT 表示返工，声明 loop_abort_on 会让返工环失效"
+            );
         }
     }
 
@@ -4740,11 +4861,16 @@ depends_on = ["b"]
         );
     }
 
-    /// DAG loop_until 端到端（jemalloc 事故回放）：gate 第一轮输出
-    /// REJECT → 跳回 design 重跑、下游 impl 一并作废重跑、design 的
-    /// prompt 带【上轮审查反馈】；第二轮 gate PASS → 放行。
+    /// DAG loop_until 端到端：gate 第一轮输出 REVISE → 跳回 design
+    /// 重跑、下游 impl 一并作废重跑、design 的 prompt 带【上轮审查
+    /// 反馈】；第二轮 gate PASS → 放行。
+    ///
+    /// 注意本例用的是 REVISE。真正的 jemalloc 事故词表是 REJECT，
+    /// 由 [`dag_gate_verdict_reject_loops_back_and_delivers`] 覆盖——
+    /// 那条路径此前被引擎硬编码的 `VERDICT: REJECT` 熔断判死，本测试
+    /// 换用 REVISE 恰好绕开了缺陷，所以一直是绿的。
     #[tokio::test]
-    async fn dag_gate_reject_loops_back_and_passes() {
+    async fn dag_gate_revise_loops_back_and_passes() {
         // 注意：本仓库 wiremock 0.6 实测为先挂载优先（FIFO），且各
         // step 的判别子串必须互不重叠——gate 的 prompt 会内嵌上游
         // 产出文本，用"实现"这类子串会误吸 gate 请求。
@@ -4889,6 +5015,307 @@ max_iterations = 2
             .filter(|r| String::from_utf8_lossy(&r.body).contains("放行判定"))
             .count();
         assert_eq!(gate_reqs, 2, "gate 跑满 2 轮才判死: {gate_reqs}");
+    }
+
+    /// jemalloc 事故回放（真实词表）：design_and_plan / implementation_plan
+    /// 的 gate 用 PASS/REJECT 两值，REJECT = 「打回重做」。引擎此前把
+    /// `VERDICT: REJECT` 硬编码成无条件终局，`loop_until`/`loop_back_to`
+    /// 形同虚设——评审如实 REJECT 就判死整条流水线（唯一跑到 gate 的
+    /// 那次运行 44 分钟零产出）。现在熔断改由 `loop_abort_on` 显式声明，
+    /// 没声明 = REJECT 走返工，第二轮 PASS 必须真的交付出计划正文。
+    #[tokio::test]
+    async fn dag_gate_verdict_reject_loops_back_and_delivers() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_reject_rework"
+[[steps]]
+id = "brainstorm"
+role = "worker"
+task = "产出设计稿 {{topic}}"
+output_key = "design"
+[[steps]]
+id = "plan"
+role = "worker"
+task = "拆解清单 {{design}}"
+output_key = "plan"
+depends_on = ["brainstorm"]
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{plan}}"
+output_key = "verdict"
+depends_on = ["plan"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "brainstorm"
+max_iterations = 3
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("DAG loop_until 应通过校验");
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出设计稿"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("设计产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("拆解清单"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("清单产出")))
+            .mount(&server)
+            .await;
+        // FIFO：第一轮 gate 命中 REJECT（仅 1 次），第二轮落到 PASS。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT\n阻断原因：stats.c:1234 行号与实测不符",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: PASS\n【实现计划】1. 改 stats.c",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let out = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect("REJECT 必须返工而不是判死整条 workflow");
+        assert!(
+            out.contains("VERDICT: PASS") && out.contains("【实现计划】"),
+            "第二轮必须真的交付计划正文: {out}"
+        );
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let design_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("产出设计稿")).collect();
+        assert_eq!(design_reqs.len(), 2, "REJECT 必须触发 brainstorm 重跑");
+        assert!(
+            design_reqs[1].contains("【上轮审查反馈】") && design_reqs[1].contains("stats.c:1234"),
+            "返工的 prompt 必须带 REJECT 的证据: {}",
+            design_reqs[1]
+        );
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("拆解清单")).count(),
+            2,
+            "下游 plan 随返工作废重跑"
+        );
+    }
+
+    /// 返工目标是**嵌套 workflow step** 时反馈必须喂进子流程 topic。
+    /// design_and_plan 的 `loop_back_to = "brainstorm"` 正是这个形状：
+    /// 嵌套分支此前在注入反馈前就 return 了，重跑拿到的 topic 与上一轮
+    /// 逐字相同，评审的 file:line 证据被丢掉，返工退化成原地重摇骰子。
+    #[tokio::test]
+    async fn dag_rework_feedback_reaches_nested_workflow_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner_design.toml"),
+            r#"
+name = "inner_design"
+[[steps]]
+id = "draft"
+role = "worker"
+task = "子流程出稿 {{topic}}"
+output_key = "draft"
+"#,
+        )
+        .unwrap();
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_nested_rework"
+[[steps]]
+id = "brainstorm"
+workflow = "inner_design"
+task = "设计主题 {{topic}}"
+output_key = "design"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{design}}"
+output_key = "verdict"
+depends_on = ["brainstorm"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "brainstorm"
+max_iterations = 3
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("嵌套 step 作为返工目标应合法");
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("子流程出稿"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("子流程产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT\n阻断原因：extent.c:88 与实测不符",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("VERDICT: PASS 放行")),
+            )
+            .mount(&server)
+            .await;
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let out = run_workflow(&wf, "主题", &ctx).await.expect("第二轮应放行");
+        assert!(out.contains("VERDICT: PASS"), "got: {out}");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let inner: Vec<&String> = bodies.iter().filter(|b| b.contains("子流程出稿")).collect();
+        assert_eq!(inner.len(), 2, "嵌套子流程应重跑一次: {}", inner.len());
+        assert!(
+            inner[1].contains("【上轮审查反馈】") && inner[1].contains("extent.c:88"),
+            "重跑的子流程 topic 必须带 REJECT 证据: {}",
+            inner[1]
+        );
+    }
+
+    /// DAG 下 `loop_abort_on` 仍然是硬终局：声明了熔断标记的 gate 命中
+    /// 它就立刻失败，不返工（task_refine 的 REJECT 语义）。
+    #[tokio::test]
+    async fn dag_loop_abort_on_is_terminal() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_abort"
+[[steps]]
+id = "refine"
+role = "worker"
+task = "产出草案 {{topic}}"
+output_key = "draft"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{draft}}"
+output_key = "verdict"
+depends_on = ["refine"]
+loop_until = "VERDICT: ACCEPT"
+loop_back_to = "refine"
+loop_abort_on = "VERDICT: REJECT"
+max_iterations = 3
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("loop_abort_on 应通过校验");
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出草案"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("草案产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT\n阻断原因：输入缺失无法核验",
+            )))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("命中 loop_abort_on 必须终止");
+        assert!(err.contains("终止 workflow"), "应报终止: {err}");
+        assert!(err.contains("输入缺失无法核验"), "应保留阻断原因: {err}");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("产出草案")).count(),
+            1,
+            "熔断不返工，refine 只跑一次"
+        );
+    }
+
+    /// 熔断判定必须锁在 loop_until 保护内：没有返工环的 step 产出里
+    /// 出现别的 step 的裁决原文（评审引用 gate 结论是常态）不该判死
+    /// workflow。此前 DAG 引擎把检查套在循环外，对 wave 里每个 step
+    /// 生效，任意 step 复述 `VERDICT: REJECT` 就能连坐。
+    #[tokio::test]
+    async fn dag_non_loop_step_quoting_reject_does_not_kill_run() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_quote"
+[[steps]]
+id = "review"
+role = "worker"
+task = "复述历史裁决 {{topic}}"
+output_key = "quoted"
+[[steps]]
+id = "summarize"
+role = "worker"
+task = "汇总结论 {{quoted}}"
+output_key = "summary"
+depends_on = ["review"]
+"#,
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("复述历史裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "上一轮评审写的是 VERDICT: REJECT，本轮已修复",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("汇总结论"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("汇总完成")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let out = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect("无返工环的 step 引用 REJECT 原文不该判死 workflow");
+        assert_eq!(out, "汇总完成");
     }
 
     /// output_from 端到端：子 workflow 末步是评审 verdict，父级用
@@ -5163,8 +5590,9 @@ output_key = "quality"
             .collect()
     }
 
-    /// gate 明确返回 REJECT 时必须立即终止；只有 REVISE 才允许
-    /// 通过 loop_until 回到上游返工。
+    /// 声明了 `loop_abort_on` 的 gate 命中熔断标记时必须立即终止；
+    /// 只有 REVISE 才允许通过 loop_until 回到上游返工。熔断词表由
+    /// step 显式声明——引擎不再硬编码 `VERDICT: REJECT`。
     #[tokio::test]
     async fn serial_loop_reject_is_terminal() {
         let server = wiremock::MockServer::start().await;
@@ -5198,6 +5626,7 @@ task = "终审判定：{{impl}}"
 output_key = "verdict"
 loop_until = "VERDICT: ACCEPT"
 loop_back_to = "implement"
+loop_abort_on = "VERDICT: REJECT"
 max_iterations = 2
 "#,
         )

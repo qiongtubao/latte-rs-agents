@@ -65,8 +65,12 @@ speakers = ["reviewer"]
 output_key = "approved"
 # gate：只输出裁决与问题清单，不重写或复述完整草案。
 # ACCEPT 才进入 submit；REVISE 回到 refine；REJECT 终止 workflow。
+# 「REJECT 终止」必须由 loop_abort_on 显式声明——引擎不再硬编码
+# VERDICT: REJECT 为终局（那个 magic string 让 PASS/REJECT 两值词表的
+# gate 永远走不到返工分支）。
 loop_until = "VERDICT: ACCEPT"
 loop_back_to = "refine"
+loop_abort_on = "VERDICT: REJECT"
 max_iterations = 2
 prompt = """根据以下评审结论判定下一步：
 

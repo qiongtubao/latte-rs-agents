@@ -1871,6 +1871,33 @@ select {
 }
 
 /* ─── timeout-prompt (TimeoutWarning banner) ────────────────── */
+/* 询问条容器：DAG 并行波会同时超时多条分派（req_review ‖ code_review），
+   每条各挂一张卡叠在这里。单条时视觉上与旧版无差别。 */
+.timeout-prompt-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* 多条并存时收紧上下外边距，避免叠出一屏 */
+.timeout-prompt-stack .timeout-prompt {
+  margin-top: 6px;
+  margin-bottom: 6px;
+}
+/* 分派来源徽章（🔀 workflow 名）——并行波里用来区分是哪一条 */
+.timeout-prompt__tag {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(180, 83, 9, 0.14);
+  border: 1px solid rgba(180, 83, 9, 0.3);
+  font-size: 0.82em;
+  font-weight: 500;
+  white-space: nowrap;
+}
+/* 已跑秒数：复发时原地更新这个 span */
+.timeout-prompt__elapsed {
+  font-variant-numeric: tabular-nums;
+}
 .timeout-prompt {
   position: relative;
   background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);

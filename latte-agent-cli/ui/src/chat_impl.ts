@@ -189,8 +189,19 @@ export function mountChat(opts: {
   let currentEventIdx = -1;
   /** 当前显示的「超时询问」条；同一 role 重复触发替换之，
    *  跨 role 的并行执行按 role 维度分别保留。 */
-  let timeoutPromptEl: HTMLElement | null = null;
-  let timeoutPromptRole: string | null = null;
+  /** 超时询问条：key → 该条 DOM。
+   *
+   *  key 是 `sub_id ?? role_id`：DAG 并行波会同时跑多条分派
+   *  （design_and_plan 的 req_review ‖ code_review），而同一 role 也
+   *  可能在一个 wave 里出现两次，所以只有 sub_id 才唯一。主 turn 的
+   *  超时不带 sub_id，退化用 role_id 作 key。
+   *
+   *  此前是单槽（timeoutPromptEl + timeoutPromptRole），后到的 warning
+   *  会把前一条**静默顶掉**，且按钮打的是全局 cancelTurn —— 用户看到
+   *  的是 B 的提示，按下去杀的是整轮。 */
+  const timeoutPrompts = new Map<string, HTMLElement>();
+  /** 承载所有询问条的容器，置顶。按需创建、空了就移除。 */
+  let timeoutStackEl: HTMLElement | null = null;
   /** advisor 暂停期间的「等待拍板」横幅；拍板或 Resumed 事件后清除。 */
   let advisorPauseBannerEl: HTMLElement | null = null;
 
@@ -1630,17 +1641,67 @@ export function mountChat(opts: {
   });
   // ── Timeout prompt ──────────────────────────────────────────────
   //
-  // 后端在 turn 跑过 soft_timeout_secs 时推 `TimeoutWarning` 上来，
-  // 我们渲染一条「继续等待 / 终止当前任务」询问条挂在消息流最
-  // 顶端。同 role 再次触发替换；turn 自然结束（RoleTurn / RoleFinished
-  // / Error 之一到达）时移除。硬超时兜底由后端 hard_timeout_secs
-  // 触发，到时 Error 事件把执行状态行切到 .error。
-  function hideTimeoutPrompt(roleId: string): void {
-    if (timeoutPromptRole === roleId && timeoutPromptEl) {
-      timeoutPromptEl.remove();
-      timeoutPromptEl = null;
-      timeoutPromptRole = null;
+  // 后端每跑过 soft_timeout_secs 就推一次 `TimeoutWarning`（周期复发，
+  // 不再是只发一次后静默），我们按 sub_id 维度各挂一条「继续等待 /
+  // 终止」询问条到置顶容器里。分派自然结束（RoleFinished / Error /
+  // DelegateFinished）时移除对应那条。
+  //
+  // 后端已无硬超时（hard_timeout_secs=0）：不会强杀，全靠用户拍板或
+  // run_turn 内部的工具轮次上限兜底。
+
+  /** 询问条容器：按需创建并置顶插入。 */
+  function ensureTimeoutStack(): HTMLElement {
+    if (timeoutStackEl && timeoutStackEl.isConnected) return timeoutStackEl;
+    const el = document.createElement("div");
+    el.className = "timeout-prompt-stack";
+    container.messagesEl.insertBefore(el, container.messagesEl.firstChild);
+    timeoutStackEl = el;
+    return el;
+  }
+
+  /** 容器空了就撤掉，避免留一个空 div 占位。 */
+  function pruneTimeoutStack(): void {
+    if (timeoutStackEl && timeoutStackEl.childElementCount === 0) {
+      timeoutStackEl.remove();
+      timeoutStackEl = null;
     }
+  }
+
+  /** 移除某条询问条。`key` 是 `sub_id ?? role_id`。 */
+  function hideTimeoutPromptByKey(key: string): void {
+    const el = timeoutPrompts.get(key);
+    if (el) {
+      el.remove();
+      timeoutPrompts.delete(key);
+      pruneTimeoutStack();
+    }
+  }
+
+  /** 分派结束时的清理入口。
+   *
+   *  带 sub_id 就精确移除那一条；不带（主 turn 事件、旧归档回放）则
+   *  清掉该 role 名下的全部询问条 —— 否则并行波里某条没有 sub_id 的
+   *  事件会漏清，留下永远不消失的僵尸提示。 */
+  function hideTimeoutPrompt(roleId: string, subId?: string | null): void {
+    if (subId) {
+      hideTimeoutPromptByKey(subId);
+      return;
+    }
+    hideTimeoutPromptByKey(roleId);
+    for (const [key, el] of [...timeoutPrompts]) {
+      if (el.dataset.roleId === roleId) {
+        el.remove();
+        timeoutPrompts.delete(key);
+      }
+    }
+    pruneTimeoutStack();
+  }
+
+  /** 清掉全部询问条（切 session / clear / replay 收尾）。 */
+  function hideAllTimeoutPrompts(): void {
+    for (const el of timeoutPrompts.values()) el.remove();
+    timeoutPrompts.clear();
+    pruneTimeoutStack();
   }
 
   // ── advisor 暂停横幅 ──────────────────────────────────────────
@@ -1671,50 +1732,74 @@ export function mountChat(opts: {
     advisorPauseBannerEl = node;
   }
   function showTimeoutPrompt(ev: Extract<ChatEvent, { type: "TimeoutWarning" }>): void {
-    // 同一 role 已经在显示 prompt → 替换；不同 role 串行覆盖（不
-    // 维护 per-role map —— 现阶段单 turn 一次只跑一个 role，
-    // 真正的并行来自 delegate（不带 TimeoutWarning，交给 delegate
-    // 的 cancel_flag 路径），所以覆盖式就够）。
-    if (timeoutPromptEl && timeoutPromptRole !== ev.role_id) {
-      // 另一条 prompt 还在：旧的关掉，新的替上来。
-      timeoutPromptEl.remove();
-      timeoutPromptEl = null;
+    // key 用 sub_id（唯一）优先，主 turn 无 sub_id 时退回 role_id。
+    // 同 key 复发 → 原地更新已跑秒数，不新增一条（后端按 soft 周期
+    // 重发，否则同一分派会堆出一叠提示）。
+    const key = ev.sub_id ?? ev.role_id;
+    const isDispatch = !!ev.sub_id;
+    const existing = timeoutPrompts.get(key);
+    if (existing) {
+      const head = existing.querySelector(".timeout-prompt__elapsed");
+      if (head) head.textContent = `${ev.elapsed_secs}s`;
+      return;
     }
-    if (timeoutPromptEl) timeoutPromptEl.remove();
 
     const node = document.createElement("div");
     node.className = "timeout-prompt";
     node.dataset.roleId = ev.role_id;
+    if (ev.sub_id) node.dataset.subId = ev.sub_id;
+    // 并行波里同时挂多条，标题必须能区分是哪一条分派 —— 带上
+    // workflow 名（有则显示），否则用户看不出该终止哪个。
+    const wfName = isDispatch
+      ? (activeDelegates.get(ev.sub_id!)?.wfId
+          ? wfNames.get(activeDelegates.get(ev.sub_id!)!.wfId!) ?? "workflow"
+          : "")
+      : "";
+    const scopeTag = wfName ? `<span class="timeout-prompt__tag">🔀 ${wfName}</span>` : "";
+    // 终止按钮的语义随粒度变：分派级只掐这一条（复用右键终止的
+    // per-subsession 通道），主 turn 级才是整轮取消。
+    const cancelLabel = isDispatch ? "终止此分派" : "终止当前任务";
     node.innerHTML = `
       <div class="timeout-prompt__head">
         <span class="timeout-prompt__icon">⏳</span>
-        <strong>${roleIcon(ev.role_id)} ${ev.role_id} 已运行 ${ev.elapsed_secs}s</strong>
+        <strong>${roleIcon(ev.role_id)} ${ev.role_id} 已运行 <span class="timeout-prompt__elapsed">${ev.elapsed_secs}s</span></strong>
+        ${scopeTag}
       </div>
       <div class="timeout-prompt__body">
-        超过设定的 ${ev.soft_timeout_secs}s 软超时${ev.hard_timeout_secs > 0 ? `（硬超时将在 ${ev.hard_timeout_secs}s 强制终止）` : "（无硬超时，可耐心等待，或手动终止）"}。
+        超过设定的 ${ev.soft_timeout_secs}s 软超时${ev.hard_timeout_secs > 0 ? `（硬超时将在 ${ev.hard_timeout_secs}s 强制终止）` : "（无硬超时，不会被强杀；可继续等待或手动终止）"}。
         是否继续等待？
       </div>
       <div class="timeout-prompt__actions">
         <button class="timeout-prompt__btn timeout-prompt__btn--continue" data-act="continue">继续等待</button>
-        <button class="timeout-prompt__btn timeout-prompt__btn--cancel" data-act="cancel">终止当前任务</button>
+        <button class="timeout-prompt__btn timeout-prompt__btn--cancel" data-act="cancel">${cancelLabel}</button>
       </div>
     `;
-    // 「继续等待」只关掉 banner，不动后端（turn 继续跑）。
+    // 「继续等待」只收掉这一条，不动后端（分派继续跑）。后端会在下
+    // 一个 soft 周期再提醒一次。
     node.querySelector('[data-act="continue"]')!.addEventListener("click", () => {
-      hideTimeoutPrompt(ev.role_id);
+      hideTimeoutPromptByKey(key);
     });
-    // 「终止当前任务」发 cancel-turn + 关 banner。后端会立刻丢掉
-    // run_turn future，session 继续接收新输入。
     node.querySelector('[data-act="cancel"]')!.addEventListener("click", () => {
-      hideTimeoutPrompt(ev.role_id);
-      void cancelTurn().catch((e) => {
-        console.error("[chat] cancelTurn failed", e);
-      });
+      hideTimeoutPromptByKey(key);
+      if (isDispatch) {
+        // per-subsession：只掐这一条，不牵连同波兄弟，也不会被
+        // manager 自动 resume（后端带 CANCELLED_BY_USER 标记）。
+        void cancelSubagent(ev.sub_id!).then((ok) => {
+          if (!ok) {
+            addMessage({
+              kind: "system",
+              content: `⏹ 分派「${ev.role_id}」已经结束了，无需终止。`,
+            });
+          }
+        });
+      } else {
+        void cancelTurn().catch((err) => {
+          console.error("[chat] cancelTurn failed", err);
+        });
+      }
     });
-    // 插到 messages 流的最顶端，让用户一眼看到。
-    container.messagesEl.insertBefore(node, container.messagesEl.firstChild);
-    timeoutPromptEl = node;
-    timeoutPromptRole = ev.role_id;
+    ensureTimeoutStack().appendChild(node);
+    timeoutPrompts.set(key, node);
   }
   function handleEvent(e: ChatEvent): void {
     const identity = eventIdentity(e);
@@ -1772,7 +1857,7 @@ export function mountChat(opts: {
         } else {
           addMessage({ kind: "status", content: `✅ ${e.role_id} 完成`, meta: e.role_id, state: "done" });
         }
-        hideTimeoutPrompt(e.role_id);
+        hideTimeoutPrompt(e.role_id, e.sub_id);
         break;
       }
       case "RolePaused": {
@@ -2016,6 +2101,10 @@ export function mountChat(opts: {
           finishedDi.stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
           finishedDi.stateEl.className = `delegate-state ${isFail ? "failed" : "done"}`;
         }
+        // 这条分派结束 → 收掉它的超时询问条。DelegateFinished 是分派
+        // 结束最可靠的信号（RoleFinished 在某些路径上不带 sub_id），
+        // 并行波里必须按 sub_id 精确移除，不能误清兄弟那条。
+        hideTimeoutPromptByKey(e.sub_id);
         msg.addEventListener("contextmenu", (ev) => { ev.preventDefault(); onShowSubsession?.(e.sub_id, label, msg); });
         currentDelegate = ""; currentActivity = "";
         const icon = currentRoleIcon || resolveIcon(e.from_role);
@@ -2237,11 +2326,12 @@ export function mountChat(opts: {
       }
       case "TimeoutWarning": {
         // 后端报告：当前 turn 跑过 soft timeout 但仍在跑。后端
-        // 不会自动终止 —— 弹出「继续等待 / 终止当前任务」让用户
-        // 决定，硬超时（hard_timeout_secs）才会兜底强杀。
+        // 不会自动终止 —— 弹出「继续等待 / 终止…」让用户决定。
+        // 后端 hard_timeout_secs 现在是 0（无硬超时，不强杀），改由
+        // 每个 soft 周期复发提醒。
         //
-        // 多次 TimeoutWarning 进来时替换之前那条（同一 role 继续
-        // 跑就会有）；不同 role 的同时执行则按 role 维度跟踪。
+        // 按 sub_id 维度各挂一条：DAG 并行波（req_review ‖ code_review）
+        // 会同时超时，同一条复发则原地更新秒数而不堆叠。
         showTimeoutPrompt(e);
         break;
       }
@@ -2273,9 +2363,13 @@ export function mountChat(opts: {
          } else {
         }
         setFooter(`错误: ${truncate(e.message, 80)}`);
-        // turn 失败 —— TimeoutWarning 失去意义（后端不会再有新
-        // warning），把 banner 收掉。
-        if (targetRole) hideTimeoutPrompt(targetRole);
+        // 该分派失败 —— 它的 TimeoutWarning 失去意义，收掉对应那条。
+        // 带 sub_id 时精确移除（并行波里不误伤兄弟的提示条）。
+        if (errSubId) {
+          hideTimeoutPrompt(targetRole ?? "", errSubId);
+        } else if (targetRole) {
+          hideTimeoutPrompt(targetRole);
+        }
         break;
       }
       default: console.warn("[chat] unknown event", e);
@@ -2333,11 +2427,7 @@ export function mountChat(opts: {
     currentDelegate="";
     delegateRunning=false;
     // 清掉残留的 timeout 询问条（切 session / 强制 clear 都用）。
-    if (timeoutPromptEl) {
-      timeoutPromptEl.remove();
-      timeoutPromptEl = null;
-      timeoutPromptRole = null;
-    }
+    hideAllTimeoutPrompts();
     hideAdvisorPauseBanner();
     updateFooter();
   }
@@ -2353,11 +2443,7 @@ export function mountChat(opts: {
       // Replay 完发现 banner 还在（说明后端当时正在跑 turn）→
       // 关掉 —— replay 表达的是"已经发生过的历史"，不应该有
       // 正在等的 prompt。
-      if (timeoutPromptEl) {
-        timeoutPromptEl.remove();
-        timeoutPromptEl = null;
-        timeoutPromptRole = null;
-      }
+      hideAllTimeoutPrompts();
       hideAdvisorPauseBanner();
       clearWaitTimer();
       // 冷启动重播：若历史停在 Paused（server 重启前 workflow 被暂停/
