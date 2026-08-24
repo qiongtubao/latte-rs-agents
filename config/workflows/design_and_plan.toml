@@ -84,21 +84,29 @@ task = "评审以下设计方案涉及代码区域的质量风险：\n{{design}}
 output_key = "code_verdict"
 
 # ── gate：总终审门 ────────────────────────────────────────────────
-# 任一评审 ❌/有阻断问题 → 产出契约失败 → 整个 workflow 以 failed
-# 收场（manager 拿到错误与 wf_id，不会把未过审的计划提交看板）。
-# 注意：本 workflow 是 DAG（有 depends_on），引擎不支持 loop_until
-# 返工环——嵌套的 implementation_plan 已在内部自带 REJECT→返工
-# 循环，多数问题在子层吸收；走到这里仍 REJECT 属于跨评审的结构
-# 性问题，硬失败是设计如此（DAG 循环支持是后续工作）。
+# REJECT → loop_until 不满足 → 自动跳回 brainstorm 重做设计（REJECT
+# 原因作为【上轮审查反馈】预置进 prompt），重新脑暴 → 重拆计划 →
+# 双评审 → 重判，最多 max_iterations 轮；耗尽仍 REJECT 才以 failed
+# 收场（带 wf_id 可 resume）。
+# 此前这里是 max_retries=0 + 契约 require PASS ——评审尽职尽责找到
+# 真问题反而把整条流水线判死（jemalloc 实锤：唯一跑到 gate 的那次
+# 运行，双评审共 6 条阻断 + 5 处实测行号错误，44 分钟流水线零产出）。
+# 子层 implementation_plan 早已自带 REJECT→返工环，顶层不该更脆。
 # ⚠️ 有条件通过 → PASS 但条件/修正项必须随计划一并带上（jemalloc
 # 实锤：实测行号错误随裸 PASS 被静默丢弃）；有实测错误未吸收进
 # 计划时必须 REJECT。
 [[steps]]
 id = "gate"
-description = "总终审门：任一评审不通过则 workflow 失败"
+description = "总终审门：REJECT 自动返工重做设计，耗尽迭代才失败"
 role = "reviewer"
 depends_on = ["plan", "req_review", "code_review"]
-max_retries = 0
+max_retries = 1
+# REJECT → 跳回 brainstorm 重新生成设计，直到 PASS 或迭代耗尽。
+# 契约只卡格式（必须有 VERDICT: 标记），放行与否交给 loop_until——
+# 不能 require PASS，否则 REJECT 变成契约失败直接判死。
+loop_until = "VERDICT: PASS"
+loop_back_to = "brainstorm"
+max_iterations = 3
 task = """根据以下两份评审结论判定放行与否：
 
 【需求评审】
@@ -115,7 +123,8 @@ task = """根据以下两份评审结论判定放行与否：
 
 - 任一份为 ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后以「【通过条件/修正项】」为标题**原样附上两份评审的全部条件与修正项**（一条都不许丢），再原样完整附上实现计划。修正项必须随计划一并交付，禁止静默丢弃。
 - 任一份（无论裁决为何）指出实测错误（行号/路径/事实核验不符）且这些修正未在实现计划中体现 → 必须输出 `VERDICT: REJECT`，理由列出未吸收的实测错误。
-- 任一份为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句），**不要**附实现计划。"""
+- 任一份为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句，写清每条阻断的 file:line 证据，返工要用），**不要**附实现计划。
+- 输出 REJECT 时，正文中不得再出现字符串「VERDICT: PASS」（会被循环条件误判为放行）。"""
 
 [steps.output_contract]
-require = ["VERDICT: PASS"]
+require = ["VERDICT:"]

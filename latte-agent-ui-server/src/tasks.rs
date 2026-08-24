@@ -1107,6 +1107,8 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
         let agent_pause_gate = api::session_pause_gate(&b, &session_id).await.ok();
         // advisor intervene 暂停门同理：判「等待用户拍板」时流水线 park。
         let advisor_pause = api::session_advisor_pause_gate(&b, &session_id).await.ok();
+        // per-turn 取消旗标：生命周期钩子的 workflow 也留终止逃生口。
+        let turn_cancel = api::session_turn_cancel_flag(&b, &session_id).await.ok();
         let ctx = WorkflowRunContext {
             merged: Arc::new(b.merged.read().clone()),
             resolver: b.resolver.clone(),
@@ -1114,6 +1116,7 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             cwd: b.cwd.clone(),
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            turn_cancel_flag: turn_cancel,
             depth: 0,
             agent_pause_gate,
             // 跑在真实 session 事件流上：分派建 subsession、过
@@ -1368,6 +1371,10 @@ pub async fn dispatch_task(
             // advisor intervene 暂停门：判「等待用户拍板」时流水线 park。
             let advisor_pause =
                 api::session_advisor_pause_gate(&b2, &session_id).await.ok();
+            // per-turn 取消旗标：step 无硬超时，用户点「终止当前任务」
+            // 靠它掐掉卡住的 step（否则只能 session 级全杀）。
+            let turn_cancel =
+                api::session_turn_cancel_flag(&b2, &session_id).await.ok();
             let ctx = WorkflowRunContext {
                 merged: Arc::new(b2.merged.read().clone()),
                 resolver: b2.resolver.clone(),
@@ -1375,6 +1382,7 @@ pub async fn dispatch_task(
                 cwd: b2.cwd.clone(),
                 event_tx: event_tx.clone(),
                 cancel_flag: cancel.clone(),
+                turn_cancel_flag: turn_cancel.clone(),
                 depth: 0,
                 agent_pause_gate: agent_pause_gate.clone(),
                 // 跑在真实 session 事件流上：分派建 subsession、过
@@ -1477,6 +1485,8 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
     tokio::spawn(async move {
         let agent_pause_gate = api::session_pause_gate(&b2, &session_id).await.ok();
         let advisor_pause = api::session_advisor_pause_gate(&b2, &session_id).await.ok();
+        // per-turn 取消旗标：任务细化也走多 step 流水线，留终止逃生口。
+        let turn_cancel = api::session_turn_cancel_flag(&b2, &session_id).await.ok();
         let ctx = WorkflowRunContext {
             merged: Arc::new(b2.merged.read().clone()),
             resolver: b2.resolver.clone(),
@@ -1484,6 +1494,7 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             cwd: b2.cwd.clone(),
             event_tx: event_tx.clone(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            turn_cancel_flag: turn_cancel,
             depth: 0,
             agent_pause_gate: agent_pause_gate.clone(),
             subsession_store: Some(b2.subsession_store.clone()),
@@ -1626,6 +1637,8 @@ async fn chain_code_review(
         tail_chars(&dev_summary, 1500)
     );
     let advisor_pause = api::session_advisor_pause_gate(b, &session_id).await.ok();
+    // per-turn 取消旗标：链式审查也可能卡在某个 step，给用户留逃生口。
+    let turn_cancel = api::session_turn_cancel_flag(b, &session_id).await.ok();
     let ctx = WorkflowRunContext {
         merged: Arc::new(b.merged.read().clone()),
         resolver: b.resolver.clone(),
@@ -1633,6 +1646,7 @@ async fn chain_code_review(
         cwd: b.cwd.clone(),
         event_tx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
+        turn_cancel_flag: turn_cancel,
         depth: 0,
         agent_pause_gate,
         // 与派发 run 同源：分派建 subsession、过 advisor gate。

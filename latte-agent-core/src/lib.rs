@@ -40,6 +40,7 @@ pub mod agent;
 pub mod advisor_monitor;
 pub mod pause_gate;
 pub mod choice;
+pub mod sub_cancel;
 pub mod controller;
 pub mod checkpoint;
 pub mod config;

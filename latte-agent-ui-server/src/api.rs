@@ -447,6 +447,23 @@ pub async fn session_pause_gate(
     Ok(controller.session_pause_gate())
 }
 
+/// 拿 session controller 的 per-turn 取消旗标（`Arc<AtomicBool>`）。
+/// 任务看板派发/续跑的 workflow run 挂上它，用户点「终止当前任务」
+/// （`POST /api/chat/cancel-turn`）就能掐掉卡住的 step 而不炸掉整个
+/// session。workflow step 已无 wall-clock 硬超时，这是唯一的
+/// per-turn 逃生口——传 `None` 的话只剩 session cancel_flag 全杀。
+pub async fn session_turn_cancel_flag(
+    b: &UiBackend,
+    id: &str,
+) -> Result<Arc<std::sync::atomic::AtomicBool>, ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    Ok(controller.session_turn_cancel_flag())
+}
+
 /// 拿 session controller 的 advisor intervene 暂停门
 /// （`AdvisorPauseGate`）。任务看板/续跑的 workflow 分派共用同一个
 /// gate——advisor 判 Intervene「等待用户拍板」时，workflow 流水线
@@ -1193,6 +1210,33 @@ pub async fn chat_cancel_turn(
     }
 }
 
+/// `POST /api/chat/cancel-turn` 带 `sub_id` 的变体：只终止**某一条**
+/// 分派（UI 右键 subsession 消息 →「终止此分派」），同一并行波里的
+/// 兄弟分派继续跑。
+///
+/// 与不带 sub_id 的 per-turn cancel 的区别见
+/// [`latte_agent_core::sub_cancel`] 的三层取消语义说明。DAG 并行波
+/// （如 design_and_plan 的 req_review ‖ code_review）下这个区别是实质
+/// 性的：per-turn 取消会连带干掉另一条已跑十几分钟的分派。
+///
+/// 返回 `Err(ApiError::not_found)` 表示该分派已经结束（或 sub_id 未知），
+/// 让前端提示「该分派已结束」而不是假装终止成功。
+pub async fn chat_cancel_subagent(
+    b: &UiBackend,
+    session_id: Option<&str>,
+    sub_id: &str,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    if latte_agent_core::sub_cancel::cancel(sub_id) {
+        Ok(())
+    } else {
+        Err(ApiError::not_found(format!(
+            "分派 {sub_id} 已结束或不存在，无需终止"
+        )))
+    }
+}
+
 /// `POST /api/chat/abort` — 终止整个 session（所有 in-flight
 /// subagent / workflow / multi-role 全部停止）。不删 session，
 /// 归档事件保留。
@@ -1727,6 +1771,7 @@ pub fn workflow_run_start(
             cwd,
             event_tx: tx_inner,
             cancel_flag: cancel,
+            turn_cancel_flag: None,
             agent_pause_gate: None, // 独立测试 run：无 session gate
             depth: 0,
             // 独立测试 run 无 session：不建 subsession、不走 advisor。
@@ -1860,6 +1905,11 @@ async fn spawn_workflow_resume(
         cwd: b.cwd.clone(),
         event_tx: controller.event_sender(),
         cancel_flag: cancel,
+        // step 已无硬超时，必须给用户留 per-turn 逃生口：点「终止当前
+        // 任务」→ cancel_turn 置位本旗标 → 卡住的 step 在下个 500ms
+        // tick 被中止，session 保留。传 None 会让续跑的 run 只能靠
+        // session cancel_flag 一按全杀。
+        turn_cancel_flag: Some(controller.session_turn_cancel_flag()),
         // 与任务看板派发的 run 同款：用户 ⏸ 时续跑也一起冻结。
         agent_pause_gate: Some(controller.session_pause_gate()),
         depth: 0,
@@ -3521,6 +3571,51 @@ mod workflow_resume_tests {
         chat_abort(&b, Some(&sid)).await.expect("abort");
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(b.session_workflows.read().is_empty());
+    }
+
+    /// 右键「终止此分派」只掐目标 subsession，兄弟分派的旗标不动 ——
+    /// 这正是它区别于 per-turn cancel 的意义（DAG 并行波里
+    /// req_review ‖ code_review，停一条不该连带另一条）。
+    #[tokio::test]
+    async fn chat_cancel_subagent_targets_only_that_dispatch() {
+        use latte_agent_core::sub_cancel;
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-sub-1").await;
+
+        let target = sub_cancel::register("sub-api-target");
+        let sibling = sub_cancel::register("sub-api-sibling");
+
+        chat_cancel_subagent(&b, Some(&sid), "sub-api-target")
+            .await
+            .expect("目标分派在跑，应能终止");
+
+        assert!(
+            target.load(std::sync::atomic::Ordering::SeqCst),
+            "目标分派旗标必须置位"
+        );
+        assert!(
+            !sibling.load(std::sync::atomic::Ordering::SeqCst),
+            "兄弟分派必须不受影响，否则退化成 per-turn 取消"
+        );
+
+        sub_cancel::unregister("sub-api-target");
+        sub_cancel::unregister("sub-api-sibling");
+    }
+
+    /// 分派已结束（登记已摘除）时必须回 404，让前端提示「该分派已
+    /// 结束」而不是假装终止成功。用户右键到点确认之间分派跑完是正常
+    /// 竞态，不该报错。
+    #[tokio::test]
+    async fn chat_cancel_subagent_404s_for_finished_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-sub-2").await;
+
+        let err = chat_cancel_subagent(&b, Some(&sid), "sub-api-already-done")
+            .await
+            .expect_err("已结束的分派应回错误");
+        assert_eq!(err.status, 404, "必须是 404，前端据此走「已结束」提示");
     }
 }
 

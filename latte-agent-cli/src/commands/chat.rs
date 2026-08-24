@@ -1123,6 +1123,7 @@ async fn register_workflow_tool(
                     cwd,
                     event_tx,
                     cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turn_cancel_flag: None,
                     agent_pause_gate: None, // CLI REPL workflow：无 session agent gate
                     depth: 0,
                     // CLI REPL 无 UI session：不建 subsession、不走 advisor。

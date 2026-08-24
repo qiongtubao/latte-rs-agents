@@ -945,6 +945,19 @@ impl ChatController {
         self.agent_pause_gate.clone()
     }
 
+    /// 返回 per-turn 取消旗标的共享句柄，供**脱离 turn 单独 spawn**
+    /// 的 workflow run（UI 续跑、任务看板派发）挂进
+    /// `WorkflowRunContext::turn_cancel_flag`。
+    ///
+    /// 为什么需要：workflow step 已无 wall-clock 硬超时（超时只发
+    /// `TimeoutWarning` 让用户拍板），若这些 run 传 `None`，卡住的
+    /// step 就只能靠 session 级 `cancel_flag`（一按全杀）收拾。挂上
+    /// 本旗标后，用户点「终止当前任务」（`cancel_turn`）能精确掐掉
+    /// 当前 step 而保留 session。
+    pub fn session_turn_cancel_flag(&self) -> Arc<AtomicBool> {
+        self.turn_cancel_flag.clone()
+    }
+
     /// 当前 session 是否处于用户手动暂停状态。
     pub fn is_session_paused(&self) -> bool {
         self.agent_pause_gate.is_paused()
@@ -1674,7 +1687,7 @@ async fn run_multi_role_loop(
                 cmd => {
                     let parts: Vec<&str> = line.splitn(2, ' ').collect();
                     let topic = parts.get(1).unwrap_or(&"").trim();
-                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), advisor_pause.clone()).await {
+                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), turn_cancel_flag.clone(), advisor_pause.clone()).await {
                         Ok(Some(summary)) => {
                             let _ = event_tx.send(ChatEvent::Status {
                                 message: format!("Workflow '{cmd}' 完成。结果已交给 manager 处理。"),
@@ -2236,7 +2249,7 @@ async fn run_single_role_loop(
                                     {
                                         *last_user_input.lock() = topic.to_string();
                                     }
-                                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), advisor_pause.clone()).await {
+                                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), turn_cancel_flag.clone(), advisor_pause.clone()).await {
                                         Ok(Some(summary)) => {
                                             let _ = event_tx.send(ChatEvent::Status {
                                                 message: format!("Workflow '{cmd}' 完成。\n{summary}"),
@@ -3373,26 +3386,28 @@ pub(crate) fn register_plan_tool(
 /// 挂起，等用户在弹框里回答，答案直接作为工具结果返回给提问的子
 /// 代理。顶层 turn 不要用——顶层没有"等待方"，靠下一条 user 消息
 /// 回喂（fire-and-forget）。
+/// 阻塞模式参数：工具挂起等用户，取消则报错退出，不再有超时路径。
 #[derive(Clone)]
 pub(crate) struct AskBlocking {
-    /// 等待上限：超时后工具返回"按默认继续"，避免 workflow 永远挂死。
-    pub timeout: std::time::Duration,
     /// turn 取消旗标：等待期间被取消则工具报错，让 runner 尽快退出。
-    pub cancel_flag: Option<Arc<AtomicBool>>,
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// session 级暂停门：等待期间用户按 ⏸ 则冻结等待，▶ 继续后恢复。
+    pub agent_pause_gate: Option<std::sync::Arc<crate::pause_gate::AgentPauseGate>>,
 }
 
-/// 阻塞 ask 的默认等待上限（30 分钟），env `LATTE_ASK_TIMEOUT_SECS`
-/// 覆盖；非法值回退默认。
+/// 默认问询超时不再使用 —— ask 阻塞模式无限等待用户。保留此函数
+/// 为兼容外部配置枚举（LATTE_ASK_TIMEOUT_SECS），但 `register_ask_tool`
+/// 不再消费其值。
 pub fn default_ask_timeout() -> std::time::Duration {
     let raw = std::env::var("LATTE_ASK_TIMEOUT_SECS").ok();
     match raw.and_then(|s| s.parse::<u64>().ok()) {
         Some(n) if n > 0 => std::time::Duration::from_secs(n),
-        _ => std::time::Duration::from_secs(1800),
+        _ => std::time::Duration::from_secs(600),
     }
 }
 
+
 /// 注册 `ask` 工具：角色向用户抛出一道**选择题**（可带图片、图片
-/// 网格、允许上传自定义图片），会话据此弹出选择框。
 ///
 /// 两种语义（由 `blocking` 决定）：
 /// - `None`（顶层 turn）：fire-and-forget。广播 `ChoiceRequested`
@@ -3402,7 +3417,7 @@ pub fn default_ask_timeout() -> std::time::Duration {
 /// - `Some(AskBlocking)`（workflow/delegate 子代理）：广播
 ///   `ChoiceRequested`（`wait=true`）→ 挂起等待，UI 把答案 POST 到
 ///   `/api/chat/choice-answer`（[`crate::choice`] 路由）后作为工具
-///   结果返回，子代理拿着答案继续干活。超时/取消有兜底。
+///   结果返回，子代理拿着答案继续干活。取消有兜底。
 pub(crate) fn register_ask_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
@@ -3511,11 +3526,15 @@ pub(crate) fn register_ask_tool(
                     "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
                 )));
             };
-
             // 阻塞模式（workflow/delegate 子代理）：挂起等 UI 经
             // `/api/chat/choice-answer` 把答案送进 choice 路由；
-            // 超时按默认继续，取消则报错退出。
+            // 无限等待用户，取消则报错退出。暂停门在每次 select
+            // 迭代前检查——用户按 ⏸ 时冻结等待，▶ 继续后恢复。
             let rx = crate::choice::register(&choice_id);
+            // 等待 future 被 drop（外层超时熔断 / workflow 中止）时自动
+            // 清理 PENDING，防泄漏——否则 has_any_pending 永远为真，
+            // advisor 被永久静音。
+            let _choice_guard = crate::choice::ChoiceGuard(choice_id.clone());
             let cancel_watch = {
                 let cf = blk.cancel_flag.clone();
                 async move {
@@ -3528,19 +3547,26 @@ pub(crate) fn register_ask_tool(
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             }
                         }
-                        // 无取消句柄：永不完成的 future（select! 里等效忽略）。
                         None => std::future::pending::<()>().await,
                     }
                 }
             };
-            let answered = tokio::select! {
-                a = rx => a.ok(),
-                _ = tokio::time::sleep(blk.timeout) => None,
-                _ = cancel_watch => {
-                    crate::choice::cancel(&choice_id);
-                    return Err(tool_err(format!(
-                        "等待用户回答期间 turn 被取消（choice_id={choice_id}）"
-                    )));
+            tokio::pin!(rx);
+            tokio::pin!(cancel_watch);
+            let answered = loop {
+                // 每次 select 迭代前检查暂停门：按 ⏸ 时冻结等待，
+                // ▶ 继续后恢复，不丢失选择框状态。
+                if let Some(gate) = &blk.agent_pause_gate {
+                    gate.wait_until_resumed(None).await;
+                }
+                tokio::select! {
+                    a = &mut rx => break a.ok(),
+                    _ = &mut cancel_watch => {
+                        crate::choice::cancel(&choice_id);
+                        return Err(tool_err(format!(
+                            "等待用户回答期间 turn 被取消（choice_id={choice_id}）"
+                        )));
+                    }
                 }
             };
             match answered {
@@ -3549,9 +3575,8 @@ pub(crate) fn register_ask_tool(
                 ))),
                 None => {
                     crate::choice::cancel(&choice_id);
-                    let mins = blk.timeout.as_secs() / 60;
-                    Ok(serde_json::Value::String(format!(
-                        "用户在 {mins} 分钟内未回答（choice_id={choice_id} 已超时）。不要重复提问——按最合理的默认选项继续，并在产出中明确注明这个假设。"
+                    Err(tool_err(format!(
+                        "等待用户回答时通道意外关闭（choice_id={choice_id}）"
                     )))
                 }
             }
@@ -3564,8 +3589,10 @@ pub(crate) fn register_ask_tool(
         input_schema,
         handler,
     )
+    // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：阻塞 ask 无限等用户作答，
+    // 不被工具管理器 25min 默认熔断掐断。
+    .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
     .build();
-
     tm.register(tool, Some(&role_id));
     Ok(())
 }
@@ -3694,6 +3721,7 @@ pub(crate) async fn gate_delegate_return(
     role_responsibilities: &str,
     task: &str,
     response: String,
+    tool_call_summary: &str,
 ) -> (String, Option<crate::advisor_monitor::ReviewVerdict>) {
     use crate::advisor_monitor::Verdict;
     // Bound the review so a slow/absent advisor model can't stall the
@@ -3703,7 +3731,13 @@ pub(crate) async fn gate_delegate_return(
     let timeout = engine.delegate_review_timeout();
     let review = tokio::time::timeout(
         timeout,
-        engine.review_delegate(role_id, role_responsibilities, task, &response),
+        engine.review_delegate(
+            role_id,
+            role_responsibilities,
+            task,
+            &response,
+            tool_call_summary,
+        ),
     )
     .await;
     let verdict = match review {
@@ -3772,6 +3806,24 @@ pub(crate) async fn gate_delegate_return(
 /// specialist 常写整套文档/脚本。解析顺序对齐 CLI（chat.rs）：
 /// `model.timeout_secs` > env `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` > 本值。
 pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
+
+/// 编排类工具（`workflow` / `delegate` / 阻塞 `ask`）的单次调用超时。
+///
+/// 这类工具的一次调用里包着**整条子流水线或一次人机交互**，时长不由
+/// 本进程决定：`workflow` 要跑完嵌套子 workflow + 并行评审波（实测
+/// design_and_plan ~48min），阻塞 `ask` 要等用户在弹框里作答（可能几
+/// 小时）。工具管理器 25min 默认熔断对它们只会误杀，所以统一放到 24h
+/// —— 相当于"不靠这层兜底"。
+///
+/// 真正的控制手段是：per-step wall-clock 触发的 `TimeoutWarning`
+/// （周期复发，让用户拍板）、`turn_cancel_flag`（用户「终止当前任务」）、
+/// session `cancel_flag`（全量中止），以及 `run_turn` 内部的工具轮次
+/// 上限与循环检测。
+///
+/// jemalloc 实锤：`workflow` 漏配本超时 → manager 调用在第 25 分钟被
+/// 熔断，而 step 因已无 wall-clock 硬超时仍在后台跑（孤儿任务）；
+/// manager 依错误提示 resume 又是 25min，两次空等 50 分钟零产出。
+pub(crate) const ORCHESTRATION_TOOL_TIMEOUT_SECS: u64 = 86_400;
 
 /// Specialist 单次委派的工具轮次默认上限。jemalloc 事故：estimate
 /// 步骤的 programmer 子代理 24min/86 次模型调用盲改循环（配置漂移
@@ -4010,6 +4062,11 @@ async fn register_delegate_tool(
                 sub_id: sub_id.clone(),
                 wf_id: None,
             });
+            // per-subsession 取消登记：UI 右键该分派 →「终止此分派」时
+            // 只掐这一条（manager 并行委派多个 specialist 时，不必为了
+            // 停一个而 cancel 整轮）。guard 随 handler 退出自动摘除。
+            let sub_cancel_flag = crate::sub_cancel::register(&sub_id);
+            let _sub_cancel_guard = crate::sub_cancel::SubCancelGuard(sub_id.clone());
             // Fan out ONLY to the subsession memory sink: the
             // `sub_sink` is `Arc<dyn TraceSink>` returning from
             // `SubsessionStore::create` —— 内部已 fanout 到
@@ -4231,6 +4288,32 @@ async fn register_delegate_tool(
                             });
                             return Err(tool_err(summary));
                         }
+                        // per-subsession 取消：只结束这一条委派，manager
+                        // 的其它并行委派继续跑。错误文案要让 manager 知道
+                        // 是"人为终止"而不是失败——否则它会自动重派，把
+                        // 用户刚掐掉的活again 起一遍。
+                        if sub_cancel_flag.load(Ordering::SeqCst) {
+                            run_handle.abort();
+                            let _ = event_tx.send(ChatEvent::RoleFinished {
+                                role_id: role_id.clone(),
+                                detail: "terminated by user (subsession)".into(),
+                                sub_id: Some(sub_id.clone()),
+                            });
+                            let summary = format!(
+                                "委派 '{role_id}' 被用户手动终止（从 subsession 右键）。\
+                                 这是用户的明确意图，**不要**自动重派同一任务；\
+                                 如需继续请先向用户确认。"
+                            );
+                            let _ = event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "cancelled".into(),
+                                summary: summary.clone(),
+                                sub_id: sub_id.clone(),
+                                wf_id: None,
+                            });
+                            return Err(tool_err(summary));
+                        }
                     }
                 }
             }
@@ -4253,6 +4336,7 @@ async fn register_delegate_tool(
                     &role.system_prompt,
                     &task,
                     response,
+                    "", // manager delegate 路径，调用方无工具计数
                 )
                 .await
                 .0),
@@ -4340,6 +4424,11 @@ async fn register_delegate_tool(
         input_schema,
         handler,
     )
+    // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：specialist 委派自带
+    // wall-clock 超时（specialist_timeout_secs）与取消旗标，不需要
+    // 工具管理器 25min 熔断再插一刀（子代理写整套文档/跑构建时会
+    // 正常超过）。
+    .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
     .build();
 
     tm.register(tool, Some("manager"));
@@ -4362,7 +4451,7 @@ async fn register_workflow_tool(
     event_tx: broadcast::Sender<ChatEvent>,
     cwd: PathBuf,
     cancel_flag: Arc<AtomicBool>,
-    _turn_cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     // 以下三项透传进 WorkflowRunContext，让 workflow 的每次角色
     // 分派与普通流程 delegate 一致：独立 subsession 日志、advisor
@@ -4438,6 +4527,7 @@ async fn register_workflow_tool(
         let default_params = default_params.clone();
         let event_tx = event_tx.clone();
         let cancel_flag = Arc::clone(&cancel_flag);
+        let turn_cancel_flag = turn_cancel_flag.clone();
         let agent_pause_gate = agent_pause_gate_owned.clone();
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
@@ -4482,6 +4572,7 @@ async fn register_workflow_tool(
                 default_params,
                 cwd,
                 event_tx,
+                turn_cancel_flag: Some(turn_cancel_flag),
                 cancel_flag,
                 agent_pause_gate: Some(agent_pause_gate),
                 depth: 0,
@@ -4498,6 +4589,16 @@ async fn register_workflow_tool(
             result
                 .map(|summary| serde_json::Value::String(strip_think_blocks(&summary)))
                 .map_err(|e| {
+                    // 用户主动终止 ≠ 执行失败，善后动作相反：绝不能
+                    // 自动 resume/重做——否则用户右键「终止此分派」把
+                    // 活停掉，manager 立刻又起一遍，功能等于没有。
+                    if crate::workflow::is_cancelled_by_user(&e) {
+                        return tool_err(format!(
+                            "{e}\n\n这是**用户主动终止**，不是失败：不要自动 resume 续跑，\
+                             也不要换路径重做同一件事。请简短告知用户已停止，\
+                             并询问下一步怎么做，然后结束本轮。"
+                        ));
+                    }
                     // 失败时给 manager 明确的善后指令——jemalloc 实锤：
                     // 裸错误回 tool loop 后 manager 没有动作，流水线
                     // 零产出收场。
@@ -4515,6 +4616,9 @@ async fn register_workflow_tool(
         input_schema,
         handler,
     )
+    // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：一次调用包着整条流水线，
+    // 不能吃工具管理器 25min 默认熔断。
+    .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
     .build();
 
     tm.register(tool, Some("manager"));
@@ -4532,6 +4636,7 @@ async fn run_workflow_command(
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    turn_cancel_flag: Arc<AtomicBool>,
     advisor_pause: AdvisorPauseGate,
 ) -> Result<Option<String>, String> {
     let wf = match crate::workflow::load_workflow_by_command(cmd, &config.cwd) {
@@ -4546,6 +4651,7 @@ async fn run_workflow_command(
         cwd: config.cwd.clone(),
         event_tx: event_tx.clone(),
         cancel_flag,
+        turn_cancel_flag: Some(turn_cancel_flag),
         agent_pause_gate: Some(agent_pause_gate),
         depth: 0,
         // 与 manager 的 workflow 工具一致：slash 命令触发的 workflow
@@ -5331,8 +5437,8 @@ mod tests {
             event_tx,
             "manager".into(),
             Some(AskBlocking {
-                timeout: std::time::Duration::from_secs(30),
                 cancel_flag: None,
+                agent_pause_gate: None,
             }),
         )
         .expect("register ask");
@@ -5356,8 +5462,12 @@ mod tests {
         assert!(text.contains("不要重复提问"), "{text}");
     }
 
+    /// 编排类工具必须显式带 `ORCHESTRATION_TOOL_TIMEOUT_SECS`，不能吃
+    /// 工具管理器 25min 默认熔断。`ask` 是本测试能低成本注册的代表；
+    /// `workflow` / `delegate` 用同一常量（漏配的后果见常量文档：
+    /// 25min 熔断 + 孤儿 step + resume 空等 50 分钟）。
     #[tokio::test]
-    async fn ask_blocking_timeout_falls_back_to_default() {
+    async fn orchestration_tools_opt_out_of_manager_default_timeout() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
         register_ask_tool(
@@ -5365,16 +5475,24 @@ mod tests {
             event_tx,
             "manager".into(),
             Some(AskBlocking {
-                timeout: std::time::Duration::from_millis(50),
                 cancel_flag: None,
+                agent_pause_gate: None,
             }),
         )
         .expect("register ask");
 
-        let out = tm.execute("ask", ask_input(), None).await.expect("ask call");
-        let text = out.as_str().expect("string result");
-        assert!(text.contains("已超时"), "{text}");
-        assert!(text.contains("不要重复提问"), "{text}");
+        let tool = tm.get_tool("ask").expect("ask 已注册");
+        assert_eq!(
+            tool.timeout,
+            Some(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS)),
+            "阻塞 ask 必须显式声明超时，否则被工具管理器默认值熔断"
+        );
+        // 25min（工具管理器默认）远小于本值——回归防线：一旦有人把
+        // 常量改小到默认值量级，这条会炸。
+        assert!(
+            tool.timeout.expect("timeout") > std::time::Duration::from_secs(1500),
+            "编排工具超时不得回落到 25min 量级"
+        );
     }
 
     #[tokio::test]
@@ -5387,8 +5505,8 @@ mod tests {
             event_tx,
             "manager".into(),
             Some(AskBlocking {
-                timeout: std::time::Duration::from_secs(60),
                 cancel_flag: Some(cancel.clone()),
+                agent_pause_gate: None,
             }),
         )
         .expect("register ask");
@@ -5408,7 +5526,6 @@ mod tests {
     }
 
     /// 一次一清单防护：上一份清单 PendingApproval 期间，第二次 plan
-    /// 调用被拒绝（提示合并到一次调用），且不重复发 PlanProposed。
     /// （坏行为样本：manager 把 11 个任务分 11 次调用，用户弹窗
     /// 每次只有 1 个任务。）
     #[tokio::test]
@@ -6089,6 +6206,35 @@ mod tests {
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["TimeoutWarning"]["sub_id"], "programmer-sub-99");
+    }
+
+    /// workflow step 已无硬超时，超时分支发 `hard_timeout_secs: 0`
+    /// 表示「不会被强杀，等或手动终止」。前端按 `> 0` 决定是否显示
+    /// 「硬超时将在 Ns 强制终止」文案，所以 0 必须原样出现在 wire 上
+    /// （不能被 skip_serializing_if 省掉，否则 UI 读到 undefined
+    /// 走进 NaN 分支）。
+    #[test]
+    fn timeout_warning_zero_hard_timeout_survives_serialization() {
+        let event = ChatEvent::TimeoutWarning {
+            role_id: "architect".into(),
+            elapsed_secs: 900,
+            soft_timeout_secs: 900,
+            hard_timeout_secs: 0,
+            sub_id: Some("architect-sub-1".into()),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["TimeoutWarning"]["hard_timeout_secs"], 0,
+            "0 必须保留在 wire 上，供前端判定「无硬超时」"
+        );
+        // elapsed 独立于 soft：复发时报的是真实已跑秒数。
+        assert_eq!(json["TimeoutWarning"]["elapsed_secs"], 900);
+
+        // 前端同款判定（chat_impl.ts: ev.hard_timeout_secs > 0）。
+        let hard = json["TimeoutWarning"]["hard_timeout_secs"]
+            .as_u64()
+            .expect("hard_timeout_secs 必须是数字，不能缺字段");
+        assert!(hard == 0, "无硬超时分支");
     }
 
     // ─── AdvisorHint driver plumbing ──────────────────────────────

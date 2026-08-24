@@ -995,6 +995,7 @@ impl AdvisorReviewEngine {
         role_responsibilities: &str,
         task: &str,
         response: &str,
+        tool_call_summary: &str,
     ) -> AgentResult<ReviewVerdict> {
         let template = self
             .agent_config
@@ -1019,6 +1020,7 @@ impl AdvisorReviewEngine {
             role_responsibilities,
             task,
             response,
+            tool_call_summary,
         ));
         let model_id = agent
             .model_chain
@@ -1164,6 +1166,7 @@ fn build_delegate_review_prompt(
     role_responsibilities: &str,
     task: &str,
     response: &str,
+    tool_call_summary: &str,
 ) -> String {
     // Bound the injected sections so a huge system prompt / response
     // doesn't blow the review context. The response is the core
@@ -1184,6 +1187,19 @@ fn build_delegate_review_prompt(
         )
     } else {
         String::new()
+    };
+    // 工具执行证据：任务要求"用工具完成 X"时，最终文本常常不带
+    // 工具痕迹（jemalloc 实锤：interview step 用 ask 弹窗收齐 4 个
+    // 答案后输出 user_profile，advisor 看不到 ask 执行记录，误判
+    // "伪造答案"→ intervene → 带反馈重做 → 用户被重复提问）。
+    // 把本轮实际工具执行摘要摆进审查上下文，让裁决基于事实而非
+    // 文本猜测。空摘要（调用方没有收集到）不渲染该段。
+    let tool_section = if tool_call_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n# 它本轮实际执行的工具调用（引擎侧记录，供核实任务是否真正执行）\n\n{tool_call_summary}\n"
+        )
     };
     format!(
         r#"# 委派返回审查任务
@@ -1206,6 +1222,7 @@ fn build_delegate_review_prompt(
 {resp_s}
 </response>
 {truncation_note}
+{tool_section}
 逐项检查：
 1. **偏离职责 / 越权**：是否做了超出「{role_id}」职责范围的事，或没有以该角色应有的专业方式完成（比如让 reviewer 去写实现、让 programmer 只空谈不给代码）。
 2. **答非所问 / 未达结果**：返回是否真正回答了委派任务、产出了任务预期的结果——有无跑题、空泛套话、遗漏关键要求，或声称完成但实际没做（幻觉式交付）。
@@ -1554,6 +1571,18 @@ impl MonitorState {
                 }
             }
             _ => {}
+        }
+        // 任意角色在回答 ask 弹窗（等待拍板）时，advisor 不得介入——
+        // 此刻工具错误/循环类 finding 大概率是 wait=true 的 ask 在等
+        // 用户选择（jemalloc 实锤：workflow 内 architect/tutor 的 ask
+        // 挂起时，advisor 却因 ask 超时弹 🛑 干扰用户选择，用户作答
+        // 结果丢失、workflow 无法继续）。挂起期间抑制 finding 注入与
+        // LLM 审查，用户作答后续跑。用 has_any_pending 而非
+        // has_pending_for(watched_role)：被监控的 manager 可能没有挂
+        // 起项，但 workflow 里的 specialist 正在 ask 等用户。
+        if crate::choice::has_any_pending() {
+            findings.clear();
+            review_requested = false;
         }
         StepOutcome {
             findings,
@@ -1912,7 +1941,7 @@ mod tests {
     fn delegate_review_prompt_fits_typical_report_without_truncation() {
         // 25K 字符的专家报告（本次事故的实际尺寸）应完整进入 prompt。
         let report = "x".repeat(25_000);
-        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report);
+        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report, "");
         assert!(p.contains(&report), "25K 报告不应被截断");
         assert!(!p.contains("被截断"), "未截断时不应出现截断提示");
     }
@@ -1920,7 +1949,7 @@ mod tests {
     #[test]
     fn delegate_review_prompt_notes_truncation_when_over_budget() {
         let report = "x".repeat(DELEGATE_REVIEW_RESPONSE_MAX_CHARS + 10_000);
-        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report);
+        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report, "");
         assert!(p.contains("被截断"), "超预算时必须显式告知复审模型");
         assert!(p.contains("[+"), "保留截断标记");
     }

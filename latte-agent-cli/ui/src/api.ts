@@ -437,6 +437,32 @@ export async function cancelTurn(): Promise<void> {
   await getTransport().request("POST", "/api/chat/cancel-turn", chatBody({}));
 }
 
+/** Terminate a *single* dispatch (subsession) without touching its
+ *  siblings. Wired to the subsession context menu's「终止此分派」.
+ *
+ *  Why this exists separately from `cancelTurn`: a DAG parallel wave
+ *  runs several dispatches at once (e.g. design_and_plan's
+ *  req_review ‖ code_review). Cancelling the whole turn to stop one
+ *  stuck dispatch also throws away the sibling that may have been
+ *  running for 10+ minutes.
+ *
+ *  Resolves `false` when the backend reports 404 — the dispatch had
+ *  already finished (benign race: it completed between right-click
+ *  and confirm). Callers should tell the user rather than treating
+ *  it as an error. */
+export async function cancelSubagent(subId: string): Promise<boolean> {
+  try {
+    await getTransport().request(
+      "POST",
+      "/api/chat/cancel-turn",
+      chatBody({ sub_id: subId }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Abort the entire session immediately (all in-flight turns, all
  *  subagents, all workflows). The session is torn down and cannot
  *  be resumed. Equivalent to clicking "delete session" but without

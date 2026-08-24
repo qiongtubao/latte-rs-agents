@@ -41,6 +41,35 @@ pub fn cancel(choice_id: &str) {
     PENDING.lock().unwrap().remove(choice_id);
 }
 
+/// Drop guard：ask 等待的 future 被 drop（workflow 中止 / 外层超时熔断）
+/// 时自动清理挂起项，避免 PENDING 泄漏。`cancel` 是幂等的——答案已
+/// 送达后 remove 不存在的键无副作用。
+pub struct ChoiceGuard(pub String);
+
+impl Drop for ChoiceGuard {
+    fn drop(&mut self) {
+        cancel(&self.0);
+    }
+}
+
+/// 是否有任何角色有挂起的阻塞 ask（未回答、未取消）。供 advisor
+/// monitor 使用：任何角色在等用户选择时，advisor 不应介入。
+pub fn has_any_pending() -> bool {
+    !PENDING.lock().unwrap().is_empty()
+}
+
+/// 该 role 是否有挂起的阻塞 ask（未回答、未取消）。workflow 超时
+/// 熔断据此判定「子代理不是卡死，而是在等用户回答」——此时暂停
+/// wall-clock 倒计时，等用户把答案交给 choice-answer 再继续。
+pub fn has_pending_for(role_id: &str) -> bool {
+    let prefix = format!("choice-{role_id}-");
+    PENDING
+        .lock()
+        .unwrap()
+        .keys()
+        .any(|k| k.starts_with(&prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,5 +95,44 @@ mod tests {
         assert!(!resolve("choice-test-2", "x".to_string()));
         // 发送端被移除后，等待方收到 Err（通道关闭）。
         assert!(rx.await.is_err());
+    }
+
+    /// ChoiceGuard 随 future 一起 drop 时必须清理 PENDING —— 否则
+    /// `has_any_pending` 永远为真，advisor 被永久静音。
+    #[test]
+    fn choice_guard_drop_clears_pending() {
+        let _rx = register("choice-guard-1");
+        {
+            let _g = ChoiceGuard("choice-guard-1".to_string());
+            assert!(has_any_pending(), "guard 在作用域内，挂起项应存在");
+        }
+        assert!(
+            !resolve("choice-guard-1", "x".to_string()),
+            "guard drop 后挂起项应已被清理"
+        );
+    }
+
+    /// `has_pending_for` 靠 `choice-{role_id}-` 前缀识别归属，而
+    /// choice_id 由 `register_ask_tool` 用
+    /// `format!("choice-{}-{}", role_id, seq)` 生成。两处格式一旦漂移，
+    /// workflow 的「等用户时暂停超时倒计时」会静默失效（永远 false →
+    /// 正在等用户作答的 step 被误报超时）。本测试锁死这个契约。
+    #[test]
+    fn has_pending_for_matches_generated_choice_id_shape() {
+        // 与 controller.rs 的 choice_id 生成方式保持一致。
+        let role_id = "architect";
+        let choice_id = format!("choice-{}-{}", role_id, 7);
+        let _rx = register(&choice_id);
+
+        assert!(
+            has_pending_for(role_id),
+            "生成格式 {choice_id} 应被 has_pending_for(\"{role_id}\") 命中"
+        );
+        // 不误伤其它角色：前缀必须精确到 role_id 后紧跟 '-'。
+        assert!(!has_pending_for("arch"), "前缀不完整的角色名不应命中");
+        assert!(!has_pending_for("programmer"), "无关角色不应命中");
+
+        cancel(&choice_id);
+        assert!(!has_pending_for(role_id), "清理后不应再命中");
     }
 }

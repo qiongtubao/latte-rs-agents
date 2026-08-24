@@ -15,7 +15,7 @@ ${c.summary}`:""}`,Be(g),ge(I,!x),He(),x){const J=gn(T);J&&(G=J,L.textContent=`�
         <strong>${Fe(n.role_id)} ${n.role_id} 已运行 ${n.elapsed_secs}s</strong>
       </div>
       <div class="timeout-prompt__body">
-        超过设定的 ${n.soft_timeout_secs}s 软超时（硬超时将在 ${n.hard_timeout_secs}s 强制终止）。
+        超过设定的 ${n.soft_timeout_secs}s 软超时${n.hard_timeout_secs>0?`（硬超时将在 ${n.hard_timeout_secs}s 强制终止）`:"（无硬超时，可耐心等待，或手动终止）"}。
         是否继续等待？
       </div>
       <div class="timeout-prompt__actions">

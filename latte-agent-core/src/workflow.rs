@@ -136,6 +136,7 @@ async fn contract_last_resort_review(
         "", // 此处拿不到角色职责全文，审查以任务+产出为基准
         task,
         response.to_string(),
+        "", // contract_last_resort_review 无工具调用数据
     )
     .await;
     let v = verdict?;
@@ -641,6 +642,21 @@ pub struct WorkflowRunContext {
     pub cwd: PathBuf,
     pub event_tx: broadcast::Sender<ChatEvent>,
     pub cancel_flag: Arc<AtomicBool>,
+    /// Per-turn cancellation flag, distinct from `cancel_flag` (which
+    /// aborts the whole session).
+    ///
+    /// Step 已无 wall-clock 硬超时：超时只发 `TimeoutWarning` 让用户
+    /// 选「继续等待 / 终止当前任务」，倒计时重新 park。所以本旗标是
+    /// **唯一的 per-turn 逃生口** —— 用户点「终止当前任务」
+    /// （`Controller::cancel_turn`）置位后，卡住的 step 在下个 500ms
+    /// tick 被 abort，session 保留。
+    ///
+    /// `None` 不再退化成硬中止（硬中止已删除），而是意味着该 run
+    /// **没有 per-turn 逃生口**，只能靠 session 级 `cancel_flag`
+    /// 一次性全杀。因此凡是能拿到 session controller 的入口都应传
+    /// `Some`（见 `api::session_turn_cancel_flag`）；仅无 session 的
+    /// 独立测试 run 才允许 `None`。
+    pub turn_cancel_flag: Option<Arc<AtomicBool>>,
     /// Session-level 暂停门。workflow 的 role runner 也 attach 这个
     /// gate —— 用户按 ⏸ 时 workflow 流水线一起冻结（下个 boundary
     /// park）。None（独立测试/无 session 的 run）跳过。
@@ -714,6 +730,7 @@ fn run_nested_workflow(
             cwd: ctx.cwd.clone(),
             event_tx: ctx.event_tx.clone(),
             cancel_flag: ctx.cancel_flag.clone(),
+            turn_cancel_flag: ctx.turn_cancel_flag.clone(),
             agent_pause_gate: ctx.agent_pause_gate.clone(),
             depth: ctx.depth + 1,
             subsession_store: ctx.subsession_store.clone(),
@@ -735,6 +752,20 @@ fn run_nested_workflow(
             None => Ok(last),
         }
     })
+}
+
+/// workflow 因**用户主动终止**而结束时，错误信息的固定前缀。
+///
+/// 存在的理由：`run_workflow` 的 Err 同时承载"跑挂了"和"人掐了"两种
+/// 情况，而这两种的善后动作完全相反 —— 跑挂了该 resume 续跑，人掐了
+/// 绝不能自动续跑（否则用户右键「终止此分派」刚把活停掉，manager 立刻
+/// 又把它 resume 起来，功能等于没有）。调用方用
+/// [`is_cancelled_by_user`] 区分。
+pub const CANCELLED_BY_USER_PREFIX: &str = "workflow cancelled by user";
+
+/// 该 workflow 错误是否源于用户主动终止（而非执行失败）。
+pub fn is_cancelled_by_user(msg: &str) -> bool {
+    msg.starts_with(CANCELLED_BY_USER_PREFIX)
 }
 
 /// Internal outcome of a workflow engine (serial or DAG), before the
@@ -1139,7 +1170,9 @@ async fn run_workflow_inner(
                     ),
                 });
             }
-            let summary = "workflow cancelled by user".to_string();
+            // 带上 wf_id：用户想续跑时自己有据可查（但**不要**让
+            // manager 自动续跑，见 CANCELLED_BY_USER_PREFIX）。
+            let summary = format!("{CANCELLED_BY_USER_PREFIX}（wf_id={wf_id}）");
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
                 name,
                 wf_id,
@@ -1323,8 +1356,8 @@ async fn build_role_runner(
         // 让 decide 步产出变成「等待您回答」垃圾文本流进下游）。
         if role.allowed_tools.iter().any(|t| t == "ask") {
             let blocking = crate::controller::AskBlocking {
-                timeout: crate::controller::default_ask_timeout(),
                 cancel_flag: Some(cancel_flag.clone()),
+                agent_pause_gate: agent_pause_gate.clone(),
             };
             crate::controller::register_ask_tool(
                 &rtm,
@@ -1384,9 +1417,13 @@ struct SpeakerDispatch {
     merged: Arc<AgentConfig>,
     resolver: Arc<ModelResolver>,
     default_params: GenerateParams,
-    cwd: PathBuf,
     event_tx: broadcast::Sender<ChatEvent>,
+    cwd: PathBuf,
     cancel_flag: Arc<AtomicBool>,
+    /// Per-turn cancellation flag, distinct from `cancel_flag`. When
+    /// `Some`, the step timeout emits `TimeoutWarning` + waits for user
+    /// decision instead of hard-aborting.
+    pub turn_cancel_flag: Option<Arc<AtomicBool>>,
     agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
     subsession_store: Option<Arc<crate::subsession::SubsessionStore>>,
     session_id: Option<String>,
@@ -1419,6 +1456,7 @@ impl SpeakerDispatch {
             cwd: ctx.cwd.clone(),
             event_tx: ctx.event_tx.clone(),
             cancel_flag: ctx.cancel_flag.clone(),
+    turn_cancel_flag: ctx.turn_cancel_flag.clone(),
             agent_pause_gate: ctx.agent_pause_gate.clone(),
             subsession_store: ctx.subsession_store.clone(),
             session_id: ctx.session_id.clone(),
@@ -1476,6 +1514,26 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             wf_id: Some(inp.wf_id.clone()),
         });
     }
+    // per-subsession 取消登记：UI 右键该 subsession →「终止此分派」。
+    //
+    // 注意粒度的真实边界：本旗标只让**这一个 step** 提前收工，但
+    // `StepFail::Cancelled` 会被 DAG 引擎升级为 `set.abort_all()` +
+    // `WfOutcome::Cancelled`（因为下游 step 靠 output_key 依赖它，
+    // 缺了就跑不下去）——所以对 workflow 而言效果是"结束这次 workflow
+    // 运行"，而不是"只停一条、兄弟继续"。真正兄弟互不影响的是
+    // manager 的 delegate 路径（各自独立的工具调用）。
+    // 相比 per-turn cancel 的好处仍然明确：session 与 manager 主循环
+    // 存活，且 checkpoint 已记录完成步，用户可自行 resume。
+    //
+    // guard 随本函数退出自动摘除登记，所以 `is_active(sub_id)` 等价于
+    // 「这条分派还在跑」，UI 据此决定是否显示菜单项。
+    let (sub_cancel_flag, _sub_cancel_guard) = match &sub_id {
+        Some(id) => (
+            Some(crate::sub_cancel::register(id)),
+            Some(crate::sub_cancel::SubCancelGuard(id.clone())),
+        ),
+        None => (None, None),
+    };
 
     // 2-4. 执行 + advisor 返回审查的重做环：返回被判 intervene/terminate
     //    时带【上轮审查反馈】重派——advisor 的「打回重做」不再只是批注
@@ -1554,10 +1612,20 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
 
         // 3. Spawn + 500ms 轮询 cancel：运行中的分派可中途 abort
         //    （对齐 controller.rs delegate 的取消语义）。
+        // 每个 step 开始前重置 turn_cancel_flag：上一步被用户取消后
+        // flag 仍为 true，若不重置会导致后续 step 一进 poll loop 就
+        // 立即 Cancelled（连锁取消 bug）。session 级 cancel_flag 不
+        // 受影响——它由 abort 路径控制，跨步有效。
+        if let Some(tcf) = &inp.turn_cancel_flag {
+            tcf.store(false, Ordering::SeqCst);
+        }
         let prompt = prompt_for_turn.clone();
         let cancel = inp.cancel_flag.clone();
         let mut run_handle = tokio::spawn(async move {
-            runner.run_turn_gated(&[Message::user(prompt)], None).await
+            let result = runner.run_turn_gated(&[Message::user(prompt)], None).await;
+            let tool_count = runner.last_turn_tool_count;
+            let tool_summary = runner.take_last_turn_tool_summary();
+            result.map(|r| (r, tool_count, tool_summary))
         });
         // 熔断：wall-clock 超时（对齐 controller delegate；被 500ms
         // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
@@ -1566,14 +1634,17 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         let timeout_s = crate::controller::specialist_timeout_secs(None);
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
         tokio::pin!(timeout);
-        let attempt: Result<String, StepFail>;
+        // step 实际起跑时刻：TimeoutWarning 复发时据此报真实已跑秒数
+        // （而不是每次都报一个 soft_timeout_secs 的固定值）。
+        let step_started = tokio::time::Instant::now();
+        let attempt: Result<(String, usize, String), StepFail>;
         loop {
             tokio::select! {
                 r = &mut run_handle => {
                     match r {
                         // 剥 <think>：主 session 展示与后续 speaker 的
                         // transcript 只保留正式回答；原文留在子会话 trace。
-                        Ok(Ok(response)) => {
+                        Ok(Ok((response, tool_count, tool_summary))) => {
                             let stripped = crate::controller::strip_think_blocks(&response);
                             // 空产出不算成功：判失败让引擎重试/失败，
                             // 而不是把空串写进 vars 穿给下游。
@@ -1582,7 +1653,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                                     "subagent '{speaker}' 返回了空内容"
                                 )));
                             } else {
-                                attempt = Ok(stripped);
+                                attempt = Ok((stripped, tool_count, tool_summary));
                             }
                             break;
                         }
@@ -1608,30 +1679,38 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     }
                 }
                 _ = &mut timeout => {
-                    run_handle.abort();
-                    let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                    // 子代理正挂起等用户回答（ask 阻塞中，choice 表里有
+                    // 该 role 的挂起项）——「等用户」不是卡死，暂停熔断
+                    // 倒计时：重置 timer 继续等，用户回答后自行恢复。
+                    if crate::choice::has_pending_for(&speaker) {
+                        timeout.as_mut().reset(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(timeout_s),
+                        );
+                        continue;
+                    }
+                    // 发 TimeoutWarning，让 UI 弹「继续等待 / 终止当前任务」。
+                    // 不硬杀：防死循环不由 wall-clock 兜底——run_turn 内部
+                    // 有 tool rounds 上限（100 轮）和工具循环检测（连续 3 次
+                    // 同参相同调用），两者都会报 AgentError 终止 turn。合法
+                    // 长任务（loop agent 跑很久）不应被杀。
+                    let elapsed_secs = step_started.elapsed().as_secs();
+                    let _ = inp.event_tx.send(ChatEvent::TimeoutWarning {
                         role_id: speaker.clone(),
-                        detail: format!("timed out after {timeout_s}s"),
+                        elapsed_secs,
+                        soft_timeout_secs: timeout_s,
+                        hard_timeout_secs: 0, // 0 = 无硬超时（无限等待）
                         sub_id: sub_id.clone(),
                     });
-                    if let Some(id) = &sub_id {
-                        let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                            from_role: "manager".into(),
-                            to_role: speaker.clone(),
-                            status: "timeout".into(),
-                            summary: format!(
-                                "workflow step '{}' 超过 {}s 未返回，已中止",
-                                inp.step_id, timeout_s
-                            ),
-                            sub_id: id.clone(),
-                            wf_id: Some(inp.wf_id.clone()),
-                        });
-                    }
-                    attempt = Err(StepFail::Failed(format!(
-                        "step '{}' 超过 {}s 未返回（超时熔断，env LATTE_AGENT_DELEGATE_TIMEOUT_SECS 可调）",
-                        inp.step_id, timeout_s
-                    )));
-                    break;
+                    // 按 timeout_s 周期性复发，而不是 park 到 1 年后：用户
+                    // 点「继续等待」只是前端隐藏 banner，后端若从此静默，
+                    // 真卡死的 step 在 turn_cancel_flag 为 None 的入口上
+                    // 就彻底没人知道了。复发让「还活着但很久没回」始终可见，
+                    // 同时 select! 不会空转（timer 永远指向未来）。
+                    timeout.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + std::time::Duration::from_secs(timeout_s),
+                    );
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     if cancel.load(Ordering::SeqCst) {
@@ -1653,6 +1732,61 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                         }
                         return Err(StepFail::Cancelled);
                     }
+                    // per-turn 取消：用户在 TimeoutWarning 里点「终止
+                    // 当前任务」，掐掉当前 step 但保留 session。
+                    if inp
+                        .turn_cancel_flag
+                        .as_ref()
+                        .is_some_and(|tcf| tcf.load(Ordering::SeqCst))
+                    {
+                        run_handle.abort();
+                        let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                            role_id: speaker.clone(),
+                            detail: "cancelled by user".into(),
+                            sub_id: sub_id.clone(),
+                        });
+                        if let Some(id) = &sub_id {
+                            let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: speaker.clone(),
+                                status: "cancelled".into(),
+                                summary: "workflow step cancelled by user".into(),
+                                sub_id: id.clone(),
+                                wf_id: Some(inp.wf_id.clone()),
+                            });
+                        }
+                        return Err(StepFail::Cancelled);
+                    }
+                    // per-subsession 取消：用户右键这条 subsession →
+                    // 「终止此分派」。与上面 per-turn 分支的区别是
+                    // **来源与善后**：错误经 CANCELLED_BY_USER_PREFIX
+                    // 标记，manager 不会自动 resume（用户刚掐的活不该
+                    // 被自动起回来）；session 与主循环存活，checkpoint
+                    // 保留可人工续跑。
+                    if sub_cancel_flag
+                        .as_ref()
+                        .is_some_and(|f| f.load(Ordering::SeqCst))
+                    {
+                        run_handle.abort();
+                        let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                            role_id: speaker.clone(),
+                            detail: "terminated by user (subsession)".into(),
+                            sub_id: sub_id.clone(),
+                        });
+                        if let Some(id) = &sub_id {
+                            let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: speaker.clone(),
+                                status: "cancelled".into(),
+                                summary: format!(
+                                    "分派 '{speaker}' 被用户从 subsession 右键终止"
+                                ),
+                                sub_id: id.clone(),
+                                wf_id: Some(inp.wf_id.clone()),
+                            });
+                        }
+                        return Err(StepFail::Cancelled);
+                    }
                 }
             }
         }
@@ -1660,8 +1794,13 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         // 4. Delegate-return 审查：advisor 启用（gate Some ⇒ review_engine
         //    Some）时产出先过审查再回写引擎；intervene/terminate → 重做。
         match (attempt, &inp.review_engine) {
-            (Ok(response), Some(engine)) => {
+            (Ok((response, _tool_count, tool_summary)), Some(engine)) => {
                 // 审查基准是原始任务（inp.prompt），不含重做批注。
+                // 工具调用摘要：让 advisor 的返回审查能看到专家实际执行了
+                // 哪些工具（jemalloc 实锤：interview step 用 ask 收齐答案
+                // 后输出 user_profile，advisor 看不到 ask 记录→误判伪造）。
+                // 摘要由 runner 收集（take_last_turn_tool_summary），
+                // 含工具名 + 参数 + 结果，不再是裸计数。
                 let (annotated, verdict) = crate::controller::gate_delegate_return(
                     engine,
                     &inp.event_tx,
@@ -1669,6 +1808,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     &role_responsibilities,
                     &inp.prompt,
                     response,
+                    &tool_summary,
                 )
                 .await;
                 let intervene = matches!(
@@ -1693,15 +1833,19 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     let feedback = if v.hint.is_empty() {
                         v.reason.clone()
                     } else {
-                        format!("{}\n处理建议：{}", v.reason, v.hint)
+                        format!("{}
+处理建议：{}", v.reason, v.hint)
                     };
                     prompt_for_turn =
-                        format!("{}\n\n【上轮审查反馈】\n{}", inp.prompt, feedback);
+                        format!("{}
+
+【上轮审查反馈】
+{}", inp.prompt, feedback);
                     continue;
                 }
                 break Ok(annotated);
             }
-            (other, _) => break other,
+            (other, _) => break other.map(|(r, _, _)| r),
         }
     };
 
@@ -2070,10 +2214,11 @@ struct DagStepInput {
     wf_id: String,
     merged: Arc<AgentConfig>,
     resolver: Arc<ModelResolver>,
+    event_tx: broadcast::Sender<ChatEvent>,
     default_params: GenerateParams,
     cwd: PathBuf,
-    event_tx: broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Option<Arc<AtomicBool>>,
     agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
     depth: u8,
     subsession_store: Option<Arc<crate::subsession::SubsessionStore>>,
@@ -2126,6 +2271,7 @@ async fn run_dag_step(
             cwd: inp.cwd.clone(),
             event_tx: inp.event_tx.clone(),
             cancel_flag: inp.cancel_flag.clone(),
+            turn_cancel_flag: inp.turn_cancel_flag.clone(),
             agent_pause_gate: inp.agent_pause_gate.clone(),
             depth: inp.depth,
             subsession_store: inp.subsession_store.clone(),
@@ -2198,8 +2344,9 @@ async fn run_dag_step(
                 resolver: inp.resolver.clone(),
                 default_params: inp.default_params.clone(),
                 cwd: inp.cwd.clone(),
-                event_tx: inp.event_tx.clone(),
                 cancel_flag: inp.cancel_flag.clone(),
+                event_tx: inp.event_tx.clone(),
+                turn_cancel_flag: inp.turn_cancel_flag.clone(),
                 agent_pause_gate: inp.agent_pause_gate.clone(),
                 subsession_store: inp.subsession_store.clone(),
                 session_id: inp.session_id.clone(),
@@ -2377,9 +2524,10 @@ async fn run_workflow_dag(
                     merged: ctx.merged.clone(),
                     resolver: ctx.resolver.clone(),
                     default_params: ctx.default_params.clone(),
+                    cancel_flag: ctx.cancel_flag.clone(),
                     cwd: ctx.cwd.clone(),
                     event_tx: ctx.event_tx.clone(),
-                    cancel_flag: ctx.cancel_flag.clone(),
+                    turn_cancel_flag: ctx.turn_cancel_flag.clone(),
                     agent_pause_gate: ctx.agent_pause_gate.clone(),
                     depth: ctx.depth,
                     subsession_store: ctx.subsession_store.clone(),
@@ -3497,6 +3645,37 @@ task = "t"
         );
     }
 
+    /// 用户主动终止必须能与执行失败区分开。
+    ///
+    /// 为什么关键：两者的善后动作相反。失败 → manager 该用 wf_id
+    /// resume 续跑；用户终止 → 绝不能自动续跑，否则右键「终止此分派」
+    /// 刚把活停掉，manager 立刻又 resume 起来，功能等于没有。
+    #[test]
+    fn user_cancellation_is_distinguishable_from_failure() {
+        // run_workflow 的 Cancelled 分支产出的形状（带 wf_id 便于人工续跑）。
+        let cancelled = format!("{CANCELLED_BY_USER_PREFIX}（wf_id=wf-design_and_plan-123）");
+        assert!(
+            is_cancelled_by_user(&cancelled),
+            "取消信息必须被识别为用户终止：{cancelled}"
+        );
+        assert!(
+            cancelled.contains("wf-design_and_plan-123"),
+            "取消信息应带 wf_id，用户想手动续跑时有据可查"
+        );
+
+        // 各类真失败都不能被误判成"用户终止"，否则丢掉 resume 善后。
+        for fail in [
+            "step 'gate' speaker 'reviewer': 契约失败",
+            "workflow step task failed: join error",
+            "step 'breakdown' 返回了空内容",
+        ] {
+            assert!(
+                !is_cancelled_by_user(fail),
+                "执行失败不该被当成用户终止（会丢掉 resume 善后）：{fail}"
+            );
+        }
+    }
+
     /// 验收：init_project 的 project_md step 带产出契约（任务要求文件名出现）。
     #[test]
     fn init_project_project_md_step_has_contract() {
@@ -3593,6 +3772,7 @@ mod contract_engine_tests {
                 cwd: std::env::temp_dir(),
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
+                turn_cancel_flag: None,
                 agent_pause_gate: None, depth: 0,
                 subsession_store: None,
                 session_id: None,
@@ -4226,6 +4406,7 @@ mod resume_tests {
                 cwd,
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
+                turn_cancel_flag: None,
                 agent_pause_gate: None, depth: 0,
                 subsession_store: None,
                 session_id: None,
@@ -4933,6 +5114,7 @@ mod loop_tests {
                 default_params: GenerateParams::default(),
                 cwd: std::env::temp_dir(),
                 event_tx,
+                turn_cancel_flag: None,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 agent_pause_gate: None, depth: 0,
                 subsession_store: None,

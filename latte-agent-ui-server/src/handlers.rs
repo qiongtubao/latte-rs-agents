@@ -199,6 +199,19 @@ pub(crate) struct SessionOnlyRequest {
     session_id: Option<String>,
 }
 
+/// `POST /api/chat/cancel-turn` 的请求体。
+///
+/// `sub_id` 缺省 → per-turn 取消（掐当前 turn，session 保留），与旧
+/// 客户端完全兼容；`sub_id` 给出 → 只终止那一条分派，同一并行波里的
+/// 兄弟分派继续跑（UI 右键 subsession →「终止此分派」）。
+#[derive(Deserialize)]
+pub(crate) struct CancelTurnRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    sub_id: Option<String>,
+}
+
 /// 设置 session 的流式模式开关。
 #[derive(Deserialize)]
 pub(crate) struct StreamModeRequest {
@@ -254,10 +267,19 @@ pub(crate) async fn switch_role(
 
 pub(crate) async fn chat_cancel_turn(
     State(state): State<AppState>,
-    Json(req): Json<SessionOnlyRequest>,
+    Json(req): Json<CancelTurnRequest>,
 ) -> StatusCode {
-    match api::chat_cancel_turn(&state.backend, req.session_id.as_deref()).await {
+    // 带 sub_id → 只终止那一条分派；不带 → 老语义（per-turn 取消）。
+    let result = match req.sub_id.as_deref() {
+        Some(sub_id) if !sub_id.trim().is_empty() => {
+            api::chat_cancel_subagent(&state.backend, req.session_id.as_deref(), sub_id).await
+        }
+        _ => api::chat_cancel_turn(&state.backend, req.session_id.as_deref()).await,
+    };
+    match result {
         Ok(()) => StatusCode::OK,
+        // 404 = 该分派已结束（或 session 不存在），前端据此提示而不是
+        // 报错——用户点终止时分派刚好跑完是正常竞态。
         Err(_) => StatusCode::NOT_FOUND,
     }
 }

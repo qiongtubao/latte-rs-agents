@@ -762,7 +762,15 @@ pub struct AgentRunner {
     /// 需要这个数判断"response 含 `<read>` 但 tool_use_count=0"
     /// 的回声模式。run_turn 结束时设置，run_turn_gated 据此
     /// 跑 check_response_gates。
-    last_turn_tool_count: usize,
+    /// pub(crate) so workflow.rs can read it for advisor return review
+    /// (tool-call evidence prevents hallucinated "fabricated answers" verdict).
+    pub(crate) last_turn_tool_count: usize,
+    /// 本轮 turn 实际工具调用摘要（工具名 + 结果前 200 字符），
+    /// 供 advisor delegate-return 审查核实「工具确实执行了对应任务」。
+    /// 在 `run_turn` 内与 `last_turn_tool_count` 同步收集；
+    /// `run_turn_gated` 重试时会被 `run_turn` 开头重置。
+    /// `take_last_turn_tool_summary()` 读取并清空。
+    pub(crate) last_turn_tool_summaries: Vec<String>,
     /// Pre-persistence gate 配置。None = 不 gate（向后兼容老调用方）。
     /// Some(_) = run_turn 自动按 GateConfig 跑 D5/D6 检查，命中
     /// 时通过 advisor_hints 队列注入 hint 并触发同 turn 重跑
@@ -849,6 +857,18 @@ fn classify_tool_execution_error(
 /// 检测（`short_tool_name(&tc.name) == "delegate"`）及 namespace 遗留兼容。
 fn short_tool_name(name: &str) -> &str {
     name.rsplit_once('.').map(|(_, s)| s).unwrap_or(name)
+}
+/// advisor delegate-return 审查的动机是「judge based on evidence」——
+/// 工具摘要太长会挤占审查上下文（还有 32K 字符的结果预算），
+/// 单条截断即可。返回的字符串以 `…[+N]` 结尾标记丢弃的字符数。
+fn truncate_tool_summary(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(max).collect();
+        format!("{head}…[+{}]", count - max)
+    }
 }
 
 /// `ModelsUnavailable` 的人类可读摘要：tried/failures + 最近可重试
@@ -1219,6 +1239,7 @@ impl AgentRunner {
             advisor_hints: None,
             cwd: None,
             last_turn_tool_count: 0,
+            last_turn_tool_summaries: Vec::new(),
             gate_config: None,
             pause_gate: None,
             agent_pause_gate: None,
@@ -1246,6 +1267,7 @@ impl AgentRunner {
             advisor_hints: None,
             cwd: None,
             last_turn_tool_count: 0,
+            last_turn_tool_summaries: Vec::new(),
             gate_config: None,
             pause_gate: None,
             agent_pause_gate: None,
@@ -1269,6 +1291,7 @@ impl AgentRunner {
             advisor_hints: None,
             cwd: None,
             last_turn_tool_count: 0,
+            last_turn_tool_summaries: Vec::new(),
             gate_config: None,
             pause_gate: None,
             agent_pause_gate: None,
@@ -1527,6 +1550,17 @@ impl AgentRunner {
     pub fn context_mut(&mut self) -> &mut ConversationContext {
         &mut self.context
     }
+    /// 读取本轮工具调用摘要并清空内部缓冲区。
+    /// 供 workflow.rs 的 delegate-return 审查收集工具执行证据，
+    /// 让 advisor 能看到 ask 工具返回的用户答案，而不是仅凭计数做判断。
+    pub fn take_last_turn_tool_summary(&mut self) -> String {
+        if self.last_turn_tool_summaries.is_empty() {
+            return format!("[本 step 工具调用数: {}]", self.last_turn_tool_count);
+        }
+        let out = self.last_turn_tool_summaries.join("\n");
+        self.last_turn_tool_summaries.clear();
+        out
+    }
 
 
     /// Total token usage accumulated so far.
@@ -1609,6 +1643,7 @@ impl AgentRunner {
         // run_turn 内部每次成功执行一个工具就 +1；run_turn 结束时
         // run_turn_gated 据此跑 D6 ToolCallEcho 检查。
         self.last_turn_tool_count = 0;
+        self.last_turn_tool_summaries.clear();
         use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
@@ -2124,6 +2159,18 @@ impl AgentRunner {
                         }
                         if r.executed_ok {
                             self.last_turn_tool_count += 1;
+                            // 收集工具摘要：取 loop_records 第一条为原始调用名+参数，
+                            // outcome 为结果。近似于串行路径的收集逻辑。
+                            if let (Some((name, args)), Ok(result_str)) =
+                                (r.loop_records.first(), &r.outcome)
+                            {
+                                self.last_turn_tool_summaries.push(format!(
+                                    "{} {} → {}",
+                                    name,
+                                    truncate_tool_summary(args, 160),
+                                    truncate_tool_summary(result_str, 240),
+                                ));
+                            }
                         }
                         match r.outcome {
                             Ok(result_str) => {
@@ -2314,6 +2361,12 @@ impl AgentRunner {
                                         serde_json::to_string(&result).unwrap_or_default()
                                     ),
                                 });
+                                self.last_turn_tool_summaries.push(format!(
+                                    "{} {} → {}",
+                                    tc.name,
+                                    truncate_tool_summary(&args_json, 160),
+                                    truncate_tool_summary(&result_str, 240),
+                                ));
                                 final_outcome = Ok(result_str);
                                 break;
                             }

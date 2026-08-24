@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, sendCommand, switchRole, cancelTurn, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
@@ -219,6 +219,9 @@ export function mountChat(opts: {
     capturedTools: { tool: string; args: string; result?: string }[];
     /** "⏳ 执行中…" badge on the DelegateStarted bubble. */
     stateEl?: HTMLElement;
+    /** 流程内分派带 wf_id；独立委派为 undefined。终止确认文案据此
+     *  区分「结束整次 workflow」与「只停这一条委派」。 */
+    wfId?: string;
   }
   const activeDelegates = new Map<string, DelegateInfo>();
   let currentDelegateSubId = ""; // most recent delegate (for non-sub_id legacy events)
@@ -1489,6 +1492,13 @@ export function mountChat(opts: {
         // Subagent rows use the dedicated subsession action; all top-level
         // messages, including advisor RoleTurn bubbles, use session history.
         el.style.display = "none";
+      } else if (act === "terminate-subagent") {
+        // 只对**还在跑**的分派显示：activeDelegates 由 DelegateStarted
+        // 装入、DelegateFinished 摘除，所以它就是"这条还活着吗"。
+        // 已结束的分派显示终止项没有意义（点了只会拿到 404）。
+        const liveSubId = row.dataset.subId;
+        el.style.display =
+          liveSubId && activeDelegates.has(liveSubId) ? "" : "none";
       } else if (act === "add-to-board" && !(record?.planTasks && record.planTasks.length > 0)) {
         // 仅 plan 工具产出的消息（带 planTasks）显示「导入任务看板」。
         el.style.display = "none";
@@ -1556,6 +1566,35 @@ export function mountChat(opts: {
         } else {
           alert("查看本次执行日志回调未注册");
         }
+        break;
+      }
+      case "terminate-subagent": {
+        // 只终止这一条分派，同一并行波里的兄弟分派继续跑。
+        // 后端 404（分派刚好跑完）不当错误处理——如实告诉用户。
+        const subId = record.el.dataset.subId;
+        if (!subId) {
+          alert("该消息没有关联的分派");
+          break;
+        }
+        const who = record.meta ? `${record.meta}` : "该分派";
+        // 文案要说实话：流程内分派（带 wf_id）停掉会结束整次 workflow
+        // 运行——下游步骤依赖它的产出，没法接着跑。独立委派才是真的
+        // 只停一条。两种情况都保留 session，且不会被自动重启。
+        const inWorkflow = !!activeDelegates.get(subId)?.wfId;
+        const scope = inWorkflow
+          ? "这会结束本次 workflow 运行（下游步骤依赖它的产出）。已完成的步骤保留在 checkpoint，可稍后手动续跑。"
+          : "只结束这一条委派，其它并行委派继续跑。";
+        if (!confirm(`终止分派「${who}」？\n\n${scope}\n未完成的产出会丢失。`)) {
+          break;
+        }
+        void cancelSubagent(subId).then((ok) => {
+          if (!ok) {
+            addMessage({
+              kind: "system",
+              content: `⏹ 分派「${who}」已经结束了，无需终止。`,
+            });
+          }
+        });
         break;
       }
       case "add-to-board": {
@@ -1652,7 +1691,7 @@ export function mountChat(opts: {
         <strong>${roleIcon(ev.role_id)} ${ev.role_id} 已运行 ${ev.elapsed_secs}s</strong>
       </div>
       <div class="timeout-prompt__body">
-        超过设定的 ${ev.soft_timeout_secs}s 软超时（硬超时将在 ${ev.hard_timeout_secs}s 强制终止）。
+        超过设定的 ${ev.soft_timeout_secs}s 软超时${ev.hard_timeout_secs > 0 ? `（硬超时将在 ${ev.hard_timeout_secs}s 强制终止）` : "（无硬超时，可耐心等待，或手动终止）"}。
         是否继续等待？
       </div>
       <div class="timeout-prompt__actions">
@@ -1946,6 +1985,7 @@ export function mountChat(opts: {
           delegateMsgId: msgId,
           capturedTools: [],
           stateEl,
+          wfId: e.wf_id ?? undefined,
         });
         currentDelegateSubId = e.sub_id;
         subagentTools = [];
@@ -2172,7 +2212,11 @@ export function mountChat(opts: {
             kind: "system",
             content: `🦉 ${e.role_id} 介入：${e.question}`,
           });
-          const bubble = msg.querySelector(".msg-bubble") as HTMLElement | null;
+          // system 行没有 .msg-bubble（addMessage 非 avatar 分支只建
+          // .message.system）——卡片要挂在 .message.system 上，否则
+          // renderAdvisorPausePrompt 永远不执行（e0bd456 起的回归：
+          // ChoiceRequested 事件到了 UI 却不弹选择框）。
+          const bubble = msg.querySelector(".message.system") as HTMLElement | null;
           if (bubble) renderAdvisorPausePrompt(bubble, e);
           showAdvisorPauseBanner();
           setFooter("advisor 已暂停，等待拍板");
@@ -2185,7 +2229,7 @@ export function mountChat(opts: {
           kind: "system",
           content: `❓ ${e.role_id} 请你选择：${e.question}`,
         });
-        const bubble = msg.querySelector(".msg-bubble") as HTMLElement | null;
+        const bubble = msg.querySelector(".message.system") as HTMLElement | null;
         if (bubble) renderChoiceDialog(bubble, e);
         setFooter(`${e.role_id} 等待你的选择`);
         resetWaitTimer();

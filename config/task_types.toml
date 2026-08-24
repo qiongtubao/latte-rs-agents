@@ -30,6 +30,11 @@ color = "#8b5cf6"
 icon = "📚"
 
 [types.research]
+label = "探索调研"
+description = "通读代码/文档，摸清结构与术语，产出决策背景"
+default_workflow = "explore"
+color = "#06b6d4"
+icon = "🔍"
 
 [types.learn_loop]
 label = "交互学习"
@@ -37,11 +42,6 @@ description = "交互式学习循环：知识点拆解→弹窗出题→掌握�
 default_workflow = "learn_loop"
 color = "#a78bfa"
 icon = "🎓"
-label = "探索调研"
-description = "通读代码/文档，摸清结构与术语，产出决策背景"
-default_workflow = "explore"
-color = "#06b6d4"
-icon = "🔍"
 
 [types.docs]
 label = "文档写作"
