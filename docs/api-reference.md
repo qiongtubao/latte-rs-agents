@@ -179,11 +179,38 @@
 
 ### `POST /api/chat/choice-answer`
 
-阻塞中的 ask（`ChoiceRequested.wait=true`，workflow/delegate 子代理正挂起等回答）的答案直达通道：答案经后端 choice 路由直接交给等待的子代理，不另起一轮。
+阻塞中的 ask（`ChoiceRequested.wait=true`，workflow/delegate 子代理正挂起等回答）的答案投递口。
 
 **请求体：** `{ "choice_id": "choice-manager-3", "answer": "方案A" }`
 
-**响应 `200`**（已送达）/ **`404`**（无匹配挂起项：已回答/已超时/服务重启——前端应降级为 `POST /api/chat/send` 回喂）
+两条投递路径：
+
+1. **等待方还活着**（同进程）：答案经 core 的 choice 路由直接交给挂起的 `ask` 工具调用，子代理拿着答案继续干活。
+2. **孤儿**（服务器重启过，等待方随进程消失）：从 `<cwd>/.latte/pending-asks/<choice_id>.json` 读回这次提问属于哪个 run，把答案补写成该 run checkpoint 里的一条 `Answer` 记录，然后触发断点续跑。续跑的 run 跳过已完成的 step，走到同一个 `ask` 时 `AnswerLog::recall` 命中、不再弹框，整个 workflow 继续。
+
+**响应 `200`** —— 已送达（直达等待方，或答案已落 checkpoint + 续跑已拉起）
+**`404`** —— 既没有等待方也没有可恢复的落盘记录（未知 id / checkpoint 已清）：前端应降级为 `POST /api/chat/send` 回喂
+**`500`** —— 答案已落 checkpoint 但续跑起不来（workflow 定义被删等）。**前端不要**把答案当普通消息重发，它已经在 checkpoint 里了
+
+### `GET /api/chat/pending-prompts`
+
+本会话**仍未被用户处理**的弹框事件（阻塞 ask + 非阻塞 ask/plan + 跨进程孤儿 ask），以 SSE 同构的前端事件 JSON 数组返回。
+
+弹框事件比普通事件脆弱：broadcast 是「没订阅者就丢弃」的，`Lagged` 掉的那几条既不进 SSE 也不进 archiver 的 `event_log`（连 `GET /api/session/history` 都没有），长会话里早期的还会被 `MAX_LOG` 挤出去。SSE 只在**新建连接**时补发挂起弹框，而 broadcast lag 时连接还活着；`clear() + replayEvents(history)` 又会把弹框卡片连未提交状态一起抹掉。所以前端每次全量重放之后都要显式拉这一份补齐。
+
+数据来源两处：内存表（`choice::PENDING` / `choice::PROMPTS`，同 id 时内存优先）+ 盘上的 `<cwd>/.latte/pending-asks/`（服务器重启后内存全空，孤儿 ask 只在这里；它们**可答**，见上面的 `choice-answer`）。已答过的（问题在 checkpoint 里有 `Answer` 行）、checkpoint 已清的、超过 7 天的都不再返回。
+
+**查询参数：** `id`（session_id，必填）
+
+**响应 `200`**：`[{ "type": "ChoiceRequested", ... }, { "type": "PlanProposed", ... }]`
+
+### `POST /api/chat/prompt-dismiss`
+
+用户已处理某个**非阻塞**弹框（提交了选择 / 跳过）→ 从补发表销账，避免重连时弹出僵尸框。阻塞 ask 由 `choice-answer` 自动销账；plan 清单由 `POST /api/tasks/import` 带 `plan_id` 自动销账。
+
+**请求体：** `{ "prompt_id": "choice-programmer-2" }`（ask 用 `choice_id`，plan 用 `plan_id`）
+
+**响应 `200`**（幂等：未命中也回 200）
 
 ### `POST /api/chat/command`
 

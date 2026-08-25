@@ -1116,6 +1116,17 @@ pub struct CheckpointState {
     answers: std::collections::HashMap<String, String>,
 }
 
+impl CheckpointState {
+    /// 这个问题在本 checkpoint 里是否已有答案。
+    ///
+    /// 挂起 ask 的落盘记录用它做"已答"判定：一旦答案进了 checkpoint
+    /// （无论是活着的 run 记的，还是重启后补写的），那条挂起记录就该
+    /// 被当作已处理，不能再补发成弹框（否则用户重复回答同一题）。
+    pub fn has_answer(&self, question: &str) -> bool {
+        self.answers.contains_key(question.trim())
+    }
+}
+
 /// Load and validate a checkpoint file for resume. `wf_id` comes from
 /// tool input, so reject anything that isn't a plain file name.
 pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, String> {
@@ -1173,9 +1184,18 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
 ///
 /// 回放按**问题原文**（trim 后）匹配。模型换了措辞就不算命中，会正常
 /// 重新问用户——宁可多问一次，也不要把答案对错问题。
+///
+/// 它同时是 run 的**恢复身份**载体：`cwd + wf_id + session_id` 是
+/// `ask` 工具那一层唯一能拿到的三元组（`AskBlocking` 里没有 session_id
+/// / wf_id，而 `build_role_runner` 也不接这两个参数）。挂起的阻塞 ask
+/// 要落盘成一条可跨进程恢复的记录（见 [`crate::pending_ask`]），靠的
+/// 就是从这里读出来的身份。
 pub struct AnswerLog {
     cwd: PathBuf,
     wf_id: String,
+    /// 本 run 所属的 UI session（`WorkflowRunContext.session_id`）。
+    /// CLI / 独立测试为 None —— 没有 session 就无从续跑。
+    session_id: Option<String>,
     seen: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
@@ -1183,13 +1203,30 @@ impl AnswerLog {
     pub(crate) fn new(
         cwd: &Path,
         wf_id: &str,
+        session_id: Option<String>,
         preloaded: std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             wf_id: wf_id.to_string(),
+            session_id,
             seen: std::sync::Mutex::new(preloaded),
         }
+    }
+
+    /// run 的工作目录（checkpoint / 挂起 ask 记录都落在它下面的 `.latte/`）。
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// 本 run 的 checkpoint id。
+    pub fn wf_id(&self) -> &str {
+        &self.wf_id
+    }
+
+    /// 本 run 所属的 UI session（None = CLI / 独立测试）。
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// 本 run（含 resume 继承）里这个问题是否已经有答案。
@@ -1222,6 +1259,31 @@ impl AnswerLog {
             },
         );
     }
+}
+
+/// 把一条用户回答直接写进某个 run 的 checkpoint，**不需要该 run 还活着**。
+///
+/// 为「服务器重启后回答孤儿 ask 弹框」而存在：重启把等待方（oneshot
+/// 通道 + workflow future + 整个 runner）全带走了，答案没有活着的接收
+/// 方可投。但 resume 的地基本来就是"从 checkpoint 预载已答问题"——
+/// 所以把答案补写成一条 `Answer` 行，再触发
+/// `POST /api/workflows/resume`，续跑的 run 走到同一个 `ask` 时
+/// [`AnswerLog::recall`] 直接命中，不再弹框，流水线自然往下走。
+///
+/// 与 [`AnswerLog::record`] 写的是同一种记录，区别只是这里不持有内存
+/// 表（本进程里没有在跑的 run 需要回放）。
+pub fn record_answer_for_run(cwd: &Path, wf_id: &str, role: &str, question: &str, answer: &str) {
+    append_checkpoint(
+        cwd,
+        wf_id,
+        &CheckpointRecord::Answer {
+            wf_id: wf_id.to_string(),
+            role: role.to_string(),
+            question: question.trim().to_string(),
+            answer: answer.to_string(),
+            answered_at: now_secs(),
+        },
+    );
 }
 
 /// Per-run checkpoint writer shared by both engines. Bundles the file
@@ -1455,6 +1517,27 @@ async fn run_workflow_inner(
                 },
             );
         }
+        // 用户回答同理必须抄过来。此前只抄了 Step 行：答案仅被预载进
+        // 新 run 的**内存** AnswerLog，新 checkpoint 文件里一条
+        // `Answer` 都没有。于是第二次中断（再重启 / 再 resume）时，
+        // load_checkpoint 读新 wf_id 拿到空 answers，用户已经答过的题
+        // 被整批重问一遍 —— 用户的回答是不可再生资源，不能因为续跑了
+        // 一次就作废。
+        for (question, answer) in &state.answers {
+            append_checkpoint(
+                &ctx.cwd,
+                &wf_id,
+                &CheckpointRecord::Answer {
+                    wf_id: wf_id.clone(),
+                    // 原记录的 role 不进 CheckpointState（recall 不按 role
+                    // 匹配），抄写时标注来源即可。
+                    role: "(resumed)".to_string(),
+                    question: question.clone(),
+                    answer: answer.clone(),
+                    answered_at: now_secs(),
+                },
+            );
+        }
         let _ = ctx.event_tx.send(ChatEvent::Status {
             message: format!(
                 "workflow '{name}' 从断点续跑（checkpoint {}）：跳过已完成的 {} 步",
@@ -1498,10 +1581,13 @@ async fn run_workflow_inner(
         Budget::Auto => 0,
     };
     // 用户回答台账：resume 时预载上一次运行已答过的问题，同一个问题
-    // 不再弹给用户（见 AnswerLog）。
+    // 不再弹给用户（见 AnswerLog）。同时带上本 run 的恢复身份
+    // （cwd + wf_id + session_id）—— 阻塞 ask 靠它把挂起项落盘，
+    // 服务器重启后用户回答能驱动断点续跑。
     let answer_log = Arc::new(AnswerLog::new(
         &ctx.cwd,
         &wf_id,
+        ctx.session_id.clone(),
         resume
             .as_ref()
             .map(|s| s.answers.clone())
@@ -5964,7 +6050,7 @@ max_iterations = 3
         let cwd = dir.path();
         // checkpoint 需要 meta 行才能被 load_checkpoint 接受。
         let ckpt = CheckpointLog::new(cwd, "wf-ans-1", "design_and_plan", "主题", 0);
-        let log = AnswerLog::new(cwd, "wf-ans-1", Default::default());
+        let log = AnswerLog::new(cwd, "wf-ans-1", None, Default::default());
 
         assert_eq!(log.recall("第 1 题：你的目标？"), None);
         log.record("tutor", "第 1 题：你的目标？", "改源码/做实现");
@@ -5999,13 +6085,82 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-ans-2", "design_and_plan", "主题", 0);
-        AnswerLog::new(cwd, "wf-ans-2", Default::default())
+        AnswerLog::new(cwd, "wf-ans-2", None, Default::default())
             .record("tutor", "时间预算？", "10h+");
 
         let state = load_checkpoint(cwd, "wf-ans-2").expect("checkpoint");
         // 新 run（新 wf_id）用上一次的回答预载。
-        let resumed = AnswerLog::new(cwd, "wf-ans-3", state.answers.clone());
+        let resumed = AnswerLog::new(cwd, "wf-ans-3", None, state.answers.clone());
         assert_eq!(resumed.recall("时间预算？").as_deref(), Some("10h+"));
+    }
+
+    /// **第二次**中断也不能让用户重答：resume 必须把 `Answer` 行抄进新
+    /// 的 checkpoint 文件，不能只预载进内存。
+    ///
+    /// 此前只抄了 `Step` 行，答案仅活在新 run 的内存 AnswerLog 里。于是
+    /// 「答题 → 崩 → 续跑 → 再崩 → 再续跑」时，第二次 load_checkpoint 读
+    /// 新 wf_id 拿到空 answers，整批题重问一遍。用户的回答是不可再生
+    /// 资源，续跑一次就作废是不可接受的。
+    #[test]
+    fn resume_carries_answers_into_new_checkpoint_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _ckpt = CheckpointLog::new(cwd, "wf-carry-1", "design_and_plan", "主题", 0);
+        AnswerLog::new(cwd, "wf-carry-1", None, Default::default())
+            .record("tutor", "时间预算？", "10h+");
+        let first = load_checkpoint(cwd, "wf-carry-1").expect("第一份 checkpoint");
+
+        // 模拟 run_workflow_inner 的 resume 抄写块（Step + Answer）。
+        let _ckpt2 = CheckpointLog::new(cwd, "wf-carry-2", "design_and_plan", "主题", 0);
+        for (question, answer) in &first.answers {
+            append_checkpoint(
+                cwd,
+                "wf-carry-2",
+                &CheckpointRecord::Answer {
+                    wf_id: "wf-carry-2".to_string(),
+                    role: "(resumed)".to_string(),
+                    question: question.clone(),
+                    answer: answer.clone(),
+                    answered_at: now_secs(),
+                },
+            );
+        }
+
+        // 第二次中断后只认新 wf_id —— 答案必须还在盘上。
+        let second = load_checkpoint(cwd, "wf-carry-2").expect("第二份 checkpoint");
+        assert!(
+            second.has_answer("时间预算？"),
+            "resume 后的 checkpoint 必须自带上一次的回答，否则第二次续跑会重问"
+        );
+        assert_eq!(
+            AnswerLog::new(cwd, "wf-carry-3", None, second.answers.clone())
+                .recall("时间预算？")
+                .as_deref(),
+            Some("10h+")
+        );
+    }
+
+    /// `record_answer_for_run`（重启后补写孤儿 ask 的答案）写出来的记录
+    /// 必须与活着的 run 记的完全等价 —— 否则续跑时 recall 匹配不上，
+    /// 用户白答一次、题目又弹一遍。
+    #[test]
+    fn record_answer_for_run_is_recallable_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _ckpt = CheckpointLog::new(cwd, "wf-orphan-1", "design_and_plan", "主题", 0);
+        // 没有活着的 AnswerLog（进程重启后就是这个状态）。
+        record_answer_for_run(cwd, "wf-orphan-1", "tutor", "  选哪个？  ", "方案A");
+
+        let state = load_checkpoint(cwd, "wf-orphan-1").expect("checkpoint");
+        // 匹配键是 trim 后的问题原文，与 AnswerLog::record 一致。
+        assert!(state.has_answer("选哪个？"));
+        assert_eq!(
+            AnswerLog::new(cwd, "wf-orphan-2", None, state.answers.clone())
+                .recall("选哪个？")
+                .as_deref(),
+            Some("方案A"),
+            "续跑的 run 必须 recall 命中，才不会再弹同一个框"
+        );
     }
 
     /// 同一问题重复 record 取最后一次（用户改了主意的场景）。
@@ -6014,7 +6169,7 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-ans-4", "wf", "t", 0);
-        let log = AnswerLog::new(cwd, "wf-ans-4", Default::default());
+        let log = AnswerLog::new(cwd, "wf-ans-4", None, Default::default());
         log.record("tutor", "选哪个？", "A");
         log.record("tutor", "选哪个？", "B");
         assert_eq!(log.recall("选哪个？").as_deref(), Some("B"));

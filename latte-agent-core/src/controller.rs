@@ -1834,8 +1834,8 @@ async fn run_multi_role_loop(
         // Plain text = manager input
         {
             // plan 阶段门复位：新的用户消息 = 新的决策周期，上一轮
-            // 未批准的 plan 不再约束 delegate。
-            *plan_stage.write() = PlanStage::Normal;
+            // 未批准的 plan 不再约束 delegate（同时销账它的弹窗补发）。
+            reset_plan_stage(&plan_stage);
             let mut mgr = session_arc.lock().await;
             mgr.append_to_role(
                 "manager",
@@ -2405,8 +2405,9 @@ async fn run_single_role_loop(
 
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
                         // plan 阶段门复位：新的用户消息 = 新的决策周期，
-                        // 上一轮未批准的 plan 不再约束 delegate。
-                        *plan_stage.write() = PlanStage::Normal;
+                        // 上一轮未批准的 plan 不再约束 delegate
+                        //（同时销账它的弹窗补发）。
+                        reset_plan_stage(&plan_stage);
                         let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
                             role_id: current_role.clone(),
@@ -3182,6 +3183,20 @@ fn next_plan_id(role_id: &str) -> String {
     )
 }
 
+/// plan 阶段门复位为 [`PlanStage::Normal`]，并把上一轮未批准的 plan
+/// 弹窗从补发表销账。
+///
+/// 复位的语义是"新的用户消息 = 新的决策周期，上一份清单不再约束
+/// delegate"。既然它已经不作数了，就不该在下次重连时又被补发弹一遍
+/// （消息气泡上的「📥 导入任务看板」按钮和右键补救仍在，用户想导入
+/// 随时能开）。
+fn reset_plan_stage(plan_stage: &SharedPlanStage) {
+    let prev = std::mem::replace(&mut *plan_stage.write(), PlanStage::Normal);
+    if let PlanStage::PendingApproval { plan_id } = prev {
+        crate::choice::dismiss_prompt(&plan_id);
+    }
+}
+
 /// 从 workflow 产出文本里提取任务看板清单：找第一个内容为
 /// `{"tasks": [...]}` 的 ```json 代码块，逐项按 [`PlanTask`] 解析校验。
 /// 找不到/解析失败/空清单都返回 None（不提案）。
@@ -3233,11 +3248,15 @@ pub(crate) fn propose_plan_from_summary(
     *plan_stage.write() = PlanStage::PendingApproval {
         plan_id: plan_id.clone(),
     };
-    let _ = event_tx.send(ChatEvent::PlanProposed {
+    let proposed = ChatEvent::PlanProposed {
         role_id: role_id.to_string(),
-        plan_id,
+        plan_id: plan_id.clone(),
         tasks,
-    });
+    };
+    // 未处理快照（同 `plan` 工具）：没订阅者/broadcast 落后时弹窗不丢，
+    // 导入成功后由 `POST /api/tasks/import` 按 plan_id 销账。
+    crate::choice::register_prompt(&plan_id, proposed.clone(), event_tx.clone());
+    let _ = event_tx.send(proposed);
     true
 }
 
@@ -3415,11 +3434,17 @@ pub(crate) fn register_plan_tool(
 
             let plan_id = next_plan_id(&role_id);
             let n = tasks.len();
-            let _ = event_tx.send(ChatEvent::PlanProposed {
+            let proposed = ChatEvent::PlanProposed {
                 role_id: role_id.clone(),
                 plan_id: plan_id.clone(),
                 tasks,
-            });
+            };
+            // 未处理快照：plan 弹窗是这份清单的唯一入口，broadcast 丢
+            // 一次（无订阅者 / Lagged）就等于清单永久卡在
+            // PendingApproval——delegate 被门禁挡着，用户却没有弹窗可
+            // 导入。导入成功时 `POST /api/tasks/import` 按 plan_id 销账。
+            crate::choice::register_prompt(&plan_id, proposed.clone(), event_tx.clone());
+            let _ = event_tx.send(proposed);
             // plan 阶段门：任务清单已提交，等用户在弹窗导入任务看板；
             // 批准前 delegate 实现类角色会被工具层拒绝。
             *plan_stage.write() = PlanStage::PendingApproval {
@@ -3475,6 +3500,19 @@ pub fn default_ask_timeout() -> std::time::Duration {
     match raw.and_then(|s| s.parse::<u64>().ok()) {
         Some(n) if n > 0 => std::time::Duration::from_secs(n),
         _ => std::time::Duration::from_secs(600),
+    }
+}
+
+/// 删掉这次 ask 的跨进程落盘记录（见 [`crate::pending_ask`]）。
+///
+/// 只在**答案已进 checkpoint**或**用户主动取消**时调用。刻意**不**放进
+/// `ChoiceGuard::drop`：future 因进程退出而被 drop 时删掉记录，正好把
+/// 唯一能救回这次提问的凭据毁掉。
+fn clear_persisted_ask(answer_log: Option<&crate::workflow::AnswerLog>, choice_id: &str) {
+    if let Some(log) = answer_log {
+        if log.session_id().is_some() {
+            crate::pending_ask::remove(log.cwd(), choice_id);
+        }
     }
 }
 
@@ -3646,6 +3684,15 @@ pub(crate) fn register_ask_tool(
             };
             let Some(blk) = blocking else {
                 // fire-and-forget：没有等待方，直接推给前端即可。
+                //
+                // 但"推出去"不等于"到得了"：broadcast 没订阅者就丢弃，
+                // 且 Lagged 掉的那几条既进不了 SSE 也进不了 archiver 的
+                // event_log（连历史里都没有）。先登记一份未处理快照，
+                // 让新连接 / 显式补拉把它重新弹出来；用户提交或跳过时
+                // 前端调 `POST /api/chat/prompt-dismiss` 销账。
+                // 登记必须早于广播：反序时用户秒答的 dismiss 会先落地，
+                // 随后登记的快照成为僵尸，下次重连又弹一遍。
+                crate::choice::register_prompt(&choice_id, requested.clone(), event_tx.clone());
                 let _ = event_tx.send(requested);
                 return Ok(serde_json::Value::String(format!(
                     "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
@@ -3666,6 +3713,33 @@ pub(crate) fn register_ask_tool(
             // 的，发的这一刻用户可能没开着这个 session 的 SSE。新连接
             // 会经 `choice::pending_for_channel` 把它补发一遍。
             let rx = crate::choice::register(&choice_id, requested.clone(), event_tx.clone());
+            // 跨进程落盘：内存表只能救"弹框事件丢了"，救不了"进程没了"。
+            // 服务器一重启，这个 oneshot、正 park 的 workflow future、
+            // 整个 runner 一起消失，答案再也没有接收方 —— 那一步永远不
+            // 会继续。落一条 (session_id, wf_id, question) 记录，重启后
+            // 用户回答就能补写进 checkpoint 并触发断点续跑
+            // （见 crate::pending_ask）。只有 workflow run 的 ask 有
+            // 这三元组；顶层 turn / CLI / 测试没有，跳过。
+            if let Some(log) = blk.answer_log.as_ref() {
+                if let Some(sid) = log.session_id() {
+                    match crate::event_json::chat_event_to_frontend_json(&requested) {
+                        Ok(json) => crate::pending_ask::persist(
+                            log.cwd(),
+                            &choice_id,
+                            sid,
+                            log.wf_id(),
+                            &role_id,
+                            &question,
+                            &json,
+                        ),
+                        Err(e) => tracing::warn!(
+                            choice_id = %choice_id,
+                            error = %e,
+                            "挂起 ask 快照序列化失败，跳过落盘（本进程内仍可回答）"
+                        ),
+                    }
+                }
+            }
             // 等待 future 被 drop（外层超时熔断 / workflow 中止）时自动
             // 清理 PENDING，防泄漏——否则 has_any_pending 永远为真，
             // advisor 被永久静音。
@@ -3699,6 +3773,11 @@ pub(crate) fn register_ask_tool(
                     a = &mut rx => break a.ok(),
                     _ = &mut cancel_watch => {
                         crate::choice::cancel(&choice_id);
+                        // 用户主动掐了这一轮 —— 这是有意的放弃，落盘
+                        // 记录也该走，否则重启后又弹一遍一个已被放弃的
+                        // 问题。（进程被 kill 时 Drop 根本不跑，记录留在
+                        // 盘上，这正是孤儿恢复要的。）
+                        clear_persisted_ask(blk.answer_log.as_deref(), &choice_id);
                         return Err(tool_err(format!(
                             "等待用户回答期间 turn 被取消（choice_id={choice_id}）"
                         )));
@@ -3714,6 +3793,10 @@ pub(crate) fn register_ask_tool(
                     if let Some(log) = &blk.answer_log {
                         log.record(&blk.role_id, &question, &answer);
                     }
+                    // 答案已进 checkpoint → 挂起记录销账。
+                    // 顺序要紧：先 record 再删。反过来的话，两步之间崩溃
+                    // 会让答案和挂起记录一起消失，用户白答一次。
+                    clear_persisted_ask(blk.answer_log.as_deref(), &choice_id);
                     Ok(serde_json::Value::String(format!(
                     "用户已回答你的问题「{question}」，选择：{answer}。请据此继续完成任务，不要重复提问同一个问题。"
                     )))
@@ -6056,6 +6139,7 @@ mod tests {
         let log = std::sync::Arc::new(crate::workflow::AnswerLog::new(
             dir.path(),
             "wf-replay-1",
+            None,
             Default::default(),
         ));
         let tm = build_tool_manager(&[]).await.expect("tool manager");

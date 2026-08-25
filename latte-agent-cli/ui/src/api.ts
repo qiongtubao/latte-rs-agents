@@ -424,6 +424,26 @@ export async function sendChoiceAnswer(choiceId: string, answer: string): Promis
   }
 }
 
+/** GET /api/chat/pending-prompts —— 本 session 仍未被用户处理的弹框
+ *  事件（阻塞 ask + 非阻塞 ask/plan），以普通 ChatEvent 形式返回。
+ *
+ *  为什么 history 不够：SSE 只在**新建连接**时补发挂起弹框，而
+ *  `clear() + replayEvents(history)` 会把弹框卡片连未提交状态一起抹
+ *  掉；broadcast lag（连接没断）与被 MAX_LOG 挤出去的早期事件更是
+ *  history 里都没有。所以每次重放之后都要显式补这一份。 */
+export async function getPendingPrompts(sessionId: string): Promise<ChatEvent[]> {
+  return getTransport().request(
+    "GET",
+    `/api/chat/pending-prompts?id=${encodeURIComponent(sessionId)}`,
+  );
+}
+
+/** POST /api/chat/prompt-dismiss —— 用户已处理某个非阻塞弹框（提交
+ *  选择 / 跳过 / 导入清单），销账后重连不再补发僵尸框。幂等。 */
+export async function dismissPrompt(promptId: string): Promise<void> {
+  await getTransport().requestText("POST", "/api/chat/prompt-dismiss", { prompt_id: promptId });
+}
+
 export async function sendCommand(command: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/command", chatBody({ command }));
 }

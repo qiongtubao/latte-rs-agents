@@ -470,6 +470,10 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/chat/send", post(chat_send))
         .route("/chat/choice-answer", post(chat_choice_answer))
+        // 弹框补齐：显式查「仍未处理的弹框」+ 处理后销账。SSE 只在
+        // 新建连接时补发，broadcast lag / history 重放后需要这条路径。
+        .route("/chat/pending-prompts", get(chat_pending_prompts))
+        .route("/chat/prompt-dismiss", post(chat_prompt_dismiss))
         .route("/chat/command", post(chat_command))
         .route("/chat/role", post(switch_role))
         .route("/chat/cancel-turn", post(chat_cancel_turn))
@@ -875,6 +879,159 @@ mod tests {
             .expect("delete");
         assert!(crate::api::list_sessions(&backend_b).is_empty());
         assert!(!file.exists(), "delete 后落盘文件应删除");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// 服务器重启后回答阻塞 ask：答案必须补写进该 run 的 checkpoint，
+    /// 并触发断点续跑，让整个 session 继续往下走。
+    ///
+    /// 重启把等待方（oneshot + workflow future + runner）全带走了，
+    /// `choice::resolve` 必然失败。恢复靠的是 `.latte/pending-asks/`
+    /// 里的落盘记录 + `.latte/workflow-runs/<wf_id>.jsonl`：答案补写成
+    /// 一条 `Answer` 行，续跑的 run 走到同一个 ask 时 `recall` 命中，
+    /// 不再弹框。
+    ///
+    /// 这里不跑真 workflow（要模型），只锁死**恢复契约**：
+    ///   1. 孤儿弹框会被 pending-prompts 补出来（重启后仍可答）；
+    ///   2. 回答**先**落 checkpoint **再**尝试续跑 —— 即便续跑起不来
+    ///      （workflow 定义没了），答案也不丢，绝不能回 404 让前端把它
+    ///      当普通消息重发；
+    ///   3. 答案进了 checkpoint 后同一题不再补发（不让人重答）。
+    #[tokio::test]
+    async fn restart_orphan_ask_answer_lands_in_checkpoint_and_drives_resume() {
+        use latte_agent_core::config::{AgentConfig, ModelCatalog, ModelDef};
+        use latte_agent_core::role::RoleTemplate;
+
+        let ws = std::env::temp_dir().join(format!(
+            "ui-server-orphan-ask-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+        let make_backend = || {
+            let agent_config = AgentConfig {
+                advisor: Default::default(),
+                models: ModelCatalog {
+                    models: vec![ModelDef {
+                        name: "dead-model".into(),
+                        api: "openai".into(),
+                        provider: "test".into(),
+                        base_url: "http://127.0.0.1:1".into(),
+                        api_key: "k".into(),
+                        context_window: 32000,
+                        max_tokens: 4096,
+                        supports_thinking: false,
+                        supports_vision: false,
+                        supports_image_generation: false,
+                        cost_per_million_input: None,
+                        cost_per_million_output: None,
+                        tier: Some("standard".into()),
+                        timeout_secs: Some(2),
+                    }],
+                    tiers: None,
+                    role_tiers: None,
+                },
+                roles: [(
+                    "manager".to_string(),
+                    RoleTemplate {
+                        id: "manager".into(),
+                        name: "Manager".into(),
+                        category: "planning".into(),
+                        model_tier: "standard".into(),
+                        model_chain: vec![],
+                        prompt_file: None,
+                        temperature: None,
+                        tools: vec![],
+                        icon: "[m]".into(),
+                        skills: vec![],
+                        code_paths: vec![],
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            };
+            let resolver = ModelResolver::from_config(&agent_config).expect("resolver");
+            UiBackend::new(UiBackendConfig {
+                agent_config,
+                model_resolver: resolver,
+                role: None,
+                tier: None,
+                model_id: None,
+                cwd: Some(ws.clone()),
+                agents_config: ".latte/agents.d".into(),
+            })
+        };
+
+        let backend = make_backend().expect("backend");
+        let sid = crate::api::create_session(&backend)
+            .await
+            .expect("create session")
+            .session_id;
+
+        // ── 造出"重启后"的盘上状态 ──
+        // 1) 一个 run 的 checkpoint（meta 行足够被 load_checkpoint 接受）。
+        let wf_id = "wf-orphan-restart-1";
+        let runs = ws.join(".latte").join("workflow-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let meta = serde_json::json!({
+            "type": "meta", "wf_id": wf_id,
+            "workflow_name": "design_and_plan", "topic": "主题", "started_at": 1,
+        });
+        std::fs::write(runs.join(format!("{wf_id}.jsonl")), format!("{meta}\n")).unwrap();
+        // 2) 一条挂起的阻塞 ask 记录（进程被 kill 时留在盘上的那份）。
+        let choice_id = "choice-tutor-0";
+        let question = "先重构还是先加功能？";
+        let event_json = serde_json::json!({
+            "type": "ChoiceRequested", "role_id": "tutor", "choice_id": choice_id,
+            "question": question, "multi": false, "layout": "",
+            "allow_upload": false, "wait": true,
+            "options": [{"label": "先重构"}, {"label": "先加功能"}],
+        })
+        .to_string();
+        latte_agent_core::pending_ask::persist(
+            &ws, choice_id, &sid, wf_id, "tutor", question, &event_json,
+        );
+
+        // ① 孤儿弹框必须被补出来 —— 否则重启后用户连"可答"的入口都没有。
+        let pending = crate::api::pending_dialog_events_json(&backend, &sid)
+            .await
+            .expect("pending prompts");
+        assert!(
+            pending.iter().any(|v| v["choice_id"] == choice_id && v["wait"] == true),
+            "重启后挂起的阻塞 ask 必须出现在 pending-prompts 里: {pending:?}"
+        );
+
+        // ② 回答：等待方早已不存在（choice::resolve 必失败）。
+        // workflow 定义 design_and_plan 在这个空 ws 里找不到 → 续跑起不来，
+        // 但答案必须已经落进 checkpoint，且**不能**回 NotFound。
+        let outcome =
+            crate::api::deliver_choice_answer(&backend, choice_id, "先重构".to_string()).await;
+        assert!(
+            matches!(
+                outcome,
+                crate::api::ChoiceAnswerOutcome::ResumeFailed(_)
+                    | crate::api::ChoiceAnswerOutcome::DeliveredViaResume
+            ),
+            "孤儿 ask 的回答不能被当成 NotFound（那会让前端把它当普通消息重发）"
+        );
+        let state = latte_agent_core::workflow::load_checkpoint(&ws, wf_id).expect("checkpoint");
+        assert!(
+            state.has_answer(question),
+            "答案必须先落进 checkpoint 再尝试续跑，否则续跑失败就等于白答"
+        );
+
+        // ③ 已答过的题不再补发（不让用户重答）。
+        let pending2 = crate::api::pending_dialog_events_json(&backend, &sid)
+            .await
+            .expect("pending prompts 2");
+        assert!(
+            !pending2.iter().any(|v| v["choice_id"] == choice_id),
+            "答案已在 checkpoint 里，这道题不该再弹: {pending2:?}"
+        );
+        // 落盘记录也应销账。
+        assert!(latte_agent_core::pending_ask::load(&ws, choice_id).is_none());
+
         let _ = std::fs::remove_dir_all(&ws);
     }
 

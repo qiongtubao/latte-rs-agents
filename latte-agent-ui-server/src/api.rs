@@ -354,6 +354,12 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
     let removed = b.sessions.write().remove(id);
     match removed {
         Some(h) => {
+            // session 没了，它的未处理弹框快照也该走：PROMPTS 是进程级
+            // 全局表，不清就随进程生命周期泄漏。要在 abort 之前取
+            // sender（abort 后 controller 可能已不可用）。
+            if let Some(c) = h.try_controller() {
+                latte_agent_core::choice::clear_prompts_for_channel(&c.event_sender());
+            }
             h.abort_if_spawned().await;
             h.delete_files();
             // 联删 subagent 落盘文件（与主 session 文件同生命周期）：
@@ -398,16 +404,24 @@ pub async fn subscribe_session(
     Ok(controller.subscribe())
 }
 
-/// 订阅时要补发的「仍在等用户回答」的弹框事件（阻塞 ask）。
+/// 订阅时要补发的「仍未被用户处理」的弹框事件。
 ///
-/// broadcast 没有回放：`ChoiceRequested` 发出的那一刻若本 session 没有
-/// SSE 订阅者（用户切到别的 session、关了 tab、EventSource 正在重连），
-/// 这个弹框就再也不会出现，而阻塞的 ask 会无限等下去。取消超时兜底后
-/// 这等于会话永久卡死，所以新连接必须把挂起的弹框补一遍。
+/// broadcast 没有回放：弹框发出的那一刻若本 session 没有 SSE 订阅者
+/// （用户切到别的 session、关了 tab、EventSource 正在重连），或
+/// broadcast 落后（`Lagged` 掉的那几条既不进这条 SSE、也不进 archiver
+/// 的 event_log，连历史里都没有），这个弹框就再也不会出现。对阻塞
+/// ask 来说等于会话永久卡死；对 plan 弹窗来说等于任务清单卡在
+/// PendingApproval 而用户没有入口导入。所以新连接必须补一遍。
+///
+/// 两类都补：
+/// - 阻塞 ask（`choice::PENDING`，有等待方，答完即销账）；
+/// - 非阻塞弹框（`choice::PROMPTS`：fire-and-forget ask、
+///   `PlanProposed`），由前端提交/跳过（`prompt-dismiss`）或任务导入
+///   （带 plan_id）销账。
 ///
 /// 只补发**属于本 session 事件通道**的挂起项（`same_channel` 判归属），
-/// 不会把别的会话的问题弹到这里。已回答/已取消的不在 PENDING 里，
-/// 因此不会补出僵尸弹框。
+/// 不会把别的会话的问题弹到这里。已处理的不在表里，因此不会补出僵尸
+/// 弹框。
 ///
 /// 走 SSE 流的私有前缀而不是 `event_sender().send()` 重播：重播会被
 /// archiver 再归档一次，history 里出现重复弹框。
@@ -420,9 +434,131 @@ pub async fn pending_choice_events(
     let Some(controller) = h.try_controller() else {
         return Ok(vec![]);
     };
-    Ok(latte_agent_core::choice::pending_for_channel(
+    Ok(latte_agent_core::choice::pending_dialogs_for_channel(
         &controller.event_sender(),
     ))
+}
+
+/// 本 session 需要补发的弹框事件（前端事件 JSON），**含跨进程孤儿**。
+///
+/// 与 [`pending_choice_events`] 的区别：那个只看内存表，进程一重启就
+/// 是空的。这里还会读 `<cwd>/.latte/pending-asks/` 里落盘的挂起阻塞
+/// ask（[`latte_agent_core::pending_ask`]）—— 重启后弹框能重新弹出来
+/// 且**真的可答**，靠的就是这一份。
+///
+/// 内存项优先：同一个 `choice_id` 既在内存又在盘上时（正常运行中的
+/// run），只发内存那份，避免同一问题渲染两次。
+pub async fn pending_dialog_events_json(
+    b: &UiBackend,
+    id: &str,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let live = pending_choice_events(b, id).await.unwrap_or_default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for ev in &live {
+        if let ChatEvent::ChoiceRequested { choice_id, .. } = ev {
+            seen.insert(choice_id.clone());
+        }
+        if let Ok(json) = latte_agent_core::event_json::chat_event_to_frontend_json(ev) {
+            if let Ok(v) = serde_json::from_str(&json) {
+                out.push(v);
+            }
+        }
+    }
+    for rec in latte_agent_core::pending_ask::load_for_session(&b.cwd, id) {
+        if seen.contains(&rec.choice_id) {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&rec.event_json) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// [`deliver_choice_answer`] 的结果。
+pub enum ChoiceAnswerOutcome {
+    /// 直达活着的等待方。
+    DeliveredLive,
+    /// 答案已落进 checkpoint 并触发断点续跑。
+    DeliveredViaResume,
+    /// 没有等待方也没有可恢复的落盘记录 → 前端降级成普通消息。
+    NotFound,
+    /// 记录有效但续跑起不来（workflow 定义没了等）。
+    ResumeFailed(ApiError),
+}
+
+/// 投递一个阻塞 ask 的答案。
+///
+/// 两条路：
+/// 1. **等待方还活着**（同进程）：`choice::resolve` 直接把答案交给挂起
+///    的工具调用，子代理拿着答案继续干活。
+/// 2. **孤儿**（服务器重启过，等待方随进程消失）：把答案补写成该 run
+///    checkpoint 里的一条 `Answer` 行，然后从断点续跑。续跑的 run 跳过
+///    已完成的 step，走到同一个 `ask` 时 `AnswerLog::recall` 命中，
+///    不再弹框，整个 workflow 继续往下走。
+///
+/// 两条都不通才算未送达（未知 id / checkpoint 已清），由调用方回 404
+/// 让前端降级成普通消息。
+pub async fn deliver_choice_answer(
+    b: &UiBackend,
+    choice_id: &str,
+    answer: String,
+) -> ChoiceAnswerOutcome {
+    // 无论走哪条路，非阻塞补发表里的同 id 快照都该销账。
+    latte_agent_core::choice::dismiss_prompt(choice_id);
+    if latte_agent_core::choice::resolve(choice_id, answer.clone()) {
+        return ChoiceAnswerOutcome::DeliveredLive;
+    }
+    let Some(rec) = latte_agent_core::pending_ask::load(&b.cwd, choice_id) else {
+        return ChoiceAnswerOutcome::NotFound;
+    };
+    match latte_agent_core::workflow::load_checkpoint(&b.cwd, &rec.wf_id) {
+        // 落盘记录还在但问题已经有答案 = 重复提交（多 tab / 重复点击）。
+        // 当成已送达，不触发第二次续跑。
+        Ok(state) if state.has_answer(&rec.question) => {
+            latte_agent_core::pending_ask::remove(&b.cwd, choice_id);
+            return ChoiceAnswerOutcome::DeliveredLive;
+        }
+        Ok(_) => {}
+        // checkpoint 没了，续跑无从下手。
+        Err(_) => {
+            latte_agent_core::pending_ask::remove(&b.cwd, choice_id);
+            return ChoiceAnswerOutcome::NotFound;
+        }
+    }
+    // 先写答案再删记录：反过来的话，两步之间崩溃会让答案和凭据一起没。
+    latte_agent_core::workflow::record_answer_for_run(
+        &b.cwd,
+        &rec.wf_id,
+        &rec.role_id,
+        &rec.question,
+        &answer,
+    );
+    latte_agent_core::pending_ask::remove(&b.cwd, choice_id);
+    // 让用户看到"答案收到了、正在续跑"，而不是点完一片安静。
+    if let Ok(tx) = session_event_sender(b, &rec.session_id).await {
+        let _ = tx.send(ChatEvent::Status {
+            message: format!(
+                "↩ 收到你对「{}」的回答：{answer} —— 原提问方已随服务重启消失，正从断点续跑该 workflow",
+                rec.question.chars().take(40).collect::<String>()
+            ),
+        });
+    }
+    match spawn_workflow_resume(b, &rec.session_id, Some(rec.wf_id.clone()), None).await {
+        Ok(_) => ChoiceAnswerOutcome::DeliveredViaResume,
+        // 409 = 这个 session 已经有 workflow 在跑。答案已经落进
+        // checkpoint，那个 run（或它的下一次 resume）会读到，算送达。
+        Err(e) if e.status == 409 => ChoiceAnswerOutcome::DeliveredViaResume,
+        Err(e) => ChoiceAnswerOutcome::ResumeFailed(e),
+    }
+}
+
+/// 用户已处理某个非阻塞弹框（提交选择 / 跳过 / 关掉不再需要）→ 从
+/// 补发表里销账。返回是否命中（幂等：未命中不算错误，可能是阻塞
+/// ask 走的 `choice-answer`，或已被别的 tab 处理过）。
+pub fn dismiss_prompt(prompt_id: &str) -> bool {
+    latte_agent_core::choice::dismiss_prompt(prompt_id)
 }
 
 /// 拿 session controller 的事件 broadcast **sender**（懒 spawn 同

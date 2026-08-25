@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
@@ -624,11 +624,19 @@ export function mountChat(opts: {
   // wait=true（子代理阻塞等答）→ POST choice-answer 直达等待方；
   // wait=false/缺省（顶层 turn）→ 拼成 user 消息经 sendMessage 回喂
   // （后端会 echo 一条 UserMessage 事件渲染用户气泡，这里不手动补）。
-  function renderChoiceDialog(bubble: HTMLElement, e: ChoiceRequestedEvent): void {
+  function renderChoiceDialog(
+    bubble: HTMLElement,
+    e: ChoiceRequestedEvent,
+    opts?: { archived?: boolean },
+  ): void {
+    const archived = !!opts?.archived;
+    // 存档卡片经「仍要回答」复活时置真：强制走普通 user 消息，
+    // 不再尝试 choice 路由（原等待方已随进程一起消失）。
+    let forceMessage = false;
     const multi = !!e.multi;
     const grid = e.layout === "grid";
     const card = document.createElement("div");
-    card.className = "choice-card" + (grid ? " grid" : "");
+    card.className = "choice-card" + (grid ? " grid" : "") + (archived ? " answered" : "");
     card.dataset.choiceId = e.choice_id;
 
     const optsWrap = document.createElement("div");
@@ -796,18 +804,26 @@ export function mountChat(opts: {
       done.className = "choice-answer";
       done.textContent = summary;
       card.appendChild(done);
+      // 弹框已处理 → 从后端补发表销账，否则下次重连/重放又被弹一遍。
+      // 幂等且最佳努力：失败只 warn，不影响答案本身的回喂。
+      void dismissPrompt(e.choice_id).catch((err) =>
+        console.warn("[chat] prompt dismiss failed:", err),
+      );
       if (sendText === null) return;
       const showError = (err: unknown) => {
         console.error("[chat] choice submit failed:", err);
         done.textContent = `${summary}（发送失败：${err instanceof Error ? err.message : String(err)}，请手动输入你的选择）`;
       };
-      if (e.wait) {
+      if (e.wait && !forceMessage) {
         // 阻塞中的子代理在等这个答案：直达 choice 路由；挂起项已消失
         // （超时/服务重启）时降级为普通 user 消息回喂。
         sendChoiceAnswer(e.choice_id, sendText)
           .then((delivered) => (delivered ? Promise.resolve() : sendMessage(sendText)))
           .catch(showError);
       } else {
+        // forceMessage = 从存档卡片「仍要回答」进来的：原提问方（子代理
+        // 的等待 future）在重启时就没了，choice 路由必然 404，直接走
+        // 普通消息，语义对用户也是诚实的。
         sendMessage(sendText).catch(showError);
       }
     }
@@ -821,6 +837,40 @@ export function mountChat(opts: {
     skipBtn.addEventListener("click", () => {
       finish("已跳过此选择。", "我先跳过这个选择，你按最合理的默认继续。");
     });
+
+    // 存档态（history 重放出来的历史选择题）：只展示问过什么，不给
+    // 可点的按钮。仍未处理的那条会由 pending-prompts 补拉成 live 事件
+    // 覆盖掉这张卡（见 shouldSkipPrompt）。
+    //
+    // 但"不可点"不等于"没救"：服务重启后 PENDING/PROMPTS（内存表）
+    // 都空了，弹框只剩历史里那一份，pending-prompts 补不出来 —— 而
+    // 用户的选择本身仍有价值。所以给一个显式的「仍要回答」入口：点开
+    // 才恢复选项，且强制走普通 user 消息（forceMessage）。
+    // 不默认可点是因为历史里绝大多数是**已经答过**的题，给可点卡片会
+    // 让用户误答一遍、发出一条莫名其妙的消息。
+    if (archived) {
+      optsWrap.style.display = "none";
+      foot.style.display = "none";
+      const note = document.createElement("div");
+      note.className = "choice-answer";
+      note.textContent = "（历史记录：这道选择题已不在待办中）";
+      card.appendChild(note);
+      const revive = document.createElement("button");
+      revive.type = "button";
+      revive.className = "choice-revive";
+      revive.textContent = e.wait
+        ? "仍要回答（原提问方已不在等待，将作为新消息发送）"
+        : "仍要回答（作为新消息发送）";
+      revive.addEventListener("click", () => {
+        forceMessage = true;
+        note.remove();
+        revive.remove();
+        card.classList.remove("answered");
+        optsWrap.style.display = "";
+        foot.style.display = "";
+      });
+      card.appendChild(revive);
+    }
 
     bubble.appendChild(card);
   }
@@ -1346,6 +1396,59 @@ export function mountChat(opts: {
   // When true, handleEvent is replaying archived history for a
   // session switch — suppress network side effects (switchRole).
   let replaying = false;
+
+  // ── 弹框去重表 ──
+  // 弹框类事件（ChoiceRequested / PlanProposed）现在有三条到达路径：
+  //   1. 实时 SSE；
+  //   2. history 重放（`clear() + replayEvents`，切 session / 刷新 /
+  //      broadcast lag 补齐都走它）；
+  //   3. 挂起弹框补拉（新建 SSE 连接的 replay 前缀，以及
+  //      `GET /api/chat/pending-prompts`）。
+  // 同一个 choice_id / plan_id 会被送来多次，必须按 id 收敛，否则
+  // 同一个问题渲染成好几张卡片。
+  //
+  // `live` 区分「历史里那条（已经发生过，可能早就答完了）」和「后端
+  // 确认仍未处理的那条」：历史那张渲染成不可交互的存档卡片；补拉那
+  // 张是真的还等着用户 → 替换掉存档卡片，恢复可交互。
+  const promptRows = new Map<string, { row: HTMLElement; live: boolean }>();
+
+  /** 弹框去重第一步：本条是否应跳过（已有等价或更权威的卡片）。
+   *  非 replay 的重复（= 后端确认仍挂起）会先摘掉旧的存档卡片，
+   *  让调用方重新渲染一张可交互的。 */
+  function shouldSkipPrompt(id: string): boolean {
+    const prev = promptRows.get(id);
+    if (!prev) return false;
+    // 已有 live 卡片 → 补拉/重放都不再渲染；
+    // 只有存档卡片但本条也是重放 → 同样跳过。
+    if (prev.live || replaying) return true;
+    // 存档卡片 + 实时/补拉事件 → 摘掉，由调用方渲染可交互的那张。
+    prev.row.remove();
+    promptRows.delete(id);
+    return false;
+  }
+
+  /** 弹框去重第二步：登记这条弹框渲染出的消息行。 */
+  function registerPromptRow(id: string, row: HTMLElement): void {
+    promptRows.set(id, { row, live: !replaying });
+  }
+
+  /** 弹框卡片的挂载点。
+   *
+   *  system 行没有 `.msg-bubble`（addMessage 非 avatar 分支只建
+   *  `.message.system`），所以首选 `.message.system`。原来这里是裸的
+   *  `querySelector(...)` + `if (bubble)`：选择器一旦对不上（e0bd456
+   *  的回归就是查了 `.msg-bubble`），事件到了 UI 却静默不渲染，没有
+   *  任何线索。现在逐级回退到 `.msg-bubble` 再到消息行本身，并在回退
+   *  时报错——宁可卡片位置不好看，也不能让弹框凭空消失。 */
+  function promptHost(msg: HTMLElement, promptId: string): HTMLElement {
+    const host = msg.querySelector(".message.system") as HTMLElement | null;
+    if (host) return host;
+    const fallback = msg.querySelector(".msg-bubble") as HTMLElement | null;
+    console.error(
+      `[chat] prompt ${promptId}: 找不到 .message.system 挂载点，回退到 ${fallback ? ".msg-bubble" : "消息行"}`,
+    );
+    return fallback ?? msg;
+  }
 
   function resolveIcon(roleId: string): string {
     return currentRoleIcon || roleIcon(roleId);
@@ -2268,6 +2371,9 @@ export function mountChat(opts: {
       case "PlanProposed": {
         // plan 工具提交的任务候选：渲染消息 + 导入按钮。弹窗 debounce：
         // 连续多个 plan 调用（如 LLM 先测试再提真实任务）只对最后一个弹窗
+        //
+        // 去重：同一 plan_id 可能同时经 history 重放和挂起弹框补拉到达。
+        if (shouldSkipPrompt(e.plan_id)) break;
         const n = e.tasks.length;
         const msg = addMessage({
           kind: "system",
@@ -2275,6 +2381,7 @@ export function mountChat(opts: {
           planTasks: e.tasks,
           planId: e.plan_id,
         });
+        registerPromptRow(e.plan_id, msg);
         // 气泡内附「导入任务看板」按钮，作为弹窗入口。
         const btn = document.createElement("button");
         btn.className = "workflow-import-btn";
@@ -2283,6 +2390,11 @@ export function mountChat(opts: {
         msg.querySelector(".msg-bubble")?.appendChild(btn);
         setFooter(`${e.role_id} 提交 ${n} 个任务候选`);
         resetWaitTimer();
+        // 重放的历史 plan 不自动弹窗：它可能早就导入过 / 用户已经放弃，
+        // 每次刷新都糊一个旧清单的模态框上来纯属骚扰。真正还没处理的
+        // 那份会经挂起弹框补拉（pending-prompts）以 live 事件再来一次，
+        // 走下面的自动弹窗。存档消息上的按钮与右键补救始终可用。
+        if (replaying) break;
         // 防抖弹窗：1.5 秒内无新 PlanProposed 才自动打开
         if ((window as unknown as Record<string, unknown>).__planDebounceTimer) {
           clearTimeout((window as unknown as Record<string, unknown>).__planDebounceTimer as number);
@@ -2294,6 +2406,9 @@ export function mountChat(opts: {
         break;
       }
       case "ChoiceRequested": {
+        // 去重：同一 choice_id 可能同时经 history 重放和挂起弹框补拉
+        // 到达（SSE 新连接的 replay 前缀 + GET pending-prompts）。
+        if (shouldSkipPrompt(e.choice_id)) break;
         // advisor 暂停门（choice_id 前缀 "advisor-pause-"）：渲染专用
         // 拍板卡片 + 置顶「已暂停」横幅，不走通用 select+提交流程。
         if (e.choice_id.startsWith("advisor-pause-")) {
@@ -2301,12 +2416,8 @@ export function mountChat(opts: {
             kind: "system",
             content: `🦉 ${e.role_id} 介入：${e.question}`,
           });
-          // system 行没有 .msg-bubble（addMessage 非 avatar 分支只建
-          // .message.system）——卡片要挂在 .message.system 上，否则
-          // renderAdvisorPausePrompt 永远不执行（e0bd456 起的回归：
-          // ChoiceRequested 事件到了 UI 却不弹选择框）。
-          const bubble = msg.querySelector(".message.system") as HTMLElement | null;
-          if (bubble) renderAdvisorPausePrompt(bubble, e);
+          registerPromptRow(e.choice_id, msg);
+          renderAdvisorPausePrompt(promptHost(msg, e.choice_id), e);
           showAdvisorPauseBanner();
           setFooter("advisor 已暂停，等待拍板");
           resetWaitTimer();
@@ -2318,9 +2429,13 @@ export function mountChat(opts: {
           kind: "system",
           content: `❓ ${e.role_id} 请你选择：${e.question}`,
         });
-        const bubble = msg.querySelector(".message.system") as HTMLElement | null;
-        if (bubble) renderChoiceDialog(bubble, e);
-        setFooter(`${e.role_id} 等待你的选择`);
+        registerPromptRow(e.choice_id, msg);
+        // 重放出来的历史选择题渲染成存档态（不可点）：它大概率早就答
+        // 过了，给一张能点的卡片只会让用户白点一次（提交必然 404 降级
+        // 成一条莫名其妙的新消息）。仍未回答的那条会经 pending-prompts
+        // 以 live 事件再来一次，替换成可交互卡片。
+        renderChoiceDialog(promptHost(msg, e.choice_id), e, { archived: replaying });
+        setFooter(replaying ? `${e.role_id} 曾请你选择（历史）` : `${e.role_id} 等待你的选择`);
         resetWaitTimer();
         break;
       }
@@ -2429,6 +2544,22 @@ export function mountChat(opts: {
     // 清掉残留的 timeout 询问条（切 session / 强制 clear 都用）。
     hideAllTimeoutPrompts();
     hideAdvisorPauseBanner();
+    // 弹框状态一起清：
+    // - promptRows：去重表跟着消息区一起作废，否则重放时所有弹框都
+    //   被判成"已渲染过"而跳过，聊天区永远缺这几条。
+    // - plan 导入弹窗挂在 document.body 上，`messagesEl.innerHTML=""`
+    //   清不掉它。切 session 后它还浮在页面上，而里面的 sid/parentId
+    //   是打开时算的 —— 用户在新 session 里点「导入」会把任务导到**旧**
+    //   session 的父任务下。
+    // - 已排队但没触发的自动弹窗定时器同理（1.5s 内切了 session 就会
+    //   在新 session 上弹出旧清单）。
+    promptRows.clear();
+    document.getElementById("plan-import-modal")?.remove();
+    const pendingPlanTimer = (window as unknown as Record<string, unknown>).__planDebounceTimer;
+    if (pendingPlanTimer) {
+      clearTimeout(pendingPlanTimer as number);
+      (window as unknown as Record<string, unknown>).__planDebounceTimer = undefined;
+    }
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {

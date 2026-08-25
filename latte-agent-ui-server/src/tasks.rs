@@ -916,6 +916,9 @@ pub async fn import_tasks(
     // 按 session 存），置 Approved 解除实现类 delegate 拦截。
     if let Some(plan_id) = &req.plan_id {
         approve_plan_stage(b, plan_id);
+        // 清单已导入 = 弹窗已处理：从补发表销账，否则用户下次重连
+        // 又被弹一遍同一份清单。
+        latte_agent_core::choice::dismiss_prompt(plan_id);
     }
     Ok(ImportTasksResponse { created })
 }

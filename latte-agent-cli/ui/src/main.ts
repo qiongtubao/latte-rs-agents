@@ -3,6 +3,7 @@ import {
   ensureSession, listSessions, createSession,
   switchSession, getSession, subscribeEvents, fetchSubsession,
   persistSessionId, getSessionHistory, getCurrentSessionId, forkSession,
+  getPendingPrompts,
   renameSession, deleteSession,
   getRolesConfig,
 } from "./api";
@@ -432,9 +433,26 @@ async function main(): Promise<void> {
       if (!history) return;
       chat.clear();
       chat.replayEvents(history);
+      await replayPendingPrompts(id);
     } finally {
       resyncing = false;
     }
+  }
+
+  /** 历史重放之后把「仍未被用户处理的弹框」补回来。
+   *
+   * history 重放不足以恢复弹框：
+   * - `clear()` 会把弹框卡片连未提交状态一起抹掉，重放出来的是存档态；
+   * - broadcast lag 掉的那几条压根没进 archiver 的 event_log，history
+   *   里就没有；
+   * - 长会话里被 MAX_LOG 挤出去的早期弹框同理。
+   * SSE 只在**新建连接**时补发挂起弹框，而 lag 补齐时连接还活着 ——
+   * 所以每次重放后都要显式拉一次 pending-prompts。这些是 live 事件
+   * （非 replay），会替换掉存档卡片、恢复可交互。 */
+  async function replayPendingPrompts(id: string): Promise<void> {
+    const pending = await getPendingPrompts(id).catch(() => null);
+    if (!pending) return;
+    for (const ev of pending) chat.handleEvent(ev);
   }
   // 首次激活 = 完整走一遍 activateSession：拉历史回放（live 与落盘
   // 恢复的 session 都覆盖）+ 订阅 SSE + 刷新会话列表。没有这一步，
@@ -454,6 +472,10 @@ async function main(): Promise<void> {
     chat.refreshRoles(info.available_roles, info.role);
     chat.setRoleSelected(info.role);
     openSse();
+    // 挂起弹框补齐：openSse 建连时服务端会补发一遍，这里再显式拉一次
+    // 兜底（建连是异步的、且 Tauri 等别的 transport 未必有 replay 前缀）。
+    // 重复的按 choice_id/plan_id 收敛，不会渲染两张卡。
+    await replayPendingPrompts(id);
     await refreshSessionSelect(sessionSelect, id);
     if (opts?.created) {
       chat.setFooter(`new session ${id.slice(0, 12)}… · ${info.role}`);

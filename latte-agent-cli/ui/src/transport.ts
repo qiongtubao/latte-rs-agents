@@ -100,7 +100,10 @@ export class HttpSseTransport implements ChatTransport {
           const data = JSON.parse((e as MessageEvent).data) as ChatEvent;
           onEvent(data);
         } catch (err) {
+          // 解析失败这一条永久丢了（弹框事件落在这里就是"没弹出"）。
+          // 触发一次全量补齐：history 重放 + 挂起弹框补拉。
           console.error("[sse] failed to parse chat_event", err, e);
+          onResync?.();
         }
       });
       // 服务端每 15s 的 ping（真实 SSE 事件；keep-alive 注释对 JS

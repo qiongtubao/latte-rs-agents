@@ -183,14 +183,70 @@ pub(crate) struct ChoiceAnswerRequest {
 }
 
 pub(crate) async fn chat_choice_answer(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<ChoiceAnswerRequest>,
 ) -> StatusCode {
-    if latte_agent_core::choice::resolve(&req.choice_id, req.answer) {
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
+    use api::ChoiceAnswerOutcome as O;
+    match api::deliver_choice_answer(&state.backend, &req.choice_id, req.answer).await {
+        // 直达活着的等待方，或答案已落 checkpoint + 断点续跑已拉起。
+        O::DeliveredLive | O::DeliveredViaResume => StatusCode::OK,
+        // 既没有等待方也没有可恢复的落盘记录 → 前端降级成普通消息。
+        O::NotFound => StatusCode::NOT_FOUND,
+        // 记录有效但续跑起不来（workflow 定义被删等）。答案已经在
+        // checkpoint 里了，不该让前端再把它当普通消息发一遍，所以不回
+        // 404；回 500 让 UI 显示失败原因。
+        O::ResumeFailed(e) => {
+            eprintln!(
+                "[ui-choice] {} 的答案已落 checkpoint，但续跑失败: {}",
+                req.choice_id, e.message
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
+}
+
+/// `POST /api/chat/prompt-dismiss` 的请求体。
+#[derive(Deserialize)]
+pub(crate) struct PromptDismissRequest {
+    /// ask 的 `choice_id` 或 plan 的 `plan_id`。
+    prompt_id: String,
+}
+
+/// POST /api/chat/prompt-dismiss —— 用户已处理某个非阻塞弹框
+/// （提交了选择 / 跳过 / 导入了清单），从补发表销账，避免重连时
+/// 弹出僵尸框。幂等：未命中也回 200（可能已被别的 tab 处理）。
+pub(crate) async fn chat_prompt_dismiss(
+    State(_state): State<AppState>,
+    Json(req): Json<PromptDismissRequest>,
+) -> StatusCode {
+    api::dismiss_prompt(&req.prompt_id);
+    StatusCode::OK
+}
+
+/// GET /api/chat/pending-prompts?id=... —— 本 session 仍未被用户处理
+/// 的弹框事件（阻塞 ask + 非阻塞 ask/plan + **跨进程孤儿 ask**），
+/// 以前端事件 JSON 返回。
+///
+/// SSE 只在**新建连接**时补发挂起弹框。但补齐路径不止重连一条：
+/// broadcast lag 时连接是活的（前端只做 history 全量重放），而
+/// `clear() + replayEvents(history)` 会把弹框卡片连同未提交状态一起
+/// 抹掉——history 里没有的（Lagged 掉、被 MAX_LOG 挤出去的）就永远
+/// 回不来了。这个端点让前端在任何一次重放后显式把挂起弹框补上。
+///
+/// 服务器重启后内存表全空，这里返回的是盘上的孤儿 ask
+/// （`.latte/pending-asks/`）——它们**可答**，答案会补写进 checkpoint
+/// 并触发断点续跑（见 `api::deliver_choice_answer`）。
+pub(crate) async fn chat_pending_prompts(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing ?id=".into()))?;
+    api::pending_dialog_events_json(&state.backend, id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
 }
 /// Only carries `session_id`, used for endpoints that need no other params.
 #[derive(Deserialize)]
@@ -393,14 +449,17 @@ pub(crate) async fn events_sse(
     // broadcasting the single shared controller's events to every
     // connected tab.
     //
-    // 补发仍在等用户回答的 ask 弹框（见 `api::pending_choice_events`）：
+    // 补发仍在等用户回答的 ask 弹框（见 `api::pending_dialog_events_json`）：
     // 只发给这条新连接，不重新广播，避免 archiver 二次归档。
+    // 含**跨进程孤儿**：服务器重启后内存表全空，弹框只在盘上
+    // （`.latte/pending-asks/`），这里把它补出来，用户回答会补写进
+    // checkpoint 并触发断点续跑。
     let replay: Vec<Result<Event, axum::Error>> =
-        api::pending_choice_events(&state.backend, id)
+        api::pending_dialog_events_json(&state.backend, id)
             .await
             .unwrap_or_default()
             .iter()
-            .filter_map(|ev| chat_event_to_frontend_json(ev).ok())
+            .filter_map(|v| serde_json::to_string(v).ok())
             .map(|json| Ok(Event::default().event("chat_event").data(json)))
             .collect();
     let replay = tokio_stream::iter(replay);

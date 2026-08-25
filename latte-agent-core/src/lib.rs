@@ -40,6 +40,8 @@ pub mod agent;
 pub mod advisor_monitor;
 pub mod pause_gate;
 pub mod choice;
+/// 阻塞 ask 挂起项的跨进程落盘（服务器重启后用户回答仍能驱动续跑）。
+pub mod pending_ask;
 pub mod sub_cancel;
 pub mod controller;
 pub mod checkpoint;
