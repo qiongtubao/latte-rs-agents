@@ -54,7 +54,12 @@ temperature = 0.3
 #   bash    — execute shell commands
 #   search  — regex search across files
 #   list    — list agents, workflows, config
-tools = ["read", "write", "bash", "search", "delegate", "code_graph"]
+#   ask     — 向用户抛选择题并弹框（workflow/delegate 下阻塞等回答）
+# ask 是必需的：programmer 在实现过程中撞上「设计没说清、必须用户
+# 拍板」的岔路时，唯一的合法提问通道就是它。缺了它模型照样会调，
+# 拿到 Tool not found 后只能自己瞎猜或空转（jemalloc 实锤：
+# programmer 问「归档 3 份还是 5 份」，Tool not found: ask）。
+tools = ["read", "write", "bash", "search", "delegate", "code_graph", "ask"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "💻"

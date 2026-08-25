@@ -824,7 +824,21 @@ fn classify_tool_execution_error(
             tried_aliases: vec![name.clone()],
         };
     }
+    // 工具管理器的 wall-clock 熔断。此前没有这一条：`ToolTimeout` 的
+    // Display（"Tool execution timeout: …"）不匹配任何 PERMANENT 模式，
+    // 于是被归成 `Execution`，而 `ToolCallErrorKind::Timeout` 是个**从未
+    // 被构造过**的死 variant。后果是超时和普通执行错误共用一条重试路径，
+    // 看不出区别、也没法给超时单独定预算。
+    if let ToolError::ToolTimeout { .. } = e {
+        return ToolCallErrorKind::Timeout;
+    }
     let msg = e.to_string();
+    // workflow 预算超支：checkpoint 已落盘，盲目重试 = 从第 0 步重跑，
+    // 已完成的成果全扔再烧一份同样长的预算（jemalloc「两次空等 50
+    // 分钟」）。判不可重试，把带 wf_id 的错误喂回模型走 resume。
+    if msg.contains(crate::workflow::BUDGET_EXCEEDED_MARKER) {
+        return ToolCallErrorKind::PermanentExec { reason: msg };
+    }
     const PERMANENT: &[&str] = &[
         "No such file or directory",
         "Path not found",
@@ -1076,6 +1090,12 @@ async fn run_one_tool_call(
         };
         let input = match &cwd {
             Some(c) => resolve_tool_input_against_cwd(input, c),
+            None => input,
+        };
+        // 类型方言纠正：必须在 tm.execute 之前——工具管理器先跑
+        // schema 校验，handler 里的宽松解析根本碰不到。
+        let input = match tm.get_tool(&full_name) {
+            Some(t) => coerce_tool_input_to_schema(input, &t.input_schema),
             None => input,
         };
 
@@ -2247,6 +2267,13 @@ impl AgentRunner {
                             Some(cwd) => resolve_tool_input_against_cwd(input, cwd),
                             None => input,
                         };
+                        // 类型方言纠正：必须在 tm.execute 之前——工具
+                        // 管理器先跑 schema 校验，handler 里的宽松解析
+                        // 根本碰不到。
+                        let input = match tm.get_tool(&full_name) {
+                            Some(t) => coerce_tool_input_to_schema(input, &t.input_schema),
+                            None => input,
+                        };
                         let final_input = input; // capture for the Ok arm
 
                         // 2. PreToolHook
@@ -2762,6 +2789,60 @@ fn resolve_tool_input_against_cwd(
     input
 }
 
+/// 按工具自己的 input schema 把模型的「类型方言」纠正回声明类型。
+///
+/// 动机：工具管理器在 handler **之前**跑 `validate_input`，类型不符
+/// 直接 `ToolError::Validation`，handler 里写多宽松的解析都碰不到。
+/// 而模型（尤其非头部模型）把 boolean 发成 `"true"`、把候选项数组包
+/// 进 `{"item":[...]}` 是高频错误——一次就废掉整个工具调用，
+/// `classify_tool_execution_error` 还会把它归成不可重试。
+///
+/// jemalloc 实锤两例：
+/// - tutor 的 `ask` 发 `"recommended":"true"` → 提问失败，选择框没弹
+/// - programmer 的 `ask` 发 `{"options":{"item":[…]},"multiSelect":"false"}`
+///
+/// 只做**保守、由 schema 驱动**的两条纠正，绝不猜测未声明的字段：
+/// 1. schema 声明 Boolean，而值是可无歧义识别的字符串/0-1 数字
+///    （见 [`crate::controller::lenient_bool`]）→ 换成真 bool。
+/// 2. schema 声明 Array，而值是对象且其中**恰好一个**字段是数组
+///    → 解开那一层。多于一个数组时不猜，保持原样让校验照常报错。
+///
+/// 识别不了的值原样透传 —— 校验该报的错还是会报，模型仍能拿到反馈。
+pub(crate) fn coerce_tool_input_to_schema(
+    mut input: serde_json::Value,
+    schema: &latte_rs_agent_tools::types::ToolInputSchema,
+) -> serde_json::Value {
+    use latte_rs_agent_tools::types::PropertyType;
+    use serde_json::Value;
+
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+    for (key, value) in obj.iter_mut() {
+        let Some(prop) = schema.properties.get(key) else {
+            continue;
+        };
+        match prop.property_type {
+            PropertyType::Boolean if !value.is_boolean() => {
+                if let Some(b) = crate::controller::lenient_bool(value) {
+                    *value = Value::Bool(b);
+                }
+            }
+            PropertyType::Array => {
+                if let Value::Object(map) = value {
+                    let mut arrays = map.values().filter(|v| v.is_array());
+                    if let (Some(a), None) = (arrays.next(), arrays.next()) {
+                        let unwrapped = a.clone();
+                        *value = unwrapped;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    input
+}
+
 /// True when `s` looks like a relative filesystem path: not absolute, not
 /// a URL, not an env-var/`~` reference, not a Windows drive path.
 fn is_relative_fs_path(s: &str) -> bool {
@@ -2868,6 +2949,41 @@ mod tests {
         let kind = classify_tool_execution_error(&ToolError::other("connection reset by peer"));
         assert!(matches!(kind, ToolCallErrorKind::Execution { .. }));
         assert!(policy.retryable(&kind));
+    }
+
+    /// 工具管理器熔断必须归到 `Timeout`，不能混进 `Execution`。
+    /// 回归防线：`ToolCallErrorKind::Timeout` 曾经是个从未被构造过的死
+    /// variant——超时和普通执行错误共用一条路径，trace 上看不出区别，
+    /// 也没法给超时单独定策略。
+    #[test]
+    fn tool_manager_timeout_classifies_as_timeout_kind() {
+        let policy = DefaultRetryPolicy;
+        let kind = classify_tool_execution_error(&ToolError::timeout(
+            "workflow",
+            std::time::Duration::from_secs(1500),
+        ));
+        assert_eq!(kind, ToolCallErrorKind::Timeout, "必须归到 Timeout");
+        assert_eq!(kind.label(), "Timeout", "trace 上要能看出是超时");
+        assert!(policy.retryable(&kind), "工具级超时仍可重试一次");
+    }
+
+    /// workflow 预算超支 → 不可重试。盲目重试等于丢掉 checkpoint 从第 0
+    /// 步重跑，再烧一份同样长的预算（jemalloc「两次空等 50 分钟」）。
+    /// 正确善后是把带 wf_id 的错误喂回模型走 resume。
+    #[test]
+    fn workflow_budget_exceeded_is_not_blindly_retried() {
+        let policy = DefaultRetryPolicy;
+        let msg = format!(
+            "{} 1800s（2 个分派单元 × 900s/单元），已中止\
+             （已完成 1/3 步，可用 resume 从断点续跑：wf_id=wf-x-1）",
+            crate::workflow::BUDGET_EXCEEDED_MARKER
+        );
+        let kind = classify_tool_execution_error(&ToolError::other(&msg));
+        assert!(
+            matches!(kind, ToolCallErrorKind::PermanentExec { .. }),
+            "got {kind:?}"
+        );
+        assert!(!policy.retryable(&kind), "预算超支不得原样重跑整条流水线");
     }
 
     fn test_model() -> Model {

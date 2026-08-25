@@ -579,21 +579,73 @@ fn plan_gate_rejection(stage: &SharedPlanStage, role_id: &str) -> Option<String>
     }
 }
 
+/// 宽松布尔解析：模型（尤其非头部模型）经常把 JSON schema 里的
+/// boolean 发成字符串 `"true"` / `"false"`，或 0/1 数字。严格
+/// `serde_json` 会直接报 `invalid type: string "true", expected a
+/// boolean`，被 `classify_tool_execution_error` 归成 PermanentExec
+/// （消息含 "invalid"）→ 不重试，一次工具调用就此废掉。
+///
+/// jemalloc 实锤：tutor 在 `interview` 步给 `recommended` 发了
+/// `"true"`，ask 直接失败，弹框没弹出。
+///
+/// 接受：真 bool、`"true"/"false"/"yes"/"no"/"1"/"0"/"on"/"off"`
+/// （忽略大小写与首尾空白）、数字 0/1。其余返回 `None`。
+pub(crate) fn lenient_bool(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" | "on" => Some(true),
+            "false" | "no" | "0" | "off" => Some(false),
+            _ => None,
+        },
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// serde 适配器：给 `ChoiceOption::recommended` 提供宽松布尔语义。
+/// 无法识别的形态**不报错**，退化成 `false` —— 一个推荐角标不值得
+/// 让整次提问失败。
+fn de_lenient_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(lenient_bool(&v).unwrap_or(false))
+}
+
 /// `ask` 工具的单个选项。前端 `ChoiceRequested` 弹框逐项渲染。
 /// 字段与前端 `api.ts` 的 `ChoiceOption` 同构。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceOption {
     /// 选项显示标签，必填非空。
+    #[serde(alias = "title", alias = "name", alias = "text")]
     pub label: String,
     /// 可选补充说明，显示在标签下方。空则不序列化。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// `desc` 别名：模型常这么简写（jemalloc 实锤：programmer 发的
+    /// 每一项都是 `desc`，严格字段名下说明文字被静默丢弃）。
+    #[serde(
+        default,
+        alias = "desc",
+        alias = "detail",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub description: String,
     /// 可选配图 URL（一般是 `/api/images/<file>`）。列表模式显示为
     /// 缩略图，`layout="grid"` 时显示为大图卡片。空则不序列化。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image: String,
     /// 标记为推荐项；前端加「推荐」角标。默认 false。
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// 宽松布尔（见 [`lenient_bool`]）：`"true"` 这类字符串照收。
+    #[serde(
+        default,
+        deserialize_with = "de_lenient_bool",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub recommended: bool,
 }
 
@@ -3389,6 +3441,17 @@ pub(crate) fn register_plan_tool(
 /// 阻塞模式参数：工具挂起等用户，取消则报错退出，不再有超时路径。
 #[derive(Clone)]
 pub(crate) struct AskBlocking {
+    /// 用户回答台账：收到答案**立刻**落盘，同一问题再被问到时直接
+    /// 回放，不再弹框。`None` = 不记账（顶层 turn / 独立测试）。
+    ///
+    /// 为什么必须有：答案此前只活在 subagent 的内存 context 里。step
+    /// 内的契约重试是全新 subagent（无跨分派记忆），resume 也只跳过
+    /// 已完成的 step —— 两条路都会把同一批问题重新弹给用户。
+    /// design_and_plan 的 interview 步连问 3-4 题，只要该 step 后续任何
+    /// 环节挂了，用户就得从第 1 题重答一遍。
+    pub answer_log: Option<std::sync::Arc<crate::workflow::AnswerLog>>,
+    /// 记账用的角色 id（提问方）。
+    pub role_id: String,
     /// turn 取消旗标：等待期间被取消则工具报错，让 runner 尽快退出。
     pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// session 级暂停门：等待期间用户按 ⏸ 则冻结等待，▶ 继续后恢复。
@@ -3483,10 +3546,30 @@ pub(crate) fn register_ask_tool(
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| tool_err("missing non-empty 'question' field".into()))?;
 
-            let opts_arr = input
-                .get("options")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| tool_err("'options' must be an array".into()))?;
+            // options 宽松取值：正常是裸数组，但模型也会包一层对象
+            // （jemalloc 实锤：programmer 发的是 `{"item":[...]}`,
+            // 直接 as_array() 拿不到 → 'options' must be an array,
+            // 提问废掉）。包一层时取其中唯一的数组字段，不猜键名。
+            let opts_owned;
+            let opts_arr = match input.get("options") {
+                Some(serde_json::Value::Array(a)) => a,
+                Some(serde_json::Value::Object(map)) => {
+                    let mut arrays = map.values().filter_map(|v| v.as_array());
+                    match (arrays.next(), arrays.next()) {
+                        (Some(a), None) => {
+                            opts_owned = a.clone();
+                            &opts_owned
+                        }
+                        _ => {
+                            return Err(tool_err(
+                                "'options' must be an array（收到对象且无法确定其中的候选项数组）"
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
+                _ => return Err(tool_err("'options' must be an array".into())),
+            };
             if opts_arr.len() < 2 {
                 return Err(tool_err("'options' must have at least 2 entries".into()));
             }
@@ -3500,14 +3583,45 @@ pub(crate) fn register_ask_tool(
                 options.push(opt);
             }
 
-            let multi = input.get("multi").and_then(|v| v.as_bool()).unwrap_or(false);
-            let allow_upload = input.get("allow_upload").and_then(|v| v.as_bool()).unwrap_or(false);
+            // 宽松布尔 + 常见键名别名。此前用裸 `as_bool()`：字符串
+            // `"false"` / `"true"` 一律 None → 静默退化成 false，
+            // 模型想开多选却拿到单选，无任何报错线索
+            // （jemalloc 实锤：programmer 发的是 `"multiSelect":"false"`）。
+            let pick_bool = |keys: &[&str]| -> bool {
+                keys.iter()
+                    .filter_map(|k| input.get(*k))
+                    .find_map(lenient_bool)
+                    .unwrap_or(false)
+            };
+            let multi = pick_bool(&["multi", "multiSelect", "multi_select", "multiple"]);
+            let allow_upload = pick_bool(&["allow_upload", "allowUpload"]);
             let layout = input
                 .get("layout")
                 .and_then(|v| v.as_str())
                 .filter(|s| *s == "grid")
                 .unwrap_or("")
                 .to_string();
+
+            // 回放：这个问题本 run（含 resume 继承）已经答过了 → 直接把
+            // 旧答案当工具结果返回。必须在**发 ChoiceRequested 之前**
+            // 拦下来，否则弹框已经推给前端，用户照样得再点一次。
+            // 用户的回答是不可再生资源，step 重试 / resume 续跑不该让人
+            // 重答一遍。发 Status 让回放对用户可见，而不是静默替他作答。
+            if let Some(prev) = blocking
+                .as_ref()
+                .and_then(|blk| blk.answer_log.as_ref())
+                .and_then(|log| log.recall(&question))
+            {
+                let _ = event_tx.send(ChatEvent::Status {
+                    message: format!(
+                        "↩ 复用你之前的回答（{role_id}）：「{}」→ {prev}",
+                        question.chars().take(60).collect::<String>()
+                    ),
+                });
+                return Ok(serde_json::Value::String(format!(
+                    "用户此前已回答过这个问题「{question}」，选择：{prev}。请据此继续完成任务，不要重复提问同一个问题。"
+                )));
+            }
 
             let choice_id = format!("choice-{}-{}", role_id, CHOICE_SEQ.fetch_add(1, Ordering::Relaxed));
             let n = options.len();
@@ -3570,9 +3684,18 @@ pub(crate) fn register_ask_tool(
                 }
             };
             match answered {
-                Some(answer) => Ok(serde_json::Value::String(format!(
+                Some(answer) => {
+                    // **收到即落盘**，在把结果交回模型之前。这一步之后
+                    // 无论 step 怎么挂（契约不合格、空产出、advisor 拦、
+                    // 预算超支、模型报错），这条回答都还在 checkpoint 里，
+                    // 重试与 resume 都能回放。
+                    if let Some(log) = &blk.answer_log {
+                        log.record(&blk.role_id, &question, &answer);
+                    }
+                    Ok(serde_json::Value::String(format!(
                     "用户已回答你的问题「{question}」，选择：{answer}。请据此继续完成任务，不要重复提问同一个问题。"
-                ))),
+                    )))
+                }
                 None => {
                     crate::choice::cancel(&choice_id);
                     Err(tool_err(format!(
@@ -3815,15 +3938,21 @@ pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
 /// 小时）。工具管理器 25min 默认熔断对它们只会误杀，所以统一放到 24h
 /// —— 相当于"不靠这层兜底"。
 ///
-/// 真正的控制手段是：per-step wall-clock 触发的 `TimeoutWarning`
-/// （周期复发，让用户拍板）、`turn_cancel_flag`（用户「终止当前任务」）、
-/// session `cancel_flag`（全量中止），以及 `run_turn` 内部的工具轮次
-/// 上限与循环检测。
+/// 真正的控制手段是：
+/// - **workflow 的规模预算**（[`crate::workflow::Budget`] /
+///   [`crate::workflow::estimate_budget_secs`]）—— 顶层 run 按「分派单元数
+///   × 单次分派预算」推算 wall-clock 上限，在引擎内enforce。它才是
+///   `workflow` 这条路径真正的天花板；本常量只是把工具管理器那一层
+///   让开，避免两层超时倒挂（工具层比引擎层更紧 → 引擎还在跑，工具
+///   已经熔断 → 孤儿 step）。
+/// - per-step wall-clock 触发的 `TimeoutWarning`（周期复发，让用户拍板）、
+///   `turn_cancel_flag`（用户「终止当前任务」）、session `cancel_flag`
+///   （全量中止），以及 `run_turn` 内部的工具轮次上限与循环检测。
 ///
 /// jemalloc 实锤：`workflow` 漏配本超时 → manager 调用在第 25 分钟被
 /// 熔断，而 step 因已无 wall-clock 硬超时仍在后台跑（孤儿任务）；
 /// manager 依错误提示 resume 又是 25min，两次空等 50 分钟零产出。
-pub(crate) const ORCHESTRATION_TOOL_TIMEOUT_SECS: u64 = 86_400;
+pub const ORCHESTRATION_TOOL_TIMEOUT_SECS: u64 = 86_400;
 
 /// Specialist 单次委派的工具轮次默认上限。jemalloc 事故：estimate
 /// 步骤的 programmer 子代理 24min/86 次模型调用盲改循环（配置漂移
@@ -5439,6 +5568,8 @@ mod tests {
             Some(AskBlocking {
                 cancel_flag: None,
                 agent_pause_gate: None,
+                answer_log: None,
+                role_id: "manager".into(),
             }),
         )
         .expect("register ask");
@@ -5477,6 +5608,8 @@ mod tests {
             Some(AskBlocking {
                 cancel_flag: None,
                 agent_pause_gate: None,
+                answer_log: None,
+                role_id: "manager".into(),
             }),
         )
         .expect("register ask");
@@ -5495,6 +5628,342 @@ mod tests {
         );
     }
 
+    /// 宽松布尔单元表：模型把 boolean 发成字符串/0-1 是常态。
+    #[test]
+    fn lenient_bool_accepts_model_dialects() {
+        use serde_json::json;
+        for v in [json!(true), json!("true"), json!("True"), json!("  TRUE "),
+                  json!("yes"), json!("1"), json!("on"), json!(1)] {
+            assert_eq!(lenient_bool(&v), Some(true), "should be true: {v}");
+        }
+        for v in [json!(false), json!("false"), json!("FALSE"), json!("no"),
+                  json!("0"), json!("off"), json!(0)] {
+            assert_eq!(lenient_bool(&v), Some(false), "should be false: {v}");
+        }
+        // 无法识别的形态 → None（调用点自行决定默认值）。
+        for v in [json!("maybe"), json!(2), json!(-1), json!(1.5), json!(null),
+                  json!([]), json!({})] {
+            assert_eq!(lenient_bool(&v), None, "should be None: {v}");
+        }
+    }
+
+    /// jemalloc 事故回放（tutor / interview 步）：`recommended` 发成
+    /// 字符串 `"true"`，此前 serde 严格解析报
+    /// `options[0] invalid: invalid type: string "true", expected a
+    /// boolean` → PermanentExec 不重试 → 选择框根本没弹出来。
+    #[tokio::test]
+    async fn ask_accepts_string_bool_in_option_recommended() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "tutor".into(), None).expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "第 4 题：你最想深入的方向？",
+            "options": [
+                {"label": "核心分配链路", "description": "jemalloc.c → tcache", "recommended": "true"},
+                {"label": "extent 内存池与 rtree", "description": "edata 元数据"},
+            ]
+        });
+        tm.execute("ask", input, None)
+            .await
+            .expect("字符串布尔不该让 ask 失败");
+
+        let ev = rx.try_recv().expect("ChoiceRequested event");
+        let ChatEvent::ChoiceRequested { options, .. } = ev else {
+            panic!("expected ChoiceRequested");
+        };
+        assert!(options[0].recommended, "\"true\" 必须解析成 true");
+        assert!(!options[1].recommended, "缺省仍是 false");
+    }
+
+    /// 无法识别的 `recommended` 形态只丢角标，不让提问失败。
+    #[tokio::test]
+    async fn ask_tolerates_garbage_recommended_without_failing() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "tutor".into(), None).expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "选哪个？",
+            "options": [
+                {"label": "A", "recommended": "大概吧"},
+                {"label": "B", "recommended": 7},
+            ]
+        });
+        tm.execute("ask", input, None).await.expect("垃圾值不该失败");
+        let ChatEvent::ChoiceRequested { options, .. } = rx.try_recv().expect("event") else {
+            panic!("expected ChoiceRequested");
+        };
+        assert!(!options[0].recommended && !options[1].recommended);
+    }
+
+    /// 走真实管线：`coerce_tool_input_to_schema`（runner 在
+    /// `tm.execute` 前调用）→ execute。顶层 `multi`/`options` 由工具
+    /// 管理器的 schema 校验先拦，所以纠正必须发生在 execute 之前，
+    /// handler 里再宽松也没用。
+    async fn ask_via_pipeline(
+        tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, latte_rs_agent_tools::error::ToolError> {
+        let schema = tm.get_tool("ask").expect("ask 已注册").input_schema;
+        let coerced = crate::agent::coerce_tool_input_to_schema(input, &schema);
+        tm.execute("ask", coerced, None).await
+    }
+
+    /// jemalloc 事故回放（programmer）：模型把 options 包进
+    /// `{"item":[...]}`、每项用 `desc` 而不是 `description`、
+    /// 多选键写成 `"multiSelect":"false"`。原始报错是
+    /// `Tool not found: ask`（角色没这个工具），补上工具后紧接着就会
+    /// 撞上 `Property 'options' must be Array, got object`。
+    #[tokio::test]
+    async fn ask_normalizes_wrapped_options_and_aliases() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "programmer".into(), None).expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "归档份数：你希望按哪种粒度归档？",
+            "options": {"item": [
+                {"label": "归档 5 份（推荐）", "desc": "把 5 份过期报告全部 git mv"},
+                {"label": "只归档 Architect 指定的 3 份", "desc": "贴着设计走"},
+            ]},
+            "multi": "false"
+        });
+        ask_via_pipeline(&tm, input).await.expect("包一层的 options 应被解开");
+
+        let ChatEvent::ChoiceRequested { options, multi, .. } = rx.try_recv().expect("event") else {
+            panic!("expected ChoiceRequested");
+        };
+        assert!(!multi, "\"false\" 字符串必须解析成 false");
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].label, "归档 5 份（推荐）");
+        assert_eq!(
+            options[0].description, "把 5 份过期报告全部 git mv",
+            "desc 别名必须落到 description，不能被静默丢弃"
+        );
+    }
+
+    /// `"multi": "true"` / `"allow_upload": 1` 走宽松布尔。
+    #[tokio::test]
+    async fn ask_accepts_string_bool_for_multi_and_allow_upload() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "多选题",
+            "options": [{"label": "A"}, {"label": "B"}],
+            "multi": "true",
+            "allow_upload": 1
+        });
+        ask_via_pipeline(&tm, input).await.expect("ask call");
+        let ChatEvent::ChoiceRequested { multi, allow_upload, .. } =
+            rx.try_recv().expect("event")
+        else {
+            panic!("expected ChoiceRequested");
+        };
+        assert!(multi, "\"true\" → multi");
+        assert!(allow_upload, "1 → allow_upload");
+    }
+
+    /// options 是对象但含多个数组时无法判定 —— 不瞎猜键名，让 schema
+    /// 校验照常报错，模型拿到反馈自己修。
+    #[tokio::test]
+    async fn ask_rejects_ambiguous_options_object() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "q",
+            "options": {"a": [{"label": "A"}, {"label": "B"}], "b": [{"label": "C"}]}
+        });
+        let err = ask_via_pipeline(&tm, input)
+            .await
+            .expect_err("多个候选数组必须报错");
+        assert!(err.to_string().contains("schema validation"), "{err}");
+    }
+
+    /// 纠正器只按 schema 声明动手，绝不碰未声明字段，也不猜无法识别
+    /// 的值 —— 该报的校验错还得报，模型才拿得到反馈。
+    #[tokio::test]
+    async fn coercion_leaves_undeclared_and_unrecognized_values_alone() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+        let schema = tm.get_tool("ask").expect("ask").input_schema;
+
+        let out = crate::agent::coerce_tool_input_to_schema(
+            serde_json::json!({
+                "question": "q",
+                "options": [{"label": "A"}, {"label": "B"}],
+                "multi": "大概吧",
+                "未声明字段": "true",
+            }),
+            &schema,
+        );
+        assert_eq!(out["multi"], "大概吧", "识别不了的布尔值原样保留");
+        assert_eq!(out["未声明字段"], "true", "未声明字段不得被改写");
+        assert!(out["options"].is_array(), "已经是数组的不动");
+        // question 是 String 声明，字符串照旧。
+        assert_eq!(out["question"], "q");
+    }
+
+    /// 阻塞 ask 收到答案必须**立刻**落盘，然后同一问题再问时直接回放
+    /// —— 不再弹第二个选择框，用户不用重答。
+    ///
+    /// jemalloc 形状：design_and_plan 的 interview 步连问 3-4 题，
+    /// 只要该 step 后续任何环节挂了（契约不合格 / 空产出 / advisor 拦 /
+    /// 预算超支 / 模型报错），契约重试是**全新 subagent**、resume 又只
+    /// 跳过已完成的 step —— 两条路都会把同一批问题重新弹一遍。
+    #[tokio::test]
+    async fn blocking_ask_records_answer_and_replays_it_without_second_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(crate::workflow::AnswerLog::new(
+            dir.path(),
+            "wf-replay-1",
+            Default::default(),
+        ));
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(32);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "tutor".into(),
+            Some(AskBlocking {
+                cancel_flag: None,
+                agent_pause_gate: None,
+                answer_log: Some(log.clone()),
+                role_id: "tutor".into(),
+            }),
+        )
+        .expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "第 1 题：你最终想达成什么？",
+            "options": [{"label": "学习代码机制"}, {"label": "改源码/做实现"}]
+        });
+
+        // 第一次：正常弹框 + 用户作答。
+        let tm2 = tm.clone();
+        let inp2 = input.clone();
+        let call = tokio::spawn(async move { tm2.execute("ask", inp2, None).await });
+        let choice_id = loop {
+            if let ChatEvent::ChoiceRequested { choice_id, .. } = rx.recv().await.expect("event") {
+                break choice_id;
+            }
+        };
+        assert!(crate::choice::resolve(&choice_id, "改源码/做实现".to_string()));
+        let first = call.await.expect("join").expect("ask ok");
+        assert!(first.as_str().expect("str").contains("改源码/做实现"));
+
+        // 落盘即时性：此刻还没有任何 step 完成，答案已经可回放。
+        assert_eq!(
+            log.recall("第 1 题：你最终想达成什么？").as_deref(),
+            Some("改源码/做实现")
+        );
+
+        // 第二次（模拟 step 重试后的全新 subagent 又问同一题）：
+        // 必须直接返回旧答案，且**不再**发 ChoiceRequested。
+        while rx.try_recv().is_ok() {} // 清空历史事件
+        let second = tm
+            .execute("ask", input, None)
+            .await
+            .expect("重放不该失败");
+        let text = second.as_str().expect("str");
+        assert!(text.contains("此前已回答"), "{text}");
+        assert!(text.contains("改源码/做实现"), "{text}");
+
+        let mut popped_again = false;
+        let mut saw_status = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ChatEvent::ChoiceRequested { .. } => popped_again = true,
+                ChatEvent::Status { message } if message.contains("复用你之前的回答") => {
+                    saw_status = true
+                }
+                _ => {}
+            }
+        }
+        assert!(!popped_again, "同一问题不得再弹一次选择框让用户重答");
+        assert!(saw_status, "回放要对用户可见，不能静默替他作答");
+    }
+
+    /// 没有台账时行为不变（顶层 turn / 独立测试）：照常弹框，不记账。
+    #[tokio::test]
+    async fn blocking_ask_without_answer_log_still_prompts() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "tutor".into(),
+            Some(AskBlocking {
+                cancel_flag: None,
+                agent_pause_gate: None,
+                answer_log: None,
+                role_id: "tutor".into(),
+            }),
+        )
+        .expect("register ask");
+
+        let tm2 = tm.clone();
+        let call = tokio::spawn(async move {
+            tm2.execute(
+                "ask",
+                serde_json::json!({
+                    "question": "q?",
+                    "options": [{"label": "A"}, {"label": "B"}]
+                }),
+                None,
+            )
+            .await
+        });
+        let choice_id = loop {
+            if let ChatEvent::ChoiceRequested { choice_id, .. } = rx.recv().await.expect("event") {
+                break choice_id;
+            }
+        };
+        assert!(crate::choice::resolve(&choice_id, "A".to_string()));
+        assert!(call.await.expect("join").is_ok());
+    }
+
+    /// programmer 必须带 `ask`：缺了它模型照样会调，拿到
+    /// `Tool not found: ask` 就只能瞎猜（jemalloc 实锤：programmer
+    /// 问「归档 3 份还是 5 份」，Tool not found: ask）。
+    ///
+    /// 两份都要查：`config/agents/`（权威模板，install.sh 装到全局）
+    /// 用 `[roles.<id>]` 嵌套表，`.latte/agents/`（本项目生效副本）
+    /// 是平铺表。
+    #[test]
+    fn programmer_role_has_ask_tool() {
+        let tools_of = |raw: &str, label: &str| -> Vec<String> {
+            let v: toml::Value = toml::from_str(raw).expect("合法 TOML");
+            let table = v
+                .get("roles")
+                .and_then(|r| r.get("programmer"))
+                .unwrap_or(&v);
+            table
+                .get("tools")
+                .unwrap_or_else(|| panic!("{label} 缺 tools 字段"))
+                .as_array()
+                .expect("tools 应是数组")
+                .iter()
+                .map(|t| t.as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        for (raw, label) in [
+            (include_str!("../../config/agents/programmer.toml"), "config/agents"),
+            (include_str!("../../.latte/agents/programmer.toml"), ".latte/agents"),
+        ] {
+            let tools = tools_of(raw, label);
+            assert!(
+                tools.iter().any(|t| t == "ask"),
+                "{label} 的 programmer.tools 必须含 ask，实际: {tools:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn ask_blocking_cancel_flag_aborts_wait() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
@@ -5507,6 +5976,8 @@ mod tests {
             Some(AskBlocking {
                 cancel_flag: Some(cancel.clone()),
                 agent_pause_gate: None,
+                answer_log: None,
+                role_id: "manager".into(),
             }),
         )
         .expect("register ask");

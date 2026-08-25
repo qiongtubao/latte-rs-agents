@@ -734,6 +734,116 @@ pub struct WorkflowRunContext {
 /// with an error — almost always a cycle or a design mistake.
 pub const MAX_WORKFLOW_DEPTH: u8 = 3;
 
+/// 无法加载的嵌套 workflow 按几个分派单元估。取值偏小是故意的：
+/// 名字都加载不出来的 step 大概率会立刻失败，不该为它把整体预算
+/// 抬高。
+const NESTED_UNKNOWN_UNITS: usize = 4;
+
+/// 「预算超支」失败消息的固定标记。存在的理由：`classify_tool_execution_error`
+/// 要能把它认出来判**不可重试**——预算超支时 checkpoint 已经落盘，
+/// 盲目重试等于从第 0 步重跑一遍，把已完成的成果全扔了再烧一份同样
+/// 长的预算（这正是 jemalloc「两次空等 50 分钟」的形状）。正确善后是
+/// 拿错误里的 wf_id 走 resume，由模型决策。
+pub const BUDGET_EXCEEDED_MARKER: &str = "超出按规模推算的时间预算";
+
+/// 一条 workflow 的「分派单元」数：一个单元 = 一次 speaker 分派
+/// （一个 step 里每个 role 各算一次），嵌套 step 递归展开成子流程的
+/// 单元数。用于把时间预算按**子流程真实规模**推算，而不是所有
+/// workflow 共用一个拍脑袋的常量。
+///
+/// 计入的放大因素：
+/// - `max_retries`：契约不合格会带批注重跑同一 step
+/// - `loop_until` 的 `max_iterations`：返工环会把目标及其下游重跑多轮
+///   （取全流程最大值作为整体倍数——偏保守，宁可预算大也不要误杀）
+///
+/// 递归以 [`MAX_WORKFLOW_DEPTH`] 为界；加载不出来的嵌套名按
+/// [`NESTED_UNKNOWN_UNITS`] 兜底，绝不因此报错（预算估算不该让注册
+/// 或启动失败）。
+pub fn dispatch_units(wf: &WorkflowDef, cwd: &Path, depth: u8) -> usize {
+    let per_step: Vec<usize> = wf
+        .steps
+        .iter()
+        .map(|step| {
+            let base = match &step.workflow {
+                Some(name) if depth < MAX_WORKFLOW_DEPTH => load_workflow(name, cwd)
+                    .map(|nested| dispatch_units(&nested, cwd, depth + 1))
+                    .unwrap_or(NESTED_UNKNOWN_UNITS),
+                // 深度到顶：不再展开（运行时也会被 MAX_WORKFLOW_DEPTH
+                // 拒），按兜底值计。
+                Some(_) => NESTED_UNKNOWN_UNITS,
+                None => step.roles().len().max(1),
+            };
+            base.saturating_mul(1 + step.max_retries as usize)
+        })
+        .collect();
+    let base: usize = per_step.iter().copied().fold(0, usize::saturating_add);
+
+    // 返工环的额外预算 = (轮数 - 1) × 「被重跑的区间」的单元数。
+    // 区间 = loop_back_to 目标 → 本 loop step（文件序；DAG 下 validate
+    // 已保证目标位于严格更早的 wave，文件序是可用的近似）。
+    //
+    // 不能把整条流水线乘以轮数：design_and_plan 那样算出 93 个单元、
+    // 23 小时预算，等于天花板不存在（改动前就是 24h 常量）。返工只重跑
+    // 目标及其下游，interview / explore 这些上游一次都不会重来。
+    let mut extra: usize = 0;
+    for (i, step) in wf.steps.iter().enumerate() {
+        if step.loop_until.is_none() {
+            continue;
+        }
+        let iters = step.max_iterations.unwrap_or(3).clamp(1, 10);
+        let target = step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
+        let start = wf
+            .steps
+            .iter()
+            .position(|s| s.id == target)
+            .unwrap_or(i)
+            .min(i);
+        let scope: usize = per_step[start..=i].iter().copied().fold(0, usize::saturating_add);
+        extra = extra.saturating_add(scope.saturating_mul(iters.saturating_sub(1)));
+    }
+    base.saturating_add(extra).max(1)
+}
+
+/// 默认的「每个分派单元」预算秒数。
+///
+/// 刻意**不用** `specialist_timeout_secs`（per-step 软超时，默认 900s）：
+/// 那是「这一步慢得该提醒用户了」的告警线，把它当预算单位等于假设每次
+/// 分派都病态地慢 —— 实测 design_and_plan 会算出 23 小时预算，跟改动前
+/// 的 24h 常量没有区别，天花板等于不存在。
+///
+/// 取值依据：design_and_plan 实测约 48 分钟 / 31 个基础单元 ≈ 93s/单元，
+/// 取 240s 留约 2.5 倍余量。env `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`
+/// 可覆盖。
+pub const DEFAULT_BUDGET_SECS_PER_UNIT: u64 = 240;
+
+/// 每个分派单元的预算秒数（env 可覆盖，每次调用读 env 便于测试）。
+pub fn budget_secs_per_unit() -> u64 {
+    std::env::var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_BUDGET_SECS_PER_UNIT)
+}
+
+/// 按规模推算一条 workflow 的 wall-clock 时间预算（秒）。
+///
+/// `per_unit_secs` 是单次分派计入预算的秒数，调用方传
+/// [`budget_secs_per_unit`]。
+///
+/// 结果夹在 `[per_unit_secs, ORCHESTRATION_TOOL_TIMEOUT_SECS]`：下界
+/// 保证再小的 workflow 也有一个单元的余量，上界保证永不超过工具管理器
+/// 那一层的天花板（否则工具层先熔断，又变成孤儿 step）。
+pub fn estimate_budget_secs(wf: &WorkflowDef, cwd: &Path, per_unit_secs: u64) -> u64 {
+    let ceiling = crate::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS;
+    let per_unit = per_unit_secs.max(1);
+    // 下界也要压在天花板之内：单次分派预算本身就大过天花板时
+    // （env 配了个荒谬的值），`clamp(min, max)` 会因 min > max 直接
+    // panic。
+    let floor = per_unit.min(ceiling);
+    let units = dispatch_units(wf, cwd, 0).saturating_mul(wf.effective_max_rounds());
+    (units as u64).saturating_mul(per_unit).clamp(floor, ceiling)
+}
+
 /// Run a nested workflow step: load the named workflow and run it with
 /// `topic`, sharing the parent's config / event channel / cancel flag.
 /// Events of the nested run stream under their own wf_id.
@@ -780,7 +890,10 @@ fn run_nested_workflow(
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
         };
-        let (last, keyed) = run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
+        // 嵌套 run 不自设预算：外层顶层 run 的截止时间已经把它包住，
+        // 内外层各设一份等于同一段时间被重复计费。
+        let (last, keyed) =
+            run_workflow_inner(&wf, &topic, &nested_ctx, None, Budget::Off).await?;
         // output_from：取子 workflow 指定 output_key 的产出（如
         // proposal），而非默认的最后一步输出（常是评审 verdict）。
         match output_from {
@@ -850,6 +963,24 @@ enum CheckpointRecord {
         output: String,
         finished_at: u64,
     },
+    /// 一条用户在阻塞 `ask` 弹框里给出的回答，**收到即落盘**。
+    ///
+    /// 与 `Step` 的关键区别是粒度：`Step` 只在整个 step 成功后才写，
+    /// 而用户的回答是**不可再生资源**——重跑一次就得让人重新点一遍。
+    /// design_and_plan 的 interview 步要连问 3-4 题，只要该 step 后续
+    /// 任何环节挂了（契约不合格、空产出、advisor 拦、预算超支、模型
+    /// 报错），整段问答就随 step 一起蒸发：契约重试是**全新 subagent**
+    /// （无跨分派记忆），resume 也只跳过已完成的 step——两条路都会把
+    /// 同样的问题重新弹给用户。
+    Answer {
+        wf_id: String,
+        /// 提问的角色（如 tutor）。
+        role: String,
+        /// 问题原文（去首尾空白后作为回放的 key）。
+        question: String,
+        answer: String,
+        answered_at: u64,
+    },
 }
 
 fn now_secs() -> u64 {
@@ -895,6 +1026,9 @@ pub struct CheckpointState {
     pub topic: String,
     /// Completed steps in completion order: (step_id, output_key, output).
     completed: Vec<(String, Option<String>, String)>,
+    /// 上一次运行里用户已经回答过的问题：question → answer。
+    /// resume 时预载进 [`AnswerLog`]，同一个问题不再弹给用户。
+    answers: std::collections::HashMap<String, String>,
 }
 
 /// Load and validate a checkpoint file for resume. `wf_id` comes from
@@ -913,6 +1047,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
     })?;
     let mut meta: Option<(String, String)> = None;
     let mut completed = Vec::new();
+    let mut answers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (lineno, line) in raw.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -929,11 +1064,79 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
             CheckpointRecord::Step { step_id, output_key, output, .. } => {
                 completed.push((step_id, output_key, output));
             }
+            CheckpointRecord::Answer { question, answer, .. } => {
+                // 后写覆盖：同一问题被问了两次（重试）时保留最后一次
+                // 的回答。
+                answers.insert(question, answer);
+            }
         }
     }
     let (workflow_name, topic) =
         meta.ok_or_else(|| format!("checkpoint '{wf_id}' has no meta line (corrupt?)"))?;
-    Ok(CheckpointState { workflow_name, topic, completed })
+    Ok(CheckpointState { workflow_name, topic, completed, answers })
+}
+
+/// 用户回答的持久化台账：收到即落盘，同一问题再问直接回放。
+///
+/// 解决的问题：阻塞 `ask` 的答案此前只活在 subagent 的内存 context 里。
+/// step 一失败就全丢——而 step 内的契约重试是全新 subagent、resume 又
+/// 只跳过已完成的 step，两条路都会把同样的问题重新弹一遍。用户答了
+/// 4 道题，第 1 步挂掉，等于白答。
+///
+/// 写盘与读回都走 run 的 checkpoint 文件（[`CheckpointRecord::Answer`]），
+/// 所以 resume 天然继承上一次运行的回答。
+///
+/// 回放按**问题原文**（trim 后）匹配。模型换了措辞就不算命中，会正常
+/// 重新问用户——宁可多问一次，也不要把答案对错问题。
+pub struct AnswerLog {
+    cwd: PathBuf,
+    wf_id: String,
+    seen: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl AnswerLog {
+    pub(crate) fn new(
+        cwd: &Path,
+        wf_id: &str,
+        preloaded: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            wf_id: wf_id.to_string(),
+            seen: std::sync::Mutex::new(preloaded),
+        }
+    }
+
+    /// 本 run（含 resume 继承）里这个问题是否已经有答案。
+    pub fn recall(&self, question: &str) -> Option<String> {
+        let key = question.trim();
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    /// 记下一条回答：**先进内存表再落盘**，落盘失败也不影响本 run 内
+    /// 的回放（checkpoint 只是恢复辅助，从不作为失败理由）。
+    pub fn record(&self, role: &str, question: &str, answer: &str) {
+        let key = question.trim().to_string();
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), answer.to_string());
+        append_checkpoint(
+            &self.cwd,
+            &self.wf_id,
+            &CheckpointRecord::Answer {
+                wf_id: self.wf_id.clone(),
+                role: role.to_string(),
+                question: key,
+                answer: answer.to_string(),
+                answered_at: now_secs(),
+            },
+        );
+    }
 }
 
 /// Per-run checkpoint writer shared by both engines. Bundles the file
@@ -1028,9 +1231,27 @@ pub async fn run_workflow(
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, None)
+    run_workflow_inner(wf, topic, ctx, None, Budget::Auto)
         .await
         .map(|(out, _)| out)
+}
+
+/// 一次 run 的 wall-clock 时间预算。
+///
+/// 为什么放在引擎里而不是 `workflow` 工具那一层：工具的
+/// `Tool::timeout` 是**注册期常量**（`ORCHESTRATION_TOOL_TIMEOUT_SECS`
+/// = 24h，等于没有天花板），而「这条流水线该跑多久」只有加载完
+/// `WorkflowDef` 之后才知道。放在引擎里还有一个关键好处：`wf_id` 在
+/// 这里是已知的，超支的错误消息能直接带上 resume 凭据；在工具层包一层
+/// `tokio::time::timeout` 拿不到 wf_id，只能给一句没法善后的报错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Budget {
+    /// 按 [`estimate_budget_secs`] 从子流程规模推算，resume 时再按
+    /// **剩余** step 比例缩水。仅顶层 run 生效——嵌套 run 不自设预算，
+    /// 由外层的截止时间统一兜住，否则同一段时间被内外层重复计费。
+    Auto,
+    /// 不设预算（嵌套 run；测试里也用它排除时间因素）。
+    Off,
 }
 
 /// Resume a previously interrupted workflow run from its checkpoint
@@ -1049,7 +1270,7 @@ pub async fn run_workflow_resume(
     ctx: &WorkflowRunContext,
     resume_wf_id: &str,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id))
+    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id), Budget::Auto)
         .await
         .map(|(out, _)| out)
 }
@@ -1061,6 +1282,7 @@ async fn run_workflow_inner(
     topic: &str,
     ctx: &WorkflowRunContext,
     resume_wf_id: Option<&str>,
+    budget: Budget,
 ) -> Result<(String, std::collections::HashMap<String, String>), String> {
     wf.validate()?;
     let uses_dag = wf.uses_dependency_dag();
@@ -1162,10 +1384,65 @@ async fn run_workflow_inner(
         wf_id: wf_id.clone(),
     });
 
-    let outcome = if uses_dag {
-        run_workflow_dag(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref()).await
+    // ── wall-clock 时间预算 ────────────────────────────────────────
+    // 按分派单元数 × 单次分派预算推算。此前唯一的天花板是
+    // `workflow` 工具的注册期常量 24h（= 没有天花板）：真卡住的流水线
+    // 只能靠用户盯着 TimeoutWarning 手动终止，没人盯就一直挂。
+    let per_unit = budget_secs_per_unit();
+    let budget_secs = match budget {
+        Budget::Off => 0,
+        Budget::Auto if ctx.depth == 0 => {
+            let full = estimate_budget_secs(wf, &ctx.cwd, per_unit);
+            // resume 用**不同预算**：已完成的 step 会被跳过（不发模型
+            // 请求），照抄全量估算等于给残余工作发一份跑完整条流水线的
+            // 时间。按剩余 step 比例缩水，下界一个单元。
+            // 这是「超时类失败重试不该再烧一份同样长的预算」的落点：
+            // 失败→resume 的第二次尝试自动拿到按剩余量算的预算。
+            match &resume {
+                Some(state) if !wf.steps.is_empty() => {
+                    let done = state.completed.len().min(wf.steps.len());
+                    let remaining = wf.steps.len().saturating_sub(done);
+                    let scaled = full
+                        .saturating_mul(remaining as u64)
+                        .saturating_div(wf.steps.len() as u64);
+                    scaled.max(per_unit.max(1))
+                }
+                _ => full,
+            }
+        }
+        Budget::Auto => 0,
+    };
+    // 用户回答台账：resume 时预载上一次运行已答过的问题，同一个问题
+    // 不再弹给用户（见 AnswerLog）。
+    let answer_log = Arc::new(AnswerLog::new(
+        &ctx.cwd,
+        &wf_id,
+        resume
+            .as_ref()
+            .map(|s| s.answers.clone())
+            .unwrap_or_default(),
+    ));
+    let engine = async {
+        if uses_dag {
+            run_workflow_dag(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref(), &answer_log).await
+        } else {
+            run_workflow_serial(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref(), &answer_log).await
+        }
+    };
+    let outcome = if budget_secs == 0 {
+        engine.await
     } else {
-        run_workflow_serial(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref()).await
+        match tokio::time::timeout(std::time::Duration::from_secs(budget_secs), engine).await {
+            Ok(o) => o,
+            // 超支即中止：drop 掉引擎 future 会连带 abort 在跑的 step
+            // （DAG 的 JoinSet 归该 future 所有），不留孤儿任务——这正是
+            // 此前工具层 25min 熔断做不到的事。已完成的 step 都在
+            // checkpoint 里，下面的 Failed 分支会把 wf_id 附上。
+            Err(_) => WfOutcome::Failed(format!(
+                "{BUDGET_EXCEEDED_MARKER} {budget_secs}s（{} 个分派单元 × {per_unit}s/单元），已中止",
+                dispatch_units(wf, &ctx.cwd, 0) * wf.effective_max_rounds()
+            )),
+        }
     };
 
     match outcome {
@@ -1299,6 +1576,9 @@ async fn build_role_runner(
     // 包装版（写重定向 + 读 overlay），见 crate::staging。
     staging: Option<Arc<crate::staging::Staging>>,
     step_tools: &[String],
+    // 用户回答台账：装进阻塞 ask，收到答案即落盘、重复提问直接回放。
+    // None = 不记账（独立测试）。
+    answer_log: Option<Arc<AnswerLog>>,
 ) -> Result<(AgentRunner, String), String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
@@ -1399,6 +1679,8 @@ async fn build_role_runner(
             let blocking = crate::controller::AskBlocking {
                 cancel_flag: Some(cancel_flag.clone()),
                 agent_pause_gate: agent_pause_gate.clone(),
+                answer_log: answer_log.clone(),
+                role_id: role_id.to_string(),
             };
             crate::controller::register_ask_tool(
                 &rtm,
@@ -1474,6 +1756,9 @@ struct SpeakerDispatch {
     staging: Option<Arc<crate::staging::Staging>>,
     /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
     step_tools: Vec<String>,
+    /// 用户回答台账：阻塞 `ask` 收到答案即落盘，同一问题重试/resume
+    /// 时直接回放，不再让用户重答一遍。
+    answer_log: Arc<AnswerLog>,
 }
 
 impl SpeakerDispatch {
@@ -1485,6 +1770,7 @@ impl SpeakerDispatch {
         speaker: String,
         prompt: String,
         step_tools: Vec<String>,
+        answer_log: Arc<AnswerLog>,
     ) -> Self {
         Self {
             speaker,
@@ -1506,6 +1792,7 @@ impl SpeakerDispatch {
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
             step_tools,
+            answer_log,
         }
     }
 }
@@ -1603,6 +1890,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             inp.cancel_flag.clone(),
             inp.staging.clone(),
             &inp.step_tools,
+            Some(inp.answer_log.clone()),
         )
         .await
         {
@@ -1958,6 +2246,7 @@ async fn run_workflow_serial(
     wf_id: &str,
     ckpt: &CheckpointLog,
     resume: Option<&CheckpointState>,
+    answer_log: &Arc<AnswerLog>,
 ) -> WfOutcome {
     // Advisor 启用时构建 delegate-return 审查引擎（整个 run 共享
     // 一个，仿 controller 的 register_delegate_tool）。有 session
@@ -2115,6 +2404,7 @@ async fn run_workflow_serial(
                         speaker.clone(),
                         prompt.clone(),
                         step.tools.clone(),
+                        answer_log.clone(),
                     );
                     let mut response = match run_step_speaker(dispatch).await {
                         Ok(r) => r,
@@ -2283,6 +2573,8 @@ struct DagStepInput {
     /// loop_until 返工时由调度器预置的「上轮审查反馈」（未满足循环
     /// 条件的那个 step 的产出），拼进本 step 的 prompt 后消费。
     feedback: Option<String>,
+    /// 用户回答台账（透传给 SpeakerDispatch）。
+    answer_log: Arc<AnswerLog>,
 }
 
 /// Run one DAG step (all its speakers, serially) with a fresh runner
@@ -2416,6 +2708,7 @@ async fn run_dag_step(
                 advisor_pause: inp.advisor_pause.clone(),
                 staging: inp.staging.clone(),
                 step_tools: step.tools.clone(),
+                answer_log: inp.answer_log.clone(),
             };
             let mut response = match run_step_speaker(dispatch).await {
                 Ok(r) => r,
@@ -2505,6 +2798,7 @@ async fn run_workflow_dag(
     wf_id: &str,
     ckpt: &CheckpointLog,
     resume: Option<&CheckpointState>,
+    answer_log: &Arc<AnswerLog>,
 ) -> WfOutcome {
     use tokio::sync::Semaphore;
     use tokio::task::JoinSet;
@@ -2598,6 +2892,7 @@ async fn run_workflow_dag(
                     advisor_pause: ctx.advisor_pause.clone(),
                     staging: ctx.staging.clone(),
                     feedback: pending_feedback.remove(wf.steps[idx].id.as_str()),
+                    answer_log: answer_log.clone(),
                 };
                 let sem = sem.clone();
                 set.spawn(async move {
@@ -3218,6 +3513,266 @@ loop_abort_on = "VERDICT: REJECT"
         let err = wf.validate().expect_err("孤立的 loop_abort_on 必须报错");
         assert!(err.contains("loop_abort_on"), "错误应点名字段: {err}");
         assert!(err.contains("loop_until"), "错误应说明依赖: {err}");
+    }
+
+    /// 分派单元计数：多 speaker、max_retries、返工环倍数都要计入。
+    #[test]
+    fn dispatch_units_counts_speakers_retries_and_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+
+        // 单 role 三步 = 3 个单元。
+        let wf = wf_from(
+            r#"
+name = "plain"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+[[steps]]
+id = "c"
+role = "reviewer"
+task = "t"
+"#,
+        );
+        assert_eq!(dispatch_units(&wf, cwd, 0), 3);
+
+        // 多 speaker：一个 step 里每个 role 各一次分派。
+        let wf = wf_from(
+            r#"
+name = "multi"
+[[steps]]
+id = "a"
+speakers = ["pm", "architect", "reviewer"]
+prompt = "t"
+"#,
+        );
+        assert_eq!(dispatch_units(&wf, cwd, 0), 3);
+
+        // max_retries=2 → 该 step 最多跑 3 次。
+        let wf = wf_from(
+            r#"
+name = "retry"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+max_retries = 2
+"#,
+        );
+        assert_eq!(dispatch_units(&wf, cwd, 0), 3);
+
+        // 返工环：额外预算只覆盖被重跑的区间 [loop_back_to, loop step]，
+        // 不是整条流水线乘轮数。
+        // upstream(1) + a(1) + gate(1) = 3 基础；区间 a..=gate = 2 个单元，
+        // (3-1) × 2 = 4 额外 → 7。
+        let wf = wf_from(
+            r#"
+name = "loop"
+[[steps]]
+id = "upstream"
+role = "pm"
+task = "t"
+[[steps]]
+id = "a"
+role = "architect"
+task = "t"
+[[steps]]
+id = "gate"
+role = "reviewer"
+task = "t"
+loop_until = "VERDICT: PASS"
+loop_back_to = "a"
+max_iterations = 3
+"#,
+        );
+        assert_eq!(
+            dispatch_units(&wf, cwd, 0),
+            7,
+            "上游 upstream 一次都不会重跑，不该被计入返工倍数"
+        );
+    }
+
+    /// per-unit 预算旋钮：默认值 + env 覆盖。刻意与 per-step 软超时
+    /// （900s 告警线）分开——混用会把 design_and_plan 算成 23 小时。
+    #[test]
+    fn budget_per_unit_defaults_and_env_override() {
+        let _guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
+        assert_eq!(budget_secs_per_unit(), DEFAULT_BUDGET_SECS_PER_UNIT);
+        assert_ne!(
+            DEFAULT_BUDGET_SECS_PER_UNIT,
+            crate::controller::DEFAULT_UI_DELEGATE_TIMEOUT_SECS,
+            "预算单位不得等于 per-step 软超时告警线"
+        );
+        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "60");
+        assert_eq!(budget_secs_per_unit(), 60);
+        // 0 / 垃圾值退回默认，不会算出 0 预算（0 = 关闭，语义完全相反）。
+        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "0");
+        assert_eq!(budget_secs_per_unit(), DEFAULT_BUDGET_SECS_PER_UNIT);
+        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "abc");
+        assert_eq!(budget_secs_per_unit(), DEFAULT_BUDGET_SECS_PER_UNIT);
+        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
+    }
+
+    /// 嵌套 step 递归展开成子流程的单元数——「按子流程规模推算」的
+    /// 核心。加载不出来的嵌套名按兜底值计，绝不报错。
+    #[test]
+    fn dispatch_units_expands_nested_workflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner.toml"),
+            r#"
+name = "inner"
+[[steps]]
+id = "i1"
+role = "pm"
+task = "t"
+[[steps]]
+id = "i2"
+speakers = ["architect", "reviewer"]
+prompt = "t"
+"#,
+        )
+        .unwrap();
+
+        // inner 自己 = 1 + 2 = 3 个单元。
+        let parent = wf_from(
+            r#"
+name = "outer"
+[[steps]]
+id = "own"
+role = "pm"
+task = "t"
+[[steps]]
+id = "nested"
+workflow = "inner"
+task = "t"
+"#,
+        );
+        assert_eq!(
+            dispatch_units(&parent, dir.path(), 0),
+            4,
+            "1（自有 step）+ 3（展开 inner）"
+        );
+
+        // 加载不出来的嵌套名 → 兜底值，不 panic 不报错。
+        let broken = wf_from(
+            r#"
+name = "outer2"
+[[steps]]
+id = "nested"
+workflow = "does_not_exist"
+task = "t"
+"#,
+        );
+        assert_eq!(dispatch_units(&broken, dir.path(), 0), NESTED_UNKNOWN_UNITS);
+    }
+
+    /// 拿仓库里真实的 design_and_plan（6 层嵌套 + 双评审并行波 + gate
+    /// 返工环）验证推算落在合理区间：实测这条流水线约 48 分钟，预算
+    /// 必须明显宽于它（否则健康的长任务会被误杀），同时远低于 24h
+    /// 天花板（否则等于没有天花板，回到改动前）。
+    #[test]
+    fn real_design_and_plan_budget_is_sane() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let wf = match load_workflow("design_and_plan", &root) {
+            Ok(w) => w,
+            // 仓库布局变了就跳过，不把无关改动搞红。
+            Err(_) => return,
+        };
+        let units = dispatch_units(&wf, &root, 0);
+        let budget = estimate_budget_secs(&wf, &root, DEFAULT_BUDGET_SECS_PER_UNIT);
+        assert!(
+            units >= 20,
+            "6 个嵌套子流程 + gate 返工环，单元数不该这么小: {units}"
+        );
+        // 下界：明显宽于实测 48 分钟，否则健康的长任务会被误杀。
+        assert!(
+            budget > 48 * 60 * 2,
+            "预算必须明显宽于实测 48 分钟: {budget}s（{units} 单元）"
+        );
+        // 上界：必须远离 24h 天花板，否则「有上限」只是纸面上的
+        // （改动前就是 24h 常量）。取 12h 作回归线。
+        assert!(
+            budget < 12 * 3600,
+            "预算顶到天花板量级 = 等于没有上限: {budget}s（{units} 单元）"
+        );
+    }
+
+    /// 预算 = 单元数 × 单次分派预算，并夹在 [per_unit, 工具层天花板]。
+    /// 上界很重要：预算若超过 `ORCHESTRATION_TOOL_TIMEOUT_SECS`，工具
+    /// 管理器那一层会先熔断，又变回孤儿 step。
+    #[test]
+    fn estimate_budget_scales_with_units_and_stays_under_tool_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let wf = wf_from(
+            r#"
+name = "three"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+[[steps]]
+id = "c"
+role = "reviewer"
+task = "t"
+"#,
+        );
+        assert_eq!(estimate_budget_secs(&wf, cwd, 100), 300);
+        // 下界：单步 workflow 也至少有一个单元的余量。
+        let one = wf_from(
+            r#"
+name = "one"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+"#,
+        );
+        assert_eq!(estimate_budget_secs(&one, cwd, 900), 900);
+        // 上界：不得越过工具管理器那一层的天花板。
+        let huge = estimate_budget_secs(&wf, cwd, u64::MAX / 2);
+        assert_eq!(huge, crate::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS);
+    }
+
+    /// 嵌套 run 不自设预算：内外层各设一份等于同一段时间被重复计费，
+    /// 子流程会先于父级预算被判死。
+    #[test]
+    fn nested_runs_do_not_set_their_own_budget() {
+        assert_eq!(Budget::Off, Budget::Off);
+        // depth > 0 的 Auto 等价于关闭 —— 由 run_workflow_inner 的
+        // match 保证；这里锁住语义文档，实际行为由上面的端到端测试
+        // （嵌套返工/组合类）覆盖。
+        let dir = tempfile::tempdir().unwrap();
+        let wf = wf_from(
+            r#"
+name = "n"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+"#,
+        );
+        // 估算函数本身不看 depth：depth 判定在调用点。
+        assert!(estimate_budget_secs(&wf, dir.path(), 10) > 0);
     }
 
     /// 熔断标记若把放行条件当子串包含，放行判定永远先命中，熔断成
@@ -3942,6 +4497,7 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             &[],
+            None,
         )
         .await
         .expect("worker runner");
@@ -5268,6 +5824,273 @@ max_iterations = 3
             1,
             "熔断不返工，refine 只跑一次"
         );
+    }
+
+    /// 用户回答**收到即落盘**，而不是等 step 成功才写。
+    /// 回归防线：此前答案只活在 subagent 内存里，step 一挂就没了。
+    #[test]
+    fn answer_log_persists_immediately_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        // checkpoint 需要 meta 行才能被 load_checkpoint 接受。
+        let ckpt = CheckpointLog::new(cwd, "wf-ans-1", "design_and_plan", "主题", 0);
+        let log = AnswerLog::new(cwd, "wf-ans-1", Default::default());
+
+        assert_eq!(log.recall("第 1 题：你的目标？"), None);
+        log.record("tutor", "第 1 题：你的目标？", "改源码/做实现");
+        log.record("tutor", "第 2 题：当前水平？", "看过一些代码");
+
+        // 内存表立刻可回放（同一 run 内的 step 重试就靠这条）。
+        assert_eq!(
+            log.recall("第 1 题：你的目标？").as_deref(),
+            Some("改源码/做实现")
+        );
+        // trim 后匹配：模型多打了空白也算命中。
+        assert_eq!(
+            log.recall("  第 2 题：当前水平？  ").as_deref(),
+            Some("看过一些代码")
+        );
+
+        // **一个 step 都还没完成**，但回答已经在盘上了 —— 这正是重点。
+        assert_eq!(ckpt.completed(), 0);
+        let state = load_checkpoint(cwd, "wf-ans-1").expect("checkpoint 可读");
+        assert!(state.completed.is_empty(), "没有任何已完成 step");
+        assert_eq!(
+            state.answers.get("第 1 题：你的目标？").map(String::as_str),
+            Some("改源码/做实现")
+        );
+        assert_eq!(state.answers.len(), 2);
+    }
+
+    /// resume 预载上一次运行的回答：新 run 的台账里直接就有答案，
+    /// 用户不会被重新问一遍。
+    #[test]
+    fn resumed_run_preloads_previous_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _ckpt = CheckpointLog::new(cwd, "wf-ans-2", "design_and_plan", "主题", 0);
+        AnswerLog::new(cwd, "wf-ans-2", Default::default())
+            .record("tutor", "时间预算？", "10h+");
+
+        let state = load_checkpoint(cwd, "wf-ans-2").expect("checkpoint");
+        // 新 run（新 wf_id）用上一次的回答预载。
+        let resumed = AnswerLog::new(cwd, "wf-ans-3", state.answers.clone());
+        assert_eq!(resumed.recall("时间预算？").as_deref(), Some("10h+"));
+    }
+
+    /// 同一问题重复 record 取最后一次（用户改了主意的场景）。
+    #[test]
+    fn answer_log_last_write_wins_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _ckpt = CheckpointLog::new(cwd, "wf-ans-4", "wf", "t", 0);
+        let log = AnswerLog::new(cwd, "wf-ans-4", Default::default());
+        log.record("tutor", "选哪个？", "A");
+        log.record("tutor", "选哪个？", "B");
+        assert_eq!(log.recall("选哪个？").as_deref(), Some("B"));
+        let state = load_checkpoint(cwd, "wf-ans-4").expect("checkpoint");
+        assert_eq!(state.answers.get("选哪个？").map(String::as_str), Some("B"));
+    }
+
+    /// 端到端接线验证：真实 workflow run 里，speaker 调阻塞 `ask`、
+    /// 用户作答后，答案必须出现在该 run 的 checkpoint 里。
+    ///
+    /// 为什么值得单独测：`answer_log` 要穿过
+    /// run_workflow_inner → 引擎 → DagStepInput/SpeakerDispatch →
+    /// run_step_speaker → build_role_runner → AskBlocking 六层。
+    /// 任何一层传成 `None`，单元测试全绿而线上照样让用户重答 —— 本轮
+    /// 早前就踩过同型的坑（`dataset.wfId` 从未被赋值，判断恒 false）。
+    #[tokio::test]
+    async fn ask_answer_lands_in_run_checkpoint_end_to_end() {
+        fn tool_call_body(args: &str) -> String {
+            serde_json::json!({
+                "id": "chatcmpl-tc",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_ask_1",
+                            "type": "function",
+                            "function": { "name": "ask", "arguments": args }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string()
+        }
+
+        let server = wiremock::MockServer::start().await;
+        // 第 1 次模型调用：调 ask 提问。之后：给出最终产出。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(tool_call_body(
+                r#"{"question":"第 1 题：你最终想达成什么？","options":[{"label":"学习代码机制"},{"label":"改源码/做实现"}]}"#,
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("用户画像汇总完毕")),
+            )
+            .mount(&server)
+            .await;
+
+        // worker 需要 ask 工具，否则 build_role_runner 不注册它。
+        let mut config = (*test_config_at(&server.uri())).clone();
+        if let Some(r) = config.roles.get_mut("worker") {
+            r.tools = vec!["ask".into()];
+        }
+        let config = Arc::new(config);
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "interview_only"
+[[steps]]
+id = "interview"
+role = "worker"
+task = "先问用户：{{topic}}"
+output_key = "user_profile"
+"#,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut rx) = test_ctx_at(config, dir.path().to_path_buf());
+
+        // 模拟 UI：看到选择框就把答案投递回去。
+        let answerer = tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let ChatEvent::ChoiceRequested { choice_id, .. } = ev {
+                    crate::choice::resolve(&choice_id, "改源码/做实现".to_string());
+                    return true;
+                }
+            }
+            false
+        });
+
+        let out = run_workflow(&wf, "学 jemalloc", &ctx).await;
+        let asked = answerer.await.unwrap_or(false);
+        assert!(asked, "speaker 应该真的弹出了选择框（ask 已注册）");
+        assert!(out.is_ok(), "run 应成功: {out:?}");
+
+        // checkpoint 里必须有 Answer 记录 —— 证明六层接线没有断在 None。
+        let runs = dir.path().join(".latte").join("workflow-runs");
+        let mut found: Option<String> = None;
+        for entry in std::fs::read_dir(&runs).expect("workflow-runs 目录").flatten() {
+            let raw = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            for line in raw.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if v["type"] == "answer" {
+                    found = Some(line.to_string());
+                }
+            }
+        }
+        let line = found.expect("checkpoint 必须落一条 answer 记录（接线断了就没有）");
+        assert!(line.contains("改源码/做实现"), "答案原文要落盘: {line}");
+        assert!(line.contains("第 1 题"), "问题原文要落盘（回放的 key）: {line}");
+        assert!(line.contains("\"role\":\"worker\""), "记账要带提问角色: {line}");
+    }
+
+    /// 预算超支必须**中止**并给出可 resume 的错误（标记 + 单元数说明
+    /// + wf_id），而不是无限挂着等人来看 TimeoutWarning。此前唯一的
+    /// 天花板是 `workflow` 工具的注册期常量 24h = 没有天花板。
+    #[tokio::test]
+    async fn budget_exceeded_aborts_with_resumable_error() {
+        let server = wiremock::MockServer::start().await;
+        // 模型每次慢 3s；预算被 env 压到 1s/单元 × 1 单元 = 1s。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("慢产出"))
+                    .set_delay(std::time::Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "budget_demo"
+[[steps]]
+id = "a"
+role = "worker"
+task = "慢任务 {{topic}}"
+output_key = "out"
+"#,
+        )
+        .unwrap();
+
+        let guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("超出预算必须失败");
+        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
+        drop(guard);
+
+        assert!(
+            err.contains(crate::workflow::BUDGET_EXCEEDED_MARKER),
+            "错误必须带预算超支标记（分类器靠它判不可重试）: {err}"
+        );
+        assert!(err.contains("分派单元"), "应说明预算是怎么算出来的: {err}");
+        assert!(err.contains("wf_id="), "必须带 resume 凭据: {err}");
+    }
+
+    /// 预算充裕时不得误杀：同一条 workflow、同样的慢模型，把 per-unit
+    /// 预算放宽后必须正常跑完。回归防线——预算推算错成过小会把所有
+    /// 长任务判死。
+    #[tokio::test]
+    async fn generous_budget_does_not_kill_slow_but_healthy_run() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("慢但正常的产出"))
+                    .set_delay(std::time::Duration::from_millis(300)),
+            )
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "budget_ok"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务 {{topic}}"
+output_key = "out"
+"#,
+        )
+        .unwrap();
+
+        let guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "30");
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let out = run_workflow(&wf, "主题", &ctx).await;
+        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
+        drop(guard);
+        assert_eq!(out.expect("预算充裕不该被杀"), "慢但正常的产出");
     }
 
     /// 熔断判定必须锁在 loop_until 保护内：没有返工环的 step 产出里

@@ -5,5 +5,5 @@ category = "execution"
 model_tier = "budget"
 prompt_file = "prompts/programmer.md"
 temperature = 0.3
-tools = ["read", "write", "bash", "search"]
+tools = ["read", "write", "bash", "search", "ask"]
 icon = "💻"
