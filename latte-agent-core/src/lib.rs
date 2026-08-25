@@ -45,6 +45,7 @@ pub mod controller;
 pub mod checkpoint;
 pub mod config;
 pub mod context;
+pub mod dispatch_ledger;
 pub mod doc_graph_tools;
 pub mod error;
 pub mod event_json;

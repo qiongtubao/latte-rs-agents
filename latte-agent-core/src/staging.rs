@@ -11,8 +11,16 @@
 //! 把文件移到目标位置；失败/取消则保留暂存目录供人工检查，一行
 //! `rm -rf` 可清理。
 //!
-//! 已知边界：`bash`/`edit` 等其它写通道不拦截（开了 staging 的
-//! workflow 里角色约定用 write 产文档）；目录 listing 不合并暂存项。
+//! `bash` 是**感知**而非拦截（见 [`Staging::wrap_tools`] 的 bash 分支）：
+//! 无法可靠改写任意 shell 命令里的路径（`git log docs/a.md` 改成暂存路径
+//! 就直接坏了），所以改为让它知情——注入 `LATTE_STAGING_ROOT` 环境变量，
+//! 并在命令触碰到「有暂存草稿的路径」时在返回值里挂 `stagingNotice`，
+//! 点名哪些文件的权威版本在暂存区。否则会出现很具体的错读：`read` 看到
+//! 的是本 run 的草稿，`bash cat` 同一路径看到的却是仓库里的旧版本，
+//! 两个通道对同一个文件给出不同答案，而模型无从察觉。
+//!
+//! 已知边界：`edit` / `doc_write` / `spawn` 等其它写通道仍不拦截；
+//! 目录 listing 不合并暂存项。
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -186,6 +194,87 @@ impl Staging {
             tm.unregister("read");
             tm.register(wrapped, None);
         }
+
+        // ── bash：感知，不拦截 ────────────────────────────────────
+        // 为什么不改写命令：bash 收的是任意 shell 字符串，把里面的路径
+        // 替换成暂存路径会坏掉一大类命令（`git log docs/a.md`、
+        // `cargo test`、相对路径拼接…）。所以给它三件事：
+        //   1. `LATTE_STAGING_ROOT` / `LATTE_STAGING_ACTIVE` 环境变量
+        //      —— 需要读写草稿的命令可以直接寻址；
+        //   2. 描述里写清规则，模型知道 bash 写出去的东西**不会**进
+        //      暂存区、也不会被 promote；
+        //   3. 命令触碰到有草稿的路径时，返回值挂 `stagingNotice`
+        //      点名它读到的可能是旧版本 —— 这是最容易踩的坑：`read`
+        //      给草稿、`bash cat` 给旧文件，同一路径两个答案。
+        if let Some(orig) = tm.get_tool("bash") {
+            let st = Arc::clone(self);
+            let orig_handler = orig.handler.clone();
+            let handler: SharedToolHandler = Arc::new(move |input, ctx| {
+                let st = Arc::clone(&st);
+                let orig_handler = orig_handler.clone();
+                Box::pin(async move {
+                    let command = input
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    // 注入 staging 环境变量（不覆盖调用方已给的同名项）。
+                    let mut rewritten = input.clone();
+                    let env = rewritten
+                        .as_object_mut()
+                        .map(|o| {
+                            o.entry("env".to_string())
+                                .or_insert_with(|| serde_json::json!({}))
+                        })
+                        .filter(|v| v.is_object());
+                    if let Some(env) = env {
+                        if let Some(obj) = env.as_object_mut() {
+                            obj.entry("LATTE_STAGING_ROOT".to_string()).or_insert_with(
+                                || serde_json::json!(st.root().to_string_lossy()),
+                            );
+                            obj.entry("LATTE_STAGING_ACTIVE".to_string())
+                                .or_insert_with(|| serde_json::json!("1"));
+                        }
+                    }
+                    let touched = st.staged_paths_in_command(&command);
+                    let mut out = (orig_handler)(rewritten, ctx).await?;
+                    if !touched.is_empty() {
+                        let listed = touched
+                            .iter()
+                            .map(|(rel, staged)| format!("{rel} → {staged}"))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        if let Some(obj) = out.as_object_mut() {
+                            obj.insert(
+                                "stagingNotice".into(),
+                                serde_json::json!(format!(
+                                    "本 workflow 处于暂存模式，命令里这些路径有**更新的草稿**在暂存区，\
+                                     仓库里的版本是旧的：{listed}。读请改用 read 工具（自动 overlay）\
+                                     或直接读上面的暂存路径；写请用 write 工具——bash 直接写仓库\
+                                     不会进暂存区、也不会被终审后的 promote 带上。"
+                                )),
+                            );
+                        }
+                    }
+                    Ok(out)
+                })
+            });
+            let wrapped = Tool::builder(
+                "bash",
+                format!(
+                    "{}（workflow 暂存模式：草稿区在 $LATTE_STAGING_ROOT。\
+                     产出文档请用 write 工具——bash 直接写仓库不进暂存区、\
+                     终审 promote 也不会带上它。读已被本 run 改过的文件请用 read 工具。）",
+                    orig.description
+                ),
+                orig.input_schema.clone(),
+                handler,
+            )
+            .concurrency_safe(orig.concurrency_safe)
+            .build();
+            tm.unregister("bash");
+            tm.register(wrapped, None);
+        }
     }
 
     /// workflow 成功结束：把暂存文件移到目标位置（同一文件多次写取
@@ -229,6 +318,83 @@ impl Staging {
     pub fn pending_count(&self) -> usize {
         self.entries.lock().len()
     }
+
+    /// 当前有暂存草稿的目标路径（去重，绝对路径）。
+    fn staged_dests(&self) -> Vec<(String, String)> {
+        let mut seen: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for e in self.entries.lock().iter() {
+            seen.insert(e.dest_abs.clone(), e.staged.clone());
+        }
+        seen.into_iter().collect()
+    }
+
+    /// 一条 shell 命令里提到了哪些「有暂存草稿」的路径。
+    ///
+    /// 匹配绝对路径与项目相对路径两种写法，且要求命中处是**独立 token**
+    /// （两侧是命令分隔符/引号/空白），避免 `a.md` 命中 `xa.md` 或
+    /// `a.mdx` 这类前后缀误报。
+    fn staged_paths_in_command(&self, command: &str) -> Vec<(String, String)> {
+        let mut hits: Vec<(String, String)> = Vec::new();
+        for (dest_abs, staged) in self.staged_dests() {
+            let rel = Path::new(&dest_abs)
+                .strip_prefix(&self.cwd)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let candidates: Vec<&str> = match &rel {
+                Some(r) => vec![dest_abs.as_str(), r.as_str()],
+                None => vec![dest_abs.as_str()],
+            };
+            if candidates
+                .iter()
+                .any(|needle| mentions_path_token(command, needle))
+            {
+                hits.push((rel.unwrap_or_else(|| dest_abs.clone()), staged));
+            }
+        }
+        hits
+    }
+}
+
+/// `needle` 是否作为独立路径 token 出现在 `haystack` 里。
+///
+/// 「独立」= 命中处左右不是路径字符（字母数字、`.`、`_`、`-`、`/`）。
+/// 这样 `notes/a.md` 不会命中 `notes/a.mdx`，也不会命中 `old_notes/a.md`。
+fn mentions_path_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_path_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/');
+    let bytes = haystack.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .map(is_path_char)
+                .unwrap_or(false);
+        let after_ok = end >= bytes.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .map(is_path_char)
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        // 继续找下一个出现位置（按字符边界前进，避免切断 UTF-8）。
+        from = end.min(haystack.len());
+        while from < haystack.len() && !haystack.is_char_boundary(from) {
+            from += 1;
+        }
+        if from >= haystack.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// rename 优先，跨设备等失败回退 copy+remove。
@@ -402,6 +568,145 @@ mod tests {
         // 全部成功 → 暂存目录已清理。
         assert!(!st.root().exists());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 独立 token 匹配：前后缀不能误报，否则 stagingNotice 会满屏乱挂。
+    #[test]
+    fn path_token_matching_avoids_prefix_and_suffix_false_positives() {
+        assert!(mentions_path_token("cat notes/a.md", "notes/a.md"));
+        assert!(mentions_path_token("wc -l 'notes/a.md'", "notes/a.md"));
+        assert!(mentions_path_token("cat notes/a.md | head", "notes/a.md"));
+        assert!(mentions_path_token("notes/a.md", "notes/a.md"));
+        // 后缀更长 → 不算命中。
+        assert!(!mentions_path_token("cat notes/a.mdx", "notes/a.md"));
+        // 前缀更长 → 不算命中。
+        assert!(!mentions_path_token("cat old_notes/a.md", "notes/a.md"));
+        assert!(!mentions_path_token("cat xnotes/a.md", "notes/a.md"));
+        // 第一处是误报、第二处是真命中 → 仍应命中。
+        assert!(mentions_path_token(
+            "cat notes/a.mdx && cat notes/a.md",
+            "notes/a.md"
+        ));
+        assert!(!mentions_path_token("anything", ""));
+        // 非 ASCII 不能把 UTF-8 切断（走 char 边界前进）。
+        assert!(mentions_path_token("cat 文档/说明.md", "文档/说明.md"));
+        assert!(!mentions_path_token("cat 文档/说明.mdx", "文档/说明.md"));
+    }
+
+    /// bash 感知 staging：注入 LATTE_STAGING_ROOT，且命令碰到有草稿的
+    /// 路径时挂 stagingNotice。
+    ///
+    /// 回归动机：此前 bash 完全不知道 staging 存在 —— `read` 给的是本
+    /// run 的草稿，`bash cat` 同一路径给的是仓库旧版本，两个通道对同一
+    /// 文件给出不同答案，模型无从察觉。
+    #[tokio::test]
+    async fn bash_sees_staging_env_and_gets_notice_for_staged_paths() {
+        let dir = std::env::temp_dir().join(format!("staging-bash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 仓库里已有旧版本，暂存区有新草稿 —— 正是会读错的场景。
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        std::fs::write(dir.join("notes/plan.md"), "仓库里的旧版本").unwrap();
+
+        let st = Staging::new(&dir, "wf-bash");
+        let tm = make_tm().await;
+        st.wrap_tools(&tm, "programmer");
+
+        // 1) 环境变量注入：命令能读到 LATTE_STAGING_ROOT。
+        let out = tm
+            .execute(
+                "bash",
+                serde_json::json!({
+                    "command": "printf %s \"$LATTE_STAGING_ROOT|$LATTE_STAGING_ACTIVE\"",
+                    "cwd": dir.to_string_lossy(),
+                }),
+                ctx(),
+            )
+            .await
+            .expect("bash ok");
+        let stdout = out["stdout"].as_str().unwrap_or_default();
+        assert_eq!(
+            stdout,
+            format!("{}|1", st.root().to_string_lossy()),
+            "bash 必须能看到暂存区位置: {stdout}"
+        );
+        // 没碰到草稿路径 → 不挂通知（避免噪音）。
+        assert!(out.get("stagingNotice").is_none());
+
+        // 2) 写一份草稿，然后 bash 去读同一路径。
+        tm.execute(
+            "write",
+            serde_json::json!({"path": "notes/plan.md", "content": "草稿新版本"}),
+            ctx(),
+        )
+        .await
+        .unwrap();
+
+        let out = tm
+            .execute(
+                "bash",
+                serde_json::json!({
+                    "command": "cat notes/plan.md",
+                    "cwd": dir.to_string_lossy(),
+                }),
+                ctx(),
+            )
+            .await
+            .expect("bash ok");
+        // bash 如实读到仓库旧版本（我们不改写命令）——
+        assert_eq!(out["stdout"].as_str().unwrap_or_default(), "仓库里的旧版本");
+        // ——但必须明确告知权威版本在暂存区，否则模型会拿旧内容当真。
+        let notice = out["stagingNotice"]
+            .as_str()
+            .expect("碰到有草稿的路径必须挂 stagingNotice");
+        assert!(notice.contains("notes/plan.md"), "{notice}");
+        assert!(
+            notice.contains(&st.root().join("notes/plan.md").to_string_lossy().to_string()),
+            "通知要给出暂存路径，模型才能直接去读: {notice}"
+        );
+
+        // 3) 不相关的命令不挂通知。
+        let out = tm
+            .execute(
+                "bash",
+                serde_json::json!({"command": "echo hi", "cwd": dir.to_string_lossy()}),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(out.get("stagingNotice").is_none(), "无关命令不该有噪音");
+
+        // 4) 调用方自带 env 不被覆盖。
+        let out = tm
+            .execute(
+                "bash",
+                serde_json::json!({
+                    "command": "printf %s \"$LATTE_STAGING_ROOT\"",
+                    "cwd": dir.to_string_lossy(),
+                    "env": {"LATTE_STAGING_ROOT": "/caller/wins"},
+                }),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap_or_default(), "/caller/wins");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 描述里必须写清 bash 与 staging 的关系 —— 模型只读描述。
+    #[tokio::test]
+    async fn bash_description_states_the_staging_rule() {
+        let dir = std::env::temp_dir().join(format!("staging-bashdesc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = Staging::new(&dir, "wf-bashdesc");
+        let tm = make_tm().await;
+        st.wrap_tools(&tm, "programmer");
+        let desc = tm.get_tool("bash").expect("bash 已注册").description;
+        assert!(desc.contains("LATTE_STAGING_ROOT"), "{desc}");
+        assert!(desc.contains("write"), "要指明产文档该用 write: {desc}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -4077,6 +4077,9 @@ async fn register_delegate_tool(
     let turn_cancel_flag_owned = turn_cancel_flag.clone();
     let delegate_counter_owned = Arc::clone(&delegate_counter);
     let max_delegates_owned = max_delegates;
+    // 派发幂等台账（见 crate::dispatch_ledger）：同一 (role, task) 正在
+    // 跑就拒、已成功就复用上次结果。与 delegate_counter 同生命周期。
+    let ledger = crate::dispatch_ledger::DispatchLedger::new();
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
         let resolver = Arc::clone(&resolver_owned);
@@ -4093,6 +4096,7 @@ async fn register_delegate_tool(
         let plan_stage = plan_stage.clone();
         let delegate_counter = Arc::clone(&delegate_counter_owned);
         let max_delegates = max_delegates_owned;
+        let ledger = ledger.clone();
         // 每次 specialist 创建时 attach。
         let agent_pause_gate = agent_pause_gate.clone();
         Box::pin(async move {
@@ -4116,6 +4120,32 @@ async fn register_delegate_tool(
             if let Some(msg) = plan_gate_rejection(&plan_stage, &role_id) {
                 return Err(tool_err(msg));
             }
+
+            // 派发幂等：同身份（role + task）的派发不做第二遍。
+            // 位置在**计数之前**：重复派发不该消耗 max_delegates 预算。
+            // 也在分配 subsession / 发 DelegateStarted 之前——拒绝不留
+            // 任何副作用（否则 UI 上留下一个永远转圈的分派气泡）。
+            let dispatch_key =
+                crate::dispatch_ledger::DispatchLedger::delegate_key(&role_id, &task);
+            let inflight_guard = match ledger.begin(dispatch_key) {
+                crate::dispatch_ledger::Begin::Fresh(g) => g,
+                crate::dispatch_ledger::Begin::InFlight => {
+                    return Err(tool_err(format!(
+                        "对 '{role_id}' 的这条委派**正在执行中**（同一 role + task）。\
+                         不要重复派发：等它返回即可。若确实需要不同的工作，请修改 task 描述。"
+                    )));
+                }
+                crate::dispatch_ledger::Begin::Done(prev) => {
+                    // 已经干过一遍且成功了 —— 直接复用，省掉整次
+                    // specialist 往返（几十秒到十几分钟）与重复副作用。
+                    let _ = event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "↩ 复用已完成的委派结果（{role_id}）：同一 role + task 不重复派发"
+                        ),
+                    });
+                    return Ok(serde_json::Value::String(prev));
+                }
+            };
 
             // 单 session 内 delegate 计数检查：超过 max_delegates 直接拒。
             // `max_delegates == 0` 时关闭此功能（向后兼容）。fetch_add
@@ -4528,6 +4558,11 @@ async fn register_delegate_tool(
                         sub_id: sub_id.clone(),
                         wf_id: None,
                     });
+                    // 只缓存成功：失败可能是瞬时的（模型不可用），换个
+                    // 时机重试是合理的，重复失败由 max_delegates 与
+                    // supervisor 兜。guard 未 complete 就 drop → 在飞
+                    // 标记自动摘除，同身份可重试。
+                    inflight_guard.complete(response.clone());
                     Ok(serde_json::Value::String(response))
                 }
                 Err(e) => {
@@ -4649,6 +4684,10 @@ async fn register_workflow_tool(
     let merged_owned = Arc::new(merged.clone());
     let resolver_owned = Arc::new(resolver.clone());
     let agent_pause_gate_owned = agent_pause_gate.clone();
+    // 派发幂等台账：同 (name, topic, resume) 的 workflow 不并发跑两条。
+    // 两条同身份流水线会互相踩 staging 区、各写一份 checkpoint，产出
+    // 谁覆盖谁取决于时序。
+    let wf_ledger = crate::dispatch_ledger::DispatchLedger::new();
 
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
@@ -4663,6 +4702,7 @@ async fn register_workflow_tool(
         let advisor_gate = advisor_gate.clone();
         let advisor_pause = advisor_pause.clone();
         let cwd = cwd.clone();
+        let wf_ledger = wf_ledger.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
             let name = input
@@ -4685,6 +4725,23 @@ async fn register_workflow_tool(
                     "missing 'topic' field (required unless 'resume' is given)".into(),
                 ));
             }
+
+            // 派发幂等：同身份流水线正在跑就拒。**不**缓存已完成的
+            // workflow —— 同一 topic 再跑一遍常常是有意的（改了配置、
+            // 想要新一版方案），而且 workflow 有真实副作用，复用旧
+            // 摘要会掩盖「这次什么都没跑」。这里只防并发重入。
+            let wf_key = crate::dispatch_ledger::DispatchLedger::workflow_key(
+                &name,
+                &topic,
+                resume.as_deref(),
+            );
+            let Some(_wf_guard) = wf_ledger.begin_exclusive(wf_key) else {
+                return Err(tool_err(format!(
+                    "workflow '{name}' 针对同一 topic 的运行**正在进行中**。\
+                     不要重复启动：等它返回即可（两条同身份流水线会互相踩 staging 区\
+                     与 checkpoint，产出谁覆盖谁取决于时序）。"
+                )));
+            };
 
             let wf = crate::workflow::load_workflow(&name, &cwd).map_err(|e| {
                 let available = crate::workflow::list_workflows(&cwd)
@@ -5807,6 +5864,161 @@ mod tests {
         assert!(out["options"].is_array(), "已经是数组的不动");
         // question 是 String 声明，字符串照旧。
         assert_eq!(out["question"], "q");
+    }
+
+    /// 派发幂等：同一 (role, task) 的第二次 delegate 直接复用上次结果，
+    /// **不再打模型**、不再产生副作用。
+    ///
+    /// 此前没有任何一道闸管这件事：`dedupe_native_tool_calls` 只管同一
+    /// 条响应内；`LoopDetector` 每轮重建、阈值是同轮连续 3 次；
+    /// `Supervisor` 看的是被压成不带参数的字符串 `"delegate"`（既误伤
+    /// 连续 3 轮的合法分工，又看不见同轮重复）。一次委派几十秒到十几
+    /// 分钟，白跑一遍是实打实的代价。
+    #[tokio::test]
+    async fn duplicate_delegate_reuses_previous_result_without_calling_model_again() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "专家结论：这段逻辑应当收敛到单一入口，理由与证据如下，长度足够越过 advisor 的短输出阈值。" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string();
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(body)),
+            )
+            .await;
+
+        let merged = AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "programmer".to_string(),
+                RoleTemplate {
+                    id: "programmer".into(),
+                    name: "programmer".into(),
+                    category: "execution".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(64);
+        register_delegate_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "ui-test".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            fresh_plan_stage(),
+            crate::pause_gate::AgentPauseGate::new("test"),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
+        )
+        .await
+        .expect("register delegate");
+
+        let args = serde_json::json!({ "role": "programmer", "task": "收敛重复入口" });
+
+        let first = tm
+            .execute("delegate", args.clone(), None)
+            .await
+            .expect("首次派发应成功");
+        let calls_after_first = server.received_requests().await.unwrap().len();
+        assert!(calls_after_first >= 1, "首次必须真的打了模型");
+
+        // 第二次同身份派发：结果一致，且模型请求数**没有增加**。
+        let second = tm
+            .execute("delegate", args.clone(), None)
+            .await
+            .expect("重复派发应直接复用，不该报错");
+        assert_eq!(first, second, "复用的结果必须与首次一致");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            calls_after_first,
+            "重复派发不得再打模型"
+        );
+
+        // 复用要对用户可见（Status），且**不能**再发一对
+        // DelegateStarted/Finished（否则 UI 上凭空多一条分派记录）。
+        let mut started = 0usize;
+        let mut reuse_notices = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ChatEvent::DelegateStarted { .. } => started += 1,
+                ChatEvent::Status { message } if message.contains("复用已完成的委派结果") => {
+                    reuse_notices += 1
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(started, 1, "只应有首次派发的 DelegateStarted");
+        assert_eq!(reuse_notices, 1, "复用要发一条 Status 让用户看见");
+
+        // 换一个 task → 不该被挡住（会真的再打模型）。
+        let other = tm
+            .execute(
+                "delegate",
+                serde_json::json!({ "role": "programmer", "task": "另一件事" }),
+                None,
+            )
+            .await
+            .expect("不同任务应正常派发");
+        assert!(
+            server.received_requests().await.unwrap().len() > calls_after_first,
+            "不同任务必须真的派发出去"
+        );
+        assert!(!other.as_str().unwrap_or_default().is_empty());
     }
 
     /// 阻塞 ask 收到答案必须**立刻**落盘，然后同一问题再问时直接回放
