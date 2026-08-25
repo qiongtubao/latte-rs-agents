@@ -335,7 +335,7 @@ ChatController 实时事件流。每个会话独立推送。
 | `WorkflowFinished` | `name` / `wf_id` / `status` / `summary` | workflow 结束 |
 | `ImageGenerated` | `role_id` / `path` / `prompt` | generate_image 产物 |
 | `PlanProposed` | `role_id` / `plan_id` / `tasks` | plan 工具提交；slash 命令跑完的 workflow 产出含任务清单时也会代发 |
-| `ChoiceRequested` | `role_id` / `choice_id` / `question` / `multi` / `layout` / `allow_upload` / `wait` / `options` | ask 工具弹框（`wait=true` = 子代理阻塞等答，答案走 `/api/chat/choice-answer`） |
+| `ChoiceRequested` | `role_id` / `choice_id` / `question` / `multi` / `layout` / `allow_upload` / `wait` / `options` | ask 工具弹框（`wait=true` = 子代理阻塞等答，答案走 `/api/chat/choice-answer`）。`options[]` = `ChoiceOption`：`label` / `description?` / `image?` / `recommended?` / `pros?` / `cons?` / `details?`（后三项供前端「详情」按钮展开优缺点）。UI 收到即弹居中弹窗，收起后右下角留待办铃 |
 | `TimeoutWarning` | `role_id` / `elapsed_secs` / `soft_timeout_secs` / `hard_timeout_secs` / `sub_id?` | 软超时 |
 | `AdvisorTerminated` | `role_id` / `reason` / `detector?` / `sub_id?` | advisor 终止 |
 | `UserMessage` | `text` | 客户端回放用 |

@@ -125,6 +125,12 @@ export interface ChoiceOption {
   description?: string;
   image?: string;
   recommended?: boolean;
+  /** 优点清单（「详情」面板）。 */
+  pros?: string[];
+  /** 缺点/风险清单（「详情」面板）。 */
+  cons?: string[];
+  /** 详情补充说明长文本。 */
+  details?: string;
 }
 
 export interface BridgeTask {

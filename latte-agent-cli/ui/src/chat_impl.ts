@@ -618,12 +618,193 @@ export function mountChat(opts: {
     if (isNearBottom()) scrollToBottom();
     return row;
   }
-  // ── ask 选择框（内联渲染在系统消息气泡里）──
+  // ── ask 选择框（弹窗 + 消息流内联卡片）──
   // ChoiceRequested 事件触发。选项/说明/图片来自模型（不可信），一律
   // 用 textContent / img.src 构建，绝不 innerHTML 拼接。回传分两路：
   // wait=true（子代理阻塞等答）→ POST choice-answer 直达等待方；
   // wait=false/缺省（顶层 turn）→ 拼成 user 消息经 sendMessage 回喂
   // （后端会 echo 一条 UserMessage 事件渲染用户气泡，这里不手动补）。
+  //
+  // 呈现：卡片本体建在消息流里（历史留痕），随后**被移进居中弹窗**
+  // （同一个 DOM 节点搬家，状态/监听全保留）。用户不下拉到底也能看
+  // 见「会话正卡在等你选择」。收起弹窗后右下角留一枚待办铃，可随时
+  // 重新展开。
+
+  /** 一次待回答的选择（卡片 + 它在消息流里的归属地）。 */
+  interface ChoiceEntry {
+    e: ChoiceRequestedEvent;
+    /** 选择卡片本体。在消息流与弹窗之间搬家，永远只有一份。 */
+    card: HTMLElement;
+    /** 卡片在消息流里的家（system 消息行）。弹窗关闭时归位。 */
+    home: HTMLElement;
+    /** 卡片被移进弹窗时，home 里显示的「点此展开」占位。 */
+    hint: HTMLElement;
+    /** 已提交 / 已跳过。 */
+    answered: boolean;
+    /** 用户主动收起过：不再自动弹，只能由待办铃点开。 */
+    collapsed: boolean;
+  }
+  const choiceQueue: ChoiceEntry[] = [];
+  let activeChoice: ChoiceEntry | null = null;
+  let choiceOverlayEl: HTMLElement | null = null;
+  let choicePillEl: HTMLElement | null = null;
+  let choiceKeyHandler: ((ev: KeyboardEvent) => void) | null = null;
+
+  function pendingChoices(): ChoiceEntry[] {
+    return choiceQueue.filter((x) => !x.answered);
+  }
+
+  /** 右下角待办铃：还有没在弹窗里显示的待答选择时出现。 */
+  function refreshChoicePill(): void {
+    const waiting = pendingChoices().filter((x) => x !== activeChoice);
+    if (waiting.length === 0) {
+      choicePillEl?.remove();
+      choicePillEl = null;
+      return;
+    }
+    if (!choicePillEl) {
+      const pill = document.createElement("button");
+      pill.type = "button";
+      pill.className = "choice-pending-pill";
+      pill.addEventListener("click", () => {
+        const next = pendingChoices().find((x) => x !== activeChoice);
+        if (!next) return;
+        next.collapsed = false;
+        openChoiceModal(next);
+      });
+      document.body.appendChild(pill);
+      choicePillEl = pill;
+    }
+    choicePillEl.textContent =
+      waiting.length === 1
+        ? "❓ 有 1 个选择等你回答 · 点击展开"
+        : `❓ 有 ${waiting.length} 个选择等你回答 · 点击展开`;
+  }
+
+  /** 关掉弹窗外壳，把卡片搬回消息流。不改 answered/collapsed。 */
+  function teardownChoiceModal(): void {
+    const entry = activeChoice;
+    activeChoice = null;
+    if (choiceKeyHandler) {
+      document.removeEventListener("keydown", choiceKeyHandler);
+      choiceKeyHandler = null;
+    }
+    if (entry) {
+      entry.home.appendChild(entry.card);
+      entry.hint.remove();
+    }
+    choiceOverlayEl?.remove();
+    choiceOverlayEl = null;
+  }
+
+  /** 用户收起弹窗（Esc / 点遮罩 / 点「稍后再选」）：卡片归位，留铃。 */
+  function collapseChoiceModal(): void {
+    if (activeChoice) activeChoice.collapsed = true;
+    teardownChoiceModal();
+    refreshChoicePill();
+  }
+
+  /** 把某个待答选择放进居中弹窗。 */
+  function openChoiceModal(entry: ChoiceEntry): void {
+    if (activeChoice === entry) return;
+    if (entry.answered) return;
+    // 让位：正在显示的那个先收起（保留在队列里，铃里还能点回来）。
+    if (activeChoice) collapseChoiceModal();
+    activeChoice = entry;
+    entry.collapsed = false;
+
+    const overlay = document.createElement("div");
+    overlay.className = "choice-overlay";
+    overlay.id = "choice-modal";
+    const box = document.createElement("div");
+    box.className = "choice-modal";
+    overlay.appendChild(box);
+
+    const head = document.createElement("div");
+    head.className = "choice-modal__head";
+    const title = document.createElement("div");
+    title.className = "choice-modal__title";
+    title.textContent = `❓ ${entry.e.role_id} 请你选择`;
+    head.appendChild(title);
+    if (entry.e.wait) {
+      const blocked = document.createElement("span");
+      blocked.className = "choice-modal__blocked";
+      blocked.textContent = "已阻塞等待你的回答";
+      head.appendChild(blocked);
+    }
+    const later = document.createElement("button");
+    later.type = "button";
+    later.className = "choice-modal__later";
+    later.textContent = "稍后再选";
+    later.title = "收起弹窗（Esc）；右下角待办铃可重新展开";
+    later.addEventListener("click", collapseChoiceModal);
+    head.appendChild(later);
+    box.appendChild(head);
+
+    const body = document.createElement("div");
+    body.className = "choice-modal__body";
+    body.appendChild(entry.card); // 搬家：同一节点，状态不丢
+    box.appendChild(body);
+
+    // home 里留个可点的占位，说明卡片去哪了。
+    entry.hint.textContent = "（选择框已弹出显示 · 点此重新展开）";
+    entry.hint.style.display = "";
+    entry.home.appendChild(entry.hint);
+
+    // 点遮罩空白处 = 收起；点弹窗内部不关。
+    overlay.addEventListener("click", (ev) => {
+      if (ev.target === overlay) collapseChoiceModal();
+    });
+    choiceKeyHandler = (ev: KeyboardEvent) => {
+      // 弹窗已不在文档里（session 切换 / 整个 chat 被重挂）→ 顺手摘掉
+      // 监听并放行按键，别让僵尸实例继续响应 Esc。
+      if (!choiceOverlayEl || !choiceOverlayEl.isConnected) {
+        if (choiceKeyHandler) document.removeEventListener("keydown", choiceKeyHandler);
+        choiceKeyHandler = null;
+        return;
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        collapseChoiceModal();
+      }
+    };
+    document.addEventListener("keydown", choiceKeyHandler);
+
+    document.body.appendChild(overlay);
+    choiceOverlayEl = overlay;
+    refreshChoicePill();
+  }
+
+  /** 队列里挑下一个「没被用户收起过」的待答选择自动弹出。 */
+  function pumpChoiceQueue(): void {
+    if (!activeChoice) {
+      const next = pendingChoices().find((x) => !x.collapsed);
+      if (next) {
+        openChoiceModal(next); // 内部会刷新待办铃
+        return;
+      }
+    }
+    // 弹窗已被别的选择占着（或都被用户收起）→ 至少把待办铃摆出来。
+    refreshChoicePill();
+  }
+
+  /** 卡片已提交/跳过：关弹窗、卡片归位（answered 态留在消息流里）。 */
+  function settleChoice(entry: ChoiceEntry): void {
+    entry.answered = true;
+    if (activeChoice === entry) teardownChoiceModal();
+    entry.hint.remove();
+    refreshChoicePill();
+    pumpChoiceQueue();
+  }
+
+  /** 切 session / clear / replay 结束：清掉弹窗与待办铃，不留僵尸框。 */
+  function clearChoiceDialogs(): void {
+    teardownChoiceModal();
+    choiceQueue.length = 0;
+    choicePillEl?.remove();
+    choicePillEl = null;
+  }
+
   function renderChoiceDialog(
     bubble: HTMLElement,
     e: ChoiceRequestedEvent,
@@ -638,6 +819,22 @@ export function mountChat(opts: {
     const card = document.createElement("div");
     card.className = "choice-card" + (grid ? " grid" : "") + (archived ? " answered" : "");
     card.dataset.choiceId = e.choice_id;
+    /** 本卡片在队列里的登记项；建完卡片后赋值（finish 里闭包引用）。 */
+    let entry: ChoiceEntry | null = null;
+
+    // 卡片自带标题（弹窗里就是弹窗标题区下的问题正文）：单选/多选
+    // 一眼可辨——用户此前根本看不出这道题能不能多选。
+    const head = document.createElement("div");
+    head.className = "choice-head";
+    const chip = document.createElement("span");
+    chip.className = "choice-chip" + (multi ? " multi" : "");
+    chip.textContent = multi ? "多选 · 可勾选多项" : grid ? "单选 · 图片" : "单选";
+    head.appendChild(chip);
+    const questionEl = document.createElement("div");
+    questionEl.className = "choice-question";
+    questionEl.textContent = e.question;
+    head.appendChild(questionEl);
+    card.appendChild(head);
 
     const optsWrap = document.createElement("div");
     optsWrap.className = "choice-opts" + (grid ? " grid" : "");
@@ -677,7 +874,8 @@ export function mountChat(opts: {
         el.classList.toggle("sel", sel);
       });
       const ans = answersText();
-      statusLine.textContent = ans.length ? "已选：" + ans.join("、") : "未选择";
+      statusLine.textContent = ans.length ? "已选：" + ans.join("、") : multi ? "未选择（可勾选多项）" : "未选择";
+      submitBtn.textContent = multi && ans.length > 1 ? `提交（${ans.length} 项）` : "提交";
       submitBtn.disabled = ans.length === 0;
     }
     function pick(idx: number): void {
@@ -692,6 +890,44 @@ export function mountChat(opts: {
       }
       refresh();
     }
+
+    /** 优缺点/详情面板（「详情」按钮展开）。无内容时不建。 */
+    const buildDetailPanel = (o: ChoiceOption): HTMLElement | null => {
+      const pros = (o.pros ?? []).filter((s) => s.trim());
+      const cons = (o.cons ?? []).filter((s) => s.trim());
+      const extra = (o.details ?? "").trim();
+      if (pros.length === 0 && cons.length === 0 && !extra) return null;
+      const wrap = document.createElement("div");
+      wrap.className = "choice-detail";
+      wrap.hidden = true;
+      const addList = (heading: string, items: string[], cls: string): void => {
+        if (items.length === 0) return;
+        const sec = document.createElement("div");
+        sec.className = `choice-detail__sec ${cls}`;
+        const h = document.createElement("div");
+        h.className = "choice-detail__heading";
+        h.textContent = heading;
+        sec.appendChild(h);
+        const ul = document.createElement("ul");
+        ul.className = "choice-detail__list";
+        for (const it of items) {
+          const li = document.createElement("li");
+          li.textContent = it.trim();
+          ul.appendChild(li);
+        }
+        sec.appendChild(ul);
+        wrap.appendChild(sec);
+      };
+      addList("✅ 优点", pros, "pros");
+      addList("⚠️ 缺点 / 风险", cons, "cons");
+      if (extra) {
+        const p = document.createElement("div");
+        p.className = "choice-detail__text";
+        p.textContent = extra;
+        wrap.appendChild(p);
+      }
+      return wrap;
+    };
 
     // 渲染一个选项行/格。
     const buildOpt = (o: ChoiceOption | null, idx: number, isOther: boolean): HTMLElement => {
@@ -726,6 +962,24 @@ export function mountChat(opts: {
         desc.className = "choice-desc";
         desc.textContent = o.description;
         txt.appendChild(desc);
+      }
+      // 「详情」按钮：展开该方案的优缺点，不触发选中（stopPropagation）。
+      const detail = o ? buildDetailPanel(o) : null;
+      if (detail) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "choice-detail-btn";
+        btn.textContent = "详情 ▾";
+        btn.title = "查看该方案的优缺点";
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const show = detail.hidden;
+          detail.hidden = !show;
+          btn.textContent = show ? "收起 ▴" : "详情 ▾";
+          btn.classList.toggle("open", show);
+        });
+        txt.appendChild(btn);
+        txt.appendChild(detail);
       }
       if (isOther) {
         const inp = document.createElement("input");
@@ -809,6 +1063,8 @@ export function mountChat(opts: {
       void dismissPrompt(e.choice_id).catch((err) =>
         console.warn("[chat] prompt dismiss failed:", err),
       );
+      // 关弹窗、卡片搬回消息流（answered 态留痕），弹下一个待答的。
+      if (entry) settleChoice(entry);
       if (sendText === null) return;
       const showError = (err: unknown) => {
         console.error("[chat] choice submit failed:", err);
@@ -873,6 +1129,21 @@ export function mountChat(opts: {
     }
 
     bubble.appendChild(card);
+
+    // 登记进弹窗队列。存档态（history 重放出来的历史选择题）不弹窗、
+    // 不留铃——那是已经发生过的事，不该冒出个僵尸弹框要求用户回答。
+    // 真正还在等的那条会经 pending-prompts 以 live 事件再来一次
+    // （archived=false），那时才弹。
+    if (archived) return;
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "choice-moved-hint";
+    hint.style.display = "none";
+    hint.addEventListener("click", () => { if (entry) openChoiceModal(entry); });
+    bubble.appendChild(hint);
+    entry = { e, card, home: bubble, hint, answered: false, collapsed: false };
+    choiceQueue.push(entry);
+    pumpChoiceQueue();
   }
 
   // ── advisor 暂停拍板卡片 ──
@@ -2423,8 +2694,10 @@ export function mountChat(opts: {
           resetWaitTimer();
           break;
         }
-        // ask 工具抛出的选择题：渲染一条系统消息 + 内联选择卡片。
-        // 用户在卡片里选择/上传后，选择结果作为下一条 user 消息回喂角色。
+        // ask 工具抛出的选择题：消息流里留一条系统消息 + 选择卡片，
+        // 卡片随即被搬进居中弹窗（renderChoiceDialog 内部处理），用户
+        // 不用下拉到底也知道会话正等着自己回答。选择结果按 wait 分两
+        // 路回传（choice-answer 直达 / 作为下一条 user 消息）。
         const msg = addMessage({
           kind: "system",
           content: `❓ ${e.role_id} 请你选择：${e.question}`,
@@ -2560,6 +2833,8 @@ export function mountChat(opts: {
       clearTimeout(pendingPlanTimer as number);
       (window as unknown as Record<string, unknown>).__planDebounceTimer = undefined;
     }
+    // 上一个 session 的选择弹窗/待办铃不能跟着漂到新 session。
+    clearChoiceDialogs();
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {

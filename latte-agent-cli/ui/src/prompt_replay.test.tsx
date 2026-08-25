@@ -98,7 +98,12 @@ const plan = (planId: string): ChatEvent => ({
   tasks: [{ title: "拆 ringbuf" }],
 });
 
-const cards = (root: HTMLElement, id: string): HTMLElement[] =>
+/** 找出某个弹框渲染出的卡片。
+ *
+ *  注意作用域：**可交互**（live）卡片会被搬进居中弹窗（挂在
+ *  `document.body` 上，不在 messagesEl 里），只有存档卡片留在消息流。
+ *  所以默认按整个文档找，需要区分位置的用例显式传 `messagesEl`。 */
+const cards = (root: HTMLElement | Document, id: string): HTMLElement[] =>
   [...root.querySelectorAll(`.choice-card[data-choice-id="${id}"]`)] as HTMLElement[];
 
 describe("弹框补齐与去重", () => {
@@ -109,12 +114,12 @@ describe("弹框补齐与去重", () => {
   });
 
   it("同一 choice_id 重复到达只渲染一张卡", () => {
-    const { chat, messagesEl } = mount();
+    const { chat } = mount();
     chat.handleEvent(choice("choice-programmer-1"));
     // SSE 新连接的 replay 前缀 + GET pending-prompts 会各送一遍。
     chat.handleEvent(choice("choice-programmer-1"));
     chat.handleEvent(choice("choice-programmer-1"));
-    expect(cards(messagesEl, "choice-programmer-1")).toHaveLength(1);
+    expect(cards(document, "choice-programmer-1")).toHaveLength(1);
   });
 
   it("history 重放渲染成存档态（不可点），补拉的 live 事件替换成可交互", () => {
@@ -127,27 +132,29 @@ describe("弹框补齐与去重", () => {
     expect((archived[0].querySelector(".choice-opts") as HTMLElement).style.display).toBe("none");
     expect((archived[0].querySelector(".choice-foot") as HTMLElement).style.display).toBe("none");
 
-    // pending-prompts 说它其实还没答 → 替换成可交互卡片（仍只有一张）。
+    // pending-prompts 说它其实还没答 → 替换成可交互卡片（仍只有一张），
+    // 并立刻弹进居中弹窗（所以按整个文档找，不是 messagesEl）。
     chat.handleEvent(choice("choice-programmer-2"));
-    const live = cards(messagesEl, "choice-programmer-2");
+    const live = cards(document, "choice-programmer-2");
     expect(live).toHaveLength(1);
     expect(live[0].classList.contains("answered")).toBe(false);
     expect((live[0].querySelector(".choice-opts") as HTMLElement).style.display).not.toBe("none");
+    expect(document.querySelector(".choice-overlay"), "live 卡片应在弹窗里").toBeTruthy();
   });
 
   it("提交选择后调 prompt-dismiss 销账（重连不再补出僵尸框）", () => {
-    const { chat, messagesEl } = mount();
+    const { chat } = mount();
     chat.handleEvent(choice("choice-programmer-3"));
-    const card = cards(messagesEl, "choice-programmer-3")[0];
+    const card = cards(document, "choice-programmer-3")[0];
     (card.querySelector(".choice-opt") as HTMLElement).click();
     (card.querySelector(".choice-submit") as HTMLButtonElement).click();
     expect(dismissPrompt).toHaveBeenCalledWith("choice-programmer-3");
   });
 
   it("跳过也算已处理，同样销账", () => {
-    const { chat, messagesEl } = mount();
+    const { chat } = mount();
     chat.handleEvent(choice("choice-programmer-4"));
-    const card = cards(messagesEl, "choice-programmer-4")[0];
+    const card = cards(document, "choice-programmer-4")[0];
     (card.querySelector(".choice-skip") as HTMLButtonElement).click();
     expect(dismissPrompt).toHaveBeenCalledWith("choice-programmer-4");
   });
@@ -185,14 +192,16 @@ describe("弹框补齐与去重", () => {
   });
 
   it("clear 后同一弹框能重新渲染（去重表不能跨会话留存）", () => {
-    const { chat, messagesEl } = mount();
+    const { chat } = mount();
     chat.handleEvent(choice("choice-programmer-5"));
-    expect(cards(messagesEl, "choice-programmer-5")).toHaveLength(1);
+    expect(cards(document, "choice-programmer-5")).toHaveLength(1);
     chat.clear();
-    expect(cards(messagesEl, "choice-programmer-5")).toHaveLength(0);
+    // clear 连弹窗一起带走（卡片 + 遮罩都不留）。
+    expect(cards(document, "choice-programmer-5")).toHaveLength(0);
+    expect(document.querySelector(".choice-overlay")).toBeNull();
     // 重放/补拉必须能再渲染出来，否则聊天区永远缺这一条。
     chat.handleEvent(choice("choice-programmer-5"));
-    expect(cards(messagesEl, "choice-programmer-5")).toHaveLength(1);
+    expect(cards(document, "choice-programmer-5")).toHaveLength(1);
   });
 
   it("重启后（历史里有弹框、pending 表已空）可经「仍要回答」复活，强制走普通消息", () => {

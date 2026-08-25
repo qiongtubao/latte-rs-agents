@@ -3797,3 +3797,147 @@ select {
   background: transparent; color: var(--fg-2);
 }
 .choice-revive:hover { border-color: var(--fg-2); color: var(--fg); }
+
+/* 卡片标题区：单选/多选一眼可辨 + 问题正文 */
+.choice-head {
+  padding: 11px 13px 9px;
+  border-bottom: 1px solid var(--border);
+  background: linear-gradient(180deg, #eff6ff, transparent);
+}
+.choice-card.answered .choice-head { background: none; }
+.choice-chip {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--accent-2);
+  background: #dbeafe;
+  padding: 2px 8px;
+  border-radius: 20px;
+  margin-bottom: 5px;
+}
+.choice-chip.multi { color: #7c3aed; background: #ede9fe; }
+.choice-question { font-size: 14px; font-weight: 600; line-height: 1.5; }
+
+/* 「详情」按钮 + 优缺点面板 */
+.choice-detail-btn {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-2, #f8fafc);
+  color: var(--accent-2);
+  font-size: 11.5px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+.choice-detail-btn:hover { border-color: var(--accent); }
+.choice-detail-btn.open { background: #eff6ff; border-color: var(--accent); }
+.choice-detail {
+  margin-top: 7px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 9px;
+  background: var(--bg-2, #f8fafc);
+  font-size: 12px;
+}
+.choice-detail__sec + .choice-detail__sec { margin-top: 6px; }
+.choice-detail__heading { font-weight: 700; font-size: 11.5px; color: var(--fg-2); }
+.choice-detail__list { margin: 3px 0 0; padding-left: 18px; }
+.choice-detail__list li { margin: 1px 0; line-height: 1.5; }
+.choice-detail__sec.pros li { color: #15803d; }
+.choice-detail__sec.cons li { color: #b45309; }
+.choice-detail__text { margin-top: 6px; color: var(--fg-2); white-space: pre-wrap; }
+
+/* ─── ask 选择框：居中弹窗（卡片从消息流搬进来）───────────────── */
+.choice-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 600;
+  padding: 24px;
+}
+.choice-modal {
+  background: var(--bubble-bg, #fff);
+  border-radius: 16px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+  width: min(620px, 94vw);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: choice-pop 0.16s ease-out;
+}
+@keyframes choice-pop {
+  from { transform: translateY(8px) scale(0.98); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.choice-modal__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-2, #f8fafc);
+}
+.choice-modal__title { font-size: 14.5px; font-weight: 700; flex: 1; min-width: 0; }
+.choice-modal__blocked {
+  font-size: 11px;
+  font-weight: 700;
+  color: #b45309;
+  background: #fef3c7;
+  border-radius: 20px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+.choice-modal__later {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--fg-2);
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.choice-modal__later:hover { border-color: var(--fg-2); color: var(--fg); }
+.choice-modal__body { overflow-y: auto; padding: 12px 14px 16px; }
+/* 弹窗里的卡片不需要再顶一段外边距/描边阴影 */
+.choice-modal__body .choice-card { margin-top: 0; box-shadow: none; }
+
+/* 收起后：消息流里的占位入口 + 右下角待办铃 */
+.choice-moved-hint {
+  display: block;
+  margin-top: 8px;
+  border: 1px dashed var(--accent);
+  border-radius: 10px;
+  background: #eff6ff;
+  color: var(--accent-2);
+  font-size: 12px;
+  padding: 7px 11px;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+}
+.choice-pending-pill {
+  position: fixed;
+  right: 22px;
+  bottom: 96px;
+  z-index: 590;
+  border: none;
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 8px 22px rgba(37, 99, 235, 0.35);
+  cursor: pointer;
+  animation: choice-pulse 1.8s ease-in-out infinite;
+}
+.choice-pending-pill:hover { background: var(--accent-2); animation: none; }
+@keyframes choice-pulse {
+  0%, 100% { box-shadow: 0 8px 22px rgba(37, 99, 235, 0.35); }
+  50% { box-shadow: 0 8px 30px rgba(37, 99, 235, 0.7); }
+}

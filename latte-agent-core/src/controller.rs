@@ -618,9 +618,51 @@ where
     Ok(lenient_bool(&v).unwrap_or(false))
 }
 
+/// serde 适配器：把「优点/缺点」这类清单字段宽松地读成 `Vec<String>`。
+/// 模型对清单的写法五花八门：裸数组、换行/分号分隔的长字符串、
+/// `[{"text": "..."}]` 对象数组。严格类型会让整次提问失败，而一条
+/// 优缺点不值得废掉弹框——无法识别的形态一律退化成空清单。
+fn de_string_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = <serde_json::Value as serde::Deserialize>::deserialize(d)?;
+    Ok(lenient_string_list(&v))
+}
+
+/// 见 [`de_string_list`]。抽出成独立函数便于单测。
+fn lenient_string_list(v: &serde_json::Value) -> Vec<String> {
+    /// 单条文本：去掉行首的 `- ` / `* ` / `• ` 项目符号并 trim。
+    fn norm(s: &str) -> Option<String> {
+        let t = s.trim().trim_start_matches(['-', '*', '•']).trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+    match v {
+        // 长字符串：按换行 / 分号（中英文）切分。
+        serde_json::Value::String(s) => s
+            .split(['\n', ';', '；'])
+            .filter_map(norm)
+            .collect(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(s) => norm(s),
+                // `[{"text": "..."}]` / `{"point": "..."}` 之类：取第一个
+                // 非空字符串字段（不猜键名，取到即可）。
+                serde_json::Value::Object(map) => map
+                    .values()
+                    .filter_map(|x| x.as_str())
+                    .find_map(norm),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// `ask` 工具的单个选项。前端 `ChoiceRequested` 弹框逐项渲染。
 /// 字段与前端 `api.ts` 的 `ChoiceOption` 同构。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceOption {
     /// 选项显示标签，必填非空。
     #[serde(alias = "title", alias = "name", alias = "text")]
@@ -647,6 +689,40 @@ pub struct ChoiceOption {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub recommended: bool,
+    /// 优点清单。前端「详情」按钮展开后逐条渲染（✅ 列表）。
+    /// 宽松解析（见 [`de_string_list`]）：数组 / 换行字符串 / 对象数组都收。
+    #[serde(
+        default,
+        alias = "advantages",
+        alias = "pro",
+        alias = "benefits",
+        alias = "upsides",
+        deserialize_with = "de_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub pros: Vec<String>,
+    /// 缺点 / 风险清单。前端「详情」面板渲染（⚠️ 列表）。
+    #[serde(
+        default,
+        alias = "disadvantages",
+        alias = "con",
+        alias = "risks",
+        alias = "drawbacks",
+        alias = "downsides",
+        deserialize_with = "de_string_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cons: Vec<String>,
+    /// 详情补充说明（多行自由文本），与 pros/cons 一起在「详情」
+    /// 面板里显示。`description` 是列表里那一行短说明，别混用。
+    #[serde(
+        default,
+        alias = "detail_text",
+        alias = "rationale",
+        alias = "notes",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub details: String,
 }
 
 // ─── Controller input ────────────────────────────────────────────
@@ -3553,13 +3629,13 @@ pub(crate) fn register_ask_tool(
             ("options".into(), ToolInputProperty {
                 property_type: PropertyType::Array,
                 description: Some(
-                    "候选项数组，2-6 项。每项是对象：{label(必填,简短标签), description(可选,一行取舍说明), image(可选,配图URL,一般是 /api/images/<file>), recommended(可选,true 标记推荐项)}. 不要自己加“其他/Other”项——前端会自动附带“其他(自定义)”入口。".into()
+                    "候选项数组，2-6 项。每项是对象：{label(必填,简短标签), description(可选,一行取舍说明), pros(可选,字符串数组,该方案的优点), cons(可选,字符串数组,该方案的缺点/风险), details(可选,补充说明长文本), image(可选,配图URL,一般是 /api/images/<file>), recommended(可选,true 标记推荐项)}. 方案之间有取舍时**务必填 pros/cons**——UI 的「详情」按钮就是展开这两项给用户比较优缺点的。不要自己加“其他/Other”项——前端会自动附带“其他(自定义)”入口。".into()
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
             }),
             ("multi".into(), ToolInputProperty {
                 property_type: PropertyType::Boolean,
-                description: Some("是否允许多选（默认 false = 单选）。".into()),
+                description: Some("是否允许多选（默认 false = 单选）。问题本身允许同时选中多项（例如“启用哪些模块”“需要覆盖哪些场景”）时请显式传 true，UI 会渲染成复选框。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
             }),
             ("layout".into(), ToolInputProperty {
@@ -5695,6 +5771,90 @@ mod tests {
 
     // ─── ask 阻塞模式（workflow/delegate 子代理）──
 
+    /// 优缺点清单的宽松解析：模型的写法五花八门，任何一种都不该让
+    /// 整次提问失败，也不该静默丢掉优缺点（「详情」按钮会没内容）。
+    #[test]
+    fn choice_option_parses_lenient_pros_cons_and_aliases() {
+        // 标准形态：pros/cons 裸字符串数组。
+        let o: ChoiceOption = serde_json::from_value(serde_json::json!({
+            "label": "JWT",
+            "pros": ["无状态", "客户端友好"],
+            "cons": ["撤销难"],
+            "details": "适合 API 客户端。"
+        }))
+        .expect("standard shape");
+        assert_eq!(o.pros, vec!["无状态", "客户端友好"]);
+        assert_eq!(o.cons, vec!["撤销难"]);
+        assert_eq!(o.details, "适合 API 客户端。");
+
+        // 别名 + 长字符串（换行/分号分隔）+ 项目符号前缀。
+        let o: ChoiceOption = serde_json::from_value(serde_json::json!({
+            "label": "OAuth2",
+            "advantages": "- 委托授权\n- 生态成熟；标准化",
+            "risks": [{"text": "实现复杂"}, {"text": "依赖外部 IdP"}],
+            "rationale": "对接第三方身份提供方时首选。"
+        }))
+        .expect("alias shape");
+        assert_eq!(o.pros, vec!["委托授权", "生态成熟", "标准化"]);
+        assert_eq!(o.cons, vec!["实现复杂", "依赖外部 IdP"]);
+        assert_eq!(o.details, "对接第三方身份提供方时首选。");
+
+        // 无法识别的形态退化成空清单，不报错（弹框照样能弹）。
+        let o: ChoiceOption = serde_json::from_value(serde_json::json!({
+            "label": "Session",
+            "pros": 42,
+            "cons": null
+        }))
+        .expect("garbage must not fail the whole ask");
+        assert!(o.pros.is_empty() && o.cons.is_empty());
+
+        // 缺省时不序列化，前端拿不到多余空字段。
+        let bare = serde_json::to_value(ChoiceOption {
+            label: "裸选项".into(),
+            ..Default::default()
+        })
+        .expect("serialize");
+        let map = bare.as_object().expect("object");
+        assert!(!map.contains_key("pros"));
+        assert!(!map.contains_key("cons"));
+        assert!(!map.contains_key("details"));
+
+        // `detail` 仍归 description（历史别名），别被 `details` 抢走。
+        let o: ChoiceOption = serde_json::from_value(serde_json::json!({
+            "label": "x", "detail": "一行说明"
+        }))
+        .expect("legacy detail alias");
+        assert_eq!(o.description, "一行说明");
+        assert!(o.details.is_empty());
+    }
+
+    /// 弹框事件必须把 pros/cons 透传给前端（「详情」面板的数据源）。
+    #[tokio::test]
+    async fn ask_event_carries_pros_cons_and_multi() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "architect".into(), None).expect("register ask");
+
+        let input = serde_json::json!({
+            "question": "鉴权方案？",
+            "multiSelect": "true",   // 宽松布尔 + 别名
+            "options": [
+                {"label": "JWT", "pros": ["无状态"], "cons": ["撤销难"]},
+                {"label": "Session", "desc": "服务端存会话"}
+            ]
+        });
+        tm.execute("ask", input, None).await.expect("ask call");
+
+        let ev = rx.try_recv().expect("ChoiceRequested event");
+        let ChatEvent::ChoiceRequested { multi, options, .. } = ev else {
+            panic!("expected ChoiceRequested, got {ev:?}");
+        };
+        assert!(multi, "multiSelect:\"true\" 应识别为多选");
+        assert_eq!(options[0].pros, vec!["无状态"]);
+        assert_eq!(options[0].cons, vec!["撤销难"]);
+        assert_eq!(options[1].description, "服务端存会话");
+    }
+
     fn ask_input() -> serde_json::Value {
         serde_json::json!({
             "question": "选哪个方案？",
@@ -6858,12 +7018,16 @@ mod tests {
                     description: "无状态 Bearer token".into(),
                     image: "/api/images/jwt.png".into(),
                     recommended: true,
+                    pros: vec!["无状态".into()],
+                    cons: vec!["撤销难".into()],
+                    details: "适合 API 客户端。".into(),
                 },
                 ChoiceOption {
                     label: "OAuth2".into(),
                     description: String::new(),
                     image: String::new(),
                     recommended: false,
+                    ..Default::default()
                 },
             ],
         };
@@ -6883,11 +7047,17 @@ mod tests {
         assert_eq!(opts[0]["description"], "无状态 Bearer token");
         assert_eq!(opts[0]["image"], "/api/images/jwt.png");
         assert_eq!(opts[0]["recommended"], true);
+        // 优缺点 / 详情随事件透传（前端「详情」面板的数据源）。
+        assert_eq!(opts[0]["pros"][0], "无状态");
+        assert_eq!(opts[0]["cons"][0], "撤销难");
+        assert_eq!(opts[0]["details"], "适合 API 客户端。");
         // 第二项：空 description/image + recommended=false 被省略。
         assert_eq!(opts[1]["label"], "OAuth2");
         assert!(opts[1].get("description").is_none(), "空 description 应省略");
         assert!(opts[1].get("image").is_none(), "空 image 应省略");
         assert!(opts[1].get("recommended").is_none(), "recommended=false 应省略");
+        assert!(opts[1].get("pros").is_none(), "空 pros 应省略");
+        assert!(opts[1].get("cons").is_none(), "空 cons 应省略");
     }
 
     #[test]

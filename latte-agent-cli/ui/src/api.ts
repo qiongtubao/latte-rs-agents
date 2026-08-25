@@ -1048,6 +1048,12 @@ export interface ChoiceOption {
   /** 配图 URL，一般是 /api/images/<file>。 */
   image?: string;
   recommended?: boolean;
+  /** 该方案的优点清单；「详情」按钮展开后渲染。 */
+  pros?: string[];
+  /** 该方案的缺点/风险清单；「详情」按钮展开后渲染。 */
+  cons?: string[];
+  /** 详情补充说明（长文本），与 pros/cons 同在「详情」面板里。 */
+  details?: string;
 }
 
 /** POST /api/images?ext=<ext>：上传原始图片字节，返回可访问的 URL。
