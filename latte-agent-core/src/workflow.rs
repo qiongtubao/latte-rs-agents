@@ -252,6 +252,32 @@ pub struct WorkflowStepDef {
     /// [`WorkflowDef::validate`]。
     #[serde(default)]
     pub output_from: Option<String>,
+    /// 嵌套 workflow step 专用：把子 workflow 的**若干中间产物**一并
+    /// 带到父级 vars。写法 `父级变量名 = "子 workflow 的 output_key"`：
+    ///
+    /// ```toml
+    /// [[steps]]
+    /// id = "explore"
+    /// workflow = "explore"
+    /// output_key = "exploration"          # 末步的提炼稿
+    /// export = { survey = "exploration" } # 另外带出 survey 原文
+    /// ```
+    ///
+    /// **为什么需要**：`output_from` 只能挑**一个**产物绑到本 step 的
+    /// `output_key`，子 workflow 其余 step 的产出全被丢掉——引擎其实
+    /// 已经把它们算好了（`run_workflow_inner` 返回 `keyed`），只是没有
+    /// 出口。这就是「信息漏斗」：证据在子流程里，下游评审只拿到一份
+    /// 被逐层压缩的结论，想核对也无从核对（jemalloc 实锤：双评审共
+    /// 5 处实测行号错误 —— 它们只看到 proposal，survey 原文里的真实
+    /// 文件与行号根本没往下传）。
+    ///
+    /// 键（父级变量名）与 `output_key` 同一套命名规则：非空、不占用
+    /// [`RESERVED_OUTPUT_KEYS`]、不与本 workflow 任何 step 的
+    /// `output_key` 撞名。导出值只进 `vars` 供 `{{}}` 取用，不进本
+    /// workflow 的 `keyed`——`keyed` 的语义是「本 workflow 各 step 的
+    /// 产出」，混入转口货会让上层的 `output_from` 语义变模糊。
+    #[serde(default)]
+    pub export: std::collections::BTreeMap<String, String>,
 }
 
 impl WorkflowStepDef {
@@ -346,6 +372,43 @@ impl WorkflowDef {
                 if of.trim().is_empty() {
                     return Err(format!(
                         "step '{}': output_from must not be empty",
+                        step.id
+                    ));
+                }
+            }
+            // export：与 output_from 同源（都只对嵌套 step 有意义），
+            // 父级变量名沿用 output_key 的命名规则。
+            if !step.export.is_empty() && step.workflow.is_none() {
+                return Err(format!(
+                    "step '{}': `export` 仅对嵌套 workflow step 有效（该 step 没有 workflow 字段）",
+                    step.id
+                ));
+            }
+            for (var, sub_key) in &step.export {
+                if var.trim().is_empty() {
+                    return Err(format!("step '{}': export 的父级变量名不能为空", step.id));
+                }
+                if sub_key.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': export['{var}'] 指向的子 workflow output_key 不能为空",
+                        step.id
+                    ));
+                }
+                if RESERVED_OUTPUT_KEYS.contains(&var.as_str()) {
+                    return Err(format!(
+                        "step '{}': export 的父级变量名 '{var}' 占用了保留变量名",
+                        step.id
+                    ));
+                }
+                // 与本 workflow 任何 step 的 output_key 撞名 → 谁覆盖谁
+                // 取决于执行顺序，是隐藏的踩踏。直接拒。
+                if self
+                    .steps
+                    .iter()
+                    .any(|s| s.output_key.as_deref() == Some(var.as_str()))
+                {
+                    return Err(format!(
+                        "step '{}': export 的父级变量名 '{var}' 与本 workflow 某个 step 的 output_key 撞名",
                         step.id
                     ));
                 }
@@ -859,7 +922,14 @@ fn run_nested_workflow(
     topic: String,
     ctx: WorkflowRunContext,
     output_from: Option<String>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>> {
+    export: std::collections::BTreeMap<String, String>,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<(String, std::collections::BTreeMap<String, String>), String>,
+            > + Send,
+    >,
+> {
     Box::pin(async move {
         if ctx.depth >= MAX_WORKFLOW_DEPTH {
             return Err(format!(
@@ -894,17 +964,32 @@ fn run_nested_workflow(
         // 内外层各设一份等于同一段时间被重复计费。
         let (last, keyed) =
             run_workflow_inner(&wf, &topic, &nested_ctx, None, Budget::Off).await?;
+        let available = || keyed.keys().cloned().collect::<Vec<_>>().join(", ");
+        // export：把子 workflow 的若干中间产物按「父级变量名 ← 子
+        // output_key」带出去（打通信息漏斗，见 `WorkflowStepDef::export`）。
+        let mut exported = std::collections::BTreeMap::new();
+        for (var, sub_key) in &export {
+            let value = keyed.get(sub_key).cloned().ok_or_else(|| {
+                format!(
+                    "nested workflow '{name}' 的 export['{var}'] 指向不存在的 output_key \
+                     '{sub_key}'（可用：{}）",
+                    available()
+                )
+            })?;
+            exported.insert(var.clone(), value);
+        }
         // output_from：取子 workflow 指定 output_key 的产出（如
         // proposal），而非默认的最后一步输出（常是评审 verdict）。
-        match output_from {
+        let primary = match output_from {
             Some(key) => keyed.get(&key).cloned().ok_or_else(|| {
-                let available = keyed.keys().cloned().collect::<Vec<_>>().join(", ");
                 format!(
-                    "nested workflow '{name}' 没有 output_key '{key}' 的产出（可用：{available}）"
+                    "nested workflow '{name}' 没有 output_key '{key}' 的产出（可用：{}）",
+                    available()
                 )
-            }),
-            None => Ok(last),
-        }
+            })?,
+            None => last,
+        };
+        Ok((primary, exported))
     })
 }
 
@@ -2339,10 +2424,20 @@ async fn run_workflow_serial(
                     nested_topic,
                     ctx.clone(),
                     step.output_from.clone(),
+                    step.export.clone(),
                 )
                 .await
                 {
-                    Ok(output) => {
+                    Ok((output, exported)) => {
+                        // export：子 workflow 的中间产物进父级 vars，
+                        // 下游 step 用 {{父级变量名}} 取用。只进 vars
+                        // 不进 keyed（见 `WorkflowStepDef::export`）。
+                        for (var, value) in exported {
+                            vars.insert(
+                                var,
+                                crate::controller::strip_review_annotation(&value),
+                            );
+                        }
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
                             wf_id: wf_id.to_string(),
                             step_id: step.id.clone(),
@@ -2582,7 +2677,18 @@ struct DagStepInput {
 /// on success — `step_idx` 供调度器做 loop_until 返工判定。
 async fn run_dag_step(
     inp: DagStepInput,
-) -> Result<(usize, String, Option<String>, String), StepFail> {
+) -> Result<
+    (
+        usize,
+        String,
+        Option<String>,
+        String,
+        // export：嵌套 step 带出的子流程中间产物（父级变量名 → 值）。
+        // 非嵌套 step 恒为空。
+        std::collections::BTreeMap<String, String>,
+    ),
+    StepFail,
+> {
     let step = &inp.wf.steps[inp.step_idx];
     if inp.cancel_flag.load(Ordering::SeqCst) {
         return Err(StepFail::Cancelled);
@@ -2633,11 +2739,12 @@ async fn run_dag_step(
             advisor_pause: inp.advisor_pause.clone(),
             staging: inp.staging.clone(),
         };
-        let output = run_nested_workflow(
+        let (output, exported) = run_nested_workflow(
             nested_name.clone(),
             nested_topic,
             ctx,
             step.output_from.clone(),
+            step.export.clone(),
         )
         .await
         .map_err(|e| {
@@ -2658,6 +2765,7 @@ async fn run_dag_step(
             step.id.clone(),
             step.output_key.clone(),
             output,
+            exported,
         ));
     }
 
@@ -2783,6 +2891,8 @@ async fn run_dag_step(
         step.id.clone(),
         step.output_key.clone(),
         last_output,
+        // 非嵌套 step 没有可导出的子流程产物。
+        std::collections::BTreeMap::new(),
     ))
 }
 
@@ -2863,8 +2973,14 @@ async fn run_workflow_dag(
             if ctx.cancel_flag.load(Ordering::SeqCst) {
                 return WfOutcome::Cancelled;
             }
-            let mut set: JoinSet<Result<(usize, String, Option<String>, String), StepFail>> =
-                JoinSet::new();
+            type DagStepOk = (
+                usize,
+                String,
+                Option<String>,
+                String,
+                std::collections::BTreeMap<String, String>,
+            );
+            let mut set: JoinSet<Result<DagStepOk, StepFail>> = JoinSet::new();
             for &idx in wave {
                 if done_steps.contains(wf.steps[idx].id.as_str()) {
                     continue;
@@ -2910,11 +3026,14 @@ async fn run_workflow_dag(
             // after every step in the wave has finished (they were all
             // independent and read the same pre-wave snapshot).
             let mut wave_results: Vec<(usize, Option<String>, String)> = Vec::new();
+            let mut wave_exports: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
             while let Some(joined) = set.join_next().await {
                 match joined {
-                    Ok(Ok((step_idx, step_id, output_key, out))) => {
+                    Ok(Ok((step_idx, step_id, output_key, out, exported))) => {
                         ckpt.record_step(&step_id, output_key.as_deref(), &out);
                         outputs.insert(step_id, out.clone());
+                        wave_exports.extend(exported);
                         wave_results.push((step_idx, output_key, out));
                     }
                     Ok(Err(StepFail::Cancelled)) => {
@@ -2939,6 +3058,12 @@ async fn run_workflow_dag(
                     vars.insert(key.clone(), crate::controller::strip_review_annotation(out));
                     keyed.insert(key.clone(), out.clone());
                 }
+            }
+            // export：嵌套 step 带出的子流程中间产物进父级 vars，
+            // 下游 step 用 {{父级变量名}} 取用。只进 vars 不进 keyed
+            // （见 `WorkflowStepDef::export`）。
+            for (var, value) in wave_exports {
+                vars.insert(var, crate::controller::strip_review_annotation(&value));
             }
 
             // loop_until 返工判定：wave 整体 join 后才评估（不打断同
@@ -3011,6 +3136,11 @@ async fn run_workflow_dag(
                         if let Some(key) = &wf.steps[i].output_key {
                             vars.remove(key);
                             keyed.remove(key);
+                        }
+                        // export 出去的中间产物同样要作废：留着旧的
+                        // survey/证据，返工后的下游会拿新方案去对旧证据。
+                        for var in wf.steps[i].export.keys() {
+                            vars.remove(var);
                         }
                     }
                 }
@@ -6234,6 +6364,245 @@ output_key = "final"
         );
     }
 
+    /// export 端到端（打通信息漏斗）：嵌套 step 除了 `output_from` 选中
+    /// 的方案本体，还把子 workflow 的 survey 原文带到父级 vars，下游
+    /// 评审 step 用 `{{survey}}` 拿得到。
+    ///
+    /// 回归 jemalloc 现场：评审只收到被逐层压缩的 proposal，事实基线
+    /// （真实文件/行号）留在子流程里没往下传，于是评审凭记忆核事实、
+    /// 报出 5 处错行号。
+    #[tokio::test]
+    async fn nested_export_forwards_evidence_to_downstream_step() {
+        let server = wiremock::MockServer::start().await;
+        // 子 workflow：survey（证据原文）→ synthesize（方案本体）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("调研代码"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "证据原文：stats.c:1234 实测为 arena_stats_merge",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("提炼方案"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("推荐方案：改 A 模块")),
+            )
+            .mount(&server)
+            .await;
+        // 父级评审 step：产出里回显它收到的内容，便于断言。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("开始评审"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("评审完成")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner.toml"),
+            r#"
+name = "inner"
+[[steps]]
+id = "survey"
+role = "worker"
+task = "调研代码 {{topic}}"
+output_key = "raw_survey"
+[[steps]]
+id = "synthesize"
+role = "worker"
+task = "提炼方案，依据：{{raw_survey}}"
+output_key = "proposal"
+"#,
+        )
+        .unwrap();
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "funnel"
+[[steps]]
+id = "brainstorm"
+workflow = "inner"
+task = "主题"
+output_from = "proposal"
+output_key = "design"
+export = { survey = "raw_survey" }
+[[steps]]
+id = "review"
+role = "worker"
+task = "开始评审\n方案：{{design}}\n【调研原文】\n{{survey}}"
+output_key = "verdict"
+depends_on = ["brainstorm"]
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("export 应通过校验");
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&wf, "主题", &ctx).await.expect("run ok");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let review = bodies
+            .iter()
+            .find(|b| b.contains("开始评审"))
+            .expect("评审 step 应被派发");
+        assert!(
+            review.contains("推荐方案：改 A 模块"),
+            "评审仍要拿到方案本体（output_from）: {review}"
+        );
+        assert!(
+            review.contains("stats.c:1234"),
+            "评审必须同时拿到 survey 原文 —— 这就是信息漏斗被打通的证据: {review}"
+        );
+    }
+
+    /// 串行引擎的 export 也要生效。上一个测试用了 `depends_on` 走 DAG
+    /// 调度器；两个引擎的 vars 合并是**两份独立代码**，只测一边等于
+    /// 另一边没测（本仓库已有先例：熔断判定在 DAG 里套错了层）。
+    #[tokio::test]
+    async fn nested_export_works_in_serial_engine_too() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("调研代码"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("证据原文：extent.c:88")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("提炼方案"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("方案 X")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("开始评审"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("评审完成")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner_serial.toml"),
+            r#"
+name = "inner_serial"
+[[steps]]
+id = "survey"
+role = "worker"
+task = "调研代码 {{topic}}"
+output_key = "raw_survey"
+[[steps]]
+id = "synthesize"
+role = "worker"
+task = "提炼方案，依据：{{raw_survey}}"
+output_key = "proposal"
+"#,
+        )
+        .unwrap();
+
+        // 注意：没有任何 depends_on → 走串行引擎。
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "funnel_serial"
+[[steps]]
+id = "brainstorm"
+workflow = "inner_serial"
+task = "主题"
+output_from = "proposal"
+output_key = "design"
+export = { survey = "raw_survey" }
+[[steps]]
+id = "review"
+role = "worker"
+task = "开始评审\n方案：{{design}}\n【调研原文】\n{{survey}}"
+output_key = "verdict"
+"#,
+        )
+        .unwrap();
+        assert!(!wf.uses_dependency_dag(), "本例必须走串行引擎");
+        wf.validate().expect("validate");
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&wf, "主题", &ctx).await.expect("run ok");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let review = bodies
+            .iter()
+            .find(|b| b.contains("开始评审"))
+            .expect("评审 step 应被派发");
+        assert!(review.contains("方案 X"), "{review}");
+        assert!(
+            review.contains("extent.c:88"),
+            "串行引擎也必须把 survey 原文并进 vars: {review}"
+        );
+    }
+
+    /// export 指向子 workflow 不存在的 output_key → 步骤失败，错误列出
+    /// 可用 key（笔误不该静默变成空字符串喂给下游评审）。
+    #[tokio::test]
+    async fn nested_export_unknown_key_errors() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("产出")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("inner2.toml"),
+            r#"
+name = "inner2"
+[[steps]]
+id = "a"
+role = "worker"
+task = "干活 {{topic}}"
+output_key = "real_key"
+"#,
+        )
+        .unwrap();
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "funnel_bad"
+[[steps]]
+id = "nested"
+workflow = "inner2"
+task = "主题"
+export = { survey = "ghost_key" }
+"#,
+        )
+        .unwrap();
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("export 指向不存在的 key 必须失败");
+        assert!(err.contains("ghost_key"), "错误要点名笔误的 key: {err}");
+        assert!(err.contains("real_key"), "错误要列出可用 key: {err}");
+    }
+
     /// output_from 指向子 workflow 不存在的 output_key → 步骤失败，
     /// 错误列出可用的 key。
     #[tokio::test]
@@ -6715,5 +7084,113 @@ output_from = "  "
 "#;
         let wf: WorkflowDef = toml::from_str(empty).unwrap();
         assert!(wf.validate().is_err(), "空 output_from 必须报错");
+    }
+
+    /// validate：export 仅对嵌套 step 有效；空串、保留名、与 output_key
+    /// 撞名一律拒绝。撞名尤其要拒 —— 谁覆盖谁取决于执行顺序，是隐藏的
+    /// 踩踏，下游评审可能拿到另一个 step 的产出当事实基线。
+    #[test]
+    fn validate_export_rules() {
+        let case = |toml_src: &str| -> String {
+            let wf: WorkflowDef = toml::from_str(toml_src).expect("合法 TOML");
+            wf.validate().expect_err("应报错")
+        };
+
+        // 非嵌套 step 带 export。
+        let err = case(
+            r#"
+name = "bad_export_1"
+[[steps]]
+id = "a"
+role = "worker"
+task = "干活"
+export = { survey = "x" }
+"#,
+        );
+        assert!(err.contains("export"), "got: {err}");
+
+        // 子 key 为空串。
+        let err = case(
+            r#"
+name = "bad_export_2"
+[[steps]]
+id = "sub"
+workflow = "inner"
+export = { survey = "  " }
+"#,
+        );
+        assert!(err.contains("不能为空"), "got: {err}");
+
+        // 父级变量名占用保留名。
+        let err = case(
+            r#"
+name = "bad_export_3"
+[[steps]]
+id = "sub"
+workflow = "inner"
+export = { topic = "x" }
+"#,
+        );
+        assert!(err.contains("保留变量名"), "got: {err}");
+
+        // 与本 workflow 某个 step 的 output_key 撞名。
+        let err = case(
+            r#"
+name = "bad_export_4"
+[[steps]]
+id = "sub"
+workflow = "inner"
+export = { design = "x" }
+[[steps]]
+id = "other"
+role = "worker"
+task = "干活"
+output_key = "design"
+"#,
+        );
+        assert!(err.contains("撞名"), "got: {err}");
+    }
+
+    /// 仓库里真实的 design_and_plan：explore 必须 export survey，
+    /// 且两个评审 step 都必须真的引用 {{survey}}。
+    /// 回归防线——只加 export 不在评审 prompt 里用，等于漏斗照旧堵着
+    /// （本轮早前踩过同型的坑：配置加了 loop_until 但引擎走不到）。
+    #[test]
+    fn real_design_and_plan_pipes_survey_to_both_reviews() {
+        for raw in [
+            include_str!("../../config/workflows/design_and_plan.toml"),
+            include_str!("../../.latte/workflows.d/design_and_plan.toml"),
+        ] {
+            let wf: WorkflowDef = toml::from_str(raw).expect("合法 TOML");
+            wf.validate().expect("design_and_plan 应通过校验");
+
+            let explore = wf
+                .steps
+                .iter()
+                .find(|s| s.id == "explore")
+                .expect("explore step");
+            assert_eq!(
+                explore.export.get("survey").map(String::as_str),
+                Some("exploration"),
+                "explore 必须把 survey 原文 export 出来"
+            );
+
+            for id in ["req_review", "code_review"] {
+                let step = wf
+                    .steps
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap_or_else(|| panic!("{id} step"));
+                let task = step.task_text();
+                assert!(
+                    task.contains("{{design}}"),
+                    "{id} 仍要收到方案本体: {task}"
+                );
+                assert!(
+                    task.contains("{{survey}}"),
+                    "{id} 必须引用 {{{{survey}}}}，否则 export 白配、漏斗照旧: {task}"
+                );
+            }
+        }
     }
 }

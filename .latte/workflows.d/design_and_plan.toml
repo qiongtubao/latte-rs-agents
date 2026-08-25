@@ -44,7 +44,14 @@ description = "嵌套 explore：摸清背景（注入用户画像）"
 workflow = "explore"
 depends_on = ["interview"]
 task = "{{topic}}\n\n用户画像：\n{{user_profile}}"
+# output_key 拿的是 explore 末步（architect 的提炼稿）。
 output_key = "exploration"
+# 打通信息漏斗：survey 原文（programmer 实读代码得到的文件清单、真实
+# 行号、术语解释）也带出来，随方案一起下传给双评审。
+# 此前评审只拿到被逐层压缩的 proposal，想核对事实无从核对——
+# jemalloc 实锤：双评审共报 5 处实测行号错误，而正确的行号就在 survey
+# 原文里，只是从来没往下传。
+export = { survey = "exploration" }
 
 [[steps]]
 id = "brainstorm"
@@ -67,12 +74,19 @@ task = "基于以下设计方案制定实现计划：\n{{design}}"
 output_key = "plan"
 
 # ── 并行组：两个评审互不依赖，同一 wave 并行 ──────────────────────
+# 两个评审都同时收到「方案 + survey 原文」：方案讲的是要做什么，
+# survey 原文是唯一的事实基线（真实文件、真实行号、真实约定）。
+# 只给方案 = 让评审凭记忆核事实，必然产出错行号（jemalloc 实锤）。
 [[steps]]
 id = "req_review"
 description = "嵌套 requirements_review（与 code_review 并行）"
 workflow = "requirements_review"
 depends_on = ["brainstorm"]
-task = "评审以下设计方案的需求合理性：\n{{design}}"
+task = """评审以下设计方案的需求合理性：
+{{design}}
+
+【代码调研原文（事实基线，方案中的事实性描述以此为准）】
+{{survey}}"""
 output_key = "req_verdict"
 
 [[steps]]
@@ -80,7 +94,11 @@ id = "code_review"
 description = "嵌套 code_review（与 code_review 并行）"
 workflow = "code_review"
 depends_on = ["brainstorm"]
-task = "评审以下设计方案涉及代码区域的质量风险：\n{{design}}"
+task = """评审以下设计方案涉及代码区域的质量风险：
+{{design}}
+
+【代码调研原文（事实基线，文件/行号/现有约定以此为准；与方案不符处按本节为准并指出）】
+{{survey}}"""
 output_key = "code_verdict"
 
 # ── gate：总终审门 ────────────────────────────────────────────────
