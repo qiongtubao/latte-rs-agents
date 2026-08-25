@@ -1121,6 +1121,8 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             turn_cancel_flag: turn_cancel,
             depth: 0,
+            // 顶层 run：自己就是嵌套链的根。
+            root_wf_id: None,
             agent_pause_gate,
             // 跑在真实 session 事件流上：分派建 subsession、过
             // advisor gate，与 manager 的 delegate 一致。
@@ -1387,6 +1389,8 @@ pub async fn dispatch_task(
                 cancel_flag: cancel.clone(),
                 turn_cancel_flag: turn_cancel.clone(),
                 depth: 0,
+                // 顶层 run：自己就是嵌套链的根。
+                root_wf_id: None,
                 agent_pause_gate: agent_pause_gate.clone(),
                 // 跑在真实 session 事件流上：分派建 subsession、过
                 // advisor gate，与 manager 的 delegate 一致。
@@ -1499,6 +1503,8 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             cancel_flag: Arc::new(AtomicBool::new(false)),
             turn_cancel_flag: turn_cancel,
             depth: 0,
+            // 顶层 run：自己就是嵌套链的根。
+            root_wf_id: None,
             agent_pause_gate: agent_pause_gate.clone(),
             subsession_store: Some(b2.subsession_store.clone()),
             session_id: Some(session_id.clone()),
@@ -1651,6 +1657,8 @@ async fn chain_code_review(
         cancel_flag: Arc::new(AtomicBool::new(false)),
         turn_cancel_flag: turn_cancel,
         depth: 0,
+        // 顶层 run：自己就是嵌套链的根。
+        root_wf_id: None,
         agent_pause_gate,
         // 与派发 run 同源：分派建 subsession、过 advisor gate。
         subsession_store: Some(b.subsession_store.clone()),

@@ -62,6 +62,15 @@ struct Prompt {
     event: ChatEvent,
     /// 所属事件通道（= session 的 broadcast），`same_channel` 判归属。
     chan: broadcast::Sender<ChatEvent>,
+    /// 落盘归属 `(cwd, session_id)`。`Some` 时这条快照同时写进
+    /// `<cwd>/.latte/pending-asks/`，[`dismiss_prompt`] 时一并删除。
+    ///
+    /// 为什么需要：`PROMPTS` 是**进程内**内存表，服务器一重启就空了。
+    /// 而非阻塞弹框（fire-and-forget 的 ask、`PlanProposed`）此前只有
+    /// 这一份副本 —— 用户没来得及处理就重启/刷新，弹框永久消失，既
+    /// 看不到也无从补救（jemalloc 现场：workflow 挂死 + 进程重启后，
+    /// 待办弹框连痕迹都不剩）。
+    persist: Option<(std::path::PathBuf, String)>,
 }
 
 /// 每个通道最多保留的未处理弹框数。用户忽略掉的弹框不会有人来
@@ -78,17 +87,45 @@ static PROMPTS: LazyLock<Mutex<Vec<Prompt>>> = LazyLock::new(|| Mutex::new(Vec::
 ///
 /// 同 `id` 重复登记按后者覆盖（幂等：slash 路径与 plan 工具都可能
 /// 对同一份清单代发）。
-pub fn register_prompt(id: &str, event: ChatEvent, chan: broadcast::Sender<ChatEvent>) {
+///
+/// `persist` = `Some((cwd, session_id))` 时**同时落盘**到
+/// `<cwd>/.latte/pending-asks/`：内存表只能救"弹框事件丢了"，救不了
+/// "进程没了"。`None`（CLI / 测试 / 拿不到 session 的路径）只进内存。
+pub fn register_prompt(
+    id: &str,
+    event: ChatEvent,
+    chan: broadcast::Sender<ChatEvent>,
+    persist: Option<(&std::path::Path, &str)>,
+) {
+    // 落盘先于内存登记：反序时若进程在两步之间挂掉，内存那份也随之
+    // 消失，等于什么都没登记；先落盘则至少盘上有据可查。
+    if let Some((cwd, sid)) = persist {
+        match crate::event_json::chat_event_to_frontend_json(&event) {
+            Ok(json) => crate::pending_ask::persist_prompt(cwd, id, sid, &json),
+            Err(e) => tracing::warn!(
+                prompt_id = %id,
+                error = %e,
+                "非阻塞弹框快照序列化失败，跳过落盘（本进程内仍可处理）"
+            ),
+        }
+    }
+    let owned = persist.map(|(cwd, sid)| (cwd.to_path_buf(), sid.to_string()));
     let mut g = PROMPTS.lock().unwrap();
     if let Some(slot) = g.iter_mut().find(|p| p.id == id) {
         slot.event = event;
         slot.chan = chan;
+        slot.persist = owned;
         return;
     }
-    g.push(Prompt { id: id.to_string(), event, chan: chan.clone() });
+    g.push(Prompt { id: id.to_string(), event, chan: chan.clone(), persist: owned });
     // 只对同通道计数：A session 的弹框不该被 B session 的挤掉。
     while g.iter().filter(|p| p.chan.same_channel(&chan)).count() > MAX_PROMPTS_PER_CHANNEL {
         if let Some(pos) = g.iter().position(|p| p.chan.same_channel(&chan)) {
+            // 淘汰时一并删盘，否则被挤掉的那条在重启后又会被
+            // load_for_session 捞出来补发（内存里已经没有它了）。
+            if let Some((cwd, _)) = g[pos].persist.as_ref() {
+                crate::pending_ask::remove_prompt(cwd, &g[pos].id);
+            }
             g.remove(pos);
         } else {
             break;
@@ -98,11 +135,31 @@ pub fn register_prompt(id: &str, event: ChatEvent, chan: broadcast::Sender<ChatE
 
 /// 用户已处理该弹框（提交了选择 / 跳过 / 导入了任务清单）→ 不再补发。
 /// 返回是否命中（幂等，未命中不是错误）。
+///
+/// 命中且该快照登记过落盘归属时，同步删掉盘上那份 —— 否则重启后
+/// [`crate::pending_ask::load_for_session`] 会把已处理的弹框当成待办
+/// 再弹一遍。
 pub fn dismiss_prompt(id: &str) -> bool {
     let mut g = PROMPTS.lock().unwrap();
     let before = g.len();
+    for p in g.iter().filter(|p| p.id == id) {
+        if let Some((cwd, _)) = p.persist.as_ref() {
+            crate::pending_ask::remove_prompt(cwd, id);
+        }
+    }
     g.retain(|p| p.id != id);
     g.len() != before
+}
+
+/// 删掉盘上那条非阻塞弹框记录，**不要求内存表里还有它**。
+///
+/// 为什么单独给一个入口：[`dismiss_prompt`] 靠内存表里的 `persist`
+/// 找落盘位置，可进程重启后 `PROMPTS` 是空的 —— 用户此时处理的正是
+/// 从盘上补发出来的那条弹框，走 `dismiss_prompt` 会因为"未命中"而
+/// 不删盘，于是下次刷新它又回来了。ui-server 的 dismiss 路径能拿到
+/// `cwd`，用这个函数兜底。幂等。
+pub fn dismiss_persisted_prompt(cwd: &std::path::Path, id: &str) {
+    crate::pending_ask::remove_prompt(cwd, id);
 }
 
 /// 属于 `chan` 且仍未处理的非阻塞弹框快照，按发生顺序返回。
@@ -351,7 +408,7 @@ mod tests {
     #[test]
     fn prompt_replayed_until_dismissed() {
         let (ev, chan) = fixture("prompt-1");
-        register_prompt("prompt-1", ev, chan.clone());
+        register_prompt("prompt-1", ev, chan.clone(), None);
         assert_eq!(pending_prompts_for_channel(&chan).len(), 1);
         assert!(dismiss_prompt("prompt-1"), "首次销账应命中");
         assert!(
@@ -368,8 +425,8 @@ mod tests {
     fn prompts_scope_by_channel() {
         let (ev_a, chan_a) = fixture("prompt-chan-a");
         let (ev_b, chan_b) = fixture("prompt-chan-b");
-        register_prompt("prompt-chan-a", ev_a, chan_a.clone());
-        register_prompt("prompt-chan-b", ev_b, chan_b.clone());
+        register_prompt("prompt-chan-a", ev_a, chan_a.clone(), None);
+        register_prompt("prompt-chan-b", ev_b, chan_b.clone(), None);
         assert_eq!(pending_prompts_for_channel(&chan_a).len(), 1);
         // 克隆的 Sender 与原通道同源，也应命中。
         assert_eq!(pending_prompts_for_channel(&chan_a.clone()).len(), 1);
@@ -392,8 +449,8 @@ mod tests {
     fn prompt_register_is_idempotent_by_id() {
         let (ev1, chan) = fixture("prompt-dup");
         let (ev2, _other) = fixture("prompt-dup");
-        register_prompt("prompt-dup", ev1, chan.clone());
-        register_prompt("prompt-dup", ev2, chan.clone());
+        register_prompt("prompt-dup", ev1, chan.clone(), None);
+        register_prompt("prompt-dup", ev2, chan.clone(), None);
         assert_eq!(pending_prompts_for_channel(&chan).len(), 1);
         clear_prompts_for_channel(&chan);
     }
@@ -406,7 +463,7 @@ mod tests {
         for i in 0..(MAX_PROMPTS_PER_CHANNEL + 5) {
             let id = format!("prompt-cap-{i}");
             let (ev, _c) = fixture(&id);
-            register_prompt(&id, ev, chan.clone());
+            register_prompt(&id, ev, chan.clone(), None);
         }
         let pending = pending_prompts_for_channel(&chan);
         assert_eq!(pending.len(), MAX_PROMPTS_PER_CHANNEL);
@@ -429,7 +486,7 @@ mod tests {
     #[test]
     fn prompts_do_not_count_as_blocking_pending() {
         let (ev, chan) = fixture("choice-nonblockingrole-1");
-        register_prompt("choice-nonblockingrole-1", ev, chan.clone());
+        register_prompt("choice-nonblockingrole-1", ev, chan.clone(), None);
         assert!(
             pending_for_channel(&chan).is_empty(),
             "非阻塞弹框不该进阻塞表"
@@ -454,7 +511,7 @@ mod tests {
         let (ev_block, chan) = fixture("choice-union-block");
         let _rx = register("choice-union-block", ev_block, chan.clone());
         let (ev_prompt, _c) = fixture("prompt-union");
-        register_prompt("prompt-union", ev_prompt, chan.clone());
+        register_prompt("prompt-union", ev_prompt, chan.clone(), None);
 
         let ids: Vec<String> = pending_dialogs_for_channel(&chan)
             .iter()

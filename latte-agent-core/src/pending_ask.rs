@@ -41,6 +41,12 @@ pub struct PendingAsk {
     /// 所属 UI session —— 续跑要用它 resolve session。
     pub session_id: String,
     /// 所属 workflow run 的 checkpoint id。
+    ///
+    /// **空字符串 = 非阻塞弹框**（fire-and-forget 的 ask、
+    /// `PlanProposed`）：它们没有 workflow checkpoint，重启后也无从
+    /// "续跑"，但用户**仍然需要看到并回答**——答案作为下一条 user
+    /// 消息回喂即可。[`load_for_session`] 对这类记录跳过 checkpoint
+    /// 校验，直接补发。
     pub wf_id: String,
     /// 提问的角色。
     pub role_id: String,
@@ -84,6 +90,16 @@ fn path_for(cwd: &Path, choice_id: &str) -> Option<PathBuf> {
     safe_id(choice_id).then(|| dir(cwd).join(format!("{choice_id}.json")))
 }
 
+/// 非阻塞弹框快照的落盘路径。
+///
+/// **必须与 [`path_for`] 不同名**：同一个 `choice_id` 可能同时存在
+/// 两类记录语义（阻塞 ask 走 [`persist`]，非阻塞弹框走
+/// [`persist_prompt`]），而 `deliver_choice_answer` 会先销账非阻塞
+/// 那份、再读阻塞那份 —— 共用文件名会让前一步把后一步要读的记录删掉。
+fn path_for_prompt(cwd: &Path, choice_id: &str) -> Option<PathBuf> {
+    safe_id(choice_id).then(|| dir(cwd).join(format!("{choice_id}.prompt.json")))
+}
+
 /// 落盘一条挂起记录。**在广播弹框之前调用**（同
 /// [`crate::choice::register`]：反序时用户秒答会先来查表，查不到就
 /// 走不到孤儿恢复路径）。
@@ -122,6 +138,44 @@ pub fn persist(
     }
 }
 
+/// 落盘一条**非阻塞弹框**快照（fire-and-forget 的 ask、`PlanProposed`）。
+///
+/// 与 [`persist`] 的区别：没有 `wf_id`（落空字符串），因为这类弹框不
+/// 属于任何 workflow checkpoint、也不需要续跑。存在的唯一理由是让
+/// **进程重启后用户仍能看到还没处理的弹框** —— 在此之前它们的唯一
+/// 副本是 [`crate::choice`] 的 `PROMPTS` 内存表，服务器一重启就永久
+/// 消失，用户既没看到也无从补救。
+///
+/// `session_id` 为空时跳过（无从归属，补发时也筛不出来）。
+pub fn persist_prompt(cwd: &Path, choice_id: &str, session_id: &str, event_json: &str) {
+    if session_id.is_empty() {
+        return;
+    }
+    let Some(path) = path_for_prompt(cwd, choice_id) else {
+        tracing::warn!(choice_id, "非阻塞弹框 id 不合法，跳过落盘");
+        return;
+    };
+    let rec = PendingAsk {
+        choice_id: choice_id.to_string(),
+        session_id: session_id.to_string(),
+        // 空 = 非阻塞弹框标记，load_for_session 据此跳过 checkpoint 校验。
+        wf_id: String::new(),
+        role_id: String::new(),
+        question: String::new(),
+        event_json: event_json.to_string(),
+        created_at: now_secs(),
+    };
+    let write = || -> std::io::Result<()> {
+        std::fs::create_dir_all(dir(cwd))?;
+        let json = serde_json::to_string(&rec)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, json)
+    };
+    if let Err(e) = write() {
+        tracing::warn!(choice_id, error = %e, "非阻塞弹框落盘失败（不影响本进程内回答）");
+    }
+}
+
 /// 读一条挂起记录（不删）。
 pub fn load(cwd: &Path, choice_id: &str) -> Option<PendingAsk> {
     let path = path_for(cwd, choice_id)?;
@@ -133,6 +187,17 @@ pub fn load(cwd: &Path, choice_id: &str) -> Option<PendingAsk> {
 /// （孤儿恢复）之后调用。
 pub fn remove(cwd: &Path, choice_id: &str) {
     if let Some(path) = path_for(cwd, choice_id) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 删掉一条**非阻塞弹框**落盘记录（幂等）。用户处理完弹框
+/// （提交 / 跳过 / 导入清单）后调用。
+///
+/// 与 [`remove`] 分开：两者文件名不同（见 [`path_for_prompt`]），
+/// 混用会误删另一类记录。
+pub fn remove_prompt(cwd: &Path, choice_id: &str) {
+    if let Some(path) = path_for_prompt(cwd, choice_id) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -165,6 +230,13 @@ pub fn load_for_session(cwd: &Path, session_id: &str) -> Vec<PendingAsk> {
             continue;
         }
         if now.saturating_sub(rec.created_at) > MAX_AGE_SECS {
+            continue;
+        }
+        // 非阻塞弹框（wf_id 空）：没有 checkpoint 可查，直接补发。
+        // 它们的"答案"是下一条 user 消息，不需要续跑，但用户必须
+        // 能重新看到——这正是进程重启后最容易永久丢失的一类。
+        if rec.wf_id.is_empty() {
+            out.push(rec);
             continue;
         }
         match crate::workflow::load_checkpoint(cwd, &rec.wf_id) {
@@ -275,6 +347,91 @@ mod tests {
         std::fs::write(&p, serde_json::to_string(&rec).unwrap()).unwrap();
 
         assert!(load_for_session(cwd, "sess-a").is_empty());
+    }
+
+    /// 非阻塞弹框（fire-and-forget ask / PlanProposed）跨进程补发：
+    /// 没有 wf_id、没有 checkpoint，但**必须**能被 load_for_session
+    /// 捞出来 —— 这是进程重启后待办弹框唯一的存活路径。
+    #[test]
+    fn prompt_without_checkpoint_is_replayed() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        // 故意不建任何 checkpoint：非阻塞弹框本来就没有 run 可续。
+        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed"}"#);
+
+        let out = load_for_session(cwd, "sess-a");
+        assert_eq!(out.len(), 1, "非阻塞弹框应无条件补发（不查 checkpoint）");
+        assert_eq!(out[0].choice_id, "plan-manager-0");
+        assert!(out[0].wf_id.is_empty(), "非阻塞弹框的 wf_id 必须为空");
+        assert_eq!(out[0].event_json, r#"{"type":"PlanProposed"}"#);
+    }
+
+    /// 非阻塞弹框按 session 隔离（与阻塞 ask 同规则）。
+    #[test]
+    fn prompt_scopes_by_session() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed"}"#);
+        persist_prompt(cwd, "choice-tutor-9", "sess-b", r#"{"type":"ChoiceRequested"}"#);
+
+        assert_eq!(load_for_session(cwd, "sess-a").len(), 1);
+        assert_eq!(load_for_session(cwd, "sess-b").len(), 1);
+        assert!(load_for_session(cwd, "sess-c").is_empty());
+    }
+
+    /// 销账后不再补发（用户已处理 → 下次刷新不该又冒出来）。
+    #[test]
+    fn dismissed_prompt_is_not_replayed() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed"}"#);
+        assert_eq!(load_for_session(cwd, "sess-a").len(), 1);
+
+        remove_prompt(cwd, "plan-manager-0");
+        assert!(load_for_session(cwd, "sess-a").is_empty());
+        // 幂等。
+        remove_prompt(cwd, "plan-manager-0");
+    }
+
+    /// 两类记录**互不干扰**：同一个 id 既有阻塞 ask 记录又有非阻塞
+    /// 快照时，删掉一类不能动到另一类。
+    ///
+    /// 为什么必须测：`deliver_choice_answer` 先销账非阻塞快照、再读
+    /// 阻塞记录来做断点续跑。若两者共用文件名，前一步会把后一步要读
+    /// 的记录删掉，续跑直接失败。
+    #[test]
+    fn prompt_and_blocking_records_are_independent() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        seed_checkpoint(cwd, "wf-1");
+        persist_one(cwd, "choice-manager-7", "sess-a", "wf-1", "怎么推 L1 改稿？");
+        persist_prompt(cwd, "choice-manager-7", "sess-a", r#"{"type":"ChoiceRequested"}"#);
+
+        // 删非阻塞那份，阻塞记录必须还在（续跑要用）。
+        remove_prompt(cwd, "choice-manager-7");
+        assert!(
+            load(cwd, "choice-manager-7").is_some(),
+            "删非阻塞快照不能动到阻塞 ask 的落盘记录"
+        );
+
+        // 反向：删阻塞那份，非阻塞快照不受影响。
+        persist_prompt(cwd, "choice-manager-7", "sess-a", r#"{"type":"ChoiceRequested"}"#);
+        remove(cwd, "choice-manager-7");
+        assert_eq!(
+            load_for_session(cwd, "sess-a").len(),
+            1,
+            "删阻塞记录后非阻塞快照仍应补发"
+        );
+    }
+
+    /// 没有 session_id 就无从归属，跳过落盘（CLI / 独立测试路径）。
+    #[test]
+    fn prompt_without_session_is_not_persisted() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        persist_prompt(cwd, "plan-manager-0", "", r#"{"type":"PlanProposed"}"#);
+        assert!(load_for_session(cwd, "sess-a").is_empty());
+        assert!(load_for_session(cwd, "").is_empty());
     }
 
     /// 路径穿越防护：choice_id 不可逃出 pending-asks 目录。

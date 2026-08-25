@@ -1126,6 +1126,8 @@ async fn register_workflow_tool(
             turn_cancel_flag: None,
                     agent_pause_gate: None, // CLI REPL workflow：无 session agent gate
                     depth: 0,
+                    // 顶层 run：自己就是嵌套链的根。
+                    root_wf_id: None,
                     // CLI REPL 无 UI session：不建 subsession、不走 advisor。
                     subsession_store: None,
                     session_id: None,

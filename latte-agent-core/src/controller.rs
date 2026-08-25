@@ -2400,6 +2400,7 @@ async fn run_single_role_loop(
                                                 &plan_stage,
                                                 &current_role,
                                                 &summary,
+                                                Some((&config.cwd, &config.session_id)),
                                             ) {
                                                 let _ = event_tx.send(ChatEvent::Status {
                                                     message: "检测到任务清单，已提交「添加任务」弹窗供勾选导入任务看板。".into(),
@@ -2782,15 +2783,32 @@ async fn build_runner(
         // 把结构化任务清单提交给用户在弹窗里勾选导入任务看板。
         // manager 在 implementation_plan workflow 跑完后调它。
         if role.allowed_tools.iter().any(|t| t == "plan") {
-            register_plan_tool(&tm, event_tx.clone(), role_id.to_string(), plan_stage.clone(), cwd)
-                .map_err(|e| AgentError::Tool(format!("register plan: {e}")))?;
+            register_plan_tool(
+                &tm,
+                event_tx.clone(),
+                role_id.to_string(),
+                plan_stage.clone(),
+                cwd,
+                session_id.to_string(),
+            )
+            .map_err(|e| AgentError::Tool(format!("register plan: {e}")))?;
         }
         // Any role with "ask" in allowed_tools gets the ask tool:
         // 向用户抛出一道选择题（含图片 / 图片网格 / 上传），弹出选择框。
         // 顶层 turn 用 fire-and-forget（回答作为下一条 user 消息回喂）。
+        //
+        // 落盘归属 `(cwd, session_id)`：fire-and-forget 弹框此前只活在
+        // 内存 `PROMPTS` 表里，进程一重启就永久消失——用户既看不到也
+        // 无从补救。带上它，重启后 `pending-prompts` 能把待办弹框补回来。
         if role.allowed_tools.iter().any(|t| t == "ask") {
-            register_ask_tool(&tm, event_tx.clone(), role_id.to_string(), None)
-                .map_err(|e| AgentError::Tool(format!("register ask: {e}")))?;
+            register_ask_tool(
+                &tm,
+                event_tx.clone(),
+                role_id.to_string(),
+                None,
+                Some((cwd.to_path_buf(), session_id.to_string())),
+            )
+            .map_err(|e| AgentError::Tool(format!("register ask: {e}")))?;
         }
         // Any role with "task_report" in allowed_tools gets the task_report
         // tool: 任务看板闭环——manager 完成任务后调它广播 ChatEvent::TaskReport，
@@ -3316,6 +3334,9 @@ pub(crate) fn propose_plan_from_summary(
     plan_stage: &SharedPlanStage,
     role_id: &str,
     summary: &str,
+    // 弹框快照落盘归属 `(cwd, session_id)`：进程重启后「添加任务」
+    // 弹窗仍能补发。`None` = 不落盘（CLI / 测试）。
+    persist: Option<(&std::path::Path, &str)>,
 ) -> bool {
     let Some(tasks) = extract_plan_tasks(summary) else {
         return false;
@@ -3331,7 +3352,8 @@ pub(crate) fn propose_plan_from_summary(
     };
     // 未处理快照（同 `plan` 工具）：没订阅者/broadcast 落后时弹窗不丢，
     // 导入成功后由 `POST /api/tasks/import` 按 plan_id 销账。
-    crate::choice::register_prompt(&plan_id, proposed.clone(), event_tx.clone());
+    // 带 persist 时同时落盘 —— 内存表救不了进程重启。
+    crate::choice::register_prompt(&plan_id, proposed.clone(), event_tx.clone(), persist);
     let _ = event_tx.send(proposed);
     true
 }
@@ -3441,6 +3463,9 @@ pub(crate) fn register_plan_tool(
     role_id: String,
     plan_stage: SharedPlanStage,
     cwd: &std::path::Path,
+    // 所属 UI session：弹框快照落盘时的归属键。空字符串 = 不落盘
+    // （CLI / 测试）。进程重启后「添加任务」弹窗靠这份落盘补发。
+    session_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
@@ -3466,11 +3491,13 @@ pub(crate) fn register_plan_tool(
 
     let handler_role_id = role_id.clone();
     let handler_cwd = cwd.to_path_buf();
+    let handler_session_id = session_id;
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let event_tx = event_tx.clone();
         let role_id = handler_role_id.clone();
         let plan_stage = plan_stage.clone();
         let cwd = handler_cwd.clone();
+        let session_id = handler_session_id.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -3519,7 +3546,14 @@ pub(crate) fn register_plan_tool(
             // 一次（无订阅者 / Lagged）就等于清单永久卡在
             // PendingApproval——delegate 被门禁挡着，用户却没有弹窗可
             // 导入。导入成功时 `POST /api/tasks/import` 按 plan_id 销账。
-            crate::choice::register_prompt(&plan_id, proposed.clone(), event_tx.clone());
+            // 同时落盘：内存快照救不了进程重启（重启后清单同样只剩
+            // PendingApproval 的门禁，弹窗无影无踪）。
+            crate::choice::register_prompt(
+                &plan_id,
+                proposed.clone(),
+                event_tx.clone(),
+                (!session_id.is_empty()).then_some((cwd.as_path(), session_id.as_str())),
+            );
             let _ = event_tx.send(proposed);
             // plan 阶段门：任务清单已提交，等用户在弹窗导入任务看板；
             // 批准前 delegate 实现类角色会被工具层拒绝。
@@ -3609,6 +3643,12 @@ pub(crate) fn register_ask_tool(
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
     blocking: Option<AskBlocking>,
+    // fire-and-forget 分支的弹框快照落盘归属 `(cwd, session_id)`。
+    // `Some` 时非阻塞 ask 也写进 `<cwd>/.latte/pending-asks/`，进程
+    // 重启后仍能补发给用户（内存 `PROMPTS` 表重启即空）。
+    // 阻塞分支不看这个参数——它走 `AskBlocking::answer_log` 那条
+    // 带 wf_id 的落盘路径（可续跑）。
+    persist: Option<(PathBuf, String)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
@@ -3659,6 +3699,7 @@ pub(crate) fn register_ask_tool(
         let event_tx = event_tx.clone();
         let role_id = handler_role_id.clone();
         let blocking = blocking.clone();
+        let persist = persist.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -3768,7 +3809,12 @@ pub(crate) fn register_ask_tool(
                 // 前端调 `POST /api/chat/prompt-dismiss` 销账。
                 // 登记必须早于广播：反序时用户秒答的 dismiss 会先落地，
                 // 随后登记的快照成为僵尸，下次重连又弹一遍。
-                crate::choice::register_prompt(&choice_id, requested.clone(), event_tx.clone());
+                crate::choice::register_prompt(
+                    &choice_id,
+                    requested.clone(),
+                    event_tx.clone(),
+                    persist.as_ref().map(|(c, s)| (c.as_path(), s.as_str())),
+                );
                 let _ = event_tx.send(requested);
                 return Ok(serde_json::Value::String(format!(
                     "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
@@ -3803,7 +3849,13 @@ pub(crate) fn register_ask_tool(
                             log.cwd(),
                             &choice_id,
                             sid,
-                            log.wf_id(),
+                            // 用**根** run 的 id，不是发出提问的那一层：
+                            // 嵌套场景下只 resume 子 run 是不够的——父
+                            // 流水线不知道自己在等谁，永远醒不过来
+                            // （jemalloc 现场：requirements_review 的
+                            // decide 弹窗答了也只能让子流程跑完，顶层
+                            // design_and_plan 依旧卡死）。
+                            log.resume_wf_id(),
                             &role_id,
                             &question,
                             &json,
@@ -4948,6 +5000,8 @@ async fn register_workflow_tool(
                 advisor_gate,
                 advisor_pause: Some(advisor_pause),
                 staging: None,
+                // 顶层 run：自己就是嵌套链的根。
+                root_wf_id: None,
             };
             let result = match &resume {
                 Some(rid) => crate::workflow::run_workflow_resume(&wf, &topic, &ctx, rid).await,
@@ -5029,6 +5083,8 @@ async fn run_workflow_command(
         advisor_gate: config.advisor_monitor.runner_gate(),
         advisor_pause: Some(advisor_pause),
         staging: None,
+        // 顶层 run：自己就是嵌套链的根。
+        root_wf_id: None,
     };
 
     let summary = crate::workflow::run_workflow(&wf, topic, &ctx).await?;
@@ -5693,7 +5749,7 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."))
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
             .expect("register plan");
 
         let out = tm
@@ -5749,7 +5805,7 @@ mod tests {
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
         let summary = "VERDICT: PASS\n```json\n{\"tasks\": [{\"title\": \"任务甲\"}, {\"title\": \"任务乙\"}]}\n```";
-        assert!(propose_plan_from_summary(&event_tx, &stage, "manager", summary));
+        assert!(propose_plan_from_summary(&event_tx, &stage, "manager", summary, None));
 
         let ev = rx.try_recv().expect("PlanProposed event");
         let ChatEvent::PlanProposed { role_id, plan_id, tasks } = ev else {
@@ -5764,7 +5820,7 @@ mod tests {
 
         // 无任务清单的产出：不提案、不动阶段门（复位后验证）。
         *stage.write() = PlanStage::Normal;
-        assert!(!propose_plan_from_summary(&event_tx, &stage, "manager", "没有任何清单"));
+        assert!(!propose_plan_from_summary(&event_tx, &stage, "manager", "没有任何清单", None));
         assert!(rx.try_recv().is_err(), "不应再发事件");
         assert_eq!(stage.read().clone(), PlanStage::Normal);
     }
@@ -5833,7 +5889,7 @@ mod tests {
     async fn ask_event_carries_pros_cons_and_multi() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "architect".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "architect".into(), None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "鉴权方案？",
@@ -5866,7 +5922,7 @@ mod tests {
     async fn ask_fire_and_forget_returns_immediately_with_wait_false() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
 
         let out = tm.execute("ask", ask_input(), None).await.expect("ask call");
         let text = out.as_str().expect("string result");
@@ -5893,6 +5949,7 @@ mod tests {
                 answer_log: None,
                 role_id: "manager".into(),
             }),
+            None,
         )
         .expect("register ask");
 
@@ -5933,6 +5990,7 @@ mod tests {
                 answer_log: None,
                 role_id: "manager".into(),
             }),
+            None,
         )
         .expect("register ask");
 
@@ -5977,7 +6035,7 @@ mod tests {
     async fn ask_accepts_string_bool_in_option_recommended() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "tutor".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "第 4 题：你最想深入的方向？",
@@ -6003,7 +6061,7 @@ mod tests {
     async fn ask_tolerates_garbage_recommended_without_failing() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "tutor".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "选哪个？",
@@ -6041,7 +6099,7 @@ mod tests {
     async fn ask_normalizes_wrapped_options_and_aliases() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "programmer".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "programmer".into(), None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "归档份数：你希望按哪种粒度归档？",
@@ -6070,7 +6128,7 @@ mod tests {
     async fn ask_accepts_string_bool_for_multi_and_allow_upload() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "多选题",
@@ -6094,7 +6152,7 @@ mod tests {
     async fn ask_rejects_ambiguous_options_object() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "q",
@@ -6112,7 +6170,7 @@ mod tests {
     async fn coercion_leaves_undeclared_and_unrecognized_values_alone() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
         let schema = tm.get_tool("ask").expect("ask").input_schema;
 
         let out = crate::agent::coerce_tool_input_to_schema(
@@ -6300,6 +6358,7 @@ mod tests {
             dir.path(),
             "wf-replay-1",
             None,
+            None,
             Default::default(),
         ));
         let tm = build_tool_manager(&[]).await.expect("tool manager");
@@ -6314,6 +6373,7 @@ mod tests {
                 answer_log: Some(log.clone()),
                 role_id: "tutor".into(),
             }),
+            None,
         )
         .expect("register ask");
 
@@ -6382,6 +6442,7 @@ mod tests {
                 answer_log: None,
                 role_id: "tutor".into(),
             }),
+            None,
         )
         .expect("register ask");
 
@@ -6457,6 +6518,7 @@ mod tests {
                 answer_log: None,
                 role_id: "manager".into(),
             }),
+            None,
         )
         .expect("register ask");
 
@@ -6482,7 +6544,7 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."))
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
             .expect("register plan");
 
         tm.execute(
@@ -6531,7 +6593,7 @@ mod tests {
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
             .expect("register plan");
 
         let err = tm
@@ -6563,7 +6625,7 @@ mod tests {
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
             .expect("register plan");
 
         tm.execute(
@@ -6585,7 +6647,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
         std::fs::create_dir_all(dir.path().join("src/cache")).unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
             .expect("register plan");
 
         let err = tm
@@ -6625,7 +6687,7 @@ mod tests {
         let (event_tx, _rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path())
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
             .expect("register plan");
 
         tm.execute(

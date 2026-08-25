@@ -1035,6 +1035,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&ws);
     }
 
+    /// **非阻塞**弹框（fire-and-forget 的 ask、`PlanProposed`）跨进程重启
+    /// 补发：没有 wf_id、没有 checkpoint，重启后仍必须能被
+    /// `pending-prompts` 捞出来，且用户处理后不再复现。
+    ///
+    /// 为什么单独锁这条：这类弹框此前的唯一副本是 `choice::PROMPTS`
+    /// 内存表 —— 进程一重启就永久消失，用户既看不到也无从补救
+    /// （jemalloc 现场：workflow 挂死 + 进程重启后，「添加任务」弹窗
+    /// 连痕迹都不剩，用户只能干等）。
+    ///
+    /// 与上一个测试的关键差异：那条走 checkpoint 续跑（阻塞 ask），
+    /// 这条**没有 checkpoint 可查**，走的是 `wf_id == ""` 的直接补发
+    /// 分支。两者的落盘文件名也必须不同，否则互删。
+    #[tokio::test]
+    async fn restart_replays_fire_and_forget_prompt() {
+        let ws = std::env::temp_dir().join(format!(
+            "ui-server-prompt-replay-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("mkdir ws");
+
+        let make_backend = || {
+            let resolver = ModelResolver::from_config(
+                &latte_agent_core::config::AgentConfig::default(),
+            )
+            .expect("resolver");
+            UiBackend::new(UiBackendConfig {
+                agent_config: latte_agent_core::config::AgentConfig::default(),
+                model_resolver: resolver,
+                role: None,
+                tier: None,
+                model_id: None,
+                cwd: Some(ws.clone()),
+                agents_config: ".latte/agents.d".into(),
+            })
+            .expect("backend")
+        };
+
+        let sid = {
+            let backend = make_backend();
+            let sid = crate::api::create_session(&backend)
+                .await
+                .expect("create session")
+                .session_id;
+            // 模拟旧进程里 manager 调了 plan 工具：弹框快照落盘。
+            // 这正是 `choice::register_prompt(.., Some((cwd, sid)))` 干的事。
+            let event_json = serde_json::json!({
+                "type": "PlanProposed", "role_id": "manager", "plan_id": "plan-manager-0",
+                "tasks": [{ "title": "W0: 修复阻断问题" }],
+            })
+            .to_string();
+            latte_agent_core::pending_ask::persist_prompt(
+                &ws,
+                "plan-manager-0",
+                &sid,
+                &event_json,
+            );
+            sid
+            // backend drop = 进程重启：内存 PROMPTS 表随之消失。
+        };
+
+        // 新 backend（同 cwd）= 重启后的进程。session 未被 spawn，
+        // 内存里不可能有任何 pending 快照 —— 补发只能来自盘上。
+        let backend = make_backend();
+
+        // ① 非阻塞弹框必须被补出来（无 checkpoint 也要发）。
+        let pending = crate::api::pending_dialog_events_json(&backend, &sid)
+            .await
+            .expect("pending prompts");
+        assert!(
+            pending
+                .iter()
+                .any(|v| v["type"] == "PlanProposed" && v["plan_id"] == "plan-manager-0"),
+            "重启后未处理的 PlanProposed 弹框必须出现在 pending-prompts 里: {pending:?}"
+        );
+
+        // ② 用户处理掉（导入清单 / 跳过）→ 销账。内存表里没有它，
+        //    只有落盘那份 —— dismiss 必须能删到盘上，否则下次刷新又弹。
+        crate::api::dismiss_prompt(&backend, "plan-manager-0");
+
+        // ③ 处理过的弹框不再补发。
+        let pending2 = crate::api::pending_dialog_events_json(&backend, &sid)
+            .await
+            .expect("pending prompts 2");
+        assert!(
+            !pending2.iter().any(|v| v["plan_id"] == "plan-manager-0"),
+            "已处理的弹框不该再补发（僵尸框）: {pending2:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     /// subagent 落盘跨 backend 重启：backend A create 一个 subagent
     /// 事件，drop A；新 backend B（同 cwd）启动后通过 `get_subsession`
     /// API 仍能拿到事件（磁盘回查路径）。

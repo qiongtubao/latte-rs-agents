@@ -216,10 +216,10 @@ pub(crate) struct PromptDismissRequest {
 /// （提交了选择 / 跳过 / 导入了清单），从补发表销账，避免重连时
 /// 弹出僵尸框。幂等：未命中也回 200（可能已被别的 tab 处理）。
 pub(crate) async fn chat_prompt_dismiss(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<PromptDismissRequest>,
 ) -> StatusCode {
-    api::dismiss_prompt(&req.prompt_id);
+    api::dismiss_prompt(&state.backend, &req.prompt_id);
     StatusCode::OK
 }
 

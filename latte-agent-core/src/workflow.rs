@@ -768,6 +768,18 @@ pub struct WorkflowRunContext {
     /// Nesting depth: 0 for a top-level run, +1 per nested workflow
     /// step. Guarded against [`MAX_WORKFLOW_DEPTH`] to stop cycles.
     pub depth: u8,
+    /// **顶层** run 的 `wf_id`（嵌套链的根）。`None` = 本 run 就是顶层。
+    ///
+    /// 为什么必须有：阻塞 `ask` 的落盘记录要指向**能把整条流水线带起来**
+    /// 的那个 run。此前它记的是"发出提问的那个 run"，而嵌套场景下那是
+    /// 子 run —— 回答后只 resume 子 run，父流水线既不知道自己在等谁、
+    /// 也没有任何机制被唤醒，于是永久卡死（jemalloc 现场：
+    /// `design_and_plan` → `req_review` → `requirements_review` 的
+    /// `decide` 步骤弹出选择题，答案无处可去，顶层再也没动过）。
+    ///
+    /// 由 [`run_nested_workflow`] 一路透传：顶层把自己的 `wf_id` 填进去，
+    /// 每层嵌套原样继承。
+    pub root_wf_id: Option<String>,
     /// 有 Some 时每次 step 分派都为专家建 subsession（独立子会话
     /// 日志，UI 右键「查看日志」可读）——与普通流程 delegate 一致。
     /// None（独立测试 run / CLI REPL）时跳过，专家过程不可追溯。
@@ -923,6 +935,10 @@ fn run_nested_workflow(
     ctx: WorkflowRunContext,
     output_from: Option<String>,
     export: std::collections::BTreeMap<String, String>,
+    // 发起本次嵌套的那个 run 的 `wf_id`。仅当 `ctx.root_wf_id` 为
+    // `None`（父级自己就是顶层）时用它做根身份；否则原样继承 ctx 里
+    // 已有的根。调用方传自己的 wf_id 即可，不必判断自己是第几层。
+    parent_wf_id: String,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -936,6 +952,8 @@ fn run_nested_workflow(
                 "nested workflow '{name}' exceeds max depth {MAX_WORKFLOW_DEPTH} (cycle?)"
             ));
         }
+        // 根身份：父级已经在嵌套链里就沿用它的根，否则父级自己是根。
+        let root_wf_id = ctx.root_wf_id.clone().unwrap_or(parent_wf_id);
         let wf = load_workflow(&name, &ctx.cwd).map_err(|e| {
             let available = list_workflows(&ctx.cwd)
                 .iter()
@@ -959,6 +977,11 @@ fn run_nested_workflow(
             advisor_gate: ctx.advisor_gate.clone(),
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
+            // 顶层身份原样继承：嵌套多深，阻塞 ask 的落盘记录都指向
+            // 同一个根 run —— 回答后 resume 它，整条链才会重新走起来。
+            // `parent_wf_id` 是本次嵌套的直接父级（顶层调用时 ctx 的
+            // root 为 None，用父自己的 wf_id 兜底）。
+            root_wf_id: Some(root_wf_id.clone()),
         };
         // 嵌套 run 不自设预算：外层顶层 run 的截止时间已经把它包住，
         // 内外层各设一份等于同一段时间被重复计费。
@@ -1196,6 +1219,12 @@ pub struct AnswerLog {
     /// 本 run 所属的 UI session（`WorkflowRunContext.session_id`）。
     /// CLI / 独立测试为 None —— 没有 session 就无从续跑。
     session_id: Option<String>,
+    /// **顶层** run 的 `wf_id`（嵌套链的根）。`None` = 本 run 就是顶层。
+    ///
+    /// 回答落盘时要写**两份**：本 run 的 checkpoint（本层 resume 用）
+    /// 和根 run 的 checkpoint（唤醒整条流水线用）。只写本层的话，
+    /// 嵌套 ask 的答案就只能续跑子 run，父流水线永远醒不过来。
+    root_wf_id: Option<String>,
     seen: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
@@ -1204,12 +1233,14 @@ impl AnswerLog {
         cwd: &Path,
         wf_id: &str,
         session_id: Option<String>,
+        root_wf_id: Option<String>,
         preloaded: std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             wf_id: wf_id.to_string(),
             session_id,
+            root_wf_id,
             seen: std::sync::Mutex::new(preloaded),
         }
     }
@@ -1227,6 +1258,16 @@ impl AnswerLog {
     /// 本 run 所属的 UI session（None = CLI / 独立测试）。
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// 能把**整条流水线**带起来的那个 run 的 id：嵌套链的根，没有嵌套
+    /// 时就是本 run 自己。
+    ///
+    /// 阻塞 `ask` 的落盘记录必须用它而不是 [`Self::wf_id`] —— 那样
+    /// 回答后 resume 的是顶层，父流水线才会继续；用本层 id 只能让子
+    /// run 单独跑完，父级永久卡住。
+    pub fn resume_wf_id(&self) -> &str {
+        self.root_wf_id.as_deref().unwrap_or(&self.wf_id)
     }
 
     /// 本 run（含 resume 继承）里这个问题是否已经有答案。
@@ -1247,17 +1288,26 @@ impl AnswerLog {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key.clone(), answer.to_string());
-        append_checkpoint(
-            &self.cwd,
-            &self.wf_id,
-            &CheckpointRecord::Answer {
-                wf_id: self.wf_id.clone(),
-                role: role.to_string(),
-                question: key,
-                answer: answer.to_string(),
-                answered_at: now_secs(),
-            },
-        );
+        let mk = |wf_id: &str| CheckpointRecord::Answer {
+            wf_id: wf_id.to_string(),
+            role: role.to_string(),
+            question: key.clone(),
+            answer: answer.to_string(),
+            answered_at: now_secs(),
+        };
+        append_checkpoint(&self.cwd, &self.wf_id, &mk(&self.wf_id));
+        // 嵌套 run：答案再写一份到根 run 的 checkpoint。
+        //
+        // 两份都要，各有用处：本层那份让**子** run 单独 resume 时能
+        // recall；根那份让**顶层** resume 时能 recall —— 而顶层 resume
+        // 会重新走到这个嵌套 step、重新跑子 workflow，那时子 run 是全新
+        // 的 wf_id（resume 也是新建 wf_id），它的 preloaded 只能来自根。
+        // 少了根那份，顶层续跑会把同一道题重新弹给用户。
+        if let Some(root) = self.root_wf_id.as_deref() {
+            if root != self.wf_id {
+                append_checkpoint(&self.cwd, root, &mk(root));
+            }
+        }
     }
 }
 
@@ -1584,14 +1634,33 @@ async fn run_workflow_inner(
     // 不再弹给用户（见 AnswerLog）。同时带上本 run 的恢复身份
     // （cwd + wf_id + session_id）—— 阻塞 ask 靠它把挂起项落盘，
     // 服务器重启后用户回答能驱动断点续跑。
+    //
+    // 预载来源有两处，缺一不可：
+    //   1. 本 run 的 resume 状态 —— 顶层续跑跳过已完成 step 的常规路径；
+    //   2. **根 run** 的 checkpoint —— 嵌套场景的关键。顶层 resume 会
+    //      重新走到嵌套 step 并新建一个子 run（resume 也是新 wf_id），
+    //      这个新子 run 没有自己的 resume 状态，答案只能从根那里继承。
+    //      少了它，顶层每次续跑都会把嵌套里问过的题重新弹一遍。
+    let mut preloaded = resume
+        .as_ref()
+        .map(|s| s.answers.clone())
+        .unwrap_or_default();
+    if let Some(root) = ctx.root_wf_id.as_deref() {
+        if root != wf_id {
+            if let Ok(root_state) = load_checkpoint(&ctx.cwd, root) {
+                // 本 run 自己的 resume 答案优先（更贴近当前上下文）。
+                for (q, a) in root_state.answers {
+                    preloaded.entry(q).or_insert(a);
+                }
+            }
+        }
+    }
     let answer_log = Arc::new(AnswerLog::new(
         &ctx.cwd,
         &wf_id,
         ctx.session_id.clone(),
-        resume
-            .as_ref()
-            .map(|s| s.answers.clone())
-            .unwrap_or_default(),
+        ctx.root_wf_id.clone(),
+        preloaded,
     ));
     let engine = async {
         if uses_dag {
@@ -1834,8 +1903,23 @@ async fn build_role_runner(
         if role.allowed_tools.iter().any(|t| t == "plan") {
             let plan_stage: crate::controller::SharedPlanStage =
                 Arc::new(parking_lot::RwLock::new(crate::controller::PlanStage::Normal));
-            register_plan_tool(&rtm, event_tx.clone(), role_id.to_string(), plan_stage, &cwd)
-                .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
+            // session_id 取自 answer_log（run 的恢复身份三元组之一）：
+            // 有它才能把 PlanProposed 快照落盘，进程重启后「添加任务」
+            // 弹窗仍可补发。CLI / 独立测试的 run 没有，落空串 = 不落盘。
+            let sid = answer_log
+                .as_ref()
+                .and_then(|l| l.session_id())
+                .unwrap_or_default()
+                .to_string();
+            register_plan_tool(
+                &rtm,
+                event_tx.clone(),
+                role_id.to_string(),
+                plan_stage,
+                &cwd,
+                sid,
+            )
+            .map_err(|e| format!("register plan for '{role_id}': {e}"))?;
         }
         // ask / task_report：与 controller::build_runner 对齐——manager
         // 在 workflow step 里也要能向用户抛选择题（ask 是其 prompt 指定
@@ -1858,6 +1942,9 @@ async fn build_role_runner(
                 event_tx.clone(),
                 role_id.to_string(),
                 Some(blocking),
+                // 阻塞分支不用这个：它走 AskBlocking::answer_log 那条
+                // 带 wf_id 的落盘路径（可续跑），比非阻塞快照更完整。
+                None,
             )
             .map_err(|e| format!("register ask for '{role_id}': {e}"))?;
         }
@@ -2511,6 +2598,7 @@ async fn run_workflow_serial(
                     ctx.clone(),
                     step.output_from.clone(),
                     step.export.clone(),
+                    wf_id.to_string(),
                 )
                 .await
                 {
@@ -2736,6 +2824,10 @@ struct DagStepInput {
     /// pre-wave snapshot; outputs merge back only after the wave joins.
     vars: HashMap<String, String>,
     wf_id: String,
+    /// 顶层 run 的 `wf_id`（嵌套链的根）。`None` = 本 run 就是顶层。
+    /// 嵌套 step 重建 ctx 时要原样带下去，否则子 run 认不出根身份，
+    /// 阻塞 ask 的落盘记录会退化成指向子 run（父流水线醒不过来）。
+    root_wf_id: Option<String>,
     merged: Arc<AgentConfig>,
     resolver: Arc<ModelResolver>,
     event_tx: broadcast::Sender<ChatEvent>,
@@ -2824,6 +2916,7 @@ async fn run_dag_step(
             advisor_gate: inp.advisor_gate.clone(),
             advisor_pause: inp.advisor_pause.clone(),
             staging: inp.staging.clone(),
+            root_wf_id: inp.root_wf_id.clone(),
         };
         let (output, exported) = run_nested_workflow(
             nested_name.clone(),
@@ -2831,6 +2924,7 @@ async fn run_dag_step(
             ctx,
             step.output_from.clone(),
             step.export.clone(),
+            inp.wf_id.clone(),
         )
         .await
         .map_err(|e| {
@@ -3078,6 +3172,7 @@ async fn run_workflow_dag(
                     round,
                     vars: vars.clone(),
                     wf_id: wf_id.to_string(),
+                    root_wf_id: ctx.root_wf_id.clone(),
                     merged: ctx.merged.clone(),
                     resolver: ctx.resolver.clone(),
                     default_params: ctx.default_params.clone(),
@@ -4671,6 +4766,7 @@ mod contract_engine_tests {
                 advisor_gate: None,
                 advisor_pause: None,
                 staging: None,
+                root_wf_id: None,
             },
             event_rx,
         )
@@ -5306,6 +5402,7 @@ mod resume_tests {
                 advisor_gate: None,
                 advisor_pause: None,
                 staging: None,
+                root_wf_id: None,
             },
             event_rx,
         )
@@ -6050,7 +6147,7 @@ max_iterations = 3
         let cwd = dir.path();
         // checkpoint 需要 meta 行才能被 load_checkpoint 接受。
         let ckpt = CheckpointLog::new(cwd, "wf-ans-1", "design_and_plan", "主题", 0);
-        let log = AnswerLog::new(cwd, "wf-ans-1", None, Default::default());
+        let log = AnswerLog::new(cwd, "wf-ans-1", None, None, Default::default());
 
         assert_eq!(log.recall("第 1 题：你的目标？"), None);
         log.record("tutor", "第 1 题：你的目标？", "改源码/做实现");
@@ -6085,12 +6182,12 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-ans-2", "design_and_plan", "主题", 0);
-        AnswerLog::new(cwd, "wf-ans-2", None, Default::default())
+        AnswerLog::new(cwd, "wf-ans-2", None, None, Default::default())
             .record("tutor", "时间预算？", "10h+");
 
         let state = load_checkpoint(cwd, "wf-ans-2").expect("checkpoint");
         // 新 run（新 wf_id）用上一次的回答预载。
-        let resumed = AnswerLog::new(cwd, "wf-ans-3", None, state.answers.clone());
+        let resumed = AnswerLog::new(cwd, "wf-ans-3", None, None, state.answers.clone());
         assert_eq!(resumed.recall("时间预算？").as_deref(), Some("10h+"));
     }
 
@@ -6106,7 +6203,7 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-carry-1", "design_and_plan", "主题", 0);
-        AnswerLog::new(cwd, "wf-carry-1", None, Default::default())
+        AnswerLog::new(cwd, "wf-carry-1", None, None, Default::default())
             .record("tutor", "时间预算？", "10h+");
         let first = load_checkpoint(cwd, "wf-carry-1").expect("第一份 checkpoint");
 
@@ -6133,7 +6230,7 @@ max_iterations = 3
             "resume 后的 checkpoint 必须自带上一次的回答，否则第二次续跑会重问"
         );
         assert_eq!(
-            AnswerLog::new(cwd, "wf-carry-3", None, second.answers.clone())
+            AnswerLog::new(cwd, "wf-carry-3", None, None, second.answers.clone())
                 .recall("时间预算？")
                 .as_deref(),
             Some("10h+")
@@ -6155,11 +6252,137 @@ max_iterations = 3
         // 匹配键是 trim 后的问题原文，与 AnswerLog::record 一致。
         assert!(state.has_answer("选哪个？"));
         assert_eq!(
-            AnswerLog::new(cwd, "wf-orphan-2", None, state.answers.clone())
+            AnswerLog::new(cwd, "wf-orphan-2", None, None, state.answers.clone())
                 .recall("选哪个？")
                 .as_deref(),
             Some("方案A"),
             "续跑的 run 必须 recall 命中，才不会再弹同一个框"
+        );
+    }
+
+    /// 嵌套 run 的回答必须**同时**落进本层与根 run 的 checkpoint。
+    ///
+    /// 为什么是修复本次事故的核心：阻塞 ask 出在子 workflow 里时，
+    /// 回答只写本层 = 只能 resume 子 run，父流水线不知道自己在等谁，
+    /// 永久卡死（jemalloc 现场：`design_and_plan` → `req_review` →
+    /// `requirements_review` 的 `decide` 弹出选择题，答了也没用）。
+    #[test]
+    fn nested_answer_lands_in_both_own_and_root_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _root = CheckpointLog::new(cwd, "wf-root-1", "design_and_plan", "主题", 0);
+        let _child = CheckpointLog::new(cwd, "wf-child-1", "requirements_review", "子主题", 0);
+
+        // 子 run 的 AnswerLog：root 指向顶层。
+        let log = AnswerLog::new(
+            cwd,
+            "wf-child-1",
+            Some("sess-a".into()),
+            Some("wf-root-1".into()),
+            Default::default(),
+        );
+        log.record("manager", "怎么推 L1 改稿？", "走精简计划");
+
+        // 本层能 recall（子 run 单独 resume 的场景）。
+        assert!(
+            load_checkpoint(cwd, "wf-child-1")
+                .expect("child ckpt")
+                .has_answer("怎么推 L1 改稿？"),
+            "答案必须写进本层 checkpoint"
+        );
+        // 根也能 recall（顶层 resume 唤醒整条流水线的场景）——这是关键。
+        assert!(
+            load_checkpoint(cwd, "wf-root-1")
+                .expect("root ckpt")
+                .has_answer("怎么推 L1 改稿？"),
+            "答案必须同时写进根 checkpoint，否则顶层续跑会重新弹同一道题"
+        );
+    }
+
+    /// 顶层 run 自己就是根时不重复写（root == 自己 → 只落一条）。
+    #[test]
+    fn top_level_answer_is_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _ckpt = CheckpointLog::new(cwd, "wf-solo-1", "design_and_plan", "主题", 0);
+        // 顶层：root 显式等于自己（run_workflow_inner 里 root 为 None 时
+        // resume_wf_id() 回落到 wf_id，这里模拟两者相等的情况）。
+        let log = AnswerLog::new(
+            cwd,
+            "wf-solo-1",
+            Some("sess-a".into()),
+            Some("wf-solo-1".into()),
+            Default::default(),
+        );
+        log.record("tutor", "选哪个？", "A");
+
+        let raw = std::fs::read_to_string(
+            cwd.join(".latte").join("workflow-runs").join("wf-solo-1.jsonl"),
+        )
+        .expect("read ckpt");
+        let answers = raw.lines().filter(|l| l.contains("\"answer\"")).count();
+        assert_eq!(answers, 1, "root == 自己时不该写两条重复 Answer 行");
+    }
+
+    /// `resume_wf_id()` 是"能把整条流水线带起来的那个 run"：
+    /// 嵌套时给根，无嵌套时给自己。ask 落盘用的就是它。
+    #[test]
+    fn resume_wf_id_prefers_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let nested = AnswerLog::new(
+            cwd,
+            "wf-child-9",
+            None,
+            Some("wf-root-9".into()),
+            Default::default(),
+        );
+        assert_eq!(
+            nested.resume_wf_id(),
+            "wf-root-9",
+            "嵌套 run 的 ask 必须让顶层去 resume"
+        );
+        let top = AnswerLog::new(cwd, "wf-top-9", None, None, Default::default());
+        assert_eq!(top.resume_wf_id(), "wf-top-9", "顶层 run 用自己的 id");
+    }
+
+    /// 跨层 recall：顶层 resume 会**重新建一个子 run**（resume 也是新
+    /// wf_id），这个新子 run 没有自己的 resume 状态，答案只能从根
+    /// checkpoint 继承 —— 否则顶层每次续跑都把嵌套里问过的题重弹一遍。
+    ///
+    /// 这里直接验 `run_workflow_inner` 里那段预载逻辑的等价行为：
+    /// 新子 run 的 preloaded = 自己的 resume 状态 ∪ 根的 answers。
+    #[test]
+    fn fresh_nested_run_recalls_answers_from_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let _root = CheckpointLog::new(cwd, "wf-root-2", "design_and_plan", "主题", 0);
+        let _old_child = CheckpointLog::new(cwd, "wf-child-2a", "requirements_review", "子", 0);
+
+        // 第一次跑：子 run A 里用户答了题（双写本层 + 根）。
+        AnswerLog::new(
+            cwd,
+            "wf-child-2a",
+            Some("sess-a".into()),
+            Some("wf-root-2".into()),
+            Default::default(),
+        )
+        .record("manager", "怎么推 L1 改稿？", "走精简计划");
+
+        // 顶层 resume → 重新跑嵌套 → 全新子 run B（wf_id 不同、无 resume 态）。
+        // 它的 preloaded 按 run_workflow_inner 的规则从根继承。
+        let root_answers = load_checkpoint(cwd, "wf-root-2").expect("root").answers;
+        let fresh_child = AnswerLog::new(
+            cwd,
+            "wf-child-2b",
+            Some("sess-a".into()),
+            Some("wf-root-2".into()),
+            root_answers,
+        );
+        assert_eq!(
+            fresh_child.recall("怎么推 L1 改稿？").as_deref(),
+            Some("走精简计划"),
+            "顶层续跑重建的子 run 必须 recall 命中，否则用户被迫重答"
         );
     }
 
@@ -6169,7 +6392,7 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-ans-4", "wf", "t", 0);
-        let log = AnswerLog::new(cwd, "wf-ans-4", None, Default::default());
+        let log = AnswerLog::new(cwd, "wf-ans-4", None, None, Default::default());
         log.record("tutor", "选哪个？", "A");
         log.record("tutor", "选哪个？", "B");
         assert_eq!(log.recall("选哪个？").as_deref(), Some("B"));
@@ -6896,6 +7119,7 @@ mod loop_tests {
                 advisor_gate: None,
                 advisor_pause: None,
                 staging: None,
+                root_wf_id: None,
             },
             event_rx,
         )

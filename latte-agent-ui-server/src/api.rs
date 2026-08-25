@@ -456,8 +456,18 @@ pub async fn pending_dialog_events_json(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<serde_json::Value> = Vec::new();
     for ev in &live {
-        if let ChatEvent::ChoiceRequested { choice_id, .. } = ev {
-            seen.insert(choice_id.clone());
+        // 内存表里已有的 id 都要记下：下面读盘时同 id 跳过，否则同一个
+        // 弹框在「内存 + 落盘」都命中时会被返回两份。
+        // PlanProposed 的键是 plan_id（与 register_prompt 的登记键一致），
+        // 漏掉它会让「添加任务」弹窗在同进程内重复补发。
+        match ev {
+            ChatEvent::ChoiceRequested { choice_id, .. } => {
+                seen.insert(choice_id.clone());
+            }
+            ChatEvent::PlanProposed { plan_id, .. } => {
+                seen.insert(plan_id.clone());
+            }
+            _ => {}
         }
         if let Ok(json) = latte_agent_core::event_json::chat_event_to_frontend_json(ev) {
             if let Ok(v) = serde_json::from_str(&json) {
@@ -505,7 +515,10 @@ pub async fn deliver_choice_answer(
     choice_id: &str,
     answer: String,
 ) -> ChoiceAnswerOutcome {
-    // 无论走哪条路，非阻塞补发表里的同 id 快照都该销账。
+    // 无论走哪条路，非阻塞补发表里的同 id 快照都该销账（内存 + 落盘
+    // 两处：重启后补发的那份只在盘上）。注意这在 `pending_ask::load`
+    // **之前** —— 非阻塞快照与阻塞 ask 记录用的是不同的 wf_id 约定
+    // （空 vs 真 wf_id），删非阻塞那份不会动到下面要读的阻塞记录。
     latte_agent_core::choice::dismiss_prompt(choice_id);
     if latte_agent_core::choice::resolve(choice_id, answer.clone()) {
         return ChoiceAnswerOutcome::DeliveredLive;
@@ -557,8 +570,14 @@ pub async fn deliver_choice_answer(
 /// 用户已处理某个非阻塞弹框（提交选择 / 跳过 / 关掉不再需要）→ 从
 /// 补发表里销账。返回是否命中（幂等：未命中不算错误，可能是阻塞
 /// ask 走的 `choice-answer`，或已被别的 tab 处理过）。
-pub fn dismiss_prompt(prompt_id: &str) -> bool {
-    latte_agent_core::choice::dismiss_prompt(prompt_id)
+///
+/// 内存表 + 落盘**两处都销账**：重启后 `PROMPTS` 是空的，用户处理的
+/// 正是从盘上补发出来的那条 —— 只清内存会让它下次刷新又冒出来。
+pub fn dismiss_prompt(b: &UiBackend, prompt_id: &str) -> bool {
+    let hit = latte_agent_core::choice::dismiss_prompt(prompt_id);
+    // 内存未命中也要删盘：重启后补发的弹框只在盘上有记录。
+    latte_agent_core::choice::dismiss_persisted_prompt(&b.cwd, prompt_id);
+    hit
 }
 
 /// 拿 session controller 的事件 broadcast **sender**（懒 spawn 同
@@ -1947,6 +1966,8 @@ pub fn workflow_run_start(
             turn_cancel_flag: None,
             agent_pause_gate: None, // 独立测试 run：无 session gate
             depth: 0,
+            // 顶层 run：自己就是嵌套链的根。
+            root_wf_id: None,
             // 独立测试 run 无 session：不建 subsession、不走 advisor。
             subsession_store: None,
             session_id: None,
@@ -2086,6 +2107,8 @@ async fn spawn_workflow_resume(
         // 与任务看板派发的 run 同款：用户 ⏸ 时续跑也一起冻结。
         agent_pause_gate: Some(controller.session_pause_gate()),
         depth: 0,
+        // 顶层 run：自己就是嵌套链的根。
+        root_wf_id: None,
         // 续跑跑在真实 session 事件流上：分派建 subsession（UI 右键
         // 可查日志）、过 advisor gate + 返回审查，与 manager 的
         // delegate / workflow 工具一致。
