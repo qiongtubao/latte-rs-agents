@@ -374,6 +374,7 @@ pub(crate) async fn events_sse(
     let id = params
         .get("id")
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing ?id=".into()))?;
+    // 先订阅再取挂起弹框：反序会漏掉这两步之间新发出的弹框。
     let rx = api::subscribe_session(&state.backend, id).await.map_err(|e| {
         (
             StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -391,11 +392,18 @@ pub(crate) async fn events_sse(
     // stream sees only events for THIS tab — the server is no longer
     // broadcasting the single shared controller's events to every
     // connected tab.
-    // Each SessionHandle owns its own ChatController (and therefore
-    // its own broadcast channel). Subscribing guarantees the SSE
-    // stream sees only events for THIS tab — the server is no longer
-    // broadcasting the single shared controller's events to every
-    // connected tab.
+    //
+    // 补发仍在等用户回答的 ask 弹框（见 `api::pending_choice_events`）：
+    // 只发给这条新连接，不重新广播，避免 archiver 二次归档。
+    let replay: Vec<Result<Event, axum::Error>> =
+        api::pending_choice_events(&state.backend, id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ev| chat_event_to_frontend_json(ev).ok())
+            .map(|json| Ok(Event::default().event("chat_event").data(json)))
+            .collect();
+    let replay = tokio_stream::iter(replay);
     let backend = state.backend.clone();
     let stream = BroadcastStream::new(rx).map(move |item| match item {
         Ok(ev) => {
@@ -437,7 +445,8 @@ pub(crate) async fn events_sse(
         std::time::Duration::from_secs(15),
     ))
     .map(|_| Ok(Event::default().event("ping").data("1")));
-    let stream = stream.merge(ping);
+    // replay 在前、live 在后：挂起弹框先到，之后是实时事件。
+    let stream = replay.chain(stream).merge(ping);
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new().interval(std::time::Duration::from_secs(15)),
     ))

@@ -604,9 +604,39 @@ impl SessionHandle {
         {
             let log = self.event_log.clone();
             let persist = self.persist.clone();
+            let sid = self.session_id.clone();
             let mut archive_rx = controller.subscribe();
+            // 落盘搬到独立任务：archiver 的 recv 循环里只做内存
+            // push（快），文件 open/write 经无界 mpsc 交给写手任务。
+            // 此前同步 IO 就在 recv 路径上，archiver 因此天生是最慢
+            // 的订阅者，最容易被 broadcast(256) 甩掉。
+            let (disk_tx, mut disk_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            if let Some(p) = persist {
+                let log_for_disk = log.clone();
+                tokio::spawn(async move {
+                    while let Some(line) = disk_rx.recv().await {
+                        p.lock().append_event(&line, &log_for_disk);
+                    }
+                });
+            }
             tokio::spawn(async move {
-                while let Ok(ev) = archive_rx.recv().await {
+                loop {
+                    let ev = match archive_rx.recv().await {
+                        Ok(ev) => ev,
+                        // Lagged 是**可恢复**的：只丢了 n 条，通道还活着。
+                        // 此前 `while let Ok(..)` 把它当终止条件——一次
+                        // 突发就让 archiver 永久退出，event_log 与落盘
+                        // 从此不再增长（切 tab 回来历史停在断点，重启
+                        // 后断点之后全丢；正等用户回答的 ask 弹框如果
+                        // 落在这段里，前端再也拿不到它）。
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            eprintln!(
+                                "[ui-sessions] {sid} archiver 落后，丢弃 {n} 条事件（继续归档）"
+                            );
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
                     let is_init = matches!(
                         &ev,
                         ChatEvent::Prompt { .. } | ChatEvent::SessionInfo { .. }
@@ -620,9 +650,9 @@ impl SessionHandle {
                             g.push(json.clone());
                         }
                         if !is_init {
-                            if let Some(p) = &persist {
-                                p.lock().append_event(&json, &log);
-                            }
+                            // 写手任务不在时（persist == None）发送失败，
+                            // 忽略即可——不落盘的 session 照常聊。
+                            let _ = disk_tx.send(json);
                         }
                     }
                 }

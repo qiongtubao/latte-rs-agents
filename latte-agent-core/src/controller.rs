@@ -870,7 +870,16 @@ impl ChatController {
         let state_slot = self.last_failed_workflow.clone();
         let mut state_rx = self.event_tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(ev) = state_rx.recv().await {
+            loop {
+                let ev = match state_rx.recv().await {
+                    Ok(ev) => ev,
+                    // Lagged 可恢复：跳过丢掉的那批继续跟踪。此前当成
+                    // 终止条件——一次突发之后 last_failed_workflow 冻在
+                    // 旧值，"继续"按钮要么续跑早已成功的 run，要么拒绝
+                    // 续跑真失败的那个。
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
                 if let ChatEvent::WorkflowFinished { name, wf_id, status, summary } = ev {
                     let mut slot = state_slot.write();
                     if status == "ok" {
@@ -3625,7 +3634,7 @@ pub(crate) fn register_ask_tool(
 
             let choice_id = format!("choice-{}-{}", role_id, CHOICE_SEQ.fetch_add(1, Ordering::Relaxed));
             let n = options.len();
-            let _ = event_tx.send(ChatEvent::ChoiceRequested {
+            let requested = ChatEvent::ChoiceRequested {
                 role_id: role_id.clone(),
                 choice_id: choice_id.clone(),
                 question: question.clone(),
@@ -3634,8 +3643,10 @@ pub(crate) fn register_ask_tool(
                 allow_upload,
                 wait: blocking.is_some(),
                 options,
-            });
+            };
             let Some(blk) = blocking else {
+                // fire-and-forget：没有等待方，直接推给前端即可。
+                let _ = event_tx.send(requested);
                 return Ok(serde_json::Value::String(format!(
                     "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
                 )));
@@ -3644,11 +3655,22 @@ pub(crate) fn register_ask_tool(
             // `/api/chat/choice-answer` 把答案送进 choice 路由；
             // 无限等待用户，取消则报错退出。暂停门在每次 select
             // 迭代前检查——用户按 ⏸ 时冻结等待，▶ 继续后恢复。
-            let rx = crate::choice::register(&choice_id);
+            //
+            // **注册必须先于广播**：反过来的话，弹框已经到了前端而
+            // PENDING 里还没有挂起项，用户秒答 → `resolve` 返回 false
+            // → 404 → 前端降级成普通消息，而随后注册上的等待方再也
+            // 收不到答案，这次 ask 无限挂起（超时路径已移除，只能等
+            // 24h 或删 session）。
+            //
+            // 同时把弹框快照存进挂起项：broadcast 是"没订阅者就丢弃"
+            // 的，发的这一刻用户可能没开着这个 session 的 SSE。新连接
+            // 会经 `choice::pending_for_channel` 把它补发一遍。
+            let rx = crate::choice::register(&choice_id, requested.clone(), event_tx.clone());
             // 等待 future 被 drop（外层超时熔断 / workflow 中止）时自动
             // 清理 PENDING，防泄漏——否则 has_any_pending 永远为真，
             // advisor 被永久静音。
             let _choice_guard = crate::choice::ChoiceGuard(choice_id.clone());
+            let _ = event_tx.send(requested);
             let cancel_watch = {
                 let cf = blk.cancel_flag.clone();
                 async move {

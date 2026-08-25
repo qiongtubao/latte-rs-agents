@@ -398,6 +398,33 @@ pub async fn subscribe_session(
     Ok(controller.subscribe())
 }
 
+/// 订阅时要补发的「仍在等用户回答」的弹框事件（阻塞 ask）。
+///
+/// broadcast 没有回放：`ChoiceRequested` 发出的那一刻若本 session 没有
+/// SSE 订阅者（用户切到别的 session、关了 tab、EventSource 正在重连），
+/// 这个弹框就再也不会出现，而阻塞的 ask 会无限等下去。取消超时兜底后
+/// 这等于会话永久卡死，所以新连接必须把挂起的弹框补一遍。
+///
+/// 只补发**属于本 session 事件通道**的挂起项（`same_channel` 判归属），
+/// 不会把别的会话的问题弹到这里。已回答/已取消的不在 PENDING 里，
+/// 因此不会补出僵尸弹框。
+///
+/// 走 SSE 流的私有前缀而不是 `event_sender().send()` 重播：重播会被
+/// archiver 再归档一次，history 里出现重复弹框。
+pub async fn pending_choice_events(
+    b: &UiBackend,
+    id: &str,
+) -> Result<Vec<ChatEvent>, ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    // 已 spawn 才可能有挂起弹框；未激活的恢复 session 直接空。
+    let Some(controller) = h.try_controller() else {
+        return Ok(vec![]);
+    };
+    Ok(latte_agent_core::choice::pending_for_channel(
+        &controller.event_sender(),
+    ))
+}
+
 /// 拿 session controller 的事件 broadcast **sender**（懒 spawn 同
 /// [`subscribe_session`]）。任务看板把绑定 workflow 的 run 直接跑在
 /// session 的事件流上：`run_workflow` 的 WorkflowStarted/Step/Turn/
@@ -1760,8 +1787,18 @@ pub fn workflow_run_start(
         let (tx_inner, mut rx_inner) = broadcast::channel::<ChatEvent>(64);
         let fwd_state = state.clone();
         let forwarder = tokio::spawn(async move {
-            while let Ok(ev) = rx_inner.recv().await {
-                fwd_state.broadcast(ev);
+            loop {
+                match rx_inner.recv().await {
+                    Ok(ev) => fwd_state.broadcast(ev),
+                    // Lagged 可恢复：内部通道只有 64 格，一个快 run 很
+                    // 容易挤爆。此前当成终止条件 → 转发永久停摆，UI 从
+                    // 中途开始什么都收不到（含 ask 弹框）。
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("[workflow-run] forwarder 落后，丢弃 {n} 条事件（继续转发）");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         });
         let ctx = WorkflowRunContext {
