@@ -49,6 +49,55 @@ pub fn for_skill(name: &str) -> Option<&'static str> {
     }
 }
 
+// ─── Tool-level prompts (oh-my-pi pattern) ─────────────────────────────
+// Appended to tool descriptions at registration time. Guides the model
+// on WHEN to use each tool, WHEN NOT TO, and critical constraints.
+// Format follows `<instruction>` + `<critical>` convention.
+
+pub mod tool_prompts {
+    pub const CODE_GRAPH: &str = include_str!("../../prompts/tools/code_graph.md");
+    pub const READ: &str = include_str!("../../prompts/tools/read.md");
+    pub const SEARCH: &str = include_str!("../../prompts/tools/search.md");
+    pub const BASH: &str = include_str!("../../prompts/tools/bash.md");
+    pub const WRITE: &str = include_str!("../../prompts/tools/write.md");
+    pub const DELEGATE: &str = include_str!("../../prompts/tools/delegate.md");
+    pub const ASK: &str = include_str!("../../prompts/tools/ask.md");
+    pub const WORKFLOW: &str = include_str!("../../prompts/tools/workflow.md");
+    pub const PLAN: &str = include_str!("../../prompts/tools/plan.md");
+    pub const TASK_REPORT: &str = include_str!("../../prompts/tools/task_report.md");
+    pub const PLAYWRIGHT: &str = include_str!("../../prompts/tools/playwright.md");
+    pub const MCP: &str = include_str!("../../prompts/tools/mcp.md");
+    pub const GENERATE_IMAGE: &str = include_str!("../../prompts/tools/generate_image.md");
+    pub const DOC_GRAPH_SCAN: &str = include_str!("../../prompts/tools/doc_graph_scan.md");
+    pub const DOC_GRAPH_CONTEXT: &str = include_str!("../../prompts/tools/doc_graph_context.md");
+    pub const DOC_WRITE: &str = include_str!("../../prompts/tools/doc_write.md");
+    pub const DOC_INDEX: &str = include_str!("../../prompts/tools/doc_index.md");
+
+    /// Look up a tool prompt by tool name. Returns `None` if no prompt exists.
+    pub fn for_tool(name: &str) -> Option<&'static str> {
+        Some(match name {
+            "code_graph" | "code-graph" => CODE_GRAPH,
+            "read" => READ,
+            "search" => SEARCH,
+            "bash" => BASH,
+            "write" => WRITE,
+            "delegate" => DELEGATE,
+            "ask" => ASK,
+            "workflow" => WORKFLOW,
+            "plan" => PLAN,
+            "task_report" => TASK_REPORT,
+            "playwright" | "playwright_script" => PLAYWRIGHT,
+            "mcp" | "mcp_connect" | "mcp_list" | "mcp_call" => MCP,
+            "generate_image" => GENERATE_IMAGE,
+            "doc_graph_scan" => DOC_GRAPH_SCAN,
+            "doc_graph_context" => DOC_GRAPH_CONTEXT,
+            "doc_write" => DOC_WRITE,
+            "doc_index" => DOC_INDEX,
+            _ => return None,
+        })
+    }
+}
+
 /// Look up a default role prompt by its id (e.g. `"pm"`, `"architect"`).
 /// Look up a default role prompt by its id (e.g. `"pm"`, `"architect"`).
 ///

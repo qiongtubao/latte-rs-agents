@@ -3115,6 +3115,41 @@ pub(crate) async fn build_tool_manager(
             mgr.unregister(&tool_id);
         }
     }
+
+    // ── Tool-level prompt injection (oh-my-pi pattern) ──────────────────
+    // For each surviving tool, look up its built-in tool prompt (compiled
+    // into the binary via include_str! in prompts::tool_prompts). If found,
+    // append to the tool's description. This gives the model per-tool usage
+    // guidance (when to use, when not to, critical constraints) without
+    // bloating the system prompt. Falls back to reading from filesystem
+    // `prompts/tools/{name}.md` for project-level overrides.
+    {
+        use crate::prompts::tool_prompts;
+        for tool_name in mgr.get_tool_names() {
+            // Priority: 1) project-local file override, 2) built-in compiled prompt
+            let content = {
+                let local_file = std::path::Path::new("prompts/tools")
+                    .join(format!("{}.md", tool_name));
+                if let Ok(text) = std::fs::read_to_string(&local_file) {
+                    let trimmed = text.trim().to_string();
+                    if trimmed.is_empty() { None } else { Some(trimmed) }
+                } else {
+                    tool_prompts::for_tool(&tool_name).map(|s| s.trim().to_string())
+                }
+            };
+            if let Some(prompt_text) = content {
+                if let Some(mut tool) = mgr.get_tool(&tool_name) {
+                    tool.description = format!(
+                        "{}\n\n{}",
+                        tool.description, prompt_text
+                    );
+                    mgr.unregister(&tool_name);
+                    mgr.register(tool, None);
+                }
+            }
+        }
+    }
+
     Ok(mgr)
 }
 
@@ -3233,17 +3268,238 @@ pub(crate) fn register_request_tool(
 }
 
 
+// ─────────────────────────────────────────────────────────────────────
+// code_graph：结构化代码导航
+//
+// 设计要点（2026-08-27 重写，起因见 jemalloc 会话事故）：
+//
+// 旧实现把 `kind` 映射成 **Rust/TypeScript 语法的 ast-grep pattern**
+// （`fn $NAME($$$PARAMS) -> $RET { ... }`、`trait`、`impl`、ES6
+// `import`），且不传 `--lang`。在 C 项目上这些 pattern 命中数恒为 0，
+// 于是 programmer 角色虽然配置里有 code_graph，实际 151 次工具调用
+// 里 0 次用它，全部退化成 `bash grep` + 34 次整文件 `read`（288KB），
+// 直接催生了单次 delegate 976 万 input tokens。
+//
+// 关键修正：**按 pattern 匹配改成按 tree-sitter 节点类型（`kind:`）
+// 匹配**。实测对比（jemalloc `src/pac.c`，真实函数 22 个）：
+//   - pattern `$RET $NAME($$$PARAMS) { $$$BODY }` → 命中 8（召回 36%）
+//   - rule    `kind: function_definition`        → 命中 22（召回 100%）
+// 在 pac.c / pa.c / hpa.c / sec.c 上抽查，节点类型路线召回均为 100%。
+// 本文件 CODE_GRAPH_KIND_TABLE 里每一个 (语言, 语义类型) → 节点类型的
+// 映射都是用 `ast-grep scan --inline-rules` 在真实样本上实测过命中数
+// 非 0 的，新增条目务必同样实测，否则又会退化成"配置里有、模型不敢用"。
+// ─────────────────────────────────────────────────────────────────────
+
+/// 语义查询类型 → tree-sitter 节点类型的映射表。
+///
+/// 每行 `(语言, 语义 kind, 节点类型)`。同一 (语言, kind) 可以有多行，
+/// 会合并成 `any:` 规则（例如 Go 的 `function` 同时覆盖普通函数和方法）。
+const CODE_GRAPH_KIND_TABLE: &[(&str, &str, &str)] = &[
+    // ── C ──（实测样本：jemalloc src/pac.c, include/.../edata.h）
+    ("c", "function", "function_definition"),
+    ("c", "struct", "struct_specifier"),
+    ("c", "type", "type_definition"),
+    ("c", "macro", "preproc_def"),
+    ("c", "macro", "preproc_function_def"),
+    ("c", "call", "call_expression"),
+    ("c", "import", "preproc_include"),
+    ("c", "decl", "declaration"),
+    // ── C++ ──
+    ("cpp", "function", "function_definition"),
+    ("cpp", "struct", "struct_specifier"),
+    ("cpp", "class", "class_specifier"),
+    ("cpp", "call", "call_expression"),
+    ("cpp", "import", "preproc_include"),
+    // ── Rust ──
+    ("rust", "function", "function_item"),
+    ("rust", "struct", "struct_item"),
+    ("rust", "enum", "enum_item"),
+    ("rust", "trait", "trait_item"),
+    ("rust", "impl", "impl_item"),
+    ("rust", "call", "call_expression"),
+    ("rust", "import", "use_declaration"),
+    // ── Go ──
+    ("go", "function", "function_declaration"),
+    ("go", "function", "method_declaration"),
+    ("go", "method", "method_declaration"),
+    ("go", "type", "type_declaration"),
+    ("go", "struct", "struct_type"),
+    ("go", "interface", "interface_type"),
+    ("go", "call", "call_expression"),
+    ("go", "import", "import_declaration"),
+    // ── Python ──
+    ("python", "function", "function_definition"),
+    ("python", "class", "class_definition"),
+    ("python", "call", "call"),
+    ("python", "import", "import_statement"),
+    // ── TypeScript ──
+    ("typescript", "function", "function_declaration"),
+    ("typescript", "function", "method_definition"),
+    ("typescript", "method", "method_definition"),
+    ("typescript", "class", "class_declaration"),
+    ("typescript", "interface", "interface_declaration"),
+    ("typescript", "call", "call_expression"),
+    ("typescript", "import", "import_statement"),
+    // ── JavaScript ──
+    ("javascript", "function", "function_declaration"),
+    ("javascript", "function", "method_definition"),
+    ("javascript", "method", "method_definition"),
+    ("javascript", "class", "class_declaration"),
+    ("javascript", "call", "call_expression"),
+    ("javascript", "import", "import_statement"),
+    // ── Java ──
+    ("java", "function", "method_declaration"),
+    ("java", "method", "method_declaration"),
+    ("java", "class", "class_declaration"),
+    ("java", "interface", "interface_declaration"),
+    ("java", "call", "method_invocation"),
+    ("java", "import", "import_declaration"),
+];
+
+/// 文件扩展名 → ast-grep 语言名。
+fn code_graph_lang_from_ext(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "rs" => "rust",
+        "go" => "go",
+        "py" | "pyi" => "python",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "java" => "java",
+        _ => return None,
+    })
+}
+
+/// 从路径推断语言。目录路径推断不出来（没有扩展名），调用方需要显式传 `lang`。
+fn code_graph_infer_lang(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    code_graph_lang_from_ext(&ext)
+}
+
+/// 查 (语言, 语义 kind) 对应的 tree-sitter 节点类型列表。
+fn code_graph_node_kinds(lang: &str, kind: &str) -> Vec<&'static str> {
+    CODE_GRAPH_KIND_TABLE
+        .iter()
+        .filter(|(l, k, _)| *l == lang && *k == kind)
+        .map(|(_, _, node)| *node)
+        .collect()
+}
+
+/// 某语言支持的语义 kind 清单（用于报错时给出可选值）。
+fn code_graph_kinds_for_lang(lang: &str) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = CODE_GRAPH_KIND_TABLE
+        .iter()
+        .filter(|(l, _, _)| *l == lang)
+        .map(|(_, k, _)| *k)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// 支持的语言清单。
+fn code_graph_supported_langs() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = CODE_GRAPH_KIND_TABLE.iter().map(|(l, _, _)| *l).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// 构造 ast-grep 的 inline YAML 规则。
+///
+/// 多个节点类型合并成 `any:`；`name` 非空时再叠一层 `all:` + `regex`
+/// 约束，让"只找某个函数"不需要把整个目录的匹配都拉回来。
+///
+/// YAML 缩进必须逐层算准：ast-grep 对 `rule:` 下的结构很严格，缩进错
+/// 一层就报 `invalid type: unit value, expected struct SerializableRule`
+/// 并返回 0 命中——而 0 命中对模型来说和"这工具没用"无法区分，正是
+/// 旧实现被弃用的原因。所以这里的每个分支都有对应的单元测试。
+fn code_graph_build_rule(lang: &str, node_kinds: &[&str], name: Option<&str>) -> String {
+    // 先构造"匹配节点类型"这个子规则的行列表（不带缩进）。
+    let kind_lines: Vec<String> = if node_kinds.len() == 1 {
+        vec![format!("kind: {}", node_kinds[0])]
+    } else {
+        let mut v = vec!["any:".to_string()];
+        for nk in node_kinds {
+            v.push(format!("- kind: {nk}"));
+        }
+        v
+    };
+
+    let mut out = format!("id: code_graph\nlanguage: {lang}\nrule:\n");
+    match name {
+        None => {
+            // rule:
+            //   kind: X
+            // 或
+            //   any:
+            //   - kind: X
+            //   - kind: Y
+            for l in &kind_lines {
+                out.push_str(&format!("  {l}\n"));
+            }
+        }
+        Some(n) => {
+            // rule:
+            //   all:
+            //   - kind: X                （或 - any: / 后续 - kind 再缩进）
+            //   - regex: '...'
+            out.push_str("  all:\n");
+            for (i, l) in kind_lines.iter().enumerate() {
+                if i == 0 {
+                    out.push_str(&format!("  - {l}\n"));
+                } else {
+                    // any: 的子项要落在 `- any:` 这一项的内部，缩进 4 空格。
+                    out.push_str(&format!("    {l}\n"));
+                }
+            }
+            // YAML 单引号转义：内部单引号写两遍。
+            out.push_str(&format!("  - regex: '{}'\n", n.replace('\'', "''")));
+        }
+    }
+    out
+}
+
+/// 从一条 ast-grep JSON 匹配里提取"签名行"——匹配文本的第一行，
+/// 并把跨行的参数列表压平。这是 code_graph 省 token 的核心。
+///
+/// 真实仓库实测（jemalloc，10 个最大的源文件 / 431 个函数）：
+/// 整文件 328,625 B → 签名清单 47,576 B，**6.9x**。单文件区间 3.1x
+/// (edata.h，全是短小的 inline getter) ~ 11.6x (jemalloc.c，函数体长)。
+/// 函数体越长压缩比越高，正好对应"想看结构时最不需要函数体"。
+fn code_graph_signature_of(text: &str) -> String {
+    // 取到函数体开始（`{`）之前，避免把整个 body 带回来。
+    let head = match text.find('{') {
+        Some(i) => &text[..i],
+        None => text,
+    };
+    // 压平多行参数列表：C/Rust 惯用换行对齐，原样回传浪费 token。
+    let flat = head.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        text.lines().next().unwrap_or("").trim().to_string()
+    } else {
+        flat
+    }
+}
+
 fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
-    use latte_rs_agent_tools::types::*;
     use latte_rs_agent_tools::error::ToolError;
+    use latte_rs_agent_tools::types::*;
     use std::sync::Arc;
-    use serde_json::json;
 
     fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
         ToolInputProperty {
             property_type: ty,
             description: Some(desc.into()),
-            enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
         }
     }
     fn optional_schema(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
@@ -3261,48 +3517,250 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
 
     let handler: SharedToolHandler = Arc::new(|input: serde_json::Value, _ctx| {
         Box::pin(async move {
-            let pattern = input.get("pattern")
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            let raw_pattern = input
+                .get("pattern")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::other("pattern is required"))?;
-            let path = input.get("path")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let kind = input
+                .get("kind")
                 .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            let kind = input.get("kind")
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let name = input
+                .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("function");
-            let query = match kind {
-                "function" => format!("fn $NAME($$$PARAMS) -> $RET {{ $$$BODY }}"),
-                "struct" => format!("struct $NAME {{ $$$FIELDS }}"),
-                "class" => format!("class $NAME {{ $$$BODY }}"),
-                "import" => format!("import {{ $$$IMPORTS }} from \"$SRC\""),
-                "interface" => format!("interface $NAME {{ $$$BODY }}"),
-                "trait" => format!("trait $NAME {{ $$$BODY }}"),
-                "impl" => format!("impl $NAME {{ $$$BODY }}"),
-                "call" => format!("$CALLEE($$$ARGS)"),
-                _ => pattern.to_string(),
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("signatures");
+            let want_full = mode == "full";
+
+            // ── ast-grep 可用性预检 ──
+            // 旧实现直接 spawn，缺二进制时模型只拿到一句
+            // "ast-grep failed: No such file"，试一次就再也不用这个工具。
+            // 这里给可执行的安装指引 + 明确的降级建议。
+            if tokio::process::Command::new("ast-grep")
+                .arg("--version")
+                .output()
+                .await
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
+            {
+                return Err(ToolError::execution_str(
+                    "code_graph",
+                    "本机没有可用的 ast-grep，code_graph 无法工作。\
+                     安装：`brew install ast-grep` 或 `cargo install ast-grep --locked`。\
+                     在装好之前请改用 search/bash grep + 带行范围的 read。"
+                        .to_string(),
+                ));
+            }
+
+            // ── 语言判定 ──
+            let lang_owned: String;
+            let lang: &str = match input.get("lang").and_then(|v| v.as_str()).map(str::trim) {
+                Some(l) if !l.is_empty() => {
+                    lang_owned = l.to_ascii_lowercase();
+                    &lang_owned
+                }
+                _ => match code_graph_infer_lang(path) {
+                    Some(l) => l,
+                    None => {
+                        // 目录路径没有扩展名，推断不出语言。
+                        return Err(ToolError::execution_str(
+                            "code_graph",
+                            format!(
+                                "无法从 path='{path}' 推断语言（目录或未知扩展名），请显式传 lang。\
+                                 支持的 lang：{}",
+                                code_graph_supported_langs().join(", ")
+                            ),
+                        ));
+                    }
+                },
             };
-            let output = tokio::process::Command::new("ast-grep")
-                .args(["-p", &query, path])
-                .output().await
-                .map_err(|e| ToolError::execution_str("code_graph", format!("ast-grep failed: {e}")))?;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            // ── 组装 ast-grep 命令 ──
+            // 两条路径：语义 kind（走 scan --inline-rules，按节点类型匹配，
+            // 召回可靠）与裸 pattern（走 run -p，逃生舱，交给模型自己写）。
+            let mut cmd = tokio::process::Command::new("ast-grep");
+            let rule_text;
+            match (kind, raw_pattern) {
+                (Some(k), _) => {
+                    let node_kinds = code_graph_node_kinds(lang, k);
+                    if node_kinds.is_empty() {
+                        let avail = code_graph_kinds_for_lang(lang);
+                        return Err(ToolError::execution_str(
+                            "code_graph",
+                            if avail.is_empty() {
+                                format!(
+                                    "不支持的 lang='{lang}'。支持：{}",
+                                    code_graph_supported_langs().join(", ")
+                                )
+                            } else {
+                                format!(
+                                    "lang='{lang}' 不支持 kind='{k}'。可用 kind：{}。\
+                                     或改用 pattern 参数写裸 ast-grep 模式。",
+                                    avail.join(", ")
+                                )
+                            },
+                        ));
+                    }
+                    rule_text = code_graph_build_rule(lang, &node_kinds, name);
+                    cmd.args(["scan", "--inline-rules", &rule_text, path, "--json=compact"]);
+                }
+                (None, Some(p)) => {
+                    cmd.args(["run", "-l", lang, "-p", p, path, "--json=compact"]);
+                }
+                (None, None) => {
+                    return Err(ToolError::execution_str(
+                        "code_graph",
+                        format!(
+                            "必须提供 kind 或 pattern 之一。lang='{lang}' 可用 kind：{}",
+                            code_graph_kinds_for_lang(lang).join(", ")
+                        ),
+                    ));
+                }
+            }
+
+            let output = cmd.output().await.map_err(|e| {
+                ToolError::execution_str("code_graph", format!("ast-grep 执行失败: {e}"))
+            })?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+            let parsed: Vec<serde_json::Value> = if stdout.trim().is_empty() {
+                Vec::new()
+            } else {
+                serde_json::from_str(stdout.trim()).unwrap_or_default()
+            };
+
+            // ── 结果格式化 ──
+            // signatures（默认）：`file:line: 签名`，一条一行。
+            // full：带完整匹配文本，只在确实要读实现时用。
+            //
+            // 输出封顶是必须的：`kind: call_expression` 打在 src/ 上
+            // 轻松几千条命中，不封顶就会把这个"省 token 的工具"变成
+            // 新的 token 黑洞。截断时明确告诉模型怎么收窄。
+            const MAX_MATCHES: usize = 200;
+            const MAX_CHARS: usize = 12_000;
+            let total = parsed.len();
+            let mut lines: Vec<String> = Vec::new();
+            let mut chars = 0usize;
+            let mut emitted = 0usize;
+            for m in parsed.iter().take(MAX_MATCHES) {
+                let file = m.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+                let line = m
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .map(|l| l + 1) // ast-grep 的 line 是 0-based
+                    .unwrap_or(0);
+                let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let body = if want_full {
+                    text.to_string()
+                } else {
+                    code_graph_signature_of(text)
+                };
+                let entry = format!("{file}:{line}: {body}");
+                if chars + entry.len() > MAX_CHARS {
+                    break;
+                }
+                chars += entry.len();
+                emitted += 1;
+                lines.push(entry);
+            }
+
             let mut result = serde_json::Map::new();
-            result.insert("matches".into(), serde_json::Value::String(stdout));
+            result.insert("lang".into(), serde_json::Value::String(lang.to_string()));
+            result.insert(
+                "total_matches".into(),
+                serde_json::Value::Number(total.into()),
+            );
+            result.insert(
+                "shown".into(),
+                serde_json::Value::Number(emitted.into()),
+            );
+            result.insert(
+                "matches".into(),
+                serde_json::Value::String(lines.join("\n")),
+            );
+            if emitted < total {
+                result.insert(
+                    "note".into(),
+                    serde_json::Value::String(format!(
+                        "只回传了 {emitted}/{total} 条。收窄方式：把 path 指向单个文件、\
+                         用 name 参数按名字过滤，或换更具体的 kind。"
+                    )),
+                );
+            }
+            if total == 0 {
+                result.insert(
+                    "note".into(),
+                    serde_json::Value::String(format!(
+                        "0 命中。检查：path 是否存在、lang='{lang}' 是否正确（当前由\
+                         {} 得出）、kind 是否适合该语言（可用：{}）。",
+                        if input.get("lang").is_some() { "显式参数" } else { "路径扩展名推断" },
+                        code_graph_kinds_for_lang(lang).join(", ")
+                    )),
+                );
+            }
             if !stderr.is_empty() {
                 result.insert("stderr".into(), serde_json::Value::String(stderr));
             }
             Ok(serde_json::Value::Object(result))
         })
     });
+
     let schema = optional_schema(vec![
-        ("pattern", PropertyType::String, "AST 模式，如 fn $NAME($$$PARAMS) -> $RET { $$$BODY }"),
-        ("path", PropertyType::String, "搜索路径，默认当前目录"),
-        ("kind", PropertyType::String, "查询类型: function/struct/class/import/interface/trait/impl/call"),
+        (
+            "path",
+            PropertyType::String,
+            "搜索路径，文件或目录。默认当前目录。指向单个文件时可省略 lang（按扩展名推断）",
+        ),
+        (
+            "kind",
+            PropertyType::String,
+            "语义查询类型（推荐用法，按 AST 节点类型精确匹配）：\
+             function / method / struct / class / interface / enum / trait / impl / type / macro / call / import / decl。\
+             不同语言支持的子集不同，传错会返回该语言的可用清单",
+        ),
+        (
+            "lang",
+            PropertyType::String,
+            "语言：c / cpp / rust / go / python / typescript / javascript / java。\
+             path 是目录时必填",
+        ),
+        (
+            "name",
+            PropertyType::String,
+            "可选，按正则过滤匹配文本（如只找名字含 decay 的函数）。用它替代把整个目录的匹配全拉回来",
+        ),
+        (
+            "mode",
+            PropertyType::String,
+            "signatures（默认，只回签名行，省 token）| full（回完整匹配文本，仅在需要读实现时用）",
+        ),
+        (
+            "pattern",
+            PropertyType::String,
+            "逃生舱：裸 ast-grep 模式（如 'pac_decay_all($$$ARGS)'）。\
+             kind 覆盖不到时才用；kind 与 pattern 同时给出时 kind 优先",
+        ),
     ]);
-    Tool::builder("code_graph", "用 AST 模式查询代码结构，比 grep 更精准。支持多种结构类型查询", schema, handler)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
+
+    Tool::builder(
+        "code_graph",
+        "结构化代码导航：按 AST 节点类型查函数/结构体/类/调用点/import，比 grep 精准、比整文件 read 省得多。\
+         典型用法——先用它建地图（`kind=function` + `path=src/foo.c` 拿到全部函数签名和行号），\
+         再只对少数热点用带行范围的 read 精读。查「谁调用了 X」用 `kind=call` + `name=X`。\
+         实测（jemalloc 10 个最大源文件 / 431 个函数）：整文件 328KB → 签名清单 47KB，6.9x。\
+         支持 c/cpp/rust/go/python/typescript/javascript/java。需要本机装有 ast-grep",
+        schema,
+        handler,
+    )
+    .timeout(std::time::Duration::from_secs(30))
+    .build()
 }
 
 pub(crate) fn tool_usage_prompt(_allowed: &[String]) -> String {
@@ -3552,8 +4010,10 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
             .to_string()
     };
     // ── 存在性 ──
+    // 反馈只报路径本身（不带任务标题）并去重：tool_result 只有 256
+    // 字节，带标题的长清单一撑就爆，模型看到的是被砍掉尾部的残句。
     let mut missing: Vec<String> = Vec::new();
-    let mut check_exists = |title: &str, raw: &str| {
+    let mut check_exists = |_title: &str, raw: &str| {
         let p = normalize(raw);
         if p.is_empty() {
             return;
@@ -3572,8 +4032,8 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
                 break;
             }
         }
-        if !top_exists {
-            missing.push(format!("任务「{title}」的 path「{p}」"));
+        if !top_exists && !missing.contains(&p) {
+            missing.push(p);
         }
     };
     for t in tasks {
@@ -3587,15 +4047,39 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
         }
     }
     if !missing.is_empty() {
+        // 反馈通道只有 256 字节（tool_result 截断，见 agent.rs 终止态
+        // 处理），长清单会被砍掉尾部，模型只能看到前一两条 —— 与其被
+        // 动截断，不如主动只报前 3 条 + 总数。
+        let head = missing.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+        let more = if missing.len() > 3 {
+            format!("（共 {} 处）", missing.len())
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "以下 paths 的第一级目录在仓库里不存在（疑似幻觉路径，请用 read/search 核实后再提交，或改为真实存在的路径前缀）：{}",
-            missing.join("；")
+            "paths 的第一级目录在仓库里不存在（疑似幻觉路径，先用 read/search 核实）：{head}{more}"
         ));
     }
     // ── 清单内重叠（仅顶层任务两两比较；子任务继承父任务范围） ──
-    let mut conflicts: Vec<String> = Vec::new();
+    //
+    // 只读任务不参与校验：重叠的唯一害处是"并行写互相覆盖"，纯阅读/
+    // 学习/调研类任务天然可以共用同一份代码。（jemalloc 2026-08-26
+    // 会话：8 个纯阅读的学习任务因为都要读
+    // `include/jemalloc/internal` 被判 45 处冲突，5855 字错误回喂时又
+    // 被截到 256 字节，模型看不全、改不动，连撞两次 plan 后靠蒙才过。）
+    let mut pairs = 0usize;
+    // 冲突热点：重叠路径 → 牵涉到的任务下标集合。按路径聚合而不是按
+    // "任务对"罗列，同一个热点路径只报一次，反馈短且可执行。
+    let mut hot: std::collections::HashMap<String, std::collections::BTreeSet<usize>> =
+        std::collections::HashMap::new();
     for i in 0..tasks.len() {
+        if is_readonly_plan_task(&tasks[i]) {
+            continue;
+        }
         for j in (i + 1)..tasks.len() {
+            if is_readonly_plan_task(&tasks[j]) {
+                continue;
+            }
             for a in tasks[i].paths.iter().map(|p| normalize(p)) {
                 for b in tasks[j].paths.iter().map(|p| normalize(p)) {
                     if a.is_empty() || b.is_empty() {
@@ -3603,22 +4087,45 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
                     }
                     let (pa, pb) = (std::path::Path::new(&a), std::path::Path::new(&b));
                     if pa == pb || pa.starts_with(pb) || pb.starts_with(pa) {
-                        conflicts.push(format!(
-                            "「{}」的「{a}」 与 「{}」的「{b}」",
-                            tasks[i].title, tasks[j].title
-                        ));
+                        pairs += 1;
+                        // 记较短的那个（= 包含关系里的父前缀）作热点。
+                        let key = if a.len() <= b.len() { a.clone() } else { b.clone() };
+                        let entry = hot.entry(key).or_default();
+                        entry.insert(i);
+                        entry.insert(j);
                     }
                 }
             }
         }
     }
-    if !conflicts.is_empty() {
+    if pairs > 0 {
+        let mut top: Vec<(String, usize)> =
+            hot.into_iter().map(|(p, ts)| (p, ts.len())).collect();
+        // 牵涉任务最多的热点优先；同数按路径名稳定排序。
+        top.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+        let head = top
+            .iter()
+            .take(2)
+            .map(|(p, n)| format!("{p}({n} 个任务)"))
+            .collect::<Vec<_>>()
+            .join("、");
         return Err(format!(
-            "以下任务的 paths 范围重叠（并行执行会互相覆盖，派发时会被任务看板 409 拒绝），请调整使各任务范围互不重叠：{}",
-            conflicts.join("；")
+            "paths 范围重叠 {pairs} 处，集中在：{head}。并行会互相覆盖（派发被看板 409），\
+             请让各任务范围互不重叠；纯阅读任务的 labels 加「只读」可跳过本校验"
         ));
     }
     Ok(())
+}
+
+/// 纯阅读类任务判定：labels 里带只读标记的任务不参与 paths 重叠校验。
+///
+/// 用 labels 而不是新增字段，是为了不动 `PlanTask` 与后端 `ImportTask`
+/// / 前端 `ImportTask` 的三处同构约定。
+fn is_readonly_plan_task(t: &PlanTask) -> bool {
+    const MARKERS: &[&str] = &["只读", "readonly", "read-only", "学习", "learning", "调研"];
+    t.labels
+        .iter()
+        .any(|l| MARKERS.iter().any(|m| l.eq_ignore_ascii_case(m)))
 }
 
 pub(crate) fn register_plan_tool(
@@ -3644,7 +4151,7 @@ pub(crate) fn register_plan_tool(
             ("tasks".into(), ToolInputProperty {
                 property_type: PropertyType::Array,
                 description: Some(
-                    "任务候选清单（一次调用提交整份清单：拆分出几个任务就放几项，禁止每个任务单独调一次本工具——上一份清单未获用户批准时后续调用会被拒绝）。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs/annotate_code;没有贴合的必须留空走manager直接执行,禁止硬绑不相关的workflow), paths(可选,字符串数组,任务涉及的文件/目录前缀如\"src/ringbuf\";并行执行时范围重叠的任务会被拒绝派发,拆任务时让各任务范围互不重叠), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
+                    "任务候选清单（一次调用提交整份清单：拆分出几个任务就放几项，禁止每个任务单独调一次本工具——上一份清单未获用户批准时后续调用会被拒绝）。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs/annotate_code;没有贴合的必须留空走manager直接执行,禁止硬绑不相关的workflow), paths(可选,字符串数组,任务涉及的文件/目录前缀如\"src/ringbuf\";并行执行时范围重叠的任务会被拒绝派发,拆任务时让各任务范围互不重叠;纯阅读/学习类任务在 labels 里加\"只读\"即可免除重叠校验), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
             }),
@@ -5302,6 +5809,94 @@ fn role_icon(role_id: &str) -> String {
 mod tests {
     use super::*;
 
+    // ─── plan 工具的 paths 机械校验 ───────────────────────────────
+
+    fn plan_task(title: &str, labels: &[&str], paths: &[&str]) -> PlanTask {
+        PlanTask {
+            title: title.into(),
+            description: String::new(),
+            priority: None,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            workflow: None,
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+            subtasks: vec![],
+        }
+    }
+
+    /// 纯阅读/学习类任务共用同一份代码是正常的（不会互相覆盖），
+    /// 不该被重叠校验拦下。
+    ///
+    /// 回归 jemalloc 2026-08-26 事故：8 个只读学习任务因为都要读
+    /// `include/jemalloc/internal` 被判 45 处冲突，manager 连撞两次
+    /// plan、白烧约 5 分钟模型时间。
+    #[test]
+    fn readonly_tasks_skip_overlap_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("include/jemalloc/internal")).unwrap();
+        let tasks = vec![
+            plan_task("P1 读公共头", &["学习", "只读"], &["include/jemalloc"]),
+            plan_task(
+                "P2 读内部头",
+                &["只读"],
+                &["include/jemalloc/internal"],
+            ),
+        ];
+        assert!(validate_plan_paths(cwd, &tasks).is_ok());
+        // 同样的路径，但任务没有只读标记 → 仍然拦。
+        let writing = vec![
+            plan_task("P1 改公共头", &[], &["include/jemalloc"]),
+            plan_task("P2 改内部头", &[], &["include/jemalloc/internal"]),
+        ];
+        assert!(validate_plan_paths(cwd, &writing).is_err());
+    }
+
+    /// 冲突反馈必须短且按路径聚合：tool_result 只有 256 字节，长清单
+    /// 会被截断，模型看不全就修不动（事故里 5855 字 / 45 对）。
+    #[test]
+    fn overlap_error_is_short_and_aggregated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("include/jemalloc/internal")).unwrap();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        let hot = "include/jemalloc/internal";
+        let tasks: Vec<PlanTask> = (0..8)
+            .map(|i| {
+                plan_task(
+                    &format!("P{i}：一个标题很长的任务，长到足以把错误信息撑爆"),
+                    &[],
+                    &[hot, "src"],
+                )
+            })
+            .collect();
+        let err = validate_plan_paths(cwd, &tasks).expect_err("应判重叠");
+        assert!(
+            err.len() <= 256,
+            "错误必须能塞进 256 字节的 tool_result（实际 {} 字节）：{err}",
+            err.len()
+        );
+        // 保留分类关键词，否则 classify_tool_execution_error 不会判
+        // PermanentExec（会变成原样重试）。
+        assert!(err.contains("paths 范围重叠"), "{err}");
+        // 报热点路径而不是罗列任务对。
+        assert!(err.contains(hot), "{err}");
+        assert!(err.contains("只读"), "应告知只读逃生阀：{err}");
+    }
+
+    /// 幻觉路径清单同样要截断，只报前几条 + 总数。
+    #[test]
+    fn missing_paths_error_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let tasks: Vec<PlanTask> = (0..9)
+            .map(|i| plan_task(&format!("T{i}"), &[], &[&format!("no_such_dir_{i}/x.rs")]))
+            .collect();
+        let err = validate_plan_paths(cwd, &tasks).expect_err("应判幻觉路径");
+        assert!(err.contains("疑似幻觉路径"), "{err}");
+        assert!(err.contains("共 9 处"), "应给出总数：{err}");
+        assert!(err.len() <= 256, "实际 {} 字节：{err}", err.len());
+    }
+
     // ─── Advisor v3 pause gate（controller 侧）─────────────────────
 
     #[tokio::test]
@@ -6923,8 +7518,12 @@ mod tests {
             .await
             .expect_err("清单内重叠必须被拒绝");
         let msg = err.to_string();
-        assert!(msg.contains("任务A") && msg.contains("任务B"), "{msg}");
-        assert!(!msg.contains("任务C」的"), "{msg}");
+        // 反馈按**热点路径**聚合（不再罗列任务对）：tool_result 只有
+        // 256 字节，罗列式清单会被截断，模型看不全就改不动。
+        assert!(msg.contains("src/ringbuf"), "{msg}");
+        assert!(msg.contains("paths 范围重叠"), "{msg}");
+        assert!(!msg.contains("src/cache"), "不该牵连无重叠的任务范围: {msg}");
+        assert!(msg.len() <= 256, "错误必须塞进 256 字节: {msg}");
         assert_eq!(stage.read().clone(), PlanStage::Normal);
 
         // 互不重叠则放行。
@@ -8816,5 +9415,497 @@ require = ["永远不可能出现的验收字符串"]
         let names_after = tm.get_tool_names();
         assert!(names_after.contains(&"read".to_string()),
             "read must be registered after request: {names_after:?}");
+    }
+
+    // ─── code_graph ────────────────────────────────────────────────
+    //
+    // 回归护栏：旧实现把 kind 映射成 Rust 语法的 pattern 又不传 --lang，
+    // 在 C 项目上恒 0 命中，导致角色配置里有 code_graph 却从不被调用。
+    // 下面的测试锁住「每个语言至少能查函数」和「C 必须走 tree-sitter
+    // 节点类型而不是 Rust pattern」这两条底线。
+
+    #[test]
+    fn code_graph_c_function_maps_to_tree_sitter_kind() {
+        // C 的 function 必须映射到 function_definition。
+        // 实测依据：jemalloc src/pac.c 真实函数 22 个，
+        // `kind: function_definition` 命中 22（100%），而旧的
+        // pattern `$RET $NAME($$$PARAMS) { $$$BODY }` 只命中 8（36%）。
+        let kinds = code_graph_node_kinds("c", "function");
+        assert_eq!(kinds, vec!["function_definition"], "C function 映射错误");
+    }
+
+    #[test]
+    fn code_graph_no_rust_syntax_leaks_into_other_langs() {
+        // 旧 bug 的直接形态：非 Rust 语言拿到 Rust 的节点类型。
+        for lang in ["c", "cpp", "go", "python", "typescript", "javascript", "java"] {
+            for kind in code_graph_kinds_for_lang(lang) {
+                for node in code_graph_node_kinds(lang, kind) {
+                    assert!(
+                        !matches!(node, "function_item" | "struct_item" | "trait_item"
+                                      | "impl_item" | "enum_item" | "use_declaration"),
+                        "{lang}/{kind} 漏进了 Rust 专属节点类型 {node}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code_graph_every_lang_supports_function() {
+        // 每个声明支持的语言都必须至少能查函数——这是建地图的最小能力。
+        for lang in code_graph_supported_langs() {
+            assert!(
+                !code_graph_node_kinds(lang, "function").is_empty(),
+                "{lang} 缺 function 映射"
+            );
+        }
+    }
+
+    #[test]
+    fn code_graph_lang_inference_from_extension() {
+        assert_eq!(code_graph_infer_lang("src/pac.c"), Some("c"));
+        assert_eq!(code_graph_infer_lang("include/jemalloc/internal/edata.h"), Some("c"));
+        assert_eq!(code_graph_infer_lang("a/b/mod.rs"), Some("rust"));
+        assert_eq!(code_graph_infer_lang("ui/src/api.ts"), Some("typescript"));
+        assert_eq!(code_graph_infer_lang("main.go"), Some("go"));
+        // 目录 / 未知扩展名推断不出来，handler 会要求显式传 lang。
+        assert_eq!(code_graph_infer_lang("src/"), None);
+        assert_eq!(code_graph_infer_lang("README"), None);
+    }
+
+    #[test]
+    fn code_graph_rule_yaml_shapes() {
+        // 缩进错一层 ast-grep 就报 "invalid type: unit value" 并返回 0 命中，
+        // 而 0 命中对模型来说和"这工具没用"无法区分——正是旧实现被弃用的
+        // 机制。所以这里锁死四种形态的**逐字节** YAML。
+        // 每种形态都已用 `ast-grep scan --inline-rules` 实测可解析。
+
+        // 1) 单节点类型
+        assert_eq!(
+            code_graph_build_rule("c", &["function_definition"], None),
+            "id: code_graph\nlanguage: c\nrule:\n  kind: function_definition\n"
+        );
+
+        // 2) 多节点类型 → any（旧实现在这里把 `any:` 顶到了第 0 列）
+        assert_eq!(
+            code_graph_build_rule("go", &["function_declaration", "method_declaration"], None),
+            "id: code_graph\nlanguage: go\nrule:\n  any:\n  \
+             - kind: function_declaration\n  - kind: method_declaration\n"
+        );
+
+        // 3) 单节点类型 + name → all
+        assert_eq!(
+            code_graph_build_rule("c", &["function_definition"], Some("decay")),
+            "id: code_graph\nlanguage: c\nrule:\n  all:\n  \
+             - kind: function_definition\n  - regex: 'decay'\n"
+        );
+
+        // 4) 多节点类型 + name → all 里嵌 any，any 的子项缩进 4 空格
+        assert_eq!(
+            code_graph_build_rule("go", &["function_declaration", "method_declaration"], Some("M")),
+            "id: code_graph\nlanguage: go\nrule:\n  all:\n  - any:\n    \
+             - kind: function_declaration\n    - kind: method_declaration\n  - regex: 'M'\n"
+        );
+
+        // YAML 单引号必须转义，否则规则被截断成非法 YAML。
+        let r = code_graph_build_rule("c", &["function_definition"], Some("it's"));
+        assert!(r.contains("regex: 'it''s'"), "单引号未转义: {r}");
+    }
+
+    #[test]
+    fn code_graph_signature_strips_body_and_flattens_params() {
+        // jemalloc 惯用换行风格：返回类型独占一行、参数跨行对齐。
+        // 签名模式必须压平并砍掉函数体——这是 19x 体积压缩的来源。
+        let text = "static bool\npac_init(tsdn_t *tsdn, pac_t *pac,\n    base_t *base) {\n\tint x = 1;\n\treturn false;\n}";
+        let sig = code_graph_signature_of(text);
+        assert_eq!(sig, "static bool pac_init(tsdn_t *tsdn, pac_t *pac, base_t *base)");
+        assert!(!sig.contains("return false"), "函数体没被砍掉: {sig}");
+
+        // 没有函数体的匹配（如 import / 宏）原样压平即可。
+        let sig = code_graph_signature_of("#include \"jemalloc/internal/pac.h\"");
+        assert_eq!(sig, "#include \"jemalloc/internal/pac.h\"");
+    }
+
+    #[test]
+    fn code_graph_unknown_kind_lists_available() {
+        // 传错 kind 时必须能拿到该语言的可用清单，否则模型只能瞎猜、
+        // 试一次失败就永久放弃这个工具（旧实现的实际后果）。
+        let avail = code_graph_kinds_for_lang("c");
+        assert!(avail.contains(&"function"), "{avail:?}");
+        assert!(avail.contains(&"struct"), "{avail:?}");
+        assert!(avail.contains(&"macro"), "{avail:?}");
+        // C 没有 trait/impl，不该出现。
+        assert!(!avail.contains(&"trait"), "{avail:?}");
+        assert!(code_graph_kinds_for_lang("brainfuck").is_empty());
+    }
+
+    // ─── code_graph 端到端（真的 spawn ast-grep）─────────────────────
+    //
+    // 上面的单元测试只锁得住映射表，锁不住"ast-grep 真的认这个节点类型"
+    // ——那必须真跑一次。旧实现的 bug 恰恰是"表里有值但跑出来 0 命中"，
+    // 所以这层测试是防回归的关键。
+    // 没装 ast-grep 时跳过而不是失败（CI 不一定有）。
+
+    fn cg_have_ast_grep() -> bool {
+        std::process::Command::new("ast-grep")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// 多语言样本。C 部分刻意用 jemalloc 的风格：返回类型独占一行、
+    /// 参数跨行对齐、static 函数——旧 pattern 实现在这种风格上召回 36%。
+    fn cg_fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tempdir");
+        let w = |name: &str, body: &str| {
+            std::fs::write(d.path().join(name), body).expect("write fixture");
+        };
+        w(
+            "sample.c",
+            "#include <stdlib.h>\n\
+             #define PAC_MAGIC 0x1234\n\
+             #define PAC_ROUND(x) (((x) + 7) & ~7)\n\
+             \n\
+             struct pac_s {\n\tint npages;\n\tint ndirty;\n};\n\
+             \n\
+             static bool\n\
+             pac_init(void *tsdn, struct pac_s *pac,\n    int npages) {\n\
+             \tpac->npages = npages;\n\
+             \tpac->ndirty = 0;\n\
+             \tif (npages < 0) {\n\t\treturn true;\n\t}\n\
+             \tif (npages > PAC_MAGIC) {\n\t\treturn true;\n\t}\n\
+             \treturn false;\n}\n\
+             \n\
+             void\n\
+             pac_decay_all(struct pac_s *pac) {\n\
+             \tpac_init(NULL, pac, 0);\n\
+             \tpac->ndirty = 0;\n\
+             \tpac->npages = PAC_ROUND(pac->npages);\n\
+             \tpac_init(NULL, pac, pac->npages);\n}\n\
+             \n\
+             int\n\
+             pac_npages_get(struct pac_s *pac) {\n\
+             \tif (pac == NULL) {\n\t\treturn -1;\n\t}\n\
+             \tint n = pac->npages;\n\
+             \tif (n < 0) {\n\t\tn = 0;\n\t}\n\
+             \treturn n;\n}\n",
+        );
+        w(
+            "sample.rs",
+            "use std::fmt;\n\
+             pub struct Foo { a: i32 }\n\
+             pub trait Bar { fn go(&self); }\n\
+             impl Bar for Foo { fn go(&self) { let _ = self.a; } }\n\
+             pub fn top_level(x: i32) -> i32 { x + 1 }\n",
+        );
+        w(
+            "sample.py",
+            "import os\n\
+             class Foo:\n    def bar(self):\n        return os.getcwd()\n\
+             def baz(x):\n    return Foo().bar()\n",
+        );
+        w(
+            "sample.go",
+            "package m\n\
+             import \"fmt\"\n\
+             type S struct{ A int }\n\
+             func F(x int) int { return x }\n\
+             func (s *S) M() { fmt.Println(1) }\n",
+        );
+        w(
+            "sample.ts",
+            "import { a } from \"b\";\n\
+             export interface I { x: number }\n\
+             export class C { m(): number { return 1; } }\n\
+             export function f(n: number): number { return n + 1; }\n",
+        );
+        d
+    }
+
+    /// 直接驱动 code_graph 的 handler（`Tool::handler` 是公开字段），
+    /// 不用起 ToolManager。
+    async fn cg_call(
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, latte_rs_agent_tools::error::ToolError> {
+        let tool = code_graph_tool();
+        let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
+        (tool.handler)(args, ctx).await
+    }
+
+    fn cg_matches(v: &serde_json::Value) -> String {
+        v.get("matches").and_then(|m| m.as_str()).unwrap_or("").to_string()
+    }
+    fn cg_total(v: &serde_json::Value) -> u64 {
+        v.get("total_matches").and_then(|m| m.as_u64()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_c_functions_full_recall() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        let out = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "function"
+        }))
+        .await
+        .expect("code_graph 应成功");
+
+        // 3 个函数定义：pac_init / pac_decay_all / pac_npages_get。
+        // 旧 pattern 实现在"返回类型独占一行"的风格上会全部漏掉。
+        assert_eq!(cg_total(&out), 3, "C 函数召回不全: {out:?}");
+        let m = cg_matches(&out);
+        for f in ["pac_init", "pac_decay_all", "pac_npages_get"] {
+            assert!(m.contains(f), "缺函数 {f}: {m}");
+        }
+        // 语言应由 .c 扩展名自动推断。
+        assert_eq!(out.get("lang").and_then(|v| v.as_str()), Some("c"));
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_signatures_much_smaller_than_file() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        let file_size = std::fs::read_to_string(&p).unwrap().len();
+
+        let sigs = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "function"
+        }))
+        .await
+        .unwrap();
+        let sig_text = cg_matches(&sigs);
+
+        // 签名模式不能带函数体。
+        assert!(!sig_text.contains("return pac->npages"), "签名混进函数体: {sig_text}");
+        assert!(!sig_text.contains('{'), "签名混进函数体起始: {sig_text}");
+        // 必须带 file:line，供后续 ranged read 用。
+        assert!(sig_text.contains("sample.c:"), "缺 file:line 定位: {sig_text}");
+
+        // full 模式应含函数体且明显更大。
+        let full = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "function", "mode": "full"
+        }))
+        .await
+        .unwrap();
+        let full_text = cg_matches(&full);
+        assert!(full_text.contains("return n;"), "full 模式应含函数体: {full_text}");
+        assert!(
+            sig_text.len() < full_text.len(),
+            "签名({}) 应小于 full({})", sig_text.len(), full_text.len()
+        );
+
+        // 省 token 是这个工具存在的理由。这里比的是"签名正文"而不是整条
+        // 输出行——临时目录的绝对路径前缀在真实仓库里是短相对路径，
+        // 算进去会掩盖真实压缩率。
+        let sig_body: usize = sig_text
+            .lines()
+            .map(|l| l.split_once(": ").map(|(_, b)| b.len()).unwrap_or(l.len()))
+            .sum();
+        assert!(
+            sig_body * 3 < file_size,
+            "签名正文({sig_body}) 相对整文件({file_size}) 压缩不足"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_all_langs_find_functions() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        // (文件, 最少命中数, 必须出现的名字)
+        let cases: &[(&str, u64, &str)] = &[
+            ("sample.c", 3, "pac_init"),
+            ("sample.rs", 1, "top_level"),
+            ("sample.py", 2, "baz"),
+            ("sample.go", 2, "F"),
+            ("sample.ts", 1, "f"),
+        ];
+        for (file, min_n, needle) in cases {
+            let p = d.path().join(file);
+            let out = cg_call(serde_json::json!({
+                "path": p.to_str().unwrap(), "kind": "function"
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("{file} 查询失败: {e}"));
+            assert!(
+                cg_total(&out) >= *min_n,
+                "{file} 命中 {} < 期望 {min_n}: {out:?}", cg_total(&out)
+            );
+            assert!(
+                cg_matches(&out).contains(needle),
+                "{file} 缺 {needle}: {}", cg_matches(&out)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_name_filter_narrows() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        let out = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "function", "name": "decay"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(cg_total(&out), 1, "name 过滤应只留 1 个: {out:?}");
+        assert!(cg_matches(&out).contains("pac_decay_all"));
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_c_struct_and_macro() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+
+        let s = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "struct"
+        }))
+        .await
+        .unwrap();
+        assert!(cg_total(&s) >= 1, "C struct 应有命中: {s:?}");
+        assert!(cg_matches(&s).contains("pac_s"), "{}", cg_matches(&s));
+
+        let m = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "macro"
+        }))
+        .await
+        .unwrap();
+        assert!(cg_total(&m) >= 1, "C macro 应有命中: {m:?}");
+        assert!(cg_matches(&m).contains("PAC_MAGIC"), "{}", cg_matches(&m));
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_directory_requires_lang() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let dir = d.path().to_str().unwrap().to_string();
+
+        // 目录推断不出语言 → 必须报错并列出可选 lang，而不是静默 0 命中。
+        let err = cg_call(serde_json::json!({ "path": &dir, "kind": "function" }))
+            .await
+            .expect_err("目录不带 lang 应报错");
+        let msg = err.to_string();
+        assert!(msg.contains("lang"), "报错应提示传 lang: {msg}");
+
+        // 显式传 lang 后应能跨文件工作。
+        let out = cg_call(serde_json::json!({
+            "path": &dir, "kind": "function", "lang": "c"
+        }))
+        .await
+        .unwrap();
+        assert!(cg_total(&out) >= 3, "显式 lang=c 应命中 C 函数: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_unsupported_kind_lists_available() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        // C 没有 trait —— 必须明确告知可用 kind，而不是 0 命中让模型瞎猜。
+        let err = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "trait"
+        }))
+        .await
+        .expect_err("C 的 trait 应报错");
+        let msg = err.to_string();
+        assert!(msg.contains("function"), "报错应列出可用 kind: {msg}");
+        assert!(msg.contains("struct"), "报错应列出可用 kind: {msg}");
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_raw_pattern_escape_hatch() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        // kind 覆盖不到的查询交给模型自己写 pattern。
+        //
+        // 注意 C 的 pattern 限制：裸的 `helper($$$ARGS)` 在 C 里命中 0，
+        // 因为它会被解析成 K&R 风格的函数声明而不是 call_expression
+        // （实测：`helper($$$ARGS)` → 0，`helper(3)` → 1）。这正是为什么
+        // 查调用点要用 kind=call + name，而不是裸 pattern（见下一个测试）。
+        // 这里用一个在 C 里确实可用的形态。
+        let out = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "pattern": "int $N($$$P) { $$$B }"
+        }))
+        .await
+        .unwrap();
+        assert!(cg_total(&out) >= 1, "裸 pattern 应有命中: {out:?}");
+        assert!(cg_matches(&out).contains("pac_npages_get"), "{}", cg_matches(&out));
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_call_sites_via_kind_beats_raw_pattern() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+
+        // 语义路线：kind=call + name → 找齐 pac_decay_all 里对 pac_init
+        // 的 2 处调用。这是"谁调用了 X"这类问题的正确用法。
+        let via_kind = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "call", "name": "pac_init"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(cg_total(&via_kind), 2, "kind=call 应找到 2 处调用: {via_kind:?}");
+
+        // 裸 pattern 路线在 C 上不可靠（K&R 声明歧义）。锁住这个差异，
+        // 避免以后有人把 call 的实现"优化"回 pattern。
+        let via_pattern = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "pattern": "pac_init($$$ARGS)"
+        }))
+        .await
+        .unwrap();
+        assert!(
+            cg_total(&via_pattern) < cg_total(&via_kind),
+            "C 上裸 pattern 查调用点不应优于 kind 路线（pattern={}, kind={}）",
+            cg_total(&via_pattern), cg_total(&via_kind)
+        );
+    }
+
+    #[tokio::test]
+    async fn code_graph_e2e_zero_match_has_actionable_note() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        let out = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "function", "name": "no_such_symbol_xyz"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(cg_total(&out), 0);
+        let note = out.get("note").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(!note.is_empty(), "0 命中必须给排查提示");
+        assert!(note.contains("kind") || note.contains("lang"), "提示不可操作: {note}");
     }
 }
