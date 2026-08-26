@@ -444,8 +444,28 @@ impl SessionHandle {
 
     /// 懒 spawn：已有 controller 直接返回；恢复 session 在首个
     /// chat_send/subscribe 时在这里真正起 controller（双重检查锁）。
+    ///
+    /// 额外保护：若 controller 存在但 driver 已死（abort 后），自动
+    /// respawn driver，避免 session 永久变哑。
     pub(crate) async fn controller_or_spawn(&self) -> Result<Arc<ChatController>, String> {
-        if let Some(c) = self.controller.lock().clone() {
+        // Clone out of parking_lot guard immediately to avoid holding
+        // non-Send guard across await points.
+        let existing = self.controller.lock().clone();
+        if let Some(c) = existing {
+            // Fast path: driver alive → return immediately.
+            if !c.is_driver_dead().await {
+                return Ok(c);
+            }
+            // Driver dead (post-abort): respawn under lock to avoid
+            // racing with another caller.
+            let _guard = self.spawn_lock.lock().await;
+            // Double-check after acquiring lock.
+            if !c.is_driver_dead().await {
+                return Ok(c);
+            }
+            c.respawn()
+                .await
+                .map_err(|e| format!("respawn failed: {e}"))?;
             return Ok(c);
         }
         let _guard = self.spawn_lock.lock().await;

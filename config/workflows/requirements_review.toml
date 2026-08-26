@@ -27,7 +27,14 @@ id = "estimate"
 description = "工期与风险估算"
 speakers = ["programmer", "tester"]
 output_key = "estimate"
-prompt = "【需求】\n{{requirements}}\n\n【架构建议】\n{{arch_review}}\n\n估算工期和风险。Programmer：实现复杂度和大致时间线。Tester：测试面和边界用例。"
+# step 级工具过滤：硬性摘掉 write / bash（引擎层 enforce，不靠 prompt
+# 自觉）——本步只估算，不实现。programmer 的角色 prompt 本身在推
+# 「取证到底 / 修复必须先有失败测试」，一旦手里有 write+bash，估算就会
+# 滑成完整实现（jemalloc 实锤：本步跑了 131 次工具调用、改了
+# src/tcache.c、编译 + lldb 验证，最后撞 100 轮上限，连带整条
+# design_and_plan 失败）。
+tools = ["read", "search", "code_graph"]
+prompt = "【需求】\n{{requirements}}\n\n【架构建议】\n{{arch_review}}\n\n估算工期和风险。Programmer：实现复杂度和大致时间线。Tester：测试面和边界用例。\n\n**本步只输出估算，禁止修改任何文件、禁止编译或运行验证**。需要事实支撑就读代码取证（read/search）；信息不足时写明假设与待核实项，不要用动手实现来消除不确定性。"
 
 [[steps]]
 id = "decide"

@@ -13,7 +13,6 @@ path = "src/lib.rs"
 latte-ai = { workspace = true }
 latte-agent-core = { path = "../latte-agent-core" }
 latte-rs-agent-tools = { workspace = true }
-latte-rs-graph = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

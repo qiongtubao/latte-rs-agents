@@ -1,10 +1,13 @@
 //! Build a "role × tool" code-graph for the running project.
 //!
 //! The graph is built by combining two sources of truth:
-//! 1. **Code graph** (TreeSitterEngine): scans `latte-agent-core/src/` for
-//!    function definitions. We look specifically for `register_*_tool(...)`
-//!    call sites — these are the prose locations where a role's
-//!    allowed_tools list gets wired into a working ToolManager.
+//! 1. **Code scan** (`scan_register_tool_fns`): text-scans `project_root`
+//!    for `register_*_tool` function identifiers. These are the code-level
+//!    evidence that a role's allowed_tools list gets wired into a working
+//!    ToolManager.
+//!    (Previously this used `latte-rs-graph` + a SQLite-backed
+//!    TreeSitterEngine build that took >60s per request; the text
+//!    scan returns the same identifier set in milliseconds.)
 //! 2. **Config graph** (TOML loader): reads `.latte/agents.d/*.toml` and
 //!    their `tools = [...]` declarations to determine which tools each
 //!    role declared it can use.
@@ -19,13 +22,14 @@
 //! This powers the `latte-agent ui` Graph panel — the HTTP endpoint
 //! `/api/role-graph` serves this JSON.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use latte_agent_core::config::AgentConfig;
-use latte_rs_graph::prelude::*;
 use serde::{Deserialize, Serialize};
+
+use crate::tools::scan_register_tool_fns;
 
 /// JSON wire shape returned to the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,50 +94,29 @@ fn load_agent_config(agents_dir: &Path, models_dir: &Path) -> Result<AgentConfig
 /// Build the role-graph for a project rooted at `cwd`.
 ///
 /// - Loads `.latte/agents.d/*.toml` via the agent config loader.
-/// - Uses TreeSitterEngine to scan `project_root` (the latte-agents repo)
-///   for `register_*_tool` call sites — these are the code-level evidence
-///   that a role wires its tools in.
+/// - Text-scans `project_root` for `register_*_tool` function names —
+///   these are the code-level call sites where roles' allowed_tools
+///   get wired into a working ToolManager.
 /// - Combines the two: every (role, tool_name) pair declared in TOML
 ///   becomes a `Role -[USES_TOOL]-> Tool` edge. Every `register_*_tool`
-///   function becomes a `ToolRegistration` node.
+///   function becomes a `ToolRegistration` node pointing at `(CWD)`.
 pub async fn build(cwd: &Path, project_root: &Path) -> Result<RoleGraph> {
     // 1. Load agent config from `.latte/agents.d/`.
     let agents_cfg_dir = cwd.join(".latte/agents.d");
     let models_cfg_dir = cwd.join(".latte/models.d");
     let cfg = load_agent_config(&agents_cfg_dir, &models_cfg_dir)?;
 
-    // 2. Build the code graph via TreeSitterEngine over a SQLite DB in
-    //    $TMPDIR. TreeSitterEngine currently requires SqliteStorage.
-    let db_path = std::env::temp_dir().join("latte-graph-build.db");
-    let storage = SqliteStorage::open(&db_path)
-        .map_err(|e| anyhow!("open graph.db: {e}"))?;
-    let engine = TreeSitterEngine::new(storage);
-    engine
-        .build(project_root, &BuildOptions::default())
-        .await
-        .map_err(|e| anyhow!("graph build {}: {e}", project_root.display()))?;
-    let graph_data = engine
-        .graph_data()
-        .await
-        .map_err(|e| anyhow!("graph_data: {e}"))?;
+    // 2. Scan `project_root` for `register_*_tool` identifiers. The
+    //    previous implementation built a full TreeSitter code graph over
+    //    a SQLite DB in $TMPDIR (~60s per request). The text scan
+    //    returns the same identifier set in milliseconds.
+    let register_fns = scan_register_tool_fns(project_root).await;
 
-    // 3. Pull `register_*_tool` symbols from the graph.
-    let mut registrations: Vec<ToolRegistration> = Vec::new();
-    for n in &graph_data.nodes {
-        let nm = n.name.as_str();
-        if nm.starts_with("register_") && nm.ends_with("_tool") {
-            registrations.push(ToolRegistration {
-                function: nm.to_string(),
-            });
-        }
-    }
-
-    // 4. Combine config + code.
+    // 3. Combine config + code.
     let mut nodes: Vec<RoleGraphNode> = Vec::new();
     let mut edges: Vec<RoleGraphEdge> = Vec::new();
     let mut seen_role: BTreeSet<String> = BTreeSet::new();
     let mut seen_tool: BTreeSet<String> = BTreeSet::new();
-
 
     for (role_id, role) in &cfg.roles {
         let role_node_id = format!("role:{role_id}");
@@ -174,12 +157,12 @@ pub async fn build(cwd: &Path, project_root: &Path) -> Result<RoleGraph> {
         }
     }
 
-    for r in &registrations {
-        let reg_id = format!("reg:{}", r.function);
+    for r in &register_fns {
+        let reg_id = format!("reg:{r}");
         nodes.push(RoleGraphNode {
             id: reg_id.clone(),
             kind: "ToolRegistration".into(),
-            label: r.function.clone(),
+            label: r.clone(),
             detail: Some("latte-agent-core controller register_*_tool call site".into()),
         });
         edges.push(RoleGraphEdge {
@@ -193,17 +176,12 @@ pub async fn build(cwd: &Path, project_root: &Path) -> Result<RoleGraph> {
         stats: RoleGraphStats {
             roles: seen_role.len(),
             tools: seen_tool.len(),
-            registrations: registrations.len(),
+            registrations: register_fns.len(),
         },
         nodes,
         edges,
         project_root: project_root.display().to_string(),
     })
-}
-
-#[derive(Debug, Clone)]
-struct ToolRegistration {
-    function: String,
 }
 
 /// A deterministic palette used by the UI to color nodes.
@@ -222,7 +200,101 @@ pub fn palette() -> NodePalette {
     }
 }
 
-#[allow(dead_code)]
-fn _btreemap_keep<T>(v: BTreeMap<String, T>) -> usize {
-    v.len()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写一个最小角色 TOML 到 `<dir>/<id>.toml`：必填字段
+    /// id/name/category/model_tier，tools 可选。
+    fn write_role(dir: &Path, id: &str, name: &str, tools: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let tools_toml = if tools.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = tools.iter().map(|t| format!("\"{t}\"")).collect();
+            format!("tools = [{}]\n", items.join(", "))
+        };
+        let content = format!(
+            "[roles.{id}]\n\
+             id = \"{id}\"\n\
+             name = \"{name}\"\n\
+             category = \"management\"\n\
+             model_tier = \"standard\"\n\
+             {tools_toml}",
+        );
+        std::fs::write(dir.join(format!("{id}.toml")), content).unwrap();
+    }
+
+    /// 完整构建路径：角色 TOML + 项目根目录里的 register_*_tool 源文件
+    /// → stats 与节点/边符合预期；无 `_tool` 后缀的 identifier 不应被
+    /// 计为注册节点。
+    #[tokio::test]
+    async fn build_collects_roles_tools_and_registrations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let agents_d = cwd.join(".latte/agents.d");
+        write_role(&agents_d, "pm", "Product Manager", &["read", "search"]);
+        write_role(&agents_d, "dev", "Software Engineer", &["read", "write", "bash"]);
+
+        // Fake latte-agent-core source tree.
+        let core_src = cwd.join("latte-agent-core/src");
+        std::fs::create_dir_all(&core_src).unwrap();
+        std::fs::write(
+            core_src.join("controller.rs"),
+            "fn register_delegate_tool() {}\n\
+             fn register_workflow_tool() {}\n\
+             fn register_unrelated() {}\n",
+        )
+        .unwrap();
+
+        let g = build(cwd, &core_src).await.expect("build");
+
+        assert_eq!(g.stats.roles, 2);
+        assert_eq!(g.stats.tools, 4); // read, search, write, bash
+        assert_eq!(g.stats.registrations, 2); // delegate + workflow (no _tool excluded)
+
+        // ToolRegistration 节点是 scan 出来的两个函数名。
+        let reg_labels: Vec<&str> = g
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "ToolRegistration")
+            .map(|n| n.label.as_str())
+            .collect();
+        assert!(reg_labels.contains(&"register_delegate_tool"));
+        assert!(reg_labels.contains(&"register_workflow_tool"));
+        // 没有 `_tool` 后缀的不计。
+        assert!(!reg_labels.contains(&"register_unrelated"));
+
+        // USES_TOOL 边数 = pm 2 + dev 3 = 5。
+        let uses_edges = g.edges.iter().filter(|e| e.kind == "USES_TOOL").count();
+        assert_eq!(uses_edges, 5);
+
+        // 每个 ToolRegistration 都有一行 REGISTERED_BY 指向 (CWD)。
+        let reg_edges = g.edges.iter().filter(|e| e.kind == "REGISTERED_BY").count();
+        assert_eq!(reg_edges, 2);
+
+        // 每个 role 的 detail 至少有 tier 信息。
+        let role_with_detail = g
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "Role")
+            .any(|n| n.detail.as_deref().unwrap_or("").contains("tier="));
+        assert!(role_with_detail);
+    }
+
+    /// 项目根目录不存在 → 不能 panic，registrations 为空；roles 走
+    /// `AgentConfig::load_with_global` 的内建兜底（11 个 built-ins），
+    /// 只要 build() 正常返回就视为通过。
+    #[tokio::test]
+    async fn build_handles_missing_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        // 空 .latte/agents.d：路径存在，load_with_global 不报错。
+        std::fs::create_dir_all(cwd.join(".latte/agents.d")).unwrap();
+        let missing = cwd.join("does/not/exist");
+        let g = build(cwd, &missing).await.expect("build");
+        assert_eq!(g.stats.registrations, 0);
+        // built-in 角色兜底 → 至少有 1 个 Role 节点。
+        assert!(g.stats.roles > 0);
+    }
 }

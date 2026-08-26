@@ -5,6 +5,19 @@ use thiserror::Error;
 /// Result alias used throughout the agent crates.
 pub type AgentResult<T> = std::result::Result<T, AgentError>;
 
+/// `MaxToolRoundsExceeded` 的 Display 后缀：只报 partial 的规模，不把
+/// 正文塞进错误串（错误串会被回填给模型/上报给 manager，正文另有降级
+/// 采纳路径，见 `workflow.rs` 的 partial 降级分支）。
+fn fmt_partial(partial: &str) -> String {
+    if partial.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "（已产出 {} 字符未收尾，可降级采纳）",
+        partial.chars().count()
+    )
+}
+
 /// Agent runtime errors.
 #[derive(Error, Debug)]
 pub enum AgentError {
@@ -53,8 +66,18 @@ pub enum AgentError {
     TokenBudgetExceeded { used: usize, budget: usize },
 
     /// Max tool-call rounds exceeded.
-    #[error("max tool rounds ({0}) exceeded")]
-    MaxToolRoundsExceeded(usize),
+    ///
+    /// `partial` 是撞上限那一刻模型已经产出的最后一段正文。带上它是因为
+    /// 「撞上限」不等于「零产出」——jemalloc 实锤：estimate 步跑了 105
+    /// 轮，最后一条回复是完整的验证结论，却因为这个错误只带一个数字而
+    /// 被整段丢弃，连带整条 design_and_plan 判死。上层可以据此降级采纳。
+    #[error("max tool rounds ({rounds}) exceeded{}", fmt_partial(partial))]
+    MaxToolRoundsExceeded {
+        /// 触发上限的轮次数。
+        rounds: usize,
+        /// 撞上限时模型已产出的正文（可能为空）。
+        partial: String,
+    },
     /// A tool loop was detected: the model called the same tool with
     /// the same arguments `LOOP_STREAK_THRESHOLD+` times in a row,
     /// indicating it is stuck. We break out before

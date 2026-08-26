@@ -32,6 +32,9 @@ id = "evaluate"
 description = "评审团评估方案"
 speakers = ["reviewer", "security", "devops"]
 output_key = "evaluation"
+# reviewer / security 本身就是只读角色；devops 带 bash + write，评审
+# 步骤不需要——统一收紧成只读，防止"评审"滑成"顺手改一改"。
+tools = ["read", "search", "code_graph"]
 prompt = """主题：{{topic}}
 
 待评估的方案：

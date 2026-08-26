@@ -819,7 +819,7 @@ struct RunnerModelSource {
 fn classify_tool_execution_error(
     e: &latte_rs_agent_tools::error::ToolError,
 ) -> ToolCallErrorKind {
-    if let ToolError::ToolNotFound(name) = e {
+    if let ToolError::ToolNotFound { name, .. } = e {
         return ToolCallErrorKind::ToolNotFound {
             tried_aliases: vec![name.clone()],
         };
@@ -864,6 +864,28 @@ fn classify_tool_execution_error(
     } else {
         ToolCallErrorKind::Execution { reason: msg }
     }
+}
+
+/// `ToolNotFound` 回填给模型的错误文本：区分「工具真的不存在」与
+/// 「工具存在但本角色/本 step 未授权」。
+///
+/// 动机（jemalloc 实锤）：programmer 调 `edit` 拿到的是 `Tool not found:
+/// edit`。但 `edit` 其实**注册了**（`EditToolsPackage` 在
+/// `builtin_tool_packages()` 里），只是被角色 allowlist 过滤掉了。这条
+/// 报错把「未授权」说成「不存在」，模型于是判定该能力不存在、改用
+/// bash 绕路，而正确出路是 `request_tool` 申请。
+///
+/// 提示必须短：`tool_result` 回填有 256 字节截断，长文本会被砍掉尾部。
+fn tool_not_found_detail(name: &str, raw_detail: String) -> String {
+    let short = short_tool_name(name);
+    if crate::controller::full_tool_pool().contains_key(short) {
+        return format!(
+            "工具 `{short}` 存在但本角色/本步骤未授权。要用它请先调 \
+             request_tool(tool_name=\"{short}\", reason=...) 申请；\
+             或改用已授权工具完成同一目的。"
+        );
+    }
+    raw_detail
 }
 
 /// Short (namespace-stripped) tool name, e.g. `manager.delegate` → `delegate`.
@@ -1199,7 +1221,12 @@ async fn run_one_tool_call(
             }
             Err(e) => {
                 let kind = classify_tool_execution_error(&e);
-                let detail = e.to_string();
+                let detail = match &kind {
+                    ToolCallErrorKind::ToolNotFound { .. } => {
+                        tool_not_found_detail(&tc.name, e.to_string())
+                    }
+                    _ => e.to_string(),
+                };
                 sink.emit(TraceEvent::ToolExec {
                     meta: meta.refreshed(),
                     name: tc.name.clone(),
@@ -1736,6 +1763,11 @@ impl AgentRunner {
         };
 
         let mut final_response = String::new();
+        // 撞轮次上限时要交出去的 partial 产出。不能直接用
+        // `final_response`：它每轮被覆盖，而最后一轮常常是「只有 tool_call、
+        // 没有正文」的一轮，那样 partial 会是空串，前面几十轮写好的正文
+        // 白丢。这里只在正文非空时更新，保留「最后一段有实质内容的回复」。
+        let mut last_substantive_response = String::new();
         let mut total_input: u32 = 0;
         let mut total_output: u32 = 0;
         let mut total_thinking: u32 = 0;
@@ -1950,6 +1982,9 @@ impl AgentRunner {
             total_thinking += completion.usage.thinking_tokens;
 
             final_response = completion.content.clone();
+            if !final_response.trim().is_empty() {
+                last_substantive_response = final_response.clone();
+            }
 
             self.sink.emit(TraceEvent::ModelCall {
                 meta: meta.refreshed(),
@@ -2205,7 +2240,10 @@ impl AgentRunner {
                     }
 
                     if round + 1 >= max_rounds {
-                        return Err(AgentError::MaxToolRoundsExceeded(max_rounds));
+                        return Err(AgentError::MaxToolRoundsExceeded {
+                            rounds: max_rounds,
+                            partial: last_substantive_response.clone(),
+                        });
                     }
                     continue;
                 }
@@ -2399,7 +2437,12 @@ impl AgentRunner {
                             }
                             Err(e) => {
                                 let kind = classify_tool_execution_error(&e);
-                                let detail = e.to_string();
+                                let detail = match &kind {
+                                    ToolCallErrorKind::ToolNotFound { .. } => {
+                                        tool_not_found_detail(&tc.name, e.to_string())
+                                    }
+                                    _ => e.to_string(),
+                                };
                                 self.sink.emit(TraceEvent::ToolExec {
                                     meta: meta.refreshed(),
                                     name: tc.name.clone(),
@@ -2476,7 +2519,10 @@ impl AgentRunner {
             }
 
             if round + 1 >= max_rounds {
-                return Err(AgentError::MaxToolRoundsExceeded(max_rounds));
+                return Err(AgentError::MaxToolRoundsExceeded {
+                            rounds: max_rounds,
+                            partial: last_substantive_response.clone(),
+                        });
             }
         }
 
@@ -2915,8 +2961,23 @@ mod tests {
     fn permanent_tool_errors_are_not_retried() {
         let policy = DefaultRetryPolicy;
         // 工具不存在 → ToolNotFound，不重试
-        let kind = classify_tool_execution_error(&ToolError::ToolNotFound("bash".into()));
+        let kind = classify_tool_execution_error(&ToolError::tool_not_found("bash"));
         assert!(matches!(kind, ToolCallErrorKind::ToolNotFound { .. }));
+
+        // 回填给模型的文本要区分「未授权」与「不存在」：
+        // `edit` 在 builtin 池里（EditToolsPackage），只是被角色 allowlist
+        // 过滤掉了——报 "Tool not found" 会让模型判定该能力不存在、改用
+        // bash 绕路，而正确出路是 request_tool（jemalloc 实锤）。
+        let detail = tool_not_found_detail("edit", "Tool not found: edit".into());
+        assert!(detail.contains("未授权"), "detail = {detail}");
+        assert!(detail.contains("request_tool"), "detail = {detail}");
+        // 提示要短：tool_result 回填有 256 字节截断。
+        assert!(detail.len() <= 256, "提示过长会被截断: {} 字节", detail.len());
+
+        // 真的不存在的工具名 → 保留原始报错，不编造未授权的说法。
+        let raw = "Tool not found: definitely_not_a_tool".to_string();
+        let detail = tool_not_found_detail("definitely_not_a_tool", raw.clone());
+        assert_eq!(detail, raw);
         assert!(!policy.retryable(&kind));
         // ENOENT → PermanentExec，不重试
         let kind = classify_tool_execution_error(&ToolError::other(
@@ -4474,7 +4535,7 @@ mod tests {
             .await
             .expect_err("repeated tool calls hit the round cap");
         assert!(
-            matches!(err, AgentError::MaxToolRoundsExceeded(4)),
+            matches!(err, AgentError::MaxToolRoundsExceeded { rounds: 4, .. }),
             "got {err:?}"
         );
 
@@ -4493,6 +4554,88 @@ mod tests {
         // First request predates any hint.
         let body1 = String::from_utf8_lossy(&reqs[0].body);
         assert!(!body1.contains("🦉 advisor 监察"));
+    }
+
+    /// 回归防线：撞工具轮次上限时，`MaxToolRoundsExceeded` 必须把模型
+    /// 已产出的正文作为 `partial` 交出来。
+    ///
+    /// 事故背景（jemalloc）：estimate 步跑了 105 轮，最后一条回复是完整
+    /// 的验证结论，但该错误当时只带一个轮次数字，上层拿不到任何产出，
+    /// 于是 step 失败 → 嵌套 workflow 失败 → 父 workflow 失败，3 小时
+    /// 零产出。partial 是 workflow / delegate 两条降级路径的唯一输入。
+    #[tokio::test]
+    async fn max_tool_rounds_error_carries_partial_output() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("ping", "test ping", schema, handler).build(),
+            None,
+        );
+
+        // 每轮都「有正文 + 有 tool_call」——正是事故里的形态：模型边写
+        // 结论边继续调工具，最终撞上限。
+        const PROSE: &str = "refill_produced=65 已核对，语义符合预期";
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body(
+                            PROSE,
+                            vec![serde_json::json!({
+                                "id": "call_ping",
+                                "type": "function",
+                                "function": { "name": "ping", "arguments": "{}" }
+                            })],
+                        ),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm, 3);
+
+        let err = runner
+            .run_turn(&[Message::user("go")], None)
+            .await
+            .expect_err("应撞上工具轮次上限");
+        match &err {
+            AgentError::MaxToolRoundsExceeded { rounds, partial } => {
+                assert_eq!(*rounds, 3);
+                assert!(
+                    partial.contains(PROSE),
+                    "partial 必须携带模型已产出的正文，实际: {partial:?}"
+                );
+            }
+            other => panic!("期望 MaxToolRoundsExceeded，实际 {other:?}"),
+        }
+        // Display 只报规模、不倒正文（错误串会回填给模型）。
+        let msg = err.to_string();
+        assert!(msg.contains("max tool rounds (3) exceeded"), "msg = {msg}");
+        assert!(msg.contains("可降级采纳"), "msg 应提示可降级: {msg}");
+        assert!(!msg.contains(PROSE), "Display 不应内联正文: {msg}");
     }
 
     /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板
@@ -4596,7 +4739,7 @@ mod tests {
             .unwrap()
             .expect_err("repeated tool calls hit the round cap");
         assert!(
-            matches!(err, AgentError::MaxToolRoundsExceeded(4)),
+            matches!(err, AgentError::MaxToolRoundsExceeded { rounds: 4, .. }),
             "got {err:?}"
         );
         assert!(

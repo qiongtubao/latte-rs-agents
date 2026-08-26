@@ -2071,7 +2071,51 @@ impl SpeakerDispatch {
 /// The engines still own `WorkflowTurn` events and output-contract
 /// retries; this function owns the delegate-style events and the
 /// subsession lifecycle.
+/// 撞工具轮次上限时的 partial 降级判定。
+///
+/// 返回 `Some((notice, adopted))` 表示可以降级采纳：`notice` 发给 UI
+/// （告知这一步是截断产出），`adopted` 是带截断标注、写进 vars 穿给下游
+/// 的正文。返回 `None` 表示 partial 无实质内容，按失败处理。
+///
+/// 为什么必须降级而不是判死：「撞上限」≠「零产出」。jemalloc 实锤：
+/// estimate 步跑了 105 轮、131 次工具调用，最后一条回复是完整的验证
+/// 结论，却因为 step 判失败 → 嵌套 workflow 失败 → 父 workflow 失败，
+/// 3 小时成果全丢。
+///
+/// 为什么要加截断标注：下游 step（评审、拍板）必须知道这份输入没经过
+/// 作者收尾，否则会把半成品当终稿评审。
+fn degrade_max_rounds_partial(
+    speaker: &str,
+    step_id: &str,
+    rounds: usize,
+    partial: &str,
+) -> Option<(String, String)> {
+    let stripped = crate::controller::strip_think_blocks(partial);
+    if crate::controller::is_empty_output(&stripped) {
+        return None;
+    }
+    // `strip_think_blocks` 有个刻意的兜底：剥完为空时返回**原文**
+    // （controller.rs:126-128），于是「只有思维链、没有正式回答」的
+    // partial 剥完仍非空。正常收尾的回复走这条兜底无妨，但降级采纳不行
+    // ——把裸思维链写进 vars 穿给下游评审，比判失败更糟。用「剥完仍带
+    // <think>」判定兜底已触发。
+    if stripped.contains("<think>") {
+        return None;
+    }
+    let notice = format!(
+        "⚠️ {speaker} 在 step '{step_id}' 撞到工具轮次上限（{rounds} 轮），\
+         已降级采纳其未收尾产出（{} 字符）——下游请把它当\"未完成的中间结论\"看待，\
+         不要视为终稿。",
+        stripped.chars().count()
+    );
+    let adopted = format!(
+        "{stripped}\n\n---\n[本产出因达到工具轮次上限（{rounds} 轮）被截断，未经作者收尾]"
+    );
+    Some((notice, adopted))
+}
+
 async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
+
     let speaker = inp.speaker.clone();
     // Advisor intervene 暂停门：派发前先等用户拍板（此前 advisor 的
     // 「已暂停」对 workflow 不生效，流水线照跑）。
@@ -2212,7 +2256,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             let result = runner.run_turn_gated(&[Message::user(prompt)], None).await;
             let tool_count = runner.last_turn_tool_count;
             let tool_summary = runner.take_last_turn_tool_summary();
-            result.map(|r| (r, tool_count, tool_summary))
+            // 失败路径也带出 tool_count / summary：MaxToolRoundsExceeded
+            // 的降级采纳需要它们（撞上限的 step 恰恰是工具用得最多的
+            // step，摘要对下游最有价值）。
+            (result, tool_count, tool_summary)
         });
         // 熔断：wall-clock 超时（对齐 controller delegate；被 500ms
         // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
@@ -2231,7 +2278,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                     match r {
                         // 剥 <think>：主 session 展示与后续 speaker 的
                         // transcript 只保留正式回答；原文留在子会话 trace。
-                        Ok(Ok((response, tool_count, tool_summary))) => {
+                        Ok((Ok(response), tool_count, tool_summary)) => {
                             let stripped = crate::controller::strip_think_blocks(&response);
                             // 空产出不算成功：判失败让引擎重试/失败，
                             // 而不是把空串写进 vars 穿给下游。
@@ -2244,7 +2291,37 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                             }
                             break;
                         }
-                        Ok(Err(e)) => {
+                        Ok((Err(e), tool_count, tool_summary)) => {
+                            // ── 撞轮次上限的降级采纳 ──────────────────
+                            //
+                            // 「撞上限」≠「零产出」。此前这里把
+                            // MaxToolRoundsExceeded 一律判 StepFail::Failed，
+                            // 于是 step 失败 → 嵌套 workflow 失败 → 父
+                            // workflow 失败，模型已写好的正文全丢（jemalloc
+                            // 实锤：estimate 步 105 轮、131 次工具调用，
+                            // 最后一条回复是完整结论，整条 design_and_plan
+                            // 仍被判死，3 小时零产出）。
+                            //
+                            // 有实质 partial 就带截断标注采纳，让下游 step
+                            // 拿到证据继续跑；partial 为空才按失败处理。
+                            if let crate::error::AgentError::MaxToolRoundsExceeded {
+                                rounds,
+                                partial,
+                            } = &e
+                            {
+                                if let Some((notice, adopted)) = degrade_max_rounds_partial(
+                                    &speaker,
+                                    &inp.step_id,
+                                    *rounds,
+                                    partial,
+                                ) {
+                                    let _ = inp
+                                        .event_tx
+                                        .send(ChatEvent::Status { message: notice });
+                                    attempt = Ok((adopted, tool_count, tool_summary));
+                                    break;
+                                }
+                            }
                             // Gate 重试耗尽 → 被 advisor 终止：发
                             // AdvisorTerminated（带 sub_id）让 UI 显示
                             // 「已暂停」状态。
@@ -4322,8 +4399,55 @@ prompt = "review it"
 }
 
 #[cfg(test)]
-mod contract_tests {
-    use super::*;
+mod max_rounds_degrade_tests {
+    use super::degrade_max_rounds_partial;
+
+    /// 有实质 partial → 降级采纳，且必须带截断标注（下游不能把半成品
+    /// 当终稿）。
+    #[test]
+    fn substantive_partial_is_adopted_with_truncation_notice() {
+        let partial = "## 工期估算\n\n实现复杂度中等，预计 6 小时。风险：inline 热路径。";
+        let (notice, adopted) =
+            degrade_max_rounds_partial("programmer", "estimate", 100, partial)
+                .expect("有实质内容应降级采纳");
+
+        // 通知要点名 speaker / step / 轮次，运维才能定位是哪一步被截断。
+        assert!(notice.contains("programmer"), "{notice}");
+        assert!(notice.contains("estimate"), "{notice}");
+        assert!(notice.contains("100"), "{notice}");
+
+        // 采纳的正文保留原内容，并追加截断标注。
+        assert!(adopted.contains("工期估算"), "{adopted}");
+        assert!(adopted.contains("预计 6 小时"), "{adopted}");
+        assert!(adopted.contains("未经作者收尾"), "缺截断标注: {adopted}");
+        assert!(adopted.contains("100"), "{adopted}");
+    }
+
+    /// `<think>` 块要被剥掉——降级采纳的是正式回答，不是思维链。
+    #[test]
+    fn think_blocks_are_stripped_before_adoption() {
+        let partial = "<think>先读 tcache.c 再决定</think>\n\n结论：可行，约 6 小时。";
+        let (_, adopted) = degrade_max_rounds_partial("programmer", "estimate", 100, partial)
+            .expect("剥掉 think 后仍有正文");
+        assert!(!adopted.contains("先读 tcache.c"), "think 未剥净: {adopted}");
+        assert!(adopted.contains("结论：可行"), "{adopted}");
+    }
+
+    /// partial 为空 / 只有 think / 只有空白 → 不降级，交回失败路径。
+    /// 否则会把空串写进 vars 穿给下游，比失败更糟。
+    #[test]
+    fn empty_partial_is_not_adopted() {
+        for partial in ["", "   \n\t ", "<think>只想了想，没写结论</think>"] {
+            assert!(
+                degrade_max_rounds_partial("programmer", "estimate", 100, partial).is_none(),
+                "空 partial 不应降级采纳: {partial:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {    use super::*;
 
     #[test]
     fn contract_min_chars() {

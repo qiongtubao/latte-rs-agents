@@ -222,7 +222,7 @@ pub(crate) async fn enumerate_inner() -> Result<Vec<ToolEntry>> {
         });
     }
 
-    // 2. controller 动态 register 的工具
+    // 2. controller 动态 register 的 tool entries
     for reg_fn in dynamic_registrations().await {
         let id = reg_fn_to_id(&reg_fn);
         by_id.entry(id.clone()).or_insert(ToolEntry {
@@ -273,19 +273,24 @@ fn reg_fn_to_id(reg_fn: &str) -> String {
     stem.to_string()
 }
 
-/// 扫描 `latte-agent-core/src/**/*.rs` 找 `register_*_tool` 标识符。
+/// Scan `<root>/**/*.rs` for `register_*_tool` identifier-shaped tokens.
 ///
-/// 轻量文本扫描：这里只需要函数名集合，文本匹配与建图结果等价。
-/// （原实现用 latte-rs-graph TreeSitterEngine 全量建图 + SQLite，
-/// 单次 >60s，曾把 server 启动拖到 ~65s。）
-async fn dynamic_registrations() -> Vec<String> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_root = manifest
-        .parent()
-        .map(|p| p.join("latte-agent-core"))
-        .unwrap_or_else(|| manifest.clone());
-    let mut found = BTreeSet::new();
-    let mut stack = vec![project_root.join("src")];
+/// 轻量文本扫描：`dynamic_registrations()` 原来用 latte-rs-graph 的
+/// TreeSitterEngine 全量建图 + SQLite，单次 >60s；本函数与建图返回的
+/// 标识符集合等价，毫秒级。两个调用方（`enumerate_inner` + role-graph
+/// 端点）共用，避免把代码图重新拉一遍。
+///
+/// 匹配规则：
+/// - 文件后缀必须是 `.rs`；
+/// - 取字面 `register_` 之后连续的 `[A-Za-z0-9_]+`；
+/// - 至少一个非空前缀字符（裸 `register_` 丢弃）；
+/// - 必须以 `_tool` 结尾（`register_foo`、`register_foo_tool123` 不计）。
+///
+/// 返回值是去重 + 排序后的 `Vec<String>`（`BTreeSet` 序），保证调用方
+/// 拿到稳定列表，便于 snapshot test 与对照。
+pub(crate) async fn scan_register_tool_fns(root: &Path) -> Vec<String> {
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
@@ -314,6 +319,20 @@ async fn dynamic_registrations() -> Vec<String> {
     found.into_iter().collect()
 }
 
+/// 扫描 `latte-agent-core/src/**/*.rs` 找 `register_*_tool` 标识符。
+///
+/// 路径由 `CARGO_MANIFEST_DIR` 解析到 `latte-agent-ui-server` 的同级
+/// crate，与仓库目录布局绑定（与 `tools.rs` 旧实现的硬编码路径一致，
+/// 保持调用方零修改）。
+async fn dynamic_registrations() -> Vec<String> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let project_root = manifest
+        .parent()
+        .map(|p| p.join("latte-agent-core"))
+        .unwrap_or_else(|| manifest.clone());
+    scan_register_tool_fns(&project_root.join("src")).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +356,72 @@ mod tests {
         assert!(loaded.disabled.contains("exec"));
         assert!(loaded.disabled.contains("delegate"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `scan_register_tool_fns` 必须挑出所有 `register_*_tool` 标识符、
+    /// 去重、跳过非 `.rs` 文件与无 `_tool` 后缀的 identifier，且对裸
+    /// `register_` 字面量不计入。
+    #[tokio::test]
+    async fn scan_register_tool_fns_finds_matching_identifiers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // 命中：两个标准 register_*_tool 函数定义。
+        std::fs::write(
+            src.join("controller.rs"),
+            "fn register_delegate_tool() {}\n\
+             fn register_workflow_tool() {}\n",
+        )
+        .unwrap();
+
+        // 子目录里的命中 + 严格不命中混在一起：
+        // - `register_extra_tool` 命中（以 `_tool` 结尾）
+        // - `register_no_match` 不命中（不以 `_tool` 结尾）
+        // - `register__tool` 命中（空前缀但仍是合法 identifier）
+        // - 字符串字面量 `register_in_string_tool` 也命中（文本扫描不过滤词法）
+        let nested = src.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("extra.rs"),
+            "fn register_extra_tool() {}\n\
+             fn register_no_match() {}   // does NOT end with _tool\n\
+             fn register__tool() {}      // empty prefix but valid identifier\n\
+             let s = \"register_in_string_tool\"; // string literals count too\n",
+        )
+        .unwrap();
+
+        // 不应被扫描：非 .rs 文件。
+        std::fs::write(src.join("readme.md"), "fn register_ignored_tool() {}").unwrap();
+        // .rs 但不含 `_tool` 结尾。
+        std::fs::write(src.join("helpers.rs"), "fn register_helper() {}\n").unwrap();
+
+        let mut found = scan_register_tool_fns(&src).await;
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                "register__tool".to_string(),
+                "register_delegate_tool".to_string(),
+                "register_extra_tool".to_string(),
+                "register_in_string_tool".to_string(),
+                "register_workflow_tool".to_string(),
+            ]
+        );
+        // `register_no_match` / `register_helper` 不在结果里（双重保险）：
+        assert!(!found.iter().any(|n| n == "register_no_match"));
+        assert!(!found.iter().any(|n| n == "register_helper"));
+    }
+
+    /// 不存在的根目录 / 空目录 → 空结果（不能 panic、不能误报）。
+    #[tokio::test]
+    async fn scan_register_tool_fns_handles_missing_and_empty_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(scan_register_tool_fns(&tmp.path().join("does/not/exist")).await.is_empty());
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(scan_register_tool_fns(&empty).await.is_empty());
     }
 
     #[tokio::test]

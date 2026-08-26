@@ -58,7 +58,7 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         // 工具 / 上层
         AgentError::Tool(s) => ModelErrorKind::Other { message: format!("tool: {s}") },
         AgentError::TokenBudgetExceeded { .. } => ModelErrorKind::Config { message: "token budget exceeded".into() },
-        AgentError::MaxToolRoundsExceeded(_) => ModelErrorKind::Other { message: "max tool rounds exceeded".into() },
+        AgentError::MaxToolRoundsExceeded { .. } => ModelErrorKind::Other { message: "max tool rounds exceeded".into() },
         AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other { message: format!("tool loop: {tool}") },
         AgentError::Orchestration(s) => ModelErrorKind::Other { message: format!("orchestration: {s}") },
         AgentError::ModelsUnavailable { tried, .. } => {
@@ -607,6 +607,48 @@ pub(crate) fn lenient_bool(v: &serde_json::Value) -> Option<bool> {
     }
 }
 
+/// `question` 文案是否已经**向用户承诺了多选**。
+///
+/// 为什么需要：模型经常把多选意图只写进问题文字里，却忘了传 `multi`
+/// 参数（jemalloc 实锤：tutor 发的是
+/// `{"question":"你最想深入哪条线？（可多选）","options":[…]}`，
+/// 完全没有 `multi` 键）。此时 `multi` 缺省 false，前端老老实实渲染
+/// 单选——用户看着"（可多选）"却只能点一个，是纯粹的承诺违背。
+///
+/// 语义：先看否定标记（"不可多选"/"仅单选"/"只能选一个"…），命中则
+/// 明确是单选；否则命中任一多选标记即为 true。`multi` 显式为 true 时
+/// 调用方不会走到这里；显式 false 但文案写着"可多选"属于自相矛盾，
+/// 以**用户看得见的那句文案**为准（见 `register_ask_tool`）。
+pub(crate) fn question_implies_multi(question: &str) -> bool {
+    let q = question.to_ascii_lowercase();
+    // 否定标记优先：注意 "不可多选" 本身含有 "多选" 子串，不先排除
+    // 会被正向标记误命中。
+    const NEGATIVE: [&str; 6] = [
+        "不可多选",
+        "不能多选",
+        "非多选",
+        "仅单选",
+        "只能单选",
+        "只能选一",
+    ];
+    if NEGATIVE.iter().any(|m| q.contains(m)) {
+        return false;
+    }
+    const POSITIVE: [&str; 10] = [
+        "可多选",
+        "可以多选",
+        "支持多选",
+        "多选",
+        "可复选",
+        "可勾选多项",
+        "选多项",
+        "可选多个",
+        "multi-select",
+        "select all that apply",
+    ];
+    POSITIVE.iter().any(|m| q.contains(m))
+}
+
 /// serde 适配器：给 `ChoiceOption::recommended` 提供宽松布尔语义。
 /// 无法识别的形态**不报错**，退化成 `false` —— 一个推荐角标不值得
 /// 让整次提问失败。
@@ -757,6 +799,7 @@ enum ControllerInput {
 // ─── Configuration ───────────────────────────────────────────────
 
 /// Configuration for creating a ChatController.
+#[derive(Clone)]
 pub struct ControllerConfig {
     /// `Some(id)` → multi-role HIL mode on existing worktree.
     /// `None` → single-role mode (no SessionManager).
@@ -871,6 +914,8 @@ pub struct ChatController {
     /// + delegate 出去的 specialist 共享同一个 gate —— 用户暂停时
     /// 全部一起冻结。
     agent_pause_gate: Arc<crate::pause_gate::AgentPauseGate>,
+    /// 最近一次 spawn 的配置快照——abort 后 respawn 复用。
+    last_config: tokio::sync::Mutex<Option<ControllerConfig>>,
 }
 
 /// 最近一次失败 workflow 的快照。`wf_id` 对应
@@ -919,6 +964,7 @@ impl ChatController {
             advisor_pause: AdvisorPauseGate::new(),
             last_failed_workflow: Arc::new(parking_lot::RwLock::new(None)),
             agent_pause_gate,
+            last_config: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -927,6 +973,14 @@ impl ChatController {
         &self,
         config: ControllerConfig,
     ) -> broadcast::Receiver<ChatEvent> {
+        // Reset session-level cancel flag so a previously-aborted
+        // session does not instantly kill the new driver loop.
+        self.cancel_flag.store(false, Ordering::SeqCst);
+        self.turn_cancel_flag.store(false, Ordering::SeqCst);
+
+        // Store config snapshot for potential respawn after abort.
+        *self.last_config.lock().await = Some(config.clone());
+
         let (new_tx, input_rx) = mpsc::unbounded_channel();
         let _old = std::mem::replace(&mut *self.input_tx.lock().await, Some(new_tx));
         drop(_old);
@@ -1019,7 +1073,11 @@ impl ChatController {
             }
         }
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
-            let _ = tx.send(ControllerInput::Input(text.to_string()));
+            if tx.send(ControllerInput::Input(text.to_string())).is_err() {
+                eprintln!(
+                    "[ChatController] submit_input: driver channel closed (driver dead after abort?)"
+                );
+            }
         }
     }
 
@@ -1212,6 +1270,42 @@ impl ChatController {
     /// Get a subscriber that receives all future events.
     pub fn subscribe(&self) -> broadcast::Receiver<ChatEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Returns `true` when the driver task has exited (the input
+    /// channel's receiver has been dropped). After `abort()` the
+    /// driver breaks out of its loop and drops `input_rx`; subsequent
+    /// sends via `input_tx` would silently fail. Callers (e.g.
+    /// `sessions.rs`) should use this to decide whether to respawn.
+    pub async fn is_driver_dead(&self) -> bool {
+        let guard = self.input_tx.lock().await;
+        match guard.as_ref() {
+            None => true, // never spawned
+            Some(tx) => tx.is_closed(),
+        }
+    }
+
+    /// Respawn the driver loop after a previous `abort()` killed it.
+    /// Reuses the stored `ControllerConfig` from the last `spawn()`.
+    /// Returns `Ok(())` on success or `Err` if no config was stored
+    /// (i.e. `spawn()` was never called).
+    ///
+    /// This preserves the `event_tx` broadcast channel (archiver /
+    /// SSE subscribers stay connected) and resets the cancel flags.
+    /// Chat history is NOT preserved in the new driver — but since
+    /// single-role mode keeps history in `AgentRunner` (which dies
+    /// with the driver), loss is expected and consistent with the
+    /// design. The UI event_log (archiver) retains the visible
+    /// history for display purposes.
+    pub async fn respawn(&self) -> Result<(), String> {
+        let cfg = self
+            .last_config
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| "no stored config; spawn() was never called".to_string())?;
+        self.spawn(cfg).await;
+        Ok(())
     }
 }
 
@@ -1445,6 +1539,23 @@ async fn run_driver(
 }
 
 // ─── Multi-role HIL mode ─────────────────────────────────────────
+
+/// 多角色 round loop 的实际轮次上限。`0` = 不限（与单角色
+/// `loop {}` 的语义一致）。
+///
+/// 为什么需要这层转换：round loop 写作 `1..=limit`，`limit == 0` 时
+/// `1..=0` 是**空区间**，循环体一次都不跑 → `run_driver` 立刻返回 →
+/// driver task 结束、`input_rx` 被 drop → 之后所有 `input_tx.send()`
+/// 静默失败（调用点都是 `let _ = ...`），session 出生即哑，而
+/// `/api/chat/send` 照样返回 202。ui-server 建 session 时传的正是
+/// `max_rounds: 0`（`sessions.rs`），只因它同时是单角色配置才没踩到。
+fn effective_round_limit(max_rounds: u32) -> u32 {
+    if max_rounds == 0 {
+        u32::MAX
+    } else {
+        max_rounds
+    }
+}
 
 async fn run_multi_role_loop(
     config: ControllerConfig,
@@ -1683,7 +1794,8 @@ async fn run_multi_role_loop(
     }
 
     // ─── Round loop ────────────────────────────────────────────
-    'rounds: for round_num in 1..=scheduler.max_rounds {
+    let round_limit = effective_round_limit(scheduler.max_rounds);
+    'rounds: for round_num in 1..=round_limit {
         if cancel_flag.load(Ordering::SeqCst) {
             break 'rounds;
         }
@@ -1701,12 +1813,39 @@ async fn run_multi_role_loop(
                     }
                 }
                 Some(ControllerInput::Pause) => {
-                    let mut mgr = session_arc.lock().await;
-                    let _ = mgr.pause("user /pause");
+                    {
+                        let mut mgr = session_arc.lock().await;
+                        let _ = mgr.pause("user /pause");
+                    }
                     let _ = event_tx.send(ChatEvent::Paused {
                         reason: "用户暂停".into(),
                     });
-                    break 'rounds;
+                    // 原地挂起等 Resume，**不要** `break 'rounds`：
+                    // break 会让 run_driver 返回、driver task 结束、
+                    // input_rx 被 drop —— 之后所有 send 静默失败，
+                    // session 永久变哑（/api/chat/send 仍回 202）。
+                    // 暂停是可恢复状态，不是 session 终止。
+                    loop {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            break 'rounds;
+                        }
+                        match input_rx.recv().await {
+                            Some(ControllerInput::Resume) => {
+                                {
+                                    let mut mgr = session_arc.lock().await;
+                                    let _ = mgr.resume();
+                                }
+                                let _ = event_tx.send(ChatEvent::Resumed);
+                                break;
+                            }
+                            Some(ControllerInput::Abort) | None => break 'rounds,
+                            Some(ControllerInput::AdvisorHint(t)) => {
+                                advisor_hints.lock().push_back(t);
+                            }
+                            // 暂停期间的其它输入（含重复 Pause）忽略。
+                            _ => {}
+                        }
+                    }
                 }
                 Some(ControllerInput::Abort) => break 'rounds,
                 // 取消当前 turn：仅打断正在跑的 run_turn，不退出
@@ -1734,12 +1873,36 @@ async fn run_multi_role_loop(
             match line.as_str() {
                 "/exit" | "/quit" => break 'rounds,
                 "/pause" => {
-                    let mut mgr = session_arc.lock().await;
-                    let _ = mgr.pause("user /pause");
+                    {
+                        let mut mgr = session_arc.lock().await;
+                        let _ = mgr.pause("user /pause");
+                    }
                     let _ = event_tx.send(ChatEvent::Paused {
                         reason: "用户暂停".into(),
                     });
-                    break 'rounds;
+                    // 同上：暂停原地挂起等 Resume，不 break 'rounds。
+                    // break 会 drop input_rx 让 session 永久变哑。
+                    loop {
+                        if cancel_flag.load(Ordering::SeqCst) {
+                            break 'rounds;
+                        }
+                        match input_rx.recv().await {
+                            Some(ControllerInput::Resume) => {
+                                {
+                                    let mut mgr = session_arc.lock().await;
+                                    let _ = mgr.resume();
+                                }
+                                let _ = event_tx.send(ChatEvent::Resumed);
+                                break;
+                            }
+                            Some(ControllerInput::Abort) | None => break 'rounds,
+                            Some(ControllerInput::AdvisorHint(t)) => {
+                                advisor_hints.lock().push_back(t);
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue 'rounds;
                 }
                 // Per-role pause (HIL v1.4): flag one role and keep the
                 // session running for the others. Orthogonal to the
@@ -1812,12 +1975,13 @@ async fn run_multi_role_loop(
                 }
                 line if line.starts_with("/rounds") => {
                     let mgr = session_arc.lock().await;
+                    let limit = if scheduler.max_rounds == 0 {
+                        "∞".to_string()
+                    } else {
+                        scheduler.max_rounds.to_string()
+                    };
                     let _ = event_tx.send(ChatEvent::Status {
-                        message: format!(
-                            "[round: {} / {}]",
-                            mgr.record().current_turn,
-                            scheduler.max_rounds
-                        ),
+                        message: format!("[round: {} / {}]", mgr.record().current_turn, limit),
                     });
                     continue 'rounds;
                 }
@@ -3675,7 +3839,7 @@ pub(crate) fn register_ask_tool(
             }),
             ("multi".into(), ToolInputProperty {
                 property_type: PropertyType::Boolean,
-                description: Some("是否允许多选（默认 false = 单选）。问题本身允许同时选中多项（例如“启用哪些模块”“需要覆盖哪些场景”）时请显式传 true，UI 会渲染成复选框。".into()),
+                description: Some("是否允许多选（默认 false = 单选）。问题本身允许同时选中多项（例如“启用哪些模块”“需要覆盖哪些场景”）时请显式传 true，UI 会渲染成复选框。⚠️ 只在 question 文案里写“（可多选）”是不够的——必须同时传 multi=true，否则 UI 渲染的是单选。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
             }),
             ("layout".into(), ToolInputProperty {
@@ -3757,7 +3921,14 @@ pub(crate) fn register_ask_tool(
                     .find_map(lenient_bool)
                     .unwrap_or(false)
             };
-            let multi = pick_bool(&["multi", "multiSelect", "multi_select", "multiple"]);
+            // `multi` 双通道判定：显式参数 **或** question 文案。模型
+            // 常常只在文案里写"（可多选）"而不传 `multi`（jemalloc
+            // 实锤：tutor 的「你最想深入哪条线？（可多选）」整个 args
+            // 里没有 multi 键），缺省 false 让前端渲染成单选，用户看着
+            // "可多选"只能点一个。两个信号任一为真就开多选——文案是
+            // 用户唯一看得见的承诺，不能让它变哑。
+            let multi = pick_bool(&["multi", "multiSelect", "multi_select", "multiple"])
+                || question_implies_multi(&question);
             let allow_upload = pick_bool(&["allow_upload", "allowUpload"]);
             let layout = input
                 .get("layout")
@@ -4601,6 +4772,23 @@ async fn register_delegate_tool(
                                 break;
                             }
                             Ok(Err(e)) => {
+                                // 撞轮次上限但已有实质产出：把正文一并回喂
+                                // manager。只报一句 "max tool rounds exceeded"
+                                // 会让 manager 以为这一支彻底没成果，从而
+                                // 原样重派——同一个坑再烧一遍预算。带上
+                                // partial，manager 才能判断是「接着收尾」
+                                // 还是「缩小范围重派」。
+                                if let AgentError::MaxToolRoundsExceeded { rounds, partial } = &e {
+                                    let stripped = strip_think_blocks(partial);
+                                    if !is_empty_output(&stripped) {
+                                        result = Err(tool_err(format!(
+                                            "subagent failed: 达到工具轮次上限（{rounds} 轮）。\
+                                             以下是它撞上限前已产出的未收尾内容，请据此决定\
+                                             「缩小范围重派」还是「让它接着收尾」，不要原样重派：\n\n{stripped}"
+                                        )));
+                                        break;
+                                    }
+                                }
                                 // Gate 重试耗尽 → subsession 被 advisor
                                 // 终止：发 AdvisorTerminated（带 sub_id）
                                 // 让 UI 显示"已暂停"状态，再把错误
@@ -5911,6 +6099,78 @@ mod tests {
         assert_eq!(options[1].description, "服务端存会话");
     }
 
+    /// jemalloc 事故回放（tutor / interview 步）：模型把多选意图只写进
+    /// question 文案（`你最想深入哪条线？（可多选）`），args 里完全没有
+    /// `multi` 键 → 缺省 false → 前端按 radio 渲染，用户看着"可多选"
+    /// 却只能点一个。文案兜底必须把这种情形识别成多选。
+    #[tokio::test]
+    async fn ask_infers_multi_from_question_text() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
+
+        // 与线上 args 同形：只有 question + options，无任何 multi 键。
+        let input = serde_json::json!({
+            "question": "你最想深入哪条线？（可多选）",
+            "options": [
+                {"label": "6 函数热路径 + tcache"},
+                {"label": "arena / bin / extent 三层"},
+                {"label": "stats + 调优 cookbook"},
+                {"label": "HPA 新机制（5.3 新增）"}
+            ]
+        });
+        tm.execute("ask", input, None).await.expect("ask call");
+
+        let ev = rx.try_recv().expect("ChoiceRequested event");
+        let ChatEvent::ChoiceRequested { multi, options, .. } = ev else {
+            panic!("expected ChoiceRequested, got {ev:?}");
+        };
+        assert!(multi, "question 写了「（可多选）」就必须按多选渲染");
+        assert_eq!(options.len(), 4);
+    }
+
+    /// 文案没有任何多选标记时保持单选（回归保护：兜底不能把所有提问
+    /// 都变成多选）。
+    #[tokio::test]
+    async fn ask_stays_single_select_without_multi_markers() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
+
+        tm.execute("ask", ask_input(), None).await.expect("ask call");
+        let ev = rx.try_recv().expect("ChoiceRequested event");
+        let ChatEvent::ChoiceRequested { multi, .. } = ev else {
+            panic!("expected ChoiceRequested, got {ev:?}");
+        };
+        assert!(!multi, "没有多选标记应保持单选");
+    }
+
+    /// 文案推断的边界：否定标记优先（"不可多选" 自身含 "多选" 子串，
+    /// 不先排除会被正向标记误命中）。
+    #[test]
+    fn question_implies_multi_marker_table() {
+        for q in [
+            "你最想深入哪条线？（可多选）",
+            "选哪些模块？可以多选",
+            "支持多选：要覆盖哪些场景",
+            "可勾选多项",
+            "Which areas? (multi-select)",
+            "Pick options — select all that apply",
+        ] {
+            assert!(question_implies_multi(q), "应判为多选: {q}");
+        }
+        for q in [
+            "选哪个方案？",
+            "你打算投入多少时间？",
+            "选一个方向（不可多选）",
+            "只能单选：主力模型是哪个",
+            "只能选一个",
+            "这里非多选",
+        ] {
+            assert!(!question_implies_multi(q), "应判为单选: {q}");
+        }
+    }
+
     fn ask_input() -> serde_json::Value {
         serde_json::json!({
             "question": "选哪个方案？",
@@ -7059,6 +7319,209 @@ mod tests {
         );
 
         controller.abort().await;
+    }
+
+    /// 回归测试：abort() 之后 session 必须能恢复，不能永久变哑。
+    ///
+    /// 旧行为（bug）：abort() 只置 `cancel_flag = true` 并发 Abort，
+    /// driver break 退出后 `input_rx` 被 drop，但 `input_tx` 仍是
+    /// `Some(dead_sender)`；`cancel_flag` 全代码从不复位，任何重启的
+    /// driver 在循环头 `if cancel_flag.load() { break }` 立刻再退出。
+    /// 结果 `/api/chat/send` 一路返回 202，SSE 连着但永远静默。
+    #[tokio::test]
+    async fn abort_then_respawn_revives_driver() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(64);
+
+        // 未 spawn：driver 视为「死」（没有可投递的接收端）。
+        assert!(
+            controller.is_driver_dead().await,
+            "spawn 之前 is_driver_dead 必须为 true"
+        );
+
+        let mut rx = controller.spawn(cfg).await;
+        assert!(
+            !controller.is_driver_dead().await,
+            "spawn 之后 driver 必须活着"
+        );
+
+        // 第一轮：确认 driver 正常消费输入。
+        controller.submit_input("第一条").await;
+        wait_for_user_message(&mut rx, "第一条").await;
+
+        // ── abort：driver 退出 ──
+        controller.abort().await;
+        // driver 需要一点时间跑到循环头、break、drop input_rx。
+        let dead = wait_until(|| controller.is_driver_dead()).await;
+        assert!(dead, "abort 之后 driver 必须真的死掉（input_rx 被 drop）");
+
+        // 旧 bug 的核心复现：此时发消息会静默丢弃。
+        controller.submit_input("abort 后的消息（应被丢弃）").await;
+
+        // ── respawn：session 复活 ──
+        controller
+            .respawn()
+            .await
+            .expect("respawn 必须成功（spawn 存过 config）");
+        assert!(
+            !controller.is_driver_dead().await,
+            "respawn 之后 driver 必须重新活着"
+        );
+        // cancel_flag 必须已复位，否则新 driver 会在循环头立刻再退出。
+        assert!(
+            !controller.cancel_flag.load(Ordering::SeqCst),
+            "respawn 必须复位 cancel_flag，否则新 driver 立刻自杀"
+        );
+
+        // 第二轮：新 driver 必须真的消费输入（不是又一个哑 session）。
+        controller.submit_input("第二条").await;
+        wait_for_user_message(&mut rx, "第二条").await;
+
+        controller.abort().await;
+    }
+
+    /// 轮询等待条件成立（最多 ~2s），避免 sleep 固定时长带来的抖动。
+    async fn wait_until<F, Fut>(mut cond: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        for _ in 0..200 {
+            if cond().await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// 从事件流里等一条内容匹配的 `UserMessage` —— 证明 driver 真的
+    /// 收到并处理了这条输入（哑 session 会在这里超时）。
+    async fn wait_for_user_message(rx: &mut broadcast::Receiver<ChatEvent>, expect: &str) {
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("等 UserMessage('{expect}') 超时 —— driver 没在消费输入"))
+                .expect("recv");
+            if let ChatEvent::UserMessage { text } = ev {
+                if text == expect {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// `max_rounds: 0` 必须表示「不限轮次」，绝不能让 `1..=0` 变成
+    /// 空区间把 driver 直接跑完退出（session 出生即哑）。
+    #[test]
+    fn round_limit_zero_means_unlimited_not_empty_range() {
+        // 0 → 不限：区间非空，循环体至少跑一轮。
+        let limit = effective_round_limit(0);
+        assert_eq!(limit, u32::MAX);
+        assert!(
+            (1..=limit).next().is_some(),
+            "max_rounds=0 时轮次区间必须非空，否则 driver 出生即死"
+        );
+        // 回归对照：修复前的写法就是空区间。
+        assert!(
+            (1..=0u32).next().is_none(),
+            "1..=0 确实是空区间（这正是旧 bug 的成因）"
+        );
+        // 非 0 原样透传。
+        assert_eq!(effective_round_limit(1), 1);
+        assert_eq!(effective_round_limit(20), 20);
+        assert_eq!((1..=effective_round_limit(3)).count(), 3);
     }
 
     #[test]
