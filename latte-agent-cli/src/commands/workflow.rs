@@ -14,11 +14,8 @@ use std::collections::HashMap;
 
 use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
-use latte_agent_core::config::AgentConfig;
-use latte_agent_core::model_resolver::ModelResolver;
 use latte_agent_orchestrator::orchestrator::{DiscussionConfig, DiscussionOrchestrator};
 use latte_agent_orchestrator::ConsensusMethod;
-use latte_agent_orchestrator::DiscussionWorkflow;
 use latte_ai::params::GenerateParams;
 
 use super::config_layer::{self, CliOverrides};
@@ -115,7 +112,7 @@ impl WorkflowCmd {
         //    the workflow's `speakers` lists (deduped) so the user
         //    doesn't have to repeat themselves.
         let default_params = GenerateParams::default();
-        let mut role_names: Vec<String> = if self.roles.is_empty() {
+        let role_names: Vec<String> = if self.roles.is_empty() {
             let mut set: Vec<String> = Vec::new();
             for step in &workflow.steps {
                 for s in &step.speakers {
@@ -150,7 +147,7 @@ impl WorkflowCmd {
             let role_for_tools = role.clone();
             let tier = role.default_model_tier;
             let models = resolver.resolve_chain(&role.id, tier, &role.model_chain)?;
-            let model_id = models[0].id.clone();
+            let _model_id = models[0].id.clone();
             let agent = Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
             let runner = if !role_for_tools.allowed_tools.is_empty() {
                 let tm = super::chat::build_tool_manager(&role_for_tools.allowed_tools)

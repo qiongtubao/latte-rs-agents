@@ -117,7 +117,7 @@ async fn sync_one_doc_dirty(
     http: &reqwest::Client,
     cfg: &NotionSyncConfig,
     cwd: &std::path::Path,
-    marker: &str,
+    _marker: &str,
     rel_path: &str,
 ) -> SyncResult {
     let full = cwd.join(".latte-review").join("docs").join(rel_path);
@@ -127,7 +127,7 @@ async fn sync_one_doc_dirty(
     };
     let body = build_doc_record_body(&content, rel_path);
     // 命名空间 agents-docs（doc 不覆盖任务命名空间）。
-    let url = record_url(&cfg.base_url, "agents-docs", rel_path);
+    let _url = record_url(&cfg.base_url, "agents-docs", rel_path);
     let mut doc_cfg = cfg.clone();
     doc_cfg.namespace = "agents-docs".to_string();
     upsert_with_retry(http, &doc_cfg, rel_path, &body).await

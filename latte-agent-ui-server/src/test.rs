@@ -602,7 +602,7 @@ pub struct TestRoleResponse {
 pub async fn run_role_test(
     req: TestRoleRequest,
     resolver: &latte_agent_core::model_resolver::ModelResolver,
-    cwd: &std::path::Path,
+    _cwd: &std::path::Path,
 ) -> TestRoleResponse {
     let started = Instant::now();
     let role_id = req.role_id.clone();

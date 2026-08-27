@@ -1834,6 +1834,15 @@ impl AgentRunner {
     pub(crate) fn has_model_hot_reload(&self) -> bool {
         self.model_source.is_some()
     }
+    /// 测试用：是否挂了真实 trace sink（默认的 `NullSink` 不算）。
+    ///
+    /// 同上的接线回归用途：`build_runner` 的无工具分支曾把 `runner_sink`
+    /// 造好却忘了 `with_sink`，编译器只报 `unused variable`，而后果是该类
+    /// 角色的 trace 既不落子会话日志、也不广播给 UI。
+    #[cfg(test)]
+    pub(crate) fn has_trace_sink(&self) -> bool {
+        !self.sink.is_null()
+    }
     /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
     /// to `self.context.messages`. Deletes the queue file. This is
     /// called at the start of `run_turn` and can also be called
@@ -2008,6 +2017,12 @@ impl AgentRunner {
         // 模型配置热更新：turn 边界比对配置代际，变了就重建 model chain。
         self.maybe_reload_models();
         // HIL blackboard: drain per-role inject queue.
+        // 这行此前丢了（只剩上面这句注释和一个直接调它的单测），后果是
+        // `.latte/inject/<role>.txt` 在运行时完全无效——而 CLI 的 HIL 会话
+        // 与 controller 多角色路径都调了 `with_inject_worktree_root` 启用它，
+        // 字段文档也写明「`run_turn` 每轮开头读队列」。编译器只报了
+        // 「method never used」。
+        self.drain_inject_queue();
         // Advisor monitor: drain pending hints into the context
         // *before* the working message list is built below, so the
         // first model call of this turn already sees them.
@@ -5688,6 +5703,67 @@ mod tests {
             (LOOP_WINDOW_SIZE..=LOOP_WINDOW_SIZE + 2).contains(&n),
             "应在窗口填满时熔断，实际发了 {n} 次 model call"
         );
+    }
+
+    /// 回归防线：注入队列必须**在 `run_turn` 里**被 drain，内容要真的送到模型。
+    ///
+    /// 既有的 `drain_inject_queue_prepends_synthetic_user_message` 直接调
+    /// `runner.drain_inject_queue()`，因此**测不到接线**——`run_turn` 里那行
+    /// 调用被删掉后它照样通过。实际后果是 `.latte/inject/<role>.txt` 在运行时
+    /// 完全无效，而 CLI 的 HIL 会话与 controller 多角色路径都调了
+    /// `with_inject_worktree_root` 启用它。编译器只报「method never used」。
+    ///
+    /// 本测试穿过 `run_turn` 并断言注入内容出现在**发给模型的请求体**里。
+    #[tokio::test]
+    async fn run_turn_drains_inject_queue_into_model_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue = dir
+            .path()
+            .join(".latte")
+            .join("inject")
+            .join("programmer.txt");
+        std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
+        std::fs::write(&queue, "look at foo.rs\n").unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("收到", vec![])),
+                    ),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent)
+            .with_role("programmer")
+            .with_inject_worktree_root(dir.path().to_path_buf());
+
+        runner
+            .run_turn(&[Message::user("go")], None)
+            .await
+            .expect("turn 应正常收尾");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert!(!reqs.is_empty(), "应至少发出一次模型请求");
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        assert!(
+            body.contains("[INJECTED]") && body.contains("look at foo.rs"),
+            "注入队列的内容必须出现在首个模型请求里: {body}"
+        );
+        assert!(!queue.exists(), "drain 后队列文件应被删除");
     }
 
     /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板

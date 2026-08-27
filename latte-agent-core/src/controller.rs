@@ -15,9 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
 
-use latte_ai::models::{Message, Role as MsgRole};
+use latte_ai::models::Message;
 use latte_ai::params::GenerateParams;
 use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -31,7 +30,7 @@ use crate::scheduler::{plan_md_slice_for, RoundScheduler};
 use crate::session::{SessionManager, SessionRecord, SessionState};
 use crate::subsession::SubsessionStore;
 use crate::supervisor::{Supervisor, SupervisorConfig};
-use crate::trace::{FanoutSink, ModelErrorKind};
+use crate::trace::ModelErrorKind;
 use crate::workspace::WorkspaceManager;
 use crate::AgentResult;
 
@@ -1764,7 +1763,6 @@ async fn run_multi_role_loop(
             role_id,
             tier,
             config.primary_model_id.as_deref(),
-            Some(session_arc.clone()),
             event_tx,
             &config.cwd,
             config.subsession_store.clone(),
@@ -2363,7 +2361,6 @@ async fn run_single_role_loop(
         &role_id,
         tier,
         config.primary_model_id.as_deref(),
-        None,
         event_tx,
         &config.cwd,
         config.subsession_store.clone(),
@@ -2494,7 +2491,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2516,7 +2513,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2721,7 +2718,7 @@ let usage_before = runner.total_usage().clone();
                             continue;
                         }
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2736,7 +2733,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2769,7 +2766,7 @@ let usage_before = runner.total_usage().clone();
                     Some(ControllerInput::CancelTurn) => {
                         turn_cancel_flag.store(true, Ordering::SeqCst);
                     }
-                    Some(ControllerInput::Abort) | None => break,
+                    Some(ControllerInput::Abort) => break,
                 }
             }
         }
@@ -2783,7 +2780,6 @@ async fn build_runner(
     role_id: &str,
     tier: ModelTier,
     primary_id: Option<&str>,
-    session: Option<Arc<Mutex<SessionManager>>>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cwd: &Path,
     subsession_store: Arc<SubsessionStore>,
@@ -3055,6 +3051,11 @@ async fn build_runner(
         let mut runner = AgentRunner::new(agent)
             .with_role(role_id)
             .with_cwd(cwd.to_path_buf());
+        // 这条 `.with_sink` 此前漏了：`runner_sink` 构造完就被丢弃
+        // （编译器只报了个 unused variable 警告，实际后果是无工具角色的
+        // trace 事件既不落子会话日志、也不经 ChatEventTraceSink 广播给
+        // UI —— 有工具的那条分支一直是对的，两边不一致）。
+        runner = runner.with_sink(runner_sink);
         if let Some(gate) = advisor_gate {
             runner = runner.with_gate_config(gate);
         }
@@ -6480,6 +6481,99 @@ mod tests {
     /// 造一个共享阶段门句柄。
     fn fresh_plan_stage() -> SharedPlanStage {
         Arc::new(parking_lot::RwLock::new(PlanStage::Normal))
+    }
+
+    /// 回归防线：`build_runner` 的**两条分支都必须装上 trace sink**。
+    ///
+    /// 无工具分支曾把 `runner_sink` 造好却忘了 `.with_sink(...)`，编译器只报
+    /// 一句 `unused variable: runner_sink`，实际后果是这类角色的 trace 事件
+    /// 既不落 `.latte/ui-sessions/<sid>/` 子会话日志、也不经
+    /// `ChatEventTraceSink` 广播给 UI——执行轨迹当场看不到、事后查不到。
+    /// 有工具的分支一直是对的，两边不一致。
+    ///
+    /// `build_runner` 此前**零测试覆盖**，这是第一个。
+    #[tokio::test]
+    async fn build_runner_attaches_trace_sink_for_both_branches() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        let server = wiremock::MockServer::start().await;
+        let model = ModelDef {
+            name: "stub".into(),
+            api: "openai".into(),
+            provider: "test".into(),
+            base_url: server.uri(),
+            api_key: "test-key".into(),
+            context_window: 32000,
+            max_tokens: 4096,
+            supports_thinking: false,
+            supports_vision: false,
+            supports_image_generation: false,
+            cost_per_million_input: None,
+            cost_per_million_output: None,
+            tier: Some("standard".into()),
+            timeout_secs: None,
+        };
+        let role_with = |id: &str, tools: Vec<String>| RoleTemplate {
+            id: id.into(),
+            name: id.into(),
+            category: "execution".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: None,
+            tools,
+            icon: String::new(),
+            skills: vec![],
+            code_paths: vec![],
+        };
+        let merged = AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![model],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [
+                // 无工具 → 走 build_runner 的 else 分支（曾漏挂 sink）
+                ("bare".to_string(), role_with("bare", vec![])),
+                // 有工具 → 走 if 分支（一直正确）
+                ("handy".to_string(), role_with("handy", vec!["bash".into()])),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let (event_tx, _rx) = broadcast::channel(64);
+        let params = GenerateParams::default();
+
+        for role_id in ["bare", "handy"] {
+            let (runner, _) = build_runner(
+                &merged,
+                &resolver,
+                &params,
+                role_id,
+                ModelTier::Standard,
+                None,
+                &event_tx,
+                std::path::Path::new("/tmp"),
+                Arc::new(crate::subsession::SubsessionStore::new()),
+                "ui-test",
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(parking_lot::Mutex::new(String::new())),
+                None,
+                AdvisorPauseGate::new(),
+                &fresh_plan_stage(),
+                crate::pause_gate::AgentPauseGate::new("test"),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("build_runner");
+            assert!(
+                runner.has_trace_sink(),
+                "角色 '{role_id}' 的 runner 漏挂了 trace sink"
+            );
+        }
     }
 
     #[test]

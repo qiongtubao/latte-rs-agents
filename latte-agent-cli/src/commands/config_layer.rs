@@ -146,7 +146,7 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
  pub fn load(
      project_agents: Option<&str>,
      project_models: Option<&str>,
-     cli: CliOverrides,
+     _cli: CliOverrides,
  ) -> AgentResult<Resolved> {
      // Layer 3 (lowest): global ~/.latte/models.{yaml,toml} + ~/.latte/models.d/
      let global = GlobalConfig::load_default()?;

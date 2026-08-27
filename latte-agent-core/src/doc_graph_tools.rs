@@ -16,7 +16,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use latte_rs_agent_tools::types::{
-    PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
+    PropertyType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
 };
 
 /// 解析 latte-review 可执行文件路径：env LATTE_REVIEW_BIN > PATH。

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use latte_agent_core::agent::AgentRunner;
 use latte_agent_core::context::ConversationContext;
-use latte_ai::models::{Message, Role, TokenUsage};
+use latte_ai::models::{Message, TokenUsage};
 
 use crate::consensus::ConsensusMethod;
 use crate::error::{OrchError, OrchResult};

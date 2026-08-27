@@ -62,7 +62,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::Router;
 use latte_agent_core::config::AgentConfig;
 use latte_agent_core::model_resolver::{ModelResolver, ModelTier};

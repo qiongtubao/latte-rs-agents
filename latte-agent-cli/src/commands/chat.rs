@@ -329,7 +329,7 @@ impl ChatCmd {
 
         let stdin = io::stdin();
         let mut stdout = io::stdout();
-        let term_width = style::terminal_width();
+        let _term_width = style::terminal_width();
         loop {
             let model_id = session.primary_model_id();
             let role_icon = session.role_icon();
@@ -392,8 +392,8 @@ impl ChatCmd {
                 stdout.flush()?;
             }
             let usage_after = session.runner.total_usage();
-            let in_delta = usage_after.input_tokens - usage_before.input_tokens;
-            let out_delta = usage_after.output_tokens - usage_before.output_tokens;
+            let _in_delta = usage_after.input_tokens - usage_before.input_tokens;
+            let _out_delta = usage_after.output_tokens - usage_before.output_tokens;
         }
         Ok(())
     }

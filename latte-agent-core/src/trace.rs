@@ -637,6 +637,19 @@ pub enum HookPoint {
 /// can be shared across async tasks.
 pub trait TraceSink: Send + Sync {
     fn emit(&self, event: TraceEvent);
+
+    /// 本 sink 是否为「什么都不做」的占位（[`NullSink`]）。
+    ///
+    /// 存在理由是**接线回归测试**：`sink` 字段默认就是 `NullSink`，所以
+    /// 「忘了调 `with_sink`」和「装了真 sink」在类型上无法区分，只会被编译器
+    /// 报成一句 `unused variable`。`build_runner` 的无工具分支就这么漏过一次
+    /// ——sink 造好却没装，该类角色的 trace 既不落子会话日志也不广播给 UI。
+    /// 有了这个方法，测试可以直接断言「装上了」。
+    ///
+    /// 默认 `false`：任何真实 sink 无需实现。
+    fn is_null(&self) -> bool {
+        false
+    }
 }
 
 /// Default sink. `emit` is `#[inline]` empty; compiler eliminates the call.
@@ -645,6 +658,10 @@ pub struct NullSink;
 impl TraceSink for NullSink {
     #[inline]
     fn emit(&self, _event: TraceEvent) {}
+    #[inline]
+    fn is_null(&self) -> bool {
+        true
+    }
 }
 
 /// Fan-out sink: forwards every event to each child sink, in order.

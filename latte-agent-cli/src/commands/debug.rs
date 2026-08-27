@@ -275,9 +275,7 @@ fn run_replay(
     parser: Option<&str>,
     hooks: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use latte_agent_core::hooks::builtin::{
-        EnforceToolAllowlist, RedactPii, RequireToolCall,
-    };
+    use latte_agent_core::hooks::builtin::EnforceToolAllowlist;
     use latte_agent_core::hooks::HookChain;
     use latte_agent_core::hooks::Hook;
     use std::sync::Arc;
