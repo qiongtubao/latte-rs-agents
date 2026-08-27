@@ -584,26 +584,71 @@ fn ensure_unique_tool_call_ids(calls: &mut [latte_ai::models::ToolCall]) {
 // ─── LoopDetector ─────────────────────────────────────────────────────────
 
 /// Detects when a model is stuck calling the same tool with the
-/// same args repeatedly. Used to break the tool-call loop early
-/// before `max_tool_rounds` is exhausted.
+/// same args repeatedly, and breaks the tool-call loop.
 ///
 /// The "model is stuck" failure mode: the model emits the same
-/// `<tool_call>` on every round, gets the same result, but can't break
-/// out of the pattern on its own. With a hard cap of 8 rounds that's
-/// 8 wasted model calls before we surface a `MaxToolRoundsExceeded`
-/// error. With this detector, the 3rd consecutive identical call
-/// trips and we return a `ToolLoopDetected` error that names the
-/// offending tool — much faster feedback, much less wasted spend.
+/// tool call on every round, gets the same result, but can't break
+/// out of the pattern on its own.
+///
+/// **这是 deadline-only 模式下唯一的自动刹车。** 轮次上限已退化为 soft
+/// warning，`deadline` 只在 delegate / workflow step 上设置（交互式 chat
+/// 不设，按设计交给人工 ⏸ 或 advisor 叫停），所以没有别的机制会兜住死
+/// 循环。探测器由 `run_turn` 在**整个 turn 内共用一个实例**，streak 跨
+/// round 累积；放进 round 循环里就等于关掉它（模型一轮通常只发一个调
+/// 用，streak 永远是 1）。
+///
+/// 判定键是 (tool_name, args_json) 的**逐字节相同**。两条规则并行：
+///
+/// 1. **连击**：连续 [`LOOP_STREAK_THRESHOLD`] 次同一个 key → 熔断。
+/// 2. **打转**：窗口（[`LOOP_WINDOW_SIZE`] 次调用）填满后，若其中只有
+///    ≤ [`LOOP_CYCLE_MAX_DISTINCT`] 种 key、且每种都出现 ≥
+///    [`LOOP_CYCLE_MIN_EACH`] 次 → 熔断。
+///
+/// 只有规则 1 时存在一个洞：模型在两个调用之间来回跳（`read A` →
+/// `search B` → `read A` → `search B` …），每次都与上一次不同，`streak`
+/// 恒为 1，永远不熔断。而交互式 chat 既没有轮次上限也不设 `deadline`，
+/// 于是无限空转。规则 2 就是补这个洞——`history` 窗口此前只被
+/// `.last()` 读过，维护了却不用，现在真正派上用场。
+///
+/// 两条规则都要求参数**逐字节相同**，所以「改参数后重试」这种正常进展
+/// 不会被误杀。规则 2 额外要求「每种 key 都重复出现」，用来区分真打转和
+/// 「一串相同调用里夹了一个孤立的别的调用」——后者是被打断的连击，交给
+/// 规则 1 判，不该按环处理。
 #[derive(Default)]
 struct LoopDetector {
-    /// Recent (tool_name, args_json) pairs, capped at `LOOP_WINDOW_SIZE`.
+    /// 最近 [`LOOP_WINDOW_SIZE`] 次 (tool_name, args_json)。规则 1 只看
+    /// 末尾，规则 2 看整个窗口。
     history: Vec<(String, String)>,
     /// Count of consecutive identical tool calls seen at the tail.
     streak: usize,
 }
 
-const LOOP_WINDOW_SIZE: usize = 5;
-const LOOP_STREAK_THRESHOLD: usize = 3;
+const LOOP_WINDOW_SIZE: usize = 8;
+const LOOP_STREAK_THRESHOLD: usize = 5;
+
+/// 判「打转」时窗口内最多允许几种不同调用。2 = 只在两个调用之间来回跳。
+const LOOP_CYCLE_MAX_DISTINCT: usize = 2;
+
+/// 判「打转」时每种调用至少要出现几次。
+///
+/// 这一条把「7 次 read A 中间夹 1 次 search」排除在外：那是被打断的连击
+/// （规则 1 的辖区），不是环。少了它，`loop_detector_resets_on_different_call`
+/// 那种「换个调用清零连击」的正常语义会被误判成打转。
+const LOOP_CYCLE_MIN_EACH: usize = 2;
+
+/// 「同一工具连续被确定性校验拒绝」的两级阈值。
+///
+/// 与 [`LOOP_STREAK_THRESHOLD`] 分工：`LoopDetector` 只认 (工具, args)
+/// **逐字节相同**的重复；而模型常常每轮改一点参数再撞同一类校验
+/// （jemalloc 2026-08-26：manager 连着 3 轮调 `plan`，每轮重写 8 个任务
+/// 40+ 条 paths，每轮烧 100~150s），那种模式只有这个只看
+/// (工具, 失败类别) 的计数器能抓。
+///
+/// 提成模块级常量是为了让实现和测试共用同一个真值来源——这两个数字
+/// 曾经是 `run_turn` 里的局部 `const`，被从 3/5 调到 5/8 时测试没跟着
+/// 改，于是测试长期失败却没人发现。
+const PERMANENT_NUDGE_AT: usize = 5;
+const PERMANENT_BREAK_AT: usize = 8;
 
 impl LoopDetector {
     /// Record a tool call and decide whether to continue or break.
@@ -633,7 +678,50 @@ impl LoopDetector {
         if self.history.len() > LOOP_WINDOW_SIZE {
             self.history.remove(0);
         }
+        // 规则 2：窗口填满后判「打转」。放在 push 之后，这样刚好第
+        // LOOP_WINDOW_SIZE 次调用就能判。
+        if self.history.len() >= LOOP_WINDOW_SIZE {
+            if let Some(reason) = self.cycle_reason() {
+                return LoopDecision::Break(reason);
+            }
+        }
         LoopDecision::Continue
+    }
+
+    /// 窗口是否构成「在少数几个调用之间来回打转」。
+    ///
+    /// 判据：窗口内不同 key ≤ [`LOOP_CYCLE_MAX_DISTINCT`] 种，且**每种**
+    /// 都出现 ≥ [`LOOP_CYCLE_MIN_EACH`] 次。后半条不可省——否则「一串相同
+    /// 调用里夹了一个孤立的别的调用」也会被判成环。
+    fn cycle_reason(&self) -> Option<String> {
+        // 窗口只有 8 项，线性统计比建 HashMap 更省。
+        let mut counts: Vec<(&(String, String), usize)> = Vec::new();
+        for k in &self.history {
+            match counts.iter_mut().find(|(key, _)| *key == k) {
+                Some((_, c)) => *c += 1,
+                None => counts.push((k, 1)),
+            }
+        }
+        if counts.len() > LOOP_CYCLE_MAX_DISTINCT {
+            return None;
+        }
+        if counts.iter().any(|(_, c)| *c < LOOP_CYCLE_MIN_EACH) {
+            return None;
+        }
+        let cycle = counts
+            .iter()
+            .map(|((tool, args), c)| {
+                format!("{tool}({}) ×{c}", truncate_tool_summary(args, 60))
+            })
+            .collect::<Vec<_>>()
+            .join(" ↔ ");
+        Some(format!(
+            "最近 {} 次工具调用只在 {} 种调用之间来回打转：{cycle}。\
+             参数逐次完全相同，模型在原地绕圈而非取得进展。\
+             Breaking out so the user can intervene.",
+            self.history.len(),
+            counts.len(),
+        ))
     }
 
     /// Clear all state. Tests use it to reset between scenarios.
@@ -713,8 +801,6 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {    match e {
 pub struct AgentRunner {
     agent: Agent,
     context: ConversationContext,
-    /// Max tool-call round trips per turn (0 = disables tool calling).
-    max_tool_rounds: usize,
     /// Optional tool manager for executing tool calls.
     tool_manager: Option<Arc<dyn latte_rs_agent_tools::types::ToolManager>>,
     /// Accumulated token usage across all turns.
@@ -798,6 +884,11 @@ pub struct AgentRunner {
     // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
     // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
     // `tools` 字段。tool_choice 取自 `agent.params.tool_choice`（默认 Auto）。
+    /// 循环内 deadline（对齐 oh-my-pi）：绝对墙钟时刻。每个 model call
+    /// 前检查：超时时优雅退出、返回 partial 产出，而不是被外层 tokio
+    /// timeout abort（后者会丢失所有未 flush 的 partial 文本）。
+    /// `None` = 不启用循环内 deadline（向后兼容：外层 tokio timeout 仍兜底）。
+    deadline: Option<std::time::Instant>,
 }
 
 /// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
@@ -831,6 +922,21 @@ fn classify_tool_execution_error(
     // 看不出区别、也没法给超时单独定预算。
     if let ToolError::ToolTimeout { .. } = e {
         return ToolCallErrorKind::Timeout;
+    }
+    // 参数校验失败：确定性输入错误，同参数重试必然拿到同一份拒绝。
+    // 判不可重试，把错误喂回模型让它改参数。
+    //
+    // 此前没有这一条，靠下面 PERMANENT 那张**消息子串黑名单**兜：
+    // schema 层的「缺必填参数」恰好命中 "is required" 所以侥幸正确，
+    // 而 handler 内部的校验只要文案没撞上关键词就漏网。jemalloc
+    // 2026-08-26 会话：code_graph 的「无法从 path 推断语言，请显式传
+    // lang」一个词都没命中 → 归成 Execution → 同参数自动重试 2 次，
+    // 每次都拿到同一份报错。黑名单要靠人穷举中文文案，每加一个工具
+    // 漏一次；改判类型。
+    if let ToolError::Validation { .. } = e {
+        return ToolCallErrorKind::PermanentExec {
+            reason: e.to_string(),
+        };
     }
     let msg = e.to_string();
     // workflow 预算超支：checkpoint 已落盘，盲目重试 = 从第 0 步重跑，
@@ -907,6 +1013,49 @@ fn truncate_tool_summary(text: &str, max: usize) -> String {
     }
 }
 
+/// 模型不可用自动暂停后，最多连续自动重试几次；用尽转人工。
+///
+/// 5 次配合 [`auto_pause_backoff`] 的退避序列约覆盖 4 分钟——足够扛过
+/// 常见的厂商限流窗口和本机网络抖动（jemalloc 会话那次实际只需 9s），
+/// 又不至于在真·配置错误上磨太久。
+/// env `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` 可覆盖，0 = 不自动重试
+/// （退回「立刻等人工 ▶」的旧行为）。
+const DEFAULT_AUTO_PAUSE_MAX_RETRIES: u32 = 5;
+
+fn auto_pause_max_retries() -> u32 {
+    std::env::var("LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_AUTO_PAUSE_MAX_RETRIES)
+}
+
+/// 自动暂停的退避上限：再长就不如交给人。
+const AUTO_PAUSE_BACKOFF_CAP: Duration = Duration::from_secs(120);
+
+/// 第 `attempt` 次（0-based）自动重试前等多久。
+///
+/// 以厂商给的 cooldown（`ModelsUnavailable::next_retry_in`）为基线做
+/// 二进制指数退避并封顶：cooldown 是「最早那个模型退出冷却」的时刻，
+/// 照它重试一次是对的，但如果重试完还是全挂，说明问题比单个模型的
+/// 冷却更大（本机网络、全域限流），这时必须拉长间隔而不是原地
+/// 空转。下界 1s，避免 cooldown 为 0 时变成忙等。
+fn auto_pause_backoff(attempt: u32, cooldown: Duration) -> Duration {
+    let base = cooldown.max(Duration::from_secs(1));
+    let factor = 1u32 << attempt.min(6); // 1,2,4,…,64
+    base.saturating_mul(factor).min(AUTO_PAUSE_BACKOFF_CAP)
+}
+
+/// 失败列表是否**全部**为「请求没送出去」类（连接/DNS/代理/连接超时）。
+///
+/// 多个厂商、多个域名同时连不上，几乎必然是本机网络或代理的问题，而不
+/// 是「所有模型都挂了」。空列表返回 false —— 没有证据不下结论。
+fn failures_are_all_transport(failures: &[(String, String)]) -> bool {
+    !failures.is_empty()
+        && failures
+            .iter()
+            .all(|(_, err)| err.contains(latte_ai::error::TRANSPORT_FAILURE_MARKER))
+}
+
 /// `ModelsUnavailable` 的人类可读摘要：tried/failures + 最近可重试
 /// 时间。给自动暂停的 Paused 事件原因用。
 fn model_failures_summary(e: &AgentError) -> String {
@@ -921,6 +1070,18 @@ fn model_failures_summary(e: &AgentError) -> String {
                 .map(|(id, err)| format!("{id}: {err}"))
                 .collect::<Vec<_>>()
                 .join("; ");
+            // 全链都连不上 → 先把结论说出来。否则这段摘要会以
+            // 「all models unavailable + 4 个模型名」开头，读起来像
+            // 配额/鉴权问题，实际是本机网络断了。
+            let f = if failures_are_all_transport(failures) {
+                format!(
+                    "疑似本机网络/代理故障：{} 个模型的请求都没能送出（连接失败），\
+                     并非厂商侧不可用——请先检查网络、代理与 DNS。原始失败：{f}",
+                    failures.len()
+                )
+            } else {
+                f
+            };
             match next_retry_in {
                 Some(d) => format!("{f}（{}s 后可自动重试）", d.as_secs()),
                 None => f,
@@ -990,6 +1151,17 @@ fn slow_model_call_notice() -> Duration {
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(120))
+}
+
+/// Session 暂停门的 park 上限：超过该时长自动恢复继续。默认 `None`
+/// （不限）——用户按 ⏸ 是显式意图，自动恢复会违背意图；无人值守
+/// 场景（CI / 长跑）用 `LATTE_AGENT_PAUSE_MAX_PARK_SECS` 配上限。
+fn max_pause_park() -> Option<Duration> {
+    std::env::var("LATTE_AGENT_PAUSE_MAX_PARK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(Duration::from_secs)
 }
 
 /// 空 completion 判定：无有效文本且无任何 tool_calls。只有文本为空
@@ -1274,7 +1446,6 @@ impl AgentRunner {
         Self {
             agent,
             context: ConversationContext::default(),
-            max_tool_rounds: 0,
             tool_manager: None,
             total_usage: TokenUsage::default(),
             sink: Arc::new(crate::trace::NullSink),
@@ -1292,17 +1463,21 @@ impl AgentRunner {
             agent_pause_gate: None,
             stream_mode: None,
             model_source: None,
+            deadline: None,
         }
     }
-    pub fn new_with_tools(
-        agent: Agent,
-        tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
-        max_tool_rounds: usize,
-    ) -> Self {
+    /// 构造带工具的 runner。
+    ///
+    /// 曾有第三个参数 `max_tool_rounds`（轮次上限）。deadline-only 重构
+    /// 把硬上限拿掉后，该值只是被存进字段、再没人读，是纯粹的死参数
+    /// （CLI 三处都传 0——按旧文档那意思是「关闭工具调用」，而工具照常
+    /// 工作，正好印证它已被忽略）。现在循环的自动刹车只有
+    /// [`LoopDetector`]（同参数死循环），超时与叫停交给
+    /// `set_deadline` / 人工 ⏸ / advisor。
+    pub fn new_with_tools(agent: Agent, tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>) -> Self {
         Self {
             agent,
             context: ConversationContext::default(),
-            max_tool_rounds,
             tool_manager: Some(tool_manager),
             total_usage: TokenUsage::default(),
             sink: Arc::new(crate::trace::NullSink),
@@ -1320,13 +1495,13 @@ impl AgentRunner {
             agent_pause_gate: None,
             stream_mode: None,
             model_source: None,
+            deadline: None,
         }
     }
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
         Self {
             agent,
             context,
-            max_tool_rounds: 0,
             tool_manager: None,
             total_usage: TokenUsage::default(),
             sink: Arc::new(crate::trace::NullSink),
@@ -1344,6 +1519,7 @@ impl AgentRunner {
             agent_pause_gate: None,
             stream_mode: None,
             model_source: None,
+            deadline: None,
         }
     }
 
@@ -1378,38 +1554,188 @@ impl AgentRunner {
         self
     }
 
-    /// 模型全链不可用（`ModelsUnavailable`）时的「自动暂停等人」：
+    /// 模型全链不可用（`ModelsUnavailable`）时的自动暂停。
+    ///
     /// 挂了 session 暂停门 → engage 门（带原因，controller 的
     /// on_change listener 会广播 `ChatEvent::Paused`，UI 弹出
-    /// 「已暂停 + ▶ 继续」），park 到用户恢复；恢复后返回 true，
-    /// 调用方重试模型调用。无门 → false，调用方原样抛错。
+    /// 「已暂停 + ▶ 继续」）。恢复后返回 true，调用方重试模型调用。
+    /// 无门 → false，调用方原样抛错。
     ///
     /// 语义对齐用户手动 ⏸：in-flight 的本次 model call 已经失败
     /// 落定，重试从下一次调用开始，不打断任何进行中的流。
-    async fn pause_wait_model_unavailable(&self, e: &AgentError) -> bool {
+    ///
+    /// ## 退避自动重试
+    ///
+    /// `attempt`（0-based）是本次模型调用已经因同一原因暂停过几次，
+    /// 由调用方的重试循环维护。
+    ///
+    /// 此前这里无条件 `wait_until_resumed(None)` —— 无上限死等人点
+    /// ▶。但事件文本写的是「9s 后可自动重试」，`ModelsUnavailable`
+    /// 也带着 `next_retry_in`，两边都在承诺自动重试，代码却没做。
+    /// jemalloc 2026-08-26 会话：22:06:27 三家 provider 同时连接失败
+    /// （本机网络抖动），reviewer 就地 park 到死，84 分钟后整条
+    /// workflow 被预算判超支中止。一次 9 秒的抖动毁掉一次完整运行。
+    ///
+    /// 现在：厂商 cooldown（`next_retry_in`）有值 → 按退避自动恢复重
+    /// 试，人仍可随时点 ▶ 抢先继续；退避次数用尽、或 cooldown 为
+    /// `None`（失败不可重试，如鉴权错误——重试一万次也是 401）→ 退回
+    /// 无上限 park 等人工。
+    async fn pause_wait_model_unavailable(&self, e: &AgentError, attempt: u32) -> bool {
         let Some(gate) = self.agent_pause_gate.clone() else {
             return false;
         };
         let summary = model_failures_summary(e);
+        let cooldown = match e {
+            AgentError::ModelsUnavailable { next_retry_in, .. } => *next_retry_in,
+            _ => None,
+        };
+        let max_retries = auto_pause_max_retries();
+        // 自动重试的两个前提：厂商给了 cooldown（说明失败可重试），
+        // 且退避次数还没用尽。
+        let auto_after = cooldown
+            .filter(|_| attempt < max_retries)
+            .map(|d| auto_pause_backoff(attempt, d));
+
         let hint = if failures_include_context_overflow(e) {
             "检测到上下文超出模型窗口——原样重试必败。点 ▶ 继续将自动裁剪本轮待发消息中的超长内容（多为工具结果）后重试；会话记录不受影响"
+                .to_string()
+        } else if let Some(d) = auto_after {
+            format!(
+                "{}s 后自动重试（第 {}/{} 次），也可点 ▶ 立即继续",
+                d.as_secs(),
+                attempt + 1,
+                max_retries
+            )
+        } else if cooldown.is_none() {
+            "失败不可自动重试（多为鉴权/配置问题，非限流）——请修正后点 ▶ 继续".to_string()
         } else {
-            "点 ▶ 继续会自动重试"
+            format!("已连续自动重试 {max_retries} 次仍不可用，转人工——点 ▶ 继续会再试一次")
         };
         gate.pause_with_reason(format!("模型不可用（{summary}），已自动暂停——{hint}"));
         self.sink.emit(crate::trace::TraceEvent::SessionPaused {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
             task_id: String::new(),
-            reason: format!("models unavailable: {summary}"),
+            reason: format!("models unavailable (attempt {attempt}): {summary}"),
             turn: 0,
         });
-        let r = gate.wait_until_resumed(None).await;
+
+        let resumed = match auto_after {
+            // 退避窗口内人点了 ▶ 就走人工路径；没人管则超时自恢复。
+            // 注意 gate 必须由我们显式 resume：wait 超时不会解除门，
+            // 而门还 engaged 的话后续 park 点会再次卡住。
+            Some(d) => {
+                match tokio::time::timeout(d, gate.wait_until_resumed(None)).await {
+                    Ok(r) => matches!(r, crate::pause_gate::WaitResult::Ok),
+                    Err(_) => {
+                        gate.resume();
+                        true
+                    }
+                }
+            }
+            None => matches!(
+                gate.wait_until_resumed(None).await,
+                crate::pause_gate::WaitResult::Ok
+            ),
+        };
         self.sink.emit(crate::trace::TraceEvent::SessionResumed {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
             task_id: String::new(),
             turn: 0,
         });
-        matches!(r, crate::pause_gate::WaitResult::Ok)
+        resumed
+    }
+
+    /// Session 门 park 期间的"仍在等待"提醒间隔。
+    const PARK_NOTICE_INTERVAL: Duration = Duration::from_secs(120);
+
+    /// 统一的 session 暂停 park：进出各发一次 trace 事件，park 期间
+    /// 定期 warn，可选上限防死等。
+    ///
+    /// 动机（jemalloc 2026-08-26 会话）：session 门的 3 个 park 点
+    /// （turn 入口 / model call 前 / tool 启动前）此前都直接
+    /// `wait_until_resumed(None)`，park 期间 trace 里**一个事件都没有**。
+    /// 那条会话 67 分钟里有 37 分钟是完整空洞（13:03:33 → 13:40:49 所有
+    /// 角色同时静默），事后无法区分"用户暂停 / 厂商限流 / 死锁"——排查
+    /// 只能靠猜。
+    ///
+    /// `site` 写进 reason，用来区分停在哪个边界。
+    /// `LATTE_AGENT_PAUSE_MAX_PARK_SECS`（默认 0 = 不限）给一个防死等
+    /// 上限：用户按 ⏸ 是显式意图，默认不自动恢复；无人值守场景可用
+    /// 这个 env 配上限。
+    async fn park_if_paused(&self, site: &str) {
+        let Some(gate) = self.agent_pause_gate.clone() else {
+            return;
+        };
+        if !gate.is_paused() {
+            return;
+        }
+        let detail = gate.pause_reason().unwrap_or_default();
+        let reason = if detail.is_empty() {
+            format!("pause gate parked at {site}")
+        } else {
+            format!("pause gate parked at {site}: {detail}")
+        };
+        self.sink.emit(crate::trace::TraceEvent::SessionPaused {
+            meta: crate::trace::TraceMeta::now(0, &self.role_id, self.session_id.clone()),
+            task_id: String::new(),
+            reason,
+            turn: 0,
+        });
+        let started = Instant::now();
+        let cap = max_pause_park();
+        loop {
+            match tokio::time::timeout(Self::PARK_NOTICE_INTERVAL, gate.wait_until_resumed(None))
+                .await
+            {
+                Ok(_) => break,
+                Err(_) => {
+                    let waited = started.elapsed().as_secs();
+                    tracing::warn!(
+                        "session pause gate: {} 在 {site} 已 park {waited}s，仍在等待恢复",
+                        self.role_id
+                    );
+                    if let Some(cap) = cap {
+                        if started.elapsed() >= cap {
+                            gate.resume();
+                            tracing::warn!(
+                                "session pause gate: 超过上限 {}s，自动恢复继续",
+                                cap.as_secs()
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.sink.emit(crate::trace::TraceEvent::SessionResumed {
+            meta: crate::trace::TraceMeta::now(0, &self.role_id, self.session_id.clone()),
+            task_id: String::new(),
+            turn: 0,
+        });
+    }
+
+    /// Advisor 暂停门的 park，同样补 trace 事件。门自带 600s 自动恢复
+    /// （见 [`crate::advisor_monitor::AdvisorPauseGate`]），这里只负责
+    /// 可观测性。
+    async fn park_if_advisor_requested(&self) {
+        let Some(gate) = self.pause_gate.clone() else {
+            return;
+        };
+        if !gate.is_requested() {
+            return;
+        }
+        self.sink.emit(crate::trace::TraceEvent::SessionPaused {
+            meta: crate::trace::TraceMeta::now(0, &self.role_id, self.session_id.clone()),
+            task_id: String::new(),
+            reason: "advisor pause gate: 等待用户拍板".to_string(),
+            turn: 0,
+        });
+        gate.wait_if_requested().await;
+        self.sink.emit(crate::trace::TraceEvent::SessionResumed {
+            meta: crate::trace::TraceMeta::now(0, &self.role_id, self.session_id.clone()),
+            task_id: String::new(),
+            turn: 0,
+        });
     }
 
     /// 设置流式模式开关（运行时可切换）。
@@ -1579,10 +1905,12 @@ impl AgentRunner {
         self
     }
 
-    /// Set the max tool-call round trips per turn.
-    pub fn set_max_tool_rounds(&mut self, n: usize) {
-        self.max_tool_rounds = n;
+    /// Set the absolute wall-clock deadline for the tool loop (对齐 oh-my-pi
+    /// `config.deadline`). 超时时循环优雅退出、返回 partial 产出。
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.deadline = Some(deadline);
     }
+
     /// Get a reference to the agent.
     pub fn agent(&self) -> &Agent {
         &self.agent
@@ -1676,9 +2004,7 @@ impl AgentRunner {
         system_vars: Option<&serde_json::Value>,
     ) -> AgentResult<String> {
         // Session-level 暂停：用户按 ⏸ 时 run_turn 入口 park。
-        if let Some(gate) = self.agent_pause_gate.clone() {
-            let _ = gate.wait_until_resumed(None).await;
-        }
+        self.park_if_paused("turn entry").await;
         // 模型配置热更新：turn 边界比对配置代际，变了就重建 model chain。
         self.maybe_reload_models();
         // HIL blackboard: drain per-role inject queue.
@@ -1693,6 +2019,9 @@ impl AgentRunner {
         self.last_turn_tool_summaries.clear();
         use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
+        // wall-clock 起点：与 `turn_start`（单调）配对，用来暴露进程被
+        // 挂起（系统睡眠）的时长——见 TurnEnd 发射处。
+        let turn_start_wall = std::time::SystemTime::now();
         let meta = TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
         let default_vars = serde_json::json!({});
         let vars = system_vars.unwrap_or(&default_vars);
@@ -1752,18 +2081,25 @@ impl AgentRunner {
             est_input_tokens,
         });
 
-        let max_rounds = if self.tool_manager.is_some() {
-            if self.max_tool_rounds == 0 {
-                usize::MAX
-            } else {
-                self.max_tool_rounds
-            }
-        } else {
-            1
-        };
+        // 工具轮次没有硬性上限（对齐 oh-my-pi deadline-only 模式）。
+        // 循环终止靠：
+        //   (1) 模型返回无 tool_calls → break；
+        //   (2) `self.deadline`（`set_deadline` 设置，仅 delegate /
+        //       workflow step 两条路径会设；交互式 chat 不设，超时按设计
+        //       交给人工 ⏸ 或 advisor 叫停）；
+        //   (3) LoopDetector —— 同一工具 + 逐字节相同参数连续
+        //       LOOP_STREAK_THRESHOLD 次即熔断，是**唯一始终生效**的自动
+        //       刹车；
+        //   (4) permanent_streak —— 同一工具连续被确定性校验拒绝
+        //       （参数每次都变，LoopDetector 抓不到）。
+        //
+        // 曾经的第 5 条是 `max_tool_rounds` 硬上限。deadline-only 重构把它
+        // 拿掉后，那个字段只写不读、setter 零调用、`MaxToolRoundsExceeded`
+        // 再没人构造，已连同参数一起删除。若之后要加回 soft warning，
+        // 重新引入即可，别再留一个不生效的字段冒充刹车。
 
         let mut final_response = String::new();
-        // 撞轮次上限时要交出去的 partial 产出。不能直接用
+        // 循环被熔断中止时要交出去的 partial 产出。不能直接用
         // `final_response`：它每轮被覆盖，而最后一轮常常是「只有 tool_call、
         // 没有正文」的一轮，那样 partial 会是空串，前面几十轮写好的正文
         // 白丢。这里只在正文非空时更新，保留「最后一段有实质内容的回复」。
@@ -1774,32 +2110,51 @@ impl AgentRunner {
         // 悬挂工具标记的卫生重试计数（每 turn 至多 1 次）。
         let mut markup_retried: u8 = 0;
 
-        // Per-round "stuck" detector. Each round the model emits one
-        // or more tool calls; we want to catch the case where the
-        // SAME call is duplicated WITHIN that single response (which
-        // `dedupe_tool_calls` already collapses to 1) and the case
-        // where a single call is repeated 3+ times within the same
-        // response (the post-dedup streak).
+        // 死循环探测器：**整个 turn 共用一个**，streak 跨 round 累积。
         //
-        // Cross-round "same call every round" is NOT this detector's
-        // job — it's the supervisor's `dead_loop_window = 3` (see
-        // `RoundScheduler::supervisor.observe(...)`), which pauses
-        // the session when `last_decision_kind()` is the same 3
-        // rounds in a row. The supervisor is the right place for
-        // across-round "manager keeps re-delegating the same task"
-        // because the manager's `run_turn` is called fresh per round
-        // and a fresh `LoopDetector` each round means we don't
-        // double-count legitimate "manager is making progress".
+        // 这是 deadline-only 模式下唯一的自动刹车。轮次上限
+        // 已随死代码删除、`deadline` 只在
+        // delegate / workflow step 两条路径上设置，交互式 chat 不设——
+        // 按设计，超时与叫停交给人工 ⏸ 或 advisor 角色。所以「模型连续
+        // 拿同一条命令+同一份参数反复调工具」必须由这里兜住，别处没有
+        // 兜底了。
         //
-        // The detector is constructed fresh INSIDE the `for round`
-        // loop (line below) so the streak doesn't bleed across
-        // rounds. The original code had `let mut loop_detector =
-        // LoopDetector::default()` here, which caused the 2026-07-10
-        // bug: a manager that delegated the same task 3 rounds in
-        // a row (legit retry pattern) tripped the within-round
-        // detector even though each round was internally fine.
-        for round in 0..max_rounds {
-            let mut loop_detector = LoopDetector::default();
+        // 为什么必须放在循环外：模型通常一轮只发一个工具调用，探测器若
+        // 每轮新建，streak 永远是 1，跨轮死循环一次都测不到——这正是
+        // 之前的状态（构造语句原本在 `loop` 内第一行）。
+        //
+        // 与 2026-07-10 那次「manager 连着 3 轮 delegate 同一任务被误杀」
+        // 不冲突：判定键是 (工具名, **完全相同**的 args_json)，合法重试
+        // 每次都会改参数（重写任务描述），一改就 `streak = 1` 重新计数；
+        // 且阈值当时是 3，现在是 `LOOP_STREAK_THRESHOLD = 5`。真正连续
+        // 5 次逐字节相同的调用，就是死循环而不是进展。
+        //
+        // 注：同一 response 内的重复调用由 `dedupe_tool_calls` 先折叠；
+        // 跨 round 的「manager 反复改派同类任务」（参数每次都变）仍归
+        // supervisor 的 `dead_loop_window = 3` 管，两者互补不重叠。
+        let mut loop_detector = LoopDetector::default();
+        // 跨 round 的「同一工具连续确定性失败」熔断计数：
+        // (工具名, 连续 PermanentExec 次数)。`LoopDetector` 只认参数
+        // **完全相同**的重复调用，而模型每次都会改一点参数再撞同一个
+        // 校验（jemalloc 2026-08-26：manager 连着 3 轮调 plan，每轮重写
+        // 8 个任务 40+ 条 paths，前两次分别撞 paths 重叠和 paths 类型
+        // 错误，每轮烧 100~150s 模型时间），所以需要一个只看
+        // (工具, 失败类别) 的计数器。
+        let mut permanent_streak: (String, usize) = (String::new(), 0);
+        let mut round: usize = 0;
+        loop {
+            // Deadline 检查（对齐 oh-my-pi `isDeadlineExceeded`）：
+            // 每个 model call 前检查，超时时优雅退出、返回已有 partial。
+            if let Some(dl) = self.deadline {
+                if std::time::Instant::now() >= dl {
+                    tracing::info!(round, "deadline exceeded, returning partial output");
+                    if !last_substantive_response.is_empty() {
+                        final_response = last_substantive_response.clone();
+                    }
+                    break;
+                }
+            }
+
             // Advisor monitor (tool-round boundary): hints that landed
             // while the previous round's tools were executing are
             // appended to the working message list, so the model call
@@ -1812,16 +2167,14 @@ impl AgentRunner {
                 // resolve）或 gate 超时自动恢复。恢复后照常 drain
                 // hint——advisor 的纠正提示与用户的拍板决定一起进入
                 // 下一次模型调用。
-                if let Some(gate) = self.pause_gate.clone() {
-                    gate.wait_if_requested().await;
+                if self.pause_gate.is_some() {
+                    self.park_if_advisor_requested().await;
                 }
                 // Session-level 暂停（用户按 ⏸）：每个 model call 之前
                 // park —— 与 entry + tool-exec 边界一起，构成"任何
                 // 状态都能暂停"的完整覆盖。in-flight model stream
                 // 跑完，下个 round 才停。
-                if let Some(gate) = self.agent_pause_gate.clone() {
-                    let _ = gate.wait_until_resumed(None).await;
-                }
+                self.park_if_paused("model call boundary").await;
                 for hint in self.drain_advisor_hints() {
                     messages.push(Message::user(format!("🦉 advisor 监察：\n{hint}")));
                 }
@@ -1843,15 +2196,22 @@ impl AgentRunner {
                 // 空 completion（无文本、无 tool_calls）多为厂商抖动：流式在连接
                 // 建立后无法链式 fallback，拿到空 Done 时整流重试，上限 2 次。
                 let mut empty_retries = 0u8;
+                // 模型全链不可用导致的自动暂停次数（同一次 model call
+                // 内累计），驱动 `pause_wait_model_unavailable` 的退避。
+                let mut unavail_attempt = 0u32;
                 'stream_attempt: loop {
                     let mut rx = loop {
                         match self.agent.chat_stream(&messages, chat_params.as_ref()).await {
                             Ok(rx) => break rx,
                             Err(e @ AgentError::ModelsUnavailable { .. }) => {
                                 let overflow = failures_include_context_overflow(&e);
-                                if !self.pause_wait_model_unavailable(&e).await {
+                                if !self
+                                    .pause_wait_model_unavailable(&e, unavail_attempt)
+                                    .await
+                                {
                                     return Err(e);
                                 }
+                                unavail_attempt = unavail_attempt.saturating_add(1);
                                 // 用户在暂停期间可能已在 UI 改了模型配置：
                                 // 重试前先热更新 chain。
                                 self.maybe_reload_models();
@@ -1919,7 +2279,8 @@ impl AgentRunner {
                 }
             } else {
                 // 非流式模式（默认）：chat() 内部走流式传输 + idle watchdog，对外返回完整 Completion。
-                // 模型全链不可用 → 自动暂停 session 门，等用户「继续」后重试。
+                // 模型全链不可用 → 自动暂停 session 门，退避自动重试 / 等用户「继续」。
+                let mut unavail_attempt = 0u32;
                 loop {
                     // 慢调用可见性：非流式下生成过程没有任何中间事件，
                     // 慢速 trickle 在 UI 上等同卡死（日志事故：glm 大
@@ -1955,9 +2316,13 @@ impl AgentRunner {
                         Ok(c) => break c,
                         Err(e @ AgentError::ModelsUnavailable { .. }) => {
                             let overflow = failures_include_context_overflow(&e);
-                            if !self.pause_wait_model_unavailable(&e).await {
+                            if !self
+                                .pause_wait_model_unavailable(&e, unavail_attempt)
+                                .await
+                            {
                                 return Err(e);
                             }
+                            unavail_attempt = unavail_attempt.saturating_add(1);
                             // 用户在暂停期间可能已在 UI 改了模型配置：
                             // 重试前先热更新 chain。
                             self.maybe_reload_models();
@@ -2209,6 +2574,11 @@ impl AgentRunner {
                                 return Err(AgentError::ToolLoopDetected {
                                     tool: name.clone(),
                                     reason,
+                                    partial: if last_substantive_response.is_empty() {
+                                        final_response.clone()
+                                    } else {
+                                        last_substantive_response.clone()
+                                    },
                                 });
                             }
                         }
@@ -2239,12 +2609,7 @@ impl AgentRunner {
                         }
                     }
 
-                    if round + 1 >= max_rounds {
-                        return Err(AgentError::MaxToolRoundsExceeded {
-                            rounds: max_rounds,
-                            partial: last_substantive_response.clone(),
-                        });
-                    }
+                    round += 1;
                     continue;
                 }
 
@@ -2277,15 +2642,12 @@ impl AgentRunner {
                     // 终止态：Ok(result_str) or Err((kind, detail_str))
                     let mut final_outcome: Result<String, (ToolCallErrorKind, String)> =
                         Err((ToolCallErrorKind::ToolNotFound { tried_aliases: vec![] }, "init".into()));
-                    let mut final_args_json = tc.args.clone();
 
                     while attempt < max_attempts {
                         attempt += 1;
                         // Session-level 暂停：tool 启动前 park（in-flight
                         // tool 跑完才停，下一个 tool 启动前才看 gate）。
-                        if let Some(gate) = self.agent_pause_gate.clone() {
-                            let _ = gate.wait_until_resumed(None).await;
-                        }
+                        self.park_if_paused("tool exec boundary").await;
                         // 1. parse args。native 协议下模型输出的是合法 JSON；
                         // 若 latte-ai 层解析失败，arguments_raw 保留原始坏串，
                         // 这里 from_str 会失败并归类为 MalformedArgs。
@@ -2363,13 +2725,20 @@ impl AgentRunner {
                         let tool_latency = tool_start.elapsed().as_millis() as u64;
                         let args_json = serde_json::to_string(&input)
                             .unwrap_or_else(|_| tc.args.clone());
-                        final_args_json = args_json.clone();
-
                         // 4. Loop detection（per-args 哈希，与 retry 无关）
                         if let LoopDecision::Break(reason) = loop_detector.record(&tc.name, &args_json) {
+                            // 带出已产出正文：熔断是「模型卡住了」，不是
+                            // 「什么都没做出来」。上层 workflow / delegate
+                            // 靠这份 partial 降级采纳，丢了它就等于把前面
+                            // 几十轮的成果一起扔掉。
                             return Err(AgentError::ToolLoopDetected {
                                 tool: tc.name.clone(),
                                 reason,
+                                partial: if last_substantive_response.is_empty() {
+                                    final_response.clone()
+                                } else {
+                                    last_substantive_response.clone()
+                                },
                             });
                         }
                         match exec_result {
@@ -2489,9 +2858,12 @@ impl AgentRunner {
                     //    (name, args) 模糊匹配找 id。
                     match final_outcome {
                         Ok(result_str) => {
+                            if permanent_streak.0 == tc.name {
+                                permanent_streak = (String::new(), 0);
+                            }
                             messages.push(Message::tool_result(tc.id.clone(), result_str));
                         }
-                        Err((_kind, detail)) => {
+                        Err((kind, detail)) => {
                             // 成功失败都必须回填 tool_result：native 协议要求
                             // 每个 tool_call_id 都有对应 tool 消息，缺一条
                             // deepseek 系 API 下一轮直接 400（"tool_calls
@@ -2513,23 +2885,83 @@ impl AgentRunner {
                                 detail
                             };
                             messages.push(Message::tool_result(tc.id.clone(), truncated));
+                            // 熔断：同一工具连续被确定性校验拒绝。
+                            // NUDGE_AT 次 → 追加一条硬指令，让模型停手
+                            // 换路径（此时它已经证明自己修不好这份输入）；
+                            // BREAK_AT 次 → 判死循环退出，避免整个 turn
+                            // 烧在一个工具的输入格式上。
+                            if matches!(kind, ToolCallErrorKind::PermanentExec { .. }) {
+                                if permanent_streak.0 == tc.name {
+                                    permanent_streak.1 += 1;
+                                } else {
+                                    permanent_streak = (tc.name.clone(), 1);
+                                }
+                                const NUDGE_AT: usize = PERMANENT_NUDGE_AT;
+                                const BREAK_AT: usize = PERMANENT_BREAK_AT;
+                                if permanent_streak.1 >= BREAK_AT {
+                                    return Err(AgentError::ToolLoopDetected {
+                                        tool: tc.name.clone(),
+                                        reason: format!(
+                                            "'{}' 连续 {} 次因输入校验被拒（每次参数都不同），\
+                                             模型无法自行修正，停止重试",
+                                            tc.name, permanent_streak.1
+                                        ),
+                                        partial: if last_substantive_response.is_empty() {
+                                            final_response.clone()
+                                        } else {
+                                            last_substantive_response.clone()
+                                        },
+                                    });
+                                }
+                                if permanent_streak.1 == NUDGE_AT {
+                                    messages.push(Message::user(format!(
+                                        "⚠️ `{}` 已连续 {} 次因输入校验失败被拒。不要再用同一个\
+                                         工具反复试：要么换一条路径完成任务，要么把当前进展和\
+                                         卡点直接讲给用户。",
+                                        tc.name, permanent_streak.1
+                                    )));
+                                }
+                            } else if permanent_streak.0 == tc.name {
+                                permanent_streak = (String::new(), 0);
+                            }
                         }
                     }
                 }
             }
 
-            if round + 1 >= max_rounds {
-                return Err(AgentError::MaxToolRoundsExceeded {
-                            rounds: max_rounds,
-                            partial: last_substantive_response.clone(),
-                        });
-            }
+            round += 1;
         }
 
         // 5. Emit TurnEnd
-        let elapsed_ms = turn_start.elapsed().as_millis() as u64;
+        //
+        // elapsed_ms 用 **wall-clock**：`Instant` 在 macOS 上不含系统
+        // 睡眠时间，只用它会让 turn 看起来比实际短得多（jemalloc
+        // 2026-08-26 会话：manager 的 turn 真实跨度 67 分钟，单调时钟
+        // 只有 28.7 分钟——差的 38 分钟是合盖睡眠。当时 TurnEnd 报的是
+        // 单调值，于是"trace 里没有任何事件的 38 分钟空洞"既没有事件
+        // 也没有时长佐证，只能靠翻 pmset 日志才定位）。
+        // 单调值同时保留在下面的 suspended 判定里：两者的差就是进程
+        // 被挂起（睡眠 / SIGSTOP）的时长，超过 60s 就 warn 出来。
+        let mono_elapsed = turn_start.elapsed();
+        let wall_elapsed = turn_start_wall
+            .elapsed()
+            .unwrap_or(mono_elapsed)
+            .max(mono_elapsed);
+        let suspended = wall_elapsed.saturating_sub(mono_elapsed);
+        if suspended.as_secs() >= 60 {
+            tracing::warn!(
+                "turn 期间进程被挂起约 {}s（系统睡眠/SIGSTOP）：wall {}s vs 运行 {}s——\
+                 trace 上这段时间不会有任何事件，属正常现象",
+                suspended.as_secs(),
+                wall_elapsed.as_secs(),
+                mono_elapsed.as_secs(),
+            );
+        }
+        let elapsed_ms = wall_elapsed.as_millis() as u64;
         self.sink.emit(TraceEvent::TurnEnd {
-            meta,
+            // 结束时刻的 meta —— 此前复用 turn 起始 meta，TurnEnd.ts
+            // 指向 turn 开头，时间线上看像是 turn 刚开始就结束了。
+            meta: meta.refreshed(),
             total_input,
             total_output,
             total_thinking,
@@ -3612,7 +4044,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
             g2.resume();
         });
-        let retry = runner.pause_wait_model_unavailable(&err).await;
+        let retry = runner.pause_wait_model_unavailable(&err, 0).await;
         assert!(retry, "resume 后应返回 true（重试）");
         assert!(!gate.is_paused(), "resume 后门已放开");
     }
@@ -3633,7 +4065,7 @@ mod tests {
             failures: vec![],
             next_retry_in: None,
         };
-        assert!(!runner.pause_wait_model_unavailable(&err).await);
+        assert!(!runner.pause_wait_model_unavailable(&err, 0).await);
     }
 
     /// 自动暂停期间原因可读（Paused 事件的数据源）。
@@ -3664,7 +4096,7 @@ mod tests {
             assert!(reason.contains("m1"), "{reason}");
             g2.resume();
         });
-        assert!(runner.pause_wait_model_unavailable(&err).await);
+        assert!(runner.pause_wait_model_unavailable(&err, 0).await);
     }
 
     #[tokio::test]
@@ -3851,6 +4283,245 @@ mod tests {
             .filter(|e| matches!(e, TraceEvent::ModelCallSlow { .. }))
             .count();
         assert_eq!(slows, 1, "应恰好发一次慢调用提示，events: {}", events.len());
+    }
+
+    /// 同一工具连续被确定性校验拒绝 → 先追加硬指令，再熔断。
+    ///
+    /// 回归 jemalloc 2026-08-26 事故：manager 连着 3 轮调 `plan`，每轮
+    /// 都改一点参数再撞同一类校验（`LoopDetector` 只认参数完全相同的
+    /// 重复调用，所以毫无反应），每轮烧 100~150s 模型时间。
+    #[tokio::test]
+    async fn consecutive_permanent_tool_failures_break_the_loop() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 永远以"确定性输入错误"失败的工具（"is required" 命中
+        // classify_tool_execution_error 的 PERMANENT 列表）。
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move {
+                Err(latte_rs_agent_tools::error::ToolError::other(
+                    "title is required",
+                ))
+            })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("plan", "test plan", schema, handler).build(),
+            None,
+        );
+
+        let server = wiremock::MockServer::start().await;
+        // **每轮参数都不同** —— 这是 permanent_streak 存在的理由，也是
+        // 本测试与死循环熔断的分工：`LoopDetector` 只认逐字节相同的重复
+        // 调用，参数一变它就清零，于是「每轮改一点参数、反复撞同一类
+        // 校验」这种烧钱模式只有 permanent_streak 能抓。
+        //
+        // 桩必须变参数，否则 LoopDetector 会在第 5 次先行熔断，
+        // permanent_streak 的 BREAK_AT(8) 永远走不到。
+        for i in 0..(PERMANENT_BREAK_AT + 1) {
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body(
+                                "",
+                                vec![serde_json::json!({
+                                    "id": format!("call_plan_{i}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": "plan",
+                                        // 参数每轮不同，但都会撞同一个
+                                        // "title is required" 校验。
+                                        "arguments": format!("{{\"seq\":{i}}}")
+                                    }
+                                })],
+                            ),
+                        ))
+                        .up_to_n_times(1),
+                )
+                .await;
+        }
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        // 轮次上限已退化为 soft warning，这里给 0（不限），让
+        // permanent_streak 成为唯一出口。
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+
+        let err = runner
+            .run_turn(&[Message::user("go")], None)
+            .await
+            .expect_err("连续确定性失败应熔断");
+        match err {
+            AgentError::ToolLoopDetected { tool, reason, .. } => {
+                assert_eq!(tool, "plan");
+                assert!(
+                    reason.contains(&format!("连续 {PERMANENT_BREAK_AT} 次")),
+                    "应报 permanent_streak 的熔断（而非同参数死循环）: {reason}"
+                );
+                assert!(
+                    reason.contains("每次参数都不同"),
+                    "要说明是变参数撞同一校验: {reason}"
+                );
+            }
+            other => panic!("应判 ToolLoopDetected，实际 {other:?}"),
+        }
+
+        // 第 NUDGE_AT 次失败后的下一个请求必须带上"别再调这个工具"的硬指令。
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(
+            reqs.len(),
+            PERMANENT_BREAK_AT,
+            "{PERMANENT_BREAK_AT} 次失败 = {PERMANENT_BREAK_AT} 个模型请求"
+        );
+        let nudged = String::from_utf8_lossy(&reqs[PERMANENT_NUDGE_AT].body);
+        assert!(
+            nudged.contains(&format!("已连续 {PERMANENT_NUDGE_AT} 次因输入校验失败被拒")),
+            "第 {} 个请求应带熔断前的硬指令: {nudged}",
+            PERMANENT_NUDGE_AT + 1
+        );
+        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        assert!(
+            !body2.contains("已连续"),
+            "第 2 个请求还没到 3 次，不该有指令"
+        );
+    }
+
+    /// session 暂停门 park 必须在 trace 上留痕（进 SessionPaused、出
+    /// SessionResumed）。
+    ///
+    /// 回归 jemalloc 2026-08-26 会话：3 个 park 点都是裸
+    /// `wait_until_resumed(None)`，park 期间 trace 一个事件都没有，
+    /// 事后无法区分"暂停 / 限流 / 死锁"。
+    #[tokio::test]
+    async fn park_emits_session_paused_and_resumed() {
+        use crate::trace::{TraceEvent, TraceSink};
+
+        struct VecSink(parking_lot::Mutex<Vec<TraceEvent>>);
+        impl TraceSink for VecSink {
+            fn emit(&self, e: TraceEvent) {
+                self.0.lock().push(e);
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let sink = Arc::new(VecSink(parking_lot::Mutex::new(vec![])));
+        let gate = crate::pause_gate::AgentPauseGate::new("test");
+        let runner = AgentRunner::new(agent)
+            .with_sink(sink.clone() as Arc<dyn TraceSink>)
+            .with_agent_pause_gate(gate.clone());
+
+        // 未暂停 → 不产生任何事件，也不阻塞。
+        runner.park_if_paused("noop").await;
+        assert!(sink.0.lock().is_empty(), "没暂停就不该发事件");
+
+        gate.pause_with_reason("用户按了 ⏸");
+        let g = gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            g.resume();
+        });
+        runner.park_if_paused("tool exec boundary").await;
+
+        let events = sink.0.lock();
+        let paused = events.iter().find_map(|e| match e {
+            TraceEvent::SessionPaused { reason, .. } => Some(reason.clone()),
+            _ => None,
+        });
+        let reason = paused.expect("应发 SessionPaused");
+        assert!(reason.contains("tool exec boundary"), "reason: {reason}");
+        assert!(reason.contains("用户按了 ⏸"), "应带上门的暂停原因: {reason}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TraceEvent::SessionResumed { .. })),
+            "恢复后应发 SessionResumed"
+        );
+    }
+
+    /// TurnEnd 必须用结束时刻的 meta（此前复用 turn 起始 meta，时间线上
+    /// 看起来 turn 刚开始就结束了），且 elapsed_ms 是 wall-clock。
+    #[tokio::test]
+    async fn turn_end_uses_end_timestamp() {
+        use crate::trace::{TraceEvent, TraceSink};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        struct VecSink(parking_lot::Mutex<Vec<TraceEvent>>);
+        impl TraceSink for VecSink {
+            fn emit(&self, e: TraceEvent) {
+                self.0.lock().push(e);
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(Duration::from_millis(1200))
+                            .set_body_string(openai_completion_body("done", vec![])),
+                    ),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let sink = Arc::new(VecSink(parking_lot::Mutex::new(vec![])));
+        let mut runner = AgentRunner::new(agent).with_sink(sink.clone() as Arc<dyn TraceSink>);
+        runner.run_turn(&[Message::user("hi")], None).await.unwrap();
+
+        let events = sink.0.lock();
+        let built = events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::PromptBuilt { meta, .. } => Some(meta.ts.clone()),
+                _ => None,
+            })
+            .expect("PromptBuilt");
+        let (end_ts, elapsed) = events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::TurnEnd { meta, elapsed_ms, .. } => {
+                    Some((meta.ts.clone(), *elapsed_ms))
+                }
+                _ => None,
+            })
+            .expect("TurnEnd");
+        assert!(
+            end_ts >= built,
+            "TurnEnd.ts({end_ts}) 不能早于 PromptBuilt.ts({built})"
+        );
+        assert!(elapsed >= 1200, "elapsed_ms 应覆盖真实耗时，实际 {elapsed}");
     }
 
     #[tokio::test]
@@ -4328,34 +4999,44 @@ mod tests {
     #[test]
     fn loop_detector_breaks_on_repeated_calls() {
         let mut d = LoopDetector::default();
-        // First two calls don't trip the threshold.
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        // Third identical call trips. The reason string should
-        // name the offending tool so the user can act on it.
+        // 前 4 次同样的调用还够不上阈值（LOOP_STREAK_THRESHOLD = 5）。
+        for _ in 0..4 {
+            assert!(matches!(
+                d.record("read", "{\"path\":\"a.rs\"}"),
+                LoopDecision::Continue
+            ));
+        }
+        // 第 5 次同样的调用触发。reason 要点名肇事工具，用户才能据此处理。
         let decision = d.record("read", "{\"path\":\"a.rs\"}");
         match decision {
             LoopDecision::Break(reason) => {
                 assert!(reason.contains("read"),
                     "break reason should name the offending tool, got: {reason}");
             }
-            LoopDecision::Continue => panic!("expected Break on third identical call"),
+            LoopDecision::Continue => panic!("expected Break on 5th identical call"),
         }
     }
 
     #[test]
     fn loop_detector_resets_on_different_call() {
         let mut d = LoopDetector::default();
-        // Build up a near-streak with the same call.
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        // A different call resets the streak.
+        // 先攒一段接近阈值的连击。
+        for _ in 0..4 {
+            assert!(matches!(
+                d.record("read", "{\"path\":\"a.rs\"}"),
+                LoopDecision::Continue
+            ));
+        }
+        // 换一个调用把连击清零 —— 这正是「改了参数就是有进展」的语义。
         assert!(matches!(d.record("search", "{\"path\":\".\"}"), LoopDecision::Continue));
-        // Now two `read` calls in a row — the counter starts at 1,
-        // then 2; still below the threshold.
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        // Third consecutive after the reset trips.
+        // 重新计数：接下来 4 次仍在阈值之下。
+        for _ in 0..4 {
+            assert!(matches!(
+                d.record("read", "{\"path\":\"a.rs\"}"),
+                LoopDecision::Continue
+            ));
+        }
+        // 清零后的第 5 次连续调用才触发。
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Break(_)));
     }
 
@@ -4490,14 +5171,21 @@ mod tests {
         let tm = create_tool_manager();
         tm.register(tool, None);
 
-        // The stub model always answers with the same tool call, so
-        // the turn ping-pongs through tool rounds. Note: the
-        // LoopDetector is constructed fresh *per round* (see the
-        // 2026-07-10 fix in run_turn), so cross-round repetition is
-        // NOT broken by it — the turn ends via MaxToolRoundsExceeded.
-        // That still gives us several round-boundary drains to
-        // observe.
+        // 桩模型：前 3 次返回同一个 tool call，让 turn 在工具轮次里
+        // 打乒乓（这样才有 round 边界可观察）；第 4 次返回纯文本，
+        // turn 自然收尾。
+        //
+        // 终止方式为什么不靠轮次上限：`max_tool_rounds` 已改为
+        // deadline-only 模式下的 soft warning，不再硬中止（见 run_turn
+        // 里的说明），`MaxToolRoundsExceeded` 也不再被构造。本测试要验
+        // 的是「hint 在工具循环中途就下发到模型」，终止手段无关紧要，
+        // 所以改用响应序列——比挂 deadline 更确定，也不留超时抖动。
+        //
+        // 注意 LoopDetector 是**每轮**新建的（见 run_turn 里 2026-07-10
+        // 的修复），跨轮重复不会被它熔断，所以这里必须由桩自己收尾。
         let server = wiremock::MockServer::start().await;
+        // 先挂 tool_call 桩：wiremock 中**先挂载的优先匹配**，这条
+        // up_to_n_times(3) 耗尽后才落到后面的收尾 mock。
         server
             .register(
                 Mock::given(method("POST"))
@@ -4513,6 +5201,16 @@ mod tests {
                                 }
                             })
                         ]),
+                    ))
+                    .up_to_n_times(3),
+            )
+            .await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("收尾产出", vec![]),
                     )),
             )
             .await;
@@ -4525,19 +5223,13 @@ mod tests {
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new_with_tools(agent, tm, 4).with_advisor_hints(hints);
+        let mut runner = AgentRunner::new_with_tools(agent, tm).with_advisor_hints(hints);
 
-        let err = runner
-            .run_turn(
-                &[Message::user("go")],
-                None,
-            )
+        let out = runner
+            .run_turn(&[Message::user("go")], None)
             .await
-            .expect_err("repeated tool calls hit the round cap");
-        assert!(
-            matches!(err, AgentError::MaxToolRoundsExceeded { rounds: 4, .. }),
-            "got {err:?}"
-        );
+            .expect("桩模型第 4 次返回纯文本，turn 应正常收尾");
+        assert_eq!(out.trim(), "收尾产出", "最终产出应来自收尾那一轮");
 
         // Round 0 produced request #1 and executed the tool (which
         // pushed a hint); the round-1 boundary drain must make
@@ -4556,15 +5248,20 @@ mod tests {
         assert!(!body1.contains("🦉 advisor 监察"));
     }
 
-    /// 回归防线：撞工具轮次上限时，`MaxToolRoundsExceeded` 必须把模型
-    /// 已产出的正文作为 `partial` 交出来。
+    /// 回归防线：**循环被自动刹车中止时，模型已产出的正文必须作为
+    /// `partial` 交出来。**
     ///
     /// 事故背景（jemalloc）：estimate 步跑了 105 轮，最后一条回复是完整
-    /// 的验证结论，但该错误当时只带一个轮次数字，上层拿不到任何产出，
+    /// 的验证结论，但中止错误当时只带一个轮次数字，上层拿不到任何产出，
     /// 于是 step 失败 → 嵌套 workflow 失败 → 父 workflow 失败，3 小时
     /// 零产出。partial 是 workflow / delegate 两条降级路径的唯一输入。
+    ///
+    /// 本测试原先断言 `MaxToolRoundsExceeded`。deadline-only 模式下轮次
+    /// 上限已退化为 soft warning、该错误不再被构造，实际生效的刹车是
+    /// **同参数死循环熔断**（`ToolLoopDetected`）——所以防线必须挪到它
+    /// 身上，否则「唯一会触发的刹车恰好不带 partial」，事故原样复发。
     #[tokio::test]
-    async fn max_tool_rounds_error_carries_partial_output() {
+    async fn tool_loop_error_carries_partial_output() {
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -4587,8 +5284,8 @@ mod tests {
             None,
         );
 
-        // 每轮都「有正文 + 有 tool_call」——正是事故里的形态：模型边写
-        // 结论边继续调工具，最终撞上限。
+        // 每轮都「有正文 + 有完全相同的 tool_call」——正是事故里的形态：
+        // 模型边写结论边反复调同一个工具，最终被死循环熔断。
         const PROSE: &str = "refill_produced=65 已核对，语义符合预期";
         let server = wiremock::MockServer::start().await;
         server
@@ -4615,27 +5312,382 @@ mod tests {
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new_with_tools(agent, tm, 3);
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
 
         let err = runner
             .run_turn(&[Message::user("go")], None)
             .await
-            .expect_err("应撞上工具轮次上限");
+            .expect_err("同参数反复调用应被死循环熔断");
         match &err {
-            AgentError::MaxToolRoundsExceeded { rounds, partial } => {
-                assert_eq!(*rounds, 3);
+            AgentError::ToolLoopDetected {
+                tool,
+                reason,
+                partial,
+            } => {
+                assert_eq!(tool, "ping");
+                assert!(
+                    reason.contains("identical args"),
+                    "原因要说明是同参数重复: {reason}"
+                );
                 assert!(
                     partial.contains(PROSE),
                     "partial 必须携带模型已产出的正文，实际: {partial:?}"
                 );
             }
-            other => panic!("期望 MaxToolRoundsExceeded，实际 {other:?}"),
+            other => panic!("期望 ToolLoopDetected，实际 {other:?}"),
         }
         // Display 只报规模、不倒正文（错误串会回填给模型）。
         let msg = err.to_string();
-        assert!(msg.contains("max tool rounds (3) exceeded"), "msg = {msg}");
+        assert!(msg.contains("tool loop detected"), "msg = {msg}");
         assert!(msg.contains("可降级采纳"), "msg 应提示可降级: {msg}");
         assert!(!msg.contains(PROSE), "Display 不应内联正文: {msg}");
+    }
+
+    /// 核心保证：**跨 round 的同参数死循环必须被抓到。**
+    ///
+    /// deadline-only 模式下这是唯一的自动刹车——轮次上限已退化为 soft
+    /// warning，`deadline` 只在 delegate / workflow step 上设置（交互式
+    /// chat 不设，超时与叫停按设计交给人工 ⏸ 或 advisor）。
+    ///
+    /// 回归对象：`LoopDetector` 曾被构造在 round 循环**内部**，每轮重置。
+    /// 模型一轮通常只发一个工具调用，于是 streak 永远是 1，跨轮死循环
+    /// 一次都测不到——刹车形同虚设，turn 会无限空转（本测试在修复前会
+    /// 一直打 wiremock 直到外层超时）。
+    ///
+    /// 断言「模型每轮发一个完全相同的调用」这一最常见形态：连续
+    /// `LOOP_STREAK_THRESHOLD`(5) 轮后熔断，且点名肇事工具。
+    #[tokio::test]
+    async fn identical_tool_call_across_rounds_trips_loop_detector() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("spin", "always same", schema, handler).build(),
+            None,
+        );
+
+        // 每轮**一个**调用、参数逐字节相同 —— 探测器若按轮重置就永远
+        // 抓不到（streak 恒为 1）。
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body(
+                            "",
+                            vec![serde_json::json!({
+                                "id": "call_spin",
+                                "type": "function",
+                                "function": { "name": "spin", "arguments": "{\"k\":1}" }
+                            })],
+                        ),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        // 注意：不设 deadline、轮次上限给 0（=不限），刻意让死循环
+        // 探测器成为唯一出口。
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            runner.run_turn(&[Message::user("go")], None),
+        )
+        .await
+        .expect("必须由死循环熔断收尾，而不是无限空转到外层超时")
+        .expect_err("同参数跨轮重复应被熔断");
+
+        match &err {
+            AgentError::ToolLoopDetected { tool, reason, .. } => {
+                assert_eq!(tool, "spin", "要点名肇事工具");
+                assert!(
+                    reason.contains("5 times in a row"),
+                    "应在第 5 次连续相同调用时熔断: {reason}"
+                );
+            }
+            other => panic!("期望 ToolLoopDetected，实际 {other:?}"),
+        }
+        // 熔断要快：5 轮就够，不该把几十轮 model call 都烧掉。
+        let n = server.received_requests().await.unwrap().len();
+        assert!(
+            (5..=7).contains(&n),
+            "应在 ~5 轮内熔断，实际发了 {n} 次 model call"
+        );
+    }
+
+    /// 反向防线：参数**每次都变**的连续调用不是死循环，不得误杀。
+    ///
+    /// 对应 2026-07-10 那次事故：manager 连着几轮 delegate「同一类」任务
+    /// （每次重写任务描述）被当成死循环打断。判定键含 args_json，改参数
+    /// 就该重新计数——这条测试把该语义钉住，防止有人为了「更严格」把
+    /// 判定放宽成只看工具名。
+    #[tokio::test]
+    async fn varying_args_across_rounds_do_not_trip_loop_detector() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("step", "varying", schema, handler).build(),
+            None,
+        );
+
+        let server = wiremock::MockServer::start().await;
+        // 6 轮，每轮参数都不同（> 阈值 5），最后一轮返回纯文本收尾。
+        for i in 0..6 {
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body(
+                                "",
+                                vec![serde_json::json!({
+                                    "id": format!("call_{i}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": "step",
+                                        "arguments": format!("{{\"i\":{i}}}")
+                                    }
+                                })],
+                            ),
+                        ))
+                        .up_to_n_times(1),
+                )
+                .await;
+        }
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("按步骤走完了", vec![]),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            runner.run_turn(&[Message::user("go")], None),
+        )
+        .await
+        .expect("不该挂住")
+        .expect("参数每轮都变，不是死循环，不得熔断");
+        assert_eq!(out.trim(), "按步骤走完了");
+    }
+
+    /// 核心保证（规则 2）：**A-B-A-B 交替打转必须被抓到。**
+    ///
+    /// 只有连击规则时这里是个洞：每次调用都与上一次不同 → `streak` 恒为
+    /// 1 → 永不熔断。而交互式 chat 既无轮次上限也不设 deadline，模型这么
+    /// 跳就是无限空转。
+    #[test]
+    fn loop_detector_breaks_on_alternating_cycle() {
+        let mut d = LoopDetector::default();
+        let a = ("read", r#"{"path":"a.rs"}"#);
+        let b = ("search", r#"{"pattern":"foo"}"#);
+        // 前 7 次都不该触发：连击恒为 1，窗口也还没填满。
+        for i in 0..7 {
+            let (t, args) = if i % 2 == 0 { a } else { b };
+            assert!(
+                matches!(d.record(t, args), LoopDecision::Continue),
+                "第 {i} 次不该熔断（连击恒为 1，窗口未满）"
+            );
+        }
+        // 第 8 次填满窗口：只有 2 种 key、每种都重复出现 → 判打转。
+        let (t, args) = a;
+        match d.record(t, args) {
+            LoopDecision::Break(reason) => {
+                assert!(reason.contains("来回打转"), "reason: {reason}");
+                assert!(reason.contains("read"), "要点出参与打转的工具: {reason}");
+                assert!(reason.contains("search"), "两个工具都要点出: {reason}");
+            }
+            LoopDecision::Continue => panic!("窗口填满后应判打转"),
+        }
+    }
+
+    /// 反向防线一：窗口里夹一个**孤立**的别的调用，不算打转。
+    ///
+    /// 这是被打断的连击（规则 1 的辖区），不是环。少了
+    /// `LOOP_CYCLE_MIN_EACH` 这条，`loop_detector_resets_on_different_call`
+    /// 描述的正常语义会被规则 2 误杀。
+    #[test]
+    fn loop_detector_isolated_odd_call_is_not_a_cycle() {
+        let mut d = LoopDetector::default();
+        // read×4（连击到 4，未达 5）→ search×1 清零 → read×3。
+        // 窗口 8 项里 read×7 + search×1：search 只出现 1 次，不构成环。
+        for _ in 0..4 {
+            assert!(matches!(
+                d.record("read", r#"{"path":"a.rs"}"#),
+                LoopDecision::Continue
+            ));
+        }
+        assert!(matches!(
+            d.record("search", r#"{"pattern":"x"}"#),
+            LoopDecision::Continue
+        ));
+        for i in 0..3 {
+            assert!(
+                matches!(d.record("read", r#"{"path":"a.rs"}"#), LoopDecision::Continue),
+                "第 {i} 次 read 不该被判打转（search 只出现 1 次）"
+            );
+        }
+    }
+
+    /// 反向防线二：「读 → 改 → 读验证」这类交替是**正常进展**，不得误杀。
+    ///
+    /// 关键在 edit 的参数每次都不同（写入的内容在变），窗口里的 key 种类
+    /// 因此远超 2，规则 2 不会触发。
+    #[test]
+    fn loop_detector_read_edit_verify_cycle_is_progress() {
+        let mut d = LoopDetector::default();
+        for i in 0..4 {
+            // 读同一个文件（参数相同）——改完要复核，这是正常的。
+            assert!(
+                matches!(d.record("read", r#"{"path":"a.rs"}"#), LoopDecision::Continue),
+                "第 {i} 轮 read 不该熔断"
+            );
+            // 每次写入不同内容 → 不同 key。
+            assert!(
+                matches!(
+                    d.record("edit", &format!(r#"{{"path":"a.rs","content":"v{i}"}}"#)),
+                    LoopDecision::Continue
+                ),
+                "第 {i} 轮 edit 不该熔断"
+            );
+        }
+    }
+
+    /// 端到端：模型跨 round 在两个工具之间来回跳 → 由打转规则收尾。
+    ///
+    /// 不设 deadline、不设轮次上限，刻意让死循环熔断成为唯一出口。
+    #[tokio::test]
+    async fn alternating_tool_calls_across_rounds_trip_loop_detector() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let tm = create_tool_manager();
+        for name in ["ping", "pong"] {
+            let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+                Box::pin(async move { Ok(serde_json::json!({ "ok": true })) })
+            });
+            tm.register(
+                Tool::builder(
+                    name,
+                    "alt",
+                    ToolInputSchema {
+                        schema_type: SchemaType,
+                        properties: Default::default(),
+                        required: None,
+                        additional_properties: None,
+                    },
+                    handler,
+                )
+                .build(),
+                None,
+            );
+        }
+
+        // 桩模型交替返回 ping / pong，参数恒定 —— 连击规则抓不到。
+        let server = wiremock::MockServer::start().await;
+        for i in 0..(LOOP_WINDOW_SIZE + 2) {
+            let name = if i % 2 == 0 { "ping" } else { "pong" };
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body(
+                                "",
+                                vec![serde_json::json!({
+                                    "id": format!("call_{i}"),
+                                    "type": "function",
+                                    "function": { "name": name, "arguments": "{}" }
+                                })],
+                            ),
+                        ))
+                        .up_to_n_times(1),
+                )
+                .await;
+        }
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            runner.run_turn(&[Message::user("go")], None),
+        )
+        .await
+        .expect("必须由打转熔断收尾，而不是无限空转到外层超时")
+        .expect_err("交替调用应被判打转");
+
+        match &err {
+            AgentError::ToolLoopDetected { reason, .. } => {
+                assert!(reason.contains("来回打转"), "reason: {reason}");
+            }
+            other => panic!("期望 ToolLoopDetected，实际 {other:?}"),
+        }
+        // 窗口 8 就该收手，不能烧到十几轮。
+        let n = server.received_requests().await.unwrap().len();
+        assert!(
+            (LOOP_WINDOW_SIZE..=LOOP_WINDOW_SIZE + 2).contains(&n),
+            "应在窗口填满时熔断，实际发了 {n} 次 model call"
+        );
     }
 
     /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板
@@ -4680,7 +5732,7 @@ mod tests {
         tm.register(tool, None);
 
         // 恒定返回同一 tool call，turn 在工具循环里打乒乓；若 pause
-        // gate 不生效，turn 会迅速撞 MaxToolRoundsExceeded(4)。
+        // gate 不生效，turn 会迅速撞死循环熔断（同参数连续 5 次）。
         let server = wiremock::MockServer::start().await;
         server
             .register(
@@ -4709,7 +5761,7 @@ mod tests {
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new_with_tools(agent, tm, 4).with_pause_gate(gate.clone());
+        let mut runner = AgentRunner::new_with_tools(agent, tm).with_pause_gate(gate.clone());
 
         let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
 
@@ -4731,17 +5783,30 @@ mod tests {
             server.received_requests().await.unwrap().len()
         );
 
-        // 用户拍板（继续）→ resolve → turn 恢复并跑完（撞 round 上限）。
+        // 用户拍板（继续）→ resolve → turn 恢复并继续跑工具循环，
+        // 最终由死循环探测器收尾：桩模型每轮都发**逐字节相同**的
+        // `ping {}`，连续 5 次即熔断。
+        //
+        // 这里原本断言 `MaxToolRoundsExceeded { rounds: 4 }`。轮次上限
+        // 在 deadline-only 模式下已退化为 soft warning、该错误也不再被
+        // 构造，所以改断言死循环熔断——它现在是这条路径上唯一的自动
+        // 刹车（本测试没设 deadline，也没有人工 ⏸）。
         gate.resolve();
         let err = tokio::time::timeout(std::time::Duration::from_secs(10), turn)
             .await
             .expect("turn resumes after resolve")
             .unwrap()
-            .expect_err("repeated tool calls hit the round cap");
-        assert!(
-            matches!(err, AgentError::MaxToolRoundsExceeded { rounds: 4, .. }),
-            "got {err:?}"
-        );
+            .expect_err("identical repeated tool calls trip the loop detector");
+        match err {
+            AgentError::ToolLoopDetected { tool, reason, .. } => {
+                assert_eq!(tool, "ping", "熔断要点名肇事工具");
+                assert!(
+                    reason.contains("identical args"),
+                    "原因要说明是同参数重复: {reason}"
+                );
+            }
+            other => panic!("期望 ToolLoopDetected，实际 {other:?}"),
+        }
         assert!(
             server.received_requests().await.unwrap().len() >= 2,
             "tool loop continued after resume"
@@ -4776,7 +5841,7 @@ mod tests {
         // Pre-pause（模拟用户先按 ⏸ 后才发消息）。
         gate.pause();
         let mut runner =
-            AgentRunner::new_with_tools(agent, tm, 4).with_agent_pause_gate(gate.clone());
+            AgentRunner::new_with_tools(agent, tm).with_agent_pause_gate(gate.clone());
         let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
         // 200ms 后仍不完成（gate 在 park）。
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -4856,7 +5921,7 @@ mod tests {
         )
         .unwrap();
         let mut runner =
-            AgentRunner::new_with_tools(agent, tm, 4).with_agent_pause_gate(gate.clone());
+            AgentRunner::new_with_tools(agent, tm).with_agent_pause_gate(gate.clone());
         let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
         // 第一个 tool 已启动、in-flight 会跑完，但 tool 内部 engage
         // 了 gate → 下个 model call 边界 park。
@@ -4966,7 +6031,7 @@ mod tests {
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new_with_tools(agent, tm, 4);
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
 
         let resp = runner
             .run_turn(
@@ -5259,7 +6324,7 @@ mod tests {
                 GenerateParams::default(),
             )
             .unwrap();
-            let mut runner = AgentRunner::new_with_tools(agent, tm, 4);
+            let mut runner = AgentRunner::new_with_tools(agent, tm);
             let resp = runner
                 .run_turn(&[Message::user("go")], None)
                 .await
@@ -5526,48 +6591,60 @@ mod tests {
 
     // ─── LoopDetector 报数修正测试 ───────────────────────────────────
     //
-    // 历史 bug：第 3 次相同调用触发 Break 时，错误消息里写成
-    // "called 4 times in a row"（`self.streak + 1` 多算了 1）。
-    // 修正后第 3 次触发应该是 "called 3 times in a row"。
+    // 历史 bug：触发 Break 时错误消息把次数多算 1（`self.streak + 1`）。
+    // 修正后报的次数必须与实际连续调用次数一致。
 
     #[test]
     fn loop_detector_break_message_count_matches_actual_call() {
         let mut d = LoopDetector::default();
-        let _ = d.record("delegate", r#"{"role":"programmer","task":"pwd"}"#);
-        let _ = d.record("delegate", r#"{"role":"programmer","task":"pwd"}"#);
-        let decision = d.record("delegate", r#"{"role":"programmer","task":"pwd"}"#);
+        let payload = r#"{"role":"programmer","task":"pwd"}"#;
+        // 阈值 = LOOP_STREAK_THRESHOLD(5)，前 4 次不触发。
+        for _ in 0..4 {
+            let _ = d.record("delegate", payload);
+        }
+        let decision = d.record("delegate", payload);
         match decision {
             LoopDecision::Break(reason) => {
                 assert!(
-                    reason.contains("3 times in a row"),
-                    "第 3 次触发应报 '3 times in a row'，实际：{reason}"
+                    reason.contains("5 times in a row"),
+                    "第 5 次触发应报 '5 times in a row'，实际：{reason}"
                 );
                 assert!(
-                    !reason.contains("4 times"),
-                    "不应出现 '4 times'（off-by-one），实际：{reason}"
+                    !reason.contains("6 times"),
+                    "不应出现 '6 times'（off-by-one），实际：{reason}"
                 );
             }
-            LoopDecision::Continue => panic!("第 3 次相同调用应该触发 Break"),
+            LoopDecision::Continue => panic!("第 5 次相同调用应该触发 Break"),
         }
     }
 
+    /// 契约：**一个 detector 跨 round 共用，streak 必须累积**。
+    ///
+    /// 这条测试原先钉的是相反的契约（「每轮一个全新 detector」，
+    /// 2026-07-10 的修复）。那个设计在 deadline-only 模式下等于关掉刹车：
+    /// 模型一轮通常只发一个工具调用，每轮重置就意味着 streak 恒为 1，
+    /// 跨轮死循环永远测不到，而轮次上限已退化为 soft warning、交互式
+    /// chat 也不设 deadline —— 没有任何东西会兜住。
+    ///
+    /// 误杀合法重试的顾虑由判定键解决：键含 args_json，manager 每轮重写
+    /// 任务描述就会清零（见 `loop_detector_resets_on_different_call`）；
+    /// 真正逐字节相同地重复 5 次，就是死循环。
     #[test]
-    fn loop_detector_per_round_does_not_accumulate_across_rounds() {
-        // 2026-07-10 修复：loop_detector 改为每个 round 重新构造。
-        // 这个测试把"每轮一个全新 detector"的契约钉死 —— 3 轮每轮
-        // 吐一个完全相同的 delegate 调用，每个 detector 各自看到
-        // streak=1，不 trip。跨 round 的"manager 一模一样地重试"
-        // 不归 in-round detector 管，那是 supervisor 的
-        // dead_loop_window 的活（见 RoundScheduler::supervisor）。
+    fn loop_detector_accumulates_across_rounds() {
         let payload = r#"{"role":"programmer","task":"pwd"}"#;
-        for _round in 0..3 {
-            let mut d = LoopDetector::default();
-            let r = d.record("delegate", payload);
+        // 模拟 run_turn：detector 建在 round 循环**外**，每轮吐一个
+        // 完全相同的调用。
+        let mut d = LoopDetector::default();
+        for round in 0..4 {
             assert!(
-                matches!(r, LoopDecision::Continue),
-                "每轮的全新 detector 不应被单次调用 trip"
+                matches!(d.record("delegate", payload), LoopDecision::Continue),
+                "第 {round} 轮还不该触发（阈值 5）"
             );
         }
+        assert!(
+            matches!(d.record("delegate", payload), LoopDecision::Break(_)),
+            "跨 4 轮累积后，第 5 次相同调用必须熔断"
+        );
     }
     /// build_tool_schemas：配置层扁平名（bash/read/search）与 registry
     /// 注册名一致（latte-rs-agent-tools 已扁平化命名空间，不再有点号前缀）。

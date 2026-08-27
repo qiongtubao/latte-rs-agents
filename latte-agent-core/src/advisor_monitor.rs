@@ -16,7 +16,7 @@
 //! failures (including an unavailable advisor model) degrade to
 //! `tracing::warn` — the main session is never interrupted.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,11 +32,6 @@ use crate::error::AgentError;
 use crate::model_resolver::{ModelResolver, ModelTier};
 use crate::AgentResult;
 
-/// Hard budget for the rolling transcript fed to the LLM review.
-/// ~6K tokens at the 4-chars-per-token heuristic used in agent.rs.
-const MAX_TRANSCRIPT_CHARS: usize = 24_000;
-/// Cap on any single transcript entry (a full RoleTurn can be huge).
-const MAX_ENTRY_CHARS: usize = 6_000;
 /// Wall-clock budget for one advisor review call. Bounds the stall the
 /// monitor loop experiences when the advisor model is slow; the main
 /// session is unaffected either way.
@@ -651,44 +646,90 @@ pub fn check_response_gates(
     GateVerdict::Pass
 }
 
-// ─── Rolling transcript ────────────────────────────────────────────
+// ─── Dispatch digest ───────────────────────────────────────────────
 
-/// Rolling per-turn transcript fed to the LLM review. Oldest lines
-/// are dropped once the char budget is exceeded (recent context is
-/// the most diagnostic).
-struct Transcript {
-    lines: VecDeque<String>,
-    chars: usize,
-    max_chars: usize,
+/// 路由审查用的**紧凑分派摘要**，取代原来的原始事件流 transcript。
+///
+/// ## 为什么换掉原始 transcript
+///
+/// 旧实现是一个 24,000 字符的环形缓冲，逐条塞进 manager 的
+/// `[assistant]` 全文（6K/条）、`[tool_use]` 原始参数、`[tool_result]`
+/// 原始结果（1.5K/条）、子会话回复（2K/条）。三个问题叠在一起：
+///
+/// 1. **静默丢弃**：超预算就丢最老的行，`render()` 不留任何痕迹。advisor
+///    拿到一份看起来完整、实则掐了头的记录。
+/// 2. **谎报范围**：prompt 标题写「manager 本 turn transcript」，但
+///    `reset_turn_state` 从不碰它、`MonitorState` 整会话只建一次，实际是
+///    跨会话累积。
+/// 3. 于是 advisor 被骗两次（说一轮实为多轮、说完整实为掐头），据此做
+///    「过程取证」必然出错——jemalloc 2026-08-26 会话里它断言
+///    「记录中无成功读取 README，故引用为幻觉」，而那次读取真实发生过，
+///    只是在被丢掉的那一段里。
+///
+/// ## 现在的定位
+///
+/// 路径分工明确后，本摘要**只服务路由审查**（manager 选了哪个 workflow、
+/// 派给谁、拆分合理否），不再承担「审查产出内容」——那是
+/// `build_delegate_review_prompt`（委派返回审查）的职责，它有完整结果和
+/// 正确的截断标注。
+///
+/// 因此这里只记**决策与其结果状态**，不记正文：条目短（每条 ≤
+/// [`DIGEST_LINE_CHARS`]）、条数有限（≤ [`DIGEST_MAX_LINES`]），超限时
+/// `render()` **显式标注**省略了多少条。每轮开头清空，所以「本 turn」
+/// 这个说法是真的。
+#[derive(Default)]
+struct DispatchDigest {
+    lines: Vec<String>,
+    /// 因超出条数上限而丢弃的条数，`render()` 会显式报出来。
+    dropped: usize,
+    /// 「下次 push 时先清空」。不能在 `reset_turn_state` 里直接清——
+    /// EveryTurn 模式的审查发生在 observe() 返回**之后**，那时 turn 已
+    /// 结束、reset 已跑过，直接清会让该次审查拿到空摘要。改为惰性清空：
+    /// 本轮的摘要留到审查读完，下一轮第一条事件到来时才重置。
+    pending_reset: bool,
 }
 
-impl Transcript {
-    fn new(max_chars: usize) -> Self {
-        Self {
-            lines: VecDeque::new(),
-            chars: 0,
-            max_chars,
+/// 单条摘要的字符上限。只记决策不记正文，240 足够放下角色名 + 任务首句。
+const DIGEST_LINE_CHARS: usize = 240;
+/// 摘要条数上限。一轮里 40 条分派动作已经远超正常规模（超了本身就是
+/// 过度编排的证据，而 `dropped` 计数会把这个信号显式交给 advisor）。
+const DIGEST_MAX_LINES: usize = 40;
+
+impl DispatchDigest {
+    fn push(&mut self, line: String) {
+        if self.pending_reset {
+            self.lines.clear();
+            self.dropped = 0;
+            self.pending_reset = false;
+        }
+        self.lines.push(truncate_chars(&line, DIGEST_LINE_CHARS));
+        while self.lines.len() > DIGEST_MAX_LINES {
+            self.lines.remove(0);
+            self.dropped += 1;
         }
     }
 
-    fn push(&mut self, line: String) {
-        self.chars += line.len() + 1; // + '\n'
-        self.lines.push_back(line);
-        while self.chars > self.max_chars {
-            if let Some(old) = self.lines.pop_front() {
-                self.chars -= old.len() + 1;
-            } else {
-                break;
-            }
-        }
+    /// 标记「下一条事件到来时清空」。见 `pending_reset` 的说明。
+    fn mark_reset(&mut self) {
+        self.pending_reset = true;
     }
 
     fn render(&self) -> String {
-        self.lines
+        let body = self
+            .lines
             .iter()
             .map(|s| s.as_str())
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        if self.dropped == 0 {
+            return body;
+        }
+        // 省略必须可见：advisor 据此知道「没看到」不等于「没发生过」。
+        format!(
+            "[注意：本轮分派动作过多，最早的 {} 条已省略——这本身就是过度编排的信号；\
+             不要因为某条动作不在下面就断言它没发生]\n{body}",
+            self.dropped
+        )
     }
 }
 
@@ -902,7 +943,7 @@ impl AdvisorReviewEngine {
     pub async fn review(
         &self,
         user_question: &str,
-        transcript: &str,
+        digest: &str,
         trigger: &str,
     ) -> AgentResult<ReviewVerdict> {
         let template = self
@@ -931,7 +972,7 @@ impl AdvisorReviewEngine {
             String::new()
         };
         let sys = agent.system_message(&serde_json::json!({}))?;
-        let user = Message::user(build_review_prompt(user_question, transcript, trigger, &notes));
+        let user = Message::user(build_review_prompt(user_question, digest, trigger, &notes));
         let model_id = agent
             .model_chain
             .first()
@@ -991,6 +1032,7 @@ impl AdvisorReviewEngine {
     /// (return the specialist output unchanged).
     pub async fn review_delegate(
         &self,
+        main_topic: &str,
         role_id: &str,
         role_responsibilities: &str,
         task: &str,
@@ -1016,6 +1058,7 @@ impl AdvisorReviewEngine {
         )?;
         let sys = agent.system_message(&serde_json::json!({}))?;
         let user = Message::user(build_delegate_review_prompt(
+            main_topic,
             role_id,
             role_responsibilities,
             task,
@@ -1106,7 +1149,7 @@ fn read_watchdog_notes(session_cwd: Option<&Path>) -> String {
 /// (empty when none found or the feature is off).
 fn build_review_prompt(
     user_question: &str,
-    transcript: &str,
+    digest: &str,
     trigger: &str,
     notes: &str,
 ) -> String {
@@ -1120,29 +1163,32 @@ fn build_review_prompt(
     format!(
         r#"# 监察审查任务
 
-你正以**监察者**身份旁路审查 manager（主会话 agent）刚刚的处理过程。下面是用户当前问题与 manager 本 turn 的事件 transcript。
+你正以**监察者**身份旁路审查 manager（主会话 agent）的**任务分派决策**。下面给出用户当前问题，以及 manager 本 turn 做过的分派动作摘要。
+
+**本次审查只判分派路由，不做产出内容的取证。** 摘要里只有「派了什么、结果是什么状态」，**没有** manager 的回复正文、也没有工具的原始参数与返回。所以：
+
+- 不要评判 manager 回复的措辞或结论细节——那由「委派返回审查」在专家结果返回时单独把关，那里有完整产出。
+- **不要因为某件事没出现在摘要里就断言它没发生。** 摘要按设计只收分派动作；「没看到证据」≠「有证据表明没做」。缺证据时最多给 `warn`，不要 `intervene`。
 
 逐项检查：
-1. **幻觉**：声称读过没读过的文件、编造路径或结论、结论与工具返回的证据矛盾。
-2. **工具误用**：调用格式错误、参数不合法、无意义的重复调用。
-3. **思路跑偏**：偏离用户问题、在错误方向上持续投入。
-4. **异常循环**：同一失败模式反复重试。
-5. **分派路由是否合理**（manager 的核心职责）：
+1. **分派路由是否合理**（manager 的核心职责，也是本次审查的重点）：
    - **简单任务**（一两步就能答/改的）应当**直接完成**，不该动辄开 workflow 或委派角色（过度编排 → 建议 intervene 让它直接做）。
    - **复杂任务**应当**优先尝试匹配已有 workflow**；若选了 workflow，核查所选 workflow 与任务是否对得上（选错/硬套 → 建议纠正）。
    - **确无合适 workflow** 时，manager 自行判断**委派角色**：核查委派的角色是否对口、任务拆分是否合理（把实现派给 reviewer、把审查派给 programmer 这类错配 → 建议纠正）。
+2. **思路跑偏**：分派方向是否偏离用户问题、在错误方向上持续投入。
+3. **异常循环**：同一分派模式反复重试（同一角色、同一任务反复派发且都失败）。
 {attention_block}
 # 触发原因
 
 {trigger}
 
-# 用户当前问题
+# 用户当前问题（主会话主题）
 
 {user_question}
 
-# manager 本 turn transcript（滚动截断到最近 ~6K tokens）
+# manager 本 turn 的分派动作摘要
 
-{transcript}
+{digest}
 
 # 输出格式（严格遵守，键名小写英文，不要输出其他键）
 
@@ -1162,6 +1208,7 @@ hint: <给 manager 的一句话纠正提示，具体可执行；仅 intervene �
 /// system message; this is the user message. Focuses on two axes:
 /// role-responsibility adherence and task-result relevance.
 fn build_delegate_review_prompt(
+    main_topic: &str,
     role_id: &str,
     role_responsibilities: &str,
     task: &str,
@@ -1177,6 +1224,11 @@ fn build_delegate_review_prompt(
     // is exceeded, the truncation note tells the reviewer to judge
     // only what is visible.
     let duties = truncate_chars(role_responsibilities, 2_000);
+    let main_topic_s = if main_topic.trim().is_empty() {
+        "（未记录到原始用户诉求——此时不要因「偏离主诉求」下判，仅就任务本身裁决）".to_string()
+    } else {
+        truncate_chars(main_topic, 1_000)
+    };
     let task_s = truncate_chars(task, 1_500);
     let resp_s = truncate_chars(response, DELEGATE_REVIEW_RESPONSE_MAX_CHARS);
     let truncation_note = if resp_s.len() < response.len() {
@@ -1205,6 +1257,12 @@ fn build_delegate_review_prompt(
         r#"# 委派返回审查任务
 
 专家角色「{role_id}」刚完成一次被委派的子任务，其结果**即将返回给 manager 合并进主会话**。请在返回前做一次把关。
+
+# 用户在主会话里的原始诉求（最终要满足的是这个）
+
+{main_topic_s}
+
+判断「是否符合预期」时以它为准绳：子任务做得再漂亮，若偏离主诉求也要指出；反之，只要它在主诉求这条线上交付了被派的那部分，就不要因为它没顺手做别的事而挑刺。
 
 # 该角色的职责范围（其系统提示，可能截断）
 
@@ -1257,7 +1315,7 @@ struct StepOutcome {
 
 struct MonitorState {
     watched_role: String,
-    transcript: Transcript,
+    digest: DispatchDigest,
     detectors: TurnDetectors,
     /// Timestamps of recent LLM reviews — the quota is a sliding
     /// time window (`max_reviews_per_turn` per `review_window_secs`),
@@ -1289,7 +1347,7 @@ impl MonitorState {
     fn new(watched_role: String) -> Self {
         Self {
             watched_role,
-            transcript: Transcript::new(MAX_TRANSCRIPT_CHARS),
+            digest: DispatchDigest::default(),
             detectors: TurnDetectors::default(),
             review_times: std::collections::VecDeque::new(),
             open_delegates: 0,
@@ -1304,6 +1362,10 @@ impl MonitorState {
 
     /// Per-turn reset (turn end of the watched role).
     fn reset_turn_state(&mut self) {
+        // 摘要按「本 turn」语义走：标记待清，下一轮首条事件才真正清空
+        // （见 DispatchDigest::pending_reset —— EveryTurn 审查在 observe
+        // 返回后才读，此刻直接清会让它拿到空摘要）。
+        self.digest.mark_reset();
         self.detectors.reset();
         self.review_times.clear();
         self.serial_delegate_streak = 0;
@@ -1346,15 +1408,7 @@ impl MonitorState {
                 } else if sub_id.is_some() {
                     // Specialist subsession turn: context only, no
                     // detectors (its tool events aren't broadcast).
-                    self.transcript.push(format!(
-                        "[delegate turn {role_id}] {}",
-                        truncate_chars(content, 2_000)
-                    ));
                 } else if role_id == &self.watched_role {
-                    self.transcript.push(format!(
-                        "[assistant] {}",
-                        truncate_chars(content, MAX_ENTRY_CHARS)
-                    ));
                     // D1 runs at turn end, before the per-turn reset.
                     if let Some(f) = self.detectors.finish_turn(content) {
                         findings.push(f);
@@ -1388,7 +1442,6 @@ impl MonitorState {
                 args,
                 ..
             } if role_id == &self.watched_role => {
-                self.transcript.push(format!("[tool_use] {tool_name} {args}"));
                 findings.extend(self.detectors.observe_tool_use(tool_name, args));
                 // Manager invoking the `workflow` tool is a routing
                 // decision — review whether the chosen workflow fits.
@@ -1402,10 +1455,6 @@ impl MonitorState {
                 result,
                 ..
             } if role_id == &self.watched_role => {
-                self.transcript.push(format!(
-                    "[tool_result] {tool_name} → {}",
-                    truncate_chars(result, 1_500)
-                ));
                 self.detectors.observe_tool_result();
             }
             ChatEvent::ToolError {
@@ -1414,7 +1463,7 @@ impl MonitorState {
                 error,
                 ..
             } if role_id == &self.watched_role => {
-                self.transcript
+                self.digest
                     .push(format!("[tool_error] {tool_name} → {error}"));
                 findings.extend(self.detectors.observe_tool_error(tool_name, error));
             }
@@ -1429,7 +1478,7 @@ impl MonitorState {
                 wf_id,
                 ..
             } if from_role == &self.watched_role && wf_id.is_none() => {
-                self.transcript.push(format!(
+                self.digest.push(format!(
                     "[delegate → {to_role}] {}",
                     truncate_chars(task, 500)
                 ));
@@ -1463,7 +1512,7 @@ impl MonitorState {
                 ..
             } if from_role == &self.watched_role && wf_id.is_none() => {
                 self.open_delegates = self.open_delegates.saturating_sub(1);
-                self.transcript.push(format!(
+                self.digest.push(format!(
                     "[delegate {to_role} {status}] {}",
                     truncate_chars(summary, 1_500)
                 ));
@@ -1484,7 +1533,7 @@ impl MonitorState {
                 error,
                 ..
             } if role_id != &self.watched_role && role_id != "advisor" => {
-                self.transcript.push(format!(
+                self.digest.push(format!(
                     "[tool_error {role_id}] {tool_name} → {}",
                     truncate_chars(error, 500)
                 ));
@@ -1524,7 +1573,7 @@ impl MonitorState {
                     Some(parent) => format!(" (nested in {parent})"),
                     None => String::new(),
                 };
-                self.transcript.push(format!(
+                self.digest.push(format!(
                     "[workflow started]{nesting} {name}: {}",
                     truncate_chars(topic, 500)
                 ));
@@ -1536,7 +1585,7 @@ impl MonitorState {
                 summary,
                 ..
             } => {
-                self.transcript.push(format!(
+                self.digest.push(format!(
                     "[workflow {name} {status}] {}",
                     truncate_chars(summary, 1_000)
                 ));
@@ -1682,11 +1731,11 @@ impl AdvisorMonitor {
                     "例行审查（every_turn 模式）：本 turn 未命中确定性检测器".to_string()
                 };
                 let question = controller.last_user_input();
-                let transcript = state.transcript.render();
+                let digest = state.digest.render();
 
                 let review = tokio::time::timeout(
                     Duration::from_secs(REVIEW_TIMEOUT_SECS),
-                    review_engine.review(&question, &transcript, &trigger),
+                    review_engine.review(&question, &digest, &trigger),
                 )
                 .await;
                 let verdict = match review {
@@ -1937,11 +1986,47 @@ mod tests {
 
     // ── delegate 复审 prompt：response 预算与截断提示 ──────────────
 
+    /// 主会话主题必须进入委派返回审查——它是「是否符合预期」的准绳。
+    ///
+    /// 缺了它，advisor 只能拿「被派的子任务」当基准，无法发现「子任务做得
+    /// 漂亮但整体跑偏」。对 workflow step 而言这个主题就是整条 workflow 的
+    /// topic（见 `SpeakerDispatch::main_topic`）。
+    #[test]
+    fn delegate_review_prompt_carries_main_topic() {
+        let p = build_delegate_review_prompt(
+            "把 jemalloc 的学习计划拆成任务",
+            "programmer",
+            "写代码",
+            "读 src/arena.c 并总结",
+            "结果正文",
+            "",
+        );
+        assert!(
+            p.contains("把 jemalloc 的学习计划拆成任务"),
+            "主会话诉求必须出现在 prompt 里: {p}"
+        );
+        assert!(
+            p.contains("原始诉求"),
+            "要有明确的段落标题让模型知道这是准绳: {p}"
+        );
+    }
+
+    /// 主题为空时不得让 advisor 拿它当依据下判（旧 workflow 路径传空串的
+    /// 遗留场景，以及任何取不到用户输入的入口）。
+    #[test]
+    fn delegate_review_prompt_handles_missing_main_topic() {
+        let p = build_delegate_review_prompt("", "programmer", "写代码", "任务", "结果", "");
+        assert!(
+            p.contains("未记录到原始用户诉求"),
+            "空主题要显式告知，不能留白让模型自行想象: {p}"
+        );
+    }
+
     #[test]
     fn delegate_review_prompt_fits_typical_report_without_truncation() {
         // 25K 字符的专家报告（本次事故的实际尺寸）应完整进入 prompt。
         let report = "x".repeat(25_000);
-        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report, "");
+        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "");
         assert!(p.contains(&report), "25K 报告不应被截断");
         assert!(!p.contains("被截断"), "未截断时不应出现截断提示");
     }
@@ -1949,7 +2034,7 @@ mod tests {
     #[test]
     fn delegate_review_prompt_notes_truncation_when_over_budget() {
         let report = "x".repeat(DELEGATE_REVIEW_RESPONSE_MAX_CHARS + 10_000);
-        let p = build_delegate_review_prompt("programmer", "写代码", "任务", &report, "");
+        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "");
         assert!(p.contains("被截断"), "超预算时必须显式告知复审模型");
         assert!(p.contains("[+"), "保留截断标记");
     }
@@ -2060,7 +2145,7 @@ mod tests {
             topic: "t".into(),
             wf_id: "wf-inner".into(),
         });
-        let rendered = s.transcript.render();
+        let rendered = s.digest.render();
         // 嵌套启动必须标注父 workflow，否则 advisor 会把嵌套步骤
         // 误读成对同一请求的重复派发（过度编排误报）。
         assert!(
@@ -2085,7 +2170,7 @@ mod tests {
             topic: "t".into(),
             wf_id: "wf-next".into(),
         });
-        let rendered = s.transcript.render();
+        let rendered = s.digest.render();
         assert!(
             rendered.contains("[workflow started] code_review"),
             "transcript: {rendered}"
@@ -2303,7 +2388,7 @@ mod tests {
         });
         assert!(!out.turn_ended);
         assert!(out.findings.is_empty());
-        assert!(!s.transcript.render().contains("warn：test"));
+        assert!(!s.digest.render().contains("warn：test"));
     }
 
     #[test]
@@ -2317,7 +2402,13 @@ mod tests {
         });
         assert!(!out.turn_ended);
         assert!(out.findings.is_empty());
-        assert!(s.transcript.render().contains("[delegate turn programmer]"));
+        // 子会话的回复正文**不再**进摘要：路由摘要只记决策，产出内容由
+        // 委派返回审查（build_delegate_review_prompt）单独把关。
+        assert!(
+            !s.digest.render().contains("[delegate turn"),
+            "子会话正文不该出现在路由摘要里: {}",
+            s.digest.render()
+        );
     }
 
     #[test]
@@ -2333,7 +2424,13 @@ mod tests {
         assert!(out.findings.is_empty());
         // State was reset: a fresh turn needs two errors for D3.
         s.observe(&tool_error("exec", "boom"));
-        assert!(s.transcript.render().contains("[tool_use]"));
+        // 原始 tool_use 参数**不再**进摘要（它曾是「过程取证」的素材，也是
+        // 误判的来源）；本测试只保证错误收尾路径确实结束了 turn。
+        assert!(
+            !s.digest.render().contains("[tool_use]"),
+            "原始工具参数不该出现在路由摘要里: {}",
+            s.digest.render()
+        );
     }
 
     // ── verdict parsing ────────────────────────────────────────────
@@ -2401,16 +2498,67 @@ mod tests {
 
     // ── transcript rolling ─────────────────────────────────────────
 
+    /// 核心回归：**省略必须可见。**
+    ///
+    /// 旧的 `Transcript` 超预算就丢最老的行且 `render()` 不留痕迹，advisor
+    /// 拿到一份看起来完整、实则掐了头的记录，于是把「我没看到证据」当成
+    /// 「有证据表明没发生」——jemalloc 2026-08-26 会话里它据此断言
+    /// 「记录中无成功读取 README，故引用为幻觉」，而那次读取真实发生过，
+    /// 只是落在被丢弃的那一段里。
     #[test]
-    fn transcript_drops_oldest_lines_beyond_budget() {
-        let mut t = Transcript::new(100);
-        for i in 0..20 {
-            t.push(format!("line-{i:02}-{}", "x".repeat(20)));
+    fn digest_marks_dropped_lines_explicitly() {
+        let mut d = DispatchDigest::default();
+        for i in 0..(DIGEST_MAX_LINES + 5) {
+            d.push(format!("[delegate → r{i:02}] task"));
         }
-        let rendered = t.render();
-        assert!(rendered.len() <= 100 + 30, "budget respected: {}", rendered.len());
-        assert!(rendered.contains("line-19"), "tail kept");
-        assert!(!rendered.contains("line-00"), "head dropped");
+        let rendered = d.render();
+        assert!(rendered.contains("已省略"), "必须显式标注省略: {rendered}");
+        assert!(
+            rendered.contains("不要因为某条动作不在下面就断言它没发生"),
+            "必须提示 advisor 别把「没看到」当「没发生」: {rendered}"
+        );
+        assert!(rendered.contains("r44"), "最新的动作要保留");
+        assert!(!rendered.contains("[delegate → r00]"), "最老的动作被丢弃");
+        assert_eq!(d.dropped, 5, "丢弃计数要准确");
+    }
+
+    /// 未超限时不该出现省略提示（否则每次审查都白挂一段噪音）。
+    #[test]
+    fn digest_has_no_notice_when_within_limit() {
+        let mut d = DispatchDigest::default();
+        d.push("[delegate → programmer] 写代码".into());
+        let rendered = d.render();
+        assert!(!rendered.contains("已省略"), "未超限不该有省略提示: {rendered}");
+        assert_eq!(d.dropped, 0);
+    }
+
+    /// 单条过长要截断（带 `[+NB]` 标记），避免一条动作吃掉整份摘要。
+    #[test]
+    fn digest_truncates_overlong_line_with_marker() {
+        let mut d = DispatchDigest::default();
+        d.push(format!("[delegate → programmer] {}", "任".repeat(2_000)));
+        let rendered = d.render();
+        assert!(rendered.contains("[+"), "单条截断要留标记: {}", &rendered[..80.min(rendered.len())]);
+    }
+
+    /// 惰性重置：标记后要等下一条事件才清空。
+    ///
+    /// 不能在 `reset_turn_state` 里直接清——EveryTurn 模式的审查发生在
+    /// `observe()` 返回**之后**，那时 reset 已跑过，直接清会让该次审查拿到
+    /// 空摘要（等于把刚结束那一轮的分派动作全藏起来）。
+    #[test]
+    fn digest_reset_is_lazy_until_next_push() {
+        let mut d = DispatchDigest::default();
+        d.push("[delegate → programmer] 本轮动作".into());
+        d.mark_reset();
+        assert!(
+            d.render().contains("本轮动作"),
+            "标记后、下一条事件前，本轮摘要必须仍可读"
+        );
+        d.push("[delegate → reviewer] 下一轮动作".into());
+        let rendered = d.render();
+        assert!(rendered.contains("下一轮动作"));
+        assert!(!rendered.contains("本轮动作"), "下一轮首条事件才真正清空");
     }
 
     // ── monitor integration (wiremock advisor model) ───────────────

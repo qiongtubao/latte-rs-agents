@@ -5,7 +5,7 @@ use thiserror::Error;
 /// Result alias used throughout the agent crates.
 pub type AgentResult<T> = std::result::Result<T, AgentError>;
 
-/// `MaxToolRoundsExceeded` 的 Display 后缀：只报 partial 的规模，不把
+/// `ToolLoopDetected` 的 Display 后缀：只报 partial 的规模，不把
 /// 正文塞进错误串（错误串会被回填给模型/上报给 manager，正文另有降级
 /// 采纳路径，见 `workflow.rs` 的 partial 降级分支）。
 fn fmt_partial(partial: &str) -> String {
@@ -65,25 +65,23 @@ pub enum AgentError {
     #[error("token budget exceeded: used {used}, budget {budget}")]
     TokenBudgetExceeded { used: usize, budget: usize },
 
-    /// Max tool-call rounds exceeded.
-    ///
-    /// `partial` 是撞上限那一刻模型已经产出的最后一段正文。带上它是因为
-    /// 「撞上限」不等于「零产出」——jemalloc 实锤：estimate 步跑了 105
-    /// 轮，最后一条回复是完整的验证结论，却因为这个错误只带一个数字而
-    /// 被整段丢弃，连带整条 design_and_plan 判死。上层可以据此降级采纳。
-    #[error("max tool rounds ({rounds}) exceeded{}", fmt_partial(partial))]
-    MaxToolRoundsExceeded {
-        /// 触发上限的轮次数。
-        rounds: usize,
-        /// 撞上限时模型已产出的正文（可能为空）。
-        partial: String,
-    },
     /// A tool loop was detected: the model called the same tool with
     /// the same arguments `LOOP_STREAK_THRESHOLD+` times in a row,
-    /// indicating it is stuck. We break out before
-    /// `max_tool_rounds` is exhausted so the user can intervene.
-    #[error("tool loop detected: {tool} — {reason}")]
-    ToolLoopDetected { tool: String, reason: String },
+    /// indicating it is stuck.
+    ///
+    /// deadline-only 模式下这是唯一始终生效的自动刹车（轮次上限连同
+    /// `MaxToolRoundsExceeded` 已删除，`deadline` 只在 delegate / workflow
+    /// step 上设置），所以它必须把已产出的正文带出来——熔断时丢掉模型已
+    /// 写好的结论，就是 jemalloc「105 轮跑完、3 小时零产出」那次事故的
+    /// 成因。上层据此降级采纳（见 `workflow.rs` 的 partial 降级分支与
+    /// `controller.rs` 的 delegate 回喂）。
+    #[error("tool loop detected: {tool} — {reason}{}", fmt_partial(partial))]
+    ToolLoopDetected {
+        tool: String,
+        reason: String,
+        /// 熔断时模型已产出的正文（可能为空）。
+        partial: String,
+    },
 
     /// Invalid parameter.
     #[error("invalid parameter: {0}")]

@@ -979,7 +979,7 @@ async fn build_runner(
             }
         }
         with_session(
-            AgentRunner::new_with_tools(agent, tm, 0)
+            AgentRunner::new_with_tools(agent, tm)
                 .with_sink(Arc::clone(&sink))
                 .with_hooks(Arc::clone(&hooks))
                 .with_role(role_id)
@@ -1347,7 +1347,7 @@ async fn register_delegate_tool(
                 let mut runner = match specialist_tm {
                     // unlimited tool rounds — model decides when it's done.
                     // LoopDetector in agent.rs trips on actual stuck patterns.
-                    Some(tm) => AgentRunner::new_with_tools(agent, tm, 0)
+                    Some(tm) => AgentRunner::new_with_tools(agent, tm)
                         .with_sink(scoped_sink.clone())
                         .with_role(role_id.clone()),
                     None => AgentRunner::new(agent)

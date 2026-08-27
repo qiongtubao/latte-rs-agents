@@ -68,6 +68,15 @@ pub struct AgentPauseGate {
     /// 注册路径不需要锁。
     next_listener_id: AtomicU64,
     listeners: Mutex<Vec<(u64, Arc<dyn Fn(bool) + Send + Sync + 'static>)>>,
+    /// 累计**已结束**的暂停时长（毫秒）。正在进行的那一次不在内，
+    /// 由 [`total_paused`](Self::total_paused) 现算后叠加。
+    ///
+    /// 动机（jemalloc 2026-08-26 会话）：workflow 的 wall-clock 预算
+    /// 此前用裸 `tokio::time::timeout` 计时，对 pause 一无所知。reviewer
+    /// 22:06:27 停在 gate 上一次模型调用都没发出去，预算却照扣，5040s
+    /// 到点后整条 task_refine 被判超支中止，2/4 步成果作废。预算要扣的
+    /// 是「真在干活的时间」，所以必须能问出「一共停了多久」。
+    total_paused_ms: AtomicU64,
     /// 调试用的 gate 名称（`tracing` span / 错误消息用）。
     name: &'static str,
 }
@@ -91,6 +100,7 @@ impl AgentPauseGate {
             notify: Notify::new(),
             next_listener_id: AtomicU64::new(0),
             listeners: Mutex::new(Vec::new()),
+            total_paused_ms: AtomicU64::new(0),
             name,
         })
     }
@@ -134,6 +144,11 @@ impl AgentPauseGate {
         let mut state = self.state.lock();
         let st = state.take()?;
         let elapsed_ms = st.paused_at_instant.elapsed().as_millis();
+        // 累计进总账 —— 计时器（如 workflow 预算）靠它把 park 的时间
+        // 从「干活时间」里扣掉。饱和转换：u128→u64 溢出在物理上不可能
+        // （5.8 亿年），但不给 panic 留口子。
+        self.total_paused_ms
+            .fetch_add(elapsed_ms.min(u64::MAX as u128) as u64, Ordering::Relaxed);
         drop(state);
         self.notify.notify_waiters();
         self.notify_listeners(false);
@@ -143,6 +158,35 @@ impl AgentPauseGate {
             "agent pause gate released"
         );
         Some(elapsed_ms)
+    }
+
+    /// 本 gate 自创建以来的**累计暂停时长**，含当前正在进行的那一次。
+    ///
+    /// 用途：把 wall-clock 计时换算成「有效工作时间」。典型用法是先取
+    /// 一个基线，之后用 `started.elapsed() - (total_paused() - base)`
+    /// 判断是否真的超支：
+    ///
+    /// ```ignore
+    /// let base = gate.total_paused();
+    /// // …干活，期间可能被 pause 若干次…
+    /// let effective = started.elapsed().saturating_sub(gate.total_paused() - base);
+    /// ```
+    ///
+    /// 单调不减，可跨多次 pause/resume 累加。
+    pub fn total_paused(&self) -> std::time::Duration {
+        // 先读原子量再读锁内的 live 值。顺序反了会漏账：若 resume 恰好
+        // 发生在两次读之间，live 读到 0 而 done 还是旧值，那一段就丢了。
+        let done = self.total_paused_ms.load(Ordering::Relaxed);
+        let live = self
+            .state
+            .lock()
+            .as_ref()
+            .map(|s| s.paused_at_instant.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        // 重读一次 done：若上面那个 race 真发生了（live=0 但 resume 已
+        // 把时长记进 done），这次能读到新值，账目不会变小。
+        let done = done.max(self.total_paused_ms.load(Ordering::Relaxed));
+        std::time::Duration::from_millis(done.saturating_add(live))
     }
 
     /// 当前是否暂停。
@@ -299,6 +343,83 @@ mod tests {
         assert!(g.resume().is_none(), "再次 resume 应返回 None");
         // _ = dur; 实际 elapsed 视测试机速度，可能是 0ms。
         let _ = dur;
+    }
+
+    /// `total_paused` 跨多次 pause/resume 累加，且未暂停时不增长。
+    /// workflow 预算靠它把 park 时间从「干活时间」里扣掉。
+    #[test]
+    fn total_paused_accumulates_across_cycles() {
+        let g = AgentPauseGate::new("t");
+        assert_eq!(g.total_paused(), Duration::ZERO, "初始应为 0");
+
+        g.pause();
+        std::thread::sleep(Duration::from_millis(60));
+        g.resume();
+        let after_first = g.total_paused();
+        assert!(
+            after_first >= Duration::from_millis(50),
+            "第一次 park 应计入，实际 {after_first:?}"
+        );
+
+        // 未暂停期间不增长。
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            g.total_paused(),
+            after_first,
+            "running 期间 total_paused 不应变化"
+        );
+
+        g.pause();
+        std::thread::sleep(Duration::from_millis(60));
+        g.resume();
+        assert!(
+            g.total_paused() >= after_first + Duration::from_millis(50),
+            "第二次 park 应叠加"
+        );
+    }
+
+    /// 正在进行的暂停也要算进去——否则预算看门狗在 park 期间读到的
+    /// 是「一直没停过」，照样会把 workflow 判超支（P0-1 的原样复现）。
+    #[test]
+    fn total_paused_includes_in_flight_pause() {
+        let g = AgentPauseGate::new("t");
+        g.pause();
+        std::thread::sleep(Duration::from_millis(60));
+        // 注意：还没 resume。
+        assert!(g.is_paused());
+        assert!(
+            g.total_paused() >= Duration::from_millis(50),
+            "in-flight 的 park 必须现算进去，实际 {:?}",
+            g.total_paused()
+        );
+    }
+
+    /// 「有效工作时间 = wall-clock − 累计暂停」这条换算成立。
+    #[test]
+    fn effective_time_excludes_paused_span() {
+        let g = AgentPauseGate::new("t");
+        let base = g.total_paused();
+        let started = Instant::now();
+
+        std::thread::sleep(Duration::from_millis(30)); // 干活
+        g.pause();
+        std::thread::sleep(Duration::from_millis(100)); // park
+        g.resume();
+        std::thread::sleep(Duration::from_millis(30)); // 干活
+
+        let parked = g.total_paused() - base;
+        let effective = started.elapsed().saturating_sub(parked);
+        // 真实工作 ~60ms，wall-clock ~160ms。有效时间必须明显小于
+        // wall-clock，且不该把 park 的 100ms 算进来。
+        assert!(
+            effective < Duration::from_millis(120),
+            "有效时间不应包含 park，实际 {effective:?}（wall {:?}）",
+            started.elapsed()
+        );
+        assert!(
+            parked >= Duration::from_millis(90),
+            "park 时长应被记全，实际 {parked:?}"
+        );
     }
 
     #[tokio::test]

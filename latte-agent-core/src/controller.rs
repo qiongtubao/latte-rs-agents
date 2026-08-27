@@ -58,7 +58,6 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         // 工具 / 上层
         AgentError::Tool(s) => ModelErrorKind::Other { message: format!("tool: {s}") },
         AgentError::TokenBudgetExceeded { .. } => ModelErrorKind::Config { message: "token budget exceeded".into() },
-        AgentError::MaxToolRoundsExceeded { .. } => ModelErrorKind::Other { message: "max tool rounds exceeded".into() },
         AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other { message: format!("tool loop: {tool}") },
         AgentError::Orchestration(s) => ModelErrorKind::Other { message: format!("orchestration: {s}") },
         AgentError::ModelsUnavailable { tried, .. } => {
@@ -1517,6 +1516,7 @@ async fn run_driver(
             plan_stage,
             advisor_pause,
             agent_pause_gate,
+            last_user_input.clone(),
         )
         .await;
     } else {
@@ -1568,6 +1568,8 @@ async fn run_multi_role_loop(
     plan_stage: SharedPlanStage,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    // 与 ChatController 共享的原始用户诉求句柄（委派返回审查的准绳）。
+    last_user_input: Arc<parking_lot::Mutex<String>>,
 ) {
     let repo_root = match WorkspaceManager::resolve_repo_root(&config.cwd) {
         Ok(root) => root,
@@ -1769,6 +1771,7 @@ async fn run_multi_role_loop(
             &config.session_id,
             cancel_flag.clone(),
             turn_cancel_flag.clone(),
+            last_user_input.clone(),
             config.advisor_monitor.runner_gate(),
             advisor_pause.clone(),
             &plan_stage,
@@ -2367,6 +2370,7 @@ async fn run_single_role_loop(
         &config.session_id,
         cancel_flag.clone(),
         turn_cancel_flag.clone(),
+        last_user_input.clone(),
         config.advisor_monitor.runner_gate(),
         advisor_pause.clone(),
         &plan_stage,
@@ -2490,7 +2494,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2512,7 +2516,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2717,7 +2721,7 @@ let usage_before = runner.total_usage().clone();
                             continue;
                         }
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2732,7 +2736,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), None, event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2789,6 +2793,9 @@ async fn build_runner(
     session_id: &str,
     cancel_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
+    // 用户在主会话里的原始诉求（与 ChatController 共享句柄）。透传给
+    // `register_delegate_tool`，最终作为委派返回审查的「是否符合预期」准绳。
+    main_topic: Arc<parking_lot::Mutex<String>>,
     // Advisor pre-persistence gate（D5/D6）。`Some` 时装到本 runner
     // 及 delegate specialist runner 上（`with_gate_config`），
     // `run_turn_gated` 在产出被接受前先过 `check_response_gates`；
@@ -2904,6 +2911,7 @@ async fn build_runner(
                 // 自动归零。`default_max_delegates` 从 env 读，默认 12。
                 std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 default_max_delegates(),
+                main_topic.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -3011,7 +3019,7 @@ async fn build_runner(
             Some(sub) => Arc::new(crate::trace::FanOutSink::new(vec![sub, chat_sink])),
             None => chat_sink,
         };
-        let mut runner = AgentRunner::new_with_tools(agent, tm, 16)
+        let mut runner = AgentRunner::new_with_tools(agent, tm)
             .with_role(role_id)
             .with_cwd(cwd.to_path_buf());
         runner = runner.with_sink(runner_sink);
@@ -3567,13 +3575,20 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     Some(l) => l,
                     None => {
                         // 目录路径没有扩展名，推断不出语言。
-                        return Err(ToolError::execution_str(
-                            "code_graph",
+                        // 用 Validation 而非 execution：这是确定性参数
+                        // 错误，同参数重试必败，必须让上层判不可重试、
+                        // 直接把提示喂回模型改参数（见
+                        // `classify_tool_execution_error`）。
+                        return Err(ToolError::validation(
                             format!(
-                                "无法从 path='{path}' 推断语言（目录或未知扩展名），请显式传 lang。\
-                                 支持的 lang：{}",
+                                "code_graph: 无法从 path='{path}' 推断语言（目录或未知扩展名），\
+                                 请显式传 lang。支持的 lang：{}",
                                 code_graph_supported_langs().join(", ")
                             ),
+                            vec![latte_rs_agent_tools::error::ValidationIssue {
+                                path: "lang".into(),
+                                message: "目录路径必须显式指定 lang".into(),
+                            }],
                         ));
                     }
                 },
@@ -3589,20 +3604,24 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     let node_kinds = code_graph_node_kinds(lang, k);
                     if node_kinds.is_empty() {
                         let avail = code_graph_kinds_for_lang(lang);
-                        return Err(ToolError::execution_str(
-                            "code_graph",
+                        // 同上：确定性参数错误，走 Validation 不重试。
+                        return Err(ToolError::validation(
                             if avail.is_empty() {
                                 format!(
-                                    "不支持的 lang='{lang}'。支持：{}",
+                                    "code_graph: 不支持的 lang='{lang}'。支持：{}",
                                     code_graph_supported_langs().join(", ")
                                 )
                             } else {
                                 format!(
-                                    "lang='{lang}' 不支持 kind='{k}'。可用 kind：{}。\
+                                    "code_graph: lang='{lang}' 不支持 kind='{k}'。可用 kind：{}。\
                                      或改用 pattern 参数写裸 ast-grep 模式。",
                                     avail.join(", ")
                                 )
                             },
+                            vec![latte_rs_agent_tools::error::ValidationIssue {
+                                path: if avail.is_empty() { "lang".into() } else { "kind".into() },
+                                message: "取值不在支持范围内".into(),
+                            }],
                         ));
                     }
                     rule_text = code_graph_build_rule(lang, &node_kinds, name);
@@ -3612,12 +3631,15 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     cmd.args(["run", "-l", lang, "-p", p, path, "--json=compact"]);
                 }
                 (None, None) => {
-                    return Err(ToolError::execution_str(
-                        "code_graph",
+                    return Err(ToolError::validation(
                         format!(
-                            "必须提供 kind 或 pattern 之一。lang='{lang}' 可用 kind：{}",
+                            "code_graph: 必须提供 kind 或 pattern 之一。lang='{lang}' 可用 kind：{}",
                             code_graph_kinds_for_lang(lang).join(", ")
                         ),
+                        vec![latte_rs_agent_tools::error::ValidationIssue {
+                            path: "kind".into(),
+                            message: "kind 与 pattern 至少提供一个".into(),
+                        }],
                     ));
                 }
             }
@@ -3798,14 +3820,16 @@ pub(crate) fn role_roster_text(merged: &AgentConfig) -> String {
 }
 
 
-/// 单 session 累计 delegate 工具调用上限（默认 12）。env `LATTE_MAX_DELEGATES_PER_SESSION`
-/// 覆盖；非法值回退到默认。0 = 禁用限制（保留字段 compatibility）。
+/// 单 session 累计 delegate 工具调用上限。env `LATTE_MAX_DELEGATES_PER_SESSION`
+/// 覆盖；非法值回退到默认。0 = 禁用限制（无上限）。
 /// 详见 `docs/perf/diagnose-latency.md` §5（#1-A 方案）。
 pub fn default_max_delegates() -> u32 {
     let raw = std::env::var("LATTE_MAX_DELEGATES_PER_SESSION").ok();
     match raw.and_then(|s| s.parse::<u32>().ok()) {
         Some(n) => n,
-        None => 12,
+        // 默认无限制。delegate 路径有 wall-clock 超时（set_deadline）兜底；
+        // 交互式 chat 没有，按设计由人工 ⏸ / advisor 叫停 + 死循环熔断兜住。
+        None => 0,
     }
 }
 /// delegate 工具提示：可用专家列表来自 `merged.roles` 动态生成
@@ -4751,6 +4775,9 @@ pub(crate) fn register_task_report_tool(
 pub(crate) async fn gate_delegate_return(
     engine: &AdvisorReviewEngine,
     event_tx: &broadcast::Sender<ChatEvent>,
+    // 用户在主会话里的原始诉求，作为「是否符合预期」的准绳。空串表示
+    // 调用方拿不到（此时 prompt 会显式告知 advisor 不要据此下判）。
+    main_topic: &str,
     role_id: &str,
     role_responsibilities: &str,
     task: &str,
@@ -4766,6 +4793,7 @@ pub(crate) async fn gate_delegate_return(
     let review = tokio::time::timeout(
         timeout,
         engine.review_delegate(
+            main_topic,
             role_id,
             role_responsibilities,
             task,
@@ -4858,29 +4886,12 @@ pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
 ///   已经熔断 → 孤儿 step）。
 /// - per-step wall-clock 触发的 `TimeoutWarning`（周期复发，让用户拍板）、
 ///   `turn_cancel_flag`（用户「终止当前任务」）、session `cancel_flag`
-///   （全量中止），以及 `run_turn` 内部的工具轮次上限与循环检测。
+///   （全量中止），以及 `run_turn` 内部的死循环熔断。
 ///
 /// jemalloc 实锤：`workflow` 漏配本超时 → manager 调用在第 25 分钟被
 /// 熔断，而 step 因已无 wall-clock 硬超时仍在后台跑（孤儿任务）；
 /// manager 依错误提示 resume 又是 25min，两次空等 50 分钟零产出。
 pub const ORCHESTRATION_TOOL_TIMEOUT_SECS: u64 = 86_400;
-
-/// Specialist 单次委派的工具轮次默认上限。jemalloc 事故：estimate
-/// 步骤的 programmer 子代理 24min/86 次模型调用盲改循环（配置漂移
-/// 丢了 bash → 无法验证 → 反复重写同一批文件），拖死整个 workflow——
-/// 当时这里写死 `max_tool_rounds = 0`（无限）。正常任务远低于 100 轮。
-pub(crate) const DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS: usize = 100;
-
-/// Specialist（delegate / workflow step）的工具轮次上限。
-/// env `LATTE_AGENT_MAX_TOOL_ROUNDS` 覆盖，默认
-/// [`DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS`]。每次调用读 env，
-/// 测试可直接 set_var。
-pub(crate) fn specialist_max_tool_rounds() -> usize {
-    std::env::var("LATTE_AGENT_MAX_TOOL_ROUNDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS)
-}
 
 /// Specialist 的 wall-clock 超时（秒）。`model_timeout` 是模型目录里
 /// 的 per-model `timeout_secs`（workflow 路径拿不到模型 id，传 None）。
@@ -4920,6 +4931,10 @@ async fn register_delegate_tool(
     // 每次 invocation 入口 fetch_add 后检查；超限返回 ClientError。
     // 0 = 禁用（保留字段供 future 配置）。
     max_delegates: u32,
+    // 用户在主会话里的原始诉求（与 ChatController 共享同一句柄）。
+    // 委派返回审查拿它当「是否符合预期」的准绳。注册时取不到值——它每轮
+    // 都变，所以传句柄、在 handler 里按次读取。
+    main_topic: Arc<parking_lot::Mutex<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -5010,6 +5025,8 @@ async fn register_delegate_tool(
         let ledger = ledger.clone();
         // 每次 specialist 创建时 attach。
         let agent_pause_gate = agent_pause_gate.clone();
+        // 主会话诉求句柄：每次 invocation 现读（它每轮都变）。
+        let main_topic = Arc::clone(&main_topic);
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -5189,13 +5206,13 @@ async fn register_delegate_tool(
             // 工具轮次上限兜底盲改/跑偏循环（jemalloc 事故前写死
             // 0 = 无限，靠 LoopDetector 抓「连续 3 次相同调用」，
             // 对换着参数重写的循环无效）。正常任务远低于默认值，
-            // 超限冒泡 MaxToolRoundsExceeded → 回喂 manager 重派。
+            // 死循环熔断冒泡 ToolLoopDetected（带 partial）→ 回喂 manager 重派。
             // Wire the workspace cwd so the specialist's path-aware
             // tools (`bash`, `read`, …) chdir into the
             // workspace the user opened — not the Tauri process
             // cwd. See `AgentRunner::with_cwd` for the contract.
             let mut runner = match specialist_tm {
-                Some(tm) => AgentRunner::new_with_tools(agent, tm, specialist_max_tool_rounds()),
+                Some(tm) => AgentRunner::new_with_tools(agent, tm),
                 None => AgentRunner::new(agent),
             };
             // Fan-out：子会话 JSONL 日志 + ChatEventTraceSink——专家的
@@ -5248,6 +5265,9 @@ async fn register_delegate_tool(
             // Move runner + messages into a spawned task so we can
             // cancel it from the select! loop. The task owns everything.
             let task_content = task.clone();
+            // 循环内 deadline（对齐 oh-my-pi）：让 agent 在临近超时时
+            // 优雅退出返回 partial，而不是被 tokio timeout abort 丢失产出。
+            runner.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(timeout_s));
             let mut run_handle = tokio::spawn(async move {
                 // gated 版：装了 gate_config 时产出先过 D5/D6；
                 // 没装时等价 run_turn。
@@ -5279,18 +5299,17 @@ async fn register_delegate_tool(
                                 break;
                             }
                             Ok(Err(e)) => {
-                                // 撞轮次上限但已有实质产出：把正文一并回喂
-                                // manager。只报一句 "max tool rounds exceeded"
-                                // 会让 manager 以为这一支彻底没成果，从而
-                                // 原样重派——同一个坑再烧一遍预算。带上
-                                // partial，manager 才能判断是「接着收尾」
-                                // 还是「缩小范围重派」。
-                                if let AgentError::MaxToolRoundsExceeded { rounds, partial } = &e {
+                                // 死循环熔断但已有实质产出：把正文一并回喂
+                                // manager。只报一句 "tool loop" 会让 manager
+                                // 以为这一支彻底没成果，从而原样重派——同一
+                                // 个坑再烧一遍预算。带上 partial，manager 才
+                                // 能判断是「接着收尾」还是「缩小范围重派」。
+                                if let AgentError::ToolLoopDetected { tool, partial, .. } = &e {
                                     let stripped = strip_think_blocks(partial);
                                     if !is_empty_output(&stripped) {
                                         result = Err(tool_err(format!(
-                                            "subagent failed: 达到工具轮次上限（{rounds} 轮）。\
-                                             以下是它撞上限前已产出的未收尾内容，请据此决定\
+                                            "subagent failed: 检测到工具死循环（'{tool}' 反复调用）。\
+                                             以下是它被中止前已产出的未收尾内容，请据此决定\
                                              「缩小范围重派」还是「让它接着收尾」，不要原样重派：\n\n{stripped}"
                                         )));
                                         break;
@@ -5412,6 +5431,9 @@ async fn register_delegate_tool(
             // bubble is emitted for the human either way. Degrades
             // silently (returns the output unchanged) if the advisor is
             // unavailable or times out.
+            // 先落成 String：parking_lot 的 guard 不是 Send，跨 await 持锁
+            // 会让整个 handler future 失去 Send。
+            let topic_snapshot: String = main_topic.lock().clone();
             let run_result = match result {
                 // manager delegate 路径保持「只批注不重做」——重做决策
                 // 是 manager 自己的事（它看得到批注，可自行再委派）。
@@ -5419,6 +5441,7 @@ async fn register_delegate_tool(
                 Ok(response) if advisor_gate.is_some() => Ok(gate_delegate_return(
                     &review_engine,
                     &event_tx,
+                    &topic_snapshot,
                     &role_id,
                     &role.system_prompt,
                     &task,
@@ -6461,13 +6484,15 @@ mod tests {
 
     #[test]
     fn default_max_delegates_respects_env_and_default() {
-        // env 缺失 → 默认 12。
+        // env 缺失 → 0 = 不限制（改自旧默认 12：单 session 的
+        // delegate 次数改由 wall-clock timeout 与死循环熔断兜底，
+        // 不再用一个固定次数硬砍）。
         let _g = lock_env();
         std::env::remove_var("LATTE_MAX_DELEGATES_PER_SESSION");
-        assert_eq!(default_max_delegates(), 12);
+        assert_eq!(default_max_delegates(), 0);
         // env 非法 → 回退默认。
         std::env::set_var("LATTE_MAX_DELEGATES_PER_SESSION", "abc");
-        assert_eq!(default_max_delegates(), 12);
+        assert_eq!(default_max_delegates(), 0);
         // env 合法 → 用之。
         std::env::set_var("LATTE_MAX_DELEGATES_PER_SESSION", "5");
         assert_eq!(default_max_delegates(), 5);
@@ -7142,6 +7167,7 @@ mod tests {
             crate::pause_gate::AgentPauseGate::new("test"),
             Arc::new(std::sync::atomic::AtomicU32::new(0)),
             0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
         )
         .await
         .expect("register delegate");
@@ -7614,6 +7640,7 @@ mod tests {
             // fresh counter + max=0（本测试只验阶段门，无 delegate 计数）。
             Arc::new(std::sync::atomic::AtomicU32::new(0)),
             0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
         )
         .await
         .expect("register delegate");
@@ -7748,6 +7775,7 @@ mod tests {
             crate::pause_gate::AgentPauseGate::new("test"),
             Arc::new(std::sync::atomic::AtomicU32::new(0)),
             0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
         )
         .await
         .expect("register delegate");
@@ -7785,11 +7813,10 @@ mod tests {
 
     #[test]
     fn specialist_circuit_breaker_defaults_and_env_override() {
-        // 默认上限；env 覆盖后恢复。
-        assert_eq!(
-            specialist_max_tool_rounds(),
-            DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS
-        );
+        // 轮次上限那半已随死代码删除（`specialist_max_tool_rounds` /
+        // `DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS`）：值读出来只是存进
+        // `AgentRunner.max_tool_rounds`，从不被读取。现在只剩 wall-clock
+        // 超时这一路熔断。
         assert_eq!(
             specialist_timeout_secs(None),
             DEFAULT_UI_DELEGATE_TIMEOUT_SECS

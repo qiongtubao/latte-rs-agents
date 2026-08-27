@@ -105,9 +105,33 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | CLI 300s / UI 900s | specialist（delegate / workflow step）的 wall-clock 超时，超时即中止并回喂 manager 重派。模型目录里的 per-model `timeout_secs` 优先级最高 |
-| `LATTE_AGENT_MAX_TOOL_ROUNDS` | 100 | specialist 单次委派的工具轮次上限，超限报 `MaxToolRoundsExceeded`（0 = 不限） |
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
-| `LATTE_MAX_DELEGATES_PER_SESSION` | — | 单 session delegate 调用次数上限（0 = 禁用） |
+| `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` | 5 | 模型全链不可用时自动暂停后的退避重试次数上限，用尽转人工（0 = 不自动重试，立刻等人点 ▶） |
+| `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS` | 420 | workflow 时间预算的「每分派单元」秒数。预算只计**有效工作时间**，暂停期间不扣 |
+| `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
+
+### 工具循环的终止条件
+
+工具调用循环**没有轮次上限**（deadline-only 模式）。终止靠这四条：
+
+1. 模型返回不带 tool_calls 的回复 —— 正常收尾；
+2. `deadline` —— 仅 delegate 与 workflow step 会设置（见
+   `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`）。**交互式 `chat` 不设**，超时按设计
+   交给人工 ⏸ 或 advisor 角色叫停；
+3. **死循环熔断** —— 唯一始终生效的自动刹车，两条规则并行：
+   - **连击**：同一工具 + 逐字节相同的参数连续 5 次；
+   - **打转**：最近 8 次调用里只有 ≤2 种调用、且每种都重复出现（抓
+     `read A → search B → read A → search B …` 这类交替空转——它每次都与
+     上一次不同，连击规则抓不到）。
+
+   两条都要求参数逐字节相同，所以「改参数后重试」这种正常进展不会被误杀；
+   打转规则还要求每种调用都重复出现，因此「读 → 改 → 读验证」（改的参数
+   每次都变）也不会误判。中止时报 `ToolLoopDetected`。
+4. 确定性失败熔断 —— 同一工具连续 8 次被输入校验拒绝（参数每次都不同，
+   死循环熔断抓不到这种），第 5 次时先追加一条硬指令劝它换路径。
+
+第 3、4 条中止时会把模型**已产出的正文**作为 `partial` 带出来，workflow 与
+delegate 据此降级采纳，不会把前面几十轮的成果一起丢掉。
 
 ## Skill 系统
 

@@ -156,7 +156,7 @@ impl WorkflowCmd {
                 let tm = super::chat::build_tool_manager(&role_for_tools.allowed_tools)
                     .await
                     .map_err(|e| format!("tool setup for role '{}' failed: {}", role_name, e))?;
-                AgentRunner::new_with_tools(agent, tm, 0)
+                AgentRunner::new_with_tools(agent, tm)
             } else {
                 AgentRunner::new(agent)
             };

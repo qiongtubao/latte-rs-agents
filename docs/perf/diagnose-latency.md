@@ -44,7 +44,13 @@
 |------|------|------|--------|
 | **A. 限制 manager 每个 turn 的 delegate 次数** | ~50% | 中（可能让 manager 表达不完整） | 小 |
 | **B. 给 manager 加一个"已经做过的事"记忆，抑制重复 dispatch** | ~70% | 低 | 中 |
-| C. 限制 deepseek-v4-flash 工具调用轮数（`max_tool_rounds=3`） | ~30% | 高（过早截断可能导致读取失败） | 极小 |
+| ~~C. 限制工具调用轮数~~ | — | — | — |
+
+> ⚠️ 方案 C 已失效：`max_tool_rounds` 硬上限连同 `MaxToolRoundsExceeded` 已随
+> deadline-only 重构删除（字段只写不读、setter 零调用）。现在能限制循环规模的手段是
+> `AgentRunner::set_deadline`（wall-clock，delegate / workflow step 已默认设置，见
+> `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`）与死循环熔断，都不是「按轮次截断」。若确实需要
+> 轮次上限，得重新引入——别再指望这个旋钮。
 
 ### 因素 #2 — Manager 第一轮调错工具（+6.5s）
 
@@ -79,7 +85,7 @@ programmer/deepseek-v4-flash: bash cat Cargo.toml     1.06s
 | 方案 | 收益 | 风险 |
 |------|------|------|
 | 改 `prompts/programmer.md`：从"mandatory 4 步"改为"如果 ls 输出已经够，跳到第 2 步" | 30-40% | 低 |
-| 给 specialist 加 `max_tool_rounds=4` 硬上限 | ~30% | 中 |
+| ~~给 specialist 加轮次硬上限~~（旋钮已删，见上方 ⚠️；可改用 `set_deadline` 收紧 wall-clock） | ~30% | 中 |
 
 ### 因素 #4 — Manager 综合回答是再调一次 LLM（~5-10s）
 
@@ -135,7 +141,9 @@ programmer → reviewer_sanity → reviewer_architecture → reviewer_security
 | 不改 | 0 | 0 | — |
 
 **首选方案**：先做 #1-A（**限制单个 manager turn 的 delegate 次数到 1**），看效果。
-- 实现位置：`chat.rs` 中 `max_tool_rounds=1` for the manager runner's tool call，或者在 `DELEGATE_TOOL_HINT` 中显式约束 manager 行为。
+- 实现位置：`DELEGATE_TOOL_HINT` 中显式约束 manager 行为，或用
+  `LATTE_MAX_DELEGATES_PER_SESSION` 限制单 session 累计 delegate 次数。
+  （原文写的 `max_tool_rounds=1` 已不可用——旋钮已删，见上方 ⚠️。）
 - 风险：很小的 chat（用户一句话 "echo hello"）可能无法完成多层委托。
 
 ---

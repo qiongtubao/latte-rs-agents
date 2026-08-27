@@ -63,12 +63,27 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 
 - **触发模式** `AdvisorReviewMode`：`Off | OnAnomaly | EveryTurn`，默认 `OnAnomaly`
   （EveryTurn 每个 manager turn 结束都审，premium 成本，留给愿意烧钱的场景）。
-- 输入：滚动 transcript（本 turn 的 RoleTurn 全文 + ToolUse/ToolResult/ToolError 序列，
-  截断到 ~6K tokens）+ 用户原始问题。
-- 调用：advisor prompt（`prompts::ADVISOR`，作为 system message）+ 审查指令（检查：幻觉——声称读过没读过的
-  文件/编造路径与结论；工具误用；思路跑偏；结论与证据矛盾）作为 user message。
+- 输入：**分派动作摘要**（`DispatchDigest`）+ 用户原始问题。摘要只收
+  delegate 派发/返回、workflow 启动/结束、工具错误这几类**决策与结果状态**，
+  每条 ≤240 字符、最多 40 条，**不含** RoleTurn 全文、也不含 ToolUse 原始参数
+  与 ToolResult 原始返回。超出条数上限时 `render()` **显式标注**省略了多少条。
+  每个 manager turn 开头清空（惰性：标记后下一条事件才真清，否则 EveryTurn
+  模式的审查——它在 `observe()` 返回之后才读——会拿到空摘要）。
+- 调用：advisor prompt（`prompts::ADVISOR`，作为 system message）+ 审查指令作为
+  user message。**本路径只判分派路由**（简单任务是否被过度编排、复杂任务是否优先
+  匹配 workflow、所选 workflow 与角色是否对口、思路是否跑偏、是否反复重试同一分派），
+  **不做产出内容的取证**——那是 §3b 委派返回审查的职责，它有完整产出与工具证据。
   输出三态裁决：`ok / warn / intervene` + 理由 + 给 manager 的纠正提示，键名格式：
   `verdict:` / `reason:` / `hint:`。**malformed 输出降级为 `ok`**（无法解析的审查不得注入噪声）。
+
+  > **为什么不再喂原始事件流**：旧实现是 24,000 字符的滚动 transcript，逐条塞进
+  > RoleTurn 全文（6K/条）、ToolUse 原始参数、ToolResult 原始返回（1.5K/条）。三个
+  > 问题叠加——超预算**静默**丢最老的行且 `render()` 不留痕迹；prompt 标题写「本 turn」
+  > 而 `reset_turn_state` 从不碰它、`MonitorState` 整会话只建一次，实际跨会话累积。
+  > 于是 advisor 被骗两次（说一轮实为多轮、说完整实为掐头），据此做「过程取证」必然
+  > 出错：jemalloc 2026-08-26 会话里它断言「记录中无成功读取 README，故引用为幻觉」，
+  > 而那次读取真实发生过，只是落在被丢弃的那段里。现在改为「只判路由 + 省略可见」，
+  > 并在 advisor prompt 里加了硬约束「证据缺失 ≠ 证据为负，缺失时最多 warn」。
 - **分级语义（warn / intervene 拉开）**：
   - `warn`（值得关注但不阻塞的问题）→ 只发通道 B 气泡（⚠️，用户可见），
     **不**向 manager 注 hint——轻打扰，用户自己判断要不要管；气泡也不引用 hint。
@@ -92,6 +107,38 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   30–60s 冷却**再重试，监控停摆。`NoWait` 走完整条 fallback 链后立即降级，
   monitor 继续监听。审查另有 120s wall-clock 超时兜底。
 - 失败（模型不可用/解析失败/超时）静默降级：`tracing::warn`，只留确定性提示，不打断主流程。
+
+## 3b. 委派返回审查（`gate_delegate_return`）
+
+与 §3 的路由审查**并列的第二条 LLM 审查路径**，两者分工不重叠：
+
+| | §3 路由审查 | §3b 委派返回审查 |
+|---|---|---|
+| 审什么 | manager 的**分派决策** | 专家交回的**产出** |
+| 何时 | manager 调 workflow/delegate 时、或检测器命中 | subsession 返回、结果并入主会话之前 |
+| 输入 | 分派动作摘要 + 用户原始问题 | 主会话主题 + 被派任务 + 完整结果 + 工具执行摘要 + 角色职责 |
+| 入口 | `AdvisorReviewEngine::review` | `AdvisorReviewEngine::review_delegate` |
+
+输入的四件套各有存在理由：
+
+- **主会话主题**（`main_topic`）——「是否符合预期」的准绳。子任务做得再漂亮，
+  偏离主诉求也要指出；反之只要在主诉求这条线上交付了被派那部分，就不该因为它
+  没顺手做别的事而挑刺。来源：manager delegate 路径取
+  `ChatController::last_user_input`（句柄共享、每次调用现读，因为它每轮都变）；
+  workflow step 取本 workflow 的 topic（`SpeakerDispatch::main_topic` ←
+  `vars["topic"]`，嵌套时是当前这层，它本身派生自父级）。取不到时传空串，prompt
+  会显式告知「未记录到原始用户诉求」，禁止 advisor 据此下判。
+- **被派任务** 2K / **角色职责** 2K（其系统提示）。
+- **完整结果** 32K（`DELEGATE_REVIEW_RESPONSE_MAX_CHARS`）——刻意调到能装下真实
+  专家报告（实测 25.5K）。超出时附**显式截断标注**（字符数 + `[+NB]`），并要求
+  「仅依据可见内容裁决，不要臆测被截断部分」。
+- **工具执行摘要**（引擎侧记录）——不可省。jemalloc 实锤：interview step 用 `ask`
+  弹窗收齐 4 个答案后输出 user_profile，advisor 看不到 `ask` 的执行记录，误判
+  「伪造答案」→ intervene → 带反馈重做 → 用户被重复提问。
+
+裁决语义与 §3 相同；`intervene`/`terminate` 时除气泡外还会把审查批注追加进 manager
+消费的 payload。advisor 不可用或审查超时（`delegate_review_timeout`，可配）→
+**静默降级**，原样放行专家产出。
 
 ## 4. 注入机制（core 改动点）
 
@@ -126,8 +173,8 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
    （`last_user_input()`），monitor 审查时读取。
 6. monitor 自身容错：检测/审查错误、模型不可用、审查超时（120s）→
    `tracing::warn`，绝不影响主会话；monitor 忽略 `role_id == "advisor"` 的自身
-   气泡，避免自反馈循环；delegate 专家的 RoleTurn（`sub_id.is_some()`）只进
-   transcript 不参与检测。
+   气泡，避免自反馈循环；delegate 专家的 RoleTurn（`sub_id.is_some()`）既不参与
+   检测、也不进分派摘要——专家产出的把关由 §3b 委派返回审查负责。
 
 ## 5. 配置与成本控制
 
@@ -188,8 +235,10 @@ AgentPauseGate，与本 monitor 无关）。
 
 - 检测器单测（`advisor_monitor::tests`，合成 ChatEvent 序列直接驱动
   `MonitorState::observe`）：D1–D4 各自触发/不触发、每 turn 去重、下一 turn
-  重新武装；角色过滤（他角色与 advisor 自身事件忽略）、专家 RoleTurn 只进
-  transcript、error 路径的 turn 结束重置。
+  重新武装；角色过滤（他角色与 advisor 自身事件忽略）、专家 RoleTurn 不进分派
+  摘要、error 路径的 turn 结束重置。
+- 分派摘要（`DispatchDigest`）：超限时显式标注省略条数并提示「别把没看到当没发生」、
+  未超限不挂噪音、单条过长带 `[+NB]` 标记、惰性重置（标记后下一条事件才清）。
 - AdvisorHint 注入：
   - runner 级（`agent::tests`）：turn 开始 drain（首个请求即见 hint + context
     留痕）；工具循环中途 drain（wiremock 恒定返回 tool_call + 工具 handler 推
@@ -199,7 +248,7 @@ AgentPauseGate，与本 monitor 无关）。
 - LLM 审查（`advisor_monitor::tests`，wiremock 作 advisor premium 模型）：
   裁决解析单测（ok/warn/intervene/大小写/多行 section/malformed→ok）；
   全链路（D3 触发 → 确定性 hint 立即入队 → wiremock 裁决 intervene → 🛑 气泡
-  + 纠正 hint 入队；断言审查请求包含触发证据/transcript/用户问题）；
+  + 纠正 hint 入队；断言审查请求包含触发证据/分派摘要/用户问题）；
   **分级**：warn → 只气泡（不引用 hint、队列仍只有确定性 hint），intervene →
   气泡 + 注 hint；`max_reviews_per_turn=1` 时两个检测器只审一次。
 - 监察笔记（tmp 目录构造文件，LATTE_HOME 重定向 + ENV_LOCK 隔离）：
