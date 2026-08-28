@@ -397,6 +397,24 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
     // 错过的排期），之后每 5s 扫描到期任务并派发给 manager。
     tokio::spawn(tasks::scheduler_loop(state.backend.clone()));
 
+    // Code-graph 索引：UI 启动后台预建，之后**周期性增量更新**，覆盖多种
+    // 「代码被改动」的场景——不管是 agent 的 write/edit/bash 改了源码、还是
+    // 用户用外部编辑器改、还是 git checkout/pull 换了分支，都能被接住。
+    //
+    // 为什么用周期轮询而不是挂 PostTool hook：
+    // - build_or_update 本身是「无改动即秒退」的 no-op（只比对已索引文件的
+    //   mtime），周期调用极廉价；
+    // - 轮询与「谁改的文件」解耦，外部编辑/git 操作同样覆盖，而 PostTool
+    //   只能接住 agent 自己的工具调用；
+    // - 不必把 cwd + async spawn plumb 进 per-role 的 hook 链。
+    //
+    // 落盘到 `.latte/code_graph/index.json`，让 code_graph 工具「先建地图」
+    // 命中索引秒回。非阻塞、不影响 bind；ast-grep 缺失/出错仅降级 no-op。
+    {
+        let cwd = state.backend.cwd.clone();
+        tokio::spawn(code_graph_index_loop(cwd));
+    }
+
     // Notion 同步器握手：从 env 读配置，挂 reqwest client，
     // 后台每 5s 跑一轮 sync_dirty_tasks。配置缺失（token 空）则
     // loop 内部 cfg.enabled=false 直接 no-op，不影响 server 启动。
@@ -429,6 +447,58 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         shutdown_tx: Some(shutdown_tx),
         server_task,
     })
+}
+
+/// Code-graph 索引后台循环：启动即建一次，之后每
+/// `LATTE_CODE_GRAPH_REFRESH_SECS`（默认 45s）增量刷新一次。
+///
+/// `build_or_update` 内部靠已索引文件的 mtime 判定新鲜度：无改动直接
+/// 秒退（UpToDate），只有真有源文件被改/消失才重扫落盘。因此高频轮询
+/// 也几乎零成本。设 `LATTE_CODE_GRAPH_REFRESH_SECS=0` 可关闭周期刷新
+/// （仅保留启动时那一次）。
+async fn code_graph_index_loop(cwd: PathBuf) {
+    use latte_agent_core::code_graph_index::{build_or_update, BuildOutcome};
+
+    async fn run_once(cwd: &std::path::Path, tag: &str) -> bool {
+        let t0 = std::time::Instant::now();
+        match build_or_update(cwd).await {
+            BuildOutcome::Built { files, symbols } => {
+                eprintln!(
+                    "[{tag}] code-graph index: built {files} files / {symbols} symbols in {:?}",
+                    t0.elapsed()
+                );
+                true
+            }
+            BuildOutcome::UpToDate => true,
+            BuildOutcome::AstGrepMissing => {
+                eprintln!(
+                    "[{tag}] code-graph index: skipped (ast-grep not installed; \
+                     code_graph tool falls back to live scan)"
+                );
+                false // 没装 ast-grep：别再周期空转
+            }
+        }
+    }
+
+    // 启动构建。
+    let ast_grep_ok = run_once(&cwd, "boot").await;
+    if !ast_grep_ok {
+        return;
+    }
+
+    let secs = std::env::var("LATTE_CODE_GRAPH_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(45);
+    if secs == 0 {
+        return; // 显式关闭周期刷新
+    }
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        // 周期刷新：静默处理（只有真重建时 build 分支才打印），避免刷屏。
+        let _ = run_once(&cwd, "refresh").await;
+    }
 }
 
 // ─── State ────────────────────────────────────────────────────────

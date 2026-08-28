@@ -6,5 +6,5 @@ model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/security_codeaudit.md"
 temperature = 0.4
-tools = ["read", "search", "delegate"]
+tools = ["read", "search", "delegate", "code_graph"]
 icon = "🔍"

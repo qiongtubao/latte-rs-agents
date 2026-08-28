@@ -6,5 +6,5 @@ model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/programmer_python.md"
 temperature = 0.3
-tools = ["read", "write", "bash", "search", "delegate"]
+tools = ["read", "write", "bash", "search", "delegate", "code_graph"]
 icon = "🐍"

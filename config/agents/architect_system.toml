@@ -6,5 +6,5 @@ model_tier = "premium"
 model_chain = ["deepseek-v4-flash"]
 prompt_file = "prompts/architect_system.md"
 temperature = 0.5
-tools = ["read", "search", "delegate"]
+tools = ["read", "search", "delegate", "code_graph"]
 icon = "🏛️"

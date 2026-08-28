@@ -51,7 +51,7 @@ temperature = 0.1
 # Same surface as architecture; the difference is the model and
 # the prompt (security-focused lens). Read-only by design: this
 # role reports findings, never fixes them.
-tools = ["read", "search"]
+tools = ["read", "search", "code_graph"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🛡️"

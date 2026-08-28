@@ -3537,6 +3537,53 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("signatures");
             let want_full = mode == "full";
 
+            // ── 预建索引 fast-path ──
+            // UI 启动时把定义类符号（function/struct/class/type…）的签名+行号
+            // 预扫进 `.latte/code_graph/index.json`。当这次查询是「按定义 kind
+            // 列签名」（无裸 pattern、mode=signatures）且索引对该 path 新鲜时，
+            // 直接读索引秒回，省掉一次 ast-grep 冷扫。索引不可用/不新鲜/是
+            // call/import 这类非索引 kind → 返回 None，落到下面的实时 ast-grep。
+            if !want_full {
+                if let Some(k) = kind {
+                    const MAX_MATCHES: usize = 200;
+                    const MAX_CHARS: usize = 12_000;
+                    if let Some((lines, total)) = crate::code_graph_index::query_signatures(
+                        std::path::Path::new("."),
+                        path,
+                        k,
+                        name,
+                        MAX_MATCHES,
+                        MAX_CHARS,
+                    ) {
+                        let mut result = serde_json::Map::new();
+                        result.insert(
+                            "source".into(),
+                            serde_json::Value::String("prebuilt_index".to_string()),
+                        );
+                        result.insert(
+                            "total_matches".into(),
+                            serde_json::Value::Number(total.into()),
+                        );
+                        result.insert(
+                            "shown".into(),
+                            serde_json::Value::Number(lines.len().into()),
+                        );
+                        result.insert(
+                            "matches".into(),
+                            serde_json::Value::String(lines.join("\n")),
+                        );
+                        if lines.len() < total {
+                            result.insert("note".into(), serde_json::Value::String(format!(
+                                "只回传了 {}/{total} 条（来自预建索引）。收窄：把 path 指向单个文件、\
+                                 或用 name 过滤。",
+                                lines.len()
+                            )));
+                        }
+                        return Ok(serde_json::Value::Object(result));
+                    }
+                }
+            }
+
             // ── ast-grep 可用性预检 ──
             // 旧实现直接 spawn，缺二进制时模型只拿到一句
             // "ast-grep failed: No such file"，试一次就再也不用这个工具。
@@ -9209,6 +9256,43 @@ require = ["永远不可能出现的验收字符串"]
         assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
         // eval 不在 allowed 里，被过滤掉。
         assert!(!names.iter().any(|n| n.starts_with("eval")), "eval 不应被保留（不在 allowed）: {names:?}");
+    }
+
+    /// 锁定 code_graph 暴露契约：allowed 含 "code_graph" 时，
+    /// build_tool_manager 必须注册出名为 "code_graph" 的工具。
+    /// 这是「programmer 为什么没用上 code_graph」排查的回归护栏——
+    /// 一旦 keep 匹配逻辑或工具名漂移导致 code_graph 被过滤掉，此测试立刻失败。
+    #[tokio::test]
+    async fn code_graph_kept_when_allowed() {
+        let mgr = build_tool_manager(&[
+            "read".into(),
+            "write".into(),
+            "bash".into(),
+            "search".into(),
+            "delegate".into(),
+            "code_graph".into(),
+            "ask".into(),
+        ])
+        .await
+        .expect("build_tool_manager");
+        let names: Vec<String> = mgr.get_tool_names();
+        assert!(
+            names.contains(&"code_graph".to_string()),
+            "allowed 含 code_graph 时必须注册 code_graph 工具: {names:?}"
+        );
+    }
+
+    /// 反向契约：allowed 不含 code_graph 时不应注册它（避免误暴露）。
+    #[tokio::test]
+    async fn code_graph_absent_when_not_allowed() {
+        let mgr = build_tool_manager(&["read".into(), "search".into()])
+            .await
+            .expect("build_tool_manager");
+        let names: Vec<String> = mgr.get_tool_names();
+        assert!(
+            !names.contains(&"code_graph".to_string()),
+            "未 allow 时不应注册 code_graph: {names:?}"
+        );
     }
 
     /// Advisor gate 端到端（driver 级）：manager turn 产出连续撞 D5
