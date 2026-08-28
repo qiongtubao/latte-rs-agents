@@ -107,8 +107,15 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | CLI 300s / UI 900s | specialist（delegate / workflow step）的 wall-clock 超时，超时即中止并回喂 manager 重派。模型目录里的 per-model `timeout_secs` 优先级最高 |
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
 | `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` | 5 | 模型全链不可用时自动暂停后的退避重试次数上限，用尽转人工（0 = 不自动重试，立刻等人点 ▶） |
-| `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS` | 420 | workflow 时间预算的「每分派单元」秒数。预算只计**有效工作时间**，暂停期间不扣 |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
+
+> **关于 workflow 的「防挂死」**：曾有一个 `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`
+> 按分派单元数推算 workflow 的 wall-clock 时间上限，跑满即中止。它只看**总时长**、
+> 无法区分「后端卡死」与「任务本身就重」，反复误杀持续在产出的健康长任务（如
+> 大仓库 explore 单步产出巨量报告），已移除。防挂死现在完全交给**单次模型调用的
+> TTFB/idle 流式超时**：后端零字节响应时秒级发现，冷却后沿模型链换下一个模型，
+> 全链都哑才升级为 `ModelsUnavailable → 自动暂停等用户`。合法长任务只要一直在
+> 产出就不受时限约束。
 
 ### 工具循环的终止条件
 

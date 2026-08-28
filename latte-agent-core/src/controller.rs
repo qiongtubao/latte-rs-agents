@@ -4918,12 +4918,16 @@ pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
 /// —— 相当于"不靠这层兜底"。
 ///
 /// 真正的控制手段是：
-/// - **workflow 的规模预算**（[`crate::workflow::Budget`] /
-///   [`crate::workflow::estimate_budget_secs`]）—— 顶层 run 按「分派单元数
-///   × 单次分派预算」推算 wall-clock 上限，在引擎内enforce。它才是
-///   `workflow` 这条路径真正的天花板；本常量只是把工具管理器那一层
+/// - **单次模型调用的 TTFB / idle 流式超时**（`agent.rs`）—— 后端零
+///   字节响应时秒级发现，冷却后沿模型链换下一个模型，全链都哑才升级
+///   为 `ModelsUnavailable → 自动暂停等用户`。这才是 `workflow` /
+///   `delegate` 路径真正的防挂死手段：它按「活性」而非「总时长」判定，
+///   不会误杀持续在产出的健康长任务。本常量只是把工具管理器那一层
 ///   让开，避免两层超时倒挂（工具层比引擎层更紧 → 引擎还在跑，工具
 ///   已经熔断 → 孤儿 step）。
+///   （历史：曾在引擎里加过一层「按分派单元数推算的 wall-clock 规模
+///   预算」，但它只看总时长、无法区分「卡死」与「任务就是重」，反复
+///   误杀 jemalloc explore 这类合法长任务，已移除。）
 /// - per-step wall-clock 触发的 `TimeoutWarning`（周期复发，让用户拍板）、
 ///   `turn_cancel_flag`（用户「终止当前任务」）、session `cancel_flag`
 ///   （全量中止），以及 `run_turn` 内部的死循环熔断。

@@ -1130,10 +1130,10 @@ async fn register_workflow_tool(
         handler,
     )
     // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：这里此前漏配 `.timeout()`，
-    // 于是吃工具管理器 1500s(25min) 默认熔断 —— 比引擎侧按规模推算的
-    // 预算紧得多，正是「超时倒挂」：引擎还在跑，工具层已经熔断，
-    // step 变孤儿任务。真正的天花板由 workflow::Budget 在引擎里管，
-    // 它知道 wf_id，报错能带 resume 凭据。
+    // 于是吃工具管理器 1500s(25min) 默认熔断 —— 比子流水线真实时长紧
+    // 得多，正是「超时倒挂」：引擎还在跑，工具层已经熔断，step 变孤儿
+    // 任务。防挂死改由单次模型调用的 idle/TTFB 流式超时按「活性」兜底
+    // （见 agent.rs），不再靠工具层这道墙钟。
     .timeout(std::time::Duration::from_secs(
         latte_agent_core::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS,
     ))

@@ -937,12 +937,6 @@ fn classify_tool_execution_error(
         };
     }
     let msg = e.to_string();
-    // workflow 预算超支：checkpoint 已落盘，盲目重试 = 从第 0 步重跑，
-    // 已完成的成果全扔再烧一份同样长的预算（jemalloc「两次空等 50
-    // 分钟」）。判不可重试，把带 wf_id 的错误喂回模型走 resume。
-    if msg.contains(crate::workflow::BUDGET_EXCEEDED_MARKER) {
-        return ToolCallErrorKind::PermanentExec { reason: msg };
-    }
     const PERMANENT: &[&str] = &[
         "No such file or directory",
         "Path not found",
@@ -3422,25 +3416,6 @@ mod tests {
         assert_eq!(kind, ToolCallErrorKind::Timeout, "必须归到 Timeout");
         assert_eq!(kind.label(), "Timeout", "trace 上要能看出是超时");
         assert!(policy.retryable(&kind), "工具级超时仍可重试一次");
-    }
-
-    /// workflow 预算超支 → 不可重试。盲目重试等于丢掉 checkpoint 从第 0
-    /// 步重跑，再烧一份同样长的预算（jemalloc「两次空等 50 分钟」）。
-    /// 正确善后是把带 wf_id 的错误喂回模型走 resume。
-    #[test]
-    fn workflow_budget_exceeded_is_not_blindly_retried() {
-        let policy = DefaultRetryPolicy;
-        let msg = format!(
-            "{} 1800s（2 个分派单元 × 900s/单元），已中止\
-             （已完成 1/3 步，可用 resume 从断点续跑：wf_id=wf-x-1）",
-            crate::workflow::BUDGET_EXCEEDED_MARKER
-        );
-        let kind = classify_tool_execution_error(&ToolError::other(&msg));
-        assert!(
-            matches!(kind, ToolCallErrorKind::PermanentExec { .. }),
-            "got {kind:?}"
-        );
-        assert!(!policy.retryable(&kind), "预算超支不得原样重跑整条流水线");
     }
 
     fn test_model() -> Model {

@@ -812,161 +812,17 @@ pub struct WorkflowRunContext {
 /// with an error — almost always a cycle or a design mistake.
 pub const MAX_WORKFLOW_DEPTH: u8 = 3;
 
-/// 无法加载的嵌套 workflow 按几个分派单元估。取值偏小是故意的：
-/// 名字都加载不出来的 step 大概率会立刻失败，不该为它把整体预算
-/// 抬高。
-const NESTED_UNKNOWN_UNITS: usize = 4;
-
-/// 「预算超支」失败消息的固定标记。存在的理由：`classify_tool_execution_error`
-/// 要能把它认出来判**不可重试**——预算超支时 checkpoint 已经落盘，
-/// 盲目重试等于从第 0 步重跑一遍，把已完成的成果全扔了再烧一份同样
-/// 长的预算（这正是 jemalloc「两次空等 50 分钟」的形状）。正确善后是
-/// 拿错误里的 wf_id 走 resume，由模型决策。
-pub const BUDGET_EXCEEDED_MARKER: &str = "超出按规模推算的时间预算";
-
-/// 一条 workflow 的「分派单元」数：一个单元 = 一次 speaker 分派
-/// （一个 step 里每个 role 各算一次），嵌套 step 递归展开成子流程的
-/// 单元数。用于把时间预算按**子流程真实规模**推算，而不是所有
-/// workflow 共用一个拍脑袋的常量。
-///
-/// 计入的放大因素：
-/// - `max_retries`：契约不合格会带批注重跑同一 step
-/// - `loop_until` 的 `max_iterations`：返工环会把目标及其下游重跑多轮
-///   （取全流程最大值作为整体倍数——偏保守，宁可预算大也不要误杀）
-///
-/// 递归以 [`MAX_WORKFLOW_DEPTH`] 为界；加载不出来的嵌套名按
-/// [`NESTED_UNKNOWN_UNITS`] 兜底，绝不因此报错（预算估算不该让注册
-/// 或启动失败）。
-pub fn dispatch_units(wf: &WorkflowDef, cwd: &Path, depth: u8) -> usize {
-    let per_step: Vec<usize> = wf
-        .steps
-        .iter()
-        .map(|step| {
-            let base = match &step.workflow {
-                Some(name) if depth < MAX_WORKFLOW_DEPTH => load_workflow(name, cwd)
-                    .map(|nested| dispatch_units(&nested, cwd, depth + 1))
-                    .unwrap_or(NESTED_UNKNOWN_UNITS),
-                // 深度到顶：不再展开（运行时也会被 MAX_WORKFLOW_DEPTH
-                // 拒），按兜底值计。
-                Some(_) => NESTED_UNKNOWN_UNITS,
-                None => step.roles().len().max(1),
-            };
-            base.saturating_mul(1 + step.max_retries as usize)
-        })
-        .collect();
-    let base: usize = per_step.iter().copied().fold(0, usize::saturating_add);
-
-    // 返工环的额外预算 = (轮数 - 1) × 「被重跑的区间」的单元数。
-    // 区间 = loop_back_to 目标 → 本 loop step（文件序；DAG 下 validate
-    // 已保证目标位于严格更早的 wave，文件序是可用的近似）。
-    //
-    // 不能把整条流水线乘以轮数：design_and_plan 那样算出 93 个单元、
-    // 23 小时预算，等于天花板不存在（改动前就是 24h 常量）。返工只重跑
-    // 目标及其下游，interview / explore 这些上游一次都不会重来。
-    let mut extra: usize = 0;
-    for (i, step) in wf.steps.iter().enumerate() {
-        if step.loop_until.is_none() {
-            continue;
-        }
-        let iters = step.max_iterations.unwrap_or(3).clamp(1, 10);
-        let target = step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
-        let start = wf
-            .steps
-            .iter()
-            .position(|s| s.id == target)
-            .unwrap_or(i)
-            .min(i);
-        let scope: usize = per_step[start..=i].iter().copied().fold(0, usize::saturating_add);
-        extra = extra.saturating_add(scope.saturating_mul(iters.saturating_sub(1)));
-    }
-    base.saturating_add(extra).max(1)
-}
-
 /// spawn 出去的任务在守卫被 drop 时一起 abort。
 ///
 /// 存在理由：`tokio::task::JoinHandle` 被 drop 时任务**继续跑**。
-/// workflow 预算超支时我们 drop 整个引擎 future，如果分派是 spawn 的，
-/// 它不会因此停下（jemalloc 实锤见使用处注释）。任务已结束时 abort
-/// 是 no-op，正常路径无副作用。
+/// 引擎 future 提前落地时（如用户取消），若分派是 spawn 的，它不会因此
+/// 停下。任务已结束时 abort 是 no-op，正常路径无副作用。
 struct AbortOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
-}
-
-/// 默认的「每个分派单元」预算秒数。
-///
-/// 刻意**不用** `specialist_timeout_secs`（per-step 软超时，默认 900s）：
-/// 那是「这一步慢得该提醒用户了」的告警线，把它当预算单位等于假设每次
-/// 分派都病态地慢 —— 实测 design_and_plan 会算出 23 小时预算，跟改动前
-/// 的 24h 常量没有区别，天花板等于不存在。
-///
-/// 取值依据：design_and_plan 实测约 48 分钟 / 31 个基础单元 ≈ 93s/单元。
-/// 原取 240s（2.5 倍余量），但实测单次分派的 p90 已经超过它：jemalloc
-/// 2026-08-26 会话里 explore 的 `synthesize` 单步 architect 跑了 247s /
-/// 251s，`delegate` 单次 262s ——「2 个单元 × 240s = 480s」对一个真要跑
-/// 500s 的两步流水线就是必死，explore 连着两次被砍（480s、240s），两次
-/// 都只完成 1/2 步，最后 manager 只能放弃流程改手工 delegate。
-///
-/// 改取 420s：小流水线拿到够用的余量（2 单元 → 840s），同时最大的
-/// design_and_plan（87 单元）仍落在 ~10h，明显低于工具层 24h 天花板 ——
-/// 上限不能因为放宽而退化成"没有上限"（见
-/// `real_design_and_plan_budget_is_sane` 回归测试）。
-/// env `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS` 可覆盖。
-pub const DEFAULT_BUDGET_SECS_PER_UNIT: u64 = 420;
-
-/// 每个分派单元的预算秒数（env 可覆盖，每次调用读 env 便于测试）。
-pub fn budget_secs_per_unit() -> u64 {
-    std::env::var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_BUDGET_SECS_PER_UNIT)
-}
-
-/// 按规模推算一条 workflow 的 wall-clock 时间预算（秒）。
-///
-/// `per_unit_secs` 是单次分派计入预算的秒数，调用方传
-/// [`budget_secs_per_unit`]。
-///
-/// 结果夹在 `[per_unit_secs, ORCHESTRATION_TOOL_TIMEOUT_SECS]`：下界
-/// 保证再小的 workflow 也有一个单元的余量，上界保证永不超过工具管理器
-/// 那一层的天花板（否则工具层先熔断，又变成孤儿 step）。
-pub fn estimate_budget_secs(wf: &WorkflowDef, cwd: &Path, per_unit_secs: u64) -> u64 {
-    let ceiling = crate::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS;
-    let per_unit = per_unit_secs.max(1);
-    // 下界也要压在天花板之内：单次分派预算本身就大过天花板时
-    // （env 配了个荒谬的值），`clamp(min, max)` 会因 min > max 直接
-    // panic。
-    let floor = per_unit.min(ceiling);
-    let units = dispatch_units(wf, cwd, 0).saturating_mul(wf.effective_max_rounds());
-    (units as u64).saturating_mul(per_unit).clamp(floor, ceiling)
-}
-
-/// resume 的时间预算：已完成的 step 会被跳过（不发模型请求），照抄全量
-/// 估算等于给残余工作发一份跑完整条流水线的时间，所以按剩余 step 比例
-/// 缩水。
-///
-/// **下界是「剩余 step × 单元预算」**，不是「一个单元」：jemalloc
-/// 2026-08-26 会话里 explore 首跑 480s 超支（完成 1/2 步），resume 被算成
-/// 480×1/2 = 240s —— 比首次还短，而剩下那一步本身要 ~250s，于是必然二次
-/// 超支，两次共白等 12 分钟。「因超时而重试却拿到更短的预算」是反向激励。
-pub fn resume_budget_secs(full_secs: u64, per_unit_secs: u64, steps: usize, done: usize) -> u64 {
-    if steps == 0 {
-        return full_secs;
-    }
-    let done = done.min(steps);
-    let remaining = steps.saturating_sub(done);
-    let scaled = full_secs
-        .saturating_mul(remaining as u64)
-        .saturating_div(steps as u64);
-    let floor = per_unit_secs
-        .max(1)
-        .saturating_mul(remaining.max(1) as u64)
-        .min(crate::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS);
-    scaled.max(floor)
 }
 
 /// Run a nested workflow step: load the named workflow and run it with
@@ -1033,10 +889,10 @@ fn run_nested_workflow(
             // root 为 None，用父自己的 wf_id 兜底）。
             root_wf_id: Some(root_wf_id.clone()),
         };
-        // 嵌套 run 不自设预算：外层顶层 run 的截止时间已经把它包住，
-        // 内外层各设一份等于同一段时间被重复计费。
+        // 嵌套 run 不自设预算（墙钟机制已废弃）：防挂死由下层 idle
+        // 超时统一兜住。
         let (last, keyed) =
-            run_workflow_inner(&wf, &topic, &nested_ctx, None, Budget::Off).await?;
+            run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
         let available = || keyed.keys().cloned().collect::<Vec<_>>().join(", ");
         // export：把子 workflow 的若干中间产物按「父级变量名 ← 子
         // output_key」带出去（打通信息漏斗，见 `WorkflowStepDef::export`）。
@@ -1478,27 +1334,9 @@ pub async fn run_workflow(
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, None, Budget::Auto)
+    run_workflow_inner(wf, topic, ctx, None)
         .await
         .map(|(out, _)| out)
-}
-
-/// 一次 run 的 wall-clock 时间预算。
-///
-/// 为什么放在引擎里而不是 `workflow` 工具那一层：工具的
-/// `Tool::timeout` 是**注册期常量**（`ORCHESTRATION_TOOL_TIMEOUT_SECS`
-/// = 24h，等于没有天花板），而「这条流水线该跑多久」只有加载完
-/// `WorkflowDef` 之后才知道。放在引擎里还有一个关键好处：`wf_id` 在
-/// 这里是已知的，超支的错误消息能直接带上 resume 凭据；在工具层包一层
-/// `tokio::time::timeout` 拿不到 wf_id，只能给一句没法善后的报错。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Budget {
-    /// 按 [`estimate_budget_secs`] 从子流程规模推算，resume 时再按
-    /// **剩余** step 比例缩水。仅顶层 run 生效——嵌套 run 不自设预算，
-    /// 由外层的截止时间统一兜住，否则同一段时间被内外层重复计费。
-    Auto,
-    /// 不设预算（嵌套 run；测试里也用它排除时间因素）。
-    Off,
 }
 
 /// Resume a previously interrupted workflow run from its checkpoint
@@ -1517,7 +1355,7 @@ pub async fn run_workflow_resume(
     ctx: &WorkflowRunContext,
     resume_wf_id: &str,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id), Budget::Auto)
+    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id))
         .await
         .map(|(out, _)| out)
 }
@@ -1529,7 +1367,6 @@ async fn run_workflow_inner(
     topic: &str,
     ctx: &WorkflowRunContext,
     resume_wf_id: Option<&str>,
-    budget: Budget,
 ) -> Result<(String, std::collections::HashMap<String, String>), String> {
     wf.validate()?;
     let uses_dag = wf.uses_dependency_dag();
@@ -1652,36 +1489,19 @@ async fn run_workflow_inner(
         wf_id: wf_id.clone(),
     });
 
-    // ── wall-clock 时间预算 ────────────────────────────────────────
-    // 按分派单元数 × 单次分派预算推算。此前唯一的天花板是
-    // `workflow` 工具的注册期常量 24h（= 没有天花板）：真卡住的流水线
-    // 只能靠用户盯着 TimeoutWarning 手动终止，没人盯就一直挂。
-    let per_unit = budget_secs_per_unit();
-    let budget_secs = match budget {
-        Budget::Off => 0,
-        Budget::Auto if ctx.depth == 0 => {
-            let full = estimate_budget_secs(wf, &ctx.cwd, per_unit);
-            // resume 用**不同预算**：已完成的 step 会被跳过（不发模型
-            // 请求），照抄全量估算等于给残余工作发一份跑完整条流水线的
-            // 时间。按剩余 step 比例缩水。
-            //
-            // 但下界必须是「剩余 step × 单元预算」，不能是「一个单元」：
-            // jemalloc 2026-08-26 会话里 explore 首跑 480s 超支（完成
-            // 1/2 步），resume 按比例算成 480×1/2 = 240s —— 比首次更短，
-            // 而剩下那一步本身就要 ~250s，于是必然二次超支，两次共白等
-            // 12 分钟。「因超时而重试」拿到更短的预算是纯粹的反向激励。
-            match &resume {
-                Some(state) if !wf.steps.is_empty() => resume_budget_secs(
-                    full,
-                    per_unit,
-                    wf.steps.len(),
-                    state.completed.len(),
-                ),
-                _ => full,
-            }
-        }
-        Budget::Auto => 0,
-    };
+    // ── 不设 workflow 层 wall-clock 预算（deadline-only 已废弃）─────
+    // 曾经这里按「分派单元数 × 每单元 420s」推算一个墙钟上限，跑满即
+    // 中止整条流程。它的意图是防「流水线真卡死没人叫停」，但用错了
+    // 信号维度：只看总时长，无法区分「后端卡死」和「任务本身就重」，
+    // 于是持续在吐 token、完全健康的重任务（jemalloc explore 单步产
+    // 40KB 报告）被反复误杀，还诱导 resume 二次空等。
+    //
+    // 真正的「防挂死」由更精准的下层机制承担，无需这一层冗余墙钟：
+    //   1. 单次模型调用的 TTFB/idle 流式超时（agent.rs）—— 后端零字节
+    //      响应时秒级发现，冷却后沿模型链换下一个模型，全链都哑才升级
+    //      为 ModelsUnavailable → 自动暂停等用户，全程不丢已有成果；
+    //   2. 死循环熔断（连击 / 打转）—— 抓「空转」这个正交的真信号。
+    // 合法长任务只要一直在产出就想跑多久跑多久。
     // 用户回答台账：resume 时预载上一次运行已答过的问题，同一个问题
     // 不再弹给用户（见 AnswerLog）。同时带上本 run 的恢复身份
     // （cwd + wf_id + session_id）—— 阻塞 ask 靠它把挂起项落盘，
@@ -1714,13 +1534,6 @@ async fn run_workflow_inner(
         ctx.root_wf_id.clone(),
         preloaded,
     ));
-    // 预算相关的两份材料必须在 engine future 之前取好：engine 会可变
-    // 借走 ctx，之后（select! 的另一分支里）再碰 ctx 借用检查过不去。
-    let budget_gate = ctx.agent_pause_gate.clone();
-    let budget_exceeded_msg = format!(
-        "{BUDGET_EXCEEDED_MARKER} {budget_secs}s（{} 个分派单元 × {per_unit}s/单元），已中止",
-        dispatch_units(wf, &ctx.cwd, 0) * wf.effective_max_rounds()
-    );
     let engine = async {
         if uses_dag {
             run_workflow_dag(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref(), &answer_log).await
@@ -1728,75 +1541,9 @@ async fn run_workflow_inner(
             run_workflow_serial(wf, &topic, ctx, &wf_id, &ckpt, resume.as_ref(), &answer_log).await
         }
     };
-    let outcome = if budget_secs == 0 {
-        engine.await
-    } else {
-        // 预算只扣「真在干活」的时间：session 被 ⏸ park 期间（用户手动
-        // 暂停，或模型不可用自动暂停）不计入。
-        //
-        // 此前这里是裸 `tokio::time::timeout`，纯 wall-clock，对 pause
-        // 一无所知。jemalloc 2026-08-26 会话：reviewer 22:06:27 因
-        // 「模型不可用」自动暂停，停在 gate 上一次模型调用都没发出去，
-        // 5040s 预算照扣到点，整条 task_refine 被判超支中止，已完成的
-        // 2/4 步成果作废，用户要的东西一样没交付。一次 9 秒的网络抖动
-        // 放大成 84 分钟静默 + 全盘丢失。
-        let budget = std::time::Duration::from_secs(budget_secs);
-        let paused_base = budget_gate
-            .as_ref()
-            .map(|g| g.total_paused())
-            .unwrap_or_default();
-        // 精确 deadline + 补偿，而不是固定间隔轮询：先睡到 deadline，
-        // 醒来时看这段里 park 了多久，把 park 掉的时间**原样补回**
-        // deadline 再继续睡；补偿追平后才判超支。
-        //
-        // 为什么不用固定 tick 轮询：粒度会吃掉小预算。测试
-        // `budget_exceeded_aborts_with_resumable_error` 把预算压到 1s
-        // （模型慢 3s），15s 一跳的看门狗根本来不及开火，超支判不出来。
-        let watchdog = async {
-            let mut deadline = tokio::time::Instant::now() + budget;
-            // 已经补偿进 deadline 的 park 总量，避免重复补偿。
-            let mut compensated = std::time::Duration::ZERO;
-            loop {
-                tokio::time::sleep_until(deadline).await;
-                let parked = budget_gate
-                    .as_ref()
-                    .map(|g| g.total_paused().saturating_sub(paused_base))
-                    .unwrap_or_default();
-                let owed = parked.saturating_sub(compensated);
-                if owed.is_zero() {
-                    // 没有未补偿的暂停 → 有效工时确实用尽。
-                    return parked;
-                }
-                // 把 park 的时间还给 deadline。仍在暂停中时
-                // `total_paused()` 含 in-flight 段，下一轮会继续顺延。
-                deadline += owed;
-                compensated = parked;
-            }
-        };
-        tokio::pin!(engine);
-        tokio::select! {
-            // biased：engine 先于看门狗被 poll。同一次唤醒里两者都就绪
-            // 时，已经跑完的流水线不该被判超支。
-            biased;
-            o = &mut engine => o,
-            // 超支即中止：drop 掉引擎 future 会连带 abort 在跑的 step
-            // （DAG 的 JoinSet 归该 future 所有），不留孤儿任务——这正是
-            // 此前工具层 25min 熔断做不到的事。已完成的 step 都在
-            // checkpoint 里，下面的 Failed 分支会把 wf_id 附上。
-            parked = watchdog => {
-                if parked > std::time::Duration::from_secs(1) {
-                    // 有效工时超支，但期间确实停过——把 park 时长写进
-                    // 错误，否则「跑了 5040s」会被读成「一直在干活」。
-                    WfOutcome::Failed(format!(
-                        "{budget_exceeded_msg}（另有 {}s 处于暂停，未计入预算）",
-                        parked.as_secs()
-                    ))
-                } else {
-                    WfOutcome::Failed(budget_exceeded_msg.clone())
-                }
-            }
-        }
-    };
+    // 墙钟已移除：直接跑到引擎自然收尾（正常完成 / 用户取消 /
+    // step 失败）。真卡死由下层 idle 超时 + 自动暂停接管，不在此中止。
+    let outcome = engine.await;
 
     match outcome {
         WfOutcome::Ok(last_output, keyed_outputs) => {
@@ -2385,12 +2132,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             // 下游最有价值）。
             (result, tool_count, tool_summary)
         });
-        // 外层 future 被 drop（预算超支中止 / 上层取消）时连带 abort 这个
+        // 外层 future 被 drop（上层取消 / 用户终止）时连带 abort 这个
         // spawn 出去的分派。`JoinHandle` 自己 drop **不取消**任务，光靠
-        // "drop 引擎 future" 并不能停掉 specialist：jemalloc
-        // 2026-08-26 会话里 wf 13:52:06 判预算超支，architect 子会话
-        // 一直写到 13:54:24 —— 2 分钟孤儿工作，token 白烧，且它的产出
-        // 没人再要。
+        // "drop 引擎 future" 并不能停掉 specialist：否则被取消后 architect
+        // 子会话会变成孤儿任务继续写，token 白烧且产出没人再要。
         let _abort_on_drop = AbortOnDrop(run_handle.abort_handle());
         // 熔断：wall-clock 超时（对齐 controller delegate；被 500ms
         // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
@@ -4043,270 +3788,6 @@ loop_abort_on = "VERDICT: REJECT"
         assert!(err.contains("loop_until"), "错误应说明依赖: {err}");
     }
 
-    /// 分派单元计数：多 speaker、max_retries、返工环倍数都要计入。
-    #[test]
-    fn dispatch_units_counts_speakers_retries_and_loops() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path();
-
-        // 单 role 三步 = 3 个单元。
-        let wf = wf_from(
-            r#"
-name = "plain"
-[[steps]]
-id = "a"
-role = "pm"
-task = "t"
-[[steps]]
-id = "b"
-role = "architect"
-task = "t"
-[[steps]]
-id = "c"
-role = "reviewer"
-task = "t"
-"#,
-        );
-        assert_eq!(dispatch_units(&wf, cwd, 0), 3);
-
-        // 多 speaker：一个 step 里每个 role 各一次分派。
-        let wf = wf_from(
-            r#"
-name = "multi"
-[[steps]]
-id = "a"
-speakers = ["pm", "architect", "reviewer"]
-prompt = "t"
-"#,
-        );
-        assert_eq!(dispatch_units(&wf, cwd, 0), 3);
-
-        // max_retries=2 → 该 step 最多跑 3 次。
-        let wf = wf_from(
-            r#"
-name = "retry"
-[[steps]]
-id = "a"
-role = "pm"
-task = "t"
-max_retries = 2
-"#,
-        );
-        assert_eq!(dispatch_units(&wf, cwd, 0), 3);
-
-        // 返工环：额外预算只覆盖被重跑的区间 [loop_back_to, loop step]，
-        // 不是整条流水线乘轮数。
-        // upstream(1) + a(1) + gate(1) = 3 基础；区间 a..=gate = 2 个单元，
-        // (3-1) × 2 = 4 额外 → 7。
-        let wf = wf_from(
-            r#"
-name = "loop"
-[[steps]]
-id = "upstream"
-role = "pm"
-task = "t"
-[[steps]]
-id = "a"
-role = "architect"
-task = "t"
-[[steps]]
-id = "gate"
-role = "reviewer"
-task = "t"
-loop_until = "VERDICT: PASS"
-loop_back_to = "a"
-max_iterations = 3
-"#,
-        );
-        assert_eq!(
-            dispatch_units(&wf, cwd, 0),
-            7,
-            "上游 upstream 一次都不会重跑，不该被计入返工倍数"
-        );
-    }
-
-    /// per-unit 预算旋钮：默认值 + env 覆盖。刻意与 per-step 软超时
-    /// （900s 告警线）分开——混用会把 design_and_plan 算成 23 小时。
-    #[test]
-    fn budget_per_unit_defaults_and_env_override() {
-        let _guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
-        assert_eq!(budget_secs_per_unit(), DEFAULT_BUDGET_SECS_PER_UNIT);
-        assert_ne!(
-            DEFAULT_BUDGET_SECS_PER_UNIT,
-            crate::controller::DEFAULT_UI_DELEGATE_TIMEOUT_SECS,
-            "预算单位不得等于 per-step 软超时告警线"
-        );
-        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "60");
-        assert_eq!(budget_secs_per_unit(), 60);
-        // 0 / 垃圾值退回默认，不会算出 0 预算（0 = 关闭，语义完全相反）。
-        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "0");
-        assert_eq!(budget_secs_per_unit(), DEFAULT_BUDGET_SECS_PER_UNIT);
-        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "abc");
-        assert_eq!(budget_secs_per_unit(), DEFAULT_BUDGET_SECS_PER_UNIT);
-        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
-    }
-
-    /// 嵌套 step 递归展开成子流程的单元数——「按子流程规模推算」的
-    /// 核心。加载不出来的嵌套名按兜底值计，绝不报错。
-    #[test]
-    fn dispatch_units_expands_nested_workflows() {
-        let dir = tempfile::tempdir().unwrap();
-        let wf_dir = dir.path().join(".latte").join("workflows.d");
-        std::fs::create_dir_all(&wf_dir).unwrap();
-        std::fs::write(
-            wf_dir.join("inner.toml"),
-            r#"
-name = "inner"
-[[steps]]
-id = "i1"
-role = "pm"
-task = "t"
-[[steps]]
-id = "i2"
-speakers = ["architect", "reviewer"]
-prompt = "t"
-"#,
-        )
-        .unwrap();
-
-        // inner 自己 = 1 + 2 = 3 个单元。
-        let parent = wf_from(
-            r#"
-name = "outer"
-[[steps]]
-id = "own"
-role = "pm"
-task = "t"
-[[steps]]
-id = "nested"
-workflow = "inner"
-task = "t"
-"#,
-        );
-        assert_eq!(
-            dispatch_units(&parent, dir.path(), 0),
-            4,
-            "1（自有 step）+ 3（展开 inner）"
-        );
-
-        // 加载不出来的嵌套名 → 兜底值，不 panic 不报错。
-        let broken = wf_from(
-            r#"
-name = "outer2"
-[[steps]]
-id = "nested"
-workflow = "does_not_exist"
-task = "t"
-"#,
-        );
-        assert_eq!(dispatch_units(&broken, dir.path(), 0), NESTED_UNKNOWN_UNITS);
-    }
-
-    /// 拿仓库里真实的 design_and_plan（6 层嵌套 + 双评审并行波 + gate
-    /// 返工环）验证推算落在合理区间：实测这条流水线约 48 分钟，预算
-    /// 必须明显宽于它（否则健康的长任务会被误杀），同时远低于 24h
-    /// 天花板（否则等于没有天花板，回到改动前）。
-    #[test]
-    fn real_design_and_plan_budget_is_sane() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("workspace root")
-            .to_path_buf();
-        let wf = match load_workflow("design_and_plan", &root) {
-            Ok(w) => w,
-            // 仓库布局变了就跳过，不把无关改动搞红。
-            Err(_) => return,
-        };
-        let units = dispatch_units(&wf, &root, 0);
-        let budget = estimate_budget_secs(&wf, &root, DEFAULT_BUDGET_SECS_PER_UNIT);
-        assert!(
-            units >= 20,
-            "6 个嵌套子流程 + gate 返工环，单元数不该这么小: {units}"
-        );
-        // 下界：明显宽于实测 48 分钟，否则健康的长任务会被误杀。
-        assert!(
-            budget > 48 * 60 * 2,
-            "预算必须明显宽于实测 48 分钟: {budget}s（{units} 单元）"
-        );
-        // 上界：必须远离 24h 天花板，否则「有上限」只是纸面上的
-        // （改动前就是 24h 常量）。取 12h 作回归线。
-        assert!(
-            budget < 12 * 3600,
-            "预算顶到天花板量级 = 等于没有上限: {budget}s（{units} 单元）"
-        );
-    }
-
-    /// 预算 = 单元数 × 单次分派预算，并夹在 [per_unit, 工具层天花板]。
-    /// 上界很重要：预算若超过 `ORCHESTRATION_TOOL_TIMEOUT_SECS`，工具
-    /// 管理器那一层会先熔断，又变回孤儿 step。
-    #[test]
-    fn estimate_budget_scales_with_units_and_stays_under_tool_ceiling() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path();
-        let wf = wf_from(
-            r#"
-name = "three"
-[[steps]]
-id = "a"
-role = "pm"
-task = "t"
-[[steps]]
-id = "b"
-role = "architect"
-task = "t"
-[[steps]]
-id = "c"
-role = "reviewer"
-task = "t"
-"#,
-        );
-        assert_eq!(estimate_budget_secs(&wf, cwd, 100), 300);
-        // 下界：单步 workflow 也至少有一个单元的余量。
-        let one = wf_from(
-            r#"
-name = "one"
-[[steps]]
-id = "a"
-role = "pm"
-task = "t"
-"#,
-        );
-        assert_eq!(estimate_budget_secs(&one, cwd, 900), 900);
-        // 上界：不得越过工具管理器那一层的天花板。
-        let huge = estimate_budget_secs(&wf, cwd, u64::MAX / 2);
-        assert_eq!(huge, crate::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS);
-    }
-
-    /// resume 的预算不得比"剩余 step 实际需要的时间"更短。
-    ///
-    /// 回归的是 jemalloc 2026-08-26 事故：explore 首跑 480s 超支（完成
-    /// 1/2 步），resume 按比例算成 240s —— 比首次更短，剩下那一步要
-    /// ~250s，必然二次超支。
-    #[test]
-    fn resume_budget_never_below_remaining_steps() {
-        // 2 步完成 1 步：按比例是 480/2 = 240，但下界 = 剩余 1 步 × 240。
-        assert_eq!(resume_budget_secs(480, 240, 2, 1), 240);
-        // 单元预算抬到 600 后同样场景拿到 600，而不是 240。
-        assert_eq!(resume_budget_secs(480, 600, 2, 1), 600);
-        // 4 步完成 1 步：比例值 750 高于下界 2×240=480 → 取比例值。
-        assert_eq!(resume_budget_secs(1000, 240, 4, 1), 750);
-        // 4 步完成 3 步：比例值 250 低于下界 1×600 → 取下界。
-        assert_eq!(resume_budget_secs(1000, 600, 4, 3), 600);
-        // 全部完成：仍留一个单元跑收尾，不给 0（0 = 不限预算）。
-        assert!(resume_budget_secs(1000, 600, 2, 2) > 0);
-        // 天花板：下界也不许越过工具层上限。
-        assert_eq!(
-            resume_budget_secs(0, u64::MAX / 2, 4, 0),
-            crate::controller::ORCHESTRATION_TOOL_TIMEOUT_SECS
-        );
-        // steps=0（畸形定义）走原值，不 panic。
-        assert_eq!(resume_budget_secs(123, 600, 0, 0), 123);
-    }
-
     /// `AbortOnDrop` 必须真的取消 spawn 出去的任务：`JoinHandle` 自身
     /// drop 不取消，预算超支时孤儿 specialist 会继续烧 token。
     #[tokio::test]
@@ -4327,28 +3808,6 @@ task = "t"
             "任务应在守卫 drop 时被取消，不该跑完"
         );
         assert!(handle.await.is_err(), "被 abort 的任务 join 应返回 JoinError");
-    }
-
-    /// 嵌套 run 不自设预算：内外层各设一份等于同一段时间被重复计费，
-    /// 子流程会先于父级预算被判死。
-    #[test]
-    fn nested_runs_do_not_set_their_own_budget() {
-        assert_eq!(Budget::Off, Budget::Off);
-        // depth > 0 的 Auto 等价于关闭 —— 由 run_workflow_inner 的
-        // match 保证；这里锁住语义文档，实际行为由上面的端到端测试
-        // （嵌套返工/组合类）覆盖。
-        let dir = tempfile::tempdir().unwrap();
-        let wf = wf_from(
-            r#"
-name = "n"
-[[steps]]
-id = "a"
-role = "pm"
-task = "t"
-"#,
-        );
-        // 估算函数本身不看 depth：depth 判定在调用点。
-        assert!(estimate_budget_secs(&wf, dir.path(), 10) > 0);
     }
 
     /// 熔断标记若把放行条件当子串包含，放行判定永远先命中，熔断成
@@ -6821,169 +6280,6 @@ output_key = "user_profile"
         assert!(line.contains("第 1 题"), "问题原文要落盘（回放的 key）: {line}");
         assert!(line.contains("\"role\":\"worker\""), "记账要带提问角色: {line}");
     }
-
-    /// 预算超支必须**中止**并给出可 resume 的错误（标记 + 单元数说明
-    /// + wf_id），而不是无限挂着等人来看 TimeoutWarning。此前唯一的
-    /// 天花板是 `workflow` 工具的注册期常量 24h = 没有天花板。
-    #[tokio::test]
-    async fn budget_exceeded_aborts_with_resumable_error() {
-        let server = wiremock::MockServer::start().await;
-        // 模型每次慢 3s；预算被 env 压到 1s/单元 × 1 单元 = 1s。
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(openai_body("慢产出"))
-                    .set_delay(std::time::Duration::from_secs(3)),
-            )
-            .mount(&server)
-            .await;
-
-        let wf: WorkflowDef = toml::from_str(
-            r#"
-name = "budget_demo"
-[[steps]]
-id = "a"
-role = "worker"
-task = "慢任务 {{topic}}"
-output_key = "out"
-"#,
-        )
-        .unwrap();
-
-        let guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "1");
-        let dir = tempfile::tempdir().unwrap();
-        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
-        let err = run_workflow(&wf, "主题", &ctx)
-            .await
-            .expect_err("超出预算必须失败");
-        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
-        drop(guard);
-
-        assert!(
-            err.contains(crate::workflow::BUDGET_EXCEEDED_MARKER),
-            "错误必须带预算超支标记（分类器靠它判不可重试）: {err}"
-        );
-        assert!(err.contains("分派单元"), "应说明预算是怎么算出来的: {err}");
-        assert!(err.contains("wf_id="), "必须带 resume 凭据: {err}");
-    }
-
-    /// 预算充裕时不得误杀：同一条 workflow、同样的慢模型，把 per-unit
-    /// 预算放宽后必须正常跑完。回归防线——预算推算错成过小会把所有
-    /// 长任务判死。
-    #[tokio::test]
-    async fn generous_budget_does_not_kill_slow_but_healthy_run() {
-        let server = wiremock::MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(openai_body("慢但正常的产出"))
-                    .set_delay(std::time::Duration::from_millis(300)),
-            )
-            .mount(&server)
-            .await;
-
-        let wf: WorkflowDef = toml::from_str(
-            r#"
-name = "budget_ok"
-[[steps]]
-id = "a"
-role = "worker"
-task = "任务 {{topic}}"
-output_key = "out"
-"#,
-        )
-        .unwrap();
-
-        let guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "30");
-        let dir = tempfile::tempdir().unwrap();
-        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
-        let out = run_workflow(&wf, "主题", &ctx).await;
-        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
-        drop(guard);
-        assert_eq!(out.expect("预算充裕不该被杀"), "慢但正常的产出");
-    }
-
-    /// P0-1 回归：**暂停期间不得扣预算**。
-    ///
-    /// jemalloc 2026-08-26 会话的事故复现——reviewer 因「模型不可用」
-    /// 自动暂停，停在 gate 上一次模型调用都没发出去，5040s 预算却照
-    /// wall-clock 扣到点，整条 task_refine 被判超支中止，已完成的 2/4
-    /// 步成果作废。根因是这里用了裸 `tokio::time::timeout`。
-    ///
-    /// 构造：预算 2s，模型本身很快（100ms），但 workflow 一开跑就把
-    /// session gate 按下 3s（＞预算）。若预算按 wall-clock 计，必然
-    /// 在 2s 处误杀；正确行为是 park 的 3s 不计入，最终跑完。
-    #[tokio::test]
-    async fn paused_time_does_not_consume_budget() {
-        let server = wiremock::MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(openai_body("暂停后仍然跑完"))
-                    .set_delay(std::time::Duration::from_millis(100)),
-            )
-            .mount(&server)
-            .await;
-
-        let wf: WorkflowDef = toml::from_str(
-            r#"
-name = "budget_pause"
-[[steps]]
-id = "a"
-role = "worker"
-task = "任务 {{topic}}"
-output_key = "out"
-"#,
-        )
-        .unwrap();
-
-        let guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS", "2");
-        let dir = tempfile::tempdir().unwrap();
-        let (mut ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
-        let gate = crate::pause_gate::AgentPauseGate::new("test-session");
-        ctx.agent_pause_gate = Some(gate.clone());
-
-        // 立刻按下暂停，3s 后放开——park 时长超过 2s 预算本身。
-        gate.pause_with_reason("模拟：模型不可用自动暂停");
-        let g2 = gate.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            g2.resume();
-        });
-
-        let started = std::time::Instant::now();
-        let out = run_workflow(&wf, "主题", &ctx).await;
-        let wall = started.elapsed();
-        std::env::remove_var("LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS");
-        drop(guard);
-
-        assert_eq!(
-            out.expect("park 的时间不该算进预算，workflow 必须跑完"),
-            "暂停后仍然跑完"
-        );
-        // wall-clock 明显超过 2s 预算，证明这条路径真的跨过了 deadline
-        // 而不是因为跑太快侥幸绕开（否则测试等于没测）。
-        assert!(
-            wall >= std::time::Duration::from_secs(3),
-            "本测试必须真的跨过预算时刻才有意义，实际 wall={wall:?}"
-        );
-    }
-
     /// 熔断判定必须锁在 loop_until 保护内：没有返工环的 step 产出里
     /// 出现别的 step 的裁决原文（评审引用 gate 结论是常态）不该判死
     /// workflow。此前 DAG 引擎把检查套在循环外，对 wave 里每个 step
