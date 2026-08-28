@@ -520,6 +520,22 @@ Self-loop 进度 SSE 流。
 
 ---
 
+## 9b. Advisor 开关
+
+### `GET /api/advisor`
+
+读取 advisor 监察的启用状态。
+
+**响应 `200`：** `{ "enabled": true }`
+
+### `PUT /api/advisor`
+
+开关 advisor 监察。
+
+**请求体：** `{ "enabled": false }`
+
+**响应 `200`：** 更新后的状态
+
 ## 10. 工具管理
 
 ### `GET /api/tools`
@@ -631,6 +647,28 @@ manager 回报任务完成（state → human_review）。
 **响应 `200`：** `TaskView`
 
 ---
+
+## 11b. 任务类型注册表
+
+### `GET /api/task-types`
+
+列出已注册的任务类型（`TaskTypeEntry` 数组）。
+
+### `POST /api/task-types`
+
+新建任务类型。
+
+### `GET /api/task-types/:id`
+
+读取单个任务类型。
+
+### `PUT /api/task-types/:id`
+
+更新任务类型。
+
+### `DELETE /api/task-types/:id`
+
+删除任务类型。
 
 ## 12. 工作流管理
 

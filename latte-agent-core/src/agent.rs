@@ -825,8 +825,6 @@ pub struct AgentRunner {
     /// set, `run_turn` (via `drain_inject_queue`) reads
     /// `<worktree>/.latte/inject/<role>.txt` at the start of every
     /// turn and prepends a synthetic user message containing the
-    /// queue's content.
-    inject_worktree_root: Option<std::path::PathBuf>,
     /// Shared in-memory advisor hint queue (see
     /// `crate::advisor_monitor`). The producer (advisor monitor via
     /// `ChatController::advisor_hint`) pushes correction hints while
@@ -1453,7 +1451,6 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: String::new(),
             session_id: String::new(),
-            inject_worktree_root: None,
             advisor_hints: None,
             cwd: None,
             last_turn_tool_count: 0,
@@ -1485,7 +1482,6 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: String::new(),
             session_id: String::new(),
-            inject_worktree_root: None,
             advisor_hints: None,
             cwd: None,
             last_turn_tool_count: 0,
@@ -1509,7 +1505,6 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: "default".to_string(),
             session_id: String::new(),
-            inject_worktree_root: None,
             advisor_hints: None,
             cwd: None,
             last_turn_tool_count: 0,
@@ -1842,44 +1837,6 @@ impl AgentRunner {
     #[cfg(test)]
     pub(crate) fn has_trace_sink(&self) -> bool {
         !self.sink.is_null()
-    }
-    /// synthetic `Role::User` message with content `"[INJECTED]\n..."`
-    /// to `self.context.messages`. Deletes the queue file. This is
-    /// called at the start of `run_turn` and can also be called
-    /// directly from tests.
-    fn drain_inject_queue(&mut self) {
-        let Some(root) = self.inject_worktree_root.clone() else {
-            return;
-        };
-        let queue_path = root
-            .join(".latte")
-            .join("inject")
-            .join(format!("{}.txt", self.role_id));
-        if !queue_path.exists() {
-            return;
-        }
-        let Ok(content) = std::fs::read_to_string(&queue_path) else {
-            return;
-        };
-        if content.trim().is_empty() {
-            let _ = std::fs::remove_file(&queue_path);
-            return;
-        }
-        let synthetic = latte_ai::models::Message::user(format!("[INJECTED]\n{}", content));
-        // Prepend the synthetic message. `messages_mut()` returns a
-        // `&mut [Message]` slice which has no `insert(0, _)`, and
-        // there's no `Vec`-level accessor on `ConversationContext`
-        // outside this file. Clone into a local Vec, prepend, then
-        // rebuild the context via `clear` + `push` — slightly wasteful
-        // for large histories but only on a rare inject-drain path.
-        let existing: Vec<latte_ai::models::Message> =
-            self.context.messages_mut().to_vec();
-        self.context.clear();
-        self.context.push(synthetic);
-        for m in existing {
-            self.context.push(m);
-        }
-        let _ = std::fs::remove_file(&queue_path);
     }
 
     /// Drain all pending advisor hints from the shared in-memory
@@ -3118,13 +3075,6 @@ impl AgentRunner {
         self
     }
 
-    /// Set the inject-queue worktree root. When set, `run_turn`
-    /// prepends any pending `<root>/.latte/inject/<role_id>.txt`
-    /// content to the conversation as a synthetic user message
-    pub fn with_inject_worktree_root(mut self, root: std::path::PathBuf) -> Self {
-        self.inject_worktree_root = Some(root);
-        self
-    }
 
     /// Set the working directory tools see as their default cwd.
     /// `run_turn` rewrites relative paths in tool inputs against it
@@ -5065,30 +5015,6 @@ mod tests {
         assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
     }
 
-    #[test]
-    fn drain_inject_queue_prepends_synthetic_user_message() {
-        use latte_ai::models::Role as MsgRole;
-
-        let dir = tempfile::tempdir().unwrap();
-        let queue = dir.path().join(".latte").join("inject").join("programmer.txt");
-        std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
-        std::fs::write(&queue, "look at foo.rs\n").unwrap();
-
-        let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
-                .unwrap();
-        let mut runner = AgentRunner::new(agent)
-            .with_role("programmer")
-            .with_inject_worktree_root(dir.path().to_path_buf());
-        runner.drain_inject_queue();
-
-        assert!(!runner.context.messages().is_empty());
-        let first = &runner.context.messages()[0];
-        assert_eq!(first.role, MsgRole::User);
-        assert_eq!(first.as_text(), "[INJECTED]\nlook at foo.rs\n");
-        assert!(!queue.exists());
-    }
 
     // ─── Advisor hint queue ────────────────────────────────────────
     //
@@ -5704,73 +5630,6 @@ mod tests {
         );
     }
 
-    /// 记录事实：`AgentRunner::drain_inject_queue` **不由 `run_turn` 调用**，
-    /// 因此单独给 runner 挂上 `with_inject_worktree_root` 并跑一个 turn，
-    /// 队列文件不会被消费。
-    ///
-    /// 注入队列（`.latte/inject/<role>.txt`）在本仓有**三份实现**：
-    ///   1. 本方法（`agent.rs`）—— 从未接线；
-    ///   2. `latte-agent-cli/src/commands/chat.rs` 的 HIL 循环；
-    ///   3. `latte-agent-core/src/controller.rs` 的多角色循环。
-    ///
-    /// 生效的是 2 和 3：它们在调 `run_turn` **之前**读文件、`append_to_role`
-    /// 写进角色历史、并 `remove_file`，所以功能是好的（`hil_v13_at_role_inject_e2e`
-    /// 覆盖的是这条路径）。1 是重复实现，其 `never used` 警告是**真的**没用，
-    /// 不是接线丢失——本测试把这个结论钉住，避免有人看到警告后又"顺手接回去"，
-    /// 造成第四条路径或与外层循环抢同一个文件。
-    #[tokio::test]
-    async fn run_turn_does_not_drain_inject_queue_outer_loops_do() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
-
-        let dir = tempfile::tempdir().unwrap();
-        let queue = dir
-            .path()
-            .join(".latte")
-            .join("inject")
-            .join("programmer.txt");
-        std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
-        std::fs::write(&queue, "look at foo.rs\n").unwrap();
-
-        let server = wiremock::MockServer::start().await;
-        server
-            .register(
-                Mock::given(method("POST"))
-                    .and(path("/chat/completions"))
-                    .respond_with(
-                        ResponseTemplate::new(200)
-                            .set_body_string(openai_completion_body("收到", vec![])),
-                    ),
-            )
-            .await;
-
-        let agent = Agent::new_with_chain(
-            "t".into(),
-            test_role(),
-            vec![model_at(&server, "stub")],
-            GenerateParams::default(),
-        )
-        .unwrap();
-        let mut runner = AgentRunner::new(agent)
-            .with_role("programmer")
-            .with_inject_worktree_root(dir.path().to_path_buf());
-
-        runner
-            .run_turn(&[Message::user("go")], None)
-            .await
-            .expect("turn 应正常收尾");
-
-        let reqs = server.received_requests().await.unwrap();
-        let body = String::from_utf8_lossy(&reqs[0].body);
-        assert!(
-            !body.contains("[INJECTED]"),
-            "run_turn 不该 drain 注入队列（那是外层循环的职责）: {body}"
-        );
-        assert!(
-            queue.exists(),
-            "队列文件应保持原样，等外层循环来消费"
-        );
-    }
 
     /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板
     /// （resolve）才继续。模拟链路：工具 handler 扮演 monitor 置位

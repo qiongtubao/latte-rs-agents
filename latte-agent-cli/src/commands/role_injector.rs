@@ -30,23 +30,15 @@ impl RoleInjector {
     /// accumulated content (possibly empty) as a `String` suitable
     /// for prepending to the role's `ConversationContext` as a
     /// synthetic user message.
+    /// 委托给 `latte_agent_core::inject_queue::drain` —— 该逻辑曾有四份
+    /// 独立实现且行为不一致（详见那个模块的文档）。这里只保留薄封装，
+    /// 让既有调用方与测试不必改签名。
     pub fn drain(worktree_root: &Path, role_id: &str) -> std::io::Result<Option<String>> {
-        let path = Self::queue_path(worktree_root, role_id);
-        if !path.exists() { return Ok(None); }
-        let content = std::fs::read_to_string(&path)?;
-        if content.trim().is_empty() {
-            let _ = std::fs::remove_file(&path);
-            return Ok(None);
-        }
-        std::fs::remove_file(&path)?;
-        Ok(Some(content))
+        Ok(latte_agent_core::inject_queue::drain(worktree_root, role_id))
     }
 
     pub fn queue_path(worktree_root: &Path, role_id: &str) -> PathBuf {
-        worktree_root
-            .join(".latte")
-            .join("inject")
-            .join(format!("{}.txt", role_id))
+        latte_agent_core::inject_queue::queue_path(worktree_root, role_id)
     }
 }
 

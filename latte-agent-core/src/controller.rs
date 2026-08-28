@@ -1779,7 +1779,6 @@ async fn run_multi_role_loop(
         .await
         {
             Ok((mut runner, _canonical_id)) => {
-                runner = runner.with_inject_worktree_root(worktree_root.clone());
                 runner = runner.with_advisor_hints(advisor_hints.clone());
                 runners.push((role_id.clone(), runner));
             }
@@ -2129,20 +2128,13 @@ async fn run_multi_role_loop(
                     continue;
                 }
 
-                // Drain inject queue
-                let inject_path = mgr
-                    .worktree_root()
-                    .join(".latte")
-                    .join("inject")
-                    .join(format!("{role_id}.txt"));
-                if inject_path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&inject_path) {
-                        if !content.trim().is_empty() {
-                            let synth = Message::user(format!("[INJECTED]\n{}", content));
-                            mgr.append_to_role(role_id, synth).ok();
-                        }
-                        let _ = std::fs::remove_file(&inject_path);
-                    }
+                // Drain inject queue（统一实现见 crate::inject_queue —— 这段
+                // 逻辑此前有四份拷贝且行为不一致）
+                if let Some(content) =
+                    crate::inject_queue::drain(mgr.worktree_root(), role_id)
+                {
+                    let synth = Message::user(crate::inject_queue::format_injected(&content));
+                    mgr.append_to_role(role_id, synth).ok();
                 }
                 // Slice plan.md for this role
                 let plan_slice = plan_md_slice_for(&mgr.record().plan_md, role_id);

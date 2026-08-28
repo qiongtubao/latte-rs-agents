@@ -1954,7 +1954,6 @@ async fn run_hil_chat(
         // its in-memory context. The REPL also still writes the
         // inject to `role_history.messages` so the next round's
         // replay sees it.
-        runner = runner.with_inject_worktree_root(worktree_root.clone());
         runners.push((role_id, runner));
     }
 
@@ -2199,18 +2198,22 @@ async fn run_hil_repl(
                     renderer.on_status(&format!("[{} round {}: skipped — role paused]", role_id, round_num)).await;
                     continue;
                 }
-                let queue_path = mgr.worktree_root().join(".latte").join("inject").join(format!("{}.txt", role_id));
-                if queue_path.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&queue_path) {
-                        let synth = Message {
-                            role: MsgRole::User,
-                            content: vec![latte_ai::models::ContentPart::text(format!("[INJECTED]\n{}", content))],
-                            tool_call_id: None,
-                            tool_calls: None
-                        };
-                        let _ = std::fs::remove_file(&queue_path);
-                        mgr.append_to_role(&role_id, synth).ok();
-                    }
+                // 统一实现见 latte_agent_core::inject_queue。旧的内联版本**不检查
+                // 空内容**，空队列文件会注入一条只有 [INJECTED] 头、没有正文的
+                // 消息（controller 那份内联版检查了，两边行为不一致）。
+                if let Some(content) = latte_agent_core::inject_queue::drain(
+                    mgr.worktree_root(),
+                    &role_id,
+                ) {
+                    let synth = Message {
+                        role: MsgRole::User,
+                        content: vec![latte_ai::models::ContentPart::text(
+                            latte_agent_core::inject_queue::format_injected(&content),
+                        )],
+                        tool_call_id: None,
+                        tool_calls: None,
+                    };
+                    mgr.append_to_role(&role_id, synth).ok();
                 }
                 // Slice plan.md for this role (H2-tagged section + initial-prompt).
                 let plan_slice = plan_md_slice_for(&mgr.record().plan_md, &role_id);

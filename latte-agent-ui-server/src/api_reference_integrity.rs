@@ -50,88 +50,132 @@ fn read_api_ref_chapter_keywords() -> Vec<String> {
     out
 }
 
-/// 路由前缀 → 章节关键词（必须出现至少一次；关键词必须小写）。
-fn route_to_keywords(route: &str) -> Vec<String> {
-    let r = route.trim_start_matches('/');
-    let kw = |s: &str| s.to_string();
-    if r == "health" {
-        return vec![kw("健康检查")];
+/// 把端点路径规范化成可比较形式。
+///
+/// 两边写法不统一，必须先归一：
+///   - 路由是 `/traces/:id`（无 `/api` 前缀，axum 风格参数）；
+///   - 文档是 `` `GET /api/traces/<session_id>` ``（有前缀，尖括号参数），
+///     还混用 `:id`、`{key}`，以及 `?id=<sid>` 这种查询串。
+///
+/// 规则：去查询串 → 路径参数统一成 `*` → 补 `/api` 前缀。
+///
+/// 例外：`/health` 按设计**不在** `/api/` 下（见 api-reference.md 开头的说明），
+/// 所以对根路径端点保持原样，不硬套前缀。
+fn normalize_endpoint(path: &str) -> String {
+    let p = path.split('?').next().unwrap_or(path);
+    let p = p.trim();
+    let p = p.strip_prefix("/api").unwrap_or(p);
+    let segs: Vec<String> = p
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let is_param = s.starts_with(':')
+                || (s.starts_with('<') && s.ends_with('>'))
+                || (s.starts_with('{') && s.ends_with('}'));
+            if is_param { "*".to_string() } else { s.to_ascii_lowercase() }
+        })
+        .collect();
+    let joined = segs.join("/");
+    // 根路径端点（当前只有 health）不套 /api 前缀。
+    if ROOT_LEVEL_ENDPOINTS.contains(&joined.as_str()) {
+        return format!("/{joined}");
     }
-    if r.starts_with("sessions") || r == "session" || r.starts_with("session/") {
-        return vec![kw("会话管理")];
-    }
-    if r.starts_with("roles/") || r == "roles" {
-        if r.contains("config") || r.contains("toml") || r.contains(":id") {
-            return vec![kw("角色配置"), kw("角色查询")];
+    format!("/api/{joined}")
+}
+
+/// 按设计挂在根路径、不在 `/api/` 下的端点。新增此类端点时在此登记，
+/// 否则校验会因为前缀不匹配误报。
+const ROOT_LEVEL_ENDPOINTS: &[&str] = &["health"];
+
+/// 从 `docs/api-reference.md` 的 `### ` 标题里抽出所有已登记端点。
+#[cfg(test)]
+fn read_api_ref_endpoints() -> std::collections::HashSet<String> {
+    let raw = fs::read_to_string("../docs/api-reference.md")
+        .or_else(|_| fs::read_to_string("docs/api-reference.md"))
+        .expect("api-reference.md");
+    let mut out = std::collections::HashSet::new();
+    for line in raw.lines() {
+        if !line.starts_with("###") {
+            continue;
         }
-        return vec![kw("角色查询")];
+        // 按 HTTP 方法定位路径：不能只找 `/api/`，因为 `/health` 按设计
+        // 不在该前缀下（漏了它会把已登记端点误报成未登记）。
+        // 一行里可能出现多个 `METHOD /path`（同一路径多方法合写）。
+        for m in ["GET ", "POST ", "PUT ", "PATCH ", "DELETE "] {
+            let mut rest = line;
+            while let Some(at) = rest.find(m) {
+                let tail = &rest[at + m.len()..];
+                if !tail.starts_with('/') {
+                    rest = &rest[at + m.len()..];
+                    continue;
+                }
+                let end = tail
+                    .find(|c: char| c.is_whitespace() || c == '`' || c == ')' || c == ',')
+                    .unwrap_or(tail.len());
+                out.insert(normalize_endpoint(&tail[..end]));
+                rest = &tail[end..];
+            }
+        }
     }
-    if r.starts_with("chat/") {
-        return vec![kw("聊天命令")];
-    }
-    if r == "events" {
-        return vec![kw("sse 事件流")];
-    }
-    if r.starts_with("traces") || r == "subsessions" {
-        return vec![kw("trace"), kw("调试")];
-    }
-    if r.starts_with("self-loop") {
-        return vec![kw("self-loop")];
-    }
-    if r == "role-graph" {
-        return vec![kw("角色-工具关系图")];
-    }
-    if r.starts_with("models") {
-        return vec![kw("模型管理")];
-    }
-    if r.starts_with("tools") {
-        return vec![kw("工具管理")];
-    }
-    if r.starts_with("tasks") {
-        return vec![kw("任务看板")];
-    }
-    if r.starts_with("workflows") {
-        return vec![kw("工作流管理")];
-    }
-    if r.starts_with("images") {
-        return vec![kw("文档图像上传")];
-    }
-    vec![]
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 每条 `.route(...)` 都必须在 `docs/api-reference.md` 里有对应端点标题。
+    ///
+    /// ## 此前为什么形同虚设
+    ///
+    /// 旧实现有两处缺陷叠加：
+    ///
+    /// 1. **认不出的路由直接放行**：靠一张手写的「路径前缀 → 章节关键词」映射，
+    ///    映射里没有的路由返回空关键词、然后 `continue`。于是**新增一个未登记
+    ///    类别的端点永远不会报错**——而这恰恰是本校验唯一要防的场景。
+    ///    实锤：`/logs` 加进路由、文档没写，校验照样绿。
+    /// 2. **匹配粒度太粗**：只要求「关键词出现在某个章节标题里」。`/traces/:id`
+    ///    映射到关键词 `trace`，而文档有 `## 6. Trace / 调试` 章节 → 命中。
+    ///    即**同类别下有任意章节，该类别的新端点全部自动通过**。
+    ///
+    /// 现在改为逐端点精确比对，且**没有放行分支**：路由不在文档里就失败。
     #[test]
-    fn every_route_has_matching_chapter() {
-        let chapters = read_api_ref_chapter_keywords();
+    fn every_route_is_documented() {
+        let documented = read_api_ref_endpoints();
         let routes = read_lib_routes();
-        let mut missing: Vec<(String, Vec<String>)> = Vec::new();
-        for r in &routes {
-            let kws = route_to_keywords(r);
-            if kws.is_empty() {
-                continue;
-            }
-            let ok = kws.iter().any(|kw| chapters.iter().any(|c| c.contains(kw)));
-            if !ok {
-                missing.push((r.clone(), kws));
-            }
+        assert!(
+            !routes.is_empty(),
+            "没解析到任何路由，说明 read_lib_routes 的解析失效了（比 false-pass 更危险）"
+        );
+        let missing: Vec<String> = routes
+            .iter()
+            .filter(|r| !documented.contains(&normalize_endpoint(r)))
+            .map(|r| format!("  - {r}  (规范化后: {})", normalize_endpoint(r)))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "以下路由没有在 docs/api-reference.md 里登记（新增端点请同步文档）：\n{}\n\n             文档中已登记 {} 个端点。",
+            missing.join("\n"),
+            documented.len()
+        );
+    }
+
+    /// 规范化本身的行为锁定：两边三种参数写法必须归一到同一个 key。
+    #[test]
+    fn normalize_unifies_param_styles_and_prefix() {
+        let expect = "/api/traces/*";
+        for form in [
+            "/traces/:id",                 // 路由写法
+            "/api/traces/<session_id>",    // 文档尖括号
+            "/api/traces/{id}",            // 文档花括号
+            "/api/traces/:id",             // 文档冒号
+            "/api/traces/<session_id>?x=1" // 带查询串
+        ] {
+            assert_eq!(normalize_endpoint(form), expect, "form = {form}");
         }
-        if !missing.is_empty() {
-            let detail: Vec<String> = missing
-                .iter()
-                .map(|(r, kws)| {
-                    format!(
-                        "  - {} (expected keyword in chapter titles: {:?})",
-                        r, kws
-                    )
-                })
-                .collect();
-            panic!(
-                "routes 缺少文档章节（routes 不为空；路径前缀应在 docs/api-reference.md 章节标题里出现）：\n{}",
-                detail.join("\n")
-            );
-        }
+        // 大小写与多段
+        assert_eq!(normalize_endpoint("/Models/:key/TOML"), "/api/models/*/toml");
+        // 根路径端点不套 /api 前缀（否则 /health 会被误报未登记）。
+        assert_eq!(normalize_endpoint("/health"), "/health");
     }
 }

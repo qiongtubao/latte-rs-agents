@@ -169,7 +169,6 @@ impl Drop for MockOpenAIServer {
     }
 }
 
-/// Write the mock model declaration into the worktree's
 /// 测试结束时移除本次创建的 worktree 及其分支。
 ///
 /// 这些 e2e 必须以**仓库根**为 cwd（要 `.latte/` 角色 + `prompts/` + 源码树），
@@ -188,19 +187,25 @@ struct WorktreeGuard {
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
         let wt = self.repo.join(".latte").join("worktrees").join(&self.task_id);
-        if wt.exists() {
-            let _ = Command::new("git")
-                .args(["worktree", "remove", "--force"])
-                .arg(&wt)
-                .current_dir(&self.repo)
-                .output();
-        }
+        // 1) 正常路径：让 git 自己摘除登记 + 删目录。
         let _ = Command::new("git")
-            .args(["branch", "-D", &format!("latte/{}", self.task_id)])
+            .args(["worktree", "remove", "--force"])
+            .arg(&wt)
             .current_dir(&self.repo)
             .output();
+        // 2) 兜底：git 拒绝时（子进程仍持有、锁未释放等）直接删目录，
+        //    再 prune 掉悬空登记。少了这一步，失败就是静默残留 ——
+        //    实测能积到 107 个 / 720 MB。
+        if wt.exists() {
+            let _ = std::fs::remove_dir_all(&wt);
+        }
         let _ = Command::new("git")
             .args(["worktree", "prune"])
+            .current_dir(&self.repo)
+            .output();
+        // 3) 分支最后删：worktree 还占着它时 `branch -D` 会失败。
+        let _ = Command::new("git")
+            .args(["branch", "-D", &format!("latte/{}", self.task_id)])
             .current_dir(&self.repo)
             .output();
     }
