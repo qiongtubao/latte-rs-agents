@@ -424,32 +424,6 @@ struct ChatSession {
 }
 
 impl ChatSession {
-    fn new(
-        merged: AgentConfig,
-        resolver: ModelResolver,
-        default_params: GenerateParams,
-        runner: AgentRunner,
-        role_id: String,
-        tier: ModelTier,
-        primary_id: Option<String>,
-        debug_flags: super::DebugFlags,
-        renderer: Box<dyn latte_agent_core::renderer::ChatRenderer>,
-    ) -> Self {
-        Self {
-            merged,
-            resolver,
-            default_params,
-            runner,
-            role_id,
-            tier,
-            primary_id,
-            log: None,
-            last_response: None,
-            turn_count: 0,
-            debug_flags,
-            renderer,
-        }
-    }
 
     /// Look up the role's display icon (emoji) from the merged config.
     /// Falls back to a generic 🤖 if the role is not configured.

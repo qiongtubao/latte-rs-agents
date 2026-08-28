@@ -131,6 +131,42 @@ impl Drop for MockOpenAIServer {
 }
 
 /// Write the mock model declaration into the worktree's
+/// 测试结束时移除本次创建的 worktree 及其分支。
+///
+/// 这些 e2e 必须以**仓库根**为 cwd（要 `.latte/` 角色 + `prompts/` + 源码树），
+/// `latte-agent run` 会在 `.latte/worktrees/<task_id>/` 建真实 git worktree。
+/// 此前没有任何清理：跑一次留一个，实测积到 **107 个 / 720 MB**，还附带 107 个
+/// `latte/*` 分支。副作用不只是占地——`role_graph` / persistence 这类扫描
+/// `.latte/` 的测试会被残留干扰而偶发失败。
+///
+/// 用 `Drop` 而非末尾显式调用：断言失败 panic 时同样要清理（对齐
+/// `MockOpenAIServer` 的既有做法）。
+struct WorktreeGuard {
+    repo: PathBuf,
+    task_id: String,
+}
+
+impl Drop for WorktreeGuard {
+    fn drop(&mut self) {
+        let wt = self.repo.join(".latte").join("worktrees").join(&self.task_id);
+        if wt.exists() {
+            let _ = Command::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&wt)
+                .current_dir(&self.repo)
+                .output();
+        }
+        let _ = Command::new("git")
+            .args(["branch", "-D", &format!("latte/{}", self.task_id)])
+            .current_dir(&self.repo)
+            .output();
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&self.repo)
+            .output();
+    }
+}
+
 /// `.latte/models.d/` so the config layer can resolve the model id
 /// "mock" before --model-override targets it.
 fn write_mock_toml(repo: &Path, api_base: &str) {
@@ -172,6 +208,8 @@ async fn ask_human_actually_pauses_session_via_real_llm() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap()
         .to_path_buf();
+    // repo 就绪后立刻挂 guard：后续任何 panic 都能清理 worktree + 分支。
+    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
 
     // 3. Write the mock model declaration.
     write_mock_toml(&repo, &api_base);
@@ -201,6 +239,8 @@ async fn ask_human_actually_pauses_session_via_real_llm() {
     //     leave a worktree behind if the binary crashes) don't
     //     collide with the previous run's worktree.
     let task_id = format!("askhuman-test-{}", std::process::id());
+    // 建完 task_id 立刻挂 guard：后续任何 panic 都能清理。
+    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
     let mut chat_cmd = Command::new(bin());
     chat_cmd.arg("chat")
         .arg("--task-id").arg(&task_id)

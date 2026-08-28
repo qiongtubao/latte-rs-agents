@@ -26,6 +26,12 @@
 !.latte/prompts.d/
 !.latte/models.toml
 !.latte/models.d/
+# 例外中的例外：mock.toml 是 e2e 测试产物，不是配置。
+# latte-agent-cli/tests/hil_*_e2e.rs 的 `write_mock_toml()` 把 wiremock
+# 的**随机端口**写进 base_url，且写的是仓库根（CARGO_MANIFEST_DIR/..）
+# 而非临时目录 —— 每跑一次测试它就变一次。追踪它的后果是工作树反复变脏、
+# 多人协作互相覆盖端口。
+.latte/models.d/mock.toml
 !.latte/workflows/
 tests/.latte/
 # Frontend (`latte-agent-cli/ui/`, Vite + React). Source-of-truth

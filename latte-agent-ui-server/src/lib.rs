@@ -482,6 +482,11 @@ fn build_router(state: AppState) -> Router {
         .route("/chat/resume", post(chat_resume))
         .route("/chat/pause-session", post(chat_pause_session))
         .route("/chat/resume-session", post(chat_resume_session))
+        // `pause-role` 此前漏挂：handler `chat_pause_role` 写好了却没注册，
+        // 只留下一句 `function is never used` 警告。而前端一直在调它
+        // （`ui/src/api.ts` 的 `POST /api/chat/pause-role`），线上是 404 ——
+        // 「暂停单个角色」功能实际不可用，而对称的 resume-role 就在下一行。
+        .route("/chat/pause-role", post(chat_pause_role))
         .route("/chat/resume-role", post(chat_resume_role))
         .route("/chat/stream-mode", post(chat_stream_mode))
         // SSE event stream for the main chat. UI subscribes via
@@ -489,6 +494,14 @@ fn build_router(state: AppState) -> Router {
         // events as they arrive.
         .route("/events", get(events_sse))
         .route("/traces", get(list_traces))
+        // `/traces/:id` 此前漏挂：handler `read_trace` 写好了却没注册。
+        // README:180、docs/api-reference.md 的 `GET /api/traces/<session_id>`
+        // 以及前端 `ui/src/api.ts` 都要这个端点 —— Trace 面板点开单条时 404。
+        .route("/traces/:id", get(read_trace))
+        // `/logs` 同样漏挂：handler `get_logs` 的文档注释写明
+        // `GET /api/logs`，前端 `ui/src/api.ts` 与 `ui/src/log.ts` 都在调
+        // （含 `?file=&tail=` 形式），但路由没注册 —— 日志面板取不到数据。
+        .route("/logs", get(get_logs))
         .route("/self-loop/start", post(self_loop_start))
         .route("/self-loop/events", get(self_loop_events_sse))
         .route("/self-loop/stop", post(self_loop_stop))

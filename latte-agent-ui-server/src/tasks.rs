@@ -1772,6 +1772,7 @@ fn path_covers(a: &str, b: &str) -> bool {
 
 /// 两个范围列表是否重叠：存在一对 (a, b) 满足 a 覆盖 b 或 b 覆盖 a。
 /// 任一方为空 → 不冲突（未声明范围，无法证明会互相覆盖）。
+#[cfg(test)]
 fn paths_overlap(a: &[String], b: &[String]) -> bool {
     first_path_overlap(a, b).is_some()
 }

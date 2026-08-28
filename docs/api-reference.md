@@ -276,6 +276,15 @@
 
 **响应 `200`**
 
+### `POST /api/chat/pause-role`
+
+暂停单个角色（多角色 HIL）：该角色的回合被跳过，同一轮其他角色继续。
+与 `resume-role` 配对。
+
+**请求体：** `{ "session_id": "abc123", "role_id": "programmer" }`
+
+**响应 `202`**
+
 ### `POST /api/chat/resume-role`
 
 恢复单个角色（多角色 HIL）。与 `pause-role` 配对。
@@ -384,6 +393,14 @@ export type ChatEvent =
 ---
 
 ## 6. Trace / 调试
+
+### `GET /api/logs`
+
+列出或读取 `<cwd>/.latte/ui-sessions/` 下的日志文件。
+
+**查询参数：** 无参数 → 返回文件列表；`?file=<name>&tail=<n>` → 返回该文件末 n 行。
+
+**响应 `200`**
 
 ### `GET /api/traces`
 

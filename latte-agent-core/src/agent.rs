@@ -2016,13 +2016,12 @@ impl AgentRunner {
         self.park_if_paused("turn entry").await;
         // 模型配置热更新：turn 边界比对配置代际，变了就重建 model chain。
         self.maybe_reload_models();
-        // HIL blackboard: drain per-role inject queue.
-        // 这行此前丢了（只剩上面这句注释和一个直接调它的单测），后果是
-        // `.latte/inject/<role>.txt` 在运行时完全无效——而 CLI 的 HIL 会话
-        // 与 controller 多角色路径都调了 `with_inject_worktree_root` 启用它，
-        // 字段文档也写明「`run_turn` 每轮开头读队列」。编译器只报了
-        // 「method never used」。
-        self.drain_inject_queue();
+        // 注：注入队列（`.latte/inject/<role>.txt`）**不在这里** drain。
+        // 真正生效的是外层循环——CLI HIL（`chat.rs`）与 controller 多角色
+        // （`controller.rs`）在调用 run_turn **之前**就读文件、
+        // `append_to_role` 写进角色历史、并 `remove_file`。等执行到这里
+        // 文件已不存在。`AgentRunner::drain_inject_queue` 是第三份重复
+        // 实现，从未接线也不该接（见其文档注释）。
         // Advisor monitor: drain pending hints into the context
         // *before* the working message list is built below, so the
         // first model call of this turn already sees them.
@@ -5705,17 +5704,22 @@ mod tests {
         );
     }
 
-    /// 回归防线：注入队列必须**在 `run_turn` 里**被 drain，内容要真的送到模型。
+    /// 记录事实：`AgentRunner::drain_inject_queue` **不由 `run_turn` 调用**，
+    /// 因此单独给 runner 挂上 `with_inject_worktree_root` 并跑一个 turn，
+    /// 队列文件不会被消费。
     ///
-    /// 既有的 `drain_inject_queue_prepends_synthetic_user_message` 直接调
-    /// `runner.drain_inject_queue()`，因此**测不到接线**——`run_turn` 里那行
-    /// 调用被删掉后它照样通过。实际后果是 `.latte/inject/<role>.txt` 在运行时
-    /// 完全无效，而 CLI 的 HIL 会话与 controller 多角色路径都调了
-    /// `with_inject_worktree_root` 启用它。编译器只报「method never used」。
+    /// 注入队列（`.latte/inject/<role>.txt`）在本仓有**三份实现**：
+    ///   1. 本方法（`agent.rs`）—— 从未接线；
+    ///   2. `latte-agent-cli/src/commands/chat.rs` 的 HIL 循环；
+    ///   3. `latte-agent-core/src/controller.rs` 的多角色循环。
     ///
-    /// 本测试穿过 `run_turn` 并断言注入内容出现在**发给模型的请求体**里。
+    /// 生效的是 2 和 3：它们在调 `run_turn` **之前**读文件、`append_to_role`
+    /// 写进角色历史、并 `remove_file`，所以功能是好的（`hil_v13_at_role_inject_e2e`
+    /// 覆盖的是这条路径）。1 是重复实现，其 `never used` 警告是**真的**没用，
+    /// 不是接线丢失——本测试把这个结论钉住，避免有人看到警告后又"顺手接回去"，
+    /// 造成第四条路径或与外层循环抢同一个文件。
     #[tokio::test]
-    async fn run_turn_drains_inject_queue_into_model_request() {
+    async fn run_turn_does_not_drain_inject_queue_outer_loops_do() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -5757,13 +5761,15 @@ mod tests {
             .expect("turn 应正常收尾");
 
         let reqs = server.received_requests().await.unwrap();
-        assert!(!reqs.is_empty(), "应至少发出一次模型请求");
         let body = String::from_utf8_lossy(&reqs[0].body);
         assert!(
-            body.contains("[INJECTED]") && body.contains("look at foo.rs"),
-            "注入队列的内容必须出现在首个模型请求里: {body}"
+            !body.contains("[INJECTED]"),
+            "run_turn 不该 drain 注入队列（那是外层循环的职责）: {body}"
         );
-        assert!(!queue.exists(), "drain 后队列文件应被删除");
+        assert!(
+            queue.exists(),
+            "队列文件应保持原样，等外层循环来消费"
+        );
     }
 
     /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板

@@ -99,6 +99,8 @@ pub struct Resolved {
 /// The CLI overrides are applied last and on top of everything.
 
 /// 项目讨论配置，从 `.latte/discussion.toml` 自动加载。
+// serde 反序列化目标：字段即使代码不读也必须保留，否则解析形状变了。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct DiscussionConfig {
     pub default_workflow: Option<WorkflowDef>,
@@ -110,6 +112,8 @@ pub struct DiscussionConfig {
     pub role_hierarchy: std::collections::HashMap<String, Vec<String>>,
 }
 
+// serde 反序列化目标：字段即使代码不读也必须保留，否则解析形状变了。
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkflowDef {
     pub name: String,
@@ -118,6 +122,8 @@ pub struct WorkflowDef {
     pub context_token_budget: Option<u32>,
 }
 
+// serde 反序列化目标：字段即使代码不读也必须保留，否则解析形状变了。
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct StepDef {
     pub id: String,

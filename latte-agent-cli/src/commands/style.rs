@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// Reset all attributes.
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
+// ANSI 调色板：成套定义，按需取用；缺哪个都会让后续配色不一致。
+#[allow(dead_code)]
 pub const DIM: &str = "\x1b[2m";
 pub const ITALIC: &str = "\x1b[3m";
 pub const UNDERLINE: &str = "\x1b[4m";

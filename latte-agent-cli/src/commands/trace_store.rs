@@ -112,6 +112,8 @@ pub fn index_path(id: &str) -> Option<PathBuf> {
 }
 
 /// Path to a session's chat-log file (`~/.latte/logs/agents/<id>.log`).
+// 目前无调用点：与 logs_dir()/sessions 系列成套的路径助手，保留。
+#[allow(dead_code)]
 pub fn log_path(id: &str) -> Option<PathBuf> {
     logs_dir().map(|d| d.join("agents").join(format!("{}.log", id)))
 }

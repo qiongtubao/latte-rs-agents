@@ -6,6 +6,7 @@
 
 use std::fs;
 
+#[cfg(test)]
 fn read_lib_routes() -> Vec<String> {
     let raw = fs::read_to_string("../latte-agent-ui-server/src/lib.rs")
         .or_else(|_| fs::read_to_string("src/lib.rs"))
@@ -32,6 +33,7 @@ fn read_lib_routes() -> Vec<String> {
     routes
 }
 
+#[cfg(test)]
 fn read_api_ref_chapter_keywords() -> Vec<String> {
     let raw = fs::read_to_string("../docs/api-reference.md")
         .or_else(|_| fs::read_to_string("docs/api-reference.md"))

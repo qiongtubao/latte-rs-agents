@@ -332,6 +332,8 @@ fn run_replay(
 // ─── helpers ─────────────────────────────────────────────────────────────
 
 fn yes_no(b: bool) -> &'static str { if b { "yes" } else { "no" } }
+// 目前无调用点（百分比格式化助手），保留供 debug 子命令扩展。
+#[allow(dead_code)]
 fn pct(num: usize, denom: usize) -> usize {
     if denom == 0 { 0 } else { (num * 100) / denom }
 }
