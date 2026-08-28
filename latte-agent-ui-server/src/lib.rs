@@ -415,6 +415,20 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
         tokio::spawn(code_graph_index_loop(cwd));
     }
 
+    // Doc-graph 索引：与 code-graph 对称——UI 启动后台重建一次 doc-graph
+    // 知识图谱（`.latte-review/graph.json`），之后周期性 rescan，接住 agent
+    // 通过 doc_write 写入/改动的文档节点、以及外部对 .latte-review/docs/ 的改动。
+    //
+    // 与 code-graph 的差异：
+    // - 后端是外部 `latte-review` 二进制（缺失就降级 no-op）；
+    // - 仅当 `.latte-review/docs/` 存在（即这个项目确实在用 doc-graph）时才扫，
+    //   避免在没用文档图谱的项目里空跑 / 报错。
+    // 非阻塞、不影响 bind。
+    {
+        let cwd = state.backend.cwd.clone();
+        tokio::spawn(doc_graph_index_loop(cwd));
+    }
+
     // Notion 同步器握手：从 env 读配置，挂 reqwest client，
     // 后台每 5s 跑一轮 sync_dirty_tasks。配置缺失（token 空）则
     // loop 内部 cfg.enabled=false 直接 no-op，不影响 server 启动。
@@ -498,6 +512,73 @@ async fn code_graph_index_loop(cwd: PathBuf) {
         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         // 周期刷新：静默处理（只有真重建时 build 分支才打印），避免刷屏。
         let _ = run_once(&cwd, "refresh").await;
+    }
+}
+
+/// Doc-graph 索引后台循环：与 code-graph 对称。UI 启动重建一次 doc-graph
+/// 知识图谱，之后每 `LATTE_DOC_GRAPH_REFRESH_SECS`（默认 90s）rescan 一次，
+/// 接住 doc_write 新增/改动的文档节点。设为 0 关闭周期刷新（仅启动扫一次）。
+///
+/// 前置条件（任一不满足即降级 no-op，不影响 server）：
+/// - `.latte-review/docs/` 存在——即这个项目确实在用 doc-graph；否则不扫。
+/// - `latte-review` 二进制可执行——缺失时首次 scan 报错，循环退出不再空转。
+///
+/// 与 code-graph 的 mtime 增量不同，`latte-review scan` 每次全量重建 graph.json；
+/// 但它只在 docs 目录存在时才跑，且默认间隔更长（90s），成本可接受。
+async fn doc_graph_index_loop(cwd: PathBuf) {
+    use latte_agent_core::doc_graph_tools::run_scan;
+
+    // 只在项目启用了 doc-graph（.latte-review/docs/ 存在）时才扫。
+    fn docs_dir_exists(cwd: &std::path::Path) -> bool {
+        cwd.join(".latte-review").join("docs").is_dir()
+    }
+
+    async fn run_once(cwd: &std::path::Path, tag: &str) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        let stats = run_scan(cwd).await?;
+        eprintln!(
+            "[{tag}] doc-graph index: {} nodes / {} edges / {} communities / {} orphans in {:?}",
+            stats.node_count, stats.edge_count, stats.community_count, stats.orphan_count, t0.elapsed()
+        );
+        Ok(())
+    }
+
+    if !docs_dir_exists(&cwd) {
+        // 项目没用 doc-graph：启动不扫，但保留周期循环——等 doc_write 之后
+        // 创建了 docs/，下一轮会自动开始扫。
+    } else {
+        match run_once(&cwd, "boot").await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "[boot] doc-graph index: skipped ({e}); doc_graph_* tools still work on-demand"
+                );
+                // latte-review 缺失/报错：不再周期空转。
+                return;
+            }
+        }
+    }
+
+    let secs = std::env::var("LATTE_DOC_GRAPH_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(90);
+    if secs == 0 {
+        return;
+    }
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        // 目录还不存在就跳过这一轮（等 doc_write 创建后再扫）。
+        if !docs_dir_exists(&cwd) {
+            continue;
+        }
+        if let Err(e) = run_once(&cwd, "refresh").await {
+            // scan 失败（多半是 latte-review 不可用）：记一条并**退出循环**，
+            // 不再每 90s 空转报错。重启进程或装好 latte-review 后恢复。
+            eprintln!("[refresh] doc-graph index: {e}; stopping doc-graph loop");
+            return;
+        }
     }
 }
 
@@ -679,6 +760,39 @@ mod tests {
             "/nonexistent/path/1234"
         )))
         .is_none());
+    }
+
+    /// doc_graph_index_loop 优雅降级：
+    /// - docs 目录不存在 + 周期关闭（REFRESH_SECS=0）→ 立即返回，不 hang。
+    /// - docs 目录存在但 latte-review 不可用 → boot scan 失败 → 返回，不空转。
+    /// 用 5s 超时兜底，卡住即测试失败。
+    #[tokio::test]
+    async fn doc_graph_loop_degrades_gracefully() {
+        // case 1: 无 docs 目录 + 关周期 → 立即返回。
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LATTE_DOC_GRAPH_REFRESH_SECS", "0");
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            doc_graph_index_loop(dir.path().to_path_buf()),
+        )
+        .await;
+        assert!(r.is_ok(), "loop should return promptly when docs absent + refresh off");
+
+        // case 2: 有 docs 目录、但 latte-review 大概率不在 PATH → boot scan
+        // 失败 → 返回（不 hang）。用一个几乎不可能存在的 bin 名强制失败，
+        // 避免依赖环境里是否真装了 latte-review。
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir2.path().join(".latte-review").join("docs")).unwrap();
+        std::env::set_var("LATTE_REVIEW_BIN", "latte-review-definitely-not-installed-xyz");
+        std::env::set_var("LATTE_DOC_GRAPH_REFRESH_SECS", "0");
+        let r2 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            doc_graph_index_loop(dir2.path().to_path_buf()),
+        )
+        .await;
+        std::env::remove_var("LATTE_REVIEW_BIN");
+        std::env::remove_var("LATTE_DOC_GRAPH_REFRESH_SECS");
+        assert!(r2.is_ok(), "loop should return (not hang) when latte-review missing");
     }
 
     /// 端口 0 语义 + 端到端冒烟：`bind: 127.0.0.1:0` 时
