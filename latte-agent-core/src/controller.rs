@@ -3709,8 +3709,21 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             let mut lines: Vec<String> = Vec::new();
             let mut chars = 0usize;
             let mut emitted = 0usize;
+            // 输出路径归一化基准：ast-grep 未设 current_dir，继承进程 cwd
+            // （= 仓库根）。给它绝对 path 时它回传绝对 `file`，给它 `.` 时
+            // 回传相对 `file`。而 agent 的 resolve_tool_input_against_cwd 会把
+            // 相对 path 拼成绝对，所以常态是绝对——与预建索引 fast-path 回传的
+            // 相对路径不一致。这里统一 strip 掉 cwd 前缀，让两条路径（索引 /
+            // 实时）以及 read/search/find 的相对显示口径保持一致。
+            let proc_cwd = std::env::current_dir().ok();
             for m in parsed.iter().take(MAX_MATCHES) {
-                let file = m.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+                let file_raw = m.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+                // 绝对路径且落在 cwd 下 → 转相对；否则原样。
+                let file: String = proc_cwd
+                    .as_ref()
+                    .and_then(|c| std::path::Path::new(file_raw).strip_prefix(c).ok())
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|| file_raw.to_string());
                 let line = m
                     .get("range")
                     .and_then(|r| r.get("start"))

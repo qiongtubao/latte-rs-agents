@@ -136,14 +136,55 @@ impl CodeGraphIndex {
     }
 }
 
+/// 把工具传入的 query `path` 归一化成「索引 key（相对仓库根）」的可比形式。
+///
+/// 索引里的文件 key 都是**相对仓库根**的路径（ast-grep 以 `current_dir(cwd)`
+/// 运行，回传相对路径）。但模型经常传**绝对路径**（如
+/// `/Users/.../repo/src/jemalloc.c`），旧实现只 `trim_start_matches("./")`，
+/// 绝对路径原样带进 scope，永远匹配不上相对 key → 静默返回 0 命中，且因为
+/// 「空清单也算命中」而**不会回退**到实时 ast-grep，等于 code_graph 对所有
+/// 绝对路径查询完全失效。
+///
+/// 归一化规则：
+/// - 先解析出仓库根：`cwd` 能 canonicalize 就用其绝对形态，否则用进程 cwd。
+/// - `path` 若是绝对路径且落在仓库根下 → strip 掉根前缀，得到相对路径。
+/// - 若绝对但不在仓库根下 → 返回 None（该 path 不属于本仓库，索引必然无它，
+///   交给调用方回退实时扫描而不是谎报 0 命中）。
+/// - 相对路径 → 去掉前导 `./` 与首尾 `/`。
+/// - 空串或 `.` → `"."`（全仓范围）。
+fn normalize_scope(cwd: &Path, path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let rel_str = if p.is_absolute() {
+        // 仓库根：优先 canonicalize（吃掉 `.`、软链、`..`），失败则退回原样。
+        let root = std::fs::canonicalize(cwd)
+            .or_else(|_| std::env::current_dir())
+            .unwrap_or_else(|_| cwd.to_path_buf());
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        // 同样 canonicalize query path（文件可能不存在时 canonicalize 会失败，
+        // 退回按字符串前缀 strip）。
+        let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        match abs.strip_prefix(&root) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => return None, // 不在仓库根下 → 让调用方回退实时扫描
+        }
+    } else {
+        path.trim_start_matches("./").to_string()
+    };
+    let cleaned = rel_str.trim_start_matches("./").trim_matches('/');
+    if cleaned.is_empty() {
+        Some(".".to_string())
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
 /// 索引新鲜度判定：索引存在、版本匹配、且 `path` 覆盖到的文件都没在
 /// 索引构建后被改动过。用于工具 fast-path 决定「能否信任索引」。
-fn index_is_fresh_for(cwd: &Path, idx: &CodeGraphIndex, path: &str) -> bool {
+fn index_is_fresh_for(cwd: &Path, idx: &CodeGraphIndex, scope: &str) -> bool {
     if idx.version != CodeGraphIndex::CURRENT_VERSION {
         return false;
     }
-    // 只校验落在 query path 范围内的文件。path="." 时校验全部。
-    let scope = path.trim_start_matches("./");
+    // 只校验落在 query scope 范围内的文件。scope="." 时校验全部。
     for (rel, _entry) in &idx.files {
         if scope != "." && !scope.is_empty() && !rel.starts_with(scope) {
             continue;
@@ -179,19 +220,22 @@ pub fn query_signatures(
     if !INDEXED_KINDS.contains(&kind) {
         return None;
     }
+    // 把 query path 归一化成索引 key（相对仓库根）的可比形式。绝对路径、
+    // `./` 前缀、末尾 `/` 都在此吃掉；不在本仓库下的绝对路径返回 None，
+    // 让调用方回退实时扫描而不是谎报 0 命中。
+    let scope = normalize_scope(cwd, path)?;
     let idx_path = CodeGraphIndex::path(cwd);
     let idx: CodeGraphIndex = serde_json::from_str(&std::fs::read_to_string(idx_path).ok()?).ok()?;
-    if !index_is_fresh_for(cwd, &idx, path) {
+    if !index_is_fresh_for(cwd, &idx, &scope) {
         return None;
     }
-    let scope = path.trim_start_matches("./");
     let name_lc = name.map(|n| n.to_ascii_lowercase());
 
     // 收集命中：遍历范围内文件的目标 kind 符号。
     let mut hits: Vec<(String, u64, String)> = Vec::new(); // (file, line, sig)
     for (rel, entry) in &idx.files {
         // 路径范围过滤：scope 是文件时精确匹配，是目录时前缀匹配。
-        if scope != "." && !scope.is_empty() && !(rel == scope || rel.starts_with(&format!("{scope}/")) || rel.starts_with(scope)) {
+        if scope != "." && !scope.is_empty() && !(rel == &scope || rel.starts_with(&format!("{scope}/"))) {
             continue;
         }
         for s in &entry.symbols {
@@ -477,6 +521,87 @@ mod tests {
         assert_eq!(lang_from_ext("h"), Some("c"));
         assert_eq!(lang_from_ext("rs"), Some("rust"));
         assert_eq!(lang_from_ext("md"), None);
+    }
+
+    #[test]
+    fn normalize_scope_handles_relative_and_dot() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(normalize_scope(&cwd, "."), Some(".".to_string()));
+        assert_eq!(normalize_scope(&cwd, ""), Some(".".to_string()));
+        assert_eq!(normalize_scope(&cwd, "./src/lib.c"), Some("src/lib.c".to_string()));
+        assert_eq!(normalize_scope(&cwd, "src/lib.c"), Some("src/lib.c".to_string()));
+        assert_eq!(normalize_scope(&cwd, "src/"), Some("src".to_string()));
+    }
+
+    #[test]
+    fn normalize_scope_strips_absolute_repo_prefix() {
+        // 绝对路径落在仓库根下 → strip 成相对 key。用真实临时目录，
+        // 因为 normalize_scope 会 canonicalize（需要目录真实存在）。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.c"), "int x;\n").unwrap();
+        let abs = dir.path().join("src/lib.c");
+        assert_eq!(
+            normalize_scope(dir.path(), abs.to_str().unwrap()),
+            Some("src/lib.c".to_string()),
+            "absolute path under repo root must normalize to relative key"
+        );
+    }
+
+    #[test]
+    fn normalize_scope_rejects_path_outside_repo() {
+        // 绝对路径不在仓库根下 → None（调用方回退实时扫描，不谎报 0 命中）。
+        let repo = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("foo.c"), "int y;\n").unwrap();
+        let outside = other.path().join("foo.c");
+        assert_eq!(
+            normalize_scope(repo.path(), outside.to_str().unwrap()),
+            None,
+            "absolute path outside repo root must return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_signatures_matches_absolute_path() {
+        // 回归测试：模型传绝对路径时也应命中预建索引（旧实现会谎报 0）。
+        if !ast_grep_available().await {
+            eprintln!("ast-grep not installed; skipping absolute-path query test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.c"),
+            "void *do_alloc(size_t size) { return 0; }\nvoid do_free(void *p) { (void)p; }\n",
+        )
+        .unwrap();
+        let built = build_or_update(dir.path()).await;
+        assert!(matches!(built, BuildOutcome::Built { .. }), "got {built:?}");
+
+        // 相对路径命中（基线）。
+        let (rel_lines, rel_total) =
+            query_signatures(dir.path(), "src/lib.c", "function", None, 200, 12_000).unwrap();
+        assert_eq!(rel_total, 2, "relative path baseline: {rel_lines:?}");
+
+        // 绝对路径必须命中同样的结果（旧实现在这里返回 total=0）。
+        let abs = dir.path().join("src/lib.c");
+        let (abs_lines, abs_total) =
+            query_signatures(dir.path(), abs.to_str().unwrap(), "function", None, 200, 12_000)
+                .unwrap();
+        assert_eq!(abs_total, 2, "absolute path must match same 2 functions: {abs_lines:?}");
+        assert!(abs_lines.iter().any(|l| l.contains("do_alloc")));
+        assert!(abs_lines.iter().any(|l| l.contains("do_free")));
+
+        // 仓库外的绝对路径 → None（回退实时扫描）。
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("z.c"), "int z(void){return 0;}\n").unwrap();
+        let zabs = outside.path().join("z.c");
+        assert!(
+            query_signatures(dir.path(), zabs.to_str().unwrap(), "function", None, 200, 12_000)
+                .is_none(),
+            "path outside repo must return None so caller falls back to live scan"
+        );
     }
 
     #[tokio::test]
