@@ -60,6 +60,7 @@ pub mod tool_prompts {
     pub const SEARCH: &str = include_str!("../../prompts/tools/search.md");
     pub const BASH: &str = include_str!("../../prompts/tools/bash.md");
     pub const WRITE: &str = include_str!("../../prompts/tools/write.md");
+    pub const EDIT: &str = include_str!("../../prompts/tools/edit.md");
     pub const DELEGATE: &str = include_str!("../../prompts/tools/delegate.md");
     pub const ASK: &str = include_str!("../../prompts/tools/ask.md");
     pub const WORKFLOW: &str = include_str!("../../prompts/tools/workflow.md");
@@ -81,6 +82,7 @@ pub mod tool_prompts {
             "search" => SEARCH,
             "bash" => BASH,
             "write" => WRITE,
+            "edit" => EDIT,
             "delegate" => DELEGATE,
             "ask" => ASK,
             "workflow" => WORKFLOW,
@@ -331,5 +333,39 @@ mod tests {
                 "empty prompt for role '{id}'"
             );
         }
+    }
+
+    /// manager 必须带「交付物收敛」门禁，且**不得**退化成拍脑袋的
+    /// 轮次上限。
+    ///
+    /// 回归背景：一次实测会话里 manager 连跑 2 轮 `explore` + 2 个
+    /// 「通读/解剖」委派（共 28 分钟、260 次工具调用），用户点名的
+    /// 任务清单一个都没产出。但根因不是"探多了"——jemalloc 确实大。
+    /// 根因是没人盯着交付物，所以门禁必须按交付物写，不能按轮数写
+    /// （按计数刹车就是已移除的 WORKFLOW_BUDGET_PER_UNIT_SECS 那类
+    /// 误杀健康长任务的错误）。
+    #[test]
+    fn manager_prompt_gates_on_deliverables_not_round_counts() {
+        assert!(MANAGER.contains("交付物收敛"), "缺少门禁小节");
+        assert!(MANAGER.contains("这里不限制调研轮数"), "必须明说不限轮数");
+        assert!(MANAGER.contains("不许重复探索同一范围"), "缺少重复探索约束");
+        assert!(MANAGER.contains("implementation_plan"), "未点名产出流程");
+        assert!(MANAGER.contains("learn"), "未点名学习流程");
+        // 「先不锁方向」不得成为回退调研的借口。
+        assert!(MANAGER.contains("先不锁方向"), "未覆盖 punt-back 分支");
+        // 硬性反向断言：不得出现任何轮次上限。
+        assert!(
+            !MANAGER.contains("调研最多 1 轮"),
+            "轮次上限已被判定为错误设计，不得再出现"
+        );
+    }
+
+    /// `ask` 必须禁止「没有下一步动作」的兜底选项。用户一旦选中它，
+    /// manager 就失去收敛依据，实测直接退回又一轮调研。
+    #[test]
+    fn ask_prompt_forbids_punt_back_options() {
+        let ask = tool_prompts::ASK;
+        assert!(ask.contains("punt-back"), "未禁止 punt-back 选项");
+        assert!(ask.contains("先不锁方向"), "未给出具体反例");
     }
 }

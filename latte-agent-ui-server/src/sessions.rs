@@ -514,7 +514,7 @@ impl SessionHandle {
         let agent_config_snapshot = Arc::new(self.spawn.merged.read().clone());
         let default_params = GenerateParams::default();
         // advisor 总开关来自 agents 配置（`[advisor] enabled`），不再是
-        // 硬编码 default（此前用户无法关闭 advisor——jemalloc 反馈
+        // 硬编码 default（此前用户无法关闭 advisor——用户反馈
         // 「advisor 总是卡/空喊」却无路可关）。
         let advisor_monitor_cfg = AdvisorMonitorConfig {
             enabled: agent_config_snapshot.advisor.enabled(),
@@ -956,7 +956,7 @@ mod tests {
         assert_eq!(got.wf_id, "wf-c", "末尾的 failed 覆盖前序的语义");
     }
 
-    /// 中断场景（jemalloc 事故）：workflow 被 Paused 后进程重启，
+    /// 中断场景（实测事故）：workflow 被 Paused 后进程重启，
     /// 永远等不到 WorkflowFinished。扫描应挑出最外层未完成的 run
     /// （嵌套 workflow 的 Started 更晚，最早 Started = 最外层）。
     #[test]

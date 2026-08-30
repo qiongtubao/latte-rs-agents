@@ -35,7 +35,7 @@ task = """先快速摸清代码库背景（3-5 次工具调用：读目录结构
 选项文字要贴合第 1 步摸到的代码背景（如引用真实目录/文件/术语），不要放通用选项。
 图片支持：ask 选项的 `preview` 字段支持富内容（含图片），当某个选项靠文字说不清时——比如方向对比、架构图、代码摘录、截图——把图片/图示放进该选项的 `preview`，让用户看到图再选。
 
-问完汇总：把 4 个答案整合成一段 100-200 字用户画像，并附带代码背景观察（如"该仓库 src/ 下有 arena/tcache/extent 等模块，入口在 src/jemalloc.c"），作为 user_profile 输出。"""
+问完汇总：把 4 个答案整合成一段 100-200 字用户画像，并附带代码背景观察（引用第 1 步在**本仓库**实际看到的目录/模块/入口文件，如"该仓库 src/ 下有 <模块A>/<模块B> 等模块，入口在 <入口文件>"），作为 user_profile 输出。"""
 
 # ── 串行链：探索 → 脑暴 → 计划 ────────────────────────────────────
 [[steps]]
@@ -49,7 +49,7 @@ output_key = "exploration"
 # 打通信息漏斗：survey 原文（programmer 实读代码得到的文件清单、真实
 # 行号、术语解释）也带出来，随方案一起下传给双评审。
 # 此前评审只拿到被逐层压缩的 proposal，想核对事实无从核对——
-# jemalloc 实锤：双评审共报 5 处实测行号错误，而正确的行号就在 survey
+# 实测实锤：双评审共报 5 处实测行号错误，而正确的行号就在 survey
 # 原文里，只是从来没往下传。
 export = { survey = "exploration" }
 
@@ -61,7 +61,7 @@ depends_on = ["explore"]
 task = "{{topic}}\n\n用户画像：\n{{user_profile}}\n\n背景探索结论：\n{{exploration}}"
 # 子 workflow 最后一步是 advisor_verdict（评审裁决），父级要的是
 # synthesize 的方案本体 —— 否则下游拿到的是「裁决：✅ 通过…」评审
-# 文本而不是方案（jemalloc 现场实锤：plan/评审步骤全被喂了 verdict）。
+# 文本而不是方案（现场实锤：plan/评审步骤全被喂了 verdict）。
 output_from = "proposal"
 output_key = "design"
 
@@ -76,7 +76,7 @@ output_key = "plan"
 # ── 并行组：两个评审互不依赖，同一 wave 并行 ──────────────────────
 # 两个评审都同时收到「方案 + survey 原文」：方案讲的是要做什么，
 # survey 原文是唯一的事实基线（真实文件、真实行号、真实约定）。
-# 只给方案 = 让评审凭记忆核事实，必然产出错行号（jemalloc 实锤）。
+# 只给方案 = 让评审凭记忆核事实，必然产出错行号（实测实锤）。
 [[steps]]
 id = "req_review"
 description = "嵌套 requirements_review（与 code_review 并行）"
@@ -107,10 +107,10 @@ output_key = "code_verdict"
 # 双评审 → 重判，最多 max_iterations 轮；耗尽仍 REJECT 才以 failed
 # 收场（带 wf_id 可 resume）。
 # 此前这里是 max_retries=0 + 契约 require PASS ——评审尽职尽责找到
-# 真问题反而把整条流水线判死（jemalloc 实锤：唯一跑到 gate 的那次
+# 真问题反而把整条流水线判死（实测实锤：唯一跑到 gate 的那次
 # 运行，双评审共 6 条阻断 + 5 处实测行号错误，44 分钟流水线零产出）。
 # 子层 implementation_plan 早已自带 REJECT→返工环，顶层不该更脆。
-# ⚠️ 有条件通过 → PASS 但条件/修正项必须随计划一并带上（jemalloc
+# ⚠️ 有条件通过 → PASS 但条件/修正项必须随计划一并带上（实测
 # 实锤：实测行号错误随裸 PASS 被静默丢弃）；有实测错误未吸收进
 # 计划时必须 REJECT。
 [[steps]]

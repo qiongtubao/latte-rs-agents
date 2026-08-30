@@ -201,7 +201,7 @@ pub(crate) fn iso8601_utc_now() -> String {
 }
 
 /// UTF-8 安全的字节截断：`max_bytes` 是字节预算，直接 `&s[..max]`
-/// 在多字节字符中间会 panic（jemalloc 事故：中文工具校验错误在
+/// 在多字节字符中间会 panic（实测事故：中文工具校验错误在
 /// byte 256 处切断 '确'，整个 delegate task panic、workflow 失败、
 /// plan 弹窗从未出现）。回退到不超过预算的最近 char boundary。
 pub(crate) fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {

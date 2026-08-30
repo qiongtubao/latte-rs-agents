@@ -72,7 +72,7 @@ pub enum AgentError {
     /// deadline-only 模式下这是唯一始终生效的自动刹车（轮次上限连同
     /// `MaxToolRoundsExceeded` 已删除，`deadline` 只在 delegate / workflow
     /// step 上设置），所以它必须把已产出的正文带出来——熔断时丢掉模型已
-    /// 写好的结论，就是 jemalloc「105 轮跑完、3 小时零产出」那次事故的
+    /// 写好的结论，就是实测「105 轮跑完、3 小时零产出」那次事故的
     /// 成因。上层据此降级采纳（见 `workflow.rs` 的 partial 降级分支与
     /// `controller.rs` 的 delegate 回喂）。
     #[error("tool loop detected: {tool} — {reason}{}", fmt_partial(partial))]

@@ -264,9 +264,9 @@ mod tests {
 
     #[test]
     fn workflow_key_separates_resume_from_fresh_run() {
-        let fresh = DispatchLedger::workflow_key("design_and_plan", "学 jemalloc", None);
+        let fresh = DispatchLedger::workflow_key("design_and_plan", "学某个 C 项目", None);
         let resumed =
-            DispatchLedger::workflow_key("design_and_plan", "学 jemalloc", Some("wf-x-1"));
+            DispatchLedger::workflow_key("design_and_plan", "学某个 C 项目", Some("wf-x-1"));
         assert_ne!(fresh, resumed, "resume 与新开是两件事，不能互相命中");
         // 不同 topic 不互撞。
         assert_ne!(

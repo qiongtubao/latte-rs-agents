@@ -583,7 +583,7 @@ fn plan_gate_rejection(stage: &SharedPlanStage, role_id: &str) -> Option<String>
 /// boolean`，被 `classify_tool_execution_error` 归成 PermanentExec
 /// （消息含 "invalid"）→ 不重试，一次工具调用就此废掉。
 ///
-/// jemalloc 实锤：tutor 在 `interview` 步给 `recommended` 发了
+/// 实测实锤：tutor 在 `interview` 步给 `recommended` 发了
 /// `"true"`，ask 直接失败，弹框没弹出。
 ///
 /// 接受：真 bool、`"true"/"false"/"yes"/"no"/"1"/"0"/"on"/"off"`
@@ -608,7 +608,7 @@ pub(crate) fn lenient_bool(v: &serde_json::Value) -> Option<bool> {
 /// `question` 文案是否已经**向用户承诺了多选**。
 ///
 /// 为什么需要：模型经常把多选意图只写进问题文字里，却忘了传 `multi`
-/// 参数（jemalloc 实锤：tutor 发的是
+/// 参数（实测实锤：tutor 发的是
 /// `{"question":"你最想深入哪条线？（可多选）","options":[…]}`，
 /// 完全没有 `multi` 键）。此时 `multi` 缺省 false，前端老老实实渲染
 /// 单选——用户看着"（可多选）"却只能点一个，是纯粹的承诺违背。
@@ -708,7 +708,7 @@ pub struct ChoiceOption {
     #[serde(alias = "title", alias = "name", alias = "text")]
     pub label: String,
     /// 可选补充说明，显示在标签下方。空则不序列化。
-    /// `desc` 别名：模型常这么简写（jemalloc 实锤：programmer 发的
+    /// `desc` 别名：模型常这么简写（实测实锤：programmer 发的
     /// 每一项都是 `desc`，严格字段名下说明文字被静默丢弃）。
     #[serde(
         default,
@@ -2017,7 +2017,7 @@ async fn run_multi_role_loop(
                             // 失败也要注入 manager 善后输入（与成功路径
                             // 同款 inject）。此前失败只发 Status 就回等
                             // 输入——advisor 的纠正 hint 悬在队列里无人
-                            // 消费（jemalloc 实锤：gate 失败后 advisor
+                            // 消费（实测实锤：gate 失败后 advisor
                             // 的「过度编排」intervene 悬空，50 分钟零产出）。
                             let hints: Vec<String> =
                                 advisor_hints.lock().drain(..).collect();
@@ -2456,7 +2456,7 @@ async fn run_single_role_loop(
 
                         // workflow slash 失败时合成的善后输入：Some 时不
                         // continue，落到下面的正常 turn 路径直接开一轮
-                        // （jemalloc 实锤：失败只发 Status 回等输入，
+                        // （实测实锤：失败只发 Status 回等输入，
                         // advisor 的纠正 hint 悬空，50 分钟零产出）。
                         let mut synthetic_followup: Option<String> = None;
                         if trimmed.starts_with('/') {
@@ -2923,6 +2923,9 @@ async fn build_runner(
                 session_id.to_string(),
                 advisor_gate.clone(),
                 advisor_pause.clone(),
+                // 原始诉求：调研流程返回时用来判断用户点名的交付物
+                // 是否还欠着（见 workflow::deliverable_reminder）。
+                main_topic.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register workflow: {e}")))?;
@@ -3272,7 +3275,7 @@ pub(crate) fn register_request_tool(
 // ─────────────────────────────────────────────────────────────────────
 // code_graph：结构化代码导航
 //
-// 设计要点（2026-08-27 重写，起因见 jemalloc 会话事故）：
+// 设计要点（2026-08-27 重写，起因见实测会话事故）：
 //
 // 旧实现把 `kind` 映射成 **Rust/TypeScript 语法的 ast-grep pattern**
 // （`fn $NAME($$$PARAMS) -> $RET { ... }`、`trait`、`impl`、ES6
@@ -3282,7 +3285,7 @@ pub(crate) fn register_request_tool(
 // 直接催生了单次 delegate 976 万 input tokens。
 //
 // 关键修正：**按 pattern 匹配改成按 tree-sitter 节点类型（`kind:`）
-// 匹配**。实测对比（jemalloc `src/pac.c`，真实函数 22 个）：
+// 匹配**。实测对比（某 C 仓库 `src/pac.c`，真实函数 22 个）：
 //   - pattern `$RET $NAME($$$PARAMS) { $$$BODY }` → 命中 8（召回 36%）
 //   - rule    `kind: function_definition`        → 命中 22（召回 100%）
 // 在 pac.c / pa.c / hpa.c / sec.c 上抽查，节点类型路线召回均为 100%。
@@ -3296,7 +3299,7 @@ pub(crate) fn register_request_tool(
 /// 每行 `(语言, 语义 kind, 节点类型)`。同一 (语言, kind) 可以有多行，
 /// 会合并成 `any:` 规则（例如 Go 的 `function` 同时覆盖普通函数和方法）。
 const CODE_GRAPH_KIND_TABLE: &[(&str, &str, &str)] = &[
-    // ── C ──（实测样本：jemalloc src/pac.c, include/.../edata.h）
+    // ── C ──（实测样本：某 C 仓库 src/pac.c, include/.../edata.h）
     ("c", "function", "function_definition"),
     ("c", "struct", "struct_specifier"),
     ("c", "type", "type_definition"),
@@ -3468,9 +3471,9 @@ fn code_graph_build_rule(lang: &str, node_kinds: &[&str], name: Option<&str>) ->
 /// 从一条 ast-grep JSON 匹配里提取"签名行"——匹配文本的第一行，
 /// 并把跨行的参数列表压平。这是 code_graph 省 token 的核心。
 ///
-/// 真实仓库实测（jemalloc，10 个最大的源文件 / 431 个函数）：
+/// 真实仓库实测（某 C 仓库，10 个最大的源文件 / 431 个函数）：
 /// 整文件 328,625 B → 签名清单 47,576 B，**6.9x**。单文件区间 3.1x
-/// (edata.h，全是短小的 inline getter) ~ 11.6x (jemalloc.c，函数体长)。
+/// (edata.h，全是短小的 inline getter) ~ 11.6x (大源文件，函数体长)。
 /// 函数体越长压缩比越高，正好对应"想看结构时最不需要函数体"。
 fn code_graph_signature_of(text: &str) -> String {
     // 取到函数体开始（`{`）之前，避免把整个 body 带回来。
@@ -3829,7 +3832,7 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         "结构化代码导航：按 AST 节点类型查函数/结构体/类/调用点/import，比 grep 精准、比整文件 read 省得多。\
          典型用法——先用它建地图（`kind=function` + `path=src/foo.c` 拿到全部函数签名和行号），\
          再只对少数热点用带行范围的 read 精读。查「谁调用了 X」用 `kind=call` + `name=X`。\
-         实测（jemalloc 10 个最大源文件 / 431 个函数）：整文件 328KB → 签名清单 47KB，6.9x。\
+         实测（某 C 仓库 10 个最大源文件 / 431 个函数）：整文件 328KB → 签名清单 47KB，6.9x。\
          支持 c/cpp/rust/go/python/typescript/javascript/java。需要本机装有 ast-grep",
         schema,
         handler,
@@ -3956,6 +3959,30 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 - 调用 workflow 前先用一句话说明：选哪个、为什么、预期拿到什么结论
 - workflow 会跑完整条流水线并把结论返回给你；你综合后再回复用户。
 
+按**用户点名的交付物**选流程（照抄这张表，别一律 explore）：
+
+| 用户要的东西 | 选这个 | 别选 explore 的理由 |
+|---|---|---|
+| 「学习 / 讲讲 XXX 原理 / 入门」 | `learn` | explore 的产出是「决策背景要点」，不是能读的教程；`learn` 会落盘 `docs/learn/<slug>.md` |
+| 「拆分任务 / 排任务 / 给我计划」 | `implementation_plan` | explore 不产出任务清单，它的终点是背景结论 |
+| 「安排学习计划 + 拆分任务」（两者都要） | `learn` 或调研一轮 → **紧接** `implementation_plan` | 光跑 explore 等于一件都没交付 |
+| 「这块代码怎么回事 / 有什么坑」 | `explore` | 这类才是 explore 的正题 |
+
+**调研要收口（不是限制轮数）**：调研类流程（`explore` / `design_brainstorm`）想探几轮就探几轮——
+大仓库分模块深入是正当的。但每一轮都必须**换一个具体问题**，且随时对着交付物问自己一句：
+「这一轮结束后，用户点名的交付物离产出更近了，还是我只是更懂了？」
+
+- 连续两轮答案都是"只是更懂了" → 已有结论就够动手了，转去跑产出交付物的流程。
+- **不要重复探索同一范围**：把上一轮的 topic 换几个词再探一遍不会带来新信息。还要探就必须说得出
+  **这一轮补的是哪一个具体问题**；说不出来（只是「再摸一遍结构」）就说明该转产出了。
+- 用户诉求里点名过交付物时，调研流程的返回末尾会附一条**交付物提醒**（列出还欠着什么、该跑哪个流程）。
+  它不阻断你，但别忽略它。
+- 把「通读 XXX 产出解剖报告」派成 `delegate`，与再跑一轮 `explore` 是同一件事，同样受这条约束。
+
+**用户选了「先不锁方向 / 以后再定」不要退回调研**：这类回答通常已经隐含阶段骨架
+（例如「读整体 → 深读 X → 再定改动点」就是 3 个阶段任务）。直接按这个骨架拆任务清单，
+把"定改动点"本身作为最后一个任务；方向没锁 ≠ 无法拆分。
+
 workflow 失败时的兜底（必须遵守）：
 - 错误信息里带失败原因——gate 被拦时会附「不合格产出摘要」（REJECT 理由）。先读懂它。
 - 能修复的（方案有冲突、内容可调整）：修复后用 resume 续跑，或直接 delegate 重做失败的那一步。
@@ -4026,7 +4053,7 @@ fn extract_plan_tasks(summary: &str) -> Option<Vec<PlanTask>> {
 
 /// slash 命令路径的自动提案：workflow 成功且产出带任务清单时，代
 /// manager 广播 `PlanProposed`（slash 路径不经 manager 的 agent loop，
-/// 没人会调 `plan` 工具——jemalloc 现场实锤两次会话 0 次 PlanProposed，
+/// 没人会调 `plan` 工具——现场实锤两次会话 0 次 PlanProposed，
 /// 「添加任务」弹窗从未弹出）。返回是否发出了提案。
 pub(crate) fn propose_plan_from_summary(
     event_tx: &broadcast::Sender<ChatEvent>,
@@ -4140,9 +4167,9 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     // ── 清单内重叠（仅顶层任务两两比较；子任务继承父任务范围） ──
     //
     // 只读任务不参与校验：重叠的唯一害处是"并行写互相覆盖"，纯阅读/
-    // 学习/调研类任务天然可以共用同一份代码。（jemalloc 2026-08-26
+    // 学习/调研类任务天然可以共用同一份代码。（实测
     // 会话：8 个纯阅读的学习任务因为都要读
-    // `include/jemalloc/internal` 被判 45 处冲突，5855 字错误回喂时又
+    // `include/foo/internal` 被判 45 处冲突，5855 字错误回喂时又
     // 被截到 256 字节，模型看不全、改不动，连撞两次 plan 后靠蒙才过。）
     let mut pairs = 0usize;
     // 冲突热点：重叠路径 → 牵涉到的任务下标集合。按路径聚合而不是按
@@ -4459,7 +4486,7 @@ pub(crate) fn register_ask_tool(
                 .ok_or_else(|| tool_err("missing non-empty 'question' field".into()))?;
 
             // options 宽松取值：正常是裸数组，但模型也会包一层对象
-            // （jemalloc 实锤：programmer 发的是 `{"item":[...]}`,
+            // （实测实锤：programmer 发的是 `{"item":[...]}`,
             // 直接 as_array() 拿不到 → 'options' must be an array,
             // 提问废掉）。包一层时取其中唯一的数组字段，不猜键名。
             let opts_owned;
@@ -4498,7 +4525,7 @@ pub(crate) fn register_ask_tool(
             // 宽松布尔 + 常见键名别名。此前用裸 `as_bool()`：字符串
             // `"false"` / `"true"` 一律 None → 静默退化成 false，
             // 模型想开多选却拿到单选，无任何报错线索
-            // （jemalloc 实锤：programmer 发的是 `"multiSelect":"false"`）。
+            // （实测实锤：programmer 发的是 `"multiSelect":"false"`）。
             let pick_bool = |keys: &[&str]| -> bool {
                 keys.iter()
                     .filter_map(|k| input.get(*k))
@@ -4506,7 +4533,7 @@ pub(crate) fn register_ask_tool(
                     .unwrap_or(false)
             };
             // `multi` 双通道判定：显式参数 **或** question 文案。模型
-            // 常常只在文案里写"（可多选）"而不传 `multi`（jemalloc
+            // 常常只在文案里写"（可多选）"而不传 `multi`（实测
             // 实锤：tutor 的「你最想深入哪条线？（可多选）」整个 args
             // 里没有 multi 键），缺省 false 让前端渲染成单选，用户看着
             // "可多选"只能点一个。两个信号任一为真就开多选——文案是
@@ -4607,7 +4634,7 @@ pub(crate) fn register_ask_tool(
                             // 用**根** run 的 id，不是发出提问的那一层：
                             // 嵌套场景下只 resume 子 run 是不够的——父
                             // 流水线不知道自己在等谁，永远醒不过来
-                            // （jemalloc 现场：requirements_review 的
+                            // （实测现场：requirements_review 的
                             // decide 弹窗答了也只能让子流程跑完，顶层
                             // design_and_plan 依旧卡死）。
                             log.resume_wf_id(),
@@ -4840,7 +4867,7 @@ pub(crate) async fn gate_delegate_return(
     use crate::advisor_monitor::Verdict;
     // Bound the review so a slow/absent advisor model can't stall the
     // delegate return (mirrors the monitor's REVIEW_TIMEOUT_SECS).
-    // 预算可配（AdvisorMonitorConfig::review_settings）：jemalloc 实锤
+    // 预算可配（AdvisorMonitorConfig::review_settings）：实测实锤
     // 45s 硬编码对 20–44s 延迟的慢审查模型太紧，频繁未审放行。
     let timeout = engine.delegate_review_timeout();
     let review = tokio::time::timeout(
@@ -4940,12 +4967,12 @@ pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
 ///   已经熔断 → 孤儿 step）。
 ///   （历史：曾在引擎里加过一层「按分派单元数推算的 wall-clock 规模
 ///   预算」，但它只看总时长、无法区分「卡死」与「任务就是重」，反复
-///   误杀 jemalloc explore 这类合法长任务，已移除。）
+///   误杀 explore 这类合法长任务，已移除。）
 /// - per-step wall-clock 触发的 `TimeoutWarning`（周期复发，让用户拍板）、
 ///   `turn_cancel_flag`（用户「终止当前任务」）、session `cancel_flag`
 ///   （全量中止），以及 `run_turn` 内部的死循环熔断。
 ///
-/// jemalloc 实锤：`workflow` 漏配本超时 → manager 调用在第 25 分钟被
+/// 实测实锤：`workflow` 漏配本超时 → manager 调用在第 25 分钟被
 /// 熔断，而 step 因已无 wall-clock 硬超时仍在后台跑（孤儿任务）；
 /// manager 依错误提示 resume 又是 25min，两次空等 50 分钟零产出。
 pub const ORCHESTRATION_TOOL_TIMEOUT_SECS: u64 = 86_400;
@@ -5186,7 +5213,7 @@ async fn register_delegate_tool(
                 })?;
             // 熔断：delegate wall-clock 超时。解析顺序对齐 CLI
             // （chat.rs）：model.timeout_secs > env > UI 默认 900s。
-            // jemalloc 事故：无超时 → estimate 步骤的 programmer
+            // 实测事故：无超时 → estimate 步骤的 programmer
             // 盲改循环 24min，父 workflow 被无限期吊住。
             let timeout_s = specialist_timeout_secs(
                 resolver.get_def(&models[0].id).and_then(|d| d.timeout_secs),
@@ -5260,7 +5287,7 @@ async fn register_delegate_tool(
                 });
                 tool_err(summary)
             })?;
-            // 工具轮次上限兜底盲改/跑偏循环（jemalloc 事故前写死
+            // 工具轮次上限兜底盲改/跑偏循环（实测事故前写死
             // 0 = 无限，靠 LoopDetector 抓「连续 3 次相同调用」，
             // 对换着参数重写的循环无效）。正常任务远低于默认值，
             // 死循环熔断冒泡 ToolLoopDetected（带 partial）→ 回喂 manager 重派。
@@ -5314,7 +5341,7 @@ async fn register_delegate_tool(
 
             // 5. Run the specialist with a wall-clock timeout
             //    (`timeout_s`, resolved above) plus 500ms cancel_flag
-            //    polling. jemalloc 事故前无超时：子代理永不结束时
+            //    polling. 实测事故前无超时：子代理永不结束时
             //    父方永远等待。
             let _permit = sem.acquire().await.map_err(|_| {
                 tool_err("delegate pool shut down".into())
@@ -5634,6 +5661,9 @@ async fn register_workflow_tool(
     // Advisor intervene 暂停门：分派前 wait、运行中 park——advisor 的
     // 「已暂停等待拍板」对 workflow 流水线真实生效。
     advisor_pause: AdvisorPauseGate,
+    // 原始用户诉求。调研类流水线跑完后用它判断「用户点名的交付物是否
+    // 还欠着」——这是个二值事实，不涉及任何阈值或轮次计数。
+    main_topic: Arc<parking_lot::Mutex<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     // 注册时动态枚举 .latte/workflows.d（项目 + 全局）里的可用
@@ -5711,6 +5741,7 @@ async fn register_workflow_tool(
         let advisor_pause = advisor_pause.clone();
         let cwd = cwd.clone();
         let wf_ledger = wf_ledger.clone();
+        let main_topic = Arc::clone(&main_topic);
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
             let name = input
@@ -5783,7 +5814,22 @@ async fn register_workflow_tool(
                 None => crate::workflow::run_workflow(&wf, &topic, &ctx).await,
             };
             result
-                .map(|summary| serde_json::Value::String(strip_think_blocks(&summary)))
+                .map(|summary| {
+                    let mut out = strip_think_blocks(&summary);
+                    // 交付物提醒：调研类流水线跑完，且用户诉求里点名过
+                    // 交付物时，把"还欠着什么 + 该跑哪个流程"附在返回末
+                    // 尾。不数轮次、不设阈值、不阻断——只是把事实摆出来。
+                    // 诉求没点名交付物（如「这块代码怎么回事」）时
+                    // named 为空，什么也不加。
+                    if crate::workflow::is_research_workflow(&name) {
+                        let user_ask: String = main_topic.lock().clone();
+                        let named = crate::workflow::named_deliverables(&user_ask);
+                        if !named.is_empty() {
+                            out.push_str(&crate::workflow::deliverable_reminder(&named));
+                        }
+                    }
+                    serde_json::Value::String(out)
+                })
                 .map_err(|e| {
                     // 用户主动终止 ≠ 执行失败，善后动作相反：绝不能
                     // 自动 resume/重做——否则用户右键「终止此分派」把
@@ -5795,7 +5841,7 @@ async fn register_workflow_tool(
                              并询问下一步怎么做，然后结束本轮。"
                         ));
                     }
-                    // 失败时给 manager 明确的善后指令——jemalloc 实锤：
+                    // 失败时给 manager 明确的善后指令——实测实锤：
                     // 裸错误回 tool loop 后 manager 没有动作，流水线
                     // 零产出收场。
                     tool_err(format!(
@@ -5906,27 +5952,27 @@ mod tests {
     /// 纯阅读/学习类任务共用同一份代码是正常的（不会互相覆盖），
     /// 不该被重叠校验拦下。
     ///
-    /// 回归 jemalloc 2026-08-26 事故：8 个只读学习任务因为都要读
-    /// `include/jemalloc/internal` 被判 45 处冲突，manager 连撞两次
+    /// 回归实测事故：8 个只读学习任务因为都要读
+    /// `include/foo/internal` 被判 45 处冲突，manager 连撞两次
     /// plan、白烧约 5 分钟模型时间。
     #[test]
     fn readonly_tasks_skip_overlap_check() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        std::fs::create_dir_all(cwd.join("include/jemalloc/internal")).unwrap();
+        std::fs::create_dir_all(cwd.join("include/foo/internal")).unwrap();
         let tasks = vec![
-            plan_task("P1 读公共头", &["学习", "只读"], &["include/jemalloc"]),
+            plan_task("P1 读公共头", &["学习", "只读"], &["include/foo"]),
             plan_task(
                 "P2 读内部头",
                 &["只读"],
-                &["include/jemalloc/internal"],
+                &["include/foo/internal"],
             ),
         ];
         assert!(validate_plan_paths(cwd, &tasks).is_ok());
         // 同样的路径，但任务没有只读标记 → 仍然拦。
         let writing = vec![
-            plan_task("P1 改公共头", &[], &["include/jemalloc"]),
-            plan_task("P2 改内部头", &[], &["include/jemalloc/internal"]),
+            plan_task("P1 改公共头", &[], &["include/foo"]),
+            plan_task("P2 改内部头", &[], &["include/foo/internal"]),
         ];
         assert!(validate_plan_paths(cwd, &writing).is_err());
     }
@@ -5937,9 +5983,9 @@ mod tests {
     fn overlap_error_is_short_and_aggregated() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        std::fs::create_dir_all(cwd.join("include/jemalloc/internal")).unwrap();
+        std::fs::create_dir_all(cwd.join("include/foo/internal")).unwrap();
         std::fs::create_dir_all(cwd.join("src")).unwrap();
-        let hot = "include/jemalloc/internal";
+        let hot = "include/foo/internal";
         let tasks: Vec<PlanTask> = (0..8)
             .map(|i| {
                 plan_task(
@@ -6084,7 +6130,7 @@ mod tests {
 
     /// delegate / workflow speaker 路径的 sink 带 sub_id：工具事件
     /// 必须把它透传给 ChatEvent，前端才能按 subsession 精确归属，
-    /// 而不是泄进主 session 按 role_id 猜（jemalloc 日志事故：
+    /// 而不是泄进主 session 按 role_id 猜（日志事故：
     /// task_planner 的 read 全显示在主 session）。
     #[test]
     fn chat_event_trace_sink_propagates_sub_id() {
@@ -6189,6 +6235,29 @@ mod tests {
         assert!(hint.contains("分派前先想流程"), "hint: {hint}");
     }
 
+    /// 交付物 → 流程的路由表必须在提示里。实测会话里 manager 两次都
+    /// 选了 `explore`（产出是决策背景），`learn` 与 `implementation_plan`
+    /// 明明都在可用清单里却一次没用，最终 0 任务收场 —— 光有"任务类型
+    /// 要匹配"这种抽象话不够，得给对照表。
+    #[test]
+    fn workflow_hint_carries_deliverable_routing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let hint = workflow_tool_hint(dir.path());
+        assert!(hint.contains("按**用户点名的交付物**选流程"), "hint: {hint}");
+        assert!(hint.contains("`learn`"), "hint: {hint}");
+        assert!(hint.contains("`implementation_plan`"), "hint: {hint}");
+        // 收口是按交付物，不是按轮数——提示里不得出现轮次上限。
+        assert!(hint.contains("调研要收口（不是限制轮数）"), "hint: {hint}");
+        assert!(
+            !hint.contains("最多 1 轮"),
+            "不该有拍脑袋的轮次上限: {hint}"
+        );
+        assert!(hint.contains("不要重复探索同一范围"), "hint: {hint}");
+        assert!(hint.contains("交付物提醒"), "hint: {hint}");
+        // 「先不锁方向」不得成为回退调研的理由。
+        assert!(hint.contains("先不锁方向"), "hint: {hint}");
+    }
+
     #[test]
     fn workflow_hint_empty_dir_degrades_gracefully() {
         // list_workflows 会回退到全局 $LATTE_HOME/workflows.d —— 用
@@ -6244,6 +6313,7 @@ mod tests {
             "test-session".into(),
             None,
             AdvisorPauseGate::new(),
+            Arc::new(parking_lot::Mutex::new(String::new())),
         )
         .await
         .expect("register workflow tool");
@@ -6741,7 +6811,7 @@ mod tests {
     #[test]
     fn extract_plan_tasks_reads_json_fence_with_surrounding_text() {
         // gate 通过时的典型产出：VERDICT + 标题 + ```json 代码块。
-        let summary = "VERDICT: PASS\n\n【任务清单】\n```json\n{\n  \"tasks\": [\n    {\"title\": \"D1: 理解 stats_print\", \"description\": \"阅读\", \"priority\": 1, \"labels\": [\"jemalloc\"], \"workflow\": \"\", \"subtasks\": [{\"title\": \"D1.1\"}]}\n  ]\n}\n```\n";
+        let summary = "VERDICT: PASS\n\n【任务清单】\n```json\n{\n  \"tasks\": [\n    {\"title\": \"D1: 理解 stats_print\", \"description\": \"阅读\", \"priority\": 1, \"labels\": [\"学习\"], \"workflow\": \"\", \"subtasks\": [{\"title\": \"D1.1\"}]}\n  ]\n}\n```\n";
         let tasks = extract_plan_tasks(summary).expect("应提取到任务清单");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "D1: 理解 stats_print");
@@ -6869,7 +6939,7 @@ mod tests {
         assert_eq!(options[1].description, "服务端存会话");
     }
 
-    /// jemalloc 事故回放（tutor / interview 步）：模型把多选意图只写进
+    /// 事故回放（tutor / interview 步）：模型把多选意图只写进
     /// question 文案（`你最想深入哪条线？（可多选）`），args 里完全没有
     /// `multi` 键 → 缺省 false → 前端按 radio 渲染，用户看着"可多选"
     /// 却只能点一个。文案兜底必须把这种情形识别成多选。
@@ -7057,7 +7127,7 @@ mod tests {
         }
     }
 
-    /// jemalloc 事故回放（tutor / interview 步）：`recommended` 发成
+    /// 事故回放（tutor / interview 步）：`recommended` 发成
     /// 字符串 `"true"`，此前 serde 严格解析报
     /// `options[0] invalid: invalid type: string "true", expected a
     /// boolean` → PermanentExec 不重试 → 选择框根本没弹出来。
@@ -7070,7 +7140,7 @@ mod tests {
         let input = serde_json::json!({
             "question": "第 4 题：你最想深入的方向？",
             "options": [
-                {"label": "核心分配链路", "description": "jemalloc.c → tcache", "recommended": "true"},
+                {"label": "核心分配链路", "description": "main.c → cache", "recommended": "true"},
                 {"label": "extent 内存池与 rtree", "description": "edata 元数据"},
             ]
         });
@@ -7120,7 +7190,7 @@ mod tests {
         tm.execute("ask", coerced, None).await
     }
 
-    /// jemalloc 事故回放（programmer）：模型把 options 包进
+    /// 事故回放（programmer）：模型把 options 包进
     /// `{"item":[...]}`、每项用 `desc` 而不是 `description`、
     /// 多选键写成 `"multiSelect":"false"`。原始报错是
     /// `Tool not found: ask`（角色没这个工具），补上工具后紧接着就会
@@ -7378,7 +7448,7 @@ mod tests {
     /// 阻塞 ask 收到答案必须**立刻**落盘，然后同一问题再问时直接回放
     /// —— 不再弹第二个选择框，用户不用重答。
     ///
-    /// jemalloc 形状：design_and_plan 的 interview 步连问 3-4 题，
+    /// 实测形状：design_and_plan 的 interview 步连问 3-4 题，
     /// 只要该 step 后续任何环节挂了（契约不合格 / 空产出 / advisor 拦 /
     /// 预算超支 / 模型报错），契约重试是**全新 subagent**、resume 又只
     /// 跳过已完成的 step —— 两条路都会把同一批问题重新弹一遍。
@@ -7499,7 +7569,7 @@ mod tests {
     }
 
     /// programmer 必须带 `ask`：缺了它模型照样会调，拿到
-    /// `Tool not found: ask` 就只能瞎猜（jemalloc 实锤：programmer
+    /// `Tool not found: ask` 就只能瞎猜（实测实锤：programmer
     /// 问「归档 3 份还是 5 份」，Tool not found: ask）。
     ///
     /// 两份都要查：`config/agents/`（权威模板，install.sh 装到全局）
@@ -7850,7 +7920,7 @@ mod tests {
 
         // 模型端永不返回（30s 延迟），model.timeout_secs=1 → delegate
         // 必须在 ~1s 被熔断：tool error + DelegateFinished status=timeout。
-        // 回归：jemalloc 事故前 controller delegate 无 wall-clock 超时，
+        // 回归：实测事故前 controller delegate 无 wall-clock 超时，
         // 失控子代理把父 workflow 吊死 24min。
         let server = wiremock::MockServer::start().await;
         server
@@ -8644,7 +8714,7 @@ mod tests {
     // ─── workflow 失败自动善后 ───────────────────────────────────
     //
     // slash 路径 workflow 失败 → 不停在等输入：合成一条「[自动善后]」
-    // 输入立刻开一轮（jemalloc 实锤：gate 失败后 advisor hint 悬空、
+    // 输入立刻开一轮（实测实锤：gate 失败后 advisor hint 悬空、
     // 无人动作，50 分钟流水线零产出）。
     #[tokio::test]
     async fn workflow_failure_triggers_auto_followup_turn() {
@@ -9641,7 +9711,7 @@ require = ["永远不可能出现的验收字符串"]
     #[test]
     fn code_graph_c_function_maps_to_tree_sitter_kind() {
         // C 的 function 必须映射到 function_definition。
-        // 实测依据：jemalloc src/pac.c 真实函数 22 个，
+        // 实测依据：某 C 仓库 src/pac.c 真实函数 22 个，
         // `kind: function_definition` 命中 22（100%），而旧的
         // pattern `$RET $NAME($$$PARAMS) { $$$BODY }` 只命中 8（36%）。
         let kinds = code_graph_node_kinds("c", "function");
@@ -9678,7 +9748,7 @@ require = ["永远不可能出现的验收字符串"]
     #[test]
     fn code_graph_lang_inference_from_extension() {
         assert_eq!(code_graph_infer_lang("src/pac.c"), Some("c"));
-        assert_eq!(code_graph_infer_lang("include/jemalloc/internal/edata.h"), Some("c"));
+        assert_eq!(code_graph_infer_lang("include/foo/internal/edata.h"), Some("c"));
         assert_eq!(code_graph_infer_lang("a/b/mod.rs"), Some("rust"));
         assert_eq!(code_graph_infer_lang("ui/src/api.ts"), Some("typescript"));
         assert_eq!(code_graph_infer_lang("main.go"), Some("go"));
@@ -9728,7 +9798,7 @@ require = ["永远不可能出现的验收字符串"]
 
     #[test]
     fn code_graph_signature_strips_body_and_flattens_params() {
-        // jemalloc 惯用换行风格：返回类型独占一行、参数跨行对齐。
+        // C 项目常见换行风格：返回类型独占一行、参数跨行对齐。
         // 签名模式必须压平并砍掉函数体——这是 19x 体积压缩的来源。
         let text = "static bool\npac_init(tsdn_t *tsdn, pac_t *pac,\n    base_t *base) {\n\tint x = 1;\n\treturn false;\n}";
         let sig = code_graph_signature_of(text);
@@ -9736,8 +9806,8 @@ require = ["永远不可能出现的验收字符串"]
         assert!(!sig.contains("return false"), "函数体没被砍掉: {sig}");
 
         // 没有函数体的匹配（如 import / 宏）原样压平即可。
-        let sig = code_graph_signature_of("#include \"jemalloc/internal/pac.h\"");
-        assert_eq!(sig, "#include \"jemalloc/internal/pac.h\"");
+        let sig = code_graph_signature_of("#include \"foo/internal/pac.h\"");
+        assert_eq!(sig, "#include \"foo/internal/pac.h\"");
     }
 
     #[test]
@@ -9768,7 +9838,7 @@ require = ["永远不可能出现的验收字符串"]
             .unwrap_or(false)
     }
 
-    /// 多语言样本。C 部分刻意用 jemalloc 的风格：返回类型独占一行、
+    /// 多语言样本。C 部分刻意用 C 项目常见的风格：返回类型独占一行、
     /// 参数跨行对齐、static 函数——旧 pattern 实现在这种风格上召回 36%。
     fn cg_fixture() -> tempfile::TempDir {
         let d = tempfile::tempdir().expect("tempdir");

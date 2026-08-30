@@ -46,8 +46,10 @@ temperature = 0.3  # low: splitting must be grounded in facts, not creative
 # Allowed tools — which capabilities this role has access to in chat mode.
 #   read    — read files and directories (ground the split in real code/docs)
 #   search  — regex search across files
+#   code_graph — 按符号名查定义/引用：拆分依据改用「文件+符号名」锚点后，
+#                符号**存在性**是唯一硬要求，用它核验最直接
 #   plan    — submit the structured subtask list for user import to the board
-tools = ["read", "search", "plan"]
+tools = ["read", "search", "code_graph", "plan"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🧩"

@@ -41,7 +41,7 @@ const REVIEW_TIMEOUT_SECS: u64 = 120;
 /// Sized to fit real specialist reports whole (observed: 25.5K chars).
 const DELEGATE_REVIEW_RESPONSE_MAX_CHARS: usize = 32_000;
 
-/// 默认 delegate-return 审查超时（秒）。jemalloc 实锤：慢速审查模型
+/// 默认 delegate-return 审查超时（秒）。实测实锤：慢速审查模型
 /// （MiniMax-M3 单次 20–44s）在 45s 预算下频繁「未审直接放行」，
 /// 审查形同虚设；放宽到 90s 覆盖慢模型的 p95。
 pub const DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS: u64 = 90;
@@ -122,7 +122,7 @@ pub struct AdvisorMonitorConfig {
     /// `AgentError::AdvisorTerminated` 终止本 turn。
     #[serde(default)]
     pub gate: GateConfig,
-    /// delegate-return 审查超时与返回重做上限（jemalloc 实锤：45s
+    /// delegate-return 审查超时与返回重做上限（实测实锤：45s
     /// 硬编码超时让慢审查模型频繁「未审直接放行」；重做上限此前是
     /// workflow.rs 里的硬编码常量）。
     #[serde(default)]
@@ -468,6 +468,36 @@ fn is_benign_probe_error(error: &str) -> bool {
 
 /// Char-boundary-safe truncation with the same marker format the
 /// controller's event sink uses.
+/// 启发式判断一条 delegate 任务是否属于**调研**（只产出理解，不产出
+/// 交付物）。
+///
+/// 存在的原因：manager 绕过 `explore` 流程、改用「通读 XXX 产出解剖
+/// 报告」这类 delegate，效果与再跑一轮探索完全相同，但按 workflow 名
+/// 分类抓不到它。实测会话正是这样连追了两个调研 delegate。
+///
+/// 只用于给 advisor 提供「连着几轮只调研」这一事实，不做任何自动阻断
+/// ——所以宁可宽松：命中调研动词且没有落地动词才算。
+fn delegate_task_looks_like_research(task: &str) -> bool {
+    const RESEARCH: [&str; 12] = [
+        "通读", "解剖", "调研", "探索", "摸清", "梳理", "弄清", "学习路径",
+        "背景说明", "survey", "explore", "investigate",
+    ];
+    const DELIVERY: [&str; 10] = [
+        "实现", "修改", "重构", "修复", "编写", "写入", "落盘", "提交", "任务清单",
+        "验收标准",
+    ];
+    let has_research = RESEARCH.iter().any(|k| task.contains(k));
+    let has_delivery = DELIVERY.iter().any(|k| task.contains(k));
+    has_research && !has_delivery
+}
+
+/// 从用户诉求里识别点名的交付物。单一实现在
+/// [`crate::workflow::named_deliverables`]——工具侧提醒与本处的缺口
+/// 判定必须用同一张表，否则两边会对"用户到底要什么"给出不同答案。
+fn named_deliverables(user_text: &str) -> Vec<&'static str> {
+    crate::workflow::named_deliverables(user_text)
+}
+
 fn truncate_chars(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -584,6 +614,23 @@ fn looks_like_short_ack(response: &str) -> bool {
     ACK_PREFIXES.iter().any(|p| trimmed.starts_with(p))
 }
 
+/// 结构化裁决识别：`VERDICT: ACCEPT` 这类**契约明确要求的**极简产出是
+/// 合法的，不该被 D5 当成「没真正回答」。
+///
+/// 背景（真实互锁）：`task_refine` 的 gate 步契约是「严格只输出三种裁决
+/// 之一」+ `output_contract.require = ["VERDICT:"]`——模型照做且写得简洁
+/// 时，产出可能短到 15 字符。D5 若判死它，会重试 3 次后
+/// 「advisor terminated」判死整条 workflow，于是 `submit` 步执行不到、
+/// `plan` 不被调用、拆分弹窗消失——正是我们要修的那个症状。
+///
+/// 用 `starts_with` 而非 `contains`：只承认「以裁决标记开头」的产出，
+/// 避免给「东拉西扯里恰好提到 VERDICT」开后门。
+fn looks_like_structured_verdict(response: &str) -> bool {
+    let trimmed = response.trim();
+    const MARKERS: &[&str] = &["VERDICT:", "VERDICT :", "裁决：", "裁决:"];
+    MARKERS.iter().any(|m| trimmed.starts_with(m))
+}
+
 /// Pre-persistence gate 的入口。`AgentRunner` 在 LLM/tool 循环
 /// 跑完、得到 final_response 但还没 return 给 controller 之前
 /// 调用本函数。`tool_use_count_this_turn` 由 runner 在循环里
@@ -597,21 +644,32 @@ pub fn check_response_gates(
     tool_use_count_this_turn: usize,
     config: &GateConfig,
 ) -> GateVerdict {
-    // D5: 短输出（且非明确 ack）
-    if response.len() < config.short_output_threshold && !looks_like_short_ack(response) {
+    // D5: 短输出（且非明确 ack、非契约要求的结构化裁决）
+    //
+    // 长度按**字节**计（`str::len()`），这是有意的：UTF-8 字节数是跨语言
+    // 的「信息量」粗略代理——阈值 50 按英文校准（chars≈bytes），而 50 字节
+    // ≈17 个汉字，同样是「说了句实在话」的量级。若改成按字符计，中文就需要
+    // 凑满 50 个汉字才算合格，等于把门槛收紧 3 倍、大量误杀正常中文答复
+    // （实测：改成字符计会让 9 个既有 advisor 用例从放行翻转为判死）。
+    // 提示文案因此说「字节」而不是「字符」。
+    let len_bytes = response.len();
+    if len_bytes < config.short_output_threshold
+        && !looks_like_short_ack(response)
+        && !looks_like_structured_verdict(response)
+    {
         return GateVerdict::Fail {
             detector: DetectorKind::ShortOutput,
             hint: format!(
-                "[advisor gate D5] 你的上一轮输出只有 {} 字符（阈值 {}），看起来像没真正回答。\n\
+                "[advisor gate D5] 你的上一轮输出只有 {} 字节（阈值 {}），看起来像没真正回答。\n\
                  - 如果你已经调用了工具，请把工具结果**用文字**复述给用户。\n\
                  - 如果没调用工具，请**用文字**直接回答问题，不要只输出工具调用语法。\n\
                  - 调用工具的格式必须是 `<tool_call>NAME {{\"key\": \"value\"}}</tool_call>`（单行、JSON 参数），不是 `<read>...</read>` 这种 XML。",
-                response.len(),
+                len_bytes,
                 config.short_output_threshold
             ),
             evidence: format!(
-                "D5 ShortOutput: response.len()={} < threshold={}",
-                response.len(),
+                "D5 ShortOutput: response.len()={} bytes < threshold={}",
+                len_bytes,
                 config.short_output_threshold
             ),
         };
@@ -662,7 +720,7 @@ pub fn check_response_gates(
 ///    `reset_turn_state` 从不碰它、`MonitorState` 整会话只建一次，实际是
 ///    跨会话累积。
 /// 3. 于是 advisor 被骗两次（说一轮实为多轮、说完整实为掐头），据此做
-///    「过程取证」必然出错——jemalloc 2026-08-26 会话里它断言
+///    「过程取证」必然出错——实测会话里它断言
 ///    「记录中无成功读取 README，故引用为幻觉」，而那次读取真实发生过，
 ///    只是在被丢掉的那一段里。
 ///
@@ -1177,6 +1235,18 @@ fn build_review_prompt(
    - **确无合适 workflow** 时，manager 自行判断**委派角色**：核查委派的角色是否对口、任务拆分是否合理（把实现派给 reviewer、把审查派给 programmer 这类错配 → 建议纠正）。
 2. **思路跑偏**：分派方向是否偏离用户问题、在错误方向上持续投入。
 3. **异常循环**：同一分派模式反复重试（同一角色、同一任务反复派发且都失败）。
+4. **交付物差距**（与路由同等重要，别只看"角色选得对不对"）：
+   - 先读用户问题里**点名的交付物**：任务清单 / 看板 / 计划 / 教程 / 文档 / 某个具体改动。
+   - 再看本次分派是在**产出**它，还是又一轮**调研**（探索流程、"通读/解剖/摸清/产出背景说明"类委派）。
+   - **调研跑了几轮本身不是问题**——大仓库分模块深入是正当的，不要因为"探了好几次"就报警。
+     问题是「点名的交付物一次都没往产出走」。
+   - 摘要末尾若出现 `[本 session 累计（跨 turn）]` 块，说明系统已确认：用户点名了交付物、
+     调研在跑、产出型分派为 0。**这种情况给 `intervene`**，hint 点名该跑哪个流程
+     （要任务清单 → `implementation_plan` 拆完用 `plan` 提交；要教程 → `learn`）。
+   - 判断标准是「离用户点名的交付物还有多远」，不是「这轮调研本身做得好不好」。这条**不受**
+     「证据缺失 ≠ 证据为负」限制：累计块是系统统计的确定性事实，不是你的推测。
+   - 反例（不要误报）：用户只是问「这块代码怎么回事」，调研本身就是交付物 → `ok`。
+     这种情况下累计块也不会出现（诉求里没有交付物名词）。
 {attention_block}
 # 触发原因
 
@@ -1241,7 +1311,7 @@ fn build_delegate_review_prompt(
         String::new()
     };
     // 工具执行证据：任务要求"用工具完成 X"时，最终文本常常不带
-    // 工具痕迹（jemalloc 实锤：interview step 用 ask 弹窗收齐 4 个
+    // 工具痕迹（实测实锤：interview step 用 ask 弹窗收齐 4 个
     // 答案后输出 user_profile，advisor 看不到 ask 执行记录，误判
     // "伪造答案"→ intervene → 带反馈重做 → 用户被重复提问）。
     // 把本轮实际工具执行摘要摆进审查上下文，让裁决基于事实而非
@@ -1341,6 +1411,12 @@ struct MonitorState {
     /// 里给嵌套启动标注父 workflow，否则 advisor 看到多条平铺的
     /// "[workflow started]" 会把嵌套步骤误读成重复派发（过度编排误报）。
     workflow_stack: Vec<String>,
+    /// **会话级**（跨 turn，`reset_turn_state` 不清零）调研 vs 交付物
+    /// 计数。路由审查的摘要按 turn 切片，所以 advisor 看得见"这一轮
+    /// 派得对不对"，却看不见"已经连着四轮都在调研、用户点名的任务清
+    /// 单一个都没产出"——实测会话里它因此把每一轮都判成 ok。
+    research_rounds: u32,
+    deliverable_rounds: u32,
 }
 
 impl MonitorState {
@@ -1357,6 +1433,47 @@ impl MonitorState {
             last_user_text: String::new(),
             last_workflow_failure: None,
             workflow_stack: Vec::new(),
+            research_rounds: 0,
+            deliverable_rounds: 0,
+        }
+    }
+
+    /// 会话级事实块，拼在 per-turn 摘要之后送进路由审查。
+    ///
+    /// 判据是**交付物**，不是轮数：用户诉求里点名了某个交付物、
+    /// session 里已经有调研在跑、却一次产出型分派都没有。轮数在这里
+    /// 故意不作为条件——大仓库分模块探三轮是健康的，按计数报警会误杀
+    /// （与已移除的 `WORKFLOW_BUDGET_PER_UNIT_SECS` 同一类错误）。
+    /// 交付物一次都没产出才是可举证的问题。
+    fn session_facts(&self) -> Option<String> {
+        if self.research_rounds == 0 || self.deliverable_rounds > 0 {
+            return None;
+        }
+        let named = named_deliverables(&self.last_user_text);
+        if named.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "\n\n[本 session 累计（跨 turn）] 用户诉求里点名的交付物：{}。\
+             已发生调研类分派 {} 次（探索流程 / 通读·解剖·调研类委派），\
+             产出交付物的分派 **0** 次（未跑规划流程、未提交 plan、未产出文档）。\
+             注意：轮数本身不是问题（分模块深入是正当的），问题是点名的交付物一次都没往产出走。",
+            named.join("、"),
+            self.research_rounds
+        ))
+    }
+
+    /// 累计一次分派的类型（调研 / 交付物）。`task` 为空表示只按名字判。
+    ///
+    /// delegate 侧只能靠任务描述判型——关键词表是启发式的，所以只用来
+    /// 喂 advisor 的判断材料（advisor 拿到的是"连着 N 轮"这个事实，
+    /// 裁决仍由它做），不用来做任何自动阻断。
+    fn tally_dispatch(&mut self, kind_is_research: bool, kind_is_deliverable: bool) {
+        if kind_is_research {
+            self.research_rounds = self.research_rounds.saturating_add(1);
+        }
+        if kind_is_deliverable {
+            self.deliverable_rounds = self.deliverable_rounds.saturating_add(1);
         }
     }
 
@@ -1443,6 +1560,10 @@ impl MonitorState {
                 ..
             } if role_id == &self.watched_role => {
                 findings.extend(self.detectors.observe_tool_use(tool_name, args));
+                // 提交任务清单即产出交付物：交付物缺口就此关闭。
+                if tool_name == "plan" {
+                    self.tally_dispatch(false, true);
+                }
                 // Manager invoking the `workflow` tool is a routing
                 // decision — review whether the chosen workflow fits.
                 if tool_name == "workflow" {
@@ -1482,6 +1603,11 @@ impl MonitorState {
                     "[delegate → {to_role}] {}",
                     truncate_chars(task, 500)
                 ));
+                // 「通读/解剖」类 delegate 与再跑一轮 explore 等价，
+                // 一起计入调研轮次（见 delegate_task_looks_like_research）。
+                if delegate_task_looks_like_research(task) {
+                    self.tally_dispatch(true, false);
+                }
                 // D8: serial dispatch streak — a delegate started while
                 // none are in flight means the previous one finished
                 // first. Independent tasks should be dispatched in one
@@ -1577,6 +1703,19 @@ impl MonitorState {
                     "[workflow started]{nesting} {name}: {}",
                     truncate_chars(topic, 500)
                 ));
+                // 只统计顶层启动（栈空）：workflow 步骤里拉起的子流程
+                // 不是 manager 的又一次分派决策。
+                if self.workflow_stack.is_empty() {
+                    let research = crate::workflow::is_research_workflow(name);
+                    // 规划类产出任务清单，learn/write_doc/update_docs
+                    // 会落盘真实文档——对"学习/文档"类诉求就是交付物。
+                    let deliverable = crate::workflow::is_planning_workflow(name)
+                        || matches!(
+                            name.as_str(),
+                            "learn" | "learn_loop" | "write_doc" | "update_docs"
+                        );
+                    self.tally_dispatch(research, deliverable);
+                }
                 self.workflow_stack.push(name.clone());
             }
             ChatEvent::WorkflowFinished {
@@ -1623,7 +1762,7 @@ impl MonitorState {
         }
         // 任意角色在回答 ask 弹窗（等待拍板）时，advisor 不得介入——
         // 此刻工具错误/循环类 finding 大概率是 wait=true 的 ask 在等
-        // 用户选择（jemalloc 实锤：workflow 内 architect/tutor 的 ask
+        // 用户选择（实测实锤：workflow 内 architect/tutor 的 ask
         // 挂起时，advisor 却因 ask 超时弹 🛑 干扰用户选择，用户作答
         // 结果丢失、workflow 无法继续）。挂起期间抑制 finding 注入与
         // LLM 审查，用户作答后续跑。用 has_any_pending 而非
@@ -1731,7 +1870,13 @@ impl AdvisorMonitor {
                     "例行审查（every_turn 模式）：本 turn 未命中确定性检测器".to_string()
                 };
                 let question = controller.last_user_input();
-                let digest = state.digest.render();
+                // per-turn 摘要 + 会话级累计事实。后者只在存在交付物
+                // 缺口时出现，让 advisor 能看见"连着几轮只调研"——
+                // 单看一轮摘要，每一轮的路由都是"合理"的。
+                let mut digest = state.digest.render();
+                if let Some(facts) = state.session_facts() {
+                    digest.push_str(&facts);
+                }
 
                 let review = tokio::time::timeout(
                     Duration::from_secs(REVIEW_TIMEOUT_SECS),
@@ -1770,7 +1915,7 @@ impl AdvisorMonitor {
                 };
                 let mut bubble = format!("{label}：{reason}");
                 // Channel A：warn 与 intervene 都把 hint 注入 manager 的
-                // hint 队列（下一 tool-round 边界生效）。jemalloc 事故前
+                // hint 队列（下一 tool-round 边界生效）。实测事故前
                 // warn 只发气泡——advisor 警告「过度编排」时 manager 完全
                 // 收不到，继续狂奔。hint 为空时仍只发气泡。
                 if matches!(verdict.verdict, Verdict::Warn | Verdict::Intervene)
@@ -1994,7 +2139,7 @@ mod tests {
     #[test]
     fn delegate_review_prompt_carries_main_topic() {
         let p = build_delegate_review_prompt(
-            "把 jemalloc 的学习计划拆成任务",
+            "把某项目的学习计划拆成任务",
             "programmer",
             "写代码",
             "读 src/arena.c 并总结",
@@ -2002,7 +2147,7 @@ mod tests {
             "",
         );
         assert!(
-            p.contains("把 jemalloc 的学习计划拆成任务"),
+            p.contains("把某项目的学习计划拆成任务"),
             "主会话诉求必须出现在 prompt 里: {p}"
         );
         assert!(
@@ -2175,6 +2320,163 @@ mod tests {
             rendered.contains("[workflow started] code_review"),
             "transcript: {rendered}"
         );
+    }
+
+    // ── 交付物缺口：按「点名的交付物」判，不按轮数 ─────────────────
+
+    fn wf_started(name: &str) -> ChatEvent {
+        ChatEvent::WorkflowStarted {
+            name: name.into(),
+            topic: "t".into(),
+            wf_id: format!("wf-{name}"),
+        }
+    }
+
+    fn wf_finished(name: &str) -> ChatEvent {
+        ChatEvent::WorkflowFinished {
+            name: name.into(),
+            wf_id: format!("wf-{name}"),
+            status: "ok".into(),
+            summary: "done".into(),
+        }
+    }
+
+    fn user_msg(text: &str) -> ChatEvent {
+        ChatEvent::UserMessage { text: text.into() }
+    }
+
+    /// 实测那一条诉求：点名了"学习计划"和"拆分任务"两个交付物。
+    const JEMALLOC_ASK: &str = "查看代码  安排学习计划  拆分任务（从浅到深学习）";
+
+    #[test]
+    fn gap_reported_when_a_named_deliverable_never_moves() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        // 跨 turn 不清零：turn 结束不能抹掉"交付物还没产出"这个事实。
+        s.observe(&role_turn("请在上方选择"));
+        let facts = s.session_facts().expect("gap must be reported");
+        assert!(facts.contains("任务清单"), "{facts}");
+        assert!(facts.contains("计划"), "{facts}");
+        assert!(facts.contains("**0**"), "{facts}");
+        // 明确声明轮数不是判据，避免 advisor 误读成"探多了就报警"。
+        assert!(facts.contains("轮数本身不是问题"), "{facts}");
+    }
+
+    /// 关键的不误杀用例：探了 5 轮，但用户只是问"这块代码怎么回事"
+    /// ——调研本身就是交付物，不该报缺口。
+    #[test]
+    fn many_research_rounds_are_fine_when_no_deliverable_was_named() {
+        let mut s = state();
+        s.observe(&user_msg("arena 和 extent 之间的锁顺序是怎么回事？有什么坑"));
+        for _ in 0..5 {
+            s.observe(&wf_started("explore"));
+            s.observe(&wf_finished("explore"));
+        }
+        assert_eq!(s.research_rounds, 5);
+        assert!(
+            s.session_facts().is_none(),
+            "诉求没点名交付物时，探几轮都不该报警"
+        );
+    }
+
+    #[test]
+    fn single_research_round_already_counts_when_deliverable_stalls() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        // 判据是交付物没动，不是"探够了 2 轮"——1 轮就足以报缺口。
+        assert!(s.session_facts().is_some());
+    }
+
+    #[test]
+    fn research_style_delegates_count_toward_the_gap() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        // 「通读…产出解剖报告」与再跑一轮 explore 等价，必须计入。
+        s.observe(&ChatEvent::DelegateStarted {
+            from_role: "manager".into(),
+            to_role: "architect_system".into(),
+            task: "通读本仓库，产出「从浅到深学习路径」解剖报告".into(),
+            sub_id: "a-1".into(),
+            wf_id: None,
+        });
+        let facts = s.session_facts().expect("gap must be reported");
+        assert!(facts.contains("调研类分派 1 次"), "{facts}");
+    }
+
+    #[test]
+    fn implementation_delegates_do_not_count_as_research() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        // 带落地动词的委派是产出，不是调研。
+        s.observe(&ChatEvent::DelegateStarted {
+            from_role: "manager".into(),
+            to_role: "programmer".into(),
+            task: "实现 ctl 端点扩展并补充验收标准".into(),
+            sub_id: "p-1".into(),
+            wf_id: None,
+        });
+        assert_eq!(s.research_rounds, 0);
+        assert!(s.session_facts().is_none());
+    }
+
+    #[test]
+    fn planning_workflow_closes_the_gap() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        assert!(s.session_facts().is_some());
+        s.observe(&wf_started("implementation_plan"));
+        assert!(
+            s.session_facts().is_none(),
+            "跑了规划流程就不该再报交付物缺口"
+        );
+    }
+
+    #[test]
+    fn plan_submission_closes_the_gap() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        assert!(s.session_facts().is_some());
+        s.observe(&tool_use("plan", "{\"tasks\":[]}"));
+        assert!(s.session_facts().is_none(), "提交清单即关闭缺口");
+    }
+
+    #[test]
+    fn nested_research_workflow_counts_once() {
+        let mut s = state();
+        // design_and_plan 内部拉起 explore：那是流水线的一步，
+        // 不是 manager 的又一次调研决策。
+        s.observe(&wf_started("design_and_plan"));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        s.observe(&wf_finished("design_and_plan"));
+        assert_eq!(s.research_rounds, 0, "嵌套子流程不计入调研");
+        assert_eq!(s.deliverable_rounds, 1, "design_and_plan 是规划流程");
+    }
+
+    #[test]
+    fn learn_workflow_counts_as_deliverable_not_research() {
+        let mut s = state();
+        s.observe(&wf_started("learn"));
+        assert_eq!(s.research_rounds, 0);
+        assert_eq!(s.deliverable_rounds, 1, "learn 会落盘教程，是交付物");
+    }
+
+    #[test]
+    fn named_deliverables_recognizes_the_observed_request() {
+        let named = named_deliverables(JEMALLOC_ASK);
+        assert!(named.contains(&"任务清单"), "{named:?}");
+        assert!(named.contains(&"计划"), "{named:?}");
+        // 纯咨询类问句不该被识别成有交付物。
+        assert!(named_deliverables("这个函数为什么会崩？").is_empty());
+        assert!(named_deliverables("arena 的锁顺序是怎么回事").is_empty());
     }
 
     #[test]
@@ -2502,7 +2804,7 @@ mod tests {
     ///
     /// 旧的 `Transcript` 超预算就丢最老的行且 `render()` 不留痕迹，advisor
     /// 拿到一份看起来完整、实则掐了头的记录，于是把「我没看到证据」当成
-    /// 「有证据表明没发生」——jemalloc 2026-08-26 会话里它据此断言
+    /// 「有证据表明没发生」——实测会话里它据此断言
     /// 「记录中无成功读取 README，故引用为幻觉」，而那次读取真实发生过，
     /// 只是落在被丢弃的那一段里。
     #[test]
@@ -2955,7 +3257,7 @@ mod tests {
         );
 
         // …and the hint IS injected into the manager's hint queue
-        // (jemalloc 事故：warn 只发气泡，「过度编排」警告 manager
+        // (实测事故：warn 只发气泡，「过度编排」警告 manager
         // 完全收不到)。队列里同时有确定性 D3 hint 和 warn hint。
         let hints = wait_for_hints(&controller, |h| {
             h.iter().any(|x| x.contains("收敛范围"))
@@ -3214,7 +3516,7 @@ mod tests {
 
     #[test]
     fn gate_catches_53char_broken_response() {
-        // 复现 ui-2569234-1785207692440.jsonl L7 的 programmer 输出。
+        // 复现 某次实测日志 L7 的 programmer 输出。
         // 53 chars ≥ 默认 D5 阈值 50，所以 D5 不撞；D6 命中
         // （<read> + tool_use_count=0）。
         let response = "<read><path>deps/xredis-gtid/Cargo.toml</path></read>";
@@ -3280,6 +3582,81 @@ mod tests {
             }
             other => panic!("expected Fail, got {other:?}"),
         }
+    }
+
+    /// 记录 D5 的长度语义是**字节**，且这是有意选择（不是笔误）。
+    ///
+    /// UTF-8 字节数是跨语言「信息量」的粗略代理：阈值 50 按英文校准
+    /// （chars≈bytes），50 字节 ≈17 个汉字，同属「说了句实在话」的量级。
+    /// 曾尝试改成按字符计，结果把中文门槛收紧 3 倍（需凑满 50 汉字才合格），
+    /// 9 个既有 advisor 用例从放行翻转为判死。故保持字节语义，并让提示
+    /// 文案如实说「字节」而不是「字符」。
+    #[test]
+    fn gate_d5_length_is_measured_in_bytes_by_design() {
+        let cfg = GateConfig::default();
+        // 20 个汉字 = 60 字节 > 阈值 → 放行（若按字符计只有 20，会被误杀）。
+        let twenty_cjk = "这段回答一共二十个汉字长度足够表达一个结论";
+        assert!(
+            twenty_cjk.chars().count() < cfg.short_output_threshold,
+            "前提：字符数不足阈值"
+        );
+        assert!(twenty_cjk.len() > cfg.short_output_threshold, "前提：字节数超阈值");
+        assert!(
+            matches!(check_response_gates(twenty_cjk, 0, &cfg), GateVerdict::Pass),
+            "合格的中文短答复必须放行（按字节计），实际 {:?}",
+            check_response_gates(twenty_cjk, 0, &cfg)
+        );
+        // 提示文案要如实标单位，别把字节报成字符。
+        match check_response_gates("TODO", 0, &cfg) {
+            GateVerdict::Fail { hint, evidence, .. } => {
+                assert!(hint.contains("字节"), "hint 应如实说字节: {hint}");
+                assert!(evidence.contains("bytes"), "evidence 应标明单位: {evidence}");
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// 回归（与 P0 修复互锁）：契约要求的极简裁决不得被 D5 判死。
+    ///
+    /// `task_refine` 的 gate 步契约是「严格只输出三种裁决之一」+
+    /// `output_contract.require = ["VERDICT:"]`。模型照做且写得简洁时产出
+    /// 可能只有 15 字符；D5 若判死它，重试 3 次后 advisor terminated →
+    /// 整条 workflow 失败 → `submit` 执行不到 → `plan` 不被调用 →
+    /// 「添加子任务」弹窗消失，正是要修的症状。
+    #[test]
+    fn gate_d5_exempts_contract_required_verdicts() {
+        let cfg = GateConfig::default();
+        for verdict_text in &[
+            "VERDICT: ACCEPT",
+            "VERDICT: ACCEPT 无阻断问题",
+            "VERDICT: REVISE",
+            "VERDICT: REJECT",
+            "裁决：通过",
+        ] {
+            assert!(
+                verdict_text.chars().count() < cfg.short_output_threshold,
+                "前提：{verdict_text} 确实短于阈值"
+            );
+            assert!(
+                matches!(check_response_gates(verdict_text, 0, &cfg), GateVerdict::Pass),
+                "契约要求的裁决 `{verdict_text}` 必须放行，实际 {:?}",
+                check_response_gates(verdict_text, 0, &cfg)
+            );
+        }
+    }
+
+    /// 豁免只认「以裁决标记开头」，不给「东拉西扯里恰好提到 VERDICT」开后门。
+    #[test]
+    fn gate_d5_verdict_exemption_requires_leading_marker() {
+        let cfg = GateConfig::default();
+        let sneaky = "我还没想好 VERDICT:";
+        assert!(
+            matches!(
+                check_response_gates(sneaky, 0, &cfg),
+                GateVerdict::Fail { detector: DetectorKind::ShortOutput, .. }
+            ),
+            "非开头的 VERDICT 不应豁免"
+        );
     }
 
     #[test]

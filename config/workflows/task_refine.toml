@@ -1,19 +1,42 @@
 # Workflow: task_refine
 # 任务细化：任务看板「拆分子任务」入口（POST /api/tasks/:id/refine）
-# 在独立 session 里跑。四步串行：task_planner 出拆分草案 → reviewer
-# 评审（事实抽查）→ 终审门（REJECT 自动循环回 refine 返工）→ 过审后
-# task_planner 才调 plan 工具提交，用户在弹窗勾选导入（导入时前端带
-# parent_id，成为原任务的子任务）。只规划不实现：本 workflow 不派
-# worker、不改代码。
+# 在独立 session 里跑。五步串行：task_planner 出拆分草案 → reviewer
+# 评审（事实抽查）→ 终审门（REJECT 自动循环回 refine 返工）→
+# task_planner 按评审的 important 清单定向修补 → 提交 plan，用户在弹窗
+# 勾选导入（导入时前端带 parent_id，成为原任务的子任务）。只规划不
+# 实现：本 workflow 不派 worker、不改代码。
 #
 # 时序要点：评审通过后才调 plan 工具——弹窗里出现的只有过审清单。
 # 引擎事实：每个 step 的 speaker 是全新 runner，plan 工具挂私有
 # PlanStage（workflow.rs），跨 step 不受「一次一清单」门禁影响；
 # loop 返工时上轮产出自动以【上轮审查反馈】拼进 refine 的 prompt。
+#
+# 为什么必须有 revise 步（实测实录）：gate 放行门槛是「无
+# blocking」，important 不阻断——但此前 submit 消费的是**第一版**
+# `{{draft}}` 且被要求「禁止增删改」，gate 又被要求「不要重写草案」，
+# 于是 reviewer 明确写着「必须修正后再提交 plan」的 important 问题
+# （Task 3 的 paths 漏了验收标准点名的 src/arena.c；Task 1 对 edata_s
+# union 的描述与代码不符）100% 带病入库。gate 当时的免责说法「用户会
+# 在导入弹窗里看到并自行取舍」也是假的：PlanProposed 事件只带
+# tasks，导入弹窗根本不展示评审结论。修正项必须有回写通道。
+#
+# 为什么 paths 规则要写成「二选一」（实测会话 实录）：
+# 旧规则同时要求「paths 必须包含验收标准点名的所有文件」和「共读同一文件时改成
+# 消费上游子任务的交付物」—— 但"消费上游交付物"本身就要把上游 doc 写进自己的
+# paths，正好踩中前一条的禁令。planner 照规则拆出 6 个链式子任务，13 处
+# doc_internal/*.md 重叠；revise 步又按 reviewer 的 important 把 src/arena.c
+# 补进 L2.4（L2.5 已持有）凑成第 14 处。plan 工具整单拒绝，workflow 仍报
+# status ok，零任务入库。三处修正：① refine/revise 明确重叠判据是**路径字符串
+# 层、不区分读写**，链式消费二选一（下游不写上游路径 / 加 `只读` label）；
+# ② review/gate 按同一判据逐路径清点，字符串层重叠算 blocking；
+# ③ submit 步授权只改 paths/labels 的受限自愈 + `require_plan_submit` 引擎兜底。
+# 「只读」豁免（controller.rs::is_readonly_plan_task）此前只写在 plan 工具的
+# input_schema description 里，而 refine/revise 都用 tools= 摘掉了 plan ——
+# 写草案的角色从来看不到这个出口，必须在 prompt 里明写。
 
 name = "task_refine"
 command = "/task-refine"
-description = "任务细化：拆分草案 → reviewer 评审 → 终审门(REJECT 自动返工) → 过审后 plan 提交用户勾选"
+description = "任务细化：拆分草案 → reviewer 评审 → 终审门(REJECT 自动返工) → important 定向修补 → plan 提交用户勾选"
 max_rounds = 1
 
 [[steps]]
@@ -24,7 +47,7 @@ output_key = "draft"
 max_retries = 1
 # step 级工具过滤：本步硬性摘掉 plan 工具（引擎层 enforce，不靠
 # prompt 自觉）——草案必须先过 review/gate，submit 步才放行 plan。
-tools = ["read", "search"]
+tools = ["read", "search", "code_graph"]
 # 拆分规则（粒度、paths、workflow 字段等）在 task_planner 角色 prompt
 # 里，这里只投递任务本体与产出格式。
 prompt = """拆分下面这条看板任务：
@@ -33,8 +56,31 @@ prompt = """拆分下面这条看板任务：
 {{topic}}
 
 先读代码/文档摸清现状再拆。**本步只输出草案，禁止调用 plan 工具**。输出格式：
-1) 拆分依据（每条引事实出处 file:line）；
-2) 子任务清单，每项含：title / description(做什么+验收标准) / priority(1-4，1最高) / labels / workflow(执行该任务的 workflow：tdd_development / bug_triage / update_docs / annotate_code；没有贴合的必须留空) / paths(涉及的文件/目录前缀，各任务互不重叠)。"""
+1) 拆分依据（每条引事实出处，用「文件路径 + 符号名」，如 `src/arena.c 的 arena_slab_alloc()`；
+   **不要用裸行号做依据**，行号只可作为括注的导航提示）；
+2) 子任务清单，每项含：title / description(做什么+验收标准) / priority(1-4，1最高) / labels / workflow(执行该任务的 workflow：tdd_development / bug_triage / update_docs / annotate_code；没有贴合的必须留空) / paths(涉及的文件/目录前缀)。
+
+paths 与顺序的硬约束（看板会按它们派发，写错就是执行不了；paths 由 plan 工具**机械校验**，
+不合规就是整单拒绝、本轮拆分全部作废）：
+- 每个子任务的 paths **必须非空**、必须是仓库里真实存在的路径前缀，且必须包含它自己的
+  验收标准里点名的每一个**源码**文件。
+- **重叠校验在路径字符串层做，不区分读与写**：同一个路径出现在两个任务的 paths 里就算
+  重叠，「我只读不写」不构成豁免。逻辑层的「读不算冲突」不是工具的判据。
+- **下游消费上游交付物时，二选一、别混**：
+  ① **推荐**：下游 paths **只写它自己要产出的文件/目录**；上游交付物只在验收标准里文字
+     引用（写「参见 L2.1 的产出 `doc/x.md`」），那份路径**不进** paths；
+  ② 若确实要把上游交付物列进 paths，**必须给该任务的 labels 加 `只读`** ——
+     带 `只读` / `学习` / `调研` 标记的任务不参与重叠校验。纯阅读/调研型任务一律加。
+- 同一个源码文件不得被两个「写」型任务同时持有：要么合并，要么按 ① 改成消费上游交付物。
+- 草案末尾附「paths 重叠自查」：把全部 paths 摊平成一张列表，逐个路径写出它出现在哪几个
+  任务里；出现在 ≥2 个**未标 `只读`** 的任务里就必须先消掉。不要只写一句「已确认不重叠」。
+- 依赖顺序**只能靠 priority 表达**（先做的 priority 更小）——任务看板没有依赖字段，
+  写在描述文字里的「本任务依赖 X」不会被派发逻辑读到。
+- 子任务标题沿用父任务的编号/层级语境，**不要自造与父任务冲突的新编号体系**
+  （父任务叫「L2：…」时，子任务不要重新编成 L1…L7）。
+- 若发现原任务描述本身有事实/术语错误（如仓库已改名的概念），在草案顶部单列
+  「父任务描述纠偏」，并把纠偏结论写进受影响子任务的 description ——
+  父任务描述不会被本流程自动更新，只写在草案正文里就会丢。"""
 
 [steps.output_contract]
 min_chars = 200
@@ -54,9 +100,34 @@ prompt = """评审这份任务拆分草案：
 【拆分草案】
 {{draft}}
 
-用 read/search 抽查事实依据（行号、文件路径、paths 前缀是否真实存在），然后按裁决格式输出：
+用 read/search/code_graph 抽查事实依据（**符号是否真实存在**、文件路径与 paths 前缀是否真实存在），然后按裁决格式输出：
 - ✅ 通过 / ⚠️ 有条件通过（列出修正项）/ ❌ 不通过（列出阻断问题，每条带证据）
-检查清单：① 子任务是否完整覆盖原任务目标；② 粒度是否半天到一天、各自可独立验收；③ 依赖顺序是否正确；④ paths 是否真实存在且互不重叠；⑤ 事实依据是否属实。"""
+检查清单：① 子任务是否完整覆盖原任务目标；② 粒度是否半天到一天、各自可独立验收；
+③ 顺序是否用 priority 表达（写在描述文字里的依赖不算，看板没有依赖字段）；
+④ paths 是否**非空**、真实存在、且**包含各自验收标准里点名的所有源码文件**；两两之间有无
+重叠 —— 按 plan 工具的**真实判据**核：**两个路径字符串相同、或一个是另一个的前缀即算重叠，
+不区分读与写**；只有 labels 里带 `只读` / `学习` / `调研` 的任务豁免本校验。
+核法是机械的：把全部任务的 paths 摊平，**逐个路径数它出现在几个未标 `只读` 的任务里**，
+≥2 就报。最常见的踩雷方式是下游任务把上游产出的 doc 路径写进了自己的 paths ——
+草案自称「不重叠」时尤其要自己数一遍，不要采信它的自查结论；
+⑤ 引用的符号/文件是否真实存在；⑥ 是否有一堆同质子任务（都只是同一份最终产物的素材）
+被无谓地切碎；⑦ 子任务编号是否与父任务的层级语境冲突。
+
+**严重度定义（必须照此分级，不得升格）**：
+- `blocking`：引用的**符号或文件根本不存在**；子任务遗漏原任务的关键目标；
+  paths 在**路径字符串层**重叠、而相关任务都没标 `只读`（plan 工具会整单拒绝，
+  清单一个任务都进不了看板）；依赖顺序错误会导致无法执行。
+- `important`：验收标准含糊到无法判定完成；粒度明显失衡（远超一天或碎到无意义）；
+  paths 为空或漏了验收标准点名的源码文件；描述与代码事实不符；
+  依赖只写在描述文字里没落到 priority；编号体系与父任务冲突。
+  —— important 不阻断，但下游 `revise` 步会照单修补，所以**必须写清楚「改哪个子任务的
+  哪个字段、改成什么」**，含糊的条目等于没提。
+  **提「把某文件补进某任务 paths」这类修正前，先查该文件是否已在别的任务 paths 里** ——
+  在的话直接补会造成字符串层重叠、把清单从「可提交」推成「整单被拒」，
+  必须改成「限定为消费持有该文件的那个子任务的交付物」或「给本任务 labels 加 `只读`」。
+- `nit`：**行号偏差**、命名/措辞、格式、术语不统一、引用写法不规范。
+  行号在本流程中**只是导航提示、不是验收依据**——发现偏差记为 nit 即可，
+  **禁止**因此判 blocking 或要求返工（行号随无关改动漂移，纠缠它会把拆分卡死）。"""
 
 [[steps]]
 id = "gate"
@@ -64,7 +135,8 @@ description = "终审门：只裁决，不重写草案；REVISE 自动返工"
 speakers = ["reviewer"]
 output_key = "approved"
 # gate：只输出裁决与问题清单，不重写或复述完整草案。
-# ACCEPT 才进入 submit；REVISE 回到 refine；REJECT 终止 workflow。
+# ACCEPT 进入 revise（定向修补）→ submit；REVISE 回到 refine；
+# REJECT 终止 workflow。
 # 「REJECT 终止」必须由 loop_abort_on 显式声明——引擎不再硬编码
 # VERDICT: REJECT 为终局（那个 magic string 让 PASS/REJECT 两值词表的
 # gate 永远走不到返工分支）。
@@ -78,9 +150,27 @@ prompt = """根据以下评审结论判定下一步：
 {{verdict}}
 
 严格只输出以下三种裁决之一，并附必要的证据化问题清单：
-- `VERDICT: ACCEPT`：评审无 blocking/important 问题，当前 draft 可以直接进入 submit。
-- `VERDICT: REVISE`：存在需要 planner 修正的问题；列出每条问题的 severity、file:line 证据、影响和具体修正要求。该结果会回到 refine。
+- `VERDICT: ACCEPT`：评审**没有 blocking 问题**，当前 draft 可以进入后续步骤。
+  important / nit 一律**不阻断** —— 原样列出即可，紧接着的 `revise` 步会拿你
+  这份清单去定向修补草案（important 必修、nit 可选），不需要退回 refine 重做。
+- `VERDICT: REVISE`：**存在 blocking 问题**（引用的符号或文件不存在、遗漏原任务关键
+  目标、paths 在路径字符串层重叠且未标 `只读`、依赖顺序错误）；逐条列出证据、影响和具体
+  修正要求。该结果回到 refine。
 - `VERDICT: REJECT`：输入缺失、关键事实无法核验或流程不可继续；列出阻断原因。该结果终止 workflow。
+
+判定纪律（防止流程被小瑕疵卡死）：
+- **行号偏差是 nit，绝不构成 REVISE 理由**。行号在本流程里只是导航提示，不是验收依据。
+- 只有 `blocking` 才能触发 REVISE。看到评审把行号/措辞/格式类问题标成了 important 或
+  blocking，按本判据**降级处理**，不要跟着升格。
+- 拆分草案的价值在于「任务切分是否正确」，不在于引用格式是否完美；能让用户看懂并认领
+  就该放行。
+- ACCEPT 时**必须把 important 条目逐条抄进输出**（编号 + 一句话结论 + 具体修正要求）：
+  下游 revise 步只看你这份裁决，漏抄等于该修正项被丢弃。
+- ACCEPT 前**必须确认评审是按「路径字符串层、不区分读写」清点过 paths 重叠的**。
+  评审只写了一句「paths 不重叠」而没有逐路径清点时，你自己把 paths 摊平数一遍：
+  同一路径出现在 ≥2 个未标 `只读` 的任务里 = blocking，判 REVISE。
+  这条不是形式要求 —— 漏掉它，清单会在最后的 plan 提交步被工具整单拒绝，
+  前面几十轮评审全部白跑。
 
 不要重新生成、修改或复述完整拆分草案；不要使用 `VERDICT: PASS`。"""
 
@@ -88,10 +178,72 @@ prompt = """根据以下评审结论判定下一步：
 require = ["VERDICT:"]
 
 [[steps]]
-id = "submit"
-description = "task_planner 把已通过审查的最新草案用 plan 工具一次性提交"
+id = "revise"
+description = "task_planner 按评审的 important 清单定向修补草案（不重做拆分）"
 speakers = ["task_planner"]
+output_key = "final_draft"
 max_retries = 1
-prompt = """下面这份拆分草案已经通过 gate 审查。请把最新 `draft` 原样转成 tasks 数组，**调用一次** plan 工具提交（禁止增删改任务内容）：
+# 与 refine 同样摘掉 plan：修补产物仍要走 submit 才能提交。
+tools = ["read", "search", "code_graph"]
+prompt = """gate 已放行（无 blocking）。现在把评审提出的 **important** 修正项落到草案里，输出**完整的修订版草案**。
 
-{{draft}}"""
+【评审结论（含 important / nit 清单）】
+{{verdict}}
+
+【终审裁决】
+{{approved}}
+
+【当前草案】
+{{draft}}
+
+修补纪律（这一步是「定向修补」，不是重新拆分）：
+- **只改被点名的地方**：important 必改；nit 可改（只改明显笔误/术语，别顺手重写）。
+- **禁止**新增或删除子任务、禁止调整子任务顺序、禁止改动没被点名的字段。
+- 典型 important 与对应改法：
+  - 「paths 不完整」→ 把验收标准里点名的文件补进该子任务的 paths。**补之前先查这个文件
+    是不是已经在别的子任务 paths 里**：
+    · 已在 → **不要直接补**（那会造成路径字符串层重叠，plan 工具整单拒绝、清单全部作废）。
+      改成把本子任务的验收范围限定为「消费持有该文件的那个子任务的交付物」，
+      或给本子任务的 labels 追加 `只读`；
+    · 不在 → 直接补。
+  - 「描述与代码不符」→ 用 read/search/code_graph 核实后按代码事实改写那句描述。
+  - 「验收标准含糊」→ 改成可判定的检查项（写明要产出什么、在哪里能查到）。
+- **修补完必须重跑一遍全清单的 paths 重叠自查**（修补本身最容易引入新重叠）：把所有任务的
+  paths 摊平成一张列表，逐个路径写出它出现在哪几个任务里；出现在 ≥2 个**未标 `只读`** 的
+  任务里就必须消掉。自查表附在「本次修订」清单末尾 —— 只写「已确认不重叠」不算自查。
+- 输出格式与草案一致（拆分依据 + 子任务清单，每项含 title / description / priority /
+  labels / workflow / paths），**末尾附「本次修订」清单**：逐条写「评审编号 → 改了哪个
+  子任务的哪个字段 → 改成什么」；未采纳的条目写明理由。
+- 若评审没有任何 important 条目：原样输出草案，末尾写「本次修订：无 important 项，草案未改动」。"""
+
+[steps.output_contract]
+min_chars = 200
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "submit"
+description = "task_planner 把修订后的草案用 plan 工具一次性提交"
+speakers = ["task_planner"]
+max_retries = 2
+# 引擎兜底：本步必须真的产生一份 plan 提案才算完成。plan 被机械校验
+# 整单拒绝时模型往往改口输出一份「请指示走 A/B/C」的回退报告，正文
+# 完全合格 → step 通过 → workflow 报 ok，而零任务入库（实测
+# 实测实录）。声明本字段后：未提交成功 = step
+# 不合格，带上工具报错重试（复用 max_retries），耗尽则 workflow 失败。
+require_plan_submit = true
+prompt = """下面这份拆分草案已经通过 gate 审查、并已按评审意见修补完成。请把它原样转成 tasks 数组，**调用一次** plan 工具提交（禁止增删改任务内容；末尾的「本次修订」清单是给人看的说明，不要当成子任务）：
+
+{{final_draft}}
+
+---
+
+**机械校验被拒时的受限自愈（重要）**：plan 工具会对 paths 做机械校验（路径存在性、
+路径字符串层的两两重叠）。被整单拒绝时**不要停下来问「走 A 还是 B」** —— 清单没入库
+就等于整轮拆分白跑。按错误信息**只改 `paths` 与 `labels` 两个字段**后重新提交，
+最多重试 2 次，`title` / `description` / `priority` / `workflow` 锁死不动：
+- 报「paths 范围重叠」→ 把下游任务 paths 里的**上游交付物路径删掉**（改在验收标准里
+  文字引用即可），或给纯消费型 / 纯阅读型任务的 labels 追加 `只读`
+  （带 `只读` / `学习` / `调研` 标记的任务不参与重叠校验）。
+- 报「paths 的第一级目录不存在」→ 用 read/search 核实后换成真实存在的路径前缀。
+提交成功后，在最终回复里列一张「为过机械校验改了哪几个任务的哪个字段」的表。
+只有连改 2 次仍被拒、或根因不在 paths/labels 时才停下来报告并说明需要什么决策。"""

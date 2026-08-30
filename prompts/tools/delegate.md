@@ -3,6 +3,7 @@
 - Provide clear task description with: goal, scope, acceptance criteria. Do NOT include specific commands or tool usage instructions.
 - Batch independent tasks in parallel — don't serialize what can run concurrently.
 - After specialists return, synthesize results and check for contradictions before answering the user.
+- **复用已有产物，别让 specialist 从零重读**：若已有相关产出（如 `lab/notes/*.md`、之前步骤的报告），在任务描述里**指名点出这些文件路径 + 一句话摘要**，并把范围收敛为"读增量 / 只更新差异"，而不是让 specialist 把整批既有笔记再全量读一遍。这是最大的一处 token 浪费来源。
 </instruction>
 
 <critical>

@@ -1,6 +1,7 @@
 # Workflow: learn_loop
-# 交互式学习循环：知识点拆解 → 逐个教学 + 弹窗出题 → 掌握报告
-# 流水线：plan（拆解知识点+写账本）→ teach（循环教学+ask弹窗出题，每步fresh subagent）
+# 交互式学习循环：知识点拆解 → 讲解 → 弹窗出题 → 掌握报告
+# 流水线：plan（取证 + 拆知识点 + 出题 + 写账本）
+#         → teach（只讲解）→ quiz（只出题判分，未学完跳回 teach）
 #         → report（输出掌握报告）
 #
 # 核心机制（A + C）：
@@ -8,83 +9,328 @@
 #   C - 文件账本（.latte/learn/<slug>/ledger.json），覆盖写，恒 O(N)
 #   ask 弹窗出题——答案经 choice-answer 直达，不入主 session 对话流
 #
+# ══════════════════════════════════════════════════════════════════
+#  设计原则：每步的**行为**由引擎字段声明，prompt 只写"内容怎么写"
+# ══════════════════════════════════════════════════════════════════
+#
+# 这个文件此前把行为约束全写成 prompt 里的祈使句（「禁止调用 ask」
+# 「必须恰好调用一次 ask」「最后一行必须是 STATUS_*」「取证不可跳过」），
+# 实测每一条都被违反过至少一次。原因是结构性的：prompt 是**劝告**，模型
+# 可以不听，而且违反了没人知道。行为要落在引擎能核对的字段上：
+#
+#   tools              拿不到的工具就调不了（硬隔离，不是劝告）
+#   require_tools      必须真的调过（AND）
+#   require_tools_any  必须至少调过其中一个（OR，用于"取证"这种多路径动作）
+#   tool_call_limits   调用次数上限（表达"恰好一次" / "禁止调用"）
+#   output_contract    产出形状：长度、必含/禁含字样、末行前缀
+#   loop_until / loop_back_to / max_iterations   循环控制
+#
+# 每个 step 的「行为契约」注释块列出该步被引擎钉住的行为，以及这条契约
+# 堵的是哪次实测事故。prompt 里不再重复这些约束——重复既涨 token，又让人
+# 误以为"写了就生效"。
+#
+# ── 为什么 teach 与 quiz 是两个 step（实测会话的教训）──
+#
+# 旧设计把「讲解 + 出题」放在同一个 step 里，实测失败：模型把 1282 字符的
+# 讲解全写进 <think> 块、可见正文为空，然后直接调 ask 弹窗阻塞 28.9 分钟。
+# 学员看到的是一道没有课的考题；那段看起来像讲解的文字是**答完题之后**才
+# 作为 step 输出交付的，顺序完全反了。
+#
+# 根因是结构性的：step 的正文输出只在 step 结束时交付，而 ask 在 step 中间
+# 阻塞。拆成两步后 teach 没有出题职责、必须产出正文才能结束这一步，讲解
+# 一定先于弹窗落到主 session。靠 prompt 劝「先讲再问」不可靠。
+#
 # 用法：manager 收到「帮我学习 XXX」时调用：
 #   workflow { name: "learn_loop", topic: "<主题>" }
 # 或 slash 命令：
 #   /learn_loop <主题>
 #
-# 产物：.latte/learn/<slug>/ledger.json（掌握进度）+ 最终报告
+# 产物：.latte/learn/<slug>/plan.json（知识点+题目+答案+证据）
+#       .latte/learn/<slug>/ledger.json（掌握进度）+ 最终报告
 
 name = "learn_loop"
 command = "/learn_loop"
-description = "交互式学习循环：知识点拆解 → 逐个教学+弹窗出题 → 掌握报告"
+description = "交互式学习循环：知识点拆解 → 讲解 → 弹窗出题 → 掌握报告"
 max_rounds = 1
 
-# ── 1. 拆解知识点 ─────────────────────────────────────
-# tutor 角色分析主题，产出知识点清单 + 初始账本，输出 slug
+# ═══ 1. 取证 + 拆解知识点 ═══════════════════════════════════════
+#
+# ── 行为契约（引擎强制，prompt 不再重复）──────────────────────
+# tools             摘掉 ask：本步是课程设计，不许弹窗打扰学员。
+# require_tools_any 取证不可跳过。实测事故：这一步一次源码都没读（全部
+#                   工具调用就是 2 次 write），5 道题里 3 道的"正确答案"是
+#                   幻觉——不存在的 `init` 回调、全仓不存在的
+#                   `MALLOCX_FAIL_NOWAIT`、写错文件的版本宏。学员照这种题
+#                   去理解代码，学到的是假知识，比不学更糟。
+#                   用 _any 而非 require_tools：取证走 read / code_graph /
+#                   search 都算，AND 会逼它三个都调一遍。
+# require_tools     必须真把 plan.json / ledger.json 落盘，不能只在正文里
+#                   贴 JSON——下游两步靠文件工作，正文丢了就断链。
+# max_chars         本步产出被下游当**路径片段**直接拼进
+#                   `.latte/learn/{{plan_out}}/plan.json`，所以整个产出必须
+#                   只是 slug 本身。多写一句话，拼出来就是不存在的路径。
+# forbid            slug 不能带空格/斜杠/反引号（拼成多级目录或非法路径）。
 [[steps]]
 id = "plan"
-description = "拆解知识点并写入 plan.json / ledger.json"
+description = "读代码取证，拆解知识点并写入 plan.json / ledger.json"
 role = "tutor"
 output_key = "plan_out"
 max_retries = 1
+tools = ["read", "code_graph", "search", "write"]
+require_tools_any = ["read", "code_graph", "search"]
+require_tools = ["write"]
 task = """围绕主题「{{topic}}」拆解知识点。你是课程设计师，不是老师——只产出知识点清单，不教学。
 
-1. 把主题拆成 3-6 个知识点，每个知识点涵盖一个独立概念/机制，互不重叠。
-2. 为每个知识点设计：id（短英文，如 ownership）、title（中文，如「所有权规则」）、**一道选择题**（含 question + 4 个选项，含正确答案标记 recommended）。
-3. 从主题推导 slug（小写英文 + 连字符，如 "rust-ownership"）。
-4. 用 write 工具写入 `.latte/learn/<slug>/plan.json`，格式：
+## 第一步：取证
+
+**先用工具把这个主题涉及的代码/文档实际读一遍，再出题。** 你对任何具体代码库的
+记忆都不可信，凭记忆出题会造出不存在的符号，学员照着学到的是假知识。
+
+- `code_graph`（`kind=function`/`struct`/`type` + `path`）拿签名和行号；
+- `read("<file>:<起>-<止>")` 精读片段；宏定义、字符串这类用 `search`；
+- 相互独立的取证**同一轮批量发出**：`read(paths=["a.h:1-40", "b.c:120-160"])`，一次最多 10 个。
+
+出题涉及"某结构体有几个字段""某回调按什么顺序""某宏定义在哪一行"这类事实时，
+**必须把定义整段读出来数**，不能凭印象。
+
+## 第二步：拆知识点并出题
+
+1. 把主题拆成 3-6 个知识点，每个涵盖一个独立概念/机制，互不重叠。
+2. 为每个知识点设计：
+   - `id`（短英文，如 `ownership`）、`title`（中文）
+   - `evidence`：取证出处，`file:line` 格式（如 `include/foo/bar.h:67-77`），必须是本仓库真实存在的路径
+   - `teach_points`：讲解要点数组，每条一句话 + 出处，供 teach 步展开
+   - **一道选择题**：`question` + 4 个 `options`
+   - `answer`：正确选项的 `label` **原文**（不是位置序号）
+3. 出题铁律（每一条都有过实测事故）：
+   - **`options` 里禁止出现 `recommended` 字段**。它在前端渲染成字面的「✓ 推荐」
+     徽标，等于把答案印在题面上；答案只放 `answer` 字段，只用于判分。
+   - **`label` 必须是该选项的实际内容**（符号名 / 短语，≤ 20 字，如 `extent_purge_t`、
+     `dalloc → decommit`），**禁止用 `A`/`B`/`C`/`D` 这类纯序号当 label**——
+     用字母当 label 会把 `answer` 退化成位置引用，位置偏置就藏不住了。
+   - **正确答案的位置不用你操心**：quiz 步派发时 `ask` 会打乱选项顺序，位置不再
+     携带信息。你只要保证四个选项等重、`answer` 写的是 label 原文。
+   - **四个选项等重**：长度、语气、详略、术语密度保持一致。正确项写得比别人具体、
+     别人写得明显荒谬（"两者完全等价"、"由链接器自动处理"这类一秒能排除的）都等于
+     送分——那不叫干扰项。
+   - 干扰项必须是**真实存在**的东西（真实的函数/宏/文件/字段），只是不满足题干
+     条件。禁止编造不存在的符号，尤其禁止把编造的符号当正确答案。
+   - **题目必须考 `title` 说的那个核心**，知识点之间的题目不得互相重叠（实测事故：
+     标题是"9 个回调字段"，题目却去考两个字段的类型关系，和另一个知识点撞车，
+     而"9 个字段"这个核心根本没考）。
+   - 每个选项 `description` 里出现的事实，同样要来自第一步的取证。
+4. 从主题推导 slug（小写英文 + 连字符，如 `rust-ownership`）。
+5. 用 write 写入 `.latte/learn/<slug>/plan.json`：
    ```json
    {
      "slug": "<slug>",
      "topic": "{{topic}}",
      "knowledge_points": [
-       {"id": "k1", "title": "所有权规则", "question": "…", "options": [{"label":"…","description":"…","recommended":true}, …]},
-       ...
+       {
+         "id": "k1",
+         "title": "所有权规则",
+         "evidence": "src/ownership.rs:12-48",
+         "teach_points": [
+           "每个值有唯一 owner（src/ownership.rs:12）",
+           "owner 离开作用域即 drop（src/ownership.rs:31）"
+         ],
+         "question": "…",
+         "options": [
+           {"label": "move 语义", "description": "客观描述这一项是什么"},
+           {"label": "borrow 语义", "description": "客观描述这一项是什么"},
+           {"label": "Copy trait", "description": "客观描述这一项是什么"},
+           {"label": "Rc 引用计数", "description": "客观描述这一项是什么"}
+         ],
+         "answer": "borrow 语义"
+       }
      ]
    }
    ```
-5. 写入初始 ledger.json（全部 pending）：
+6. 用 write 写入初始 `.latte/learn/<slug>/ledger.json`（只记两个事实，**不写状态名**）：
    ```json
-   {"slug":"<slug>","knowledge_points":[{"id":"k1","title":"所有权规则","status":"pending"},…],"updated_at":"<now>"}
+   {"slug":"<slug>","knowledge_points":[{"id":"k1","title":"所有权规则","wrong":0,"passed":false}],"updated_at":"<now>"}
    ```
-6. **最后一行输出 slug**（如 `rust-ownership`），不要包含其他内容。"""
+   状态（pending / fail / weak / pass）由读取方按 `wrong`+`passed` 推导，不进账本——
+   实测事故：让模型自己在四个状态名之间查表推进，它第一次答错就直接写 `weak`，
+   跳过了重考档，学员被剥夺重考机会。只记事实就不需要做状态推理。
 
-# ── 2. 循环教学 + 弹窗出题 ─────────────────────────────
-# 每轮 fresh subagent，读 plan.json + ledger.json，ASK 弹窗出题
-# 答案经 choice-answer 直达，不入主 session 对话流
-# 学完输出 STATUS_ALL_DONE，否则 STATUS_CONTINUE
+## 产出
+
+**只输出 slug 本身**（如 `rust-ownership`），不要有任何其他文字。下游会把它直接
+拼进文件路径。"""
+
+[steps.output_contract]
+min_chars = 3
+max_chars = 60
+forbid = [" ", "/", "\\", "`"]
+
+# ═══ 2. 讲解（本步拿不到 ask，也拿不到 write）═════════════════
+#
+# ── 行为契约（引擎强制，prompt 不再重复）──────────────────────
+# tools                只给只读工具。「禁止调用 ask」「禁止改写 ledger.json」
+#                      不再是 prompt 里的祈使句，而是**它拿不到这两个工具**。
+#                      旧版靠 prompt 劝，实测被违反过。
+# min_chars            堵「讲解全写进 <think> 块、可见正文为空」：那次 1282
+#                      字符的讲解学员一个字也没看到。正文不够长直接判不合格。
+# forbid               讲解不许摊开选项或点出答案（下一步才考）。
+# last_line_prefix_any 下一步靠**末行** `TEACH_DONE <id>` 决定考哪个知识点。
+#                      用末行契约而非 require 子串检查：写在正文中间时子串
+#                      检查照样通过，而下游解析失败，表现为"讲了 k1 却考 k2"。
 [[steps]]
 id = "teach"
-description = "逐个教学并用 ask 弹窗出题检验掌握程度"
+description = "讲解当前知识点（引擎层禁出题、禁改账本）"
 role = "tutor"
 output_key = "teach_out"
 max_retries = 1
+tools = ["read", "code_graph", "search"]
+task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
+
+读取 `.latte/learn/{{plan_out}}/plan.json` 和 `.latte/learn/{{plan_out}}/ledger.json`，
+选出**当前知识点**：按 plan.json 里的顺序，第一个满足 `passed == false 且 wrong < 2`
+的知识点（`passed == true` 的已掌握、`wrong >= 2` 的已放弃，都跳过）。
+
+## 把这个知识点讲透
+
+- 以该知识点的 `teach_points` 为骨架展开，按需再读代码补充细节
+  （`code_graph` / `read("<file>:<起>-<止>")`，独立取证用 `paths` 批量发）。
+- 讲解**必须带 `file:line`**，关键处摘几行真实代码进来。说不出出处的结论不要写。
+- 讲解要覆盖该知识点 `question` 会考的那个点——下一步就考它，不许突袭。
+- 若该知识点已经 `wrong == 1`（上一轮答错过一次），说明第一次没讲明白：换一个
+  角度重讲，重点讲清 `answer` 那个选项与其余选项的区别在哪。
+- 长度服从内容需要，不设上限。讲清一个机制该带上调用链和"为什么这么设计"。
+
+## 产出
+
+正文是讲解本身（要让学员真的看到，不要塞进思考块）。
+**最后一行写 `TEACH_DONE <知识点id>`**（如 `TEACH_DONE k1`）——下一步靠这一行知道
+该考哪个知识点。"""
+
+[steps.output_contract]
+min_chars = 500
+forbid = ["正确答案是", "答案：", "选项 A", "选项一"]
+last_line_prefix_any = ["TEACH_DONE"]
+
+# ═══ 3. 弹窗出题 + 判分 + 循环控制 ═══════════════════════════
+#
+# ── 行为契约（引擎强制，prompt 不再重复）──────────────────────
+# tools                只给 read / write / ask。摘掉 code_graph / search：
+#                      本步不取证（题目和答案 plan 步已定好），放开检索工具
+#                      只会让它跑去临时改题。
+# require_tools ask    必须真的弹过窗。实测事故：quiz 看到某知识点是 `fail`
+#                      就自行脑补成"已经答错两次了"，**没调 ask** 就拿上一轮
+#                      prompt 里出现过的旧答案编了一段「判分结果：答错 /
+#                      你选的是：split」——纯字符串契约完全满足，学员连题都
+#                      没看到，账本却被写成"答错两次、不再重教"。
+# require_tools write  必须真的更新账本。旧版只查了 ask：答完题不写
+#                      ledger.json 也能通过，于是同一个知识点被反复考，循环
+#                      靠 max_iterations 撞满才结束。
+# tool_call_limits ask 恰好一次。`require_tools` 只查"有没有调过"，查不出
+#                      "调了几次"；弹两次窗就是同一个知识点连考两遍、账本按
+#                      最后一次覆盖，学员的作答记录被悄悄丢掉一条。
+# require              判分结果必须回显给学员（答对答错 + 他选了什么）。
+# last_line_prefix_any 末行必须是循环状态标记。缺失时引擎按"不含 loop_until"
+#                      判返工，等于把"全部学完"误当成"还没学完"，循环停不下来。
+# max_iterations       引擎硬上限就是 10（`unwrap_or(3).min(10)`），写更大没有
+#                      意义。够不够用：每个知识点最多消耗 2 轮，plan 最多拆
+#                      6 个 → 最坏 12 轮。撞满时 workflow 带最后一次产出降级
+#                      收尾，report 步照常列出未通过的点，不丢进度。
+[[steps]]
+id = "quiz"
+description = "用 ask 弹窗出题、判分并更新账本"
+role = "tutor"
+output_key = "quiz_out"
+max_retries = 2
 loop_until = "STATUS_ALL_DONE"
+loop_back_to = "teach"
 max_iterations = 10
-task = """你是互动学习辅导员。当前主题 slug 由上一轮产出（plan 步的末行）指定：{{plan_out}}。
+tools = ["read", "write", "ask"]
+require_tools = ["ask", "write"]
+tool_call_limits = { ask = 1 }
+task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 
-读取 .latte/learn/{{plan_out}}/plan.json 和 .latte/learn/{{plan_out}}/ledger.json，找出第一个 status != "pass" 的知识点：
+## 考哪个知识点：由 teach 步决定，你不要自己推断
 
-1. **教学**：输出 3-8 句简短讲解，聚焦该知识点的一个关键理解点。
-2. **出题**：用 `ask` 工具弹出选择题——使用 plan.json 里该知识点预设的 question 和 options（含正确答案 recommended 标记）。支持图片展示在选项里。
-3. **评估**：用户答案（tool result）与正确答案对比——正确则 ledger 写 `pass`，错误写 `fail`。覆盖写 ledger.json。
-4. **循环控制**：最后一行输出——全部知识点为 `pass` 则输出 `STATUS_ALL_DONE`，否则输出 `STATUS_CONTINUE`。
+上一步（teach）的完整输出如下，它的**最后一行**是 `TEACH_DONE <知识点id>`：
 
-规则：
-- 每次只处理一个知识点（第一个未掌握的）。
-- 答错的知识点标 `fail`，本轮不再重教——下一轮迭代会再处理它。
-- 教学输出保持简短（3-8 句），详细内容放文档里不在这里铺开。
-- **最后一行必须且只能是 STATUS_ALL_DONE 或 STATUS_CONTINUE**，不要包含其他内容在最后一行。"""
+```
+{{teach_out}}
+```
 
-# ── 3. 输出掌握报告 ───────────────────────────────────
+从那一行取出知识点 id，**只考这一个**。不要按 ledger 状态自己重新挑——挑歪了就会
+出现"刚讲完 k1 却拿 k2 考人"（实测事故：teach 重讲 k1，quiz 却去考了 k2，学员被
+突袭，而 k1 永远停在 fail 不推进）。若那一行缺失或解析不出 id，退回"plan.json 顺序
+里第一个 `passed == false 且 wrong < 2` 的知识点"。
+
+读 `.latte/learn/{{plan_out}}/plan.json` 拿该知识点的 `question` / `options` /
+`answer`，读 `.latte/learn/{{plan_out}}/ledger.json` 拿它当前的 `wrong` / `passed`。
+
+## 步骤
+
+1. **出题**：用 `ask` 弹出该知识点的 `question` 和 `options`，**必须带上这三个参数**
+   （各自堵一个实测事故）：
+   - `allow_repeat: true`：重考弹的是同一道题，不传会被 `ask` 的"同题复用旧答案"
+     保护静默拦掉——工具立刻返回上一次的错误答案、根本不弹窗，学员的重考机会就
+     这么被吞了（日志里连 answer 事件都没有）。
+   - `shuffle: true`：让工具打乱选项展示顺序。plan 步再怎么被要求"打散位置"，生成
+     出来的题正确答案还是高度集中在第一位；交给程序洗牌才彻底。判分按 label 文本
+     匹配、与顺序无关。
+   - `auto_answer: false`：关掉超时兜底。否则一旦部署设了
+     `LATTE_AGENT_ASK_TIMEOUT_SECS`，超时会自动替学员选"推荐项/第一项"，凭空造出
+     一条作答记录，判分和账本全是假的。
+   - **原样传 `options`，禁止添加 `recommended` 字段**——它会渲染成「✓ 推荐」徽标把
+     答案标出来，还会被超时兜底优先选中，等于双重泄漏。正确答案在 `answer` 字段里，
+     只给你判分用，永远不下发。也不要在 `question` 或任何 `description` 里暗示。
+2. **判分**：把用户答案（tool result）与 `answer` 比对。**按 label 文本匹配，绝不按位置**
+   ——顺序已被 `shuffle` 打乱，"第几项"没有意义。用户可能只回 label 的一部分
+   或带前缀（如「我的选择：xxx」）。对不上任何 label（乱填、空、"不知道"）一律按
+   **答错**处理。
+   - 若 tool result 是「用户此前已回答过这个问题…」这类**复用提示**而不是本轮的真实
+     作答，说明你漏传了 `allow_repeat: true`：带上它重新调一次 `ask`，不要拿旧答案判分。
+3. **更新账本**（用 write 覆盖写 ledger.json，同时刷新 `updated_at`）。只做**两个极简
+   操作之一**，不要做任何状态推理：
+   - **答对** → 该知识点 `passed` 改成 `true`（`wrong` 原样不动）；
+   - **答错** → 该知识点 `wrong` 改成**读到的值 + 1**（`passed` 保持 `false`）。
+
+   铁律：
+   - **`wrong` 只能 +1，绝不允许跳步**。读到 0 就写 1，读到 1 才写 2。（实测事故：模型
+     第一次答错就把知识点判成"不再重教"，跳过重考档，学员被剥夺重考机会——所以这里
+     不让你判"该不该重教"，只让你记事实。）
+   - "还有没有重考机会""要不要放弃"这些判断**不由你做**，读取方按 `wrong`/`passed`
+     自己推导（`wrong>=2` 即放弃，`wrong==1` 即还有一次机会）。
+   - 其余知识点的 `wrong` / `passed` **原样保留**，不要顺手改动。
+4. **反馈**：正文里回显 `判分结果`（答对还是答错）和 `你选的是`（用户实际选了哪一项）。
+   答错时还要说明正确答案是哪个、为什么，并带上 `file:line` 出处。
+5. **循环控制**：最后一行输出——plan.json 里每个知识点都满足
+   `passed == true 或 wrong >= 2` 则输出 `STATUS_ALL_DONE`，只要还有
+   `passed == false 且 wrong < 2` 的就输出 `STATUS_CONTINUE`。
+
+每次只处理一个知识点。"""
+
+[steps.output_contract]
+require = ["判分结果", "你选的是"]
+last_line_prefix_any = ["STATUS_ALL_DONE", "STATUS_CONTINUE"]
+
+# ═══ 4. 输出掌握报告 ═══════════════════════════════════════════
+#
+# ── 行为契约（引擎强制，prompt 不再重复）──────────────────────
+# tools     只读。报告步不许改账本（改了就掩盖真实掌握情况），也不许弹窗。
+# require   报告必须包含进度小节，防"一句话敷衍"。
 [[steps]]
 id = "report"
 description = "输出最终掌握报告"
 role = "tutor"
 output_key = "report"
 max_retries = 1
-task = """读取 .latte/learn/{{plan_out}}/ledger.json，输出一份简洁的掌握报告。
+tools = ["read"]
+task = """读取 `.latte/learn/{{plan_out}}/ledger.json`，输出一份简洁的掌握报告。
+
+账本里每个知识点只有 `wrong`（答错次数）和 `passed`（是否通过）两个事实，状态按
+这条规则推导：
+
+- `passed == true` → **已掌握**
+- `passed == false 且 wrong >= 2` → **未掌握**（答错两次，已放弃重教）
+- `passed == false 且 wrong == 1` → **未掌握**（还差一次机会，循环提前结束）
+- `passed == false 且 wrong == 0` → **未涉及**（还没轮到，循环提前结束）
 
 报告格式：
 ```
@@ -93,10 +339,13 @@ task = """读取 .latte/learn/{{plan_out}}/ledger.json，输出一份简洁的�
 **掌握进度**：X/Y（已通过 X 个，共 Y 个知识点）
 
 **未通过知识点**：
-- 知识点名（标题）
-- 知识点名（标题）
+- 知识点标题（答错 N 次，建议重看 <plan.json 里该点的 evidence>）
 
 **建议**：一句总结。
 ```
 
-只输出报告文本，不要调用其他工具。"""
+需要 evidence 时读 `.latte/learn/{{plan_out}}/plan.json`。除此之外只输出报告文本。"""
+
+[steps.output_contract]
+min_chars = 80
+require = ["掌握进度"]

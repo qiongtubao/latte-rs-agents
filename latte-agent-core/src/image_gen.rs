@@ -264,6 +264,8 @@ pub fn register_generate_image_tool(
         input_schema,
         handler,
     )
+    // 生成后落盘到 .latte/images/，串行。
+    .concurrency_safe(false)
     .build();
 
     tm.register(tool, Some(&role_id));

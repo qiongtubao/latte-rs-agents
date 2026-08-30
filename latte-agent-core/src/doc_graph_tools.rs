@@ -339,6 +339,8 @@ pub fn register_doc_graph_tools(
             ToolInputSchema { properties: vec![].into_iter().collect(), ..Default::default() },
             scan_handler,
         )
+        // 重建 graph.json（写文件），串行。
+        .concurrency_safe(false)
         .build(),
         None,
     );
@@ -371,6 +373,8 @@ pub fn register_doc_graph_tools(
             },
             ctx_handler,
         )
+        // 只读：查图谱、预读文档块。
+        .concurrency_safe(true)
         .build(),
         None,
     );
@@ -463,6 +467,8 @@ pub fn register_doc_graph_tools(
             },
             write_handler,
         )
+        // 写 .md + 重建索引，串行。
+        .concurrency_safe(false)
         .build(),
         None,
     );
@@ -499,6 +505,8 @@ pub fn register_doc_graph_tools(
             ToolInputSchema { properties: vec![].into_iter().collect(), ..Default::default() },
             index_handler,
         )
+        // 写 docs/index.md，串行。
+        .concurrency_safe(false)
         .build(),
         None,
     );

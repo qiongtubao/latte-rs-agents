@@ -640,7 +640,7 @@ const LOOP_CYCLE_MIN_EACH: usize = 2;
 ///
 /// 与 [`LOOP_STREAK_THRESHOLD`] 分工：`LoopDetector` 只认 (工具, args)
 /// **逐字节相同**的重复；而模型常常每轮改一点参数再撞同一类校验
-/// （jemalloc 2026-08-26：manager 连着 3 轮调 `plan`，每轮重写 8 个任务
+/// （实测事故：manager 连着 3 轮调 `plan`，每轮重写 8 个任务
 /// 40+ 条 paths，每轮烧 100~150s），那种模式只有这个只看
 /// (工具, 失败类别) 的计数器能抓。
 ///
@@ -926,7 +926,7 @@ fn classify_tool_execution_error(
     //
     // 此前没有这一条，靠下面 PERMANENT 那张**消息子串黑名单**兜：
     // schema 层的「缺必填参数」恰好命中 "is required" 所以侥幸正确，
-    // 而 handler 内部的校验只要文案没撞上关键词就漏网。jemalloc
+    // 而 handler 内部的校验只要文案没撞上关键词就漏网。实测
     // 2026-08-26 会话：code_graph 的「无法从 path 推断语言，请显式传
     // lang」一个词都没命中 → 归成 Execution → 同参数自动重试 2 次，
     // 每次都拿到同一份报错。黑名单要靠人穷举中文文案，每加一个工具
@@ -967,7 +967,7 @@ fn classify_tool_execution_error(
 /// `ToolNotFound` 回填给模型的错误文本：区分「工具真的不存在」与
 /// 「工具存在但本角色/本 step 未授权」。
 ///
-/// 动机（jemalloc 实锤）：programmer 调 `edit` 拿到的是 `Tool not found:
+/// 动机（实测实锤）：programmer 调 `edit` 拿到的是 `Tool not found:
 /// edit`。但 `edit` 其实**注册了**（`EditToolsPackage` 在
 /// `builtin_tool_packages()` 里），只是被角色 allowlist 过滤掉了。这条
 /// 报错把「未授权」说成「不存在」，模型于是判定该能力不存在、改用
@@ -1008,7 +1008,7 @@ fn truncate_tool_summary(text: &str, max: usize) -> String {
 /// 模型不可用自动暂停后，最多连续自动重试几次；用尽转人工。
 ///
 /// 5 次配合 [`auto_pause_backoff`] 的退避序列约覆盖 4 分钟——足够扛过
-/// 常见的厂商限流窗口和本机网络抖动（jemalloc 会话那次实际只需 9s），
+/// 常见的厂商限流窗口和本机网络抖动（那次实测实际只需 9s），
 /// 又不至于在真·配置错误上磨太久。
 /// env `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` 可覆盖，0 = 不自动重试
 /// （退回「立刻等人工 ▶」的旧行为）。
@@ -1206,6 +1206,122 @@ fn delegate_parallel_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 一条响应里允许多个 tool_call 的偏好，下发给 OpenAI 协议的
+/// `parallel_tool_calls`（Anthropic 默认就允许并行，无需也不会下发）。
+///
+/// `LATTE_AGENT_PARALLEL_TOOL_CALLS` 三态：
+/// - 未设 / 真值（`1`/`true`/`yes`/`on`）→ `Some(true)`，显式要求可并行；
+/// - 假值（`0`/`false`/`no`/`off`）→ `Some(false)`，强制每轮最多一个工具调用
+///   （排查"并发引入的问题"时用）；
+/// - `omit` → `None`，字段完全不下发。留这一档是因为并非所有 OpenAI 兼容
+///   端点都认它（litellm #22637：Bedrock Converse 在 Claude 4.5+ 上收到
+///   这个字段直接失败）。遇到这种端点用 `omit` 退回供应商默认。
+///
+/// 注意：**开了也不保证模型会批量发**。实测 186 轮里 185 轮
+/// 只发 1 个调用，而当时这个字段根本没下发、走的是供应商默认 `true` ——
+/// 也就是说协议层一直是允许的，模型只是不肯。真正让它批量的是角色 prompt
+/// 里的硬要求 + `read` 的 `paths` 批量入口。
+fn parallel_tool_calls_pref() -> Option<bool> {
+    match std::env::var("LATTE_AGENT_PARALLEL_TOOL_CALLS") {
+        Err(_) => Some(true),
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "omit" => None,
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => Some(true),
+            }
+        }
+    }
+}
+
+/// 可以在**同一响应内并发执行**的只读工具（短名，不含 namespace）。
+///
+/// 入选标准只有一条：**执行它不会改变任何进程外状态**。`read` 只读文件、
+/// `code_graph` 只解析源码出符号表，两者都没有写路径，因此同一轮里的多个
+/// 此类调用彼此没有顺序依赖，串行执行纯属浪费墙钟时间。
+///
+/// 反面例子（永远不进这张表）：`bash`（可以写文件 / 起进程）、`write` /
+/// `edit`（改文件）、`delegate`（子 agent 会写文件，另有
+/// `LATTE_AGENT_DELEGATE_PARALLEL` 单独管）。
+///
+/// 实测会话（`.latte/ui-sessions/…/programmer-*.jsonl`）的实测数据是
+/// 这张表存在的理由：186 轮里 185 轮只发 1 个工具调用，185 次工具的真实
+/// I/O 合计 18s，却付了 577s 模型往返。批量发起后如果还串行执行，收益会
+/// 被工具侧的串行 I/O 吃掉一部分——这里把它并发掉。
+///
+/// **为什么不直接读 `Tool::concurrency_safe`**：那个字段的默认值是 `true`，
+/// 而 MCP 服务器注册进来的工具、TOML 配出来的工具都可能没显式声明——信它
+/// 就等于让一个会写文件的外部工具默认获得并发资格。并发这件事应当
+/// deny-by-default，所以这里用显式白名单，`concurrency_safe` 只作为工具
+/// 自描述的文档。要加 `search` / `find` 这类同样无副作用的工具，往这张表
+/// 里加一项即可。
+const READONLY_PARALLEL_TOOLS: &[&str] = &["read", "code_graph"];
+
+/// `name` 是否属于 [`READONLY_PARALLEL_TOOLS`]（按短名比较，容忍
+/// `namespace.read` 这类遗留全名）。
+fn is_readonly_parallel_tool(name: &str) -> bool {
+    READONLY_PARALLEL_TOOLS.contains(&short_tool_name(name))
+}
+
+/// 同一响应内的多个只读工具调用是否并发执行。**默认开**——只读工具没有
+/// 写路径，并发不会引入竞态。设 `LATTE_AGENT_READONLY_PARALLEL` 为
+/// `0`/`false`/`no`/`off` 可退回严格串行（排查问题时的逃生口）。
+///
+/// 与 `LATTE_AGENT_DELEGATE_PARALLEL`（默认关）的区别：delegate 会派生
+/// 能写文件的子 agent，并发有真实风险，所以默认关；只读工具没有这个问题。
+fn readonly_parallel_enabled() -> bool {
+    std::env::var("LATTE_AGENT_READONLY_PARALLEL")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true)
+}
+
+/// 只读并发的 in-flight 上限，`LATTE_AGENT_READONLY_PARALLEL_MAX` 覆盖，
+/// 默认 8，钳在 `1..=32`。
+///
+/// 需要上限是因为 `code_graph` 会跑 tree-sitter 解析（CPU 密集），模型
+/// 一轮批量发 30 个调用时全部同时起会把 CPU 打满、反而变慢；`read` 侧
+/// 也避免一次撑爆 fd。上限为 1 等价于串行。
+fn readonly_parallel_max() -> usize {
+    std::env::var("LATTE_AGENT_READONLY_PARALLEL_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+
+/// 把一轮的工具调用切成「可并发的只读段」与「屏障调用」。
+///
+/// 返回**连续**只读调用的区间 `[start, end)`，且只返回长度 ≥2 的区间
+/// （长度 1 并发没有意义，走原串行路径少一次 spawn）。
+///
+/// **必须连续**是这里唯一的正确性要求：任何非只读调用（`bash`、`write`、
+/// `edit`、`delegate`…）都是屏障，它前后的只读调用不会被合并到同一段。
+/// 这样 `bash "echo x > f"` → `read f` 仍然严格按模型给出的顺序执行，
+/// read 一定看得到那次写入。段内调用彼此只读，顺序无关，可以任意并发。
+fn readonly_parallel_runs(calls: &[ParsedCall]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < calls.len() {
+        if !is_readonly_parallel_tool(&calls[i].name) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < calls.len() && is_readonly_parallel_tool(&calls[i].name) {
+            i += 1;
+        }
+        if i - start >= 2 {
+            runs.push((start, i));
+        }
+    }
+    runs
+}
+
 /// Outcome of running a single tool call through the full pipeline
 /// (parse → PreToolHook → execute+retry → PostToolHook). Returned by
 /// [`run_one_tool_call`] so the caller can apply the `&mut self`
@@ -1284,6 +1400,17 @@ async fn run_one_tool_call(
             Some(t) => coerce_tool_input_to_schema(input, &t.input_schema),
             None => input,
         };
+        // 行号自愈（anchor）：edit 派发前用「本 agent 读过什么」的台账自动
+        // 补 expect/tag，模型无需配合。工具层据此原子校验：行号漂了唯一
+        // 重定位，定位不了就拒绝——绝不静默改错位置。见 `crate::edit_anchor`。
+        let input = {
+            let mut healed = input;
+            let notes = crate::edit_anchor::heal_edit_input(&resolved_name, &mut healed);
+            for note in notes {
+                log_hook_fire(&note, crate::trace::HookPoint::PreTool, "anchor");
+            }
+            healed
+        };
 
         // 2. PreToolHook
         let mut mutable_input = input;
@@ -1335,6 +1462,11 @@ async fn run_one_tool_call(
         match exec_result {
             Ok(result) => {
                 executed_ok = true;
+                // 记进 anchor 台账：read 存「模型看到的内容 + tag」，edit 只刷新
+                // tag，write 作废。给后续 edit 的行号自愈提供基准。
+                if let Ok(raw) = serde_json::to_string(&result) {
+                    crate::edit_anchor::record_tool_result(&resolved_name, &raw);
+                }
                 // 5. PostToolHook
                 let mut result_str = serde_json::to_string_pretty(&result)
                     .unwrap_or_else(|_| format!("{:?}", result));
@@ -1561,7 +1693,7 @@ impl AgentRunner {
     /// 此前这里无条件 `wait_until_resumed(None)` —— 无上限死等人点
     /// ▶。但事件文本写的是「9s 后可自动重试」，`ModelsUnavailable`
     /// 也带着 `next_retry_in`，两边都在承诺自动重试，代码却没做。
-    /// jemalloc 2026-08-26 会话：22:06:27 三家 provider 同时连接失败
+    /// 实测会话：22:06:27 三家 provider 同时连接失败
     /// （本机网络抖动），reviewer 就地 park 到死，84 分钟后整条
     /// workflow 被预算判超支中止。一次 9 秒的抖动毁掉一次完整运行。
     ///
@@ -1640,7 +1772,7 @@ impl AgentRunner {
     /// 统一的 session 暂停 park：进出各发一次 trace 事件，park 期间
     /// 定期 warn，可选上限防死等。
     ///
-    /// 动机（jemalloc 2026-08-26 会话）：session 门的 3 个 park 点
+    /// 动机（实测会话）：session 门的 3 个 park 点
     /// （turn 入口 / model call 前 / tool 启动前）此前都直接
     /// `wait_until_resumed(None)`，park 期间 trace 里**一个事件都没有**。
     /// 那条会话 67 分钟里有 37 分钟是完整空洞（13:03:33 → 13:40:49 所有
@@ -1701,6 +1833,113 @@ impl AgentRunner {
             task_id: String::new(),
             turn: 0,
         });
+    }
+
+    /// 把一次 [`run_one_tool_call`] 的结果落到 `&mut self` 与消息历史上。
+    ///
+    /// 并发执行路径（delegate 扇出、只读工具扇出）都必须**按模型给出的
+    /// 原始调用顺序**逐个调用它，这样死循环探测、成功计数、`tool_result`
+    /// 追加、`PermanentExec` 连击熔断的顺序语义与串行路径完全一致——并发
+    /// 只改变「工具什么时候真正执行」，不改变「模型看到什么」。
+    ///
+    /// - `tool_name`：模型给出的调用名（`ParsedCall::name`）。不从
+    ///   `loop_records` 里取，因为参数 JSON 非法时压根没进 execute，
+    ///   `loop_records` 会是空的。
+    /// - `permanent_streak`：`(工具名, 连续被确定性校验拒绝的次数)`，跨
+    ///   调用累积，语义见串行路径。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_call_result(
+        &mut self,
+        r: OneCallResult,
+        tool_name: &str,
+        messages: &mut Vec<Message>,
+        loop_detector: &mut LoopDetector,
+        permanent_streak: &mut (String, usize),
+        final_response: &str,
+        last_substantive_response: &str,
+    ) -> Result<(), AgentError> {
+        // 1. 死循环探测：回放并发任务里攒下的 (name, args) 记录。
+        for (name, args_json) in &r.loop_records {
+            if let LoopDecision::Break(reason) = loop_detector.record(name, args_json) {
+                return Err(AgentError::ToolLoopDetected {
+                    tool: name.clone(),
+                    reason,
+                    partial: if last_substantive_response.is_empty() {
+                        final_response.to_string()
+                    } else {
+                        last_substantive_response.to_string()
+                    },
+                });
+            }
+        }
+        // 2. 成功计数 + 工具摘要（供 advisor 审查用）。
+        if r.executed_ok {
+            self.last_turn_tool_count += 1;
+            if let (Some((name, args)), Ok(result_str)) = (r.loop_records.first(), &r.outcome) {
+                self.last_turn_tool_summaries.push(format!(
+                    "{} {} → {}",
+                    name,
+                    truncate_tool_summary(args, 160),
+                    truncate_tool_summary(result_str, 240),
+                ));
+            }
+        }
+        // 3. 回填 tool_result（成功失败都必须回填，否则 native 协议下
+        //    下一轮请求 400，见串行路径的长注释）。
+        match r.outcome {
+            Ok(result_str) => {
+                if permanent_streak.0 == tool_name {
+                    *permanent_streak = (String::new(), 0);
+                }
+                messages.push(Message::tool_result(r.id, result_str));
+            }
+            Err((kind, detail)) => {
+                const MAX_ERR_BYTES: usize = 256;
+                let truncated = if detail.len() > MAX_ERR_BYTES {
+                    format!(
+                        "{}...\n[error truncated - {} bytes]",
+                        crate::trace::utf8_safe_prefix(&detail, MAX_ERR_BYTES),
+                        detail.len() - MAX_ERR_BYTES,
+                    )
+                } else {
+                    detail
+                };
+                messages.push(Message::tool_result(r.id, truncated));
+                if matches!(kind, ToolCallErrorKind::PermanentExec { .. }) {
+                    if permanent_streak.0 == tool_name {
+                        permanent_streak.1 += 1;
+                    } else {
+                        *permanent_streak = (tool_name.to_string(), 1);
+                    }
+                    if permanent_streak.1 >= PERMANENT_BREAK_AT {
+                        return Err(AgentError::ToolLoopDetected {
+                            tool: tool_name.to_string(),
+                            reason: format!(
+                                "'{}' 连续 {} 次因输入校验被拒（每次参数都不同），\
+                                 模型无法自行修正，停止重试",
+                                tool_name, permanent_streak.1
+                            ),
+                            partial: if last_substantive_response.is_empty() {
+                                final_response.to_string()
+                            } else {
+                                last_substantive_response.to_string()
+                            },
+                        });
+                    }
+                    if permanent_streak.1 == PERMANENT_NUDGE_AT {
+                        messages.push(Message::user(format!(
+                            "⚠️ `{}` 已连续 {} 次因输入校验失败被拒。不要再用同一个\
+                             工具反复试：要么换一条路径完成任务，要么把当前进展和\
+                             卡点直接讲给用户。",
+                            tool_name, permanent_streak.1
+                        )));
+                    }
+                } else if permanent_streak.0 == tool_name {
+                    *permanent_streak = (String::new(), 0);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Advisor 暂停门的 park，同样补 trace 事件。门自带 600s 自动恢复
@@ -2101,7 +2340,7 @@ impl AgentRunner {
         // 跨 round 的「同一工具连续确定性失败」熔断计数：
         // (工具名, 连续 PermanentExec 次数)。`LoopDetector` 只认参数
         // **完全相同**的重复调用，而模型每次都会改一点参数再撞同一个
-        // 校验（jemalloc 2026-08-26：manager 连着 3 轮调 plan，每轮重写
+        // 校验（实测事故：manager 连着 3 轮调 plan，每轮重写
         // 8 个任务 40+ 条 paths，前两次分别撞 paths 重叠和 paths 类型
         // 错误，每轮烧 100~150s 模型时间），所以需要一个只看
         // (工具, 失败类别) 的计数器。
@@ -2152,6 +2391,11 @@ impl AgentRunner {
             let chat_params: Option<GenerateParams> = self.tool_manager.as_ref().map(|tm| {
                 let mut p = self.agent.params.clone();
                 p.tools = build_tool_schemas(tm);
+                // 显式声明「允许一条响应里发多个工具调用」。调用方已经
+                // 明确设过就尊重它，不覆盖。
+                if p.parallel_tool_calls.is_none() {
+                    p.parallel_tool_calls = parallel_tool_calls_pref();
+                }
                 p
             });
             let completion = if self.is_stream_mode() {
@@ -2387,7 +2631,7 @@ impl AgentRunner {
                 // 产出卫生：最终答复尾部带悬挂工具标记（native
                 // function-calling 下 `</parameter>`/`</function>` 等
                 // 只会是模型泄漏的垃圾，且正文常断在半句——glm-5.2 在
-                // jemalloc 现场的实锤形态）。重试一次让模型重出完整
+                // 实测现场的实锤形态）。重试一次让模型重出完整
                 // 答复，省一轮 advisor 打回；重试仍带标记则照收（避免
                 // 死循环）。
                 if markup_retried == 0 && has_dangling_tool_markup_tail(&final_response) {
@@ -2527,51 +2771,147 @@ impl AgentRunner {
 
                     // Pass 4: apply bookkeeping + append tool_results in
                     // original call order.
-                    for slot in results.into_iter() {
+                    for (i, slot) in results.into_iter().enumerate() {
                         let r = match slot {
                             Some(r) => r,
                             None => continue,
                         };
-                        for (name, args_json) in &r.loop_records {
-                            if let LoopDecision::Break(reason) =
-                                loop_detector.record(name, args_json)
+                        let name = post_parse_calls[i].name.clone();
+                        self.apply_call_result(
+                            r,
+                            &name,
+                            &mut messages,
+                            &mut loop_detector,
+                            &mut permanent_streak,
+                            &final_response,
+                            &last_substantive_response,
+                        )?;
+                    }
+
+                    round += 1;
+                    continue;
+                }
+
+                // ── Concurrent read-only fan-out ───────────────────────
+                //
+                // 同一响应里**连续**的多个只读工具调用（`read` /
+                // `code_graph`，见 [`READONLY_PARALLEL_TOOLS`]）并发执行，
+                // 其余调用保持原地串行。默认开，`LATTE_AGENT_READONLY_
+                // PARALLEL=0` 退回串行。
+                //
+                // 为什么安全：段内全是无副作用的读，顺序无关；任何可能
+                // 写状态的调用都是屏障（见 [`readonly_parallel_runs`]），
+                // 不会跨屏障重排。记账仍按原始顺序走
+                // [`AgentRunner::apply_call_result`]，模型看到的
+                // `tool_result` 序列与串行路径逐字节一致。
+                //
+                // 为什么值得：实测会话里 programmer 一轮只发 1 个
+                // 调用、185 次工具 I/O 只占 18s，模型往返却烧掉 577s。
+                // 让模型批量发之后，工具侧不能再成为新的串行瓶颈——
+                // 一段 8 个 read 并发跑，墙钟从 8×latency 降到 ≈1×。
+                let readonly_runs = if readonly_parallel_enabled() {
+                    readonly_parallel_runs(&post_parse_calls)
+                } else {
+                    Vec::new()
+                };
+
+                if !readonly_runs.is_empty() {
+                    use tokio::sync::Semaphore;
+                    use tokio::task::JoinSet;
+
+                    let mut results: Vec<Option<OneCallResult>> =
+                        (0..post_parse_calls.len()).map(|_| None).collect();
+                    let sem = Arc::new(Semaphore::new(readonly_parallel_max()));
+                    // 段起点 → 段终点，便于顺序遍历时跳段。
+                    let run_start: std::collections::HashMap<usize, usize> =
+                        readonly_runs.iter().copied().collect();
+
+                    let mut i = 0usize;
+                    while i < post_parse_calls.len() {
+                        if let Some(&end) = run_start.get(&i) {
+                            // 并发段：spawn 段内全部只读调用后一起 join。
+                            // park 点放在段边界（与串行路径的「in-flight
+                            // tool 跑完才停」语义一致）。
+                            self.park_if_paused("tool exec boundary").await;
+                            tracing::debug!(
+                                "readonly fan-out: {} calls concurrently (cap {})",
+                                end - i,
+                                readonly_parallel_max(),
+                            );
+                            let mut set: JoinSet<(usize, OneCallResult)> = JoinSet::new();
+                            for (idx, tc) in post_parse_calls
+                                .iter()
+                                .enumerate()
+                                .take(end)
+                                .skip(i)
                             {
-                                return Err(AgentError::ToolLoopDetected {
-                                    tool: name.clone(),
-                                    reason,
-                                    partial: if last_substantive_response.is_empty() {
-                                        final_response.clone()
-                                    } else {
-                                        last_substantive_response.clone()
-                                    },
+                                let tm_c = tm.clone();
+                                let hooks_c = self.hooks.clone();
+                                let sink_c = self.sink.clone();
+                                let rp_c = self.retry_policy.clone();
+                                let cwd_c = self.cwd.clone();
+                                let meta_c = meta.clone();
+                                let tc_c = tc.clone();
+                                let sem_c = sem.clone();
+                                set.spawn(async move {
+                                    // permit 在 task 内获取：spawn 不阻塞，
+                                    // 实际 in-flight 数由 semaphore 钳住。
+                                    let _permit = sem_c.acquire().await;
+                                    (
+                                        idx,
+                                        run_one_tool_call(
+                                            tm_c, hooks_c, sink_c, rp_c, cwd_c, meta_c, tc_c,
+                                        )
+                                        .await,
+                                    )
                                 });
                             }
-                        }
-                        if r.executed_ok {
-                            self.last_turn_tool_count += 1;
-                            // 收集工具摘要：取 loop_records 第一条为原始调用名+参数，
-                            // outcome 为结果。近似于串行路径的收集逻辑。
-                            if let (Some((name, args)), Ok(result_str)) =
-                                (r.loop_records.first(), &r.outcome)
-                            {
-                                self.last_turn_tool_summaries.push(format!(
-                                    "{} {} → {}",
-                                    name,
-                                    truncate_tool_summary(args, 160),
-                                    truncate_tool_summary(result_str, 240),
-                                ));
+                            while let Some(joined) = set.join_next().await {
+                                match joined {
+                                    Ok((idx, r)) => results[idx] = Some(r),
+                                    Err(e) => {
+                                        return Err(AgentError::Tool(format!(
+                                            "readonly tool task join failed: {e}"
+                                        )))
+                                    }
+                                }
                             }
+                            i = end;
+                        } else {
+                            // 屏障 / 单个只读调用：原地串行。
+                            self.park_if_paused("tool exec boundary").await;
+                            results[i] = Some(
+                                run_one_tool_call(
+                                    tm.clone(),
+                                    self.hooks.clone(),
+                                    self.sink.clone(),
+                                    self.retry_policy.clone(),
+                                    self.cwd.clone(),
+                                    meta.clone(),
+                                    post_parse_calls[i].clone(),
+                                )
+                                .await,
+                            );
+                            i += 1;
                         }
-                        match r.outcome {
-                            Ok(result_str) => {
-                                messages.push(Message::tool_result(r.id, result_str));
-                            }
-                            Err((_kind, detail)) => {
-                                // 协议闭环：每个 tool_call_id 都必须有对应
-                                // tool 消息，否则下一轮请求 400。
-                                messages.push(Message::tool_result(r.id, detail));
-                            }
-                        }
+                    }
+
+                    // 按原始调用顺序记账。
+                    for (idx, slot) in results.into_iter().enumerate() {
+                        let r = match slot {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        let name = post_parse_calls[idx].name.clone();
+                        self.apply_call_result(
+                            r,
+                            &name,
+                            &mut messages,
+                            &mut loop_detector,
+                            &mut permanent_streak,
+                            &final_response,
+                            &last_substantive_response,
+                        )?;
                     }
 
                     round += 1;
@@ -2638,6 +2978,21 @@ impl AgentRunner {
                         let input = match tm.get_tool(&full_name) {
                             Some(t) => coerce_tool_input_to_schema(input, &t.input_schema),
                             None => input,
+                        };
+                        // 行号自愈（anchor）：见 `crate::edit_anchor` 与
+                        // run_one_tool_call 里的同款处理。
+                        let input = {
+                            let mut healed = input;
+                            let notes =
+                                crate::edit_anchor::heal_edit_input(&resolved_name, &mut healed);
+                            for note in notes {
+                                log_hook_fire(
+                                    &note,
+                                    crate::trace::HookPoint::PreTool,
+                                    "anchor",
+                                );
+                            }
+                            healed
                         };
                         let final_input = input; // capture for the Ok arm
 
@@ -2711,6 +3066,10 @@ impl AgentRunner {
                                 // Pre-persistence gate: D6 需要 tool
                                 // 实际执行计数。失败的工具不计入。
                                 self.last_turn_tool_count += 1;
+                                // 记进 anchor 台账（见 crate::edit_anchor）。
+                                if let Ok(raw) = serde_json::to_string(&result) {
+                                    crate::edit_anchor::record_tool_result(&resolved_name, &raw);
+                                }
                                 // 5. PostToolHook
                                 let mut result_str = serde_json::to_string_pretty(&result)
                                     .unwrap_or_else(|_| format!("{:?}", result));
@@ -2833,7 +3192,7 @@ impl AgentRunner {
                             // 每个 tool_call_id 都有对应 tool 消息，缺一条
                             // deepseek 系 API 下一轮直接 400（"tool_calls
                             // must be followed by tool messages"），整个会话
-                            // 卡死（jemalloc 日志事故：architect 调了未授权的
+                            // 卡死（日志事故：architect 调了未授权的
                             // bash，ToolNotFound 不回填 → 历史破损 → 模型
                             // 链全灭 → 会话永久暂停）。防"模型看自己错误
                             // 输出循环恶化"靠 LoopDetector，不靠断链。
@@ -2900,7 +3259,7 @@ impl AgentRunner {
         // 5. Emit TurnEnd
         //
         // elapsed_ms 用 **wall-clock**：`Instant` 在 macOS 上不含系统
-        // 睡眠时间，只用它会让 turn 看起来比实际短得多（jemalloc
+        // 睡眠时间，只用它会让 turn 看起来比实际短得多（实测
         // 2026-08-26 会话：manager 的 turn 真实跨度 67 分钟，单调时钟
         // 只有 28.7 分钟——差的 38 分钟是合盖睡眠。当时 TurnEnd 报的是
         // 单调值，于是"trace 里没有任何事件的 38 分钟空洞"既没有事件
@@ -3218,6 +3577,19 @@ fn resolve_tool_input_against_cwd(
             }
         }
     }
+    // 批量 read 的 `paths` 数组同样逐项改写。不做的话会出现「单路径按 cwd
+    // 解析、批量路径不解析」的不对称——工具侧 `resolve_tool_path` 虽然也会
+    // 兜一层 ctx.cwd，但 trace 里记的 args_json 就不一致了，排查时看到两种
+    // 形状的路径。
+    if let Some(Value::Array(items)) = obj.get_mut("paths") {
+        for item in items.iter_mut() {
+            if let Some(s) = item.as_str() {
+                if is_relative_fs_path(s) {
+                    *item = Value::String(cwd.join(s).display().to_string());
+                }
+            }
+        }
+    }
     if obj.contains_key("command") {
         obj.entry("cwd".to_string())
             .or_insert_with(|| Value::String(cwd.display().to_string()));
@@ -3233,7 +3605,7 @@ fn resolve_tool_input_against_cwd(
 /// 进 `{"item":[...]}` 是高频错误——一次就废掉整个工具调用，
 /// `classify_tool_execution_error` 还会把它归成不可重试。
 ///
-/// jemalloc 实锤两例：
+/// 实测实锤两例：
 /// - tutor 的 `ask` 发 `"recommended":"true"` → 提问失败，选择框没弹
 /// - programmer 的 `ask` 发 `{"options":{"item":[…]},"multiSelect":"false"}`
 ///
@@ -3276,6 +3648,45 @@ pub(crate) fn coerce_tool_input_to_schema(
             _ => {}
         }
     }
+
+    // 3. 声明 String 的字段收到了**字符串数组**，而 schema 里存在同名复数
+    //    字段且声明为 Array → 把值搬过去。
+    //
+    //    唯一的落点是 `read`：schema 同时有 `path: String` 与
+    //    `paths: Array`，模型很容易写成 `path: ["a","b"]`。校验器没有
+    //    union 类型，这会被判 Validation 失败 → 归为不可重试 → 白烧一次
+    //    往返。而本次改造的全部目的就是**省往返**，在这里纠正比让模型
+    //    自己发现划算。
+    //
+    //    仍然是 schema 驱动、不猜测：必须同时满足「K 声明 String」+
+    //    「K+s 声明 Array」+「值是全字符串数组」+「K+s 尚未出现」。
+    let mut moves: Vec<(String, String)> = Vec::new();
+    for (key, value) in obj.iter() {
+        let Some(prop) = schema.properties.get(key) else {
+            continue;
+        };
+        if !matches!(prop.property_type, PropertyType::String) {
+            continue;
+        }
+        let Some(items) = value.as_array() else { continue };
+        if items.is_empty() || !items.iter().all(|v| v.is_string()) {
+            continue;
+        }
+        let plural = format!("{key}s");
+        let plural_is_array = schema
+            .properties
+            .get(&plural)
+            .is_some_and(|p| matches!(p.property_type, PropertyType::Array));
+        if plural_is_array && !obj.contains_key(&plural) {
+            moves.push((key.clone(), plural));
+        }
+    }
+    for (from, to) in moves {
+        if let Some(v) = obj.remove(&from) {
+            obj.insert(to, v);
+        }
+    }
+
     input
 }
 
@@ -3328,7 +3739,7 @@ mod tests {
     /// 与干净答复不触发。
     #[test]
     fn dangling_tool_markup_tail_detection() {
-        // jemalloc 实锤样本形态：标记在末尾
+        // 实测实锤样本形态：标记在末尾
         let bad = "折中：同一函数内累计≥80，中间无≥5行纯代码的段落</parameter> </function>";
         assert!(has_dangling_tool_markup_tail(bad));
         let bad2 = "好的，我来处理<tool_call>";
@@ -3357,7 +3768,7 @@ mod tests {
         // 回填给模型的文本要区分「未授权」与「不存在」：
         // `edit` 在 builtin 池里（EditToolsPackage），只是被角色 allowlist
         // 过滤掉了——报 "Tool not found" 会让模型判定该能力不存在、改用
-        // bash 绕路，而正确出路是 request_tool（jemalloc 实锤）。
+        // bash 绕路，而正确出路是 request_tool（实测实锤）。
         let detail = tool_not_found_detail("edit", "Tool not found: edit".into());
         assert!(detail.contains("未授权"), "detail = {detail}");
         assert!(detail.contains("request_tool"), "detail = {detail}");
@@ -4226,7 +4637,7 @@ mod tests {
 
     /// 同一工具连续被确定性校验拒绝 → 先追加硬指令，再熔断。
     ///
-    /// 回归 jemalloc 2026-08-26 事故：manager 连着 3 轮调 `plan`，每轮
+    /// 回归实测事故：manager 连着 3 轮调 `plan`，每轮
     /// 都改一点参数再撞同一类校验（`LoopDetector` 只认参数完全相同的
     /// 重复调用，所以毫无反应），每轮烧 100~150s 模型时间。
     #[tokio::test]
@@ -4345,7 +4756,7 @@ mod tests {
     /// session 暂停门 park 必须在 trace 上留痕（进 SessionPaused、出
     /// SessionResumed）。
     ///
-    /// 回归 jemalloc 2026-08-26 会话：3 个 park 点都是裸
+    /// 回归实测会话：3 个 park 点都是裸
     /// `wait_until_resumed(None)`，park 期间 trace 一个事件都没有，
     /// 事后无法区分"暂停 / 限流 / 死锁"。
     #[tokio::test]
@@ -5166,7 +5577,7 @@ mod tests {
     /// 回归防线：**循环被自动刹车中止时，模型已产出的正文必须作为
     /// `partial` 交出来。**
     ///
-    /// 事故背景（jemalloc）：estimate 步跑了 105 轮，最后一条回复是完整
+    /// 事故背景（实测）：estimate 步跑了 105 轮，最后一条回复是完整
     /// 的验证结论，但中止错误当时只带一个轮次数字，上层拿不到任何产出，
     /// 于是 step 失败 → 嵌套 workflow 失败 → 父 workflow 失败，3 小时
     /// 零产出。partial 是 workflow / delegate 两条降级路径的唯一输入。
@@ -6260,6 +6671,312 @@ mod tests {
         let parallel_max = run_phase().await;
         std::env::remove_var("LATTE_AGENT_DELEGATE_PARALLEL");
         assert_eq!(parallel_max, 2, "flag on must run the two delegates concurrently");
+    }
+
+    /// [`readonly_parallel_runs`] 的分段语义：
+    ///   - 只返回长度 ≥2 的**连续**只读区间；
+    ///   - 任何非只读工具都是屏障，前后不合并（保证
+    ///     `bash 写文件 → read 读它` 的顺序不被重排）。
+    #[test]
+    fn readonly_parallel_runs_splits_on_write_barriers() {
+        fn c(name: &str) -> ParsedCall {
+            ParsedCall { id: String::new(), name: name.into(), args: "{}".into() }
+        }
+        // 全是只读 → 一整段。
+        assert_eq!(
+            readonly_parallel_runs(&[c("read"), c("code_graph"), c("read")]),
+            vec![(0, 3)]
+        );
+        // 单个只读不成段（并发无意义）。
+        assert_eq!(readonly_parallel_runs(&[c("read")]), vec![]);
+        // bash 是屏障：两侧各 1 个 read，都不成段 → 全串行。
+        assert_eq!(
+            readonly_parallel_runs(&[c("read"), c("bash"), c("read")]),
+            vec![]
+        );
+        // 屏障两侧各 2 个 read → 两段，互不跨越屏障。
+        assert_eq!(
+            readonly_parallel_runs(&[
+                c("read"),
+                c("read"),
+                c("write"),
+                c("code_graph"),
+                c("read"),
+            ]),
+            vec![(0, 2), (3, 5)]
+        );
+        // delegate / edit 不属于只读表。
+        assert_eq!(
+            readonly_parallel_runs(&[c("delegate"), c("delegate"), c("edit")]),
+            vec![]
+        );
+        // 带 namespace 的遗留全名按短名识别。
+        assert_eq!(
+            readonly_parallel_runs(&[c("fs.read"), c("graph.code_graph")]),
+            vec![(0, 2)]
+        );
+    }
+
+    /// End-to-end proof of the read-only fan-out:
+    ///   - 默认（`LATTE_AGENT_READONLY_PARALLEL` unset）→ 一轮里的 3 个
+    ///     `read` **并发**执行（观测到的最大并发 = 3）；
+    ///   - `LATTE_AGENT_READONLY_PARALLEL=0` → 退回**串行**（最大并发 1）。
+    /// 两种情况都必须回填 3 条 tool_result 并以第 1 轮的 "done" 收尾。
+    #[tokio::test]
+    async fn readonly_batch_runs_concurrently_by_default_serial_when_disabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        async fn run_phase() -> usize {
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_seen = Arc::new(AtomicUsize::new(0));
+            let total = Arc::new(AtomicUsize::new(0));
+            let active_h = active.clone();
+            let max_h = max_seen.clone();
+            let total_h = total.clone();
+            let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+                let active = active_h.clone();
+                let max_seen = max_h.clone();
+                let total = total_h.clone();
+                Box::pin(async move {
+                    let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(cur, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    total.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({ "ok": true }))
+                })
+            });
+            let schema = ToolInputSchema {
+                schema_type: SchemaType,
+                properties: Default::default(),
+                required: None,
+                additional_properties: None,
+            };
+            // 名字必须是 `read` —— 只读并发靠 READONLY_PARALLEL_TOOLS 白名单
+            // 识别，不是靠「工具看起来只读」猜的。
+            let tool = Tool::builder("read", "test read", schema, handler).build();
+            let tm = create_tool_manager();
+            tm.register(tool, None);
+
+            let server = wiremock::MockServer::start().await;
+            struct FirstOnly(std::sync::atomic::AtomicUsize);
+            impl wiremock::Match for FirstOnly {
+                fn matches(&self, _req: &wiremock::Request) -> bool {
+                    self.0.fetch_add(1, Ordering::SeqCst) == 0
+                }
+            }
+            let call = |id: &str, p: &str| {
+                serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": "read", "arguments": format!("{{\"path\":\"{p}\"}}") }
+                })
+            };
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body(
+                                "",
+                                vec![
+                                    call("call_a", "/tmp/a"),
+                                    call("call_b", "/tmp/b"),
+                                    call("call_c", "/tmp/c"),
+                                ],
+                            ),
+                        )),
+                )
+                .await;
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body("done", vec![]),
+                        )),
+                )
+                .await;
+
+            let role = test_role();
+            let agent = Agent::new_with_chain(
+                "prog".into(),
+                role,
+                vec![model_at(&server, "stub")],
+                GenerateParams::default(),
+            )
+            .unwrap();
+            let mut runner = AgentRunner::new_with_tools(agent, tm);
+            let resp = runner
+                .run_turn(&[Message::user("go")], None)
+                .await
+                .expect("turn completes");
+            assert_eq!(resp, "done");
+            assert_eq!(total.load(Ordering::SeqCst), 3, "all three reads must run");
+            assert_eq!(
+                runner.last_turn_tool_count, 3,
+                "记账必须与串行路径一致：3 次成功计数"
+            );
+            max_seen.load(Ordering::SeqCst)
+        }
+
+        // Phase 1: 默认 → 并发。
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL");
+        let parallel_max = run_phase().await;
+        assert_eq!(parallel_max, 3, "默认应并发执行同一轮的 3 个 read");
+
+        // Phase 2: 显式关闭 → 串行。
+        std::env::set_var("LATTE_AGENT_READONLY_PARALLEL", "0");
+        let serial_max = run_phase().await;
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL");
+        assert_eq!(serial_max, 1, "关闭后必须退回串行（最大并发 1）");
+    }
+
+    /// 批量读的 `paths` 数组也要按 cwd 改写，否则会出现「单路径按 cwd
+    /// 解析、批量路径不解析」的不对称。绝对路径 / URL / `~` 一律不动。
+    #[test]
+    fn cwd_rewrite_covers_paths_array() {
+        let cwd = std::path::Path::new("/work/repo");
+        let out = resolve_tool_input_against_cwd(
+            serde_json::json!({"paths":["src/a.rs","/abs/b.rs","https://x/y","~/c.rs"]}),
+            cwd,
+        );
+        let arr = out["paths"].as_array().unwrap();
+        assert_eq!(arr[0], "/work/repo/src/a.rs", "相对路径要拼 cwd");
+        assert_eq!(arr[1], "/abs/b.rs", "绝对路径不动");
+        assert_eq!(arr[2], "https://x/y", "URL 不动");
+        assert_eq!(arr[3], "~/c.rs", "~ 不动");
+    }
+
+    /// 模型把批量路径误写进单数字段（`path: ["a","b"]`）时自动搬到 `paths`。
+    ///
+    /// 校验器没有 union 类型，不纠正就是 Validation 失败 → 归为不可重试 →
+    /// 白烧一次往返，而本次改造的全部目的就是省往返。规则仍是 schema 驱动：
+    /// 必须「K 声明 String」+「K+s 声明 Array」+「值是全字符串数组」+
+    /// 「K+s 尚未出现」四条同时成立。
+    #[test]
+    fn coerce_moves_string_array_to_plural_array_field() {
+        use latte_rs_agent_tools::types::{
+            PropertyType, SchemaType, ToolInputProperty, ToolInputSchema,
+        };
+        fn p(ty: PropertyType) -> ToolInputProperty {
+            ToolInputProperty {
+                property_type: ty,
+                description: None,
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+            }
+        }
+        let mut props = std::collections::BTreeMap::new();
+        props.insert("path".to_string(), p(PropertyType::String));
+        props.insert("paths".to_string(), p(PropertyType::Array));
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: props,
+            required: None,
+            additional_properties: None,
+        };
+
+        // 搬移：path 收到字符串数组。
+        let out = coerce_tool_input_to_schema(
+            serde_json::json!({"path":["a.rs","b.rs"]}),
+            &schema,
+        );
+        assert!(out.get("path").is_none(), "原字段应被搬走");
+        assert_eq!(out["paths"], serde_json::json!(["a.rs", "b.rs"]));
+
+        // 正常单路径不动。
+        let out = coerce_tool_input_to_schema(serde_json::json!({"path":"a.rs"}), &schema);
+        assert_eq!(out["path"], "a.rs");
+        assert!(out.get("paths").is_none());
+
+        // paths 已存在 → 不覆盖（不猜模型意图）。
+        let out = coerce_tool_input_to_schema(
+            serde_json::json!({"path":["a.rs"],"paths":["keep.rs"]}),
+            &schema,
+        );
+        assert_eq!(out["paths"], serde_json::json!(["keep.rs"]));
+        assert_eq!(out["path"], serde_json::json!(["a.rs"]));
+
+        // 数组里有非字符串 → 不动，让校验照常报错。
+        let out = coerce_tool_input_to_schema(serde_json::json!({"path":["a.rs",1]}), &schema);
+        assert!(out.get("paths").is_none());
+    }
+
+    /// `parallel_tool_calls` 必须真的落到 wire 上（默认 `true`），并且
+    /// `LATTE_AGENT_PARALLEL_TOOL_CALLS=omit` 能让它整条消失。
+    ///
+    /// 这条是路径 A 的核心断言：在实测会话里这个字段**根本没下发**，
+    /// 走的是供应商默认，所以"模型不并行"从来不是被我们关掉的。加上它是
+    /// 为了把意图显式化，并给不认这个字段的端点留 `omit` 逃生口。
+    #[tokio::test]
+    async fn parallel_tool_calls_lands_on_wire_and_can_be_omitted() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+
+        /// 跑一轮（无工具调用直接收尾），返回请求体里 parallel_tool_calls 的值。
+        async fn body_flag() -> Option<serde_json::Value> {
+            let handler: SharedToolHandler =
+                Arc::new(move |_i, _c| Box::pin(async move { Ok(serde_json::json!({})) }));
+            let schema = ToolInputSchema {
+                schema_type: SchemaType,
+                properties: Default::default(),
+                required: None,
+                additional_properties: None,
+            };
+            let tm = create_tool_manager();
+            tm.register(Tool::builder("read", "t", schema, handler).build(), None);
+
+            let server = wiremock::MockServer::start().await;
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(
+                            openai_completion_body("done", vec![]),
+                        )),
+                )
+                .await;
+            let agent = Agent::new_with_chain(
+                "prog".into(),
+                test_role(),
+                vec![model_at(&server, "stub")],
+                GenerateParams::default(),
+            )
+            .unwrap();
+            let mut runner = AgentRunner::new_with_tools(agent, tm);
+            runner.run_turn(&[Message::user("go")], None).await.unwrap();
+            let reqs = server.received_requests().await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+            // 顺带确认工具确实下发了——没工具时该字段本就不该出现。
+            assert!(body["tools"].as_array().is_some_and(|a| !a.is_empty()));
+            body.get("parallel_tool_calls").cloned()
+        }
+
+        std::env::remove_var("LATTE_AGENT_PARALLEL_TOOL_CALLS");
+        assert_eq!(body_flag().await, Some(serde_json::json!(true)), "默认应显式下发 true");
+
+        std::env::set_var("LATTE_AGENT_PARALLEL_TOOL_CALLS", "off");
+        assert_eq!(body_flag().await, Some(serde_json::json!(false)), "关掉应下发 false");
+
+        std::env::set_var("LATTE_AGENT_PARALLEL_TOOL_CALLS", "omit");
+        assert_eq!(body_flag().await, None, "omit 时字段必须完全不出现");
+        std::env::remove_var("LATTE_AGENT_PARALLEL_TOOL_CALLS");
     }
 
     #[test]

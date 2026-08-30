@@ -71,7 +71,7 @@ pub struct AgentPauseGate {
     /// 累计**已结束**的暂停时长（毫秒）。正在进行的那一次不在内，
     /// 由 [`total_paused`](Self::total_paused) 现算后叠加。
     ///
-    /// 动机（jemalloc 2026-08-26 会话）：workflow 的 wall-clock 预算
+    /// 动机（实测会话）：workflow 的 wall-clock 预算
     /// 此前用裸 `tokio::time::timeout` 计时，对 pause 一无所知。reviewer
     /// 22:06:27 停在 gate 上一次模型调用都没发出去，预算却照扣，5040s
     /// 到点后整条 task_refine 被判超支中止，2/4 步成果作废。预算要扣的

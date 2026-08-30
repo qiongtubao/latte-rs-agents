@@ -764,7 +764,7 @@ fn import_one(
     // workflow 引用必须存在：静默降级会让任务丢掉绑定的流程而无人
     // 察觉——拒绝并报错，让提交方（manager/用户）修正后重试。
     // 空串/空白 = 不绑定：plan 工具约定「没有贴合的必须留空」，产出
-    // 就是 workflow: ""，不能当成 workflow 名去校验（jemalloc 现场：
+    // 就是 workflow: ""，不能当成 workflow 名去校验（实测现场：
     // 6 个任务全部 workflow:"" 导入被 400 整单拒绝）。
     let workflow = match item.workflow.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -1210,6 +1210,31 @@ pub async fn dispatch_task(
     actor: &str,
     mode: &str,
 ) -> Result<TaskView, ApiError> {
+    // 0. 容器分流：**带未完成子任务的父任务不自己跑 workflow**。
+    //    否则父任务会把子任务清单当成一段文本塞进 topic、整体跑一遍
+    //    自己的 workflow 就收尾（human_review），子任务从未被真正执行
+    //    ——这正是「拆分本质没执行成」的根因。这里改为把父任务当作
+    //    聚合容器：派发它的 todo 子任务，父任务标记 in_progress 等子任务
+    //    全部完成后由 maybe_complete_parent 自动收尾。
+    {
+        let is_container = {
+            let store = b.tasks.read();
+            let t = store
+                .get(id)
+                .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+            if t.state != "todo" && t.state != "rework" {
+                return Err(ApiError::bad_request(format!(
+                    "state {:?} 不可派发（仅 todo/rework 可派发）",
+                    t.state
+                )));
+            }
+            is_container_with_pending_children(&store, id)
+        };
+        if is_container {
+            return dispatch_container(b, id, actor).await;
+        }
+    }
+
     // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
     let (title, priority, description, children, task_type, workflow, prev_state, recent_notes) = {
         let store = b.tasks.read();
@@ -1406,15 +1431,106 @@ pub async fn dispatch_task(
             };
             let result = run_workflow(&wf, &msg2, &ctx).await;
             // 开发流跑完（非 code_review 本身）→ 链式自动审查。
-            let chain_review = result.is_ok() && wf.name != "code_review";
+            //
+            // 但**没有代码改动就不审**：`explore` / `learn` 这类纯探索流
+            // 产出的是文档结论，`git diff` 是空的，套上 4 步 code_review
+            // 只会让 programmer/reviewer/tester 围着一份文档空转，并把
+            // 行号错位当成 blocking（实测实录：explore 之后
+            // 自动链了 code_review，首步 programmer 就说「该任务是探索
+            // 任务…git diff 是空的，没有源码改动」）。
+            let changed = workspace_has_reviewable_changes(&b2.cwd);
+            let chain_review =
+                result.is_ok() && wf.name != "code_review" && changed != Some(false);
             let dev_summary = result.as_ref().ok().cloned().unwrap_or_default();
-            finish_workflow_run(&b2, &task_id, result, &cancel);
+            finish_workflow_run(&b2, &task_id, result, &cancel, &session_id);
             if chain_review {
                 chain_code_review(&b2, &task_id, msg2, dev_summary, event_tx, agent_pause_gate.clone(), session_id).await;
+            } else if changed == Some(false) {
+                // 让「为什么没有自动审查」在看板上可见，而不是静默跳过。
+                let mut store = b2.tasks.write();
+                if let Some(t) = store.get_mut(&task_id) {
+                    t.push_note(
+                        "workflow",
+                        format!(
+                            "跳过自动代码审查：workflow '{}' 未产生代码改动（工作区无\
+                             待审查变更），本任务产出为文档/结论类。",
+                            wf.name
+                        ),
+                        now_ms(),
+                    );
+                    if let Err(e) = store.persist(&task_id) {
+                        eprintln!("[tasks] persist {task_id} after skip review: {e}");
+                    }
+                }
             }
         });
     }
     Ok(view)
+}
+
+/// 容器父任务派发：父任务本身**不跑 workflow**，只作为“子任务全部完成
+/// 即完成”的聚合节点。
+///
+/// 动作：
+/// 1. 把父任务迁到 `in_progress`（容器标记，附说明），使 scheduler 不再
+///    把它当叶子重复挑起；子任务完成后 [`maybe_complete_parent`] 会把它
+///    自动收尾到 `done`。
+/// 2. 逐个派发它处于 `todo` 的子任务（按 sub_order）。子任务各自带 workflow
+///    绑定，走正常的 workflow / manager 派发路径，是真正干活的执行单元。
+///    受并发上限与同族/跨族互斥约束——被 429/409 挡下的子任务留在 `todo`，
+///    由 scheduler 后续补派。
+///
+/// 幂等：父任务已 `in_progress` 时只补派 `todo` 子任务，不重复迁移状态。
+async fn dispatch_container(
+    b: &UiBackend,
+    id: &str,
+    actor: &str,
+) -> Result<TaskView, ApiError> {
+    // 1. 父任务迁 in_progress（容器标记）。仅当当前是 todo/rework 时迁移。
+    let now = now_ms();
+    let child_ids: Vec<String> = {
+        let mut store = b.tasks.write();
+        let t = store
+            .get_mut(id)
+            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        if t.state == "todo" || t.state == "rework" {
+            t.set_state(
+                "in_progress",
+                actor,
+                Some("容器任务：派发子任务，等子任务全部完成后自动收尾".into()),
+                now,
+            );
+            t.scheduled_at = None;
+            t.updated_at = now;
+            store.persist(id).map_err(ApiError::internal)?;
+        }
+        store
+            .children_of(id)
+            .into_iter()
+            .filter(|c| c.state == "todo")
+            .map(|c| c.id)
+            .collect()
+    };
+
+    // 2. 逐个派发 todo 子任务。子任务派发失败（并发上限 / 范围互斥）不
+    //    影响父任务容器状态——留在 todo，scheduler 后续补派。
+    for cid in child_ids {
+        match Box::pin(dispatch_task(b, &cid, actor, "redo")).await {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "[tasks] container {id}: dispatch child {cid} skipped ({}): {}",
+                    e.status, e.message
+                );
+            }
+        }
+    }
+
+    let store = b.tasks.read();
+    let t = store
+        .get(id)
+        .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+    Ok(store.view(t))
 }
 
 /// `POST /api/tasks/:id/refine` 响应：拆分会话的 session id。
@@ -1516,9 +1632,11 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             advisor_pause: advisor_pause.clone(),
             staging: None,
         };
-        if let Err(e) = run_workflow(&wf, &msg, &ctx).await {
+        let result = run_workflow(&wf, &msg, &ctx).await;
+        if let Err(e) = &result {
             eprintln!("[tasks] refine workflow for {task_id} failed: {e}");
         }
+        record_refine_outcome(&b2, &task_id, &session_id, result);
     });
     Ok(RefineTaskResponse {
         session_id: info.session_id,
@@ -1611,6 +1729,43 @@ pub async fn dispatch_ready(
         }
     }
     resp
+}
+
+/// agent 自身的簿记目录：它们的增删不构成「代码改动」，不该触发代码审查。
+const BOOKKEEPING_PREFIXES: [&str; 4] = [".latte/", ".omc/", ".omp/", ".git/"];
+
+/// 从 `git status --porcelain` 输出判断是否存在**值得审查**的改动。
+///
+/// 与落盘/进程分离的纯函数，便于单测。规则：逐行取路径，滤掉 agent
+/// 簿记目录（`.latte/` 等——每次 run 都会写 trace/task json，若算进去
+/// 则「有改动」永真，判据失效）；剩下任何一条即认为有待审查变更。
+fn porcelain_has_reviewable_changes(porcelain: &str) -> bool {
+    porcelain.lines().any(|line| {
+        // porcelain v1 行格式：`XY <path>`，重命名为 `R  old -> new`。
+        let path = line.get(3..).unwrap_or("").trim();
+        let path = path.rsplit(" -> ").next().unwrap_or(path);
+        let path = path.trim_matches('"');
+        !path.is_empty() && !BOOKKEEPING_PREFIXES.iter().any(|p| path.starts_with(p))
+    })
+}
+
+/// 工作区是否存在值得代码审查的改动。
+///
+/// - `Some(true)`  有待审查变更 → 该链式审查；
+/// - `Some(false)` 明确没有（干净工作区）→ 跳过审查；
+/// - `None`        无法判定（非 git 仓库 / git 不可用）→ 调用方保守处理
+///   （维持链式审查的历史行为，不因探测失败而少审）。
+fn workspace_has_reviewable_changes(cwd: &Path) -> Option<bool> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None; // 不是 git 仓库，或 git 报错 → 不做判断
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Some(porcelain_has_reviewable_changes(&text))
 }
 
 /// 开发 workflow 跑完（→ human_review）后，在同一 session 自动执行
@@ -1733,19 +1888,38 @@ fn maybe_complete_parent(store: &mut TaskStore, child: &Task, now: i64) {
 /// 同家族互斥检查：plan 拆出的兄弟任务常改同一批文件，并行执行会
 /// 互相覆盖。家族 = 父任务 + 其全部子任务。返回冲突中的 in_progress
 /// 任务 id（无冲突 → None）。
+///
+/// 例外：**容器父任务**（有子任务、自己不跑 workflow，只作为“子任务全
+/// 完成即完成”的聚合节点）处于 in_progress 时，**不阻塞它自己的子任务**
+/// 派发——否则子任务永远无法开跑（见 [`dispatch_task`] 的容器分流）。
+/// 兄弟之间、以及在跑的子任务反过来阻塞父任务被当叶子派发，仍然有效。
 fn family_running_conflict(store: &TaskStore, id: &str) -> Option<String> {
     let t = store.get(id)?;
-    let family_ids: Vec<String> = match &t.parent_id {
-        Some(pid) => {
-            let mut v: Vec<String> = store.children_of(pid).into_iter().map(|c| c.id).collect();
-            v.push(pid.clone());
-            v
-        }
-        None => store.children_of(id).into_iter().map(|c| c.id).collect(),
-    };
-    family_ids.into_iter().find(|fid| {
-        fid != id && store.get(fid).map(|c| c.state == "in_progress").unwrap_or(false)
-    })
+    match &t.parent_id {
+        // 派发的是子任务：只被在跑的**兄弟**阻塞；父任务作为容器在跑不算冲突。
+        Some(pid) => store
+            .children_of(pid)
+            .into_iter()
+            .map(|c| c.id)
+            .find(|cid| cid != id && store.get(cid).map(|c| c.state == "in_progress").unwrap_or(false)),
+        // 派发的是父任务：任一子任务在跑都算冲突（父不该被当叶子重复派发）。
+        None => store
+            .children_of(id)
+            .into_iter()
+            .map(|c| c.id)
+            .find(|cid| store.get(cid).map(|c| c.state == "in_progress").unwrap_or(false)),
+    }
+}
+
+/// 任务是否为“容器”：有子任务，且至少一个子任务尚未进入终态
+/// （done/cancelled）。容器任务不自己跑 workflow，而是派发子任务、
+/// 等子任务全部完成后由 [`maybe_complete_parent`] 自动收尾。
+fn is_container_with_pending_children(store: &TaskStore, id: &str) -> bool {
+    let children = store.children_of(id);
+    !children.is_empty()
+        && children
+            .iter()
+            .any(|c| c.state != "done" && c.state != "cancelled")
 }
 
 /// 规范化声明的路径范围：去 `./` 前缀、去尾部 `/`，压掉中间重复的
@@ -1823,18 +1997,30 @@ fn tail_chars(s: &str, n: usize) -> String {
 
 /// workflow run 结束时的任务状态迁移（actor=workflow）：
 /// Ok → completed → human_review（摘要取末尾 500 字符）；Err →
-/// failed → todo；观察到 cancel → aborted → todo。run 已被
-/// abort_task 收尾（ended_at 已填）时不动状态（返回 Ok 让调用方
-/// 照常清理取消旗标）。
+/// failed → todo；观察到 cancel → aborted → todo。
+///
+/// `session_id` 是**本次** run 的 session。只有「最后一条 run 未结束
+/// 且正是本次 run」才迁移，其余情况一律 no-op（返回 Ok 让调用方照常
+/// 清理取消旗标）：
+/// - run 已被 [`abort_task`] 收尾 → 不覆盖用户的回退；
+/// - 最后一条 run 是**另一次**派发 → 尤其是「中止 → 立刻重新执行」：
+///   `run_workflow` 要到下个 step 边界才退出，此时新 run 已经登记，
+///   不按 session 匹配就会把刚起来的新 run 标成 aborted、状态打回
+///   `todo`，表现为「重新执行秒失败」。
 fn apply_workflow_finish(
     store: &mut TaskStore,
     id: &str,
     result: Result<String, String>,
     cancelled: bool,
     now: i64,
+    session_id: &str,
 ) -> Result<(), String> {
     let t = store.get_mut(id).ok_or_else(|| format!("task {id:?} 不存在"))?;
-    if t.runs.last().filter(|r| r.ended_at.is_none()).is_none() {
+    if t.runs
+        .last()
+        .filter(|r| r.ended_at.is_none() && r.session_id == session_id)
+        .is_none()
+    {
         return Ok(());
     }
     let (res, summary) = match (result, cancelled) {
@@ -1859,6 +2045,49 @@ fn apply_workflow_finish(
     Ok(())
 }
 
+/// 把「拆分（refine）」workflow 的最终结果回写任务看板。
+///
+/// 为什么必需：`refine_task` 此前只把失败打到 stderr，看板永远停在
+/// 「已发起拆分（session …）」这一条 note 上。于是 workflow 挂掉时用户
+/// 在界面上看不到任何异常，只会困惑「怎么不弹窗添加子任务」——
+/// 实测实录：`task_refine` 的 gate 撞 `max_iterations=2`
+/// 判 Failed，`submit` 步没执行、`plan` 没被调用、弹窗没出现，而看板
+/// 上零痕迹。成功也记一笔：若成功却没弹窗，说明本次没产出可提交清单，
+/// 这同样需要让用户看见。
+///
+/// 只记 note、**不动状态**：拆分不改变任务本身的生命周期状态。
+fn record_refine_outcome(
+    b: &UiBackend,
+    task_id: &str,
+    session_id: &str,
+    result: Result<String, String>,
+) {
+    let note = refine_outcome_note(session_id, &result);
+    let mut store = b.tasks.write();
+    if let Some(t) = store.get_mut(task_id) {
+        t.push_note("workflow", note, now_ms());
+        if let Err(e) = store.persist(task_id) {
+            eprintln!("[tasks] persist {task_id} after refine outcome: {e}");
+        }
+    }
+}
+
+/// 拆分结果的看板文案（与落盘分离，便于单测）。
+fn refine_outcome_note(session_id: &str, result: &Result<String, String>) -> String {
+    match result {
+        // 截断：workflow 的错误摘要可能很长（含最后一次产出摘要），
+        // 看板只留可读的开头，完整内容在 session / workflow-runs 日志里。
+        Err(e) => {
+            let reason: String = e.chars().take(300).collect();
+            format!("拆分失败（session {session_id}）：{reason}")
+        }
+        Ok(_) => format!(
+            "拆分流程已完成（session {session_id}）。若未出现导入弹窗，说明本次未产出\
+             可提交的子任务清单，可重新发起拆分。"
+        ),
+    }
+}
+
 /// 后台 workflow 跑完后的收尾：迁移状态 + 落盘 + 清取消旗标。
 /// 任务已被删 / persist 失败只记日志（都是正常竞态或锦上添花）。
 fn finish_workflow_run(
@@ -1866,11 +2095,19 @@ fn finish_workflow_run(
     id: &str,
     result: Result<String, String>,
     cancel: &Arc<AtomicBool>,
+    session_id: &str,
 ) {
     let cancelled = cancel.load(Ordering::SeqCst);
     let mut store = b.tasks.write();
-    store.take_workflow_cancel(id);
-    if let Err(e) = apply_workflow_finish(&mut store, id, result, cancelled, now_ms()) {
+    // 只清理**自己**的取消旗标。「中止 → 立刻重新执行」时表里已是新 run
+    // 的旗标，无条件 remove 会让新 run 从此中止不掉（abort 走到
+    // take_workflow_cancel → None → 误对 workflow session 调 chat_abort）。
+    if let Some(flag) = store.take_workflow_cancel(id) {
+        if !Arc::ptr_eq(&flag, cancel) {
+            store.register_workflow_cancel(id, flag);
+        }
+    }
+    if let Err(e) = apply_workflow_finish(&mut store, id, result, cancelled, now_ms(), session_id) {
         eprintln!("[tasks] workflow finish {id}: {e}");
         return;
     }
@@ -1881,8 +2118,20 @@ fn finish_workflow_run(
 
 /// `POST /api/tasks/:id/abort` — 中止执行：对当前 run 的 session 调
 /// 现有 `chat_abort`，run 补 ended_at/result=aborted，state → todo。
+///
+/// **没有进行中 run 的 in_progress 任务同样可以中止**，此前这里直接报
+/// 400「没有进行中的 run」，制造了两类中止不掉的死状态：
+/// 1. **容器父任务**：[`dispatch_container`] 只把父任务迁 `in_progress`
+///    作聚合标记、**不 push run**（干活的是子任务）。于是父任务永远
+///    400，只能等子任务全部 done 才由 [`maybe_complete_parent`] 收尾
+///    ——中途想停下来无路可走（实测实录）。这里改为：
+///    容器的「中止」= 递归中止它在跑的子任务，自己回 `todo`。
+/// 2. **服务重启后遗留的 `in_progress`**：进程没了，run 的 ended_at
+///    还是 None、内存里也没有取消旗标；此时中止只是状态回退，无 run
+///    可收尾也应当成功。
 pub async fn abort_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
-    let session_id = {
+    // 1. 读锁内取材：本任务的在跑 run（可能没有）+ 在跑的子任务。
+    let (session_id, running_children) = {
         let store = b.tasks.read();
         let t = store
             .get(id)
@@ -1893,41 +2142,84 @@ pub async fn abort_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
                 t.state
             )));
         }
-        t.runs
+        let sid = t
+            .runs
             .last()
             .filter(|r| r.ended_at.is_none())
-            .map(|r| r.session_id.clone())
-            .ok_or_else(|| ApiError::bad_request("没有进行中的 run"))?
+            .map(|r| r.session_id.clone());
+        let kids: Vec<String> = store
+            .children_of(id)
+            .into_iter()
+            .filter(|c| c.state == "in_progress")
+            .map(|c| c.id)
+            .collect();
+        (sid, kids)
     };
 
-    // workflow run：置取消旗标（run_workflow 在下一个 step/speaker
-    // 边界退出，随后 finish_workflow_run 看到 run 已被下方收尾便不再
-    // 重复迁移）。workflow 不占 chat turn，chat_abort 只会误杀托管
-    // session 的 controller，故跳过。经典 run 维持原语义：session
-    // 可能已被用户删掉，中止失败不阻塞任务状态回退。
-    let wf_cancel = b.tasks.write().take_workflow_cancel(id);
-    if let Some(flag) = wf_cancel {
-        flag.store(true, Ordering::SeqCst);
-    } else {
-        let _ = api::chat_abort(b, Some(&session_id)).await;
+    // 2. 容器父任务：中止 = 逐个中止在跑的子任务（它们才是真正的执行
+    //    单元）。子任务中止失败不阻塞父任务回退——否则父任务又卡住了。
+    //    父子最多一层嵌套（见 [`maybe_complete_parent`]），递归不会深。
+    for cid in &running_children {
+        if let Err(e) = Box::pin(abort_task(b, cid)).await {
+            eprintln!(
+                "[tasks] abort {id}: 子任务 {cid} 中止失败（{}）：{}",
+                e.status, e.message
+            );
+        }
+    }
+
+    // 3. 有 run 才需要掐执行体。workflow run：置取消旗标（run_workflow 在
+    //    下一个 step/speaker 边界退出，随后 finish_workflow_run 认出 run
+    //    已被下方收尾便不再重复迁移）。workflow 不占 chat turn，chat_abort
+    //    只会误杀托管 session 的 controller，故跳过。经典 run 维持原语义：
+    //    session 可能已被用户删掉，中止失败不阻塞任务状态回退。
+    if let Some(session_id) = &session_id {
+        let wf_cancel = b.tasks.write().take_workflow_cancel(id);
+        if let Some(flag) = wf_cancel {
+            flag.store(true, Ordering::SeqCst);
+        } else {
+            let _ = api::chat_abort(b, Some(session_id)).await;
+        }
     }
 
     let now = now_ms();
     let mut store = b.tasks.write();
-    {
-        let t = store
-            .get_mut(id)
-            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
-        if let Some(run) = t.runs.last_mut().filter(|r| r.ended_at.is_none()) {
-            run.ended_at = Some(now);
-            run.result = Some("aborted".to_string());
-        }
-        t.set_state("todo", "user", Some("中止执行".to_string()), now);
-        t.updated_at = now;
-    }
+    apply_abort_finish(&mut store, id, running_children.len(), now)
+        .map_err(|e| ApiError::not_found(e))?;
     store.persist(id).map_err(ApiError::internal)?;
     let t = store.get(id).expect("刚 persist 的任务必然存在");
     Ok(store.view(t))
+}
+
+/// abort 的落盘部分：收尾未结束的 run（如果有）、state → todo。
+/// 与网络/取消旗标解耦，便于单测容器与「无 run」两条路径。
+fn apply_abort_finish(
+    store: &mut TaskStore,
+    id: &str,
+    aborted_children: usize,
+    now: i64,
+) -> Result<(), String> {
+    let t = store
+        .get_mut(id)
+        .ok_or_else(|| format!("task {id:?} 不存在"))?;
+    let had_run = match t.runs.last_mut().filter(|r| r.ended_at.is_none()) {
+        Some(run) => {
+            run.ended_at = Some(now);
+            run.result = Some("aborted".to_string());
+            true
+        }
+        None => false,
+    };
+    let note = if aborted_children > 0 {
+        format!("中止执行（容器任务：已中止 {aborted_children} 个在跑子任务）")
+    } else if had_run {
+        "中止执行".to_string()
+    } else {
+        "中止执行（无进行中的 run，仅回退状态）".to_string()
+    };
+    t.set_state("todo", "user", Some(note), now);
+    t.updated_at = now;
+    Ok(())
 }
 
 /// `POST /api/tasks/:id/report` — manager 回报：run 补 ended_at/result；
@@ -2154,6 +2446,106 @@ mod tests {
         assert_eq!(store2.meta().next_seq, 101);
     }
 
+    /// P1-编排回归（实测实录）：纯探索流（explore/learn）
+    /// 产出文档、`git diff` 为空，此前仍被无条件链式套上 4 步 code_review，
+    /// 导致 programmer/reviewer/tester 围着一份文档空转，还把行号错位
+    /// 当 blocking。判据：工作区没有值得审查的改动就不链式审查。
+    #[test]
+    fn clean_worktree_has_no_reviewable_changes() {
+        assert!(!porcelain_has_reviewable_changes(""), "干净工作区 = 无待审查改动");
+    }
+
+    /// agent 自身的簿记目录不算代码改动——每次 run 都会写 trace/task json，
+    /// 若算进去则「有改动」永真、判据失效。
+    #[test]
+    fn bookkeeping_dirs_are_not_reviewable() {
+        let porcelain = "?? .latte/\n?? .omc/\n?? .omp/skills/\n";
+        assert!(
+            !porcelain_has_reviewable_changes(porcelain),
+            "仅 agent 簿记目录变动不应触发代码审查"
+        );
+    }
+
+    /// 真实源码改动要触发审查（已跟踪的修改、新增未跟踪源文件都算）。
+    #[test]
+    fn real_source_changes_are_reviewable() {
+        assert!(porcelain_has_reviewable_changes(" M src/arena.c\n"), "已跟踪修改");
+        assert!(porcelain_has_reviewable_changes("?? src/newfile.c\n"), "新增未跟踪源文件");
+        assert!(porcelain_has_reviewable_changes("A  include/x.h\n"), "已暂存新增");
+        assert!(
+            porcelain_has_reviewable_changes("?? .latte/x\n M src/arena.c\n"),
+            "簿记 + 真实改动混合时应判有改动"
+        );
+    }
+
+    /// 重命名行 `R  old -> new` 取目标路径判定。
+    #[test]
+    fn rename_entries_use_destination_path() {
+        assert!(
+            porcelain_has_reviewable_changes("R  src/a.c -> src/b.c\n"),
+            "源码重命名算改动"
+        );
+        assert!(
+            !porcelain_has_reviewable_changes("R  .latte/a.json -> .latte/b.json\n"),
+            "簿记目录内重命名不算"
+        );
+    }
+
+    /// 端到端：真实 git 仓库上验证探测结果（干净 → Some(false)，
+    /// 改了源码 → Some(true)，只动簿记目录 → 仍 Some(false)）。
+    #[test]
+    fn workspace_detection_on_real_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(p)
+                .output()
+                .expect("git 可用")
+        };
+        if !git(&["init", "-q"]).status.success() {
+            eprintln!("git init 失败，跳过该用例");
+            return;
+        }
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+        std::fs::write(p.join("main.c"), "int main(){}\n").unwrap();
+        let _ = git(&["add", "."]);
+        let _ = git(&["commit", "-qm", "init"]);
+
+        // 干净工作区 → 明确「无待审查改动」。
+        assert_eq!(
+            workspace_has_reviewable_changes(p),
+            Some(false),
+            "干净仓库应明确判定无改动（此前会白跑一轮 code_review）"
+        );
+
+        // 只写 agent 簿记目录（模拟 explore 流只落 trace/task json）。
+        std::fs::create_dir_all(p.join(".latte/tasks")).unwrap();
+        std::fs::write(p.join(".latte/tasks/LAT-100.json"), "{}").unwrap();
+        assert_eq!(
+            workspace_has_reviewable_changes(p),
+            Some(false),
+            "只动 .latte/ 仍应判无代码改动"
+        );
+
+        // 真改源码 → 应判有改动。
+        std::fs::write(p.join("main.c"), "int main(){return 1;}\n").unwrap();
+        assert_eq!(workspace_has_reviewable_changes(p), Some(true));
+    }
+
+    /// 非 git 目录 → None（无法判定），调用方保守维持链式审查。
+    #[test]
+    fn non_git_dir_yields_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            workspace_has_reviewable_changes(dir.path()),
+            None,
+            "非 git 仓库应返回 None，让调用方保守处理（不因探测失败而少审）"
+        );
+    }
+
     #[test]
     fn next_seq_increments() {
         let (_dir, mut store) = tmp_store();
@@ -2162,6 +2554,68 @@ mod tests {
         assert_eq!(a.id, "LAT-100");
         assert_eq!(b.id, "LAT-101");
         assert_eq!(store.meta().next_seq, 102);
+    }
+
+    /// P1 回归（实测实录）：拆分 workflow 失败必须回写看板。
+    /// 此前失败只打 stderr，看板永远停在「已发起拆分」，用户只看到
+    /// 「不弹窗」却查不到原因。
+    #[test]
+    fn refine_failure_note_is_actionable() {
+        let err: Result<String, String> = Err(
+            "step 'gate' 循环条件「VERDICT: ACCEPT」在 2 次迭代后仍未满足\
+             （已达 max_iterations=2）"
+                .into(),
+        );
+        let note = refine_outcome_note("ui-1-2", &err);
+        assert!(note.contains("拆分失败"), "必须明说失败: {note}");
+        assert!(note.contains("ui-1-2"), "必须带 session 便于追溯: {note}");
+        assert!(note.contains("max_iterations"), "必须保留失败原因: {note}");
+    }
+
+    /// 过长的 workflow 错误摘要要截断，避免把整份产出灌进看板。
+    #[test]
+    fn refine_failure_note_is_truncated() {
+        let long: Result<String, String> = Err("x".repeat(5000));
+        let note = refine_outcome_note("s", &long);
+        assert!(note.chars().count() < 400, "应截断: {} 字符", note.chars().count());
+    }
+
+    /// 成功也要留痕：成功却没弹窗 = 本次没产出可提交清单，用户需要知道。
+    #[test]
+    fn refine_success_note_explains_missing_popup() {
+        let ok: Result<String, String> = Ok("done".into());
+        let note = refine_outcome_note("ui-9", &ok);
+        assert!(note.contains("已完成"), "{note}");
+        assert!(note.contains("弹窗"), "应解释没弹窗的含义: {note}");
+        assert!(!note.contains("失败"), "成功路径不应出现失败字样: {note}");
+    }
+
+    /// 回写只记 note、不改任务状态（拆分不影响任务生命周期）。
+    #[test]
+    fn refine_outcome_records_note_without_state_change() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_task(&mut store, "待拆分");
+        let before_state = t.state.clone();
+        let before_len = t.history.len();
+
+        let task = store.get_mut(&t.id).expect("task");
+        task.push_note(
+            "workflow",
+            refine_outcome_note("ui-x", &Err("gate 撞上限".into())),
+            now_ms(),
+        );
+
+        let after = store.get(&t.id).expect("task");
+        assert_eq!(after.state, before_state, "拆分回写不得改状态");
+        assert_eq!(after.history.len(), before_len + 1, "应新增一条 history");
+        let last = after.history.last().expect("history");
+        assert_eq!(last.actor, "workflow");
+        assert_eq!(last.from, None, "note 不带状态迁移");
+        assert!(
+            last.note.as_deref().unwrap_or("").contains("拆分失败"),
+            "{:?}",
+            last.note
+        );
     }
 
     #[test]
@@ -2432,7 +2886,7 @@ mod tests {
 
     /// 回归：plan 工具约定「没有贴合的 workflow 必须留空」，产出就是
     /// `workflow: ""`——空串/空白必须视为「不绑定」，整单 400 是 bug
-    /// （jemalloc 现场：6 个任务全部 workflow:"" 被 unknown workflow ''
+    /// （实测现场：6 个任务全部 workflow:"" 被 unknown workflow ''
     /// 拒绝）。子任务同理。
     #[test]
     fn import_treats_empty_workflow_as_unbound() {
@@ -2494,7 +2948,8 @@ mod tests {
         let (_dir, mut store) = tmp_store();
         let t = make_running_task(&mut store, "wf 成功");
         let summary = format!("{}结论", "x".repeat(600));
-        apply_workflow_finish(&mut store, &t.id, Ok(summary), false, now_ms()).expect("finish");
+        apply_workflow_finish(&mut store, &t.id, Ok(summary), false, now_ms(), "ui-test")
+            .expect("finish");
         let t = store.get(&t.id).unwrap();
         assert_eq!(t.state, "human_review");
         let run = t.runs.last().unwrap();
@@ -2513,7 +2968,7 @@ mod tests {
     fn workflow_finish_err_moves_back_to_todo() {
         let (_dir, mut store) = tmp_store();
         let t = make_running_task(&mut store, "wf 失败");
-        apply_workflow_finish(&mut store, &t.id, Err("boom".into()), false, now_ms())
+        apply_workflow_finish(&mut store, &t.id, Err("boom".into()), false, now_ms(), "ui-test")
             .expect("finish");
         let t = store.get(&t.id).unwrap();
         assert_eq!(t.state, "todo");
@@ -2529,7 +2984,7 @@ mod tests {
     fn workflow_finish_cancelled_marks_aborted() {
         let (_dir, mut store) = tmp_store();
         let t = make_running_task(&mut store, "wf 取消");
-        apply_workflow_finish(&mut store, &t.id, Err("cancelled".into()), true, now_ms())
+        apply_workflow_finish(&mut store, &t.id, Err("cancelled".into()), true, now_ms(), "ui-test")
             .expect("finish");
         let t = store.get(&t.id).unwrap();
         assert_eq!(t.state, "todo");
@@ -2604,21 +3059,43 @@ mod tests {
             .unwrap()
             .set_state("todo", "user", None, now_ms());
         assert!(family_running_conflict(&store, &c2.id).is_none());
-        // 父 in_progress → 子也冲突；子在跑 → 父 dispatch 也冲突
+        // 容器父任务 in_progress **不再**阻塞它自己的子任务（否则子任务
+        // 永远开不了跑）——父作为聚合容器在跑时，子任务照常派发。
         store
             .get_mut(&p.id)
             .unwrap()
             .set_state("in_progress", "user", None, now_ms());
-        assert_eq!(family_running_conflict(&store, &c2.id).as_deref(), Some(p.id.as_str()));
+        assert!(
+            family_running_conflict(&store, &c2.id).is_none(),
+            "容器父任务在跑不应阻塞子任务派发"
+        );
         store
             .get_mut(&p.id)
             .unwrap()
             .set_state("todo", "user", None, now_ms());
+        // 但子任务在跑 → 父任务被当叶子派发仍算冲突（父不该重复挑起）。
         store
             .get_mut(&c1.id)
             .unwrap()
             .set_state("in_progress", "user", None, now_ms());
         assert_eq!(family_running_conflict(&store, &p.id).as_deref(), Some(c1.id.as_str()));
+    }
+
+    #[test]
+    fn container_detection_ignores_terminal_children() {
+        let (_dir, mut store) = tmp_store();
+        let p = make_task(&mut store, "容器父");
+        let c1 = make_child(&mut store, &p, "子1");
+        let c2 = make_child(&mut store, &p, "子2");
+        let now = now_ms();
+        // 有未完成子任务 → 是容器
+        assert!(is_container_with_pending_children(&store, &p.id));
+        // 无子任务的叶子 → 不是容器
+        assert!(!is_container_with_pending_children(&store, &c1.id));
+        // 子任务全进终态（done/cancelled）→ 不再是容器（可自行收尾）
+        store.get_mut(&c1.id).unwrap().set_state("done", "user", None, now);
+        store.get_mut(&c2.id).unwrap().set_state("cancelled", "user", None, now);
+        assert!(!is_container_with_pending_children(&store, &p.id));
     }
 
     // ─── 跨族文件范围互斥（paths） ───────────────────────────────
@@ -3194,11 +3671,103 @@ mod tests {
             t.set_state("todo", "user", Some("中止执行".into()), now);
         }
         let history_len = store.get(&t.id).unwrap().history.len();
-        apply_workflow_finish(&mut store, &t.id, Ok("late success".into()), false, now_ms())
+        apply_workflow_finish(&mut store, &t.id, Ok("late success".into()), false, now_ms(), "ui-test")
             .expect("finish");
         let t = store.get(&t.id).unwrap();
         assert_eq!(t.state, "todo", "不得覆盖 abort 的回退");
         assert_eq!(t.runs.last().unwrap().result.as_deref(), Some("aborted"));
         assert_eq!(t.history.len(), history_len, "不得追加 history");
+    }
+
+    /// 「中止 → 立刻重新执行」：旧 workflow 到 step 边界才退出，那时
+    /// 最后一条 run 已经是新派发的 run。旧 run 的收尾必须按 session
+    /// 匹配、认出不是自己就 no-op，否则新 run 被标 aborted、状态打回
+    /// todo，用户看到的就是「重新执行秒失败」。
+    #[test]
+    fn workflow_finish_does_not_clobber_a_newer_run() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_running_task(&mut store, "中止后重新执行");
+        let now = now_ms();
+        {
+            let t = store.get_mut(&t.id).unwrap();
+            // 旧 run（session ui-test）被 abort 收尾
+            let run = t.runs.last_mut().unwrap();
+            run.ended_at = Some(now);
+            run.result = Some("aborted".into());
+            t.set_state("todo", "user", Some("中止执行".into()), now);
+            // 重新派发：新 run + in_progress
+            t.set_state("in_progress", "user", None, now);
+            t.runs.push(TaskRun {
+                session_id: "ui-new".into(),
+                started_at: now,
+                ended_at: None,
+                result: None,
+            });
+        }
+        // 旧 run 的后台任务这时才收尾（cancelled=true）
+        apply_workflow_finish(&mut store, &t.id, Err("cancelled".into()), true, now_ms(), "ui-test")
+            .expect("finish");
+        let t = store.get(&t.id).unwrap().clone();
+        assert_eq!(t.state, "in_progress", "新 run 必须继续跑");
+        let run = t.runs.last().unwrap();
+        assert_eq!(run.session_id, "ui-new");
+        assert!(run.ended_at.is_none(), "新 run 不得被旧 run 收尾");
+        // 本次 run 自己的收尾照常生效
+        apply_workflow_finish(&mut store, &t.id, Ok("done".into()), false, now_ms(), "ui-new")
+            .expect("finish");
+        assert_eq!(store.get(&t.id).unwrap().state, "human_review");
+    }
+
+    // ─── 中止（abort）的落盘部分 ─────────────────────────────────
+
+    #[test]
+    fn abort_closes_open_run_and_returns_to_todo() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_running_task(&mut store, "叶子任务");
+        apply_abort_finish(&mut store, &t.id, 0, now_ms()).expect("abort");
+        let t = store.get(&t.id).unwrap();
+        assert_eq!(t.state, "todo");
+        let run = t.runs.last().unwrap();
+        assert!(run.ended_at.is_some());
+        assert_eq!(run.result.as_deref(), Some("aborted"));
+        assert_eq!(t.history.last().unwrap().note.as_deref(), Some("中止执行"));
+    }
+
+    /// 容器父任务没有 run（dispatch_container 只迁状态），中止必须成功
+    /// 而不是报「没有进行中的 run」（实测卡死实录）。
+    #[test]
+    fn abort_container_without_run_succeeds() {
+        let (_dir, mut store) = tmp_store();
+        let p = make_task(&mut store, "容器父");
+        let _c = make_child(&mut store, &p, "子1");
+        let now = now_ms();
+        store
+            .get_mut(&p.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now);
+        assert!(p.runs.is_empty());
+        apply_abort_finish(&mut store, &p.id, 1, now_ms()).expect("abort");
+        let p = store.get(&p.id).unwrap();
+        assert_eq!(p.state, "todo");
+        let note = p.history.last().unwrap().note.as_deref().unwrap_or_default();
+        assert!(note.contains("容器任务"), "{note}");
+        assert!(note.contains('1'), "{note}");
+    }
+
+    /// 服务重启后遗留的 in_progress：run 的 ended_at 还是 None 但进程
+    /// 已经没了；中止只是状态回退，也必须成功。
+    #[test]
+    fn abort_stale_in_progress_without_run_succeeds() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_task(&mut store, "重启遗留");
+        store
+            .get_mut(&t.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        apply_abort_finish(&mut store, &t.id, 0, now_ms()).expect("abort");
+        let t = store.get(&t.id).unwrap();
+        assert_eq!(t.state, "todo");
+        let note = t.history.last().unwrap().note.as_deref().unwrap_or_default();
+        assert!(note.contains("无进行中的 run"), "{note}");
     }
 }

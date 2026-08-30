@@ -74,8 +74,13 @@ for f in "$SOURCE_DIR/config/prompts/"*.md; do
     cp "$f" "$TARGET_DIR/prompts/"
     count=$((count + 1))
 done
-# 清理历史同步留下的基础设施角色拷贝（它们会被当作定制层整个追加）。
-rm -f "$TARGET_DIR/prompts/manager.md" "$TARGET_DIR/prompts/advisor.md"
+# 清理历史同步留下的基础设施角色拷贝（它们会被当作定制层整个追加，
+# 让 system prompt 里并存两套规则——其中一套是过期的）。三个位置都清：
+# 运行时按 prompt_file 相对路径读 <target>/prompts/，读不到再回落到
+# .latte/prompts.d/ 全局覆盖；.latte/prompts/ 是更早的历史位置。
+for d in "prompts" ".latte/prompts" ".latte/prompts.d"; do
+    rm -f "$TARGET_DIR/$d/manager.md" "$TARGET_DIR/$d/advisor.md"
+done
 echo "  ✅ Prompts: $count 个提示词文件（跳过 manager/advisor，由内置基座兜底）"
 
 # 3. 同步模型和讨论配置
@@ -85,7 +90,7 @@ done
 echo "  ✅ Configs: 模型/讨论配置"
 
 # 4. 同步 workflow 模板（全量覆盖：config/workflows 是权威源，旧版
-#    残留会让 session 跑陈旧流程——jemalloc 现场实锤）
+#    残留会让 session 跑陈旧流程——实测现场实锤）
 mkdir -p "$TARGET_DIR/.latte/workflows.d"
 count=0
 for f in "$SOURCE_DIR/config/workflows/"*.toml; do

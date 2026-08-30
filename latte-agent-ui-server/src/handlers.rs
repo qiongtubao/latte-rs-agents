@@ -498,7 +498,7 @@ pub(crate) async fn events_sse(
     });
     // JS 看不到 axum keep-alive 的注释心跳——前端看门狗需要真实事件
     // 来判断连接死活（半开连接时 EventSource 不报错也不收数据，会
-    // 让 UI 永久停在旧状态；jemalloc 现场实锤）。每 15s 一个 ping
+    // 让 UI 永久停在旧状态；现场实锤）。每 15s 一个 ping
     // 命名事件，前端 >60s 无任何事件即主动断开重建。
     let ping = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
         std::time::Duration::from_secs(15),

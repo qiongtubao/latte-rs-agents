@@ -50,6 +50,7 @@ pub mod config;
 pub mod context;
 pub mod dispatch_ledger;
 pub mod doc_graph_tools;
+pub mod edit_anchor;
 pub mod error;
 pub mod event_json;
 pub mod global_config;

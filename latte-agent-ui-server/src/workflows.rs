@@ -182,6 +182,16 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 output_from: None,
                 export: Default::default(),
                 output_contract: Default::default(),
+                // 「本步必须真的调用过某工具」同样只在 TOML 权威版可配；
+                // 表单编辑器的试运行不强制（空 = 不校验，现状行为）。
+                require_tools: vec![],
+                // 同上：OR 语义的取证要求与工具调用次数上限也只在 TOML
+                // 权威版可配（空 = 不校验）。
+                require_tools_any: vec![],
+                tool_call_limits: Default::default(),
+                // plan 提交硬校验同样只在 TOML 权威版可配；表单编辑器的
+                // 试运行不强制（false = 现状行为）。
+                require_plan_submit: false,
                 // step 级工具过滤仅 TOML 权威版可配；表单编辑器不支持，
                 // 试运行给空（= 角色全集）。
                 tools: vec![],

@@ -44,13 +44,23 @@ prompt_file = "prompts/tutor.md"
 temperature = 0.5
 
 # Allowed tools — which capabilities this role has access to in chat mode.
-#   read    — read files and directories
-#   write   — create or overwrite files
-#   ask     — pop a choice dialog (single/multi-select, image options, grid)
-# Available tools: read, write, bash, search, list, ask
-#   ask 让 tutor 在学习循环里向用户弹窗出题——答案经 choice-answer 直达，
-#   不入主 session 对话流（这是 token 零增长的关键）。
-tools = ["read", "write", "ask"]
+#   read       — read files and directories（支持 paths 数组批量读）
+#   code_graph — 结构化代码导航：按 AST 节点类型查函数/结构体/调用点
+#   search     — 文本检索，code_graph 覆盖不到的形态（宏定义、字符串）用它
+#   write      — create or overwrite files
+#   ask        — pop a choice dialog (single/multi-select, image options, grid)
+#
+# 为什么 tutor 必须有 code_graph / search：出题和讲解都**必须基于仓库实际
+# 内容取证**，不能凭模型对某个库的记忆编。实测会话是反面
+# 教材——当时 tutor 只有 read/write/ask，plan 步的全部工具调用就是 2 次
+# write（0 次读源码），5 道题里 3 道的"正确答案"是幻觉：
+#   - k4 把不存在的 `init` 标成 extent_hooks_t 最先调用的回调（真实 9 个
+#     成员里没有 init）
+#   - k5 说版本宏在 foo_typedefs.h（该文件里 VERSION 出现 0 次，
+#     真正的位置是 foo_macros.h:8）
+#   - k2 的 `MALLOCX_FAIL_NOWAIT` 全仓不存在
+# 学员照这种题去理解代码，学到的是假知识——比不学更糟。
+tools = ["read", "code_graph", "search", "write", "ask"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🎓"

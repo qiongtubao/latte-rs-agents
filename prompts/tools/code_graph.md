@@ -4,7 +4,8 @@
 - Use `name` to filter by substring — drastically reduces output when scanning directories.
 - Default mode `signatures` returns one-line-per-match. Only use `mode=full` when you need the implementation body.
 - For directories, pass `lang` explicitly (e.g. `lang=c` for `.c`/`.h` files).
-- Workflow: `code_graph(kind=function, path=file)` → read signatures → pick targets → `read(path, offset=line, limit=30)` for details.
+- Workflow: `code_graph(kind=function, path=file)` → read signatures → pick targets → `read(path="file:120-160")` for details.
+- Batch independent follow-up reads into ONE call: `read(paths=["a.c:120-160", "b.h", "c.c:20-60"])` (max 10). Each extra round costs a full model round-trip plus a resend of the whole history; the file I/O itself is milliseconds. Only split across rounds when what to read next depends on what you just read.
 </instruction>
 
 <critical>

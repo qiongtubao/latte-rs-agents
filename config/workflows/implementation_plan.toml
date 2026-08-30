@@ -45,10 +45,10 @@ prompt = "终审这份实现规划：\n【拆解】{{plan}}\n【任务清单】{
 # 重拆 → 重生成清单 → 重审 → 重判，最多 max_iterations 轮；耗尽仍
 # REJECT 才以 failed 收场（带 wf_id 可 resume）。此前 REJECT 直接
 # 判死整个 workflow——评审尽职尽责找到真问题反而让 50 分钟流水线
-# 血本无归（jemalloc 实锤：B-1/B-2/B-3 三条实证阻断随 workflow
+# 血本无归（实测实锤：B-1/B-2/B-3 三条实证阻断随 workflow
 # failed 被丢掉）。
 # ⚠️ 有条件通过 → PASS 但必须把条件/修正项随清单一并带上——否则
-# 修正项在 gate 被静默丢弃，带错的清单直接进看板（jemalloc 实锤：
+# 修正项在 gate 被静默丢弃，带错的清单直接进看板（实测实锤：
 # 4 处 stats.c 行号实测错误随 VERDICT: PASS 被放行）。有实测错误
 # 且未吸收进清单时必须 REJECT。
 [[steps]]

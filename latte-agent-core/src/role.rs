@@ -85,8 +85,23 @@ pub fn system_tools_for(id: &str) -> &'static [&'static str] {
     }
 }
 
-/// A role template — defines the identity, behavior, and defaults for an agent role.
+/// 用户 prompt 文件是否其实是一份**完整 prompt 拷贝**，而不是定制增量。
 ///
+/// 基础设施角色（见 [`is_infrastructure_role`]）的用户文件只做追加。但
+/// 历史上多处安装/同步路径把内置 prompt 整份拷进用户目录；那份拷贝一旦
+/// 落后于内置基座就不再逐字相同，于是被当成"定制层"整份追加——system
+/// prompt 里出现两套规则（其中一套是旧的），首轮输入 token 翻倍，模型还
+/// 会在两套互相矛盾的规则之间挑最省事的那条执行。
+///
+/// 判据取**结构**而非内容：内置基座以 `<role>` 开篇并声明 `<rules>`，
+/// 而真正的定制增量是补充条款，不会重新声明这两个节。这样无论拷贝的是
+/// 哪个历史版本都能识别，不依赖与当前基座逐字比对。
+fn is_full_prompt_copy(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("<role>") || (t.contains("<role>") && t.contains("<rules>"))
+}
+
+
 /// Loaded from TOML config + markdown prompt files. Supports `{{variable}}` template
 /// substitution via handlebars.
 #[derive(Debug, Clone)]
@@ -192,10 +207,11 @@ impl RoleTemplate {
 
         // Infrastructure roles (manager, advisor): built-in prompt is the
         // always-present base; a user prompt file only appends a
-        // <project_rules> customization section (skipped when identical
-        // to the base, e.g. a synced copy). Escape hatch: an absolute or
-        // `~`-prefixed prompt_file keeps full-replace semantics
-        // (deliberate user intent, handled by the branch below).
+        // <project_rules> customization section. A user file that is
+        // itself a full prompt copy (any version — see
+        // `is_full_prompt_copy`) is ignored, not appended. Escape hatch:
+        // an absolute or `~`-prefixed prompt_file keeps full-replace
+        // semantics (deliberate user intent, handled by the branch below).
         let system_prompt = if is_infrastructure_role(&self.id)
             && !matches!(&self.prompt_file, Some(p) if p.starts_with('/') || p.starts_with('~'))
         {
@@ -208,7 +224,10 @@ impl RoleTemplate {
                 },
                 None => None,
             };
-            match user.filter(|c| !c.trim().is_empty() && c.trim() != base.trim()) {
+            match user.filter(|c| {
+                let c = c.trim();
+                !c.is_empty() && c != base.trim() && !is_full_prompt_copy(c)
+            }) {
                 Some(custom) => format!("{base}\n\n<project_rules>\n{custom}\n</project_rules>"),
                 None => base.to_string(),
             }
@@ -565,6 +584,36 @@ mod tests {
         let _ = std::fs::remove_file(&rel);
         assert_eq!(role.system_prompt, base);
         assert!(!role.system_prompt.contains("<project_rules>"));
+    }
+
+    /// 陈旧的**旧版**全量副本（不逐字等于当前基座）同样不能被当作定制层
+    /// 追加——否则 system prompt 里会并存两套规则，其中一套是过期的。
+    #[tokio::test]
+    async fn test_infrastructure_prompt_skips_stale_full_copy() {
+        let base = crate::prompts::for_role("manager").unwrap();
+        // 模拟"落后一个版本的拷贝"：结构完整，但内容与基座不同。
+        let stale = format!("{base}\n\n## 某个已经被删掉的旧章节\n旧规则正文。\n");
+        assert_ne!(stale.trim(), base.trim());
+        let rel = format!("test_stale_manager_prompt_{}.md", std::process::id());
+        std::fs::write(&rel, &stale).unwrap();
+        let tmpl = infra_template("manager", Some(rel.clone()), vec![]);
+        let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
+        let _ = std::fs::remove_file(&rel);
+        assert!(
+            !role.system_prompt.contains("<project_rules>"),
+            "旧版全量副本不该被追加成定制层"
+        );
+        assert!(!role.system_prompt.contains("已经被删掉的旧章节"));
+    }
+
+    /// `is_full_prompt_copy` 的判据边界：整份 prompt 认得出，普通增量放行。
+    #[test]
+    fn test_full_prompt_copy_detection() {
+        assert!(is_full_prompt_copy("<role>\n你是…\n</role>\n<rules>\n…\n</rules>"));
+        assert!(is_full_prompt_copy("\n\n<role>x</role>"));
+        // 增量：只补充条款，不重新声明 <role>/<rules>。
+        assert!(!is_full_prompt_copy("本项目约定：优先用 Rust。"));
+        assert!(!is_full_prompt_copy("## 额外规则\n- 提交前跑 cargo test"));
     }
 
     #[tokio::test]

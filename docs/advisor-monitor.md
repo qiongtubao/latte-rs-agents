@@ -81,7 +81,7 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   > 问题叠加——超预算**静默**丢最老的行且 `render()` 不留痕迹；prompt 标题写「本 turn」
   > 而 `reset_turn_state` 从不碰它、`MonitorState` 整会话只建一次，实际跨会话累积。
   > 于是 advisor 被骗两次（说一轮实为多轮、说完整实为掐头），据此做「过程取证」必然
-  > 出错：jemalloc 2026-08-26 会话里它断言「记录中无成功读取 README，故引用为幻觉」，
+  > 出错：实测会话里它断言「记录中无成功读取 README，故引用为幻觉」，
   > 而那次读取真实发生过，只是落在被丢弃的那段里。现在改为「只判路由 + 省略可见」，
   > 并在 advisor prompt 里加了硬约束「证据缺失 ≠ 证据为负，缺失时最多 warn」。
 - **分级语义（warn / intervene 拉开）**：
@@ -132,7 +132,7 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
 - **完整结果** 32K（`DELEGATE_REVIEW_RESPONSE_MAX_CHARS`）——刻意调到能装下真实
   专家报告（实测 25.5K）。超出时附**显式截断标注**（字符数 + `[+NB]`），并要求
   「仅依据可见内容裁决，不要臆测被截断部分」。
-- **工具执行摘要**（引擎侧记录）——不可省。jemalloc 实锤：interview step 用 `ask`
+- **工具执行摘要**（引擎侧记录）——不可省。实测实锤：interview step 用 `ask`
   弹窗收齐 4 个答案后输出 user_profile，advisor 看不到 `ask` 的执行记录，误判
   「伪造答案」→ intervene → 带反馈重做 → 用户被重复提问。
 
@@ -190,7 +190,7 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   `review_settings`（`delegate_review_timeout_secs = 90` +
   `return_max_redo = 1`，硬上限 3）在 `runner_gate()` 注入 gate 副本，
   随既有 plumbing 流到各 delegate-return 审查 engine：前者是
-  `gate_delegate_return` 的单次审查超时（jemalloc 实锤：45s 硬编码对
+  `gate_delegate_return` 的单次审查超时（实测实锤：45s 硬编码对
   20–44s 延迟的慢审查模型太紧，频繁「未审直接放行」），后者是
   workflow speaker 返回被判 intervene/terminate 时的重做上限。
 - 确定性提示每 turn 每种检测器最多一次（`fired` 集合去重，turn 结束重置）。

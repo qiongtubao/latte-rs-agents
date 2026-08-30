@@ -1,4 +1,4 @@
-import type { SessionInfo, ModelWithSource } from "./api";
+import type { SessionInfo, ModelWithSource, ChatEvent } from "./api";
 import {
   ensureSession, listSessions, createSession,
   switchSession, getSession, subscribeEvents, fetchSubsession,
@@ -24,6 +24,7 @@ import type { LatteUiApi } from "./host";
 import { waitForHost, setUiApi, installUiCallListener } from "./host";
 import { initTransport } from "./transport";
 import { extractCodeRefs, makeRefChips } from "./linkify";
+import { pendingAfterHistory } from "./history_merge";
 
 function $(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -409,15 +410,56 @@ async function main(): Promise<void> {
     }
   });
 
+  // ── live 事件的汇聚点 ──
+  // 正常直接进 chat；处于「历史对齐窗口」（正在拉 /api/session/history）
+  // 时先缓冲，对齐完成后去重补放。见 replayHistoryAligned。
+  let liveBuffer: ChatEvent[] | null = null;
+  function onLiveEvent(ev: ChatEvent): void {
+    if (liveBuffer) liveBuffer.push(ev);
+    else chat.handleEvent(ev);
+  }
+
   function openSse(): void {
     sseDisconnector();
     const { disconnect, reconnect } = subscribeEvents(
-      (ev) => chat.handleEvent(ev),
+      (ev) => onLiveEvent(ev),
       (status) => chat.setStatus(status),
       () => { void resyncHistory(); },
     );
     sseDisconnector = disconnect;
     sseConnector = reconnect;
+  }
+
+  /** 拉服务端权威历史 → 清屏 → 回放 → 把对齐窗口里缓冲的 live 事件
+   *  去重补放。
+   *
+   *  为什么要缓冲（实测实录）：拉历史是异步的，这段时间里
+   *  到达的 live 事件如果直接渲染，会被紧随其后的 `chat.clear()` 抹掉，
+   *  而它们并不在刚拿到的快照里 —— 等于永久丢失。缓冲 + 按 key 去重
+   *  （history_merge.pendingAfterHistory）既不丢也不重。
+   *
+   *  @returns 回放的历史条数；`null` 表示拉历史失败（不清屏，保留现状）。 */
+  async function replayHistoryAligned(id: string): Promise<number | null> {
+    const buffered: ChatEvent[] = [];
+    liveBuffer = buffered;
+    let history: ChatEvent[];
+    try {
+      history = await getSessionHistory(id);
+    } catch (e) {
+      // 静默 catch 会让聊天区无声空白（此前就是 `.catch(() => [])`）。
+      // 保留已渲染内容 + 明确报错，并把缓冲事件照常放出来。
+      liveBuffer = null;
+      for (const ev of buffered) chat.handleEvent(ev);
+      console.error("[main] load history failed", e);
+      chat.setFooter(`⚠️ 历史加载失败（实时事件仍在接收）：${String(e)}`);
+      return null;
+    }
+    chat.clear();
+    chat.replayEvents(history);
+    const pending = pendingAfterHistory(history, buffered);
+    liveBuffer = null;
+    for (const ev of pending) chat.handleEvent(ev);
+    return history.length;
   }
 
   /** SSE 断流/广播滞后后的补齐：拉服务端权威历史整体重放（等价于
@@ -429,10 +471,8 @@ async function main(): Promise<void> {
     try {
       const id = getCurrentSessionId();
       if (!id) return;
-      const history = await getSessionHistory(id).catch(() => null);
-      if (!history) return;
-      chat.clear();
-      chat.replayEvents(history);
+      const replayed = await replayHistoryAligned(id);
+      if (replayed === null) return;
       await replayPendingPrompts(id);
     } finally {
       resyncing = false;
@@ -459,19 +499,30 @@ async function main(): Promise<void> {
   // 启动后聊天区永远空白（此前只靠切 session 才回放）。
   await activateSession(currentId);
 
-  /** Make `id` the active session: disconnect old SSE, restore its
-   * archived chat history, refresh role chrome, subscribe new SSE. */
+  /** Make `id` the active session: disconnect old SSE, subscribe the new
+   * one, then restore its archived chat history and refresh role chrome.
+   *
+   * 顺序是「**先订阅**、再拉历史」，不能反：任务看板的「拆分子任务」/
+   * 「派发」在 HTTP 响应之前就已经把 workflow 跑起来了，实测
+   * WorkflowStarted / WorkflowStep / DelegateStarted / RoleStarted 全部
+   * 落在 session 创建后 ~2ms 内。事件 broadcast 没有回放，先拉历史再
+   * 订阅的话，落在「快照之后、订阅之前」的事件永久丢失 —— 主对话在
+   * subagent 跑的几分钟里一片空白，刷新才靠 history 显出「执行中」
+   * （实测实录）。服务端 events_sse 早就写着同一条教训：
+   * 「先订阅再取挂起弹框：反序会漏掉这两步之间新发出的弹框」。 */
   async function activateSession(id: string, opts?: { created?: boolean }): Promise<void> {
     sseDisconnector();
     switchSession(id);
     persistSessionId(id);
+    // 切 session 立即清屏：旧 session 的内容不能与新 session 的 live
+    // 事件混排。（拉历史成功后 replayHistoryAligned 还会再清一次，
+    // 幂等。）
     chat.clear();
-    const history = await getSessionHistory(id).catch(() => []);
-    chat.replayEvents(history);
+    openSse();
+    const replayed = await replayHistoryAligned(id);
     const info = await getSession();
     chat.refreshRoles(info.available_roles, info.role);
     chat.setRoleSelected(info.role);
-    openSse();
     // 挂起弹框补齐：openSse 建连时服务端会补发一遍，这里再显式拉一次
     // 兜底（建连是异步的、且 Tauri 等别的 transport 未必有 replay 前缀）。
     // 重复的按 choice_id/plan_id 收敛，不会渲染两张卡。
@@ -479,8 +530,8 @@ async function main(): Promise<void> {
     await refreshSessionSelect(sessionSelect, id);
     if (opts?.created) {
       chat.setFooter(`new session ${id.slice(0, 12)}… · ${info.role}`);
-    } else {
-      const restored = history.length > 0 ? ` · restored ${history.length} events` : "";
+    } else if (replayed !== null) {
+      const restored = replayed > 0 ? ` · restored ${replayed} events` : "";
       chat.setFooter(`switched · ${info.role} · ${id.slice(0, 12)}…${restored}`);
     }
   }

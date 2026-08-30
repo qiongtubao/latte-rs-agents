@@ -140,7 +140,7 @@ export class HttpSseTransport implements ChatTransport {
     connect();
     // 看门狗：超过 60s 没有任何事件（含 ping）说明连接半开——机器
     // 休眠/网络挂起时 EventSource 不报错也没数据，UI 会永久停在旧
-    // 状态（jemalloc 现场实锤）。只能主动断开重建。
+    // 状态（现场实锤）。只能主动断开重建。
     const watchdog = setInterval(() => {
       if (closed || !es) return;
       if (Date.now() - lastEventAt > 60_000) {

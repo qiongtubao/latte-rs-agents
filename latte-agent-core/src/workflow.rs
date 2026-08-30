@@ -69,22 +69,176 @@ pub struct OutputContract {
     /// 产出最少字符数（防"一句话敷衍"）。
     #[serde(default)]
     pub min_chars: Option<usize>,
+    /// 产出最多字符数。用于「本步产出必须是一个短标识」这类形状约束——
+    /// learn_loop 的 plan 步产出直接被下游当路径片段用
+    /// （`.latte/learn/{{plan_out}}/plan.json`），一旦模型在 slug 前后
+    /// 多写一句话，下游拼出来的就是一条不存在的路径。靠 prompt 说
+    /// "不要包含其他内容"拦不住，这里给它一个机械上限。
+    #[serde(default)]
+    pub max_chars: Option<usize>,
     /// 禁止出现的子串（占位符等），命中即不合格。
     #[serde(default)]
     pub forbid: Vec<String>,
     /// 必须全部出现的子串。
     #[serde(default)]
     pub require: Vec<String>,
+    /// 必须**至少出现一个**的子串（OR 语义）。`require` 是 AND，表达
+    /// 不了「二选一必须选一个」——learn_loop 的 quiz 步末行只能是
+    /// `STATUS_ALL_DONE` 或 `STATUS_CONTINUE`，两者都不写时循环控制就
+    /// 失去依据（引擎按"不含 loop_until"判返工，等于把"讲完了"误当成
+    /// "还没讲完"）。空 = 不校验。
+    #[serde(default)]
+    pub require_any: Vec<String>,
+    /// 产出**最后一个非空行**必须以其中之一开头（OR 语义）。空 = 不校验。
+    ///
+    /// 为什么单独查末行而不是用 `require`/`require_any` 的子串检查：
+    /// 下游步骤是按「末行」取值的（quiz 从 teach 产出的末行取
+    /// `TEACH_DONE <id>` 决定考哪个知识点），而子串检查只要正文里任何
+    /// 位置出现过就算过——模型把标记写在中间、末行是一句总结时，契约
+    /// 通过而下游解析失败，表现为"讲了 k1 却考 k2"。
+    #[serde(default)]
+    pub last_line_prefix_any: Vec<String>,
 }
 
-/// 校验产出是否满足契约。按 min_chars → forbid → require 顺序检查，
-/// 第一个违规即返回中文原因（措辞可直接作为给模型的验收批注）。
-/// 空契约（全默认）恒 Ok。
+/// 校验本步是否真的调用过 `required` 里的工具。
+///
+/// `summary` 是 runner 收集的工具摘要，每行形如 `"{name} {args} → {result}"`
+/// （见 `AgentRunner::last_turn_tool_summaries`），取首个空白分隔 token 作为
+/// 工具名，并按短名（去 namespace 前缀）比较。
+///
+/// 与 [`check_output_contract`] 的分工：那个查模型**说了什么**，这个查它
+/// **做了什么**。模型能把没做的事说得像做过（learn_loop quiz 编造判分结果的
+/// 实测事故），所以凡是"必须真的执行某个动作"的步骤都该用这条。
+fn check_required_tools(required: &[String], summary: &str) -> Result<(), String> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let called = called_tool_names(summary);
+    let missing: Vec<&str> = required
+        .iter()
+        .map(|r| short_tool_name(r))
+        .filter(|r| !called.contains(r))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "本步要求实际调用工具 [{}]，但本轮没有调用（实际调用了 [{}]）。\
+             不要只在正文里描述结果——必须真的把工具调起来。",
+            missing.join(", "),
+            if called.is_empty() { "无".to_string() } else { called.join(", ") },
+        ))
+    }
+}
+
+/// 工具短名：去掉 `namespace.` 前缀。
+fn short_tool_name(n: &str) -> &str {
+    n.rsplit_once('.').map(|(_, s)| s).unwrap_or(n)
+}
+
+/// 从 runner 的工具摘要里取出实际调用过的工具短名（按调用顺序，含重复）。
+///
+/// 跳过占位行：一次工具都没调时 runner 给的是 `"[本 step 工具调用数: 0]"`，
+/// 按空白切会得到 `[本` 这种伪工具名，混进"实际调用了"清单里既误导人、
+/// 又可能让某个叫 `[本` 的必需工具意外通过（单测抓到过这个）。真实摘要行
+/// 永远以工具名开头。
+fn called_tool_names(summary: &str) -> Vec<&str> {
+    summary
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('['))
+        .filter_map(|s| s.split_whitespace().next())
+        .map(short_tool_name)
+        .collect()
+}
+
+/// 校验本步是否**至少调用过一个** `any_of` 里的工具（OR 语义）。
+///
+/// 与 [`check_required_tools`]（AND）的分工：有些"动作"有多条合法实现
+/// 路径，AND 会把它们全变成必须。learn_loop 的 plan 步要求"取证不可
+/// 跳过"，而取证既可以 `read` 也可以 `code_graph` 也可以 `search`，
+/// 写成 `require_tools` 就等于逼它三个都调一遍。
+///
+/// 为什么这条必须由引擎查：plan 步实测事故——它一次源码都没读
+/// （全部工具调用就是 2 次 `write`），5 道题里 3 道的"正确答案"是幻觉
+/// （不存在的 `init` 回调、`MALLOCX_FAIL_NOWAIT`、写错文件的版本宏）。
+/// 学员照这种题去理解代码，学到的是假知识——比不学更糟。
+fn check_required_tools_any(any_of: &[String], summary: &str) -> Result<(), String> {
+    if any_of.is_empty() {
+        return Ok(());
+    }
+    let called = called_tool_names(summary);
+    let wanted: Vec<&str> = any_of.iter().map(|r| short_tool_name(r)).collect();
+    if wanted.iter().any(|w| called.contains(w)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "本步要求至少调用 [{}] 之中的一个工具，但本轮一个都没调用\
+             （实际调用了 [{}]）。产出必须建立在真实取证之上，不能凭记忆写。",
+            wanted.join(" / "),
+            if called.is_empty() { "无".to_string() } else { called.join(", ") },
+        ))
+    }
+}
+
+/// 校验单个工具在本步的调用次数上限（`工具短名 → 最大次数`）。
+///
+/// 为什么需要它：`require_tools` 只能查"有没有调过"，查不出"调了几次"。
+/// learn_loop 的 quiz 步语义是「恰好弹一次窗」——多弹一次就是同一个知识点
+/// 连考两遍、账本按最后一次覆盖，学员的答题记录被悄悄丢掉一条；上限设 0
+/// 则可表达"本步禁止调用该工具"（比从 `tools` 白名单里摘掉更精确：白名单
+/// 是"拿不到工具"，上限 0 是"拿得到但不许用"，批注也能说清为什么）。
+fn check_tool_call_limits(
+    limits: &std::collections::BTreeMap<String, usize>,
+    summary: &str,
+) -> Result<(), String> {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    let called = called_tool_names(summary);
+    for (name, max) in limits {
+        let short = short_tool_name(name);
+        let n = called.iter().filter(|c| **c == short).count();
+        if n > *max {
+            return Err(if *max == 0 {
+                format!("本步禁止调用工具 `{short}`，但本轮调用了 {n} 次。")
+            } else {
+                format!(
+                    "本步允许调用工具 `{short}` 最多 {max} 次，但本轮调用了 {n} 次。\
+                     多余的调用会让本步的记账依据变得不唯一，请只保留必要的那一次。"
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 本步的**工具使用行为**总校验：必调（AND）→ 至少调一个（OR）→ 次数上限。
+///
+/// 三条都查"它做了什么"，与 [`check_output_contract`]（查"它说了什么"）
+/// 互补。顺序按批注的指导性排：完全没调 > 没取证 > 调多了。
+fn check_tool_usage(step: &WorkflowStepDef, summary: &str) -> Result<(), String> {
+    check_required_tools(&step.require_tools, summary)?;
+    check_required_tools_any(&step.require_tools_any, summary)?;
+    check_tool_call_limits(&step.tool_call_limits, summary)
+}
+
+/// 校验产出是否满足契约。按 min_chars → max_chars → forbid → require →
+/// require_any → last_line_prefix_any 顺序检查，第一个违规即返回中文原因
+/// （措辞可直接作为给模型的验收批注）。空契约（全默认）恒 Ok。
 fn check_output_contract(contract: &OutputContract, output: &str) -> Result<(), String> {
     if let Some(min) = contract.min_chars {
         let n = output.chars().count();
         if n < min {
             return Err(format!("产出过短：{n} 字符，少于要求的 {min} 字符"));
+        }
+    }
+    if let Some(max) = contract.max_chars {
+        let n = output.chars().count();
+        if n > max {
+            return Err(format!(
+                "产出过长：{n} 字符，超过要求的 {max} 字符上限。\
+                 本步的产出会被下游直接取用，只输出要求的那部分内容，不要加说明或前言。"
+            ));
         }
     }
     for pat in &contract.forbid {
@@ -95,6 +249,34 @@ fn check_output_contract(contract: &OutputContract, output: &str) -> Result<(), 
     for pat in &contract.require {
         if !output.contains(pat.as_str()) {
             return Err(format!("产出缺少必须出现的内容「{pat}」"));
+        }
+    }
+    if !contract.require_any.is_empty()
+        && !contract.require_any.iter().any(|p| output.contains(p.as_str()))
+    {
+        return Err(format!(
+            "产出必须包含 [{}] 之中的至少一个，但一个都没出现。",
+            contract.require_any.join(" / ")
+        ));
+    }
+    if !contract.last_line_prefix_any.is_empty() {
+        let last = output
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        if !contract
+            .last_line_prefix_any
+            .iter()
+            .any(|p| last.starts_with(p.as_str()))
+        {
+            return Err(format!(
+                "产出的最后一行必须以 [{}] 之中的一个开头，实际末行是「{}」。\
+                 下游步骤按末行取值，写在正文中间不算。",
+                contract.last_line_prefix_any.join(" / "),
+                output_excerpt(last, 80),
+            ));
         }
     }
     Ok(())
@@ -113,8 +295,41 @@ fn output_excerpt(output: &str, max_chars: usize) -> String {
     }
 }
 
+/// `require_plan_submit` 的判据：plan 工具提交成功即把私有 `PlanStage`
+/// 推到 `PendingApproval`；机械校验（paths 存在性 / paths 重叠）整单
+/// 拒绝时不改状态，停在 `Normal`。
+fn plan_submitted(stage: Option<&crate::controller::SharedPlanStage>) -> bool {
+    stage
+        .map(|s| {
+            matches!(
+                &*s.read(),
+                crate::controller::PlanStage::PendingApproval { .. }
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// 未成功提交 plan 时拼进重试 prompt 的批注。
+///
+/// 必须把**上次产出整段**带过去：每次尝试都是全新 subagent（无跨次
+/// 记忆），plan 工具的报错只存在于上一次的对话里，不带过去模型就只知道
+/// 「你失败了」、不知道失败在哪个 path 上。
+fn plan_submit_retry_annotation(prev_output: &str) -> String {
+    format!(
+        "上次**没有成功提交 plan 提案** —— plan 工具没有产生待批准清单，\
+         任务一个都没进看板，这一步等于白跑。\
+         最常见的原因是 plan 的机械校验（paths 第一级目录不存在 / paths 范围重叠）\
+         整单拒绝后，改口输出了一份文字报告代替提交。\
+         请按下面这份上次产出里的工具报错修正 **paths 与 labels**（重叠就删掉下游任务 paths\
+         里的上游交付物路径、改在验收标准里文字引用；或给纯阅读 / 纯消费型任务的 labels\
+         追加「只读」），然后**重新调用一次 plan 工具**提交完整清单。\
+         禁止用文字报告、方案表、请示代替提交。\n\n--- 上次产出 ---\n{}",
+        output_excerpt(prev_output, 2000)
+    )
+}
+
 /// 契约重试耗尽后的语义兜底裁决。纯字符串契约分不清「格式不合格
-/// 的坏产出」和「语义正确但没写约定标记的好产出」（jemalloc 实锤：
+/// 的坏产出」和「语义正确但没写约定标记的好产出」（实测实锤：
 /// gate 的合法 REJECT 缺「VERDICT: PASS」字样，被契约当成格式错误
 /// 判死）。耗尽前过一道 advisor 返回审查：
 /// - verdict ok → 带批注放行（下游与人都能看到契约被语义覆盖）；
@@ -156,6 +371,76 @@ async fn contract_last_resort_review(
         "{reviewed}\n\n⚠️ [监察审查] 本产出未通过产出契约（{contract_reason}），\
          经 advisor 语义审查判定内容合格后放行"
     ))
+}
+
+/// 返工环耗尽前的最后一道 advisor 语义复核。
+///
+/// 机械判据（`loop_until` 子串匹配）分不清两件事：**草案真有阻断缺陷**，
+/// 和**评审在挑不影响下游的小瑕疵**。而耗尽即判死会把整条流水线连同前面
+/// 几十轮成果一起作废——实测实录：`task_refine` 的 gate 两轮
+/// `VERDICT: REVISE`（理由是行号偏差）撞满 `max_iterations=2` → workflow
+/// Failed → `submit` 步永不执行 → `plan` 工具从不被调用 → 「添加子任务」
+/// 弹窗彻底消失，用户只看到「没反应」。
+///
+/// 因此耗尽前把**被返工的那份产出**（`loop_back_to` 目标 step 的 output）
+/// 连同**尚未消化的评审意见**交给 advisor 做语义审查：
+/// - `Ok` → 判定实质合格，放行进入下游（带 Status 说明，可追溯）；
+/// - 其他裁决 / 无 advisor 引擎 / 拿不到产出 → `false`，维持原失败。
+///
+/// 与「无条件降级放行」的关键区别：**必须 advisor 主动判定合格**才放行。
+/// 真有实质缺陷时它会给出非 Ok 裁决，流程照旧失败——不是放水。
+/// advisor 未启用时行为与历史完全一致（直接失败）。
+async fn loop_exhausted_last_resort_review(
+    review_engine: &Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
+    event_tx: &broadcast::Sender<ChatEvent>,
+    main_topic: &str,
+    step_id: &str,
+    cond: &str,
+    iterations: usize,
+    artifact: &str,
+    objection: &str,
+) -> bool {
+    let Some(engine) = review_engine.as_ref() else {
+        return false;
+    };
+    if artifact.trim().is_empty() {
+        return false;
+    }
+    let task = format!(
+        "评审返工环已迭代 {iterations} 次仍未满足「{cond}」，即将判整条流程失败。\
+         请对下面这份产出做最后一次语义复核，判断它**是否实质合格、可以进入下游**。\n\n\
+         【尚未消化的评审意见】\n{objection}\n\n\
+         判定标准：\n\
+         - 合格（ok）：剩余意见都属于不影响下游使用的小瑕疵——措辞、格式、\
+           行号/引用偏差、命名风格等；产出的主体结论与结构是可用的。\n\
+         - 不合格：存在实质缺陷——内容事实错误、关键目标遗漏、自相矛盾、\
+           或下游据此无法执行。\n\
+         只做这一个判断，不要重写产出。"
+    );
+    let (_reviewed, verdict) = crate::controller::gate_delegate_return(
+        engine,
+        event_tx,
+        main_topic,
+        "advisor",
+        "", // 此处不注入角色职责全文，审查以「产出 + 未消化意见」为基准
+        &task,
+        artifact.to_string(),
+        "", // 无工具调用数据
+    )
+    .await;
+    let Some(v) = verdict else {
+        return false;
+    };
+    if v.verdict != crate::advisor_monitor::Verdict::Ok {
+        return false;
+    }
+    let _ = event_tx.send(ChatEvent::Status {
+        message: format!(
+            "⚠️ step '{step_id}' 返工环迭代 {iterations} 次未满足「{cond}」，\
+             经 advisor 语义复核判定产出实质合格，放行进入下游"
+        ),
+    });
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,6 +491,49 @@ pub struct WorkflowStepDef {
     /// 作为重试上限），耗尽则 step 失败。默认空契约 = 不校验。
     #[serde(default)]
     pub output_contract: OutputContract,
+    /// 本步**必须实际调用过**的工具（短名）。没调用即不合格，走
+    /// `output_contract` 同一条重试链（复用 `max_retries`）。
+    ///
+    /// 为什么需要它而不是把要求写进 prompt 或 `output_contract`：
+    /// 两者都只能检查模型**说了什么**，而模型可以把没做的事说得像做过。
+    /// learn_loop 的 quiz 步实测事故——它没调 `ask`，直接拿上一轮 prompt
+    /// 里出现过的旧答案编了一段「判分结果：答错 / 你选的是：split」，
+    /// `output_contract.require` 的子串检查完全满足，学员却连题都没看到，
+    /// 而账本被写成了"答错两次"。只有核对**真实的工具调用记录**才拦得住。
+    #[serde(default)]
+    pub require_tools: Vec<String>,
+    /// 本步必须**至少调用过其中一个**工具（OR 语义，短名）。同一条重试链。
+    ///
+    /// 用于"这个动作有多条合法实现路径"的场合：`require_tools` 是 AND，
+    /// 写上 `["read","code_graph","search"]` 等于逼模型三个都调一遍；而
+    /// 真实要求只是"必须取证"。见 [`check_required_tools_any`] 里记录的
+    /// plan 步零取证事故。
+    #[serde(default)]
+    pub require_tools_any: Vec<String>,
+    /// 本步单个工具的调用次数上限：`工具短名 → 最大次数`。同一条重试链。
+    ///
+    /// `require_tools` 只能查"有没有调过"，查不出"调了几次"。需要表达
+    /// 「恰好一次」时两者搭配使用（`require_tools = ["ask"]` +
+    /// `tool_call_limits = { ask = 1 }`）——learn_loop 的 quiz 步就是这个
+    /// 语义：多弹一次窗就是同一个知识点连考两遍、账本按最后一次覆盖，
+    /// 学员的答题记录被悄悄丢掉一条。上限写 0 = 本步禁止调用该工具。
+    #[serde(default)]
+    pub tool_call_limits: std::collections::BTreeMap<String, usize>,
+    /// 本 step 必须**成功提交一份 plan 提案**才算合格（与
+    /// `output_contract` 同一条重试链，复用 `max_retries`）。
+    ///
+    /// 为什么需要它：plan 工具的机械校验（paths 存在性 / paths 重叠）
+    /// 整单拒绝后，模型往往改口输出一份「已被拒绝，请指示走 A/B/C」的
+    /// 回退报告——这份正文字数、格式全部合格，纯字符串契约看不出问题，
+    /// 于是 step 通过、workflow 报 `ok`，而**零任务入库**（实测
+    /// 某次实测会话：14 处 paths 重叠被拒，六个子任务
+    /// 一个都没进看板，会话看起来正常完成）。
+    ///
+    /// 判据取 plan 工具的私有 `PlanStage`：提交成功即置
+    /// `PendingApproval`，机械校验失败则停在 `Normal`。不合格时把工具
+    /// 的原始报错拼进重试 prompt，让模型知道该修什么。
+    #[serde(default)]
+    pub require_plan_submit: bool,
     /// 跨 step 循环条件：本 step 完成后检查产出是否包含
     /// 该子串，包含 = 通过继续；不包含则跳回 `loop_back_to` 指定的 step
     /// 重做（缺省 = 自己），并把本 step 产出作为"上轮审查反馈"批注预置
@@ -230,7 +558,7 @@ pub struct WorkflowStepDef {
     /// 词表的 gate（implementation_plan、design_and_plan）配了
     /// `loop_until`/`loop_back_to` 也永远走不到返工分支——注释与配置
     /// 写着「REJECT → 跳回重做」，实际是评审如实 REJECT 就判死整条
-    /// 流水线（jemalloc 实锤：唯一跑到 gate 的那次运行，44 分钟零产出）。
+    /// 流水线（实测实锤：唯一跑到 gate 的那次运行，44 分钟零产出）。
     /// 熔断词表改为按 step 显式声明，引擎不再私藏 magic string。
     #[serde(default)]
     pub loop_abort_on: Option<String>,
@@ -270,7 +598,7 @@ pub struct WorkflowStepDef {
     /// `output_key`，子 workflow 其余 step 的产出全被丢掉——引擎其实
     /// 已经把它们算好了（`run_workflow_inner` 返回 `keyed`），只是没有
     /// 出口。这就是「信息漏斗」：证据在子流程里，下游评审只拿到一份
-    /// 被逐层压缩的结论，想核对也无从核对（jemalloc 实锤：双评审共
+    /// 被逐层压缩的结论，想核对也无从核对（实测实锤：双评审共
     /// 5 处实测行号错误 —— 它们只看到 proposal，survey 原文里的真实
     /// 文件与行号根本没往下传）。
     ///
@@ -379,6 +707,39 @@ impl WorkflowDef {
                     ));
                 }
             }
+            // 工具行为字段的形状校验。空工具名会被 `short_tool_name`
+            // 归一成空串、永远匹配不上任何调用，于是 `require_tools_any`
+            // 恒失败、`tool_call_limits` 恒通过——两种都是静默失效，
+            // 与"写了却不生效"是同一类事故。直接拒。
+            for t in &step.require_tools_any {
+                if t.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': require_tools_any 里的工具名不能为空",
+                        step.id
+                    ));
+                }
+            }
+            for name in step.tool_call_limits.keys() {
+                if name.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': tool_call_limits 的工具名不能为空",
+                        step.id
+                    ));
+                }
+            }
+            // min/max 反了的话没有任何产出能通过，且报错会指向 min（先查
+            // min），排查方向完全错。配置期就拦掉。
+            if let (Some(min), Some(max)) =
+                (step.output_contract.min_chars, step.output_contract.max_chars)
+            {
+                if min > max {
+                    return Err(format!(
+                        "step '{}': output_contract.min_chars ({min}) 大于 max_chars ({max})，\
+                         没有任何产出能同时满足",
+                        step.id
+                    ));
+                }
+            }
             // export：与 output_from 同源（都只对嵌套 step 有意义），
             // 父级变量名沿用 output_key 的命名规则。
             if !step.export.is_empty() && step.workflow.is_none() {
@@ -452,7 +813,7 @@ impl WorkflowDef {
                 }
             }
             if step.loop_until.is_some() && uses_dag {
-                // DAG 返工环（jemalloc 实锤：gate 的合法 REJECT 被契约
+                // DAG 返工环（实测实锤：gate 的合法 REJECT 被契约
                 // 判死，50 分钟流水线零产出）。约束：跳回目标必须在
                 // 严格更早的 wave——跳同 wave / 未来 wave 无法表达
                 // 「重跑上游再流到本 step」的语义。自环（loop_back_to
@@ -584,6 +945,109 @@ fn compute_waves(steps: &[WorkflowStepDef]) -> Result<Vec<Vec<usize>>, String> {
         waves.push(wave);
     }
     Ok(waves)
+}
+
+/// 调研类流水线：产出只是**背景/事实/决策要点**，本身不是可交付物。
+///
+/// 之所以要单独识别它们：实测会话里 manager 连着跑了两轮 `explore`
+/// 又追加两个「通读 / 解剖」delegate，四轮全在调研，用户点名要的
+/// 任务清单一个都没产出（`.latte/tasks/board.json` 里 0 任务）。
+///
+/// **注意这里不设轮次上限。** 轮数是错的度量：大仓库分模块探三轮是
+/// 健康的，原地把同一件事再探一遍才是病态的——两者轮数可能相同。
+/// 按轮数刹车就是 `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`
+/// （已移除）那个错误的翻版：只看计数、分不清"任务本身重"与"在空转"。
+/// 判据只有一条二值事实：**用户点名的交付物有没有被产出**
+/// （见 [`named_deliverables`]）。
+///
+/// `learn` / `write_doc` / `update_docs` **不在**此列：它们会落盘真实
+/// 产物（`docs/learn/<slug>.md` 等），对"讲讲原理"这类诉求本身就是
+/// 交付物。
+pub fn is_research_workflow(name: &str) -> bool {
+    matches!(name, "explore" | "design_brainstorm")
+}
+
+/// 规划类流水线：产出是可导入任务看板的任务清单（交付物）。
+pub fn is_planning_workflow(name: &str) -> bool {
+    matches!(
+        name,
+        "implementation_plan" | "task_refine" | "design_and_plan" | "feature_design"
+    )
+}
+
+/// 交付物表：`(标签, 诉求里的关键词, 产出它该跑的流程)`。
+///
+/// 单一真源——`named_deliverables` 与 `deliverable_route` 都读它，
+/// 避免"识别出了交付物却指错流程"这种两处不同步的错。
+const DELIVERABLES: [(&str, &[&str], &str); 4] = [
+    (
+        "任务清单",
+        &["拆分任务", "拆任务", "任务清单", "任务列表", "看板", "排任务"],
+        "implementation_plan（拿到清单后用 plan 提交给用户勾选导入看板）",
+    ),
+    ("计划", &["计划", "规划", "路线图", "roadmap"], "implementation_plan"),
+    (
+        "教程 / 学习材料",
+        &["教程", "讲讲", "学习", "入门", "科普"],
+        "learn（会落盘 docs/learn/<slug>.md）",
+    ),
+    ("文档", &["文档", "README", "写一篇", "报告"], "write_doc"),
+];
+
+/// 从用户诉求里识别**点名的交付物**。
+///
+/// 只匹配用户明确说出来的产出物名词。诉求里没有任何交付物名词时返回
+/// 空——那种情况下"只调研不产出"是完全正常的（「这块代码怎么回事」的
+/// 答案就是调研本身），不该提醒、不该报警。
+///
+/// 这里刻意**没有**相似度阈值一类的可调参数。曾试过用字符 bigram
+/// 相似度检测「把上一轮 topic 换几个词再探一遍」，实测在真实样本上
+/// 分不开：那两次重复的 explore（jaccard 0.179 / containment 0.429）
+/// 与一对确实不同的 topic（0.128 / 0.490）区间交叠，任何阈值都是
+/// 拍脑袋，且会误杀正当的分模块深入。判据因此收敛成一个二值事实：
+/// **用户点名的交付物有没有被产出**，不需要任何数字。
+pub fn named_deliverables(user_text: &str) -> Vec<&'static str> {
+    DELIVERABLES
+        .iter()
+        .filter(|(_, keys, _)| keys.iter().any(|k| user_text.contains(k)))
+        .map(|(label, _, _)| *label)
+        .collect()
+}
+
+/// 交付物 → 该跑哪个流程。未知标签回退到 `write_doc`（只可能来自
+/// 调用方手写标签，正常路径的标签都来自 [`DELIVERABLES`]）。
+fn deliverable_route(label: &str) -> &'static str {
+    DELIVERABLES
+        .iter()
+        .find(|(l, _, _)| *l == label)
+        .map(|(_, _, route)| *route)
+        .unwrap_or("write_doc")
+}
+
+/// 调研类流水线跑完、且用户诉求里点名过交付物时，追加给 manager 的
+/// 提醒。
+///
+/// **不限制任何东西**：不数轮次、不设阈值、不阻断。它只做一件事——
+/// 把「用户还欠着什么」和「该跑哪个流程」摆在 manager 眼前。想接着
+/// 分模块深入完全可以，只是别忘了欠着的东西。
+///
+/// 诉求里没点名交付物时调用方不会走到这里（`named` 为空），所以
+/// 「这块代码怎么回事」这类纯咨询不会收到任何提醒。
+pub fn deliverable_reminder(named: &[&str]) -> String {
+    let routes: Vec<String> = named
+        .iter()
+        .map(|d| format!("  - **{d}** → 跑 `{}`", deliverable_route(d)))
+        .collect();
+    format!(
+        "\n\n---\n\
+         📌 **交付物提醒（系统注入，非专家结论）**：本轮是**调研**，产出是背景结论，不是交付物。\
+         用户在诉求里点名要的东西还欠着：\n{}\n\n\
+         这不限制你继续调研——分模块深入是正当的。但每再探一轮，请先说得出\
+         **这一轮补的是哪一个具体问题**；说不出来（只是「再摸一遍结构」）就说明已有结论\
+         足够动手，该转去产出上面欠着的东西了。\n\
+         注意：把「通读 XXX 产出解剖报告」派成 delegate，与再跑一轮调研流程是同一件事。",
+        routes.join("\n")
+    )
 }
 
 fn workflows_dirs(project_cwd: &Path) -> Vec<PathBuf> {
@@ -776,7 +1240,7 @@ pub struct WorkflowRunContext {
     /// 为什么必须有：阻塞 `ask` 的落盘记录要指向**能把整条流水线带起来**
     /// 的那个 run。此前它记的是"发出提问的那个 run"，而嵌套场景下那是
     /// 子 run —— 回答后只 resume 子 run，父流水线既不知道自己在等谁、
-    /// 也没有任何机制被唤醒，于是永久卡死（jemalloc 现场：
+    /// 也没有任何机制被唤醒，于是永久卡死（实测现场：
     /// `design_and_plan` → `req_review` → `requirements_review` 的
     /// `decide` 步骤弹出选择题，答案无处可去，顶层再也没动过）。
     ///
@@ -1493,7 +1957,7 @@ async fn run_workflow_inner(
     // 曾经这里按「分派单元数 × 每单元 420s」推算一个墙钟上限，跑满即
     // 中止整条流程。它的意图是防「流水线真卡死没人叫停」，但用错了
     // 信号维度：只看总时长，无法区分「后端卡死」和「任务本身就重」，
-    // 于是持续在吐 token、完全健康的重任务（jemalloc explore 单步产
+    // 于是持续在吐 token、完全健康的重任务（explore 单步产
     // 40KB 报告）被反复误杀，还诱导 resume 二次空等。
     //
     // 真正的「防挂死」由更精准的下层机制承担，无需这一层冗余墙钟：
@@ -1679,6 +2143,10 @@ async fn build_role_runner(
     // 用户回答台账：装进阻塞 ask，收到答案即落盘、重复提问直接回放。
     // None = 不记账（独立测试）。
     answer_log: Option<Arc<AnswerLog>>,
+    // plan 工具的 PlanStage 句柄：`Some` 时用调用方给的（调用方据此判断
+    // plan 是否提交成功，见 `WorkflowStepDef::require_plan_submit`），
+    // `None` 时自建私有句柄。
+    plan_stage: Option<crate::controller::SharedPlanStage>,
 ) -> Result<(AgentRunner, String), String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
@@ -1758,11 +2226,16 @@ async fn build_role_runner(
         }
         // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
         // （与 controller::build_runner 对齐）。workflow 引擎不走
-        // delegate 工具，阶段门无人消费——给一个私有句柄即可（plan
-        // 提案仍会广播 PlanProposed 事件，只是不驱动 delegate 门禁）。
+        // delegate 工具，阶段门无人消费——调用方没给句柄时给一个私有的
+        // 即可（plan 提案仍会广播 PlanProposed 事件，只是不驱动
+        // delegate 门禁）。调用方给了句柄（require_plan_submit 的 step）
+        // 则用它，让引擎能在分派结束后读到提交结果。
         if role.allowed_tools.iter().any(|t| t == "plan") {
-            let plan_stage: crate::controller::SharedPlanStage =
-                Arc::new(parking_lot::RwLock::new(crate::controller::PlanStage::Normal));
+            let plan_stage: crate::controller::SharedPlanStage = plan_stage
+                .clone()
+                .unwrap_or_else(|| {
+                    Arc::new(parking_lot::RwLock::new(crate::controller::PlanStage::Normal))
+                });
             // session_id 取自 answer_log（run 的恢复身份三元组之一）：
             // 有它才能把 PlanProposed 快照落盘，进程重启后「添加任务」
             // 弹窗仍可补发。CLI / 独立测试的 run 没有，落空串 = 不落盘。
@@ -1784,11 +2257,11 @@ async fn build_role_runner(
         // ask / task_report：与 controller::build_runner 对齐——manager
         // 在 workflow step 里也要能向用户抛选择题（ask 是其 prompt 指定
         // 的唯一提问通道）和回报任务看板；缺失时模型调用得到
-        // Tool not found（jemalloc 日志实锤：manager 在 decide 步调
+        // Tool not found（日志实锤：manager 在 decide 步调
         // ask 失败，选择框永远没弹出）。
         // 注意：子代理没有"下一轮"，ask 必须是阻塞模式——挂起等用户
         // 在弹框回答，答案经 /api/chat/choice-answer 直达本工具结果
-        // （jemalloc 日志实锤：fire-and-forget 的"结束本轮等回答"语义
+        // （日志实锤：fire-and-forget 的"结束本轮等回答"语义
         // 让 decide 步产出变成「等待您回答」垃圾文本流进下游）。
         if role.allowed_tools.iter().any(|t| t == "ask") {
             let blocking = crate::controller::AskBlocking {
@@ -1882,6 +2355,11 @@ struct SpeakerDispatch {
     /// 用户回答台账：阻塞 `ask` 收到答案即落盘，同一问题重试/resume
     /// 时直接回放，不再让用户重答一遍。
     answer_log: Arc<AnswerLog>,
+    /// plan 工具的 PlanStage 句柄。`Some` 时由**引擎**持有（而不是
+    /// `build_role_runner` 自建私有句柄），这样本次分派结束后引擎能读到
+    /// 「plan 到底提交成功了没有」——`WorkflowStepDef::require_plan_submit`
+    /// 的判据。`None` = 引擎不关心，runner 自建私有句柄（现状）。
+    plan_stage: Option<crate::controller::SharedPlanStage>,
 }
 
 impl SpeakerDispatch {
@@ -1919,6 +2397,9 @@ impl SpeakerDispatch {
             staging: ctx.staging.clone(),
             step_tools,
             answer_log,
+            // 默认不接管；需要 require_plan_submit 的 step 由引擎在
+            // 构造后写入自己的句柄。
+            plan_stage: None,
         }
     }
 }
@@ -1945,7 +2426,7 @@ impl SpeakerDispatch {
 /// （告知这一步是截断产出），`adopted` 是带截断标注、写进 vars 穿给下游
 /// 的正文。返回 `None` 表示 partial 无实质内容，按失败处理。
 ///
-/// 为什么必须降级而不是判死：「撞上限」≠「零产出」。jemalloc 实锤：
+/// 为什么必须降级而不是判死：「撞上限」≠「零产出」。实测实锤：
 /// estimate 步跑了 105 轮、131 次工具调用，最后一条回复是完整的验证
 /// 结论，却因为 step 判失败 → 嵌套 workflow 失败 → 父 workflow 失败，
 /// 3 小时成果全丢。
@@ -1982,7 +2463,19 @@ fn degrade_partial_on_break(
     Some((notice, adopted))
 }
 
-async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
+/// [`run_step_speaker`] 的产出：模型正文 + 本轮**真实发生过**的工具调用摘要。
+///
+/// 带出 `tools` 是为了让引擎能校验 `require_tools`——只看正文无法区分
+/// "调用了 ask" 和 "编了一段像调用过 ask 的话"。
+struct SpeakerOut {
+    response: String,
+    /// runner 收集的工具摘要，每行形如 `"{name} {args} → {result}"`
+    /// （见 `AgentRunner::take_last_turn_tool_summary`）。一次工具都没调时
+    /// 是 `"[本 step 工具调用数: 0]"` 这样的占位串，不含任何工具名。
+    tools: String,
+}
+
+async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> {
 
     let speaker = inp.speaker.clone();
     // Advisor intervene 暂停门：派发前先等用户拍板（此前 advisor 的
@@ -2035,7 +2528,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
 
     // 2-4. 执行 + advisor 返回审查的重做环：返回被判 intervene/terminate
     //    时带【上轮审查反馈】重派——advisor 的「打回重做」不再只是批注
-    //    （jemalloc 实锤：reviewer 空转被 advisor 抓到、hint 要求重做，
+    //    （实测实锤：reviewer 空转被 advisor 抓到、hint 要求重做，
     //    流水线却照流不误）。上限可配（AdvisorMonitorConfig::
     //    review_settings.return_max_redo，经 engine 注入），默认 1、
     //    硬上限 MAX_RETURN_REDO。
@@ -2046,7 +2539,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         .unwrap_or(crate::advisor_monitor::DEFAULT_RETURN_MAX_REDO);
     let mut prompt_for_turn = inp.prompt.clone();
     let mut redo: u8 = 0;
-    let result: Result<String, StepFail> = loop {
+    let result: Result<SpeakerOut, StepFail> = loop {
         // 2. Fresh runner（每次尝试都是全新 subagent，无跨次记忆）
         //    + sink + gate。
         let (mut runner, role_responsibilities) = match build_role_runner(
@@ -2061,6 +2554,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             inp.staging.clone(),
             &inp.step_tools,
             Some(inp.answer_log.clone()),
+            inp.plan_stage.clone(),
         )
         .await
         {
@@ -2140,7 +2634,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
         // 熔断：wall-clock 超时（对齐 controller delegate；被 500ms
         // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
         // 超时走 StepFail::Failed → 引擎按 max_retries 重试/失败冒泡，
-        // 而不是无限挂起（jemalloc 事故：estimate 步挂 24min）。
+        // 而不是无限挂起（实测事故：estimate 步挂 24min）。
         let timeout_s = crate::controller::specialist_timeout_secs(None);
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
         tokio::pin!(timeout);
@@ -2174,7 +2668,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
                             // 死循环熔断要走降级采纳，不能一律判
                             // StepFail::Failed —— 否则 step 失败 → 嵌套
                             // workflow 失败 → 父 workflow 失败，模型已写好
-                            // 的正文全丢（jemalloc 实锤：estimate 步 105 轮、
+                            // 的正文全丢（实测实锤：estimate 步 105 轮、
                             // 131 次工具调用，最后一条回复是完整结论，整条
                             // design_and_plan 仍被判死，3 小时零产出）。
                             //
@@ -2338,7 +2832,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
             (Ok((response, _tool_count, tool_summary)), Some(engine)) => {
                 // 审查基准是原始任务（inp.prompt），不含重做批注。
                 // 工具调用摘要：让 advisor 的返回审查能看到专家实际执行了
-                // 哪些工具（jemalloc 实锤：interview step 用 ask 收齐答案
+                // 哪些工具（实测实锤：interview step 用 ask 收齐答案
                 // 后输出 user_profile，advisor 看不到 ask 记录→误判伪造）。
                 // 摘要由 runner 收集（take_last_turn_tool_summary），
                 // 含工具名 + 参数 + 结果，不再是裸计数。
@@ -2386,15 +2880,18 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<String, StepFail> {
 {}", inp.prompt, feedback);
                     continue;
                 }
-                break Ok(annotated);
+                break Ok(SpeakerOut { response: annotated, tools: tool_summary });
             }
-            (other, _) => break other.map(|(r, _, _)| r),
+            (other, _) => {
+                break other.map(|(r, _, t)| SpeakerOut { response: r, tools: t })
+            }
         }
     };
 
     // 5. 收尾事件（RoleTurn 由引擎的 WorkflowTurn 承担，不重复发）。
     match &result {
-        Ok(response) => {
+        Ok(out) => {
+            let response = &out.response;
             let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                 role_id: speaker.clone(),
                 detail: format!("ok, {} chars", response.len()),
@@ -2621,7 +3118,17 @@ async fn run_workflow_serial(
                 let mut prompt = full_prompt.clone();
                 let mut attempt: u32 = 0;
                 loop {
-                    let dispatch = SpeakerDispatch::from_ctx(
+                    // require_plan_submit 的 step：每次尝试都用一个新的
+                    // PlanStage，避免上一次尝试的成功状态污染本次判定。
+                    let plan_stage: Option<crate::controller::SharedPlanStage> =
+                        if step.require_plan_submit {
+                            Some(Arc::new(parking_lot::RwLock::new(
+                                crate::controller::PlanStage::Normal,
+                            )))
+                        } else {
+                            None
+                        };
+                    let mut dispatch = SpeakerDispatch::from_ctx(
                         ctx,
                         review_engine.clone(),
                         wf_id,
@@ -2632,8 +3139,9 @@ async fn run_workflow_serial(
                         answer_log.clone(),
                         topic.to_string(),
                     );
-                    let mut response = match run_step_speaker(dispatch).await {
-                        Ok(r) => r,
+                    dispatch.plan_stage = plan_stage.clone();
+                    let (mut response, tools_called) = match run_step_speaker(dispatch).await {
+                        Ok(o) => (o.response, o.tools),
                         Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
                         Err(StepFail::Failed(e)) => {
                             return WfOutcome::Failed(format!(
@@ -2642,11 +3150,58 @@ async fn run_workflow_serial(
                             ))
                         }
                     };
+                    // plan 提交硬校验：**不走 advisor 语义兜底**。
+                    // 「零任务入库」没有语义解释空间——放行只会让
+                    // workflow 继续报 ok（实测
+                    // 实测实录）。
+                    if step.require_plan_submit && !plan_submitted(plan_stage.as_ref()) {
+                        if attempt >= step.max_retries {
+                            return WfOutcome::Failed(format!(
+                                "step '{}' speaker '{}': 本步要求成功提交 plan 提案，\
+                                 重试 {attempt} 次后仍未提交成功（任务未进看板）\
+                                 ；最后一次产出摘要：{}",
+                                step.id,
+                                speaker,
+                                output_excerpt(&response, 1200)
+                            ));
+                        }
+                        attempt += 1;
+                        tracing::warn!(
+                            step = %step.id,
+                            speaker = %speaker,
+                            attempt,
+                            "workflow step did not submit a plan proposal; retrying"
+                        );
+                        let annotation = plan_submit_retry_annotation(&response);
+                        step_transcript.push_str("[验收批注]: 未成功提交 plan 提案，已要求重提\n");
+                        prompt = format!("{full_prompt}\n\n{annotation}");
+                        continue;
+                    }
+                    // 工具使用行为（require_tools / require_tools_any / tool_call_limits）：
+            // 查它**做了什么**（output_contract 只能查它说了什么）。
+                    // 放在 output_contract 之前——「根本没调工具」比「正文缺字样」更根本，
+                    // 批注也更有指导性。
+                    if let Err(reason) = check_tool_usage(step, &tools_called) {
+                        if attempt >= step.max_retries {
+                            return WfOutcome::Failed(format!(
+                                "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                step.id, speaker
+                            ));
+                        }
+                        attempt += 1;
+                        tracing::warn!(
+                            step = %step.id, speaker = %speaker, attempt,
+                            "workflow step skipped a required tool; retrying"
+                        );
+                        step_transcript.push_str("[验收批注]: 未调用必需工具，已要求重做\n");
+                        prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
+                        continue;
+                    }
                     if let Err(reason) = check_output_contract(&step.output_contract, &response) {
                         if attempt >= step.max_retries {
                             // 重试耗尽：判死前过一道 advisor 语义兜底
                             // （字符串契约分不清格式错误与合法但无标记
-                            // 的产出——jemalloc 实锤 gate REJECT 判死）。
+                            // 的产出——实测实锤 gate REJECT 判死）。
                             match contract_last_resort_review(
                                 &review_engine,
                                 &ctx.event_tx,
@@ -2732,6 +3287,33 @@ async fn run_workflow_serial(
                     };
                     let max = step.max_iterations.unwrap_or(3).min(10);
                     if count >= max {
+                        // 判死前最后一道 advisor 语义复核：把「被返工的那份
+                        // 产出」+「未消化的评审意见」交给 advisor，判定实质
+                        // 合格则放行进入下游（见 loop_exhausted_last_resort_review）。
+                        let target_id =
+                            step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
+                        let artifact = wf
+                            .steps
+                            .iter()
+                            .find(|s| s.id == target_id)
+                            .and_then(|s| s.output_key.as_ref())
+                            .and_then(|k| vars.get(k).cloned())
+                            .unwrap_or_default();
+                        if loop_exhausted_last_resort_review(
+                            &review_engine,
+                            &ctx.event_tx,
+                            topic,
+                            &step.id,
+                            cond,
+                            count,
+                            &artifact,
+                            &last_output,
+                        )
+                        .await
+                        {
+                            idx += 1;
+                            continue;
+                        }
                         let summary: String = last_output.chars().take(200).collect();
                         return WfOutcome::Failed(format!(
                             "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
@@ -2934,6 +3516,16 @@ async fn run_dag_step(
         let mut prompt = full_prompt.clone();
         let mut attempt: u32 = 0;
         loop {
+            // 同串行引擎：require_plan_submit 的 step 每次尝试新建
+            // PlanStage，引擎据此判断 plan 是否真的提交成功。
+            let plan_stage: Option<crate::controller::SharedPlanStage> =
+                if step.require_plan_submit {
+                    Some(Arc::new(parking_lot::RwLock::new(
+                        crate::controller::PlanStage::Normal,
+                    )))
+                } else {
+                    None
+                };
             let dispatch = SpeakerDispatch {
                 speaker: speaker.clone(),
                 step_id: step.id.clone(),
@@ -2958,9 +3550,10 @@ async fn run_dag_step(
                 staging: inp.staging.clone(),
                 step_tools: step.tools.clone(),
                 answer_log: inp.answer_log.clone(),
+                plan_stage: plan_stage.clone(),
             };
-            let mut response = match run_step_speaker(dispatch).await {
-                Ok(r) => r,
+            let (mut response, tools_called) = match run_step_speaker(dispatch).await {
+                Ok(o) => (o.response, o.tools),
                 Err(e) => {
                     return Err(match e {
                         StepFail::Cancelled => StepFail::Cancelled,
@@ -2971,10 +3564,54 @@ async fn run_dag_step(
                     })
                 }
             };
+            // plan 提交硬校验：不走 advisor 语义兜底（同串行引擎）。
+            if step.require_plan_submit && !plan_submitted(plan_stage.as_ref()) {
+                if attempt >= step.max_retries {
+                    return Err(StepFail::Failed(format!(
+                        "step '{}' speaker '{}': 本步要求成功提交 plan 提案，\
+                         重试 {attempt} 次后仍未提交成功（任务未进看板）\
+                         ；最后一次产出摘要：{}",
+                        step.id,
+                        speaker,
+                        output_excerpt(&response, 1200)
+                    )));
+                }
+                attempt += 1;
+                tracing::warn!(
+                    step = %step.id,
+                    speaker = %speaker,
+                    attempt,
+                    "workflow step did not submit a plan proposal; retrying"
+                );
+                let annotation = plan_submit_retry_annotation(&response);
+                step_transcript.push_str("[验收批注]: 未成功提交 plan 提案，已要求重提\n");
+                prompt = format!("{full_prompt}\n\n{annotation}");
+                continue;
+            }
+            // 工具使用行为（require_tools / require_tools_any / tool_call_limits）：
+            // 查它**做了什么**（output_contract 只能查它说了什么）。
+            // 放在 output_contract 之前——「根本没调工具」比「正文缺字样」更根本，
+            // 批注也更有指导性。
+            if let Err(reason) = check_tool_usage(step, &tools_called) {
+                if attempt >= step.max_retries {
+                    return Err(StepFail::Failed(format!(
+                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                        step.id, speaker
+                    )));
+                }
+                attempt += 1;
+                tracing::warn!(
+                    step = %step.id, speaker = %speaker, attempt,
+                    "workflow step skipped a required tool; retrying"
+                );
+                step_transcript.push_str("[验收批注]: 未调用必需工具，已要求重做\n");
+                prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
+                continue;
+            }
             if let Err(reason) = check_output_contract(&step.output_contract, &response) {
                 if attempt >= step.max_retries {
                     // 重试耗尽：判死前过一道 advisor 语义兜底（同串行
-                    // 引擎；jemalloc 实锤 gate REJECT 被契约判死）。
+                    // 引擎；实测实锤 gate REJECT 被契约判死）。
                     match contract_last_resort_review(
                         &inp.review_engine,
                         &inp.event_tx,
@@ -3213,7 +3850,7 @@ async fn run_workflow_dag(
             // wave 仍在跑的兄弟 step）。产出不满足条件的 step 把产出
             // 作为反馈预置给跳回目标，调度指针退回目标所在 wave，
             // 目标及其全部下游作废重跑（迭代上限 max_iterations，缺省
-            // 3、硬上限 10，耗尽才 failed——jemalloc 实锤：gate 的
+            // 3、硬上限 10，耗尽才 failed——实测实锤：gate 的
             // 合法 REJECT 此前被契约直接判死，零返工）。
             let mut jump_back: Option<usize> = None;
             let mut rework_notes: Vec<String> = Vec::new();
@@ -3243,6 +3880,35 @@ async fn run_workflow_dag(
                 };
                 let max = step.max_iterations.unwrap_or(3).min(10);
                 if count >= max {
+                    // 判死前最后一道 advisor 语义复核（与串行引擎同款）：
+                    // 把「被返工的那份产出」+「未消化的评审意见」交 advisor，
+                    // 判定实质合格则免除本 step 的返工要求，让 wave 正常推进。
+                    // DAG 下 loop_back_to 必填且指向更早 wave，故直接取它。
+                    // 实际暴露面：design_and_plan 既是 DAG 又配了返工环
+                    // （loop_until = "VERDICT: PASS", max_iterations = 3）。
+                    let target_id =
+                        step.loop_back_to.clone().unwrap_or_else(|| step.id.clone());
+                    let artifact = wf
+                        .steps
+                        .iter()
+                        .find(|s| s.id == target_id)
+                        .and_then(|s| s.output_key.as_ref())
+                        .and_then(|k| vars.get(k).cloned())
+                        .unwrap_or_default();
+                    if loop_exhausted_last_resort_review(
+                        &review_engine,
+                        &ctx.event_tx,
+                        topic,
+                        &step.id,
+                        cond,
+                        count,
+                        &artifact,
+                        out,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
                     let summary: String = out.chars().take(200).collect();
                     return WfOutcome::Failed(format!(
                         "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
@@ -3308,6 +3974,98 @@ async fn run_workflow_dag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn research_and_planning_workflows_are_disjoint() {
+        // explore 的产出是"决策背景要点"——调研，不是交付物。
+        assert!(is_research_workflow("explore"));
+        assert!(is_research_workflow("design_brainstorm"));
+        // 规划类产出可导入看板的任务清单。
+        assert!(is_planning_workflow("implementation_plan"));
+        assert!(is_planning_workflow("task_refine"));
+        // 两类互斥：任何名字不能同时算调研和交付物。
+        for n in [
+            "explore",
+            "design_brainstorm",
+            "implementation_plan",
+            "task_refine",
+            "design_and_plan",
+            "feature_design",
+        ] {
+            assert!(
+                !(is_research_workflow(n) && is_planning_workflow(n)),
+                "{n} classified as both"
+            );
+        }
+    }
+
+    #[test]
+    fn learn_and_doc_workflows_are_not_research() {
+        // learn / write_doc 会落盘真实产物（docs/learn/<slug>.md），
+        // 对"讲讲原理"这类诉求本身就是交付物——不能被重复调研判定误伤。
+        for n in ["learn", "learn_loop", "write_doc", "update_docs"] {
+            assert!(!is_research_workflow(n), "{n} must not count as research");
+        }
+    }
+
+    /// 实测那条诉求点名了两个交付物，必须都识别出来。
+    #[test]
+    fn named_deliverables_recognizes_the_observed_request() {
+        let named = named_deliverables("查看代码  安排学习计划  拆分任务（从浅到深学习）");
+        assert!(named.contains(&"任务清单"), "{named:?}");
+        assert!(named.contains(&"计划"), "{named:?}");
+        assert!(named.contains(&"教程 / 学习材料"), "{named:?}");
+    }
+
+    /// 不误报的底线：纯咨询类问句没有交付物，调研本身就是答案。
+    #[test]
+    fn pure_consultation_names_no_deliverable() {
+        for q in [
+            "这个函数为什么会崩？",
+            "arena 和 extent 之间的锁顺序是怎么回事，有什么坑",
+            "帮我看下 free_fastpath 的边界条件",
+        ] {
+            assert!(named_deliverables(q).is_empty(), "误判有交付物: {q}");
+        }
+    }
+
+    #[test]
+    fn reminder_names_what_is_owed_and_which_workflow() {
+        let named = named_deliverables("帮我拆分任务");
+        let r = deliverable_reminder(&named);
+        assert!(r.contains("任务清单"), "{r}");
+        // 光说"你还欠着"没用，必须点名该跑哪个流程。
+        assert!(r.contains("implementation_plan"), "{r}");
+        assert!(r.contains("plan"), "{r}");
+        // 明确声明不是限制，避免 manager 把它读成禁令而停止正当调研。
+        assert!(r.contains("不限制你继续调研"), "{r}");
+        // 变相再探一轮也要点名。
+        assert!(r.contains("解剖报告"), "{r}");
+    }
+
+    #[test]
+    fn every_recognized_deliverable_has_a_route() {
+        // 单一真源自检：识别得出的每个标签都必须能查到流程，
+        // 否则会出现"知道用户要什么、却指不出该跑哪个流程"。
+        for (label, keys, route) in DELIVERABLES {
+            assert!(!route.is_empty(), "{label} 缺少流程");
+            assert_eq!(deliverable_route(label), route, "{label} 路由不一致");
+            for k in keys {
+                assert!(
+                    named_deliverables(k).contains(&label),
+                    "关键词 {k} 未能识别出 {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reminder_routes_learning_requests_to_learn() {
+        let named = named_deliverables("给我讲讲 jemalloc 的原理，想入门");
+        let r = deliverable_reminder(&named);
+        assert!(r.contains("learn"), "{r}");
+        assert!(r.contains("docs/learn/"), "{r}");
+    }
 
     #[test]
     fn parse_minimal_workflow() {
@@ -3433,6 +4191,209 @@ output_key = "exploration"
         assert_eq!(ids, ["tests_first", "implement", "spec_review", "quality_review"]);
     }
 
+    /// `check_required_tools`：查步骤**做了什么**，而不是它说了什么。
+    ///
+    /// 动机是 learn_loop quiz 的实测事故：它没调 `ask`，却拿上一轮 prompt 里
+    /// 出现过的旧答案编了一段「判分结果：答错 / 你选的是：split」，
+    /// `output_contract` 的子串检查完全满足——学员连题都没看到，账本却被写成
+    /// "答错两次、不再重教"。只有核对真实工具调用记录才拦得住这种。
+    #[test]
+    fn required_tools_checks_actual_calls_not_claims() {
+        let need = vec!["ask".to_string()];
+        // 真的调过 → 放行。摘要格式是 runner 的 "{name} {args} → {result}"。
+        let called = "read {\"path\":\"a\"} → ok\nask {\"question\":\"…\"} → 我的选择：X";
+        assert!(check_required_tools(&need, called).is_ok());
+
+        // 一次工具都没调（runner 给的是占位串，不含工具名）→ 拦下。
+        let none = "[本 step 工具调用数: 0]";
+        let err = check_required_tools(&need, none).unwrap_err();
+        assert!(err.contains("ask"), "批注要点名缺哪个工具: {err}");
+        assert!(err.contains("无"), "没调任何工具时要说明: {err}");
+
+        // 调了别的工具但没调 ask → 拦下，并回显实际调了什么。
+        let other = "read {\"path\":\"plan.json\"} → ok\nwrite {\"path\":\"ledger.json\"} → ok";
+        let err = check_required_tools(&need, other).unwrap_err();
+        assert!(err.contains("ask") && err.contains("read"), "{err}");
+
+        // 空要求恒放行（绝大多数 step 不设这个契约）。
+        assert!(check_required_tools(&[], none).is_ok());
+
+        // 带 namespace 的全名按短名比较（两侧都归一化）。
+        assert!(check_required_tools(&need, "tutor.ask {} → x").is_ok());
+        assert!(check_required_tools(&[
+            "ns.ask".to_string()
+        ], "ask {} → x").is_ok());
+    }
+
+    /// `check_required_tools_any`：OR 语义——"必须取证"有多条合法路径。
+    ///
+    /// 动机是 learn_loop plan 步的零取证事故（全部工具调用就是 2 次
+    /// `write`，5 道题里 3 道的正确答案是幻觉）。取证走 read / code_graph /
+    /// search 都算，用 AND 的 `require_tools` 会逼它三个都调一遍。
+    #[test]
+    fn require_tools_any_is_or_semantics() {
+        let any = vec!["read".to_string(), "code_graph".to_string(), "search".to_string()];
+
+        // 命中任意一个即通过。
+        assert!(check_required_tools_any(&any, "code_graph {} → ok").is_ok());
+        assert!(check_required_tools_any(&any, "search {} → ok").is_ok());
+
+        // 一个都没命中 → 报错，且把实际调用了什么写进批注（好让模型知道
+        // 自己干了什么、缺什么）。
+        let err = check_required_tools_any(&any, "write {} → ok").unwrap_err();
+        assert!(err.contains("至少调用"), "批注要说清是 OR 语义：{err}");
+        assert!(err.contains("write"), "批注要回显实际调用了什么：{err}");
+
+        // 一次工具都没调：占位行 `[本 step 工具调用数: 0]` 不能被当成工具名。
+        let err = check_required_tools_any(&any, "[本 step 工具调用数: 0]").unwrap_err();
+        assert!(err.contains("无"), "零调用应显示\"无\"而不是伪工具名：{err}");
+
+        // 空声明 = 不校验。
+        assert!(check_required_tools_any(&[], "[本 step 工具调用数: 0]").is_ok());
+
+        // namespace 归一化（两侧都按短名比）。
+        assert!(check_required_tools_any(&any, "tutor.read {} → ok").is_ok());
+    }
+
+    /// `check_tool_call_limits`：`require_tools` 查"有没有调过"，这条查
+    /// "调了几次"。learn_loop quiz 的语义是「恰好弹一次窗」——弹两次就是
+    /// 同一知识点连考两遍、账本按最后一次覆盖，丢掉一条作答记录。
+    #[test]
+    fn tool_call_limits_counts_calls() {
+        let mut limits = std::collections::BTreeMap::new();
+        limits.insert("ask".to_string(), 1usize);
+
+        // 恰好一次 → 通过；零次也通过（"有没有调过"由 require_tools 管，
+        // 两个字段职责不重叠）。
+        assert!(check_tool_call_limits(&limits, "ask {} → A").is_ok());
+        assert!(check_tool_call_limits(&limits, "read {} → x").is_ok());
+
+        // 两次 → 超限。
+        let err = check_tool_call_limits(&limits, "ask {} → A\nask {} → B").unwrap_err();
+        assert!(err.contains("最多 1 次"), "批注要说清上限：{err}");
+        assert!(err.contains("2 次"), "批注要说清实际次数：{err}");
+
+        // 上限 0 = 本步禁止调用该工具（比从 tools 白名单摘掉更精确：
+        // 白名单是"拿不到"，上限 0 是"拿得到但不许用"，批注能说清原因）。
+        let mut forbid = std::collections::BTreeMap::new();
+        forbid.insert("write".to_string(), 0usize);
+        assert!(check_tool_call_limits(&forbid, "read {} → x").is_ok());
+        let err = check_tool_call_limits(&forbid, "write {} → ok").unwrap_err();
+        assert!(err.contains("禁止调用"), "上限 0 的批注措辞应是禁止：{err}");
+
+        // namespace 归一化 + 空声明恒通过。
+        assert!(check_tool_call_limits(&limits, "tutor.ask {} → A").is_ok());
+        let dup = "tutor.ask {} → A\nask {} → B";
+        assert!(check_tool_call_limits(&limits, dup).is_err(), "短名归一后应算 2 次");
+        assert!(check_tool_call_limits(&Default::default(), dup).is_ok());
+    }
+
+    /// `check_tool_usage`：三条工具行为按"批注指导性"排序——完全没调 >
+    /// 没取证 > 调多了。顺序错了模型会先去修次要问题。
+    #[test]
+    fn tool_usage_checks_run_in_priority_order() {
+        let step: WorkflowStepDef = toml::from_str(
+            "id = \"quiz\"\nrole = \"tutor\"\ntask = \"t\"\n\
+             require_tools = [\"ask\"]\nrequire_tools_any = [\"read\"]\n\
+             tool_call_limits = { ask = 1 }",
+        )
+        .expect("valid step TOML");
+
+        // 三条全违反时，先报"没调 ask"（最根本）。
+        let err = check_tool_usage(&step, "[本 step 工具调用数: 0]").unwrap_err();
+        assert!(err.contains("要求实际调用工具"), "应先报缺必需工具：{err}");
+
+        // 补上 ask 后，改报"没取证"。
+        let err = check_tool_usage(&step, "ask {} → A").unwrap_err();
+        assert!(err.contains("至少调用"), "应接着报缺取证：{err}");
+
+        // 再补上 read，但 ask 弹了两次 → 报次数超限。
+        let err = check_tool_usage(&step, "read {} → x\nask {} → A\nask {} → B").unwrap_err();
+        assert!(err.contains("最多 1 次"), "应最后报次数超限：{err}");
+
+        // 全满足。
+        assert!(check_tool_usage(&step, "read {} → x\nask {} → A").is_ok());
+    }
+
+    /// `output_contract.max_chars` / `require_any` / `last_line_prefix_any`。
+    #[test]
+    fn output_contract_shape_checks() {
+        // max_chars：learn_loop plan 步的产出被下游当路径片段拼接
+        // （`.latte/learn/{{plan_out}}/plan.json`），多写一句话就拼出
+        // 一条不存在的路径。
+        let c = OutputContract { max_chars: Some(10), ..Default::default() };
+        assert!(check_output_contract(&c, "rust-owner").is_ok());
+        let err = check_output_contract(&c, "好的，slug 是 rust-ownership").unwrap_err();
+        assert!(err.contains("产出过长"), "{err}");
+
+        // require_any：OR 语义。quiz 末行只能是两个状态标记之一，
+        // `require`（AND）表达不了"二选一"。
+        let c = OutputContract {
+            require_any: vec!["STATUS_ALL_DONE".to_string(), "STATUS_CONTINUE".to_string()],
+            ..Default::default()
+        };
+        assert!(check_output_contract(&c, "…\nSTATUS_CONTINUE").is_ok());
+        let err = check_output_contract(&c, "讲完了").unwrap_err();
+        assert!(err.contains("至少一个"), "{err}");
+
+        // last_line_prefix_any：下游按**末行**取值，子串检查拦不住
+        // "标记写在正文中间、末行是句总结"（表现为讲了 k1 却考 k2）。
+        let c = OutputContract {
+            last_line_prefix_any: vec!["TEACH_DONE".to_string()],
+            ..Default::default()
+        };
+        assert!(check_output_contract(&c, "讲解…\nTEACH_DONE k1").is_ok());
+        // 末尾空行/缩进不影响（取最后一个非空行并 trim）。
+        assert!(check_output_contract(&c, "讲解…\n  TEACH_DONE k1  \n\n").is_ok());
+        // 标记在中间、末行是总结 → 必须拦下。这正是子串检查放过的那种。
+        let err = check_output_contract(&c, "TEACH_DONE k1\n以上就是本节内容。").unwrap_err();
+        assert!(err.contains("最后一行"), "{err}");
+        assert!(err.contains("以上就是本节内容。"), "批注要回显实际末行：{err}");
+
+        // 空契约恒通过。
+        let c = OutputContract::default();
+        assert!(check_output_contract(&c, "随便写").is_ok());
+    }
+
+    /// `validate`：新字段的形状错误必须在**配置期**拦下，而不是运行到
+    /// 一半才静默失效。空工具名会被 `short_tool_name` 归一成空串、永远
+    /// 匹配不上任何调用，于是 `require_tools_any` 恒失败、
+    /// `tool_call_limits` 恒通过——两种都是"写了却不生效"。
+    #[test]
+    fn validate_rejects_malformed_behavior_fields() {
+        let base = |extra: &str| {
+            format!(
+                "name = \"w\"\n[[steps]]\nid = \"s\"\nrole = \"tutor\"\ntask = \"t\"\n{extra}"
+            )
+        };
+
+        let wf: WorkflowDef = toml::from_str(&base("require_tools_any = [\"\"]")).unwrap();
+        let err = wf.validate().unwrap_err();
+        assert!(err.contains("require_tools_any"), "{err}");
+
+        let wf: WorkflowDef =
+            toml::from_str(&base("tool_call_limits = { \"\" = 1 }")).unwrap();
+        let err = wf.validate().unwrap_err();
+        assert!(err.contains("tool_call_limits"), "{err}");
+
+        // min > max：没有任何产出能同时满足，而先查 min 会让报错指向
+        // "产出过短"，排查方向完全错。
+        let wf: WorkflowDef = toml::from_str(&base(
+            "[steps.output_contract]\nmin_chars = 100\nmax_chars = 10",
+        ))
+        .unwrap();
+        let err = wf.validate().unwrap_err();
+        assert!(err.contains("min_chars") && err.contains("max_chars"), "{err}");
+
+        // 合法配置照常通过。
+        let wf: WorkflowDef = toml::from_str(&base(
+            "require_tools_any = [\"read\"]\ntool_call_limits = { ask = 1 }\n\
+             [steps.output_contract]\nmin_chars = 10\nmax_chars = 100",
+        ))
+        .unwrap();
+        wf.validate().expect("合法配置应通过");
+    }
+
     #[test]
     fn learn_workflow_structure() {
         let raw = include_str!("../../config/workflows/learn.toml");
@@ -3457,27 +4418,266 @@ output_key = "exploration"
         // verify：reviewer + programmer 接力（校对 + 修正）
         assert_eq!(wf.steps[3].roles(), vec!["reviewer", "programmer"]);
     }
-    /// learn_loop：交互式学习循环——plan（拆解+写账本）→ teach（loop_until
-    /// 弹窗出题）→ report。核心：teach 必须是循环步（每轮 fresh subagent
-    /// context 隔离），且 tutor 配 ask 工具（弹窗出题，答案不入主 session）。
+    /// learn_loop：交互式学习循环——plan（取证+拆解+出题+写账本）→ teach
+    /// （只讲解）→ quiz（只出题判分，未学完 loop_back_to teach）→ report。
+    ///
+    /// 这个测试锁的是实测会话暴露的三个缺陷的修复：
+    ///   1. **答案泄漏**：旧设计要求把正确答案标成 options 里的
+    ///      `recommended`，而该字段在前端渲染成字面的「✓ 推荐」徽标
+    ///      （`chat_impl.ts`）——等于把答案印在题面上。现在答案只存
+    ///      plan.json 的 `answer` 字段，workflow 明文禁止传 recommended。
+    ///   2. **先考后教**：旧设计把讲解与出题塞进同一个 step，实测模型把
+    ///      讲解写进 <think> 块、可见正文为空就直接 ask 弹窗阻塞 28.9 分钟，
+    ///      学员看到一道没有课的考题。拆成 teach / quiz 两步，讲解一定先
+    ///      落到主 session。
+    ///   3. **凭记忆出题**：旧设计 plan 步全部工具调用是 2 次 write（0 次读
+    ///      源码），5 道题里 3 道的"正确答案"是幻觉。现在 plan 步必须先取证、
+    ///      每个知识点带 evidence（file:line）。
     #[test]
     fn learn_loop_workflow_structure() {
         let raw = include_str!("../../config/workflows/learn_loop.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("learn_loop should validate");
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["plan", "teach", "report"]);
-        // teach：跨 step 循环（A——每轮 fresh subagent，context 隔离）
+        assert_eq!(ids, ["plan", "teach", "quiz", "report"]);
+
+        let plan = &wf.steps[0];
         let teach = &wf.steps[1];
-        assert_eq!(teach.loop_until.as_deref(), Some("STATUS_ALL_DONE"));
-        assert_eq!(teach.max_iterations, Some(10));
-        assert_eq!(teach.roles(), vec!["tutor"]);
-        // teach 必须产出循环状态标记（CONTINUE / ALL_DONE）
-        assert!(teach.task_text().contains("STATUS_CONTINUE"));
-        assert!(teach.task_text().contains("STATUS_ALL_DONE"));
-        // plan：先写账本再进循环；report：结尾收报告
-        assert!(wf.steps[0].task_text().contains("ledger.json"));
-        assert!(wf.steps[2].task_text().contains("ledger.json"));
+        let quiz = &wf.steps[2];
+        let report = &wf.steps[3];
+        for s in [plan, teach, quiz, report] {
+            assert_eq!(s.roles(), vec!["tutor"]);
+        }
+
+        // ── 缺陷 3：plan 必须先取证再出题 ──
+        assert!(plan.task_text().contains("code_graph"), "plan 必须要求用 code_graph 取证");
+        assert!(plan.task_text().contains("evidence"), "plan 必须要求记 evidence 出处");
+        assert!(plan.task_text().contains("ledger.json"));
+
+        // ── 缺陷 2：讲解与出题分属两步，循环跨步回跳 ──
+        // 循环标记只挂在 quiz 上：teach 不负责循环控制，也不许出题。
+        assert!(teach.loop_until.is_none(), "teach 不该是循环步");
+        assert_eq!(quiz.loop_until.as_deref(), Some("STATUS_ALL_DONE"));
+        assert_eq!(
+            quiz.loop_back_to.as_deref(),
+            Some("teach"),
+            "quiz 未学完必须跳回 teach 讲下一个知识点"
+        );
+        // 引擎硬上限是 10（unwrap_or(3).min(10)），配更大是自欺。
+        assert_eq!(quiz.max_iterations, Some(10));
+        assert!(quiz.task_text().contains("STATUS_CONTINUE"));
+        assert!(quiz.task_text().contains("STATUS_ALL_DONE"));
+        // teach 必须禁止出题——否则就退化回"讲解写进 think 块 + 直接弹窗"。
+        //
+        // 这条从"明文禁止"改成了"拿不到工具"：旧版靠 prompt 里的祈使句
+        // 「禁止调用 `ask`」，那是劝告，模型可以不听且违反了没人知道。
+        // 现在 teach 的 `tools` 白名单里根本没有 ask（也没有 write），
+        // 引擎在构建 runner 时就把它们过滤掉了（`effective_step_tools`）。
+        assert!(
+            !teach.tools.is_empty(),
+            "teach 必须声明 tools 白名单，否则拿到角色全集（含 ask/write）"
+        );
+        assert!(
+            !teach.tools.iter().any(|t| t == "ask"),
+            "teach 的 tools 白名单里不能有 ask——禁出题要靠工具隔离，不是 prompt 劝告"
+        );
+        assert!(
+            !teach.tools.iter().any(|t| t == "write"),
+            "teach 的 tools 白名单里不能有 write——账本只由 quiz 步更新"
+        );
+        assert!(!teach.task_text().contains("STATUS_ALL_DONE"), "循环标记不该出现在 teach");
+
+        // ── 缺陷 1：答案键不得走 recommended ──
+        assert!(
+            plan.task_text().contains("禁止出现 `recommended`"),
+            "plan 必须禁止把答案标成 recommended"
+        );
+        assert!(
+            quiz.task_text().contains("禁止添加 `recommended`"),
+            "quiz 调 ask 时必须禁止补 recommended"
+        );
+        assert!(plan.task_text().contains("\"answer\""), "答案应放独立的 answer 字段");
+
+        // ── 缺陷 4（首次实跑发现）：答案位置偏置 ──
+        // 实测 plan 生成的 5 道题答案全在第 1 位、label 退化成 A/B/C/D，
+        // 学员靠位置就能全对——等于换了个通道泄漏答案。
+        // 位置打散已从 plan（靠模型自觉，实测 5 题里 3 题答案仍在第 1 位）
+        // 移交给 ask 的 shuffle（程序洗牌）——plan 这边只需说明"位置不用操心"。
+        assert!(
+            plan.task_text().contains("位置不用你操心"),
+            "plan 应说明位置由 ask 洗牌解决，不再要求模型自己打散"
+        );
+        assert!(
+            plan.task_text().contains("禁止用 `A`/`B`/`C`/`D`"),
+            "plan 必须禁止用纯字母序号当 label"
+        );
+
+        // ── 缺陷 5（首次实跑发现）：teach 讲 k1、quiz 考 k2 ──
+        // 两步各自按 ledger 状态推断"当前知识点"，fail 状态下推断分岔：
+        // teach 重讲 k1，quiz 跳到 k2 出题，学员被突袭且 k1 永不推进。
+        // 修法是单一事实来源——teach 声明 id，quiz 沿用。
+        assert!(
+            teach.task_text().contains("TEACH_DONE <知识点id>"),
+            "teach 末行必须声明它讲的是哪个知识点"
+        );
+        assert!(
+            quiz.task_text().contains("{{teach_out}}"),
+            "quiz 必须从 teach 的输出里取知识点 id，不能自己推断"
+        );
+        assert_eq!(
+            teach.output_key.as_deref(),
+            Some("teach_out"),
+            "quiz 插值 {{teach_out}} 依赖这个 output_key"
+        );
+
+        // ── 缺陷 6（第二次实跑发现）：quiz 跳过出题直接判 weak ──
+        // 实测：k1 状态是 fail（只答错过一次），quiz 脑补成"已经答错两次"，
+        // 没调 ask 就把它标成 weak，学员连重考机会都没有。光靠 prompt 说
+        // "必须先出题"拦不住，所以用 output_contract 在引擎层设门槛：
+        // 没拿到用户答案就写不出这两个字样，契约不满足会带批注重试。
+        for pat in ["判分结果", "你选的是"] {
+            assert!(
+                quiz.output_contract.require.iter().any(|r| r == pat),
+                "quiz 的 output_contract 缺少必需子串 {pat}"
+            );
+        }
+        // 但子串检查会被编造绕过（实测：模型拿上一轮的旧答案编了一段判分），
+        // 所以还必须有 require_tools 在引擎层核对真实工具调用记录。
+        assert!(
+            quiz.require_tools.iter().any(|t| t == "ask"),
+            "quiz 必须声明 require_tools=[\"ask\"]，否则模型可以编造判分结果"
+        );
+        assert!(
+            teach.require_tools.is_empty(),
+            "teach 不该要求调用工具（它的 tools 白名单里没有 ask/write）"
+        );
+        // 「恰好一次」的后半句：require_tools 只查"有没有调过"，查不出
+        // "调了几次"。弹两次窗 = 同一知识点连考两遍、账本按最后一次覆盖，
+        // 学员的作答记录被悄悄丢掉一条。旧版这条只写在 prompt 里
+        //（「本步必须恰好调用一次 `ask`」），是劝告；现在由引擎计数。
+        assert_eq!(
+            quiz.tool_call_limits.get("ask"),
+            Some(&1),
+            "quiz 必须声明 tool_call_limits={{ask=1}}，否则\"恰好一次\"只是句劝告"
+        );
+        // 答完题必须真的落账本。旧版只查了 ask：答完不写 ledger.json 也能
+        // 通过，于是同一个知识点被反复考，循环靠 max_iterations 撞满才结束。
+        assert!(
+            quiz.require_tools.iter().any(|t| t == "write"),
+            "quiz 必须声明 require_tools 含 write，否则判完分可以不落账本"
+        );
+        // 末行契约：下游/引擎按末行取循环状态。用 require 子串检查不够——
+        // 标记写在正文中间时子串检查照样通过，而循环控制拿不到依据。
+        assert!(
+            quiz.output_contract.last_line_prefix_any.iter().any(|p| p == "STATUS_ALL_DONE")
+                && quiz
+                    .output_contract
+                    .last_line_prefix_any
+                    .iter()
+                    .any(|p| p == "STATUS_CONTINUE"),
+            "quiz 的末行必须被契约钉成两个循环状态标记之一"
+        );
+        assert!(
+            teach
+                .output_contract
+                .last_line_prefix_any
+                .iter()
+                .any(|p| p == "TEACH_DONE"),
+            "teach 的末行必须被契约钉成 TEACH_DONE——quiz 靠它决定考哪个知识点"
+        );
+        // 堵「讲解全写进 <think> 块、可见正文为空」：那次 1282 字符的讲解
+        // 学员一个字也没看到。正文长度是引擎唯一能机械核对的"有没有真讲"。
+        assert!(
+            teach.output_contract.min_chars.unwrap_or(0) >= 300,
+            "teach 必须有 min_chars 下限，否则空正文也能通过"
+        );
+        // plan 取证：用 _any（OR）而不是 require_tools（AND）——取证走
+        // read / code_graph / search 都算，AND 会逼它三个都调一遍。
+        assert!(
+            !plan.require_tools_any.is_empty()
+                && plan
+                    .require_tools_any
+                    .iter()
+                    .all(|t| ["read", "code_graph", "search"].contains(&t.as_str())),
+            "plan 必须声明 require_tools_any 覆盖取证工具，否则可以零取证凭记忆出题"
+        );
+        assert!(
+            plan.require_tools.iter().any(|t| t == "write"),
+            "plan 必须真把 plan.json / ledger.json 落盘"
+        );
+        // plan 的产出被下游当路径片段拼接，必须只是 slug 本身。
+        assert!(
+            plan.output_contract.max_chars.is_some_and(|m| m <= 60),
+            "plan 必须有 max_chars 上限，否则多写一句话就把下游路径拼坏"
+        );
+        assert!(
+            plan.output_contract.forbid.iter().any(|f| f == " ")
+                && plan.output_contract.forbid.iter().any(|f| f == "/"),
+            "plan 的 slug 不能带空格或斜杠"
+        );
+        // report 只读：改账本会掩盖真实掌握情况。
+        assert_eq!(report.tools, vec!["read"], "report 必须是只读步");
+        // 缺陷 7（第四次实跑发现）：模型执行四状态机不可靠——第一次答错就
+        // 直接写 weak，跳过重考档。账本改成只存 wrong/passed 两个事实，
+        // 状态由读取方推导，模型不再做状态推理。
+        // 缺陷 8（第五次实跑发现，根因在 ask 工具而不在 workflow）：
+        // 重考弹的是同一道题，被 ask 的"同题复用旧答案"保护静默拦掉，
+        // 学员的重考机会被工具层吞掉。quiz 必须显式要求 allow_repeat。
+        assert!(
+            quiz.task_text().contains("allow_repeat: true"),
+            "quiz 必须要求传 allow_repeat=true，否则重考会被 ask 复用旧答案吞掉"
+        );
+        // 缺陷 9/10（收尾优化）：位置偏置交给程序洗牌；测验必须关掉超时兜底
+        // （否则会凭空造出一条学员作答记录，成绩账本全是假的）。
+        assert!(
+            quiz.task_text().contains("shuffle: true"),
+            "quiz 必须要求 ask 打乱选项顺序"
+        );
+        assert!(
+            quiz.task_text().contains("auto_answer: false"),
+            "quiz 必须关掉超时兜底"
+        );
+        assert!(
+            quiz.task_text().contains("绝不按位置"),
+            "洗牌后判分必须按 label 文本匹配"
+        );
+        assert!(
+            quiz.task_text().contains("`wrong` 只能 +1，绝不允许跳步"),
+            "quiz 必须把状态推进降级成 wrong+1，不许它自己判状态"
+        );
+        assert!(
+            plan.task_text().contains("\"wrong\":0") && plan.task_text().contains("\"passed\":false"),
+            "初始账本必须是 wrong/passed 两个事实，不是状态名"
+        );
+        assert!(
+            teach.task_text().contains("passed == false 且 wrong < 2"),
+            "teach 选题必须按 wrong/passed 推导"
+        );
+        assert!(
+            report.task_text().contains("wrong >= 2") && report.task_text().contains("passed == true"),
+            "report 必须按 wrong/passed 推导掌握情况"
+        );
+
+        // report：结尾收报告，把 fail/weak/pending 都算未通过。
+        assert!(report.task_text().contains("ledger.json"));
+    }
+
+    /// tutor 角色必须有取证工具，否则 learn_loop 里"基于源码出题"的要求
+    /// 根本执行不了——实测会话就是这么编出 3 道幻觉题的（当时白名单
+    /// 只有 read/write/ask）。
+    #[test]
+    fn tutor_role_has_evidence_tools() {
+        let raw = include_str!("../../config/agents/tutor.toml");
+        let cfg: toml::Value = toml::from_str(raw).expect("valid TOML");
+        let tools = cfg["roles"]["tutor"]["tools"]
+            .as_array()
+            .expect("tutor.tools must be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for t in ["read", "code_graph", "search", "write", "ask"] {
+            assert!(tools.contains(&t), "tutor 缺少工具 {t}：{tools:?}");
+        }
     }
 
     /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
@@ -3490,7 +4690,7 @@ output_key = "exploration"
         assert_eq!(
             design.output_key,
             Some("design".to_string()),
-            "step 'design' missing output_key=\"design\" — required by LAT-106"
+            "step 'design' missing output_key=\"design\" — 下游 plan step 靠这个 key 注入设计正文"
         );
     }
 
@@ -4211,16 +5411,23 @@ task = "t"
         assert!(breakdown.max_retries >= 1, "contract needs retry budget");
     }
 
-    /// 验收：task_refine 是「草案 → 评审 → 终审门 → 过审后才 plan 提交」
-    /// 的四步评审流。gate 只输出裁决，submit 消费最新 draft。
+    /// 验收：task_refine 是「草案 → 评审 → 终审门 → important 定向修补
+    /// → plan 提交」的五步评审流。gate 只输出裁决，revise 负责把评审的
+    /// important 修正项落回草案，submit 消费**修订后**的草案。
+    ///
+    /// 为什么 submit 不能再消费 `{{draft}}`（实测实录）：
+    /// gate 放行门槛是「无 blocking」，important 不阻断；但只要 submit
+    /// 提交的是第一版 draft、且 gate 被禁止重写草案，任何 important
+    /// 修正项就都没有回写通道，reviewer 写着「必须修正后再提交」的问题
+    /// 100% 带病入库。
     #[test]
-    fn task_refine_is_reviewed_four_step_flow() {
+    fn task_refine_is_reviewed_five_step_flow() {
         let raw = include_str!("../../config/workflows/task_refine.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("task_refine should validate");
 
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["refine", "review", "gate", "submit"]);
+        assert_eq!(ids, ["refine", "review", "gate", "revise", "submit"]);
 
         let refine = &wf.steps[0];
         assert_eq!(refine.output_key.as_deref(), Some("draft"));
@@ -4246,20 +5453,211 @@ task = "t"
         assert!(!gate.prompt.contains("原样完整附上拆分草案"));
         assert_eq!(gate.output_key.as_deref(), Some("approved"));
 
-        let submit = &wf.steps[3];
+        let revise = &wf.steps[3];
+        assert_eq!(revise.roles(), &["task_planner".to_string()]);
+        assert_eq!(revise.output_key.as_deref(), Some("final_draft"));
+        assert!(
+            revise.task_text().contains("{{draft}}") && revise.task_text().contains("{{verdict}}"),
+            "revise 步必须同时拿到原草案与评审结论才能定向修补"
+        );
+        assert!(
+            revise.task_text().contains("只改被点名的地方"),
+            "revise 是定向修补，不是重新拆分"
+        );
+        assert!(
+            !revise.tools.iter().any(|t| t == "plan"),
+            "revise 步不放行 plan——修补产物仍要走 submit 提交"
+        );
+
+        let submit = &wf.steps[4];
         assert_eq!(submit.roles(), &["task_planner".to_string()]);
         assert!(
-            submit.task_text().contains("{{draft}}"),
-            "submit 步必须消费最新 draft，而不是 gate 裁决文本"
+            submit.task_text().contains("{{final_draft}}"),
+            "submit 步必须消费修订后的草案，否则 important 修正项被丢弃"
+        );
+        assert!(
+            !submit.task_text().contains("{{draft}}"),
+            "submit 不能回退到第一版 draft"
         );
         assert!(!submit.task_text().contains("{{approved}}"));
 
-        // step 级工具过滤：refine 步硬性摘掉 plan（引擎层 enforce，
+        // step 级工具过滤：refine/revise 步硬性摘掉 plan（引擎层 enforce，
         // 不靠 prompt 自觉），submit 步不限制（需要 plan 提交）。
-        assert_eq!(refine.tools, vec!["read", "search"]);
+        // code_graph 在列：拆分依据改用「文件+符号名」锚点后，符号
+        // **存在性**是唯一硬要求，refine 需要它来自证。
+        assert_eq!(refine.tools, vec!["read", "search", "code_graph"]);
+        assert_eq!(revise.tools, vec!["read", "search", "code_graph"]);
+        assert!(
+            !refine.tools.iter().any(|t| t == "plan"),
+            "refine 步绝不能放行 plan——草案必须先过 review/gate"
+        );
         assert!(review.tools.is_empty());
         assert!(gate.tools.is_empty());
         assert!(submit.tools.is_empty());
+    }
+
+    /// P0 回归（实测会话 实锤）：paths 规则
+    /// 必须按 plan 工具的**真实判据**写 —— 路径字符串层、不区分读写 ——
+    /// 并且必须在 prompt 里明写「只读」豁免。
+    ///
+    /// 事故链：旧规则同时要求「paths 必须包含验收标准点名的所有文件」和
+    /// 「共读同一文件时改成消费上游子任务的交付物」，而"消费上游交付物"
+    /// 本身就要把上游 doc 写进自己的 paths，正好踩中前一条禁令 →
+    /// 6 个链式子任务撞出 14 处重叠 → plan 整单拒绝 → 零任务入库。
+    /// 而 `is_readonly_plan_task` 的豁免只写在 plan 工具的 input_schema
+    /// description 里，refine/revise 又用 `tools =` 摘掉了 plan，写草案的
+    /// 角色从来看不到这个出口。
+    #[test]
+    fn task_refine_paths_rules_match_plan_tool_semantics() {
+        for path in [
+            "../config/workflows/task_refine.toml",
+            "../.latte/workflows.d/task_refine.toml",
+        ] {
+            let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+            wf.validate().unwrap_or_else(|e| panic!("{path}: {e}"));
+            let step = |id: &str| {
+                wf.steps
+                    .iter()
+                    .find(|s| s.id == id)
+                    .unwrap_or_else(|| panic!("{path}: 缺 step '{id}'"))
+            };
+            let refine = step("refine");
+            let review = step("review");
+            let revise = step("revise");
+            let submit = step("submit");
+
+            // ① 重叠判据必须写明是路径字符串层、不区分读写。
+            for (id, text) in [
+                ("refine", refine.task_text()),
+                ("review", review.task_text()),
+            ] {
+                assert!(
+                    text.contains("不区分读") && text.contains("字符串"),
+                    "{path}: {id} 步必须写明重叠判据是路径字符串层、不区分读写"
+                );
+            }
+            // ② 「只读」豁免必须在写草案的步骤里明写（这些步骤看不到
+            //    plan 工具的 schema）。
+            for (id, text) in [
+                ("refine", refine.task_text()),
+                ("review", review.task_text()),
+                ("revise", revise.task_text()),
+                ("submit", submit.task_text()),
+            ] {
+                assert!(
+                    text.contains("只读"),
+                    "{path}: {id} 步必须明写「只读」label 豁免"
+                );
+            }
+            // ③ 旧的自相矛盾表述不得回归。
+            assert!(
+                !refine.task_text().contains("纯合成型子任务（只消费上游交付物）写它要产出的文档目录"),
+                "{path}: refine 不得回退到旧的「隐式重叠」表述"
+            );
+            assert!(
+                !revise
+                    .task_text()
+                    .contains("补进去若与别的\n    子任务重叠"),
+                "{path}: revise 不得回退到「先补再说」的旧改法"
+            );
+            // ④ revise 补 paths 前必须先查该文件是否已被别的任务持有
+            //    （事故里第 14 处重叠正是 revise 照 important 直接补出来的）。
+            assert!(
+                revise.task_text().contains("补之前先查"),
+                "{path}: revise 必须要求补 paths 前先查重"
+            );
+            // ⑤ submit 步授权受限自愈 + 引擎兜底。
+            assert!(
+                submit.task_text().contains("受限自愈")
+                    && submit.task_text().contains("paths` 与 `labels"),
+                "{path}: submit 必须授权只改 paths/labels 的受限自愈"
+            );
+            assert!(
+                submit.require_plan_submit,
+                "{path}: submit 必须声明 require_plan_submit（否则零任务入库仍报 ok）"
+            );
+            assert!(
+                submit.max_retries >= 1,
+                "{path}: submit 需要重试预算才能自愈，实得 {}",
+                submit.max_retries
+            );
+        }
+    }
+
+    /// P0 回归（实测实锤）：gate 的通过门槛必须是「无 blocking」，
+    /// 而不是「无 blocking/important」——后者让 reviewer 的行号偏差类
+    /// important 反复触发 REVISE，撞满 max_iterations 后整条 workflow
+    /// Failed，`submit` 步永远执行不到 → plan 工具从不被调用 →
+    /// 「添加子任务」弹窗彻底消失（session ui-88486-…-2 实录）。
+    #[test]
+    fn task_refine_gate_blocks_only_on_blocking() {
+        for path in [
+            "../config/workflows/task_refine.toml",
+            "../.latte/workflows.d/task_refine.toml",
+        ] {
+            let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+            let gate = wf.steps.iter().find(|s| s.id == "gate").expect("gate step");
+            let review = wf.steps.iter().find(|s| s.id == "review").expect("review step");
+            let refine = wf.steps.iter().find(|s| s.id == "refine").expect("refine step");
+
+            assert!(
+                gate.prompt.contains("没有 blocking 问题"),
+                "{path}: gate 的 ACCEPT 条件必须是「无 blocking」"
+            );
+            assert!(
+                !gate.prompt.contains("无 blocking/important 问题"),
+                "{path}: important 不得再作为阻断条件（这是弹窗消失的根因）"
+            );
+            assert!(
+                gate.prompt.contains("行号偏差是 nit"),
+                "{path}: gate 必须显式声明行号偏差不构成 REVISE 理由"
+            );
+            // 评审步要有严重度分级，且把行号归入 nit。
+            assert!(
+                review.prompt.contains("blocking") && review.prompt.contains("nit"),
+                "{path}: review 步必须给出严重度定义"
+            );
+            assert!(
+                review.prompt.contains("行号偏差"),
+                "{path}: review 步必须把行号偏差明确归为 nit"
+            );
+            // 草案锚点改用符号名，不再用裸行号当验收依据。
+            assert!(
+                refine.prompt.contains("不要用裸行号"),
+                "{path}: refine 步必须要求符号级锚点"
+            );
+            // 三值裁决与返工环仍在（放宽门槛不等于取消评审）。
+            assert_eq!(gate.loop_until.as_deref(), Some("VERDICT: ACCEPT"));
+            assert_eq!(gate.loop_back_to.as_deref(), Some("refine"));
+            assert_eq!(gate.loop_abort_on.as_deref(), Some("VERDICT: REJECT"));
+            assert!(
+                wf.steps.iter().any(|s| s.id == "submit"),
+                "{path}: submit 步必须存在（它才是调 plan 弹窗的那一步）"
+            );
+            // important 必须有回写通道：gate 不阻断 important，所以
+            // 只要 submit 提交的是第一版 draft，important 就永远丢。
+            let revise = wf
+                .steps
+                .iter()
+                .find(|s| s.id == "revise")
+                .unwrap_or_else(|| panic!("{path}: 必须有 revise 步来落实 important 修正项"));
+            assert_eq!(revise.output_key.as_deref(), Some("final_draft"), "{path}");
+            let submit = wf.steps.iter().find(|s| s.id == "submit").expect("submit");
+            assert!(
+                submit.task_text().contains("{{final_draft}}")
+                    && !submit.task_text().contains("{{draft}}"),
+                "{path}: submit 必须消费修订后的草案（{{{{final_draft}}}}）"
+            );
+            // gate 不得再宣称「用户会在导入弹窗里看到 important」——
+            // PlanProposed 事件只带 tasks，弹窗不展示评审结论（虚假免责
+            // 会让 gate 心安理得地把带病草案放行）。
+            assert!(
+                !gate.prompt.contains("导入弹窗里看到"),
+                "{path}: 导入弹窗并不展示评审结论，不能靠这个说法免责"
+            );
+        }
     }
 
     /// step 级工具过滤语义：空 = 角色全集；非空 = 交集（保持角色
@@ -4289,7 +5687,7 @@ task = "t"
     /// implementation_plan 与 design_and_plan 用 PASS/REJECT 两值词表，
     /// 其中 REJECT = 「返工」而非终局，所以这两个 gate **不得**声明
     /// `loop_abort_on`——一旦声明，REJECT 又会像此前硬编码那样判死整条
-    /// 流水线，`loop_until`/`loop_back_to` 变回死配置（jemalloc 实锤：
+    /// 流水线，`loop_until`/`loop_back_to` 变回死配置（实测实锤：
     /// 唯一跑到 gate 的运行 44 分钟零产出）。task_refine 的
     /// ACCEPT/REVISE/REJECT 三值契约由专门测试覆盖。
     #[test]
@@ -4328,7 +5726,7 @@ task = "t"
 
     /// 验收：implementation_plan 的 gate 必须把 REJECT 变成返工循环
     /// （loop_until 跳回 breakdown），而不是契约判死整条流水线——
-    /// jemalloc 实锤：评审如实 REJECT（3 条实证阻断）导致 50 分钟
+    /// 实测实锤：评审如实 REJECT（3 条实证阻断）导致 50 分钟
     /// workflow 血本无归。契约只能卡「VERDICT:」格式，不能
     /// require PASS（否则 REJECT 又变回契约失败）。
     #[test]
@@ -4367,7 +5765,7 @@ task = "t"
 
     /// 验收：design_and_plan 的 gate 同样必须把 REJECT 变成返工循环
     /// （DAG 引擎已支持 loop_until），跳回 brainstorm 重新生成设计——
-    /// jemalloc 实锤：gate 如实 REJECT（extent 状态数、LG_QUANTUM 等
+    /// 实测实锤：gate 如实 REJECT（extent 状态数、LG_QUANTUM 等
     /// 实测错误）被契约 require PASS 判死，50 分钟流水线零产出。
     #[test]
     fn design_and_plan_gate_reject_loops_back_for_rework() {
@@ -4563,7 +5961,7 @@ forbid = ["TBD"]
 
     /// workflow step 的 runner 必须挂模型热更新源——否则「模型不可用
     /// 暂停 → 用户在 UI 改配置保存 → ▶ 恢复」的重试仍拿构建时的旧链
-    /// 重放同一个必挂请求（jemalloc tester 卡 k3 400 的实锤路径）。
+    /// 重放同一个必挂请求（实测里 tester 卡 400 的实锤路径）。
     #[tokio::test]
     async fn build_role_runner_attaches_model_hot_reload() {
         let config = test_config_at("http://127.0.0.1:1");
@@ -4580,6 +5978,7 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             &[],
+            None,
             None,
         )
         .await
@@ -4662,8 +6061,70 @@ forbid = ["TBD"]
         assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
     }
 
+    /// P0 回归（实测会话 实锤）：
+    /// `require_plan_submit` 的 step 只产出文字、没成功提交 plan 时，
+    /// 必须重试并最终判 step 失败 —— 不能像事故里那样让「plan 被工具
+    /// 整单拒绝 → 改口输出一份请示报告」通过验收，把零任务入库的运行
+    /// 报成 `status ok`。
+    ///
+    /// 同时验证重试 prompt 带上了「上次产出」（每次尝试都是全新
+    /// subagent，工具报错只存在于上一次的产出里，不带过去模型不知道
+    /// 该修哪个 path）。
+    #[tokio::test]
+    async fn serial_require_plan_submit_fails_without_plan_proposal() {
+        let server = wiremock::MockServer::start().await;
+        // 模型每次都只回文字（模拟「plan 被拒 → 改口写请示报告」）。
+        let excuse = "plan 工具报 paths 范围重叠 14 处，我没有修改任务内容，请指示走 A / B / C 方案。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(excuse)))
+            .mount(&server)
+            .await;
+
+        let raw = r#"
+name = "plan_submit_demo"
+[[steps]]
+id = "submit"
+role = "worker"
+task = "把清单用 plan 工具提交"
+max_retries = 1
+require_plan_submit = true
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        assert!(wf.steps[0].require_plan_submit, "字段必须从 TOML 解析出来");
+
+        let (ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        let err = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect_err("没提交 plan 必须判失败，不能报 ok");
+        assert!(err.contains("submit"), "错误含 step id: {err}");
+        assert!(err.contains("plan 提案"), "错误说清是 plan 没提交: {err}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "首发 + max_retries=1 次重试: {}",
+            requests.len()
+        );
+        let second = String::from_utf8_lossy(&requests[1].body);
+        assert!(
+            second.contains("没有成功提交 plan 提案"),
+            "重试 prompt 带批注: {second}"
+        );
+        assert!(
+            second.contains("paths 范围重叠 14 处"),
+            "重试 prompt 必须回带上次产出里的工具报错: {second}"
+        );
+        assert_eq!(
+            count_workflow_turns(&mut rx),
+            0,
+            "未提交成功的产出不发 WorkflowTurn"
+        );
+    }
+
     /// advisor 返回审查判 intervene → 同一 speaker 带【上轮审查反馈】
-    /// 重做一次，第二次审 ok → step 成功、产出是重做版（jemalloc 实锤：
+    /// 重做一次，第二次审 ok → step 成功、产出是重做版（实测实锤：
     /// reviewer 空转被 advisor 抓到「打回重做」，流水线却照流不误）。
     #[tokio::test]
     async fn advisor_intervene_triggers_redo_with_feedback() {
@@ -4917,8 +6378,363 @@ task = "任务B：{{out_a}}"
         assert!(r.is_ok(), "resume 后 workflow 成功: {:?}", r);
     }
 
+    /// P2 回归（实测实录）：gate 返工环耗尽时，advisor 语义
+    /// 复核判 ok → 放行进入下游 `submit`，弹窗得以出现。
+    ///
+    /// 修复前：gate 两轮 REVISE 撞满 max_iterations=2 → 整条 workflow
+    /// Failed → submit 永不执行 → plan 从不被调 → 「添加子任务」弹窗消失。
+    /// 注意这不是「无条件放水」：必须 advisor 主动判 ok（见下一个用例）。
+    #[tokio::test]
+    async fn loop_exhausted_advisor_ok_reaches_downstream() {
+        let server = wiremock::MockServer::start().await;
+        let draft = "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
+        // refine 产出草案（会被返工重跑，故不限次数）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出拆分草案"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(draft)))
+            .mount(&server)
+            .await;
+        // gate 永远 REVISE（模拟 reviewer 反复挑行号偏差）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REVISE 行号引用仍有偏差，若干处 file:line 与实际位置差了一两行，其余内容无异议。",
+            )))
+            .mount(&server)
+            .await;
+        // advisor 语义复核：判 ok（剩余意见只是行号小瑕疵）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .mount(&server)
+            .await;
+        // 下游 submit。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("提交清单"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "已提交完整子任务清单：共两条子任务，均带验收标准与 paths 范围，等待用户在导入弹窗中确认。",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "loop_rescue_demo"
+[[steps]]
+id = "refine"
+role = "worker"
+task = "产出拆分草案 {{topic}}"
+output_key = "draft"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{draft}}"
+output_key = "approved"
+loop_until = "VERDICT: ACCEPT"
+loop_back_to = "refine"
+max_iterations = 2
+[[steps]]
+id = "submit"
+role = "worker"
+task = "提交清单 {{draft}}"
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect("advisor 判 ok 应放行到 submit");
+        assert!(
+            out.contains("已提交完整子任务清单"),
+            "必须真的执行到 submit 步并拿到它的产出: {out}"
+        );
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        // 语义复核只在**耗尽那一刻**问一次，不是每轮都问（否则等于取消返工）。
+        // 注意不能按 step 任务文本计数：advisor 的返回审查请求也内嵌任务原文。
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("最后一次语义复核")).count(),
+            1,
+            "advisor 语义复核应恰好在耗尽点被问一次"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("提交清单")),
+            "submit 步必须真的被派发"
+        );
+        // 返工环仍然有界（没有放开成无限重试）。
+        assert!(
+            bodies.len() < 20,
+            "请求总数应受 max_iterations 约束，实际 {}",
+            bodies.len()
+        );
+    }
+
+    /// 对照用例：advisor 判 intervene（草案真有实质缺陷）→ 维持原失败。
+    /// 证明这条兜底不是「无条件放水」。
+    #[tokio::test]
+    async fn loop_exhausted_advisor_intervene_still_fails() {
+        let server = wiremock::MockServer::start().await;
+        let draft = "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出拆分草案"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(draft)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REVISE 子任务引用了不存在的符号",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 引用的符号不存在，属实质缺陷\nhint: 重新核验符号",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("提交清单"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("不该到这里")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "loop_rescue_deny"
+[[steps]]
+id = "refine"
+role = "worker"
+task = "产出拆分草案 {{topic}}"
+output_key = "draft"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{draft}}"
+output_key = "approved"
+loop_until = "VERDICT: ACCEPT"
+loop_back_to = "refine"
+max_iterations = 2
+[[steps]]
+id = "submit"
+role = "worker"
+task = "提交清单 {{draft}}"
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("advisor 判 intervene 应维持失败");
+        assert!(err.contains("循环条件"), "应报循环条件未满足: {err}");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("提交清单")).count(),
+            0,
+            "实质缺陷时绝不能放行到 submit"
+        );
+    }
+
+    /// DAG 侧兜底（与串行同款）：返工环耗尽 → advisor 判 ok → 免除本
+    /// step 的返工要求，wave 正常推进到下游。
+    ///
+    /// 实际暴露面：`design_and_plan` 既走 DAG（有 depends_on）又配了返工环
+    /// （`loop_until = "VERDICT: PASS"`, `max_iterations = 3`），耗尽即判死
+    /// 会把已完成 wave 的成果一起丢掉。
+    #[tokio::test]
+    async fn dag_loop_exhausted_advisor_ok_reaches_downstream() {
+        let server = wiremock::MockServer::start().await;
+        let design = "设计稿：分三层落地，接口与数据结构均已给出，边界条件与回滚路径写明，可直接进入实现。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出设计稿"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(design)))
+            .mount(&server)
+            .await;
+        // gate 永远 REVISE（>50 字节以避开 advisor D5 短输出门禁）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REVISE 仍有若干引用位置与实际行号差了一两行，其它部分没有异议。",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("编写实现"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "实现已完成：按设计稿落地全部三层，补齐单元测试与边界用例，回归通过。",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_loop_rescue"
+[[steps]]
+id = "design"
+role = "worker"
+task = "产出设计稿 {{topic}}"
+output_key = "design"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{design}}"
+output_key = "verdict"
+depends_on = ["design"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "design"
+max_iterations = 2
+[[steps]]
+id = "impl"
+role = "worker"
+task = "编写实现 {{design}}"
+depends_on = ["gate"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect("advisor 判 ok 应放行到下游 wave");
+        assert!(out.contains("实现已完成"), "必须真的执行到下游 impl 步: {out}");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("最后一次语义复核")).count(),
+            1,
+            "语义复核只在耗尽点问一次"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("编写实现")),
+            "下游 wave 必须被派发"
+        );
+    }
+
+    /// DAG 侧对照：advisor 判 intervene → 维持原失败，下游不得执行。
+    #[tokio::test]
+    async fn dag_loop_exhausted_advisor_intervene_still_fails() {
+        let server = wiremock::MockServer::start().await;
+        let design = "设计稿：分三层落地，接口与数据结构均已给出，边界条件与回滚路径写明，可直接进入实现。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出设计稿"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(design)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REVISE 设计稿遗漏了并发路径下的一致性处理，属实质缺陷，必须返工。",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 关键路径遗漏，属实质缺陷\nhint: 补并发一致性设计",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("编写实现"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("不该到这里")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "dag_loop_rescue_deny"
+[[steps]]
+id = "design"
+role = "worker"
+task = "产出设计稿 {{topic}}"
+output_key = "design"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{design}}"
+output_key = "verdict"
+depends_on = ["design"]
+loop_until = "VERDICT: PASS"
+loop_back_to = "design"
+max_iterations = 2
+[[steps]]
+id = "impl"
+role = "worker"
+task = "编写实现 {{design}}"
+depends_on = ["gate"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("advisor 判 intervene 应维持失败");
+        assert!(err.contains("循环条件"), "应报循环条件未满足: {err}");
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("编写实现")).count(),
+            0,
+            "实质缺陷时下游 wave 绝不能被派发"
+        );
+    }
+
     /// C3 兜底（串行）：契约重试耗尽 → advisor 语义审查判 ok →
-    /// 带批注放行。jemalloc 实锤：gate 的合法 REJECT 没写契约要求的
+    /// 带批注放行。实测实锤：gate 的合法 REJECT 没写契约要求的
     /// 「VERDICT: PASS」字样，被字符串契约当格式错误判死。
     #[tokio::test]
     async fn contract_exhausted_advisor_ok_passes_with_annotation() {
@@ -5367,7 +7183,7 @@ output_key = "out_b"
     }
 
     /// 契约最终失败时，错误消息必须附「不合格产出摘要」——gate 判
-    /// REJECT 的场景里 manager 要能直接看到 REJECT 理由（jemalloc 现场：
+    /// REJECT 的场景里 manager 要能直接看到 REJECT 理由（实测现场：
     /// 错误只有"缺少 VERDICT: PASS"，阻断原因被丢弃，manager 无从
     /// 解释也无从修复，turn 以裸错误收场）。
     #[tokio::test]
@@ -5505,7 +7321,7 @@ depends_on = ["b"]
     /// 重跑、下游 impl 一并作废重跑、design 的 prompt 带【上轮审查
     /// 反馈】；第二轮 gate PASS → 放行。
     ///
-    /// 注意本例用的是 REVISE。真正的 jemalloc 事故词表是 REJECT，
+    /// 注意本例用的是 REVISE。真正的实测事故词表是 REJECT，
     /// 由 [`dag_gate_verdict_reject_loops_back_and_delivers`] 覆盖——
     /// 那条路径此前被引擎硬编码的 `VERDICT: REJECT` 熔断判死，本测试
     /// 换用 REVISE 恰好绕开了缺陷，所以一直是绿的。
@@ -5657,7 +7473,7 @@ max_iterations = 2
         assert_eq!(gate_reqs, 2, "gate 跑满 2 轮才判死: {gate_reqs}");
     }
 
-    /// jemalloc 事故回放（真实词表）：design_and_plan / implementation_plan
+    /// 事故回放（真实词表）：design_and_plan / implementation_plan
     /// 的 gate 用 PASS/REJECT 两值，REJECT = 「打回重做」。引擎此前把
     /// `VERDICT: REJECT` 硬编码成无条件终局，`loop_until`/`loop_back_to`
     /// 形同虚设——评审如实 REJECT 就判死整条流水线（唯一跑到 gate 的
@@ -6035,7 +7851,7 @@ max_iterations = 3
     ///
     /// 为什么是修复本次事故的核心：阻塞 ask 出在子 workflow 里时，
     /// 回答只写本层 = 只能 resume 子 run，父流水线不知道自己在等谁，
-    /// 永久卡死（jemalloc 现场：`design_and_plan` → `req_review` →
+    /// 永久卡死（实测现场：`design_and_plan` → `req_review` →
     /// `requirements_review` 的 `decide` 弹出选择题，答了也没用）。
     #[test]
     fn nested_answer_lands_in_both_own_and_root_checkpoint() {
@@ -6256,7 +8072,7 @@ output_key = "user_profile"
             false
         });
 
-        let out = run_workflow(&wf, "学 jemalloc", &ctx).await;
+        let out = run_workflow(&wf, "学某个 C 项目", &ctx).await;
         let asked = answerer.await.unwrap_or(false);
         assert!(asked, "speaker 应该真的弹出了选择框（ask 已注册）");
         assert!(out.is_ok(), "run 应成功: {out:?}");
@@ -6330,7 +8146,7 @@ depends_on = ["review"]
 
     /// output_from 端到端：子 workflow 末步是评审 verdict，父级用
     /// output_from 取中间 step（synthesize，output_key=proposal）的
-    /// 方案本体。回归 jemalloc 现场：design_and_plan 的 {{design}}
+    /// 方案本体。回归实测现场：design_and_plan 的 {{design}}
     /// 被绑成 advisor_verdict 的裁决文本，下游 plan/评审全部跑偏。
     #[tokio::test]
     async fn nested_output_from_selects_intermediate_output() {
@@ -6425,7 +8241,7 @@ output_key = "final"
     /// 的方案本体，还把子 workflow 的 survey 原文带到父级 vars，下游
     /// 评审 step 用 `{{survey}}` 拿得到。
     ///
-    /// 回归 jemalloc 现场：评审只收到被逐层压缩的 proposal，事实基线
+    /// 回归实测现场：评审只收到被逐层压缩的 proposal，事实基线
     /// （真实文件/行号）留在子流程里没往下传，于是评审凭记忆核事实、
     /// 报出 5 处错行号。
     #[tokio::test]

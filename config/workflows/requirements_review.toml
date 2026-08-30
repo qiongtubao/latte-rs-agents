@@ -30,7 +30,7 @@ output_key = "estimate"
 # step 级工具过滤：硬性摘掉 write / bash（引擎层 enforce，不靠 prompt
 # 自觉）——本步只估算，不实现。programmer 的角色 prompt 本身在推
 # 「取证到底 / 修复必须先有失败测试」，一旦手里有 write+bash，估算就会
-# 滑成完整实现（jemalloc 实锤：本步跑了 131 次工具调用、改了
+# 滑成完整实现（实测实锤：本步跑了 131 次工具调用、改了
 # src/tcache.c、编译 + lldb 验证，最后撞 100 轮上限，连带整条
 # design_and_plan 失败）。
 tools = ["read", "search", "code_graph"]

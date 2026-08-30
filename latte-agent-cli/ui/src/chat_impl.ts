@@ -5,6 +5,7 @@ import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hi
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
 import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
+import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks } from "./plan_import";
 import type { CodeRef } from "./host";
 interface UIBinding {
@@ -209,19 +210,6 @@ export function mountChat(opts: {
    * persisted event immediately after live delivery; suppress only exact
    * adjacent duplicates, preserving legitimate repeated turns. */
   let lastEventIdentity = "";
-
-  function eventIdentity(e: ChatEvent): string {
-    switch (e.type) {
-      // Lifecycle events can legitimately repeat for the same role/detail
-      // (e.g. two archived turns), so they are not deduplicated.
-      case "RoleTurn": return `${e.type}|${e.role_id}|${e.sub_id ?? ""}|${e.is_complete}|${e.content}`;
-      case "WorkflowTurn": return `${e.type}|${e.wf_id}|${e.step_id}|${e.round}|${e.content}`;
-      case "ToolUse": return `${e.type}|${e.sub_id ?? ""}|${e.tool_name}|${e.args}`;
-      case "ToolResult": return `${e.type}|${e.sub_id ?? ""}|${e.tool_name}|${e.result}`;
-      case "ToolError": return `${e.type}|${e.sub_id ?? ""}|${e.tool_name}|${e.error}`;
-      default: return "";
-    }
-  }
   // ── Delegate tracking (keyed by sub_id for parallel delegates) ──
   interface DelegateInfo {
     targetRole: string;
@@ -273,6 +261,38 @@ export function mountChat(opts: {
     currentDelegateSubId = "";
     workflowStates.clear();
     workflowTranscripts.clear();
+    delegateToolCounts.clear();
+  }
+  /** sub_id → 该 subsession 已发生的工具调用数（心跳用，见
+   *  [`bumpDelegateHeartbeat`]）。 */
+  const delegateToolCounts = new Map<string, number>();
+  /** subagent 的工具事件按设计不进主对话正文（详情面板里有完整流水），
+   *  但一次委派可能连续几分钟没有任何可见变化，看起来就像卡死了
+   *  （实测：单个 refine step 跑了 228 秒、42 条工具事件，
+   *  主对话零变化）。这里给它加心跳：delegate 气泡的「⏳ 执行中…」
+   *  徽章与该角色的 executing 行都带上「工具调用数 + 最近工具名」。 */
+  /** delegate 气泡上的「⏳ 执行中…」徽章。
+   *
+   *  优先用 `activeDelegates` 里的 live 引用；取不到时按 sub_id 从 DOM
+   *  里找回 —— 历史回放会把 `activeDelegates` 清空（replayEvents 视历史
+   *  为「已发生」），但 session 完全可能还在跑（刷新页面 / 切回来时的
+   *  常态），此时后续 live 事件仍要能翻转这枚徽章。 */
+  function delegateBadge(subId: string): HTMLElement | null {
+    const live = activeDelegates.get(subId)?.stateEl;
+    if (live) return live;
+    const sel = `.message-row[data-sub-id="${subId.replace(/"/g, '\\"')}"] .delegate-state`;
+    return container.messagesEl.querySelector(sel) as HTMLElement | null;
+  }
+  function bumpDelegateHeartbeat(subId: string, roleId: string, toolName: string): void {
+    const n = (delegateToolCounts.get(subId) ?? 0) + 1;
+    delegateToolCounts.set(subId, n);
+    const badge = delegateBadge(subId);
+    if (badge) badge.textContent = `⏳ 执行中… 🔧${n} ${toolName}`;
+    const row = latestExecutingRow(roleId, subId);
+    if (row && row.subId === subId) {
+      const content = row.row.querySelector(".message.status .content");
+      if (content) content.textContent = `🧠 ${roleId} 执行中… 🔧${n} ${toolName}`;
+    }
   }
   let lastUserMsgId = "";
   let lastRoleStarted = "";
@@ -2283,6 +2303,8 @@ export function mountChat(opts: {
           // Subagent tools are persisted in the subsession trace. Keep them
           // out of the top-level chat; the standard Subsession panel renders
           // the complete event stream when the user opens Details.
+          // 但主对话必须有「还活着」的信号 —— 只更新徽章/状态行，不刷正文。
+          bumpDelegateHeartbeat(e.sub_id, e.role_id, e.tool_name);
           break;
         }
         if (!appendToolToExecutingRow(e.role_id, line)) {
@@ -2470,10 +2492,12 @@ export function mountChat(opts: {
         msg.appendChild(makeSubsessionBtn(e.sub_id, label, msg));
         if (isFail) msg.classList.add("fail-flash");
         // Flip the pending badge on the DelegateStarted bubble.
-        const finishedDi = activeDelegates.get(e.sub_id);
-        if (finishedDi?.stateEl) {
-          finishedDi.stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
-          finishedDi.stateEl.className = `delegate-state ${isFail ? "failed" : "done"}`;
+        // 用 delegateBadge：历史回放清过 activeDelegates 的场景（刷新
+        // 后 session 仍在跑）也能找回那枚 ⏳ 徽章。
+        const finishedBadge = delegateBadge(e.sub_id);
+        if (finishedBadge) {
+          finishedBadge.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
+          finishedBadge.className = `delegate-state ${isFail ? "failed" : "done"}`;
         }
         // 这条分派结束 → 收掉它的超时询问条。DelegateFinished 是分派
         // 结束最可靠的信号（RoleFinished 在某些路径上不带 sub_id），

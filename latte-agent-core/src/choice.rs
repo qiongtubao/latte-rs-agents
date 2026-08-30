@@ -68,7 +68,7 @@ struct Prompt {
     /// 为什么需要：`PROMPTS` 是**进程内**内存表，服务器一重启就空了。
     /// 而非阻塞弹框（fire-and-forget 的 ask、`PlanProposed`）此前只有
     /// 这一份副本 —— 用户没来得及处理就重启/刷新，弹框永久消失，既
-    /// 看不到也无从补救（jemalloc 现场：workflow 挂死 + 进程重启后，
+    /// 看不到也无从补救（实测现场：workflow 挂死 + 进程重启后，
     /// 待办弹框连痕迹都不剩）。
     persist: Option<(std::path::PathBuf, String)>,
 }

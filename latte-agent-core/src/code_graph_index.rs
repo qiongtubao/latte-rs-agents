@@ -1,7 +1,7 @@
 //! Prebuilt code-graph symbol index.
 //!
 //! latte 的 `code_graph` 工具本身是**无索引**的 ast-grep 实时扫描：每次
-//! 调用现场 spawn `ast-grep` 扫源码。对大仓库（如 jemalloc）第一次「建
+//! 调用现场 spawn `ast-grep` 扫源码。对大仓库第一次「建
 //! 地图」要冷扫全仓，几百毫秒~数秒。本模块在 **UI 启动时**后台预扫一遍
 //! cwd 仓库的定义类符号（function/struct/class/type/enum/trait/interface），
 //! 把 `文件 → 符号签名 + 行号` 落盘成 `.latte/code_graph/index.json`，让
@@ -140,7 +140,7 @@ impl CodeGraphIndex {
 ///
 /// 索引里的文件 key 都是**相对仓库根**的路径（ast-grep 以 `current_dir(cwd)`
 /// 运行，回传相对路径）。但模型经常传**绝对路径**（如
-/// `/Users/.../repo/src/jemalloc.c`），旧实现只 `trim_start_matches("./")`，
+/// `/Users/.../repo/src/main.c`），旧实现只 `trim_start_matches("./")`，
 /// 绝对路径原样带进 scope，永远匹配不上相对 key → 静默返回 0 命中，且因为
 /// 「空清单也算命中」而**不会回退**到实时 ast-grep，等于 code_graph 对所有
 /// 绝对路径查询完全失效。

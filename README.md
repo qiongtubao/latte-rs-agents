@@ -108,6 +108,41 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
 | `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` | 5 | 模型全链不可用时自动暂停后的退避重试次数上限，用尽转人工（0 = 不自动重试，立刻等人点 ▶） |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
+| `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
+| `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
+| `LATTE_AGENT_PARALLEL_TOOL_CALLS` | 1（开） | 下发 OpenAI 协议的 `parallel_tool_calls`，显式声明"一条响应里可以发多个工具调用"。`0`/`false`/`off` → 下发 `false` 强制单调用；`omit` → 字段完全不下发（个别兼容端点不认它，如 litellm #22637 的 Bedrock Converse + Claude 4.5）。Anthropic 默认就允许并行，该路径不下发 |
+| `LATTE_AGENT_DELEGATE_PARALLEL` | 0（关） | 同一轮里 ≥2 个 `delegate` 调用并发派发。默认关：子 agent 会写文件，并发有真实竞态风险 |
+
+### 减少模型往返（read 批量读）
+
+`read` 接受 `paths` 数组，一次调用读多个文件（上限 10 个），内部并发、按输入顺序回传：
+
+```json
+{"paths": ["src/a.c:20-80", "include/b.h", "src/c.c:raw"]}
+→ {"files": [ …每项与单文件返回逐字段一致… ], "failed": [{"path": …, "error": …}], "count": 3}
+```
+
+- **部分失败不整体失败**：一个路径读不到只出现在 `failed` 里，其余文件照常返回。
+- **字节预算** 192KB，按输入顺序累加；超出的文件转进 `failed` 并说明是预算而非文件坏了（第一个文件永远收下）。
+- 单路径调用（`{"path": "..."}`）的返回形状**逐字段不变**，不包 `files`。
+
+> **为什么批量读比工具并发重要得多**：实测，programmer 那 594s 里
+> 185 次工具调用的真实 I/O 合计只有 **18s**，其余全是 186 次模型往返。把 4 个
+> 独立取证并成 1 次调用，省的是 3 次**秒级**往返（还包括重传整个对话历史），
+> 而不是 3 次**毫秒级** I/O。工具侧并发（`LATTE_AGENT_READONLY_PARALLEL`）
+> 的天花板就是那 18s，作用是"批量之后工具侧不要变成新瓶颈"。
+
+> **只读并发的边界**：任何非只读工具（`bash` / `write` / `edit` / `delegate`）都是**屏障**，
+> 它前后的只读调用不会被合并进同一个并发段——`bash "echo x > f"` → `read f` 仍严格
+> 按模型给出的顺序执行。记账（死循环探测、`tool_result` 回填、`PermanentExec` 连击
+> 熔断）一律按原始调用顺序进行，模型看到的消息序列与串行路径逐字节一致；并发只
+> 改变「工具什么时候真正执行」。
+>
+> 注意这个开关的收益**取决于模型是否批量发调用**。实测会话的实测是 186 轮里
+> 185 轮只发 1 个工具调用（`parsed` 长度恒为 1），此时并发无从发生、行为与串行完全
+> 相同。让模型批量发靠两件事：角色 prompt 里的硬要求（programmer / architect /
+> `prompts/tools/read.md` 已加），以及 `read` 的 `paths` 批量入口——后者不依赖模型
+> 是否愿意发并行 tool_calls，是更可靠的一条路。
 
 > **关于 workflow 的「防挂死」**：曾有一个 `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`
 > 按分派单元数推算 workflow 的 wall-clock 时间上限，跑满即中止。它只看**总时长**、
