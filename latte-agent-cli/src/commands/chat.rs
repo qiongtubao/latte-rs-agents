@@ -31,6 +31,10 @@ use super::config_layer::{self, CliOverrides};
 use super::style;
 type AnyResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+/// "用户主动中止本轮"的哨兵错误串。REPL 主循环据此跳过 auto-save 与
+/// 退出，只是回到提示符——Ctrl-C 停一轮不该终结整个会话。
+const TURN_CANCELLED: &str = "__latte_turn_cancelled__";
+
 /// `println!` 的分离模式替代品。参数与 `println!` 完全一致，便于原地替换。
 macro_rules! ui_println {
     () => { ui_out("") };
@@ -394,6 +398,10 @@ impl ChatCmd {
                 }
             };
             if let Err(e) = session.turn(&line).await {
+                // 用户 Ctrl-C 中止：回到提示符，不 auto-save、不退出。
+                if e.to_string().contains(TURN_CANCELLED) {
+                    continue;
+                }
                 // Auto-save on turn failure so the user can resume
                 // with `latte-agent chat --resume <path>` after the
                 let saved = session.save_to_default();
@@ -559,7 +567,49 @@ impl ChatSession {
         } else {
             Some(style::Spinner::start("thinking…"))
         };
-        let result = self.runner.run_turn(&msgs, None).await;
+        // 可取消地跑：Ctrl-C（turn 进行中）置 `turn_cancel_flag`，这里
+        // 轮询到就 abort 掉 join handle。与 UI 的 driver 同一模式
+        // （`controller.rs` 里也是 spawn + 轮询 + `run_handle.abort()`），
+        // 因为 `AgentRunner` 本身没有取消入口，只能靠丢弃 future 中止。
+        //
+        // 分离模式才启用：非 TTY（管道 / e2e）没有 Ctrl-C 来源，直接
+        // await 保持原路径逐字节不变。
+        let result = if split {
+            turn_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+            turn_in_flight().store(true, std::sync::atomic::Ordering::SeqCst);
+            // runner 是 `&mut self` 借用，移不进 `tokio::spawn`，所以用
+            // `select!` 与取消轮询竞速：取消胜出时 `run_turn` 的 future
+            // 被丢弃，等价于 abort（在途 HTTP 与工具循环一起停）。
+            let outcome = {
+                let cancel_watch = async {
+                    loop {
+                        if turn_cancel_flag().load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    }
+                };
+                tokio::select! {
+                    r = self.runner.run_turn(&msgs, None) => Some(r),
+                    _ = cancel_watch => None,
+                }
+            };
+            turn_in_flight().store(false, std::sync::atomic::Ordering::SeqCst);
+            match outcome {
+                Some(r) => r,
+                None => {
+                    ui_emit("⛔ 本轮已中止（Ctrl-C）");
+                    ui_set_activity(None);
+                    // 用哨兵串标识"用户主动中止"，与真正的 turn 失败区分。
+                    // 不区分的话：REPL 主循环拿到 Err 会 auto-save +
+                    // 打印 `turn failed` + **退出整个会话**——而用户
+                    // 按 Ctrl-C 只想停这一轮（实测复现）。
+                    return Err(TURN_CANCELLED.into());
+                }
+            }
+        } else {
+            self.runner.run_turn(&msgs, None).await
+        };
         match spinner {
             Some(sp) => sp.stop(),
             None => ui_set_activity(None),
@@ -612,15 +662,19 @@ impl ChatSession {
             "/roles" => {
                 let mut ids: Vec<&String> = self.merged.roles.keys().collect();
                 ids.sort();
-                ui_println!("Available roles ({}):", ids.len());
+                // 攒成一段再输出：分离模式下每次输出都要清+重画整个
+                // viewport，逐行发 51 个角色就是 51 次重绘（实测
+                // `/roles` 制造了 900+ 个重绘段）。攒批后只有 1 次。
+                let mut buf = format!("Available roles ({}):", ids.len());
                 for id in ids {
                     if let Some(tpl) = self.merged.roles.get(id) {
-                        ui_println!(
-                            "  {} \u{2014} {} [{}]",
+                        buf.push_str(&format!(
+                            "\n  {} \u{2014} {} [{}]",
                             id, tpl.name, tpl.model_tier
-                        );
+                        ));
                     }
                 }
+                ui_out(&buf);
             }
             "/role" => {
                 let Some(id) = rest.first() else {
@@ -750,6 +804,14 @@ impl ChatSession {
             "/clear" => {
                 self.runner.context_mut().clear();
                 self.last_response = None;
+                // advisor 宿主状态也要清：`last_user_input` 是审查 prompt
+                // 的「主诉求」基准，残留会让清空后的第一次审查拿**上一个
+                // 话题**当准绳；未消费的 hint 会串到新话题上。
+                {
+                    let host = cli_advisor_host();
+                    host.last_input.lock().clear();
+                    host.hints.lock().clear();
+                }
                 ui_println!("Context cleared.");
             }
             "/save" => {
@@ -782,10 +844,16 @@ impl ChatSession {
                 if msgs.is_empty() {
                     ui_println!("(no messages)");
                 } else {
+                    // 同上：长会话里 /history 会有几十行。
+                    let mut buf = String::new();
                     for (i, m) in msgs.iter().enumerate() {
                         let preview: String = m.as_text().chars().take(80).collect();
-                        ui_println!("{:>3} [{:?}] {}", i, m.role, preview);
+                        if !buf.is_empty() {
+                            buf.push('\n');
+                        }
+                        buf.push_str(&format!("{:>3} [{:?}] {}", i, m.role, preview));
                     }
+                    ui_out(&buf);
                 }
             }
             "/status" => {
@@ -827,10 +895,13 @@ impl ChatSession {
                 if tools.is_empty() {
                     ui_println!("role '{}' has no tools configured", self.role_id);
                 } else {
-                    ui_println!("role '{}' tools ({}):", self.role_id, tools.len());
+                    // 同 /roles：攒批，避免逐行重绘。
+                    let mut buf =
+                        format!("role '{}' tools ({}):", self.role_id, tools.len());
                     for t in &tools {
-                        ui_println!("  - {}", t);
+                        buf.push_str(&format!("\n  - {t}"));
                     }
+                    ui_out(&buf);
                     ui_println!(
                         "\nFormat: <tool_call>{} {{\"arg\": \"value\"}}</tool_call>",
                         tools.first().map(String::as_str).unwrap_or("name")
@@ -1328,6 +1399,19 @@ impl Drop for UiGuard {
     fn drop(&mut self) {
         ui_leave();
     }
+}
+
+/// 当前是否有 turn 在跑。输入线程据此决定 Ctrl-C 的语义：
+/// 跑着 → 中止本轮；空闲 → 只清输入行。
+fn turn_in_flight() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &F
+}
+
+/// 本轮取消请求。Ctrl-C（turn 进行中）置位，`turn()` 轮询到即 abort。
+fn turn_cancel_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &F
 }
 
 /// 交互输出（斜杠命令的回显、响应正文）：分离模式走历史区，非 TTY
@@ -2595,10 +2679,21 @@ fn spawn_input_thread() {
                         let _ = tx.send(InputEvent::Eof);
                         return;
                     }
+                    // Ctrl-C 分两级，对齐终端习惯（curl / 多数 REPL）：
+                    // turn 进行中 → 中止本轮（相当于 UI 的
+                    // `/chat/cancel-turn`）；空闲 → 只清输入行。
+                    //
+                    // 只清行不中止是反直觉的：用户在一个跑了十几分钟的
+                    // turn 里按 Ctrl-C，期望的是"停下来"。
                     KeyOutcome::Interrupt => {
                         ui.redraw();
                         drop(g);
-                        ui_emit("^C");
+                        if turn_in_flight().load(std::sync::atomic::Ordering::SeqCst) {
+                            turn_cancel_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+                            ui_emit("^C 正在中止本轮…");
+                        } else {
+                            ui_emit("^C");
+                        }
                     }
                     KeyOutcome::Redraw => ui.redraw(),
                     KeyOutcome::HistoryPrev => {
@@ -3299,6 +3394,32 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// `/clear` 必须连 advisor 宿主状态一起清。
+    ///
+    /// `last_user_input` 是审查 prompt 的「主诉求」基准，残留会让清空后
+    /// 的第一次审查拿**上一个话题**当准绳；未消费的 hint 会串到新话题上。
+    #[test]
+    fn clear_command_also_resets_advisor_host_state() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+        let body = src
+            .split("\"/clear\" => {")
+            .nth(1)
+            .expect("/clear 分支应存在");
+        let body = body.split("\n            \"").next().unwrap_or(body);
+        assert!(
+            body.contains("last_input.lock().clear()"),
+            "/clear 必须清 advisor 的 last_user_input（审查基准）"
+        );
+        assert!(
+            body.contains("hints.lock().clear()"),
+            "/clear 必须清未消费的 advisor hint，否则会串到新话题"
+        );
     }
 
     #[test]

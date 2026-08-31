@@ -222,6 +222,83 @@ fn input_line_is_live_during_a_turn() {
     );
 }
 
+/// Ctrl-C 在 turn **进行中**必须中止本轮，且**不能终结会话**。
+///
+/// 两处曾经的问题：
+/// 1. 原来 Ctrl-C 只清输入行，turn 继续跑——用户在一个跑了十几分钟的
+///    turn 里按 Ctrl-C，期望的是"停下来"；
+/// 2. 加了中止之后，中止走 `Err` 路径被当成 turn 失败：触发 auto-save、
+///    打印 `turn failed`，且 REPL 主循环拿到 `Err` 会**退出整个会话**。
+///    实测复现，靠哨兵错误串区分。
+#[test]
+fn ctrl_c_cancels_the_turn_without_killing_the_session() {
+    if !python3_available() {
+        eprintln!("[skip] python3 不可用，跳过 pty 交互测试");
+        return;
+    }
+    let cwd = scratch_dir("ctrlc");
+    let out = drive(
+        &cwd,
+        &[
+            ("4.0", "用一千字详细讲讲内存分配器的完整历史"),
+            // turn 跑起来后按 Ctrl-C（`~` = 不补回车，直接发控制字符）。
+            ("6.0", "~\u{3}"),
+            // 中止后会话必须还活着：再发一轮短问题应能正常完成。
+            ("5.0", "用一句话说你好"),
+            ("30.0", "/quit"),
+        ],
+    );
+    assert!(
+        out.contains("本轮已中止"),
+        "Ctrl-C 应中止当前 turn：\n{}",
+        tail(&out)
+    );
+    assert!(
+        !out.contains("auto-save"),
+        "用户主动中止不该被当成 turn 失败而 auto-save：\n{}",
+        tail(&out)
+    );
+    assert!(
+        !out.contains("turn failed"),
+        "用户主动中止不该打印 `turn failed`：\n{}",
+        tail(&out)
+    );
+    // 会话存活的证据：中止之后仍完成了一次 turn。
+    assert!(
+        out.contains("TurnEnd"),
+        "中止后应还能正常跑完下一轮（会话未退出）：\n{}",
+        tail(&out)
+    );
+}
+
+/// 多行命令输出必须**攒成一段**再发，不能逐行发。
+///
+/// 分离模式下每次输出都要清+重画整个 viewport，逐行发 51 个角色就是
+/// 51 次重绘。实测：批量化前 8 次 `/roles` 制造 936 个重绘段 / 67KB，
+/// 批量化后 108 段 / 31KB。不是正确性问题，但在慢终端上会可见闪烁。
+#[test]
+fn multi_line_command_output_is_batched() {
+    if !python3_available() {
+        eprintln!("[skip] python3 不可用，跳过 pty 交互测试");
+        return;
+    }
+    let cwd = scratch_dir("batch");
+    // 连发 4 次 /roles（每次 50+ 行）。
+    let out = drive(
+        &cwd,
+        &[("4.0", "/roles"), ("1.2", "/roles"), ("1.2", "/roles"), ("1.2", "/roles"), ("1.5", "/quit")],
+    );
+    let listings = out.matches("Available roles (").count();
+    assert!(listings >= 3, "至少应有 3 次 /roles 输出，实际 {listings}");
+    // `\x1b[J`（清到屏幕底）是每次 viewport 重绘的指纹。
+    let redraws = out.matches("\u{1b}[J").count();
+    // 逐行发时每个角色一次重绘（4×51≈200+，实测 936）；攒批后应远低于此。
+    assert!(
+        redraws < 60 * listings,
+        "重绘次数 {redraws} 相对 {listings} 次列表输出过多，多行输出可能又变成逐行发了"
+    );
+}
+
 fn tail(s: &str) -> String {
     let n = s.chars().count();
     s.chars().skip(n.saturating_sub(1200)).collect()
