@@ -22,6 +22,7 @@ toml = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }

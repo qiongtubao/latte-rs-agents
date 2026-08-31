@@ -14,6 +14,7 @@ pub mod repl;
 pub mod resume;
 pub mod role_injector;
 pub mod run;
+pub mod split_screen;
 pub mod style;
 pub mod ui;
 pub mod workflow;

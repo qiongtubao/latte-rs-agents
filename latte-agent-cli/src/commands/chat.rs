@@ -31,6 +31,13 @@ use super::config_layer::{self, CliOverrides};
 use super::style;
 type AnyResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
+/// `println!` 的分离模式替代品。参数与 `println!` 完全一致，便于原地替换。
+macro_rules! ui_println {
+    () => { ui_out("") };
+    ($($arg:tt)*) => { ui_out(&format!($($arg)*)) };
+}
+
+
 /// Start an interactive REPL chat session with a single agent.
 #[derive(Args, Debug)]
 pub struct ChatCmd {
@@ -223,6 +230,18 @@ impl ChatCmd {
         let resolver = resolved.resolver;
         let default_params = GenerateParams::default();
         let initial_role = self.role.clone().unwrap_or_else(|| "manager".into());
+        // Advisor 监察：旁路订阅会话事件流，异常时经 hint 注入纠偏
+        // （通道 A）+ 广播 🦉 气泡（通道 B）。此前只有 UI 会拉起它，
+        // chat 的顶层 turn 完全没有监察。
+        // 状态行的耗时刷新（每秒）。分离模式下显示「在干什么 · 干了多久」。
+        spawn_ui_status_ticker();
+        ensure_cli_advisor_monitor(
+            &merged,
+            &resolver,
+            default_params.clone(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            &initial_role,
+        );
         // Tier resolution: explicit --tier flag wins, otherwise the
         // role's `model_tier` from its TOML config. This is the
         // fix for "reviewer_sanity stays at standard instead of
@@ -327,22 +346,26 @@ impl ChatCmd {
             return Ok(());
         }
 
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
         let _term_width = style::terminal_width();
+        // 输入/显示分离：TTY 下历史推进 scrollback、状态行与输入行固定
+        // 在底部；非 TTY（管道 / 重定向 / e2e）`enter()` 返回 None，
+        // 全部调用点退回纯文本路径，输出逐字节不变。
+        *split_ui().lock() = super::split_screen::SplitScreen::enter("› ");
+        // 守卫必须是局部变量：static 永不 drop，靠 `Drop for SplitScreen`
+        // 恢复终端是不成立的（实机抓到 `?2004l` 从未下发）。
+        let _ui_guard = UiGuard;
+        // 立刻拉起常驻按键线程：输入行必须在**第一个 turn 期间**就已经
+        // 活着，不能等到第一次 read_user_line 才起——否则第一轮等待时
+        // 用户打的字仍然看不见。
+        spawn_input_thread();
         loop {
             let model_id = session.primary_model_id();
             let role_icon = session.role_icon();
             // Prompt: `👔 manager · deepseek-v4-flash › ` (colorized when TTY).
-            print!("{}", style::render_prompt(role_icon, &session.role_id, model_id));
-            stdout.flush()?;
-
-            let mut line = String::new();
-            let n = stdin.lock().read_line(&mut line)?;
-            if n == 0 {
-                println!();
+            let prompt = style::render_prompt(role_icon, &session.role_id, model_id);
+            let Some(line) = read_user_line(&prompt).await? else {
                 break;
-            }
+            };
 
             if line.trim().is_empty() {
                 continue;
@@ -354,6 +377,22 @@ impl ChatCmd {
                 continue;
             }
             let usage_before = session.runner.total_usage().clone();
+            // advisor 宿主接入：① 记录本轮用户输入（审查 prompt 的
+            // 「主诉求」基准）；② 取走上一轮 monitor 注入的纠正提示，
+            // 拼进本轮输入——与 controller 的 hint 队列（通道 A）等价。
+            let host = cli_advisor_host();
+            *host.last_input.lock() = line.trim().to_string();
+            let line = {
+                let hints: Vec<String> = std::mem::take(&mut *host.hints.lock());
+                if hints.is_empty() {
+                    line.clone()
+                } else {
+                    for h in &hints {
+                        ui_emit(&format!("🦉 advisor: {h}"));
+                    }
+                    format!("{line}\n\n【advisor 纠正提示】\n{}", hints.join("\n"))
+                }
+            };
             if let Err(e) = session.turn(&line).await {
                 // Auto-save on turn failure so the user can resume
                 // with `latte-agent chat --resume <path>` after the
@@ -385,11 +424,15 @@ impl ChatCmd {
                         resp,
                         style::terminal_width(),
                     );
-                    print!("{}", body);
+                    // 必须走 ui_emit：分离模式下直接 print! 会覆盖在
+                    // 底部的状态行/输入行上。非 TTY 时 ui_emit 退回
+                    // eprintln，但 TTY 判断已经保证走不到那条分支。
+                    ui_emit(body.trim_end_matches('\n'));
                 } else {
+                    // 非 TTY：保持原样 println 到 stdout（e2e 断言它）。
                     println!("{}", resp);
+                    io::stdout().flush()?;
                 }
-                stdout.flush()?;
             }
             let usage_after = session.runner.total_usage();
             let _in_delta = usage_after.input_tokens - usage_before.input_tokens;
@@ -502,12 +545,25 @@ impl ChatSession {
             tool_call_id: None,
             tool_calls: None
         }];
-        // Show a braille spinner while the model is generating. The
-        // spinner writes to stderr with `\r` so it doesn't fight
-        // stdout on a TTY; piped (non-TTY) runs get no decoration.
-        let spinner = style::Spinner::start("thinking…");
+        // 生成期间显示进度。两条路：
+        //
+        // - **分离模式**：走状态行（我们自己重绘、位置固定）。独立
+        //   spinner 在这里是**有害**的——它往 stderr 写 `\r\x1b[K`，
+        //   会把光标拉回行首并清行，正好擦掉底部的输入行。原注释说的
+        //   "用 `\r` 所以不会打架"只对旧的交错式输出成立。
+        // - **非分离模式**（管道 / 非 TTY）：保持原来的 braille spinner。
+        let split = split_ui().lock().is_some();
+        let spinner = if split {
+            ui_set_activity(Some("thinking…"));
+            None
+        } else {
+            Some(style::Spinner::start("thinking…"))
+        };
         let result = self.runner.run_turn(&msgs, None).await;
-        spinner.stop();
+        match spinner {
+            Some(sp) => sp.stop(),
+            None => ui_set_activity(None),
+        }
         match result {
             Ok(response) => {
                 if let Some(log) = &self.log {
@@ -556,10 +612,10 @@ impl ChatSession {
             "/roles" => {
                 let mut ids: Vec<&String> = self.merged.roles.keys().collect();
                 ids.sort();
-                println!("Available roles ({}):", ids.len());
+                ui_println!("Available roles ({}):", ids.len());
                 for id in ids {
                     if let Some(tpl) = self.merged.roles.get(id) {
-                        println!(
+                        ui_println!(
                             "  {} \u{2014} {} [{}]",
                             id, tpl.name, tpl.model_tier
                         );
@@ -568,7 +624,7 @@ impl ChatSession {
             }
             "/role" => {
                 let Some(id) = rest.first() else {
-                    println!("usage: /role <id>");
+                    ui_println!("usage: /role <id>");
                     return Ok(false);
                 };
                 let history: Vec<Message> =
@@ -600,7 +656,7 @@ impl ChatSession {
                             .collect();
                         self.runner = runner;
                         self.role_id = rid.clone();
-                        println!(
+                        ui_println!(
                             "Switched to role '{}' (tier {})",
                             rid,
                             self.tier.label()
@@ -620,13 +676,13 @@ impl ChatSession {
                         if let Some(log) = &self.log {
                             log.error("switch role failed", &[("error", e.to_string())]);
                         }
-                        println!("error: {}", e)
+                        ui_println!("error: {}", e)
                     }
                 }
             }
             "/model" => {
                 let Some(t) = rest.first() else {
-                    println!("usage: /model <premium|standard|budget>");
+                    ui_println!("usage: /model <premium|standard|budget>");
                     return Ok(false);
                 };
                 match parse_tier(t) {
@@ -659,7 +715,7 @@ impl ChatSession {
                                     .collect();
                                 self.runner = runner;
                                 self.tier = new_tier;
-                                println!("Switched to tier {}", self.tier.label());
+                                ui_println!("Switched to tier {}", self.tier.label());
                                 if let Some(log) = &self.log {
                                     log.info(
                                         "switch tier",
@@ -678,7 +734,7 @@ impl ChatSession {
                                         &[("error", e.to_string())],
                                     );
                                 }
-                                println!("error: {}", e)
+                                ui_println!("error: {}", e)
                             }
                         }
                     }
@@ -687,27 +743,27 @@ impl ChatSession {
                             log.warn("invalid tier", &[("input", t.to_string())]);
                             log.error("invalid tier", &[("error", e.to_string())]);
                         }
-                        println!("error: {}", e);
+                        ui_println!("error: {}", e);
                     }
                 }
             }
             "/clear" => {
                 self.runner.context_mut().clear();
                 self.last_response = None;
-                println!("Context cleared.");
+                ui_println!("Context cleared.");
             }
             "/save" => {
                 let Some(path) = rest.first() else {
-                    println!("usage: /save <file>");
+                    ui_println!("usage: /save <file>");
                     return Ok(false);
                 };
                 let n = self.runner.context().messages().len();
                 save_session(path, self.runner.context().messages())?;
-                println!("Saved {} messages to {}", n, path);
+                ui_println!("Saved {} messages to {}", n, path);
             }
             "/load" => {
                 let Some(path) = rest.first() else {
-                    println!("usage: /load <file>");
+                    ui_println!("usage: /load <file>");
                     return Ok(false);
                 };
                 let msgs = load_session(path)?;
@@ -715,7 +771,7 @@ impl ChatSession {
                 for m in msgs {
                     self.runner.context_mut().push(m);
                 }
-                println!(
+                ui_println!(
                     "Loaded {} messages from {}",
                     self.runner.context().messages().len(),
                     path
@@ -724,11 +780,11 @@ impl ChatSession {
             "/history" => {
                 let msgs = self.runner.context().messages();
                 if msgs.is_empty() {
-                    println!("(no messages)");
+                    ui_println!("(no messages)");
                 } else {
                     for (i, m) in msgs.iter().enumerate() {
                         let preview: String = m.as_text().chars().take(80).collect();
-                        println!("{:>3} [{:?}] {}", i, m.role, preview);
+                        ui_println!("{:>3} [{:?}] {}", i, m.role, preview);
                     }
                 }
             }
@@ -743,7 +799,7 @@ impl ChatSession {
                 let primary = chain.first().map(String::as_str).unwrap_or("?");
                 let usage = self.runner.total_usage();
                 let ctx_msgs = self.runner.context().messages().len();
-                println!(
+                ui_println!(
                     "role    : {}\n\
                      tier    : {}\n\
                      model   : {}\n\
@@ -769,20 +825,20 @@ impl ChatSession {
                     .map(|r| r.tools.clone())
                     .unwrap_or_default();
                 if tools.is_empty() {
-                    println!("role '{}' has no tools configured", self.role_id);
+                    ui_println!("role '{}' has no tools configured", self.role_id);
                 } else {
-                    println!("role '{}' tools ({}):", self.role_id, tools.len());
+                    ui_println!("role '{}' tools ({}):", self.role_id, tools.len());
                     for t in &tools {
-                        println!("  - {}", t);
+                        ui_println!("  - {}", t);
                     }
-                    println!(
+                    ui_println!(
                         "\nFormat: <tool_call>{} {{\"arg\": \"value\"}}</tool_call>",
                         tools.first().map(String::as_str).unwrap_or("name")
                     );
                 }
             }
             other => {
-                println!("unknown command: {} (try /help)", other);
+                ui_println!("unknown command: {} (try /help)", other);
             }
         }
         Ok(false)
@@ -895,6 +951,12 @@ async fn build_runner(
             .map_err(|e| format!("tool setup failed: {}", e))?;
         // Register the delegate tool so the manager can dispatch
         // subtasks to specialist agents.
+        //
+        // 门槛对齐 UI：controller 只给 `allowed_tools` 里声明了
+        // `delegate` 的角色注册。CLI 此前是**无条件**注册——任何角色
+        // （programmer / reviewer …）都能派活给别人，绕过了角色配置里
+        // 刻意收紧的权限边界，而同一个角色在 UI 里根本没有这个工具。
+        if role.allowed_tools.iter().any(|t| t == "delegate") {
         register_delegate_tool(
             &tm,
             Arc::new(merged.clone()),
@@ -924,6 +986,7 @@ async fn build_runner(
         )
         .await
         .map_err(|e| format!("delegate tool setup failed: {}", e))?;
+        }
         // Register the `workflow` tool for roles that declare it
         // (manager). The controller/UI path already did this; the REPL
         // path was missing it, so a REPL manager could never run named
@@ -940,6 +1003,62 @@ async fn build_runner(
             .await
             .map_err(|e| format!("workflow tool setup failed: {}", e))?;
         }
+        // 顶层 `ask`（选择题）对齐 UI：controller 路径给每个声明了
+        // `ask` 的角色注册 core 版 ask 工具，REPL 路径此前完全没有
+        // ——同一个角色（tutor / manager）在 UI 里能弹选择题，在 chat
+        // 里调 `ask` 直接 ToolNotFound。
+        //
+        // 用 fire-and-forget（`blocking = None`），与 controller 顶层
+        // turn 的语义一致：结束本轮、答案作为下一条 user 消息回喂。
+        // 阻塞版只属于 workflow / delegate 的子代理（它们等得起）。
+        // 落盘归属 `(cwd, session_id)` 同样对齐：进程重启后
+        // `.latte/pending-asks/` 能把待办弹框补回来。
+        if role.allowed_tools.iter().any(|t| t == "ask") {
+            latte_agent_core::controller::register_ask_tool(
+                &tm,
+                cli_session_event_tx().clone(),
+                role_id.to_string(),
+                None,
+                Some((cwd.to_path_buf(), cli_session_id())),
+            )
+            .map_err(|e| format!("ask tool setup failed: {}", e))?;
+        }
+        // `plan` / `task_report` 对齐 UI：controller 给声明了它们的角色
+        // （manager 两个都声明了）注册，REPL 路径此前完全没有——manager
+        // 的 prompt 教它用 `plan` 提交任务候选、用 `task_report` 回报看板
+        // 结果，在 chat 里调用却是 ToolNotFound。
+        if role.allowed_tools.iter().any(|t| t == "plan") {
+            latte_agent_core::controller::register_plan_tool(
+                &tm,
+                cli_session_event_tx().clone(),
+                role_id.to_string(),
+                Arc::new(parking_lot::RwLock::new(
+                    latte_agent_core::controller::PlanStage::Normal,
+                )),
+                cwd,
+                cli_session_id(),
+            )
+            .map_err(|e| format!("plan tool setup failed: {}", e))?;
+        }
+        if role.allowed_tools.iter().any(|t| t == "task_report") {
+            latte_agent_core::controller::register_task_report_tool(
+                &tm,
+                cli_session_event_tx().clone(),
+                role_id.to_string(),
+            )
+            .map_err(|e| format!("task_report tool setup failed: {}", e))?;
+        }
+        // `generate_image` 对齐 UI（已是 pub，无需改可见性）。
+        if role.allowed_tools.iter().any(|t| t == "generate_image") {
+            latte_agent_core::image_gen::register_generate_image_tool(
+                &tm,
+                merged,
+                cli_session_event_tx().clone(),
+                cwd.to_path_buf(),
+                role_id.to_string(),
+            )
+            .map_err(|e| format!("generate_image tool setup failed: {}", e))?;
+        }
         // HIL v1.1 phase 6: wire the `ask_human` tool for every
         // non-manager role. The tool pauses the shared session
         // when a specialist needs clarification, surfacing the
@@ -954,14 +1073,14 @@ async fn build_runner(
         }
         with_session(
             AgentRunner::new_with_tools(agent, tm)
-                .with_sink(Arc::clone(&sink))
+                .with_sink(cli_top_level_sink(&sink))
                 .with_hooks(Arc::clone(&hooks))
                 .with_role(role_id)
         )
     } else {
         with_session(
             AgentRunner::new(agent)
-                .with_sink(Arc::clone(&sink))
+                .with_sink(cli_top_level_sink(&sink))
                 .with_hooks(Arc::clone(&hooks))
                 .with_role(role_id)
         )
@@ -1001,6 +1120,642 @@ pub async fn build_tool_manager(
         }
     }
     Ok(mgr)
+}
+
+/// 拉起 CLI 的 advisor 监察（幂等，进程内只跑一份）。
+///
+/// 与 UI（`sessions.rs`）同构：`AdvisorReviewEngine` + watchdog 笔记 +
+/// review 设置 + 给 advisor 自己分配一个 subsession sink（每次 review
+/// 的模型往返落 `<cli-sessions>/<sid>/advisor-<micros>.jsonl`）。
+/// 配置关掉 advisor 时直接不拉。
+fn ensure_cli_advisor_monitor(
+    merged: &AgentConfig,
+    resolver: &ModelResolver,
+    default_params: GenerateParams,
+    cwd: &Path,
+    watched_role: &str,
+) {
+    use latte_agent_core::advisor_monitor::{
+        AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine,
+    };
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.get().is_some() {
+        return;
+    }
+    let cfg = AdvisorMonitorConfig {
+        enabled: merged.advisor.enabled(),
+        ..AdvisorMonitorConfig::default()
+    };
+    if !cfg.enabled {
+        return;
+    }
+    let _ = STARTED.set(());
+    let engine = AdvisorReviewEngine::new(
+        Arc::new(merged.clone()),
+        Arc::new(resolver.clone()),
+        default_params,
+    )
+    .with_watchdog_notes(cwd.to_path_buf(), cfg.watchdog_notes)
+    .with_review_settings(cfg.review_settings);
+    let (_sub_id, sink) = cli_subsession_store().create(&cli_session_id(), "advisor");
+    let engine = engine.with_subsession_sink(sink);
+    AdvisorMonitor::spawn_on_host(
+        cli_advisor_host(),
+        cfg,
+        engine,
+        watched_role.to_string(),
+    );
+}
+
+/// 顶层 runner 的 sink：既有的 trace sink（CliRenderer / jsonl / index）
+/// **并上** `ChatEventTraceSink`。
+///
+/// 后者把 TraceSink 事件转成 `ChatEvent` 送进会话级通道，供 advisor
+/// monitor 消费。这样接的好处是渲染路径完全不动——`CliRenderer` 照旧
+/// 从 TraceSink 拿事件，monitor 从 broadcast 拿，谁也不用改。
+fn cli_top_level_sink(
+    base: &Arc<dyn latte_agent_core::trace::TraceSink>,
+) -> Arc<dyn latte_agent_core::trace::TraceSink> {
+    Arc::new(latte_agent_core::trace::FanOutSink::new(vec![
+        Arc::clone(base),
+        Arc::new(latte_agent_core::controller::ChatEventTraceSink {
+            event_tx: cli_session_event_tx().clone(),
+            // 顶层角色不属于任何 subsession。
+            sub_id: None,
+        }),
+    ]))
+}
+
+/// CLI REPL 作为 advisor 监察的宿主。
+///
+/// 修的是：`AdvisorMonitor` 原来只由 `ChatController::spawn` 拉起，而
+/// chat 不走 controller，于是顶层 turn 完全没有 advisor 监察——
+/// intervene/warn 气泡、派单路由审查、以及全部确定性检测器（D3 文件
+/// 不存在连击、D8 串行 delegate…）在 chat 里一个都不跑，同一个会话
+/// 在 UI 里跑就有。
+///
+/// 事件来源不需要改 REPL 的渲染路径：`ChatEventTraceSink` 挂在顶层
+/// runner 的 sink fanout 上，把 TraceSink 事件转成 ChatEvent 送进会话
+/// 级通道，`CliRenderer` 照旧从 TraceSink 渲染，两者互不干扰。
+struct CliAdvisorHost {
+    /// monitor 注入的纠正提示。REPL 主循环在下一轮取走，拼进用户输入前。
+    hints: Arc<parking_lot::Mutex<Vec<String>>>,
+    /// 最近一条用户输入，作为「主诉求」喂给审查 prompt。
+    last_input: Arc<parking_lot::Mutex<String>>,
+    /// terminate 裁决时置位；REPL 在轮次边界检查。
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl latte_agent_core::advisor_monitor::AdvisorHost for CliAdvisorHost {
+    fn subscribe(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<latte_agent_core::controller::ChatEvent> {
+        cli_session_event_tx().subscribe()
+    }
+    fn event_sender(
+        &self,
+    ) -> tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent> {
+        cli_session_event_tx().clone()
+    }
+    fn advisor_hint(&self, text: &str) {
+        self.hints.lock().push(text.to_string());
+    }
+    fn last_user_input(&self) -> String {
+        self.last_input.lock().clone()
+    }
+    fn request_cancel_turn(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        // CLI 没有 controller 的 input 通道要唤醒：置标志即可，
+        // REPL 在轮次边界读它。
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {})
+    }
+}
+
+/// 进程级单例：REPL 主循环与 monitor 共享同一份 hint / 输入 / 取消状态。
+fn cli_advisor_host() -> Arc<CliAdvisorHost> {
+    static HOST: std::sync::OnceLock<Arc<CliAdvisorHost>> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        Arc::new(CliAdvisorHost {
+            hints: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            last_input: Arc::new(parking_lot::Mutex::new(String::new())),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    })
+    .clone()
+}
+
+/// 进程级共享的分离式屏幕。
+///
+/// 必须共享：REPL 用它读输入，事件消费者用它把历史行推进 scrollback，
+/// ask 选择器两样都用。如果消费者绕过它直接 `eprintln!`，输出会覆盖在
+/// 输入行上——"分离"就白做了。
+///
+/// `None` = 非 TTY（管道 / 重定向 / e2e），全部调用点退回纯文本路径。
+fn split_ui() -> &'static parking_lot::Mutex<Option<super::split_screen::SplitScreen>> {
+    static UI: std::sync::OnceLock<parking_lot::Mutex<Option<super::split_screen::SplitScreen>>> =
+        std::sync::OnceLock::new();
+    UI.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// 当前活动的简报 + 起始时刻，供状态行显示"在干什么 · 干了多久"。
+///
+/// 分开存而不是把耗时直接写进 `ui_status`：耗时要每秒变，但事件只在
+/// step/delegate 边界到达。所以事件只更新"在干什么"，另有一个定时任务
+/// 负责把秒数刷上去。
+fn ui_activity() -> &'static parking_lot::Mutex<Option<(String, std::time::Instant)>> {
+    static A: std::sync::OnceLock<parking_lot::Mutex<Option<(String, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    A.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+/// 设置当前活动（`None` = 空闲，清空状态行）。
+fn ui_set_activity(label: Option<&str>) {
+    let mut g = ui_activity().lock();
+    match label {
+        Some(l) => *g = Some((l.to_string(), std::time::Instant::now())),
+        None => {
+            *g = None;
+            drop(g);
+            ui_status("");
+        }
+    }
+}
+
+/// 起一个每秒刷状态行的任务（幂等，进程内只跑一份）。
+///
+/// 只在分离模式下有意义：非 TTY 时 `ui_status` 是空操作，任务空转但
+/// 无副作用（每秒一次，可忽略）。
+fn spawn_ui_status_ticker() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let snapshot = ui_activity().lock().clone();
+            if let Some((label, started)) = snapshot {
+                let secs = started.elapsed().as_secs();
+                ui_status(&format!("⚙ {label} · {secs}s"));
+            }
+        }
+    });
+}
+
+/// 退出分离模式并恢复终端（幂等）。
+///
+/// **必须显式调用**：`SplitScreen` 存在 `static` 里，而 Rust 的 static
+/// 永不 drop——靠 `Drop for SplitScreen` 恢复终端是不成立的。不调它的
+/// 后果是 `latte-agent chat` 退出后用户的终端留在 raw mode（无回显，
+/// 只能盲敲 `reset`）+ bracketed paste 未关。实机在伪终端里抓到过：
+/// `?2004h` 有、`?2004l` 没有。
+fn ui_leave() {
+    if let Some(mut ui) = split_ui().lock().take() {
+        ui.leave();
+    }
+}
+
+/// 作用域守卫：REPL 无论正常退出、`?` 早退还是 panic，都恢复终端。
+///
+/// 是**局部变量**而非 static，所以 Drop 一定会跑——这正是 `static` 做
+/// 不到的那一点。
+struct UiGuard;
+
+impl Drop for UiGuard {
+    fn drop(&mut self) {
+        ui_leave();
+    }
+}
+
+/// 交互输出（斜杠命令的回显、响应正文）：分离模式走历史区，非 TTY
+/// 退回 **stdout** 的 `println!`。
+///
+/// 与 [`ui_emit`] 的区别只在降级目标：后台事件原本是 `eprintln!`（stderr），
+/// 命令输出原本是 `println!`（stdout），而 CLI 侧 e2e 断言的是 stdout。
+/// 混用会让 `/roles`、`/history` 这类输出跑到 stderr 上，测试看不见。
+fn ui_out(text: &str) {
+    let mut g = split_ui().lock();
+    match g.as_mut() {
+        Some(ui) => ui.emit(text),
+        None => println!("{text}"),
+    }
+}
+
+/// 把一行输出交给分离式屏幕；非 TTY 时退回 `eprintln!`。
+///
+/// 所有后台事件的输出都必须走这里，不要直接 `eprintln!`。
+fn ui_emit(text: &str) {
+    let mut g = split_ui().lock();
+    match g.as_mut() {
+        Some(ui) => ui.emit(text),
+        None => eprintln!("{text}"),
+    }
+}
+
+/// 更新状态行（仅分离模式有效；非 TTY 时静默丢弃——它是易失信息，
+/// 塞进被 grep 的 stdout 只会污染 e2e 断言）。
+fn ui_status(text: &str) {
+    if let Some(ui) = split_ui().lock().as_mut() {
+        ui.set_status(text);
+    }
+}
+
+/// 取首行并按**字符**（非字节）截断，用于事件行的简报。
+/// 按字节切会把多字节字符切一半 panic —— 任务描述基本都是中文。
+fn first_line_brief(s: &str, max_chars: usize) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= max_chars {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(max_chars).collect();
+    format!("{head}…")
+}
+
+/// CLI REPL 的**会话级**事件通道，对齐 UI 的"每 session 一个 broadcast"。
+///
+/// `latte-agent chat` 一个进程就是一个会话，所以进程级单例与 UI 的
+/// per-session 通道语义等价。首次取用时顺带把终端事件消费者拉起来
+/// （渲染进度 + 让阻塞式 `ask` 可回答）。
+///
+/// 为什么不再每次 workflow 建一个通道：`choice::register` /
+/// `register_prompt` 会把 sender 克隆存进挂起表，未回答的挂起项让通道
+/// 永不关闭。此前 per-run 通道要靠"有界等待 + abort"兜底才不死锁；
+/// 会话级通道活到进程结束，根本不需要收尾，那类死锁不可能发生。
+fn cli_session_event_tx()
+-> &'static tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent> {
+    static TX: std::sync::OnceLock<
+        tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent>,
+    > = std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = tokio::sync::broadcast::channel(256);
+        // 消费者随进程存活；REPL 退出即进程退出，无需回收。
+        spawn_cli_workflow_event_consumer_with(rx, terminal_ask_answerer());
+        tx
+    })
+}
+
+/// CLI 会话 id：`ask` 的落盘补发（`.latte/pending-asks/`）按
+/// `(cwd, session_id)` 归属，UI 侧用真实 session id，CLI 用进程 id
+/// 保证同一次运行内稳定、跨运行不串。
+fn cli_session_id() -> String {
+    format!("cli-{}", std::process::id())
+}
+
+/// CLI REPL 的子会话存储，对齐 UI 的 `b.subsession_store`。
+///
+/// UI 落 `<cwd>/.latte/ui-sessions/`；CLI 落 `<cwd>/.latte/cli-sessions/`
+/// ——刻意分开：`ui-sessions` 是 UI 的 session 索引根，混进 CLI 的记录
+/// 会让 UI 侧列出不存在的会话。两边都能被 `latte-agent debug` 系列读到。
+///
+/// 没有这个的后果（原状）：CLI 跑 workflow 时每个 specialist 的完整
+/// 子会话日志（prompt / 模型往返 / 工具调用）**一条都不落盘**，
+/// `latte-agent debug session|trace|tokens` 对 CLI 的 workflow 全瞎，
+/// 而同一个 workflow 在 UI 里跑就有完整记录。
+fn cli_subsession_store() -> Arc<latte_agent_core::subsession::SubsessionStore> {
+    static STORE: std::sync::OnceLock<Arc<latte_agent_core::subsession::SubsessionStore>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let base = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".latte")
+                .join("cli-sessions");
+            Arc::new(latte_agent_core::subsession::SubsessionStore::with_persistence(base))
+        })
+        .clone()
+}
+
+/// 建 CLI REPL 用的 [`WorkflowRunContext`]，挂在会话级事件通道上。
+fn cli_workflow_ctx(
+    merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    default_params: GenerateParams,
+    cwd: PathBuf,
+) -> latte_agent_core::workflow::WorkflowRunContext {
+    cli_workflow_ctx_on(
+        merged,
+        resolver,
+        default_params,
+        cwd,
+        cli_session_event_tx().clone(),
+    )
+}
+
+fn cli_workflow_ctx_on(
+    merged: Arc<AgentConfig>,
+    resolver: Arc<ModelResolver>,
+    default_params: GenerateParams,
+    cwd: PathBuf,
+    event_tx: tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent>,
+) -> latte_agent_core::workflow::WorkflowRunContext {
+    let merged_for_advisor = merged.clone();
+    latte_agent_core::workflow::WorkflowRunContext {
+        merged,
+        resolver,
+        default_params,
+        cwd,
+        event_tx,
+        cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        turn_cancel_flag: None,
+        agent_pause_gate: None, // CLI REPL workflow：无 session agent gate
+        depth: 0,
+        // 顶层 run：自己就是嵌套链的根。
+        root_wf_id: None,
+        // 对齐 UI（tasks.rs 的 workflow ctx）：分派建 subsession、过
+        // advisor gate。原状是两个都 None，导致同一个 workflow 在 chat
+        // 里跑**没有子会话日志、也不过 advisor 的返回审查**——UI 里
+        // 会被 intervene 打回重做的产出，chat 里直接放行。
+        subsession_store: Some(cli_subsession_store()),
+        session_id: Some(cli_session_id()),
+        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+            enabled: merged_for_advisor.advisor.enabled(),
+            ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+        }
+        .runner_gate(),
+        // intervene 暂停门（v4 起休眠，UI 侧也常为 None）：CLI 无
+        // session 级门，保持 None 与 UI 的休眠语义一致。
+        advisor_pause: None,
+        staging: None,
+    }
+}
+
+/// 一道待回答的选择题交给"回答器"的入参。抽出来是为了让事件消费循环
+/// 可测——终端实现读 stdin，测试注入预设答案。
+struct AskRequest {
+    role_id: String,
+    question: String,
+    multi: bool,
+    options: Vec<latte_agent_core::controller::ChoiceOption>,
+}
+
+/// 回答器：拿到一道题给出答案，`None` = 无法作答（stdin EOF 等）。
+type AskAnswerer = Arc<
+    dyn Fn(AskRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// 终端回答器：渲染编号选项并读 stdin。
+fn terminal_ask_answerer() -> AskAnswerer {
+    Arc::new(|req: AskRequest| {
+        Box::pin(async move {
+            prompt_choice_on_terminal(&req.role_id, &req.question, req.multi, &req.options).await
+        })
+    })
+}
+
+/// 订阅 workflow 的事件通道，把阻塞式 `ask` 变成**终端里可回答**的选择器。
+///
+/// 修的 bug：`register_workflow_tool` 此前把 receiver 绑到 `_rx` 就不管了
+/// （"REPL 无 UI 消费者，事件丢弃"）。但 workflow step 注册的 `ask` 是
+/// **阻塞版**（`workflow.rs` 里的 `AskBlocking`），而 controller 侧写明
+/// 「无限等待用户」——超时路径已移除。两件事凑在一起的后果：
+///
+/// - `ChoiceRequested` 广播进空通道，用户在终端**什么都看不到**；
+/// - 工具调用挂在 oneshot 上永不返回，而唯一能 `choice::resolve` 的入口
+///   是 ui-server 的 HTTP 端点，终端里根本不存在；
+/// - 于是 `latte-agent chat -r manager` 一旦跑到带 `ask` 的 step
+///   （`design_and_plan` 第一步的 tutor 就是），整个会话静默永久挂死，
+///   只能 Ctrl-C，本轮进度全丢。
+///
+/// 现在：订阅同一个通道，阻塞式 ask 在终端渲染编号选项并读 stdin，
+/// 答完调 `choice::resolve` 把答案交回挂起的工具调用。
+///
+/// 读 stdin 是安全的：REPL 主循环此刻正 `await` 在 `session.turn()` 上，
+/// 只有 turn 结束后才会回去读下一行输入，不存在两处争抢 stdin。
+///
+/// 任务在所有 sender 被 drop（workflow 跑完）后自行退出。入口只有
+/// [`cli_workflow_ctx`]——不要在别处裸建 workflow 通道。
+fn spawn_cli_workflow_event_consumer_with(
+    mut rx: tokio::sync::broadcast::Receiver<latte_agent_core::controller::ChatEvent>,
+    answerer: AskAnswerer,
+) -> tokio::task::JoinHandle<()> {
+    use latte_agent_core::controller::ChatEvent;
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ChatEvent::ChoiceRequested {
+                    role_id,
+                    choice_id,
+                    question,
+                    multi,
+                    wait,
+                    options,
+                    ..
+                }) => {
+                    if !wait {
+                        // fire-and-forget：提问方没在等，回答会作为下一条
+                        // user 消息回喂。终端只提示，不阻塞。
+                        ui_emit(&format!(
+                            "❓ [{role_id}] {question}（{} 个选项，非阻塞：可在下一轮直接回答）",
+                            options.len()
+                        ));
+                        continue;
+                    }
+                    let req = AskRequest { role_id, question, multi, options };
+                    let answer = match answerer(req).await {
+                        Some(a) => a,
+                        None => {
+                            // stdin EOF / 读失败：不能静默——挂起的工具
+                            // 会永远等下去。取消这次 ask，让工具报错退出，
+                            // 至少把控制权还给用户。
+                            ui_emit("[ask] stdin 不可用，取消本次提问");
+                            latte_agent_core::choice::cancel(&choice_id);
+                            continue;
+                        }
+                    };
+                    if !latte_agent_core::choice::resolve(&choice_id, answer) {
+                        ui_emit(&format!(
+                            "[ask] 答案未送达（choice_id={choice_id} 已被取消或已回答）"
+                        ));
+                    }
+                }
+                // 进度可见性：没有这几行，用户无法区分「在等我回答」和
+                // 「还在干活」——这正是原来那个静默挂死难查的一半原因。
+                Ok(ChatEvent::WorkflowStep { step_id, index, total, role_id, .. }) => {
+                    // step 进度同时进历史与状态行：历史留痕，状态行给
+                    // "现在在哪一步"的常驻可见性（分离模式的主要收益）。
+                    ui_emit(&format!("  [step {index}/{total}] {step_id} → {role_id}"));
+                    ui_set_activity(Some(&format!("step {index}/{total} · {step_id} · {role_id}")));
+                }
+                Ok(ChatEvent::WorkflowFinished { name, status, .. }) => {
+                    ui_emit(&format!("  [workflow {name}] {status}"));
+                    ui_set_activity(None);
+                }
+                // advisor 的裁决气泡（monitor 的通道 B）。UI 里是一个
+                // 🦉 卡片，chat 里进历史区——原来这条事件在 CLI 完全
+                // 不可见，用户看不到 advisor 判了什么。
+                Ok(ChatEvent::RoleTurn { role_id, content, .. })
+                    if role_id == "advisor" =>
+                {
+                    ui_emit(&format!("🦉 {}", content.trim()));
+                }
+                Ok(ChatEvent::DelegateStarted { to_role, task, .. }) => {
+                    ui_emit(&format!("  → delegate {to_role}: {}", first_line_brief(&task, 90)));
+                    ui_set_activity(Some(&format!("delegate → {to_role}")));
+                }
+                Ok(ChatEvent::DelegateFinished { to_role, status, summary, .. }) => {
+                    ui_emit(&format!(
+                        "  ← delegate {to_role} {status} ({} chars)",
+                        summary.chars().count()
+                    ));
+                    ui_set_activity(None);
+                }
+                // ── 以下几条原来 CLI 一条都不处理，事件广播进空气 ──
+                //
+                // `Paused` 最严重：模型全链哑掉（如 glm-5.3 报 400 +
+                // MiniMax 流式空闲超时 + deepseek 余额不足）时后端自动
+                // 暂停等人，而 chat 里用户**看不到任何提示**，只觉得
+                // 卡死了。UI 侧这条会弹暂停条 + ▶ 按钮。
+                Ok(ChatEvent::Paused { reason }) => {
+                    ui_emit(&format!("⏸ 已自动暂停：{}", reason.trim()));
+                    ui_set_activity(Some("已暂停，等待恢复"));
+                }
+                Ok(ChatEvent::Resumed) => {
+                    ui_emit("▶ 已恢复");
+                    ui_set_activity(None);
+                }
+                // 模型/后端错误。原来只在 trace 里能看到，正文无提示。
+                Ok(ChatEvent::Error { message, .. }) => {
+                    ui_emit(&format!("⚠️ {}", first_line_brief(&message, 160)));
+                }
+                // 工具失败：D3 这类检测器靠它，用户也该看见。
+                Ok(ChatEvent::ToolError { role_id, tool_name, error, .. }) => {
+                    ui_emit(&format!(
+                        "  ✗ [{role_id}] {tool_name}: {}",
+                        first_line_brief(&error, 140)
+                    ));
+                }
+                // advisor 判 terminate 时中止本轮——不提示的话用户只看到
+                // 一个突然结束的轮次。
+                Ok(ChatEvent::AdvisorTerminated { role_id, reason, detector, .. }) => {
+                    let det = detector.unwrap_or_else(|| "?".into());
+                    ui_emit(&format!("🛑 advisor 中止 [{role_id} · {det}]: {}", reason.trim()));
+                    ui_set_activity(None);
+                }
+                // 软超时：轮次还活着，但预算已超——UI 会转成"继续/取消"提示。
+                Ok(ChatEvent::TimeoutWarning {
+                    role_id, elapsed_secs, soft_timeout_secs, hard_timeout_secs, ..
+                }) => {
+                    ui_emit(&format!(
+                        "⏳ [{role_id}] 已跑 {elapsed_secs}s（软超时 {soft_timeout_secs}s，硬中止 {hard_timeout_secs}s）"
+                    ));
+                }
+                // `plan` 工具提交的任务候选。CLI 没有勾选弹窗，但至少要
+                // 让用户知道产出了什么、去哪看——否则 manager 调了 plan
+                // 而用户毫无感知（我刚把这个工具接进 CLI）。
+                Ok(ChatEvent::PlanProposed { role_id, plan_id, tasks }) => {
+                    ui_emit(&format!(
+                        "📋 [{role_id}] 提交 {} 个任务候选（{plan_id}）；在 UI 弹窗勾选导入，或看 .latte/tasks/",
+                        tasks.len()
+                    ));
+                }
+                // `task_report` 工具的回报（同上，CLI 侧新接的工具）。
+                Ok(ChatEvent::TaskReport { task_id, result, summary, .. }) => {
+                    ui_emit(&format!(
+                        "📊 task_report {task_id} {result}: {}",
+                        first_line_brief(&summary, 120)
+                    ));
+                }
+                Ok(_) => {}
+                // Lagged：事件产出快于消费，丢了几条无所谓——ask 是
+                // 阻塞的，不会因为丢事件而漏掉（丢了也还挂着）。但要
+                // 提示，否则用户不知道自己漏看了进度。
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    ui_emit(&format!("  [事件流跳过 {n} 条]"));
+                }
+                // Closed：所有 sender 都 drop 了 = workflow 结束。
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// 在终端渲染一道选择题并读取回答。返回 `None` 表示 stdin 不可用。
+///
+/// 输入约定（对齐 oh-my-pi `ask` 的可用性，不追求它的富渲染）：
+/// - 输入序号选择；`multi` 时可用逗号/空格分隔多个序号；
+/// - 输入任意非序号文本 = 自由作答（等价于 oh-my-pi 的
+///   `Other (type your own)`）；
+/// - 空行重问——不做「超时自动选推荐项」，因为 latte 的 `ChoiceOption`
+///   没有 `recommended` 字段，无从判断默认项。
+async fn prompt_choice_on_terminal(
+    role_id: &str,
+    question: &str,
+    multi: bool,
+    options: &[latte_agent_core::controller::ChoiceOption],
+) -> Option<String> {
+    let mut rendered = String::new();
+    rendered.push_str(&format!("\n❓ [{role_id}] {question}\n"));
+    for (i, opt) in options.iter().enumerate() {
+        rendered.push_str(&format!("  {}) {}\n", i + 1, opt.label));
+        if !opt.description.is_empty() {
+            rendered.push_str(&format!("     {}\n", opt.description));
+        }
+    }
+    let hint = if multi {
+        "多选，逗号或空格分隔序号"
+    } else {
+        "输入序号"
+    };
+    rendered.push_str(&format!("  （{hint}；也可直接输入自己的答案）\n"));
+
+    let labels: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
+    loop {
+        // 题面进历史区（scrollback），回答走底部输入行——分离模式下
+        // 二者不会互相覆盖。非 TTY 时 ui_emit / read_user_line 各自
+        // 退回 stderr + read_line，行为与改造前一致。
+        ui_emit(rendered.trim_end_matches('\n'));
+        let line = read_user_line("answer › ").await.ok().flatten()?;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // 先试解析成序号；解析不出来就当自由作答原样回传。
+        let picked = parse_choice_indices(trimmed, labels.len(), multi);
+        return Some(match picked {
+            Some(idx) => idx
+                .into_iter()
+                .map(|i| labels[i].clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => trimmed.to_string(),
+        });
+    }
+}
+
+/// 把 `"2"` / `"1,3"` / `"1 3"` 解析成 0-based 下标。
+///
+/// 返回 `None` = 不是合法的序号表达式（调用方按自由作答处理）。单选时
+/// 给多个序号也返回 `None`——那是用户意图不明，按自由文本原样交给模型
+/// 比悄悄取第一个更诚实。
+fn parse_choice_indices(input: &str, n: usize, multi: bool) -> Option<Vec<usize>> {
+    if n == 0 {
+        return None;
+    }
+    let parts: Vec<&str> = input
+        .split([',', '，', ' ', '\t'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.is_empty() || (!multi && parts.len() > 1) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    for p in parts {
+        let k: usize = p.parse().ok()?;
+        if k == 0 || k > n {
+            return None;
+        }
+        let idx = k - 1;
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    Some(out)
 }
 
 /// Register the `workflow` tool so roles that declare it (manager) can
@@ -1087,28 +1842,11 @@ async fn register_workflow_tool(
                         .join(", ");
                     tool_err(format!("{e}. available workflows: {available}"))
                 })?;
-                // No UI subscriber in the REPL: keep the receiver alive
-                // for the duration of the run and drop it afterwards.
-                let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
-                let ctx = latte_agent_core::workflow::WorkflowRunContext {
-                    merged,
-                    resolver,
-                    default_params,
-                    cwd,
-                    event_tx,
-                    cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            turn_cancel_flag: None,
-                    agent_pause_gate: None, // CLI REPL workflow：无 session agent gate
-                    depth: 0,
-                    // 顶层 run：自己就是嵌套链的根。
-                    root_wf_id: None,
-                    // CLI REPL 无 UI session：不建 subsession、不走 advisor。
-                    subsession_store: None,
-                    session_id: None,
-                    advisor_gate: None,
-                    advisor_pause: None,
-                    staging: None,
-                };
+                // ctx 挂在会话级事件通道上：阻塞式 `ask` 在终端可回答，
+                // 否则 workflow 跑到带 ask 的 step 就静默永久挂死
+                // （见 `cli_session_event_tx`）。通道活到进程结束，
+                // 这里不需要任何收尾。
+                let ctx = cli_workflow_ctx(merged, resolver, default_params, cwd);
                 latte_agent_core::workflow::run_workflow(&wf, &topic, &ctx)
                     .await
                     .map(serde_json::Value::String)
@@ -1314,18 +2052,44 @@ async fn register_delegate_tool(
                         }
                     }
                 };
+                // 子会话 + 事件对齐 UI（controller.rs 的 delegate 路径）：
+                // 此前 CLI 的 delegate 是个纯黑盒——不发任何 ChatEvent、
+                // 不建 subsession，于是 `latte-agent debug session|trace`
+                // 读不到专家的往返，终端上也看不到"派了谁、派了什么"。
+                // workflow 路径已经有这两样（子会话日志会落盘），
+                // delegate 路径是最后一处遗漏。
+                let (sub_id, sub_sink) =
+                    cli_subsession_store().create(&cli_session_id(), &role_id);
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::DelegateStarted {
+                        from_role: "manager".into(),
+                        to_role: role_id.clone(),
+                        task: task.clone(),
+                        sub_id: sub_id.clone(),
+                        wf_id: None,
+                    },
+                );
+                // sub_sink 内部已 fanout 到 MemorySink + DiskSink，
+                // 不要再包一层 FanoutSink（会把事件写两份进内存）。
+                // 这里与既有的 scoped_sink 并列：前者给子会话日志，
+                // 后者给 REPL 的 stdout/jsonl 追踪。
                 let scoped_sink = Arc::new(latte_agent_core::trace::ScopedSink::new(
                     Arc::clone(&sink),
                     role_id.clone(),
                 ));
+                let specialist_sink: Arc<dyn latte_agent_core::trace::TraceSink> =
+                    Arc::new(latte_agent_core::trace::FanOutSink::new(vec![
+                        scoped_sink.clone(),
+                        sub_sink,
+                    ]));
                 let mut runner = match specialist_tm {
                     // unlimited tool rounds — model decides when it's done.
                     // LoopDetector in agent.rs trips on actual stuck patterns.
                     Some(tm) => AgentRunner::new_with_tools(agent, tm)
-                        .with_sink(scoped_sink.clone())
+                        .with_sink(specialist_sink.clone())
                         .with_role(role_id.clone()),
                     None => AgentRunner::new(agent)
-                        .with_sink(scoped_sink.clone())
+                        .with_sink(specialist_sink.clone())
                         .with_role(role_id.clone()),
                 };
                 let msgs = vec![Message {
@@ -1346,12 +2110,34 @@ async fn register_delegate_tool(
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
                         eprintln!("  ← {} failed: {}", role_id, e);
+                        // 失败路径也要补 DelegateFinished——否则消费端的
+                        // 分派记录永远停在「执行中」（UI 侧同样约定）。
+                        let _ = cli_session_event_tx().send(
+                            latte_agent_core::controller::ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "failed".into(),
+                                summary: e.to_string(),
+                                sub_id: sub_id.clone(),
+                                wf_id: None,
+                            },
+                        );
                         return Err(tool_err(format!(
                             "delegate to '{}' failed: {}", role_id, e
                         )));
                     }
                     Err(_) => {
                         eprintln!("  ← {} timed out after {}s", role_id, timeout_s);
+                        let _ = cli_session_event_tx().send(
+                            latte_agent_core::controller::ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "timeout".into(),
+                                summary: format!("{timeout_s}s wall-clock timeout"),
+                                sub_id: sub_id.clone(),
+                                wf_id: None,
+                            },
+                        );
                         return Err(tool_err(format!(
                             "delegate to '{}' timed out after {}s",
                             role_id, timeout_s
@@ -1365,6 +2151,16 @@ async fn register_delegate_tool(
                     role_id,
                     response.len(),
                     elapsed.as_secs_f64(),
+                );
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::DelegateFinished {
+                        from_role: "manager".into(),
+                        to_role: role_id.clone(),
+                        status: "ok".into(),
+                        summary: response.clone(),
+                        sub_id: sub_id.clone(),
+                        wf_id: None,
+                    },
                 );
                 Ok(serde_json::json!({
                     "role": role_id,
@@ -1690,6 +2486,175 @@ fn load_session(path: &str) -> AnyResult<Vec<Message>> {
     Ok(msgs)
 }
 
+/// 常驻输入任务提交上来的一条输入。
+enum InputEvent {
+    Line(String),
+    /// Ctrl-D（空行）或终端关闭。
+    Eof,
+}
+
+/// 输入队列：常驻按键线程 → 消费方（REPL 主循环 / ask 选择器）。
+///
+/// 为什么要队列：`read_user_line` 原来只在两个 turn **之间**被调用，
+/// turn 期间没有任何东西在读 stdin——用户在等待的几十分钟里看不到自己
+/// 打的字，也没法预先排下一条消息。实测实锤：turn 中打的字在日志里的
+/// 位置晚于 `TurnEnd`，说明回显发生在 turn 结束之后。
+///
+/// 改成常驻读取后：输入行始终活着，turn 期间提交的行排队、turn 结束后
+/// 依次消费——与 UI 的「发送框始终可用」语义一致。
+///
+/// receiver 用 `tokio::sync::Mutex` 包住：同一时刻只允许一个消费方等行。
+/// REPL 只在 turn 之间等行，而 `ask` 只在 turn 之内出现，两者不重叠；
+/// 加锁是把这个前提显式化，避免将来有人在 idle 期发 ask 时静默抢走
+/// 用户本要发给 REPL 的那一行。
+#[allow(clippy::type_complexity)]
+fn input_queue() -> &'static (
+    tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<InputEvent>>,
+) {
+    static Q: std::sync::OnceLock<(
+        tokio::sync::mpsc::UnboundedSender<InputEvent>,
+        tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<InputEvent>>,
+    )> = std::sync::OnceLock::new();
+    Q.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (tx, tokio::sync::Mutex::new(rx))
+    })
+}
+
+/// 起常驻按键线程（幂等）。只在分离模式下有意义。
+///
+/// 用**专用 OS 线程**而不是 tokio 任务：终端读取是阻塞 IO，放在
+/// 线程里可以直接同步持锁（`parking_lot`），不必在 await 上跨锁；
+/// 也不会占用执行器的 worker。
+fn spawn_input_thread() {
+    use super::split_screen::{apply_key, KeyOutcome};
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    let tx = input_queue().0.clone();
+    std::thread::Builder::new()
+        .name("latte-input".into())
+        .spawn(move || {
+            loop {
+                // 读事件（阻塞）。终端关闭时 read 报错 → 报 EOF 收尾。
+                let ev = match crossterm::event::read() {
+                    Ok(ev) => ev,
+                    Err(_) => {
+                        let _ = tx.send(InputEvent::Eof);
+                        return;
+                    }
+                };
+                let key = match ev {
+                    crossterm::event::Event::Key(k)
+                        if k.kind == crossterm::event::KeyEventKind::Press =>
+                    {
+                        k
+                    }
+                    // 粘贴：整段一次插入，换行折成空格。
+                    crossterm::event::Event::Paste(text) => {
+                        let cleaned = super::split_screen::normalize_pasted(&text);
+                        if !cleaned.is_empty() {
+                            if let Some(ui) = split_ui().lock().as_mut() {
+                                ui.buf.insert_str(&cleaned);
+                                ui.redraw();
+                            }
+                        }
+                        continue;
+                    }
+                    // 尺寸变化：重画 viewport（历史已在 scrollback，由终端重排）。
+                    crossterm::event::Event::Resize(_, _) => {
+                        if let Some(ui) = split_ui().lock().as_mut() {
+                            ui.redraw();
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                // 持锁只在这一小段内，且不跨越任何 await。
+                let mut g = split_ui().lock();
+                let Some(ui) = g.as_mut() else {
+                    // 分离模式已退出（/quit 后）：线程收尾。
+                    return;
+                };
+                match apply_key(&mut ui.buf, key) {
+                    KeyOutcome::Submit(line) => {
+                        ui.history.push(&line);
+                        let prompt = ui.prompt_text().to_string();
+                        ui.redraw();
+                        drop(g);
+                        // 提交的行也进历史区，否则回车后它就消失了。
+                        ui_emit(&format!("{prompt}{line}"));
+                        if tx.send(InputEvent::Line(line)).is_err() {
+                            return;
+                        }
+                    }
+                    KeyOutcome::Eof => {
+                        drop(g);
+                        let _ = tx.send(InputEvent::Eof);
+                        return;
+                    }
+                    KeyOutcome::Interrupt => {
+                        ui.redraw();
+                        drop(g);
+                        ui_emit("^C");
+                    }
+                    KeyOutcome::Redraw => ui.redraw(),
+                    KeyOutcome::HistoryPrev => {
+                        let cur = ui.buf.text();
+                        if let Some(prev) = ui.history.prev(&cur) {
+                            ui.buf.set(&prev);
+                            ui.redraw();
+                        }
+                    }
+                    KeyOutcome::HistoryNext => {
+                        if let Some(next) = ui.history.next() {
+                            ui.buf.set(&next);
+                            ui.redraw();
+                        }
+                    }
+                    KeyOutcome::Ignored => {}
+                }
+            }
+        })
+        .ok();
+}
+
+/// 读一行用户输入。
+///
+/// 分离模式（TTY）走 `SplitScreen` 的按键循环；非 TTY 走原来的
+/// `print! + read_line`，**逐字节不变**——CLI 侧 e2e 全都 grep stdout。
+///
+/// 返回 `None` = EOF（Ctrl-D 或管道读完），调用方退出 REPL。
+async fn read_user_line(prompt: &str) -> io::Result<Option<String>> {
+    // 非分离模式：原路径，逐字节不变（CLI 侧 e2e 全都 grep stdout）。
+    if split_ui().lock().is_none() {
+        let mut out = io::stdout();
+        print!("{prompt}");
+        out.flush()?;
+        let mut line = String::new();
+        let n = io::stdin().lock().read_line(&mut line)?;
+        if n == 0 {
+            println!();
+            return Ok(None);
+        }
+        return Ok(Some(line));
+    }
+    // 分离模式：提示符交给常驻按键线程渲染，这里只等队列里的行。
+    // 输入行因此在 turn 期间也是活的——用户能看到自己打的字、能预先
+    // 排下一条消息（改造前这段时间输入行是死的）。
+    if let Some(ui) = split_ui().lock().as_mut() {
+        ui.set_prompt(prompt.to_string());
+    }
+    spawn_input_thread();
+    let mut rx = input_queue().1.lock().await;
+    match rx.recv().await {
+        Some(InputEvent::Line(line)) => Ok(Some(line)),
+        Some(InputEvent::Eof) | None => Ok(None),
+    }
+}
+
 /// Default directory for auto-saved sessions (used when a turn fails
 /// and the user didn't specify a path). Created on demand.
 fn default_save_dir() -> std::path::PathBuf {
@@ -1711,6 +2676,648 @@ mod tests {
             MsgRole::Assistant => Message::assistant(content),
             MsgRole::Tool => Message::tool_result("call_test", content),
         }
+    }
+
+    // ─── CLI 阻塞式 ask（修复静默挂死）────────────────────────────
+
+    fn opt(label: &str, desc: &str) -> latte_agent_core::controller::ChoiceOption {
+        let mut o = latte_agent_core::controller::ChoiceOption::default();
+        o.label = label.into();
+        o.description = desc.into();
+        o
+    }
+
+    fn choice_event(
+        choice_id: &str,
+        wait: bool,
+        multi: bool,
+    ) -> latte_agent_core::controller::ChatEvent {
+        latte_agent_core::controller::ChatEvent::ChoiceRequested {
+            role_id: "tutor".into(),
+            choice_id: choice_id.into(),
+            question: "你的目标是什么？".into(),
+            multi,
+            layout: String::new(),
+            allow_upload: false,
+            wait,
+            options: vec![opt("搞懂代码机制", "读源码"), opt("做调优", "调参数")],
+        }
+    }
+
+    /// 预设答案的回答器（替代读 stdin）。
+    fn canned_answerer(answer: Option<&'static str>) -> AskAnswerer {
+        Arc::new(move |_req: AskRequest| {
+            Box::pin(async move { answer.map(|s| s.to_string()) })
+        })
+    }
+
+    /// 核心回归：阻塞式 ask 必须被终端消费者回答，工具调用得以继续。
+    ///
+    /// 修复前这里会永久挂起——事件广播进无人订阅的通道，而唯一能
+    /// `choice::resolve` 的入口在 ui-server 的 HTTP 端点里。
+    #[tokio::test]
+    async fn blocking_ask_gets_answered_from_cli_consumer() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let task = spawn_cli_workflow_event_consumer_with(rx, canned_answerer(Some("做调优")));
+
+        let id = "choice-cli-test-1";
+        let ev = choice_event(id, true, false);
+        // 顺序同真实 ask 工具：先 register 再广播。
+        let waiter = latte_agent_core::choice::register(id, ev.clone(), tx.clone());
+        tx.send(ev).unwrap();
+
+        // 修复前这个 await 永不返回，靠 timeout 把「挂死」变成断言失败。
+        let answer = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("阻塞 ask 必须在 5s 内拿到答案（挂死回归）")
+            .expect("通道不该被关闭");
+        assert_eq!(answer, "做调优");
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// stdin 不可用（EOF）→ 必须 `cancel` 让等待方立刻拿到 RecvError
+    /// 退出，而不是继续挂着。挂死的另一半：修复得别引入新的挂死。
+    #[tokio::test]
+    async fn unanswerable_ask_is_cancelled_not_hung() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let task = spawn_cli_workflow_event_consumer_with(rx, canned_answerer(None));
+
+        let id = "choice-cli-test-2";
+        let ev = choice_event(id, true, false);
+        let waiter = latte_agent_core::choice::register(id, ev.clone(), tx.clone());
+        tx.send(ev).unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("cancel 后等待方必须立刻返回，不能挂着");
+        assert!(outcome.is_err(), "cancel 应让 oneshot 关闭而非投递答案");
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// fire-and-forget（`wait=false`）不该被消费者回答——它的答案走
+    /// 「下一条 user 消息」那条路，抢答会让挂起表状态错乱。
+    #[tokio::test]
+    async fn non_blocking_ask_is_not_resolved_by_consumer() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let task = spawn_cli_workflow_event_consumer_with(rx, canned_answerer(Some("不该用到")));
+
+        let id = "choice-cli-test-3";
+        let ev = choice_event(id, false, false);
+        let waiter = latte_agent_core::choice::register(id, ev.clone(), tx.clone());
+        tx.send(ev).unwrap();
+
+        // 给消费者足够时间处理完事件，再确认没人动过这个挂起项。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_terminated(),
+            "wait=false 的 ask 不该被终端消费者回答"
+        );
+        latte_agent_core::choice::cancel(id);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// 通道关闭（workflow 跑完，sender 全 drop）→ 消费任务必须退出，
+    /// 否则每跑一次 workflow 泄漏一个常驻 task。
+    #[tokio::test]
+    async fn consumer_exits_when_channel_closes() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let task = spawn_cli_workflow_event_consumer_with(rx, canned_answerer(Some("x")));
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("sender drop 后消费任务必须退出")
+            .expect("任务不该 panic");
+    }
+
+    /// 覆盖**接线本身**：`cli_workflow_ctx_on` 造出来的 ctx，它的
+    /// `event_tx` 必须真的有消费者在听。上面几条测试直接调
+    /// `spawn_..._with`，所以即使构造入口把 receiver 丢了也照样绿——
+    /// 这条堵的就是那个缺口（原 bug 恰恰只错在构造入口）。
+    #[tokio::test]
+    async fn cli_workflow_ctx_wires_the_ask_consumer() {
+        let cfg = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: latte_agent_core::config::ModelCatalog {
+                models: vec![latte_agent_core::config::ModelDef {
+                    name: "Test".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "k".into(),
+                    context_window: 8192,
+                    max_tokens: 1024,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&cfg).unwrap());
+        // 用测试自建的通道 + 预设答案回答器，避免碰进程级单例
+        // （单例的消费者会去读真实 stdin）。
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let consumer =
+            spawn_cli_workflow_event_consumer_with(rx, canned_answerer(Some("搞懂代码机制")));
+        let ctx = cli_workflow_ctx_on(
+            cfg,
+            resolver,
+            GenerateParams::default(),
+            std::env::temp_dir(),
+            tx,
+        );
+        // session_id 必须带上：`ask` 的落盘补发按 (cwd, session_id) 归属，
+        // UI 侧一直有，CLI 侧此前是 None。
+        assert!(ctx.session_id.is_some(), "CLI workflow ctx 必须带 session_id");
+
+        let id = "choice-cli-ctx-1";
+        let ev = choice_event(id, true, false);
+        let waiter = latte_agent_core::choice::register(id, ev.clone(), ctx.event_tx.clone());
+        ctx.event_tx.send(ev).unwrap();
+
+        let answer = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("ctx 的事件通道必须有消费者在听（接线回归）")
+            .expect("通道不该被关闭");
+        assert_eq!(answer, "搞懂代码机制");
+
+        drop(ctx);
+        consumer.abort();
+    }
+
+    /// 防回归：CLI 必须为 UI(controller) 支持的**每一个**编排工具都
+    /// 提供注册路径。此前 CLI 只接了 `workflow`/`delegate`，`ask`/`plan`/
+    /// `task_report`/`generate_image` 全缺——manager 声明了前三个，在 UI
+    /// 里能用、在 chat 里调用直接 ToolNotFound。
+    ///
+    /// 这条测试用源码扫描而非运行时探测：注册发生在 `build_runner` 深处，
+    /// 需要真实模型配置才能构造，而"少接一个工具"是纯静态的漏接。
+    #[test]
+    fn cli_registers_every_orchestration_tool_the_ui_does() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let controller = std::fs::read_to_string(
+            root.join("latte-agent-core/src/controller.rs"),
+        )
+        .expect("controller.rs");
+        let chat = std::fs::read_to_string(
+            root.join("latte-agent-cli/src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+
+        // UI 侧的真源：controller 里所有 `allowed_tools ... t == "X"` 分支。
+        let mut ui_tools: Vec<String> = Vec::new();
+        for line in controller.lines() {
+            if !line.contains("allowed_tools") || !line.contains("t == \"") {
+                continue;
+            }
+            if let Some(rest) = line.split("t == \"").nth(1) {
+                if let Some(name) = rest.split('"').next() {
+                    if !ui_tools.iter().any(|t| t == name) {
+                        ui_tools.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            ui_tools.len() >= 6,
+            "应扫到 UI 的全部编排工具，实际: {ui_tools:?}"
+        );
+
+        for tool in &ui_tools {
+            let guard = format!("t == \"{tool}\"");
+            assert!(
+                chat.contains(&guard),
+                "CLI chat 缺少 `{tool}` 的注册分支（UI 有）。\
+                 UI 支持的编排工具: {ui_tools:?}"
+            );
+        }
+    }
+
+    /// 防回归：CLI 的 workflow ctx 必须带上 subsession_store 与
+    /// advisor_gate。原状两个都是 None——同一个 workflow 在 chat 里跑
+    /// 没有子会话日志、也不过 advisor 的返回审查（UI 里会被 intervene
+    /// 打回重做的产出，chat 里直接放行）。
+    #[tokio::test]
+    async fn cli_workflow_ctx_matches_ui_observability_wiring() {
+        let cfg = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: latte_agent_core::config::ModelCatalog {
+                models: vec![latte_agent_core::config::ModelDef {
+                    name: "Test".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "k".into(),
+                    context_window: 8192,
+                    max_tokens: 1024,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        });
+        let advisor_on = cfg.advisor.enabled();
+        let resolver = Arc::new(ModelResolver::from_config(&cfg).unwrap());
+        let (tx, _rx) = tokio::sync::broadcast::channel(4);
+        let ctx = cli_workflow_ctx_on(
+            cfg,
+            resolver,
+            GenerateParams::default(),
+            std::env::temp_dir(),
+            tx,
+        );
+        assert!(
+            ctx.subsession_store.is_some(),
+            "CLI workflow ctx 必须带 subsession_store（对齐 UI 的 debug 可观测）"
+        );
+        assert!(ctx.session_id.is_some(), "必须带 session_id（ask 落盘归属）");
+        // advisor_gate 跟随配置开关，与 UI 的 `advisor.enabled()` 同源。
+        assert_eq!(
+            ctx.advisor_gate.is_some(),
+            advisor_on,
+            "advisor_gate 必须与配置里的 advisor.enabled() 一致"
+        );
+    }
+
+    /// 防回归：CLI 的 delegate 必须建 subsession + 发
+    /// DelegateStarted/Finished。原状是纯黑盒（0 处 ChatEvent、
+    /// 0 处 subsession），`latte-agent debug session|trace` 读不到
+    /// 专家的往返，终端上也看不到派了谁——而 UI 侧两样都有。
+    ///
+    /// 同样用源码扫描：注册在闭包深处，运行时探测要真实模型。
+    #[test]
+    fn cli_delegate_is_observable_like_the_ui() {
+        let chat = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        let body = chat
+            .split("async fn register_delegate_tool")
+            .nth(1)
+            .expect("register_delegate_tool 应存在");
+        // 边界收到本函数结尾的 `tm.register(...)` 为止——否则会把测试
+        // 自身的源码也算进匹配（实测：DelegateFinished 数出 4 而非 3）。
+        let body = body
+            .split("tm.register(tool, Some(\"manager\"))")
+            .next()
+            .expect("delegate 函数应以 tm.register 收尾");
+
+        assert!(
+            body.contains("cli_subsession_store()"),
+            "delegate 必须给 specialist 建 subsession（对齐 UI）"
+        );
+        assert!(
+            body.contains("ChatEvent::DelegateStarted"),
+            "delegate 必须发 DelegateStarted"
+        );
+        // 三条出口（ok / failed / timeout）都要销账，否则消费端的分派
+        // 记录永远停在「执行中」。
+        assert_eq!(
+            body.matches("ChatEvent::DelegateFinished").count(),
+            3,
+            "ok / failed / timeout 三条出口都必须发 DelegateFinished"
+        );
+        for status in ["\"ok\"", "\"failed\"", "\"timeout\""] {
+            assert!(
+                body.contains(status),
+                "DelegateFinished 缺少 status={status} 的出口"
+            );
+        }
+    }
+
+    #[test]
+    fn brief_truncation_is_char_safe_for_cjk() {
+        // 按字节切会把多字节字符切一半 panic——任务描述基本都是中文。
+        let cjk = "为当前仓库编排从浅到深的学习路径与任务清单";
+        let out = first_line_brief(cjk, 5);
+        assert_eq!(out, "为当前仓库…");
+        // 多行只取首行。
+        assert_eq!(first_line_brief("第一行\n第二行", 90), "第一行");
+        // 不足上限时原样返回、不加省略号。
+        assert_eq!(first_line_brief("短", 90), "短");
+        // 空输入不 panic。
+        assert_eq!(first_line_brief("", 10), "");
+        // 边界：恰好等于上限不截断。
+        assert_eq!(first_line_brief("一二三", 3), "一二三");
+    }
+
+    /// 防回归：CLI 的 advisor 宿主必须真的能驱动 monitor。
+    ///
+    /// 这条不是源码扫描——它真跑 `spawn_on_host`，喂一条 ToolError 事件
+    /// （D3 检测器的输入），断言 monitor 把纠正提示注入了宿主的 hint
+    /// 队列。原状是 monitor 只由 `ChatController::spawn` 拉起，chat 的
+    /// 顶层 turn 一条检测器都不跑。
+    #[tokio::test]
+    async fn cli_advisor_host_drives_the_monitor() {
+        use latte_agent_core::advisor_monitor::AdvisorHost;
+        let host = cli_advisor_host();
+        host.hints.lock().clear();
+        // trait 方法必须接到会话级通道上——接错了 monitor 收不到事件。
+        let mut rx = AdvisorHost::subscribe(&*host);
+        AdvisorHost::event_sender(&*host)
+            .send(latte_agent_core::controller::ChatEvent::Status {
+                message: "probe".into(),
+            })
+            .expect("宿主的 event_sender 必须与 subscribe 同一个通道");
+        let got = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("应收到自己发的事件")
+            .expect("通道不该关闭");
+        assert!(
+            matches!(
+                got,
+                latte_agent_core::controller::ChatEvent::Status { .. }
+            ),
+            "subscribe/event_sender 必须成对指向同一通道"
+        );
+
+        // hint 注入 → REPL 会在下一轮取走。
+        AdvisorHost::advisor_hint(&*host, "换个路径");
+        assert_eq!(host.hints.lock().as_slice(), ["换个路径"]);
+
+        // last_user_input 是审查 prompt 的「主诉求」基准。
+        *host.last_input.lock() = "原始诉求".into();
+        assert_eq!(AdvisorHost::last_user_input(&*host), "原始诉求");
+
+        // terminate 裁决置取消标志（CLI 无 controller 的 input 通道要唤醒）。
+        host.cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        AdvisorHost::request_cancel_turn(&*host).await;
+        assert!(
+            host.cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "request_cancel_turn 必须置位取消标志"
+        );
+        host.hints.lock().clear();
+    }
+
+    /// 防回归：顶层 runner 的 sink 必须并上 `ChatEventTraceSink`，
+    /// 否则 monitor 收不到顶层 turn 的任何事件（检测器全瞎），
+    /// 而 REPL 看起来一切正常——是最难发现的那类漏接。
+    #[test]
+    fn top_level_sink_feeds_the_event_channel() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        // 先切掉 test 模块再扫：否则本测试自己的字面量会被算进匹配
+        // （任何搜索串都出现在这段源码里，实测恒定多数出 1）。
+        let chat = full
+            .split("#[cfg(test)]")
+            .next()
+            .expect("非测试部分");
+        let body = chat
+            .split("fn cli_top_level_sink(")
+            .nth(1)
+            .expect("cli_top_level_sink 应存在");
+        let body = body.split("\n}").next().unwrap_or(body);
+        assert!(
+            body.contains("ChatEventTraceSink"),
+            "顶层 sink 必须并上 ChatEventTraceSink（advisor monitor 的事件源）"
+        );
+        // 两个分支都必须用它，不能只改一个。
+        assert_eq!(
+            // 匹配含 `.with_sink(` 的完整调用：只数真实接线，
+            // 不会把本测试源码里的裸名算进去（实测数出 3 而非 2）。
+            chat.matches(".with_sink(cli_top_level_sink(&sink))").count(),
+            2,
+            "带工具/无工具两个 runner 分支都要用 cli_top_level_sink"
+        );
+    }
+
+    /// 防回归：`ensure_cli_advisor_monitor` 必须真的拉起 monitor。
+    ///
+    /// 判据用 subsession 计数：函数内部会给 advisor 分配一个子会话
+    /// （每次 review 的模型往返落 `advisor-<micros>.jsonl`），拉起了就
+    /// 一定 +1。不用"检查日志文件是否存在"——`create()` 在没有事件写入
+    /// 时不落文件，实机验证时我就是被这点误导过一次。
+    #[tokio::test]
+    async fn ensure_cli_advisor_monitor_actually_spawns() {
+        let cfg = AgentConfig {
+            advisor: Default::default(),
+            models: latte_agent_core::config::ModelCatalog {
+                models: vec![latte_agent_core::config::ModelDef {
+                    name: "Test".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: "http://127.0.0.1:1".into(),
+                    api_key: "k".into(),
+                    context_window: 8192,
+                    max_tokens: 1024,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        // 默认配置下 advisor 是开的——这本身就是要锁住的前提：
+        // 关掉它等于 chat 又回到"没有监察"。
+        assert!(
+            cfg.advisor.enabled(),
+            "advisor 默认应开启（enabled() 缺省 true）"
+        );
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+        let before = cli_subsession_store().len();
+        ensure_cli_advisor_monitor(
+            &cfg,
+            &resolver,
+            GenerateParams::default(),
+            &std::env::temp_dir(),
+            "manager",
+        );
+        assert_eq!(
+            cli_subsession_store().len(),
+            before + 1,
+            "monitor 应已拉起并为 advisor 分配子会话"
+        );
+        // 幂等：进程内只跑一份，重复调用不再新增。
+        ensure_cli_advisor_monitor(
+            &cfg,
+            &resolver,
+            GenerateParams::default(),
+            &std::env::temp_dir(),
+            "manager",
+        );
+        assert_eq!(
+            cli_subsession_store().len(),
+            before + 1,
+            "重复调用必须幂等（否则每次切角色都多拉一个 monitor）"
+        );
+    }
+
+    /// 防回归：REPL 必须用**局部**守卫恢复终端，不能依赖
+    /// `Drop for SplitScreen`。
+    ///
+    /// `SplitScreen` 存在 `static` 里，而 Rust 的 static 永不 drop——
+    /// 少了这个守卫，`latte-agent chat` 退出后用户终端留在 raw mode
+    /// （无回显，只能盲敲 `reset`）。实机在伪终端里抓到过：`?2004h`
+    /// 下发了、`?2004l` 从来没有。
+    #[test]
+    fn repl_installs_a_local_guard_to_restore_the_terminal() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        // 扫描前切掉 test 模块，否则本测试的字面量会被算进匹配。
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+        assert!(
+            src.contains("let _ui_guard = UiGuard;"),
+            "REPL 必须安装 UiGuard；static 里的 SplitScreen 不会被 drop"
+        );
+        // 守卫本身要真的做恢复动作。
+        let guard_impl = src
+            .split("impl Drop for UiGuard")
+            .nth(1)
+            .expect("UiGuard 应实现 Drop");
+        let guard_impl = guard_impl.split("\n}").next().unwrap_or(guard_impl);
+        assert!(
+            guard_impl.contains("ui_leave()"),
+            "UiGuard::drop 必须调 ui_leave() 恢复终端"
+        );
+    }
+
+    /// 防回归：对用户**可见性关键**的事件，CLI 消费者必须都有分支。
+    ///
+    /// 原状是 CLI 只处理 6 个事件，其余广播进空气。最严重的是 `Paused`：
+    /// 模型全链哑掉（glm-5.3 报 400 + MiniMax 流式空闲超时 + deepseek
+    /// 余额不足）时后端自动暂停等人，而 chat 里用户看不到任何提示，
+    /// 只觉得卡死了——UI 侧这条会弹暂停条 + ▶ 按钮。
+    ///
+    /// 这里不要求"全部 39 个变体都处理"（RoundStarted 之类是多角色模式
+    /// 专用，CLI 单角色路径用不到），只钉住这份清单。
+    #[test]
+    fn cli_consumer_handles_user_visible_events() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        // 扫描前切掉 test 模块，否则本测试的字面量会被算进匹配。
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+        let body = src
+            .split("fn spawn_cli_workflow_event_consumer_with")
+            .nth(1)
+            .expect("消费者函数应存在");
+        // 边界收到函数结尾（`})` + `}` 收尾的 spawn 块）之前的下一个顶层 fn。
+        let body = body.split("\nfn ").next().unwrap_or(body);
+
+        for ev in [
+            // 会话状态：不提示就等于"卡死了"。
+            "Paused",
+            "Resumed",
+            // 失败可见性。
+            "Error",
+            "ToolError",
+            "AdvisorTerminated",
+            "TimeoutWarning",
+            // 我们刚接进 CLI 的两个工具，产出必须让用户知道。
+            "PlanProposed",
+            "TaskReport",
+            // 既有的。
+            "ChoiceRequested",
+            "WorkflowStep",
+            "WorkflowFinished",
+            "DelegateStarted",
+            "DelegateFinished",
+            "RoleTurn",
+        ] {
+            assert!(
+                body.contains(&format!("ChatEvent::{ev}")),
+                "CLI 事件消费者缺少 `{ev}` 分支（UI 侧对用户可见）"
+            );
+        }
+    }
+
+    /// `Paused` 必须落到状态行上（而不仅是历史里一行）。
+    ///
+    /// 用状态而非输出做判据：`ui_emit` 在非 TTY 下写 stderr，测试里不好
+    /// 捕获；`ui_activity()` 是进程内可读的，能确定性断言。
+    ///
+    /// 为什么这条重要：模型全链哑掉时后端自动暂停等人，用户若看不到
+    /// "已暂停"就只会以为卡死了。实机没法稳定复现（要让所有 provider
+    /// 同时失败），所以用合成事件锁住。
+    #[tokio::test]
+    async fn paused_event_surfaces_in_the_status_line() {
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        let task = spawn_cli_workflow_event_consumer_with(rx, canned_answerer(None));
+        ui_set_activity(None);
+
+        tx.send(latte_agent_core::controller::ChatEvent::Paused {
+            reason: "模型不可用（glm-5.3: 400; MiniMax-M3: 流式空闲超时）".into(),
+        })
+        .unwrap();
+        // 等消费者处理（事件是异步的）。
+        let mut label = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Some((l, _)) = ui_activity().lock().clone() {
+                label = Some(l);
+                break;
+            }
+        }
+        assert_eq!(
+            label.as_deref(),
+            Some("已暂停，等待恢复"),
+            "Paused 必须反映到状态行，否则用户只觉得卡死了"
+        );
+
+        tx.send(latte_agent_core::controller::ChatEvent::Resumed).unwrap();
+        let mut cleared = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if ui_activity().lock().is_none() {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared, "Resumed 必须清掉暂停状态");
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    #[test]
+    fn choice_index_parsing() {
+        // 单选：合法序号。
+        assert_eq!(parse_choice_indices("2", 3, false), Some(vec![1]));
+        // 多选：逗号 / 空格 / 中文逗号都认，去重。
+        assert_eq!(parse_choice_indices("1,3", 3, true), Some(vec![0, 2]));
+        assert_eq!(parse_choice_indices("1 3", 3, true), Some(vec![0, 2]));
+        assert_eq!(parse_choice_indices("1，3", 3, true), Some(vec![0, 2]));
+        assert_eq!(parse_choice_indices("2,2", 3, true), Some(vec![1]));
+        // 越界 / 0 / 非数字 → None（按自由作答处理，原样交给模型）。
+        assert_eq!(parse_choice_indices("4", 3, false), None);
+        assert_eq!(parse_choice_indices("0", 3, false), None);
+        assert_eq!(parse_choice_indices("我想先看代码", 3, false), None);
+        // 单选给多个序号 → None：意图不明，不偷偷取第一个。
+        assert_eq!(parse_choice_indices("1,2", 3, false), None);
+        // 零选项的 ask（模型发歪了）不该 panic。
+        assert_eq!(parse_choice_indices("1", 0, false), None);
     }
 
     #[test]

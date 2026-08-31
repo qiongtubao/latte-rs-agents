@@ -47,5 +47,10 @@ tracing = "0.1"
 # Sync primitives (used by agent cooldown map for non-blocking &self access)
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive"] }
+# 终端控制（chat 的输入/显示分离）。刻意只用 crossterm 而非 ratatui：
+# 后者默认 alt-screen 全屏重绘会毁掉终端 scrollback，而我们要的正是
+# 「历史推进 scrollback + 底部固定输入块」——与 oh-my-pi 的 pi-tui
+# 同一取舍（它也刻意不进 alt screen）。
+crossterm = "0.28"
 # HTTP client (used by `latte-agent test --raw` for raw request debugging).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
