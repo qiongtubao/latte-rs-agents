@@ -147,12 +147,14 @@ pub(crate) fn strip_review_annotation(s: &str) -> String {
     }
 }
 
-pub(crate) struct ChatEventTraceSink {
-    pub(crate) event_tx: broadcast::Sender<ChatEvent>,
+/// `pub` 而非 `pub(crate)`：CLI REPL 要用它把顶层 turn 的 TraceSink
+/// 事件转成 ChatEvent 喂给 advisor monitor，而不必改 REPL 的渲染路径。
+pub struct ChatEventTraceSink {
+    pub event_tx: broadcast::Sender<ChatEvent>,
     /// 工具事件归属的 subsession：delegate / workflow speaker 的
     /// runner 填真实 sub_id，主 session 角色填 `None`。没有它
     /// ToolUse/ToolResult 泄进主 session 后前端只能按 role_id 猜。
-    pub(crate) sub_id: Option<String>,
+    pub sub_id: Option<String>,
 }
 
 impl crate::trace::TraceSink for ChatEventTraceSink {
@@ -519,7 +521,23 @@ pub struct PlanTask {
     pub workflow: Option<String>,
     /// 任务涉及的文件/目录前缀（相对项目根）：并行执行时范围重叠的
     /// 任务会被任务看板拒绝派发（409）。空则不序列化（视作未声明）。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `alias` 收编模型高频写错的同义字段名。实测会话里 manager 连撞
+    /// 两次输出长度上限后，第三次把字段名写成 `involved_paths`，serde
+    /// 静默丢弃整个数组 —— 结果 24 个任务全部 `paths: []`，
+    /// [`validate_plan_paths`] 的幻觉路径校验与重叠校验双双退化成空
+    /// 操作，"因为写错字段名所以校验通过"。别名 + 未知键回执
+    /// （见 `register_plan_tool` 的 `PLAN_TASK_KNOWN_KEYS`）是两道防线。
+    #[serde(
+        default,
+        alias = "involved_paths",
+        alias = "involved_files",
+        alias = "affected_paths",
+        alias = "affected_files",
+        alias = "file_paths",
+        alias = "files",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub paths: Vec<String>,
     /// 子任务，同构，最多一层。空则不序列化。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3955,18 +3973,18 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
 判断标准（分派前先想流程）：
 - 单点问题（读代码、改文件、审查某个具体实现）→ delegate
 - 需要多个角色按固定流程协作的完整任务 → workflow，从上面清单里选最贴合的
-- 任务类型必须与 workflow 类型匹配：学习/调研/规划类诉求（不落地代码改动）选学习、探索、规划向的 workflow；不要把面向代码实现的评审/计划流水线套上去
 - 调用 workflow 前先用一句话说明：选哪个、为什么、预期拿到什么结论
 - workflow 会跑完整条流水线并把结论返回给你；你综合后再回复用户。
 
-按**用户点名的交付物**选流程（照抄这张表，别一律 explore）：
+**怎么挑：按交付物落点，不按话题词（唯一判别依据）**
 
-| 用户要的东西 | 选这个 | 别选 explore 的理由 |
-|---|---|---|
-| 「学习 / 讲讲 XXX 原理 / 入门」 | `learn` | explore 的产出是「决策背景要点」，不是能读的教程；`learn` 会落盘 `docs/learn/<slug>.md` |
-| 「拆分任务 / 排任务 / 给我计划」 | `implementation_plan` | explore 不产出任务清单，它的终点是背景结论 |
-| 「安排学习计划 + 拆分任务」（两者都要） | `learn` 或调研一轮 → **紧接** `implementation_plan` | 光跑 explore 等于一件都没交付 |
-| 「这块代码怎么回事 / 有什么坑」 | `explore` | 这类才是 explore 的正题 |
+1. 先写下用户点名要的东西**最后落在哪儿**——任务看板条目 / 某个文件 / 对话里的结论 / 代码改动。
+2. 再从上面清单里挑**落点相同**的那条：每条流程的描述末尾都标了「落点：」，那是它实际产出什么、
+   产出物落在哪儿。挑之前把候选的落点与第 1 步写下的落点逐字比一遍。
+3. 话题词（"学习""设计""重构""调研"）只说明**内容**，不决定落点：同一个话题既可能是"要一份清单"，
+   也可能是"现在就要内容"，两者落点不同、流程也就不同。用话题词匹配流程名是最常见的选错方式。
+4. 用户诉求里出现**几个不同落点，就发几个 workflow 调用**。不许让一条流程"顺带覆盖"另一个落点：
+   宣称"一次覆盖"之前，先把每个落点的产出物写出来；写不出来就是在合并交差。
 
 **调研要收口（不是限制轮数）**：调研类流程（`explore` / `design_brainstorm`）想探几轮就探几轮——
 大仓库分模块深入是正当的。但每一轮都必须**换一个具体问题**，且随时对着交付物问自己一句：
@@ -4232,7 +4250,57 @@ fn is_readonly_plan_task(t: &PlanTask) -> bool {
         .any(|l| MARKERS.iter().any(|m| l.eq_ignore_ascii_case(m)))
 }
 
-pub(crate) fn register_plan_tool(
+/// [`PlanTask`] 认得的全部键（含 `paths` 的 serde 别名）。
+///
+/// serde 对未知键默认静默忽略，`deny_unknown_fields` 又会把
+/// `extract_plan_tasks` 那条路径上 workflow 产出的 `id`/`week`/
+/// `dependencies`/`risks` 一并判死。折中：解析照旧宽容，但把被忽略的
+/// 键**原样回执给模型**，让"字段名写错 → 数据静默消失"变成显式反馈。
+const PLAN_TASK_KNOWN_KEYS: &[&str] = &[
+    "title",
+    "description",
+    "priority",
+    "labels",
+    "workflow",
+    "paths",
+    "subtasks",
+    // paths 的 serde 别名
+    "involved_paths",
+    "involved_files",
+    "affected_paths",
+    "affected_files",
+    "file_paths",
+    "files",
+];
+
+/// 递归收集 `tasks` 数组里所有不被 [`PlanTask`] 认得的键（去重、稳定
+/// 排序）。返回空 = 没有字段被静默丢弃。
+fn unknown_plan_task_keys(tasks_arr: &[serde_json::Value]) -> Vec<String> {
+    fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+        let Some(obj) = v.as_object() else { return };
+        for (k, val) in obj {
+            if !PLAN_TASK_KNOWN_KEYS.contains(&k.as_str()) {
+                out.insert(k.clone());
+            }
+            if k == "subtasks" {
+                if let Some(arr) = val.as_array() {
+                    for s in arr {
+                        walk(s, out);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for t in tasks_arr {
+        walk(t, &mut out);
+    }
+    out.into_iter().collect()
+}
+
+/// `pub` 而非 `pub(crate)`：CLI REPL 也要注册它，否则声明了该工具的
+/// 角色（manager）在 chat 里调用直接 ToolNotFound，而 UI 里正常。
+pub fn register_plan_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
@@ -4255,7 +4323,7 @@ pub(crate) fn register_plan_tool(
             ("tasks".into(), ToolInputProperty {
                 property_type: PropertyType::Array,
                 description: Some(
-                    "任务候选清单（一次调用提交整份清单：拆分出几个任务就放几项，禁止每个任务单独调一次本工具——上一份清单未获用户批准时后续调用会被拒绝）。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs/annotate_code;没有贴合的必须留空走manager直接执行,禁止硬绑不相关的workflow), paths(可选,字符串数组,任务涉及的文件/目录前缀如\"src/ringbuf\";并行执行时范围重叠的任务会被拒绝派发,拆任务时让各任务范围互不重叠;纯阅读/学习类任务在 labels 里加\"只读\"即可免除重叠校验), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
+                    "任务候选清单（一次调用提交整份清单：拆分出几个任务就放几项，禁止每个任务单独调一次本工具——上一份清单未获用户批准时后续调用会被拒绝）。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs/annotate_code/learn/learn_loop;学习或讲解类任务绑learn(一次性教程)或learn_loop(逐知识点讲解+出题);没有贴合的必须留空走manager直接执行,禁止硬绑不相关的workflow), paths(可选,字符串数组,任务涉及的文件/目录前缀如\"src/ringbuf\";并行执行时范围重叠的任务会被拒绝派发,拆任务时让各任务范围互不重叠;纯阅读/学习类任务在 labels 里加\"只读\"即可免除重叠校验), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
             }),
@@ -4310,6 +4378,21 @@ pub(crate) fn register_plan_tool(
             // 不进 PendingApproval——模型可修正后同轮重调。
             validate_plan_paths(&cwd, &tasks).map_err(tool_err)?;
 
+            // 被静默丢弃的键：不拦（workflow 产出的 id/week/
+            // dependencies/risks 是合法附加信息），但必须回执，否则
+            // 「字段名写错 → 整个数组消失 → 校验空转通过」无从发现。
+            let dropped = unknown_plan_task_keys(tasks_arr);
+            let dropped_note = if dropped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n⚠️ 以下字段不在 plan 工具 schema 内、已被忽略：{}。\
+                     若其中有本该写进 paths 的路径信息（schema 字段名是 paths），\
+                     请改名后重新提交整份清单。",
+                    dropped.join("、")
+                )
+            };
+
             let plan_id = next_plan_id(&role_id);
             let n = tasks.len();
             let proposed = ChatEvent::PlanProposed {
@@ -4336,7 +4419,7 @@ pub(crate) fn register_plan_tool(
                 plan_id: plan_id.clone(),
             };
             Ok(serde_json::Value::String(format!(
-                "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。"
+                "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。{dropped_note}"
             )))
         })
     });
@@ -4359,7 +4442,7 @@ pub(crate) fn register_plan_tool(
 /// 回喂（fire-and-forget）。
 /// 阻塞模式参数：工具挂起等用户，取消则报错退出，不再有超时路径。
 #[derive(Clone)]
-pub(crate) struct AskBlocking {
+pub struct AskBlocking {
     /// 用户回答台账：收到答案**立刻**落盘，同一问题再被问到时直接
     /// 回放，不再弹框。`None` = 不记账（顶层 turn / 独立测试）。
     ///
@@ -4413,7 +4496,10 @@ fn clear_persisted_ask(answer_log: Option<&crate::workflow::AnswerLog>, choice_i
 ///   `ChoiceRequested`（`wait=true`）→ 挂起等待，UI 把答案 POST 到
 ///   `/api/chat/choice-answer`（[`crate::choice`] 路由）后作为工具
 ///   结果返回，子代理拿着答案继续干活。取消有兜底。
-pub(crate) fn register_ask_tool(
+/// 注册 `ask` 工具。`pub` 而非 `pub(crate)`：CLI REPL 也要注册它，
+/// 否则同一个角色在 UI 里能弹选择题、在 `latte-agent chat` 里调 `ask`
+/// 直接 ToolNotFound（两条路径行为不一致）。
+pub fn register_ask_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
@@ -4743,7 +4829,9 @@ pub(crate) fn register_ask_tool(
 ///
 /// `result` 必须是 `completed` / `aborted` / `failed` / `timeout` 之一，
 /// 与后端 `tasks::report_task` 的入参和 `tasks::RESULTS` 数组对齐。
-pub(crate) fn register_task_report_tool(
+/// `pub` 而非 `pub(crate)`：CLI REPL 也要注册它，否则声明了该工具的
+/// 角色（manager）在 chat 里调用直接 ToolNotFound，而 UI 里正常。
+pub fn register_task_report_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
     role_id: String,
@@ -5949,6 +6037,74 @@ mod tests {
         }
     }
 
+    // ─── paths 字段名别名 + 未知键回执 ────────────────────────────
+    //
+    // 回归 jemalloc 会话事故：manager 把 `paths` 写成 `involved_paths`，
+    // serde 静默丢弃整个数组 → 24 个任务全部 `paths: []` →
+    // `validate_plan_paths` 的幻觉路径校验与重叠校验双双空转通过。
+
+    #[test]
+    fn plan_task_accepts_involved_paths_alias() {
+        let v = serde_json::json!({
+            "title": "T-401 P2 修复",
+            "involved_paths": ["src/safety_check.c", "include/jemalloc/internal"],
+        });
+        let t: PlanTask = serde_json::from_value(v).expect("必须解析成功");
+        assert_eq!(
+            t.paths,
+            vec!["src/safety_check.c", "include/jemalloc/internal"],
+            "involved_paths 必须映射到 paths，不能被静默丢弃"
+        );
+    }
+
+    #[test]
+    fn plan_task_accepts_other_path_aliases() {
+        for key in ["involved_files", "affected_paths", "affected_files", "file_paths", "files"] {
+            let v = serde_json::json!({ "title": "t", key: ["src/a.c"] });
+            let t: PlanTask = serde_json::from_value(v).unwrap_or_else(|e| panic!("{key}: {e}"));
+            assert_eq!(t.paths, vec!["src/a.c"], "别名 {key} 必须映射到 paths");
+        }
+    }
+
+    #[test]
+    fn unknown_plan_task_keys_reports_dropped_fields() {
+        // workflow 产出的 id/week/dependencies/risks 是合法附加信息，
+        // 不拦但要回执；paths 的别名不算未知键。
+        let arr = vec![
+            serde_json::json!({
+                "title": "a",
+                "involved_paths": ["src/a.c"],
+                "week": 1,
+                "dependencies": ["T-101"],
+            }),
+            serde_json::json!({
+                "title": "b",
+                "risks": ["x"],
+                "subtasks": [{ "title": "b1", "id": "S-1" }],
+            }),
+        ];
+        let got = unknown_plan_task_keys(&arr);
+        assert_eq!(
+            got,
+            vec!["dependencies", "id", "risks", "week"],
+            "未知键必须去重、稳定排序，并递归覆盖 subtasks；paths 别名不算未知"
+        );
+    }
+
+    #[test]
+    fn unknown_plan_task_keys_empty_for_clean_input() {
+        let arr = vec![serde_json::json!({
+            "title": "a",
+            "description": "d",
+            "priority": 1,
+            "labels": ["x"],
+            "workflow": "",
+            "paths": ["src/a.c"],
+            "subtasks": [],
+        })];
+        assert!(unknown_plan_task_keys(&arr).is_empty(), "全合法键不应有回执");
+    }
+
     /// 纯阅读/学习类任务共用同一份代码是正常的（不会互相覆盖），
     /// 不该被重叠校验拦下。
     ///
@@ -6235,17 +6391,39 @@ mod tests {
         assert!(hint.contains("分派前先想流程"), "hint: {hint}");
     }
 
-    /// 交付物 → 流程的路由表必须在提示里。实测会话里 manager 两次都
-    /// 选了 `explore`（产出是决策背景），`learn` 与 `implementation_plan`
-    /// 明明都在可用清单里却一次没用，最终 0 任务收场 —— 光有"任务类型
-    /// 要匹配"这种抽象话不够，得给对照表。
+    /// 选流程的判别依据必须是**交付物落点**，而且只能有一条、还得是
+    /// 与具体流程无关的通则。
+    ///
+    /// 回归背景：这里曾经是一张硬编码的「用户要的东西 → 选这个」对照
+    /// 表，里面连「安排学习计划 + 拆分任务」这种具体句式都写死了。个别
+    /// 化的表有两个坏处：新增自定义流程它一律覆盖不到；以及它和 prompt
+    /// 里另一处「按话题选流程」的说法互相矛盾，模型命中先出现的那条就
+    /// 选错（实测：用户要的是拆任务清单，manager 按"从浅到深"这个话题
+    /// 词跑了交互学习流程，看板 0 个任务）。落点信息现在由每条 workflow
+    /// 自己在 description 里声明，提示只留通则。
     #[test]
-    fn workflow_hint_carries_deliverable_routing_table() {
+    fn workflow_hint_selects_by_deliverable_landing_not_topic() {
         let dir = tempfile::tempdir().unwrap();
         let hint = workflow_tool_hint(dir.path());
-        assert!(hint.contains("按**用户点名的交付物**选流程"), "hint: {hint}");
-        assert!(hint.contains("`learn`"), "hint: {hint}");
-        assert!(hint.contains("`implementation_plan`"), "hint: {hint}");
+        assert!(
+            hint.contains("按交付物落点，不按话题词"),
+            "hint: {hint}"
+        );
+        assert!(hint.contains("落点："), "hint 必须指向清单里的落点标注: {hint}");
+        assert!(
+            hint.contains("几个不同落点，就发几个 workflow 调用"),
+            "hint: {hint}"
+        );
+        // 不得再出现按话题匹配流程类型的说法（与落点规则冲突的旧文案）。
+        assert!(
+            !hint.contains("学习/调研/规划类诉求"),
+            "按话题选流程的说法必须清除: {hint}"
+        );
+        // 不得再出现硬编码的「用户要的东西 → 选这个」对照表。
+        assert!(
+            !hint.contains("| 用户要的东西 |"),
+            "个别化路由表必须清除: {hint}"
+        );
         // 收口是按交付物，不是按轮数——提示里不得出现轮次上限。
         assert!(hint.contains("调研要收口（不是限制轮数）"), "hint: {hint}");
         assert!(
@@ -6256,6 +6434,38 @@ mod tests {
         assert!(hint.contains("交付物提醒"), "hint: {hint}");
         // 「先不锁方向」不得成为回退调研的理由。
         assert!(hint.contains("先不锁方向"), "hint: {hint}");
+    }
+
+    /// 落点必须由每条 workflow 自己声明，否则「按落点挑」这条通则在
+    /// 清单里无据可依，prompt 就又会被迫抄一张个别化的对照表。
+    #[test]
+    fn every_shipped_workflow_declares_its_deliverable_landing() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("config")
+            .join("workflows");
+        let mut missing: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for e in std::fs::read_dir(&dir).expect("config/workflows 必须存在").flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let wf: crate::workflow::WorkflowDef = match toml::from_str(&raw) {
+                Ok(w) => w,
+                Err(err) => panic!("{} 解析失败: {err}", path.display()),
+            };
+            checked += 1;
+            if !wf.description.contains("落点：") {
+                missing.push(path.file_stem().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        assert!(checked > 0, "没扫到任何 workflow");
+        assert!(
+            missing.is_empty(),
+            "这些 workflow 的 description 没声明落点：{missing:?}"
+        );
     }
 
     #[test]

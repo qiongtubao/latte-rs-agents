@@ -773,6 +773,17 @@ impl DispatchDigest {
     }
 
     fn render(&self) -> String {
+        if self.lines.is_empty() {
+            // 空摘要必须自己说话。留空的话 advisor 拿到的是一个没有内容
+            // 的章节标题，它会去猜这个空白是什么意思——实测它猜出了三种
+            // 互相矛盾的解释（"manager 没分派" / "数据缺失" / "分派太简单
+            // 没被记录"），然后基于其中一种下判。
+            debug_assert_eq!(self.dropped, 0, "无行时不可能有丢弃计数");
+            return "（本 turn 没有记录到任何分派动作：既没有 workflow 启动，\
+                    也没有 delegate / plan 调用。注意这是「摘要为空」这一事实本身，\
+                    不要据此推断 manager 正文里说了什么或没说什么。）"
+                .to_string();
+        }
         let body = self
             .lines
             .iter()
@@ -1241,12 +1252,16 @@ fn build_review_prompt(
    - **调研跑了几轮本身不是问题**——大仓库分模块深入是正当的，不要因为"探了好几次"就报警。
      问题是「点名的交付物一次都没往产出走」。
    - 摘要末尾若出现 `[本 session 累计（跨 turn）]` 块，说明系统已确认：用户点名了交付物、
-     调研在跑、产出型分派为 0。**这种情况给 `intervene`**，hint 点名该跑哪个流程
-     （要任务清单 → `implementation_plan` 拆完用 `plan` 提交；要教程 → `learn`）。
+     调研在跑、而块里「仍然欠着的」那几样**到现在为止没有任何对应的分派动作**。
+     **这种情况给 `intervene`**，hint 只点名**欠着的那几样**该跑哪个流程
+     （要任务清单 → `implementation_plan` 拆完用 `plan` 提交；要教程 → `learn` / `learn_loop`）。
+   - **一次诉求点名多样东西时，交清一样不等于交清全部**。块里如果同时有「已经往产出走的」
+     和「仍然欠着的」，别因为前者就判 ok——那正是最容易漏的形态：manager 跑了第一个流程、
+     在正文里承诺了第二个，然后就没有了。hint 里**不要**再催已经在跑的那一样。
    - 判断标准是「离用户点名的交付物还有多远」，不是「这轮调研本身做得好不好」。这条**不受**
      「证据缺失 ≠ 证据为负」限制：累计块是系统统计的确定性事实，不是你的推测。
    - 反例（不要误报）：用户只是问「这块代码怎么回事」，调研本身就是交付物 → `ok`。
-     这种情况下累计块也不会出现（诉求里没有交付物名词）。
+     这种情况下累计块也不会出现（诉求里没有交付物名词）。点名的东西全部产出后累计块同样消失。
 {attention_block}
 # 触发原因
 
@@ -1417,6 +1432,16 @@ struct MonitorState {
     /// 单一个都没产出"——实测会话里它因此把每一轮都判成 ok。
     research_rounds: u32,
     deliverable_rounds: u32,
+    /// **已被产出型分派关掉的交付物标签**（会话级，跨 turn）。
+    ///
+    /// 为什么不能只留 `deliverable_rounds` 这个计数：用户一句话点名两三
+    /// 样东西是常态，而计数一旦 >0 就把缺口整体关闭。实测会话
+    /// （jemalloc 12:24）诉求是「安排学习计划 + 拆分任务」，命中三个标签；
+    /// manager 正文里写明"先跑 `learn`，再跑 `implementation_plan` 拆任务"，
+    /// 但 `learn` 一启动 `deliverable_rounds` 就变 1，`session_facts()` 从此
+    /// 恒返回 `None`——欠着的任务清单再没有任何机制会提起它，看板至今
+    /// 0 个任务。逐标签记账后，关掉一个只关一个。
+    deliverables_done: std::collections::BTreeSet<&'static str>,
 }
 
 impl MonitorState {
@@ -1435,6 +1460,7 @@ impl MonitorState {
             workflow_stack: Vec::new(),
             research_rounds: 0,
             deliverable_rounds: 0,
+            deliverables_done: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1446,34 +1472,66 @@ impl MonitorState {
     /// （与已移除的 `WORKFLOW_BUDGET_PER_UNIT_SECS` 同一类错误）。
     /// 交付物一次都没产出才是可举证的问题。
     fn session_facts(&self) -> Option<String> {
-        if self.research_rounds == 0 || self.deliverable_rounds > 0 {
+        if self.research_rounds == 0 {
             return None;
         }
         let named = named_deliverables(&self.last_user_text);
         if named.is_empty() {
             return None;
         }
+        // 逐标签算差集：关掉一个只关一个。跑了 `learn` 不代表
+        // 「拆分任务」也交付了（见 `deliverables_done` 的说明）。
+        let pending: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|d| !self.deliverables_done.contains(d))
+            .collect();
+        if pending.is_empty() {
+            return None;
+        }
+        let done: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|d| self.deliverables_done.contains(d))
+            .collect();
+        let done_note = if done.is_empty() {
+            format!(
+                "产出交付物的分派 **0** 次（未跑规划流程、未提交 plan、未产出文档）。\
+                 注意：轮数本身不是问题（分模块深入是正当的），\
+                 问题是点名的交付物一次都没往产出走。"
+            )
+        } else {
+            format!(
+                "其中**已经往产出走的**：{}；**仍然欠着的**：{}。\
+                 注意：已交付一样不等于全部交清——一次诉求里点名多样东西时，\
+                 每一样都要有自己的产出型分派。上面「仍然欠着的」那几样，\
+                 到现在为止**没有任何**对应的分派动作。",
+                done.join("、"),
+                pending.join("、"),
+            )
+        };
         Some(format!(
             "\n\n[本 session 累计（跨 turn）] 用户诉求里点名的交付物：{}。\
-             已发生调研类分派 {} 次（探索流程 / 通读·解剖·调研类委派），\
-             产出交付物的分派 **0** 次（未跑规划流程、未提交 plan、未产出文档）。\
-             注意：轮数本身不是问题（分模块深入是正当的），问题是点名的交付物一次都没往产出走。",
+             已发生调研类分派 {} 次（探索流程 / 通读·解剖·调研类委派）。{}",
             named.join("、"),
-            self.research_rounds
+            self.research_rounds,
+            done_note,
         ))
     }
 
-    /// 累计一次分派的类型（调研 / 交付物）。`task` 为空表示只按名字判。
+    /// 累计一次分派的类型（调研 / 交付物）。`satisfied` 是这次分派关掉的
+    /// 交付物标签（空 = 不关任何标签）。
     ///
     /// delegate 侧只能靠任务描述判型——关键词表是启发式的，所以只用来
     /// 喂 advisor 的判断材料（advisor 拿到的是"连着 N 轮"这个事实，
     /// 裁决仍由它做），不用来做任何自动阻断。
-    fn tally_dispatch(&mut self, kind_is_research: bool, kind_is_deliverable: bool) {
+    fn tally_dispatch(&mut self, kind_is_research: bool, satisfied: &[&'static str]) {
         if kind_is_research {
             self.research_rounds = self.research_rounds.saturating_add(1);
         }
-        if kind_is_deliverable {
+        if !satisfied.is_empty() {
             self.deliverable_rounds = self.deliverable_rounds.saturating_add(1);
+            self.deliverables_done.extend(satisfied.iter().copied());
         }
     }
 
@@ -1560,15 +1618,29 @@ impl MonitorState {
                 ..
             } if role_id == &self.watched_role => {
                 findings.extend(self.detectors.observe_tool_use(tool_name, args));
-                // 提交任务清单即产出交付物：交付物缺口就此关闭。
+                // 提交任务清单即产出交付物：任务清单 / 计划两个标签就此关闭
+                // （只关这两个——学习材料、文档不因提交清单而交付）。
                 if tool_name == "plan" {
-                    self.tally_dispatch(false, true);
+                    let closes = crate::workflow::deliverables_produced_by_plan_submit();
+                    self.tally_dispatch(false, &closes);
                 }
-                // Manager invoking the `workflow` tool is a routing
-                // decision — review whether the chosen workflow fits.
-                if tool_name == "workflow" {
-                    review_requested = true;
-                }
+                // 这里**不**触发路由审查。曾经在 `ToolUse{workflow}` 上
+                // 置 `review_requested`，但那一刻摘要里还没有任何关于这次
+                // 分派的行——描述这次分派的 `[workflow started]` 行是在
+                // 随后的 `ChatEvent::WorkflowStarted` 才 push 的，而审查在
+                // `observe()` 返回后立刻发出。结果 advisor 拿到的是**空摘要**
+                // 加一句"manager 刚做出任务分派决策"，两者直接矛盾。
+                //
+                // 实测事故（jemalloc 会话 12:24:02）：manager 发了
+                // `workflow{name:"learn"}`，advisor 收到空摘要，于是在
+                // <think> 里反复纠结「summary is completely empty…this is
+                // contradictory」，最后判 warn 并建议"应当优先匹配 `learn`"
+                // ——建议 manager 去做它这一轮已经做了的事。真正该被它抓住
+                // 的问题（manager 正文里承诺了 `implementation_plan` 却没发
+                // 出对应调用）反而完全看不见。
+                //
+                // 触发点因此下移到 `WorkflowStarted`（仅顶层），那里 push
+                // 与置位在同一个 handler 里，证据必然先于审查落地。
             }
             ChatEvent::ToolResult {
                 role_id,
@@ -1606,7 +1678,7 @@ impl MonitorState {
                 // 「通读/解剖」类 delegate 与再跑一轮 explore 等价，
                 // 一起计入调研轮次（见 delegate_task_looks_like_research）。
                 if delegate_task_looks_like_research(task) {
-                    self.tally_dispatch(true, false);
+                    self.tally_dispatch(true, &[]);
                 }
                 // D8: serial dispatch streak — a delegate started while
                 // none are in flight means the previous one finished
@@ -1706,15 +1778,18 @@ impl MonitorState {
                 // 只统计顶层启动（栈空）：workflow 步骤里拉起的子流程
                 // 不是 manager 的又一次分派决策。
                 if self.workflow_stack.is_empty() {
+                    // 路由审查在这里触发，而不是在 `ToolUse{workflow}`：
+                    // 上面那条 `[workflow started]` 已经进摘要，advisor
+                    // 一定能看见被审查的那次分派（见 ToolUse 分支的注释）。
+                    review_requested = true;
                     let research = crate::workflow::is_research_workflow(name);
-                    // 规划类产出任务清单，learn/write_doc/update_docs
-                    // 会落盘真实文档——对"学习/文档"类诉求就是交付物。
-                    let deliverable = crate::workflow::is_planning_workflow(name)
-                        || matches!(
-                            name.as_str(),
-                            "learn" | "learn_loop" | "write_doc" | "update_docs"
-                        );
-                    self.tally_dispatch(research, deliverable);
+                    // 这个流程能关掉哪几个交付物标签，由 DELIVERABLES 表的
+                    // `satisfied_by` 列说话——`learn` 只关「教程 / 学习材料」，
+                    // 关不掉「任务清单」。旧实现是个布尔（planning 流程或
+                    // learn/write_doc/update_docs → true），于是跑一个 learn
+                    // 就把同一句诉求里点名的任务清单也一起"交付"了。
+                    let closes = crate::workflow::deliverables_produced_by(name);
+                    self.tally_dispatch(research, &closes);
                 }
                 self.workflow_stack.push(name.clone());
             }
@@ -1785,6 +1860,55 @@ impl MonitorState {
 /// The advisor monitor. Spawned per session by the session creator
 /// (ui-server's `create_session_handle`); exits on `ChatEvent::Done`
 /// or when the broadcast channel closes (controller dropped).
+/// advisor monitor 对**宿主会话**的最小依赖面。
+///
+/// 为什么要这个 trait：`AdvisorMonitor::spawn` 原来绑死
+/// `Arc<ChatController>`，而 CLI REPL 不走 controller，于是 chat 的
+/// 顶层 turn **完全没有 advisor 监察**——intervene/warn 气泡、派单路由
+/// 审查、以及全部确定性检测器（D3 文件不存在连击、D8 串行 delegate…）
+/// 在 chat 里一个都不跑，同一个会话在 UI 里跑就有。
+///
+/// monitor 循环实际只用到宿主的这 5 件事，抽出来即可两处复用。
+pub trait AdvisorHost: Send + Sync + 'static {
+    /// 订阅宿主的事件流（monitor 的输入）。
+    fn subscribe(&self) -> broadcast::Receiver<ChatEvent>;
+    /// 宿主的事件发送端（monitor 发气泡用）。
+    fn event_sender(&self) -> broadcast::Sender<ChatEvent>;
+    /// 把纠正提示注入被监察角色的下一轮输入。
+    fn advisor_hint(&self, text: &str);
+    /// 最近一条用户输入，作为「主诉求」喂给审查 prompt。
+    fn last_user_input(&self) -> String;
+    /// 请求中止当前 turn（terminate 裁决）。
+    ///
+    /// 返回 boxed future 而非同步接口：controller 的实现除了置取消标志，
+    /// 还要往 `input_tx` 投一条 `CancelTurn` 唤醒阻塞在 `recv()` 的循环，
+    /// 而那需要 `.await` 一把 tokio Mutex。用 `try_lock` 降级会在锁竞争
+    /// 时**丢掉唤醒**——terminate 是安全关键路径，不接受概率性失效。
+    /// 手写 boxed future 可以逐字保留原行为，且不必引入 async_trait。
+    fn request_cancel_turn(&self)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+}
+
+impl AdvisorHost for ChatController {
+    fn subscribe(&self) -> broadcast::Receiver<ChatEvent> {
+        ChatController::subscribe(self)
+    }
+    fn event_sender(&self) -> broadcast::Sender<ChatEvent> {
+        ChatController::event_sender(self)
+    }
+    fn advisor_hint(&self, text: &str) {
+        ChatController::advisor_hint(self, text)
+    }
+    fn last_user_input(&self) -> String {
+        ChatController::last_user_input(self)
+    }
+    fn request_cancel_turn(&self)
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { ChatController::cancel_turn(self).await })
+    }
+}
+
+
 pub struct AdvisorMonitor;
 
 impl AdvisorMonitor {
@@ -1797,6 +1921,17 @@ impl AdvisorMonitor {
     ///   session's primary role, usually `"manager"`).
     pub fn spawn(
         controller: Arc<ChatController>,
+        config: AdvisorMonitorConfig,
+        review_engine: AdvisorReviewEngine,
+        watched_role: String,
+    ) -> tokio::task::JoinHandle<()> {
+        Self::spawn_on_host(controller, config, review_engine, watched_role)
+    }
+
+    /// 与 [`Self::spawn`] 同一个循环，但宿主换成 [`AdvisorHost`]——
+    /// 让不走 `ChatController` 的宿主（CLI REPL）也能跑监察。
+    pub fn spawn_on_host(
+        controller: Arc<dyn AdvisorHost>,
         config: AdvisorMonitorConfig,
         review_engine: AdvisorReviewEngine,
         watched_role: String,
@@ -1957,7 +2092,7 @@ impl AdvisorMonitor {
                     // run_turn future，driver 回到等用户输入；若 turn
                     // 刚好已结束，flag 会在下个 turn 入口被清掉，不会
                     // 误伤下一轮。语义见 ChatEvent::AdvisorTerminated。
-                    controller.cancel_turn().await;
+                    controller.request_cancel_turn().await;
                     let _ = bubble_tx.send(ChatEvent::AdvisorTerminated {
                         role_id: state.watched_role.clone(),
                         reason: reason.clone(),
@@ -2322,8 +2457,79 @@ mod tests {
         );
     }
 
-    // ── 交付物缺口：按「点名的交付物」判，不按轮数 ─────────────────
+    /// 路由审查触发点必须**晚于**该次分派进摘要。
+    ///
+    /// 实测事故（jemalloc 会话 12:24:02）：触发点原先挂在
+    /// `ToolUse{workflow}`，而描述这次分派的 `[workflow started]` 行是随后
+    /// 的 `WorkflowStarted` 才 push 的。审查在 `observe()` 返回后立刻发出，
+    /// 于是 advisor 收到「manager 刚做出分派决策」+ **空摘要**，两者直接
+    /// 矛盾；它猜了半页 <think> 之后判 warn，建议 manager 去用 `learn`
+    /// ——而 manager 那一轮发的就是 `learn`。
+    #[test]
+    fn workflow_routing_review_fires_only_after_dispatch_is_in_digest() {
+        let mut s = state();
+        // 工具调用本身不再触发审查：此刻摘要里还没有这次分派。
+        let out = s.observe(&ChatEvent::ToolUse {
+            role_id: "manager".into(),
+            tool_name: "workflow".into(),
+            args: r#"{"name":"learn","topic":"jemalloc"}"#.into(),
+            sub_id: None,
+        });
+        assert!(
+            !out.review_requested,
+            "ToolUse 阶段摘要还是空的，此时审查等于让 advisor 盲判"
+        );
+        // workflow 真正启动时才触发，且摘要里已有对应行。
+        let out = s.observe(&ChatEvent::WorkflowStarted {
+            name: "learn".into(),
+            topic: "jemalloc".into(),
+            wf_id: "wf-1".into(),
+        });
+        assert!(out.review_requested, "顶层 workflow 启动必须触发路由审查");
+        let rendered = s.digest.render();
+        assert!(
+            rendered.contains("[workflow started] learn"),
+            "触发审查时摘要必须已含这次分派: {rendered}"
+        );
+    }
 
+    /// 嵌套子 workflow 不重复触发路由审查（它不是 manager 的又一次分派）。
+    #[test]
+    fn nested_workflow_start_does_not_request_review() {
+        let mut s = state();
+        s.observe(&ChatEvent::WorkflowStarted {
+            name: "design_and_plan".into(),
+            topic: "t".into(),
+            wf_id: "wf-outer".into(),
+        });
+        let out = s.observe(&ChatEvent::WorkflowStarted {
+            name: "explore".into(),
+            topic: "t".into(),
+            wf_id: "wf-inner".into(),
+        });
+        assert!(
+            !out.review_requested,
+            "嵌套启动是流程内部步骤，不该当成新的分派决策再审一遍"
+        );
+    }
+
+    /// 空摘要必须自己说明「空」是什么意思，不能真的留白。
+    #[test]
+    fn empty_digest_states_its_own_emptiness() {
+        let d = DispatchDigest::default();
+        let rendered = d.render();
+        assert!(!rendered.trim().is_empty(), "空摘要不能渲染成空白");
+        assert!(
+            rendered.contains("没有记录到任何分派动作"),
+            "必须直说没有分派动作: {rendered}"
+        );
+        assert!(
+            rendered.contains("不要据此推断"),
+            "必须拦住 advisor 从留白里外推: {rendered}"
+        );
+    }
+
+    // ── 交付物缺口：按「点名的交付物」判，不按轮数 ─────────────────
     fn wf_started(name: &str) -> ChatEvent {
         ChatEvent::WorkflowStarted {
             name: name.into(),
@@ -2423,29 +2629,89 @@ mod tests {
         assert!(s.session_facts().is_none());
     }
 
+    /// 规划流程只关掉它自己产出的那几个标签，**不**顺手关掉别的。
+    ///
+    /// `JEMALLOC_ASK` 同时点名了「任务清单 / 计划 / 教程 / 学习材料」三样。
+    /// 旧实现记一个布尔，跑 `implementation_plan` 就把教程也算交付了；
+    /// 现在教程仍然欠着，缺口继续报，但报的是**差集**。
     #[test]
-    fn planning_workflow_closes_the_gap() {
+    fn planning_workflow_closes_only_its_own_deliverables() {
         let mut s = state();
         s.observe(&user_msg(JEMALLOC_ASK));
         s.observe(&wf_started("explore"));
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some());
         s.observe(&wf_started("implementation_plan"));
+        let facts = s
+            .session_facts()
+            .expect("教程还欠着，缺口不该整体关闭");
+        assert!(facts.contains("已经往产出走的"), "{facts}");
+        assert!(facts.contains("任务清单"), "{facts}");
+        assert!(facts.contains("仍然欠着的"), "{facts}");
+        assert!(facts.contains("教程 / 学习材料"), "{facts}");
+        // 把最后一样也跑掉，缺口才真正关闭。
+        // 先让 implementation_plan 结束——栈非空时 learn 会被当成嵌套子
+        // 流程（流程内部步骤不是 manager 的又一次分派，不记账）。
+        s.observe(&wf_finished("implementation_plan"));
+        s.observe(&wf_started("learn"));
         assert!(
             s.session_facts().is_none(),
-            "跑了规划流程就不该再报交付物缺口"
+            "三个标签全部产出后不该再报缺口"
+        );
+    }
+
+    /// 本次修复的核心回归：跑 `learn` 关不掉「拆分任务」。
+    ///
+    /// 实测事故（jemalloc 会话 12:24）：manager 正文写明"先 `learn`，再
+    /// `implementation_plan` 拆任务"，只发出了 `learn`。旧的布尔记账让
+    /// `session_facts()` 从此恒为 `None`，advisor 再也不会提起欠着的任务
+    /// 清单——看板至今 0 个任务。
+    #[test]
+    fn learn_does_not_close_the_task_list_gap() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        s.observe(&wf_started("learn"));
+        let facts = s
+            .session_facts()
+            .expect("任务清单还欠着，必须继续报缺口");
+        assert!(facts.contains("仍然欠着的"), "{facts}");
+        assert!(facts.contains("任务清单"), "{facts}");
+        assert!(
+            facts.contains("**已经往产出走的**：教程 / 学习材料"),
+            "已交付的那样要如实标出，否则 advisor 会重复催 learn: {facts}"
         );
     }
 
     #[test]
-    fn plan_submission_closes_the_gap() {
+    fn plan_submission_closes_the_task_list_gap_only() {
         let mut s = state();
         s.observe(&user_msg(JEMALLOC_ASK));
         s.observe(&wf_started("explore"));
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some());
         s.observe(&tool_use("plan", "{\"tasks\":[]}"));
-        assert!(s.session_facts().is_none(), "提交清单即关闭缺口");
+        let facts = s
+            .session_facts()
+            .expect("提交清单关不掉「教程」这一样");
+        assert!(facts.contains("任务清单"), "{facts}");
+        assert!(facts.contains("教程 / 学习材料"), "{facts}");
+    }
+
+    /// 单一交付物的诉求下，跑对流程就该彻底关闭缺口（不引入误报）。
+    #[test]
+    fn single_named_deliverable_is_fully_closed_by_its_workflow() {
+        let mut s = state();
+        s.observe(&user_msg("先摸清结构，然后给我拆分任务"));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        assert!(s.session_facts().is_some(), "任务清单欠着时要报");
+        s.observe(&wf_started("implementation_plan"));
+        assert!(
+            s.session_facts().is_none(),
+            "只点名了任务清单，跑了规划流程就该彻底关闭"
+        );
     }
 
     #[test]

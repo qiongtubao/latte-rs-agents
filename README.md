@@ -112,6 +112,7 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
 | `LATTE_AGENT_PARALLEL_TOOL_CALLS` | 1（开） | 下发 OpenAI 协议的 `parallel_tool_calls`，显式声明"一条响应里可以发多个工具调用"。`0`/`false`/`off` → 下发 `false` 强制单调用；`omit` → 字段完全不下发（个别兼容端点不认它，如 litellm #22637 的 Bedrock Converse + Claude 4.5）。Anthropic 默认就允许并行，该路径不下发 |
 | `LATTE_AGENT_DELEGATE_PARALLEL` | 0（关） | 同一轮里 ≥2 个 `delegate` 调用并发派发。默认关：子 agent 会写文件，并发有真实竞态风险 |
+| `LATTE_AGENT_BLOCKING_CALLS_LAST` | 1（开） | 同一轮里**会停下来等人作答**的调用（`ask`、内部有 `ask` 步的 `workflow`）排到最后执行，同批其他派发调用先跑。设 `0`/`false`/`off` 退回严格按模型给出的下标串行 |
 
 ### 减少模型往返（read 批量读）
 

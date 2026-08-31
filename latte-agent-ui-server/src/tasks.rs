@@ -593,6 +593,22 @@ pub struct TaskPatch {
     /// 必须自定义 deserialize_with 才能区分三者。）
     #[serde(default, deserialize_with = "deserialize_nullable")]
     pub workflow: Option<Option<String>>,
+    /// 任务涉及的文件/目录前缀：缺省 = 不变；数组 = 整体替换（空数组
+    /// = 清空声明）。
+    ///
+    /// 原先 `paths` 只能在 create/import 时写入、事后无法修正——一旦
+    /// 导入时字段名写错（实测：`involved_paths` 被 serde 静默丢弃），
+    /// 26 个任务的范围声明就永久是空的，只能手改 JSON 落盘文件。
+    #[serde(
+        default,
+        alias = "involved_paths",
+        alias = "involved_files",
+        alias = "affected_paths",
+        alias = "affected_files",
+        alias = "file_paths",
+        alias = "files"
+    )]
+    pub paths: Option<Vec<String>>,
 }
 
 /// 双层 Option 字段的反序列化：键存在即 `Some(值或null)`，缺失时由
@@ -643,7 +659,18 @@ pub struct ImportTask {
     pub workflow: Option<String>,
     /// 任务涉及的文件/目录前缀（相对项目根）：派发时与在跑任务范围
     /// 重叠会被拒绝（409）。空 = 未声明。
-    #[serde(default)]
+    ///
+    /// `alias` 与 [`latte_agent_core::controller::PlanTask`] 保持一致：
+    /// 模型写成 `involved_paths` 等同义名时不再静默丢整个数组。
+    #[serde(
+        default,
+        alias = "involved_paths",
+        alias = "involved_files",
+        alias = "affected_paths",
+        alias = "affected_files",
+        alias = "file_paths",
+        alias = "files"
+    )]
     pub paths: Vec<String>,
     #[serde(default)]
     pub subtasks: Vec<ImportTask>,
@@ -972,6 +999,16 @@ pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView
         }
         if let Some(labels) = patch.labels {
             t.labels = labels;
+        }
+        if let Some(paths) = patch.paths {
+            // 归一化：去空白、丢空串、去重（保持首次出现顺序）。派发时
+            // 的范围互斥按前缀比较，空串会匹配一切，必须挡在入口。
+            let mut seen = std::collections::HashSet::new();
+            t.paths = paths
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+                .collect();
         }
         if let Some(sched) = patch.scheduled_at {
             t.scheduled_at = sched;
@@ -2342,6 +2379,90 @@ mod tests {
         store
             .create(title, "desc", 2, vec![], None, None, None, None, "user")
             .expect("create")
+    }
+
+    // ─── ImportTask.paths 字段名别名 ─────────────────────────────────
+    //
+    // 回归 jemalloc 会话事故：plan 清单把 `paths` 写成 `involved_paths`，
+    // serde 静默丢弃整个数组 → 导入后 24 个任务全是 `paths: []` →
+    // 派发时的跨族文件范围互斥（`path_running_conflict`）失去依据。
+    // 与 `latte_agent_core::controller::PlanTask` 的别名集合保持同步。
+
+    #[test]
+    fn import_task_accepts_involved_paths_alias() {
+        let t: ImportTask = serde_json::from_value(serde_json::json!({
+            "title": "T-401 P2 修复",
+            "involved_paths": ["src/safety_check.c"],
+        }))
+        .expect("必须解析成功");
+        assert_eq!(
+            t.paths,
+            vec!["src/safety_check.c"],
+            "involved_paths 必须映射到 paths，不能被静默丢弃"
+        );
+    }
+
+    #[test]
+    fn import_task_accepts_all_path_aliases() {
+        for key in ["involved_files", "affected_paths", "affected_files", "file_paths", "files"] {
+            let t: ImportTask =
+                serde_json::from_value(serde_json::json!({ "title": "t", key: ["src/a.c"] }))
+                    .unwrap_or_else(|e| panic!("{key}: {e}"));
+            assert_eq!(t.paths, vec!["src/a.c"], "别名 {key} 必须映射到 paths");
+        }
+    }
+
+    #[test]
+    fn import_task_canonical_paths_still_works() {
+        let t: ImportTask =
+            serde_json::from_value(serde_json::json!({ "title": "t", "paths": ["src/b.c"] }))
+                .expect("解析");
+        assert_eq!(t.paths, vec!["src/b.c"], "规范字段名不能被别名破坏");
+    }
+
+    // ─── TaskPatch.paths：导入后可修正范围声明 ────────────────────────
+
+    #[test]
+    fn task_patch_paths_updates_and_normalizes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let id = {
+            let mut store = b.tasks.write();
+            store
+                .create("T-405", "desc", 1, vec![], None, None, None, None, "user")
+                .expect("create")
+                .id
+        };
+        // 起点是空 paths（= 导入时字段名写错后的实际状态）。
+        let got = update_task(
+            &b,
+            &id,
+            serde_json::from_value(serde_json::json!({
+                "involved_paths": [
+                    "  include/jemalloc/internal/tcache_inlines.h  ",
+                    "",
+                    "src/tcache.c",
+                    "src/tcache.c"
+                ]
+            }))
+            .expect("patch 解析"),
+        )
+        .expect("update");
+        assert_eq!(
+            got.task.paths,
+            vec!["include/jemalloc/internal/tcache_inlines.h", "src/tcache.c"],
+            "别名生效 + trim + 去空串 + 去重"
+        );
+    }
+
+    #[test]
+    fn task_patch_without_paths_keeps_existing() {
+        let p: TaskPatch =
+            serde_json::from_value(serde_json::json!({ "priority": 2 })).expect("解析");
+        assert!(p.paths.is_none(), "缺省 paths 必须是 None（= 不变）");
+        let p2: TaskPatch =
+            serde_json::from_value(serde_json::json!({ "paths": [] })).expect("解析");
+        assert_eq!(p2.paths, Some(vec![]), "显式空数组 = 清空声明，与缺省区分");
     }
 
     /// plan 阶段门：import 带 plan_id 时，持有对应 PendingApproval 的

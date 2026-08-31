@@ -527,6 +527,18 @@ fn log_hook_fire(name: &str, point: crate::trace::HookPoint, kind: &str) {
     eprintln!("[hook] {} {:?}: {}", name, point, kind);
 }
 
+/// `stop_reason` 是否表示"输出撞上长度上限"（各家命名不同：OpenAI 系
+/// `length`、Anthropic 系 `max_tokens`、部分兼容端点用
+/// `max_output_tokens` / `output_limit`）。
+///
+/// 只在这一处集中判定：截断的后果是 tool_calls 的 arguments 半截，必须
+/// 与"模型写错 JSON 格式"区分开——前者原样重试必然再撞一次。
+fn is_length_truncation(stop_reason: &str) -> bool {
+    const MARKERS: &[&str] = &["length", "max_tokens", "max_output_tokens", "output_limit"];
+    let s = stop_reason.trim().to_ascii_lowercase();
+    MARKERS.iter().any(|m| s == *m)
+}
+
 // ─── dedupe_native_tool_calls ─────────────────────────────────────────────
 
 /// 同一响应内去掉完全相同的 `(name, arguments)` tool_call，保留首次出现
@@ -1320,6 +1332,138 @@ fn readonly_parallel_runs(calls: &[ParsedCall]) -> Vec<(usize, usize)> {
         }
     }
     runs
+}
+
+/// 会**阻塞等人作答**的工具（短名）。
+///
+/// `ask` 在 workflow step / delegate 子代理里是阻塞语义，且刻意不设超时
+/// （见 `controller::register_ask_tool` 的 `ORCHESTRATION_TOOL_TIMEOUT_SECS`
+/// 注释）——没人点弹窗它就永远不返回。`ask_human` 直接把 session 暂停。
+const HUMAN_BLOCKING_TOOLS: &[&str] = &["ask", "ask_human"];
+
+/// **派发型**工具（短名）：把活交给子代理/子流水线跑完再返回。
+///
+/// 同一批里的多个派发调用彼此独立——引擎本来就允许它们并发执行
+/// （`LATTE_AGENT_DELEGATE_PARALLEL`），所以也允许**重排**。这张表存在的
+/// 唯一用途是给 [`human_blocking_last_order`] 画一条保守的适用边界：只有
+/// 整批都是派发调用时才敢动顺序。
+const DISPATCH_TOOLS: &[&str] = &["workflow", "delegate"];
+
+fn is_human_blocking_tool(name: &str) -> bool {
+    HUMAN_BLOCKING_TOOLS.contains(&short_tool_name(name))
+}
+
+fn is_dispatch_tool(name: &str) -> bool {
+    DISPATCH_TOOLS.contains(&short_tool_name(name))
+}
+
+/// 一个 `workflow` 工具调用是否会**在中途停下来等人作答**。
+///
+/// 按名字加载 workflow 定义，看有没有哪一步能调 `ask`：`tools` 里列了、
+/// `require_tools` / `require_tools_any` 要求了、或 `tool_call_limits` 给它
+/// 定了次数上限——任一即算。加载不到（名字错、文件不存在）按"不阻塞"处理：
+/// 这个判断只用来决定执行顺序，猜错的代价是退回现状，不能因为猜不出就报错。
+///
+/// 为什么不能只看工具名：manager 发的是 `workflow{name:"learn_loop"}`，
+/// 阻塞发生在它内部第三步的 `ask` 上，调用点本身完全看不出来。
+fn workflow_call_blocks_on_human(args_json: &str, cwd: Option<&std::path::Path>) -> bool {
+    let name = match serde_json::from_str::<serde_json::Value>(args_json) {
+        Ok(v) => match v.get("name").and_then(|n| n.as_str()) {
+            Some(n) => n.to_string(),
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let cwd = match cwd {
+        Some(c) => c.to_path_buf(),
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    };
+    let wf = match crate::workflow::load_workflow(&name, &cwd) {
+        Ok(wf) => wf,
+        Err(_) => return false,
+    };
+    wf.steps.iter().any(|s| {
+        s.tools.iter().any(|t| is_human_blocking_tool(t))
+            || s.require_tools.iter().any(|t| is_human_blocking_tool(t))
+            || s.require_tools_any.iter().any(|t| is_human_blocking_tool(t))
+            || s.tool_call_limits.keys().any(|t| is_human_blocking_tool(t))
+    })
+}
+
+/// 把一批 tool_call 里**会阻塞等人**的调用排到最后，返回执行顺序；
+/// `None` = 按模型给出的原顺序执行（现状，绝大多数批次走这条）。
+///
+/// ── 堵的是哪次事故 ────────────────────────────────────────────
+/// 实测（jemalloc 会话 `ui-87189-1788067528852-0`，事件 220/221）：manager
+/// 在同一条响应里发了两个 `workflow` 调用 —— `learn_loop`（学习，第三步
+/// 弹窗出题）和 `implementation_plan`（用户点名的"拆分任务"）。工具循环
+/// 严格按下标串行，`learn_loop` 跑到 quiz 步调 `ask` 就挂在那儿等人点弹窗
+/// （无超时），于是 `implementation_plan` 连一次 `ToolExec` 都没有 ——
+/// 用户明确要的产出被一个人机交互无限期押在队列里。advisor 当场就发现了
+/// 「任务清单至今没有任何产出型分派动作」，但 manager 正卡在弹窗里收不到。
+///
+/// 换成"阻塞调用最后跑"，同一批里的其他派发照样先产出，弹窗照样弹，
+/// 只是顺序反过来 —— 没有任何能力被牺牲。
+///
+/// ── 为什么重排是安全的 ────────────────────────────────────────
+/// 同一批调用的参数在模型产出时**就已经全部定死**，后一个调用的入参不可能
+/// 依赖前一个调用的结果（那需要另起一轮），所以批内不存在数据依赖。剩下的
+/// 只有副作用可见性（`bash` 写文件 → `read` 读它），因此这里画了一条很保守
+/// 的边界：**整批调用全是派发型（`workflow`/`delegate`）或阻塞型时才重排**，
+/// 批里出现任何 `read`/`write`/`bash`/`edit` 就整批不动。派发之间彼此独立，
+/// 引擎本来就允许它们并发（`LATTE_AGENT_DELEGATE_PARALLEL`）。
+///
+/// 记账（死循环探测、`tool_result` 回填）仍严格按**原始下标**顺序进行，
+/// 模型看到的消息序列与不重排时逐字节一致；重排只改变"谁先真正执行"。
+fn human_blocking_last_order(
+    calls: &[ParsedCall],
+    cwd: Option<&std::path::Path>,
+) -> Option<Vec<usize>> {
+    if calls.len() < 2 {
+        return None;
+    }
+    let mut blocking: Vec<usize> = Vec::new();
+    let mut rest: Vec<usize> = Vec::new();
+    for (i, c) in calls.iter().enumerate() {
+        let blocks = if is_human_blocking_tool(&c.name) {
+            true
+        } else if short_tool_name(&c.name) == "workflow" {
+            workflow_call_blocks_on_human(&c.args, cwd)
+        } else {
+            false
+        };
+        if blocks {
+            blocking.push(i);
+        } else {
+            // 保守边界：非阻塞侧只允许派发型调用被提到前面。
+            if !is_dispatch_tool(&c.name) {
+                return None;
+            }
+            rest.push(i);
+        }
+    }
+    if blocking.is_empty() || rest.is_empty() {
+        return None;
+    }
+    let order: Vec<usize> = rest.into_iter().chain(blocking).collect();
+    // 已经是原顺序（阻塞调用本来就在最后）→ 不必走重排路径。
+    if order.iter().copied().eq(0..calls.len()) {
+        return None;
+    }
+    Some(order)
+}
+
+/// 「阻塞调用排最后」是否生效。**默认开**——它不牺牲任何能力，只改执行
+/// 顺序。设 `LATTE_AGENT_BLOCKING_CALLS_LAST` 为 `0`/`false`/`no`/`off`
+/// 退回严格按模型下标串行（排查问题时的逃生口）。
+fn blocking_calls_last_enabled() -> bool {
+    std::env::var("LATTE_AGENT_BLOCKING_CALLS_LAST")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true)
 }
 
 /// Outcome of running a single tool call through the full pipeline
@@ -2567,6 +2711,14 @@ impl AgentRunner {
                 latency_ms,
                 finish_reason: completion.stop_reason.clone(),
             });
+            // 输出被长度上限截断：native tool_calls 的 arguments 会是半截
+            // JSON，下游 `from_str` 报 "EOF while parsing a string"，模型
+            // 看到的却是一句不知所以的 `invalid JSON`，于是原样重发再撞
+            // 一次。实测会话里 manager 连撞两次（finish_reason=length，
+            // args 断在 436 / 12081 字符），第三次靠删掉几乎所有 subtasks
+            // 才挤进去——拆分粒度是被这条静默截断吃掉的，不是判断失误。
+            // 记一个 flag，MalformedArgs 时把真实原因和可执行对策讲清。
+            let output_truncated = is_length_truncation(&completion.stop_reason);
             self.sink.emit(TraceEvent::ModelRawOut {
                 meta: meta.refreshed(),
                 raw_content: final_response.clone(),
@@ -2792,6 +2944,79 @@ impl AgentRunner {
                     continue;
                 }
 
+                // ── 阻塞人机交互的调用排到最后（默认开）─────────────
+                //
+                // 同一批里如果既有"会停下来等人点弹窗"的调用（`ask` /
+                // 内部会 `ask` 的 workflow），又有别的派发调用，先把不等人
+                // 的跑完，再去等人。见 [`human_blocking_last_order`]：那里
+                // 记了这条路径堵的实测事故（`implementation_plan` 被
+                // `learn_loop` 的弹窗无限期押在队列里，一次都没执行）。
+                //
+                // 重排只改执行时机；记账与 `tool_result` 回填仍按原始下标
+                // 顺序，模型看到的消息序列与不重排时完全一致。
+                let blocking_last_order = if blocking_calls_last_enabled() {
+                    human_blocking_last_order(&post_parse_calls, self.cwd.as_deref())
+                } else {
+                    None
+                };
+
+                if let Some(exec_order) = blocking_last_order {
+                    let names: Vec<&str> = exec_order
+                        .iter()
+                        .map(|&i| short_tool_name(&post_parse_calls[i].name))
+                        .collect();
+                    tracing::info!(
+                        "blocking-last reorder: executing {} calls as {:?} ({:?})",
+                        exec_order.len(),
+                        exec_order,
+                        names,
+                    );
+                    log_hook_fire(
+                        "blocking_calls_last",
+                        crate::trace::HookPoint::PostParse,
+                        "reorder",
+                    );
+
+                    let mut results: Vec<Option<OneCallResult>> =
+                        (0..post_parse_calls.len()).map(|_| None).collect();
+                    for &i in &exec_order {
+                        self.park_if_paused("tool exec boundary").await;
+                        results[i] = Some(
+                            run_one_tool_call(
+                                tm.clone(),
+                                self.hooks.clone(),
+                                self.sink.clone(),
+                                self.retry_policy.clone(),
+                                self.cwd.clone(),
+                                meta.clone(),
+                                post_parse_calls[i].clone(),
+                            )
+                            .await,
+                        );
+                    }
+
+                    // 按原始调用顺序记账 + 回填 tool_result。
+                    for (i, slot) in results.into_iter().enumerate() {
+                        let r = match slot {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        let name = post_parse_calls[i].name.clone();
+                        self.apply_call_result(
+                            r,
+                            &name,
+                            &mut messages,
+                            &mut loop_detector,
+                            &mut permanent_streak,
+                            &final_response,
+                            &last_substantive_response,
+                        )?;
+                    }
+
+                    round += 1;
+                    continue;
+                }
+
                 // ── Concurrent read-only fan-out ───────────────────────
                 //
                 // 同一响应里**连续**的多个只读工具调用（`read` /
@@ -2959,7 +3184,21 @@ impl AgentRunner {
                         let input: serde_json::Value = match serde_json::from_str(&tc.args) {
                             Ok(v) => v,
                             Err(e) => {
-                                let detail = format!("invalid JSON: {e}");
+                                // 截断导致的坏 JSON 与"模型写错格式"是两
+                                // 回事：前者重发同一份必然再撞，必须让模型
+                                // 缩小单次提交量（分批 / 精简字段），而不是
+                                // 原样重试。
+                                let detail = if output_truncated {
+                                    format!(
+                                        "工具参数被模型输出长度上限截断（finish_reason=length，\
+                                         收到 {} 字节不完整 JSON）：{e}。不要原样重发——\
+                                         必须缩小单次提交量：分批调用（每批 3-5 项）\
+                                         或精简每项的长文本字段。",
+                                        tc.args.len()
+                                    )
+                                } else {
+                                    format!("invalid JSON: {e}")
+                                };
                                 final_outcome = Err((
                                     ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
                                     detail,
@@ -6541,6 +6780,152 @@ mod tests {
         assert_eq!(short_tool_name("read"), "read");
     }
 
+    /// End-to-end proof that a human-blocking call can no longer strand
+    /// its siblings: 一轮里 `workflow{interactive}`（内部会 `ask`）排在
+    /// `workflow{plain}` 前面，引擎必须先跑 plain。
+    ///
+    /// 构造成"interactive 的 handler 一直等到 plain 跑完才返回"——所以
+    /// 在**修复前**的严格按下标串行下这个测试会直接死等超时（正是实测事故：
+    /// `implementation_plan` 被 `learn_loop` 的弹窗永久押在队列里）。
+    #[tokio::test]
+    async fn blocking_workflow_call_does_not_strand_its_sibling() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // workflow 定义 fixture：interactive 步声明了 ask，plain 没有。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir");
+        std::fs::write(
+            wf_dir.join("interactive.toml"),
+            "name = \"interactive\"\ndescription = \"d\"\n[[steps]]\nid = \"quiz\"\nrole = \"tutor\"\ntask = \"t\"\ntools = [\"ask\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            wf_dir.join("plain.toml"),
+            "name = \"plain\"\ndescription = \"d\"\n[[steps]]\nid = \"plan\"\nrole = \"pm\"\ntask = \"t\"\ntools = [\"write\"]\n",
+        )
+        .unwrap();
+
+        // plain 跑完才 notify；interactive 的 handler 等这个通知。
+        let plain_done = Arc::new(tokio::sync::Notify::new());
+        let order: Arc<parking_lot::Mutex<Vec<String>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let plain_done_h = plain_done.clone();
+        let order_h = order.clone();
+        let handler: SharedToolHandler = Arc::new(move |input, _ctx| {
+            let plain_done = plain_done_h.clone();
+            let order = order_h.clone();
+            let name = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            Box::pin(async move {
+                if name == "interactive" {
+                    // 模拟"等人点弹窗"：这里等的是 plain 完成的信号。
+                    plain_done.notified().await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    plain_done.notify_one();
+                }
+                order.lock().push(name.clone());
+                Ok(serde_json::json!({ "ok": name }))
+            })
+        });
+        let tool = Tool::builder(
+            "workflow",
+            "test workflow",
+            ToolInputSchema {
+                schema_type: SchemaType,
+                properties: Default::default(),
+                required: None,
+                additional_properties: None,
+            },
+            handler,
+        )
+        .build();
+        let tm = create_tool_manager();
+        tm.register(tool, None);
+
+        let server = wiremock::MockServer::start().await;
+        struct FirstOnly(std::sync::atomic::AtomicUsize);
+        impl wiremock::Match for FirstOnly {
+            fn matches(&self, _req: &wiremock::Request) -> bool {
+                self.0
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+            }
+        }
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body(
+                            "",
+                            vec![
+                                serde_json::json!({
+                                    "id": "call_i",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "workflow",
+                                        "arguments": "{\"name\":\"interactive\",\"topic\":\"learn\"}"
+                                    }
+                                }),
+                                serde_json::json!({
+                                    "id": "call_p",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "workflow",
+                                        "arguments": "{\"name\":\"plain\",\"topic\":\"split tasks\"}"
+                                    }
+                                }),
+                            ],
+                        ),
+                    )),
+            )
+            .await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("done", vec![])),
+                    ),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "mgr".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm).with_cwd(dir.path().to_path_buf());
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            runner.run_turn(&[Message::user("go")], None),
+        )
+        .await
+        .expect("阻塞调用排到最后后本轮必须能收尾——超时说明兄弟调用又被押住了")
+        .expect("turn completes");
+        assert_eq!(resp, "done");
+        assert_eq!(
+            *order.lock(),
+            vec!["plain".to_string(), "interactive".to_string()],
+            "不等人的派发必须先跑完，等人的排最后"
+        );
+    }
+
     /// End-to-end proof of the opt-in delegate concurrency:
     ///   - `LATTE_AGENT_DELEGATE_PARALLEL` unset → the two delegate
     ///     calls in one response run **serially** (max observed
@@ -6671,6 +7056,168 @@ mod tests {
         let parallel_max = run_phase().await;
         std::env::remove_var("LATTE_AGENT_DELEGATE_PARALLEL");
         assert_eq!(parallel_max, 2, "flag on must run the two delegates concurrently");
+    }
+
+    /// [`human_blocking_last_order`]：会等人点弹窗的调用必须排到最后，
+    /// 且只在整批都是派发调用时才敢重排。
+    ///
+    /// 回归防线（jemalloc 会话 ui-87189-1788067528852-0，事件 220/221）：
+    /// manager 同一轮发了 `workflow{learn_loop}` + `workflow{implementation_plan}`，
+    /// 前者第三步 `ask` 弹窗挂住不返回（无超时），后者一次都没执行 ——
+    /// 用户点名要的"拆分任务"被一个人机交互无限期押在队列里。
+    #[test]
+    fn human_blocking_calls_are_reordered_last() {
+        fn c(name: &str, args: &str) -> ParsedCall {
+            ParsedCall { id: String::new(), name: name.into(), args: args.into() }
+        }
+        // workflow 定义 fixture：interactive 步里有 ask，plain 没有。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir workflows.d");
+        std::fs::write(
+            wf_dir.join("interactive.toml"),
+            r#"
+name = "interactive"
+description = "有弹窗的流水线"
+[[steps]]
+id = "quiz"
+role = "tutor"
+task = "出题"
+tools = ["read", "write", "ask"]
+require_tools = ["ask"]
+"#,
+        )
+        .expect("write interactive.toml");
+        std::fs::write(
+            wf_dir.join("plain.toml"),
+            r#"
+name = "plain"
+description = "无弹窗的流水线"
+[[steps]]
+id = "plan"
+role = "pm"
+task = "拆任务"
+tools = ["read", "write"]
+"#,
+        )
+        .expect("write plain.toml");
+        let cwd = Some(dir.path());
+
+        // 事故原样重放：交互式 workflow 在前 → 必须换到最后。
+        assert_eq!(
+            human_blocking_last_order(
+                &[
+                    c("workflow", r#"{"name":"interactive","topic":"x"}"#),
+                    c("workflow", r#"{"name":"plain","topic":"y"}"#),
+                ],
+                cwd,
+            ),
+            Some(vec![1, 0]),
+            "内部会 ask 的 workflow 必须排到最后"
+        );
+
+        // 已经在最后 → 不必重排（走原有串行路径，少一层包装）。
+        assert_eq!(
+            human_blocking_last_order(
+                &[
+                    c("workflow", r#"{"name":"plain","topic":"y"}"#),
+                    c("workflow", r#"{"name":"interactive","topic":"x"}"#),
+                ],
+                cwd,
+            ),
+            None
+        );
+
+        // 裸 ask 调用同样算阻塞，派发调用先跑。
+        assert_eq!(
+            human_blocking_last_order(
+                &[c("ask", "{}"), c("delegate", r#"{"role":"programmer"}"#)],
+                cwd,
+            ),
+            Some(vec![1, 0])
+        );
+
+        // 保守边界：批里出现非派发调用（read/write/bash/edit）→ 整批不动。
+        // 副作用可见性（bash 写 → read 读）绝不能被顺序调整破坏。
+        for other in ["read", "write", "bash", "edit"] {
+            assert_eq!(
+                human_blocking_last_order(
+                    &[
+                        c("workflow", r#"{"name":"interactive","topic":"x"}"#),
+                        c(other, "{}"),
+                    ],
+                    cwd,
+                ),
+                None,
+                "批里有 {other} 时不许重排"
+            );
+        }
+
+        // 没有阻塞调用 / 全是阻塞调用 / 单个调用 → 都不重排。
+        assert_eq!(
+            human_blocking_last_order(
+                &[
+                    c("workflow", r#"{"name":"plain","topic":"a"}"#),
+                    c("workflow", r#"{"name":"plain","topic":"b"}"#),
+                ],
+                cwd,
+            ),
+            None
+        );
+        assert_eq!(
+            human_blocking_last_order(
+                &[
+                    c("workflow", r#"{"name":"interactive","topic":"a"}"#),
+                    c("ask", "{}"),
+                ],
+                cwd,
+            ),
+            None
+        );
+        assert_eq!(
+            human_blocking_last_order(&[c("ask", "{}")], cwd),
+            None
+        );
+
+        // 名字加载不到的 workflow 按"不阻塞"处理：判断只影响顺序，
+        // 猜不出时退回现状，绝不因此报错。
+        assert_eq!(
+            human_blocking_last_order(
+                &[
+                    c("workflow", r#"{"name":"nope","topic":"a"}"#),
+                    c("workflow", r#"{"name":"plain","topic":"b"}"#),
+                ],
+                cwd,
+            ),
+            None
+        );
+
+        // 三个调用：交互式夹在中间 → 其余保持相对顺序，它去最后。
+        assert_eq!(
+            human_blocking_last_order(
+                &[
+                    c("delegate", r#"{"role":"architect"}"#),
+                    c("workflow", r#"{"name":"interactive","topic":"x"}"#),
+                    c("workflow", r#"{"name":"plain","topic":"y"}"#),
+                ],
+                cwd,
+            ),
+            Some(vec![0, 2, 1])
+        );
+    }
+
+    /// 逃生口：`LATTE_AGENT_BLOCKING_CALLS_LAST=0` 退回严格按下标串行。
+    #[test]
+    fn blocking_calls_last_env_escape_hatch() {
+        std::env::remove_var("LATTE_AGENT_BLOCKING_CALLS_LAST");
+        assert!(blocking_calls_last_enabled(), "默认开");
+        for off in ["0", "false", "no", "off", "OFF"] {
+            std::env::set_var("LATTE_AGENT_BLOCKING_CALLS_LAST", off);
+            assert!(!blocking_calls_last_enabled(), "{off} 应关掉重排");
+        }
+        std::env::set_var("LATTE_AGENT_BLOCKING_CALLS_LAST", "1");
+        assert!(blocking_calls_last_enabled());
+        std::env::remove_var("LATTE_AGENT_BLOCKING_CALLS_LAST");
     }
 
     /// [`readonly_parallel_runs`] 的分段语义：
@@ -7150,6 +7697,34 @@ mod tests {
         let calls = vec![t("read", args.clone()), t("bash", args)];
         let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 2, "不同工具名应保留");
+    }
+
+    // ─── is_length_truncation tests ─────────────────────────────────
+    //
+    // 回归 jemalloc plan 事故：manager 提交 24 个任务的 plan 清单，两次
+    // 撞 finish_reason=length（args 断在 436 / 12081 字符），下游只报
+    // 一句 `invalid JSON`，模型据此原样重发再撞一次；第三次靠删掉几乎
+    // 所有 subtasks 才挤进去，拆分粒度被这条静默截断吃掉。截断必须与
+    // "模型写错 JSON 格式"区分开，回执里给出"分批/精简"的可执行对策。
+
+    #[test]
+    fn length_truncation_recognizes_provider_markers() {
+        for s in ["length", "max_tokens", "max_output_tokens", "output_limit"] {
+            assert!(is_length_truncation(s), "{s} 必须判为长度截断");
+        }
+    }
+
+    #[test]
+    fn length_truncation_is_case_and_space_insensitive() {
+        assert!(is_length_truncation("  LENGTH "), "大小写/空白不应影响判定");
+        assert!(is_length_truncation("Max_Tokens"));
+    }
+
+    #[test]
+    fn length_truncation_rejects_normal_stop_reasons() {
+        for s in ["stop", "tool_calls", "end_turn", "", "stop_sequence", "content_filter"] {
+            assert!(!is_length_truncation(s), "{s:?} 不是长度截断");
+        }
     }
 
     // ─── ensure_unique_tool_call_ids tests ──────────────────────────
