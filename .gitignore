@@ -34,6 +34,10 @@
 .latte/models.d/mock.toml
 !.latte/workflows/
 tests/.latte/
+# CLI 会话索引（`latte-agent chat --session` 的运行时产物，同根 /.latte/sessions/ 一类）
+latte-agent-cli/.latte/
+# Python 辅助脚本的字节码缓存（pty_drive.py 运行产物）
+scripts/__pycache__/
 # Frontend (`latte-agent-cli/ui/`, Vite + React). Source-of-truth
 # is the `.ts` files; `tsc` emits `.js` alongside and `vite build`
 # produces `dist/`. `node_modules/` is npm install output.
