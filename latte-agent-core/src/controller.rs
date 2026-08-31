@@ -176,7 +176,14 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                         role_id: meta.role,
                         content: delta,
                         is_complete: false,
-                        sub_id: None,
+                        // 必须带 sub_id（同 ToolUse/ToolResult 分支）。
+                        // 此前写死 None：delegate/workflow 子代理的逐
+                        // token 流以主角色气泡的身份出现，而它的
+                        // ToolUse/ToolResult 却带 sub_id，同一段对话被
+                        // 拆到两处；并行波里两个同 role 分派的 token 还
+                        // 会交错进同一个气泡（前端按 role_id+sub_id 建
+                        // 流式气泡，None 会让它们撞同一个 key）。
+                        sub_id: self.sub_id.clone(),
                     });
                 }
             }
@@ -789,6 +796,11 @@ enum ControllerInput {
     Input(String),
     Pause,
     Resume,
+    /// Session-level resume used by the V2 pause gate endpoint. Unlike
+    /// `Resume`, this also reaches the multi-role driver's persisted
+    /// `SessionManager` state, but does not emit `Resumed`: the gate
+    /// listener/API owns that single user-visible event.
+    ResumeSession(tokio::sync::oneshot::Sender<bool>),
     SwitchRole(String),
     SwitchModel(ModelTier),
     Abort,
@@ -885,12 +897,29 @@ pub struct ControllerConfig {
 
 // ─── Controller ──────────────────────────────────────────────────
 
+/// Result of a V2 session resume request. A command that is still pending
+/// acknowledgement is treated as live: starting checkpoint fallback while
+/// that command can still be consumed would run two execution paths at once.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionResumeOutcome {
+    pub gate_paused_for_ms: Option<u128>,
+    pub driver_resumed: bool,
+    pub driver_command_pending: bool,
+}
+
+impl SessionResumeOutcome {
+    pub fn is_live(self) -> bool {
+        self.gate_paused_for_ms.is_some()
+            || self.driver_resumed
+            || self.driver_command_pending
+    }
+}
+
 /// Event-driven chat session controller.
 pub struct ChatController {
     input_tx: tokio::sync::Mutex<Option<mpsc::UnboundedSender<ControllerInput>>>,
     event_tx: broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
-    pause_requested: Arc<AtomicBool>,
     /// Per-turn cancellation flag, distinct from `cancel_flag`
     /// (which aborts the whole session). The driver arms it before
     /// awaiting `run_turn` and clears it after the turn resolves; the
@@ -972,7 +1001,6 @@ impl ChatController {
             input_tx: tokio::sync::Mutex::new(None),
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            pause_requested: Arc::new(AtomicBool::new(false)),
             turn_cancel_flag: Arc::new(AtomicBool::new(false)),
             advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
@@ -1003,7 +1031,6 @@ impl ChatController {
 
         let event_tx = self.event_tx.clone();
         let cancel_flag = self.cancel_flag.clone();
-        let pause_flag = self.pause_requested.clone();
         let turn_cancel_flag = self.turn_cancel_flag.clone();
         let advisor_hints = self.advisor_hints.clone();
         let plan_stage = self.plan_stage.clone();
@@ -1052,7 +1079,6 @@ impl ChatController {
                 input_rx,
                 &event_tx,
                 cancel_flag,
-                pause_flag,
                 turn_cancel_flag,
                 advisor_hints,
                 plan_stage,
@@ -1078,7 +1104,7 @@ impl ChatController {
         // 的 runner；文本命中"终止/stop/取消/别继续"时同时软终止
         // 当前 turn（turn_cancel_flag 由 run_turn_cancellable 的
         // 500ms tick 看到，driver 丢掉 in-flight turn 回到等输入）。
-        if self.pause_requested() {
+        if self.advisor_pause_requested() {
             let lower = text.to_lowercase();
             let stop = ["终止", "stop", "取消", "别继续"]
                 .iter()
@@ -1182,7 +1208,6 @@ impl ChatController {
 
     /// Resume from paused state.
     pub async fn resume(&self) {
-        self.pause_requested.store(false, Ordering::SeqCst);
         // 用户显式恢复也算对 advisor pause gate 拍板。
         self.advisor_pause.resolve();
         if let Some(tx) = self.input_tx.lock().await.as_ref() {
@@ -1204,19 +1229,54 @@ impl ChatController {
     pub fn pause_session(&self) -> bool {
         self.agent_pause_gate.pause_with_reason("用户暂停 session")
     }
-    /// Session-level 恢复（与 [`pause_session`] 配对）。返回 paused
-    /// 时长 ms；若本来就没 paused 返回 `None`。Resumed 事件同样由
-    /// on_change listener 统一广播。
-    pub fn resume_session(&self) -> Option<u128> {
+    /// Session-level 恢复（与 [`pause_session`] 配对）。返回 gate、
+    /// driver ack 与 pending 状态，供 API 安全地区分 live resume 和
+    /// cold-start checkpoint fallback。
+    pub async fn resume_session(&self) -> SessionResumeOutcome {
         // 与 `resume()` 对齐：用户点「继续」同样算对 advisor pause gate
         // 拍板，否则 advisor 暂停（只置 advisor 门，不 engage
         // agent_pause_gate）永远无法通过 resume-session 解除。
         self.advisor_pause.resolve();
-        self.agent_pause_gate.resume()
+        let paused_for = self.agent_pause_gate.resume();
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let sent = if let Some(tx) = self.input_tx.lock().await.as_ref() {
+            tx.send(ControllerInput::ResumeSession(ack_tx)).is_ok()
+        } else {
+            false
+        };
+        if paused_for.is_some() || !sent {
+            return SessionResumeOutcome {
+                gate_paused_for_ms: paused_for,
+                driver_resumed: false,
+                driver_command_pending: sent,
+            };
+        }
+        match tokio::time::timeout(Duration::from_secs(1), ack_rx).await {
+            Ok(Ok(driver_resumed)) => SessionResumeOutcome {
+                gate_paused_for_ms: None,
+                driver_resumed,
+                driver_command_pending: false,
+            },
+            // Sender disappeared: the driver cannot consume this command, so
+            // checkpoint fallback remains safe.
+            Ok(Err(_)) => SessionResumeOutcome::default(),
+            // Timeout is ambiguous, not a negative ack. The command remains
+            // queued and can still be consumed after this API returns, so it
+            // must suppress fallback to avoid concurrent execution.
+            Err(_) => SessionResumeOutcome {
+                gate_paused_for_ms: None,
+                driver_resumed: false,
+                driver_command_pending: true,
+            },
+        }
     }
 
     /// 当前是否有未拍板的 advisor 暂停请求（测试与嵌入方断言用）。
-    pub fn pause_requested(&self) -> bool {
+    ///
+    /// 曾经叫 `pause_requested()` —— 与当时同名的 `pause_requested`
+    /// 字段（多角色 loop 的暂停旗标，实际是死字段）指的根本不是一回事，
+    /// 谁去读那段代码都会先被这个同名坑一次。字段已删，方法改名。
+    pub fn advisor_pause_requested(&self) -> bool {
         self.advisor_pause.is_requested()
     }
 
@@ -1511,7 +1571,6 @@ async fn run_driver(
     mut input_rx: mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
-    pause_flag: Arc<AtomicBool>,
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
@@ -1527,7 +1586,6 @@ async fn run_driver(
             &mut input_rx,
             event_tx,
             cancel_flag,
-            &*pause_flag,
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
@@ -1579,7 +1637,6 @@ async fn run_multi_role_loop(
     input_rx: &mut mpsc::UnboundedReceiver<ControllerInput>,
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
-    pause_flag: &AtomicBool,
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
@@ -1856,6 +1913,14 @@ async fn run_multi_role_loop(
                                 let _ = event_tx.send(ChatEvent::Resumed);
                                 break;
                             }
+                            Some(ControllerInput::ResumeSession(ack)) => {
+                                let resumed = {
+                                    let mut mgr = session_arc.lock().await;
+                                    mgr.resume().is_ok()
+                                };
+                                let _ = ack.send(resumed);
+                                break;
+                            }
                             Some(ControllerInput::Abort) | None => break 'rounds,
                             Some(ControllerInput::AdvisorHint(t)) => {
                                 advisor_hints.lock().push_back(t);
@@ -1873,7 +1938,42 @@ async fn run_multi_role_loop(
                 Some(ControllerInput::CancelTurn) => {
                     turn_cancel_flag.store(true, Ordering::SeqCst);
                 }
-                Some(ControllerInput::Resume) => {}
+                // ▶ 在 round 边界到达：如果 SessionRecord 还停在 Paused，
+                // 这里必须真的 resume 它。
+                //
+                // 此前是空 arm（`=> {}`），于是 supervisor 的**自动**暂停
+                // （预算超支 / dead-loop：`pause_with_reason` +
+                // `continue 'rounds`）成了不可恢复状态：记录停在 Paused，
+                // 之后每轮所有角色都被「session not running」跳过，用户
+                // 按 ▶ 无效、发消息也无效 —— 会话永久空转（照收消息、照
+                // 发 RoundStarted，但永远没产出）。用户手动 /pause 走上面
+                // 那个原地 park 分支，不受影响；这里补的是自动暂停那条路。
+                Some(ControllerInput::Resume) => {
+                    let resumed = {
+                        let mut mgr = session_arc.lock().await;
+                        if mgr.state() == SessionState::Paused {
+                            let _ = mgr.resume();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if resumed {
+                        let _ = event_tx.send(ChatEvent::Resumed);
+                    }
+                }
+                Some(ControllerInput::ResumeSession(ack)) => {
+                    let resumed = {
+                        let mut mgr = session_arc.lock().await;
+                        if mgr.state() == SessionState::Paused {
+                            let _ = mgr.resume();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    let _ = ack.send(resumed);
+                }
                 Some(ControllerInput::AdvisorHint(text)) => {
                     advisor_hints.lock().push_back(text);
                 }
@@ -1911,6 +2011,14 @@ async fn run_multi_role_loop(
                                     let _ = mgr.resume();
                                 }
                                 let _ = event_tx.send(ChatEvent::Resumed);
+                                break;
+                            }
+                            Some(ControllerInput::ResumeSession(ack)) => {
+                                let resumed = {
+                                    let mut mgr = session_arc.lock().await;
+                                    mgr.resume().is_ok()
+                                };
+                                let _ = ack.send(resumed);
                                 break;
                             }
                             Some(ControllerInput::Abort) | None => break 'rounds,
@@ -2194,6 +2302,15 @@ async fn run_multi_role_loop(
                 sub_id: None,
             });
 
+            // 本轮用量基线：`Supervisor::observe` 内部做 `+=`，所以这里
+            // 必须传**本轮增量**，不能传 `runner.total_usage()`（那是该
+            // runner 的累计值）。传累计值的后果是第 N 轮把前 N-1 轮重复
+            // 加一次，总量按 O(N²) 膨胀 —— 名义 5 万预算会远早于 5 万就
+            // 触发 "token budget exceeded"，角色越多、轮次越多越夸张。
+            // 单角色路径一直是对的（usage_after - usage_before），这里
+            // 与它对齐。
+            let usage_before = runner.total_usage().clone();
+
             let new_assistant_text = match run_turn_cancellable(
                 runner,
                 &[],
@@ -2254,13 +2371,16 @@ async fn run_multi_role_loop(
             }
 
             // ─── Context threshold check ──────────────────────────────
-            // Check accumulated token usage against the session token
-            // budget. Uses the runner's actual `total_usage` (not a
-            // hardcoded placeholder). If the budget is exceeded, the
-            // supervisor triggers an auto-pause and we skip remaining
-            // roles in this round.
-            let usage = runner.total_usage();
-            let tokens_used = usage.input_tokens + usage.output_tokens + usage.thinking_tokens;
+            // 把**本轮增量**交给 supervisor（它内部 `+=` 累加）。见上面
+            // `usage_before` 的注释：传累计值会让预算按 O(N²) 提前打爆。
+            let usage_after = runner.total_usage();
+            let tokens_used = (usage_after.input_tokens + usage_after.output_tokens
+                + usage_after.thinking_tokens)
+                .saturating_sub(
+                    usage_before.input_tokens
+                        + usage_before.output_tokens
+                        + usage_before.thinking_tokens,
+                );
             let decision_kind = runner.last_decision_kind();
             let pause_reason = scheduler
                 .supervisor
@@ -2288,41 +2408,6 @@ async fn run_multi_role_loop(
             mgr.advance_turn().ok();
         }
         let _ = event_tx.send(ChatEvent::RoundEnded { round: round_num });
-
-        // Check pause flag
-        if pause_flag.load(Ordering::SeqCst) {
-            {
-                let mut mgr = session_arc.lock().await;
-                let _ = mgr.pause("用户请求暂停");
-            }
-            let _ = event_tx.send(ChatEvent::Paused {
-                reason: "用户请求暂停".into(),
-            });
-            // Pause-wait loop: only accept Resume or Abort
-            'pause: loop {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    break 'rounds;
-                }
-                match input_rx.recv().await {
-                    Some(ControllerInput::Resume) => {
-                        let mut mgr = session_arc.lock().await;
-                        if mgr.state() == SessionState::Paused {
-                            let _ = mgr.resume();
-                        }
-                        pause_flag.store(false, Ordering::SeqCst);
-                        let _ = event_tx.send(ChatEvent::Resumed);
-                        break 'pause;
-                    }
-                    Some(ControllerInput::Abort) | None => break 'rounds,
-                    Some(ControllerInput::AdvisorHint(text)) => {
-                        // Paused: park the hint; the runner drains it
-                        // when the session resumes.
-                        advisor_hints.lock().push_back(text);
-                    }
-                    _ => {}
-                }
-            }
-        }
     }
 
     // Cleanup
@@ -2469,7 +2554,15 @@ async fn run_single_role_loop(
                     None => break,
                     Some(ControllerInput::Input(text)) => {
                         let trimmed = text.trim().to_string();
+                        // 空输入直接丢弃，回到等输入 —— 这里原本是个
+                        // **空语句块**（`if trimmed.is_empty() {}`），本意
+                        // 显然是 continue（多角色路径写的就是
+                        // `if !trimmed.is_empty() { break trimmed }`）。
+                        // 落空的后果：前端误发空串/纯空白也会发
+                        // UserMessage 并真跑一轮，而部分厂商对 text 为空
+                        // 的消息直接 400，这一轮白报错。
                         if trimmed.is_empty() {
+                            continue;
                         }
 
                         // workflow slash 失败时合成的善后输入：Some 时不
@@ -2637,6 +2730,12 @@ async fn run_single_role_loop(
                                         let _ = event_tx.send(ChatEvent::Resumed);
                                         break;
                                     }
+                                    Some(ControllerInput::ResumeSession(ack)) => {
+                                        let was_paused = paused;
+                                        paused = false;
+                                        let _ = ack.send(was_paused);
+                                        break;
+                                    }
                                     Some(ControllerInput::Abort) | None => return,
                                     Some(ControllerInput::CancelTurn) => {
                                         cancelled = true;
@@ -2651,6 +2750,62 @@ async fn run_single_role_loop(
                                 }
                             }
                             if cancelled {
+                                continue;
+                            }
+                        }
+
+                        // Session 级暂停门（⏸ = `pause_session` /
+                        // `POST /api/chat/pause-session`）：这是随附 UI
+                        // 实际用的那一组端点，与上面那个 driver-local
+                        // `paused`（legacy `/chat/pause`）是两套独立状态。
+                        //
+                        // 此前 driver 只看 `paused`，从不查 gate：gate
+                        // engaged 时照样把 UserMessage / RoleStarted /
+                        // [calling LLM] 全发出去，真正的 park 发生在
+                        // runner 内部的 tool-round 边界。用户看到的是
+                        // 「消息发出去了，然后永远没结果」，而不是
+                        // 「已暂停」—— 按了 ⏸ 再发消息就会命中。
+                        //
+                        // 这里只轮询 gate 与 session cancel_flag，**不**从
+                        // input_rx 取输入：取了就得负责回写，否则暂停期间
+                        // 的消息/切角色会被静默吞掉（上面那个 park 循环的
+                        // `_ => {}` 就是这个毛病，不要复制它）。
+                        // `Paused`/`Resumed` 事件由 gate 的 on_change
+                        // listener 统一广播，这里不重复发。
+                        if agent_pause_gate.is_paused() {
+                            let reason = agent_pause_gate
+                                .pause_reason()
+                                .unwrap_or_else(|| "会话已暂停".to_string());
+                            let _ = event_tx.send(ChatEvent::Status {
+                                message: format!(
+                                    "[{reason} — 本条输入已收到，▶ 继续后执行]"
+                                ),
+                            });
+                            let mut pending_turn_cancelled = false;
+                            loop {
+                                if cancel_flag.load(Ordering::SeqCst) {
+                                    return;
+                                }
+                                // `cancel_turn()` sets this atomic before queuing
+                                // ControllerInput::CancelTurn. The current Input arm
+                                // already owns the pending text, so it cannot consume
+                                // that command without also risking later inputs. Drop
+                                // the pending turn here; the queued command is harmless
+                                // because run_turn_cancellable clears stale idle flags.
+                                if turn_cancel_flag.swap(false, Ordering::SeqCst) {
+                                    pending_turn_cancelled = true;
+                                    break;
+                                }
+                                if !agent_pause_gate.is_paused() {
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(200))
+                                    .await;
+                            }
+                            if pending_turn_cancelled {
+                                let _ = event_tx.send(ChatEvent::Status {
+                                    message: "[已取消暂停中等待执行的输入]".into(),
+                                });
                                 continue;
                             }
                         }
@@ -2760,6 +2915,11 @@ let usage_before = runner.total_usage().clone();
                     Some(ControllerInput::Resume) => {
                         paused = false;
                         let _ = event_tx.send(ChatEvent::Resumed);
+                    }
+                    // V2 resume-session already emits via the gate listener/API.
+                    // Single-role has no SessionManager state to restore.
+                    Some(ControllerInput::ResumeSession(ack)) => {
+                        let _ = ack.send(false);
                     }
                     Some(ControllerInput::AdvisorHint(text)) => {
                         // Idle-side delivery: park the hint in the
@@ -4471,8 +4631,7 @@ pub fn default_ask_timeout() -> std::time::Duration {
     }
 }
 
-/// 删掉这次 ask 的跨进程落盘记录（见 [`crate::pending_ask`]）。
-///
+/// 删掉这次 ask 的跨进程落盘记录（见 [`crate::pending_ask`]）。///
 /// 只在**答案已进 checkpoint**或**用户主动取消**时调用。刻意**不**放进
 /// `ChoiceGuard::drop`：future 因进程退出而被 drop 时删掉记录，正好把
 /// 唯一能救回这次提问的凭据毁掉。
@@ -5445,6 +5604,17 @@ async fn register_delegate_tool(
                 // 没装时等价 run_turn。
                 runner.run_turn_gated(&[Message::user(task_content)], None).await
             });
+            // abort-on-drop：**必须**有。下面的 select! 会在超时/取消
+            // 分支里显式 abort，但那是这个 handler future 还在被 poll
+            // 的前提下。驱动侧 `run_turn_cancellable` 同样是 500ms 轮询，
+            // 它先赢时会直接 drop 整个 run_turn future → 这个 handler
+            // future 被丢弃 → 走不到任何 abort 分支，而裸 JoinHandle 被
+            // drop **不会**取消任务（tokio 语义）。后果：specialist 脱管
+            // 继续真实写文件/跑 bash，事件仍打进共享 event_tx 污染下一
+            // 个 turn，气泡永远停在「运行中」（无配对 DelegateFinished），
+            // 而 SubCancelGuard 已析构 → 用户再也取消不了它。
+            // 两个 500ms 轮询谁先赢是竞态，不能靠"通常是 select 先赢"。
+            let _abort_on_drop = crate::sub_cancel::AbortOnDrop(run_handle.abort_handle());
             // 超时被 500ms cancel 轮询每次 select! 重建会永远不响，
             // 必须在循环外 pin 住。
             let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
@@ -6184,12 +6354,12 @@ mod tests {
     #[tokio::test]
     async fn advisor_pause_resolves_on_any_user_input() {
         let c = ChatController::new(8);
-        assert!(!c.pause_requested());
+        assert!(!c.advisor_pause_requested());
         c.request_pause();
-        assert!(c.pause_requested());
+        assert!(c.advisor_pause_requested());
         // 任何用户输入都算拍板（继续）：清旗，不取消 turn。
         c.submit_input("继续").await;
-        assert!(!c.pause_requested());
+        assert!(!c.advisor_pause_requested());
         assert!(!c.turn_cancel_requested());
     }
 
@@ -6199,7 +6369,7 @@ mod tests {
         c.request_pause();
         // 命中"终止"关键词：resolve + 软终止当前 turn 同时发生。
         c.submit_input("终止本轮吧").await;
-        assert!(!c.pause_requested());
+        assert!(!c.advisor_pause_requested());
         assert!(c.turn_cancel_requested());
     }
 
@@ -6208,7 +6378,7 @@ mod tests {
         let c = ChatController::new(8);
         c.request_pause();
         c.resume().await;
-        assert!(!c.pause_requested());
+        assert!(!c.advisor_pause_requested());
     }
 
     #[test]
@@ -6232,6 +6402,53 @@ mod tests {
             strip_think_blocks("<think>只有推理</think>"),
             "<think>只有推理</think>"
         );
+    }
+
+    /// 流式 delta 必须带 `sub_id`（与同一个 sink 里的 ToolUse /
+    /// ToolResult 分支一致）。
+    ///
+    /// 此前写死 `None`：子代理的逐 token 流以主角色身份出现，而它的
+    /// 工具行带 sub_id，同一段对话被拆到两处；前端按 role_id + sub_id
+    /// 建流式气泡，None 会让并行波里两个同 role 分派撞同一个 key，
+    /// 两路 token 交错混进一个气泡。
+    #[test]
+    fn model_delta_carries_sub_id_like_tool_events() {
+        use crate::trace::TraceSink as _;
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let sink = ChatEventTraceSink {
+            event_tx: tx,
+            sub_id: Some("programmer-sub-7".into()),
+        };
+        sink.emit(crate::trace::TraceEvent::ModelDelta {
+            meta: crate::trace::TraceMeta::test_default(),
+            delta: "半句话".into(),
+        });
+        match rx.try_recv().unwrap() {
+            ChatEvent::RoleTurn { content, is_complete, sub_id, .. } => {
+                assert_eq!(content, "半句话");
+                assert!(!is_complete, "delta 是增量，不是终态");
+                assert_eq!(
+                    sub_id.as_deref(),
+                    Some("programmer-sub-7"),
+                    "delta 必须归属到发起它的 subsession"
+                );
+            }
+            other => panic!("expected RoleTurn, got {other:?}"),
+        }
+
+        // 主 session 角色（sub_id: None）仍然不带 —— 不能反过来给主
+        // 角色的流硬塞一个 sub_id。
+        let (tx2, mut rx2) = broadcast::channel(8);
+        let main_sink = ChatEventTraceSink { event_tx: tx2, sub_id: None };
+        main_sink.emit(crate::trace::TraceEvent::ModelDelta {
+            meta: crate::trace::TraceMeta::test_default(),
+            delta: "主角色".into(),
+        });
+        match rx2.try_recv().unwrap() {
+            ChatEvent::RoleTurn { sub_id, .. } => assert!(sub_id.is_none()),
+            other => panic!("expected RoleTurn, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8386,97 +8603,9 @@ mod tests {
     /// 结果 `/api/chat/send` 一路返回 202，SSE 连着但永远静默。
     #[tokio::test]
     async fn abort_then_respawn_revives_driver() {
-        use crate::config::{ModelCatalog, ModelDef};
-        use crate::role::RoleTemplate;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
-
-        let server = wiremock::MockServer::start().await;
-        server
-            .register(
-                Mock::given(method("POST"))
-                    .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        serde_json::json!({
-                            "id": "chatcmpl-test",
-                            "object": "chat.completion",
-                            "created": 0,
-                            "model": "test",
-                            "choices": [{
-                                "index": 0,
-                                "message": { "role": "assistant", "content": "占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰。" },
-                                "finish_reason": "stop"
-                            }],
-                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-                        })
-                        .to_string(),
-                    )),
-            )
-            .await;
-
-        let agent_config = Arc::new(AgentConfig {
-            advisor: Default::default(),
-            models: ModelCatalog {
-                models: vec![ModelDef {
-                    name: "stub-standard".into(),
-                    api: "openai".into(),
-                    provider: "test".into(),
-                    base_url: server.uri(),
-                    api_key: "test-key".into(),
-                    context_window: 32000,
-                    max_tokens: 4096,
-                    supports_thinking: false,
-                    supports_vision: false,
-                    supports_image_generation: false,
-                    cost_per_million_input: None,
-                    cost_per_million_output: None,
-                    tier: Some("standard".into()),
-                    timeout_secs: None,
-                }],
-                tiers: None,
-                role_tiers: None,
-            },
-            roles: [(
-                "manager".to_string(),
-                RoleTemplate {
-                    id: "manager".into(),
-                    name: "manager".into(),
-                    category: "planning".into(),
-                    model_tier: "standard".into(),
-                    model_chain: vec![],
-                    prompt_file: None,
-                    temperature: None,
-                    tools: vec![],
-                    icon: "👔".into(),
-                    skills: vec![],
-                    code_paths: vec![],
-                },
-            )]
-            .into_iter()
-            .collect(),
-        });
-        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let server = stub_llm_server().await;
         let dir = tempfile::tempdir().unwrap();
-
-        let cfg = ControllerConfig {
-            task_id: None,
-            roles: vec!["manager".to_string()],
-            initial_prompt: None,
-            max_rounds: 0,
-            session_token_budget: 0,
-            agent_config,
-            model_resolver: resolver,
-            default_params: GenerateParams::default(),
-            primary_model_id: None,
-            initial_tier: None,
-            initial_history: vec![],
-            cwd: dir.path().to_path_buf(),
-            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
-            advisor_monitor: AdvisorMonitorConfig::default(),
-            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            max_delegates_per_session: crate::controller::default_max_delegates(),
-            session_id: String::new(),
-        };
+        let cfg = stub_single_role_config(server.uri(), dir.path());
 
         let controller = ChatController::new(64);
 
@@ -8540,6 +8669,322 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         false
+    }
+
+    /// 起一个总是回固定长回答的 OpenAI-兼容 mock，返回它的 base_url。
+    /// 回答故意超过 advisor D5 短输出阈值，避免 gate 重试干扰断言。
+    async fn stub_llm_server() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "占位长回答：超过 advisor D5 短输出 gate 的 50 字符阈值，避免测试被 gate 重试干扰。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+        server
+    }
+
+    /// 单角色（manager）driver 的最小可用配置，指向 `base_url` 的 mock。
+    fn stub_single_role_config(base_url: String, cwd: &std::path::Path) -> ControllerConfig {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url,
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: cwd.to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        }
+    }
+
+    /// 空/纯空白输入必须被丢弃，不能真跑一轮。
+    ///
+    /// 原来这里是个**空语句块**（`if trimmed.is_empty() {}`），本意显然
+    /// 是 continue（多角色路径写的就是 `if !trimmed.is_empty()`）。落空
+    /// 的后果：前端误发空串也会发 UserMessage 并真调模型，而部分厂商对
+    /// text 为空的消息直接 400，这一轮白报错。
+    #[tokio::test]
+    async fn blank_input_is_dropped_without_running_a_turn() {
+        let server = stub_llm_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = stub_single_role_config(server.uri(), dir.path());
+
+        let controller = ChatController::new(64);
+        let mut rx = controller.spawn(cfg).await;
+
+        controller.submit_input("").await;
+        controller.submit_input("   \n\t ").await;
+        // 紧跟一条真输入：它必须是第一个被处理的 —— 说明前两条既没发
+        // UserMessage 也没跑 turn（不是"慢"，是"没有"）。
+        controller.submit_input("真正的问题").await;
+
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("等 UserMessage 超时")
+                .expect("recv");
+            if let ChatEvent::UserMessage { text } = ev {
+                assert_eq!(
+                    text, "真正的问题",
+                    "空输入不该产生 UserMessage（它先到，说明空 if 又漏了）"
+                );
+                break;
+            }
+        }
+
+        controller.abort().await;
+    }
+
+    /// `AbortOnDrop` 必须真的取消 task。
+    ///
+    /// 裸 `JoinHandle` 被 drop 不取消任务是 tokio 的既定语义，delegate
+    /// 那条路正是踩在这上面：驱动侧 500ms 轮询先赢时直接 drop 整个
+    /// run_turn future，handler 走不到任何 abort 分支，specialist 脱管
+    /// 继续写文件/跑 bash，事件还在往共享 event_tx 里发。
+    #[tokio::test]
+    async fn abort_on_drop_really_cancels_the_task() {
+        use std::sync::atomic::AtomicBool;
+
+        let ran_to_completion = Arc::new(AtomicBool::new(false));
+        let flag = ran_to_completion.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        {
+            let _guard = crate::sub_cancel::AbortOnDrop(handle.abort_handle());
+            // 模拟"外层 future 被 drop"：guard 在这里出作用域。
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !ran_to_completion.load(Ordering::SeqCst),
+            "guard drop 后 task 必须被取消 —— 否则它会脱管跑到底"
+        );
+
+        // 反向对照：没有 guard 时裸 drop JoinHandle 不会取消（锁死我们
+        // 依赖的 tokio 语义，将来若变了这个测试会提醒）。
+        let ran2 = Arc::new(AtomicBool::new(false));
+        let flag2 = ran2.clone();
+        drop(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            flag2.store(true, Ordering::SeqCst);
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            ran2.load(Ordering::SeqCst),
+            "裸 drop JoinHandle 不取消任务（这正是需要 AbortOnDrop 的原因）"
+        );
+    }
+
+    /// Session 级暂停门 engaged 时，driver **不得**先把
+    /// `UserMessage` / `RoleStarted` / `[calling LLM]` 发出去再到 runner
+    /// 内部 park —— 那样 UI 看到的是「消息发出去了，然后永远没结果」
+    /// 而不是「已暂停」。这是随附 UI 会命中的路径（它只用
+    /// `pause-session` / `resume-session` 这一组端点）。
+    ///
+    /// 断言两半：暂停期间只出「输入已收到、▶ 继续后执行」的 Status，
+    /// 不出 `UserMessage`；resume 之后那条输入被真的执行。
+    #[tokio::test]
+    async fn session_gate_paused_holds_input_instead_of_faking_a_turn() {
+        let server = stub_llm_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = stub_single_role_config(server.uri(), dir.path());
+
+        let controller = ChatController::new(64);
+        let mut rx = controller.spawn(cfg).await;
+
+        // 先确认 driver 正常工作（排除"哑 session"造成的假阳性）。
+        controller.submit_input("热身").await;
+        wait_for_user_message(&mut rx, "热身").await;
+
+        // ⏸：engage session gate（= POST /api/chat/pause-session）。
+        assert!(controller.pause_session(), "首次 pause 应返回 true");
+
+        controller.submit_input("暂停期间发的消息").await;
+
+        // 暂停期间：必须出现"输入已收到"的 Status，且**不能**出现
+        // 这条输入的 UserMessage（旧 bug 就是照发不误）。
+        let mut saw_hold_status = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(ChatEvent::UserMessage { text })) if text == "暂停期间发的消息" => {
+                    panic!("暂停期间不该发出这条输入的 UserMessage（driver 没查 gate）");
+                }
+                Ok(Ok(ChatEvent::Status { message })) => {
+                    if message.contains("▶ 继续后执行") {
+                        saw_hold_status = true;
+                    }
+                    // 旧 bug 的另一个指纹：暂停期间就发 [calling LLM]。
+                    assert!(
+                        !message.contains("calling LLM"),
+                        "暂停期间不该发 [calling LLM]：{message}"
+                    );
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if saw_hold_status {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_hold_status,
+            "暂停期间应给出「输入已收到、▶ 继续后执行」的反馈，而不是静默"
+        );
+
+        // ▶：resume 之后那条被 hold 的输入必须真的执行。
+        assert!(
+            controller
+                .resume_session()
+                .await
+                .gate_paused_for_ms
+                .is_some(),
+            "resume 应返回暂停时长"
+        );
+        wait_for_user_message(&mut rx, "暂停期间发的消息").await;
+
+        controller.abort().await;
+    }
+
+    /// CancelTurn issued while a V2-paused input is parked must discard
+    /// that input. Resuming must not run it, and the queued CancelTurn must
+    /// not poison the next fresh input.
+    #[tokio::test]
+    async fn session_gate_paused_pending_input_can_be_cancelled() {
+        let server = stub_llm_server().await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = stub_single_role_config(server.uri(), dir.path());
+
+        let controller = ChatController::new(64);
+        let mut rx = controller.spawn(cfg).await;
+        assert!(controller.pause_session());
+        controller.submit_input("不要执行这条").await;
+
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("wait for parked status")
+                .expect("recv");
+            if matches!(ev, ChatEvent::Status { ref message } if message.contains("▶ 继续后执行")) {
+                break;
+            }
+        }
+
+        controller.cancel_turn().await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("wait for pending cancellation")
+                .expect("recv");
+            match ev {
+                ChatEvent::UserMessage { text } if text == "不要执行这条" => {
+                    panic!("cancelled parked input must never start")
+                }
+                ChatEvent::Status { message } if message.contains("已取消暂停中等待执行的输入") => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            controller
+                .resume_session()
+                .await
+                .gate_paused_for_ms
+                .is_some()
+        );
+        controller.submit_input("恢复后的新输入").await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("wait for fresh input")
+                .expect("recv");
+            match ev {
+                ChatEvent::UserMessage { text } if text == "不要执行这条" => {
+                    panic!("cancelled parked input ran after resume")
+                }
+                ChatEvent::UserMessage { text } if text == "恢复后的新输入" => break,
+                _ => {}
+            }
+        }
+
+        controller.abort().await;
     }
 
     /// 从事件流里等一条内容匹配的 `UserMessage` —— 证明 driver 真的
@@ -9338,6 +9783,148 @@ require = ["永远不可能出现的验收字符串"]
                     panic!("slash command must not emit UserMessage: {um:?}")
                 }
                 ChatEvent::RoleList { .. } => break,
+                _ => {}
+            }
+        }
+
+        controller.abort().await;
+    }
+
+    // 多角色 supervisor 自动暂停必须能由外层 `Resume` 恢复。
+    //
+    // 旧实现只在手动 `/pause` 的内层 park loop 处理 Resume；supervisor
+    // 在 round 尾把 SessionRecord 置为 Paused 后会回到外层收输入，而外层
+    // 的 Resume arm 是空的。之后虽然还能收到消息、发 RoundStarted，但
+    // 每轮都会被 `session not running` 跳过，session 永久空转。
+    #[tokio::test]
+    async fn multi_role_supervisor_auto_pause_can_resume() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+
+        let server = stub_llm_server().await;
+        let stub_role = |id: &str, icon: &str| {
+            (
+                id.to_string(),
+                RoleTemplate {
+                    id: id.into(),
+                    name: id.into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: icon.into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            )
+        };
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [stub_role("manager", "👔"), stub_role("programmer", "🧑‍💻")]
+                .into_iter()
+                .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let git_ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !git_ok {
+            eprintln!("skipping multi_role_supervisor_auto_pause_can_resume: git unavailable");
+            return;
+        }
+
+        let cfg = ControllerConfig {
+            task_id: Some("t-supervisor-resume".to_string()),
+            roles: vec!["manager".to_string(), "programmer".to_string()],
+            initial_prompt: Some("exercise supervisor resume".to_string()),
+            max_rounds: 20,
+            // mock 每轮报告 15 tokens；第一位角色结束即自动暂停。
+            session_token_budget: 1,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig::default(),
+            stream_mode: Arc::new(AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        async fn next_event(
+            rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>,
+        ) -> ChatEvent {
+            tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
+                .await
+                .expect("event timeout")
+                .expect("recv")
+        }
+
+        let controller = ChatController::new(256);
+        let mut rx = controller.spawn(cfg).await;
+        controller.submit_input("first turn").await;
+
+        loop {
+            match next_event(&mut rx).await {
+                ChatEvent::Paused { reason } => {
+                    assert!(reason.contains("token budget"), "unexpected pause: {reason}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        // 使用真实 V2 resume-session 对应的公开入口，而不是 legacy
+        // `resume()`；即使 supervisor pause 没有 engage gate，也必须把
+        // SessionManager 从 Paused 恢复。
+        assert!(controller.resume_session().await.driver_resumed);
+
+        controller.submit_input("turn after resume").await;
+        loop {
+            match next_event(&mut rx).await {
+                // 恢复后必须真的有角色起跑。具体是哪个角色由 scheduler
+                // 的 order 决定（不一定是 manager），这里只关心「不再被
+                // session not running 跳过」。
+                ChatEvent::RoleStarted { role_id, .. } => {
+                    assert!(
+                        role_id == "manager" || role_id == "programmer",
+                        "unexpected role: {role_id}"
+                    );
+                    break;
+                }
+                ChatEvent::Status { message } if message.contains("session not running") => {
+                    panic!("resumed session remained non-running: {message}");
+                }
                 _ => {}
             }
         }

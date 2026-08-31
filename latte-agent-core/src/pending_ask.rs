@@ -191,6 +191,29 @@ pub fn remove(cwd: &Path, choice_id: &str) {
     }
 }
 
+/// 删掉某个 session 名下所有挂起记录（session 被删除时调用）。
+///
+/// 记录是按 `session_id` 归属被 [`load_for_session`] 读回来补发弹框的，
+/// session 都没了还留着，它们既补不到任何地方，又会一直躺在盘上。
+pub fn remove_for_session(cwd: &Path, session_id: &str) {
+    let Ok(rd) = std::fs::read_dir(dir(cwd)) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let matches = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<PendingAsk>(&raw).ok())
+            .is_some_and(|rec| rec.session_id == session_id);
+        if matches {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// 删掉一条**非阻塞弹框**落盘记录（幂等）。用户处理完弹框
 /// （提交 / 跳过 / 导入清单）后调用。
 ///

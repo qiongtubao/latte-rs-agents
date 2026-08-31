@@ -231,10 +231,61 @@ export function mountChat(opts: {
   const workflowStepQueues = new Map<string, Array<{ key: string; roleId: string; taskText: string }>>();
   const workflowStepMsgIds = new Map<string, string>();
   const workflowStepSubIds = new Map<string, string>();
-  /** role_id → active streaming response bubble. */
+  /** role_id + sub_id → active streaming response bubble. */
   const streamingEl = new Map<string, HTMLElement>();
-  /** role_id → accumulated raw streaming text. */
+  /** role_id + sub_id → accumulated raw streaming text. */
   const streamingRaw = new Map<string, string>();
+  const streamKey = (roleId: string, subId?: string | null): string =>
+    `${roleId}\u0000${subId ?? ""}`;
+  function clearStream(roleId: string, subId?: string | null): void {
+    const key = streamKey(roleId, subId);
+    streamingEl.delete(key);
+    streamingRaw.delete(key);
+  }
+  function clearAllStreams(): void {
+    streamingEl.clear();
+    streamingRaw.clear();
+  }
+  function forgetDelegate(subId: string): void {
+    delegateToolCounts.delete(subId);
+    activeDelegates.delete(subId);
+    if (currentDelegateSubId === subId) {
+      currentDelegateSubId = "";
+      // Preserve the legacy no-sub_id fallback only when another delegate is
+      // genuinely still active; otherwise the next main RoleStarted must not
+      // inherit the retired subsession.
+      for (const activeSubId of activeDelegates.keys()) {
+        currentDelegateSubId = activeSubId;
+      }
+    }
+  }
+  /** Drop-only/abort paths can miss DelegateFinished. Reconcile the live
+   *  badge/map without synthesising a duplicate chat message. */
+  function retireDelegate(subId: string, status: string): void {
+    const di = activeDelegates.get(subId);
+    if (!di) return;
+    clearStream(di.targetRole, subId);
+    const badge = di.stateEl ?? delegateBadge(subId);
+    if (badge) {
+      badge.textContent = `❌ ${status}`;
+      badge.className = "delegate-state failed";
+    }
+    hideTimeoutPromptByKey(subId);
+    forgetDelegate(subId);
+  }
+  function retireWorkflowDelegates(wfId: string, status: string): void {
+    for (const [subId, di] of [...activeDelegates]) {
+      if (di.wfId === wfId) retireDelegate(subId, status);
+    }
+  }
+  function retireTurnDelegates(status: string): void {
+    for (const [subId, di] of [...activeDelegates]) {
+      if (!di.wfId) retireDelegate(subId, status);
+    }
+  }
+  function retireAllDelegates(status: string): void {
+    for (const subId of [...activeDelegates.keys()]) retireDelegate(subId, status);
+  }
   /** wf_id → workflow output transcript used for plan import extraction. */
   const workflowTranscripts = new Map<string, string>();
   /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
@@ -2212,6 +2263,10 @@ export function mountChat(opts: {
       case "RoleStarted": {
         subagentTools = [];
         const startedSubId = e.sub_id || findDelegateSubByRole(e.role_id) || currentDelegateSubId || undefined;
+        // A missing terminal (SSE loss, model error, cancelled outer future,
+        // or replay ending on a partial) must never make this new turn append
+        // to the previous turn's partial bubble.
+        clearStream(e.role_id, e.sub_id);
         const isDelegate = !!startedSubId;
         const node = addMessage({
           kind: "status",
@@ -2239,6 +2294,7 @@ export function mountChat(opts: {
         break;
       }
       case "RoleFinished": {
+        clearStream(e.role_id, e.sub_id);
         const entry = takeExecutingRow(e.role_id, e.sub_id);
         if (entry) {
           const inner = entry.row.querySelector(".message.status") as HTMLElement | null;
@@ -2368,8 +2424,15 @@ export function mountChat(opts: {
 
         // ── 流式增量渲染 ──
         // `is_complete:false` 的事件携带模型逐 token 生成的增量片段。
-        // 首个 delta 创建气泡，后续 delta 追加到同一气泡（按 role 追踪）。
-        const streamRow = streamingEl.get(e.role_id);
+        // 首个 delta 创建气泡，后续 delta 追加到同一气泡。
+        //
+        // key 必须是 `role_id + sub_id` 而不是裸 role_id：DAG 并行波里
+        // 两个分派可以命中同一个 role（或分派 role 与主角色相同），只按
+        // role 索引会让两路 token 交错写进同一个气泡，正文混成一团。
+        // （后端此前还把 delta 的 sub_id 写死成 None，两个坑叠在一起；
+        // 见 controller.rs 的 ModelDelta 分支。）
+        const key = streamKey(e.role_id, e.sub_id);
+        const streamRow = streamingEl.get(key);
         if (e.is_complete) {
           // 终态：若之前有流式气泡，把终态 content 追加进去/结束；否则整段加新泡。
           if (streamRow) {
@@ -2379,17 +2442,22 @@ export function mountChat(opts: {
               // 已追加的 delta 拼接误差）。仅当 content 与已显示不一致时。
               contentEl.innerHTML = renderMarkdown(e.content);
             }
-            streamingEl.delete(e.role_id);
-            streamingRaw.delete(e.role_id);
+            streamingEl.delete(key);
+            streamingRaw.delete(key);
           } else {
             addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: ref, filePath: getFilePath(e.role_id) });
           }
           currentToolCall = ""; currentActivity = ""; updateFooter();
           setStatus("connected"); clearWaitTimer();
           if (di) {
-            activeDelegates.delete(subId);
+            forgetDelegate(subId);
+            // 分派结束只更新角色徽标显示，**不**再自动发
+            // switchRole("manager")：那是一次真实的 HTTP 调用，会把
+            // 服务端当前角色改掉 —— 用户手动切到别的角色后，一个分派
+            // 完成就把他的选择静默改回 manager（服务端还会重建 runner）。
+            // 分派回到 manager 是后端编排的内部事实，不该反向覆盖用户
+            // 在 UI 上的显式选择。
             if (activeDelegates.size === 0) {
-              if (!replaying) switchRole("manager").catch(() => {});
               container.rolePill.textContent = `${roleIcon("manager")} manager`;
             }
           }
@@ -2397,13 +2465,13 @@ export function mountChat(opts: {
           // 增量 delta：已有流式气泡则累积重渲染，否则新建。
           if (streamRow) {
             const contentEl = streamRow.querySelector<HTMLElement>(".msg-content");
-            const raw = (streamingRaw.get(e.role_id) ?? "") + e.content;
-            streamingRaw.set(e.role_id, raw);
+            const raw = (streamingRaw.get(key) ?? "") + e.content;
+            streamingRaw.set(key, raw);
             if (contentEl) contentEl.innerHTML = renderMarkdown(raw);
           } else {
             const row = addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: undefined, filePath: getFilePath(e.role_id) });
-            streamingEl.set(e.role_id, row);
-            streamingRaw.set(e.role_id, e.content);
+            streamingEl.set(key, row);
+            streamingRaw.set(key, e.content);
           }
           updateStatusPillLabel(`${icon} 模型输出中…`);
           resetWaitTimer();
@@ -2508,11 +2576,16 @@ export function mountChat(opts: {
         const icon = currentRoleIcon || resolveIcon(e.from_role);
         updateFooter(); updateStatusPillLabel(`${icon} 思考中…`);
         container.rolePill.textContent = `${icon} ${e.from_role}`;
-        // Clean up delegate tracking
-        activeDelegates.delete(e.sub_id);
+        // Clean up delegate tracking and any partial stream that ended
+        // without a complete RoleTurn.
+        clearStream(e.to_role, e.sub_id);
+        forgetDelegate(e.sub_id);
         resetWaitTimer(); break;
       }
-      case "Done": setStatus("connected"); clearWaitTimer(); addMessage({ kind: "system", content: "[会话结束]" }); setFooter("会话结束"); break;
+      case "Done":
+        clearAllStreams();
+        retireAllDelegates("会话已终止");
+        setStatus("connected"); clearWaitTimer(); addMessage({ kind: "system", content: "[会话结束]" }); setFooter("会话结束"); break;
       case "WorkflowStarted": {
         const msg = addMessage({
           kind: "role",
@@ -2589,6 +2662,10 @@ export function mountChat(opts: {
       }
       case "WorkflowFinished": {
         const isFail = e.status !== "ok";
+        // JoinSet::abort_all can drop sibling step futures before they emit
+        // DelegateFinished. The workflow terminal is authoritative for all
+        // remaining delegates owned by this wf_id.
+        retireWorkflowDelegates(e.wf_id, isFail ? e.status : "工作流已结束");
         const stateEl = workflowStates.get(e.wf_id);
         if (stateEl) {
           stateEl.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
@@ -2774,6 +2851,17 @@ export function mountChat(opts: {
           }
          } else {
         }
+        if (errSubId) {
+          const errRole = activeDelegates.get(errSubId)?.targetRole ?? targetRole;
+          if (errRole) clearStream(errRole, errSubId);
+          retireDelegate(errSubId, "中断");
+        } else {
+          if (targetRole) clearStream(targetRole);
+          // A top-level turn error/cancel drops the parent future. Any
+          // delegate handlers still registered under it will never reach
+          // their explicit DelegateFinished cleanup.
+          retireTurnDelegates("父任务中断");
+        }
         setFooter(`错误: ${truncate(e.message, 80)}`);
         // 该分派失败 —— 它的 TimeoutWarning 失去意义，收掉对应那条。
         // 带 sub_id 时精确移除（并行波里不误伤兄弟的提示条）。
@@ -2828,8 +2916,7 @@ export function mountChat(opts: {
     messageStore.length=0;
     allEvents.length=0;
     currentEventIdx=-1;
-    streamingEl.clear();
-    streamingRaw.clear();
+    clearAllStreams();
     clearAllDelegates();
     subagentTools.length = 0;
     lastUserMsgId = "";

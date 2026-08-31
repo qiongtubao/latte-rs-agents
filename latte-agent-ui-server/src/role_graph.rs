@@ -249,8 +249,14 @@ mod tests {
 
         let g = build(cwd, &core_src).await.expect("build");
 
-        assert_eq!(g.stats.roles, 2);
-        assert_eq!(g.stats.tools, 4); // read, search, write, bash
+        // load_with_global 按产品语义还会合并用户全局角色；测试环境
+        // 不能假设 ~/.latte/agents.d 为空，只锁定本夹具的两个角色和
+        // 四个工具确实存在。
+        assert!(g.stats.roles >= 2);
+        assert!(g.stats.tools >= 4);
+        for id in ["role:pm", "role:dev", "tool:read", "tool:search", "tool:write", "tool:bash"] {
+            assert!(g.nodes.iter().any(|n| n.id == id), "missing fixture node {id}");
+        }
         assert_eq!(g.stats.registrations, 2); // delegate + workflow (no _tool excluded)
 
         // ToolRegistration 节点是 scan 出来的两个函数名。
@@ -265,9 +271,21 @@ mod tests {
         // 没有 `_tool` 后缀的不计。
         assert!(!reg_labels.contains(&"register_unrelated"));
 
-        // USES_TOOL 边数 = pm 2 + dev 3 = 5。
-        let uses_edges = g.edges.iter().filter(|e| e.kind == "USES_TOOL").count();
-        assert_eq!(uses_edges, 5);
+        // 夹具声明的 USES_TOOL 边必须都在；全局角色可能再贡献额外边。
+        for (role, tool) in [
+            ("role:pm", "tool:read"),
+            ("role:pm", "tool:search"),
+            ("role:dev", "tool:read"),
+            ("role:dev", "tool:write"),
+            ("role:dev", "tool:bash"),
+        ] {
+            assert!(
+                g.edges.iter().any(|e| {
+                    e.kind == "USES_TOOL" && e.source == role && e.target == tool
+                }),
+                "missing fixture edge {role} -> {tool}"
+            );
+        }
 
         // 每个 ToolRegistration 都有一行 REGISTERED_BY 指向 (CWD)。
         let reg_edges = g.edges.iter().filter(|e| e.kind == "REGISTERED_BY").count();

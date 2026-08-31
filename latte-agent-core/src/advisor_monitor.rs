@@ -3426,7 +3426,7 @@ mod tests {
         assert!(!saw_choice, "v4: intervene 不再弹拍板窗");
         assert!(!saw_pause_status, "v4: intervene 不再发暂停 Status");
         assert!(
-            !controller.pause_requested(),
+            !controller.advisor_pause_requested(),
             "v4: intervene 不置暂停门（纠正并继续）"
         );
     }

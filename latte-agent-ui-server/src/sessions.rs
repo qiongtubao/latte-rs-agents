@@ -380,6 +380,74 @@ fn last_resumable_workflow_from_log(
 }
 
 
+/// Streaming deltas are transport-only. The final complete RoleTurn carries
+/// the full text, so persisting each partial would let one long answer evict
+/// thousands of semantic events from the bounded durable window.
+fn should_archive_event(event: &ChatEvent) -> bool {
+    !matches!(
+        event,
+        ChatEvent::RoleTurn {
+            is_complete: false,
+            ..
+        }
+    )
+}
+
+/// 从持久化的前端 ChatEvent JSON 行重建单角色 runner 的模型上下文。
+///
+/// 只保留真正属于主对话的文本回合：
+/// - `UserMessage` → user；
+/// - 完整、非 advisor、非 subsession 的 `RoleTurn` → assistant。
+///
+/// `ModelDelta`/partial RoleTurn 只是流式展示，delegate/workflow 的
+/// `sub_id` 回合和 advisor 旁路输出也不能串进主 runner。损坏行直接跳过，
+/// 让单条历史损坏不阻塞整个 session 恢复。
+pub(crate) fn initial_history_from_event_log(
+    event_log: &[String],
+) -> Vec<latte_ai::models::Message> {
+    let mut history = Vec::new();
+    // A bounded/lagged log may start in the middle of a turn. Never seed
+    // the model with a leading or duplicate assistant message: only accept
+    // a complete assistant after at least one retained user message.
+    let mut has_unanswered_user = false;
+    for line in event_log {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("UserMessage") => {
+                if let Some(text) = v.get("text").and_then(|x| x.as_str()) {
+                    if !text.is_empty() {
+                        history.push(latte_ai::models::Message::user(text));
+                        has_unanswered_user = true;
+                    }
+                }
+            }
+            Some("RoleTurn") => {
+                let complete = v
+                    .get("is_complete")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(true);
+                let is_advisor = v.get("role_id").and_then(|x| x.as_str()) == Some("advisor");
+                let is_subsession = v
+                    .get("sub_id")
+                    .and_then(|x| x.as_str())
+                    .is_some_and(|id| !id.is_empty());
+                if complete && !is_advisor && !is_subsession && has_unanswered_user {
+                    if let Some(content) = v.get("content").and_then(|x| x.as_str()) {
+                        if !content.is_empty() {
+                            history.push(latte_ai::models::Message::assistant(content));
+                            has_unanswered_user = false;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    history
+}
+
 // ─── Session 状态 ─────────────────────────────────────────────────
 
 /// 懒 spawn 所需的全部输入（恢复 session 首个 chat/subscribe 时才
@@ -393,10 +461,9 @@ pub(crate) struct SessionSpawnParams {
     pub(crate) initial_tier: Option<ModelTier>,
     pub(crate) subsession_store: Arc<latte_agent_core::subsession::SubsessionStore>,
     /// Pre-existing conversation history to seed the controller with
-    /// before the first user turn. Empty for fresh/restored sessions;
-    /// populated for forked sessions (reconstructed from the source
-    /// session's event prefix) so the fork's agent remembers the
-    /// discussion it branched from. Threaded into
+    /// before the first user turn. Empty for fresh sessions; populated
+    /// for forked sessions from the source prefix and for restored
+    /// sessions from their persisted event log. Threaded into
     /// `ControllerConfig.initial_history` (single-role path).
     pub(crate) initial_history: Vec<latte_ai::models::Message>,
 }
@@ -657,6 +724,9 @@ impl SessionHandle {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
+                    if !should_archive_event(&ev) {
+                        continue;
+                    }
                     let is_init = matches!(
                         &ev,
                         ChatEvent::Prompt { .. } | ChatEvent::SessionInfo { .. }
@@ -837,11 +907,18 @@ pub(crate) fn restore_sessions(cwd: &Path, spawn: &SessionSpawnParams) -> Vec<Se
             .unwrap_or_else(Instant::now);
         let session_id = loaded.persist.session_id.clone();
         let initial_role = loaded.persist.initial_role.clone();
+        // 每个恢复 session 都从自己的持久 event_log 重建模型历史；不能
+        // 继续克隆全局 restore_base 里的空 initial_history，否则历史只
+        // 在 UI 可见，下一次模型调用却像一段全新对话。
+        let restored_spawn = SessionSpawnParams {
+            initial_history: initial_history_from_event_log(&loaded.event_log),
+            ..spawn.clone()
+        };
         out.push(SessionHandle {
             session_id,
             controller: parking_lot::Mutex::new(None),
             spawn_lock: tokio::sync::Mutex::new(()),
-            spawn: spawn.clone(),
+            spawn: restored_spawn,
             first_user_msg: parking_lot::Mutex::new(loaded.first_user_msg),
             label: parking_lot::Mutex::new(loaded.label),
             event_log: Arc::new(parking_lot::RwLock::new(loaded.event_log)),
@@ -884,6 +961,116 @@ mod tests {
     fn make_log(lines: &[&str]) -> Arc<parking_lot::RwLock<Vec<String>>> {
         let log: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
         Arc::new(parking_lot::RwLock::new(log))
+    }
+
+    #[test]
+    fn initial_history_keeps_only_main_complete_text_turns() {
+        let lines = vec![
+            r#"{"type":"UserMessage","text":"question"}"#.to_string(),
+            r#"{"type":"RoleTurn","role_id":"manager","content":"partial","is_complete":false,"sub_id":null}"#.to_string(),
+            r#"{"type":"RoleTurn","role_id":"programmer","content":"delegate","is_complete":true,"sub_id":"sub-1"}"#.to_string(),
+            r#"{"type":"RoleTurn","role_id":"advisor","content":"watchdog","is_complete":true,"sub_id":null}"#.to_string(),
+            r#"{"type":"ModelDelta","role_id":"manager","delta":"token"}"#.to_string(),
+            "truncated json".to_string(),
+            // 旧日志可能没有 is_complete/sub_id；按完整主回合兼容。
+            r#"{"type":"RoleTurn","role_id":"manager","content":"answer"}"#.to_string(),
+        ];
+
+        let history = initial_history_from_event_log(&lines);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].as_text(), "question");
+        assert_eq!(history[1].as_text(), "answer");
+    }
+
+    #[test]
+    fn initial_history_drops_leading_unpaired_assistant() {
+        let lines = vec![
+            r#"{"type":"RoleTurn","role_id":"manager","content":"orphan","is_complete":true,"sub_id":null}"#.to_string(),
+            r#"{"type":"UserMessage","text":"question 2"}"#.to_string(),
+            r#"{"type":"RoleTurn","role_id":"manager","content":"answer 2","is_complete":true,"sub_id":null}"#.to_string(),
+            r#"{"type":"RoleTurn","role_id":"manager","content":"duplicate orphan","is_complete":true,"sub_id":null}"#.to_string(),
+        ];
+
+        let history = initial_history_from_event_log(&lines);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].as_text(), "question 2");
+        assert_eq!(history[1].as_text(), "answer 2");
+    }
+
+    #[test]
+    fn partial_role_turns_do_not_consume_durable_window() {
+        let mut log = Vec::new();
+        let mut archive = |event: ChatEvent| {
+            if !should_archive_event(&event) {
+                return;
+            }
+            let json = chat_event_to_frontend_json(&event).expect("serialize event");
+            if log.len() >= MAX_LOG {
+                log.remove(0);
+            }
+            log.push(json);
+        };
+
+        archive(ChatEvent::UserMessage {
+            text: "long streamed question".into(),
+        });
+        for _ in 0..(MAX_LOG + 100) {
+            archive(ChatEvent::RoleTurn {
+                role_id: "manager".into(),
+                content: "x".into(),
+                is_complete: false,
+                sub_id: None,
+            });
+        }
+        archive(ChatEvent::RoleTurn {
+            role_id: "manager".into(),
+            content: "complete answer".into(),
+            is_complete: true,
+            sub_id: None,
+        });
+        drop(archive);
+
+        assert_eq!(log.len(), 2, "partial transport events must not be durable");
+        assert!(log.iter().all(|line| !line.contains(r#""is_complete":false"#)));
+        let history = initial_history_from_event_log(&log);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].as_text(), "long streamed question");
+        assert_eq!(history[1].as_text(), "complete answer");
+    }
+
+    /// 模拟进程重启：从 ui-sessions/*.jsonl 扫回的 lazy handle 必须
+    /// 已携带由事件重建的 initial_history，而不是 restore_base 的空值。
+    #[test]
+    fn restore_sessions_rebuilds_initial_history_from_event_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut persist = SessionPersist::create(dir.path(), "restored-history", "manager")
+            .unwrap();
+        persist
+            .append_raw(r#"{"type":"UserMessage","text":"before restart"}"#)
+            .unwrap();
+        persist
+            .append_raw(r#"{"type":"RoleTurn","role_id":"manager","content":"remembered answer","is_complete":true,"sub_id":null}"#)
+            .unwrap();
+
+        let config = AgentConfig::default();
+        let spawn = SessionSpawnParams {
+            merged: Arc::new(parking_lot::RwLock::new(config.clone())),
+            resolver: Arc::new(ModelResolver::from_config(&config).unwrap()),
+            cwd: dir.path().to_path_buf(),
+            primary_model_id: None,
+            initial_tier: None,
+            subsession_store: Arc::new(
+                latte_agent_core::subsession::SubsessionStore::new(),
+            ),
+            initial_history: Vec::new(),
+        };
+
+        let restored = restore_sessions(dir.path(), &spawn);
+        assert_eq!(restored.len(), 1);
+        let history = &restored[0].spawn.initial_history;
+        assert_eq!(history.len(), 2, "restart must seed user + assistant history");
+        assert_eq!(history[0].as_text(), "before restart");
+        assert_eq!(history[1].as_text(), "remembered answer");
     }
 
     /// 正常路径：log 末尾有一条 status != "ok" 的 WorkflowFinished，

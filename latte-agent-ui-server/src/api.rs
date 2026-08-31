@@ -190,34 +190,9 @@ pub async fn fork_session(
     // 可见历史：每个事件序列化成一行（与 event_log 落盘格式一致）。
     let event_lines: Vec<String> = events.iter().map(|v| v.to_string()).collect();
 
-    // agent 上下文重建：只取用户/助手的文本回合（工具/委派/工作流
-    // 事件对单角色续聊的上下文价值有限，从简）。
-    let mut initial_history: Vec<latte_ai::models::Message> = Vec::new();
-    for v in &events {
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("UserMessage") => {
-                if let Some(t) = v.get("text").and_then(|x| x.as_str()) {
-                    if !t.is_empty() {
-                        initial_history.push(latte_ai::models::Message::user(t));
-                    }
-                }
-            }
-            Some("RoleTurn") => {
-                let complete = v
-                    .get("is_complete")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(true);
-                if complete {
-                    if let Some(c) = v.get("content").and_then(|x| x.as_str()) {
-                        if !c.is_empty() {
-                            initial_history.push(latte_ai::models::Message::assistant(c));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    // agent 上下文与冷启动恢复共用同一转换规则，避免 fork/restore
+    // 对 partial、advisor、subsession 回合的过滤逐渐漂移。
+    let initial_history = crate::sessions::initial_history_from_event_log(&event_lines);
 
     // 侧栏预览：第一条 UserMessage 的前 80 字符（与 chat_send 一致）。
     let first_user_msg = events.iter().find_map(|v| {
@@ -361,6 +336,18 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
                 latte_agent_core::choice::clear_prompts_for_channel(&c.event_sender());
             }
             h.abort_if_spawned().await;
+            // 连带取消该 session 事件流上正在跑的 workflow（续跑 run /
+            // 任务看板派发的 run）—— 它**不**走 controller 的
+            // cancel_flag，有自己的句柄，`abort_if_spawned` 掐不到它。
+            // 漏了这一步的后果：删掉的会话在后台继续调模型、继续写
+            // `.latte/` 产物、往已无订阅者的 broadcast 发事件，而 map
+            // 里那条 guard 也永久残留。与 `chat_abort` 保持一致。
+            if let Some(flag) = b.session_workflows.write().remove(id) {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            // 落盘的孤儿 ask 记录同理：按 session 归属加载，session 都
+            // 没了就不该再被补发成弹框。
+            latte_agent_core::pending_ask::remove_for_session(&b.cwd, id);
             h.delete_files();
             // 联删 subagent 落盘文件（与主 session 文件同生命周期）：
             // `<ui-sessions>/<sid>/` 整目录 rm + 索引清掉 + 内存
@@ -369,6 +356,29 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
             Ok(())
         }
         None => Err(ApiError::not_found(format!("session {id} unknown"))),
+    }
+}
+
+/// `session_workflows` 的 at-most-one guard 的 RAII 释放器。
+///
+/// 必须是 RAII 而不是「await 之后 remove」：workflow 执行链上任意
+/// panic 都会 unwind 跳过手写的 remove，留下 `flag=false` 的僵尸条目，
+/// 而 409 的判据正是 `!flag.load()` —— 该 session 之后所有续跑永远 409。
+struct SessionWorkflowGuard {
+    runs: Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
+    session_id: String,
+    owner: Arc<AtomicBool>,
+}
+
+impl Drop for SessionWorkflowGuard {
+    fn drop(&mut self) {
+        let mut runs = self.runs.write();
+        if runs
+            .get(&self.session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.owner))
+        {
+            runs.remove(&self.session_id);
+        }
     }
 }
 
@@ -1491,6 +1501,12 @@ pub async fn chat_pause_session(
 /// 中断的 workflow」，并补发一条 `Resumed` 同步 UI 暂停态（replay
 /// 会把历史 Paused 恢复成 isPaused=true，而本进程 gate 未 engage，
 /// 不会有 listener 发 Resumed）。
+fn is_live_session_resume(
+    outcome: latte_agent_core::controller::SessionResumeOutcome,
+) -> bool {
+    outcome.is_live()
+}
+
 pub async fn chat_resume_session(
     b: &UiBackend,
     session_id: Option<&str>,
@@ -1498,7 +1514,7 @@ pub async fn chat_resume_session(
     let h = resolve_session(b, session_id)?;
     h.touch();
     let resumed_live = match h.try_controller() {
-        Some(controller) => controller.resume_session().is_some(),
+        Some(controller) => is_live_session_resume(controller.resume_session().await),
         None => false,
     };
     if resumed_live {
@@ -2075,6 +2091,14 @@ async fn spawn_workflow_resume(
         }
         runs.insert(session_id.to_string(), cancel.clone());
     }
+    // Bind cleanup to this exact run, not merely the reusable session id.
+    // An old workflow may finish after abort removed it and a new run has
+    // already claimed the same id; its guard must not delete the new owner.
+    let _release = SessionWorkflowGuard {
+        runs: b.session_workflows.clone(),
+        session_id: session_id.to_string(),
+        owner: cancel.clone(),
+    };
 
     // 启动前校验：checkpoint 存在（load_checkpoint 内含 wf_id 安全
     // 检查：拒绝空 / 含路径分隔符 / `..`），workflow 定义可加载。
@@ -2086,10 +2110,7 @@ async fn spawn_workflow_resume(
     })();
     let wf = match validated {
         Ok(wf) => wf,
-        Err(e) => {
-            b.session_workflows.write().remove(session_id);
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
 
     let ctx = WorkflowRunContext {
@@ -2125,12 +2146,16 @@ async fn spawn_workflow_resume(
     let wf_name = wf.name.clone();
     let resp_wf_id = wf_id.clone();
     let topic = topic.unwrap_or_default();
-    let runs = b.session_workflows.clone();
-    let sid = session_id.to_string();
+    // guard 的释放交给 drop：此前是 `run_workflow_resume(...).await` 之后
+    // 才 `remove(&sid)`，执行链上任意 panic 都会 unwind 跳过那一行，留下
+    // 一条 flag=false 的僵尸条目 —— 而 409 的判据正是 `!flag.load()`，
+    // 于是这个 session 之后所有续跑永远 409，只能靠 chat_abort 或重启
+    // 自愈。RAII 版无论正常返回、panic、还是 task 被 abort 都会释放；
+    // owner identity 又保证旧 run 晚退时不会删掉同 session 的新 run。
     tokio::spawn(async move {
+        let _release = _release;
         let _ = run_workflow_resume(&wf, &topic, &ctx, &wf_id).await;
-        // run 结束（无论成败）释放 guard；失败事件里的新 wf_id 可再续跑。
-        runs.write().remove(&sid);
+        // `_release` 在这里 drop：释放 guard，失败事件里的新 wf_id 可再续跑。
     });
 
     Ok(serde_json::json!({
@@ -3704,6 +3729,24 @@ mod workflow_resume_tests {
         assert_eq!(resp["wf_id"], serde_json::json!("wf-snap"));
     }
 
+    #[test]
+    fn supervisor_driver_ack_or_pending_command_counts_as_live_resume_without_gate() {
+        use latte_agent_core::controller::SessionResumeOutcome;
+        assert!(is_live_session_resume(SessionResumeOutcome {
+            driver_resumed: true,
+            ..Default::default()
+        }));
+        assert!(is_live_session_resume(SessionResumeOutcome {
+            gate_paused_for_ms: Some(10),
+            ..Default::default()
+        }));
+        assert!(is_live_session_resume(SessionResumeOutcome {
+            driver_command_pending: true,
+            ..Default::default()
+        }));
+        assert!(!is_live_session_resume(SessionResumeOutcome::default()));
+    }
+
     /// ▶ 重启兜底：gate 未暂停（模拟 server 重启后新 spawn 的
     /// controller，旧 workflow task 已消亡），但有可续跑的快照 →
     /// chat_resume_session 从 checkpoint 拉起续跑。
@@ -3767,6 +3810,124 @@ mod workflow_resume_tests {
         chat_abort(&b, Some(&sid)).await.expect("abort");
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(b.session_workflows.read().is_empty());
+    }
+
+    /// **删除** session 必须和 abort 一样掐掉它的 workflow。
+    ///
+    /// 漏了这一步的后果是最贵的一类：删掉的会话在后台继续调模型、继续
+    /// 写 `.latte/` 产物、往已无订阅者的 broadcast 发事件，guard 条目也
+    /// 永久残留（`controller.abort()` 置的是 controller 自己的
+    /// cancel_flag，掐不到 workflow run 的独立句柄）。
+    /// 顺带：落盘的孤儿 ask 记录也该跟着走 —— 它们是按 session_id
+    /// 归属被补发的，session 没了就补不到任何地方。
+    #[tokio::test]
+    async fn delete_session_cancels_workflow_and_clears_pending_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-del-1").await;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        b.session_workflows.write().insert(sid.clone(), flag.clone());
+
+        // 一条属于该 session 的孤儿 ask 记录（+ 它的 checkpoint，
+        // 否则 load_for_session 会因 checkpoint 缺失先把它滤掉）。
+        write_checkpoint(dir.path(), "wf-del-1", "learn");
+        latte_agent_core::pending_ask::persist(
+            dir.path(),
+            "choice-tutor-0",
+            &sid,
+            "wf-del-1",
+            "tutor",
+            "选哪个？",
+            r#"{"type":"ChoiceRequested"}"#,
+        );
+        assert!(latte_agent_core::pending_ask::load(dir.path(), "choice-tutor-0").is_some());
+
+        delete_session(&b, &sid).await.expect("delete");
+
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "删 session 必须置位 workflow 的取消旗标，否则它继续在后台烧钱"
+        );
+        assert!(
+            b.session_workflows.read().is_empty(),
+            "guard 条目必须清掉，否则同 id 复用时永远 409"
+        );
+        assert!(
+            latte_agent_core::pending_ask::load(dir.path(), "choice-tutor-0").is_none(),
+            "该 session 的孤儿 ask 记录应随 session 一起删除"
+        );
+    }
+
+    /// at-most-one guard 必须用 RAII 释放：workflow 执行链上任意 panic
+    /// 都会 unwind 跳过手写的 `remove`，留下一条 `flag=false` 的僵尸
+    /// 条目，而 409 的判据正是 `!flag.load()` —— 该 session 之后所有
+    /// 续跑永远 409，只能靠 chat_abort 或重启自愈。
+    #[tokio::test]
+    async fn session_workflow_guard_releases_even_on_panic() {
+        let runs: Arc<
+            parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>,
+        > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        let sid = "ui-panic-1".to_string();
+        let owner = Arc::new(AtomicBool::new(false));
+        runs.write().insert(sid.clone(), owner.clone());
+
+        let runs2 = runs.clone();
+        let sid2 = sid.clone();
+        let joined = tokio::spawn(async move {
+            let _guard = SessionWorkflowGuard {
+                runs: runs2,
+                session_id: sid2,
+                owner,
+            };
+            panic!("模拟 workflow 执行链上的 panic");
+        })
+        .await;
+        assert!(joined.is_err(), "task 应该确实 panic 了");
+
+        assert!(
+            runs.read().is_empty(),
+            "panic unwind 也必须释放 guard，否则该 session 永久 409"
+        );
+    }
+
+    /// An aborted old workflow may unwind after a replacement run has
+    /// already claimed the same session id. The old guard must only remove
+    /// its own Arc owner, never the replacement (ABA-safe cleanup).
+    #[test]
+    fn session_workflow_guard_does_not_remove_new_owner() {
+        let runs: Arc<
+            parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>,
+        > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        let sid = "ui-aba-1".to_string();
+        let old_owner = Arc::new(AtomicBool::new(false));
+        runs.write().insert(sid.clone(), old_owner.clone());
+        let old_guard = SessionWorkflowGuard {
+            runs: runs.clone(),
+            session_id: sid.clone(),
+            owner: old_owner.clone(),
+        };
+
+        let removed = runs.write().remove(&sid).expect("old owner present");
+        removed.store(true, std::sync::atomic::Ordering::Relaxed);
+        let new_owner = Arc::new(AtomicBool::new(false));
+        runs.write().insert(sid.clone(), new_owner.clone());
+        let new_guard = SessionWorkflowGuard {
+            runs: runs.clone(),
+            session_id: sid.clone(),
+            owner: new_owner.clone(),
+        };
+
+        drop(old_guard);
+        assert!(
+            runs.read()
+                .get(&sid)
+                .is_some_and(|current| Arc::ptr_eq(current, &new_owner)),
+            "old guard must not remove the replacement workflow"
+        );
+
+        drop(new_guard);
+        assert!(runs.read().get(&sid).is_none());
     }
 
     /// 右键「终止此分派」只掐目标 subsession，兄弟分派的旗标不动 ——

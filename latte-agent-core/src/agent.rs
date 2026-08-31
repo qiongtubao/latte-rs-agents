@@ -929,7 +929,7 @@ struct RunnerModelSource {
 fn classify_tool_execution_error(
     e: &latte_rs_agent_tools::error::ToolError,
 ) -> ToolCallErrorKind {
-    if let ToolError::ToolNotFound { name, .. } = e {
+    if let ToolError::ToolNotFound(name) = e {
         return ToolCallErrorKind::ToolNotFound {
             tried_aliases: vec![name.clone()],
         };
@@ -2369,6 +2369,20 @@ impl AgentRunner {
         // *before* the working message list is built below, so the
         // first model call of this turn already sees them.
         self.drain_advisor_hints();
+
+        // 一旦 turn 已开始，就立即把调用方输入提交到持久 context，而不
+        // 等模型成功返回。`run_turn_cancellable` 通过 drop in-flight future
+        // 取消；模型/API/hook 也可能在下面任一点返回 Err。若在函数尾才
+        // push，这些路径会让 UI 已显示、事件已落盘的用户消息从下一轮
+        // prompt 消失。先提交同时保证 future 被取消时输入仍然保留。
+        //
+        // advisor hint 必须先于本轮输入（保持原有 prompt 顺序）；成功
+        // 路径末尾不再重复 push。`run_turn_gated` 的重试传空 slice，因而
+        // 同一用户输入也只提交一次。
+        for msg in new_messages {
+            self.context.push(msg.clone());
+        }
+
         // Pre-persistence gate: 每次 turn 开始清零 tool 计数器，
         // run_turn 内部每次成功执行一个工具就 +1；run_turn 结束时
         // run_turn_gated 据此跑 D6 ToolCallEcho 检查。
@@ -2387,8 +2401,9 @@ impl AgentRunner {
         let system_rendered = sys_msg.as_text();
         let mut messages: Vec<Message> = Vec::new();
         messages.push(sys_msg);
+        // 本轮输入已在上方提交进 context；这里直接复制完整上下文，不能
+        // 再 extend new_messages，否则发给模型的 user message 会重复。
         messages.extend_from_slice(self.context.messages());
-        messages.extend_from_slice(new_messages);
 
         // Run PreCall hooks before the prompt is built — this lets hooks
         // like `redact_pii` mutate the outgoing message list in-place so
@@ -2433,7 +2448,8 @@ impl AgentRunner {
         self.sink.emit(TraceEvent::PromptBuilt {
             meta: meta.refreshed(),
             system_rendered,
-            history_len: self.context.messages().len(),
+            // 保持原有语义：history_len 不含本轮 new_messages。
+            history_len: self.context.messages().len().saturating_sub(n_new),
             user_input: user_input.clone(),
             est_input_tokens,
         });
@@ -3540,10 +3556,8 @@ impl AgentRunner {
             elapsed_ms,
         });
 
-        // Store in context
-        for msg in new_messages {
-            self.context.push(msg.clone());
-        }
+        // Store successful assistant output in context. 本轮输入已在
+        // 模型调用前提交，不能在这里再次 push。
         // 空响应不入 context：部分 API（deepseek 系）对 text 为空的
         // assistant 消息直接 400（"text content is empty"）——一旦入
         // context，后续每个请求都带着它，这个 turn 就永久卡死。
@@ -4913,6 +4927,127 @@ mod tests {
             .filter(|e| matches!(e, TraceEvent::ModelCallSlow { .. }))
             .count();
         assert_eq!(slows, 1, "应恰好发一次慢调用提示，events: {}", events.len());
+    }
+
+    /// 本轮 user 输入在模型调用前提交：成功时 prompt/context 都只能出现
+    /// 一次，不能因「提前提交 + 旧尾部提交」或额外 extend 而重复。
+    #[tokio::test]
+    async fn turn_input_is_committed_once_on_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("success-output", vec![]),
+                    )),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "success".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+
+        let out = runner
+            .run_turn(&[Message::user("success-input")], None)
+            .await
+            .unwrap();
+        assert_eq!(out, "success-output");
+        let history = runner.context().messages();
+        assert_eq!(history.len(), 2, "user + assistant, each exactly once");
+        assert_eq!(history[0].as_text(), "success-input");
+        assert_eq!(history[1].as_text(), "success-output");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert_eq!(
+            body.matches("success-input").count(),
+            1,
+            "model prompt must not duplicate the just-committed input: {body}"
+        );
+    }
+
+    /// HTTP/model 失败也必须保留用户已经提交的输入，供下一轮模型看到。
+    #[tokio::test]
+    async fn turn_input_survives_model_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized")),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "error".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+
+        let result = runner
+            .run_turn(&[Message::user("input-before-model-error")], None)
+            .await;
+        assert!(result.is_err(), "401 must fail the turn");
+        let history = runner.context().messages();
+        assert_eq!(history.len(), 1, "failed turn must retain only its user input");
+        assert_eq!(history[0].as_text(), "input-before-model-error");
+    }
+
+    /// controller 的当前-turn 取消会 drop `run_turn` future；drop 后输入仍
+    /// 必须留在 runner context，不能随 in-flight 请求一起消失。
+    #[tokio::test]
+    async fn turn_input_survives_future_cancellation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(Duration::from_secs(5))
+                            .set_body_string(openai_completion_body("too late", vec![])),
+                    ),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "cancel".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+
+        let input = [Message::user("input-before-cancel")];
+        let mut future = Box::pin(runner.run_turn(&input, None));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), future.as_mut())
+                .await
+                .is_err(),
+            "mock turn should still be in flight"
+        );
+        drop(future);
+
+        let history = runner.context().messages();
+        assert_eq!(history.len(), 1, "cancelled turn must retain its user input");
+        assert_eq!(history[0].as_text(), "input-before-cancel");
     }
 
     /// 同一工具连续被确定性校验拒绝 → 先追加硬指令，再熔断。

@@ -82,6 +82,26 @@ impl Drop for SubCancelGuard {
     }
 }
 
+/// spawn 出去的任务在守卫被 drop 时一起 abort。
+///
+/// 存在理由：`tokio::task::JoinHandle` 被 drop 时任务**继续跑**。凡是
+/// 「spawn 出去、又在 `select!` 里等它、而这个 select 本身可能被外层
+/// drop」的地方都必须挂一个 —— 外层一 drop，spawn 的任务就走不到任何
+/// abort 分支，脱管跑到底（还在写文件、还在往共享事件流发事件），而
+/// [`SubCancelGuard`] 已经析构，用户连"终止此分派"都点不到了。
+///
+/// 两处调用点各自踩过这个坑：workflow DAG 引擎的并行分派，以及
+/// controller 的 `delegate` 工具（驱动侧 `run_turn_cancellable` 的
+/// 500ms 轮询先赢时会直接 drop 整个 run_turn future）。任务已结束时
+/// abort 是 no-op，正常路径无副作用。
+pub struct AbortOnDrop(pub tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

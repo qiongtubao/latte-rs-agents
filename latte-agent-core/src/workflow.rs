@@ -1632,19 +1632,6 @@ pub struct WorkflowRunContext {
 /// with an error — almost always a cycle or a design mistake.
 pub const MAX_WORKFLOW_DEPTH: u8 = 3;
 
-/// spawn 出去的任务在守卫被 drop 时一起 abort。
-///
-/// 存在理由：`tokio::task::JoinHandle` 被 drop 时任务**继续跑**。
-/// 引擎 future 提前落地时（如用户取消），若分派是 spawn 的，它不会因此
-/// 停下。任务已结束时 abort 是 no-op，正常路径无副作用。
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// Run a nested workflow step: load the named workflow and run it with
 /// `topic`, sharing the parent's config / event channel / cancel flag.
 /// Events of the nested run stream under their own wf_id.
@@ -2986,7 +2973,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         // spawn 出去的分派。`JoinHandle` 自己 drop **不取消**任务，光靠
         // "drop 引擎 future" 并不能停掉 specialist：否则被取消后 architect
         // 子会话会变成孤儿任务继续写，token 白烧且产出没人再要。
-        let _abort_on_drop = AbortOnDrop(run_handle.abort_handle());
+        let _abort_on_drop = crate::sub_cancel::AbortOnDrop(run_handle.abort_handle());
         // 熔断：wall-clock 超时（对齐 controller delegate；被 500ms
         // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
         // 超时走 StepFail::Failed → 引擎按 max_retries 重试/失败冒泡，
@@ -6033,7 +6020,7 @@ loop_abort_on = "VERDICT: REJECT"
             f.store(true, Ordering::SeqCst);
         });
         {
-            let _guard = AbortOnDrop(handle.abort_handle());
+            let _guard = crate::sub_cancel::AbortOnDrop(handle.abort_handle());
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         } // guard drop → abort
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
