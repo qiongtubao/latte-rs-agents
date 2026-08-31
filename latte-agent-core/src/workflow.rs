@@ -222,6 +222,38 @@ fn check_tool_usage(step: &WorkflowStepDef, summary: &str) -> Result<(), String>
     check_tool_call_limits(&step.tool_call_limits, summary)
 }
 
+
+/// 把一个 step 内多个 speaker 的产出聚合成该 step 的输出。
+///
+/// # 修的 bug
+///
+/// 原来是 `last_output = response`，每个 speaker 覆盖一次，于是
+/// `output_key` 只绑到**最后一个** speaker 的产出——前面所有 speaker 的
+/// 内容只进 `step_transcript`（step 内可见），**从不传给下游**。
+///
+/// 实测实锤（jemalloc 会话 `wf-design_brainstorm-1788084798861063`）：
+/// `evaluate` 步派了 reviewer / security / devops，三份产出分别 4556 /
+/// 12346 / 5131 字符，而 `evaluation` 只拿到 devops 的 5131 字符。
+/// security 那 12346 字里**包含 3 项 P0 安全阻断**，从未到达下游
+/// synthesize。这不是性能问题，是数据丢失。
+///
+/// # 聚合形式
+///
+/// 单 speaker（绝大多数 step）时**逐字返回原产出**，不加任何包装——
+/// 否则会改变所有既有 workflow 的下游输入。多 speaker 时按声明顺序
+/// 拼接，并加 `## [role]` 分隔，让下游能分辨谁说了什么。
+fn aggregate_step_output(parts: &[(String, String)]) -> String {
+    match parts {
+        [] => String::new(),
+        [(_, only)] => only.clone(),
+        many => many
+            .iter()
+            .map(|(role, out)| format!("## [{role}]\n\n{out}"))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n"),
+    }
+}
+
 /// 校验产出是否满足契约。按 min_chars → max_chars → forbid → require →
 /// require_any → last_line_prefix_any 顺序检查，第一个违规即返回中文原因
 /// （措辞可直接作为给模型的验收批注）。空契约（全默认）恒 Ok。
@@ -558,6 +590,22 @@ pub struct WorkflowStepDef {
     /// ```
     #[serde(default)]
     pub optional_speakers: Vec<OptionalSpeaker>,
+    /// **step 级**条件执行：命中其中任意一个关键词才跑这一步。
+    ///
+    /// 与 [`OptionalSpeaker`] 的分工：后者在**一个 step 内**按需增删
+    /// speaker；这里是整步的开关。把多 speaker 步拆成同 wave 的多个
+    /// 单 speaker 步（为了并发）之后，"按需派某个角色"就只能用它表达
+    /// ——`optional_speakers` 是 step 内的机制，拆开后没有载体。
+    ///
+    /// 空 = 无条件执行（默认，既有 workflow 不受影响）。
+    #[serde(default)]
+    pub when_any: Vec<String>,
+    /// 命中其中任意一个关键词就**跳过**这一步（否决优先于 `when_any`）。
+    #[serde(default)]
+    pub unless_any: Vec<String>,
+    /// 关键词匹配范围，默认 `topic`。
+    #[serde(default)]
+    pub match_scope: MatchScope,
     #[serde(default)]
     pub prompt: String,
     /// Key under which this step's last output is stored in the shared
@@ -774,6 +822,35 @@ impl WorkflowStepDef {
         (active, skipped)
     }
 
+    /// 本 step 这次要不要跑。返回 `(是否执行, 跳过原因)`。
+    ///
+    /// 跳过的 step 的 `output_key` 会被绑成**空串**（见调用点）——不绑的话
+    /// 下游 prompt 里的 `{{key}}` 会原样留着，模型看到一个字面占位符。
+    pub fn is_enabled(&self, topic: &str, task_text: &str) -> (bool, Option<String>) {
+        if self.when_any.is_empty() && self.unless_any.is_empty() {
+            return (true, None);
+        }
+        let hay = match self.match_scope {
+            MatchScope::Topic => topic.to_lowercase(),
+            MatchScope::Task => task_text.to_lowercase(),
+        };
+        let scope = match self.match_scope {
+            MatchScope::Topic => "topic",
+            MatchScope::Task => "task",
+        };
+        if let Some(veto) = self.unless_any.iter().find(|k| keyword_hit(&hay, k)) {
+            return (false, Some(format!("{scope} 命中排除词 '{veto}'")));
+        }
+        if self.when_any.is_empty() || self.when_any.iter().any(|k| keyword_hit(&hay, k)) {
+            (true, None)
+        } else {
+            (
+                false,
+                Some(format!("{scope} 未命中 {:?}", self.when_any)),
+            )
+        }
+    }
+
     pub fn task_text(&self) -> &str {
         if self.task.is_empty() { &self.prompt } else { &self.task }
     }
@@ -850,6 +927,28 @@ impl WorkflowDef {
                         step.id
                     ));
                 }
+            }
+            // step 级条件的形状校验。空关键词永不命中 = 静默失效。
+            for kw in step.when_any.iter().chain(step.unless_any.iter()) {
+                if kw.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': when_any/unless_any 的关键词不能为空串（永不命中）",
+                        step.id
+                    ));
+                }
+            }
+            // 条件跳过的 step 若绑了 output_key，下游会拿到空串——这是
+            // 设计如此（见 `is_enabled` 的说明），但**没有** output_key
+            // 的条件 step 等于"跳过了也没人知道"，通常是配置写漏了。
+            if (!step.when_any.is_empty() || !step.unless_any.is_empty())
+                && step.output_key.is_none()
+                && step.workflow.is_none()
+            {
+                return Err(format!(
+                    "step '{}': 有 when_any/unless_any 时必须声明 output_key\
+                     （否则跳过与执行对下游没有任何可观察差别，通常是配置写漏）",
+                    step.id
+                ));
             }
             // 可选 speaker 的形状校验。这些错法全都是「静默失效」——
             // 条件恒真等于白写、role 拼错等于永远不派、全员可选等于
@@ -3272,6 +3371,30 @@ async fn run_workflow_serial(
                 idx += 1;
                 continue;
             }
+            // step 级条件：不命中就整步跳过。output_key 绑空串——不绑的话
+            // 下游 prompt 里的 `{{key}}` 会原样留着，模型看到字面占位符。
+            {
+                let mut probe = vars.clone();
+                probe.insert("step_id".into(), step.id.clone());
+                let task_text = wf.render_task(step, &probe);
+                let topic_s = vars.get("topic").map(|s| s.as_str()).unwrap_or("");
+                if let (false, reason) = step.is_enabled(topic_s, &task_text) {
+                    let why = reason.unwrap_or_default();
+                    let _ = ctx.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "[workflow '{}'] 跳过 step '{}'（{why}）",
+                            wf.name, step.id
+                        ),
+                    });
+                    if let Some(key) = &step.output_key {
+                        vars.insert(key.clone(), String::new());
+                        keyed.insert(key.clone(), String::new());
+                    }
+                    ckpt.record_step(&step.id, step.output_key.as_deref(), "");
+                    idx += 1;
+                    continue;
+                }
+            }
             let first_role = step.roles().first().cloned().unwrap_or_default();
             let _ = ctx.event_tx.send(ChatEvent::WorkflowStep {
                 wf_id: wf_id.to_string(),
@@ -3364,6 +3487,11 @@ async fn run_workflow_serial(
                     ),
                 });
             }
+            // **每次进入 step 都重置**：loop_until 返工会重入同一个 step，
+            // 声明在 workflow 层会把上一轮的产出也累进来（实测：既有测试
+            // `serial_loop_rework_then_pass` 里同时出现 VERDICT: FAIL 与
+            // VERDICT: PASS 两轮内容）。
+            let mut speaker_outputs: Vec<(String, String)> = Vec::new();
             for speaker in active_speakers {
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
                     return WfOutcome::Cancelled;
@@ -3527,10 +3655,14 @@ async fn run_workflow_serial(
                         round,
                     });
                     step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
-                    last_output = response;
+                    // 收集而非覆盖：见 `aggregate_step_output`。
+                    speaker_outputs.push((speaker.clone(), response));
                     break;
                 }
             }
+            // 聚合本 step 全部 speaker 的产出。单 speaker 时逐字等于原
+            // 产出，所以既有 workflow 的下游输入不变。
+            last_output = aggregate_step_output(&speaker_outputs);
             if let Some(key) = &step.output_key {
                 // 监察批注（⚠️ [监察审查]…）不进 vars：它给人看，
                 // 穿给下游 step / 嵌套 workflow 是污染。
@@ -3765,6 +3897,9 @@ async fn run_dag_step(
 
     let mut step_transcript = String::new();
     let mut last_output = String::new();
+    // 本 step 内各 speaker 的产出，按声明顺序。step 收尾时聚合成
+    // `last_output`（见 `aggregate_step_output`）。
+    let mut speaker_outputs: Vec<(String, String)> = Vec::new();
     // 可选 speaker 过滤（同串行引擎，见 WorkflowStepDef::active_roles）。
     let (active_speakers, skipped_speakers) = {
         let mut probe_vars = inp.vars.clone();
@@ -3953,10 +4088,13 @@ async fn run_dag_step(
                 round: inp.round,
             });
             step_transcript.push_str(&format!("[{speaker}]: {response}\n"));
-            last_output = response;
+            // 收集而非覆盖：见 `aggregate_step_output`。
+            speaker_outputs.push((speaker.clone(), response));
             break;
         }
     }
+    // 同串行引擎：聚合本 step 全部 speaker 的产出。
+    last_output = aggregate_step_output(&speaker_outputs);
     Ok((
         inp.step_idx,
         step.id.clone(),
@@ -4055,6 +4193,30 @@ async fn run_workflow_dag(
             for &idx in wave {
                 if done_steps.contains(wf.steps[idx].id.as_str()) {
                     continue;
+                }
+                // step 级条件（同串行引擎）：不命中就不派发，output_key
+                // 绑空串，下游照常推进（skip 不阻塞 depends_on）。
+                {
+                    let step = &wf.steps[idx];
+                    let mut probe = vars.clone();
+                    probe.insert("step_id".into(), step.id.clone());
+                    let task_text = wf.render_task(step, &probe);
+                    let topic_s = vars.get("topic").map(|s| s.as_str()).unwrap_or("");
+                    if let (false, reason) = step.is_enabled(topic_s, &task_text) {
+                        let why = reason.unwrap_or_default();
+                        let _ = ctx.event_tx.send(ChatEvent::Status {
+                            message: format!(
+                                "[workflow '{}'] 跳过 step '{}'（{why}）",
+                                wf.name, step.id
+                            ),
+                        });
+                        if let Some(key) = &step.output_key {
+                            vars.insert(key.clone(), String::new());
+                            keyed.insert(key.clone(), String::new());
+                        }
+                        ckpt.record_step(&step.id, step.output_key.as_deref(), "");
+                        continue;
+                    }
                 }
                 let inp = DagStepInput {
                     wf: wf_arc.clone(),
@@ -4629,34 +4791,318 @@ prompt = "x"
         assert_eq!(wf.steps[0].declared_roles(), active);
     }
 
+    /// 同一 wave 里并发跑的 step，只要**有两个以上**，就必须全是只读
+    /// （`read`/`search`/`code_graph`）——否则并发写文件有真实竞态。
+    ///
+    /// 这条扫全部内置 workflow，是并发重排的安全网：以后有人给某个并发
+    /// step 加了 `write`/`bash`，这里会直接失败。
+    ///
+    /// 例外：只有一个 step 的 wave 不算并发；嵌套 workflow step 的工具由
+    /// 子流程自己的 step 决定，这里不管。
+    ///
+    /// 豁免名单里的 step 是**经核实写不同路径**的：`init_project` 的
+    /// 每个 `overlay_*` 步各写 `prompts/overlays/<role>.md`，路径互不重叠，
+    /// 并发无竞态。加豁免必须先核实这一点。
     #[test]
-    fn shipped_design_brainstorm_skips_designer_and_devops_for_code_task() {
-        // 真实配置回归：仓库里的 design_brainstorm.toml 对「学习路径」
-        // 这类无界面无部署的任务，必须把 designer 与 devops 都跳掉。
+    fn concurrent_steps_in_a_wave_are_read_only() {
+        const READ_ONLY: &[&str] = &["read", "search", "code_graph"];
+        /// (workflow 名, step id 前缀) —— 写各自独立路径，已核实无竞态。
+        const EXEMPT: &[(&str, &str)] = &[("init_project", "overlay_")];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/workflows");
+        let entries = std::fs::read_dir(&dir).expect("config/workflows");
+        let mut checked = 0usize;
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let Ok(wf) = toml::from_str::<WorkflowDef>(&raw) else { continue };
+            if !wf.uses_dependency_dag() {
+                continue;
+            }
+            let Ok(waves) = compute_waves(&wf.steps) else { continue };
+            for wave in &waves {
+                // 只看真正会并发的（同 wave 有 ≥2 个非嵌套 step）。
+                let concurrent: Vec<&WorkflowStepDef> = wave
+                    .iter()
+                    .map(|&i| &wf.steps[i])
+                    .filter(|s| s.workflow.is_none())
+                    .collect();
+                if concurrent.len() < 2 {
+                    continue;
+                }
+                for st in concurrent {
+                    if EXEMPT
+                        .iter()
+                        .any(|(w, p)| *w == wf.name && st.id.starts_with(p))
+                    {
+                        continue;
+                    }
+                    checked += 1;
+                    assert!(
+                        !st.tools.is_empty(),
+                        "{}: step '{}' 与同 wave 的其他步并发，必须显式声明只读工具集\
+                         （空 = 角色全集，可能含 write/bash）",
+                        wf.name,
+                        st.id
+                    );
+                    for t in &st.tools {
+                        assert!(
+                            READ_ONLY.contains(&t.as_str()),
+                            "{}: step '{}' 并发却声明了非只读工具 '{t}'——并发写文件有竞态",
+                            wf.name,
+                            st.id
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "应至少扫到一组并发 step，实际 0 组（扫描逻辑可能失效）");
+    }
+
+    /// 仓库里有**两份** workflow 副本：`config/workflows/`（权威）与
+    /// `.latte/workflows.d/`（项目级，会遮蔽前者）。改了权威版忘了同步，
+    /// 运行时加载的仍是旧版——实测踩过两次：第一次是 `optional_speakers`
+    /// 白改了，第二次是本次的并发重排"没生效"（实际跑的是旧文件）。
+    ///
+    /// 这条测试只钉住 step 拓扑一致，不逐字比对（两份的注释可以不同）。
+    #[test]
+    fn workflow_copies_do_not_drift() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for name in ["design_brainstorm", "design_and_plan", "explore"] {
+            let authoritative = root.join(format!("config/workflows/{name}.toml"));
+            let project = root.join(format!(".latte/workflows.d/{name}.toml"));
+            let (Ok(a), Ok(b)) = (
+                std::fs::read_to_string(&authoritative),
+                std::fs::read_to_string(&project),
+            ) else {
+                continue; // 某一份不存在就不比
+            };
+            let ids = |raw: &str| -> Vec<String> {
+                toml::from_str::<WorkflowDef>(raw)
+                    .map(|w| w.steps.iter().map(|s| s.id.clone()).collect())
+                    .unwrap_or_default()
+            };
+            assert_eq!(
+                ids(&a),
+                ids(&b),
+                "workflow '{name}' 的两份副本 step 拓扑不一致：\
+                 config/workflows/ 是权威版，改完必须同步到 .latte/workflows.d/\
+                 （否则运行时加载的是后者，改动静默失效）"
+            );
+        }
+    }
+
+    /// 重排后的 `design_brainstorm` 必须：走 DAG、脑暴三步同 wave、
+    /// 评审三步同 wave，且 designer/devops 对无界面无部署的任务被跳过。
+    #[test]
+    fn shipped_design_brainstorm_runs_fanout_concurrently() {
         let raw = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../config/workflows/design_brainstorm.toml"),
         )
-        .expect("仓库内置 design_brainstorm.toml 应存在");
+        .expect("内置 design_brainstorm.toml");
         let wf: WorkflowDef = toml::from_str(&raw).unwrap();
         wf.validate().unwrap();
-        let topic = "为当前仓库 jemalloc 编排「从浅到深学习」的学习路径与任务清单：\
-                     先探索代码库整体结构，再设计分阶段学习路径，最后拆分为任务看板清单";
-        for step in &wf.steps {
-            let (active, _) = step.active_roles(topic, "");
-            assert!(!active.contains(&"designer".to_string()), "step {}", step.id);
-            assert!(!active.contains(&"devops".to_string()), "step {}", step.id);
-            assert!(!active.is_empty(), "step {} 不能零 speaker", step.id);
-        }
-        // 反向：涉及界面 + 部署的任务两个角色都该在场。
-        let ui_topic = "重做控制台的前端界面，并接入 CI 自动部署";
-        let all: Vec<String> = wf
-            .steps
+        wf.validate_dag().unwrap();
+        assert!(wf.uses_dependency_dag(), "必须走 DAG 引擎才能并发");
+
+        let waves = compute_waves(&wf.steps).expect("waves");
+        let name_of = |i: usize| wf.steps[i].id.clone();
+        let wave_names: Vec<Vec<String>> = waves
             .iter()
-            .flat_map(|s| s.active_roles(ui_topic, "").0)
+            .map(|w| w.iter().map(|&i| name_of(i)).collect())
             .collect();
-        assert!(all.contains(&"designer".to_string()));
-        assert!(all.contains(&"devops".to_string()));
+
+        // 脑暴三步必须落在同一个 wave（否则还是串行）。
+        let brainstorm_wave = wave_names
+            .iter()
+            .find(|w| w.iter().any(|n| n == "brainstorm_arch"))
+            .expect("找不到脑暴 wave");
+        for n in ["brainstorm_arch", "brainstorm_prog", "brainstorm_design"] {
+            assert!(
+                brainstorm_wave.iter().any(|x| x == n),
+                "{n} 应与其他脑暴步同 wave，实际分组: {wave_names:?}"
+            );
+        }
+        // 评审三步同理。
+        let eval_wave = wave_names
+            .iter()
+            .find(|w| w.iter().any(|n| n == "eval_review"))
+            .expect("找不到评审 wave");
+        for n in ["eval_review", "eval_security", "eval_devops"] {
+            assert!(
+                eval_wave.iter().any(|x| x == n),
+                "{n} 应与其他评审步同 wave，实际分组: {wave_names:?}"
+            );
+        }
+        // 评审步必须是只读（并发写文件有竞态）。
+        for id in ["eval_review", "eval_security", "eval_devops"] {
+            let st = wf.steps.iter().find(|s| s.id == id).unwrap();
+            assert!(!st.tools.is_empty(), "{id} 必须显式声明只读工具集");
+            for t in &st.tools {
+                assert!(
+                    matches!(t.as_str(), "read" | "search" | "code_graph"),
+                    "{id} 声明了非只读工具 '{t}'，并发会有写竞态"
+                );
+            }
+        }
+        // 条件角色：无界面无部署的任务应跳过 designer 与 devops。
+        let topic = "为当前仓库 jemalloc 编排「从浅到深学习」的学习路径与任务清单";
+        for id in ["brainstorm_design", "eval_devops"] {
+            let st = wf.steps.iter().find(|s| s.id == id).unwrap();
+            assert!(!st.is_enabled(topic, "").0, "{id} 对该 topic 应被跳过");
+        }
+        // 反向：涉及界面 + 部署的任务两者都在场。
+        let ui_topic = "重做控制台的前端界面，并接入 CI 自动部署";
+        for id in ["brainstorm_design", "eval_devops"] {
+            let st = wf.steps.iter().find(|s| s.id == id).unwrap();
+            assert!(st.is_enabled(ui_topic, "").0, "{id} 对该 topic 应执行");
+        }
+    }
+
+    /// `optional_speakers`（step 内按需增删 speaker）本身仍要有覆盖——
+    /// 内置的 design_brainstorm 现在改用 **step 级**条件了，所以这条改用
+    /// 一份内联配置来验，不再依赖那个文件的具体形态。
+    #[test]
+    fn optional_speakers_still_gate_within_a_step() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "opt_in_step"
+[[steps]]
+id = "fan"
+speakers = ["architect", "programmer"]
+task = "x"
+output_key = "ideas"
+[[steps.optional_speakers]]
+role = "designer"
+when_any = ["ui", "界面"]
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let topic = "为 jemalloc 编排学习路径";
+        let (active, skipped) = wf.steps[0].active_roles(topic, "");
+        assert_eq!(active, vec!["architect", "programmer"]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].role, "designer");
+        let (active, _) = wf.steps[0].active_roles("重做界面", "");
+        assert!(active.contains(&"designer".to_string()));
+    }
+
+
+    const COND_WF: &str = r#"
+name = "cond"
+[[steps]]
+id = "always"
+role = "pm"
+task = "无条件"
+output_key = "a"
+[[steps]]
+id = "only_ui"
+role = "designer"
+task = "只在有界面时跑"
+output_key = "b"
+when_any = ["ui", "界面"]
+"#;
+
+    #[test]
+    fn step_level_condition_gates_the_whole_step() {
+        let wf: WorkflowDef = toml::from_str(COND_WF).unwrap();
+        wf.validate().unwrap();
+        // 无条件的步永远跑。
+        assert_eq!(wf.steps[0].is_enabled("任何 topic", ""), (true, None));
+        // 有条件的步：命中才跑。
+        let (on, why) = wf.steps[1].is_enabled("重做设置页的界面", "");
+        assert!(on && why.is_none());
+        let (off, why) = wf.steps[1].is_enabled("为 jemalloc 编排学习路径", "");
+        assert!(!off);
+        assert!(why.unwrap().contains("未命中"));
+    }
+
+    #[test]
+    fn step_condition_unless_any_vetoes() {
+        let raw = COND_WF.replace(
+            "when_any = [\"ui\", \"界面\"]",
+            "when_any = [\"ui\"]\nunless_any = [\"cli only\"]",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        wf.validate().unwrap();
+        // 否决优先。
+        let (on, why) = wf.steps[1].is_enabled("build a ui, cli only", "");
+        assert!(!on);
+        assert!(why.unwrap().contains("命中排除词"));
+    }
+
+    #[test]
+    fn step_condition_validation_rejects_silent_misconfig() {
+        // 空关键词永不命中。
+        let raw = COND_WF.replace("when_any = [\"ui\", \"界面\"]", "when_any = [\"  \"]");
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf.validate().unwrap_err().contains("不能为空串"));
+
+        // 条件 step 没有 output_key → 跳过与执行对下游没有可观察差别。
+        let raw = COND_WF.replace("output_key = \"b\"\n", "");
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf
+            .validate()
+            .unwrap_err()
+            .contains("必须声明 output_key"));
+    }
+
+    #[test]
+    fn steps_without_conditions_are_unchanged() {
+        // 回归：既有 workflow 一个字都没改，行为必须不变。
+        let raw = r#"
+name = "legacy"
+[[steps]]
+id = "a"
+role = "pm"
+task = "x"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        wf.validate().unwrap();
+        assert_eq!(wf.steps[0].is_enabled("", ""), (true, None));
+    }
+
+    // ─── 多 speaker 产出聚合 ──────────────────────────────────────
+
+    #[test]
+    fn single_speaker_output_is_passed_through_verbatim() {
+        // 绝大多数 step 是单 speaker。加任何包装都会改变所有既有
+        // workflow 的下游输入，所以必须逐字返回。
+        let parts = vec![("architect".to_string(), "方案 A\n第二行".to_string())];
+        assert_eq!(aggregate_step_output(&parts), "方案 A\n第二行");
+        // 空（speaker 全被 optional 过滤掉是不可能的，但别 panic）。
+        assert_eq!(aggregate_step_output(&[]), "");
+    }
+
+    #[test]
+    fn multi_speaker_output_keeps_every_speaker() {
+        // 修的 bug：原来 `last_output = response` 逐个覆盖，`output_key`
+        // 只绑最后一个 speaker 的产出。实测（jemalloc 会话
+        // wf-design_brainstorm-1788084798861063）：`evaluate` 步的
+        // reviewer / security / devops 三份产出 4556 / 12346 / 5131
+        // 字符，而 `evaluation` 只拿到 devops 的 5131 字符——security
+        // 那 12346 字里的 3 项 P0 安全阻断从未到达下游。
+        let parts = vec![
+            ("reviewer".to_string(), "可维护性意见".to_string()),
+            ("security".to_string(), "P0 阻断三项".to_string()),
+            ("devops".to_string(), "运维成本意见".to_string()),
+        ];
+        let out = aggregate_step_output(&parts);
+        for (role, body) in &parts {
+            assert!(out.contains(body), "{role} 的产出丢了：{out}");
+            assert!(out.contains(&format!("## [{role}]")), "{role} 缺少归属标记");
+        }
+        // 顺序 = 声明顺序，便于下游与 transcript 对照。
+        let (i, j, k) = (
+            out.find("可维护性意见").unwrap(),
+            out.find("P0 阻断三项").unwrap(),
+            out.find("运维成本意见").unwrap(),
+        );
+        assert!(i < j && j < k, "应按声明顺序拼接");
     }
 
     #[test]
@@ -6769,6 +7215,125 @@ when_any = ["ui", "界面"]
         let (turns, _) = drain_turns_and_status(&mut rx);
         assert_eq!(turns, vec!["arch", "arch", "prog", "design"]);
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    /// 端到端：多 speaker step 的**每一份**产出都必须流到下游 step。
+    ///
+    /// 这是 `aggregate_step_output` 的真正目的。原来 `output_key` 只绑
+    /// 最后一个 speaker 的产出，下游拿到的是残缺输入——实测 jemalloc
+    /// 会话里 security 的 12346 字（含 3 项 P0 安全阻断）就是这么丢的。
+    /// 产出契约必须作用在**单个 speaker 的产出**上，不能作用在聚合结果上。
+    ///
+    /// 我加聚合时的衍生风险：若契约校验聚合后的文本，多 speaker 步的契约
+    /// 语义就变了——比如 `learn.toml` 的 `verify` 步要求产出含
+    /// `KIND`/`PASS`/`FAIL`，聚合后只要**任一** speaker 提到就算过，
+    /// 而原意是**每个** speaker 都要给出裁决。
+    ///
+    /// 实现上校验发生在 `response` 上、聚合在其后，所以语义没变。这条
+    /// 测试把这个顺序钉住。
+    #[tokio::test]
+    async fn contract_is_checked_per_speaker_not_on_aggregate() {
+        let server = wiremock::MockServer::start().await;
+        // 第一个 speaker 的产出**不含** VERDICT（违反契约），第二个含。
+        // 若契约作用在聚合结果上，第一个的违规会被第二个"救回来"，
+        // 于是只有 2 次请求；作用在单个产出上则第一个要重试，共 3 次。
+        let bad = "这是一段足够长的产出但缺少必需标记，用于触发契约重试与批注回填机制。";
+        let good = "这是一段足够长的产出。VERDICT: PASS";
+        // wiremock 是**先注册先匹配**：限次的违约 mock 必须注册在兜底
+        // 之前，否则兜底会吃掉所有请求、违约永不发生（我第一版就这么错的，
+        // 实测请求数 2 而非 3）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(bad)))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        // 兜底：合格产出。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(good)))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "per_speaker_contract"
+[[steps]]
+id = "fan"
+speakers = ["a", "b"]
+task = "各自给裁决"
+output_key = "verdicts"
+max_retries = 1
+
+[steps.output_contract]
+require = ["VERDICT:"]
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+
+        let (ctx, _rx) = test_ctx(test_config_roles_at(&server.uri(), &["a", "b"]));
+        let out = run_workflow(&wf, "测试", &ctx).await.expect("应成功");
+        let n = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            n, 3,
+            "speaker a 的首次产出违约应触发重试（1 首发 + 1 重试 + 1 个 b），\
+             实际 {n} 次——若为 2 说明契约被改成校验聚合结果了"
+        );
+        // 聚合结果里两个 speaker 都在。
+        assert!(out.contains("## [a]") && out.contains("## [b]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn multi_speaker_step_feeds_all_outputs_downstream() {
+        let server = wiremock::MockServer::start().await;
+        // 所有调用都回同一段话：足够长以通过默认契约，内容里带 speaker
+        // 无关的固定串，便于数出现次数。
+        let body = "这是一份足够详实的产出，覆盖方案概述与取舍依据，没有占位内容。MARKER";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(body)))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "agg_demo"
+[[steps]]
+id = "fan"
+speakers = ["a", "b", "c"]
+task = "各自发表意见"
+output_key = "opinions"
+
+[[steps]]
+id = "join"
+role = "a"
+task = "下面是全部意见，请汇总：\n{{opinions}}"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+
+        let (ctx, _rx) = test_ctx(test_config_roles_at(&server.uri(), &["a", "b", "c"]));
+        run_workflow(&wf, "测试主题", &ctx).await.expect("workflow 应成功");
+
+        // 最后一次请求是 join 步，它的 prompt 里应含三份产出。
+        let requests = server.received_requests().await.unwrap();
+        let last = String::from_utf8_lossy(&requests.last().unwrap().body);
+        assert_eq!(
+            last.matches("MARKER").count(),
+            3,
+            "join 步应看到全部 3 份产出，实际 {} 份：\n{}",
+            last.matches("MARKER").count(),
+            &last[last.len().saturating_sub(600)..]
+        );
+        for role in ["a", "b", "c"] {
+            assert!(
+                last.contains(&format!("## [{role}]")),
+                "join 步的输入应带 {role} 的归属标记"
+            );
+        }
     }
 
     fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {        let mut n = 0;        while let Ok(ev) = rx.try_recv() {

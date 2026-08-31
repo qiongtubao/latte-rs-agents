@@ -35,3 +35,6 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 让 e2e 能打本地 mock 而不是真实模型 API（见 tests/hil_v11_e2e.rs）。
+wiremock = "0.6"
+tokio = { workspace = true }

@@ -104,8 +104,10 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | CLI 300s / UI 900s | specialist（delegate / workflow step）的 wall-clock 超时，超时即中止并回喂 manager 重派。模型目录里的 per-model `timeout_secs` 优先级最高 |
+| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | CLI 300s / UI 900s | specialist（delegate / workflow step）的 wall-clock 超时，超时即中止并回喂 manager 重派。**注意**：模型目录里的 per-model `timeout_secs` 管的是**流式超时**（首 token / chunk 间隔），与这条 wall-clock 超时是两套独立机制，不存在覆盖关系 |
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
+| `LATTE_AI_FIRST_EVENT_TIMEOUT_SECS` | 100 | 首 token（TTFB）超时。reasoning 模型思考久，窗口给得宽。模型目录里的 `timeout_secs` **精确覆盖**它（既能放宽也能收紧，用于给已知秒回的模型配快速失败） |
+| `LATTE_AI_IDLE_TIMEOUT_SECS` | 120 | 两个 SSE chunk 之间的最大间隔。只要 token 在流动就不触发，总生成时间无上限。同样被 per-model `timeout_secs` 精确覆盖 |
 | `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` | 5 | 模型全链不可用时自动暂停后的退避重试次数上限，用尽转人工（0 = 不自动重试，立刻等人点 ▶） |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
 | `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |

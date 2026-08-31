@@ -10,26 +10,73 @@ max_rounds = 1
 [[steps]]
 id = "explain"
 description = "变更说明"
-speakers = ["programmer"]
+role = "programmer"
 output_key = "changes"
-prompt = "说明这次变更：{{topic}}。用工具读相关代码，禁止凭记忆。输出：1) 改了什么（文件/逻辑）；2) 为什么这样改；3) 爆炸半径（受影响的调用方/行为）。"
+task = "说明这次变更：{{topic}}。用工具读相关代码，禁止凭记忆。输出：1) 改了什么（文件/逻辑）；2) 为什么这样改；3) 爆炸半径（受影响的调用方/行为）。"
+
+# ── 审查：reviewer 与 tester **并发**（同一 DAG wave）────────────────
+#
+# 拆成两个单 speaker step：step 内多 speaker 是严格串行的，而 DAG 引擎
+# 对同 wave 的 step 并发。两人维度互不依赖（代码质量 vs 测试覆盖）。
+#
+# 两步都收紧成只读：审查不该改文件。原来是一个多 speaker 步且**没有**
+# `tools` 过滤——tester 手里有 write/bash 时，"审查"会滑成"顺手补测试
+# 并跑一遍"（requirements_review 的 estimate 步就是这么失控的，实测跑了
+# 131 次工具调用、改了源文件、最后撞轮次上限）。
+[[steps]]
+id = "review_quality"
+description = "reviewer：设计与代码质量"
+role = "reviewer"
+depends_on = ["explain"]
+tools = ["read", "search", "code_graph"]
+output_key = "feedback_quality"
+task = """审查这次变更：
+{{changes}}
+
+只看**设计、模式、代码质量**，按 blocking / important / nit 分级。
+输出编号意见清单，每条附证据（file:line）。本步只审查，禁止修改文件。"""
 
 [[steps]]
-id = "review"
-description = "多角度审查"
-speakers = ["reviewer", "tester"]
-output_key = "feedback"
-prompt = "审查这次变更：\n{{changes}}\nReviewer：设计、模式、代码质量（按 blocking/important/nit 分级）。Tester：边界用例与测试覆盖缺口。各自输出编号意见清单，每条附证据（file:line）。"
+id = "review_test"
+description = "tester：边界用例与覆盖缺口"
+role = "tester"
+depends_on = ["explain"]
+tools = ["read", "search", "code_graph"]
+output_key = "feedback_test"
+task = """审查这次变更：
+{{changes}}
+
+只看**边界用例与测试覆盖缺口**。输出编号意见清单，每条附证据（file:line）。
+本步只审查，禁止修改文件或运行测试。"""
 
 [[steps]]
 id = "respond"
 description = "逐条回应"
-speakers = ["programmer"]
+role = "programmer"
+depends_on = ["review_quality", "review_test"]
 output_key = "response"
-prompt = "回应审查意见：\n【变更说明】{{changes}}\n【审查意见】{{feedback}}\n对每一条意见：接受（给修复方案）或反驳（给理由）。输出逐条对应表。"
+task = """回应审查意见：
+【变更说明】{{changes}}
+
+【质量意见】{{feedback_quality}}
+
+【测试意见】{{feedback_test}}
+
+对每一条意见：接受（给修复方案）或反驳（给理由）。输出逐条对应表。"""
 
 [[steps]]
 id = "verdict"
 description = "终审裁决"
-speakers = ["reviewer"]
-prompt = "终审这次变更审查：\n【变更】{{changes}}\n【意见】{{feedback}}\n【回应】{{response}}\n按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。只报告有证据、可行动的问题。"
+role = "reviewer"
+depends_on = ["respond"]
+output_key = "verdict"
+task = """终审这次变更审查：
+【变更】{{changes}}
+
+【质量意见】{{feedback_quality}}
+
+【测试意见】{{feedback_test}}
+
+【回应】{{response}}
+
+按裁决格式输出：裁决（✅/⚠️/❌）、理由（引用证据）、阻断问题、后续建议。只报告有证据、可行动的问题。"""

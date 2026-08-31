@@ -21,6 +21,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR = <root>/latte-agent-cli
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
@@ -53,6 +55,10 @@ fn scratch_dir(name: &str) -> PathBuf {
 
 /// 跑 pty 驱动，返回 pty 上收到的全部输出（含转义序列）。
 fn drive(cwd: &Path, steps: &[(&str, &str)]) -> String {
+    drive_with_env(cwd, steps, &[])
+}
+
+fn drive_with_env(cwd: &Path, steps: &[(&str, &str)], env: &[(&str, String)]) -> String {
     let script = repo_root().join("scripts/pty_drive.py");
     let mut cmd = Command::new("python3");
     cmd.arg(&script)
@@ -62,6 +68,9 @@ fn drive(cwd: &Path, steps: &[(&str, &str)]) -> String {
         .arg(cwd)
         .arg("--timeout")
         .arg("90");
+    for (k, v) in env {
+        cmd.arg("--env").arg(format!("{k}={v}"));
+    }
     for (wait, text) in steps {
         cmd.arg("--step").arg(format!("{wait}:{text}"));
     }
@@ -305,21 +314,29 @@ fn multi_line_command_output_is_batched() {
 /// 普通输入走 mpsc 队列，而队列的消费方（REPL 主循环）在 turn 期间正忙。
 /// 实测：排队时 `⏸ 已暂停` 出现在 `TurnEnd` **之后**（12144 → 13431），
 /// 对 `/pause` 等于完全失效——想暂停的恰恰是那个正在跑的 turn。
-#[test]
-fn pause_takes_effect_during_a_turn_not_after() {
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_takes_effect_during_a_turn_not_after() {
     if !python3_available() {
         eprintln!("[skip] python3 不可用，跳过 pty 交互测试");
         return;
     }
+    // 需要一个"turn 正在跑"的窗口才能在中途 /pause，所以让 mock 每次
+    // 响应前等 25 秒——真实模型也能造出这个窗口，但耗时长且不稳定
+    // （本测试原来打真实 API，会因 turn 太短而抖动）。
+    let (_server, base_url) =
+        common::start_model_mock_delayed("stub", std::time::Duration::from_secs(14)).await;
+    let home = tempfile::tempdir().unwrap();
+    common::write_isolated_home(home.path(), &base_url);
     let cwd = scratch_dir("pause");
-    let out = drive(
+    let out = drive_with_env(
         &cwd,
         &[
-            ("4.0", "依次读 seed.txt 三次，每次单独调用工具"),
-            ("8.0", "/pause"),
-            ("10.0", "/resume"),
-            ("35.0", "/quit"),
+            ("3.0", "随便说一句"),
+            ("3.0", "/pause"),
+            ("4.0", "/resume"),
+            ("14.0", "/quit"),
         ],
+        &[("LATTE_HOME", home.path().display().to_string())],
     );
     let paused = out.find("已暂停");
     let resumed = out.find("已恢复");

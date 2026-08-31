@@ -1,47 +1,187 @@
 # Workflow: design_brainstorm
-# 注意：本流程尚未按精致化模式重构（缺 output_key 穿线），见看板任务。
+# 设计脑暴：PM 铺需求 → 多角色脑暴 → 评审团评估 → 综合定案 → 终审。
+# 步骤间用 output_key 显式穿线（引擎跨步骤只传 output_key 变量 +
+# step 内 transcript；"上面的讨论"这类隐式引用拿不到任何上下文）。
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "design_brainstorm"
 description = "关于架构或特性设计的开放式创意讨论。｜落点：对话里的设计方案"
-max_rounds = 2
+max_rounds = 1
+
 [[steps]]
 id = "context"
+description = "PM 描述需求与目标"
 speakers = ["pm"]
+output_key = "context"
 prompt = "描述这个需求和目标：{{topic}}。我们要解决什么样的用户需求？"
+
+# ── 脑暴：三个角色**并发**（同一 DAG wave）──────────────────────────
+#
+# 为什么拆成三个单 speaker step 而不是一个多 speaker step：
+# step 内的多个 speaker 是**严格串行**的（`for speaker in ...`），而 DAG
+# 引擎对同一 wave 的 step 是并发的（`LATTE_WORKFLOW_CONCURRENCY`，默认 4）。
+# 实测：三个只读 step 放同 wave 同时启动、各自 4–12s 结束；而原来
+# brainstorm + evaluate 两步串行跑了 22 分钟。
+#
+# designer / devops 改用 **step 级** `when_any`：拆开后
+# `optional_speakers`（step 内机制）没有载体了。
 [[steps]]
-id = "brainstorm"
-speakers = ["architect", "programmer"]
-prompt = "头脑风暴各种方案。只谈属于你这个角色职责的那部分——architect 谈系统设计选项，programmer 谈实现层面的实际考量，designer 谈 UX 影响；本步不一定三个角色都在场，不要替不在场的角色代笔。在彼此想法的基础上推进。"
-# 与 config/workflows/design_brainstorm.toml 同步：designer 只在任务
-# 真的涉及界面时才派（`[[steps.optional_speakers]]` 必须写在本 step
-# 全部标量键之后，否则后续键会被 TOML 归进子表）。
-[[steps.optional_speakers]]
+id = "brainstorm_arch"
+description = "architect：系统设计选项"
+role = "architect"
+depends_on = ["context"]
+# 并发步必须只读：脑暴只出方案，不落文件。
+tools = ["read", "search", "code_graph"]
+output_key = "ideas_arch"
+task = """主题：{{topic}}
+
+需求背景：
+{{context}}
+
+从**系统设计**角度给出方案选项与取舍。只谈属于 architect 职责的部分。"""
+
+[[steps]]
+id = "brainstorm_prog"
+description = "programmer：实现层考量"
+role = "programmer"
+depends_on = ["context"]
+# 并发步必须只读：脑暴只出方案，不落文件。
+tools = ["read", "search", "code_graph"]
+output_key = "ideas_prog"
+task = """主题：{{topic}}
+
+需求背景：
+{{context}}
+
+从**实现**角度给出实际考量（可行性、工作量、风险点）。只谈属于 programmer 职责的部分。"""
+
+[[steps]]
+id = "brainstorm_design"
+description = "designer：UX 影响（仅涉及界面时）"
 role = "designer"
+depends_on = ["context"]
+# 并发步必须只读：脑暴只出方案，不落文件。
+tools = ["read", "search", "code_graph"]
+output_key = "ideas_design"
 when_any = [
   "ui", "ux", "gui", "css", "html", "frontend", "figma", "wcag",
   "界面", "前端", "交互", "视觉", "设计稿", "原型", "布局", "样式",
   "用户体验", "可访问性", "组件库", "页面",
 ]
+task = """主题：{{topic}}
+
+需求背景：
+{{context}}
+
+从 **UX** 角度给出影响与建议。只谈属于 designer 职责的部分。"""
+
+# ── 评审：三个只读角色**并发** ─────────────────────────────────────
+#
+# 这一步全部收紧成只读工具，所以并发没有写文件的竞态风险。
 [[steps]]
-id = "evaluate"
-speakers = ["reviewer", "security"]
-prompt = "评估提出的方案。按你的角色职责给出评估——reviewer 看可维护性，security 看安全性，devops 看运维成本；本步不一定三个角色都在场，只评属于你职责范围内的那部分。"
-# 同步：devops 只在任务真的涉及部署/CI/运维时才派。
-[[steps.optional_speakers]]
+id = "eval_review"
+description = "reviewer：可维护性"
+role = "reviewer"
+depends_on = ["brainstorm_arch", "brainstorm_prog", "brainstorm_design"]
+tools = ["read", "search", "code_graph"]
+output_key = "eval_review"
+task = """主题：{{topic}}
+
+待评估的方案：
+{{ideas_arch}}
+
+{{ideas_prog}}
+
+{{ideas_design}}
+
+只从**可维护性**角度评估。"""
+
+[[steps]]
+id = "eval_security"
+description = "security：安全性"
+role = "security"
+depends_on = ["brainstorm_arch", "brainstorm_prog", "brainstorm_design"]
+tools = ["read", "search", "code_graph"]
+output_key = "eval_security"
+task = """主题：{{topic}}
+
+待评估的方案：
+{{ideas_arch}}
+
+{{ideas_prog}}
+
+{{ideas_design}}
+
+只从**安全性**角度评估。"""
+
+[[steps]]
+id = "eval_devops"
+description = "devops：运维成本（仅涉及部署/CI 时）"
 role = "devops"
+depends_on = ["brainstorm_arch", "brainstorm_prog", "brainstorm_design"]
+tools = ["read", "search", "code_graph"]
+output_key = "eval_devops"
 when_any = [
   "ci", "cd", "docker", "k8s", "kubernetes", "deploy", "pipeline",
   "terraform", "ansible", "helm", "makefile", "cmake",
   "部署", "发布", "上线", "运维", "流水线", "容器", "镜像",
   "监控", "告警", "灰度", "回滚", "集群",
 ]
+task = """主题：{{topic}}
+
+待评估的方案：
+{{ideas_arch}}
+
+{{ideas_prog}}
+
+{{ideas_design}}
+
+只从**运维成本**角度评估。"""
+
 [[steps]]
 id = "synthesize"
+description = "综合成推荐方案"
 speakers = ["architect", "pm"]
-prompt = "把讨论综合成一个推荐方案，权衡取舍有据可查。"
+depends_on = ["eval_review", "eval_security", "eval_devops"]
+output_key = "proposal"
+prompt = """主题：{{topic}}
+
+【需求背景】
+{{context}}
+
+【脑暴方案】
+{{ideas_arch}}
+
+{{ideas_prog}}
+
+{{ideas_design}}
+
+【评审意见】
+{{eval_review}}
+
+{{eval_security}}
+
+{{eval_devops}}
+
+把上面的讨论综合成一个推荐方案，权衡取舍有据可查。
+注：被条件跳过的角色其段落为空，按现有内容综合即可，不要凭空补写。"""
+
 [[steps]]
 id = "advisor_verdict"
 description = "Reviewer reviews all outputs and gives the final verdict"
-speakers = ["reviewer"]
-prompt = "你现在是终审顾问。通读上面的全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。"
+role = "reviewer"
+depends_on = ["synthesize"]
+output_key = "verdict"
+task = """主题：{{topic}}
+
+你现在是终审顾问。通读以下全部讨论与产出，按你的裁决格式给出最终结论：裁决（✅ 通过 / ⚠️ 有条件通过 / ❌ 不通过）、理由（1-3 句，需有证据）、阻断问题（如有，逐条：问题 → 影响 → 建议）、条件或后续建议（如有）。只报告影响可证明、可行动的问题。
+
+【推荐方案】
+{{proposal}}
+
+【评审意见】
+{{eval_review}}
+
+{{eval_security}}
+
+{{eval_devops}}"""

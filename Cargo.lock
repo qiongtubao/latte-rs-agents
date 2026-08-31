@@ -1201,6 +1201,7 @@ dependencies = [
  "toml",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

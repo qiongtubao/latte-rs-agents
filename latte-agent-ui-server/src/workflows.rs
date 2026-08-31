@@ -199,6 +199,11 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // speakers 一律按无条件处理（空 = 无可选角色，现状行为）。
                 // 保存走 TOML 原文，不经此函数，不会丢 toml 里的配置。
                 optional_speakers: vec![],
+                // step 级条件（when_any/unless_any）同样只在 TOML 权威版
+                // 可配：表单编辑器的试运行一律无条件执行（空 = 现状行为）。
+                when_any: vec![],
+                unless_any: vec![],
+                match_scope: Default::default(),
             })
             .collect(),
     }

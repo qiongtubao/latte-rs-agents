@@ -21,6 +21,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::io::Write;
 
+mod common;
+use common::{start_model_mock, write_isolated_home};
+
 fn bin() -> std::path::PathBuf {
     std::env::var("CARGO_BIN_EXE_latte-agent")
         .ok()
@@ -34,8 +37,21 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
+    latte_with_home(cwd, args, stdin, None)
+}
+
+fn latte_with_home(
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    home: Option<&Path>,
+) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.args(args).current_dir(cwd);
+    if let Some(h) = home {
+        // 隔离全局配置层，否则会 fallback 到真实 API（见 common/mod.rs）。
+        cmd.env("LATTE_HOME", h);
+    }
     if let Some(input) = stdin {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
@@ -46,8 +62,13 @@ fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Outpu
     }
 }
 
-#[test]
-fn specialist_output_written_back_to_history() {
+#[tokio::test(flavor = "multi_thread")]
+async fn specialist_output_written_back_to_history() {
+    // mock + 隔离 HOME：本测试测的是 specialist 产出回写历史，不是模型
+    // 行为。原来打真实 API，**稳定失败**在 "programmer has no messages"。
+    let (_server, base_url) = start_model_mock("specialist stub 产出：已完成。").await;
+    let home = tempfile::tempdir().unwrap();
+    write_isolated_home(home.path(), &base_url);
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     git(repo, &["init", "-q", "-b", "main"]);
@@ -58,7 +79,12 @@ fn specialist_output_written_back_to_history() {
     git(repo, &["commit", "-q", "-m", "init"]);
 
     // 1. Start a task.
-    let run_out = latte(repo, &["run", "--task-id", "e2e12", "--initial-prompt", "noop"], None);
+    let run_out = latte_with_home(
+        repo,
+        &["run", "--task-id", "e2e12", "--initial-prompt", "noop"],
+        None,
+        Some(home.path()),
+    );
     assert!(run_out.status.success(),
         "latte run failed: stderr={}",
         String::from_utf8_lossy(&run_out.stderr));
@@ -71,11 +97,12 @@ fn specialist_output_written_back_to_history() {
     //    session JSON is in `Done` state and the specialist output
     //    from rounds 1+2 has been written back to role history.
     let script = b"first task\nnoop\n/quit\n";
-    let out = latte(
+    let out = latte_with_home(
         repo,
         &["chat", "--task-id", "e2e12", "--roles", "manager,programmer",
           "--initial-prompt", "noop", "--max-rounds", "3"],
         Some(script),
+        Some(home.path()),
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

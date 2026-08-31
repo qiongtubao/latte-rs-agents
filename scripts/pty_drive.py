@@ -34,11 +34,14 @@ import termios
 import time
 
 
-def drive(binary, cwd, role, steps, timeout, rows=40, cols=120):
+def drive(binary, cwd, role, steps, timeout, rows=40, cols=120, env=None):
     """steps: [(等待秒数, 要写入的字节)]。返回 pty 上收到的全部输出。"""
     master, slave = pty.openpty()
     # 必须设 winsize：不设时终端报 0×0，被测程序拿不到真实宽度。
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    child_env = dict(os.environ)
+    if env:
+        child_env.update(env)
     proc = subprocess.Popen(
         [binary, "chat", "-r", role],
         stdin=slave,
@@ -46,6 +49,7 @@ def drive(binary, cwd, role, steps, timeout, rows=40, cols=120):
         stderr=slave,
         cwd=cwd,
         close_fds=True,
+        env=child_env,
     )
     os.close(slave)
     out = bytearray()
@@ -100,7 +104,18 @@ def main():
             "文本可为空（只等待）。"
         ),
     )
+    ap.add_argument(
+        "--env",
+        action="append",
+        default=[],
+        help="`KEY=VALUE`，透传给被测进程（如 LATTE_HOME=/tmp/x 用于隔离全局配置）。",
+    )
     args = ap.parse_args()
+    extra_env = {}
+    for kv in args.env:
+        k, _, v = kv.partition("=")
+        if k:
+            extra_env[k] = v
 
     steps = []
     for raw in args.step:
@@ -112,7 +127,9 @@ def main():
         else:
             payload = (text + "\r").encode()
         steps.append((float(wait), payload))
-    sys.stdout.write(drive(args.binary, args.cwd, args.role, steps, args.timeout))
+    sys.stdout.write(
+        drive(args.binary, args.cwd, args.role, steps, args.timeout, env=extra_env)
+    )
 
 
 if __name__ == "__main__":

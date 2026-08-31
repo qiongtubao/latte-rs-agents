@@ -13,6 +13,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::io::Write;
 
+mod common;
+use common::{start_model_mock, write_isolated_home};
+
 fn bin() -> std::path::PathBuf {
     let mut p = std::env::var("CARGO_BIN_EXE_latte-agent")
         .ok()
@@ -28,8 +31,21 @@ fn git(cwd: &Path, args: &[&str]) {
 }
 
 fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
+    latte_with_home(cwd, args, stdin, None)
+}
+
+fn latte_with_home(
+    cwd: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    home: Option<&Path>,
+) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.args(args).current_dir(cwd);
+    if let Some(h) = home {
+        // 隔离全局配置层，否则会 fallback 到真实 API（见 common/mod.rs）。
+        cmd.env("LATTE_HOME", h);
+    }
     if let Some(input) = stdin {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
@@ -40,8 +56,14 @@ fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Outpu
     }
 }
 
-#[test]
-fn chat_hil_pause_resume_inject_rollback() {
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_hil_pause_resume_inject_rollback() {
+    // mock + 隔离 HOME：本测试的断言全是 CLI 自身行为（session banner、
+    // paused、queue、rollback），不依赖模型产出内容。原来打真实 API 要
+    // 55s，还会因模型路径不同而抖动。
+    let (_server, base_url) = start_model_mock("stub 产出：本轮无操作。").await;
+    let home = tempfile::tempdir().unwrap();
+    write_isolated_home(home.path(), &base_url);
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     git(repo, &["init", "-q", "-b", "main"]);
@@ -52,7 +74,7 @@ fn chat_hil_pause_resume_inject_rollback() {
     git(repo, &["commit", "-q", "-m", "init"]);
 
     // 1. Start a task.
-    latte(repo, &["run", "--task-id", "e2e", "--initial-prompt", "noop"], None);
+    latte_with_home(repo, &["run", "--task-id", "e2e", "--initial-prompt", "noop"], None, Some(home.path()));
 
     let wt = repo.join(".latte/worktrees/e2e");
 
@@ -62,7 +84,7 @@ fn chat_hil_pause_resume_inject_rollback() {
     //    stdin script is fully buffered before the binary spawns,
     //    so timing is deterministic.
     let script1 = b"first task\n/pause\n";
-    let out1 = latte(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script1));
+    let out1 = latte_with_home(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script1), Some(home.path()));
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let stderr1 = String::from_utf8_lossy(&out1.stderr);
     println!("[chat1 stdout]\n{}", stdout1);
@@ -97,7 +119,7 @@ fn chat_hil_pause_resume_inject_rollback() {
     //    with just [manager] and `programmer` inject queue never
     //    exists.
     let script2 = b"@programmer check this\n/quit\n";
-    let out2 = latte(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script2));
+    let out2 = latte_with_home(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script2), Some(home.path()));
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
     println!("[chat2 stdout]\n{}", stdout2);
@@ -112,7 +134,7 @@ fn chat_hil_pause_resume_inject_rollback() {
     //    untouched. (Inject queue was already drained by the REPL
     //    quit; we just verify plan.md byte-equal pre/post.)
     let plan_before = std::fs::read_to_string(wt.join("plan.md")).unwrap();
-    let out3 = latte(repo, &["checkpoint", "rollback", "--task-id", "e2e", "--id", "0"], None);
+    let out3 = latte_with_home(repo, &["checkpoint", "rollback", "--task-id", "e2e", "--id", "0"], None, Some(home.path()));
     let _ = String::from_utf8_lossy(&out3.stdout);
     let plan_after = std::fs::read_to_string(wt.join("plan.md")).unwrap();
     assert_eq!(plan_before, plan_after,
