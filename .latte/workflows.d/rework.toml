@@ -4,7 +4,7 @@
 # 而不是重跑开发流——topic 里带审查反馈和前次产出摘要。
 
 name = "rework"
-description = "返工：理解反馈 → 定点修复 → 验证 → 终审"
+description = "返工：理解反馈 → 定点修复 → 验证 → 终审｜落点：代码改动"
 max_rounds = 1
 
 [[steps]]

@@ -14,7 +14,7 @@
 
 name = "init_project"
 command = "/init"
-description = "初始化项目 agent 配置：探索代码库 → 生成共享 project.md → 各角色并行生成专属 prompt 增量"
+description = "初始化项目 agent 配置：探索代码库 → 生成共享 project.md → 各角色并行生成专属 prompt 增量｜落点：prompts/ 下的项目配置文件"
 max_rounds = 1
 
 # ── Wave 0：嵌套 explore workflow，通读代码库 ─────────────────────

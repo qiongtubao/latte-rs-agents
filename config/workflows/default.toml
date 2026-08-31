@@ -3,7 +3,7 @@
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "standard-software-discussion"
-description = "标准软件开发讨论：需求 → 设计 → 估算 → 评审 → 决策"
+description = "标准软件开发讨论：需求 → 设计 → 估算 → 评审 → 决策｜落点：对话里的讨论结论"
 max_rounds = 3
 context_token_budget = 32000
 [[steps]]

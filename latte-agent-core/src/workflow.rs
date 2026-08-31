@@ -443,6 +443,95 @@ async fn loop_exhausted_last_resort_review(
     true
 }
 
+/// 可选 speaker 的关键词匹配范围。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchScope {
+    /// 只看 workflow 的 `topic`（默认）。topic 是用户诉求的原文，
+    /// 跨 step 稳定、不含上游产出，误命中概率最低。
+    #[default]
+    Topic,
+    /// 看渲染后的任务全文（topic + 上游 `{{var}}` 注入的产出）。
+    /// 命中面更广但更容易被上游文本里偶然出现的词带偏——只在
+    /// 「相关性只能从上游产出里判断」时才用。
+    Task,
+}
+
+/// 可选 speaker：按关键词命中情况决定这一步**是否真的把它派出去**。
+///
+/// 为什么需要它：多 speaker 的 step 是固定阵容（`speakers` 写死），
+/// 一个 step 只渲染一份 prompt 广播给所有 speaker，角色分工全靠 prompt
+/// 里一句话。任务与某个角色无关时（实测实锤：给
+/// 「编排 jemalloc 源码学习路径」这种没有界面的任务派 `designer`），
+/// 该角色只有两条路——交元讨论，或越权替别人干活——两条都会被 advisor
+/// 的返回审查判 intervene 并触发重做，而重做也救不回来（角色本身就
+/// 不该来）。实测代价：designer + devops 两个分派合计约 55 万
+/// input tokens 与 500s 墙钟全部作废。
+///
+/// 判定放在**派发前**且**零模型调用**：这是静态的模板选型问题，
+/// 用静态手段解——不花 token、结果确定、resume 后可复现。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionalSpeaker {
+    /// 角色 id。不得与本 step 的无条件 speaker 重复。
+    pub role: String,
+    /// 命中其中**任意一个**关键词才派（OR 语义）。空 = 不设正向条件。
+    #[serde(default)]
+    pub when_any: Vec<String>,
+    /// 命中其中**任意一个**关键词就不派（否决优先于 `when_any`）。
+    #[serde(default)]
+    pub unless_any: Vec<String>,
+    /// 关键词匹配范围，默认 `topic`。
+    #[serde(default)]
+    pub match_scope: MatchScope,
+}
+
+/// 被跳过的可选 speaker 及原因（用于事件与日志，便于回查
+/// 「这一步为什么少了个人」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSpeaker {
+    pub role: String,
+    pub reason: String,
+}
+
+/// 关键词命中判定（大小写不敏感）。
+///
+/// 纯 ASCII 字母数字的关键词按**词边界**匹配，非 ASCII（中文等）按
+/// 子串匹配。原因：`"ui"` 用裸子串会命中 `build` / `guide` /
+/// `require` / `quick`，一个 CI 构建话题就能把 designer 拉进来，
+/// 可选角色等于没做——这类静默误命中比漏命中更难查。
+fn keyword_hit(haystack_lower: &str, needle: &str) -> bool {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let ascii_word = needle.chars().all(|c| c.is_ascii_alphanumeric());
+    if !ascii_word {
+        return haystack_lower.contains(&needle);
+    }
+    let bytes = haystack_lower.as_bytes();
+    let nlen = needle.len();
+    let mut from = 0usize;
+    while let Some(rel) = haystack_lower[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + nlen;
+        let left_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+        let right_ok = end >= bytes.len() || !is_word_byte(bytes[end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= haystack_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStepDef {
@@ -456,6 +545,19 @@ pub struct WorkflowStepDef {
     pub task: String,
     #[serde(default)]
     pub speakers: Vec<String>,
+    /// 可选 speaker：只在关键词命中时才派（见 [`OptionalSpeaker`]）。
+    /// 与无条件 `speakers` 并列，派发顺序排在无条件 speaker 之后。
+    ///
+    /// ```toml
+    /// [[steps]]
+    /// id = "brainstorm"
+    /// speakers = ["architect", "programmer"]
+    /// [[steps.optional_speakers]]
+    /// role = "designer"
+    /// when_any = ["ui", "ux", "界面", "前端", "交互"]
+    /// ```
+    #[serde(default)]
+    pub optional_speakers: Vec<OptionalSpeaker>,
     #[serde(default)]
     pub prompt: String,
     /// Key under which this step's last output is stored in the shared
@@ -616,6 +718,62 @@ impl WorkflowStepDef {
         if let Some(role) = &self.role { vec![role.clone()] } else { self.speakers.clone() }
     }
 
+    /// 全部**声明过**的角色（无条件 + 可选），供 validate 的角色存在性
+    /// 检查、UI 列举、`speaker_roles()` 用。不代表本次真的会派。
+    pub fn declared_roles(&self) -> Vec<String> {
+        let mut out = self.roles();
+        for opt in &self.optional_speakers {
+            if !out.contains(&opt.role) {
+                out.push(opt.role.clone());
+            }
+        }
+        out
+    }
+
+    /// 本次真正要派的角色 + 被跳过的可选角色（含原因）。
+    ///
+    /// `topic` 取 workflow 入口写入 vars 的 `topic`（嵌套 step 取当前层
+    /// 的 topic）；`task_text` 取渲染后的任务全文。无条件 speaker 永远
+    /// 保留——validate 已保证至少有一个，因此返回值不会为空。
+    pub fn active_roles(&self, topic: &str, task_text: &str) -> (Vec<String>, Vec<SkippedSpeaker>) {
+        let mut active = self.roles();
+        let mut skipped = Vec::new();
+        if self.optional_speakers.is_empty() {
+            return (active, skipped);
+        }
+        let topic_lower = topic.to_lowercase();
+        let task_lower = task_text.to_lowercase();
+        for opt in &self.optional_speakers {
+            if active.contains(&opt.role) {
+                continue;
+            }
+            let hay = match opt.match_scope {
+                MatchScope::Topic => &topic_lower,
+                MatchScope::Task => &task_lower,
+            };
+            let scope = match opt.match_scope {
+                MatchScope::Topic => "topic",
+                MatchScope::Task => "task",
+            };
+            if let Some(veto) = opt.unless_any.iter().find(|k| keyword_hit(hay, k)) {
+                skipped.push(SkippedSpeaker {
+                    role: opt.role.clone(),
+                    reason: format!("{scope} 命中排除词 '{veto}'"),
+                });
+                continue;
+            }
+            if opt.when_any.is_empty() || opt.when_any.iter().any(|k| keyword_hit(hay, k)) {
+                active.push(opt.role.clone());
+            } else {
+                skipped.push(SkippedSpeaker {
+                    role: opt.role.clone(),
+                    reason: format!("{scope} 未命中 {:?}", opt.when_any),
+                });
+            }
+        }
+        (active, skipped)
+    }
+
     pub fn task_text(&self) -> &str {
         if self.task.is_empty() { &self.prompt } else { &self.task }
     }
@@ -629,7 +787,7 @@ impl WorkflowDef {
     pub fn speaker_roles(&self) -> Vec<String> {
         let mut out = Vec::new();
         for step in &self.steps {
-            for role in step.roles() {
+            for role in step.declared_roles() {
                 if !out.contains(&role) { out.push(role); }
             }
         }
@@ -693,8 +851,63 @@ impl WorkflowDef {
                     ));
                 }
             }
-            if step.output_from.is_some() && step.workflow.is_none() {
-                return Err(format!(
+            // 可选 speaker 的形状校验。这些错法全都是「静默失效」——
+            // 条件恒真等于白写、role 拼错等于永远不派、全员可选等于
+            // step 可能零产出——配置期直接拦掉。
+            if !step.optional_speakers.is_empty() {
+                if step.workflow.is_some() {
+                    return Err(format!(
+                        "step '{}': `optional_speakers` 与嵌套 workflow 互斥（嵌套 step 没有 speaker）",
+                        step.id
+                    ));
+                }
+                let unconditional = step.roles();
+                if unconditional.is_empty() {
+                    return Err(format!(
+                        "step '{}': 有 `optional_speakers` 时必须至少保留一个无条件 speaker \
+                         （否则关键词全不命中时本 step 零 speaker、零产出）",
+                        step.id
+                    ));
+                }
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for opt in &step.optional_speakers {
+                    if opt.role.trim().is_empty() {
+                        return Err(format!(
+                            "step '{}': optional_speakers 的 role 不能为空",
+                            step.id
+                        ));
+                    }
+                    if unconditional.contains(&opt.role) {
+                        return Err(format!(
+                            "step '{}': optional_speakers 的 '{}' 已经是无条件 speaker，\
+                             条件永远不生效（要么从 speakers 里移除，要么删掉这条）",
+                            step.id, opt.role
+                        ));
+                    }
+                    if !seen.insert(opt.role.as_str()) {
+                        return Err(format!(
+                            "step '{}': optional_speakers 里 '{}' 重复声明",
+                            step.id, opt.role
+                        ));
+                    }
+                    if opt.when_any.is_empty() && opt.unless_any.is_empty() {
+                        return Err(format!(
+                            "step '{}': optional_speakers['{}'] 的 when_any 与 unless_any 全空，\
+                             条件恒真等于无条件 speaker——请写条件或直接放进 speakers",
+                            step.id, opt.role
+                        ));
+                    }
+                    for kw in opt.when_any.iter().chain(opt.unless_any.iter()) {
+                        if kw.trim().is_empty() {
+                            return Err(format!(
+                                "step '{}': optional_speakers['{}'] 的关键词不能为空串（永不命中）",
+                                step.id, opt.role
+                            ));
+                        }
+                    }
+                }
+            }
+            if step.output_from.is_some() && step.workflow.is_none() {                return Err(format!(
                     "step '{}': `output_from` 仅对嵌套 workflow step 有效（该 step 没有 workflow 字段）",
                     step.id
                 ));
@@ -975,23 +1188,39 @@ pub fn is_planning_workflow(name: &str) -> bool {
     )
 }
 
-/// 交付物表：`(标签, 诉求里的关键词, 产出它该跑的流程)`。
+/// 交付物表：`(标签, 诉求里的关键词, 产出它该跑的流程, 能产出它的流程名)`。
 ///
-/// 单一真源——`named_deliverables` 与 `deliverable_route` 都读它，
-/// 避免"识别出了交付物却指错流程"这种两处不同步的错。
-const DELIVERABLES: [(&str, &[&str], &str); 4] = [
+/// 单一真源——`named_deliverables` / `deliverable_route` /
+/// `deliverables_produced_by` 都读它，避免"识别出了交付物却指错流程"、
+/// 或者"某个流程被算作关掉了它其实产不出的交付物"这两类不同步的错。
+///
+/// 第 3 项是给人看的路由说明（可以带括号注解），第 4 项是给引擎比对的
+/// **纯流程名**列表。两者分开，否则记账只能去 substring 匹配一句人话。
+const DELIVERABLES: [(&str, &[&str], &str, &[&str]); 4] = [
     (
         "任务清单",
         &["拆分任务", "拆任务", "任务清单", "任务列表", "看板", "排任务"],
         "implementation_plan（拿到清单后用 plan 提交给用户勾选导入看板）",
+        &["implementation_plan", "task_refine", "design_and_plan", "feature_design"],
     ),
-    ("计划", &["计划", "规划", "路线图", "roadmap"], "implementation_plan"),
+    (
+        "计划",
+        &["计划", "规划", "路线图", "roadmap"],
+        "implementation_plan",
+        &["implementation_plan", "task_refine", "design_and_plan", "feature_design"],
+    ),
     (
         "教程 / 学习材料",
         &["教程", "讲讲", "学习", "入门", "科普"],
         "learn（会落盘 docs/learn/<slug>.md）",
+        &["learn", "learn_loop"],
     ),
-    ("文档", &["文档", "README", "写一篇", "报告"], "write_doc"),
+    (
+        "文档",
+        &["文档", "README", "写一篇", "报告"],
+        "write_doc",
+        &["write_doc", "update_docs"],
+    ),
 ];
 
 /// 从用户诉求里识别**点名的交付物**。
@@ -1009,8 +1238,36 @@ const DELIVERABLES: [(&str, &[&str], &str); 4] = [
 pub fn named_deliverables(user_text: &str) -> Vec<&'static str> {
     DELIVERABLES
         .iter()
-        .filter(|(_, keys, _)| keys.iter().any(|k| user_text.contains(k)))
-        .map(|(label, _, _)| *label)
+        .filter(|(_, keys, _, _)| keys.iter().any(|k| user_text.contains(k)))
+        .map(|(label, _, _, _)| *label)
+        .collect()
+}
+
+/// 这个流程**能关掉**哪几个交付物标签。
+///
+/// 为什么必须按标签逐项记账、而不是记一个"产出过交付物"的布尔：用户
+/// 一句话里点名两三样东西是常态（实测：「安排学习计划 + 拆分任务」同时
+/// 命中`任务清单` / `计划` / `教程 / 学习材料` 三个标签）。布尔记账下，
+/// 只要跑了 `learn`，缺口整体关闭——欠着的任务清单从此再没有任何机制
+/// 会提起它。实测会话正是这样：manager 在正文里写明还要跑
+/// `implementation_plan`，`learn` 一启动缺口就关了，看板至今 0 个任务。
+pub fn deliverables_produced_by(workflow_name: &str) -> Vec<&'static str> {
+    DELIVERABLES
+        .iter()
+        .filter(|(_, _, _, by)| by.contains(&workflow_name))
+        .map(|(label, _, _, _)| *label)
+        .collect()
+}
+
+/// `plan` 工具提交成功关掉的交付物标签：任务清单类。
+///
+/// 提交清单给用户勾选导入看板，是"任务清单 / 计划"这两个标签的终点
+/// 动作——比跑规划流程更硬（流程只是产出草案，提交才进看板）。
+pub fn deliverables_produced_by_plan_submit() -> Vec<&'static str> {
+    DELIVERABLES
+        .iter()
+        .filter(|(_, _, _, by)| by.contains(&"implementation_plan"))
+        .map(|(label, _, _, _)| *label)
         .collect()
 }
 
@@ -1019,8 +1276,8 @@ pub fn named_deliverables(user_text: &str) -> Vec<&'static str> {
 fn deliverable_route(label: &str) -> &'static str {
     DELIVERABLES
         .iter()
-        .find(|(l, _, _)| *l == label)
-        .map(|(_, _, route)| *route)
+        .find(|(l, _, _, _)| *l == label)
+        .map(|(_, _, route, _)| *route)
         .unwrap_or("write_doc")
 }
 
@@ -3090,7 +3347,24 @@ async fn run_workflow_serial(
                 idx += 1;
                 continue;
             }
-            for speaker in step.roles() {
+            // 可选 speaker 过滤：派发前按 topic/任务文本决定阵容，零模型
+            // 调用。跳过的角色发一条 Status，UI 上能看到「这一步为什么
+            // 少了个人」。
+            let (active_speakers, skipped_speakers) = {
+                let mut probe_vars = vars.clone();
+                probe_vars.insert("step_id".into(), step.id.clone());
+                let task_text = wf.render_task(step, &probe_vars);
+                step.active_roles(vars.get("topic").map(|s| s.as_str()).unwrap_or(""), &task_text)
+            };
+            for s in &skipped_speakers {
+                let _ = ctx.event_tx.send(ChatEvent::Status {
+                    message: format!(
+                        "[workflow '{}' step '{}'] 跳过可选角色 {}（{}）",
+                        wf.name, step.id, s.role, s.reason
+                    ),
+                });
+            }
+            for speaker in active_speakers {
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
                     return WfOutcome::Cancelled;
                 }
@@ -3491,7 +3765,25 @@ async fn run_dag_step(
 
     let mut step_transcript = String::new();
     let mut last_output = String::new();
-    for speaker in step.roles() {
+    // 可选 speaker 过滤（同串行引擎，见 WorkflowStepDef::active_roles）。
+    let (active_speakers, skipped_speakers) = {
+        let mut probe_vars = inp.vars.clone();
+        probe_vars.insert("step_id".into(), step.id.clone());
+        let task_text = inp.wf.render_task(step, &probe_vars);
+        step.active_roles(
+            inp.vars.get("topic").map(|s| s.as_str()).unwrap_or(""),
+            &task_text,
+        )
+    };
+    for s in &skipped_speakers {
+        let _ = inp.event_tx.send(ChatEvent::Status {
+            message: format!(
+                "[workflow '{}' step '{}'] 跳过可选角色 {}（{}）",
+                inp.wf.name, step.id, s.role, s.reason
+            ),
+        });
+    }
+    for speaker in active_speakers {
         if inp.cancel_flag.load(Ordering::SeqCst) {
             return Err(StepFail::Cancelled);
         }
@@ -4047,7 +4339,7 @@ mod tests {
     fn every_recognized_deliverable_has_a_route() {
         // 单一真源自检：识别得出的每个标签都必须能查到流程，
         // 否则会出现"知道用户要什么、却指不出该跑哪个流程"。
-        for (label, keys, route) in DELIVERABLES {
+        for (label, keys, route, produced_by) in DELIVERABLES {
             assert!(!route.is_empty(), "{label} 缺少流程");
             assert_eq!(deliverable_route(label), route, "{label} 路由不一致");
             for k in keys {
@@ -4056,7 +4348,54 @@ mod tests {
                     "关键词 {k} 未能识别出 {label}"
                 );
             }
+            // `produced_by` 是记账用的**纯流程名**列表：不能为空（否则这个
+            // 交付物永远关不掉、缺口提醒会一直响），且每个名字都必须真的
+            // 存在于路由说明里（防止两列漂移——记账关掉了一个交付物，
+            // 而提醒还在让 manager 去跑另一个流程）。
+            assert!(!produced_by.is_empty(), "{label} 没有任何流程能产出它");
+            assert!(
+                produced_by.iter().any(|n| route.contains(n)),
+                "{label} 的 produced_by {produced_by:?} 与路由说明 `{route}` 不一致"
+            );
         }
+    }
+
+    /// `produced_by` 里的规划类流程必须与 [`is_planning_workflow`] 完全一致。
+    ///
+    /// 两处各写一份名单必然漂移：加了新的规划流程只改一处，另一处就静默
+    /// 失效（记账那侧漂移的后果是交付物缺口永远关不掉或永远不响）。
+    #[test]
+    fn planning_workflows_agree_between_predicate_and_table() {
+        let from_table = deliverables_produced_by("implementation_plan");
+        assert!(
+            from_table.contains(&"任务清单") && from_table.contains(&"计划"),
+            "{from_table:?}"
+        );
+        for name in ["implementation_plan", "task_refine", "design_and_plan", "feature_design"] {
+            assert!(is_planning_workflow(name), "{name} 应是规划流程");
+            assert!(
+                deliverables_produced_by(name).contains(&"任务清单"),
+                "{name} 是规划流程，必须能关掉「任务清单」"
+            );
+        }
+    }
+
+    /// `learn` 关不掉「任务清单」——本次修复的核心断言。
+    ///
+    /// 旧实现把"产出过交付物"记成一个布尔，于是一句「安排学习计划 +
+    /// 拆分任务」的诉求里，跑一个 `learn` 就把任务清单也一起算交付了。
+    #[test]
+    fn learn_does_not_close_the_task_list_deliverable() {
+        let closes = deliverables_produced_by("learn");
+        assert!(closes.contains(&"教程 / 学习材料"), "{closes:?}");
+        assert!(!closes.contains(&"任务清单"), "learn 产不出任务清单: {closes:?}");
+        assert!(!closes.contains(&"计划"), "learn 产不出任务清单/计划: {closes:?}");
+        // learn_loop 同理（它多了知识点拆解，但拆的是知识点不是工程任务）。
+        let closes = deliverables_produced_by("learn_loop");
+        assert!(closes.contains(&"教程 / 学习材料"), "{closes:?}");
+        assert!(!closes.contains(&"任务清单"), "{closes:?}");
+        // 反向：调研类流程什么都关不掉。
+        assert!(deliverables_produced_by("explore").is_empty());
     }
 
     #[test]
@@ -4090,9 +4429,238 @@ prompt = "review"
         assert_eq!(wf.render_prompt(&wf.steps[0], &vars), "do X");
     }
 
+    // ─── 可选 speaker ────────────────────────────────────────────
+
+    const OPT_WF: &str = r#"
+name = "brain"
+[[steps]]
+id = "brainstorm"
+speakers = ["architect", "programmer"]
+prompt = "主题：{{topic}}\n\n背景：{{context}}"
+[[steps.optional_speakers]]
+role = "designer"
+when_any = ["ui", "界面", "前端"]
+"#;
+
+    fn vars_with(topic: &str, context: &str) -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            ("topic".to_string(), topic.to_string()),
+            ("context".to_string(), context.to_string()),
+        ])
+    }
+
     #[test]
-    fn nested_workflow_step_validation() {
-        let ok = r#"
+    fn optional_speaker_skipped_when_topic_has_no_ui() {
+        let wf: WorkflowDef = toml::from_str(OPT_WF).unwrap();
+        wf.validate().unwrap();
+        // 声明过的角色仍然全都列出来（validate 的角色存在性检查、UI
+        // 列举要看得到可选角色）。
+        assert_eq!(wf.speaker_roles(), vec!["architect", "programmer", "designer"]);
+
+        // 实测那次的 topic：编排 jemalloc 源码学习路径，没有界面。
+        let (active, skipped) = wf.steps[0].active_roles(
+            "为当前仓库 jemalloc 编排「从浅到深学习」的学习路径与任务清单",
+            "",
+        );
+        assert_eq!(active, vec!["architect", "programmer"], "designer 不该被派");
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].role, "designer");
+        assert!(skipped[0].reason.contains("topic 未命中"), "{:?}", skipped[0]);
+    }
+
+    #[test]
+    fn optional_speaker_included_when_topic_has_ui() {
+        let wf: WorkflowDef = toml::from_str(OPT_WF).unwrap();
+        for topic in ["重做设置页的 UI", "改前端布局", "give the CLI a UI"] {
+            let (active, skipped) = wf.steps[0].active_roles(topic, "");
+            assert_eq!(
+                active,
+                vec!["architect", "programmer", "designer"],
+                "topic={topic} 应该拉上 designer"
+            );
+            assert!(skipped.is_empty(), "topic={topic}");
+        }
+    }
+
+    #[test]
+    fn ascii_keyword_matches_on_word_boundary_only() {
+        // "ui" 裸子串会命中 build / guide / require / quick —— 一个纯
+        // 构建话题就能把 designer 拉进来，可选角色等于没做。
+        let wf: WorkflowDef = toml::from_str(OPT_WF).unwrap();
+        for topic in [
+            "fix the build pipeline",
+            "写一份 style guide",
+            "requirements 收敛",
+            "quick fix",
+            "GUI_TOOLKIT 常量改名", // 下划线也算词内字符
+        ] {
+            let (active, _) = wf.steps[0].active_roles(topic, "");
+            assert_eq!(
+                active,
+                vec!["architect", "programmer"],
+                "topic={topic} 不该误命中 ui"
+            );
+        }
+        // 中文关键词按子串匹配（无词边界概念）。
+        let (active, _) = wf.steps[0].active_roles("重做界面交互", "");
+        assert!(active.contains(&"designer".to_string()));
+        // 大小写不敏感。
+        let (active, _) = wf.steps[0].active_roles("redesign the UI", "");
+        assert!(active.contains(&"designer".to_string()));
+    }
+
+    #[test]
+    fn optional_speaker_unless_any_vetoes() {
+        let raw = r#"
+name = "brain"
+[[steps]]
+id = "s"
+speakers = ["architect"]
+prompt = "x"
+[[steps.optional_speakers]]
+role = "designer"
+when_any = ["ui"]
+unless_any = ["cli only"]
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        wf.validate().unwrap();
+        // 否决优先于 when_any：两个条件都命中时不派。
+        let (active, skipped) = wf.steps[0].active_roles("build a ui, cli only", "");
+        assert_eq!(active, vec!["architect"]);
+        assert!(skipped[0].reason.contains("命中排除词"), "{:?}", skipped[0]);
+    }
+
+    #[test]
+    fn optional_speaker_task_scope_sees_upstream_vars() {
+        let raw = OPT_WF.replace(
+            "when_any = [\"ui\", \"界面\", \"前端\"]",
+            "when_any = [\"ui\", \"界面\", \"前端\"]\nmatch_scope = \"task\"",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        wf.validate().unwrap();
+        let vars = vars_with("做个功能", "上游结论：需要新增一个前端页面");
+        let task = wf.render_task(&wf.steps[0], &vars);
+        // topic 里没有界面词，但上游产出里有 —— task 范围能看到。
+        let (active_topic, _) = wf.steps[0].active_roles("做个功能", "");
+        assert_eq!(active_topic, vec!["architect", "programmer"]);
+        let (active_task, _) = wf.steps[0].active_roles("做个功能", &task);
+        assert!(active_task.contains(&"designer".to_string()));
+    }
+
+    #[test]
+    fn optional_speaker_validation_rejects_silent_misconfig() {
+        let base = |extra: &str| {
+            format!(
+                r#"
+name = "brain"
+[[steps]]
+id = "s"
+{extra}
+"#
+            )
+        };
+        // 1. 全员可选 → 关键词全不命中时 step 零 speaker、零产出。
+        let raw = base(
+            "prompt = \"x\"\n[[steps.optional_speakers]]\nrole = \"designer\"\nwhen_any = [\"ui\"]",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf
+            .validate()
+            .unwrap_err()
+            .contains("至少保留一个无条件 speaker"));
+
+        // 2. 已经是无条件 speaker → 条件永远不生效。
+        let raw = base(
+            "speakers = [\"designer\"]\nprompt = \"x\"\n\
+             [[steps.optional_speakers]]\nrole = \"designer\"\nwhen_any = [\"ui\"]",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf.validate().unwrap_err().contains("已经是无条件 speaker"));
+
+        // 3. 条件全空 → 恒真，等于无条件 speaker。
+        let raw = base(
+            "speakers = [\"architect\"]\nprompt = \"x\"\n\
+             [[steps.optional_speakers]]\nrole = \"designer\"",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf.validate().unwrap_err().contains("条件恒真"));
+
+        // 4. 空关键词 → 永不命中。
+        let raw = base(
+            "speakers = [\"architect\"]\nprompt = \"x\"\n\
+             [[steps.optional_speakers]]\nrole = \"designer\"\nwhen_any = [\"  \"]",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf.validate().unwrap_err().contains("不能为空串"));
+
+        // 5. 同一角色重复声明。
+        let raw = base(
+            "speakers = [\"architect\"]\nprompt = \"x\"\n\
+             [[steps.optional_speakers]]\nrole = \"designer\"\nwhen_any = [\"ui\"]\n\
+             [[steps.optional_speakers]]\nrole = \"designer\"\nwhen_any = [\"ux\"]",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf.validate().unwrap_err().contains("重复声明"));
+
+        // 6. 与嵌套 workflow 互斥。
+        let raw = base(
+            "workflow = \"explore\"\n\
+             [[steps.optional_speakers]]\nrole = \"designer\"\nwhen_any = [\"ui\"]",
+        );
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        assert!(wf.validate().unwrap_err().contains("与嵌套 workflow 互斥"));
+    }
+
+    #[test]
+    fn steps_without_optional_speakers_are_unchanged() {
+        // 回归：没写 optional_speakers 的 step 阵容逐字不变。
+        let raw = r#"
+name = "legacy"
+[[steps]]
+id = "a"
+speakers = ["pm", "architect", "designer"]
+prompt = "x"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        wf.validate().unwrap();
+        let (active, skipped) = wf.steps[0].active_roles("任何 topic", "任何 task");
+        assert_eq!(active, vec!["pm", "architect", "designer"]);
+        assert!(skipped.is_empty());
+        assert_eq!(wf.steps[0].declared_roles(), active);
+    }
+
+    #[test]
+    fn shipped_design_brainstorm_skips_designer_and_devops_for_code_task() {
+        // 真实配置回归：仓库里的 design_brainstorm.toml 对「学习路径」
+        // 这类无界面无部署的任务，必须把 designer 与 devops 都跳掉。
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../config/workflows/design_brainstorm.toml"),
+        )
+        .expect("仓库内置 design_brainstorm.toml 应存在");
+        let wf: WorkflowDef = toml::from_str(&raw).unwrap();
+        wf.validate().unwrap();
+        let topic = "为当前仓库 jemalloc 编排「从浅到深学习」的学习路径与任务清单：\
+                     先探索代码库整体结构，再设计分阶段学习路径，最后拆分为任务看板清单";
+        for step in &wf.steps {
+            let (active, _) = step.active_roles(topic, "");
+            assert!(!active.contains(&"designer".to_string()), "step {}", step.id);
+            assert!(!active.contains(&"devops".to_string()), "step {}", step.id);
+            assert!(!active.is_empty(), "step {} 不能零 speaker", step.id);
+        }
+        // 反向：涉及界面 + 部署的任务两个角色都该在场。
+        let ui_topic = "重做控制台的前端界面，并接入 CI 自动部署";
+        let all: Vec<String> = wf
+            .steps
+            .iter()
+            .flat_map(|s| s.active_roles(ui_topic, "").0)
+            .collect();
+        assert!(all.contains(&"designer".to_string()));
+        assert!(all.contains(&"devops".to_string()));
+    }
+
+    #[test]
+    fn nested_workflow_step_validation() {        let ok = r#"
 name = "outer"
 [[steps]]
 id = "explore"
@@ -4438,6 +5006,26 @@ output_key = "exploration"
         let raw = include_str!("../../config/workflows/learn_loop.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("learn_loop should validate");
+
+        // prompt 文本断言的归一化：去掉反引号与 markdown 强调符。
+        //
+        // 为什么需要它：这些断言的目的是"某条禁令还在"，而不是"某句中文
+        // 一字不改"。旧版直接 contains 整句（如「禁止出现 `recommended`」），
+        // 结果每次精简 prompt 排版都会红一片测试，却没多挡住任何缺陷。
+        fn norm(s: &str) -> String {
+            s.replace(['`', '*'], "")
+        }
+        // `keyword` 所在行是否带否定词 —— 断言"这条禁令还在"，措辞自由。
+        fn banned(text: &str, keyword: &str) -> bool {
+            let t = norm(text);
+            t.lines().any(|l| {
+                l.contains(keyword)
+                    && ["禁止", "不许", "不要", "不得", "不加", "别"]
+                        .iter()
+                        .any(|n| l.contains(n))
+            })
+        }
+
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["plan", "teach", "quiz", "report"]);
 
@@ -4489,11 +5077,11 @@ output_key = "exploration"
 
         // ── 缺陷 1：答案键不得走 recommended ──
         assert!(
-            plan.task_text().contains("禁止出现 `recommended`"),
+            banned(plan.task_text(), "recommended"),
             "plan 必须禁止把答案标成 recommended"
         );
         assert!(
-            quiz.task_text().contains("禁止添加 `recommended`"),
+            banned(quiz.task_text(), "recommended"),
             "quiz 调 ask 时必须禁止补 recommended"
         );
         assert!(plan.task_text().contains("\"answer\""), "答案应放独立的 answer 字段");
@@ -4504,11 +5092,11 @@ output_key = "exploration"
         // 位置打散已从 plan（靠模型自觉，实测 5 题里 3 题答案仍在第 1 位）
         // 移交给 ask 的 shuffle（程序洗牌）——plan 这边只需说明"位置不用操心"。
         assert!(
-            plan.task_text().contains("位置不用你操心"),
+            norm(plan.task_text()).contains("洗牌") || plan.task_text().contains("shuffle"),
             "plan 应说明位置由 ask 洗牌解决，不再要求模型自己打散"
         );
         assert!(
-            plan.task_text().contains("禁止用 `A`/`B`/`C`/`D`"),
+            banned(plan.task_text(), "A/B/C/D"),
             "plan 必须禁止用纯字母序号当 label"
         );
 
@@ -4638,11 +5226,11 @@ output_key = "exploration"
             "quiz 必须关掉超时兜底"
         );
         assert!(
-            quiz.task_text().contains("绝不按位置"),
+            norm(quiz.task_text()).contains("绝不按位置") && quiz.task_text().contains("label"),
             "洗牌后判分必须按 label 文本匹配"
         );
         assert!(
-            quiz.task_text().contains("`wrong` 只能 +1，绝不允许跳步"),
+            norm(quiz.task_text()).contains("wrong 只能 +1"),
             "quiz 必须把状态推进降级成 wrong+1，不许它自己判状态"
         );
         assert!(
@@ -5989,8 +6577,201 @@ forbid = ["TBD"]
         );
     }
 
-    fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {
-        let mut n = 0;        while let Ok(ev) = rx.try_recv() {
+    // ─── 可选 speaker：引擎级（真跑 run_workflow，数真实模型请求）──
+    //
+    // 上面 `mod tests` 里的测试只覆盖 `active_roles()` 这个判定函数；
+    // 这几条覆盖的是**两个引擎真的把它接上了**——串行与 DAG 是两处
+    // 独立的扇出点，漏接一处就是「配置写了但不生效」的静默失效。
+
+    /// 多角色测试配置（同 tier 同 mock 端点，靠 role_id 区分谁被派）。
+    fn test_config_roles_at(base_url: &str, role_ids: &[&str]) -> Arc<AgentConfig> {
+        let base = test_config_at(base_url);
+        let mut roles = HashMap::new();
+        for id in role_ids {
+            roles.insert(
+                id.to_string(),
+                RoleTemplate {
+                    id: (*id).into(),
+                    name: (*id).into(),
+                    category: "execution".into(),
+                    model_tier: "premium".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                },
+            );
+        }
+        Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: base.models.clone(),
+            roles,
+        })
+    }
+
+    /// 排干事件流：返回 (发过言的 role_id 顺序, Status 消息).
+    fn drain_turns_and_status(
+        rx: &mut broadcast::Receiver<ChatEvent>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut turns = Vec::new();
+        let mut status = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ChatEvent::WorkflowTurn { role_id, .. } => turns.push(role_id),
+                ChatEvent::Status { message } => status.push(message),
+                _ => {}
+            }
+        }
+        (turns, status)
+    }
+
+    /// 串行引擎（无 depends_on）。
+    fn optional_speaker_wf_serial() -> WorkflowDef {
+        toml::from_str(
+            r#"
+name = "opt_serial"
+[[steps]]
+id = "brainstorm"
+speakers = ["arch", "prog"]
+task = "脑暴：{{topic}}"
+output_key = "ideas"
+[[steps.optional_speakers]]
+role = "design"
+when_any = ["ui", "界面"]
+"#,
+        )
+        .expect("valid TOML")
+    }
+
+    /// DAG 引擎（有 depends_on → 走 waves 调度，另一处扇出点）。
+    fn optional_speaker_wf_dag() -> WorkflowDef {
+        toml::from_str(
+            r#"
+name = "opt_dag"
+[[steps]]
+id = "seed"
+role = "arch"
+task = "起个头：{{topic}}"
+output_key = "seed"
+[[steps]]
+id = "brainstorm"
+speakers = ["arch", "prog"]
+depends_on = ["seed"]
+task = "脑暴：{{topic}} / {{seed}}"
+output_key = "ideas"
+[[steps.optional_speakers]]
+role = "design"
+when_any = ["ui", "界面"]
+"#,
+        )
+        .expect("valid TOML")
+    }
+
+    async fn mock_server_always_ok() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "这是一份足够详实的产出，覆盖方案概述与取舍依据，没有占位内容。",
+            )))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// 串行引擎：topic 无界面词 → designer 一次模型请求都不该发生。
+    #[tokio::test]
+    async fn serial_engine_skips_optional_speaker_when_topic_misses() {
+        let server = mock_server_always_ok().await;
+        let (ctx, mut rx) =
+            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        run_workflow(
+            &optional_speaker_wf_serial(),
+            "为 jemalloc 编排从浅到深的学习路径与任务清单",
+            &ctx,
+        )
+        .await
+        .expect("workflow 应成功");
+
+        let (turns, status) = drain_turns_and_status(&mut rx);
+        assert_eq!(turns, vec!["arch", "prog"], "designer 不该发言");
+        // 真实模型请求数是最硬的证据：没派就不会有第 3 个请求。
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "只应有 2 个 speaker 各一次请求"
+        );
+        assert!(
+            status.iter().any(|m| m.contains("跳过可选角色 design")),
+            "应发出跳过原因的 Status: {status:?}"
+        );
+    }
+
+    /// 串行引擎：topic 有界面词 → designer 正常参与（第 3 个请求）。
+    #[tokio::test]
+    async fn serial_engine_dispatches_optional_speaker_when_topic_hits() {
+        let server = mock_server_always_ok().await;
+        let (ctx, mut rx) =
+            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        run_workflow(&optional_speaker_wf_serial(), "重做设置页的界面", &ctx)
+            .await
+            .expect("workflow 应成功");
+
+        let (turns, status) = drain_turns_and_status(&mut rx);
+        assert_eq!(turns, vec!["arch", "prog", "design"], "designer 应在场");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert!(
+            !status.iter().any(|m| m.contains("跳过可选角色")),
+            "命中时不应发跳过 Status: {status:?}"
+        );
+    }
+
+    /// DAG 引擎是**另一处**扇出点，必须单独覆盖——只接串行那处的话
+    /// 带 depends_on 的 workflow（design_and_plan 就是）完全不生效。
+    #[tokio::test]
+    async fn dag_engine_skips_optional_speaker_when_topic_misses() {
+        let server = mock_server_always_ok().await;
+        let wf = optional_speaker_wf_dag();
+        assert!(wf.uses_dependency_dag(), "本用例必须走 DAG 引擎");
+        let (ctx, mut rx) =
+            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        run_workflow(&wf, "为 jemalloc 编排学习路径", &ctx)
+            .await
+            .expect("workflow 应成功");
+
+        let (turns, status) = drain_turns_and_status(&mut rx);
+        // seed(arch) + brainstorm(arch, prog)，无 design。
+        assert_eq!(turns, vec!["arch", "arch", "prog"], "designer 不该发言");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            3,
+            "seed 1 次 + brainstorm 2 个 speaker"
+        );
+        assert!(
+            status.iter().any(|m| m.contains("跳过可选角色 design")),
+            "DAG 引擎也要发跳过 Status: {status:?}"
+        );
+    }
+
+    /// DAG 引擎命中时正常参与（第 4 个请求）。
+    #[tokio::test]
+    async fn dag_engine_dispatches_optional_speaker_when_topic_hits() {
+        let server = mock_server_always_ok().await;
+        let (ctx, mut rx) =
+            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        run_workflow(&optional_speaker_wf_dag(), "把 UI 重构一遍", &ctx)
+            .await
+            .expect("workflow 应成功");
+
+        let (turns, _) = drain_turns_and_status(&mut rx);
+        assert_eq!(turns, vec!["arch", "arch", "prog", "design"]);
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {        let mut n = 0;        while let Ok(ev) = rx.try_recv() {
             if matches!(ev, ChatEvent::WorkflowTurn { .. }) {
                 n += 1;
             }

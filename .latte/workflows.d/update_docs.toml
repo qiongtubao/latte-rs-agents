@@ -3,7 +3,7 @@
 # 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
 
 name = "update_docs"
-description = "看代码写文档：取证分析 → 文档撰写 → 终审"
+description = "看代码写文档：取证分析 → 文档撰写 → 终审｜落点：文档文件"
 max_rounds = 1
 
 [[steps]]

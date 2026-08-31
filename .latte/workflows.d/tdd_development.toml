@@ -7,7 +7,7 @@
 # 步骤间用 output_key 显式穿线（跨步骤只传 output_key 变量）。
 
 name = "tdd_development"
-description = "TDD 开发：测试先行 → 实现（四态报告）→ 规格审查 → 质量审查"
+description = "TDD 开发：测试先行 → 实现（四态报告）→ 规格审查 → 质量审查｜落点：代码改动 + 测试"
 max_rounds = 1
 
 [[steps]]

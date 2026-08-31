@@ -36,7 +36,7 @@
 
 name = "task_refine"
 command = "/task-refine"
-description = "任务细化：拆分草案 → reviewer 评审 → 终审门(REJECT 自动返工) → important 定向修补 → plan 提交用户勾选"
+description = "任务细化：拆分草案 → reviewer 评审 → 终审门(REJECT 自动返工) → important 定向修补 → plan 提交用户勾选｜落点：任务看板条目（plan 弹窗勾选导入）"
 max_rounds = 1
 
 [[steps]]

@@ -4,7 +4,7 @@
 
 name = "implementation_plan"
 command = "/plan"
-description = "实现规划：架构拆解 → 任务清单(JSON) → 终审"
+description = "实现规划：架构拆解 → 任务清单(JSON) → 终审｜落点：任务看板条目（plan 弹窗勾选导入）"
 max_rounds = 1
 
 [[steps]]

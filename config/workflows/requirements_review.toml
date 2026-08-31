@@ -5,7 +5,7 @@
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "requirements_review"
-description = "PM 阐述需求，团队讨论可行性和范围。"
+description = "PM 阐述需求，团队讨论可行性和范围。｜落点：对话里的需求结论"
 max_rounds = 1
 
 [[steps]]

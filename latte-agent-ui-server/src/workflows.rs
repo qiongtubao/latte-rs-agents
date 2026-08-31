@@ -195,6 +195,10 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // step 级工具过滤仅 TOML 权威版可配；表单编辑器不支持，
                 // 试运行给空（= 角色全集）。
                 tools: vec![],
+                // 可选 speaker 同样只在 TOML 权威版可配：表单里的
+                // speakers 一律按无条件处理（空 = 无可选角色，现状行为）。
+                // 保存走 TOML 原文，不经此函数，不会丢 toml 里的配置。
+                optional_speakers: vec![],
             })
             .collect(),
     }

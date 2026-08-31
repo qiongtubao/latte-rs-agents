@@ -1,6 +1,6 @@
 # Workflow: update_graph — 更新图谱
 name = "update_graph"
-description = "图谱更新流水线：结构分析 → 图谱更新 → Reviewer 终审"
+description = "图谱更新流水线：结构分析 → 图谱更新 → Reviewer 终审｜落点：图谱文件"
 max_rounds = 1
 
 [[steps]]

@@ -3,7 +3,7 @@
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "tech_director_dispatch"
-description = "技术总监拆解任务，分派给 PM/架构师/程序员/测试员，然后综合总结。"
+description = "技术总监拆解任务，分派给 PM/架构师/程序员/测试员，然后综合总结。｜落点：对话里的综合答复"
 max_rounds = 1
 context_token_budget = 32000
 [[steps]]

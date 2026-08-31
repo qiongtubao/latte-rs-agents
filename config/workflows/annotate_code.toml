@@ -11,7 +11,7 @@
 # 步骤间用 output_key 显式穿线（引擎跨步骤只传 output_key 变量）。
 
 name = "annotate_code"
-description = "代码注释流水线：定位流程代码 → 加注释 → 独立核验注释准确性"
+description = "代码注释流水线：定位流程代码 → 加注释 → 独立核验注释准确性｜落点：源码文件里的注释"
 max_rounds = 1
 
 [[steps]]

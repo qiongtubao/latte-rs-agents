@@ -1,6 +1,6 @@
 # Workflow: feature_design — 设计功能/方案讨论
 name = "feature_design"
-description = "功能设计流水线：PM 需求 → 架构师方案 → Reviewer 终审"
+description = "功能设计流水线：PM 需求 → 架构师方案 → Reviewer 终审｜落点：对话里的功能方案"
 max_rounds = 1
 
 [[steps]]

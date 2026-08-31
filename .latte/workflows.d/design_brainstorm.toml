@@ -3,7 +3,7 @@
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "design_brainstorm"
-description = "关于架构或特性设计的开放式创意讨论。"
+description = "关于架构或特性设计的开放式创意讨论。｜落点：对话里的设计方案"
 max_rounds = 2
 [[steps]]
 id = "context"
@@ -11,12 +11,31 @@ speakers = ["pm"]
 prompt = "描述这个需求和目标：{{topic}}。我们要解决什么样的用户需求？"
 [[steps]]
 id = "brainstorm"
-speakers = ["architect", "programmer", "designer"]
-prompt = "头脑风暴各种方案。Architect：系统设计选项。Programmer：实现层面的实际考量。Designer：UX 影响。在彼此想法的基础上推进。"
+speakers = ["architect", "programmer"]
+prompt = "头脑风暴各种方案。只谈属于你这个角色职责的那部分——architect 谈系统设计选项，programmer 谈实现层面的实际考量，designer 谈 UX 影响；本步不一定三个角色都在场，不要替不在场的角色代笔。在彼此想法的基础上推进。"
+# 与 config/workflows/design_brainstorm.toml 同步：designer 只在任务
+# 真的涉及界面时才派（`[[steps.optional_speakers]]` 必须写在本 step
+# 全部标量键之后，否则后续键会被 TOML 归进子表）。
+[[steps.optional_speakers]]
+role = "designer"
+when_any = [
+  "ui", "ux", "gui", "css", "html", "frontend", "figma", "wcag",
+  "界面", "前端", "交互", "视觉", "设计稿", "原型", "布局", "样式",
+  "用户体验", "可访问性", "组件库", "页面",
+]
 [[steps]]
 id = "evaluate"
-speakers = ["reviewer", "security", "devops"]
-prompt = "评估提出的方案。考虑：可维护性、安全性和运维成本。"
+speakers = ["reviewer", "security"]
+prompt = "评估提出的方案。按你的角色职责给出评估——reviewer 看可维护性，security 看安全性，devops 看运维成本；本步不一定三个角色都在场，只评属于你职责范围内的那部分。"
+# 同步：devops 只在任务真的涉及部署/CI/运维时才派。
+[[steps.optional_speakers]]
+role = "devops"
+when_any = [
+  "ci", "cd", "docker", "k8s", "kubernetes", "deploy", "pipeline",
+  "terraform", "ansible", "helm", "makefile", "cmake",
+  "部署", "发布", "上线", "运维", "流水线", "容器", "镜像",
+  "监控", "告警", "灰度", "回滚", "集群",
+]
 [[steps]]
 id = "synthesize"
 speakers = ["architect", "pm"]

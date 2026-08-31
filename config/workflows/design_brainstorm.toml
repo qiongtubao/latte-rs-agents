@@ -5,7 +5,7 @@
 # 格式说明参考 config/workflows/bug_triage.toml 头部注释。
 
 name = "design_brainstorm"
-description = "关于架构或特性设计的开放式创意讨论。"
+description = "关于架构或特性设计的开放式创意讨论。｜落点：对话里的设计方案"
 max_rounds = 1
 
 [[steps]]
@@ -18,19 +18,37 @@ prompt = "描述这个需求和目标：{{topic}}。我们要解决什么样的�
 [[steps]]
 id = "brainstorm"
 description = "多角色方案脑暴"
-speakers = ["architect", "programmer", "designer"]
+speakers = ["architect", "programmer"]
 output_key = "ideas"
 prompt = """主题：{{topic}}
 
 需求背景：
 {{context}}
 
-头脑风暴各种方案。Architect：系统设计选项。Programmer：实现层面的实际考量。Designer：UX 影响。在彼此想法的基础上推进。"""
+头脑风暴各种方案。**只谈属于你这个角色职责的那部分**——architect 谈系统设计选项，
+programmer 谈实现层面的实际考量，designer 谈 UX 影响；本步不一定三个角色都在场，
+不要替不在场的角色代笔，也不要为了凑齐视角而越权。在彼此想法的基础上推进。"""
+# designer 只在任务真的涉及界面时才派。实测实锤：给「编排 jemalloc
+# 源码学习路径」这种没有界面的任务派 designer，它只有两条路——交
+# 「三个岔路待 manager 拍板」的元讨论，或越权替 architect 写 C 源码级
+# 分析——两条都被 advisor 返回审查判 intervene 触发重做，重做也救不
+# 回来（角色本身就不该来）。那次分派 7 次调用、约 142K input tokens
+# 全废。关键词匹配 topic（用户诉求原文，跨 step 稳定），纯 ASCII 词
+# 按词边界匹配，所以 "ui" 不会被 build/guide/require 误命中。
+# ⚠️ TOML 语法：`[[steps.optional_speakers]]` 之后的键都归属子表，
+# 所以它必须写在本 step 全部标量键之后。
+[[steps.optional_speakers]]
+role = "designer"
+when_any = [
+  "ui", "ux", "gui", "css", "html", "frontend", "figma", "wcag",
+  "界面", "前端", "交互", "视觉", "设计稿", "原型", "布局", "样式",
+  "用户体验", "可访问性", "组件库", "页面",
+]
 
 [[steps]]
 id = "evaluate"
 description = "评审团评估方案"
-speakers = ["reviewer", "security", "devops"]
+speakers = ["reviewer", "security"]
 output_key = "evaluation"
 # reviewer / security 本身就是只读角色；devops 带 bash + write，评审
 # 步骤不需要——统一收紧成只读，防止"评审"滑成"顺手改一改"。
@@ -40,7 +58,23 @@ prompt = """主题：{{topic}}
 待评估的方案：
 {{ideas}}
 
-评估上面 brainstorm 提出的方案。考虑：可维护性、安全性和运维成本。"""
+评估上面 brainstorm 提出的方案。按你的角色职责给出评估——reviewer 看可维护性，
+security 看安全性，devops 看运维成本；本步不一定三个角色都在场，只评属于你
+职责范围内的那部分，不要替不在场的角色补位。"""
+# devops 同理只在任务真的涉及部署/CI/运维时才派。实测实锤：同一次
+# 会话里 devops 被派去做「学习路径 + 22 张任务卡」，25 次调用、约
+# 404K input tokens、2.6 万字产出全部作废——advisor 判「交付的 80%
+# 是源码学习路径设计，角色越权」，重做后交回一份零工具调用的元评论。
+# 注意关键词里**不含「构建」**：中文里「构建一个 X」常指抽象的搭建，
+# 会把纯设计话题误判成基建话题。
+[[steps.optional_speakers]]
+role = "devops"
+when_any = [
+  "ci", "cd", "docker", "k8s", "kubernetes", "deploy", "pipeline",
+  "terraform", "ansible", "helm", "makefile", "cmake",
+  "部署", "发布", "上线", "运维", "流水线", "容器", "镜像",
+  "监控", "告警", "灰度", "回滚", "集群",
+]
 
 [[steps]]
 id = "synthesize"

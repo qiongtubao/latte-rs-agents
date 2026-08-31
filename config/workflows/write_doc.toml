@@ -19,7 +19,7 @@
 # （config/agents/tech_writer.toml 已配）。
 
 name = "write_doc"
-description = "写一篇 doc-graph 文档：预读相关 → 写正文 → 重建索引 → 终审"
+description = "写一篇 doc-graph 文档：预读相关 → 写正文 → 重建索引 → 终审｜落点：doc-graph 文档文件 + docs/index.md"
 max_rounds = 1
 
 # ── plan：分析 + 预读，产出 doc_write 参数 ─────────────────────────

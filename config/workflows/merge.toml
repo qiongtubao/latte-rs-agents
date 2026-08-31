@@ -4,7 +4,7 @@
 # 合并动作本身由人完成。
 
 name = "merge"
-description = "合并准备：最终验证 → 提交包 → 终审"
+description = "合并准备：最终验证 → 提交包 → 终审｜落点：对话里的合并结论与提交包"
 max_rounds = 1
 
 [[steps]]

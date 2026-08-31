@@ -3,7 +3,7 @@
 # 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
 
 name = "bug_triage"
-description = "Bug 分诊：复现定界 → 根因诊断 → 修复方案 → 终审裁决"
+description = "Bug 分诊：复现定界 → 根因诊断 → 修复方案 → 终审裁决｜落点：对话里的分诊结论与修复方案"
 max_rounds = 1
 
 [[steps]]

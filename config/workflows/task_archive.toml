@@ -3,7 +3,7 @@
 # 任务进入 done 时自动执行，产出写入 .latte/tasks/archive/<id>.md。
 
 name = "task_archive"
-description = "任务存档：全生命周期整理 → 归档记录"
+description = "任务存档：全生命周期整理 → 归档记录｜落点：归档记录文档"
 max_rounds = 1
 
 [[steps]]

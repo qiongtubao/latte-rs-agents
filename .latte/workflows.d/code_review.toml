@@ -4,7 +4,7 @@
 # 也是任务看板 human_review 阶段自动执行的审查流程。
 
 name = "code_review"
-description = "代码审查：变更说明 → 多角度审查 → 回应 → 终审"
+description = "代码审查：变更说明 → 多角度审查 → 回应 → 终审｜落点：对话里的审查结论"
 max_rounds = 1
 
 [[steps]]

@@ -9,7 +9,7 @@
 
 name = "design_and_plan"
 command = "/design-and-plan"
-description = "组合 workflow：探索→设计脑暴→实现计划串行链 + 评审并行组（嵌套组合示例）"
+description = "组合 workflow：探索→设计脑暴→实现计划串行链 + 评审并行组（嵌套组合示例）｜落点：任务看板条目（链尾拆出任务清单）"
 max_rounds = 1
 # 文档暂存：中途步骤的 write 先落 .latte/staging/<wf_id>/（read 优先读
 # 暂存副本），整个 workflow ok 才提升到目标路径——未终审的文档不进仓库。
