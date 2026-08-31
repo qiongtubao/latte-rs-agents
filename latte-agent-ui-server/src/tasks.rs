@@ -274,8 +274,22 @@ impl TaskStore {
                     continue;
                 }
                 if let Ok(raw) = std::fs::read_to_string(&path) {
-                    if let Ok(t) = serde_json::from_str::<Task>(&raw) {
-                        tasks.insert(t.id.clone(), t);
+                    match serde_json::from_str::<Task>(&raw) {
+                        Ok(t) => {
+                            tasks.insert(t.id.clone(), t);
+                        }
+                        // 解析失败原来是静默 `continue`：手写或外部工具
+                        // 生成的任务文件少一个必填字段（`note` /
+                        // `created_at` / `updated_at` 都没有 serde
+                        // default），就毫无提示地**不出现在看板里**。
+                        // 实测踩过：造的两个任务文件一直不显示，查到
+                        // 这里才发现被吞了。
+                        Err(e) => {
+                            eprintln!(
+                                "[tasks] 跳过无法解析的任务文件 {}: {e}",
+                                path.display()
+                            );
+                        }
                     }
                 }
             }

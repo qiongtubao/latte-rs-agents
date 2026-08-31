@@ -306,6 +306,46 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
 mod tests {
     use super::*;
 
+    /// 高产角色必须带**篇幅约束**。
+    ///
+    /// 起因：一次实测会话里 25 次「万字级」交付合计占掉 37% 的总模型
+    /// 时间——单份 2.5 万字的文档要独占 254 秒，期间整条流水线在等。
+    /// 而这些角色的 prompt 原来对篇幅**一个字都没提**。
+    ///
+    /// 刻意不用 `output_contract.max_chars` 强制：那条路超限即重试，
+    /// 而重试是整份重新生成，硬加反而可能更慢。所以走 prompt 软约束。
+    #[test]
+    fn high_output_roles_declare_a_length_budget() {
+        // 这些角色在实测里都产出过万字级交付。
+        for id in [
+            "architect",
+            "programmer",
+            "designer",
+            "security",
+            "reviewer",
+            "devops",
+            "pm",
+        ] {
+            let p = for_role(id).unwrap_or_else(|| panic!("missing prompt for '{id}'"));
+            assert!(
+                p.contains("## 篇幅"),
+                "角色 '{id}' 的 prompt 缺少「篇幅」约束段"
+            );
+            // pm 沿用它自己的 300 字规则，其余给显式上限。
+            if id == "pm" {
+                assert!(
+                    p.contains("300 字以内"),
+                    "pm 应沿用既有的 300 字上限，而不是另立一个更宽的数值"
+                );
+            } else {
+                assert!(
+                    p.contains("默认上限"),
+                    "角色 '{id}' 应给出明确的字数上限"
+                );
+            }
+        }
+    }
+
     /// Every role declared by `prompts::template_for` below must
     /// have a matching prompt here. Adding a role upstream
     /// without adding the prompt constant will fail this test.

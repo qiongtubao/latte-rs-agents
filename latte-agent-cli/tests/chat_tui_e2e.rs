@@ -299,6 +299,89 @@ fn multi_line_command_output_is_batched() {
     );
 }
 
+/// 控制命令必须**带外**生效：turn 进行中输入 `/pause` 应立刻暂停，
+/// 而不是排到 turn 结束后。
+///
+/// 普通输入走 mpsc 队列，而队列的消费方（REPL 主循环）在 turn 期间正忙。
+/// 实测：排队时 `⏸ 已暂停` 出现在 `TurnEnd` **之后**（12144 → 13431），
+/// 对 `/pause` 等于完全失效——想暂停的恰恰是那个正在跑的 turn。
+#[test]
+fn pause_takes_effect_during_a_turn_not_after() {
+    if !python3_available() {
+        eprintln!("[skip] python3 不可用，跳过 pty 交互测试");
+        return;
+    }
+    let cwd = scratch_dir("pause");
+    let out = drive(
+        &cwd,
+        &[
+            ("4.0", "依次读 seed.txt 三次，每次单独调用工具"),
+            ("8.0", "/pause"),
+            ("10.0", "/resume"),
+            ("35.0", "/quit"),
+        ],
+    );
+    let paused = out.find("已暂停");
+    let resumed = out.find("已恢复");
+    let turn_end = out.find("TurnEnd");
+    let (Some(p), Some(r), Some(t)) = (paused, resumed, turn_end) else {
+        panic!(
+            "应同时出现 已暂停 / 已恢复 / TurnEnd：\n{}",
+            tail(&out)
+        );
+    };
+    assert!(
+        p < t,
+        "/pause 必须在 turn 期间即时生效（已暂停@{p} 应早于 TurnEnd@{t}）：\n{}",
+        tail(&out)
+    );
+    assert!(r < t, "/resume 也应在 turn 期间生效（已恢复@{r} vs TurnEnd@{t}）");
+}
+
+/// 新命令的错误路径必须有反馈，且不能崩会话。
+///
+/// 实测抓到过一个静默吞输入的 bug：`/stream maybe` 既不匹配带外的三个
+/// 精确串，又被 `handle_command` 的 `"/stream"` 分支（只看首词）当合法
+/// 处理，用户打错参数**完全没有反馈**。
+#[test]
+fn new_command_error_paths_give_feedback() {
+    if !python3_available() {
+        eprintln!("[skip] python3 不可用，跳过 pty 交互测试");
+        return;
+    }
+    let cwd = scratch_dir("errpaths");
+    let out = drive(
+        &cwd,
+        &[
+            ("4.0", "/wf"),                      // 缺参数
+            ("1.5", "/wf nosuch topic"),         // 不存在的 workflow
+            ("2.0", "/wf-resume"),               // 缺参数
+            ("1.5", "/wf-resume ../etc/passwd"), // 路径穿越
+            ("1.5", "/stream maybe"),            // 非法参数
+            ("1.5", "/quit"),
+        ],
+    );
+    for (what, needle) in [
+        ("/wf 缺参数", "usage: /wf <name>"),
+        ("不存在的 workflow", "可用 workflow:"),
+        ("/wf-resume 缺参数", "usage: /wf-resume"),
+        ("路径穿越", "invalid resume wf_id"),
+        ("/stream 非法参数", "未知参数"),
+    ] {
+        assert!(
+            out.contains(needle),
+            "{what} 应给出反馈（找不到 `{needle}`）：\n{}",
+            tail(&out)
+        );
+    }
+    // 会话必须活到 /quit（错误路径不能崩）。
+    assert!(
+        out.contains("SessionEnd"),
+        "错误路径不该终结会话：\n{}",
+        tail(&out)
+    );
+}
+
 fn tail(s: &str) -> String {
     let n = s.chars().count();
     s.chars().skip(n.saturating_sub(1200)).collect()

@@ -777,7 +777,16 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {    match e {
         AiError::Api { status, .. } => match *status {
             429 => Some(Duration::from_secs(60)),
             500..=599 => Some(Duration::from_secs(30)),
-            // 4xx (other than 429) usually means "this model id doesn't
+            // 402 Payment Required / 余额不足：在**本次会话内不会自愈**
+            // ——充值是人的动作，不是等一会儿就好。5s 冷却意味着每轮
+            // 失败切换都要再白烧它一次：实测 jemalloc 那次 61 分钟的
+            // 会话里，`deepseek-v4-flash: 402 Insufficient Balance`
+            // 出现在每一次全链失败的日志里，每次都占掉一整个往返。
+            //
+            // 给一个远超正常会话时长的冷却，等价于"本次会话内摘掉它"，
+            // 但不需要改配置、也不会永久禁用（新进程重新试一次）。
+            402 => Some(Duration::from_secs(24 * 3600)),
+            // 4xx (other than 429/402) usually means "this model id doesn't
             // exist on this vendor" or "bad request payload for this
             // model". Walking the fallback chain is still worth it
             // because the next model may have a different id format or
@@ -4212,6 +4221,38 @@ mod tests {
             message: "burst".into(),
         });
         assert_eq!(d, Some(Duration::from_secs(1)));
+    }
+
+    /// 402（余额不足）必须**长冷却**，不能按普通 4xx 的 5s 处理。
+    ///
+    /// 余额不足在本次会话内不会自愈——充值是人的动作。5s 冷却意味着每轮
+    /// 失败切换都要再白烧它一次：实测 jemalloc 那次 61 分钟的会话里，
+    /// `deepseek-v4-flash: 402 Insufficient Balance` 出现在每一次全链
+    /// 失败的日志里，每次都占掉一整个往返。
+    #[test]
+    fn test_cooldown_for_402_is_effectively_session_long() {
+        let d = cooldown_for_error(&AiError::Api {
+            status: 402,
+            message: "Insufficient Balance".into(),
+        })
+        .expect("402 应有冷却");
+        // 远超任何正常会话时长；但不是永久禁用（新进程重新试一次）。
+        assert!(
+            d >= Duration::from_secs(3600),
+            "402 的冷却应远超会话时长，实际 {d:?}"
+        );
+        // 对照：其余 4xx 仍是短冷却（可能是模型 id 写错，下一个模型
+        // 换个 id 格式就能成，值得快速重试）。
+        for status in [400u16, 401, 403, 404, 422] {
+            let other = cooldown_for_error(&AiError::Api {
+                status,
+                message: "bad".into(),
+            });
+            assert!(
+                other.is_some_and(|o| o < Duration::from_secs(600)),
+                "status {status} 不该跟 402 一样长冷却"
+            );
+        }
     }
 
     #[test]

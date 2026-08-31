@@ -574,41 +574,17 @@ impl ChatSession {
         //
         // 分离模式才启用：非 TTY（管道 / e2e）没有 Ctrl-C 来源，直接
         // await 保持原路径逐字节不变。
-        let result = if split {
-            turn_cancel_flag().store(false, std::sync::atomic::Ordering::SeqCst);
-            turn_in_flight().store(true, std::sync::atomic::Ordering::SeqCst);
-            // runner 是 `&mut self` 借用，移不进 `tokio::spawn`，所以用
-            // `select!` 与取消轮询竞速：取消胜出时 `run_turn` 的 future
-            // 被丢弃，等价于 abort（在途 HTTP 与工具循环一起停）。
-            let outcome = {
-                let cancel_watch = async {
-                    loop {
-                        if turn_cancel_flag().load(std::sync::atomic::Ordering::SeqCst) {
-                            return;
-                        }
-                        tokio::time::sleep(Duration::from_millis(120)).await;
-                    }
-                };
-                tokio::select! {
-                    r = self.runner.run_turn(&msgs, None) => Some(r),
-                    _ = cancel_watch => None,
-                }
-            };
-            turn_in_flight().store(false, std::sync::atomic::Ordering::SeqCst);
-            match outcome {
-                Some(r) => r,
-                None => {
-                    ui_emit("⛔ 本轮已中止（Ctrl-C）");
-                    ui_set_activity(None);
-                    // 用哨兵串标识"用户主动中止"，与真正的 turn 失败区分。
-                    // 不区分的话：REPL 主循环拿到 Err 会 auto-save +
-                    // 打印 `turn failed` + **退出整个会话**——而用户
-                    // 按 Ctrl-C 只想停这一轮（实测复现）。
-                    return Err(TURN_CANCELLED.into());
-                }
+        let result = match run_cancellable(self.runner.run_turn(&msgs, None)).await {
+            Some(r) => r,
+            None => {
+                ui_emit("⛔ 本轮已中止（Ctrl-C）");
+                ui_set_activity(None);
+                // 用哨兵串标识"用户主动中止"，与真正的 turn 失败区分。
+                // 不区分的话：REPL 主循环拿到 Err 会 auto-save +
+                // 打印 `turn failed` + **退出整个会话**——而用户
+                // 按 Ctrl-C 只想停这一轮（实测复现）。
+                return Err(TURN_CANCELLED.into());
             }
-        } else {
-            self.runner.run_turn(&msgs, None).await
         };
         match spinner {
             Some(sp) => sp.stop(),
@@ -658,6 +634,146 @@ impl ChatSession {
             "/exit" | "/quit" => return Ok(true),
             "/help" => {
                 print_help();
+            }
+            // 任务看板（对齐 UI 的 GET /api/tasks）。
+            //
+            // 只做**只读列出**：manager 的 `plan` 工具往看板提交候选、
+            // `task_report` 回报结果，两者我都已接进 CLI，但用户此前
+            // 完全看不到看板内容。写操作（import / dispatch / abort）
+            // 牵扯派发调度，先不做——CLI 侧的价值主要是"看得见"。
+            "/tasks" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                match latte_agent_ui_server::tasks::TaskStore::load(&cwd) {
+                    Ok(store) => {
+                        let mut tasks = store.list();
+                        if tasks.is_empty() {
+                            ui_out("任务看板为空（.latte/tasks/board.json）");
+                        } else {
+                            // 按状态分组更好读：待办的在前。
+                            tasks.sort_by(|a, b| {
+                                a.state.cmp(&b.state).then(b.priority.cmp(&a.priority))
+                            });
+                            let mut buf = format!("任务看板（{} 项）：", tasks.len());
+                            for t in tasks.iter().take(40) {
+                                buf.push_str(&format!(
+                                    "\n  [{}] {} — {}",
+                                    t.state,
+                                    t.id,
+                                    first_line_brief(&t.title, 60)
+                                ));
+                            }
+                            if tasks.len() > 40 {
+                                buf.push_str(&format!("\n  …还有 {} 项", tasks.len() - 40));
+                            }
+                            ui_out(&buf);
+                        }
+                    }
+                    Err(e) => ui_out(&format!("读不到任务看板：{e}")),
+                }
+            }
+            // 会话分叉（对齐 UI 的 /api/sessions/fork）。终端里没有"多标签"
+            // 概念，所以落成"导出可继续的快照"：写一个 JSONL，之后用
+            // `latte-agent chat --resume <file>` 另起一个会话接着聊，
+            // 当前会话不受影响。
+            "/fork" => {
+                let path = rest.first().map(|s| s.to_string()).unwrap_or_else(|| {
+                    format!(
+                        "fork-{}.jsonl",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0)
+                    )
+                });
+                let msgs = self.runner.context().messages().to_vec();
+                let n = msgs.len();
+                match save_session(&path, &msgs) {
+                    Ok(()) => ui_out(&format!(
+                        "🍴 已分叉 {n} 条消息 → {path}\n用 `latte-agent chat --resume {path}` 继续；当前会话不受影响"
+                    )),
+                    Err(e) => ui_out(&format!("分叉失败：{e}")),
+                }
+            }
+            // ── 暂停门（对齐 UI 的 ⏸/▶ 与 /api/chat/pause|resume）──
+            //
+            // 与 Ctrl-C 的分工：Ctrl-C 是**中止**（丢弃 future，本轮作废），
+            // /pause 是**暂停**（在工具轮边界停住，不打断在飞的 HTTP，
+            // /resume 后原地继续）。想停一下去改配置时用后者。
+            // 分离模式下这几条已被输入线程带外拦截，走不到这里；
+            // 非 TTY（管道 / e2e）没有输入线程，仍需这条兜底路径。
+            "/pause" | "/resume" | "/cancel" => {
+                handle_out_of_band(cmd);
+            }
+            "/stream" => {
+                // 非 TTY 兜底（分离模式下已被带外拦截）。整行透传，
+                // 让带外那边做统一的参数校验。
+                handle_out_of_band(line.trim());
+            }
+            // 落盘的待办弹框（对齐 UI 的 /api/chat/pending-prompts）。
+            // `.latte/pending-asks/` 一直在写（我接 ask 工具时带上了
+            // 落盘归属），但 CLI 没有读回入口——进程重启后那些没答完的
+            // 提问就永远看不见了。
+            "/pending" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                let items = latte_agent_core::pending_ask::load_for_session(
+                    &cwd,
+                    &cli_session_id(),
+                );
+                if items.is_empty() {
+                    ui_out("没有待办弹框");
+                } else {
+                    let mut buf = format!("待办弹框（{} 个）：", items.len());
+                    for it in &items {
+                        buf.push_str(&format!(
+                            "\n  {} (wf_id={})",
+                            it.choice_id,
+                            if it.wf_id.is_empty() { "-" } else { &it.wf_id }
+                        ));
+                    }
+                    buf.push_str("\n注：CLI 暂不支持直接回答历史弹框，可用 /wf-resume <wf_id> 续跑触发重问");
+                    ui_out(&buf);
+                }
+            }
+            // ── workflow 操作面（对齐 UI 的 /api/workflows/*）──
+            "/wf" => {
+                let Some(name) = rest.first() else {
+                    ui_println!("usage: /wf <name> <topic…>");
+                    return Ok(false);
+                };
+                let topic = rest[1..].join(" ");
+                if topic.trim().is_empty() {
+                    ui_println!("usage: /wf <name> <topic…>（topic 不能为空）");
+                    return Ok(false);
+                }
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                cmd_run_workflow(
+                    &self.merged,
+                    &self.resolver,
+                    &self.default_params,
+                    &cwd,
+                    name,
+                    &topic,
+                )
+                .await;
+            }
+            "/wf-runs" => {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                cmd_list_workflow_runs(&cwd);
+            }
+            "/wf-resume" => {
+                let Some(wf_id) = rest.first() else {
+                    ui_println!("usage: /wf-resume <wf_id>（用 /wf-runs 列出）");
+                    return Ok(false);
+                };
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                cmd_resume_workflow(
+                    &self.merged,
+                    &self.resolver,
+                    &self.default_params,
+                    &cwd,
+                    wf_id,
+                )
+                .await;
             }
             "/roles" => {
                 let mut ids: Vec<&String> = self.merged.roles.keys().collect();
@@ -1146,6 +1262,11 @@ async fn build_runner(
             AgentRunner::new_with_tools(agent, tm)
                 .with_sink(cli_top_level_sink(&sink))
                 .with_hooks(Arc::clone(&hooks))
+                // 顶层 turn 也过暂停门，否则 /pause 只能停 workflow 里的
+                // 子代理，停不了 manager 自己的工具轮。
+                .with_agent_pause_gate(cli_pause_gate())
+                // 流式开关（/stream）：共享 AtomicBool，运行中改也生效。
+                .with_stream_mode(cli_stream_mode())
                 .with_role(role_id)
         )
     } else {
@@ -1153,6 +1274,8 @@ async fn build_runner(
             AgentRunner::new(agent)
                 .with_sink(cli_top_level_sink(&sink))
                 .with_hooks(Arc::clone(&hooks))
+                .with_agent_pause_gate(cli_pause_gate())
+                .with_stream_mode(cli_stream_mode())
                 .with_role(role_id)
         )
     };
@@ -1544,7 +1667,9 @@ fn cli_workflow_ctx_on(
         event_tx,
         cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_cancel_flag: None,
-        agent_pause_gate: None, // CLI REPL workflow：无 session agent gate
+        // 会话级暂停门（/pause /resume）。原来是 None——chat 里完全没有
+        // 暂停能力，跑一半的 workflow 只能 Ctrl-C 整个中止。
+        agent_pause_gate: Some(cli_pause_gate()),
         depth: 0,
         // 顶层 run：自己就是嵌套链的根。
         root_wf_id: None,
@@ -1572,6 +1697,10 @@ struct AskRequest {
     role_id: String,
     question: String,
     multi: bool,
+    /// 模型请求了"允许上传"。终端无此通道，只能提示用户改用文字。
+    allow_upload: bool,
+    /// `"grid"` = 图片网格。终端画不了，降级成列表并说明。
+    layout: String,
     options: Vec<latte_agent_core::controller::ChoiceOption>,
 }
 
@@ -1586,7 +1715,15 @@ type AskAnswerer = Arc<
 fn terminal_ask_answerer() -> AskAnswerer {
     Arc::new(|req: AskRequest| {
         Box::pin(async move {
-            prompt_choice_on_terminal(&req.role_id, &req.question, req.multi, &req.options).await
+            prompt_choice_on_terminal(
+                &req.role_id,
+                &req.question,
+                req.multi,
+                req.allow_upload,
+                &req.layout,
+                &req.options,
+            )
+            .await
         })
     })
 }
@@ -1628,6 +1765,8 @@ fn spawn_cli_workflow_event_consumer_with(
                     multi,
                     wait,
                     options,
+                    allow_upload,
+                    layout,
                     ..
                 }) => {
                     if !wait {
@@ -1639,7 +1778,14 @@ fn spawn_cli_workflow_event_consumer_with(
                         ));
                         continue;
                     }
-                    let req = AskRequest { role_id, question, multi, options };
+                    let req = AskRequest {
+                        role_id,
+                        question,
+                        multi,
+                        allow_upload,
+                        layout,
+                        options,
+                    };
                     let answer = match answerer(req).await {
                         Some(a) => a,
                         None => {
@@ -1770,10 +1916,21 @@ async fn prompt_choice_on_terminal(
     role_id: &str,
     question: &str,
     multi: bool,
+    allow_upload: bool,
+    layout: &str,
     options: &[latte_agent_core::controller::ChoiceOption],
 ) -> Option<String> {
     let mut rendered = String::new();
     rendered.push_str(&format!("\n❓ [{role_id}] {question}\n"));
+    // 终端没有上传通道，也画不了图片网格。模型以为用户能上传/看网格时
+    // 必须显式说明，否则用户被问一个答不了的问题（`allow_upload` 与
+    // `layout=grid` 在 CLI 侧原来是被静默忽略的）。
+    if allow_upload {
+        rendered.push_str("  （注：终端不支持上传文件，请用文字描述）\n");
+    }
+    if layout == "grid" {
+        rendered.push_str("  （注：终端不支持图片网格，下面按列表显示）\n");
+    }
     for (i, opt) in options.iter().enumerate() {
         rendered.push_str(&format!("  {}) {}\n", i + 1, opt.label));
         if !opt.description.is_empty() {
@@ -1785,7 +1942,12 @@ async fn prompt_choice_on_terminal(
     } else {
         "输入序号"
     };
-    rendered.push_str(&format!("  （{hint}；也可直接输入自己的答案）\n"));
+    // 必须提示 Ctrl-C：ask 挂起时输入行归它所有，斜杠命令会被当成
+    // **答案**吞掉（实测：用户打 `/quit` 想退出，结果成了答案文本）。
+    // 唯一的逃生口是 Ctrl-C——它中止整个 turn，连带丢掉这次 ask。
+    rendered.push_str(&format!(
+        "  （{hint}；也可直接输入自己的答案；Ctrl-C 放弃本轮）\n"
+    ));
 
     let labels: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
     loop {
@@ -1797,6 +1959,23 @@ async fn prompt_choice_on_terminal(
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        // 拒收"看起来是斜杠命令"的行。
+        //
+        // 队列不区分"给 REPL 的命令"和"给 ask 的答案"——ask 在等答案时
+        // 任何排队行都归它。实测事故：turn 期间输入的
+        // `/wf ask_probe 第二个` 被当成答案投递，模型收到的是
+        // 「选择：/wf ask_probe 第二个」。用户以为发了个命令，实际喂了
+        // 一句垃圾给模型，而那个 workflow 从未启动。
+        //
+        // 不能直接"当命令执行"——ask 的答案完全可能以 `/` 开头（路径）。
+        // 所以拒收 + 说明，把决定权交回用户：真想作答就换个写法，真想
+        // 发命令就先 Ctrl-C。
+        if is_known_command(trimmed) {
+            ui_emit(&format!(
+                "⚠️ `{trimmed}` 看起来是命令而不是答案，已忽略。\n                 若要回答请直接输入序号或文字；若要执行命令请先 Ctrl-C 放弃本次提问。"
+            ));
             continue;
         }
         // 先试解析成序号；解析不出来就当自由作答原样回传。
@@ -2397,7 +2576,8 @@ skip this section — a direct answer with no justification will be
 treated as a routing error.
 "#;
 fn print_help() {
-    println!(
+    // 走 ui_out：分离模式下裸 println 会盖住底部的状态行/输入行。
+    ui_out(
         "Commands:\n\
          /role <id>           Switch to a different role (preserves history)\n\
          /model <tier>        Switch model tier: premium | standard | budget\n\
@@ -2408,8 +2588,18 @@ fn print_help() {
          /history             Show recent messages\n\
          /save <file>         Save conversation to a JSONL file\n\
          /load <file>         Load conversation from a JSONL file\n\
+         /pause               Pause at the next tool-round boundary\n\
+         /resume              Resume from a pause\n\
+         /cancel              Abort the running task (same as Ctrl-C)\n\
+         /pending             List persisted pending ask dialogs\n\
+         /stream [on|off]     Toggle streaming output\n\
+         /fork [file]         Export a resumable snapshot (forks the session)\n\
+         /tasks               List the task board\n\
+         /wf <name> <topic>   Run a named workflow directly\n\
+         /wf-runs             List resumable workflow checkpoints\n\
+         /wf-resume <wf_id>   Resume a failed workflow from its checkpoint\n\
          /help                Show this help\n\
-         /exit | /quit        Exit the chat"
+         /exit | /quit        Exit the chat",
     );
 }
 
@@ -2670,6 +2860,22 @@ fn spawn_input_thread() {
                         drop(g);
                         // 提交的行也进历史区，否则回车后它就消失了。
                         ui_emit(&format!("{prompt}{line}"));
+                        // 控制命令走带外：队列的消费方在 turn 期间正忙，
+                        // 排队会让 /pause 等到 turn 结束才生效（实测失效）。
+                        if handle_out_of_band(&line) {
+                            continue;
+                        }
+                        // turn 进行中提交的行会排队，turn 结束后才消费。
+                        // 不提示的话用户以为"没反应"——尤其是又发了一个
+                        // `/wf` 却看不到任何输出的时候。
+                        //
+                        // 例外：ask 挂起时输入行归 ask 所有，那条会被立刻
+                        // 取走作答，不算排队。
+                        if turn_in_flight().load(std::sync::atomic::Ordering::SeqCst)
+                            && !latte_agent_core::choice::has_any_pending()
+                        {
+                            ui_emit("  ⏳ 当前有任务在跑，本条已排队（Ctrl-C 可中止当前任务）");
+                        }
                         if tx.send(InputEvent::Line(line)).is_err() {
                             return;
                         }
@@ -2714,6 +2920,292 @@ fn spawn_input_thread() {
             }
         })
         .ok();
+}
+
+/// 会话级流式开关，对齐 UI 的 `POST /api/chat/stream-mode`。
+///
+/// 共享 `AtomicBool`：`AgentRunner` 每次调用前读它，所以运行中改也生效。
+fn cli_stream_mode() -> Arc<std::sync::atomic::AtomicBool> {
+    static M: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        .clone()
+}
+
+/// 这一行是不是本 REPL 认得的斜杠命令（含带参数的形式）。
+///
+/// 用于 ask 拒收误输入：只认**已知命令**，避免把以 `/` 开头的合法答案
+/// （比如 `/usr/local/lib` 这样的路径）也拒掉。
+fn is_known_command(line: &str) -> bool {
+    const CMDS: &[&str] = &[
+        "/exit", "/quit", "/help", "/roles", "/role", "/model", "/status", "/tools",
+        "/clear", "/history", "/save", "/load", "/pause", "/resume", "/cancel",
+        "/pending", "/stream", "/fork", "/tasks", "/wf", "/wf-runs", "/wf-resume",
+    ];
+    let head = line.split_whitespace().next().unwrap_or("");
+    CMDS.contains(&head)
+}
+
+/// 控制命令的**带外**处理：在输入线程里立即执行，不进行列队。
+///
+/// 返回 `true` = 已处理，该行不该再进队列。
+///
+/// 为什么必须带外：普通输入走 `mpsc` 队列，而队列的消费方（REPL 主循环）
+/// 在 turn 期间正忙——排队的行要等 turn 结束才执行。对 `/pause` 来说这
+/// 等于**完全失效**：实测 `/pause` 在 turn 里输入后，`⏸ 已暂停` 出现在
+/// `TurnEnd` 之后（12144 → 13431），而想暂停的恰恰是那个正在跑的 turn。
+///
+/// 这里只放"改标志位"这类瞬时、同步、无 IO 的命令。任何需要 await 或
+/// 产生长输出的命令都不该进来——输入线程一卡，按键就没人读了。
+fn handle_out_of_band(line: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    match line.trim() {
+        "/pause" => {
+            if cli_pause_gate().pause_with_reason("用户手动暂停（/pause）") {
+                ui_emit("⏸ 已暂停；用 /resume 继续（在工具轮边界生效）");
+                ui_set_activity(Some("已暂停"));
+            } else {
+                ui_emit("已经是暂停状态");
+            }
+            true
+        }
+        "/resume" => {
+            match cli_pause_gate().resume() {
+                Some(ms) => {
+                    ui_emit(&format!("▶ 已恢复（暂停了 {:.1}s）", ms as f64 / 1000.0));
+                    ui_set_activity(None);
+                }
+                None => ui_emit("当前没有暂停"),
+            }
+            true
+        }
+        // 流式开关：只是一个标志位，适合带外（运行中也能切）。
+        //
+        // 参数必须显式校验：第一版只匹配 `"/stream on"|"/stream off"|
+        // "/stream"` 三个精确串，于是 `/stream maybe` 一个都不中，当普通
+        // 输入进了队列，又被 handle_command 的 `"/stream"` 分支（只看
+        // 首词）当合法吞掉——用户打错参数**完全没有反馈**（实测复现）。
+        s if s.trim_start().starts_with("/stream") => {
+            let arg = s.trim().strip_prefix("/stream").unwrap_or("").trim();
+            let cur = cli_stream_mode().load(Ordering::SeqCst);
+            let next = match arg {
+                "on" => Some(true),
+                "off" => Some(false),
+                "" => Some(!cur), // 裸 /stream = 切换
+                _ => None,
+            };
+            match next {
+                Some(v) => {
+                    cli_stream_mode().store(v, Ordering::SeqCst);
+                    ui_emit(&format!("流式输出：{}", if v { "开" } else { "关" }));
+                }
+                None => ui_emit(&format!(
+                    "未知参数 '{arg}'；用法：/stream [on|off]（省略参数则切换）"
+                )),
+            }
+            true
+        }
+        // `/cancel` 是 Ctrl-C 的显式写法——有些终端把 Ctrl-C 交给了
+        // 外层（tmux/ssh 转发配置），留一条文字入口。
+        "/cancel" => {
+            if turn_in_flight().load(Ordering::SeqCst) {
+                turn_cancel_flag().store(true, Ordering::SeqCst);
+                ui_emit("⛔ 正在中止当前任务…");
+            } else {
+                ui_emit("当前没有正在跑的任务");
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// CLI 的会话级暂停门，对齐 UI 的 ⏸/▶。
+///
+/// 原来 CLI 的 workflow ctx 传的是 `agent_pause_gate: None`，所以 chat 里
+/// **完全没有暂停能力**：一个跑到一半的 workflow 想让它停一下（比如
+/// 先去改个配置、或让位给别的活）做不到，只能 Ctrl-C 整个中止。
+///
+/// 暂停是在**工具轮边界**生效的（`AgentRunner` 在每轮工具调用前查门），
+/// 所以不会打断正在飞的 HTTP 请求，比中止温和。
+fn cli_pause_gate() -> Arc<latte_agent_core::pause_gate::AgentPauseGate> {
+    static G: std::sync::OnceLock<Arc<latte_agent_core::pause_gate::AgentPauseGate>> =
+        std::sync::OnceLock::new();
+    G.get_or_init(|| latte_agent_core::pause_gate::AgentPauseGate::new("cli-session"))
+        .clone()
+}
+
+/// 把一个长任务跑成"可被 Ctrl-C 中止"的。
+///
+/// 返回 `None` = 用户中止（future 被丢弃，在途 HTTP 与工具循环一起停）。
+///
+/// 为什么要抽出来：`turn_in_flight` 原来只在 `ChatSession::turn()` 里
+/// 置位，于是 `/wf`、`/wf-resume` 这类**斜杠命令里跑的 workflow** 不在
+/// 保护范围内——按 Ctrl-C 走的是"空闲"分支（只清输入行），一个跑了几
+/// 十分钟的 workflow 根本停不下来（实测复现）。
+///
+/// 只在分离模式下启用取消：非 TTY 没有 Ctrl-C 来源，直接 await 保持
+/// 原路径不变。
+async fn run_cancellable<F, T>(fut: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    use std::sync::atomic::Ordering;
+    if split_ui().lock().is_none() {
+        return Some(fut.await);
+    }
+    turn_cancel_flag().store(false, Ordering::SeqCst);
+    turn_in_flight().store(true, Ordering::SeqCst);
+    let cancel_watch = async {
+        loop {
+            if turn_cancel_flag().load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+    };
+    let out = tokio::select! {
+        r = fut => Some(r),
+        _ = cancel_watch => None,
+    };
+    turn_in_flight().store(false, Ordering::SeqCst);
+    out
+}
+
+/// 直接跑一个命名 workflow（`/wf <name> <topic>`）。
+///
+/// 对齐 UI 的 `POST /api/workflows/run`。原来 chat 里只能靠 manager
+/// 自己决定调 `workflow` 工具——想指定跑哪个都做不到。
+async fn cmd_run_workflow(
+    merged: &AgentConfig,
+    resolver: &ModelResolver,
+    default_params: &GenerateParams,
+    cwd: &Path,
+    name: &str,
+    topic: &str,
+) {
+    let wf = match latte_agent_core::workflow::load_workflow(name, cwd) {
+        Ok(wf) => wf,
+        Err(e) => {
+            let avail = latte_agent_core::workflow::list_workflows(cwd)
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui_out(&format!("{e}\n可用 workflow: {avail}"));
+            return;
+        }
+    };
+    let ctx = cli_workflow_ctx(
+        Arc::new(merged.clone()),
+        Arc::new(resolver.clone()),
+        default_params.clone(),
+        cwd.to_path_buf(),
+    );
+    ui_out(&format!("▶ 运行 workflow '{name}'…（Ctrl-C 可中止）"));
+    match run_cancellable(latte_agent_core::workflow::run_workflow(&wf, topic, &ctx)).await {
+        Some(Ok(out)) => ui_out(&out),
+        Some(Err(e)) => ui_out(&format!("workflow '{name}' 失败：{e}")),
+        None => {
+            ui_emit("⛔ workflow 已中止（Ctrl-C）；用 /wf-runs 查看可续跑的 checkpoint");
+            ui_set_activity(None);
+        }
+    }
+}
+
+/// 从 checkpoint 续跑一个失败的 workflow（`/wf-resume <wf_id>`）。
+///
+/// 对齐 UI 的 `POST /api/workflows/resume`。这是**功能缺口里最实际的
+/// 一个**：checkpoint 已经写在 `.latte/workflow-runs/` 里，但 CLI 没有
+/// 读回的入口——一个跑了 40 分钟失败的 workflow 在 chat 里只能从头再来，
+/// 而 workflow 工具返回的错误提示里恰恰写着"用上面的 wf_id 以 resume
+/// 参数续跑"。
+///
+/// workflow 名与 topic 都从 checkpoint 里取，不需要用户重新输入。
+async fn cmd_resume_workflow(
+    merged: &AgentConfig,
+    resolver: &ModelResolver,
+    default_params: &GenerateParams,
+    cwd: &Path,
+    wf_id: &str,
+) {
+    let ckpt = match latte_agent_core::workflow::load_checkpoint(cwd, wf_id) {
+        Ok(c) => c,
+        Err(e) => {
+            ui_out(&format!("读不到 checkpoint '{wf_id}'：{e}"));
+            return;
+        }
+    };
+    let wf = match latte_agent_core::workflow::load_workflow(&ckpt.workflow_name, cwd) {
+        Ok(wf) => wf,
+        Err(e) => {
+            ui_out(&format!(
+                "checkpoint 指向的 workflow '{}' 加载失败：{e}",
+                ckpt.workflow_name
+            ));
+            return;
+        }
+    };
+    let ctx = cli_workflow_ctx(
+        Arc::new(merged.clone()),
+        Arc::new(resolver.clone()),
+        default_params.clone(),
+        cwd.to_path_buf(),
+    );
+    ui_out(&format!(
+        "▶ 续跑 '{}'（wf_id={wf_id}）；已完成的 step 会被跳过",
+        ckpt.workflow_name
+    ));
+    let topic = ckpt.topic.clone();
+    match run_cancellable(latte_agent_core::workflow::run_workflow_resume(
+        &wf, &topic, &ctx, wf_id,
+    ))
+    .await
+    {
+        Some(Ok(out)) => ui_out(&out),
+        Some(Err(e)) => ui_out(&format!("续跑失败：{e}")),
+        None => {
+            ui_emit("⛔ 续跑已中止（Ctrl-C）；checkpoint 仍在，可再次 /wf-resume");
+            ui_set_activity(None);
+        }
+    }
+}
+
+/// 列出可续跑的 workflow（`.latte/workflow-runs/` 下的 checkpoint）。
+fn cmd_list_workflow_runs(cwd: &Path) {
+    let dir = cwd.join(".latte").join("workflow-runs");
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            // checkpoint 落盘名形如 `wf-<workflow>-<micros>.jsonl`。
+            let Some(id) = name.strip_suffix(".jsonl") else { continue };
+            let when = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| {
+                    let secs = t
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    format!("{secs}")
+                })
+                .unwrap_or_default();
+            rows.push((id.to_string(), when));
+        }
+    }
+    if rows.is_empty() {
+        ui_out(&format!("没有可续跑的 workflow（{}）", dir.display()));
+        return;
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1)); // 新的在前
+    let mut buf = format!("可续跑的 workflow（{} 个）：", rows.len());
+    for (id, _) in rows.iter().take(20) {
+        buf.push_str(&format!("\n  {id}"));
+    }
+    buf.push_str("\n用 `/wf-resume <wf_id>` 续跑");
+    ui_out(&buf);
 }
 
 /// 读一行用户输入。
@@ -3420,6 +3912,129 @@ mod tests {
             body.contains("hints.lock().clear()"),
             "/clear 必须清未消费的 advisor hint，否则会串到新话题"
         );
+    }
+
+    /// CLI 无法支持的 ask 能力必须**显式降级**，不能静默忽略。
+    ///
+    /// `allow_upload`（上传文件）与 `layout="grid"`（图片网格）在终端里
+    /// 都不存在。原来这两个字段在 CLI 侧被静默丢弃——模型以为用户能上传
+    /// 图片或从网格里挑，用户却被问一个答不了的问题。
+    #[test]
+    fn unsupported_ask_capabilities_are_disclosed_not_ignored() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+        let body = src
+            .split("async fn prompt_choice_on_terminal")
+            .nth(1)
+            .expect("选择器应存在");
+        let body = body.split("\nasync fn ").next().unwrap_or(body);
+        assert!(
+            body.contains("allow_upload") && body.contains("不支持上传"),
+            "allow_upload 必须提示用户改用文字，不能静默忽略"
+        );
+        assert!(
+            body.contains("grid") && body.contains("不支持图片网格"),
+            "layout=grid 必须说明降级成列表"
+        );
+    }
+
+    /// 防回归：所有长任务都必须走 `run_cancellable`，否则 Ctrl-C 停不下来。
+    ///
+    /// `turn_in_flight` 原来只在 `ChatSession::turn()` 里置位，于是 `/wf`、
+    /// `/wf-resume` 里跑的 workflow 不在保护范围内——按 Ctrl-C 走的是
+    /// "空闲"分支（只清输入行），一个跑几十分钟的 workflow 根本停不下来。
+    /// 实测复现过，抽成 helper 后修掉。
+    #[test]
+    fn every_long_running_path_is_cancellable() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+        // 三处长任务：顶层 turn、/wf、/wf-resume。
+        for (what, needle) in [
+            ("顶层 turn", "run_cancellable(self.runner.run_turn"),
+            ("/wf", "run_cancellable(latte_agent_core::workflow::run_workflow("),
+            ("/wf-resume", "run_cancellable(latte_agent_core::workflow::run_workflow_resume("),
+        ] {
+            assert!(
+                src.contains(needle),
+                "{what} 必须走 run_cancellable，否则 Ctrl-C 停不下来"
+            );
+        }
+        // 反向：不该再有裸 await 的 run_workflow（绕过取消保护）。
+        assert!(
+            !src.contains("workflow::run_workflow(&wf, topic, &ctx).await"),
+            "/wf 不该直接 await run_workflow（绕过取消保护）"
+        );
+    }
+
+    /// 防回归：`/help` 列出的命令必须都真的有实现，反之新命令也要登记。
+    ///
+    /// 这一批新增了 10 个命令（`/pause` `/resume` `/cancel` `/pending`
+    /// `/stream` `/fork` `/tasks` `/wf` `/wf-runs` `/wf-resume`）。加命令
+    /// 时忘记更新 help 是最常见的疏漏——用户看不到就等于没做。
+    #[test]
+    fn help_and_implementation_stay_in_sync() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+
+        // help 文本里登记的命令。
+        let help_body = src
+            .split("fn print_help()")
+            .nth(1)
+            .expect("print_help 应存在");
+        let help_body = help_body.split("\n}").next().unwrap_or(help_body);
+
+        for cmd in [
+            "/pause", "/resume", "/cancel", "/pending", "/stream", "/fork", "/tasks",
+            "/wf", "/wf-runs", "/wf-resume",
+        ] {
+            assert!(
+                help_body.contains(cmd),
+                "`{cmd}` 没有登记在 /help 里——用户看不到就等于没做"
+            );
+            // 实现侧：要么是 handle_command 的 match 分支，要么走带外。
+            let as_arm = format!("\"{cmd}\"");
+            assert!(
+                src.matches(&as_arm).count() >= 1,
+                "`{cmd}` 在 /help 里登记了但找不到实现分支"
+            );
+        }
+    }
+
+    /// ask 拒收误输入的判据：只认**已知命令**。
+    ///
+    /// 队列不区分"给 REPL 的命令"和"给 ask 的答案"——ask 在等答案时任何
+    /// 排队行都归它。实测事故：turn 期间输入的 `/wf ask_probe 第二个`
+    /// 被当成答案投递，模型收到「选择：/wf ask_probe 第二个」，而那个
+    /// workflow 从未启动。
+    ///
+    /// 判据不能是"以 `/` 开头"——ask 的答案完全可能是路径。第一版我写成
+    /// `starts_with('/') && !contains(' ') || is_known_command(..)`，`&&`
+    /// 优先级让它把 `/usr/local/lib` 也拒了，正好违反本意。
+    #[test]
+    fn known_command_detection_does_not_reject_paths() {
+        // 已知命令（含带参数形式）→ 拒收。
+        assert!(is_known_command("/quit"));
+        assert!(is_known_command("/wf ask_probe 第二个"));
+        assert!(is_known_command("/wf-resume wf-x-1"));
+        assert!(is_known_command("  /pause  "));
+        // 合法答案 → 放行。
+        assert!(!is_known_command("/usr/local/lib"));
+        assert!(!is_known_command("/etc/hosts"));
+        assert!(!is_known_command("src/main.rs"));
+        assert!(!is_known_command("1,3"));
+        assert!(!is_known_command("先看架构"));
+        // 形似但非已知命令 → 放行（宁可放过，不要拦掉真答案）。
+        assert!(!is_known_command("/wfx"));
+        assert!(!is_known_command("/unknown"));
     }
 
     #[test]
