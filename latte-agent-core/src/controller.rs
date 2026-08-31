@@ -3243,92 +3243,235 @@ async fn build_runner(
     }
 }
 
+const BATCH_READ_MAX_PATHS: usize = 10;
+const BATCH_READ_OUTPUT_BUDGET: usize = 192 * 1024;
+
+fn tool_prompt_content(name: &str) -> Option<String> {
+    use crate::prompts::tool_prompts;
+
+    let local_file = Path::new("prompts/tools").join(format!("{name}.md"));
+    if let Ok(text) = std::fs::read_to_string(local_file) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    tool_prompts::for_tool(name).map(|text| text.trim().to_string())
+}
+
+/// Add the model-facing batch contract and wrap the single-file read handler.
+/// The sibling tools crate remains the canonical single-file implementation;
+/// this adapter only coordinates independent calls and preserves each native
+/// result unchanged.
+fn add_batch_read_contract(
+    mut tool: latte_rs_agent_tools::types::Tool,
+) -> latte_rs_agent_tools::types::Tool {
+    use futures::{stream, StreamExt};
+    use latte_rs_agent_tools::error::ToolError;
+    use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
+
+    if tool.name != "read" || tool.input_schema.properties.contains_key("paths") {
+        return tool;
+    }
+
+    if let Some(path) = tool.input_schema.properties.get_mut("path") {
+        path.description =
+            Some("单个读取目标，支持行范围选择器；有多个相互独立的目标时改用 paths。".into());
+    }
+    tool.input_schema.properties.insert(
+        "paths".into(),
+        ToolInputProperty {
+            property_type: PropertyType::Array,
+            description: Some(
+                "1–10 个相互独立读取目标的批量入口；内部并发执行并按输入顺序归并结果，优先用于 2 个以上目标。".into(),
+            ),
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: Some(1),
+            max_length: Some(BATCH_READ_MAX_PATHS),
+        },
+    );
+    // ToolInputSchema cannot express oneOf(path, paths), so the handler owns
+    // that validation. strict=true would incorrectly require both fields.
+    tool.input_schema.required = None;
+    tool.strict = None;
+
+    let base_handler = tool.handler.clone();
+    tool.handler = Arc::new(move |input, ctx| {
+        let base_handler = base_handler.clone();
+        Box::pin(async move {
+            let path = input.get("path");
+            let paths = input.get("paths");
+            match (path, paths) {
+                (Some(_), Some(_)) => {
+                    return Err(ToolError::other(
+                        "exactly one of 'path' or 'paths' is required",
+                    ));
+                }
+                (None, None) => {
+                    return Err(ToolError::other(
+                        "exactly one of 'path' or 'paths' is required",
+                    ));
+                }
+                (Some(value), None) => {
+                    if !value.is_string() {
+                        return Err(ToolError::other("'path' must be a string"));
+                    }
+                    return (base_handler)(input, ctx).await;
+                }
+                (None, Some(_)) => {}
+            }
+
+            let values = paths
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| ToolError::other("'paths' must be an array of strings"))?;
+            if values.is_empty() || values.len() > BATCH_READ_MAX_PATHS {
+                return Err(ToolError::other(format!(
+                    "'paths' must contain 1–{BATCH_READ_MAX_PATHS} entries"
+                )));
+            }
+            let paths = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|path| !path.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            ToolError::other("every 'paths' entry must be a non-empty string")
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let max_size = input.get("maxSize").cloned();
+            let parallelism = if crate::agent::readonly_parallel_enabled() {
+                crate::agent::readonly_parallel_max()
+            } else {
+                1
+            };
+            let jobs = paths.into_iter().map(|path| {
+                let handler = base_handler.clone();
+                let ctx = ctx.clone();
+                let max_size = max_size.clone();
+                async move {
+                    let mut single = serde_json::Map::new();
+                    single.insert("path".into(), serde_json::Value::String(path.clone()));
+                    if let Some(max_size) = max_size {
+                        single.insert("maxSize".into(), max_size);
+                    }
+                    let result = (handler)(serde_json::Value::Object(single), ctx).await;
+                    (path, result)
+                }
+            });
+            // `buffered`, unlike `buffer_unordered`, preserves input order.
+            let results = stream::iter(jobs)
+                .buffered(parallelism)
+                .collect::<Vec<_>>()
+                .await;
+
+            let count = results.len();
+            let mut files = Vec::new();
+            let mut failed = Vec::new();
+            let mut output_bytes = 0usize;
+            for (path, result) in results {
+                match result {
+                    Ok(value) => {
+                        let size = serde_json::to_vec(&value)
+                            .map(|bytes| bytes.len())
+                            .unwrap_or(0);
+                        if !files.is_empty()
+                            && output_bytes.saturating_add(size) > BATCH_READ_OUTPUT_BUDGET
+                        {
+                            failed.push(serde_json::json!({
+                                "path": path,
+                                "error": format!("batch output budget exceeded ({BATCH_READ_OUTPUT_BUDGET} bytes)")
+                            }));
+                        } else {
+                            output_bytes = output_bytes.saturating_add(size);
+                            files.push(value);
+                        }
+                    }
+                    Err(error) => failed.push(serde_json::json!({
+                        "path": path,
+                        "error": error.to_string()
+                    })),
+                }
+            }
+
+            Ok(serde_json::json!({"files": files, "failed": failed, "count": count}))
+        })
+    });
+    tool
+}
+
+fn enrich_tool_for_model(
+    mut tool: latte_rs_agent_tools::types::Tool,
+) -> latte_rs_agent_tools::types::Tool {
+    tool = add_batch_read_contract(tool);
+    if let Some(prompt) = tool_prompt_content(&tool.name) {
+        if !tool.description.contains(&prompt) {
+            tool.description.push_str("\n\n");
+            tool.description.push_str(&prompt);
+        }
+    }
+    tool
+}
+
 pub(crate) async fn build_tool_manager(
     allowed: &[String],
-) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     use latte_rs_agent_tools::prelude::*;
     let mgr = create_tool_manager();
-    for p in builtin_tool_packages() {
-        mgr.register_package(p).await
-            .map_err(|e| format!("register_package: {e}"))?;
+    for package in builtin_tool_packages() {
+        mgr.register_package(package)
+            .await
+            .map_err(|error| format!("register_package: {error}"))?;
     }
-    // 注册所有包后、过滤前，缓存完整工具池供 request_tool 使用。
-    FULL_TOOL_POOL.get_or_init(|| {
-        let mut pool = FullToolPool::new();
+    // Register before enrichment/filtering so request_tool can grant it too.
+    mgr.register(code_graph_tool(), None);
+
+    // Enrich the complete registry first. Both initial allowlists and later
+    // request_tool grants must clone the exact same model-facing definition.
         for name in mgr.get_tool_names() {
             if let Some(tool) = mgr.get_tool(&name) {
-                pool.insert(name, tool);
+            mgr.unregister(&name);
+            mgr.register(enrich_tool_for_model(tool), None);
             }
         }
-        pool
+    FULL_TOOL_POOL.get_or_init(|| {
+        mgr.get_tool_names()
+            .into_iter()
+            .filter_map(|name| mgr.get_tool(&name).map(|tool| (name, tool)))
+            .collect()
     });
+
     // allowed 里是配置层扁平名（bash/read/edit/...）。tools crate 扁平化
     // 后注册名 == 配置名 == 模型 schema 名，配置名直接进 keep 即可匹配。
     let mut keep: std::collections::HashSet<String> = allowed
         .iter()
-        .flat_map(|s| vec![s.to_lowercase(), s.clone()])
+        .flat_map(|name| vec![name.to_lowercase(), name.clone()])
         .collect();
-    // mcp 是配置层分组别名（一个名字展开成 3 个 mcp_* 工具），不是工具名别名。
     if keep.contains("mcp") {
-        keep.insert("mcp_connect".to_string());
-        keep.insert("mcp_list".to_string());
-        keep.insert("mcp_call".to_string());
+        keep.extend(["mcp_connect".into(), "mcp_list".into(), "mcp_call".into()]);
     }
-    // playwright 同理：展开成 playwright_script + screenshot（扁平化后
-    // 截图工具独立注册为 "screenshot"，原 playwright_screenshot 已不存在）。
     if keep.contains("playwright") {
-        keep.insert("playwright_script".to_string());
-        keep.insert("screenshot".to_string());
+        keep.extend(["playwright_script".into(), "screenshot".into()]);
     }
-    // Register code_graph tool if allowed
-    if keep.contains("code_graph") || keep.contains("code-graph") {
-        let cg = code_graph_tool();
-        mgr.register(cg, None);
+    if keep.contains("code-graph") {
+        keep.insert("code_graph".into());
     }
-    // 过滤：注册名全名或短名（点号后缀）命中 keep 就保留。
-    // 扁平化后注册名已无点号，短名 == 全名（恒等）；短名兜底仅作
-    // 防御性保留，兼容未来可能带点号的注册名。
+
     for tool_id in mgr.get_tool_names() {
         let short = tool_id
             .rsplit_once('.')
-            .map(|(_, s)| s.to_string())
-            .unwrap_or_else(|| tool_id.clone());
-        if !(keep.contains(&short) || keep.contains(&tool_id)) {
+            .map(|(_, name)| name)
+            .unwrap_or(&tool_id);
+        if !(keep.contains(short) || keep.contains(&tool_id)) {
             mgr.unregister(&tool_id);
-        }
-    }
-
-    // ── Tool-level prompt injection (oh-my-pi pattern) ──────────────────
-    // For each surviving tool, look up its built-in tool prompt (compiled
-    // into the binary via include_str! in prompts::tool_prompts). If found,
-    // append to the tool's description. This gives the model per-tool usage
-    // guidance (when to use, when not to, critical constraints) without
-    // bloating the system prompt. Falls back to reading from filesystem
-    // `prompts/tools/{name}.md` for project-level overrides.
-    {
-        use crate::prompts::tool_prompts;
-        for tool_name in mgr.get_tool_names() {
-            // Priority: 1) project-local file override, 2) built-in compiled prompt
-            let content = {
-                let local_file = std::path::Path::new("prompts/tools")
-                    .join(format!("{}.md", tool_name));
-                if let Ok(text) = std::fs::read_to_string(&local_file) {
-                    let trimmed = text.trim().to_string();
-                    if trimmed.is_empty() { None } else { Some(trimmed) }
-                } else {
-                    tool_prompts::for_tool(&tool_name).map(|s| s.trim().to_string())
-                }
-            };
-            if let Some(prompt_text) = content {
-                if let Some(mut tool) = mgr.get_tool(&tool_name) {
-                    tool.description = format!(
-                        "{}\n\n{}",
-                        tool.description, prompt_text
-                    );
-                    mgr.unregister(&tool_name);
-                    mgr.register(tool, None);
-                }
-            }
         }
     }
 
@@ -3354,11 +3497,14 @@ pub(crate) fn full_tool_pool() -> &'static FullToolPool {
         // original name from the package definition).
         use latte_rs_agent_tools::tools::builtin_tool_packages;
         let mut pool = FullToolPool::new();
-        for pkg in builtin_tool_packages() {
-            for tool in pkg.tools {
+        for package in builtin_tool_packages() {
+            for tool in package.tools {
+                let tool = enrich_tool_for_model(tool);
                 pool.insert(tool.name.clone(), tool);
             }
         }
+        let code_graph = enrich_tool_for_model(code_graph_tool());
+        pool.insert(code_graph.name.clone(), code_graph);
         FULL_TOOL_POOL.get_or_init(|| pool)
     })
 }
@@ -10140,6 +10286,161 @@ require = ["永远不可能出现的验收字符串"]
         assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
         // eval 不在 allowed 里，被过滤掉。
         assert!(!names.iter().any(|n| n.starts_with("eval")), "eval 不应被保留（不在 allowed）: {names:?}");
+    }
+
+    /// 工具级说明是模型行为的单一事实源：read 的批量能力必须同时出现
+    /// 在 description 和 schema 中，不能依赖某个角色 prompt 恰好提到它。
+    #[tokio::test]
+    async fn read_tool_exposes_batch_contract_in_description_and_schema() {
+        let mgr = build_tool_manager(&["read".into()])
+            .await
+            .expect("build_tool_manager");
+        let read = mgr.get_tool("read").expect("read tool");
+        assert!(
+            read.description.contains("read(paths") || read.description.contains("paths"),
+            "read description must teach the batch form: {}",
+            read.description
+        );
+        let paths = read
+            .input_schema
+            .properties
+            .get("paths")
+            .expect("read schema must expose paths");
+        assert_eq!(paths.min_length, Some(1));
+        assert_eq!(paths.max_length, Some(10));
+    }
+
+    /// `paths` 不是只给模型看的文案：handler 必须真正按输入顺序批量执行，
+    /// 且单项失败不能丢掉其余成功结果。
+    #[tokio::test]
+    async fn read_tool_batch_executes_with_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let missing = dir.path().join("missing.txt");
+        tokio::fs::write(&a, "alpha").await.unwrap();
+        tokio::fs::write(&b, "beta").await.unwrap();
+
+        let mgr = build_tool_manager(&["read".into()])
+            .await
+            .expect("build_tool_manager");
+        let out = mgr
+            .execute(
+                "read",
+                serde_json::json!({
+                    "paths": [
+                        a.to_string_lossy(),
+                        missing.to_string_lossy(),
+                        b.to_string_lossy()
+                    ]
+                }),
+                None,
+            )
+            .await
+            .expect("batch read should partially succeed");
+        let files = out["files"].as_array().expect("files array");
+        let failed = out["failed"].as_array().expect("failed array");
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            files[0]["content"], "alpha",
+            "successful results keep input order"
+        );
+        assert_eq!(
+            files[1]["content"], "beta",
+            "successful results keep input order"
+        );
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["path"], missing.to_string_lossy().as_ref());
+        assert_eq!(out["count"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_tool_single_path_stays_backward_compatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.txt");
+        tokio::fs::write(&path, "unchanged").await.unwrap();
+        let mgr = build_tool_manager(&["read".into()]).await.unwrap();
+
+        let out = mgr
+            .execute(
+                "read",
+                serde_json::json!({"path": path.to_string_lossy()}),
+                None,
+            )
+            .await
+            .expect("single read");
+        assert_eq!(out["content"], "unchanged");
+        assert!(
+            out.get("files").is_none(),
+            "single result must not be wrapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_tool_rejects_invalid_batch_shapes() {
+        let mgr = build_tool_manager(&["read".into()]).await.unwrap();
+        let cases = [
+            serde_json::json!({}),
+            serde_json::json!({"path":"a", "paths":["b"]}),
+            serde_json::json!({"paths":[]}),
+            serde_json::json!({"paths":["1","2","3","4","5","6","7","8","9","10","11"]}),
+            serde_json::json!({"paths":["ok", 2]}),
+        ];
+        for input in cases {
+            assert!(
+                mgr.execute("read", input.clone(), None).await.is_err(),
+                "invalid input should fail: {input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_tool_batch_enforces_output_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        let payload = "x".repeat(110 * 1024);
+        tokio::fs::write(&first, &payload).await.unwrap();
+        tokio::fs::write(&second, &payload).await.unwrap();
+        let mgr = build_tool_manager(&["read".into()]).await.unwrap();
+
+        let out = mgr
+            .execute(
+                "read",
+                serde_json::json!({"paths":[first.to_string_lossy(), second.to_string_lossy()]}),
+                None,
+            )
+            .await
+            .expect("budgeted batch read");
+        assert_eq!(out["files"].as_array().unwrap().len(), 1);
+        let failed = out["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["path"], second.to_string_lossy().as_ref());
+        assert!(failed[0]["error"].as_str().unwrap().contains("budget"));
+        assert_eq!(out["count"], 2);
+    }
+
+    /// 动态授权必须拿到与初始 allowlist 相同的增强后工具；旧实现先缓存
+    /// FULL_TOOL_POOL 再注入 description，导致 request_tool 授权出的 read
+    /// 没有工具说明，也没有批量 schema。
+    #[tokio::test]
+    async fn requested_read_keeps_model_description_and_batch_schema() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        register_request_tool(tm.clone()).expect("register request_tool");
+        tm.execute(
+            "request_tool",
+            serde_json::json!({"tool_name":"read", "reason":"inspect files"}),
+            None,
+        )
+        .await
+        .expect("grant read");
+
+        let read = tm.get_tool("read").expect("granted read");
+        assert!(
+            read.description.contains("paths"),
+            "description lost after grant"
+        );
+        assert!(read.input_schema.properties.contains_key("paths"));
     }
 
     /// 锁定 code_graph 暴露契约：allowed 含 "code_graph" 时，

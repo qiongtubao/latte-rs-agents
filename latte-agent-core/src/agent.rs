@@ -1291,7 +1291,7 @@ fn is_readonly_parallel_tool(name: &str) -> bool {
 ///
 /// 与 `LATTE_AGENT_DELEGATE_PARALLEL`（默认关）的区别：delegate 会派生
 /// 能写文件的子 agent，并发有真实风险，所以默认关；只读工具没有这个问题。
-fn readonly_parallel_enabled() -> bool {
+pub(crate) fn readonly_parallel_enabled() -> bool {
     std::env::var("LATTE_AGENT_READONLY_PARALLEL")
         .ok()
         .map(|v| {
@@ -1307,7 +1307,7 @@ fn readonly_parallel_enabled() -> bool {
 /// 需要上限是因为 `code_graph` 会跑 tree-sitter 解析（CPU 密集），模型
 /// 一轮批量发 30 个调用时全部同时起会把 CPU 打满、反而变慢；`read` 侧
 /// 也避免一次撑爆 fd。上限为 1 等价于串行。
-fn readonly_parallel_max() -> usize {
+pub(crate) fn readonly_parallel_max() -> usize {
     std::env::var("LATTE_AGENT_READONLY_PARALLEL_MAX")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -3795,16 +3795,63 @@ impl From<GenerateParams> for AgentParams {
 /// `tools` 字段。工具名直接用 registry 注册名（扁平规范名，== 模型看到的
 /// 名字），不再有 friendly_tool_name / namespace 别名转换。
 /// `tool_choice` 不在此设置，取自 `agent.params.tool_choice`（默认 Auto）。
+fn model_facing_tool_schema(
+    definition: &latte_rs_agent_tools::types::ToolDefinition,
+) -> serde_json::Value {
+    let mut schema = serde_json::to_value(&definition.input_schema)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let Some(properties) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return schema;
+    };
+
+    for (name, property) in properties {
+        let Some(property) = property.as_object_mut() else {
+            continue;
+        };
+        let property_type = property
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let min = property.remove("min_length");
+        let max = property.remove("max_length");
+        match property_type.as_deref() {
+            Some("array") => {
+                if let Some(min) = min {
+                    property.insert("minItems".into(), min);
+                }
+                if let Some(max) = max {
+                    property.insert("maxItems".into(), max);
+                }
+                if definition.name == "read" && name == "paths" {
+                    property.insert("items".into(), serde_json::json!({"type": "string"}));
+                }
+            }
+            Some("string") => {
+                if let Some(min) = min {
+                    property.insert("minLength".into(), min);
+                }
+                if let Some(max) = max {
+                    property.insert("maxLength".into(), max);
+                }
+            }
+            _ => {}
+        }
+    }
+    schema
+}
+
 fn build_tool_schemas(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
 ) -> Vec<latte_ai::models::Tool> {
     tm.get_tool_definitions()
         .iter()
-        .map(|td| latte_ai::models::Tool {
-            name: td.name.clone(),
-            description: Some(td.description.clone()),
-            parameters: serde_json::to_value(&td.input_schema)
-                .unwrap_or(serde_json::json!({})),
+        .map(|definition| latte_ai::models::Tool {
+            name: definition.name.clone(),
+            description: Some(definition.description.clone()),
+            parameters: model_facing_tool_schema(definition),
             strict: None,
         })
         .collect()
@@ -8030,6 +8077,77 @@ tools = ["read", "write"]
             "跨 4 轮累积后，第 5 次相同调用必须熔断"
         );
     }
+    /// 工具 description 和 schema 必须进入真实 provider 请求，而不只是留在本地 registry。
+    #[tokio::test]
+    async fn tool_description_lands_on_openai_wire() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty,
+            ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        const SENTINEL: &str = "BATCH_INDEPENDENT_READS_WITH_PATHS";
+        const PATHS_DESCRIPTION: &str = "batch paths field description";
+        let handler: SharedToolHandler =
+            Arc::new(move |_i, _c| Box::pin(async move { Ok(serde_json::json!({})) }));
+        let mut schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+        };
+        schema.properties.insert(
+            "paths".into(),
+            ToolInputProperty {
+                property_type: PropertyType::Array,
+                description: Some(PATHS_DESCRIPTION.into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: Some(1),
+                max_length: Some(10),
+            },
+        );
+        let tm = create_tool_manager();
+        tm.register(Tool::builder("read", SENTINEL, schema, handler).build(), None);
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("done", vec![])),
+                    ),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "prog".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+        runner.run_turn(&[Message::user("go")], None).await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let description = body["tools"][0]["function"]["description"]
+            .as_str()
+            .expect("tool description on wire");
+        assert_eq!(description, SENTINEL);
+        let paths = &body["tools"][0]["function"]["parameters"]["properties"]["paths"];
+        assert_eq!(paths["type"], "array");
+        assert_eq!(paths["description"], PATHS_DESCRIPTION);
+        assert_eq!(paths["minItems"], 1);
+        assert_eq!(paths["maxItems"], 10);
+        assert_eq!(paths["items"]["type"], "string");
+    }
+
     /// build_tool_schemas：配置层扁平名（bash/read/search）与 registry
     /// 注册名一致（latte-rs-agent-tools 已扁平化命名空间，不再有点号前缀）。
     #[tokio::test]

@@ -143,9 +143,9 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 >
 > 注意这个开关的收益**取决于模型是否批量发调用**。实测会话的实测是 186 轮里
 > 185 轮只发 1 个工具调用（`parsed` 长度恒为 1），此时并发无从发生、行为与串行完全
-> 相同。让模型批量发靠两件事：角色 prompt 里的硬要求（programmer / architect /
-> `prompts/tools/read.md` 已加），以及 `read` 的 `paths` 批量入口——后者不依赖模型
-> 是否愿意发并行 tool_calls，是更可靠的一条路。
+> 相同。让模型批量发依靠 `read` 自身随工具 schema 下发的 description 和
+> `paths` 字段说明，而不是角色 prompt；这条批量入口也不依赖模型是否愿意发多个
+> 并行 tool_calls，是更可靠的一条路。
 
 > **关于 workflow 的「防挂死」**：曾有一个 `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`
 > 按分派单元数推算 workflow 的 wall-clock 时间上限，跑满即中止。它只看**总时长**、
