@@ -349,8 +349,14 @@ mod tests {
         assert!(MANAGER.contains("交付物收敛"), "缺少门禁小节");
         assert!(MANAGER.contains("这里不限制调研轮数"), "必须明说不限轮数");
         assert!(MANAGER.contains("不许重复探索同一范围"), "缺少重复探索约束");
-        assert!(MANAGER.contains("implementation_plan"), "未点名产出流程");
-        assert!(MANAGER.contains("learn"), "未点名学习流程");
+        // 选流程的判别依据必须是落点这条通则，而不是逐个流程列举的对照表
+        // （个别化的表覆盖不到自定义流程，且与按话题选的说法互相矛盾）。
+        assert!(MANAGER.contains("按交付物落点"), "缺少落点判别通则");
+        assert!(MANAGER.contains("话题词不决定落点"), "缺少话题≠落点的澄清");
+        assert!(
+            !MANAGER.contains("学习/调研/规划类诉求"),
+            "按话题选流程的说法必须清除"
+        );
         // 「先不锁方向」不得成为回退调研的借口。
         assert!(MANAGER.contains("先不锁方向"), "未覆盖 punt-back 分支");
         // 硬性反向断言：不得出现任何轮次上限。
