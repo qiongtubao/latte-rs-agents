@@ -2061,6 +2061,10 @@ async fn register_workflow_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
             ("topic".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -2070,6 +2074,10 @@ async fn register_workflow_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
         ]
         .into_iter()
@@ -2198,6 +2206,10 @@ async fn register_delegate_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
             ("task".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -2209,6 +2221,10 @@ async fn register_delegate_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
         ]
         .into_iter()
@@ -4724,6 +4740,10 @@ pub fn register_ask_human_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             },
         )]
         .into_iter()

@@ -293,15 +293,13 @@ pub fn generate_index(cwd: &Path, now_unix: i64) -> Result<String, String> {
 // ─── 工具 schema 构造辅助 ─────────────────────────────────────────
 
 fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
-    ToolInputProperty {
-        property_type: ty,
-        description: Some(desc.into()),
-        enum_values: None,
-        minimum: None,
-        maximum: None,
-        min_length: None,
-        max_length: None,
-    }
+    ToolInputProperty { property_type: ty,
+    description: Some(desc.into()),
+    enum_values: None,
+    minimum: None,
+    maximum: None,
+    min_length: None,
+    max_length: None, items: None, properties: None, required: None, additional_properties: None }
 }
 
 fn tool_err(msg: String) -> latte_rs_agent_tools::error::ToolError {
@@ -458,8 +456,8 @@ pub fn register_doc_graph_tools(
                 properties: vec![
                     ("title".into(), prop(PropertyType::String, "文档标题（必填，生成文件名 slug）。")),
                     ("doc_type".into(), prop(PropertyType::String, "文档类型：entity/concept/feature/spec/task/bug/component。默认 entity。")),
-                    ("sources".into(), prop(PropertyType::Array, "来源文件/代码路径数组（可选）。")),
-                    ("tags".into(), prop(PropertyType::Array, "标签数组（可选）。")),
+                    ("sources".into(), prop(PropertyType::Array, "来源文件/代码路径数组（可选）。").with_items(prop(PropertyType::String, "来源文件或代码路径。"))),
+                    ("tags".into(), prop(PropertyType::Array, "标签数组（可选）。").with_items(prop(PropertyType::String, "标签。"))),
                     ("body".into(), prop(PropertyType::String, "Markdown 正文（必填）。")),
                 ].into_iter().collect(),
                 required: Some(vec!["title".into(), "body".into()]),

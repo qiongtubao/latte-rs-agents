@@ -710,15 +710,20 @@ fn lenient_string_list(v: &serde_json::Value) -> Vec<String> {
             .collect(),
         serde_json::Value::Array(a) => a
             .iter()
-            .filter_map(|item| match item {
-                serde_json::Value::String(s) => norm(s),
+            .flat_map(|item| match item {
+                serde_json::Value::String(s) => s
+                    .split(['\n', ';', '；'])
+                    .filter_map(norm)
+                    .collect::<Vec<_>>(),
                 // `[{"text": "..."}]` / `{"point": "..."}` 之类：取第一个
                 // 非空字符串字段（不猜键名，取到即可）。
                 serde_json::Value::Object(map) => map
                     .values()
                     .filter_map(|x| x.as_str())
-                    .find_map(norm),
-                _ => None,
+                    .find_map(norm)
+                    .into_iter()
+                    .collect(),
+                _ => Vec::new(),
             })
             .collect(),
         _ => Vec::new(),
@@ -3243,6 +3248,31 @@ async fn build_runner(
     }
 }
 
+fn input_property(
+    property_type: latte_rs_agent_tools::types::PropertyType,
+    description: impl Into<String>,
+) -> latte_rs_agent_tools::types::ToolInputProperty {
+    latte_rs_agent_tools::types::ToolInputProperty {
+        property_type,
+        description: Some(description.into()),
+        enum_values: None,
+        minimum: None,
+        maximum: None,
+        min_length: None,
+        max_length: None,
+        items: None,
+        properties: None,
+        required: None,
+        additional_properties: None,
+    }
+}
+
+fn string_array_property(description: impl Into<String>) -> latte_rs_agent_tools::types::ToolInputProperty {
+    use latte_rs_agent_tools::types::PropertyType;
+    input_property(PropertyType::Array, description)
+        .with_items(input_property(PropertyType::String, "String array item."))
+}
+
 const BATCH_READ_MAX_PATHS: usize = 10;
 const BATCH_READ_OUTPUT_BUDGET: usize = 192 * 1024;
 
@@ -3268,7 +3298,6 @@ fn add_batch_read_contract(
 ) -> latte_rs_agent_tools::types::Tool {
     use futures::{stream, StreamExt};
     use latte_rs_agent_tools::error::ToolError;
-    use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 
     if tool.name != "read" || tool.input_schema.properties.contains_key("paths") {
         return tool;
@@ -3278,20 +3307,14 @@ fn add_batch_read_contract(
         path.description =
             Some("单个读取目标，支持行范围选择器；有多个相互独立的目标时改用 paths。".into());
     }
-    tool.input_schema.properties.insert(
-        "paths".into(),
-        ToolInputProperty {
-            property_type: PropertyType::Array,
-            description: Some(
-                "1–10 个相互独立读取目标的批量入口；内部并发执行并按输入顺序归并结果，优先用于 2 个以上目标。".into(),
-            ),
-            enum_values: None,
-            minimum: None,
-            maximum: None,
-            min_length: Some(1),
-            max_length: Some(BATCH_READ_MAX_PATHS),
-        },
+    let mut paths_property = string_array_property(
+        "1–10 个相互独立读取目标的批量入口；内部并发执行并按输入顺序归并结果，优先用于 2 个以上目标。",
     );
+    paths_property.min_length = Some(1);
+    paths_property.max_length = Some(BATCH_READ_MAX_PATHS);
+    tool.input_schema
+        .properties
+        .insert("paths".into(), paths_property);
     // ToolInputSchema cannot express oneOf(path, paths), so the handler owns
     // that validation. strict=true would incorrectly require both fields.
     tool.input_schema.required = None;
@@ -3529,11 +3552,13 @@ pub(crate) fn register_request_tool(
                 property_type: PropertyType::String,
                 description: Some("要申请使用的工具名称。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
             ("reason".into(), ToolInputProperty {
                 property_type: PropertyType::String,
                 description: Some("申请使用该工具的原因（角色 prompt 的上下文或任务需求描述）。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
         ].into_iter().collect(),
         required: Some(vec!["tool_name".into(), "reason".into()]),
@@ -3814,21 +3839,134 @@ fn code_graph_signature_of(text: &str) -> String {
     }
 }
 
+
+const CODE_GRAPH_BACKEND: &str = "ast-grep";
+
+/// Keep backend diagnostics actionable without allowing an external process to
+/// flood the tool result. This follows the same bounded-diagnostic principle as
+/// oh-my-pi's capped ast-grep parse errors.
+fn code_graph_short_diagnostic(raw: &str) -> String {
+    const MAX_CHARS: usize = 800;
+    let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = flat.chars().count();
+    if count <= MAX_CHARS {
+        flat
+    } else {
+        format!("{}…[+{}]", flat.chars().take(MAX_CHARS).collect::<String>(), count - MAX_CHARS)
+    }
+}
+
+async fn code_graph_check_backend(program: &str) -> Result<(), latte_rs_agent_tools::error::ToolError> {
+    use latte_rs_agent_tools::error::ToolError;
+
+    let output = tokio::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|e| {
+            ToolError::execution_str(
+                "code_graph",
+                format!(
+                    "code_graph backend unavailable: cannot run `{program} --version` ({e}). \
+                     Install with `brew install ast-grep` or `cargo install ast-grep --locked`; \
+                     until then use search plus ranged read."
+                ),
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let diagnostic = code_graph_short_diagnostic(&String::from_utf8_lossy(&output.stderr));
+    Err(ToolError::execution_str(
+        "code_graph",
+        format!(
+            "code_graph backend unavailable: `{program} --version` exited with {}{}. \
+             Reinstall ast-grep; until then use search plus ranged read.",
+            output.status.code().map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") }
+        ),
+    ))
+}
+
+/// A successful preflight is process-stable and can be cached. Failures are not
+/// cached, so installing/fixing ast-grep while Latte is running takes effect on
+/// the next call instead of requiring a restart.
+async fn code_graph_require_backend() -> Result<(), latte_rs_agent_tools::error::ToolError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static READY: AtomicBool = AtomicBool::new(false);
+
+    if READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    code_graph_check_backend(CODE_GRAPH_BACKEND).await?;
+    READY.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Decode ast-grep's compact JSON contract without treating its documented
+/// exit code 1 (valid query, zero matches) as a failure. Any other non-zero exit
+/// or malformed JSON is a backend/protocol failure, never a fake empty result.
+fn code_graph_decode_backend_output(
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(Vec<serde_json::Value>, String), latte_rs_agent_tools::error::ToolError> {
+    use latte_rs_agent_tools::error::ToolError;
+
+    let diagnostic = code_graph_short_diagnostic(&String::from_utf8_lossy(stderr));
+    if !matches!(exit_code, Some(0 | 1)) {
+        return Err(ToolError::execution_str(
+            "code_graph",
+            format!(
+                "ast-grep query failed (exit={}){}. This is a backend/query failure, not 0 matches; \
+                 check pattern/name syntax or use search plus ranged read.",
+                exit_code.map_or_else(|| "signal".to_string(), |code| code.to_string()),
+                if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") }
+            ),
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(stdout);
+    if raw.trim().is_empty() {
+        if exit_code == Some(0) {
+            return Ok((Vec::new(), diagnostic));
+        }
+        return Err(ToolError::execution_str(
+            "code_graph",
+            format!(
+                "ast-grep returned exit=1 without its expected JSON result{}. This is a backend \
+                 protocol failure, not 0 matches.",
+                if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") }
+            ),
+        ));
+    }
+
+    let parsed = serde_json::from_str::<Vec<serde_json::Value>>(raw.trim()).map_err(|e| {
+        let preview = code_graph_short_diagnostic(raw.trim());
+        ToolError::execution_str(
+            "code_graph",
+            format!(
+                "ast-grep returned invalid compact JSON ({e}); output={preview:?}. \
+                 This is a backend protocol failure, not 0 matches."
+            ),
+        )
+    })?;
+    Ok((parsed, diagnostic))
+}
 fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
     use latte_rs_agent_tools::error::ToolError;
     use latte_rs_agent_tools::types::*;
     use std::sync::Arc;
 
     fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
-        ToolInputProperty {
-            property_type: ty,
-            description: Some(desc.into()),
-            enum_values: None,
-            minimum: None,
-            maximum: None,
-            min_length: None,
-            max_length: None,
-        }
+        ToolInputProperty { property_type: ty,
+        description: Some(desc.into()),
+        enum_values: None,
+        minimum: None,
+        maximum: None,
+        min_length: None,
+        max_length: None, items: None, properties: None, required: None, additional_properties: None }
     }
     fn optional_schema(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
         let mut p = std::collections::BTreeMap::new();
@@ -3861,8 +3999,107 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let mode = input.get("mode").and_then(|v| v.as_str()).unwrap_or("signatures");
+            let mode = input
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("signatures");
+            if !matches!(mode, "signatures" | "full") {
+                return Err(ToolError::validation(
+                    format!("code_graph: 不支持的 mode='{mode}'。可用：signatures, full"),
+                    vec![latte_rs_agent_tools::error::ValidationIssue {
+                        path: "mode".into(),
+                        message: "必须是 signatures 或 full".into(),
+                    }],
+                ));
+            }
+            if !std::path::Path::new(path).exists() {
+                return Err(ToolError::validation(
+                    format!("code_graph: path 不存在：{path}"),
+                    vec![latte_rs_agent_tools::error::ValidationIssue {
+                        path: "path".into(),
+                        message: "文件或目录不存在".into(),
+                    }],
+                ));
+            }
+            if kind.is_none() && raw_pattern.is_none() {
+                return Err(ToolError::validation(
+                    "code_graph: 必须提供 kind 或 pattern 之一".to_string(),
+                    vec![latte_rs_agent_tools::error::ValidationIssue {
+                        path: "kind".into(),
+                        message: "kind 与 pattern 至少提供一个".into(),
+                    }],
+                ));
+            }
+            if let Some(explicit_lang) = input
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let normalized = explicit_lang.to_ascii_lowercase();
+                if !code_graph_supported_langs().contains(&normalized.as_str()) {
+                    return Err(ToolError::validation(
+                        format!(
+                            "code_graph: 不支持的 lang='{normalized}'。支持：{}",
+                            code_graph_supported_langs().join(", ")
+                        ),
+                        vec![latte_rs_agent_tools::error::ValidationIssue {
+                            path: "lang".into(),
+                            message: "取值不在支持范围内".into(),
+                        }],
+                    ));
+                }
+            }
             let want_full = mode == "full";
+
+            // Language and semantic kind are deterministic input constraints,
+            // so validate them before the index fast-path as well as before the
+            // external backend. An index hit must not hide invalid arguments.
+            let validated_lang_owned: String;
+            let validated_lang: &str = match input
+                .get("lang")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(lang) => {
+                    validated_lang_owned = lang.to_ascii_lowercase();
+                    &validated_lang_owned
+                }
+                None => match code_graph_infer_lang(path) {
+                    Some(lang) => lang,
+                    None => {
+                        return Err(ToolError::validation(
+                            format!(
+                                "code_graph: 无法从 path='{path}' 推断语言（目录或未知扩展名），\
+                                 请显式传 lang。支持：{}",
+                                code_graph_supported_langs().join(", ")
+                            ),
+                            vec![latte_rs_agent_tools::error::ValidationIssue {
+                                path: "lang".into(),
+                                message: "目录路径必须显式指定 lang".into(),
+                            }],
+                        ));
+                    }
+                },
+            };
+            if let Some(k) = kind {
+                if code_graph_node_kinds(validated_lang, k).is_empty() {
+                    return Err(ToolError::validation(
+                        format!(
+                            "code_graph: lang='{validated_lang}' 不支持 kind='{k}'。可用 kind：{}。\
+                             或改用 pattern 参数。",
+                            code_graph_kinds_for_lang(validated_lang).join(", ")
+                        ),
+                        vec![latte_rs_agent_tools::error::ValidationIssue {
+                            path: "kind".into(),
+                            message: "取值不在该语言支持范围内".into(),
+                        }],
+                    ));
+                }
+            }
 
             // ── 预建索引 fast-path ──
             // UI 启动时把定义类符号（function/struct/class/type…）的签名+行号
@@ -3888,6 +4125,10 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                             serde_json::Value::String("prebuilt_index".to_string()),
                         );
                         result.insert(
+                            "lang".into(),
+                            serde_json::Value::String(validated_lang.to_string()),
+                        );
+                        result.insert(
                             "total_matches".into(),
                             serde_json::Value::Number(total.into()),
                         );
@@ -3905,6 +4146,12 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                                  或用 name 过滤。",
                                 lines.len()
                             )));
+                        } else if total == 0 {
+                            result.insert("note".into(), serde_json::Value::String(format!(
+                                "0 命中（预建索引已覆盖该范围）。检查 name，或改用 pattern/其他 kind；\
+                                 lang='{validated_lang}' 可用 kind：{}。",
+                                code_graph_kinds_for_lang(validated_lang).join(", ")
+                            )));
                         }
                         return Ok(serde_json::Value::Object(result));
                     }
@@ -3912,59 +4159,17 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             }
 
             // ── ast-grep 可用性预检 ──
-            // 旧实现直接 spawn，缺二进制时模型只拿到一句
-            // "ast-grep failed: No such file"，试一次就再也不用这个工具。
-            // 这里给可执行的安装指引 + 明确的降级建议。
-            if tokio::process::Command::new("ast-grep")
-                .arg("--version")
-                .output()
-                .await
-                .map(|o| !o.status.success())
-                .unwrap_or(true)
-            {
-                return Err(ToolError::execution_str(
-                    "code_graph",
-                    "本机没有可用的 ast-grep，code_graph 无法工作。\
-                     安装：`brew install ast-grep` 或 `cargo install ast-grep --locked`。\
-                     在装好之前请改用 search/bash grep + 带行范围的 read。"
-                        .to_string(),
-                ));
-            }
+            // Only reached after deterministic validation and index lookup.
+            // Successful checks are cached; failures stay retryable after a
+            // user installs or repairs ast-grep in the running process.
+            code_graph_require_backend().await?;
 
-            // ── 语言判定 ──
-            let lang_owned: String;
-            let lang: &str = match input.get("lang").and_then(|v| v.as_str()).map(str::trim) {
-                Some(l) if !l.is_empty() => {
-                    lang_owned = l.to_ascii_lowercase();
-                    &lang_owned
-                }
-                _ => match code_graph_infer_lang(path) {
-                    Some(l) => l,
-                    None => {
-                        // 目录路径没有扩展名，推断不出语言。
-                        // 用 Validation 而非 execution：这是确定性参数
-                        // 错误，同参数重试必败，必须让上层判不可重试、
-                        // 直接把提示喂回模型改参数（见
-                        // `classify_tool_execution_error`）。
-                        return Err(ToolError::validation(
-                            format!(
-                                "code_graph: 无法从 path='{path}' 推断语言（目录或未知扩展名），\
-                                 请显式传 lang。支持的 lang：{}",
-                                code_graph_supported_langs().join(", ")
-                            ),
-                            vec![latte_rs_agent_tools::error::ValidationIssue {
-                                path: "lang".into(),
-                                message: "目录路径必须显式指定 lang".into(),
-                            }],
-                        ));
-                    }
-                },
-            };
+            let lang = validated_lang;
 
             // ── 组装 ast-grep 命令 ──
             // 两条路径：语义 kind（走 scan --inline-rules，按节点类型匹配，
             // 召回可靠）与裸 pattern（走 run -p，逃生舱，交给模型自己写）。
-            let mut cmd = tokio::process::Command::new("ast-grep");
+            let mut cmd = tokio::process::Command::new(CODE_GRAPH_BACKEND);
             let rule_text;
             match (kind, raw_pattern) {
                 (Some(k), _) => {
@@ -4012,16 +4217,19 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             }
 
             let output = cmd.output().await.map_err(|e| {
-                ToolError::execution_str("code_graph", format!("ast-grep 执行失败: {e}"))
+                ToolError::execution_str(
+                    "code_graph",
+                    format!(
+                        "code_graph backend unavailable during query: cannot run ast-grep ({e}). \
+                         Reinstall it; until then use search plus ranged read."
+                    ),
+                )
             })?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-
-            let parsed: Vec<serde_json::Value> = if stdout.trim().is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_str(stdout.trim()).unwrap_or_default()
-            };
+            let (parsed, diagnostic) = code_graph_decode_backend_output(
+                output.status.code(),
+                &output.stdout,
+                &output.stderr,
+            )?;
 
             // ── 结果格式化 ──
             // signatures（默认）：`file:line: 签名`，一条一行。
@@ -4097,24 +4305,29 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 );
             }
             if total == 0 {
-                result.insert(
-                    "note".into(),
-                    serde_json::Value::String(format!(
-                        "0 命中。检查：path 是否存在、lang='{lang}' 是否正确（当前由\
-                         {} 得出）、kind 是否适合该语言（可用：{}）。",
-                        if input.get("lang").is_some() { "显式参数" } else { "路径扩展名推断" },
+                let note = if diagnostic.is_empty() {
+                    format!(
+                        "0 命中。检查 lang='{lang}'、kind/pattern 与查询范围；可用 kind：{}。",
                         code_graph_kinds_for_lang(lang).join(", ")
-                    )),
-                );
+                    )
+                } else {
+                    "0 命中，但 ast-grep 返回了解析/模式诊断；这不能证明代码不存在。\
+                     请先修正 pattern/name，或把 path 收窄到单一语言文件。"
+                        .to_string()
+                };
+                result.insert("note".into(), serde_json::Value::String(note));
             }
-            if !stderr.is_empty() {
-                result.insert("stderr".into(), serde_json::Value::String(stderr));
+            if !diagnostic.is_empty() {
+                result.insert(
+                    "diagnostics".into(),
+                    serde_json::Value::String(diagnostic),
+                );
             }
             Ok(serde_json::Value::Object(result))
         })
     });
 
-    let schema = optional_schema(vec![
+    let mut schema = optional_schema(vec![
         (
             "path",
             PropertyType::String,
@@ -4150,6 +4363,26 @@ fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
              kind 覆盖不到时才用；kind 与 pattern 同时给出时 kind 优先",
         ),
     ]);
+    for (name, values) in [
+        ("lang", code_graph_supported_langs()),
+        ("mode", vec!["signatures", "full"]),
+        (
+            "kind",
+            vec![
+                "function", "method", "struct", "class", "interface", "enum", "trait",
+                "impl", "type", "macro", "call", "import", "decl",
+            ],
+        ),
+    ] {
+        if let Some(property) = schema.properties.get_mut(name) {
+            property.enum_values = Some(
+                values
+                    .into_iter()
+                    .map(|value| serde_json::Value::String(value.into()))
+                    .collect(),
+            );
+        }
+    }
 
     Tool::builder(
         "code_graph",
@@ -4604,6 +4837,64 @@ fn unknown_plan_task_keys(tasks_arr: &[serde_json::Value]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// 构造单条 plan 任务的 `ToolInputProperty`（含 priority 范围、paths
+/// 描述等 schema 元数据）。`include_subtasks=true` 时在物件内追加一
+/// 个可选 `subtasks` 字段，其元素复用本函数自身以避免重复 schema
+/// 字符串——保证一处维护、单元测试稳定。
+fn plan_task_input_property(
+    include_subtasks: bool,
+) -> latte_rs_agent_tools::types::ToolInputProperty {
+    use latte_rs_agent_tools::types::PropertyType;
+
+    let mut priority = input_property(PropertyType::Integer, "Priority 1-4; 1 is highest.");
+    priority.minimum = Some(1.0);
+    priority.maximum = Some(4.0);
+    // workflow 字段保持开放字符串（不强制 enum）：注册表见
+    // `.latte/workflows.d/*.toml`，目前 ~20 个；任何未来新增的流程都不
+    // 应被 plan 工具的 schema 卡住。"常用名"在描述里列出仅为提示。
+    let workflow = input_property(
+        PropertyType::String,
+        "Optional workflow name (e.g. tdd_development, bug_triage, update_docs, \
+         annotate_code, learn, learn_loop, design_and_plan, feature_design, \
+         implementation_plan, task_refine, explore, design_brainstorm, write_doc); \
+         omit when no workflow fits.",
+    );
+    let mut properties = std::collections::BTreeMap::from([
+        (
+            "title".into(),
+            input_property(PropertyType::String, "Required one-line task title."),
+        ),
+        (
+            "description".into(),
+            input_property(PropertyType::String, "Work scope and acceptance criteria."),
+        ),
+        ("priority".into(), priority),
+        ("labels".into(), string_array_property("Task labels.")),
+        ("workflow".into(), workflow),
+        (
+            "paths".into(),
+            string_array_property(
+                "Non-overlapping file or directory prefixes affected by this task.",
+            ),
+        ),
+    ]);
+    if include_subtasks {
+        properties.insert(
+            "subtasks".into(),
+            input_property(
+                PropertyType::Array,
+                "Optional child tasks; at most one nested level.",
+            )
+            .with_items(plan_task_input_property(false)),
+        );
+    }
+    input_property(PropertyType::Object, "One proposed task.").with_object(
+        properties,
+        Some(vec!["title".into()]),
+        Some(true.into()),
+    )
+}
+
 /// `pub` 而非 `pub(crate)`：CLI REPL 也要注册它，否则声明了该工具的
 /// 角色（manager）在 chat 里调用直接 ToolNotFound，而 UI 里正常。
 pub fn register_plan_tool(
@@ -4617,23 +4908,23 @@ pub fn register_plan_tool(
     session_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
-        PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
+        PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputSchema,
     };
 
-    // tasks 是数组；ToolInputProperty 无嵌套 items schema，故用描述
-    // 把每项结构讲清（title/description/priority/labels/workflow/
-    // paths/subtasks）。LLM 按描述产出，handler 逐项 serde 解析 + 校验。
+    // The recursive canonical schema below mirrors PlanTask, including one
+    // nested subtask level; handler validation still enforces path semantics.
     let input_schema = ToolInputSchema {
         schema_type: SchemaType,
-        properties: vec![
-            ("tasks".into(), ToolInputProperty {
-                property_type: PropertyType::Array,
-                description: Some(
-                    "任务候选清单（一次调用提交整份清单：拆分出几个任务就放几项，禁止每个任务单独调一次本工具——上一份清单未获用户批准时后续调用会被拒绝）。每项是对象：{title(必填,一句话), description(做什么+验收标准), priority(1-4,1最高), labels(字符串数组), workflow(执行该任务的workflow名:tdd_development/bug_triage/update_docs/annotate_code/learn/learn_loop;学习或讲解类任务绑learn(一次性教程)或learn_loop(逐知识点讲解+出题);没有贴合的必须留空走manager直接执行,禁止硬绑不相关的workflow), paths(可选,字符串数组,任务涉及的文件/目录前缀如\"src/ringbuf\";并行执行时范围重叠的任务会被拒绝派发,拆任务时让各任务范围互不重叠;纯阅读/学习类任务在 labels 里加\"只读\"即可免除重叠校验), subtasks(同构数组,最多一层)}. 调用本工具后任务会出现在用户弹窗里供勾选导入任务看板，不要再以 Markdown 列表输出任务。".into()
-                ),
-                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
-            }),
-        ].into_iter().collect(),
+        properties: [(
+            "tasks".into(),
+            input_property(
+                PropertyType::Array,
+                "一次调用提交整份任务候选清单；上一份未获用户处理前不要重复调用。",
+            )
+            .with_items(plan_task_input_property(true)),
+        )]
+        .into_iter()
+        .collect(),
         required: Some(vec!["tasks".into()]),
         ..Default::default()
     };
@@ -4790,6 +5081,37 @@ fn clear_persisted_ask(answer_log: Option<&crate::workflow::AnswerLog>, choice_i
 }
 
 
+fn choice_option_input_property() -> latte_rs_agent_tools::types::ToolInputProperty {
+    use latte_rs_agent_tools::types::PropertyType;
+
+    let properties = std::collections::BTreeMap::from([
+        (
+            "label".into(),
+            input_property(PropertyType::String, "Required short option label."),
+        ),
+        (
+            "description".into(),
+            input_property(PropertyType::String, "Optional one-line trade-off summary."),
+        ),
+        (
+            "image".into(),
+            input_property(PropertyType::String, "Optional image URL."),
+        ),
+        ("pros".into(), string_array_property("Advantages.")),
+        ("cons".into(), string_array_property("Disadvantages or risks.")),
+        (
+            "details".into(),
+            input_property(PropertyType::String, "Optional longer rationale."),
+        ),
+    ]);
+    input_property(
+        PropertyType::Object,
+        "One option. Canonical fields: label, description, image, pros, cons, details; \
+         recommended is optional and handler-tolerant (boolean/string/number).",
+    )
+    .with_object(properties, None, Some(true.into()))
+}
+
 /// 注册 `ask` 工具：角色向用户抛出一道**选择题**（可带图片、图片
 ///
 /// 两种语义（由 `blocking` 决定）：
@@ -4824,6 +5146,14 @@ pub fn register_ask_tool(
     // 进程级单调序号，保证 choice_id 全局唯一。
     static CHOICE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    let mut options_property = input_property(
+        PropertyType::Array,
+        "2–6 个候选项；不要添加 Other，前端会自动提供自定义入口。",
+    )
+    .with_items(choice_option_input_property());
+    options_property.min_length = Some(2);
+    options_property.max_length = Some(6);
+
     let input_schema = ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
@@ -4831,29 +5161,27 @@ pub fn register_ask_tool(
                 property_type: PropertyType::String,
                 description: Some("要向用户提出的问题（一句话）。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
-            ("options".into(), ToolInputProperty {
-                property_type: PropertyType::Array,
-                description: Some(
-                    "候选项数组，2-6 项。每项是对象：{label(必填,简短标签), description(可选,一行取舍说明), pros(可选,字符串数组,该方案的优点), cons(可选,字符串数组,该方案的缺点/风险), details(可选,补充说明长文本), image(可选,配图URL,一般是 /api/images/<file>), recommended(可选,true 标记推荐项)}. 方案之间有取舍时**务必填 pros/cons**——UI 的「详情」按钮就是展开这两项给用户比较优缺点的。不要自己加“其他/Other”项——前端会自动附带“其他(自定义)”入口。".into()
-                ),
-                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
-            }),
+            ("options".into(), options_property),
             ("multi".into(), ToolInputProperty {
                 property_type: PropertyType::Boolean,
                 description: Some("是否允许多选（默认 false = 单选）。问题本身允许同时选中多项（例如“启用哪些模块”“需要覆盖哪些场景”）时请显式传 true，UI 会渲染成复选框。⚠️ 只在 question 文案里写“（可多选）”是不够的——必须同时传 multi=true，否则 UI 渲染的是单选。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
             ("layout".into(), ToolInputProperty {
                 property_type: PropertyType::String,
                 description: Some("展示方式：\"list\"(默认) 或 \"grid\"(图片网格选择,适合每项都有 image 的视觉挑选)。".into()),
                 enum_values: Some(vec!["list".into(), "grid".into()]),
                 minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
             ("allow_upload".into(), ToolInputProperty {
                 property_type: PropertyType::Boolean,
                 description: Some("是否允许用户上传自己的图片作为答案（默认 false）。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
         ].into_iter().collect(),
         required: Some(vec!["question".into(), "options".into()]),
@@ -5156,6 +5484,7 @@ pub fn register_task_report_tool(
                     "要回报的任务 ID（如 LAT-100）；来自任务看板派发时的初始消息。必填。".into(),
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
             ("summary".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -5163,6 +5492,7 @@ pub fn register_task_report_tool(
                     "完成情况摘要（1-3 句中文，写到任务 history note）。".into(),
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
             ("result".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -5171,6 +5501,7 @@ pub fn register_task_report_tool(
                 ),
                 enum_values: Some(VALID_RESULTS.iter().map(|s| serde_json::Value::String(s.to_string())).collect()),
                 minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
             }),
         ].into_iter().collect(),
         required: Some(vec![
@@ -5432,6 +5763,10 @@ async fn register_delegate_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
             ("task".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -5441,6 +5776,10 @@ async fn register_delegate_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
         ]
         .into_iter()
@@ -6097,6 +6436,10 @@ async fn register_workflow_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
             ("topic".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -6106,6 +6449,10 @@ async fn register_workflow_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
             ("resume".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -6115,6 +6462,10 @@ async fn register_workflow_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
         ]
         .into_iter()
@@ -6338,6 +6689,112 @@ fn role_icon(role_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn code_graph_missing_backend_is_actionable() {
+        let err = code_graph_check_backend("latte-definitely-missing-ast-grep")
+            .await
+            .expect_err("missing binary must fail preflight");
+        let message = err.to_string();
+        assert!(message.contains("backend unavailable"), "{message}");
+        assert!(message.contains("cargo install ast-grep"), "{message}");
+        assert!(message.contains("search plus ranged read"), "{message}");
+    }
+
+    #[test]
+    fn code_graph_accepts_ast_grep_exit_one_as_zero_matches() {
+        let (matches, diagnostic) = code_graph_decode_backend_output(Some(1), b"[]\n", b"")
+            .expect("ast-grep uses exit=1 for a valid zero-match query");
+        assert!(matches.is_empty());
+        assert!(diagnostic.is_empty());
+    }
+
+    #[test]
+    fn code_graph_does_not_hide_backend_or_json_failures() {
+        let err = code_graph_decode_backend_output(
+            Some(8),
+            b"",
+            b"Error: Cannot parse rule INLINE_RULES",
+        )
+        .expect_err("backend failure must not become zero matches");
+        let message = err.to_string();
+        assert!(message.contains("exit=8"), "{message}");
+        assert!(message.contains("not 0 matches"), "{message}");
+
+        let err = code_graph_decode_backend_output(Some(0), b"not-json", b"")
+            .expect_err("invalid protocol output must not become zero matches");
+        let message = err.to_string();
+        assert!(message.contains("invalid compact JSON"), "{message}");
+        assert!(message.contains("not 0 matches"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn code_graph_rejects_bad_mode_before_backend() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sample.rs");
+        std::fs::write(&file, "fn sample() {}\n").unwrap();
+        let tool = code_graph_tool();
+        let err = (tool.handler)(
+            serde_json::json!({
+                "path": file,
+                "kind": "function",
+                "mode": "verbose"
+            }),
+            ToolExecutionContext::fresh("code_graph", 0),
+        )
+        .await
+        .expect_err("invalid mode must be deterministic validation");
+        assert!(matches!(
+            err,
+            latte_rs_agent_tools::error::ToolError::Validation { .. }
+        ));
+        assert!(err.to_string().contains("signatures, full"));
+    }
+
+
+    #[test]
+    fn plan_and_ask_publish_recursive_item_schemas() {
+        use latte_rs_agent_tools::types::PropertyType;
+
+        let plan = input_property(PropertyType::Array, "tasks")
+            .with_items(plan_task_input_property(true));
+        let plan = serde_json::to_value(plan).expect("serialize plan schema");
+        let task = &plan["items"];
+        assert_eq!(task["type"], "object");
+        assert_eq!(task["required"], serde_json::json!(["title"]));
+        assert_eq!(task["properties"]["labels"]["items"]["type"], "string");
+        assert_eq!(task["properties"]["paths"]["items"]["type"], "string");
+        assert_eq!(
+            task["properties"]["subtasks"]["items"]["properties"]["title"]["type"],
+            "string"
+        );
+
+        let choice = choice_option_input_property();
+        let choice = serde_json::to_value(choice).expect("serialize choice schema");
+        assert!(choice.get("required").is_none());
+        assert_eq!(choice["properties"]["pros"]["items"]["type"], "string");
+        assert_eq!(choice["properties"]["cons"]["items"]["type"], "string");
+        assert_eq!(choice["additionalProperties"], true);
+    }
+
+    #[test]
+    fn code_graph_schema_exposes_standard_enums() {
+        let schema = serde_json::to_value(code_graph_tool().input_schema)
+            .expect("serialize code_graph schema");
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["signatures", "full"])
+        );
+        assert!(schema["properties"]["lang"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.contains(&serde_json::json!("rust"))));
+        assert!(schema["properties"]["kind"]["enum"]
+            .as_array()
+            .is_some_and(|values| values.contains(&serde_json::json!("call"))));
+        assert!(schema["properties"]["mode"].get("enum_values").is_none());
+    }
 
     // ─── plan 工具的 paths 机械校验 ───────────────────────────────
 
@@ -7496,7 +7953,11 @@ mod tests {
             "question": "鉴权方案？",
             "multiSelect": "true",   // 宽松布尔 + 别名
             "options": [
-                {"label": "JWT", "pros": ["无状态"], "cons": ["撤销难"]},
+                {
+                    "label": "JWT",
+                    "pros": "无状态\n- 易扩展",
+                    "cons": [{"text": "撤销难"}]
+                },
                 {"label": "Session", "desc": "服务端存会话"}
             ]
         });
@@ -7507,7 +7968,7 @@ mod tests {
             panic!("expected ChoiceRequested, got {ev:?}");
         };
         assert!(multi, "multiSelect:\"true\" 应识别为多选");
-        assert_eq!(options[0].pros, vec!["无状态"]);
+        assert_eq!(options[0].pros, vec!["无状态", "易扩展"]);
         assert_eq!(options[0].cons, vec!["撤销难"]);
         assert_eq!(options[1].description, "服务端存会话");
     }

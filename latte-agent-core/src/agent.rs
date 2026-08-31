@@ -974,6 +974,12 @@ fn classify_tool_execution_error(
         "第一级目录在仓库里不存在",
         "疑似幻觉路径",
         "tasks[",
+        // code_graph dependency preflight/query spawn failures are deterministic
+        // until the local ast-grep installation changes. Retrying the same call
+        // immediately only burns a tool round-trip.
+        "code_graph backend unavailable",
+        "ast-grep query failed",
+        "backend protocol failure",
         // ask_human 的"错误返回"是设计好的控制流（暂停会话），不是
         // 执行失败——重试只会重复 pause + 重复发 AskHuman trace 事件。
         "session paused",
@@ -3795,51 +3801,74 @@ impl From<GenerateParams> for AgentParams {
 /// `tools` 字段。工具名直接用 registry 注册名（扁平规范名，== 模型看到的
 /// 名字），不再有 friendly_tool_name / namespace 别名转换。
 /// `tool_choice` 不在此设置，取自 `agent.params.tool_choice`（默认 Auto）。
+fn normalize_model_schema_node(schema: &mut serde_json::Value) {
+    let Some(node) = schema.as_object_mut() else {
+        return;
+    };
+
+    let schema_type = node
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let min = node.remove("min_length");
+    let max = node.remove("max_length");
+    match schema_type.as_deref() {
+        Some("array") => {
+            if let Some(min) = min {
+                node.insert("minItems".into(), min);
+            }
+            if let Some(max) = max {
+                node.insert("maxItems".into(), max);
+            }
+        }
+        Some("string") => {
+            if let Some(min) = min {
+                node.insert("minLength".into(), min);
+            }
+            if let Some(max) = max {
+                node.insert("maxLength".into(), max);
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(properties) = node
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for property in properties.values_mut() {
+            normalize_model_schema_node(property);
+        }
+    }
+    for key in [
+        "items",
+        "additionalProperties",
+        "contains",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = node.get_mut(key) {
+            normalize_model_schema_node(child);
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(children) = node.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+            for child in children {
+                normalize_model_schema_node(child);
+            }
+        }
+    }
+}
+
 fn model_facing_tool_schema(
     definition: &latte_rs_agent_tools::types::ToolDefinition,
 ) -> serde_json::Value {
     let mut schema = serde_json::to_value(&definition.input_schema)
         .unwrap_or_else(|_| serde_json::json!({}));
-    let Some(properties) = schema
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return schema;
-    };
-
-    for (name, property) in properties {
-        let Some(property) = property.as_object_mut() else {
-            continue;
-        };
-        let property_type = property
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
-        let min = property.remove("min_length");
-        let max = property.remove("max_length");
-        match property_type.as_deref() {
-            Some("array") => {
-                if let Some(min) = min {
-                    property.insert("minItems".into(), min);
-                }
-                if let Some(max) = max {
-                    property.insert("maxItems".into(), max);
-                }
-                if definition.name == "read" && name == "paths" {
-                    property.insert("items".into(), serde_json::json!({"type": "string"}));
-                }
-            }
-            Some("string") => {
-                if let Some(min) = min {
-                    property.insert("minLength".into(), min);
-                }
-                if let Some(max) = max {
-                    property.insert("maxLength".into(), max);
-                }
-            }
-            _ => {}
-        }
-    }
+    normalize_model_schema_node(&mut schema);
     schema
 }
 
@@ -4116,6 +4145,20 @@ mod tests {
         ));
         assert!(matches!(kind, ToolCallErrorKind::PermanentExec { .. }));
         assert!(!policy.retryable(&kind));
+        // code_graph backend/query/protocol errors are deterministic for the
+        // same invocation and must not be executed twice automatically.
+        for message in [
+            "code_graph backend unavailable: ast-grep missing",
+            "ast-grep query failed (exit=8): invalid rule",
+            "ast-grep backend protocol failure, not 0 matches",
+        ] {
+            let kind = classify_tool_execution_error(&ToolError::other(message));
+            assert!(
+                matches!(kind, ToolCallErrorKind::PermanentExec { .. }),
+                "{message}"
+            );
+            assert!(!policy.retryable(&kind), "{message}");
+        }
         // 普通执行错误（网络/5xx 类）→ Execution，重试一次
         let kind = classify_tool_execution_error(&ToolError::other("connection reset by peer"));
         assert!(matches!(kind, ToolCallErrorKind::Execution { .. }));
@@ -7638,15 +7681,13 @@ tools = ["read", "write"]
             PropertyType, SchemaType, ToolInputProperty, ToolInputSchema,
         };
         fn p(ty: PropertyType) -> ToolInputProperty {
-            ToolInputProperty {
-                property_type: ty,
-                description: None,
-                enum_values: None,
-                minimum: None,
-                maximum: None,
-                min_length: None,
-                max_length: None,
-            }
+            ToolInputProperty { property_type: ty,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None, items: None, properties: None, required: None, additional_properties: None }
         }
         let mut props = std::collections::BTreeMap::new();
         props.insert("path".to_string(), p(PropertyType::String));
@@ -8077,6 +8118,104 @@ tools = ["read", "write"]
             "跨 4 轮累积后，第 5 次相同调用必须熔断"
         );
     }
+    #[test]
+    fn model_schema_recurses_without_tool_or_field_name_special_cases() {
+        use latte_rs_agent_tools::types::{
+            PropertyType, SchemaType, ToolAdditionalProperties, ToolDefinition,
+            ToolInputProperty, ToolInputSchema,
+        };
+
+        fn property(property_type: PropertyType) -> ToolInputProperty {
+            ToolInputProperty {
+                property_type,
+                description: None,
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
+            }
+        }
+
+        let mut tags = property(PropertyType::Array)
+            .with_items(property(PropertyType::Integer));
+        tags.min_length = Some(2);
+        tags.max_length = Some(4);
+        let item = property(PropertyType::Object).with_object(
+            [("tags".into(), tags)].into_iter().collect(),
+            Some(vec!["tags".into()]),
+            Some(ToolAdditionalProperties::Boolean(false)),
+        );
+        let mut entries = property(PropertyType::Array).with_items(item);
+        entries.min_length = Some(1);
+        let definition = ToolDefinition {
+            name: "not_read".into(),
+            description: "recursive test".into(),
+            input_schema: ToolInputSchema {
+                schema_type: SchemaType,
+                properties: [("entries".into(), entries)].into_iter().collect(),
+                required: Some(vec!["entries".into()]),
+                additional_properties: Some(false),
+            },
+            strict: None,
+        };
+
+        let wire = model_facing_tool_schema(&definition);
+        let entries = &wire["properties"]["entries"];
+        assert_eq!(entries["minItems"], 1);
+        assert_eq!(entries["items"]["type"], "object");
+        assert_eq!(entries["items"]["required"], serde_json::json!(["tags"]));
+        assert_eq!(entries["items"]["additionalProperties"], false);
+        let tags = &entries["items"]["properties"]["tags"];
+        assert_eq!(tags["items"]["type"], "integer");
+        assert_eq!(tags["minItems"], 2);
+        assert_eq!(tags["maxItems"], 4);
+        assert!(wire.to_string().find("min_length").is_none());
+        assert!(wire.to_string().find("max_length").is_none());
+    }
+
+    #[tokio::test]
+    async fn all_builtin_array_schemas_have_items() {
+        fn inspect(node: &serde_json::Value, path: &str, missing: &mut Vec<String>) {
+            let Some(object) = node.as_object() else {
+                return;
+            };
+            if object.get("type").and_then(|value| value.as_str()) == Some("array")
+                && !object.contains_key("items")
+            {
+                missing.push(path.to_string());
+            }
+            if let Some(properties) = object.get("properties").and_then(|value| value.as_object()) {
+                for (name, child) in properties {
+                    inspect(child, &format!("{path}.properties.{name}"), missing);
+                }
+            }
+            for key in ["items", "additionalProperties"] {
+                if let Some(child) = object.get(key) {
+                    inspect(child, &format!("{path}.{key}"), missing);
+                }
+            }
+        }
+
+        let names: Vec<String> = crate::controller::full_tool_pool()
+            .keys()
+            .cloned()
+            .collect();
+        let manager = crate::controller::build_tool_manager(&names)
+            .await
+            .expect("build all tools");
+        let schemas = build_tool_schemas(&manager);
+        let mut missing = Vec::new();
+        for tool in &schemas {
+            inspect(&tool.parameters, &tool.name, &mut missing);
+        }
+        assert!(missing.is_empty(), "array schemas missing items: {missing:?}");
+    }
+
     /// 工具 description 和 schema 必须进入真实 provider 请求，而不只是留在本地 registry。
     #[tokio::test]
     async fn tool_description_lands_on_openai_wire() {
@@ -8100,15 +8239,26 @@ tools = ["read", "write"]
         };
         schema.properties.insert(
             "paths".into(),
-            ToolInputProperty {
-                property_type: PropertyType::Array,
-                description: Some(PATHS_DESCRIPTION.into()),
+            ToolInputProperty { property_type: PropertyType::Array,
+            description: Some(PATHS_DESCRIPTION.into()),
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: Some(1),
+            max_length: Some(10),
+            items: Some(Box::new(ToolInputProperty {
+                property_type: PropertyType::String,
+                description: None,
                 enum_values: None,
                 minimum: None,
                 maximum: None,
-                min_length: Some(1),
-                max_length: Some(10),
-            },
+                min_length: None,
+                max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
+            })), properties: None, required: None, additional_properties: None },
         );
         let tm = create_tool_manager();
         tm.register(Tool::builder("read", SENTINEL, schema, handler).build(), None);

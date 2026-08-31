@@ -199,6 +199,10 @@ pub fn register_generate_image_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
             ("size".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -208,6 +212,10 @@ pub fn register_generate_image_tool(
                 maximum: None,
                 min_length: None,
                 max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
             }),
         ]
         .into_iter()
