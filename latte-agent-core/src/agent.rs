@@ -8298,6 +8298,357 @@ tools = ["read", "write"]
         assert_eq!(paths["items"]["type"], "string");
     }
 
+    #[tokio::test]
+    async fn recursive_tool_schema_is_compatible_across_provider_wires() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            PropertyType, SchemaType, SharedToolHandler, Tool, ToolAdditionalProperties,
+            ToolInputProperty, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        fn property(property_type: PropertyType, description: &str) -> ToolInputProperty {
+            ToolInputProperty {
+                property_type,
+                description: (!description.is_empty()).then(|| description.to_string()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
+            }
+        }
+
+        fn recursive_schema_fixture() -> ToolInputSchema {
+            let mut pattern = property(PropertyType::String, "Search pattern.");
+            pattern.min_length = Some(2);
+            pattern.max_length = Some(64);
+
+            let mut mode = property(PropertyType::String, "Match mode.");
+            mode.enum_values = Some(vec!["literal".into(), "regex".into()]);
+
+            let mut limit = property(PropertyType::Integer, "Maximum matches.");
+            limit.minimum = Some(1.0);
+            limit.maximum = Some(100.0);
+
+            let mut metadata_value = property(PropertyType::String, "Metadata value.");
+            metadata_value.min_length = Some(1);
+            metadata_value.max_length = Some(32);
+            let metadata = property(PropertyType::Object, "Typed metadata map.")
+                .with_additional_properties(metadata_value);
+
+            let item = property(PropertyType::Object, "One query.").with_object(
+                std::collections::BTreeMap::from([
+                    ("limit".into(), limit),
+                    ("metadata".into(), metadata),
+                    ("mode".into(), mode),
+                    ("pattern".into(), pattern),
+                ]),
+                Some(vec!["pattern".into()]),
+                Some(ToolAdditionalProperties::Boolean(false)),
+            );
+            let mut queries = property(PropertyType::Array, "Queries to execute.")
+                .with_items(item);
+            queries.min_length = Some(2);
+            queries.max_length = Some(4);
+
+            ToolInputSchema {
+                schema_type: SchemaType,
+                properties: std::collections::BTreeMap::from([("queries".into(), queries)]),
+                required: Some(vec!["queries".into()]),
+                additional_properties: Some(false),
+            }
+        }
+
+        fn wire_tool_name(tool: &serde_json::Value) -> Option<&str> {
+            tool.get("function")
+                .and_then(|function| function.get("name"))
+                .or_else(|| tool.get("name"))
+                .and_then(serde_json::Value::as_str)
+        }
+
+        fn has_tool(body: &serde_json::Value, name: &str) -> bool {
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| wire_tool_name(tool) == Some(name)))
+        }
+
+        async fn capture(
+            api: latte_ai::models::ApiType,
+            provider: &str,
+            base_suffix: &str,
+            request_path: &str,
+        ) -> (serde_json::Value, serde_json::Value) {
+            let server = wiremock::MockServer::start().await;
+            let response = match api {
+                latte_ai::models::ApiType::OpenAiCompletions => ResponseTemplate::new(200)
+                    .set_body_string(openai_completion_body("done", vec![])),
+                latte_ai::models::ApiType::AnthropicMessages => ResponseTemplate::new(200)
+                    .set_body_raw(
+                        concat!(
+                            "event: content_block_delta\n",
+                            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+                            "event: message_delta\n",
+                            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\n",
+                            "event: message_stop\n",
+                            "data: {\"type\":\"message_stop\"}\n\n"
+                        ),
+                        "text/event-stream",
+                    ),
+            };
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path(request_path))
+                        .respond_with(response),
+                )
+                .await;
+
+            let model = Model {
+                id: format!("{provider}-schema-test"),
+                name: format!("{provider} schema test"),
+                api,
+                provider: provider.into(),
+                base_url: format!("{}{base_suffix}", server.uri()),
+                api_key: "test-key".into(),
+                context_window: 32_000,
+                max_tokens: 4_096,
+                supports_thinking: false,
+                supports_vision: false,
+                cost_per_million_input: 0.0,
+                cost_per_million_output: 0.0,
+                timeout_secs: None,
+            };
+            let tm = create_tool_manager();
+            let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+                Box::pin(async move { Ok(serde_json::json!({})) })
+            });
+            tm.register(
+                Tool::builder(
+                    "static_schema_matrix",
+                    "Static recursive provider schema fixture",
+                    recursive_schema_fixture(),
+                    handler.clone(),
+                )
+                .build(),
+                None,
+            );
+
+            let agent = Agent::new_with_chain(
+                "provider-schema".into(),
+                test_role(),
+                vec![model],
+                GenerateParams::default(),
+            )
+            .unwrap();
+            let mut runner = AgentRunner::new_with_tools(agent, tm.clone());
+
+            // First turn sees only the tool present when the runner was created.
+            runner.run_turn(&[Message::user("static")], None).await.unwrap();
+
+            // Register between turns: the next turn must rebuild model-facing schemas
+            // and send this dynamically granted tool through the same provider path.
+            tm.register(
+                Tool::builder(
+                    "dynamic_schema_matrix",
+                    "Dynamic recursive provider schema fixture",
+                    recursive_schema_fixture(),
+                    handler,
+                )
+                .build(),
+                None,
+            );
+
+            runner.run_turn(&[Message::user("dynamic")], None).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2, "{provider} request count");
+            let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert!(
+                has_tool(&first, "static_schema_matrix"),
+                "{provider} first turn keeps the static tool"
+            );
+            assert!(
+                !has_tool(&first, "dynamic_schema_matrix"),
+                "{provider} first turn must precede dynamic registration"
+            );
+
+            let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+            assert!(
+                has_tool(&second, "static_schema_matrix"),
+                "{provider} second turn keeps the static tool"
+            );
+            assert!(
+                has_tool(&second, "dynamic_schema_matrix"),
+                "{provider} second turn picks up the dynamic tool"
+            );
+            (first, second)
+        }
+
+        fn find_tool<'a>(body: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+            body["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .find(|tool| wire_tool_name(tool) == Some(name))
+                .unwrap_or_else(|| panic!("tool {name} on provider wire"))
+        }
+
+        fn assert_structure(schema: &serde_json::Value) {
+            let queries = &schema["properties"]["queries"];
+            let item = &queries["items"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["required"], serde_json::json!(["queries"]));
+            assert_eq!(schema["additionalProperties"], false);
+            assert_eq!(queries["type"], "array");
+            assert_eq!(item["type"], "object");
+            assert_eq!(item["required"], serde_json::json!(["pattern"]));
+            assert_eq!(item["additionalProperties"], false);
+            assert_eq!(
+                item["properties"]["mode"]["enum"],
+                serde_json::json!(["literal", "regex"])
+            );
+            assert_eq!(
+                item["properties"]["metadata"]["additionalProperties"]["type"],
+                "string"
+            );
+        }
+
+        fn assert_standard_schema(schema: &serde_json::Value) {
+            assert_structure(schema);
+            let queries = &schema["properties"]["queries"];
+            let properties = &queries["items"]["properties"];
+            assert_eq!(queries["minItems"], 2);
+            assert_eq!(queries["maxItems"], 4);
+            assert_eq!(properties["pattern"]["minLength"], 2);
+            assert_eq!(properties["pattern"]["maxLength"], 64);
+            assert_eq!(properties["limit"]["minimum"], 1.0);
+            assert_eq!(properties["limit"]["maximum"], 100.0);
+            assert_eq!(
+                properties["metadata"]["additionalProperties"]["minLength"],
+                1
+            );
+            assert_eq!(
+                properties["metadata"]["additionalProperties"]["maxLength"],
+                32
+            );
+        }
+
+        fn assert_anthropic_schema(schema: &serde_json::Value) {
+            assert_structure(schema);
+            let queries = &schema["properties"]["queries"];
+            let properties = &queries["items"]["properties"];
+            let metadata_value = &properties["metadata"]["additionalProperties"];
+            assert!(queries.get("minItems").is_none());
+            assert!(queries.get("maxItems").is_none());
+            assert!(queries["description"].as_str().unwrap().contains("minItems"));
+            assert!(properties["pattern"].get("minLength").is_none());
+            assert!(properties["pattern"].get("maxLength").is_none());
+            assert!(properties["limit"].get("minimum").is_none());
+            assert!(properties["limit"].get("maximum").is_none());
+            assert!(metadata_value.get("minLength").is_none());
+            assert!(metadata_value.get("maxLength").is_none());
+        }
+
+        let (openai_first, openai) = capture(
+            latte_ai::models::ApiType::OpenAiCompletions,
+            "openai",
+            "",
+            "/chat/completions",
+        )
+        .await;
+        let (gemini_first, gemini) = capture(
+            latte_ai::models::ApiType::OpenAiCompletions,
+            "google",
+            "/v1beta/openai",
+            "/v1beta/openai/chat/completions",
+        )
+        .await;
+        let (anthropic_first, anthropic) = capture(
+            latte_ai::models::ApiType::AnthropicMessages,
+            "anthropic",
+            "",
+            "/v1/messages",
+        )
+        .await;
+
+        let openai_first_static = find_tool(&openai_first, "static_schema_matrix");
+        let gemini_first_static = find_tool(&gemini_first, "static_schema_matrix");
+        let anthropic_first_static = find_tool(&anthropic_first, "static_schema_matrix");
+
+        let openai_static = find_tool(&openai, "static_schema_matrix");
+        let openai_dynamic = find_tool(&openai, "dynamic_schema_matrix");
+        let gemini_static = find_tool(&gemini, "static_schema_matrix");
+        let gemini_dynamic = find_tool(&gemini, "dynamic_schema_matrix");
+        let anthropic_static = find_tool(&anthropic, "static_schema_matrix");
+        let anthropic_dynamic = find_tool(&anthropic, "dynamic_schema_matrix");
+
+        let openai_first_static_schema = &openai_first_static["function"]["parameters"];
+        let gemini_first_static_schema = &gemini_first_static["function"]["parameters"];
+        let anthropic_first_static_schema = &anthropic_first_static["input_schema"];
+
+        let openai_static_schema = &openai_static["function"]["parameters"];
+        let openai_dynamic_schema = &openai_dynamic["function"]["parameters"];
+        let gemini_static_schema = &gemini_static["function"]["parameters"];
+        let gemini_dynamic_schema = &gemini_dynamic["function"]["parameters"];
+        let anthropic_static_schema = &anthropic_static["input_schema"];
+        let anthropic_dynamic_schema = &anthropic_dynamic["input_schema"];
+
+        for schema in [
+            openai_first_static_schema,
+            openai_static_schema,
+            openai_dynamic_schema,
+            gemini_first_static_schema,
+            gemini_static_schema,
+            gemini_dynamic_schema,
+        ] {
+            assert_standard_schema(schema);
+        }
+        assert_eq!(
+            openai_first_static_schema, openai_static_schema,
+            "OpenAI static schema is stable across turns"
+        );
+        assert_eq!(
+            gemini_first_static_schema, gemini_static_schema,
+            "Gemini-compatible static schema is stable across turns"
+        );
+        assert_eq!(
+            openai_static_schema, openai_dynamic_schema,
+            "static and dynamic tools share the OpenAI schema path"
+        );
+        assert_eq!(
+            gemini_static_schema, gemini_dynamic_schema,
+            "static and dynamic tools share the Gemini-compatible schema path"
+        );
+        assert_eq!(
+            openai_static_schema, gemini_static_schema,
+            "Gemini compatibility uses OpenAI tool wire"
+        );
+
+        assert_anthropic_schema(anthropic_first_static_schema);
+        assert_anthropic_schema(anthropic_static_schema);
+        assert_anthropic_schema(anthropic_dynamic_schema);
+        assert_eq!(
+            anthropic_first_static_schema, anthropic_static_schema,
+            "Anthropic static schema is stable across turns"
+        );
+        assert_eq!(
+            anthropic_static_schema, anthropic_dynamic_schema,
+            "static and dynamic tools share the Anthropic schema path"
+        );
+        for tool in [
+            anthropic_first_static,
+            anthropic_static,
+            anthropic_dynamic,
+        ] {
+            assert!(tool.get("parameters").is_none());
+        }
+    }
+
     /// build_tool_schemas：配置层扁平名（bash/read/search）与 registry
     /// 注册名一致（latte-rs-agent-tools 已扁平化命名空间，不再有点号前缀）。
     #[tokio::test]
