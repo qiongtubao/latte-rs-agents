@@ -74,11 +74,14 @@ pub fn is_infrastructure_role(id: &str) -> bool {
 /// registration.
 pub fn system_tools_for(id: &str) -> &'static [&'static str] {
     match id {
-        // delegate/workflow/plan/ask 是调度契约；read/search/write/bash
-        // 支撑"简单任务 manager 亲手做"的三档分流（见内置 prompt 的
-        // 任务启动决策流程第 0 档）。
+        // delegate/workflow/plan/ask 是调度契约；read/search/code_graph
+        // 支撑探索与取证；write 支撑"简单任务 manager 亲手做"的收尾。
+        // **不授予 bash**：manager 定位是调度，探索必须走 workflow 或
+        // 专用工具（read/search/code_graph），禁止 bash find/grep/ls
+        // 硬啃（实测 jemalloc 会话 manager 用 bash 探索不走流程，是
+        // 路由失效根因之一；add-only merge 意味着不在此列出 = 物理禁用）。
         "manager" => &[
-            "delegate", "workflow", "plan", "ask", "read", "search", "write", "bash",
+            "delegate", "workflow", "plan", "ask", "read", "search", "write", "code_graph",
         ],
         "advisor" => &["read", "search"],
         _ => &[],

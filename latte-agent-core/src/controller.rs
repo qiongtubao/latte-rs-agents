@@ -3086,18 +3086,12 @@ async fn build_runner(
     }
     let mut role = role;
 
-    // Append the tool-call protocol + (for manager) the delegate hints.
+    // Append the tool-call protocol. Tool usage guidance (when/why/how,
+    // available roles/workflows) lives in each tool's own description —
+    // registered dynamically — not in the system prompt.
     let mut prompt = String::new();
     if !role.allowed_tools.is_empty() {
         prompt.push_str(&tool_usage_prompt(&role.allowed_tools));
-        // Any role with "delegate" in its tools gets the delegation capability
-        if role.allowed_tools.iter().any(|t| t == "delegate") {
-            prompt.push_str(&delegate_tool_hint(merged));
-        }
-        // Any role with "workflow" in its tools gets the workflow hint.
-        if role.allowed_tools.iter().any(|t| t == "workflow") {
-            prompt.push_str(&workflow_tool_hint(cwd));
-        }
     }
     // Every role — tools or no tools — gets the system ground truth
     // (cwd, host, time). When the user asks about runtime state
@@ -4506,8 +4500,11 @@ pub fn default_max_delegates() -> u32 {
         None => 0,
     }
 }
-/// delegate 工具提示：可用专家列表来自 `merged.roles` 动态生成
-/// （与角色编辑器同源），不再硬编码 7 个基础角色。
+/// Build the `delegate` tool description. Content goes straight into
+/// `Tool::builder(... description ...)` at registration time, not into
+/// the system prompt — the model sees it alongside the schema. The role
+/// list is generated from `merged.roles` so role-editor additions show
+/// up immediately.
 fn delegate_tool_hint(merged: &AgentConfig) -> String {
     let roster = role_roster_text(merged);
     let roster_line = if roster.is_empty() {
@@ -4516,97 +4513,44 @@ fn delegate_tool_hint(merged: &AgentConfig) -> String {
         roster
     };
     format!(
-        r#"
-### 关键规则：你必须使用 delegate 工具
-
-你**必须**使用 `delegate` 工具来完成任务，**绝不能**直接输出计划而不执行。
-
-正确的流程：
-1. 分析任务 → 决定需要哪些专家
-2. **立即**调用 delegate 工具派发任务
-3. 等专家返回结果
-4. 综合所有结果输出最终答案
-
-可用专家（来自角色配置，含角色编辑器新建的自定义角色）：{roster_line}
-
-失败升级：工具调用连续失败、专家报错且原因不明、或需要在多个方案间取舍时 → 派 advisor 诊断；诊断清楚之前不要直接回答用户，更不要重复回答旧问题。
-
-**错误流程（禁止）：**
-- 只输出计划而不调用 delegate ← 这是最常见的错误！不要这样做！
-- 自己分析而不派发给专家
-
-用 native function-calling 调 delegate 工具（参数 role + task）。
-"#
+        "Delegate a subtask to a specialist agent. Available roles (sorted, including custom roles from the role editor): {roster_line}\n\
+         \nWhen to use: a focused task that needs one specialist. Params: role (must be from the list above) + task (natural language goal + acceptance criteria). Batch independent tasks in the same round (2-4 in parallel); do not serialize. Write the task as goal + acceptance criteria — never commands/tool names/step sequences. If a specialist returns empty, wrong, or too-short output, re-dispatch or escalate to the advisor.\n\
+         \nNever use for: trivial single-step work you can do directly. Always use this instead of analyzing things yourself when the task needs a specialist."
     )
 }
 
-/// workflow 工具提示：动态列出 `.latte/workflows.d`（项目 + 全局）里
-/// 实际可用的 workflow —— UI 管理界面新建的自定义流程会出现在这里，
-/// 模型不需要靠猜。清单为空时退化成不带列表的通用提示。
+/// Build the `workflow` tool description. Lists workflows dynamically
+/// from `.latte/workflows.d` (project + global) and embeds the
+/// landing-point selection rule (the only valid criterion for picking a
+/// workflow). Content goes into `Tool::builder(... description ...)` at
+/// registration time.
 fn workflow_tool_hint(cwd: &std::path::Path) -> String {
     let available = crate::workflow::list_workflows(cwd);
     let list = if available.is_empty() {
-        "（当前 .latte/workflows.d 里没有可用 workflow，只能 delegate）\n".to_string()
+        "（当前 .latte/workflows.d 里没有可用 workflow，只能 delegate）".to_string()
     } else {
         available
             .iter()
             .map(|(n, d)| {
-                if d.is_empty() {
-                    format!("- `{n}`\n")
-                } else {
-                    format!("- `{n}` — {d}\n")
-                }
+                if d.is_empty() { format!("- `{n}`") } else { format!("- `{n}` — {d}") }
             })
-            .collect()
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     format!(
-        r#"
-### 你还可以用 workflow 工具触发多角色工作流
-
-当任务适合**固定的多角色流水线**时，调用 `workflow` 而不是逐个 delegate。
-当前可用的 workflow（含 UI 管理界面新建的自定义流程）：
-
-{list}
-用 native function-calling 调 workflow 工具（参数 name + topic）。
-若 workflow 失败，错误信息会带 wf_id——用 name + resume=<wf_id> 从断点续跑，不要从头重跑。
-
-判断标准（分派前先想流程）：
-- 单点问题（读代码、改文件、审查某个具体实现）→ delegate
-- 需要多个角色按固定流程协作的完整任务 → workflow，从上面清单里选最贴合的
-- 调用 workflow 前先用一句话说明：选哪个、为什么、预期拿到什么结论
-- workflow 会跑完整条流水线并把结论返回给你；你综合后再回复用户。
-
-**怎么挑：按交付物落点，不按话题词（唯一判别依据）**
-
-1. 先写下用户点名要的东西**最后落在哪儿**——任务看板条目 / 某个文件 / 对话里的结论 / 代码改动。
-2. 再从上面清单里挑**落点相同**的那条：每条流程的描述末尾都标了「落点：」，那是它实际产出什么、
-   产出物落在哪儿。挑之前把候选的落点与第 1 步写下的落点逐字比一遍。
-3. 话题词（"学习""设计""重构""调研"）只说明**内容**，不决定落点：同一个话题既可能是"要一份清单"，
-   也可能是"现在就要内容"，两者落点不同、流程也就不同。用话题词匹配流程名是最常见的选错方式。
-4. 用户诉求里出现**几个不同落点，就发几个 workflow 调用**。不许让一条流程"顺带覆盖"另一个落点：
-   宣称"一次覆盖"之前，先把每个落点的产出物写出来；写不出来就是在合并交差。
-
-**调研要收口（不是限制轮数）**：调研类流程（`explore` / `design_brainstorm`）想探几轮就探几轮——
-大仓库分模块深入是正当的。但每一轮都必须**换一个具体问题**，且随时对着交付物问自己一句：
-「这一轮结束后，用户点名的交付物离产出更近了，还是我只是更懂了？」
-
-- 连续两轮答案都是"只是更懂了" → 已有结论就够动手了，转去跑产出交付物的流程。
-- **不要重复探索同一范围**：把上一轮的 topic 换几个词再探一遍不会带来新信息。还要探就必须说得出
-  **这一轮补的是哪一个具体问题**；说不出来（只是「再摸一遍结构」）就说明该转产出了。
-- 用户诉求里点名过交付物时，调研流程的返回末尾会附一条**交付物提醒**（列出还欠着什么、该跑哪个流程）。
-  它不阻断你，但别忽略它。
-- 把「通读 XXX 产出解剖报告」派成 `delegate`，与再跑一轮 `explore` 是同一件事，同样受这条约束。
-
-**用户选了「先不锁方向 / 以后再定」不要退回调研**：这类回答通常已经隐含阶段骨架
-（例如「读整体 → 深读 X → 再定改动点」就是 3 个阶段任务）。直接按这个骨架拆任务清单，
-把"定改动点"本身作为最后一个任务；方向没锁 ≠ 无法拆分。
-
-workflow 失败时的兜底（必须遵守）：
-- 错误信息里带失败原因——gate 被拦时会附「不合格产出摘要」（REJECT 理由）。先读懂它。
-- 能修复的（方案有冲突、内容可调整）：修复后用 resume 续跑，或直接 delegate 重做失败的那一步。
-- 不能修复或需要用户拍板的：把失败原因、已完成的中间成果、可选的下一步向用户解释清楚，由用户决定。
-- 禁止不解释原因、不给出路，只把错误原样转述给用户就结束。
-"#
+        "Run a named multi-role workflow. Available workflows (sorted, including custom workflows from the workflow editor):\n{list}\n\
+         \n**分派前先想流程**。When to use: a task that fits a fixed multi-role pipeline. Pick the workflow whose deliverable landing matches what the user asked for (each workflow declares its landing point — marked with「落点：」— in its description). **按交付物落点，不按话题词** — do not pick by topic word; match landing point to landing point. If the user asks for multiple deliverables with different landing points, call workflow multiple times in the same round — one call per deliverable. **几个不同落点，就发几个 workflow 调用**. After the workflow returns, synthesize results; if it failed, diagnose and either resume (with wf_id) or fall back manually and tell the user what failed.\n\
+         \nHow to pick (the only rule — match by deliverable landing, not by topic word):\n\
+         1. Write down where the user's deliverable finally lands — task board entry / a specific file / a conclusion in the conversation / a code change.\n\
+         2. From the list above, pick the workflow whose 「落点：」 matches that landing point. Compare word-for-word before you choose.\n\
+         3. Topic words (\"learn\" / \"design\" / \"refactor\" / \"research\") describe content, not the landing. Two requests with the same topic can need different workflows because they have different landing points.\n\
+         4. Several different landing points in one user request → several workflow calls in the same round. Never let one workflow \"also cover\" another deliverable. Write out each deliverable's landing before claiming one workflow is enough.\n\
+         \n**调研要收口（不是限制轮数）**。Research stops on deliverables (not on a round count). Research workflows (e.g. explore / design_brainstorm) can run as many rounds as needed — but every round must ask one concrete new question, and each round you should ask yourself: 「this round later, is the user's named deliverable closer, or do I only understand more?」 Two rounds in a row of \"only understand more\" means stop and switch to the workflow that actually produces the deliverable. **不要重复探索同一范围** — Do NOT re-explore the same scope by rewording the topic — if you can't say what concrete new question this round answers, it's time to switch to the deliverable-producing workflow. When the user named a deliverable, the research workflow's return will include a **交付物提醒** listing what's still owed and which workflow produces it — non-blocking, but don't ignore it.\n\
+         \nIf the user picks 「先不锁方向 / 以后再定」, do NOT retreat to research. The answer usually implies a stage skeleton (e.g.「read whole → deep-read X → decide the change point」 is 3 stage tasks). Split the list by that skeleton and put「定改动点」 as the last task. Direction unlocked ≠ can't split.\n\
+         \nFailure recovery (required):\n\
+         - Read the failure reason in the error message (the gate may append「不合格产出摘要」 with the REJECT rationale).\n\
+         - If fixable: fix and resume with name + resume=<wf_id> from the error, or delegate the failed step to a specialist.\n\
+         - If not fixable or needs the user: explain the failure, the intermediate results, and the next-step options to the user, and let them decide. Never just paste the error and stop."
     )
 }
 // 进程级单调序号，保证 plan_id 全局唯一。
@@ -6438,16 +6382,13 @@ async fn register_delegate_tool(
     });
 
 
+    let usage = delegate_tool_hint(merged);
     let tool = Tool::builder(
         "delegate".to_string(),
-        format!("Delegate a subtask to a specialist agent. Available roles: {roster}"),
+        usage,
         input_schema,
         handler,
     )
-    // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：specialist 委派自带
-    // wall-clock 超时（specialist_timeout_secs）与取消旗标，不需要
-    // 工具管理器 25min 熔断再插一刀（子代理写整套文档/跑构建时会
-    // 正常超过）。
     .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
     .build();
 
@@ -6559,7 +6500,8 @@ async fn register_workflow_tool(
     // 两条同身份流水线会互相踩 staging 区、各写一份 checkpoint，产出
     // 谁覆盖谁取决于时序。
     let wf_ledger = crate::dispatch_ledger::DispatchLedger::new();
-
+    let cwd_for_hint = cwd.clone();
+    let usage = workflow_tool_hint(&cwd_for_hint);
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
         let merged = Arc::clone(&merged_owned);
         let resolver = Arc::clone(&resolver_owned);
@@ -6684,15 +6626,12 @@ async fn register_workflow_tool(
                 })
         })
     });
-
     let tool = Tool::builder(
         "workflow".to_string(),
-        format!("Run a named multi-role workflow. Available workflows: {available_text}"),
+        usage,
         input_schema,
         handler,
     )
-    // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：一次调用包着整条流水线，
-    // 不能吃工具管理器 25min 默认熔断。
     .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
     .build();
 

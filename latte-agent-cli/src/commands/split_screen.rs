@@ -328,6 +328,12 @@ pub fn visible_window(text: &str, cursor_chars: usize, width: usize) -> (String,
 /// stdin 不是 TTY 说明输入是脚本喂的——两种情况都必须退回纯文本路径，
 /// 否则转义序列会污染被断言的输出、raw mode 也读不到脚本输入。
 pub fn split_screen_available() -> bool {
+    // 测试/驱动用：通过 `LATTE_CHAT_NO_SPLIT_SCREEN=1` 强制走纯文本路径，
+    // 即使 stdin/stdout 都是 TTY（PTY 驱动场景）。让 `answer › ` 之类
+    // 提示以可 grep 的纯文本形式落到 stdout，PTY pexpect 驱动能识别。
+    if std::env::var_os("LATTE_CHAT_NO_SPLIT_SCREEN").is_some() {
+        return false;
+    }
     std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
 }
 

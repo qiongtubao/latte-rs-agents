@@ -358,10 +358,10 @@ impl ChatCmd {
         // 守卫必须是局部变量：static 永不 drop，靠 `Drop for SplitScreen`
         // 恢复终端是不成立的（实机抓到 `?2004l` 从未下发）。
         let _ui_guard = UiGuard;
-        // 立刻拉起常驻按键线程：输入行必须在**第一个 turn 期间**就已经
-        // 活着，不能等到第一次 read_user_line 才起——否则第一轮等待时
-        // 用户打的字仍然看不见。
-        spawn_input_thread();
+        // 只有在 split-screen 真正启用时，才拉起按键线程（避免与纯文本 read_line 双读 stdin）。
+        if split_ui().lock().is_some() {
+            spawn_input_thread();
+        }
         loop {
             let model_id = session.primary_model_id();
             let role_icon = session.role_icon();

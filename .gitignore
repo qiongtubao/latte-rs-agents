@@ -10,6 +10,9 @@
 /.latte/chat-sessions/
 /.latte/ui-sessions/
 /.latte/tasks/
+/.latte/cli-sessions/
+/.latte/pending-asks/
+/.latte/workflow-runs/
 .omc/
 # Project-level config (committed):
 #   .latte/agents/        — role TOML (id, tools, model_chain, etc.)
