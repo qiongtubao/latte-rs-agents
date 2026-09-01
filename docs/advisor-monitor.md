@@ -136,7 +136,14 @@ D1–D4 命中 → **立即**走通道 A 注入确定性提示（不等 LLM，ma
   弹窗收齐 4 个答案后输出 user_profile，advisor 看不到 `ask` 的执行记录，误判
   「伪造答案」→ intervene → 带反馈重做 → 用户被重复提问。
 
-裁决语义与 §3 相同；`intervene`/`terminate` 时除气泡外还会把审查批注追加进 manager
+裁决语义与 §3 相同，另多一个 **`remedy: patch | restart`** 键（仅 intervene/
+terminate 时填，缺省 patch）：advisor 必须**优先选 patch**——workflow 引擎收到
+patch 时**复用同一 subsession 的 runner 续作修补**（上下文里保留着全部已完成的
+探索与工具取证，只需追加一轮修订 turn），只有产出基于虚构事实、方向根本错误、
+上下文被污染到「续作不如重来」时才选 restart（废弃本轮分派，全新 runner 重做，
+整轮工具调用作废重烧）。选型动机见 `workflow.rs` `run_step_speaker` 的
+`held_runner` 注释（实测实锤：46 万 input tokens 的探索型分派被 intervene 打回后
+整轮重跑）。`intervene`/`terminate` 时除气泡外还会把审查批注追加进 manager
 消费的 payload。advisor 不可用或审查超时（`delegate_review_timeout`，可配）→
 **静默降级**，原样放行专家产出。
 

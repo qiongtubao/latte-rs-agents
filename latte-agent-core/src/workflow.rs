@@ -2869,10 +2869,12 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         None => (None, None),
     };
 
-    // 2-4. 执行 + advisor 返回审查的重做环：返回被判 intervene/terminate
-    //    时带【上轮审查反馈】重派——advisor 的「打回重做」不再只是批注
+    // 2-4. 执行 + advisor 返回审查的返工环：返回被判 intervene/terminate
+    //    时带【上轮审查反馈】返工——advisor 的「打回」不再只是批注
     //    （实测实锤：reviewer 空转被 advisor 抓到、hint 要求重做，
-    //    流水线却照流不误）。上限可配（AdvisorMonitorConfig::
+    //    流水线却照流不误）。返工分两种：remedy=patch（默认）续作复用
+    //    同一 runner 的 context 修补；remedy=restart 才废弃重建。
+    //    上限可配（AdvisorMonitorConfig::
     //    review_settings.return_max_redo，经 engine 注入），默认 1、
     //    硬上限 MAX_RETURN_REDO。
     let max_redo = inp
@@ -2882,64 +2884,80 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         .unwrap_or(crate::advisor_monitor::DEFAULT_RETURN_MAX_REDO);
     let mut prompt_for_turn = inp.prompt.clone();
     let mut redo: u8 = 0;
+    // 续作句柄：advisor 打回判 remedy=patch 时**复用同一 runner** 追加
+    // 一轮修补 turn——它的 context 里保留着全部已完成的探索与工具取证
+    // （AgentRunner::run_turn 把每轮 user/assistant 消息持久进 context，
+    // 见 agent.rs），修订只需一两次模型调用；而不是整轮重跑（实测实锤：
+    // 46 万 input tokens 的探索型分派被 intervene 打回后全部作废重烧）。
+    // 仅 remedy=restart（产出基于虚构/方向全错，续作不如重来）时清空
+    // 此槽位，下一次循环重建全新 runner。
+    let mut held_runner: Option<AgentRunner> = None;
+    let mut role_responsibilities = String::new();
     let result: Result<SpeakerOut, StepFail> = loop {
-        // 2. Fresh runner（每次尝试都是全新 subagent，无跨次记忆）
-        //    + sink + gate。
-        let (mut runner, role_responsibilities) = match build_role_runner(
-            &speaker,
-            &inp.merged,
-            &inp.resolver,
-            &inp.default_params,
-            &inp.cwd,
-            &inp.event_tx,
-            inp.agent_pause_gate.clone(),
-            inp.cancel_flag.clone(),
-            inp.staging.clone(),
-            &inp.step_tools,
-            Some(inp.answer_log.clone()),
-            inp.plan_stage.clone(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // 构建失败也要补 DelegateFinished——否则 UI 上的分派
-                // 气泡永远停在「⏳ 执行中…」。
-                if let Some(id) = &sub_id {
-                    let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
-                        from_role: "manager".into(),
-                        to_role: speaker.clone(),
-                        status: "failed".into(),
-                        summary: e.clone(),
-                        sub_id: id.clone(),
-                        wf_id: Some(inp.wf_id.clone()),
-                    });
+        // 2. Runner：patch 续作复用 held_runner；首发与 restart 重建
+        //    （全新 subagent，无跨次记忆）+ sink + gate。
+        let mut runner = match held_runner.take() {
+            Some(r) => r,
+            None => {
+                let (mut r, resp) = match build_role_runner(
+                    &speaker,
+                    &inp.merged,
+                    &inp.resolver,
+                    &inp.default_params,
+                    &inp.cwd,
+                    &inp.event_tx,
+                    inp.agent_pause_gate.clone(),
+                    inp.cancel_flag.clone(),
+                    inp.staging.clone(),
+                    &inp.step_tools,
+                    Some(inp.answer_log.clone()),
+                    inp.plan_stage.clone(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // 构建失败也要补 DelegateFinished——否则 UI 上的分派
+                        // 气泡永远停在「⏳ 执行中…」。
+                        if let Some(id) = &sub_id {
+                            let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: speaker.clone(),
+                                status: "failed".into(),
+                                summary: e.clone(),
+                                sub_id: id.clone(),
+                                wf_id: Some(inp.wf_id.clone()),
+                            });
+                        }
+                        return Err(StepFail::Failed(e));
+                    }
+                };
+                role_responsibilities = resp;
+                if let Some(sink) = &sub_sink {
+                    // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
+                    // 由此广播到 session channel，advisor monitor 的
+                    // specialist-error 检测依赖它（与 delegate 路径一致）。
+                    let specialist_sink: Arc<dyn crate::trace::TraceSink> =
+                        Arc::new(crate::trace::FanOutSink::new(vec![
+                            sink.clone(),
+                            Arc::new(crate::controller::ChatEventTraceSink {
+                                event_tx: inp.event_tx.clone(),
+                                sub_id: sub_id.clone(),
+                            }),
+                        ]));
+                    r = r.with_sink(specialist_sink);
                 }
-                return Err(StepFail::Failed(e));
+                if let Some(gate) = inp.advisor_gate.clone() {
+                    r = r.with_gate_config(gate);
+                }
+                // intervene 暂停门也装到专家 runner：运行中判 Intervene 时在
+                // tool-round 边界 park，直到用户拍板（或超时自动恢复）。
+                if let Some(gate) = &inp.advisor_pause {
+                    r = r.with_pause_gate(gate.clone());
+                }
+                r
             }
         };
-        if let Some(sink) = &sub_sink {
-            // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
-            // 由此广播到 session channel，advisor monitor 的
-            // specialist-error 检测依赖它（与 delegate 路径一致）。
-            let specialist_sink: Arc<dyn crate::trace::TraceSink> =
-                Arc::new(crate::trace::FanOutSink::new(vec![
-                    sink.clone(),
-                    Arc::new(crate::controller::ChatEventTraceSink {
-                        event_tx: inp.event_tx.clone(),
-                        sub_id: sub_id.clone(),
-                    }),
-                ]));
-            runner = runner.with_sink(specialist_sink);
-        }
-        if let Some(gate) = inp.advisor_gate.clone() {
-            runner = runner.with_gate_config(gate);
-        }
-        // intervene 暂停门也装到专家 runner：运行中判 Intervene 时在
-        // tool-round 边界 park，直到用户拍板（或超时自动恢复）。
-        if let Some(gate) = &inp.advisor_pause {
-            runner = runner.with_pause_gate(gate.clone());
-        }
         let _ = inp.event_tx.send(ChatEvent::RoleStarted {
             role_id: speaker.clone(),
             detail: format!("workflow step '{}'", inp.step_id),
@@ -2967,7 +2985,9 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
             // 失败路径也带出 tool_count / summary：死循环熔断的降级采纳
             // 需要它们（被熔断的 step 恰恰是工具用得最多的 step，摘要对
             // 下游最有价值）。
-            (result, tool_count, tool_summary)
+            // runner 一并带回：成功路径下 advisor 判 patch 续作时复用
+            // 它的 context（见 held_runner），不必重建。
+            (runner, result, tool_count, tool_summary)
         });
         // 外层 future 被 drop（上层取消 / 用户终止）时连带 abort 这个
         // spawn 出去的分派。`JoinHandle` 自己 drop **不取消**任务，光靠
@@ -2991,7 +3011,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     match r {
                         // 剥 <think>：主 session 展示与后续 speaker 的
                         // transcript 只保留正式回答；原文留在子会话 trace。
-                        Ok((Ok(response), tool_count, tool_summary)) => {
+                        Ok((returned, Ok(response), tool_count, tool_summary)) => {
+                            // runner 放回槽位：成功产出若被 advisor 判
+                            // patch 续作，下一轮复用它的 context。
+                            held_runner = Some(returned);
                             let stripped = crate::controller::strip_think_blocks(&response);
                             // 空产出不算成功：判失败让引擎重试/失败，
                             // 而不是把空串写进 vars 穿给下游。
@@ -3004,7 +3027,11 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                             }
                             break;
                         }
-                        Ok((Err(e), tool_count, tool_summary)) => {
+                        Ok((returned, Err(e), tool_count, tool_summary)) => {
+                            // 失败路径不复用 runner：context 可能带着半截
+                            // 脏 turn；redo 环对 Err 也只会 break 出去，
+                            // 这里直接丢弃。
+                            drop(returned);
                             // ── 死循环熔断的降级采纳 ──────────────────
                             //
                             // 「撞上限」≠「零产出」。此前这里把
@@ -3199,15 +3226,24 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                 if intervene && redo < max_redo {
                     redo += 1;
                     let v = verdict.as_ref().expect("intervene 蕴含 verdict");
+                    // 处置分流：patch（默认）复用 held_runner 在同一
+                    // subsession 续作修补；restart 清空槽位，下一次循环
+                    // 重建全新 subagent（仅在 advisor 判定续作不如重做时）。
+                    let restart =
+                        matches!(v.remedy, crate::advisor_monitor::Remedy::Restart);
+                    if restart {
+                        held_runner = None;
+                    }
+                    let action = if restart { "重做" } else { "续作修补" };
                     let _ = inp.event_tx.send(ChatEvent::Status {
                         message: format!(
-                            "↩ advisor 判定 {speaker} 的返回未达标，带审查意见重做（第 {redo}/{max_redo} 次）"
+                            "↩ advisor 判定 {speaker} 的返回未达标，带审查意见{action}（第 {redo}/{max_redo} 次）"
                         ),
                     });
                     // 与下一次派发的 RoleStarted 配平。
                     let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                         role_id: speaker.clone(),
-                        detail: "advisor intervene：带审查意见重做".into(),
+                        detail: format!("advisor intervene：带审查意见{action}"),
                         sub_id: sub_id.clone(),
                     });
                     let feedback = if v.hint.is_empty() {
@@ -3216,11 +3252,23 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         format!("{}
 处理建议：{}", v.reason, v.hint)
                     };
-                    prompt_for_turn =
+                    prompt_for_turn = if restart {
+                        // 全新 subagent 没有上下文：重发原始任务 + 反馈。
                         format!("{}
 
 【上轮审查反馈】
-{}", inp.prompt, feedback);
+{}", inp.prompt, feedback)
+                    } else {
+                        // 续作：原始任务与上轮产出已在 runner context 里，
+                        // 只发反馈 + 修补指令——重发原始任务会让模型误以为
+                        // 要推倒重来。
+                        format!(
+                            "【审查打回·续作】你的上一版产出未通过返回审查。\n\n【上轮审查反馈】\n{feedback}\n\n\
+                             请在**已有产出与已完成取证**的基础上修订后重新作答——\
+                             不要重复已做过的探索/读取，只补必要的新取证。\
+                             若审查意见不成立，说明理由后给出修订版。"
+                        )
+                    };
                     continue;
                 }
                 break Ok(SpeakerOut { response: annotated, tools: tool_summary });
@@ -7456,11 +7504,12 @@ require_plan_submit = true
         );
     }
 
-    /// advisor 返回审查判 intervene → 同一 speaker 带【上轮审查反馈】
-    /// 重做一次，第二次审 ok → step 成功、产出是重做版（实测实锤：
-    /// reviewer 空转被 advisor 抓到「打回重做」，流水线却照流不误）。
+    /// advisor 返回审查判 intervene（未写 remedy → 默认 patch）→ 同一
+    /// runner **续作**修补：第二次请求必须带着首轮的完整上下文（含 v1
+    /// 产出），而不是全新 subagent 重跑（实测实锤：探索型分派被 intervene
+    /// 打回后整轮重跑，几十万 input tokens 作废）。
     #[tokio::test]
-    async fn advisor_intervene_triggers_redo_with_feedback() {
+    async fn advisor_intervene_triggers_patch_continuation_with_feedback() {
         let server = wiremock::MockServer::start().await;
         let v1 = "v1 产出：这份内容足够长，肯定超过五十个字符的短输出门禁阈值，不含工具回声。";
         let v2 = "v2 产出：已吸收审查意见重写，同样超过五十个字符的短输出门禁阈值，不含工具回声。";
@@ -7523,8 +7572,14 @@ prompt = "围绕测试主题产出学习笔记。"
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 4, "worker×2 + advisor×2: {}", requests.len());
         let redo_req = String::from_utf8_lossy(&requests[2].body);
-        assert!(redo_req.contains("【上轮审查反馈】"), "重做 prompt 带反馈批注: {redo_req}");
+        assert!(redo_req.contains("【上轮审查反馈】"), "续作 prompt 带反馈批注: {redo_req}");
         assert!(redo_req.contains("重写并紧扣任务"), "批注含 advisor hint: {redo_req}");
+        // 续作的判据：同一 runner 的 context 保留了首轮产出——全新
+        // subagent 重跑的请求里不会有它。
+        assert!(
+            redo_req.contains("v1 产出"),
+            "续作请求必须带首轮上下文（含 v1 产出）: {redo_req}"
+        );
 
         let events: Vec<ChatEvent> = {
             let mut v = Vec::new();
@@ -7536,9 +7591,9 @@ prompt = "围绕测试主题产出学习笔记。"
         assert!(
             events.iter().any(|ev| matches!(
                 ev,
-                ChatEvent::Status { message } if message.contains("带审查意见重做")
+                ChatEvent::Status { message } if message.contains("带审查意见续作修补")
             )),
-            "应有重做 Status 事件: {events:?}"
+            "应有续作修补 Status 事件: {events:?}"
         );
         // intervene 批注不污染最终产出（verdict ok 的第二次返回原样）。
         assert!(!out.contains("监察审查"));
@@ -7608,6 +7663,92 @@ prompt = "围绕测试主题产出学习笔记。"
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 4, "只重做一次: {}", requests.len());
+    }
+
+    /// advisor 显式判 remedy: restart → 废弃本轮产出，**重建全新 runner**
+    /// 重跑：重做请求带原始任务 + 反馈，但**不含**首轮上下文（与 patch
+    /// 续作相反——续作请求里能查到首轮产出，见上上个测试）。
+    #[tokio::test]
+    async fn advisor_intervene_remedy_restart_rebuilds_fresh_runner() {
+        let server = wiremock::MockServer::start().await;
+        let v1 = "v1 产出：这份内容足够长，肯定超过五十个字符的短输出门禁阈值，不含工具回声。";
+        let v2 = "v2 产出：已按 restart 重做，同样超过五十个字符的短输出门禁阈值，不含工具回声。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("v2 产出"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("【上轮审查反馈】"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(v2)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("v1 产出"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 内容基于虚构，续作不可信\nhint: 推倒重来\nremedy: restart",
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(v1)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "restart_test"
+description = "advisor intervene restart"
+
+[[steps]]
+id = "only"
+description = "单步"
+speakers = ["worker"]
+output_key = "out"
+prompt = "围绕测试主题产出学习笔记。"
+"#,
+        )
+        .unwrap();
+        let (mut ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("restart 重做后应成功");
+        assert_eq!(out, v2, "最终产出必须是重做版");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4, "worker×2 + advisor×2: {}", requests.len());
+        let redo_req = String::from_utf8_lossy(&requests[2].body);
+        assert!(redo_req.contains("【上轮审查反馈】"), "重做 prompt 带反馈批注: {redo_req}");
+        assert!(
+            !redo_req.contains("v1 产出"),
+            "restart 必须是全新上下文，不得携带首轮产出: {redo_req}"
+        );
+
+        let events: Vec<ChatEvent> = {
+            let mut v = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                v.push(ev);
+            }
+            v
+        };
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                ChatEvent::Status { message } if message.contains("带审查意见重做")
+            )),
+            "restart 应发「重做」Status 事件: {events:?}"
+        );
     }
 
     /// 分派 = 完整 subagent（与普通流程 delegate 一致）：ctx 带

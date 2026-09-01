@@ -520,7 +520,11 @@ pub struct PlanTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i64>,
     /// 标签数组。空则不序列化。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "empty_str_as_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub labels: Vec<String>,
     /// 执行该任务的 workflow 名（tdd_development/bug_triage/update_docs）。
     /// 轻量任务可空。空则不序列化。
@@ -543,12 +547,69 @@ pub struct PlanTask {
         alias = "affected_files",
         alias = "file_paths",
         alias = "files",
+        deserialize_with = "empty_str_as_empty_vec",
         skip_serializing_if = "Vec::is_empty"
     )]
     pub paths: Vec<String>,
     /// 子任务，同构，最多一层。空则不序列化。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "empty_str_as_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub subtasks: Vec<PlanTask>,
+}
+
+/// 模型的高频习惯：把「空」写成 `""` 或 `null`（`workflow: ""` 对
+/// `Option<String>` 恰好合法，模型就类推到数组字段——实测 jemalloc
+/// 会话里每个叶子子任务都带 `"subtasks": ""`，整单被拒）。裸 `Vec`
+/// 反序列化会直接拒掉，这里把 `""`/`null` 收编成空数组；与 `paths`
+/// 的别名防线同思路：模型写偏不致命，后续校验仍能拿到正确数据。
+///
+/// 用 Visitor 而不是先转 `serde_json::Value`：后者会脱离外层
+/// `serde_path_to_error` 的路径跟踪，嵌套元素的类型错误只能报到本
+/// 字段为止（如 `subtasks[0].labels` 只报得出 `subtasks`）。其他类型
+/// 错误（如 `"labels": 5`）照常报错，由调用方的 `serde_path_to_error`
+/// 补上完整字段路径。
+fn empty_str_as_empty_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct LenientVec<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for LenientVec<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array (empty string / null is treated as empty)")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Vec<T>, E> {
+            if s.trim().is_empty() {
+                Ok(Vec::new())
+            } else {
+                Err(serde::de::Error::invalid_type(
+                    serde::de::Unexpected::Str(s),
+                    &self,
+                ))
+            }
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(item) = seq.next_element::<T>()? {
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    d.deserialize_any(LenientVec(std::marker::PhantomData))
 }
 
 /// plan 阶段门（oh-my-pi plan-mode 写门禁在 delegate 层的等价物）：
@@ -4961,10 +5022,21 @@ pub fn register_plan_tool(
                 return Err(tool_err("'tasks' must not be empty".into()));
             }
             // 逐项解析 + 校验 title 非空（与后端 import_tasks 的校验对齐）。
+            // serde_path_to_error：裸 from_value 的报错没有字段路径
+            // （"tasks[0] invalid: invalid type: string \"\", expected a
+            // sequence"），模型不知道是哪层哪个字段，会对着错误字段空转
+            // 重试（实测 manager 误诊成 workflow 字段、原样重撞两次）。
             let mut tasks: Vec<PlanTask> = Vec::with_capacity(tasks_arr.len());
             for (i, t) in tasks_arr.iter().enumerate() {
-                let pt: PlanTask = serde_json::from_value(t.clone())
-                    .map_err(|e| tool_err(format!("tasks[{i}] invalid: {e}")))?;
+                let pt: PlanTask =
+                    serde_path_to_error::deserialize(t.clone()).map_err(|e| {
+                        let path = e.path().to_string();
+                        if path == "." {
+                            tool_err(format!("tasks[{i}] invalid: {e}"))
+                        } else {
+                            tool_err(format!("tasks[{i}] invalid: {e}（出错字段：{path}）"))
+                        }
+                    })?;
                 if pt.title.trim().is_empty() {
                     return Err(tool_err(format!("tasks[{i}].title must not be empty")));
                 }
@@ -7834,6 +7906,79 @@ mod tests {
                 plan_id: plan_id.clone()
             }
         );
+    }
+
+    /// 实测会话回归：模型把「空数组」写成 `""`（叶子子任务的
+    /// `"subtasks": ""`、顶层 `"labels": ""`）。宽容反序列化应收编成空
+    /// 数组、整单放行，而不是整单拒绝。
+    #[tokio::test]
+    async fn plan_tool_tolerates_empty_string_arrays() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
+            .expect("register plan");
+
+        let out = tm
+            .execute(
+                "plan",
+                serde_json::json!({
+                    "tasks": [{
+                        "title": "T1 读 tsd",
+                        "labels": "",
+                        "paths": "",
+                        "workflow": "",
+                        "subtasks": [
+                            { "title": "T1.1 读 configure.ac", "labels": "", "subtasks": "" },
+                            { "title": "T1.2 画 tsd 状态机", "subtasks": null }
+                        ]
+                    }]
+                }),
+                None,
+            )
+            .await
+            .expect("空字符串/null 数组应收编成空数组、整单放行");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("plan_id=plan-manager-"), "{text}");
+
+        let ev = _rx.try_recv().expect("PlanProposed event");
+        let ChatEvent::PlanProposed { tasks, .. } = ev else {
+            panic!("expected PlanProposed, got {ev:?}");
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].subtasks.len(), 2);
+        assert!(tasks[0].labels.is_empty() && tasks[0].paths.is_empty());
+        assert!(tasks[0].subtasks[0].subtasks.is_empty());
+    }
+
+    /// 真正的类型错误必须报出字段路径——无路径的报错会让模型对着
+    /// 错误字段空转重试（实测 manager 把 subtasks:"" 误诊成 workflow
+    /// 字段、原样重撞两次后才想起来委派审查）。
+    #[tokio::test]
+    async fn plan_tool_type_error_names_field_path() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
+            .expect("register plan");
+
+        let err = tm
+            .execute(
+                "plan",
+                serde_json::json!({
+                    "tasks": [{ "title": "T1", "subtasks": [{ "title": "T1.1", "labels": 5 }] }]
+                }),
+                None,
+            )
+            .await
+            .expect_err("labels 传数字必须被拒");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("subtasks[0].labels"),
+            "报错应指出嵌套字段路径：{msg}"
+        );
+        // 类型错误不进 PendingApproval（模型可修正后同轮重调）。
+        assert_eq!(stage.read().clone(), PlanStage::Normal);
     }
 
     // ─── slash 路径自动提案（extract_plan_tasks / propose_plan_from_summary）──

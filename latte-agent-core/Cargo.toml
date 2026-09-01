@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Used by config / role modules in the library
 serde = { workspace = true }
 serde_json = { workspace = true }
+# plan 工具参数报错带字段路径（裸 serde_json 的 "invalid type" 不说是
+# 哪个字段，模型会对着错误字段空转重试——实测 manager 把子任务里
+# subtasks:"" 的报错误诊成 workflow 字段，原样重撞两次）。
+serde_path_to_error = "0.1"
 toml = { workspace = true }
 serde_yaml = { workspace = true }
 handlebars = { workspace = true }

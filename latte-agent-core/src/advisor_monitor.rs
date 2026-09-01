@@ -817,12 +817,27 @@ pub enum Verdict {
     Terminate,
 }
 
+/// advisor 判 intervene/terminate 后的处置建议：**优先续作**（同一
+/// subsession 带审查反馈再跑一轮，保留已完成的取证与上下文，成本约
+/// 一两次模型调用）；仅当产出基于虚构事实、方向根本错误或上下文已
+/// 被污染到「续作不如重来」时才建议 restart（废弃本次分派，全新
+/// runner 重做——整轮工具调用与探索全部作废重烧）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Remedy {
+    /// 默认：续作修补。advisor 未写 remedy 行时按此处理。
+    #[default]
+    Patch,
+    Restart,
+}
+
 /// Parsed advisor review output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewVerdict {
     pub verdict: Verdict,
     pub reason: String,
     pub hint: String,
+    /// intervene/terminate 时的处置建议；ok/warn 时无意义（恒 Patch）。
+    pub remedy: Remedy,
 }
 
 fn verdict_word(s: &str) -> Option<Verdict> {
@@ -869,15 +884,18 @@ fn strip_think_blocks(raw: &str) -> String {
 /// verdict: ok | warn | intervene
 /// reason: <user-visible justification>
 /// hint: <one-line correction for the manager>
+/// remedy: patch | restart   (可选，仅 intervene/terminate 时有意义)
 /// ```
 ///
 /// Tolerates a bare verdict word on its own line and multi-line
 /// reason/hint sections. Malformed output degrades to `Ok`
 /// (no action — an unreadable review must not inject noise).
+/// 缺省 remedy = patch（续作优先），见 [`Remedy`]。
 pub fn parse_verdict(raw: &str) -> ReviewVerdict {
     let cleaned = strip_think_blocks(raw);
     let raw = cleaned.as_str();
     let mut verdict: Option<Verdict> = None;
+    let mut remedy = Remedy::default();
     let mut reason_lines: Vec<&str> = Vec::new();
     let mut hint_lines: Vec<&str> = Vec::new();
     // 0 = no open section, 1 = reason, 2 = hint.
@@ -888,6 +906,20 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
         let lower = t.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("verdict:") {
             verdict = verdict_word(rest).or(verdict);
+            section = 0;
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("remedy:") {
+            let w = rest
+                .trim()
+                .trim_matches(|c: char| c == '*' || c == '`')
+                .trim_end_matches(['.', ';', '。', '；'])
+                .trim()
+                .to_ascii_lowercase();
+            remedy = match w.as_str() {
+                "restart" | "redo" | "重做" => Remedy::Restart,
+                _ => Remedy::Patch,
+            };
             section = 0;
             continue;
         }
@@ -926,6 +958,7 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
         verdict: verdict.unwrap_or(Verdict::Ok),
         reason: reason_lines.join("\n").trim().to_string(),
         hint: hint_lines.join("\n").trim().to_string(),
+        remedy,
     }
 }
 
@@ -1374,12 +1407,17 @@ fn build_delegate_review_prompt(
 
 verdict: ok | warn | intervene
 reason: <1-3 句给用户看的裁决理由；verdict 为 ok 时留空>
-hint: <给 manager 的一句话提示，说明该返回的问题以及应如何处理（打回重做 / 补充哪部分）；仅 intervene 时必填，其余留空>
+hint: <给 manager 的一句话提示，说明该返回的问题以及应如何处理（续作修补 / 重做 / 补充哪部分）；仅 intervene 时必填，其余留空>
+remedy: patch | restart
 
 判定标准：
 - 切题、在职责内、达成了任务 → ok
 - 有瑕疵但基本可用（略不完整 / 轻微偏移）→ warn：只给用户看气泡，不改返回内容
-- 明显越权、答非所问、或未达成任务 → intervene：会在返回给 manager 的内容后追加审查提示"#
+- 明显越权、答非所问、或未达成任务 → intervene：会在返回给 manager 的内容后追加审查提示
+
+remedy 的填写规则（仅 intervene 时填，其余留空）：
+- patch（默认，优先选）：让该专家在**同一 subsession** 里带着你的审查意见续作修补——它已完成的探索、读过的代码、工具取证都还在上下文里，修订成本很低。绝大多数「形态不对 / 遗漏要点 / 结论需调整」都该选它。
+- restart（慎用）：仅当产出**基于虚构事实、方向根本错误、或上下文已被错误结论污染到不可信**，在坏产出上续作反而比重头再来更糟时才选。restart 会废弃该专家本轮全部工作（所有工具调用与探索作废重跑），代价是整轮 token 与时间重烧——选它必须在 reason 里说清为什么 patch 救不回来。"#
     )
 }
 
@@ -3062,6 +3100,25 @@ mod tests {
         // 未闭合的 think 块（截断输出）剥到末尾，剩余部分照常解析。
         let v2 = parse_verdict("verdict: ok\n<think>verdict: intervene\nreason: 草稿");
         assert_eq!(v2.verdict, Verdict::Ok);
+    }
+
+    #[test]
+    fn parse_verdict_remedy_defaults_patch_and_parses_restart() {
+        // 不写 remedy → 默认 patch（续作优先）。
+        let v = parse_verdict("verdict: intervene\nreason: 偏航\nhint: 重写");
+        assert_eq!(v.remedy, Remedy::Patch);
+        // restart 显式解析，容忍别名/中文。
+        let v = parse_verdict("verdict: intervene\nreason: 虚构\nhint: 重来\nremedy: restart");
+        assert_eq!(v.remedy, Remedy::Restart);
+        let v = parse_verdict("verdict: intervene\nreason: x\nhint: y\nremedy: 重做");
+        assert_eq!(v.remedy, Remedy::Restart);
+        // remedy 行是独立键，不能吞掉后面的 hint 段。
+        let v = parse_verdict("verdict: intervene\nreason: x\nremedy: restart\nhint: 保留我");
+        assert_eq!(v.remedy, Remedy::Restart);
+        assert_eq!(v.hint, "保留我");
+        // patch 显式写出也按 patch。
+        let v = parse_verdict("verdict: intervene\nreason: x\nhint: y\nremedy: patch");
+        assert_eq!(v.remedy, Remedy::Patch);
     }
 
     // ── transcript rolling ─────────────────────────────────────────

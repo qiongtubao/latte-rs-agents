@@ -59,7 +59,7 @@ pub mod workflows;
 mod test;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::routing::{get, post};
@@ -174,6 +174,12 @@ pub struct UiBackend {
 }
 
 impl UiBackend {
+    /// 容器的工作目录（task_types 等按文件路径操作的 API 需要它；
+    /// 字段本身是 `pub(crate)`，Tauri 命令侧只能经这个访问器拿）。
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     /// 构造容器：先扫描 `<cwd>/.latte/ui-sessions/` 恢复落盘 session
     /// （元数据 + event_log 载入，**不** spawn controller——首个
     /// chat_send/subscribe 懒 spawn）；不新建任何 session，新建走

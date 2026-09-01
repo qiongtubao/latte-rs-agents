@@ -929,7 +929,7 @@ struct RunnerModelSource {
 fn classify_tool_execution_error(
     e: &latte_rs_agent_tools::error::ToolError,
 ) -> ToolCallErrorKind {
-    if let ToolError::ToolNotFound(name) = e {
+    if let ToolError::ToolNotFound { name, .. } = e {
         return ToolCallErrorKind::ToolNotFound {
             tried_aliases: vec![name.clone()],
         };
