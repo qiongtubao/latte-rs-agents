@@ -80,6 +80,30 @@ standard = "deepseek-v4-flash"
 budget   = "deepseek-chat"
 ```
 
+#### Google Gemini（OpenAI-compatible）
+
+`latte-ai` 当前没有独立的 Google wire protocol。Gemini 必须通过 Google 官方
+OpenAI-compatible endpoint 配置；`api` 表示 wire protocol，因此应写
+`api = "openai"`，**不要**写 `api = "google"`：
+
+```toml
+# config/models.toml
+[[models.models]]
+# name 同时是 tier 引用和请求中的 model 字段；按 Google 当前可用模型调整。
+name = "gemini-2.5-pro"
+api = "openai"
+provider = "google"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key = "${GEMINI_API_KEY}"
+context_window = 1048576  # 按所选模型的实际限制调整
+max_tokens = 65536        # 按所选模型的实际限制调整
+```
+
+运行时会在该 `base_url` 后请求 `/chat/completions`，最终路径为
+`/v1beta/openai/chat/completions`。如需通过 tier 使用它，请把现有
+`[models.tiers]` 或 `[models.role_tiers.<role>]` 的值改为同一个 `name`；不要在
+同一 TOML 文件里重复声明 `[models.tiers]` 表。
+
 ### 角色配置
 
 ```toml

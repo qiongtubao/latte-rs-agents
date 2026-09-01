@@ -102,7 +102,10 @@ budget = "deepseek-v4-flash"
 # Required fields:
 #   name             — model id：tier 映射/CLI 标志引用的键，同时是 API
 #                      请求里的 `model` 字段（不是展示名！）
-#   api              — API protocol: "anthropic" | "openai" | "google"
+#   api              — API protocol: "anthropic" | "openai".
+#                      Gemini uses Google's OpenAI-compatible endpoint with
+#                      api="openai", provider="google", and base_url ending
+#                      in `/v1beta/openai`.
 #   provider         — provider slug: "anthropic" | "openai" | "deepseek" | "ollama" | "google"
 #   base_url         — API endpoint base URL
 #   api_key          — API key; use "${ENV_VAR}" to reference environment variables
