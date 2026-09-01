@@ -5521,6 +5521,12 @@ pub fn register_ask_tool(
     // 见 ORCHESTRATION_TOOL_TIMEOUT_SECS：阻塞 ask 无限等用户作答，
     // 不被工具管理器 25min 默认熔断掐断。
     .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
+    // ask 的 handler 明确按「垃圾输入也尽力弹框」设计（宽松布尔、别名、
+    // pros/cons 乱形状都收编，见下方 ChoiceOption 的反序列化容错），而
+    // 共享层的递归 schema 校验比它严格（如 cons:[{text}] 会被拒）。
+    // 弹框工具拒收 = 用户永远看不到问题，比形状不标准严重得多，所以开
+    // 宽容逃生门：校验失败也放行归一化后的参数。
+    .lenient_arg_validation(true)
     .build();
     tm.register(tool, Some(&role_id));
     Ok(())
@@ -7954,6 +7960,11 @@ mod tests {
     /// 真正的类型错误必须报出字段路径——无路径的报错会让模型对着
     /// 错误字段空转重试（实测 manager 把 subtasks:"" 误诊成 workflow
     /// 字段、原样重撞两次后才想起来委派审查）。
+    ///
+    /// 第一道拦截是共享层的递归 schema 校验（`latte-rs-agent-tools`
+    /// `validate_input`，路径用 `/` 分隔）；能穿过它的更深类型错误才
+    /// 轮到 handler 里的 serde_path_to_error 兜底（`tasks[i]` 前缀 +
+    /// `字段路径：` 后缀）。
     #[tokio::test]
     async fn plan_tool_type_error_names_field_path() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
@@ -7974,7 +7985,7 @@ mod tests {
             .expect_err("labels 传数字必须被拒");
         let msg = err.to_string();
         assert!(
-            msg.contains("subtasks[0].labels"),
+            msg.contains("tasks/0/subtasks/0/labels") || msg.contains("subtasks[0].labels"),
             "报错应指出嵌套字段路径：{msg}"
         );
         // 类型错误不进 PendingApproval（模型可修正后同轮重调）。
@@ -8425,8 +8436,10 @@ mod tests {
         assert!(allow_upload, "1 → allow_upload");
     }
 
-    /// options 是对象但含多个数组时无法判定 —— 不瞎猜键名，让 schema
-    /// 校验照常报错，模型拿到反馈自己修。
+    /// options 是对象但含多个数组时无法判定 —— 不瞎猜键名，照常报错，
+    /// 模型拿到反馈自己修。（纠错链：runner 侧 `coerce_tool_input_to_schema`
+    /// 解不开 → 共享层 schema 校验因 ask 声明了 lenient_arg_validation
+    /// 而放行 → handler 自己做最终判定并拒绝。）
     #[tokio::test]
     async fn ask_rejects_ambiguous_options_object() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
@@ -8440,7 +8453,7 @@ mod tests {
         let err = ask_via_pipeline(&tm, input)
             .await
             .expect_err("多个候选数组必须报错");
-        assert!(err.to_string().contains("schema validation"), "{err}");
+        assert!(err.to_string().contains("must be an array"), "{err}");
     }
 
     /// 纠正器只按 schema 声明动手，绝不碰未声明字段，也不猜无法识别
