@@ -2713,6 +2713,181 @@ pub fn toggle_tool(b: &UiBackend, id: &str, enabled: bool) -> Result<bool, ApiEr
         .set_enabled(id, enabled)
         .map_err(|e| ApiError::internal(format!("toggle tool: {e}")))
 }
+
+/// `GET /api/tools/:id/doc` 的返回：工具的模型侧 Markdown 文档 + 是否可编辑。
+///
+/// `content` 是模型在运行时真正读到的那份文档（见 controller 的
+/// `tool_prompt_content`：磁盘 `prompts/tools/<id>.md` 优先，缺省回退到
+/// 编译期 `include_str!` 的内置常量）。
+#[derive(Serialize)]
+pub struct ToolDocResponse {
+    /// 工具短名（与 `ToolEntry.id` 对齐）。
+    pub id: String,
+    /// 文档正文（Markdown 原文，未渲染）。可能为空（该工具无任何文档）。
+    pub content: String,
+    /// 是否可编辑保存：
+    /// - `dynamic`（controller 运行时动态注册，如 delegate/workflow）→ `false`，只读；
+    /// - 其余（builtin / package_alias）→ `true`，可写到 `<cwd>/prompts/tools/<id>.md`。
+    pub editable: bool,
+    /// 文档来源：`"disk"`（项目本地覆盖文件）| `"embedded"`（编译期内置）| `"none"`（无文档）。
+    pub source: String,
+    /// 若来源为磁盘，给出相对路径提示（UI 展示"文件位置"）。
+    pub path: String,
+    /// 工具简介（一行描述，取自枚举结果）。
+    pub description: String,
+    /// 工具分组（builtin / dynamic / package_alias），供 UI 显示与判定。
+    pub kind: String,
+}
+
+/// 校验工具 id 不含路径分隔符/父目录跳出，防止写到 `prompts/tools/` 之外。
+fn validate_tool_doc_id(id: &str) -> Result<(), ApiError> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || id.contains(std::path::MAIN_SEPARATOR)
+    {
+        return Err(ApiError::bad_request(format!("非法工具 id: {id:?}")));
+    }
+    Ok(())
+}
+
+/// 在枚举结果里找该工具的 `(kind, description)`；未找到返回 `None`。
+async fn lookup_tool_meta(id: &str) -> Option<(String, String)> {
+    let tools = crate::tools::enumerate().await.ok()?;
+    tools
+        .into_iter()
+        .find(|t| t.id == id)
+        .map(|t| (t.kind, t.description))
+}
+
+/// 工具文档的相对路径（与运行时 `tool_prompt_content` 用的相对路径一致）。
+fn tool_doc_rel_path(id: &str) -> String {
+    format!("prompts/tools/{id}.md")
+}
+
+/// 解析工具文档内容 + 来源，纯函数（只依赖 `cwd` 与 `id`，便于单测）。
+///
+/// 顺序与 controller 的 `tool_prompt_content` 一致：磁盘
+/// `<cwd>/prompts/tools/<id>.md` 优先，缺省回退编译期内置常量。
+fn resolve_tool_doc_at(cwd: &Path, id: &str) -> (String, &'static str) {
+    let disk_path = cwd.join(tool_doc_rel_path(id));
+    if let Ok(text) = std::fs::read_to_string(&disk_path) {
+        return (text, "disk");
+    }
+    if let Some(embedded) = latte_agent_core::prompts::tool_prompts::for_tool(id) {
+        return (embedded.trim().to_string(), "embedded");
+    }
+    (String::new(), "none")
+}
+
+/// 写工具文档到 `<cwd>/prompts/tools/<id>.md`（含建目录），纯 IO，便于单测。
+fn write_tool_doc_at(cwd: &Path, id: &str, content: &str) -> Result<PathBuf, ApiError> {
+    let disk_path = cwd.join(tool_doc_rel_path(id));
+    if let Some(dir) = disk_path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    }
+    std::fs::write(&disk_path, content)
+        .map_err(|e| ApiError::internal(format!("write {}: {e}", disk_path.display())))?;
+    Ok(disk_path)
+}
+
+/// `GET /api/tools/:id/doc` — 读取工具的模型侧 Markdown 文档。
+///
+/// 解析顺序与运行时 `tool_prompt_content` 保持一致：先读磁盘
+/// `<cwd>/prompts/tools/<id>.md`，缺省回退到内置 `tool_prompts::for_tool`。
+pub async fn get_tool_doc(b: &UiBackend, id: &str) -> Result<ToolDocResponse, ApiError> {
+    validate_tool_doc_id(id)?;
+
+    let (kind, description) = lookup_tool_meta(id)
+        .await
+        .unwrap_or_else(|| ("other".to_string(), String::new()));
+    // dynamic 工具（controller 运行时注册）不提供可编辑文档。
+    let editable = kind != "dynamic";
+
+    let (content, source) = resolve_tool_doc_at(&b.cwd, id);
+    Ok(ToolDocResponse {
+        id: id.to_string(),
+        content,
+        editable,
+        source: source.to_string(),
+        path: tool_doc_rel_path(id),
+        description,
+        kind,
+    })
+}
+
+/// `PUT /api/tools/:id/doc` — 写入工具的模型侧 Markdown 文档到
+/// `<cwd>/prompts/tools/<id>.md`。运行时 `tool_prompt_content` 会优先读该文件，
+/// 因此保存后新 session 立即生效。dynamic 工具拒绝写入（只读）。
+pub async fn put_tool_doc(b: &UiBackend, id: &str, content: &str) -> Result<(), ApiError> {
+    validate_tool_doc_id(id)?;
+
+    let (kind, _desc) = lookup_tool_meta(id)
+        .await
+        .unwrap_or_else(|| ("other".to_string(), String::new()));
+    if kind == "dynamic" {
+        return Err(ApiError::bad_request(format!(
+            "工具 {id:?} 是动态注册工具，其文档不可编辑"
+        )));
+    }
+
+    write_tool_doc_at(&b.cwd, id, content)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tool_doc_tests {
+    use super::*;
+
+    /// 路径穿越 / 非法 id 必须在触碰文件系统之前被拒。
+    #[test]
+    fn validate_tool_doc_id_rejects_traversal() {
+        assert!(validate_tool_doc_id("read").is_ok());
+        assert!(validate_tool_doc_id("doc_graph_scan").is_ok());
+        for bad in ["", "../etc/passwd", "a/b", "a\\b", "..", "x/../y"] {
+            let err = validate_tool_doc_id(bad).expect_err(&format!("{bad:?} must be rejected"));
+            assert_eq!(err.status, 400, "id {bad:?} → 400");
+        }
+    }
+
+    /// 无磁盘文件时回退到编译期内置文档；有磁盘文件时磁盘优先。
+    /// 这条顺序必须与 controller 的 `tool_prompt_content` 一致，否则 UI
+    /// 展示的与模型实际读到的会不是同一份。
+    #[test]
+    fn resolve_prefers_disk_then_embedded_then_none() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path();
+
+        // 1) 无磁盘文件 → embedded（read 有内置文档）。
+        let (content, source) = resolve_tool_doc_at(cwd, "read");
+        assert_eq!(source, "embedded");
+        assert!(!content.is_empty(), "embedded read doc must not be empty");
+
+        // 2) 未知工具且无内置文档 → none + 空内容。
+        let (content, source) = resolve_tool_doc_at(cwd, "no_such_tool_xyz");
+        assert_eq!(source, "none");
+        assert!(content.is_empty());
+
+        // 3) 写盘后 → disk 优先，内容逐字节回读。
+        let body = "# 自定义 read\n\n- 项目覆盖生效。\n";
+        let written = write_tool_doc_at(cwd, "read", body).expect("write");
+        assert_eq!(written, cwd.join("prompts/tools/read.md"));
+        let (content, source) = resolve_tool_doc_at(cwd, "read");
+        assert_eq!(source, "disk");
+        assert_eq!(content, body);
+    }
+
+    /// 写入路径必须正好是运行时 `tool_prompt_content` 读的那个相对路径，
+    /// 否则"保存后新 session 生效"这个承诺就不成立。
+    #[test]
+    fn write_target_matches_runtime_lookup_path() {
+        assert_eq!(tool_doc_rel_path("read"), "prompts/tools/read.md");
+        assert_eq!(tool_doc_rel_path("doc_index"), "prompts/tools/doc_index.md");
+    }
+}
+
 // ─── Models（模型 CRUD） ──────────────────────────────────────────
 //
 // 读源：`UiBackend.merged: Arc<RwLock<AgentConfig>>` —— 由

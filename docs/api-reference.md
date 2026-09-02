@@ -560,6 +560,39 @@ Self-loop 进度 SSE 流。
 
 **响应 `200`**
 
+### `GET /api/tools/:id/doc`
+
+读取工具的**模型侧 Markdown 文档** —— 即模型运行时随工具 schema 一起读到的那份说明。
+解析顺序与 controller 的 `tool_prompt_content` 一致：磁盘 `<cwd>/prompts/tools/<id>.md`
+优先，缺省回退到编译期 `include_str!` 的内置默认文档。
+
+**响应 `200`：**
+
+```json
+{
+  "id": "read",
+  "content": "<instruction>\n读取单个文件…\n</instruction>",
+  "editable": true,
+  "source": "disk",
+  "path": "prompts/tools/read.md",
+  "description": "builtin tool: read",
+  "kind": "builtin"
+}
+```
+
+- `source`：`disk`（项目本地覆盖文件，模型实际读的就是这份）| `embedded`（编译期内置默认）| `none`（该工具无任何文档）。
+- `editable`：`kind == "dynamic"`（controller 运行时动态注册，如 `delegate` / `workflow`）时为 `false`，只读；其余为 `true`。
+
+### `PUT /api/tools/:id/doc`
+
+写入工具的模型侧 Markdown 文档到 `<cwd>/prompts/tools/<id>.md`，新 session 生效。
+
+**请求体：** Markdown 原文（`text/plain` 风格的裸字符串，不包 JSON）。
+
+**响应 `200`**
+
+**响应 `400`：** 工具为 `dynamic`（动态注册）→ 文档只读；或 `id` 含路径分隔符/`..`（防路径穿越）。
+
 ---
 
 ## 11. 任务看板

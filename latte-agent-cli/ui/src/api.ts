@@ -675,12 +675,65 @@ export async function listTools(): Promise<ToolEntry[]> {
   return Array.isArray(resp) ? resp : resp.tools;
 }
 
-/** PATCH /api/tools/:id：切换工具启用状态。 */
+/**
+ * POST /api/tools/:id/toggle：切换工具启用状态（写 `.latte/tools.yaml`）。
+ *
+ * 注意方法与路径：后端只注册了 `POST /api/tools/:id/toggle`（见
+ * `latte-agent-ui-server/src/lib.rs` 的路由表）。这里曾误写成
+ * `PATCH /api/tools/:id`，导致面板上的启用/禁用开关与批量操作全部
+ * 405/404 静默失败。
+ */
 export async function setToolEnabled(id: string, enabled: boolean): Promise<void> {
   await getTransport().request(
-    "PATCH",
-    `/api/tools/${encodeURIComponent(id)}`,
+    "POST",
+    `/api/tools/${encodeURIComponent(id)}/toggle`,
     { enabled },
+  );
+}
+
+/**
+ * `GET /api/tools/:id/doc` 的返回：工具的模型侧 Markdown 文档。
+ *
+ * `content` 就是模型运行时真正读到的那份文档（后端解析顺序与
+ * controller 的 `tool_prompt_content` 一致：磁盘 `prompts/tools/<id>.md`
+ * 优先，缺省回退编译期内置常量）。
+ */
+export interface ToolDocResponse {
+  id: string;
+  /** Markdown 原文（未渲染）。可能为空字符串。 */
+  content: string;
+  /** 是否可编辑保存：dynamic（运行时动态注册）工具为 false。 */
+  editable: boolean;
+  /** 文档来源：disk（项目本地覆盖）| embedded（编译期内置）| none（无文档）。 */
+  source: "disk" | "embedded" | "none" | string;
+  /** 相对路径提示，如 `prompts/tools/read.md`。 */
+  path: string;
+  /** 工具简介（一行描述）。 */
+  description: string;
+  /** 工具分组：builtin / dynamic / package_alias。 */
+  kind: string;
+}
+
+/** GET /api/tools/:id/doc —— 读取工具的模型侧 Markdown 文档 + 可编辑标志。 */
+export async function getToolDoc(id: string): Promise<ToolDocResponse> {
+  return getTransport().request(
+    "GET",
+    `/api/tools/${encodeURIComponent(id)}/doc`,
+  );
+}
+
+/**
+ * PUT /api/tools/:id/doc —— 写入工具的模型侧 Markdown 文档。
+ *
+ * body 为 Markdown 原文（raw string，不包 JSON）。写入
+ * `<cwd>/prompts/tools/<id>.md`，新 session 生效。
+ * dynamic 工具只读，后端返回 400。
+ */
+export async function putToolDoc(id: string, content: string): Promise<void> {
+  await getTransport().request(
+    "PUT",
+    `/api/tools/${encodeURIComponent(id)}/doc`,
+    content,
   );
 }
 

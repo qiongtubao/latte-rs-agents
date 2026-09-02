@@ -968,6 +968,40 @@ pub(crate) async fn test_tool(
     Json(resp)
 }
 
+/// `GET /api/tools/:id/doc` —— 读取工具的模型侧 Markdown 文档 + 可编辑标志。
+pub(crate) async fn get_tool_doc(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<api::ToolDocResponse>, (StatusCode, String)> {
+    api::get_tool_doc(&state.backend, &id)
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `PUT /api/tools/:id/doc` —— 写入工具的模型侧 Markdown 文档（body 为 Markdown 原文）。
+/// dynamic 工具只读，写入返回 400。
+pub(crate) async fn put_tool_doc(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+    body: String,
+) -> Result<StatusCode, (StatusCode, String)> {
+    api::put_tool_doc(&state.backend, &id, &body)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
 /// `POST /api/roles/test` —— 测试角色配置是否能正常与模型对话。
 #[derive(Deserialize)]
 pub(crate) struct TestRoleBody {

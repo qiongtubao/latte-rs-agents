@@ -1,7 +1,9 @@
 // 工具管理页面：全功能工具查看/搜索/过滤/批量操作面板。
-// 支持工具测试（测试工具是否能正常执行）。
-import { listTools, setToolEnabled, testTool } from "./api";
-import type { ToolEntry, TestToolResponse } from "./api";
+// 支持工具测试（测试工具是否能正常执行），以及工具文档（模型运行时读取的
+// `prompts/tools/<id>.md`）的查看/编辑 —— dynamic 工具只读，其余可编辑保存。
+import { listTools, setToolEnabled, testTool, getToolDoc, putToolDoc } from "./api";
+import type { ToolEntry, TestToolResponse, ToolDocResponse } from "./api";
+import { renderMarkdown } from "./chat_impl";
 
 // ─── 类型定义 ────────────────────────────────────────────────────────
 
@@ -458,6 +460,17 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
     const closeBtn = document.getElementById("tool-detail-close") as HTMLButtonElement;
 
     title.textContent = `🔧 ${t.id}`;
+    body.replaceChildren();
+
+    // ── 简介区：ID / 类型 / 状态 / 描述 / 注册点 ──
+    const infoSection = document.createElement("section");
+    infoSection.className = "tool-detail-section";
+
+    const infoHeading = document.createElement("div");
+    infoHeading.className = "tool-detail-section-heading";
+    infoHeading.textContent = "简介";
+    infoSection.appendChild(infoHeading);
+
     const rows: { label: string; value: string }[] = [
       { label: "ID", value: t.id },
       { label: "类型", value: kindLabel(t.kind || "other") },
@@ -465,15 +478,205 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
     ];
     if (t.description) rows.push({ label: "描述", value: t.description });
     if (t.registered_by) rows.push({ label: "注册点", value: t.registered_by });
+    for (const r of rows) {
+      const row = document.createElement("div");
+      row.className = "tool-detail-row";
+      const label = document.createElement("span");
+      label.className = "tool-detail-label";
+      label.textContent = r.label;
+      const value = document.createElement("span");
+      value.className = "tool-detail-value";
+      value.textContent = r.value;
+      row.append(label, value);
+      infoSection.appendChild(row);
+    }
+    body.appendChild(infoSection);
 
-    body.innerHTML = rows.map(r =>
-      `<div class="tool-detail-row"><span class="tool-detail-label">${r.label}</span><span class="tool-detail-value">${r.value}</span></div>`
-    ).join("");
+    // ── 文档区：模型运行时读取的 prompts/tools/<id>.md ──
+    const docSection = document.createElement("section");
+    docSection.className = "tool-detail-section tool-doc-section";
+    body.appendChild(docSection);
+    void renderToolDoc(t, docSection);
 
     overlay.classList.remove("hidden");
     const close = () => overlay.classList.add("hidden");
     closeBtn.onclick = close;
     overlay.onclick = (e) => { if (e.target === overlay) close(); };
+  }
+
+  /**
+   * 渲染工具文档区：拉取 `GET /api/tools/:id/doc`，展示模型运行时真正读到的
+   * 那份 Markdown（磁盘 `prompts/tools/<id>.md` 优先，回退编译期内置常量）。
+   *
+   * 可编辑性由后端 `editable` 决定：dynamic（controller 运行时动态注册，
+   * 如 delegate / workflow）只读；builtin / package_alias 可编辑，保存写到
+   * `<cwd>/prompts/tools/<id>.md`，新 session 生效。
+   */
+  async function renderToolDoc(t: ToolEntry, host: HTMLElement): Promise<void> {
+    host.replaceChildren();
+
+    const heading = document.createElement("div");
+    heading.className = "tool-detail-section-heading";
+    heading.textContent = "工具文档（模型读取）";
+    host.appendChild(heading);
+
+    const loading = document.createElement("div");
+    loading.className = "tool-doc-loading";
+    loading.textContent = "加载文档中…";
+    host.appendChild(loading);
+
+    let doc: ToolDocResponse;
+    try {
+      doc = await getToolDoc(t.id);
+    } catch (e) {
+      loading.remove();
+      const err = document.createElement("div");
+      err.className = "tool-doc-error";
+      err.textContent = `文档加载失败：${(e as Error).message}`;
+      host.appendChild(err);
+      return;
+    }
+    loading.remove();
+
+    // ── 元信息条：来源徽章 + 可编辑徽章 + 文件路径 ──
+    const metaBar = document.createElement("div");
+    metaBar.className = "tool-doc-meta";
+
+    const sourceBadge = document.createElement("span");
+    sourceBadge.className = `tool-doc-badge tool-doc-source-${doc.source}`;
+    sourceBadge.textContent = sourceLabel(doc.source);
+    sourceBadge.title = sourceHint(doc.source);
+    metaBar.appendChild(sourceBadge);
+
+    const editBadge = document.createElement("span");
+    editBadge.className = `tool-doc-badge ${doc.editable ? "tool-doc-editable" : "tool-doc-readonly"}`;
+    editBadge.textContent = doc.editable ? "可编辑" : "只读";
+    editBadge.title = doc.editable
+      ? `可保存到 ${doc.path}（新 session 生效）`
+      : "动态注册工具（运行时由 controller 注册），其文档不可编辑";
+    metaBar.appendChild(editBadge);
+
+    const pathEl = document.createElement("code");
+    pathEl.className = "tool-doc-path";
+    pathEl.textContent = doc.path;
+    metaBar.appendChild(pathEl);
+
+    const actions = document.createElement("div");
+    actions.className = "tool-doc-actions";
+    metaBar.appendChild(actions);
+    host.appendChild(metaBar);
+
+    // ── 内容区：查看（渲染 markdown）/ 编辑（textarea）双态 ──
+    const viewEl = document.createElement("div");
+    viewEl.className = "tool-doc-view markdown-body";
+
+    const editEl = document.createElement("textarea");
+    editEl.className = "tool-doc-editor";
+    editEl.spellcheck = false;
+
+    const statusEl = document.createElement("div");
+    statusEl.className = "tool-doc-status";
+
+    const paintView = (markdown: string) => {
+      if (markdown.trim()) {
+        viewEl.innerHTML = renderMarkdown(markdown);
+      } else {
+        viewEl.replaceChildren();
+        const empty = document.createElement("div");
+        empty.className = "tool-doc-empty";
+        empty.textContent = doc.editable
+          ? "该工具还没有文档。点击「编辑」新建 —— 保存后模型会在下个 session 读到它。"
+          : "该工具没有文档。";
+        viewEl.appendChild(empty);
+      }
+    };
+
+    let editing = false;
+    let current = doc.content;
+    paintView(current);
+
+    host.append(viewEl, editEl, statusEl);
+
+    const syncMode = () => {
+      viewEl.classList.toggle("hidden", editing);
+      editEl.classList.toggle("hidden", !editing);
+    };
+    syncMode();
+
+    // 只读工具：不渲染编辑按钮，只给一条说明。
+    if (!doc.editable) {
+      const note = document.createElement("span");
+      note.className = "tool-doc-note";
+      note.textContent = "动态工具不可编辑";
+      actions.appendChild(note);
+      return;
+    }
+
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "tool-doc-btn";
+    editBtn.textContent = "编辑";
+
+    const saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.className = "tool-doc-btn tool-doc-btn-primary hidden";
+    saveBtn.textContent = "保存";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "tool-doc-btn hidden";
+    cancelBtn.textContent = "取消";
+
+    const setEditing = (on: boolean) => {
+      editing = on;
+      syncMode();
+      editBtn.classList.toggle("hidden", on);
+      saveBtn.classList.toggle("hidden", !on);
+      cancelBtn.classList.toggle("hidden", !on);
+    };
+
+    editBtn.addEventListener("click", () => {
+      editEl.value = current;
+      setEditing(true);
+      statusEl.textContent = "";
+      statusEl.classList.remove("error");
+      editEl.focus();
+    });
+
+    cancelBtn.addEventListener("click", () => {
+      setEditing(false);
+      statusEl.textContent = "";
+      statusEl.classList.remove("error");
+    });
+
+    saveBtn.addEventListener("click", () => {
+      void (async () => {
+        const next = editEl.value;
+        saveBtn.disabled = true;
+        statusEl.classList.remove("error");
+        statusEl.textContent = "保存中…";
+        try {
+          await putToolDoc(t.id, next);
+          current = next;
+          paintView(current);
+          setEditing(false);
+          statusEl.textContent = `✅ 已保存到 ${doc.path}（新 session 生效）`;
+          // 保存后来源必定变成磁盘覆盖文件。
+          doc.source = "disk";
+          sourceBadge.className = "tool-doc-badge tool-doc-source-disk";
+          sourceBadge.textContent = sourceLabel("disk");
+          sourceBadge.title = sourceHint("disk");
+          setStatus(`✅ ${t.id} 文档已保存`);
+        } catch (e) {
+          statusEl.classList.add("error");
+          statusEl.textContent = `保存失败：${(e as Error).message}`;
+        } finally {
+          saveBtn.disabled = false;
+        }
+      })();
+    });
+
+    actions.append(editBtn, saveBtn, cancelBtn);
   }
 
   return {
@@ -520,6 +723,30 @@ function kindLabel(kind: string): string {
     case "dynamic": return "动态注册";
     case "package_alias": return "包别名";
     default: return kind;
+  }
+}
+
+/** 文档来源徽章文案。 */
+function sourceLabel(source: string): string {
+  switch (source) {
+    case "disk": return "项目文件";
+    case "embedded": return "内置默认";
+    case "none": return "无文档";
+    default: return source;
+  }
+}
+
+/** 文档来源 tooltip：解释这份文档从哪来、模型读的是哪一份。 */
+function sourceHint(source: string): string {
+  switch (source) {
+    case "disk":
+      return "来自项目本地 prompts/tools/ 下的文件，优先级最高——模型运行时读的就是这一份。";
+    case "embedded":
+      return "来自编译期内置的默认文档。保存编辑会在项目里新建覆盖文件，此后模型改读那一份。";
+    case "none":
+      return "该工具当前没有任何文档（既无项目文件也无内置默认）。";
+    default:
+      return "";
   }
 }
 
