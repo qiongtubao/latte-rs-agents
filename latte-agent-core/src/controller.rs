@@ -3042,6 +3042,19 @@ async fn build_runner(
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
+    // ControllerConfig.session_id is the authoritative UI tab id. Bind its
+    // deterministic transcript; never enumerate ui-sessions or choose latest.
+    let current_session_file = if !session_id.is_empty()
+        && session_id != "."
+        && session_id != ".."
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+    {
+        Some(cwd.join(".latte").join("ui-sessions").join(format!("{session_id}.jsonl")))
+    } else {
+        None
+    };
+
     let template = merged
         .roles
         .get(role_id)
@@ -3250,7 +3263,11 @@ async fn build_runner(
         };
         let mut runner = AgentRunner::new_with_tools(agent, tm)
             .with_role(role_id)
-            .with_cwd(cwd.to_path_buf());
+            .with_cwd(cwd.to_path_buf())
+            .with_session_id(session_id);
+        if let Some(path) = current_session_file.as_ref() {
+            runner = runner.with_current_session_file(path.clone());
+        }
         runner = runner.with_sink(runner_sink);
         if let Some(gate) = advisor_gate.clone() {
             runner = runner.with_gate_config(gate);
@@ -3283,7 +3300,11 @@ async fn build_runner(
         };
         let mut runner = AgentRunner::new(agent)
             .with_role(role_id)
-            .with_cwd(cwd.to_path_buf());
+            .with_cwd(cwd.to_path_buf())
+            .with_session_id(session_id);
+        if let Some(path) = current_session_file.as_ref() {
+            runner = runner.with_current_session_file(path.clone());
+        }
         // 这条 `.with_sink` 此前漏了：`runner_sink` 构造完就被丢弃
         // （编译器只报了个 unused variable 警告，实际后果是无工具角色的
         // trace 事件既不落子会话日志、也不经 ChatEventTraceSink 广播给
@@ -3423,6 +3444,7 @@ fn add_batch_read_contract(
                 .collect::<Result<Vec<_>, _>>()?;
 
             let max_size = input.get("maxSize").cloned();
+            let diagnostic = input.get("diagnostic").cloned();
             let parallelism = if crate::agent::readonly_parallel_enabled() {
                 crate::agent::readonly_parallel_max()
             } else {
@@ -3432,11 +3454,15 @@ fn add_batch_read_contract(
                 let handler = base_handler.clone();
                 let ctx = ctx.clone();
                 let max_size = max_size.clone();
+                let diagnostic = diagnostic.clone();
                 async move {
                     let mut single = serde_json::Map::new();
                     single.insert("path".into(), serde_json::Value::String(path.clone()));
                     if let Some(max_size) = max_size {
                         single.insert("maxSize".into(), max_size);
+                    }
+                    if let Some(diagnostic) = diagnostic {
+                        single.insert("diagnostic".into(), diagnostic);
                     }
                     let result = (handler)(serde_json::Value::Object(single), ctx).await;
                     (path, result)
@@ -6706,6 +6732,35 @@ fn role_icon(role_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn batch_read_forwards_diagnostic_to_each_item() {
+        use latte_rs_agent_tools::types::{PropertyType, ToolExecutionContext, ToolInputSchema};
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("path".into(), input_property(PropertyType::String, "path"));
+        properties.insert(
+            "diagnostic".into(),
+            input_property(PropertyType::Boolean, "diagnostic"),
+        );
+        let schema = ToolInputSchema {
+            schema_type: Default::default(),
+            properties,
+            required: Some(vec!["path".into()]),
+            additional_properties: None,
+        };
+        let handler: latte_rs_agent_tools::types::SharedToolHandler =
+            Arc::new(|input, _ctx| Box::pin(async move { Ok(input) }));
+        let tool = latte_rs_agent_tools::types::Tool::builder(
+            "read", "test", schema, handler,
+        ).build();
+        let wrapped = add_batch_read_contract(tool);
+        let out = (wrapped.handler)(
+            serde_json::json!({"paths": ["session://current"], "diagnostic": true}),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap();
+        assert_eq!(out["files"][0]["path"], "session://current");
+        assert_eq!(out["files"][0]["diagnostic"], true);
+    }
 
     #[tokio::test]
     async fn code_graph_missing_backend_is_actionable() {

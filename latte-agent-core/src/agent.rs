@@ -863,6 +863,9 @@ pub struct AgentRunner {
     /// (which in Tauri is the app data dir, not the workspace the user
     /// opened — the bug that motivated this field).
     cwd: Option<std::path::PathBuf>,
+    /// Exact persisted transcript for the session that owns this runner.
+    /// The embedding runtime binds it; tools never select by id or mtime.
+    current_session_file: Option<std::path::PathBuf>,
     /// 本轮 turn 实际执行成功的工具调用次数。D6 ToolCallEcho
     /// 需要这个数判断"response 含 `<read>` 但 tool_use_count=0"
     /// 的回声模式。run_turn 结束时设置，run_turn_gated 据此
@@ -1501,6 +1504,23 @@ struct OneCallResult {
     executed_ok: bool,
 }
 
+fn tool_execution_metadata(
+    cwd: Option<&std::path::Path>,
+    current_session_file: Option<&std::path::Path>,
+) -> Option<serde_json::Value> {
+    if cwd.is_none() && current_session_file.is_none() {
+        return None;
+    }
+    let mut metadata = serde_json::Map::new();
+    if let Some(cwd) = cwd {
+        metadata.insert("cwd".into(), cwd.display().to_string().into());
+    }
+    if let Some(path) = current_session_file {
+        metadata.insert("current_session_file".into(), path.display().to_string().into());
+    }
+    Some(serde_json::Value::Object(metadata))
+}
+
 /// Run one tool call end-to-end without touching `&mut self`, so it can
 /// be `tokio::spawn`ed for concurrent delegate execution. All inputs
 /// are owned/`Arc` clones. Mirrors the serial inline pipeline in
@@ -1512,6 +1532,7 @@ async fn run_one_tool_call(
     sink: Arc<dyn crate::trace::TraceSink>,
     retry_policy: Arc<dyn RetryPolicy>,
     cwd: Option<std::path::PathBuf>,
+    current_session_file: Option<std::path::PathBuf>,
     meta: crate::trace::TraceMeta,
     tc: ParsedCall,
 ) -> OneCallResult {
@@ -1608,9 +1629,7 @@ async fn run_one_tool_call(
         // 3. Execute
         let mut ctx =
             latte_rs_agent_tools::types::ToolExecutionContext::fresh(&resolved_name, 1);
-        if let Some(c) = &cwd {
-            ctx.metadata = Some(serde_json::json!({ "cwd": c.display().to_string() }));
-        }
+        ctx.metadata = tool_execution_metadata(cwd.as_deref(), current_session_file.as_deref());
         let tool_start = Instant::now();
         let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
         let tool_latency = tool_start.elapsed().as_millis() as u64;
@@ -1738,6 +1757,7 @@ impl AgentRunner {
             session_id: String::new(),
             advisor_hints: None,
             cwd: None,
+            current_session_file: None,
             last_turn_tool_count: 0,
             last_turn_tool_summaries: Vec::new(),
             gate_config: None,
@@ -1769,6 +1789,7 @@ impl AgentRunner {
             session_id: String::new(),
             advisor_hints: None,
             cwd: None,
+            current_session_file: None,
             last_turn_tool_count: 0,
             last_turn_tool_summaries: Vec::new(),
             gate_config: None,
@@ -1792,6 +1813,7 @@ impl AgentRunner {
             session_id: String::new(),
             advisor_hints: None,
             cwd: None,
+            current_session_file: None,
             last_turn_tool_count: 0,
             last_turn_tool_summaries: Vec::new(),
             gate_config: None,
@@ -2907,13 +2929,15 @@ impl AgentRunner {
                         let sink_c = self.sink.clone();
                         let rp_c = self.retry_policy.clone();
                         let cwd_c = self.cwd.clone();
+                        let current_session_file_c = self.current_session_file.clone();
                         let meta_c = meta.clone();
                         let tc_c = tc.clone();
                         set.spawn(async move {
                             (
                                 i,
                                 run_one_tool_call(
-                                    tm_c, hooks_c, sink_c, rp_c, cwd_c, meta_c, tc_c,
+                                    tm_c, hooks_c, sink_c, rp_c, cwd_c,
+                                    current_session_file_c, meta_c, tc_c,
                                 )
                                 .await,
                             )
@@ -2933,6 +2957,7 @@ impl AgentRunner {
                                 self.sink.clone(),
                                 self.retry_policy.clone(),
                                 self.cwd.clone(),
+                                self.current_session_file.clone(),
                                 meta.clone(),
                                 tc.clone(),
                             )
@@ -3019,6 +3044,7 @@ impl AgentRunner {
                                 self.sink.clone(),
                                 self.retry_policy.clone(),
                                 self.cwd.clone(),
+                                self.current_session_file.clone(),
                                 meta.clone(),
                                 post_parse_calls[i].clone(),
                             )
@@ -3106,6 +3132,7 @@ impl AgentRunner {
                                 let sink_c = self.sink.clone();
                                 let rp_c = self.retry_policy.clone();
                                 let cwd_c = self.cwd.clone();
+                                let current_session_file_c = self.current_session_file.clone();
                                 let meta_c = meta.clone();
                                 let tc_c = tc.clone();
                                 let sem_c = sem.clone();
@@ -3116,7 +3143,8 @@ impl AgentRunner {
                                     (
                                         idx,
                                         run_one_tool_call(
-                                            tm_c, hooks_c, sink_c, rp_c, cwd_c, meta_c, tc_c,
+                                            tm_c, hooks_c, sink_c, rp_c, cwd_c,
+                                            current_session_file_c, meta_c, tc_c,
                                         )
                                         .await,
                                     )
@@ -3143,6 +3171,7 @@ impl AgentRunner {
                                     self.sink.clone(),
                                     self.retry_policy.clone(),
                                     self.cwd.clone(),
+                                    self.current_session_file.clone(),
                                     meta.clone(),
                                     post_parse_calls[i].clone(),
                                 )
@@ -3305,11 +3334,10 @@ impl AgentRunner {
                             &resolved_name,
                             1,
                         );
-                        if let Some(cwd) = &self.cwd {
-                            ctx.metadata = Some(serde_json::json!({
-                                "cwd": cwd.display().to_string(),
-                            }));
-                        }
+                        ctx.metadata = tool_execution_metadata(
+                            self.cwd.as_deref(),
+                            self.current_session_file.as_deref(),
+                        );
                         let tool_start = Instant::now();
                         let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
                         let tool_latency = tool_start.elapsed().as_millis() as u64;
@@ -3707,6 +3735,12 @@ impl AgentRunner {
         self.cwd = Some(cwd);
         self
     }
+
+    /// Bind the exact persisted transcript exposed as `session://current`.
+    pub fn with_current_session_file(mut self, path: std::path::PathBuf) -> Self {
+        self.current_session_file = Some(path);
+        self
+    }
     /// 设置工具调用策略（`tool_choice`）。透传到 `agent.params.tool_choice`，
     /// 经 `build_chat_params` 下发到 OpenAI/Anthropic wire 的 `tool_choice` 字段。
     /// 默认 `Auto`；`Required` 强制模型至少调一次工具；`Specific(name)` 锁定工具。
@@ -4070,6 +4104,20 @@ mod tests {
             allowed_tools: vec![],
             icon: "🧪".into(),
         }
+    }
+
+    #[test]
+    fn tool_metadata_uses_exact_bound_session_file() {
+        let cwd = std::path::Path::new("/workspace");
+        let a = std::path::Path::new("/workspace/.latte/ui-sessions/a.jsonl");
+        let b = std::path::Path::new("/workspace/.latte/ui-sessions/b.jsonl");
+        let meta_a = tool_execution_metadata(Some(cwd), Some(a)).unwrap();
+        let meta_b = tool_execution_metadata(Some(cwd), Some(b)).unwrap();
+        assert_eq!(meta_a["cwd"], "/workspace");
+        assert_eq!(meta_a["current_session_file"], a.to_string_lossy().as_ref());
+        assert_eq!(meta_b["current_session_file"], b.to_string_lossy().as_ref());
+        assert_ne!(meta_a["current_session_file"], meta_b["current_session_file"]);
+        assert!(tool_execution_metadata(None, None).is_none());
     }
 
     /// 悬挂工具标记只命中尾部窗口：glm 实锤形态（正文断在半句、
