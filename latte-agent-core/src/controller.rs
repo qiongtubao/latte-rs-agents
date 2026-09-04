@@ -34,6 +34,10 @@ use crate::trace::ModelErrorKind;
 use crate::workspace::WorkspaceManager;
 use crate::AgentResult;
 
+// Re-export the canonical tool metadata tables from `tool_docs` so UI server
+// callers keep a stable import path (`latte_agent_core::controller::…`).
+pub use crate::tool_docs::{DYNAMIC_TOOL_CATALOG, TOOL_ALIAS_GROUPS};
+
 /// 把 `AgentError` 投影成 `ModelErrorKind`。`Controller` 端
 /// 收到 `turn failed: {AgentError}` 时，把 e 转成 kind 写进
 /// `ChatEvent::Error.kind`，让消费方拿到结构化分类。
@@ -3118,7 +3122,7 @@ async fn build_runner(
     let agent = Agent::new_with_chain(role_id.to_string(), role.clone(), models, default_params.clone())?;
 
     if !role.allowed_tools.is_empty() {
-        let tm = build_tool_manager(&role.allowed_tools).await
+        let tm = build_tool_manager_at(cwd, &role.allowed_tools).await
             .map_err(|e| AgentError::Tool(format!("build tool manager '{role_id}': {e}")))?;
         // request_tool：所有带工具的角色都可申请临时使用未授权工具
         // （角色 prompt 与 allowed_tools 不对齐时的软拒绝 + 申请通道）。
@@ -3352,17 +3356,80 @@ fn string_array_property(description: impl Into<String>) -> latte_rs_agent_tools
 const BATCH_READ_MAX_PATHS: usize = 10;
 const BATCH_READ_OUTPUT_BUDGET: usize = 192 * 1024;
 
-fn tool_prompt_content(name: &str) -> Option<String> {
-    use crate::prompts::tool_prompts;
+fn enrich_tool_for_model(
+    mut tool: latte_rs_agent_tools::types::Tool,
+    cwd: &Path,
+    ctx: &crate::tool_docs::TemplateContext,
+) -> latte_rs_agent_tools::types::Tool {
+    tool = add_batch_read_contract(tool);
+    let base = crate::tool_docs::base_description(&tool.name, &tool.description);
+    tool.description = crate::tool_docs::effective_description(&base, cwd, &tool.name, ctx);
+    tool
+}
 
-    let local_file = Path::new("prompts/tools").join(format!("{name}.md"));
-    if let Ok(text) = std::fs::read_to_string(local_file) {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+fn enrich_registered_tools(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    cwd: &Path,
+) {
+    let names = tm.get_tool_names();
+    let ctx = crate::tool_docs::TemplateContext::from_tool_names(cwd, &names);
+    for name in names {
+        if let Some(tool) = tm.get_tool(&name) {
+            tm.unregister(&name);
+            tm.register(enrich_tool_for_model(tool, cwd, &ctx), None);
         }
     }
-    tool_prompts::for_tool(name).map(|text| text.trim().to_string())
+}
+
+/// Re-enrich a live manager after its project tool documentation changes.
+pub(crate) fn refresh_tool_manager(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    cwd: &Path,
+) {
+    enrich_registered_tools(tm, cwd);
+}
+
+/// Re-enrich every live `ToolManager` (per cwd) — called by the UI server
+/// after a tool-doc PUT/DELETE so running sessions pick up the change without
+/// a restart. Returns how many managers were refreshed.
+pub fn refresh_tool_docs() -> usize {
+    crate::tool_docs::for_each_live(|cwd, tm| refresh_tool_manager(tm, cwd))
+}
+
+/// Enumerate every builtin tool (packages + `code_graph`) with its pristine
+/// `Tool::builder` description, as a `(registered name, description)` list.
+/// The UI tools panel uses this instead of re-deriving descriptions locally,
+/// so the panel shows the same text the model gets at schema time.
+pub async fn builtin_tool_base_descriptions() -> Result<
+    Vec<(String, String)>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    builtin_tool_base_descriptions_at(Path::new(".")).await
+}
+
+/// Enumerate builtin descriptions after applying runtime schema/contract
+/// rewrites, rooted at `cwd`. Project tool-doc text is intentionally omitted;
+/// callers that need the full model description should build a manager.
+pub async fn builtin_tool_base_descriptions_at(
+    _cwd: &Path,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    use latte_rs_agent_tools::prelude::*;
+    let mgr = create_tool_manager();
+    for package in builtin_tool_packages() {
+        mgr.register_package(package)
+            .await
+            .map_err(|error| format!("register_package: {error}"))?;
+    }
+    mgr.register(code_graph_tool(), None);
+    let mut out = Vec::new();
+    for name in mgr.get_tool_names() {
+        if let Some(tool) = mgr.get_tool(&name) {
+            let tool = add_batch_read_contract(tool);
+            out.push((name, tool.description.clone()));
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// Add the model-facing batch contract and wrap the single-file read handler.
@@ -3377,6 +3444,19 @@ fn add_batch_read_contract(
 
     if tool.name != "read" || tool.input_schema.properties.contains_key("paths") {
         return tool;
+    }
+
+    // Keep the model-facing prose in sync with the schema extension. This is
+    // also consumed by the UI catalog, which does not execute the handler.
+    if !tool.description.contains("paths") {
+        tool.description = format!(
+            "读取文件、目录或多个独立目标，支持通过 paths 并发批量读取与行范围选择。{}",
+            if tool.description.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" {}", tool.description.trim())
+            }
+        );
     }
 
     if let Some(path) = tool.input_schema.properties.get_mut("path") {
@@ -3509,50 +3589,43 @@ fn add_batch_read_contract(
     tool
 }
 
-fn enrich_tool_for_model(
-    mut tool: latte_rs_agent_tools::types::Tool,
-) -> latte_rs_agent_tools::types::Tool {
-    tool = add_batch_read_contract(tool);
-    if let Some(prompt) = tool_prompt_content(&tool.name) {
-        if !tool.description.contains(&prompt) {
-            tool.description.push_str("\n\n");
-            tool.description.push_str(&prompt);
-        }
-    }
-    tool
+
+/// Build an allowlisted tool manager rooted at the current directory.
+///
+/// Frontends that create role runners (such as the CLI chat and workflow
+/// commands) use this so their model-visible tool schemas match core's
+/// runtime registrations and document enrichment.
+pub async fn build_tool_manager(
+    allowed: &[String],
+) -> Result<
+    Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    build_tool_manager_at(Path::new("."), allowed).await
 }
 
-pub(crate) async fn build_tool_manager(
+pub async fn build_tool_manager_at(
+    cwd: &Path,
     allowed: &[String],
 ) -> Result<
     Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     use latte_rs_agent_tools::prelude::*;
-    let mgr = create_tool_manager();
+    let mgr: Arc<dyn latte_rs_agent_tools::types::ToolManager> = create_tool_manager();
     for package in builtin_tool_packages() {
         mgr.register_package(package)
             .await
             .map_err(|error| format!("register_package: {error}"))?;
     }
-    // Register before enrichment/filtering so request_tool can grant it too.
     mgr.register(code_graph_tool(), None);
-
-    // Enrich the complete registry first. Both initial allowlists and later
-    // request_tool grants must clone the exact same model-facing definition.
-        for name in mgr.get_tool_names() {
-            if let Some(tool) = mgr.get_tool(&name) {
-            mgr.unregister(&name);
-            mgr.register(enrich_tool_for_model(tool), None);
-            }
-        }
+    enrich_registered_tools(&mgr, cwd);
     FULL_TOOL_POOL.get_or_init(|| {
         mgr.get_tool_names()
             .into_iter()
             .filter_map(|name| mgr.get_tool(&name).map(|tool| (name, tool)))
             .collect()
     });
-
     // allowed 里是配置层扁平名（bash/read/edit/...）。tools crate 扁平化
     // 后注册名 == 配置名 == 模型 schema 名，配置名直接进 keep 即可匹配。
     let mut keep: std::collections::HashSet<String> = allowed
@@ -3579,8 +3652,10 @@ pub(crate) async fn build_tool_manager(
         }
     }
 
+    crate::tool_docs::register_live_manager(cwd, &mgr);
     Ok(mgr)
 }
+
 
 // ─── Full tool pool: cached registry of all builtin tools ──────────────
 // Built once on first build_tool_manager call (after all packages
@@ -3603,11 +3678,11 @@ pub(crate) fn full_tool_pool() -> &'static FullToolPool {
         let mut pool = FullToolPool::new();
         for package in builtin_tool_packages() {
             for tool in package.tools {
-                let tool = enrich_tool_for_model(tool);
+                let tool = enrich_tool_for_model(tool, Path::new("."), &crate::tool_docs::TemplateContext::default());
                 pool.insert(tool.name.clone(), tool);
             }
         }
-        let code_graph = enrich_tool_for_model(code_graph_tool());
+        let code_graph = enrich_tool_for_model(code_graph_tool(), Path::new("."), &crate::tool_docs::TemplateContext::default());
         pool.insert(code_graph.name.clone(), code_graph);
         FULL_TOOL_POOL.get_or_init(|| pool)
     })
@@ -4035,7 +4110,7 @@ fn code_graph_decode_backend_output(
     })?;
     Ok((parsed, diagnostic))
 }
-fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
+pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
     use latte_rs_agent_tools::error::ToolError;
     use latte_rs_agent_tools::types::*;
     use std::sync::Arc;
@@ -6033,7 +6108,7 @@ async fn register_delegate_tool(
             let specialist_tm = if role.allowed_tools.is_empty() {
                 None
             } else {
-                match build_tool_manager(&role.allowed_tools).await {
+                match build_tool_manager_at(&cwd, &role.allowed_tools).await {
                     Ok(tm) => Some(tm),
                     Err(e) => {
                         let summary = format!("tool setup for '{}' failed: {}", role_id, e);
@@ -10905,7 +10980,11 @@ require = ["永远不可能出现的验收字符串"]
     /// 在 description 和 schema 中，不能依赖某个角色 prompt 恰好提到它。
     #[tokio::test]
     async fn read_tool_exposes_batch_contract_in_description_and_schema() {
-        let mgr = build_tool_manager(&["read".into()])
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .to_path_buf();
+        let mgr = build_tool_manager_at(&workspace, &["read".into()])
             .await
             .expect("build_tool_manager");
         let read = mgr.get_tool("read").expect("read tool");
@@ -10987,6 +11066,108 @@ require = ["永远不可能出现的验收字符串"]
             out.get("files").is_none(),
             "single result must not be wrapped"
         );
+    }
+
+    /// 工具文档加载顺序：项目 `.latte/tools.d/<id>.md` 覆盖全局
+    /// `$LATTE_HOME/tools.d/<id>.md`，两层都没有时无文档（不再回退到
+    /// 编译期内置）。与 UI server 的 resolver 同源，保证面板与模型读同一份。
+    #[test]
+    fn tool_doc_prefers_project_then_global_then_none() {
+        use crate::tool_docs as docs;
+        let _guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("LATTE_HOME");
+        std::env::set_var("LATTE_HOME", &global.path());
+
+        // 1) 两层都没有 → Missing + 空 raw。
+        let none = docs::resolve_doc(project.path(), "zz_nodoc");
+        assert!(none.raw.is_empty());
+        assert_eq!(none.source, docs::DocSource::Missing);
+
+        // 2) 只有全局 → Global。
+        std::fs::create_dir_all(global.path().join("tools.d")).unwrap();
+        std::fs::write(global.path().join("tools.d/zz_global.md"), "全局文档").unwrap();
+        let g = docs::resolve_doc(project.path(), "zz_global");
+        assert_eq!(g.source, docs::DocSource::Global);
+        assert!(g.raw.contains("全局文档"));
+
+        // 3) 项目同名覆盖 → Project，读到的是项目那份。
+        std::fs::create_dir_all(project.path().join(".latte/tools.d")).unwrap();
+        std::fs::write(project.path().join(".latte/tools.d/zz_global.md"), "项目覆盖").unwrap();
+        let p = docs::resolve_doc(project.path(), "zz_global");
+        assert_eq!(p.source, docs::DocSource::Project);
+        assert!(p.raw.contains("项目覆盖"));
+
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+    }
+
+    /// 动态工具（workflow / delegate / ask …）在 `build_runner` 里注册到
+    /// manager **之后**必须再 enrich 一次，否则它们的 md 文档不会下发模型。
+    /// 幂等由 `base_description` 保证：再次 enrich 不重复追加。
+    #[tokio::test]
+    async fn dynamic_tools_get_enriched_after_registration() {
+        use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputSchema, ToolInputProperty};
+        crate::tool_docs::clear_base_descriptions();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".latte/tools.d")).unwrap();
+        std::fs::write(
+            dir.path().join(".latte/tools.d/zz_dyn.md"),
+            "<!-- SUMMARY -->\n动态工具简介\n<!-- /SUMMARY -->\n\n<!-- DETAILS -->\n动态工具详情 MYTOOL-DOC\n<!-- /DETAILS -->",
+        )
+        .unwrap();
+
+        let mgr = build_tool_manager_at(dir.path(), &[]).await.unwrap();
+        let schema = ToolInputSchema {
+            schema_type: Default::default(),
+            properties: vec![(
+                "q".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some("q".into()),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            required: None,
+            additional_properties: None,
+        };
+        mgr.register(
+            Tool::builder(
+                "zz_dyn".to_string(),
+                "内置动态描述".to_string(),
+                schema,
+                std::sync::Arc::new(|_i, _c| Box::pin(async move { Ok(serde_json::json!({})) })),
+            )
+            .build(),
+            None,
+        );
+
+        // 注册后 enrich：动态工具拿到 .latte/tools.d 文档。
+        enrich_registered_tools(&mgr, dir.path());
+        let dyn_tool = mgr.get_tool("zz_dyn").expect("zz_dyn registered");
+        assert!(dyn_tool.description.contains("动态工具详情 MYTOOL-DOC"), "{}", dyn_tool.description);
+        assert!(dyn_tool.description.contains("动态工具简介"), "{}", dyn_tool.description);
+
+        // 幂等：再次 enrich 不重复追加。
+        enrich_registered_tools(&mgr, dir.path());
+        let again = mgr.get_tool("zz_dyn").expect("zz_dyn").description.clone();
+        assert_eq!(again.matches("MYTOOL-DOC").count(), 1, "重复追加: {again}");
     }
 
     #[tokio::test]

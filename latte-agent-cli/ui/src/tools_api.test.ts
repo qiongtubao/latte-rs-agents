@@ -158,16 +158,17 @@ describe("工具 API 与后端路由表一致", () => {
     const calls: Call[] = [];
     install(transport, calls, {
       id: "read",
+      summary: "读取文件、目录或多个独立目标。",
       content: "# doc",
       editable: true,
-      source: "disk",
-      path: "prompts/tools/read.md",
+      source: "project",
+      path: ".latte/tools.d/read.md",
       description: "",
       kind: "builtin",
     });
 
     const doc = await api.getToolDoc("read");
-    expect(doc.source).toBe("disk");
+    expect(doc.source).toBe("project");
 
     expect(calls[0].method).toBe("GET");
     expect(calls[0].path).toBe("/api/tools/read/doc");
@@ -178,23 +179,51 @@ describe("工具 API 与后端路由表一致", () => {
     );
   });
 
-  it("putToolDoc → PUT /api/tools/:id/doc，body 为 Markdown 裸字符串", async () => {
+  it("putToolDoc → PUT /api/tools/:id/doc，body 为 JSON { summary, content, target }", async () => {
     const { api, transport } = await importFresh();
     const calls: Call[] = [];
     install(transport, calls);
 
-    await api.putToolDoc("read", "# 自定义\n\n- 一行。");
+    await api.putToolDoc("read", "简介文本", "# 详情\n\n- 一行。");
 
     expect(calls[0].method).toBe("PUT");
     expect(calls[0].path).toBe("/api/tools/read/doc");
-    // 必须是裸字符串：transport 对 string body 不做 JSON.stringify，
-    // 后端 axum 侧用 `body: String` 提取。包成对象会写进一个 JSON 文本。
-    expect(typeof calls[0].body).toBe("string");
-    expect(calls[0].body).toBe("# 自定义\n\n- 一行。");
+    // body 是对象 { summary, content, target }；target 与 models 的
+    // `update_model` 同名同义（project / global），省略时按项目层。
+    expect(typeof calls[0].body).toBe("object");
+    expect(calls[0].body).toEqual({
+      summary: "简介文本",
+      content: "# 详情\n\n- 一行。",
+      target: "project",
+    });
+
+    // 显式存到全局层
+    calls.length = 0;
+    await api.putToolDoc("read", "s", "c", "global");
+    expect(calls[0].body).toEqual({ summary: "s", content: "c", target: "global" });
 
     const routes = backendApiRoutes();
     expect(routes).toContain(
       `${calls[0].method} ${toRouteTemplate(calls[0].path, "read")}`,
+    );
+  });
+
+  it("deleteToolDoc → DELETE /api/tools/:id/doc?target=…", async () => {
+    const { api, transport } = await importFresh();
+    const calls: Call[] = [];
+    install(transport, calls);
+
+    await api.deleteToolDoc("read");
+    expect(calls[0].method).toBe("DELETE");
+    expect(calls[0].path).toBe("/api/tools/read/doc?target=project");
+
+    await api.deleteToolDoc("read", "global");
+    expect(calls[1].path).toBe("/api/tools/read/doc?target=global");
+
+    const routes = backendApiRoutes();
+    // 路由表里是不带 query 的 `/tools/:id/doc`
+    expect(routes).toContain(
+      `DELETE ${toRouteTemplate(calls[0].path.split("?")[0], "read")}`,
     );
   });
 

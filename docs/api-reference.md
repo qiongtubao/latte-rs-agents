@@ -554,7 +554,8 @@ Self-loop 进度 SSE 流。
 
 ### `POST /api/tools/:id/toggle`
 
-启用/禁用工具（更新 `.latte/tools.yaml`）。
+启用/禁用工具（更新 `.latte/tools.yaml`）。**仅影响工具面板展示**，
+运行时可用工具由角色配置的 `tools` 字段决定。
 
 **请求体：** `{ "enabled": false }`
 
@@ -562,36 +563,76 @@ Self-loop 进度 SSE 流。
 
 ### `GET /api/tools/:id/doc`
 
-读取工具的**模型侧 Markdown 文档** —— 即模型运行时随工具 schema 一起读到的那份说明。
-解析顺序与 controller 的 `tool_prompt_content` 一致：磁盘 `<cwd>/prompts/tools/<id>.md`
-优先，缺省回退到编译期 `include_str!` 的内置默认文档。
+读取工具的**模型侧说明** —— 即模型运行时随工具 schema 一起读到的那份文本。
+完整说明与拆分约定见 `docs/tool-docs.md`。
 
 **响应 `200`：**
 
 ```json
 {
   "id": "read",
+  "label": "Read",
+  "brief": "读取文件、目录或多个独立目标，支持行范围与批量读取。",
+  "builtin_detail": "支持行范围选择器：path:start-end、path:start+count…",
+  "summary": "读取文件、目录或多个独立目标，支持行范围与批量读取。",
   "content": "<instruction>\n读取单个文件…\n</instruction>",
+  "rendered_content": "<instruction>\n读取单个文件…\n</instruction>",
+  "is_template": false,
+  "template_vars": ["cwd", "os", "tool", "tool_count", "tools", "doc_path"],
+  "template_flags": ["hasread", "haswrite", "iswindows", "…"],
   "editable": true,
-  "source": "disk",
-  "path": "prompts/tools/read.md",
-  "description": "builtin tool: read",
-  "kind": "builtin"
+  "source": "project",
+  "path": "/abs/path/.latte/tools.d/read.md",
+  "matched_id": "read",
+  "description": "读取文件或目录。把要读的目标放进 `paths` 数组…",
+  "kind": "builtin",
+  "layers": [
+    { "layer": "project", "exists": true,  "path": "/abs/.latte/tools.d/read.md", "matched_id": "read", "active": true },
+    { "layer": "global",  "exists": false, "path": "/home/u/.latte/tools.d/read.md", "matched_id": "read", "active": false }
+  ]
 }
 ```
 
-- `source`：`disk`（项目本地覆盖文件，模型实际读的就是这份）| `embedded`（编译期内置默认）| `none`（该工具无任何文档）。
-- `editable`：`kind == "dynamic"`（controller 运行时动态注册，如 `delegate` / `workflow`）时为 `false`，只读；其余为 `true`。
+- `brief`：一句话简介。md 里写过 `<!-- SUMMARY -->` 就用它，否则取 `description` 的首行/首句。
+- `builtin_detail`：`description` 里简介之后的部分。模型总能看到，但编译进代码，面板里只读。
+- `summary` / `content`：磁盘 md 的两段原文。**这两个字段是编辑缓冲**（`PUT` 的入参），
+  不要直接当简介/详情展示；无 md 时为空串（不能把内置描述灌进编辑器，否则一保存就复制一遍）。
+- `rendered_content` / `is_template` / `template_vars` / `template_flags`：模板支持。
+  `content` 里含 `{{…}}` 时 `is_template = true`，`rendered_content` 是按当前进程可见工具集
+  渲染后的预览（真正下发给模型时按各会话自己的工具集渲染）。
+- `source`：`project` | `global` | `none`（此时 `path` 是将要写入的路径）。
+- `matched_id`：实际命中的文档 id。走别名回退时与 `id` 不同（`mcp_call` → `mcp`）。
+- `kind`：`builtin` | `dynamic` | `package_alias` | `mcp`。
+- `layers`：项目层 / 全局层各自的落点（项目层在前），语义与 models 面板一致——
+  项目层覆盖全局层。`exists = false` 时 `path` 是**将要写入**的路径，`active` 标出当前生效的那层。
 
 ### `PUT /api/tools/:id/doc`
 
-写入工具的模型侧 Markdown 文档到 `<cwd>/prompts/tools/<id>.md`，新 session 生效。
+写入项目文档 `<cwd>/.latte/tools.d/<id>.md`，**并就地刷新所有活跃会话的工具描述**。
 
-**请求体：** Markdown 原文（`text/plain` 风格的裸字符串，不包 JSON）。
+**请求体：** `{ "summary": "一句话简介", "content": "Markdown 详情（可含模板）", "target": "project" }`
+—— 后端合成为带 `<!-- SUMMARY -->` / `<!-- DETAILS -->` 标记的 md。
 
-**响应 `200`**
+`target` 与 models 的 `update_model` 同名同义：`project`（默认，写
+`<cwd>/.latte/tools.d/<id>.md`）| `global`（写 `$LATTE_HOME/tools.d/<id>.md`）。
+UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一条路由。其它值 → 400。
 
-**响应 `400`：** 工具为 `dynamic`（动态注册）→ 文档只读；或 `id` 含路径分隔符/`..`（防路径穿越）。
+**响应 `200`：**
+
+```json
+{ "path": "/abs/path/.latte/tools.d/read.md", "source": "project", "refreshed_managers": 2 }
+```
+
+`refreshed_managers` 是就地刷新了几个活跃 `ToolManager`（>0 表示进行中的会话已经用上新文档，
+不需要重开 session）。
+
+**响应 `400`：** `id` 含路径分隔符 / `..`（防路径穿越）。
+
+### `DELETE /api/tools/:id/doc?target=project|global`
+
+删掉指定层的文档（`target` 默认 `project`），返回体同 `PUT`。
+删项目层后若全局层还有文档，运行时**自动回落到全局层**（不是变成「无文档」）。
+幂等（文件本来就没有也返回 200）；层必须显式给出，不做隐式跨层删除。
 
 ---
 

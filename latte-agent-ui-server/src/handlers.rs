@@ -984,16 +984,35 @@ pub(crate) async fn get_tool_doc(
         })
 }
 
-/// `PUT /api/tools/:id/doc` —— 写入工具的模型侧 Markdown 文档（body 为 Markdown 原文）。
-/// dynamic 工具只读，写入返回 400。
+/// `PUT /api/tools/:id/doc` —— 写入工具的模型侧 Markdown 文档（body 为 JSON）。
+///
+/// 写 `<cwd>/.latte/tools.d/<id>.md`，并就地刷新活跃会话的工具描述；返回体
+/// 里的 `refreshed_managers` 就是热更新到了几个会话（UI 拿它给用户回执）。
 pub(crate) async fn put_tool_doc(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(state): State<AppState>,
-    body: String,
-) -> Result<StatusCode, (StatusCode, String)> {
-    api::put_tool_doc(&state.backend, &id, &body)
+    axum::extract::Json(body): axum::extract::Json<api::PutToolDocRequest>,
+) -> Result<Json<api::PutToolDocResponse>, (StatusCode, String)> {
+    api::put_tool_doc(&state.backend, &id, &body.summary, &body.content, &body.target)
         .await
-        .map(|_| StatusCode::OK)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
+/// `DELETE /api/tools/:id/doc` —— 删掉项目工具文档，回到只有内置描述的状态。
+pub(crate) async fn delete_tool_doc(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<api::DeleteToolDocQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<api::PutToolDocResponse>, (StatusCode, String)> {
+    api::delete_tool_doc(&state.backend, &id, &query.target)
+        .await
+        .map(Json)
         .map_err(|e| {
             (
                 StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

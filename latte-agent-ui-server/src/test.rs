@@ -497,34 +497,48 @@ pub struct TestToolResponse {
     pub error: Option<String>,
 }
 
-/// 运行一次工具测试：创建完整 tool manager，注册全部 builtin 包，
-/// 执行指定工具，返回结果。不走 ChatController，不维护 context。
+/// 运行一次工具测试：**用运行时那套 tool manager**（builtin + `code_graph`
+/// + 文档增强 + MCP 代理），执行指定工具，返回结果。不走 ChatController，
+/// 不维护 context。
+///
+/// 特意复用 `controller::build_tool_manager_at` 而不是自己 `create_tool_manager()`
+/// + `register_package`：后者少了 `code_graph`、少了 `.latte/tools.d` 增强、
+/// 也少了 `mcp_connect` 的包装，于是「面板里测通了」不等于「模型那边能用」。
+/// 顺带让面板的「测试」按钮能真正用来连 MCP server —— 连上之后
+/// `GET /api/tools` 立刻能列出外部工具。
 pub async fn run_tool_test(req: TestToolRequest, cwd: &std::path::Path) -> TestToolResponse {
     use latte_rs_agent_tools::types::ToolManager as _;
     let started = Instant::now();
     let tool_id = &req.tool_id;
 
-    // 1. 创建 tool manager + 注册全部 builtin 包
-    let mgr = {
-        use latte_rs_agent_tools::prelude::*;
-        let mgr = create_tool_manager();
-        for p in builtin_tool_packages() {
-            if let Err(e) = mgr.register_package(p).await {
-                return TestToolResponse {
-                    ok: false,
-                    tool_id: tool_id.clone(),
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    response: None,
-                    error: Some(format!("注册 builtin package 失败: {e}")),
-                };
+    // 1. 建 manager：allowed 给「当前枚举出来的全部工具 + 别名」，等价于不过滤。
+    let mut allowed: Vec<String> = crate::tools::enumerate()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    allowed.push(tool_id.clone());
+    for (alias, members) in latte_agent_core::tool_docs::TOOL_ALIAS_GROUPS {
+        allowed.push((*alias).to_string());
+        allowed.extend(members.iter().map(|m| (*m).to_string()));
+    }
+    let mgr = match latte_agent_core::controller::build_tool_manager_at(cwd, &allowed).await {
+        Ok(mgr) => mgr,
+        Err(e) => {
+            return TestToolResponse {
+                ok: false,
+                tool_id: tool_id.clone(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                response: None,
+                error: Some(format!("构建 tool manager 失败: {e}")),
             }
         }
-        mgr
     };
 
-    // 2. 别名解析：bash → exec
+    // 2. 别名解析：bash → exec（tools crate 里 shell 包的注册名）
     let resolved = match tool_id.as_str() {
-        "bash" => "exec".to_string(),
+        "bash" if mgr.get_tool("bash").is_none() => "exec".to_string(),
         id => id.to_string(),
     };
 

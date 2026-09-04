@@ -68,6 +68,7 @@ pub mod session_store;
 pub mod staging;
 pub mod supervisor;
 pub mod renderer;
+pub mod tool_docs;
 pub mod trace;
 pub mod subsession;
 pub mod bridge;

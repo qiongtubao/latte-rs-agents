@@ -650,19 +650,35 @@ export async function stopSelfLoop(): Promise<void> {
 }
 
 // ─── Tools ───────────────────────────────────────────────────────────
+//
+// 工具目录的唯一事实来源在后端 `latte_agent_core::tool_docs`；这里的类型与
+// `latte-agent-ui-server/src/tools.rs::ToolEntry` 一一对应。
 export interface ToolEntry {
+  /** 注册名，也是 `.latte/tools.d/<id>.md` 的文件名。 */
   id: string;
+  /** UI 展示用短标签（`code_graph` → `Code Graph`）。 */
+  label?: string;
+  /** 分组：builtin | dynamic | package_alias | mcp。 */
   kind: string;
   enabled: boolean;
-  /** 工具描述，渲染时作为 tooltip。 */
+  /** 完整描述（模型随 schema 读到的那份）。 */
   description?: string;
-  /** 注册点（dynamic 工具的函数名）。 */
+  /** 一句话简介（description 的首行/首句）。 */
+  brief?: string;
+  /** 磁盘上是否已有 md 文档。 */
+  has_doc?: boolean;
+  /** 文档来源：project | global | none。 */
+  doc_source?: string;
+  /** 注册点：dynamic 为函数名，mcp 为 server 命令。 */
   registered_by?: string;
 }
 
-/** GET /api/tools 返回 `{tools: ToolEntry[]}` 形状（旧 schema 也兼容裸数组）。 */
+/** GET /api/tools 返回 `{tools, disabled, mcp_servers}`（旧 schema 的裸数组也兼容）。 */
 export interface ToolsListResponse {
   tools: ToolEntry[];
+  disabled?: string[];
+  /** 已连接的外部 MCP server 命令列表。 */
+  mcp_servers?: string[];
 }
 
 /** GET /api/tools：列出所有可用工具 + enabled 状态。 */
@@ -673,6 +689,15 @@ export async function listTools(): Promise<ToolEntry[]> {
   );
   // 兼容两种返回形态
   return Array.isArray(resp) ? resp : resp.tools;
+}
+
+/** GET /api/tools：同时要 mcp_servers 时用这个（裸数组形态下为空列表）。 */
+export async function listToolsWithMeta(): Promise<ToolsListResponse> {
+  const resp = await getTransport().request<ToolEntry[] | ToolsListResponse>(
+    "GET",
+    "/api/tools",
+  );
+  return Array.isArray(resp) ? { tools: resp, mcp_servers: [] } : resp;
 }
 
 /**
@@ -692,26 +717,71 @@ export async function setToolEnabled(id: string, enabled: boolean): Promise<void
 }
 
 /**
- * `GET /api/tools/:id/doc` 的返回：工具的模型侧 Markdown 文档。
+ * `GET /api/tools/:id/doc` 的返回：工具的模型侧说明。
  *
- * `content` 就是模型运行时真正读到的那份文档（后端解析顺序与
- * controller 的 `tool_prompt_content` 一致：磁盘 `prompts/tools/<id>.md`
- * 优先，缺省回退编译期内置常量）。
+ * 模型运行时看到的完整说明 = 注册描述（`description`，随 schema 下发）
+ * + 可选的项目/全局 md（`.latte/tools.d/<id>.md`，由 core 追加）。
+ * 后端按「首行/首句是简介，其余是详情」把它拆成 `brief` + `builtin_detail`
+ * （注册描述侧）与 `summary` + `content`（磁盘 md 侧，编辑缓冲）。
  */
 export interface ToolDocResponse {
   id: string;
-  /** Markdown 原文（未渲染）。可能为空字符串。 */
+  /** UI 展示用短标签。 */
+  label?: string;
+  /** 一句话简介：md 写过 `<!-- SUMMARY -->` 用它，否则取注册描述的首行/首句。 */
+  brief: string;
+  /** 注册描述里简介之后的部分。模型总能看到，但不可在面板里编辑。 */
+  builtin_detail: string;
+  /** 磁盘 md 的 SUMMARY 段原文，可能为空。**编辑缓冲用**，别直接当简介展示。 */
+  summary: string;
+  /** 磁盘 md 的正文原文（Markdown + 模板，未渲染）。**编辑缓冲用**。 */
   content: string;
-  /** 是否可编辑保存：dynamic（运行时动态注册）工具为 false。 */
+  /** 模板按当前上下文渲染后的详情；非模板时与 `content` 相同。 */
+  rendered_content?: string;
+  /** `content` 里是否用到了 `{{…}}` 模板语法。 */
+  is_template?: boolean;
+  /** 模板可用变量名（`{{CWD}}` 之类）。 */
+  template_vars?: string[];
+  /** 模板可用布尔开关名（`{{#if has_eval}}` 之类）。 */
+  template_flags?: string[];
+  /** 是否可编辑保存；当前所有工具均支持项目覆盖。 */
   editable: boolean;
-  /** 文档来源：disk（项目本地覆盖）| embedded（编译期内置）| none（无文档）。 */
-  source: "disk" | "embedded" | "none" | string;
-  /** 相对路径提示，如 `prompts/tools/read.md`。 */
+  /** 文档来源：project（项目）| global（全局）| none（无文档）。 */
+  source: "project" | "global" | "none" | string;
+  /** 实际文件路径；无文件时为项目写入提示路径。 */
   path: string;
-  /** 工具简介（一行描述）。 */
+  /** 实际命中的文档 id：走别名回退时与 `id` 不同（`mcp_call` → `mcp`）。 */
+  matched_id?: string;
+  /** 完整注册描述（`brief` + `builtin_detail` 的原始形态）。 */
   description: string;
-  /** 工具分组：builtin / dynamic / package_alias。 */
+  /** 工具分组：builtin / dynamic / package_alias / mcp。 */
   kind: string;
+  /** 项目层 / 全局层各自的文档落点（项目层在前），与 models 面板同一套分层语义。 */
+  layers?: ToolDocLayerInfo[];
+}
+
+/** 单层文档状态。`exists=false` 时 `path` 是将要写入的路径。 */
+export interface ToolDocLayerInfo {
+  layer: "project" | "global" | string;
+  exists: boolean;
+  path: string;
+  /** 命中的文档 id（别名回退时与工具 id 不同）。 */
+  matched_id: string;
+  /** 是否是当前生效的那一层。 */
+  active: boolean;
+}
+
+/** 写入目标层，与 models 的 `target` 同名同义。 */
+export type ToolDocTarget = "project" | "global";
+
+/** PUT / DELETE /api/tools/:id/doc 的返回。 */
+export interface PutToolDocResponse {
+  /** 实际写入（或删除）的文件路径。 */
+  path: string;
+  /** 实际落到哪一层。 */
+  source?: ToolDocTarget | string;
+  /** 就地刷新了几个活跃会话的工具描述（>0 表示不用新建 session 就已生效）。 */
+  refreshed_managers: number;
 }
 
 /** GET /api/tools/:id/doc —— 读取工具的模型侧 Markdown 文档 + 可编辑标志。 */
@@ -725,16 +795,40 @@ export async function getToolDoc(id: string): Promise<ToolDocResponse> {
 /**
  * PUT /api/tools/:id/doc —— 写入工具的模型侧 Markdown 文档。
  *
- * body 为 Markdown 原文（raw string，不包 JSON）。写入
- * `<cwd>/prompts/tools/<id>.md`，新 session 生效。
- * dynamic 工具只读，后端返回 400。
+ * body 为 JSON `{ summary: string, content: string }`。写入项目
+ * `<cwd>/.latte/tools.d/<id>.md`，并就地刷新活跃会话的工具描述
+ * （返回 `refreshed_managers` 即刷新了几个会话）。所有工具均可编辑。
  */
-export async function putToolDoc(id: string, content: string): Promise<void> {
-  await getTransport().request(
+export async function putToolDoc(
+  id: string,
+  summary: string,
+  content: string,
+  target: ToolDocTarget = "project",
+): Promise<PutToolDocResponse> {
+  const resp = await getTransport().request<PutToolDocResponse | null>(
     "PUT",
     `/api/tools/${encodeURIComponent(id)}/doc`,
-    content,
+    { summary, content, target },
   );
+  // 老后端返回空 body（204/200 无内容），按「没有热更新」处理。
+  return resp ?? { path: "", refreshed_managers: 0 };
+}
+
+/**
+ * DELETE /api/tools/:id/doc?target=… —— 删掉指定层的文档。
+ *
+ * 删项目层后若全局层还有文档，运行时自动回落到全局层。幂等：文件本来就没有
+ * 也返回成功。
+ */
+export async function deleteToolDoc(
+  id: string,
+  target: ToolDocTarget = "project",
+): Promise<PutToolDocResponse> {
+  const resp = await getTransport().request<PutToolDocResponse | null>(
+    "DELETE",
+    `/api/tools/${encodeURIComponent(id)}/doc?target=${target}`,
+  );
+  return resp ?? { path: "", refreshed_managers: 0 };
 }
 
 // ─── Models ──────────────────────────────────────────────────────────

@@ -202,6 +202,18 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 第 3、4 条中止时会把模型**已产出的正文**作为 `partial` 带出来，workflow 与
 delegate 据此降级采纳，不会把前面几十轮的成果一起丢掉。
 
+## 工具说明（tool docs）
+
+模型在 schema 里读到的工具说明 = **基线描述**（代码里写死）+ **项目/全局 md**
+（`.latte/tools.d/<工具名>.md`）。md 首行是一句话简介，其后是细则；可以用
+`{{#if has_eval}}…{{/if}}` 按当前会话真实可用的工具改写内容。
+
+在 Web UI 的 Tools 面板里直接编辑：保存后**就地刷新所有活跃会话**
+（返回体里的 `refreshed_managers` 就是刷新了几个），不必重开 session。
+外部 MCP server 的工具连上后会注册成一等工具，同样能写文档、能在面板里管理。
+
+详见 `docs/tool-docs.md`。
+
 ## Skill 系统
 
 Skill 是扩展 Agent 能力的指令模块。在角色 TOML 中声明，运行时追加到 system prompt。
@@ -252,6 +264,8 @@ Web UI 提供完整的 REST + SSE API，详情见 `docs/api-reference.md`。
 | `/api/self-loop/events` | GET | 自调试 SSE |
 | `/api/self-loop/stop` | POST | 停止自调试 |
 | `/api/role-graph` | GET | 角色工具关系图 |
+| `/api/tools` | GET | 工具目录（内置/动态/别名/外部 MCP + 文档状态） |
+| `/api/tools/:id/doc` | GET/PUT/DELETE | 工具的模型侧说明（支持模板，保存即热更新） |
 
 ---
 

@@ -681,8 +681,11 @@ fn build_router(state: AppState) -> Router {
         .route("/tools", get(list_tools))
         .route("/tools/test", axum::routing::post(test_tool))
         .route("/tools/:id/toggle", axum::routing::post(toggle_tool))
-        // 工具模型侧 Markdown 文档查看/编辑（prompts/tools/<id>.md）
-        .route("/tools/:id/doc", get(get_tool_doc).put(put_tool_doc))
+        // 工具模型侧 Markdown 文档（.latte/tools.d/<id>.md）
+        .route(
+            "/tools/:id/doc",
+            get(get_tool_doc).put(put_tool_doc).delete(delete_tool_doc),
+        )
         // 角色管理（新建/删除/测试）
         .route("/roles", get(list_roles).post(create_role))
         .route("/roles/test", axum::routing::post(test_role))

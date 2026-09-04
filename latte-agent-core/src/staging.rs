@@ -154,6 +154,61 @@ impl Staging {
                 let st = Arc::clone(&st);
                 let orig_handler = orig_handler.clone();
                 Box::pin(async move {
+                    // `paths` 批量：逐项做 overlay 改写后交给内层（批量适配器）
+                    // 一次执行，再把每个 file 的 path 还原成调用方给的原值。
+                    //
+                    // 必须在这里处理：`wrap_tools` 是**外层**包装（拿已注册的
+                    // read 再包一次），批量适配器在内层。原来这里直接
+                    // `input["path"].ok_or("path is required")`，于是
+                    // staging 启用时（`design_and_plan.toml`）任何 `paths`
+                    // 调用都在到达批量适配器之前就报错。
+                    if let Some(items) = input.get("paths").and_then(|v| v.as_array()) {
+                        let mut rewritten_items = Vec::with_capacity(items.len());
+                        // 原始入参 → 命中暂存区时的 staged 绝对路径。
+                        let mut staged_of: Vec<(String, Option<String>)> =
+                            Vec::with_capacity(items.len());
+                        for item in items {
+                            let Some(spec) = item.as_str() else {
+                                // 非字符串项交给内层报错，形状与非 staging 路径一致。
+                                return (orig_handler)(input, ctx).await;
+                            };
+                            let (file_part, selector) = split_path_selector(spec);
+                            let dest_abs = st.resolve(file_part);
+                            let staged = st.staged_path(&dest_abs);
+                            if staged.is_file() {
+                                let staged_str = staged.to_string_lossy().into_owned();
+                                let rewritten_spec = match selector {
+                                    Some(sel) => format!("{staged_str}:{sel}"),
+                                    None => staged_str.clone(),
+                                };
+                                rewritten_items.push(serde_json::Value::String(rewritten_spec));
+                                staged_of.push((spec.to_string(), Some(staged_str)));
+                            } else {
+                                // 暂存未命中：原样走真实 fs。
+                                rewritten_items.push(item.clone());
+                                staged_of.push((spec.to_string(), None));
+                            }
+                        }
+                        let mut rewritten = input.clone();
+                        rewritten["paths"] = serde_json::Value::Array(rewritten_items);
+                        let mut out = (orig_handler)(rewritten, ctx).await?;
+                        // 还原 path 并标注 stagedFrom。`files` 与输入同序
+                        // （批量适配器用 `buffered` 保序）；失败项落在 `failed`
+                        // 里，所以按 files 实际长度对齐前缀即可。
+                        if let Some(files) = out.get_mut("files").and_then(|v| v.as_array_mut()) {
+                            for (file, (orig_spec, staged)) in
+                                files.iter_mut().zip(staged_of.iter())
+                            {
+                                let Some(obj) = file.as_object_mut() else { continue };
+                                obj.insert("path".into(), serde_json::json!(orig_spec));
+                                if let Some(staged) = staged {
+                                    obj.insert("stagedFrom".into(), serde_json::json!(staged));
+                                }
+                            }
+                        }
+                        return Ok(out);
+                    }
+
                     let path = input
                         .get("path")
                         .and_then(|v| v.as_str())
@@ -439,12 +494,21 @@ mod tests {
     use latte_rs_agent_tools::prelude::*;
     use latte_rs_agent_tools::types::ToolExecutionContext;
 
+    /// 生产路径的 tool manager —— 必须经 `build_tool_manager`，不能只
+    /// `register_package` 裸包。
+    ///
+    /// 为什么：批量读契约（`read` 的 `paths` 入口）是
+    /// `controller::enrich_tool_for_model` 加的，只在 `build_tool_manager`
+    /// 里跑。裸注册出来的 `read` 还是单 `path` 版本，于是「staging 外层包装
+    /// 把 `paths` 调用挡在批量适配器之前」这个真实 bug 在测试里根本复现不出来。
     async fn make_tm() -> Arc<dyn ToolManager> {
-        let mgr = create_tool_manager();
-        for p in builtin_tool_packages() {
-            mgr.register_package(p).await.unwrap();
-        }
-        mgr
+        crate::controller::build_tool_manager(&[
+            "read".into(),
+            "write".into(),
+            "bash".into(),
+        ])
+        .await
+        .expect("build_tool_manager")
     }
 
     fn ctx() -> Option<ToolExecutionContext> {
@@ -494,14 +558,20 @@ mod tests {
         assert!(!dir.join("notes/plan.md").exists());
         assert!(st.root().join("notes/plan.md").exists());
 
-        // read overlay：请求原路径，读到暂存内容。
+        // read overlay：请求原路径，读到暂存内容。入口是 `paths`（`path` 已
+        // 从模型可见 schema 摘掉），overlay 改写必须发生在批量适配器**之前**
+        // ——`wrap_tools` 是外层包装，原来这里硬要求 `path`，导致 staging
+        // 启用时任何 `paths` 调用都在到达批量适配器前就报 "path is required"。
         let out = tm
-            .execute("read", serde_json::json!({"path": "notes/plan.md"}), ctx())
+            .execute("read", serde_json::json!({"paths": ["notes/plan.md"]}), ctx())
             .await
             .unwrap();
-        assert_eq!(out["content"], "草稿v1");
-        assert_eq!(out["path"], "notes/plan.md");
-        assert!(out["stagedFrom"].is_string());
+        assert_eq!(out["files"][0]["content"], "草稿v1");
+        assert_eq!(
+            out["files"][0]["path"], "notes/plan.md",
+            "path 要还原成调用方给的原值，不能泄露暂存区路径"
+        );
+        assert!(out["files"][0]["stagedFrom"].is_string());
 
         // 行选择器在暂存副本上同样生效。
         tm.execute(
@@ -512,19 +582,49 @@ mod tests {
         .await
         .unwrap();
         let out = tm
-            .execute("read", serde_json::json!({"path": "notes/plan.md:2-3"}), ctx())
+            .execute(
+                "read",
+                serde_json::json!({"paths": ["notes/plan.md:2-3"]}),
+                ctx(),
+            )
             .await
             .unwrap();
-        assert_eq!(out["content"], "l2\nl3");
+        assert_eq!(out["files"][0]["content"], "l2\nl3");
 
         // 未命中 overlay：读真实 fs。
         std::fs::write(dir.join("real.md"), "真实文件").unwrap();
         let out = tm
-            .execute("read", serde_json::json!({"path": "real.md"}), ctx_in(&dir))
+            .execute(
+                "read",
+                serde_json::json!({"paths": ["real.md"]}),
+                ctx_in(&dir),
+            )
             .await
             .unwrap();
-        assert_eq!(out["content"], "真实文件");
-        assert!(out.get("stagedFrom").is_none());
+        assert_eq!(out["files"][0]["content"], "真实文件");
+        assert!(out["files"][0].get("stagedFrom").is_none());
+
+        // 同一次批量里混合「命中暂存」与「未命中」：各自走各自的来源，
+        // 顺序与输入一致。这是外层 overlay + 内层批量最容易错的组合。
+        let out = tm
+            .execute(
+                "read",
+                serde_json::json!({"paths": ["notes/plan.md", "real.md"]}),
+                ctx_in(&dir),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["count"], 2);
+        assert_eq!(out["files"][0]["path"], "notes/plan.md");
+        assert!(
+            out["files"][0]["stagedFrom"].is_string(),
+            "第 1 项命中暂存: {out}"
+        );
+        assert_eq!(out["files"][1]["content"], "真实文件");
+        assert!(
+            out["files"][1].get("stagedFrom").is_none(),
+            "第 2 项未命中暂存: {out}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -2757,7 +2757,11 @@ select {
   background: white;
 }
 
-.tools-page-body,
+.tools-page-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 16px 12px;
+}
 .tools-page-status {
   padding: 0 16px 12px;
 }
@@ -3088,7 +3092,16 @@ select {
   white-space: pre-wrap;
 }
 
-/* 详情弹层分区（简介 / 工具文档） */
+/* 详情弹层分区（简介固定 / 工具文档可滚动） */
+.tool-detail-section {
+  flex-shrink: 0;
+}
+.tool-detail-section.tool-doc-section {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .tool-detail-section + .tool-detail-section {
   margin-top: 16px;
   padding-top: 12px;
@@ -3101,9 +3114,10 @@ select {
   color: var(--fg-2);
   text-transform: uppercase;
   margin-bottom: 6px;
+  flex-shrink: 0;
 }
 
-/* ─── 工具文档（模型读取的 prompts/tools/<id>.md）查看/编辑 ───── */
+/* ─── 工具文档（模型读取的 .latte/tools.d/<id>.md）查看/编辑 ───── */
 
 .tool-doc-meta {
   display: flex;
@@ -3111,6 +3125,7 @@ select {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 8px;
+  flex-shrink: 0;
 }
 .tool-doc-badge {
   display: inline-block;
@@ -3122,16 +3137,16 @@ select {
   border: 1px solid transparent;
   cursor: help;
 }
-/* 来源：项目文件（模型实际读到的那份）/ 内置默认 / 无 */
-.tool-doc-source-disk {
+/* 来源：项目文件（模型实际读到的那份）/ 全局文件 / 无 */
+.tool-doc-source-project {
   background: #eff6ff;
   color: var(--accent-2);
   border-color: #bfdbfe;
 }
-.tool-doc-source-embedded {
-  background: var(--bg-3);
-  color: var(--fg-2);
-  border-color: var(--border);
+.tool-doc-source-global {
+  background: #f0fdf4;
+  color: #15803d;
+  border-color: #bbf7d0;
 }
 .tool-doc-source-none {
   background: #fffbeb;
@@ -3200,7 +3215,7 @@ select {
 
 /* 查看态：渲染后的 markdown */
 .tool-doc-view {
-  max-height: 46vh;
+  flex: 1;
   overflow-y: auto;
   padding: 10px 12px;
   border: 1px solid var(--border);
@@ -3255,15 +3270,16 @@ select {
 
 /* 编辑态：Markdown 原文 textarea（风格对齐角色 TOML 编辑器） */
 .tool-doc-editor {
+  flex: 1;
   width: 100%;
-  min-height: 42vh;
+  min-height: 0;
   font-family: var(--mono-font);
   font-size: 0.78em;
   line-height: 1.55;
   padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  resize: vertical;
+  resize: none;
   background: var(--bg-2);
   color: var(--fg);
   tab-size: 2;
@@ -3279,6 +3295,7 @@ select {
 
 /* 状态行 / 加载 / 报错 / 空文档 */
 .tool-doc-status {
+  flex-shrink: 0;
   min-height: 1.2em;
   margin-top: 6px;
   font-size: 0.76em;
@@ -3288,11 +3305,13 @@ select {
   color: var(--err);
 }
 .tool-doc-loading {
+  flex-shrink: 0;
   padding: 10px 0;
   font-size: 0.82em;
   color: var(--fg-2);
 }
 .tool-doc-error {
+  flex-shrink: 0;
   padding: 8px 10px;
   border: 1px solid #fecaca;
   border-radius: 6px;
@@ -3304,6 +3323,148 @@ select {
   color: var(--fg-2);
   font-size: 0.95em;
   font-style: italic;
+}
+
+/* 简介和详情子区域 */
+.tool-doc-subsection {
+  margin-bottom: 12px;
+}
+.tool-doc-subsection:last-child {
+  margin-bottom: 0;
+}
+.tool-doc-subsection-label {
+  font-size: 0.75em;
+  font-weight: 600;
+  color: var(--fg-2);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.tool-doc-summary-view,
+.tool-doc-detail-view {
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.88em;
+  line-height: 1.5;
+}
+/* 详情区里「内置说明 / 项目文档」两段各自的小标签。 */
+.tool-doc-origin-label {
+  margin: 8px 0 4px;
+  font-size: 0.74em;
+  color: var(--fg-2);
+}
+/* 文档状态徽章：一眼看出哪些工具还没写说明。 */
+.tools-card-badge.badge-doc-yes {
+  background: rgba(34, 197, 94, 0.14);
+  color: #16a34a;
+}
+.tools-card-badge.badge-doc-no {
+  background: rgba(168, 131, 42, 0.16);
+  color: #a8832a;
+}
+.tools-card-badge.badge-mcp {
+  background: rgba(139, 92, 246, 0.16);
+  color: #7c3aed;
+}
+/* 已连接的外部 MCP server 列表。 */
+.tools-mcp-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  font-size: 0.78em;
+  color: var(--fg-2);
+}
+.tools-mcp-bar code {
+  font-family: var(--mono-font);
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-2);
+}
+.tool-doc-alias-note {
+  background: rgba(59, 130, 246, 0.14);
+  color: #2563eb;
+}
+/* 模板说明/预览折叠区。 */
+.tool-doc-template {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  font-size: 0.84em;
+}
+.tool-doc-template > summary {
+  cursor: pointer;
+  color: var(--fg-2);
+}
+.tool-doc-template-help {
+  margin: 6px 0;
+  color: var(--fg-2);
+  line-height: 1.7;
+}
+.tool-doc-template-help code {
+  font-family: var(--mono-font);
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-2);
+}
+.tool-doc-template-ctx {
+  margin-top: 6px;
+  white-space: pre-wrap;
+  font-family: var(--mono-font);
+  font-size: 0.92em;
+  color: var(--fg-2);
+}
+/* 内置说明：只读，视觉上比可编辑的项目文档更淡一档。 */
+.tool-doc-builtin-view {
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  font-size: 0.86em;
+  line-height: 1.5;
+  color: var(--fg-2);
+}
+.tool-doc-summary-editor,
+.tool-doc-detail-editor {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: var(--mono-font);
+  font-size: 0.82em;
+  line-height: 1.5;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  resize: vertical;
+}
+.tool-doc-summary-editor {
+  min-height: 60px;
+  max-height: 120px;
+}
+.tool-doc-detail-editor {
+  min-height: 200px;
+}
+.tool-doc-summary-editor:focus,
+.tool-doc-detail-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+}
+/* 查看/编辑态互斥：tools_panel.ts 用 `hidden` class 切换这四个节点。
+   本文件早期只有 `.tool-doc-view` / `.tool-doc-editor` 两条旧类名的
+   `.hidden` 规则，而全局没有 `.hidden { display:none }`，导致
+   summary/detail 的 view 与 textarea 永远同时可见（查看态多出两个空
+   灰框，编辑态 view 与编辑器上下堆叠）。 */
+.tool-doc-summary-view.hidden,
+.tool-doc-detail-view.hidden,
+.tool-doc-summary-editor.hidden,
+.tool-doc-detail-editor.hidden {
+  display: none;
 }
 
 /* ─── 任务看板（task_board.ts，视觉对齐 task-board.html mockup） ─── */
@@ -4158,4 +4319,35 @@ select {
 @keyframes choice-pulse {
   0%, 100% { box-shadow: 0 8px 22px rgba(37, 99, 235, 0.35); }
   50% { box-shadow: 0 8px 30px rgba(37, 99, 235, 0.7); }
+}
+/* 「删除文档」：危险操作，红色描边但不抢主按钮位置。 */
+.tool-doc-btn-danger {
+  border-color: rgba(220, 38, 38, 0.5);
+  color: #dc2626;
+}
+.tool-doc-btn-danger:hover {
+  background: rgba(220, 38, 38, 0.1);
+}
+/* 文档分层条：项目层 / 全局层各自有没有文档、哪层生效（与 models 面板同一套语义）。 */
+.tool-doc-layers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 2px;
+}
+.tool-doc-layer-chip {
+  font-size: 0.72em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--fg-2);
+  cursor: help;
+}
+.tool-doc-layer-chip.layer-exists {
+  border-color: rgba(34, 197, 94, 0.45);
+  color: #16a34a;
+}
+.tool-doc-layer-chip.layer-active {
+  background: rgba(34, 197, 94, 0.12);
+  font-weight: 600;
 }

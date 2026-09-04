@@ -894,8 +894,14 @@ fn role_config_entry(
 }
 
 /// 枚举全部可用工具的 short name：注册全部 builtin packages 后取
-/// `get_tool_names()` 的最后一段，去重排序，再补上 `delegate` 和
-/// `workflow`（这两个由 controller 动态注册，不在 builtin packages 里）。
+/// `get_tool_names()` 的最后一段，再补上 `code_graph`（core 单独 register）、
+/// controller 运行时注册的动态工具（`DYNAMIC_TOOL_CATALOG`）与配置层别名
+/// （`TOOL_ALIAS_GROUPS`，`agents.toml` 里可以直接写 `tools = ["mcp"]`），
+/// 去重排序。
+///
+/// 与工具面板的 `crate::tools::enumerate_inner()` 共用同一批 core 常量，
+/// 避免两处各维护一份手抄清单后漂移（历史上角色编辑器补了 `code_graph`、
+/// 工具面板没补，doc_* 四个工具两边都漏）。
 async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
     use latte_rs_agent_tools::prelude::*;
     let mgr = create_tool_manager();
@@ -909,14 +915,17 @@ async fn enumerate_available_tools() -> Result<Vec<String>, ApiError> {
         .into_iter()
         .map(|n| n.rsplit('.').next().unwrap_or(&n).to_string())
         .collect();
-    names.insert("ask".to_string());
-    names.insert("plan".to_string());
-    names.insert("task_report".to_string());
-    names.insert("request_tool".to_string());
-    names.insert("delegate".to_string());
-    names.insert("workflow".to_string());
-    names.insert("generate_image".to_string());
-    names.insert("code_graph".to_string());
+    names.insert(latte_agent_core::controller::code_graph_tool().name);
+    names.extend(
+        latte_agent_core::controller::DYNAMIC_TOOL_CATALOG
+            .iter()
+            .map(|(id, _)| (*id).to_string()),
+    );
+    names.extend(
+        latte_agent_core::controller::TOOL_ALIAS_GROUPS
+            .iter()
+            .map(|(alias, _)| (*alias).to_string()),
+    );
     Ok(names.into_iter().collect())
 }
 
@@ -2171,7 +2180,10 @@ mod tests {
 
     /// 进程级 mutex，串行化测试里对 `LATTE_HOME` / `HOME` 的修改。
     /// `cargo test` 多线程跑测试，env 变量是进程级的，不锁会互相踩。
-    static ENV_LOCK: std::sync::LazyLock<parking_lot::Mutex<()>> =
+    ///
+    /// `pub(super)`：兄弟测试模块（`tool_doc_tests`）也改 `LATTE_HOME`，
+    /// 必须共用这一把——各自一把等于没锁。
+    pub(super) static ENV_LOCK: std::sync::LazyLock<parking_lot::Mutex<()>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(()));
 
     /// 把 `LATTE_HOME` 重定向到临时目录跑 `f`，结束后恢复原值。
@@ -2686,9 +2698,11 @@ pub struct ToolsListResponse {
     pub tools: Vec<crate::tools::ToolEntry>,
     /// 当前被禁用的工具 ID 列表（方便 UI 快速判断全选状态）。
     pub disabled: Vec<String>,
+    /// 已连接的外部 MCP server 命令列表（UI 展示「外部工具来自哪里」）。
+    pub mcp_servers: Vec<String>,
 }
 
-/// `GET /api/tools` — 列出所有可用工具，标记每个工具的启用/禁用状态。
+/// `GET /api/tools` — 列出所有可用工具，标记启用状态与文档状态。
 /// `enumerate()` 总是立即返回（预热完成前返回 fallback 列表），不阻塞。
 pub async fn list_tools(b: &UiBackend) -> Result<ToolsListResponse, ApiError> {
     let mut tools = crate::tools::enumerate()
@@ -2698,11 +2712,17 @@ pub async fn list_tools(b: &UiBackend) -> Result<ToolsListResponse, ApiError> {
     for tool in &mut tools {
         tool.enabled = store.is_enabled(&tool.id);
     }
+    // 「这个工具写过文档没有」要按当前工作目录实时算，不能进枚举缓存。
+    crate::tools::annotate_doc_state(&b.cwd, &mut tools);
     let disabled: Vec<String> = tools.iter()
         .filter(|t| !t.enabled)
         .map(|t| t.id.clone())
         .collect();
-    Ok(ToolsListResponse { tools, disabled })
+    Ok(ToolsListResponse {
+        tools,
+        disabled,
+        mcp_servers: latte_agent_core::tool_docs::mcp_servers(),
+    })
 }
 
 /// `POST /api/tools/:id/toggle` — 切换工具的启用/禁用状态。
@@ -2714,32 +2734,98 @@ pub fn toggle_tool(b: &UiBackend, id: &str, enabled: bool) -> Result<bool, ApiEr
         .map_err(|e| ApiError::internal(format!("toggle tool: {e}")))
 }
 
-/// `GET /api/tools/:id/doc` 的返回：工具的模型侧 Markdown 文档 + 是否可编辑。
+/// `GET /api/tools/:id/doc` 的返回：工具的模型侧说明 + 编辑所需的一切。
 ///
-/// `content` 是模型在运行时真正读到的那份文档（见 controller 的
-/// `tool_prompt_content`：磁盘 `prompts/tools/<id>.md` 优先，缺省回退到
-/// 编译期 `include_str!` 的内置常量）。
+/// 模型运行时看到的完整说明 = **注册描述**（`Tool::description`，随 schema
+/// 一起下发）+ 可选的**项目/全局文档**（`.latte/tools.d/<id>.md`，由 core 的
+/// `tool_docs::effective_description` 渲染模板后追加）。本结构把这份文本按
+/// oh-my-pi 的工具文档约定拆成「一句话简介 + 详情」两层：
+/// 首行（或首句）是简介，其余是细则。
 #[derive(Serialize)]
 pub struct ToolDocResponse {
-    /// 工具短名（与 `ToolEntry.id` 对齐）。
+    /// 工具注册名（与 `ToolEntry.id` 对齐，也是 md 的文件名）。
     pub id: String,
-    /// 文档正文（Markdown 原文，未渲染）。可能为空（该工具无任何文档）。
+    /// UI 展示用短标签。
+    pub label: String,
+    /// 一句话简介。优先取磁盘文档里的 `<!-- SUMMARY -->`，否则取注册描述的首行/首句。
+    pub brief: String,
+    /// 注册描述里简介之后的部分（模型总能看到，但不可在面板里编辑）。
+    pub builtin_detail: String,
+    /// 磁盘文档的 SUMMARY 段原文，可能为空。**编辑缓冲用**，不要直接当简介展示。
+    pub summary: String,
+    /// 磁盘文档的正文原文（Markdown + 模板，未渲染）。**编辑缓冲用**。
     pub content: String,
-    /// 是否可编辑保存：
-    /// - `dynamic`（controller 运行时动态注册，如 delegate/workflow）→ `false`，只读；
-    /// - 其余（builtin / package_alias）→ `true`，可写到 `<cwd>/prompts/tools/<id>.md`。
+    /// 模板按当前上下文渲染后的详情。`content` 里没有 `{{…}}` 时与它相同。
+    pub rendered_content: String,
+    /// `content` 里是否用到了模板语法。
+    pub is_template: bool,
+    /// 模板可用的变量名（`{{CWD}}` 之类）。
+    pub template_vars: Vec<String>,
+    /// 模板可用的布尔开关名（`{{#if has_eval}}` 之类）。
+    pub template_flags: Vec<String>,
+    /// 是否可编辑保存：始终为 true（写入项目 `.latte/tools.d/<id>.md`）。
     pub editable: bool,
-    /// 文档来源：`"disk"`（项目本地覆盖文件）| `"embedded"`（编译期内置）| `"none"`（无文档）。
+    /// 磁盘文档来源：`"project"` | `"global"` | `"none"`。
     pub source: String,
-    /// 若来源为磁盘，给出相对路径提示（UI 展示"文件位置"）。
+    /// 磁盘文档路径（`none` 时给出将要写入的相对路径）。
     pub path: String,
-    /// 工具简介（一行描述，取自枚举结果）。
+    /// 实际命中的文档 id：走别名回退时与 `id` 不同（`mcp_call` → `mcp`）。
+    pub matched_id: String,
+    /// 完整注册描述（`brief` + `builtin_detail` 的原始形态）。
     pub description: String,
-    /// 工具分组（builtin / dynamic / package_alias），供 UI 显示与判定。
+    /// 工具分组（builtin / dynamic / package_alias / mcp）。
     pub kind: String,
+    /// 两层（项目/全局）各自的文档落点，项目层在前。UI 据此显示
+    /// 「保存到项目 / 保存到全局」以及哪层正在生效——与 models 面板同一套语义。
+    pub layers: Vec<ToolDocLayerInfo>,
 }
 
-/// 校验工具 id 不含路径分隔符/父目录跳出，防止写到 `prompts/tools/` 之外。
+/// 单层文档状态。`exists = false` 时 `path` 是**将要写入**的路径。
+#[derive(Debug, Serialize)]
+pub struct ToolDocLayerInfo {
+    /// `project` | `global`。
+    pub layer: String,
+    pub exists: bool,
+    pub path: String,
+    /// 命中的文档 id（别名回退时与工具 id 不同）。
+    pub matched_id: String,
+    /// 是否是当前生效的那一层（项目层存在时它生效，否则全局层）。
+    pub active: bool,
+}
+
+/// `PUT /api/tools/:id/doc` 的请求体。
+#[derive(Deserialize)]
+pub struct PutToolDocRequest {
+    /// 简介（Markdown）。
+    pub summary: String,
+    /// 详情文档（Markdown + 可选模板语法）。
+    pub content: String,
+    /// 写到哪一层：`project`（默认）| `global`。与 models 的
+    /// `update_model` 同名同义——「保存到项目 / 保存到全局」两个按钮共用一条路由。
+    #[serde(default)]
+    pub target: String,
+}
+
+/// `DELETE /api/tools/:id/doc` 的查询参数：删哪一层。
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteToolDocQuery {
+    /// `project`（默认）| `global`。
+    #[serde(default)]
+    pub target: String,
+}
+
+/// `PUT /api/tools/:id/doc` 的返回。
+#[derive(Debug, Serialize)]
+pub struct PutToolDocResponse {
+    /// 实际写入（或删除）的文件路径。
+    pub path: String,
+    /// 实际落到哪一层：`project` | `global`。
+    pub source: String,
+    /// 就地刷新了几个活跃 `ToolManager`（>0 表示进行中的会话已经用上新文档）。
+    pub refreshed_managers: usize,
+}
+
+/// 校验工具 id 不含路径分隔符/父目录跳出，防止写到 `.latte/tools.d/` 之外。
 fn validate_tool_doc_id(id: &str) -> Result<(), ApiError> {
     if id.is_empty()
         || id.contains('/')
@@ -2761,85 +2847,173 @@ async fn lookup_tool_meta(id: &str) -> Option<(String, String)> {
         .map(|t| (t.kind, t.description))
 }
 
-/// 工具文档的相对路径（与运行时 `tool_prompt_content` 用的相对路径一致）。
+/// 工具文档的项目相对路径。运行时读的、UI 写的必须是同一个路径，所以直接
+/// 用 core 的实现，不在这里另写一份。
 fn tool_doc_rel_path(id: &str) -> String {
-    format!("prompts/tools/{id}.md")
+    latte_agent_core::tool_docs::doc_rel_path(id)
 }
 
-/// 解析工具文档内容 + 来源，纯函数（只依赖 `cwd` 与 `id`，便于单测）。
+/// `GET /api/tools/:id/doc` — 读取工具的模型侧说明。
 ///
-/// 顺序与 controller 的 `tool_prompt_content` 一致：磁盘
-/// `<cwd>/prompts/tools/<id>.md` 优先，缺省回退编译期内置常量。
-fn resolve_tool_doc_at(cwd: &Path, id: &str) -> (String, &'static str) {
-    let disk_path = cwd.join(tool_doc_rel_path(id));
-    if let Ok(text) = std::fs::read_to_string(&disk_path) {
-        return (text, "disk");
-    }
-    if let Some(embedded) = latte_agent_core::prompts::tool_prompts::for_tool(id) {
-        return (embedded.trim().to_string(), "embedded");
-    }
-    (String::new(), "none")
-}
-
-/// 写工具文档到 `<cwd>/prompts/tools/<id>.md`（含建目录），纯 IO，便于单测。
-fn write_tool_doc_at(cwd: &Path, id: &str, content: &str) -> Result<PathBuf, ApiError> {
-    let disk_path = cwd.join(tool_doc_rel_path(id));
-    if let Some(dir) = disk_path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
-    }
-    std::fs::write(&disk_path, content)
-        .map_err(|e| ApiError::internal(format!("write {}: {e}", disk_path.display())))?;
-    Ok(disk_path)
-}
-
-/// `GET /api/tools/:id/doc` — 读取工具的模型侧 Markdown 文档。
+/// 磁盘文档的解析（项目 → 全局 → 别名组）、SUMMARY/DETAILS 标记拆分、模板
+/// 渲染全部走 `latte_agent_core::tool_docs`，与运行时下发给模型的是同一套
+/// 代码；这里只负责组装 HTTP 响应。
 ///
-/// 解析顺序与运行时 `tool_prompt_content` 保持一致：先读磁盘
-/// `<cwd>/prompts/tools/<id>.md`，缺省回退到内置 `tool_prompts::for_tool`。
+/// 注册描述（模型总能看到的那份）拆成 `brief` + `builtin_detail` 一并返回，
+/// 这样没写过 md 的工具在面板上也不再是「简介一大段 + 详情空白」。
 pub async fn get_tool_doc(b: &UiBackend, id: &str) -> Result<ToolDocResponse, ApiError> {
+    use latte_agent_core::tool_docs as docs;
     validate_tool_doc_id(id)?;
 
     let (kind, description) = lookup_tool_meta(id)
         .await
         .unwrap_or_else(|| ("other".to_string(), String::new()));
-    // dynamic 工具（controller 运行时注册）不提供可编辑文档。
-    let editable = kind != "dynamic";
 
-    let (content, source) = resolve_tool_doc_at(&b.cwd, id);
+    let doc = docs::resolve_doc(&b.cwd, id);
+    let (summary, content) = docs::split_doc_markers(&doc.raw);
+    // 无标记的 md 整份都算详情（用户没划分简介/详情时不该丢内容）。
+    let content = if summary.trim().is_empty() && content.trim().is_empty() {
+        doc.raw.trim().to_string()
+    } else {
+        content.trim().to_string()
+    };
+    let summary = summary.trim().to_string();
+
+    // 简介优先级：md 里人工写的 SUMMARY → 注册描述的首行/首句。
+    let (desc_brief, builtin_detail) = docs::split_brief_and_detail(&description);
+    let brief = if summary.is_empty() { desc_brief } else { summary.clone() };
+
+    // 模板按「当前进程能看到的全部工具」渲染，给编辑者一个预览。真正下发给
+    // 模型时用的是各会话自己的工具集（见 core 的 enrich_registered_tools），
+    // 所以这里只是预览，不是最终文本。
+    let names: Vec<String> = crate::tools::enumerate()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    let mut ctx = docs::TemplateContext::from_tool_names(&b.cwd, &names);
+    ctx.set_var("tool", id).set_var("doc_path", doc.path.display().to_string());
+
+    let active_layer = match doc.source {
+        docs::DocSource::Global => Some("global"),
+        docs::DocSource::Project => Some("project"),
+        docs::DocSource::Missing => None,
+    };
+    let layers = docs::doc_layers(&b.cwd, id)
+        .into_iter()
+        .map(|state| ToolDocLayerInfo {
+            active: Some(state.layer.as_str()) == active_layer,
+            layer: state.layer.as_str().to_string(),
+            exists: state.exists,
+            path: state.path.display().to_string(),
+            matched_id: state.matched_id,
+        })
+        .collect();
+
     Ok(ToolDocResponse {
         id: id.to_string(),
+        layers,
+        label: crate::tools::label_for(id),
+        brief,
+        builtin_detail,
+        rendered_content: docs::render_template(&content, &ctx),
+        is_template: docs::uses_template_syntax(&content),
+        template_vars: ctx.var_names(),
+        template_flags: ctx.flag_names(),
+        summary,
         content,
-        editable,
-        source: source.to_string(),
-        path: tool_doc_rel_path(id),
+        editable: true,
+        source: doc.source.as_str().to_string(),
+        path: doc.path.display().to_string(),
+        matched_id: doc.matched_id,
         description,
         kind,
     })
 }
 
 /// `PUT /api/tools/:id/doc` — 写入工具的模型侧 Markdown 文档到
-/// `<cwd>/prompts/tools/<id>.md`。运行时 `tool_prompt_content` 会优先读该文件，
-/// 因此保存后新 session 立即生效。dynamic 工具拒绝写入（只读）。
-pub async fn put_tool_doc(b: &UiBackend, id: &str, content: &str) -> Result<(), ApiError> {
+/// `target` 指定的层（项目 `<cwd>/.latte/tools.d/<id>.md` 或全局
+/// `$LATTE_HOME/tools.d/<id>.md`），并**就地刷新所有活跃会话的工具描述**。
+///
+/// 热更新是这里的关键：`refresh_tool_docs()` 把每个还活着的 `ToolManager`
+/// 重新 enrich 一遍（`基线描述 + 当前文档` 的纯函数，重复执行不会叠加），
+/// 所以改完文档不必新建 session 就能生效。
+pub async fn put_tool_doc(
+    b: &UiBackend,
+    id: &str,
+    summary: &str,
+    content: &str,
+    target: &str,
+) -> Result<PutToolDocResponse, ApiError> {
+    use latte_agent_core::tool_docs as docs;
     validate_tool_doc_id(id)?;
+    let layer = docs::DocLayer::parse(target).ok_or_else(|| {
+        ApiError::bad_request(format!("unknown target {target:?}（仅 project / global）"))
+    })?;
 
-    let (kind, _desc) = lookup_tool_meta(id)
-        .await
-        .unwrap_or_else(|| ("other".to_string(), String::new()));
-    if kind == "dynamic" {
-        return Err(ApiError::bad_request(format!(
-            "工具 {id:?} 是动态注册工具，其文档不可编辑"
-        )));
-    }
+    let composed = docs::compose_doc(summary, content);
+    let path = docs::write_doc_in(&b.cwd, id, layer, &composed)
+        .map_err(|e| ApiError::internal(format!("write tool doc {id}: {e}")))?;
+    let refreshed = latte_agent_core::controller::refresh_tool_docs();
+    Ok(PutToolDocResponse {
+        path: path.display().to_string(),
+        source: layer.as_str().to_string(),
+        refreshed_managers: refreshed,
+    })
+}
 
-    write_tool_doc_at(&b.cwd, id, content)?;
-    Ok(())
+/// `DELETE /api/tools/:id/doc?target=project|global` — 删掉指定层的文档，
+/// 并就地刷新活跃会话。删项目层后若全局层还有，运行时自动回落到全局层。
+///
+/// 文件本来就不存在时按成功处理（幂等）：调用方要的是「这一层最终没有文档」。
+/// 层必须由调用方显式给出（默认项目层），不做隐式跨层删除。
+pub async fn delete_tool_doc(
+    b: &UiBackend,
+    id: &str,
+    target: &str,
+) -> Result<PutToolDocResponse, ApiError> {
+    use latte_agent_core::tool_docs as docs;
+    validate_tool_doc_id(id)?;
+    let layer = docs::DocLayer::parse(target).ok_or_else(|| {
+        ApiError::bad_request(format!("unknown target {target:?}（仅 project / global）"))
+    })?;
+
+    let path = docs::remove_doc_in(&b.cwd, id, layer)
+        .map_err(|e| ApiError::internal(format!("delete tool doc {id}: {e}")))?;
+    let refreshed = latte_agent_core::controller::refresh_tool_docs();
+    Ok(PutToolDocResponse {
+        path: path.display().to_string(),
+        source: layer.as_str().to_string(),
+        refreshed_managers: refreshed,
+    })
 }
 
 #[cfg(test)]
 mod tool_doc_tests {
     use super::*;
+
+    /// 活跃 `ToolManager` 登记表是进程级全局，两个热更新用例都要独占它
+    /// （否则一个用例的 `clear_live_managers()` 会把另一个的登记抹掉，
+    /// `refresh_tool_docs()` 返回 0，表现为「文档没热更新」的假失败）。
+    static LIVE_MANAGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 构造一个 cwd 指向临时目录的 backend（工具文档全按 cwd 解析）。
+    fn doc_backend(cwd: &Path) -> UiBackend {
+        let cfg = AgentConfig::default();
+        let resolver = latte_agent_core::model_resolver::ModelResolver::from_config(&cfg)
+            .expect("resolver");
+        UiBackend::new(crate::UiBackendConfig {
+            agent_config: cfg,
+            model_resolver: resolver,
+            role: None,
+            tier: None,
+            model_id: None,
+            cwd: Some(cwd.to_path_buf()),
+            agents_config: ".latte/agents.d".into(),
+        })
+        .expect("backend")
+    }
 
     /// 路径穿越 / 非法 id 必须在触碰文件系统之前被拒。
     #[test]
@@ -2852,39 +3026,271 @@ mod tool_doc_tests {
         }
     }
 
-    /// 无磁盘文件时回退到编译期内置文档；有磁盘文件时磁盘优先。
-    /// 这条顺序必须与 controller 的 `tool_prompt_content` 一致，否则 UI
-    /// 展示的与模型实际读到的会不是同一份。
-    #[test]
-    fn resolve_prefers_disk_then_embedded_then_none() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cwd = tmp.path();
-
-        // 1) 无磁盘文件 → embedded（read 有内置文档）。
-        let (content, source) = resolve_tool_doc_at(cwd, "read");
-        assert_eq!(source, "embedded");
-        assert!(!content.is_empty(), "embedded read doc must not be empty");
-
-        // 2) 未知工具且无内置文档 → none + 空内容。
-        let (content, source) = resolve_tool_doc_at(cwd, "no_such_tool_xyz");
-        assert_eq!(source, "none");
-        assert!(content.is_empty());
-
-        // 3) 写盘后 → disk 优先，内容逐字节回读。
-        let body = "# 自定义 read\n\n- 项目覆盖生效。\n";
-        let written = write_tool_doc_at(cwd, "read", body).expect("write");
-        assert_eq!(written, cwd.join("prompts/tools/read.md"));
-        let (content, source) = resolve_tool_doc_at(cwd, "read");
-        assert_eq!(source, "disk");
-        assert_eq!(content, body);
-    }
-
-    /// 写入路径必须正好是运行时 `tool_prompt_content` 读的那个相对路径，
-    /// 否则"保存后新 session 生效"这个承诺就不成立。
+    /// 写入路径必须正好是运行时读的那个相对路径（core 与 UI 共用一个实现）。
     #[test]
     fn write_target_matches_runtime_lookup_path() {
-        assert_eq!(tool_doc_rel_path("read"), "prompts/tools/read.md");
-        assert_eq!(tool_doc_rel_path("doc_index"), "prompts/tools/doc_index.md");
+        assert_eq!(tool_doc_rel_path("read"), ".latte/tools.d/read.md");
+        assert_eq!(tool_doc_rel_path("doc_index"), ".latte/tools.d/doc_index.md");
+    }
+
+    /// PUT → GET 往返：简介/详情分别落到 SUMMARY/DETAILS 标记里，再读回来
+    /// 逐字一致；`brief` 用 md 的简介而不是注册描述。
+    #[tokio::test]
+    async fn put_then_get_round_trips_summary_and_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = doc_backend(tmp.path());
+
+        let saved = put_tool_doc(&backend, "read", "一句话简介。", "详情正文\n- 第二行", "project")
+            .await
+            .expect("put");
+        assert!(saved.path.ends_with(".latte/tools.d/read.md"), "{}", saved.path);
+
+        let doc = get_tool_doc(&backend, "read").await.expect("get");
+        assert_eq!(doc.summary, "一句话简介。");
+        assert_eq!(doc.content, "详情正文\n- 第二行");
+        assert_eq!(doc.brief, "一句话简介。", "简介应该用 md 里写的那句");
+        assert_eq!(doc.source, "project");
+        assert_eq!(doc.matched_id, "read");
+        assert!(!doc.is_template);
+        assert_eq!(doc.rendered_content, doc.content, "非模板时渲染结果 == 原文");
+
+        // 磁盘上确实是带标记的 md（运行时按标记剥离）
+        let raw = std::fs::read_to_string(tmp.path().join(".latte/tools.d/read.md")).unwrap();
+        assert!(raw.contains("<!-- SUMMARY -->") && raw.contains("<!-- DETAILS -->"), "{raw}");
+    }
+
+    /// 没有 md 时：简介回退到注册描述首句，详情走 `builtin_detail`，
+    /// `summary`/`content`（编辑缓冲）保持为空——不能把内置描述灌进编辑器，
+    /// 否则一保存就把内置文案复制进 md，运行时变成重复两遍。
+    #[tokio::test]
+    async fn missing_doc_falls_back_to_registered_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = doc_backend(tmp.path());
+        crate::tools::set_enumerate_cache(vec![crate::tools::ToolEntry {
+            id: "zz_probe".into(),
+            label: "Zz Probe".into(),
+            kind: "builtin".into(),
+            description: "一句话用途。剩下的都是细则，很长很长。".into(),
+            brief: "一句话用途。".into(),
+            enabled: true,
+            has_doc: false,
+            doc_source: "none".into(),
+            registered_by: None,
+        }]);
+
+        let doc = get_tool_doc(&backend, "zz_probe").await.expect("get");
+        assert_eq!(doc.source, "none");
+        assert_eq!(doc.brief, "一句话用途。");
+        assert_eq!(doc.builtin_detail, "剩下的都是细则，很长很长。");
+        assert!(doc.summary.is_empty() && doc.content.is_empty(), "编辑缓冲必须是空的");
+        assert!(doc.path.ends_with(".latte/tools.d/zz_probe.md"));
+        crate::tools::clear_cache();
+    }
+
+    /// 无标记的 md（手写、或从 oh-my-pi 那种一份 md 直接拷来的）整份算详情，
+    /// 不能因为找不到 DETAILS 标记就当空文档。
+    #[tokio::test]
+    async fn unmarked_doc_counts_as_detail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".latte/tools.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bash.md"), "<instruction>\n- 直接写的正文\n</instruction>").unwrap();
+        let backend = doc_backend(tmp.path());
+
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert!(doc.summary.is_empty());
+        assert!(doc.content.contains("直接写的正文"), "{}", doc.content);
+    }
+
+    /// 模板文档：`is_template` 要立起来，`rendered_content` 给出按当前工具集
+    /// 渲染后的预览，可用变量/开关一并回给编辑器提示。
+    #[tokio::test]
+    async fn template_doc_reports_render_preview_and_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = doc_backend(tmp.path());
+        put_tool_doc(
+            &backend,
+            "bash",
+            "",
+            "cwd={{CWD}}\n{{#if has_read}}read 可用{{else}}没有 read{{/if}}",
+            "project",
+        )
+        .await
+        .expect("put");
+
+        crate::tools::set_enumerate_cache(vec![crate::tools::ToolEntry {
+            id: "read".into(),
+            label: "Read".into(),
+            kind: "builtin".into(),
+            description: "读取文件。".into(),
+            brief: "读取文件。".into(),
+            enabled: true,
+            has_doc: false,
+            doc_source: "none".into(),
+            registered_by: None,
+        }]);
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert!(doc.is_template, "没识别出模板: {}", doc.content);
+        assert!(doc.content.contains("{{CWD}}"), "编辑缓冲必须是模板原文");
+        assert!(
+            doc.rendered_content.contains(&tmp.path().display().to_string()),
+            "渲染预览没替换 CWD: {}",
+            doc.rendered_content
+        );
+        assert!(doc.rendered_content.contains("read 可用"), "{}", doc.rendered_content);
+        assert!(!doc.rendered_content.contains("没有 read"), "{}", doc.rendered_content);
+        assert!(doc.template_vars.iter().any(|v| v == "cwd"), "{:?}", doc.template_vars);
+        assert!(doc.template_flags.iter().any(|f| f == "hasread"), "{:?}", doc.template_flags);
+        crate::tools::clear_cache();
+    }
+
+    /// 保存后必须把活跃 `ToolManager` 就地刷新掉：这是「不新建 session 也能
+    /// 生效」的唯一保证。这里直接建一个真 manager 挂进登记表来验。
+    #[tokio::test]
+    async fn put_hot_reloads_live_tool_managers() {
+        let _serial = LIVE_MANAGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = doc_backend(tmp.path());
+        latte_agent_core::tool_docs::clear_live_managers();
+
+        let tm = latte_agent_core::controller::build_tool_manager_at(
+            tmp.path(),
+            &["bash".to_string()],
+        )
+        .await
+        .expect("tool manager");
+        let before = tm.get_tool("bash").expect("bash").description;
+        assert!(!before.contains("热更新验证段落"));
+
+        let saved = put_tool_doc(&backend, "bash", "", "热更新验证段落", "project").await.expect("put");
+        assert!(saved.refreshed_managers >= 1, "没刷新任何活跃 manager");
+        let after = tm.get_tool("bash").expect("bash").description;
+        assert!(after.contains("热更新验证段落"), "文档没热更新进描述: {after}");
+
+        // 再改一次：只保留新版，不叠加旧版。
+        put_tool_doc(&backend, "bash", "", "第二版段落", "project").await.expect("put");
+        let after2 = tm.get_tool("bash").expect("bash").description;
+        assert!(after2.contains("第二版段落"), "{after2}");
+        assert!(!after2.contains("热更新验证段落"), "旧文档残留: {after2}");
+        latte_agent_core::tool_docs::clear_live_managers();
+    }
+
+    /// 删文档同样要热更新：删完模型只应看到内置描述。幂等——文件不在也成功。
+    #[tokio::test]
+    async fn delete_removes_doc_and_hot_reloads() {
+        let _serial = LIVE_MANAGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = doc_backend(tmp.path());
+        latte_agent_core::tool_docs::clear_live_managers();
+
+        let tm = latte_agent_core::controller::build_tool_manager_at(
+            tmp.path(),
+            &["bash".to_string()],
+        )
+        .await
+        .expect("tool manager");
+
+        put_tool_doc(&backend, "bash", "", "待删除段落", "project").await.expect("put");
+        assert!(tm.get_tool("bash").unwrap().description.contains("待删除段落"));
+
+        let removed = delete_tool_doc(&backend, "bash", "project").await.expect("delete");
+        assert!(removed.refreshed_managers >= 1);
+        assert!(
+            !tm.get_tool("bash").unwrap().description.contains("待删除段落"),
+            "删完还留着: {}",
+            tm.get_tool("bash").unwrap().description
+        );
+        assert!(!tmp.path().join(".latte/tools.d/bash.md").exists());
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert_eq!(doc.source, "none");
+        assert!(doc.content.is_empty());
+
+        // 幂等：再删一次不报错
+        delete_tool_doc(&backend, "bash", "project").await.expect("second delete is idempotent");
+        // 非法 id 仍然要被拒（防路径穿越）
+        assert_eq!(
+            delete_tool_doc(&backend, "../x", "project").await.expect_err("must reject").status,
+            400
+        );
+        latte_agent_core::tool_docs::clear_live_managers();
+    }
+
+    /// 分层读写要和 models / roles 面板一样：GET 报两层各自的落点，PUT/DELETE
+    /// 按 `target` 落到对应文件，项目层覆盖全局层。
+    ///
+    /// 之前 PUT 恒写项目层——在别的工作目录（或想改全局默认）时，用户点「保存」
+    /// 会悄悄新建一份项目文档，而不是改他正在看的那份全局文档。
+    #[tokio::test]
+    async fn doc_layers_read_and_write_per_layer() {
+        let _serial = LIVE_MANAGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 与 `api::tests` 共用同一把 env 锁（都改 LATTE_HOME）。
+        let _env = super::tests::ENV_LOCK.lock();
+        let project = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("LATTE_HOME");
+        std::env::set_var("LATTE_HOME", global.path());
+        let backend = doc_backend(project.path());
+
+        // 1) 两层都空
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert_eq!(doc.source, "none");
+        assert_eq!(doc.layers.len(), 2);
+        assert_eq!(doc.layers[0].layer, "project");
+        assert_eq!(doc.layers[1].layer, "global");
+        assert!(!doc.layers.iter().any(|l| l.exists || l.active));
+
+        // 2) 存到全局 → 落在全局目录，GET 报 global 生效
+        let saved = put_tool_doc(&backend, "bash", "全局简介", "全局详情", "global")
+            .await
+            .expect("put global");
+        assert_eq!(saved.source, "global");
+        assert!(saved.path.starts_with(&global.path().display().to_string()), "{}", saved.path);
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert_eq!(doc.source, "global");
+        assert_eq!(doc.content, "全局详情");
+        assert!(!doc.layers[0].exists, "项目层不该被写");
+        assert!(doc.layers[1].exists && doc.layers[1].active, "{:?}", doc.layers);
+
+        // 3) 存到项目 → 覆盖全局，两层都在
+        let saved = put_tool_doc(&backend, "bash", "项目简介", "项目详情", "project")
+            .await
+            .expect("put project");
+        assert_eq!(saved.source, "project");
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert_eq!(doc.source, "project");
+        assert_eq!(doc.content, "项目详情");
+        assert!(doc.layers[0].exists && doc.layers[0].active);
+        assert!(doc.layers[1].exists && !doc.layers[1].active, "全局层仍应存在但不生效");
+
+        // 4) 删项目层 → 回落到全局层（不是变成「无文档」）
+        let removed = delete_tool_doc(&backend, "bash", "project").await.expect("delete project");
+        assert_eq!(removed.source, "project");
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert_eq!(doc.source, "global");
+        assert_eq!(doc.content, "全局详情");
+
+        // 5) 删全局层 → 彻底没文档
+        delete_tool_doc(&backend, "bash", "global").await.expect("delete global");
+        let doc = get_tool_doc(&backend, "bash").await.expect("get");
+        assert_eq!(doc.source, "none");
+
+        // 6) 非法层要报 400，不能悄悄按项目层处理
+        assert_eq!(
+            put_tool_doc(&backend, "bash", "", "x", "nope").await.expect_err("bad target").status,
+            400
+        );
+        assert_eq!(
+            delete_tool_doc(&backend, "bash", "nope").await.expect_err("bad target").status,
+            400
+        );
+        // 省略 target（老客户端/空串）默认项目层，保持向后兼容
+        let saved = put_tool_doc(&backend, "bash", "", "默认层", "").await.expect("put default");
+        assert_eq!(saved.source, "project");
+
+        match previous {
+            Some(value) => std::env::set_var("LATTE_HOME", value),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
     }
 }
 
@@ -3350,6 +3756,7 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
         def: req.def,
     })
 }
+
 
 #[cfg(test)]
 mod list_models_tests {
