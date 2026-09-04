@@ -155,6 +155,40 @@ pub struct WorkflowRegistry {
     pub default: Option<DiscussionWorkflow>,
     /// Named workflows keyed by their `name` field.
     pub workflows: std::collections::HashMap<String, DiscussionWorkflow>,
+    /// 被跳过的文件：`(文件名, 原因)`。
+    ///
+    /// 目录里放着**两套** workflow schema：本 crate 的 speakers 式，和
+    /// `latte_agent_core::workflow::WorkflowDef` 的 step 式（`role` +
+    /// `output_key` + `output_contract`…，由 chat 里的 `workflow` 工具执行）。
+    /// 后者在这里必然解析失败。原来 [`Self::load_dir`] 一遇到失败就整体
+    /// `Err`，而 [`Self::load_with_global`] 用 `if let Ok(..)` 接 ——
+    /// **一个不属于本 schema 的文件就静默清空整层**，用户看到的是
+    /// `Available: []`。实测 `~/.latte/workflows.d/` 22 个文件里 10 个是
+    /// step 式，字母序第一的 `annotate_code.toml` 直接让 12 个本来能用的
+    /// workflow 全部消失。
+    ///
+    /// 现在改成逐文件容错 + 把原因记在这里，让调用方能讲清"为什么没有它"。
+    pub skipped: Vec<(String, String)>,
+}
+
+/// 把 `DiscussionWorkflow::parse` 的失败分成「不是这套 schema」和「真写错了」。
+///
+/// 目录里混着两套 workflow 格式，绝大多数"解析失败"其实是
+/// `latte_agent_core::workflow::WorkflowDef` 的 step 式文件——它们由 chat 里的
+/// `workflow` 工具执行，本 crate 的 discuss/workflow 子命令跑不了。把这两类
+/// 混成一句 "invalid workflow TOML" 会让人以为文件坏了，然后去改一个本来
+/// 没问题的文件。
+///
+/// 判据取 step 式独有的字段：`role = `（本 crate 是 `speakers = [...]`）、
+/// `output_key`、`output_contract`。命中任一即判为格式不匹配。
+fn classify_parse_failure(content: &str, err: &crate::error::OrchError) -> String {
+    let step_only_markers = ["\nrole = ", "\noutput_key", "[steps.output_contract]"];
+    if step_only_markers.iter().any(|m| content.contains(m)) {
+        return "step 式 workflow（core 的 WorkflowDef 格式，用 role/output_key/output_contract）\
+                ——由 chat 里的 `workflow` 工具执行，discuss/workflow 子命令不支持"
+            .to_string();
+    }
+    format!("解析失败: {err}")
 }
 
 impl WorkflowRegistry {
@@ -202,26 +236,39 @@ impl WorkflowRegistry {
                     .and_then(|d| d.to_str().map(|s| s.to_string()))
             });
         if let Some(path) = project_dir {
-            if let Ok(part) = Self::load(&path) {
-                if part.default.is_some() {
-                    merged.default = part.default;
+            match Self::load(&path) {
+                Ok(part) => {
+                    if part.default.is_some() {
+                        merged.default = part.default;
+                    }
+                    merged.skipped.extend(part.skipped);
+                    for (id, wf) in part.workflows {
+                        merged.workflows.insert(id, wf);
+                    }
                 }
-                for (id, wf) in part.workflows {
-                    merged.workflows.insert(id, wf);
-                }
+                // 目录级失败（读不了目录 / 单文件格式坏了）也要留痕，
+                // 不能像原来那样 `if let Ok` 直接丢。
+                Err(e) => merged.skipped.push((path.clone(), format!("整层加载失败: {e}"))),
             }
         }
 
         // 2) Global layer: always uses ConfigLayer::Global.
         if let Some(wf_dir) = latte_agent_core::config::ConfigLayer::Global.workflows_dir() {
             if wf_dir.is_dir() {
-                if let Ok(global_part) = Self::load(wf_dir.to_str().unwrap()) {
-                    if merged.default.is_none() {
-                        merged.default = global_part.default;
+                let as_str = wf_dir.to_string_lossy().into_owned();
+                match Self::load(&as_str) {
+                    Ok(global_part) => {
+                        if merged.default.is_none() {
+                            merged.default = global_part.default;
+                        }
+                        merged.skipped.extend(global_part.skipped);
+                        for (id, wf) in global_part.workflows {
+                            merged.workflows.entry(id).or_insert(wf);
+                        }
                     }
-                    for (id, wf) in global_part.workflows {
-                        merged.workflows.entry(id).or_insert(wf);
-                    }
+                    Err(e) => merged
+                        .skipped
+                        .push((as_str, format!("整层加载失败: {e}"))),
                 }
             }
         }
@@ -250,15 +297,33 @@ impl WorkflowRegistry {
 
         let mut registry = Self::default();
         for entry in &entries {
-            let content = std::fs::read_to_string(entry)?;
-            let wf = DiscussionWorkflow::parse(&content)?;
+            let fname = entry
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.display().to_string());
+            let content = match std::fs::read_to_string(entry) {
+                Ok(c) => c,
+                Err(e) => {
+                    registry.skipped.push((fname, format!("读不出来: {e}")));
+                    continue;
+                }
+            };
+            // 单个文件解析失败**不能**让整层作废（见 `skipped` 字段的说明）。
+            let wf = match DiscussionWorkflow::parse(&content) {
+                Ok(wf) => wf,
+                Err(e) => {
+                    registry.skipped.push((fname, classify_parse_failure(&content, &e)));
+                    continue;
+                }
+            };
             let id = wf.name.clone();
             if registry.workflows.contains_key(&id) {
-                return Err(crate::error::OrchError::Config(format!(
-                    "duplicate workflow '{}' in {}",
-                    id,
-                    entry.display()
-                )));
+                // 重名同理：记原因、保留字母序在前的那个，不要清空整层。
+                registry.skipped.push((
+                    fname,
+                    format!("workflow 名 '{id}' 与前一个文件重复，已保留先加载的那个"),
+                ));
+                continue;
             }
             // File named `default.toml` (or matching the workflow's own
             // `name` of "default") is promoted to the default slot.
@@ -290,6 +355,7 @@ impl WorkflowRegistry {
         Ok(Self {
             default: wf_file.default_workflow,
             workflows: wf_file.workflows,
+            skipped: Vec::new(),
         })
     }
 
@@ -487,6 +553,14 @@ prompt = "Review."
         assert!(format!("{}", err).contains("not found"));
     }
 
+    /// 重名不再让整个目录 `Err`（契约变更，原
+    /// `test_registry_dir_duplicate_workflow`）。
+    ///
+    /// 理由见 [`WorkflowRegistry::skipped`]：目录级硬失败会被
+    /// `load_with_global` 的 `if let Ok(..)` 吞掉，结果一个配置小错就让整层
+    /// workflow 消失。现在保留先加载的那个、把后来者记进 `skipped`。
+    /// 「保留哪一个 + 原因留痕」由 `duplicate_name_skips_the_later_file_only`
+    /// 覆盖，这里只锁住「不 Err」这一条。
     #[test]
     fn test_registry_dir_duplicate_workflow() {
         let tmp = std::env::temp_dir().join("latte_wf_registry_dup");
@@ -504,8 +578,15 @@ prompt = "Hi"
         std::fs::write(tmp.join("a.toml"), body).unwrap();
         std::fs::write(tmp.join("b.toml"), body).unwrap();
 
-        let err = WorkflowRegistry::load(tmp.to_str().unwrap()).unwrap_err();
-        assert!(format!("{}", err).contains("duplicate workflow 'same'"));
+        let reg = WorkflowRegistry::load(tmp.to_str().unwrap())
+            .expect("重名不能让整个目录加载失败");
+        assert!(reg.workflows.contains_key("same"));
+        assert_eq!(reg.workflows.len(), 1);
+        assert!(
+            reg.skipped.iter().any(|(f, r)| f == "b.toml" && r.contains("重复")),
+            "后来者要记进 skipped: {:?}",
+            reg.skipped
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -566,6 +647,101 @@ prompt = "Review"
                 "Project"
             );
         });
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 一个不属于本 schema 的文件**不能**清空整层。
+    ///
+    /// 回归的真实故障：`~/.latte/workflows.d/` 22 个文件里 10 个是 core 的
+    /// step 式（`role` + `output_key`），字母序第一的 `annotate_code.toml`
+    /// 让 `load_dir` 直接 `Err`，而 `load_with_global` 用 `if let Ok(..)` 接，
+    /// 于是 12 个本来能用的 workflow 全部消失，用户只看到 `Available: []`。
+    #[test]
+    fn foreign_schema_file_does_not_wipe_the_whole_layer() {
+        let tmp = std::env::temp_dir().join("latte_wf_mixed_schema");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // 字母序第一，且是 step 式（core 格式）—— 原来它会让整层作废。
+        std::fs::write(
+            tmp.join("aaa_step_style.toml"),
+            r#"
+name = "aaa_step_style"
+[[steps]]
+id = "survey"
+role = "programmer"
+output_key = "exploration"
+task = "看代码"
+"#,
+        )
+        .unwrap();
+        // 本 schema 的正常文件，必须还在。
+        std::fs::write(
+            tmp.join("zzz_ok.toml"),
+            r#"
+name = "zzz_ok"
+description = "Speakers style"
+[[steps]]
+id = "s1"
+speakers = ["reviewer"]
+prompt = "Review"
+"#,
+        )
+        .unwrap();
+
+        let reg = WorkflowRegistry::load(tmp.to_str().unwrap()).expect("目录级不该失败");
+        assert!(
+            reg.workflows.contains_key("zzz_ok"),
+            "坏文件之后的正常 workflow 必须照常加载: {:?}",
+            reg.workflows.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(reg.workflows.len(), 1);
+        // 跳过原因要指明「格式不匹配」，而不是含糊的 invalid TOML——
+        // 后者会让人去改一个本来没问题的文件。
+        let (file, reason) = reg
+            .skipped
+            .iter()
+            .find(|(f, _)| f == "aaa_step_style.toml")
+            .expect("被跳过的文件必须留痕");
+        assert_eq!(file, "aaa_step_style.toml");
+        assert!(
+            reason.contains("step 式"),
+            "原因要说清是格式不匹配: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 重名也只跳过后来者，不清空整层。
+    #[test]
+    fn duplicate_name_skips_the_later_file_only() {
+        let tmp = std::env::temp_dir().join("latte_wf_dup_name");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let body = |desc: &str| {
+            format!(
+                r#"
+name = "dup"
+description = "{desc}"
+[[steps]]
+id = "s1"
+speakers = ["reviewer"]
+prompt = "Review"
+"#
+            )
+        };
+        std::fs::write(tmp.join("a_first.toml"), body("first")).unwrap();
+        std::fs::write(tmp.join("b_second.toml"), body("second")).unwrap();
+
+        let reg = WorkflowRegistry::load(tmp.to_str().unwrap()).expect("重名不该让目录失败");
+        assert_eq!(reg.workflows.len(), 1);
+        assert_eq!(
+            reg.workflows["dup"].description, "first",
+            "保留字母序在前的那个"
+        );
+        assert!(
+            reg.skipped.iter().any(|(f, r)| f == "b_second.toml" && r.contains("重复")),
+            "重名要留痕: {:?}",
+            reg.skipped
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

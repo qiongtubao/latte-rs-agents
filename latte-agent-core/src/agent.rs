@@ -241,6 +241,16 @@ pub struct Agent {
     pub model_chain: Vec<ModelClient>,
     /// Generation parameters for this agent instance.
     pub params: GenerateParams,
+    /// 最近一次请求**实际由哪个模型接的**（`model_chain` 下标）。
+    ///
+    /// 为什么不能靠 `model_chain.first()` 推：trace 里的 `ModelCall` /
+    /// `ModelCallSlow` 原来就是这么算的，于是发生 fallback 后仍然报链首模型
+    /// —— 实测一次 `glm-5.3 → MiniMax-M3` 回退后，三条 `ModelCall` 全标着
+    /// `glm-5.3`，等于把「换没换成模型」这件事从日志里抹掉了。也不能靠
+    /// 「链上第一个 available」反推：冷却窗口会过期，回头看时链首又变可用了。
+    ///
+    /// `chat` / `chat_stream` 选定模型时写入，只用于观测。
+    served_index: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 // Manual Clone because `ModelClient.cooldown_until` is a `Mutex` (not Clone).
@@ -253,6 +263,9 @@ impl Clone for Agent {
             client: self.client.clone(),
             model_chain: self.model_chain.clone(),
             params: self.params.clone(),
+            // Arc 共享：克隆出来的 Agent 与原件指向同一次"实际服务模型"
+            // 记录，避免 clone 之后观测值退回默认的链首。
+            served_index: Arc::clone(&self.served_index),
         }
     }
 }
@@ -300,6 +313,7 @@ impl Agent {
             client: primary.client.clone(),
             model_chain,
             params,
+            served_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -369,7 +383,10 @@ impl Agent {
                     ));
                     mc.set_cooldown(Duration::from_secs(5));
                 }
-                Ok(c) => return Ok(c),
+                Ok(c) => {
+                    self.note_served(mc);
+                    return Ok(c);
+                }
                 Err(e) => {
                     tried.push(mc.model.id.clone());
                     failures.push((mc.model.id.clone(), brief_model_error(&e)));
@@ -461,7 +478,10 @@ impl Agent {
                 continue;
             }
             match mc.client.chat_stream(messages, p).await {
-                Ok(rx) => return Ok(rx),
+                Ok(rx) => {
+                    self.note_served(mc);
+                    return Ok(rx);
+                }
                 Err(e) => {
                     tried.push(mc.model.id.clone());
                     failures.push((mc.model.id.clone(), brief_model_error(&e)));
@@ -483,6 +503,52 @@ impl Agent {
                 .filter_map(|mc| mc.cooldown_remaining())
                 .min(),
         })
+    }
+
+    /// 记下这次请求由链上哪个模型接的（仅观测用，见 `served_index`）。
+    fn note_served(&self, mc: &ModelClient) {
+        if let Some(i) = self
+            .model_chain
+            .iter()
+            .position(|m| m.model.id == mc.model.id)
+        {
+            self.served_index
+                .store(i, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 最近一次请求**实际由哪个模型**接的 id。没发过请求时返回链首。
+    ///
+    /// trace 里报模型 id 一律走这里，别再用 `model_chain.first()` —— 那样
+    /// fallback 之后日志会继续标着链首模型，等于把换模型这件事抹掉。
+    pub fn served_model_id(&self) -> String {
+        let i = self.served_index.load(std::sync::atomic::Ordering::Relaxed);
+        self.model_chain
+            .get(i)
+            .or_else(|| self.model_chain.first())
+            .map(|mc| mc.model.id.clone())
+            .unwrap_or_default()
+    }
+
+    /// 把**当前正在服务这一路流**的模型置入冷却，返回它的 id。
+    ///
+    /// 用途：连接**已经建立成功**、但第一个事件就是 `HttpError` / `Error`
+    /// 的场景（实测 glm-5.3 中转站的 400）。不冷却的话下一次重开流还会选中
+    /// 同一个模型，永远换不掉，模型链形同虚设。
+    pub fn cooldown_serving_model(&self, cd: Duration) -> Option<String> {
+        let i = self.served_index.load(std::sync::atomic::Ordering::Relaxed);
+        let mc = self.model_chain.get(i).or_else(|| self.model_chain.first())?;
+        mc.set_cooldown(cd);
+        Some(mc.model.id.clone())
+    }
+
+    /// 链上下一个仍可用的模型 id（跳过 `skip_id`），只用于 trace 展示。
+    pub fn next_available_model_after(&self, skip_id: &str) -> Option<String> {
+        self.model_chain
+            .iter()
+            .filter(|mc| mc.model.id != skip_id && mc.is_available())
+            .map(|mc| mc.model.id.clone())
+            .next()
     }
 
     /// Build the system message for this agent.
@@ -792,7 +858,7 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {    match e {
             // because the next model may have a different id format or
             // accept the payload. Short cooldown to avoid hammering a
             // broken model.
-            400..=499 => Some(Duration::from_secs(5)),
+            400..=499 => Some(Duration::from_secs(60)),
             // Anything else (3xx redirects we don't auto-follow, 6xx
             // exotic) — also retryable, very long cooldown.
             _ => Some(Duration::from_secs(30)),
@@ -2237,6 +2303,42 @@ impl AgentRunner {
         self.stream_mode.as_ref().map_or(false, |m| m.load(Ordering::SeqCst))
     }
 
+    /// 流上报错时决定「冷却当前模型 + 重开流」还是「把错误上交」。
+    ///
+    /// `Some(_)` = 决定重开（调用方 `continue 'stream_attempt`）；
+    /// `None` = 不能重开，调用方把错误上交。
+    ///
+    /// 三个不重开的条件：
+    /// 1. **已经有内容吐给用户**（`streamed_any`）—— 重开会把这段重复输出，
+    ///    比报一个错更糟；
+    /// 2. 错误不可通过换模型规避（`cooldown_for_error` 返回 `None`，即本地
+    ///    配置/序列化类错误）；
+    /// 3. 已经换过 `max` 次 —— 防止「链上每个模型都在连接后立刻报错」时打转。
+    fn try_stream_fallback(
+        &self,
+        err: &AiError,
+        streamed_any: bool,
+        fallbacks: &mut u8,
+        max: u8,
+        meta: &crate::trace::TraceMeta,
+    ) -> Option<Option<String>> {
+        if streamed_any || *fallbacks >= max {
+            return None;
+        }
+        let cd = cooldown_for_error(err)?;
+        let from = self.agent.cooldown_serving_model(cd)?;
+        let to = self.agent.next_available_model_after(&from);
+        *fallbacks += 1;
+        self.sink.emit(crate::trace::TraceEvent::FallbackTriggered {
+            meta: meta.refreshed(),
+            from_model: from,
+            to_model: to.clone(),
+            reason: crate::trace::FallbackReason::RetryableFailure,
+            cause_kind: Some(crate::trace::ModelErrorKind::from(err)),
+        });
+        Some(to)
+    }
+
     /// 测试用：是否挂了模型热更新源（workflow / delegate 路径的接线
     /// 回归测试据此断言，不漏挂）。
     #[cfg(test)]
@@ -2469,9 +2571,11 @@ impl AgentRunner {
             .map(|m| m.as_text())
             .collect::<Vec<_>>()
             .join("\n");
-        let model_id = self.agent.model_chain.first()
-            .map(|mc| mc.model.id.clone())
-            .unwrap_or_default();
+        // 模型 id 一律在**发出请求之后**经 `self.agent.served_model_id()` 取，
+        // 不在这里预先算一个链首值。原来这里算 `model_chain.first()` 供
+        // `ModelCall` / `ModelCallSlow` 使用，于是 fallback 换过模型之后日志
+        // 仍标着链首 —— 实测一次 `glm-5.3 → MiniMax-M3` 回退后三条
+        // `ModelCall` 全标 `glm-5.3`，把"换没换成"从日志里抹掉了。
         let est_input_tokens = (messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4) as u32;
         self.sink.emit(TraceEvent::PromptBuilt {
             meta: meta.refreshed(),
@@ -2605,6 +2709,17 @@ impl AgentRunner {
                 // 模型全链不可用导致的自动暂停次数（同一次 model call
                 // 内累计），驱动 `pause_wait_model_unavailable` 的退避。
                 let mut unavail_attempt = 0u32;
+                // 「连接建立成功、但流上还没吐出任何内容就报错」时的换模型次数。
+                //
+                // 修的 bug：`chat_stream` 的链式 fallback 只覆盖**连接建立
+                // 阶段**（返回 Err）。厂商在连接成功之后才吐 400 的话，错误
+                // 是以 `StreamEvent::HttpError` 进 channel 的，原来直接
+                // `return Err` —— 整条模型链一次都没被咨询，turn 当场判死。
+                // 实测（`chat -r programmer`，glm-5.3 中转站）：把一条工具校验
+                // 错误喂回去之后厂商回 400，链上还有 MiniMax-M3 /
+                // deepseek-v4-flash / deepseek-v4-pro 三个健康模型，全没轮到。
+                let mut stream_fallbacks = 0u8;
+                const MAX_STREAM_FALLBACKS: u8 = 3;
                 'stream_attempt: loop {
                     let mut rx = loop {
                         match self.agent.chat_stream(&messages, chat_params.as_ref()).await {
@@ -2631,6 +2746,7 @@ impl AgentRunner {
                             Err(e) => return Err(e),
                         }
                     };
+                    let mut streamed_any = false;
                     let c = loop {
                         match rx.recv().await {
                             Some(StreamEvent::Delta { content, .. }) => {
@@ -2642,6 +2758,9 @@ impl AgentRunner {
                                     .collect::<Vec<_>>()
                                     .join("");
                                 if !delta_text.is_empty() {
+                                    // 一旦有内容吐给用户，就不能再整流重开了
+                                    // ——重开会把这段重复输出一遍。
+                                    streamed_any = true;
                                     self.sink.emit(TraceEvent::ModelDelta {
                                         meta: meta.refreshed(),
                                         delta: delta_text,
@@ -2665,10 +2784,32 @@ impl AgentRunner {
                                 };
                             }
                             Some(StreamEvent::Error(e)) => {
-                                return Err(AgentError::from(AiError::Stream(e)));
+                                let err = AiError::Stream(e);
+                                if let Some(next) = self.try_stream_fallback(
+                                    &err,
+                                    streamed_any,
+                                    &mut stream_fallbacks,
+                                    MAX_STREAM_FALLBACKS,
+                                    &meta,
+                                ) {
+                                    let _ = next;
+                                    continue 'stream_attempt;
+                                }
+                                return Err(AgentError::from(err));
                             }
                             Some(StreamEvent::HttpError { status, message }) => {
-                                return Err(AgentError::from(AiError::Api { status, message }));
+                                let err = AiError::Api { status, message };
+                                if let Some(next) = self.try_stream_fallback(
+                                    &err,
+                                    streamed_any,
+                                    &mut stream_fallbacks,
+                                    MAX_STREAM_FALLBACKS,
+                                    &meta,
+                                ) {
+                                    let _ = next;
+                                    continue 'stream_attempt;
+                                }
+                                return Err(AgentError::from(err));
                             }
                             None => {
                                 return Err(AgentError::from(AiError::Stream(
@@ -2710,7 +2851,7 @@ impl AgentRunner {
                                         noticed = true;
                                         self.sink.emit(TraceEvent::ModelCallSlow {
                                             meta: meta.refreshed(),
-                                            model_id: model_id.clone(),
+                                            model_id: self.agent.served_model_id(),
                                             elapsed_secs: slow_model_call_notice().as_secs(),
                                         });
                                     }
@@ -2759,7 +2900,7 @@ impl AgentRunner {
 
             self.sink.emit(TraceEvent::ModelCall {
                 meta: meta.refreshed(),
-                model_id: model_id.clone(),
+                model_id: self.agent.served_model_id(),
                 params_json: serde_json::to_string(&self.agent.params).unwrap_or_default(),
                 latency_ms,
                 finish_reason: completion.stop_reason.clone(),
@@ -5812,6 +5953,110 @@ mod tests {
     //   1. run_turn 返回拼好的完整文本（跨多个 delta chunk）。
     //   2. sink 收到 ≥1 个 ModelDelta 增量事件。
     //   3. non-stream（默认）时 sink 收到 0 个 ModelDelta（走 chat() 聚合路径）。
+    /// 流式下「连接建立成功、但流上第一个事件就是 HTTP 400」必须沿模型链
+    /// 换到下一个模型，而不是当场判死整个 turn。
+    ///
+    /// 回归的真实故障（`chat -r programmer`，glm-5.3 中转站）：把一条工具
+    /// 校验错误喂回去之后厂商回 400，链上还有三个健康模型，却一个都没轮到，
+    /// turn 直接以 `AI client error: API error: 400` 失败。根因是
+    /// `chat_stream` 的链式 fallback 只覆盖**连接建立阶段**（返回 Err），
+    /// 连接成功后到达的 `StreamEvent::HttpError` 走的是 `return Err` 死路。
+    #[tokio::test]
+    async fn stream_http_error_before_any_delta_falls_back_to_next_model() {
+        use crate::trace::{FallbackReason, TraceEvent, TraceSink};
+        use std::sync::Arc;
+        #[derive(Clone)]
+        struct VecSink(Arc<parking_lot::Mutex<Vec<TraceEvent>>>);
+        impl TraceSink for VecSink {
+            fn emit(&self, e: TraceEvent) {
+                self.0.lock().push(e);
+            }
+        }
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 坏模型：**200 建连**不行——要让 latte-ai 走到 HttpError 分支，
+        // 得让首个响应就是非 2xx；它会先试非流式，也 400，然后把
+        // HttpError 推进 channel。
+        let broken = wiremock::MockServer::start().await;
+        broken
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(400).set_body_string(
+                        r#"{"error":{"message":"请求参数值或格式不受支持","type":"invalid_request_error"}}"#,
+                    )),
+            )
+            .await;
+        // 健康模型：正常吐 SSE。
+        let healthy = wiremock::MockServer::start().await;
+        healthy
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("Content-Type", "text/event-stream")
+                            .set_body_string(openai_sse_body(&["recovered"])),
+                    ),
+            )
+            .await;
+
+        let sink = Arc::new(VecSink(Arc::new(parking_lot::Mutex::new(vec![]))));
+        let agent = Agent::new_with_chain(
+            "fallback-test".into(),
+            test_role(),
+            vec![
+                model_at(&broken, "broken-400"),
+                model_at(&healthy, "healthy-model"),
+            ],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent)
+            .with_sink(sink.clone() as Arc<dyn TraceSink>)
+            .with_role("fallback-test".to_string())
+            .with_stream_mode(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+
+        let resp = runner
+            .run_turn(&[Message::user("hi")], None)
+            .await
+            .expect("400 之后必须换模型跑通，而不是整 turn 判死");
+        assert_eq!(resp, "recovered", "应拿到链上第二个模型的输出");
+
+        let events = sink.0.lock().clone();
+        let fb = events
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::FallbackTriggered {
+                    from_model,
+                    to_model,
+                    reason,
+                    ..
+                } => Some((from_model.clone(), to_model.clone(), *reason)),
+                _ => None,
+            })
+            .expect("必须留下 FallbackTriggered 痕迹，否则换模型是黑盒");
+        assert_eq!(fb.0, "broken-400", "from 应是报 400 的那个");
+        assert_eq!(fb.1.as_deref(), Some("healthy-model"), "to 应是链上下一个");
+        assert_eq!(fb.2, FallbackReason::RetryableFailure);
+
+        // `ModelCall` 必须报**实际服务**的模型，不能报链首。
+        // 原来它取 `model_chain.first()`，fallback 之后仍标 broken-400，
+        // 等于把"换没换成模型"从日志里抹掉——本次会话就被它误导过。
+        let called: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::ModelCall { model_id, .. } => Some(model_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            called.iter().all(|m| m == "healthy-model"),
+            "ModelCall 应报实际服务的 healthy-model，实际: {called:?}"
+        );
+    }
+
     #[tokio::test]
     async fn stream_mode_run_turn_emits_deltas_and_assembles() {
         use crate::trace::{TraceEvent, TraceSink};

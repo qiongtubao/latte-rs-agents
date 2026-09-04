@@ -1290,30 +1290,21 @@ async fn build_runner(
 pub async fn build_tool_manager(
     allowed: &[String],
 ) -> Result<Arc<dyn latte_rs_agent_tools::types::ToolManager>, Box<dyn std::error::Error>> {
-    use latte_rs_agent_tools::prelude::*;
-     let mgr = create_tool_manager();
-     for p in builtin_tool_packages() {
-         mgr.register_package(p)
-            .await
-            .map_err(|e| format!("register_package: {}", e))?;
-    }
-    // Allowlist filter: builtin tools register under flat names
-    // ("bash", "read", …) identical to the config names, so the
-    // config entries match the registry directly.
-    let keep: std::collections::HashSet<String> = allowed
-        .iter()
-        .flat_map(|s| vec![s.to_lowercase(), s.clone()])
-        .collect();
-    for tool_id in mgr.get_tool_names() {
-        let short = tool_id
-            .rsplit_once('.')
-            .map(|(_, s)| s.to_string())
-            .unwrap_or_else(|| tool_id.clone());
-        if !(keep.contains(&short) || keep.contains(&tool_id)) {
-            mgr.unregister(&tool_id);
-        }
-    }
-    Ok(mgr)
+    // 委托给 core，不要在这里另建一份。
+    //
+    // 这里原来是一份「create_tool_manager + register_package + allowlist 过滤」
+    // 的复制品，漏掉了 core 版里的三件事：
+    //   1. `enrich_tool_for_model` —— `read` 的 `paths` 批量入口、以及
+    //      `prompts/tools/*.md`（read/bash/code_graph/… 的模型侧说明）
+    //      全靠它拼进 tool description；
+    //   2. `code_graph_tool()` 的注册 —— CLI 里这个工具压根不存在；
+    //   3. `FULL_TOOL_POOL` 的初始化 —— `request_tool` 靠它查被 allowlist
+    //      过滤掉的工具定义。
+    // 实测（chat -r programmer 读 3 个头文件）：走这份复制品时模型发出 3 个
+    // 单目标 `{"path":…}`，因为它看到的 schema 里根本没有 `paths`。
+    latte_agent_core::controller::build_tool_manager(allowed)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
 }
 
 /// 拉起 CLI 的 advisor 监察（幂等，进程内只跑一份）。

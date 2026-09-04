@@ -105,7 +105,29 @@ impl WorkflowCmd {
         let wf_name = self.workflow_name();
         let workflow = registry
             .resolve(Some(&wf_name))
-            .map_err(|e| format!("workflow '{}' not found: {}", wf_name, e))?;
+            .map_err(|e| {
+                // 光报 "not found. Available: []" 会把人引向错误方向——真实原因
+                // 通常是「这个 workflow 是 step 式的，本子命令跑不了」。把
+                // registry 记下的跳过原因一并打出来。
+                let mut msg = format!("workflow '{wf_name}' not found: {e}");
+                if !registry.skipped.is_empty() {
+                    msg.push_str("\n\n以下文件被跳过：");
+                    for (file, reason) in &registry.skipped {
+                        msg.push_str(&format!("\n  - {file}: {reason}"));
+                    }
+                    if registry
+                        .skipped
+                        .iter()
+                        .any(|(f, _)| f.starts_with(&wf_name) || f.contains(&wf_name))
+                    {
+                        msg.push_str(&format!(
+                            "\n\n`{wf_name}` 正在被跳过的名单里。它是 step 式 workflow，\
+                             改用：latte-agent chat -r manager，然后让 manager 调 `workflow` 工具。"
+                        ));
+                    }
+                }
+                msg
+            })?;
 
         // 3. Determine which roles to instantiate. If the user gave
         //    --roles, use exactly that. Otherwise, derive the set from
