@@ -3246,6 +3246,11 @@ async fn build_runner(
                     .map_err(|e| AgentError::Tool(format!("register doc_graph tools: {e}")))?;
             }
         }
+        // Dynamic tools are registered above (delegate/workflow/ask/etc.) after
+        // the builtin manager was initially enriched. Enrich once more so the
+        // model receives their project/global SUMMARY + DETAILS too. The base
+        // description cache keeps this idempotent across refreshes.
+        enrich_registered_tools(&tm, cwd);
         // ── 给主 runner 分配 subsession sink（manager / 任何角色通用） ──
         let subsession_sink: Option<Arc<dyn crate::trace::TraceSink>> = if session_id.is_empty() {
             None
