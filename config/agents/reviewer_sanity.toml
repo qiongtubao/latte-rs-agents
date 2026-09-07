@@ -15,6 +15,7 @@ id = "reviewer_sanity"
 
 # Human-readable display name — shown in logs and discussion transcripts.
 name = "Sanity Reviewer"
+description = "合理性审查者：快速低成本核查产出中的幻觉与明显缺陷，只验证不修改"
 
 # Lifecycle category: verification roles check the work of execution /
 # planning roles. Same category as the existing `reviewer` role.

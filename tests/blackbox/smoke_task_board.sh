@@ -3,7 +3,7 @@
 #
 # 起一个真实的 `latte-agent ui` server（临时 cwd，随机端口），
 # 用 curl 走一遍不依赖模型的看板链路：
-#   建任务 → 改状态 → 父子嵌套（含孙任务拒绝）→ 排期字段 →
+#   建任务 → 改状态 → 父子嵌套（任意深度，孙任务接受）→ 排期字段 →
 #   列表聚合 → 删除归档 → 磁盘落盘（board.json + <id>.json）
 #
 # 不发模型调用（dispatch/abort/report 需要真实 session，不在此覆盖）。
@@ -63,25 +63,30 @@ out=$(curl -sf -X PATCH "$BASE/tasks/$TID" -H 'Content-Type: application/json' -
 [[ "$(echo "$out" | jsonget "d['state']")" == "todo" ]] || fail "state not todo"
 echo "$out" | jsonget "'dispatch' in d['actions']" | grep -q True || fail "todo actions missing dispatch"
 
-# ── 3. 子任务 OK；孙任务必须拒绝（最多一层）──
+# ── 3. 子任务 OK；孙任务也 OK（任意深度任务树）──
 out=$(curl -sf -X POST "$BASE/tasks" -H 'Content-Type: application/json' \
   -d "{\"title\":\"子任务\",\"parent_id\":\"$TID\"}") || fail "create child"
 CID=$(echo "$out" | jsonget "d['id']")
-rc=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/tasks" -H 'Content-Type: application/json' \
-  -d "{\"title\":\"孙任务\",\"parent_id\":\"$CID\"}")
-[[ "$rc" == "400" ]] || fail "grandchild create rc=$rc, want 400"
+out=$(curl -sf -X POST "$BASE/tasks" -H 'Content-Type: application/json' \
+  -d "{\"title\":\"孙任务\",\"parent_id\":\"$CID\"}") || fail "create grandchild"
+GID=$(echo "$out" | jsonget "d['id']")
 
 # ── 4. 排期字段 → actions 切换为已排期形态 ──
 out=$(curl -sf -X PATCH "$BASE/tasks/$TID" -H 'Content-Type: application/json' \
   -d '{"scheduled_at":9999999999999}') || fail "patch scheduled_at"
 echo "$out" | jsonget "'unschedule' in d['actions']" | grep -q True || fail "scheduled actions missing unschedule"
 
-# ── 5. 列表聚合：父任务 sub_total=1 ──
+# ── 5. 列表聚合：sub_total 递归统计全部后代（父=2，子=1）──
 out=$(curl -sf "$BASE/tasks") || fail "list tasks"
-echo "$out" | jsonget "[t for t in d if t['id']=='$TID'][0]['sub_total']" | grep -q '^1$' \
-  || fail "parent sub_total != 1"
+echo "$out" | jsonget "[t for t in d if t['id']=='$TID'][0]['sub_total']" | grep -q '^2$' \
+  || fail "parent sub_total != 2"
+echo "$out" | jsonget "[t for t in d if t['id']=='$CID'][0]['sub_total']" | grep -q '^1$' \
+  || fail "child sub_total != 1"
 
-# ── 6. 删除子任务 → 进 archive/ ──
+# ── 6. 删除孙任务与子任务 → 进 archive/ ──
+rc=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/tasks/$GID")
+[[ "$rc" == "204" || "$rc" == "200" ]] || fail "delete grandchild rc=$rc"
+[[ -f "$TMP/.latte/tasks/archive/$GID.json" ]] || fail "archived grandchild file missing"
 rc=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$BASE/tasks/$CID")
 [[ "$rc" == "204" || "$rc" == "200" ]] || fail "delete child rc=$rc"
 [[ -f "$TMP/.latte/tasks/archive/$CID.json" ]] || fail "archived child file missing"

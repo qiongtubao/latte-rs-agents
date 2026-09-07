@@ -1,6 +1,7 @@
 [roles.designer_leader]
 id = "designer_leader"
 name = "Design Lead"
+description = "设计负责人：管理 UI/UX/视觉设计师团队，按需求分配设计任务"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

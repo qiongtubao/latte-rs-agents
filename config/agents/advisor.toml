@@ -1,6 +1,7 @@
 [roles.advisor]
 id = "advisor"
 name = "Senior Advisor"
+description = "资深终审顾问：解释根因、权衡取舍，对方案与结论做最终把关，不动手写代码"
 category = "verification"
 model_tier = "premium"
 prompt_file = "prompts/advisor.md"

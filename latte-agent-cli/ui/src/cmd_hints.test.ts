@@ -57,7 +57,7 @@ describe("mergeWorkflowCommands：内建 + workflow 斜杠命令合并", () => {
     expect(out).toHaveLength(BUILTIN_CMD_HINTS.length);
     const planEntry = out.find((h) => h.cmd === "/plan");
     expect(planEntry?.desc).not.toBe("邪恶的 plan");
-    expect(planEntry?.desc).toBe("运行实现规划 workflow");
+    expect(planEntry?.desc).toBe("运行任务规划 workflow");
   });
 
   it("command 为空/不以 / 开头 -> 跳过", () => {

@@ -1,6 +1,7 @@
 [roles.tech_writer_leader]
 id = "tech_writer_leader"
 name = "Tech Writing Lead"
+description = "技术写作负责人：管理 API 文档与用户手册团队，分配写作任务"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

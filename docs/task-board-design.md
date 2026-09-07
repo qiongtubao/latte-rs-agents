@@ -18,7 +18,6 @@ v2 新增：**业务类型 `task_type`（可配置）→ 默认 workflow**，类
 非目标（v1 不做）：
 
 - 多项目聚合视图、跨任务依赖（blocked-by）、cron 周期任务
-- 多层任务树（只允许一层父子嵌套）
 - 看板拖拽排序（mockup 之后再评估）
 
 ## 2. 状态机
@@ -167,10 +166,12 @@ v2 新增：**业务类型 `task_type`（可配置）→ 默认 workflow**，类
 - **`result` 枚举**：`completed` / `aborted` / `failed` / `timeout`
 - **`history` 内嵌**：事件量小不单独开 JSONL；`actor` ∈ `user` / `scheduler` / `manager` / `code_review` / `workflow`
 
-### 3.3 任务嵌套（父子）
+### 3.3 任务嵌套（任意深度任务树）
 
-- 扁平文件 + `parent_id` 引用，**最多一层**（父任务不允许再有 `parent_id`）
-- 子任务是普通任务：独立状态机、独立排期/派发/ runs，独立 `task_type`
-- 父状态**手动控制，不自动级联**；父卡片显示聚合进度（`子任务 3/5`），
-  全部子任务终态时抽屉给提示 + 一键确认完成
-- 派发父任务时把子任务清单拼进发给 manager 的消息（见 §5）
+- 扁平文件 + `parent_id` 引用，**任意深度**：校验只要求 parent 存在且
+  无环（新 parent 不能是本任务自身或其后代）
+- 子任务是普通任务：独立状态机、独立排期/派发/ runs，独立 `task_type`；
+  子任务可继续再拆（refine/import 均支持多级嵌套）
+- 直接子任务全部 done → 父任务自动 done，并向上冒泡直到根
+  （`maybe_complete_parent`）；父卡片显示**全部后代**的聚合进度
+- 派发父任务时把直接子任务清单拼进发给 manager 的消息（见 §5）

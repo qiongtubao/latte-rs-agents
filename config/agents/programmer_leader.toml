@@ -14,6 +14,7 @@
 [roles.programmer_leader]
 id = "programmer_leader"
 name = "Programmer Lead"
+description = "程序员负责人：管理多语言工程师团队，按语言与技术栈分派实现任务"
 category = "execution"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

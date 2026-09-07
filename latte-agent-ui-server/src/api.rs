@@ -709,6 +709,9 @@ pub struct RoleConfigEntry {
     pub skills: Vec<String>,
     /// 领域代码/文档路径（注入角色系统提示，见 core `RoleTemplate::code_paths`）。
     pub code_paths: Vec<String>,
+    /// 一句话职责介绍（见 core `RoleTemplate::description`）——delegate
+    /// 工具的角色花名册按它展示；角色编辑器可编辑。
+    pub description: String,
     pub prompt_file: Option<String>,
     pub prompt_path: Option<String>,
     pub config_path: String,
@@ -886,6 +889,7 @@ fn role_config_entry(
         tools: tpl.tools.clone(),
         skills: tpl.skills.clone(),
         code_paths: tpl.code_paths.clone(),
+        description: tpl.description.clone(),
         prompt_file: tpl.prompt_file.clone(),
         prompt_path,
         config_path: toml_path.display().to_string(),
@@ -1087,6 +1091,10 @@ pub struct SaveRoleConfigRequest {
     /// 领域代码/文档路径（空数组 = 清空）。
     #[serde(default)]
     pub code_paths: Vec<String>,
+    /// 一句话职责介绍。`None` = 不改动（前端没传时保留磁盘原值），
+    /// `Some("")` = 清空。
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub prompt: String,
 }
@@ -1138,6 +1146,10 @@ fn write_role_toml(
         t["model_chain"] = value(str_array(&req.model_chain));
         t["tools"] = value(str_array(&req.tools));
         t["code_paths"] = value(str_array(&req.code_paths));
+        // description 只在请求显式携带时改写；前端没传（None）保留磁盘原值。
+        if let Some(desc) = &req.description {
+            t["description"] = value(desc.clone());
+        }
         match req.temperature {
             Some(temp) => {
                 t["temperature"] = value(temp);
@@ -1169,6 +1181,9 @@ fn write_role_toml(
         t["tools"] = value(str_array(&req.tools));
         if !req.code_paths.is_empty() {
             t["code_paths"] = value(str_array(&req.code_paths));
+        }
+        if let Some(desc) = req.description.as_ref().filter(|d| !d.is_empty()) {
+            t["description"] = value(desc.clone());
         }
         if !tpl.skills.is_empty() {
             t["skills"] = value(str_array(&tpl.skills));
@@ -1237,6 +1252,9 @@ pub fn save_role_config(
                 t.temperature = req.temperature;
                 t.tools = req.tools.clone();
                 t.code_paths = req.code_paths.clone();
+                if let Some(desc) = &req.description {
+                    t.description = desc.clone();
+                }
                 role_config_entry(b, t)
             }
             None => {
@@ -1272,6 +1290,7 @@ pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<Role
         icon: String::new(),
         skills: vec![],
             code_paths: vec![],
+        description: String::new(),
     };
     let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
     std::fs::create_dir_all(&agents_dir)
@@ -2296,6 +2315,7 @@ mod tests {
             icon: String::new(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         };
         // cwd 下没有文件 → 读全局 prompts.d
         assert_eq!(
@@ -2328,6 +2348,7 @@ mod tests {
                 icon: String::new(),
                 skills: vec![],
             code_paths: vec![],
+                description: String::new(),
             },
         );
         let resolver = latte_agent_core::model_resolver::ModelResolver::from_config(&cfg)
@@ -2847,6 +2868,20 @@ async fn lookup_tool_meta(id: &str) -> Option<(String, String)> {
         .map(|t| (t.kind, t.description))
 }
 
+/// workflow / delegate 的注册描述是**动态生成**的：内嵌当前
+/// `.latte/workflows.d` 的可用 workflow 清单 / 当前配置的角色花名册
+/// （见 core 的 `register_workflow_tool` / `register_delegate_tool`）。
+/// `tools::enumerate` 里只有 `DYNAMIC_TOOL_CATALOG` 的稳定摘要，详情弹层
+/// 要显示模型真读到的那份，所以用注册路径上**同一个构造函数**现算，
+/// 保证面板与模型侧不漂移。其余工具返回 `None`，沿用枚举目录的描述。
+fn dynamic_tool_description(b: &UiBackend, id: &str) -> Option<String> {
+    match id {
+        "workflow" => Some(latte_agent_core::controller::workflow_tool_hint(&b.cwd)),
+        "delegate" => Some(latte_agent_core::controller::delegate_tool_hint(&b.merged.read())),
+        _ => None,
+    }
+}
+
 /// 工具文档的项目相对路径。运行时读的、UI 写的必须是同一个路径，所以直接
 /// 用 core 的实现，不在这里另写一份。
 fn tool_doc_rel_path(id: &str) -> String {
@@ -2868,6 +2903,9 @@ pub async fn get_tool_doc(b: &UiBackend, id: &str) -> Result<ToolDocResponse, Ap
     let (kind, description) = lookup_tool_meta(id)
         .await
         .unwrap_or_else(|| ("other".to_string(), String::new()));
+    // workflow / delegate：枚举目录里只有稳定摘要，换成模型真读到的
+    // 动态注册描述（内嵌当前可用 workflow / 角色清单）。
+    let description = dynamic_tool_description(b, id).unwrap_or(description);
 
     let doc = docs::resolve_doc(&b.cwd, id);
     let (summary, content) = docs::split_doc_markers(&doc.raw);
@@ -3085,6 +3123,35 @@ mod tool_doc_tests {
         assert!(doc.summary.is_empty() && doc.content.is_empty(), "编辑缓冲必须是空的");
         assert!(doc.path.ends_with(".latte/tools.d/zz_probe.md"));
         crate::tools::clear_cache();
+    }
+
+    /// workflow / delegate 的注册描述是运行时动态生成的（内嵌当前可用
+    /// workflow 清单 / 角色花名册）。详情弹层必须显示这份动态原文，而不是
+    /// `DYNAMIC_TOOL_CATALOG` 里的稳定摘要——否则面板上又是「模型看得到、
+    /// 面板看不到」。
+    #[tokio::test]
+    async fn get_tool_doc_shows_dynamic_description_for_workflow_and_delegate() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 项目层放一个自定义 workflow，动态描述必须把它列出来。
+        let dir = tmp.path().join(".latte/workflows.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("zz_probe_wf.toml"),
+            "name = \"zz_probe_wf\"\nmax_rounds = 1\n\n[[steps]]\nid = \"s1\"\nspeakers = [\"manager\"]\nprompt = \"hi {{topic}}\"\n",
+        )
+        .unwrap();
+        let backend = doc_backend(tmp.path());
+
+        let doc = get_tool_doc(&backend, "workflow").await.expect("get workflow");
+        assert!(doc.description.contains("zz_probe_wf"),
+                "workflow 详情没内嵌当前可用清单: {:?}", doc.description);
+        assert!(doc.builtin_detail.contains("zz_probe_wf"),
+                "清单应在 builtin_detail 里: {:?}", doc.builtin_detail);
+        assert_eq!(doc.brief, "Run a named multi-role workflow.");
+
+        let doc = get_tool_doc(&backend, "delegate").await.expect("get delegate");
+        assert!(doc.description.contains("Delegate a subtask to a specialist role"),
+                "delegate 详情不是注册路径的动态描述: {:?}", doc.description);
     }
 
     /// 无标记的 md（手写、或从 oh-my-pi 那种一份 md 直接拷来的）整份算详情，
@@ -4597,6 +4664,7 @@ mod hot_reload_tests {
             temperature: None,
             tools: vec![],
             code_paths: vec![],
+            description: None,
             prompt: String::new(),
         })
         .expect("save role");

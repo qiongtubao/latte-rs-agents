@@ -16,7 +16,12 @@ use latte_agent_core::session::SessionManager;
 /// Max concurrent `delegate` tool calls per manager session.
 const DEFAULT_DELEGATE_CONCURRENCY: usize = 4;
 /// Per-specialist wall-clock timeout in seconds.
-const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 300;
+///
+/// 与 UI 的 `DEFAULT_UI_DELEGATE_TIMEOUT_SECS` 对齐（900s）。原值 300s
+/// 在慢速厂商模型下会误杀正常任务：实测 glm-5.3 单次模型调用 167s+，
+/// architect 深读一个模块（多轮 read/search 往返）首轮 delegate 被 300s
+/// 掐死、manager 原样重派又烧一遍，整轮近 1/3 时间浪费在重跑上。
+const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 900;
 
 use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
@@ -342,6 +347,11 @@ impl ChatCmd {
             io::stdin().read_line(&mut input)?;
             let input = input.trim_end_matches(['\n', '\r']);
             if !input.is_empty() {
+                // 与交互式 REPL 一致：先把用户输入记进 advisor 宿主的
+                // last_input——审查 prompt 的「主诉求」基准。此前这里漏记，
+                // 管道/e2e 场景下 manager 的分派决策审查拿到的主诉求恒为
+                // 空，advisor 只能按「缺少用户锚点」告警。
+                *cli_advisor_host().last_input.lock() = input.to_string();
                 session.turn(input).await?;
                 if let Some(resp) = &session.last_response {
                     println!("{}", resp);
@@ -602,6 +612,18 @@ impl ChatSession {
                             ("preview", truncate(&response, 400)),
                         ],
                     );
+                }
+                // 空答复兜底提示：模型侧偶发整轮空响应（流式空 completion
+                // 已在 runner 内重试 2 次仍空），此前用户只能看到一个空气
+                // 泡/空行，完全不知道发生了什么。明确告知 + 给补救路径。
+                // 实测现场：manager 拿到 delegate 结果后第三轮合成调用
+                // glm-5.3 连续返回空，turn 结束 len=0。
+                if response.trim().is_empty() {
+                    self.renderer
+                        .on_status(
+                            "⚠️ 模型返回了空回复（已自动重试仍为空，通常是模型侧抖动）。请把刚才的请求再发一次，或 /model 切换模型后重试。",
+                        )
+                        .await;
                 }
                 self.last_response = Some(response);
                 Ok(())
@@ -2056,6 +2078,7 @@ async fn register_workflow_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             }),
             ("topic".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -2069,6 +2092,7 @@ async fn register_workflow_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             }),
         ]
         .into_iter()
@@ -2201,6 +2225,7 @@ async fn register_delegate_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             }),
             ("task".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -2216,6 +2241,7 @@ async fn register_delegate_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             }),
         ]
         .into_iter()
@@ -2278,7 +2304,7 @@ async fn register_delegate_tool(
                 //      on 8-step tasks)
                 //   2. `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` (env, captured
                 //      once at startup as `env_timeout`)
-                //   3. `DEFAULT_DELEGATE_TIMEOUT_SECS` (60s)
+                //   3. `DEFAULT_DELEGATE_TIMEOUT_SECS` (900s, 与 UI 对齐)
                 let timeout_s = resolver
                     .get_def(&models[0].id)
                     .and_then(|d| d.timeout_secs)
@@ -4735,6 +4761,7 @@ pub fn register_ask_human_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             },
         )]
         .into_iter()

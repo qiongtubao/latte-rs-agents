@@ -185,6 +185,11 @@ pub struct RoleTemplate {
     /// 树状清单 —— 不依赖模型自觉去读。角色编辑器可编辑。
     #[serde(default)]
     pub code_paths: Vec<String>,
+    /// 一句话职责介绍：manager 的 `delegate` 工具描述按它选角色
+    /// （`controller::role_roster_detail_text`）。留空时花名册回退到
+    /// 「类别 + 工具清单」的派生简介。角色编辑器可编辑。
+    #[serde(default)]
+    pub description: String,
 }
 
 impl RoleTemplate {
@@ -557,6 +562,7 @@ mod tests {
             icon: String::new(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         }
     }
 
@@ -569,8 +575,9 @@ mod tests {
         let tmpl = infra_template("manager", Some(rel.clone()), vec![]);
         let role = tmpl.resolve(&GenerateParams::default()).await.unwrap();
         let _ = std::fs::remove_file(&rel);
-        // Built-in base is present …
-        assert!(role.system_prompt.contains("任务启动决策流程"));
+        // Built-in base is present …（锚点取现行基座首行；b6f1284 轻量
+        // 化后旧的"任务启动决策流程"已不在内置 prompt 里）
+        assert!(role.system_prompt.contains("你是资深技术负责人/架构师 agent（manager）"));
         // … and the user file was appended, not replaced.
         assert!(role.system_prompt.contains("<project_rules>"));
         assert!(role.system_prompt.contains("本项目约定：优先用 Rust。"));
@@ -779,6 +786,7 @@ mod tests {
             icon: "".into(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         }
     }
 

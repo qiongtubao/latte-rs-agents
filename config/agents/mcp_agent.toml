@@ -17,6 +17,7 @@
 [roles.mcp_agent]
 id = "mcp_agent"
 name = "MCP Agent"
+description = "MCP Agent：连接和管理 MCP 服务器，发现并调用其提供的工具"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

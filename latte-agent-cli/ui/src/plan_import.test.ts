@@ -11,7 +11,7 @@
 //   - 空描述 -> undefined（与 ImportTask 可选字段一致）
 //   - priority/labels/workflow/subtasks 透传
 import { describe, it, expect } from "vitest";
-import { buildSelectedPlanTasks } from "./plan_import";
+import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
 import type { ImportTask } from "./api";
 
 /** 构造一行输入（模拟弹窗 DOM 取值），缺省字段给合理默认。 */
@@ -84,5 +84,87 @@ describe("buildSelectedPlanTasks：plan 弹窗选择 -> ImportTask[]", () => {
     expect(out[0].labels).toBeUndefined();
     expect(out[0].workflow).toBeUndefined();
     expect(out[0].subtasks).toBeUndefined();
+  });
+});
+
+// ─── 多层嵌套 subtasks：勾选树递归透传 ────────────────────────────
+//
+// 弹窗为每个 subtask 递归生成子行（subRows），勾选状态逐层生效：
+// 未勾选/空标题的行连同整个子树跳过。不传 subRows（旧调用方）时
+// subtasks 原样透传，不做逐层过滤。
+
+/** 按弹窗行为递归构造勾选树行（默认全勾选）。 */
+function deepRow(t: ImportTask, over: Partial<PlanImportRowInput> = {}): PlanImportRowInput {
+  return {
+    checked: true,
+    title: t.title,
+    description: t.description ?? "",
+    priority: t.priority ?? 2,
+    task: t,
+    subRows: t.subtasks?.map((s) => deepRow(s)),
+    ...over,
+  };
+}
+
+/** 三层嵌套：根 ─┬─ 子A ─┬─ 孙A1
+ *               │      └─ 孙A2
+ *               └─ 子B */
+function nestedTask(): ImportTask {
+  return {
+    title: "根",
+    subtasks: [
+      { title: "子A", subtasks: [{ title: "孙A1" }, { title: "孙A2" }] },
+      { title: "子B" },
+    ],
+  };
+}
+
+describe("buildSelectedPlanTasks：多层嵌套勾选树", () => {
+  it("全勾选：三层结构完整透传，子行的编辑值（标题/优先级）生效", () => {
+    const r = deepRow(nestedTask(), { title: "根-改" });
+    r.subRows![0].title = "子A-改";
+    r.subRows![0].subRows![0].priority = 1;
+    const out = buildSelectedPlanTasks([r]);
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe("根-改");
+    expect(out[0].subtasks!.map(s => s.title)).toEqual(["子A-改", "子B"]);
+    expect(out[0].subtasks![0].subtasks!.map(s => s.title)).toEqual(["孙A1", "孙A2"]);
+    expect(out[0].subtasks![0].subtasks![0].priority).toBe(1);
+  });
+
+  it("取消中间层「子A」：整个子树（含孙）被丢弃，兄弟「子B」保留", () => {
+    const r = deepRow(nestedTask());
+    r.subRows![0].checked = false;
+    const out = buildSelectedPlanTasks([r]);
+    expect(out[0].subtasks!.map(s => s.title)).toEqual(["子B"]);
+  });
+
+  it("取消叶子「孙A2」：只移除该叶子，孙A1 保留", () => {
+    const r = deepRow(nestedTask());
+    r.subRows![0].subRows![1].checked = false;
+    const out = buildSelectedPlanTasks([r]);
+    expect(out[0].subtasks![0].subtasks!.map(s => s.title)).toEqual(["孙A1"]);
+  });
+
+  it("子树的行全部未勾选：父行输出不带 subtasks（而不是空数组）", () => {
+    const r = deepRow(nestedTask());
+    r.subRows!.forEach(s => { s.checked = false; });
+    const out = buildSelectedPlanTasks([r]);
+    expect(out).toHaveLength(1);
+    expect(out[0].subtasks).toBeUndefined();
+  });
+
+  it("不传 subRows（旧调用方）：多层 subtasks 原样透传不过滤", () => {
+    const out = buildSelectedPlanTasks([
+      row({ title: "t", task: nestedTask() }),
+    ]);
+    expect(out[0].subtasks![0].subtasks!.map(s => s.title)).toEqual(["孙A1", "孙A2"]);
+  });
+
+  it("嵌套层空标题同样跳过（含其子树）", () => {
+    const r = deepRow(nestedTask());
+    r.subRows![1].title = "   "; // 子B 空标题
+    const out = buildSelectedPlanTasks([r]);
+    expect(out[0].subtasks!.map(s => s.title)).toEqual(["子A"]);
   });
 });

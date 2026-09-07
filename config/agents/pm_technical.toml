@@ -1,6 +1,7 @@
 [roles.pm_technical]
 id = "pm_technical"
 name = "Technical PM"
+description = "技术 PM：技术需求拆解、研发进度跟踪、技术风险与跨团队协调"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

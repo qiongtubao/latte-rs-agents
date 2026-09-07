@@ -1,6 +1,7 @@
 [roles.tester_automation]
 id = "tester_automation"
 name = "Test Automation Engineer"
+description = "测试自动化工程师：搭建自动化测试体系，编写可维护脚本并集成 CI"
 category = "verification"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

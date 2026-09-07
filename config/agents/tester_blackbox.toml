@@ -1,6 +1,7 @@
 [roles.tester_blackbox]
 id = "tester_blackbox"
 name = "Black-Box Tester"
+description = "黑盒测试工程师：不看内部实现，只验证输入输出与端到端用户场景"
 category = "verification"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

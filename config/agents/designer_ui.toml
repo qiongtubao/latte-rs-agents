@@ -1,6 +1,7 @@
 [roles.designer_ui]
 id = "designer_ui"
 name = "UI Designer"
+description = "UI 设计师：界面布局与组件设计、设计系统维护、交互原型制作"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

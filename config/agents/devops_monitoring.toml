@@ -1,6 +1,7 @@
 [roles.devops_monitoring]
 id = "devops_monitoring"
 name = "Monitoring Engineer"
+description = "监控工程师：监控指标设计、日志聚合、告警规则与容量规划"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

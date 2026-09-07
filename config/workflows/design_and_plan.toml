@@ -122,8 +122,11 @@ max_retries = 1
 # REJECT → 跳回 brainstorm 重新生成设计，直到 PASS 或迭代耗尽。
 # 契约只卡格式（必须有 VERDICT: 标记），放行与否交给 loop_until——
 # 不能 require PASS，否则 REJECT 变成契约失败直接判死。
+# loop_no_release_on：REJECT = 带阻断证据的硬拒绝，耗尽时不许
+# advisor 复核放行（同 implementation_plan 的 gate）。
 loop_until = "VERDICT: PASS"
 loop_back_to = "brainstorm"
+loop_no_release_on = "VERDICT: REJECT"
 max_iterations = 3
 task = """根据以下两份评审结论判定放行与否：
 

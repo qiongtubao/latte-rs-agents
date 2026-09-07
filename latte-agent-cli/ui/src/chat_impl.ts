@@ -6,7 +6,8 @@ type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
 import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
-import { buildSelectedPlanTasks } from "./plan_import";
+import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
+import { parentOptions } from "./task_board";
 import type { CodeRef } from "./host";
 interface UIBinding {
 
@@ -1310,13 +1311,17 @@ export function mountChat(opts: {
     header.textContent = `导入任务看板 · ${tasks.length} 个候选${planId ? `（${planId}）` : ""}${refineParent ? `（作为 ${refineParent} 的子任务）` : ""}`;
     box.appendChild(header);
 
-    // 每个任务一行：勾选框 + 可编辑 title/desc/priority。
-    const rows: { cb: HTMLInputElement; titleInp: HTMLInputElement; descInp: HTMLTextAreaElement; priSel: HTMLSelectElement; task: ImportTask }[] = [];
+    // 每个任务一行：勾选框 + 可编辑 title/desc/priority；subtasks 任意
+    // 深度递归成行（缩进表达层级），勾选父行会级联勾掉整个子树。
+    type PlanRow = { cb: HTMLInputElement; titleInp: HTMLInputElement; descInp: HTMLTextAreaElement; priSel: HTMLSelectElement; task: ImportTask; subRows: PlanRow[] };
+    const rows: PlanRow[] = [];
+    const allRows: PlanRow[] = []; // 拍平的全部行，给「全选/全不选」用
     const list = document.createElement("div");
     list.className = "plan-import-list";
-    for (const t of tasks) {
+    const addRow = (t: ImportTask, depth: number): PlanRow => {
       const row = document.createElement("div");
       row.className = "plan-import-row";
+      if (depth > 0) row.style.marginLeft = `${depth * 20}px`;
       const cb = document.createElement("input");
       cb.type = "checkbox";
       cb.checked = true;
@@ -1346,13 +1351,25 @@ export function mountChat(opts: {
       top.append(cb, titleInp, priSel);
       row.append(top, descInp);
       list.appendChild(row);
-      rows.push({ cb, titleInp, descInp, priSel, task: t });
-    }
+      const rec: PlanRow = { cb, titleInp, descInp, priSel, task: t, subRows: [] };
+      // 勾选/取消父行级联到整个子树。
+      cb.addEventListener("change", () => {
+        const walk = (r: PlanRow): void => {
+          r.cb.checked = cb.checked;
+          r.subRows.forEach(walk);
+        };
+        rec.subRows.forEach(walk);
+      });
+      allRows.push(rec);
+      for (const s of t.subtasks ?? []) rec.subRows.push(addRow(s, depth + 1));
+      return rec;
+    };
+    for (const t of tasks) rows.push(addRow(t, 0));
     box.appendChild(list);
 
     // 父任务下拉框：默认「自动」（拆分会话由后端 refine 映射解析，
-    // 页面刷新也不丢）；可人工改选具体根任务、或显式选「无（根任
-    // 务）」覆盖自动关联——防止父任务关联丢失时无法干预。
+    // 页面刷新也不丢）；可人工改选任意任务作为父任务、或显式选「无
+    // （根任务）」覆盖自动关联——防止父任务关联丢失时无法干预。
     const parentRow = document.createElement("div");
     parentRow.className = "plan-import-parent";
     const parentLbl = document.createElement("span");
@@ -1368,16 +1385,16 @@ export function mountChat(opts: {
     parentSel.appendChild(noneOpt);
     parentRow.append(parentLbl, parentSel);
     box.appendChild(parentRow);
-    // 异步拉根任务列表填充候选；本地 refineParent 命中时预选。
+    // 异步拉任务列表填充候选：任意层级都可作父任务，树形缩进帮助
+    // 辨识层级；本地 refineParent 命中时预选。
     void listTasks()
       .catch(() => [] as TaskView[])
       .then((all) => {
         if (!document.getElementById("plan-import-modal")) return; // 弹窗已关
-        for (const t of all) {
-          if (t.parent_id) continue; // 父任务只能是根任务
+        for (const { task: t, depth } of parentOptions(all)) {
           const o = document.createElement("option");
           o.value = t.id;
-          o.textContent = `${t.id} · ${t.title}`;
+          o.textContent = `${"　".repeat(depth)}${t.id} · ${t.title}`;
           parentSel.appendChild(o);
         }
         if (refineParent && [...parentSel.options].some(o => o.value === refineParent)) {
@@ -1392,8 +1409,8 @@ export function mountChat(opts: {
     toggleAll.type = "button";
     toggleAll.textContent = "全选/全不选";
     toggleAll.addEventListener("click", () => {
-      const all = rows.every(r => r.cb.checked);
-      rows.forEach(r => { r.cb.checked = !all; });
+      const all = allRows.every(r => r.cb.checked);
+      allRows.forEach(r => { r.cb.checked = !all; });
     });
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
@@ -1407,13 +1424,16 @@ export function mountChat(opts: {
     box.appendChild(bar);
 
     importBtn.addEventListener("click", async () => {
-      const selected = buildSelectedPlanTasks(rows.map(r => ({
+      // 勾选树递归收集：未勾选的行连同其子树一起不进导入清单。
+      const toInput = (r: PlanRow): PlanImportRowInput => ({
         checked: r.cb.checked,
         title: r.titleInp.value,
         description: r.descInp.value,
         priority: Number(r.priSel.value),
         task: r.task,
-      })));
+        subRows: r.subRows.length > 0 ? r.subRows.map(toInput) : undefined,
+      });
+      const selected = buildSelectedPlanTasks(rows.map(toInput));
       if (selected.length === 0) { alert("未选择任何任务"); return; }
       importBtn.disabled = true;
       importBtn.textContent = "导入中…";

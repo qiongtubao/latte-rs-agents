@@ -1,6 +1,7 @@
 [roles.pm_leader]
 id = "pm_leader"
 name = "PM Lead"
+description = "PM 负责人：管理技术 PM 与业务分析团队，分配产品需求任务"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

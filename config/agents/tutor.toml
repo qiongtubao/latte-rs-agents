@@ -14,6 +14,7 @@ id = "tutor"
 
 # Human-readable display name — shown in logs and discussion transcripts.
 name = "Tutor"
+description = "互动学习辅导员：把主题拆成知识点逐个教学，用选择题检验掌握程度"
 
 # Lifecycle category determines when the role participates in a discussion:
 #   planning     — upfront design/requirements (pm, architect, designer, manager)

@@ -1,19 +1,32 @@
 # Workflow: implementation_plan
-# 实现规划：架构拆解 → 任务清单(JSON，可导入任务看板) → 终审。
+# 任务规划：目标拆解（实现/学习/调研等任意主题通用）→ 任务清单(JSON，
+# 可导入任务看板) → 终审。description 必须让"拆分任务"类诉求按落点
+# 命中本流程——此前描述以"实现规划/架构拆解"开头，manager 按话题词
+# 把"学习计划拆分"判成不贴合，绕过评审门直接调 plan（2026-09 jemalloc
+# 会话实锤：看了 3 个目录列表拍出 5 个任务，零评审进弹窗）。
 # 步骤间用 output_key 显式穿线（mini-engine 跨步骤只传 output_key 变量）。
 
 name = "implementation_plan"
 command = "/plan"
-description = "实现规划：架构拆解 → 任务清单(JSON) → 终审｜落点：任务看板条目（plan 弹窗勾选导入）"
+description = "任务规划：把目标拆解 → 任务清单(JSON) → 终审。不限实现类——学习/调研/重构等任何主题的「拆分任务、出任务清单」诉求都走这里｜落点：任务看板条目（plan 弹窗勾选导入）"
 max_rounds = 1
 
 [[steps]]
 id = "breakdown"
-description = "架构拆解"
+description = "目标拆解"
 speakers = ["architect"]
 output_key = "plan"
 max_retries = 1
-prompt = "为以下目标做实现拆解：{{topic}}。先读代码了解现状再拆。输出：1) 方案概述（为什么这样拆）；2) 工作分解（每项：做什么、改动范围、依赖关系、验收标准）；3) 风险与未知项。"
+# 取证下限：拆解必须真的看过代码/资料。零工具调用的拆解只能凭训练记忆写，
+# 实测（2026-09 jemalloc 会话）产出的 74 个反引号标识符里 56% 全仓搜不到，
+# 且成体系地是旧大版本的术语（chunk/run/arena_bin_t 那一代），彼此自洽、
+# 读起来很专业，评审看不出来。OR 语义：三个工具任一即可，别逼它三个都调。
+require_tools_any = ["read", "code_graph", "search"]
+# 符号回指：反引号里的代码符号必须在仓库里搜得到。require_tools_any 只能
+# 证明「它调了工具」，管不到「对着没打开过的文件凭记忆写函数名」——那 74 个
+# 幻觉符号里 39 个正是这一类。查不到的会带「相近的真实符号」批注打回重做。
+require_symbols_resolvable = true
+prompt = "为以下目标做拆解（实现/学习/调研等主题通用）：{{topic}}。先读代码/资料了解现状再拆。输出：1) 方案概述（为什么这样拆）；2) 工作分解（每项：做什么、涉及范围、依赖关系、验收标准）；3) 风险与未知项。"
 
 [steps.output_contract]
 min_chars = 200
@@ -24,11 +37,20 @@ id = "tasks_json"
 description = "生成任务看板数据结构"
 speakers = ["architect"]
 output_key = "tasks"
+# 机械校验前移到草案步：复用 plan 工具的同一套判据（paths 存在性、清单内
+# 重叠、workflow 名、task_type 名）。不开这条时校验只发生在最后 manager 调
+# plan 的那一刻——实测（2026-09 jemalloc 会话）报的是 src/arena.c 重叠，
+# manager 直接给全部任务贴「只读」标签跳过校验，重叠原样进了看板弹窗；而
+# paths 里那个不存在的 arena_inlines.h 一路没人拦。
+require_plan_tasks = true
+# 清单正文里的符号同样要能回指——acceptance/description 里那些「口述
+# arena_bin_malloc_hard 的三种分支」才是学习者真正照着找的东西。
+require_symbols_resolvable = true
 prompt = """把拆解转成任务看板数据结构：
 {{plan}}
 严格输出一个 ```json 代码块。**JSON 代码块之外不写任何文字——不写思考过程、不写说明、不写前后缀。**
 schema：
-{"tasks": [{"title": "必填，一句话", "description": "做什么+验收标准", "priority": 1-4（1最高）, "labels": ["可选"], "workflow": "执行该任务的 workflow：开发类 tdd_development，修 bug bug_triage，文档类 update_docs，代码注释 annotate_code；没有贴合的必须留空（走 manager 直接执行），禁止硬绑不相关的 workflow", "subtasks": [同构，最多一层]}]}
+{"tasks": [{"title": "必填，一句话", "description": "做什么+验收标准", "priority": 1-4（1最高）, "labels": ["可选"], "task_type": "按任务主体性质选：feature=写代码/改行为的实现（含跑实验程序），bugfix=缺陷修复，learn=学习/研读类（产出教程笔记），learn_loop=交互式学习循环，research=读代码/文档摸底调研，docs=纯文档写作，chore=杂项；没有贴合的留空。看主体动作，不看产出物形态", "workflow": "默认留空——派发时按 task_type 自动推导默认流程；仅当确需偏离类型默认流程时才显式填已注册 workflow 名", "subtasks": [同构，任意深度]}]}
 要求：任务粒度 0.5-2 天；有依赖的排好序（先做的事情在前）；每个任务都能独立验收。"""
 
 [[steps]]
@@ -36,7 +58,12 @@ id = "verdict"
 description = "终审"
 speakers = ["reviewer"]
 output_key = "verdict"
-prompt = "终审这份实现规划：\n【拆解】{{plan}}\n【任务清单】{{tasks}}\n按裁决格式输出。重点：任务是否覆盖目标、粒度是否合理、依赖顺序是否正确、JSON 是否合法可导入。"
+# 终审必须自己取证，不许只做「plan 文本 ↔ JSON」的自洽比对。实测
+# （2026-09 jemalloc 会话）verdict 与 gate 两个 reviewer 子会话的工具调用
+# 数都是 0，于是一份引用了 4 个已删除文件、19 个不存在符号的清单被判
+# PASS，裁决书里还表扬了「取证覆盖度自评…诚实的项目治理」。
+require_tools_any = ["read", "code_graph", "search"]
+prompt = "终审这份任务规划：\n【拆解】{{plan}}\n【任务清单】{{tasks}}\n按裁决格式输出。重点：任务是否覆盖目标、粒度是否合理、依赖顺序是否正确、JSON 是否合法可导入。\n**必须实地核对**：清单里引用的文件路径与代码符号（函数/类型/宏名）是否真的存在于当前仓库——用 code_graph 或 search 抽查，不要凭印象判断。查不到的符号按实测错误处理。"
 
 # ── gate：终审门 ─────────────────────────────────────────────────
 # verdict 不通过（❌/changes-requested/阻断问题）→ gate 输出
@@ -59,8 +86,13 @@ max_retries = 1
 # REJECT → 跳回 breakdown 重做（反馈随 prompt 注入），直到 PASS 或
 # 迭代耗尽。契约只卡格式（必须有 VERDICT: 标记），放行与否交给
 # loop_until——不能 require PASS，否则 REJECT 变成契约失败直接判死。
+# loop_no_release_on：REJECT = 带阻断证据的硬拒绝，迭代耗尽时不许
+# advisor 语义复核放行（实测实锤：2026-09 jemalloc 会话，gate 三轮
+# REJECT 被复核误判「实质合格」，run 以 ok 收尾、summary 是 REJECT
+# 原文——失败被吞成成功）。复核放行只留给 REVISE 类小瑕疵场景。
 loop_until = "VERDICT: PASS"
 loop_back_to = "breakdown"
+loop_no_release_on = "VERDICT: REJECT"
 max_iterations = 3
 prompt = """根据以下终审结论判定放行与否：
 
@@ -74,7 +106,7 @@ prompt = """根据以下终审结论判定放行与否：
 {{tasks}}
 
 - 终审为 ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后以「【通过条件/修正项】」为标题**原样附上终审列出的全部条件与修正项**（一条都不许丢），再原样完整附上任务清单。修正项必须随清单一并交付，禁止静默丢弃。
-- 终审（无论裁决为何）指出实测错误（行号/路径/事实核验不符）且这些修正未在任务清单中体现 → 必须输出 `VERDICT: REJECT`，理由列出未吸收的实测错误。
+- 终审（无论裁决为何）指出实测错误（行号/路径/**符号存在性**/事实核验不符）且这些修正未在任务清单中体现 → 必须输出 `VERDICT: REJECT`，理由列出未吸收的实测错误。
 - 终审为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句，写清每条阻断的 file:line 证据，返工要用），**不要**附任务清单。
 - 输出 REJECT 时，正文中不得再出现字符串「VERDICT: PASS」（会被循环条件误判为放行）。"""
 

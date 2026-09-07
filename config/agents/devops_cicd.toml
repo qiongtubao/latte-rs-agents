@@ -1,6 +1,7 @@
 [roles.devops_cicd]
 id = "devops_cicd"
 name = "CI/CD Engineer"
+description = "CI/CD 工程师：构建流水线配置、自动化部署策略、版本发布管理"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

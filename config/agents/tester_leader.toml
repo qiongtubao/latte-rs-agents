@@ -1,6 +1,7 @@
 [roles.tester_leader]
 id = "tester_leader"
 name = "Test Lead"
+description = "测试负责人：管理功能/黑盒/白盒/性能/自动化测试团队，分配测试任务"
 category = "verification"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

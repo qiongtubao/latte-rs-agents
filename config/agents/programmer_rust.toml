@@ -1,6 +1,7 @@
 [roles.programmer_rust]
 id = "programmer_rust"
 name = "RUST Engineer"
+description = "Rust 工程师：用 Rust 实现功能与修 bug，擅长内存安全的系统编程"
 category = "execution"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

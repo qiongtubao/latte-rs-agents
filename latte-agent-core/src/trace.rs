@@ -214,6 +214,20 @@ pub(crate) fn utf8_safe_prefix(s: &str, max_bytes: usize) -> &str {
     }
     &s[..end]
 }
+
+/// [`utf8_safe_prefix`] 的镜像：取**尾部**至多 `max_bytes` 字节，
+/// 起点对齐到字符边界。中段省略式压缩需要它（见
+/// `crate::agent::compact_middle_out`）。
+pub(crate) fn utf8_safe_suffix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while !s.is_char_boundary(start) && start < s.len() {
+        start += 1;
+    }
+    &s[start..]
+}
 #[cfg(test)]
 mod utf8_prefix_tests {
     use super::utf8_safe_prefix;

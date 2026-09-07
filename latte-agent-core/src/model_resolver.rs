@@ -803,6 +803,7 @@ mod tests {
             icon: String::new(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         }
     }
 

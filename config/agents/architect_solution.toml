@@ -1,6 +1,7 @@
 [roles.architect_solution]
 id = "architect_solution"
 name = "Solution Architect"
+description = "解决方案架构师：把业务需求转成端到端技术方案，评估成本并推荐技术栈"
 category = "planning"
 model_tier = "premium"
 model_chain = ["deepseek-v4-flash"]

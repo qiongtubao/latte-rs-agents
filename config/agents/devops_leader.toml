@@ -1,6 +1,7 @@
 [roles.devops_leader]
 id = "devops_leader"
 name = "DevOps Lead"
+description = "DevOps 负责人：管理 CI/CD/基础设施/监控团队，分配运维任务"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

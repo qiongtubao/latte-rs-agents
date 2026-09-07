@@ -1,6 +1,7 @@
 [roles.tech_writer_api]
 id = "tech_writer_api"
 name = "API Documenter"
+description = "API 文档工程师：REST/GraphQL API 文档、SDK 使用指南与变更日志"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

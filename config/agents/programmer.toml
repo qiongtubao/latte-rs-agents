@@ -14,6 +14,7 @@ id = "programmer"
 
 # Human-readable display name — shown in logs and discussion transcripts.
 name = "Software Engineer"
+description = "动手实现代码：写功能、修 bug、跑构建和测试验证"
 
 # Lifecycle category determines when the role participates in a discussion:
 #   planning     — upfront design/requirements (pm, architect, designer, manager)

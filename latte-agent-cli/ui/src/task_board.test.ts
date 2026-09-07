@@ -8,6 +8,7 @@ import {
   STATES, STATE_ACTIONS, COLUMN_ORDER,
   effectiveActions, lastSessionId, actionRequest, actionToast, actionLabel,
   dispatchReadyToast,
+  childTasksOf, descendantIds, parentOptions,
 } from "./task_board";
 import type { TaskView } from "./api";
 
@@ -169,5 +170,92 @@ describe("dispatchReadyToast（派发全部结果提示）", () => {
     expect(msg).toContain("跳过 4 个");
     expect(msg).toContain("…");
     expect(msg).not.toContain("LAT-4:");
+  });
+});
+
+// ─── 任意深度任务树的纯函数 ──────────────────────────────────────
+
+/** 构造最小 TaskView；缺省字段给合理默认，只覆盖测试关心的。 */
+function mkTask(id: string, parent_id: string | null = null, over: Partial<TaskView> = {}): TaskView {
+  return {
+    schema: "task-v1", id, title: `标题-${id}`, description: "", priority: 3,
+    state: "todo", labels: [], task_type: null, parent_id, sub_order: 0,
+    scheduled_at: null, runs: [], created_at: 0, updated_at: 0, history: [],
+    workflow: null, effective_workflow: null,
+    sub_total: 0, sub_done: 0, sub_state_counts: {},
+    ...over,
+  };
+}
+
+/** 三层树：R ─┬─ A ── B（孙）  另有一棵 C。
+ *           └─ A2（sub_order 先于 A 验证排序） */
+function threeLevelTree(): TaskView[] {
+  return [
+    mkTask("R"),
+    mkTask("A", "R", { sub_order: 2 }),
+    mkTask("A2", "R", { sub_order: 1 }),
+    mkTask("B", "A"),
+    mkTask("C"),
+  ];
+}
+
+describe("childTasksOf（直接子任务，按 sub_order/created_at 排序）", () => {
+  it("三层树下各层取到自己的直接子任务", () => {
+    const tasks = threeLevelTree();
+    expect(childTasksOf(tasks, "R").map(t => t.id)).toEqual(["A2", "A"]); // sub_order 1 < 2
+    expect(childTasksOf(tasks, "A").map(t => t.id)).toEqual(["B"]);
+    expect(childTasksOf(tasks, "B")).toEqual([]);
+  });
+
+  it("sub_order 相同按 created_at 排", () => {
+    const tasks = [
+      mkTask("P"),
+      mkTask("x", "P", { created_at: 20 }),
+      mkTask("y", "P", { created_at: 10 }),
+    ];
+    expect(childTasksOf(tasks, "P").map(t => t.id)).toEqual(["y", "x"]);
+  });
+});
+
+describe("descendantIds（全部后代，防环排除用）", () => {
+  it("三层树：根的后代含子与孙，不含另一棵树", () => {
+    const tasks = threeLevelTree();
+    expect([...descendantIds(tasks, "R")].sort()).toEqual(["A", "A2", "B"]);
+    expect(descendantIds(tasks, "A").has("B")).toBe(true);
+    expect(descendantIds(tasks, "B").size).toBe(0);
+  });
+});
+
+describe("parentOptions（父任务下拉：全部任务 + 树形缩进 + 防环）", () => {
+  it("不排除时列出全部任务，DFS 序且深度正确（非根任务也可作父）", () => {
+    const tasks = threeLevelTree();
+    const opts = parentOptions(tasks);
+    expect(opts.map(o => o.task.id)).toEqual(["R", "A2", "A", "B", "C"]);
+    expect(opts.map(o => o.depth)).toEqual([0, 1, 1, 2, 0]);
+  });
+
+  it("编辑时排除自身及全部后代（防环），其它分支保留", () => {
+    const tasks = threeLevelTree();
+    // 编辑 A：A 自身与后代 B 不可选，A2/R/C 可选
+    expect(parentOptions(tasks, "A").map(o => o.task.id)).toEqual(["R", "A2", "C"]);
+    // 编辑 R：整棵 R 子树不可选，只剩 C
+    expect(parentOptions(tasks, "R").map(o => o.task.id)).toEqual(["C"]);
+  });
+
+  it("父任务已不在列表中的孤儿按根处理（深度 0，不丢任务）", () => {
+    const tasks = [mkTask("orphan", "GONE"), mkTask("kid", "orphan")];
+    const opts = parentOptions(tasks);
+    expect(opts.map(o => [o.task.id, o.depth])).toEqual([["orphan", 0], ["kid", 1]]);
+  });
+});
+
+describe("拆分入口对任意层级开放", () => {
+  it("todo / todo_scheduled 的动作含 refine，与是否子任务无关（不再按 parent_id 拦截）", () => {
+    // effectiveActions 不看 parent_id：子任务在 todo 状态下同样能再拆；
+    // in_progress / merging 由后端拒绝，前端本来就不给这些状态的 refine 动作。
+    expect(keysOf({ state: "todo", scheduled_at: null })).toContain("refine");
+    expect(keysOf({ state: "todo", scheduled_at: 1 })).toContain("refine");
+    expect(keysOf({ state: "in_progress", scheduled_at: null })).not.toContain("refine");
+    expect(keysOf({ state: "merging", scheduled_at: null })).not.toContain("refine");
   });
 });

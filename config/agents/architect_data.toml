@@ -1,6 +1,7 @@
 [roles.architect_data]
 id = "architect_data"
 name = "Data Architect"
+description = "数据架构师：数据模型与 Schema 设计、数据库选型、数据流与 ETL 管道"
 category = "planning"
 model_tier = "premium"
 model_chain = ["deepseek-v4-flash"]

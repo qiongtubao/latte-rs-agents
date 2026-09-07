@@ -1,6 +1,7 @@
 [roles.designer_ux]
 id = "designer_ux"
 name = "UX Researcher"
+description = "UX 研究员：用户调研与访谈、信息架构、可用性测试与用户旅程"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

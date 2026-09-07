@@ -96,6 +96,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "📋".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "拆解需求、定义范围与验收标准；需求模糊时先派它".into(),
         },
         "architect" => RoleTemplate {
             id: "architect".into(),
@@ -109,6 +110,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🏗️".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "设计系统架构与技术方案；动手实现前先派它定方向".into(),
         },
         "programmer" => RoleTemplate {
             id: "programmer".into(),
@@ -127,6 +129,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "💻".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "动手实现代码：写功能、修 bug、跑构建和测试验证".into(),
         },
         "tester" => RoleTemplate {
             id: "tester".into(),
@@ -144,6 +147,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🧪".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "写测试、跑验证、抓回归；实现完成后派它把关质量".into(),
         },
         "reviewer" => RoleTemplate {
             id: "reviewer".into(),
@@ -157,6 +161,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🔍".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "评审代码改动、挑问题与风险；合并前派它把关".into(),
         },
         "devops" => RoleTemplate {
             id: "devops".into(),
@@ -170,6 +175,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🚀".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "管构建、部署与 CI/CD 流水线；发布运维类任务派它".into(),
         },
         "security" => RoleTemplate {
             id: "security".into(),
@@ -183,6 +189,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🛡️".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "安全审计：查漏洞与合规风险；涉及鉴权或数据时派它".into(),
         },
         "designer" => RoleTemplate {
             id: "designer".into(),
@@ -196,6 +203,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🎨".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "设计 UI/UX 与交互方案；界面和体验类任务派它".into(),
         },
         "tech_writer" => RoleTemplate {
             id: "tech_writer".into(),
@@ -209,6 +217,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "📝".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "写文档：README、API 说明与使用指南".into(),
         },
         "manager" => RoleTemplate {
             id: "manager".into(),
@@ -222,6 +231,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "👔".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "调度分工：拆任务、委派角色、盯交付物收敛".into(),
         },
         "mcp_agent" => RoleTemplate {
             id: "mcp_agent".into(),
@@ -235,6 +245,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🔌".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "通过 MCP 调用外部工具与服务的执行角色".into(),
         },
         "advisor" => RoleTemplate {
             id: "advisor".into(),
@@ -248,6 +259,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             icon: "🦉".into(),
             skills: vec![],
             code_paths: vec![],
+            description: "资深终审：复核方案与交付物，给放行或打回结论".into(),
         },
         _ => return None,
     })

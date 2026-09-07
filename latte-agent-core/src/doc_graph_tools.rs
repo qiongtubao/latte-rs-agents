@@ -299,7 +299,7 @@ fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
     minimum: None,
     maximum: None,
     min_length: None,
-    max_length: None, items: None, properties: None, required: None, additional_properties: None }
+    max_length: None, items: None, properties: None, required: None, additional_properties: None, ref_: None }
 }
 
 fn tool_err(msg: String) -> latte_rs_agent_tools::error::ToolError {

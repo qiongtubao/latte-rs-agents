@@ -1,6 +1,7 @@
 [roles.tech_writer_manual]
 id = "tech_writer_manual"
 name = "User Manual Writer"
+description = "用户手册作者：产品使用指南、快速入门教程与故障排除指南"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

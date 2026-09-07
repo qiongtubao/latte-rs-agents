@@ -96,8 +96,16 @@ fn path_for(cwd: &Path, choice_id: &str) -> Option<PathBuf> {
 /// 两类记录语义（阻塞 ask 走 [`persist`]，非阻塞弹框走
 /// [`persist_prompt`]），而 `deliver_choice_answer` 会先销账非阻塞
 /// 那份、再读阻塞那份 —— 共用文件名会让前一步把后一步要读的记录删掉。
-fn path_for_prompt(cwd: &Path, choice_id: &str) -> Option<PathBuf> {
-    safe_id(choice_id).then(|| dir(cwd).join(format!("{choice_id}.prompt.json")))
+///
+/// 文件名带 `session_id`：`choice_id` 只是「角色 + 序号」（如
+/// `plan-manager-0`），同一 cwd 下两个 session（两个 UI 会话、或 UI +
+/// CLI 各跑一个 manager）会撞出同一个 id。不带 sid 时后写覆盖先写，
+/// 被覆盖的那个 session 在进程重启后永远找不回自己的待办弹框（实测：
+/// jemalloc 仓 UI 会话与 CLI 会话并发，双方的 `plan-manager-0` 互相
+/// 踩掉盘上记录）。
+fn path_for_prompt(cwd: &Path, choice_id: &str, session_id: &str) -> Option<PathBuf> {
+    (safe_id(choice_id) && safe_id(session_id))
+        .then(|| dir(cwd).join(format!("{choice_id}.{session_id}.prompt.json")))
 }
 
 /// 落盘一条挂起记录。**在广播弹框之前调用**（同
@@ -151,7 +159,7 @@ pub fn persist_prompt(cwd: &Path, choice_id: &str, session_id: &str, event_json:
     if session_id.is_empty() {
         return;
     }
-    let Some(path) = path_for_prompt(cwd, choice_id) else {
+    let Some(path) = path_for_prompt(cwd, choice_id, session_id) else {
         tracing::warn!(choice_id, "非阻塞弹框 id 不合法，跳过落盘");
         return;
     };
@@ -219,9 +227,27 @@ pub fn remove_for_session(cwd: &Path, session_id: &str) {
 ///
 /// 与 [`remove`] 分开：两者文件名不同（见 [`path_for_prompt`]），
 /// 混用会误删另一类记录。
+///
+/// 销账按 `choice_id` 抹掉**全部** session 变体：内存表
+/// [`crate::choice::PROMPTS`] 本来就是按 choice_id 全局销账的（同 id
+/// 只保留一份快照），盘上保持一致；旧版二进制留下的无 sid 文件名
+/// （`{choice_id}.prompt.json`）一并清掉，免得重启后冒出僵尸弹框。
 pub fn remove_prompt(cwd: &Path, choice_id: &str) {
-    if let Some(path) = path_for_prompt(cwd, choice_id) {
-        let _ = std::fs::remove_file(path);
+    if !safe_id(choice_id) {
+        return;
+    }
+    // 旧版无 sid 文件名。
+    let _ = std::fs::remove_file(dir(cwd).join(format!("{choice_id}.prompt.json")));
+    // 新版带 sid 文件名：抹掉该 choice_id 的全部 session 变体。
+    let prefix = format!("{choice_id}.");
+    if let Ok(rd) = std::fs::read_dir(dir(cwd)) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && name.ends_with(".prompt.json") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 
@@ -400,6 +426,59 @@ mod tests {
         assert_eq!(load_for_session(cwd, "sess-a").len(), 1);
         assert_eq!(load_for_session(cwd, "sess-b").len(), 1);
         assert!(load_for_session(cwd, "sess-c").is_empty());
+    }
+
+    /// 实测事故回归（jemalloc 仓）：UI 会话与 CLI 会话在同一 cwd 并发，
+    /// 双方 manager 都生成 `plan-manager-0` —— choice_id 只是「角色 +
+    /// 序号」，撞 id 是常态。文件名不带 session_id 时后写覆盖先写，被
+    /// 覆盖的 session 重启后永远找不回自己的待办弹框。
+    #[test]
+    fn prompt_same_choice_id_coexists_across_sessions() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed","n":1}"#);
+        persist_prompt(cwd, "plan-manager-0", "sess-b", r#"{"type":"PlanProposed","n":2}"#);
+
+        let a = load_for_session(cwd, "sess-a");
+        let b = load_for_session(cwd, "sess-b");
+        assert_eq!(a.len(), 1, "sess-a 的快照不能被 sess-b 覆盖");
+        assert_eq!(b.len(), 1, "sess-b 的快照不能被 sess-a 覆盖");
+        assert_eq!(a[0].event_json, r#"{"type":"PlanProposed","n":1}"#);
+        assert_eq!(b[0].event_json, r#"{"type":"PlanProposed","n":2}"#);
+
+        // 销账按 choice_id 抹掉全部变体（与内存表 PROMPTS 的全局销账
+        // 语义一致），双方的记录都不再补发。
+        remove_prompt(cwd, "plan-manager-0");
+        assert!(load_for_session(cwd, "sess-a").is_empty());
+        assert!(load_for_session(cwd, "sess-b").is_empty());
+    }
+
+    /// 旧版二进制留下的无 sid 文件名（`{choice_id}.prompt.json`）也要
+    /// 能读回、并在销账时清掉——否则升级前的记录在重启后变僵尸弹框。
+    #[test]
+    fn legacy_prompt_filename_is_replayed_and_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = d.path();
+        let rec = PendingAsk {
+            choice_id: "plan-manager-0".into(),
+            session_id: "sess-a".into(),
+            wf_id: String::new(),
+            role_id: String::new(),
+            question: String::new(),
+            event_json: r#"{"type":"PlanProposed"}"#.into(),
+            created_at: now_secs(),
+        };
+        let legacy = cwd
+            .join(".latte")
+            .join("pending-asks")
+            .join("plan-manager-0.prompt.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&rec).unwrap()).unwrap();
+
+        assert_eq!(load_for_session(cwd, "sess-a").len(), 1, "旧文件名仍应可读回");
+        remove_prompt(cwd, "plan-manager-0");
+        assert!(!legacy.exists(), "销账必须清掉旧文件名");
+        assert!(load_for_session(cwd, "sess-a").is_empty());
     }
 
     /// 销账后不再补发（用户已处理 → 下次刷新不该又冒出来）。

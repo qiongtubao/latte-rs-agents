@@ -99,7 +99,8 @@ pub struct Task {
     /// 旧文件缺省 → None（兼容），未填时派发走普通 manager 会话。
     #[serde(default)]
     pub task_type: Option<String>,
-    /// 最多一层嵌套：父任务不允许再有 `parent_id`。
+    /// 任意深度任务树：`parent_id` 指向上级任务；校验只要求 parent
+    /// 存在且无环（新 parent 不能是本任务自身或其后代）。
     #[serde(default)]
     pub parent_id: Option<String>,
     #[serde(default)]
@@ -216,11 +217,11 @@ pub struct TaskView {
     pub task: Task,
     /// 派发时实际生效的 workflow（显式 workflow 优先，否则按 task_type 默认推导；None=走 manager）。
     pub effective_workflow: Option<String>,
-    /// 子任务总数（非子任务本身也有，恒 0）。
+    /// 后代任务总数（整棵子树递归统计，非仅直接子任务；无后代恒 0）。
     pub sub_total: usize,
-    /// 子任务中已终态（done/cancelled）的数量。
+    /// 后代中已终态（done/cancelled）的数量。
     pub sub_done: usize,
-    /// 子任务各状态计数。
+    /// 后代各状态计数（后代聚合）。
     pub sub_state_counts: BTreeMap<String, usize>,
     pub actions: Vec<&'static str>,
 }
@@ -328,6 +329,59 @@ impl TaskStore {
         out
     }
 
+    /// 沿 parent 链爬到根任务 id（无 parent 即自身）。visited 集合
+    /// 兜底：既有数据异常成环时返回环入口，不死循环。
+    pub fn root_of(&self, id: &str) -> String {
+        let mut cur = id.to_string();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(cur.clone());
+        while let Some(pid) = self.tasks.get(&cur).and_then(|t| t.parent_id.clone()) {
+            if !visited.insert(pid.clone()) {
+                break;
+            }
+            cur = pid;
+        }
+        cur
+    }
+
+    /// 全部后代 id（BFS：按层级再按 sub_order 展开，结果稳定）。
+    /// visited 集合兜底防环。
+    pub fn descendants_of(&self, id: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(id.to_string());
+        let mut queue: std::collections::VecDeque<String> =
+            std::collections::VecDeque::from([id.to_string()]);
+        while let Some(cur) = queue.pop_front() {
+            for c in self.children_of(&cur) {
+                if visited.insert(c.id.clone()) {
+                    out.push(c.id.clone());
+                    queue.push_back(c.id);
+                }
+            }
+        }
+        out
+    }
+
+    /// 无环校验：把 `child_id` 挂到 `parent_id` 下是否会成环——沿
+    /// parent 链上爬，命中 `child_id` 即成环（新 parent 是本任务自身
+    /// 或其后代）。visited 集合兜底：既有数据异常成环时终止上爬而不
+    /// 死循环（此时放行，新边本身不加剧异常）。
+    fn check_no_cycle(&self, child_id: &str, parent_id: &str) -> Result<(), String> {
+        let mut visited = std::collections::HashSet::new();
+        let mut cur = Some(parent_id.to_string());
+        while let Some(pid) = cur {
+            if pid == child_id {
+                return Err(format!("parent_id {pid:?} 会形成环（是本任务自身或其后代）"));
+            }
+            if !visited.insert(pid.clone()) {
+                break;
+            }
+            cur = self.tasks.get(&pid).and_then(|t| t.parent_id.clone());
+        }
+        Ok(())
+    }
+
     /// 到期排期任务：`state == "todo" && scheduled_at <= now`。
     pub fn due_task_ids(&self, now: i64) -> Vec<String> {
         let mut out: Vec<String> = self
@@ -374,18 +428,17 @@ impl TaskStore {
                 Some(tt.to_string())
             }
         };
-        // 父子规则（§3.3，最多一层）。
+        // 父子规则（§3.3，任意深度任务树）：parent 必须存在且无环
+        // （新 parent 链上爬不得回到新任务自身；新任务尚无后代，环
+        // 只会来自异常数据，visited 集合兜底防死循环）。
+        let id = format!("{}-{}", self.meta.id_prefix, self.meta.next_seq);
         if let Some(pid) = &parent_id {
-            let parent = self
-                .tasks
-                .get(pid)
-                .ok_or_else(|| format!("parent_id {pid:?} 不存在"))?;
-            if parent.parent_id.is_some() {
-                return Err(format!("最多一层嵌套：{pid} 本身已是子任务"));
+            if !self.tasks.contains_key(pid) {
+                return Err(format!("parent_id {pid:?} 不存在"));
             }
+            self.check_no_cycle(&id, pid)?;
         }
         let now = now_ms();
-        let id = format!("{}-{}", self.meta.id_prefix, self.meta.next_seq);
         self.meta.next_seq += 1;
         let sub_order = parent_id
             .as_ref()
@@ -499,27 +552,25 @@ impl TaskStore {
     }
 
     /// 给已有任务设置 parent 时的校验（v1 的 update 不改 parent，仅
-    /// 备后续用）：parent 必须存在且本身无 parent；本任务不能有子任务。
+    /// 备后续用）：parent 必须存在，且无环（新 parent 不能是本任务
+    /// 自身或其后代）。任意深度任务树允许带着子树整体移动。
     pub fn validate_reparent(&self, id: &str, parent_id: &str) -> Result<(), String> {
-        let parent = self
-            .tasks
-            .get(parent_id)
-            .ok_or_else(|| format!("parent_id {parent_id:?} 不存在"))?;
-        if parent.parent_id.is_some() {
-            return Err(format!("最多一层嵌套：{parent_id} 本身已是子任务"));
+        if !self.tasks.contains_key(parent_id) {
+            return Err(format!("parent_id {parent_id:?} 不存在"));
         }
-        if !self.children_of(id).is_empty() {
-            return Err("该任务已有子任务，不能再挂到父任务下".to_string());
-        }
-        Ok(())
+        self.check_no_cycle(id, parent_id)
     }
 
-    /// 组装 TaskView（含子任务聚合）。
+    /// 组装 TaskView（含后代聚合：sub_* 递归统计整棵子树的全部后代，
+    /// 不只直接子任务）。
     pub fn view(&self, task: &Task) -> TaskView {
-        let children = self.children_of(&task.id);
+        let descendants = self.descendants_of(&task.id);
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut done = 0;
-        for c in &children {
+        for did in &descendants {
+            let Some(c) = self.tasks.get(did) else {
+                continue;
+            };
             *counts.entry(c.state.clone()).or_insert(0) += 1;
             if TERMINAL_STATES.contains(&c.state.as_str()) {
                 done += 1;
@@ -533,7 +584,7 @@ impl TaskStore {
             effective_workflow: effective,
             actions: task.effective_actions(),
             task: task.clone(),
-            sub_total: children.len(),
+            sub_total: descendants.len(),
             sub_done: done,
             sub_state_counts: counts,
         }
@@ -644,9 +695,9 @@ pub struct ImportTasksRequest {
     /// `PendingApproval` 置为 `Approved`，解除实现类 delegate 拦截。
     #[serde(default)]
     pub plan_id: Option<String>,
-    /// 父任务指定：拆分导入时全部任务作为该父任务的子任务创建（父
-    /// 任务必须是根任务；带 parent_id 的导入不支持 item 再嵌套
-    /// subtasks）。三态：非空串 = 显式指定；空串 = 显式「无父任务」
+    /// 父任务指定：拆分导入时全部任务作为该父任务的子任务创建（任意
+    /// 深度任务树：父任务本身也可以是子任务，item 的 subtasks 也可
+    /// 继续嵌套）。三态：非空串 = 显式指定；空串 = 显式「无父任务」
     /// （覆盖 session_id 解析，防止误挂）；缺省 = 按 session_id 查
     /// 拆分会话映射（refine 登记）。
     #[serde(default)]
@@ -657,7 +708,7 @@ pub struct ImportTasksRequest {
     pub session_id: Option<String>,
 }
 
-/// 导入的单个任务：除 `title` 外全部可选；`subtasks` 最多一层。
+/// 导入的单个任务：除 `title` 外全部可选；`subtasks` 可任意深度嵌套。
 #[derive(Deserialize, Clone)]
 pub struct ImportTask {
     pub title: String,
@@ -774,17 +825,20 @@ fn validate_workflow_name(cwd: &Path, name: Option<&str>) -> Result<(), ApiError
     Ok(())
 }
 
-/// 导入单个任务（含一层子任务）的校验 + 落库。返回新建 id（父先于子）。
-/// workflow 引用不存在时，静默降级为 null（不阻塞导入）。
-/// `parent_id` 非空时任务作为该父任务的子任务创建（拆分导入），
-/// 此时 item 不得再嵌套 subtasks（只能一层父子）。
-fn import_one(
-    store: &mut TaskStore,
+/// import item 的公共校验 + 字段解析（`import_one` 递归每层复用）：
+/// title 去空白（空 → 报错）并截断到 80 字符；priority 必须在 1-4；
+/// task_type / workflow 非空时必须已知。返回
+/// (title, priority, task_type, workflow)。
+///
+/// workflow 引用必须存在：静默降级会让任务丢掉绑定的流程而无人
+/// 察觉——拒绝并报错，让提交方（manager/用户）修正后重试。
+/// 空串/空白 = 不绑定：plan 工具约定「没有贴合的必须留空」，产出
+/// 就是 workflow: ""，不能当成 workflow 名去校验（实测现场：
+/// 6 个任务全部 workflow:"" 导入被 400 整单拒绝）。
+fn prepare_import_fields(
     cwd: &Path,
     item: &ImportTask,
-    parent_id: Option<&str>,
-    created: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(String, i64, Option<String>, Option<String>), String> {
     let title = item.title.trim();
     if title.is_empty() {
         return Err("title 不能为空".to_string());
@@ -796,17 +850,6 @@ fn import_one(
             return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
         }
     }
-    if item.subtasks.iter().any(|s| !s.subtasks.is_empty()) {
-        return Err("subtasks nested deeper than one level".to_string());
-    }
-    if parent_id.is_some() && !item.subtasks.is_empty() {
-        return Err("拆分导入（带 parent_id）不支持再嵌套 subtasks".to_string());
-    }
-    // workflow 引用必须存在：静默降级会让任务丢掉绑定的流程而无人
-    // 察觉——拒绝并报错，让提交方（manager/用户）修正后重试。
-    // 空串/空白 = 不绑定：plan 工具约定「没有贴合的必须留空」，产出
-    // 就是 workflow: ""，不能当成 workflow 名去校验（实测现场：
-    // 6 个任务全部 workflow:"" 导入被 400 整单拒绝）。
     let workflow = match item.workflow.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(wf) if !crate::workflows::exists(cwd, wf) => {
@@ -824,66 +867,38 @@ fn import_one(
             Some(tt.to_string())
         }
     };
-    let parent = store.create(
+    Ok((title, item.priority.unwrap_or(3), task_type, workflow))
+}
+
+/// 导入单个任务（`subtasks` 可任意深度嵌套）的校验 + 落库：递归
+/// 创建，返回新建 id（父先于子，深度优先）。`parent_id` 非空时任务
+/// 作为该父任务的子任务创建（拆分导入）。
+fn import_one(
+    store: &mut TaskStore,
+    cwd: &Path,
+    item: &ImportTask,
+    parent_id: Option<&str>,
+    created: &mut Vec<String>,
+) -> Result<(), String> {
+    let (title, priority, task_type, workflow) = prepare_import_fields(cwd, item)?;
+    let task = store.create(
         &title,
         &item.description,
-        item.priority.unwrap_or(3),
+        priority,
         item.labels.clone(),
-        task_type.clone(),
+        task_type,
         parent_id.map(str::to_string),
         None,
-        workflow.clone(),
+        workflow,
         "import",
     )?;
     if !item.paths.is_empty() {
-        store.get_mut(&parent.id).expect("刚创建").paths = item.paths.clone();
-        store.persist(&parent.id)?;
+        store.get_mut(&task.id).expect("刚创建").paths = item.paths.clone();
+        store.persist(&task.id)?;
     }
-    created.push(parent.id.clone());
+    created.push(task.id.clone());
     for sub in &item.subtasks {
-        let stitle = sub.title.trim();
-        if stitle.is_empty() {
-            return Err(format!("子任务 title 不能为空（父任务 '{title}'）"));
-        }
-        let stitle: String = stitle.chars().take(80).collect();
-        if let Some(p) = sub.priority {
-            if !(1..=4).contains(&p) {
-                return Err(format!("priority 必须在 1-4 之间，收到 {p}"));
-            }
-        }
-        if let Some(tt) = sub.task_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let reg = crate::task_types::TaskTypeRegistry::load(cwd);
-            if !reg.is_known(tt) {
-                return Err(format!("unknown task_type '{tt}'（子任务 '{stitle}'）"));
-            }
-        }
-        let sub_task_type = sub.task_type.as_deref().map(str::trim).and_then(|tt| {
-            if tt.is_empty() { None } else { Some(tt.to_string()) }
-        });
-        // 子任务 workflow 引用不存在时同样降级；空串/空白 = 不绑定。
-        let sub_workflow = sub.workflow.as_deref().map(str::trim).and_then(|wf| {
-            if !wf.is_empty() && crate::workflows::exists(cwd, wf) {
-                Some(wf.to_string())
-            } else {
-                None
-            }
-        });
-        let child = store.create(
-            &stitle,
-            &sub.description,
-            sub.priority.unwrap_or(3),
-            sub.labels.clone(),
-            sub_task_type,
-            Some(parent.id.clone()),
-            None,
-            sub_workflow,
-            "import",
-        )?;
-        if !sub.paths.is_empty() {
-            store.get_mut(&child.id).expect("刚创建").paths = sub.paths.clone();
-            store.persist(&child.id)?;
-        }
-        created.push(child.id.clone());
+        import_one(store, cwd, sub, Some(&task.id), created)?;
     }
     Ok(())
 }
@@ -895,14 +910,11 @@ fn import_tasks_into(
     cwd: &Path,
     req: &ImportTasksRequest,
 ) -> Result<Vec<String>, String> {
-    // 拆分导入：父任务必须存在且是根任务（子任务不能再有子任务）。
+    // 拆分导入：父任务必须存在（任意深度任务树——父任务本身也可以是
+    // 子任务，item 的 subtasks 也可继续嵌套）。
     if let Some(pid) = req.parent_id.as_deref() {
-        match store.get(pid) {
-            None => return Err(format!("父任务 {pid:?} 不存在")),
-            Some(p) if p.parent_id.is_some() => {
-                return Err(format!("父任务 {pid:?} 本身是子任务，不能再拆"))
-            }
-            _ => {}
+        if store.get(pid).is_none() {
+            return Err(format!("父任务 {pid:?} 不存在"));
         }
     }
     let mut created: Vec<String> = Vec::new();
@@ -1595,8 +1607,8 @@ pub struct RefineTaskResponse {
 /// 清单），用户在该 session 的弹窗里勾选导入。**不改变任务状态、不
 /// 记 run**——拆分是规划动作不是执行，任务留在原状态等子任务导入。
 ///
-/// 只拆根任务（子任务不能再嵌套）；执行中（in_progress/merging）的
-/// 任务不可拆。
+/// 任意层级的任务都可再拆（任务树深度不限）；执行中（in_progress/
+/// merging）的任务不可拆。
 pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, ApiError> {
     // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
     let (title, description) = {
@@ -1604,11 +1616,6 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
         let t = store
             .get(id)
             .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
-        if t.parent_id.is_some() {
-            return Err(ApiError::bad_request(format!(
-                "task {id:?} 本身是子任务，不能再拆（只支持一层父子）"
-            )));
-        }
         if t.state == "in_progress" || t.state == "merging" {
             return Err(ApiError::bad_request(format!(
                 "state {:?} 不可拆分（执行中的任务请先中止）",
@@ -1914,52 +1921,81 @@ fn verdict_is_reject(summary: &str) -> bool {
     summary.chars().take(200).collect::<String>().contains('❌')
 }
 
-/// 状态变更后的家族联动：子任务全部 done → 父任务自动 done
-/// （actor=workflow，附说明）。有子任务 cancelled 或仍非 done → 不动，
-/// 由人决定。父子最多一层嵌套，不会递归。
+/// 状态变更后的家族联动：直接子任务全部 done → 父任务自动 done
+/// （actor=workflow，附说明），然后继续向上冒泡——祖父的直接子任务
+/// （含刚收尾的父）若也全部 done，祖父同样收尾，递归直到根。任一层
+/// 有子任务 cancelled 或仍非 done → 停在该层，由人决定。
 fn maybe_complete_parent(store: &mut TaskStore, child: &Task, now: i64) {
-    let Some(parent_id) = child.parent_id.clone() else {
-        return;
-    };
-    let children = store.children_of(&parent_id);
-    if children.is_empty() || !children.iter().all(|c| c.state == "done") {
-        return;
-    }
-    if let Some(p) = store.get_mut(&parent_id) {
-        if p.state != "done" {
-            p.set_state("done", "workflow", Some("全部子任务已完成".into()), now);
-            p.updated_at = now;
+    let mut cur = child.parent_id.clone();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent_id) = cur {
+        if !visited.insert(parent_id.clone()) {
+            break; // 数据异常成环兜底
+        }
+        let children = store.children_of(&parent_id);
+        if children.is_empty() || !children.iter().all(|c| c.state == "done") {
+            return;
+        }
+        let (changed, next) = {
+            let Some(p) = store.get_mut(&parent_id) else {
+                return;
+            };
+            let changed = p.state != "done";
+            if changed {
+                p.set_state("done", "workflow", Some("全部子任务已完成".into()), now);
+            }
+            (changed, p.parent_id.clone())
+        };
+        if changed {
             if let Err(e) = store.persist(&parent_id) {
                 eprintln!("[tasks] persist parent {parent_id}: {e}");
             }
         }
+        cur = next;
     }
 }
 
-/// 同家族互斥检查：plan 拆出的兄弟任务常改同一批文件，并行执行会
-/// 互相覆盖。家族 = 父任务 + 其全部子任务。返回冲突中的 in_progress
-/// 任务 id（无冲突 → None）。
-///
-/// 例外：**容器父任务**（有子任务、自己不跑 workflow，只作为“子任务全
-/// 完成即完成”的聚合节点）处于 in_progress 时，**不阻塞它自己的子任务**
-/// 派发——否则子任务永远无法开跑（见 [`dispatch_task`] 的容器分流）。
-/// 兄弟之间、以及在跑的子任务反过来阻塞父任务被当叶子派发，仍然有效。
-fn family_running_conflict(store: &TaskStore, id: &str) -> Option<String> {
-    let t = store.get(id)?;
-    match &t.parent_id {
-        // 派发的是子任务：只被在跑的**兄弟**阻塞；父任务作为容器在跑不算冲突。
-        Some(pid) => store
-            .children_of(pid)
-            .into_iter()
-            .map(|c| c.id)
-            .find(|cid| cid != id && store.get(cid).map(|c| c.state == "in_progress").unwrap_or(false)),
-        // 派发的是父任务：任一子任务在跑都算冲突（父不该被当叶子重复派发）。
-        None => store
-            .children_of(id)
-            .into_iter()
-            .map(|c| c.id)
-            .find(|cid| store.get(cid).map(|c| c.state == "in_progress").unwrap_or(false)),
+/// `ancestor` 是否为 `id` 的祖先（沿 parent 链上爬，visited 防环兜底）。
+fn is_ancestor_of(store: &TaskStore, ancestor: &str, id: &str) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut cur = store.get(id).and_then(|t| t.parent_id.clone());
+    while let Some(pid) = cur {
+        if pid == ancestor {
+            return true;
+        }
+        if !visited.insert(pid.clone()) {
+            break;
+        }
+        cur = store.get(&pid).and_then(|t| t.parent_id.clone());
     }
+    false
+}
+
+/// 同家族互斥检查：同树拆出的任务常改同一批文件，并行执行会
+/// 互相覆盖。家族 = 同一根任务（[`TaskStore::root_of`]）下的整棵
+/// 任务树（任意深度）。返回树内冲突中的 in_progress 任务 id
+/// （无冲突 → None）。
+///
+/// 例外：**容器祖先**（被派发任务的祖先节点，作为“子任务全完成即
+/// 完成”的聚合节点）处于 in_progress 时，**不阻塞其后代**派发——
+/// 否则子任务永远无法开跑（见 [`dispatch_task`] 的容器分流）。
+/// 同树其他分支、以及后代在跑反过来阻塞祖先被当叶子派发，仍然有效。
+fn family_running_conflict(store: &TaskStore, id: &str) -> Option<String> {
+    store.get(id)?;
+    let root = store.root_of(id);
+    std::iter::once(root.clone())
+        .chain(store.descendants_of(&root))
+        .filter(|oid| oid != id)
+        .find(|oid| {
+            let Some(o) = store.get(oid) else {
+                return false;
+            };
+            if o.state != "in_progress" {
+                return false;
+            }
+            // 容器祖先在跑只是聚合标记，不阻塞后代派发。
+            !is_ancestor_of(store, oid, id)
+        })
 }
 
 /// 任务是否为“容器”：有子任务，且至少一个子任务尚未进入终态
@@ -2209,7 +2245,7 @@ pub async fn abort_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
 
     // 2. 容器父任务：中止 = 逐个中止在跑的子任务（它们才是真正的执行
     //    单元）。子任务中止失败不阻塞父任务回退——否则父任务又卡住了。
-    //    父子最多一层嵌套（见 [`maybe_complete_parent`]），递归不会深。
+    //    任务树任意深度：abort_task 自身递归处理在跑子任务的子树。
     for cid in &running_children {
         if let Err(e) = Box::pin(abort_task(b, cid)).await {
             eprintln!(
@@ -2780,25 +2816,61 @@ mod tests {
             .create("孤儿", "", 3, vec![], None, Some("LAT-999".into()), None, None, "user")
             .unwrap_err();
         assert!(err.contains("不存在"), "{err}");
-        // 拒绝第二层嵌套：parent_id 指向本身也是子任务的任务。
-        let err = store
+        // 任意深度任务树：三层（父→子→孙）可以建。
+        let grandchild = store
             .create("孙", "", 3, vec![], None, Some(child.id.clone()), None, None, "user")
-            .unwrap_err();
-        assert!(err.contains("最多一层"), "{err}");
-        // 拒绝给已有子任务的任务设 parent。
-        let other = make_task(&mut store, "另一个父");
-        let err = store.validate_reparent(&parent.id, &other.id);
-        assert!(err.is_err(), "已有子任务的任务不能再设 parent: {err:?}");
+            .expect("第三层（孙）应可创建");
+        assert_eq!(grandchild.parent_id.as_deref(), Some(child.id.as_str()));
+        assert_eq!(store.root_of(&grandchild.id), parent.id);
+        assert_eq!(
+            store.descendants_of(&parent.id),
+            vec![child.id.clone(), grandchild.id.clone()],
+            "后代 BFS：子先于孙"
+        );
         // sub_order 递增。
         let child2 = store
             .create("子2", "", 3, vec![], None, Some(parent.id.clone()), None, None, "user")
             .expect("child2");
         assert_eq!(child2.sub_order, 1);
-        // 聚合。
+        // 后代聚合（递归统计整棵子树：子×2 + 孙×1）。
         let view = store.view(store.get(&parent.id).unwrap());
-        assert_eq!(view.sub_total, 2);
-        assert_eq!(view.sub_state_counts.get("backlog"), Some(&2));
+        assert_eq!(view.sub_total, 3);
+        assert_eq!(view.sub_state_counts.get("backlog"), Some(&3));
         assert_eq!(view.sub_done, 0);
+    }
+
+    /// 环检测两路：validate_reparent 拒绝挂到自身/后代下；
+    /// create 在既有数据异常成环时靠 visited 兜底不死循环。
+    #[test]
+    fn reparent_cycle_rejected_and_create_survives_corrupt_cycle() {
+        let (_dir, mut store) = tmp_store();
+        let a = make_task(&mut store, "A");
+        let b = store
+            .create("B", "", 3, vec![], None, Some(a.id.clone()), None, None, "user")
+            .expect("B");
+        let c = store
+            .create("C", "", 3, vec![], None, Some(b.id.clone()), None, None, "user")
+            .expect("C");
+        // 挂到自身或后代之下 → 成环，拒绝。
+        let err = store.validate_reparent(&a.id, &a.id).unwrap_err();
+        assert!(err.contains("环"), "{err}");
+        let err = store.validate_reparent(&a.id, &c.id).unwrap_err();
+        assert!(err.contains("环"), "{err}");
+        // 反向（后代挂到祖先下）合法；带子树移动也合法（B 有子任务 C）。
+        assert!(store.validate_reparent(&c.id, &a.id).is_ok());
+        assert!(store.validate_reparent(&b.id, &a.id).is_ok());
+        // 新任务 id 不会出现在任何已有链上，create 天然无环。
+        let d = store
+            .create("D", "", 3, vec![], None, Some(c.id.clone()), None, None, "user")
+            .expect("深层创建");
+        assert_eq!(store.root_of(&d.id), a.id);
+        // 数据异常兜底：人为造成环（A↔B）后 create / root_of 不死循环。
+        store.get_mut(&a.id).unwrap().parent_id = Some(b.id.clone());
+        let e = store
+            .create("E", "", 3, vec![], None, Some(a.id.clone()), None, None, "user")
+            .expect("环数据下 create 应靠 visited 兜底正常返回");
+        assert_eq!(e.parent_id.as_deref(), Some(a.id.as_str()));
+        let _ = store.root_of(&a.id);
     }
 
     #[test]
@@ -2992,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn import_rejects_two_level_nesting() {
+    fn import_accepts_deep_nesting() {
         let (dir, mut store) = tmp_store();
         let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
             "tasks": [{
@@ -3001,11 +3073,14 @@ mod tests {
             }]
         }))
         .expect("parse");
-        let err = import_tasks_into(&mut store, dir.path(), &req).unwrap_err();
-        assert!(
-            err.contains("subtasks nested deeper than one level"),
-            "{err}"
-        );
+        let created = import_tasks_into(&mut store, dir.path(), &req)
+            .expect("任意深度嵌套应导入成功");
+        assert_eq!(created, vec!["LAT-100", "LAT-101", "LAT-102"], "父先于子，深度优先");
+        let child = store.get("LAT-101").expect("child");
+        let grandchild = store.get("LAT-102").expect("grandchild");
+        assert_eq!(child.parent_id.as_deref(), Some("LAT-100"));
+        assert_eq!(grandchild.parent_id.as_deref(), Some("LAT-101"));
+        assert_eq!(store.root_of("LAT-102"), "LAT-100");
     }
 
     #[test]
@@ -3214,6 +3289,130 @@ mod tests {
             .unwrap()
             .set_state("in_progress", "user", None, now_ms());
         assert_eq!(family_running_conflict(&store, &p.id).as_deref(), Some(c1.id.as_str()));
+    }
+
+    /// 跨层（根与孙）冲突：家族 = 同一 root 的整棵任务树。
+    #[test]
+    fn family_conflict_spans_whole_tree() {
+        let (_dir, mut store) = tmp_store();
+        let root = make_task(&mut store, "根");
+        let a = make_child(&mut store, &root, "A");
+        let b = make_child(&mut store, &root, "B");
+        let g = make_child(&mut store, &a, "孙G");
+        // 孙在跑 → 根不能当叶子重复派发（跨层冲突）。
+        store
+            .get_mut(&g.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert_eq!(
+            family_running_conflict(&store, &root.id).as_deref(),
+            Some(g.id.as_str()),
+            "孙在跑应阻塞根被当叶子派发"
+        );
+        // 同树跨分支：叔伯 B 在跑 → 阻塞孙 G。
+        store
+            .get_mut(&g.id)
+            .unwrap()
+            .set_state("todo", "user", None, now_ms());
+        store
+            .get_mut(&b.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert_eq!(
+            family_running_conflict(&store, &g.id).as_deref(),
+            Some(b.id.as_str()),
+            "同树跨分支在跑应算冲突"
+        );
+        // 但容器祖先（根/A）在跑只是聚合标记，不阻塞后代派发。
+        store
+            .get_mut(&b.id)
+            .unwrap()
+            .set_state("todo", "user", None, now_ms());
+        store
+            .get_mut(&root.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        store
+            .get_mut(&a.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert!(
+            family_running_conflict(&store, &g.id).is_none(),
+            "容器祖先在跑不应阻塞后代"
+        );
+    }
+
+    /// maybe_complete_parent 多层冒泡：叶全 done → 中层 done → 根 done。
+    #[test]
+    fn maybe_complete_parent_bubbles_up_to_root() {
+        let (_dir, mut store) = tmp_store();
+        let root = make_task(&mut store, "根");
+        let mid = make_child(&mut store, &root, "中");
+        let leaf1 = make_child(&mut store, &mid, "叶1");
+        let leaf2 = make_child(&mut store, &mid, "叶2");
+        let now = now_ms();
+        for l in [&leaf1, &leaf2] {
+            store
+                .get_mut(&l.id)
+                .unwrap()
+                .set_state("done", "user", None, now);
+            let snap = store.get(&l.id).unwrap().clone();
+            maybe_complete_parent(&mut store, &snap, now);
+        }
+        assert_eq!(store.get(&mid.id).unwrap().state, "done", "叶全 done → 中层收尾");
+        assert_eq!(store.get(&root.id).unwrap().state, "done", "应冒泡到根");
+    }
+
+    /// 冒泡停在未完成的层：根的另一支未完 → 中层收尾、根不动。
+    #[test]
+    fn maybe_complete_parent_stops_at_unfinished_level() {
+        let (_dir, mut store) = tmp_store();
+        let root = make_task(&mut store, "根");
+        let mid = make_child(&mut store, &root, "中");
+        let _other = make_child(&mut store, &root, "另一支");
+        let leaf = make_child(&mut store, &mid, "叶");
+        let now = now_ms();
+        store
+            .get_mut(&leaf.id)
+            .unwrap()
+            .set_state("done", "user", None, now);
+        let snap = store.get(&leaf.id).unwrap().clone();
+        maybe_complete_parent(&mut store, &snap, now);
+        assert_eq!(store.get(&mid.id).unwrap().state, "done");
+        assert_eq!(
+            store.get(&root.id).unwrap().state,
+            "backlog",
+            "另一支未完，根不得收尾"
+        );
+    }
+
+    /// view 递归聚合：sub_* 统计整棵子树的全部后代。
+    #[test]
+    fn view_aggregates_all_descendants() {
+        let (_dir, mut store) = tmp_store();
+        let root = make_task(&mut store, "根");
+        let a = make_child(&mut store, &root, "A");
+        let g1 = make_child(&mut store, &a, "孙1");
+        let _g2 = make_child(&mut store, &a, "孙2");
+        let now = now_ms();
+        store
+            .get_mut(&g1.id)
+            .unwrap()
+            .set_state("done", "user", None, now);
+        store
+            .get_mut(&a.id)
+            .unwrap()
+            .set_state("todo", "user", None, now);
+        let view = store.view(store.get(&root.id).unwrap());
+        assert_eq!(view.sub_total, 3, "根的后代 = A + 孙×2");
+        assert_eq!(view.sub_done, 1);
+        assert_eq!(view.sub_state_counts.get("done"), Some(&1));
+        assert_eq!(view.sub_state_counts.get("todo"), Some(&1));
+        assert_eq!(view.sub_state_counts.get("backlog"), Some(&1));
+        // 中间层只聚合自己的子树。
+        let view_a = store.view(store.get(&a.id).unwrap());
+        assert_eq!(view_a.sub_total, 2);
+        assert_eq!(view_a.sub_done, 1);
     }
 
     #[test]
@@ -3631,13 +3830,13 @@ mod tests {
         assert_eq!(t.parent_id, None, "显式空串 = 根任务，不得挂父");
     }
 
-    /// 拆分导入校验：父任务不存在 / 父任务本身是子任务 / item 再嵌套
-    /// subtasks，都整单 400。
+    /// 拆分导入校验：父任务必须存在；任意深度任务树下 item 可再嵌套
+    /// subtasks、父任务本身也可以是子任务。
     #[tokio::test]
     async fn import_with_parent_id_validates_parent_and_nesting() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = test_backend(&dir);
-        // 父任务不存在
+        // 父任务不存在 → 400
         let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
             "parent_id": "T-999",
             "tasks": [{ "title": "子甲" }]
@@ -3652,30 +3851,38 @@ mod tests {
             serde_json::from_value(serde_json::json!({"title": "父任务"})).expect("parse"),
         )
         .expect("create parent");
-        // item 再嵌套 subtasks（会变成两层父子）
+        // item 再嵌套 subtasks：任意深度任务树下合法。
         let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
             "parent_id": parent.task.id,
             "tasks": [{ "title": "子甲", "subtasks": [{ "title": "孙任务" }] }]
         }))
         .expect("parse req");
-        let err = import_tasks(&b, req).await.expect_err("嵌套 subtasks 应 400");
-        assert!(err.message.contains("subtasks"), "{}", err.message);
-
-        // 父任务本身是子任务：先给 parent 挂一个子任务，再拿子任务当父
-        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
-            "parent_id": parent.task.id,
-            "tasks": [{ "title": "子甲" }]
-        }))
-        .expect("parse req");
-        let resp = import_tasks(&b, req).await.expect("import");
+        let resp = import_tasks(&b, req).await.expect("嵌套 subtasks 应可导入");
+        assert_eq!(resp.created.len(), 2);
         let child_id = resp.created[0].clone();
+        {
+            let store = b.tasks.read();
+            assert_eq!(
+                store.get(&child_id).unwrap().parent_id.as_deref(),
+                Some(parent.task.id.as_str())
+            );
+            assert_eq!(
+                store.get(&resp.created[1]).unwrap().parent_id.as_deref(),
+                Some(child_id.as_str())
+            );
+        }
+        // 父任务本身也可以是子任务：拿刚导入的子任务当父继续导入。
         let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
             "parent_id": child_id,
-            "tasks": [{ "title": "孙任务" }]
+            "tasks": [{ "title": "曾孙任务" }]
         }))
         .expect("parse req");
-        let err = import_tasks(&b, req).await.expect_err("子任务不能再拆");
-        assert!(err.message.contains("不能再拆"), "{}", err.message);
+        let resp = import_tasks(&b, req).await.expect("子任务也可作为父任务");
+        let store = b.tasks.read();
+        assert_eq!(
+            store.get(&resp.created[0]).unwrap().parent_id.as_deref(),
+            Some(child_id.as_str())
+        );
     }
 
     /// 拆分子任务入口：建 session 跑 task_refine workflow，任务状态不变、
@@ -3717,10 +3924,19 @@ mod tests {
         );
     }
 
-    /// 拆分入口校验：子任务不能再拆；执行中的任务不可拆。
+    /// 拆分入口校验：任意层级任务都可再拆（子任务也能拆，任务树
+    /// 深度不限）；执行中（in_progress/merging）的任务不可拆。
     #[tokio::test]
-    async fn refine_task_rejects_subtask_and_running() {
+    async fn refine_task_allows_subtask_rejects_running() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // refine 依赖 task_refine workflow：写进项目 workflows.d。
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir workflows.d");
+        std::fs::write(
+            wf_dir.join("task_refine.toml"),
+            "name = \"task_refine\"\nmax_rounds = 1\n[[steps]]\nid = \"refine\"\nspeakers = [\"manager\"]\nprompt = \"拆分\"\n",
+        )
+        .expect("write workflow");
         let b = test_backend(&dir);
         let parent = create_task(
             &b,
@@ -3733,8 +3949,10 @@ mod tests {
                 .expect("parse"),
         )
         .expect("create");
-        let err = refine_task(&b, &child.task.id).await.expect_err("子任务不能再拆");
-        assert_eq!(err.status, 400);
+        // 子任务也可以再拆（任意深度任务树）。
+        let resp = refine_task(&b, &child.task.id).await.expect("子任务应可再拆");
+        assert!(!resp.session_id.is_empty());
+        // 执行中的任务不可拆。
         b.tasks
             .write()
             .get_mut(&parent.task.id)

@@ -1043,6 +1043,11 @@ fn classify_tool_execution_error(
         "第一级目录在仓库里不存在",
         "疑似幻觉路径",
         "tasks[",
+        // plan 工具的 workflow/task_type 名提交侧校验：同为确定性
+        // 输入错误（实测 2026-09 jemalloc 会话：task_type:"learning"
+        // 被同参数自动重试 2 次，错误才喂回模型）。
+        "unknown workflow",
+        "unknown task_type",
         // code_graph dependency preflight/query spawn failures are deterministic
         // until the local ast-grep installation changes. Retrying the same call
         // immediately only burns a tool round-trip.
@@ -1199,8 +1204,55 @@ fn failures_include_context_overflow(e: &AgentError) -> bool {
     }
 }
 
-/// 单条待发消息的文本上限（字符）。成功的工具结果原样回填、不设上限，
-/// 一旦因此撑爆模型上下文，恢复重试前靠它把超长消息裁成头部 + 标记。
+/// 回填给模型的**工具错误**详情上限（字节）。
+///
+/// 曾经是 256，且是纯截头。两个后果都实测到了：
+/// - `plan` 的 paths 冲突清单 5855 字 / 45 对被砍到只剩开头，模型看不全
+///   就修不动（代码里为此加了 `assert!(detail.len() <= 256)` 来迁就）；
+/// - `code_graph` 的 "可用 kind：…" 这类**修复指引在尾部**，正好被砍掉。
+///
+/// 截头之所以最坏：错误的「是什么」在头部，「怎么改」在尾部，砍尾等于
+/// 把唯一可操作的信息扔了，模型只能原样重试——一次白跑的模型往返比几 KB
+/// 上下文贵几个数量级。所以改成 2KB + 中段省略（见
+/// [`compact_middle_out`]），头尾都保住。
+const MAX_TOOL_ERROR_BYTES: usize = 2048;
+
+/// 中段省略式压缩：超限时保留头 60% + 尾 40%，中间换成一行标记。
+///
+/// 与"截断"的区别是**不丢两端**：错误的分类在头部、修复指引在尾部，
+/// 两头都得留。标记里带上省略字节数，模型知道自己看的是压缩过的。
+/// `max_bytes` 是压缩后正文的预算（标记本身不计入，它是常数级）。
+fn compact_middle_out(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let head_budget = max_bytes * 6 / 10;
+    let tail_budget = max_bytes - head_budget;
+    let head = crate::trace::utf8_safe_prefix(text, head_budget);
+    let tail = crate::trace::utf8_safe_suffix(text, tail_budget);
+    let elided = text.len().saturating_sub(head.len() + tail.len());
+    format!("{head}\n…[中段省略 {elided} 字节，共 {} 字节]…\n{tail}", text.len())
+}
+
+/// [`compact_middle_out`] 的字符版（预算以字符而非字节计）。
+fn compact_middle_out_chars(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let head_budget = max_chars * 6 / 10;
+    let tail_budget = max_chars - head_budget;
+    let head: String = text.chars().take(head_budget).collect();
+    let tail: String = text
+        .chars()
+        .skip(total.saturating_sub(tail_budget))
+        .collect();
+    let elided = total - head_budget - tail_budget;
+    format!("{head}\n…[中段省略 {elided} 字符，原 {total} 字符]…\n{tail}")
+}
+
+/// 单条待发消息的文本上限（字符）。成功的工具结果原样回填、不设上限；
+/// 一旦因此撑爆模型上下文，恢复重试前靠它把超长消息压成头 + 尾 + 标记。
 const OVERSIZED_MSG_CHARS: usize = 8_000;
 
 /// 原地裁剪消息列表中超过 [`OVERSIZED_MSG_CHARS`] 的文本 part（system
@@ -1217,8 +1269,11 @@ fn slim_oversized_messages(messages: &mut [Message]) -> usize {
             if let ContentPart::Text { text } = part {
                 let n = text.chars().count();
                 if n > OVERSIZED_MSG_CHARS {
-                    let head: String = text.chars().take(OVERSIZED_MSG_CHARS).collect();
-                    *text = format!("{head}\n…[消息过长已裁剪，原 {n} 字符]");
+                    // 同样中段省略而不是截头：这条路径专门处理超大工具结果，
+                    // 而结果的结论/note 往往在末尾（read 的结构摘要 footer、
+                    // code_graph 的"怎么收窄"、批量读的 failed 清单）。
+                    // 砍尾会让恢复重试拿到一份没有出口信息的残缺结果。
+                    *text = compact_middle_out_chars(text, OVERSIZED_MSG_CHARS);
                     touched = true;
                 }
             }
@@ -2141,17 +2196,9 @@ impl AgentRunner {
                 messages.push(Message::tool_result(r.id, result_str));
             }
             Err((kind, detail)) => {
-                const MAX_ERR_BYTES: usize = 256;
-                let truncated = if detail.len() > MAX_ERR_BYTES {
-                    format!(
-                        "{}...\n[error truncated - {} bytes]",
-                        crate::trace::utf8_safe_prefix(&detail, MAX_ERR_BYTES),
-                        detail.len() - MAX_ERR_BYTES,
-                    )
-                } else {
-                    detail
-                };
-                messages.push(Message::tool_result(r.id, truncated));
+                // 中段省略而非截头：错误分类在头、修复指引在尾，两头都要留。
+                let compacted = compact_middle_out(&detail, MAX_TOOL_ERROR_BYTES);
+                messages.push(Message::tool_result(r.id, compacted));
                 if matches!(kind, ToolCallErrorKind::PermanentExec { .. }) {
                     if permanent_streak.0 == tool_name {
                         permanent_streak.1 += 1;
@@ -3636,18 +3683,14 @@ impl AgentRunner {
                             // 链全灭 → 会话永久暂停）。防"模型看自己错误
                             // 输出循环恶化"靠 LoopDetector，不靠断链。
                             //
-                            // 截断错误消息：长 payload（write/edit 类的大内容）
-                            // 不截断会 echo 回 model 变成巨大 tool_result。
-                            const MAX_ERR_BYTES: usize = 256;
-                            let truncated = if detail.len() > MAX_ERR_BYTES {
-                                format!("{}...\n[error truncated - {} bytes]",
-                                    crate::trace::utf8_safe_prefix(&detail, MAX_ERR_BYTES),
-                                    detail.len() - MAX_ERR_BYTES,
-                                )
-                            } else {
-                                detail
-                            };
-                            messages.push(Message::tool_result(tc.id.clone(), truncated));
+                            // 压缩错误消息：长 payload（write/edit 类的大内容）
+                            // 原样 echo 回模型会变成巨大 tool_result。但**中段
+                            // 省略**而不是截头 —— 错误分类在头、修复指引在尾，
+                            // 砍尾等于把唯一可操作的信息扔了（见
+                            // MAX_TOOL_ERROR_BYTES 的文档）。
+                            let compacted =
+                                compact_middle_out(&detail, MAX_TOOL_ERROR_BYTES);
+                            messages.push(Message::tool_result(tc.id.clone(), compacted));
                             // 熔断：同一工具连续被确定性校验拒绝。
                             // NUDGE_AT 次 → 追加一条硬指令，让模型停手
                             // 换路径（此时它已经证明自己修不好这份输入）；
@@ -4015,6 +4058,16 @@ fn normalize_model_schema_node(schema: &mut serde_json::Value) {
             normalize_model_schema_node(property);
         }
     }
+    // `$defs`（自递归 schema 的共享定义表，如 plan 工具的 planTask）同样
+    // 需要递归归一化——$ref 目标的内部节点不走 properties/items 路径。
+    if let Some(defs) = node
+        .get_mut("$defs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for def in defs.values_mut() {
+            normalize_model_schema_node(def);
+        }
+    }
     for key in [
         "items",
         "additionalProperties",
@@ -4299,8 +4352,14 @@ mod tests {
         let detail = tool_not_found_detail("edit", "Tool not found: edit".into());
         assert!(detail.contains("未授权"), "detail = {detail}");
         assert!(detail.contains("request_tool"), "detail = {detail}");
-        // 提示要短：tool_result 回填有 256 字节截断。
-        assert!(detail.len() <= 256, "提示过长会被截断: {} 字节", detail.len());
+        // 提示仍应短小：虽然 tool_result 的上限已从 256 提到
+        // MAX_TOOL_ERROR_BYTES（且改成中段省略），一条"换个路径"的硬指令
+        // 没有理由写长——短提示更容易被照做。
+        assert!(
+            detail.len() <= MAX_TOOL_ERROR_BYTES,
+            "提示过长: {} 字节",
+            detail.len()
+        );
 
         // 真的不存在的工具名 → 保留原始报错，不编造未授权的说法。
         let raw = "Tool not found: definitely_not_a_tool".to_string();
@@ -4569,15 +4628,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cooldown_for_4xx_other_than_429_is_5s() {
-        // 400/401/403/404 cooldown short so the chain can fall through
-        // to the next model (different id or different vendor).
+    fn test_cooldown_for_4xx_other_than_429_is_60s() {
+        // 400/401/403/404：模型 id 不存在或 payload 不被该模型接受，
+        // 60s 冷却后链落到下一个模型（不同 id / 不同厂商）。cd92331
+        // 把 4xx 从 5s 提到 60s（流式 400 沿模型链 fallback），本测试
+        // 对齐现行语义。
         for status in [400u16, 401, 403, 404] {
             let d = cooldown_for_error(&AiError::Api {
                 status,
                 message: "bad request".into(),
             });
-            assert_eq!(d, Some(Duration::from_secs(5)), "status={status}");
+            assert_eq!(d, Some(Duration::from_secs(60)), "status={status}");
         }
     }
 
@@ -4635,10 +4696,59 @@ mod tests {
         assert_eq!(msgs[0].role, MsgRole::System);
         // 短消息不动
         assert_eq!(msgs[1].as_text(), "short");
-        // 超长消息裁到上限附近并带标记
+        // 超长消息压到上限附近并带标记。压缩是**中段省略**：头尾都必须
+        // 还在（工具结果的结论/note 在末尾，砍尾等于把出口信息扔了）。
         let slimmed = msgs[2].as_text();
-        assert!(slimmed.chars().count() <= OVERSIZED_MSG_CHARS + 40);
-        assert!(slimmed.contains("消息过长已裁剪"), "{slimmed}");
+        assert!(
+            slimmed.chars().count() <= OVERSIZED_MSG_CHARS + 60,
+            "{} 字符",
+            slimmed.chars().count()
+        );
+        assert!(slimmed.contains("中段省略"), "{slimmed}");
+        let (head, tail) = slimmed.split_once("\n…[中段省略").expect("应有中段标记");
+        assert_eq!(head.chars().count(), OVERSIZED_MSG_CHARS * 6 / 10, "头部预算 60%");
+        let tail = tail.split_once("]…\n").expect("标记应闭合").1;
+        assert_eq!(tail.chars().count(), OVERSIZED_MSG_CHARS * 4 / 10, "尾部预算 40%");
+    }
+
+    /// 工具错误详情：中段省略而非截头。回归实测事故——旧实现 256 字节
+    /// 截头，把 `plan` 的冲突清单（5855 字 / 45 对）和 `code_graph` 的
+    /// "可用 kind：…" 修复指引都砍在尾部，模型看不全就修不动。
+    #[test]
+    fn tool_error_detail_is_compacted_middle_out_not_head_truncated() {
+        // 短错误原样透传。
+        let short = "code_graph: 不支持的 kind='fn'。可用 kind：function, struct";
+        assert_eq!(compact_middle_out(short, MAX_TOOL_ERROR_BYTES), short);
+
+        // 长错误：头（错误分类）与尾（修复指引）都必须留下。
+        let head_marker = "PLAN_REJECTED: paths 重叠";
+        let tail_marker = "修法：把 involved_paths 改成 paths";
+        let long = format!("{head_marker}{}{tail_marker}", "冲突对; ".repeat(2000));
+        assert!(long.len() > MAX_TOOL_ERROR_BYTES * 2, "样本要够长");
+        let out = compact_middle_out(&long, MAX_TOOL_ERROR_BYTES);
+        assert!(out.starts_with(head_marker), "头部（错误分类）必须保留: {out:.80}");
+        assert!(out.ends_with(tail_marker), "尾部（修复指引）必须保留 —— 这正是旧实现丢掉的");
+        assert!(out.contains("中段省略"), "必须告知模型内容被压缩过");
+        // 预算：正文 ≤ 上限，标记是常数级开销。
+        assert!(
+            out.len() <= MAX_TOOL_ERROR_BYTES + 64,
+            "压缩后 {} 字节超预算",
+            out.len()
+        );
+        // 新上限至少要装得下那 5855 字节的实测样本的头尾两端。
+        assert!(MAX_TOOL_ERROR_BYTES >= 2048, "256 字节的旧上限已被实测证伪");
+    }
+
+    /// 多字节字符不得被切坏（头尾两端都要对齐字符边界）。
+    #[test]
+    fn compact_middle_out_is_utf8_safe() {
+        let text = "中".repeat(4000); // 每字 3 字节
+        let out = compact_middle_out(&text, 1000);
+        assert!(out.contains("中段省略"));
+        assert!(out.starts_with('中'), "{out:.20}");
+        assert!(out.ends_with('中'));
+        // 能正常按字符迭代 = 没有非法字节序列。
+        assert!(out.chars().count() > 0);
     }
 
     #[test]
@@ -4905,6 +5015,7 @@ mod tests {
                     icon: String::new(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             );
             AgentConfig {
@@ -5357,6 +5468,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tm = create_tool_manager();
         tm.register(
@@ -6290,6 +6402,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tool = Tool::builder("ping", "test ping", schema, handler).build();
         let tm = create_tool_manager();
@@ -6401,6 +6514,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tm = create_tool_manager();
         tm.register(
@@ -6497,6 +6611,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tm = create_tool_manager();
         tm.register(
@@ -6584,6 +6699,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tm = create_tool_manager();
         tm.register(
@@ -6752,6 +6868,7 @@ mod tests {
                         properties: Default::default(),
                         required: None,
                         additional_properties: None,
+                        defs: None,
                     },
                     handler,
                 )
@@ -6851,6 +6968,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tool = Tool::builder("ping", "test ping", schema, handler).build();
         let tm = create_tool_manager();
@@ -7013,6 +7131,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tool = Tool::builder("ping", "test ping", schema, handler).build();
         let server = wiremock::MockServer::start().await;
@@ -7103,6 +7222,7 @@ mod tests {
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         let tool = Tool::builder("ping", "test ping", schema, handler).build();
         let tm = create_tool_manager();
@@ -7405,6 +7525,7 @@ mod tests {
                 properties: Default::default(),
                 required: None,
                 additional_properties: None,
+                defs: None,
             },
             handler,
         )
@@ -7535,6 +7656,7 @@ mod tests {
                 properties: Default::default(),
                 required: None,
                 additional_properties: None,
+                defs: None,
             };
             let tool = Tool::builder("delegate", "test delegate", schema, handler).build();
             let tm = create_tool_manager();
@@ -7864,6 +7986,7 @@ tools = ["read", "write"]
                 properties: Default::default(),
                 required: None,
                 additional_properties: None,
+                defs: None,
             };
             // 名字必须是 `read` —— 只读并发靠 READONLY_PARALLEL_TOOLS 白名单
             // 识别，不是靠「工具看起来只读」猜的。
@@ -7980,7 +8103,7 @@ tools = ["read", "write"]
             minimum: None,
             maximum: None,
             min_length: None,
-            max_length: None, items: None, properties: None, required: None, additional_properties: None }
+            max_length: None, items: None, properties: None, required: None, additional_properties: None, ref_: None, }
         }
         let mut props = std::collections::BTreeMap::new();
         props.insert("path".to_string(), p(PropertyType::String));
@@ -7990,6 +8113,7 @@ tools = ["read", "write"]
             properties: props,
             required: None,
             additional_properties: None,
+            defs: None,
         };
 
         // 搬移：path 收到字符串数组。
@@ -8042,6 +8166,7 @@ tools = ["read", "write"]
                 properties: Default::default(),
                 required: None,
                 additional_properties: None,
+                defs: None,
             };
             let tm = create_tool_manager();
             tm.register(Tool::builder("read", "t", schema, handler).build(), None);
@@ -8431,6 +8556,7 @@ tools = ["read", "write"]
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             }
         }
 
@@ -8453,6 +8579,7 @@ tools = ["read", "write"]
                 properties: [("entries".into(), entries)].into_iter().collect(),
                 required: Some(vec!["entries".into()]),
                 additional_properties: Some(false),
+                defs: None,
             },
             strict: None,
         };
@@ -8529,6 +8656,7 @@ tools = ["read", "write"]
             properties: Default::default(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         schema.properties.insert(
             "paths".into(),
@@ -8551,7 +8679,8 @@ tools = ["read", "write"]
                 properties: None,
                 required: None,
                 additional_properties: None,
-            })), properties: None, required: None, additional_properties: None },
+                ref_: None,
+            })), properties: None, required: None, additional_properties: None, ref_: None, },
         );
         let tm = create_tool_manager();
         tm.register(Tool::builder("read", SENTINEL, schema, handler).build(), None);
@@ -8614,6 +8743,7 @@ tools = ["read", "write"]
                 properties: None,
                 required: None,
                 additional_properties: None,
+                ref_: None,
             }
         }
 
@@ -8655,6 +8785,7 @@ tools = ["read", "write"]
                 properties: std::collections::BTreeMap::from([("queries".into(), queries)]),
                 required: Some(vec!["queries".into()]),
                 additional_properties: Some(false),
+                defs: None,
             }
         }
 

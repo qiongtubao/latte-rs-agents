@@ -326,6 +326,12 @@ pub fn build_record_body(t: &crate::tasks::Task) -> serde_json::Value {
     if let Some(sched) = t.scheduled_at {
         props.insert("scheduled_at".into(), serde_json::Value::Number(sched.into()));
     }
+    // 看板已支持任意深度任务树：真实 parent_id 透传到 props。Notion
+    // 记录是平铺结构（title/props/content_md），props 里保留父子引用
+    // 供检索，不在 Notion 端重建层级。
+    if let Some(pid) = &t.parent_id {
+        props.insert("parent_id".into(), serde_json::Value::String(pid.clone()));
+    }
 
     serde_json::json!({
         "title": t.title,
@@ -537,7 +543,7 @@ mod tests {
             state: "in_progress".into(),
             labels: vec!["core".into()],
             task_type: Some("feature".into()),
-            parent_id: None,
+            parent_id: Some("LAT-99".into()),
             sub_order: 0,
             scheduled_at: None,
             workflow: Some("tdd_development".into()),
@@ -554,6 +560,7 @@ mod tests {
         assert_eq!(props["priority"], 1);
         assert_eq!(props["labels"], serde_json::json!(["core"]));
         assert_eq!(props["workflow"], "tdd_development");
+        assert_eq!(props["parent_id"], "LAT-99", "任意深度树的 parent_id 透传到 props");
         let content = body["content_md"].as_str().expect("content_md string");
         assert!(content.contains("覆盖并发读写路径"));
         assert!(content.contains("[LAT-100]"));

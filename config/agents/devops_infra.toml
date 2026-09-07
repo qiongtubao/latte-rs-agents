@@ -1,6 +1,7 @@
 [roles.devops_infra]
 id = "devops_infra"
 name = "Infrastructure Engineer"
+description = "基础设施工程师：云资源、K8s/Docker 容器编排、Terraform 配置管理"
 category = "execution"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

@@ -1,6 +1,7 @@
 [roles.architect_system]
 id = "architect_system"
 name = "System Architect"
+description = "系统架构师：模块划分与接口定义、技术选型、性能与可扩展性设计"
 category = "planning"
 model_tier = "premium"
 model_chain = ["deepseek-v4-flash"]

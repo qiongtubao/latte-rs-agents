@@ -1,6 +1,7 @@
 [roles.designer_visual]
 id = "designer_visual"
 name = "Visual Designer"
+description = "视觉设计师：品牌视觉系统、图标插图、动效、色彩与排版"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

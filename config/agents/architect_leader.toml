@@ -1,6 +1,7 @@
 [roles.architect_leader]
 id = "architect_leader"
 name = "Architecture Lead"
+description = "架构负责人：管理系统/数据/解决方案架构师团队，按需求分配架构评估"
 category = "planning"
 model_tier = "premium"
 model_chain = ["deepseek-v4-flash"]

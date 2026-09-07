@@ -14,6 +14,7 @@ id = "devops"
 
 # Human-readable display name — shown in logs and discussion transcripts.
 name = "DevOps Engineer"
+description = "DevOps/SRE 工程师：交付流水线、基础设施即代码、监控告警与事故响应"
 
 # Lifecycle category determines when the role participates in a discussion:
 #   planning     — upfront design/requirements (pm, architect, designer, manager)

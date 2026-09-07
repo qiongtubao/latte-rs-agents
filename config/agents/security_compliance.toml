@@ -1,6 +1,7 @@
 [roles.security_compliance]
 id = "security_compliance"
 name = "Compliance Auditor"
+description = "合规审计员：检查 SOC2/ISO27001 等合规标准、安全策略与风险整改"
 category = "verification"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

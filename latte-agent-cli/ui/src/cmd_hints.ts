@@ -15,7 +15,7 @@ export interface CmdHint {
 
 /** 内建命令的固定提示（运行时内建，不来自 workflow 配置）。 */
 export const BUILTIN_CMD_HINTS: CmdHint[] = [
-  { cmd: "/plan", icon: "📋", desc: "运行实现规划 workflow" },
+  { cmd: "/plan", icon: "📋", desc: "运行任务规划 workflow" },
   { cmd: "/clear", icon: "🗑️", desc: "清除对话历史" },
   { cmd: "/quit", icon: "🚪", desc: "退出当前 session" },
   { cmd: "/pause", icon: "⏸️", desc: "暂停当前 agent" },

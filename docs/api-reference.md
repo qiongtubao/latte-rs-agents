@@ -642,7 +642,7 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 ### `GET /api/tasks`
 
-列出所有任务（含子任务聚合进度）。
+列出所有任务（含后代聚合进度）。
 
 **响应 `200`：** `TaskView[]`（含 `actions` / `sub_total` / `sub_done` / `sub_state_counts`）
 
@@ -678,13 +678,13 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 批量导入任务（plan 工具批准后调用）。导入的任务一律进 `todo`，是否派发由用户在任务看板手动操作（不做自动调度）。
 
-**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?`）。`parent_id` 三态：任务 id = 显式指定父任务（须为根任务，item 不得再嵌套 `subtasks`）；空串 = 显式「无父任务」；缺省 = 按 `session_id` 查拆分会话映射（`/api/tasks/<id>/refine` 登记，页面刷新不丢）
+**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?`）。`parent_id` 三态：任务 id = 显式指定父任务（任意深度任务树：父任务本身也可以是子任务，item 的 `subtasks` 也可继续嵌套）；空串 = 显式「无父任务」；缺省 = 按 `session_id` 查拆分会话映射（`/api/tasks/<id>/refine` 登记，页面刷新不丢）
 
 **响应 `200`：** `ImportTasksResponse`（含 `created`）
 
 ### `POST /api/tasks/<id>/refine`
 
-拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 出拆分草案 → reviewer 评审 → 终审门 REJECT 自动返工 → 过审后用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。plan 提交前对 `paths` 做机械校验（路径前缀必须真实存在、清单内互不重叠），失败整单打回模型修正。不改变任务状态、不记 run。仅根任务可拆；`in_progress`/`merging` 中的任务不可拆。
+拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 出拆分草案 → reviewer 评审 → 终审门 REJECT 自动返工 → 过审后用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。plan 提交前对 `paths` 做机械校验（路径前缀必须真实存在、清单内互不重叠），失败整单打回模型修正。不改变任务状态、不记 run。任意层级任务都可拆（任务树深度不限）；`in_progress`/`merging` 中的任务不可拆。
 
 **请求体：** `{}`
 

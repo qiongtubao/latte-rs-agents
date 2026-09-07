@@ -314,6 +314,264 @@ fn check_output_contract(contract: &OutputContract, output: &str) -> Result<(), 
     Ok(())
 }
 
+// ─── plan tasks 结构化 patch（require_plan_tasks / patch_from / submit_plan_from） ───
+//
+// 设计血缘：oh-my-pi 的 hashline 验证了「小操作集 + 锚点 + 机械校验 +
+// 失败重试」在 LLM 编辑场景可行；这里把同一模式从「文本行」平移到
+// 「任务字段」——锚点是标题子串，校验复用 plan 工具的同一套机械判据，
+// 失败走 output_contract 同一条批注重试链。
+
+/// 扫描文本中的 ``` 代码块，返回（整段字节范围, info 串, 内容）。
+fn fenced_code_blocks(text: &str) -> Vec<(std::ops::Range<usize>, String, String)> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let line_start = offset;
+        offset += line.len() + 1; // +1 for '\n'（最后一行无换行也无妨：span 只用于切片）
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("```") {
+            continue;
+        }
+        let info = trimmed.trim_start_matches('`').trim().to_string();
+        let content_start = offset;
+        let mut content_end = offset;
+        let mut closed_end = None;
+        for line in lines.by_ref() {
+            let ls = offset;
+            offset += line.len() + 1;
+            if line.trim_start().starts_with("```") {
+                closed_end = Some(offset.min(text.len()));
+                content_end = ls;
+                break;
+            }
+            content_end = offset.min(text.len());
+        }
+        let end = closed_end.unwrap_or_else(|| text.len());
+        out.push((line_start..end, info, text[content_start..content_end].to_string()));
+    }
+    out
+}
+
+/// 解析 fence 内容为 JSON。模型常把闭合 ``` 写在内容最后一行的行尾
+/// （`…} ``` ` 不换行），按行扫描会把它吞进内容导致解析失败——先原样
+/// 解析，失败则剥掉行尾的闭合反引号再试一次。
+fn parse_fence_json(content: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(content) {
+        return Some(v);
+    }
+    let stripped = content.trim_end().trim_end_matches('`').trim_end();
+    serde_json::from_str(stripped).ok()
+}
+
+/// 从文本中定位**唯一**含 `"tasks"` 数组的 ```json fence，返回
+/// (fence 整段范围, tasks 数组的 Value)。0 个 = 模型没给结构化清单；
+/// 多个 = 草案里混了示例 JSON，「哪份是 canonical」无从判断——两种
+/// 都是机械错误，带指导文案走批注重试。
+fn find_tasks_fence(text: &str) -> Result<(std::ops::Range<usize>, serde_json::Value), String> {
+    let mut hits: Vec<(std::ops::Range<usize>, serde_json::Value)> = Vec::new();
+    for (span, _info, content) in fenced_code_blocks(text) {
+        let Some(v) = parse_fence_json(&content) else {
+            continue;
+        };
+        if let Some(tasks) = v.get("tasks").filter(|t| t.is_array()) {
+            hits.push((span, tasks.clone()));
+        }
+    }
+    match hits.len() {
+        0 => Err("产出中没有可解析的、含 \"tasks\" 数组的 ```json 代码块。\
+                  请把任务清单放进一个 ```json fenced 代码块，顶层结构为 {\"tasks\": [...]}"
+            .into()),
+        1 => Ok(hits.pop().expect("len == 1")),
+        n => Err(format!(
+            "产出里有 {n} 个含 \"tasks\" 数组的 json 代码块，无法判断哪份是正式清单。\
+             请只保留一个（示例/草稿请删除或改成非 tasks 结构）。"
+        )),
+    }
+}
+
+/// `require_plan_tasks` 的校验：抽清单 fence + 跑 plan 工具的同一套
+/// 机械校验。措辞直接作为给模型的验收批注。
+fn check_plan_tasks_output(output: &str, cwd: &std::path::Path) -> Result<(), String> {
+    let (_, tasks) = find_tasks_fence(output)?;
+    crate::controller::parse_and_validate_plan_tasks(&tasks, cwd)
+        .map(|_| ())
+        .map_err(|e| format!("任务清单未通过机械校验：{e}"))
+}
+
+/// `require_symbols_resolvable` 的校验：产出里反引号包裹的代码符号必须
+/// 都能在仓库源码里回指到。判据、豁免与报错措辞都在
+/// [`latte_rs_agent_tools::utils::symbol_check`]。
+fn check_symbols_output(output: &str, cwd: &std::path::Path) -> Result<(), String> {
+    latte_rs_agent_tools::utils::symbol_check::check_symbols_resolvable(output, cwd)
+}
+
+/// `patch_from` 的一条修改操作：把标题包含 `task` 子串的唯一任务的
+/// `field` 字段整体替换为 `set`。操作集故意保持最小（只有整体替换
+/// 一种语义）——字段级 set 已足够表达评审修正，更细的数组合并/删除
+/// 语义只会放大模型出错面。
+#[derive(Debug, serde::Deserialize)]
+struct TaskPatchOp {
+    task: String,
+    field: String,
+    set: serde_json::Value,
+}
+
+/// 从 patch 步产出里解析 ops：一个 ```json fence 的 `{"ops":[...]}`。
+fn parse_task_patch_ops(text: &str) -> Result<(Vec<TaskPatchOp>, std::ops::Range<usize>), String> {
+    let mut hits = Vec::new();
+    for (span, _info, content) in fenced_code_blocks(text) {
+        let Some(v) = parse_fence_json(&content) else {
+            continue;
+        };
+        if v.get("ops").is_some_and(|o| o.is_array()) {
+            hits.push((span, v["ops"].clone()));
+        }
+    }
+    let (span, ops_val) = match hits.len() {
+        0 => return Err("产出中没有含 \"ops\" 数组的 ```json 代码块。\
+                         本步是定向修补：只输出修订说明 + 一个 ```json 代码块 \
+                         {\"ops\": [{\"task\": \"<标题唯一子串>\", \"field\": \"<字段名>\", \"set\": <新值>}]}；\
+                         没有需要修改的字段时输出 {\"ops\": []}。"
+            .into()),
+        1 => hits.pop().expect("len == 1"),
+        n => {
+            return Err(format!(
+                "产出里有 {n} 个含 \"ops\" 数组的 json 代码块，请只保留一个。"
+            ))
+        }
+    };
+    let ops: Vec<TaskPatchOp> = serde_json::from_value(ops_val)
+        .map_err(|e| format!("ops 解析失败：{e}（每条 op 需要 task / field / set 三个字段）"))?;
+    Ok((ops, span))
+}
+
+/// patch 可写字段白名单与值类型校验。subtasks 不支持（嵌套层的锚定
+/// 语义靠标题子串表达不清，真需要时走 draft 重做）。
+fn check_patch_field(field: &str, value: &serde_json::Value) -> Result<(), String> {
+    let ok = match field {
+        "title" | "description" => value.is_string(),
+        "priority" => value.is_i64() || value.is_u64() || value.is_null(),
+        "labels" | "paths" => value
+            .as_array()
+            .is_some_and(|a| a.iter().all(|x| x.is_string())),
+        "task_type" | "workflow" => value.is_string() || value.is_null(),
+        _ => {
+            return Err(format!(
+                "field '{field}' 不可 patch（允许：title / description / priority / labels / task_type / workflow / paths）"
+            ))
+        }
+    };
+    if !ok {
+        return Err(format!("field '{field}' 的值类型不对（收到 {value}）"));
+    }
+    Ok(())
+}
+
+/// 把 patch 步产出（修订说明 + ops）机械应用到上游草案，返回打了补丁
+/// 的完整草案。ops 为空 = 无修订，草案原样返回。
+fn apply_task_patch(
+    draft: &str,
+    response: &str,
+    cwd: &std::path::Path,
+) -> Result<String, String> {
+    let (ops, ops_span) = parse_task_patch_ops(response)?;
+    if ops.is_empty() {
+        return Ok(draft.to_string());
+    }
+    let (span, tasks_val) = find_tasks_fence(draft)?;
+    let mut tasks: Vec<serde_json::Value> = tasks_val
+        .as_array()
+        .expect("find_tasks_fence 只返回数组")
+        .clone();
+    let mut titles: Vec<String> = tasks
+        .iter()
+        .map(|t| {
+            t.get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    for (i, op) in ops.iter().enumerate() {
+        check_patch_field(&op.field, &op.set).map_err(|e| format!("ops[{i}]：{e}"))?;
+        let matched: Vec<usize> = titles
+            .iter()
+            .enumerate()
+            .filter(|(_, title)| title.contains(op.task.as_str()))
+            .map(|(idx, _)| idx)
+            .collect();
+        let idx = match matched.len() {
+            1 => matched[0],
+            0 => {
+                return Err(format!(
+                    "ops[{i}]：没有标题包含「{}」的任务。可选标题：{}",
+                    op.task,
+                    titles.join("；")
+                ))
+            }
+            n => {
+                return Err(format!(
+                    "ops[{i}]：「{}」匹配到 {n} 个任务（{}），请用更长的标题子串唯一定位。",
+                    op.task,
+                    matched
+                        .iter()
+                        .map(|&j| titles[j].as_str())
+                        .collect::<Vec<_>>()
+                        .join("；")
+                ))
+            }
+        };
+        let obj = tasks[idx]
+            .as_object_mut()
+            .ok_or_else(|| format!("ops[{i}]：tasks[{idx}] 不是对象"))?;
+        // no-op 守卫：新值与现值相同 = 白转一圈还以为自己改了
+        // （hashline 把 byte-identical edit 判为错误是同一道理）。
+        let old = obj.get(&op.field).cloned().unwrap_or(serde_json::Value::Null);
+        if old == op.set {
+            return Err(format!(
+                "ops[{i}]：字段 '{}' 的新值与现值相同（无实际修改）。若无需修改请从 ops 里移除该条。",
+                op.field
+            ));
+        }
+        obj.insert(op.field.clone(), op.set.clone());
+        // title 被改时刷新定位表，后续 op 按新标题匹配。
+        if op.field == "title" {
+            titles[idx] = tasks[idx]
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+    // 补丁后重跑 plan 机械校验：修补最容易引入新重叠（task_refine
+    // 实录：revise 把 src/arena.c 补进已持有它的任务，凑成第 14 处
+    // 重叠，整单被 plan 工具拒绝）。
+    let patched = crate::controller::parse_and_validate_plan_tasks(
+        &serde_json::Value::Array(tasks),
+        cwd,
+    )
+    .map_err(|e| format!("补丁后的清单未通过机械校验：{e}"))?;
+    let new_fence = format!(
+        "```json\n{}\n```",
+        serde_json::to_string_pretty(&serde_json::json!({ "tasks": patched }))
+            .expect("PlanTask 序列化不会失败")
+    );
+    let mut out = String::with_capacity(draft.len() + response.len());
+    out.push_str(&draft[..span.start]);
+    out.push_str(&new_fence);
+    out.push_str(&draft[span.end..]);
+    // 修订说明 = 模型产出里去掉 ops fence 的部分，附在草案末尾给人看。
+    let notes = format!("{}{}", &response[..ops_span.start], &response[ops_span.end..]);
+    let notes = notes.trim();
+    if !notes.is_empty() {
+        out.push_str("\n\n---\n\n### 本次修订\n\n");
+        out.push_str(notes);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// 契约校验最终失败时附进错误消息的产出摘要：取前 `max_chars` 个字符，
 /// 超长补「…」。目的：gate 类 step 判 REJECT 时，manager 拿到的错误
 /// 里能直接看到 REJECT 理由（而不是只有"缺少 VERDICT: PASS"），
@@ -684,6 +942,69 @@ pub struct WorkflowStepDef {
     /// 的原始报错拼进重试 prompt，让模型知道该修什么。
     #[serde(default)]
     pub require_plan_submit: bool,
+    /// 本步产出必须包含一个 ```json fence 的 `{"tasks":[...]}`，且该
+    /// 清单必须通过 plan 工具的**同一套**机械校验（`controller.rs` 的
+    /// `parse_and_validate_plan_tasks`：路径存在性、字符串层重叠、
+    /// workflow 名、task_type 名）。不合格走 `output_contract` 同一条
+    /// 批注重试链（复用 `max_retries`）。
+    ///
+    /// 为什么需要它：task_refine 的 paths 重叠自查长期靠「模型自觉画
+    /// 自查表」，实测多次漏判、清单带病走到 submit 才被 plan 工具整单
+    /// 拒绝（前期几十轮评审全部白跑）。把校验前移到产出草案的 step，
+    /// 自查从「说的」变成「算的」。
+    #[serde(default)]
+    pub require_plan_tasks: bool,
+    /// 本步产出里**反引号包裹**的代码符号必须都能在仓库源码里按词边界回指到，
+    /// 查不到的走 `output_contract` 同一条批注重试链（复用 `max_retries`）。
+    /// 判据与豁免见 `latte_rs_agent_tools::utils::symbol_check`。
+    ///
+    /// 为什么需要它（实测 2026-09 jemalloc 会话）：architect 产出的学习规划里
+    /// 131 个反引号标识符有 **74 个（56%）全仓搜不到**，且成体系地是该项目
+    /// 3.x/4.x 的旧术语（`arena_bin_malloc_hard`、`bin->runcur`、
+    /// `chunk_alloc_mmap`…）——5.x 早把 chunk→extent、run→slab 改了名，但
+    /// 训练语料里旧版本的解析文章远多于新版本。这些名字彼此自洽、读起来
+    /// 非常专业，人类评审与 LLM 终审都没看出来（那次 verdict 反而表扬了
+    /// 「取证覆盖度」）。
+    ///
+    /// 与 `require_tools_any`（查它调没调工具）、`require_plan_tasks`（查
+    /// 路径存在性）的分工：那两条管不到「文件对、函数名假」这一类。按来源
+    /// 归因那 74 个，**39 个来自模型压根没打开过的文件**——任何工具侧改进
+    /// 都碰不到这部分，只能在产出侧做机械回指。
+    ///
+    /// 与 oh-my-pi 的 hashline seen-line guard 同源：那边是「编辑不许落在
+    /// read 没显示过的行上」，这边把同一条 provenance 思路从「行」平移到
+    /// 「符号」。
+    #[serde(default)]
+    pub require_symbols_resolvable: bool,
+    /// patch 模式：本步 speaker 不再重出整份清单，只输出「修订说明 +
+    /// 一个 ```json fence 的 `{"ops":[{"task":"<标题唯一子串>",
+    /// "field":"<字段名>","set":<新值>}]}`」。引擎把 ops 机械应用到
+    /// 指定 output_key 的上游草案（必须含 tasks JSON fence）上：
+    /// 定位失败（0 或 >1 匹配）、字段名/类型非法、补丁后清单过不了
+    /// plan 机械校验，都走批注重试链。空 `ops: []` = 无需修订，草案
+    /// 原样成为本步产出。成功时本步产出 = 打了补丁的完整草案（下游
+    /// 拿到的仍是全量文本，只有模型那一跳是增量）。
+    ///
+    /// 为什么需要它（实测实录）：跨 step 信息只有 `{{output_key}}` 纯
+    /// 文本替换，没有 patch 通道，revise 类 step 只能「输出完整修订
+    /// 版」——实测一次 task_refine 运行里同一份清单被模型完整输出
+    /// 3 次（draft → 全量重出 → 转写成 plan args），revise 一跳花了
+    /// 3884 output token 只改 2 个字段。
+    #[serde(default)]
+    pub patch_from: Option<String>,
+    /// 机械提交步：本 step **不派 speaker、零模型调用**——引擎直接从
+    /// 指定 output_key 的上游产出里抽 tasks JSON fence，调用 plan 工具
+    /// 的共享实现（`controller::submit_plan_proposal`：同一套校验 +
+    /// PlanProposed 广播 + 弹窗落盘 + PlanStage 置位）提交给用户勾选。
+    /// 与 `role`/`speakers` 互斥（validate 期拦截）。校验失败 = step
+    /// 失败（上游 `require_plan_tasks`/`patch_from` 已两道硬校验，
+    /// 理论上不可达；真失败则响亮报错，不静默）。
+    ///
+    /// 为什么需要它（实测实录）：submit 步此前是「模型把草案再抄一遍
+    /// 成 plan args」——实测一跳 in=18001/out=3311/158s，且转写过程
+    /// 本身曾引入增删改漂移（`task_refine.toml` 头部实录）。
+    #[serde(default)]
+    pub submit_plan_from: Option<String>,
     /// 跨 step 循环条件：本 step 完成后检查产出是否包含
     /// 该子串，包含 = 通过继续；不包含则跳回 `loop_back_to` 指定的 step
     /// 重做（缺省 = 自己），并把本 step 产出作为"上轮审查反馈"批注预置
@@ -712,6 +1033,21 @@ pub struct WorkflowStepDef {
     /// 熔断词表改为按 step 显式声明，引擎不再私藏 magic string。
     #[serde(default)]
     pub loop_abort_on: Option<String>,
+    /// 「不可放行」标记：返工环**迭代耗尽**时，若产出包含该子串，
+    /// 跳过 advisor 语义复核直接判 workflow 失败。与 `loop_abort_on`
+    /// 的区别：abort 是首次命中即终局（不给返工机会）；本字段允许
+    /// 正常返工，只是耗尽那一刻不许被复核放行。
+    ///
+    /// 为什么需要它（实测实锤：2026-09 jemalloc implementation_plan
+    /// 会话）：gate 三轮均输出 `VERDICT: REJECT`（阻断问题带 file:line
+    /// 证据），耗尽点 advisor 复核的却是 `loop_back_to` 目标的产出
+    /// （breakdown 计划文本——本身没病，病在 tasks JSON），误判「实质
+    /// 合格」放行，run 以 `ok` 收尾、summary 却是 REJECT 原文——
+    /// 失败被吞成成功，三道带证据的阻断意见被一次复核否决。
+    /// REJECT（存在阻断问题/实测错误）与 REVISE（小瑕疵返工）必须
+    /// 区别对待：后者才是 advisor 复核放行的设计场景。
+    #[serde(default)]
+    pub loop_no_release_on: Option<String>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
     /// Nest another workflow as this step: the named workflow runs with
@@ -1124,6 +1460,32 @@ impl WorkflowDef {
                     }
                 }
             }
+            // loop_no_release_on 与 loop_abort_on 同规则：只在返工环耗尽
+            // 判定里生效，没有 loop_until 必然是笔误；含 loop_until 标记
+            // 则永远先命中放行，成死代码。
+            if let Some(marker) = &step.loop_no_release_on {
+                if step.loop_until.is_none() {
+                    return Err(format!(
+                        "step '{}': `loop_no_release_on` 需要配合 `loop_until`（没有返工环时不存在耗尽放行）",
+                        step.id
+                    ));
+                }
+                if marker.trim().is_empty() {
+                    return Err(format!(
+                        "step '{}': loop_no_release_on must not be empty",
+                        step.id
+                    ));
+                }
+                if let Some(cond) = &step.loop_until {
+                    if marker.contains(cond.as_str()) {
+                        return Err(format!(
+                            "step '{}': loop_no_release_on '{marker}' 包含 loop_until '{cond}'，\
+                             永远不会触发（放行条件先命中）",
+                            step.id
+                        ));
+                    }
+                }
+            }
             if step.loop_until.is_some() && uses_dag {
                 // DAG 返工环（实测实锤：gate 的合法 REJECT 被契约
                 // 判死，50 分钟流水线零产出）。约束：跳回目标必须在
@@ -1165,6 +1527,50 @@ impl WorkflowDef {
                         step.id
                     ));
                 }
+            }
+            // patch / 机械提交字段的形状校验（三者都只在串行引擎实现，
+            // DAG 用到即报配置错误，不静默忽略）。
+            if (step.require_plan_tasks || step.patch_from.is_some()
+                || step.submit_plan_from.is_some())
+                && uses_dag
+            {
+                return Err(format!(
+                    "step '{}': require_plan_tasks / patch_from / submit_plan_from \
+                     目前仅支持串行引擎（本 workflow 有 step 声明了 depends_on）",
+                    step.id
+                ));
+            }
+            // patch_from / submit_plan_from 必须指向**更早** step 的
+            // output_key——指向自己或未来 step 在串行执行下永远拿到空串，
+            // 是静默失效类错误。
+            for (attr, src) in [
+                ("patch_from", step.patch_from.as_deref()),
+                ("submit_plan_from", step.submit_plan_from.as_deref()),
+            ] {
+                let Some(src) = src else { continue };
+                if src.trim().is_empty() {
+                    return Err(format!("step '{}': {attr} must not be empty", step.id));
+                }
+                let own_idx = self.steps.iter().position(|s| s.id == step.id);
+                let ok = own_idx.is_some_and(|i| {
+                    self.steps[..i]
+                        .iter()
+                        .any(|s| s.output_key.as_deref() == Some(src))
+                });
+                if !ok {
+                    return Err(format!(
+                        "step '{}': {attr} '{src}' 必须指向更早 step 的 output_key",
+                        step.id
+                    ));
+                }
+            }
+            if step.submit_plan_from.is_some()
+                && (step.role.is_some() || !step.speakers.is_empty())
+            {
+                return Err(format!(
+                    "step '{}': `submit_plan_from` 是零模型调用的机械步，与 role/speakers 互斥",
+                    step.id
+                ));
             }
         }
         Ok(())
@@ -1772,6 +2178,12 @@ enum CheckpointRecord {
         workflow_name: String,
         topic: String,
         started_at: u64,
+        /// 本 run 所属的 UI session。plan 工具的直提门禁靠它判断
+        /// 「本 session 是否跑过 workflow」（扫 workflow-runs/ 各
+        /// checkpoint 的首行）。旧 checkpoint 无此字段，serde
+        /// default 兼容。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// One completed step.
     Step {
@@ -2063,8 +2475,9 @@ struct CheckpointLog {
 impl CheckpointLog {
     /// Start a new checkpoint file (writes the meta line). `resumed`
     /// seeds the completed counter with steps carried over from a
-    /// previous run's checkpoint.
-    fn new(cwd: &Path, wf_id: &str, workflow_name: &str, topic: &str, resumed: usize) -> Self {
+    /// previous run's checkpoint. `session_id` 写进 meta 首行，供
+    /// plan 工具的直提门禁按 session 查询「是否跑过 workflow」。
+    fn new(cwd: &Path, wf_id: &str, workflow_name: &str, topic: &str, resumed: usize, session_id: Option<String>) -> Self {
         append_checkpoint(
             cwd,
             wf_id,
@@ -2073,6 +2486,7 @@ impl CheckpointLog {
                 workflow_name: workflow_name.to_string(),
                 topic: topic.to_string(),
                 started_at: now_secs(),
+                session_id,
             },
         );
         Self {
@@ -2241,6 +2655,7 @@ async fn run_workflow_inner(
         &name,
         &topic,
         resume.as_ref().map_or(0, |s| s.completed.len()),
+        ctx.session_id.clone(),
     );
     // Copy the carried-over step records into the new run's checkpoint
     // file so it stays self-contained (a second resume needs only the
@@ -3441,6 +3856,52 @@ async fn run_workflow_serial(
                 task: step.task_text().to_string(),
             });
             let mut step_transcript = String::new();
+            // 机械提交步（submit_plan_from）：零模型调用——引擎直接从
+            // 上游产出抽 tasks JSON，走 plan 工具的共享实现提交。
+            // 校验失败 = step 失败：上游 require_plan_tasks / patch_from
+            // 已两道硬校验，这里失败说明有未知路径，响亮报错不静默。
+            if let Some(src_key) = &step.submit_plan_from {
+                let src = vars.get(src_key).cloned().unwrap_or_default();
+                let result = find_tasks_fence(&src).and_then(|(_, tasks)| {
+                    crate::controller::submit_plan_proposal(
+                        &serde_json::json!({ "tasks": tasks }),
+                        // 本步没有 speaker；role_id 只用于 plan_id 与
+                        // 前端展示，用 workflow 名标识来源。
+                        &format!("workflow:{}", wf.name),
+                        &Arc::new(parking_lot::RwLock::new(
+                            crate::controller::PlanStage::Normal,
+                        )),
+                        &ctx.cwd,
+                        ctx.session_id.as_deref().unwrap_or(""),
+                        &ctx.event_tx,
+                    )
+                });
+                match result {
+                    Ok(summary) => {
+                        let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
+                            wf_id: wf_id.to_string(),
+                            step_id: step.id.clone(),
+                            role_id: format!("workflow:{}", wf.name),
+                            content: summary.clone(),
+                            round,
+                        });
+                        last_output = summary;
+                        if let Some(key) = &step.output_key {
+                            vars.insert(key.clone(), last_output.clone());
+                            keyed.insert(key.clone(), last_output.clone());
+                        }
+                        ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
+                        idx += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        return WfOutcome::Failed(format!(
+                            "step '{}' 机械提交 plan 失败：{e}",
+                            step.id
+                        ))
+                    }
+                }
+            }
             // Nested workflow step: run the named workflow with the
             // rendered task as its topic; bind its final output.
             if let Some(nested_name) = step.workflow.clone() {
@@ -3679,6 +4140,92 @@ async fn run_workflow_serial(
                             continue;
                         }
                     }
+                    // 符号可解析性（require_symbols_resolvable）：产出里反引号
+                    // 包裹的代码符号必须能在仓库里回指到。放在清单硬校验之前
+                    // ——「引用的函数根本不存在」比「JSON 字段不齐」更根本，
+                    // 而且这条挡的正是 require_tools_any 挡不住的那部分：
+                    // 工具调了、但对着没打开过的文件凭记忆写符号名。
+                    if step.require_symbols_resolvable {
+                        if let Err(reason) = check_symbols_output(&response, &ctx.cwd) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                "workflow step referenced unresolvable symbols; retrying"
+                            );
+                            step_transcript
+                                .push_str("[验收批注]: 引用了仓库中不存在的代码符号，已要求核对后重做\n");
+                            prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
+                            continue;
+                        }
+                    }
+                    // 清单 JSON 硬校验（require_plan_tasks）：与 plan 工具
+                    // 同一套机械判据——paths 重叠自查从「模型自觉画表」变成
+                    // 「引擎算的」（实测模型自查多次漏判、带病入库）。
+                    if step.require_plan_tasks {
+                        if let Err(reason) = check_plan_tasks_output(&response, &ctx.cwd) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）\
+                                     ；不合格产出摘要：{}",
+                                    step.id,
+                                    speaker,
+                                    output_excerpt(&response, 1200)
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "workflow step output failed plan-tasks check; retrying"
+                            );
+                            let annotation =
+                                format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    // patch 模式（patch_from）：产出是「修订说明 + ops」，
+                    // 引擎机械打到上游草案上，本步产出 = 打过补丁的完整草案
+                    // （下游拿到的仍是全量文本，只有模型那一跳是增量）。
+                    if let Some(src_key) = &step.patch_from {
+                        let draft = vars.get(src_key).cloned().unwrap_or_default();
+                        match apply_task_patch(&draft, &response, &ctx.cwd) {
+                            Ok(patched) => response = patched,
+                            Err(reason) => {
+                                if attempt >= step.max_retries {
+                                    return WfOutcome::Failed(format!(
+                                        "step '{}' speaker '{}': patch 应用失败\
+                                         （已重试 {attempt} 次）：{reason}\
+                                         ；不合格产出摘要：{}",
+                                        step.id,
+                                        speaker,
+                                        output_excerpt(&response, 1200)
+                                    ));
+                                }
+                                attempt += 1;
+                                tracing::warn!(
+                                    step = %step.id, speaker = %speaker, attempt,
+                                    reason = %reason,
+                                    "workflow step patch failed; retrying"
+                                );
+                                let annotation = format!(
+                                    "上次产出的 patch 未通过机械校验：{reason}。\
+                                     请修正 ops 后重新输出（只输出修订说明 + 一个 \
+                                     ```json ops 代码块，不要重出完整清单）。"
+                                );
+                                step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                                prompt = format!("{full_prompt}\n\n{annotation}");
+                                continue;
+                            }
+                        }
+                    }
                     // 契约合格的产出才发事件 / 进 transcript / last_output。
                     // （run_step_speaker 已剥离 <think>；step_transcript /
                     // last_output 保留原文供后续 speaker 与最终总结使用。）
@@ -3728,6 +4275,20 @@ async fn run_workflow_serial(
                     };
                     let max = step.max_iterations.unwrap_or(3).min(10);
                     if count >= max {
+                        // 「不可放行」标记：gate 已给出带证据的硬拒绝
+                        // （如 VERDICT: REJECT），不许 advisor 复核把
+                        // 失败吞成成功，直接判死（见 loop_no_release_on）。
+                        if let Some(marker) = &step.loop_no_release_on {
+                            if last_output.contains(marker.as_str()) {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                                     （已达 max_iterations={max}），产出含不可放行标记「{marker}」\
+                                     （跳过 advisor 复核），最后一次产出摘要：{}",
+                                    step.id,
+                                    last_output.chars().take(200).collect::<String>()
+                                ));
+                            }
+                        }
                         // 判死前最后一道 advisor 语义复核：把「被返工的那份
                         // 产出」+「未消化的评审意见」交给 advisor，判定实质
                         // 合格则放行进入下游（见 loop_exhausted_last_resort_review）。
@@ -4070,6 +4631,28 @@ async fn run_dag_step(
                 prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
                 continue;
             }
+            // 符号可解析性（require_symbols_resolvable）：与串行引擎同语义。
+            // 这条是纯产出检查、无跨步状态，所以 DAG 引擎也支持（不像
+            // require_plan_tasks / patch_from 那样只能串行）。
+            if step.require_symbols_resolvable {
+                if let Err(reason) = check_symbols_output(&response, &inp.cwd) {
+                    if attempt >= step.max_retries {
+                        return Err(StepFail::Failed(format!(
+                            "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                            step.id, speaker
+                        )));
+                    }
+                    attempt += 1;
+                    tracing::warn!(
+                        step = %step.id, speaker = %speaker, attempt,
+                        "workflow step referenced unresolvable symbols; retrying"
+                    );
+                    step_transcript
+                        .push_str("[验收批注]: 引用了仓库中不存在的代码符号，已要求核对后重做\n");
+                    prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
+                    continue;
+                }
+            }
             if let Err(reason) = check_output_contract(&step.output_contract, &response) {
                 if attempt >= step.max_retries {
                     // 重试耗尽：判死前过一道 advisor 语义兜底（同串行
@@ -4369,6 +4952,19 @@ async fn run_workflow_dag(
                 };
                 let max = step.max_iterations.unwrap_or(3).min(10);
                 if count >= max {
+                    // 「不可放行」标记（与串行引擎同款）：硬拒绝不被
+                    // advisor 复核放行（见 loop_no_release_on）。
+                    if let Some(marker) = &step.loop_no_release_on {
+                        if out.contains(marker.as_str()) {
+                            return WfOutcome::Failed(format!(
+                                "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                                 （已达 max_iterations={max}），产出含不可放行标记「{marker}」\
+                                 （跳过 advisor 复核），最后一次产出摘要：{}",
+                                step.id,
+                                out.chars().take(200).collect::<String>()
+                            ));
+                        }
+                    }
                     // 判死前最后一道 advisor 语义复核（与串行引擎同款）：
                     // 把「被返工的那份产出」+「未消化的评审意见」交 advisor，
                     // 判定实质合格则免除本 step 的返工要求，让 wave 正常推进。
@@ -6103,6 +6699,48 @@ loop_abort_on = "VERDICT: REJECT"
         assert!(err.contains("熔断永远不会触发"), "错误应解释原因: {err}");
     }
 
+    /// `loop_no_release_on` 与 `loop_abort_on` 同规则：没有 loop_until
+    /// 是死配置，必须拒绝。
+    #[test]
+    fn loop_no_release_on_without_loop_until_rejected() {
+        let wf = wf_from(
+            r#"
+name = "no_release_orphan"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+loop_no_release_on = "VERDICT: REJECT"
+"#,
+        );
+        let err = wf.validate().expect_err("孤立的 loop_no_release_on 必须报错");
+        assert!(err.contains("loop_no_release_on"), "错误应点名字段: {err}");
+        assert!(err.contains("loop_until"), "错误应说明依赖: {err}");
+    }
+
+    /// 不可放行标记若包含放行条件，永远先命中放行，成死代码——拒绝。
+    #[test]
+    fn loop_no_release_on_containing_loop_until_rejected() {
+        let wf = wf_from(
+            r#"
+name = "no_release_shadowed"
+[[steps]]
+id = "a"
+role = "pm"
+task = "t"
+[[steps]]
+id = "b"
+role = "architect"
+task = "t"
+loop_until = "VERDICT:"
+loop_back_to = "a"
+loop_no_release_on = "VERDICT: REJECT"
+"#,
+        );
+        let err = wf.validate().expect_err("被放行条件遮蔽的不可放行标记必须报错");
+        assert!(err.contains("永远不会触发"), "错误应解释原因: {err}");
+    }
+
     /// Linear chain a→b→c produces one step per wave (fully serial).
     #[test]
     fn linear_chain_is_serial_waves() {
@@ -6505,6 +7143,10 @@ task = "t"
             refine.task_text().contains("禁止调用 plan"),
             "refine 步必须禁止调 plan（草案先过评审）"
         );
+        assert!(
+            refine.require_plan_tasks,
+            "refine 步必须声明 require_plan_tasks（清单 JSON 由引擎机械校验）"
+        );
 
         let review = &wf.steps[1];
         assert_eq!(review.roles(), &["reviewer".to_string()]);
@@ -6525,6 +7167,11 @@ task = "t"
         let revise = &wf.steps[3];
         assert_eq!(revise.roles(), &["task_planner".to_string()]);
         assert_eq!(revise.output_key.as_deref(), Some("final_draft"));
+        assert_eq!(
+            revise.patch_from.as_deref(),
+            Some("draft"),
+            "revise 步必须是 patch 模式：模型只输出 ops，引擎机械打到 draft 上"
+        );
         assert!(
             revise.task_text().contains("{{draft}}") && revise.task_text().contains("{{verdict}}"),
             "revise 步必须同时拿到原草案与评审结论才能定向修补"
@@ -6534,24 +7181,31 @@ task = "t"
             "revise 是定向修补，不是重新拆分"
         );
         assert!(
+            revise.task_text().contains("禁止重出完整清单"),
+            "revise 必须明写禁止重出完整清单（patch 的意义就是省掉全文重出）"
+        );
+        assert!(
             !revise.tools.iter().any(|t| t == "plan"),
             "revise 步不放行 plan——修补产物仍要走 submit 提交"
         );
 
         let submit = &wf.steps[4];
-        assert_eq!(submit.roles(), &["task_planner".to_string()]);
-        assert!(
-            submit.task_text().contains("{{final_draft}}"),
+        assert_eq!(
+            submit.submit_plan_from.as_deref(),
+            Some("final_draft"),
             "submit 步必须消费修订后的草案，否则 important 修正项被丢弃"
         );
         assert!(
-            !submit.task_text().contains("{{draft}}"),
-            "submit 不能回退到第一版 draft"
+            submit.roles().is_empty() && !submit.task_text().contains("{{draft}}"),
+            "submit 是零模型调用的机械步（无 speaker、不消费第一版 draft）"
         );
-        assert!(!submit.task_text().contains("{{approved}}"));
+        assert!(
+            !submit.require_plan_submit,
+            "引擎直提后 require_plan_submit 退役（提交动作由引擎完成，不存在「没提交」）"
+        );
 
         // step 级工具过滤：refine/revise 步硬性摘掉 plan（引擎层 enforce，
-        // 不靠 prompt 自觉），submit 步不限制（需要 plan 提交）。
+        // 不靠 prompt 自觉），submit 步是机械步（无 speaker、无工具）。
         // code_graph 在列：拆分依据改用「文件+符号名」锚点后，符号
         // **存在性**是唯一硬要求，refine 需要它来自证。
         assert_eq!(refine.tools, vec!["read", "search", "code_graph"]);
@@ -6606,13 +7260,13 @@ task = "t"
                     "{path}: {id} 步必须写明重叠判据是路径字符串层、不区分读写"
                 );
             }
-            // ② 「只读」豁免必须在写草案的步骤里明写（这些步骤看不到
-            //    plan 工具的 schema）。
+            // ② 「只读」豁免必须在写草案/打补丁的步骤里明写（这些步骤看不到
+            //    plan 工具的 schema）。submit 是零模型调用的机械步，
+            //    没有 prompt，不在此列。
             for (id, text) in [
                 ("refine", refine.task_text()),
                 ("review", review.task_text()),
                 ("revise", revise.task_text()),
-                ("submit", submit.task_text()),
             ] {
                 assert!(
                     text.contains("只读"),
@@ -6636,20 +7290,23 @@ task = "t"
                 revise.task_text().contains("补之前先查"),
                 "{path}: revise 必须要求补 paths 前先查重"
             );
-            // ⑤ submit 步授权受限自愈 + 引擎兜底。
+            // ⑤ 提交由引擎机械完成（submit_plan_from），重叠/存在性校验在
+            //    refine（require_plan_tasks）与 revise patch 后各跑一遍——
+            //    「模型受限自愈 + require_plan_submit 兜底」已随模型转写步
+            //    一起退役。
             assert!(
-                submit.task_text().contains("受限自愈")
-                    && submit.task_text().contains("paths` 与 `labels"),
-                "{path}: submit 必须授权只改 paths/labels 的受限自愈"
+                refine.require_plan_tasks,
+                "{path}: refine 必须声明 require_plan_tasks（清单机械校验前置到产出时）"
             );
-            assert!(
-                submit.require_plan_submit,
-                "{path}: submit 必须声明 require_plan_submit（否则零任务入库仍报 ok）"
+            assert_eq!(
+                revise.patch_from.as_deref(),
+                Some("draft"),
+                "{path}: revise 必须是 patch 模式（补丁后引擎重跑机械校验）"
             );
-            assert!(
-                submit.max_retries >= 1,
-                "{path}: submit 需要重试预算才能自愈，实得 {}",
-                submit.max_retries
+            assert_eq!(
+                submit.submit_plan_from.as_deref(),
+                Some("final_draft"),
+                "{path}: submit 必须是引擎机械提交步（submit_plan_from）"
             );
         }
     }
@@ -6714,10 +7371,10 @@ task = "t"
                 .unwrap_or_else(|| panic!("{path}: 必须有 revise 步来落实 important 修正项"));
             assert_eq!(revise.output_key.as_deref(), Some("final_draft"), "{path}");
             let submit = wf.steps.iter().find(|s| s.id == "submit").expect("submit");
-            assert!(
-                submit.task_text().contains("{{final_draft}}")
-                    && !submit.task_text().contains("{{draft}}"),
-                "{path}: submit 必须消费修订后的草案（{{{{final_draft}}}}）"
+            assert_eq!(
+                submit.submit_plan_from.as_deref(),
+                Some("final_draft"),
+                "{path}: submit 必须消费修订后的草案（submit_plan_from = \"final_draft\"）"
             );
             // gate 不得再宣称「用户会在导入弹窗里看到 important」——
             // PlanProposed 事件只带 tasks，弹窗不展示评审结论（虚假免责
@@ -6958,6 +7615,7 @@ mod contract_engine_tests {
                 icon: String::new(),
                 skills: vec![],
                 code_paths: vec![],
+                description: String::new(),
             },
         )]);
         Arc::new(AgentConfig {
@@ -7083,6 +7741,7 @@ forbid = ["TBD"]
                     icon: String::new(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             );
         }
@@ -8035,6 +8694,104 @@ task = "提交清单 {{draft}}"
         );
     }
 
+    /// 回归（实测实锤：2026-09 jemalloc implementation_plan 会话）：
+    /// gate 三轮均输出 `VERDICT: REJECT`（带阻断证据的硬拒绝），耗尽点
+    /// advisor 复核的是 loop_back_to 目标的产出（breakdown 计划——本身
+    /// 没病），误判「实质合格」放行，run 以 ok 收尾、summary 却是
+    /// REJECT 原文——失败被吞成成功。
+    ///
+    /// `loop_no_release_on` 后：含不可放行标记的产出在耗尽点**不问
+    /// advisor** 直接判死。REVISE 类小瑕疵（不含标记）仍走复核放行
+    /// （见 loop_exhausted_advisor_ok_reaches_downstream）。
+    #[tokio::test]
+    async fn loop_exhausted_reject_marker_is_not_released() {
+        let server = wiremock::MockServer::start().await;
+        let draft = "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("产出拆分草案"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(draft)))
+            .mount(&server)
+            .await;
+        // gate 永远 REJECT（阻断问题，带证据）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("放行判定"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "VERDICT: REJECT 任务清单缺失 id/depends_on 字段，依赖拓扑全丢（B1/B2 阻断）。",
+            )))
+            .mount(&server)
+            .await;
+        // advisor 若被问到会判 ok——但含 REJECT 标记时根本不该问它。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: ok\nreason:\nhint:",
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("提交清单"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("不该到这里")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "loop_no_release_demo"
+[[steps]]
+id = "refine"
+role = "worker"
+task = "产出拆分草案 {{topic}}"
+output_key = "draft"
+[[steps]]
+id = "gate"
+role = "worker"
+task = "放行判定 {{draft}}"
+output_key = "approved"
+loop_until = "VERDICT: PASS"
+loop_back_to = "refine"
+loop_no_release_on = "VERDICT: REJECT"
+max_iterations = 2
+[[steps]]
+id = "submit"
+role = "worker"
+task = "提交清单 {{draft}}"
+"#,
+        )
+        .unwrap();
+        let mut ctx = test_ctx(test_config_at(&server.uri())).0;
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("REJECT 硬拒绝在耗尽点必须判死，不许复核放行");
+        assert!(err.contains("循环条件"), "应报循环条件未满足: {err}");
+        assert!(
+            err.contains("不可放行标记"),
+            "失败消息应说明是不可放行标记触发的: {err}"
+        );
+
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("最后一次语义复核")).count(),
+            0,
+            "含 REJECT 标记时绝不能问 advisor（问了就可能被放行）"
+        );
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("提交清单")).count(),
+            0,
+            "REJECT 硬拒绝绝不能放行到 submit"
+        );
+    }
+
     /// DAG 侧兜底（与串行同款）：返工环耗尽 → advisor 判 ok → 免除本
     /// step 的返工要求，wave 正常推进到下游。
     ///
@@ -8414,6 +9171,7 @@ mod resume_tests {
                 icon: String::new(),
                 skills: vec![],
                 code_paths: vec![],
+                description: String::new(),
             },
         )]);
         Arc::new(AgentConfig {
@@ -9207,7 +9965,7 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         // checkpoint 需要 meta 行才能被 load_checkpoint 接受。
-        let ckpt = CheckpointLog::new(cwd, "wf-ans-1", "design_and_plan", "主题", 0);
+        let ckpt = CheckpointLog::new(cwd, "wf-ans-1", "design_and_plan", "主题", 0, None);
         let log = AnswerLog::new(cwd, "wf-ans-1", None, None, Default::default());
 
         assert_eq!(log.recall("第 1 题：你的目标？"), None);
@@ -9242,7 +10000,7 @@ max_iterations = 3
     fn resumed_run_preloads_previous_answers() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _ckpt = CheckpointLog::new(cwd, "wf-ans-2", "design_and_plan", "主题", 0);
+        let _ckpt = CheckpointLog::new(cwd, "wf-ans-2", "design_and_plan", "主题", 0, None);
         AnswerLog::new(cwd, "wf-ans-2", None, None, Default::default())
             .record("tutor", "时间预算？", "10h+");
 
@@ -9263,13 +10021,13 @@ max_iterations = 3
     fn resume_carries_answers_into_new_checkpoint_file() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _ckpt = CheckpointLog::new(cwd, "wf-carry-1", "design_and_plan", "主题", 0);
+        let _ckpt = CheckpointLog::new(cwd, "wf-carry-1", "design_and_plan", "主题", 0, None);
         AnswerLog::new(cwd, "wf-carry-1", None, None, Default::default())
             .record("tutor", "时间预算？", "10h+");
         let first = load_checkpoint(cwd, "wf-carry-1").expect("第一份 checkpoint");
 
         // 模拟 run_workflow_inner 的 resume 抄写块（Step + Answer）。
-        let _ckpt2 = CheckpointLog::new(cwd, "wf-carry-2", "design_and_plan", "主题", 0);
+        let _ckpt2 = CheckpointLog::new(cwd, "wf-carry-2", "design_and_plan", "主题", 0, None);
         for (question, answer) in &first.answers {
             append_checkpoint(
                 cwd,
@@ -9305,7 +10063,7 @@ max_iterations = 3
     fn record_answer_for_run_is_recallable_on_resume() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _ckpt = CheckpointLog::new(cwd, "wf-orphan-1", "design_and_plan", "主题", 0);
+        let _ckpt = CheckpointLog::new(cwd, "wf-orphan-1", "design_and_plan", "主题", 0, None);
         // 没有活着的 AnswerLog（进程重启后就是这个状态）。
         record_answer_for_run(cwd, "wf-orphan-1", "tutor", "  选哪个？  ", "方案A");
 
@@ -9331,8 +10089,8 @@ max_iterations = 3
     fn nested_answer_lands_in_both_own_and_root_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _root = CheckpointLog::new(cwd, "wf-root-1", "design_and_plan", "主题", 0);
-        let _child = CheckpointLog::new(cwd, "wf-child-1", "requirements_review", "子主题", 0);
+        let _root = CheckpointLog::new(cwd, "wf-root-1", "design_and_plan", "主题", 0, None);
+        let _child = CheckpointLog::new(cwd, "wf-child-1", "requirements_review", "子主题", 0, None);
 
         // 子 run 的 AnswerLog：root 指向顶层。
         let log = AnswerLog::new(
@@ -9365,7 +10123,7 @@ max_iterations = 3
     fn top_level_answer_is_written_once() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _ckpt = CheckpointLog::new(cwd, "wf-solo-1", "design_and_plan", "主题", 0);
+        let _ckpt = CheckpointLog::new(cwd, "wf-solo-1", "design_and_plan", "主题", 0, None);
         // 顶层：root 显式等于自己（run_workflow_inner 里 root 为 None 时
         // resume_wf_id() 回落到 wf_id，这里模拟两者相等的情况）。
         let log = AnswerLog::new(
@@ -9417,8 +10175,8 @@ max_iterations = 3
     fn fresh_nested_run_recalls_answers_from_root() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _root = CheckpointLog::new(cwd, "wf-root-2", "design_and_plan", "主题", 0);
-        let _old_child = CheckpointLog::new(cwd, "wf-child-2a", "requirements_review", "子", 0);
+        let _root = CheckpointLog::new(cwd, "wf-root-2", "design_and_plan", "主题", 0, None);
+        let _old_child = CheckpointLog::new(cwd, "wf-child-2a", "requirements_review", "子", 0, None);
 
         // 第一次跑：子 run A 里用户答了题（双写本层 + 根）。
         AnswerLog::new(
@@ -9452,7 +10210,7 @@ max_iterations = 3
     fn answer_log_last_write_wins_on_repeat() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let _ckpt = CheckpointLog::new(cwd, "wf-ans-4", "wf", "t", 0);
+        let _ckpt = CheckpointLog::new(cwd, "wf-ans-4", "wf", "t", 0, None);
         let log = AnswerLog::new(cwd, "wf-ans-4", None, None, Default::default());
         log.record("tutor", "选哪个？", "A");
         log.record("tutor", "选哪个？", "B");
@@ -10038,6 +10796,7 @@ mod loop_tests {
             icon: String::new(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         };
         let roles = HashMap::from([
             ("programmer".to_string(), role("programmer")),
@@ -10540,5 +11299,342 @@ output_key = "design"
                 );
             }
         }
+    }
+
+    // ─── plan tasks 结构化 patch（require_plan_tasks / patch_from / submit_plan_from） ───
+
+    /// 带 src/ 与 docs/ 的临时目录：paths 机械校验需要真实存在的路径。
+    fn patch_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wf-patch-test-{}", tag));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        dir
+    }
+
+    const PATCH_DRAFT: &str = r#"草案说明文字。
+
+```json
+{"tasks": [
+  {"title": "T1 实现", "description": "做 T1", "priority": 2, "paths": ["src"]},
+  {"title": "T2 文档", "description": "写文档", "labels": ["只读"], "paths": ["docs"]}
+]}
+```
+"#;
+
+    #[test]
+    fn find_tasks_fence_requires_exactly_one_tasks_block() {
+        // 恰好一个 → 拿到 tasks 数组
+        let (_span, tasks) = find_tasks_fence(PATCH_DRAFT).expect("单 fence 应解析");
+        assert_eq!(tasks.as_array().unwrap().len(), 2);
+        // 没有 → 机械错误
+        let err = find_tasks_fence("纯文字，没有清单").unwrap_err();
+        assert!(err.contains("tasks"), "{err}");
+        // 两个 → 拒绝（哪份是 canonical 无从判断）
+        let two = format!("{PATCH_DRAFT}\n{PATCH_DRAFT}");
+        let err = find_tasks_fence(&two).unwrap_err();
+        assert!(err.contains("2 个"), "{err}");
+    }
+
+    #[test]
+    fn apply_task_patch_happy_path() {
+        let dir = patch_test_dir("happy");
+        let resp = "把 T1 的优先级提到 1。\n\n```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
+        let out = apply_task_patch(PATCH_DRAFT, resp, &dir).expect("patch 应成功");
+        // 补丁后的 fence 里是结构化的新值
+        let (_span, tasks) = find_tasks_fence(&out).expect("产出仍含唯一清单");
+        assert_eq!(tasks[0]["priority"], serde_json::json!(1));
+        assert_eq!(tasks[1]["title"], "T2 文档");
+        // 修订说明（ops fence 之外的文字）附在末尾
+        assert!(out.contains("本次修订"), "{out}");
+        assert!(out.contains("把 T1 的优先级提到 1"), "{out}");
+        // 草案正文保留
+        assert!(out.contains("草案说明文字"), "{out}");
+    }
+
+    #[test]
+    fn apply_task_patch_empty_ops_passes_draft_through() {
+        let dir = patch_test_dir("empty");
+        let resp = "无 important 项，草案未改动。\n\n```json\n{\"ops\": []}\n```\n";
+        let out = apply_task_patch(PATCH_DRAFT, resp, &dir).expect("空 ops 应放行");
+        assert_eq!(out, PATCH_DRAFT);
+    }
+
+    #[test]
+    fn apply_task_patch_unknown_task_lists_titles() {
+        let dir = patch_test_dir("unknown");
+        let resp = "```json\n{\"ops\": [{\"task\": \"T9\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
+        let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
+        assert!(err.contains("T9") && err.contains("T1 实现"), "{err}");
+    }
+
+    #[test]
+    fn apply_task_patch_ambiguous_task_rejected() {
+        let dir = patch_test_dir("ambiguous");
+        // 「T」同时匹配 T1/T2
+        let resp = "```json\n{\"ops\": [{\"task\": \"T\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
+        let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
+        assert!(err.contains("匹配到 2 个任务"), "{err}");
+    }
+
+    #[test]
+    fn apply_task_patch_unknown_field_rejected() {
+        let dir = patch_test_dir("field");
+        let resp = "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"owner\", \"set\": \"x\"}]}\n```\n";
+        let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
+        assert!(err.contains("owner") && err.contains("paths"), "{err}");
+    }
+
+    #[test]
+    fn apply_task_patch_type_mismatch_rejected() {
+        let dir = patch_test_dir("type");
+        let resp = "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"title\", \"set\": 5}]}\n```\n";
+        let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
+        assert!(err.contains("类型"), "{err}");
+    }
+
+    #[test]
+    fn apply_task_patch_noop_guard() {
+        let dir = patch_test_dir("noop");
+        // priority 已是 2，再 set 2 = 无实际修改
+        let resp = "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"priority\", \"set\": 2}]}\n```\n";
+        let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
+        assert!(err.contains("无实际修改"), "{err}");
+    }
+
+    /// 补丁后重跑 plan 机械校验：把 docs 改到 T1 持有的 src 上制造
+    /// 字符串层重叠（T2 无只读豁免时）——必须被拦下（实录：revise
+    /// 直接补 paths 曾把清单从「可提交」推成「整单被拒」）。
+    #[test]
+    fn parse_ops_tolerates_closing_fence_on_content_line() {
+        // 实测 glm-5.3：闭合 ``` 写在 JSON 最后一行的行尾，不换行。
+        let resp = "修订说明。\n\n```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"priority\", \"set\": 1}]} ```\n";
+        let (ops, _span) = parse_task_patch_ops(resp).expect("行尾闭合应被容忍");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].task, "T1");
+    }
+
+    #[test]
+    fn apply_task_patch_revalidates_overlap() {
+        let dir = patch_test_dir("overlap");
+        let draft = r#"```json
+{"tasks": [
+  {"title": "T1 实现", "paths": ["src"]},
+  {"title": "T2 工具", "paths": ["docs"]}
+]}
+```"#;
+        let resp = "```json\n{\"ops\": [{\"task\": \"T2\", \"field\": \"paths\", \"set\": [\"docs\", \"src\"]}]}\n```\n";
+        let err = apply_task_patch(draft, resp, &dir).unwrap_err();
+        assert!(err.contains("机械校验"), "{err}");
+    }
+
+    #[test]
+    fn check_plan_tasks_output_runs_plan_validation() {
+        let dir = patch_test_dir("contract");
+        assert!(check_plan_tasks_output(PATCH_DRAFT, &dir).is_ok());
+        // 幻觉路径 → 机械校验打回
+        let bad = "```json\n{\"tasks\": [{\"title\": \"T\", \"paths\": [\"nonexistent_dir_xyz\"]}]}\n```";
+        let err = check_plan_tasks_output(bad, &dir).unwrap_err();
+        assert!(err.contains("机械校验"), "{err}");
+    }
+
+    /// `require_symbols_resolvable` 的引擎侧接线：产出里查不到的符号要被
+    /// 打回，真实符号要放行。判据细节在
+    /// `latte_rs_agent_tools::utils::symbol_check` 自己的测试里。
+    ///
+    /// 回归 2026-09 jemalloc 会话：`require_tools_any`（调没调工具）与
+    /// `require_plan_tasks`（路径存在性）都管不到「文件对、函数名假」，
+    /// 而那 74 个幻觉符号里 39 个出自模型压根没打开过的文件。
+    #[test]
+    fn check_symbols_output_rejects_unresolvable_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/arena.c"),
+            "void\narena_slab_reg_alloc(bin_t *bin) {\n\t(void)bin;\n}\n",
+        )
+        .unwrap();
+
+        // 真实符号 → 放行。
+        assert!(
+            check_symbols_output("主线索是 `arena_slab_reg_alloc`。", root).is_ok(),
+            "真实符号不该被拦"
+        );
+        // 旧版本符号 → 打回，且批注里点名并给出相近真实符号。
+        let err = check_symbols_output("主线索是 `arena_bin_malloc_hard`。", root)
+            .expect_err("查不到的符号必须被拦");
+        assert!(err.contains("arena_bin_malloc_hard"), "{err}");
+        assert!(err.contains("code_graph"), "批注要指路到正确工具：{err}");
+    }
+
+    /// 该字段能从 step TOML 解析（默认 false = 不校验）。
+    #[test]
+    fn require_symbols_resolvable_parses_from_step_toml() {
+        let on: WorkflowStepDef = toml::from_str(
+            "id = \"s\"\nrole = \"worker\"\ntask = \"t\"\nrequire_symbols_resolvable = true",
+        )
+        .expect("parse");
+        assert!(on.require_symbols_resolvable);
+        let off: WorkflowStepDef =
+            toml::from_str("id = \"s\"\nrole = \"worker\"\ntask = \"t\"").expect("parse");
+        assert!(!off.require_symbols_resolvable, "默认不校验");
+    }
+
+    #[test]
+    fn validate_patch_fields_shape() {
+        // patch_from 必须指向更早 step 的 output_key
+        let bad_later = r#"
+name = "w"
+[[steps]]
+id = "a"
+role = "worker"
+task = "t"
+patch_from = "draft"
+
+[[steps]]
+id = "b"
+role = "worker"
+task = "t"
+output_key = "draft"
+"#;
+        let wf: WorkflowDef = toml::from_str(bad_later).unwrap();
+        let err = wf.validate().unwrap_err();
+        assert!(err.contains("patch_from") && err.contains("更早"), "{err}");
+
+        // submit_plan_from 与 speakers 互斥
+        let bad_speakers = r#"
+name = "w"
+[[steps]]
+id = "a"
+role = "worker"
+task = "t"
+output_key = "draft"
+
+[[steps]]
+id = "b"
+speakers = ["worker"]
+submit_plan_from = "draft"
+"#;
+        let wf: WorkflowDef = toml::from_str(bad_speakers).unwrap();
+        let err = wf.validate().unwrap_err();
+        assert!(err.contains("互斥"), "{err}");
+
+        // DAG 下禁用
+        let dag = r#"
+name = "w"
+[[steps]]
+id = "a"
+role = "worker"
+task = "t"
+output_key = "draft"
+
+[[steps]]
+id = "b"
+role = "worker"
+task = "t"
+depends_on = ["a"]
+patch_from = "draft"
+"#;
+        let wf: WorkflowDef = toml::from_str(dag).unwrap();
+        let err = wf.validate().unwrap_err();
+        assert!(err.contains("串行"), "{err}");
+
+        // 合法形态通过
+        let ok = r#"
+name = "w"
+[[steps]]
+id = "a"
+role = "worker"
+task = "t"
+output_key = "draft"
+require_plan_tasks = true
+
+[[steps]]
+id = "b"
+role = "worker"
+task = "t"
+output_key = "final_draft"
+patch_from = "draft"
+
+[[steps]]
+id = "c"
+submit_plan_from = "final_draft"
+"#;
+        let wf: WorkflowDef = toml::from_str(ok).unwrap();
+        wf.validate().expect("合法 patch 流程应通过校验");
+    }
+
+    /// 端到端（wiremock 假模型）：refine 出结构化草案 → revise 只输出
+    /// ops → submit 零模型调用机械提交。断言：模型请求只有 2 次
+    /// （submit 不调模型）、PlanProposed 里是打过补丁的清单。
+    #[tokio::test]
+    async fn serial_patch_revise_and_mechanical_submit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::start().await;
+        let draft_resp = "草案说明。\n\n```json\n{\"tasks\": [{\"title\": \"T1 实现\", \"description\": \"做 T1\", \"priority\": 2, \"paths\": [\"src\"]}, {\"title\": \"T2 文档\", \"description\": \"写文档\", \"labels\": [\"只读\"], \"paths\": [\"docs\"]}]}\n```\n";
+        let ops_resp = "把 T1 的优先级提到 1。\n\n```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
+        // wiremock 后注册先匹配：revise 的匹配器（含「请修补」）先注册
+        // 也行——两个匹配器互斥（请求体不会同时含「请拆分」和「请修补」）。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("请修补"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(ops_resp)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(draft_resp)))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "patch_flow"
+[[steps]]
+id = "refine"
+role = "reviewer"
+task = "请拆分"
+output_key = "draft"
+require_plan_tasks = true
+
+[[steps]]
+id = "revise"
+role = "reviewer"
+task = "请修补 {{draft}}"
+output_key = "final_draft"
+patch_from = "draft"
+
+[[steps]]
+id = "submit"
+submit_plan_from = "final_draft"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+
+        let (ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        // paths 机械校验需要真实目录
+        let dir = patch_test_dir("e2e");
+        let ctx = WorkflowRunContext { cwd: dir, ..ctx };
+        let out = run_workflow(&wf, "测试主题", &ctx).await.expect("workflow 应成功");
+        assert!(out.contains("已提交 2 个任务候选"), "{out}");
+
+        // submit 是机械步：模型请求只有 refine + revise 两次。
+        let n = server.received_requests().await.unwrap().len();
+        assert_eq!(n, 2, "submit 不应产生模型调用，实际 {n} 次");
+
+        // PlanProposed 里是打过补丁的清单（T1 priority 已被 patch 成 1）。
+        let mut proposed = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::PlanProposed { tasks, .. } = ev {
+                proposed = Some(tasks);
+            }
+        }
+        let tasks = proposed.expect("应发出 PlanProposed 事件");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].title, "T1 实现");
+        assert_eq!(tasks[0].priority, Some(1), "patch 应已生效");
+        assert_eq!(tasks[1].labels, vec!["只读".to_string()]);
     }
 }

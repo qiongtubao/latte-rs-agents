@@ -530,8 +530,15 @@ pub struct PlanTask {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub labels: Vec<String>,
-    /// 执行该任务的 workflow 名（tdd_development/bug_triage/update_docs）。
-    /// 轻量任务可空。空则不序列化。
+    /// 任务类型 id（feature/bugfix/learn/research/…，注册表见
+    /// `config/task_types.toml` + 项目层 `.latte/task_types.toml` 覆盖）。
+    /// 派发时按类型推导默认 workflow；轻量任务可空（走 manager）。
+    /// 空则不序列化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_type: Option<String>,
+    /// 执行该任务的 workflow 名。**默认留空**：不绑定 = 派发时先按
+    /// `task_type` 的默认 workflow 推导，无类型则走普通 manager 会话。
+    /// 仅当确需偏离类型默认流程时才显式填写。空则不序列化。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
     /// 任务涉及的文件/目录前缀（相对项目根）：并行执行时范围重叠的
@@ -555,7 +562,7 @@ pub struct PlanTask {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub paths: Vec<String>,
-    /// 子任务，同构，最多一层。空则不序列化。
+    /// 子任务，同构，任意深度嵌套（任务树）。空则不序列化。
     #[serde(
         default,
         deserialize_with = "empty_str_as_empty_vec",
@@ -3349,6 +3356,7 @@ fn input_property(
         properties: None,
         required: None,
         additional_properties: None,
+        ref_: None,
     }
 }
 
@@ -3485,18 +3493,31 @@ fn add_batch_read_contract(
     tool.handler = Arc::new(move |input, ctx| {
         let base_handler = base_handler.clone();
         Box::pin(async move {
+            let mut input = input;
+            // 先快照实收键：归一化会丢弃空 path/paths 条目，(None,None)
+            // 报错若事后才读键名，模型看到的 keys 里就没有 path/paths，
+            // 无法对号入座自纠（实测 MiniMax-M3 发 `{"path":"","paths":[""]}`）。
+            let received_keys: Vec<String> = input
+                .as_object()
+                .map(|obj| obj.keys().cloned().collect())
+                .unwrap_or_default();
+            normalize_read_path_args(&mut input);
+            fold_read_range_keys(&mut input)?;
             let path = input.get("path");
             let paths = input.get("paths");
             match (path, paths) {
                 (Some(_), Some(_)) => {
                     return Err(ToolError::other(
-                        "exactly one of 'path' or 'paths' is required",
+                        "exactly one of 'path' or 'paths' is required, got both",
                     ));
                 }
                 (None, None) => {
-                    return Err(ToolError::other(
-                        "exactly one of 'path' or 'paths' is required",
-                    ));
+                    // 附上实际收到的顶层键：实测模型把参数多套一层
+                    // `{"arguments":{…}}` 信封时，只说"缺 path/paths"会让它
+                    // 原样重试同样的错误形状；点名多余键它才能自我纠正。
+                    return Err(ToolError::other(format!(
+                        "exactly one of 'path' or 'paths' is required, got neither (received keys: {received_keys:?})"
+                    )));
                 }
                 (Some(value), None) => {
                     if !value.is_string() {
@@ -3594,6 +3615,200 @@ fn add_batch_read_contract(
     tool
 }
 
+
+/// `read` 的 path/paths 二选一校验之前的归一化：意图明确时归并服务，
+/// 与 `fold_read_range_keys` / `normalize_llm_args` 同思路。
+///
+/// 实测事故（jemalloc 会话 2026-09-05，reviewer / MiniMax-M3）：模型反复
+/// 同时给出两者——`{"path":"a.c:raw","paths":["a.c:raw","b.c:raw",…]}`，
+/// 被 oneOf 校验连拒 8 次触发 tool-loop 熔断，拖死整个 workflow。同会话
+/// manager / glm-5.3 还把字符串化的 JSON 数组塞进过 `path`
+/// （`"path":"[\"a.c:1-1\", …]"`）。两种形状的意图都无歧义——就是批量读，
+/// 归并成 paths 继续执行；归并不了的（paths 不是数组等）才留给后面的
+/// match 报错。
+fn normalize_read_path_args(input: &mut serde_json::Value) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+
+    // 模型用 `""`/空白表示"没传"（实测 MiniMax-M3 反复发
+    // `{"path":"","paths":[…]}`）：空 path 视为未传，否则它会被并入
+    // paths 触发 "every 'paths' entry must be a non-empty string"。
+    let path_is_blank = obj
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(false);
+    if path_is_blank {
+        obj.remove("path");
+    }
+    // 同理过滤 paths 数组里的空/空白条目；全空则移除整个键，让
+    // 后续 (None,None) 分支报出准确的"缺 path/paths"。
+    if let Some(arr) = obj.get_mut("paths").and_then(|v| v.as_array_mut()) {
+        arr.retain(|item| item.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true));
+    }
+    let paths_now_empty = obj
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.is_empty())
+        .unwrap_or(false);
+    if paths_now_empty {
+        obj.remove("paths");
+    }
+
+    // path 里塞了字符串化的 JSON 数组 → 还原成数组并入 paths。
+    if let Some(path_str) = obj.get("path").and_then(|v| v.as_str()).map(str::to_owned) {
+        let trimmed = path_str.trim_start();
+        if trimmed.starts_with('[') {
+            if let Ok(serde_json::Value::Array(items)) =
+                serde_json::from_str::<serde_json::Value>(trimmed)
+            {
+                if items.iter().all(|item| item.is_string()) {
+                    obj.remove("path");
+                    let has_array_paths =
+                        obj.get("paths").map(|v| v.is_array()).unwrap_or(false);
+                    if has_array_paths {
+                        if let Some(arr) = obj.get_mut("paths").and_then(|v| v.as_array_mut()) {
+                            arr.extend(items);
+                        }
+                    } else {
+                        obj.insert("paths".into(), serde_json::Value::Array(items));
+                    }
+                }
+            }
+        }
+    }
+
+    // path + paths 同时存在且 paths 是数组 → path 并入 paths（去重，保序）。
+    if let Some(path_str) = obj.get("path").and_then(|v| v.as_str()).map(str::to_owned) {
+        let has_array_paths = obj.get("paths").map(|v| v.is_array()).unwrap_or(false);
+        if has_array_paths {
+            obj.remove("path");
+            if let Some(arr) = obj.get_mut("paths").and_then(|v| v.as_array_mut()) {
+                if !arr.iter().any(|item| item.as_str() == Some(path_str.as_str())) {
+                    arr.push(serde_json::Value::String(path_str));
+                }
+            }
+        }
+    }
+}
+
+/// `read` 的行范围只有一种入口：写进 path 里的选择器（`path:start-end`）。
+/// 模型很自然会改用**独立的 start/end 参数**——这些键 schema 没声明，
+/// 而 schema 校验对未声明键既不拒绝也不告警，于是它们被**静默丢弃**，
+/// read 照常返回 ok + 整文件结构摘要。
+///
+/// 实测事故（task_planner / glm-5.3）：`{"path":"…controller.rs",
+/// "start":3786,"end":3985}` 返回 ok，内容却是整文件（273 处折叠、11030
+/// 行省略）。模型自己看出来了（"两次调用都返回了整个文件的摘要"），又花
+/// 2 轮改写——静默丢参数比直接报错贵得多。
+///
+/// 这里把它们**折进选择器**而不是报错：参数意图明确、无歧义，能服务就
+/// 服务（与 `normalize_llm_args` 同思路）。真有歧义时才报错，且报错文案
+/// 直接给出正确写法。
+fn fold_read_range_keys(
+    input: &mut serde_json::Value,
+) -> Result<(), latte_rs_agent_tools::error::ToolError> {
+    use latte_rs_agent_tools::error::ToolError;
+
+    const START_KEYS: &[&str] = &["start", "start_line", "startLine", "from", "from_line", "begin", "offset"];
+    const END_KEYS: &[&str] = &["end", "end_line", "endLine", "to", "to_line", "last_line"];
+    const COUNT_KEYS: &[&str] = &["count", "limit", "lines", "num_lines"];
+
+    let Some(obj) = input.as_object_mut() else {
+        return Ok(());
+    };
+
+    /// 取第一个存在且能读成正整数的键（数字或数字字符串），并记下键名。
+    fn take_num(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        keys: &[&str],
+    ) -> Option<(String, u64)> {
+        for k in keys {
+            let Some(v) = obj.get(*k) else { continue };
+            let n = v
+                .as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()));
+            if let Some(n) = n.filter(|n| *n >= 1) {
+                let k = (*k).to_string();
+                obj.remove(&k);
+                return Some((k, n));
+            }
+        }
+        None
+    }
+
+    let start = take_num(obj, START_KEYS);
+    let end = take_num(obj, END_KEYS);
+    let count = take_num(obj, COUNT_KEYS);
+
+    // 一个都没有 → 常态路径，什么都不做。
+    if start.is_none() && end.is_none() && count.is_none() {
+        return Ok(());
+    }
+
+    let hint = "行范围写在 path 里：`path:start-end`、`path:start+count`、`path:N`；\
+                整文件原文用 `path:raw`。多个目标用 paths 数组，每项各自带选择器。";
+
+    // paths（批量）里每项自带选择器，顶层范围键无从对应。
+    if obj.contains_key("paths") {
+        return Err(ToolError::other(format!(
+            "read: 批量 paths 不接受顶层行范围参数。{hint}"
+        )));
+    }
+
+    let Some(path) = obj.get("path").and_then(|v| v.as_str()).map(str::to_owned) else {
+        return Err(ToolError::other(format!("read: 有行范围参数但缺 path。{hint}")));
+    };
+    // path 已带选择器 → 两处范围冲突，不猜哪个作准。
+    if read_path_has_selector(&path) {
+        return Err(ToolError::other(format!(
+            "read: path 已带行范围选择器（{path}），不要再传独立的行范围参数。{hint}"
+        )));
+    }
+
+    let Some((_, start)) = start else {
+        return Err(ToolError::other(format!(
+            "read: 只给了终点/长度、缺起始行。{hint}"
+        )));
+    };
+    let selector = match (end, count) {
+        (Some((k, end)), _) => {
+            if end < start {
+                return Err(ToolError::other(format!(
+                    "read: {k}={end} 小于起始行 {start}。{hint}"
+                )));
+            }
+            format!("{start}-{end}")
+        }
+        (None, Some((_, count))) => format!("{start}+{count}"),
+        (None, None) => start.to_string(),
+    };
+    obj.insert(
+        "path".into(),
+        serde_json::Value::String(format!("{path}:{selector}")),
+    );
+    Ok(())
+}
+
+/// path 尾部是否已经是行范围选择器。判据与
+/// `latte_rs_agent_tools::tools::file` 的 `parse_path_selector` 保持一致：
+/// 最后一个 `:` 之后是 `raw` / `conflicts` / 纯 `0-9,-+` 才算选择器
+/// （否则是 Windows 盘符、`http://` 之类的普通冒号）。
+fn read_path_has_selector(path: &str) -> bool {
+    let Some(pos) = path.rfind(':') else {
+        return false;
+    };
+    let after = &path[pos + 1..];
+    if path[..pos].is_empty() || after.starts_with('\\') || after.is_empty() {
+        return false;
+    }
+    after == "raw"
+        || after == "conflicts"
+        || after
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == ',')
+}
 
 /// Build an allowlisted tool manager rooted at the current directory.
 ///
@@ -3714,12 +3929,14 @@ pub(crate) fn register_request_tool(
                 description: Some("要申请使用的工具名称。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
             ("reason".into(), ToolInputProperty {
                 property_type: PropertyType::String,
                 description: Some("申请使用该工具的原因（角色 prompt 的上下文或任务需求描述）。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
         ].into_iter().collect(),
         required: Some(vec!["tool_name".into(), "reason".into()]),
@@ -3885,13 +4102,67 @@ fn code_graph_lang_from_ext(ext: &str) -> Option<&'static str> {
     })
 }
 
-/// 从路径推断语言。目录路径推断不出来（没有扩展名），调用方需要显式传 `lang`。
+/// 从单个文件路径的扩展名推断语言。目录走 `code_graph_infer_dir_lang`。
 fn code_graph_infer_lang(path: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
     code_graph_lang_from_ext(&ext)
+}
+
+/// 目录的语言推断：递归统计已知扩展名的源文件数，取文件数最多的语言。
+/// 返回 (主导语言, 其它在场的语言)；扫不到可识别源文件时返回 None，
+/// 调用方再要求显式传 `lang`。
+///
+/// 跳过隐藏目录和依赖/构建产物目录（node_modules、target 等），否则
+/// vendored 依赖会淹没主导语言统计。visited 封顶防止病态大目录卡住工具。
+fn code_graph_infer_dir_lang(path: &str) -> Option<(&'static str, Vec<&'static str>)> {
+    const MAX_VISIT: usize = 50_000;
+    let mut counts: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    let mut visited = 0usize;
+    let mut stack = vec![std::path::PathBuf::from(path)];
+    'walk: while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_VISIT {
+                break 'walk;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // 隐藏文件/目录（.git、.latte、.github…）不参与统计。
+            if name.starts_with('.') {
+                continue;
+            }
+            let ft = match entry.file_type() {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                if matches!(name.as_ref(), "node_modules" | "target" | "dist" | "out") {
+                    continue;
+                }
+                stack.push(entry.path());
+            } else if let Some(lang) = std::path::Path::new(name.as_ref())
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .and_then(|e| code_graph_lang_from_ext(&e))
+            {
+                *counts.entry(lang).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(&'static str, usize)> = counts.into_iter().collect();
+    // 文件数降序；并列时按语言名定序，保证结果稳定。
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let (top, _) = *ranked.first()?;
+    let others = ranked[1..].iter().map(|(l, _)| *l).collect();
+    Some((top, others))
 }
 
 /// 查 (语言, 语义 kind) 对应的 tree-sitter 节点类型列表。
@@ -4127,7 +4398,8 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         minimum: None,
         maximum: None,
         min_length: None,
-        max_length: None, items: None, properties: None, required: None, additional_properties: None }
+        max_length: None, items: None, properties: None, required: None, additional_properties: None, ref_: None,
+        }
     }
     fn optional_schema(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
         let mut p = std::collections::BTreeMap::new();
@@ -4139,10 +4411,11 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             properties: p,
             required: None,
             additional_properties: None,
+            defs: None,
         }
     }
 
-    let handler: SharedToolHandler = Arc::new(|input: serde_json::Value, _ctx| {
+    let handler: SharedToolHandler = Arc::new(|input: serde_json::Value, ctx| {
         Box::pin(async move {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let raw_pattern = input
@@ -4176,8 +4449,23 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 ));
             }
             if !std::path::Path::new(path).exists() {
+                // 幻觉路径自救：附模糊匹配的相近真实路径，让模型一轮改对
+                // 而不是换个名字再猜（实测 jemalloc 会话：planner 连撞
+                // src/hash.c / src/slab.c 等 ≤5.2 旧文件名，6 连 ToolError）。
+                let cg_cwd = ctx
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("cwd"))
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    });
                 return Err(ToolError::validation(
-                    format!("code_graph: path 不存在：{path}"),
+                    format!(
+                        "code_graph: path 不存在：{path}{}",
+                        latte_rs_agent_tools::utils::path_suggest::suggestion_suffix(&cg_cwd, path)
+                    ),
                     vec![latte_rs_agent_tools::error::ValidationIssue {
                         path: "path".into(),
                         message: "文件或目录不存在".into(),
@@ -4219,6 +4507,8 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             // so validate them before the index fast-path as well as before the
             // external backend. An index hit must not hide invalid arguments.
             let validated_lang_owned: String;
+            // 目录自动推断出 lang 且目录里还有其它语言的源文件时，给模型一条提示。
+            let mut dir_lang_note: Option<String> = None;
             let validated_lang: &str = match input
                 .get("lang")
                 .and_then(|v| v.as_str())
@@ -4229,22 +4519,39 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     validated_lang_owned = lang.to_ascii_lowercase();
                     &validated_lang_owned
                 }
-                None => match code_graph_infer_lang(path) {
-                    Some(lang) => lang,
-                    None => {
-                        return Err(ToolError::validation(
-                            format!(
-                                "code_graph: 无法从 path='{path}' 推断语言（目录或未知扩展名），\
-                                 请显式传 lang。支持：{}",
-                                code_graph_supported_langs().join(", ")
-                            ),
-                            vec![latte_rs_agent_tools::error::ValidationIssue {
-                                path: "lang".into(),
-                                message: "目录路径必须显式指定 lang".into(),
-                            }],
-                        ));
+                None => {
+                    let inferred = if std::path::Path::new(path).is_dir() {
+                        // 目录：按内容统计推断主导语言，免去显式传 lang。
+                        code_graph_infer_dir_lang(path).map(|(lang, others)| {
+                            if !others.is_empty() {
+                                dir_lang_note = Some(format!(
+                                    "lang 未指定，按目录内容自动推断为 '{lang}'；\
+                                     目录里还有 {} 的源文件，要查它们请显式传 lang。",
+                                    others.join(", ")
+                                ));
+                            }
+                            lang
+                        })
+                    } else {
+                        code_graph_infer_lang(path)
+                    };
+                    match inferred {
+                        Some(lang) => lang,
+                        None => {
+                            return Err(ToolError::validation(
+                                format!(
+                                    "code_graph: 无法推断 path='{path}' 的语言（扩展名未知，\
+                                     或目录下没有可识别的源文件），请显式传 lang。支持：{}",
+                                    code_graph_supported_langs().join(", ")
+                                ),
+                                vec![latte_rs_agent_tools::error::ValidationIssue {
+                                    path: "lang".into(),
+                                    message: "无法自动推断语言，需显式指定".into(),
+                                }],
+                            ));
+                        }
                     }
-                },
+                }
             };
             if let Some(k) = kind {
                 if code_graph_node_kinds(validated_lang, k).is_empty() {
@@ -4313,6 +4620,12 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                                  lang='{validated_lang}' 可用 kind：{}。",
                                 code_graph_kinds_for_lang(validated_lang).join(", ")
                             )));
+                        }
+                        if let Some(n) = &dir_lang_note {
+                            result.insert(
+                                "lang_note".into(),
+                                serde_json::Value::String(n.clone()),
+                            );
                         }
                         return Ok(serde_json::Value::Object(result));
                     }
@@ -4420,20 +4733,37 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     .and_then(|c| std::path::Path::new(file_raw).strip_prefix(c).ok())
                     .map(|rel| rel.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|| file_raw.to_string());
-                let line = m
+                let start_line = m
                     .get("range")
                     .and_then(|r| r.get("start"))
                     .and_then(|s| s.get("line"))
                     .and_then(|l| l.as_u64())
                     .map(|l| l + 1) // ast-grep 的 line 是 0-based
                     .unwrap_or(0);
+                let end_line = m
+                    .get("range")
+                    .and_then(|r| r.get("end"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .map(|l| l + 1)
+                    .unwrap_or(0);
+                // 位置锚点报**跨度**而不是单个起始行：`file:start-end` 能被
+                // 直接粘进 `read` 的行范围选择器，模型不必再猜函数有多长。
+                // 实测事故（task_planner）：只给起始行时它猜 `3874-3950` 去读
+                // `code_graph_build_rule`（真实跨度 3935-3979），正好切掉
+                // match 的 `Some(name)` 分支，只能回一句"body 部分被截断了"。
+                let span = if end_line > start_line {
+                    format!("{start_line}-{end_line}")
+                } else {
+                    start_line.to_string()
+                };
                 let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 let body = if want_full {
                     text.to_string()
                 } else {
                     code_graph_signature_of(text)
                 };
-                let entry = format!("{file}:{line}: {body}");
+                let entry = format!("{file}:{span}: {body}");
                 if chars + entry.len() > MAX_CHARS {
                     break;
                 }
@@ -4484,6 +4814,9 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     serde_json::Value::String(diagnostic),
                 );
             }
+            if let Some(n) = &dir_lang_note {
+                result.insert("lang_note".into(), serde_json::Value::String(n.clone()));
+            }
             Ok(serde_json::Value::Object(result))
         })
     });
@@ -4492,7 +4825,7 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         (
             "path",
             PropertyType::String,
-            "搜索路径，文件或目录。默认当前目录。指向单个文件时可省略 lang（按扩展名推断）",
+            "搜索路径，文件或目录。默认当前目录。lang 一般可省略：单文件按扩展名推断，目录按内容自动推断",
         ),
         (
             "kind",
@@ -4505,7 +4838,8 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             "lang",
             PropertyType::String,
             "语言：c / cpp / rust / go / python / typescript / javascript / java。\
-             path 是目录时必填",
+             可选——不传时自动推断（单文件按扩展名，目录按内容统计主导语言）；\
+             只有推断失败、或目录多语言混杂要查非主导语言时才需要显式传",
         ),
         (
             "name",
@@ -4593,6 +4927,59 @@ pub(crate) fn role_roster_text(merged: &AgentConfig) -> String {
     entries.join(", ")
 }
 
+/// 角色类别的中文标签（花名册详情行用）。
+fn category_label(category: &str) -> &str {
+    match category {
+        "planning" => "规划",
+        "execution" => "执行",
+        "verification" => "验证",
+        "custom" => "自定义",
+        _ => "其他",
+    }
+}
+
+/// 角色花名册的**详情版**：每行一个角色，含 id、显示名、类别、职责
+/// 描述与可用工具 —— manager 选角色靠的是职责匹配，光有 `id(Name)`
+/// 清单时分不清 `programmer_rust` 和 `programmer_go` 之外的细分角色
+/// 各干什么。
+///
+/// 职责描述取 `RoleTemplate.description`（角色编辑器可写）；留空时
+/// 回退到「类别 + 工具清单」的派生简介，自定义角色不写描述也能
+/// 得到一行可用的介绍。
+pub(crate) fn role_roster_detail_text(merged: &AgentConfig) -> String {
+    let mut templates: Vec<&crate::role::RoleTemplate> = merged.roles.values().collect();
+    templates.sort_by(|a, b| a.id.cmp(&b.id));
+    templates
+        .into_iter()
+        .map(|t| {
+            let duty = if t.description.trim().is_empty() {
+                format!("{}类角色", category_label(&t.category))
+            } else {
+                t.description.trim().to_string()
+            };
+            let name_part = if t.name.is_empty() || t.name == t.id {
+                String::new()
+            } else {
+                format!("（{}）", t.name)
+            };
+            let tools_part = if t.tools.is_empty() {
+                "无工具".to_string()
+            } else {
+                format!("tools: {}", t.tools.join(", "))
+            };
+            format!(
+                "- `{}`{} — {}【{}；{}】",
+                t.id,
+                name_part,
+                duty,
+                category_label(&t.category),
+                tools_part
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 
 /// 单 session 累计 delegate 工具调用上限。env `LATTE_MAX_DELEGATES_PER_SESSION`
 /// 覆盖；非法值回退到默认。0 = 禁用限制（无上限）。
@@ -4611,17 +4998,25 @@ pub fn default_max_delegates() -> u32 {
 /// the system prompt — the model sees it alongside the schema. The role
 /// list is generated from `merged.roles` so role-editor additions show
 /// up immediately.
-fn delegate_tool_hint(merged: &AgentConfig) -> String {
-    let roster = role_roster_text(merged);
-    let roster_line = if roster.is_empty() {
+///
+/// UI 工具面板的详情弹层（`GET /api/tools/delegate/doc`）也直接复用
+/// 本函数，保证面板显示的就是模型随 schema 读到的那份。
+pub fn delegate_tool_hint(merged: &AgentConfig) -> String {
+    let roster = role_roster_detail_text(merged);
+    let roster_block = if roster.is_empty() {
         "（当前配置里没有任何角色）".to_string()
     } else {
         roster
     };
     format!(
-        "Delegate a subtask to a specialist agent. Available roles (sorted, including custom roles from the role editor): {roster_line}\n\
-         \nWhen to use: a focused task that needs one specialist. Params: role (must be from the list above) + task (natural language goal + acceptance criteria). Batch independent tasks in the same round (2-4 in parallel); do not serialize. Write the task as goal + acceptance criteria — never commands/tool names/step sequences. If a specialist returns empty, wrong, or too-short output, re-dispatch or escalate to the advisor.\n\
-         \nNever use for: trivial single-step work you can do directly. Always use this instead of analyzing things yourself when the task needs a specialist."
+        "Delegate a subtask to a specialist role. The specialist runs as an independent sub-agent with its own context, tools, and model chain; you only get back its final summary (plus, sometimes, an advisor review annotation).\n\
+         \nAvailable roles — 每行一个：`id`（显示名）— 职责【类别；tools】。按职责匹配选角色，不要只看 id 猜；这份清单按当前配置动态生成，角色编辑器里新建/改名/写了职责描述的角色会自动出现在这里。传 `role` 时只填 id 部分（如 `programmer`，不要带括号里的显示名）；传清单外的 id 会直接报错并回传当前清单：\n{roster_block}\n\
+         \nWhen to use: a focused task that needs one specialist's skills or tools (code change → programmer*, design/architecture → architect*, review → reviewer*, …). For a fixed multi-role pipeline use `workflow` instead. Never delegate trivial single-step work you can do directly (reading a file, a small edit) — a delegate costs a full sub-agent round-trip.\n\
+         \nParams:\n\
+         - role: one id from the list above (exact match).\n\
+         - task: natural-language goal + acceptance criteria + the context the specialist cannot see (relevant file paths, constraints, prior conclusions). Write WHAT and WHY — never HOW: no commands, tool names, or step sequences; the specialist re-plans and runs its own tools.\n\
+         \nParallel dispatch: batch independent tasks in the SAME response (2-4 delegate calls in parallel); do not serialize independent work. Idempotency: an identical (role, task) pair is rejected while still running, and reuses the previous result if it already succeeded — only change the task text when the work is genuinely different.\n\
+         \nReading results: if a specialist returns empty, off-task, or too-thin output, re-dispatch with a sharper task (more context, clearer acceptance criteria) or escalate to the advisor. On timeout/failure, read the error message, fix the cause, and retry with an adjusted task — do not re-send the identical failing call."
     )
 }
 
@@ -4630,7 +5025,10 @@ fn delegate_tool_hint(merged: &AgentConfig) -> String {
 /// landing-point selection rule (the only valid criterion for picking a
 /// workflow). Content goes into `Tool::builder(... description ...)` at
 /// registration time.
-fn workflow_tool_hint(cwd: &std::path::Path) -> String {
+///
+/// UI 工具面板的详情弹层（`GET /api/tools/workflow/doc`）也直接复用
+/// 本函数，保证面板显示的就是模型随 schema 读到的那份。
+pub fn workflow_tool_hint(cwd: &std::path::Path) -> String {
     let available = crate::workflow::list_workflows(cwd);
     let list = if available.is_empty() {
         "（当前 .latte/workflows.d 里没有可用 workflow，只能 delegate）".to_string()
@@ -4643,12 +5041,49 @@ fn workflow_tool_hint(cwd: &std::path::Path) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    // 落点速查表：从各 workflow 描述尾部的「落点：…」标注自动汇聚
+    // （分组键 = 落点正文截到「（」前），不落硬编码对照——新增/自定义
+    // workflow 只要在描述里写了落点就会自动进表。选流程的正确顺序是
+    // 「先写下交付物落点 → 速查表对号」，而不是通读 20 条长描述凭话题
+    // 词挑（实测 2026-09 jemalloc 会话：manager 按话题词把落点匹配的
+    // implementation_plan 判成不贴合，绕过评审门直调 plan）。
+    let index = if available.is_empty() {
+        String::new()
+    } else {
+        let mut by_landing: std::collections::BTreeMap<String, Vec<&str>> =
+            std::collections::BTreeMap::new();
+        let mut unmarked: Vec<&str> = Vec::new();
+        for (n, d) in &available {
+            match d.split("落点：").nth(1).map(str::trim).filter(|s| !s.is_empty()) {
+                Some(landing) => {
+                    let key = landing.split('（').next().unwrap_or(landing).trim().to_string();
+                    by_landing.entry(key).or_default().push(n.as_str());
+                }
+                None => unmarked.push(n.as_str()),
+            }
+        }
+        // 大组在前（常见落点优先入眼），同组内 workflow 按名字排序，
+        // 输出稳定可测。
+        let mut groups: Vec<(String, Vec<&str>)> = by_landing.into_iter().collect();
+        groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        let mut lines: Vec<String> = groups
+            .iter()
+            .map(|(landing, names)| format!("- {landing} ← {}", names.join(", ")))
+            .collect();
+        if !unmarked.is_empty() {
+            lines.push(format!("- （描述未标注落点，见上方完整描述）← {}", unmarked.join(", ")));
+        }
+        format!(
+            "\n落点速查（先写下用户交付物的落点，再在这里对号选流程；只有对不上时才通读上方完整描述）：\n{}\n",
+            lines.join("\n")
+        )
+    };
     format!(
-        "Run a named multi-role workflow. Available workflows (sorted, including custom workflows from the workflow editor):\n{list}\n\
+        "Run a named multi-role workflow. Available workflows (sorted, including custom workflows from the workflow editor):\n{list}\n{index}\
          \n**分派前先想流程**。When to use: a task that fits a fixed multi-role pipeline. Pick the workflow whose deliverable landing matches what the user asked for (each workflow declares its landing point — marked with「落点：」— in its description). **按交付物落点，不按话题词** — do not pick by topic word; match landing point to landing point. If the user asks for multiple deliverables with different landing points, call workflow multiple times in the same round — one call per deliverable. **几个不同落点，就发几个 workflow 调用**. After the workflow returns, synthesize results; if it failed, diagnose and either resume (with wf_id) or fall back manually and tell the user what failed.\n\
          \nHow to pick (the only rule — match by deliverable landing, not by topic word):\n\
          1. Write down where the user's deliverable finally lands — task board entry / a specific file / a conclusion in the conversation / a code change.\n\
-         2. From the list above, pick the workflow whose 「落点：」 matches that landing point. Compare word-for-word before you choose.\n\
+         2. 先在「落点速查」表里对号——表是按各流程自声明的落点自动汇聚的；只有表里对不上时，才通读上方完整描述按「落点：」逐字比对。\n\
          3. Topic words (\"learn\" / \"design\" / \"refactor\" / \"research\") describe content, not the landing. Two requests with the same topic can need different workflows because they have different landing points.\n\
          4. Several different landing points in one user request → several workflow calls in the same round. Never let one workflow \"also cover\" another deliverable. Write out each deliverable's landing before claiming one workflow is enough.\n\
          \n**调研要收口（不是限制轮数）**。Research stops on deliverables (not on a round count). Research workflows (e.g. explore / design_brainstorm) can run as many rounds as needed — but every round must ask one concrete new question, and each round you should ask yourself: 「this round later, is the user's named deliverable closer, or do I only understand more?」 Two rounds in a row of \"only understand more\" means stop and switch to the workflow that actually produces the deliverable. **不要重复探索同一范围** — Do NOT re-explore the same scope by rewording the topic — if you can't say what concrete new question this round answers, it's time to switch to the deliverable-producing workflow. When the user named a deliverable, the research workflow's return will include a **交付物提醒** listing what's still owed and which workflow produces it — non-blocking, but don't ignore it.\n\
@@ -4669,6 +5104,40 @@ fn next_plan_id(role_id: &str) -> String {
         role_id,
         PLAN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
+}
+
+/// plan 直提门禁的「已警告」记录（key = (cwd, session_id)）。放全局
+/// 而不是 handler 闭包里的 AtomicBool：build_runner 在角色/模型切换
+/// 时会重复注册工具，闭包状态随之重置，「警告一次、原样重提即放行」
+/// 的语义需要跨注册存活。
+static PLAN_DIRECT_WARNED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, String)>>,
+> = std::sync::OnceLock::new();
+
+fn plan_direct_warned(
+) -> &'static std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, String)>> {
+    PLAN_DIRECT_WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 本 session 是否有任何 workflow 运行记录：扫
+/// `<cwd>/.latte/workflow-runs/*.jsonl` 各文件首行
+/// （CheckpointRecord::Meta，带 session_id——见 workflow.rs）。只读
+/// 首行；目录不存在/文件读失败一律按「没跑过」处理——门禁宁可误拦
+/// 一次（模型原样重提即放行），也不因 IO 异常放行零评审清单。
+fn session_has_workflow_run(cwd: &std::path::Path, session_id: &str) -> bool {
+    let dir = cwd.join(".latte").join("workflow-runs");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let needle = format!("\"session_id\":\"{session_id}\"");
+    entries.flatten().any(|e| {
+        let mut first = String::new();
+        std::fs::File::open(e.path())
+            .ok()
+            .map(std::io::BufReader::new)
+            .and_then(|mut r| std::io::BufRead::read_line(&mut r, &mut first).ok())
+            .is_some_and(|_| first.contains(&needle))
+    })
 }
 
 /// plan 阶段门复位为 [`PlanStage::Normal`]，并把上一轮未批准的 plan
@@ -4767,13 +5236,49 @@ pub(crate) fn propose_plan_from_summary(
 /// [`PlanStage::PendingApproval`]——用户导入任务看板（置 Approved）
 /// 或发下一条消息（复位 Normal）之前，`register_delegate_tool` 的
 /// handler 会拒绝派发实现类角色（programmer*/devops*）。
+/// 深度优先遍历整棵 plan 任务树（任意深度），对每个任务调用 `f`。
+/// `validate_plan_workflows` / `validate_plan_task_types` 等逐任务检查
+/// 共用它，避免各自手写递归（早期版本只遍历一层 `t.subtasks`，更深层
+/// 的校验会静默空转）。
+fn walk_plan_tasks(tasks: &[PlanTask], f: &mut impl FnMut(&PlanTask)) {
+    for t in tasks {
+        f(t);
+        walk_plan_tasks(&t.subtasks, f);
+    }
+}
+
 /// plan 清单内 paths 的机械校验（提交前调用，失败则整单拒绝、不进
 /// PendingApproval，模型可修正后同轮重调）：
-/// - 存在性：路径逐级向上找已存在的祖先；第一级段都不存在 → 判定
+/// - 存在性（宽松档）：路径逐级向上找已存在的祖先；第一级段都不存在 → 判定
 ///   幻觉路径并拒绝（要新建的文件只要祖先目录存在即放行）。
+/// - 存在性（严格档）：**只读类任务**（`task_type` ∈ learn / learn_loop /
+///   research，或 labels 含「只读」）的 paths 必须**整条存在**。这类任务不
+///   新建文件，它要读的东西必须已经在仓库里；宽松档只查第一级目录，等于
+///   把 `include/jemalloc/internal/arena_inlines.h`（5.x 已删除的文件）
+///   当合法路径放过——实测 2026-09 jemalloc 会话就是这么让 4 个不存在的
+///   文件进了交付清单，学习者按图索骥第一步就落空。
 /// - 清单内重叠：两个任务的 paths 存在组件级前缀包含 → 拒绝
 ///   （paths 互不重叠是并行派发不互踩的前提，靠 prompt 嘱咐不可靠）。
 /// paths 为空 = 未声明范围，跳过校验。
+/// `validate_plan_paths` 的存在性检查沿任务树递归下行（任意深度）。
+/// 子任务未自己声明类型/标签时继承祖先的严格档位——实测清单里 22 个
+/// 叶子任务全在 subtasks 里，父任务带「只读」而子任务字段更省，
+/// 不继承等于严格档对整份交付物失效。
+fn check_exists_tree(
+    t: &PlanTask,
+    inherited_strict: bool,
+    read_only: &dyn Fn(Option<&str>, &[String]) -> bool,
+    check_exists: &mut dyn FnMut(&str, &str, bool),
+) {
+    let strict = inherited_strict || read_only(t.task_type.as_deref(), &t.labels);
+    for p in &t.paths {
+        check_exists(&t.title, p, strict);
+    }
+    for s in &t.subtasks {
+        check_exists_tree(s, strict, read_only, check_exists);
+    }
+}
+
 fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), String> {
     let normalize = |p: &str| -> String {
         p.trim()
@@ -4785,9 +5290,21 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     // 反馈只报路径本身（不带任务标题）并去重：tool_result 只有 256
     // 字节，带标题的长清单一撑就爆，模型看到的是被砍掉尾部的残句。
     let mut missing: Vec<String> = Vec::new();
-    let mut check_exists = |_title: &str, raw: &str| {
+    // 只读类任务：不新建文件，声明的 paths 必须整条存在。
+    let read_only = |task_type: Option<&str>, labels: &[String]| -> bool {
+        matches!(task_type, Some("learn") | Some("learn_loop") | Some("research"))
+            || labels.iter().any(|l| l.trim() == "只读")
+    };
+    let mut check_exists = |_title: &str, raw: &str, strict: bool| {
         let p = normalize(raw);
         if p.is_empty() {
+            return;
+        }
+        if strict {
+            // 严格档：整条路径必须存在。
+            if !cwd.join(&p).exists() && !missing.contains(&p) {
+                missing.push(p);
+            }
             return;
         }
         let mut cur = cwd.to_path_buf();
@@ -4809,27 +5326,36 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
         }
     };
     for t in tasks {
-        for p in &t.paths {
-            check_exists(&t.title, p);
-        }
-        for s in &t.subtasks {
-            for p in &s.paths {
-                check_exists(&s.title, p);
-            }
-        }
+        check_exists_tree(t, false, &read_only, &mut check_exists);
     }
     if !missing.is_empty() {
         // 反馈通道只有 256 字节（tool_result 截断，见 agent.rs 终止态
         // 处理），长清单会被砍掉尾部，模型只能看到前一两条 —— 与其被
         // 动截断，不如主动只报前 3 条 + 总数。
-        let head = missing.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+        // 每条幻觉路径附模糊匹配的相近真实路径（path_suggest）：
+        // 「第一级目录不存在」+ 候选清单才能让模型一次改对（实测 jemalloc
+        // 会话：模型按 ≤5.2 的旧记忆写 `src/slab.c` 这类已消失的文件）。
+        let head = missing
+            .iter()
+            .take(3)
+            .map(|p| {
+                let suggestions =
+                    latte_rs_agent_tools::utils::path_suggest::suggest_similar_paths(cwd, p, 2);
+                if suggestions.is_empty() {
+                    p.clone()
+                } else {
+                    format!("{p}（相近：{}）", suggestions.join("、"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、");
         let more = if missing.len() > 3 {
             format!("（共 {} 处）", missing.len())
         } else {
             String::new()
         };
         return Err(format!(
-            "paths 的第一级目录在仓库里不存在（疑似幻觉路径，先用 read/search 核实）：{head}{more}"
+            "paths 的第一级目录不存在：{head}{more}（相对路径按会话工作目录校验，任务针对其他仓库请改用绝对路径；疑似幻觉路径先用 read/search 核实）"
         ));
     }
     // ── 清单内重叠（仅顶层任务两两比较；子任务继承父任务范围） ──
@@ -4900,6 +5426,160 @@ fn is_readonly_plan_task(t: &PlanTask) -> bool {
         .any(|l| MARKERS.iter().any(|m| l.eq_ignore_ascii_case(m)))
 }
 
+/// plan 清单内 workflow 名的机械校验（提交前调用，失败则整单拒绝、
+/// 不进 PendingApproval，模型可修正后同轮重调——与
+/// [`validate_plan_paths`] 同语义）。
+///
+/// 为什么必须在 plan 侧拦：plan 工具的 workflow 字段是开放字符串
+/// （不强制 enum），模型会把 task_type 名（research 等）或臆造名写
+/// 进来；提交侧不校验，错误就一直留到用户点「导入任务看板」才以
+/// `unknown workflow 'xxx'` 400 爆给最终用户（实测 jemalloc 会话：
+/// "建立 jemalloc 学习环境与版本基线" 写了 workflow:"research"，
+/// 而该名字只是 task_type，对应 workflow 是 explore），此时模型已
+/// 不在场，清单整单报废。
+fn validate_plan_workflows(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), String> {
+    let available: Vec<String> = crate::workflow::list_workflows(cwd)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut check = |wf: Option<&String>| {
+        if let Some(name) = wf.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !available.iter().any(|a| a == name) && !unknown.iter().any(|u| u == name) {
+                unknown.push(name.to_string());
+            }
+        }
+    };
+    // 递归遍历整棵任务树（任意深度），每层的 workflow 都要查。
+    walk_plan_tasks(tasks, &mut |t| check(t.workflow.as_ref()));
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    // 反馈通道只有 256 字节：可用名只给前 5 个 + 总数，够模型改对。
+    let head = available
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    let more = if available.len() > 5 {
+        format!(" 等共 {} 个", available.len())
+    } else {
+        format!(" 共 {} 个", available.len())
+    };
+    Err(format!(
+        "unknown workflow '{}'：必须是已注册流程名（{head}{more}），不是 task_type；留空=不绑定",
+        unknown.join("', '")
+    ))
+}
+
+/// plan 清单内 task_type 名的机械校验：与 [`validate_plan_workflows`]
+/// 同语义（失败整单拒绝、模型可修正后同轮重调）。
+///
+/// 校验前先做一次**别名收编**（与 `paths` 的 serde 别名同思路：模型
+/// 写偏不致命）：大小写差异归一到注册表 canonical id，已观测的笔误
+/// 就近改写（2026-09 jemalloc 学习拆分会话：manager 两次提交
+/// `task_type:"learning"`，注册表 id 是 `learn`，整单连撞两次拒绝、
+/// 靠 advisor 介入才纠正）。收编写回任务本身，看板拿到的就是合法 id。
+///
+/// 注册表是 ui-server 的 `TaskTypeRegistry`（bundled
+/// `config/task_types.toml` + 项目层 `<cwd>/.latte/task_types.toml`
+/// 覆盖）；core 不能反向依赖 ui-server，这里只复刻「加载 type id 集合」
+/// 这一小段——校验只需要名字清单，不需要 default_workflow 等定义。
+/// 两侧解析同一文件格式，新增/覆盖类型对两边同时生效。
+fn validate_plan_task_types(cwd: &std::path::Path, tasks: &mut [PlanTask]) -> Result<(), String> {
+    let known = load_task_type_ids(cwd);
+    normalize_plan_task_types(&known, tasks);
+    let mut unknown: Vec<String> = Vec::new();
+    let mut check = |tt: Option<&String>| {
+        if let Some(name) = tt.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !known.iter().any(|k| k == name) && !unknown.iter().any(|u| u == name) {
+                unknown.push(name.to_string());
+            }
+        }
+    };
+    // 递归遍历整棵任务树（任意深度），每层的 task_type 都要查。
+    walk_plan_tasks(tasks, &mut |t| check(t.task_type.as_ref()));
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let head = known
+        .iter()
+        .take(7)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("、");
+    let more = if known.len() > 7 {
+        format!(" 等共 {} 个", known.len())
+    } else {
+        format!(" 共 {} 个", known.len())
+    };
+    Err(format!(
+        "unknown task_type '{}'：必须是已注册类型 id（{head}{more}）；留空=不分类（走 manager）",
+        unknown.join("', '")
+    ))
+}
+
+/// task_type 归一：校验前把可判定的笔误改写为注册表 canonical id。
+/// 已合法（精确命中）→ 不动；大小写差异 → 归一（id 全小写）；已知
+/// 别名 → 改写。都不命中 → 保留原值，交给校验报错。别名只收编实测
+/// 出现过的笔误，不臆造映射表。
+fn normalize_plan_task_types(known: &[String], tasks: &mut [PlanTask]) {
+    /// 实测笔误 → 注册表 id（2026-09 jemalloc 会话："learning"）。
+    const TASK_TYPE_ALIASES: &[(&str, &str)] = &[("learning", "learn")];
+    fn canon(name: &str, known: &[String]) -> Option<String> {
+        let n = name.trim();
+        if n.is_empty() {
+            return None; // 空（语义=不分类），无需改写
+        }
+        if known.iter().any(|k| k.as_str() == n) {
+            // 已合法；顺带把首尾空白 trim 写回，免得原样进看板。
+            return (n.len() != name.len()).then(|| n.to_string());
+        }
+        if let Some(k) = known.iter().find(|k| k.eq_ignore_ascii_case(n)) {
+            return Some(k.clone());
+        }
+        let lower = n.to_ascii_lowercase();
+        TASK_TYPE_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == lower)
+            .and_then(|(_, c)| known.iter().find(|k| k.as_str() == *c))
+            .cloned()
+    }
+    for t in tasks {
+        if let Some(c) = t.task_type.as_deref().and_then(|tt| canon(tt, known)) {
+            t.task_type = Some(c);
+        }
+        normalize_plan_task_types(known, &mut t.subtasks);
+    }
+}
+
+/// 加载 task_type 注册表的 id 集合：bundled 默认 + 项目层
+/// `<cwd>/.latte/task_types.toml` 覆盖（同名覆盖、新增增补）。
+/// 解析失败/文件缺失时返回已加载的部分——只用于校验提示，宁可放行
+/// 也不因注册表读取问题整单拒绝。
+fn load_task_type_ids(cwd: &std::path::Path) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct RawRegistry {
+        #[serde(default)]
+        types: std::collections::HashMap<String, toml::Value>,
+    }
+    let mut ids: Vec<String> = toml::from_str::<RawRegistry>(include_str!("../../config/task_types.toml"))
+        .map(|r| r.types.into_keys().collect())
+        .unwrap_or_default();
+    if let Ok(raw) = std::fs::read_to_string(cwd.join(".latte").join("task_types.toml")) {
+        if let Ok(overlay) = toml::from_str::<RawRegistry>(&raw) {
+            for k in overlay.types.into_keys() {
+                if !ids.iter().any(|i| i == &k) {
+                    ids.push(k);
+                }
+            }
+        }
+    }
+    ids.sort();
+    ids
+}
+
 /// [`PlanTask`] 认得的全部键（含 `paths` 的 serde 别名）。
 ///
 /// serde 对未知键默认静默忽略，`deny_unknown_fields` 又会把
@@ -4911,6 +5591,7 @@ const PLAN_TASK_KNOWN_KEYS: &[&str] = &[
     "description",
     "priority",
     "labels",
+    "task_type",
     "workflow",
     "paths",
     "subtasks",
@@ -4948,27 +5629,45 @@ fn unknown_plan_task_keys(tasks_arr: &[serde_json::Value]) -> Vec<String> {
     out.into_iter().collect()
 }
 
+/// plan 任务树节点在 `$defs` 里的名字：`tasks` 数组元素与每层
+/// `subtasks` 元素都是 `{ "$ref": "#/$defs/planTask" }`。
+const PLAN_TASK_DEF: &str = "planTask";
+
 /// 构造单条 plan 任务的 `ToolInputProperty`（含 priority 范围、paths
-/// 描述等 schema 元数据）。`include_subtasks=true` 时在物件内追加一
-/// 个可选 `subtasks` 字段，其元素复用本函数自身以避免重复 schema
-/// 字符串——保证一处维护、单元测试稳定。
-fn plan_task_input_property(
-    include_subtasks: bool,
-) -> latte_rs_agent_tools::types::ToolInputProperty {
+/// 描述等 schema 元数据），作为根 schema `$defs` 里的唯一定义。
+/// `subtasks` 的元素是 `$ref` 自引用（`#/$defs/planTask`）——一份
+/// 定义表达**任意深度**的任务树，不再内联展开、也没有层级上限。
+fn plan_task_input_property() -> latte_rs_agent_tools::types::ToolInputProperty {
     use latte_rs_agent_tools::types::PropertyType;
 
-    let mut priority = input_property(PropertyType::Integer, "Priority 1-4; 1 is highest.");
+    let mut priority = input_property(PropertyType::Integer, "Priority 1-4; 1 is highest. MUST be an integer in 1..=4 — any other value rejects the WHOLE submission.");
     priority.minimum = Some(1.0);
     priority.maximum = Some(4.0);
+    // task_type 是派发路由的首选字段：看板按 task_type 注册表推导默认
+    // workflow（config/task_types.toml + 项目层覆盖）。开放字符串不强制
+    // enum——项目层可新增类型，schema 不应卡住未来的类型。
+    let task_type = input_property(
+        PropertyType::String,
+        "Optional task type id. The board derives the default workflow from the type at \
+         dispatch time; prefer this over setting `workflow` directly. MUST be an id that \
+         already exists in the task-type registry (config/task_types.toml + project \
+         overrides; e.g. feature, bugfix, learn, research, learn_loop, docs, chore) — \
+         an invented/unknown id rejects the WHOLE submission. Omit when no type fits \
+         (plain manager session).",
+    );
     // workflow 字段保持开放字符串（不强制 enum）：注册表见
     // `.latte/workflows.d/*.toml`，目前 ~20 个；任何未来新增的流程都不
     // 应被 plan 工具的 schema 卡住。"常用名"在描述里列出仅为提示。
     let workflow = input_property(
         PropertyType::String,
-        "Optional workflow name (e.g. tdd_development, bug_triage, update_docs, \
-         annotate_code, learn, learn_loop, design_and_plan, feature_design, \
-         implementation_plan, task_refine, explore, design_brainstorm, write_doc); \
-         omit when no workflow fits.",
+        "Optional workflow name override (registered names include: tdd_development, \
+         bug_triage, update_docs, annotate_code, learn, learn_loop, design_and_plan, \
+         feature_design, implementation_plan, task_refine, explore, \
+         design_brainstorm, write_doc). MUST be a name from the workflow registry \
+         (.latte/workflows.d) — an invented/unknown name rejects the WHOLE submission. \
+         DEFAULT: omit — dispatch then follows `task_type`'s default workflow, or a \
+         plain manager session when no type is set. Set this ONLY to deliberately \
+         deviate from the type's default workflow.",
     );
     let mut properties = std::collections::BTreeMap::from([
         (
@@ -4981,6 +5680,7 @@ fn plan_task_input_property(
         ),
         ("priority".into(), priority),
         ("labels".into(), string_array_property("Task labels.")),
+        ("task_type".into(), task_type),
         ("workflow".into(), workflow),
         (
             "paths".into(),
@@ -4989,16 +5689,14 @@ fn plan_task_input_property(
             ),
         ),
     ]);
-    if include_subtasks {
-        properties.insert(
-            "subtasks".into(),
-            input_property(
-                PropertyType::Array,
-                "Optional child tasks; at most one nested level.",
-            )
-            .with_items(plan_task_input_property(false)),
-        );
-    }
+    properties.insert(
+        "subtasks".into(),
+        input_property(
+            PropertyType::Array,
+            "Optional child tasks; same shape as a top-level task, nest as deep as the breakdown requires.",
+        )
+        .with_items(latte_rs_agent_tools::types::ToolInputProperty::ref_to(PLAN_TASK_DEF)),
+    );
     input_property(PropertyType::Object, "One proposed task.").with_object(
         properties,
         Some(vec!["title".into()]),
@@ -5006,8 +5704,215 @@ fn plan_task_input_property(
     )
 }
 
+/// `plan` 工具的完整 input schema：任务树节点的对象定义只在根
+/// `$defs.planTask` 里放一份，`tasks` 数组元素与每层 `subtasks` 元素
+/// 都用 `$ref` 指过去——自递归一份定义，任意深度（serde 侧的
+/// [`PlanTask`] 本身就是递归类型，两层本就同构）。
+fn plan_input_schema() -> latte_rs_agent_tools::types::ToolInputSchema {
+    use latte_rs_agent_tools::types::{PropertyType, SchemaType, ToolInputSchema};
+    ToolInputSchema {
+        schema_type: SchemaType,
+        properties: [(
+            "tasks".into(),
+            input_property(
+                PropertyType::Array,
+                "一次调用提交整份任务候选清单；所有任务都必须放进这个数组（数组之外的顶层字段会被整单拒绝）；上一份未获用户处理前不要重复调用。",
+            )
+            .with_items(latte_rs_agent_tools::types::ToolInputProperty::ref_to(PLAN_TASK_DEF)),
+        )]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["tasks".into()]),
+        defs: Some(
+            [(PLAN_TASK_DEF.into(), plan_task_input_property())]
+                .into_iter()
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
 /// `pub` 而非 `pub(crate)`：CLI REPL 也要注册它，否则声明了该工具的
 /// 角色（manager）在 chat 里调用直接 ToolNotFound，而 UI 里正常。
+/// 解析并机械校验一份 `tasks` JSON 数组：`plan` 工具 handler 与
+/// workflow 引擎（`require_plan_tasks` / `patch_from` / `submit_plan_from`）
+/// 共用的同一份判据——拆出独立函数就是为了杜绝「工具校验一套、引擎
+/// 校验另一套」的漂移（paths 重叠自查曾靠模型自觉，实测多次漏判）。
+///
+/// 覆盖：数组形态、逐题 `serde_path_to_error` 解析（报错带字段路径，
+/// 模型知道修哪）、title 非空、paths 存在性/重叠、workflow 名、
+/// task_type 名（含别名收编）。返回的是**别名归一化后**的 tasks。
+pub(crate) fn parse_and_validate_plan_tasks(
+    tasks_val: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> Result<Vec<PlanTask>, String> {
+    let tasks_arr = tasks_val
+        .as_array()
+        .ok_or_else(|| "'tasks' must be an array".to_string())?;
+    if tasks_arr.is_empty() {
+        return Err("'tasks' must not be empty".into());
+    }
+    // 逐项解析 + 校验 title 非空（与后端 import_tasks 的校验对齐）。
+    // serde_path_to_error：裸 from_value 的报错没有字段路径
+    // （"tasks[0] invalid: invalid type: string \"\", expected a
+    // sequence"），模型不知道是哪层哪个字段，会对着错误字段空转
+    // 重试（实测 manager 误诊成 workflow 字段、原样重撞两次）。
+    let mut tasks: Vec<PlanTask> = Vec::with_capacity(tasks_arr.len());
+    for (i, t) in tasks_arr.iter().enumerate() {
+        let pt: PlanTask =
+            serde_path_to_error::deserialize(t.clone()).map_err(|e| {
+                let path = e.path().to_string();
+                if path == "." {
+                    format!("tasks[{i}] invalid: {e}")
+                } else {
+                    format!("tasks[{i}] invalid: {e}（出错字段：{path}）")
+                }
+            })?;
+        if pt.title.trim().is_empty() {
+            return Err(format!("tasks[{i}].title must not be empty"));
+        }
+        tasks.push(pt);
+    }
+
+    // paths 机械校验（存在性 + 清单内重叠）：失败整单拒绝——模型可
+    // 修正后重提。
+    validate_plan_paths(cwd, &tasks)?;
+    // workflow 名机械校验：同上语义。不拦的话错名会留到用户
+    // 点「导入」才 400（unknown workflow），模型已不在场无法
+    // 修正（实测 jemalloc 会话：workflow:"research" 整单报废，
+    // research 只是 task_type，对应 workflow 是 explore）。
+    validate_plan_workflows(cwd, &tasks)?;
+    // task_type 名机械校验：同上语义——错名留到「导入」才 400
+    // 时模型已不在场（派发路由按 task_type 推导 workflow，填错
+    // 类型等于整条清单的路由静默失效）。校验前先别名收编
+    // （learning→learn 等实测笔误），见函数文档。
+    validate_plan_task_types(cwd, &mut tasks)?;
+    Ok(tasks)
+}
+
+/// 提交一份 plan 提案的共享实现：`plan` 工具 handler 与 workflow 引擎的
+/// `submit_plan_from` 机械步（`workflow.rs`）走同一条路径——校验、
+/// PlanProposed 广播、弹窗快照落盘、PlanStage 置位完全同源，避免
+/// 「工具一套、引擎一套」的行为分叉。
+///
+/// 成功时返回给人看的摘要文本（plan 工具把它作为工具结果回给模型；
+/// 引擎把它绑到 submit 步的产出）。失败返回机械错误文本。
+pub(crate) fn submit_plan_proposal(
+    input: &serde_json::Value,
+    role_id: &str,
+    plan_stage: &SharedPlanStage,
+    cwd: &std::path::Path,
+    session_id: &str,
+    event_tx: &broadcast::Sender<ChatEvent>,
+) -> Result<String, String> {
+    // 一次一清单：上一份清单还在等用户批准时拒绝再次提交。
+    // 任务拆分必须把全部任务合并进一次调用的 tasks 数组——
+    // 逐任务多次调用会让用户弹窗每次只有 1 个任务（观测到
+    // 的实际坏行为：11 个任务弹了 11 次窗）。
+    if let PlanStage::PendingApproval { plan_id } = &*plan_stage.read() {
+        return Err(format!(
+            "上一份任务清单还在等待用户批准（plan_id={plan_id}）。plan 工具每轮只提交一次：请把所有拆分出的任务合并进 tasks 数组一次提交；如需修改清单，等用户处理完上一份（导入看板或发消息）后再提交。"
+        ));
+    }
+
+    // 顶层游离键硬校验：schema 只认 `tasks` 一个顶层字段，模型把
+    // 任务写到数组外（实测 jemalloc 学习拆分会话：{"tasks":[1 个],
+    // "item":{…21 个任务…}}）时这些任务**静默消失**——弹窗只弹 1
+    // 个任务、plan 门禁却已锁死，模型还以为 22 个都提交了。拒绝并
+    // 点名，模型可同轮把全部任务合并进 tasks 重提（此检查在进
+    // PendingApproval 之前，与 paths/workflow 校验同级语义）。
+    if let Some(obj) = input.as_object() {
+        let stray: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "tasks")
+            .collect();
+        if !stray.is_empty() {
+            let head = stray.iter().take(3).copied().collect::<Vec<_>>().join("、");
+            let more = if stray.len() > 3 {
+                format!("（共 {} 个）", stray.len())
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "除 tasks 外的顶层字段不会被读取，已整单拒绝：{head}{more}。疑似有任务被写到了 tasks 数组之外——请把所有任务合并进 tasks 数组一次提交。"
+            ));
+        }
+    }
+
+    let tasks_val = input
+        .get("tasks")
+        .ok_or_else(|| "missing 'tasks' field".to_string())?;
+    let tasks = parse_and_validate_plan_tasks(tasks_val, cwd)?;
+
+    // 直提门禁（实测 2026-09 jemalloc 会话：manager 只读了 3 个
+    // 目录列表就拍出 5 个任务直调 plan，绕过 implementation_plan
+    // 的拆解→评审→终审门，零评审清单直接进弹窗）。本 session
+    // 没有任何 workflow 运行记录、又直提 ≥3 个顶层任务时，第一
+    // 次整单拒绝并指路；原样重提视为已知晓风险、放行（每
+    // session 只拦一次）。workflow 跑过但失败的，checkpoint
+    // meta 已落盘，天然放行（失败披露后允许手工兜底）。
+    // CLI/测试（session_id 为空）不启用。
+    if tasks.len() >= 3 && !session_id.is_empty() && !session_has_workflow_run(cwd, session_id) {
+        let key = (cwd.to_path_buf(), session_id.to_string());
+        if plan_direct_warned().lock().unwrap().insert(key) {
+            return Err(format!(
+                "清单已拦下未提交：本 session 没有 workflow 运行记录，这份 {} 个任务的拆分等于零评审直进弹窗。\
+                 拆分任务清单的默认路径是 workflow `implementation_plan`（拆解→评审→终审，落点=任务看板条目，不限实现类——学习/调研类拆分同样走它），请先跑它。\
+                 例外——清单是用户逐条给定的、或 workflow 刚跑过且结果已向你交底：把整份 tasks 原样重提一次即放行（本拦截每 session 只出现一次）。",
+                tasks.len()
+            ));
+        }
+    }
+
+    // 被静默丢弃的键：不拦（workflow 产出的 id/week/
+    // dependencies/risks 是合法附加信息），但必须回执，否则
+    // 「字段名写错 → 整个数组消失 → 校验空转通过」无从发现。
+    let dropped = match tasks_val.as_array() {
+        Some(arr) => unknown_plan_task_keys(arr),
+        None => Vec::new(),
+    };
+    let dropped_note = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n⚠️ 以下字段不在 plan 工具 schema 内、已被忽略：{}。\
+             若其中有本该写进 paths 的路径信息（schema 字段名是 paths），\
+             请改名后重新提交整份清单。",
+            dropped.join("、")
+        )
+    };
+
+    let plan_id = next_plan_id(role_id);
+    let n = tasks.len();
+    let proposed = ChatEvent::PlanProposed {
+        role_id: role_id.to_string(),
+        plan_id: plan_id.clone(),
+        tasks,
+    };
+    // 未处理快照：plan 弹窗是这份清单的唯一入口，broadcast 丢
+    // 一次（无订阅者 / Lagged）就等于清单永久卡在
+    // PendingApproval——delegate 被门禁挡着，用户却没有弹窗可
+    // 导入。导入成功时 `POST /api/tasks/import` 按 plan_id 销账。
+    // 同时落盘：内存快照救不了进程重启（重启后清单同样只剩
+    // PendingApproval 的门禁，弹窗无影无踪）。
+    crate::choice::register_prompt(
+        &plan_id,
+        proposed.clone(),
+        event_tx.clone(),
+        (!session_id.is_empty()).then_some((cwd, session_id)),
+    );
+    let _ = event_tx.send(proposed);
+    // plan 阶段门：任务清单已提交，等用户在弹窗导入任务看板；
+    // 批准前 delegate 实现类角色会被工具层拒绝。
+    *plan_stage.write() = PlanStage::PendingApproval {
+        plan_id: plan_id.clone(),
+    };
+    Ok(format!(
+        "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。{dropped_note}"
+    ))
+}
+
 pub fn register_plan_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     event_tx: broadcast::Sender<ChatEvent>,
@@ -5018,27 +5923,12 @@ pub fn register_plan_tool(
     // （CLI / 测试）。进程重启后「添加任务」弹窗靠这份落盘补发。
     session_id: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use latte_rs_agent_tools::types::{
-        PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputSchema,
-    };
+    use latte_rs_agent_tools::types::{SharedToolHandler, Tool};
 
-    // The recursive canonical schema below mirrors PlanTask, including one
-    // nested subtask level; handler validation still enforces path semantics.
-    let input_schema = ToolInputSchema {
-        schema_type: SchemaType,
-        properties: [(
-            "tasks".into(),
-            input_property(
-                PropertyType::Array,
-                "一次调用提交整份任务候选清单；上一份未获用户处理前不要重复调用。",
-            )
-            .with_items(plan_task_input_property(true)),
-        )]
-        .into_iter()
-        .collect(),
-        required: Some(vec!["tasks".into()]),
-        ..Default::default()
-    };
+    // 递归 canonical schema 镜像 PlanTask：任务树节点定义在根
+    // `$defs.planTask` 一份，tasks/subtasks 均 `$ref` 指过去，任意深度；
+    // handler 侧仍由 parse_and_validate_plan_tasks 做语义校验。
+    let input_schema = plan_input_schema();
 
     let handler_role_id = role_id.clone();
     let handler_cwd = cwd.to_path_buf();
@@ -5050,102 +5940,17 @@ pub fn register_plan_tool(
         let cwd = handler_cwd.clone();
         let session_id = handler_session_id.clone();
         Box::pin(async move {
-            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
-
-            // 一次一清单：上一份清单还在等用户批准时拒绝再次提交。
-            // 任务拆分必须把全部任务合并进一次调用的 tasks 数组——
-            // 逐任务多次调用会让用户弹窗每次只有 1 个任务（观测到
-            // 的实际坏行为：11 个任务弹了 11 次窗）。
-            if let PlanStage::PendingApproval { plan_id } = &*plan_stage.read() {
-                return Err(tool_err(format!(
-                    "上一份任务清单还在等待用户批准（plan_id={plan_id}）。plan 工具每轮只提交一次：请把所有拆分出的任务合并进 tasks 数组一次提交；如需修改清单，等用户处理完上一份（导入看板或发消息）后再提交。"
-                )));
-            }
-
-            let tasks_val = input
-                .get("tasks")
-                .ok_or_else(|| tool_err("missing 'tasks' field".into()))?;
-            let tasks_arr = tasks_val
-                .as_array()
-                .ok_or_else(|| tool_err("'tasks' must be an array".into()))?;
-            if tasks_arr.is_empty() {
-                return Err(tool_err("'tasks' must not be empty".into()));
-            }
-            // 逐项解析 + 校验 title 非空（与后端 import_tasks 的校验对齐）。
-            // serde_path_to_error：裸 from_value 的报错没有字段路径
-            // （"tasks[0] invalid: invalid type: string \"\", expected a
-            // sequence"），模型不知道是哪层哪个字段，会对着错误字段空转
-            // 重试（实测 manager 误诊成 workflow 字段、原样重撞两次）。
-            let mut tasks: Vec<PlanTask> = Vec::with_capacity(tasks_arr.len());
-            for (i, t) in tasks_arr.iter().enumerate() {
-                let pt: PlanTask =
-                    serde_path_to_error::deserialize(t.clone()).map_err(|e| {
-                        let path = e.path().to_string();
-                        if path == "." {
-                            tool_err(format!("tasks[{i}] invalid: {e}"))
-                        } else {
-                            tool_err(format!("tasks[{i}] invalid: {e}（出错字段：{path}）"))
-                        }
-                    })?;
-                if pt.title.trim().is_empty() {
-                    return Err(tool_err(format!("tasks[{i}].title must not be empty")));
-                }
-                tasks.push(pt);
-            }
-
-            // paths 机械校验（存在性 + 清单内重叠）：失败整单拒绝、
-            // 不进 PendingApproval——模型可修正后同轮重调。
-            validate_plan_paths(&cwd, &tasks).map_err(tool_err)?;
-
-            // 被静默丢弃的键：不拦（workflow 产出的 id/week/
-            // dependencies/risks 是合法附加信息），但必须回执，否则
-            // 「字段名写错 → 整个数组消失 → 校验空转通过」无从发现。
-            let dropped = unknown_plan_task_keys(tasks_arr);
-            let dropped_note = if dropped.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n⚠️ 以下字段不在 plan 工具 schema 内、已被忽略：{}。\
-                     若其中有本该写进 paths 的路径信息（schema 字段名是 paths），\
-                     请改名后重新提交整份清单。",
-                    dropped.join("、")
-                )
-            };
-
-            let plan_id = next_plan_id(&role_id);
-            let n = tasks.len();
-            let proposed = ChatEvent::PlanProposed {
-                role_id: role_id.clone(),
-                plan_id: plan_id.clone(),
-                tasks,
-            };
-            // 未处理快照：plan 弹窗是这份清单的唯一入口，broadcast 丢
-            // 一次（无订阅者 / Lagged）就等于清单永久卡在
-            // PendingApproval——delegate 被门禁挡着，用户却没有弹窗可
-            // 导入。导入成功时 `POST /api/tasks/import` 按 plan_id 销账。
-            // 同时落盘：内存快照救不了进程重启（重启后清单同样只剩
-            // PendingApproval 的门禁，弹窗无影无踪）。
-            crate::choice::register_prompt(
-                &plan_id,
-                proposed.clone(),
-                event_tx.clone(),
-                (!session_id.is_empty()).then_some((cwd.as_path(), session_id.as_str())),
-            );
-            let _ = event_tx.send(proposed);
-            // plan 阶段门：任务清单已提交，等用户在弹窗导入任务看板；
-            // 批准前 delegate 实现类角色会被工具层拒绝。
-            *plan_stage.write() = PlanStage::PendingApproval {
-                plan_id: plan_id.clone(),
-            };
-            Ok(serde_json::Value::String(format!(
-                "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。{dropped_note}"
-            )))
+            // 全部逻辑在共享实现里（校验/广播/落盘/置门），与 workflow
+            // 引擎的 `submit_plan_from` 机械步同一条路径。
+            submit_plan_proposal(&input, &role_id, &plan_stage, &cwd, &session_id, &event_tx)
+                .map(serde_json::Value::String)
+                .map_err(latte_rs_agent_tools::error::ToolError::Other)
         })
     });
 
     let tool = Tool::builder(
         "plan".to_string(),
-        "把一份结构化任务清单提交给用户，用户在弹窗里勾选后导入任务看板（backlog）。用于 implementation_plan workflow 跑完或手持具体任务清单时把任务交给看板。参数 tasks 是任务对象数组——一次调用提交整份清单（拆分出几个任务就放几项），不要逐任务多次调用本工具。".to_string(),
+        "把一份结构化任务清单提交给用户，用户在弹窗里勾选后导入任务看板（backlog）。用于 implementation_plan workflow 跑完、或清单已经过一道评审/核查时把任务交给看板。多任务拆分（≥3 项）若只凭目录结构/文件名拍出、未经任何评审，先走 implementation_plan workflow 过评审门，不要直接调本工具。参数 tasks 是任务对象数组——一次调用提交整份清单（拆分出几个任务就放几项），不要逐任务多次调用本工具。".to_string(),
         input_schema,
         handler,
     )
@@ -5284,6 +6089,7 @@ pub fn register_ask_tool(
                 description: Some("要向用户提出的问题（一句话）。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
             ("options".into(), options_property),
             ("multi".into(), ToolInputProperty {
@@ -5291,6 +6097,7 @@ pub fn register_ask_tool(
                 description: Some("是否允许多选（默认 false = 单选）。问题本身允许同时选中多项（例如“启用哪些模块”“需要覆盖哪些场景”）时请显式传 true，UI 会渲染成复选框。⚠️ 只在 question 文案里写“（可多选）”是不够的——必须同时传 multi=true，否则 UI 渲染的是单选。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
             ("layout".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -5298,12 +6105,14 @@ pub fn register_ask_tool(
                 enum_values: Some(vec!["list".into(), "grid".into()]),
                 minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
             ("allow_upload".into(), ToolInputProperty {
                 property_type: PropertyType::Boolean,
                 description: Some("是否允许用户上传自己的图片作为答案（默认 false）。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
         ].into_iter().collect(),
         required: Some(vec!["question".into(), "options".into()]),
@@ -5554,8 +6363,13 @@ pub fn register_ask_tool(
                 }
                 None => {
                     crate::choice::cancel(&choice_id);
+                    // 通道关闭 = 当前环境没人能答（典型：CLI stdin 已 EOF，
+                    // 消费端把挂起项 cancel 掉了）。模型拿到裸错误会原样
+                    // 重试 ask，撞出确定性 tool error streak——必须告诉它
+                    // 改道：别再弹框，把问题+推荐项写进正文继续干活。
                     Err(tool_err(format!(
-                        "等待用户回答时通道意外关闭（choice_id={choice_id}）"
+                        "等待用户回答时通道意外关闭（choice_id={choice_id}）——当前环境无法把选择框送达用户。\
+                         不要重试 ask：直接把问题和你推荐的默认选项写进本轮回复/返回结论里，按推荐项继续完成任务。"
                     )))
                 }
             }
@@ -5613,6 +6427,7 @@ pub fn register_task_report_tool(
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
             ("summary".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -5621,6 +6436,7 @@ pub fn register_task_report_tool(
                 ),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
             ("result".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -5630,6 +6446,7 @@ pub fn register_task_report_tool(
                 enum_values: Some(VALID_RESULTS.iter().map(|s| serde_json::Value::String(s.to_string())).collect()),
                 minimum: None, maximum: None, min_length: None, max_length: None,
                 items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
             }),
         ].into_iter().collect(),
         required: Some(vec![
@@ -5796,8 +6613,9 @@ pub(crate) async fn gate_delegate_return(
 }
 
 /// UI/controller 路径 delegate 的默认 wall-clock 超时（秒）。
-/// 比 CLI 的 300s（`DEFAULT_DELEGATE_TIMEOUT_SECS`）宽：UI 工作流里
-/// specialist 常写整套文档/脚本。解析顺序对齐 CLI（chat.rs）：
+/// 与 CLI 的 `DEFAULT_DELEGATE_TIMEOUT_SECS` 同值（900s）：慢速厂商模型
+/// 下一次深读/写文档的 specialist 多轮往返，300s 级超时只会误杀重跑。
+/// 解析顺序对齐 CLI（chat.rs）：
 /// `model.timeout_secs` > env `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` > 本值。
 pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
 
@@ -5885,7 +6703,7 @@ async fn register_delegate_tool(
         properties: vec![
             ("role".into(), ToolInputProperty {
                 property_type: PropertyType::String,
-                description: Some(format!("Specialist role id. Available roles: {roster}")),
+                description: Some(format!("Specialist role id — the **id** part (not the display name in parentheses) of an entry in the roster. Available roles: {roster}")),
                 enum_values: None,
                 minimum: None,
                 maximum: None,
@@ -5895,10 +6713,11 @@ async fn register_delegate_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+            ref_: None,
             }),
             ("task".into(), ToolInputProperty {
                 property_type: PropertyType::String,
-                description: Some("Natural-language task for the specialist".into()),
+                description: Some("Natural-language task for the specialist: goal + acceptance criteria + context it cannot see (file paths, constraints, prior conclusions). WHAT and WHY only — never commands, tool names, or step sequences.".into()),
                 enum_values: None,
                 minimum: None,
                 maximum: None,
@@ -5908,6 +6727,7 @@ async fn register_delegate_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+            ref_: None,
             }),
         ]
         .into_iter()
@@ -6565,6 +7385,7 @@ async fn register_workflow_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+            ref_: None,
             }),
             ("topic".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -6578,6 +7399,7 @@ async fn register_workflow_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+            ref_: None,
             }),
             ("resume".into(), ToolInputProperty {
                 property_type: PropertyType::String,
@@ -6591,6 +7413,7 @@ async fn register_workflow_tool(
                 properties: None,
                 required: None,
                 additional_properties: None,
+            ref_: None,
             }),
         ]
         .into_iter()
@@ -6827,6 +7650,7 @@ mod tests {
             properties,
             required: Some(vec!["path".into()]),
             additional_properties: None,
+            defs: None,
         };
         let handler: latte_rs_agent_tools::types::SharedToolHandler =
             Arc::new(|input, _ctx| Box::pin(async move { Ok(input) }));
@@ -6840,6 +7664,113 @@ mod tests {
         ).await.unwrap();
         assert_eq!(out["files"][0]["path"], "session://current");
         assert_eq!(out["files"][0]["diagnostic"], true);
+    }
+
+    fn echo_wrapped_read() -> latte_rs_agent_tools::types::Tool {
+        use latte_rs_agent_tools::types::{PropertyType, ToolInputSchema};
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert("path".into(), input_property(PropertyType::String, "path"));
+        let schema = ToolInputSchema {
+            schema_type: Default::default(),
+            properties,
+            required: Some(vec!["path".into()]),
+            additional_properties: None,
+            defs: None,
+        };
+        let handler: latte_rs_agent_tools::types::SharedToolHandler =
+            Arc::new(|input, _ctx| Box::pin(async move { Ok(input) }));
+        let tool = latte_rs_agent_tools::types::Tool::builder(
+            "read", "test", schema, handler,
+        ).build();
+        add_batch_read_contract(tool)
+    }
+
+    /// 实测事故（MiniMax-M3）：path 与 paths 同时给，应归并服务而非报错。
+    #[tokio::test]
+    async fn batch_read_merges_path_into_paths_when_both_given() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+        let wrapped = echo_wrapped_read();
+        let out = (wrapped.handler)(
+            serde_json::json!({
+                "path": "src/jemalloc.c:raw",
+                "paths": ["src/jemalloc.c:raw", "src/arena.c:raw"]
+            }),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap();
+        assert_eq!(out["count"], 2, "{out}");
+        assert_eq!(out["files"][0]["path"], "src/jemalloc.c:raw");
+        assert_eq!(out["files"][1]["path"], "src/arena.c:raw");
+    }
+
+    /// 实测事故（glm-5.3）：把字符串化的 JSON 数组塞进 path，应还原成批量读。
+    #[tokio::test]
+    async fn batch_read_repairs_json_array_string_in_path() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+        let wrapped = echo_wrapped_read();
+        let out = (wrapped.handler)(
+            serde_json::json!({"path": "[\"src/sc.c:1-1\", \"src/decay.c:1-1\"]"}),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap();
+        assert_eq!(out["count"], 2, "{out}");
+        assert_eq!(out["files"][0]["path"], "src/sc.c:1-1");
+        assert_eq!(out["files"][1]["path"], "src/decay.c:1-1");
+    }
+
+    /// 归一化不得破坏常态：单个 path 仍走单文件路径。
+    #[tokio::test]
+    async fn batch_read_leaves_single_path_untouched() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+        let wrapped = echo_wrapped_read();
+        let out = (wrapped.handler)(
+            serde_json::json!({"path": "src/sc.c:1-1"}),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap();
+        assert_eq!(out["path"], "src/sc.c:1-1");
+    }
+
+    /// 实测事故（reviewer / MiniMax-M3）：`{"path":"","paths":[…]}` 用空串
+    /// 表示"没传 path"，应视作未传走批量读，而不是报 non-empty string。
+    #[tokio::test]
+    async fn batch_read_treats_empty_path_as_absent() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+        let wrapped = echo_wrapped_read();
+        let out = (wrapped.handler)(
+            serde_json::json!({"path": "", "paths": ["src/sc.c:1-1"]}),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap();
+        assert_eq!(out["count"], 1, "{out}");
+        assert_eq!(out["files"][0]["path"], "src/sc.c:1-1");
+    }
+
+    /// 实测事故（reviewer / MiniMax-M3）：`paths` 里的空条目应被过滤，
+    /// 非空 path 正常并入，而不是整单报错。
+    #[tokio::test]
+    async fn batch_read_filters_empty_entries_in_paths() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+        let wrapped = echo_wrapped_read();
+        let out = (wrapped.handler)(
+            serde_json::json!({"path": "src/sc.c:1-1", "paths": ["", "src/sz.c:1-1"]}),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap();
+        assert_eq!(out["count"], 2, "{out}");
+        assert_eq!(out["files"][0]["path"], "src/sz.c:1-1");
+        assert_eq!(out["files"][1]["path"], "src/sc.c:1-1");
+    }
+
+    /// 全部为空时仍应报"缺 path/paths"，且点名归一化前实收的键，
+    /// 让模型能对号入座自纠（而不是看到键名凭空消失）。
+    #[tokio::test]
+    async fn batch_read_all_blank_still_errors_with_received_keys() {
+        use latte_rs_agent_tools::types::ToolExecutionContext;
+        let wrapped = echo_wrapped_read();
+        let err = (wrapped.handler)(
+            serde_json::json!({"path": "", "paths": [""], "maxSize": 1000}),
+            ToolExecutionContext::fresh("read", 0),
+        ).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("got neither"), "{message}");
+        assert!(message.contains("\"path\""), "{message}");
+        assert!(message.contains("\"paths\""), "{message}");
     }
 
     #[tokio::test]
@@ -6908,19 +7839,26 @@ mod tests {
 
     #[test]
     fn plan_and_ask_publish_recursive_item_schemas() {
-        use latte_rs_agent_tools::types::PropertyType;
-
-        let plan = input_property(PropertyType::Array, "tasks")
-            .with_items(plan_task_input_property(true));
-        let plan = serde_json::to_value(plan).expect("serialize plan schema");
-        let task = &plan["items"];
+        let plan = serde_json::to_value(plan_input_schema()).expect("serialize plan schema");
+        // 任务树节点定义在 $defs.planTask 一份；tasks items 与每层
+        // subtasks items 都是 $ref 指过去——任意深度自递归。
+        let defs = plan["$defs"].as_object().expect("$defs present");
+        let task = &defs["planTask"];
         assert_eq!(task["type"], "object");
         assert_eq!(task["required"], serde_json::json!(["title"]));
         assert_eq!(task["properties"]["labels"]["items"]["type"], "string");
         assert_eq!(task["properties"]["paths"]["items"]["type"], "string");
+        assert_eq!(task["properties"]["priority"]["minimum"], 1.0);
+        assert_eq!(task["properties"]["priority"]["maximum"], 4.0);
         assert_eq!(
-            task["properties"]["subtasks"]["items"]["properties"]["title"]["type"],
-            "string"
+            task["properties"]["subtasks"]["items"]["$ref"],
+            "#/$defs/planTask",
+            "subtasks 元素必须 $ref 自引用，才能表达任意深度"
+        );
+        assert_eq!(
+            plan["properties"]["tasks"]["items"]["$ref"],
+            "#/$defs/planTask",
+            "tasks 元素必须 $ref 到同一个定义"
         );
 
         let choice = choice_option_input_property();
@@ -6956,6 +7894,7 @@ mod tests {
             description: String::new(),
             priority: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
+            task_type: None,
             workflow: None,
             paths: paths.iter().map(|s| s.to_string()).collect(),
             subtasks: vec![],
@@ -7030,6 +7969,133 @@ mod tests {
         assert!(unknown_plan_task_keys(&arr).is_empty(), "全合法键不应有回执");
     }
 
+    // ─── workflow 名提交侧校验 ────────────────────────────────────
+    //
+    // 回归 jemalloc 会话事故：模型把 task_type 名 "research" 写进
+    // workflow 字段，plan 提交侧不拦，用户点「导入任务看板」才以
+    // unknown workflow 'research' 400 整单失败，模型已不在场无法修正。
+
+    fn setup_workflows_dir(cwd: &std::path::Path, names: &[&str]) {
+        let dir = cwd.join(".latte/workflows.d");
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            std::fs::write(
+                dir.join(format!("{n}.toml")),
+                format!("name = \"{n}\"\n[[steps]]\nid = \"s\"\nspeakers = [\"pm\"]\nprompt = \"x\"\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn plan_workflows_unknown_name_rejected_with_available_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        setup_workflows_dir(cwd, &["explore", "learn"]);
+        // 顶层任务与子任务的 workflow 都要查。
+        let mut t = plan_task("建立 jemalloc 学习环境与版本基线", &[], &[]);
+        t.workflow = Some("research".into()); // task_type 名，不是 workflow
+        t.subtasks = vec![plan_task("子任务", &[], &[])];
+        t.subtasks[0].workflow = Some("ghost_wf".into());
+        let err = validate_plan_workflows(cwd, &[t]).expect_err("未知 workflow 必须拒绝");
+        assert!(err.contains("unknown workflow 'research'"), "{err}");
+        assert!(err.contains("ghost_wf"), "子任务的 workflow 也要报：{err}");
+        // 可用名列表随环境（项目层 + 全局层）变化，只断言列表存在且
+        // 给了留空逃生阀，不断言具体名字。
+        assert!(err.contains("已注册流程名（"), "{err}");
+        assert!(err.contains("留空"), "{err}");
+        assert!(
+            err.len() <= 256,
+            "错误必须能塞进 256 字节的 tool_result（实际 {} 字节）：{err}",
+            err.len()
+        );
+    }
+
+    #[test]
+    fn plan_workflows_known_or_empty_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        setup_workflows_dir(cwd, &["explore"]);
+        // 已注册名 / None / 空串（= 不绑定）都放行。
+        let mut t = plan_task("t", &[], &[]);
+        t.workflow = Some("explore".into());
+        assert!(validate_plan_workflows(cwd, &[t]).is_ok());
+        assert!(validate_plan_workflows(cwd, &[plan_task("t", &[], &[])]).is_ok());
+        let mut t = plan_task("t", &[], &[]);
+        t.workflow = Some("  ".into());
+        assert!(validate_plan_workflows(cwd, &[t]).is_ok());
+    }
+
+    // ─── task_type 名提交侧校验 ───────────────────────────────────
+    //
+    // 派发路由按 task_type 推导 workflow（注册表 bundled +
+    // 项目层 .latte/task_types.toml 覆盖）；填错类型 = 整条清单的
+    // 路由静默失效，必须提交侧拦下。
+
+    #[test]
+    fn plan_task_types_unknown_rejected_with_known_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        // 顶层任务与子任务的 task_type 都要查。
+        let mut t = plan_task("t", &[], &[]);
+        t.task_type = Some("explore".into()); // workflow 名，不是 task_type
+        t.subtasks = vec![plan_task("子任务", &[], &[])];
+        t.subtasks[0].task_type = Some("ghost_type".into());
+        let err = validate_plan_task_types(cwd, &mut [t]).expect_err("未知 task_type 必须拒绝");
+        assert!(err.contains("unknown task_type 'explore'"), "{err}");
+        assert!(err.contains("ghost_type"), "子任务的 task_type 也要报：{err}");
+        assert!(err.contains("feature"), "已知类型列表要给出：{err}");
+        assert!(err.contains("留空"), "{err}");
+        assert!(
+            err.len() <= 256,
+            "错误必须能塞进 256 字节的 tool_result（实际 {} 字节）：{err}",
+            err.len()
+        );
+    }
+
+    /// 别名收编回归（2026-09 jemalloc 学习拆分会话）：manager 两次提交
+    /// `task_type:"learning"`（注册表 id 是 `learn`），整单连撞两次拒绝。
+    /// 笔误应在校验前就近改写为合法 id，而不是打回给模型；大小写差异
+    /// 同样归一。改写必须落回任务本身——看板派发路由按 task_type 推导
+    /// workflow，留原值等于路由静默失效。
+    #[test]
+    fn plan_task_types_alias_normalized_before_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let mut t = plan_task("t", &[], &[]);
+        t.task_type = Some("learning".into());
+        t.subtasks = vec![plan_task("子任务", &[], &[])];
+        t.subtasks[0].task_type = Some("LEARN".into()); // 大小写也归一
+        validate_plan_task_types(cwd, std::slice::from_mut(&mut t))
+            .expect("别名/大小写应收编为 learn");
+        assert_eq!(t.task_type.as_deref(), Some("learn"));
+        assert_eq!(t.subtasks[0].task_type.as_deref(), Some("learn"));
+    }
+
+    #[test]
+    fn plan_task_types_known_empty_and_project_overlay_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        // bundled 已知类型 / None / 空串（= 不分类）都放行。
+        let mut t = plan_task("t", &[], &[]);
+        t.task_type = Some("feature".into());
+        assert!(validate_plan_task_types(cwd, &mut [t]).is_ok());
+        assert!(validate_plan_task_types(cwd, &mut [plan_task("t", &[], &[])]).is_ok());
+        let mut t = plan_task("t", &[], &[]);
+        t.task_type = Some(" ".into());
+        assert!(validate_plan_task_types(cwd, &mut [t]).is_ok());
+        // 项目层覆盖/增补的类型同样认得。
+        std::fs::create_dir_all(cwd.join(".latte")).unwrap();
+        std::fs::write(
+            cwd.join(".latte/task_types.toml"),
+            "[types.spike]\nlabel = \"预研\"\ndefault_workflow = \"\"\n",
+        )
+        .unwrap();
+        let mut t = plan_task("t", &[], &[]);
+        t.task_type = Some("spike".into());
+        assert!(validate_plan_task_types(cwd, &mut [t]).is_ok(), "项目层增补类型必须放行");
+    }
+
     /// 纯阅读/学习类任务共用同一份代码是正常的（不会互相覆盖），
     /// 不该被重叠校验拦下。
     ///
@@ -7056,6 +8122,96 @@ mod tests {
             plan_task("P2 改内部头", &[], &["include/foo/internal"]),
         ];
         assert!(validate_plan_paths(cwd, &writing).is_err());
+    }
+
+    /// 只读类任务的 paths 必须**整条存在**（严格档）。
+    ///
+    /// 回归 2026-09 jemalloc 会话：宽松档只查第一级目录，
+    /// `include/jemalloc/internal/arena_inlines.h`（5.x 已删除的文件）因为
+    /// `include/` 存在就被放过，学习任务按图索骥第一步就落空。实现类任务
+    /// 保留宽松语义——它要新建的文件本来就还不存在。
+    #[test]
+    fn read_only_tasks_require_full_path_existence() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("include/jemalloc/internal")).unwrap();
+        std::fs::write(cwd.join("include/jemalloc/internal/tsd.h"), "x").unwrap();
+
+        let ghost = "include/jemalloc/internal/arena_inlines.h"; // 不存在
+        let real = "include/jemalloc/internal/tsd.h";
+
+        // labels 含「只读」→ 严格档，幻觉文件被拦。
+        let by_label = vec![plan_task("T1 研读 arena inlines", &["只读"], &[ghost])];
+        let err = validate_plan_paths(cwd, &by_label).expect_err("只读任务的幻觉文件必须被拦");
+        assert!(err.contains("arena_inlines.h"), "错误要点名那个路径：{err}");
+
+        // task_type = learn → 同样严格。
+        let mut by_type = plan_task("T2 研读", &[], &[ghost]);
+        by_type.task_type = Some("learn".into());
+        assert!(validate_plan_paths(cwd, &[by_type]).is_err(), "learn 类型应走严格档");
+
+        // 真实存在的文件照常放行。
+        let ok = vec![plan_task("T3 研读 tsd", &["只读"], &[real])];
+        assert!(validate_plan_paths(cwd, &ok).is_ok(), "存在的文件不该被拦");
+
+        // 实现类任务：文件还不存在是正常的（要新建），保持宽松。
+        let feature = vec![plan_task("T4 新建实现文件", &[], &["include/jemalloc/internal/brand_new.h"])];
+        assert!(
+            validate_plan_paths(cwd, &feature).is_ok(),
+            "实现类任务允许 paths 指向待新建文件"
+        );
+    }
+
+    /// 严格档必须下探到 subtasks，并从父任务继承只读档位。
+    ///
+    /// 实测那份交付清单的 22 个叶子任务全在 `subtasks` 里，父任务带「只读」
+    /// 标签而子任务字段更省——不继承等于严格档对整份交付物失效。
+    #[test]
+    fn read_only_strictness_inherits_into_subtasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+
+        let mut parent = plan_task("阶段 3：Arena 与 bin/slab", &["只读"], &["src"]);
+        let mut leaf = plan_task("T3.3 梳理 Chunk 管理", &[], &["src/chunk.c"]); // 5.0 已删除
+        leaf.paths = vec!["src/chunk.c".into()];
+        parent.subtasks = vec![leaf];
+
+        let err = validate_plan_paths(cwd, &[parent]).expect_err("子任务的幻觉文件必须被拦");
+        assert!(err.contains("chunk.c"), "错误要点名子任务里的那个路径：{err}");
+    }
+
+    /// 任意深度任务树：三个校验器都必须下探到第三层（孙任务）。
+    /// 此前只遍历一层 `subtasks`，更深层的幻觉路径 / 未知 workflow /
+    /// 未知 task_type 会静默空转通过；只读严格档也要跨两层继承。
+    #[test]
+    fn plan_validators_recurse_into_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        setup_workflows_dir(cwd, &["explore"]);
+
+        let mut root = plan_task("根任务", &["只读"], &[]);
+        let mut child = plan_task("子任务", &[], &[]);
+        let mut grandchild = plan_task("孙任务", &[], &[]);
+        grandchild.paths = vec!["src/ghost.c".into()]; // src/ 存在、文件不存在
+        grandchild.workflow = Some("ghost_wf".into());
+        grandchild.task_type = Some("ghost_type".into());
+        child.subtasks = vec![grandchild];
+        root.subtasks = vec![child];
+
+        let err = validate_plan_paths(cwd, std::slice::from_ref(&root))
+            .expect_err("孙任务的幻觉路径必须被拦（只读档位跨两层继承）");
+        assert!(err.contains("ghost.c"), "{err}");
+
+        let err = validate_plan_workflows(cwd, std::slice::from_ref(&root))
+            .expect_err("孙任务的未知 workflow 必须被拦");
+        assert!(err.contains("ghost_wf"), "{err}");
+
+        let mut tasks = vec![root];
+        let err = validate_plan_task_types(cwd, &mut tasks)
+            .expect_err("孙任务的未知 task_type 必须被拦");
+        assert!(err.contains("ghost_type"), "{err}");
     }
 
     /// 冲突反馈必须短且按路径聚合：tool_result 只有 256 字节，长清单
@@ -7322,29 +8478,43 @@ mod tests {
     #[test]
     fn delegate_hint_lists_roles_from_config() {
         let mut cfg = AgentConfig::default();
-        for (id, name) in [("programmer", "Software Engineer"), ("my_custom_role", "")] {
+        for (id, name, desc) in [
+            ("programmer", "Software Engineer", "动手改代码：实现功能、修 bug、跑构建验证"),
+            ("my_custom_role", "", ""),
+        ] {
             cfg.roles.insert(
                 id.to_string(),
                 crate::role::RoleTemplate {
                     id: id.into(),
                     name: name.into(),
-                    category: "engineering".into(),
+                    category: "execution".into(),
                     model_tier: "standard".into(),
                     model_chain: vec![],
                     prompt_file: None,
                     temperature: None,
-                    tools: vec![],
+                    tools: vec!["read".into(), "write".into()],
                     icon: String::new(),
                     skills: vec![],
             code_paths: vec![],
+                    description: desc.into(),
                 },
             );
         }
         let hint = delegate_tool_hint(&cfg);
-        assert!(hint.contains("programmer(Software Engineer)"), "hint: {hint}");
-        assert!(hint.contains("my_custom_role"), "hint: {hint}");
-        // 花名册排序：my_custom_role 在 programmer 前
+        // 详情花名册：id + 显示名 + 职责 + 类别 + 工具
+        assert!(hint.contains("`programmer`（Software Engineer）"), "hint: {hint}");
+        assert!(hint.contains("动手改代码"), "hint: {hint}");
+        // 没写描述的自定义角色回退到「类别 + 工具」派生简介
+        assert!(hint.contains("`my_custom_role` — 执行类角色【执行；tools: read, write】"), "hint: {hint}");
+        // 细化后的说明必须覆盖：动态花名册语义、id 传参、并行扇出、
+        // 派发幂等、结果处理。
+        assert!(hint.contains("动态生成"), "hint: {hint}");
+        assert!(hint.contains("Parallel dispatch"), "hint: {hint}");
+        assert!(hint.contains("Idempotency"), "hint: {hint}");
+        assert!(hint.contains("Reading results"), "hint: {hint}");
+        // 紧凑花名册仍保持排序（schema / 系统提示用）：my_custom_role 在 programmer 前
         let roster = role_roster_text(&cfg);
+        assert!(roster.contains("programmer(Software Engineer)"), "roster: {roster}");
         assert!(roster.find("my_custom_role").unwrap() < roster.find("programmer").unwrap());
     }
 
@@ -7361,6 +8531,43 @@ mod tests {
         let hint = workflow_tool_hint(dir.path());
         assert!(hint.contains("`my_custom` — 自定义流程"), "hint: {hint}");
         assert!(hint.contains("分派前先想流程"), "hint: {hint}");
+    }
+
+    /// 落点速查表：从各 workflow 描述的「落点：…」标注自动汇聚成分组
+    /// 索引——同落点的流程归一行，分组键截到「（」前；未标注落点的
+    /// 归入提示行。不是硬编码对照表（见下方回归测试的背景），新增
+    /// workflow 只要写了落点就自动进表。
+    #[test]
+    fn workflow_hint_builds_landing_index() {
+        let guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("LATTE_HOME");
+        std::env::set_var("LATTE_HOME", home.path());
+        let wf_dir = project.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        let wf = |name: &str, desc: &str| {
+            format!("name = \"{name}\"\ndescription = \"{desc}\"\n[[steps]]\nid = \"a\"\nspeakers = [\"tester\"]\nprompt = \"{{{{topic}}}}\"\n")
+        };
+        std::fs::write(wf_dir.join("wf_a.toml"), wf("wf_a", "甲流程｜落点：任务看板条目（弹窗导入）")).unwrap();
+        std::fs::write(wf_dir.join("wf_b.toml"), wf("wf_b", "乙流程｜落点：任务看板条目（弹窗导入）")).unwrap();
+        std::fs::write(wf_dir.join("wf_c.toml"), wf("wf_c", "丙流程，没写落点")).unwrap();
+        let hint = workflow_tool_hint(project.path());
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+        drop(guard);
+        assert!(hint.contains("落点速查"), "hint: {hint}");
+        assert!(
+            hint.contains("- 任务看板条目 ← wf_a, wf_b"),
+            "同落点的流程归一行、组内按名排序: {hint}"
+        );
+        assert!(hint.contains("（描述未标注落点"), "hint: {hint}");
+        assert!(hint.contains("wf_c"), "未标注落点的流程也要出现: {hint}");
     }
 
     /// 选流程的判别依据必须是**交付物落点**，而且只能有一条、还得是
@@ -7739,6 +8946,7 @@ mod tests {
                     description: "覆盖并发读写路径".into(),
                     priority: Some(1),
                     labels: vec!["core".into()],
+                    task_type: Some("feature".into()),
                     workflow: Some("tdd_development".into()),
                     paths: vec!["src/ringbuf".into()],
                     subtasks: vec![],
@@ -7748,6 +8956,7 @@ mod tests {
                     description: String::new(),
                     priority: None,
                     labels: vec![],
+                    task_type: None,
                     workflow: None,
                     paths: vec![],
                     subtasks: vec![],
@@ -7833,6 +9042,7 @@ mod tests {
             icon: String::new(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         };
         let merged = AgentConfig {
             advisor: Default::default(),
@@ -8064,6 +9274,50 @@ mod tests {
         );
         // 类型错误不进 PendingApproval（模型可修正后同轮重调）。
         assert_eq!(stage.read().clone(), PlanStage::Normal);
+    }
+
+    /// 任意深度任务树端到端：三层嵌套（含第四层曾孙）的 plan 提交必须
+    /// 整单成功——schema 侧（$defs/$ref 自递归）、参数归一化、schema
+    /// 校验、serde 解析任一层都不再有深度上限。
+    #[tokio::test]
+    async fn plan_tool_accepts_deeply_nested_tasks() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
+            .expect("register plan");
+
+        let out = tm
+            .execute(
+                "plan",
+                serde_json::json!({
+                    "tasks": [{
+                        "title": "T1 顶层任务",
+                        "subtasks": [{
+                            "title": "T1.1 子任务",
+                            "subtasks": [{
+                                "title": "T1.1.1 孙任务",
+                                "labels": ["leaf"],
+                                "subtasks": [{ "title": "T1.1.1.1 曾孙任务" }]
+                            }]
+                        }]
+                    }]
+                }),
+                None,
+            )
+            .await
+            .expect("三层以上嵌套必须提交成功");
+        let text = out.as_str().expect("string result");
+        assert!(text.contains("plan_id=plan-manager-"), "{text}");
+
+        let ev = rx.try_recv().expect("PlanProposed event");
+        let ChatEvent::PlanProposed { tasks, .. } = ev else {
+            panic!("expected PlanProposed, got {ev:?}");
+        };
+        let t111 = &tasks[0].subtasks[0].subtasks[0];
+        assert_eq!(t111.title, "T1.1.1 孙任务");
+        assert_eq!(t111.labels, vec!["leaf"]);
+        assert_eq!(t111.subtasks[0].title, "T1.1.1.1 曾孙任务");
     }
 
     // ─── slash 路径自动提案（extract_plan_tasks / propose_plan_from_summary）──
@@ -8629,6 +9883,7 @@ mod tests {
                     icon: String::new(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -8951,6 +10206,84 @@ mod tests {
         .expect("复位后第二次调用应放行");
     }
 
+    /// 直提门禁：session 没有任何 workflow 运行记录时，≥3 个顶层任务
+    /// 的清单第一次整单拒绝并指路 implementation_plan；原样重提放行
+    /// （每 session 只拦一次）。<3 个任务的小清单不拦。
+    #[tokio::test]
+    async fn plan_tool_direct_submission_gate_warns_once() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "ui-test-direct-gate-1";
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), sid.to_string())
+            .expect("register plan");
+
+        // 2 个任务的小清单：低于门禁阈值，直接放行。
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [{ "title": "任务一" }, { "title": "任务二" }] }),
+            None,
+        )
+        .await
+        .expect("2 个任务的小清单不应触发门禁");
+        *stage.write() = PlanStage::Normal;
+
+        let three = serde_json::json!({ "tasks": [
+            { "title": "任务一" }, { "title": "任务二" }, { "title": "任务三" }
+        ] });
+        let err = tm
+            .execute("plan", three.clone(), None)
+            .await
+            .expect_err("无 workflow 记录的 3 任务直提必须被拦");
+        assert!(err.to_string().contains("implementation_plan"), "{err}");
+        assert_eq!(stage.read().clone(), PlanStage::Normal, "拦截不算提交");
+
+        // 原样重提（例外通道：用户逐条给定 / workflow 已交底）→ 放行。
+        tm.execute("plan", three, None)
+            .await
+            .expect("警告一次后原样重提应放行");
+
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, ChatEvent::PlanProposed { .. }) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 2, "小清单 1 次 + 重提 1 次，被拦那次不能发 PlanProposed");
+    }
+
+    /// 直提门禁：session 已有 workflow 运行记录（checkpoint meta 首行
+    /// 带本 session_id）时，多任务清单直接放行——workflow 的评审门
+    /// 已经走过（或失败已交底，允许手工兜底）。
+    #[tokio::test]
+    async fn plan_tool_direct_gate_passes_after_workflow_run() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        let sid = "ui-test-direct-gate-2";
+        let runs = dir.path().join(".latte").join("workflow-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(
+            runs.join("wf-x.jsonl"),
+            "{\"type\":\"meta\",\"wf_id\":\"wf-x\",\"workflow_name\":\"implementation_plan\",\"topic\":\"t\",\"started_at\":1,\"session_id\":\"ui-test-direct-gate-2\"}\n",
+        )
+        .unwrap();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), sid.to_string())
+            .expect("register plan");
+
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [
+                { "title": "任务一" }, { "title": "任务二" }, { "title": "任务三" }
+            ] }),
+            None,
+        )
+        .await
+        .expect("本 session 已有 workflow 运行记录，应直接放行");
+    }
+
     /// paths 机械校验：第一级段就不存在的路径判定为幻觉路径，整单
     /// 拒绝且**不进** PendingApproval（模型可修正后同轮重调）。
     #[tokio::test]
@@ -8983,6 +10316,44 @@ mod tests {
         .expect("修正后应放行");
     }
 
+    /// 顶层游离键硬校验：模型把任务写到 tasks 数组外（实测 jemalloc
+    /// 学习拆分会话：{"tasks":[1 个], "item":{…其余任务…}}，21 个
+    /// 任务静默消失，弹窗只弹 1 个、门禁却已锁死）→ 整单拒绝并点名，
+    /// 不进 PendingApproval，模型可同轮合并后重提。
+    #[tokio::test]
+    async fn plan_tool_rejects_top_level_stray_keys() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
+            .expect("register plan");
+
+        let err = tm
+            .execute(
+                "plan",
+                serde_json::json!({
+                    "tasks": [{ "title": "任务一" }],
+                    "item": { "title": "任务二（被写到了 tasks 外）" }
+                }),
+                None,
+            )
+            .await
+            .expect_err("顶层游离键必须被拒");
+        let msg = err.to_string();
+        assert!(msg.contains("item"), "报错应点名游离键：{msg}");
+        assert!(msg.contains("tasks 数组"), "报错应指引合并进 tasks：{msg}");
+        // 整单拒绝：不进 PendingApproval、不发 PlanProposed，可同轮重调。
+        assert_eq!(stage.read().clone(), PlanStage::Normal);
+        assert!(rx.try_recv().is_err(), "拒绝时不应广播 PlanProposed");
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [{ "title": "任务一" }, { "title": "任务二" }] }),
+            None,
+        )
+        .await
+        .expect("合并进 tasks 后应放行");
+    }
+
     /// 新建文件路径放行：叶子不存在但祖先目录存在（paths 指向要
     /// 创建的新文件是合法场景）。
     #[tokio::test]
@@ -9004,7 +10375,6 @@ mod tests {
         .expect("祖先存在的待新建路径应放行");
         assert!(matches!(*stage.read(), PlanStage::PendingApproval { .. }));
     }
-
     /// 清单内 paths 前缀重叠（含相等）→ 整单拒绝并列出冲突对。
     #[tokio::test]
     async fn plan_tool_rejects_overlapping_paths_within_plan() {
@@ -9087,6 +10457,7 @@ mod tests {
             icon: String::new(),
             skills: vec![],
             code_paths: vec![],
+            description: String::new(),
         };
         let merged = AgentConfig {
             advisor: Default::default(),
@@ -9237,6 +10608,7 @@ mod tests {
                     icon: String::new(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -9377,6 +10749,7 @@ mod tests {
                     icon: "👔".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -9581,6 +10954,7 @@ mod tests {
                     icon: "👔".into(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -10134,6 +11508,7 @@ mod tests {
                     icon: "👔".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -10276,6 +11651,7 @@ mod tests {
                     icon: "👔".into(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -10428,6 +11804,7 @@ require = ["永远不可能出现的验收字符串"]
                     icon: "💻".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -10560,6 +11937,7 @@ require = ["永远不可能出现的验收字符串"]
                     icon: "👔".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -10656,6 +12034,7 @@ require = ["永远不可能出现的验收字符串"]
                     icon: icon.into(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             )
         };
@@ -10820,6 +12199,7 @@ require = ["永远不可能出现的验收字符串"]
                     icon: icon.into(),
                     skills: vec![],
                     code_paths: vec![],
+                    description: String::new(),
                 },
             )
         };
@@ -11145,12 +12525,14 @@ require = ["永远不可能出现的验收字符串"]
                     properties: None,
                     required: None,
                     additional_properties: None,
+                ref_: None,
                 },
             )]
             .into_iter()
             .collect(),
             required: None,
             additional_properties: None,
+            defs: None,
         };
         mgr.register(
             Tool::builder(
@@ -11180,7 +12562,6 @@ require = ["永远不可能出现的验收字符串"]
         let mgr = build_tool_manager(&["read".into()]).await.unwrap();
         let cases = [
             serde_json::json!({}),
-            serde_json::json!({"path":"a", "paths":["b"]}),
             serde_json::json!({"paths":[]}),
             serde_json::json!({"paths":["1","2","3","4","5","6","7","8","9","10","11"]}),
             serde_json::json!({"paths":["ok", 2]}),
@@ -11191,6 +12572,18 @@ require = ["永远不可能出现的验收字符串"]
                 "invalid input should fail: {input}"
             );
         }
+
+        // path + paths 同时给不再是硬错误：归并为批量读（单文件不存在时
+        // 错误落在 per-file failed 里，顶层调用本身合法）。
+        let out = mgr
+            .execute(
+                "read",
+                serde_json::json!({"path":"a", "paths":["b"]}),
+                None,
+            )
+            .await
+            .expect("path+paths should merge into a batch read");
+        assert_eq!(out["count"], 2, "{out}");
     }
 
     #[tokio::test]
@@ -11240,6 +12633,246 @@ require = ["永远不可能出现的验收字符串"]
             "description lost after grant"
         );
         assert!(read.input_schema.properties.contains_key("paths"));
+    }
+
+    // ─── read 的独立行范围参数（start/end）折进选择器 ──────────────
+    //
+    // 回归实测事故（task_planner / glm-5.3）：`{"path":…,"start":3786,
+    // "end":3985}` 曾返回 ok + **整文件**结构摘要——未声明键被静默丢弃。
+    // 静默丢参数比报错贵：模型拿到 ok 就以为读到了想要的行。
+
+    /// 走真实管线（tm.execute），确认折叠后真的只回那几行。
+    async fn read_via_manager(
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, latte_rs_agent_tools::error::ToolError> {
+        let tm = build_tool_manager(&["read".into()]).await.unwrap();
+        tm.execute("read", input, None).await
+    }
+
+    #[tokio::test]
+    async fn read_folds_start_end_into_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("m.txt");
+        let body: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(&p, body).unwrap();
+        let path = p.to_str().unwrap();
+
+        let r = read_via_manager(serde_json::json!({"path": path, "start": 3, "end": 5}))
+            .await
+            .expect("start/end 应被折进选择器而不是静默丢弃");
+        assert_eq!(r["startLine"].as_u64(), Some(3), "{r:?}");
+        assert_eq!(r["endLine"].as_u64(), Some(5), "{r:?}");
+        assert_eq!(r["selectedLines"].as_u64(), Some(3), "{r:?}");
+        assert_eq!(r["selector"].as_str(), Some("3-5"), "{r:?}");
+        assert!(r["content"].as_str().unwrap().starts_with("line3"), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn read_folds_range_key_aliases_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("m.txt");
+        std::fs::write(&p, (1..=20).map(|i| format!("line{i}\n")).collect::<String>()).unwrap();
+        let path = p.to_str().unwrap();
+
+        // 别名对 + 字符串数字。
+        let r = read_via_manager(serde_json::json!({
+            "path": path, "start_line": "7", "end_line": "9"
+        }))
+        .await
+        .unwrap();
+        assert_eq!(r["selector"].as_str(), Some("7-9"), "{r:?}");
+
+        // start + count → `start+count` 选择器。
+        let r = read_via_manager(serde_json::json!({"path": path, "start": 4, "limit": 2}))
+            .await
+            .unwrap();
+        assert_eq!(r["startLine"].as_u64(), Some(4), "{r:?}");
+        assert_eq!(r["endLine"].as_u64(), Some(5), "{r:?}");
+
+        // 只有 start → 单行。
+        let r = read_via_manager(serde_json::json!({"path": path, "start": 11}))
+            .await
+            .unwrap();
+        assert_eq!(r["selectedLines"].as_u64(), Some(1), "{r:?}");
+        assert_eq!(r["startLine"].as_u64(), Some(11), "{r:?}");
+    }
+
+    /// 有歧义的情形必须**报错并给出正确写法**，不能猜也不能静默丢。
+    #[tokio::test]
+    async fn read_rejects_ambiguous_range_args_with_actionable_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("m.txt");
+        std::fs::write(&p, "a\nb\nc\nd\n").unwrap();
+        let path = p.to_str().unwrap();
+
+        // path 已带选择器 + 又传 start/end。
+        let e = read_via_manager(serde_json::json!({
+            "path": format!("{path}:1-2"), "start": 3, "end": 4
+        }))
+        .await
+        .expect_err("两处范围冲突必须报错");
+        assert!(e.to_string().contains("path:start-end"), "报错要给写法: {e}");
+
+        // 批量 paths + 顶层 start/end。
+        let e = read_via_manager(serde_json::json!({"paths": [path], "start": 1, "end": 2}))
+            .await
+            .expect_err("批量路径不接受顶层范围键");
+        assert!(e.to_string().contains("paths"), "{e}");
+
+        // 只给 end，缺起始行。
+        let e = read_via_manager(serde_json::json!({"path": path, "end": 3}))
+            .await
+            .expect_err("缺起始行必须报错");
+        assert!(e.to_string().contains("起始行"), "{e}");
+    }
+
+    /// 不带范围键时行为逐字段不变（默认结构摘要/整文件路径不受影响）。
+    #[tokio::test]
+    async fn read_without_range_keys_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("m.txt");
+        std::fs::write(&p, "a\nb\nc\n").unwrap();
+        let r = read_via_manager(serde_json::json!({"path": p.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert_eq!(r["totalLines"].as_u64(), Some(3), "{r:?}");
+        assert!(r.get("selector").is_none(), "无选择器时不应凭空出现: {r:?}");
+    }
+
+    /// 专给「批量读完整函数」用的多语言样本：每个文件放 2 个**跨多行**的
+    /// 函数（`cg_fixture` 里 rs/go/ts 的函数都是单行的，验不出跨度）。
+    /// 独立一份而不是扩 `cg_fixture`，避免动到那批按命中数断言的 e2e 测试。
+    fn cg_multiline_fixture() -> tempfile::TempDir {
+        let d = tempfile::tempdir().expect("tempdir");
+        let w = |name: &str, body: &str| {
+            std::fs::write(d.path().join(name), body).expect("write fixture");
+        };
+        w(
+            "m.c",
+            "#include <stdlib.h>\n\nstatic int\nc_add(int a,\n      int b)\n{\n    int s = a + b;\n    return s;\n}\n\nvoid\nc_touch(int *p)\n{\n    if (p == NULL) {\n        return;\n    }\n    *p = c_add(*p, 1);\n}\n",
+        );
+        w(
+            "m.rs",
+            "use std::fmt;\n\npub fn rs_add(a: i32, b: i32) -> i32 {\n    let s = a + b;\n    s\n}\n\nfn rs_touch(p: &mut i32) {\n    if *p < 0 {\n        *p = 0;\n    }\n    *p = rs_add(*p, 1);\n}\n",
+        );
+        w(
+            "m.go",
+            "package m\n\nimport \"fmt\"\n\nfunc GoAdd(a int, b int) int {\n\ts := a + b\n\treturn s\n}\n\nfunc GoTouch(p *int) {\n\tif *p < 0 {\n\t\t*p = 0\n\t}\n\tfmt.Println(GoAdd(*p, 1))\n}\n",
+        );
+        w(
+            "m.py",
+            "import os\n\ndef py_add(a, b):\n    s = a + b\n    return s\n\ndef py_touch(p):\n    if p < 0:\n        p = 0\n    return py_add(p, 1)\n",
+        );
+        w(
+            "m.ts",
+            "export function tsAdd(a: number, b: number): number {\n    const s = a + b;\n    return s;\n}\n\nexport function tsTouch(p: number): number {\n    if (p < 0) {\n        p = 0;\n    }\n    return tsAdd(p, 1);\n}\n",
+        );
+        d
+    }
+
+    /// 端到端锁死「批量读完整函数」这条链路：
+    /// `code_graph(kind=function)` 拿跨度 → **一次** `read(paths=[…])`
+    /// 批量读回那些函数体，跨多语言、用满 10 个目标的上限。
+    ///
+    /// 这是用户诉求的直接验收项，也是 code_graph 回跨度的意义所在：
+    /// 断言每段返回的**首行是函数签名、末行闭合**，且不含相邻函数的名字
+    /// （证明切的是"整个函数"而不是"一段行"）。
+    #[tokio::test]
+    async fn read_batch_reads_whole_functions_across_languages() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_multiline_fixture();
+        let mgr = build_tool_manager(&["read".into()]).await.unwrap();
+
+        // 每种语言问一次 code_graph，收集 `path:START-END` 锚点。
+        let mut anchors: Vec<String> = Vec::new();
+        // 每个锚点对应的源码原文切片（按 code_graph 给的跨度切）。
+        // 断言 read 回来的内容与它**逐字节相同** —— 这比按函数名做子串判定
+        // 稳得多（C 的返回类型常独占一行，签名首 token 根本不是函数名）。
+        let mut expected: Vec<String> = Vec::new();
+        let mut langs_covered: Vec<&str> = Vec::new();
+        for file in ["m.c", "m.rs", "m.go", "m.py", "m.ts"] {
+            let p = d.path().join(file);
+            let src = std::fs::read_to_string(&p).expect("读 fixture");
+            let src_lines: Vec<&str> = src.lines().collect();
+            let out = cg_call(serde_json::json!({
+                "path": p.to_str().unwrap(), "kind": "function"
+            }))
+            .await
+            .unwrap_or_else(|e| panic!("code_graph({file}) 失败: {e}"));
+            let before = anchors.len();
+            for entry in cg_matches(&out).lines() {
+                let (loc, _sig) = entry.split_once(": ").expect("条目缺签名");
+                // loc = `<file>:<start>-<end>`；只取跨度式锚点（单行定义跳过）。
+                let (_, span) = loc.rsplit_once(':').expect("条目缺位置");
+                let Some((start, end)) = span.split_once('-') else {
+                    continue;
+                };
+                let start: usize = start.parse().expect("start 应为数字");
+                let end: usize = end.parse().expect("end 应为数字");
+                anchors.push(format!("{}:{span}", p.to_string_lossy()));
+                expected.push(src_lines[start - 1..end].join("\n"));
+            }
+            if anchors.len() > before {
+                langs_covered.push(file);
+            }
+        }
+        assert!(
+            langs_covered.len() == 5,
+            "5 种语言应各拿到多行函数跨度，实际 {langs_covered:?}"
+        );
+        assert!(
+            anchors.len() >= 2,
+            "多语言 fixture 至少该有 2 个多行函数，实得 {}: {anchors:?}",
+            anchors.len()
+        );
+        // 用满 read 的批量上限（1–10）。
+        anchors.truncate(BATCH_READ_MAX_PATHS);
+        expected.truncate(BATCH_READ_MAX_PATHS);
+        let n = anchors.len();
+        assert_eq!(
+            n, BATCH_READ_MAX_PATHS,
+            "5 语言 × 2 函数应正好用满批量上限 {BATCH_READ_MAX_PATHS}，实得 {n}: {anchors:?}"
+        );
+
+        let out = mgr
+            .execute("read", serde_json::json!({ "paths": anchors.clone() }), None)
+            .await
+            .expect("批量读函数跨度应成功");
+
+        let files = out["files"].as_array().expect("files");
+        let failed = out["failed"].as_array().expect("failed");
+        assert!(failed.is_empty(), "不应有失败项: {failed:?}");
+        assert_eq!(files.len(), n, "应按输入顺序返回 {n} 段: {out:?}");
+        assert_eq!(out["count"].as_u64(), Some(n as u64));
+
+        for (i, f) in files.iter().enumerate() {
+            let body = f["content"].as_str().expect("content");
+            // 逐字节等于源码里那段函数：既证明跨度对、也证明批量按输入顺序归并。
+            assert_eq!(
+                body, expected[i],
+                "第 {i} 段（{}）内容与源码切片不一致",
+                anchors[i]
+            );
+            // 选区元数据必须在（证明走的是 ranged read，没退化成整文件读）。
+            let start = f["startLine"].as_u64().unwrap_or_else(|| {
+                panic!("第 {i} 段缺 startLine，说明退化成整文件读了: {f:?}")
+            });
+            let end = f["endLine"].as_u64().expect("endLine");
+            assert_eq!(
+                f["selectedLines"].as_u64(),
+                Some(end - start + 1),
+                "第 {i} 段选区行数与 start/end 不符: {f:?}"
+            );
+            assert!(end > start, "多行函数的 end 必须大于 start: {f:?}");
+            // 不是整文件：选区行数必须小于该文件总行数。
+            assert!(
+                f["selectedLines"].as_u64() < f["totalLines"].as_u64(),
+                "第 {i} 段选区不应等于整文件: {f:?}"
+            );
+        }
     }
 
     /// 锁定 code_graph 暴露契约：allowed 含 "code_graph" 时，
@@ -11365,6 +12998,7 @@ require = ["永远不可能出现的验收字符串"]
                     icon: "👔".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -11649,9 +13283,34 @@ require = ["永远不可能出现的验收字符串"]
         assert_eq!(code_graph_infer_lang("a/b/mod.rs"), Some("rust"));
         assert_eq!(code_graph_infer_lang("ui/src/api.ts"), Some("typescript"));
         assert_eq!(code_graph_infer_lang("main.go"), Some("go"));
-        // 目录 / 未知扩展名推断不出来，handler 会要求显式传 lang。
+        // 目录 / 未知扩展名推断不出来；目录由 handler 走 code_graph_infer_dir_lang。
         assert_eq!(code_graph_infer_lang("src/"), None);
         assert_eq!(code_graph_infer_lang("README"), None);
+    }
+
+    #[test]
+    fn code_graph_dir_lang_inference_picks_dominant() {
+        let d = tempfile::tempdir().expect("tempdir");
+        let w = |name: &str| {
+            let p = d.path().join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        };
+        w("src/a.c");
+        w("src/b.c");
+        w("include/c.h");
+        w("scripts/gen.py");
+        w("README"); // 无扩展名，不参与
+        w(".hidden/ignored.rs"); // 隐藏目录，不参与
+        let (lang, others) =
+            code_graph_infer_dir_lang(d.path().to_str().unwrap()).expect("应推断出主导语言");
+        assert_eq!(lang, "c", "2 .c + 1 .h 应胜过 1 .py");
+        assert_eq!(others, vec!["python"]);
+
+        // 扫不到可识别源文件 → None，handler 才会要求显式传 lang。
+        let empty = tempfile::tempdir().expect("tempdir");
+        std::fs::write(empty.path().join("notes.md"), "x").unwrap();
+        assert_eq!(code_graph_infer_dir_lang(empty.path().to_str().unwrap()), None);
     }
 
     #[test]
@@ -11972,7 +13631,7 @@ require = ["永远不可能出现的验收字符串"]
     }
 
     #[tokio::test]
-    async fn code_graph_e2e_directory_requires_lang() {
+    async fn code_graph_e2e_directory_lang_auto_inferred() {
         if !cg_have_ast_grep() {
             eprintln!("skip: ast-grep 未安装");
             return;
@@ -11980,14 +13639,28 @@ require = ["永远不可能出现的验收字符串"]
         let d = cg_fixture();
         let dir = d.path().to_str().unwrap().to_string();
 
-        // 目录推断不出语言 → 必须报错并列出可选 lang，而不是静默 0 命中。
-        let err = cg_call(serde_json::json!({ "path": &dir, "kind": "function" }))
+        // 目录不带 lang → 自动按内容推断主导语言（fixture 各语言各 1 个文件，
+        // 并列按语言名定序取 c），不再报错。
+        let out = cg_call(serde_json::json!({ "path": &dir, "kind": "function" }))
             .await
-            .expect_err("目录不带 lang 应报错");
-        let msg = err.to_string();
-        assert!(msg.contains("lang"), "报错应提示传 lang: {msg}");
+            .expect("目录应自动推断 lang");
+        assert_eq!(out.get("lang").and_then(|v| v.as_str()), Some("c"));
+        assert!(cg_total(&out) >= 3, "自动推断 lang=c 应命中 C 函数: {out:?}");
+        // 多语言目录必须提示其它在场语言，模型才知道覆盖面不全。
+        let note = out.get("lang_note").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(note.contains("rust"), "lang_note 应列出其它语言: {note}");
 
-        // 显式传 lang 后应能跨文件工作。
+        // 推断不出来的目录（没有可识别源文件）→ 仍然明确报错而不是静默 0 命中。
+        let empty = tempfile::tempdir().expect("tempdir");
+        std::fs::write(empty.path().join("notes.md"), "x").unwrap();
+        let err = cg_call(serde_json::json!({
+            "path": empty.path().to_str().unwrap(), "kind": "function"
+        }))
+        .await
+        .expect_err("无可识别源文件的目录应报错");
+        assert!(err.to_string().contains("lang"), "报错应提示传 lang: {err}");
+
+        // 显式传 lang 仍然优先。
         let out = cg_call(serde_json::json!({
             "path": &dir, "kind": "function", "lang": "c"
         }))
@@ -12069,6 +13742,64 @@ require = ["永远不可能出现的验收字符串"]
             "C 上裸 pattern 查调用点不应优于 kind 路线（pattern={}, kind={}）",
             cg_total(&via_pattern), cg_total(&via_kind)
         );
+    }
+
+    /// 位置锚点必须是**跨度** `file:start-end`，而不是单个起始行。
+    ///
+    /// 这是「查到的函数 = 读得到的函数」的关键：`read` 的行范围选择器要
+    /// `start-end`，只给 start 就等于让模型猜函数有多长。实测事故
+    /// （task_planner / glm-5.3）：code_graph 回 `:3935`，模型猜
+    /// `3874-3950` 去读 `code_graph_build_rule`（真实跨度 3935-3979），
+    /// 正好切掉 match 的 `Some(name)` 分支，它只能回一句"body 部分被截断
+    /// 了"然后放弃，整个 turn 无产出。
+    ///
+    /// 断言到"跨度真的圈住了整个函数"：按 span 切出源码，必须同时含函数名
+    /// 和函数体收尾的 `}`。
+    #[tokio::test]
+    async fn code_graph_e2e_span_covers_whole_function() {
+        if !cg_have_ast_grep() {
+            eprintln!("skip: ast-grep 未安装");
+            return;
+        }
+        let d = cg_fixture();
+        let p = d.path().join("sample.c");
+        let src = std::fs::read_to_string(&p).expect("读 fixture");
+        let lines: Vec<&str> = src.lines().collect();
+
+        let out = cg_call(serde_json::json!({
+            "path": p.to_str().unwrap(), "kind": "function"
+        }))
+        .await
+        .expect("code_graph 应成功");
+
+        let m = cg_matches(&out);
+        let mut checked = 0usize;
+        for entry in m.lines() {
+            // 形状：`<file>:<start>-<end>: <签名>`
+            let (loc, sig) = entry.split_once(": ").expect(&format!("条目缺签名: {entry}"));
+            let span = loc.rsplit_once(':').expect(&format!("条目缺位置: {entry}")).1;
+            let (start, end) = span
+                .split_once('-')
+                .expect(&format!("位置必须是 start-end 跨度，实际 {span:?}: {entry}"));
+            let start: usize = start.parse().expect("start 应为数字");
+            let end: usize = end.parse().expect("end 应为数字");
+            assert!(end > start, "多行函数的 end 必须大于 start: {entry}");
+            assert!(end <= lines.len(), "end 越界: {entry}");
+
+            let name = sig
+                .split(['(', ' '])
+                .filter(|t| !t.is_empty())
+                .next_back()
+                .unwrap_or(sig);
+            let body = lines[start - 1..end].join("\n");
+            assert!(
+                body.contains('}'),
+                "跨度必须含函数体收尾的 }}，实际切出：\n{body}"
+            );
+            let _ = name;
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "应检查到 3 个函数: {m}");
     }
 
     #[tokio::test]

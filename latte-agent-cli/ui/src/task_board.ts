@@ -194,6 +194,58 @@ export function dispatchReadyToast(resp: DispatchReadyResponse): string {
   return msg;
 }
 
+// ─── 任务树（任意深度父子，纯函数，单独可测） ─────────────────────
+
+/** 某任务的直接子任务，按 sub_order/created_at 排序。
+ * 明细由全量列表按 parent_id 推导（后端只给全部后代的聚合计数）。 */
+export function childTasksOf(tasks: TaskView[], parentId: string): TaskView[] {
+  return tasks
+    .filter((t) => t.parent_id === parentId)
+    .sort((a, b) => a.sub_order - b.sub_order || a.created_at - b.created_at);
+}
+
+/** 某任务的全部后代 id（按 parent_id 链逐层展开）。
+ * 父任务下拉用它排除「自身及全部后代」，防止挂到自己的子树下成环。 */
+export function descendantIds(tasks: TaskView[], rootId: string): Set<string> {
+  const out = new Set<string>();
+  let frontier = [rootId];
+  while (frontier.length > 0) {
+    const next: string[] = [];
+    for (const t of tasks) {
+      if (t.parent_id && frontier.includes(t.parent_id) && !out.has(t.id)) {
+        out.add(t.id);
+        next.push(t.id);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+export interface ParentOption {
+  task: TaskView;
+  /** 距根的深度（根 = 0），下拉项用它缩进表达层级。 */
+  depth: number;
+}
+
+/** 父任务下拉候选：全部任务按树形（DFS）序排出并带深度缩进信息；
+ * excludeId 时排除该任务自身及其全部后代（防环）。 */
+export function parentOptions(tasks: TaskView[], excludeId?: string): ParentOption[] {
+  const excluded = excludeId ? descendantIds(tasks, excludeId) : new Set<string>();
+  if (excludeId) excluded.add(excludeId);
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const out: ParentOption[] = [];
+  const walk = (t: TaskView, depth: number): void => {
+    if (!excluded.has(t.id)) out.push({ task: t, depth });
+    for (const c of childTasksOf(tasks, t.id)) walk(c, depth + 1);
+  };
+  // 根 = 无 parent，或 parent 已不在列表中（父被删的孤儿按根处理）。
+  for (const t of tasks) {
+    if (!t.parent_id || !byId.has(t.parent_id)) walk(t, 0);
+  }
+  return out;
+}
+
 // ─── 工具函数 ────────────────────────────────────────────────────
 
 function fmtTime(ts: number): string {
@@ -249,6 +301,8 @@ export function mountTaskBoard(opts: {
   let loadedOnce = false;
   let pollTimer: number | null = null;
   let drawerTaskId: string | null = null;
+  // 看板树上被折叠的任务 id（默认全部展开）。
+  const collapsedIds = new Set<string>();
 
   // ── toast ──
   const toastEl = el("div", "tb-toast");
@@ -430,10 +484,8 @@ export function mountTaskBoard(opts: {
     }
     body.appendChild(propSec);
 
-    // 子任务区（根任务可拆分）
-    if (!task.parent_id) {
-      body.appendChild(renderChildrenSection(task));
-    }
+    // 子任务区（任意层级都可查看/再拆；sub_total/sub_done 是全部后代聚合）
+    body.appendChild(renderChildrenSection(task));
 
     // 状态历史
     const histSec = el("div", "tb-drawer-section");
@@ -476,24 +528,32 @@ export function mountTaskBoard(opts: {
     head.appendChild(addBtn);
     sec.appendChild(head);
 
-    // 子任务明细由全量列表按 parent_id 推导（后端只给聚合计数）。
-    const children = tasks
-      .filter((t) => t.parent_id === task.id)
-      .sort((a, b) => a.sub_order - b.sub_order || a.created_at - b.created_at);
+    // 子任务明细由全量列表按 parent_id 推导（后端只给聚合计数）；
+    // 任意深度递归渲染，marginLeft 缩进表达层级。
+    const children = childTasksOf(tasks, task.id);
     if (children.length > 0) {
       const list = el("div", "tb-child-list");
-      for (const c of children) {
-        const cst = STATES[c.state] ?? STATES.backlog;
-        const item = el("div", "tb-child-item");
-        const cdot = el("span", "tb-state-dot");
-        cdot.style.background = cst.color;
-        item.appendChild(cdot);
-        item.appendChild(el("span", "tb-child-id", c.id));
-        item.appendChild(el("span", "tb-child-title", c.title));
-        item.appendChild(el("span", "tb-child-state", cst.name));
-        item.addEventListener("click", () => openDrawer(c.id));
-        list.appendChild(item);
-      }
+      const appendItems = (parentId: string, depth: number): void => {
+        for (const c of childTasksOf(tasks, parentId)) {
+          const cst = STATES[c.state] ?? STATES.backlog;
+          const item = el("div", "tb-child-item");
+          if (depth > 0) item.style.marginLeft = `${depth * 16}px`;
+          const cdot = el("span", "tb-state-dot");
+          cdot.style.background = cst.color;
+          item.appendChild(cdot);
+          item.appendChild(el("span", "tb-child-id", c.id));
+          item.appendChild(el("span", "tb-child-title", c.title));
+          // 自己也是父任务时带上后代进度，提示它下面还有一层。
+          if (c.sub_total > 0) {
+            item.appendChild(el("span", "tb-child-state", `子 ${c.sub_done}/${c.sub_total}`));
+          }
+          item.appendChild(el("span", "tb-child-state", cst.name));
+          item.addEventListener("click", () => openDrawer(c.id));
+          list.appendChild(item);
+          appendItems(c.id, depth + 1);
+        }
+      };
+      appendItems(task.id, 0);
       sec.appendChild(list);
     } else {
       sec.appendChild(el("div", "tb-hint", "还没有子任务。拆分子任务后由父任务跟踪进度。"));
@@ -526,7 +586,7 @@ export function mountTaskBoard(opts: {
       return;
     }
     if (key === "refine") {
-      if (task.parent_id) { toast("子任务不能再拆（只支持一层父子）"); return; }
+      // 任意层级都可再拆；in_progress/merging 等状态后端仍会拒绝。
       try {
         const resp = await refineTask(task.id);
         setRefineParent(resp.session_id, task.id);
@@ -959,18 +1019,17 @@ export function mountTaskBoard(opts: {
     descInput.value = opts2.edit?.description ?? "";
     prioSelect.value = String(opts2.edit?.priority ?? 3);
 
-    // 父任务候选：只列无 parent 的根任务；编辑时排除自己。
+    // 父任务候选：列全部任务（按树形缩进帮助辨识层级）；编辑时排除
+    // 自身及全部后代，防止把任务挂到自己的子树下成环。
     parentSelect.replaceChildren();
     const none = document.createElement("option");
     none.value = "";
     none.textContent = "（无 — 作为根任务）";
     parentSelect.appendChild(none);
-    for (const t of tasks) {
-      if (t.parent_id) continue;
-      if (opts2.edit && t.id === opts2.edit.id) continue;
+    for (const { task: t, depth } of parentOptions(tasks, opts2.edit?.id)) {
       const opt = document.createElement("option");
       opt.value = t.id;
-      opt.textContent = `${t.id} · ${t.title}`;
+      opt.textContent = `${"　".repeat(depth)}${t.id} · ${t.title}`;
       parentSelect.appendChild(opt);
     }
     parentSelect.value = opts2.parentId ?? opts2.edit?.parent_id ?? "";
@@ -1047,8 +1106,11 @@ export function mountTaskBoard(opts: {
   // ── 渲染看板 ──
   function render(): void {
     container.boardEl.replaceChildren();
-    // 看板卡片只放根任务；子任务通过父任务抽屉进入。
-    const roots = tasks.filter(t => !t.parent_id);
+    // 每列放该状态的根任务；子任务递归嵌在父卡片下方（缩进 + 展开/折叠），
+    // 不按子任务自身状态散到其它列 —— 嵌套卡片带状态芯片标明真实状态。
+    // 父已不在列表中的孤儿任务按根处理，避免整棵子树从看板消失。
+    const byId = new Map(tasks.map(t => [t.id, t]));
+    const roots = tasks.filter(t => !t.parent_id || !byId.has(t.parent_id));
     for (const key of COLUMN_ORDER) {
       const st = STATES[key];
       const list = roots.filter(t => t.state === key);
@@ -1062,7 +1124,7 @@ export function mountTaskBoard(opts: {
         el("span", "tb-hint", st.hint));
       col.appendChild(head);
       const bodyEl = el("div", "tb-column-body");
-      for (const task of list) bodyEl.appendChild(renderCard(task));
+      for (const task of list) bodyEl.appendChild(renderTaskNode(task, 0));
       col.appendChild(bodyEl);
       container.boardEl.appendChild(col);
     }
@@ -1072,12 +1134,47 @@ export function mountTaskBoard(opts: {
     container.statReviewEl.textContent = String(tasks.filter(t => t.state === "human_review").length);
   }
 
-  function renderCard(task: TaskView): HTMLElement {
+  /** 递归渲染任务节点：卡片 +（未折叠时）缩进的子任务树。 */
+  function renderTaskNode(task: TaskView, depth: number): HTMLElement {
+    const node = el("div", "tb-tree-node");
+    node.appendChild(renderCard(task, depth));
+    const kids = childTasksOf(tasks, task.id);
+    if (kids.length > 0 && !collapsedIds.has(task.id)) {
+      const box = el("div", "tb-tree-children");
+      for (const k of kids) box.appendChild(renderTaskNode(k, depth + 1));
+      node.appendChild(box);
+    }
+    return node;
+  }
+
+  function renderCard(task: TaskView, depth = 0): HTMLElement {
     const card = el("div", "tb-card");
     card.addEventListener("click", () => openDrawer(task.id));
 
     const top = el("div", "tb-card-top");
+    // 有子任务的卡片带展开/折叠开关（作用于直接子任务那一层）。
+    const kids = childTasksOf(tasks, task.id);
+    if (kids.length > 0) {
+      const collapsed = collapsedIds.has(task.id);
+      const toggle = el("button", "tb-tree-toggle", `${collapsed ? "▸" : "▾"} ${kids.length}`) as HTMLButtonElement;
+      toggle.type = "button";
+      toggle.title = collapsed ? "展开子任务" : "折叠子任务";
+      toggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (collapsed) collapsedIds.delete(task.id); else collapsedIds.add(task.id);
+        render();
+      });
+      top.appendChild(toggle);
+    }
     top.appendChild(el("span", "tb-task-id", task.id));
+    // 嵌套卡片不再能从列位置看出状态，补一个状态芯片。
+    if (depth > 0) {
+      const st = STATES[task.state] ?? STATES.backlog;
+      const chip = el("span", "tb-chip", st.name);
+      chip.style.background = st.bg;
+      chip.style.color = st.color;
+      top.appendChild(chip);
+    }
     top.appendChild(el("span", `tb-prio p${task.priority}`, `P${task.priority}`));
     card.appendChild(top);
     card.appendChild(el("div", "tb-title", task.title));

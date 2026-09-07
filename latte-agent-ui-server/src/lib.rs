@@ -841,6 +841,7 @@ mod tests {
                 icon: "[m]".into(),
                 skills: vec![],
             code_paths: vec![],
+                description: String::new(),
             },
         );
         let resolver = ModelResolver::from_config(&agent_config).expect("resolver");
@@ -987,6 +988,7 @@ mod tests {
                     icon: "[m]".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             )]
             .into_iter()
@@ -1016,7 +1018,9 @@ mod tests {
             .await
             .expect("chat send");
         // 等 turn 结束（Error 事件落进 event_log）且内容稳定。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        // 死端口 turn 要跑完整个重试退避链（单跑约 12s），15s 上限在
+        // 全量并行测试的 CPU 竞争下不够，放宽到 30s。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let history_a = loop {
             let h = crate::api::session_history(&backend_a, &sid).expect("history poll");
             let has_user = h.iter().any(|v| v["type"] == "UserMessage");
@@ -1154,6 +1158,7 @@ mod tests {
                         icon: "[m]".into(),
                         skills: vec![],
                         code_paths: vec![],
+                        description: String::new(),
                     },
                 )]
                 .into_iter()

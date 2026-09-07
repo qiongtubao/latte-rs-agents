@@ -1,6 +1,7 @@
 [roles.pm_business]
 id = "pm_business"
 name = "Business Analyst"
+description = "业务分析师：业务需求收集与文档、流程建模与优化、干系人沟通"
 category = "planning"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

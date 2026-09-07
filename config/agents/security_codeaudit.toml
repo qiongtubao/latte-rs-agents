@@ -1,6 +1,7 @@
 [roles.security_codeaudit]
 id = "security_codeaudit"
 name = "Code Security Auditor"
+description = "代码安全审计员：审查注入漏洞、认证授权缺陷与敏感信息泄露"
 category = "verification"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]

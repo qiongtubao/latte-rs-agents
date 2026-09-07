@@ -3671,6 +3671,32 @@ select {
   border-top: 1px dashed #e8eef4;
 }
 
+/* 任务树：子任务递归嵌在父卡片下方，缩进 + 左边线表达层级 */
+.tb-tree-node {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tb-tree-children {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-left: 10px;
+  padding-left: 10px;
+  border-left: 2px solid #e2e8f0;
+}
+.tb-tree-toggle {
+  border: none;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tb-tree-toggle:hover { background: #e2e8f0; }
+
 /* 详情抽屉 */
 .tb-drawer-mask {
   position: fixed;

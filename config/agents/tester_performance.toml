@@ -1,6 +1,7 @@
 [roles.tester_performance]
 id = "tester_performance"
 name = "Performance Tester"
+description = "性能测试工程师：评估响应时间、吞吐量、并发能力与资源使用"
 category = "verification"
 model_tier = "budget"
 model_chain = ["deepseek-v4-flash"]

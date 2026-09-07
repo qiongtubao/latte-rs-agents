@@ -15,6 +15,7 @@ id = "reviewer_security"
 
 # Human-readable display name — shown in logs and discussion transcripts.
 name = "Security Reviewer"
+description = "安全审查者：对认证、用户数据等高风险代码路径做深度安全审计，只读不修改"
 
 # Lifecycle category: verification. The existing `security` role
 # (config/agents/security.toml) is already in this category; this

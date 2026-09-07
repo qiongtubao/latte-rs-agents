@@ -177,6 +177,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 loop_until: None,
                 loop_back_to: None,
                 loop_abort_on: None,
+                // loop_no_release_on（返工环耗尽时禁止 advisor 语义放行的
+                // 标记）同样只在 TOML 权威版可配。
+                loop_no_release_on: None,
                 max_iterations: None,
                 workflow: None,
                 output_from: None,
@@ -192,6 +195,14 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // plan 提交硬校验同样只在 TOML 权威版可配；表单编辑器的
                 // 试运行不强制（false = 现状行为）。
                 require_plan_submit: false,
+                // 结构化清单校验 / patch / 机械提交同样只在 TOML 权威版
+                // 可配；表单编辑器的试运行给零值（不校验、不 patch、不
+                // 机械提交 = 现状行为）。
+                require_plan_tasks: false,
+                // 符号可解析性校验同样只在 TOML 权威版可配（false = 现状行为）。
+                require_symbols_resolvable: false,
+                patch_from: None,
+                submit_plan_from: None,
                 // step 级工具过滤仅 TOML 权威版可配；表单编辑器不支持，
                 // 试运行给空（= 角色全集）。
                 tools: vec![],
@@ -594,6 +605,7 @@ mod tests {
                     icon: "[t]".into(),
                     skills: vec![],
             code_paths: vec![],
+                    description: String::new(),
                 },
             );
         }

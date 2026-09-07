@@ -96,8 +96,32 @@ pub struct Symbol {
     pub kind: String,
     /// 单行签名（去掉函数体、参数压平）。
     pub sig: String,
-    /// 1-based 行号。
+    /// 1-based 起始行号。
     pub line: u64,
+    /// 1-based 结束行号（定义体的最后一行，含）。
+    ///
+    /// 有它才能把「查到的函数」直接变成「读得到的函数」：`read` 的行范围
+    /// 选择器要的是 `start-end`，只给 start 等于让模型自己猜函数有多长。
+    /// 实测事故（task_planner）：code_graph 只回 `:3935`，模型猜了
+    /// `3874-3950` 去读 `code_graph_build_rule`，正好把 match 的
+    /// `Some(name)` 分支切掉，它只能回一句"body 部分被截断了"然后放弃。
+    ///
+    /// `default` 让旧索引（v1，无此字段）还能读；为 0 时视为未知，
+    /// 回退成只报起始行。索引 version 已随之升到 2，正常会自动重建。
+    #[serde(default)]
+    pub end_line: u64,
+}
+
+impl Symbol {
+    /// 模型侧的位置锚点：知道跨度时给 `start-end`（可直接粘进 `read`），
+    /// 否则退回单个起始行。
+    pub fn span(&self) -> String {
+        if self.end_line > self.line {
+            format!("{}-{}", self.line, self.end_line)
+        } else {
+            self.line.to_string()
+        }
+    }
 }
 
 /// 单文件的索引条目。
@@ -123,7 +147,9 @@ pub struct CodeGraphIndex {
 }
 
 impl CodeGraphIndex {
-    pub const CURRENT_VERSION: u32 = 1;
+    /// v2 起每个 Symbol 带 `end_line`（定义体跨度）。v1 索引缺该字段，
+    /// 只能报起始行，所以升版本强制重建而不是将就着用。
+    pub const CURRENT_VERSION: u32 = 2;
 
     /// 索引文件路径：`<cwd>/.latte/code_graph/index.json`。
     pub fn path(cwd: &Path) -> PathBuf {
@@ -232,7 +258,8 @@ pub fn query_signatures(
     let name_lc = name.map(|n| n.to_ascii_lowercase());
 
     // 收集命中：遍历范围内文件的目标 kind 符号。
-    let mut hits: Vec<(String, u64, String)> = Vec::new(); // (file, line, sig)
+    // 元组第 2 项是排序键（起始行），第 3 项是模型侧锚点（`start-end` 跨度）。
+    let mut hits: Vec<(String, u64, String, String)> = Vec::new(); // (file, line, span, sig)
     for (rel, entry) in &idx.files {
         // 路径范围过滤：scope 是文件时精确匹配，是目录时前缀匹配。
         if scope != "." && !scope.is_empty() && !(rel == &scope || rel.starts_with(&format!("{scope}/"))) {
@@ -247,7 +274,7 @@ pub fn query_signatures(
                     continue;
                 }
             }
-            hits.push((rel.clone(), s.line, s.sig.clone()));
+            hits.push((rel.clone(), s.line, s.span(), s.sig.clone()));
         }
     }
     // 索引里该范围/kind 一个都没有：可能是索引确实没有（也可能范围不含源码）。
@@ -257,8 +284,8 @@ pub fn query_signatures(
     let total = hits.len();
     let mut lines = Vec::new();
     let mut chars = 0usize;
-    for (file, line, sig) in hits.into_iter().take(max_matches) {
-        let entry = format!("{file}:{line}: {sig}");
+    for (file, _line, span, sig) in hits.into_iter().take(max_matches) {
+        let entry = format!("{file}:{span}: {sig}");
         if chars + entry.len() > max_chars {
             break;
         }
@@ -331,6 +358,7 @@ struct AgMatch {
 #[derive(Deserialize)]
 struct AgRange {
     start: AgPos,
+    end: AgPos,
 }
 #[derive(Deserialize)]
 struct AgPos {
@@ -455,6 +483,7 @@ pub async fn build_or_update(cwd: &Path) -> BuildOutcome {
                     kind: (*kind).to_string(),
                     sig,
                     line: m.range.start.line + 1, // ast-grep 0-based → 1-based
+                    end_line: m.range.end.line + 1,
                 });
             }
         }
@@ -638,6 +667,68 @@ mod tests {
         // 第二次立即再建：无改动 → UpToDate。
         let again = build_or_update(dir.path()).await;
         assert_eq!(again, BuildOutcome::UpToDate);
+    }
+
+    /// 索引路径同样必须回**跨度**。多行函数用 `start-end`，单行定义退化成
+    /// 单个行号（`start-start` 对 read 没意义，也白占 token）。
+    ///
+    /// 回归 task_planner 实测事故，见 [`Symbol::end_line`] 的文档。
+    #[tokio::test]
+    async fn query_signatures_emits_span_for_multiline_definitions() {
+        if !ast_grep_available().await {
+            eprintln!("ast-grep not installed; skipping span test");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // one_liner 单行；spread 跨 4 行（2-5）。
+        std::fs::write(
+            dir.path().join("m.c"),
+            "int one_liner(void) { return 1; }\nint spread(int a,\n           int b)\n{\n    return a + b;\n}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            build_or_update(dir.path()).await,
+            BuildOutcome::Built { .. }
+        ));
+
+        let (lines, total) =
+            query_signatures(dir.path(), ".", "function", None, 200, 12_000).unwrap();
+        assert_eq!(total, 2, "expected 2 functions: {lines:?}");
+
+        let spread = lines
+            .iter()
+            .find(|l| l.contains("spread"))
+            .expect(&format!("缺 spread: {lines:?}"));
+        assert!(
+            spread.starts_with("m.c:2-6:"),
+            "跨行函数必须回 start-end 跨度，实际 {spread:?}"
+        );
+
+        let one = lines
+            .iter()
+            .find(|l| l.contains("one_liner"))
+            .expect(&format!("缺 one_liner: {lines:?}"));
+        assert!(
+            one.starts_with("m.c:1:"),
+            "单行定义应退化成单行号（跨度无意义），实际 {one:?}"
+        );
+    }
+
+    /// 旧索引（v1，Symbol 无 `end_line`）反序列化不得报错，且退化成单行号
+    /// 而不是伪造一个 `start-0` 之类的坏跨度。
+    #[test]
+    fn v1_symbol_without_end_line_degrades_to_start_only() {
+        let s: Symbol =
+            serde_json::from_str(r#"{"kind":"function","sig":"int f(void)","line":42}"#)
+                .expect("v1 Symbol 必须仍能反序列化");
+        assert_eq!(s.end_line, 0, "缺字段应为 0（未知）");
+        assert_eq!(s.span(), "42", "跨度未知时只报起始行");
+
+        let s2 = Symbol { end_line: 50, ..s.clone() };
+        assert_eq!(s2.span(), "42-50");
+        // end == start（单行定义）同样退化，避免 `42-42` 这种冗余。
+        let s3 = Symbol { end_line: 42, ..s };
+        assert_eq!(s3.span(), "42");
     }
 
     #[tokio::test]

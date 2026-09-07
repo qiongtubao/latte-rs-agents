@@ -1,6 +1,7 @@
 [roles.programmer_go]
 id = "programmer_go"
 name = "GO Engineer"
+description = "Go 工程师：用 Go 实现功能与修 bug，擅长并发与后端服务开发"
 category = "execution"
 model_tier = "standard"
 model_chain = ["deepseek-v4-flash"]
