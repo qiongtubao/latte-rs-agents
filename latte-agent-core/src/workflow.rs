@@ -663,6 +663,25 @@ async fn contract_last_resort_review(
     ))
 }
 
+/// 按「病灶标记」挑选返工目标（P0：返工恢复粒度）。
+///
+/// 在 `step` 的 [`WorkflowStepDef::loop_back_routes`] 里按标记字典序找第一个
+/// 出现在 `output`（本 step 的裁决/产出正文）中的标记，返回它映射的目标
+/// step id；一个都没命中则回落到 `loop_back_to`，再回落到本 step 自己。
+///
+/// 为什么要有它：旧逻辑 `loop_back_to.unwrap_or(step.id)` **只读静态配置**，
+/// 与「这次哪一步坏了」无关。`implementation_plan` 配 `breakdown`，于是
+/// `tasks_json` 里一次 JSON 截断也会把没病的方案拆解整个重做——实测
+/// jemalloc 会话同一目标整条重跑 3 次、architect 独自烧掉 6.74M 输入 token。
+fn rework_target_id<'a>(step: &'a WorkflowStepDef, output: &str) -> &'a str {
+    for (marker, target) in &step.loop_back_routes {
+        if !marker.is_empty() && output.contains(marker.as_str()) {
+            return target.as_str();
+        }
+    }
+    step.loop_back_to.as_deref().unwrap_or(step.id.as_str())
+}
+
 /// 返工环耗尽前的最后一道 advisor 语义复核。
 ///
 /// 机械判据（`loop_until` 子串匹配）分不清两件事：**草案真有阻断缺陷**，
@@ -1017,8 +1036,36 @@ pub struct WorkflowStepDef {
     pub loop_until: Option<String>,
     /// `loop_until` 不满足时跳回的 step id（串行缺省 = 本 step 自己；
     /// DAG 下必填且必须位于更早的 wave）。
+    ///
+    /// 单一固定目标的局限见 [`Self::loop_back_routes`]：它只表达
+    /// 「返工一律回到某一步」，与「这次到底哪一步坏了」无关。
     #[serde(default)]
     pub loop_back_to: Option<String>,
+    /// **按病灶路由返工目标**：`标记子串 → 跳回的 step id`。
+    ///
+    /// 为什么需要它（实测实锤：2026-09 jemalloc 会话，单会话 22.19M
+    /// 输入 token）：`implementation_plan` 配的是
+    /// `loop_back_to = "breakdown"`，而那次的病灶在 `tasks_json`
+    /// （JSON 撞输出上限被截断）。引擎照配置跳回 `breakdown`，让
+    /// architect **把本来没问题的方案拆解重做一遍**、再重新转 JSON——
+    /// 用最贵的一步去修最便宜的错。同一目标整条重跑 3 次，architect
+    /// 一人烧掉 6.74M 输入 token / 139 次调用，绝大部分是同一份源码被
+    /// 反复读进上下文。
+    ///
+    /// 语义：返工判定成立后，按标记的**字典序**扫描（`BTreeMap` 的确定
+    /// 性顺序，与书写顺序无关），跳回**第一个**在本 step 产出里出现的
+    /// 标记所映射的 step；一个都没命中则回落到 [`Self::loop_back_to`]
+    /// （缺省=自己）——因此不配置本字段时行为与从前逐字节一致，纯增量。
+    /// 标记应设计成互斥的（如 `REWORK: <step_id>`），避免一次产出同时
+    /// 命中多个而依赖字典序决定去向。
+    ///
+    /// 为什么由评审者显式标注而不是引擎猜：引擎无法可靠判断"JSON 被
+    /// 截断"该归咎于哪一步（可能是转换步、也可能是上游拆解太长）。而
+    /// 评审者本来就在做归因——jemalloc 那次 reviewer 的裁决原文就写明
+    /// 「病在 tasks JSON」。把这个已经存在的判断结构化即可，不必让引擎
+    /// 去推测。校验要求每个目标都是存在的 step id（见 `validate`）。
+    #[serde(default)]
+    pub loop_back_routes: std::collections::BTreeMap<String, String>,
     /// 「不可返工」熔断标记：`loop_until` 未满足时，若产出还包含该子串
     /// 则直接判 workflow 失败，不做返工。给 task_refine 这类三值裁决
     /// （ACCEPT 继续 / REVISE 返工 / REJECT 终止）表达「输入缺失、事实
@@ -1433,6 +1480,31 @@ impl WorkflowDef {
                     ));
                 }
             }
+            // loop_back_routes：每个目标都必须是存在的 step；且没有返工环
+            // （loop_until）时写它必然是笔误——路由只在返工判定成立后生效，
+            // 静默忽略会让人以为配了就有效。
+            if !step.loop_back_routes.is_empty() {
+                if step.loop_until.is_none() {
+                    return Err(format!(
+                        "step '{}': `loop_back_routes` 需要配合 `loop_until`（没有返工环时路由不会生效）",
+                        step.id
+                    ));
+                }
+                for (marker, target) in &step.loop_back_routes {
+                    if marker.trim().is_empty() {
+                        return Err(format!(
+                            "step '{}': loop_back_routes 的标记不能为空",
+                            step.id
+                        ));
+                    }
+                    if !step_ids.contains(target.as_str()) {
+                        return Err(format!(
+                            "step '{}': loop_back_routes['{marker}'] 指向不存在的 step '{target}'",
+                            step.id
+                        ));
+                    }
+                }
+            }
             // loop_abort_on 只在返工判定里生效；没有 loop_until 的 step
             // 写了它必然是笔误（会被静默忽略），直接拒。
             if let Some(marker) = &step.loop_abort_on {
@@ -1510,6 +1582,19 @@ impl WorkflowDef {
                          同 wave 自环请改用 output_contract + max_retries",
                         step.id
                     ));
+                }
+                // 病灶路由的每个目标同受「更早 wave」约束——否则运行时
+                // 命中该标记就会跳到同 wave/未来 wave，语义不成立。
+                for (marker, routed) in &step.loop_back_routes {
+                    let routed_wave = wave_of(routed.as_str());
+                    if routed_wave >= own_wave {
+                        return Err(format!(
+                            "step '{}': DAG 模式下 loop_back_routes['{marker}'] → '{routed}' \
+                             必须位于严格更早的 wave（目标 wave {routed_wave}，\
+                             本 step wave {own_wave}）",
+                            step.id
+                        ));
+                    }
                 }
             }
             if let Some(key) = &step.output_key {
@@ -4296,8 +4381,7 @@ async fn run_workflow_serial(
                         // 判死前最后一道 advisor 语义复核：把「被返工的那份
                         // 产出」+「未消化的评审意见」交给 advisor，判定实质
                         // 合格则放行进入下游（见 loop_exhausted_last_resort_review）。
-                        let target_id =
-                            step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
+                        let target_id = rework_target_id(step, &last_output);
                         let artifact = wf
                             .steps
                             .iter()
@@ -4327,12 +4411,12 @@ async fn run_workflow_serial(
                             step.id
                         ));
                     }
-                    let target_id = step.loop_back_to.as_deref().unwrap_or(step.id.as_str());
+                    let target_id = rework_target_id(step, &last_output);
                     let target_idx = wf
                         .steps
                         .iter()
                         .position(|s| s.id == target_id)
-                        .expect("validate 已保证 loop_back_to 指向存在的 step");
+                        .expect("validate 已保证 loop_back_to/loop_back_routes 指向存在的 step");
                     let _ = ctx.event_tx.send(ChatEvent::Status {
                         message: format!(
                             "↩ 第 {count} 轮返工：step '{}' 产出未满足循环条件\
@@ -4972,11 +5056,9 @@ async fn run_workflow_dag(
                     // 判死前最后一道 advisor 语义复核（与串行引擎同款）：
                     // 把「被返工的那份产出」+「未消化的评审意见」交 advisor，
                     // 判定实质合格则免除本 step 的返工要求，让 wave 正常推进。
-                    // DAG 下 loop_back_to 必填且指向更早 wave，故直接取它。
-                    // 实际暴露面：design_and_plan 既是 DAG 又配了返工环
-                    // （loop_until = "VERDICT: PASS", max_iterations = 3）。
-                    let target_id =
-                        step.loop_back_to.clone().unwrap_or_else(|| step.id.clone());
+                    // DAG 下 loop_back_to 必填且指向更早 wave；
+                    // loop_back_routes 的目标同样受该约束（见 validate）。
+                    let target_id = rework_target_id(step, out).to_string();
                     let artifact = wf
                         .steps
                         .iter()
@@ -5005,11 +5087,11 @@ async fn run_workflow_dag(
                         step.id
                     ));
                 }
-                let target_id = step.loop_back_to.clone().unwrap_or_else(|| step.id.clone());
+                let target_id = rework_target_id(step, out).to_string();
                 let target_wave = waves
                     .iter()
                     .position(|w| w.iter().any(|&i| wf.steps[i].id == target_id))
-                    .expect("validate 已保证 loop_back_to 指向存在的 step");
+                    .expect("validate 已保证 loop_back_to/loop_back_routes 指向存在的 step");
                 pending_feedback.insert(target_id.clone(), out.clone());
                 rework_notes.push(format!(
                     "step '{}' 未满足「{cond}」（第 {count}/{max} 轮），跳回 '{target_id}'",
@@ -5919,6 +6001,124 @@ output_key = "exploration"
                 s.id
             );
         }
+    }
+
+    /// 病灶路由（P0：返工恢复粒度）——`rework_target_id` 按标记选目标。
+    ///
+    /// 回归 2026-09 jemalloc 会话：病灶在 tasks_json（JSON 被截断），
+    /// 而 loop_back_to 写死 breakdown，于是把没病的方案拆解整个重做。
+    #[test]
+    fn rework_routes_pick_target_by_lesion_marker() {
+        let raw = r#"
+name = "t"
+[[steps]]
+id = "a"
+role = "architect"
+[[steps]]
+id = "b"
+role = "architect"
+[[steps]]
+id = "g"
+role = "reviewer"
+loop_until = "VERDICT: PASS"
+loop_back_to = "a"
+[steps.loop_back_routes]
+"REWORK: b" = "b"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("should validate");
+        let gate = wf.steps.iter().find(|s| s.id == "g").unwrap();
+
+        // 命中标记 → 跳回标记指定的病灶步（只重做便宜的那步）。
+        assert_eq!(rework_target_id(gate, "VERDICT: REJECT\nREWORK: b\n理由…"), "b");
+        // 没有任何标记 → 回落 loop_back_to（旧行为逐字节不变）。
+        assert_eq!(rework_target_id(gate, "VERDICT: REJECT\n理由…"), "a");
+    }
+
+    /// 不配 loop_back_routes 时行为必须与从前完全一致（纯增量保证）。
+    #[test]
+    fn rework_target_falls_back_to_loop_back_to_then_self() {
+        let raw = r#"
+name = "t"
+[[steps]]
+id = "a"
+role = "architect"
+[[steps]]
+id = "g"
+role = "reviewer"
+loop_until = "OK"
+loop_back_to = "a"
+[[steps]]
+id = "h"
+role = "reviewer"
+loop_until = "OK"
+"#;
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let g = wf.steps.iter().find(|s| s.id == "g").unwrap();
+        let h = wf.steps.iter().find(|s| s.id == "h").unwrap();
+        assert_eq!(rework_target_id(g, "任何产出"), "a", "有 loop_back_to 就用它");
+        assert_eq!(rework_target_id(h, "任何产出"), "h", "没配则自环");
+    }
+
+    /// validate：routes 目标必须存在；且必须配合 loop_until。
+    #[test]
+    fn rework_routes_validation_rejects_bad_config() {
+        // 目标 step 不存在
+        let bad_target = r#"
+name = "t"
+[[steps]]
+id = "g"
+role = "reviewer"
+loop_until = "OK"
+[steps.loop_back_routes]
+"REWORK: nope" = "nope"
+"#;
+        let wf: WorkflowDef = toml::from_str(bad_target).expect("valid TOML");
+        let err = wf.validate().expect_err("目标不存在应报错");
+        assert!(err.contains("loop_back_routes"), "err: {err}");
+
+        // 没有 loop_until 却配了 routes（笔误，静默忽略最坑）
+        let no_loop = r#"
+name = "t"
+[[steps]]
+id = "a"
+role = "architect"
+[[steps]]
+id = "g"
+role = "reviewer"
+[steps.loop_back_routes]
+"REWORK: a" = "a"
+"#;
+        let wf: WorkflowDef = toml::from_str(no_loop).expect("valid TOML");
+        let err = wf.validate().expect_err("缺 loop_until 应报错");
+        assert!(err.contains("loop_until"), "err: {err}");
+    }
+
+    /// implementation_plan 必须把 tasks_json 类病灶路由到 tasks_json——
+    /// 这是 P0 修复真正生效的配置面（引擎能力 + 配置利用，缺一不可）。
+    #[test]
+    fn implementation_plan_routes_json_lesion_to_tasks_json() {
+        let raw = include_str!("../../config/workflows/implementation_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("implementation_plan should validate");
+        let gate = wf.steps.iter().find(|s| s.id == "gate").expect("gate step");
+
+        assert_eq!(
+            gate.loop_back_routes.get("REWORK: tasks_json").map(String::as_str),
+            Some("tasks_json"),
+            "JSON 落地类病灶必须只重做 tasks_json，不得连带重烧 breakdown"
+        );
+        assert_eq!(
+            gate.loop_back_routes.get("REWORK: breakdown").map(String::as_str),
+            Some("breakdown"),
+            "方案层面病灶回到 breakdown"
+        );
+        // 兜底仍是 breakdown（标记缺失时等于旧行为）。
+        assert_eq!(gate.loop_back_to.as_deref(), Some("breakdown"));
+        // gate 的 prompt 必须教会评审输出该标记，否则路由永远命不中。
+        let p = gate.task_text();
+        assert!(p.contains("REWORK: tasks_json"), "prompt 需说明 tasks_json 标记");
+        assert!(p.contains("REWORK: breakdown"), "prompt 需说明 breakdown 标记");
     }
 
     /// 修问题 #5（评审独立性）：learn 的校验阶段必须是「审/改/复核」三步

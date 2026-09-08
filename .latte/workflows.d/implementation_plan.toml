@@ -108,7 +108,25 @@ prompt = """根据以下终审结论判定放行与否：
 - 终审为 ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后以「【通过条件/修正项】」为标题**原样附上终审列出的全部条件与修正项**（一条都不许丢），再原样完整附上任务清单。修正项必须随清单一并交付，禁止静默丢弃。
 - 终审（无论裁决为何）指出实测错误（行号/路径/**符号存在性**/事实核验不符）且这些修正未在任务清单中体现 → 必须输出 `VERDICT: REJECT`，理由列出未吸收的实测错误。
 - 终审为 ❌ 不通过 / changes-requested / 存在阻断问题 → 只输出 `VERDICT: REJECT` 和阻断原因摘要（一两句，写清每条阻断的 file:line 证据，返工要用），**不要**附任务清单。
-- 输出 REJECT 时，正文中不得再出现字符串「VERDICT: PASS」（会被循环条件误判为放行）。"""
+- 输出 REJECT 时，正文中不得再出现字符串「VERDICT: PASS」（会被循环条件误判为放行）。
+- **输出 REJECT 时必须另起一行标注病灶步**，二者选一（照抄，不要改写）：
+  - `REWORK: tasks_json` —— 问题只在**清单落地形态**：JSON 不合法/被截断/字段缺失（depends_on、验收标准等）、依赖顺序与拆解不一致、粒度或标签写错。方案本身没问题，只需重做「拆解 → JSON」这一转换。
+  - `REWORK: breakdown` —— 问题在**方案层面**：拆解方向错、覆盖不全、任务本身不合理、事实/符号存在性错误源于拆解阶段。必须回到拆解重做。
+  判不准时选 `REWORK: breakdown`（更保守，等于旧行为）。**这一行决定引擎重跑哪一步**：标 tasks_json 就只重做转换，不会把没病的方案拆解连带重烧一遍。"""
+
+# 按病灶路由返工目标（P0：返工恢复粒度）。
+#
+# 实测实锤（2026-09 jemalloc 会话，单会话 22.19M 输入 token）：那次的病灶在
+# tasks_json —— JSON 撞输出上限被截断、T3/T4/T5 整段缺失。而 loop_back_to
+# 写死 breakdown，引擎就把**本来没问题的方案拆解**整个重做一遍再重转 JSON。
+# 同一目标整条重跑 3 次，architect 独自烧掉 6.74M 输入 token / 139 次调用，
+# 大部分是同一份源码被反复读进上下文——用最贵的一步去修最便宜的错。
+#
+# gate 判 REJECT 时按 prompt 规则标注病灶步，引擎据此只重做该步及其下游；
+# 标记没出现时回落 loop_back_to（= breakdown，旧行为），纯增量。
+[steps.loop_back_routes]
+"REWORK: tasks_json" = "tasks_json"
+"REWORK: breakdown" = "breakdown"
 
 [steps.output_contract]
 require = ["VERDICT:"]

@@ -263,6 +263,10 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 max_retries: 0,
                 loop_until: None,
                 loop_back_to: None,
+                // 按病灶路由返工目标（loop_back_routes）同样只在 TOML
+                // 权威版可配；表单编辑器给空 map = 回落 loop_back_to
+                // （现状行为）。
+                loop_back_routes: Default::default(),
                 loop_abort_on: None,
                 // loop_no_release_on（返工环耗尽时禁止 advisor 语义放行的
                 // 标记）同样只在 TOML 权威版可配。
