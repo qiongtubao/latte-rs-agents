@@ -3221,6 +3221,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,

@@ -500,6 +500,13 @@ pub struct ModelDef {
     pub context_window: u32,
     /// Maximum output tokens.
     pub max_tokens: u32,
+    /// 完全**不下发**输出上限字段，把每次响应的上限交给上游 API 决定。
+    #[serde(default)]
+    pub omit_max_tokens: bool,
+    /// 输出上限用哪个字段名下发：`"max_tokens"`（默认）或
+    /// `"max_completion_tokens"`。
+    #[serde(default)]
+    pub max_tokens_field: latte_ai::models::MaxTokensField,
     /// Whether the model supports thinking/reasoning.
     #[serde(default)]
     pub supports_thinking: bool,

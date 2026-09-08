@@ -503,6 +503,8 @@ impl ResolverSnapshot {
             cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
             cost_per_million_output: def.cost_per_million_output.unwrap_or(0.0),
             timeout_secs: def.timeout_secs,
+            omit_max_tokens: def.omit_max_tokens,
+            max_tokens_field: def.max_tokens_field,
         })
     }
     /// Look up the raw `ModelDef` for a model id, returning the catalog
@@ -590,6 +592,8 @@ mod tests {
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: false,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             cost_per_million_input: Some(0.0),
             cost_per_million_output: Some(0.0),
             tier: tier.map(|s| s.into()),

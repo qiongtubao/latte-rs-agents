@@ -448,6 +448,19 @@ pub enum ChatEvent {
         wait: bool,
         options: Vec<ChoiceOption>,
     },
+    /// 方案 A：工具参数死循环/反复报错时的人工弹窗介入（HIL）。
+    /// 前端弹出带代码编辑器的修改框，允许用户直接修正坏 JSON 或参数。
+    /// 用户修正后，POST 到 `/api/chat/choice-answer`（choice_id 路由），
+    /// 触发上下文裁剪与单次正确执行。
+    ToolFixRequested {
+        role_id: String,
+        choice_id: String,
+        tool_name: String,
+        malformed_args: String,
+        error_detail: String,
+        #[serde(default)]
+        wait: bool,
+    },
     /// 角色调用 `task_report` 工具回报任务执行结果（任务看板闭环）。
     /// 广播后由 ui-server 侧 `events_sse` 订阅器拦截，调内部
     /// `POST /api/tasks/:id/report`，把任务推进到 human_review
@@ -3321,6 +3334,7 @@ async fn build_runner(
         if let Some(path) = current_session_file.as_ref() {
             runner = runner.with_current_session_file(path.clone());
         }
+    let mut runner = runner.with_tool_fix_event_tx(event_tx.clone());
         // 这条 `.with_sink` 此前漏了：`runner_sink` 构造完就被丢弃
         // （编译器只报了个 unused variable 警告，实际后果是无工具角色的
         // trace 事件既不落子会话日志、也不经 ChatEventTraceSink 广播给
@@ -9024,6 +9038,8 @@ mod tests {
             max_tokens: 4096,
             supports_thinking: false,
             supports_vision: false,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             supports_image_generation: false,
             cost_per_million_input: None,
             cost_per_million_output: None,
@@ -9860,6 +9876,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -10585,6 +10603,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -10726,6 +10746,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -10931,6 +10953,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -11485,6 +11509,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -11628,6 +11654,8 @@ mod tests {
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -11781,6 +11809,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -11914,6 +11944,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -12051,6 +12083,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -12217,6 +12251,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -12975,6 +13011,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,

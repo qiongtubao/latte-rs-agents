@@ -1816,6 +1816,41 @@ fn spawn_cli_workflow_event_consumer_with(
                         ));
                     }
                 }
+                Ok(ChatEvent::ToolFixRequested {
+                    role_id,
+                    choice_id,
+                    tool_name,
+                    malformed_args,
+                    error_detail,
+                    wait,
+                }) => {
+                    if !wait {
+                        ui_emit(&format!("⚠️ [{role_id}] 工具 `{tool_name}` 参数损坏: {error_detail}"));
+                        continue;
+                    }
+                    let mut prompt_text = format!(
+                        "\n⚠️ [{role_id}] 工具 `{tool_name}` 反复报错，需要人工介入修正参数：\n\
+                         报错信息: {error_detail}\n\
+                         损坏参数:\n{malformed_args}\n\n\
+                         请输入修正后的 JSON/参数（按 Enter 提交，Ctrl-C 放弃本轮）：\n"
+                    );
+                    ui_emit(prompt_text.trim_end_matches('\n'));
+                    let answer = match read_user_line("fixed args › ").await.ok().flatten() {
+                        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+                        _ => {
+                            ui_emit("[tool_fix] 取消本次人工修正");
+                            latte_agent_core::choice::cancel(&choice_id);
+                            continue;
+                        }
+                    };
+                    if !latte_agent_core::choice::resolve(&choice_id, answer) {
+                        ui_emit(&format!(
+                            "[tool_fix] 修正未送达（choice_id={choice_id} 已失效）"
+                        ));
+                    } else {
+                        ui_emit("✅ 已提交人工修正参数，已剪除冗余纠错历史，继续执行...");
+                    }
+                }
                 // 进度可见性：没有这几行，用户无法区分「在等我回答」和
                 // 「还在干活」——这正是原来那个静默挂死难查的一半原因。
                 Ok(ChatEvent::WorkflowStep { step_id, index, total, role_id, .. }) => {
@@ -3378,6 +3413,32 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
+    /// 验证 CLI 终端事件循环支持 ToolFixRequested 人工介入事件并能完成 resolve
+    #[tokio::test]
+    async fn tool_fix_requested_can_be_resolved_in_cli_channel() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let choice_id = "toolfix-cli-test-1";
+        let ev = latte_agent_core::controller::ChatEvent::ToolFixRequested {
+            role_id: "manager".into(),
+            choice_id: choice_id.into(),
+            tool_name: "plan".into(),
+            malformed_args: "{\"broken\": true,".into(),
+            error_detail: "unexpected trailing comma".into(),
+            wait: true,
+        };
+
+        let waiter = latte_agent_core::choice::register(choice_id, ev.clone(), tx.clone());
+        // 模拟用户在 CLI 中提交修正参数
+        let resolved = latte_agent_core::choice::resolve(choice_id, "{\"fixed\": true}".into());
+        assert!(resolved, "resolve 必须成功送达");
+
+        let answer = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("必须在 2s 内收到答案")
+            .expect("通道不该异常关闭");
+        assert_eq!(answer, "{\"fixed\": true}");
+    }
+
     /// fire-and-forget（`wait=false`）不该被消费者回答——它的答案走
     /// 「下一条 user 消息」那条路，抢答会让挂起表状态错乱。
     #[tokio::test]
@@ -3434,6 +3495,8 @@ mod tests {
                     max_tokens: 1024,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -3544,6 +3607,8 @@ mod tests {
                     max_tokens: 1024,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
@@ -3745,6 +3810,8 @@ mod tests {
                     max_tokens: 1024,
                     supports_thinking: false,
                     supports_vision: false,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_image_generation: false,
                     cost_per_million_input: None,
                     cost_per_million_output: None,
