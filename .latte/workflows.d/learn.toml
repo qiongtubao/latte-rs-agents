@@ -126,58 +126,89 @@ min_chars = 800
 require = ["```mermaid", "名词解释", "docs/learn/"]
 forbid = ["TBD", "待补充", "占位符", "显而易见", "众所周知"]
 
-# ── 4. 校验：事实校对 + 小白测试，programmer 修正 ──────────────────
+# ── 4. 校验（独立审计，审/改/复核三步分离）────────────────────────
+# 为什么拆三步（修问题 #5，实测实锤：2026-09-07 jemalloc wf-learn-*）：
+# 旧 verify 是 speakers=["reviewer","programmer"] 单步，reviewer 先列问题、
+# programmer 在**同一上下文**里紧接着改、并由 **programmer 自己**在最后一行
+# 宣布 VERDICT: PASS。三重独立性缺陷：① 放行判据由「改的人」给（自评自批）；
+# ② reviewer 只看到修复**前**的文档，没有对修复结果的独立复核回合；
+# ③ 同上下文让 programmer 照 reviewer 措辞「改到刚好能过」而非真正修好。
+# 拆成 verify（reviewer 独立审）→ fix（programmer 只改不表态）→ recheck
+# （reviewer 独立复核修复后的文件、给放行门），放行判据回到「审的人」手里。
+
+# 4a. reviewer 独立审：只检查、列问题，不改文件、不放行。
 [[steps]]
 id = "verify"
-description = "reviewer 双重校验，programmer 修正"
-speakers = ["reviewer", "programmer"]
-output_key = "report"
-max_retries = 1
-task = """校验下面这篇小白教程：
+description = "reviewer 双重校验（只审不改）"
+speakers = ["reviewer"]
+output_key = "verify_report"
+task = """校验下面这篇小白教程（你只审、不改文件、不放行——修复与放行是后续两步的事）：
 
 【write 产出】
 {{doc}}
 
-reviewer 做双重校验（只检查+列问题，不改文件）：
-1. **事实校对**：看 `KIND=` 标记——code 类抽查至少 5 处行号引用和 3 条机制性断言对照真实代码；mechanism/concept 类核对断言是否有事实依据、有没有编造细节。有出入的逐条列出（位置/文档说的/实际）。
-2. **小白测试**：假装自己完全不懂这个领域，只读这篇文档：六层是否都能读懂？哪个名词没解释？哪张图看不懂？类比对理解有帮助还是误导？Mermaid 语法是否明显错误（节点未闭合、箭头写错）？
-输出：**第一行**必须是 `VERDICT: PASS`（可交付）或 `VERDICT: FAIL`，其后是逐条问题清单。
+做双重校验：
+1. **事实校对**：看 `KIND=` 标记——code 类抽查至少 5 处行号引用和 3 条机制性断言对照真实代码（用工具读源码核对，不要凭记忆）；mechanism/concept 类核对断言是否有事实依据、有没有编造细节。有出入的逐条列出（位置 / 文档说的 / 实际）。
+2. **小白测试**：假装完全不懂这个领域，只读这篇文档：六层是否都能读懂？哪个名词没解释？哪张图看不懂？类比有帮助还是误导？Mermaid 语法是否明显错误（节点未闭合、箭头写错、id 重复）？
 
-programmer：若 reviewer 判 FAIL，用 write/edit 逐条修正文档文件（保持六层结构与写作规则），回复修正了哪些。
-你的回复**最后一行**必须是二者之一：
-- `VERDICT: PASS` —— 问题已全部修完（或 reviewer 本来就判 PASS），文档可交付；
-- `VERDICT: FAIL` —— 你改不动（骨架层面的缺陷、事实不足等），需要退回写作步重写。
-
-⚠️ 输出 `VERDICT: FAIL` 时，你的正文里不得再出现字符串 `VERDICT: PASS`（放行条件按子串匹配，会被误判为放行）。"""
-
-# 返工回环：programmer 声明修完（VERDICT: PASS）才放行；声明改不动则
-# 跳回 write 重写。
-#
-# 修的 bug（实测实锤：2026-09-07 jemalloc 会话 wf-learn-1788721322564918）：
-# 此前 verify 没有 loop_until，于是 reviewer 判「裁决：❌ FAIL」并列出两条
-# 实质缺陷（L1 Mermaid 图语法错误导致渲染黑屏、tcache_t 结构描述不完整）
-# 之后，workflow 依旧以 `status: ok` 收尾，summary 就是那份 FAIL 报告原文。
-# 引擎从来没有读过 reviewer 的结论 —— 契约只做子串查找，没有任何一处按
-# 「判了 PASS 还是 FAIL」做决策。那次缺陷是靠 programmer 恰好在同一 step
-# 里自觉修掉的，属于运气，不是机制。
-#
-# 为什么标记要由 **最后一个** speaker 给：loop_until 判的是
-# `aggregate_step_output` 拼接后的聚合产出（多 speaker 会带 `## [role]`
-# 分隔）。若只让 reviewer 表态，reviewer 判 FAIL → 聚合里含 FAIL 不含
-# PASS → 即使 programmer 已经修完也会被判返工，白烧一整个 write 步。
-# 让 programmer 在修完后复述终态，聚合里才有正确的放行依据。
-loop_until = "VERDICT: PASS"
-loop_back_to = "write"
-max_iterations = 2
+输出：**第一行**必须是 `VERDICT: PASS`（无需修改，可直接交付）或 `VERDICT: FAIL`（有问题）。其后按严重度（blocking / important / nit）逐条列问题，每条给出**位置 + 该怎么改**，让下一步的 programmer 能照着修。列问题时必须带上文档的文件路径，供后续复核重读。"""
 
 [steps.output_contract]
 min_chars = 50
-# 曾是 `require = ["KIND", "PASS", "FAIL"]`。`require` 是 **AND** 语义
-# （workflow.rs 逐条 `!output.contains(pat)` 即判失败），而契约是**逐
-# speaker** 校验的 —— 于是这条要求「同一个 speaker 的同一段产出里同时
-# 出现 PASS 和 FAIL」，任务书本身写的却是「输出 PASS **或** FAIL」，
-# 结构性自相矛盾、100% 过不了。实测：reviewer 报缺「PASS」、programmer
-# 报缺「FAIL」，两条 learn 流水线全靠 advisor 兜底放行。
-# OR 语义的正确字段是 require_any；"KIND" 同 write 步一并移除。
+require_any = ["VERDICT: PASS", "VERDICT: FAIL"]
+forbid = []
+
+# 4b. programmer 按问题清单修文件——只改，不宣布通过（不自评）。
+[[steps]]
+id = "fix"
+description = "programmer 按 reviewer 问题清单修正文档（不放行）"
+speakers = ["programmer"]
+output_key = "fix_note"
+max_retries = 1
+task = """reviewer 对教程「{{topic}}」的校验报告如下：
+
+{{verify_report}}
+
+如果报告第一行是 `VERDICT: PASS`：无需任何修改，直接回复「无需修改」并结束，不要动文件。
+
+如果是 `VERDICT: FAIL`：用 write/edit 逐条修正文档文件（保持六层结构与写作规则），对着报告里每条问题改。改完回复你**具体改了哪些**（每条问题对应改了什么、在文件哪处），供 reviewer 复核。
+
+**不要在回复里宣布 VERDICT / PASS / FAIL**——是否放行由 reviewer 在下一步独立复核决定，不由你自己说了算。"""
+
+[steps.output_contract]
+min_chars = 10
+forbid = []
+
+# 4c. reviewer 独立复核修复后的文件——这才是放行门。FAIL 则跳回 fix。
+[[steps]]
+id = "recheck"
+description = "reviewer 复核修复结果并给放行裁决"
+speakers = ["reviewer"]
+output_key = "report"
+task = """你在上一轮校验了教程「{{topic}}」，programmer 已按你的意见做了修正。
+
+【你上轮的校验报告】
+{{verify_report}}
+
+【programmer 的修正说明】
+{{fix_note}}
+
+现在**独立复核修复后的实际文件**（用 read/工具重新读文档文件，不要只看修正说明的自述——以文件真实内容为准）：
+1. 你上轮列的每条问题是否真的改好了（逐条核对，别被「已修复」的措辞带过）；
+2. 修正有没有引入新问题（改错行号、图又坏了、结构被破坏）。
+
+输出：**第一行**必须是 `VERDICT: PASS`（问题已全部改好，可交付）或 `VERDICT: FAIL`（仍有未改好/新引入的问题）。FAIL 时其后逐条列出**还差什么**，供 programmer 再修一轮。
+
+⚠️ 输出 `VERDICT: FAIL` 时，正文里不得再出现字符串 `VERDICT: PASS`（放行按子串匹配，会被误判为放行）。"""
+
+# 放行门在 reviewer 手里：复核判 PASS 才放行；判 FAIL 跳回 fix 再修一轮
+# （fix 会拿到本步的 report 作为「上轮复核反馈」）。修问题 #5 的核心：
+# loop_until 判的是 **reviewer（复核者）** 的输出，不再是 programmer 自宣。
+loop_until = "VERDICT: PASS"
+loop_back_to = "fix"
+max_iterations = 2
+
+[steps.output_contract]
+min_chars = 20
 require_any = ["VERDICT: PASS", "VERDICT: FAIL"]
 forbid = []

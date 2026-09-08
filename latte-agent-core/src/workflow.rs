@@ -5921,6 +5921,40 @@ output_key = "exploration"
         }
     }
 
+    /// 修问题 #5（评审独立性）：learn 的校验阶段必须是「审/改/复核」三步
+    /// 分离，放行门（loop_until）判的是 **reviewer**（复核者）的输出，
+    /// 而不是 programmer（改的人）自宣 PASS。回归 2026-09 jemalloc 会话：
+    /// 旧 verify 是 speakers=["reviewer","programmer"] 单步、programmer 自评。
+    #[test]
+    fn learn_review_is_independent_audit_not_self_review() {
+        let raw = include_str!("../../config/workflows/learn.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("learn.toml valid TOML");
+        wf.validate().expect("learn should validate");
+
+        let step = |id: &str| wf.steps.iter().find(|s| s.id == id);
+
+        // 三步都存在且各自单一 speaker（审与改分离）。
+        let verify = step("verify").expect("verify step exists");
+        let fix = step("fix").expect("fix step exists");
+        let recheck = step("recheck").expect("recheck step exists");
+        assert_eq!(verify.speakers, vec!["reviewer".to_string()], "verify 只有 reviewer 审");
+        assert_eq!(fix.speakers, vec!["programmer".to_string()], "fix 只有 programmer 改");
+        assert_eq!(recheck.speakers, vec!["reviewer".to_string()], "recheck 由 reviewer 独立复核");
+
+        // 放行门在 recheck（reviewer），不在 fix（programmer）——核心修复点。
+        assert_eq!(recheck.loop_until.as_deref(), Some("VERDICT: PASS"),
+            "放行门必须挂在 reviewer 的复核步上");
+        assert_eq!(recheck.loop_back_to.as_deref(), Some("fix"),
+            "复核不过应跳回 fix 再修一轮");
+        assert!(fix.loop_until.is_none(), "fix（改的人）不得持有放行门");
+        assert!(verify.loop_until.is_none(), "verify（初审）不放行，只列问题");
+
+        // 步序：verify 在 fix 前、fix 在 recheck 前（审→改→复核）。
+        let idx = |id: &str| wf.steps.iter().position(|s| s.id == id).unwrap();
+        assert!(idx("verify") < idx("fix"), "先审后改");
+        assert!(idx("fix") < idx("recheck"), "先改后复核");
+    }
+
     #[test]
     fn design_and_plan_composes_workflows_serial_and_parallel() {
         let raw = include_str!("../../config/workflows/design_and_plan.toml");
@@ -6173,7 +6207,7 @@ output_key = "exploration"
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("learn should validate");
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["investigate", "structure", "write", "verify"]);
+        assert_eq!(ids, ["investigate", "structure", "write", "verify", "fix", "recheck"]);
         // investigate：防幻觉——要求行号锚点
         assert!(wf.steps[0].task_text().contains("行号"));
         // structure：六层骨架契约
@@ -6188,8 +6222,11 @@ output_key = "exploration"
         let write = &wf.steps[2];
         assert!(write.output_contract.require.iter().any(|r| r == "```mermaid"));
         assert!(write.output_contract.require.iter().any(|r| r == "名词解释"));
-        // verify：reviewer + programmer 接力（校对 + 修正）
-        assert_eq!(wf.steps[3].roles(), vec!["reviewer", "programmer"]);
+        // 校验阶段：审/改/复核三步分离（修问题 #5 评审独立性）。
+        // 详见 learn_review_is_independent_audit_not_self_review。
+        assert_eq!(wf.steps[3].roles(), vec!["reviewer"], "verify 独立审");
+        assert_eq!(wf.steps[4].roles(), vec!["programmer"], "fix 只改");
+        assert_eq!(wf.steps[5].roles(), vec!["reviewer"], "recheck 独立复核");
     }
     /// learn_loop：交互式学习循环——plan（取证+拆解+出题+写账本）→ teach
     /// （只讲解）→ quiz（只出题判分，未学完 loop_back_to teach）→ report。
