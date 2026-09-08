@@ -2429,7 +2429,12 @@ async fn run_multi_role_loop(
         {
             // plan 阶段门复位：新的用户消息 = 新的决策周期，上一轮
             // 未批准的 plan 不再约束 delegate（同时销账它的弹窗补发）。
-            reset_plan_stage(&plan_stage);
+            // 丢弃不静默：告知用户它失效了、以及怎么补救。
+            if let Some(dropped) = reset_plan_stage(&plan_stage) {
+                let _ = event_tx.send(ChatEvent::Status {
+                    message: discarded_plan_notice(&dropped),
+                });
+            }
             let mut mgr = session_arc.lock().await;
             mgr.append_to_role(
                 "manager",
@@ -3095,8 +3100,12 @@ async fn run_single_role_loop(
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
                         // plan 阶段门复位：新的用户消息 = 新的决策周期，
                         // 上一轮未批准的 plan 不再约束 delegate
-                        //（同时销账它的弹窗补发）。
-                        reset_plan_stage(&plan_stage);
+                        //（同时销账它的弹窗补发）。丢弃不静默。
+                        if let Some(dropped) = reset_plan_stage(&plan_stage) {
+                            let _ = event_tx.send(ChatEvent::Status {
+                                message: discarded_plan_notice(&dropped),
+                            });
+                        }
                         let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
                         let _ = event_tx.send(ChatEvent::RoleStarted {
                             role_id: current_role.clone(),
@@ -5491,17 +5500,37 @@ fn session_has_workflow_run(cwd: &std::path::Path, session_id: &str) -> bool {
 }
 
 /// plan 阶段门复位为 [`PlanStage::Normal`]，并把上一轮未批准的 plan
-/// 弹窗从补发表销账。
+/// 弹窗从补发表销账。**返回被丢弃的 `plan_id`**（`None` = 上一轮没有
+/// 悬着的清单），调用方据此告知用户，不要静默丢弃。
 ///
 /// 复位的语义是"新的用户消息 = 新的决策周期，上一份清单不再约束
 /// delegate"。既然它已经不作数了，就不该在下次重连时又被补发弹一遍
 /// （消息气泡上的「📥 导入任务看板」按钮和右键补救仍在，用户想导入
 /// 随时能开）。
-fn reset_plan_stage(plan_stage: &SharedPlanStage) {
+///
+/// 为什么必须把 id 交出去（实测实锤：2026-09 jemalloc 会话）：那次
+/// `implementation_plan` 跑通并 PASS、清单已提交弹窗，但用户没点导入就
+/// 发了下一条消息——清单在这里被静默销账，看板至今 0 条任务。整条流水线
+/// 22.19M 输入 token 的产出，就这么无声无息地作废了，事后翻日志才发现。
+/// 丢弃可以，但必须让用户看见「刚才那份清单没导入、现在失效了、还能补救」。
+fn reset_plan_stage(plan_stage: &SharedPlanStage) -> Option<String> {
     let prev = std::mem::replace(&mut *plan_stage.write(), PlanStage::Normal);
     if let PlanStage::PendingApproval { plan_id } = prev {
         crate::choice::dismiss_prompt(&plan_id);
+        return Some(plan_id);
     }
+    None
+}
+
+/// 未导入的任务清单被新一轮输入作废时给用户的提示文案。
+/// 单独提出来是为了让两个调用点（斜杠命令路径与普通消息路径）措辞一致，
+/// 且能被测试直接断言。
+fn discarded_plan_notice(plan_id: &str) -> String {
+    format!(
+        "⚠️ 上一份任务清单（plan_id={plan_id}）未导入任务看板，已随本轮新输入失效。\
+         若仍需要它，请在上方那条清单消息上右键选「导入任务看板」补救；\
+         否则它不会再被自动提起。"
+    )
 }
 
 /// 从 workflow 产出文本里提取任务看板清单：找第一个内容为
@@ -9563,6 +9592,93 @@ mod tests {
     /// 造一个共享阶段门句柄。
     fn fresh_plan_stage() -> SharedPlanStage {
         Arc::new(parking_lot::RwLock::new(PlanStage::Normal))
+    }
+
+    /// 未导入的任务清单被新一轮输入作废时，必须把 plan_id 交出来让调用方
+    /// 告知用户——不能静默丢弃。
+    ///
+    /// 回归实测实锤（2026-09 jemalloc 会话）：`implementation_plan` 跑通并
+    /// PASS、清单已提交弹窗，用户没点导入就发了下一条消息，清单在
+    /// `reset_plan_stage` 里被静默销账，看板至今 0 条任务——整条流水线
+    /// 22.19M 输入 token 的产出无声作废，事后翻日志才发现。
+    #[test]
+    fn reset_plan_stage_reports_the_discarded_plan() {
+        let stage = fresh_plan_stage();
+        *stage.write() = PlanStage::PendingApproval {
+            plan_id: "plan-manager-7".into(),
+        };
+        let dropped = reset_plan_stage(&stage);
+        assert_eq!(
+            dropped.as_deref(),
+            Some("plan-manager-7"),
+            "被丢弃的清单必须把 plan_id 交给调用方去提示用户"
+        );
+        assert!(
+            matches!(*stage.read(), PlanStage::Normal),
+            "复位后阶段门回到 Normal"
+        );
+    }
+
+    /// 没有悬着的清单时不报（避免每轮输入都刷一条无意义提示）。
+    #[test]
+    fn reset_plan_stage_is_silent_when_nothing_pending() {
+        let stage = fresh_plan_stage();
+        assert!(reset_plan_stage(&stage).is_none(), "Normal 态不该报");
+
+        *stage.write() = PlanStage::Approved {
+            plan_id: "plan-manager-8".into(),
+        };
+        assert!(
+            reset_plan_stage(&stage).is_none(),
+            "已批准（已导入看板）的清单不是丢弃，不该报"
+        );
+    }
+
+    /// 提示文案必须带 plan_id 和可执行的补救路径——否则用户看到也不知道
+    /// 能怎么救回来。
+    #[test]
+    fn discarded_plan_notice_tells_user_how_to_recover() {
+        let msg = discarded_plan_notice("plan-manager-9");
+        assert!(msg.contains("plan-manager-9"), "要带 plan_id: {msg}");
+        assert!(msg.contains("导入任务看板"), "要给补救入口: {msg}");
+        assert!(msg.contains("失效"), "要说清它已经不作数了: {msg}");
+    }
+
+    /// 接线防回归：`reset_plan_stage` 的**每一个**调用点都必须把返回的
+    /// plan_id 用掉（发提示）。只让函数返回 id 是不够的——调用点忽略它
+    /// 就又变回静默丢弃，而这种漏接编译器只会警告 `unused`（甚至不警告，
+    /// 因为 `if let Some(..)` 之外的写法也能编过）。
+    ///
+    /// 与 `top_level_sink_feeds_the_event_channel` 同款做法：扫非测试部分的
+    /// 源码，逐个调用点检查紧邻其后是否有提示发送。
+    #[test]
+    fn every_reset_plan_stage_call_site_emits_the_notice() {
+        let full = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller.rs"),
+        )
+        .expect("controller.rs");
+        // 切掉 test 模块：否则本测试自己的字面量会被算成调用点。
+        let src = full.split("#[cfg(test)]").next().expect("非测试部分");
+        // 排除定义本身（`fn reset_plan_stage`）。
+        let call_sites: Vec<&str> = src
+            .split("reset_plan_stage(&plan_stage)")
+            .skip(1) // 第一段是首个调用点之前的内容
+            .collect();
+        assert!(
+            call_sites.len() >= 2,
+            "应至少有两个调用点（斜杠命令路径 + 普通消息路径），实际 {}",
+            call_sites.len()
+        );
+        for (i, after) in call_sites.iter().enumerate() {
+            // 调用点之后 300 字符内必须出现提示发送。
+            let window: String = after.chars().take(300).collect();
+            assert!(
+                window.contains("discarded_plan_notice"),
+                "第 {} 个 reset_plan_stage 调用点没有发失效提示（静默丢弃回归）：{}",
+                i + 1,
+                window.lines().take(6).collect::<Vec<_>>().join(" / ")
+            );
+        }
     }
 
     /// 回归防线：`build_runner` 的**两条分支都必须装上 trace sink**。
