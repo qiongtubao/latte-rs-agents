@@ -352,6 +352,15 @@ impl ChatCmd {
                 // 管道/e2e 场景下 manager 的分派决策审查拿到的主诉求恒为
                 // 空，advisor 只能按「缺少用户锚点」告警。
                 *cli_advisor_host().last_input.lock() = input.to_string();
+                // 同时发到事件总线：monitor 的 MonitorState.last_user_text
+                // 靠订阅 UserMessage 事件（D9 零工具轮、session_facts 交付物
+                // 缺口都以它为主诉求锚点）。host.last_input 只喂 review
+                // prompt，两者是不同消费者，都要喂。
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::UserMessage {
+                        text: input.to_string(),
+                    },
+                );
                 session.turn(input).await?;
                 if let Some(resp) = &session.last_response {
                     println!("{}", resp);
@@ -396,6 +405,12 @@ impl ChatCmd {
             // 拼进本轮输入——与 controller 的 hint 队列（通道 A）等价。
             let host = cli_advisor_host();
             *host.last_input.lock() = line.trim().to_string();
+            // 同上：喂 monitor 的 last_user_text（D9 / session_facts 用）。
+            let _ = cli_session_event_tx().send(
+                latte_agent_core::controller::ChatEvent::UserMessage {
+                    text: line.trim().to_string(),
+                },
+            );
             let line = {
                 let hints: Vec<String> = std::mem::take(&mut *host.hints.lock());
                 if hints.is_empty() {
@@ -625,6 +640,19 @@ impl ChatSession {
                         )
                         .await;
                 }
+                // 把本轮收尾产出发到会话事件总线，供 advisor monitor 的
+                // 收尾类检测器（D1 掉调用 / D9 零工具轮 / D10 连续空转）
+                // 消费。此前 CLI 只发 delegate 事件、从不发 manager 的
+                // RoleTurn，于是这些检测器在 CLI 下拿不到任何信号——只在
+                // UI 路径生效。这里补齐，与 controller.rs 的 UI 路径对齐。
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::RoleTurn {
+                        role_id: self.role_id.clone(),
+                        content: response.clone(),
+                        is_complete: true,
+                        sub_id: None,
+                    },
+                );
                 self.last_response = Some(response);
                 Ok(())
             }

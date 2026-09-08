@@ -298,18 +298,21 @@ pub enum DetectorKind {
     /// for complex tasks the correct path is explore→ask→plan——the
     /// hint reminds the manager of the flow (advisory, not blocking).
     NoToolTurn,
-    /// D10: watched role spent ≥2 consecutive turns **thinking in
-    /// circles** on the same fork — its final text keeps raising
-    /// opposing options and reversing itself (“but… might be wrong…
-    /// let me re-read…”) while producing **zero tool calls / zero
-    /// output**. This is reasoning-layer thrash, invisible to the
-    /// tool-call loop detector (D4). The correct exit is to stop
-    /// self-arguing and `ask` the user to decide.
+    /// D10: watched role spent ≥2 consecutive turns **stalling** —
+    /// each turn produced substantive text but **zero progress**:
+    /// no tool call (an `ask` counts as a tool call, so genuinely
+    /// asking the user is NOT a stall), no delegate. Reasoning-layer
+    /// spin, invisible to the tool-call loop detector (D4). The
+    /// correct exit is to stop and `ask` the user to decide.
+    ///
+    /// **判据不看 think 内容**：横跳/自我拉锯只是「光想不做」的表象，
+    /// think 在事件流里被 strip、靠关键词判又漏又误报。真正的病理信号
+    /// 是「连着几轮反复输出正文、却既不动手也不问用户」——用零工具/零
+    /// delegate 这个 strip 后即可得的确定性结构信号来抓。
     ///
     /// 事故根因（2026-09 jemalloc）：advisor 注入了一条**错的** intervene
-    /// （「用户只要清单不要教程」），manager 在最后一轮 9552 字的 think 里
-    /// 反复推翻自己、零工具、零产出，session 就此耗死。D4 只抓工具调用
-    /// 层面的重复，抓不到这种纯推理横跳。
+    /// （「用户只要清单不要教程」），manager 在最后一轮 9552 字里反复自我
+    /// 拉锯、零工具、零产出、零 ask，session 就此耗死。
     ReasoningFlipFlop,
 }
 
@@ -465,43 +468,6 @@ impl TurnDetectors {
 /// JSON-validated.
 fn args_look_truncated(args: &str) -> bool {
     args.ends_with("B]") && args.contains("...[+")
-}
-
-/// D10 启发式：一段收尾文本是否呈现「在同一分叉反复自我拉锯」的特征。
-///
-/// 判据（两类信号都要够）：
-/// 1. **反复推翻**：出现足够多的"自我修正/推翻"措辞（but/however/actually/
-///    wait/on second thought/might be wrong/let me re-read/reconsider/
-///    但是/其实/等等/重新想/也许错了/再看一遍…）。单独一两个是正常思考，
-///    密集出现才是打转。
-/// 2. **对立选项**：文本里同时出现相互对立的选择措辞（correct/wrong、
-///    should/should not、A vs B、该/不该…），说明在两个方向之间摇摆。
-///
-/// 只在 caller 已确认「这一轮零工具调用」时才有意义——有实质工具动作
-/// 说明在推进，不算空转打转。纯字符串启发式，命中只喂给 advisor 当
-/// 证据（不自动阻断），最终是否升级 ask 由累计 streak 决定。
-fn looks_like_reasoning_flipflop(text: &str) -> bool {
-    let t = text.to_ascii_lowercase();
-    // 太短的收尾不可能是"反复拉锯"——横跳的实测形态是超长 think。
-    if t.chars().count() < 400 {
-        return false;
-    }
-    const REVERSAL: &[&str] = &[
-        "but ", "however", "actually", "wait", "on second thought",
-        "might be wrong", "may be wrong", "let me re-read", "let me reconsider",
-        "reconsider", "re-read", "rethink", "hmm",
-        "但是", "其实", "等等", "重新想", "重新读", "重新看", "再看一遍",
-        "也许错", "可能错", "让我再", "不对，", "又或者", "到底是",
-    ];
-    const OPPOSING: &[&str] = &[
-        "correct", "wrong", "should not", "shouldn't", "vs ", "versus",
-        "either", "or should", "该不该", "到底要", "不是", "还是",
-        "两个都", "只要", "既要",
-    ];
-    let reversal_hits = REVERSAL.iter().filter(|m| t.contains(**m)).count();
-    let opposing_hits = OPPOSING.iter().filter(|m| t.contains(**m)).count();
-    // 反复推翻要够密（≥3 种不同的自我修正措辞），且确有对立选项在摇摆。
-    reversal_hits >= 3 && opposing_hits >= 2
 }
 
 /// 良性探测错误：探索期的自愈型失败，不等于「agent 失控」，D3 与
@@ -804,11 +770,12 @@ const DIGEST_LINE_CHARS: usize = 240;
 /// 过度编排的证据，而 `dropped` 计数会把这个信号显式交给 advisor）。
 const DIGEST_MAX_LINES: usize = 40;
 
-/// D10 触发阈值：连续多少轮「同一分叉反复拉锯 + 零工具动作」就升级为
-/// 强制 ask。设 2——单独一轮长 think 可能是正常权衡，连着两轮还在原地
-/// 摇摆、没有任何工具推进，就是耗死前兆（jemalloc 事故的最后一轮正是
-/// 这种形态，只是当时没有任何机制在它耗死前叫停）。
-const FLIPFLOP_STREAK_TRIGGER: u32 = 2;
+/// D10 触发阈值：连续多少轮「有实质输出却零推进（零工具/零 delegate/
+/// 没 ask）」就升级为强制 ask。设 2——单独一轮长篇但没动作可能是正常
+/// 权衡，连着两轮还在原地空转、既不动手也不问用户，就是耗死前兆
+/// （jemalloc 事故的最后一轮正是这种形态，只是当时没有任何机制在它
+/// 耗死前叫停）。
+const REASONING_STALL_TRIGGER: u32 = 2;
 
 impl DispatchDigest {
     fn push(&mut self, line: String) {
@@ -1633,10 +1600,19 @@ struct MonitorState {
     /// 恒返回 `None`——欠着的任务清单再没有任何机制会提起它，看板至今
     /// 0 个任务。逐标签记账后，关掉一个只关一个。
     deliverables_done: std::collections::BTreeSet<&'static str>,
-    /// D10 状态（跨 turn）：连续多少轮收尾文本呈现「同一分叉反复自我
-    /// 拉锯 + 零工具动作」。一轮命中 +1，一旦某轮有实质工具动作就清零
-    /// （说明在推进，不是打转）。达到 FLIPFLOP_STREAK_TRIGGER 触发 D10。
-    flipflop_streak: u32,
+    /// D10 状态（跨 turn）：连续多少轮「有实质输出，却零推进」——
+    /// 零工具调用（含 `ask`：该问就问会计入 tool_use，不算空转）、
+    /// 零 delegate、非空产出。一轮命中 +1，任一轮有推进动作（任何工具
+    /// 调用 / delegate）就清零。达到 REASONING_STALL_TRIGGER 触发 D10。
+    ///
+    /// 判据**不看 think 内容**：横跳只是「光想不做」的表象，真正的病理
+    /// 信号是「连着几轮反复输出正文、却既不动手也不问用户」。think 在
+    /// 事件流里被 strip、且靠关键词判横跳既漏又误报——改用这个确定性、
+    /// strip 后即可得的结构信号。
+    reasoning_stall_streak: u32,
+    /// 本 turn 是否发生过 delegate（DelegateStarted）。delegate 走独立
+    /// 事件、不计入 `tool_use_count`，所以单独跟踪，turn 结束结算后清。
+    delegated_this_turn: bool,
 }
 
 impl MonitorState {
@@ -1656,7 +1632,8 @@ impl MonitorState {
             research_rounds: 0,
             deliverable_rounds: 0,
             deliverables_done: std::collections::BTreeSet::new(),
-            flipflop_streak: 0,
+            reasoning_stall_streak: 0,
+            delegated_this_turn: false,
         }
     }
 
@@ -1801,31 +1778,39 @@ impl MonitorState {
                         });
                     }
 
-                    // D10：推理层横跳探测（跨 turn）。只有「零工具 + 收尾
-                    // 文本呈现反复自我拉锯」才累计 streak；一旦这一轮有实质
-                    // 工具动作就清零（说明在推进）。连续到阈值 → 升级为
-                    // 强制 ask，让 manager 停止自我拉锯、把分叉交给用户拍板。
-                    if self.detectors.tool_use_count == 0
-                        && looks_like_reasoning_flipflop(content)
-                    {
-                        self.flipflop_streak = self.flipflop_streak.saturating_add(1);
-                        if self.flipflop_streak >= FLIPFLOP_STREAK_TRIGGER {
+                    // D10：推理层空转探测（跨 turn），不看 think 内容。
+                    // 判据是确定性结构信号：这一轮**有实质输出**（非空、
+                    // 非纯 ack），却**零工具调用**（含 ask——该问就问会计入
+                    // tool_use，不算空转）**且未 delegate**。也就是「反复
+                    // 输出正文、既不动手也不问用户」。连续到阈值 → 升级
+                    // 强制 ask，让 manager 停止空转、把分叉交用户拍板。
+                    let substantive_output = !looks_like_short_ack(content)
+                        && content.trim().chars().count() >= 40;
+                    let zero_progress = self.detectors.tool_use_count == 0
+                        && !self.delegated_this_turn;
+                    if substantive_output && zero_progress {
+                        self.reasoning_stall_streak =
+                            self.reasoning_stall_streak.saturating_add(1);
+                        if self.reasoning_stall_streak >= REASONING_STALL_TRIGGER {
                             findings.push(Finding {
                                 kind: DetectorKind::ReasoningFlipFlop,
-                                hint: "你已经连续多轮在同一个分叉上反复推翻自己、却没有任何工具动作或产出——这是在原地空转，再想下去只会耗尽而不会收敛。**立刻停止自我拉锯**：用 `ask` 把这个分叉作为结构化选项交给用户拍板（把你正在纠结的两个方向分别列成选项，附各自的取舍），而不是继续在脑子里两边横跳。如果分叉源于一条你无法核实的外部建议（如 advisor 提示），在选项里如实说明该建议与你自己的判断冲突在哪。".into(),
+                                hint: "你已经连续多轮只输出正文、却没有任何工具动作、没有 delegate、也没有 ask——这是在原地空转，再想下去只会耗尽而不会收敛。**立刻停止空转**：如果卡在一个need拍板的分叉上，用 `ask` 把它作为结构化选项交给用户（把你正在纠结的方向分别列成选项，附各自取舍）；如果只是缺信息，用工具去取证。绝不要再发一轮「还在权衡、暂无动作」。如果分叉源于一条你无法核实的外部建议（如 advisor 提示），在 ask 选项里如实说明该建议与你自己的判断冲突在哪。".into(),
                                 evidence: format!(
-                                    "reasoning flip-flop for {} consecutive zero-tool turns (latest {} chars)",
-                                    self.flipflop_streak,
+                                    "reasoning stall: {} consecutive turns with output but zero tool/delegate/ask (latest {} chars)",
+                                    self.reasoning_stall_streak,
                                     content.chars().count()
                                 ),
                             });
                             // 触发后清零，避免同一僵局每轮反复上报。
-                            self.flipflop_streak = 0;
+                            self.reasoning_stall_streak = 0;
                         }
                     } else {
-                        // 有工具动作 or 本轮不像横跳 → 打转链断开，清零。
-                        self.flipflop_streak = 0;
+                        // 有推进动作（工具/delegate/ask）或本轮无实质输出
+                        // → 空转链断开，清零。
+                        self.reasoning_stall_streak = 0;
                     }
+                    // 本 turn 的 delegate 标志已结算，清掉备下一轮。
+                    self.delegated_this_turn = false;
 
                     self.reset_turn_state();
                     turn_ended = true;
@@ -1898,6 +1883,8 @@ impl MonitorState {
                     "[delegate → {to_role}] {}",
                     truncate_chars(task, 500)
                 ));
+                // D10：本轮发生过 delegate = 有推进动作，不是空转。
+                self.delegated_this_turn = true;
                 // 「通读/解剖」类 delegate 与再跑一轮 explore 等价，
                 // 一起计入调研轮次（见 delegate_task_looks_like_research）。
                 if delegate_task_looks_like_research(task) {
@@ -4258,83 +4245,114 @@ mod tests {
         assert!(!out.contains("应服从"), "heuristic 不该要求服从: {out}");
     }
 
-    // ── 方向2：D10 推理层横跳探测 ────────────────────────────────
+    // ── 方向2：D10 推理层空转探测（不看 think，看零推进）────────────
 
-    /// 还原 jemalloc #16 那轮的横跳形态：反复推翻 + 对立选项 + 超长。
-    fn flipflop_text() -> String {
-        "The advisor is telling me to stop learn. But looking back, \
-         the user explicitly chose BOTH task list and tutorial. \
-         So launching learn was actually correct. But now the advisor \
-         says the user only wants a list — hmm, the advisor might be wrong here. \
-         Actually wait, let me re-read the conversation. The user's choices were \
-         task list + tutorial. So it should be correct... but the advisor. \
-         Let me reconsider whether it is wrong or correct. 到底是该停还是不该停。\
-         也许 advisor 错了，也许我错了，等等，重新想一遍这个分叉。"
-            .repeat(2)
+    // 一段「有实质输出、但什么都没做」的收尾文本。内容本身不重要——
+    // D10 判据看的是「有输出 + 零工具 + 零 delegate」，不是文本措辞。
+    const STALL_TEXT: &str = "我还在权衡这个分叉，advisor 建议停掉 learn，\
+        但用户其实两个交付物都点了，我需要再想想到底怎么办，暂时先不动手。";
+
+    fn mgr_tool_use(name: &str) -> ChatEvent {
+        ChatEvent::ToolUse {
+            role_id: "manager".into(),
+            tool_name: name.into(),
+            args: "{}".into(),
+            sub_id: None,
+        }
     }
 
     #[test]
-    fn flipflop_helper_ignores_short_or_progressing_text() {
-        assert!(!looks_like_reasoning_flipflop("好的，我这就去做。"), "短文本不该命中");
-        assert!(
-            !looks_like_reasoning_flipflop(&"正常推进，读文件然后修改。".repeat(30)),
-            "无对立/无反复推翻的长文本不该命中"
-        );
-        assert!(looks_like_reasoning_flipflop(&flipflop_text()), "横跳形态应命中");
-    }
-
-    #[test]
-    fn d10_fires_after_two_consecutive_zero_tool_flipflop_turns() {
+    fn d10_fires_after_two_consecutive_zero_progress_turns() {
         let mut s = state();
         s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
-        // 第一轮横跳、零工具 → 累计，不触发。
-        let out1 = s.observe(&role_turn(&flipflop_text()));
+        // 第一轮：有输出、零工具、零 delegate → 累计，不触发。
+        let out1 = s.observe(&role_turn(STALL_TEXT));
         assert!(
             out1.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
-            "首轮横跳只累计不触发"
+            "首轮空转只累计不触发"
         );
-        // 第二轮再横跳、零工具 → 达阈值触发 D10。
+        // 第二轮再空转 → 达阈值触发 D10。
         s.observe(&user_msg("继续"));
-        let out2 = s.observe(&role_turn(&flipflop_text()));
+        let out2 = s.observe(&role_turn(STALL_TEXT));
         let d10 = out2
             .findings
             .iter()
             .find(|f| f.kind == DetectorKind::ReasoningFlipFlop)
-            .expect("连续两轮横跳应触发 D10");
+            .expect("连续两轮零推进应触发 D10");
         assert!(d10.hint.contains("ask"), "D10 hint 应指示用 ask 交用户拍板: {}", d10.hint);
+    }
+
+    #[test]
+    fn d10_does_not_fire_when_the_turn_asks_the_user() {
+        // ask 是工具调用 → tool_use_count>0 → 不算空转。「该问就问」
+        // 是正确出口，绝不能被 D10 误报。
+        let mut s = state();
+        s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
+        s.observe(&role_turn(STALL_TEXT)); // streak = 1
+        s.observe(&user_msg("继续"));
+        s.observe(&mgr_tool_use("ask")); // 本轮问了用户
+        let out = s.observe(&role_turn("请在上方选择"));
+        assert!(
+            out.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "调用了 ask 的轮次是正确出口，不该触发 D10"
+        );
+    }
+
+    #[test]
+    fn d10_does_not_fire_when_the_turn_delegates() {
+        // delegate = 有推进动作，不是空转。
+        let mut s = state();
+        s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
+        s.observe(&role_turn(STALL_TEXT)); // streak = 1
+        s.observe(&user_msg("继续"));
+        s.observe(&delegate_started("programmer")); // 本轮派了活
+        let out = s.observe(&role_turn("已委派 programmer 去实现"));
+        assert!(
+            out.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "发生 delegate 的轮次不是空转，不该触发 D10"
+        );
     }
 
     #[test]
     fn d10_streak_resets_when_a_turn_does_real_tool_work() {
         let mut s = state();
         s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
-        s.observe(&role_turn(&flipflop_text())); // streak = 1
-        // 中间一轮有实质工具动作 → 该轮收尾时 streak 清零。
-        s.observe(&ChatEvent::ToolUse {
-            role_id: "manager".into(),
-            tool_name: "read".into(),
-            args: "{\"path\":\"src/x.rs\"}".into(),
-            sub_id: None,
-        });
+        s.observe(&role_turn(STALL_TEXT)); // streak = 1
+        // 中间一轮有实质工具动作（read）→ 该轮收尾清零。
         s.observe(&user_msg("继续"));
-        // 这一轮收尾时 tool_use_count>0（含上面的 read）→ 走 else，streak=0。
-        let mid = s.observe(&role_turn(&flipflop_text()));
+        s.observe(&mgr_tool_use("read"));
+        let mid = s.observe(&role_turn("读了 src/x.rs，接下来…"));
         assert!(
             mid.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
-            "夹了工具动作的这轮不该触发"
+            "有工具动作的这轮不该触发、且清零"
         );
-        // 此后需要重新连续两轮**干净的**零工具横跳才触发。
+        // 此后需要重新连续两轮零推进才触发。
         s.observe(&user_msg("继续"));
-        let first_clean = s.observe(&role_turn(&flipflop_text())); // streak = 1
+        let first = s.observe(&role_turn(STALL_TEXT)); // streak = 1
         assert!(
-            first_clean.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
-            "清零后的首轮只累计"
+            first.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "清零后首轮只累计"
         );
         s.observe(&user_msg("继续"));
-        let out = s.observe(&role_turn(&flipflop_text())); // streak = 2 → fire
+        let out = s.observe(&role_turn(STALL_TEXT)); // streak = 2 → fire
         assert!(
             out.findings.iter().any(|f| f.kind == DetectorKind::ReasoningFlipFlop),
-            "工具动作清零后重新连续两轮零工具横跳才触发"
+            "清零后重新连续两轮零推进才触发"
+        );
+    }
+
+    #[test]
+    fn d10_ignores_short_ack_turns() {
+        // 纯 ack（「好的」）不算「有实质输出」，不进空转计数——否则
+        // 用户闲聊两句「谢谢」也会被累计。
+        let mut s = state();
+        s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
+        s.observe(&role_turn("好的")); // 短 ack，不计入
+        s.observe(&user_msg("继续"));
+        let out = s.observe(&role_turn("好的")); // 仍是短 ack
+        assert!(
+            out.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "短 ack 不算实质输出，不该累计成空转"
         );
     }
 }
