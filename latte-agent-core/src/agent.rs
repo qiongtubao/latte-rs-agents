@@ -704,6 +704,13 @@ struct LoopDetector {
 const LOOP_WINDOW_SIZE: usize = 8;
 const LOOP_STREAK_THRESHOLD: usize = 5;
 
+/// 正文撞长度上限后，最多**续写**几段再拼接。到顶仍未正常收尾才降级
+/// 贴 `⚠️ [产出被截断]` 标记。给 5 段：既能把 5×单次上限的长产出续全
+/// （如 384000 上限下理论可达 ~1.9M token 的最终产出），又对「续写循环
+/// 本身失控」有硬止损。每续一段，前文都会随消息历史回传，输入 token
+/// 单调涨，靠这个上限兜住成本。
+const MAX_LENGTH_CONTINUATIONS: u8 = 5;
+
 /// 判「打转」时窗口内最多允许几种不同调用。2 = 只在两个调用之间来回跳。
 const LOOP_CYCLE_MAX_DISTINCT: usize = 2;
 
@@ -2965,9 +2972,16 @@ impl AgentRunner {
         let mut total_thinking: u32 = 0;
         // 悬挂工具标记的卫生重试计数（每 turn 至多 1 次）。
         let mut markup_retried: u8 = 0;
-        // 正文撞长度上限后的重试次数（同 markup_retried：只重试一次，
-        // 避免"每次都被截断"变成死循环）。
-        let mut length_retried: u8 = 0;
+        // 正文撞长度上限后的**续写**次数。旧实现是「重试一次让模型
+        // 压缩重写」——已生成的半截 token 全丢、且逼模型砍内容才能装下
+        // （实测：implementation_plan 清单被从 30 子任务压到 ≤18 才不
+        // 截断，用户点名的粒度被压没了）。现在改为**续写拼接**：保留
+        // 已生成内容，让模型从截断处接着写，engine 侧累加，直到
+        // finish_reason 正常收尾或达到 MAX_LENGTH_CONTINUATIONS。
+        let mut length_continued: u8 = 0;
+        // 已续写确认的前缀：截断续写模式下，每轮真正的产出 =
+        // continuation_prefix + 本轮 completion.content。空 = 未进入续写。
+        let mut continuation_prefix = String::new();
 
         // 死循环探测器：**整个 turn 共用一个**，streak 跨 round 累积。
         //
@@ -3263,7 +3277,15 @@ impl AgentRunner {
             total_output += completion.usage.output_tokens;
             total_thinking += completion.usage.thinking_tokens;
 
-            final_response = completion.content.clone();
+            // 续写模式下（continuation_prefix 非空），本轮 completion 只是
+            // 「接着写的下一段」——真正的产出是前缀 + 本段拼起来。下游
+            // 看到的 final_response 始终是**拼接后的完整内容**，TraceEvent、
+            // hooks、tool 解析、workflow 契约都据此工作，感知不到分段。
+            final_response = if continuation_prefix.is_empty() {
+                completion.content.clone()
+            } else {
+                format!("{continuation_prefix}{}", completion.content)
+            };
             if !final_response.trim().is_empty() {
                 last_substantive_response = final_response.clone();
             }
@@ -3354,49 +3376,63 @@ impl AgentRunner {
                 // 引擎不看 finish_reason，把它当正常产出穿给下游终审；
                 // 终审连着三轮 REJECT，理由都是「JSON 在 T2c 处被截断」，
                 // max_iterations 耗尽后整条 20 分钟的流水线判 failed。
-                // 更糟的是**返工无效**：gate 跳回 breakdown 重拆，而反馈里
-                // 只说「JSON 不完整」、没说「你被长度上限掐断了」，于是
-                // 模型又写一份同样长的清单、又被掐断，三轮空转。
                 //
-                // 对策与上面的悬挂标记同形：重试一次，并且把**真实原因和
-                // 可执行对策**讲明（不是「重写一遍」，而是「压缩到能装下」）。
-                // 仍被截断则照收，但在正文末尾留一条显式标记，让人、
-                // 下游评审与 workflow 契约都能看见——最坏情况下也不再是
-                // 静默采纳。
-                if length_retried == 0 && output_truncated {
-                    length_retried += 1;
+                // 旧对策是「重试一次让模型压缩重写」，有两个本质缺陷：
+                // ① 已生成的半截 token 全丢、重烧一遍（和整条重跑同性质，
+                //    只是范围小）；② 逼模型砍内容才能装下——实测那份清单
+                //    被从「6 顶层 + 30 子任务」压到「≤18 项」才不截断，
+                //    用户点名要的粒度被压没了。那不是修复，是拿内容缩水
+                //    换「不截断」。
+                //
+                // 现在改为**续写拼接**：不丢已生成内容，把它作为 assistant
+                // 消息保留，让模型**从截断处接着写**（不重复已输出的部分），
+                // engine 侧把新片段累加到 continuation_prefix。下一轮
+                // `final_response` = 前缀 + 新段，下游看到的始终是拼接后的
+                // 完整内容。循环到 finish_reason 正常收尾（不再是 length）
+                // 或续满 MAX_LENGTH_CONTINUATIONS 段为止。
+                if output_truncated && length_continued < MAX_LENGTH_CONTINUATIONS {
+                    length_continued += 1;
                     tracing::warn!(
                         stop_reason = %completion.stop_reason,
                         chars = final_response.chars().count(),
-                        "final response hit the output length limit; retrying once with a compression instruction"
+                        segment = length_continued,
+                        "final response hit the output length limit; requesting a continuation (segment {}/{})",
+                        length_continued, MAX_LENGTH_CONTINUATIONS
                     );
+                    // 把「到目前为止拼好的完整内容」作为 assistant 上文，
+                    // 让模型知道自己写到哪了；下一段直接从断点接续。
                     messages.push(Message::assistant(final_response.clone()));
                     messages.push(Message::user(format!(
                         "你上一条回复撞上了输出长度上限（finish_reason={}），\
-                         正文在 {} 字符处被强行截断、内容不完整（结构化产出会是半截 \
-                         JSON，下游无法使用）。\n\n\
-                         不要原样重写——同样的长度必然再次被截断。请压缩到能一次装下：\
-                         减少条目数量（宁少勿缺）、精简每条的长文本字段、\
-                         去掉解释性前言与重复表述，只保留要求的那部分内容。\
-                         若信息量确实装不下一条回复，先输出**完整且自洽**的一部分，\
-                         并在结尾明确说明还缺哪些、需要后续补充。",
+                         在 {} 字符处被截断，内容尚未写完。\n\n\
+                         请**从截断处继续**，直接接着写剩余部分即可：\n\
+                         - 不要重复任何已经输出的内容（不要重发开头、不要重写已列出的条目）；\n\
+                         - 不要加「接上文」「继续」之类的过渡语，也不要用 ``` 重开代码块——\
+                           你的这段输出会被原样拼接到上一段末尾，必须无缝衔接；\n\
+                         - 若这一段又写不完，同样在长度上限处停下，我会再让你继续。",
                         completion.stop_reason,
                         final_response.chars().count()
                     )));
+                    // 记录「已确认的前缀」= 当前完整内容；下一轮的
+                    // completion.content 会拼到它后面。
+                    continuation_prefix = final_response.clone();
                     continue;
                 }
                 if output_truncated {
-                    // 重试后仍被截断：照收，但绝不静默。
+                    // 续满上限仍未收尾：照收拼好的部分，但绝不静默——
+                    // 贴显式标记让人、下游评审、workflow 契约都看得见。
                     final_response.push_str(&format!(
-                        "\n\n⚠️ [产出被截断] 本回复撞上模型输出长度上限\
-                         （finish_reason={}，已重试 1 次仍未装下），\
-                         上面的内容**不完整**，结构化数据（JSON/清单）很可能缺尾。\
-                         下游请勿当作完整产出使用。",
+                        "\n\n⚠️ [产出被截断] 本回复在续写 {} 段后仍未写完\
+                         （finish_reason={}），上面的内容**可能不完整**，\
+                         结构化数据（JSON/清单）很可能缺尾。下游请勿当作\
+                         完整产出使用。",
+                        MAX_LENGTH_CONTINUATIONS,
                         completion.stop_reason
                     ));
                     tracing::warn!(
                         stop_reason = %completion.stop_reason,
-                        "final response still truncated after retry; annotated the payload"
+                        segments = MAX_LENGTH_CONTINUATIONS,
+                        "final response still truncated after max continuations; annotated the payload"
                     );
                 }
                 // 产出卫生：最终答复尾部带悬挂工具标记（native
@@ -3419,6 +3455,14 @@ impl AgentRunner {
                 }
                 break;
             }
+
+            // 走到这里说明本轮带了 tool_calls（no-tool-call 分支已在上面
+            // 处理完并 break/continue）。若之前进过截断续写模式，工具轮
+            // 之后模型的下一段正文是**全新响应**，不能再拼到旧前缀上——
+            // 在此清空续写状态，避免下一次截断把新内容错误地续在陈旧
+            // 前缀后面。
+            continuation_prefix.clear();
+            length_continued = 0;
 
             // 3b. Run PostParseHook (can mutate parsed calls)
             let mut post_parse_calls: Vec<ParsedCall> = parsed_calls;
@@ -9302,26 +9346,30 @@ tools = ["read", "write"]
         .to_string()
     }
 
-    /// 正文撞长度上限（`finish_reason=length`、无 tool_calls）必须**重试
-    /// 一次**并带上压缩指令，而不是把半截产出当正常答复返回。
+    /// 正文撞长度上限（`finish_reason=length`、无 tool_calls）必须触发
+    /// **续写拼接**：保留已生成的半截，让模型从断点接着写，engine 侧把
+    /// 新片段累加，最终产出 = 段1 + 段2 的无缝拼接——而不是丢弃半截、
+    /// 逼模型压缩重写。
     ///
     /// 回归 2026-09-07 jemalloc 会话：architect 在 tasks_json 步撞 8192
     /// token 上限，半个 JSON 被静默采纳穿给终审，gate 连着三轮 REJECT
     /// （理由都是「JSON 被截断」），max_iterations 耗尽后整条流水线 failed。
+    /// 旧修复用「压缩重写」止血——已生成 token 全丢、且逼模型砍任务项
+    /// 才能装下（清单被从 30 子任务压到 ≤18）。现在改为续写，内容不缩水。
     #[tokio::test]
-    async fn length_truncated_final_response_is_retried_once() {
+    async fn length_truncated_final_response_is_continued_and_stitched() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
         let server = wiremock::MockServer::start().await;
-        // 第一次返回被截断的半截 JSON，第二次返回完整产出。
+        // 第一次返回被截断的前半段，第二次返回续写的后半段。
         server
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
                         openai_completion_body_with_finish(
-                            r#"{"tasks":[{"title":"T0","description":"半截"#,
+                            r#"{"tasks":[{"title":"T0","desc":"aaa"},{"title":"T1","#,
                             "length",
                         ),
                     ))
@@ -9333,7 +9381,7 @@ tools = ["read", "write"]
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish(r#"{"tasks":[]}"#, "stop"),
+                        openai_completion_body_with_finish(r#""desc":"bbb"}]}"#, "stop"),
                     )),
             )
             .await;
@@ -9348,49 +9396,52 @@ tools = ["read", "write"]
         let mut runner = AgentRunner::new(agent);
         let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
 
+        // 关键断言：两段无缝拼接成完整 JSON，第一段**没有被丢弃**。
         assert_eq!(
-            out, r#"{"tasks":[]}"#,
-            "应采纳重试后的完整产出，而不是第一次的半截 JSON"
+            out,
+            r#"{"tasks":[{"title":"T0","desc":"aaa"},{"title":"T1","desc":"bbb"}]}"#,
+            "截断的前半段与续写后半段必须无缝拼接成完整产出: {out}"
         );
+        // 拼出来的必须是合法 JSON（证明续写真的补全了、不是半截）。
         assert!(
-            !out.contains("半截"),
-            "被截断的产出不该出现在最终答复里: {out}"
+            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+            "拼接结果应为合法 JSON: {out}"
         );
-        // 重试的追问必须讲清真实原因与对策（否则模型只会再写一份同样长
-        // 的）。它进的是工具循环内的工作消息表、不落 runner context，所以
-        // 检查**真正发出去的第二个请求**。
+        // 检查真正发出去的第二个请求：必须是「从断点继续」而非「重写」。
         let reqs = server.received_requests().await.expect("mock 应记录请求");
-        assert_eq!(reqs.len(), 2, "应恰好重试一次（共 2 次模型调用）");
+        assert_eq!(reqs.len(), 2, "应恰好续写一次（共 2 次模型调用）");
         let second = String::from_utf8_lossy(&reqs[1].body).to_string();
         assert!(
-            second.contains("输出长度上限"),
-            "第二次请求应带讲明截断原因的追问: {second}"
-        );
-        assert!(second.contains("finish_reason=length"), "{second}");
-        assert!(
-            second.contains("不要原样重写"),
-            "追问必须给出「压缩」而非「重写」的对策: {second}"
+            second.contains("从截断处继续"),
+            "第二次请求应指示模型从断点续写: {second}"
         );
         assert!(
-            second.contains("半截"),
-            "被截断的那份产出要作为 assistant 消息回喂，模型才知道自己写到哪断了: {second}"
+            second.contains("不要重复"),
+            "续写指令必须明确不要重复已输出内容: {second}"
+        );
+        assert!(
+            second.contains(r#"T1"#),
+            "已生成的前半段要作为 assistant 上文回喂，模型才知道续在哪: {second}"
         );
     }
 
-    /// 重试后仍被截断：照收（不死循环），但必须打上显式标记——最坏情况
-    /// 下也不能是静默采纳。
+    /// 续满上限仍被截断：照收拼好的部分（不死循环），但必须打上显式
+    /// 标记——最坏情况下也不能静默采纳。且**所有已产出的段都要保留**
+    /// （降级采纳的是完整累加内容，不是最后一段）。
     #[tokio::test]
     async fn persistently_truncated_response_is_annotated_not_silent() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
         let server = wiremock::MockServer::start().await;
+        // 每次都返回一段带 length 截断的内容，内容各不相同以便验证累加。
+        // run_turn 会续写 MAX_LENGTH_CONTINUATIONS 次后放弃。
         server
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish("永远装不下的长清单开头", "length"),
+                        openai_completion_body_with_finish("SEG", "length"),
                     )),
             )
             .await;
@@ -9407,13 +9458,18 @@ tools = ["read", "write"]
 
         assert!(
             out.contains("⚠️ [产出被截断]"),
-            "连续截断必须留下显式标记，实际: {out}"
+            "续满上限仍截断必须留下显式标记，实际: {out}"
         );
         assert!(out.contains("finish_reason=length"), "标记要带真实原因: {out}");
-        assert!(
-            out.contains("永远装不下的长清单开头"),
-            "已产出的内容仍要保留（降级采纳，不是丢弃）: {out}"
+        // 首段 + 5 段续写 = "SEG" 出现 6 次（1 初始 + MAX_LENGTH_CONTINUATIONS）。
+        let seg_count = out.matches("SEG").count();
+        assert_eq!(
+            seg_count, 6,
+            "已产出的每一段都要累加保留（1 首段 + 5 续段），实际出现 {seg_count} 次: {out}"
         );
+        // 请求次数 = 1 首次 + MAX_LENGTH_CONTINUATIONS 续写 = 6。
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(reqs.len(), 6, "首次 + 5 次续写 = 6 次模型调用");
     }
 
     // ─── ensure_unique_tool_call_ids tests ──────────────────────────
