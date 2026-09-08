@@ -298,6 +298,19 @@ pub enum DetectorKind {
     /// for complex tasks the correct path is explore→ask→plan——the
     /// hint reminds the manager of the flow (advisory, not blocking).
     NoToolTurn,
+    /// D10: watched role spent ≥2 consecutive turns **thinking in
+    /// circles** on the same fork — its final text keeps raising
+    /// opposing options and reversing itself (“but… might be wrong…
+    /// let me re-read…”) while producing **zero tool calls / zero
+    /// output**. This is reasoning-layer thrash, invisible to the
+    /// tool-call loop detector (D4). The correct exit is to stop
+    /// self-arguing and `ask` the user to decide.
+    ///
+    /// 事故根因（2026-09 jemalloc）：advisor 注入了一条**错的** intervene
+    /// （「用户只要清单不要教程」），manager 在最后一轮 9552 字的 think 里
+    /// 反复推翻自己、零工具、零产出，session 就此耗死。D4 只抓工具调用
+    /// 层面的重复，抓不到这种纯推理横跳。
+    ReasoningFlipFlop,
 }
 
 impl DetectorKind {
@@ -312,6 +325,7 @@ impl DetectorKind {
             Self::WorkflowFailed => "D7",
             Self::SerialDelegates => "D8",
             Self::NoToolTurn => "D9",
+            Self::ReasoningFlipFlop => "D10",
         }
     }
 }
@@ -451,6 +465,43 @@ impl TurnDetectors {
 /// JSON-validated.
 fn args_look_truncated(args: &str) -> bool {
     args.ends_with("B]") && args.contains("...[+")
+}
+
+/// D10 启发式：一段收尾文本是否呈现「在同一分叉反复自我拉锯」的特征。
+///
+/// 判据（两类信号都要够）：
+/// 1. **反复推翻**：出现足够多的"自我修正/推翻"措辞（but/however/actually/
+///    wait/on second thought/might be wrong/let me re-read/reconsider/
+///    但是/其实/等等/重新想/也许错了/再看一遍…）。单独一两个是正常思考，
+///    密集出现才是打转。
+/// 2. **对立选项**：文本里同时出现相互对立的选择措辞（correct/wrong、
+///    should/should not、A vs B、该/不该…），说明在两个方向之间摇摆。
+///
+/// 只在 caller 已确认「这一轮零工具调用」时才有意义——有实质工具动作
+/// 说明在推进，不算空转打转。纯字符串启发式，命中只喂给 advisor 当
+/// 证据（不自动阻断），最终是否升级 ask 由累计 streak 决定。
+fn looks_like_reasoning_flipflop(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    // 太短的收尾不可能是"反复拉锯"——横跳的实测形态是超长 think。
+    if t.chars().count() < 400 {
+        return false;
+    }
+    const REVERSAL: &[&str] = &[
+        "but ", "however", "actually", "wait", "on second thought",
+        "might be wrong", "may be wrong", "let me re-read", "let me reconsider",
+        "reconsider", "re-read", "rethink", "hmm",
+        "但是", "其实", "等等", "重新想", "重新读", "重新看", "再看一遍",
+        "也许错", "可能错", "让我再", "不对，", "又或者", "到底是",
+    ];
+    const OPPOSING: &[&str] = &[
+        "correct", "wrong", "should not", "shouldn't", "vs ", "versus",
+        "either", "or should", "该不该", "到底要", "不是", "还是",
+        "两个都", "只要", "既要",
+    ];
+    let reversal_hits = REVERSAL.iter().filter(|m| t.contains(**m)).count();
+    let opposing_hits = OPPOSING.iter().filter(|m| t.contains(**m)).count();
+    // 反复推翻要够密（≥3 种不同的自我修正措辞），且确有对立选项在摇摆。
+    reversal_hits >= 3 && opposing_hits >= 2
 }
 
 /// 良性探测错误：探索期的自愈型失败，不等于「agent 失控」，D3 与
@@ -753,6 +804,12 @@ const DIGEST_LINE_CHARS: usize = 240;
 /// 过度编排的证据，而 `dropped` 计数会把这个信号显式交给 advisor）。
 const DIGEST_MAX_LINES: usize = 40;
 
+/// D10 触发阈值：连续多少轮「同一分叉反复拉锯 + 零工具动作」就升级为
+/// 强制 ask。设 2——单独一轮长 think 可能是正常权衡，连着两轮还在原地
+/// 摇摆、没有任何工具推进，就是耗死前兆（jemalloc 事故的最后一轮正是
+/// 这种形态，只是当时没有任何机制在它耗死前叫停）。
+const FLIPFLOP_STREAK_TRIGGER: u32 = 2;
+
 impl DispatchDigest {
     fn push(&mut self, line: String) {
         if self.pending_reset {
@@ -830,6 +887,26 @@ pub enum Remedy {
     Restart,
 }
 
+/// intervene 建议的**强度**——让 manager 知道哪条该硬听、哪条可权衡。
+///
+/// 事故根因（2026-09 jemalloc）：advisor 注入「用户要清单不是教程」，
+/// manager 无法分辨这是「确定性事实纠正」（该服从）还是「启发式提醒」
+/// （可权衡），只能反复自我拉锯直到 turn 空耗结束。分级后 manager 拿到
+/// 的 hint 会明确标注该如何对待——而**恰恰这次 advisor 的判断是错的**
+/// （用户两个交付物都点了），所以 Factual 也必须**附依据**（`basis`），
+/// 让 manager 能据实核实/反驳，而不是盲从一条错的「事实」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    /// 启发式提醒：advisor 的判断/偏好，manager 应权衡但不必服从。
+    /// 缺省——advisor 未标注、或标注无法识别时按此处理（更保守：
+    /// 不逼 manager 盲从）。
+    #[default]
+    Heuristic,
+    /// 确定性事实纠正：基于可核实的硬事实（如「用户在选项里明确点了 X」）。
+    /// manager 应服从，**除非**能用 `basis` 里的依据证明该事实有误。
+    Factual,
+}
+
 /// Parsed advisor review output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewVerdict {
@@ -838,6 +915,12 @@ pub struct ReviewVerdict {
     pub hint: String,
     /// intervene/terminate 时的处置建议；ok/warn 时无意义（恒 Patch）。
     pub remedy: Remedy,
+    /// intervene 建议的强度分级（方向1）。ok/warn 时无意义（恒 Heuristic）。
+    pub severity: Severity,
+    /// advisor 判断所依据的**可核实事实**（方向3）。intervene 时应填，
+    /// 注入 manager 时一并带上，manager 可据此核实/反驳，不必盲从。
+    /// 为空 = advisor 未给依据（此时该 intervene 的可信度应打折）。
+    pub basis: String,
 }
 
 fn verdict_word(s: &str) -> Option<Verdict> {
@@ -896,9 +979,11 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
     let raw = cleaned.as_str();
     let mut verdict: Option<Verdict> = None;
     let mut remedy = Remedy::default();
+    let mut severity = Severity::default();
     let mut reason_lines: Vec<&str> = Vec::new();
     let mut hint_lines: Vec<&str> = Vec::new();
-    // 0 = no open section, 1 = reason, 2 = hint.
+    let mut basis_lines: Vec<&str> = Vec::new();
+    // 0 = no open section, 1 = reason, 2 = hint, 3 = basis.
     let mut section = 0u8;
 
     for line in raw.lines() {
@@ -921,6 +1006,28 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
                 _ => Remedy::Patch,
             };
             section = 0;
+            continue;
+        }
+        if let Some(rest) = lower.strip_prefix("severity:") {
+            let w = rest
+                .trim()
+                .trim_matches(|c: char| c == '*' || c == '`')
+                .trim_end_matches(['.', ';', '。', '；'])
+                .trim()
+                .to_ascii_lowercase();
+            severity = match w.as_str() {
+                "factual" | "fact" | "确定性" | "事实" => Severity::Factual,
+                _ => Severity::Heuristic,
+            };
+            section = 0;
+            continue;
+        }
+        if lower.starts_with("basis:") {
+            section = 3;
+            let rest = t["basis:".len()..].trim();
+            if !rest.is_empty() {
+                basis_lines.push(rest);
+            }
             continue;
         }
         if lower.starts_with("reason:") {
@@ -949,6 +1056,7 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
         match section {
             1 if !t.is_empty() => reason_lines.push(t),
             2 if !t.is_empty() => hint_lines.push(t),
+            3 if !t.is_empty() => basis_lines.push(t),
             _ => {}
         }
     }
@@ -959,11 +1067,49 @@ pub fn parse_verdict(raw: &str) -> ReviewVerdict {
         reason: reason_lines.join("\n").trim().to_string(),
         hint: hint_lines.join("\n").trim().to_string(),
         remedy,
+        severity,
+        basis: basis_lines.join("\n").trim().to_string(),
+    }
+}
+
+/// 把 intervene 裁决编成注入给 manager 的纠正文本，带上**强度**与**依据**。
+///
+/// 方向1+3 的落地：manager 收到的不再是一条光秃秃的断言，而是明确
+/// - 这条该**服从**还是可**权衡**（severity）；
+/// - advisor 依据的是哪条可核实事实（basis），manager 能去核对/反驳。
+///
+/// factual 但**没给依据**的 intervene 会被降级措辞（要求 manager 先核实
+/// 再决定），因为「声称是事实却拿不出出处」正是 jemalloc 事故里那条错判
+/// 的形态——不能让它以「确定性」的口吻逼 manager 盲从。
+fn compose_intervene_hint(v: &ReviewVerdict) -> String {
+    let hint = v.hint.trim();
+    match (v.severity, v.basis.trim()) {
+        // 事实纠正 + 有依据：要求服从，但把依据摆出来供核实。
+        (Severity::Factual, basis) if !basis.is_empty() => format!(
+            "【确定性事实纠正，应服从】{hint}\n依据：{basis}\n\
+             （若你能确证上述依据有误，可据实反驳并说明理由；否则请按此纠正。）"
+        ),
+        // 声称事实却无依据：降级为「先核实」，不许盲从。
+        (Severity::Factual, _) => format!(
+            "【纠正建议（未附依据，请先核实再决定）】{hint}\n\
+             （advisor 未给出可核实的依据事实，不要直接盲从——\
+             先用工具/对话历史核实这条是否成立，成立再采纳，不成立则说明理由后继续。）"
+        ),
+        // 启发式提醒：可权衡。
+        (Severity::Heuristic, basis) => {
+            let mut s = format!(
+                "【启发式提醒，可权衡】{hint}\n\
+                 （这是 advisor 的判断/偏好，不是硬事实；结合你自己的理解决定采纳与否。）"
+            );
+            if !basis.is_empty() {
+                s.push_str(&format!("\n参考依据：{basis}"));
+            }
+            s
+        }
     }
 }
 
 // ─── LLM review engine ─────────────────────────────────────────────
-
 /// Builds and runs the single-turn advisor review call.
 ///
 /// Uses `Agent::chat` with `WaitPolicy::NoWait` rather than
@@ -1311,13 +1457,20 @@ fn build_review_prompt(
 # 输出格式（严格遵守，键名小写英文，不要输出其他键）
 
 verdict: ok | warn | intervene
+severity: factual | heuristic   （仅 intervene 时有意义；见下）
 reason: <1-3 句给用户看的裁决理由；verdict 为 ok 时留空>
+basis: <你判断所依据的可核实事实；仅 intervene 时必填，见下>
 hint: <给 manager 的一句话纠正提示，具体可执行；仅 intervene 时必填，其余留空>
 
 判定标准：
 - 处理过程健康（耗时久、风格问题不算异常）→ ok
 - 值得关注但不阻塞的问题 → warn：只产生给用户看的气泡，**不会**打扰 manager
-- 继续下去明显浪费或产出错误结果（幻觉实锤、思路跑偏、关键约束遗漏）→ intervene：会给 manager 注入纠正提示"#
+- 继续下去明显浪费或产出错误结果（幻觉实锤、思路跑偏、关键约束遗漏）→ intervene：会给 manager 注入纠正提示
+
+**severity 与 basis 是强制配套（防止 manager 盲从一条错判）**：
+- `severity: factual` —— 你的纠正基于**可核实的硬事实**（如「用户在选项 X 里明确点了 Y」「摘要累计块显示交付物 Z 一次都没派」）。选 factual **必须**在 `basis:` 里写出那条事实的**出处**（哪个用户选项、摘要哪一行），让 manager 能去核对。manager 会被要求服从 factual 纠正，除非它能用 basis 证明你记错了。
+- `severity: heuristic` —— 你的纠正是**判断/偏好**（「这样可能更好」「建议先做 A」），不是硬事实。manager 会权衡而非盲从。
+- **拿不准 basis 站不站得住，就用 heuristic**。宁可让 manager 权衡，也不要用一条你没核实的「事实」逼它硬拐——实测事故正是 advisor 把「用户只要清单不要教程」当事实注入，而用户其实两样都点了，manager 被这条错判反复拉锯到空耗。basis 写不出确切出处 = 它不是 factual。"#
     )
 }
 
@@ -1480,6 +1633,10 @@ struct MonitorState {
     /// 恒返回 `None`——欠着的任务清单再没有任何机制会提起它，看板至今
     /// 0 个任务。逐标签记账后，关掉一个只关一个。
     deliverables_done: std::collections::BTreeSet<&'static str>,
+    /// D10 状态（跨 turn）：连续多少轮收尾文本呈现「同一分叉反复自我
+    /// 拉锯 + 零工具动作」。一轮命中 +1，一旦某轮有实质工具动作就清零
+    /// （说明在推进，不是打转）。达到 FLIPFLOP_STREAK_TRIGGER 触发 D10。
+    flipflop_streak: u32,
 }
 
 impl MonitorState {
@@ -1499,6 +1656,7 @@ impl MonitorState {
             research_rounds: 0,
             deliverable_rounds: 0,
             deliverables_done: std::collections::BTreeSet::new(),
+            flipflop_streak: 0,
         }
     }
 
@@ -1642,6 +1800,33 @@ impl MonitorState {
                             ),
                         });
                     }
+
+                    // D10：推理层横跳探测（跨 turn）。只有「零工具 + 收尾
+                    // 文本呈现反复自我拉锯」才累计 streak；一旦这一轮有实质
+                    // 工具动作就清零（说明在推进）。连续到阈值 → 升级为
+                    // 强制 ask，让 manager 停止自我拉锯、把分叉交给用户拍板。
+                    if self.detectors.tool_use_count == 0
+                        && looks_like_reasoning_flipflop(content)
+                    {
+                        self.flipflop_streak = self.flipflop_streak.saturating_add(1);
+                        if self.flipflop_streak >= FLIPFLOP_STREAK_TRIGGER {
+                            findings.push(Finding {
+                                kind: DetectorKind::ReasoningFlipFlop,
+                                hint: "你已经连续多轮在同一个分叉上反复推翻自己、却没有任何工具动作或产出——这是在原地空转，再想下去只会耗尽而不会收敛。**立刻停止自我拉锯**：用 `ask` 把这个分叉作为结构化选项交给用户拍板（把你正在纠结的两个方向分别列成选项，附各自的取舍），而不是继续在脑子里两边横跳。如果分叉源于一条你无法核实的外部建议（如 advisor 提示），在选项里如实说明该建议与你自己的判断冲突在哪。".into(),
+                                evidence: format!(
+                                    "reasoning flip-flop for {} consecutive zero-tool turns (latest {} chars)",
+                                    self.flipflop_streak,
+                                    content.chars().count()
+                                ),
+                            });
+                            // 触发后清零，避免同一僵局每轮反复上报。
+                            self.flipflop_streak = 0;
+                        }
+                    } else {
+                        // 有工具动作 or 本轮不像横跳 → 打转链断开，清零。
+                        self.flipflop_streak = 0;
+                    }
+
                     self.reset_turn_state();
                     turn_ended = true;
                 }
@@ -2094,11 +2279,19 @@ impl AdvisorMonitor {
                 if matches!(verdict.verdict, Verdict::Warn | Verdict::Intervene)
                     && !verdict.hint.is_empty()
                 {
+                    // 方向1+3：intervene 时把强度分级 + 依据事实编进注入文本，
+                    // 让 manager 知道该硬听还是可权衡、并能据依据核实/反驳，
+                    // 而不是拿到一条光秃秃的断言反复自我拉锯（jemalloc 事故）。
+                    let injected = if verdict.verdict == Verdict::Intervene {
+                        compose_intervene_hint(&verdict)
+                    } else {
+                        verdict.hint.clone()
+                    };
                     bubble.push_str(&format!(
                         "\n\n> 给 {} 的纠正提示：{}",
-                        state.watched_role, verdict.hint
+                        state.watched_role, injected
                     ));
-                    controller.advisor_hint(&verdict.hint);
+                    controller.advisor_hint(&injected);
                 }
                 let _ = bubble_tx.send(ChatEvent::RoleTurn {
                     role_id: "advisor".to_string(),
@@ -3991,5 +4184,157 @@ mod tests {
         assert_eq!(cfg.short_output_threshold, 50);
         assert_eq!(cfg.max_retries, 2);
         assert!(cfg.tool_call_echo_patterns.contains(&"<read>".to_string()));
+    }
+
+    // ── 方向1+3：severity / basis 解析与注入措辞 ──────────────────
+
+    #[test]
+    fn parse_verdict_reads_severity_and_basis() {
+        let v = parse_verdict(
+            "verdict: intervene\n\
+             severity: factual\n\
+             reason: 用户两个交付物都点了\n\
+             basis: 用户在 choice-manager-1 明确选了「任务清单 + 配套教程文档」\n\
+             hint: 不要停掉 learn",
+        );
+        assert_eq!(v.verdict, Verdict::Intervene);
+        assert_eq!(v.severity, Severity::Factual);
+        assert!(v.basis.contains("choice-manager-1"), "basis: {}", v.basis);
+        assert_eq!(v.hint, "不要停掉 learn");
+    }
+
+    #[test]
+    fn parse_verdict_severity_defaults_to_heuristic() {
+        // 未标 severity → 缺省 heuristic（保守：不逼 manager 盲从）。
+        let v = parse_verdict("verdict: intervene\nreason: r\nhint: h");
+        assert_eq!(v.severity, Severity::Heuristic);
+        assert!(v.basis.is_empty());
+    }
+
+    #[test]
+    fn factual_with_basis_says_obey_but_shows_evidence() {
+        let v = ReviewVerdict {
+            verdict: Verdict::Intervene,
+            reason: "r".into(),
+            hint: "改走 implementation_plan".into(),
+            remedy: Remedy::Patch,
+            severity: Severity::Factual,
+            basis: "累计块显示任务清单 0 次产出分派".into(),
+        };
+        let out = compose_intervene_hint(&v);
+        assert!(out.contains("应服从"), "factual 应要求服从: {out}");
+        assert!(out.contains("依据："), "必须带出依据供核实: {out}");
+        assert!(out.contains("据实反驳"), "仍允许据依据反驳: {out}");
+    }
+
+    #[test]
+    fn factual_without_basis_is_downgraded_to_verify_first() {
+        // 声称事实却无依据 = jemalloc 事故里那条错判的形态：不许盲从。
+        let v = ReviewVerdict {
+            verdict: Verdict::Intervene,
+            reason: "r".into(),
+            hint: "用户只要清单不要教程".into(),
+            remedy: Remedy::Patch,
+            severity: Severity::Factual,
+            basis: String::new(),
+        };
+        let out = compose_intervene_hint(&v);
+        assert!(out.contains("请先核实"), "无依据的 factual 应降级为先核实: {out}");
+        assert!(!out.contains("应服从"), "无依据不该要求盲从: {out}");
+    }
+
+    #[test]
+    fn heuristic_hint_is_weighable_not_obeyed() {
+        let v = ReviewVerdict {
+            verdict: Verdict::Intervene,
+            reason: "r".into(),
+            hint: "建议先做 A".into(),
+            remedy: Remedy::Patch,
+            severity: Severity::Heuristic,
+            basis: String::new(),
+        };
+        let out = compose_intervene_hint(&v);
+        assert!(out.contains("可权衡"), "heuristic 应可权衡: {out}");
+        assert!(!out.contains("应服从"), "heuristic 不该要求服从: {out}");
+    }
+
+    // ── 方向2：D10 推理层横跳探测 ────────────────────────────────
+
+    /// 还原 jemalloc #16 那轮的横跳形态：反复推翻 + 对立选项 + 超长。
+    fn flipflop_text() -> String {
+        "The advisor is telling me to stop learn. But looking back, \
+         the user explicitly chose BOTH task list and tutorial. \
+         So launching learn was actually correct. But now the advisor \
+         says the user only wants a list — hmm, the advisor might be wrong here. \
+         Actually wait, let me re-read the conversation. The user's choices were \
+         task list + tutorial. So it should be correct... but the advisor. \
+         Let me reconsider whether it is wrong or correct. 到底是该停还是不该停。\
+         也许 advisor 错了，也许我错了，等等，重新想一遍这个分叉。"
+            .repeat(2)
+    }
+
+    #[test]
+    fn flipflop_helper_ignores_short_or_progressing_text() {
+        assert!(!looks_like_reasoning_flipflop("好的，我这就去做。"), "短文本不该命中");
+        assert!(
+            !looks_like_reasoning_flipflop(&"正常推进，读文件然后修改。".repeat(30)),
+            "无对立/无反复推翻的长文本不该命中"
+        );
+        assert!(looks_like_reasoning_flipflop(&flipflop_text()), "横跳形态应命中");
+    }
+
+    #[test]
+    fn d10_fires_after_two_consecutive_zero_tool_flipflop_turns() {
+        let mut s = state();
+        s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
+        // 第一轮横跳、零工具 → 累计，不触发。
+        let out1 = s.observe(&role_turn(&flipflop_text()));
+        assert!(
+            out1.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "首轮横跳只累计不触发"
+        );
+        // 第二轮再横跳、零工具 → 达阈值触发 D10。
+        s.observe(&user_msg("继续"));
+        let out2 = s.observe(&role_turn(&flipflop_text()));
+        let d10 = out2
+            .findings
+            .iter()
+            .find(|f| f.kind == DetectorKind::ReasoningFlipFlop)
+            .expect("连续两轮横跳应触发 D10");
+        assert!(d10.hint.contains("ask"), "D10 hint 应指示用 ask 交用户拍板: {}", d10.hint);
+    }
+
+    #[test]
+    fn d10_streak_resets_when_a_turn_does_real_tool_work() {
+        let mut s = state();
+        s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
+        s.observe(&role_turn(&flipflop_text())); // streak = 1
+        // 中间一轮有实质工具动作 → 该轮收尾时 streak 清零。
+        s.observe(&ChatEvent::ToolUse {
+            role_id: "manager".into(),
+            tool_name: "read".into(),
+            args: "{\"path\":\"src/x.rs\"}".into(),
+            sub_id: None,
+        });
+        s.observe(&user_msg("继续"));
+        // 这一轮收尾时 tool_use_count>0（含上面的 read）→ 走 else，streak=0。
+        let mid = s.observe(&role_turn(&flipflop_text()));
+        assert!(
+            mid.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "夹了工具动作的这轮不该触发"
+        );
+        // 此后需要重新连续两轮**干净的**零工具横跳才触发。
+        s.observe(&user_msg("继续"));
+        let first_clean = s.observe(&role_turn(&flipflop_text())); // streak = 1
+        assert!(
+            first_clean.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            "清零后的首轮只累计"
+        );
+        s.observe(&user_msg("继续"));
+        let out = s.observe(&role_turn(&flipflop_text())); // streak = 2 → fire
+        assert!(
+            out.findings.iter().any(|f| f.kind == DetectorKind::ReasoningFlipFlop),
+            "工具动作清零后重新连续两轮零工具横跳才触发"
+        );
     }
 }
