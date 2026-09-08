@@ -80,6 +80,12 @@ pub trait ChatRenderer: Send + Sync {
                 })
                 .await;
             }
+            ChatEvent::ToolFixRequested { tool_name, malformed_args, error_detail, .. } => {
+                self.on_status(&format!(
+                    "⚠️ 工具 `{tool_name}` 连续出错，等待人工介入修正参数:\n错误信息: {error_detail}\n坏参数: {malformed_args}"
+                ))
+                .await;
+            }
             ChatEvent::Status { message } => self.on_status(message).await,
             ChatEvent::UserMessage { .. } => {
                 // 用户输入在 CLI 里本来就是本地 echo，无需渲染器再画
@@ -157,7 +163,6 @@ pub trait ChatRenderer: Send + Sync {
                 ))
                 .await;
             }
-            // ask 工具抛出的选择题：CLI 仅提示问题与选项数，web UI 弹窗选择。
             ChatEvent::ChoiceRequested { role_id, question, options, .. } => {
                 self.on_status(&format!(
                     "❓ {role_id} 请你选择（{} 个选项）：{question}",

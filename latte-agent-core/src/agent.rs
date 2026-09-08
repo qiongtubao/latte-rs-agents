@@ -726,7 +726,7 @@ const LOOP_CYCLE_MIN_EACH: usize = 2;
 /// 曾经是 `run_turn` 里的局部 `const`，被从 3/5 调到 5/8 时测试没跟着
 /// 改，于是测试长期失败却没人发现。
 const PERMANENT_NUDGE_AT: usize = 5;
-const PERMANENT_BREAK_AT: usize = 8;
+pub(crate) const PERMANENT_BREAK_AT: usize = 8;
 
 impl LoopDetector {
     /// Record a tool call and decide whether to continue or break.
@@ -975,10 +975,10 @@ pub struct AgentRunner {
     /// 循环内 deadline（对齐 oh-my-pi）：绝对墙钟时刻。每个 model call
     /// 前检查：超时时优雅退出、返回 partial 产出，而不是被外层 tokio
     /// timeout abort（后者会丢失所有未 flush 的 partial 文本）。
-    /// `None` = 不启用循环内 deadline（向后兼容：外层 tokio timeout 仍兜底）。
     deadline: Option<std::time::Instant>,
+    /// Optional event channel for human intervention on broken JSON/inputs (Scheme A).
+    tool_fix_event_tx: Option<tokio::sync::broadcast::Sender<crate::controller::ChatEvent>>,
 }
-
 /// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
 /// 来的，以及构建时的配置代际。
 #[derive(Clone)]
@@ -1392,14 +1392,154 @@ fn slim_oversized_messages(messages: &mut [Message]) -> usize {
                 }
             }
         }
+
         if touched {
             slimmed += 1;
         }
     }
     slimmed
 }
+/// 清理 LLM 输出的 JSON 字符串（去除 markdown 代码块标记与多余首尾空白）。
+pub(crate) fn clean_json_string(raw: &str) -> &str {
+    let mut s = raw.trim();
+    if s.starts_with("```json") {
+        s = s.strip_prefix("```json").unwrap_or(s);
+    } else if s.starts_with("```") {
+        s = s.strip_prefix("```").unwrap_or(s);
+    }
+    if s.ends_with("```") {
+        s = s.strip_suffix("```").unwrap_or(s);
+    }
+    s.trim()
+}
+
+/// 尝试使用本地启发式规则快速修复常见轻微 JSON 格式错误：
+/// 1. Markdown 代码块包裹
+/// 2. 末尾缺少闭合花括号/方括号
+/// 3. 常见的行尾多余逗号（如 `",\n}"` -> `"\n}"`）
+pub(crate) fn fast_heuristic_json_repair(raw: &str) -> Option<String> {
+    let cleaned = clean_json_string(raw);
+    if serde_json::from_str::<serde_json::Value>(cleaned).is_ok() {
+        return Some(cleaned.to_string());
+    }
+
+    let mut attempt = cleaned.to_string();
+    // 1. 去除对象/数组末尾的尾随逗号 (trailing commas)
+    attempt = attempt.replace(",\n}", "\n}").replace(",}", "}").replace(",\n]", "\n]").replace(",]", "]");
+    if serde_json::from_str::<serde_json::Value>(&attempt).is_ok() {
+        return Some(attempt);
+    }
+
+    // 2. 补齐缺失的闭合括号
+    let mut open_braces = 0isize;
+    let mut open_brackets = 0isize;
+    let mut in_string = false;
+    let mut escape = false;
+    for c in attempt.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            match c {
+                '{' => open_braces += 1,
+                '}' => open_braces -= 1,
+                '[' => open_brackets += 1,
+                ']' => open_brackets -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    if open_braces > 0 || open_brackets > 0 {
+        let mut patched = attempt.clone();
+        for _ in 0..open_brackets {
+            patched.push(']');
+        }
+        for _ in 0..open_braces {
+            patched.push('}');
+        }
+        if serde_json::from_str::<serde_json::Value>(&patched).is_ok() {
+            return Some(patched);
+        }
+    }
+
+    None
+}
+
+/// 方案 B：Subsession 旁路 JSON 修复。
+/// 当主模型的 tool args JSON 解析失败时，启动一个无上下文隔离的极简子任务修复 JSON，
+/// 避免污染主模型的上下文，并省去多轮来回重传的历史 token。
+async fn repair_json_via_subsession(
+    agent: &Agent,
+    tool_name: &str,
+    raw_args: &str,
+    serde_err: &str,
+) -> Option<String> {
+    // 1. 先尝试本地启发式规则（零 Token、零延迟）
+    if let Some(repaired) = fast_heuristic_json_repair(raw_args) {
+        tracing::info!(tool = tool_name, "工具参数 JSON 由本地启发式规则修复成功");
+        return Some(repaired);
+    }
+
+    // 2. 本地修复无效时，使用纯文本极简 prompt 启动一次独立的模型调用（Subsession）
+    let sys_prompt = "You are an expert JSON syntax repair subagent. \
+Your task is to fix syntax errors in a tool call argument string so that it is valid JSON. \
+Preserve all keys, values, and semantics. \
+Output ONLY the fixed valid JSON string. \
+Do NOT include markdown formatting, backticks, or any explanation.";
+
+    let user_msg = format!(
+        "Tool name: `{tool_name}`\nError: {serde_err}\n\nMalformed JSON arguments:\n{raw_args}\n\nOutput only valid JSON:"
+    );
+
+    let messages = vec![
+        Message::system(sys_prompt),
+        Message::user(user_msg),
+    ];
+
+    let mut params = agent.params.clone();
+    params.temperature = Some(0.0);
+
+    match agent.chat(&messages, Some(&params), WaitPolicy::NoWait).await {
+        Ok(completion) => {
+            let raw_out = completion.content;
+            let cleaned = clean_json_string(&raw_out);
+            if serde_json::from_str::<serde_json::Value>(cleaned).is_ok() {
+                tracing::info!(tool = tool_name, "工具参数 JSON 由 Subsession 模型修复成功");
+                Some(cleaned.to_string())
+            } else if let Some(heuristic) = fast_heuristic_json_repair(cleaned) {
+                tracing::info!(tool = tool_name, "工具参数 JSON 由 Subsession + 启发式修复成功");
+                Some(heuristic)
+            } else {
+                tracing::warn!(tool = tool_name, output = %raw_out, "Subsession 修复产物仍非合法 JSON");
+                None
+            }
+        }
+        Err(e) => {
+            tracing::warn!(tool = tool_name, error = %e, "Subsession JSON 修复调用失败");
+            None
+        }
+    }
+}
 
 /// 慢模型调用提示阈值：非流式 `chat` 超过该时长未返回时，向 UI 发
+
+/// 生成弹框/干预 choice_id 的时间戳后缀
+fn uuid_or_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".into())
+}
 /// 一次「仍在等待」状态（见 run_turn 非流式分支）。默认 120s；
 /// 测试可用 `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` 调小。
 fn slow_model_call_notice() -> Duration {
@@ -1992,6 +2132,7 @@ impl AgentRunner {
             session_id: String::new(),
             advisor_hints: None,
             cwd: None,
+            tool_fix_event_tx: None,
             current_session_file: None,
             last_turn_tool_count: 0,
             last_turn_tool_summaries: Vec::new(),
@@ -2022,6 +2163,7 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: String::new(),
             session_id: String::new(),
+            tool_fix_event_tx: None,
             advisor_hints: None,
             cwd: None,
             current_session_file: None,
@@ -2034,6 +2176,15 @@ impl AgentRunner {
             model_source: None,
             deadline: None,
         }
+    }
+    /// Attach an event broadcaster so the runner can trigger human-intervention
+    /// fix popups on repeated tool-parameter/JSON failures (Scheme A).
+    pub fn with_tool_fix_event_tx(
+        mut self,
+        tx: tokio::sync::broadcast::Sender<crate::controller::ChatEvent>,
+    ) -> Self {
+        self.tool_fix_event_tx = Some(tx);
+        self
     }
     pub fn with_context(agent: Agent, context: ConversationContext) -> Self {
         Self {
@@ -2048,6 +2199,7 @@ impl AgentRunner {
             session_id: String::new(),
             advisor_hints: None,
             cwd: None,
+            tool_fix_event_tx: None,
             current_session_file: None,
             last_turn_tool_count: 0,
             last_turn_tool_summaries: Vec::new(),
@@ -2140,6 +2292,7 @@ impl AgentRunner {
             format!(
                 "{}s 后自动重试（第 {}/{} 次），也可点 ▶ 立即继续",
                 d.as_secs(),
+
                 attempt + 1,
                 max_retries
             )
@@ -2264,7 +2417,7 @@ impl AgentRunner {
     /// - `permanent_streak`：`(工具名, 连续被确定性校验拒绝的次数)`，跨
     ///   调用累积，语义见串行路径。
     #[allow(clippy::too_many_arguments)]
-    fn apply_call_result(
+    async fn apply_call_result(
         &mut self,
         r: OneCallResult,
         tool_name: &str,
@@ -2312,21 +2465,58 @@ impl AgentRunner {
             Err((kind, detail)) => {
                 // 中段省略而非截头：错误分类在头、修复指引在尾，两头都要留。
                 let compacted = compact_middle_out(&detail, MAX_TOOL_ERROR_BYTES);
-                messages.push(Message::tool_result(r.id, compacted));
-                if matches!(kind, ToolCallErrorKind::PermanentExec { .. }) {
+                messages.push(Message::tool_result(r.id, compacted.clone()));
+                // 方案 B 跟进：`MalformedArgs` 不再是无声清零的失败。
+                // subsession 修复耗尽了（heuristic 与 LLM 都失败）时也应计入 streak：
+                // 每轮都是合法 JSON 校验失败 + 修复失败 = 同一确定性问题反复重试。
+                if matches!(kind, ToolCallErrorKind::PermanentExec { .. })
+                    || matches!(kind, ToolCallErrorKind::MalformedArgs { .. })
+                {
                     if permanent_streak.0 == tool_name {
                         permanent_streak.1 += 1;
                     } else {
                         *permanent_streak = (tool_name.to_string(), 1);
                     }
                     if permanent_streak.1 >= PERMANENT_BREAK_AT {
+                        // 方案 A：弹窗人工介入（HIL）。
+                        // 如果配置了 event_tx，则向前端发出 ToolFixRequested 弹窗，
+                        // 允许用户直接在线修好 JSON 或参数，而不是直接硬终止。
+                        if let Some(event_tx) = &self.tool_fix_event_tx {
+                            let choice_id = format!("toolfix-{}-{}", tool_name, uuid_or_timestamp());
+                            let req = crate::tool_fix::FixRequest {
+                                tool_name: tool_name.to_string(),
+                                malformed_args: compacted.clone(),
+                                error_detail: detail.clone(),
+                                first_failed_idx: messages.len().saturating_sub(permanent_streak.1 * 2),
+                            };
+                            let ev = crate::tool_fix::build_fix_event(&self.role_id, &choice_id, &req, true);
+                            let rx = crate::choice::register(&choice_id, ev.clone(), event_tx.clone());
+                            let _ = event_tx.send(ev);
+                            // 等待用户修改提交（非阻塞测试模式下若无等待者则自然超时）
+                            let mut rx = rx;
+                            if let Ok(Ok(corrected_args)) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx).await {
+                                // 裁剪前面 N 轮死循环纠错历史
+                                crate::tool_fix::prune_failed_rounds(messages, req.first_failed_idx, &corrected_args);
+                                *permanent_streak = (String::new(), 0);
+                                return Ok(());
+                            }
+                        }
+
                         return Err(AgentError::ToolLoopDetected {
                             tool: tool_name.to_string(),
-                            reason: format!(
-                                "'{}' 连续 {} 次因输入校验被拒（每次参数都不同），\
-                                 模型无法自行修正，停止重试",
-                                tool_name, permanent_streak.1
-                            ),
+                            reason: if matches!(kind, ToolCallErrorKind::MalformedArgs { .. }) {
+                                format!(
+                                    "'{}' 连续 {} 次输出无法修复的坏 JSON，\
+                                     旁路修复也已耗尽，停止重试",
+                                    tool_name, permanent_streak.1
+                                )
+                            } else {
+                                format!(
+                                    "'{}' 连续 {} 次因输入校验被拒（每次参数都不同），\
+                                     模型无法自行修正，停止重试",
+                                    tool_name, permanent_streak.1
+                                )
+                            },
                             partial: if last_substantive_response.is_empty() {
                                 final_response.to_string()
                             } else {
@@ -2336,7 +2526,7 @@ impl AgentRunner {
                     }
                     if permanent_streak.1 == PERMANENT_NUDGE_AT {
                         messages.push(Message::user(format!(
-                            "⚠️ `{}` 已连续 {} 次因输入校验失败被拒。不要再用同一个\
+                            "⚠️ `{}` 已连续 {} 次因输入校验/JSON失败被拒。不要再用同一个\
                              工具反复试：要么换一条路径完成任务，要么把当前进展和\
                              卡点直接讲给用户。",
                             tool_name, permanent_streak.1
@@ -3369,7 +3559,7 @@ impl AgentRunner {
                             &mut permanent_streak,
                             &final_response,
                             &last_substantive_response,
-                        )?;
+                        ).await?;
                     }
 
                     round += 1;
@@ -3443,7 +3633,7 @@ impl AgentRunner {
                             &mut permanent_streak,
                             &final_response,
                             &last_substantive_response,
-                        )?;
+                        ).await?;
                     }
 
                     round += 1;
@@ -3572,7 +3762,7 @@ impl AgentRunner {
                             &mut permanent_streak,
                             &final_response,
                             &last_substantive_response,
-                        )?;
+                        ).await?;
                     }
 
                     round += 1;
@@ -3617,29 +3807,50 @@ impl AgentRunner {
                         // 1. parse args。native 协议下模型输出的是合法 JSON；
                         // 若 latte-ai 层解析失败，arguments_raw 保留原始坏串，
                         // 这里 from_str 会失败并归类为 MalformedArgs。
-                        let input: serde_json::Value = match serde_json::from_str(&tc.args) {
+                        let mut tc_args = tc.args.clone();
+                        let input: serde_json::Value = match serde_json::from_str(&tc_args) {
                             Ok(v) => v,
                             Err(e) => {
-                                // 截断导致的坏 JSON 与"模型写错格式"是两
-                                // 回事：前者重发同一份必然再撞，必须让模型
-                                // 缩小单次提交量（分批 / 精简字段），而不是
-                                // 原样重试。
-                                let detail = if output_truncated {
-                                    format!(
-                                        "工具参数被模型输出长度上限截断（finish_reason=length，\
-                                         收到 {} 字节不完整 JSON）：{e}。不要原样重发——\
-                                         必须缩小单次提交量：分批调用（每批 3-5 项）\
-                                         或精简每项的长文本字段。",
-                                        tc.args.len()
-                                    )
+                                // 方案 B：触发一次旁路 JSON 修复。
+                                // 若修复成功，主上下文不会塞入任何错误反馈（避免污染）。
+                                let repaired = repair_json_via_subsession(
+                                    &self.agent,
+                                    &tc.name,
+                                    &tc_args,
+                                    &e.to_string(),
+                                ).await;
+                                if let Some(new_args) = repaired {
+                                    tc_args = new_args;
+                                    match serde_json::from_str(&tc_args) {
+                                        Ok(v) => v,
+                                        Err(e2) => {
+                                            let detail = format!("invalid JSON (post-repair): {e2}");
+                                            final_outcome = Err((
+                                                ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
+                                                detail,
+                                            ));
+                                            break;
+                                        }
+                                    }
                                 } else {
-                                    format!("invalid JSON: {e}")
-                                };
-                                final_outcome = Err((
-                                    ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
-                                    detail,
-                                ));
-                                break;
+                                    // 修复失败：保持原行为，把错误塞回 messages 让模型重试
+                                    let detail = if output_truncated {
+                                        format!(
+                                            "工具参数被模型输出长度上限截断（finish_reason=length，\
+                                             收到 {} 字节不完整 JSON）：{e}。不要原样重发——\
+                                             必须缩小单次提交量：分批调用（每批 3-5 项）\
+                                             或精简每项的长文本字段。",
+                                            tc_args.len()
+                                        )
+                                    } else {
+                                        format!("invalid JSON: {e}")
+                                    };
+                                    final_outcome = Err((
+                                        ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
+                                        detail,
+                                    ));
+                                    break;
+                                }
                             }
                         };
                         // cwd rewrite
@@ -9885,5 +10096,134 @@ tools = ["read", "write"]
         assert!(names.contains(&"bash".to_string()), "应有 bash: {names:?}");
         assert!(names.contains(&"read".to_string()), "应有 read: {names:?}");
         assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
+    }
+
+    #[test]
+    fn test_clean_json_string_and_heuristics() {
+        // 1. Markdown code block wrapping
+        let wrapped = "```json\n{\"path\": \"/foo/bar\"}\n```";
+        assert_eq!(clean_json_string(wrapped), "{\"path\": \"/foo/bar\"}");
+
+        // 2. Trailing commas repair
+        let trailing = "{\"path\": \"/foo/bar\",\n}";
+        let fixed = fast_heuristic_json_repair(trailing).expect("should repair trailing comma");
+        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok());
+
+        // 3. Unclosed braces repair
+        let unclosed = "{\"path\": \"/foo/bar\", \"nested\": {\"key\": 1";
+        let fixed = fast_heuristic_json_repair(unclosed).expect("should repair unclosed braces");
+        let val: serde_json::Value = serde_json::from_str(&fixed).expect("valid json");
+        assert_eq!(val["path"], "/foo/bar");
+        assert_eq!(val["nested"]["key"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_malformed_args_streak_breaks_out() {
+        // Verify that MalformedArgs error now counts into permanent_streak and breaks out
+        // instead of getting cleared and looping forever.
+        let mut streak = (String::new(), 0);
+        let mut detector = LoopDetector::default();
+        let role = test_role();
+        let agent = Agent::new("tester".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let mut msgs = Vec::new();
+
+        for i in 1..PERMANENT_BREAK_AT {
+            let res = runner.apply_call_result(
+                OneCallResult {
+                    id: format!("call_{i}"),
+                    outcome: Err((
+                        ToolCallErrorKind::MalformedArgs { serde_err: "syntax error".into() },
+                        "bad json".into(),
+                    )),
+                    loop_records: vec![],
+                    executed_ok: false,
+                },
+                "some_tool",
+                &mut msgs,
+                &mut detector,
+                &mut streak,
+                "",
+                "",
+            ).await;
+            assert!(res.is_ok(), "round {i} should not break yet");
+            assert_eq!(streak.1, i);
+        }
+
+        // Round BREAK_AT should break
+        let res = runner.apply_call_result(
+            OneCallResult {
+                id: format!("call_{PERMANENT_BREAK_AT}"),
+                outcome: Err((
+                    ToolCallErrorKind::MalformedArgs { serde_err: "syntax error".into() },
+                    "bad json".into(),
+                )),
+                loop_records: vec![],
+                executed_ok: false,
+            },
+            "some_tool",
+            &mut msgs,
+            &mut detector,
+            &mut streak,
+            "",
+            "",
+        ).await;
+        assert!(res.is_err(), "should break on reaching PERMANENT_BREAK_AT");
+        match res.unwrap_err() {
+            AgentError::ToolLoopDetected { tool, reason, .. } => {
+                assert_eq!(tool, "some_tool");
+                assert!(reason.contains("无法修复的坏 JSON"));
+            }
+            other => panic!("expected ToolLoopDetected, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn test_human_intervention_and_pruning() {
+        use tokio::sync::broadcast;
+        let (event_tx, mut rx) = broadcast::channel(16);
+        let role = test_role();
+        let agent = Agent::new("tester".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let mut runner = AgentRunner::new(agent).with_tool_fix_event_tx(event_tx);
+        let mut streak = (String::new(), 0);
+        let mut detector = LoopDetector::default();
+        let mut msgs = vec![
+            Message::user("Task description"),
+            Message::assistant("I will run tool"),
+            Message::tool_result("c1", "bad 1"),
+            Message::tool_result("c2", "bad 2"),
+        ];
+
+        // Spawn background task to auto-answer the ToolFixRequested event
+        tokio::spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                if let crate::controller::ChatEvent::ToolFixRequested { choice_id, .. } = ev {
+                    crate::choice::resolve(&choice_id, "{\"corrected\": true}".to_string());
+                    break;
+                }
+            }
+        });
+
+        streak = ("tool_a".to_string(), PERMANENT_BREAK_AT - 1);
+        let res = runner.apply_call_result(
+            OneCallResult {
+                id: "call_break".into(),
+                outcome: Err((
+                    ToolCallErrorKind::MalformedArgs { serde_err: "syntax error".into() },
+                    "bad json".into(),
+                )),
+                loop_records: vec![],
+                executed_ok: false,
+            },
+            "tool_a",
+            &mut msgs,
+            &mut detector,
+            &mut streak,
+            "",
+            "",
+        ).await;
+        assert!(res.is_ok(), "Human intervention should successfully intercept the break");
+        assert_eq!(streak.1, 0, "Streak should be reset after human fix");
+        // The pruned messages should contain the user correction marker
+        assert!(msgs.iter().any(|m| m.as_text().contains("人工修正并执行")));
     }
 }

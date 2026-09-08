@@ -45,6 +45,7 @@ pub mod pending_ask;
 pub mod sub_cancel;
 pub mod controller;
 pub mod code_graph_index;
+pub mod tool_fix;
 pub mod checkpoint;
 pub mod config;
 pub mod context;
