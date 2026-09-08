@@ -45,13 +45,19 @@ prompt_file = "prompts/tech_writer.md"
 temperature = 0.5
 
 # Allowed tools — which capabilities this role has access to in chat mode.
-# Available tools: read, write, bash, search, list
-#   read    — read files and directories
-#   write   — create or overwrite files
-#   bash    — execute shell commands
-#   search  — regex search across files
-#   list    — list agents, workflows, config
-tools = ["read", "write", "doc_write", "doc_index"]
+# Available tools: read, write, bash, search, code_graph, list
+#   read       — read files and directories
+#   write      — create or overwrite files
+#   bash       — execute shell commands
+#   search     — regex search across files
+#   code_graph — 预建符号索引（函数/结构体/调用），一次调用拿回整个目录的
+#                签名 + 行号
+#   list       — list agents, workflows, config
+#
+# `code_graph` / `search` 是 2026-09-07 补的：写手要核对源码引用，此前
+# 只能靠 bash 的 grep/sed 硬凑（实测一个子会话 50 次 bash 全在做取证，
+# 1.09M 输入 token）。一次 code_graph 抵几十次 grep。
+tools = ["read", "write", "search", "code_graph", "doc_write", "doc_index"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "📝"

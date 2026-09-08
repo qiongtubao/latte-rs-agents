@@ -2308,6 +2308,24 @@ select {
   border-radius: 4px;
 }
 
+/* 多题弹框：一个卡片 N 道题，全部答完才能提交。 */
+.choice-card.multi-q .choice-questions {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin: 8px 0;
+}
+.choice-card.multi-q .choice-q-block {
+  border-left: 3px solid #cbd5e1;
+  padding-left: 10px;
+}
+.choice-card.multi-q .choice-q-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
 /* ─── Workflows 面板（详见 ui/src/workflows_panel.ts） ─────────────── */
 
 .workflow-steps {
@@ -2321,6 +2339,37 @@ select {
   border-radius: 8px;
   padding: 10px 12px;
   background: #f8fafc;
+}
+
+/* 只读门禁摘要：与可编辑字段在视觉上分开，避免被当成能改的表单项。 */
+.workflow-step-gates {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 3px solid #94a3b8;
+  background: #f1f5f9;
+  border-radius: 0 4px 4px 0;
+}
+.workflow-gates-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 0.85em;
+  color: #334155;
+  line-height: 1.5;
+}
+.workflow-gates-list li {
+  margin: 2px 0;
+}
+.workflow-gates-empty {
+  /* 「无门禁」用中性色，不是警告 —— 很多 step 本来就不需要门禁。 */
+  color: #475569;
+  background: #e2e8f0;
+}
+.workflow-trial-note {
+  /* 试运行与正式跑行为不一致，这条必须显眼。 */
+  flex-basis: 100%;
 }
 .workflow-step-head {
   display: flex;

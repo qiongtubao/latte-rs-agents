@@ -180,6 +180,10 @@ pub(crate) async fn chat_send(
 pub(crate) struct ChoiceAnswerRequest {
     choice_id: String,
     answer: String,
+    /// 多题弹框：这个答案属于哪一道题（`ChoiceQuestion.id`，如 `q2`）。
+    /// 缺省 = 单题形态，行为与改造前逐字一致。
+    #[serde(default)]
+    question_id: Option<String>,
 }
 
 pub(crate) async fn chat_choice_answer(
@@ -187,9 +191,19 @@ pub(crate) async fn chat_choice_answer(
     Json(req): Json<ChoiceAnswerRequest>,
 ) -> StatusCode {
     use api::ChoiceAnswerOutcome as O;
-    match api::deliver_choice_answer(&state.backend, &req.choice_id, req.answer).await {
+    match api::deliver_choice_answer_for(
+        &state.backend,
+        &req.choice_id,
+        req.question_id.as_deref(),
+        req.answer,
+    )
+    .await
+    {
         // 直达活着的等待方，或答案已落 checkpoint + 断点续跑已拉起。
         O::DeliveredLive | O::DeliveredViaResume => StatusCode::OK,
+        // 多题：这一题收下了，还在等其余题。202 让前端知道"已接受但
+        // 未完成"，不要按 404 降级成普通消息（那会让答案走错通道）。
+        O::PartiallyCollected => StatusCode::ACCEPTED,
         // 既没有等待方也没有可恢复的落盘记录 → 前端降级成普通消息。
         O::NotFound => StatusCode::NOT_FOUND,
         // 记录有效但续跑起不来（workflow 定义被删等）。答案已经在

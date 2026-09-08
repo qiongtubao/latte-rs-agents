@@ -57,6 +57,20 @@ pub struct StepForm {
     pub prompt: String,
     #[serde(default)]
     pub output_key: Option<String>,
+    /// **只读**的门禁摘要：契约、返工回环、取证要求。
+    ///
+    /// 表单编辑器不支持编辑这些字段（保存走 TOML 原文，见
+    /// `PUT /api/workflows/:name/toml`），但必须**看得见** —— 它们决定
+    /// "产出合格与否、要不要返工"，看不见就会像 2026-09-07 jemalloc 会话
+    /// 那样：`learn.toml` 的 verify 步把 `require = ["KIND","PASS","FAIL"]`
+    /// 写成了 AND 语义（任务书写的是"输出 PASS **或** FAIL"），这条契约
+    /// 100% 不可能满足、每次都靠 advisor 兜底放行，而在 UI 上完全看不出
+    /// 有这么一道门。
+    ///
+    /// 反序列化时忽略（`skip_deserializing`）：请求体里带不带都不影响，
+    /// 也不会被误当成可写字段。
+    #[serde(default, skip_deserializing)]
+    pub gates: Vec<String>,
 }
 
 /// 新建/更新/校验的请求体（也是 detail 响应的表单部分）。
@@ -129,6 +143,78 @@ pub fn exists(cwd: &Path, name: &str) -> bool {
 
 // ─── Form <-> Def mapping ─────────────────────────────────────────
 
+/// 把一个 step 的门禁配置摘成人能读的短行，供表单 Tab 只读展示。
+/// 空 = 这一步没有任何门禁（产出不校验、不返工）。
+fn step_gate_summary(s: &WorkflowStepDef) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let c = &s.output_contract;
+    if let Some(n) = c.min_chars {
+        out.push(format!("产出至少 {n} 字符"));
+    }
+    if let Some(n) = c.max_chars {
+        out.push(format!("产出最多 {n} 字符"));
+    }
+    if !c.require.is_empty() {
+        out.push(format!(
+            "必须**全部**包含（AND）：{}",
+            c.require.join(" / ")
+        ));
+    }
+    if !c.require_any.is_empty() {
+        out.push(format!(
+            "必须包含其中**任一**（OR）：{}",
+            c.require_any.join(" / ")
+        ));
+    }
+    if !c.forbid.is_empty() {
+        out.push(format!("禁止出现：{}", c.forbid.join(" / ")));
+    }
+    if !c.last_line_prefix_any.is_empty() {
+        out.push(format!(
+            "末行需以其一开头：{}",
+            c.last_line_prefix_any.join(" / ")
+        ));
+    }
+    if !s.require_tools.is_empty() {
+        out.push(format!("本步必须调用过（AND）：{}", s.require_tools.join(" / ")));
+    }
+    if !s.require_tools_any.is_empty() {
+        out.push(format!(
+            "本步必须调用过其一（OR）：{}",
+            s.require_tools_any.join(" / ")
+        ));
+    }
+    if s.require_plan_tasks {
+        out.push("任务清单 JSON 机械校验（路径存在性 / 重叠 / 类型名）".into());
+    }
+    if s.require_plan_submit {
+        out.push("本步必须真的提交 plan".into());
+    }
+    if s.require_symbols_resolvable {
+        out.push("反引号里的代码符号必须在仓库中可解析".into());
+    }
+    if let Some(cond) = &s.loop_until {
+        let target = s.loop_back_to.as_deref().unwrap_or(&s.id);
+        let max = s.max_iterations.unwrap_or(3).min(10);
+        out.push(format!(
+            "返工环：产出不含「{cond}」→ 跳回 '{target}' 重做，最多 {max} 轮"
+        ));
+    }
+    if let Some(m) = &s.loop_abort_on {
+        out.push(format!("产出含「{m}」→ 直接终止整个 workflow"));
+    }
+    if let Some(m) = &s.loop_no_release_on {
+        out.push(format!("产出含「{m}」→ 迭代耗尽时禁止 advisor 复核放行"));
+    }
+    if s.max_retries > 0 {
+        out.push(format!("契约不合格可重试 {} 次", s.max_retries));
+    }
+    if !s.tools.is_empty() {
+        out.push(format!("本步工具收窄为：{}", s.tools.join(" / ")));
+    }
+    out
+}
+
 fn step_to_form(s: &WorkflowStepDef) -> StepForm {
     StepForm {
         id: s.id.clone(),
@@ -137,6 +223,7 @@ fn step_to_form(s: &WorkflowStepDef) -> StepForm {
         speakers: s.roles(),
         prompt: s.task_text().to_string(),
         output_key: s.output_key.clone(),
+        gates: step_gate_summary(s),
     }
 }
 
@@ -623,6 +710,7 @@ mod tests {
                 speakers,
                 prompt: prompt.into(),
                 output_key: None,
+                gates: Vec::new(),
             }],
             command: None,
         }
@@ -676,6 +764,7 @@ mod tests {
                     speakers: vec!["pm".into()],
                     prompt: "draft {{topic}}".into(),
                     output_key: Some("draft".into()),
+                    gates: Vec::new(),
                 },
                 StepForm {
                     id: "b".into(),
@@ -683,6 +772,7 @@ mod tests {
                     speakers: vec!["pm".into()],
                     prompt: "refine {{draft}} with {{missing}}".into(),
                     output_key: Some("draft".into()),
+                    gates: Vec::new(),
                 },
             ],
             command: None,
@@ -782,4 +872,78 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// 门禁摘要必须把「AND 语义的 require」和「OR 语义的 require_any」
+    /// 区分显示出来 —— 这正是 2026-09-07 jemalloc 会话踩的坑：
+    /// `learn.toml` 的 verify 步写了 `require = ["KIND","PASS","FAIL"]`
+    /// （AND），而任务书要的是「输出 PASS **或** FAIL」，于是这条契约
+    /// 100% 不可能满足、每次靠 advisor 兜底放行，UI 上却看不出有这道门。
+    #[test]
+    fn gate_summary_distinguishes_and_from_or_and_shows_rework_loop() {
+        let raw = r#"
+name = "wf"
+[[steps]]
+id = "verify"
+speakers = ["reviewer", "programmer"]
+task = "校验"
+loop_until = "VERDICT: PASS"
+loop_back_to = "write"
+max_iterations = 2
+require_tools_any = ["read", "search"]
+require_symbols_resolvable = true
+[steps.output_contract]
+min_chars = 50
+require_any = ["VERDICT: PASS", "VERDICT: FAIL"]
+"#;
+        let wf: latte_agent_core::workflow::WorkflowDef = toml::from_str(raw).unwrap();
+        let gates = step_gate_summary(&wf.steps[0]);
+        let joined = gates.join(" | ");
+        assert!(joined.contains("任一"), "OR 语义要标明: {joined}");
+        assert!(joined.contains("VERDICT: PASS"), "{joined}");
+        assert!(joined.contains("至少 50 字符"), "{joined}");
+        assert!(
+            joined.contains("跳回 'write'") && joined.contains("最多 2 轮"),
+            "返工环要写清跳哪一步、最多几轮: {joined}"
+        );
+        assert!(joined.contains("其一（OR）：read / search"), "取证要求: {joined}");
+        assert!(joined.contains("符号必须"), "符号可解析要求: {joined}");
+
+        // AND 语义要显式标 AND，别和 OR 混淆。
+        let and_raw = r#"
+name = "wf"
+[[steps]]
+id = "v"
+task = "t"
+[steps.output_contract]
+require = ["KIND", "PASS", "FAIL"]
+"#;
+        let wf2: latte_agent_core::workflow::WorkflowDef = toml::from_str(and_raw).unwrap();
+        let g2 = step_gate_summary(&wf2.steps[0]).join(" | ");
+        assert!(g2.contains("全部"), "AND 语义要标明「全部」: {g2}");
+        assert!(g2.contains("AND"), "{g2}");
+        assert!(g2.contains("KIND / PASS / FAIL"), "{g2}");
+    }
+
+    /// 没有任何门禁的 step → 空列表（前端据此显示「不校验、不返工」）。
+    #[test]
+    fn gate_summary_is_empty_when_step_has_no_gates() {
+        let raw = r#"
+name = "wf"
+[[steps]]
+id = "plain"
+task = "做点事"
+"#;
+        let wf: latte_agent_core::workflow::WorkflowDef = toml::from_str(raw).unwrap();
+        assert!(step_gate_summary(&wf.steps[0]).is_empty());
+    }
+
+    /// `gates` 是只读的：反序列化时忽略，请求体里带了也不会被当成可写字段。
+    #[test]
+    fn gates_field_is_ignored_on_deserialize() {
+        let json = r#"{"id":"s","description":"","speakers":[],"prompt":"p",
+                       "output_key":null,"gates":["伪造的门禁"]}"#;
+        let f: StepForm = serde_json::from_str(json).unwrap();
+        assert!(f.gates.is_empty(), "gates 不该从请求体读入: {:?}", f.gates);
+        assert_eq!(f.id, "s");
+    }
+
 }

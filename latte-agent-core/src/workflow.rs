@@ -63,7 +63,7 @@ impl WorkflowDef {
 /// 引擎用 [`check_output_contract`] 校验，不合格则带批注重试（最多
 /// `max_retries` 次），重试耗尽 → step 失败。全部默认（空契约）时
 /// 恒合格，等价于不校验。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OutputContract {
     /// 产出最少字符数（防"一句话敷衍"）。
@@ -3201,12 +3201,16 @@ fn degrade_partial_on_break(
     if crate::controller::is_empty_output(&stripped) {
         return None;
     }
-    // `strip_think_blocks` 有个刻意的兜底：剥完为空时返回**原文**
-    // （controller.rs:126-128），于是「只有思维链、没有正式回答」的
-    // partial 剥完仍非空。正常收尾的回复走这条兜底无妨，但降级采纳不行
-    // ——把裸思维链写进 vars 穿给下游评审，比判失败更糟。用「剥完仍带
-    // <think>」判定兜底已触发。
-    if stripped.contains("<think>") {
+    // `strip_think_blocks` 有个刻意的兜底：剥完为空时返回**原文**，
+    // 于是「只有思维链、没有正式回答」的 partial 剥完仍非空。正常收尾的
+    // 回复走这条兜底无妨，但降级采纳不行——把裸思维链写进 vars 穿给下游
+    // 评审，比判失败更糟。
+    //
+    // 判定改用 `is_only_think_blocks`：此前这里写的是
+    // `stripped.contains("<think>")`，只认得裸 `<think>`，漏掉厂商带
+    // 命名空间前缀的 `<mm:think>`（实测 MiniMax-M3 会吐这种），于是那类
+    // 裸思维链会被当成中间结论穿下去。
+    if crate::controller::is_only_think_blocks(partial) {
         return None;
     }
     let notice = format!(
@@ -5498,30 +5502,154 @@ prompt = "x"
     /// 白改了，第二次是本次的并发重排"没生效"（实际跑的是旧文件）。
     ///
     /// 这条测试只钉住 step 拓扑一致，不逐字比对（两份的注释可以不同）。
+    ///
+    /// 第三次踩坑（2026-09-07 jemalloc 会话）促成两处加强：
+    /// ① 名单从 3 个硬编码 workflow 改为**遍历权威目录**——`learn` 不在
+    ///    旧名单里，于是它的项目副本停在 8/31、比权威版少了整段取证顺序
+    ///    与停止条件指引，漂移无人发现；
+    /// ② 拓扑之外**同时钉住门禁字段**（`output_contract` / `loop_until` /
+    ///    `loop_back_to` / `max_iterations`）。这些字段决定"产出合格与否、
+    ///    要不要返工"，拓扑相同而门禁不同的两份副本是两套完全不同的行为，
+    ///    而旧测试对此完全免疫。
     #[test]
     fn workflow_copies_do_not_drift() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        for name in ["design_brainstorm", "design_and_plan", "explore"] {
-            let authoritative = root.join(format!("config/workflows/{name}.toml"));
+        let auth_dir = root.join("config/workflows");
+        let entries = std::fs::read_dir(&auth_dir).expect("config/workflows 必须存在");
+        let mut compared = 0usize;
+        for e in entries.flatten() {
+            let authoritative = e.path();
+            if authoritative.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let Some(name) = authoritative.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let project = root.join(format!(".latte/workflows.d/{name}.toml"));
             let (Ok(a), Ok(b)) = (
                 std::fs::read_to_string(&authoritative),
                 std::fs::read_to_string(&project),
             ) else {
-                continue; // 某一份不存在就不比
+                continue; // 项目层没有这一份就不比（不是所有 workflow 都有副本）
             };
-            let ids = |raw: &str| -> Vec<String> {
+            let parse = |raw: &str, which: &str| -> WorkflowDef {
                 toml::from_str::<WorkflowDef>(raw)
-                    .map(|w| w.steps.iter().map(|s| s.id.clone()).collect())
-                    .unwrap_or_default()
+                    .unwrap_or_else(|e| panic!("workflow '{name}' 的 {which} 副本解析失败: {e}"))
+            };
+            let (wa, wb) = (parse(&a, "config/workflows"), parse(&b, ".latte/workflows.d"));
+            let ids = |w: &WorkflowDef| -> Vec<String> {
+                w.steps.iter().map(|s| s.id.clone()).collect()
             };
             assert_eq!(
-                ids(&a),
-                ids(&b),
+                ids(&wa),
+                ids(&wb),
                 "workflow '{name}' 的两份副本 step 拓扑不一致：\
                  config/workflows/ 是权威版，改完必须同步到 .latte/workflows.d/\
                  （否则运行时加载的是后者，改动静默失效）"
             );
+            // 门禁字段（决定放行/返工/取证下限）逐 step 比对。
+            //
+            // 覆盖面要包含 `require_*` 那一组：实测（2026-09-07）权威版
+            // 给 implementation_plan 的 tasks_json 加了
+            // `require_plan_tasks = true`，两份副本都没跟上，于是一份被
+            // 长度上限截断的半截 JSON 完全没被机械校验拦住，一路穿到
+            // 终审——那条硬校验本来一眼就能判死它。
+            for (sa, sb) in wa.steps.iter().zip(wb.steps.iter()) {
+                // 分两组比：Rust 元组的 PartialEq 只实现到 12 元。
+                let release = |s: &WorkflowStepDef| {
+                    (
+                        s.output_contract.clone(),
+                        s.loop_until.clone(),
+                        s.loop_back_to.clone(),
+                        s.loop_abort_on.clone(),
+                        s.loop_no_release_on.clone(),
+                        s.max_iterations,
+                        s.max_retries,
+                    )
+                };
+                let evidence = |s: &WorkflowStepDef| {
+                    (
+                        s.require_tools.clone(),
+                        s.require_tools_any.clone(),
+                        s.require_plan_tasks,
+                        s.require_plan_submit,
+                        s.require_symbols_resolvable,
+                        s.tools.clone(),
+                    )
+                };
+                assert_eq!(
+                    release(sa),
+                    release(sb),
+                    "workflow '{name}' step '{}' 的放行门禁不一致\
+                     （output_contract / loop_* / max_*）：运行时加载的是 \
+                     .latte/workflows.d/，权威版改完必须同步过去",
+                    sa.id
+                );
+                assert_eq!(
+                    evidence(sa),
+                    evidence(sb),
+                    "workflow '{name}' step '{}' 的取证/校验门禁不一致\
+                     （require_* / tools）：运行时加载的是 .latte/workflows.d/，\
+                     权威版改完必须同步过去",
+                    sa.id
+                );
+            }
+            compared += 1;
+        }
+        assert!(
+            compared > 0,
+            "一份副本都没比到——路径约定可能变了，这条测试已失去意义"
+        );
+    }
+
+    /// `require` 是 **AND** 语义（每一项都必须出现），OR 语义的字段是
+    /// `require_any`。把"输出 A 或 B"的判据写进 `require` 会得到一条
+    /// **永远无法满足**的契约，而契约是**逐 speaker** 校验的，症状是每次
+    /// 都掉进 advisor 语义兜底放行，把关实际失效。
+    ///
+    /// 实测实锤（2026-09-07 jemalloc 会话，`learn.toml` verify 步）：
+    /// `require = ["KIND", "PASS", "FAIL"]` 要求同一段产出里同时出现 PASS
+    /// 和 FAIL，任务书写的却是"输出 PASS **或** FAIL"。两条 learn 流水线
+    /// 全程靠 advisor 放行，其中一次 advisor 自己 90s 超时"未审直接放行"
+    /// ——机械契约与语义复核两道关同时失效。
+    ///
+    /// 这条测试钉住"互斥判据不许进 require"这一类错误：同一个 `require`
+    /// 列表里若出现 ≥2 个公认互斥的裁决词，即判失败。
+    #[test]
+    fn contracts_do_not_require_mutually_exclusive_verdicts() {
+        /// 互斥裁决词分组：同组内 ≥2 个同时出现在一个 `require` 里 = 笔误。
+        const EXCLUSIVE: &[&[&str]] = &[
+            &["PASS", "FAIL"],
+            &["ACCEPT", "REJECT"],
+            &["APPROVE", "REJECT"],
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/workflows");
+        let entries = std::fs::read_dir(&dir).expect("config/workflows 必须存在");
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let Ok(wf) = toml::from_str::<WorkflowDef>(&raw) else { continue };
+            for step in &wf.steps {
+                let req = &step.output_contract.require;
+                for group in EXCLUSIVE {
+                    let hits: Vec<&str> = group
+                        .iter()
+                        .copied()
+                        .filter(|w| req.iter().any(|p| p.contains(w)))
+                        .collect();
+                    assert!(
+                        hits.len() < 2,
+                        "{} 的 step '{}' 把互斥裁决词 {hits:?} 放进了 AND 语义的 \
+                         `require`（= 永不满足的契约，每次靠 advisor 兜底放行）。\
+                         OR 语义请改用 `require_any`。当前 require = {req:?}",
+                        path.display(),
+                        step.id
+                    );
+                }
+            }
         }
     }
 
@@ -7629,6 +7757,8 @@ mod contract_engine_tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -9185,6 +9315,8 @@ mod resume_tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -10814,6 +10946,8 @@ mod loop_tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,

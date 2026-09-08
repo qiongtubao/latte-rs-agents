@@ -1255,6 +1255,120 @@ fn compact_middle_out_chars(text: &str, max_chars: usize) -> String {
 /// 一旦因此撑爆模型上下文，恢复重试前靠它把超长消息压成头 + 尾 + 标记。
 const OVERSIZED_MSG_CHARS: usize = 8_000;
 
+/// 一个 turn 内**保留逐字原文**的最近工具结果条数。更早的结果压成
+/// 头 + 尾 + 标记（[`STALE_TOOL_RESULT_CHARS`]）。
+const CONTEXT_KEEP_RECENT_TOOL_RESULTS: usize = 6;
+
+/// 被判定为"陈旧"的工具结果压缩后的字符预算。留头留尾而不是换成一句
+/// 占位符：模型要能从头部认出"这个文件我已经读过了"，否则会重新读一遍，
+/// 省下的往返又还回去了。
+///
+/// 默认取值偏保守（900 = 头 540 + 尾 360）：压得越狠省得越多，但模型
+/// 认不出读过什么就会重读，一次重读的代价是**一整轮往返**（含重传全部
+/// 历史），比多留几百字符贵得多。`LATTE_AGENT_CONTEXT_STALE_CHARS` 可调。
+const STALE_TOOL_RESULT_CHARS: usize = 900;
+
+/// 陈旧工具结果**低于**这个字符数就不动它——压缩的收益还不够抵消
+/// 标记本身的开销，而且小结果多是简短的成功/失败回执，留着最有用。
+/// 运行时门槛是 `context_stale_chars() * 4 / 3`（至少要能省下 1/3）；
+/// 本常量是默认预算下的取值（900 * 4/3 = 1200）。
+const STALE_TOOL_RESULT_FLOOR: usize = 1_200;
+
+/// 主动压缩：`LATTE_AGENT_CONTEXT_COMPACT` 设 `0`/`false`/`no`/`off` 关闭
+/// （默认开）。关掉即退回"每轮重传全部工具结果原文"的旧行为。
+fn context_compact_enabled() -> bool {
+    !matches!(
+        std::env::var("LATTE_AGENT_CONTEXT_COMPACT")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// 保留逐字的最近工具结果条数，`LATTE_AGENT_CONTEXT_KEEP_RECENT` 可调，
+/// 钳在 `1..=64`（0 会把当轮刚拿到的结果也压掉，模型立刻失去判断依据）。
+fn context_keep_recent() -> usize {
+    std::env::var("LATTE_AGENT_CONTEXT_KEEP_RECENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(CONTEXT_KEEP_RECENT_TOOL_RESULTS)
+        .clamp(1, 64)
+}
+
+/// 陈旧工具结果的压缩预算（字符），`LATTE_AGENT_CONTEXT_STALE_CHARS` 可调，
+/// 钳在 `200..=8000`。调小省得更多但模型更容易认不出读过什么而重读；
+/// 调大更安全但收益递减。
+fn context_stale_chars() -> usize {
+    std::env::var("LATTE_AGENT_CONTEXT_STALE_CHARS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(STALE_TOOL_RESULT_CHARS)
+        .clamp(200, 8_000)
+}
+
+/// 把本轮待发列表里**陈旧的**工具结果压成头 + 尾 + 标记，返回被压缩的
+/// 条数。只动 `Role::Tool` 消息的文本，**绝不删消息**。
+///
+/// # 为什么需要它
+///
+/// 工具循环每一轮都把"到目前为止的全部对话"重新发一遍，于是第 N 轮要
+/// 重传前 N-1 轮所有工具结果的原文。实测（2026-09-07 jemalloc 会话）：
+/// 一个 reviewer 子会话 70 次工具调用，返回内容合计只有 188,498 字符
+/// （≈47K token），而那一个 turn 消耗了 **1,795,762 输入 token** —— 38 倍。
+/// 整个会话 22.19M 输入 token 里，工具返回的唯一内容仅 ≈0.97M，放大 23 倍。
+/// 真正付钱的不是"读得多"，是"读完反复重传"。
+///
+/// # 为什么只压不删
+///
+/// 每个 `tool_call` 必须有 id 对得上的 `tool_result`，删一条就破坏配对、
+/// 请求直接被 provider 拒。压缩文本不动结构，与既有的
+/// [`slim_oversized_messages`]（超窗恢复路径）同一套做法。
+///
+/// # 为什么留头留尾
+///
+/// 换成"[已折叠]"这类占位符会让模型认不出自己读过什么，转头重新读一遍
+/// ——省下的往返又还回去了，还可能撞上死循环熔断。留头能认出文件/符号，
+/// 留尾能保住 `read` 的结构摘要 footer、`code_graph` 的"怎么收窄"提示、
+/// 批量读的 `failed` 清单这些出口信息。
+///
+/// 工具结果本就不入持久 context（见 [`slim_oversized_messages`]），因此
+/// 压缩只影响这一次待发 payload，会话记录与 trace 落盘均不受影响。
+fn compact_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> usize {
+    let budget = context_stale_chars();
+    // 至少要能省下 1/3 才值得动它（预算的 4/3）。默认 900 → 门槛 1200，
+    // 与 [`STALE_TOOL_RESULT_FLOOR`] 一致。
+    let floor = budget * 4 / 3;
+    // 先定位所有工具结果的下标，末尾 keep_recent 条豁免。
+    let tool_idx: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::Tool)
+        .map(|(i, _)| i)
+        .collect();
+    if tool_idx.len() <= keep_recent {
+        return 0;
+    }
+    let stale = &tool_idx[..tool_idx.len() - keep_recent];
+    let mut compacted = 0usize;
+    for &i in stale {
+        let mut touched = false;
+        for part in messages[i].content.iter_mut() {
+            if let ContentPart::Text { text } = part {
+                if text.chars().count() > floor {
+                    *text = compact_middle_out_chars(text, budget);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            compacted += 1;
+        }
+    }
+    compacted
+}
+
 /// 原地裁剪消息列表中超过 [`OVERSIZED_MSG_CHARS`] 的文本 part（system
 /// 消息除外），返回被裁剪的消息条数。只作用于本 turn 的待发
 /// payload——工具结果本就不入持久 context，会话记录不受损。
@@ -2661,6 +2775,9 @@ impl AgentRunner {
         let mut total_thinking: u32 = 0;
         // 悬挂工具标记的卫生重试计数（每 turn 至多 1 次）。
         let mut markup_retried: u8 = 0;
+        // 正文撞长度上限后的重试次数（同 markup_retried：只重试一次，
+        // 避免"每次都被截断"变成死循环）。
+        let mut length_retried: u8 = 0;
 
         // 死循环探测器：**整个 turn 共用一个**，streak 跨 round 累积。
         //
@@ -2732,6 +2849,22 @@ impl AgentRunner {
                 }
             }
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
+            //
+            // 发请求前主动压缩陈旧工具结果：工具循环每轮都重传全部历史，
+            // 第 N 轮要把前 N-1 轮的工具结果原文再发一遍。实测一个
+            // reviewer 子会话 70 次调用、返回内容合计 47K token，那个 turn
+            // 却烧了 1.79M 输入 token（38 倍）。只压文本不删消息，保住
+            // tool_call ↔ tool_result 的 id 配对。
+            if round > 0 && context_compact_enabled() {
+                let n = compact_stale_tool_results(&mut messages, context_keep_recent());
+                if n > 0 {
+                    tracing::debug!(
+                        round,
+                        compacted = n,
+                        "compacted stale tool results before model call"
+                    );
+                }
+            }
             let chat_start = Instant::now();
             // native function-calling：tool schema 经 GenerateParams.tools 下发。
             // 文本 `<tool_call>` 协议已移除，不再有降级路径。
@@ -3021,6 +3154,61 @@ impl AgentRunner {
             });
 
             if tool_calls.is_empty() {
+                // 产出被长度上限截断、且这一轮**没有工具调用**——也就是
+                // 这半截正文就要作为最终答复返回了。
+                //
+                // 修的 bug（实测实锤：2026-09-07 jemalloc 会话
+                // `wf-implementation_plan-1788718876052941`）：architect 在
+                // tasks_json 步撞上 8192 token 上限，`finish_reason=length`，
+                // 正文停在 `…large（大对象直连 extent）、` —— 半个 JSON。
+                // 引擎不看 finish_reason，把它当正常产出穿给下游终审；
+                // 终审连着三轮 REJECT，理由都是「JSON 在 T2c 处被截断」，
+                // max_iterations 耗尽后整条 20 分钟的流水线判 failed。
+                // 更糟的是**返工无效**：gate 跳回 breakdown 重拆，而反馈里
+                // 只说「JSON 不完整」、没说「你被长度上限掐断了」，于是
+                // 模型又写一份同样长的清单、又被掐断，三轮空转。
+                //
+                // 对策与上面的悬挂标记同形：重试一次，并且把**真实原因和
+                // 可执行对策**讲明（不是「重写一遍」，而是「压缩到能装下」）。
+                // 仍被截断则照收，但在正文末尾留一条显式标记，让人、
+                // 下游评审与 workflow 契约都能看见——最坏情况下也不再是
+                // 静默采纳。
+                if length_retried == 0 && output_truncated {
+                    length_retried += 1;
+                    tracing::warn!(
+                        stop_reason = %completion.stop_reason,
+                        chars = final_response.chars().count(),
+                        "final response hit the output length limit; retrying once with a compression instruction"
+                    );
+                    messages.push(Message::assistant(final_response.clone()));
+                    messages.push(Message::user(format!(
+                        "你上一条回复撞上了输出长度上限（finish_reason={}），\
+                         正文在 {} 字符处被强行截断、内容不完整（结构化产出会是半截 \
+                         JSON，下游无法使用）。\n\n\
+                         不要原样重写——同样的长度必然再次被截断。请压缩到能一次装下：\
+                         减少条目数量（宁少勿缺）、精简每条的长文本字段、\
+                         去掉解释性前言与重复表述，只保留要求的那部分内容。\
+                         若信息量确实装不下一条回复，先输出**完整且自洽**的一部分，\
+                         并在结尾明确说明还缺哪些、需要后续补充。",
+                        completion.stop_reason,
+                        final_response.chars().count()
+                    )));
+                    continue;
+                }
+                if output_truncated {
+                    // 重试后仍被截断：照收，但绝不静默。
+                    final_response.push_str(&format!(
+                        "\n\n⚠️ [产出被截断] 本回复撞上模型输出长度上限\
+                         （finish_reason={}，已重试 1 次仍未装下），\
+                         上面的内容**不完整**，结构化数据（JSON/清单）很可能缺尾。\
+                         下游请勿当作完整产出使用。",
+                        completion.stop_reason
+                    ));
+                    tracing::warn!(
+                        stop_reason = %completion.stop_reason,
+                        "final response still truncated after retry; annotated the payload"
+                    );
+                }
                 // 产出卫生：最终答复尾部带悬挂工具标记（native
                 // function-calling 下 `</parameter>`/`</function>` 等
                 // 只会是模型泄漏的垃圾，且正文常断在半句——glm-5.2 在
@@ -4268,6 +4456,16 @@ fn is_relative_fs_path(s: &str) -> bool {
     {
         return false;
     }
+    // 字符串化的 JSON 数组不是路径：模型想批量读时会把
+    // `["a.c:1-40", "b.h"]` 整个塞进 `path`（实测 architect / MiniMax-M3）。
+    // 若在这里被当成相对路径拼上 cwd，就变成
+    // `/Users/…/jemalloc/["a.c:1-40", …]` —— 开头的 `[` 不在首位了，
+    // 下游 `normalize_read_path_args` 的"字符串化数组 → paths"归一化
+    // 认不出它，于是报一个莫名的 "No such file or directory"，模型看不懂
+    // 也改不对，白烧一整轮往返。
+    if s.trim_start().starts_with('[') {
+        return false;
+    }
     // Windows drive: "C:\" / "C:/"
     if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
     {
@@ -4439,6 +4637,8 @@ mod tests {
             api_key: "test-key".into(),
             context_window: 32000,
             max_tokens: 4096,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,
@@ -4448,6 +4648,36 @@ mod tests {
     }
 
     // ── resolve_tool_input_against_cwd / is_relative_fs_path ─────────────
+
+    /// 字符串化的 JSON 数组**不是**相对路径：模型想批量读时会把
+    /// `["a.c:1-40","b.h"]` 整个塞进 `path`。若被当成相对路径拼上 cwd，
+    /// 就变成 `/Users/…/proj/["a.c:1-40",…]` —— 开头的 `[` 不在首位，
+    /// 下游 `normalize_read_path_args` 的"字符串化数组 → paths"归一化认不
+    /// 出它，于是报一个莫名的 not-found，模型看不懂也改不对。
+    ///
+    /// 回归 2026-09-07 jemalloc 会话（architect / MiniMax-M3）实测形态：
+    /// `path='/Users/zhouguodong/Documents/github/jemalloc/["/Users/…/a.md:1-40", …]'`
+    #[test]
+    fn json_array_in_path_is_not_treated_as_a_relative_path() {
+        assert!(!is_relative_fs_path(r#"["a.c:1-40", "b.h"]"#));
+        assert!(!is_relative_fs_path(r#"  ["a.c"]"#), "前置空白也要认");
+        // 仍然是相对路径的形状不受影响
+        assert!(is_relative_fs_path("src/foo.rs"));
+        assert!(is_relative_fs_path("a.c"));
+        // 方括号出现在中间不算（真实文件名可以带方括号）
+        assert!(is_relative_fs_path("docs/note[1].md"));
+
+        let cwd = std::path::Path::new("/tmp/proj");
+        let out = resolve_tool_input_against_cwd(
+            serde_json::json!({ "path": r#"["a.c", "b.h"]"# }),
+            cwd,
+        );
+        assert_eq!(
+            out["path"].as_str().unwrap(),
+            r#"["a.c", "b.h"]"#,
+            "不得被拼上 cwd，否则下游归一化认不出"
+        );
+    }
 
     #[test]
     fn relative_path_args_are_joined_onto_cwd() {
@@ -4711,6 +4941,342 @@ mod tests {
         assert_eq!(tail.chars().count(), OVERSIZED_MSG_CHARS * 4 / 10, "尾部预算 40%");
     }
 
+    // ─── compact_stale_tool_results tests ───────────────────────────
+    //
+    // 回归 2026-09-07 jemalloc 会话的 token 放大：工具循环每轮重传全部
+    // 历史，一个 reviewer 子会话 70 次调用（返回内容合计 ≈47K token）
+    // 烧掉 1.79M 输入 token；整场 22.19M 里唯一内容仅 ≈0.97M（23 倍）。
+
+    /// 只压陈旧的、只压大的；最近 N 条与小结果一律不动。
+    #[test]
+    fn compact_stale_tool_results_keeps_recent_and_small_verbatim() {
+        use latte_ai::models::Role as MsgRole;
+        let big = "A".repeat(STALE_TOOL_RESULT_FLOOR * 3);
+        let small = "ok".repeat(10);
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("go"),
+            Message::tool_result("t1", &big), // 陈旧 + 大 → 压
+            Message::tool_result("t2", &small), // 陈旧但小 → 不动
+            Message::tool_result("t3", &big), // 陈旧 + 大 → 压
+            Message::tool_result("t4", &big), // 最近 2 条 → 不动
+            Message::tool_result("t5", &big),
+        ];
+        let n = compact_stale_tool_results(&mut msgs, 2);
+        assert_eq!(n, 2, "只有 t1/t3 该被压缩");
+
+        assert_eq!(msgs[0].as_text(), "sys", "system 不动");
+        assert_eq!(msgs[1].as_text(), "go", "user 不动");
+        assert!(msgs[2].as_text().contains("中段省略"), "t1 应被压缩");
+        assert!(
+            msgs[2].as_text().chars().count() <= STALE_TOOL_RESULT_CHARS + 60,
+            "{}",
+            msgs[2].as_text().chars().count()
+        );
+        assert_eq!(msgs[3].as_text(), small, "小结果保持逐字");
+        assert!(msgs[4].as_text().contains("中段省略"), "t3 应被压缩");
+        assert_eq!(msgs[5].as_text(), big, "最近 2 条保持逐字");
+        assert_eq!(msgs[6].as_text(), big, "最近 2 条保持逐字");
+        // 消息条数与角色顺序不变 —— tool_call ↔ tool_result 的配对不能破。
+        assert_eq!(msgs.len(), 7);
+        assert_eq!(
+            msgs.iter().filter(|m| m.role == MsgRole::Tool).count(),
+            5,
+            "绝不删消息，否则 provider 因 tool_call 无配对结果直接拒请求"
+        );
+    }
+
+    /// 压缩必须**留头留尾**：换成占位符会让模型认不出读过什么，转头
+    /// 重读一遍，省下的往返又还回去。
+    #[test]
+    fn compact_stale_tool_results_preserves_head_and_tail() {
+        let body = format!(
+            "src/jemalloc.c:2743 起是 je_malloc 的快路径{}结构摘要：共 4476 行，顶层 87 个函数",
+            "填充".repeat(STALE_TOOL_RESULT_FLOOR)
+        );
+        let mut msgs = vec![
+            Message::tool_result("t1", &body),
+            Message::tool_result("t2", "recent"),
+        ];
+        assert_eq!(compact_stale_tool_results(&mut msgs, 1), 1);
+        let out = msgs[0].as_text();
+        assert!(
+            out.starts_with("src/jemalloc.c:2743"),
+            "头部要留，模型才认得出这是哪份产出: {}",
+            out.chars().take(60).collect::<String>()
+        );
+        assert!(
+            out.ends_with("结构摘要：共 4476 行，顶层 87 个函数"),
+            "尾部要留（read 的结构摘要 / code_graph 的收窄提示都在末尾）: {}",
+            out.chars().rev().take(40).collect::<String>()
+        );
+    }
+
+    /// 幂等：已压过的消息再压一次不变（工具循环每轮都会调它）。
+    #[test]
+    fn compact_stale_tool_results_is_idempotent() {
+        let mut msgs = vec![
+            Message::tool_result("t1", "B".repeat(STALE_TOOL_RESULT_FLOOR * 5)),
+            Message::tool_result("t2", "recent"),
+        ];
+        assert_eq!(compact_stale_tool_results(&mut msgs, 1), 1);
+        let once = msgs[0].as_text().to_string();
+        assert_eq!(
+            compact_stale_tool_results(&mut msgs, 1),
+            0,
+            "第二次不该再压（已在预算内）"
+        );
+        assert_eq!(msgs[0].as_text(), once);
+    }
+
+    /// 工具结果条数不超过 keep_recent 时什么都不做。
+    #[test]
+    fn compact_stale_tool_results_noop_when_under_threshold() {
+        let big = "C".repeat(STALE_TOOL_RESULT_FLOOR * 3);
+        let mut msgs = vec![
+            Message::user("go"),
+            Message::tool_result("t1", &big),
+            Message::tool_result("t2", &big),
+        ];
+        assert_eq!(compact_stale_tool_results(&mut msgs, 6), 0);
+        assert_eq!(msgs[1].as_text(), big);
+        assert_eq!(msgs[2].as_text(), big);
+    }
+
+    /// UTF-8 安全：压缩点落在多字节字符中间不能 panic / 产生乱码。
+    #[test]
+    fn compact_stale_tool_results_is_utf8_safe() {
+        let body = "中文内容😀".repeat(STALE_TOOL_RESULT_FLOOR);
+        let mut msgs = vec![
+            Message::tool_result("t1", &body),
+            Message::tool_result("t2", "recent"),
+        ];
+        assert_eq!(compact_stale_tool_results(&mut msgs, 1), 1);
+        let out = msgs[0].as_text();
+        assert!(out.is_char_boundary(0));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.contains("中段省略"));
+    }
+
+    /// 量化收益：按实测会话的形状（70 次调用、返回内容合计 188,498 字符）
+    /// 模拟一个 turn 的累计重传量，确认压缩确实把放大倍数打下来。
+    #[test]
+    fn compact_stale_tool_results_cuts_resend_volume() {
+        // 实测：70 次工具调用 / 188,498 字符 → 平均每条 ≈2693 字符。
+        const CALLS: usize = 70;
+        const PER_RESULT: usize = 2693;
+
+        // 模拟工具循环：第 r 轮发出的 payload = 前 r 条工具结果之和。
+        // 累计重传量 = Σ(r=1..CALLS) payload(r)。
+        let resend_total = |compact: bool| -> usize {
+            let mut msgs: Vec<Message> = vec![Message::user("go")];
+            let mut total = 0usize;
+            for i in 0..CALLS {
+                msgs.push(Message::tool_result(
+                    format!("t{i}"),
+                    "x".repeat(PER_RESULT),
+                ));
+                if compact {
+                    compact_stale_tool_results(&mut msgs, CONTEXT_KEEP_RECENT_TOOL_RESULTS);
+                }
+                total += msgs.iter().map(|m| m.as_text().chars().count()).sum::<usize>();
+            }
+            total
+        };
+
+        let before = resend_total(false);
+        let after = resend_total(true);
+        let unique = CALLS * PER_RESULT;
+        println!(
+            "唯一内容 {unique} 字符；累计重传 压缩前 {before} / 压缩后 {after}\
+             （放大 {:.1}x → {:.1}x，省 {:.0}%）",
+            before as f64 / unique as f64,
+            after as f64 / unique as f64,
+            100.0 * (1.0 - after as f64 / before as f64),
+        );
+        // 缺省参数（keep_recent=6 / budget=900）下实测省 ~55%：陈旧的每条
+        // 2693 → 900 字符，最近 6 条保持逐字，早期轮次本来就没多少可压。
+        // 这里钉一条保守下界，避免将来把预算调大到收益消失还没人发现。
+        assert!(
+            after * 2 < before,
+            "压缩后累计重传量应至少腰斩：before={before} after={after}"
+        );
+        // 压缩前的放大倍数应与实测量级吻合（那个子会话是 38x），确认这个
+        // 模拟模型没跑偏。
+        assert!(
+            before / unique >= 20,
+            "模拟的放大倍数 {}x 与实测量级不符",
+            before / unique
+        );
+    }
+
+    /// 端到端：压缩必须真的作用在**发出去的请求体**上，而不只是函数
+    /// 单测通过。让模型连发多轮工具调用，然后检查最后一次请求里早期的
+    /// 工具结果已被压缩、最近几条仍逐字。
+    #[tokio::test]
+    async fn stale_tool_results_are_compacted_in_outgoing_requests() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 每条工具结果都远超压缩门槛，便于断言。
+        const BIG: usize = STALE_TOOL_RESULT_FLOOR * 2;
+        const ROUNDS: usize = 10;
+
+        // 固定返回一大段文本的工具。
+        let make_tm = || {
+            let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+                Box::pin(async move { Ok(serde_json::json!({ "text": "Z".repeat(BIG) })) })
+            });
+            let schema = ToolInputSchema {
+                schema_type: SchemaType,
+                properties: Default::default(),
+                required: None,
+                additional_properties: None,
+                defs: None,
+            };
+            let tm = create_tool_manager();
+            tm.register(
+                Tool::builder("echo_big", "返回一大段文本", schema, handler).build(),
+                None,
+            );
+            tm
+        };
+
+        // 前 ROUNDS 次响应各发一个工具调用，最后一次不带工具调用收尾。
+        let make_server = |rounds: usize| async move {
+            let server = wiremock::MockServer::start().await;
+            for i in 0..rounds {
+                server
+                    .register(
+                        Mock::given(method("POST"))
+                            .and(path("/chat/completions"))
+                            .respond_with(ResponseTemplate::new(200).set_body_string(
+                                openai_completion_body(
+                                    "",
+                                    vec![serde_json::json!({
+                                        "id": format!("call_{i}"),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "echo_big",
+                                            "arguments": format!("{{\"n\":{i}}}")
+                                        }
+                                    })],
+                                ),
+                            ))
+                            .up_to_n_times(1),
+                    )
+                    .await;
+            }
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_string(openai_completion_body("收尾", vec![])),
+                        ),
+                )
+                .await;
+            server
+        };
+
+        std::env::remove_var("LATTE_AGENT_CONTEXT_COMPACT");
+        std::env::remove_var("LATTE_AGENT_CONTEXT_KEEP_RECENT");
+        std::env::remove_var("LATTE_AGENT_CONTEXT_STALE_CHARS");
+
+        let server = make_server(ROUNDS).await;
+        let agent = Agent::new_with_chain(
+            "compact-e2e".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, make_tm());
+        let _ = runner.run_turn(&[Message::user("连续读")], None).await.unwrap();
+
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert!(reqs.len() > CONTEXT_KEEP_RECENT_TOOL_RESULTS, "轮数要够才压得到: {}", reqs.len());
+        let last = String::from_utf8_lossy(&reqs[reqs.len() - 1].body).to_string();
+
+        assert!(
+            last.contains("中段省略"),
+            "最后一次请求应含被压缩的陈旧工具结果"
+        );
+        let verbatim = last.matches(&"Z".repeat(BIG)).count();
+        assert!(
+            verbatim <= CONTEXT_KEEP_RECENT_TOOL_RESULTS,
+            "逐字保留的大块应不超过 keep_recent={}，实际 {verbatim}",
+            CONTEXT_KEEP_RECENT_TOOL_RESULTS
+        );
+        assert!(verbatim >= 1, "最近的结果必须逐字保留，实际 {verbatim}");
+
+        // 关掉开关后行为回退：所有结果逐字重传，一处压缩都不该有。
+        std::env::set_var("LATTE_AGENT_CONTEXT_COMPACT", "0");
+        let server2 = make_server(ROUNDS).await;
+        let agent2 = Agent::new_with_chain(
+            "compact-off".into(),
+            test_role(),
+            vec![model_at(&server2, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner2 = AgentRunner::new_with_tools(agent2, make_tm());
+        let _ = runner2.run_turn(&[Message::user("连续读")], None).await.unwrap();
+        let reqs2 = server2.received_requests().await.unwrap();
+        let last2 = String::from_utf8_lossy(&reqs2[reqs2.len() - 1].body).to_string();
+        assert!(!last2.contains("中段省略"), "关闭开关后不应有任何压缩");
+        assert!(
+            last2.matches(&"Z".repeat(BIG)).count() > CONTEXT_KEEP_RECENT_TOOL_RESULTS,
+            "关闭后所有结果都该逐字重传"
+        );
+        std::env::remove_var("LATTE_AGENT_CONTEXT_COMPACT");
+    }
+
+    /// 开关：`LATTE_AGENT_CONTEXT_COMPACT=0` 关闭，`KEEP_RECENT` 可调且钳位。
+    #[test]
+    fn context_compact_env_knobs() {
+        // 该测试改进程级环境变量，与其他用例串行跑（同一测试内自己清理）。
+        std::env::remove_var("LATTE_AGENT_CONTEXT_COMPACT");
+        assert!(context_compact_enabled(), "缺省应为开");
+        for off in ["0", "false", "no", "off", "OFF", " off "] {
+            std::env::set_var("LATTE_AGENT_CONTEXT_COMPACT", off);
+            assert!(!context_compact_enabled(), "{off:?} 应关闭");
+        }
+        std::env::set_var("LATTE_AGENT_CONTEXT_COMPACT", "1");
+        assert!(context_compact_enabled());
+        std::env::remove_var("LATTE_AGENT_CONTEXT_COMPACT");
+
+        std::env::remove_var("LATTE_AGENT_CONTEXT_KEEP_RECENT");
+        assert_eq!(context_keep_recent(), CONTEXT_KEEP_RECENT_TOOL_RESULTS);
+        std::env::set_var("LATTE_AGENT_CONTEXT_KEEP_RECENT", "3");
+        assert_eq!(context_keep_recent(), 3);
+        // 0 会把当轮刚拿到的结果也压掉 → 钳到 1
+        std::env::set_var("LATTE_AGENT_CONTEXT_KEEP_RECENT", "0");
+        assert_eq!(context_keep_recent(), 1);
+        std::env::set_var("LATTE_AGENT_CONTEXT_KEEP_RECENT", "999");
+        assert_eq!(context_keep_recent(), 64);
+        std::env::set_var("LATTE_AGENT_CONTEXT_KEEP_RECENT", "不是数字");
+        assert_eq!(context_keep_recent(), CONTEXT_KEEP_RECENT_TOOL_RESULTS);
+        std::env::remove_var("LATTE_AGENT_CONTEXT_KEEP_RECENT");
+
+        std::env::remove_var("LATTE_AGENT_CONTEXT_STALE_CHARS");
+        assert_eq!(context_stale_chars(), STALE_TOOL_RESULT_CHARS);
+        // 默认预算下的压缩门槛应与常量一致（900 * 4/3 = 1200）
+        assert_eq!(context_stale_chars() * 4 / 3, STALE_TOOL_RESULT_FLOOR);
+        std::env::set_var("LATTE_AGENT_CONTEXT_STALE_CHARS", "400");
+        assert_eq!(context_stale_chars(), 400);
+        std::env::set_var("LATTE_AGENT_CONTEXT_STALE_CHARS", "10");
+        assert_eq!(context_stale_chars(), 200, "下钳到 200");
+        std::env::set_var("LATTE_AGENT_CONTEXT_STALE_CHARS", "99999");
+        assert_eq!(context_stale_chars(), 8_000, "上钳到 8000");
+        std::env::remove_var("LATTE_AGENT_CONTEXT_STALE_CHARS");
+    }
+
     /// 工具错误详情：中段省略而非截头。回归实测事故——旧实现 256 字节
     /// 截头，把 `plan` 的冲突清单（5855 字 / 45 对）和 `code_graph` 的
     /// "可用 kind：…" 修复指引都砍在尾部，模型看不全就修不动。
@@ -4908,12 +5474,107 @@ mod tests {
             api_key: "test-key".into(),
             context_window: 32000,
             max_tokens: 4096,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
             timeout_secs: None,
         }
+    }
+
+    /// 端到端：`run_turn` 真的把**模型目录里配的** `max_tokens` 发到线上。
+    ///
+    /// 这条钉的是 2026-09-07 jemalloc 会话那个 bug 的完整链路：目录里
+    /// `max_tokens = 384000`，而 529 次请求下发的全是 `None` ——
+    /// `build_openai_request` 直接透传 `Option` + `skip_serializing_if`，
+    /// 字段整个被省略，于是上限由厂商默认值说话，architect 撞上 8192 截断、
+    /// 半个 JSON 穿给下游，整条 20 分钟流水线判 failed。
+    ///
+    /// 只测 `effective_max_tokens` 不够 —— 那个 bug 恰恰不在决策逻辑里，
+    /// 而在「决策出来的值有没有真的进请求体」。所以这里从 `run_turn` 入口
+    /// 打到 mock server 收到的字节。
+    #[tokio::test]
+    async fn run_turn_sends_the_configured_max_tokens_on_the_wire() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("好", vec![])),
+                    ),
+            )
+            .await;
+
+        // 目录配 384000 —— 实测配置里的真实值
+        let mut model = model_at(&server, "stub");
+        model.max_tokens = 384_000;
+        model.context_window = 1_000_000;
+
+        let agent = Agent::new_with_chain(
+            "max-tokens-e2e".into(),
+            test_role(),
+            vec![model],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        runner.run_turn(&[Message::user("你好")], None).await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "应恰好一次请求");
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(384_000),
+            "目录里配的上限必须原样出现在请求体里（曾经这里是 None）: {body}"
+        );
+    }
+
+    /// 目录没配（`0`）时该字段**完全不出现**，而不是发 `null` 或发一个
+    /// 我们替使用者拍的数 —— 由厂商默认值说话。
+    #[tokio::test]
+    async fn run_turn_omits_max_tokens_when_catalog_leaves_it_unset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("好", vec![])),
+                    ),
+            )
+            .await;
+
+        let mut model = model_at(&server, "stub");
+        model.max_tokens = 0;
+
+        let agent = Agent::new_with_chain(
+            "max-tokens-unset".into(),
+            test_role(),
+            vec![model],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        runner.run_turn(&[Message::user("你好")], None).await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert!(
+            body.get("max_tokens").is_none(),
+            "未配置时应省略字段，不能发 null: {body}"
+        );
     }
 
     /// 模型热更新：resolver 代际变了以后，maybe_reload_models 重建
@@ -4933,6 +5594,8 @@ mod tests {
                         api_key: "k".into(),
                         context_window: 32000,
                         max_tokens: 4096,
+                        omit_max_tokens: false,
+                        max_tokens_field: Default::default(),
                         supports_thinking: false,
                         supports_vision: false,
                         supports_image_generation: false,
@@ -4990,6 +5653,8 @@ mod tests {
                 api_key: "k".into(),
                 context_window: 32000,
                 max_tokens: 4096,
+                omit_max_tokens: false,
+                max_tokens_field: Default::default(),
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -8409,6 +9074,137 @@ tools = ["read", "write"]
         }
     }
 
+    /// 构造一个 `finish_reason` 可指定的 OpenAI 非流式响应体。
+    fn openai_completion_body_with_finish(content: &str, finish_reason: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": finish_reason
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    /// 正文撞长度上限（`finish_reason=length`、无 tool_calls）必须**重试
+    /// 一次**并带上压缩指令，而不是把半截产出当正常答复返回。
+    ///
+    /// 回归 2026-09-07 jemalloc 会话：architect 在 tasks_json 步撞 8192
+    /// token 上限，半个 JSON 被静默采纳穿给终审，gate 连着三轮 REJECT
+    /// （理由都是「JSON 被截断」），max_iterations 耗尽后整条流水线 failed。
+    #[tokio::test]
+    async fn length_truncated_final_response_is_retried_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // 第一次返回被截断的半截 JSON，第二次返回完整产出。
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish(
+                            r#"{"tasks":[{"title":"T0","description":"半截"#,
+                            "length",
+                        ),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish(r#"{"tasks":[]}"#, "stop"),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "trunc".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
+
+        assert_eq!(
+            out, r#"{"tasks":[]}"#,
+            "应采纳重试后的完整产出，而不是第一次的半截 JSON"
+        );
+        assert!(
+            !out.contains("半截"),
+            "被截断的产出不该出现在最终答复里: {out}"
+        );
+        // 重试的追问必须讲清真实原因与对策（否则模型只会再写一份同样长
+        // 的）。它进的是工具循环内的工作消息表、不落 runner context，所以
+        // 检查**真正发出去的第二个请求**。
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(reqs.len(), 2, "应恰好重试一次（共 2 次模型调用）");
+        let second = String::from_utf8_lossy(&reqs[1].body).to_string();
+        assert!(
+            second.contains("输出长度上限"),
+            "第二次请求应带讲明截断原因的追问: {second}"
+        );
+        assert!(second.contains("finish_reason=length"), "{second}");
+        assert!(
+            second.contains("不要原样重写"),
+            "追问必须给出「压缩」而非「重写」的对策: {second}"
+        );
+        assert!(
+            second.contains("半截"),
+            "被截断的那份产出要作为 assistant 消息回喂，模型才知道自己写到哪断了: {second}"
+        );
+    }
+
+    /// 重试后仍被截断：照收（不死循环），但必须打上显式标记——最坏情况
+    /// 下也不能是静默采纳。
+    #[tokio::test]
+    async fn persistently_truncated_response_is_annotated_not_silent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("永远装不下的长清单开头", "length"),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "trunc2".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
+
+        assert!(
+            out.contains("⚠️ [产出被截断]"),
+            "连续截断必须留下显式标记，实际: {out}"
+        );
+        assert!(out.contains("finish_reason=length"), "标记要带真实原因: {out}");
+        assert!(
+            out.contains("永远装不下的长清单开头"),
+            "已产出的内容仍要保留（降级采纳，不是丢弃）: {out}"
+        );
+    }
+
     // ─── ensure_unique_tool_call_ids tests ──────────────────────────
     //
     // 回归：manager 并行委派同一角色的不同任务时，若 provider 给这些
@@ -8842,6 +9638,8 @@ tools = ["read", "write"]
                 api_key: "test-key".into(),
                 context_window: 32_000,
                 max_tokens: 4_096,
+                omit_max_tokens: false,
+                max_tokens_field: Default::default(),
                 supports_thinking: false,
                 supports_vision: false,
                 cost_per_million_input: 0.0,

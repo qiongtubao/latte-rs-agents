@@ -500,6 +500,8 @@ pub async fn pending_dialog_events_json(
 pub enum ChoiceAnswerOutcome {
     /// 直达活着的等待方。
     DeliveredLive,
+    /// 多题弹框：这一题收下了，还在等其余题。等待方尚未被唤醒。
+    PartiallyCollected,
     /// 答案已落进 checkpoint 并触发断点续跑。
     DeliveredViaResume,
     /// 没有等待方也没有可恢复的落盘记录 → 前端降级成普通消息。
@@ -525,12 +527,42 @@ pub async fn deliver_choice_answer(
     choice_id: &str,
     answer: String,
 ) -> ChoiceAnswerOutcome {
+    deliver_choice_answer_for(b, choice_id, None, answer).await
+}
+
+/// [`deliver_choice_answer`] 的多题版：`question_id` 为 `Some` 时只投递
+/// 这**一道题**的答案，收齐全部题目才唤醒等待方。
+///
+/// 单题形态（`question_id = None`，或挂起项没有记 `expected`）行为与
+/// [`deliver_choice_answer`] 完全一致 —— 旧前端、旧落盘记录、CLI 都走
+/// 这条，不受影响。
+pub async fn deliver_choice_answer_for(
+    b: &UiBackend,
+    choice_id: &str,
+    question_id: Option<&str>,
+    answer: String,
+) -> ChoiceAnswerOutcome {
     // 无论走哪条路，非阻塞补发表里的同 id 快照都该销账（内存 + 落盘
     // 两处：重启后补发的那份只在盘上）。注意这在 `pending_ask::load`
     // **之前** —— 非阻塞快照与阻塞 ask 记录用的是不同的 wf_id 约定
     // （空 vs 真 wf_id），删非阻塞那份不会动到下面要读的阻塞记录。
-    latte_agent_core::choice::dismiss_prompt(choice_id);
-    if latte_agent_core::choice::resolve(choice_id, answer.clone()) {
+    //
+    // 多题时**只有收齐那一刻**才销账：提前销掉的话，用户答到一半刷新
+    // 页面就再也拿不到这个弹框，剩下的题永远答不了、等待方无限挂起。
+    if question_id.is_none() {
+        latte_agent_core::choice::dismiss_prompt(choice_id);
+    }
+    if let Some(qid) = question_id {
+        match latte_agent_core::choice::resolve_one(choice_id, qid, answer.clone()) {
+            Ok(true) => {
+                latte_agent_core::choice::dismiss_prompt(choice_id);
+                return ChoiceAnswerOutcome::DeliveredLive;
+            }
+            Ok(false) => return ChoiceAnswerOutcome::PartiallyCollected,
+            // 未知 id / 未知题号：落到下面的孤儿续跑路径去判。
+            Err(()) => {}
+        }
+    } else if latte_agent_core::choice::resolve(choice_id, answer.clone()) {
         return ChoiceAnswerOutcome::DeliveredLive;
     }
     let Some(rec) = latte_agent_core::pending_ask::load(&b.cwd, choice_id) else {
@@ -2514,6 +2546,8 @@ mod tests {
                     api_key: "k".into(),
                     context_window: 1,
                     max_tokens: 1,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -2530,6 +2564,8 @@ mod tests {
                     api_key: "k".into(),
                     context_window: 1,
                     max_tokens: 1,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -2546,6 +2582,8 @@ mod tests {
                     api_key: "k".into(),
                     context_window: 1,
                     max_tokens: 1,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -2600,6 +2638,8 @@ max_tokens = 1
                 api_key: "k".into(),
                 context_window: 1,
                 max_tokens: 1,
+                omit_max_tokens: false,
+                max_tokens_field: Default::default(),
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -3866,6 +3906,8 @@ mod model_patch_tests {
             api_key: "sk-old".into(),
             context_window: 128_000,
             max_tokens: 4096,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             supports_thinking: false,
             supports_vision: true,
             supports_image_generation: false,
@@ -4697,6 +4739,8 @@ mod hot_reload_tests {
                 api_key: "k".into(),
                 context_window: 32000,
                 max_tokens: 4096,
+                omit_max_tokens: false,
+                max_tokens_field: Default::default(),
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,

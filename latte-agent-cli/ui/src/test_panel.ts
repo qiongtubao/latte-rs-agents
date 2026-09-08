@@ -263,7 +263,13 @@ export function mountTestDialog(opts: {
       : `✗ ${r.error ?? "失败"}`;
     container.resultStatusEl.classList.toggle("error", !r.ok);
     container.resultStatusEl.classList.toggle("ok", r.ok);
-    container.resultLatencyEl.textContent = `${r.latency_ms}ms · mode=${r.mode}`;
+    // 把实际下发的输出上限显示出来。只看「通了」判断不了上限配得对不对
+    // —— 这个面板以前写死 1024，配置里那个值从来没被测到过。
+    const cap =
+      r.max_tokens_sent === undefined
+        ? " · max_tokens 未下发（用厂商默认）"
+        : ` · max_tokens=${r.max_tokens_sent}`;
+    container.resultLatencyEl.textContent = `${r.latency_ms}ms · mode=${r.mode}${cap}`;
     container.resultBodyEl.textContent = r.response ?? r.error ?? "";
     if (r.available_models && r.available_models.length > 0) {
       container.resultAvailableModelsEl.textContent =

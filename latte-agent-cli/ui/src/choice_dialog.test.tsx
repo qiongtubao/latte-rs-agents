@@ -9,14 +9,14 @@ import type { ChatEvent, ChoiceOption } from "./api";
 
 // 提交路径会打网络：桩掉，只断言 UI 行为与回传文本。
 const sent: string[] = [];
-const answered: Array<{ choiceId: string; answer: string }> = [];
+const answered: Array<{ choiceId: string; answer: string; questionId?: string }> = [];
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>();
   return {
     ...actual,
     sendMessage: (msg: string) => { sent.push(msg); return Promise.resolve(); },
-    sendChoiceAnswer: (choiceId: string, answer: string) => {
-      answered.push({ choiceId, answer });
+    sendChoiceAnswer: (choiceId: string, answer: string, questionId?: string) => {
+      answered.push({ choiceId, answer, questionId });
       return Promise.resolve(true);
     },
     listWorkflows: () => Promise.resolve([]),
@@ -208,4 +208,125 @@ describe("ask 选择框弹窗", () => {
     expect(overlay()).toBeNull();
     expect(pill()).toBeNull();
   });
+
+  // ─── 多题弹框：一次问 N 道、全部答完才能提交 ─────────────────────
+  //
+  // 回归 2026-09-07 jemalloc 会话：manager 一轮连发 3 道 ask，用户答完
+  // 前 2 道它就启动了 4 条 workflow，剩下 2 道的答案在流水线跑完之后
+  // 才到 —— 前面全按默认假设做了。
+  function multiEvent(wait: boolean): ChatEvent {
+    return choiceEvent({
+      choice_id: "choice-manager-multi",
+      wait,
+      questions: [
+        {
+          id: "q1",
+          question: "你的背景？",
+          multi: false,
+          options: [{ label: "小白" }, { label: "有基础" }],
+        },
+        {
+          id: "q2",
+          question: "产出形式？",
+          multi: false,
+          options: [{ label: "只要清单" }, { label: "清单+教程" }],
+        },
+        {
+          id: "q3",
+          question: "深度档位？",
+          multi: false,
+          options: [{ label: "读懂主链路" }, { label: "改得动" }],
+        },
+      ],
+    } as Partial<Extract<ChatEvent, { type: "ChoiceRequested" }>>);
+  }
+
+  const qBlocks = () => Array.from(scope().querySelectorAll<HTMLElement>(".choice-q-block"));
+
+  it("多题：渲染成一个弹框，答不全不能提交", () => {
+    const { chat } = mount();
+    chat.handleEvent(multiEvent(true));
+    expect(overlay()).not.toBeNull();
+    expect(qBlocks()).toHaveLength(3);
+    expect(submitBtn().disabled).toBe(true);
+
+    // 只答第 1 题 —— 这正是实测里 manager 提前开工的那一刻
+    qBlocks()[0].querySelectorAll<HTMLElement>(".choice-opt")[0].click();
+    expect(submitBtn().disabled).toBe(true);
+    // 答第 2 题，仍不能提交
+    qBlocks()[1].querySelectorAll<HTMLElement>(".choice-opt")[1].click();
+    expect(submitBtn().disabled).toBe(true);
+    expect(scope().querySelector(".choice-status")!.textContent).toContain("2 / 3");
+
+    // 答满 3 题才放行
+    qBlocks()[2].querySelectorAll<HTMLElement>(".choice-opt")[1].click();
+    expect(submitBtn().disabled).toBe(false);
+  });
+
+  it("多题（阻塞）：提交时逐题投递，带上各自的 question_id", async () => {
+    const { chat } = mount();
+    chat.handleEvent(multiEvent(true));
+    qBlocks()[0].querySelectorAll<HTMLElement>(".choice-opt")[0].click();
+    qBlocks()[1].querySelectorAll<HTMLElement>(".choice-opt")[1].click();
+    qBlocks()[2].querySelectorAll<HTMLElement>(".choice-opt")[1].click();
+    submitBtn().click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(answered.map((a) => a.questionId)).toEqual(["q1", "q2", "q3"]);
+    expect(answered.map((a) => a.answer)).toEqual(["小白", "清单+教程", "改得动"]);
+    // 阻塞路径不该再走普通消息
+    expect(sent).toHaveLength(0);
+    expect(overlay()).toBeNull();
+  });
+
+  it("多题（fire-and-forget）：N 个答案合成**一条** user 消息，只起一个 turn", async () => {
+    const { chat } = mount();
+    chat.handleEvent(multiEvent(false));
+    qBlocks()[0].querySelectorAll<HTMLElement>(".choice-opt")[0].click();
+    qBlocks()[1].querySelectorAll<HTMLElement>(".choice-opt")[0].click();
+    qBlocks()[2].querySelectorAll<HTMLElement>(".choice-opt")[0].click();
+    submitBtn().click();
+    await Promise.resolve();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("小白");
+    expect(sent[0]).toContain("只要清单");
+    expect(sent[0]).toContain("读懂主链路");
+    expect(answered).toHaveLength(0);
+  });
+
+  it("多题：题面与选项按纯文本渲染（不解释 HTML）", () => {
+    const { chat } = mount();
+    chat.handleEvent(
+      choiceEvent({
+        choice_id: "choice-xss",
+        wait: false,
+        questions: [
+          {
+            id: "q1",
+            question: "<img src=x onerror=alert(1)>",
+            options: [{ label: "<b>bold</b>" }, { label: "ok" }],
+          },
+          { id: "q2", question: "第二题", options: [{ label: "a" }, { label: "b" }] },
+        ],
+      } as Partial<Extract<ChatEvent, { type: "ChoiceRequested" }>>),
+    );
+    expect(scope().querySelector("img")).toBeNull();
+    expect(scope().querySelector(".choice-q-block b")).toBeNull();
+    expect(qBlocks()[0].querySelector(".choice-question")!.textContent).toContain(
+      "<img src=x onerror=alert(1)>",
+    );
+  });
+
+  it("单题形态逐字不变：没有 questions 时仍走原来的单题渲染", () => {
+    const { chat } = mount();
+    chat.handleEvent(choiceEvent());
+    expect(qBlocks(), "单题不该产生多题块").toHaveLength(0);
+    expect(scope().querySelector(".choice-card.multi-q")).toBeNull();
+    // 弹窗里那张卡片仍是单题结构。选项数 = 2 个模型给的 + 1 个
+    // "其他（自定义）"（单题路径的既有行为，多题路径不加这一项）。
+    const card = cardInOverlay()!;
+    expect(card.querySelectorAll(".choice-opt").length).toBe(3);
+    expect(card.querySelector(".choice-question")!.textContent).toBe("鉴权方案选哪个？");
+  });
+
 });

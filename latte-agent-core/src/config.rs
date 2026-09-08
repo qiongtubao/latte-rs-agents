@@ -499,7 +499,30 @@ pub struct ModelDef {
     /// Context window size in tokens.
     pub context_window: u32,
     /// Maximum output tokens.
+    ///
+    /// **原样**作为出站请求的输出上限下发，不经过任何隐式钳位 —— 这里写多少
+    /// 就发多少。配得超过厂商真实上限时会收到 4xx，那是可诊断的；早先版本会
+    /// 悄悄压到 64000，代价是改这个数看不到任何变化、等于配置项是死的。
+    /// `0` = 不配置（不下发该字段，由厂商默认值决定）。
     pub max_tokens: u32,
+    /// 完全**不下发**输出上限字段，把每次响应的上限交给上游 API 决定。
+    ///
+    /// 用于**代理**：它转发给一个我们无法探知真实输出上限的后端，发一个猜
+    /// 的值只会换来上游 400。典型场景是自建/第三方 OpenAI-compatible 网关
+    /// 和 Ollama 这类本地转发层。
+    ///
+    /// 只对 OpenAI-compatible 协议有效；Anthropic 协议要求该字段必填，
+    /// 那条路在完全没配时用 `ANTHROPIC_UNCONFIGURED_MAX_TOKENS`（4096）兜底。
+    #[serde(default)]
+    pub omit_max_tokens: bool,
+    /// 输出上限用哪个字段名下发：`"max_tokens"`（默认）或
+    /// `"max_completion_tokens"`。
+    ///
+    /// 较新的 OpenAI-compatible 端点废弃了 `max_tokens`、只认后者；写死一个
+    /// 的后果是遇到新端点时**静默失效**（对方忽略该字段，于是又回到"由厂商
+    /// 默认值说话"）。
+    #[serde(default)]
+    pub max_tokens_field: latte_ai::models::MaxTokensField,
     /// Whether the model supports thinking/reasoning.
     #[serde(default)]
     pub supports_thinking: bool,

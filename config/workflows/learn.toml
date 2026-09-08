@@ -109,7 +109,7 @@ task = """你是写给零基础读者的技术作家。按下面的骨架，把�
 2. **六层结构**：严格按 L0-L6 组织（层名用骨架给的，L3/L4 别画蛇添足叫"内存/落盘"除非主题确实是那个），层与层之间有一句承上启下（"现在你知道了 X 从哪进来，那它进来之后去了哪？→"）。
 3. **每层一张 Mermaid 图**：用 ```mermaid 代码块，图型按骨架建议（flowchart/graph/sequenceDiagram/stateDiagram）。图里的节点文字用中文短词，不要超过 15 个节点，宁可拆两张。
 4. **每层一个类比**：用骨架给的类比，并诚实说明它在哪一点上失效。
-5. **关键事实带出处**：KNID=code 提到代码实现处，括注（`文件:行号`）供读者按图索骥；mechanism/concept 类对关键断言给"依据"来源（文档/知识），不编造行号。
+5. **关键事实带出处**：KIND=code 提到代码实现处，括注（`文件:行号`）供读者按图索骥；mechanism/concept 类对关键断言给"依据"来源（文档/知识），不编造行号。
 6. **结尾**：L6 之后加一节"30 秒回顾"：六层每层一句话。
 7. 语气：像朋友讲解，不用"显而易见/众所周知"；允许短句；禁止"教程/文档"这种自指措辞。
 8. 事实不足的地方如实写"这部分没读到/不确定"，禁止编造。
@@ -118,7 +118,12 @@ task = """你是写给零基础读者的技术作家。按下面的骨架，把�
 
 [steps.output_contract]
 min_chars = 800
-require = ["```mermaid", "名词解释", "docs/learn/", "KIND"]
+# "KIND" 曾在 require 里 —— 那是**内部判型标记**，成品教程正文不会出现它，
+# 于是这条契约每次必然失败、每次靠 advisor 语义复核兜底放行（实测：
+# 2026-09-07 jemalloc 会话两条 learn 各失败一次，其中一次 advisor 自己
+# 90s 超时「未审直接放行」，两道关同时失效）。判型是给写手看的输入约束，
+# 不是产出约束，故移除。
+require = ["```mermaid", "名词解释", "docs/learn/"]
 forbid = ["TBD", "待补充", "占位符", "显而易见", "众所周知"]
 
 # ── 4. 校验：事实校对 + 小白测试，programmer 修正 ──────────────────
@@ -136,11 +141,43 @@ task = """校验下面这篇小白教程：
 reviewer 做双重校验（只检查+列问题，不改文件）：
 1. **事实校对**：看 `KIND=` 标记——code 类抽查至少 5 处行号引用和 3 条机制性断言对照真实代码；mechanism/concept 类核对断言是否有事实依据、有没有编造细节。有出入的逐条列出（位置/文档说的/实际）。
 2. **小白测试**：假装自己完全不懂这个领域，只读这篇文档：六层是否都能读懂？哪个名词没解释？哪张图看不懂？类比对理解有帮助还是误导？Mermaid 语法是否明显错误（节点未闭合、箭头写错）？
-输出：PASS（可交付）或 FAIL + 逐条问题清单。
+输出：**第一行**必须是 `VERDICT: PASS`（可交付）或 `VERDICT: FAIL`，其后是逐条问题清单。
 
-programmer：若 FAIL，用 write 逐条修正文档文件（保持六层结构与写作规则），回复修正了哪些；若 PASS，回复"通过"。"""
+programmer：若 reviewer 判 FAIL，用 write/edit 逐条修正文档文件（保持六层结构与写作规则），回复修正了哪些。
+你的回复**最后一行**必须是二者之一：
+- `VERDICT: PASS` —— 问题已全部修完（或 reviewer 本来就判 PASS），文档可交付；
+- `VERDICT: FAIL` —— 你改不动（骨架层面的缺陷、事实不足等），需要退回写作步重写。
+
+⚠️ 输出 `VERDICT: FAIL` 时，你的正文里不得再出现字符串 `VERDICT: PASS`（放行条件按子串匹配，会被误判为放行）。"""
+
+# 返工回环：programmer 声明修完（VERDICT: PASS）才放行；声明改不动则
+# 跳回 write 重写。
+#
+# 修的 bug（实测实锤：2026-09-07 jemalloc 会话 wf-learn-1788721322564918）：
+# 此前 verify 没有 loop_until，于是 reviewer 判「裁决：❌ FAIL」并列出两条
+# 实质缺陷（L1 Mermaid 图语法错误导致渲染黑屏、tcache_t 结构描述不完整）
+# 之后，workflow 依旧以 `status: ok` 收尾，summary 就是那份 FAIL 报告原文。
+# 引擎从来没有读过 reviewer 的结论 —— 契约只做子串查找，没有任何一处按
+# 「判了 PASS 还是 FAIL」做决策。那次缺陷是靠 programmer 恰好在同一 step
+# 里自觉修掉的，属于运气，不是机制。
+#
+# 为什么标记要由 **最后一个** speaker 给：loop_until 判的是
+# `aggregate_step_output` 拼接后的聚合产出（多 speaker 会带 `## [role]`
+# 分隔）。若只让 reviewer 表态，reviewer 判 FAIL → 聚合里含 FAIL 不含
+# PASS → 即使 programmer 已经修完也会被判返工，白烧一整个 write 步。
+# 让 programmer 在修完后复述终态，聚合里才有正确的放行依据。
+loop_until = "VERDICT: PASS"
+loop_back_to = "write"
+max_iterations = 2
 
 [steps.output_contract]
 min_chars = 50
-require = ["KIND", "PASS", "FAIL"]
+# 曾是 `require = ["KIND", "PASS", "FAIL"]`。`require` 是 **AND** 语义
+# （workflow.rs 逐条 `!output.contains(pat)` 即判失败），而契约是**逐
+# speaker** 校验的 —— 于是这条要求「同一个 speaker 的同一段产出里同时
+# 出现 PASS 和 FAIL」，任务书本身写的却是「输出 PASS **或** FAIL」，
+# 结构性自相矛盾、100% 过不了。实测：reviewer 报缺「PASS」、programmer
+# 报缺「FAIL」，两条 learn 流水线全靠 advisor 兜底放行。
+# OR 语义的正确字段是 require_any；"KIND" 同 write 步一并移除。
+require_any = ["VERDICT: PASS", "VERDICT: FAIL"]
 forbid = []

@@ -298,6 +298,8 @@ mod tests {
             api_key: "test-key".into(),
             context_window: 32000,
             max_tokens: 4096,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: true,

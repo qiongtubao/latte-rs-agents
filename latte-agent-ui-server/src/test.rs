@@ -55,6 +55,13 @@ pub struct TestModelResponse {
     pub status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub available_models: Option<Vec<String>>,
+    /// 本次实际下发的输出上限（`None` = 该字段未下发，由厂商默认值决定）。
+    ///
+    /// 存在的理由：`max_tokens` 配错时厂商回 4xx，而在这个字段出现之前
+    /// 测试面板写死 `Some(1024)`，于是**永远测不出配置里的值有问题** ——
+    /// 面板显示「通了」，真实 chat 用配置值照样 400。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens_sent: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +120,7 @@ async fn test_connectivity(req: &TestModelRequest, started: Instant) -> TestMode
             error: None,
             status: Some(status.as_u16()),
             available_models,
+            max_tokens_sent: None,
         }
     } else {
         TestModelResponse {
@@ -123,6 +131,7 @@ async fn test_connectivity(req: &TestModelRequest, started: Instant) -> TestMode
             error: Some(format!("HTTP {status}")),
             status: Some(status.as_u16()),
             available_models,
+            max_tokens_sent: None,
         }
     }
 }
@@ -141,10 +150,10 @@ async fn test_via_aiclient(req: &TestModelRequest, started: Instant) -> TestMode
         Err(e) => return err_response(started, e),
     };
     let history: Vec<latte_ai::models::Message> = vec![user_msg];
-    let params = latte_ai::params::GenerateParams {
-        max_tokens: Some(1024),
-        ..Default::default()
-    };
+    // 关键：**不显式给 max_tokens**，让 AiClient 按生产路径解析
+    // （目录值 → 原样下发）。写死一个测试专用的小值等于绕开被测对象。
+    let params = latte_ai::params::GenerateParams::default();
+    let sent = client.resolved_max_tokens();
     let result = client.chat(&history, &params).await;
     let latency = started.elapsed().as_millis() as u64;
     match result {
@@ -156,6 +165,7 @@ async fn test_via_aiclient(req: &TestModelRequest, started: Instant) -> TestMode
             error: None,
             status: Some(200),
             available_models: None,
+            max_tokens_sent: sent,
         },
         Err(e) => TestModelResponse {
             ok: false,
@@ -165,6 +175,7 @@ async fn test_via_aiclient(req: &TestModelRequest, started: Instant) -> TestMode
             error: Some(format!("{e}")),
             status: None,
             available_models: None,
+            max_tokens_sent: sent,
         },
     }
 }
@@ -185,10 +196,17 @@ async fn test_via_raw_http(req: &TestModelRequest, started: Instant) -> TestMode
     } else {
         req.def.name.as_str()
     };
-    let body = if req.def.api.eq_ignore_ascii_case("anthropic") {
+    // 用**配置里的**上限，而不是测试专用的小值 —— 目的正是让配错的值在
+    // 这里就暴露。0 视为未配置。
+    let raw_cap = (req.def.max_tokens > 0).then_some(req.def.max_tokens);
+    let is_anthropic = req.def.api.eq_ignore_ascii_case("anthropic");
+    // Anthropic 必填，没配就兜 4096；OpenAI 没配则整个不发该字段。
+    let reported_cap = if is_anthropic { Some(raw_cap.unwrap_or(4_096)) } else { raw_cap };
+    let body = if is_anthropic {
         serde_json::json!({
+            // Anthropic 要求必填；用配置值，配错了这次测试就该失败。
             "model": model_id,
-            "max_tokens": 1024,
+            "max_tokens": raw_cap.unwrap_or(4_096),
             "messages": [{
                 "role": "user",
                 "content": build_anthropic_content(&req.prompt, &req.images),
@@ -227,6 +245,7 @@ async fn test_via_raw_http(req: &TestModelRequest, started: Instant) -> TestMode
             error: None,
             status: Some(status.as_u16()),
             available_models: None,
+            max_tokens_sent: reported_cap,
         }
     } else {
         TestModelResponse {
@@ -237,6 +256,7 @@ async fn test_via_raw_http(req: &TestModelRequest, started: Instant) -> TestMode
             error: Some(format!("HTTP {status}")),
             status: Some(status.as_u16()),
             available_models: None,
+            max_tokens_sent: reported_cap,
         }
     }
 }
@@ -316,6 +336,8 @@ fn build_latte_ai_model(def: &ModelDef) -> anyhow::Result<latte_ai::models::Mode
         api_key: resolve_env_vars(&def.api_key),
         context_window: def.context_window,
         max_tokens: def.max_tokens,
+        omit_max_tokens: def.omit_max_tokens,
+        max_tokens_field: def.max_tokens_field,
         supports_thinking: def.supports_thinking,
         supports_vision: def.supports_vision,
         cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
@@ -468,6 +490,8 @@ fn err_response<E: std::fmt::Display>(started: Instant, e: E) -> TestModelRespon
         error: Some(format!("{e}")),
         status: None,
         available_models: None,
+        // 这条路径是「请求都没发出去」（构造/网络失败），没有下发值可报。
+        max_tokens_sent: None,
     }
 }
 
@@ -705,6 +729,115 @@ pub async fn run_role_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn def_at(uri: &str, api: &str, max_tokens: u32) -> ModelDef {
+        ModelDef {
+            name: "probe".into(),
+            api: api.into(),
+            provider: "test".into(),
+            base_url: uri.into(),
+            api_key: "k".into(),
+            context_window: 1_000_000,
+            max_tokens,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
+            supports_thinking: false,
+            supports_vision: false,
+            supports_image_generation: false,
+            cost_per_million_input: Some(0.0),
+            cost_per_million_output: Some(0.0),
+            tier: None,
+            timeout_secs: None,
+        }
+    }
+
+    /// 「测试模型」必须用**配置里的**输出上限发请求，并把该值报回前端。
+    ///
+    /// 回归：这个面板以前在 aiclient / http 两个模式里都写死
+    /// `max_tokens: 1024`。后果是配置里那个值**从来没被测到过** —— 面板显示
+    /// 「✓ 通过」，真实 chat 用配置值照样可能被厂商 4xx 拒。既然现在配置值
+    /// 是原样下发的（没有天花板兜着了），这个面板就必须测真实值才有意义。
+    #[tokio::test]
+    async fn model_test_uses_the_configured_cap_and_reports_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        r#"{"id":"c","object":"chat.completion","created":0,"model":"probe",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+                            "finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                    )),
+            )
+            .await;
+
+        let resp = run_test(TestModelRequest {
+            def: def_at(&server.uri(), "openai", 384_000),
+            mode: TestMode::AiClient,
+            prompt: "hi".into(),
+            images: Vec::new(),
+            probe_path: None,
+        })
+        .await;
+
+        assert!(resp.ok, "测试应通过: {resp:?}");
+        assert_eq!(
+            resp.max_tokens_sent,
+            Some(384_000),
+            "必须把实际下发值报回前端，否则用户无从判断上限配得合不合理"
+        );
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body.get("max_tokens").and_then(|v| v.as_u64()),
+            Some(384_000),
+            "出站请求必须带配置值，不能是写死的 1024: {body}"
+        );
+    }
+
+    /// 目录没配（`0`）时，OpenAI 模式不下发该字段，报回的也是 `None`
+    /// —— 前端据此显示「用厂商默认」，而不是显示一个假的数。
+    #[tokio::test]
+    async fn model_test_reports_none_when_cap_unset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        r#"{"id":"c","object":"chat.completion","created":0,"model":"probe",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},
+                            "finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                    )),
+            )
+            .await;
+
+        let resp = run_test(TestModelRequest {
+            def: def_at(&server.uri(), "openai", 0),
+            mode: TestMode::AiClient,
+            prompt: "hi".into(),
+            images: Vec::new(),
+            probe_path: None,
+        })
+        .await;
+
+        assert!(resp.ok, "测试应通过: {resp:?}");
+        assert_eq!(resp.max_tokens_sent, None, "未配置就不该报一个数");
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert!(body.get("max_tokens").is_none(), "未配置应省略字段: {body}");
+    }
 
     #[test]
     fn join_endpoint_avoids_double_version_segment() {

@@ -198,6 +198,11 @@ export type ChatEvent =
       allow_upload?: boolean;
       wait?: boolean;
       options: ChoiceOption[];
+      /** **多题弹框**：一次问 N 道，渲染成一个弹框、收齐后一次提交。
+       *  空/缺省 = 单题形态（用上面的 question/options/multi/…）。
+       *  非空时以本数组为准；上面那几个单题字段只是**第一题**的兼容
+       *  降级视图（旧前端读到的仍是一道能答的题）。 */
+      questions?: ChoiceQuestion[];
     }
   | { type: "DelegateStarted"; from_role: string; to_role: string; task: string; sub_id: string; wf_id?: string | null }
   | { type: "DelegateFinished"; from_role: string; to_role: string; status: string; summary: string; sub_id: string; wf_id?: string | null }
@@ -414,9 +419,21 @@ export async function sendMessage(message: string): Promise<void> {
  * 正挂起等回答）的答案直达通道：经后端 choice 路由直接交给等待方，
  * 而不是另起一轮 user 消息。返回 false = 无匹配挂起项（已答/超时/
  * 服务重启），调用方应降级为 `sendMessage` 回喂。 */
-export async function sendChoiceAnswer(choiceId: string, answer: string): Promise<boolean> {
+export async function sendChoiceAnswer(
+  choiceId: string,
+  answer: string,
+  questionId?: string,
+): Promise<boolean> {
   try {
-    await getTransport().request("POST", "/api/chat/choice-answer", chatBody({ choice_id: choiceId, answer }));
+    await getTransport().request(
+      "POST",
+      "/api/chat/choice-answer",
+      chatBody(
+        questionId
+          ? { choice_id: choiceId, answer, question_id: questionId }
+          : { choice_id: choiceId, answer },
+      ),
+    );
     return true;
   } catch (err) {
     if (err instanceof HttpError && err.status === 404) return false;
@@ -940,6 +957,8 @@ export interface TestModelResponse {
   error?: string;
   status?: number;
   available_models?: string[];
+  /** 本次实际下发的输出上限；缺省 = 该字段未下发，由厂商默认值决定。 */
+  max_tokens_sent?: number;
 }
 
 export interface ModelCapabilities {
@@ -991,6 +1010,15 @@ export interface StepForm {
   speakers: string[];
   prompt: string;
   output_key: string | null;
+  /** **只读**门禁摘要（契约 / 返工环 / 取证要求）。后端 `step_gate_summary`
+   *  生成，表单不可编辑——要改这些字段请切到「TOML」Tab。
+   *
+   *  为什么必须显示：它们决定「产出合格与否、要不要返工」，看不见就会像
+   *  2026-09-07 jemalloc 会话那样——`learn.toml` 的 verify 步把
+   *  `require = ["KIND","PASS","FAIL"]` 写成了 AND 语义（任务书写的却是
+   *  "输出 PASS **或** FAIL"），这条契约 100% 不可能满足、每次都靠 advisor
+   *  兜底放行，而 UI 上完全看不出有这么一道门。 */
+  gates?: string[];
 }
 
 export interface WorkflowForm {
@@ -1186,6 +1214,17 @@ export interface ImportTask {
   /** 任务涉及的文件/目录前缀（相对项目根）；并行执行时范围重叠的任务会被拒绝派发（409）。 */
   paths?: string[];
   subtasks?: ImportTask[];
+}
+
+/** 多题弹框里的一道题（与后端 `ChoiceQuestion` 同构）。 */
+export interface ChoiceQuestion {
+  /** 这一组里的稳定题号（`q1`/`q2`…），答案回传时按它对号。 */
+  id: string;
+  question: string;
+  multi?: boolean;
+  layout?: string;
+  allow_upload?: boolean;
+  options: ChoiceOption[];
 }
 
 /** ChoiceRequested 事件里的单个选项（与后端 ChoiceOption 同构）。 */

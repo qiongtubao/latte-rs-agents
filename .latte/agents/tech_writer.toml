@@ -5,5 +5,5 @@ category = "execution"
 model_tier = "budget"
 prompt_file = "prompts/tech_writer.md"
 temperature = 0.5
-tools = ["read", "write"]
+tools = ["read", "write", "search", "code_graph"]
 icon = "📝"

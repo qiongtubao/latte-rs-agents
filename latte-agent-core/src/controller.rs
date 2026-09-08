@@ -99,6 +99,104 @@ fn truncate_event_text(text: &str, max: usize) -> String {
     format!("{}...[+{}B]", &text[..end], text.len() - end)
 }
 
+/// 找到 `from` 之后的下一个 think 标签。
+///
+/// 认三种形状：`<think>` / `</think>`，以及**带命名空间前缀**的
+/// `<mm:think>` / `</mm:think>`。前缀是厂商自己加的（`mm` = MiniMax），
+/// 名字部分大小写不敏感。
+///
+/// 返回 `(标签起始字节下标, 标签结束字节下标(exclusive), 是否闭标签)`。
+fn next_think_tag(hay: &str, from: usize) -> Option<(usize, usize, bool)> {
+    let bytes = hay.as_bytes();
+    let mut i = from;
+    // `<` 是 ASCII，`start + 1` 必然落在字符边界上，切片安全。
+    while let Some(rel) = hay.get(i..)?.find('<') {
+        let start = i + rel;
+        let mut p = start + 1;
+        let closing = bytes.get(p) == Some(&b'/');
+        if closing {
+            p += 1;
+        }
+        let ident = |from: usize| -> usize {
+            let mut q = from;
+            while q < bytes.len()
+                && (bytes[q].is_ascii_alphanumeric() || bytes[q] == b'_' || bytes[q] == b'-')
+            {
+                q += 1;
+            }
+            q
+        };
+        let mut q = ident(p);
+        let mut name = &hay[p..q];
+        // 可选的 `prefix:` —— 前缀后面必须紧跟标签名。
+        if bytes.get(q) == Some(&b':') {
+            let after = q + 1;
+            q = ident(after);
+            name = &hay[after..q];
+        }
+        if name.eq_ignore_ascii_case("think") && bytes.get(q) == Some(&b'>') {
+            return Some((start, q + 1, closing));
+        }
+        i = start + 1;
+    }
+    None
+}
+
+/// 剥 think 块的内核。返回 `None` 表示**产出里只有思维链**（有开标签、
+/// 剥完什么都不剩），由调用方决定兜底策略。
+///
+/// 注意区分两种"剥完为空"：
+/// - **有开标签**（`<think>推理</think>`）→ 确实有内容、只是全是思维链，
+///   返回 `None`，由 [`strip_think_blocks`] 回退原文，避免空负载；
+/// - **只有孤立闭标签**（content 就是一个裸 `</mm:think>`，实测有 3 例）
+///   → 本来就没有正文，那个标签是纯噪声。返回 `Some("")`，让
+///   `is_empty_output` 按"空产出"正常判失败/重试，而不是把噪声当产出
+///   回显到 UI 气泡里。
+fn strip_think_blocks_inner(content: &str) -> Option<String> {
+    if next_think_tag(content, 0).is_none() {
+        return Some(content.to_string());
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    let mut saw_open = false;
+    while let Some((start, end, closing)) = next_think_tag(content, cursor) {
+        out.push_str(&content[cursor..start]);
+        if closing {
+            // **孤立闭标签**：只删标签本身，正文照留。
+            //
+            // 实测（2026-09-07 jemalloc 会话）：MiniMax-M3 有 24 次只吐出
+            // 裸 `</mm:think>`、没有配对的开标签（同会话另有 255 次正常
+            // 配对）——推理正文走了响应里的另一个字段，闭标签误留在了
+            // content 开头。旧实现第一行就 `if !content.contains("<think>")
+            // { return ... }`，`</mm:think>` 里不含 `<think>` 子串，于是原样
+            // 返回，四个连续闭标签一路进了 UI 气泡、DelegateFinished /
+            // WorkflowFinished 的 summary，以及 manager 的 tool_result
+            // （污染 manager 的对话历史，之后每轮都重发）。
+            cursor = end;
+            continue;
+        }
+        saw_open = true;
+        // 开标签：连同到配对闭标签之间的内容一起丢弃。
+        match next_think_tag(content, end) {
+            Some((_, close_end, true)) => cursor = close_end,
+            // 下一个还是开标签（嵌套/未闭合）：丢到那里，交给下一轮处理。
+            Some((next_start, _, false)) => cursor = next_start,
+            // 后面再无标签 = 未闭合（模型在推理中途被截断）：丢到结尾。
+            None => {
+                cursor = content.len();
+                break;
+            }
+        }
+    }
+    out.push_str(&content[cursor..]);
+    let stripped = out.trim();
+    if stripped.is_empty() && saw_open {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
 /// Strip `<think>…</think>` reasoning blocks from content surfaced to
 /// the main session (RoleTurn bubbles, delegate/workflow returns to the
 /// manager). The raw content stays in the subsession trace logs; this
@@ -106,31 +204,24 @@ fn truncate_event_text(text: &str, max: usize) -> String {
 /// (model truncated mid-reasoning) is dropped to end-of-string. If
 /// stripping would leave nothing, the original is returned so callers
 /// never receive an empty payload.
+///
+/// 带命名空间前缀的变体（`<mm:think>` / `</mm:think>`）与孤立的闭标签
+/// 一并处理，见 [`strip_think_blocks_inner`]。
 pub(crate) fn strip_think_blocks(content: &str) -> String {
-    if !content.contains("<think>") {
-        return content.to_string();
-    }
-    let mut out = String::with_capacity(content.len());
-    let mut rest = content;
-    while let Some(start) = rest.find("<think>") {
-        out.push_str(&rest[..start]);
-        let after_open = &rest[start + "<think>".len()..];
-        match after_open.find("</think>") {
-            Some(end) => rest = &after_open[end + "</think>".len()..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    let stripped = out.trim();
-    if stripped.is_empty() {
-        content.to_string()
-    } else {
-        stripped.to_string()
-    }
+    strip_think_blocks_inner(content).unwrap_or_else(|| content.to_string())
 }
+
+/// 产出是否**只剩思维链**——即 [`strip_think_blocks`] 触发了「剥完为空
+/// 就返回原文」的兜底。
+///
+/// 降级采纳路径（熔断/超时中止后把未收尾产出当中间结论穿给下游）必须
+/// 靠它判断：直接拿 `strip_think_blocks` 的结果去 `contains("<think>")`
+/// 只认得裸 `<think>`，漏掉 `<mm:think>` 这类命名空间变体，会把裸思维链
+/// 当成结论穿给下游评审。
+pub(crate) fn is_only_think_blocks(content: &str) -> bool {
+    !content.trim().is_empty() && strip_think_blocks_inner(content).is_none()
+}
+
 
 /// 判定分派/subagent 产出是否为"空"：空串或只剩模板壳
 /// （`<response></response>`）。空产出不能算成功——下游会把空串
@@ -447,6 +538,26 @@ pub enum ChatEvent {
         #[serde(default)]
         wait: bool,
         options: Vec<ChoiceOption>,
+        /// **多题**弹框：一次问 N 道，前端渲染成一个弹框、收齐后一次提交。
+        ///
+        /// 空 = 单题形态（用上面的 `question`/`options`/`multi`/`layout`/
+        /// `allow_upload`）。非空时前端应以本数组为准，上面那几个单题字段
+        /// 只保留**第一题**的内容作为向后兼容的降级视图 —— 旧前端/旧
+        /// `pending-asks` 快照读到的仍是一道能答的题，而不是空弹框。
+        ///
+        /// # 为什么需要它
+        ///
+        /// 顶层 `ask` 是 fire-and-forget：广播后本轮 turn 就结束，答案作为
+        /// **下一条 user 消息**回喂。于是"一轮问 3 题"会变成 3 个独立
+        /// turn，而角色在只收到部分答案时就可能判断"够了"往下走。
+        ///
+        /// 实测（2026-09-07 jemalloc 会话）：manager 一轮连发 3 道题，用户
+        /// 答完前 2 道后它就启动了 4 条 workflow（3×implementation_plan +
+        /// 1×learn）；剩下 2 道的答案（"能读懂+改得动"、"先广后深—两轮
+        /// 清单"）在那 4 条流水线跑完之后才到达，前面全按默认假设做了。
+        /// 这是那次重复劳动最上游的原因，比自动善后更早。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<ChoiceQuestion>,
     },
     /// 角色调用 `task_report` 工具回报任务执行结果（任务看板闭环）。
     /// 广播后由 ui-server 侧 `events_sse` 订阅器拦截，调内部
@@ -800,6 +911,33 @@ fn lenient_string_list(v: &serde_json::Value) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// 多题弹框里的一道题。字段与单题形态的同名字段语义完全一致，
+/// 只是多了一个 `id` 用来把答案对回具体某题。
+///
+/// 与前端 `api.ts` 的 `ChoiceQuestion` 同构。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceQuestion {
+    /// 本题在这一组里的稳定标识（`q1` / `q2` …）。答案回传时按它对号。
+    ///
+    /// 由后端生成而不是让模型给：模型给的 id 可能重复或为空，而这个键
+    /// 是"收齐判定"的依据 —— 重复就会让一道题的答案顶掉另一道，导致
+    /// 永远收不齐、工具无限挂起。
+    pub id: String,
+    /// 题面（一句话）。
+    pub question: String,
+    /// 是否允许多选（默认 false = 单选）。
+    #[serde(default)]
+    pub multi: bool,
+    /// `"list"`（默认）或 `"grid"`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub layout: String,
+    /// 是否允许上传自定义图片作为答案。
+    #[serde(default)]
+    pub allow_upload: bool,
+    /// 本题的选项。
+    pub options: Vec<ChoiceOption>,
 }
 
 /// `ask` 工具的单个选项。前端 `ChoiceRequested` 弹框逐项渲染。
@@ -2583,6 +2721,9 @@ async fn run_single_role_loop(
     let mut current_role = canonical_id;
     let mut current_tier = tier;
     let current_primary = config.primary_model_id.clone();
+    // workflow 失败自动善后的累计次数（session 级）。用尽即转人工，
+    // 见 [`default_max_auto_remediations`]。
+    let mut auto_remediations: u32 = 0;
 
     let icon = merged
         .roles
@@ -2763,19 +2904,70 @@ async fn run_single_role_loop(
                                             let _ = event_tx.send(ChatEvent::Status {
                                                 message: format!("Workflow '{cmd}' 失败: {e}"),
                                             });
-                                            // 自动善后：合成一条输入落到
-                                            // 下面的正常 turn 路径，带上失败
-                                            // 上下文 + advisor 积存的监察建议。
-                                            let hints: Vec<String> =
-                                                advisor_hints.lock().drain(..).collect();
-                                            let hints_text = if hints.is_empty() {
-                                                String::new()
+                                            let budget = default_max_auto_remediations();
+                                            if auto_remediations >= budget {
+                                                // 自动善后额度用尽 → 转人工。
+                                                //
+                                                // 不再合成 followup，本轮就此收住、
+                                                // 回到等用户输入。实测（2026-09-07
+                                                // jemalloc 会话）此前没有上限：一条
+                                                // implementation_plan 失败 → 自动善后
+                                                // → manager 换个描述整条重跑，同一目标
+                                                // 最终跑了 3 条（其中第一条 3.56M 输入
+                                                // token 完全打水漂），而用户在 UI 上只
+                                                // 看到"又一条 workflow 开始跑"，既不知道
+                                                // 上一条失败了，也没有插手的机会。
+                                                let hints: Vec<String> =
+                                                    advisor_hints.lock().drain(..).collect();
+                                                let hints_text = if hints.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!(
+                                                        "\n\nadvisor 监察建议：\n- {}",
+                                                        hints.join("\n- ")
+                                                    )
+                                                };
+                                                let _ = event_tx.send(ChatEvent::Status {
+                                                    message: format!(
+                                                        "⏸ 自动善后已用尽（{auto_remediations}/{budget} 次），转人工。\n\
+                                                         最后一次失败：{e}{hints_text}\n\n\
+                                                         请选择怎么处理，然后直接回复：\n\
+                                                         ① 缩小范围重试（例如把任务数/文档长度砍半——若失败原因是产出被长度上限截断，这一条最有效）\n\
+                                                         ② 我改完配置了，用 wf_id resume 从断点续跑\n\
+                                                         ③ 换条路径重做（换 workflow 或直接派单个角色）\n\
+                                                         ④ 放弃这条流水线\n\
+                                                         （想调额度：LATTE_AGENT_AUTO_REMEDIATE_MAX，0 = 失败即刻转人工）"
+                                                    ),
+                                                });
+                                                tracing::warn!(
+                                                    workflow = %cmd,
+                                                    used = auto_remediations,
+                                                    budget,
+                                                    "auto-remediation budget exhausted; handing back to the user"
+                                                );
                                             } else {
-                                                format!("\n\nadvisor 监察建议：\n- {}", hints.join("\n- "))
-                                            };
-                                            synthetic_followup = Some(format!(
-                                                "[自动善后] Workflow '{cmd}' 失败。用户请求：{topic}\n\n错误：\n{e}{hints_text}\n\n请善后：能修复的修复后用错误消息里的 wf_id 以 resume 续跑，或按 advisor 建议换路径重做；无法继续则向用户说明失败原因。"
-                                            ));
+                                                auto_remediations += 1;
+                                                // 自动善后：合成一条输入落到
+                                                // 下面的正常 turn 路径，带上失败
+                                                // 上下文 + advisor 积存的监察建议。
+                                                let hints: Vec<String> =
+                                                    advisor_hints.lock().drain(..).collect();
+                                                let hints_text = if hints.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!("\n\nadvisor 监察建议：\n- {}", hints.join("\n- "))
+                                                };
+                                                // 次数进提示，让用户看得见"这是第几次自救"。
+                                                let _ = event_tx.send(ChatEvent::Status {
+                                                    message: format!(
+                                                        "↩ 自动善后第 {auto_remediations}/{budget} 次：交给 {current_role} 自行修复或换路径"
+                                                    ),
+                                                });
+                                                synthetic_followup = Some(format!(
+                                                    "[自动善后 {auto_remediations}/{budget}] Workflow '{cmd}' 失败。用户请求：{topic}\n\n错误：\n{e}{hints_text}\n\n请善后：能修复的修复后用错误消息里的 wf_id 以 resume 续跑，或按 advisor 建议换路径重做；无法继续则向用户说明失败原因。\n\n注意：自动善后额度剩 {} 次，用尽后会停下来等用户拍板。不要整条流水线原样重跑——先判断失败是不是「产出被长度上限截断」这类靠缩小单次提交量就能解决的问题。",
+                                                    budget.saturating_sub(auto_remediations)
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -3501,7 +3693,13 @@ fn add_batch_read_contract(
                 .as_object()
                 .map(|obj| obj.keys().cloned().collect())
                 .unwrap_or_default();
-            normalize_read_path_args(&mut input);
+            let cwd_for_split: Option<String> = ctx
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cwd"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            normalize_read_path_args(&mut input, cwd_for_split.as_deref());
             fold_read_range_keys(&mut input)?;
             let path = input.get("path");
             let paths = input.get("paths");
@@ -3626,7 +3824,89 @@ fn add_batch_read_contract(
 /// （`"path":"[\"a.c:1-1\", …]"`）。两种形状的意图都无歧义——就是批量读，
 /// 归并成 paths 继续执行；归并不了的（paths 不是数组等）才留给后面的
 /// match 报错。
-fn normalize_read_path_args(input: &mut serde_json::Value) {
+/// 把"一个字符串里塞了多个路径"拆成多条；拆不了返回 `None`。
+///
+/// 对齐 oh-my-pi 的 `splitDelimitedPathEntry`（`packages/coding-agent/src/
+/// tools/path-utils.ts:913`），核心是**字面量优先**的判定顺序：
+///
+/// 1. 整串作为一个真实路径**存在** → 不拆（真实文件名可以含空格和逗号，
+///    `My Notes, v2.md` 必须原样保留）。
+/// 2. 依次试分号 → 逗号 → 换行/空白：拆出的每一段都要**存在**才算成功。
+///    有任何一段不存在就换下一个分隔符；全都不行就 `None`。
+///
+/// `cwd` 为 `None` 时不做任何拆分——没有工作目录就无法验证"段是否存在"，
+/// 而无验证的拆分会把带空格的合法文件名切碎。
+///
+/// # 为什么值得做
+///
+/// 批量读的采纳率实测只有 **4.9%**（2026-09-07 jemalloc 会话：430 次单
+/// 文件 read vs 22 次 `paths`）。每次单文件调用都是一整轮模型往返，而往返
+/// 要重传全部对话历史 —— 那个会话 22.19M 输入 token 里绝大部分是这么来的。
+/// 与其指望模型学会用 `paths` 数组，不如**把它自然写出来的形状也收下**：
+/// 这条路不依赖模型改变行为，立即生效。
+fn split_delimited_path_entry(entry: &str, cwd: Option<&str>) -> Option<Vec<String>> {
+    let cwd = cwd?;
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let root = std::path::Path::new(cwd);
+    // 选择器（`:10-40` / `:raw`）不参与存在性判断，剥掉再看。
+    let exists = |s: &str| -> bool {
+        let bare = s.rsplit_once(':').map_or(s, |(head, tail)| {
+            // 只有形如 `:数字…` / `:raw` 的尾巴才算选择器；Windows 盘符
+            // 和文件名里的冒号不该被剥。
+            if tail == "raw" || tail.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                head
+            } else {
+                s
+            }
+        });
+        let bare = bare.trim();
+        if bare.is_empty() {
+            return false;
+        }
+        let p = std::path::Path::new(bare);
+        if p.is_absolute() { p.exists() } else { root.join(bare).exists() }
+    };
+
+    // ① 字面量优先：整串就是一个真实路径 → 绝不拆。
+    if exists(trimmed) {
+        return None;
+    }
+    // 没有任何候选分隔符就没得拆。
+    if !trimmed.contains(';') && !trimmed.contains(',') && !trimmed.split_whitespace().nth(1).is_some()
+    {
+        return None;
+    }
+
+    // ② 依次试分隔符；每段都存在才算拆成功。
+    for sep in [';', ','] {
+        if trimmed.contains(sep) {
+            let parts: Vec<String> = trimmed
+                .split(sep)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2 && parts.iter().all(|p| exists(p)) {
+                return Some(parts);
+            }
+        }
+    }
+    // 换行/空白：路径本身可能带空格，所以这条最容易误伤，放最后且同样
+    // 要求每段都存在。
+    let parts: Vec<String> = trimmed
+        .split_whitespace()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() >= 2 && parts.iter().all(|p| exists(p)) {
+        return Some(parts);
+    }
+    None
+}
+
+fn normalize_read_path_args(input: &mut serde_json::Value, cwd: Option<&str>) {
     let Some(obj) = input.as_object_mut() else {
         return;
     };
@@ -3675,6 +3955,30 @@ fn normalize_read_path_args(input: &mut serde_json::Value) {
                         obj.insert("paths".into(), serde_json::Value::Array(items));
                     }
                 }
+            }
+        }
+    }
+
+    // path 里塞了**分隔符连接的多个路径** → 拆成 paths。
+    //
+    // 对齐 oh-my-pi 的 `splitDelimitedPathEntry`（`path-utils.ts:913`）。
+    // 关键是**字面量优先**：真实文件名可以含空格/逗号（`My Notes, v2.md`），
+    // 所以只有当整串**不存在**、且拆出来的每一段都存在时才拆。顺序也照抄
+    // 它的：分号 → 逗号 → 换行/空白。
+    //
+    // 动机：批量读的采纳率实测只有 4.9%（430 次单文件 read vs 22 次
+    // paths）。与其指望模型学会 `paths` 数组，不如**把它自然写出来的形状
+    // 也收下** —— 这条路不依赖模型改变行为。
+    if let Some(path_str) = obj.get("path").and_then(|v| v.as_str()).map(str::to_owned) {
+        if obj.get("paths").is_none() {
+            if let Some(parts) = split_delimited_path_entry(&path_str, cwd) {
+                obj.remove("path");
+                obj.insert(
+                    "paths".into(),
+                    serde_json::Value::Array(
+                        parts.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
             }
         }
     }
@@ -4981,6 +5285,38 @@ pub(crate) fn role_roster_detail_text(merged: &AgentConfig) -> String {
 }
 
 
+/// 单 session 累计 workflow 失败**自动善后**次数上限。
+/// env `LATTE_AGENT_AUTO_REMEDIATE_MAX` 覆盖；非法值回退默认；`0` = 从不
+/// 自动善后（失败即刻转人工）。
+///
+/// # 为什么要有上限
+///
+/// workflow 失败后引擎会合成一条 `[自动善后]` 输入喂回 manager，让它自己
+/// 决定 resume 还是换路径——设计意图是"别卡在那儿等人"。但此前**没有任何
+/// 次数上限**：manager 可以一条流水线跑失败、自动善后、再整条重跑、再失败，
+/// 外层这个环没人计数。
+///
+/// 实测（2026-09-07 jemalloc 会话）：`implementation_plan` 第一条 gate 三轮
+/// REJECT 耗尽后判 failed → 自动善后 → manager 换个话题描述整条重跑。
+/// 同一个"拆学习任务"的目标最终跑了 **3 条** implementation_plan
+/// （3.56M + 0.20M + 3.89M 输入 token），其中第一条完全打水漂。而用户在
+/// UI 上只看到"又一条 workflow 开始跑"，没有"上一条失败了、我正在重试"
+/// 的提示，也没有插手的机会。
+///
+/// 默认 2：一次真失败给一次自救机会足够；连着两次说明不是抖动，此时
+/// 人的一句话（缩小范围 / 改配置 / 放弃）比再烧一条流水线有效得多。
+/// 同一模式的先例见 `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES`（模型全链不可用
+/// 时退避重试上限，用尽转人工等用户点 ▶）。
+pub fn default_max_auto_remediations() -> u32 {
+    match std::env::var("LATTE_AGENT_AUTO_REMEDIATE_MAX")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        Some(n) => n,
+        None => 2,
+    }
+}
+
 /// 单 session 累计 delegate 工具调用上限。env `LATTE_MAX_DELEGATES_PER_SESSION`
 /// 覆盖；非法值回退到默认。0 = 禁用限制（无上限）。
 /// 详见 `docs/perf/diagnose-latency.md` §5（#1-A 方案）。
@@ -6114,8 +6450,23 @@ pub fn register_ask_tool(
                 items: None, properties: None, required: None, additional_properties: None,
             ref_: None,
             }),
+            ("questions".into(), ToolInputProperty {
+                property_type: PropertyType::Array,
+                description: Some("**一次问多道题**（推荐：需要多个维度才能决策时用这个，不要一轮连发多次 ask）。每项 {question, options, multi?, layout?, allow_upload?}，语义与顶层同名参数一致。用户会在**一个弹框里答完全部题目**、答案一起回来，你只需等这一批答完。⚠️ 与顶层 question/options 二选一：给了 questions 就不要再给 question/options。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: Some(Box::new(input_property(
+                    PropertyType::Object,
+                    "一道题：question（必填，一句话）+ options（必填，≥2 项，同顶层 options 结构）+ 可选 multi / layout / allow_upload。",
+                ))),
+                properties: None, required: None, additional_properties: None,
+            ref_: None,
+            }),
         ].into_iter().collect(),
-        required: Some(vec!["question".into(), "options".into()]),
+        // `question`/`options` 不再是 schema 级必填：多题形态用 `questions`。
+        // 二选一的校验放在 handler（`ask requires either …`）——schema 的
+        // oneOf 实测被模型频繁违反（同时给两组、或都不给），报错文本还很
+        // 难懂；handler 侧能给出可执行的提示。
+        required: None,
         ..Default::default()
     };
 
@@ -6128,38 +6479,64 @@ pub fn register_ask_tool(
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
-            let question = input
-                .get("question")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| tool_err("missing non-empty 'question' field".into()))?;
+            // 多题形态（`questions` 非空）时，顶层 question/options 不再必填。
+            // 二选一的校验在这里做，而不是靠 schema 的 oneOf —— 实测模型会
+            // 同时给两组、或两组都不给，schema 报错文本很难懂。
+            let has_questions = input
+                .get("questions")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if !has_questions && input.get("question").is_none() {
+                return Err(tool_err(
+                    "ask 需要二者之一：单题给 question + options；多题给 questions=[{question, options}, …]。\
+                     需要多个维度才能决策时请用 questions 一次问完，不要一轮连发多次 ask。"
+                        .into(),
+                ));
+            }
+            let question = if has_questions {
+                // 占位：下面会用 questions[0] 覆盖它。
+                String::new()
+            } else {
+                input
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| tool_err("missing non-empty 'question' field".into()))?
+            };
 
             // options 宽松取值：正常是裸数组，但模型也会包一层对象
             // （实测实锤：programmer 发的是 `{"item":[...]}`,
             // 直接 as_array() 拿不到 → 'options' must be an array,
             // 提问废掉）。包一层时取其中唯一的数组字段，不猜键名。
             let opts_owned;
-            let opts_arr = match input.get("options") {
-                Some(serde_json::Value::Array(a)) => a,
-                Some(serde_json::Value::Object(map)) => {
-                    let mut arrays = map.values().filter_map(|v| v.as_array());
-                    match (arrays.next(), arrays.next()) {
-                        (Some(a), None) => {
-                            opts_owned = a.clone();
-                            &opts_owned
-                        }
-                        _ => {
-                            return Err(tool_err(
-                                "'options' must be an array（收到对象且无法确定其中的候选项数组）"
-                                    .into(),
-                            ))
+            let empty_opts: Vec<serde_json::Value> = Vec::new();
+            let opts_arr = if has_questions {
+                // 多题：顶层 options 不参与校验，下面用 questions[0] 覆盖。
+                &empty_opts
+            } else {
+                match input.get("options") {
+                    Some(serde_json::Value::Array(a)) => a,
+                    Some(serde_json::Value::Object(map)) => {
+                        let mut arrays = map.values().filter_map(|v| v.as_array());
+                        match (arrays.next(), arrays.next()) {
+                            (Some(a), None) => {
+                                opts_owned = a.clone();
+                                &opts_owned
+                            }
+                            _ => {
+                                return Err(tool_err(
+                                    "'options' must be an array（收到对象且无法确定其中的候选项数组）"
+                                        .into(),
+                                ))
+                            }
                         }
                     }
+                    _ => return Err(tool_err("'options' must be an array".into())),
                 }
-                _ => return Err(tool_err("'options' must be an array".into())),
             };
-            if opts_arr.len() < 2 {
+            if !has_questions && opts_arr.len() < 2 {
                 return Err(tool_err("'options' must have at least 2 entries".into()));
             }
             let mut options: Vec<ChoiceOption> = Vec::with_capacity(opts_arr.len());
@@ -6220,6 +6597,95 @@ pub fn register_ask_tool(
             }
 
             let choice_id = format!("choice-{}-{}", role_id, CHOICE_SEQ.fetch_add(1, Ordering::Relaxed));
+
+            // ── 多题分支：一次问 N 道，收齐才回 ────────────────────
+            //
+            // `questions` 非空时以它为准；单题字段退化为**第一题**的副本，
+            // 供旧前端 / 旧 pending-asks 快照仍能渲染出一道能答的题。
+            //
+            // 题目 id 由后端生成（`q1`/`q2`…）而不是让模型给：模型给的可能
+            // 重复或为空，而这个键是"收齐判定"的依据——重复会让一题的答案
+            // 顶掉另一题，导致永远收不齐、工具无限挂起。
+            let questions: Vec<ChoiceQuestion> = match input.get("questions") {
+                Some(v) => {
+                    let arr = v.as_array().ok_or_else(|| {
+                        tool_err("questions must be an array of {question, options} objects".into())
+                    })?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for (qi, q) in arr.iter().enumerate() {
+                        let qtext = q
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| {
+                                tool_err(format!("questions[{qi}].question must be a non-empty string"))
+                            })?;
+                        let qopts_arr = q
+                            .get("options")
+                            .and_then(|v| v.as_array())
+                            .ok_or_else(|| tool_err(format!("questions[{qi}].options must be an array")))?;
+                        if qopts_arr.len() < 2 {
+                            return Err(tool_err(format!(
+                                "questions[{qi}].options needs at least 2 entries（只有一个选项就不是选择题）"
+                            )));
+                        }
+                        let mut qopts: Vec<ChoiceOption> = Vec::with_capacity(qopts_arr.len());
+                        for (oi, o) in qopts_arr.iter().enumerate() {
+                            let opt: ChoiceOption = serde_json::from_value(o.clone()).map_err(|e| {
+                                tool_err(format!("questions[{qi}].options[{oi}] invalid: {e}"))
+                            })?;
+                            if opt.label.trim().is_empty() {
+                                return Err(tool_err(format!(
+                                    "questions[{qi}].options[{oi}].label must not be empty"
+                                )));
+                            }
+                            qopts.push(opt);
+                        }
+                        let qmulti = ["multi", "multiSelect", "multi_select", "multiple"]
+                            .iter()
+                            .filter_map(|k| q.get(*k))
+                            .find_map(lenient_bool)
+                            .unwrap_or(false)
+                            || question_implies_multi(&qtext);
+                        out.push(ChoiceQuestion {
+                            id: format!("q{}", qi + 1),
+                            question: qtext,
+                            multi: qmulti,
+                            layout: q
+                                .get("layout")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| *s == "grid")
+                                .unwrap_or("")
+                                .to_string(),
+                            allow_upload: ["allow_upload", "allowUpload"]
+                                .iter()
+                                .filter_map(|k| q.get(*k))
+                                .find_map(lenient_bool)
+                                .unwrap_or(false),
+                            options: qopts,
+                        });
+                    }
+                    if out.is_empty() {
+                        return Err(tool_err("questions must not be empty".into()));
+                    }
+                    out
+                }
+                None => Vec::new(),
+            };
+
+            // 单题字段：多题时取第一题作为兼容降级视图。
+            let (question, options, multi, layout, allow_upload) = match questions.first() {
+                Some(first) => (
+                    first.question.clone(),
+                    first.options.clone(),
+                    first.multi,
+                    first.layout.clone(),
+                    first.allow_upload,
+                ),
+                None => (question, options, multi, layout, allow_upload),
+            };
+
             let n = options.len();
             let requested = ChatEvent::ChoiceRequested {
                 role_id: role_id.clone(),
@@ -6230,6 +6696,7 @@ pub fn register_ask_tool(
                 allow_upload,
                 wait: blocking.is_some(),
                 options,
+                questions: questions.clone(),
             };
             let Some(blk) = blocking else {
                 // fire-and-forget：没有等待方，直接推给前端即可。
@@ -6248,9 +6715,23 @@ pub fn register_ask_tool(
                     persist.as_ref().map(|(c, s)| (c.as_path(), s.as_str())),
                 );
                 let _ = event_tx.send(requested);
-                return Ok(serde_json::Value::String(format!(
-                    "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
-                )));
+                // 多题时把"这一批一起答"讲清楚：模型此前会一轮连发多个
+                // ask，然后在只收到部分答案时就往下走（实测 jemalloc 会话
+                // 问 3 答 2 就启动了 4 条 workflow）。现在一次一批、一起
+                // 回来，提示语也要明确"等这一批全部答完"。
+                return Ok(serde_json::Value::String(if questions.len() > 1 {
+                    format!(
+                        "已向用户展示 1 个弹框、共 {} 道题（choice_id={choice_id}）。\
+                         用户会**一次性答完全部题目**，答案随下一条消息一起回来。\
+                         请输出一句简短引导语，然后结束本轮：不要调用其他工具，\
+                         不要只凭部分答案往下推进，也不要臆测用户会选哪个。",
+                        questions.len()
+                    )
+                } else {
+                    format!(
+                        "已向用户展示 {n} 个选项的选择框（choice_id={choice_id}）。请输出一句简短引导语（例如「请在上方选择」），然后结束本轮，不要调用其他工具，也不要臆测用户会选哪个——等待用户在弹框里选择后再继续。"
+                    )
+                }));
             };
             // 阻塞模式（workflow/delegate 子代理）：挂起等 UI 经
             // `/api/chat/choice-answer` 把答案送进 choice 路由；
@@ -8315,6 +8796,76 @@ mod tests {
         );
     }
 
+    /// 命名空间前缀的 think 标签 + **孤立闭标签**。
+    ///
+    /// 实测样本取自 2026-09-07 jemalloc 会话（模型 MiniMax-M3）：同一会话
+    /// 里 `<think>`/`</think>` 正常配对 255 次，另有 24 次只吐裸
+    /// `</mm:think>`。旧实现对后者完全免疫（`</mm:think>` 不含 `<think>`
+    /// 子串），于是 4 个连续闭标签进了 UI 气泡与 manager 的 tool_result。
+    #[test]
+    fn strip_think_blocks_handles_namespaced_and_orphan_tags() {
+        // 单个孤立闭标签：只删标签，正文照留
+        assert_eq!(
+            strip_think_blocks("</mm:think>头部信息已确认 KIND=code 在第 7 行出现一次。"),
+            "头部信息已确认 KIND=code 在第 7 行出现一次。"
+        );
+        // 日志原文：连续四个孤立闭标签
+        assert_eq!(
+            strip_think_blocks("</mm:think></mm:think></mm:think></mm:think>共 7 个 mermaid 图"),
+            "共 7 个 mermaid 图"
+        );
+        // 孤立的无前缀闭标签同样处理
+        assert_eq!(strip_think_blocks("</think>正文"), "正文");
+        // 带前缀的配对块：整块丢掉
+        assert_eq!(
+            strip_think_blocks("<mm:think>推理</mm:think>\n\n正文"),
+            "正文"
+        );
+        // 大小写不敏感
+        assert_eq!(strip_think_blocks("</MM:Think>正文"), "正文");
+        // 只有孤立闭标签、没有任何正文：返回空串，交给 is_empty_output 按
+        // 「空产出」正常判失败/重试。实测有 3 例 content 就是一个裸
+        // `</mm:think>`——回退原文会把纯噪声回显进 UI 气泡。
+        assert_eq!(strip_think_blocks("</mm:think>"), "");
+        assert_eq!(strip_think_blocks("</mm:think></mm:think>\n\n"), "");
+        // 但「有开标签、内容全是思维链」仍走回退原文（不给空负载）
+        assert_eq!(
+            strip_think_blocks("<mm:think>只有推理</mm:think>"),
+            "<mm:think>只有推理</mm:think>"
+        );
+        // 形似但不是 think 标签的内容不许被动到
+        assert_eq!(
+            strip_think_blocks("<thinking>保留</thinking>"),
+            "<thinking>保留</thinking>"
+        );
+        assert_eq!(strip_think_blocks("a < b 且 c > d"), "a < b 且 c > d");
+        // 非 ASCII 正文里出现标签：不许 panic（字节下标必须落在字符边界）
+        assert_eq!(
+            strip_think_blocks("中文前缀</mm:think>中文正文😀"),
+            "中文前缀中文正文😀"
+        );
+    }
+
+    /// `is_only_think_blocks` 是降级采纳路径的守门判据：产出只剩思维链时
+    /// 必须判 true，否则裸思维链会被当成中间结论穿给下游评审。
+    #[test]
+    fn is_only_think_blocks_covers_namespaced_variants() {
+        // 只有思维链 → true（两种前缀形态都要认）
+        assert!(is_only_think_blocks("<think>只有推理</think>"));
+        assert!(is_only_think_blocks("<mm:think>只有推理</mm:think>"));
+        assert!(is_only_think_blocks("<think>推理中断"));
+        // 只有孤立闭标签 = 空产出，不是「只剩思维链」（前者归
+        // is_empty_output 管，strip 已把它剥成空串）
+        assert!(!is_only_think_blocks("</mm:think>"));
+        // 有正式回答 → false
+        assert!(!is_only_think_blocks("<think>推理</think>结论：可行"));
+        assert!(!is_only_think_blocks("</mm:think>结论：可行"));
+        assert!(!is_only_think_blocks("结论：可行"));
+        // 空 / 纯空白不算「只剩思维链」（那是 is_empty_output 的职责）
+        assert!(!is_only_think_blocks(""));
+        assert!(!is_only_think_blocks("   \n\t "));
+    }
+
     /// 流式 delta 必须带 `sub_id`（与同一个 sink 里的 ToolUse /
     /// ToolResult 分支一致）。
     ///
@@ -9022,6 +9573,8 @@ mod tests {
             api_key: "test-key".into(),
             context_window: 32000,
             max_tokens: 4096,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: false,
@@ -9858,6 +10411,8 @@ mod tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -10583,6 +11138,8 @@ mod tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -10724,6 +11281,8 @@ mod tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -10929,6 +11488,8 @@ mod tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11269,6 +11830,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            questions: vec![],
         };
         let wire = crate::event_json::chat_event_to_frontend_json(&event).expect("frontend json");
         let v: serde_json::Value = serde_json::from_str(&wire).expect("parse wire");
@@ -11483,6 +12045,8 @@ mod tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11626,6 +12190,8 @@ mod tests {
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11721,11 +12287,216 @@ require = ["永远不可能出现的验收字符串"]
         wait_request_count(&server, 2).await;
         let reqs = server.received_requests().await.unwrap();
         let body2 = String::from_utf8_lossy(&reqs[1].body);
-        assert!(body2.contains("[自动善后]"), "第二轮是自动善后 turn: {body2}");
+        assert!(
+            body2.contains("[自动善后 1/"),
+            "第二轮是自动善后 turn，且标注第几次: {body2}"
+        );
         assert!(body2.contains("wf_id="), "善后输入带 wf_id: {body2}");
         assert!(body2.contains("请善后"), "善后输入带处置指令: {body2}");
+        assert!(
+            body2.contains("自动善后额度剩"),
+            "要告诉模型还剩几次，用尽会停下等人: {body2}"
+        );
 
         controller.abort().await;
+    }
+
+    /// 自动善后额度用尽 → **不再合成 followup**，停下来等用户拍板。
+    ///
+    /// 回归实测（2026-09-07 jemalloc 会话）：此前外层这个环没有任何计数，
+    /// 一条 implementation_plan 失败 → 自动善后 → manager 整条重跑 → …
+    /// 同一目标最终跑了 3 条（第一条 3.56M 输入 token 完全打水漂），
+    /// 用户在 UI 上只看到"又一条 workflow 开始跑"，没有插手的机会。
+    #[tokio::test]
+    async fn auto_remediation_budget_exhaustion_hands_back_to_user() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 额度 0 = 失败即刻转人工，最容易断言"没有善后 turn"。
+        std::env::set_var("LATTE_AGENT_AUTO_REMEDIATE_MAX", "0");
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "占位长回答，避免 advisor 短输出 gate 干扰测试断言。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("failwf.toml"),
+            r#"
+name = "failwf"
+command = "/failwf"
+[[steps]]
+id = "only"
+role = "manager"
+task = "做点事"
+[steps.output_contract]
+require = ["永远不可能出现的验收字符串"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(256);
+        let mut rx = controller.spawn(cfg).await;
+
+        controller.submit_input("/failwf 做点事").await;
+
+        // 先确认 workflow 的 worker step 真的跑了（=1 次模型调用）。
+        for _ in 0..200 {
+            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let ran = server.received_requests().await.map(|r| r.len()).unwrap_or(0);
+        assert!(ran >= 1, "workflow 的 worker step 应至少调一次模型，实际 {ran}");
+        // 额度用尽时应发一条「转人工」Status。订阅早于 submit_input，
+        // broadcast 会缓冲，不依赖调度时序。
+        let mut handoff: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(ChatEvent::Status { message })) => {
+                    seen.push(message.chars().take(60).collect());
+                    if message.contains("自动善后已用尽") {
+                        handoff = Some(message);
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => seen.push(format!("RecvError: {e:?}")),
+                Err(_) => {}
+            }
+        }
+        let msg = handoff.unwrap_or_else(|| {
+            std::env::remove_var("LATTE_AGENT_AUTO_REMEDIATE_MAX");
+            panic!("额度用尽时应发一条「转人工」Status。收到的 Status:\n{}", seen.join("\n"))
+        });
+        assert!(msg.contains("转人工"), "{msg}");
+        assert!(
+            msg.contains("LATTE_AGENT_AUTO_REMEDIATE_MAX"),
+            "要告诉用户额度怎么调: {msg}"
+        );
+        assert!(msg.contains("缩小范围重试"), "要给可执行选项: {msg}");
+        assert!(msg.contains("resume"), "要给 resume 选项: {msg}");
+
+        // 关键：只有 workflow 的那 1 次模型调用，**没有**自动善后 turn。
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let n = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            n, 1,
+            "额度为 0 时不该再开善后 turn（应停在等用户输入），实际 {n} 次模型调用"
+        );
+
+        controller.abort().await;
+        std::env::remove_var("LATTE_AGENT_AUTO_REMEDIATE_MAX");
+    }
+
+    /// 额度上限的环境变量解析与默认值。
+    #[test]
+    fn auto_remediation_budget_env_knob() {
+        std::env::remove_var("LATTE_AGENT_AUTO_REMEDIATE_MAX");
+        assert_eq!(default_max_auto_remediations(), 2, "默认给一次自救机会足够");
+        std::env::set_var("LATTE_AGENT_AUTO_REMEDIATE_MAX", "0");
+        assert_eq!(default_max_auto_remediations(), 0, "0 = 失败即刻转人工");
+        std::env::set_var("LATTE_AGENT_AUTO_REMEDIATE_MAX", "5");
+        assert_eq!(default_max_auto_remediations(), 5);
+        std::env::set_var("LATTE_AGENT_AUTO_REMEDIATE_MAX", " 3 ");
+        assert_eq!(default_max_auto_remediations(), 3, "应容忍空白");
+        std::env::set_var("LATTE_AGENT_AUTO_REMEDIATE_MAX", "不是数字");
+        assert_eq!(default_max_auto_remediations(), 2, "非法值回退默认");
+        std::env::remove_var("LATTE_AGENT_AUTO_REMEDIATE_MAX");
     }
 
     // ─── Soft-timeout warning plumbing ───────────────────────────
@@ -11779,6 +12550,8 @@ require = ["永远不可能出现的验收字符串"]
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11912,6 +12685,8 @@ require = ["永远不可能出现的验收字符串"]
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12049,6 +12824,8 @@ require = ["永远不可能出现的验收字符串"]
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12215,6 +12992,8 @@ require = ["永远不可能出现的验收字符串"]
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12973,6 +13752,8 @@ require = ["永远不可能出现的验收字符串"]
                     api_key: "test-key".into(),
                     context_window: 32000,
                     max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13820,4 +14601,107 @@ require = ["永远不可能出现的验收字符串"]
         assert!(!note.is_empty(), "0 命中必须给排查提示");
         assert!(note.contains("kind") || note.contains("lang"), "提示不可操作: {note}");
     }
+    // ─── split_delimited_path_entry：把模型自然写出的多路径收下 ──────
+    //
+    // 批量读采纳率实测只有 4.9%（2026-09-07 jemalloc 会话：430 次单文件
+    // read vs 22 次 paths）。与其指望模型学会 `paths` 数组，不如把它自然
+    // 写出来的形状也收下 —— 不依赖模型改变行为。
+
+    fn split_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.c", "b.h", "src/deep.rs", "My Notes, v2.md", "weird;name.txt"] {
+            let p = dir.path().join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn split_delimited_handles_comma_and_semicolon_and_space() {
+        let dir = split_fixture();
+        let cwd = dir.path().to_str().unwrap();
+        assert_eq!(
+            split_delimited_path_entry("a.c, b.h", Some(cwd)),
+            Some(vec!["a.c".into(), "b.h".into()])
+        );
+        assert_eq!(
+            split_delimited_path_entry("a.c;src/deep.rs", Some(cwd)),
+            Some(vec!["a.c".into(), "src/deep.rs".into()])
+        );
+        assert_eq!(
+            split_delimited_path_entry("a.c b.h", Some(cwd)),
+            Some(vec!["a.c".into(), "b.h".into()])
+        );
+        // 带行选择器的段也要能判存在
+        assert_eq!(
+            split_delimited_path_entry("a.c:1-40, b.h:raw", Some(cwd)),
+            Some(vec!["a.c:1-40".into(), "b.h:raw".into()])
+        );
+    }
+
+    /// **字面量优先**：真实文件名可以含逗号、空格、分号 —— 整串存在时绝不拆。
+    /// 这是 oh-my-pi 明确踩过的坑（issue #4618：拆分跑在了字面量检查之前）。
+    #[test]
+    fn split_delimited_never_breaks_a_real_filename() {
+        let dir = split_fixture();
+        let cwd = dir.path().to_str().unwrap();
+        assert_eq!(
+            split_delimited_path_entry("My Notes, v2.md", Some(cwd)),
+            None,
+            "含逗号+空格的真实文件名不得被拆"
+        );
+        assert_eq!(
+            split_delimited_path_entry("weird;name.txt", Some(cwd)),
+            None,
+            "含分号的真实文件名不得被拆"
+        );
+        assert_eq!(split_delimited_path_entry("a.c", Some(cwd)), None, "单个路径无需拆");
+    }
+
+    /// 任何一段不存在就不拆 —— 宁可原样报错，也不要把模型的一句话切碎。
+    #[test]
+    fn split_delimited_requires_every_part_to_exist() {
+        let dir = split_fixture();
+        let cwd = dir.path().to_str().unwrap();
+        assert_eq!(split_delimited_path_entry("a.c, nope.c", Some(cwd)), None);
+        assert_eq!(
+            split_delimited_path_entry("请读 a.c 和 b.h", Some(cwd)),
+            None,
+            "自然语言不该被当成多路径"
+        );
+    }
+
+    /// 没有 cwd 就无法验证段是否存在，一律不拆（无验证的拆分会误伤）。
+    #[test]
+    fn split_delimited_is_disabled_without_cwd() {
+        assert_eq!(split_delimited_path_entry("a.c, b.h", None), None);
+    }
+
+    /// 归一化整体：分隔符串最终变成 paths 数组。
+    #[test]
+    fn normalize_read_args_folds_delimited_path_into_paths() {
+        let dir = split_fixture();
+        let cwd = dir.path().to_str().unwrap();
+        let mut v = serde_json::json!({ "path": "a.c, b.h" });
+        normalize_read_path_args(&mut v, Some(cwd));
+        assert!(v.get("path").is_none(), "path 应被折叠掉: {v}");
+        assert_eq!(
+            v["paths"],
+            serde_json::json!(["a.c", "b.h"]),
+            "应折成 paths 数组: {v}"
+        );
+    }
+
+    /// 已经显式给了 paths 时不动 path（交给后面的"并入 paths"逻辑）。
+    #[test]
+    fn normalize_read_args_leaves_delimited_path_alone_when_paths_present() {
+        let dir = split_fixture();
+        let cwd = dir.path().to_str().unwrap();
+        let mut v = serde_json::json!({ "path": "a.c, b.h", "paths": ["src/deep.rs"] });
+        normalize_read_path_args(&mut v, Some(cwd));
+        // path 被并入 paths（既有行为），但不该先被拆成两条
+        assert!(v["paths"].as_array().unwrap().iter().any(|x| x == "a.c, b.h"));
+    }
+
 }

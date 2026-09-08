@@ -877,11 +877,224 @@ export function mountChat(opts: {
     choicePillEl = null;
   }
 
+  /** 多题弹框：一个卡片渲染 N 道题，**全部答完**才能提交，提交时一次
+   *  把 N 个答案送出。
+   *
+   *  为什么要这样而不是弹 N 个单题框：顶层 `ask` 是 fire-and-forget，
+   *  每个答案各自成一条 user 消息、各自一个 turn，于是角色会在只拿到
+   *  部分答案时就往下走。实测（2026-09-07 jemalloc 会话）manager 一轮
+   *  问 3 道，用户答完 2 道它就启动了 4 条 workflow，剩下 2 道的答案
+   *  在那些流水线跑完之后才到 —— 前面全按默认假设做了。 */
+  function renderMultiChoiceDialog(
+    bubble: HTMLElement,
+    e: ChoiceRequestedEvent,
+    opts?: { archived?: boolean },
+  ): void {
+    const archived = !!opts?.archived;
+    const questions = e.questions ?? [];
+    let forceMessage = false;
+    const card = document.createElement("div");
+    card.className = "choice-card multi-q" + (archived ? " answered" : "");
+    card.dataset.choiceId = e.choice_id;
+    let entry: ChoiceEntry | null = null;
+
+    const head = document.createElement("div");
+    head.className = "choice-head";
+    const chip = document.createElement("span");
+    chip.className = "choice-chip multi";
+    chip.textContent = `${questions.length} 道题 · 全部答完后一起提交`;
+    head.appendChild(chip);
+    card.appendChild(head);
+
+    /** 每题的选中项标签（按题序）。 */
+    const picked: (string[] | null)[] = questions.map(() => null);
+
+    const submitBtn = document.createElement("button");
+    submitBtn.className = "choice-submit";
+    submitBtn.textContent = "提交全部";
+    submitBtn.disabled = true;
+    const statusLine = document.createElement("div");
+    statusLine.className = "choice-status";
+
+    function refresh(): void {
+      const done = picked.filter((p) => p && p.length > 0).length;
+      statusLine.textContent = `已答 ${done} / ${questions.length}`;
+      // 少一题就不许提交 —— 这是"收齐才回"在 UI 侧的落点。
+      submitBtn.disabled = done < questions.length;
+    }
+
+    const qsWrap = document.createElement("div");
+    qsWrap.className = "choice-questions";
+    questions.forEach((q, qi) => {
+      const qBlock = document.createElement("div");
+      qBlock.className = "choice-q-block";
+      qBlock.dataset.questionId = q.id;
+
+      const qHead = document.createElement("div");
+      qHead.className = "choice-q-head";
+      const qChip = document.createElement("span");
+      qChip.className = "choice-chip" + (q.multi ? " multi" : "");
+      qChip.textContent = q.multi ? "多选" : "单选";
+      qHead.appendChild(qChip);
+      const qText = document.createElement("div");
+      qText.className = "choice-question";
+      // textContent：选项与题面来自模型，一律按纯文本渲染，不解释 HTML。
+      qText.textContent = `${qi + 1}. ${q.question}`;
+      qHead.appendChild(qText);
+      qBlock.appendChild(qHead);
+
+      const optsWrap = document.createElement("div");
+      optsWrap.className = "choice-opts" + (q.layout === "grid" ? " grid" : "");
+      const sel = new Set<number>();
+      q.options.forEach((opt, oi) => {
+        const btn = document.createElement("button");
+        btn.className = "choice-opt";
+        btn.type = "button";
+        const label = document.createElement("div");
+        label.className = "choice-opt-label";
+        label.textContent = opt.label;
+        btn.appendChild(label);
+        if (opt.description) {
+          const d = document.createElement("div");
+          d.className = "choice-opt-desc";
+          d.textContent = opt.description;
+          btn.appendChild(d);
+        }
+        btn.addEventListener("click", () => {
+          if (q.multi) {
+            if (sel.has(oi)) sel.delete(oi);
+            else sel.add(oi);
+          } else {
+            sel.clear();
+            sel.add(oi);
+          }
+          Array.from(optsWrap.children).forEach((c, ci) =>
+            c.classList.toggle("selected", sel.has(ci)),
+          );
+          picked[qi] = Array.from(sel)
+            .sort((a, b) => a - b)
+            .map((i) => q.options[i].label);
+          refresh();
+        });
+        optsWrap.appendChild(btn);
+      });
+      qBlock.appendChild(optsWrap);
+      qsWrap.appendChild(qBlock);
+    });
+    card.appendChild(qsWrap);
+
+    const foot = document.createElement("div");
+    foot.className = "choice-foot";
+    foot.appendChild(statusLine);
+    foot.appendChild(submitBtn);
+    card.appendChild(foot);
+
+    function finish(summary: string, send: null | (() => void)): void {
+      card.classList.add("answered");
+      qsWrap.style.display = "none";
+      foot.style.display = "none";
+      const done = document.createElement("div");
+      done.className = "choice-answer";
+      done.textContent = summary;
+      card.appendChild(done);
+      void dismissPrompt(e.choice_id).catch((err) =>
+        console.warn("[chat] prompt dismiss failed:", err),
+      );
+      if (entry) settleChoice(entry);
+      send?.();
+    }
+
+    submitBtn.addEventListener("click", () => {
+      const lines = questions.map(
+        (q, qi) => `${qi + 1}. ${q.question} → ${(picked[qi] ?? []).join("、")}`,
+      );
+      const summary = `你的选择：\n${lines.join("\n")}`;
+      const showError = (err: unknown) => {
+        console.error("[chat] multi choice submit failed:", err);
+        const box = card.querySelector<HTMLElement>(".choice-answer");
+        if (box) {
+          box.textContent = `${box.textContent}（发送失败：${
+            err instanceof Error ? err.message : String(err)
+          }，请手动输入你的选择）`;
+        }
+      };
+      if (e.wait && !forceMessage) {
+        // 阻塞路径：逐题投递，后端收齐才唤醒等待方（202 = 已收下、未收齐）。
+        finish(summary, () => {
+          void (async () => {
+            try {
+              let delivered = true;
+              for (let qi = 0; qi < questions.length; qi++) {
+                const ans = (picked[qi] ?? []).join("、");
+                const ok = await sendChoiceAnswer(e.choice_id, ans, questions[qi].id);
+                if (!ok) {
+                  delivered = false;
+                  break;
+                }
+              }
+              // 任何一题没送达（挂起项已消失 / 服务重启）→ 整批降级为
+              // 普通 user 消息，语义对用户诚实，也不会只送一半。
+              if (!delivered) await sendMessage(`我的选择：\n${lines.join("\n")}`);
+            } catch (err) {
+              showError(err);
+            }
+          })();
+        });
+      } else {
+        // fire-and-forget：N 个答案合成**一条** user 消息，只起一个 turn。
+        // 这正是修的那个问题 —— 不再是"每答一题就一个 turn"。
+        finish(summary, () => {
+          sendMessage(`我的选择：\n${lines.join("\n")}`).catch(showError);
+        });
+      }
+    });
+
+    if (archived) {
+      submitBtn.disabled = true;
+      const revive = document.createElement("button");
+      revive.className = "choice-revive";
+      revive.textContent = "仍要回答";
+      revive.addEventListener("click", () => {
+        forceMessage = true;
+        card.classList.remove("answered");
+        qsWrap.style.display = "";
+        foot.style.display = "";
+        revive.remove();
+        refresh();
+      });
+      card.appendChild(revive);
+    } else {
+      refresh();
+    }
+
+    bubble.appendChild(card);
+    // 与单题路径同一套队列登记：卡片在消息流与弹窗之间搬家，只有一份。
+    if (archived) return;
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "choice-moved-hint";
+    hint.style.display = "none";
+    hint.addEventListener("click", () => {
+      if (entry) openChoiceModal(entry);
+    });
+    bubble.appendChild(hint);
+    entry = { e, card, home: bubble, hint, answered: false, collapsed: false };
+    choiceQueue.push(entry);
+    pumpChoiceQueue();
+  }
+
   function renderChoiceDialog(
     bubble: HTMLElement,
     e: ChoiceRequestedEvent,
     opts?: { archived?: boolean },
   ): void {
+    // 多题弹框走独立渲染：一个卡片 N 道题、一个提交按钮，**全部答完**
+    // 才能提交。单题形态（questions 空/缺省）继续走下面原来的路径，
+    // 逐字不变。
+    if ((e.questions?.length ?? 0) > 1) {
+      renderMultiChoiceDialog(bubble, e, opts);
+      return;
+    }
     const archived = !!opts?.archived;
     // 存档卡片经「仍要回答」复活时置真：强制走普通 user 消息，
     // 不再尝试 choice 路由（原等待方已随进程一起消失）。

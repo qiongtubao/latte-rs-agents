@@ -122,6 +122,60 @@ export function extractImportableTasks(text: string): ImportTask[] | null {
   return null;
 }
 
+/** 只读门禁摘要块：契约 / 返工环 / 取证要求。
+ *
+ *  表单 Tab 能编辑的只有 id/description/speakers/prompt/output_key 五个
+ *  字段，而 TOML 里一个 step 能配 28 个 —— 决定「产出合格与否、要不要
+ *  返工」的那些全在表单之外。看不见的门禁就是会写错的门禁：实测
+ *  2026-09-07 jemalloc 会话里 `learn.toml` 的 verify 步把
+ *  `require = ["KIND","PASS","FAIL"]` 写成 AND 语义（任务书写的是
+ *  「输出 PASS **或** FAIL」），100% 不可能满足、每次靠 advisor 兜底
+ *  放行，UI 上却完全看不出有这道门。 */
+export function makeGatesBlock(gates: string[]): HTMLElement {
+  const box = document.createElement("div");
+  box.className = "workflow-step-gates";
+  const lab = document.createElement("span");
+  lab.className = "models-form-label";
+  lab.textContent = "门禁（只读）";
+  box.appendChild(lab);
+  if (gates.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "models-form-note workflow-gates-empty";
+    empty.textContent = "无 —— 本步产出不校验、不返工";
+    box.appendChild(empty);
+    return box;
+  }
+  const ul = document.createElement("ul");
+  ul.className = "workflow-gates-list";
+  for (const g of gates) {
+    const li = document.createElement("li");
+    li.textContent = g;
+    ul.appendChild(li);
+  }
+  box.appendChild(ul);
+  const note = document.createElement("span");
+  note.className = "models-form-note";
+  note.textContent = "这些字段只能在「TOML」Tab 编辑";
+  box.appendChild(note);
+  return box;
+}
+
+/** 从步骤卡片的 `dataset.gates` 还原只读门禁列表。
+ *
+ *  为什么需要：`collectSteps` 会从 DOM 重建 StepForm（移动/增删步骤都会
+ *  触发 renderSteps）。门禁是后端产物、表单里没有对应输入框，不带过去的话
+ *  一次「↑」就把摘要显示成空的了。坏数据一律退化为空列表，不抛异常。 */
+export function parseGatesDataset(raw: string | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((x): x is string => typeof x === "string");
+  } catch {
+    return [];
+  }
+}
+
 export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPanelController {
   const { container } = opts;
   let items: WorkflowSummary[] = [];
@@ -460,6 +514,17 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
     testBtn.addEventListener("click", () => openRunModal());
     actions.appendChild(testBtn);
 
+    // 试运行走的是「表单 → WorkflowDef」的转换（后端 workflows.rs 的
+    // `def_from_form`），那条路把 output_contract / loop_* / require_* /
+    // tools 全部置空 —— 也就是说**试运行不施加任何门禁**，行为与正式跑
+    // 不一致。不标出来的话，UI 上试跑通过会给人「没问题」的错觉，而正式
+    // 跑起来还有一堆看不见的门。
+    const trialNote = document.createElement("span");
+    trialNote.className = "models-form-note workflow-trial-note";
+    trialNote.textContent =
+      "⚠️ 试运行不施加门禁（契约 / 返工环 / 取证要求一律不生效），只验流程走得通；正式跑以 TOML 为准";
+    actions.appendChild(trialNote);
+
     if (current && current.source === "global") {
       const note = document.createElement("span");
       note.className = "models-form-note";
@@ -601,6 +666,11 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
     card.appendChild(promptRow);
 
     card.appendChild(makeStepField("output_key（可选）", "text", step.output_key ?? "", "本步输出写入的变量名"));
+    card.appendChild(makeGatesBlock(step.gates ?? []));
+    // gates 是只读的后端产物，但 collectSteps 会从 DOM 重建 StepForm
+    // （移动/增删步骤都会触发 renderSteps）。挂在 dataset 上带过去，
+    // 否则一次「↑」就把门禁摘要显示成空的了。
+    card.dataset.gates = JSON.stringify(step.gates ?? []);
     return card;
   }
 
@@ -650,12 +720,15 @@ export function mountWorkflowsPanel(opts: { container: UIBinding }): WorkflowsPa
       );
       const speakers = order.filter(id => checked.has(id));
       const outputKey = fieldValue(card, "output_key");
+      // 只读门禁：从 dataset 带回来，别让重渲染把它吃掉。
+      const gates = parseGatesDataset(card.dataset.gates);
       return {
         id: fieldValue(card, "id"),
         description: fieldValue(card, "description"),
         speakers,
         prompt: fieldValue(card, "prompt"),
         output_key: outputKey || null,
+        gates,
       };
     });
   }

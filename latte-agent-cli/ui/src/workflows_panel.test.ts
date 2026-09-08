@@ -55,3 +55,25 @@ describe("extractImportableTasks（试运行 transcript → 可导入任务）",
     expect(tasks![0].title).toBe("修复登录页");
   });
 });
+
+// ─── 只读门禁摘要：dataset 往返（纯函数，DOM 部分见 .test.tsx） ───
+import { parseGatesDataset } from "./workflows_panel";
+
+describe("parseGatesDataset（重渲染后门禁不丢）", () => {
+  it("正常往返", () => {
+    const gates = ["产出至少 300 字符", "禁止出现：TBD / 待补充"];
+    expect(parseGatesDataset(JSON.stringify(gates))).toEqual(gates);
+  });
+
+  it("空 / undefined / 坏 JSON / 非数组 → 空列表，不抛异常", () => {
+    expect(parseGatesDataset(undefined)).toEqual([]);
+    expect(parseGatesDataset("")).toEqual([]);
+    expect(parseGatesDataset("{不是 json")).toEqual([]);
+    expect(parseGatesDataset('{"a":1}')).toEqual([]);
+    expect(parseGatesDataset("null")).toEqual([]);
+  });
+
+  it("数组里的非字符串项被过滤掉", () => {
+    expect(parseGatesDataset('["ok", 1, null, {"a":1}, "yes"]')).toEqual(["ok", "yes"]);
+  });
+});

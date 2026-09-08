@@ -42,6 +42,14 @@ struct Pending {
     /// 该弹框所属的事件通道（= session 的 broadcast）。用
     /// `same_channel` 判归属，不必把 session_id 一路透传到工具层。
     chan: broadcast::Sender<ChatEvent>,
+    /// 多题弹框期待的题目 id 列表（按题序）。空 = 单题形态。
+    ///
+    /// 收齐判定的依据：只有 [`expected`] 里每一个 id 都在 [`collected`]
+    /// 里有答案时才 `send`。少一题就继续等 —— 否则就退化成"答一部分就
+    /// 往下走"，正是要修的那个问题。
+    expected: Vec<String>,
+    /// 已收到的逐题答案（question_id → answer）。
+    collected: HashMap<String, String>,
 }
 
 static PENDING: LazyLock<Mutex<HashMap<String, Pending>>> =
@@ -201,9 +209,22 @@ pub fn register(
     chan: broadcast::Sender<ChatEvent>,
 ) -> oneshot::Receiver<String> {
     let (tx, rx) = oneshot::channel();
+    // 多题弹框：从事件里抽出题目 id 作为"收齐"判据。
+    let expected: Vec<String> = match &event {
+        ChatEvent::ChoiceRequested { questions, .. } if questions.len() > 1 => {
+            questions.iter().map(|q| q.id.clone()).collect()
+        }
+        _ => Vec::new(),
+    };
     PENDING.lock().unwrap().insert(
         choice_id.to_string(),
-        Pending { answer: tx, event, chan },
+        Pending {
+            answer: tx,
+            event,
+            chan,
+            expected,
+            collected: HashMap::new(),
+        },
     );
     rx
 }
@@ -232,6 +253,51 @@ pub fn resolve(choice_id: &str, answer: String) -> bool {
         }
         None => false,
     }
+}
+
+/// 投递**多题弹框里某一道题**的答案。
+///
+/// 只有 `expected` 里每道题都收到答案时才真正 `send` 并摘除挂起项；
+/// 少一题就留在表里继续等 —— 这是"收齐才回"的落点。返回值：
+/// - `Ok(true)`  收齐并已送达等待方；
+/// - `Ok(false)` 已收下这一题，还在等其余题；
+/// - `Err(())`   没有匹配的挂起项（未知 id / 已回答 / 已取消）。
+///
+/// # 为什么要收齐
+///
+/// 顶层 `ask` 是 fire-and-forget、每个答案各自成一个 turn，于是"一轮问
+/// 3 题"会让角色在只拿到部分答案时就往下走。实测（2026-09-07 jemalloc
+/// 会话）manager 问 3 题、用户答完 2 题它就启动了 4 条 workflow，剩下
+/// 2 题的答案在那些流水线跑完之后才到 —— 前面全按默认假设做了。
+pub fn resolve_one(choice_id: &str, question_id: &str, answer: String) -> Result<bool, ()> {
+    let mut g = PENDING.lock().unwrap();
+    let Some(p) = g.get_mut(choice_id) else {
+        return Err(());
+    };
+    // 单题形态没有 expected：按整体答案处理，保持既有语义。
+    if p.expected.is_empty() {
+        let p = g.remove(choice_id).expect("just checked");
+        return Ok(p.answer.send(answer).is_ok());
+    }
+    if !p.expected.iter().any(|id| id == question_id) {
+        // 未知题号：不能当成"收齐进度"，否则永远收不齐。
+        return Err(());
+    }
+    p.collected.insert(question_id.to_string(), answer);
+    if p.collected.len() < p.expected.len() {
+        return Ok(false);
+    }
+    // 收齐 → 按题序拼成一份可读答案交给等待方。
+    let p = g.remove(choice_id).expect("just checked");
+    let joined = p
+        .expected
+        .iter()
+        .filter_map(|id| p.collected.get(id).map(|a| (id, a)))
+        .enumerate()
+        .map(|(i, (_, a))| format!("{}. {a}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(p.answer.send(joined).is_ok())
 }
 
 /// 超时或取消时清理挂起项，避免泄漏。
@@ -284,6 +350,7 @@ mod tests {
             allow_upload: false,
             wait: true,
             options: vec![],
+            questions: vec![],
         };
         (ev, tx)
     }
@@ -525,4 +592,123 @@ mod tests {
         cancel("choice-union-block");
         clear_prompts_for_channel(&chan);
     }
+    // ─── 多题弹框：收齐才回 ─────────────────────────────────────────
+    //
+    // 回归 2026-09-07 jemalloc 会话：manager 一轮连发 3 道 ask，用户答完
+    // 前 2 道它就启动了 4 条 workflow，剩下 2 道的答案在流水线跑完之后
+    // 才到 —— 前面全按默认假设做了。这一组测试钉住"少一题就继续等"。
+
+    fn multi_event(choice_id: &str, ids: &[&str]) -> ChatEvent {
+        ChatEvent::ChoiceRequested {
+            role_id: "manager".into(),
+            choice_id: choice_id.into(),
+            question: "第一题".into(),
+            multi: false,
+            layout: String::new(),
+            allow_upload: false,
+            wait: true,
+            options: vec![],
+            questions: ids
+                .iter()
+                .map(|id| crate::controller::ChoiceQuestion {
+                    id: (*id).into(),
+                    question: format!("题 {id}"),
+                    multi: false,
+                    layout: String::new(),
+                    allow_upload: false,
+                    options: vec![],
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_question_waits_until_every_answer_arrives() {
+        let (tx, _rx0) = broadcast::channel(8);
+        let id = "choice-manager-multi-1";
+        let mut rx = register(id, multi_event(id, &["q1", "q2", "q3"]), tx);
+
+        assert_eq!(resolve_one(id, "q1", "小白".into()), Ok(false), "答 1/3 不该放行");
+        assert!(rx.try_recv().is_err(), "还没收齐就不能有答案送达");
+        assert_eq!(resolve_one(id, "q2", "清单+教程".into()), Ok(false), "答 2/3 仍不放行");
+        assert!(rx.try_recv().is_err(), "这正是实测里 manager 提前开工的那一刻");
+
+        assert_eq!(resolve_one(id, "q3", "先广后深".into()), Ok(true), "收齐才放行");
+        let got = rx.await.expect("收齐后应送达");
+        assert!(got.contains("小白") && got.contains("清单+教程") && got.contains("先广后深"), "{got}");
+        // 按题序编号，便于模型对号
+        assert!(got.starts_with("1. 小白"), "{got}");
+    }
+
+    #[tokio::test]
+    async fn multi_question_same_answer_twice_does_not_fake_completion() {
+        let (tx, _rx0) = broadcast::channel(8);
+        let id = "choice-manager-multi-2";
+        let mut rx = register(id, multi_event(id, &["q1", "q2"]), tx);
+        assert_eq!(resolve_one(id, "q1", "A".into()), Ok(false));
+        // 同一题重复回答只是覆盖，不能把进度算成 2/2
+        assert_eq!(resolve_one(id, "q1", "A2".into()), Ok(false), "重复答同一题不算收齐");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(resolve_one(id, "q2", "B".into()), Ok(true));
+        let got = rx.await.unwrap();
+        assert!(got.contains("A2") && got.contains("B"), "覆盖后取最新: {got}");
+    }
+
+    #[tokio::test]
+    async fn multi_question_rejects_unknown_question_id() {
+        let (tx, _rx0) = broadcast::channel(8);
+        let id = "choice-manager-multi-3";
+        let _rx = register(id, multi_event(id, &["q1", "q2"]), tx);
+        assert_eq!(
+            resolve_one(id, "q9", "野答案".into()),
+            Err(()),
+            "未知题号不能被计入收齐进度，否则永远收不齐"
+        );
+    }
+
+    /// 单题形态**逐字不变**：`resolve` 老路径照旧，`resolve_one` 对没有
+    /// `expected` 的挂起项按整体答案处理。旧 pending-asks 快照、
+    /// AnswerLog 续跑、UI 去重都依赖这条。
+    #[tokio::test]
+    async fn single_question_path_is_unchanged() {
+        let (tx, _rx0) = broadcast::channel(8);
+        let id = "choice-manager-single-1";
+        let ev = ChatEvent::ChoiceRequested {
+            role_id: "manager".into(),
+            choice_id: id.into(),
+            question: "只有一题".into(),
+            multi: false,
+            layout: String::new(),
+            allow_upload: false,
+            wait: true,
+            options: vec![],
+            questions: vec![],
+        };
+        let rx = register(id, ev, tx.clone());
+        assert!(resolve(id, "答案".into()), "老 resolve 路径不变");
+        assert_eq!(rx.await.unwrap(), "答案");
+
+        // resolve_one 打到单题挂起项上时按整体答案处理
+        let id2 = "choice-manager-single-2";
+        let ev2 = ChatEvent::ChoiceRequested {
+            role_id: "manager".into(),
+            choice_id: id2.into(),
+            question: "只有一题".into(),
+            multi: false,
+            layout: String::new(),
+            allow_upload: false,
+            wait: true,
+            options: vec![],
+            questions: vec![],
+        };
+        let rx2 = register(id2, ev2, tx);
+        assert_eq!(resolve_one(id2, "ignored", "整体答案".into()), Ok(true));
+        assert_eq!(rx2.await.unwrap(), "整体答案");
+    }
+
+    #[tokio::test]
+    async fn resolve_one_reports_missing_pending() {
+        assert_eq!(resolve_one("no-such-choice", "q1", "x".into()), Err(()));
+    }
+
 }

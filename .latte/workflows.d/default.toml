@@ -20,7 +20,10 @@ prompt = "从技术角度审查上述需求。建议架构方案，识别风险�
 id = "implementation"
 description = "程序员估算实现方法和工期"
 speakers = ["programmer"]
-prompt = "根据上述需求和架构，估算实现方案。识别关键模块、数据流和复杂度。"
+# 见 requirements_review.toml 的 estimate 步：估算步骤必须摘掉
+# write / bash，否则 programmer 会把估算做成实现。
+tools = ["read", "search", "code_graph"]
+prompt = "根据上述需求和架构，估算实现方案。识别关键模块、数据流和复杂度。**只估算，禁止修改文件或编译运行**。"
 [[steps]]
 id = "quality"
 description = "测试员识别测试策略和边界用例"
