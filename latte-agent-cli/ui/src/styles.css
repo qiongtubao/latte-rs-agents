@@ -2326,6 +2326,126 @@ select {
   margin-bottom: 6px;
 }
 
+
+/* ─── tool_fix 人工介入卡片（详见 ui/src/chat_impl.ts::renderToolFixDialog）── */
+/* 卡片形似 ChoiceDialog；编辑器本身是等宽字体 + 深色背景的代码块样式，
+ * 让用户一眼看出「这是 JSON 不是自然语言」。与已提交卡片区分：
+ * answered 态把可编辑区变只读、留 summary + 修正后参数快照。 */
+.tool-fix-card {
+  margin-top: 10px;
+  border: 1px solid #dc2626;
+  border-left: 4px solid #dc2626;
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #fef2f2;
+  font-size: 0.9em;
+}
+.tool-fix-card.answered {
+  border-color: var(--border);
+  background: var(--bg, #fff);
+}
+.tool-fix-card__head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.tool-fix-card__head .choice-chip {
+  align-self: flex-start;
+  background: #dc2626;
+  color: #fff;
+}
+.tool-fix-card.answered .choice-chip {
+  background: #94a3b8;
+}
+.tool-fix-card__tool {
+  font-weight: 600;
+  color: #991b1b;
+}
+.tool-fix-card.answered .tool-fix-card__tool {
+  color: var(--text, #1e293b);
+}
+.tool-fix-card__err {
+  font-size: 0.85em;
+  color: #7f1d1d;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  white-space: pre-wrap;
+}
+.tool-fix-card__broken-wrap,
+.tool-fix-card__fix-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.tool-fix-card__label {
+  font-size: 0.8em;
+  color: #475569;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tool-fix-card__broken {
+  margin: 0;
+  padding: 10px 12px;
+  background: #1e293b;
+  color: #f8fafc;
+  border-radius: 6px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  font-size: 0.85em;
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow: auto;
+}
+.tool-fix-card__editor {
+  width: 100%;
+  min-height: 80px;
+  padding: 10px 12px;
+  background: #f1f5f9;
+  color: #0f172a;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+  font-size: 0.85em;
+  line-height: 1.4;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.tool-fix-card__editor.read-only {
+  background: #f8fafc;
+  color: #475569;
+}
+.tool-fix-card__foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.tool-fix-card__foot .choice-status {
+  margin-right: auto;
+}
+.tool-fix-card__cancel {
+  padding: 6px 12px;
+  background: transparent;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.tool-fix-card__cancel:hover:not(:disabled) {
+  background: #f1f5f9;
+}
+.tool-fix-card__cancel:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.tool-fix-card__summary {
+  flex-basis: 100%;
+  margin-top: 8px;
+  font-size: 0.8em;
+  color: #16a34a;
+  font-style: italic;
+}
 /* ─── Workflows 面板（详见 ui/src/workflows_panel.ts） ─────────────── */
 
 .workflow-steps {

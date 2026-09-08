@@ -230,7 +230,31 @@ export type ChatEvent =
       message: string;
       screenshot?: string;
       data?: unknown;
-      timestamp_unix_ms: number;
+    }
+  | {
+      /** **工具参数死循环/反复报错**时的人工介入弹窗（latte-agent-core
+       * `tool_fix` 模块，Scheme A 触发的 HIL）。`malformed_args` 是模型
+       * 最近一次送出的坏 JSON（已经本地启发式 / subsession 修复都救不
+       * 回来），用户在前端改完后通过 `sendChoiceAnswer(choice_id, …)`
+       * 直达挂起方——后端 `prune_failed_rounds` 会把前 N 轮纠错历史
+       * 裁掉、注一条「工具参数已由人工修正」进 messages，单步正确执行。
+       *
+       * 与 `ChoiceRequested` 的关系：复用同一条 choice 路由（`POST
+       * /api/chat/choice-answer` + `prompt-dismiss`），所以前端不必新
+       * 增任何网络层。`wait=false` 是 fire-and-forget 形态（不挂起、
+       * 仅通知），按 status pill 展示，不弹模态框——与 `ChoiceRequested.wait`
+       * 语义一致。
+       *
+       * `role_id` / `tool_name` 是给人看的；`choice_id` 是路由键（不要
+       * 自己拼，**完全沿用后端生成的稳定 id**，否则取消/作答都会落到
+       * 错的挂起项上、模型侧表现为没收到答案）。 */
+      type: "ToolFixRequested";
+      role_id: string;
+      choice_id: string;
+      tool_name: string;
+      malformed_args: string;
+      error_detail: string;
+      wait?: boolean;
     };
 export interface SelfLoopEvent {
   kind: "started" | "iteration" | "log" | "screenshot" | "done" | "error";

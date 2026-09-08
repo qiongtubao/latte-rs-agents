@@ -3526,7 +3526,7 @@ async fn build_runner(
         if let Some(path) = current_session_file.as_ref() {
             runner = runner.with_current_session_file(path.clone());
         }
-    let mut runner = runner.with_tool_fix_event_tx(event_tx.clone());
+        runner = runner.with_tool_fix_event_tx(event_tx.clone());
         // 这条 `.with_sink` 此前漏了：`runner_sink` 构造完就被丢弃
         // （编译器只报了个 unused variable 警告，实际后果是无工具角色的
         // trace 事件既不落子会话日志、也不经 ChatEventTraceSink 广播给

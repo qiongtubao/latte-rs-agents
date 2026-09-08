@@ -1,8 +1,9 @@
 import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
-
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
+/** ToolFixRequested 事件的窄化类型（tool_fix Scheme A 触发的人工介入）。 */
+type ToolFixRequestedEvent = Extract<ChatEvent, { type: "ToolFixRequested" }>;
 import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
@@ -1427,6 +1428,179 @@ export function mountChat(opts: {
     hint.addEventListener("click", () => { if (entry) openChoiceModal(entry); });
     bubble.appendChild(hint);
     entry = { e, card, home: bubble, hint, answered: false, collapsed: false };
+    choiceQueue.push(entry);
+    pumpChoiceQueue();
+  }
+
+  // ── tool_fix 人工介入卡片（Scheme A） ──
+  // 同一条 ChoiceRequested 路由（`POST /api/chat/choice-answer` +
+  // `prompt-dismiss`），但卡的不是选择题、是要**直接改一个 JSON
+  // 字符串**——给用户一个代码编辑器式的输入框，预填最近一次坏参数，
+  // 改完提交；后端 `prune_failed_rounds` 会把前 N 轮纠错历史裁掉、
+  // 注一条「工具参数已由人工修正」进 messages，单步正确执行。
+  //
+  // 复用 ChoiceEntry / pumpChoiceQueue 的弹窗搬运机制，行为与
+  // ChoiceRequested 完全一致：wait=true 弹模态；wait=false 仅
+  // status 提示，不挂起。卡片在消息流与弹窗之间搬家，永远只有一份。
+  function renderToolFixDialog(
+    bubble: HTMLElement,
+    e: ToolFixRequestedEvent,
+    opts?: { archived?: boolean },
+  ): void {
+    const archived = !!opts?.archived;
+    const card = document.createElement("div");
+    card.className = "tool-fix-card" + (archived ? " answered" : "");
+    card.dataset.choiceId = e.choice_id;
+    let entry: ChoiceEntry | null = null;
+
+    const head = document.createElement("div");
+    head.className = "tool-fix-card__head";
+    const chip = document.createElement("span");
+    chip.className = "choice-chip";
+    chip.textContent = archived ? "已收到修正（历史）" : "工具参数需修正";
+    head.appendChild(chip);
+    const toolLine = document.createElement("div");
+    toolLine.className = "tool-fix-card__tool";
+    toolLine.textContent = `${e.role_id} · ${e.tool_name} 反复报错（连续 ${"8" /* PERMANENT_BREAK_AT */} 次无法自愈）`;
+    head.appendChild(toolLine);
+    const errLine = document.createElement("div");
+    errLine.className = "tool-fix-card__err";
+    errLine.textContent = e.error_detail;
+    head.appendChild(errLine);
+    card.appendChild(head);
+
+    // 坏参数只读展示：让用户看见模型错在哪，而不是让他盲改。textContent
+    // 防 XSS（错误信息含模型原文，不可信）。
+    const brokenWrap = document.createElement("div");
+    brokenWrap.className = "tool-fix-card__broken-wrap";
+    const brokenLabel = document.createElement("div");
+    brokenLabel.className = "tool-fix-card__label";
+    brokenLabel.textContent = "原始（坏）参数";
+    brokenWrap.appendChild(brokenLabel);
+    const broken = document.createElement("pre");
+    broken.className = "tool-fix-card__broken";
+    broken.textContent = e.malformed_args;
+    brokenWrap.appendChild(broken);
+    card.appendChild(brokenWrap);
+
+    // 修正区：等宽字体 textarea，预填坏参数——常见修复就是删个尾巴逗号，
+    // 不想让用户从头敲。
+    const fixWrap = document.createElement("div");
+    fixWrap.className = "tool-fix-card__fix-wrap";
+    const fixLabel = document.createElement("div");
+    fixLabel.className = "tool-fix-card__label";
+    fixLabel.textContent = "修正后的参数（修改后提交；放弃则本轮放弃）";
+    fixWrap.appendChild(fixLabel);
+    const ta = document.createElement("textarea");
+    ta.className = "tool-fix-card__editor";
+    ta.value = e.malformed_args;
+    ta.spellcheck = false;
+    ta.rows = Math.min(12, Math.max(4, e.malformed_args.split("\n").length + 2));
+    fixWrap.appendChild(ta);
+    card.appendChild(fixWrap);
+
+    const foot = document.createElement("div");
+    foot.className = "tool-fix-card__foot";
+    const statusLine = document.createElement("div");
+    statusLine.className = "choice-status";
+    statusLine.textContent = "";
+    const submitBtn = document.createElement("button");
+    submitBtn.className = "choice-submit";
+    submitBtn.type = "button";
+    submitBtn.textContent = "提交修正";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.className = "tool-fix-card__cancel";
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "放弃";
+    foot.append(statusLine, cancelBtn, submitBtn);
+    card.appendChild(foot);
+
+    function finish(summary: string): void {
+      card.classList.add("answered");
+      // 关弹窗、卡片搬回消息流（answered 态留痕）。
+      const summaryEl = document.createElement("div");
+      summaryEl.className = "tool-fix-card__summary";
+      summaryEl.textContent = summary;
+      // 把可交互区藏起来，留 summary + 修正后参数可读快照。
+      ta.readOnly = true;
+      ta.classList.add("read-only");
+      submitBtn.disabled = true;
+      cancelBtn.disabled = true;
+      foot.appendChild(summaryEl);
+      void dismissPrompt(e.choice_id).catch((err) =>
+        console.warn("[chat] tool_fix prompt dismiss failed:", err),
+      );
+      if (entry) settleChoice(entry);
+    }
+
+    submitBtn.addEventListener("click", () => {
+      const corrected = ta.value;
+      const summary = `修正后的 ${e.tool_name} 参数（${corrected.length} 字符）`;
+      const showError = (err: unknown) => {
+        console.error("[chat] tool_fix submit failed:", err);
+        statusLine.textContent = `发送失败：${err instanceof Error ? err.message : String(err)}`;
+      };
+      // tool_fix 只有 wait=true 这一形态（HIL 必挂起），但为了与 ChoiceDialog
+      // 语义对齐这里仍分两路：wait=true 直达；wait=false 降级为普通 user
+      // 消息（虽然后端基本不会发 wait=false 的 ToolFixRequested）。
+      if (e.wait !== false) {
+        finish(summary);
+        sendChoiceAnswer(e.choice_id, corrected)
+          .then((delivered) => {
+            if (!delivered) {
+              // 挂起项已消失（超时/服务重启）→ 整条降级为 user 消息。
+              statusLine.textContent = "等待方已失效，已降级为消息发送";
+              return sendMessage(
+                `[tool_fix 手动修正 ${e.tool_name}] ${corrected}`,
+              );
+            }
+            return Promise.resolve();
+          })
+          .catch(showError);
+      } else {
+        finish(summary);
+        sendMessage(`[tool_fix 手动修正 ${e.tool_name}] ${corrected}`).catch(
+          showError,
+        );
+      }
+    });
+
+    cancelBtn.addEventListener("click", () => {
+      // cancel 走与 submit 同一条 dismiss 路由（幂等）；后端 choice 表里
+      // 这条 entry 被注销，runner 的 50ms 超时再回来时已经拿不到挂起项、
+      // 走回 ToolLoopDetected 终止路径。无需单独的 cancel 端点。
+      finish("已放弃本轮修正（后端将走原 ToolLoopDetected 终止路径）");
+    });
+
+    bubble.appendChild(card);
+    if (archived) {
+      submitBtn.disabled = true;
+      cancelBtn.disabled = true;
+      ta.readOnly = true;
+      ta.classList.add("read-only");
+      return;
+    }
+    const hint = document.createElement("button");
+    hint.type = "button";
+    hint.className = "choice-moved-hint";
+    hint.addEventListener("click", () => {
+      if (entry) openChoiceModal(entry);
+    });
+    bubble.appendChild(hint);
+    // 复用 ChoiceEntry / choiceQueue / pumpChoiceQueue 这套机制——
+    // 与 ChoiceRequested 走完全相同的弹窗/收起/待办铃路径。
+    // 字段类型上 `e` 这里是 ToolFixRequestedEvent，但 ChoiceEntry.e
+    // 是 ChoiceRequestedEvent——这里强转是因为 ChoiceEntry 的字段
+    // 只用到 choice_id + 给模态留 generic 占位（openChoiceModal 不读
+    // 内部字段），后续如果 ChoiceEntry 抽公共基类再去掉这个转换。
+    entry = {
+      e: e as unknown as ChoiceRequestedEvent,
+      card,
+      home: bubble,
+      hint,
+      answered: false,
+      collapsed: false,
+    };
     choiceQueue.push(entry);
     pumpChoiceQueue();
   }
@@ -2970,6 +3144,35 @@ export function mountChat(opts: {
         }
         workflowTranscripts.delete(e.wf_id);
         setFooter(`workflow ${e.name} ${e.status}`);
+        resetWaitTimer();
+        break;
+      }
+
+      case "ToolFixRequested": {
+        // 与 ChoiceRequested 同一套路由（choice-answer / prompt-dismiss），
+        // 同一套弹窗搬运（renderToolFixDialog 内部调 pumpChoiceQueue）。
+        // 去重：同一 choice_id 可能同时经 history 重放和挂起弹框补拉到达。
+        if (shouldSkipPrompt(e.choice_id)) break;
+        if (!e.wait) {
+          // fire-and-forget 形态：仅 status 提示，不挂起、不弹模态。
+          console.warn(
+            `[chat] tool_fix ${e.role_id}/${e.tool_name} (no wait): ${e.error_detail}`,
+          );
+          break;
+        }
+        const msg = addMessage({
+          kind: "system",
+          content: `🛠 ${e.role_id} 的 ${e.tool_name} 工具反复报错，需要人工修正参数`,
+        });
+        registerPromptRow(e.choice_id, msg);
+        renderToolFixDialog(promptHost(msg, e.choice_id), e, {
+          archived: replaying,
+        });
+        setFooter(
+          replaying
+            ? `${e.role_id} 曾请你修正参数（历史）`
+            : `${e.role_id} 等待人工修正参数`,
+        );
         resetWaitTimer();
         break;
       }
