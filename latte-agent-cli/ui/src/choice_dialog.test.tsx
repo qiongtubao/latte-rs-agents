@@ -251,7 +251,9 @@ describe("ask 选择框弹窗", () => {
     expect(submitBtn().disabled).toBe(true);
 
     // 只答第 1 题 —— 这正是实测里 manager 提前开工的那一刻
-    qBlocks()[0].querySelectorAll<HTMLElement>(".choice-opt")[0].click();
+    const q1opt = qBlocks()[0].querySelectorAll<HTMLElement>(".choice-opt")[0];
+    q1opt.click();
+    expect(q1opt.classList.contains("sel"), "选中项要有 sel 高亮态").toBe(true);
     expect(submitBtn().disabled).toBe(true);
     // 答第 2 题，仍不能提交
     qBlocks()[1].querySelectorAll<HTMLElement>(".choice-opt")[1].click();

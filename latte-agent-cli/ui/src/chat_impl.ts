@@ -970,7 +970,7 @@ export function mountChat(opts: {
             sel.add(oi);
           }
           Array.from(optsWrap.children).forEach((c, ci) =>
-            c.classList.toggle("selected", sel.has(ci)),
+            c.classList.toggle("sel", sel.has(ci)),
           );
           picked[qi] = Array.from(sel)
             .sort((a, b) => a - b)
