@@ -47,6 +47,7 @@ pub mod controller;
 pub mod code_graph_index;
 pub mod tool_fix;
 pub mod checkpoint;
+pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod dispatch_ledger;

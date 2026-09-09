@@ -355,6 +355,14 @@ pub enum TraceEvent {
         point: HookPoint,
         outcome_kind: String,
     },
+    /// 自动上下文压缩：旧历史被摘要成一条 checkpoint 并替换。
+    /// 记 removed/前后估算，用来事后核对压缩到底省了多少。
+    ContextCompacted {
+        meta: TraceMeta,
+        removed_messages: u32,
+        est_tokens_before: u32,
+        est_tokens_after: u32,
+    },
     TurnEnd {
         meta: TraceMeta,
         total_input: u32,
@@ -807,6 +815,7 @@ impl TraceEvent {
         match self {
             TraceEvent::SessionStart { meta, .. }
             | TraceEvent::PromptBuilt { meta, .. }
+            | TraceEvent::ContextCompacted { meta, .. }
             | TraceEvent::ModelCall { meta, .. }
             | TraceEvent::ModelRawOut { meta, .. }
             | TraceEvent::ModelDelta { meta, .. }
@@ -815,6 +824,7 @@ impl TraceEvent {
             | TraceEvent::ToolExec { meta, .. }
             | TraceEvent::ToolRetry { meta, .. }
             | TraceEvent::HookFired { meta, .. }
+            | TraceEvent::ContextCompacted { meta, .. }
             | TraceEvent::TurnEnd { meta, .. }
             | TraceEvent::SessionEnd { meta, .. }
             | TraceEvent::SessionStarted { meta, .. }
@@ -835,6 +845,7 @@ impl TraceEvent {
         match self {
             TraceEvent::SessionStart { .. } => "SessionStart",
             TraceEvent::PromptBuilt { .. } => "PromptBuilt",
+            TraceEvent::ContextCompacted { .. } => "ContextCompacted",
             TraceEvent::ModelCall { .. } => "ModelCall",
             TraceEvent::ModelRawOut { .. } => "ModelRawOut",
             TraceEvent::ModelDelta { .. } => "ModelDelta",
@@ -866,6 +877,9 @@ impl TraceEvent {
             TraceEvent::PromptBuilt { est_input_tokens, history_len, user_input, .. } =>
                 format!("est_input={} history_len={} user_input={}",
                     est_input_tokens, history_len, user_input),
+            TraceEvent::ContextCompacted { removed_messages, est_tokens_before, est_tokens_after, .. } =>
+                format!("compacted removed={} est {} -> {}",
+                    removed_messages, est_tokens_before, est_tokens_after),
             TraceEvent::ModelCall { model_id, latency_ms, finish_reason, .. } =>
                 format!("model={} latency={}ms finish={}", model_id, latency_ms, finish_reason),
             TraceEvent::ModelRawOut { raw_content, .. } =>
@@ -949,6 +963,13 @@ impl TraceEvent {
                 kind: "SessionStart".into(),
                 model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
                 detail: format!("tier={} chain_len={} tools={}", tier, model_chain.len(), allowed_tools.len()),
+            },
+            TraceEvent::ContextCompacted { removed_messages, est_tokens_before, est_tokens_after, .. } => IndexLine {
+                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                kind: "ContextCompacted".into(),
+                model_id: None, latency_ms: None,
+                tokens_in: Some(*est_tokens_after), tokens_out: None, tokens_think: None,
+                detail: format!("removed={} est {} -> {}", removed_messages, est_tokens_before, est_tokens_after),
             },
             TraceEvent::PromptBuilt { est_input_tokens, history_len, .. } => IndexLine {
                 turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
@@ -1267,6 +1288,7 @@ impl TraceSink for ScopedSink {
         match &mut event {
             TraceEvent::SessionStart { meta, .. }
             | TraceEvent::PromptBuilt { meta, .. }
+            | TraceEvent::ContextCompacted { meta, .. }
             | TraceEvent::ModelCall { meta, .. }
             | TraceEvent::ModelRawOut { meta, .. }
             | TraceEvent::ModelDelta { meta, .. }

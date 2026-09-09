@@ -2765,6 +2765,102 @@ impl AgentRunner {
     pub fn context_mut(&mut self) -> &mut ConversationContext {
         &mut self.context
     }
+
+    /// 上下文压力达阈值时，把旧历史摘要成一条 checkpoint 并替换掉。
+    ///
+    /// 骨架对齐 deepseek-harness 的 `compaction-basic`：**触发** → **选区**
+    /// → **摘要** → **替换**，参数全部可配（见
+    /// [`crate::compaction::CompactionPolicy`]）。
+    ///
+    /// 与既有 `compact_stale_tool_results` 的分工：那个只缩短工具结果**文本**、
+    /// 不减消息条数（≈ deepseek 的 tool-result-pruner，是本方法的前置减负）；
+    /// 本方法真正**减少历史长度**，让长会话能一直续下去而不是撞窗口。
+    ///
+    /// 失败即放弃（返回 `Ok(false)`）而不是让整个 turn 挂掉：压缩是优化，
+    /// 不是正确性前提。摘要调用失败 / 没有可压区间 / 未达阈值都属正常路径。
+    ///
+    /// 返回是否真的压缩了。
+    async fn maybe_auto_compact(&mut self, meta: &crate::trace::TraceMeta) -> bool {
+        let policy = crate::compaction::CompactionPolicy::from_env();
+        if !policy.enabled {
+            return false;
+        }
+        let window = self
+            .agent
+            .model_chain
+            .first()
+            .map(|mc| mc.model.context_window)
+            .unwrap_or(0);
+        let est = self.context.token_count() as u32;
+        if !policy.should_compact(est, window) {
+            return false;
+        }
+
+        let mut compacted_any = false;
+        for _pass in 0..policy.max_passes {
+            let msgs = self.context.messages().to_vec();
+            let Some(end) = crate::compaction::select_compaction_end(&msgs, policy.keep_recent_turns)
+            else {
+                break; // 没有可压区间（历史太短 / 全是要保留的尾部）
+            };
+
+            let sections = crate::compaction::summary_template_sections();
+            let req = crate::compaction::build_summary_request(&msgs, end, &sections);
+
+            // 摘要调用：不带工具（摘要不该调工具）、限制输出长度。
+            // WaitPolicy::NoWait —— 压缩是优化，不值得为它睡过模型冷却。
+            let mut params = self.agent.params.clone();
+            params.tools = Vec::new();
+            params.tool_choice = latte_ai::models::ToolChoice::None;
+            params.max_tokens = Some(policy.summary_max_tokens);
+
+            let summary = match self
+                .agent
+                .chat(&req, Some(&params), WaitPolicy::NoWait)
+                .await
+            {
+                Ok(c) if !c.content.trim().is_empty() => c.content,
+                Ok(_) => {
+                    tracing::warn!("auto-compact: 摘要为空，放弃本次压缩");
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("auto-compact: 摘要调用失败，放弃本次压缩: {e}");
+                    break;
+                }
+            };
+
+            // 替换：清掉被压区间，在原位插入 checkpoint。
+            let checkpoint = Message::user(crate::compaction::checkpoint_message_text(&summary));
+            let removed = self.context.clear_range(0..end);
+            if removed == 0 {
+                break;
+            }
+            self.context.insert(0, checkpoint);
+            compacted_any = true;
+
+            let after = self.context.token_count() as u32;
+            tracing::info!(
+                removed_messages = removed,
+                est_before = est,
+                est_after = after,
+                window,
+                "auto-compact: 已把旧历史压成 checkpoint"
+            );
+            self.sink.emit(crate::trace::TraceEvent::ContextCompacted {
+                meta: meta.refreshed(),
+                removed_messages: removed as u32,
+                est_tokens_before: est,
+                est_tokens_after: after,
+            });
+
+            if !policy.should_compact(after, window) {
+                break; // 已降到阈值下
+            }
+        }
+        compacted_any
+    }
+
     /// 读取本轮工具调用摘要并清空内部缓冲区。
     /// 供 workflow.rs 的 delegate-return 审查收集工具执行证据，
     /// 让 advisor 能看到 ask 工具返回的用户答案，而不是仅凭计数做判断。
@@ -2943,6 +3039,19 @@ impl AgentRunner {
             user_input: user_input.clone(),
             est_input_tokens,
         });
+
+        // 自动压缩：turn 入口检查上下文压力，达阈值就把旧历史摘成一条
+        // checkpoint（见 crate::compaction）。放在这里而不是工具循环内，
+        // 是因为循环内每轮都可能新增 tool_result，在那里替换历史容易切断
+        // tool_call ↔ tool_result 配对；turn 边界是天然的安全点。
+        //
+        // 压缩改了 self.context，所以要在它之后重新取待发消息列表。
+        let compacted = self.maybe_auto_compact(&meta).await;
+        let mut messages: Vec<Message> = if compacted {
+            self.context.messages().to_vec()
+        } else {
+            messages
+        };
 
         // 工具轮次没有硬性上限（对齐 oh-my-pi deadline-only 模式）。
         // 循环终止靠：
@@ -10172,8 +10281,7 @@ tools = ["read", "write"]
         assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
     }
 
-    /// byte-stability：工具 schema 顺序必须**确定且跨调用一致**。
-    ///
+    /// byte-stability：工具 schema 顺序必须**确定且跨调用一致**。    ///
     /// 这是 prompt caching 的硬前提。工具定义在请求最前面、是缓存前缀的
     /// 开头；底层 registry 是 `HashMap`，`.values()` 顺序不保证稳定——
     /// 顺序一抖，tools+system 整段前缀的字节就变，缓存当场失效、每轮按
@@ -10201,6 +10309,124 @@ tools = ["read", "write"]
         for _ in 0..8 {
             assert_eq!(names_of(&mgr), first, "同一 manager 多次构造顺序必须一致");
         }
+    }
+
+    /// 端到端：压力达阈值时 `run_turn` 真的会摘要旧历史并替换掉。
+    ///
+    /// 只测策略层（阈值/选区/模板）不够——那些是纯函数，真正容易坏的是
+    /// 「决策出来之后有没有真的执行」：摘要调用发不发、历史换不换、
+    /// 换完消息数是否真的变少。这条从 run_turn 入口打到 context 终态。
+    #[tokio::test]
+    async fn run_turn_compacts_history_when_over_threshold() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // 摘要调用与普通调用都回同一个 mock；靠 body 里的压缩指令区分不了
+        // 响应内容（wiremock 按顺序匹配），所以统一返回一段合法摘要文本，
+        // 普通轮把它当回复也无妨——本测试只关心历史是否被替换。
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("## Primary Request and Intent\n- 压缩摘要", vec![]),
+                    )),
+            )
+            .await;
+
+        // 窗口设小 + 阈值调低，让既有历史必然越线。
+        let mut model = model_at(&server, "stub");
+        model.context_window = 2_000;
+        let agent = Agent::new_with_chain(
+            "compact-e2e".into(),
+            test_role(),
+            vec![model],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+
+        // 灌入 6 轮历史（每条都够长，保证 token 估算越过 2000*0.5）。
+        let filler = "x".repeat(1_200);
+        for i in 0..6 {
+            runner.context_mut().push(Message::user(format!("u{i} {filler}")));
+            runner.context_mut().push(Message::assistant(format!("a{i} {filler}")));
+        }
+        let before = runner.context().messages().len();
+        assert!(before >= 12, "前置历史应有 12 条: {before}");
+
+        // 阈值 0.5、保留 1 轮 —— 用 env 覆盖（策略全可配）。
+        std::env::set_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO", "0.5");
+        std::env::set_var("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS", "1");
+        let _ = runner.run_turn(&[Message::user("go")], None).await;
+        std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO");
+        std::env::remove_var("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS");
+
+        let msgs = runner.context().messages();
+        // 1. 历史真的变短了（不是只算了个数字）。
+        assert!(
+            msgs.len() < before,
+            "压缩后消息数必须减少：before={before} after={}",
+            msgs.len()
+        );
+        // 2. 首条是带标签的 checkpoint，供下次压缩识别并合并。
+        let head = msgs[0].as_text();
+        assert!(
+            head.contains(crate::compaction::SUMMARY_OPEN_TAG),
+            "首条应是带标签的 checkpoint: {head:.120}"
+        );
+    }
+
+    /// 关掉开关就一条摘要调用都不发（压缩是可选优化，不是必须路径）。
+    #[tokio::test]
+    async fn auto_compact_can_be_disabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("ok", vec![])),
+                    ),
+            )
+            .await;
+        let mut model = model_at(&server, "stub");
+        model.context_window = 2_000;
+        let agent = Agent::new_with_chain(
+            "compact-off".into(),
+            test_role(),
+            vec![model],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let filler = "y".repeat(1_200);
+        for i in 0..6 {
+            runner.context_mut().push(Message::user(format!("u{i} {filler}")));
+            runner.context_mut().push(Message::assistant(format!("a{i} {filler}")));
+        }
+        let before = runner.context().messages().len();
+
+        std::env::set_var("LATTE_AGENT_AUTO_COMPACT", "0");
+        let _ = runner.run_turn(&[Message::user("go")], None).await;
+        std::env::remove_var("LATTE_AGENT_AUTO_COMPACT");
+
+        // 关掉后只增不减：新增本轮 user + assistant，绝不摘要替换。
+        assert!(
+            runner.context().messages().len() > before,
+            "关闭时不应压缩"
+        );
+        assert!(
+            !runner.context().messages()[0]
+                .as_text()
+                .contains(crate::compaction::SUMMARY_OPEN_TAG),
+            "关闭时不应出现 checkpoint"
+        );
     }
 
     #[test]

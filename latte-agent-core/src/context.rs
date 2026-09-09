@@ -210,10 +210,25 @@ impl ConversationContext {
         true
     }
 
+    /// Insert a message at `idx` (clamped to the current length), keeping
+    /// the importance vector and token accounting in sync.
+    ///
+    /// Added for auto-compaction: after `clear_range` drops the compacted
+    /// span, the summary checkpoint takes its place at the same position, so
+    /// the conversation keeps its chronological shape (checkpoint first, then
+    /// the retained recent turns).
+    pub fn insert(&mut self, idx: usize, message: Message) {
+        let at = idx.min(self.messages.len());
+        self.token_count = self
+            .token_count
+            .saturating_add(estimate_tokens_for_msg(&message));
+        self.messages.insert(at, message);
+        self.importance.insert(at, Importance::Normal);
+    }
+
     /// Remove a contiguous range of messages. Returns how many were
     /// actually removed (clamped to the current length).
-    pub fn clear_range(&mut self, range: std::ops::Range<usize>) -> usize {
-        let start = range.start.min(self.messages.len());
+    pub fn clear_range(&mut self, range: std::ops::Range<usize>) -> usize {        let start = range.start.min(self.messages.len());
         let end = range.end.min(self.messages.len()).max(start);
         let count = end - start;
         if count == 0 {

@@ -137,6 +137,12 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_CONTEXT_COMPACT` | 1（开） | 工具循环内**主动压缩陈旧工具结果**。工具循环每轮都重传全部历史，第 N 轮要把前 N-1 轮的工具结果原文再发一遍——实测一个子会话 70 次调用、返回内容合计 ≈47K token，那一个 turn 烧了 1.79M 输入 token（38 倍）。设 `0`/`false`/`no`/`off` 退回旧行为（全部逐字重传） |
 | `LATTE_AGENT_CONTEXT_KEEP_RECENT` | 6 | 保留**逐字原文**的最近工具结果条数，钳在 `1..=64`。更早的压成头 + 尾 + 标记 |
 | `LATTE_AGENT_CONTEXT_STALE_CHARS` | 900 | 陈旧工具结果的压缩预算（字符），钳在 `200..=8000`。低于 `预算 × 4/3` 的结果不动（省不下 1/3 不值得压）。调小省得更多，但模型认不出自己读过什么就会重读，**一次重读 = 一整轮往返**（含重传全部历史），比多留几百字符贵得多 |
+| `LATTE_AGENT_AUTO_COMPACT` | 1（开） | **自动上下文压缩**：占用达阈值时把旧历史摘要成一条 checkpoint 并替换掉。与 `LATTE_AGENT_CONTEXT_COMPACT` 分工不同——后者只缩短工具结果**文本**、不减消息条数（实测覆盖约 30% 内容、把 105 倍放大降到 90 倍）；本项真正**减少历史长度**，让长会话能一直续下去而不是撞窗口。设 `0`/`false`/`no`/`off` 关闭 |
+| `LATTE_AGENT_COMPACT_THRESHOLD_RATIO` | 0.8 | 触发压缩的上下文占用比例（占 `context_window`），钳在 `0.5..=0.95`。留 20% 余量给"本轮还要产生的输出 + 工具结果"，否则刚压完又撞窗口。目录没配 `context_window` 时**恒不触发**（没有分母就没有压力，宁可不压也不按猜的窗口误压） |
+| `LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS` | 2 | 保留**逐字原文**的尾部轮数，钳在 `1..=32`。一轮 = 一条 user 消息起、到下一条 user 前为止。切点会自动避开 `tool_call ↔ tool_result` 配对（切在中间会产生孤儿 tool_result、被 provider 直接拒），前导 System 永不进入压缩区间 |
+| `LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS` | 2048 | 摘要输出的 token 上限，钳在 `256..=16384`。摘要是结构化清单，给太大反而鼓励模型把原文抄进去、失去压缩意义 |
+| `LATTE_AGENT_COMPACT_MAX_PASSES` | 1 | 单次检查内最多连续压几遍，钳在 `1..=3`。防"压不动还一直压"——每次压缩都是一次真实 LLM 调用 |
+| `LATTE_AGENT_COMPACT_SECTIONS` | （8 段默认模板） | 自定义摘要模板段落，用 `\|` 分隔（如 `"Goal\|Progress\|Next"`）。默认 8 段取自 deepseek-harness：Primary Request and Intent / Key Technical Concepts / Files and Code / Errors and Fixes / Pending Jobs / Current Work / Next Step / Critical Context |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
 | `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
 | `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
