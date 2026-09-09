@@ -7,8 +7,8 @@
 //
 // 数据契约：见 `api.ts` 的 `ModelsListResponse` / `ModelWithSource`。
 // `file_path` 字段是后端独立扫盘拿到的真实绝对路径，UI 直接展示给用户。
-import { listModels, updateModel, deleteModel, getModelToml, putModelToml, getAdvisor, putAdvisor } from "./api";
-import type { AdvisorState, ModelDef, ModelWithSource } from "./api";
+import { listModels, updateModel, deleteModel, getModelToml, putModelToml, getAdvisor, putAdvisor, getCompaction, putCompaction } from "./api";
+import type { AdvisorState, CompactionSection, CompactionState, ModelDef, ModelWithSource } from "./api";
 interface UIBinding {
   panelEl: HTMLElement;
   openBtn: HTMLButtonElement;
@@ -145,9 +145,119 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     }
   });
 
+  // ── 自动上下文压缩设置 ──
+  //
+  // 输入框显示的是**生效值**（后端算完 env > project > global > 默认）。
+  // 被环境变量接管的字段标灰并提示——env 优先级最高，在面板上改了不会
+  // 生效，不说清楚用户会以为面板坏了。
+  const cpEnabled = document.getElementById("compaction-enabled") as HTMLInputElement | null;
+  const cpThreshold = document.getElementById("compaction-threshold") as HTMLInputElement | null;
+  const cpKeepTurns = document.getElementById("compaction-keep-turns") as HTMLInputElement | null;
+  const cpSummaryMax = document.getElementById("compaction-summary-max") as HTMLInputElement | null;
+  const cpMaxPasses = document.getElementById("compaction-max-passes") as HTMLInputElement | null;
+  const cpSections = document.getElementById("compaction-sections") as HTMLInputElement | null;
+  const cpStatus = document.getElementById("compaction-status") as HTMLElement | null;
+  const cpBadge = document.getElementById("compaction-effective-badge") as HTMLElement | null;
+  const cpPaths = document.getElementById("compaction-paths") as HTMLElement | null;
+  const cpSaveProject = document.getElementById("compaction-save-project") as HTMLButtonElement | null;
+  const cpSaveGlobal = document.getElementById("compaction-save-global") as HTMLButtonElement | null;
+
+  /** env 接管的字段：标灰 + 加 title，避免"改了不生效"的困惑。 */
+  function markEnvOverride(el: HTMLInputElement | null, field: string, overrides: string[]): void {
+    if (!el) return;
+    const taken = overrides.includes(field);
+    el.disabled = taken;
+    el.title = taken
+      ? `该字段被环境变量接管（优先级最高），在此修改不会生效`
+      : "";
+  }
+
+  function renderCompaction(s: CompactionState): void {
+    const e = s.effective;
+    if (cpEnabled) cpEnabled.checked = e.enabled;
+    if (cpThreshold) cpThreshold.value = String(e.threshold_ratio);
+    if (cpKeepTurns) cpKeepTurns.value = String(e.keep_recent_turns);
+    if (cpSummaryMax) cpSummaryMax.value = String(e.summary_max_tokens);
+    if (cpMaxPasses) cpMaxPasses.value = String(e.max_passes);
+    if (cpSections) cpSections.value = e.sections.join("|");
+
+    markEnvOverride(cpEnabled, "enabled", s.env_overrides);
+    markEnvOverride(cpThreshold, "threshold_ratio", s.env_overrides);
+    markEnvOverride(cpKeepTurns, "keep_recent_turns", s.env_overrides);
+    markEnvOverride(cpSummaryMax, "summary_max_tokens", s.env_overrides);
+    markEnvOverride(cpMaxPasses, "max_passes", s.env_overrides);
+    markEnvOverride(cpSections, "sections", s.env_overrides);
+
+    if (cpBadge) {
+      cpBadge.textContent = e.enabled
+        ? `（阈值 ${Math.round(e.threshold_ratio * 100)}% · 保留 ${e.keep_recent_turns} 轮）`
+        : "（已关闭）";
+    }
+    if (cpPaths) {
+      const envNote = s.env_overrides.length
+        ? `　环境变量接管：${s.env_overrides.join(", ")}`
+        : "";
+      cpPaths.textContent = `项目：${s.project_file}　全局：${s.global_file}${envNote}`;
+    }
+  }
+
+  async function refreshCompaction(): Promise<void> {
+    if (!cpThreshold) return;
+    try {
+      renderCompaction(await getCompaction());
+    } catch (err) {
+      if (cpStatus) cpStatus.textContent = `读取失败：${err}`;
+    }
+  }
+
+  /** 从输入框收集 patch：空值 = 不配置（交给下层/默认）。 */
+  function collectCompactionPatch(): CompactionSection {
+    const num = (el: HTMLInputElement | null): number | undefined => {
+      const v = el?.value?.trim();
+      if (!v) return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const secs = cpSections?.value
+      ?.split("|")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    return {
+      enabled: cpEnabled ? cpEnabled.checked : undefined,
+      threshold_ratio: num(cpThreshold),
+      keep_recent_turns: num(cpKeepTurns),
+      summary_max_tokens: num(cpSummaryMax),
+      max_passes: num(cpMaxPasses),
+      sections: secs && secs.length ? secs : undefined,
+    };
+  }
+
+  async function saveCompaction(target: "project" | "global"): Promise<void> {
+    const btns = [cpSaveProject, cpSaveGlobal];
+    btns.forEach((b) => b && (b.disabled = true));
+    if (cpStatus) cpStatus.textContent = "保存中…";
+    try {
+      renderCompaction(await putCompaction(collectCompactionPatch(), target));
+      if (cpStatus) {
+        cpStatus.textContent = `已保存到${target === "global" ? "全局" : "项目"}，已加载会话下一轮生效`;
+      }
+    } catch (err) {
+      if (cpStatus) cpStatus.textContent = `保存失败：${err}`;
+    } finally {
+      btns.forEach((b) => b && (b.disabled = false));
+    }
+  }
+
+  cpSaveProject?.addEventListener("click", () => void saveCompaction("project"));
+  cpSaveGlobal?.addEventListener("click", () => void saveCompaction("global"));
+
+  // mount 时就拉一次：面板未展开也让输入框有值，避免"打开瞬间空白"，
+  // 也让 e2e 不必依赖面板开关时序。
+  void refreshCompaction();
+
+
   /** 按条目身份（key + source + file_path）在 `items[]` 里定位索引。 */
-  function itemIndex(m: ModelWithSource | null): number {
-    if (!m) return -1;
+  function itemIndex(m: ModelWithSource | null): number {    if (!m) return -1;
     return items.findIndex(
       x => x.key === m.key && x.source === m.source && x.file_path === m.file_path,
     );
@@ -172,6 +282,7 @@ export function mountModelsPanel(opts: { container: UIBinding }): ModelsPanelCon
     showTab("form");
     void refresh();
     void refreshAdvisor();
+    void refreshCompaction();
   });
   container.closeBtn.addEventListener("click", () => container.panelEl.classList.add("hidden"));
   container.refreshBtn.addEventListener("click", () => {

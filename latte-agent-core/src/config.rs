@@ -342,11 +342,13 @@ impl AgentConfig {
                 // 只填 project 没声明的空档）。
                 if part.advisor.enabled.is_some() {
                     merged.advisor = part.advisor.clone();
-                    // 同 advisor：后读到的层覆盖前面的。整段未配置时不动，
-                    // 以便更低优先级的层能填进来。
-                    if !part.compaction.is_unset() {
-                        merged.compaction = part.compaction.clone();
-                    }
+                }
+                // compaction 独立判断——**不能嵌在 advisor 的 if 里**：
+                // 只写 compaction.toml（不写 advisor）时 advisor 是 None，
+                // 嵌在里面会导致这段永远不被合并（实测：目录加载后
+                // compaction 恒为空段，UI 保存的值读不回来）。
+                if !part.compaction.is_unset() {
+                    merged.compaction = part.compaction.clone();
                 }
                 for m in part.models.models {
                     if !merged.models.models.iter().any(|e| e.provider == m.provider && e.name == m.name) {
@@ -466,11 +468,10 @@ impl AgentConfig {
             // Advisor 开关：声明过的文件覆盖先前的（字母序后写赢）。
             if part.advisor.enabled.is_some() {
                 merged.advisor = part.advisor.clone();
-                // 同 advisor：后读到的层覆盖前面的。整段未配置时不动，
-                // 以便更低优先级的层能填进来。
-                if !part.compaction.is_unset() {
-                    merged.compaction = part.compaction.clone();
-                }
+            }
+            // compaction 独立判断（同上：不能嵌在 advisor 的 if 里）。
+            if !part.compaction.is_unset() {
+                merged.compaction = part.compaction.clone();
             }
 
             // Models: append.

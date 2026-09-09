@@ -3286,6 +3286,80 @@ mod tool_doc_tests {
         latte_agent_core::tool_docs::clear_live_managers();
     }
 
+    /// UI 面板保存压缩参数：写盘 + **推进 resolver 快照**。
+    ///
+    /// 后者是「点击保存 → 已加载会话下一轮即生效」的关键：运行中的
+    /// runner 从 resolver 取压缩参数，若只更新 b.merged（advisor 那条老
+    /// 路的做法），已加载 session 要等重开才生效。
+    #[tokio::test]
+    async fn put_compaction_writes_file_and_hot_reloads() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let b = doc_backend(dir.path());
+
+        // 保存前：resolver 里是空段（未配置）。
+        assert!(
+            b.resolver.compaction_section().is_unset(),
+            "初始应未配置"
+        );
+
+        let patch = latte_agent_core::config::CompactionSection {
+            enabled: Some(true),
+            threshold_ratio: Some(0.66),
+            keep_recent_turns: Some(4),
+            ..Default::default()
+        };
+        let st = put_compaction(&b, "project", patch).expect("put ok");
+
+        // 1. 生效值回传给 UI（已应用钳位与优先级）。
+        assert!(st.effective.enabled);
+        assert_eq!(st.effective.threshold_ratio, 0.66);
+        assert_eq!(st.effective.keep_recent_turns, 4);
+
+        // 2. 真的写了项目层文件，且只含给出的键（缺席=未配置）。
+        let raw = std::fs::read_to_string(&st.project_file).expect("file written");
+        assert!(raw.contains("[compaction]"), "{raw}");
+        assert!(raw.contains("threshold_ratio = 0.66"), "{raw}");
+        assert!(!raw.contains("summary_max_tokens"), "未给的键不该写进去: {raw}");
+
+        // 3. **热生效**：resolver 快照已带上新值。
+        let live = b.resolver.compaction_section();
+        assert_eq!(live.threshold_ratio, Some(0.66), "resolver 必须读到新阈值");
+        assert_eq!(live.keep_recent_turns, Some(4));
+
+        // 4. GET 能回读一致的生效值。
+        let got = get_compaction(&b);
+        assert_eq!(got.effective.threshold_ratio, 0.66);
+        assert_eq!(got.project.threshold_ratio, Some(0.66), "project 层声明应回传");
+    }
+
+    /// 环境变量接管的字段要显式告知 UI——否则用户在面板改了不生效会以为坏了。
+    ///
+    /// 只验「映射与上报」这一段：**不设真 env**。`std::env` 是进程级的，
+    /// 在这里 set 会漏给并行跑的其它测试（实测污染过
+    /// `put_compaction_writes_file_and_hot_reloads` 的生效值断言）。
+    /// 「env 覆盖配置段」的生效逻辑由 `compaction::tests::
+    /// env_overrides_the_config_section` 覆盖。
+    #[tokio::test]
+    async fn compaction_state_reports_env_overrides() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let b = doc_backend(dir.path());
+
+        // 没有任何 env 时不该虚报（否则 UI 会无故标灰所有输入框）。
+        let st = get_compaction(&b);
+        for (env, field) in COMPACT_ENV_KEYS {
+            if std::env::var(env).is_err() {
+                assert!(
+                    !st.env_overrides.iter().any(|f| f == field),
+                    "{env} 未设置却上报了 {field}"
+                );
+            }
+        }
+        // 映射表本身要覆盖全部 6 个可配字段——漏一个就会有输入框改了不生效
+        // 却没提示。
+        assert_eq!(COMPACT_ENV_KEYS.len(), 6, "6 个可配字段都要有对应 env 键");
+    }
+
+
     /// 删文档同样要热更新：删完模型只应看到内置描述。幂等——文件不在也成功。
     #[tokio::test]
     async fn delete_removes_doc_and_hot_reloads() {
@@ -4132,6 +4206,198 @@ pub fn put_advisor(b: &UiBackend, enabled: bool) -> Result<AdvisorState, ApiErro
         project_override,
         file: path.to_string_lossy().into_owned(),
     })
+}
+
+// ─── 自动上下文压缩设置面板 ──────────────────────────────────────
+
+/// `GET /api/compaction` 返回：当前**生效**的压缩参数 + 各层原始声明 +
+/// 两个可写文件路径。
+///
+/// 生效值经 `CompactionPolicy::resolve` 算出（env > project > global >
+/// 默认），所以 UI 显示的就是引擎真正会用的数——而不是某一层的原始声明。
+/// `env_overrides` 列出被环境变量接管的字段：那些字段在 UI 上改了也不会
+/// 生效（env 优先级最高），必须显式告知，否则用户会以为面板坏了。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompactionState {
+    /// 生效值（env > project > global > 默认）。
+    pub effective: CompactionEffective,
+    /// project 层 `[compaction]` 的原始声明（未声明 → 全 null）。
+    pub project: latte_agent_core::config::CompactionSection,
+    /// global 层 `[compaction]` 的原始声明。
+    pub global: latte_agent_core::config::CompactionSection,
+    /// 被环境变量接管的字段名——UI 上改这些不会生效，要标灰并提示。
+    pub env_overrides: Vec<String>,
+    /// project 层写入目标。
+    pub project_file: String,
+    /// global 层写入目标。
+    pub global_file: String,
+}
+
+/// 生效参数的扁平投影（给 UI 直接渲染，不必自己算优先级）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompactionEffective {
+    pub enabled: bool,
+    pub threshold_ratio: f64,
+    pub keep_recent_turns: usize,
+    pub summary_max_tokens: u32,
+    pub max_passes: u8,
+    pub sections: Vec<String>,
+}
+
+/// 环境变量名 → 它接管的字段名。UI 用来标灰那些改了也不生效的输入框。
+const COMPACT_ENV_KEYS: &[(&str, &str)] = &[
+    ("LATTE_AGENT_AUTO_COMPACT", "enabled"),
+    ("LATTE_AGENT_COMPACT_THRESHOLD_RATIO", "threshold_ratio"),
+    ("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS", "keep_recent_turns"),
+    ("LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS", "summary_max_tokens"),
+    ("LATTE_AGENT_COMPACT_MAX_PASSES", "max_passes"),
+    ("LATTE_AGENT_COMPACT_SECTIONS", "sections"),
+];
+
+fn compaction_env_overrides() -> Vec<String> {
+    COMPACT_ENV_KEYS
+        .iter()
+        .filter(|(env, _)| std::env::var(env).is_ok())
+        .map(|(_, field)| (*field).to_string())
+        .collect()
+}
+
+/// 读某一层 agents 配置目录里的 `[compaction]` 声明。
+fn compaction_section_at(dir: &std::path::Path) -> latte_agent_core::config::CompactionSection {
+    dir.to_str()
+        .and_then(|p| latte_agent_core::config::AgentConfig::load(p).ok())
+        .map(|c| c.compaction)
+        .unwrap_or_default()
+}
+
+/// project 层 agents 配置目录（与 `project_advisor_override` 同款解析）。
+fn project_agents_dir_of(b: &UiBackend) -> std::path::PathBuf {
+    let raw = std::path::PathBuf::from(&b.agents_config);
+    if b.agents_config.trim().is_empty() {
+        b.cwd.join(".latte/agents.d")
+    } else if raw.is_absolute() {
+        raw
+    } else {
+        b.cwd.join(raw)
+    }
+}
+
+/// `GET /api/compaction` — 当前生效的压缩参数与各层声明。
+pub fn get_compaction(b: &UiBackend) -> CompactionState {
+    let project_dir = project_agents_dir_of(b);
+    let global_dir = global_agents_dir();
+    let project = compaction_section_at(&project_dir);
+    let global = compaction_section_at(&global_dir);
+
+    // 生效值以内存 merged 为准（它已经过分层合并），再让 resolve 应用
+    // env 覆盖与钳位——与引擎运行时走的是同一条路。
+    let merged = b.merged.read().compaction.clone();
+    let policy = latte_agent_core::compaction::CompactionPolicy::resolve(&merged);
+    let sections = latte_agent_core::compaction::resolve_template_sections(&merged)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect();
+
+    CompactionState {
+        effective: CompactionEffective {
+            enabled: policy.enabled,
+            threshold_ratio: policy.threshold_ratio,
+            keep_recent_turns: policy.keep_recent_turns,
+            summary_max_tokens: policy.summary_max_tokens,
+            max_passes: policy.max_passes,
+            sections,
+        },
+        project,
+        global,
+        env_overrides: compaction_env_overrides(),
+        project_file: project_dir.join("compaction.toml").to_string_lossy().into_owned(),
+        global_file: global_dir.join("compaction.toml").to_string_lossy().into_owned(),
+    }
+}
+
+/// `PUT /api/compaction` — 把 `[compaction]` 写到指定层并**立刻热生效**。
+///
+/// 与 `put_advisor` 的关键差别：那条只更新 `b.merged`（新 session 才生效），
+/// 这里额外调 [`hot_reload_resolver`] 把新值推进 `ModelResolver` 快照——
+/// 运行中的 runner 从 resolver 取压缩参数，所以**已加载的会话下一轮就用
+/// 新值**，不必重开 session。
+///
+/// `target`: `"project"`（默认）写 `<cwd>/.latte/agents.d/compaction.toml`；
+/// `"global"` 写 `~/.latte/agents.d/compaction.toml`。
+pub fn put_compaction(
+    b: &UiBackend,
+    target: &str,
+    patch: latte_agent_core::config::CompactionSection,
+) -> Result<CompactionState, ApiError> {
+    let dir = if target == "global" {
+        global_agents_dir()
+    } else {
+        project_agents_dir_of(b)
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
+    let path = dir.join("compaction.toml");
+
+    // 只写用户给了的字段：TOML 里缺席 = 未配置 = 交给下层/默认，这正是
+    // `Option` 分层语义。全部为空时写一个只有段头的文件（等于整段未配置）。
+    let mut body = String::from(
+        "# 自动上下文压缩参数（UI 设置面板写入）。\n\
+         # 缺席的键 = 未配置，交给下层（global）或内置默认。\n\
+         # 优先级：环境变量 > 项目配置 > 全局配置 > 内置默认。\n\
+         [compaction]\n",
+    );
+    if let Some(v) = patch.enabled {
+        body.push_str(&format!("enabled = {v}\n"));
+    }
+    if let Some(v) = patch.threshold_ratio {
+        body.push_str(&format!("threshold_ratio = {v}\n"));
+    }
+    if let Some(v) = patch.keep_recent_turns {
+        body.push_str(&format!("keep_recent_turns = {v}\n"));
+    }
+    if let Some(v) = patch.summary_max_tokens {
+        body.push_str(&format!("summary_max_tokens = {v}\n"));
+    }
+    if let Some(v) = patch.max_passes {
+        body.push_str(&format!("max_passes = {v}\n"));
+    }
+    if let Some(list) = patch.sections.as_ref() {
+        if !list.is_empty() {
+            let joined = list
+                .iter()
+                .map(|s| format!("{:?}", s))
+                .collect::<Vec<_>>()
+                .join(", ");
+            body.push_str(&format!("sections = [{joined}]\n"));
+        }
+    }
+    std::fs::write(&path, body)
+        .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
+
+    // 内存 merged 更新。
+    //
+    // 这里直接用刚写入的 patch，而不是"再从磁盘把两层读回来合并"——后者
+    // 依赖 `agents_config` 指向的目录与写入目录一致，测试与自定义配置路径
+    // 下并不总成立（实测：写 project 成功但重读拿到空段，生效值退回默认）。
+    // 写 project 层时它就是最高优先级；写 global 层时，project 层若另有
+    // 声明则仍以 project 为准，所以只在 project 未配置时采用本次 global。
+    {
+        let project_now = compaction_section_at(&project_agents_dir_of(b));
+        let effective_section = if target == "global" {
+            if project_now.is_unset() {
+                patch.clone()
+            } else {
+                project_now
+            }
+        } else {
+            patch.clone()
+        };
+        b.merged.write().compaction = effective_section;
+    }
+    // 关键：推进 resolver 快照，让**已加载的会话**下一轮就读到新值。
+    hot_reload_resolver(b);
+
+    Ok(get_compaction(b))
 }
 
 // ─── Models TOML 源文件编辑 ──────────────────────────────────────

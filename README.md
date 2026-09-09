@@ -166,6 +166,11 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
 
 **动态生效**：配置段随 `ModelResolver` 快照热更新（与角色 model_chain 同款
 机制），改完保存后**已加载的会话下一轮即生效**，不必重开 session。
+
+**UI 面板**：Web UI 的 Models 面板里有「🗜️ 自动上下文压缩」折叠块，可直接
+改参数并选择「保存到项目 / 保存到全局」，保存后同样是已加载会话下一轮生效。
+被环境变量接管的字段会标灰并提示（env 优先级最高，在面板上改不会生效）。
+对应端点 `GET/PUT /api/compaction`（见 `docs/api-reference.md` 9c 节）。
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
 | `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
 | `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |

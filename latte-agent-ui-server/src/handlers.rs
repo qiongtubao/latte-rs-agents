@@ -1155,6 +1155,38 @@ pub(crate) async fn put_advisor(
         })
 }
 
+/// `GET /api/compaction` — 自动上下文压缩的生效参数与各层声明。
+pub(crate) async fn get_compaction(State(state): State<AppState>) -> Json<api::CompactionState> {
+    Json(api::get_compaction(&state.backend))
+}
+
+/// `PUT /api/compaction` 请求体：`target` 选写哪一层，其余字段缺席 = 不配置。
+#[derive(serde::Deserialize)]
+pub(crate) struct PutCompactionRequest {
+    /// `"project"`（默认）或 `"global"`。
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(flatten)]
+    patch: latte_agent_core::config::CompactionSection,
+}
+
+/// `PUT /api/compaction` — 写指定层的 `[compaction]` 并**立刻热生效**
+/// （推进 resolver 快照，已加载会话下一轮即用新值）。
+pub(crate) async fn put_compaction(
+    State(state): State<AppState>,
+    Json(req): Json<PutCompactionRequest>,
+) -> Result<Json<api::CompactionState>, (StatusCode, String)> {
+    let target = req.target.unwrap_or_else(|| "project".to_string());
+    api::put_compaction(&state.backend, &target, req.patch)
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
+}
+
 // ─── Tasks（任务看板，薄壳 → crate::tasks） ──────────────────────
 
 /// `GET /api/tasks` —— 全量列表（含子任务聚合进度）。

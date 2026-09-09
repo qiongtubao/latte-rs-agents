@@ -536,6 +536,53 @@ Self-loop 进度 SSE 流。
 
 **响应 `200`：** 更新后的状态
 
+## 9c. 自动上下文压缩设置
+
+### `GET /api/compaction`
+
+读取自动上下文压缩的**生效参数**与各层原始声明。
+
+生效值由后端按 **环境变量 > 项目配置 > 全局配置 > 内置默认** 算出并钳位，
+UI 直接渲染即可，不必自己算优先级。
+
+**响应 `200`：**
+
+```json
+{
+  "effective": {
+    "enabled": true,
+    "threshold_ratio": 0.8,
+    "keep_recent_turns": 2,
+    "summary_max_tokens": 2048,
+    "max_passes": 1,
+    "sections": ["Primary Request and Intent", "..."]
+  },
+  "project": { "threshold_ratio": null, "...": null },
+  "global": { "...": null },
+  "env_overrides": ["threshold_ratio"],
+  "project_file": "<cwd>/.latte/agents.d/compaction.toml",
+  "global_file": "~/.latte/agents.d/compaction.toml"
+}
+```
+
+`env_overrides` 列出被环境变量接管的字段——那些字段在面板上改了**不会生效**
+（env 优先级最高），UI 应据此标灰并提示。
+
+### `PUT /api/compaction`
+
+写 `[compaction]` 到指定层并**立刻热生效**：更新内存 merged 后推进
+`ModelResolver` 快照，运行中的 runner 从 resolver 取压缩参数，因此
+**已加载的会话下一轮就用新值**，不必重开 session。
+
+**请求体：** `target` 选写哪一层（`"project"` 默认 / `"global"`），其余字段
+缺席 = 不配置（交给下层或内置默认）。
+
+```json
+{ "target": "project", "threshold_ratio": 0.75, "keep_recent_turns": 4 }
+```
+
+**响应 `200`：** 与 `GET` 同结构（回传保存后的生效值）
+
 ## 10. 工具管理
 
 ### `GET /api/tools`

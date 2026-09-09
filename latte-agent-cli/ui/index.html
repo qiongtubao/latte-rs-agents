@@ -290,6 +290,46 @@
           </label>
           <span id="advisor-setting-status" class="hint"></span>
         </div>
+        <!-- 自动上下文压缩：写 agents.d/compaction.toml，保存后推进 resolver
+             快照，**已加载会话下一轮即生效**（不必重开 session）。 -->
+        <details class="compaction-setting" id="compaction-setting">
+          <summary title="上下文占用达阈值时，把旧历史摘要成一条 checkpoint 并替换掉，让长会话能一直续下去。">
+            🗜️ 自动上下文压缩
+            <span id="compaction-effective-badge" class="hint"></span>
+          </summary>
+          <div class="compaction-grid">
+            <label class="compaction-row">
+              <input type="checkbox" id="compaction-enabled" />
+              启用
+            </label>
+            <label class="compaction-row">
+              触发阈值（占上下文窗口）
+              <input type="number" id="compaction-threshold" step="0.05" min="0.5" max="0.95" />
+            </label>
+            <label class="compaction-row">
+              保留最近几轮原文
+              <input type="number" id="compaction-keep-turns" step="1" min="1" max="32" />
+            </label>
+            <label class="compaction-row">
+              摘要输出上限（token）
+              <input type="number" id="compaction-summary-max" step="128" min="256" max="16384" />
+            </label>
+            <label class="compaction-row">
+              单次最多压几遍
+              <input type="number" id="compaction-max-passes" step="1" min="1" max="3" />
+            </label>
+            <label class="compaction-row compaction-row-wide">
+              摘要模板段落（`|` 分隔，留空用内置 8 段）
+              <input type="text" id="compaction-sections" placeholder="Goal|Progress|Next Step" />
+            </label>
+          </div>
+          <div class="compaction-actions">
+            <button id="compaction-save-project" type="button">保存到项目</button>
+            <button id="compaction-save-global" type="button">保存到全局</button>
+            <span id="compaction-status" class="hint"></span>
+          </div>
+          <div class="compaction-paths" id="compaction-paths"></div>
+        </details>
         <div class="models-paths" id="models-paths"></div>
         <div class="models-select-row">
           <label for="model-select" class="models-select-label">选择模型：</label>

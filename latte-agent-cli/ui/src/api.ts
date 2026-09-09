@@ -435,6 +435,54 @@ export async function putAdvisor(enabled: boolean): Promise<AdvisorState> {
   return getTransport().request("PUT", "/api/advisor", { enabled });
 }
 
+// ─── 自动上下文压缩设置 ──────────────────────────────────────────
+
+/** `[compaction]` 一层的原始声明；每个字段可缺省（= 未配置，交给下层）。 */
+export interface CompactionSection {
+  enabled?: boolean | null;
+  threshold_ratio?: number | null;
+  keep_recent_turns?: number | null;
+  summary_max_tokens?: number | null;
+  max_passes?: number | null;
+  sections?: string[] | null;
+}
+
+/** 生效参数（后端已算完 env > project > global > 默认的优先级与钳位）。 */
+export interface CompactionEffective {
+  enabled: boolean;
+  threshold_ratio: number;
+  keep_recent_turns: number;
+  summary_max_tokens: number;
+  max_passes: number;
+  sections: string[];
+}
+
+export interface CompactionState {
+  effective: CompactionEffective;
+  project: CompactionSection;
+  global: CompactionSection;
+  /** 被环境变量接管的字段名——面板上要标灰，改了不生效。 */
+  env_overrides: string[];
+  project_file: string;
+  global_file: string;
+}
+
+/** GET /api/compaction — 生效的压缩参数与各层声明。 */
+export async function getCompaction(): Promise<CompactionState> {
+  return getTransport().request("GET", "/api/compaction");
+}
+
+/**
+ * PUT /api/compaction — 写指定层并**立刻热生效**。
+ * `target` 省略即写项目层；字段缺省 = 不配置（交给下层/默认）。
+ */
+export async function putCompaction(
+  patch: CompactionSection,
+  target: "project" | "global" = "project",
+): Promise<CompactionState> {
+  return getTransport().request("PUT", "/api/compaction", { target, ...patch });
+}
+
 export async function sendMessage(message: string): Promise<void> {
   await getTransport().request("POST", "/api/chat/send", chatBody({ message }));
 }
