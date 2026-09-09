@@ -954,6 +954,7 @@ mod tests {
         // Error 都会进 event_log 并落盘。
         let make_config = || AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "dead-model".into(),
@@ -1127,6 +1128,7 @@ mod tests {
         let make_backend = || {
             let agent_config = AgentConfig {
                 advisor: Default::default(),
+                compaction: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: "dead-model".into(),

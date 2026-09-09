@@ -7985,6 +7985,7 @@ mod contract_engine_tests {
         )]);
         Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -8115,6 +8116,7 @@ forbid = ["TBD"]
         }
         Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: base.models.clone(),
             roles,
         })
@@ -9544,6 +9546,7 @@ mod resume_tests {
         )]);
         Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -11176,6 +11179,7 @@ mod loop_tests {
         ]);
         Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),

@@ -143,6 +143,29 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS` | 2048 | 摘要输出的 token 上限，钳在 `256..=16384`。摘要是结构化清单，给太大反而鼓励模型把原文抄进去、失去压缩意义 |
 | `LATTE_AGENT_COMPACT_MAX_PASSES` | 1 | 单次检查内最多连续压几遍，钳在 `1..=3`。防"压不动还一直压"——每次压缩都是一次真实 LLM 调用 |
 | `LATTE_AGENT_COMPACT_SECTIONS` | （8 段默认模板） | 自定义摘要模板段落，用 `\|` 分隔（如 `"Goal\|Progress\|Next"`）。默认 8 段取自 deepseek-harness：Primary Request and Intent / Key Technical Concepts / Files and Code / Errors and Fixes / Pending Jobs / Current Work / Next Step / Critical Context |
+
+#### 压缩参数也可写在配置文件里
+
+上面 6 个环境变量都能改成 `[compaction]` 配置段，写在任意 agents 配置文件
+（项目 `.latte/agents.d/*.toml` 或全局 `~/.latte/agents.d/*.toml`）：
+
+```toml
+[compaction]
+enabled = true
+threshold_ratio = 0.8       # 占 context_window 的比例，钳 0.5..=0.95
+keep_recent_turns = 2       # 保留逐字原文的尾部轮数，钳 1..=32
+summary_max_tokens = 2048   # 摘要输出上限，钳 256..=16384
+max_passes = 1              # 单次检查最多压几遍，钳 1..=3
+sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
+```
+
+**优先级：环境变量 > 项目配置 > 全局配置 > 内置默认**。环境变量留在最高
+优先级，是为了保留「临时压测某个参数不用改文件」的能力。每个字段都是可选的
+——只写想改的那几项，其余走下层/默认；越界值一律钳到安全区间，配错不会把
+行为推到极端（阈值 0 每轮都压、保留 0 轮丢上下文）。
+
+**动态生效**：配置段随 `ModelResolver` 快照热更新（与角色 model_chain 同款
+机制），改完保存后**已加载的会话下一轮即生效**，不必重开 session。
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
 | `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
 | `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |

@@ -2781,7 +2781,18 @@ impl AgentRunner {
     ///
     /// 返回是否真的压缩了。
     async fn maybe_auto_compact(&mut self, meta: &crate::trace::TraceMeta) -> bool {
-        let policy = crate::compaction::CompactionPolicy::from_env();
+        // 策略解析：env > `[compaction]` 配置段 > 内置默认。
+        //
+        // 配置段从 **resolver 快照**取（不是构建时固化的 AgentConfig）——
+        // resolver 是长存句柄、`reload_from_config` 会更新它，所以
+        // 「UI 改参数 → 保存 → 已加载 session 下一轮生效」在这里成立。
+        // 没有 model_source（如单元测试直接 new 的 runner）时退回纯 env。
+        let section = self
+            .model_source
+            .as_ref()
+            .map(|src| src.resolver.compaction_section())
+            .unwrap_or_default();
+        let policy = crate::compaction::CompactionPolicy::resolve(&section);
         if !policy.enabled {
             return false;
         }
@@ -2804,7 +2815,7 @@ impl AgentRunner {
                 break; // 没有可压区间（历史太短 / 全是要保留的尾部）
             };
 
-            let sections = crate::compaction::summary_template_sections();
+            let sections = crate::compaction::resolve_template_sections(&section);
             let req = crate::compaction::build_summary_request(&msgs, end, &sections);
 
             // 摘要调用：不带工具（摘要不该调工具）、限制输出长度。
@@ -5964,6 +5975,7 @@ mod tests {
         fn cfg_with(id: &str) -> AgentConfig {
             AgentConfig {
                 advisor: Default::default(),
+                compaction: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: id.into(),
@@ -6066,6 +6078,7 @@ mod tests {
             );
             AgentConfig {
                 advisor: Default::default(),
+                compaction: Default::default(),
                 models: ModelCatalog {
                     models: vec![model_def(model_id)],
                     tiers: None,

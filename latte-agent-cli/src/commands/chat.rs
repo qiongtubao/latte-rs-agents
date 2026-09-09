@@ -3516,6 +3516,7 @@ mod tests {
     async fn cli_workflow_ctx_wires_the_ask_consumer() {
         let cfg = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: latte_agent_core::config::ModelCatalog {
                 models: vec![latte_agent_core::config::ModelDef {
                     name: "Test".into(),
@@ -3629,6 +3630,7 @@ mod tests {
     async fn cli_workflow_ctx_matches_ui_observability_wiring() {
         let cfg = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: latte_agent_core::config::ModelCatalog {
                 models: vec![latte_agent_core::config::ModelDef {
                     name: "Test".into(),
@@ -3833,6 +3835,7 @@ mod tests {
     async fn ensure_cli_advisor_monitor_actually_spawns() {
         let cfg = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: latte_agent_core::config::ModelCatalog {
                 models: vec![latte_agent_core::config::ModelDef {
                     name: "Test".into(),

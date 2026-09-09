@@ -3390,6 +3390,7 @@ mod tests {
     fn advisor_config_at(base_url: &str) -> Arc<AgentConfig> {
         Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Advisor Premium".into(),

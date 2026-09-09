@@ -9271,6 +9271,7 @@ mod tests {
             .expect("tool manager");
         let merged = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![],
                 tiers: None,
@@ -9730,6 +9731,7 @@ mod tests {
         };
         let merged = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![model],
                 tiers: None,
@@ -10533,6 +10535,7 @@ mod tests {
 
         let merged = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub".into(),
@@ -11148,6 +11151,7 @@ mod tests {
         };
         let merged = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![],
                 tiers: None,
@@ -11261,6 +11265,7 @@ mod tests {
 
         let merged = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-slow".into(),
@@ -11405,6 +11410,7 @@ mod tests {
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -11613,6 +11619,7 @@ mod tests {
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -12171,6 +12178,7 @@ mod tests {
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -12317,6 +12325,7 @@ mod tests {
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -12479,6 +12488,7 @@ require = ["永远不可能出现的验收字符串"]
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -12679,6 +12689,7 @@ require = ["永远不可能出现的验收字符串"]
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-slow".into(),
@@ -12815,6 +12826,7 @@ require = ["永远不可能出现的验收字符串"]
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -12955,6 +12967,7 @@ require = ["永远不可能出现的验收字符串"]
         };
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -13124,6 +13137,7 @@ require = ["永远不可能出现的验收字符串"]
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -13885,6 +13899,7 @@ require = ["永远不可能出现的验收字符串"]
 
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),

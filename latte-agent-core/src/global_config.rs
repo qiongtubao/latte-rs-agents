@@ -531,6 +531,7 @@ models:
         // project model gets the real key.
         let project = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "shared".into(),
@@ -590,6 +591,7 @@ models:
         // Project already has a real key — global must not clobber it.
         let project = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "shared".into(),
@@ -650,6 +652,7 @@ models:
         std::env::remove_var("DEFINITELY_UNSET_OVERRIDE_TEST");
         let project = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "deepseek-chat".into(),

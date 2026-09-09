@@ -155,6 +155,60 @@ pub struct AgentConfig {
     /// Advisor 总开关（`[advisor]` 段）。project 层覆盖 global 层。
     #[serde(default)]
     pub advisor: AdvisorSection,
+    /// 自动上下文压缩（`[compaction]` 段）。project 层覆盖 global 层。
+    #[serde(default)]
+    pub compaction: CompactionSection,
+}
+
+/// `[compaction]` 配置段：自动上下文压缩的可调参数。
+///
+/// 任意 agents 配置文件（project `.latte/agents*.toml`、`agents.d/*.toml`
+/// 或 global `~/.latte/agents.d/*.toml`）都可声明：
+///
+/// ```toml
+/// [compaction]
+/// enabled = true
+/// threshold_ratio = 0.8      # 占 context_window 的比例，钳 0.5..=0.95
+/// keep_recent_turns = 2      # 保留逐字原文的尾部轮数，钳 1..=32
+/// summary_max_tokens = 2048  # 摘要输出上限，钳 256..=16384
+/// max_passes = 1             # 单次检查最多压几遍，钳 1..=3
+/// sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
+/// ```
+///
+/// 每个字段都是 `Option`，用来区分「未配置」与「显式值」——分层合并时
+/// project 层的 `Some` 覆盖 global 层（与 [`AdvisorSection`] 同款语义）。
+///
+/// 优先级：**环境变量 > 项目配置 > 全局配置 > 内置默认**。环境变量留在
+/// 最高优先级是为了保留「临时压测某个参数不用改文件」的能力
+/// （见 [`crate::compaction::CompactionPolicy::resolve`]）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CompactionSection {
+    /// 总开关（缺省 true）。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 触发阈值：占 `context_window` 的比例。
+    #[serde(default)]
+    pub threshold_ratio: Option<f64>,
+    /// 保留逐字原文的尾部轮数。
+    #[serde(default)]
+    pub keep_recent_turns: Option<usize>,
+    /// 摘要输出的 token 上限。
+    #[serde(default)]
+    pub summary_max_tokens: Option<u32>,
+    /// 单次检查内最多连续压几遍。
+    #[serde(default)]
+    pub max_passes: Option<u8>,
+    /// 自定义摘要模板段落（只给标题，语义由标题自解释）。
+    /// 空 / 未配置 = 用内置 8 段模板。
+    #[serde(default)]
+    pub sections: Option<Vec<String>>,
+}
+
+impl CompactionSection {
+    /// 本段是否**完全未配置**（用于分层合并时判断要不要整体取用下层值）。
+    pub fn is_unset(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[advisor]` 配置段：advisor 监察的总开关。
@@ -288,6 +342,11 @@ impl AgentConfig {
                 // 只填 project 没声明的空档）。
                 if part.advisor.enabled.is_some() {
                     merged.advisor = part.advisor.clone();
+                    // 同 advisor：后读到的层覆盖前面的。整段未配置时不动，
+                    // 以便更低优先级的层能填进来。
+                    if !part.compaction.is_unset() {
+                        merged.compaction = part.compaction.clone();
+                    }
                 }
                 for m in part.models.models {
                     if !merged.models.models.iter().any(|e| e.provider == m.provider && e.name == m.name) {
@@ -324,6 +383,10 @@ impl AgentConfig {
                     // Advisor 开关：只填 project 未声明的空档（project 优先）。
                     if merged.advisor.enabled.is_none() && global_part.advisor.enabled.is_some() {
                         merged.advisor = global_part.advisor.clone();
+                    }
+                    // compaction 同款：project 层整段没配才取全局值。
+                    if merged.compaction.is_unset() && !global_part.compaction.is_unset() {
+                        merged.compaction = global_part.compaction.clone();
                     }
                 }
             }
@@ -403,6 +466,11 @@ impl AgentConfig {
             // Advisor 开关：声明过的文件覆盖先前的（字母序后写赢）。
             if part.advisor.enabled.is_some() {
                 merged.advisor = part.advisor.clone();
+                // 同 advisor：后读到的层覆盖前面的。整段未配置时不动，
+                // 以便更低优先级的层能填进来。
+                if !part.compaction.is_unset() {
+                    merged.compaction = part.compaction.clone();
+                }
             }
 
             // Models: append.

@@ -59,40 +59,18 @@ const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 2048;
 /// 防「压不动还一直压」：每次压缩都是一次真实 LLM 调用，失控会烧钱。
 const DEFAULT_MAX_PASSES: u8 = 1;
 
-/// 环境变量读取的公共套路：解析失败或缺失回落默认值。
-fn env_f64(key: &str, default: f64, lo: f64, hi: f64) -> f64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .unwrap_or(default)
-        .clamp(lo, hi)
+/// 环境变量读取：**只在显式设置且能解析时**返回 `Some`，供优先级链
+/// （env > 配置段 > 默认）判断"这一层有没有给值"。
+fn env_f64_opt(key: &str) -> Option<f64> {
+    std::env::var(key).ok()?.trim().parse::<f64>().ok()
 }
 
-fn env_usize(key: &str, default: usize, lo: usize, hi: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(default)
-        .clamp(lo, hi)
+fn env_usize_opt(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.trim().parse::<usize>().ok()
 }
 
-fn env_u32(key: &str, default: u32, lo: u32, hi: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(default)
-        .clamp(lo, hi)
-}
-
-fn env_bool_on(key: &str) -> bool {
-    !matches!(
-        std::env::var(key)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "0" | "false" | "no" | "off"
-    )
+fn env_u32_opt(key: &str) -> Option<u32> {
+    std::env::var(key).ok()?.trim().parse::<u32>().ok()
 }
 
 /// 压缩策略：全部参数可配。
@@ -131,29 +109,48 @@ impl Default for CompactionPolicy {
 
 impl CompactionPolicy {
     /// 从环境变量解析策略（缺失项用默认值，越界值被钳住）。
+    ///
+    /// 等价于 `resolve(&Default::default())`——即没有配置文件时的行为。
     pub fn from_env() -> Self {
+        Self::resolve(&crate::config::CompactionSection::default())
+    }
+
+    /// 按 **环境变量 > 配置段 > 内置默认** 的优先级解析策略。
+    ///
+    /// 配置段来自 `[compaction]`（project 层覆盖 global 层，合并在
+    /// [`crate::config`] 完成）。环境变量留在最高优先级，是为了保留
+    /// 「临时压测某个参数不用改文件」的能力——排查问题时最常用。
+    ///
+    /// 所有数值都钳在安全区间：配错（阈值 0 导致每轮都压、保留 0 轮导致
+    /// 模型失去上下文）不会把行为推到极端。
+    pub fn resolve(section: &crate::config::CompactionSection) -> Self {
+        // 每一项：env 有值用 env；否则配置段有值用它（钳位）；否则默认。
+        let enabled = match std::env::var("LATTE_AGENT_AUTO_COMPACT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            Err(_) => section.enabled.unwrap_or(true),
+        };
         Self {
-            enabled: env_bool_on("LATTE_AGENT_AUTO_COMPACT"),
-            threshold_ratio: env_f64(
-                "LATTE_AGENT_COMPACT_THRESHOLD_RATIO",
-                DEFAULT_THRESHOLD_RATIO,
-                0.5,
-                0.95,
-            ),
-            keep_recent_turns: env_usize(
-                "LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS",
-                DEFAULT_KEEP_RECENT_TURNS,
-                1,
-                32,
-            ),
-            summary_max_tokens: env_u32(
-                "LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS",
-                DEFAULT_SUMMARY_MAX_TOKENS,
-                256,
-                16_384,
-            ),
-            max_passes: env_u32("LATTE_AGENT_COMPACT_MAX_PASSES", DEFAULT_MAX_PASSES as u32, 1, 3)
-                as u8,
+            enabled,
+            threshold_ratio: env_f64_opt("LATTE_AGENT_COMPACT_THRESHOLD_RATIO")
+                .or(section.threshold_ratio)
+                .unwrap_or(DEFAULT_THRESHOLD_RATIO)
+                .clamp(0.5, 0.95),
+            keep_recent_turns: env_usize_opt("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS")
+                .or(section.keep_recent_turns)
+                .unwrap_or(DEFAULT_KEEP_RECENT_TURNS)
+                .clamp(1, 32),
+            summary_max_tokens: env_u32_opt("LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS")
+                .or(section.summary_max_tokens)
+                .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS)
+                .clamp(256, 16_384),
+            max_passes: env_u32_opt("LATTE_AGENT_COMPACT_MAX_PASSES")
+                .map(|v| v as u8)
+                .or(section.max_passes)
+                .unwrap_or(DEFAULT_MAX_PASSES)
+                .clamp(1, 3),
         }
     }
 
@@ -251,24 +248,46 @@ pub const DEFAULT_TEMPLATE_SECTIONS: &[(&str, &str)] = &[
     ("Critical Context", "决策与其理由、约束、用户偏好、待解问题、继续所需的数据"),
 ];
 
-/// 允许用环境变量覆盖模板段落：
-/// `LATTE_AGENT_COMPACT_SECTIONS="Goal|Progress|Next"`（用 `|` 分隔）。
-/// 缺省用 [`DEFAULT_TEMPLATE_SECTIONS`]。
+/// 解析摘要模板段落，优先级 **环境变量 > 配置段 > 内置 8 段**。
 ///
-/// 覆盖时只给标题、不给说明——自定义段落的语义由标题自解释。
-pub fn summary_template_sections() -> Vec<(String, String)> {
-    match std::env::var("LATTE_AGENT_COMPACT_SECTIONS") {
-        Ok(raw) if !raw.trim().is_empty() => raw
+/// - 环境变量：`LATTE_AGENT_COMPACT_SECTIONS="Goal|Progress|Next"`（`|` 分隔）
+/// - 配置段：`[compaction] sections = ["Goal", "Progress", "Next"]`
+///
+/// 自定义时只给标题、不给说明——段落语义由标题自解释。
+pub fn resolve_template_sections(
+    section: &crate::config::CompactionSection,
+) -> Vec<(String, String)> {
+    if let Ok(raw) = std::env::var("LATTE_AGENT_COMPACT_SECTIONS") {
+        let titles: Vec<(String, String)> = raw
             .split('|')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(|title| (title.to_string(), String::new()))
-            .collect(),
-        _ => DEFAULT_TEMPLATE_SECTIONS
-            .iter()
-            .map(|(t, d)| (t.to_string(), d.to_string()))
-            .collect(),
+            .map(|t| (t.to_string(), String::new()))
+            .collect();
+        if !titles.is_empty() {
+            return titles;
+        }
     }
+    if let Some(list) = section.sections.as_ref() {
+        let titles: Vec<(String, String)> = list
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|t| (t.to_string(), String::new()))
+            .collect();
+        if !titles.is_empty() {
+            return titles;
+        }
+    }
+    DEFAULT_TEMPLATE_SECTIONS
+        .iter()
+        .map(|(t, d)| (t.to_string(), d.to_string()))
+        .collect()
+}
+
+/// 只按环境变量 / 默认解析（无配置段时的便捷入口）。
+pub fn summary_template_sections() -> Vec<(String, String)> {
+    resolve_template_sections(&crate::config::CompactionSection::default())
 }
 
 /// 渲染压缩指令（作为**最后一条 user 消息**发出，见模块文档的缓存说明）。
@@ -340,6 +359,83 @@ mod tests {
     }
     fn sys(t: &str) -> Message {
         Message::system(t)
+    }
+
+    // ─── 优先级：env > 配置段 > 默认 ─────────────────────────────────
+
+    #[test]
+    fn config_section_drives_policy_when_no_env() {
+        let section = crate::config::CompactionSection {
+            enabled: Some(true),
+            threshold_ratio: Some(0.6),
+            keep_recent_turns: Some(5),
+            summary_max_tokens: Some(4096),
+            max_passes: Some(2),
+            sections: Some(vec!["Goal".into(), "Next".into()]),
+        };
+        let p = CompactionPolicy::resolve(&section);
+        assert_eq!(p.threshold_ratio, 0.6);
+        assert_eq!(p.keep_recent_turns, 5);
+        assert_eq!(p.summary_max_tokens, 4096);
+        assert_eq!(p.max_passes, 2);
+
+        let secs = resolve_template_sections(&section);
+        assert_eq!(secs.len(), 2, "配置段的自定义模板应生效: {secs:?}");
+        assert_eq!(secs[0].0, "Goal");
+    }
+
+    #[test]
+    fn unset_section_falls_back_to_builtin_defaults() {
+        let p = CompactionPolicy::resolve(&Default::default());
+        assert_eq!(p, CompactionPolicy::default(), "未配置应等于内置默认");
+        assert_eq!(
+            resolve_template_sections(&Default::default()).len(),
+            DEFAULT_TEMPLATE_SECTIONS.len(),
+            "未配置应用内置 8 段"
+        );
+    }
+
+    #[test]
+    fn out_of_range_config_is_clamped_not_honoured() {
+        // 配错不该把行为推到极端（阈值 0 每轮都压 / 保留 0 轮丢上下文）。
+        let section = crate::config::CompactionSection {
+            threshold_ratio: Some(0.01),
+            keep_recent_turns: Some(0),
+            summary_max_tokens: Some(10),
+            max_passes: Some(99),
+            ..Default::default()
+        };
+        let p = CompactionPolicy::resolve(&section);
+        assert_eq!(p.threshold_ratio, 0.5, "钳到下限");
+        assert_eq!(p.keep_recent_turns, 1, "至少保留 1 轮");
+        assert_eq!(p.summary_max_tokens, 256, "钳到下限");
+        assert_eq!(p.max_passes, 3, "钳到上限");
+    }
+
+    #[test]
+    fn env_overrides_the_config_section() {
+        // env 留在最高优先级：排查问题时不用改文件就能压测某个参数。
+        let section = crate::config::CompactionSection {
+            threshold_ratio: Some(0.6),
+            keep_recent_turns: Some(5),
+            ..Default::default()
+        };
+        std::env::set_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO", "0.9");
+        let p = CompactionPolicy::resolve(&section);
+        std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO");
+        assert_eq!(p.threshold_ratio, 0.9, "env 必须覆盖配置段");
+        assert_eq!(p.keep_recent_turns, 5, "未被 env 覆盖的项仍取配置段");
+    }
+
+    #[test]
+    fn section_is_unset_detects_a_blank_block() {
+        // 分层合并靠它判断「这一层整段没配、该取下层值」。
+        assert!(crate::config::CompactionSection::default().is_unset());
+        assert!(!crate::config::CompactionSection {
+            enabled: Some(false),
+            ..Default::default()
+        }
+        .is_unset());
     }
 
     // ─── 阈值 ────────────────────────────────────────────────────────

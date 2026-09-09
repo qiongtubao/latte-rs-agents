@@ -92,6 +92,10 @@ struct ResolverSnapshot {
     /// 角色编辑器保存的 model_tier（解析失败的项跳过，调用方回退
     /// 到自己构建时的 tier）。
     role_model_tiers: std::collections::HashMap<String, ModelTier>,
+    /// `[compaction]` 配置段。放进快照与 role_model_chains 同理：运行中的
+    /// runner 持有 resolver，而它构建时的 AgentConfig 已经固化——把这段
+    /// 放这里，「UI 改压缩参数 → 保存 → 已加载 session 下一轮生效」才成立。
+    compaction: crate::config::CompactionSection,
 }
 
 impl ResolverSnapshot {
@@ -156,6 +160,7 @@ impl ResolverSnapshot {
             role_tiers,
             role_model_chains,
             role_model_tiers,
+            compaction: config.compaction.clone(),
         })
     }
 }
@@ -214,6 +219,16 @@ impl ModelResolver {
     }
 
     /// 见 [`ResolverSnapshot::resolve_id_or_name`]。
+    /// 当前生效的 `[compaction]` 配置段（**实时**，随 `reload_from_config`
+    /// 更新）。
+    ///
+    /// 运行中的 runner 通过它拿最新压缩参数，而不是用构建时固化的
+    /// AgentConfig ——「UI 改参数 → 保存 → 已加载 session 下一轮生效」
+    /// 就靠这条路（与 role_model_chains 同款设计）。
+    pub fn compaction_section(&self) -> crate::config::CompactionSection {
+        self.inner.read().compaction.clone()
+    }
+
     pub fn resolve_id_or_name(&self, query: &str) -> AgentResult<Model> {
         self.snapshot().resolve_id_or_name(query)
     }
@@ -625,6 +640,7 @@ mod tests {
     fn test_resolve_via_tier_defaults() {
         let config = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium-model", Some("premium")),
@@ -655,6 +671,7 @@ mod tests {
     fn test_resolve_fallback() {
         let config = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![test_model_def("only-model", None)],
                 tiers: None,
@@ -674,6 +691,7 @@ mod tests {
         def.name = "DeepSeek-v4-flash".into();
         let config = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -692,6 +710,7 @@ mod tests {
         def.name = "DeepSeek-v4-flash".into();
         let config = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -714,6 +733,7 @@ mod tests {
         def.name = "Real Name".into();
         let config = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -747,6 +767,7 @@ mod tests {
     fn catalog_with(models: Vec<ModelDef>) -> AgentConfig {
         AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models,
                 tiers: None,
@@ -834,6 +855,47 @@ mod tests {
 
     // ─── resolve_chain tests ───────────────────────────────────────────
 
+    /// 动态生效：`reload_from_config` 之后，长存 resolver 交出的
+    /// `[compaction]` 必须是**新值**。
+    ///
+    /// 这是「UI 改压缩参数 → 保存 → 已加载 session 下一轮生效」的直接
+    /// 证明：运行中的 runner 持有 resolver，而它构建时的 AgentConfig 已经
+    /// 固化——若配置段不随 resolver 更新，UI 上改完只能等重开会话。
+    #[test]
+    fn compaction_section_hot_reloads_with_the_resolver() {
+        use crate::config::CompactionSection;
+        let mut cfg = catalog_with_three();
+        cfg.compaction = CompactionSection {
+            threshold_ratio: Some(0.7),
+            keep_recent_turns: Some(3),
+            ..Default::default()
+        };
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+        let before = resolver.compaction_section();
+        assert_eq!(before.threshold_ratio, Some(0.7));
+        assert_eq!(before.keep_recent_turns, Some(3));
+        let gen_before = resolver.generation();
+
+        // 模拟 UI 保存：改配置 → reload。
+        cfg.compaction = CompactionSection {
+            threshold_ratio: Some(0.9),
+            keep_recent_turns: Some(8),
+            enabled: Some(false),
+            ..Default::default()
+        };
+        resolver.reload_from_config(&cfg).unwrap();
+
+        let after = resolver.compaction_section();
+        assert_eq!(after.threshold_ratio, Some(0.9), "reload 后必须读到新阈值");
+        assert_eq!(after.keep_recent_turns, Some(8));
+        assert_eq!(after.enabled, Some(false), "开关也要热生效");
+        assert!(
+            resolver.generation() > gen_before,
+            "代际必须推进，长存 runner 据此感知变更"
+        );
+    }
+
+
     /// prompt_cache 必须从 TOML 一路透传到 `latte_ai::Model`。
     ///
     /// 只测「决策逻辑」不够——这类字段的经典失效是**算对了但没进请求**
@@ -877,6 +939,7 @@ prompt_cache = true
 
         let cfg = AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def_on],
                 tiers: None,
@@ -896,6 +959,7 @@ prompt_cache = true
     fn catalog_with_three() -> AgentConfig {
         AgentConfig {
             advisor: Default::default(),
+            compaction: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium", Some("premium")),
