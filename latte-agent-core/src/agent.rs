@@ -4543,11 +4543,24 @@ fn model_facing_tool_schema(
     schema
 }
 
+/// 构造下发给模型的工具 schema 列表。
+///
+/// **按名字排序**是 prompt caching 的硬前提（byte-stability）：工具定义
+/// 位于请求最前面，是缓存前缀的开头。底层 registry 用
+/// `HashMap<String, RegisteredTool>`（`tool_registry.rs`），`.values()`
+/// 的遍历顺序**不保证跨调用稳定**——顺序一变，`tools` 数组的字节就变，
+/// 整个缓存前缀（tools + system）当场失效，每轮都按未缓存价格重算。
+///
+/// 排序不影响语义：工具按名字调用，数组顺序只是呈现顺序。
+///
+/// 对齐 oh-my-pi 的 byte-stability plane（`planStableAnthropicTools`）——
+/// 它同样把"跨轮字节稳定"当作缓存生效的前置条件来专门保障。
 fn build_tool_schemas(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
 ) -> Vec<latte_ai::models::Tool> {
-    tm.get_tool_definitions()
-        .iter()
+    let mut defs = tm.get_tool_definitions();
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    defs.iter()
         .map(|definition| latte_ai::models::Tool {
             name: definition.name.clone(),
             description: Some(definition.description.clone()),
@@ -10157,6 +10170,37 @@ tools = ["read", "write"]
         assert!(names.contains(&"bash".to_string()), "应有 bash: {names:?}");
         assert!(names.contains(&"read".to_string()), "应有 read: {names:?}");
         assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
+    }
+
+    /// byte-stability：工具 schema 顺序必须**确定且跨调用一致**。
+    ///
+    /// 这是 prompt caching 的硬前提。工具定义在请求最前面、是缓存前缀的
+    /// 开头；底层 registry 是 `HashMap`，`.values()` 顺序不保证稳定——
+    /// 顺序一抖，tools+system 整段前缀的字节就变，缓存当场失效、每轮按
+    /// 未缓存价格重算。实测背景：单会话 22.19M 输入 token / 22.7 倍放大，
+    /// 缓存是对症解法，而缓存的前提就是这条。
+    #[tokio::test]
+    async fn build_tool_schemas_order_is_byte_stable() {
+        let mgr = crate::controller::build_tool_manager(
+            &["bash".into(), "read".into(), "search".into(), "write".into()],
+        )
+        .await
+        .unwrap();
+
+        let names_of = |m: &_| -> Vec<String> {
+            build_tool_schemas(m).iter().map(|t| t.name.clone()).collect()
+        };
+        let first = names_of(&mgr);
+
+        // 1. 已排序（确定性来源，而不是碰巧）。
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "工具顺序必须按名字排序: {first:?}");
+
+        // 2. 反复构造得到逐字相同的顺序（HashMap 抖动不会漏进请求）。
+        for _ in 0..8 {
+            assert_eq!(names_of(&mgr), first, "同一 manager 多次构造顺序必须一致");
+        }
     }
 
     #[test]
