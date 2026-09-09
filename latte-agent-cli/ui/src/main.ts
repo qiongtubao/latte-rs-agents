@@ -589,6 +589,15 @@ async function main(): Promise<void> {
   };
   setUiApi(uiApi);
   installUiCallListener(uiApi);
+  // e2e 可依赖的**确定性** mount 完成标记。
+  //
+  // 为什么需要它：`#chat-input` 出现 ≠ mount 完成——面板按钮的 click
+  // handler 是在这之后才绑的。实测（Playwright）在 `domcontentloaded`
+  // 或 `load` 之后立刻点 `#models-btn`，点击落在还没绑 handler 的按钮上、
+  // 静默丢失，面板打不开且**没有任何报错**，很容易被误判成应用 bug。
+  // 现有 e2e 靠 `waitForTimeout(500~5000)` 硬等，机器一慢就翻。
+  // 有了这个标记，测试可以 `waitForSelector('body[data-ui-mounted="1"]')`。
+  document.body.dataset.uiMounted = "1";
   console.log(`[ui] mounted; self-loop panel`, selfLoop.isOpen() ? "open" : "closed");
 }
 

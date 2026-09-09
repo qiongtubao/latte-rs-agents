@@ -34,31 +34,26 @@ test.describe("自动上下文压缩设置面板", () => {
   test.beforeEach(async () => {
     page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
     await page.goto(UI_BASE, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await page.waitForSelector("#chat-input", { timeout: 10000 });
+    // 等**mount 完成**再操作。`#chat-input` 出现不代表 mount 完了——面板
+    // 按钮的 click handler 是在那之后才绑的，早点会静默丢失（实测：
+    // domcontentloaded/load 之后立刻点 #models-btn，面板不开且无报错）。
+    await page.waitForSelector('body[data-ui-mounted="1"]', { timeout: 15000 });
   });
 
-  /** 打开模型面板并展开压缩设置块。
-   *
-   * ⚠️ 这里**不点** `#models-btn`：实测（本分支基线、stash 掉本次前端改动
-   * 后同样复现）点它并不会移除 `#models-panel` 的 `.hidden`，面板打不开、
-   * 也没有 JS 报错——这是一个**既有缺陷**，与压缩面板无关，已在提交信息
-   * 里记录。为了让本用例验证的是「压缩面板的显示与保存」而不是被那个
-   * 缺陷挡住，这里直接去掉 `.hidden` 把面板显出来。
-   * 那个按钮本身的修复应由独立用例覆盖。
-   */
+  /** 打开模型面板并展开压缩设置块——走**真实点击**，与用户操作一致。 */
   async function openCompactionPanel(): Promise<void> {
-    await page.evaluate(() => {
-      document.getElementById("models-panel")?.classList.remove("hidden");
-    });
     const panel = page.locator("#models-panel");
+    if (await panel.evaluate((el) => el.classList.contains("hidden"))) {
+      await page.locator("#models-btn").click();
+    }
     await expect(panel).toBeVisible({ timeout: 10000 });
 
-    // <details> 默认折叠——用 DOM 直接展开，避免受面板动画/定位影响。
-    await page.evaluate(() => {
-      const d = document.getElementById("compaction-setting") as HTMLDetailsElement | null;
-      if (d) d.open = true;
-    });
-    await expect(page.locator("#compaction-setting")).toBeVisible({ timeout: 10000 });
+    // <details> 默认折叠，点 summary 展开（同样是真实点击）。
+    const details = page.locator("#compaction-setting");
+    await expect(details).toBeVisible({ timeout: 10000 });
+    if (!(await details.evaluate((el) => (el as HTMLDetailsElement).open))) {
+      await details.locator("summary").click();
+    }
     await page.waitForFunction(
       () => {
         const el = document.getElementById("compaction-threshold") as HTMLInputElement | null;
@@ -123,7 +118,7 @@ test.describe("自动上下文压缩设置面板", () => {
 
     // 3. **修改生效**：重开面板（重新 GET）读到的是新值
     await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector("#chat-input", { timeout: 10000 });
+    await page.waitForSelector('body[data-ui-mounted="1"]', { timeout: 15000 });
     await openCompactionPanel();
     expect(await page.locator("#compaction-keep-turns").inputValue()).toBe(target);
     expect(Number(await page.locator("#compaction-threshold").inputValue())).toBeCloseTo(0.75, 5);
