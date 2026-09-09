@@ -300,6 +300,7 @@ mod tests {
             max_tokens: 4096,
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
+            prompt_cache: false,
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: true,

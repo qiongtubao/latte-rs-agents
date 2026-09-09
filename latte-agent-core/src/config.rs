@@ -523,6 +523,20 @@ pub struct ModelDef {
     /// 默认值说话"）。
     #[serde(default)]
     pub max_tokens_field: latte_ai::models::MaxTokensField,
+
+    /// OpenAI-compatible 端点是否下发 prompt caching 断点
+    /// （`cache_control`）。**默认关**：不认这个字段的兼容端点看到未知
+    /// 字段会 400，无条件下发等于把可用模型打挂。只在确认支持的端点上
+    /// 开（OpenRouter 转 Claude、DeepSeek 上下文缓存、阿里云等）。
+    ///
+    /// Anthropic 原生协议（`api = "anthropic"`）**不看这个开关**：那条
+    /// 路的 caching 是协议一等公民、恒开。
+    ///
+    /// 收益（实测 jemalloc 会话）：单会话 22.19M 输入 token、工具结果
+    /// 唯一内容仅 0.97M = 22.7 倍放大。缓存住工具定义 + system prompt
+    /// 这段"巨大且不变的前缀"是对症解法。
+    #[serde(default)]
+    pub prompt_cache: bool,
     /// Whether the model supports thinking/reasoning.
     #[serde(default)]
     pub supports_thinking: bool,

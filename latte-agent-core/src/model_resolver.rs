@@ -500,6 +500,7 @@ impl ResolverSnapshot {
             max_tokens: def.max_tokens,
             omit_max_tokens: def.omit_max_tokens,
             max_tokens_field: def.max_tokens_field,
+            prompt_cache: def.prompt_cache,
             supports_thinking: def.supports_thinking,
             supports_vision: def.supports_vision,
             cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
@@ -591,6 +592,7 @@ mod tests {
             max_tokens: 4096,
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
+            prompt_cache: false,
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: false,
@@ -831,6 +833,65 @@ mod tests {
     }
 
     // ─── resolve_chain tests ───────────────────────────────────────────
+
+    /// prompt_cache 必须从 TOML 一路透传到 `latte_ai::Model`。
+    ///
+    /// 只测「决策逻辑」不够——这类字段的经典失效是**算对了但没进请求**
+    /// （见 latte-ai 那次 max_tokens：目录配 384000、529 次请求全发 None）。
+    /// 这里钉的是配置 → ModelDef → Model 这一段；wire 侧由 latte-ai 的
+    /// openai_cache_breakpoints_* 测试覆盖。
+    #[test]
+    fn prompt_cache_flows_from_toml_to_model() {
+        // 1. TOML 缺省 = false（不认 cache_control 的端点不会被打挂）。
+        let def: crate::config::ModelDef = toml::from_str(
+            r#"
+name = "m"
+api = "openai"
+provider = "p"
+base_url = "http://x"
+api_key = "k"
+context_window = 1000
+max_tokens = 100
+supports_thinking = false
+"#,
+        )
+        .expect("ModelDef 应能在不写 prompt_cache 时反序列化");
+        assert!(!def.prompt_cache, "缺省必须是关");
+
+        // 2. 显式打开 → 透传到 Model。
+        let def_on: crate::config::ModelDef = toml::from_str(
+            r#"
+name = "m"
+api = "openai"
+provider = "p"
+base_url = "http://x"
+api_key = "k"
+context_window = 1000
+max_tokens = 100
+supports_thinking = false
+prompt_cache = true
+"#,
+        )
+        .expect("显式 prompt_cache 应能反序列化");
+        assert!(def_on.prompt_cache);
+
+        let cfg = AgentConfig {
+            advisor: Default::default(),
+            models: crate::config::ModelCatalog {
+                models: vec![def_on],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+        let model = resolver.resolve_id_or_name("m").expect("按 id 解析");
+        assert!(
+            model.prompt_cache,
+            "配置里开了 prompt_cache，解析出的 Model 必须带着它——否则断点永远不下发"
+        );
+    }
+
 
     fn catalog_with_three() -> AgentConfig {
         AgentConfig {

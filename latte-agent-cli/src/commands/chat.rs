@@ -3379,6 +3379,10 @@ mod tests {
             role_id: "tutor".into(),
             choice_id: choice_id.into(),
             question: "你的目标是什么？".into(),
+            // 多题弹框协议（pi-dev 引入 ChoiceQuestion 时漏更新了这个
+            // CLI 测试 helper，导致 --tests 编译一直是坏的）：单题形态
+            // 走 question/options，questions 留空。
+            questions: vec![],
             multi,
             layout: String::new(),
             allow_upload: false,
@@ -3523,6 +3527,7 @@ mod tests {
                     max_tokens: 1024,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
+                    prompt_cache: false,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -3635,6 +3640,7 @@ mod tests {
                     max_tokens: 1024,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
+                    prompt_cache: false,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -3838,6 +3844,7 @@ mod tests {
                     max_tokens: 1024,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
+                    prompt_cache: false,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
