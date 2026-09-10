@@ -13740,6 +13740,17 @@ require = ["永远不可能出现的验收字符串"]
             eprintln!("skip: ast-grep 未安装");
             return;
         }
+        // ENV_LOCK：ast-grep 子进程继承当前进程的 cwd，且要求 cwd 下能找到
+        // 项目配置（`sgconfig.yml`）。全量测试并发跑时，别的测试（如
+        // config.rs 的 load_with_global 系列）会用 `set_current_dir`
+        // 把 cwd 切到不含该配置的临时目录、跑完再切回来——如果切换窗口期
+        // 恰好撞上本测试发起 `ast-grep`，子进程继承的是被污染的 cwd，报
+        // "No ast-grep project configuration is found" 而不是真实的解析
+        // 失败。持锁能确保运行期间没有人在改 cwd（那些测试同样持这把锁）。
+        let _guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let d = cg_multiline_fixture();
         let mgr = build_tool_manager(&["read".into()]).await.unwrap();
 
