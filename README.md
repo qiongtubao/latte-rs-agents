@@ -144,6 +144,35 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_COMPACT_MAX_PASSES` | 1 | 单次检查内最多连续压几遍，钳在 `1..=3`。防"压不动还一直压"——每次压缩都是一次真实 LLM 调用 |
 | `LATTE_AGENT_COMPACT_SECTIONS` | （8 段默认模板） | 自定义摘要模板段落，用 `\|` 分隔（如 `"Goal\|Progress\|Next"`）。默认 8 段取自 deepseek-harness：Primary Request and Intent / Key Technical Concepts / Files and Code / Errors and Fixes / Pending Jobs / Current Work / Next Step / Critical Context |
 
+#### 压缩的两种触发
+
+| 触发 | 判据 | 用途 |
+|---|---|---|
+| **pressure** | 轮次入口检查 `占用 / context_window >= threshold_ratio` | 常规。依赖模型目录里声明的 `context_window` 是对的 |
+| **context-overflow** | 供应商**真的报了**「超出上下文窗口」 | 兜底。**跳过阈值判断**，不看声明值 |
+
+第二种是必需的，因为第一种的判据里 `context_window` 是**配置声明的值**：
+声明写大了阈值就永不触发。实测事故——jemalloc 的三个模型全写
+`context_window = 1000000`（阈值 0.8 → 800K），7 个会话里 `ContextCompacted`
+**一次都没出现**，主动压缩形同不存在。被动触发只认「请求被拒」这个事实，
+不依赖配置正确性。
+
+溢出识别覆盖各家 OpenAI 兼容端点的措辞（`context length exceeded` /
+`maximum context` / `input too long` / `context_length_exceeded` / 中文
+「上下文长度超出」等）。判据故意收紧成「超限动作词 + 上下文名词」的组合：
+误判的代价是白烧一次摘要调用还压掉好历史，所以宁可漏判、退回原错误。
+
+被动触发时按 **真压缩 → 兜底瘦身** 两级处理：先把旧历史摘要成 checkpoint
+（真正减少消息条数），压不动（历史太短、或摘要调用也失败）时至少把超大
+单条消息裁短。被动触发只压一遍就交回重试——真实窗口未知，多压也无从判断
+够不够，让重试结果说话。
+
+> **压缩治不了工具循环内的放大**：自动压缩挂在 **turn 入口**（放进工具
+> 循环里替换历史容易切断 `tool_call ↔ tool_result` 配对）。而 22.7 倍放大
+> 发生在**单个 turn 的工具循环内部**——第 N 次调用要把前 N-1 次的历史再发
+> 一遍。对这个问题唯一的杠杆是 **prompt caching**（让重传变便宜），压缩解决
+> 的是另一件事：长会话别撞窗口。
+
 #### 压缩参数也可写在配置文件里
 
 上面 6 个环境变量都能改成 `[compaction]` 配置段，写在任意 agents 配置文件
@@ -171,6 +200,9 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
 改参数并选择「保存到项目 / 保存到全局」，保存后同样是已加载会话下一轮生效。
 被环境变量接管的字段会标灰并提示（env 优先级最高，在面板上改不会生效）。
 对应端点 `GET/PUT /api/compaction`（见 `docs/api-reference.md` 9c 节）。
+| `LATTE_AI_PROMPT_CACHE_KEY` | 1（开） | 是否下发顶层 `prompt_cache_key`（**缓存亲和键**）。与模型目录里的 `prompt_cache` 是**两条独立机制**：后者声明「缓存边界在哪」（Anthropic 式 `cache_control`，塞进 OpenAI body 容易 400，所以默认关）；本项只声明「这些请求属于同一会话」，走供应商的自动前缀缓存。命中自动缓存要求请求落到**持有那份 KV cache 的机器**上，网关的负载均衡不保证这点，这个键就是给它做路由亲和的。键取 session id（整个会话内稳定）。个别对未知顶层字段严格 400 的端点用 `0` 关，或在模型目录里写 `prompt_cache_key = false`。实测事故：jemalloc 会话三个模型全是 `api = "openai"` 且都没开 `prompt_cache`，22.19M 输入 token **零缓存命中** |
+| `LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS` | 90 | advisor 对 delegate/workflow 返回做**单次审查**的超时（秒），钳在 `10..=600`。超时按「未审直接放行」降级，所以这是「一次审查值多少钱」的预算。实测事故：默认 90s 撞上常态 >120s 的慢模型，一个会话里 4 次静默放行——审查门禁形同虚设。也可写 `[advisor] delegate_review_timeout_secs`；若审查和干活共用慢模型池，要么调大，要么给 advisor 单独配快模型 |
+| `LATTE_AGENT_ADVISOR_RETURN_MAX_REDO` | 1 | workflow speaker 的返回被 advisor 判 intervene/terminate 时的**重做上限**（每次重做都是全新 subagent），钳到硬顶 3。也可写 `[advisor] return_max_redo` |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
 | `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
 | `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
@@ -239,6 +271,33 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
 
 第 3、4 条中止时会把模型**已产出的正文**作为 `partial` 带出来，workflow 与
 delegate 据此降级采纳，不会把前面几十轮的成果一起丢掉。
+
+### edit 锚点失败的两级升级
+
+`edit` 的确定性失败（锚点找不到 / 命中多处 / 快照过期）带**失败码**
+（`EDIT_ANCHOR_NOT_FOUND` / `EDIT_AMBIGUOUS` / `EDIT_STALE_TAG` /
+`EDIT_BAD_ARGS`），据此做三件事：
+
+1. **不重试**。同一份输入第二次不可能成功。此前这些失败没命中错误分类器
+   那张中文子串黑名单，被归成「瞬时执行错误」自动重跑一遍——实测一个
+   `ToolUse` 对着**两条**完全相同的 `ToolError`，4 次失败白烧 4 次往返。
+2. **报文自带补救动作**：不只说哪里错了，还说下一步干什么（「先 `read`
+   重读该文件，按当前内容与返回的 tag 重写锚点」）。实测模型连续 4 次
+   只收到「找不到匹配」，就一直靠猜改锚点，从没想到该重读。
+3. **按文件累计计数**：同一文件连续 3 次锚点类失败后，从软提示升级为
+   硬性「换策略」指令（停止重发、给出重读/放弃两条明确出路）。对该文件
+   成功 `read`/`edit`/`write` 即清零。
+
+> **为什么现有的死循环熔断抓不到它**：熔断按「工具名 + 逐字节相同的参数」
+> 计数（连击 5 次）或「最近 8 次里 ≤2 种调用且各自重复」（打转）。模型猜
+> 锚点时**每次 `old_text` 都不一样**，两条规则一条都不触发。所以这里按
+> **语义类别**计数，而不是按参数指纹。
+
+另外，`edit` 的布尔参数（`all` / `delete` / `insert_after` /
+`insert_before`）接受字符串写法（`"true"` / `"1"` / `"yes"` / `"on"`）——
+实测部分模型就是这么发的，只认 JSON 布尔会静默判 `false`，然后报「请显式
+传 `all: true`」，而模型认为自己已经传了，于是原地打转。宽容解析的同时会
+往返回体的 `warnings` 里记一条，避免用宽容掩盖模型的类型错误。
 
 ## 工具说明（tool docs）
 
