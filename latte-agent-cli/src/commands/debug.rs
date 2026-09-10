@@ -412,6 +412,8 @@ impl IndexLineExt for latte_agent_core::trace::IndexLine {
                 total_input: self.tokens_in.unwrap_or(0),
                 total_output: self.tokens_out.unwrap_or(0),
                 total_thinking: self.tokens_think.unwrap_or(0),
+                total_cache_read: 0,
+                total_cache_write: 0,
                 elapsed_ms: self.latency_ms.unwrap_or(0),
             },
             "SessionEnd" => TraceEvent::SessionEnd {

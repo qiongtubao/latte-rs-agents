@@ -361,11 +361,11 @@ mod tests {
         let events = vec![
             TraceEvent::TurnEnd {
                 meta: TraceMeta { turn: 0, role: "manager".into(), ts: "t".into(), session_id: "s".into() },
-                total_input: 100, total_output: 200, total_thinking: 5, elapsed_ms: 1,
+                total_input: 100, total_output: 200, total_thinking: 5, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 1,
             },
             TraceEvent::TurnEnd {
                 meta: TraceMeta { turn: 0, role: "manager".into(), ts: "t".into(), session_id: "s".into() },
-                total_input: 50, total_output: 100, total_thinking: 0, elapsed_ms: 1,
+                total_input: 50, total_output: 100, total_thinking: 0, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 1,
             },
             TraceEvent::ToolExec {
                 meta: TraceMeta { turn: 0, role: "manager".into(), ts: "t".into(), session_id: "s".into() },
@@ -374,7 +374,7 @@ mod tests {
             },
             TraceEvent::TurnEnd {
                 meta: TraceMeta { turn: 1, role: "programmer".into(), ts: "t".into(), session_id: "s".into() },
-                total_input: 30, total_output: 60, total_thinking: 2, elapsed_ms: 1,
+                total_input: 30, total_output: 60, total_thinking: 2, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 1,
             },
         ];
         let agg = aggregate_tokens(&events);

@@ -1379,6 +1379,7 @@ fn ensure_cli_advisor_monitor(
     }
     let cfg = AdvisorMonitorConfig {
         enabled: merged.advisor.enabled(),
+        review_settings: merged.advisor.review_settings(),
         ..AdvisorMonitorConfig::default()
     };
     if !cfg.enabled {
@@ -1722,6 +1723,7 @@ fn cli_workflow_ctx_on(
         session_id: Some(cli_session_id()),
         advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
             enabled: merged_for_advisor.advisor.enabled(),
+            review_settings: merged_for_advisor.advisor.review_settings(),
             ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
         }
         .runner_gate(),
@@ -3529,6 +3531,7 @@ mod tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
                     prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -3643,6 +3646,7 @@ mod tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
                     prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -3848,6 +3852,7 @@ mod tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
                     prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
