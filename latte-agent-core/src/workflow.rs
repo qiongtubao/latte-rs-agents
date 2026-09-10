@@ -995,6 +995,28 @@ pub struct WorkflowStepDef {
     /// 「符号」。
     #[serde(default)]
     pub require_symbols_resolvable: bool,
+    /// 产出里的 `path:line` 引用必须落在**本步 speaker 实际读到过**的行内。
+    ///
+    /// 与 `require_symbols_resolvable` 的分工：那条查「名字在不在仓库里」，
+    /// 这条查「关于名字的断言对不对」。实测 2026-09-10 jemalloc 会话 LAT-113：
+    /// 符号门禁放行了产出（`bit_util.h`、`ffs_zu`、`lg_floor` 全都真实存在），
+    /// 但 reviewer 查出 7 个 `#error` 行号里 **6 个标错**，还有一个断言了整个
+    /// 不存在的 `#error`；后续 programmer 那 8 次 `edit` 失败全在修这些引用。
+    /// 符号门禁只验证一个 bit（字符串存在），不验证任何 claim。
+    ///
+    /// 判据靠 `edit_anchor` 的行级观察台账（read/search/code_graph 都会记）。
+    /// **三态放行**：台账查不到、同名歧义、只有 tag 没有行级来源，一律放行
+    /// ——台账有容量上限会 LRU 淘汰，把「查不到」当「没看过」会大量误杀。只
+    /// 拦「确定读过这个文件、但引用的行在读到的范围之外」。
+    ///
+    /// 报错带 reveal（照 oh-my-pi 的 `UnseenLinesReveal`）：直接给出那些行的
+    /// 真实内容，模型原地改对，不必再花一轮 `read`。
+    ///
+    /// 建议只在**调研型** step 上开（`learn` / `explore` 这类"读代码写笔记"
+    /// 的产出，行号引用是主要返工来源）。设计型 step 谈的是还不存在的代码，
+    /// 开了只会添乱。
+    #[serde(default)]
+    pub require_citations_observed: bool,
     /// patch 模式：本步 speaker 不再重出整份清单，只输出「修订说明 +
     /// 一个 ```json fence 的 `{"ops":[{"task":"<标题唯一子串>",
     /// "field":"<字段名>","set":<新值>}]}`」。引擎把 ops 机械应用到
@@ -3816,6 +3838,8 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     total_input: 0,
                     total_output: 0,
                     total_thinking: 0,
+                    total_cache_read: 0,
+                    total_cache_write: 0,
                     elapsed_ms: 0,
                 });
             }
@@ -4249,6 +4273,39 @@ async fn run_workflow_serial(
                             );
                             step_transcript
                                 .push_str("[验收批注]: 引用了仓库中不存在的代码符号，已要求核对后重做\n");
+                            prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
+                            continue;
+                        }
+                    }
+                    // 行号引用校验（require_citations_observed）：产出里的
+                    // `path:line` 必须落在本步 speaker 实际读到过的行内。
+                    // 放在符号校验之后——先确认「名字真实」，再确认「关于它
+                    // 的行号断言真实」。三态放行的语义见
+                    // `citation_check::check_citations_observed`。
+                    if step.require_citations_observed {
+                        let scope = crate::edit_anchor::Scope::new(
+                            ctx.session_id.clone().unwrap_or_default(),
+                            &speaker,
+                        );
+                        if let Err(reason) = crate::citation_check::check_citations_observed(
+                            &response,
+                            &scope,
+                            &ctx.cwd,
+                        ) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                "workflow step cited unobserved lines; retrying"
+                            );
+                            step_transcript.push_str(
+                                "[验收批注]: 行号引用落在没读到过的行上，已带真实内容要求改正\n",
+                            );
                             prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
                             continue;
                         }
@@ -4737,6 +4794,34 @@ async fn run_dag_step(
                     );
                     step_transcript
                         .push_str("[验收批注]: 引用了仓库中不存在的代码符号，已要求核对后重做\n");
+                    prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
+                    continue;
+                }
+            }
+            // 行号引用校验：与串行引擎同语义（见那一处的注释）。同为纯产出
+            // 检查、无跨步状态，所以 DAG 也支持。
+            if step.require_citations_observed {
+                let scope = crate::edit_anchor::Scope::new(
+                    inp.session_id.clone().unwrap_or_default(),
+                    &speaker,
+                );
+                if let Err(reason) =
+                    crate::citation_check::check_citations_observed(&response, &scope, &inp.cwd)
+                {
+                    if attempt >= step.max_retries {
+                        return Err(StepFail::Failed(format!(
+                            "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                            step.id, speaker
+                        )));
+                    }
+                    attempt += 1;
+                    tracing::warn!(
+                        step = %step.id, speaker = %speaker, attempt,
+                        "workflow step cited unobserved lines; retrying"
+                    );
+                    step_transcript.push_str(
+                        "[验收批注]: 行号引用落在没读到过的行上，已带真实内容要求改正\n",
+                    );
                     prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
                     continue;
                 }
@@ -7998,6 +8083,7 @@ mod contract_engine_tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -9559,6 +9645,7 @@ mod resume_tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11192,6 +11279,7 @@ mod loop_tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11823,6 +11911,54 @@ output_key = "design"
     /// `require_plan_tasks`（路径存在性）都管不到「文件对、函数名假」，
     /// 而那 74 个幻觉符号里 39 个出自模型压根没打开过的文件。
     #[test]
+    /// 新门禁必须**默认关**，且 learn 的 write 步真的开了。
+    ///
+    /// 默认关是刻意的：设计型 step 谈的是还不存在的代码，行号引用校验开了只会
+    /// 添乱。只在「读代码写笔记」这类调研型产出上开。
+    #[test]
+    fn citation_gate_defaults_off_and_is_enabled_on_learn_write() {
+        // 不写这个字段时必须是 false
+        let bare: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+description = "d"
+task = "t"
+"#,
+        )
+        .expect("最小 step 应能反序列化");
+        assert!(
+            !bare.require_citations_observed,
+            "未声明时必须是关——否则所有既有 workflow 一夜之间都被加了道门"
+        );
+
+        // 显式开
+        let on: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+description = "d"
+task = "t"
+require_citations_observed = true
+"#,
+        )
+        .expect("显式开应能反序列化");
+        assert!(on.require_citations_observed);
+
+        // learn 的 write 步实际配上了
+        let learn = std::fs::read_to_string("../config/workflows/learn.toml")
+            .or_else(|_| std::fs::read_to_string("config/workflows/learn.toml"))
+            .expect("读 learn.toml");
+        let def: WorkflowDef = toml::from_str(&learn).expect("learn.toml 应能解析");
+        let write = def
+            .steps
+            .iter()
+            .find(|s| s.id == "write")
+            .expect("learn 应有 write 步");
+        assert!(
+            write.require_citations_observed,
+            "learn 的 write 步是行号引用错误的高发地（LAT-113），必须开"
+        );
+    }
+
     fn check_symbols_output_rejects_unresolvable_names() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
