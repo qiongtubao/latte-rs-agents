@@ -915,6 +915,18 @@ pub struct AgentRunner {
     /// `~/.latte/traces/<id>.jsonl` files. Empty string when the
     /// runner was built without an explicit id (test paths).
     session_id: String,
+    /// 本 runner 的专属子会话标识（若有）。workflow 引擎给每个 step
+    /// 分派分配的 `sub_id` 是全局唯一的（见 `SubsessionStore::create`），
+    /// 与父 `session_id` 不同——`session_id` 在 workflow specialist 路径
+    /// 上此前从未被设置（恒为空串），`edit_anchor::Scope` 因此把同一
+    /// session 内所有同角色的 workflow 分派（甚至跨 workflow 运行）都
+    /// 归到同一个观察作用域，互相污染彼此的"读过哪些行"记录。
+    ///
+    /// `anchor_scope_id()` 优先用这个字段；`None` 时退回 `session_id`
+    /// （delegate 工具路径的现状：subagent 复用父 session_id，只靠角色
+    /// 分——那条路径尚未接入独立 id，是有意保留的现状，不是本次改动
+    /// 范围）。
+    sub_id: Option<String>,
     /// Optional worktree root for the per-role inject queue. When
     /// set, `run_turn` (via `drain_inject_queue`) reads
     /// `<worktree>/.latte/inject/<role>.txt` at the start of every
@@ -1911,6 +1923,11 @@ async fn run_one_tool_call(
     cwd: Option<std::path::PathBuf>,
     current_session_file: Option<std::path::PathBuf>,
     meta: crate::trace::TraceMeta,
+    // `edit_anchor::Scope` 的有效标识：调用方传 `AgentRunner::anchor_scope_id()`
+    // （`sub_id` 优先，否则退回 `meta.session_id`）。故意不直接读
+    // `meta.session_id`——那个字段还要用于 trace 与
+    // `~/.latte/sessions/<id>.idx` 的关联，语义不能被 sub_id 顶替。
+    anchor_scope_id: &str,
     tc: ParsedCall,
 ) -> OneCallResult {
     use crate::trace::{ToolStatus, TraceEvent};
@@ -1963,7 +1980,7 @@ async fn run_one_tool_call(
         let input = {
             let mut healed = input;
             let notes = crate::edit_anchor::heal_edit_input(
-                &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                &crate::edit_anchor::Scope::new(anchor_scope_id, &meta.role),
                 &resolved_name,
                 &mut healed,
             );
@@ -2025,7 +2042,7 @@ async fn run_one_tool_call(
                 // tag，write 作废。给后续 edit 的行号自愈提供基准。
                 if let Ok(raw) = serde_json::to_string(&result) {
                     crate::edit_anchor::record_tool_result(
-                        &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                        &crate::edit_anchor::Scope::new(anchor_scope_id, &meta.role),
                         &resolved_name,
                         &raw,
                     );
@@ -2090,7 +2107,7 @@ async fn run_one_tool_call(
                 // 升级成「换策略」硬指令（oh-my-pi 的两级 no-op 守卫）。
                 if let Some(note) =
                     crate::edit_anchor::note_edit_failure(
-                        &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                        &crate::edit_anchor::Scope::new(anchor_scope_id, &meta.role),
                         &resolved_name,
                         &input,
                         &e,
@@ -2152,6 +2169,7 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: String::new(),
             session_id: String::new(),
+            sub_id: None,
             advisor_hints: None,
             cwd: None,
             tool_fix_event_tx: None,
@@ -2185,6 +2203,7 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: String::new(),
             session_id: String::new(),
+            sub_id: None,
             tool_fix_event_tx: None,
             advisor_hints: None,
             cwd: None,
@@ -2219,6 +2238,7 @@ impl AgentRunner {
             retry_policy: Arc::new(DefaultRetryPolicy),
             role_id: "default".to_string(),
             session_id: String::new(),
+            sub_id: None,
             advisor_hints: None,
             cwd: None,
             tool_fix_event_tx: None,
@@ -3746,13 +3766,14 @@ impl AgentRunner {
                         let cwd_c = self.cwd.clone();
                         let current_session_file_c = self.current_session_file.clone();
                         let meta_c = meta.clone();
+                        let anchor_scope_id_c = self.anchor_scope_id().to_string();
                         let tc_c = tc.clone();
                         set.spawn(async move {
                             (
                                 i,
                                 run_one_tool_call(
                                     tm_c, hooks_c, sink_c, rp_c, cwd_c,
-                                    current_session_file_c, meta_c, tc_c,
+                                    current_session_file_c, meta_c, &anchor_scope_id_c, tc_c,
                                 )
                                 .await,
                             )
@@ -3774,6 +3795,7 @@ impl AgentRunner {
                                 self.cwd.clone(),
                                 self.current_session_file.clone(),
                                 meta.clone(),
+                                self.anchor_scope_id(),
                                 tc.clone(),
                             )
                             .await,
@@ -3861,6 +3883,7 @@ impl AgentRunner {
                                 self.cwd.clone(),
                                 self.current_session_file.clone(),
                                 meta.clone(),
+                                self.anchor_scope_id(),
                                 post_parse_calls[i].clone(),
                             )
                             .await,
@@ -3949,6 +3972,7 @@ impl AgentRunner {
                                 let cwd_c = self.cwd.clone();
                                 let current_session_file_c = self.current_session_file.clone();
                                 let meta_c = meta.clone();
+                        let anchor_scope_id_c = self.anchor_scope_id().to_string();
                                 let tc_c = tc.clone();
                                 let sem_c = sem.clone();
                                 set.spawn(async move {
@@ -3959,7 +3983,7 @@ impl AgentRunner {
                                         idx,
                                         run_one_tool_call(
                                             tm_c, hooks_c, sink_c, rp_c, cwd_c,
-                                            current_session_file_c, meta_c, tc_c,
+                                            current_session_file_c, meta_c, &anchor_scope_id_c, tc_c,
                                         )
                                         .await,
                                     )
@@ -3988,6 +4012,7 @@ impl AgentRunner {
                                     self.cwd.clone(),
                                     self.current_session_file.clone(),
                                     meta.clone(),
+                                    self.anchor_scope_id(),
                                     post_parse_calls[i].clone(),
                                 )
                                 .await,
@@ -4120,7 +4145,7 @@ impl AgentRunner {
                             let mut healed = input;
                             let notes =
                                 crate::edit_anchor::heal_edit_input(
-                                    &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                                    &self.anchor_scope(&meta.session_id),
                                     &resolved_name,
                                     &mut healed,
                                 );
@@ -4207,7 +4232,7 @@ impl AgentRunner {
                                 // 记进 anchor 台账（见 crate::edit_anchor）。
                                 if let Ok(raw) = serde_json::to_string(&result) {
                                     crate::edit_anchor::record_tool_result(
-                                        &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                                        &self.anchor_scope(&meta.session_id),
                                         &resolved_name,
                                         &raw,
                                     );
@@ -4280,7 +4305,7 @@ impl AgentRunner {
                                 };
                                 // 见上一处同名逻辑（两套重复的工具重试循环）。
                                 if let Some(note) = crate::edit_anchor::note_edit_failure(
-                                    &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                                    &self.anchor_scope(&meta.session_id),
                                     &resolved_name,
                                     &input,
                                     &e,
@@ -4606,6 +4631,34 @@ impl AgentRunner {
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = session_id.into();
         self
+    }
+
+    /// 绑定本 runner 专属的子会话标识（workflow step 分派的
+    /// `sub_id`，全局唯一）。设置后 `anchor_scope()` 用它而不是
+    /// `session_id` 构造观察台账作用域，让并发的同角色 subagent
+    /// 各自持有独立的"读过哪些行"记录，互不污染。
+    pub fn with_sub_id(mut self, sub_id: impl Into<String>) -> Self {
+        self.sub_id = Some(sub_id.into());
+        self
+    }
+
+    /// `edit_anchor::Scope` 的有效标识：`sub_id` 优先，否则退回
+    /// `session_id`。传给自由函数 `run_one_tool_call`（它没有 `self`）。
+    fn anchor_scope_id(&self) -> &str {
+        self.sub_id.as_deref().unwrap_or(&self.session_id)
+    }
+
+    /// 本 runner 用于 `edit_anchor::Scope` 的有效标识：`sub_id` 优先，
+    /// 没有则退回 `meta.session_id`（即调用方传入的 `session_id`）。
+    ///
+    /// `meta_session_id` 参数取自调用点已有的 `TraceMeta.session_id`
+    /// （而不是直接读 `self.session_id`）是为了不改变现有的传参路径——
+    /// 两者在没有 `sub_id` 时理应相等。
+    fn anchor_scope(&self, meta_session_id: &str) -> crate::edit_anchor::Scope {
+        match &self.sub_id {
+            Some(id) => crate::edit_anchor::Scope::new(id.as_str(), &self.role_id),
+            None => crate::edit_anchor::Scope::new(meta_session_id, &self.role_id),
+        }
     }
 
     // ── Accessors ───────────────────────────────────────────────────────────
@@ -5002,6 +5055,94 @@ mod tests {
         assert_eq!(meta_b["current_session_file"], b.to_string_lossy().as_ref());
         assert_ne!(meta_a["current_session_file"], meta_b["current_session_file"]);
         assert!(tool_execution_metadata(None, None).is_none());
+    }
+
+    /// P0 回归：并发同角色 workflow subagent 不再共享观察台账作用域。
+    ///
+    /// 背景：`build_role_runner`（workflow.rs）此前从未调
+    /// `.with_session_id`，所有 workflow specialist 的 `AgentRunner`
+    /// 恒为空串 session_id——比"共享父 session"更差，是"完全无隔离，
+    /// 只按角色分，且跨 workflow 运行也互相污染"。修复给 `AgentRunner`
+    /// 加了 `sub_id`（workflow 引擎已有的 subsession 标识，全局唯一），
+    /// `anchor_scope`/`anchor_scope_id` 优先用它构造 `edit_anchor::Scope`。
+    ///
+    /// 本测试不跑真实 turn（不需要网络/模型），只验证这两个新方法本身
+    /// 的选择逻辑：有 `sub_id` 时用它、没有时退回 `session_id`（对齐
+    /// delegate 工具路径的现状行为，不做范围外改动）。
+    #[test]
+    fn concurrent_same_role_subagents_get_isolated_anchor_scopes() {
+        let agent_a = Agent::new_with_chain(
+            "programmer".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let agent_b = Agent::new_with_chain(
+            "programmer".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+
+        // 两个并发的 workflow step 分派：同一个父 session、同一个角色，
+        // 但 workflow 引擎给了各自独立的 sub_id（对齐 run_step_speaker
+        // 里 `store.create(sid, &speaker)` 的真实产出形态）。
+        let runner_a = AgentRunner::new(agent_a)
+            .with_role("programmer".to_string())
+            .with_session_id("parent-session".to_string())
+            .with_sub_id("programmer-1700000000001".to_string());
+        let runner_b = AgentRunner::new(agent_b)
+            .with_role("programmer".to_string())
+            .with_session_id("parent-session".to_string())
+            .with_sub_id("programmer-1700000000002".to_string());
+
+        // 核心断言：即使 role 和父 session_id 完全相同，有 sub_id 时
+        // 两者的有效作用域标识必须不同——否则就是本次要修的那个漏洞。
+        assert_ne!(
+            runner_a.anchor_scope_id(),
+            runner_b.anchor_scope_id(),
+            "并发同角色 subagent 必须各自持有独立的观察作用域"
+        );
+        assert_eq!(runner_a.anchor_scope_id(), "programmer-1700000000001");
+        assert_eq!(runner_b.anchor_scope_id(), "programmer-1700000000002");
+
+        // 退化场景：没有 sub_id（delegate 工具路径的现状）时退回
+        // session_id，行为与修复前一致，不做范围外改动。
+        let agent_c = Agent::new_with_chain(
+            "programmer".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let runner_c = AgentRunner::new(agent_c)
+            .with_role("programmer".to_string())
+            .with_session_id("parent-session".to_string());
+        assert_eq!(runner_c.anchor_scope_id(), "parent-session");
+
+        // anchor_scope() 同样受 sub_id 影响：构造出的 Scope 的台账 key
+        // 应该以 sub_id 而不是 session_id 为主键。用 record_tool_result +
+        // observed_lines 间接验证（Scope 内部字段是私有的）。
+        let scope_a = runner_a.anchor_scope("parent-session");
+        let scope_b = runner_b.anchor_scope("parent-session");
+        let path = "/tmp/p0-anchor-scope-isolation.rs";
+        crate::edit_anchor::record_tool_result(
+            &scope_a,
+            "read",
+            &serde_json::json!({"path": path, "content": "fn a() {}\n", "tag": "AAAA"})
+                .to_string(),
+        );
+        assert!(
+            crate::edit_anchor::observed_lines(&scope_a, path).is_some(),
+            "subagent A 应该能查到自己读过的行"
+        );
+        assert!(
+            crate::edit_anchor::observed_lines(&scope_b, path).is_none(),
+            "并发的 subagent B 不该继承 A 的观察记录——这正是本次修复要\
+             堵住的污染路径"
+        );
     }
 
     /// 悬挂工具标记只命中尾部窗口：glm 实锤形态（正文断在半句、

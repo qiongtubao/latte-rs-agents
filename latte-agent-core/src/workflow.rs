@@ -3012,6 +3012,13 @@ async fn build_role_runner(
     // plan 是否提交成功，见 `WorkflowStepDef::require_plan_submit`），
     // `None` 时自建私有句柄。
     plan_stage: Option<crate::controller::SharedPlanStage>,
+    // 本次 step 分派的 subsession 标识（`SubsessionStore::create` 生成，
+    // 全局唯一）。绑到 runner 的 `sub_id`，让 `edit_anchor::Scope` 按
+    // 分派而不是按角色隔离观察记录——此前这里恒为 `None`（从未
+    // `.with_session_id`），并发的同角色 step 会共享同一个几乎空白的
+    // 作用域，互相污染彼此"读过哪些行"的记录。`None` 时（独立测试、
+    // 没有 subsession store 的调用方）保持旧行为：靠角色分。
+    sub_id: Option<&str>,
 ) -> Result<(AgentRunner, String), String> {
     if role_id == "advisor" {
         return Err("advisor is monitor-only; use reviewer for workflow tasks".into());
@@ -3173,6 +3180,9 @@ async fn build_role_runner(
     let mut r = runner
         .with_role(role_id.to_string())
         .with_cwd(cwd.to_path_buf());
+    if let Some(id) = sub_id {
+        r = r.with_sub_id(id.to_string());
+    }
     if let Some(gate) = agent_pause_gate {
         r = r.with_agent_pause_gate(gate);
     }
@@ -3438,6 +3448,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     &inp.step_tools,
                     Some(inp.answer_log.clone()),
                     inp.plan_stage.clone(),
+                    sub_id.as_deref(),
                 )
                 .await
                 {
@@ -8160,6 +8171,7 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             &[],
+            None,
             None,
             None,
         )

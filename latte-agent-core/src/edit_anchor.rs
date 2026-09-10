@@ -74,14 +74,26 @@ const MAX_SNAPSHOT_FILE_BYTES: usize = 4 * 1024 * 1024;
 /// `breakdown` 步（architect）根本没读，但查台账查得到。对「行号自愈」来说
 /// 这只是偏宽松；对「引用的东西是否真的观察过」这类判据就是直接失效。
 ///
-/// # 为什么用 role 而不是 subagent id
+/// # 为什么用 role 而不是 subagent id（历史原因，workflow 路径已修复）
 ///
-/// 实测：`build_runner` 的所有调用点传的都是 `&config.session_id`，即
-/// **父会话 id**——subagent 并没有自己的 session_id（事件层的 `sub_id`
-/// 有，但没挂到 runner 上）。所以退一步用 role 作细分轴：它能把上面那个
-/// programmer/architect 的例子分开，也不会把「同一角色跨轮次继续干活」
-/// 误切开（那种情况本就该共享）。真正的按 subagent 隔离需要把 sub_id
-/// 一路传下来，是后续的事。
+/// 早期实测：`build_role_runner`（workflow 引擎）从未把 workflow 分派
+/// 分配到的 `sub_id`（`SubsessionStore::create` 产出，全局唯一）接到
+/// `AgentRunner` 上——不只是"退化成按父 session 分"，是**完全没设置
+/// session_id**（恒为空串），并发的同角色 workflow step 会共享同一个
+/// 几乎空白的作用域，甚至跨 workflow 运行也互相污染。
+///
+/// 已修复：`AgentRunner` 现在有 `sub_id` 字段（`with_sub_id`），
+/// `anchor_scope`/`anchor_scope_id` 构造 `Scope` 时优先用它；
+/// `build_role_runner` 接线到 workflow 引擎已有的 subsession 标识。
+/// 并发的同角色 workflow subagent 现在各自持有独立作用域。
+///
+/// 仍未跟进的路径：`delegate` 工具（`controller.rs::build_runner`）
+/// 派发的 subagent 目前**没有**独立 id 传下来，`AgentRunner.sub_id`
+/// 为 `None`，`anchor_scope`/`anchor_scope_id` 退回 `session_id`——
+/// 与旧行为一致，靠 role 作细分轴。这不是本次改动范围（delegate 的
+/// subsession 标识生成时机与 workflow 不同，接线需要单独评估），只是
+/// 现状记录：那条路径下，同一父 session 里两个并发的同角色 `delegate`
+/// 调用仍会共享观察作用域。
 ///
 /// 复合键用 `\0` 拼接，同 oh-my-pi 的 chain key
 /// （`baseUrl \0 model.id \0 sessionId`）。
