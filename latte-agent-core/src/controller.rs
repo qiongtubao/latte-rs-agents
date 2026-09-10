@@ -7517,7 +7517,15 @@ async fn register_delegate_tool(
             runner = runner
                 .with_role(role_id.clone())
                 .with_cwd(cwd.clone())
-                .with_sink(specialist_sink);
+                .with_sink(specialist_sink)
+                // P0 跟进：delegate 派发的 specialist 此前从未绑定
+                // sub_id（`SubsessionStore::create` 在几行前就已经生成
+                // 了，只是只用来发 DelegateStarted/取消登记，没接到
+                // runner 上）——与 workflow 路径此前的疏漏完全同构：
+                // AgentRunner::anchor_scope_id() 退回 session_id，同一
+                // 父 session 里两个并发的同角色 delegate 调用会共享
+                // 观察台账作用域。用已经存在的 sub_id 补上即可。
+                .with_sub_id(sub_id.clone());
             if let Some(gate) = advisor_gate.clone() {
                 runner = runner.with_gate_config(gate);
             }
