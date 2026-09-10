@@ -51,7 +51,7 @@ temperature = 0.3
 #   bash    — execute shell commands
 #   search  — regex search across files
 #   list    — list agents, workflows, config
-tools = ["read", "bash", "write"]
+tools = ["read", "bash", "edit", "write"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🚀"

@@ -60,7 +60,7 @@ temperature = 0.5
 #     真正的位置是 foo_macros.h:8）
 #   - k2 的 `MALLOCX_FAIL_NOWAIT` 全仓不存在
 # 学员照这种题去理解代码，学到的是假知识——比不学更糟。
-tools = ["read", "code_graph", "search", "write", "ask"]
+tools = ["read", "code_graph", "search", "edit", "write", "ask"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "🎓"

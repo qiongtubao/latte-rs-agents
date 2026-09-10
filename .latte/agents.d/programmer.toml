@@ -5,6 +5,6 @@ category = "execution"
 model_tier = "budget"
 prompt_file = "prompts/programmer.md"
 temperature = 0.3
-tools = ["read", "search", "write"]
+tools = ["read", "search", "edit", "write"]
 icon = "💻"
 model_chain = ["glm-5.2", "MiniMax-M3", "deepseek-v4-flash"]
