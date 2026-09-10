@@ -368,6 +368,16 @@ pub enum TraceEvent {
         total_input: u32,
         total_output: u32,
         total_thinking: u32,
+        /// 命中 prompt 缓存的输入 token（`total_input` 的**子集**）。
+        ///
+        /// 没有这一项时「配了 caching」与「caching 真生效」无从区分——实测
+        /// jemalloc 会话 22.19M 输入 token 全程零命中却毫无迹象。端点不回
+        /// 这项时为 0（= 未知，不代表没命中）。
+        #[serde(default)]
+        total_cache_read: u32,
+        /// 写入 prompt 缓存的 token（Anthropic 的 cache_creation）。
+        #[serde(default)]
+        total_cache_write: u32,
         elapsed_ms: u64,
     },
     SessionEnd {
@@ -1838,7 +1848,7 @@ mod tests {
             },
             TraceEvent::TurnEnd {
                 meta: meta.clone(),
-                total_input: 100, total_output: 200, total_thinking: 0, elapsed_ms: 5000,
+                total_input: 100, total_output: 200, total_thinking: 0, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 5000,
             },
             TraceEvent::SessionEnd {
                 meta,

@@ -516,6 +516,7 @@ impl ResolverSnapshot {
             omit_max_tokens: def.omit_max_tokens,
             max_tokens_field: def.max_tokens_field,
             prompt_cache: def.prompt_cache,
+            prompt_cache_key: def.prompt_cache_key,
             supports_thinking: def.supports_thinking,
             supports_vision: def.supports_vision,
             cost_per_million_input: def.cost_per_million_input.unwrap_or(0.0),
@@ -608,6 +609,7 @@ mod tests {
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: false,
@@ -895,6 +897,52 @@ mod tests {
         );
     }
 
+
+    /// `prompt_cache_key`（缓存亲和键开关）同样要从 TOML 透传。
+    ///
+    /// 它与 `prompt_cache` 的默认值**相反**：不写 = 跟随全局默认（开），
+    /// 因为它是 OpenAI 官方文档化的顶层参数，兼容风险远低于把 Anthropic
+    /// 的 `cache_control` 塞进 OpenAI body。
+    #[test]
+    fn prompt_cache_key_flows_from_toml_to_model() {
+        let base = r#"
+name = "m"
+api = "openai"
+provider = "p"
+base_url = "http://x"
+api_key = "k"
+context_window = 1000
+max_tokens = 100
+supports_thinking = false
+"#;
+        // 不写 → None（= 跟随全局默认）
+        let def: crate::config::ModelDef = toml::from_str(base).expect("deserialize");
+        assert_eq!(def.prompt_cache_key, None, "缺省必须是「未声明」");
+
+        // 显式关 → 透传 Some(false)
+        let def_off: crate::config::ModelDef =
+            toml::from_str(&format!("{base}prompt_cache_key = false
+")).expect("deserialize");
+        assert_eq!(def_off.prompt_cache_key, Some(false));
+
+        let cfg = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: crate::config::ModelCatalog {
+                models: vec![def_off],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+        let model = resolver.resolve_id_or_name("m").expect("按 id 解析");
+        assert_eq!(
+            model.prompt_cache_key,
+            Some(false),
+            "模型级关闭必须一路传到 latte_ai::Model，否则配了也没用"
+        );
+    }
 
     /// prompt_cache 必须从 TOML 一路透传到 `latte_ai::Model`。
     ///

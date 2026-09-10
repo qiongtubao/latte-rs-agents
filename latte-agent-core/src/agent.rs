@@ -1194,19 +1194,14 @@ fn model_failures_summary(e: &AgentError) -> String {
 /// 失败列表里是否包含「上下文超出模型窗口」类错误。这类失败靠原样
 /// 重试无法恢复（payload 不变），需要裁剪待发消息或换更大上下文的模型。
 fn failures_include_context_overflow(e: &AgentError) -> bool {
-    const PATTERNS: &[&str] = &[
-        "context window",
-        "context length",
-        "maximum context",
-        "prompt is too long",
-        "too many tokens",
-        "request too large",
-    ];
     match e {
-        AgentError::ModelsUnavailable { failures, .. } => failures.iter().any(|(_, err)| {
-            let low = err.to_lowercase();
-            PATTERNS.iter().any(|p| low.contains(p))
-        }),
+        // 判据统一到 `compaction::is_context_overflow_error`（移植
+        // deepseek-harness 的 `isContextWindowExceededError`）。此前这里有
+        // 一张自己的 6 条模式表，漏掉了 `context_length_exceeded` 这类**错误
+        // 码**形态和中文措辞；两处各判一套迟早会分叉。
+        AgentError::ModelsUnavailable { failures, .. } => failures
+            .iter()
+            .any(|(_, err)| crate::compaction::is_context_overflow_error(err)),
         _ => false,
     }
 }
@@ -1967,7 +1962,11 @@ async fn run_one_tool_call(
         // 重定位，定位不了就拒绝——绝不静默改错位置。见 `crate::edit_anchor`。
         let input = {
             let mut healed = input;
-            let notes = crate::edit_anchor::heal_edit_input(&resolved_name, &mut healed);
+            let notes = crate::edit_anchor::heal_edit_input(
+                &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                &resolved_name,
+                &mut healed,
+            );
             for note in notes {
                 log_hook_fire(&note, crate::trace::HookPoint::PreTool, "anchor");
             }
@@ -2025,7 +2024,11 @@ async fn run_one_tool_call(
                 // 记进 anchor 台账：read 存「模型看到的内容 + tag」，edit 只刷新
                 // tag，write 作废。给后续 edit 的行号自愈提供基准。
                 if let Ok(raw) = serde_json::to_string(&result) {
-                    crate::edit_anchor::record_tool_result(&resolved_name, &raw);
+                    crate::edit_anchor::record_tool_result(
+                        &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                        &resolved_name,
+                        &raw,
+                    );
                 }
                 // 5. PostToolHook
                 let mut result_str = serde_json::to_string_pretty(&result)
@@ -2077,12 +2080,24 @@ async fn run_one_tool_call(
             }
             Err(e) => {
                 let kind = classify_tool_execution_error(&e);
-                let detail = match &kind {
+                let mut detail = match &kind {
                     ToolCallErrorKind::ToolNotFound { .. } => {
                         tool_not_found_detail(&tc.name, e.to_string())
                     }
                     _ => e.to_string(),
                 };
+                // 锚点类 edit 失败按文件累计计数：单次给软提示，连续到阈值
+                // 升级成「换策略」硬指令（oh-my-pi 的两级 no-op 守卫）。
+                if let Some(note) =
+                    crate::edit_anchor::note_edit_failure(
+                        &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                        &resolved_name,
+                        &input,
+                        &e,
+                    )
+                {
+                    detail.push_str(&note);
+                }
                 sink.emit(TraceEvent::ToolExec {
                     meta: meta.refreshed(),
                     name: tc.name.clone(),
@@ -2781,6 +2796,20 @@ impl AgentRunner {
     ///
     /// 返回是否真的压缩了。
     async fn maybe_auto_compact(&mut self, meta: &crate::trace::TraceMeta) -> bool {
+        self.compact_with_trigger(meta, crate::compaction::CompactionTrigger::Pressure)
+            .await
+    }
+
+    /// 压缩历史。`trigger` 决定是否还要过阈值判断。
+    ///
+    /// - `Pressure`：轮次入口的常规检查，占用没到阈值就直接返回；
+    /// - `ContextOverflow`：供应商已经拒了这次请求，**跳过阈值**，因为
+    ///   声明的 `context_window` 可能本身就是错的（那正是要兜的情况）。
+    async fn compact_with_trigger(
+        &mut self,
+        meta: &crate::trace::TraceMeta,
+        trigger: crate::compaction::CompactionTrigger,
+    ) -> bool {
         // 策略解析：env > `[compaction]` 配置段 > 内置默认。
         //
         // 配置段从 **resolver 快照**取（不是构建时固化的 AgentConfig）——
@@ -2803,7 +2832,12 @@ impl AgentRunner {
             .map(|mc| mc.model.context_window)
             .unwrap_or(0);
         let est = self.context.token_count() as u32;
-        if !policy.should_compact(est, window) {
+        // 被动触发跳过阈值：请求已经被供应商拒了，占用比例算出来是多少都
+        // 不重要——而且「声明的窗口比真实窗口大」正是要兜的场景，这时阈值
+        // 判断恒为假。
+        if trigger == crate::compaction::CompactionTrigger::Pressure
+            && !policy.should_compact(est, window)
+        {
             return false;
         }
 
@@ -2865,6 +2899,11 @@ impl AgentRunner {
                 est_tokens_after: after,
             });
 
+            if trigger == crate::compaction::CompactionTrigger::ContextOverflow {
+                // 被动触发只压一遍就交回去重试：真实窗口未知，多压也无从
+                // 判断够不够，让重试的结果说话。
+                break;
+            }
             if !policy.should_compact(after, window) {
                 break; // 已降到阈值下
             }
@@ -3090,6 +3129,10 @@ impl AgentRunner {
         let mut total_input: u32 = 0;
         let mut total_output: u32 = 0;
         let mut total_thinking: u32 = 0;
+        // 缓存命中/写入的本轮累计。只解析不上报等于观测不到——实测
+        // jemalloc 会话零命中却毫无迹象，就是因为这个数字从没露过面。
+        let mut total_cache_read: u32 = 0;
+        let mut total_cache_write: u32 = 0;
         // 悬挂工具标记的卫生重试计数（每 turn 至多 1 次）。
         let mut markup_retried: u8 = 0;
         // 正文撞长度上限后的**续写**次数。旧实现是「重试一次让模型
@@ -3193,16 +3236,31 @@ impl AgentRunner {
             // native function-calling：tool schema 经 GenerateParams.tools 下发。
             // 文本 `<tool_call>` 协议已移除，不再有降级路径。
             // tool_choice 取自 agent.params（默认 Auto，可经 with_tool_choice 覆盖）。
-            let chat_params: Option<GenerateParams> = self.tool_manager.as_ref().map(|tm| {
+            // 无论有没有工具都要走这一趟：`prompt_cache_key` 与工具无关，
+            // 早先这里是 `tool_manager.as_ref().map(...)`，没有工具的角色
+            // （reviewer / advisor 等纯读角色）会拿到 `None`，缓存亲和键
+            // 就下发不出去。
+            let chat_params: Option<GenerateParams> = {
                 let mut p = self.agent.params.clone();
-                p.tools = build_tool_schemas(tm);
-                // 显式声明「允许一条响应里发多个工具调用」。调用方已经
-                // 明确设过就尊重它，不覆盖。
-                if p.parallel_tool_calls.is_none() {
-                    p.parallel_tool_calls = parallel_tool_calls_pref();
+                if let Some(tm) = self.tool_manager.as_ref() {
+                    p.tools = build_tool_schemas(tm);
+                    // 显式声明「允许一条响应里发多个工具调用」。调用方已经
+                    // 明确设过就尊重它，不覆盖。
+                    if p.parallel_tool_calls.is_none() {
+                        p.parallel_tool_calls = parallel_tool_calls_pref();
+                    }
                 }
-                p
-            });
+                // 缓存亲和键 = session id。
+                //
+                // 供应商靠它把同一会话的请求路由到持有那份 KV cache 的机器
+                // 上；光有字节稳定的前缀不够，网关的负载均衡会把请求打散。
+                // 必须是**整个会话内稳定**的值，所以用 session_id 而不是
+                // turn/请求级的东西。调用方显式设过就不覆盖。
+                if p.prompt_cache_key.is_none() && !self.session_id.is_empty() {
+                    p.prompt_cache_key = Some(self.session_id.clone());
+                }
+                Some(p)
+            };
             let completion = if self.is_stream_mode() {
                 // Stream 模式：逐 Delta 消费，发 ModelDelta trace 让 UI 逐 token 渲染。
                 // Done 携带完整 tool_calls + usage，组装成 Completion 后下游工具循环零改动。
@@ -3241,9 +3299,27 @@ impl AgentRunner {
                                 // 重试前先热更新 chain。
                                 self.maybe_reload_models();
                                 if overflow {
-                                    // 上下文超窗：同一 payload 重试必败，
-                                    // 先瘦身本轮待发消息（只影响待发列表，
-                                    // 不动持久 context）。
+                                    // 上下文超窗：同一 payload 重试必败。
+                                    // 两级处理——
+                                    // (1) 真压缩：把旧历史摘要成 checkpoint，
+                                    //     真正减少消息条数。这是**被动触发**
+                                    //     （deepseek-harness 的
+                                    //     `context-overflow`），不看声明的
+                                    //     `context_window`——声明值写大了正是
+                                    //     要兜的场景（实测 jemalloc 三个模型
+                                    //     都写 1000000，主动阈值永不触发）。
+                                    if self
+                                        .compact_with_trigger(
+                                            &meta,
+                                            crate::compaction::CompactionTrigger::ContextOverflow,
+                                        )
+                                        .await
+                                    {
+                                        messages = self.context.messages().to_vec();
+                                    }
+                                    // (2) 兜底瘦身：压缩压不动（历史太短、
+                                    //     或摘要调用也失败）时，至少把超大
+                                    //     单条消息裁短。只影响待发列表。
                                     slim_oversized_messages(&mut messages);
                                 }
                             }
@@ -3378,9 +3454,16 @@ impl AgentRunner {
                             // 重试前先热更新 chain。
                             self.maybe_reload_models();
                             if overflow {
-                                // 上下文超窗：同一 payload 重试必败，
-                                // 先瘦身本轮待发消息（只影响待发列表，
-                                // 不动持久 context）。
+                                // 见流式分支同名逻辑：先真压缩、再兜底瘦身。
+                                if self
+                                    .compact_with_trigger(
+                                        &meta,
+                                        crate::compaction::CompactionTrigger::ContextOverflow,
+                                    )
+                                    .await
+                                {
+                                    messages = self.context.messages().to_vec();
+                                }
                                 slim_oversized_messages(&mut messages);
                             }
                         }
@@ -3396,6 +3479,8 @@ impl AgentRunner {
             total_input += completion.usage.input_tokens;
             total_output += completion.usage.output_tokens;
             total_thinking += completion.usage.thinking_tokens;
+            total_cache_read += completion.usage.cache_read_tokens;
+            total_cache_write += completion.usage.cache_write_tokens;
 
             // 续写模式下（continuation_prefix 非空），本轮 completion 只是
             // 「接着写的下一段」——真正的产出是前缀 + 本段拼起来。下游
@@ -4034,7 +4119,11 @@ impl AgentRunner {
                         let input = {
                             let mut healed = input;
                             let notes =
-                                crate::edit_anchor::heal_edit_input(&resolved_name, &mut healed);
+                                crate::edit_anchor::heal_edit_input(
+                                    &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                                    &resolved_name,
+                                    &mut healed,
+                                );
                             for note in notes {
                                 log_hook_fire(
                                     &note,
@@ -4117,7 +4206,11 @@ impl AgentRunner {
                                 self.last_turn_tool_count += 1;
                                 // 记进 anchor 台账（见 crate::edit_anchor）。
                                 if let Ok(raw) = serde_json::to_string(&result) {
-                                    crate::edit_anchor::record_tool_result(&resolved_name, &raw);
+                                    crate::edit_anchor::record_tool_result(
+                                        &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                                        &resolved_name,
+                                        &raw,
+                                    );
                                 }
                                 // 5. PostToolHook
                                 let mut result_str = serde_json::to_string_pretty(&result)
@@ -4179,12 +4272,21 @@ impl AgentRunner {
                             }
                             Err(e) => {
                                 let kind = classify_tool_execution_error(&e);
-                                let detail = match &kind {
+                                let mut detail = match &kind {
                                     ToolCallErrorKind::ToolNotFound { .. } => {
                                         tool_not_found_detail(&tc.name, e.to_string())
                                     }
                                     _ => e.to_string(),
                                 };
+                                // 见上一处同名逻辑（两套重复的工具重试循环）。
+                                if let Some(note) = crate::edit_anchor::note_edit_failure(
+                                    &crate::edit_anchor::Scope::new(&meta.session_id, &meta.role),
+                                    &resolved_name,
+                                    &input,
+                                    &e,
+                                ) {
+                                    detail.push_str(&note);
+                                }
                                 self.sink.emit(TraceEvent::ToolExec {
                                     meta: meta.refreshed(),
                                     name: tc.name.clone(),
@@ -4334,6 +4436,8 @@ impl AgentRunner {
             total_input,
             total_output,
             total_thinking,
+            total_cache_read,
+            total_cache_write,
             elapsed_ms,
         });
 
@@ -4993,6 +5097,29 @@ mod tests {
             );
             assert!(!policy.retryable(&kind), "{message}");
         }
+        // edit 的锚点类失败：确定性输入错误，同参数重试必然拿到同一份
+        // 拒绝。实测 2026-09-10 jemalloc 会话 ui-…-6：这些文案一个都没
+        // 命中 PERMANENT 黑名单 → 归成 Execution → 每次失败都白跑第二
+        // 遍，日志里一个 ToolUse 对着两条完全相同的 ToolError。edit 侧
+        // 已改发 `Validation`，这里锁住「Validation ⇒ 不重试」。
+        for message in [
+            r#"op[0]: old_text not found: "| `bit_util.h:343、352`"（old_text 在文件中找不到匹配）"#,
+            "op[2]: old_text 在文件中出现 3 次（歧义），拒绝猜测：请扩大上下文使其唯一",
+            "expect 内容 在文件中有 2 处候选匹配（歧义），拒绝猜测",
+            "stale tag：编辑基于快照 #A1B2，但文件当前快照是 #C3D4",
+        ] {
+            let kind = classify_tool_execution_error(&ToolError::validation(message, Vec::new()));
+            assert!(
+                matches!(kind, ToolCallErrorKind::PermanentExec { .. }),
+                "{message}"
+            );
+            assert!(!policy.retryable(&kind), "{message}");
+        }
+        // 真 IO 失败仍是瞬时错误：磁盘/权限抖动重试一次是有意义的。
+        let kind = classify_tool_execution_error(&ToolError::other("failed to write: broken pipe"));
+        assert!(matches!(kind, ToolCallErrorKind::Execution { .. }));
+        assert!(policy.retryable(&kind));
+
         // 普通执行错误（网络/5xx 类）→ Execution，重试一次
         let kind = classify_tool_execution_error(&ToolError::other("connection reset by peer"));
         assert!(matches!(kind, ToolCallErrorKind::Execution { .. }));
@@ -5028,6 +5155,7 @@ mod tests {
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,
@@ -5866,6 +5994,7 @@ mod tests {
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,
@@ -5988,6 +6117,7 @@ mod tests {
                         omit_max_tokens: false,
                         max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                         supports_thinking: false,
                         supports_vision: false,
                         supports_image_generation: false,
@@ -6048,6 +6178,7 @@ mod tests {
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -10047,6 +10178,7 @@ tools = ["read", "write"]
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 cost_per_million_input: 0.0,
