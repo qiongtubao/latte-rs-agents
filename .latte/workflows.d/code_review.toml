@@ -30,6 +30,10 @@ role = "reviewer"
 depends_on = ["explain"]
 tools = ["read", "search", "code_graph"]
 output_key = "feedback_quality"
+# 行号引用校验：本步无 write 工具，"每条附证据（file:line）"直接落在响应
+# 文本里，且是 respond/verdict 两步的直接输入——审查证据行号错了，终审会
+# 建立在错误证据上。细节见 WorkflowStepDef::require_citations_observed。
+require_citations_observed = true
 task = """审查这次变更：
 {{changes}}
 
@@ -43,6 +47,7 @@ role = "tester"
 depends_on = ["explain"]
 tools = ["read", "search", "code_graph"]
 output_key = "feedback_test"
+require_citations_observed = true
 task = """审查这次变更：
 {{changes}}
 

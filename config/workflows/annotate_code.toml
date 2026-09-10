@@ -20,6 +20,10 @@ description = "定位目标流程涉及的代码"
 role = "architect"
 output_key = "targets"
 max_retries = 1
+# 行号引用校验：本步无 write 工具，"每条带 file:line 锚点"直接落在响应
+# 文本里，且是 annotate 步的直接输入——定位行号错了，programmer 会照错的
+# 位置加注释。细节见 WorkflowStepDef::require_citations_observed。
+require_citations_observed = true
 task = "围绕「{{topic}}」定位需要加注释的代码：先用工具读代码取证（禁止凭记忆）。产出：1) 涉及的函数/文件清单（每条带 file:line 锚点）；2) 每个点的执行逻辑一句话说明；3) 关键术语表（术语 → 准确解释，基于真实代码）。"
 
 [steps.output_contract]

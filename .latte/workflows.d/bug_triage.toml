@@ -18,6 +18,10 @@ id = "diagnose"
 description = "根因诊断（读代码取证）"
 speakers = ["programmer"]
 output_key = "diagnosis"
+# 行号引用校验：本步无 write 工具，"最可能的根因（附代码证据 file:line）"
+# 直接落在响应文本里，且是 fix_plan/verdict 两步的直接输入——根因行号错了
+# 会带着错误证据一路传下去。细节见 WorkflowStepDef::require_citations_observed。
+require_citations_observed = true
 prompt = "根因诊断。bug 现象与复现：\n{{repro}}\n要求：必须用工具读相关代码取证，禁止凭空猜测。输出：1) 最可能的根因（附代码证据 file:line）；2) 备选根因（如无法排除，说明还缺什么证据）；3) 影响面（受影响的模块/调用方）。"
 
 [[steps]]

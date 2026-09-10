@@ -11,6 +11,10 @@ id = "analyze"
 description = "读代码取证"
 speakers = ["programmer"]
 output_key = "facts"
+# 行号引用校验：本步无 write 工具，"每条附 file:line 证据"直接落在响应
+# 文本里，且是 write 步的直接输入——事实清单行号错了会连带写进最终文档。
+# 细节见 WorkflowStepDef::require_citations_observed。
+require_citations_observed = true
 prompt = "分析主题：{{topic}}。必须用工具读相关代码/文件取证，禁止凭记忆。输出：1) 现状事实清单（每条附 file:line 证据）；2) 与文档相关的接口/行为/配置要点；3) 你不确定、需要读者注意的点。"
 
 [[steps]]
@@ -18,6 +22,9 @@ id = "write"
 description = "撰写文档"
 speakers = ["tech_writer"]
 output_key = "doc"
+# 同上：task 明确要求"输出完整 markdown 文档正文"，全文（含引用）落在
+# 响应文本里，与 learn.toml 的 write 步同一模式。
+require_citations_observed = true
 prompt = "基于事实材料撰写文档：\n{{facts}}\n主题：{{topic}}。要求：1) 只写材料里有证据的内容，不确定的明确标注；2) 结构：概述 → 细节 → 示例（示例取自真实代码）；3) 输出完整 markdown 文档正文。"
 
 [[steps]]
