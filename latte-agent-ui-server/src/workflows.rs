@@ -292,6 +292,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 require_plan_tasks: false,
                 // 符号可解析性校验同样只在 TOML 权威版可配（false = 现状行为）。
                 require_symbols_resolvable: false,
+                // 新门禁：UI 侧的表单构造用默认关（与 serde default 一致）——
+                // 它只在调研型 workflow 的 TOML 里显式开。
+                require_citations_observed: false,
                 patch_from: None,
                 submit_plan_from: None,
                 // step 级工具过滤仅 TOML 权威版可配；表单编辑器不支持，

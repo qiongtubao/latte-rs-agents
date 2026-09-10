@@ -1193,6 +1193,7 @@ fn spawn_lifecycle_hook(b: &UiBackend, id: &str, wf_name: &str, topic: String) {
             session_id: Some(session_id.clone()),
             advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
                 enabled: b.merged.read().advisor.enabled(),
+                review_settings: b.merged.read().advisor.review_settings(),
                 ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
             }
             .runner_gate(),
@@ -1486,6 +1487,7 @@ pub async fn dispatch_task(
                 session_id: Some(session_id.clone()),
                 advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
                     enabled: b2.merged.read().advisor.enabled(),
+                    review_settings: b2.merged.read().advisor.review_settings(),
                     ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
                 }
                 .runner_gate(),
@@ -1684,6 +1686,7 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             session_id: Some(session_id.clone()),
             advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
                 enabled: b2.merged.read().advisor.enabled(),
+                review_settings: b2.merged.read().advisor.review_settings(),
                 ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
             }
             .runner_gate(),
@@ -1878,6 +1881,7 @@ async fn chain_code_review(
         session_id: Some(session_id),
         advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
             enabled: b.merged.read().advisor.enabled(),
+            review_settings: b.merged.read().advisor.review_settings(),
             ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
         }
         .runner_gate(),

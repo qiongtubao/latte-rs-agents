@@ -585,6 +585,7 @@ impl SessionHandle {
         // 「advisor 总是卡/空喊」却无路可关）。
         let advisor_monitor_cfg = AdvisorMonitorConfig {
             enabled: agent_config_snapshot.advisor.enabled(),
+            review_settings: agent_config_snapshot.advisor.review_settings(),
             ..AdvisorMonitorConfig::default()
         };
         let cfg = ControllerConfig {
