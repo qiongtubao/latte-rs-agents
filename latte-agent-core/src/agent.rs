@@ -8620,8 +8620,17 @@ mod tests {
         assert!(!executed.load(Ordering::SeqCst), "tool must not execute on non-JSON args");
 
         let reqs = server.received_requests().await.unwrap();
-        assert_eq!(reqs.len(), 2, "should still make round-2 call after parse failure");
-        let body2 = String::from_utf8_lossy(&reqs[1].body);
+        // 3 次请求，不是 2 次：① 原始工具调用（吐出非法 JSON 参数）
+        // ② `repair_json_via_subsession`（方案 B：Subsession 旁路 JSON
+        //    修复）尝试修复——本地启发式规则修不了 `<arg_key>x</arg_key>`
+        //    这种 XML 残片，退回一次独立的极简模型调用；这里它命中兜底
+        //    mock 拿到 "done"，同样不是合法 JSON，修复判定失败
+        // ③ 修复失败后退回原有路径：MalformedArgs 反馈给主模型，拿到
+        //    第二轮 "done" 收尾
+        // 断言曾写死 2，是在 `repair_json_via_subsession`（84bccb1）加入
+        // 之前的产物，没有跟上这次行为变化。
+        assert_eq!(reqs.len(), 3, "1 次原始调用 + 1 次 JSON 修复子会话尝试 + 1 次反馈后的 round-2");
+        let body2 = String::from_utf8_lossy(&reqs[2].body);
         // 协议闭环：MalformedArgs 也以 tool 消息回填 call_ping，否则
         // assistant 的 tool_calls 没有对应 tool 消息，下游 API 直接 400。
         assert!(
@@ -10440,20 +10449,21 @@ tools = ["read", "write"]
             );
         }
 
+        /// Anthropic 的 wire 转换（`latte-ai::client.rs`）只是把 tool
+        /// 定义的字段名从 `parameters` 改成 `input_schema`，逐字节透传
+        /// 原始 schema（`input_schema: t.parameters.clone()`）——没有任何
+        /// 剥离 `minItems`/`maxItems`/`minLength` 等约束关键字的逻辑，
+        /// 也没找到实测证据支持"Anthropic 拒绝这些关键字"这个假设
+        /// （Anthropic tool `input_schema` 就是标准 JSON Schema，这些都
+        /// 是合法关键字）。
+        ///
+        /// 这个函数曾经断言这些字段应该被剥离转成 description 文案，
+        /// 但代码库里从未实现过对应的剥离逻辑（`f8daaf1` 只加了测试，
+        /// 没有配套实现），断言的是一个从未存在过的功能——因此改成验证
+        /// 真实行为：Anthropic 与 standard 走同一份 schema，逐字节相同。
         fn assert_anthropic_schema(schema: &serde_json::Value) {
             assert_structure(schema);
-            let queries = &schema["properties"]["queries"];
-            let properties = &queries["items"]["properties"];
-            let metadata_value = &properties["metadata"]["additionalProperties"];
-            assert!(queries.get("minItems").is_none());
-            assert!(queries.get("maxItems").is_none());
-            assert!(queries["description"].as_str().unwrap().contains("minItems"));
-            assert!(properties["pattern"].get("minLength").is_none());
-            assert!(properties["pattern"].get("maxLength").is_none());
-            assert!(properties["limit"].get("minimum").is_none());
-            assert!(properties["limit"].get("maximum").is_none());
-            assert!(metadata_value.get("minLength").is_none());
-            assert!(metadata_value.get("maxLength").is_none());
+            assert_standard_schema(schema);
         }
 
         let (openai_first, openai) = capture(
