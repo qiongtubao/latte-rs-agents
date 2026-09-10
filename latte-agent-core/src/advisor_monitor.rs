@@ -1748,6 +1748,7 @@ impl MonitorState {
                 role_id,
                 content,
                 sub_id,
+                is_complete,
                 ..
             } => {
                 if role_id == "advisor" {
@@ -1756,7 +1757,23 @@ impl MonitorState {
                 } else if sub_id.is_some() {
                     // Specialist subsession turn: context only, no
                     // detectors (its tool events aren't broadcast).
-                } else if role_id == &self.watched_role {
+                } else if role_id == &self.watched_role && *is_complete {
+                    // **必须先判 `is_complete`**：`ChatEventTraceSink` 把每一个
+                    // `ModelDelta`（逐 token 流式片段）都转成一条
+                    // `RoleTurn{is_complete:false}`。这个分支此前没读
+                    // `is_complete`（被 `..` 吸收），于是 D1/D9/D10 对**每一个
+                    // token 片段**都当「本轮结束」跑一遍——`content` 传的是
+                    // 那一个片段的几个字符，不是完整响应。
+                    //
+                    // 实测实锤：manager 一次响应流了 480 个 `ModelDelta`，
+                    // `ParseToolCalls`（真正携带 `workflow` 调用）要等**最后**
+                    // 才发；而 D9 在那之前的每个片段上都判「tool_use_count==0」
+                    // 成立（工具确实还没解析出来），连续报了 47 次「零工具」
+                    // intervene，一次次把纠正提示注入 manager，而 manager
+                    // 其实**已经**在生成那个 workflow 调用——纠正的是一件
+                    // 根本没发生的事。且每次 intervene 都会让下一轮重新生成
+                    // 回复，实质是烧掉几十次模型调用制造出的假死循环。
+                    //
                     // D1 runs at turn end, before the per-turn reset.
                     if let Some(f) = self.detectors.finish_turn(content) {
                         findings.push(f);
@@ -2366,6 +2383,17 @@ mod tests {
         }
     }
 
+    /// 流式片段（`is_complete: false`）——`ChatEventTraceSink` 把每个
+    /// `ModelDelta` 都转成一条这样的事件。
+    fn role_turn_delta(content: &str) -> ChatEvent {
+        ChatEvent::RoleTurn {
+            role_id: "manager".into(),
+            content: content.into(),
+            is_complete: false,
+            sub_id: None,
+        }
+    }
+
     fn state() -> MonitorState {
         MonitorState::new("manager".into())
     }
@@ -2627,6 +2655,45 @@ mod tests {
         });
         s.observe(&tool_use("search", "{\"q\":\"arch\"}"));
         assert!(s.observe(&role_turn("查完了，结论如下：……")).findings.is_empty());
+    }
+
+    /// 回归：流式片段（`is_complete: false`）不能触发 D1/D9/D10。
+    ///
+    /// 实测实锤（2026-09-10 jemalloc 会话）：manager 一次响应流了 480 个
+    /// `ModelDelta`，`ParseToolCalls`（真正携带 `workflow` 调用）要等**最后**
+    /// 才发。修复前这个分支没读 `is_complete`（被 `..` 吸收），于是对
+    /// **每一个流式片段**都当「本轮结束、零工具」跑一遍 D9——因为工具解析
+    /// 确实还没发生，判据字面成立，但那不是「这一轮真的结束了」。连续报了
+    /// 47 次「零工具」intervene，manager 其实**已经**在生成那个 workflow
+    /// 调用，纠正的是一件根本没发生的事，且每次纠正都触发重新生成，制造出
+    /// 一个自我维持的假死循环——一次响应硬生生烧成几十次模型往返。
+    #[test]
+    fn streaming_deltas_do_not_trigger_end_of_turn_detectors() {
+        let mut s = state();
+        s.observe(&ChatEvent::UserMessage {
+            text: "帮我分析一下这个项目的架构并给出三个可落地的重构建议".into(),
+        });
+        // 模拟一次响应被拆成很多个流式片段——此时工具调用尚未解析出来，
+        // tool_use_count 仍是 0。修复前的判据在这里字面成立（零工具），
+        // 但这不是轮次结束。
+        for chunk in ["我", "先", "看", "一下", "项目", "结构", "。"] {
+            let out = s.observe(&role_turn_delta(chunk));
+            assert!(
+                out.findings.is_empty(),
+                "流式片段 {chunk:?} 不该产生任何 finding（D9 等只应在 is_complete=true 时跑）"
+            );
+            assert!(!out.turn_ended, "流式片段不该被当成轮次结束");
+        }
+        // 紧接着才是真正的工具调用 + 轮次收尾——这才该被检查（且因为有
+        // 工具调用，D9 不应命中）。
+        s.observe(&tool_use("workflow", "{\"name\":\"learn\"}"));
+        let out = s.observe(&role_turn("已发起 learn workflow。"));
+        assert!(out.turn_ended);
+        assert!(
+            out.findings.iter().all(|f| f.kind != DetectorKind::NoToolTurn),
+            "真正调用了工具，D9 不该报: {:?}",
+            out.findings
+        );
     }
 
     // ── D7: workflow failed ────────────────────────────────────────
@@ -3403,6 +3470,7 @@ mod tests {
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
             prompt_cache: false,
+            prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
