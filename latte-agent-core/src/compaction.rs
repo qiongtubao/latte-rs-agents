@@ -73,6 +73,76 @@ fn env_u32_opt(key: &str) -> Option<u32> {
     std::env::var(key).ok()?.trim().parse::<u32>().ok()
 }
 
+/// 压缩的触发来源。
+///
+/// 抄 deepseek-harness 的 `CompactionTrigger = 'pressure' | 'context-overflow'`
+/// （`packages/compaction/compaction/src/index.ts:25`）。
+///
+/// 为什么必须有第二种：`Pressure` 的判据是 `est_tokens / context_window`，
+/// 而 `context_window` 是**配置里声明的值**。声明写大了（实测 jemalloc 的
+/// 三个模型全写 `context_window = 1000000`，阈值 0.8 → 800K）主动压缩就
+/// 永不触发——那 7 个会话里 `ContextCompacted` 一次都没出现。被动触发不看
+/// 声明值，只看供应商**真的拒了**，是不依赖配置正确性的兜底。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionTrigger {
+    /// 轮次入口的阈值检查（占用比例达到 `threshold_ratio`）。
+    Pressure,
+    /// 供应商已经报了「超出上下文窗口」，压缩后重试。
+    ///
+    /// 这条**跳过阈值判断**：既然请求已经被拒，占用比例算出来是多少都不
+    /// 重要了。
+    ContextOverflow,
+}
+
+/// 识别供应商的「超出上下文窗口」报错。
+///
+/// 移植 deepseek-harness 的 `isContextWindowExceededError`
+/// （`packages/llm/llm/src/error.ts:80`）。各家 OpenAI 兼容端点措辞都不
+/// 一样，靠一组模式覆盖，而不是指望统一的错误码。
+///
+/// 判据故意收紧：只认同时出现「超限动作」和「上下文/长度」两类词的组合。
+/// 宁可漏判（退回原错误、行为与从前一致），也不要把普通 400 误判成溢出
+/// ——误判会白烧一次摘要调用，还把好历史压掉。
+pub fn is_context_overflow_error(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    // 「超出/过长」类动作词
+    let exceeded = [
+        "exceed",
+        "exceeds",
+        "exceeded",
+        "overflow",
+        "too long",
+        "too large",
+        "larger than",
+        "maximum context",
+        "max context",
+        "context_length_exceeded",
+        "超出",
+        "超过",
+        "过长",
+    ]
+    .iter()
+    .any(|k| d.contains(k));
+    // 「上下文/长度」类名词
+    let context_noun = [
+        "context length",
+        "context window",
+        "context_length",
+        "context",
+        "prompt",
+        "input",
+        "上下文",
+        "长度",
+    ]
+    .iter()
+    .any(|k| d.contains(k));
+    // 明确的错误码单独放行（不需要凑措辞）
+    if d.contains("context_length_exceeded") || d.contains("string_above_max_length") {
+        return true;
+    }
+    exceeded && context_noun
+}
+
 /// 压缩策略：全部参数可配。
 ///
 /// 读取顺序：环境变量 → 内置默认。所有数值都钳在安全区间内，配错不会
@@ -349,6 +419,15 @@ pub fn build_summary_request(
 
 #[cfg(test)]
 mod tests {
+    /// 读 env 的用例共用的锁。
+    ///
+    /// `CompactionPolicy::resolve` 会读 env，而单测在同进程内并行跑：
+    /// `env_overrides_the_config_section` 设了
+    /// `LATTE_AGENT_COMPACT_THRESHOLD_RATIO=0.9`，会让并行的钳位用例读到
+    /// 0.9 而不是配置里的值，随机挂（既有缺陷，与本次改动无关）。凡是
+    /// 依赖 env 处于已知状态的用例都要持这把锁。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     use super::*;
 
     fn user(t: &str) -> Message {
@@ -386,6 +465,8 @@ mod tests {
 
     #[test]
     fn unset_section_falls_back_to_builtin_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO") };
         let p = CompactionPolicy::resolve(&Default::default());
         assert_eq!(p, CompactionPolicy::default(), "未配置应等于内置默认");
         assert_eq!(
@@ -397,6 +478,8 @@ mod tests {
 
     #[test]
     fn out_of_range_config_is_clamped_not_honoured() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO") };
         // 配错不该把行为推到极端（阈值 0 每轮都压 / 保留 0 轮丢上下文）。
         let section = crate::config::CompactionSection {
             threshold_ratio: Some(0.01),
@@ -414,6 +497,7 @@ mod tests {
 
     #[test]
     fn env_overrides_the_config_section() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // env 留在最高优先级：排查问题时不用改文件就能压测某个参数。
         let section = crate::config::CompactionSection {
             threshold_ratio: Some(0.6),
@@ -570,5 +654,61 @@ mod tests {
         assert_eq!(req[2].as_text(), "a1");
         assert_eq!(req[3].role, Role::User, "指令必须是最后一条 user 消息");
         assert!(req[3].as_text().contains("压缩引擎"));
+    }
+
+    /// 溢出分类器要覆盖各家 OpenAI 兼容端点的措辞，也要**不误判**普通错误。
+    ///
+    /// 移植 deepseek-harness 的 `isContextWindowExceededError`。误判的代价
+    /// 是白烧一次摘要调用并压掉好历史，所以宁可漏判。
+    #[test]
+    fn context_overflow_classifier_covers_provider_wordings() {
+        for msg in [
+            "API error: 400 - context window exceeds limit",
+            "This model's maximum context length is 128000 tokens",
+            "error code: context_length_exceeded",
+            "Input is too long for this model",
+            "prompt too large for context window",
+            "请求的上下文长度超出模型上限",
+            "输入过长，超过上下文窗口",
+        ] {
+            assert!(is_context_overflow_error(msg), "应判为溢出: {msg}");
+        }
+        for msg in [
+            "API error: 502 - Bad Gateway",
+            "rate limit exceeded, please retry later",
+            "insufficient quota",
+            "invalid api key",
+            "stream idle timeout (120s)",
+            "tool_calls must be followed by tool messages",
+        ] {
+            assert!(!is_context_overflow_error(msg), "不该判为溢出: {msg}");
+        }
+    }
+
+    /// 被动触发必须**跳过**阈值判断——那正是它存在的理由。
+    ///
+    /// 实测 jemalloc：三个模型都声明 `context_window = 1000000`，阈值 0.8
+    /// → 800K，而单次请求远达不到，7 个会话 `ContextCompacted` 零次。声明
+    /// 值不可信时，只有「供应商真的拒了」这个信号是可靠的。
+    #[test]
+    fn pressure_respects_threshold_but_overflow_does_not() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO") };
+        let policy = CompactionPolicy::resolve(&crate::config::CompactionSection::default());
+        // 1M 窗口下 10K 占用远低于 0.8 阈值
+        assert!(
+            !policy.should_compact(10_000, 1_000_000),
+            "主动触发在阈值下不该压"
+        );
+        // 触发枚举本身要能区分两者（被动分支在 agent 侧跳过 should_compact）
+        assert_ne!(
+            CompactionTrigger::Pressure,
+            CompactionTrigger::ContextOverflow
+        );
+        // 窗口未声明（0）时主动触发恒不压——没有分母就没有压力
+        assert!(
+            !policy.should_compact(999_999, 0),
+            "没有 context_window 时主动触发不该压"
+        );
     }
 }

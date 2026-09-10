@@ -230,12 +230,66 @@ pub struct AdvisorSection {
     /// ——分层合并时 project 层的 `Some` 覆盖 global 层。
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// delegate-return 单次审查超时（秒）。
+    ///
+    /// 此前只是 [`crate::advisor_monitor::AdvisorReviewSettings`] 上的一个
+    /// 结构体字段，**没有任何从 TOML/env 读进来的路径**，实际只能改代码
+    /// 常量。实测 2026-09-10 jemalloc 会话：默认 90s 撞上常态 >120s 的慢
+    /// 模型，4 次「审查超时未审直接放行」——审查门禁静默失效，而这个参数
+    /// 当时改不了。
+    #[serde(default)]
+    pub delegate_review_timeout_secs: Option<u64>,
+    /// workflow speaker 返回被判 intervene/terminate 时的重做上限。
+    #[serde(default)]
+    pub return_max_redo: Option<u8>,
 }
 
 impl AdvisorSection {
     /// 生效值：未配置 = 开。
     pub fn enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// 整段是否一个字段都没配。分层合并用它判「要不要整段覆盖」。
+    ///
+    /// 必须逐字段判：只写 `return_max_redo` 时 `enabled` 是 `None`，若还按
+    /// 老写法用 `enabled.is_some()` 当闸门，整段永远合并不进来、配置静默
+    /// 失效（compaction 段就踩过这个坑）。
+    pub fn is_unset(&self) -> bool {
+        self.enabled.is_none()
+            && self.delegate_review_timeout_secs.is_none()
+            && self.return_max_redo.is_none()
+    }
+
+    /// 审查超时生效值：**env > 配置 > 内置默认**，并钳到安全区间。
+    ///
+    /// 钳位下限 10s：再小就等于把审查关掉（还白发一次请求）。上限 600s：
+    /// 审查是串在流水线上的，给太大等于让慢模型拖死整条 workflow。
+    pub fn delegate_review_timeout_secs(&self) -> u64 {
+        let raw = std::env::var("LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or(self.delegate_review_timeout_secs)
+            .unwrap_or(crate::advisor_monitor::DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS);
+        raw.clamp(10, 600)
+    }
+
+    /// 返回重做上限生效值：env > 配置 > 默认，钳在 `0..=MAX_RETURN_REDO`。
+    pub fn return_max_redo(&self) -> u8 {
+        let raw = std::env::var("LATTE_AGENT_ADVISOR_RETURN_MAX_REDO")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .or(self.return_max_redo)
+            .unwrap_or(crate::advisor_monitor::DEFAULT_RETURN_MAX_REDO);
+        raw.min(crate::advisor_monitor::MAX_RETURN_REDO)
+    }
+
+    /// 组装成运行时用的 [`crate::advisor_monitor::AdvisorReviewSettings`]。
+    pub fn review_settings(&self) -> crate::advisor_monitor::AdvisorReviewSettings {
+        crate::advisor_monitor::AdvisorReviewSettings {
+            delegate_review_timeout_secs: self.delegate_review_timeout_secs(),
+            return_max_redo: self.return_max_redo(),
+        }
     }
 }
 
@@ -340,7 +394,7 @@ impl AgentConfig {
                 merged.roles.extend(part.roles);
                 // Advisor 开关：project 层声明了才覆盖（global 在后，
                 // 只填 project 没声明的空档）。
-                if part.advisor.enabled.is_some() {
+                if !part.advisor.is_unset() {
                     merged.advisor = part.advisor.clone();
                 }
                 // compaction 独立判断——**不能嵌在 advisor 的 if 里**：
@@ -383,7 +437,7 @@ impl AgentConfig {
                     merge_tiers_or_insert(&mut merged.models.tiers, &global_part.models.tiers);
                     merge_role_tiers_or_insert(&mut merged.models.role_tiers, &global_part.models.role_tiers);
                     // Advisor 开关：只填 project 未声明的空档（project 优先）。
-                    if merged.advisor.enabled.is_none() && global_part.advisor.enabled.is_some() {
+                    if merged.advisor.is_unset() && !global_part.advisor.is_unset() {
                         merged.advisor = global_part.advisor.clone();
                     }
                     // compaction 同款：project 层整段没配才取全局值。
@@ -466,7 +520,7 @@ impl AgentConfig {
             merged.roles.extend(part.roles);
 
             // Advisor 开关：声明过的文件覆盖先前的（字母序后写赢）。
-            if part.advisor.enabled.is_some() {
+            if !part.advisor.is_unset() {
                 merged.advisor = part.advisor.clone();
             }
             // compaction 独立判断（同上：不能嵌在 advisor 的 if 里）。
@@ -606,6 +660,19 @@ pub struct ModelDef {
     /// 这段"巨大且不变的前缀"是对症解法。
     #[serde(default)]
     pub prompt_cache: bool,
+
+    /// 是否下发顶层 `prompt_cache_key`（**缓存亲和键**）。
+    ///
+    /// 与 `prompt_cache` 是两条独立机制：那个声明「缓存边界在哪」（需要
+    /// 端点认 Anthropic 的 `cache_control`，风险高所以默认关）；这个只
+    /// 声明「这些请求属于同一会话」，走供应商的自动前缀缓存。命中自动
+    /// 缓存要求请求落到持有那份 KV cache 的机器上，网关的负载均衡不保证
+    /// 这点，这个键就是给它做路由亲和用的。
+    ///
+    /// 不写 = 跟随全局默认（**开**，`LATTE_AI_PROMPT_CACHE_KEY=0` 可关）。
+    /// 写 `false` 给个别对未知顶层字段严格 400 的端点用。
+    #[serde(default)]
+    pub prompt_cache_key: Option<bool>,
     /// Whether the model supports thinking/reasoning.
     #[serde(default)]
     pub supports_thinking: bool,
@@ -934,6 +1001,82 @@ icon = "A"
             assert!(!cfg.advisor.enabled(), "project 未声明时 global 层应生效");
         });
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// 审查参数：env > 配置 > 内置默认，且一律钳到安全区间。
+    ///
+    /// 这两个字段此前**没有任何**从 TOML/env 读进来的路径（只是
+    /// `AdvisorReviewSettings` 上的结构体字段），实际只能改代码常量重编。
+    /// advisor 审查参数用例共用的 env 锁：env 是进程级的，而单测并行跑。
+    /// 少了它，设过 env 的用例会污染只读配置的用例（实测就是这么挂的）。
+    static ADVISOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn advisor_review_settings_are_layered_and_clamped() {
+        let _guard = ADVISOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 本用例只验「配置 → 生效值」，env 必须先清干净。
+        unsafe {
+            std::env::remove_var("LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS");
+            std::env::remove_var("LATTE_AGENT_ADVISOR_RETURN_MAX_REDO");
+        }
+        use crate::advisor_monitor::{
+            DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS, DEFAULT_RETURN_MAX_REDO, MAX_RETURN_REDO,
+        };
+        // 未配置 → 内置默认
+        let bare = AdvisorSection::default();
+        assert!(bare.is_unset(), "空段必须判为未配置");
+        assert_eq!(
+            bare.delegate_review_timeout_secs(),
+            DEFAULT_DELEGATE_REVIEW_TIMEOUT_SECS
+        );
+        assert_eq!(bare.return_max_redo(), DEFAULT_RETURN_MAX_REDO);
+
+        // 配置值生效
+        let configured = AdvisorSection {
+            enabled: None,
+            delegate_review_timeout_secs: Some(180),
+            return_max_redo: Some(2),
+        };
+        assert!(
+            !configured.is_unset(),
+            "只配了审查参数（enabled 为 None）也必须算已配置——否则分层合并会\
+             把整段丢掉，配置静默失效"
+        );
+        assert_eq!(configured.delegate_review_timeout_secs(), 180);
+        assert_eq!(configured.return_max_redo(), 2);
+        assert_eq!(configured.review_settings().delegate_review_timeout_secs, 180);
+
+        // 越界一律钳住：配错不会把行为推到极端
+        let insane = AdvisorSection {
+            enabled: None,
+            delegate_review_timeout_secs: Some(0),
+            return_max_redo: Some(99),
+        };
+        assert_eq!(insane.delegate_review_timeout_secs(), 10, "下限钳到 10s");
+        assert_eq!(insane.return_max_redo(), MAX_RETURN_REDO, "重做上限钳到硬顶");
+        let huge = AdvisorSection {
+            enabled: None,
+            delegate_review_timeout_secs: Some(99_999),
+            return_max_redo: None,
+        };
+        assert_eq!(huge.delegate_review_timeout_secs(), 600, "上限钳到 600s");
+    }
+
+    /// env 覆盖配置文件。单独一个用例并串行化——env 是进程级的，
+    /// 与并行兄弟用例共享。
+    #[test]
+    fn advisor_review_timeout_env_overrides_config() {
+        let _guard = ADVISOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS";
+        let configured = AdvisorSection {
+            enabled: None,
+            delegate_review_timeout_secs: Some(180),
+            return_max_redo: None,
+        };
+        unsafe { std::env::set_var(key, "240") };
+        let got = configured.delegate_review_timeout_secs();
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(got, 240, "env 必须压过配置文件");
     }
 
     #[test]
