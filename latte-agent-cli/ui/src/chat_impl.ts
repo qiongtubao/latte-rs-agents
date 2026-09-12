@@ -8,6 +8,7 @@ import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
+import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, type TodoState } from "./todo_store";
 import { parentOptions } from "./task_board";
 import type { CodeRef } from "./host";
 interface UIBinding {
@@ -691,6 +692,143 @@ export function mountChat(opts: {
     if (isNearBottom()) scrollToBottom();
     return row;
   }
+
+  // ── Todo dock（todo 工具进度）────────────────────────────────
+  // 数据全部来自 todo store（TodoUpdated 事件驱动，不轮询）。两处渲染：
+  //  1. 消息流里的紧凑卡片：同一条 status 行原地更新，不每次追加气泡；
+  //  2. composer 上方的常驻 dock：折叠态一行（done/total + 当前活动项），
+  //     展开态按 phase 分组列出任务。列表为空时 dock 隐藏。
+  // 回放路径（replayEvents → handleEvent）走同一个 case，全量替换语义
+  // 下最后一条 TodoUpdated 即为恢复出的最终状态。
+  let todoState: TodoState = emptyTodoState();
+  /** 消息流里的紧凑 todo 卡（原地更新同一条）。 */
+  let todoCardRow: HTMLElement | null = null;
+  let todoDockEl: HTMLElement | null = null;
+  let todoDockBodyEl: HTMLElement | null = null;
+  let todoDockExpanded = false;
+  /** 展开态里各 phase 的折叠覆盖：key = `${index}:${name}`；
+   *  缺省值 = 该 phase 是否全部完成（完成的默认收成一行）。 */
+  const todoPhaseCollapsed = new Map<string, boolean>();
+
+  const TODO_TASK_ICONS: Record<string, string> = {
+    completed: "✓",
+    in_progress: "•",
+    pending: "○",
+    abandoned: "✕",
+  };
+
+  function renderTodoCard(): void {
+    const text = todoSummaryLine(todoState);
+    if (todoCardRow && todoCardRow.isConnected) {
+      const c = todoCardRow.querySelector(".content");
+      if (c) c.textContent = text;
+      return;
+    }
+    todoCardRow = addMessage({ kind: "status", content: text });
+  }
+
+  function ensureTodoDock(): void {
+    if (todoDockEl) return;
+    const dock = document.createElement("div");
+    dock.className = "todo-dock";
+    dock.style.display = "none";
+    const summary = document.createElement("button");
+    summary.type = "button";
+    summary.className = "todo-dock-summary";
+    summary.addEventListener("click", () => {
+      todoDockExpanded = !todoDockExpanded;
+      renderTodoDock();
+    });
+    const body = document.createElement("div");
+    body.className = "todo-dock-body";
+    dock.append(summary, body);
+    // dock 挂在 chat-form 前（composer 上方）；测试环境 form 未挂载进
+    // DOM 时保持游离，渲染逻辑照常（测试可直接断言 dock 内容）。
+    const host = container.formEl.parentElement;
+    if (host) host.insertBefore(dock, container.formEl);
+    todoDockEl = dock;
+    todoDockBodyEl = body;
+  }
+
+  function renderTodoDock(): void {
+    ensureTodoDock();
+    const dock = todoDockEl!;
+    const { done, total } = countTodos(todoState);
+    if (total === 0) {
+      dock.style.display = "none";
+      return;
+    }
+    dock.style.display = "";
+    dock.classList.toggle("expanded", todoDockExpanded);
+
+    const summary = dock.querySelector(".todo-dock-summary")!;
+    summary.textContent = "";
+    const title = document.createElement("span");
+    title.className = "todo-dock-title";
+    title.textContent = `📝 Todos ${done}/${total}`;
+    const curEl = document.createElement("span");
+    curEl.className = "todo-dock-current";
+    if (done === total) {
+      curEl.textContent = "全部完成";
+    } else {
+      const cur = currentTask(todoState);
+      curEl.textContent = cur ? `当前: ${cur.task.content}` : "";
+      if (cur) curEl.title = `${cur.phase} · ${cur.task.content}`;
+    }
+    const chevron = document.createElement("span");
+    chevron.className = "todo-dock-chevron";
+    chevron.textContent = todoDockExpanded ? "▾" : "▸";
+    summary.append(title, curEl, chevron);
+
+    const body = todoDockBodyEl!;
+    body.textContent = "";
+    body.style.display = todoDockExpanded ? "" : "none";
+    if (!todoDockExpanded) return;
+    todoState.phases.forEach((phase, idx) => {
+      const pc = countPhase(phase);
+      const key = `${idx}:${phase.name}`;
+      const collapsed = todoPhaseCollapsed.get(key) ?? isPhaseComplete(phase);
+      const section = document.createElement("div");
+      section.className = "todo-phase";
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "todo-phase-head";
+      const headChevron = document.createElement("span");
+      headChevron.className = "todo-phase-chevron";
+      headChevron.textContent = collapsed ? "▸" : "▾";
+      const headName = document.createElement("span");
+      headName.className = "todo-phase-name";
+      headName.textContent = phase.name;
+      const headCount = document.createElement("span");
+      headCount.className = "todo-phase-count";
+      headCount.textContent = `${pc.done}/${pc.total}`;
+      head.append(headChevron, headName, headCount);
+      head.addEventListener("click", () => {
+        todoPhaseCollapsed.set(key, !collapsed);
+        renderTodoDock();
+      });
+      section.appendChild(head);
+      if (!collapsed) {
+        const ul = document.createElement("ul");
+        ul.className = "todo-task-list";
+        for (const t of phase.tasks) {
+          const li = document.createElement("li");
+          li.className = `todo-task todo-task--${t.status}`;
+          const icon = document.createElement("span");
+          icon.className = "todo-task-icon";
+          icon.textContent = TODO_TASK_ICONS[t.status] ?? "○";
+          const text = document.createElement("span");
+          text.className = "todo-task-text";
+          text.textContent = t.content;
+          li.append(icon, text);
+          ul.appendChild(li);
+        }
+        section.appendChild(ul);
+      }
+      body.appendChild(section);
+    });
+  }
+
   // ── ask 选择框（弹窗 + 消息流内联卡片）──
   // ChoiceRequested 事件触发。选项/说明/图片来自模型（不可信），一律
   // 用 textContent / img.src 构建，绝不 innerHTML 拼接。回传分两路：
@@ -3213,6 +3351,20 @@ export function mountChat(opts: {
         }, 1500);
         break;
       }
+      case "TodoUpdated": {
+        // todo 工具调用完成后的全量清单（整表替换，无 diff）。子会话
+        // （sub_id 非空）的清单 applyTodoUpdated 原样返回旧 state，
+        // 引用不变 → 跳过重渲染。回放路径走同一 case，最后一条即为
+        // 恢复出的状态（卡片原地更新，不会堆出一串历史快照）。
+        const next = applyTodoUpdated(todoState, e);
+        if (next !== todoState) {
+          todoState = next;
+          renderTodoCard();
+          renderTodoDock();
+        }
+        resetWaitTimer();
+        break;
+      }
       case "ChoiceRequested": {
         // 去重：同一 choice_id 可能同时经 history 重放和挂起弹框补拉
         // 到达（SSE 新连接的 replay 前缀 + GET pending-prompts）。
@@ -3382,6 +3534,13 @@ export function mountChat(opts: {
     }
     // 上一个 session 的选择弹窗/待办铃不能跟着漂到新 session。
     clearChoiceDialogs();
+    // todo 状态属于 session：归零并隐藏 dock；卡片引用随消息区整体
+    // 清空而失效，置 null 让下一条 TodoUpdated 重新建卡。
+    todoState = emptyTodoState();
+    todoCardRow = null;
+    todoDockExpanded = false;
+    todoPhaseCollapsed.clear();
+    if (todoDockEl) renderTodoDock();
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {

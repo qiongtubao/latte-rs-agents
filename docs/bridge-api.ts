@@ -587,6 +587,7 @@ export const CHAT_EVENT_MAPPING: Record<string, string | null> = {
   AdvisorTerminated: null,
   UserMessage: null,
   TaskReport: null,
+  TodoUpdated: null,
   WorkflowStarted: null,
   WorkflowStep: null,
   WorkflowTurn: null,

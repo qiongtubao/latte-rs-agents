@@ -198,6 +198,31 @@ pub trait ChatRenderer: Send + Sync {
                 ))
                 .await;
             }
+            // todo 工具应用 ops 后的列表快照：紧凑一行（进度 + 当前项），
+            // web UI 渲染完整面板。
+            ChatEvent::TodoUpdated { phases, .. } => {
+                let mut done = 0usize;
+                let mut total = 0usize;
+                let mut current: Option<&str> = None;
+                for p in phases {
+                    for t in &p.tasks {
+                        if t.status == "abandoned" {
+                            continue;
+                        }
+                        total += 1;
+                        match t.status.as_str() {
+                            "completed" => done += 1,
+                            "in_progress" if current.is_none() => current = Some(&t.content),
+                            _ => {}
+                        }
+                    }
+                }
+                let line = match current {
+                    Some(c) => format!("📝 todo {done}/{total} · 当前: {c}"),
+                    None => format!("📝 todo {done}/{total}"),
+                };
+                self.on_status(&line).await;
+            }
         }
     }
 }

@@ -350,6 +350,7 @@ ChatController 实时事件流。每个会话独立推送。
 | `UserMessage` | `text` | 客户端回放用 |
 | `ContextCleared` | — | 上下文清除 |
 | `TaskReport` | `role_id` / `task_id` / `summary` / `result` | manager 任务报告（事件 → ui-server → POST /api/tasks/:id/report） |
+| `TodoUpdated` | `phases` / `sub_id?` | 会话内 todo 列表快照（todo 工具成功应用 ops 后广播）。`phases[]` = `{ name, tasks: [{ content, status }] }`，status ∈ `pending`/`in_progress`/`completed`/`abandoned` |
 
 **Keepalive：** 每 15 秒发送一个注释行（`:`）。
 
@@ -387,7 +388,8 @@ export type ChatEvent =
   | { type: "TimeoutWarning"; role_id: string; elapsed_secs: number; soft_timeout_secs: number; hard_timeout_secs: number; sub_id?: string }
   | { type: "AdvisorTerminated"; role_id: string; reason: string; detector?: string; sub_id?: string }
   | { type: "UserMessage"; text: string }
-  | { type: "TaskReport"; role_id: string; task_id: string; summary: string; result: string };
+  | { type: "TaskReport"; role_id: string; task_id: string; summary: string; result: string }
+  | { type: "TodoUpdated"; phases: { name: string; tasks: { content: string; status: "pending" | "in_progress" | "completed" | "abandoned" }[] }[]; sub_id?: string };
 ```
 
 ---

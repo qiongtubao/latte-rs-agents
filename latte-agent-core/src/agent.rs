@@ -997,6 +997,13 @@ pub struct AgentRunner {
     deadline: Option<std::time::Instant>,
     /// Optional event channel for human intervention on broken JSON/inputs (Scheme A).
     tool_fix_event_tx: Option<tokio::sync::broadcast::Sender<crate::controller::ChatEvent>>,
+    /// 会话级 todo 状态（见 [`crate::todo`]）：todo 工具 handler 读写，
+    /// TodoTracker 只读它做运行中纠偏（mid-run nudge / stop reminder）。
+    /// `with_todo_state` 装入；`None` = 不做 todo 纠偏（默认）。
+    todo_state: Option<crate::todo::SharedTodoState>,
+    /// 每 turn 的 todo 纠偏计数器，`run_turn` 入口重置（与
+    /// `last_turn_tool_count` 同位置）。
+    todo_tracker: crate::todo::TodoTracker,
 }
 /// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
 /// 来的，以及构建时的配置代际。
@@ -2182,6 +2189,8 @@ impl AgentRunner {
             stream_mode: None,
             model_source: None,
             deadline: None,
+            todo_state: None,
+            todo_tracker: crate::todo::TodoTracker::default(),
         }
     }
     /// 构造带工具的 runner。
@@ -2216,6 +2225,8 @@ impl AgentRunner {
             stream_mode: None,
             model_source: None,
             deadline: None,
+            todo_state: None,
+            todo_tracker: crate::todo::TodoTracker::default(),
         }
     }
     /// Attach an event broadcaster so the runner can trigger human-intervention
@@ -2251,6 +2262,8 @@ impl AgentRunner {
             stream_mode: None,
             model_source: None,
             deadline: None,
+            todo_state: None,
+            todo_tracker: crate::todo::TodoTracker::default(),
         }
     }
 
@@ -2486,6 +2499,9 @@ impl AgentRunner {
         // 2. 成功计数 + 工具摘要（供 advisor 审查用）。
         if r.executed_ok {
             self.last_turn_tool_count += 1;
+            // TodoTracker 记账：todo 调用清零 nudge 计数，ask 标记
+            // 「本 turn 问过用户」（stop reminder 据此跳过）。
+            self.todo_tracker.record_tool_call(short_tool_name(tool_name));
             if let (Some((name, args)), Ok(result_str)) = (r.loop_records.first(), &r.outcome) {
                 self.last_turn_tool_summaries.push(format!(
                     "{} {} → {}",
@@ -2780,6 +2796,32 @@ impl AgentRunner {
         self
     }
 
+    /// Attach 会话级 todo 状态。同一 `Arc` 由 `ChatController` 持有、
+    /// todo 工具 handler 读写；本 runner 只读它做运行中纠偏
+    /// （[`crate::todo::TodoTracker`]）。
+    pub fn with_todo_state(mut self, state: crate::todo::SharedTodoState) -> Self {
+        self.todo_state = Some(state);
+        self
+    }
+
+    /// mid-run nudge：同一 turn 里攒够非 todo 工具调用而没碰过 todo
+    /// 时，给当前 tool loop 注入一条提醒（见 [`crate::todo::TodoTracker`]）。
+    fn todo_mid_run_nudge(&mut self) -> Option<String> {
+        let state = self.todo_state.clone()?;
+        let phases = state.read().clone();
+        self.todo_tracker.take_nudge(&phases)
+    }
+
+    /// stop reminder：模型停止输出（无待处理工具调用）而 todo 还有
+    /// 未完成项时，注入提醒让 agent 继续跑。有挂起的选择题（阻塞
+    /// ask / ChoiceRequested）时跳过——agent 在等用户，不是在摸鱼。
+    fn todo_stop_reminder(&mut self) -> Option<String> {
+        let state = self.todo_state.clone()?;
+        let phases = state.read().clone();
+        let waiting_on_user = crate::choice::has_any_pending();
+        self.todo_tracker.take_stop_reminder(&phases, waiting_on_user)
+    }
+
     /// Set the absolute wall-clock deadline for the tool loop (对齐 oh-my-pi
     /// `config.deadline`). 超时时循环优雅退出、返回 partial 产出。
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
@@ -3042,6 +3084,9 @@ impl AgentRunner {
         // run_turn_gated 据此跑 D6 ToolCallEcho 检查。
         self.last_turn_tool_count = 0;
         self.last_turn_tool_summaries.clear();
+        // TodoTracker 每 turn 重置：nudge / stop reminder 的额度都按
+        // turn 计（见 crate::todo）。
+        self.todo_tracker = crate::todo::TodoTracker::default();
         use crate::trace::{ParsedCall, ParseDiag, ToolStatus, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         // wall-clock 起点：与 `turn_start`（单调）配对，用来暴露进程被
@@ -3233,6 +3278,14 @@ impl AgentRunner {
                 self.park_if_paused("model call boundary").await;
                 for hint in self.drain_advisor_hints() {
                     messages.push(Message::user(format!("🦉 advisor 监察：\n{hint}")));
+                }
+                // TodoTracker mid-run nudge：攒够非 todo 工具调用而没
+                // 碰过 todo 时注入一次提醒（每 turn 额度有限，见
+                // crate::todo::TODO_MAX_NUDGES_PER_TURN）。与 advisor
+                // hint 同款注入点：下一次模型调用（本轮）就带上了。
+                if let Some(nudge) = self.todo_mid_run_nudge() {
+                    self.context.push(Message::user(nudge.clone()));
+                    messages.push(Message::user(nudge));
                 }
             }
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
@@ -3676,6 +3729,19 @@ impl AgentRunner {
                         "你上一条回复的尾部带有未完成的工具调用标记（如 </parameter>/</function>），回复疑似被截断。请重新输出完整答复；需要调用工具时用 native function-calling，正文里不要输出任何工具调用标记。"
                             .to_string(),
                     ));
+                    continue;
+                }
+                // TodoTracker stop reminder：模型停止输出、无待处理工具
+                // 调用，而会话 todo 还有 pending/in_progress 项——注入一条
+                // 提醒让它继续跑（每 turn 上限见
+                // crate::todo::TODO_MAX_STOP_REMINDERS_PER_TURN；等用户
+                // 回答 ask / 挂起选择题时不催）。注入形式与上面的截断
+                // 续写同款：只进 working messages，不进 context。
+                if let Some(reminder) = self.todo_stop_reminder() {
+                    if !final_response.trim().is_empty() {
+                        messages.push(Message::assistant(final_response.clone()));
+                    }
+                    messages.push(Message::user(reminder));
                     continue;
                 }
                 break;
@@ -4229,6 +4295,9 @@ impl AgentRunner {
                                 // Pre-persistence gate: D6 需要 tool
                                 // 实际执行计数。失败的工具不计入。
                                 self.last_turn_tool_count += 1;
+                                // TodoTracker 记账（与 apply_call_result 同款：
+                                // 串行路径不经过它，这里单独记）。
+                                self.todo_tracker.record_tool_call(short_tool_name(&resolved_name));
                                 // 记进 anchor 台账（见 crate::edit_anchor）。
                                 if let Ok(raw) = serde_json::to_string(&result) {
                                     crate::edit_anchor::record_tool_result(

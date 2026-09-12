@@ -585,6 +585,12 @@ pub enum ChatEvent {
         summary: String,
         result: String,
     },
+    /// 会话内 todo 列表更新(todo 工具成功应用 ops 后广播)。
+    TodoUpdated {
+        phases: Vec<crate::todo::TodoPhaseView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
+    },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -1174,6 +1180,10 @@ pub struct ChatController {
     /// `PendingApproval`，ui-server 的任务导入置 `Approved`，driver
     /// 收到下一条用户消息复位 `Normal`。
     plan_stage: SharedPlanStage,
+    /// 会话级 todo 列表（见 [`crate::todo`]）：todo 工具 handler 读写，
+    /// runner 的 TodoTracker 只读做运行中纠偏。与 plan_stage 同款
+    /// 生命周期——controller = 一个会话。
+    todo_state: crate::todo::SharedTodoState,
     /// Advisor v3 pause gate（intervene 暂停门）：monitor 判
     /// `Verdict::Intervene` 时经 `request_pause()` 置位；driver 给
     /// watched role 的主 runner 装配同一句柄
@@ -1233,6 +1243,7 @@ impl ChatController {
             advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
             plan_stage: Arc::new(parking_lot::RwLock::new(PlanStage::Normal)),
+            todo_state: crate::todo::new_shared_todo_state(),
             advisor_pause: AdvisorPauseGate::new(),
             last_failed_workflow: Arc::new(parking_lot::RwLock::new(None)),
             agent_pause_gate,
@@ -1262,6 +1273,7 @@ impl ChatController {
         let turn_cancel_flag = self.turn_cancel_flag.clone();
         let advisor_hints = self.advisor_hints.clone();
         let plan_stage = self.plan_stage.clone();
+        let todo_state = self.todo_state.clone();
         let advisor_pause = self.advisor_pause.clone();
         let agent_pause_gate = self.agent_pause_gate.clone();
         let last_user_input = self.last_user_input.clone();
@@ -1310,6 +1322,7 @@ impl ChatController {
                 turn_cancel_flag,
                 advisor_hints,
                 plan_stage,
+                todo_state,
                 advisor_pause,
                 agent_pause_gate,
                 last_user_input,
@@ -1802,6 +1815,7 @@ async fn run_driver(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    todo_state: crate::todo::SharedTodoState,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     last_user_input: Arc<parking_lot::Mutex<String>>,
@@ -1817,6 +1831,7 @@ async fn run_driver(
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
+            todo_state,
             advisor_pause,
             agent_pause_gate,
             last_user_input.clone(),
@@ -1831,6 +1846,7 @@ async fn run_driver(
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
+            todo_state,
             advisor_pause,
             agent_pause_gate,
             last_user_input,
@@ -1868,6 +1884,7 @@ async fn run_multi_role_loop(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    todo_state: crate::todo::SharedTodoState,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     // 与 ChatController 共享的原始用户诉求句柄（委派返回审查的准绳）。
@@ -2076,6 +2093,7 @@ async fn run_multi_role_loop(
             config.advisor_monitor.runner_gate(),
             advisor_pause.clone(),
             &plan_stage,
+            &todo_state,
             agent_pause_gate.clone(),
             config.stream_mode.clone(),
         )
@@ -2663,6 +2681,7 @@ async fn run_single_role_loop(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    todo_state: crate::todo::SharedTodoState,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     last_user_input: Arc<parking_lot::Mutex<String>>,
@@ -2699,6 +2718,7 @@ async fn run_single_role_loop(
         config.advisor_monitor.runner_gate(),
         advisor_pause.clone(),
         &plan_stage,
+        &todo_state,
         agent_pause_gate.clone(),
         config.stream_mode.clone(),
     )
@@ -2830,7 +2850,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2852,7 +2872,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3174,7 +3194,7 @@ let usage_before = runner.total_usage().clone();
                             continue;
                         }
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3189,7 +3209,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3264,6 +3284,9 @@ async fn build_runner(
     // plan 阶段门共享句柄：透传给 `register_plan_tool`（置
     // PendingApproval）与 `register_delegate_tool`（拦截实现类角色）。
     plan_stage: &SharedPlanStage,
+    // 会话级 todo 状态共享句柄：透传给 `register_todo_tool`（读写 +
+    // 广播 TodoUpdated）与 runner（TodoTracker 运行中纠偏）。
+    todo_state: &crate::todo::SharedTodoState,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
@@ -3456,6 +3479,19 @@ async fn build_runner(
             register_task_report_tool(&tm, event_tx.clone(), role_id.to_string())
                 .map_err(|e| AgentError::Tool(format!("register task_report: {e}")))?;
         }
+        // Any role with "todo" in allowed_tools gets the stateful todo tool:
+        // 会话级 todo 列表（有状态包装版，覆盖 builtin pool 的纯函数版），
+        // 成功应用 ops 后广播 ChatEvent::TodoUpdated。
+        if role.allowed_tools.iter().any(|t| t == "todo") {
+            register_todo_tool(
+                &tm,
+                event_tx.clone(),
+                role_id.to_string(),
+                todo_state.clone(),
+                None,
+            )
+            .map_err(|e| AgentError::Tool(format!("register todo: {e}")))?;
+        }
         // Any role with doc-graph tools in allowed_tools gets the 4 doc-graph
         // tools（scan/context/write/index）。cwd 是 agent 工作目录。
         {
@@ -3504,6 +3540,12 @@ async fn build_runner(
         }
         runner = runner.with_agent_pause_gate(agent_pause_gate);
         runner = runner.with_stream_mode(stream_mode);
+        // 会话级 todo 状态：TodoTracker 运行中纠偏（mid-run nudge /
+        // stop reminder）只读它。只装给声明了 todo 工具的角色——
+        // 没有该工具的角色被提醒了也无法照办，纯属噪声。
+        if role.allowed_tools.iter().any(|t| t == "todo") {
+            runner = runner.with_todo_state(todo_state.clone());
+        }
         // 模型配置热更新：UI 保存 models 配置后，本 runner 在下一个
         // turn 边界自动重建 model chain，无需重启 session。
         runner = runner.with_model_hot_reload(
@@ -7037,6 +7079,146 @@ pub fn register_task_report_tool(
     Ok(())
 }
 
+/// `todo` 工具的 input schema：`ops` 是 object 数组（各 op 的必填字段
+/// 写进元素描述里——op 之间必填字段不同，无法用一份 properties 表达，
+/// 与 plan 工具的「数组 + 元素对象」同款写法）。`currentPhases` 刻意
+/// **不对模型暴露**：会话当前状态由 wrapper handler 注入，模型只需要
+/// 发 ops（让它自己回填 currentPhases 等于把状态机纠错责任推给模型，
+/// 实测这类「模型自己维护状态镜像」的协议必然漂移）。
+fn todo_input_schema() -> latte_rs_agent_tools::types::ToolInputSchema {
+    use latte_rs_agent_tools::types::{PropertyType, SchemaType, ToolInputSchema};
+    let op_item = input_property(
+        PropertyType::Object,
+        "一个原子操作，形如 {\"op\": \"...\", ...}。op 取值与必填字段：\
+         init {list: [{phase, items: [\"任务内容\", ...]}]} 用 list 重建整个列表；\
+         start/done/rm/drop {task: \"任务内容\"} 分别标进行中/完成/删除/放弃；\
+         append {phase, items: [...]} 向 phase 末尾追加（phase 不存在则新建）；\
+         view {} 只读查看当前列表。",
+    );
+    ToolInputSchema {
+        schema_type: SchemaType,
+        properties: [(
+            "ops".into(),
+            input_property(
+                PropertyType::Array,
+                "原子操作序列，按顺序应用；任一 op 失败则整批丢弃（状态不变）。\
+                 一次调用把相关变更合并提交（如 init + 标第一个 done），不要一个 op 调一次。",
+            )
+            .with_items(op_item),
+        )]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["ops".into()]),
+        ..Default::default()
+    }
+}
+
+/// 注册 `todo` 工具（**有状态会话级包装**）：会话当前 phases 由
+/// `todo_state` 注入，模型只见 `ops`；状态机语义全部复用
+/// `latte_rs_agent_tools::tools::todo` 的纯函数 handler（原子批量、
+/// 至多一个 in_progress、无 in_progress 时第一个 pending 自动升格）。
+///
+/// 成功应用 ops（返回 errors 为空）后：新 phases 存回 `todo_state`，
+/// 并广播 [`ChatEvent::TodoUpdated`]（UI 渲染会话内 todo 面板）。
+///
+/// `pub` 而非 `pub(crate)`：CLI REPL 也要注册它（与 plan/task_report
+/// 同理），否则声明了该工具的角色在 chat 里调用直接 ToolNotFound。
+/// 注意 builtin pool 里有一个同名**纯函数版** todo 工具
+/// （`currentPhases` 由模型自己传）：本函数在同一 tool manager 上
+/// `register` 会覆盖它——build_runner 在 allowlist 过滤之后调用，
+/// 声明了 \"todo\" 的角色拿到的始终是本包装版。
+pub fn register_todo_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    event_tx: broadcast::Sender<ChatEvent>,
+    role_id: String,
+    todo_state: crate::todo::SharedTodoState,
+    // 所属 subsession（delegate / workflow 子会话填真实值，主 session
+    // 传 None）——透传给 ChatEvent::TodoUpdated.sub_id。
+    sub_id: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use latte_rs_agent_tools::types::SharedToolHandler;
+
+    let input_schema = todo_input_schema();
+
+    // 纯函数版 handler：状态机语义的唯一事实来源。这里直接复用它的
+    // handler（不经过 tool manager），避免它被 allowlist 过滤/被本
+    // 包装覆盖后找不到。
+    let inner = latte_rs_agent_tools::tools::todo::todo_tool();
+    let inner_handler = inner.handler.clone();
+
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, ctx| {
+        let inner_handler = inner_handler.clone();
+        let todo_state = todo_state.clone();
+        let event_tx = event_tx.clone();
+        let sub_id = sub_id.clone();
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+            // 注入会话当前状态（覆盖模型万一自己传的 currentPhases——
+            // schema 不暴露这个字段，但宽松通道可能漏进来，以会话状态为准）。
+            let mut input = input;
+            {
+                let current = todo_state.read().clone();
+                let current_val = serde_json::to_value(&current)
+                    .map_err(|e| tool_err(format!("serialize current phases: {e}")))?;
+                match input.as_object_mut() {
+                    Some(obj) => {
+                        obj.insert("currentPhases".to_string(), current_val);
+                    }
+                    None => {
+                        input = serde_json::json!({ "currentPhases": current_val });
+                    }
+                }
+            }
+            let result = inner_handler(input, ctx).await?;
+            // errors 非空 = 整批未应用（纯函数版返回的 phases 已是 prev），
+            // 不写回、不广播，原样把错误回给模型让它修正后重试。
+            let failed = result
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            if failed {
+                return Ok(result);
+            }
+            let new_phases: Vec<latte_rs_agent_tools::tools::todo::TodoPhase> =
+                serde_json::from_value(
+                    result
+                        .get("phases")
+                        .cloned()
+                        .ok_or_else(|| tool_err("todo result missing 'phases'".into()))?,
+                )
+                .map_err(|e| tool_err(format!("parse todo result phases: {e}")))?;
+            {
+                let mut guard = todo_state.write();
+                *guard = new_phases;
+                let _ = event_tx.send(ChatEvent::TodoUpdated {
+                    phases: crate::todo::phase_views(&guard),
+                    sub_id,
+                });
+            }
+            Ok(result)
+        })
+    });
+
+    let tool = latte_rs_agent_tools::types::Tool::builder(
+        "todo".to_string(),
+        "管理本会话的 todo 列表（分 phase，原子批量操作）。多步任务（3+ 步）开工前先用 init 建清单；完成一项立即 done，开始新项标 in_progress（至多一个）。状态由会话保存，只需传 ops。".to_string(),
+        input_schema,
+        handler,
+    )
+    // ops 要串行应用（与纯函数版一致）：状态读-改-写不允许多个调用交错。
+    .concurrency_safe(false)
+    .timeout(std::time::Duration::from_secs(10))
+    .build();
+
+    // 用 `replace` 而非 `register`：builtin pool 里已有同名纯函数版 todo
+    // （allowed 含 "todo" 时 build_tool_manager_at 会保留它），而默认冲突
+    // 策略是 Error——register 只会 warn 并**跳过**，纯函数版继续生效，
+    // 会话状态永远不写回。replace 原子覆写，保证模型拿到的是本包装版。
+    tm.replace(tool, Some(&role_id));
+    Ok(())
+}
+
 
 /// Delegate-return gate: review a specialist's output before it flows
 /// back to the manager, checking (1) role-responsibility adherence and
@@ -9779,6 +9961,7 @@ mod tests {
                 None,
                 AdvisorPauseGate::new(),
                 &fresh_plan_stage(),
+                &crate::todo::new_shared_todo_state(),
                 crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -14111,6 +14294,150 @@ require = ["永远不可能出现的验收字符串"]
             other => panic!("expected TaskReport, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn todo_tool_persists_state_and_broadcasts_todo_updated() {
+        // 有状态包装：init 后 phases 存回会话状态 + 广播 TodoUpdated；
+        // 第二次调用（done）以会话状态为起点（模型不传 currentPhases）。
+        //
+        // allowed 刻意含 "todo"：builtin pool 的纯函数版会被保留进 tm，
+        // register_todo_tool 必须**覆写**它（replace），否则下面的状态
+        // 写回断言会挂（纯函数版没有会话状态）。
+        let tm = build_tool_manager(&["todo".to_string()]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let state = crate::todo::new_shared_todo_state();
+        register_todo_tool(&tm, event_tx, "manager".into(), state.clone(), None)
+            .expect("register todo");
+
+        let out = tm
+            .execute(
+                "todo",
+                serde_json::json!({
+                    "ops": [{ "op": "init", "list": [{ "phase": "P1", "items": ["A", "B"] }] }]
+                }),
+                None,
+            )
+            .await
+            .expect("todo init");
+        assert!(out.get("errors").is_none(), "init must succeed: {out}");
+        // 会话状态已写回，且归一化生效（A 自动 in_progress）。
+        {
+            let guard = state.read();
+            assert_eq!(guard.len(), 1);
+            assert_eq!(guard[0].tasks.len(), 2);
+            assert_eq!(
+                guard[0].tasks[0].status,
+                latte_rs_agent_tools::tools::todo::TodoStatus::InProgress
+            );
+        }
+        // 广播了 TodoUpdated（视图形状：name + tasks[content,status]）。
+        let ev = rx.try_recv().expect("TodoUpdated event");
+        match ev {
+            ChatEvent::TodoUpdated { phases, sub_id } => {
+                assert_eq!(sub_id, None, "主 session sub_id 为 None");
+                assert_eq!(phases.len(), 1);
+                assert_eq!(phases[0].name, "P1");
+                assert_eq!(phases[0].tasks[0].content, "A");
+                assert_eq!(phases[0].tasks[0].status, "in_progress");
+                assert_eq!(phases[0].tasks[1].status, "pending");
+            }
+            other => panic!("expected TodoUpdated, got {other:?}"),
+        }
+
+        // 第二次调用不带 currentPhases：wrapper 注入会话状态；done A 后
+        // B 自动升格 in_progress（归一化语义来自纯函数版）。
+        let out = tm
+            .execute(
+                "todo",
+                serde_json::json!({ "ops": [{ "op": "done", "task": "A" }] }),
+                None,
+            )
+            .await
+            .expect("todo done");
+        assert!(out.get("errors").is_none(), "done must succeed: {out}");
+        let guard = state.read();
+        assert_eq!(
+            guard[0].tasks[0].status,
+            latte_rs_agent_tools::tools::todo::TodoStatus::Completed
+        );
+        assert_eq!(
+            guard[0].tasks[1].status,
+            latte_rs_agent_tools::tools::todo::TodoStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_tool_failed_batch_keeps_state_and_skips_broadcast() {
+        // 原子性：任一 op 失败整批丢弃——会话状态不变，不广播。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let state = crate::todo::new_shared_todo_state();
+        register_todo_tool(&tm, event_tx, "manager".into(), state.clone(), None)
+            .expect("register todo");
+
+        let out = tm
+            .execute(
+                "todo",
+                serde_json::json!({
+                    "ops": [
+                        { "op": "init", "list": [{ "phase": "P1", "items": ["A"] }] },
+                        { "op": "done", "task": "nonexistent" }
+                    ]
+                }),
+                None,
+            )
+            .await
+            .expect("failed batch still returns Ok with errors array");
+        let errors = out.get("errors").and_then(|v| v.as_array()).expect("errors");
+        assert!(!errors.is_empty(), "unknown task must error: {out}");
+        assert!(state.read().is_empty(), "失败批次不得写回会话状态");
+        assert!(
+            rx.try_recv().is_err(),
+            "失败批次不得广播 TodoUpdated"
+        );
+    }
+
+    #[test]
+    fn todo_updated_serializes_to_agreed_wire_shape() {
+        // 与前端约定的线上契约（externally-tagged）：主 session sub_id
+        // 被 skip（None），子会话填真实值。
+        let ev = ChatEvent::TodoUpdated {
+            phases: vec![crate::todo::TodoPhaseView {
+                name: "Phase 1".into(),
+                tasks: vec![
+                    crate::todo::TodoTaskView { content: "task A".into(), status: "completed".into() },
+                    crate::todo::TodoTaskView { content: "task B".into(), status: "pending".into() },
+                ],
+            }],
+            sub_id: None,
+        };
+        let v = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "TodoUpdated": {
+                    "phases": [{
+                        "name": "Phase 1",
+                        "tasks": [
+                            {"content": "task A", "status": "completed"},
+                            {"content": "task B", "status": "pending"}
+                        ]
+                    }]
+                }
+            })
+        );
+        // 反序列化缺 sub_id 时不报错（旧 consumer 兼容）。
+        let back: ChatEvent = serde_json::from_value(v).expect("deserialize");
+        assert!(matches!(back, ChatEvent::TodoUpdated { sub_id: None, .. }));
+        // 子会话：sub_id 填真实值。
+        let ev_sub = ChatEvent::TodoUpdated {
+            phases: vec![],
+            sub_id: Some("sub-1".into()),
+        };
+        let v_sub = serde_json::to_value(&ev_sub).expect("serialize");
+        assert_eq!(v_sub["TodoUpdated"]["sub_id"], "sub-1");
+    }
+
 
     #[tokio::test]
     async fn task_report_tool_rejects_bad_result() {

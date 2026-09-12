@@ -1285,6 +1285,18 @@ async fn build_runner(
             )
             .map_err(|e| format!("task_report tool setup failed: {}", e))?;
         }
+        // `todo` 对齐 UI：controller 给声明了它的角色注册**有状态会话级**
+        // 包装版（覆盖 builtin pool 的纯函数版），REPL 路径此前完全没有。
+        if role.allowed_tools.iter().any(|t| t == "todo") {
+            latte_agent_core::controller::register_todo_tool(
+                &tm,
+                cli_session_event_tx().clone(),
+                role_id.to_string(),
+                cli_todo_state(),
+                None,
+            )
+            .map_err(|e| format!("todo tool setup failed: {}", e))?;
+        }
         // `generate_image` 对齐 UI（已是 pub，无需改可见性）。
         if role.allowed_tools.iter().any(|t| t == "generate_image") {
             latte_agent_core::image_gen::register_generate_image_tool(
@@ -1308,17 +1320,21 @@ async fn build_runner(
                 register_ask_human_tool(&tm, session_arc, role_id.to_string());
             }
         }
-        with_session(
-            AgentRunner::new_with_tools(agent, tm)
-                .with_sink(cli_top_level_sink(&sink))
-                .with_hooks(Arc::clone(&hooks))
-                // 顶层 turn 也过暂停门，否则 /pause 只能停 workflow 里的
-                // 子代理，停不了 manager 自己的工具轮。
-                .with_agent_pause_gate(cli_pause_gate())
-                // 流式开关（/stream）：共享 AtomicBool，运行中改也生效。
-                .with_stream_mode(cli_stream_mode())
-                .with_role(role_id)
-        )
+        let mut runner = AgentRunner::new_with_tools(agent, tm)
+            .with_sink(cli_top_level_sink(&sink))
+            .with_hooks(Arc::clone(&hooks))
+            // 顶层 turn 也过暂停门，否则 /pause 只能停 workflow 里的
+            // 子代理，停不了 manager 自己的工具轮。
+            .with_agent_pause_gate(cli_pause_gate())
+            // 流式开关（/stream）：共享 AtomicBool，运行中改也生效。
+            .with_stream_mode(cli_stream_mode())
+            .with_role(role_id);
+        // 会话级 todo 状态：TodoTracker 运行中纠偏（对齐 controller
+        // build_runner——只装给声明了 todo 工具的角色）。
+        if role.allowed_tools.iter().any(|t| t == "todo") {
+            runner = runner.with_todo_state(cli_todo_state());
+        }
+        with_session(runner)
     } else {
         with_session(
             AgentRunner::new(agent)
@@ -1653,6 +1669,17 @@ fn cli_session_id() -> String {
     format!("cli-{}", std::process::id())
 }
 
+/// CLI 会话级 todo 状态（对齐 UI 侧 `ChatController::todo_state`）：
+/// todo 工具 handler 读写，runner 的 TodoTracker 只读做运行中纠偏。
+/// 进程级 OnceLock = 一次 REPL 运行一份。
+fn cli_todo_state() -> latte_agent_core::todo::SharedTodoState {
+    static STATE: std::sync::OnceLock<latte_agent_core::todo::SharedTodoState> =
+        std::sync::OnceLock::new();
+    STATE
+        .get_or_init(latte_agent_core::todo::new_shared_todo_state)
+        .clone()
+}
+
 /// CLI REPL 的子会话存储，对齐 UI 的 `b.subsession_store`。
 ///
 /// UI 落 `<cwd>/.latte/ui-sessions/`；CLI 落 `<cwd>/.latte/cli-sessions/`
@@ -1967,6 +1994,32 @@ fn spawn_cli_workflow_event_consumer_with(
                         "📊 task_report {task_id} {result}: {}",
                         first_line_brief(&summary, 120)
                     ));
+                }
+                // `todo` 工具应用 ops 后的列表快照：紧凑一行（进度 + 当前项）。
+                Ok(ChatEvent::TodoUpdated { phases, .. }) => {
+                    let mut done = 0usize;
+                    let mut total = 0usize;
+                    let mut current: Option<&str> = None;
+                    for p in &phases {
+                        for t in &p.tasks {
+                            if t.status == "abandoned" {
+                                continue;
+                            }
+                            total += 1;
+                            match t.status.as_str() {
+                                "completed" => done += 1,
+                                "in_progress" if current.is_none() => current = Some(&t.content),
+                                _ => {}
+                            }
+                        }
+                    }
+                    match current {
+                        Some(c) => ui_emit(&format!(
+                            "📝 todo {done}/{total} · 当前: {}",
+                            first_line_brief(c, 80)
+                        )),
+                        None => ui_emit(&format!("📝 todo {done}/{total}")),
+                    }
                 }
                 Ok(_) => {}
                 // Lagged：事件产出快于消费，丢了几条无所谓——ask 是
@@ -3968,6 +4021,8 @@ mod tests {
             // 我们刚接进 CLI 的两个工具，产出必须让用户知道。
             "PlanProposed",
             "TaskReport",
+            // todo 列表快照（进度 + 当前项）。
+            "TodoUpdated",
             // 既有的。
             "ChoiceRequested",
             "WorkflowStep",
