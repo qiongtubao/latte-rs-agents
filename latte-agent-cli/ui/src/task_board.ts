@@ -14,6 +14,30 @@ import {
 } from "./api";
 import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse } from "./api";
 
+// ─── 看板任务快照（供看板外的展示层联动消费）─────────────────────
+// refresh() 每次轮询成功后发布一份快照；chat_impl 的 todo dock 据此
+// 给「已派发」的 todo 项点亮标记。不新增轮询 —— 快照只是看板现有
+// 轮询结果的镜像；看板没打开过快照为空（不点亮，保守方向）。
+let boardTasksSnapshot: TaskView[] = [];
+const boardTasksListeners = new Set<() => void>();
+
+/** 发布看板任务快照并通知订阅者（refresh 与测试共用入口）。 */
+export function publishBoardTasks(tasks: TaskView[]): void {
+  boardTasksSnapshot = tasks;
+  for (const fn of boardTasksListeners) fn();
+}
+
+/** 最近一份看板轮询快照；从未加载过时为空数组。 */
+export function getBoardTasksSnapshot(): TaskView[] {
+  return boardTasksSnapshot;
+}
+
+/** 订阅快照更新；返回退订函数。 */
+export function onBoardTasksUpdated(fn: () => void): () => void {
+  boardTasksListeners.add(fn);
+  return () => boardTasksListeners.delete(fn);
+}
+
 // ─── 状态机定义（纯数据/纯函数，单独可测） ─────────────────────────
 
 export interface StateMeta {
@@ -1234,6 +1258,7 @@ export function mountTaskBoard(opts: {
     try {
       tasks = await listTasks();
       loadedOnce = true;
+      publishBoardTasks(tasks);
       setStatus(`已加载 ${tasks.length} 个任务 · 每 ${POLL_INTERVAL_MS / 1000}s 自动刷新`);
       render();
       if (drawerTaskId) renderDrawer();

@@ -8,8 +8,9 @@ import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
-import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, countTodoPhases, currentTaskInPhases, subPhases, type TodoState } from "./todo_store";
-import { parentOptions } from "./task_board";
+import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, countTodoPhases, currentTaskInPhases, subPhases, subTodoIds, type TodoState } from "./todo_store";
+import { todoLinkedTask, type BoardTaskRef } from "./todo_board_link";
+import { parentOptions, getBoardTasksSnapshot, onBoardTasksUpdated } from "./task_board";
 import type { CodeRef } from "./host";
 interface UIBinding {
 
@@ -723,14 +724,35 @@ export function mountChat(opts: {
     abandoned: "✕",
   };
 
+  // ── 看板联动（展示层，不改状态）──────────────────────────────
+  // todo 项 content 与看板 in_progress 任务 title 高度相似时点亮
+  // 「已派发」标记（🔗 + 高亮），hover title 显示看板任务 id。
+  // 数据取自 task_board 轮询快照的镜像（getBoardTasksSnapshot），
+  // 不新增轮询；看板从未打开过快照为空 → 不点亮（保守方向）。
+  function boardInProgressTasks(): BoardTaskRef[] {
+    return getBoardTasksSnapshot()
+      .filter((t) => t.state === "in_progress")
+      .map((t) => ({ id: t.id, title: t.title }));
+  }
+
   function renderTodoCard(): void {
-    const text = todoSummaryLine(todoState);
+    let text = todoSummaryLine(todoState);
+    // 内联卡片只有一行摘要：当前活动项已派发时尾部加 🔗。
+    const cur = currentTask(todoState);
+    const linked = cur ? todoLinkedTask(cur.task.content, boardInProgressTasks()) : null;
+    if (linked) text = `${text} 🔗`;
+    let contentEl: HTMLElement | null = null;
     if (todoCardRow && todoCardRow.isConnected) {
-      const c = todoCardRow.querySelector(".content");
-      if (c) c.textContent = text;
-      return;
+      contentEl = todoCardRow.querySelector(".content");
+      if (contentEl) contentEl.textContent = text;
+    } else {
+      todoCardRow = addMessage({ kind: "status", content: text });
+      contentEl = todoCardRow.querySelector(".content");
     }
-    todoCardRow = addMessage({ kind: "status", content: text });
+    if (contentEl) {
+      if (linked) contentEl.title = `已派发: ${linked.id}`;
+      else contentEl.removeAttribute("title");
+    }
   }
 
   function removeSubTodoRow(subId: string): void {
@@ -819,12 +841,23 @@ export function mountChat(opts: {
     const chevron = document.createElement("span");
     chevron.className = "todo-dock-chevron";
     chevron.textContent = todoDockExpanded ? "▾" : "▸";
-    summary.append(title, curEl, chevron);
+    summary.append(title, curEl);
+    // 子会话分桶计数徽记（纯展示；子会话清单在消息流里按 sub_id 分行看）
+    const subCount = subTodoIds(todoState).length;
+    if (subCount > 0) {
+      const subsEl = document.createElement("span");
+      subsEl.className = "todo-dock-subs";
+      subsEl.textContent = `· ${subCount} 个子会话清单`;
+      subsEl.title = "delegate/workflow 子会话也有 todo 清单，在消息流里分行展示";
+      summary.appendChild(subsEl);
+    }
+    summary.appendChild(chevron);
 
     const body = todoDockBodyEl!;
     body.textContent = "";
     body.style.display = todoDockExpanded ? "" : "none";
     if (!todoDockExpanded) return;
+    const boardTasks = boardInProgressTasks();
     todoState.phases.forEach((phase, idx) => {
       const pc = countPhase(phase);
       const key = `${idx}:${phase.name}`;
@@ -862,6 +895,19 @@ export function mountChat(opts: {
           text.className = "todo-task-text";
           text.textContent = t.content;
           li.append(icon, text);
+          // 看板联动：pending/in_progress 项与看板 in_progress 任务
+          // title 高度相似 → 「已派发」点亮（🔗 + 高亮，hover 见任务 id）
+          if (t.status === "pending" || t.status === "in_progress") {
+            const linked = todoLinkedTask(t.content, boardTasks);
+            if (linked) {
+              li.classList.add("todo-task--linked");
+              li.title = `已派发: ${linked.id}`;
+              const badge = document.createElement("span");
+              badge.className = "todo-task-link-badge";
+              badge.textContent = "🔗";
+              li.appendChild(badge);
+            }
+          }
           ul.appendChild(li);
         }
         section.appendChild(ul);
@@ -2264,6 +2310,13 @@ export function mountChat(opts: {
   }
   ensurePlanModeToggle();
 
+  // 看板轮询快照更新时重绘 todo 点亮标记（订阅现有轮询的镜像，
+  // 不新增轮询）。dock 隐藏 / 卡片不存在时跳过，避免凭空建行。
+  onBoardTasksUpdated(() => {
+    if (todoCardRow) renderTodoCard();
+    if (todoDockEl && todoDockEl.style.display !== "none") renderTodoDock();
+  });
+
   let isPaused = false;
   function renderPauseButtons() {
     container.pauseBtn.disabled = isPaused;
@@ -3460,6 +3513,8 @@ export function mountChat(opts: {
           todoState = next;
           if (e.sub_id) {
             renderSubTodoCard(e.sub_id);
+            // dock 折叠态的「N 个子会话清单」徽记随分桶增减
+            renderTodoDock();
           } else {
             renderTodoCard();
             renderTodoDock();

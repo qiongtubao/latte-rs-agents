@@ -3,10 +3,18 @@
 //   1. 消息流里的紧凑 todo 卡「原地更新同一条」，不刷屏；
 //   2. composer 上方的 dock 仅在有 todo 时显示，折叠/展开交互；
 //   3. 回放（replayEvents）按最后一条 TodoUpdated 恢复状态；
-//   4. 子会话（sub_id 非空）清单被忽略；clear() 归零。
+//   4. 子会话（sub_id 非空）清单各自一条紧凑行；clear() 归零；
+//   5. 看板联动：todo 项与看板 in_progress 任务匹配时点亮「已派发」;
+//      dock 折叠态追加子会话计数徽记。
 import { describe, it, expect, beforeEach } from "vitest";
 import { mountChat } from "./chat_impl";
-import type { ChatEvent, TodoPhase } from "./api";
+import { publishBoardTasks } from "./task_board";
+import type { ChatEvent, TodoPhase, TaskView } from "./api";
+
+/** 构造看板任务（联动只读 id/title/state，其余字段用缺省占位）。 */
+function boardTask(id: string, title: string, state: string): TaskView {
+  return { id, title, state } as unknown as TaskView;
+}
 
 function makeBinding() {
   const el = <T extends HTMLElement>(tag: string) => document.createElement(tag) as unknown as T;
@@ -87,6 +95,8 @@ const twoPhases: TodoPhase[] = [
 describe("TodoUpdated 渲染", () => {
   beforeEach(() => {
     document.body.replaceChildren();
+    // 看板快照是模块级状态：每个用例先清空，避免跨用例串扰点亮断言。
+    publishBoardTasks([]);
   });
 
   it("内联卡片原地更新同一条 status 行", () => {
@@ -166,8 +176,10 @@ describe("TodoUpdated 渲染", () => {
     expect(rows[0].textContent).toBe("↳ 📝 子会话 sub-1 2/4 · 当前: 写 store");
     // 行带 data-sub-id（右键可「查看 subsession 日志」）
     expect((rows[0] as HTMLElement).dataset.subId).toBe("sub-1");
-    // 主会话没有 todo → dock 不出现
-    expect(document.querySelector(".todo-dock")).toBeNull();
+    // 主会话没有 todo → dock 保持隐藏（元素可能因徽记重渲已创建）
+    const dock = document.querySelector(".todo-dock") as HTMLElement | null;
+    expect(dock === null || dock.style.display === "none").toBe(true);
+    expect(document.querySelector(".todo-dock-subs")).toBeNull();
   });
 
   it("同一 sub_id 原地更新；不同 sub_id 各自一行；主/子互不干扰", () => {
@@ -214,5 +226,58 @@ describe("TodoUpdated 渲染", () => {
     const dock = document.querySelector(".todo-dock") as HTMLElement;
     expect(dock.style.display).toBe("none");
     expect(messagesEl.querySelectorAll(".message.status")).toHaveLength(0);
+  });
+
+  it("dock 折叠态追加子会话计数徽记", () => {
+    const { chat } = mount();
+    chat.handleEvent(todoEvent(twoPhases));
+    // 无子会话 → 无徽记
+    expect(document.querySelector(".todo-dock-subs")).toBeNull();
+    chat.handleEvent(todoEvent(twoPhases, "sub-1"));
+    chat.handleEvent(todoEvent(twoPhases, "sub-2"));
+    const badge = document.querySelector(".todo-dock-subs") as HTMLElement;
+    expect(badge.textContent).toBe("· 2 个子会话清单");
+    // 子会话清空后徽记收敛
+    chat.handleEvent(todoEvent([], "sub-1"));
+    chat.handleEvent(todoEvent([], "sub-2"));
+    expect(document.querySelector(".todo-dock-subs")).toBeNull();
+  });
+
+  it("看板联动：匹配的 todo 项点亮「已派发」，不匹配的不点亮", () => {
+    const { chat, messagesEl } = mount();
+    // 看板 in_progress 任务「实现 写 store 功能」匹配 todo「写 store」
+    // （包含关系）；非 in_progress 任务不参与点亮。
+    publishBoardTasks([
+      boardTask("LAT-42", "实现 写 store 功能", "in_progress"),
+      boardTask("LAT-7", "写 UI", "backlog"),
+    ]);
+    chat.handleEvent(todoEvent(twoPhases));
+    // 内联卡片：当前活动项已派发 → 尾部 🔗 + title 标任务 id
+    const card = messagesEl.querySelector(".message.status .content") as HTMLElement;
+    expect(card.textContent).toBe("📝 Todos 2/4 · 当前: 写 store 🔗");
+    expect(card.title).toBe("已派发: LAT-42");
+    // dock 展开态：匹配行加 todo-task--linked + 🔗 徽记；「写 UI」
+    // 虽与 backlog 任务同名，但非 in_progress → 不点亮
+    (document.querySelector(".todo-dock-summary") as HTMLButtonElement).click();
+    const tasks = document.querySelectorAll(".todo-phase")[1].querySelectorAll(".todo-task");
+    expect(tasks[0].classList.contains("todo-task--linked")).toBe(true);
+    expect((tasks[0] as HTMLElement).title).toBe("已派发: LAT-42");
+    expect(tasks[0].querySelector(".todo-task-link-badge")!.textContent).toBe("🔗");
+    expect(tasks[1].classList.contains("todo-task--linked")).toBe(false);
+  });
+
+  it("看板快照更新（轮询到达）会刷新点亮标记", () => {
+    const { chat, messagesEl } = mount();
+    chat.handleEvent(todoEvent(twoPhases));
+    const card = () => messagesEl.querySelector(".message.status .content") as HTMLElement;
+    expect(card().textContent).toBe("📝 Todos 2/4 · 当前: 写 store");
+    // 看板轮询到达，出现匹配的 in_progress 任务 → 卡片原地点亮
+    publishBoardTasks([boardTask("LAT-9", "写 store", "in_progress")]);
+    expect(card().textContent).toBe("📝 Todos 2/4 · 当前: 写 store 🔗");
+    expect(card().title).toBe("已派发: LAT-9");
+    // 任务移出 in_progress（快照为空）→ 标记熄灭
+    publishBoardTasks([]);
+    expect(card().textContent).toBe("📝 Todos 2/4 · 当前: 写 store");
+    expect(card().title).toBe("");
   });
 });

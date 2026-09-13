@@ -840,6 +840,24 @@ select {
 .todo-task--abandoned .todo-task-text {
   text-decoration: line-through;
 }
+/* 看板联动：todo 项与看板 in_progress 任务匹配 → 「已派发」点亮 */
+.todo-task--linked {
+  background: #ecfdf5;
+  border-left: 3px solid #10b981;
+  border-radius: 4px;
+  padding-left: 6px;
+  margin-left: -9px;
+}
+.todo-task-link-badge {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+}
+/* dock 折叠态的子会话计数徽记 */
+.todo-dock-subs {
+  color: #94a3b8;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 
 /* ─── side panels (drawers) ───────────────────────────────────── */
 
