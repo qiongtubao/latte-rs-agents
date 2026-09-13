@@ -591,6 +591,9 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_id: Option<String>,
     },
+    /// plan mode（只读规划模式）开关变化。UI 据此亮/灭徽章；事件进
+    /// 归档与回放，UI 刷新后徽章状态自然恢复。
+    PlanModeChanged { active: bool },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -632,6 +635,49 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_id: Option<String>,
     },
+}
+
+// ─── plan mode（只读规划模式） ─────────────────────────────────────
+
+/// plan mode 下保留的只读工具：探索（read/search/code_graph）、澄清
+/// （ask）、产出（plan）、进度自查（todo）。
+///
+/// `delegate` / `workflow` 刻意**不收**：specialist 角色可能带
+/// write/edit/bash，委派出去等于绕过只读沙箱（opencode 的 plan agent
+/// 同理只留只读 + plan 产出）。
+pub const PLAN_MODE_READONLY_TOOLS: &[&str] =
+    &["read", "search", "code_graph", "ask", "plan", "todo"];
+
+/// plan mode 的工具收敛：角色 allowlist ∩ 只读白名单。
+pub fn plan_mode_filter_tools(allowed: &[String]) -> Vec<String> {
+    allowed
+        .iter()
+        .filter(|t| PLAN_MODE_READONLY_TOOLS.contains(&t.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// plan mode 激活时追加到角色 system prompt 的引导段（build_runner
+/// 在过滤工具的同时挂上）。内联常量而非 md 文件：与
+/// `ground_truth_block` 同款「结构性事实注入」，不依赖 cwd 下的文件。
+/// `pub`：CLI 的 legacy REPL build_runner 也按同一段拼。
+pub const PLAN_MODE_PROMPT: &str = "\n\n## Plan mode（只读规划模式）\n\
+当前会话处于 plan mode：你只能做**只读**探索与方案设计。\
+变更类工具（write/edit/bash 等）在本模式下不可用——不要尝试调用它们，也不要假装调用过。\
+做完调研后，用 `plan` 工具把结构化任务清单提交给用户审批；审批通过前不要进入实现。\
+需要用户拍板时用 `ask`；进度跟踪用 `todo`。\n";
+
+/// plan mode 开关的唯一写入点（`ChatController::set_plan_mode` 与
+/// driver 内 `/planmode` 斜杠命令共用）：值变了才置位 + 广播
+/// [`ChatEvent::PlanModeChanged`]，同值幂等不重复发事件。
+fn set_plan_mode_flag(
+    plan_mode: &Arc<AtomicBool>,
+    event_tx: &broadcast::Sender<ChatEvent>,
+    active: bool,
+) {
+    if plan_mode.swap(active, Ordering::SeqCst) != active {
+        let _ = event_tx.send(ChatEvent::PlanModeChanged { active });
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1180,6 +1226,11 @@ pub struct ChatController {
     /// `PendingApproval`，ui-server 的任务导入置 `Approved`，driver
     /// 收到下一条用户消息复位 `Normal`。
     plan_stage: SharedPlanStage,
+    /// plan mode（只读规划模式）开关：CLI `/planmode` 与
+    /// `POST /api/chat/plan-mode` 翻转；driver 在**下一个 turn 边界**
+    /// 重建 runner（工具收敛到 [`PLAN_MODE_READONLY_TOOLS`]），与模型
+    /// 热更新同款「turn 边界生效」语义。
+    plan_mode: Arc<AtomicBool>,
     /// 会话级 todo 列表（见 [`crate::todo`]）：todo 工具 handler 读写，
     /// runner 的 TodoTracker 只读做运行中纠偏。与 plan_stage 同款
     /// 生命周期——controller = 一个会话。
@@ -1243,6 +1294,7 @@ impl ChatController {
             advisor_hints: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             last_user_input: Arc::new(parking_lot::Mutex::new(String::new())),
             plan_stage: Arc::new(parking_lot::RwLock::new(PlanStage::Normal)),
+            plan_mode: Arc::new(AtomicBool::new(false)),
             todo_state: crate::todo::new_shared_todo_state(),
             advisor_pause: AdvisorPauseGate::new(),
             last_failed_workflow: Arc::new(parking_lot::RwLock::new(None)),
@@ -1273,6 +1325,7 @@ impl ChatController {
         let turn_cancel_flag = self.turn_cancel_flag.clone();
         let advisor_hints = self.advisor_hints.clone();
         let plan_stage = self.plan_stage.clone();
+        let plan_mode = self.plan_mode.clone();
         let todo_state = self.todo_state.clone();
         let advisor_pause = self.advisor_pause.clone();
         let agent_pause_gate = self.agent_pause_gate.clone();
@@ -1322,6 +1375,7 @@ impl ChatController {
                 turn_cancel_flag,
                 advisor_hints,
                 plan_stage,
+                plan_mode,
                 todo_state,
                 advisor_pause,
                 agent_pause_gate,
@@ -1409,6 +1463,19 @@ impl ChatController {
     /// （置 `Approved`）；driver / 工具 handler 走内部共享句柄直接写。
     pub fn set_plan_stage(&self, stage: PlanStage) {
         *self.plan_stage.write() = stage;
+    }
+
+    /// 当前是否处于 plan mode（只读规划模式）。
+    pub fn is_plan_mode(&self) -> bool {
+        self.plan_mode.load(Ordering::SeqCst)
+    }
+
+    /// 翻转 plan mode 并广播 [`ChatEvent::PlanModeChanged`]（UI 徽章 +
+    /// 回放恢复）。工具收敛在**下一个 turn 边界**生效（driver 重建
+    /// runner），与模型热更新同款语义——运行中的 turn 不被打断。
+    /// 重复设置同一值是幂等空操作（不重发事件）。
+    pub fn set_plan_mode(&self, active: bool) {
+        set_plan_mode_flag(&self.plan_mode, &self.event_tx, active);
     }
 
     /// Clone of the event broadcast sender. Used by the AdvisorMonitor
@@ -1815,6 +1882,7 @@ async fn run_driver(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
@@ -1831,6 +1899,7 @@ async fn run_driver(
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
+            plan_mode,
             todo_state,
             advisor_pause,
             agent_pause_gate,
@@ -1846,6 +1915,7 @@ async fn run_driver(
             turn_cancel_flag,
             advisor_hints,
             plan_stage,
+            plan_mode,
             todo_state,
             advisor_pause,
             agent_pause_gate,
@@ -1884,6 +1954,7 @@ async fn run_multi_role_loop(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
@@ -2094,6 +2165,7 @@ async fn run_multi_role_loop(
             advisor_pause.clone(),
             &plan_stage,
             &todo_state,
+            plan_mode.load(Ordering::SeqCst),
             agent_pause_gate.clone(),
             config.stream_mode.clone(),
         )
@@ -2681,6 +2753,7 @@ async fn run_single_role_loop(
     turn_cancel_flag: Arc<AtomicBool>,
     advisor_hints: Arc<parking_lot::Mutex<std::collections::VecDeque<String>>>,
     plan_stage: SharedPlanStage,
+    plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
@@ -2719,6 +2792,7 @@ async fn run_single_role_loop(
         advisor_pause.clone(),
         &plan_stage,
         &todo_state,
+        plan_mode.load(Ordering::SeqCst),
         agent_pause_gate.clone(),
         config.stream_mode.clone(),
     )
@@ -2759,6 +2833,9 @@ async fn run_single_role_loop(
     let mut current_role = canonical_id;
     let mut current_tier = tier;
     let current_primary = config.primary_model_id.clone();
+    // 当前 runner 是按哪个 plan mode 建的：模式开关翻转后在**下一个
+    // turn 边界**重建 runner（工具收敛/恢复），见 Input 臂开头。
+    let mut runner_plan_mode = plan_mode.load(Ordering::SeqCst);
     // workflow 失败自动善后的累计次数（session 级）。用尽即转人工，
     // 见 [`default_max_auto_remediations`]。
     let mut auto_remediations: u32 = 0;
@@ -2833,7 +2910,27 @@ async fn run_single_role_loop(
                                 "/exit" | "/quit" => break,
                                 "/help" => {
                                     let _ = event_tx.send(ChatEvent::Status {
-                                        message: "Commands: /role <id>  /model <tier>  /roles  /clear  /status  /tools  /history  /save <file>  /load <file>  /help  /exit".into(),
+                                        message: "Commands: /role <id>  /model <tier>  /roles  /planmode [on|off]  /clear  /status  /tools  /history  /save <file>  /load <file>  /help  /exit".into(),
+                                    });
+                                }
+                                // plan mode（只读规划模式）：无参 = 翻转；
+                                // on/off 显式设定。广播 PlanModeChanged
+                                // （UI 徽章）；实际工具收敛在下一个 turn
+                                // 边界重建 runner 时生效（见 Input 臂开头）。
+                                "/planmode" => {
+                                    let cur = plan_mode.load(Ordering::SeqCst);
+                                    let next = match parts.get(1).map(|s| s.trim()) {
+                                        Some("on") => true,
+                                        Some("off") => false,
+                                        _ => !cur,
+                                    };
+                                    set_plan_mode_flag(&plan_mode, event_tx, next);
+                                    let _ = event_tx.send(ChatEvent::Status {
+                                        message: if next {
+                                            "[plan mode 已开启：只做只读探索与方案设计，产出走 plan 工具提交审批]".into()
+                                        } else {
+                                            "[plan mode 已关闭：恢复正常工具集]".into()
+                                        },
                                     });
                                 }
                                 "/roles" => {
@@ -2850,7 +2947,7 @@ async fn run_single_role_loop(
                                         continue;
                                     };
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, rid)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -2872,7 +2969,7 @@ async fn run_single_role_loop(
                                         Ok(new_tier) => {
                                             let role = current_role.clone();
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, _)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3118,6 +3215,22 @@ async fn run_single_role_loop(
                         }
 
                         let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
+                        // plan mode 翻转后的 **turn 边界重建**：模式与当前
+                        // runner 不一致时按同一角色/tier 重建（工具收敛到
+                        // 只读白名单或恢复完整集），历史整份搬过去——与
+                        // SwitchRole 臂同款做法。运行中的 turn 不打断。
+                        let mode_now = plan_mode.load(Ordering::SeqCst);
+                        if mode_now != runner_plan_mode {
+                            let history: Vec<Message> = runner.context().messages().to_vec();
+                            match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                Ok((mut new_runner, _)) => {
+                                    for m in history { new_runner.context_mut().push(m); }
+                                    runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
+                                    runner_plan_mode = mode_now;
+                                }
+                                Err(e) => { let _ = event_tx.send(error_event(&e, "rebuild runner for plan mode failed", None)); }
+                            }
+                        }
                         // plan 阶段门复位：新的用户消息 = 新的决策周期，
                         // 上一轮未批准的 plan 不再约束 delegate
                         //（同时销账它的弹窗补发）。丢弃不静默。
@@ -3194,7 +3307,7 @@ let usage_before = runner.total_usage().clone();
                             continue;
                         }
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, rid)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3209,7 +3322,7 @@ let usage_before = runner.total_usage().clone();
                     }
                     Some(ControllerInput::SwitchModel(new_tier)) => {
                         let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                             Ok((mut new_runner, _)) => {
                                 for m in history { new_runner.context_mut().push(m); }
                                 runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3287,6 +3400,10 @@ async fn build_runner(
     // 会话级 todo 状态共享句柄：透传给 `register_todo_tool`（读写 +
     // 广播 TodoUpdated）与 runner（TodoTracker 运行中纠偏）。
     todo_state: &crate::todo::SharedTodoState,
+    // plan mode（只读规划模式）：true 时角色 allowlist 收敛到
+    // [`PLAN_MODE_READONLY_TOOLS`]，并往 system prompt 追加只读引导段。
+    // 切换在 turn 边界生效（driver 重建 runner 时才重读）。
+    plan_mode: bool,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> AgentResult<(AgentRunner, String)> {
@@ -3346,6 +3463,14 @@ async fn build_runner(
         });
     }
     let mut role = role;
+
+    // plan mode：工具收敛到只读白名单 + system prompt 追加只读引导段。
+    // 放在 tool_usage_prompt 拼接**之前**，模型看到的工具协议清单与
+    // 实际注册表一致（不会出现"prompt 说有 write、调用时 ToolNotFound"）。
+    if plan_mode {
+        role.allowed_tools = plan_mode_filter_tools(&role.allowed_tools);
+        role.system_prompt.push_str(PLAN_MODE_PROMPT);
+    }
 
     // Append the tool-call protocol. Tool usage guidance (when/why/how,
     // available roles/workflows) lives in each tool's own description —
@@ -9991,6 +10116,7 @@ mod tests {
                 AdvisorPauseGate::new(),
                 &fresh_plan_stage(),
                 &crate::todo::new_shared_todo_state(),
+                false,
                 crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
             )
@@ -10003,9 +10129,162 @@ mod tests {
         }
     }
 
+    // ─── plan mode（只读规划模式） ─────────────────────────────────
+
     #[test]
-    fn default_max_delegates_respects_env_and_default() {
-        // env 缺失 → 0 = 不限制（改自旧默认 12：单 session 的
+    fn plan_mode_filter_keeps_readonly_drops_mutating_and_orchestration() {
+        let allowed: Vec<String> = [
+            "read", "write", "edit", "bash", "search", "code_graph", "ask", "plan", "todo",
+            "delegate", "workflow", "task_report", "generate_image",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let kept = plan_mode_filter_tools(&allowed);
+        for t in ["read", "search", "code_graph", "ask", "plan", "todo"] {
+            assert!(kept.iter().any(|k| k == t), "应保留 {t}");
+        }
+        for t in ["write", "edit", "bash", "delegate", "workflow", "task_report"] {
+            assert!(!kept.iter().any(|k| k == t), "应剔除 {t}");
+        }
+    }
+
+    #[test]
+    fn plan_mode_changed_serializes_externally_tagged() {
+        let ev = ChatEvent::PlanModeChanged { active: true };
+        let v = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(v, serde_json::json!({ "PlanModeChanged": { "active": true } }));
+        let back: ChatEvent = serde_json::from_value(v).expect("deserialize");
+        assert!(matches!(back, ChatEvent::PlanModeChanged { active: true }));
+    }
+
+    #[test]
+    fn set_plan_mode_broadcasts_only_on_change() {
+        let controller = ChatController::new(8);
+        let mut rx = controller.event_sender().subscribe();
+        controller.set_plan_mode(true);
+        match rx.try_recv().expect("PlanModeChanged") {
+            ChatEvent::PlanModeChanged { active } => assert!(active),
+            other => panic!("expected PlanModeChanged, got {other:?}"),
+        }
+        // 同值幂等：不重复发事件。
+        controller.set_plan_mode(true);
+        assert!(rx.try_recv().is_err(), "同值不应重发");
+        controller.set_plan_mode(false);
+        match rx.try_recv().expect("PlanModeChanged off") {
+            ChatEvent::PlanModeChanged { active } => assert!(!active),
+            other => panic!("expected PlanModeChanged, got {other:?}"),
+        }
+        assert!(controller.is_plan_mode() == false);
+    }
+
+    /// plan mode 下 build_runner 的工具表必须真的收敛（不是只改
+    /// prompt）：变更类（write/bash）与编排类（delegate）从注册表
+    /// 消失，只读 + plan/ask/todo 保留；同角色非 plan mode 全开对照。
+    #[tokio::test]
+    async fn build_runner_plan_mode_filters_to_readonly_tools() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        let server = wiremock::MockServer::start().await;
+        let model = ModelDef {
+            name: "stub".into(),
+            api: "openai".into(),
+            provider: "test".into(),
+            base_url: server.uri(),
+            api_key: "test-key".into(),
+            context_window: 32000,
+            max_tokens: 4096,
+            omit_max_tokens: false,
+            max_tokens_field: Default::default(),
+            prompt_cache: false,
+            prompt_cache_key: None,
+            supports_thinking: false,
+            supports_vision: false,
+            supports_image_generation: false,
+            cost_per_million_input: None,
+            cost_per_million_output: None,
+            tier: Some("standard".into()),
+            timeout_secs: None,
+        };
+        let merged = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![model],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [("planner".to_string(), RoleTemplate {
+                id: "planner".into(),
+                name: "planner".into(),
+                category: "execution".into(),
+                model_tier: "standard".into(),
+                model_chain: vec![],
+                prompt_file: None,
+                temperature: None,
+                tools: ["read", "write", "bash", "search", "plan", "ask", "todo", "delegate"]
+                    .iter().map(|s| s.to_string()).collect(),
+                icon: String::new(),
+                skills: vec![],
+                code_paths: vec![],
+                description: String::new(),
+            })]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let params = GenerateParams::default();
+
+        let build = |plan_mode: bool| {
+            let merged = &merged;
+            let resolver = &resolver;
+            let params = &params;
+            async move {
+                let (event_tx, _rx) = broadcast::channel(64);
+                build_runner(
+                    merged,
+                    resolver,
+                    params,
+                    "planner",
+                    ModelTier::Standard,
+                    None,
+                    &event_tx,
+                    std::path::Path::new("/tmp"),
+                    Arc::new(crate::subsession::SubsessionStore::new()),
+                    "ui-test",
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(parking_lot::Mutex::new(String::new())),
+                    None,
+                    AdvisorPauseGate::new(),
+                    &fresh_plan_stage(),
+                    &crate::todo::new_shared_todo_state(),
+                    plan_mode,
+                    crate::pause_gate::AgentPauseGate::new("test"),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+                .expect("build_runner")
+                .0
+            }
+        };
+
+        let tm_on = build(true).await.tool_manager().expect("tm").clone();
+        for t in ["read", "search", "plan", "ask", "todo"] {
+            assert!(tm_on.has(t), "plan mode 应保留 {t}");
+        }
+        for t in ["write", "bash", "delegate"] {
+            assert!(!tm_on.has(t), "plan mode 应剔除 {t}");
+        }
+
+        let tm_off = build(false).await.tool_manager().expect("tm").clone();
+        for t in ["read", "write", "bash", "plan", "delegate"] {
+            assert!(tm_off.has(t), "非 plan mode 应保留 {t}");
+        }
+    }
+
+    #[test]
+    fn default_max_delegates_respects_env_and_default() {        // env 缺失 → 0 = 不限制（改自旧默认 12：单 session 的
         // delegate 次数改由 wall-clock timeout 与死循环熔断兜底，
         // 不再用一个固定次数硬砍）。
         let _g = lock_env();

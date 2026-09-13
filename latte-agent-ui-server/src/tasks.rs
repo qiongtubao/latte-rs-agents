@@ -905,7 +905,11 @@ fn import_one(
 
 /// `POST /api/tasks/import` 的核心逻辑（可测）：顺序创建，首个失败即
 /// 返回 400 语义的错误（消息含失败任务的 title 与已创建的 id）。
-fn import_tasks_into(
+///
+/// `pub`：CLI（无 ui-server 进程）的 PlanProposed 导入闭环复用它——
+/// 见 [`import_tasks_standalone`]。两边写同一份 board.json，schema /
+/// id 分配（LAT-100 起）/ history 记录天然逐字一致，不存在第二份实现。
+pub fn import_tasks_into(
     store: &mut TaskStore,
     cwd: &Path,
     req: &ImportTasksRequest,
@@ -929,11 +933,35 @@ fn import_tasks_into(
     Ok(created)
 }
 
+/// 无 `UiBackend` 的导入入口（CLI 的 PlanProposed 导入闭环用）：
+/// 现 load 看板 → [`import_tasks_into`] → 全部落 `todo` → persist。
+/// 与 [`import_tasks`] 的差别只是没有 refine 父任务解析、plan 阶段门
+/// 批准与弹窗销账——那些要 session 句柄，CLI 调用方自己处理（销账走
+/// `latte_agent_core::choice::dismiss_prompt`）。
+///
+/// 并发说明：CLI 与 ui-server 同时跑时共享 `<cwd>/.latte/tasks/`，
+/// 本函数每次现 load 现写（单写者串行假设与 TaskStore 一致）；两个
+/// 进程同时导入的极端场景下 next_seq 以先落盘者为准、后写者覆盖
+/// board.json 元信息但任务文件不丢（按 id 一文件），重启后 load 会
+/// 重新归拢。tmp+rename 保证单文件不撕裂。
+pub fn import_tasks_standalone(cwd: &Path, req: &ImportTasksRequest) -> Result<Vec<String>, String> {
+    let mut store = TaskStore::load(cwd).map_err(|e| format!("load task board: {e}"))?;
+    let created = import_tasks_into(&mut store, cwd, req)?;
+    // 导入即进 todo（与 import_tasks 同语义）：执行与否由用户手动派发。
+    let now = now_ms();
+    for id in &created {
+        if let Some(t) = store.get_mut(id) {
+            t.set_state("todo", "import", Some("已导入，待派发".into()), now);
+        }
+        store.persist(id)?;
+    }
+    Ok(created)
+}
+
 pub async fn import_tasks(
     b: &UiBackend,
     req: ImportTasksRequest,
-) -> Result<ImportTasksResponse, ApiError> {
-    // 父任务三态解析：显式 parent_id（含 ""=显式根任务）优先；
+) -> Result<ImportTasksResponse, ApiError> {    // 父任务三态解析：显式 parent_id（含 ""=显式根任务）优先；
     // 缺省时按 session_id 查拆分会话映射（refine 登记，页面刷新不丢）。
     let mut req = req;
     match req.parent_id.as_deref().map(str::trim) {
@@ -2729,6 +2757,45 @@ mod tests {
         assert_eq!(a.id, "LAT-100");
         assert_eq!(b.id, "LAT-101");
         assert_eq!(store.meta().next_seq, 102);
+    }
+
+    /// CLI 导入闭环的写读往返：`import_tasks_standalone`（无 UiBackend
+    /// 入口）写出的 board.json + 任务文件，TaskStore 重新 load 回来
+    /// 必须逐项一致——id 从 LAT-100 起、初始状态 todo（含 backlog→
+    /// todo 两条 history）、子任务树随根创建、next_seq 推进。
+    #[test]
+    fn import_tasks_standalone_round_trips_through_task_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                { "title": "实现 ringbuf 读写", "priority": 2, "labels": ["core"],
+                  "paths": ["src/"],
+                  "subtasks": [{ "title": "补单测" }] },
+                { "title": "写 README" }
+            ]
+        }))
+        .expect("parse req");
+        let created = import_tasks_standalone(cwd, &req).expect("import");
+        assert_eq!(created, vec!["LAT-100", "LAT-101", "LAT-102"], "父先于子、深度优先");
+
+        // 重新 load（模拟另一个进程/重启后读同一份文件）。
+        let store = TaskStore::load(cwd).expect("reload");
+        assert_eq!(store.meta().next_seq, 103);
+        let t0 = store.get("LAT-100").expect("LAT-100");
+        assert_eq!(t0.state, "todo", "导入即进 todo");
+        assert_eq!(t0.priority, 2);
+        assert_eq!(t0.paths, vec!["src/".to_string()]);
+        // history：创建（backlog）+ 导入落 todo 两条。
+        assert_eq!(t0.history.len(), 2, "history: {:?}", t0.history);
+        assert_eq!(t0.history[0].to, "backlog");
+        assert_eq!(t0.history[1].from.as_deref(), Some("backlog"));
+        assert_eq!(t0.history[1].to, "todo");
+        // 子任务挂在根任务下。
+        let t1 = store.get("LAT-101").expect("LAT-101");
+        assert_eq!(t1.parent_id.as_deref(), Some("LAT-100"));
+        assert_eq!(t1.title, "补单测");
+        assert!(store.get("LAT-102").expect("LAT-102").parent_id.is_none());
     }
 
     /// P1 回归（实测实录）：拆分 workflow 失败必须回写看板。

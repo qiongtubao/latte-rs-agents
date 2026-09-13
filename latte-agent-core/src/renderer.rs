@@ -200,8 +200,7 @@ pub trait ChatRenderer: Send + Sync {
             }
             // todo 工具应用 ops 后的列表快照：紧凑一行（进度 + 当前项），
             // web UI 渲染完整面板。
-            ChatEvent::TodoUpdated { phases, .. } => {
-                let mut done = 0usize;
+            ChatEvent::TodoUpdated { phases, .. } => {                let mut done = 0usize;
                 let mut total = 0usize;
                 let mut current: Option<&str> = None;
                 for p in phases {
@@ -222,6 +221,15 @@ pub trait ChatRenderer: Send + Sync {
                     None => format!("📝 todo {done}/{total}"),
                 };
                 self.on_status(&line).await;
+            }
+            // plan mode 开关：CLI 打一行状态，web UI 亮/灭徽章。
+            ChatEvent::PlanModeChanged { active } => {
+                self.on_status(if *active {
+                    "📐 plan mode 已开启（只读规划，产出走 plan 审批）"
+                } else {
+                    "📐 plan mode 已关闭"
+                })
+                .await;
             }
         }
     }

@@ -290,6 +290,7 @@ impl ChatCmd {
             // Legacy single-role REPL — no HIL session.
             None,
             &std::env::current_dir()?,
+            false,
         )
         .await
         {
@@ -331,6 +332,7 @@ impl ChatCmd {
             last_response: None,
             turn_count: 0,
             debug_flags: debug_flags.clone(),
+            plan_mode: false,
             renderer: self.output.renderer(),
         };
         // If --resume was passed, load the saved history into the
@@ -494,6 +496,10 @@ struct ChatSession {
     turn_count: u32,
     last_response: Option<String>,
     debug_flags: super::DebugFlags,
+    /// plan mode（只读规划模式）：`/planmode` 翻转；翻转后**立即**
+    /// 用过滤后的工具集重建 runner（CLI 是逐命令同步循环，没有
+    /// 「turn 边界」可等——重建点即下一次 run_turn 之前）。
+    plan_mode: bool,
     /// 渲染器：把事件转成 CLI 文本或 JSON Lines 输出。
     /// 调用方决定使用哪个具体实现。
     renderer: Box<dyn latte_agent_core::renderer::ChatRenderer>,
@@ -674,6 +680,31 @@ impl ChatSession {
         }
     }
 
+    /// 按当前 role/tier/plan_mode 重建 runner（历史整份搬过去）。
+    /// `/planmode` 翻转后调用；与 `/role`、`/model` 的重建同款做法。
+    async fn rebuild_runner(&mut self) -> AnyResult<()> {
+        let history: Vec<Message> = self.runner.context().messages().to_vec();
+        let (mut runner, rid) = build_runner(
+            &self.merged,
+            &self.resolver,
+            &self.default_params,
+            &self.role_id,
+            self.tier,
+            self.primary_id.as_deref(),
+            &self.debug_flags,
+            None,
+            &std::env::current_dir()?,
+            self.plan_mode,
+        )
+        .await?;
+        for m in history {
+            runner.context_mut().push(m);
+        }
+        self.runner = runner;
+        self.role_id = rid;
+        Ok(())
+    }
+
     async fn handle_command(&mut self, line: &str) -> AnyResult<bool> {
         // Returns `Ok(true)` when the REPL should exit.
         let mut parts = line.split_whitespace();
@@ -684,6 +715,37 @@ impl ChatSession {
             "/exit" | "/quit" => return Ok(true),
             "/help" => {
                 print_help();
+            }
+            // plan mode（只读规划模式）：无参 = 翻转；on/off 显式设定。
+            // 翻转后立即重建 runner（工具收敛到只读白名单 +
+            // prompt 引导段）；plan 工具提交提案后模式保持不变，
+            // 等用户批准后手动 `/planmode off` 退出（与 UI 的
+            // POST /api/chat/plan-mode 同语义）。
+            "/planmode" => {
+                let next = match rest.first().map(|s| s.trim()) {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => !self.plan_mode,
+                };
+                if next != self.plan_mode {
+                    self.plan_mode = next;
+                    match self.rebuild_runner().await {
+                        Ok(()) => ui_println!(
+                            "{}",
+                            if next {
+                                "[plan mode 已开启：只读探索 + plan 提交审批；/planmode off 退出]"
+                            } else {
+                                "[plan mode 已关闭：恢复正常工具集]"
+                            }
+                        ),
+                        Err(e) => {
+                            self.plan_mode = !next; // 回滚：状态与 runner 保持一致
+                            ui_println!("plan mode 切换失败（runner 重建）：{e}");
+                        }
+                    }
+                } else {
+                    ui_println!("plan mode 当前{}", if next { "已开启" } else { "已关闭" });
+                }
             }
             // 任务看板（对齐 UI 的 GET /api/tasks）。
             //
@@ -861,6 +923,8 @@ impl ChatSession {
                     // Legacy /role switch — no HIL session.
                     None,
                     &std::env::current_dir()?,
+                    // 切角色保留 plan mode：模式是会话级状态，不随角色走。
+                    self.plan_mode,
                 )
                 .await
                 {
@@ -920,6 +984,7 @@ impl ChatSession {
                             // Legacy /model switch — no HIL session.
                             None,
                             &std::env::current_dir()?,
+                            self.plan_mode,
                         )
                         .await
                         {
@@ -1104,6 +1169,10 @@ async fn build_runner(
     // Working directory the runner should treat as ground truth for
     // system-prompt env injection (matches the process's actual cwd).
     cwd: &std::path::Path,
+    // plan mode（只读规划模式）：true 时角色 allowlist 收敛到只读
+    // 白名单（`plan_mode_filter_tools`），并往 system prompt 追加
+    // 只读引导段。与 controller 的 build_runner 同款语义。
+    plan_mode: bool,
 ) -> AnyResult<(AgentRunner, String)> {
     let template = merged
         .roles
@@ -1111,6 +1180,12 @@ async fn build_runner(
         .ok_or_else(|| format!("role '{}' not found", role_id))?
         .clone();
     let mut role = template.resolve(default_params).await?;
+    if plan_mode {
+        role.allowed_tools =
+            latte_agent_core::controller::plan_mode_filter_tools(&role.allowed_tools);
+        role.system_prompt
+            .push_str(latte_agent_core::controller::PLAN_MODE_PROMPT);
+    }
      let models = if let Some(id) = primary_id {
         // `-m` flag: pin the head of the chain to a specific model
         // (matched by `id` first, then by `name` case-insensitive, so
@@ -1979,14 +2054,12 @@ fn spawn_cli_workflow_event_consumer_with(
                         "⏳ [{role_id}] 已跑 {elapsed_secs}s（软超时 {soft_timeout_secs}s，硬中止 {hard_timeout_secs}s）"
                     ));
                 }
-                // `plan` 工具提交的任务候选。CLI 没有勾选弹窗，但至少要
-                // 让用户知道产出了什么、去哪看——否则 manager 调了 plan
-                // 而用户毫无感知（我刚把这个工具接进 CLI）。
+                // `plan` 工具提交的任务候选。CLI 没有勾选弹窗——打印
+                // 编号清单并询问导入哪些（全导入/编号选择/跳过），选中
+                // 的直接写进 <cwd>/.latte/tasks/（与 ui-server 同一份
+                // board.json，见 task_import 闭环）。
                 Ok(ChatEvent::PlanProposed { role_id, plan_id, tasks }) => {
-                    ui_emit(&format!(
-                        "📋 [{role_id}] 提交 {} 个任务候选（{plan_id}）；在 UI 弹窗勾选导入，或看 .latte/tasks/",
-                        tasks.len()
-                    ));
+                    cli_plan_proposed_import(&role_id, &plan_id, &tasks).await;
                 }
                 // `task_report` 工具的回报（同上，CLI 侧新接的工具）。
                 Ok(ChatEvent::TaskReport { task_id, result, summary, .. }) => {
@@ -2150,6 +2223,108 @@ fn parse_choice_indices(input: &str, n: usize, multi: bool) -> Option<Vec<usize>
         }
     }
     Some(out)
+}
+
+/// CLI 的 PlanProposed 导入闭环：打印编号清单，询问导入哪些（`a` 全
+/// 导入 / 编号如 `1,3` / `s` 或空行跳过），选中的写进
+/// `<cwd>/.latte/tasks/`（复用 ui-server 的 `import_tasks_standalone`，
+/// 与 UI 弹窗导入写同一份 board.json，schema/id 规则/history 一致）。
+///
+/// 非交互场景（管道喂输入、--output json、无 TTY）：只打印清单 +
+/// 提示，**不读 stdin**（否则会把管道里给 REPL 的下一行偷来当答案）。
+///
+/// 编号选中的是**根任务**；其子任务树随根一起导入（与 UI 勾选语义
+/// 一致：UI 弹窗勾选根任务同样带上整棵子树）。
+async fn cli_plan_proposed_import(
+    role_id: &str,
+    plan_id: &str,
+    tasks: &[latte_agent_core::controller::PlanTask],
+) {
+    let mut rendered = format!("\n📋 [{role_id}] 提交 {} 个任务候选（{plan_id}）：\n", tasks.len());
+    for (i, t) in tasks.iter().enumerate() {
+        rendered.push_str(&format!("  {}) {}\n", i + 1, t.title));
+        for sub in &t.subtasks {
+            rendered.push_str(&format!("     - {}\n", sub.title));
+        }
+    }
+    // 非交互：stdin 不是终端且分离 UI 未起（管道 / --output json）——
+    // 打印提示就返回，绝不 read（read 会偷走管道里给 REPL 的下一行）。
+    if !io::stdin().is_terminal() && split_ui().lock().is_none() {
+        rendered.push_str("  （非交互终端：未导入。稍后可在 UI 看板弹窗勾选，或交互式 chat 里重跑）");
+        ui_emit(&rendered);
+        return;
+    }
+    rendered.push_str("  导入哪些？a=全导入，或编号（如 1,3），s/空行=跳过\n");
+    ui_emit(&rendered);
+
+    let line = match read_user_line("import › ").await {
+        Ok(Some(l)) => l,
+        // EOF / 读不到：按跳过处理（不阻塞）。
+        _ => {
+            ui_emit("  （读不到输入，已跳过导入；任务仍在 .latte/tasks 之外的提案里，可在 UI 导入）");
+            return;
+        }
+    };
+    let trimmed = line.trim();
+    let lower = trimmed.to_lowercase();
+    let picked: Option<Vec<usize>> = match lower.as_str() {
+        "" | "s" | "skip" | "跳过" | "n" | "no" => None,
+        "a" | "all" | "全" | "全部" => Some((0..tasks.len()).collect()),
+        _ if is_known_command(trimmed) => {
+            // 与 ask 同款防护：等待导入回答时斜杠命令会被当成答案吞掉。
+            ui_emit(&format!(
+                "⚠️ `{trimmed}` 看起来是命令而不是导入选择，已跳过本次导入（清单可从 UI 弹窗导入）。"
+            ));
+            return;
+        }
+        _ => match parse_choice_indices(trimmed, tasks.len(), true) {
+            Some(idx) => Some(idx),
+            None => {
+                ui_emit("  （无法识别的输入，已跳过导入；输入 a 全导入、编号选择、或 s 跳过）");
+                return;
+            }
+        },
+    };
+    let Some(indices) = picked else {
+        ui_emit("  已跳过导入。");
+        return;
+    };
+
+    // PlanTask → ImportTask 走 serde 往返：两边字段名/别名一致
+    // （ImportTask 除 title 外全有 default），避免第二份结构定义漂移。
+    let mut items = Vec::with_capacity(indices.len());
+    for i in indices {
+        let v = serde_json::to_value(&tasks[i]).expect("PlanTask serialize");
+        match serde_json::from_value::<latte_agent_ui_server::tasks::ImportTask>(v) {
+            Ok(it) => items.push(it),
+            Err(e) => {
+                ui_emit(&format!("  ✗ 任务 {:?} 转换失败：{e}（整批未导入）", tasks[i].title));
+                return;
+            }
+        }
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let req = latte_agent_ui_server::tasks::ImportTasksRequest {
+        tasks: items,
+        plan_id: Some(plan_id.to_string()),
+        parent_id: None,
+        session_id: None,
+    };
+    match latte_agent_ui_server::tasks::import_tasks_standalone(&cwd, &req) {
+        Ok(created) => {
+            // 清单已导入 = 弹窗已处理：从补发表销账（与 ui-server 的
+            // import_tasks 同款收尾），否则重连又弹一遍。
+            latte_agent_core::choice::dismiss_prompt(plan_id);
+            ui_emit(&format!(
+                "  ✅ 已导入 {} 个任务进看板（{}），状态 todo 待派发；`/tasks` 查看",
+                created.len(),
+                created.join(", ")
+            ));
+        }
+        Err(e) => {
+            ui_emit(&format!("  ✗ 导入失败：{e}（任务未写入看板）"));
+        }
+    }
 }
 
 /// Register the `workflow` tool so roles that declare it (manager) can
@@ -2771,6 +2946,7 @@ fn print_help() {
          /stream [on|off]     Toggle streaming output\n\
          /fork [file]         Export a resumable snapshot (forks the session)\n\
          /tasks               List the task board\n\
+         /planmode [on|off]   Toggle plan mode (read-only planning; output via plan approval)\n\
          /wf <name> <topic>   Run a named workflow directly\n\
          /wf-runs             List resumable workflow checkpoints\n\
          /wf-resume <wf_id>   Resume a failed workflow from its checkpoint\n\
@@ -3117,6 +3293,7 @@ fn is_known_command(line: &str) -> bool {
         "/exit", "/quit", "/help", "/roles", "/role", "/model", "/status", "/tools",
         "/clear", "/history", "/save", "/load", "/pause", "/resume", "/cancel",
         "/pending", "/stream", "/fork", "/tasks", "/wf", "/wf-runs", "/wf-resume",
+        "/planmode",
     ];
     let head = line.split_whitespace().next().unwrap_or("");
     CMDS.contains(&head)
@@ -3476,6 +3653,41 @@ mod tests {
         Arc::new(move |_req: AskRequest| {
             Box::pin(async move { answer.map(|s| s.to_string()) })
         })
+    }
+
+    /// PlanTask → ImportTask 的 serde 往返转换（CLI 导入闭环用）：
+    /// 字段名/别名两边一致，子任务树与 paths 必须保真。
+    #[test]
+    fn plan_task_converts_to_import_task_losslessly() {
+        let pt = latte_agent_core::controller::PlanTask {
+            title: "实现 ringbuf 读写".into(),
+            description: "核心结构 + 边界条件".into(),
+            priority: Some(1),
+            labels: vec!["core".into()],
+            task_type: Some("feature".into()),
+            workflow: None,
+            paths: vec!["src/".into()],
+            subtasks: vec![latte_agent_core::controller::PlanTask {
+                title: "补单测".into(),
+                description: String::new(),
+                priority: None,
+                labels: vec![],
+                task_type: None,
+                workflow: None,
+                paths: vec![],
+                subtasks: vec![],
+            }],
+        };
+        let v = serde_json::to_value(&pt).expect("serialize PlanTask");
+        let it: latte_agent_ui_server::tasks::ImportTask =
+            serde_json::from_value(v).expect("deserialize ImportTask");
+        assert_eq!(it.title, "实现 ringbuf 读写");
+        assert_eq!(it.priority, Some(1));
+        assert_eq!(it.labels, vec!["core".to_string()]);
+        assert_eq!(it.paths, vec!["src/".to_string()]);
+        assert_eq!(it.subtasks.len(), 1);
+        assert_eq!(it.subtasks[0].title, "补单测");
+        assert_eq!(it.subtasks[0].priority, None);
     }
 
     /// 核心回归：阻塞式 ask 必须被终端消费者回答，工具调用得以继续。
@@ -4217,7 +4429,7 @@ mod tests {
 
         for cmd in [
             "/pause", "/resume", "/cancel", "/pending", "/stream", "/fork", "/tasks",
-            "/wf", "/wf-runs", "/wf-resume",
+            "/wf", "/wf-runs", "/wf-resume", "/planmode",
         ] {
             assert!(
                 help_body.contains(cmd),
@@ -4512,6 +4724,9 @@ async fn run_hil_chat(
             &debug_flags,
             session_arg,
             &std::env::current_dir()?,
+            // HIL 多角色 chat 不接 plan mode（会话级开关在 controller /
+            // 单角色 REPL；多角色轮值模式没有对应 UX）。
+            false,
         )
         .await?;
         // Wire the per-role inject queue drain path. With

@@ -1441,6 +1441,24 @@ pub async fn chat_switch_role(
     Ok(())
 }
 
+/// `POST /api/chat/plan-mode`：开关 session 的 plan mode（只读规划
+/// 模式）。工具收敛在下一个 turn 边界生效；开关变化经
+/// `ChatEvent::PlanModeChanged` 广播给 UI 徽章。
+pub async fn chat_set_plan_mode(
+    b: &UiBackend,
+    session_id: Option<&str>,
+    active: bool,
+) -> Result<(), ApiError> {
+    let h = resolve_session(b, session_id)?;
+    h.touch();
+    let controller = h
+        .controller_or_spawn()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
+    controller.set_plan_mode(active);
+    Ok(())
+}
+
 /// `POST /api/chat/cancel-turn`：只打断当前正在跑的 turn（用户从
 /// `TimeoutWarning` 弹窗里点了「终止当前任务」）。不退出 session，
 /// 不删落盘文件；下一次用户输入照常接收。
