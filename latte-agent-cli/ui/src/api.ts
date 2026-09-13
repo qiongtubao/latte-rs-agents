@@ -270,9 +270,13 @@ export type ChatEvent =
       wait?: boolean;
     }
   // todo 工具调用完成后广播的全量 todo 清单（整表替换；空 phases =
-  // 列表被清空）。不变量：至多一个 in_progress。UI 侧只展示主会话
-  // （sub_id 为空）的清单，子会话的暂不归组展示。
-  | { type: "TodoUpdated"; phases: TodoPhase[]; sub_id?: string | null };
+  // 列表被清空）。不变量：至多一个 in_progress。主会话 sub_id 为空；
+  // delegate/workflow 子会话带 sub_id（各自独立清单，UI 分行展示）。
+  | { type: "TodoUpdated"; phases: TodoPhase[]; sub_id?: string | null }
+  // plan mode（只读规划模式）开关：active=true 时模型侧工具收敛为只读
+  // （read/search/ask/plan/todo 等），产出是 plan 提案走 PlanProposed
+  // 审批流。回放历史里也有此事件，取最后一条恢复状态。
+  | { type: "PlanModeChanged"; active: boolean };
 export interface SelfLoopEvent {
   kind: "started" | "iteration" | "log" | "screenshot" | "done" | "error";
   iteration: number;
@@ -646,6 +650,14 @@ export async function switchRole(role_id: string): Promise<void> {
  *  运行时切换，对当前 session 立即生效。 */
 export async function setStreamMode(stream: boolean): Promise<void> {
   await getTransport().request("POST", "/api/chat/stream-mode", chatBody({ stream }));
+}
+
+/** 切换 plan mode（只读规划模式）：`active=true` 时模型侧工具收敛为
+ *  只读（read/search/ask/plan/todo 等），产出是 plan 提案走
+ *  PlanProposed 审批流。成功 202；后端广播 `PlanModeChanged` 事件
+ *  驱动 UI 态（回放历史同样有此事件）。 */
+export async function setPlanMode(sessionId: string, active: boolean): Promise<void> {
+  await getTransport().request("POST", "/api/chat/plan-mode", { session_id: sessionId, active });
 }
 
 export async function listTraces(): Promise<TraceSummary[]> {

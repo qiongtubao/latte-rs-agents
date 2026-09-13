@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, setPlanMode, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
@@ -2207,6 +2207,63 @@ export function mountChat(opts: {
   // authoritative state is reconciled by the Paused/Resumed ChatEvents
   // (see the event handler below), so a click/event race still
   // converges to the correct enabled/disabled state.
+  // ── Plan mode（只读规划模式）─────────────────────────────────
+  // active 时模型侧工具被收敛为只读（read/search/ask/plan/todo 等），
+  // 产出走 PlanProposed 审批流。状态由 PlanModeChanged 事件驱动（回放
+  // 同路径，取最后一条恢复）；开关按钮只是发端点 —— 点击乐观翻转、
+  // 失败回滚（与 stream-toggle 同一模式），事件回声再做幂等校正。
+  // 两处可见标识：composer 下方 input-bar 的开关按钮（active 高亮）+
+  // 顶部状态栏的「Plan」徽章（持续可见，避免用户忘了模型是只读的）。
+  let planModeActive = false;
+  let planModeBtn: HTMLButtonElement | null = null;
+  let planModePill: HTMLElement | null = null;
+
+  function renderPlanMode(): void {
+    if (planModeBtn) {
+      planModeBtn.classList.toggle("active", planModeActive);
+      planModeBtn.textContent = planModeActive ? "📐 Plan ✓" : "📐 Plan";
+    }
+    if (planModePill) planModePill.style.display = planModeActive ? "" : "none";
+  }
+
+  function applyPlanMode(active: boolean): void {
+    planModeActive = active;
+    renderPlanMode();
+  }
+
+  function ensurePlanModeToggle(): void {
+    if (planModeBtn) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "input-bar-action plan-mode-toggle";
+    btn.title = "Plan mode（只读规划模式）：开启后模型只能读代码/搜索/提问/提计划，产出计划提案走审批流；再点一次关闭";
+    btn.addEventListener("click", () => void togglePlanMode());
+    const bar = container.formEl.querySelector(".input-bar-actions");
+    (bar ?? container.formEl).appendChild(btn);
+    planModeBtn = btn;
+    const pill = document.createElement("span");
+    pill.className = "pill plan-mode-pill";
+    pill.textContent = "📐 Plan";
+    pill.title = "plan mode 进行中：模型处于只读规划模式";
+    pill.style.display = "none";
+    const topbar = container.statusPill.parentElement;
+    if (topbar) topbar.appendChild(pill);
+    planModePill = pill;
+    renderPlanMode();
+  }
+
+  async function togglePlanMode(): Promise<void> {
+    const next = !planModeActive;
+    applyPlanMode(next); // 乐观翻转；后端随后广播 PlanModeChanged 幂等校正
+    try {
+      await setPlanMode(getCurrentSessionId() ?? "", next);
+    } catch (err) {
+      console.error("[chat] setPlanMode failed", err);
+      applyPlanMode(!next); // 失败回滚，避免 UI 与后端不一致
+    }
+  }
+  ensurePlanModeToggle();
+
   let isPaused = false;
   function renderPauseButtons() {
     container.pauseBtn.disabled = isPaused;
@@ -3411,6 +3468,21 @@ export function mountChat(opts: {
         resetWaitTimer();
         break;
       }
+      case "PlanModeChanged": {
+        // 只读规划模式开关（后端广播；回放同路径，取最后一条恢复）。
+        // 开关按钮/状态栏徽章随之翻转；留一条 status 行痕（同 Paused），
+        // 历史里能看出何时进出过 plan mode。
+        applyPlanMode(e.active);
+        addMessage({
+          kind: "status",
+          content: e.active
+            ? "[plan mode] 已开启：模型只读，产出计划提案走审批流"
+            : "[plan mode] 已关闭",
+        });
+        setFooter(e.active ? "plan mode 已开启（只读规划）" : "plan mode 已关闭");
+        resetWaitTimer();
+        break;
+      }
       case "ChoiceRequested": {
         // 去重：同一 choice_id 可能同时经 history 重放和挂起弹框补拉
         // 到达（SSE 新连接的 replay 前缀 + GET pending-prompts）。
@@ -3589,6 +3661,9 @@ export function mountChat(opts: {
     todoDockExpanded = false;
     todoPhaseCollapsed.clear();
     if (todoDockEl) renderTodoDock();
+    // plan mode 同属 session 状态：切 session 先归零，回放历史里的
+    // PlanModeChanged 会恢复到该 session 的真实状态。
+    applyPlanMode(false);
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {

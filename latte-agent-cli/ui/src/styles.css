@@ -682,6 +682,27 @@ select {
   border-color: #cbd5e1;
 }
 
+/* ─── plan mode（只读规划模式）开关与徽章 ───────────────────────
+   开关在 composer 下方 input-bar（/clear /quit 旁边）；激活时高亮。
+   徽章挂顶部状态栏，激活期间持续可见。 */
+.plan-mode-toggle.active {
+  background: #ede9fe;
+  border-color: #7c3aed;
+  color: #4c1d95;
+  font-weight: 600;
+}
+.plan-mode-toggle.active:hover {
+  background: #ddd6fe;
+  border-color: #7c3aed;
+  color: #4c1d95;
+}
+.plan-mode-pill {
+  background: #ede9fe;
+  border: 1px solid #c4b5fd;
+  color: #4c1d95;
+  font-weight: 600;
+}
+
 /* ─── todo dock（composer 上方的常驻 todo 面板）─────────────────
    仅当 todo 列表非空时显示（JS 控制 display）。折叠态一行：
    done/total + 当前活动项 + 展开箭头；展开态按 phase 分组。 */
