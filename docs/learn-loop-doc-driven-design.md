@@ -63,10 +63,12 @@ v2 把教学载体从"chat 消息"改为"**持续演化的 markdown 文档**"：
    新增协议。
 8. **ask 支持 `questions=[...]` 一次多题**（多题弹框已实现，收齐才返回），
    配合 `tool_call_limits = { ask = 1 }` 表达"一轮只弹一次窗"。
-9. **Web UI 无法渲染 md 文件**（无文档预览路由、无 mermaid）：v1 中文档以
-   "chat 消息里的路径 + 本轮要点摘要"呈现，学员在编辑器/终端里打开阅读；
-   编辑器宿主（latte-code-editor）下可走 `host.openDoc`（host.ts:42）。
-   内嵌 DocCard 事件 / 只读文档路由属于可选的后续增强（见 §8）。
+9. **Web UI 可内嵌预览 md 文档**（2026-09-14 起）：消息里的本地 `.md`
+   链接（`.latte/learn/`、`docs/` 白名单，经 /api/doc 只读路由）点击后
+   在弹窗里渲染全文（带 TOC）；图片经 /api/doc-asset 加载。学员也可以
+   在编辑器/终端里打开原文件；编辑器宿主（latte-code-editor）下可走
+   `host.openDoc`（host.ts:42）。DocCard 事件属于可选的后续增强（见 §8）。
+   （mermaid 已于 2026-09-14 支持：chat 内的 ```mermaid 围栏会渲染为 SVG。）
 10. **改 config/workflows/learn_loop.toml 必须同步 .latte/workflows.d/**
     （sync-config.sh；workflow.rs 里有 sync 测试强制），且
     `learn_loop_workflow_structure`（workflow.rs:6557）等结构测试要跟着改。
@@ -134,7 +136,9 @@ v2 把教学载体从"chat 消息"改为"**持续演化的 markdown 文档**"：
 `.latte/learn/<slug>/draft.md`，单文件、按 `doc_outline` 组织章节：
 
 - 每个知识点一节（标题 = `doc_section`），含 teach_points 展开、`file:line`
-  出处、代码摘录、必要的 ASCII / 文本流程图（UI 无 mermaid，图只能是代码块）。
+  出处、代码摘录、必要的流程图。结构图/调用图用 `code_graph(graph=…)` 从
+  索引/AST 生成（证据级、不编造符号）；概念性流程图手写 mermaid，节点名
+  必须来自取证过的真实符号。chat 与文档预览都把 ```mermaid 渲染为 SVG。
 - 答错增强：在对应章节内补充"易错点辨析"小节（正确项 vs 干扰项的区别）。
 - 学员补充：追加 `## 补充：<问题>` 章节。
 - 全程原地演进，**不产生多版本文件**——合并压力集中在 merge 步一次完成。
@@ -296,10 +300,13 @@ loop_back 路由触发，实线箭头是串行顺序，回边是循环路由。�
   （AnswerLog::recall 旁路）——落地后删掉题面后缀的 workaround，并修正
   config/prompts/tools/ask.md 的失实描述。
 - **DocCard 交互**：仿 PlanProposed/ToolFixRequested 加 ChatEvent 变体，卡片
-  显示文档路径+「开始答题」按钮（复用 choice-answer 路由）；Web 内预览需新增
-  受控只读文档路由（白名单 `.latte/learn/`、`docs/learn/`，仿 /api/images）。
-- **mermaid 渲染**：前端 renderMarkdown 目前无 mermaid，文档里的流程图在 chat
-  内只能显示代码块原文。
+  显示文档路径+「开始答题」按钮（复用 choice-answer 路由）。~~Web 内预览需新增
+  受控只读文档路由~~（已落地 2026-09-14：`/api/doc` + `/api/doc-asset`，
+  白名单 `.latte/learn/`、`docs/`；消息里的本地 md 链接点击即内嵌预览）。
+- ~~**mermaid 渲染**~~：已落地（2026-09-14）。renderMarkdown 换用
+  markdown-it，```mermaid 围栏输出占位 div，enhanceRenderedMarkdown
+  懒加载 mermaid 渲染为 SVG（securityLevel: strict），失败回退为代码块；
+  代码块同时获得 highlight.js 高亮与「复制」工具条（codeblock.ts）。
 
 ## 9. 实测验证记录（2026-09-13，tests/blackbox/learn_loop_e2e.py）
 
