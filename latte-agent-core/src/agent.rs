@@ -1680,9 +1680,13 @@ fn parallel_tool_calls_pref() -> Option<bool> {
 /// 而 MCP 服务器注册进来的工具、TOML 配出来的工具都可能没显式声明——信它
 /// 就等于让一个会写文件的外部工具默认获得并发资格。并发这件事应当
 /// deny-by-default，所以这里用显式白名单，`concurrency_safe` 只作为工具
-/// 自描述的文档。要加 `search` / `find` 这类同样无副作用的工具，往这张表
-/// 里加一项即可。
-const READONLY_PARALLEL_TOOLS: &[&str] = &["read", "code_graph"];
+/// 自描述的文档。
+///
+/// 注意白名单按**短名**匹配（见 [`short_tool_name`]）：MCP 工具若恰好叫
+/// `search`/`find` 等同名也会获得并发资格——这四个名字对应的内置实现都是
+/// 纯查询，同名外部工具若并非如此，应改名注册或改用全名命名空间区分。
+const READONLY_PARALLEL_TOOLS: &[&str] =
+    &["read", "code_graph", "search", "find", "grep", "fetch"];
 
 /// `name` 是否属于 [`READONLY_PARALLEL_TOOLS`]（按短名比较，容忍
 /// `namespace.read` 这类遗留全名）。
@@ -3994,7 +3998,8 @@ impl AgentRunner {
                 // ── Concurrent read-only fan-out ───────────────────────
                 //
                 // 同一响应里**连续**的多个只读工具调用（`read` /
-                // `code_graph`，见 [`READONLY_PARALLEL_TOOLS`]）并发执行，
+                // `code_graph` / `search` / `find` / `grep` / `fetch`，
+                // 见 [`READONLY_PARALLEL_TOOLS`]）并发执行，
                 // 其余调用保持原地串行。默认开，`LATTE_AGENT_READONLY_
                 // PARALLEL=0` 退回串行。
                 //
@@ -9364,6 +9369,21 @@ tools = ["read", "write"]
         assert_eq!(
             readonly_parallel_runs(&[c("fs.read"), c("graph.code_graph")]),
             vec![(0, 2)]
+        );
+        // 扩员后的只读表:search/find/grep/fetch 与 read 混合也成一段。
+        assert_eq!(
+            readonly_parallel_runs(&[c("search"), c("read"), c("grep"), c("fetch"), c("find")]),
+            vec![(0, 5)]
+        );
+        // 混合形状:fetch 已入表,read, fetch, read 不再被拆成三段串行。
+        assert_eq!(
+            readonly_parallel_runs(&[c("read"), c("fetch"), c("read")]),
+            vec![(0, 3)]
+        );
+        // 写类工具仍是屏障:edit/write/bash/delete 不成段。
+        assert_eq!(
+            readonly_parallel_runs(&[c("grep"), c("grep"), c("edit"), c("search"), c("search")]),
+            vec![(0, 2), (3, 5)]
         );
     }
 
