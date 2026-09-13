@@ -57,7 +57,7 @@ temperature = 0.5
 # `code_graph` / `search` 是 2026-09-07 补的：写手要核对源码引用，此前
 # 只能靠 bash 的 grep/sed 硬凑（实测一个子会话 50 次 bash 全在做取证，
 # 1.09M 输入 token）。一次 code_graph 抵几十次 grep。
-tools = ["read", "edit", "write", "search", "code_graph", "doc_write", "doc_index"]
+tools = ["read", "edit", "write", "search", "code_graph", "doc_write", "doc_index", "todo"]
 
 # Display emoji shown next to the role name in logs and transcripts.
 icon = "📝"

@@ -335,6 +335,23 @@ pub(crate) async fn switch_role(
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct PlanModeRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    active: bool,
+}
+
+pub(crate) async fn set_plan_mode(
+    State(state): State<AppState>,
+    Json(req): Json<PlanModeRequest>,
+) -> StatusCode {
+    match api::chat_set_plan_mode(&state.backend, req.session_id.as_deref(), req.active).await {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(_) => StatusCode::NOT_FOUND,
+    }
+}
+
 pub(crate) async fn chat_cancel_turn(
     State(state): State<AppState>,
     Json(req): Json<CancelTurnRequest>,

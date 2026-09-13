@@ -3090,6 +3090,8 @@ async fn build_role_runner(
         default_params.clone(),
     )
     .map_err(|e| format!("create agent '{role_id}': {e}"))?;
+    // 本 step 分派的会话级 todo 状态（仅当角色声明 todo 工具时建）。
+    let mut todo_state: Option<crate::todo::SharedTodoState> = None;
     let runner = if role.allowed_tools.is_empty() {
         AgentRunner::new(agent)
     } else {
@@ -3169,6 +3171,22 @@ async fn build_role_runner(
             )
             .map_err(|e| format!("register task_report for '{role_id}': {e}"))?;
         }
+        // todo：与 controller::build_runner 对齐——step 分派的子会话用
+        // **独立**状态（不共享父会话/并行兄弟 step 的清单），广播带
+        // sub_id 的 TodoUpdated；状态同时留给 runner 的 TodoTracker
+        // 纠偏（子代理同样有「做一半就停」的问题）。
+        if role.allowed_tools.iter().any(|t| t == "todo") {
+            let state = crate::todo::new_shared_todo_state();
+            crate::controller::register_todo_tool(
+                &rtm,
+                event_tx.clone(),
+                role_id.to_string(),
+                state.clone(),
+                sub_id.map(|s| s.to_string()),
+            )
+            .map_err(|e| format!("register todo for '{role_id}': {e}"))?;
+            todo_state = Some(state);
+        }
         // doc-graph 工具（scan/context/write/index）：与 controller::build_runner
         // 对齐，让带 doc_graph_* 工具的角色在 workflow 里也能维护图谱。
         {
@@ -3190,6 +3208,10 @@ async fn build_role_runner(
         .with_cwd(cwd.to_path_buf());
     if let Some(id) = sub_id {
         r = r.with_sub_id(id.to_string());
+    }
+    // TodoTracker 纠偏：只读本分派自己的 todo 状态（见上面注册点）。
+    if let Some(state) = todo_state {
+        r = r.with_todo_state(state);
     }
     if let Some(gate) = agent_pause_gate {
         r = r.with_agent_pause_gate(gate);
@@ -8471,6 +8493,115 @@ forbid = ["TBD"]
             runner.has_model_hot_reload(),
             "workflow step runner must hot-reload model chain on resume"
         );
+    }
+
+    /// workflow step 分派的子会话必须接到**有状态** todo 包装版：
+    /// 第二次调用不传 currentPhases 也能基于子会话状态推进（builtin
+    /// 纯函数版此时会报 "task not found"），且广播的 TodoUpdated 带
+    /// 本分派的 sub_id。runner 同时应装 TodoTracker 用的 todo_state。
+    #[tokio::test]
+    async fn build_role_runner_wires_stateful_todo_with_sub_id() {
+        let mut cfg = (*test_config_at("http://127.0.0.1:1")).clone();
+        cfg.roles
+            .get_mut("worker")
+            .unwrap()
+            .tools = vec!["todo".to_string()];
+        let config = Arc::new(cfg);
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, mut rx) = broadcast::channel(64);
+        let (runner, _resp) = build_role_runner(
+            "worker",
+            &config,
+            &resolver,
+            &GenerateParams::default(),
+            std::env::temp_dir().as_path(),
+            &event_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            &[],
+            None,
+            None,
+            Some("sub-wf-1"),
+        )
+        .await
+        .expect("worker runner");
+        assert!(runner.has_todo_state(), "step runner 应装 TodoTracker 状态");
+        let tm = runner.tool_manager().expect("tool manager").clone();
+
+        let out = tm
+            .execute(
+                "todo",
+                serde_json::json!({
+                    "ops": [{ "op": "init", "list": [{ "phase": "P", "items": ["A", "B"] }] }]
+                }),
+                None,
+            )
+            .await
+            .expect("todo init");
+        assert!(out.get("errors").is_none(), "init must succeed: {out}");
+        // 决定性判别：不传 currentPhases 的第二次调用。纯函数版状态
+        // 为空，done 会报 "task 'A' not found"；有状态包装版基于子会话
+        // 状态成功。
+        let out2 = tm
+            .execute(
+                "todo",
+                serde_json::json!({ "ops": [{ "op": "done", "task": "A" }] }),
+                None,
+            )
+            .await
+            .expect("todo done");
+        assert!(
+            out2.get("errors").is_none(),
+            "有状态包装版应基于子会话状态完成 done: {out2}"
+        );
+
+        // 每次成功应用都广播 TodoUpdated，sub_id = 本分派 id。
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::TodoUpdated { phases, sub_id } = ev {
+                seen.push((phases, sub_id));
+            }
+        }
+        assert_eq!(seen.len(), 2, "init + done 各广播一次: {seen:?}");
+        assert_eq!(seen[0].1.as_deref(), Some("sub-wf-1"));
+        assert_eq!(seen[1].1.as_deref(), Some("sub-wf-1"));
+        assert_eq!(seen[1].0[0].tasks[0].status, "completed");
+        assert_eq!(seen[1].0[0].tasks[1].status, "in_progress");
+    }
+
+    /// 角色没声明 todo 工具时：既不注册包装版（builtin 纯函数版也被
+    /// allowlist 滤掉），也不装 TodoTracker 状态。
+    #[tokio::test]
+    async fn build_role_runner_without_todo_tool_has_no_todo_wiring() {
+        let mut cfg = (*test_config_at("http://127.0.0.1:1")).clone();
+        cfg.roles
+            .get_mut("worker")
+            .unwrap()
+            .tools = vec!["read".to_string()];
+        let config = Arc::new(cfg);
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(64);
+        let (runner, _resp) = build_role_runner(
+            "worker",
+            &config,
+            &resolver,
+            &GenerateParams::default(),
+            std::env::temp_dir().as_path(),
+            &event_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            &[],
+            None,
+            None,
+            Some("sub-wf-2"),
+        )
+        .await
+        .expect("worker runner");
+        assert!(!runner.has_todo_state(), "未声明 todo 的角色不装 tracker");
+        let tm = runner.tool_manager().expect("tool manager");
+        assert!(!tm.has("todo"), "未声明 todo 的角色不应注册该工具");
     }
 
     // ─── 可选 speaker：引擎级（真跑 run_workflow，数真实模型请求）──

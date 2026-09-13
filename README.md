@@ -204,10 +204,10 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
 | `LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS` | 90 | advisor 对 delegate/workflow 返回做**单次审查**的超时（秒），钳在 `10..=600`。超时按「未审直接放行」降级，所以这是「一次审查值多少钱」的预算。实测事故：默认 90s 撞上常态 >120s 的慢模型，一个会话里 4 次静默放行——审查门禁形同虚设。也可写 `[advisor] delegate_review_timeout_secs`；若审查和干活共用慢模型池，要么调大，要么给 advisor 单独配快模型 |
 | `LATTE_AGENT_ADVISOR_RETURN_MAX_REDO` | 1 | workflow speaker 的返回被 advisor 判 intervene/terminate 时的**重做上限**（每次重做都是全新 subagent），钳到硬顶 3。也可写 `[advisor] return_max_redo` |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
-| `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph`）并发执行。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
-| `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 只读并发的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
+| `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph` / `search` / `find` / `grep` / `fetch`）并发执行（P1a 统一调度器：并行段滚动池 + exclusive 屏障）。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
+| `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 并行段滚动池的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
 | `LATTE_AGENT_PARALLEL_TOOL_CALLS` | 1（开） | 下发 OpenAI 协议的 `parallel_tool_calls`，显式声明"一条响应里可以发多个工具调用"。`0`/`false`/`off` → 下发 `false` 强制单调用；`omit` → 字段完全不下发（个别兼容端点不认它，如 litellm #22637 的 Bedrock Converse + Claude 4.5）。Anthropic 默认就允许并行，该路径不下发 |
-| `LATTE_AGENT_DELEGATE_PARALLEL` | 0（关） | 同一轮里 ≥2 个 `delegate` 调用并发派发。默认关：子 agent 会写文件，并发有真实竞态风险 |
+| `LATTE_AGENT_DELEGATE_PARALLEL` | 0（关） | 同一轮里的 `delegate` 调用进入并行段（与同批只读调用同池）。默认关：子 agent 会写文件，并发有真实竞态风险；开启后同路径写入由进程级 per-path 写锁互斥（write/edit/delete/ast_edit） |
 | `LATTE_AGENT_BLOCKING_CALLS_LAST` | 1（开） | 同一轮里**会停下来等人作答**的调用（`ask`、内部有 `ask` 步的 `workflow`）排到最后执行，同批其他派发调用先跑。设 `0`/`false`/`off` 退回严格按模型给出的下标串行 |
 
 ### 减少模型往返（read 批量读）

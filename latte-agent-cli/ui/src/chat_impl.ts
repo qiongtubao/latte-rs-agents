@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, type ImportTask, type ChoiceOption, type TaskView } from "./api";
+import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, setPlanMode, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
@@ -8,10 +8,12 @@ import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
-import { parentOptions } from "./task_board";
 import { renderMarkdown } from "./markdown";
 import { enhanceRenderedMarkdown } from "./codeblock";
 import { openDocViewer } from "./doc_viewer";
+import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, countTodoPhases, currentTaskInPhases, subPhases, subTodoIds, type TodoState } from "./todo_store";
+import { todoLinkedTask, type BoardTaskRef } from "./todo_board_link";
+import { parentOptions, getBoardTasksSnapshot, onBoardTasksUpdated } from "./task_board";
 import type { CodeRef } from "./host";
 
 export { renderMarkdown };
@@ -652,6 +654,229 @@ export function mountChat(opts: {
     if (isNearBottom()) scrollToBottom();
     return row;
   }
+
+  // ── Todo dock（todo 工具进度）────────────────────────────────
+  // 数据全部来自 todo store（TodoUpdated 事件驱动，不轮询）。渲染分两层：
+  //  1. 主会话（sub_id 空）：消息流紧凑卡片（同一条 status 行原地更新，
+  //     不每次追加气泡）+ composer 上方的常驻 dock（折叠一行 / 展开按
+  //     phase 分组；列表为空时隐藏）。
+  //  2. 子会话（sub_id 非空，delegate/workflow）：各自一条独立紧凑行
+  //     （`↳ 📝 <标识> 2/5 · 当前: xxx`），按 sub_id 原地更新；不进
+  //     dock，避免面板膨胀。主聊天没有现成的按 sub_id 归组容器（子会话
+  //     的 ToolUse 等都只进 subsession trace），故用独立行承载。
+  // 回放路径（replayEvents → handleEvent）走同一个 case，全量替换语义
+  // 下每个桶（主会话 / 各 sub_id）的最后一条 TodoUpdated 即恢复状态。
+  let todoState: TodoState = emptyTodoState();
+  /** 消息流里的紧凑 todo 卡（原地更新同一条）。 */
+  let todoCardRow: HTMLElement | null = null;
+  /** sub_id → 子会话 todo 紧凑行（原地更新）。 */
+  const subTodoRows = new Map<string, HTMLElement>();
+  let todoDockEl: HTMLElement | null = null;
+  let todoDockBodyEl: HTMLElement | null = null;
+  let todoDockExpanded = false;
+  /** 展开态里各 phase 的折叠覆盖：key = `${index}:${name}`；
+   *  缺省值 = 该 phase 是否全部完成（完成的默认收成一行）。 */
+  const todoPhaseCollapsed = new Map<string, boolean>();
+
+  const TODO_TASK_ICONS: Record<string, string> = {
+    completed: "✓",
+    in_progress: "•",
+    pending: "○",
+    abandoned: "✕",
+  };
+
+  // ── 看板联动（展示层，不改状态）──────────────────────────────
+  // todo 项 content 与看板 in_progress 任务 title 高度相似时点亮
+  // 「已派发」标记（🔗 + 高亮），hover title 显示看板任务 id。
+  // 数据取自 task_board 轮询快照的镜像（getBoardTasksSnapshot），
+  // 不新增轮询；看板从未打开过快照为空 → 不点亮（保守方向）。
+  function boardInProgressTasks(): BoardTaskRef[] {
+    return getBoardTasksSnapshot()
+      .filter((t) => t.state === "in_progress")
+      .map((t) => ({ id: t.id, title: t.title }));
+  }
+
+  function renderTodoCard(): void {
+    let text = todoSummaryLine(todoState);
+    // 内联卡片只有一行摘要：当前活动项已派发时尾部加 🔗。
+    const cur = currentTask(todoState);
+    const linked = cur ? todoLinkedTask(cur.task.content, boardInProgressTasks()) : null;
+    if (linked) text = `${text} 🔗`;
+    let contentEl: HTMLElement | null = null;
+    if (todoCardRow && todoCardRow.isConnected) {
+      contentEl = todoCardRow.querySelector(".content");
+      if (contentEl) contentEl.textContent = text;
+    } else {
+      todoCardRow = addMessage({ kind: "status", content: text });
+      contentEl = todoCardRow.querySelector(".content");
+    }
+    if (contentEl) {
+      if (linked) contentEl.title = `已派发: ${linked.id}`;
+      else contentEl.removeAttribute("title");
+    }
+  }
+
+  function removeSubTodoRow(subId: string): void {
+    const row = subTodoRows.get(subId);
+    if (!row) return;
+    // 与右键「删除消息」同一套清理：store 记录 + DOM 一起摘。
+    const idx = messageStore.findIndex((m) => m.el === row);
+    if (idx >= 0) messageStore.splice(idx, 1);
+    row.remove();
+    subTodoRows.delete(subId);
+  }
+
+  /** 子会话 todo 紧凑行：`↳ 📝 <标识> 2/5 · 当前: xxx`。标识优先用
+   *  activeDelegates 里的目标角色（delegate/workflow 分派可读到），
+   *  查不到（已结束的分派、旧归档回放）退成截断的 sub_id。行带
+   *  data-sub-id，右键可「查看 subsession 日志」。 */
+  function renderSubTodoCard(subId: string): void {
+    const phases = subPhases(todoState, subId);
+    const { done, total } = countTodoPhases(phases);
+    if (total === 0) {
+      removeSubTodoRow(subId);
+      return;
+    }
+    const role = activeDelegates.get(subId)?.targetRole;
+    const label = role ? `${roleIcon(role)} ${role}` : `子会话 ${subId.slice(0, 12)}`;
+    const cur = currentTaskInPhases(phases);
+    const tail = done === total ? "全部完成" : cur ? `当前: ${cur.task.content}` : "";
+    const text = `↳ 📝 ${label} ${done}/${total}${tail ? ` · ${tail}` : ""}`;
+    const existing = subTodoRows.get(subId);
+    if (existing && existing.isConnected) {
+      const c = existing.querySelector(".content");
+      if (c) c.textContent = text;
+      return;
+    }
+    subTodoRows.set(subId, addMessage({ kind: "status", content: text, subId }));
+  }
+
+  function ensureTodoDock(): void {
+    if (todoDockEl) return;
+    const dock = document.createElement("div");
+    dock.className = "todo-dock";
+    dock.style.display = "none";
+    const summary = document.createElement("button");
+    summary.type = "button";
+    summary.className = "todo-dock-summary";
+    summary.addEventListener("click", () => {
+      todoDockExpanded = !todoDockExpanded;
+      renderTodoDock();
+    });
+    const body = document.createElement("div");
+    body.className = "todo-dock-body";
+    dock.append(summary, body);
+    // dock 挂在 chat-form 前（composer 上方）；测试环境 form 未挂载进
+    // DOM 时保持游离，渲染逻辑照常（测试可直接断言 dock 内容）。
+    const host = container.formEl.parentElement;
+    if (host) host.insertBefore(dock, container.formEl);
+    todoDockEl = dock;
+    todoDockBodyEl = body;
+  }
+
+  function renderTodoDock(): void {
+    ensureTodoDock();
+    const dock = todoDockEl!;
+    const { done, total } = countTodos(todoState);
+    if (total === 0) {
+      dock.style.display = "none";
+      return;
+    }
+    dock.style.display = "";
+    dock.classList.toggle("expanded", todoDockExpanded);
+
+    const summary = dock.querySelector(".todo-dock-summary")!;
+    summary.textContent = "";
+    const title = document.createElement("span");
+    title.className = "todo-dock-title";
+    title.textContent = `📝 Todos ${done}/${total}`;
+    const curEl = document.createElement("span");
+    curEl.className = "todo-dock-current";
+    if (done === total) {
+      curEl.textContent = "全部完成";
+    } else {
+      const cur = currentTask(todoState);
+      curEl.textContent = cur ? `当前: ${cur.task.content}` : "";
+      if (cur) curEl.title = `${cur.phase} · ${cur.task.content}`;
+    }
+    const chevron = document.createElement("span");
+    chevron.className = "todo-dock-chevron";
+    chevron.textContent = todoDockExpanded ? "▾" : "▸";
+    summary.append(title, curEl);
+    // 子会话分桶计数徽记（纯展示；子会话清单在消息流里按 sub_id 分行看）
+    const subCount = subTodoIds(todoState).length;
+    if (subCount > 0) {
+      const subsEl = document.createElement("span");
+      subsEl.className = "todo-dock-subs";
+      subsEl.textContent = `· ${subCount} 个子会话清单`;
+      subsEl.title = "delegate/workflow 子会话也有 todo 清单，在消息流里分行展示";
+      summary.appendChild(subsEl);
+    }
+    summary.appendChild(chevron);
+
+    const body = todoDockBodyEl!;
+    body.textContent = "";
+    body.style.display = todoDockExpanded ? "" : "none";
+    if (!todoDockExpanded) return;
+    const boardTasks = boardInProgressTasks();
+    todoState.phases.forEach((phase, idx) => {
+      const pc = countPhase(phase);
+      const key = `${idx}:${phase.name}`;
+      const collapsed = todoPhaseCollapsed.get(key) ?? isPhaseComplete(phase);
+      const section = document.createElement("div");
+      section.className = "todo-phase";
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "todo-phase-head";
+      const headChevron = document.createElement("span");
+      headChevron.className = "todo-phase-chevron";
+      headChevron.textContent = collapsed ? "▸" : "▾";
+      const headName = document.createElement("span");
+      headName.className = "todo-phase-name";
+      headName.textContent = phase.name;
+      const headCount = document.createElement("span");
+      headCount.className = "todo-phase-count";
+      headCount.textContent = `${pc.done}/${pc.total}`;
+      head.append(headChevron, headName, headCount);
+      head.addEventListener("click", () => {
+        todoPhaseCollapsed.set(key, !collapsed);
+        renderTodoDock();
+      });
+      section.appendChild(head);
+      if (!collapsed) {
+        const ul = document.createElement("ul");
+        ul.className = "todo-task-list";
+        for (const t of phase.tasks) {
+          const li = document.createElement("li");
+          li.className = `todo-task todo-task--${t.status}`;
+          const icon = document.createElement("span");
+          icon.className = "todo-task-icon";
+          icon.textContent = TODO_TASK_ICONS[t.status] ?? "○";
+          const text = document.createElement("span");
+          text.className = "todo-task-text";
+          text.textContent = t.content;
+          li.append(icon, text);
+          // 看板联动：pending/in_progress 项与看板 in_progress 任务
+          // title 高度相似 → 「已派发」点亮（🔗 + 高亮，hover 见任务 id）
+          if (t.status === "pending" || t.status === "in_progress") {
+            const linked = todoLinkedTask(t.content, boardTasks);
+            if (linked) {
+              li.classList.add("todo-task--linked");
+              li.title = `已派发: ${linked.id}`;
+              const badge = document.createElement("span");
+              badge.className = "todo-task-link-badge";
+              badge.textContent = "🔗";
+              li.appendChild(badge);
+            }
+          }
+          ul.appendChild(li);
+        }
+        section.appendChild(ul);
+      }
+      body.appendChild(section);
+    });
+  }
+
   // ── ask 选择框（弹窗 + 消息流内联卡片）──
   // ChoiceRequested 事件触发。选项/说明/图片来自模型（不可信），一律
   // 用 textContent / img.src 构建，绝不 innerHTML 拼接。回传分两路：
@@ -1996,6 +2221,70 @@ export function mountChat(opts: {
   // authoritative state is reconciled by the Paused/Resumed ChatEvents
   // (see the event handler below), so a click/event race still
   // converges to the correct enabled/disabled state.
+  // ── Plan mode（只读规划模式）─────────────────────────────────
+  // active 时模型侧工具被收敛为只读（read/search/ask/plan/todo 等），
+  // 产出走 PlanProposed 审批流。状态由 PlanModeChanged 事件驱动（回放
+  // 同路径，取最后一条恢复）；开关按钮只是发端点 —— 点击乐观翻转、
+  // 失败回滚（与 stream-toggle 同一模式），事件回声再做幂等校正。
+  // 两处可见标识：composer 下方 input-bar 的开关按钮（active 高亮）+
+  // 顶部状态栏的「Plan」徽章（持续可见，避免用户忘了模型是只读的）。
+  let planModeActive = false;
+  let planModeBtn: HTMLButtonElement | null = null;
+  let planModePill: HTMLElement | null = null;
+
+  function renderPlanMode(): void {
+    if (planModeBtn) {
+      planModeBtn.classList.toggle("active", planModeActive);
+      planModeBtn.textContent = planModeActive ? "📐 Plan ✓" : "📐 Plan";
+    }
+    if (planModePill) planModePill.style.display = planModeActive ? "" : "none";
+  }
+
+  function applyPlanMode(active: boolean): void {
+    planModeActive = active;
+    renderPlanMode();
+  }
+
+  function ensurePlanModeToggle(): void {
+    if (planModeBtn) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "input-bar-action plan-mode-toggle";
+    btn.title = "Plan mode（只读规划模式）：开启后模型只能读代码/搜索/提问/提计划，产出计划提案走审批流；再点一次关闭";
+    btn.addEventListener("click", () => void togglePlanMode());
+    const bar = container.formEl.querySelector(".input-bar-actions");
+    (bar ?? container.formEl).appendChild(btn);
+    planModeBtn = btn;
+    const pill = document.createElement("span");
+    pill.className = "pill plan-mode-pill";
+    pill.textContent = "📐 Plan";
+    pill.title = "plan mode 进行中：模型处于只读规划模式";
+    pill.style.display = "none";
+    const topbar = container.statusPill.parentElement;
+    if (topbar) topbar.appendChild(pill);
+    planModePill = pill;
+    renderPlanMode();
+  }
+
+  async function togglePlanMode(): Promise<void> {
+    const next = !planModeActive;
+    applyPlanMode(next); // 乐观翻转；后端随后广播 PlanModeChanged 幂等校正
+    try {
+      await setPlanMode(getCurrentSessionId() ?? "", next);
+    } catch (err) {
+      console.error("[chat] setPlanMode failed", err);
+      applyPlanMode(!next); // 失败回滚，避免 UI 与后端不一致
+    }
+  }
+  ensurePlanModeToggle();
+
+  // 看板轮询快照更新时重绘 todo 点亮标记（订阅现有轮询的镜像，
+  // 不新增轮询）。dock 隐藏 / 卡片不存在时跳过，避免凭空建行。
+  onBoardTasksUpdated(() => {
+    if (todoCardRow) renderTodoCard();
+    if (todoDockEl && todoDockEl.style.display !== "none") renderTodoDock();
+  });
+
   let isPaused = false;
   function renderPauseButtons() {
     container.pauseBtn.disabled = isPaused;
@@ -3186,6 +3475,42 @@ export function mountChat(opts: {
         }, 1500);
         break;
       }
+      case "TodoUpdated": {
+        // todo 工具调用完成后的全量清单（整表替换，无 diff）。主会话
+        // （sub_id 空）→ 内联卡片 + dock；子会话（sub_id 非空）→ 各自
+        // 一条紧凑行按 sub_id 原地更新，不进 dock。回放路径走同一
+        // case，每个桶的最后一条即为恢复出的状态（原地更新，不会堆出
+        // 一串历史快照）。
+        const next = applyTodoUpdated(todoState, e);
+        if (next !== todoState) {
+          todoState = next;
+          if (e.sub_id) {
+            renderSubTodoCard(e.sub_id);
+            // dock 折叠态的「N 个子会话清单」徽记随分桶增减
+            renderTodoDock();
+          } else {
+            renderTodoCard();
+            renderTodoDock();
+          }
+        }
+        resetWaitTimer();
+        break;
+      }
+      case "PlanModeChanged": {
+        // 只读规划模式开关（后端广播；回放同路径，取最后一条恢复）。
+        // 开关按钮/状态栏徽章随之翻转；留一条 status 行痕（同 Paused），
+        // 历史里能看出何时进出过 plan mode。
+        applyPlanMode(e.active);
+        addMessage({
+          kind: "status",
+          content: e.active
+            ? "[plan mode] 已开启：模型只读，产出计划提案走审批流"
+            : "[plan mode] 已关闭",
+        });
+        setFooter(e.active ? "plan mode 已开启（只读规划）" : "plan mode 已关闭");
+        resetWaitTimer();
+        break;
+      }
       case "ChoiceRequested": {
         // 去重：同一 choice_id 可能同时经 history 重放和挂起弹框补拉
         // 到达（SSE 新连接的 replay 前缀 + GET pending-prompts）。
@@ -3355,6 +3680,18 @@ export function mountChat(opts: {
     }
     // 上一个 session 的选择弹窗/待办铃不能跟着漂到新 session。
     clearChoiceDialogs();
+    // todo 状态属于 session：归零并隐藏 dock；卡片引用（主会话卡 +
+    // 各子会话紧凑行）随消息区整体清空而失效，置空让下一条
+    // TodoUpdated 重新建行。
+    todoState = emptyTodoState();
+    todoCardRow = null;
+    subTodoRows.clear();
+    todoDockExpanded = false;
+    todoPhaseCollapsed.clear();
+    if (todoDockEl) renderTodoDock();
+    // plan mode 同属 session 状态：切 session 先归零，回放历史里的
+    // PlanModeChanged 会恢复到该 session 的真实状态。
+    applyPlanMode(false);
     updateFooter();
   }
   function replayEvents(events: ChatEvent[]): void {

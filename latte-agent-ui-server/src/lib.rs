@@ -633,6 +633,7 @@ fn build_router(state: AppState) -> Router {
         .route("/chat/prompt-dismiss", post(chat_prompt_dismiss))
         .route("/chat/command", post(chat_command))
         .route("/chat/role", post(switch_role))
+        .route("/chat/plan-mode", post(set_plan_mode))
         .route("/chat/cancel-turn", post(chat_cancel_turn))
         .route("/chat/abort", post(chat_abort))
         .route("/chat/pause", post(chat_pause))

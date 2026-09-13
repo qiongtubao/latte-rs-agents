@@ -1040,6 +1040,183 @@ select {
   border-color: #cbd5e1;
 }
 
+/* ─── plan mode（只读规划模式）开关与徽章 ───────────────────────
+   开关在 composer 下方 input-bar（/clear /quit 旁边）；激活时高亮。
+   徽章挂顶部状态栏，激活期间持续可见。 */
+.plan-mode-toggle.active {
+  background: #ede9fe;
+  border-color: #7c3aed;
+  color: #4c1d95;
+  font-weight: 600;
+}
+.plan-mode-toggle.active:hover {
+  background: #ddd6fe;
+  border-color: #7c3aed;
+  color: #4c1d95;
+}
+.plan-mode-pill {
+  background: #ede9fe;
+  border: 1px solid #c4b5fd;
+  color: #4c1d95;
+  font-weight: 600;
+}
+
+/* ─── todo dock（composer 上方的常驻 todo 面板）─────────────────
+   仅当 todo 列表非空时显示（JS 控制 display）。折叠态一行：
+   done/total + 当前活动项 + 展开箭头；展开态按 phase 分组。 */
+.todo-dock {
+  margin: 0 18px;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 14px 14px 0 0;
+  font-size: 0.82rem;
+  color: var(--fg-2);
+  flex-shrink: 0;
+}
+.todo-dock-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 14px;
+  background: transparent;
+  border: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.todo-dock-summary:hover {
+  background: #f8fafc;
+  border-radius: 14px 14px 0 0;
+}
+.todo-dock-title {
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+}
+.todo-dock-current {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.todo-dock-chevron {
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+.todo-dock.expanded .todo-dock-summary {
+  border-bottom: 1px solid #f1f5f9;
+}
+.todo-dock-body {
+  padding: 6px 10px 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.todo-phase-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+  background: transparent;
+  border: none;
+  font: inherit;
+  cursor: pointer;
+  color: var(--fg);
+  font-weight: 600;
+  text-align: left;
+  border-radius: 6px;
+}
+.todo-phase-head:hover {
+  background: #f1f5f9;
+}
+.todo-phase-chevron {
+  color: #94a3b8;
+  width: 12px;
+  flex-shrink: 0;
+}
+.todo-phase-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.todo-phase-count {
+  color: var(--fg-2);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.todo-task-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px 2px 24px;
+}
+.todo-task {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  line-height: 1.45;
+}
+.todo-task-icon {
+  width: 14px;
+  flex-shrink: 0;
+  text-align: center;
+}
+.todo-task--completed {
+  color: #94a3b8;
+}
+.todo-task--completed .todo-task-text {
+  text-decoration: line-through;
+}
+.todo-task--completed .todo-task-icon {
+  color: #10b981;
+}
+.todo-task--in_progress {
+  color: #4c1d95;
+  font-weight: 500;
+}
+.todo-task--in_progress .todo-task-icon {
+  color: #7c3aed;
+  animation: todo-pulse 1.4s ease-in-out infinite;
+}
+@keyframes todo-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.todo-task--pending {
+  color: var(--fg-2);
+}
+.todo-task--pending .todo-task-icon {
+  color: #94a3b8;
+}
+.todo-task--abandoned {
+  color: #b6bfca;
+}
+.todo-task--abandoned .todo-task-text {
+  text-decoration: line-through;
+}
+/* 看板联动：todo 项与看板 in_progress 任务匹配 → 「已派发」点亮 */
+.todo-task--linked {
+  background: #ecfdf5;
+  border-left: 3px solid #10b981;
+  border-radius: 4px;
+  padding-left: 6px;
+  margin-left: -9px;
+}
+.todo-task-link-badge {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+}
+/* dock 折叠态的子会话计数徽记 */
+.todo-dock-subs {
+  color: #94a3b8;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ─── side panels (drawers) ───────────────────────────────────── */
 
 .side-panel {

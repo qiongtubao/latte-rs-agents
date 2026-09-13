@@ -228,6 +228,17 @@
 
 **响应 `202`**
 
+### `POST /api/chat/plan-mode`
+
+开关当前会话的 plan mode（只读规划模式）：开启后角色的工具集在**下一个
+turn 边界**收敛为只读白名单（read/search/code_graph/ask/plan/todo），方案产出
+走 `plan` 工具的既有审批流。开关变化广播 `ChatEvent::PlanModeChanged`（进事件
+归档，回放即恢复徽章）。幂等：同值重复设置不重发事件。
+
+**请求体：** `{ "session_id": "abc123", "active": true }`
+
+**响应 `202`**
+
 ### `POST /api/chat/cancel-turn`
 
 取消当前 turn（不退出 session）。等当前 round 的 LLM 流返回后丢弃。
@@ -350,6 +361,8 @@ ChatController 实时事件流。每个会话独立推送。
 | `UserMessage` | `text` | 客户端回放用 |
 | `ContextCleared` | — | 上下文清除 |
 | `TaskReport` | `role_id` / `task_id` / `summary` / `result` | manager 任务报告（事件 → ui-server → POST /api/tasks/:id/report） |
+| `TodoUpdated` | `phases` / `sub_id?` | 会话内 todo 列表快照（todo 工具成功应用 ops 后广播）。`phases[]` = `{ name, tasks: [{ content, status }] }`，status ∈ `pending`/`in_progress`/`completed`/`abandoned` |
+| `PlanModeChanged` | `active` | plan mode（只读规划模式）开关变化；UI 亮/灭徽章。开关走 `POST /api/chat/plan-mode {session_id?, active}` 或 CLI `/planmode [on|off]`；工具收敛在下一个 turn 边界生效（runner 重建为只读白名单 read/search/code_graph/ask/plan/todo） |
 
 **Keepalive：** 每 15 秒发送一个注释行（`:`）。
 
@@ -387,7 +400,9 @@ export type ChatEvent =
   | { type: "TimeoutWarning"; role_id: string; elapsed_secs: number; soft_timeout_secs: number; hard_timeout_secs: number; sub_id?: string }
   | { type: "AdvisorTerminated"; role_id: string; reason: string; detector?: string; sub_id?: string }
   | { type: "UserMessage"; text: string }
-  | { type: "TaskReport"; role_id: string; task_id: string; summary: string; result: string };
+  | { type: "TaskReport"; role_id: string; task_id: string; summary: string; result: string }
+  | { type: "TodoUpdated"; phases: { name: string; tasks: { content: string; status: "pending" | "in_progress" | "completed" | "abandoned" }[] }[]; sub_id?: string }
+  | { type: "PlanModeChanged"; active: boolean };
 ```
 
 ---
