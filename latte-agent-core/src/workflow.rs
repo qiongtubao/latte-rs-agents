@@ -402,8 +402,12 @@ fn check_plan_tasks_output(output: &str, cwd: &std::path::Path) -> Result<(), St
 /// `require_symbols_resolvable` 的校验：产出里反引号包裹的代码符号必须
 /// 都能在仓库源码里回指到。判据、豁免与报错措辞都在
 /// [`latte_rs_agent_tools::utils::symbol_check`]。
-fn check_symbols_output(output: &str, cwd: &std::path::Path) -> Result<(), String> {
-    latte_rs_agent_tools::utils::symbol_check::check_symbols_resolvable(output, cwd)
+///
+/// `scope` 用于跨轮伪符号记账（同一伪符号反复出现时升级批注措辞，见
+/// `symbol_check::check_symbols_resolvable_scoped` 的方向3）；取
+/// `(session_id, role)`，与 `edit_anchor::Scope` 的作用域粒度一致。
+fn check_symbols_output(output: &str, cwd: &std::path::Path, scope: &str) -> Result<(), String> {
+    latte_rs_agent_tools::utils::symbol_check::check_symbols_resolvable_scoped(output, cwd, scope)
 }
 
 /// `patch_from` 的一条修改操作：把标题包含 `task` 子串的唯一任务的
@@ -4411,7 +4415,12 @@ async fn run_workflow_serial(
                     // 而且这条挡的正是 require_tools_any 挡不住的那部分：
                     // 工具调了、但对着没打开过的文件凭记忆写符号名。
                     if step.require_symbols_resolvable {
-                        if let Err(reason) = check_symbols_output(&response, &ctx.cwd) {
+                        let symbol_scope = format!(
+                            "{}\0{}",
+                            ctx.session_id.clone().unwrap_or_default(),
+                            speaker
+                        );
+                        if let Err(reason) = check_symbols_output(&response, &ctx.cwd, &symbol_scope) {
                             if attempt >= step.max_retries {
                                 return WfOutcome::Failed(format!(
                                     "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
@@ -4938,7 +4947,12 @@ async fn run_dag_step(
             // 这条是纯产出检查、无跨步状态，所以 DAG 引擎也支持（不像
             // require_plan_tasks / patch_from 那样只能串行）。
             if step.require_symbols_resolvable {
-                if let Err(reason) = check_symbols_output(&response, &inp.cwd) {
+                let symbol_scope = format!(
+                    "{}\0{}",
+                    inp.session_id.clone().unwrap_or_default(),
+                    speaker
+                );
+                if let Err(reason) = check_symbols_output(&response, &inp.cwd, &symbol_scope) {
                     if attempt >= step.max_retries {
                         return Err(StepFail::Failed(format!(
                             "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
@@ -12393,6 +12407,7 @@ require_citations_observed = true
         );
     }
 
+    #[test]
     fn check_symbols_output_rejects_unresolvable_names() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -12405,11 +12420,11 @@ require_citations_observed = true
 
         // 真实符号 → 放行。
         assert!(
-            check_symbols_output("主线索是 `arena_slab_reg_alloc`。", root).is_ok(),
+            check_symbols_output("主线索是 `arena_slab_reg_alloc`。", root, "test-scope").is_ok(),
             "真实符号不该被拦"
         );
         // 旧版本符号 → 打回，且批注里点名并给出相近真实符号。
-        let err = check_symbols_output("主线索是 `arena_bin_malloc_hard`。", root)
+        let err = check_symbols_output("主线索是 `arena_bin_malloc_hard`。", root, "test-scope")
             .expect_err("查不到的符号必须被拦");
         assert!(err.contains("arena_bin_malloc_hard"), "{err}");
         assert!(err.contains("code_graph"), "批注要指路到正确工具：{err}");
