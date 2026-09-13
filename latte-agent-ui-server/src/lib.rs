@@ -727,7 +727,10 @@ fn build_router(state: AppState) -> Router {
             get(get_workflow_toml_h).put(put_workflow_toml_h),
         )
         .route("/images", post(upload_image))
-        .route("/images/:file", get(get_image));
+        .route("/images/:file", get(get_image))
+        .route("/doc-asset", get(get_doc_asset))
+        .route("/doc", get(get_doc))
+        .route("/code-graph/mermaid", get(get_code_graph_mermaid));
     let mut app = Router::new()
         .route("/health", get(health))
         .nest("/api", api);

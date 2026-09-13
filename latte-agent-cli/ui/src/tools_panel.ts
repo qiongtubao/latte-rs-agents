@@ -8,9 +8,11 @@ import {
   getToolDoc,
   putToolDoc,
   deleteToolDoc,
+  codeGraphMermaid,
 } from "./api";
 import type { ToolEntry, TestToolResponse, ToolDocResponse } from "./api";
 import { renderMarkdown } from "./chat_impl";
+import { enhanceRenderedMarkdown } from "./codeblock";
 
 // ─── 类型定义 ────────────────────────────────────────────────────────
 
@@ -520,6 +522,83 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
 
   // ─── 工具详情弹层 ─────────────────────────────────────────────
 
+  /** code_graph 详情里的「可视化」区：路径 + 图类型 → /api/code-graph/mermaid
+   *  → ```mermaid 统一渲染管线（SVG、点击放大、下载 SVG/PNG 全部继承）。 */
+  function buildCodeGraphVizSection(): HTMLElement {
+    const section = document.createElement("section");
+    section.className = "tool-detail-section code-graph-viz";
+
+    const heading = document.createElement("div");
+    heading.className = "tool-detail-section-heading";
+    heading.textContent = "代码图谱可视化";
+    section.appendChild(heading);
+
+    const hint = document.createElement("div");
+    hint.className = "code-graph-viz-hint";
+    hint.textContent = "结构图读预建索引（快）；调用图现场扫描，建议用子目录/单文件范围，全仓调用图会很大。";
+    section.appendChild(hint);
+
+    const controls = document.createElement("div");
+    controls.className = "code-graph-viz-controls";
+    const pathInput = document.createElement("input");
+    pathInput.className = "code-graph-viz-path";
+    pathInput.type = "text";
+    pathInput.value = ".";
+    pathInput.placeholder = "范围：相对仓库根，如 src/ 或 src/foo.rs";
+    const graphSel = document.createElement("select");
+    graphSel.className = "code-graph-viz-kind";
+    for (const [v, label] of [["structure", "结构图"], ["calls", "调用图"]] as const) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = label;
+      graphSel.appendChild(opt);
+    }
+    const runBtn = document.createElement("button");
+    runBtn.type = "button";
+    runBtn.className = "tool-doc-btn";
+    runBtn.textContent = "生成图";
+    controls.append(pathInput, graphSel, runBtn);
+    section.appendChild(controls);
+
+    const result = document.createElement("div");
+    result.className = "code-graph-viz-result markdown-body";
+    section.appendChild(result);
+
+    runBtn.addEventListener("click", async () => {
+      const path = pathInput.value.trim() || ".";
+      const graph = graphSel.value === "calls" ? "calls" : "structure";
+      runBtn.disabled = true;
+      runBtn.textContent = "生成中…";
+      result.replaceChildren();
+      const loading = document.createElement("div");
+      loading.className = "tool-doc-loading";
+      loading.textContent = graph === "calls" ? "扫描调用关系中（ast-grep 全量，可能几秒）…" : "读取索引中…";
+      result.appendChild(loading);
+      try {
+        const resp = await codeGraphMermaid(path, graph);
+        result.innerHTML = renderMarkdown("```mermaid\n" + resp.mermaid + "\n```");
+        enhanceRenderedMarkdown(result);
+        if (resp.truncated) {
+          const note = document.createElement("div");
+          note.className = "code-graph-viz-note";
+          note.textContent = "⚠️ 图过大已截断，缩小范围再生成。";
+          result.appendChild(note);
+        }
+      } catch (err) {
+        result.replaceChildren();
+        const errEl = document.createElement("div");
+        errEl.className = "code-graph-viz-note";
+        errEl.textContent = `生成失败：${(err as Error).message}`;
+        result.appendChild(errEl);
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = "生成图";
+      }
+    });
+
+    return section;
+  }
+
   function showToolDetail(t: ToolEntry): void {
     const overlay = document.getElementById("tool-detail-overlay")!;
     const title = document.getElementById("tool-detail-title")!;
@@ -566,6 +645,11 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
       infoSection.appendChild(row);
     }
     body.appendChild(infoSection);
+
+    // ── code_graph 专属：一键可视化（结构图/调用图 → mermaid SVG） ──
+    if (t.id === "code_graph") {
+      body.appendChild(buildCodeGraphVizSection());
+    }
 
     // ── 文档区：模型运行时读取的说明（注册描述 + 项目/全局 md） ──
     const docSection = document.createElement("section");
@@ -714,6 +798,7 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
       const builtinView = document.createElement("div");
       builtinView.className = "tool-doc-builtin-view markdown-body";
       builtinView.innerHTML = renderMarkdown(doc.builtin_detail);
+      enhanceRenderedMarkdown(builtinView);
       contentSection.append(builtinLabel, builtinView);
     }
 
@@ -759,6 +844,7 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
       const preview = document.createElement("div");
       preview.className = "tool-doc-builtin-view markdown-body";
       preview.innerHTML = renderMarkdown(doc.rendered_content ?? "");
+      enhanceRenderedMarkdown(preview);
       templateBox.append(previewLabel, preview);
     }
 
@@ -783,6 +869,7 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
       const effectiveBrief = summaryMd.trim() || doc.brief.trim();
       if (effectiveBrief) {
         summaryViewEl.innerHTML = renderMarkdown(effectiveBrief);
+        enhanceRenderedMarkdown(summaryViewEl);
       } else {
         summaryViewEl.replaceChildren();
         const empty = document.createElement("div");
@@ -793,6 +880,7 @@ export function mountToolsPage(opts: { container: UIBinding }): ToolsPageControl
 
       if (contentMd.trim()) {
         contentViewEl.innerHTML = renderMarkdown(contentMd);
+        enhanceRenderedMarkdown(contentViewEl);
       } else {
         contentViewEl.replaceChildren();
         const empty = document.createElement("div");

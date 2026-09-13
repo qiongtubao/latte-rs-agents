@@ -235,4 +235,18 @@ describe("工具 API 与后端路由表一致", () => {
     await api.setToolEnabled("git.status", true);
     expect(calls[0].path).toBe("/api/tools/git.status/toggle");
   });
+
+  it("codeGraphMermaid → GET /api/code-graph/mermaid（后端存在该路由）", async () => {
+    const { api, transport } = await importFresh();
+    const calls: Call[] = [];
+    install(transport, calls, { mermaid: "flowchart TD\n  n0[\"fn a\"]", truncated: false });
+
+    const resp = await api.codeGraphMermaid("src/", "calls");
+    expect(calls[0].method).toBe("GET");
+    expect(calls[0].path).toBe("/api/code-graph/mermaid?path=src%2F&graph=calls");
+    expect(resp.mermaid).toContain("flowchart");
+
+    const routes = backendApiRoutes();
+    expect(routes).toContain("GET /code-graph/mermaid");
+  });
 });

@@ -4807,6 +4807,74 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     }],
                 ));
             }
+            // ── graph 模式：直接产出 mermaid 图源 ──
+            // 走 code_graph_viz（结构图读预建索引、调用图索引归属 + ast-grep
+            // 全量扫边），绕开本工具 matches 输出的 200 条/12K 封顶——封顶
+            // 是给「模型读文本」的 token 经济，画图必须全量。
+            let graph = input
+                .get("graph")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(g) = graph {
+                if !matches!(g, "structure" | "calls") {
+                    return Err(ToolError::validation(
+                        format!("code_graph: 不支持的 graph='{g}'。可用：structure, calls"),
+                        vec![latte_rs_agent_tools::error::ValidationIssue {
+                            path: "graph".into(),
+                            message: "必须是 structure 或 calls".into(),
+                        }],
+                    ));
+                }
+                let cwd = ctx
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("cwd"))
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    });
+                // viz 的 scope 是相对仓库根语义：绝对路径落在 cwd 下时转成相对。
+                let p = std::path::Path::new(path);
+                let rel = if p.is_absolute() {
+                    p.strip_prefix(&cwd)
+                        .map(|r| r.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| path.to_string())
+                } else {
+                    path.to_string()
+                };
+                let result = match g {
+                    "structure" => crate::code_graph_viz::structure_mermaid(&cwd, &rel).await,
+                    _ => crate::code_graph_viz::calls_mermaid(&cwd, &rel).await,
+                };
+                return match result {
+                    Ok(out) => {
+                        let mut result = serde_json::Map::new();
+                        result.insert("format".into(), serde_json::Value::String("mermaid".into()));
+                        result.insert("graph".into(), serde_json::Value::String(g.into()));
+                        result.insert(
+                            "mermaid".into(),
+                            serde_json::Value::String(out.mermaid),
+                        );
+                        result.insert(
+                            "truncated".into(),
+                            serde_json::Value::Bool(out.truncated),
+                        );
+                        result.insert(
+                            "note".into(),
+                            serde_json::Value::String(
+                                "把 mermaid 字段原样放进 ```mermaid 代码围栏发给用户：\
+                                 UI 会渲染成 SVG 图（支持缩放/下载）。truncated=true 时说明图被\
+                                 规模封顶截断，建议缩小 path 再生成。"
+                                    .into(),
+                            ),
+                        );
+                        Ok(serde_json::Value::Object(result))
+                    }
+                    Err(msg) => Err(ToolError::execution_str("code_graph", msg)),
+                };
+            }
             if kind.is_none() && raw_pattern.is_none() {
                 return Err(ToolError::validation(
                     "code_graph: 必须提供 kind 或 pattern 之一".to_string(),
@@ -5179,7 +5247,9 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         (
             "name",
             PropertyType::String,
-            "可选，按正则过滤匹配文本（如只找名字含 decay 的函数）。用它替代把整个目录的匹配全拉回来",
+            "可选的二次收窄条件，必须和 kind（或 pattern）一起传——单独传 name、不传 kind/pattern 会报错。\
+             按正则匹配已被 kind/pattern 选中的节点文本（如 kind=function 时传 name='^decay' 只留函数名以 decay 开头的结果）。\
+             用它替代把整个目录同 kind 的匹配全拉回来",
         ),
         (
             "mode",
@@ -5192,10 +5262,18 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             "逃生舱：裸 ast-grep 模式（如 'pac_decay_all($$$ARGS)'）。\
              kind 覆盖不到时才用；kind 与 pattern 同时给出时 kind 优先",
         ),
+        (
+            "graph",
+            PropertyType::String,
+            "可视化模式：structure（结构图，读预建符号索引，快）| calls（调用图，现场全量扫描，\
+             建议子目录/单文件范围）。传了 graph 就不需要 kind/pattern；返回 mermaid 字段，\
+             原样放进 ```mermaid 围栏发给用户即可渲染成图",
+        ),
     ]);
     for (name, values) in [
         ("lang", code_graph_supported_langs()),
         ("mode", vec!["signatures", "full"]),
+        ("graph", vec!["structure", "calls"]),
         (
             "kind",
             vec![
@@ -5219,6 +5297,8 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         "结构化代码导航：按 AST 节点类型查函数/结构体/类/调用点/import，比 grep 精准、比整文件 read 省得多。\
          典型用法——先用它建地图（`kind=function` + `path=src/foo.c` 拿到全部函数签名和行号），\
          再只对少数热点用带行范围的 read 精读。查「谁调用了 X」用 `kind=call` + `name=X`。\
+         要画模块结构图/调用图用 `graph=structure|calls`（返回 mermaid 图源，\
+         放进 ```mermaid 围栏发给用户即渲染成 SVG）。\
          实测（某 C 仓库 10 个最大源文件 / 431 个函数）：整文件 328KB → 签名清单 47KB，6.9x。\
          支持 c/cpp/rust/go/python/typescript/javascript/java。需要本机装有 ast-grep",
         schema,
@@ -6545,7 +6625,7 @@ pub fn register_ask_tool(
             }),
             ("questions".into(), ToolInputProperty {
                 property_type: PropertyType::Array,
-                description: Some("**一次问多道题**（推荐：需要多个维度才能决策时用这个，不要一轮连发多次 ask）。每项 {question, options, multi?, layout?, allow_upload?}，语义与顶层同名参数一致。用户会在**一个弹框里答完全部题目**、答案一起回来，你只需等这一批答完。⚠️ 与顶层 question/options 二选一：给了 questions 就不要再给 question/options。".into()),
+                description: Some("**一次问多道题**（需要多个维度才能决策时用这个）。每项 {question, options, multi?, layout?, allow_upload?}，语义与顶层同名参数一致。用户会在**一个弹框里答完这一批**、答案一起回来。⚠️ 与顶层 question/options 二选一：给了 questions 就不要再给 question/options。只把这一批里**互不依赖**的问题放进同一次调用；如果后面某道题该问什么取决于前面题目的答案，或者答完这一批后发现还有遗漏，直接再调一次 ask（可以再传 questions 批量追问）——不要因为怕多调用就硬凑成一次问完，也不要为了凑单次问全而瞎猜后续分支的选项。".into()),
                 enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
                 items: Some(Box::new(input_property(
                     PropertyType::Object,
@@ -6584,7 +6664,7 @@ pub fn register_ask_tool(
             if !has_questions && input.get("question").is_none() {
                 return Err(tool_err(
                     "ask 需要二者之一：单题给 question + options；多题给 questions=[{question, options}, …]。\
-                     需要多个维度才能决策时请用 questions 一次问完，不要一轮连发多次 ask。"
+                     只把互不依赖的问题放进同一批；后续题目依赖前面答案、或发现有遗漏，再调一次 ask 追问即可。"
                         .into(),
                 ));
             }
@@ -14728,6 +14808,50 @@ require = ["永远不可能出现的验收字符串"]
     }
     fn cg_total(v: &serde_json::Value) -> u64 {
         v.get("total_matches").and_then(|m| m.as_u64()).unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn code_graph_graph_mode_structure_returns_mermaid() {
+        // 结构图走预建索引：fixture 写一份索引即可，不需要 ast-grep。
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src")).unwrap();
+        std::fs::write(d.path().join("src/lib.rs"), "fn alpha() {}\nfn beta() { alpha() }\n").unwrap();
+        let idx = d.path().join(".latte/code_graph/index.json");
+        std::fs::create_dir_all(idx.parent().unwrap()).unwrap();
+        std::fs::write(
+            &idx,
+            r#"{"version":2,"built_at":9999999999,"lang_counts":{"rust":1},
+                "files":{"src/lib.rs":{"lang":"rust","mtime":1,"symbols":[
+                    {"kind":"function","sig":"fn alpha()","line":1,"end_line":1},
+                    {"kind":"function","sig":"fn beta()","line":2,"end_line":2}
+                ]}}}"#,
+        )
+        .unwrap();
+        let tool = code_graph_tool();
+        let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
+        ctx.metadata = Some(serde_json::json!({ "cwd": d.path().to_str().unwrap() }));
+        let out = (tool.handler)(serde_json::json!({ "path": "src", "graph": "structure" }), ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.get("format").and_then(|v| v.as_str()), Some("mermaid"));
+        let mmd = out.get("mermaid").and_then(|v| v.as_str()).unwrap();
+        assert!(mmd.starts_with("flowchart TD"), "{mmd}");
+        assert!(mmd.contains("fn alpha"), "{mmd}");
+        assert!(out.get("note").is_some());
+    }
+
+    #[tokio::test]
+    async fn code_graph_graph_mode_rejects_bad_value() {
+        let d = cg_fixture();
+        let tool = code_graph_tool();
+        let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
+        let err = (tool.handler)(
+            serde_json::json!({ "path": d.path().to_str().unwrap(), "graph": "bogus" }),
+            ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("graph='bogus'"));
     }
 
     #[tokio::test]

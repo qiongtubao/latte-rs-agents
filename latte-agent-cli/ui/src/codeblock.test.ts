@@ -1,12 +1,30 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from "vitest";
-import { enhanceCodeBlocks } from "./codeblock";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { enhanceCodeBlocks, enhanceRenderedMarkdown } from "./codeblock";
+
+// mermaid 走动态 import，测试里 mock 掉，避免在 jsdom 里真的渲染 SVG。
+const mermaidRender = vi.fn(async (_id: string, source: string) => ({
+  svg: `<svg data-source="${source.trim()}"></svg>`,
+}));
+vi.mock("mermaid", () => ({
+  default: {
+    initialize: vi.fn(),
+    render: (id: string, source: string) => mermaidRender(id, source),
+  },
+}));
 
 function make(html: string): HTMLElement {
   const el = document.createElement("div");
   el.innerHTML = html;
   return el;
 }
+
+/** 等 renderMermaidNode 的异步链跑完。 */
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+beforeEach(() => {
+  mermaidRender.mockClear();
+});
 
 describe("enhanceCodeBlocks", () => {
   it("把 pre 包进 .code-block 并加复制按钮", () => {
@@ -34,5 +52,82 @@ describe("enhanceCodeBlocks", () => {
     );
     enhanceCodeBlocks(el);
     expect(el.textContent).not.toContain("在编辑器中打开");
+  });
+});
+
+describe("enhanceRenderedMarkdown", () => {
+  it("同时增强代码块并懒渲染 mermaid 占位 div", async () => {
+    const el = make(
+      '<pre><code class="language-rust">fn main() {}</code></pre>' +
+        '<div class="mermaid">graph TD;\nA--&gt;B;\n</div>',
+    );
+    // 节点须挂到 document 上，渲染完成的 isConnected 守卫才放行。
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el);
+    expect(el.querySelector(".code-block-bar")).not.toBeNull();
+    await flush();
+    const mmd = el.querySelector(".mermaid") as HTMLElement;
+    expect(mmd.dataset.mermaidDone).toBe("1");
+    expect(mmd.querySelector("svg")).not.toBeNull();
+    expect(mermaidRender).toHaveBeenCalledTimes(1);
+    el.remove();
+  });
+
+  it("deferMermaid（流式中途）跳过 mermaid，只加代码块工具条", async () => {
+    const el = make('<div class="mermaid">graph TD;</div>');
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el, { deferMermaid: true });
+    await flush();
+    expect(mermaidRender).not.toHaveBeenCalled();
+    expect(el.querySelector("svg")).toBeNull();
+    el.remove();
+  });
+
+  it("幂等：渲染完成的 mermaid 节点不重复渲染", async () => {
+    const el = make('<div class="mermaid">graph TD;</div>');
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el);
+    await flush();
+    enhanceRenderedMarkdown(el);
+    await flush();
+    expect(mermaidRender).toHaveBeenCalledTimes(1);
+    el.remove();
+  });
+
+  it("mermaid 渲染失败回退为普通代码块，不丢原文", async () => {
+    mermaidRender.mockRejectedValueOnce(new Error("parse error"));
+    const el = make('<div class="mermaid">not a diagram</div>');
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el);
+    await flush();
+    await flush();
+    const mmd = el.querySelector(".mermaid")!;
+    expect(mmd.classList.contains("mermaid-error")).toBe(true);
+    const code = mmd.querySelector("pre code.language-mermaid");
+    expect(code).not.toBeNull();
+    expect(code!.textContent).toBe("not a diagram");
+    // 回退的 pre 也补上了工具条
+    expect(mmd.querySelector(".code-block-bar")).not.toBeNull();
+    el.remove();
+  });
+
+  it("渲染完成的 mermaid 有「放大」入口，点击打开弹窗可下载/复制图源", async () => {
+    const el = make('<div class="mermaid">graph TD; A--&gt;B;</div>');
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el);
+    await flush();
+    await flush();
+    const zoomBtn = el.querySelector<HTMLElement>('.mermaid-bar [data-act="zoom"]');
+    expect(zoomBtn).not.toBeNull();
+    zoomBtn!.click();
+    const modal = document.querySelector(".md-modal-overlay.mermaid-modal");
+    expect(modal).not.toBeNull();
+    expect(modal!.querySelector(".mermaid-canvas svg")).not.toBeNull();
+    expect(modal!.querySelector('[data-act="dl-svg"]')).not.toBeNull();
+    expect(modal!.querySelector('[data-act="dl-png"]')).not.toBeNull();
+    expect(modal!.querySelector('[data-act="copy-src"]')).not.toBeNull();
+    (modal!.querySelector('[data-act="close"]') as HTMLElement).click();
+    expect(document.querySelector(".mermaid-modal")).toBeNull();
+    el.remove();
   });
 });

@@ -8,8 +8,11 @@ import {
   getRolesConfig,
 } from "./api";
 import { setStreamMode } from "./api";
+import "highlight.js/styles/github.css";
+import "katex/dist/katex.min.css";
 import { mountChat } from "./chat_impl";
 import type { ChatController } from "./chat_impl";
+import { installDocLinkHandler } from "./doc_viewer";
 import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
 import { mountRoleGraph } from "./role_graph";
@@ -115,6 +118,8 @@ async function main(): Promise<void> {
 
   let sseDisconnector: () => void = () => {};
   let sseConnector: () => void = () => {};
+
+  installDocLinkHandler();
 
   const chat: ChatController = mountChat({
     container: {

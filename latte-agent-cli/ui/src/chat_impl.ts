@@ -9,7 +9,12 @@ import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
 import { parentOptions } from "./task_board";
+import { renderMarkdown } from "./markdown";
+import { enhanceRenderedMarkdown } from "./codeblock";
+import { openDocViewer } from "./doc_viewer";
 import type { CodeRef } from "./host";
+
+export { renderMarkdown };
 interface UIBinding {
 
   messagesEl: HTMLElement; formEl: HTMLFormElement; inputEl: HTMLTextAreaElement;
@@ -59,110 +64,6 @@ function fmtTime(ms: number): string {
   return `${Math.floor(s/60)}分${s%60}秒`;
 }
 
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-// ─── Markdown 渲染 ──────────────────────────────────────────────
-// 模型输出是 Markdown，但内容不可信：所有文本先 escapeHtml，再在
-// 转义后的文本上做块级/行内转换，因此任何原始 HTML 都会被转义，
-// 不存在注入面。覆盖聊天消息常用语法：围栏代码块、标题、无序/
-// 有序列表、行内 code、粗体、斜体、http(s) 链接。
-
-/** 行内转换。输入必须是已 escapeHtml 的文本。 */
-function renderInline(escaped: string): string {
-  // 行内 code 先抽出来占位，避免其中的 `*` 等被后续规则误转。
-  const codes: string[] = [];
-  let s = escaped.replace(/`([^`\n]+)`/g, (_m, c: string) => {
-    codes.push(c);
-    return "\u0000" + (codes.length - 1) + "\u0000";
-  });
-  // 链接 [text](url) —— 仅放行 http(s)，其余按原文显示。
-  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text: string, url: string) =>
-    /^https?:\/\//i.test(url)
-      ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`
-      : m);
-  // 粗体先于斜体（否则 ** 会被 * 规则吃掉）。
-  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  s = s.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
-  // 还原行内 code（内容已转义，不再做任何转换）。
-  s = s.replace(/\u0000(\d+)\u0000/g, (_m, i: string) => `<code>${codes[Number(i)]}</code>`);
-  return s;
-}
-
-/** 块级转换：标题、列表、空行分段。输入必须是已 escapeHtml 的文本。 */
-function renderBlocks(escaped: string): string {
-  const lines = escaped.split("\n");
-  const out: string[] = [];
-  let para: string[] = [];
-  let list: { type: "ul" | "ol"; items: string[] } | null = null;
-
-  const flushPara = () => {
-    if (para.length) {
-      out.push(`<p>${renderInline(para.join("\n"))}</p>`);
-      para = [];
-    }
-  };
-  const flushList = () => {
-    if (list) {
-      out.push(`<${list.type}>${list.items.map((i) => `<li>${renderInline(i)}</li>`).join("")}</${list.type}>`);
-      list = null;
-    }
-  };
-
-  for (const line of lines) {
-    const h = line.match(/^(#{1,4})\s+(.*)$/);
-    const ul = line.match(/^\s*[-*]\s+(.*)$/);
-    const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
-    if (h) {
-      flushPara(); flushList();
-      // # → h3、## → h4、### → h5：气泡内标题不宜比正文大太多。
-      const tag = `h${Math.min(h[1].length + 2, 5)}`;
-      out.push(`<${tag}>${renderInline(h[2])}</${tag}>`);
-    } else if (ul) {
-      flushPara();
-      if (!list || list.type !== "ul") { flushList(); list = { type: "ul", items: [] }; }
-      list.items.push(ul[1]);
-    } else if (ol) {
-      flushPara();
-      if (!list || list.type !== "ol") { flushList(); list = { type: "ol", items: [] }; }
-      list.items.push(ol[1]);
-    } else if (line.trim() === "") {
-      flushPara(); flushList();
-    } else {
-      flushList();
-      para.push(line);
-    }
-  }
-  flushPara(); flushList();
-  return out.join("");
-}
-
-export function renderMarkdown(text: string): string {
-  if (!text.includes("```")) return renderBlocks(escapeHtml(text));
-  const parts: string[] = [];
-  let remaining = text;
-  while (true) {
-    const start = remaining.indexOf("```");
-    if (start === -1) { parts.push(renderBlocks(escapeHtml(remaining))); break; }
-    parts.push(renderBlocks(escapeHtml(remaining.slice(0, start))));
-    const after = remaining.slice(start + 3);
-    const end = after.indexOf("```");
-    if (end === -1) { parts.push(renderBlocks(escapeHtml(remaining))); break; }
-    const langAndCode = after.slice(0, end);
-    const newline = langAndCode.indexOf("\n");
-    const lang = newline === -1 ? "" : langAndCode.slice(0, newline).trim();
-    const code = newline === -1 ? langAndCode : langAndCode.slice(newline + 1);
-    parts.push(`<pre><code${lang ? ` class="language-${lang}"` : ""}>${escapeHtml(code)}</code></pre>`);
-    remaining = after.slice(end + 3);
-  }
-  return parts.join("");
-}
 
 /** ask 卡片附带的 markdown 学习文档：插在问题标题行之后、选项区之前
  * （单题与多题弹框共用）。`document_markdown` 为空/缺失时不渲染任何
@@ -170,8 +71,8 @@ export function renderMarkdown(text: string): string {
  * 不依赖文件还在不在。
  *
  * 安全口径与聊天正文一致：文档来自模型（不可信），body 走
- * `renderMarkdown`（内部先 escapeHtml 再渲染，无注入面）；路径标题走
- * textContent。 */
+ * `renderMarkdown`（markdown-it `html: false`，原始 HTML 一律转义，
+ * 无注入面）；路径标题走 textContent。 */
 function appendChoiceDocument(card: HTMLElement, e: ChoiceRequestedEvent): void {
   const md = e.document_markdown?.trim();
   if (!md) return;
@@ -187,6 +88,20 @@ function appendChoiceDocument(card: HTMLElement, e: ChoiceRequestedEvent): void 
   path.className = "choice-doc-path";
   path.textContent = e.document_path?.trim() || "学习文档";
   head.appendChild(path);
+  // 「大窗查看」：用文档预览弹窗（带 TOC、可拖拽缩放）打开全文，
+  // 卡片里 42vh 的可调窗口看长文档仍然局促。
+  const docPath = e.document_path?.trim();
+  if (docPath) {
+    const expand = document.createElement("button");
+    expand.type = "button";
+    expand.className = "choice-doc-expand";
+    expand.textContent = "大窗查看";
+    expand.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      void openDocViewer(docPath);
+    });
+    head.appendChild(expand);
+  }
   const toggle = document.createElement("button");
   toggle.type = "button";
   toggle.className = "choice-doc-toggle";
@@ -197,6 +112,7 @@ function appendChoiceDocument(card: HTMLElement, e: ChoiceRequestedEvent): void 
   const body = document.createElement("div");
   body.className = "choice-doc-body markdown-body";
   body.innerHTML = renderMarkdown(md);
+  enhanceRenderedMarkdown(body);
   doc.appendChild(body);
 
   toggle.addEventListener("click", (ev) => {
@@ -635,6 +551,7 @@ export function mountChat(opts: {
         });
       } else {
         content.innerHTML = renderMarkdown(opts2.content);
+        enhanceRenderedMarkdown(content);
       }
       bubble.appendChild(content);
 
@@ -2055,7 +1972,10 @@ export function mountChat(opts: {
     if (v) {
       editingRecord.content = v;
       const contentEl = editingRecord.el.querySelector(".msg-content") as HTMLElement | null;
-      if (contentEl) contentEl.innerHTML = renderMarkdown(v);
+      if (contentEl) {
+        contentEl.innerHTML = renderMarkdown(v);
+        enhanceRenderedMarkdown(contentEl);
+      }
     }
     closeEditModal();
   }
@@ -2896,6 +2816,7 @@ export function mountChat(opts: {
               // 终态 content 是完整文本——直接用 innerHTML 替换（避免与
               // 已追加的 delta 拼接误差）。仅当 content 与已显示不一致时。
               contentEl.innerHTML = renderMarkdown(e.content);
+              enhanceRenderedMarkdown(contentEl);
             }
             streamingEl.delete(key);
             streamingRaw.delete(key);
@@ -2922,7 +2843,11 @@ export function mountChat(opts: {
             const contentEl = streamRow.querySelector<HTMLElement>(".msg-content");
             const raw = (streamingRaw.get(key) ?? "") + e.content;
             streamingRaw.set(key, raw);
-            if (contentEl) contentEl.innerHTML = renderMarkdown(raw);
+            if (contentEl) {
+              contentEl.innerHTML = renderMarkdown(raw);
+              // 流式中途不渲染 mermaid（图源未完整，等终态再出 SVG）。
+              enhanceRenderedMarkdown(contentEl, { deferMermaid: true });
+            }
           } else {
             const row = addMessage({ kind: "role", content: e.content, meta: e.role_id, icon, subagent, subId: roleSubId, reference: undefined, filePath: getFilePath(e.role_id) });
             streamingEl.set(key, row);

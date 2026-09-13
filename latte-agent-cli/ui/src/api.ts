@@ -200,7 +200,8 @@ export type ChatEvent =
       /** ask 附带的学习文档：项目内相对路径（卡片文档块标题用）。 */
       document_path?: string;
       /** 学习文档的 markdown 全文（卡片内渲染用；前端经 renderMarkdown
-       *  先转义再渲染，与聊天正文同一安全口径）。空/缺失 = 不渲染文档块。 */
+       *  渲染，markdown-it `html: false` 转义原始 HTML，与聊天正文同一
+       *  安全口径）。空/缺失 = 不渲染文档块。 */
       document_markdown?: string;
       options: ChoiceOption[];
       /** **多题弹框**：一次问 N 道，渲染成一个弹框、收齐后一次提交。
@@ -1533,6 +1534,24 @@ export interface TestToolResponse {
 /** POST /api/tools/test —— 测试工具是否能正常执行。 */
 export async function testTool(req: TestToolRequest): Promise<TestToolResponse> {
   return getTransport().request("POST", "/api/tools/test", req);
+}
+
+// ─── Code graph 可视化 ─────────────────────────────────────────────
+
+export interface CodeGraphMermaidResponse {
+  mermaid: string;
+  truncated: boolean;
+}
+
+/** GET /api/code-graph/mermaid —— 结构图/调用图的 mermaid 图源。 */
+export async function codeGraphMermaid(
+  path: string,
+  graph: "structure" | "calls",
+): Promise<CodeGraphMermaidResponse> {
+  return getTransport().request(
+    "GET",
+    `/api/code-graph/mermaid?path=${encodeURIComponent(path)}&graph=${graph}`,
+  );
 }
 
 // ─── Role test ─────────────────────────────────────────────────────

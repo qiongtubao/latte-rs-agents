@@ -1,7 +1,7 @@
 <instruction>
 - PREFER this tool over `read` and `search` for code exploration. It returns precise signatures+line spans at minimal token cost.
 - Use `kind` parameter (recommended): `function`, `struct`, `type`, `macro`, `call`, `import`, `decl`. Avoids pattern syntax errors.
-- Use `name` to filter by substring — drastically reduces output when scanning directories.
+- Use `name` to narrow by regex against matched text — but `name` alone is not enough: it must be combined with `kind` or `pattern`. Passing `name` without either fails validation.
 - Default mode `signatures` returns one-line-per-match. Only use `mode=full` when you need the implementation body.
 - `lang` is optional: inferred from the file extension, or from a directory's dominant language by content. Pass it explicitly only for mixed-language directories or when inference picks wrong (the result's `lang`/`lang_note` fields tell you what was used).
 - Each match is `path:START-END: signature`. **`START-END` is the definition's full span — paste it straight into `read`.** Never guess how long a function is.
@@ -15,3 +15,9 @@
 - 0 matches usually means wrong `lang` or `kind` for the language — check the error message for available kinds.
 - Token comparison: reading a 500-line .c file costs ~4000 tokens; `code_graph` signatures for the same file costs ~200 tokens (20x savings).
 </critical>
+
+<visualization>
+- `graph=structure` / `graph=calls` returns a mermaid diagram source in the `mermaid` field (no kind/pattern needed). Reply with it verbatim inside a ```mermaid fence — the UI renders it as an SVG diagram (zoomable, downloadable).
+- Use this when the user asks for a module/class/call diagram instead of hand-writing mermaid from memory: the generated graph is derived from the real index/AST, not your recollection.
+- `structure` reads the prebuilt index (fast, whole-tree OK); `calls` does a live full scan — keep its `path` to a subdirectory or single file, whole-repo call graphs get truncated (truncated=true tells you).
+</visualization>

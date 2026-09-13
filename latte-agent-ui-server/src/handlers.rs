@@ -1439,3 +1439,117 @@ pub(crate) async fn upload_image(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write image: {e}")))?;
     Ok(Json(serde_json::json!({ "path": format!("/api/images/{file}") })))
 }
+
+// ─── 学习/文档只读资源 ─────────────────────────────────────────────
+// 前端 markdown 渲染把本地相对路径图片改写到 /api/doc-asset，把 .md
+// 链接交给内嵌预览（/api/doc）。两个路由共用同一条白名单：只允许读
+// `<cwd>` 下 `.latte/learn/`、`docs/` 里的文件，防穿越（拒绝对路径、
+// `..`、反斜杠），doc-asset 再加图片扩展名白名单，doc 限制 1 MiB。
+
+/// 校验相对路径并拼到 cwd 下。返回 None = 不合法/不在白名单目录。
+fn resolve_whitelisted_path(cwd: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains("..")
+        || rel.contains('\\')
+        || rel.contains(':')
+    {
+        return None;
+    }
+    let allowed = rel.starts_with(".latte/learn/") || rel.starts_with("docs/");
+    if !allowed {
+        return None;
+    }
+    Some(cwd.join(rel))
+}
+
+/// `GET /api/doc-asset?path=<相对路径>` —— 文档内嵌图片（白名单目录 +
+/// 图片扩展名白名单）。
+pub(crate) async fn get_doc_asset(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<([(axum::http::header::HeaderName, &'static str); 1], Vec<u8>), (StatusCode, String)> {
+    let rel = params.get("path").map(|s| s.as_str()).unwrap_or("");
+    let ext = std::path::Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let content_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => return Err((StatusCode::BAD_REQUEST, "unsupported asset type".to_string())),
+    };
+    let path = resolve_whitelisted_path(&state.backend.cwd, rel)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "path not allowed".to_string()))?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "asset not found".to_string()))?;
+    Ok(([(axum::http::header::CONTENT_TYPE, content_type)], bytes))
+}
+
+/// `GET /api/doc?path=<相对路径>` —— 只读 markdown 文档（内嵌预览用）。
+/// 仅 .md，白名单目录，上限 1 MiB。
+pub(crate) async fn get_doc(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<([(axum::http::header::HeaderName, &'static str); 1], String), (StatusCode, String)> {
+    let rel = params.get("path").map(|s| s.as_str()).unwrap_or("");
+    if !rel.to_ascii_lowercase().ends_with(".md") {
+        return Err((StatusCode::BAD_REQUEST, "only .md documents".to_string()));
+    }
+    let path = resolve_whitelisted_path(&state.backend.cwd, rel)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "path not allowed".to_string()))?;
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "doc not found".to_string()))?;
+    if meta.len() > MAX_BYTES {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "doc exceeds 1 MiB".to_string()));
+    }
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "doc not found".to_string()))?;
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
+        text,
+    ))
+}
+
+/// `GET /api/code-graph/mermaid?path=<rel>&graph=structure|calls` ——
+/// code_graph 的一键可视化：结构图读预建符号索引，调用图现场扫 ast-grep
+/// （索引定 caller 归属）。返回 mermaid 图源文本，前端塞 ```mermaid
+/// 围栏走统一渲染管线（SVG、放大、下载）。
+pub(crate) async fn get_code_graph_mermaid(
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let path = params.get("path").map(|s| s.as_str()).unwrap_or(".");
+    let graph = params.get("graph").map(|s| s.as_str()).unwrap_or("structure");
+    let cwd = state.backend.cwd.clone();
+    let result = match graph {
+        "structure" => {
+            latte_agent_core::code_graph_viz::structure_mermaid(&cwd, path).await
+        }
+        "calls" => latte_agent_core::code_graph_viz::calls_mermaid(&cwd, path).await,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown graph='{other}'（可选 structure|calls）"),
+            ))
+        }
+    };
+    match result {
+        Ok(g) => Ok(Json(serde_json::json!({
+            "mermaid": g.mermaid,
+            "truncated": g.truncated,
+        }))),
+        Err(msg) => Err((StatusCode::UNPROCESSABLE_ENTITY, msg)),
+    }
+}

@@ -897,3 +897,45 @@ workflow run 进度 SSE 流（独立 session，与主 events 隔离）。
 下载图片（相对 `.latte/images/` 路径）。
 
 **响应 `200`：** image/* 内容
+
+---
+
+## 14. 文档只读资源（markdown 内嵌预览）
+
+> 前端 markdown 渲染把本地相对路径图片改写到 `/api/doc-asset`，把本地
+> `.md` 链接交给内嵌文档查看器（`/api/doc`）。两个路由共用白名单：
+> 只允许读 `<cwd>` 下 `.latte/learn/`、`docs/` 里的文件；拒绝对路径、
+> `..`、反斜杠。
+
+### `GET /api/doc-asset?path=<相对路径>`
+
+读取文档内嵌图片（白名单目录 + 扩展名白名单）。
+
+**支持扩展：** `png` / `jpg` / `jpeg` / `gif` / `webp` / `svg`  
+**错误：** `400` 路径非法或类型不支持；`404` 文件不存在
+
+**响应 `200`：** image/* 内容
+
+### `GET /api/doc?path=<相对路径>`
+
+只读 markdown 文档（内嵌预览用），仅 `.md`，上限 1 MiB。
+
+**错误：** `400` 非 .md 或路径非法；`404` 不存在；`413` 超限
+
+**响应 `200`：** `text/markdown; charset=utf-8` 全文
+
+---
+
+## 15. 代码图谱可视化
+
+> code_graph 的一键可视化：结构图读预建符号索引
+> （`.latte/code_graph/index.json`），调用图现场扫 ast-grep（索引定
+> caller 归属，绕过工具侧的 200 条/字符封顶）。返回 mermaid 图源文本，
+> 前端走统一 ```mermaid 渲染管线。
+
+### `GET /api/code-graph/mermaid?path=<rel>&graph=structure|calls`
+
+**参数：** `path` 相对仓库根（默认 `.`）；`graph` = `structure`（默认）| `calls`  
+**错误：** `400` graph 非法；`422` 索引未构建/范围无符号/ast-grep 缺失等（body 为可读原因）
+
+**响应 `200`：** `{ "mermaid": "flowchart TD\n…", "truncated": false }`

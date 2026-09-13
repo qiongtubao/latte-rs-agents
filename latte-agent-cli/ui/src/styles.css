@@ -473,6 +473,361 @@ select {
   background: rgba(255, 255, 255, 0.45);
 }
 
+/* markdown-body（工具面板 / ask 卡片文档）里的代码块与聊天气泡同款底色。 */
+.markdown-body pre {
+  background: #f1f5f9;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 10px 0 6px;
+  overflow-x: auto;
+  font-family: var(--mono-font);
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+}
+.markdown-body code {
+  background: #f1f5f9;
+  padding: 0.1rem 0.35rem;
+  border-radius: 5px;
+  font-family: var(--mono-font);
+  font-size: 0.85em;
+}
+
+/* ─── code-block 工具条（enhanceCodeBlocks 包裹层） ─────────────── */
+
+.code-block {
+  position: relative;
+}
+.code-block pre {
+  margin-top: 0;
+}
+.code-block-bar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 1;
+}
+.code-block:hover .code-block-bar,
+.code-block-bar:focus-within {
+  opacity: 1;
+}
+.code-block-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #475569;
+  cursor: pointer;
+  font-family: inherit;
+}
+.code-block-btn:hover {
+  background: #ffffff;
+  color: var(--accent-2);
+  border-color: var(--accent-2);
+}
+
+/* ─── mermaid 图表 ─────────────────────────────────────────────── */
+
+.mermaid {
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 10px 0 6px;
+  overflow-x: auto;
+  text-align: center;
+}
+/* 渲染完成前（含流式中途 defer 期间）图源按代码显示，不突兀。 */
+.mermaid:not([data-mermaid-done]) {
+  text-align: left;
+  white-space: pre-wrap;
+  font-family: var(--mono-font);
+  font-size: 0.85em;
+  line-height: 1.45;
+  color: #475569;
+}
+.mermaid.mermaid-error {
+  text-align: left;
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+.mermaid.mermaid-error pre {
+  margin: 0;
+  border: none;
+  background: transparent;
+}
+.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ─── 表格 / 任务列表 / 引用块（markdown-it 新能力） ─────────────── */
+
+.msg-content table,
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 10px 0 6px;
+  font-size: 0.9em;
+  max-width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+.msg-content th, .msg-content td,
+.markdown-body th, .markdown-body td {
+  border: 1px solid var(--border);
+  padding: 5px 10px;
+  text-align: left;
+}
+.msg-content th,
+.markdown-body th {
+  background: #f1f5f9;
+  font-weight: 600;
+}
+.msg-content tr:nth-child(even) td,
+.markdown-body tr:nth-child(even) td {
+  background: #f8fafc;
+}
+
+.msg-content .task-list-item,
+.markdown-body .task-list-item {
+  list-style: none;
+  margin-left: -1.2em;
+}
+.msg-content .task-list-item-checkbox,
+.markdown-body .task-list-item-checkbox {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
+.msg-content blockquote,
+.markdown-body blockquote {
+  margin: 8px 0;
+  padding: 2px 12px;
+  border-left: 3px solid var(--border);
+  color: #64748b;
+  background: #f8fafc;
+  border-radius: 0 8px 8px 0;
+}
+
+/* ─── 折叠块 / 脚注 / 定义列表 / 图片 / 数学公式 ────────────────── */
+
+.md-details {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  margin: 8px 0;
+  background: #f8fafc;
+}
+.md-details summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #334155;
+  padding: 2px 0;
+}
+.md-details[open] summary {
+  margin-bottom: 6px;
+  border-bottom: 1px dashed var(--border);
+}
+
+.msg-content .footnotes,
+.markdown-body .footnotes {
+  font-size: 0.85em;
+  color: #64748b;
+}
+.msg-content .footnotes-sep,
+.markdown-body .footnotes-sep {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 12px 0 6px;
+}
+.msg-content .footnote-ref a,
+.markdown-body .footnote-ref a {
+  text-decoration: none;
+}
+
+.msg-content dl, .markdown-body dl { margin: 8px 0; }
+.msg-content dt, .markdown-body dt { font-weight: 600; color: #334155; }
+.msg-content dd, .markdown-body dd { margin: 2px 0 8px 1.2em; }
+
+.msg-content img,
+.markdown-body img {
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.msg-content .katex-display,
+.markdown-body .katex-display {
+  margin: 10px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* 本地 md 文档链接（内嵌预览入口）。 */
+.msg-content a.doc-link,
+.markdown-body a.doc-link {
+  color: var(--accent-2);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  cursor: pointer;
+}
+.msg-content a.doc-link::before,
+.markdown-body a.doc-link::before {
+  content: "📄 ";
+}
+
+/* ─── mermaid 大图交互 + 通用弹窗 ──────────────────────────────── */
+
+.mermaid {
+  position: relative;
+}
+.mermaid-zoomable svg {
+  cursor: zoom-in;
+}
+.mermaid-bar {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.mermaid:hover .mermaid-bar,
+.mermaid-bar:focus-within {
+  opacity: 1;
+}
+
+.md-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.md-modal {
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.25);
+  display: flex;
+  flex-direction: column;
+  max-width: 96vw;
+  max-height: 96vh;
+  min-width: 360px;
+  min-height: 240px;
+  overflow: hidden;
+  /* 右下角拖拽手柄：窗口大小不写死，用户可自行调整。 */
+  resize: both;
+}
+.md-modal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.md-modal-title {
+  flex: 1;
+  font-size: 13px;
+  color: #475569;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mermaid-modal-box {
+  width: 92vw;
+  height: 90vh;
+}
+.mermaid-viewport {
+  flex: 1;
+  overflow: hidden;
+  background: #f8fafc;
+  cursor: grab;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mermaid-viewport:active {
+  cursor: grabbing;
+}
+.mermaid-canvas {
+  transform-origin: center center;
+  transition: transform 0.05s linear;
+}
+
+/* ─── 文档内嵌预览 ─────────────────────────────────────────────── */
+
+.doc-viewer-box {
+  width: 88vw;
+  height: 88vh;
+}
+.doc-viewer-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+.doc-viewer-toc {
+  width: 220px;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  padding: 12px 10px;
+}
+.doc-viewer-toc-item {
+  display: block;
+  padding: 3px 8px;
+  font-size: 12.5px;
+  color: #475569;
+  text-decoration: none;
+  border-radius: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-viewer-toc-item:hover {
+  background: #f1f5f9;
+  color: var(--accent-2);
+}
+.doc-viewer-toc-item.toc-h4 { padding-left: 20px; }
+.doc-viewer-toc-item.toc-h5 { padding-left: 32px; }
+.doc-viewer-toc-item.toc-h6 { padding-left: 44px; }
+.doc-viewer-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 24px;
+  line-height: 1.6;
+}
+.doc-viewer-loading {
+  color: #64748b;
+  padding: 20px;
+}
+
+/* .markdown-body（工具面板 / 文档查看器）的基础排版：全局 reset 清了
+   margin，这里补回（聊天气泡的 .msg-content 规则在前面已有）。 */
+.markdown-body p { margin: 0 0 8px; }
+.markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+  margin: 14px 0 6px;
+  line-height: 1.35;
+  color: #1e293b;
+}
+.markdown-body h3 { font-size: 1.25em; }
+.markdown-body h4 { font-size: 1.1em; }
+.markdown-body h5 { font-size: 1em; }
+.markdown-body h6 { font-size: 0.92em; }
+.markdown-body ul, .markdown-body ol { margin: 6px 0; padding-left: 1.4em; }
+.markdown-body li + li { margin-top: 2px; }
+.markdown-body a { color: var(--accent-2); text-decoration: underline; }
+
 /* ─── markdown blocks inside messages ─────────────────────────── */
 /* 全局 reset 把 p/h/list 的 margin 都清掉了，这里补回气泡内排版。 */
 
@@ -488,19 +843,22 @@ select {
 }
 .msg-content h3,
 .msg-content h4,
-.msg-content h5 {
+.msg-content h5,
+.msg-content h6 {
   margin: 10px 0 4px;
   line-height: 1.35;
   color: #1e293b;
 }
 .msg-content h3:first-child,
 .msg-content h4:first-child,
-.msg-content h5:first-child {
+.msg-content h5:first-child,
+.msg-content h6:first-child {
   margin-top: 0;
 }
 .msg-content h3 { font-size: 1.1em; }
 .msg-content h4 { font-size: 1.02em; }
 .msg-content h5 { font-size: 0.95em; }
+.msg-content h6 { font-size: 0.9em; }
 .msg-content ul,
 .msg-content ol {
   margin: 4px 0;
@@ -4427,8 +4785,24 @@ select {
   cursor: pointer;
 }
 .choice-doc-toggle:hover { border-color: var(--accent); }
+/* 「大窗查看」与收起按钮同款样式。 */
+.choice-doc-expand {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--accent-2);
+  font-size: 11px;
+  padding: 1px 9px;
+  cursor: pointer;
+}
+.choice-doc-expand:hover { border-color: var(--accent); }
 .choice-doc-body {
-  max-height: 320px;
+  /* 默认高度可拖拽调整（右下角手柄）：不写死，学员自己拉到舒服的大小。 */
+  height: 42vh;
+  min-height: 120px;
+  max-height: 80vh;
+  resize: vertical;
   overflow: auto;
   padding: 0 12px 10px;
   font-size: 13px;
@@ -4608,4 +4982,42 @@ select {
 .tool-doc-layer-chip.layer-active {
   background: rgba(34, 197, 94, 0.12);
   font-weight: 600;
+}
+
+/* ─── code_graph 可视化区（tools panel 详情弹层） ──────────────── */
+
+.code-graph-viz-hint {
+  font-size: 12px;
+  color: #64748b;
+  margin-bottom: 8px;
+}
+.code-graph-viz-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.code-graph-viz-path {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--mono-font);
+  font-size: 12.5px;
+}
+.code-graph-viz-kind {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+}
+.code-graph-viz-result {
+  margin-top: 10px;
+}
+.code-graph-viz-result .mermaid {
+  margin: 0;
+}
+.code-graph-viz-note {
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: #b45309;
 }
