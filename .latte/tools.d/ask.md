@@ -24,5 +24,11 @@
   immediately. If "don't commit yet" genuinely is a valid answer, spell out its action:
   "按阶段拆任务，改动点留作最后一个任务" — not "先不锁方向".
 - Batch related questions into a single `ask` call rather than asking one at a time.
+- **Read-then-answer**: when the user should read a document before answering (study material,
+  a design doc, a plan), pass `document_path` (a project-relative path to the markdown file).
+  The UI renders the document's content inside the question card, above the options — the user
+  reads it inline, then clicks. Don't paste the document text into `question`; just pass the path.
+  If the backend can't read the file it degrades to showing the path only, so no fallback text
+  is needed from you.
 - NEVER set `recommended` on a quiz option — it renders as a literal "✓ 推荐" badge next to the label (i.e. the answer key, printed on the question).
 </critical>

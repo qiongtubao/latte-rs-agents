@@ -350,6 +350,8 @@ mod tests {
             allow_upload: false,
             wait: true,
             options: vec![],
+            document_path: String::new(),
+            document_markdown: String::new(),
             questions: vec![],
         };
         (ev, tx)
@@ -608,6 +610,8 @@ mod tests {
             allow_upload: false,
             wait: true,
             options: vec![],
+            document_path: String::new(),
+            document_markdown: String::new(),
             questions: ids
                 .iter()
                 .map(|id| crate::controller::ChoiceQuestion {
@@ -682,6 +686,8 @@ mod tests {
             allow_upload: false,
             wait: true,
             options: vec![],
+            document_path: String::new(),
+            document_markdown: String::new(),
             questions: vec![],
         };
         let rx = register(id, ev, tx.clone());
@@ -699,6 +705,8 @@ mod tests {
             allow_upload: false,
             wait: true,
             options: vec![],
+            document_path: String::new(),
+            document_markdown: String::new(),
             questions: vec![],
         };
         let rx2 = register(id2, ev2, tx);

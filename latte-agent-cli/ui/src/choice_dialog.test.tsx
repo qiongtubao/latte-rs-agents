@@ -331,4 +331,91 @@ describe("ask 选择框弹窗", () => {
     expect(card.querySelector(".choice-question")!.textContent).toBe("鉴权方案选哪个？");
   });
 
+  // ─── ask 附带的学习文档（document_path / document_markdown）──────
+  it("附带学习文档：markdown 渲染在问题之后、选项之前，可折叠，选项仍可点", () => {
+    const { chat } = mount();
+    chat.handleEvent(
+      choiceEvent({
+        document_path: "docs/jwt-vs-session.md",
+        document_markdown: "# 鉴权方案对比\n\n- JWT 无状态\n- Session 有状态",
+      }),
+    );
+    const card = cardInOverlay()!;
+    const doc = card.querySelector<HTMLElement>(".choice-doc");
+    expect(doc, "应渲染文档块").toBeTruthy();
+    expect(doc!.querySelector(".choice-doc-head")!.textContent).toContain("📄");
+    expect(doc!.querySelector(".choice-doc-head")!.textContent).toContain(
+      "docs/jwt-vs-session.md",
+    );
+    // markdown 被渲染：# 标题 → heading，列表 → ul/li。
+    const body = doc!.querySelector(".choice-doc-body.markdown-body")!;
+    expect(body.querySelector("h3")!.textContent).toContain("鉴权方案对比");
+    expect(body.querySelectorAll("li")).toHaveLength(2);
+    // 位置：问题标题行之后、选项区之前。
+    const children = Array.from(card.children);
+    const headIdx = children.findIndex((c) => c.classList.contains("choice-head"));
+    const docIdx = children.indexOf(doc!);
+    const optsIdx = children.findIndex((c) => c.classList.contains("choice-opts"));
+    expect(headIdx).toBeGreaterThanOrEqual(0);
+    expect(headIdx).toBeLessThan(docIdx);
+    expect(docIdx).toBeLessThan(optsIdx);
+    // 折叠切换：默认展开，点「收起」body 隐藏、按钮文案变「展开」。
+    const toggle = doc!.querySelector<HTMLButtonElement>(".choice-doc-toggle")!;
+    expect(toggle.textContent).toBe("收起");
+    toggle.click();
+    expect(doc!.classList.contains("collapsed")).toBe(true);
+    expect(toggle.textContent).toBe("展开");
+    toggle.click();
+    expect(doc!.classList.contains("collapsed")).toBe(false);
+    // 文档不影响作答：选项按钮仍可点、提交可用。
+    opts()[0].click();
+    expect(submitBtn().disabled).toBe(false);
+  });
+
+  it("多题弹框也渲染附带文档；不带 document_markdown 时零侵入", () => {
+    const { chat } = mount();
+    chat.handleEvent(
+      choiceEvent({
+        choice_id: "choice-multi-doc",
+        document_path: "docs/guide.md",
+        document_markdown: "选前必读",
+        questions: [
+          { id: "q1", question: "第一题", options: [{ label: "a" }, { label: "b" }] },
+          { id: "q2", question: "第二题", options: [{ label: "c" }, { label: "d" }] },
+        ],
+      } as Partial<Extract<ChatEvent, { type: "ChoiceRequested" }>>),
+    );
+    const card = cardInOverlay()!;
+    const doc = card.querySelector<HTMLElement>(".choice-doc");
+    expect(doc, "多题弹框也应有文档块").toBeTruthy();
+    expect(doc!.querySelector(".choice-doc-body")!.textContent).toContain("选前必读");
+    // 文档在所有题块之前。
+    const children = Array.from(card.children);
+    expect(children.indexOf(doc!)).toBeLessThan(
+      children.findIndex((c) => c.classList.contains("choice-questions")),
+    );
+
+    // 缺省/空 document_markdown → 不渲染任何文档块。
+    chat.clear();
+    chat.handleEvent(choiceEvent({ choice_id: "choice-nodoc" }));
+    expect(cardInOverlay()!.querySelector(".choice-doc")).toBeNull();
+    chat.clear();
+    chat.handleEvent(choiceEvent({ choice_id: "choice-emptydoc", document_markdown: "  " }));
+    expect(cardInOverlay()!.querySelector(".choice-doc")).toBeNull();
+  });
+
+  it("归档卡片（历史回放）同样渲染文档块", () => {
+    const { chat, messagesEl } = mount();
+    chat.replayEvents([
+      choiceEvent({
+        document_path: "docs/old.md",
+        document_markdown: "# 旧文档",
+      }),
+    ]);
+    const card = messagesEl.querySelector(".choice-card.answered")!;
+    const doc = card.querySelector(".choice-doc");
+    expect(doc, "归档卡片也应渲染文档块").toBeTruthy();
+    expect(doc!.querySelector(".choice-doc-body h3")!.textContent).toContain("旧文档");
+  });
+
 });

@@ -197,6 +197,11 @@ export type ChatEvent =
       layout?: string; // "grid" | "" (list)
       allow_upload?: boolean;
       wait?: boolean;
+      /** ask 附带的学习文档：项目内相对路径（卡片文档块标题用）。 */
+      document_path?: string;
+      /** 学习文档的 markdown 全文（卡片内渲染用；前端经 renderMarkdown
+       *  先转义再渲染，与聊天正文同一安全口径）。空/缺失 = 不渲染文档块。 */
+      document_markdown?: string;
       options: ChoiceOption[];
       /** **多题弹框**：一次问 N 道，渲染成一个弹框、收齐后一次提交。
        *  空/缺省 = 单题形态（用上面的 question/options/multi/…）。

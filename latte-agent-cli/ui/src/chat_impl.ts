@@ -164,6 +164,50 @@ export function renderMarkdown(text: string): string {
   return parts.join("");
 }
 
+/** ask 卡片附带的 markdown 学习文档：插在问题标题行之后、选项区之前
+ * （单题与多题弹框共用）。`document_markdown` 为空/缺失时不渲染任何
+ * 东西——不带文档的旧事件零侵入。归档卡片同样渲染：内容内联在事件里，
+ * 不依赖文件还在不在。
+ *
+ * 安全口径与聊天正文一致：文档来自模型（不可信），body 走
+ * `renderMarkdown`（内部先 escapeHtml 再渲染，无注入面）；路径标题走
+ * textContent。 */
+function appendChoiceDocument(card: HTMLElement, e: ChoiceRequestedEvent): void {
+  const md = e.document_markdown?.trim();
+  if (!md) return;
+  const doc = document.createElement("div");
+  doc.className = "choice-doc";
+
+  const head = document.createElement("div");
+  head.className = "choice-doc-head";
+  const icon = document.createElement("span");
+  icon.textContent = "📄";
+  head.appendChild(icon);
+  const path = document.createElement("span");
+  path.className = "choice-doc-path";
+  path.textContent = e.document_path?.trim() || "学习文档";
+  head.appendChild(path);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "choice-doc-toggle";
+  toggle.textContent = "收起";
+  head.appendChild(toggle);
+  doc.appendChild(head);
+
+  const body = document.createElement("div");
+  body.className = "choice-doc-body markdown-body";
+  body.innerHTML = renderMarkdown(md);
+  doc.appendChild(body);
+
+  toggle.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const collapsed = doc.classList.toggle("collapsed");
+    toggle.textContent = collapsed ? "展开" : "收起";
+  });
+
+  card.appendChild(doc);
+}
+
 export function mountChat(opts: {
   container: UIBinding; initialRole: string; initialModel?: string;
   onRoleSwitch?: (roleId: string) => Promise<void>;
@@ -906,6 +950,8 @@ export function mountChat(opts: {
     chip.textContent = `${questions.length} 道题 · 全部答完后一起提交`;
     head.appendChild(chip);
     card.appendChild(head);
+    // 附带的学习文档：标题行之后、选项区之前。
+    appendChoiceDocument(card, e);
 
     /** 每题的选中项标签（按题序）。 */
     const picked: (string[] | null)[] = questions.map(() => null);
@@ -1121,6 +1167,8 @@ export function mountChat(opts: {
     questionEl.textContent = e.question;
     head.appendChild(questionEl);
     card.appendChild(head);
+    // 附带的学习文档：标题行之后、选项区之前。
+    appendChoiceDocument(card, e);
 
     const optsWrap = document.createElement("div");
     optsWrap.className = "choice-opts" + (grid ? " grid" : "");

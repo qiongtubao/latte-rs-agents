@@ -4393,6 +4393,69 @@ select {
 .choice-chip.multi { color: #7c3aed; background: #ede9fe; }
 .choice-question { font-size: 14px; font-weight: 600; line-height: 1.5; }
 
+/* ask 附带的学习文档（document_markdown）：左侧竖线 + 浅底色，与问题正文区分；
+   body 限高滚动，避免长文档把选项按钮顶出视口。默认展开，.collapsed 收起到只剩标题行。 */
+.choice-doc {
+  margin: 8px 12px 0;
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--bg-2, #f8fafc);
+}
+.choice-doc-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--fg-2);
+}
+.choice-doc-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.choice-doc-toggle {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--accent-2);
+  font-size: 11px;
+  padding: 1px 9px;
+  cursor: pointer;
+}
+.choice-doc-toggle:hover { border-color: var(--accent); }
+.choice-doc-body {
+  max-height: 320px;
+  overflow: auto;
+  padding: 0 12px 10px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.choice-doc.collapsed .choice-doc-body { display: none; }
+/* markdown 排版（.msg-content 那套只管聊天气泡，这里单独补一份） */
+.choice-doc-body p { margin: 0; }
+.choice-doc-body p + p,
+.choice-doc-body p + ul,
+.choice-doc-body p + ol,
+.choice-doc-body ul + p,
+.choice-doc-body ol + p { margin-top: 6px; }
+.choice-doc-body h3,
+.choice-doc-body h4,
+.choice-doc-body h5 { margin: 8px 0 4px; line-height: 1.35; color: #1e293b; }
+.choice-doc-body h3:first-child,
+.choice-doc-body h4:first-child,
+.choice-doc-body h5:first-child { margin-top: 0; }
+.choice-doc-body h3 { font-size: 1.1em; }
+.choice-doc-body h4 { font-size: 1.02em; }
+.choice-doc-body h5 { font-size: 0.95em; }
+.choice-doc-body ul,
+.choice-doc-body ol { margin: 4px 0; padding-left: 1.4em; }
+.choice-doc-body pre { overflow: auto; }
+.choice-doc-body a { color: var(--accent-2); word-break: break-all; }
+
 /* 「详情」按钮 + 优缺点面板 */
 .choice-detail-btn {
   margin-top: 6px;

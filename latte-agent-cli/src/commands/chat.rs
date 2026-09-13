@@ -1257,6 +1257,7 @@ async fn build_runner(
                 role_id.to_string(),
                 None,
                 Some((cwd.to_path_buf(), cli_session_id())),
+                Some(cwd.to_path_buf()),
             )
             .map_err(|e| format!("ask tool setup failed: {}", e))?;
         }
@@ -1744,6 +1745,10 @@ struct AskRequest {
     allow_upload: bool,
     /// `"grid"` = 图片网格。终端画不了，降级成列表并说明。
     layout: String,
+    /// 附带文档的项目内相对路径（空 = 无）。
+    document_path: String,
+    /// 后端读出的文档 markdown 全文；非空时打印在问题上方。
+    document_markdown: String,
     options: Vec<latte_agent_core::controller::ChoiceOption>,
 }
 
@@ -1764,6 +1769,8 @@ fn terminal_ask_answerer() -> AskAnswerer {
                 req.multi,
                 req.allow_upload,
                 &req.layout,
+                &req.document_path,
+                &req.document_markdown,
                 &req.options,
             )
             .await
@@ -1810,6 +1817,8 @@ fn spawn_cli_workflow_event_consumer_with(
                     options,
                     allow_upload,
                     layout,
+                    document_path,
+                    document_markdown,
                     ..
                 }) => {
                     if !wait {
@@ -1827,6 +1836,8 @@ fn spawn_cli_workflow_event_consumer_with(
                         multi,
                         allow_upload,
                         layout,
+                        document_path,
+                        document_markdown,
                         options,
                     };
                     let answer = match answerer(req).await {
@@ -1996,9 +2007,20 @@ async fn prompt_choice_on_terminal(
     multi: bool,
     allow_upload: bool,
     layout: &str,
+    document_path: &str,
+    document_markdown: &str,
     options: &[latte_agent_core::controller::ChoiceOption],
 ) -> Option<String> {
     let mut rendered = String::new();
+    // 附带文档（"先读材料再答题"）：打印在问题上方。终端可滚动，
+    // 直接全量打印；上限已由后端截断（256 KB）。
+    if !document_markdown.is_empty() {
+        rendered.push_str(&format!(
+            "\n📄 文档：{document_path}（{} 字），请先阅读：\n{}\n",
+            document_markdown.chars().count(),
+            document_markdown
+        ));
+    }
     rendered.push_str(&format!("\n❓ [{role_id}] {question}\n"));
     // 终端没有上传通道，也画不了图片网格。模型以为用户能上传/看网格时
     // 必须显式说明，否则用户被问一个答不了的问题（`allow_upload` 与
@@ -3385,6 +3407,8 @@ mod tests {
             // CLI 测试 helper，导致 --tests 编译一直是坏的）：单题形态
             // 走 question/options，questions 留空。
             questions: vec![],
+            document_path: String::new(),
+            document_markdown: String::new(),
             multi,
             layout: String::new(),
             allow_upload: false,

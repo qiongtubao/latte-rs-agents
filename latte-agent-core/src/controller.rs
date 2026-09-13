@@ -538,6 +538,13 @@ pub enum ChatEvent {
         #[serde(default)]
         wait: bool,
         options: Vec<ChoiceOption>,
+        /// 附带文档的项目内相对路径（模型给的 `document_path` 原样），UI 显示标题用。
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        document_path: String,
+        /// 后端读出的文档 markdown 全文；空 = 无附带文档。内联而非只传路径，
+        /// 是为了归档卡片/断线恢复后文档仍可渲染。
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        document_markdown: String,
         /// **多题**弹框：一次问 N 道，前端渲染成一个弹框、收齐后一次提交。
         ///
         /// 空 = 单题形态（用上面的 `question`/`options`/`multi`/`layout`/
@@ -3446,6 +3453,7 @@ async fn build_runner(
                 role_id.to_string(),
                 None,
                 Some((cwd.to_path_buf(), session_id.to_string())),
+                Some(cwd.to_path_buf()),
             )
             .map_err(|e| AgentError::Tool(format!("register ask: {e}")))?;
         }
@@ -6418,6 +6426,38 @@ fn choice_option_input_property() -> latte_rs_agent_tools::types::ToolInputPrope
     .with_object(properties, None, Some(true.into()))
 }
 
+/// ask 附带文档的读取上限：超过即截断，避免把超大文件塞进事件载荷
+/// （事件要进 SSE / event_log / pending-asks 快照）。
+const ASK_DOCUMENT_MAX_BYTES: usize = 256 * 1024;
+
+/// 读 ask 的 `document_path`：相对 `project_root` join 后 canonicalize，
+/// 逃逸出项目根 / 文件不存在 / 读失败都返回 Err——由调用方降级为空
+/// 文档并提示，提问本身不中断。超过 [`ASK_DOCUMENT_MAX_BYTES`] 截断并
+/// 在末尾标注。
+fn read_ask_document(project_root: &Path, rel: &str) -> Result<String, String> {
+    let root = project_root
+        .canonicalize()
+        .map_err(|e| format!("项目根 canonicalize 失败: {e}"))?;
+    let canon = root
+        .join(rel)
+        .canonicalize()
+        .map_err(|e| format!("文件不存在或不可读: {e}"))?;
+    if !canon.starts_with(&root) {
+        return Err("路径逃逸出项目根".into());
+    }
+    let content =
+        std::fs::read_to_string(&canon).map_err(|e| format!("读取失败: {e}"))?;
+    if content.len() > ASK_DOCUMENT_MAX_BYTES {
+        let mut end = ASK_DOCUMENT_MAX_BYTES;
+        while !content.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        Ok(format!("{}\n\n…（文档过长，已截断）", &content[..end]))
+    } else {
+        Ok(content)
+    }
+}
+
 /// 注册 `ask` 工具：角色向用户抛出一道**选择题**（可带图片、图片
 ///
 /// 两种语义（由 `blocking` 决定）：
@@ -6443,6 +6483,9 @@ pub fn register_ask_tool(
     // 阻塞分支不看这个参数——它走 `AskBlocking::answer_log` 那条
     // 带 wf_id 的落盘路径（可续跑）。
     persist: Option<(PathBuf, String)>,
+    // 项目根：`document_path` 相对它解析（canonicalize + 逃逸检查）。
+    // `None` 时附带文档降级为空，提问照常。
+    project_cwd: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{
         PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
@@ -6454,10 +6497,10 @@ pub fn register_ask_tool(
 
     let mut options_property = input_property(
         PropertyType::Array,
-        "2–6 个候选项；不要添加 Other，前端会自动提供自定义入口。",
+        "1–6 个候选项；不要添加 Other，前端会自动提供自定义入口。选择题给 2 项以上；「读完了吗/确认继续」这类确认型门槛给 1 项（如\"开始答题\"）即可。",
     )
     .with_items(choice_option_input_property());
-    options_property.min_length = Some(2);
+    options_property.min_length = Some(1);
     options_property.max_length = Some(6);
 
     let input_schema = ToolInputSchema {
@@ -6493,6 +6536,13 @@ pub fn register_ask_tool(
                 items: None, properties: None, required: None, additional_properties: None,
             ref_: None,
             }),
+            ("document_path".into(), ToolInputProperty {
+                property_type: PropertyType::String,
+                description: Some("项目内相对路径的 markdown 学习/参考文档。传入后 UI 会把文档内容渲染在问题和选项上方，用户读完再作答。适用于“先读材料再答题”的场景。不要用它在问题里塞大段文字。".into()),
+                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
+            ref_: None,
+            }),
             ("questions".into(), ToolInputProperty {
                 property_type: PropertyType::Array,
                 description: Some("**一次问多道题**（推荐：需要多个维度才能决策时用这个，不要一轮连发多次 ask）。每项 {question, options, multi?, layout?, allow_upload?}，语义与顶层同名参数一致。用户会在**一个弹框里答完全部题目**、答案一起回来，你只需等这一批答完。⚠️ 与顶层 question/options 二选一：给了 questions 就不要再给 question/options。".into()),
@@ -6519,6 +6569,7 @@ pub fn register_ask_tool(
         let role_id = handler_role_id.clone();
         let blocking = blocking.clone();
         let persist = persist.clone();
+        let project_cwd = project_cwd.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -6579,8 +6630,13 @@ pub fn register_ask_tool(
                     _ => return Err(tool_err("'options' must be an array".into())),
                 }
             };
-            if !has_questions && opts_arr.len() < 2 {
-                return Err(tool_err("'options' must have at least 2 entries".into()));
+            // 单题至少 1 项：选择题为 2+，但「读完了吗/确认继续」这类确认型
+            // 门槛（如 learn_loop 的 read_confirm）合理形态就是只有一个
+            // 「开始答题」按钮。实测（2026-09-13 jemalloc 会话）：强要 2 项
+            // 时模型被拒两次后编造「我还在读，稍等」凑数——假选项比放宽
+            // 校验更有害。
+            if !has_questions && opts_arr.is_empty() {
+                return Err(tool_err("'options' must have at least 1 entry".into()));
             }
             let mut options: Vec<ChoiceOption> = Vec::with_capacity(opts_arr.len());
             for (i, o) in opts_arr.iter().enumerate() {
@@ -6617,6 +6673,35 @@ pub fn register_ask_tool(
                 .filter(|s| *s == "grid")
                 .unwrap_or("")
                 .to_string();
+
+            // 附带文档：模型传 `document_path` 时后端读文件、把 markdown
+            // 内联进事件（归档卡片/断线恢复后仍可渲染）。读取失败不中断
+            // 提问——降级为空文档 + 一条 Status 说明。
+            let document_path = input
+                .get("document_path")
+                .or_else(|| input.get("documentPath"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_default();
+            let mut document_markdown = String::new();
+            if !document_path.is_empty() {
+                let outcome = match project_cwd.as_deref() {
+                    Some(root) => read_ask_document(root, &document_path),
+                    None => Err("无项目根上下文".to_string()),
+                };
+                match outcome {
+                    Ok(md) => document_markdown = md,
+                    Err(reason) => {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: format!(
+                                "⚠️ ask 附带文档读取失败（{document_path}）：{reason}，提问照常继续"
+                            ),
+                        });
+                    }
+                }
+            }
 
             // 回放：这个问题本 run（含 resume 继承）已经答过了 → 直接把
             // 旧答案当工具结果返回。必须在**发 ChoiceRequested 之前**
@@ -6739,6 +6824,8 @@ pub fn register_ask_tool(
                 allow_upload,
                 wait: blocking.is_some(),
                 options,
+                document_path,
+                document_markdown,
                 questions: questions.clone(),
             };
             let Some(blk) = blocking else {
@@ -10128,7 +10215,7 @@ mod tests {
     async fn ask_event_carries_pros_cons_and_multi() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "architect".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "architect".into(), None, None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "鉴权方案？",
@@ -10162,7 +10249,7 @@ mod tests {
     async fn ask_infers_multi_from_question_text() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
 
         // 与线上 args 同形：只有 question + options，无任何 multi 键。
         let input = serde_json::json!({
@@ -10190,7 +10277,7 @@ mod tests {
     async fn ask_stays_single_select_without_multi_markers() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
 
         tm.execute("ask", ask_input(), None).await.expect("ask call");
         let ev = rx.try_recv().expect("ChoiceRequested event");
@@ -10233,11 +10320,189 @@ mod tests {
         })
     }
 
+    // ─── ask 附带文档（document_path → document_markdown 内联）────────
+
+    /// 从事件通道里取出第一条 ChoiceRequested；降级路径会先有一条
+    /// Status 警告，跳过它。返回 (ChoiceRequested 字段, 是否见过文档警告)。
+    fn recv_choice(rx: &mut broadcast::Receiver<ChatEvent>) -> (String, String, bool) {
+        let mut saw_doc_warning = false;
+        loop {
+            match rx.try_recv().expect("至少有一条事件") {
+                ChatEvent::Status { message } if message.contains("附带文档读取失败") => {
+                    saw_doc_warning = true;
+                }
+                ChatEvent::ChoiceRequested {
+                    document_path,
+                    document_markdown,
+                    ..
+                } => return (document_path, document_markdown, saw_doc_warning),
+                _ => {}
+            }
+        }
+    }
+
+    /// `document_path` 指向项目内存在的 md：后端读文件，把内容原样
+    /// 内联进事件的 `document_markdown`（归档/断线恢复后仍可渲染）。
+    #[tokio::test]
+    async fn ask_document_inlines_markdown_into_event() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/lesson.md"), "# 第一课\n\n先读我。").unwrap();
+
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "tutor".into(),
+            None,
+            None,
+            Some(dir.path().to_path_buf()),
+        )
+        .expect("register ask");
+
+        tm.execute(
+            "ask",
+            serde_json::json!({
+                "question": "读完材料后回答：选哪个？",
+                "document_path": "docs/lesson.md",
+                "options": [{"label": "方案A"}, {"label": "方案B"}]
+            }),
+            None,
+        )
+        .await
+        .expect("ask call");
+
+        let (path, markdown, warned) = recv_choice(&mut rx);
+        assert_eq!(path, "docs/lesson.md", "路径原样透传给 UI 显示标题");
+        assert_eq!(markdown, "# 第一课\n\n先读我。");
+        assert!(!warned, "读取成功不应有降级警告");
+    }
+
+    /// `document_path` 逃逸出项目根：canonicalize 后不在项目根内 →
+    /// 降级为空文档 + Status 警告，提问照常、不 panic。
+    #[tokio::test]
+    async fn ask_document_path_escape_degrades_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("proj")).unwrap();
+        std::fs::write(dir.path().join("escape.md"), "根外的文件").unwrap();
+
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "tutor".into(),
+            None,
+            None,
+            Some(dir.path().join("proj")),
+        )
+        .expect("register ask");
+
+        tm.execute(
+            "ask",
+            serde_json::json!({
+                "question": "选哪个？",
+                "document_path": "../escape.md",
+                "options": [{"label": "方案A"}, {"label": "方案B"}]
+            }),
+            None,
+        )
+        .await
+        .expect("逃逸路径不应让提问失败");
+
+        let (path, markdown, warned) = recv_choice(&mut rx);
+        assert_eq!(path, "../escape.md", "路径仍原样透传");
+        assert!(markdown.is_empty(), "逃逸路径不得读到任何内容");
+        assert!(warned, "降级必须对用户可见（Status 警告）");
+    }
+
+    /// `document_path` 指向不存在的文件：降级为空文档，提问事件照常发出。
+    #[tokio::test]
+    async fn ask_document_missing_file_degrades_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(
+            &tm,
+            event_tx,
+            "tutor".into(),
+            None,
+            None,
+            Some(dir.path().to_path_buf()),
+        )
+        .expect("register ask");
+
+        tm.execute(
+            "ask",
+            serde_json::json!({
+                "question": "选哪个？",
+                "document_path": "docs/nope.md",
+                "options": [{"label": "方案A"}, {"label": "方案B"}]
+            }),
+            None,
+        )
+        .await
+        .expect("文件不存在不应让提问失败");
+
+        let (path, markdown, warned) = recv_choice(&mut rx);
+        assert_eq!(path, "docs/nope.md");
+        assert!(markdown.is_empty());
+        assert!(warned);
+    }
+
+    /// 单选项确认型提问（learn_loop read_confirm 的「开始答题」只有一个
+    /// 按钮）必须合法——2026-09-13 jemalloc 实测：强要 2 项时模型被拒后
+    /// 编造凑数选项。
+    #[tokio::test]
+    async fn ask_single_option_confirmation_is_allowed() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
+
+        tm.execute(
+            "ask",
+            serde_json::json!({
+                "question": "学习材料（第 1 版）：draft.md。读完了吗？",
+                "options": [{"label": "开始答题，验证掌握程度", "description": "我已读完文档"}]
+            }),
+            None,
+        )
+        .await
+        .expect("单选项确认型提问不应被拒绝");
+
+        let ev = rx.try_recv().expect("ChoiceRequested event");
+        let ChatEvent::ChoiceRequested { options, .. } = ev else {
+            panic!("expected ChoiceRequested, got {ev:?}");
+        };
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].label, "开始答题，验证掌握程度");
+    }
+
+    /// 空 options 仍然拒绝（没有选项就不是提问）。
+    #[tokio::test]
+    async fn ask_empty_options_still_rejected() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
+
+        let err = tm
+            .execute(
+                "ask",
+                serde_json::json!({"question": "选哪个？", "options": []}),
+                None,
+            )
+            .await
+            .expect_err("空 options 必须报错");
+        assert!(err.to_string().contains("at least 1 entry"), "{err}");
+    }
+
     #[tokio::test]
     async fn ask_fire_and_forget_returns_immediately_with_wait_false() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None, None).expect("register ask");
 
         let out = tm.execute("ask", ask_input(), None).await.expect("ask call");
         let text = out.as_str().expect("string result");
@@ -10264,6 +10529,7 @@ mod tests {
                 answer_log: None,
                 role_id: "manager".into(),
             }),
+            None,
             None,
         )
         .expect("register ask");
@@ -10305,6 +10571,7 @@ mod tests {
                 answer_log: None,
                 role_id: "manager".into(),
             }),
+            None,
             None,
         )
         .expect("register ask");
@@ -10350,7 +10617,7 @@ mod tests {
     async fn ask_accepts_string_bool_in_option_recommended() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "第 4 题：你最想深入的方向？",
@@ -10376,7 +10643,7 @@ mod tests {
     async fn ask_tolerates_garbage_recommended_without_failing() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "tutor".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "选哪个？",
@@ -10414,7 +10681,7 @@ mod tests {
     async fn ask_normalizes_wrapped_options_and_aliases() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "programmer".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "programmer".into(), None, None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "归档份数：你希望按哪种粒度归档？",
@@ -10443,7 +10710,7 @@ mod tests {
     async fn ask_accepts_string_bool_for_multi_and_allow_upload() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "多选题",
@@ -10469,7 +10736,7 @@ mod tests {
     async fn ask_rejects_ambiguous_options_object() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None, None).expect("register ask");
 
         let input = serde_json::json!({
             "question": "q",
@@ -10487,7 +10754,7 @@ mod tests {
     async fn coercion_leaves_undeclared_and_unrecognized_values_alone() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "manager".into(), None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "manager".into(), None, None, None).expect("register ask");
         let schema = tm.get_tool("ask").expect("ask").input_schema;
 
         let out = crate::agent::coerce_tool_input_to_schema(
@@ -10698,6 +10965,7 @@ mod tests {
                 role_id: "tutor".into(),
             }),
             None,
+            None,
         )
         .expect("register ask");
 
@@ -10766,6 +11034,7 @@ mod tests {
                 answer_log: None,
                 role_id: "tutor".into(),
             }),
+            None,
             None,
         )
         .expect("register ask");
@@ -10842,6 +11111,7 @@ mod tests {
                 answer_log: None,
                 role_id: "manager".into(),
             }),
+            None,
             None,
         )
         .expect("register ask");
@@ -11987,6 +12257,8 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            document_path: String::new(),
+            document_markdown: String::new(),
             questions: vec![],
         };
         let wire = crate::event_json::chat_event_to_frontend_json(&event).expect("frontend json");

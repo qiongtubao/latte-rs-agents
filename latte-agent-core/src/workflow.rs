@@ -3150,6 +3150,8 @@ async fn build_role_runner(
                 // 阻塞分支不用这个：它走 AskBlocking::answer_log 那条
                 // 带 wf_id 的落盘路径（可续跑），比非阻塞快照更完整。
                 None,
+                // document_path 相对项目根解析（与 controller 顶层对齐）。
+                Some(cwd.to_path_buf()),
             )
             .map_err(|e| format!("register ask for '{role_id}': {e}"))?;
         }
