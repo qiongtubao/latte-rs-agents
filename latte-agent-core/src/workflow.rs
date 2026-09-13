@@ -84,18 +84,18 @@ pub struct OutputContract {
     pub require: Vec<String>,
     /// 必须**至少出现一个**的子串（OR 语义）。`require` 是 AND，表达
     /// 不了「二选一必须选一个」——learn_loop 的 quiz 步末行只能是
-    /// `STATUS_ALL_DONE` 或 `STATUS_CONTINUE`，两者都不写时循环控制就
-    /// 失去依据（引擎按"不含 loop_until"判返工，等于把"讲完了"误当成
-    /// "还没讲完"）。空 = 不校验。
+    /// `QUIZ_PASS` 或 `QUIZ_FAIL`，两者都不写时循环控制就
+    /// 失去依据（引擎按"不含 loop_until"判返工，等于把"全对"误当成
+    /// "有错返工"）。空 = 不校验。
     #[serde(default)]
     pub require_any: Vec<String>,
     /// 产出**最后一个非空行**必须以其中之一开头（OR 语义）。空 = 不校验。
     ///
     /// 为什么单独查末行而不是用 `require`/`require_any` 的子串检查：
-    /// 下游步骤是按「末行」取值的（quiz 从 teach 产出的末行取
-    /// `TEACH_DONE <id>` 决定考哪个知识点），而子串检查只要正文里任何
+    /// 引擎与下游步骤是按「末行」取循环状态标记的（learn_loop 的 quiz
+    /// 末行 `QUIZ_PASS` / `QUIZ_FAIL`），而子串检查只要正文里任何
     /// 位置出现过就算过——模型把标记写在中间、末行是一句总结时，契约
-    /// 通过而下游解析失败，表现为"讲了 k1 却考 k2"。
+    /// 通过而循环控制拿不到依据。
     #[serde(default)]
     pub last_line_prefix_any: Vec<String>,
 }
@@ -3227,6 +3227,14 @@ struct SpeakerDispatch {
     staging: Option<Arc<crate::staging::Staging>>,
     /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
     step_tools: Vec<String>,
+    /// 本 step 的 `output_contract.max_chars`（产出形状上限）。它决定
+    /// advisor D5 ShortOutput 闸门是否适用：契约明确要求"产出只是一个
+    /// 短标识"的 step（learn_loop 的 plan 只许输出 slug 本身，≤60 字符），
+    /// 必然低于 D5 的 50 字节阈值——不放宽就是"契约越守规矩越被判死"
+    /// （实测：plan 三次输出 slug 均被 D5 打回，workflow 以
+    /// AdvisorTerminated 告终）。短产出的下限由契约自己的 min_chars +
+    /// 重试链兜底，D5 对这类 step 没有额外信息量。
+    step_max_chars: Option<usize>,
     /// 用户回答台账：阻塞 `ask` 收到答案即落盘，同一问题重试/resume
     /// 时直接回放，不再让用户重答一遍。
     answer_log: Arc<AnswerLog>,
@@ -3271,12 +3279,32 @@ impl SpeakerDispatch {
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
             step_tools,
+            // 测试构造器不关联具体 step 契约；生产站点（引擎派发处）
+            // 按 step.output_contract.max_chars 显式写入。
+            step_max_chars: None,
             answer_log,
             // 默认不接管；需要 require_plan_submit 的 step 由引擎在
             // 构造后写入自己的句柄。
             plan_stage: None,
         }
     }
+}
+
+/// 按 step 的产出形状约束调整 advisor gate：`output_contract.max_chars`
+/// 存在的 step 豁免 D5 ShortOutput（阈值降为 0）。理由见
+/// [`SpeakerDispatch::step_max_chars`]——契约已经要求"只输出一个短标识"
+/// 时，D5 的短输出判定必然误杀（实测：learn_loop plan 的 slug 产出
+/// 29 字节 < 阈值 50，连续 3 次被打回后 workflow 以 AdvisorTerminated
+/// 告终）。下限由契约自己的 min_chars + 批注重试链把关，D6 等其他
+/// 探测器不受影响。
+fn gate_for_step(
+    mut gate: crate::advisor_monitor::GateConfig,
+    step_max_chars: Option<usize>,
+) -> crate::advisor_monitor::GateConfig {
+    if step_max_chars.is_some() {
+        gate.short_output_threshold = 0;
+    }
+    gate
 }
 
 /// Run one dispatched speaker as a full subagent, mirroring the
@@ -3485,7 +3513,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     r = r.with_sink(specialist_sink);
                 }
                 if let Some(gate) = inp.advisor_gate.clone() {
-                    r = r.with_gate_config(gate);
+                    r = r.with_gate_config(gate_for_step(gate, inp.step_max_chars));
                 }
                 // intervene 暂停门也装到专家 runner：运行中判 Intervene 时在
                 // tool-round 边界 park，直到用户拍板（或超时自动恢复）。
@@ -4162,6 +4190,7 @@ async fn run_workflow_serial(
                         topic.to_string(),
                     );
                     dispatch.plan_stage = plan_stage.clone();
+                    dispatch.step_max_chars = step.output_contract.max_chars;
                     let (mut response, tools_called) = match run_step_speaker(dispatch).await {
                         Ok(o) => (o.response, o.tools),
                         Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
@@ -4728,6 +4757,7 @@ async fn run_dag_step(
                 advisor_pause: inp.advisor_pause.clone(),
                 staging: inp.staging.clone(),
                 step_tools: step.tools.clone(),
+                step_max_chars: step.output_contract.max_chars,
                 answer_log: inp.answer_log.clone(),
                 plan_stage: plan_stage.clone(),
             };
@@ -6524,21 +6554,28 @@ role = "reviewer"
         assert_eq!(wf.steps[4].roles(), vec!["programmer"], "fix 只改");
         assert_eq!(wf.steps[5].roles(), vec!["reviewer"], "recheck 独立复核");
     }
-    /// learn_loop：交互式学习循环——plan（取证+拆解+出题+写账本）→ teach
-    /// （只讲解）→ quiz（只出题判分，未学完 loop_back_to teach）→ report。
+    /// learn_loop v2：文档驱动学习循环——plan（取证+拆解+出题）→ doc（写/增强
+    /// draft.md）→ read_confirm（「开始答题」按钮）→ quiz（批量出题+判分+写账本，
+    /// 有错回 doc 增强）→ supplement（全对后问补充疑问，有补充回 doc）→ merge
+    /// （定稿 docs/learn/<slug>.md）→ report。
+    /// 设计文档：docs/learn-loop-doc-driven-design.md。
     ///
-    /// 这个测试锁的是实测会话暴露的三个缺陷的修复：
-    ///   1. **答案泄漏**：旧设计要求把正确答案标成 options 里的
-    ///      `recommended`，而该字段在前端渲染成字面的「✓ 推荐」徽标
-    ///      （`chat_impl.ts`）——等于把答案印在题面上。现在答案只存
-    ///      plan.json 的 `answer` 字段，workflow 明文禁止传 recommended。
-    ///   2. **先考后教**：旧设计把讲解与出题塞进同一个 step，实测模型把
-    ///      讲解写进 <think> 块、可见正文为空就直接 ask 弹窗阻塞 28.9 分钟，
-    ///      学员看到一道没有课的考题。拆成 teach / quiz 两步，讲解一定先
-    ///      落到主 session。
-    ///   3. **凭记忆出题**：旧设计 plan 步全部工具调用是 2 次 write（0 次读
-    ///      源码），5 道题里 3 道的"正确答案"是幻觉。现在 plan 步必须先取证、
-    ///      每个知识点带 evidence（file:line）。
+    /// 这个测试锁的结构要点（前身的实测教训仍然算数）：
+    ///   1. **文档消息与答题按钮分属两步**：step 正文只在 step 结束时投递、ask
+    ///      在中途阻塞——合成一步时学员先看到弹窗、答完才看到文档路径。所以
+    ///      文档路径由 doc 步正文交付，答题按钮独占 read_confirm 步。
+    ///   2. **凭记忆出题**：plan 步实测事故——0 次读源码、5 道题里 3 道的
+    ///      "正确答案"是幻觉。plan 必须先取证（require_tools_any），每个知识
+    ///      点带 evidence（file:line）；doc 步同理，必须真 write 落盘。
+    ///   3. **答案泄漏**：options 禁止 recommended（前端渲染成「✓ 推荐」= 印
+    ///      答案）；ask 没有洗牌实现（handler 不解析 shuffle），正确项位置由
+    ///      plan 自己随机打散，判分按 label 文本、绝不按位置。
+    ///   4. **同题复用回放**：ask 的 allow_repeat 未实现，同一题面文本重问
+    ///      会被 AnswerLog 静默回放旧答案、不弹窗——read_confirm / quiz 重考
+    ///      / supplement 这些跨轮次重复的 ask，题面都必须嵌轮次号。
+    ///   5. **编造判分**：quiz 实测事故——没调 ask，拿上一轮旧答案编了一段
+    ///      「判分结果」，子串契约完全满足。所以 require_tools 核对真实工具
+    ///      调用、tool_call_limits 钉「恰好一窗」。
     #[test]
     fn learn_loop_workflow_structure() {
         let raw = include_str!("../../config/workflows/learn_loop.toml");
@@ -6565,157 +6602,45 @@ role = "reviewer"
         }
 
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["plan", "teach", "quiz", "report"]);
+        assert_eq!(
+            ids,
+            ["plan", "doc", "read_confirm", "quiz", "supplement", "merge", "report"]
+        );
 
         let plan = &wf.steps[0];
-        let teach = &wf.steps[1];
-        let quiz = &wf.steps[2];
-        let report = &wf.steps[3];
-        for s in [plan, teach, quiz, report] {
-            assert_eq!(s.roles(), vec!["tutor"]);
+        let doc = &wf.steps[1];
+        let read_confirm = &wf.steps[2];
+        let quiz = &wf.steps[3];
+        let supplement = &wf.steps[4];
+        let merge = &wf.steps[5];
+        let report = &wf.steps[6];
+        for s in &wf.steps {
+            assert_eq!(s.roles(), vec!["tutor"], "step {} 必须是 tutor", s.id);
         }
 
-        // ── 缺陷 3：plan 必须先取证再出题 ──
+        // ── plan：先取证再出题，产出只是 slug ──
         assert!(plan.task_text().contains("code_graph"), "plan 必须要求用 code_graph 取证");
         assert!(plan.task_text().contains("evidence"), "plan 必须要求记 evidence 出处");
         assert!(plan.task_text().contains("ledger.json"));
-
-        // ── 缺陷 2：讲解与出题分属两步，循环跨步回跳 ──
-        // 循环标记只挂在 quiz 上：teach 不负责循环控制，也不许出题。
-        assert!(teach.loop_until.is_none(), "teach 不该是循环步");
-        assert_eq!(quiz.loop_until.as_deref(), Some("STATUS_ALL_DONE"));
-        assert_eq!(
-            quiz.loop_back_to.as_deref(),
-            Some("teach"),
-            "quiz 未学完必须跳回 teach 讲下一个知识点"
-        );
-        // 引擎硬上限是 10（unwrap_or(3).min(10)），配更大是自欺。
-        assert_eq!(quiz.max_iterations, Some(10));
-        assert!(quiz.task_text().contains("STATUS_CONTINUE"));
-        assert!(quiz.task_text().contains("STATUS_ALL_DONE"));
-        // teach 必须禁止出题——否则就退化回"讲解写进 think 块 + 直接弹窗"。
-        //
-        // 这条从"明文禁止"改成了"拿不到工具"：旧版靠 prompt 里的祈使句
-        // 「禁止调用 `ask`」，那是劝告，模型可以不听且违反了没人知道。
-        // 现在 teach 的 `tools` 白名单里根本没有 ask（也没有 write），
-        // 引擎在构建 runner 时就把它们过滤掉了（`effective_step_tools`）。
         assert!(
-            !teach.tools.is_empty(),
-            "teach 必须声明 tools 白名单，否则拿到角色全集（含 ask/write）"
+            plan.task_text().contains("doc_outline") && plan.task_text().contains("doc_section"),
+            "plan 必须产出文档大纲与知识点章节锚，doc 步靠它们组织 draft.md"
         );
-        assert!(
-            !teach.tools.iter().any(|t| t == "ask"),
-            "teach 的 tools 白名单里不能有 ask——禁出题要靠工具隔离，不是 prompt 劝告"
-        );
-        assert!(
-            !teach.tools.iter().any(|t| t == "write"),
-            "teach 的 tools 白名单里不能有 write——账本只由 quiz 步更新"
-        );
-        assert!(!teach.task_text().contains("STATUS_ALL_DONE"), "循环标记不该出现在 teach");
-
-        // ── 缺陷 1：答案键不得走 recommended ──
+        // 答案键不得走 recommended；答案放独立的 answer 字段。
         assert!(
             banned(plan.task_text(), "recommended"),
             "plan 必须禁止把答案标成 recommended"
         );
-        assert!(
-            banned(quiz.task_text(), "recommended"),
-            "quiz 调 ask 时必须禁止补 recommended"
-        );
         assert!(plan.task_text().contains("\"answer\""), "答案应放独立的 answer 字段");
-
-        // ── 缺陷 4（首次实跑发现）：答案位置偏置 ──
-        // 实测 plan 生成的 5 道题答案全在第 1 位、label 退化成 A/B/C/D，
-        // 学员靠位置就能全对——等于换了个通道泄漏答案。
-        // 位置打散已从 plan（靠模型自觉，实测 5 题里 3 题答案仍在第 1 位）
-        // 移交给 ask 的 shuffle（程序洗牌）——plan 这边只需说明"位置不用操心"。
+        // 答案位置偏置：ask 没有洗牌实现，正确项位置由 plan 自己随机打散；
+        // 纯字母序号会让 answer 退化成位置引用。
         assert!(
-            norm(plan.task_text()).contains("洗牌") || plan.task_text().contains("shuffle"),
-            "plan 应说明位置由 ask 洗牌解决，不再要求模型自己打散"
+            norm(plan.task_text()).contains("随机"),
+            "plan 必须自己打散正确项位置（ask 无 shuffle 实现）"
         );
         assert!(
             banned(plan.task_text(), "A/B/C/D"),
             "plan 必须禁止用纯字母序号当 label"
-        );
-
-        // ── 缺陷 5（首次实跑发现）：teach 讲 k1、quiz 考 k2 ──
-        // 两步各自按 ledger 状态推断"当前知识点"，fail 状态下推断分岔：
-        // teach 重讲 k1，quiz 跳到 k2 出题，学员被突袭且 k1 永不推进。
-        // 修法是单一事实来源——teach 声明 id，quiz 沿用。
-        assert!(
-            teach.task_text().contains("TEACH_DONE <知识点id>"),
-            "teach 末行必须声明它讲的是哪个知识点"
-        );
-        assert!(
-            quiz.task_text().contains("{{teach_out}}"),
-            "quiz 必须从 teach 的输出里取知识点 id，不能自己推断"
-        );
-        assert_eq!(
-            teach.output_key.as_deref(),
-            Some("teach_out"),
-            "quiz 插值 {{teach_out}} 依赖这个 output_key"
-        );
-
-        // ── 缺陷 6（第二次实跑发现）：quiz 跳过出题直接判 weak ──
-        // 实测：k1 状态是 fail（只答错过一次），quiz 脑补成"已经答错两次"，
-        // 没调 ask 就把它标成 weak，学员连重考机会都没有。光靠 prompt 说
-        // "必须先出题"拦不住，所以用 output_contract 在引擎层设门槛：
-        // 没拿到用户答案就写不出这两个字样，契约不满足会带批注重试。
-        for pat in ["判分结果", "你选的是"] {
-            assert!(
-                quiz.output_contract.require.iter().any(|r| r == pat),
-                "quiz 的 output_contract 缺少必需子串 {pat}"
-            );
-        }
-        // 但子串检查会被编造绕过（实测：模型拿上一轮的旧答案编了一段判分），
-        // 所以还必须有 require_tools 在引擎层核对真实工具调用记录。
-        assert!(
-            quiz.require_tools.iter().any(|t| t == "ask"),
-            "quiz 必须声明 require_tools=[\"ask\"]，否则模型可以编造判分结果"
-        );
-        assert!(
-            teach.require_tools.is_empty(),
-            "teach 不该要求调用工具（它的 tools 白名单里没有 ask/write）"
-        );
-        // 「恰好一次」的后半句：require_tools 只查"有没有调过"，查不出
-        // "调了几次"。弹两次窗 = 同一知识点连考两遍、账本按最后一次覆盖，
-        // 学员的作答记录被悄悄丢掉一条。旧版这条只写在 prompt 里
-        //（「本步必须恰好调用一次 `ask`」），是劝告；现在由引擎计数。
-        assert_eq!(
-            quiz.tool_call_limits.get("ask"),
-            Some(&1),
-            "quiz 必须声明 tool_call_limits={{ask=1}}，否则\"恰好一次\"只是句劝告"
-        );
-        // 答完题必须真的落账本。旧版只查了 ask：答完不写 ledger.json 也能
-        // 通过，于是同一个知识点被反复考，循环靠 max_iterations 撞满才结束。
-        assert!(
-            quiz.require_tools.iter().any(|t| t == "write"),
-            "quiz 必须声明 require_tools 含 write，否则判完分可以不落账本"
-        );
-        // 末行契约：下游/引擎按末行取循环状态。用 require 子串检查不够——
-        // 标记写在正文中间时子串检查照样通过，而循环控制拿不到依据。
-        assert!(
-            quiz.output_contract.last_line_prefix_any.iter().any(|p| p == "STATUS_ALL_DONE")
-                && quiz
-                    .output_contract
-                    .last_line_prefix_any
-                    .iter()
-                    .any(|p| p == "STATUS_CONTINUE"),
-            "quiz 的末行必须被契约钉成两个循环状态标记之一"
-        );
-        assert!(
-            teach
-                .output_contract
-                .last_line_prefix_any
-                .iter()
-                .any(|p| p == "TEACH_DONE"),
-            "teach 的末行必须被契约钉成 TEACH_DONE——quiz 靠它决定考哪个知识点"
-        );
-        // 堵「讲解全写进 <think> 块、可见正文为空」：那次 1282 字符的讲解
-        // 学员一个字也没看到。正文长度是引擎唯一能机械核对的"有没有真讲"。
-        assert!(
-            teach.output_contract.min_chars.unwrap_or(0) >= 300,
-            "teach 必须有 min_chars 下限，否则空正文也能通过"
         );
         // plan 取证：用 _any（OR）而不是 require_tools（AND）——取证走
         // read / code_graph / search 都算，AND 会逼它三个都调一遍。
@@ -6731,6 +6656,11 @@ role = "reviewer"
             plan.require_tools.iter().any(|t| t == "write"),
             "plan 必须真把 plan.json / ledger.json 落盘"
         );
+        // 初始账本只存 wrong/passed 两个事实，状态由读取方推导。
+        assert!(
+            plan.task_text().contains("\"wrong\":0") && plan.task_text().contains("\"passed\":false"),
+            "初始账本必须是 wrong/passed 两个事实，不是状态名"
+        );
         // plan 的产出被下游当路径片段拼接，必须只是 slug 本身。
         assert!(
             plan.output_contract.max_chars.is_some_and(|m| m <= 60),
@@ -6741,51 +6671,230 @@ role = "reviewer"
                 && plan.output_contract.forbid.iter().any(|f| f == "/"),
             "plan 的 slug 不能带空格或斜杠"
         );
-        // report 只读：改账本会掩盖真实掌握情况。
-        assert_eq!(report.tools, vec!["read"], "report 必须是只读步");
-        // 缺陷 7（第四次实跑发现）：模型执行四状态机不可靠——第一次答错就
-        // 直接写 weak，跳过重考档。账本改成只存 wrong/passed 两个事实，
-        // 状态由读取方推导，模型不再做状态推理。
-        // 缺陷 8（第五次实跑发现，根因在 ask 工具而不在 workflow）：
-        // 重考弹的是同一道题，被 ask 的"同题复用旧答案"保护静默拦掉，
-        // 学员的重考机会被工具层吞掉。quiz 必须显式要求 allow_repeat。
+
+        // ── doc：写文档，不许弹窗 ──
+        // doc 拥有 write（文档与账本归它维护）但拿不到 ask——"写文档顺便出题"
+        // 会让学员在读到文档路径之前先看到弹窗（step 正文结束时才投递）。
         assert!(
-            quiz.task_text().contains("allow_repeat: true"),
-            "quiz 必须要求传 allow_repeat=true，否则重考会被 ask 复用旧答案吞掉"
-        );
-        // 缺陷 9/10（收尾优化）：位置偏置交给程序洗牌；测验必须关掉超时兜底
-        // （否则会凭空造出一条学员作答记录，成绩账本全是假的）。
-        assert!(
-            quiz.task_text().contains("shuffle: true"),
-            "quiz 必须要求 ask 打乱选项顺序"
+            doc.tools.iter().any(|t| t == "write"),
+            "doc 必须有 write：draft.md / plan.json / ledger.json 都归它更新"
         );
         assert!(
-            quiz.task_text().contains("auto_answer: false"),
-            "quiz 必须关掉超时兜底"
+            !doc.tools.iter().any(|t| t == "ask"),
+            "doc 的 tools 白名单里不能有 ask——禁弹窗要靠工具隔离，不是 prompt 劝告"
+        );
+        assert!(
+            doc.require_tools_any.iter().any(|t| t == "write")
+                && doc.require_tools_any.iter().any(|t| t == "edit"),
+            "doc 必须真改过 draft.md（edit/write 任一——返工是局部修改，不能只认 write）"
+        );
+        assert!(
+            doc.tools.iter().any(|t| t == "edit"),
+            "doc 必须有 edit：返工增强是局部修改，没有 edit 时模型会用 write \
+             整文件覆写、丢掉既有章节（实测 thrash 57 分钟）"
+        );
+        assert!(
+            doc.task_text().contains("draft.md"),
+            "doc 的正文必须把 draft.md 路径交付给学员"
+        );
+        // 文档内容直接随 doc 步正文返回 chat（学员先读完、再点答题按钮），
+        // 而不是只给一个路径让学员自己找文件。
+        assert!(
+            doc.task_text().contains("全文"),
+            "doc 必须把 draft.md 全文作为正文输出到 chat"
+        );
+        assert!(
+            doc.output_contract.min_chars.unwrap_or(0) >= 500,
+            "doc 必须有 min_chars 下限，否则空正文/只给路径也能通过"
+        );
+
+        // ── read_confirm：答题按钮独占一步 ──
+        assert!(
+            read_confirm.tools.iter().any(|t| t == "ask"),
+            "read_confirm 的 tools 里必须有 ask"
+        );
+        assert!(
+            !read_confirm.tools.iter().any(|t| t == "write"),
+            "read_confirm 不许改文档和账本"
+        );
+        assert!(
+            read_confirm.require_tools.iter().any(|t| t == "ask"),
+            "read_confirm 必须真弹过 ask"
+        );
+        assert_eq!(
+            read_confirm.tool_call_limits.get("ask"),
+            Some(&1),
+            "read_confirm 必须恰好弹一次窗"
+        );
+        assert!(
+            read_confirm.task_text().contains("开始答题"),
+            "read_confirm 的选项必须包含「开始答题」"
+        );
+        // 同题复用回放：read_confirm 的题面跨轮次重复，必须带版本号区分。
+        assert!(
+            read_confirm.task_text().contains("版本号"),
+            "read_confirm 题面必须带版本号，否则被同题复用保护静默吞掉"
+        );
+
+        // ── quiz：批量出题 + 判分 + 循环路由 ──
+        // 循环标记只挂在 quiz/supplement 上：doc/read_confirm 不负责循环控制。
+        assert!(doc.loop_until.is_none() && read_confirm.loop_until.is_none());
+        assert_eq!(quiz.loop_until.as_deref(), Some("QUIZ_PASS"));
+        assert_eq!(
+            quiz.loop_back_routes.get("QUIZ_FAIL").map(|s| s.as_str()),
+            Some("doc"),
+            "quiz 答错必须按病灶路由回 doc 增强文档"
+        );
+        // 引擎硬上限是 10（unwrap_or(3).min(10)），配更大是自欺。
+        assert_eq!(quiz.max_iterations, Some(10));
+        assert!(quiz.task_text().contains("QUIZ_PASS"));
+        assert!(quiz.task_text().contains("QUIZ_FAIL"));
+        // 「恰好一窗」：require_tools 只查"有没有调过"，查不出"调了几次"。
+        // 弹两次窗 = 同一批点连考两遍、账本按最后一次覆盖。
+        assert!(
+            quiz.require_tools.iter().any(|t| t == "ask"),
+            "quiz 必须声明 require_tools=[\"ask\"]，否则模型可以编造判分结果"
+        );
+        assert!(
+            quiz.require_tools.iter().any(|t| t == "write"),
+            "quiz 必须声明 require_tools 含 write，否则判完分可以不落账本"
+        );
+        assert_eq!(
+            quiz.tool_call_limits.get("ask"),
+            Some(&1),
+            "quiz 必须声明 tool_call_limits={{ask=1}}：一轮一窗，questions 批量出完"
+        );
+        // 没拿到用户答案就写不出这两个字样；但子串检查会被编造绕过，
+        // 所以必须与上面的 require_tools 搭配。
+        for pat in ["判分结果", "你选的是"] {
+            assert!(
+                quiz.output_contract.require.iter().any(|r| r == pat),
+                "quiz 的 output_contract 缺少必需子串 {pat}"
+            );
+        }
+        // 末行契约：引擎按末行取循环状态。标记写在正文中间时子串检查照样
+        // 通过，而循环控制拿不到依据。
+        assert!(
+            quiz.output_contract.last_line_prefix_any.iter().any(|p| p == "QUIZ_PASS")
+                && quiz
+                    .output_contract
+                    .last_line_prefix_any
+                    .iter()
+                    .any(|p| p == "QUIZ_FAIL"),
+            "quiz 的末行必须被契约钉成两个循环状态标记之一"
+        );
+        // loop_until 是全文子串匹配：正文里复述标记原文会误判全对。
+        assert!(
+            quiz.task_text().contains("除末行外"),
+            "quiz 必须禁止正文复述 QUIZ_PASS/QUIZ_FAIL（全文子串判定）"
+        );
+        assert!(
+            banned(quiz.task_text(), "recommended"),
+            "quiz 调 ask 时必须禁止补 recommended"
         );
         assert!(
             norm(quiz.task_text()).contains("绝不按位置") && quiz.task_text().contains("label"),
-            "洗牌后判分必须按 label 文本匹配"
+            "判分必须按 label 文本匹配（正确项位置已被 plan 打散）"
         );
         assert!(
             norm(quiz.task_text()).contains("wrong 只能 +1"),
             "quiz 必须把状态推进降级成 wrong+1，不许它自己判状态"
         );
+        // 重考绕过同题复用回放：题面必须带第几次作答的后缀。
         assert!(
-            plan.task_text().contains("\"wrong\":0") && plan.task_text().contains("\"passed\":false"),
-            "初始账本必须是 wrong/passed 两个事实，不是状态名"
-        );
-        assert!(
-            teach.task_text().contains("passed == false 且 wrong < 2"),
-            "teach 选题必须按 wrong/passed 推导"
-        );
-        assert!(
-            report.task_text().contains("wrong >= 2") && report.task_text().contains("passed == true"),
-            "report 必须按 wrong/passed 推导掌握情况"
+            quiz.task_text().contains("［第"),
+            "quiz 重考题面必须带轮次后缀，否则被同题复用保护静默吞掉"
         );
 
-        // report：结尾收报告，把 fail/weak/pending 都算未通过。
+        // ── supplement：全对后的补充疑问环 ──
+        assert_eq!(supplement.loop_until.as_deref(), Some("ALL_DONE"));
+        assert_eq!(
+            supplement.loop_back_to.as_deref(),
+            Some("doc"),
+            "有补充必须回 doc 写新章节与新知识点"
+        );
+        assert_eq!(supplement.max_iterations, Some(10));
+        assert!(
+            supplement.require_tools.iter().any(|t| t == "ask")
+                && supplement.require_tools.iter().any(|t| t == "write"),
+            "supplement 必须真弹 ask、真把补充记进账本"
+        );
+        assert_eq!(
+            supplement.tool_call_limits.get("ask"),
+            Some(&1),
+            "supplement 必须恰好弹一次窗"
+        );
+        assert!(
+            supplement
+                .output_contract
+                .last_line_prefix_any
+                .iter()
+                .any(|p| p == "ALL_DONE")
+                && supplement
+                    .output_contract
+                    .last_line_prefix_any
+                    .iter()
+                    .any(|p| p == "SUPPLEMENT"),
+            "supplement 的末行必须被契约钉成两个状态标记之一"
+        );
+        // 学员的补充内容走前端自动附带的「其他（自定义）」自由文本通道。
+        assert!(
+            supplement.task_text().contains("其他（自定义）"),
+            "supplement 必须说明补充内容经「其他（自定义）」收集"
+        );
+        assert!(
+            supplement.task_text().contains("轮次号"),
+            "supplement 题面必须带轮次号，否则被同题复用保护静默吞掉"
+        );
+
+        // ── merge：定稿必须真落盘到交付路径 ──
+        assert!(
+            merge.require_tools.iter().any(|t| t == "write"),
+            "merge 必须真写出最终文档"
+        );
+        assert!(
+            !merge.tools.iter().any(|t| t == "ask"),
+            "merge 不许弹窗"
+        );
+        assert!(
+            merge.task_text().contains("docs/learn/")
+                && merge.output_contract.require.iter().any(|r| r == "docs/learn/"),
+            "merge 必须产出 docs/learn/<slug>.md 并在正文给出路径"
+        );
+
+        // ── report：只读，按 wrong/passed 推导 ──
+        assert_eq!(report.tools, vec!["read"], "report 必须是只读步");
         assert!(report.task_text().contains("ledger.json"));
+        assert!(
+            report.task_text().contains("passed == true"),
+            "report 必须按 wrong/passed 推导掌握情况"
+        );
+        assert!(
+            report.output_contract.require.iter().any(|r| r == "掌握进度"),
+            "report 必须含掌握进度小节"
+        );
+    }
+
+    /// `gate_for_step`：契约要求短产出（`max_chars`）的 step 必须豁免 D5
+    /// ShortOutput——learn_loop 的 plan 只许输出 slug 本身（≤60 字符），而
+    /// D5 阈值 50 字节，不豁免就是"越守契约越被判死"（实测：plan 三次输出
+    /// slug 均被打回，workflow 以 AdvisorTerminated 告终）。其余 step 的
+    /// 阈值不动。
+    #[test]
+    fn gate_for_step_exempts_d5_for_max_chars_steps() {
+        let gate = crate::advisor_monitor::GateConfig::default();
+        let adjusted = gate_for_step(gate.clone(), Some(60));
+        assert_eq!(adjusted.short_output_threshold, 0);
+        let untouched = gate_for_step(gate, None);
+        assert_eq!(untouched.short_output_threshold, 50);
+        // 阈值 0 时 D5 对短产出放行（slug 只有 29 字节）；D6 等其他
+        // 探测器不受影响（这里 tool_count=3，回声模式也不命中）。
+        let verdict =
+            crate::advisor_monitor::check_response_gates("rust-ownership", 3, &adjusted);
+        assert!(
+            matches!(verdict, crate::advisor_monitor::GateVerdict::Pass),
+            "slug 产出不该再被 D5 拦: {verdict:?}"
+        );
     }
 
     /// tutor 角色必须有取证工具，否则 learn_loop 里"基于源码出题"的要求
