@@ -156,16 +156,60 @@ describe("TodoUpdated 渲染", () => {
     expect(messagesEl.querySelector(".message.status")!.textContent).toBe("📝 Todos 已清空");
   });
 
-  it("子会话（sub_id 非空）清单被忽略", () => {
+  it("子会话（sub_id 非空）清单渲染成独立紧凑行，不进 dock", () => {
     const { chat, messagesEl } = mount();
     chat.handleEvent(todoEvent(twoPhases, "sub-1"));
-    expect(messagesEl.querySelectorAll(".message.status")).toHaveLength(0);
+    const rows = messagesEl.querySelectorAll(".message.status");
+    expect(rows).toHaveLength(1);
+    // `↳ 📝 <标识> 2/4 · 当前: xxx`；测试里没有 DelegateStarted，
+    // activeDelegates 查不到 → 标识退成截断的 sub_id
+    expect(rows[0].textContent).toBe("↳ 📝 子会话 sub-1 2/4 · 当前: 写 store");
+    // 行带 data-sub-id（右键可「查看 subsession 日志」）
+    expect((rows[0] as HTMLElement).dataset.subId).toBe("sub-1");
+    // 主会话没有 todo → dock 不出现
     expect(document.querySelector(".todo-dock")).toBeNull();
+  });
+
+  it("同一 sub_id 原地更新；不同 sub_id 各自一行；主/子互不干扰", () => {
+    const { chat, messagesEl } = mount();
+    chat.handleEvent(todoEvent(twoPhases, "sub-1"));
+    chat.handleEvent(todoEvent(twoPhases, "sub-2"));
+    chat.handleEvent(todoEvent([
+      { name: "实现", tasks: [{ content: "写 store", status: "completed" }] },
+    ], "sub-1"));
+    // 主会话事件与两个子会话行并存
+    chat.handleEvent(todoEvent(twoPhases));
+    const rows = messagesEl.querySelectorAll(".message.status");
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toBe("↳ 📝 子会话 sub-1 1/1 · 全部完成");
+    expect(rows[1].textContent).toBe("↳ 📝 子会话 sub-2 2/4 · 当前: 写 store");
+    expect(rows[2].textContent).toBe("📝 Todos 2/4 · 当前: 写 store");
+    // dock 只反映主会话
+    expect(document.querySelector(".todo-dock-title")!.textContent).toBe("📝 Todos 2/4");
+  });
+
+  it("回放：同一 sub_id 多条取最后一条；子会话清空移除其行", () => {
+    const { chat, messagesEl } = mount();
+    chat.replayEvents([
+      todoEvent(twoPhases, "sub-1"),
+      todoEvent(twoPhases, "sub-2"),
+      todoEvent([{ name: "P", tasks: [{ content: "最终", status: "completed" }] }], "sub-1"),
+    ]);
+    let rows = messagesEl.querySelectorAll(".message.status");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toBe("↳ 📝 子会话 sub-1 1/1 · 全部完成");
+    expect(rows[1].textContent).toBe("↳ 📝 子会话 sub-2 2/4 · 当前: 写 store");
+    // 子会话清空（空 phases）→ 对应行移除，兄弟行不动
+    chat.handleEvent(todoEvent([], "sub-2"));
+    rows = messagesEl.querySelectorAll(".message.status");
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toBe("↳ 📝 子会话 sub-1 1/1 · 全部完成");
   });
 
   it("clear() 归零：dock 隐藏、卡片引用失效", () => {
     const { chat, messagesEl } = mount();
     chat.handleEvent(todoEvent(twoPhases));
+    chat.handleEvent(todoEvent(twoPhases, "sub-1"));
     chat.clear();
     const dock = document.querySelector(".todo-dock") as HTMLElement;
     expect(dock.style.display).toBe("none");

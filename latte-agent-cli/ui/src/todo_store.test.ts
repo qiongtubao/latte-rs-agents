@@ -12,6 +12,10 @@ import {
   isPhaseComplete,
   currentTask,
   todoSummaryLine,
+  countTodoPhases,
+  currentTaskInPhases,
+  subTodoIds,
+  subPhases,
 } from "./todo_store";
 import type { TodoPhase } from "./api";
 
@@ -55,13 +59,6 @@ describe("applyTodoUpdated：全量替换归约", () => {
     expect(countTodos(s2)).toEqual({ done: 0, total: 0 });
   });
 
-  it("子会话（sub_id 非空）忽略：原样返回旧 state（引用不变）", () => {
-    const s1 = applyTodoUpdated(emptyTodoState(), { phases: phases() });
-    const s2 = applyTodoUpdated(s1, { phases: [], sub_id: "sub-1" });
-    expect(s2).toBe(s1);
-    expect(countTodos(s2).total).toBe(5);
-  });
-
   it("回放语义：多条事件依次应用，最后一条为准", () => {
     let s = emptyTodoState();
     s = applyTodoUpdated(s, { phases: phases() });
@@ -69,6 +66,57 @@ describe("applyTodoUpdated：全量替换归约", () => {
       phases: [{ name: "P", tasks: [{ content: "最终", status: "completed" }] }],
     });
     expect(todoSummaryLine(s)).toBe("📝 Todos 1/1 · 全部完成");
+  });
+});
+
+describe("applyTodoUpdated：sub_id 分桶（子会话清单）", () => {
+  it("子会话写入独立分桶，不影响主会话", () => {
+    let s = applyTodoUpdated(emptyTodoState(), { phases: phases() });
+    s = applyTodoUpdated(s, {
+      phases: [{ name: "子阶段", tasks: [{ content: "子任务", status: "in_progress" }] }],
+      sub_id: "sub-1",
+    });
+    // 主会话不变
+    expect(countTodos(s)).toEqual({ done: 2, total: 5 });
+    // 子会话桶独立可读
+    expect(countTodoPhases(subPhases(s, "sub-1"))).toEqual({ done: 0, total: 1 });
+    expect(currentTaskInPhases(subPhases(s, "sub-1"))?.task.content).toBe("子任务");
+    expect(subPhases(s, "sub-不存在")).toEqual([]);
+  });
+
+  it("同一 sub_id 整表替换；不同 sub_id 各自独立", () => {
+    let s = emptyTodoState();
+    s = applyTodoUpdated(s, { phases: phases(), sub_id: "sub-1" });
+    s = applyTodoUpdated(s, {
+      phases: [{ name: "B", tasks: [{ content: "b", status: "pending" }] }],
+      sub_id: "sub-2",
+    });
+    expect(subTodoIds(s)).toEqual(["sub-1", "sub-2"]);
+    // 回放语义：同一 sub_id 多条取最后一条
+    s = applyTodoUpdated(s, {
+      phases: [{ name: "A2", tasks: [{ content: "a2", status: "completed" }] }],
+      sub_id: "sub-1",
+    });
+    expect(subTodoIds(s)).toEqual(["sub-1", "sub-2"]);
+    expect(countTodoPhases(subPhases(s, "sub-1"))).toEqual({ done: 1, total: 1 });
+    expect(countTodoPhases(subPhases(s, "sub-2"))).toEqual({ done: 0, total: 1 });
+    // 主会话始终没被动过
+    expect(countTodos(s)).toEqual({ done: 0, total: 0 });
+  });
+
+  it("子会话空 phases = 清掉该桶", () => {
+    let s = applyTodoUpdated(emptyTodoState(), { phases: phases(), sub_id: "sub-1" });
+    expect(subTodoIds(s)).toEqual(["sub-1"]);
+    s = applyTodoUpdated(s, { phases: [], sub_id: "sub-1" });
+    expect(subTodoIds(s)).toEqual([]);
+    expect(subPhases(s, "sub-1")).toEqual([]);
+  });
+
+  it("主会话清空不影响子会话桶", () => {
+    let s = applyTodoUpdated(emptyTodoState(), { phases: phases(), sub_id: "sub-1" });
+    s = applyTodoUpdated(s, { phases: [] });
+    expect(countTodos(s)).toEqual({ done: 0, total: 0 });
+    expect(countTodoPhases(subPhases(s, "sub-1"))).toEqual({ done: 2, total: 5 });
   });
 });
 

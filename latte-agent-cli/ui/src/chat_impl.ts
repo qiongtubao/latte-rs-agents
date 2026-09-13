@@ -8,7 +8,7 @@ import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
-import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, type TodoState } from "./todo_store";
+import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, countTodoPhases, currentTaskInPhases, subPhases, type TodoState } from "./todo_store";
 import { parentOptions } from "./task_board";
 import type { CodeRef } from "./host";
 interface UIBinding {
@@ -694,15 +694,21 @@ export function mountChat(opts: {
   }
 
   // ── Todo dock（todo 工具进度）────────────────────────────────
-  // 数据全部来自 todo store（TodoUpdated 事件驱动，不轮询）。两处渲染：
-  //  1. 消息流里的紧凑卡片：同一条 status 行原地更新，不每次追加气泡；
-  //  2. composer 上方的常驻 dock：折叠态一行（done/total + 当前活动项），
-  //     展开态按 phase 分组列出任务。列表为空时 dock 隐藏。
+  // 数据全部来自 todo store（TodoUpdated 事件驱动，不轮询）。渲染分两层：
+  //  1. 主会话（sub_id 空）：消息流紧凑卡片（同一条 status 行原地更新，
+  //     不每次追加气泡）+ composer 上方的常驻 dock（折叠一行 / 展开按
+  //     phase 分组；列表为空时隐藏）。
+  //  2. 子会话（sub_id 非空，delegate/workflow）：各自一条独立紧凑行
+  //     （`↳ 📝 <标识> 2/5 · 当前: xxx`），按 sub_id 原地更新；不进
+  //     dock，避免面板膨胀。主聊天没有现成的按 sub_id 归组容器（子会话
+  //     的 ToolUse 等都只进 subsession trace），故用独立行承载。
   // 回放路径（replayEvents → handleEvent）走同一个 case，全量替换语义
-  // 下最后一条 TodoUpdated 即为恢复出的最终状态。
+  // 下每个桶（主会话 / 各 sub_id）的最后一条 TodoUpdated 即恢复状态。
   let todoState: TodoState = emptyTodoState();
   /** 消息流里的紧凑 todo 卡（原地更新同一条）。 */
   let todoCardRow: HTMLElement | null = null;
+  /** sub_id → 子会话 todo 紧凑行（原地更新）。 */
+  const subTodoRows = new Map<string, HTMLElement>();
   let todoDockEl: HTMLElement | null = null;
   let todoDockBodyEl: HTMLElement | null = null;
   let todoDockExpanded = false;
@@ -725,6 +731,41 @@ export function mountChat(opts: {
       return;
     }
     todoCardRow = addMessage({ kind: "status", content: text });
+  }
+
+  function removeSubTodoRow(subId: string): void {
+    const row = subTodoRows.get(subId);
+    if (!row) return;
+    // 与右键「删除消息」同一套清理：store 记录 + DOM 一起摘。
+    const idx = messageStore.findIndex((m) => m.el === row);
+    if (idx >= 0) messageStore.splice(idx, 1);
+    row.remove();
+    subTodoRows.delete(subId);
+  }
+
+  /** 子会话 todo 紧凑行：`↳ 📝 <标识> 2/5 · 当前: xxx`。标识优先用
+   *  activeDelegates 里的目标角色（delegate/workflow 分派可读到），
+   *  查不到（已结束的分派、旧归档回放）退成截断的 sub_id。行带
+   *  data-sub-id，右键可「查看 subsession 日志」。 */
+  function renderSubTodoCard(subId: string): void {
+    const phases = subPhases(todoState, subId);
+    const { done, total } = countTodoPhases(phases);
+    if (total === 0) {
+      removeSubTodoRow(subId);
+      return;
+    }
+    const role = activeDelegates.get(subId)?.targetRole;
+    const label = role ? `${roleIcon(role)} ${role}` : `子会话 ${subId.slice(0, 12)}`;
+    const cur = currentTaskInPhases(phases);
+    const tail = done === total ? "全部完成" : cur ? `当前: ${cur.task.content}` : "";
+    const text = `↳ 📝 ${label} ${done}/${total}${tail ? ` · ${tail}` : ""}`;
+    const existing = subTodoRows.get(subId);
+    if (existing && existing.isConnected) {
+      const c = existing.querySelector(".content");
+      if (c) c.textContent = text;
+      return;
+    }
+    subTodoRows.set(subId, addMessage({ kind: "status", content: text, subId }));
   }
 
   function ensureTodoDock(): void {
@@ -3352,15 +3393,20 @@ export function mountChat(opts: {
         break;
       }
       case "TodoUpdated": {
-        // todo 工具调用完成后的全量清单（整表替换，无 diff）。子会话
-        // （sub_id 非空）的清单 applyTodoUpdated 原样返回旧 state，
-        // 引用不变 → 跳过重渲染。回放路径走同一 case，最后一条即为
-        // 恢复出的状态（卡片原地更新，不会堆出一串历史快照）。
+        // todo 工具调用完成后的全量清单（整表替换，无 diff）。主会话
+        // （sub_id 空）→ 内联卡片 + dock；子会话（sub_id 非空）→ 各自
+        // 一条紧凑行按 sub_id 原地更新，不进 dock。回放路径走同一
+        // case，每个桶的最后一条即为恢复出的状态（原地更新，不会堆出
+        // 一串历史快照）。
         const next = applyTodoUpdated(todoState, e);
         if (next !== todoState) {
           todoState = next;
-          renderTodoCard();
-          renderTodoDock();
+          if (e.sub_id) {
+            renderSubTodoCard(e.sub_id);
+          } else {
+            renderTodoCard();
+            renderTodoDock();
+          }
         }
         resetWaitTimer();
         break;
@@ -3534,10 +3580,12 @@ export function mountChat(opts: {
     }
     // 上一个 session 的选择弹窗/待办铃不能跟着漂到新 session。
     clearChoiceDialogs();
-    // todo 状态属于 session：归零并隐藏 dock；卡片引用随消息区整体
-    // 清空而失效，置 null 让下一条 TodoUpdated 重新建卡。
+    // todo 状态属于 session：归零并隐藏 dock；卡片引用（主会话卡 +
+    // 各子会话紧凑行）随消息区整体清空而失效，置空让下一条
+    // TodoUpdated 重新建行。
     todoState = emptyTodoState();
     todoCardRow = null;
+    subTodoRows.clear();
     todoDockExpanded = false;
     todoPhaseCollapsed.clear();
     if (todoDockEl) renderTodoDock();

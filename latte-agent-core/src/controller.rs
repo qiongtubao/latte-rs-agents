@@ -7655,6 +7655,30 @@ async fn register_delegate_tool(
                     }
                 }
             };
+            // 子会话 todo：specialist 声明了 "todo" 工具时，注册有状态
+            // 包装版（replace 覆盖 builtin 纯函数版）——每个子会话一份
+            // **独立**状态（不与父会话/并行兄弟子会话共享清单），广播
+            // 带 sub_id 的 ChatEvent::TodoUpdated。与主会话 build_runner
+            // 的接线同款；状态同时留给下面 runner 的 TodoTracker 纠偏。
+            let specialist_todo: Option<crate::todo::SharedTodoState> =
+                if role.allowed_tools.iter().any(|t| t == "todo") {
+                    let state = crate::todo::new_shared_todo_state();
+                    if let Some(tm) = &specialist_tm {
+                        register_todo_tool(
+                            tm,
+                            event_tx.clone(),
+                            role_id.clone(),
+                            state.clone(),
+                            Some(sub_id.clone()),
+                        )
+                        .map_err(|e| {
+                            tool_err(format!("register todo for '{}': {}", role_id, e))
+                        })?;
+                    }
+                    Some(state)
+                } else {
+                    None
+                };
             let agent = Agent::new_with_chain(
                 role_id.clone(),
                 role.clone(),
@@ -7708,6 +7732,11 @@ async fn register_delegate_tool(
                 // 父 session 里两个并发的同角色 delegate 调用会共享
                 // 观察台账作用域。用已经存在的 sub_id 补上即可。
                 .with_sub_id(sub_id.clone());
+            // TodoTracker 纠偏（mid-run nudge / stop reminder）：子代理
+            // 同样有「做一半就停」的问题。只读子会话自己的那份状态。
+            if let Some(state) = specialist_todo {
+                runner = runner.with_todo_state(state);
+            }
             if let Some(gate) = advisor_gate.clone() {
                 runner = runner.with_gate_config(gate);
             }
@@ -14436,6 +14465,75 @@ require = ["永远不可能出现的验收字符串"]
         };
         let v_sub = serde_json::to_value(&ev_sub).expect("serialize");
         assert_eq!(v_sub["TodoUpdated"]["sub_id"], "sub-1");
+    }
+
+    #[tokio::test]
+    async fn todo_tool_broadcasts_sub_id_when_registered_for_subsession() {
+        // delegate/workflow 子会话的接线契约：register_todo_tool 传入
+        // Some(sub_id) 时，TodoUpdated 必须带它（前端据此归属子会话）。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(8);
+        let state = crate::todo::new_shared_todo_state();
+        register_todo_tool(
+            &tm,
+            event_tx,
+            "programmer".into(),
+            state,
+            Some("sub-delegate-7".into()),
+        )
+        .expect("register todo");
+
+        tm.execute(
+            "todo",
+            serde_json::json!({
+                "ops": [{ "op": "init", "list": [{ "phase": "P", "items": ["A"] }] }]
+            }),
+            None,
+        )
+        .await
+        .expect("todo init");
+        let ev = rx.try_recv().expect("TodoUpdated event");
+        match ev {
+            ChatEvent::TodoUpdated { sub_id, phases } => {
+                assert_eq!(sub_id.as_deref(), Some("sub-delegate-7"));
+                assert_eq!(phases[0].tasks[0].status, "in_progress");
+            }
+            other => panic!("expected TodoUpdated, got {other:?}"),
+        }
+    }
+
+    /// 接线防回归：delegate 派发路径必须为声明了 todo 工具的
+    /// specialist 注册有状态包装版（独立子会话状态 + sub_id 广播），
+    /// 并给 specialist runner 装 TodoTracker 状态。完整行为覆盖在
+    /// workflow 侧（`build_role_runner_wires_stateful_todo_with_sub_id`）
+    /// 用真实工具执行验证；delegate 的 handler 闭包要真跑需整套模型
+    /// mock，这里用源码钉扎防「漏接/改丢」（与
+    /// `cli_registers_every_orchestration_tool_the_ui_does` 同款判据）。
+    #[test]
+    fn delegate_path_wires_stateful_todo_for_specialists() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller.rs"),
+        )
+        .expect("controller.rs");
+        let src = src.split("#[cfg(test)]").next().expect("非测试部分");
+        // 定位 delegate handler 段：从 register_delegate_tool 签名到
+        // 下一个顶层函数。
+        let body = src
+            .split("async fn register_delegate_tool(")
+            .nth(1)
+            .expect("register_delegate_tool 应存在");
+        let body = body.split("\n/// ").next().unwrap_or(body);
+        for needle in [
+            "new_shared_todo_state()",
+            "register_todo_tool(",
+            "Some(sub_id.clone())",
+            "with_todo_state(",
+        ] {
+            assert!(
+                body.contains(needle),
+                "delegate 路径缺少 todo 接线片段 `{needle}`"
+            );
+        }
     }
 
 

@@ -2763,6 +2763,19 @@ impl AgentRunner {
     pub(crate) fn has_trace_sink(&self) -> bool {
         !self.sink.is_null()
     }
+    /// 测试用：是否装了 todo 状态（TodoTracker 纠偏的接线断言）。
+    #[cfg(test)]
+    pub(crate) fn has_todo_state(&self) -> bool {
+        self.todo_state.is_some()
+    }
+    /// 测试用：取 tool manager 句柄（接线回归测试需要在 runner 构建
+    /// 之后直接执行工具，验证注册的是哪个实现）。
+    #[cfg(test)]
+    pub(crate) fn tool_manager(
+        &self,
+    ) -> Option<&Arc<dyn latte_rs_agent_tools::types::ToolManager>> {
+        self.tool_manager.as_ref()
+    }
 
     /// Drain all pending advisor hints from the shared in-memory
     /// queue. Each drained hint is recorded in the conversation

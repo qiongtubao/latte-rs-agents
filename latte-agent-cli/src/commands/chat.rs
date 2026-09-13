@@ -2496,6 +2496,28 @@ async fn register_delegate_tool(
                         scoped_sink.clone(),
                         sub_sink,
                     ]));
+                // 子会话 todo 对齐 UI（controller 的 delegate 路径）：
+                // specialist 声明了 todo 工具时注册有状态包装版——独立
+                // 子会话状态，广播带 sub_id 的 TodoUpdated；同时留给
+                // runner 的 TodoTracker 纠偏。
+                let specialist_todo = if role.allowed_tools.iter().any(|t| t == "todo") {
+                    let state = latte_agent_core::todo::new_shared_todo_state();
+                    if let Some(tm) = &specialist_tm {
+                        latte_agent_core::controller::register_todo_tool(
+                            tm,
+                            cli_session_event_tx().clone(),
+                            role_id.clone(),
+                            state.clone(),
+                            Some(sub_id.clone()),
+                        )
+                        .map_err(|e| {
+                            tool_err(format!("register todo for '{}': {}", role_id, e))
+                        })?;
+                    }
+                    Some(state)
+                } else {
+                    None
+                };
                 let mut runner = match specialist_tm {
                     // unlimited tool rounds — model decides when it's done.
                     // LoopDetector in agent.rs trips on actual stuck patterns.
@@ -2506,6 +2528,9 @@ async fn register_delegate_tool(
                         .with_sink(specialist_sink.clone())
                         .with_role(role_id.clone()),
                 };
+                if let Some(state) = specialist_todo {
+                    runner = runner.with_todo_state(state);
+                }
                 let msgs = vec![Message {
                     role: MsgRole::User,
                     content: vec![latte_ai::models::ContentPart::text(task)],
