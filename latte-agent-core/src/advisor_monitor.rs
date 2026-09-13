@@ -1253,6 +1253,8 @@ impl AdvisorReviewEngine {
         task: &str,
         response: &str,
         tool_call_summary: &str,
+        // 被审子任务的执行约束（见 build_delegate_review_prompt）。
+        constraints: Option<&str>,
     ) -> AgentResult<ReviewVerdict> {
         let template = self
             .agent_config
@@ -1279,6 +1281,7 @@ impl AdvisorReviewEngine {
             task,
             response,
             tool_call_summary,
+            constraints,
         ));
         let model_id = agent
             .model_chain
@@ -1452,6 +1455,9 @@ fn build_delegate_review_prompt(
     task: &str,
     response: &str,
     tool_call_summary: &str,
+    // 被审子任务的执行约束（授权工具白名单 + 产出契约摘要），由调用方
+    // 组装；None = 调用方拿不到约束（manager delegate 等路径），不渲染该节。
+    constraints: Option<&str>,
 ) -> String {
     // Bound the injected sections so a huge system prompt / response
     // doesn't blow the review context. The response is the core
@@ -1491,6 +1497,23 @@ fn build_delegate_review_prompt(
             "\n# 它本轮实际执行的工具调用（引擎侧记录，供核实任务是否真正执行）\n\n{tool_call_summary}\n"
         )
     };
+    // 审查者必须知道被审者的约束：否则它会拿「完整任务」的标准去量一条
+    // 流水线的其中一环——实测实锤：step 声明了产出契约（只许返回 ≤60
+    // 字符的 slug）且只授权了少数工具，advisor 不知情，反复以「没返回
+    // 正文讲解 / 没跑某工具」打回一个**正在严格遵守契约**的产出。
+    let constraints_section = match constraints {
+        Some(c) if !c.trim().is_empty() => format!(
+            "\n# 该子任务的执行约束（审查时必须尊重）\n\n{}\n",
+            truncate_chars(c, 1_000)
+        ),
+        _ => String::new(),
+    };
+    let constraints_guidance = if constraints_section.is_empty() {
+        ""
+    } else {
+        "注意：该子任务是一条流水线的其中一环，不是完整任务本身；它的产出形态与可用工具受上面「执行约束」一节限制——\
+         不要因为它「没做约束之外的事」（如调用了未授权的工具、产出形态恰好是契约要求的短文本）而打回。\n"
+    };
     format!(
         r#"# 委派返回审查任务
 
@@ -1511,7 +1534,7 @@ fn build_delegate_review_prompt(
 # 委派给它的任务
 
 {task_s}
-
+{constraints_section}
 # 它返回的结果
 
 <response>
@@ -1519,7 +1542,7 @@ fn build_delegate_review_prompt(
 </response>
 {truncation_note}
 {tool_section}
-逐项检查：
+{constraints_guidance}逐项检查：
 1. **偏离职责 / 越权**：是否做了超出「{role_id}」职责范围的事，或没有以该角色应有的专业方式完成（比如让 reviewer 去写实现、让 programmer 只空谈不给代码）。
 2. **答非所问 / 未达结果**：返回是否真正回答了委派任务、产出了任务预期的结果——有无跑题、空泛套话、遗漏关键要求，或声称完成但实际没做（幻觉式交付）。
 
@@ -2526,6 +2549,7 @@ mod tests {
             "读 src/arena.c 并总结",
             "结果正文",
             "",
+            None,
         );
         assert!(
             p.contains("把某项目的学习计划拆成任务"),
@@ -2541,7 +2565,7 @@ mod tests {
     /// 遗留场景，以及任何取不到用户输入的入口）。
     #[test]
     fn delegate_review_prompt_handles_missing_main_topic() {
-        let p = build_delegate_review_prompt("", "programmer", "写代码", "任务", "结果", "");
+        let p = build_delegate_review_prompt("", "programmer", "写代码", "任务", "结果", "", None);
         assert!(
             p.contains("未记录到原始用户诉求"),
             "空主题要显式告知，不能留白让模型自行想象: {p}"
@@ -2552,7 +2576,7 @@ mod tests {
     fn delegate_review_prompt_fits_typical_report_without_truncation() {
         // 25K 字符的专家报告（本次事故的实际尺寸）应完整进入 prompt。
         let report = "x".repeat(25_000);
-        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "");
+        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "", None);
         assert!(p.contains(&report), "25K 报告不应被截断");
         assert!(!p.contains("被截断"), "未截断时不应出现截断提示");
     }
@@ -2560,9 +2584,35 @@ mod tests {
     #[test]
     fn delegate_review_prompt_notes_truncation_when_over_budget() {
         let report = "x".repeat(DELEGATE_REVIEW_RESPONSE_MAX_CHARS + 10_000);
-        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "");
+        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "", None);
         assert!(p.contains("被截断"), "超预算时必须显式告知复审模型");
         assert!(p.contains("[+"), "保留截断标记");
+    }
+
+    /// 审查者必须知道被审者的约束：带 constraints 时 prompt 要有专节 +
+    /// 「不要拿约束之外的标准打回」的指引；不带时整节与指引都不渲染
+    /// （manager delegate 等拿不到约束的路径行为不变）。
+    #[test]
+    fn delegate_review_prompt_renders_constraints_section() {
+        let with = build_delegate_review_prompt(
+            "主诉求",
+            "planner",
+            "产出计划标识",
+            "只输出 slug",
+            "rust-ownership",
+            "",
+            Some("- 本步授权工具（白名单）：write\n- 产出上限 60 字符"),
+        );
+        assert!(with.contains("执行约束"), "要有约束专节标题: {with}");
+        assert!(with.contains("产出上限 60 字符"), "约束正文要进 prompt: {with}");
+        assert!(
+            with.contains("流水线的其中一环"),
+            "要有「不要拿完整任务标准量一环」的指引: {with}"
+        );
+        let without =
+            build_delegate_review_prompt("主诉求", "planner", "产出计划标识", "只输出 slug", "r", "", None);
+        assert!(!without.contains("执行约束"), "无约束时不渲染该节: {without}");
+        assert!(!without.contains("流水线的其中一环"));
     }
 
     // ── D3: 良性探测错误（ENOENT）豁免 ────────────────────────────

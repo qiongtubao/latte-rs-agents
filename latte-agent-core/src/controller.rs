@@ -7143,6 +7143,9 @@ pub(crate) async fn gate_delegate_return(
     task: &str,
     response: String,
     tool_call_summary: &str,
+    // 被审子任务的执行约束（授权工具 + 产出契约摘要），workflow step
+    // 路径由引擎组装传入；None = 调用方拿不到（manager delegate 等）。
+    constraints: Option<&str>,
 ) -> (String, Option<crate::advisor_monitor::ReviewVerdict>) {
     use crate::advisor_monitor::Verdict;
     // Bound the review so a slow/absent advisor model can't stall the
@@ -7159,6 +7162,7 @@ pub(crate) async fn gate_delegate_return(
             task,
             &response,
             tool_call_summary,
+            constraints,
         ),
     )
     .await;
@@ -7841,6 +7845,7 @@ async fn register_delegate_tool(
                     &task,
                     response,
                     "", // manager delegate 路径，调用方无工具计数
+                    None, // manager delegate 无 step 级执行约束
                 )
                 .await
                 .0),

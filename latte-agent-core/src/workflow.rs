@@ -645,6 +645,7 @@ async fn contract_last_resort_review(
         task,
         response.to_string(),
         "", // contract_last_resort_review 无工具调用数据
+        None, // 兜底审查不注入 step 执行约束（契约此时已判失败）
     )
     .await;
     let v = verdict?;
@@ -735,6 +736,7 @@ async fn loop_exhausted_last_resort_review(
         &task,
         artifact.to_string(),
         "", // 无工具调用数据
+        None, // 返工环复核无 step 执行约束上下文
     )
     .await;
     let Some(v) = verdict else {
@@ -3237,6 +3239,18 @@ struct SpeakerDispatch {
     /// AdvisorTerminated 告终）。短产出的下限由契约自己的 min_chars +
     /// 重试链兜底，D5 对这类 step 没有额外信息量。
     step_max_chars: Option<usize>,
+    /// 本 step 是否声明了任何产出契约约束（`output_contract` 非默认）。
+    /// 声明了契约的 step，**机器契约是唯一验收器**：advisor 的委派返回
+    /// 语义审查降级为「仅供参考」——气泡照发，但不触发重做、批注不进
+    /// 产出（实测实锤：advisor 拿用户原始任务的验收标准反复打回一个
+    /// 严格遵守 max_chars 契约的 slug 产出，「打回→续作→再打回」
+    /// 永远收敛不了）。
+    step_has_output_contract: bool,
+    /// 给委派返回审查的「该子任务的执行约束」文本（授权工具白名单 +
+    /// 产出契约摘要，见 [`step_review_constraints`]）。审查者必须知道
+    /// 被审者的约束，否则会以「没调未授权的工具 / 产出太短没展开」
+    /// 打回一个正在严格遵守契约的产出。None = 无约束可告知。
+    review_constraints: Option<String>,
     /// 用户回答台账：阻塞 `ask` 收到答案即落盘，同一问题重试/resume
     /// 时直接回放，不再让用户重答一遍。
     answer_log: Arc<AnswerLog>,
@@ -3284,6 +3298,9 @@ impl SpeakerDispatch {
             // 测试构造器不关联具体 step 契约；生产站点（引擎派发处）
             // 按 step.output_contract.max_chars 显式写入。
             step_max_chars: None,
+            // 同上：引擎派发处按 step.output_contract 与 step.tools 写入。
+            step_has_output_contract: false,
+            review_constraints: None,
             answer_log,
             // 默认不接管；需要 require_plan_submit 的 step 由引擎在
             // 构造后写入自己的句柄。
@@ -3307,6 +3324,69 @@ fn gate_for_step(
         gate.short_output_threshold = 0;
     }
     gate
+}
+
+/// step 是否声明了任何产出契约约束。`output_contract` 是带 Default 的
+/// 结构体（非 Option），「全默认」等价于不校验（见 [`check_output_contract`]），
+/// 所以「非默认」就是「声明了至少一条约束」。
+fn step_has_output_contract(step: &WorkflowStepDef) -> bool {
+    step.output_contract != OutputContract::default()
+}
+
+/// 组装给委派返回审查的「该子任务的执行约束」文本：step 级授权工具
+/// 白名单 + 产出契约的人类可读摘要。两者都没有时返回 None（审查 prompt
+/// 不渲染该节，行为与历史一致）。
+///
+/// 为什么必须给：审查 prompt 里的准绳是用户原始诉求，审查者不知道该
+/// step 只是流水线的一环、产出形态与可用工具受契约/白名单限制——实测
+/// 它反复要求一个「只许返回 ≤60 字符 slug」的 step 返回正文讲解、调用
+/// 未授权的工具，造成永远收敛不了的打回循环。
+fn step_review_constraints(step: &WorkflowStepDef) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if !step.tools.is_empty() {
+        lines.push(format!(
+            "- 本步授权工具（白名单）：{}。它被禁止调用列表外的工具，\
+             不要因为它「没调用某个不在列表里的工具」而打回。",
+            step.tools.join("、")
+        ));
+    }
+    let c = &step.output_contract;
+    if *c != OutputContract::default() {
+        lines.push("- 本步声明了产出契约，引擎会做机器校验；产出形态以契约为准，\
+                    不要拿「完整报告」的标准去衡量它：".to_string());
+        if let Some(min) = c.min_chars {
+            lines.push(format!("  - 产出至少 {min} 字符"));
+        }
+        if let Some(max) = c.max_chars {
+            lines.push(format!(
+                "  - 产出上限 {max} 字符——它可能只是一个短标识/短文本，\
+                 不要因为「太短、没有展开讲解」而打回"
+            ));
+        }
+        if !c.require.is_empty() {
+            lines.push(format!("  - 产出必须全部包含：{}", c.require.join("、")));
+        }
+        if !c.require_any.is_empty() {
+            lines.push(format!(
+                "  - 产出必须至少包含其中之一：{}",
+                c.require_any.join(" / ")
+            ));
+        }
+        if !c.forbid.is_empty() {
+            lines.push(format!("  - 产出禁止出现：{}", c.forbid.join("、")));
+        }
+        if !c.last_line_prefix_any.is_empty() {
+            lines.push(format!(
+                "  - 产出最后一个非空行必须以其中之一开头：{}",
+                c.last_line_prefix_any.join(" / ")
+            ));
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Run one dispatched speaker as a full subagent, mirroring the
@@ -3783,6 +3863,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     &inp.prompt,
                     response,
                     &tool_summary,
+                    inp.review_constraints.as_deref(),
                 )
                 .await;
                 let intervene = matches!(
@@ -3790,6 +3871,25 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     Some(crate::advisor_monitor::Verdict::Intervene)
                         | Some(crate::advisor_monitor::Verdict::Terminate)
                 );
+                // 声明了产出契约的 step：机器契约是唯一验收器，语义审查
+                // 降级为「仅供参考」——气泡照发（用户仍能看到 advisor 的
+                // 意见），但不进重做分支、批注不进产出（剥注解后的
+                // annotated 即 speaker 原始产出）。实测实锤：advisor 拿
+                // 用户原始任务的验收标准反复打回一个严格遵守 max_chars
+                // 契约的 slug 产出（要求返回正文讲解、跑未授权的工具），
+                // 「打回→续作→再打回」永远收敛不了。
+                if intervene && inp.step_has_output_contract {
+                    let _ = inp.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "ℹ️ step '{}' 已声明产出契约，advisor 语义意见仅作参考，以契约校验为准",
+                            inp.step_id
+                        ),
+                    });
+                    break Ok(SpeakerOut {
+                        response: crate::controller::strip_review_annotation(&annotated),
+                        tools: tool_summary,
+                    });
+                }
                 if intervene && redo < max_redo {
                     redo += 1;
                     let v = verdict.as_ref().expect("intervene 蕴含 verdict");
@@ -4193,6 +4293,8 @@ async fn run_workflow_serial(
                     );
                     dispatch.plan_stage = plan_stage.clone();
                     dispatch.step_max_chars = step.output_contract.max_chars;
+                    dispatch.step_has_output_contract = step_has_output_contract(step);
+                    dispatch.review_constraints = step_review_constraints(step);
                     let (mut response, tools_called) = match run_step_speaker(dispatch).await {
                         Ok(o) => (o.response, o.tools),
                         Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
@@ -4203,6 +4305,14 @@ async fn run_workflow_serial(
                             ))
                         }
                     };
+                    // 监察批注（⚠️ [监察审查]…）是给人读的旁注，绝不参与
+                    // 机器校验：envelope 分离——机器校验只认 speaker 的原始
+                    // 产出。实测实锤：33 字符的合规 slug 被重做耗尽后拼上
+                    // 的审查批注撑到 445 字符，max_chars=60 的契约校验对
+                    // 拼接文本判不合格，step 重试耗尽、workflow 判死。
+                    // 批注给人的可见性不受影响：advisor 气泡事件与
+                    // DelegateFinished 摘要里仍在。
+                    response = crate::controller::strip_review_annotation(&response);
                     // plan 提交硬校验：**不走 advisor 语义兜底**。
                     // 「零任务入库」没有语义解释空间——放行只会让
                     // workflow 继续报 ok（实测
@@ -4760,6 +4870,8 @@ async fn run_dag_step(
                 staging: inp.staging.clone(),
                 step_tools: step.tools.clone(),
                 step_max_chars: step.output_contract.max_chars,
+                step_has_output_contract: step_has_output_contract(step),
+                review_constraints: step_review_constraints(step),
                 answer_log: inp.answer_log.clone(),
                 plan_stage: plan_stage.clone(),
             };
@@ -4775,6 +4887,9 @@ async fn run_dag_step(
                     })
                 }
             };
+            // 同串行引擎：监察批注是人读的旁注，机器校验只认 speaker
+            // 原始产出（envelope 分离，见串行引擎同名注释的实测实锤）。
+            response = crate::controller::strip_review_annotation(&response);
             // plan 提交硬校验：不走 advisor 语义兜底（同串行引擎）。
             if step.require_plan_submit && !plan_submitted(plan_stage.as_ref()) {
                 if attempt >= step.max_retries {
@@ -6899,6 +7014,56 @@ role = "reviewer"
         );
     }
 
+    /// `step_has_output_contract` / `step_review_constraints`：契约「非默认」
+    /// 才算声明了约束；约束摘要覆盖授权工具白名单与各类契约条目，全默认
+    /// 且无白名单时返回 None（审查 prompt 不渲染该节，行为与历史一致）。
+    #[test]
+    fn step_constraints_summary_covers_tools_and_contract() {
+        let plain: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+role = "worker"
+task = "t"
+"#,
+        )
+        .unwrap();
+        assert!(!step_has_output_contract(&plain));
+        assert_eq!(step_review_constraints(&plain), None);
+
+        let contracted: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+role = "worker"
+task = "t"
+tools = ["write"]
+[output_contract]
+max_chars = 60
+require = ["VERDICT"]
+"#,
+        )
+        .unwrap();
+        assert!(step_has_output_contract(&contracted));
+        let c = step_review_constraints(&contracted).expect("应有约束摘要");
+        assert!(c.contains("write"), "授权工具白名单: {c}");
+        assert!(c.contains("产出上限 60 字符"), "max_chars 摘要: {c}");
+        assert!(c.contains("VERDICT"), "require 摘要: {c}");
+
+        // 只声明工具白名单（无契约）也要生成约束——白名单本身就是
+        // 审查者必须知道的限制。
+        let tools_only: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+role = "worker"
+task = "t"
+tools = ["read", "ask"]
+"#,
+        )
+        .unwrap();
+        assert!(!step_has_output_contract(&tools_only));
+        let c = step_review_constraints(&tools_only).expect("白名单也应生成约束");
+        assert!(c.contains("read、ask"), "{c}");
+    }
+
     /// tutor 角色必须有取证工具，否则 learn_loop 里"基于源码出题"的要求
     /// 根本执行不了——实测会话就是这么编出 3 道幻觉题的（当时白名单
     /// 只有 read/write/ask）。
@@ -8838,7 +9003,10 @@ prompt = "围绕测试主题产出学习笔记。"
     }
 
     /// intervene 重做后仍被判 intervene → 不再无限重试：第二次产出
-    /// 带批注放行（重做上限取默认 return_max_redo=1）。
+    /// 放行（重做上限取默认 return_max_redo=1）。批注不再随产出进入
+    /// last_output/vars——引擎在接收处剥注解（envelope 分离：批注是
+    /// 人读的旁注，机器校验与下游消费只认 speaker 原始产出）；给人的
+    /// 可见性由 advisor 气泡与 DelegateFinished 摘要承担。
     #[tokio::test]
     async fn advisor_intervene_redo_exhausted_passes_annotated() {
         let server = wiremock::MockServer::start().await;
@@ -8891,13 +9059,31 @@ prompt = "围绕测试主题产出学习笔记。"
 "#,
         )
         .unwrap();
-        let (mut ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        let (mut ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
         ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
         let out = run_workflow(&wf, "测试主题", &ctx)
             .await
-            .expect("重试耗尽后应带批注放行而不是失败");
+            .expect("重试耗尽后应放行而不是失败");
         assert!(out.contains("v2 产出"), "产出是重做版: {out}");
-        assert!(out.contains("监察审查"), "耗尽后批注随产出放行: {out}");
+        assert!(
+            !out.contains("监察审查"),
+            "批注不进产出（引擎接收处剥注解），它只在 advisor 气泡里: {out}"
+        );
+        // 批注给人的可见性不受影响：advisor 的 intervene 气泡照发。
+        let events: Vec<ChatEvent> = {
+            let mut v = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                v.push(ev);
+            }
+            v
+        };
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                ChatEvent::RoleTurn { role_id, .. } if role_id == "advisor"
+            )),
+            "advisor 气泡仍应可见: {events:?}"
+        );
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 4, "只重做一次: {}", requests.len());
@@ -9707,6 +9893,131 @@ require = ["契约要求的验收标记字符串"]
             .await
             .expect("DAG advisor 语义兜底应放行");
         assert!(out.contains("监察审查"), "产出带兜底放行批注: {out}");
+    }
+
+    /// 修 A+B 回归：声明了产出契约的 step，机器契约是唯一验收器——
+    /// advisor 判 intervene 也**不重做**、批注不进产出，且审查 prompt
+    /// 里带上了该 step 的执行约束（授权工具 + 契约摘要）。
+    ///
+    /// 实测事故：step 声明 max_chars=60（只许返回 slug），speaker 合规
+    /// 返回短标识，advisor 却拿用户原始任务的验收标准反复打回（要正文
+    /// 讲解、要跑未授权的工具），「打回→续作→再打回」永不收敛；重做
+    /// 耗尽后批注又被拼进产出，把 33 字符的合规 slug 撑到数百字符，
+    /// max_chars 校验对拼接文本判不合格，workflow 判死。
+    #[tokio::test]
+    async fn contract_step_advisor_intervene_is_advisory_only() {
+        let server = wiremock::MockServer::start().await;
+        // 33 字符内的合规 slug。
+        let slug = "rust-ownership-basics";
+        // FIFO：worker 首发命中通用 mock（仅 1 次）；advisor 审查请求
+        // （内嵌被审产出 slug）落到第二个 mock → 判 intervene。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(slug)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(slug))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "verdict: intervene\nreason: 没有返回正文讲解\nhint: 补充说明并调用 read 取证",
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "contract_advisory_demo"
+[[steps]]
+id = "plan"
+role = "worker"
+task = "为 {{topic}} 产出计划标识"
+output_key = "plan_out"
+tools = ["write"]
+[steps.output_contract]
+max_chars = 60
+"#,
+        )
+        .unwrap();
+        let (mut ctx, mut rx) = test_ctx(test_config_at(&server.uri()));
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("合规 slug 必须直接通过，advisor intervene 仅作参考");
+        assert_eq!(out, slug, "产出必须是未批注的原始 slug: {out}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "worker×1 + advisor×1，不得触发重做: {}",
+            requests.len()
+        );
+        // 审查者必须知道被审者的约束：审查请求里带着授权工具白名单与
+        // 产出契约摘要。
+        let review_req = String::from_utf8_lossy(&requests[1].body);
+        assert!(
+            review_req.contains("执行约束"),
+            "审查 prompt 应含执行约束专节: {review_req}"
+        );
+        assert!(
+            review_req.contains("产出上限 60 字符"),
+            "审查 prompt 应含契约摘要: {review_req}"
+        );
+        assert!(
+            review_req.contains("write"),
+            "审查 prompt 应含授权工具白名单: {review_req}"
+        );
+
+        let events: Vec<ChatEvent> = {
+            let mut v = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                v.push(ev);
+            }
+            v
+        };
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                ChatEvent::Status { message } if message.contains("仅作参考")
+            )),
+            "应有「语义意见仅作参考」Status: {events:?}"
+        );
+        // 气泡照发：advisor 的意见对用户仍然可见。
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                ChatEvent::RoleTurn { role_id, content, .. }
+                    if role_id == "advisor" && content.contains("没有返回正文讲解")
+            )),
+            "advisor intervene 气泡应照常可见: {events:?}"
+        );
+    }
+
+    /// 修 B 单元面：机器契约校验永远作用于未批注的原始产出——同一段
+    /// 文本，拼上审查批注会被 max_chars 判死，剥掉批注的原文合规。
+    /// （引擎接收处的 strip 让校验输入恒为后者。）
+    #[test]
+    fn output_contract_checks_raw_payload_not_annotation() {
+        let slug = "rust-ownership-basics";
+        let annotation = "本返回可能偏离职责或未完全达成委派任务：\
+                          没有返回正文讲解。处理建议：补充说明并调用 read 取证。";
+        let annotated = format!("{slug}\n\n---\n⚠️ [监察审查] {annotation}");
+        let contract = OutputContract {
+            max_chars: Some(60),
+            ..Default::default()
+        };
+        assert!(
+            check_output_contract(&contract, &annotated).is_err(),
+            "拼接批注的文本确实会撞 max_chars（旧缺陷形态）"
+        );
+        let raw = crate::controller::strip_review_annotation(&annotated);
+        assert_eq!(raw, slug);
+        assert!(
+            check_output_contract(&contract, &raw).is_ok(),
+            "剥掉批注的原始产出必须合规"
+        );
     }
 }
 
