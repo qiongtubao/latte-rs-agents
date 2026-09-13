@@ -5,7 +5,7 @@
 <instruction>
 - PREFER this tool over `read` and `search` for code exploration. It returns precise signatures+line spans at minimal token cost.
 - Use `kind` parameter (recommended): `function`, `struct`, `type`, `macro`, `call`, `import`, `decl`. Avoids pattern syntax errors.
-- Use `name` to filter by substring — drastically reduces output when scanning directories.
+- Use `name` to narrow by regex against matched text — but `name` alone is not enough: it must be combined with `kind` or `pattern`. Passing `name` without either fails validation.
 - Default mode `signatures` returns one-line-per-match. Only use `mode=full` when you need the implementation body.
 - `lang` is optional: inferred from the file extension, or from a directory's dominant language by content. Pass it explicitly only for mixed-language directories or when inference picks wrong (the result's `lang`/`lang_note` fields tell you what was used).
 - Each match is `path:START-END: signature`. **`START-END` is the definition's full span — paste it straight into `read`.** Never guess how long a function is.
