@@ -977,6 +977,9 @@ export function mountChat(opts: {
     overlay.id = "choice-modal";
     const box = document.createElement("div");
     box.className = "choice-modal";
+    // 带学习文档的询问默认用更宽的窗口（代码块/图需要横向空间）；
+    // 用户仍可用右下角手柄自行调整（CSS resize: both）。
+    if (entry.e.document_markdown?.trim()) box.classList.add("has-doc");
     overlay.appendChild(box);
 
     const head = document.createElement("div");

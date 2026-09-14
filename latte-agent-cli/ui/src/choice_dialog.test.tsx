@@ -418,4 +418,22 @@ describe("ask 选择框弹窗", () => {
     expect(doc!.querySelector(".choice-doc-body h3")!.textContent).toContain("旧文档");
   });
 
+  it("带文档的弹窗加 has-doc 类（默认更宽）；不带文档不加", () => {
+    const { chat } = mount();
+    chat.handleEvent(
+      choiceEvent({ document_markdown: "# 有文档" }),
+    );
+    expect(
+      document.querySelector(".choice-modal")!.classList.contains("has-doc"),
+      "带文档的弹窗应加 has-doc",
+    ).toBe(true);
+
+    chat.clear();
+    chat.handleEvent(choiceEvent({ choice_id: "choice-nodoc-2" }));
+    expect(
+      document.querySelector(".choice-modal")!.classList.contains("has-doc"),
+      "不带文档的弹窗不应加 has-doc",
+    ).toBe(false);
+  });
+
 });
