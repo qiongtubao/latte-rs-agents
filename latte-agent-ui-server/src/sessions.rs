@@ -523,6 +523,20 @@ impl SessionHandle {
         *self.last_activity.lock() = Instant::now();
     }
 
+    /// 已经在跑的 controller；`None` = 还没懒 spawn。
+    ///
+    /// 与 [`Self::controller_or_spawn`] 的分工：**只读**端点用这个。读一个
+    /// 状态不该有副作用——为了回答「现在有目标吗」而把整个 controller 起
+    /// 起来（连着 build_runner、模型解析、subsession store）是不可接受的。
+    pub(crate) fn controller_if_running(&self) -> Option<Arc<ChatController>> {
+        self.controller.lock().clone()
+    }
+
+    /// 本 session 的工作目录（落盘状态都在 `<cwd>/.latte/` 下）。
+    pub(crate) fn cwd(&self) -> PathBuf {
+        self.spawn.cwd.clone()
+    }
+
     /// 懒 spawn：已有 controller 直接返回；恢复 session 在首个
     /// chat_send/subscribe 时在这里真正起 controller（双重检查锁）。
     ///

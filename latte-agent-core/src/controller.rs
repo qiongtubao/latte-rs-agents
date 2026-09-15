@@ -3110,7 +3110,7 @@ async fn run_single_role_loop(
                                         "/exit" | "/quit" => break,
                                         "/help" => {
                                             let _ = event_tx.send(ChatEvent::Status {
-                                                message: "Commands: /role <id>  /model <tier>  /roles  /planmode [on|off]  /clear  /status  /tools  /history  /save <file>  /load <file>  /help  /exit".into(),
+                                                message: "Commands: /role <id>  /model <tier>  /roles  /planmode [on|off]  /goal [show|set <目标>|pause|resume|drop|rounds <N>|budget <N|off>]  /clear  /status  /tools  /history  /save <file>  /load <file>  /help  /exit".into(),
                                             });
                                         }
                                         // plan mode（只读规划模式）：无参 = 翻转；
@@ -3132,6 +3132,168 @@ async fn run_single_role_loop(
                                                     "[plan mode 已关闭：恢复正常工具集]".into()
                                                 },
                                             });
+                                        }
+                                        // goal 层的**用户侧**入口。模型侧走 `goal`
+                                        // 工具，两边共享同一份状态。
+                                        //
+                                        // 为什么必须有：blocked 的提示里写着「抬高
+                                        // 轮次上限后 resume 续跑」，而在补上这个命令
+                                        // 之前那条路径**用户根本走不到**——goal 只有
+                                        // 模型能调，CLI 没命令、HTTP 没端点。写在提示
+                                        // 里却做不到的恢复路径比没有更糟。
+                                        "/goal" => {
+                                            let sub = parts.get(1).map(|s| s.trim()).unwrap_or("show");
+                                            let (verb, rest) = match sub.split_once(' ') {
+                                                Some((v, r)) => (v.trim(), r.trim()),
+                                                None => (sub, ""),
+                                            };
+                                            let st = goal_state.clone();
+                                            let save = |sid: &str, cwd: &std::path::Path| {
+                                                crate::goal::persist(cwd, sid, &st.read());
+                                            };
+                                            // 注意：`describe` **不自己取锁** —— activation
+                                            // 由调用方传入。它常被放在
+                                            // `match goal_state.read()...` 的 arm 里，
+                                            // 内部再 `read()` 就是递归读；parking_lot 的
+                                            // RwLock 在「已有读者 + 有写者在等」时会让第二个
+                                            // read 阻塞，那是个偶发死锁（表现为会话静默卡住）。
+                                            let describe = |g: &crate::goal::Goal,
+                                                            act: crate::goal::GoalActivation| {
+                                                let budget = match (g.token_budget, g.tokens_remaining()) {
+                                                    (Some(b), Some(rem)) => {
+                                                        format!("，token {}/{b}（剩 {rem}）", g.tokens_used)
+                                                    }
+                                                    _ => format!("，token 已用 {}（无上限）", g.tokens_used),
+                                                };
+                                                let blocked = match &g.blocked_reason {
+                                                    Some(r) => format!("\n阻塞原因[{}]：{}", r.code, r.message),
+                                                    None => String::new(),
+                                                };
+                                                format!(
+                                                    "🎯 目标（{}，自动续跑{}）\n{}\n第 {}/{} 轮{budget}{blocked}",
+                                                    g.phase.as_str(),
+                                                    match act {
+                                                        crate::goal::GoalActivation::Armed => "开",
+                                                        crate::goal::GoalActivation::Disarmed => "关",
+                                                    },
+                                                    g.objective,
+                                                    g.rounds_started,
+                                                    g.max_rounds,
+                                                )
+                                            };
+                                            // 每个分支统一用它拿「当前快照 + activation」，
+                                            // 一次读锁取完立刻放。
+                                            let snapshot = || {
+                                                let g = goal_state.read();
+                                                (g.current(), g.activation())
+                                            };
+                                            let msg = match verb {
+                                                "" | "show" | "status" => {
+                                                    let (cur, act) = snapshot();
+                                                    match cur {
+                                                        Some(g) => describe(&g, act),
+                                                        None => "当前没有目标。用 `/goal set <可验证的目标>` 立一个完成契约，之后每轮会自动续跑到达成或撞上限。".to_string(),
+                                                    }
+                                                }
+                                                "set" => {
+                                                    if rest.is_empty() {
+                                                        "usage: /goal set <目标：做什么 + 怎样算做完>".to_string()
+                                                    } else {
+                                                        let r = goal_state.write().create(rest, None, None, true);
+                                                        match r {
+                                                            Ok(g) => {
+                                                                save(&config.session_id, &config.cwd);
+                                                                let _ = event_tx.send(ChatEvent::GoalUpdated { goal: Some(g.clone()), change: "set".into() });
+                                                                format!("{}\n（自动续跑已开启：我停下时若目标未达成会自己继续，`/goal pause` 可随时停）", describe(&g, snapshot().1))
+                                                            }
+                                                            Err(e) => format!("设定失败：{e}"),
+                                                        }
+                                                    }
+                                                }
+                                                "pause" | "resume" | "drop" => {
+                                                    let cur = goal_state.read().current();
+                                                    match cur {
+                                                        None => "当前没有目标。".to_string(),
+                                                        Some(g) => {
+                                                            let r = g.goal_ref();
+                                                            let out = match verb {
+                                                                "pause" => goal_state.write().pause(&r).map(Some),
+                                                                "resume" => goal_state.write().resume(&r).map(Some),
+                                                                _ => Ok(goal_state.write().clear().map(|_| None).unwrap_or(None)),
+                                                            };
+                                                            save(&config.session_id, &config.cwd);
+                                                            match out {
+                                                                Ok(Some(g2)) => {
+                                                                    let _ = event_tx.send(ChatEvent::GoalUpdated { goal: Some(g2.clone()), change: verb.into() });
+                                                                    describe(&g2, snapshot().1)
+                                                                }
+                                                                Ok(None) => {
+                                                                    let _ = event_tx.send(ChatEvent::GoalUpdated { goal: None, change: "drop".into() });
+                                                                    "🎯 目标已丢弃，自动续跑停止。".to_string()
+                                                                }
+                                                                Err(e) => format!("{verb} 失败：{e}"),
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                // 撞 round-limit 之后的补救动作：先抬上限，再 resume。
+                                                "rounds" => match rest.parse::<u32>() {
+                                                    Err(_) => "usage: /goal rounds <轮数>".to_string(),
+                                                    Ok(n) => {
+                                                        let cur = goal_state.read().current();
+                                                        match cur {
+                                                            None => "当前没有目标。".to_string(),
+                                                            Some(g) => {
+                                                                let r = goal_state.write().edit_budget(&g.goal_ref(), Some(n), None);
+                                                                save(&config.session_id, &config.cwd);
+                                                                match r {
+                                                                    Ok(g2) => {
+                                                                        let _ = event_tx.send(ChatEvent::GoalUpdated { goal: Some(g2.clone()), change: "rounds".into() });
+                                                                        format!("{}\n（`/goal resume` 才会真的接着跑）", describe(&g2, snapshot().1))
+                                                                    }
+                                                                    Err(e) => format!("改轮次上限失败：{e}"),
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                },
+                                                "budget" => {
+                                                    let new_budget = if rest.eq_ignore_ascii_case("off") || rest == "0" {
+                                                        Some(None)
+                                                    } else {
+                                                        match rest.parse::<u64>() {
+                                                            Ok(n) => Some(Some(n)),
+                                                            Err(_) => None,
+                                                        }
+                                                    };
+                                                    // 读锁必须在**独立语句**里取完就放。
+                                                    // 写成 `match (x, goal_state.read().current())`
+                                                    // 会让读守卫活到整个 match 结束，而 arm 里要拿
+                                                    // 写锁 —— parking_lot 的 RwLock 不可重入，那是
+                                                    // 一个必然死锁（且表现为整个会话静默卡住，
+                                                    // 比 panic 难查得多）。
+                                                    let cur = goal_state.read().current();
+                                                    match (new_budget, cur) {
+                                                        (None, _) => "usage: /goal budget <token 数|off>".to_string(),
+                                                        (_, None) => "当前没有目标。".to_string(),
+                                                        (Some(b), Some(g)) => {
+                                                            let r = goal_state.write().edit_budget(&g.goal_ref(), None, Some(b));
+                                                            save(&config.session_id, &config.cwd);
+                                                            match r {
+                                                                Ok(g2) => {
+                                                                    let _ = event_tx.send(ChatEvent::GoalUpdated { goal: Some(g2.clone()), change: "budget".into() });
+                                                                    describe(&g2, snapshot().1)
+                                                                }
+                                                                Err(e) => format!("改预算失败：{e}"),
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                other => format!(
+                                                    "未知的 /goal 子命令 '{other}' —— 可用：show / set <目标> / pause / resume / drop / rounds <N> / budget <N|off>"
+                                                ),
+                                            };
+                                            let _ = event_tx.send(ChatEvent::Status { message: msg });
                                         }
                                         "/roles" => {
                                             let ids: Vec<&String> = merged.roles.keys().collect();
@@ -18796,5 +18958,274 @@ require = ["永远不可能出现的验收字符串"]
         );
 
         b.abort().await;
+    }
+
+    /// 用户侧 `/goal` 命令：**撞上轮次上限后真的能自己救回来**。
+    ///
+    /// 补这条命令之前存在一个纸面路径：blocked 的提示里写着「① 抬高轮次
+    /// 上限后 resume 续跑」，但 `goal` 是**只有模型能调**的工具，CLI 没
+    /// 命令、HTTP 没端点 —— 用户照着提示做不到。写在提示里却做不到的恢复
+    /// 路径比没有更糟：用户会以为是自己用错了。
+    ///
+    /// 本测试走完整条链：set → 撞上限 blocked → `/goal rounds` 抬上限 →
+    /// `/goal resume` → 续跑真的继续。
+    #[tokio::test]
+    async fn goal_slash_command_can_recover_from_round_limit() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "又推进了一点，还没达成，先汇报进展占位。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: "slash-goal".to_string(),
+        };
+
+        let c = ChatController::new(512);
+        let mut rx = c.spawn(cfg).await;
+
+        // 收 Status 直到出现某个子串（或超时）。
+        async fn wait_status(
+            rx: &mut broadcast::Receiver<ChatEvent>,
+            needle: &str,
+            secs: u64,
+        ) -> Option<String> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+            while tokio::time::Instant::now() < deadline {
+                if let Ok(Ok(ChatEvent::Status { message })) =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+                {
+                    if message.contains(needle) {
+                        return Some(message);
+                    }
+                }
+            }
+            None
+        }
+
+        // ── 无目标时 show 给出可执行指引 ──
+        c.submit_input("/goal").await;
+        let msg = wait_status(&mut rx, "当前没有目标", 5)
+            .await
+            .expect("无目标时应给指引");
+        assert!(msg.contains("/goal set"), "要告诉用户怎么立一个：{msg}");
+
+        // ── set ──
+        c.submit_input("/goal set 把三个 bug 修完并全量验证").await;
+        let msg = wait_status(&mut rx, "自动续跑已开启", 5)
+            .await
+            .expect("set 应确认");
+        assert!(msg.contains("把三个 bug 修完并全量验证"), "{msg}");
+        // 落盘也该发生（用户侧改动同样要能跨重启）。
+        assert!(
+            crate::goal::load(dir.path(), "slash-goal").is_some(),
+            "/goal set 之后应已落盘"
+        );
+
+        // 轮次收到 1，好让它下一轮就撞上限。
+        c.submit_input("/goal rounds 1").await;
+        let msg = wait_status(&mut rx, "第 0/1 轮", 5).await.expect("rounds 应生效");
+        assert!(msg.contains("/goal resume"), "要提示 resume 才真跑：{msg}");
+
+        // ── 干一轮活 → 自动续跑第 1 轮 → 再收尾时撞上限 ──
+        c.submit_input("开始干活").await;
+        let blocked = wait_status(&mut rx, "blocked[round-limit]", 25)
+            .await
+            .expect("应撞上轮次上限");
+        assert!(blocked.contains("抬高轮次上限"), "{blocked}");
+        let g = c.goal_snapshot().expect("goal");
+        assert_eq!(g.phase, crate::goal::GoalPhase::Blocked);
+        assert_eq!(
+            c.goal_state().read().activation(),
+            crate::goal::GoalActivation::Disarmed
+        );
+        let calls_at_block = server.received_requests().await.unwrap().len();
+
+        // ── 关键：用户按提示自救 ──
+        // 先 resume 会被拒（轮次真的用完了），这正是要提示"先抬上限"的原因。
+        c.submit_input("/goal resume").await;
+        let refused = wait_status(&mut rx, "resume 失败", 5)
+            .await
+            .expect("轮次用尽时 resume 应被拒");
+        assert!(refused.contains("抬高 max_rounds"), "报错要给出补救动作：{refused}");
+
+        c.submit_input("/goal rounds 9").await;
+        wait_status(&mut rx, "第 1/9 轮", 5).await.expect("抬上限应生效");
+        c.submit_input("/goal resume").await;
+        wait_status(&mut rx, "自动续跑开", 5)
+            .await
+            .expect("resume 后 activation 应为开");
+
+        // resume 只是重新 arm；真正继续跑要等下一次 turn 收尾。
+        c.submit_input("接着干").await;
+        for _ in 0..200 {
+            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) > calls_at_block + 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            server.received_requests().await.unwrap().len() > calls_at_block + 1,
+            "抬上限 + resume 之后自动续跑必须真的继续（这是提示里承诺的恢复路径）"
+        );
+        assert!(
+            c.goal_snapshot().unwrap().rounds_started >= 2,
+            "轮号应继续往下走"
+        );
+
+        // 到此为止：恢复路径已验证。pause / drop 放在下面那条**不依赖时序**
+        // 的测试里——这里目标是 armed 的，续跑会一轮接一轮自己跑下去，
+        // 在这条流水线上断言"停下来了"必然与续跑赛跑。
+        c.abort().await;
+    }
+
+    /// `/goal` 的状态类子命令：pause / resume / drop / budget。
+    ///
+    /// 走共享句柄而不是 controller：这些分支的行为完全由状态机决定，
+    /// 而 armed 的目标会一轮接一轮自动续跑，在跑着的流水线上断言"停下来了"
+    /// 必然与续跑赛跑（上面那条测试就是这么翻的）。
+    #[tokio::test]
+    async fn goal_slash_command_pause_resume_drop_and_budget() {
+        let state = crate::goal::new_shared_goal();
+        state
+            .write()
+            .create("测试目标", Some(5), None, false)
+            .expect("create");
+        assert_eq!(
+            state.read().activation(),
+            crate::goal::GoalActivation::Armed,
+            "set 即 arm"
+        );
+
+        // pause 关掉自动续跑，但目标还在。
+        let g = state.read().current().unwrap();
+        let paused = state.write().pause(&g.goal_ref()).expect("pause");
+        assert_eq!(paused.phase, crate::goal::GoalPhase::Paused);
+        assert_eq!(
+            state.read().activation(),
+            crate::goal::GoalActivation::Disarmed
+        );
+        assert_eq!(
+            state.write().drive(),
+            crate::goal::DriveDecision::Idle,
+            "paused 时 driver 必须不动"
+        );
+
+        // resume 重新 arm。
+        let resumed = state.write().resume(&paused.goal_ref()).expect("resume");
+        assert_eq!(resumed.phase, crate::goal::GoalPhase::Active);
+        assert_eq!(state.read().activation(), crate::goal::GoalActivation::Armed);
+
+        // budget：设上限 / off 清掉。
+        let with_budget = state
+            .write()
+            .edit_budget(&resumed.goal_ref(), None, Some(Some(50_000)))
+            .expect("设预算");
+        assert_eq!(with_budget.token_budget, Some(50_000));
+        let cleared = state
+            .write()
+            .edit_budget(&with_budget.goal_ref(), None, Some(None))
+            .expect("清预算");
+        assert_eq!(cleared.token_budget, None, "off 应清掉预算");
+
+        // drop 丢掉目标并停掉续跑。
+        let dropped = state.write().clear().expect("drop");
+        assert_eq!(dropped.objective, "测试目标");
+        assert!(state.read().current().is_none());
+        assert_eq!(
+            state.read().activation(),
+            crate::goal::GoalActivation::Disarmed
+        );
     }
 }

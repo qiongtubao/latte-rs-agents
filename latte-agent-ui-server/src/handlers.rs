@@ -260,13 +260,34 @@ pub(crate) async fn chat_pending_prompts(
         .map(Json)
         .map_err(Into::into)
 }
+
+/// `GET /api/goal?id=<session>` —— 本 session 的 goal 层完成契约快照。
+///
+/// 为什么需要它而不是只靠 SSE 的 `GoalUpdated`：那是**瞬时事件**，刷新
+/// 页面或 broadcast lag 之后徽章就没了，而目标是跨 turn（现在还跨进程）
+/// 存在的东西。UI 要能在任何时候问一句"现在有目标吗、跑到第几轮了"。
+///
+/// 写侧不另开端点：`/goal set|pause|resume|drop|rounds|budget` 走既有的
+/// `POST /api/chat/command`（它直接转发斜杠命令），模型侧走 `goal` 工具，
+/// 三条路共享同一份状态。
+pub(crate) async fn get_goal(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let id = params
+        .get("id")
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing ?id=".into()))?;
+    api::goal_snapshot_json(&state.backend, id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
 /// Only carries `session_id`, used for endpoints that need no other params.
 #[derive(Deserialize)]
 pub(crate) struct SessionOnlyRequest {
     #[serde(default)]
     session_id: Option<String>,
 }
-
 /// `POST /api/chat/cancel-turn` 的请求体。
 ///
 /// `sub_id` 缺省 → per-turn 取消（掐当前 turn，session 保留），与旧

@@ -501,6 +501,57 @@ pub async fn pending_choice_events(b: &UiBackend, id: &str) -> Result<Vec<ChatEv
 ///
 /// 内存项优先：同一个 `choice_id` 既在内存又在盘上时（正常运行中的
 /// run），只发内存那份，避免同一问题渲染两次。
+/// `GET /api/goal` —— 本 session 的 goal 层完成契约快照。
+///
+/// 形状：`{"goal": null}` 或
+/// `{"goal": {id, revision, objective, phase, blocked_reason?, round,
+/// max_rounds, rounds_remaining, tokens_used, token_budget?,
+/// tokens_remaining?}, "auto_continuation": true|false}`
+///
+/// `auto_continuation` 是**进程本地**的 activation（不持久化）——它与
+/// `phase` 正交：目标可以是 `active` 而续跑是关的（典型场景：进程刚重启，
+/// 目标从盘上载回但一律 disarmed，等用户显式 resume）。UI 必须把这两个
+/// 维度分开显示，否则用户看到「active」却发现它不动，无从理解。
+///
+/// controller 还没起（session 从未跑过）时**不 spawn** 一个：读操作不该
+/// 有副作用。这种情况下退回读盘上的快照，读不到就返回 `{"goal": null}`。
+pub async fn goal_snapshot_json(b: &UiBackend, id: &str) -> Result<serde_json::Value, ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    let view = |g: &latte_agent_core::goal::Goal| {
+        serde_json::json!({
+            "id": g.id,
+            "revision": g.revision,
+            "objective": g.objective,
+            "phase": g.phase.as_str(),
+            "blocked_reason": g.blocked_reason,
+            "round": g.rounds_started,
+            "max_rounds": g.max_rounds,
+            "rounds_remaining": g.rounds_remaining(),
+            "tokens_used": g.tokens_used,
+            "token_budget": g.token_budget,
+            "tokens_remaining": g.tokens_remaining(),
+        })
+    };
+    if let Some(controller) = h.controller_if_running() {
+        let state = controller.goal_state();
+        let (goal, act) = {
+            let g = state.read();
+            (g.current(), g.activation())
+        };
+        return Ok(serde_json::json!({
+            "goal": goal.as_ref().map(view),
+            "auto_continuation": matches!(act, latte_agent_core::goal::GoalActivation::Armed),
+        }));
+    }
+    // 没有活 controller：读盘。载回的目标按定义是 disarmed。
+    let cwd = h.cwd();
+    let goal = latte_agent_core::goal::load(&cwd, id);
+    Ok(serde_json::json!({
+        "goal": goal.as_ref().map(view),
+        "auto_continuation": false,
+    }))
+}
+
 pub async fn pending_dialog_events_json(
     b: &UiBackend,
     id: &str,

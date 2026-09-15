@@ -638,6 +638,9 @@ fn build_router(state: AppState) -> Router {
         // 弹框补齐：显式查「仍未处理的弹框」+ 处理后销账。SSE 只在
         // 新建连接时补发，broadcast lag / history 重放后需要这条路径。
         .route("/chat/pending-prompts", get(chat_pending_prompts))
+        // goal 层完成契约的**读**端点。写侧走 /chat/command 的斜杠命令
+        // （`/goal set|pause|resume|drop|rounds|budget`），不另开写端点。
+        .route("/goal", get(get_goal))
         .route("/chat/prompt-dismiss", post(chat_prompt_dismiss))
         .route("/chat/command", post(chat_command))
         .route("/chat/role", post(switch_role))

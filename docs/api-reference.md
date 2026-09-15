@@ -550,6 +550,56 @@ Self-loop 进度 SSE 流。
 **请求体：** `{ "enabled": false }`
 
 **响应 `200`：** 更新后的状态
+## 9b-goal. Goal 层完成契约
+
+### `GET /api/goal`
+
+读取本 session 的 goal 层完成契约（跨 turn、跨进程存在的目标）。
+
+**查询参数：** `id`（session id，必填）
+
+**响应 `200`（有目标）：**
+
+```json
+{
+  "goal": {
+    "id": "goal-1",
+    "revision": 7,
+    "objective": "把 loop 的两个缺口补齐并全量验证",
+    "phase": "active",
+    "blocked_reason": null,
+    "round": 3,
+    "max_rounds": 12,
+    "rounds_remaining": 9,
+    "tokens_used": 412330,
+    "token_budget": 2000000,
+    "tokens_remaining": 1587670
+  },
+  "auto_continuation": true
+}
+```
+
+**响应 `200`（无目标）：** `{"goal": null, "auto_continuation": false}`
+
+`phase` ∈ `active | paused | blocked | complete`。`blocked` 时 `blocked_reason`
+带稳定 `code`：`round-limit`（轮次耗尽）、`token-budget`（预算耗尽）、
+`agent-reported`（模型主动报卡点）。**轮次或预算耗尽产出 `blocked` 而不是
+`complete`——耗尽 ≠ 达成。**
+
+`auto_continuation` 是**进程本地**的续跑许可（不持久化），与 `phase`
+**正交**：目标可以是 `active` 而续跑是关的。典型场景是进程刚重启——目标从
+`<cwd>/.latte/goals/<session_id>.json` 载回，但一律 disarmed，等用户显式
+resume。UI 必须把这两个维度分开显示，否则用户看到 `active` 却发现它不动，
+无从理解。
+
+controller 还没起时**不会**为了回答这个请求而 spawn 一个（读操作不该有
+副作用），此时退回读盘上的快照，`auto_continuation` 恒为 `false`。
+
+**写侧不另开端点**：`/goal set <目标> | show | pause | resume | drop |
+rounds <N> | budget <N|off>` 走 `POST /api/chat/command`（见 3 节），模型侧
+走 `goal` 工具，三条路共享同一份状态。变更实时经 SSE 的 `GoalUpdated`
+事件推送（见 4 节）；本端点用于**刷新页面 / broadcast lag 之后**恢复徽章
+——事件是瞬时的，目标不是。
 
 ## 9c. 自动上下文压缩设置
 

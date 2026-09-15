@@ -349,6 +349,33 @@ token。
 > `require_citations_observed` / `require_plan_submit`）。缺的从来不是校验
 > 能力，而是一个把这些门禁挂上去的跨 turn 契约载体。
 
+#### 用户侧入口
+
+模型走 `goal` 工具，用户走斜杠命令，两边共享同一份状态：
+
+```bash
+/goal                      # 看当前目标：相位、第 N/M 轮、预算余量、阻塞原因
+/goal set <可验证的目标>    # 立一个完成契约（自动续跑随之开启）
+/goal pause | resume       # 关/开自动续跑（目标本身留着）
+/goal rounds <N>           # 改轮次上限 —— 撞 round-limit 后的补救动作
+/goal budget <N|off>       # 改 token 预算
+/goal drop                 # 丢弃目标
+```
+
+撞上轮次上限后的恢复路径是 `/goal rounds <更大的N>` → `/goal resume`。
+顺序不能反：`resume` 会硬校验轮次余量，轮次真用完时直接拒绝并告诉你先抬
+上限——否则 resume 完立刻又撞上限，白跑一轮还要再 block 一次。
+
+> 补上这组命令之前存在一个**纸面路径**：blocked 提示里写着「抬高轮次上限后
+> resume 续跑」，而 `goal` 是只有模型能调的工具，CLI 没命令、HTTP 没端点
+> ——用户照着提示做不到。写在提示里却做不到的恢复路径比没有更糟：用户会
+> 以为是自己用错了。
+
+Web UI 侧：写操作走 `POST /api/chat/command`（转发同样的斜杠命令），读用
+`GET /api/goal`（见 `docs/api-reference.md` 9b-goal 节）。变更实时经 SSE 的
+`GoalUpdated` 事件推送；那是瞬时事件，所以刷新页面后靠 `GET /api/goal` 恢复
+徽章。
+
 目前 goal 层只在**单角色** `chat`（manager 主路）生效；多角色 `discuss` 的
 完成契约是 `RoundScheduler` 的轮次 + `Supervisor` 预算，两套不叠加。
 
@@ -566,6 +593,7 @@ Web UI 提供完整的 REST + SSE API，详情见 `docs/api-reference.md`。
 | `/api/self-loop/start` | POST | 启动自调试 |
 | `/api/self-loop/events` | GET | 自调试 SSE |
 | `/api/self-loop/stop` | POST | 停止自调试 |
+| `/api/goal` | GET | goal 层完成契约（目标 + 轮次进度 + 续跑是否开启）|
 | `/api/role-graph` | GET | 角色工具关系图 |
 | `/api/tools` | GET | 工具目录（内置/动态/别名/外部 MCP + 文档状态） |
 | `/api/tools/:id/doc` | GET/PUT/DELETE | 工具的模型侧说明（支持模板，保存即热更新） |
