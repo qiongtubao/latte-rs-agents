@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
-use crate::controller::{build_tool_manager, register_plan_tool, ChatEvent};
+use crate::controller::{build_tool_manager, register_plan_tool, ChatEvent, ChoiceOption, ChoiceQuestion};
 use crate::model_resolver::ModelResolver;
 
 /// Names that the runner injects into `vars` itself (`topic` from the
@@ -2634,6 +2634,74 @@ impl CheckpointLog {
     }
 }
 
+async fn deterministic_learning_ask(ctx: &WorkflowRunContext, log: &Arc<AnswerLog>, id: String, question: String, questions: Vec<ChoiceQuestion>, options: Vec<ChoiceOption>, doc: String) -> Result<String, String> {
+    if let Some(answer) = log.recall(&question) { return Ok(answer); }
+    let event = ChatEvent::ChoiceRequested { role_id: "tutor".into(), choice_id: id.clone(), question: question.clone(), multi: false, layout: String::new(), allow_upload: false, wait: true, options, document_path: doc.clone(), document_markdown: std::fs::read_to_string(ctx.cwd.join(&doc)).unwrap_or_default(), questions };
+    let rx = crate::choice::register(&id, event.clone(), ctx.event_tx.clone());
+    if let (Some(sid), Ok(json)) = (log.session_id(), crate::event_json::chat_event_to_frontend_json(&event)) { crate::pending_ask::persist(log.cwd(), &id, sid, log.resume_wf_id(), "tutor", &question, &json); }
+    let _guard = crate::choice::ChoiceGuard(id.clone()); let _ = ctx.event_tx.send(event);
+    let answer = rx.await.map_err(|_| "学习问答等待通道已关闭".to_string())?;
+    log.record("tutor", &question, &answer); crate::pending_ask::remove(log.cwd(), &id); Ok(answer)
+}
+
+async fn run_learn_control_step(step: &WorkflowStepDef, slug: &str, ctx: &WorkflowRunContext, log: &Arc<AnswerLog>) -> Result<Option<String>, String> {
+    let base = ctx.cwd.join(".latte").join("learn").join(slug);
+    let mut ledger: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    if step.id == "read_confirm" {
+        let round = ledger["round"].as_u64().unwrap_or(0) + 1;
+        let question = format!("学习材料（第 {round} 版）：.latte/learn/{slug}/draft.md。读完了吗？");
+        let options = vec![ChoiceOption { label: "开始答题，验证掌握程度".into(), description: "我已读完文档".into(), ..Default::default() }];
+        deterministic_learning_ask(ctx, log, format!("learn-{slug}-read-{round}"), question, vec![], options, format!(".latte/learn/{slug}/draft.md")).await?;
+        return Ok(Some("好，开始答题。".into()));
+    }
+    if step.id != "quiz" { return Ok(None); }
+    let plan: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("plan.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let pending = plan["knowledge_points"].as_array().into_iter().flatten().filter(|p| {
+        ledger["knowledge_points"].as_array().into_iter().flatten().any(|e| e["id"] == p["id"] && !e["passed"].as_bool().unwrap_or(false))
+    }).collect::<Vec<_>>();
+    if pending.is_empty() { return Ok(Some("判分结果：全部答对。".into())); }
+    let questions = pending.iter().map(|p| {
+        let id = p["id"].as_str().unwrap_or("");
+        let wrong = ledger["knowledge_points"].as_array().into_iter().flatten().find(|e| e["id"] == p["id"]).and_then(|e| e["wrong"].as_u64()).unwrap_or(0);
+        ChoiceQuestion { id: id.into(), question: format!("{}［第{}次作答］", p["question"].as_str().unwrap_or(""), wrong + 1), options: serde_json::from_value(p["options"].clone()).unwrap_or_default(), ..Default::default() }
+    }).collect::<Vec<_>>();
+    let identity = questions.iter().map(|q| format!("{}-{}", q.id, ledger["knowledge_points"].as_array().into_iter().flatten().find(|e| e["id"].as_str() == Some(&q.id)).and_then(|e| e["wrong"].as_u64()).unwrap_or(0) + 1)).collect::<Vec<_>>().join("+");
+    let answer_key = format!("learn:{slug}:quiz:{identity}");
+    let raw = deterministic_learning_ask(ctx, log, format!("learn-{slug}-quiz-{identity}"), answer_key, questions, vec![], String::new()).await?;
+    let answers = pending.iter().zip(raw.lines()).filter_map(|(p, line)| p["id"].as_str().map(|id| (id.to_string(), line.split_once('→').map_or(line, |(_, value)| value).trim().to_string()))).collect();
+    let passed = deterministic_grade_quiz(&plan, &mut ledger, &answers);
+    std::fs::write(base.join("ledger.json"), serde_json::to_vec_pretty(&ledger).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    Ok(Some(if passed { "判分结果：全部答对。" } else { "判分结果：存在答错知识点。" }.into()))
+}
+
+/// Grade persisted quiz answers by option label. Receipts are keyed by
+/// `knowledge-point-id:attempt`, so replay is idempotent while later attempts
+/// remain gradeable.
+pub(crate) fn deterministic_grade_quiz(
+    plan: &serde_json::Value,
+    ledger: &mut serde_json::Value,
+    answers: &HashMap<String, String>,
+) -> bool {
+    let Some(points) = plan["knowledge_points"].as_array() else { return false };
+    let mut receipts = ledger["_graded_answers"].as_object().cloned().unwrap_or_default();
+    {
+        let Some(entries) = ledger["knowledge_points"].as_array_mut() else { return false };
+        for point in points {
+            let Some(id) = point["id"].as_str() else { continue };
+            let Some(answer) = answers.get(id) else { continue };
+            let Some(entry) = entries.iter_mut().find(|e| e["id"].as_str() == Some(id)) else { continue };
+            let attempt = entry["wrong"].as_u64().unwrap_or(0) + 1;
+            let key = format!("{id}:{attempt}");
+            if receipts.contains_key(&key) { continue; }
+            if point["answer"].as_str() == Some(answer.trim()) { entry["passed"] = serde_json::Value::Bool(true); }
+            else { entry["wrong"] = serde_json::Value::from(attempt); }
+            receipts.insert(key, serde_json::Value::String(answer.clone()));
+        }
+    }
+    ledger["_graded_answers"] = serde_json::Value::Object(receipts);
+    ledger["knowledge_points"].as_array().is_some_and(|es| es.iter().all(|e| e["passed"].as_bool().unwrap_or(false)))
+}
+
 /// Max concurrent steps within a single dependency wave. Independent
 /// steps fan out via `tokio::task::JoinSet`; this caps how many
 /// specialists run at once so a wide wave can't exhaust models /
@@ -4094,6 +4162,17 @@ async fn run_workflow_serial(
         let mut idx = 0;
         while idx < wf.steps.len() {
             let step = &wf.steps[idx];
+            if wf.name == "learn_loop" && matches!(step.id.as_str(), "read_confirm" | "quiz") {
+                let slug = vars.get("plan_out").cloned().unwrap_or_default();
+                match run_learn_control_step(step, &slug, ctx, answer_log).await {
+                    Ok(Some(output)) => {
+                        last_output = output.clone(); ckpt.record_step(&step.id, step.output_key.as_deref(), &output);
+                        idx += 1; continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return WfOutcome::Failed(format!("step '{}': {e}", step.id)),
+                }
+            }
             if ctx.cancel_flag.load(Ordering::SeqCst) {
                 return WfOutcome::Cancelled;
             }
@@ -12639,6 +12718,7 @@ name = "w"
 [[steps]]
 id = "a"
 role = "worker"
+
 task = "t"
 output_key = "draft"
 require_plan_tasks = true
@@ -12730,5 +12810,31 @@ submit_plan_from = "final_draft"
         assert_eq!(tasks[0].title, "T1 实现");
         assert_eq!(tasks[0].priority, Some(1), "patch 应已生效");
         assert_eq!(tasks[1].labels, vec!["只读".to_string()]);
+    }
+}
+#[cfg(test)]
+mod deterministic_learning_tests {
+    use super::deterministic_grade_quiz;
+    use serde_json::json;
+    use std::collections::HashMap;
+    #[test]
+    fn label_grading_and_receipt_replay_are_stable() {
+        let plan = json!({"knowledge_points":[{"id":"k1","answer":"borrow"}]});
+        let mut ledger = json!({"knowledge_points":[{"id":"k1","wrong":0,"passed":false}]});
+        let mut answers = HashMap::new(); answers.insert("k1".into(), "borrow".into());
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        assert_eq!(ledger["_graded_answers"]["k1:1"], "borrow");
+    }
+    #[test]
+    fn incorrect_attempt_increments_and_later_attempt_is_gradeable() {
+        let plan = json!({"knowledge_points":[{"id":"k1","answer":"right"}]});
+        let mut ledger = json!({"knowledge_points":[{"id":"k1","wrong":0,"passed":false}]});
+        let mut answers = HashMap::new(); answers.insert("k1".into(), "wrong".into());
+        assert!(!deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        answers.insert("k1".into(), "right".into());
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        assert_eq!(ledger["knowledge_points"][0]["wrong"], 1);
+        assert!(ledger["_graded_answers"].get("k1:2").is_some());
     }
 }
