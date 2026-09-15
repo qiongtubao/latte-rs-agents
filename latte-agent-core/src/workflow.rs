@@ -2080,8 +2080,7 @@ pub fn load_workflow_by_command(cmd: &str, project_cwd: &Path) -> Result<Workflo
 /// Everything a workflow run needs from its host (controller tool
 /// handler, UI server test-run endpoint, ...).
 #[derive(Clone)]
-pub struct WorkflowRunContext {
-    /// Merged agent config (roles). Cloned per run by the host.
+pub struct WorkflowRunContext {    /// Merged agent config (roles). Cloned per run by the host.
     pub merged: Arc<AgentConfig>,
     pub resolver: Arc<ModelResolver>,
     pub default_params: GenerateParams,
@@ -2144,6 +2143,96 @@ pub struct WorkflowRunContext {
     /// 在顶层 run 创建并挂到这里；嵌套 run 原样继承，共享同一暂存区，
     /// 只由创建者在收尾时 promote）。None 时 write/read 直落真实 fs。
     pub staging: Option<Arc<crate::staging::Staging>>,
+    /// 整棵嵌套树共享的**分派单元预算**（见 [`DispatchBudget`]）。
+    ///
+    /// 由 `run_workflow_inner` 在顶层 run（`dispatch_budget.is_none()`）
+    /// 建出来，嵌套 run 原样继承 —— 这是要点：预算必须按**根 run** 计，
+    /// 而不是每层各算一份。宿主一般传 `None`。
+    pub dispatch_budget: Option<Arc<DispatchBudget>>,
+}
+
+/// 一次 workflow run（含其**全部嵌套子 run**）能派出去的分派单元总数上限。
+///
+/// # 为什么需要它
+///
+/// 按墙钟计的 `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS` 已被移除，理由
+/// 是对的（它只看总时长，无法区分「后端卡死」与「任务本身就重」，反复误杀
+/// 持续在产出的健康长任务）。但**没有任何东西补位**：嵌套深度 3 ×
+/// 每层 `max_iterations` 最多 10 × 每 step 若干 speaker，聚合起来无界。
+///
+/// 这里补的是一个纯粹的 runaway 兜底，判据换成**分派单元数**：
+///
+/// - 它不惩罚"任务重"——一个 step 花 20 分钟产出巨量报告只算 1 个单元；
+/// - 它精确抓"结构性失控"——返工环反复重跑、嵌套树意外展开，都体现为
+///   单元数暴涨。
+///
+/// 这与 deepseek-harness 的 `AGENT_CAP`（`maxTotalAgents`，默认 1000，
+/// 按 `agent()` 调用数计）同源。它那条报错原文把自己的定位讲得很清楚：
+/// *"a runaway-loop backstop; raise the applicable maxTotalAgents limit
+/// if the scale is intentional"* —— 不假装是资源预算，只承认是失控兜底。
+///
+/// 与 token 预算的分工：token 预算挂在 **goal / session** 层（那里才知道
+/// "这场任务总共值多少钱"）；workflow 这层只管"结构别炸"。三个参考实现在
+/// 这一层用的都是计数而非 token。
+pub struct DispatchBudget {
+    used: std::sync::atomic::AtomicU32,
+    cap: u32,
+}
+
+/// 分派单元上限的内置默认值。
+///
+/// 按实测标定：一条正常的 `implementation_plan` 约 6–10 个单元，带返工的
+/// `task_refine` 约 15–30；嵌套两层的组合流程 50 上下。200 给了近一个数量级
+/// 的余量——够任何"规模是有意的"的合法场景，又能在结构性失控时及时刹住。
+pub const DEFAULT_WORKFLOW_DISPATCH_CAP: u32 = 200;
+
+impl DispatchBudget {
+    pub fn new(cap: u32) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicU32::new(0),
+            cap,
+        }
+    }
+
+    /// 从 env 读上限造一个预算。`LATTE_AGENT_WORKFLOW_DISPATCH_CAP=0`
+    /// = 不限（关掉这道闸）。
+    pub fn from_env() -> Self {
+        let cap = std::env::var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(DEFAULT_WORKFLOW_DISPATCH_CAP);
+        Self::new(cap)
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    pub fn used(&self) -> u32 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 占一个单元。返回 `Err(消息)` 表示已超上限。
+    ///
+    /// `cap == 0` 时永不拒绝（关闭本闸）。
+    pub fn take(&self) -> Result<u32, String> {
+        if self.cap == 0 {
+            return Ok(self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+        }
+        let used = self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if used > self.cap {
+            return Err(format!(
+                "本次 workflow（含全部嵌套子流程）已派出 {used} 个分派单元，\
+                 超过上限 {cap} —— 这是**失控兜底**，不是资源预算。\n\
+                 常见成因：返工环把同一目标反复重跑、或嵌套 workflow 意外展开。\
+                 先看这些单元到底在重复做什么（`latte-agent debug trace <id>` 的\
+                 时间线一眼能看出来）；确认规模是有意的再调\
+                 LATTE_AGENT_WORKFLOW_DISPATCH_CAP（0 = 不限）。",
+                cap = self.cap
+            ));
+        }
+        Ok(used)
+    }
 }
 
 /// Maximum nesting depth for workflow steps that invoke another
@@ -2195,6 +2284,8 @@ fn run_nested_workflow(
             format!("nested workflow '{name}': {e}. available workflows: {available}")
         })?;
         let nested_ctx = WorkflowRunContext {
+            // 分派预算按**整棵嵌套树**计，所以原样继承而不是新建。
+            dispatch_budget: ctx.dispatch_budget.clone(),
             merged: ctx.merged.clone(),
             resolver: ctx.resolver.clone(),
             default_params: ctx.default_params.clone(),
@@ -2812,10 +2903,23 @@ async fn run_workflow_inner(
     } else {
         None
     };
+    // 分派单元预算：顶层 run 建一份，嵌套 run 原样继承（见
+    // `run_nested_workflow` 的 nested_ctx）。**必须按根 run 计**——每层
+    // 各算一份的话，深度 3 × 每层 10 次返工就等于没有上限。
+    let created_budget = if ctx.dispatch_budget.is_none() {
+        Some(Arc::new(DispatchBudget::from_env()))
+    } else {
+        None
+    };
     let owned_ctx;
-    let ctx: &WorkflowRunContext = if let Some(st) = &created_staging {
+    let ctx: &WorkflowRunContext = if created_staging.is_some() || created_budget.is_some() {
         owned_ctx = WorkflowRunContext {
-            staging: Some(st.clone()),
+            staging: created_staging
+                .clone()
+                .or_else(|| ctx.staging.clone()),
+            dispatch_budget: created_budget
+                .clone()
+                .or_else(|| ctx.dispatch_budget.clone()),
             ..ctx.clone()
         };
         &owned_ctx
@@ -3323,6 +3427,8 @@ struct SpeakerDispatch {
     review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
     advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
     staging: Option<Arc<crate::staging::Staging>>,
+    /// 整棵嵌套树共享的分派单元预算。`None` = 不计（独立测试路径）。
+    dispatch_budget: Option<Arc<DispatchBudget>>,
     /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
     step_tools: Vec<String>,
     /// 本 step 的 `output_contract.max_chars`（产出形状上限）。它决定
@@ -3388,6 +3494,7 @@ impl SpeakerDispatch {
             review_engine,
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
+            dispatch_budget: ctx.dispatch_budget.clone(),
             step_tools,
             // 测试构造器不关联具体 step 契约；生产站点（引擎派发处）
             // 按 step.output_contract.max_chars 显式写入。
@@ -3561,6 +3668,38 @@ struct SpeakerOut {
 async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> {
 
     let speaker = inp.speaker.clone();
+    // 分派单元预算（runaway 兜底，见 [`DispatchBudget`]）。
+    //
+    // 为什么卡在这里：这是**唯一**的分派单元入口（串行引擎与 DAG 引擎都
+    // 经过它），一处检查覆盖两条路径，也自然覆盖全部嵌套层级——预算对象
+    // 由顶层 run 建、整棵树共享。
+    //
+    // 位置在 advisor 暂停门与 subsession 分配**之前**：超限就拒，不留任何
+    // 副作用（否则 UI 上会多一个永远转圈的分派气泡）。
+    if let Some(budget) = &inp.dispatch_budget {
+        match budget.take() {
+            Ok(used) => {
+                // 接近上限时先提醒，别等撞墙才让用户知道。80% 是个够早
+                // 又不至于天天刷的位置。
+                let cap = budget.cap();
+                if cap > 0 && used * 5 >= cap * 4 {
+                    let _ = inp.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "⚠ 本次 workflow 已用 {used}/{cap} 个分派单元 —— \
+                             接近失控兜底上限。若这不是预期规模，现在正是查\
+                             「哪一步在反复重跑」的时候。"
+                        ),
+                    });
+                }
+            }
+            Err(msg) => {
+                let _ = inp.event_tx.send(ChatEvent::Status {
+                    message: format!("⛔ {msg}"),
+                });
+                return Err(StepFail::Failed(msg));
+            }
+        }
+    }
     // Advisor intervene 暂停门：派发前先等用户拍板（此前 advisor 的
     // 「已暂停」对 workflow 不生效，流水线照跑）。
     if let Some(gate) = &inp.advisor_pause {
@@ -4792,6 +4931,8 @@ struct DagStepInput {
     review_engine: Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
     advisor_pause: Option<crate::advisor_monitor::AdvisorPauseGate>,
     staging: Option<Arc<crate::staging::Staging>>,
+    /// 整棵嵌套树共享的分派单元预算（透传给 SpeakerDispatch）。
+    dispatch_budget: Option<Arc<DispatchBudget>>,
     /// loop_until 返工时由调度器预置的「上轮审查反馈」（未满足循环
     /// 条件的那个 step 的产出），拼进本 step 的 prompt 后消费。
     feedback: Option<String>,
@@ -4865,6 +5006,8 @@ async fn run_dag_step(
             advisor_gate: inp.advisor_gate.clone(),
             advisor_pause: inp.advisor_pause.clone(),
             staging: inp.staging.clone(),
+            // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
+            dispatch_budget: None,
             root_wf_id: inp.root_wf_id.clone(),
         };
         let (output, exported) = run_nested_workflow(
@@ -4978,6 +5121,7 @@ async fn run_dag_step(
                 review_engine: inp.review_engine.clone(),
                 advisor_pause: inp.advisor_pause.clone(),
                 staging: inp.staging.clone(),
+                dispatch_budget: inp.dispatch_budget.clone(),
                 step_tools: step.tools.clone(),
                 step_max_chars: step.output_contract.max_chars,
                 step_has_output_contract: step_has_output_contract(step),
@@ -5305,6 +5449,7 @@ async fn run_workflow_dag(
                     review_engine: review_engine.clone(),
                     advisor_pause: ctx.advisor_pause.clone(),
                     staging: ctx.staging.clone(),
+                    dispatch_budget: ctx.dispatch_budget.clone(),
                     feedback: pending_feedback.remove(wf.steps[idx].id.as_str()),
                     answer_log: answer_log.clone(),
                 };
@@ -8606,6 +8751,7 @@ mod contract_engine_tests {
                 advisor_gate: None,
                 advisor_pause: None,
                 staging: None,
+                dispatch_budget: None,
                 root_wf_id: None,
             },
             event_rx,
@@ -10427,6 +10573,7 @@ mod resume_tests {
                 advisor_gate: None,
                 advisor_pause: None,
                 staging: None,
+                dispatch_budget: None,
                 root_wf_id: None,
             },
             event_rx,
@@ -11962,6 +12109,201 @@ output_key = "design"
         assert!(err.contains("ghost"), "got: {err}");
         assert!(err.contains("result"), "错误应列出可用 key: {err}");
     }
+
+    // ─── 分派单元预算（runaway 兜底）────────────────────────────────
+
+    #[test]
+    fn dispatch_budget_counts_and_refuses_past_the_cap() {
+        let b = DispatchBudget::new(3);
+        assert_eq!(b.cap(), 3);
+        assert_eq!(b.take().expect("1"), 1);
+        assert_eq!(b.take().expect("2"), 2);
+        assert_eq!(b.take().expect("3"), 3);
+        assert_eq!(b.used(), 3);
+
+        let err = b.take().expect_err("第 4 个应超限");
+        assert!(err.contains("超过上限 3"), "{err}");
+        // 报错必须说清自己是什么、以及下一步查什么 —— 照
+        // deepseek-harness AGENT_CAP 那条「不假装是资源预算」的措辞。
+        assert!(err.contains("失控兜底"), "{err}");
+        assert!(err.contains("反复重跑"), "要指出常见成因：{err}");
+        assert!(
+            err.contains("LATTE_AGENT_WORKFLOW_DISPATCH_CAP"),
+            "要告诉用户怎么调：{err}"
+        );
+    }
+
+    /// `cap == 0` = 关掉这道闸（照既有 env 开关的惯例）。
+    #[test]
+    fn dispatch_budget_zero_cap_is_unlimited() {
+        let b = DispatchBudget::new(0);
+        for _ in 0..1_000 {
+            b.take().expect("0 = 不限，永不拒绝");
+        }
+        assert_eq!(b.used(), 1_000);
+    }
+
+    #[test]
+    fn dispatch_budget_reads_env_with_default() {
+        let _g = lock_env_for_dispatch_cap();
+        std::env::remove_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP");
+        assert_eq!(DispatchBudget::from_env().cap(), DEFAULT_WORKFLOW_DISPATCH_CAP);
+        std::env::set_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP", " 7 ");
+        assert_eq!(DispatchBudget::from_env().cap(), 7, "应容忍空白");
+        std::env::set_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP", "0");
+        assert_eq!(DispatchBudget::from_env().cap(), 0, "0 = 不限");
+        std::env::set_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP", "不是数字");
+        assert_eq!(
+            DispatchBudget::from_env().cap(),
+            DEFAULT_WORKFLOW_DISPATCH_CAP,
+            "非法值回退默认"
+        );
+        std::env::remove_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP");
+    }
+
+    fn lock_env_for_dispatch_cap() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// **端到端**：撞上分派上限时 run 失败，且**不再往下派**。
+    ///
+    /// 这是那条被移除的墙钟机制的替代物。判据从"总时长"换成"分派单元数"：
+    /// 一个 step 花 20 分钟产出巨量报告只算 1 个单元（不误杀"任务重"），
+    /// 而返工环反复重跑会让单元数暴涨（精确抓"结构性失控"）。
+    #[tokio::test]
+    async fn workflow_stops_when_dispatch_cap_is_reached() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("产出内容")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // 4 个 step，但预算只给 2 个单元。
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "cap_demo"
+[[steps]]
+id = "a"
+role = "worker"
+task = "任务A"
+[[steps]]
+id = "b"
+role = "worker"
+task = "任务B"
+[[steps]]
+id = "c"
+role = "worker"
+task = "任务C"
+[[steps]]
+id = "d"
+role = "worker"
+task = "任务D"
+"#,
+        )
+        .unwrap();
+        let (mut ctx, mut rx) =
+            test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        ctx.dispatch_budget = Some(Arc::new(DispatchBudget::new(2)));
+
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("撞上限应让 run 失败");
+        assert!(err.contains("超过上限 2"), "{err}");
+
+        // 关键：第 3 个单元被拒之后**不再派第 4 个**。
+        let calls = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            calls, 2,
+            "只该真派出 2 个单元（第 3 个被拒、第 4 个根本不该开始），实际 {calls}"
+        );
+
+        // 拒绝要对用户可见。
+        let mut saw_notice = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::Status { message } = ev {
+                if message.contains("超过上限 2") {
+                    saw_notice = true;
+                }
+            }
+        }
+        assert!(saw_notice, "撞上限要发一条 Status");
+    }
+
+    /// 预算按**整棵嵌套树**计，不是每层各一份。
+    ///
+    /// 这是本机制的要点：嵌套深度 3 × 每层 `max_iterations` 最多 10，
+    /// 每层各算一份预算就等于没有上限。
+    #[tokio::test]
+    async fn dispatch_budget_is_shared_across_nested_runs() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("产出内容")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        // 子 workflow 落到项目 workflows.d，父级用 `workflow = "child"` 嵌套。
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("child.toml"),
+            r#"
+name = "child"
+command = "/child"
+[[steps]]
+id = "c1"
+role = "worker"
+task = "子任务1"
+[[steps]]
+id = "c2"
+role = "worker"
+task = "子任务2"
+"#,
+        )
+        .unwrap();
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "parent_cap"
+[[steps]]
+id = "p1"
+role = "worker"
+task = "父任务1"
+[[steps]]
+id = "nest"
+workflow = "child"
+"#,
+        )
+        .unwrap();
+
+        let (mut ctx, _rx) =
+            test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        // 父 1 个 + 子 2 个 = 3 个单元；预算给 2 → 必须在子流程里就撞上。
+        let budget = Arc::new(DispatchBudget::new(2));
+        ctx.dispatch_budget = Some(budget.clone());
+
+        let err = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect_err("嵌套树合计超限应失败");
+        assert!(
+            err.contains("超过上限 2"),
+            "子流程也必须受同一份预算约束：{err}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "父 1 + 子 1 = 2 个单元真派出，第 3 个被同一份预算拒掉"
+        );
+        assert!(
+            budget.used() >= 3,
+            "计数是共享的（含被拒的那次 fetch_add）：{}",
+            budget.used()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -12058,6 +12400,7 @@ mod loop_tests {
                 advisor_gate: None,
                 advisor_pause: None,
                 staging: None,
+                dispatch_budget: None,
                 root_wf_id: None,
             },
             event_rx,

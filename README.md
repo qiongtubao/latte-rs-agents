@@ -281,6 +281,33 @@ specialist 改完 → manager 跑 `cargo build` 发现还是错 → 用同一条
 省下的白跑改由别的闸兜：并发同身份仍被在飞标记挡住，模型无意义地反复重发同一条调用
 由死循环熔断（连击 / 打转）处理。用「可能白跑一次」换「不再把假成功喂回 manager」。
 
+### Workflow 分派单元上限
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LATTE_AGENT_WORKFLOW_DISPATCH_CAP` | 200 | 一次 workflow run（**含全部嵌套子 run**）能派出的分派单元总数上限，`0` = 不限 |
+
+这是那条被移除的墙钟机制（`LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`）的
+替代物。移除它的理由是对的——只看总时长无法区分「后端卡死」与「任务本身
+就重」，反复误杀持续在产出的健康长任务——但此前**没有任何东西补位**：嵌套
+深度 3 × 每层 `max_iterations` 最多 10 × 每 step 若干 speaker，聚合起来无界。
+
+判据换成**分派单元数**之后两边都对：
+
+- 不惩罚"任务重"：一个 step 花 20 分钟产出巨量报告只算 1 个单元；
+- 精确抓"结构性失控"：返工环反复重跑、嵌套树意外展开，都体现为单元数暴涨。
+
+预算按**整棵嵌套树**计（顶层 run 建、嵌套 run 原样继承）。每层各算一份就
+等于没有上限。用到 80% 时先发一条提醒，撞上限时 run 失败并给出「先查哪一步
+在反复重跑」的指引。
+
+与 token 预算的分工：token 挂在 **goal / session** 层（那里才知道"这场任务
+总共值多少钱"），workflow 这层只管"结构别炸"。三个参考实现在这一层用的也都
+是计数而非 token——deepseek-harness 的 `AGENT_CAP`（`maxTotalAgents`，默认
+1000，按 `agent()` 调用数计）报错原文把定位讲得很清楚：*"a runaway-loop
+backstop; raise the applicable maxTotalAgents limit if the scale is
+intentional"*，不假装是资源预算，只承认是失控兜底。
+
 ### Session token 预算
 
 `session_token_budget`（CLI `--session-token-budget`）在**单角色**与**多角色**两条路上

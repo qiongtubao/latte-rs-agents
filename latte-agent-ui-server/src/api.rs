@@ -2114,6 +2114,8 @@ pub fn workflow_run_start(
             advisor_gate: None,
             advisor_pause: None,
             staging: None,
+            // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
+            dispatch_budget: None,
         };
         let _ = run_workflow(&wf, &topic, &ctx).await;
         // engine 返回后丢掉 tx_inner 关闭内部 channel，forwarder 排空后退出。
@@ -2267,6 +2269,8 @@ async fn spawn_workflow_resume(
         .runner_gate(),
         advisor_pause: Some(controller.advisor_pause_gate()),
         staging: None,
+        // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
+        dispatch_budget: None,
     };
     let wf_name = wf.name.clone();
     let resp_wf_id = wf_id.clone();

@@ -9007,6 +9007,8 @@ async fn register_workflow_tool(
                 advisor_gate,
                 advisor_pause: Some(advisor_pause),
                 staging: None,
+                // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
+                dispatch_budget: None,
                 // 顶层 run：自己就是嵌套链的根。
                 root_wf_id: None,
             };
@@ -9099,6 +9101,8 @@ async fn run_workflow_command(
         advisor_gate: config.advisor_monitor.runner_gate(),
         advisor_pause: Some(advisor_pause),
         staging: None,
+        // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
+        dispatch_budget: None,
         // 顶层 run：自己就是嵌套链的根。
         root_wf_id: None,
     };

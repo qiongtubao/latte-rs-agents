@@ -1827,6 +1827,8 @@ fn cli_workflow_ctx_on(
         // session 级门，保持 None 与 UI 的休眠语义一致。
         advisor_pause: None,
         staging: None,
+        // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
+        dispatch_budget: None,
     }
 }
 
