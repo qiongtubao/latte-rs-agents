@@ -648,6 +648,20 @@ pub enum ChatEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_id: Option<String>,
     },
+    /// goal 层的完成契约发生变化（新建 / 暂停 / 续跑轮次推进 / 完成 /
+    /// 阻塞 / 丢弃）。UI 据此显示目标徽章与进度（第 N/M 轮、预算余量）。
+    ///
+    /// 为什么必须广播：goal 是**跨 turn**的契约，用户看不到它就无法判断
+    /// 「机器现在为什么还在自己跑」，也不知道该不该 ⏸。自动续跑最危险的
+    /// 失效模式不是跑错，而是**在用户不知情的情况下持续烧 token**。
+    GoalUpdated {
+        /// `None` = 目标被清除。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<crate::goal::Goal>,
+        /// 触发这次变化的动作（`create` / `round` / `complete` / …），
+        /// 便于 UI 决定要不要弹提示。
+        change: String,
+    },
     /// plan mode（只读规划模式）开关变化。UI 据此亮/灭徽章；事件进
     /// 归档与回放，UI 刷新后徽章状态自然恢复。
     PlanModeChanged {
@@ -1307,6 +1321,13 @@ pub struct ChatController {
     /// runner 的 TodoTracker 只读做运行中纠偏。与 plan_stage 同款
     /// 生命周期——controller = 一个会话。
     todo_state: crate::todo::SharedTodoState,
+    /// 会话级 goal 层完成契约（见 [`crate::goal`]）：`goal` 工具 handler
+    /// 读写，driver 在每个 turn 收尾处 `record_usage` + `drive`。与
+    /// todo_state 同款生命周期——controller = 一个会话。
+    ///
+    /// 安全阀：`new_shared_goal()` 建出来就是 `Disarmed` 且无目标，所以
+    /// 一个刚起的 controller 绝不会自己跑起来。
+    goal_state: crate::goal::SharedGoal,
     /// Advisor v3 pause gate（intervene 暂停门）：monitor 判
     /// `Verdict::Intervene` 时经 `request_pause()` 置位；driver 给
     /// watched role 的主 runner 装配同一句柄
@@ -1368,6 +1389,7 @@ impl ChatController {
             plan_stage: Arc::new(parking_lot::RwLock::new(PlanStage::Normal)),
             plan_mode: Arc::new(AtomicBool::new(false)),
             todo_state: crate::todo::new_shared_todo_state(),
+            goal_state: crate::goal::new_shared_goal(),
             advisor_pause: AdvisorPauseGate::new(),
             last_failed_workflow: Arc::new(parking_lot::RwLock::new(None)),
             agent_pause_gate,
@@ -1386,6 +1408,9 @@ impl ChatController {
         *self.last_config.lock().await = Some(config.clone());
 
         let (new_tx, input_rx) = mpsc::unbounded_channel();
+        // goal round driver 的自投递端：与 UI/CLI 用的是同一个通道，所以
+        // continuation 天然与用户输入按 FIFO 排队，不会插队。
+        let self_tx = new_tx.clone();
         let _old = std::mem::replace(&mut *self.input_tx.lock().await, Some(new_tx));
         drop(_old);
 
@@ -1396,6 +1421,7 @@ impl ChatController {
         let plan_stage = self.plan_stage.clone();
         let plan_mode = self.plan_mode.clone();
         let todo_state = self.todo_state.clone();
+        let goal_state = self.goal_state.clone();
         let advisor_pause = self.advisor_pause.clone();
         let agent_pause_gate = self.agent_pause_gate.clone();
         let last_user_input = self.last_user_input.clone();
@@ -1452,6 +1478,8 @@ impl ChatController {
                 plan_stage,
                 plan_mode,
                 todo_state,
+                goal_state,
+                self_tx,
                 advisor_pause,
                 agent_pause_gate,
                 last_user_input,
@@ -1551,6 +1579,23 @@ impl ChatController {
     /// 重复设置同一值是幂等空操作（不重发事件）。
     pub fn set_plan_mode(&self, active: bool) {
         set_plan_mode_flag(&self.plan_mode, &self.event_tx, active);
+    }
+
+    /// 当前 goal 层完成契约的快照（`None` = 没有目标）。
+    ///
+    /// UI 用它渲染目标徽章与进度（第 N/M 轮、预算余量）。**自动续跑必须
+    /// 一直可见**——它最危险的失效模式不是跑错，而是在用户不知情的情况下
+    /// 持续烧 token。
+    pub fn goal_snapshot(&self) -> Option<crate::goal::Goal> {
+        self.goal_state.read().current()
+    }
+
+    /// goal 状态的共享句柄。
+    ///
+    /// 给 ui-server / CLI 用来实现「暂停自动续跑」「抬高轮次上限后 resume」
+    /// 这类**用户侧**动作——模型侧走 `goal` 工具，两边共享同一份状态。
+    pub fn goal_state(&self) -> crate::goal::SharedGoal {
+        self.goal_state.clone()
     }
 
     /// Clone of the event broadcast sender. Used by the AdvisorMonitor
@@ -1959,6 +2004,9 @@ async fn run_driver(
     plan_stage: SharedPlanStage,
     plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
+    goal_state: crate::goal::SharedGoal,
+    // 自投递句柄，透传给单角色 loop 的 goal round driver。
+    self_tx: mpsc::UnboundedSender<ControllerInput>,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     last_user_input: Arc<parking_lot::Mutex<String>>,
@@ -1976,6 +2024,7 @@ async fn run_driver(
             plan_stage,
             plan_mode,
             todo_state,
+            goal_state,
             advisor_pause,
             agent_pause_gate,
             last_user_input.clone(),
@@ -1992,6 +2041,8 @@ async fn run_driver(
             plan_stage,
             plan_mode,
             todo_state,
+            goal_state,
+            self_tx,
             advisor_pause,
             agent_pause_gate,
             last_user_input,
@@ -2031,6 +2082,10 @@ async fn run_multi_role_loop(
     plan_stage: SharedPlanStage,
     plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
+    // 多角色路径目前不跑 goal 外循环（它的完成契约是 RoundScheduler 的
+    // 轮次 + Supervisor 预算），但 build_runner 要这个句柄来决定是否给
+    // 角色注册 `goal` 工具，所以照样透传。
+    goal_state: crate::goal::SharedGoal,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     // 与 ChatController 共享的原始用户诉求句柄（委派返回审查的准绳）。
@@ -2232,6 +2287,7 @@ async fn run_multi_role_loop(
             advisor_pause.clone(),
             &plan_stage,
             &todo_state,
+        &goal_state,
             plan_mode.load(Ordering::SeqCst),
             agent_pause_gate.clone(),
             config.stream_mode.clone(),
@@ -2829,6 +2885,16 @@ async fn run_single_role_loop(
     plan_stage: SharedPlanStage,
     plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
+    goal_state: crate::goal::SharedGoal,
+    // 自投递句柄（= 输入通道的发送端）。goal round driver 用它把
+    // continuation 当成一条普通输入投回自己，这与 deepseek-harness 的
+    // `agent.followup()`（塞进 inbox 让 `turn()` 返回 true）同构。
+    //
+    // 为什么走通道而不是在 loop 里内联再跑一轮：turn 路径有 ~400 行且
+    // 嵌在 `select!` 臂里，复制一份必然漂移；而自投递能天然复用暂停门、
+    // 取消旗标、advisor hint 排空这一整套既有语义，并且 FIFO 保证了它
+    // 不会抢在用户已经排队的输入前面。
+    self_tx: mpsc::UnboundedSender<ControllerInput>,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     last_user_input: Arc<parking_lot::Mutex<String>>,
@@ -2870,6 +2936,7 @@ async fn run_single_role_loop(
         advisor_pause.clone(),
         &plan_stage,
         &todo_state,
+        &goal_state,
         plan_mode.load(Ordering::SeqCst),
         agent_pause_gate.clone(),
         config.stream_mode.clone(),
@@ -2960,6 +3027,55 @@ async fn run_single_role_loop(
     // 会话轻易上千万 token，`u32` 会溢出（实测有过 22.19M 输入 token 的
     // 单会话）。0 预算 = 不限，此时也不记账。
     let mut session_tokens_used: u64 = 0;
+    // goal 落盘坐标。空 session_id = 不落盘（临时/测试路径）。
+    let goal_persist_at: Option<(std::path::PathBuf, String)> = (!config.session_id.is_empty())
+        .then(|| (config.cwd.clone(), config.session_id.clone()));
+    // 载回上次留下的目标（如果有）。
+    //
+    // **一律 disarmed**（`load_disarmed` 是安全阀的唯一实现点）：目标要跨
+    // 进程活下来，自动续跑不许跟着活过来。不这么做的后果是「服务一重启就
+    // 在用户不在场的情况下接着烧 token」——README 里任务看板那条「对账刻意
+    // 不自动重派」讲的是同一件事，这里是它在 goal 层的对应物。
+    if let Some((cwd, sid)) = &goal_persist_at {
+        // 只在**内存里还没有目标**时才载入。
+        //
+        // `spawn()` 返回后 loop 还要走一段初始化（build_runner 等）才到这
+        // 里，这中间调用方完全可能已经通过 `goal_state()` 设过目标（UI 的
+        // 「新会话即带目标」就是这个形状）。无条件 `load_disarmed` 会把那个
+        // 刚设好的目标**降级成 disarmed**、还用盘上的旧快照覆盖它——用户设
+        // 完目标发现它没跑，且不知道为什么。
+        let already_has_goal = goal_state.read().current().is_some();
+        if already_has_goal {
+            tracing::debug!("goal: 内存里已有目标，跳过磁盘载入");
+        } else if let Some(goal) = crate::goal::load(cwd, sid) {
+            let resumable = goal.phase == crate::goal::GoalPhase::Active;
+            goal_state.write().load_disarmed(goal.clone());
+            let _ = event_tx.send(ChatEvent::GoalUpdated {
+                goal: Some(goal.clone()),
+                change: "loaded".into(),
+            });
+            let _ = event_tx.send(ChatEvent::Status {
+                message: if resumable {
+                    format!(
+                        "🎯 载回上次的目标（第 {}/{} 轮，{}）：{}\n\
+                         自动续跑处于**关闭**状态 —— 想接着跑请显式 resume；\
+                         不想继续就 drop 掉。",
+                        goal.rounds_started,
+                        goal.max_rounds,
+                        goal.phase.as_str(),
+                        goal.objective
+                    )
+                } else {
+                    format!(
+                        "🎯 载回上次的目标（{}）：{}",
+                        goal.phase.as_str(),
+                        goal.objective
+                    )
+                },
+            });
+        }
+    }
+
     loop {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
@@ -3031,7 +3147,7 @@ async fn run_single_role_loop(
                                                 continue;
                                             };
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, rid)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3053,7 +3169,7 @@ async fn run_single_role_loop(
                                                 Ok(new_tier) => {
                                                     let role = current_role.clone();
                                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                         Ok((mut new_runner, _)) => {
                                                             for m in history { new_runner.context_mut().push(m); }
                                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3306,7 +3422,7 @@ async fn run_single_role_loop(
                                 let mode_now = plan_mode.load(Ordering::SeqCst);
                                 if mode_now != runner_plan_mode {
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, _)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3318,12 +3434,34 @@ async fn run_single_role_loop(
                                 // plan 阶段门复位：新的用户消息 = 新的决策周期，
                                 // 上一轮未批准的 plan 不再约束 delegate
                                 //（同时销账它的弹窗补发）。丢弃不静默。
-                                if let Some(dropped) = reset_plan_stage(&plan_stage) {
-                                    let _ = event_tx.send(ChatEvent::Status {
-                                        message: discarded_plan_notice(&dropped),
-                                    });
+                                // goal 自动续跑**不算**新的用户决策周期：它是机器
+                                // 自己的下一轮。在这里复位会把一份正在等用户勾选的
+                                // 任务清单静默作废（每轮一次）。见
+                                // `crate::goal::GOAL_ROUND_MARKER`。
+                                let is_goal_round =
+                                    trimmed.starts_with(crate::goal::GOAL_ROUND_MARKER);
+                                if !is_goal_round {
+                                    if let Some(dropped) = reset_plan_stage(&plan_stage) {
+                                        let _ = event_tx.send(ChatEvent::Status {
+                                            message: discarded_plan_notice(&dropped),
+                                        });
+                                    }
                                 }
-                                let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
+                                // 续跑 prompt 上千字符，逐字广播会把对话冲垮 ——
+                                // 照 oh-my-pi 的隐藏消息改成一行摘要（完整文本仍在
+                                // 模型侧的消息里，trace 可查）。
+                                let _ = event_tx.send(ChatEvent::UserMessage {
+                                    text: if is_goal_round {
+                                        let round = goal_state
+                                            .read()
+                                            .current()
+                                            .map(|g| format!("{}/{}", g.rounds_started, g.max_rounds))
+                                            .unwrap_or_else(|| "?".into());
+                                        format!("🎯 [自动续跑 第 {round} 轮]")
+                                    } else {
+                                        trimmed.clone()
+                                    },
+                                });
                                 let _ = event_tx.send(ChatEvent::RoleStarted {
                                     role_id: current_role.clone(),
                                     detail: "calling LLM".into(),
@@ -3408,6 +3546,133 @@ async fn run_single_role_loop(
                                                 });
                                             }
                                         }
+                                        // ─── goal round driver ─────────────────
+                                        // 外层完成契约的驱动点。语义：**turn 收尾**
+                                        // 时若目标仍需推进，就把一轮 continuation
+                                        // 投回自己的输入通道，于是 loop 不必等用户
+                                        // 输入就会再跑一轮。
+                                        //
+                                        // 为什么挂在这里而不是别处：这是单角色 loop
+                                        // 里唯一"一轮活真的干完了"的点。deepseek-harness
+                                        // 挂 `agent/status === 'idle'`、oh-my-pi 挂
+                                        // `agent_end` 后的 800ms 定时器，都是同一个
+                                        // 位置的不同表达。
+                                        //
+                                        // 顺序很重要：先记账（本轮 token 可能刚好把
+                                        // 预算打爆 → 目标转 blocked），再 drive（此时
+                                        // 已经不是 active，自然不会再开新轮）。反过来
+                                        // 会多跑一轮才发现超预算。
+                                        {
+                                            let think_delta = usage_after
+                                                .thinking_tokens
+                                                .saturating_sub(usage_before.thinking_tokens);
+                                            let delta = crate::goal::GoalUsageDelta {
+                                                input: u64::from(in_delta),
+                                                output: u64::from(out_delta),
+                                                thinking: u64::from(think_delta),
+                                                cache_read: u64::from(
+                                                    usage_after
+                                                        .cache_read_tokens
+                                                        .saturating_sub(usage_before.cache_read_tokens),
+                                                ),
+                                                cache_write: u64::from(
+                                                    usage_after
+                                                        .cache_write_tokens
+                                                        .saturating_sub(usage_before.cache_write_tokens),
+                                                ),
+                                            };
+                                            // driver 侧的落盘出口（与工具侧的
+                                            // `emit` 对称）：record_usage / drive
+                                            // 都会改状态，改完立刻写盘。
+                                            let save_goal = || {
+                                                if let Some((cwd, sid)) = &goal_persist_at {
+                                                    crate::goal::persist(
+                                                        cwd,
+                                                        sid,
+                                                        &goal_state.read(),
+                                                    );
+                                                }
+                                            };
+                                            let budget_block =
+                                                goal_state.write().record_usage(&delta);
+                                            if budget_block.is_some() {
+                                                save_goal();
+                                            }
+                                            if let Some(reason) = budget_block {
+                                                let snapshot = goal_state.read().current();
+                                                let _ = event_tx.send(ChatEvent::GoalUpdated {
+                                                    goal: snapshot,
+                                                    change: "blocked".into(),
+                                                });
+                                                let _ = event_tx.send(ChatEvent::Status {
+                                                    message: format!(
+                                                        "🎯 目标已停在 blocked[{}]：{} \
+                                                         自动续跑停止；抬高预算后可以 resume 继续。",
+                                                        reason.code, reason.message
+                                                    ),
+                                                });
+                                            }
+
+                                            // 用户按了 ⏸ 时不自动续跑：暂停的语义是
+                                            // "别再自己往下走"，把 continuation 排进
+                                            // 队列只是把问题推迟到 resume 之后。
+                                            if !paused && !cancel_flag.load(Ordering::SeqCst) {
+                                                let decision = goal_state.write().drive();
+                                                if !matches!(
+                                                    decision,
+                                                    crate::goal::DriveDecision::Idle
+                                                ) {
+                                                    // 轮号已经占掉了，必须立刻落盘：
+                                                    // 崩在这里而没写盘，重启后同一轮
+                                                    // 会被再开一次（预算被重启刷掉）。
+                                                    save_goal();
+                                                }
+                                                match decision {
+                                                    crate::goal::DriveDecision::Idle => {}
+                                                    crate::goal::DriveDecision::Round {
+                                                        goal,
+                                                        round,
+                                                    } => {
+                                                        let _ = event_tx.send(ChatEvent::GoalUpdated {
+                                                            goal: Some(goal.clone()),
+                                                            change: "round".into(),
+                                                        });
+                                                        let _ = event_tx.send(ChatEvent::Status {
+                                                            message: format!(
+                                                                "🎯 目标未达成 —— 自动续跑第 {round}/{} 轮（⏸ 可随时停）",
+                                                                goal.max_rounds
+                                                            ),
+                                                        });
+                                                        // 自投递。send 失败只发生在
+                                                        // 接收端已关闭（会话正在收尾），
+                                                        // 那时本来就不该再开轮。
+                                                        let _ = self_tx.send(ControllerInput::Input(
+                                                            crate::goal::render_goal_round_prompt(
+                                                                &goal, round,
+                                                            ),
+                                                        ));
+                                                    }
+                                                    crate::goal::DriveDecision::JustBlocked {
+                                                        goal,
+                                                        reason,
+                                                    } => {
+                                                        let _ = event_tx.send(ChatEvent::GoalUpdated {
+                                                            goal: Some(goal.clone()),
+                                                            change: "blocked".into(),
+                                                        });
+                                                        let _ = event_tx.send(ChatEvent::Status {
+                                                            message: format!(
+                                                                "🎯 目标已停在 blocked[{}]：{}\n\
+                                                                 请选择：① 抬高轮次上限后 resume 续跑 \
+                                                                 ② 缩小目标重新设定 ③ 就此收手。\
+                                                                 （轮次耗尽不代表做完了——先看上面这几轮到底交付了什么）",
+                                                                reason.code, reason.message
+                                                            ),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         let _ = event_tx.send(ChatEvent::RoleFinished {
@@ -3444,7 +3709,7 @@ async fn run_single_role_loop(
                                     continue;
                                 }
                                 let history: Vec<Message> = runner.context().messages().to_vec();
-                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                     Ok((mut new_runner, rid)) => {
                                         for m in history { new_runner.context_mut().push(m); }
                                         runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3459,7 +3724,7 @@ async fn run_single_role_loop(
                             }
                             Some(ControllerInput::SwitchModel(new_tier)) => {
                                 let history: Vec<Message> = runner.context().messages().to_vec();
-                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                     Ok((mut new_runner, _)) => {
                                         for m in history { new_runner.context_mut().push(m); }
                                         runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3537,6 +3802,7 @@ async fn build_runner(
     // 会话级 todo 状态共享句柄：透传给 `register_todo_tool`（读写 +
     // 广播 TodoUpdated）与 runner（TodoTracker 运行中纠偏）。
     todo_state: &crate::todo::SharedTodoState,
+    goal_state: &crate::goal::SharedGoal,
     // plan mode（只读规划模式）：true 时角色 allowlist 收敛到
     // [`PLAN_MODE_READONLY_TOOLS`]，并往 system prompt 追加只读引导段。
     // 切换在 turn 边界生效（driver 重建 runner 时才重读）。
@@ -3644,6 +3910,21 @@ async fn build_runner(
         // （角色 prompt 与 allowed_tools 不对齐时的软拒绝 + 申请通道）。
         register_request_tool(tm.clone())
             .map_err(|e| AgentError::Tool(format!("register request_tool '{role_id}': {e}")))?;
+        // goal：跨 turn 的完成契约（见 `crate::goal`）。声明了它的角色才
+        // 拿到——目标层是"驱动整场任务"的工具，只该给编排型角色（manager）。
+        if role.allowed_tools.iter().any(|t| t == "goal") {
+            register_goal_tool(
+                &tm,
+                event_tx.clone(),
+                role_id.to_string(),
+                goal_state.clone(),
+                // 空 session_id 表示"临时 runner"（部分测试路径），
+                // 那种情况下不落盘。
+                (!session_id.is_empty())
+                    .then(|| (cwd.to_path_buf(), session_id.to_string())),
+            )
+            .map_err(|e| AgentError::Tool(format!("register goal '{role_id}': {e}")))?;
+        }
         // Any role with "delegate" in allowed_tools gets the delegate tool
         // registered. 这是**顶层** runner，委派深度 = 0；派出的 specialist
         // 由 `register_delegate_tool` 的 handler 递归注册（深度 +1），深度
@@ -7857,6 +8138,333 @@ pub fn register_todo_tool(
     Ok(())
 }
 
+/// 构造一个 goal 工具用的简单属性（少写 12 个 `None`）。
+fn goal_prop(
+    property_type: PropertyType,
+    description: &str,
+    minimum: Option<f64>,
+) -> ToolInputProperty {
+    ToolInputProperty {
+        property_type,
+        description: Some(description.to_string()),
+        enum_values: None,
+        minimum,
+        maximum: None,
+        min_length: None,
+        max_length: None,
+        items: None,
+        properties: None,
+        required: None,
+        additional_properties: None,
+        ref_: None,
+    }
+}
+
+/// `complete` 要求的 `evidence` 最短长度（字符）。
+///
+/// 不是为了卡长度，是为了让「我已核对过」变成一句**具体的、留在 transcript
+/// 里的话**。低于这个长度基本只能写出「已完成」三个字，那等于没有审计。
+const GOAL_EVIDENCE_MIN_CHARS: usize = 40;
+
+/// 注册 `goal` 工具：模型自己维护跨 turn 的完成契约。
+///
+/// # 权限门（这是本函数存在的主要理由）
+///
+/// 状态机（`crate::goal`）只保证**流程**正确，不做语义裁决。三个参考实现
+/// （oh-my-pi / deepseek-harness / opencode）在"目标是否达成"这件事上都
+/// **完全信任模型**：oh-my-pi 的 `completeGoalFromTool()` 只校验状态机合法
+/// 性，deepseek-harness 的 README 直接写明 "No independent evaluator"。
+///
+/// 这里加了两道 latte 特有的**程序性**门禁——不裁决对错，只强制把判断
+/// 摊开：
+///
+/// 1. **`complete` 必须带 `evidence`**（≥ [`GOAL_EVIDENCE_MIN_CHARS`] 字符）。
+///    引擎无法验证证据真假，但能强制模型把「我核对了什么」写进 transcript，
+///    于是用户与 advisor 事后可复核。对症 `loop_no_release_on` 那条注释记的
+///    事故：run 以 `ok` 收尾、summary 却是 REJECT 原文，失败被吞成成功——
+///    当时没有任何地方留下「凭什么算过了」。
+/// 2. **`blocked` 要求至少已跑过 [`crate::goal::BLOCK_MIN_ROUNDS`] 轮**
+///    （照 deepseek-harness 的 `blockedAfterConsecutiveRounds`）。模型在第一
+///    轮就报「我被卡住了」几乎总是没真试过；先让它真的试几轮。
+///
+/// 两道门都返回**可执行的**报错（告诉模型缺什么、下一步干什么），而不是
+/// 单纯拒绝——单纯拒绝会让模型原地重试同一个调用。
+pub fn register_goal_tool(
+    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    event_tx: broadcast::Sender<ChatEvent>,
+    role_id: String,
+    goal_state: crate::goal::SharedGoal,
+    // 落盘坐标 `(cwd, session_id)`。`None` = 不落盘（单测与临时 runner
+    // 用），此时目标只活在内存里。
+    //
+    // 每次成功的 mutation 之后立刻写盘：goal 的价值就在于跨 turn / 跨进程
+    // 记得那个目标，攒着批量写只会在崩溃时丢掉最该留下的那一次。
+    persist_at: Option<(PathBuf, String)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler};
+
+    let mut op = goal_prop(
+        PropertyType::String,
+        "要执行的操作：\
+         `set` 设定/覆盖目标（需要 objective）；\
+         `get` 读当前目标与进度；\
+         `complete` 标记达成（需要 evidence，会结束自动续跑）；\
+         `blocked` 标记被外部条件卡住（需要 reason）；\
+         `pause` 暂停自动续跑；`resume` 恢复；`drop` 丢弃目标。",
+        None,
+    );
+    op.enum_values = Some(vec![
+        "set".into(),
+        "get".into(),
+        "complete".into(),
+        "blocked".into(),
+        "pause".into(),
+        "resume".into(),
+        "drop".into(),
+    ]);
+
+    let input_schema = latte_rs_agent_tools::types::ToolInputSchema {
+        schema_type: SchemaType,
+        properties: vec![
+            ("op".into(), op),
+            (
+                "objective".into(),
+                goal_prop(
+                    PropertyType::String,
+                    "`set` 用：用户要达成的目标，写成可验证的结果（做什么 + 怎样算做完），不要写步骤。跨 turn 持续有效。",
+                    None,
+                ),
+            ),
+            (
+                "max_rounds".into(),
+                goal_prop(
+                    PropertyType::Integer,
+                    "`set` 用：自动续跑的轮次上限（缺省 24，硬顶 256）。一轮 = 一次完整的 turn。",
+                    Some(1.0),
+                ),
+            ),
+            (
+                "token_budget".into(),
+                goal_prop(
+                    PropertyType::Integer,
+                    "`set` 用：本目标的 token 预算（缺省不限）。耗尽会把目标标记为 blocked——预算耗尽不等于完成。",
+                    Some(1.0),
+                ),
+            ),
+            (
+                "evidence".into(),
+                goal_prop(
+                    PropertyType::String,
+                    "`complete` 必填：逐条说明每个交付物凭什么算达成——读了哪个文件、跑了什么命令、输出是什么、测试是否通过。写你**这一轮实际核对过**的当前状态，不要凭记忆。",
+                    None,
+                ),
+            ),
+            (
+                "reason".into(),
+                goal_prop(
+                    PropertyType::String,
+                    "`blocked` 必填：卡在哪、缺什么、需要用户做什么才能继续。",
+                    None,
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["op".into()]),
+        ..Default::default()
+    };
+
+    let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
+        let goal_state = goal_state.clone();
+        let event_tx = event_tx.clone();
+        let persist_at = persist_at.clone();
+        Box::pin(async move {
+            let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
+            let s = |k: &str| {
+                input
+                    .get(k)
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            };
+            let u64_of = |k: &str| input.get(k).and_then(|v| v.as_u64());
+            let op = s("op").ok_or_else(|| tool_err("缺少 'op' 字段".into()))?;
+
+            // 广播 + 落盘的公共出口。所有 mutation 都经过这里，所以
+            // 「改了状态却忘了写盘」不可能发生。
+            let emit = |goal: Option<crate::goal::Goal>, change: &str| {
+                if let Some((cwd, sid)) = &persist_at {
+                    crate::goal::persist(cwd, sid, &goal_state.read());
+                }
+                let _ = event_tx.send(ChatEvent::GoalUpdated {
+                    goal: goal.clone(),
+                    change: change.to_string(),
+                });
+            };
+            let view = |g: &crate::goal::Goal| {
+                serde_json::json!({
+                    "id": g.id,
+                    "revision": g.revision,
+                    "objective": g.objective,
+                    "phase": g.phase.as_str(),
+                    "blocked_reason": g.blocked_reason,
+                    "round": g.rounds_started,
+                    "max_rounds": g.max_rounds,
+                    "rounds_remaining": g.rounds_remaining(),
+                    "tokens_used": g.tokens_used,
+                    "token_budget": g.token_budget,
+                    "tokens_remaining": g.tokens_remaining(),
+                })
+            };
+
+            match op.as_str() {
+                "get" => {
+                    let cur = goal_state.read().current();
+                    Ok(match cur {
+                        Some(g) => serde_json::json!({ "goal": view(&g) }),
+                        None => serde_json::json!({
+                            "goal": null,
+                            "note": "当前没有目标。多 turn 的大任务可以用 op=set 立一个完成契约，之后每轮会自动续跑到达成或撞上限。"
+                        }),
+                    })
+                }
+                "set" => {
+                    let objective = s("objective").ok_or_else(|| {
+                        tool_err("op=set 需要 'objective'：写成可验证的结果（做什么 + 怎样算做完）".into())
+                    })?;
+                    let g = {
+                        let mut st = goal_state.write();
+                        st.create(
+                            objective,
+                            u64_of("max_rounds").map(|v| v.min(u32::MAX as u64) as u32),
+                            u64_of("token_budget"),
+                            // 显式 set 就是覆盖语义：模型/用户改主意时不该
+                            // 先被迫 drop 一次。
+                            true,
+                        )
+                        .map_err(|e| tool_err(e.to_string()))?
+                    };
+                    emit(Some(g.clone()), "set");
+                    Ok(serde_json::json!({
+                        "goal": view(&g),
+                        "note": format!(
+                            "目标已设定，自动续跑已开启（上限 {} 轮）。达成后必须调 op=complete 并附 evidence 才会结束续跑。",
+                            g.max_rounds
+                        )
+                    }))
+                }
+                "complete" => {
+                    // 门禁 1：必须交证据。
+                    let evidence = s("evidence").unwrap_or_default();
+                    if evidence.chars().count() < GOAL_EVIDENCE_MIN_CHARS {
+                        return Err(tool_err(format!(
+                            "op=complete 需要 'evidence'（至少 {GOAL_EVIDENCE_MIN_CHARS} 字）。\
+                             逐条写：每个交付物凭什么算达成——读了哪个文件、跑了什么命令、\
+                             输出是什么、测试过没过。这一轮实际核对过的当前状态，不要凭记忆。\n\
+                             还没核对就先去核对（读文件 / 跑测试），核对完再调这一步；\
+                             确实达不成就用 op=blocked 说明卡点。"
+                        )));
+                    }
+                    let g = {
+                        let mut st = goal_state.write();
+                        let r = st
+                            .current()
+                            .ok_or_else(|| tool_err(crate::goal::GoalError::NoGoal.to_string()))?
+                            .goal_ref();
+                        st.complete(&r).map_err(|e| tool_err(e.to_string()))?
+                    };
+                    emit(Some(g.clone()), "complete");
+                    Ok(serde_json::json!({
+                        "goal": view(&g),
+                        // 完成后的 wrap-up 要求，照 deepseek-harness 的
+                        // `<goal_complete>` 措辞：交结果、交验证方式、交产物，
+                        // 且只报本会话真的建立过的事实。
+                        "wrap_up": "自动续跑已结束。现在给用户一份收尾报告：做成了什么、\
+                                    怎么验证的、产物在哪（文件 / 提交 / 任务）。只报本会话里\
+                                    工具结果真正建立过的事实——没有的就说没有，不要补齐叙述。"
+                    }))
+                }
+                "blocked" => {
+                    let reason = s("reason").ok_or_else(|| {
+                        tool_err("op=blocked 需要 'reason'：卡在哪、缺什么、需要用户做什么".into())
+                    })?;
+                    let mut st = goal_state.write();
+                    let cur = st
+                        .current()
+                        .ok_or_else(|| tool_err(crate::goal::GoalError::NoGoal.to_string()))?;
+                    // 门禁 2：第一轮就喊卡住，通常是还没真试。
+                    if cur.rounds_started < crate::goal::BLOCK_MIN_ROUNDS {
+                        return Err(tool_err(format!(
+                            "现在才第 {} 轮，还不能标 blocked（至少要真的试过 {} 轮）。\
+                             先按目标继续推进：换一条路径、补取证、或把大目标拆成能推进的一步。\
+                             真的缺外部输入（需要用户给凭据/拍板）时才用 blocked。",
+                            cur.rounds_started,
+                            crate::goal::BLOCK_MIN_ROUNDS
+                        )));
+                    }
+                    let g = st
+                        .block(
+                            &cur.goal_ref(),
+                            crate::goal::GoalBlockReason::new("agent-reported", reason),
+                        )
+                        .map_err(|e| tool_err(e.to_string()))?;
+                    drop(st);
+                    emit(Some(g.clone()), "blocked");
+                    Ok(serde_json::json!({
+                        "goal": view(&g),
+                        "note": "已标记为 blocked，自动续跑停止。请向用户说明卡点与可选出路。"
+                    }))
+                }
+                "pause" | "resume" => {
+                    let mut st = goal_state.write();
+                    let cur = st
+                        .current()
+                        .ok_or_else(|| tool_err(crate::goal::GoalError::NoGoal.to_string()))?;
+                    let g = if op == "pause" {
+                        st.pause(&cur.goal_ref())
+                    } else {
+                        st.resume(&cur.goal_ref())
+                    }
+                    .map_err(|e| tool_err(e.to_string()))?;
+                    drop(st);
+                    emit(Some(g.clone()), &op);
+                    Ok(serde_json::json!({ "goal": view(&g) }))
+                }
+                "drop" => {
+                    let dropped = goal_state.write().clear();
+                    emit(None, "drop");
+                    Ok(serde_json::json!({
+                        "dropped": dropped.map(|g| g.objective),
+                        "goal": null
+                    }))
+                }
+                other => Err(tool_err(format!(
+                    "未知的 op '{other}'——可用：set / get / complete / blocked / pause / resume / drop"
+                ))),
+            }
+        })
+    });
+
+    let tool = latte_rs_agent_tools::types::Tool::builder(
+        "goal".to_string(),
+        "维护本会话的**完成契约**：一个跨 turn 持续有效的目标。\
+         用户提出需要多轮才能做完的大任务时，先 op=set 立一个可验证的目标；\
+         之后每当你停下、而目标还没达成，系统会自动把你唤醒继续推进（有轮次上限）。\
+         达成后必须 op=complete 并附 evidence（逐条说明凭什么算达成）才会结束续跑——\
+         轮次或预算耗尽都不等于完成。"
+            .to_string(),
+        input_schema,
+        handler,
+    )
+    // 状态读-改-写不允许交错（与 todo 同理）。
+    .concurrency_safe(false)
+    .timeout(std::time::Duration::from_secs(10))
+    .build();
+
+    tm.replace(tool, Some(&role_id));
+    Ok(())
+}
+
 /// Delegate-return gate: review a specialist's output before it flows
 /// back to the manager, checking (1) role-responsibility adherence and
 /// (2) whether the return actually answers the delegated task. Emits a
@@ -10833,6 +11441,7 @@ mod tests {
                 AdvisorPauseGate::new(),
                 &fresh_plan_stage(),
                 &crate::todo::new_shared_todo_state(),
+                &crate::goal::new_shared_goal(),
                 false,
                 crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
@@ -11004,6 +11613,7 @@ mod tests {
                     AdvisorPauseGate::new(),
                     &fresh_plan_stage(),
                     &crate::todo::new_shared_todo_state(),
+                &crate::goal::new_shared_goal(),
                     plan_mode,
                     crate::pause_gate::AgentPauseGate::new("test"),
                     Arc::new(AtomicBool::new(false)),
@@ -17438,5 +18048,753 @@ require = ["永远不可能出现的验收字符串"]
             .unwrap()
             .iter()
             .any(|x| x == "a.c, b.h"));
+    }
+
+    // ─── goal 层外循环 ────────────────────────────────────────────────
+
+    /// 造一个只注册了 `goal` 工具的裸 tool manager。
+    async fn goal_tool_fixture() -> (
+        Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+        crate::goal::SharedGoal,
+        broadcast::Receiver<ChatEvent>,
+    ) {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let state = crate::goal::new_shared_goal();
+        let (tx, rx) = broadcast::channel(64);
+        register_goal_tool(&tm, tx, "manager".into(), state.clone(), None)
+            .expect("register goal");
+        (tm, state, rx)
+    }
+
+    /// set → get 的基本形状，以及「set 即 arm」。
+    #[tokio::test]
+    async fn goal_tool_set_then_get_reports_progress() {
+        let (tm, state, _rx) = goal_tool_fixture().await;
+        let out = tm
+            .execute(
+                "goal",
+                serde_json::json!({
+                    "op": "set",
+                    "objective": "把 loop 的两个缺口补齐并验证",
+                    "max_rounds": 5
+                }),
+                None,
+            )
+            .await
+            .expect("set 应成功");
+        assert_eq!(out["goal"]["phase"], "active");
+        assert_eq!(out["goal"]["max_rounds"], 5);
+        assert_eq!(
+            state.read().activation(),
+            crate::goal::GoalActivation::Armed,
+            "显式 set 是两个 arm 点之一"
+        );
+
+        let got = tm
+            .execute("goal", serde_json::json!({ "op": "get" }), None)
+            .await
+            .expect("get 应成功");
+        assert_eq!(got["goal"]["objective"], "把 loop 的两个缺口补齐并验证");
+        assert_eq!(got["goal"]["rounds_remaining"], 5);
+    }
+
+    /// 没有目标时 get 不报错，而是给一条「可以立一个」的指引。
+    #[tokio::test]
+    async fn goal_tool_get_without_goal_is_not_an_error() {
+        let (tm, _state, _rx) = goal_tool_fixture().await;
+        let out = tm
+            .execute("goal", serde_json::json!({ "op": "get" }), None)
+            .await
+            .expect("无目标时 get 也该成功");
+        assert!(out["goal"].is_null());
+        assert!(
+            out["note"].as_str().unwrap_or_default().contains("完成契约"),
+            "要给出「可以立一个目标」的指引：{out}"
+        );
+    }
+
+    /// **权限门 1**：`complete` 必须带足够具体的 evidence。
+    ///
+    /// 引擎无法验证证据真假（三个参考实现都不验证），但能强制模型把
+    /// 「我核对了什么」写进 transcript，让用户与 advisor 事后可复核。
+    /// 报错必须**可执行**——只说"不行"会让模型原地重试同一个调用。
+    #[tokio::test]
+    async fn goal_tool_complete_requires_concrete_evidence() {
+        let (tm, state, _rx) = goal_tool_fixture().await;
+        tm.execute(
+            "goal",
+            serde_json::json!({ "op": "set", "objective": "修完三个 bug 并全量验证" }),
+            None,
+        )
+        .await
+        .expect("set");
+
+        // 无 evidence
+        let err = tm
+            .execute("goal", serde_json::json!({ "op": "complete" }), None)
+            .await
+            .expect_err("没有 evidence 必须被拒");
+        let msg = err.to_string();
+        assert!(msg.contains("evidence"), "{msg}");
+        assert!(
+            msg.contains("读了哪个文件") && msg.contains("跑了什么命令"),
+            "报错要说清要交什么：{msg}"
+        );
+        assert!(
+            msg.contains("op=blocked"),
+            "要给出另一条出路（真达不成就 blocked）：{msg}"
+        );
+
+        // 敷衍的 evidence 同样被拒
+        let err = tm
+            .execute(
+                "goal",
+                serde_json::json!({ "op": "complete", "evidence": "已完成" }),
+                None,
+            )
+            .await
+            .expect_err("敷衍的 evidence 必须被拒");
+        assert!(err.to_string().contains("evidence"));
+
+        assert_eq!(
+            state.read().current().unwrap().phase,
+            crate::goal::GoalPhase::Active,
+            "被拒的 complete 不得改相位"
+        );
+
+        // 具体的 evidence 才放行，且返回体要带 wrap-up 要求
+        let out = tm
+            .execute(
+                "goal",
+                serde_json::json!({
+                    "op": "complete",
+                    "evidence": "cargo test -p latte-agent-core 全绿（947 passed）；\
+                                 controller.rs:8035 的递归注册已生效，新测试断言 specialist \
+                                 的 tools 里含 delegate；README 已补 LATTE_AGENT_DELEGATE_MAX_DEPTH 一行。"
+                }),
+                None,
+            )
+            .await
+            .expect("具体证据应放行");
+        assert_eq!(out["goal"]["phase"], "complete");
+        let wrap = out["wrap_up"].as_str().unwrap_or_default();
+        assert!(
+            wrap.contains("怎么验证的") && wrap.contains("产物在哪"),
+            "完成后要求交收尾报告：{wrap}"
+        );
+        assert_eq!(
+            state.read().activation(),
+            crate::goal::GoalActivation::Disarmed,
+            "complete 必须停掉自动续跑"
+        );
+    }
+
+    /// **权限门 2**：第一轮就喊「卡住了」要被拦。
+    #[tokio::test]
+    async fn goal_tool_blocked_requires_having_actually_tried() {
+        let (tm, state, _rx) = goal_tool_fixture().await;
+        tm.execute(
+            "goal",
+            serde_json::json!({ "op": "set", "objective": "查清一个疑难 bug" }),
+            None,
+        )
+        .await
+        .expect("set");
+
+        let err = tm
+            .execute(
+                "goal",
+                serde_json::json!({ "op": "blocked", "reason": "太难了" }),
+                None,
+            )
+            .await
+            .expect_err("第 0 轮不该能标 blocked");
+        let msg = err.to_string();
+        assert!(msg.contains("还不能标 blocked"), "{msg}");
+        assert!(msg.contains("换一条路径"), "要给可执行的替代动作：{msg}");
+
+        // 真的跑过 BLOCK_MIN_ROUNDS 轮之后才准报。
+        for _ in 0..crate::goal::BLOCK_MIN_ROUNDS {
+            state.write().drive();
+        }
+        let out = tm
+            .execute(
+                "goal",
+                serde_json::json!({ "op": "blocked", "reason": "需要用户提供生产库凭据才能继续验证" }),
+                None,
+            )
+            .await
+            .expect("试过之后应允许标 blocked");
+        assert_eq!(out["goal"]["phase"], "blocked");
+        assert_eq!(out["goal"]["blocked_reason"]["code"], "agent-reported");
+    }
+
+    /// `blocked` / `complete` 都必须广播 `GoalUpdated`，否则用户看不到
+    /// 自动续跑为什么停了。
+    #[tokio::test]
+    async fn goal_tool_broadcasts_updates() {
+        let (tm, _state, mut rx) = goal_tool_fixture().await;
+        tm.execute(
+            "goal",
+            serde_json::json!({ "op": "set", "objective": "一件要跑很多轮的事" }),
+            None,
+        )
+        .await
+        .expect("set");
+        let mut changes = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::GoalUpdated { change, goal } = ev {
+                assert!(goal.is_some(), "set 之后 goal 不该是 None");
+                changes.push(change);
+            }
+        }
+        assert_eq!(changes, vec!["set".to_string()]);
+    }
+
+    /// **端到端**：立一个目标后，driver 必须在**不等用户输入**的情况下把
+    /// 后续轮次跑出来，撞到轮次上限时停在 `blocked[round-limit]`。
+    ///
+    /// 这是整套机制的核心断言。修复前的实况：manager 一旦返回纯文本，
+    /// session 就转 idle 等人——一条要跑多轮的大任务只会跑一轮然后静默
+    /// 停在半成品上。
+    ///
+    /// 也顺带验证两条易错的细节：
+    /// - 广播出去的 `UserMessage` 是**一行摘要**而不是上千字符的续跑
+    ///   prompt（否则每轮刷一次会把对话冲垮）；
+    /// - 轮次耗尽产出的是 `blocked` 而不是 `complete`（预算耗尽 ≠ 完成）。
+    #[tokio::test]
+    async fn goal_round_driver_runs_extra_turns_then_stops_at_round_limit() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "这一轮我推进了一点，但还没达成目标，先汇报进展。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(256);
+        let mut rx = controller.spawn(cfg).await;
+
+        // 立一个 2 轮上限的目标（模型侧走 `goal` 工具，这里直接用共享句柄，
+        // 等价于用户从 UI 设定）。
+        controller
+            .goal_state()
+            .write()
+            .create("跑一件要多轮才能做完的事", Some(2), None, false)
+            .expect("create goal");
+        assert!(controller.goal_snapshot().is_some());
+
+        controller.submit_input("开始干活").await;
+
+        // 预期时间线：用户那一轮 + 自动续跑 2 轮 = 3 次模型调用，
+        // 第 3 轮收尾时 rounds_started(2) 已达上限 → blocked。
+        let mut blocked_status: Option<String> = None;
+        let mut round_msgs: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(ChatEvent::UserMessage { text })) => round_msgs.push(text),
+                Ok(Ok(ChatEvent::Status { message })) => {
+                    if message.contains("blocked[round-limit]") {
+                        blocked_status = Some(message);
+                        break;
+                    }
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        }
+
+        let calls = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            calls, 3,
+            "应是「用户 1 轮 + 自动续跑 2 轮」共 3 次模型调用，实际 {calls}"
+        );
+
+        let g = controller.goal_snapshot().expect("goal 应还在");
+        assert_eq!(
+            g.phase,
+            crate::goal::GoalPhase::Blocked,
+            "轮次耗尽必须是 blocked 而不是 complete —— 预算耗尽 ≠ 目标达成"
+        );
+        assert_eq!(
+            g.blocked_reason.as_ref().map(|r| r.code.as_str()),
+            Some(crate::goal::BLOCK_CODE_ROUND_LIMIT)
+        );
+        assert_eq!(g.rounds_started, 2);
+        assert_eq!(
+            controller.goal_state().read().activation(),
+            crate::goal::GoalActivation::Disarmed,
+            "到顶后必须停掉自动续跑，不能继续自投递"
+        );
+
+        let msg = blocked_status.expect("到顶要发一条带可执行选项的 Status");
+        assert!(msg.contains("抬高轮次上限"), "{msg}");
+        assert!(
+            msg.contains("轮次耗尽不代表做完了"),
+            "必须提醒用户先看交付了什么：{msg}"
+        );
+
+        // 续跑注入的是**一行摘要**，不是整段 prompt。
+        assert_eq!(round_msgs.first().map(String::as_str), Some("开始干活"));
+        let auto: Vec<&String> = round_msgs.iter().filter(|m| m.contains("自动续跑")).collect();
+        assert_eq!(auto.len(), 2, "两轮续跑各应有一条摘要：{round_msgs:?}");
+        for m in auto {
+            assert!(
+                !m.contains(crate::goal::GOAL_ROUND_MARKER),
+                "不得把整段续跑 prompt 广播成用户消息：{m}"
+            );
+            assert!(m.len() < 60, "摘要应当很短：{m}");
+        }
+
+        controller.abort().await;
+    }
+
+    /// 目标是 `Disarmed` 时 driver 绝不自投递 —— 安全阀的端到端断言。
+    ///
+    /// 对应场景：进程重启后从磁盘载回一个 active 目标。目标本身要活下来，
+    /// 但机器**不许**在没人授权的情况下自己接着烧 token。
+    #[tokio::test]
+    async fn disarmed_goal_never_self_drives() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "占位回答，长度足够越过 advisor 的短输出阈值。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            session_token_budget: 0,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(256);
+        let _rx = controller.spawn(cfg).await;
+
+        // 模拟「从磁盘载回一个 active 目标」：目标在，但 disarmed。
+        {
+            let st = controller.goal_state();
+            let mut g = st.write();
+            let created = g
+                .create("重启前没做完的事", Some(8), None, false)
+                .expect("create");
+            g.load_disarmed(created);
+        }
+        assert!(controller.goal_snapshot().is_some());
+        assert_eq!(
+            controller.goal_state().read().activation(),
+            crate::goal::GoalActivation::Disarmed
+        );
+
+        controller.submit_input("随便问一句").await;
+        // 给足时间：如果安全阀失效，这里会自投递出更多轮。
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let calls = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            calls, 1,
+            "disarmed 时只该跑用户那一轮，不得自动续跑，实际 {calls} 次模型调用"
+        );
+        assert_eq!(
+            controller.goal_snapshot().unwrap().rounds_started,
+            0,
+            "一轮都不该被占用"
+        );
+
+        controller.abort().await;
+    }
+
+    /// **持久化的端到端断言**：目标跨 controller（= 跨进程）活下来，
+    /// 但自动续跑不跟着活过来。
+    ///
+    /// 两段：controller A 立目标、跑一轮、落盘；controller B 用同一个
+    /// `(cwd, session_id)` 起来，必须载回目标（含已用轮次）**且不自己跑**。
+    ///
+    /// 这条是 `activation` 那套设计的意义所在。没有持久化时它是空转的
+    /// （重启目标直接就没了，谈不上"重启不自动跑"）。
+    #[tokio::test]
+    async fn goal_survives_a_new_controller_but_stays_disarmed() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "推进了一点，还没达成，先汇报进展占位。" },
+                                "finish_reason": "stop"
+                            }],
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let make_cfg = || {
+            let agent_config = Arc::new(AgentConfig {
+                advisor: Default::default(),
+                compaction: Default::default(),
+                models: ModelCatalog {
+                    models: vec![ModelDef {
+                        name: "stub-standard".into(),
+                        api: "openai".into(),
+                        provider: "test".into(),
+                        base_url: server.uri(),
+                        api_key: "test-key".into(),
+                        context_window: 32000,
+                        max_tokens: 4096,
+                        omit_max_tokens: false,
+                        max_tokens_field: Default::default(),
+                        prompt_cache: false,
+                        prompt_cache_key: None,
+                        supports_thinking: false,
+                        supports_vision: false,
+                        supports_image_generation: false,
+                        cost_per_million_input: None,
+                        cost_per_million_output: None,
+                        tier: Some("standard".into()),
+                        timeout_secs: None,
+                    }],
+                    tiers: None,
+                    role_tiers: None,
+                },
+                roles: [(
+                    "manager".to_string(),
+                    RoleTemplate {
+                        id: "manager".into(),
+                        name: "manager".into(),
+                        category: "planning".into(),
+                        model_tier: "standard".into(),
+                        model_chain: vec![],
+                        prompt_file: None,
+                        temperature: None,
+                        tools: vec![],
+                        icon: "👔".into(),
+                        skills: vec![],
+                        code_paths: vec![],
+                        description: String::new(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            });
+            let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+            ControllerConfig {
+                task_id: None,
+                roles: vec!["manager".to_string()],
+                initial_prompt: None,
+                max_rounds: 0,
+                session_token_budget: 0,
+                agent_config,
+                model_resolver: resolver,
+                default_params: GenerateParams::default(),
+                primary_model_id: None,
+                initial_tier: None,
+                initial_history: vec![],
+                cwd: dir.path().to_path_buf(),
+                subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+                advisor_monitor: AdvisorMonitorConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                max_delegates_per_session: crate::controller::default_max_delegates(),
+                // 落盘要真 session_id —— 它就是文件名。
+                session_id: "persist-sess".to_string(),
+            }
+        };
+
+        // ── 第一段：直接在盘上造出「上一个进程留下的目标」──
+        //
+        // 不经 controller：那样就要处理「loop 什么时候初始化完」的时序，
+        // 而 driver 推进轮次的行为已由
+        // `goal_round_driver_runs_extra_turns_then_stops_at_round_limit`
+        // 覆盖。这里要测的只有「跨进程载回 + 不自己跑」。
+        let rounds_before = {
+            let mut seed = crate::goal::GoalState::default();
+            seed.create("一件要跨重启记住的事", Some(6), Some(500_000), false)
+                .expect("create");
+            seed.drive();
+            seed.drive();
+            seed.record_usage(&crate::goal::GoalUsageDelta {
+                input: 12_345,
+                ..Default::default()
+            });
+            crate::goal::persist(dir.path(), "persist-sess", &seed);
+            seed.current().unwrap().rounds_started
+        };
+        assert_eq!(rounds_before, 2);
+
+        let on_disk = crate::goal::load(dir.path(), "persist-sess").expect("盘上应有快照");
+        assert_eq!(
+            on_disk.rounds_started, rounds_before,
+            "已用轮次必须一起落盘，否则重启就能把轮次预算刷掉"
+        );
+        assert_eq!(on_disk.tokens_used, 12_345, "token 记账同理");
+
+        // ── 第二段：全新 controller（模拟进程重启）──
+        let b = ChatController::new(256);
+        let mut rx_b = b.spawn(make_cfg()).await;
+        // 载入发生在 loop 启动时，给它一点时间。
+        for _ in 0..60 {
+            if b.goal_snapshot().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let loaded = b.goal_snapshot().expect("新 controller 必须载回目标");
+        assert_eq!(loaded.objective, "一件要跨重启记住的事");
+        assert_eq!(loaded.rounds_started, rounds_before);
+        assert_eq!(loaded.tokens_used, 12_345);
+        assert_eq!(
+            b.goal_state().read().activation(),
+            crate::goal::GoalActivation::Disarmed,
+            "载回来必须是 disarmed —— 重启就自己接着跑是不可接受的失效模式"
+        );
+
+        // 载回时要告诉用户「目标还在，但续跑是关的」，否则用户既不知道
+        // 有个目标悬着，也不知道为什么它不动。
+        let mut notice: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx_b.recv()).await {
+                Ok(Ok(ChatEvent::Status { message })) if message.contains("载回上次的目标") => {
+                    notice = Some(message);
+                    break;
+                }
+                Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        let notice = notice.expect("载回目标要发一条 Status");
+        assert!(notice.contains("第 2/6 轮"), "要摊出进度：{notice}");
+        assert!(
+            notice.contains("关闭") && notice.contains("resume"),
+            "要说明续跑是关的、怎么才能继续：{notice}"
+        );
+
+        // 关键：不发任何输入，静等。绝不该有任何模型调用。
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "disarmed 的目标不得让新 controller 自己跑起来"
+        );
+
+        // 用户真的说一句话时，跑那一轮，但**不**因为目标 active 就自动续跑。
+        b.submit_input("先别继续那个目标，回答我一个问题").await;
+        for _ in 0..100 {
+            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "只跑用户那一轮：disarmed 状态下 driver 必须一直不动"
+        );
+        assert_eq!(
+            b.goal_snapshot().unwrap().rounds_started,
+            rounds_before,
+            "一轮都不该被额外占用"
+        );
+
+        b.abort().await;
     }
 }

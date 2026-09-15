@@ -231,6 +231,38 @@ pub trait ChatRenderer: Send + Sync {
                 })
                 .await;
             }
+            // goal 层的完成契约变化。CLI 打一行（含轮次进度与预算余量），
+            // web UI 渲染徽章。
+            //
+            // 为什么每次变化都要出可见的一行：自动续跑最危险的失效模式不是
+            // 跑错，而是**在用户不知情的情况下持续烧 token**。轮次进度必须
+            // 一直摊在用户眼前，他才知道该不该 ⏸。
+            ChatEvent::GoalUpdated { goal, change } => {
+                let line = match goal {
+                    None => "🎯 目标已丢弃".to_string(),
+                    Some(g) => {
+                        let budget = match (g.token_budget, g.tokens_remaining()) {
+                            (Some(b), Some(rem)) => format!(" · token {}/{b}（剩 {rem}）", g.tokens_used),
+                            _ => String::new(),
+                        };
+                        let tail = match (&g.phase, &g.blocked_reason) {
+                            (crate::goal::GoalPhase::Blocked, Some(r)) => {
+                                format!(" · 阻塞[{}]: {}", r.code, r.message)
+                            }
+                            _ => String::new(),
+                        };
+                        format!(
+                            "🎯 目标 {} · 第 {}/{} 轮{budget}{tail} — {}",
+                            g.phase.as_str(),
+                            g.rounds_started,
+                            g.max_rounds,
+                            g.objective
+                        )
+                    }
+                };
+                let _ = change;
+                self.on_status(&line).await;
+            }
         }
     }
 }

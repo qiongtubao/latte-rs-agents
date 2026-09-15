@@ -54,6 +54,7 @@ pub mod edit_anchor;
 pub mod error;
 pub mod event_json;
 pub mod global_config;
+pub mod goal;
 pub mod ground_truth;
 pub mod hooks;
 pub mod image_gen;

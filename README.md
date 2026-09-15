@@ -281,6 +281,94 @@ specialist 改完 → manager 跑 `cargo build` 发现还是错 → 用同一条
 省下的白跑改由别的闸兜：并发同身份仍被在飞标记挡住，模型无意义地反复重发同一条调用
 由死循环熔断（连击 / 打转）处理。用「可能白跑一次」换「不再把假成功喂回 manager」。
 
+### Goal 层：跨 turn 的完成契约
+
+一个巨大的任务往往需要很多轮才能做完，但 `chat` 的 turn 循环在模型返回纯
+文本时就结束了——session 转 idle 等人，**没有任何机制判断「用户要的那件事
+到底做完了没有」**。`goal` 就是补这一层的：
+
+```
+用户：把 loop 的两个缺口补齐并全量验证
+manager → goal(op="set", objective="…", max_rounds=12)
+   ↓ 干活、返回进展（turn 结束）
+   ↓ driver 发现目标还是 active → 自动注入下一轮，不等用户输入
+   ↓ …
+manager → goal(op="complete", evidence="cargo test 全绿(972 passed)；…")
+   ↓ 自动续跑结束，向用户交收尾报告
+```
+
+两条硬不变量：
+
+- **轮次 / 预算耗尽 → `blocked`，绝不是 `complete`。** 到顶时停在
+  `blocked[round-limit]` 或 `blocked[token-budget]` 并给出可执行选项（抬高
+  上限后 resume / 缩小目标 / 收手），而不是假装做完了。
+- **相位与续跑许可正交。** `phase`（active/paused/blocked/complete）是"这个
+  目标该不该继续"；`activation`（armed/disarmed）是"本进程此刻可不可以**自动**
+  继续"，**从不持久化**。载入一个 active 目标一律 `disarmed`，必须显式
+  `resume` 才会自己跑起来——重启就接着烧 token 是不可接受的失效模式。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `objective` | 必填 | 写成可验证的结果（做什么 + 怎样算做完），不写步骤。跨 turn 不变 |
+| `max_rounds` | 24（硬顶 256） | 自动续跑轮次上限。**唯一始终生效的 runaway 兜底** |
+| `token_budget` | 不限 | 本目标的 token 预算。记账口径 `input - cache_read + output + thinking + cache_write` |
+
+记账口径抄 oh-my-pi 的 `goalTokenDelta`，但**多减一次 `cache_read`**：latte 的
+`TokenUsage::cache_read_tokens` 是 `input_tokens` 的**子集**，而 oh-my-pi 的
+`input` / `cacheRead` 是并列的两个桶。不减就等于把复用前缀当成新消耗，长会话
+里这一项会主导整个预算。`cache_write` 必须算进去——轮换缓存能一次写 10 万+
+token。
+
+两道**程序性**权限门（引擎不做语义裁决，但强制把判断摊开）：
+
+1. **`complete` 必须带 `evidence`**（≥40 字）：逐条说明每个交付物凭什么算
+   达成——读了哪个文件、跑了什么命令、输出是什么。引擎无法验证证据真假，但
+   能让「凭什么算过了」留在 transcript 里供事后复核。对症的事故见
+   `WorkflowStepDef::loop_no_release_on` 那条注释：run 以 `ok` 收尾、summary
+   却是 REJECT 原文，失败被吞成成功，而当时没有任何地方留下判据。
+2. **`blocked` 要求至少真跑过 2 轮**（照 deepseek-harness 的
+   `blockedAfterConsecutiveRounds`）：第一轮就喊「我被卡住了」几乎总是还没
+   真试。
+
+续跑 prompt 里那 6 条完成审计规定取自 oh-my-pi 的 `goal-continuation.md`，
+其中三条各自对症一类既有事故：
+
+- 「绝不依赖早前轮次的记忆，重新读」→ `edit` 锚点连续失败那类（模型一直靠
+  猜改锚点，从没想到该重读）。
+- 「**验证范围 = 断言范围**」→ `require_citations_observed` 记的事故：符号
+  门禁放行了产出（名字都真实存在），但 7 个 `#error` 行号里 6 个标错。
+- 「**预算耗尽 ≠ 完成**」→ 上面那条不变量的 prompt 侧表达，代码与提示词两
+  边都写一遍。
+
+> **为什么引擎不自己判断"目标达成了没有"**：三个参考实现
+> （oh-my-pi / deepseek-harness / opencode）一个都不判。oh-my-pi 的
+> `completeGoalFromTool()` 只校验状态机合法性，不查 todo、不查 git、不跑
+> 测试；deepseek-harness 的 README 直接写明 "No independent evaluator"。
+> latte 在这件事上其实比三家都强——step 层已经有一整套机械门禁
+> （`require_tools_any` / `require_symbols_resolvable` /
+> `require_citations_observed` / `require_plan_submit`）。缺的从来不是校验
+> 能力，而是一个把这些门禁挂上去的跨 turn 契约载体。
+
+目前 goal 层只在**单角色** `chat`（manager 主路）生效；多角色 `discuss` 的
+完成契约是 `RoundScheduler` 的轮次 + `Supervisor` 预算，两套不叠加。
+
+#### 持久化：目标跨进程活，自动续跑不跨进程活
+
+目标快照落在 `<cwd>/.latte/goals/<session_id>.json`（best-effort，写失败只
+warn；口径与 `pending-asks` 一致）。落盘的**只有目标**，`activation` 从不
+持久化——载回时一律 `disarmed`：
+
+```
+进程 A: 目标 active、已跑 2/6 轮、用了 12345 token  ──落盘──┐
+进程 B: 载回 → 目标在（轮次/token 都在）、但自动续跑是关的 ←┘
+        → 发一条 Status 告诉用户「目标还在，续跑已关，想接着跑请 resume」
+        → 用户显式 resume → 轮号接着 3 往下走（不从 1 重来）
+```
+
+已用轮次与 token 必须一起落盘，否则**重启就能把预算刷掉**。载入只在内存里
+还没有目标时才发生——否则会把调用方在 loop 就绪前刚设好的目标降级成
+disarmed，用户设完发现它不跑且不知道为什么。
+
 ### Workflow 分派单元上限
 
 | 变量 | 默认 | 说明 |
