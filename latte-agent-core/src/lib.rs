@@ -36,49 +36,50 @@
 //! # }
 //! ```
 
-pub mod agent;
 pub mod advisor_monitor;
-pub mod pause_gate;
+pub mod agent;
+pub mod bridge;
+pub mod checkpoint;
 pub mod choice;
-/// 阻塞 ask 挂起项的跨进程落盘（服务器重启后用户回答仍能驱动续跑）。
-pub mod pending_ask;
-pub mod sub_cancel;
-pub mod controller;
+pub mod citation_check;
 pub mod code_graph_index;
 pub mod code_graph_viz;
-pub mod tool_fix;
-pub mod checkpoint;
-pub mod citation_check;
 pub mod compaction;
 pub mod config;
 pub mod context;
+pub mod controller;
 pub mod dispatch_ledger;
 pub mod doc_graph_tools;
 pub mod edit_anchor;
 pub mod error;
 pub mod event_json;
 pub mod global_config;
+pub mod ground_truth;
 pub mod hooks;
 pub mod image_gen;
 pub mod inject_queue;
 pub mod model_resolver;
+pub mod pause_gate;
+/// 阻塞 ask 挂起项的跨进程落盘（服务器重启后用户回答仍能驱动续跑）。
+pub mod pending_ask;
 pub mod prompts;
+pub mod renderer;
 pub mod role;
-pub mod ground_truth;
-pub mod workflow;
 pub mod scheduler;
 pub mod session;
 pub mod session_store;
 pub mod staging;
+pub mod sub_cancel;
+pub mod subsession;
+mod subsession_disk;
 pub mod supervisor;
-pub mod renderer;
+pub mod task_worktree;
 pub mod todo;
 pub mod tool_docs;
+pub mod tool_fix;
 pub mod trace;
-pub mod subsession;
-pub mod bridge;
+pub mod workflow;
 pub mod workspace;
-mod subsession_disk;
 pub use config::{AgentConfig, ConfigLayer};
 pub use context::{ConversationContext, Importance};
 pub use error::{AgentError, AgentResult};
@@ -91,19 +92,20 @@ pub mod prelude {
         AdvisorMonitor, AdvisorMonitorConfig, AdvisorReviewEngine, AdvisorReviewMode, DetectorKind,
         Verdict,
     };
-    pub use crate::agent::{Agent, AgentRunner, AgentParams, ModelClient, WaitPolicy};
+    pub use crate::agent::{Agent, AgentParams, AgentRunner, ModelClient, WaitPolicy};
     pub use crate::checkpoint::{Checkpoint, CheckpointError, CheckpointTrigger, RollbackMode};
     pub use crate::config::{AgentConfig, ConfigLayer};
     pub use crate::context::{ConversationContext, Importance};
     pub use crate::error::AgentResult;
     pub use crate::role::{Role, RoleCategory};
     pub use crate::subsession::SubsessionStore;
-    pub use crate::trace::{MemorySink, NullSink, TraceEvent, TraceSink};
     pub use crate::trace::DiffSummary;
-    pub use crate::workspace::{Blackboard, MergeMode, WorktreeSpec, WorkspaceError, WorkspaceState};
+    pub use crate::trace::{MemorySink, NullSink, TraceEvent, TraceSink};
+    pub use crate::workspace::{
+        Blackboard, MergeMode, WorkspaceError, WorkspaceState, WorktreeSpec,
+    };
     pub use latte_ai::prelude::*;
 }
-
 
 #[cfg(test)]
 pub(crate) mod test_util {

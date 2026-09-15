@@ -146,14 +146,63 @@ pub struct CodeGraphIndex {
     pub files: BTreeMap<String, FileEntry>,
 }
 
+/// linked git worktree 的索引文件后缀；主仓（`.git` 是目录）返回 `None`。
+///
+/// 后缀取「目录名 + 规范化绝对路径的 8 位哈希」：目录名让文件一眼能对上是
+/// 哪个任务，哈希保证不同路径的同名目录不撞（`worktrees/a/LAT-1` 与
+/// `worktrees/b/LAT-1`）。
+fn worktree_index_suffix(cwd: &Path) -> Option<String> {
+    // `.git` 是文件 = linked worktree（git worktree add 写的是含 `gitdir:` 的
+    // 文件）；是目录 = 主仓；都不是 = 非 git 目录，按主仓处理。
+    if !cwd.join(".git").is_file() {
+        return None;
+    }
+    let name = cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("worktree")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(32)
+        .collect::<String>();
+    let abs = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in abs.to_string_lossy().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("{name}-{:08x}", (h & 0xffff_ffff) as u32))
+}
+
 impl CodeGraphIndex {
     /// v2 起每个 Symbol 带 `end_line`（定义体跨度）。v1 索引缺该字段，
     /// 只能报起始行，所以升版本强制重建而不是将就着用。
     pub const CURRENT_VERSION: u32 = 2;
 
     /// 索引文件路径：`<cwd>/.latte/code_graph/index.json`。
+    ///
+    /// **linked worktree 例外**：任务隔离工作树里的 `.latte` 是指向主仓的软链
+    /// （见 `task_worktree::TaskWorktree::link_state_dir`），会话日志/断点/配置
+    /// 共用一份是**对的**，但代码图索引不能共用——隔离树里的代码是改过的，
+    /// 一构建就把主仓的索引覆盖成自己树的内容，主仓与其他并行任务查到的
+    /// 符号位置全是别人树里的（最后写的赢）。索引 key 是相对路径、结构上
+    /// 兼容，所以这种污染不会报错，只会静默给出错的行号。
+    ///
+    /// 因此 linked worktree 用带后缀的独立文件（仍落在共享目录里，便于一起
+    /// 清理）。判据是 `<cwd>/.git` 为**文件**——`git worktree add` 写的是一个
+    /// 含 `gitdir:` 的文件，主仓那里是目录。
     pub fn path(cwd: &Path) -> PathBuf {
-        cwd.join(".latte").join("code_graph").join("index.json")
+        let dir = cwd.join(".latte").join("code_graph");
+        match worktree_index_suffix(cwd) {
+            Some(sfx) => dir.join(format!("index-{sfx}.json")),
+            None => dir.join("index.json"),
+        }
     }
 
     /// 总符号数。
@@ -251,7 +300,8 @@ pub fn query_signatures(
     // 让调用方回退实时扫描而不是谎报 0 命中。
     let scope = normalize_scope(cwd, path)?;
     let idx_path = CodeGraphIndex::path(cwd);
-    let idx: CodeGraphIndex = serde_json::from_str(&std::fs::read_to_string(idx_path).ok()?).ok()?;
+    let idx: CodeGraphIndex =
+        serde_json::from_str(&std::fs::read_to_string(idx_path).ok()?).ok()?;
     if !index_is_fresh_for(cwd, &idx, &scope) {
         return None;
     }
@@ -262,7 +312,10 @@ pub fn query_signatures(
     let mut hits: Vec<(String, u64, String, String)> = Vec::new(); // (file, line, span, sig)
     for (rel, entry) in &idx.files {
         // 路径范围过滤：scope 是文件时精确匹配，是目录时前缀匹配。
-        if scope != "." && !scope.is_empty() && !(rel == &scope || rel.starts_with(&format!("{scope}/"))) {
+        if scope != "."
+            && !scope.is_empty()
+            && !(rel == &scope || rel.starts_with(&format!("{scope}/")))
+        {
             continue;
         }
         for s in &entry.symbols {
@@ -373,7 +426,10 @@ async fn scan_kind(cwd: &Path, lang: &str, kind: &str) -> Vec<AgMatch> {
     }
     // inline YAML 规则：单/多节点类型。
     let rule = if kinds.len() == 1 {
-        format!("id: cg_idx\nlanguage: {lang}\nrule:\n  kind: {}\n", kinds[0])
+        format!(
+            "id: cg_idx\nlanguage: {lang}\nrule:\n  kind: {}\n",
+            kinds[0]
+        )
     } else {
         let mut any = String::from("  any:\n");
         for k in kinds {
@@ -405,10 +461,7 @@ pub enum BuildOutcome {
     /// 仓库自上次构建后无改动，跳过重建。
     UpToDate,
     /// 完成一次（重）构建。
-    Built {
-        files: usize,
-        symbols: usize,
-    },
+    Built { files: usize, symbols: usize },
 }
 
 /// 判断是否需要重建：任一源文件 mtime 晚于 `built_at`，或索引缺失/版本旧。
@@ -455,7 +508,14 @@ pub async fn build_or_update(cwd: &Path) -> BuildOutcome {
     let mut lang_counts: BTreeMap<String, usize> = BTreeMap::new();
 
     for lang in [
-        "c", "cpp", "rust", "go", "python", "typescript", "javascript", "java",
+        "c",
+        "cpp",
+        "rust",
+        "go",
+        "python",
+        "typescript",
+        "javascript",
+        "java",
     ] {
         for kind in INDEXED_KINDS {
             // 该语言不支持这个 kind 时 node_kinds 为空，scan_kind 直接返回空。
@@ -491,8 +551,12 @@ pub async fn build_or_update(cwd: &Path) -> BuildOutcome {
 
     // 每文件符号去重 + 按行排序（多个 kind 扫描可能重复命中同一节点）。
     for entry in files.values_mut() {
-        entry.symbols.sort_by(|a, b| a.line.cmp(&b.line).then(a.sig.cmp(&b.sig)));
-        entry.symbols.dedup_by(|a, b| a.line == b.line && a.sig == b.sig);
+        entry
+            .symbols
+            .sort_by(|a, b| a.line.cmp(&b.line).then(a.sig.cmp(&b.sig)));
+        entry
+            .symbols
+            .dedup_by(|a, b| a.line == b.line && a.sig == b.sig);
         *lang_counts.entry(entry.lang.clone()).or_insert(0) += 1;
     }
 
@@ -545,6 +609,52 @@ mod tests {
         assert!(p.ends_with(".latte/code_graph/index.json"));
     }
 
+    /// linked worktree（`.git` 是文件）必须用**独立**索引文件。
+    ///
+    /// 回归的是一个静默污染：任务隔离工作树的 `.latte` 软链回主仓，共用
+    /// `index.json` 会让隔离树里改过的代码覆盖主仓索引——不报错，只是所有人
+    /// 查到的符号行号都变成别人树里的。
+    #[test]
+    fn linked_worktree_gets_its_own_index_file() {
+        let repo = tempfile::tempdir().unwrap();
+        // 主仓：.git 是目录 → index.json
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let main_idx = CodeGraphIndex::path(repo.path());
+        assert!(main_idx.ends_with("index.json"), "{}", main_idx.display());
+
+        // linked worktree：.git 是文件（含 gitdir:）→ 带后缀的独立文件
+        let wt = tempfile::tempdir().unwrap();
+        let tree_a = wt.path().join("LAT-100");
+        let tree_b = wt.path().join("LAT-101");
+        for t in [&tree_a, &tree_b] {
+            std::fs::create_dir_all(t).unwrap();
+            std::fs::write(t.join(".git"), "gitdir: /repo/.git/worktrees/x\n").unwrap();
+        }
+        let a = CodeGraphIndex::path(&tree_a);
+        let b = CodeGraphIndex::path(&tree_b);
+        assert_ne!(a, main_idx, "隔离树不能与主仓共用索引文件");
+        assert_ne!(a, b, "两棵隔离树之间也不能共用（否则并行任务互相覆盖）");
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("index-LAT-100-"),
+            "文件名应带任务目录名便于排查：{}",
+            a.display()
+        );
+        // 同一棵树反复取路径必须稳定（否则每次都重建索引）。
+        assert_eq!(a, CodeGraphIndex::path(&tree_a));
+        // 仍落在共享的 code_graph 目录下，便于一起清理。
+        assert!(a.parent().unwrap().ends_with(".latte/code_graph"));
+    }
+
+    /// 非 git 目录（`.git` 既不是文件也不是目录）按主仓处理。
+    #[test]
+    fn non_git_dir_uses_plain_index_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(CodeGraphIndex::path(dir.path()).ends_with("index.json"));
+    }
+
     #[test]
     fn lang_from_ext_maps_c_family() {
         assert_eq!(lang_from_ext("h"), Some("c"));
@@ -557,8 +667,14 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(normalize_scope(&cwd, "."), Some(".".to_string()));
         assert_eq!(normalize_scope(&cwd, ""), Some(".".to_string()));
-        assert_eq!(normalize_scope(&cwd, "./src/lib.c"), Some("src/lib.c".to_string()));
-        assert_eq!(normalize_scope(&cwd, "src/lib.c"), Some("src/lib.c".to_string()));
+        assert_eq!(
+            normalize_scope(&cwd, "./src/lib.c"),
+            Some("src/lib.c".to_string())
+        );
+        assert_eq!(
+            normalize_scope(&cwd, "src/lib.c"),
+            Some("src/lib.c".to_string())
+        );
         assert_eq!(normalize_scope(&cwd, "src/"), Some("src".to_string()));
     }
 
@@ -615,10 +731,19 @@ mod tests {
 
         // 绝对路径必须命中同样的结果（旧实现在这里返回 total=0）。
         let abs = dir.path().join("src/lib.c");
-        let (abs_lines, abs_total) =
-            query_signatures(dir.path(), abs.to_str().unwrap(), "function", None, 200, 12_000)
-                .unwrap();
-        assert_eq!(abs_total, 2, "absolute path must match same 2 functions: {abs_lines:?}");
+        let (abs_lines, abs_total) = query_signatures(
+            dir.path(),
+            abs.to_str().unwrap(),
+            "function",
+            None,
+            200,
+            12_000,
+        )
+        .unwrap();
+        assert_eq!(
+            abs_total, 2,
+            "absolute path must match same 2 functions: {abs_lines:?}"
+        );
         assert!(abs_lines.iter().any(|l| l.contains("do_alloc")));
         assert!(abs_lines.iter().any(|l| l.contains("do_free")));
 
@@ -627,8 +752,15 @@ mod tests {
         std::fs::write(outside.path().join("z.c"), "int z(void){return 0;}\n").unwrap();
         let zabs = outside.path().join("z.c");
         assert!(
-            query_signatures(dir.path(), zabs.to_str().unwrap(), "function", None, 200, 12_000)
-                .is_none(),
+            query_signatures(
+                dir.path(),
+                zabs.to_str().unwrap(),
+                "function",
+                None,
+                200,
+                12_000
+            )
+            .is_none(),
             "path outside repo must return None so caller falls back to live scan"
         );
     }
@@ -651,18 +783,25 @@ mod tests {
         match outcome {
             BuildOutcome::Built { files, symbols } => {
                 assert!(files >= 1, "expected >=1 file, got {files}");
-                assert!(symbols >= 2, "expected >=2 symbols (add + point), got {symbols}");
+                assert!(
+                    symbols >= 2,
+                    "expected >=2 symbols (add + point), got {symbols}"
+                );
             }
             other => panic!("expected Built, got {other:?}"),
         }
 
         // 索引落盘 + 可读回。
-        let idx: CodeGraphIndex =
-            serde_json::from_str(&std::fs::read_to_string(CodeGraphIndex::path(dir.path())).unwrap())
-                .unwrap();
+        let idx: CodeGraphIndex = serde_json::from_str(
+            &std::fs::read_to_string(CodeGraphIndex::path(dir.path())).unwrap(),
+        )
+        .unwrap();
         assert_eq!(idx.version, CodeGraphIndex::CURRENT_VERSION);
         let syms: Vec<&Symbol> = idx.files.values().flat_map(|f| &f.symbols).collect();
-        assert!(syms.iter().any(|s| s.sig.contains("add")), "index should contain add()");
+        assert!(
+            syms.iter().any(|s| s.sig.contains("add")),
+            "index should contain add()"
+        );
 
         // 第二次立即再建：无改动 → UpToDate。
         let again = build_or_update(dir.path()).await;
@@ -724,7 +863,10 @@ mod tests {
         assert_eq!(s.end_line, 0, "缺字段应为 0（未知）");
         assert_eq!(s.span(), "42", "跨度未知时只报起始行");
 
-        let s2 = Symbol { end_line: 50, ..s.clone() };
+        let s2 = Symbol {
+            end_line: 50,
+            ..s.clone()
+        };
         assert_eq!(s2.span(), "42-50");
         // end == start（单行定义）同样退化，避免 `42-42` 这种冗余。
         let s3 = Symbol { end_line: 42, ..s };
@@ -788,7 +930,10 @@ mod tests {
         std::fs::write(&file, "int one(void) { return 1; }\n").unwrap();
 
         // 首建：只有 one()。
-        assert!(matches!(build_or_update(dir.path()).await, BuildOutcome::Built { .. }));
+        assert!(matches!(
+            build_or_update(dir.path()).await,
+            BuildOutcome::Built { .. }
+        ));
         let (_l, total) = query_signatures(dir.path(), ".", "function", None, 200, 12_000).unwrap();
         assert_eq!(total, 1);
 
@@ -797,15 +942,29 @@ mod tests {
 
         // 修改代码：新增一个函数。等 >1s 让 mtime 明确超过 built_at。
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        std::fs::write(&file, "int one(void){return 1;}\nint two(void){return 2;}\n").unwrap();
+        std::fs::write(
+            &file,
+            "int one(void){return 1;}\nint two(void){return 2;}\n",
+        )
+        .unwrap();
 
         // 改动被检测 → 重建。
         let outcome = build_or_update(dir.path()).await;
-        assert!(matches!(outcome, BuildOutcome::Built { .. }), "modified file must trigger rebuild, got {outcome:?}");
+        assert!(
+            matches!(outcome, BuildOutcome::Built { .. }),
+            "modified file must trigger rebuild, got {outcome:?}"
+        );
 
         // 索引反映新符号：two() 现在也在。
-        let (lines, total) = query_signatures(dir.path(), ".", "function", None, 200, 12_000).unwrap();
-        assert_eq!(total, 2, "rebuild should include the new function: {lines:?}");
-        assert!(lines.iter().any(|l| l.contains("two")), "new symbol two() must be indexed");
+        let (lines, total) =
+            query_signatures(dir.path(), ".", "function", None, 200, 12_000).unwrap();
+        assert_eq!(
+            total, 2,
+            "rebuild should include the new function: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("two")),
+            "new symbol two() must be indexed"
+        );
     }
 }

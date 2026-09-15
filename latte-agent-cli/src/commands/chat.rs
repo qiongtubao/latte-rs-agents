@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use latte_agent_core::session::SessionManager;
 use tokio::sync::Semaphore;
 use tokio::time::timeout as tokio_timeout;
-use latte_agent_core::session::SessionManager;
 
 /// Max concurrent `delegate` tool calls per manager session.
 const DEFAULT_DELEGATE_CONCURRENCY: usize = 4;
@@ -45,7 +45,6 @@ macro_rules! ui_println {
     () => { ui_out("") };
     ($($arg:tt)*) => { ui_out(&format!($($arg)*)) };
 }
-
 
 /// Start an interactive REPL chat session with a single agent.
 #[derive(Args, Debug)]
@@ -212,7 +211,10 @@ impl ChatCmd {
         log.info(
             "session start",
             &[
-                ("role", self.role.clone().unwrap_or_else(|| "manager".into())),
+                (
+                    "role",
+                    self.role.clone().unwrap_or_else(|| "manager".into()),
+                ),
                 ("tier", self.tier.clone().unwrap_or_else(|| "auto".into())),
                 ("model_id", self.model_id.clone().unwrap_or_default()),
                 ("session_id", session_id.clone()),
@@ -220,15 +222,13 @@ impl ChatCmd {
         );
 
         let cli = build_cli_overrides(self)?;
-        let resolved = config_layer::load(
-            Some(&self.agents_config),
-            Some(&self.models_config),
-            cli,
-        )
-        .map_err(|e| {
-            log.error("config load failed", &[("error", e.to_string())]);
-            format!("failed to load configuration: {}", e)
-        })?;
+        let resolved =
+            config_layer::load(Some(&self.agents_config), Some(&self.models_config), cli).map_err(
+                |e| {
+                    log.error("config load failed", &[("error", e.to_string())]);
+                    format!("failed to load configuration: {}", e)
+                },
+            )?;
         // Emit the "config loaded" block BEFORE moving the fields
         // out of `resolved`. The block lists every file the loader
         // touched, then the per-role / per-model reverse map so the
@@ -259,9 +259,10 @@ impl ChatCmd {
         let initial_tier = if let Some(t) = &self.tier {
             parse_tier(t)?
         } else {
-            let template = merged.roles.get(&initial_role).ok_or_else(|| {
-                format!("role '{}' not found in config", initial_role)
-            })?;
+            let template = merged
+                .roles
+                .get(&initial_role)
+                .ok_or_else(|| format!("role '{}' not found in config", initial_role))?;
             parse_tier(&template.model_tier)?
         };
         let initial_primary = self.model_id.as_deref();
@@ -296,12 +297,15 @@ impl ChatCmd {
         {
             Ok(r) => r,
             Err(e) => {
-                log.error("build_runner failed", &[
-                    ("role", initial_role.clone()),
-                    ("tier", initial_tier.label().to_string()),
-                    ("model_id", initial_primary.unwrap_or("").to_string()),
-                    ("error", e.to_string()),
-                ]);
+                log.error(
+                    "build_runner failed",
+                    &[
+                        ("role", initial_role.clone()),
+                        ("tier", initial_tier.label().to_string()),
+                        ("model_id", initial_primary.unwrap_or("").to_string()),
+                        ("error", e.to_string()),
+                    ],
+                );
                 return Err(e);
             }
         };
@@ -341,7 +345,14 @@ impl ChatCmd {
             let history = load_session(path)
                 .map_err(|e| format!("failed to load resume file '{}': {}", path, e))?;
             session.load_history(history);
-            session.renderer.on_status(&format!("[resume] loaded {} messages from {}", session.runner.context().messages().len(), path)).await;
+            session
+                .renderer
+                .on_status(&format!(
+                    "[resume] loaded {} messages from {}",
+                    session.runner.context().messages().len(),
+                    path
+                ))
+                .await;
         }
         if !io::stdout().is_terminal() {
             // Non-interactive: read one message from stdin and reply once.
@@ -408,11 +419,10 @@ impl ChatCmd {
             let host = cli_advisor_host();
             *host.last_input.lock() = line.trim().to_string();
             // 同上：喂 monitor 的 last_user_text（D9 / session_facts 用）。
-            let _ = cli_session_event_tx().send(
-                latte_agent_core::controller::ChatEvent::UserMessage {
+            let _ =
+                cli_session_event_tx().send(latte_agent_core::controller::ChatEvent::UserMessage {
                     text: line.trim().to_string(),
-                },
-            );
+                });
             let line = {
                 let hints: Vec<String> = std::mem::take(&mut *host.hints.lock());
                 if hints.is_empty() {
@@ -506,7 +516,6 @@ struct ChatSession {
 }
 
 impl ChatSession {
-
     /// Look up the role's display icon (emoji) from the merged config.
     /// Falls back to a generic 🤖 if the role is not configured.
     fn role_icon(&self) -> &'static str {
@@ -545,8 +554,7 @@ impl ChatSession {
     /// turn fails so the user can resume with --resume.
     fn save_to_default(&self) -> Result<std::path::PathBuf, String> {
         let dir = default_save_dir();
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create {}: {}", dir.display(), e))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -582,7 +590,7 @@ impl ChatSession {
             role: MsgRole::User,
             content: vec![latte_ai::models::ContentPart::text(user_input)],
             tool_call_id: None,
-            tool_calls: None
+            tool_calls: None,
         }];
         // 生成期间显示进度。两条路：
         //
@@ -827,10 +835,8 @@ impl ChatSession {
             // 提问就永远看不见了。
             "/pending" => {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                let items = latte_agent_core::pending_ask::load_for_session(
-                    &cwd,
-                    &cli_session_id(),
-                );
+                let items =
+                    latte_agent_core::pending_ask::load_for_session(&cwd, &cli_session_id());
                 if items.is_empty() {
                     ui_out("没有待办弹框");
                 } else {
@@ -842,7 +848,9 @@ impl ChatSession {
                             if it.wf_id.is_empty() { "-" } else { &it.wf_id }
                         ));
                     }
-                    buf.push_str("\n注：CLI 暂不支持直接回答历史弹框，可用 /wf-resume <wf_id> 续跑触发重问");
+                    buf.push_str(
+                        "\n注：CLI 暂不支持直接回答历史弹框，可用 /wf-resume <wf_id> 续跑触发重问",
+                    );
                     ui_out(&buf);
                 }
             }
@@ -909,8 +917,7 @@ impl ChatSession {
                     ui_println!("usage: /role <id>");
                     return Ok(false);
                 };
-                let history: Vec<Message> =
-                    self.runner.context().messages().to_vec();
+                let history: Vec<Message> = self.runner.context().messages().to_vec();
                 let new_tier = self.tier;
                 match build_runner(
                     &self.merged,
@@ -940,11 +947,7 @@ impl ChatSession {
                             .collect();
                         self.runner = runner;
                         self.role_id = rid.clone();
-                        ui_println!(
-                            "Switched to role '{}' (tier {})",
-                            rid,
-                            self.tier.label()
-                        );
+                        ui_println!("Switched to role '{}' (tier {})", rid, self.tier.label());
                         if let Some(log) = &self.log {
                             log.info(
                                 "switch role",
@@ -1014,16 +1017,13 @@ impl ChatSession {
                             }
                             Err(e) => {
                                 if let Some(log) = &self.log {
-                                    log.error(
-                                        "switch tier failed",
-                                        &[("error", e.to_string())],
-                                    );
+                                    log.error("switch tier failed", &[("error", e.to_string())]);
                                 }
                                 ui_println!("error: {}", e)
                             }
                         }
                     }
-                     Err(e) => {
+                    Err(e) => {
                         if let Some(log) = &self.log {
                             log.warn("invalid tier", &[("input", t.to_string())]);
                             log.error("invalid tier", &[("error", e.to_string())]);
@@ -1120,15 +1120,12 @@ impl ChatSession {
             }
             "/tools" => {
                 let role = self.merged.roles.get(&self.role_id);
-                let tools: Vec<String> = role
-                    .map(|r| r.tools.clone())
-                    .unwrap_or_default();
+                let tools: Vec<String> = role.map(|r| r.tools.clone()).unwrap_or_default();
                 if tools.is_empty() {
                     ui_println!("role '{}' has no tools configured", self.role_id);
                 } else {
                     // 同 /roles：攒批，避免逐行重绘。
-                    let mut buf =
-                        format!("role '{}' tools ({}):", self.role_id, tools.len());
+                    let mut buf = format!("role '{}' tools ({}):", self.role_id, tools.len());
                     for t in &tools {
                         buf.push_str(&format!("\n  - {t}"));
                     }
@@ -1186,7 +1183,7 @@ async fn build_runner(
         role.system_prompt
             .push_str(latte_agent_core::controller::PLAN_MODE_PROMPT);
     }
-     let models = if let Some(id) = primary_id {
+    let models = if let Some(id) = primary_id {
         // `-m` flag: pin the head of the chain to a specific model
         // (matched by `id` first, then by `name` case-insensitive, so
         // `-m DeepSeek-v4-flash` and `-m deepseek-v4-flash` both
@@ -1194,9 +1191,11 @@ async fn build_runner(
         // the error here — never fall through to a different model
         // silently, since the operator asked for this one explicitly.
         let mut chain = Vec::with_capacity(1 + role.model_chain.len());
-        chain.push(resolver.resolve_id_or_name(id).map_err(|e| {
-            format!("{}", e)
-        })?);
+        chain.push(
+            resolver
+                .resolve_id_or_name(id)
+                .map_err(|e| format!("{}", e))?,
+        );
         // Append the role's declared fallback chain (which already
         // includes any global-only models injected by
         // `config_layer::load`).
@@ -1236,9 +1235,8 @@ async fn build_runner(
     } else {
         // No tools but still inject the env so the model sees real cwd
         // / host and doesn't hallucinate paths on direct-answer turns.
-        role.system_prompt.push_str(
-            &latte_agent_core::ground_truth::ground_truth_block(cwd),
-        );
+        role.system_prompt
+            .push_str(&latte_agent_core::ground_truth::ground_truth_block(cwd));
     }
     let agent = Agent::new_with_chain(
         role_id.to_string(),
@@ -1259,7 +1257,8 @@ async fn build_runner(
     // back to the chat log or session directory.
     let with_session = |r: AgentRunner| r.with_session_id(debug_flags.session_id.clone());
     let runner = if !role.allowed_tools.is_empty() {
-        let tm = build_tool_manager(&role.allowed_tools).await
+        let tm = build_tool_manager(&role.allowed_tools)
+            .await
             .map_err(|e| format!("tool setup failed: {}", e))?;
         // Register the delegate tool so the manager can dispatch
         // subtasks to specialist agents.
@@ -1269,35 +1268,35 @@ async fn build_runner(
         // （programmer / reviewer …）都能派活给别人，绕过了角色配置里
         // 刻意收紧的权限边界，而同一个角色在 UI 里根本没有这个工具。
         if role.allowed_tools.iter().any(|t| t == "delegate") {
-        register_delegate_tool(
-            &tm,
-            Arc::new(merged.clone()),
-            Arc::new(resolver.clone()),
-            default_params.clone(),
-            Arc::new(Semaphore::new(
-                std::env::var("LATTE_AGENT_DELEGATE_CONCURRENCY")
+            register_delegate_tool(
+                &tm,
+                Arc::new(merged.clone()),
+                Arc::new(resolver.clone()),
+                default_params.clone(),
+                Arc::new(Semaphore::new(
+                    std::env::var("LATTE_AGENT_DELEGATE_CONCURRENCY")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(DEFAULT_DELEGATE_CONCURRENCY),
+                )),
+                // Per-model timeout is resolved inside the closure after
+                // the specialist's model chain is known (model.timeout_secs
+                // > env > DEFAULT_DELEGATE_TIMEOUT_SECS). The env value
+                // is captured once here since the env doesn't change at
+                // runtime.
+                std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
                     .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(DEFAULT_DELEGATE_CONCURRENCY)
-            )),
-            // Per-model timeout is resolved inside the closure after
-            // the specialist's model chain is known (model.timeout_secs
-            // > env > DEFAULT_DELEGATE_TIMEOUT_SECS). The env value
-            // is captured once here since the env doesn't change at
-            // runtime.
-            std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok()),
-            // Pass the manager's real sink through — without this every
-            // specialist's HookFired / ToolExec / TurnEnd event was
-            // emitted to NullSink and never reached stdout / jsonl /
-            // the session index. The ScopedSink inside the delegate
-            // handler wraps this so specialist events get the right
-            // `role` field for the trace consumer.
-            Arc::clone(&sink),
-        )
-        .await
-        .map_err(|e| format!("delegate tool setup failed: {}", e))?;
+                    .and_then(|s| s.parse().ok()),
+                // Pass the manager's real sink through — without this every
+                // specialist's HookFired / ToolExec / TurnEnd event was
+                // emitted to NullSink and never reached stdout / jsonl /
+                // the session index. The ScopedSink inside the delegate
+                // handler wraps this so specialist events get the right
+                // `role` field for the trace consumer.
+                Arc::clone(&sink),
+            )
+            .await
+            .map_err(|e| format!("delegate tool setup failed: {}", e))?;
         }
         // Register the `workflow` tool for roles that declare it
         // (manager). The controller/UI path already did this; the REPL
@@ -1418,7 +1417,7 @@ async fn build_runner(
                 .with_hooks(Arc::clone(&hooks))
                 .with_agent_pause_gate(cli_pause_gate())
                 .with_stream_mode(cli_stream_mode())
-                .with_role(role_id)
+                .with_role(role_id),
         )
     };
     Ok((runner, role_id.to_string()))
@@ -1487,12 +1486,7 @@ fn ensure_cli_advisor_monitor(
     .with_review_settings(cfg.review_settings);
     let (_sub_id, sink) = cli_subsession_store().create(&cli_session_id(), "advisor");
     let engine = engine.with_subsession_sink(sink);
-    AdvisorMonitor::spawn_on_host(
-        cli_advisor_host(),
-        cfg,
-        engine,
-        watched_role.to_string(),
-    );
+    AdvisorMonitor::spawn_on_host(cli_advisor_host(), cfg, engine, watched_role.to_string());
 }
 
 /// 顶层 runner 的 sink：既有的 trace sink（CliRenderer / jsonl / index）
@@ -1556,8 +1550,7 @@ impl latte_agent_core::advisor_monitor::AdvisorHost for CliAdvisorHost {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         // CLI 没有 controller 的 input 通道要唤醒：置标志即可，
         // REPL 在轮次边界读它。
-        self.cancel
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async {})
     }
 }
@@ -1725,8 +1718,8 @@ fn first_line_brief(s: &str, max_chars: usize) -> String {
 /// `register_prompt` 会把 sender 克隆存进挂起表，未回答的挂起项让通道
 /// 永不关闭。此前 per-run 通道要靠"有界等待 + abort"兜底才不死锁；
 /// 会话级通道活到进程结束，根本不需要收尾，那类死锁不可能发生。
-fn cli_session_event_tx()
--> &'static tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent> {
+fn cli_session_event_tx(
+) -> &'static tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent> {
     static TX: std::sync::OnceLock<
         tokio::sync::broadcast::Sender<latte_agent_core::controller::ChatEvent>,
     > = std::sync::OnceLock::new();
@@ -1856,7 +1849,9 @@ struct AskRequest {
 
 /// 回答器：拿到一道题给出答案，`None` = 无法作答（stdin EOF 等）。
 type AskAnswerer = Arc<
-    dyn Fn(AskRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
+    dyn Fn(
+            AskRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>
         + Send
         + Sync,
 >;
@@ -1968,7 +1963,9 @@ fn spawn_cli_workflow_event_consumer_with(
                     wait,
                 }) => {
                     if !wait {
-                        ui_emit(&format!("⚠️ [{role_id}] 工具 `{tool_name}` 参数损坏: {error_detail}"));
+                        ui_emit(&format!(
+                            "⚠️ [{role_id}] 工具 `{tool_name}` 参数损坏: {error_detail}"
+                        ));
                         continue;
                     }
                     let mut prompt_text = format!(
@@ -1996,11 +1993,19 @@ fn spawn_cli_workflow_event_consumer_with(
                 }
                 // 进度可见性：没有这几行，用户无法区分「在等我回答」和
                 // 「还在干活」——这正是原来那个静默挂死难查的一半原因。
-                Ok(ChatEvent::WorkflowStep { step_id, index, total, role_id, .. }) => {
+                Ok(ChatEvent::WorkflowStep {
+                    step_id,
+                    index,
+                    total,
+                    role_id,
+                    ..
+                }) => {
                     // step 进度同时进历史与状态行：历史留痕，状态行给
                     // "现在在哪一步"的常驻可见性（分离模式的主要收益）。
                     ui_emit(&format!("  [step {index}/{total}] {step_id} → {role_id}"));
-                    ui_set_activity(Some(&format!("step {index}/{total} · {step_id} · {role_id}")));
+                    ui_set_activity(Some(&format!(
+                        "step {index}/{total} · {step_id} · {role_id}"
+                    )));
                 }
                 Ok(ChatEvent::WorkflowFinished { name, status, .. }) => {
                     ui_emit(&format!("  [workflow {name}] {status}"));
@@ -2009,16 +2014,24 @@ fn spawn_cli_workflow_event_consumer_with(
                 // advisor 的裁决气泡（monitor 的通道 B）。UI 里是一个
                 // 🦉 卡片，chat 里进历史区——原来这条事件在 CLI 完全
                 // 不可见，用户看不到 advisor 判了什么。
-                Ok(ChatEvent::RoleTurn { role_id, content, .. })
-                    if role_id == "advisor" =>
-                {
+                Ok(ChatEvent::RoleTurn {
+                    role_id, content, ..
+                }) if role_id == "advisor" => {
                     ui_emit(&format!("🦉 {}", content.trim()));
                 }
                 Ok(ChatEvent::DelegateStarted { to_role, task, .. }) => {
-                    ui_emit(&format!("  → delegate {to_role}: {}", first_line_brief(&task, 90)));
+                    ui_emit(&format!(
+                        "  → delegate {to_role}: {}",
+                        first_line_brief(&task, 90)
+                    ));
                     ui_set_activity(Some(&format!("delegate → {to_role}")));
                 }
-                Ok(ChatEvent::DelegateFinished { to_role, status, summary, .. }) => {
+                Ok(ChatEvent::DelegateFinished {
+                    to_role,
+                    status,
+                    summary,
+                    ..
+                }) => {
                     ui_emit(&format!(
                         "  ← delegate {to_role} {status} ({} chars)",
                         summary.chars().count()
@@ -2044,7 +2057,12 @@ fn spawn_cli_workflow_event_consumer_with(
                     ui_emit(&format!("⚠️ {}", first_line_brief(&message, 160)));
                 }
                 // 工具失败：D3 这类检测器靠它，用户也该看见。
-                Ok(ChatEvent::ToolError { role_id, tool_name, error, .. }) => {
+                Ok(ChatEvent::ToolError {
+                    role_id,
+                    tool_name,
+                    error,
+                    ..
+                }) => {
                     ui_emit(&format!(
                         "  ✗ [{role_id}] {tool_name}: {}",
                         first_line_brief(&error, 140)
@@ -2052,14 +2070,26 @@ fn spawn_cli_workflow_event_consumer_with(
                 }
                 // advisor 判 terminate 时中止本轮——不提示的话用户只看到
                 // 一个突然结束的轮次。
-                Ok(ChatEvent::AdvisorTerminated { role_id, reason, detector, .. }) => {
+                Ok(ChatEvent::AdvisorTerminated {
+                    role_id,
+                    reason,
+                    detector,
+                    ..
+                }) => {
                     let det = detector.unwrap_or_else(|| "?".into());
-                    ui_emit(&format!("🛑 advisor 中止 [{role_id} · {det}]: {}", reason.trim()));
+                    ui_emit(&format!(
+                        "🛑 advisor 中止 [{role_id} · {det}]: {}",
+                        reason.trim()
+                    ));
                     ui_set_activity(None);
                 }
                 // 软超时：轮次还活着，但预算已超——UI 会转成"继续/取消"提示。
                 Ok(ChatEvent::TimeoutWarning {
-                    role_id, elapsed_secs, soft_timeout_secs, hard_timeout_secs, ..
+                    role_id,
+                    elapsed_secs,
+                    soft_timeout_secs,
+                    hard_timeout_secs,
+                    ..
                 }) => {
                     ui_emit(&format!(
                         "⏳ [{role_id}] 已跑 {elapsed_secs}s（软超时 {soft_timeout_secs}s，硬中止 {hard_timeout_secs}s）"
@@ -2069,11 +2099,20 @@ fn spawn_cli_workflow_event_consumer_with(
                 // 编号清单并询问导入哪些（全导入/编号选择/跳过），选中
                 // 的直接写进 <cwd>/.latte/tasks/（与 ui-server 同一份
                 // board.json，见 task_import 闭环）。
-                Ok(ChatEvent::PlanProposed { role_id, plan_id, tasks }) => {
+                Ok(ChatEvent::PlanProposed {
+                    role_id,
+                    plan_id,
+                    tasks,
+                }) => {
                     cli_plan_proposed_import(&role_id, &plan_id, &tasks).await;
                 }
                 // `task_report` 工具的回报（同上，CLI 侧新接的工具）。
-                Ok(ChatEvent::TaskReport { task_id, result, summary, .. }) => {
+                Ok(ChatEvent::TaskReport {
+                    task_id,
+                    result,
+                    summary,
+                    ..
+                }) => {
                     ui_emit(&format!(
                         "📊 task_report {task_id} {result}: {}",
                         first_line_brief(&summary, 120)
@@ -2262,7 +2301,10 @@ async fn cli_plan_proposed_import(
     plan_id: &str,
     tasks: &[latte_agent_core::controller::PlanTask],
 ) {
-    let mut rendered = format!("\n📋 [{role_id}] 提交 {} 个任务候选（{plan_id}）：\n", tasks.len());
+    let mut rendered = format!(
+        "\n📋 [{role_id}] 提交 {} 个任务候选（{plan_id}）：\n",
+        tasks.len()
+    );
     for (i, t) in tasks.iter().enumerate() {
         rendered.push_str(&format!("  {}) {}\n", i + 1, t.title));
         for sub in &t.subtasks {
@@ -2272,7 +2314,8 @@ async fn cli_plan_proposed_import(
     // 非交互：stdin 不是终端且分离 UI 未起（管道 / --output json）——
     // 打印提示就返回，绝不 read（read 会偷走管道里给 REPL 的下一行）。
     if !io::stdin().is_terminal() && split_ui().lock().is_none() {
-        rendered.push_str("  （非交互终端：未导入。稍后可在 UI 看板弹窗勾选，或交互式 chat 里重跑）");
+        rendered
+            .push_str("  （非交互终端：未导入。稍后可在 UI 看板弹窗勾选，或交互式 chat 里重跑）");
         ui_emit(&rendered);
         return;
     }
@@ -2283,7 +2326,9 @@ async fn cli_plan_proposed_import(
         Ok(Some(l)) => l,
         // EOF / 读不到：按跳过处理（不阻塞）。
         _ => {
-            ui_emit("  （读不到输入，已跳过导入；任务仍在 .latte/tasks 之外的提案里，可在 UI 导入）");
+            ui_emit(
+                "  （读不到输入，已跳过导入；任务仍在 .latte/tasks 之外的提案里，可在 UI 导入）",
+            );
             return;
         }
     };
@@ -2320,7 +2365,10 @@ async fn cli_plan_proposed_import(
         match serde_json::from_value::<latte_agent_ui_server::tasks::ImportTask>(v) {
             Ok(it) => items.push(it),
             Err(e) => {
-                ui_emit(&format!("  ✗ 任务 {:?} 转换失败：{e}（整批未导入）", tasks[i].title));
+                ui_emit(&format!(
+                    "  ✗ 任务 {:?} 转换失败：{e}（整批未导入）",
+                    tasks[i].title
+                ));
                 return;
             }
         }
@@ -2372,7 +2420,11 @@ async fn register_workflow_tool(
         available
             .iter()
             .map(|(n, d)| {
-                if d.is_empty() { n.clone() } else { format!("{n} — {d}") }
+                if d.is_empty() {
+                    n.clone()
+                } else {
+                    format!("{n} — {d}")
+                }
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -2381,34 +2433,40 @@ async fn register_workflow_tool(
     let input_schema = ToolInputSchema {
         schema_type: latte_rs_agent_tools::types::SchemaType,
         properties: vec![
-            ("name".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some(format!("Workflow name. Available: {available_text}")),
-                enum_values: None,
-                minimum: None,
-                maximum: None,
-                min_length: None,
-                max_length: None,
-                items: None,
-                properties: None,
-                required: None,
-                additional_properties: None,
-                ref_: None,
-            }),
-            ("topic".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some("The task/topic the workflow should work on".into()),
-                enum_values: None,
-                minimum: None,
-                maximum: None,
-                min_length: None,
-                max_length: None,
-                items: None,
-                properties: None,
-                required: None,
-                additional_properties: None,
-                ref_: None,
-            }),
+            (
+                "name".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some(format!("Workflow name. Available: {available_text}")),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+            (
+                "topic".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some("The task/topic the workflow should work on".into()),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
         ]
         .into_iter()
         .collect(),
@@ -2600,9 +2658,7 @@ async fn register_delegate_tool(
                 let template = merged
                     .roles
                     .get(&role_id)
-                    .ok_or_else(|| {
-                        tool_err(format!("role '{}' not found in config", role_id))
-                    })?
+                    .ok_or_else(|| tool_err(format!("role '{}' not found in config", role_id)))?
                     .clone();
                 let role = template.resolve(&default_params).await.map_err(|e| {
                     tool_err(format!("failed to resolve role '{}': {}", role_id, e))
@@ -2610,9 +2666,7 @@ async fn register_delegate_tool(
                 let tier = role.default_model_tier;
                 let models = resolver
                     .resolve_chain(&role.id, tier, &role.model_chain)
-                    .map_err(|e| {
-                        tool_err(format!("no model for role '{}': {}", role_id, e))
-                })?;
+                    .map_err(|e| tool_err(format!("no model for role '{}': {}", role_id, e)))?;
                 // Resolve the per-specialist wall-clock timeout. Order:
                 //   1. `model.timeout_secs` from the model catalog (per-model
                 //      override — e.g. glm-5.2 sets 120s because it's slow
@@ -2631,7 +2685,9 @@ async fn register_delegate_tool(
                 // actually sent to the specialist.
                 eprintln!(
                     "  → delegating to {} (model={}, tier={})",
-                    role_id, models[0].id, tier.label(),
+                    role_id,
+                    models[0].id,
+                    tier.label(),
                 );
                 eprintln!("    task:");
                 for line in task.lines() {
@@ -2669,8 +2725,7 @@ async fn register_delegate_tool(
                 // 读不到专家的往返，终端上也看不到"派了谁、派了什么"。
                 // workflow 路径已经有这两样（子会话日志会落盘），
                 // delegate 路径是最后一处遗漏。
-                let (sub_id, sub_sink) =
-                    cli_subsession_store().create(&cli_session_id(), &role_id);
+                let (sub_id, sub_sink) = cli_subsession_store().create(&cli_session_id(), &role_id);
                 let _ = cli_session_event_tx().send(
                     latte_agent_core::controller::ChatEvent::DelegateStarted {
                         from_role: "manager".into(),
@@ -2707,9 +2762,7 @@ async fn register_delegate_tool(
                             state.clone(),
                             Some(sub_id.clone()),
                         )
-                        .map_err(|e| {
-                            tool_err(format!("register todo for '{}': {}", role_id, e))
-                        })?;
+                        .map_err(|e| tool_err(format!("register todo for '{}': {}", role_id, e)))?;
                     }
                     Some(state)
                 } else {
@@ -2732,17 +2785,20 @@ async fn register_delegate_tool(
                     role: MsgRole::User,
                     content: vec![latte_ai::models::ContentPart::text(task)],
                     tool_call_id: None,
-            tool_calls: None
+                    tool_calls: None,
                 }];
                 // specialists are already running).
-                let _permit = sem.acquire().await.map_err(|_| {
-                    tool_err("delegate pool shut down".into())
-                })?;
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|_| tool_err("delegate pool shut down".into()))?;
                 // Run the specialist with a wall-clock timeout.
                 let response = match tokio_timeout(
                     Duration::from_secs(timeout_s),
                     runner.run_turn(&msgs, None),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(resp)) => resp,
                     Ok(Err(e)) => {
                         eprintln!("  ← {} failed: {}", role_id, e);
@@ -2758,9 +2814,7 @@ async fn register_delegate_tool(
                                 wf_id: None,
                             },
                         );
-                        return Err(tool_err(format!(
-                            "delegate to '{}' failed: {}", role_id, e
-                        )));
+                        return Err(tool_err(format!("delegate to '{}' failed: {}", role_id, e)));
                     }
                     Err(_) => {
                         eprintln!("  ← {} timed out after {}s", role_id, timeout_s);
@@ -2977,7 +3031,6 @@ fn print_help() {
     );
 }
 
-
 /// Truncate a string for log display, keeping the head and adding an
 /// ellipsis when trimmed. Used so we don't dump multi-kilobyte model
 /// responses into a log file.
@@ -3016,24 +3069,17 @@ fn emit_config_loaded(log: &super::chatlog::ChatLog, sources: &config_layer::Res
 
     body.push(format!(
         "project_agents = {}",
-        sources
-            .project_agents
-            .as_deref()
-            .unwrap_or("(none)")
+        sources.project_agents.as_deref().unwrap_or("(none)")
     ));
     body.push(format!(
         "project_models = {}",
-        sources
-            .project_models
-            .as_deref()
-            .unwrap_or("(none)")
+        sources.project_models.as_deref().unwrap_or("(none)")
     ));
-    body.push(format!(
-        "global[{}]",
-        sources.global.len()
-    ));
+    body.push(format!("global[{}]", sources.global.len()));
     if sources.global.is_empty() {
-        body.push("  (none found; checked ~/.latte/models.{yaml,yml,toml} and ~/.latte/models.d/)".into());
+        body.push(
+            "  (none found; checked ~/.latte/models.{yaml,yml,toml} and ~/.latte/models.d/)".into(),
+        );
     } else {
         for src in &sources.global {
             body.push(format!("  {src}"));
@@ -3047,10 +3093,7 @@ fn emit_config_loaded(log: &super::chatlog::ChatLog, sources: &config_layer::Res
         }
     }
 
-    body.push(format!(
-        "roles[{}] -> file",
-        sources.role_files.len()
-    ));
+    body.push(format!("roles[{}] -> file", sources.role_files.len()));
     if sources.role_files.is_empty() {
         body.push("  (no role declared in any scanned file; using built-in defaults)".into());
     } else {
@@ -3059,12 +3102,12 @@ fn emit_config_loaded(log: &super::chatlog::ChatLog, sources: &config_layer::Res
         }
     }
 
-    body.push(format!(
-        "models[{}] -> file",
-        sources.model_files.len()
-    ));
+    body.push(format!("models[{}] -> file", sources.model_files.len()));
     if sources.model_files.is_empty() {
-        body.push("  (no model id extracted from any scanned file; YAML global models listed above)".into());
+        body.push(
+            "  (no model id extracted from any scanned file; YAML global models listed above)"
+                .into(),
+        );
     } else {
         for (id, files) in &sources.model_files {
             body.push(format!("  {id} <- {}", files.join(", ")));
@@ -3072,18 +3115,9 @@ fn emit_config_loaded(log: &super::chatlog::ChatLog, sources: &config_layer::Res
     }
 
     let header = [
-        (
-            "roles",
-            sources.role_files.len().to_string(),
-        ),
-        (
-            "models",
-            sources.model_files.len().to_string(),
-        ),
-        (
-            "global",
-            sources.global.len().to_string(),
-        ),
+        ("roles", sources.role_files.len().to_string()),
+        ("models", sources.model_files.len().to_string()),
+        ("global", sources.global.len().to_string()),
     ];
     log.block("info", "config loaded", &header, &body);
 }
@@ -3300,8 +3334,7 @@ fn spawn_input_thread() {
 ///
 /// 共享 `AtomicBool`：`AgentRunner` 每次调用前读它，所以运行中改也生效。
 fn cli_stream_mode() -> Arc<std::sync::atomic::AtomicBool> {
-    static M: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
-        std::sync::OnceLock::new();
+    static M: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> = std::sync::OnceLock::new();
     M.get_or_init(|| Arc::new(std::sync::atomic::AtomicBool::new(true)))
         .clone()
 }
@@ -3312,9 +3345,28 @@ fn cli_stream_mode() -> Arc<std::sync::atomic::AtomicBool> {
 /// （比如 `/usr/local/lib` 这样的路径）也拒掉。
 fn is_known_command(line: &str) -> bool {
     const CMDS: &[&str] = &[
-        "/exit", "/quit", "/help", "/roles", "/role", "/model", "/status", "/tools",
-        "/clear", "/history", "/save", "/load", "/pause", "/resume", "/cancel",
-        "/pending", "/stream", "/fork", "/tasks", "/wf", "/wf-runs", "/wf-resume",
+        "/exit",
+        "/quit",
+        "/help",
+        "/roles",
+        "/role",
+        "/model",
+        "/status",
+        "/tools",
+        "/clear",
+        "/history",
+        "/save",
+        "/load",
+        "/pause",
+        "/resume",
+        "/cancel",
+        "/pending",
+        "/stream",
+        "/fork",
+        "/tasks",
+        "/wf",
+        "/wf-runs",
+        "/wf-resume",
         "/planmode",
     ];
     let head = line.split_whitespace().next().unwrap_or("");
@@ -3554,7 +3606,9 @@ fn cmd_list_workflow_runs(cwd: &Path) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             // checkpoint 落盘名形如 `wf-<workflow>-<micros>.jsonl`。
-            let Some(id) = name.strip_suffix(".jsonl") else { continue };
+            let Some(id) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
             let when = e
                 .metadata()
                 .and_then(|m| m.modified())
@@ -3674,9 +3728,7 @@ mod tests {
 
     /// 预设答案的回答器（替代读 stdin）。
     fn canned_answerer(answer: Option<&'static str>) -> AskAnswerer {
-        Arc::new(move |_req: AskRequest| {
-            Box::pin(async move { answer.map(|s| s.to_string()) })
-        })
+        Arc::new(move |_req: AskRequest| Box::pin(async move { answer.map(|s| s.to_string()) }))
     }
 
     /// PlanTask → ImportTask 的 serde 往返转换（CLI 导入闭环用）：
@@ -3691,6 +3743,8 @@ mod tests {
             task_type: Some("feature".into()),
             workflow: None,
             paths: vec!["src/".into()],
+            // 依赖引用写的是同批任务的标题（新任务还没有 id）。
+            depends_on: vec!["补单测".into()],
             subtasks: vec![latte_agent_core::controller::PlanTask {
                 title: "补单测".into(),
                 description: String::new(),
@@ -3699,6 +3753,7 @@ mod tests {
                 task_type: None,
                 workflow: None,
                 paths: vec![],
+                depends_on: vec![],
                 subtasks: vec![],
             }],
         };
@@ -3709,6 +3764,11 @@ mod tests {
         assert_eq!(it.priority, Some(1));
         assert_eq!(it.labels, vec!["core".to_string()]);
         assert_eq!(it.paths, vec!["src/".to_string()]);
+        assert_eq!(
+            it.depends_on,
+            vec!["补单测".to_string()],
+            "depends_on 必须无损透传到 ImportTask，否则拆分产出的顺序约束在导入时全丢"
+        );
         assert_eq!(it.subtasks.len(), 1);
         assert_eq!(it.subtasks[0].title, "补单测");
         assert_eq!(it.subtasks[0].priority, None);
@@ -3874,7 +3934,10 @@ mod tests {
         );
         // session_id 必须带上：`ask` 的落盘补发按 (cwd, session_id) 归属，
         // UI 侧一直有，CLI 侧此前是 None。
-        assert!(ctx.session_id.is_some(), "CLI workflow ctx 必须带 session_id");
+        assert!(
+            ctx.session_id.is_some(),
+            "CLI workflow ctx 必须带 session_id"
+        );
 
         let id = "choice-cli-ctx-1";
         let ev = choice_event(id, true, false);
@@ -3901,14 +3964,10 @@ mod tests {
     #[test]
     fn cli_registers_every_orchestration_tool_the_ui_does() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let controller = std::fs::read_to_string(
-            root.join("latte-agent-core/src/controller.rs"),
-        )
-        .expect("controller.rs");
-        let chat = std::fs::read_to_string(
-            root.join("latte-agent-cli/src/commands/chat.rs"),
-        )
-        .expect("chat.rs");
+        let controller = std::fs::read_to_string(root.join("latte-agent-core/src/controller.rs"))
+            .expect("controller.rs");
+        let chat = std::fs::read_to_string(root.join("latte-agent-cli/src/commands/chat.rs"))
+            .expect("chat.rs");
 
         // UI 侧的真源：controller 里所有 `allowed_tools ... t == "X"` 分支。
         let mut ui_tools: Vec<String> = Vec::new();
@@ -3988,7 +4047,10 @@ mod tests {
             ctx.subsession_store.is_some(),
             "CLI workflow ctx 必须带 subsession_store（对齐 UI 的 debug 可观测）"
         );
-        assert!(ctx.session_id.is_some(), "必须带 session_id（ask 落盘归属）");
+        assert!(
+            ctx.session_id.is_some(),
+            "必须带 session_id（ask 落盘归属）"
+        );
         // advisor_gate 跟随配置开关，与 UI 的 `advisor.enabled()` 同源。
         assert_eq!(
             ctx.advisor_gate.is_some(),
@@ -4006,8 +4068,7 @@ mod tests {
     #[test]
     fn cli_delegate_is_observable_like_the_ui() {
         let chat = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/commands/chat.rs"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
         )
         .expect("chat.rs");
         let body = chat
@@ -4083,10 +4144,7 @@ mod tests {
             .expect("应收到自己发的事件")
             .expect("通道不该关闭");
         assert!(
-            matches!(
-                got,
-                latte_agent_core::controller::ChatEvent::Status { .. }
-            ),
+            matches!(got, latte_agent_core::controller::ChatEvent::Status { .. }),
             "subscribe/event_sender 必须成对指向同一通道"
         );
 
@@ -4120,10 +4178,7 @@ mod tests {
         .expect("chat.rs");
         // 先切掉 test 模块再扫：否则本测试自己的字面量会被算进匹配
         // （任何搜索串都出现在这段源码里，实测恒定多数出 1）。
-        let chat = full
-            .split("#[cfg(test)]")
-            .next()
-            .expect("非测试部分");
+        let chat = full.split("#[cfg(test)]").next().expect("非测试部分");
         let body = chat
             .split("fn cli_top_level_sink(")
             .nth(1)
@@ -4137,7 +4192,8 @@ mod tests {
         assert_eq!(
             // 匹配含 `.with_sink(` 的完整调用：只数真实接线，
             // 不会把本测试源码里的裸名算进去（实测数出 3 而非 2）。
-            chat.matches(".with_sink(cli_top_level_sink(&sink))").count(),
+            chat.matches(".with_sink(cli_top_level_sink(&sink))")
+                .count(),
             2,
             "带工具/无工具两个 runner 分支都要用 cli_top_level_sink"
         );
@@ -4332,7 +4388,8 @@ mod tests {
             "Paused 必须反映到状态行，否则用户只觉得卡死了"
         );
 
-        tx.send(latte_agent_core::controller::ChatEvent::Resumed).unwrap();
+        tx.send(latte_agent_core::controller::ChatEvent::Resumed)
+            .unwrap();
         let mut cleared = false;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4416,8 +4473,14 @@ mod tests {
         // 三处长任务：顶层 turn、/wf、/wf-resume。
         for (what, needle) in [
             ("顶层 turn", "run_cancellable(self.runner.run_turn"),
-            ("/wf", "run_cancellable(latte_agent_core::workflow::run_workflow("),
-            ("/wf-resume", "run_cancellable(latte_agent_core::workflow::run_workflow_resume("),
+            (
+                "/wf",
+                "run_cancellable(latte_agent_core::workflow::run_workflow(",
+            ),
+            (
+                "/wf-resume",
+                "run_cancellable(latte_agent_core::workflow::run_workflow_resume(",
+            ),
         ] {
             assert!(
                 src.contains(needle),
@@ -4452,8 +4515,17 @@ mod tests {
         let help_body = help_body.split("\n}").next().unwrap_or(help_body);
 
         for cmd in [
-            "/pause", "/resume", "/cancel", "/pending", "/stream", "/fork", "/tasks",
-            "/wf", "/wf-runs", "/wf-resume", "/planmode",
+            "/pause",
+            "/resume",
+            "/cancel",
+            "/pending",
+            "/stream",
+            "/fork",
+            "/tasks",
+            "/wf",
+            "/wf-runs",
+            "/wf-resume",
+            "/planmode",
         ] {
             assert!(
                 help_body.contains(cmd),
@@ -4560,7 +4632,6 @@ impl Drop for ChatSession {
     }
 }
 
-
 // =========================================================================
 // HIL blackboard chat (Task 3.2): drive a multi-role session via
 // SessionManager JSON when --task-id is given. The plain `chat` flow above
@@ -4587,8 +4658,11 @@ async fn run_hil_chat(
     if !worktree_root.exists() {
         return Err(format!(
             "worktree for task '{}' not found at {}. Run `latte-agent run --task-id {}` first.",
-            task_id, worktree_root.display(), task_id
-        ).into());
+            task_id,
+            worktree_root.display(),
+            task_id
+        )
+        .into());
     }
 
     // 2. Open or create the SessionManager
@@ -4597,26 +4671,42 @@ async fn run_hil_chat(
         let raw = std::fs::read_to_string(mgr.session_path())?;
         let record: latte_agent_core::session::SessionRecord = serde_json::from_str(&raw)?;
         mgr = SessionManager::from_record(record, worktree_root.clone());
-        renderer.on_session_info(&mgr.record().task_id, &format!("{:?}", mgr.state()), mgr.record().current_turn).await;
+        renderer
+            .on_session_info(
+                &mgr.record().task_id,
+                &format!("{:?}", mgr.state()),
+                mgr.record().current_turn,
+            )
+            .await;
         if mgr.state() == latte_agent_core::session::SessionState::Paused {
             mgr.resume()?;
             renderer.on_resumed().await;
-            renderer.on_status(&format!("session timestamp: {}", mgr.record().updated_at)).await;
+            renderer
+                .on_status(&format!("session timestamp: {}", mgr.record().updated_at))
+                .await;
         }
     } else {
         // Fresh session: require --initial-prompt
         let prompt = match initial_prompt {
             Some(p) => p,
-            None => return Err(format!(
-                "no session for task '{}' — pass --initial-prompt to start one",
-                task_id
-            ).into()),
+            None => {
+                return Err(format!(
+                    "no session for task '{}' — pass --initial-prompt to start one",
+                    task_id
+                )
+                .into())
+            }
         };
         let bb = latte_agent_core::workspace::Blackboard::new(worktree_root.join("plan.md"));
-        bb.write(&format!("# Task: {}\n\n## Initial prompt\n\n{}\n", task_id, prompt))?;
+        bb.write(&format!(
+            "# Task: {}\n\n## Initial prompt\n\n{}\n",
+            task_id, prompt
+        ))?;
         mgr.persist()?;
         renderer.on_session_info(&task_id, "Created", 0).await;
-        renderer.on_status(&format!("roles: {}", roles.join(", "))).await;
+        renderer
+            .on_status(&format!("roles: {}", roles.join(", ")))
+            .await;
     }
     // 3. Build the shared `Arc<Mutex<SessionManager>>` (HIL v1.1 phase 6).
     // The `ask_human` tool handler needs a shared reference to the
@@ -4636,21 +4726,26 @@ async fn run_hil_chat(
         .or_else(|| {
             let cwd = std::env::current_dir().ok()?;
             let cand = cwd.join(".latte");
-            if cand.exists() { Some(cand) } else { None }
+            if cand.exists() {
+                Some(cand)
+            } else {
+                None
+            }
         })
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latte")))
         .unwrap_or_else(|| PathBuf::from(".latte"));
-    let trace_path = latte_home.join("traces").join(format!("hil-{}.jsonl", task_id));
+    let trace_path = latte_home
+        .join("traces")
+        .join(format!("hil-{}.jsonl", task_id));
     let index_path = latte_home.join("sessions").join(format!("{}.idx", task_id));
-    let jsonl_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
-        latte_agent_core::trace::JsonlSink::new(trace_path),
-    );
-    let index_sink: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
-        latte_agent_core::trace::IndexSink::new(index_path),
-    );
-    let fanout: Arc<dyn latte_agent_core::trace::TraceSink> = Arc::new(
-        latte_agent_core::trace::FanoutSink::new(vec![jsonl_sink, index_sink]),
-    );
+    let jsonl_sink: Arc<dyn latte_agent_core::trace::TraceSink> =
+        Arc::new(latte_agent_core::trace::JsonlSink::new(trace_path));
+    let index_sink: Arc<dyn latte_agent_core::trace::TraceSink> =
+        Arc::new(latte_agent_core::trace::IndexSink::new(index_path));
+    let fanout: Arc<dyn latte_agent_core::trace::TraceSink> =
+        Arc::new(latte_agent_core::trace::FanoutSink::new(vec![
+            jsonl_sink, index_sink,
+        ]));
     let sink_arc = session_arc.clone();
     tokio::task::spawn_blocking(move || {
         sink_arc.blocking_lock().with_sink(fanout);
@@ -4676,11 +4771,9 @@ async fn run_hil_chat(
     // runtime` panics. The scheduler is then reconfigured for the
     // user-supplied `max_rounds` and `session_token_budget`.
     let scheduler_arc = session_arc.clone();
-    let mut scheduler = tokio::task::spawn_blocking(move || {
-        RoundScheduler::new(scheduler_arc)
-    })
-    .await
-    .map_err(|e| format!("scheduler join error: {}", e))??;
+    let mut scheduler = tokio::task::spawn_blocking(move || RoundScheduler::new(scheduler_arc))
+        .await
+        .map_err(|e| format!("scheduler join error: {}", e))??;
     scheduler.max_rounds = max_rounds;
     scheduler.supervisor = Supervisor::new(SupervisorConfig {
         session_token_budget,
@@ -4694,12 +4787,8 @@ async fn run_hil_chat(
     // `run_turn` directly. v1.1's `no_ask_human` flag suppresses
     // the per-specialist `ask_human` tool registration when set.
     let cli = build_cli_overrides(cmd)?;
-    let resolved = config_layer::load(
-        Some(&cmd.agents_config),
-        Some(&cmd.models_config),
-        cli,
-    )
-    .map_err(|e| format!("failed to load configuration: {}", e))?;
+    let resolved = config_layer::load(Some(&cmd.agents_config), Some(&cmd.models_config), cli)
+        .map_err(|e| format!("failed to load configuration: {}", e))?;
     let merged = resolved.config;
     let resolver = resolved.resolver;
     let default_params = GenerateParams::default();
@@ -4808,12 +4897,18 @@ async fn run_hil_repl(
                 if let Some(role_id) = parse_ask_human_role(&mgr) {
                     // Pause_reason format: "ask_human: <role> asked: <question>"
                     let question = parse_ask_human_question(&mgr);
-                    renderer.on_status(&format!("[ask_human] {} asked: {}", role_id, question)).await;
-                    renderer.on_status("[ask_human] Type your reply and press Enter to resume the session:").await;
+                    renderer
+                        .on_status(&format!("[ask_human] {} asked: {}", role_id, question))
+                        .await;
+                    renderer
+                        .on_status(
+                            "[ask_human] Type your reply and press Enter to resume the session:",
+                        )
+                        .await;
                     print!("> ");
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
-                    drop(mgr);  // release lock before blocking on stdin
+                    drop(mgr); // release lock before blocking on stdin
 
                     let mut reply_line = String::new();
                     let n = stdin.lock().read_line(&mut reply_line)?;
@@ -4834,7 +4929,12 @@ async fn run_hil_repl(
                     // Resumed -> Running so the per-role `state() != Running`
                     // check below lets the round proceed.
                     let _ = mgr.start();
-                    renderer.on_status(&format!("[ask_human] session resumed with reply: {} chars", reply.len())).await;
+                    renderer
+                        .on_status(&format!(
+                            "[ask_human] session resumed with reply: {} chars",
+                            reply.len()
+                        ))
+                        .await;
                     // Fall through: the for round_num loop continues. The
                     // session is now Running, and on the next iteration
                     // mgr.state() != Paused, so the rest of the loop runs.
@@ -4876,7 +4976,7 @@ async fn run_hil_repl(
         let trimmed = line.trim();
         if !trimmed.is_empty() {
             match parse_repl_line(trimmed) {
-                Ok(ReplInput::Empty) => {},
+                Ok(ReplInput::Empty) => {}
                 Ok(ReplInput::Cmd { name, arg }) if name == "pause" => {
                     let mut mgr = session_arc.lock().await;
                     match arg {
@@ -4884,10 +4984,14 @@ async fn run_hil_repl(
                             // Per-role pause (HIL v1.4): flag one role and
                             // keep the session running for the others.
                             if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
-                                renderer.on_error(&format!("[error: unknown role '{}']", role_id)).await;
+                                renderer
+                                    .on_error(&format!("[error: unknown role '{}']", role_id))
+                                    .await;
                             } else {
                                 mgr.pause_role(&role_id, &format!("user /pause {}", role_id))?;
-                                renderer.on_status(&format!("[role paused: {}]", role_id)).await;
+                                renderer
+                                    .on_status(&format!("[role paused: {}]", role_id))
+                                    .await;
                             }
                         }
                         None => {
@@ -4904,20 +5008,35 @@ async fn run_hil_repl(
                         Some(role_id) => {
                             // Per-role resume (HIL v1.4).
                             if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
-                                renderer.on_error(&format!("[error: unknown role '{}']", role_id)).await;
+                                renderer
+                                    .on_error(&format!("[error: unknown role '{}']", role_id))
+                                    .await;
                             } else if mgr.is_role_paused(&role_id) {
                                 mgr.resume_role(&role_id)?;
-                                renderer.on_status(&format!("[role resumed: {}]", role_id)).await;
+                                renderer
+                                    .on_status(&format!("[role resumed: {}]", role_id))
+                                    .await;
                             } else {
-                                renderer.on_status(&format!("[role '{}' is not paused]", role_id)).await;
+                                renderer
+                                    .on_status(&format!("[role '{}' is not paused]", role_id))
+                                    .await;
                             }
                         }
                         None => {
                             let paused = mgr.paused_roles();
                             if paused.is_empty() {
-                                renderer.on_status("[no individually-paused roles — use /resume <role>]").await;
+                                renderer
+                                    .on_status(
+                                        "[no individually-paused roles — use /resume <role>]",
+                                    )
+                                    .await;
                             } else {
-                                renderer.on_status(&format!("[paused roles: {} — use /resume <role>]", paused.join(", "))).await;
+                                renderer
+                                    .on_status(&format!(
+                                        "[paused roles: {} — use /resume <role>]",
+                                        paused.join(", ")
+                                    ))
+                                    .await;
                             }
                         }
                     }
@@ -4938,14 +5057,28 @@ async fn run_hil_repl(
                     let mgr = session_arc.lock().await;
                     let paused = mgr.paused_roles();
                     if paused.is_empty() {
-                        renderer.on_status(&format!("[roles: {}]", scheduler.order.join(", "))).await;
+                        renderer
+                            .on_status(&format!("[roles: {}]", scheduler.order.join(", ")))
+                            .await;
                     } else {
-                        renderer.on_status(&format!("[roles: {} | paused: {}]", scheduler.order.join(", "), paused.join(", "))).await;
+                        renderer
+                            .on_status(&format!(
+                                "[roles: {} | paused: {}]",
+                                scheduler.order.join(", "),
+                                paused.join(", ")
+                            ))
+                            .await;
                     }
                 }
                 Ok(ReplInput::Cmd { name, arg: _ }) if name == "rounds" => {
                     let mgr = session_arc.lock().await;
-                    renderer.on_status(&format!("[round: {} / {}]", mgr.record().current_turn, scheduler.max_rounds)).await;
+                    renderer
+                        .on_status(&format!(
+                            "[round: {} / {}]",
+                            mgr.record().current_turn,
+                            scheduler.max_rounds
+                        ))
+                        .await;
                 }
                 Ok(ReplInput::Cmd { name, arg: _ }) => {
                     renderer.on_status(&format!("[unknown /{} — known: pause [role], resume [role], quit, roles, rounds]", name)).await;
@@ -4953,16 +5086,22 @@ async fn run_hil_repl(
                 Ok(ReplInput::RoleInject { role_id, message }) => {
                     let mgr = session_arc.lock().await;
                     if !mgr.record().roles.iter().any(|r| r.role_id == role_id) {
-                        renderer.on_error(&format!("[error: unknown role '{}']", role_id)).await;
+                        renderer
+                            .on_error(&format!("[error: unknown role '{}']", role_id))
+                            .await;
                     } else {
                         queue_inject(mgr.worktree_root(), &role_id, &message)?;
-                        renderer.on_status(&format!("[{} queue: +1 message]", role_id)).await;
+                        renderer
+                            .on_status(&format!("[{} queue: +1 message]", role_id))
+                            .await;
                     }
                 }
                 Ok(ReplInput::ManagerInput { message }) => {
                     let mut mgr = session_arc.lock().await;
                     mgr.append_to_role("manager", Message::user(message.clone()))?;
-                    renderer.on_status(&format!("[manager turn enqueued: {} chars]", message.len())).await;
+                    renderer
+                        .on_status(&format!("[manager turn enqueued: {} chars]", message.len()))
+                        .await;
                 }
                 Err(e) => renderer.on_error(&format!("[parse error: {:?}]", e)).await,
             }
@@ -4986,7 +5125,12 @@ async fn run_hil_repl(
                 // time (HIL v1.3). Any other state (Paused / Done /
                 // Failed) skips the round.
                 if mgr.state() != SessionState::Running {
-                    renderer.on_status(&format!("[session not running — current state: {:?}]", mgr.state())).await;
+                    renderer
+                        .on_status(&format!(
+                            "[session not running — current state: {:?}]",
+                            mgr.state()
+                        ))
+                        .await;
                     // RoundStarted 已在本轮开头发出：被暂停/终止打断的
                     // 轮次也要补 RoundEnded，保持 trace 里两者成对
                     // （v1.1 契约：每轮结束一次 + 每次中途暂停一次——
@@ -5000,16 +5144,20 @@ async fn run_hil_repl(
                 // the global state check above — `continue` (this role)
                 // rather than `continue 'rounds` (whole round).
                 if mgr.is_role_paused(&role_id) {
-                    renderer.on_status(&format!("[{} round {}: skipped — role paused]", role_id, round_num)).await;
+                    renderer
+                        .on_status(&format!(
+                            "[{} round {}: skipped — role paused]",
+                            role_id, round_num
+                        ))
+                        .await;
                     continue;
                 }
                 // 统一实现见 latte_agent_core::inject_queue。旧的内联版本**不检查
                 // 空内容**，空队列文件会注入一条只有 [INJECTED] 头、没有正文的
                 // 消息（controller 那份内联版检查了，两边行为不一致）。
-                if let Some(content) = latte_agent_core::inject_queue::drain(
-                    mgr.worktree_root(),
-                    &role_id,
-                ) {
+                if let Some(content) =
+                    latte_agent_core::inject_queue::drain(mgr.worktree_root(), &role_id)
+                {
                     let synth = Message {
                         role: MsgRole::User,
                         content: vec![latte_ai::models::ContentPart::text(
@@ -5025,9 +5173,12 @@ async fn run_hil_repl(
                 if !plan_slice.is_empty() {
                     let synth = Message {
                         role: MsgRole::User,
-                            content: vec![latte_ai::models::ContentPart::text(format!("[PLAN SLICE]\n{}", plan_slice))],
-                            tool_call_id: None,
-                            tool_calls: None
+                        content: vec![latte_ai::models::ContentPart::text(format!(
+                            "[PLAN SLICE]\n{}",
+                            plan_slice
+                        ))],
+                        tool_call_id: None,
+                        tool_calls: None,
                     };
                     mgr.append_to_role(&role_id, synth).ok();
                 }
@@ -5065,11 +5216,23 @@ async fn run_hil_repl(
 
             // Drive the LLM. We pass no new messages — everything
             // the model needs is in the replayed context.
-            renderer.on_status(&format!("[{} round {}: calling LLM...]", role_id, round_num)).await;
+            renderer
+                .on_status(&format!(
+                    "[{} round {}: calling LLM...]",
+                    role_id, round_num
+                ))
+                .await;
             let turn_result = runner.run_turn(&[], None).await;
             let new_assistant_text = match turn_result {
                 Ok(text) => {
-                    renderer.on_status(&format!("[{} round {}: ok, {} chars]", role_id, round_num, text.len())).await;
+                    renderer
+                        .on_status(&format!(
+                            "[{} round {}: ok, {} chars]",
+                            role_id,
+                            round_num,
+                            text.len()
+                        ))
+                        .await;
                     text
                 }
                 Err(e) => {
@@ -5080,7 +5243,9 @@ async fn run_hil_repl(
                     // operator sees what happened, and leave the
                     // assistant message empty so the role history
                     // doesn't grow on a hard failure.
-                    renderer.on_error(&format!("[{} round {}: error: {}]", role_id, round_num, e)).await;
+                    renderer
+                        .on_error(&format!("[{} round {}: error: {}]", role_id, round_num, e))
+                        .await;
                     String::new()
                 }
             };
@@ -5097,10 +5262,15 @@ async fn run_hil_repl(
                         role: MsgRole::Assistant,
                         content: vec![latte_ai::models::ContentPart::text(new_assistant_text)],
                         tool_call_id: None,
-            tool_calls: None
+                        tool_calls: None,
                     };
                     if let Err(e) = mgr.append_to_role(&role_id, assistant_msg) {
-                        renderer.on_error(&format!("[{} round {}: failed to append assistant turn: {}]", role_id, round_num, e)).await;
+                        renderer
+                            .on_error(&format!(
+                                "[{} round {}: failed to append assistant turn: {}]",
+                                role_id, round_num, e
+                            ))
+                            .await;
                     }
                 }
             }
@@ -5113,7 +5283,9 @@ async fn run_hil_repl(
                 }
                 let mgr = session_arc.lock().await;
                 mgr.emit_round_ended(round_num);
-                renderer.on_status(&format!("[supervisor pause: {}]", reason)).await;
+                renderer
+                    .on_status(&format!("[supervisor pause: {}]", reason))
+                    .await;
                 continue 'rounds;
             }
         }
@@ -5131,11 +5303,7 @@ async fn run_hil_repl(
     Ok(())
 }
 
-fn queue_inject(
-    worktree_root: &Path,
-    role_id: &str,
-    message: &str,
-) -> std::io::Result<()> {
+fn queue_inject(worktree_root: &Path, role_id: &str, message: &str) -> std::io::Result<()> {
     let dir = worktree_root.join(".latte").join("inject");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.txt", role_id));
@@ -5147,7 +5315,6 @@ fn queue_inject(
     writeln!(f, "{}", message)?;
     Ok(())
 }
-
 
 // =====================================================================
 // ask_human tool registration (HIL v1.1 phase 6)

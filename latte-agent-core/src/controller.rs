@@ -21,7 +21,9 @@ use latte_ai::params::GenerateParams;
 use latte_rs_agent_tools::types::{PropertyType, ToolInputProperty};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use crate::advisor_monitor::{AdvisorMonitorConfig, AdvisorPauseGate, AdvisorReviewEngine, GateConfig};
+use crate::advisor_monitor::{
+    AdvisorMonitorConfig, AdvisorPauseGate, AdvisorReviewEngine, GateConfig,
+};
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
 use crate::error::AgentError;
@@ -48,31 +50,53 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
     match e {
         // Config 系：user 可修
         AgentError::Config(s) => ModelErrorKind::Config { message: s.clone() },
-        AgentError::Template(role, _) => ModelErrorKind::Config { message: format!("template render: {role}") },
-        AgentError::TemplateNotFound(p) => ModelErrorKind::Config { message: format!("template not found: {p}") },
-        AgentError::RoleNotFound(r) => ModelErrorKind::Config { message: format!("role not found: {r}") },
-        AgentError::ModelNotFound(m) => ModelErrorKind::Config { message: format!("model not found: {m}") },
-        AgentError::ModelResolutionFailed { role, tier, reason } => {
-            ModelErrorKind::Config { message: format!("resolution failed for {role}/{tier}: {reason}") }
-        }
+        AgentError::Template(role, _) => ModelErrorKind::Config {
+            message: format!("template render: {role}"),
+        },
+        AgentError::TemplateNotFound(p) => ModelErrorKind::Config {
+            message: format!("template not found: {p}"),
+        },
+        AgentError::RoleNotFound(r) => ModelErrorKind::Config {
+            message: format!("role not found: {r}"),
+        },
+        AgentError::ModelNotFound(m) => ModelErrorKind::Config {
+            message: format!("model not found: {m}"),
+        },
+        AgentError::ModelResolutionFailed { role, tier, reason } => ModelErrorKind::Config {
+            message: format!("resolution failed for {role}/{tier}: {reason}"),
+        },
         AgentError::InvalidParam(s) => ModelErrorKind::Config { message: s.clone() },
         // AI client：转发 helper 的分类
         AgentError::AiClient(ai_err) => ModelErrorKind::from(ai_err),
         // 工具 / 上层
-        AgentError::Tool(s) => ModelErrorKind::Other { message: format!("tool: {s}") },
-        AgentError::TokenBudgetExceeded { .. } => ModelErrorKind::Config { message: "token budget exceeded".into() },
-        AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other { message: format!("tool loop: {tool}") },
-        AgentError::Orchestration(s) => ModelErrorKind::Other { message: format!("orchestration: {s}") },
+        AgentError::Tool(s) => ModelErrorKind::Other {
+            message: format!("tool: {s}"),
+        },
+        AgentError::TokenBudgetExceeded { .. } => ModelErrorKind::Config {
+            message: "token budget exceeded".into(),
+        },
+        AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other {
+            message: format!("tool loop: {tool}"),
+        },
+        AgentError::Orchestration(s) => ModelErrorKind::Other {
+            message: format!("orchestration: {s}"),
+        },
         AgentError::ModelsUnavailable { tried, .. } => {
             // 告诉前端这是"全部模型都不可用"，已不是单点错误
-            ModelErrorKind::Other { message: format!("all models unavailable (tried {})", tried.len()) }
+            ModelErrorKind::Other {
+                message: format!("all models unavailable (tried {})", tried.len()),
+            }
         }
-        AgentError::HookAborted { hook, .. } => ModelErrorKind::Other { message: format!("hook aborted: {hook}") },
-        AgentError::Io(io) => ModelErrorKind::Other { message: format!("io: {io}") },
+        AgentError::HookAborted { hook, .. } => ModelErrorKind::Other {
+            message: format!("hook aborted: {hook}"),
+        },
+        AgentError::Io(io) => ModelErrorKind::Other {
+            message: format!("io: {io}"),
+        },
         // Advisor 终止（gate D5/D6 重试耗尽 或 LLM 复审返回 Terminate）。
-        AgentError::AdvisorTerminated { reason, detector } => {
-            ModelErrorKind::Other { message: format!("advisor terminated ({}): {}", detector, reason) }
-        }
+        AgentError::AdvisorTerminated { reason, detector } => ModelErrorKind::Other {
+            message: format!("advisor terminated ({}): {}", detector, reason),
+        },
     }
 }
 
@@ -222,7 +246,6 @@ pub(crate) fn is_only_think_blocks(content: &str) -> bool {
     !content.trim().is_empty() && strip_think_blocks_inner(content).is_none()
 }
 
-
 /// 判定分派/subagent 产出是否为"空"：空串或只剩模板壳
 /// （`<response></response>`）。空产出不能算成功——下游会把空串
 /// 当结论穿线（日志事故：architect 空返回被判 ok 进了讨论记录）。
@@ -282,7 +305,11 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                     });
                 }
             }
-            crate::trace::TraceEvent::ModelCallSlow { meta, model_id, elapsed_secs } => {
+            crate::trace::TraceEvent::ModelCallSlow {
+                meta,
+                model_id,
+                elapsed_secs,
+            } => {
                 let _ = self.event_tx.send(ChatEvent::Status {
                     message: format!(
                         "⏳ {} 的模型调用（{}）已超过 {}s 未返回——多为厂商慢速生成或大上下文，不是卡死，仍在等待",
@@ -291,10 +318,7 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                 });
             }
             crate::trace::TraceEvent::ToolExec {
-                meta,
-                name,
-                status,
-                ..
+                meta, name, status, ..
             } => match status {
                 crate::trace::ToolStatus::Ok(result) => {
                     let _ = self.event_tx.send(ChatEvent::ToolResult {
@@ -356,11 +380,15 @@ pub enum ChatEvent {
         sub_id: Option<String>,
     },
     /// Informational / status message (replaces `eprintln!` / `println!`).
-    Status { message: String },
+    Status {
+        message: String,
+    },
     /// 用户发出的一条消息（send 路径；`/` 开头的斜杠命令不产生此事件）。
     /// 回放（UI 的 event_log / ui-sessions 落盘）靠它恢复用户气泡——
     /// 此前全部变体都是 agent 侧产出，回放里看不到用户自己发的内容。
-    UserMessage { text: String },
+    UserMessage {
+        text: String,
+    },
     /// Prompt indicator (replaces `"👔 manager · deepseek-v4-flash › "`).
     Prompt {
         icon: String,
@@ -368,30 +396,48 @@ pub enum ChatEvent {
         model_id: String,
     },
     /// Session paused (by user or supervisor).
-    Paused { reason: String },
+    Paused {
+        reason: String,
+    },
     /// Session resumed.
     Resumed,
     /// Round started (multi-role mode).
-    RoundStarted { round: u32 },
+    RoundStarted {
+        round: u32,
+    },
     /// Round ended (multi-role mode).
-    RoundEnded { round: u32 },
+    RoundEnded {
+        round: u32,
+    },
     /// A role has started working.
     /// `sub_id` 标识本次运行所属的 subsession（delegate / workflow
     /// speaker 路径填真实值；主 session 角色的 turn 为 `None`）。
     /// 同一 role 可被并行 workflow 步同时委派，前端按
     /// `(role_id, sub_id)` 配对起止事件，不能只用 role_id。
-    RoleStarted { role_id: String, detail: String, sub_id: Option<String> },
+    RoleStarted {
+        role_id: String,
+        detail: String,
+        sub_id: Option<String>,
+    },
     /// A role has finished working. `sub_id` 与对应的
     /// [`ChatEvent::RoleStarted`] 一致。
-    RoleFinished { role_id: String, detail: String, sub_id: Option<String> },
+    RoleFinished {
+        role_id: String,
+        detail: String,
+        sub_id: Option<String>,
+    },
     /// A single role was individually paused (HIL v1.4, multi-role
     /// mode). Distinct from `Paused`, which halts the whole session.
     /// The paused role is skipped each round until `RoleResumed`.
     /// Drives the UI's per-role paused badge / toggle button.
-    RolePaused { role_id: String },
+    RolePaused {
+        role_id: String,
+    },
     /// A single individually-paused role was resumed. Counterpart to
     /// `RolePaused`.
-    RoleResumed { role_id: String },
+    RoleResumed {
+        role_id: String,
+    },
     /// Session finished (aborted or quit).
     Done,
     RoleList {
@@ -498,7 +544,11 @@ pub enum ChatEvent {
     },
     /// 角色调用 generate_image 生成的图片。path 是 UI server 的
     /// `/api/images/<file>` URL（web UI 直接渲染 <img>）。
-    ImageGenerated { role_id: String, path: String, prompt: String },
+    ImageGenerated {
+        role_id: String,
+        path: String,
+        prompt: String,
+    },
     /// 角色调用 `plan` 工具提交的任务候选清单。manager 在
     /// `implementation_plan` workflow 跑完（或手持一份具体任务清单）
     /// 后调 `plan`，把结构化任务交给用户在弹窗里勾选导入任务看板。
@@ -600,7 +650,9 @@ pub enum ChatEvent {
     },
     /// plan mode（只读规划模式）开关变化。UI 据此亮/灭徽章；事件进
     /// 归档与回放，UI 刷新后徽章状态自然恢复。
-    PlanModeChanged { active: bool },
+    PlanModeChanged {
+        active: bool,
+    },
     /// Turn soft-timeout warning: the current turn has been running
     /// longer than the configured soft timeout but is still alive.
     /// The UI uses this to surface a "继续等待 / 终止当前任务" prompt
@@ -745,6 +797,24 @@ pub struct PlanTask {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub paths: Vec<String>,
+    /// 依赖的任务：写**同一份清单里其他任务的标题**（新任务还没有 id），
+    /// 或已存在的看板任务 id。看板据此排序执行：依赖全部 done 才派发。
+    ///
+    /// 这是表达「先写测试再实现」这类顺序约束的**唯一**通道。同一棵树
+    /// 里的任务默认**并行**执行（只要 paths 互不重叠），不写依赖就等于
+    /// 声明"可以同时开工"。此前 workflow 产出的 `dependencies` 字段不在
+    /// schema 内、被静默丢弃，顺序信息全部丢失。
+    #[serde(
+        default,
+        alias = "deps",
+        alias = "depends",
+        alias = "dependencies",
+        alias = "blocked_by",
+        alias = "after",
+        deserialize_with = "empty_str_as_empty_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub depends_on: Vec<String>,
     /// 子任务，同构，任意深度嵌套（任务树）。空则不序列化。
     #[serde(
         default,
@@ -959,10 +1029,7 @@ fn lenient_string_list(v: &serde_json::Value) -> Vec<String> {
     }
     match v {
         // 长字符串：按换行 / 分号（中英文）切分。
-        serde_json::Value::String(s) => s
-            .split(['\n', ';', '；'])
-            .filter_map(norm)
-            .collect(),
+        serde_json::Value::String(s) => s.split(['\n', ';', '；']).filter_map(norm).collect(),
         serde_json::Value::Array(a) => a
             .iter()
             .flat_map(|item| match item {
@@ -1196,9 +1263,7 @@ pub struct SessionResumeOutcome {
 
 impl SessionResumeOutcome {
     pub fn is_live(self) -> bool {
-        self.gate_paused_for_ms.is_some()
-            || self.driver_resumed
-            || self.driver_command_pending
+        self.gate_paused_for_ms.is_some() || self.driver_resumed || self.driver_command_pending
     }
 }
 
@@ -1311,10 +1376,7 @@ impl ChatController {
     }
 
     /// Start the driver loop. Returns a receiver that gets all events.
-    pub async fn spawn(
-        &self,
-        config: ControllerConfig,
-    ) -> broadcast::Receiver<ChatEvent> {
+    pub async fn spawn(&self, config: ControllerConfig) -> broadcast::Receiver<ChatEvent> {
         // Reset session-level cancel flag so a previously-aborted
         // session does not instantly kill the new driver loop.
         self.cancel_flag.store(false, Ordering::SeqCst);
@@ -1353,7 +1415,13 @@ impl ChatController {
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
-                if let ChatEvent::WorkflowFinished { name, wf_id, status, summary } = ev {
+                if let ChatEvent::WorkflowFinished {
+                    name,
+                    wf_id,
+                    status,
+                    summary,
+                } = ev
+                {
                     let mut slot = state_slot.write();
                     if status == "ok" {
                         *slot = None;
@@ -1801,7 +1869,10 @@ pub fn compute_waves<S: ContractAccess>(steps: &[S]) -> WavePlan {
     while !remaining.is_empty() {
         let wave_steps: Vec<usize> = remaining.drain(..).collect();
         visited += wave_steps.len();
-        plan.waves.push(Wave { index: plan.waves.len(), steps: wave_steps });
+        plan.waves.push(Wave {
+            index: plan.waves.len(),
+            steps: wave_steps,
+        });
 
         for &wave_idx in plan.waves.last().unwrap().steps.iter() {
             for (next_idx, deps) in depends_on.iter().enumerate() {
@@ -1816,18 +1887,15 @@ pub fn compute_waves<S: ContractAccess>(steps: &[S]) -> WavePlan {
     }
 
     if visited < steps.len() {
-        let orphans: Vec<usize> = (0..steps.len())
-            .filter(|i| in_degree[*i] > 0)
-            .collect();
-        plan.waves.push(Wave { index: plan.waves.len(), steps: orphans });
+        let orphans: Vec<usize> = (0..steps.len()).filter(|i| in_degree[*i] > 0).collect();
+        plan.waves.push(Wave {
+            index: plan.waves.len(),
+            steps: orphans,
+        });
     }
 
     plan
 }
-
-
-
-
 
 /// Run a turn with cancellation support. Polls `run_turn_gated` at 500ms
 /// ticks and checks `cancel_flag` (session abort) + `turn_cancel_flag`
@@ -1872,9 +1940,9 @@ async fn run_turn_cancellable(
     drop(fut);
     match outcome {
         TurnOutcome::Done(r) => r,
-        TurnOutcome::SessionCancelled => {
-            Err(AgentError::Orchestration("session cancelled by user".into()))
-        }
+        TurnOutcome::SessionCancelled => Err(AgentError::Orchestration(
+            "session cancelled by user".into(),
+        )),
         TurnOutcome::TurnCancelled => {
             Err(AgentError::Orchestration("turn cancelled by user".into()))
         }
@@ -1972,10 +2040,10 @@ async fn run_multi_role_loop(
         Ok(root) => root,
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: format!("无法解析仓库根目录: {e}"),
-                            sub_id: None,
-                        });
+                kind: None,
+                message: format!("无法解析仓库根目录: {e}"),
+                sub_id: None,
+            });
             return;
         }
     };
@@ -1983,10 +2051,10 @@ async fn run_multi_role_loop(
         Some(id) => id.clone(),
         None => {
             let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: "multi-role 模式需要 task_id".into(),
-                            sub_id: None,
-                        });
+                kind: None,
+                message: "multi-role 模式需要 task_id".into(),
+                sub_id: None,
+            });
             return;
         }
     };
@@ -2000,10 +2068,10 @@ async fn run_multi_role_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
-                                kind: None,
-                                message: format!("读取 session 文件失败: {e}"),
-                                sub_id: None,
-                            });
+                    kind: None,
+                    message: format!("读取 session 文件失败: {e}"),
+                    sub_id: None,
+                });
                 return;
             }
         };
@@ -2011,10 +2079,10 @@ async fn run_multi_role_loop(
             Ok(r) => r,
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
-                                kind: None,
-                                message: format!("解析 session JSON 失败: {e}"),
-                                sub_id: None,
-                            });
+                    kind: None,
+                    message: format!("解析 session JSON 失败: {e}"),
+                    sub_id: None,
+                });
                 return;
             }
         };
@@ -2030,10 +2098,10 @@ async fn run_multi_role_loop(
         if session_mgr.state() == SessionState::Paused {
             if let Err(e) = session_mgr.resume() {
                 let _ = event_tx.send(ChatEvent::Error {
-                                kind: None,
-                                message: format!("resume 失败: {e}"),
-                                sub_id: None,
-                            });
+                    kind: None,
+                    message: format!("resume 失败: {e}"),
+                    sub_id: None,
+                });
                 return;
             }
             let _ = event_tx.send(ChatEvent::Status {
@@ -2045,28 +2113,28 @@ async fn run_multi_role_loop(
             Some(p) => p.clone(),
             None => {
                 let _ = event_tx.send(ChatEvent::Error {
-                                kind: None,
-                                message: format!("task '{task_id}' 无 session，需要 initial_prompt"),
-                                sub_id: None,
-                            });
+                    kind: None,
+                    message: format!("task '{task_id}' 无 session，需要 initial_prompt"),
+                    sub_id: None,
+                });
                 return;
             }
         };
         let bb = crate::workspace::Blackboard::new(worktree_root.join("plan.md"));
         if let Err(e) = bb.write(&format!("# {task_id}\n\n{prompt}")) {
             let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: format!("写入 plan.md 失败: {e}"),
-                            sub_id: None,
-                        });
+                kind: None,
+                message: format!("写入 plan.md 失败: {e}"),
+                sub_id: None,
+            });
             return;
         }
         if let Err(e) = session_mgr.persist() {
             let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: format!("持久化 session 失败: {e}"),
-                            sub_id: None,
-                        });
+                kind: None,
+                message: format!("持久化 session 失败: {e}"),
+                sub_id: None,
+            });
             return;
         }
         let _ = event_tx.send(ChatEvent::Status {
@@ -2082,29 +2150,26 @@ async fn run_multi_role_loop(
 
     // Build RoundScheduler
     let scheduler_arc = session_arc.clone();
-    let mut scheduler = match tokio::task::spawn_blocking(move || {
-        RoundScheduler::new(scheduler_arc)
-    })
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: format!("scheduler init error: {e}"),
-                            sub_id: None,
-                        });
-            return;
-        }
-        Err(e) => {
-            let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: format!("scheduler join error: {e}"),
-                            sub_id: None,
-                        });
-            return;
-        }
-    };
+    let mut scheduler =
+        match tokio::task::spawn_blocking(move || RoundScheduler::new(scheduler_arc)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
+                    message: format!("scheduler init error: {e}"),
+                    sub_id: None,
+                });
+                return;
+            }
+            Err(e) => {
+                let _ = event_tx.send(ChatEvent::Error {
+                    kind: None,
+                    message: format!("scheduler join error: {e}"),
+                    sub_id: None,
+                });
+                return;
+            }
+        };
     scheduler.max_rounds = config.max_rounds;
     scheduler.supervisor = Supervisor::new(SupervisorConfig {
         session_token_budget: config.session_token_budget,
@@ -2145,12 +2210,7 @@ async fn run_multi_role_loop(
             .initial_tier
             .as_ref()
             .map(|t| t.label().to_string())
-            .or_else(|| {
-                merged
-                    .roles
-                    .get(role_id)
-                    .map(|r| r.model_tier.clone())
-            })
+            .or_else(|| merged.roles.get(role_id).map(|r| r.model_tier.clone()))
             .unwrap_or_else(|| "standard".to_string());
         let tier = ModelTier::parse(&tier_str).unwrap_or(ModelTier::Standard);
 
@@ -2184,10 +2244,10 @@ async fn run_multi_role_loop(
             }
             Err(e) => {
                 let _ = event_tx.send(ChatEvent::Error {
-                                kind: None,
-                                message: format!("构建 role '{role_id}' runner 失败: {e}"),
-                                sub_id: None,
-                            });
+                    kind: None,
+                    message: format!("构建 role '{role_id}' runner 失败: {e}"),
+                    sub_id: None,
+                });
                 return;
             }
         }
@@ -2383,7 +2443,10 @@ async fn run_multi_role_loop(
                         });
                     } else {
                         let _ = event_tx.send(ChatEvent::Status {
-                            message: format!("[paused roles: {} — use /resume <role>]", paused.join(", ")),
+                            message: format!(
+                                "[paused roles: {} — use /resume <role>]",
+                                paused.join(", ")
+                            ),
                         });
                     }
                     continue 'rounds;
@@ -2439,10 +2502,23 @@ async fn run_multi_role_loop(
                 cmd => {
                     let parts: Vec<&str> = line.splitn(2, ' ').collect();
                     let topic = parts.get(1).unwrap_or(&"").trim();
-                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), turn_cancel_flag.clone(), advisor_pause.clone()).await {
+                    match run_workflow_command(
+                        cmd,
+                        topic,
+                        &config,
+                        &event_tx,
+                        cancel_flag.clone(),
+                        agent_pause_gate.clone(),
+                        turn_cancel_flag.clone(),
+                        advisor_pause.clone(),
+                    )
+                    .await
+                    {
                         Ok(Some(summary)) => {
                             let _ = event_tx.send(ChatEvent::Status {
-                                message: format!("Workflow '{cmd}' 完成。结果已交给 manager 处理。"),
+                                message: format!(
+                                    "Workflow '{cmd}' 完成。结果已交给 manager 处理。"
+                                ),
                             });
                             let inject_dir = worktree_root.join(".latte").join("inject");
                             let _ = std::fs::create_dir_all(&inject_dir);
@@ -2470,8 +2546,7 @@ async fn run_multi_role_loop(
                             // 输入——advisor 的纠正 hint 悬在队列里无人
                             // 消费（实测实锤：gate 失败后 advisor
                             // 的「过度编排」intervene 悬空，50 分钟零产出）。
-                            let hints: Vec<String> =
-                                advisor_hints.lock().drain(..).collect();
+                            let hints: Vec<String> = advisor_hints.lock().drain(..).collect();
                             let hints_text = if hints.is_empty() {
                                 String::new()
                             } else {
@@ -2533,11 +2608,8 @@ async fn run_multi_role_loop(
                 });
             }
             let mut mgr = session_arc.lock().await;
-            mgr.append_to_role(
-                "manager",
-                Message::user(line.clone()),
-            )
-            .ok();
+            mgr.append_to_role("manager", Message::user(line.clone()))
+                .ok();
             let _ = event_tx.send(ChatEvent::Status {
                 message: format!("[manager turn enqueued: {} chars]", line.len()),
             });
@@ -2577,18 +2649,14 @@ async fn run_multi_role_loop(
                 // rather than `continue 'rounds` (whole round).
                 if mgr.is_role_paused(role_id) {
                     let _ = event_tx.send(ChatEvent::Status {
-                        message: format!(
-                            "[{role_id} round {round_num}: skipped — role paused]"
-                        ),
+                        message: format!("[{role_id} round {round_num}: skipped — role paused]"),
                     });
                     continue;
                 }
 
                 // Drain inject queue（统一实现见 crate::inject_queue —— 这段
                 // 逻辑此前有四份拷贝且行为不一致）
-                if let Some(content) =
-                    crate::inject_queue::drain(mgr.worktree_root(), role_id)
-                {
+                if let Some(content) = crate::inject_queue::drain(mgr.worktree_root(), role_id) {
                     let synth = Message::user(crate::inject_queue::format_injected(&content));
                     mgr.append_to_role(role_id, synth).ok();
                 }
@@ -2641,46 +2709,45 @@ async fn run_multi_role_loop(
             // 与它对齐。
             let usage_before = runner.total_usage().clone();
 
-            let new_assistant_text = match run_turn_cancellable(
-                runner,
-                &[],
-                &cancel_flag,
-                &turn_cancel_flag,
-            ).await {
-                Ok(text) => {
-                    let _ = event_tx.send(ChatEvent::RoleFinished {
-                        role_id: role_id.clone(),
-                        detail: format!("round {round_num}: ok, {} chars", text.len()),
-                        sub_id: None,
-                    });
-                    text
-                }
-                Err(e) => {
-                    let _ = event_tx.send(ChatEvent::Status {
-                        message: format!("[{role_id} round {round_num}: error: {e}]"),
-                    });
-                    let _ = event_tx.send(ChatEvent::RoleFinished {
-                        role_id: role_id.clone(),
-                        detail: format!("round {round_num}: error: {e}"),
-                        sub_id: None,
-                    });
-                    // Advisor gate 重试耗尽：发 AdvisorTerminated，
-                    // 本轮不产出 RoleTurn（String::new() 下方跳过）。
-                    if let AgentError::AdvisorTerminated { reason, detector } = &e {
-                        let _ = event_tx.send(ChatEvent::AdvisorTerminated {
+            let new_assistant_text =
+                match run_turn_cancellable(runner, &[], &cancel_flag, &turn_cancel_flag).await {
+                    Ok(text) => {
+                        let _ = event_tx.send(ChatEvent::RoleFinished {
                             role_id: role_id.clone(),
-                            reason: reason.clone(),
-                            detector: Some(detector.clone()),
+                            detail: format!("round {round_num}: ok, {} chars", text.len()),
                             sub_id: None,
                         });
+                        text
                     }
-                    String::new()
-                }
-            };
+                    Err(e) => {
+                        let _ = event_tx.send(ChatEvent::Status {
+                            message: format!("[{role_id} round {round_num}: error: {e}]"),
+                        });
+                        let _ = event_tx.send(ChatEvent::RoleFinished {
+                            role_id: role_id.clone(),
+                            detail: format!("round {round_num}: error: {e}"),
+                            sub_id: None,
+                        });
+                        // Advisor gate 重试耗尽：发 AdvisorTerminated，
+                        // 本轮不产出 RoleTurn（String::new() 下方跳过）。
+                        if let AgentError::AdvisorTerminated { reason, detector } = &e {
+                            let _ = event_tx.send(ChatEvent::AdvisorTerminated {
+                                role_id: role_id.clone(),
+                                reason: reason.clone(),
+                                detector: Some(detector.clone()),
+                                sub_id: None,
+                            });
+                        }
+                        String::new()
+                    }
+                };
 
             if !new_assistant_text.is_empty() {
                 let _ = event_tx.send(ChatEvent::Status {
-                    message: format!("[{role_id} round {round_num}: ok, {} chars]", new_assistant_text.len()),
+                    message: format!(
+                        "[{role_id} round {round_num}: ok, {} chars]",
+                        new_assistant_text.len()
+                    ),
                 });
 
                 let _ = event_tx.send(ChatEvent::RoleTurn {
@@ -2704,7 +2771,8 @@ async fn run_multi_role_loop(
             // 把**本轮增量**交给 supervisor（它内部 `+=` 累加）。见上面
             // `usage_before` 的注释：传累计值会让预算按 O(N²) 提前打爆。
             let usage_after = runner.total_usage();
-            let tokens_used = (usage_after.input_tokens + usage_after.output_tokens
+            let tokens_used = (usage_after.input_tokens
+                + usage_after.output_tokens
                 + usage_after.thinking_tokens)
                 .saturating_sub(
                     usage_before.input_tokens
@@ -2728,7 +2796,6 @@ async fn run_multi_role_loop(
                 continue 'rounds;
             }
         }
-
 
         // Round ended
 
@@ -2769,7 +2836,11 @@ async fn run_single_role_loop(
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
     let default_params = &config.default_params;
-    let role_id = config.roles.first().cloned().unwrap_or_else(|| "manager".into());
+    let role_id = config
+        .roles
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "manager".into());
 
     let tier = config
         .initial_tier
@@ -2803,15 +2874,15 @@ async fn run_single_role_loop(
         agent_pause_gate.clone(),
         config.stream_mode.clone(),
     )
-        .await
+    .await
     {
         Ok(r) => r,
         Err(e) => {
             let _ = event_tx.send(ChatEvent::Error {
-                            kind: None,
-                            message: format!("构建 runner 失败: {e}"),
-                            sub_id: None,
-                        });
+                kind: None,
+                message: format!("构建 runner 失败: {e}"),
+                sub_id: None,
+            });
             return;
         }
     };
@@ -2866,7 +2937,10 @@ async fn run_single_role_loop(
     });
 
     let _ = event_tx.send(ChatEvent::SessionInfo {
-        task_id: config.task_id.clone().unwrap_or_else(|| "single-role".into()),
+        task_id: config
+            .task_id
+            .clone()
+            .unwrap_or_else(|| "single-role".into()),
         state: "Running".into(),
         turn: 0,
         roles: vec![RoleInfo {
@@ -2889,488 +2963,488 @@ async fn run_single_role_loop(
         }
 
         tokio::select! {
-            input = input_rx.recv() => {
-                match input {
-                    None => break,
-                    Some(ControllerInput::Input(text)) => {
-                        let trimmed = text.trim().to_string();
-                        // 空输入直接丢弃，回到等输入 —— 这里原本是个
-                        // **空语句块**（`if trimmed.is_empty() {}`），本意
-                        // 显然是 continue（多角色路径写的就是
-                        // `if !trimmed.is_empty() { break trimmed }`）。
-                        // 落空的后果：前端误发空串/纯空白也会发
-                        // UserMessage 并真跑一轮，而部分厂商对 text 为空
-                        // 的消息直接 400，这一轮白报错。
-                        if trimmed.is_empty() {
-                            continue;
-                        }
+                    input = input_rx.recv() => {
+                        match input {
+                            None => break,
+                            Some(ControllerInput::Input(text)) => {
+                                let trimmed = text.trim().to_string();
+                                // 空输入直接丢弃，回到等输入 —— 这里原本是个
+                                // **空语句块**（`if trimmed.is_empty() {}`），本意
+                                // 显然是 continue（多角色路径写的就是
+                                // `if !trimmed.is_empty() { break trimmed }`）。
+                                // 落空的后果：前端误发空串/纯空白也会发
+                                // UserMessage 并真跑一轮，而部分厂商对 text 为空
+                                // 的消息直接 400，这一轮白报错。
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
 
-                        // workflow slash 失败时合成的善后输入：Some 时不
-                        // continue，落到下面的正常 turn 路径直接开一轮
-                        // （实测实锤：失败只发 Status 回等输入，
-                        // advisor 的纠正 hint 悬空，50 分钟零产出）。
-                        let mut synthetic_followup: Option<String> = None;
-                        if trimmed.starts_with('/') {
-                            let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
-                            let cmd = parts[0];
-                            match cmd {
-                                "/exit" | "/quit" => break,
-                                "/help" => {
-                                    let _ = event_tx.send(ChatEvent::Status {
-                                        message: "Commands: /role <id>  /model <tier>  /roles  /planmode [on|off]  /clear  /status  /tools  /history  /save <file>  /load <file>  /help  /exit".into(),
-                                    });
-                                }
-                                // plan mode（只读规划模式）：无参 = 翻转；
-                                // on/off 显式设定。广播 PlanModeChanged
-                                // （UI 徽章）；实际工具收敛在下一个 turn
-                                // 边界重建 runner 时生效（见 Input 臂开头）。
-                                "/planmode" => {
-                                    let cur = plan_mode.load(Ordering::SeqCst);
-                                    let next = match parts.get(1).map(|s| s.trim()) {
-                                        Some("on") => true,
-                                        Some("off") => false,
-                                        _ => !cur,
-                                    };
-                                    set_plan_mode_flag(&plan_mode, event_tx, next);
-                                    let _ = event_tx.send(ChatEvent::Status {
-                                        message: if next {
-                                            "[plan mode 已开启：只做只读探索与方案设计，产出走 plan 工具提交审批]".into()
-                                        } else {
-                                            "[plan mode 已关闭：恢复正常工具集]".into()
-                                        },
-                                    });
-                                }
-                                "/roles" => {
-                                    let ids: Vec<&String> = merged.roles.keys().collect();
-                                    let roles_info: Vec<RoleInfo> = ids.iter().map(|id| {
-                                        let tpl = merged.roles.get(*id).unwrap();
-                                        RoleInfo { id: (*id).clone(), name: tpl.name.clone(), icon: tpl.icon.clone() }
-                                    }).collect();
-                                    let _ = event_tx.send(ChatEvent::RoleList { roles: roles_info });
-                                }
-                                "/role" => {
-                                    let Some(new_role) = parts.get(1) else {
-                                        let _ = event_tx.send(ChatEvent::Status { message: "usage: /role <id>".into() });
-                                        continue;
-                                    };
-                                    let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
-                                        Ok((mut new_runner, rid)) => {
-                                            for m in history { new_runner.context_mut().push(m); }
-                                            runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
-                                            current_role = rid.clone();
-                                            let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
-                                            let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
-                                            let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
-                                            let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                                // workflow slash 失败时合成的善后输入：Some 时不
+                                // continue，落到下面的正常 turn 路径直接开一轮
+                                // （实测实锤：失败只发 Status 回等输入，
+                                // advisor 的纠正 hint 悬空，50 分钟零产出）。
+                                let mut synthetic_followup: Option<String> = None;
+                                if trimmed.starts_with('/') {
+                                    let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+                                    let cmd = parts[0];
+                                    match cmd {
+                                        "/exit" | "/quit" => break,
+                                        "/help" => {
+                                            let _ = event_tx.send(ChatEvent::Status {
+                                                message: "Commands: /role <id>  /model <tier>  /roles  /planmode [on|off]  /clear  /status  /tools  /history  /save <file>  /load <file>  /help  /exit".into(),
+                                            });
                                         }
-                                        Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed", None)); }
-                                    }
-                                }
-                                "/model" => {
-                                    let Some(t) = parts.get(1) else {
-                                        let _ = event_tx.send(ChatEvent::Status { message: "usage: /model <premium|standard|budget>".into() });
-                                        continue;
-                                    };
-                                    match ModelTier::parse(t) {
-                                        Ok(new_tier) => {
-                                            let role = current_role.clone();
+                                        // plan mode（只读规划模式）：无参 = 翻转；
+                                        // on/off 显式设定。广播 PlanModeChanged
+                                        // （UI 徽章）；实际工具收敛在下一个 turn
+                                        // 边界重建 runner 时生效（见 Input 臂开头）。
+                                        "/planmode" => {
+                                            let cur = plan_mode.load(Ordering::SeqCst);
+                                            let next = match parts.get(1).map(|s| s.trim()) {
+                                                Some("on") => true,
+                                                Some("off") => false,
+                                                _ => !cur,
+                                            };
+                                            set_plan_mode_flag(&plan_mode, event_tx, next);
+                                            let _ = event_tx.send(ChatEvent::Status {
+                                                message: if next {
+                                                    "[plan mode 已开启：只做只读探索与方案设计，产出走 plan 工具提交审批]".into()
+                                                } else {
+                                                    "[plan mode 已关闭：恢复正常工具集]".into()
+                                                },
+                                            });
+                                        }
+                                        "/roles" => {
+                                            let ids: Vec<&String> = merged.roles.keys().collect();
+                                            let roles_info: Vec<RoleInfo> = ids.iter().map(|id| {
+                                                let tpl = merged.roles.get(*id).unwrap();
+                                                RoleInfo { id: (*id).clone(), name: tpl.name.clone(), icon: tpl.icon.clone() }
+                                            }).collect();
+                                            let _ = event_tx.send(ChatEvent::RoleList { roles: roles_info });
+                                        }
+                                        "/role" => {
+                                            let Some(new_role) = parts.get(1) else {
+                                                let _ = event_tx.send(ChatEvent::Status { message: "usage: /role <id>".into() });
+                                                continue;
+                                            };
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
-                                                Ok((mut new_runner, _)) => {
+                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                                Ok((mut new_runner, rid)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
-                                                    current_tier = new_tier;
-                                                    let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
+                                                    current_role = rid.clone();
+                                                    let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
+                                                    let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                                                    let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
+                                                    let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
                                                 }
-                                                Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed", None)); }
+                                                Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed", None)); }
                                             }
                                         }
-                                        Err(e) => { let _ = event_tx.send(ChatEvent::Status { message: format!("invalid tier: {e}") }); }
-                                    }
-                                }
-                                "/history" => {
-                                    let msgs = runner.context().messages();
-                                    let _ = event_tx.send(ChatEvent::Status { message: format!("history ({} messages):", msgs.len()) });
-                                    for (i, m) in msgs.iter().enumerate() {
-                                        let preview = if m.content.len() > 200 { format!("{}...", &m.as_text()[..200]) } else { m.as_text() };
-                                        let _ = event_tx.send(ChatEvent::Status { message: format!("  {i} [{:?}] {preview}", m.role) });
-                                    }
-                                }
-                                cmd => {
-                                    let topic = parts.get(1).unwrap_or(&"").trim();
-                                    // workflow 命令（如 /design-and-plan <topic>）按
-                                    // submit_input 的设计不记录用户诉求（斜杠命令
-                                    // 一律跳过）——确认是已注册 workflow 命令后把
-                                    // topic 补记进 last_user_input，否则 advisor
-                                    // 审查看到的「用户当前问题」是空串，会把正常的
-                                    // workflow 启动误判成"无目标编排"。
-                                    if !topic.is_empty()
-                                        && crate::workflow::load_workflow_by_command(
-                                            cmd,
-                                            &config.cwd,
-                                        )
-                                        .is_ok()
-                                    {
-                                        *last_user_input.lock() = topic.to_string();
-                                    }
-                                    match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), turn_cancel_flag.clone(), advisor_pause.clone()).await {
-                                        Ok(Some(summary)) => {
-                                            let _ = event_tx.send(ChatEvent::Status {
-                                                message: format!("Workflow '{cmd}' 完成。\n{summary}"),
-                                            });
-                                            // slash 路径不经 manager 的 agent loop，没人会调
-                                            // `plan` 工具——产出里带任务清单时代 manager 广播
-                                            // PlanProposed，让「添加任务」弹窗与 manager 路径
-                                            // 一致弹出（并挂上 plan 阶段门）。
-                                            if propose_plan_from_summary(
-                                                &event_tx,
-                                                &plan_stage,
-                                                &current_role,
-                                                &summary,
-                                                Some((&config.cwd, &config.session_id)),
-                                            ) {
-                                                let _ = event_tx.send(ChatEvent::Status {
-                                                    message: "检测到任务清单，已提交「添加任务」弹窗供勾选导入任务看板。".into(),
-                                                });
+                                        "/model" => {
+                                            let Some(t) = parts.get(1) else {
+                                                let _ = event_tx.send(ChatEvent::Status { message: "usage: /model <premium|standard|budget>".into() });
+                                                continue;
+                                            };
+                                            match ModelTier::parse(t) {
+                                                Ok(new_tier) => {
+                                                    let role = current_role.clone();
+                                                    let history: Vec<Message> = runner.context().messages().to_vec();
+                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                                        Ok((mut new_runner, _)) => {
+                                                            for m in history { new_runner.context_mut().push(m); }
+                                                            runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
+                                                            current_tier = new_tier;
+                                                            let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
+                                                        }
+                                                        Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed", None)); }
+                                                    }
+                                                }
+                                                Err(e) => { let _ = event_tx.send(ChatEvent::Status { message: format!("invalid tier: {e}") }); }
                                             }
                                         }
-                                        Ok(None) => {
-                                            let _ = event_tx.send(ChatEvent::Status {
-                                                message: format!(
-                                                    "[unknown {cmd} — known: role model roles clear status tools history save load help exit quit, plus any workflow command]"
-                                                ),
-                                            });
+                                        "/history" => {
+                                            let msgs = runner.context().messages();
+                                            let _ = event_tx.send(ChatEvent::Status { message: format!("history ({} messages):", msgs.len()) });
+                                            for (i, m) in msgs.iter().enumerate() {
+                                                let preview = if m.content.len() > 200 { format!("{}...", &m.as_text()[..200]) } else { m.as_text() };
+                                                let _ = event_tx.send(ChatEvent::Status { message: format!("  {i} [{:?}] {preview}", m.role) });
+                                            }
                                         }
-                                        Err(e) => {
-                                            let _ = event_tx.send(ChatEvent::Status {
-                                                message: format!("Workflow '{cmd}' 失败: {e}"),
-                                            });
-                                            let budget = default_max_auto_remediations();
-                                            if auto_remediations >= budget {
-                                                // 自动善后额度用尽 → 转人工。
-                                                //
-                                                // 不再合成 followup，本轮就此收住、
-                                                // 回到等用户输入。实测（2026-09-07
-                                                // jemalloc 会话）此前没有上限：一条
-                                                // implementation_plan 失败 → 自动善后
-                                                // → manager 换个描述整条重跑，同一目标
-                                                // 最终跑了 3 条（其中第一条 3.56M 输入
-                                                // token 完全打水漂），而用户在 UI 上只
-                                                // 看到"又一条 workflow 开始跑"，既不知道
-                                                // 上一条失败了，也没有插手的机会。
-                                                let hints: Vec<String> =
-                                                    advisor_hints.lock().drain(..).collect();
-                                                let hints_text = if hints.is_empty() {
-                                                    String::new()
-                                                } else {
-                                                    format!(
-                                                        "\n\nadvisor 监察建议：\n- {}",
-                                                        hints.join("\n- ")
-                                                    )
-                                                };
-                                                let _ = event_tx.send(ChatEvent::Status {
-                                                    message: format!(
-                                                        "⏸ 自动善后已用尽（{auto_remediations}/{budget} 次），转人工。\n\
-                                                         最后一次失败：{e}{hints_text}\n\n\
-                                                         请选择怎么处理，然后直接回复：\n\
-                                                         ① 缩小范围重试（例如把任务数/文档长度砍半——若失败原因是产出被长度上限截断，这一条最有效）\n\
-                                                         ② 我改完配置了，用 wf_id resume 从断点续跑\n\
-                                                         ③ 换条路径重做（换 workflow 或直接派单个角色）\n\
-                                                         ④ 放弃这条流水线\n\
-                                                         （想调额度：LATTE_AGENT_AUTO_REMEDIATE_MAX，0 = 失败即刻转人工）"
-                                                    ),
-                                                });
-                                                tracing::warn!(
-                                                    workflow = %cmd,
-                                                    used = auto_remediations,
-                                                    budget,
-                                                    "auto-remediation budget exhausted; handing back to the user"
-                                                );
-                                            } else {
-                                                auto_remediations += 1;
-                                                // 自动善后：合成一条输入落到
-                                                // 下面的正常 turn 路径，带上失败
-                                                // 上下文 + advisor 积存的监察建议。
-                                                let hints: Vec<String> =
-                                                    advisor_hints.lock().drain(..).collect();
-                                                let hints_text = if hints.is_empty() {
-                                                    String::new()
-                                                } else {
-                                                    format!("\n\nadvisor 监察建议：\n- {}", hints.join("\n- "))
-                                                };
-                                                // 次数进提示，让用户看得见"这是第几次自救"。
-                                                let _ = event_tx.send(ChatEvent::Status {
-                                                    message: format!(
-                                                        "↩ 自动善后第 {auto_remediations}/{budget} 次：交给 {current_role} 自行修复或换路径"
-                                                    ),
-                                                });
-                                                synthetic_followup = Some(format!(
-                                                    "[自动善后 {auto_remediations}/{budget}] Workflow '{cmd}' 失败。用户请求：{topic}\n\n错误：\n{e}{hints_text}\n\n请善后：能修复的修复后用错误消息里的 wf_id 以 resume 续跑，或按 advisor 建议换路径重做；无法继续则向用户说明失败原因。\n\n注意：自动善后额度剩 {} 次，用尽后会停下来等用户拍板。不要整条流水线原样重跑——先判断失败是不是「产出被长度上限截断」这类靠缩小单次提交量就能解决的问题。",
-                                                    budget.saturating_sub(auto_remediations)
-                                                ));
+                                        cmd => {
+                                            let topic = parts.get(1).unwrap_or(&"").trim();
+                                            // workflow 命令（如 /design-and-plan <topic>）按
+                                            // submit_input 的设计不记录用户诉求（斜杠命令
+                                            // 一律跳过）——确认是已注册 workflow 命令后把
+                                            // topic 补记进 last_user_input，否则 advisor
+                                            // 审查看到的「用户当前问题」是空串，会把正常的
+                                            // workflow 启动误判成"无目标编排"。
+                                            if !topic.is_empty()
+                                                && crate::workflow::load_workflow_by_command(
+                                                    cmd,
+                                                    &config.cwd,
+                                                )
+                                                .is_ok()
+                                            {
+                                                *last_user_input.lock() = topic.to_string();
+                                            }
+                                            match run_workflow_command(cmd, topic, &config, &event_tx, cancel_flag.clone(), agent_pause_gate.clone(), turn_cancel_flag.clone(), advisor_pause.clone()).await {
+                                                Ok(Some(summary)) => {
+                                                    let _ = event_tx.send(ChatEvent::Status {
+                                                        message: format!("Workflow '{cmd}' 完成。\n{summary}"),
+                                                    });
+                                                    // slash 路径不经 manager 的 agent loop，没人会调
+                                                    // `plan` 工具——产出里带任务清单时代 manager 广播
+                                                    // PlanProposed，让「添加任务」弹窗与 manager 路径
+                                                    // 一致弹出（并挂上 plan 阶段门）。
+                                                    if propose_plan_from_summary(
+                                                        &event_tx,
+                                                        &plan_stage,
+                                                        &current_role,
+                                                        &summary,
+                                                        Some((&config.cwd, &config.session_id)),
+                                                    ) {
+                                                        let _ = event_tx.send(ChatEvent::Status {
+                                                            message: "检测到任务清单，已提交「添加任务」弹窗供勾选导入任务看板。".into(),
+                                                        });
+                                                    }
+                                                }
+                                                Ok(None) => {
+                                                    let _ = event_tx.send(ChatEvent::Status {
+                                                        message: format!(
+                                                            "[unknown {cmd} — known: role model roles clear status tools history save load help exit quit, plus any workflow command]"
+                                                        ),
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    let _ = event_tx.send(ChatEvent::Status {
+                                                        message: format!("Workflow '{cmd}' 失败: {e}"),
+                                                    });
+                                                    let budget = default_max_auto_remediations();
+                                                    if auto_remediations >= budget {
+                                                        // 自动善后额度用尽 → 转人工。
+                                                        //
+                                                        // 不再合成 followup，本轮就此收住、
+                                                        // 回到等用户输入。实测（2026-09-07
+                                                        // jemalloc 会话）此前没有上限：一条
+                                                        // implementation_plan 失败 → 自动善后
+                                                        // → manager 换个描述整条重跑，同一目标
+                                                        // 最终跑了 3 条（其中第一条 3.56M 输入
+                                                        // token 完全打水漂），而用户在 UI 上只
+                                                        // 看到"又一条 workflow 开始跑"，既不知道
+                                                        // 上一条失败了，也没有插手的机会。
+                                                        let hints: Vec<String> =
+                                                            advisor_hints.lock().drain(..).collect();
+                                                        let hints_text = if hints.is_empty() {
+                                                            String::new()
+                                                        } else {
+                                                            format!(
+                                                                "\n\nadvisor 监察建议：\n- {}",
+                                                                hints.join("\n- ")
+                                                            )
+                                                        };
+                                                        let _ = event_tx.send(ChatEvent::Status {
+                                                            message: format!(
+                                                                "⏸ 自动善后已用尽（{auto_remediations}/{budget} 次），转人工。\n\
+                                                                 最后一次失败：{e}{hints_text}\n\n\
+                                                                 请选择怎么处理，然后直接回复：\n\
+                                                                 ① 缩小范围重试（例如把任务数/文档长度砍半——若失败原因是产出被长度上限截断，这一条最有效）\n\
+                                                                 ② 我改完配置了，用 wf_id resume 从断点续跑\n\
+                                                                 ③ 换条路径重做（换 workflow 或直接派单个角色）\n\
+                                                                 ④ 放弃这条流水线\n\
+                                                                 （想调额度：LATTE_AGENT_AUTO_REMEDIATE_MAX，0 = 失败即刻转人工）"
+                                                            ),
+                                                        });
+                                                        tracing::warn!(
+                                                            workflow = %cmd,
+                                                            used = auto_remediations,
+                                                            budget,
+                                                            "auto-remediation budget exhausted; handing back to the user"
+                                                        );
+                                                    } else {
+                                                        auto_remediations += 1;
+                                                        // 自动善后：合成一条输入落到
+                                                        // 下面的正常 turn 路径，带上失败
+                                                        // 上下文 + advisor 积存的监察建议。
+                                                        let hints: Vec<String> =
+                                                            advisor_hints.lock().drain(..).collect();
+                                                        let hints_text = if hints.is_empty() {
+                                                            String::new()
+                                                        } else {
+                                                            format!("\n\nadvisor 监察建议：\n- {}", hints.join("\n- "))
+                                                        };
+                                                        // 次数进提示，让用户看得见"这是第几次自救"。
+                                                        let _ = event_tx.send(ChatEvent::Status {
+                                                            message: format!(
+                                                                "↩ 自动善后第 {auto_remediations}/{budget} 次：交给 {current_role} 自行修复或换路径"
+                                                            ),
+                                                        });
+                                                        synthetic_followup = Some(format!(
+                                                            "[自动善后 {auto_remediations}/{budget}] Workflow '{cmd}' 失败。用户请求：{topic}\n\n错误：\n{e}{hints_text}\n\n请善后：能修复的修复后用错误消息里的 wf_id 以 resume 续跑，或按 advisor 建议换路径重做；无法继续则向用户说明失败原因。\n\n注意：自动善后额度剩 {} 次，用尽后会停下来等用户拍板。不要整条流水线原样重跑——先判断失败是不是「产出被长度上限截断」这类靠缩小单次提交量就能解决的问题。",
+                                                            budget.saturating_sub(auto_remediations)
+                                                        ));
+                                                    }
+                                                }
                                             }
                                         }
                                     }
+                                    if synthetic_followup.is_none() {
+                                        continue;
+                                    }
                                 }
-                            }
-                            if synthetic_followup.is_none() {
-                                continue;
-                            }
-                        }
-                        let trimmed = synthetic_followup.unwrap_or(trimmed);
+                                let trimmed = synthetic_followup.unwrap_or(trimmed);
 
-                        // Pause gate: if the session is paused, hold
-                        // this turn until the user resumes. Only
-                        // Resume / Abort / CancelTurn are honored while
-                        // parked; advisor hints are buffered. A
-                        // CancelTurn while parked discards this pending
-                        // input and returns to idle.
-                        if paused {
-                            let _ = event_tx.send(ChatEvent::Status {
-                                message: "[会话已暂停 — 恢复后执行本条输入]".into(),
-                            });
-                            let mut cancelled = false;
-                            loop {
-                                if cancel_flag.load(Ordering::SeqCst) {
-                                    return;
-                                }
-                                match input_rx.recv().await {
-                                    Some(ControllerInput::Resume) => {
-                                        paused = false;
-                                        let _ = event_tx.send(ChatEvent::Resumed);
-                                        break;
-                                    }
-                                    Some(ControllerInput::ResumeSession(ack)) => {
-                                        let was_paused = paused;
-                                        paused = false;
-                                        let _ = ack.send(was_paused);
-                                        break;
-                                    }
-                                    Some(ControllerInput::Abort) | None => return,
-                                    Some(ControllerInput::CancelTurn) => {
-                                        cancelled = true;
-                                        break;
-                                    }
-                                    Some(ControllerInput::AdvisorHint(t)) => {
-                                        advisor_hints.lock().push_back(t);
-                                    }
-                                    // Pause while already paused, or any
-                                    // other input, is ignored here.
-                                    _ => {}
-                                }
-                            }
-                            if cancelled {
-                                continue;
-                            }
-                        }
-
-                        // Session 级暂停门（⏸ = `pause_session` /
-                        // `POST /api/chat/pause-session`）：这是随附 UI
-                        // 实际用的那一组端点，与上面那个 driver-local
-                        // `paused`（legacy `/chat/pause`）是两套独立状态。
-                        //
-                        // 此前 driver 只看 `paused`，从不查 gate：gate
-                        // engaged 时照样把 UserMessage / RoleStarted /
-                        // [calling LLM] 全发出去，真正的 park 发生在
-                        // runner 内部的 tool-round 边界。用户看到的是
-                        // 「消息发出去了，然后永远没结果」，而不是
-                        // 「已暂停」—— 按了 ⏸ 再发消息就会命中。
-                        //
-                        // 这里只轮询 gate 与 session cancel_flag，**不**从
-                        // input_rx 取输入：取了就得负责回写，否则暂停期间
-                        // 的消息/切角色会被静默吞掉（上面那个 park 循环的
-                        // `_ => {}` 就是这个毛病，不要复制它）。
-                        // `Paused`/`Resumed` 事件由 gate 的 on_change
-                        // listener 统一广播，这里不重复发。
-                        if agent_pause_gate.is_paused() {
-                            let reason = agent_pause_gate
-                                .pause_reason()
-                                .unwrap_or_else(|| "会话已暂停".to_string());
-                            let _ = event_tx.send(ChatEvent::Status {
-                                message: format!(
-                                    "[{reason} — 本条输入已收到，▶ 继续后执行]"
-                                ),
-                            });
-                            let mut pending_turn_cancelled = false;
-                            loop {
-                                if cancel_flag.load(Ordering::SeqCst) {
-                                    return;
-                                }
-                                // `cancel_turn()` sets this atomic before queuing
-                                // ControllerInput::CancelTurn. The current Input arm
-                                // already owns the pending text, so it cannot consume
-                                // that command without also risking later inputs. Drop
-                                // the pending turn here; the queued command is harmless
-                                // because run_turn_cancellable clears stale idle flags.
-                                if turn_cancel_flag.swap(false, Ordering::SeqCst) {
-                                    pending_turn_cancelled = true;
-                                    break;
-                                }
-                                if !agent_pause_gate.is_paused() {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(200))
-                                    .await;
-                            }
-                            if pending_turn_cancelled {
-                                let _ = event_tx.send(ChatEvent::Status {
-                                    message: "[已取消暂停中等待执行的输入]".into(),
-                                });
-                                continue;
-                            }
-                        }
-
-                        let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
-                        // plan mode 翻转后的 **turn 边界重建**：模式与当前
-                        // runner 不一致时按同一角色/tier 重建（工具收敛到
-                        // 只读白名单或恢复完整集），历史整份搬过去——与
-                        // SwitchRole 臂同款做法。运行中的 turn 不打断。
-                        let mode_now = plan_mode.load(Ordering::SeqCst);
-                        if mode_now != runner_plan_mode {
-                            let history: Vec<Message> = runner.context().messages().to_vec();
-                            match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
-                                Ok((mut new_runner, _)) => {
-                                    for m in history { new_runner.context_mut().push(m); }
-                                    runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
-                                    runner_plan_mode = mode_now;
-                                }
-                                Err(e) => { let _ = event_tx.send(error_event(&e, "rebuild runner for plan mode failed", None)); }
-                            }
-                        }
-                        // plan 阶段门复位：新的用户消息 = 新的决策周期，
-                        // 上一轮未批准的 plan 不再约束 delegate
-                        //（同时销账它的弹窗补发）。丢弃不静默。
-                        if let Some(dropped) = reset_plan_stage(&plan_stage) {
-                            let _ = event_tx.send(ChatEvent::Status {
-                                message: discarded_plan_notice(&dropped),
-                            });
-                        }
-                        let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
-                        let _ = event_tx.send(ChatEvent::RoleStarted {
-                            role_id: current_role.clone(),
-                            detail: "calling LLM".into(),
-                            sub_id: None,
-                        });
-let usage_before = runner.total_usage().clone();
-                        // Run the turn with cancellation support (no
-                        // auto-timeout — user hits the stop button).
-                        let user_msg = [Message::user(trimmed.clone())];
-                        let turn_result = run_turn_cancellable(
-                            &mut runner,
-                            &user_msg,
-                            &cancel_flag,
-                            &turn_cancel_flag,
-                        )
-                        .await;
-                        match turn_result {
-                            Ok(response) => {
-                                let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
-                                let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
-                                let usage_after = runner.total_usage();
-                                let in_delta = usage_after.input_tokens - usage_before.input_tokens;
-                                let out_delta = usage_after.output_tokens - usage_before.output_tokens;
-                                let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: strip_think_blocks(&response), is_complete: true, sub_id: None });
-                                let _ = event_tx.send(ChatEvent::Status { message: format!("[{current_role} · {mid} · tokens: +{in_delta} in / +{out_delta} out]") });
-                                let _ = event_tx.send(ChatEvent::RoleFinished {
-                                    role_id: current_role.clone(),
-                                    detail: format!("ok, {} chars", response.len()),
-                                    sub_id: None,
-                                });
-                                let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
-                            }
-                            Err(e) => {
-                                let _ = event_tx.send(ChatEvent::RoleFinished {
-                                    role_id: current_role.clone(),
-                                    detail: format!("error: {e}"),
-                                    sub_id: None,
-                                });
-                                // Advisor gate 重试耗尽：发
-                                // AdvisorTerminated 而不是普通 Error —
-                                // 坏答案不落盘成 RoleTurn，driver 回到
-                                // 等用户输入（不是 session 终止）。
-                                if let AgentError::AdvisorTerminated { reason, detector } = &e {
-                                    let _ = event_tx.send(ChatEvent::AdvisorTerminated {
-                                        role_id: current_role.clone(),
-                                        reason: reason.clone(),
-                                        detector: Some(detector.clone()),
-                                        sub_id: None,
+                                // Pause gate: if the session is paused, hold
+                                // this turn until the user resumes. Only
+                                // Resume / Abort / CancelTurn are honored while
+                                // parked; advisor hints are buffered. A
+                                // CancelTurn while parked discards this pending
+                                // input and returns to idle.
+                                if paused {
+                                    let _ = event_tx.send(ChatEvent::Status {
+                                        message: "[会话已暂停 — 恢复后执行本条输入]".into(),
                                     });
-                                } else {
-                                    let _ = event_tx.send(error_event(&e, "turn failed", None));
+                                    let mut cancelled = false;
+                                    loop {
+                                        if cancel_flag.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                        match input_rx.recv().await {
+                                            Some(ControllerInput::Resume) => {
+                                                paused = false;
+                                                let _ = event_tx.send(ChatEvent::Resumed);
+                                                break;
+                                            }
+                                            Some(ControllerInput::ResumeSession(ack)) => {
+                                                let was_paused = paused;
+                                                paused = false;
+                                                let _ = ack.send(was_paused);
+                                                break;
+                                            }
+                                            Some(ControllerInput::Abort) | None => return,
+                                            Some(ControllerInput::CancelTurn) => {
+                                                cancelled = true;
+                                                break;
+                                            }
+                                            Some(ControllerInput::AdvisorHint(t)) => {
+                                                advisor_hints.lock().push_back(t);
+                                            }
+                                            // Pause while already paused, or any
+                                            // other input, is ignored here.
+                                            _ => {}
+                                        }
+                                    }
+                                    if cancelled {
+                                        continue;
+                                    }
+                                }
+
+                                // Session 级暂停门（⏸ = `pause_session` /
+                                // `POST /api/chat/pause-session`）：这是随附 UI
+                                // 实际用的那一组端点，与上面那个 driver-local
+                                // `paused`（legacy `/chat/pause`）是两套独立状态。
+                                //
+                                // 此前 driver 只看 `paused`，从不查 gate：gate
+                                // engaged 时照样把 UserMessage / RoleStarted /
+                                // [calling LLM] 全发出去，真正的 park 发生在
+                                // runner 内部的 tool-round 边界。用户看到的是
+                                // 「消息发出去了，然后永远没结果」，而不是
+                                // 「已暂停」—— 按了 ⏸ 再发消息就会命中。
+                                //
+                                // 这里只轮询 gate 与 session cancel_flag，**不**从
+                                // input_rx 取输入：取了就得负责回写，否则暂停期间
+                                // 的消息/切角色会被静默吞掉（上面那个 park 循环的
+                                // `_ => {}` 就是这个毛病，不要复制它）。
+                                // `Paused`/`Resumed` 事件由 gate 的 on_change
+                                // listener 统一广播，这里不重复发。
+                                if agent_pause_gate.is_paused() {
+                                    let reason = agent_pause_gate
+                                        .pause_reason()
+                                        .unwrap_or_else(|| "会话已暂停".to_string());
+                                    let _ = event_tx.send(ChatEvent::Status {
+                                        message: format!(
+                                            "[{reason} — 本条输入已收到，▶ 继续后执行]"
+                                        ),
+                                    });
+                                    let mut pending_turn_cancelled = false;
+                                    loop {
+                                        if cancel_flag.load(Ordering::SeqCst) {
+                                            return;
+                                        }
+                                        // `cancel_turn()` sets this atomic before queuing
+                                        // ControllerInput::CancelTurn. The current Input arm
+                                        // already owns the pending text, so it cannot consume
+                                        // that command without also risking later inputs. Drop
+                                        // the pending turn here; the queued command is harmless
+                                        // because run_turn_cancellable clears stale idle flags.
+                                        if turn_cancel_flag.swap(false, Ordering::SeqCst) {
+                                            pending_turn_cancelled = true;
+                                            break;
+                                        }
+                                        if !agent_pause_gate.is_paused() {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(200))
+                                            .await;
+                                    }
+                                    if pending_turn_cancelled {
+                                        let _ = event_tx.send(ChatEvent::Status {
+                                            message: "[已取消暂停中等待执行的输入]".into(),
+                                        });
+                                        continue;
+                                    }
+                                }
+
+                                let _ = event_tx.send(ChatEvent::Status { message: format!("[calling LLM for role '{current_role}'...]") });
+                                // plan mode 翻转后的 **turn 边界重建**：模式与当前
+                                // runner 不一致时按同一角色/tier 重建（工具收敛到
+                                // 只读白名单或恢复完整集），历史整份搬过去——与
+                                // SwitchRole 臂同款做法。运行中的 turn 不打断。
+                                let mode_now = plan_mode.load(Ordering::SeqCst);
+                                if mode_now != runner_plan_mode {
+                                    let history: Vec<Message> = runner.context().messages().to_vec();
+                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                        Ok((mut new_runner, _)) => {
+                                            for m in history { new_runner.context_mut().push(m); }
+                                            runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
+                                            runner_plan_mode = mode_now;
+                                        }
+                                        Err(e) => { let _ = event_tx.send(error_event(&e, "rebuild runner for plan mode failed", None)); }
+                                    }
+                                }
+                                // plan 阶段门复位：新的用户消息 = 新的决策周期，
+                                // 上一轮未批准的 plan 不再约束 delegate
+                                //（同时销账它的弹窗补发）。丢弃不静默。
+                                if let Some(dropped) = reset_plan_stage(&plan_stage) {
+                                    let _ = event_tx.send(ChatEvent::Status {
+                                        message: discarded_plan_notice(&dropped),
+                                    });
+                                }
+                                let _ = event_tx.send(ChatEvent::UserMessage { text: trimmed.clone() });
+                                let _ = event_tx.send(ChatEvent::RoleStarted {
+                                    role_id: current_role.clone(),
+                                    detail: "calling LLM".into(),
+                                    sub_id: None,
+                                });
+        let usage_before = runner.total_usage().clone();
+                                // Run the turn with cancellation support (no
+                                // auto-timeout — user hits the stop button).
+                                let user_msg = [Message::user(trimmed.clone())];
+                                let turn_result = run_turn_cancellable(
+                                    &mut runner,
+                                    &user_msg,
+                                    &cancel_flag,
+                                    &turn_cancel_flag,
+                                )
+                                .await;
+                                match turn_result {
+                                    Ok(response) => {
+                                        let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
+                                        let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                                        let usage_after = runner.total_usage();
+                                        let in_delta = usage_after.input_tokens - usage_before.input_tokens;
+                                        let out_delta = usage_after.output_tokens - usage_before.output_tokens;
+                                        let _ = event_tx.send(ChatEvent::RoleTurn { role_id: current_role.clone(), content: strip_think_blocks(&response), is_complete: true, sub_id: None });
+                                        let _ = event_tx.send(ChatEvent::Status { message: format!("[{current_role} · {mid} · tokens: +{in_delta} in / +{out_delta} out]") });
+                                        let _ = event_tx.send(ChatEvent::RoleFinished {
+                                            role_id: current_role.clone(),
+                                            detail: format!("ok, {} chars", response.len()),
+                                            sub_id: None,
+                                        });
+                                        let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(ChatEvent::RoleFinished {
+                                            role_id: current_role.clone(),
+                                            detail: format!("error: {e}"),
+                                            sub_id: None,
+                                        });
+                                        // Advisor gate 重试耗尽：发
+                                        // AdvisorTerminated 而不是普通 Error —
+                                        // 坏答案不落盘成 RoleTurn，driver 回到
+                                        // 等用户输入（不是 session 终止）。
+                                        if let AgentError::AdvisorTerminated { reason, detector } = &e {
+                                            let _ = event_tx.send(ChatEvent::AdvisorTerminated {
+                                                role_id: current_role.clone(),
+                                                reason: reason.clone(),
+                                                detector: Some(detector.clone()),
+                                                sub_id: None,
+                                            });
+                                        } else {
+                                            let _ = event_tx.send(error_event(&e, "turn failed", None));
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
-                    Some(ControllerInput::SwitchRole(new_role)) => {
-                        // 重复"切换"到当前角色（UI 重连/刷新会重复发
-                        // SwitchRole，日志里曾一次连发 6 条相同的
-                        // Switched Status）：不重建 runner、不发 Status
-                        // 噪声；仍发 Prompt 让 UI 同步当前角色显示。
-                        if new_role == current_role {
-                            let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
-                            let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
-                            let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
-                            continue;
-                        }
-                        let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
-                            Ok((mut new_runner, rid)) => {
-                                for m in history { new_runner.context_mut().push(m); }
-                                runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
-                                current_role = rid.clone();
-                                let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
-                                let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
-                                let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
-                                let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                            Some(ControllerInput::SwitchRole(new_role)) => {
+                                // 重复"切换"到当前角色（UI 重连/刷新会重复发
+                                // SwitchRole，日志里曾一次连发 6 条相同的
+                                // Switched Status）：不重建 runner、不发 Status
+                                // 噪声；仍发 Prompt 让 UI 同步当前角色显示。
+                                if new_role == current_role {
+                                    let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
+                                    let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                                    let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                                    continue;
+                                }
+                                let history: Vec<Message> = runner.context().messages().to_vec();
+                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    Ok((mut new_runner, rid)) => {
+                                        for m in history { new_runner.context_mut().push(m); }
+                                        runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
+                                        current_role = rid.clone();
+                                        let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
+                                        let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                                        let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to role '{rid}' (tier {})", current_tier.label()) });
+                                        let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                                    }
+                                    Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed", None)); }
+                                }
                             }
-                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch role failed", None)); }
-                        }
-                    }
-                    Some(ControllerInput::SwitchModel(new_tier)) => {
-                        let history: Vec<Message> = runner.context().messages().to_vec();
-                        match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
-                            Ok((mut new_runner, _)) => {
-                                for m in history { new_runner.context_mut().push(m); }
-                                runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
-                                current_tier = new_tier;
-                                let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
+                            Some(ControllerInput::SwitchModel(new_tier)) => {
+                                let history: Vec<Message> = runner.context().messages().to_vec();
+                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    Ok((mut new_runner, _)) => {
+                                        for m in history { new_runner.context_mut().push(m); }
+                                        runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
+                                        current_tier = new_tier;
+                                        let _ = event_tx.send(ChatEvent::Status { message: format!("Switched to tier {}", new_tier.label()) });
+                                    }
+                                    Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed", None)); }
+                                }
                             }
-                            Err(e) => { let _ = event_tx.send(error_event(&e, "switch model failed", None)); }
+                            Some(ControllerInput::Pause) => {
+                                paused = true;
+                                let _ = event_tx.send(ChatEvent::Paused { reason: "用户暂停".into() });
+                            }
+                            Some(ControllerInput::Resume) => {
+                                paused = false;
+                                let _ = event_tx.send(ChatEvent::Resumed);
+                            }
+                            // V2 resume-session already emits via the gate listener/API.
+                            // Single-role has no SessionManager state to restore.
+                            Some(ControllerInput::ResumeSession(ack)) => {
+                                let _ = ack.send(false);
+                            }
+                            Some(ControllerInput::AdvisorHint(text)) => {
+                                // Idle-side delivery: park the hint in the
+                                // shared queue; the runner drains it at the
+                                // next turn start. (Mid-turn delivery happens
+                                // via the direct `advisor_hint()` push, not
+                                // this channel.)
+                                advisor_hints.lock().push_back(text);
+                            }
+                            // 取消当前 turn：仅打断正在跑的 run_turn，不退出
+                            // 整个 session。run_single_role_loop 的 select! 循环
+                            // 会检测 turn_cancel_flag 并在下一个 500ms tick
+                            // 丢弃 run_turn future。
+                            Some(ControllerInput::CancelTurn) => {
+                                turn_cancel_flag.store(true, Ordering::SeqCst);
+                            }
+                            Some(ControllerInput::Abort) => break,
                         }
                     }
-                    Some(ControllerInput::Pause) => {
-                        paused = true;
-                        let _ = event_tx.send(ChatEvent::Paused { reason: "用户暂停".into() });
-                    }
-                    Some(ControllerInput::Resume) => {
-                        paused = false;
-                        let _ = event_tx.send(ChatEvent::Resumed);
-                    }
-                    // V2 resume-session already emits via the gate listener/API.
-                    // Single-role has no SessionManager state to restore.
-                    Some(ControllerInput::ResumeSession(ack)) => {
-                        let _ = ack.send(false);
-                    }
-                    Some(ControllerInput::AdvisorHint(text)) => {
-                        // Idle-side delivery: park the hint in the
-                        // shared queue; the runner drains it at the
-                        // next turn start. (Mid-turn delivery happens
-                        // via the direct `advisor_hint()` push, not
-                        // this channel.)
-                        advisor_hints.lock().push_back(text);
-                    }
-                    // 取消当前 turn：仅打断正在跑的 run_turn，不退出
-                    // 整个 session。run_single_role_loop 的 select! 循环
-                    // 会检测 turn_cancel_flag 并在下一个 500ms tick
-                    // 丢弃 run_turn future。
-                    Some(ControllerInput::CancelTurn) => {
-                        turn_cancel_flag.store(true, Ordering::SeqCst);
-                    }
-                    Some(ControllerInput::Abort) => break,
                 }
-            }
-        }
     }
 }
 
@@ -3422,7 +3496,11 @@ async fn build_runner(
         && !session_id.contains('/')
         && !session_id.contains('\\')
     {
-        Some(cwd.join(".latte").join("ui-sessions").join(format!("{session_id}.jsonl")))
+        Some(
+            cwd.join(".latte")
+                .join("ui-sessions")
+                .join(format!("{session_id}.jsonl")),
+        )
     } else {
         None
     };
@@ -3495,10 +3573,16 @@ async fn build_runner(
     prompt.push_str(&crate::ground_truth::ground_truth_block(cwd));
     role.system_prompt.push_str(&prompt);
 
-    let agent = Agent::new_with_chain(role_id.to_string(), role.clone(), models, default_params.clone())?;
+    let agent = Agent::new_with_chain(
+        role_id.to_string(),
+        role.clone(),
+        models,
+        default_params.clone(),
+    )?;
 
     if !role.allowed_tools.is_empty() {
-        let tm = build_tool_manager_at(cwd, &role.allowed_tools).await
+        let tm = build_tool_manager_at(cwd, &role.allowed_tools)
+            .await
             .map_err(|e| AgentError::Tool(format!("build tool manager '{role_id}': {e}")))?;
         // request_tool：所有带工具的角色都可申请临时使用未授权工具
         // （角色 prompt 与 allowed_tools 不对齐时的软拒绝 + 申请通道）。
@@ -3628,9 +3712,14 @@ async fn build_runner(
         // Any role with doc-graph tools in allowed_tools gets the 4 doc-graph
         // tools（scan/context/write/index）。cwd 是 agent 工作目录。
         {
-            let has = ["doc_graph_scan", "doc_graph_context", "doc_write", "doc_index"]
-                .iter()
-                .any(|t| role.allowed_tools.iter().any(|a| a == t));
+            let has = [
+                "doc_graph_scan",
+                "doc_graph_context",
+                "doc_write",
+                "doc_index",
+            ]
+            .iter()
+            .any(|t| role.allowed_tools.iter().any(|a| a == t));
             if has {
                 crate::doc_graph_tools::register_doc_graph_tools(&tm, cwd.to_path_buf())
                     .map_err(|e| AgentError::Tool(format!("register doc_graph tools: {e}")))?;
@@ -3750,7 +3839,9 @@ fn input_property(
     }
 }
 
-fn string_array_property(description: impl Into<String>) -> latte_rs_agent_tools::types::ToolInputProperty {
+fn string_array_property(
+    description: impl Into<String>,
+) -> latte_rs_agent_tools::types::ToolInputProperty {
     use latte_rs_agent_tools::types::PropertyType;
     input_property(PropertyType::Array, description)
         .with_items(input_property(PropertyType::String, "String array item."))
@@ -3770,10 +3861,7 @@ fn enrich_tool_for_model(
     tool
 }
 
-fn enrich_registered_tools(
-    tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
-    cwd: &Path,
-) {
+fn enrich_registered_tools(tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>, cwd: &Path) {
     let names = tm.get_tool_names();
     let ctx = crate::tool_docs::TemplateContext::from_tool_names(cwd, &names);
     for name in names {
@@ -3803,10 +3891,8 @@ pub fn refresh_tool_docs() -> usize {
 /// `Tool::builder` description, as a `(registered name, description)` list.
 /// The UI tools panel uses this instead of re-deriving descriptions locally,
 /// so the panel shows the same text the model gets at schema time.
-pub async fn builtin_tool_base_descriptions() -> Result<
-    Vec<(String, String)>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+pub async fn builtin_tool_base_descriptions(
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
     builtin_tool_base_descriptions_at(Path::new(".")).await
 }
 
@@ -4011,7 +4097,6 @@ fn add_batch_read_contract(
     tool
 }
 
-
 /// `read` 的 path/paths 二选一校验之前的归一化：意图明确时归并服务，
 /// 与 `fold_read_range_keys` / `normalize_llm_args` 同思路。
 ///
@@ -4065,7 +4150,11 @@ fn split_delimited_path_entry(entry: &str, cwd: Option<&str>) -> Option<Vec<Stri
             return false;
         }
         let p = std::path::Path::new(bare);
-        if p.is_absolute() { p.exists() } else { root.join(bare).exists() }
+        if p.is_absolute() {
+            p.exists()
+        } else {
+            root.join(bare).exists()
+        }
     };
 
     // ① 字面量优先：整串就是一个真实路径 → 绝不拆。
@@ -4073,7 +4162,9 @@ fn split_delimited_path_entry(entry: &str, cwd: Option<&str>) -> Option<Vec<Stri
         return None;
     }
     // 没有任何候选分隔符就没得拆。
-    if !trimmed.contains(';') && !trimmed.contains(',') && !trimmed.split_whitespace().nth(1).is_some()
+    if !trimmed.contains(';')
+        && !trimmed.contains(',')
+        && !trimmed.split_whitespace().nth(1).is_some()
     {
         return None;
     }
@@ -4143,8 +4234,7 @@ fn normalize_read_path_args(input: &mut serde_json::Value, cwd: Option<&str>) {
             {
                 if items.iter().all(|item| item.is_string()) {
                     obj.remove("path");
-                    let has_array_paths =
-                        obj.get("paths").map(|v| v.is_array()).unwrap_or(false);
+                    let has_array_paths = obj.get("paths").map(|v| v.is_array()).unwrap_or(false);
                     if has_array_paths {
                         if let Some(arr) = obj.get_mut("paths").and_then(|v| v.as_array_mut()) {
                             arr.extend(items);
@@ -4187,7 +4277,10 @@ fn normalize_read_path_args(input: &mut serde_json::Value, cwd: Option<&str>) {
         if has_array_paths {
             obj.remove("path");
             if let Some(arr) = obj.get_mut("paths").and_then(|v| v.as_array_mut()) {
-                if !arr.iter().any(|item| item.as_str() == Some(path_str.as_str())) {
+                if !arr
+                    .iter()
+                    .any(|item| item.as_str() == Some(path_str.as_str()))
+                {
                     arr.push(serde_json::Value::String(path_str));
                 }
             }
@@ -4213,7 +4306,15 @@ fn fold_read_range_keys(
 ) -> Result<(), latte_rs_agent_tools::error::ToolError> {
     use latte_rs_agent_tools::error::ToolError;
 
-    const START_KEYS: &[&str] = &["start", "start_line", "startLine", "from", "from_line", "begin", "offset"];
+    const START_KEYS: &[&str] = &[
+        "start",
+        "start_line",
+        "startLine",
+        "from",
+        "from_line",
+        "begin",
+        "offset",
+    ];
     const END_KEYS: &[&str] = &["end", "end_line", "endLine", "to", "to_line", "last_line"];
     const COUNT_KEYS: &[&str] = &["count", "limit", "lines", "num_lines"];
 
@@ -4260,7 +4361,9 @@ fn fold_read_range_keys(
     }
 
     let Some(path) = obj.get("path").and_then(|v| v.as_str()).map(str::to_owned) else {
-        return Err(ToolError::other(format!("read: 有行范围参数但缺 path。{hint}")));
+        return Err(ToolError::other(format!(
+            "read: 有行范围参数但缺 path。{hint}"
+        )));
     };
     // path 已带选择器 → 两处范围冲突，不猜哪个作准。
     if read_path_has_selector(&path) {
@@ -4378,7 +4481,6 @@ pub async fn build_tool_manager_at(
     Ok(mgr)
 }
 
-
 // ─── Full tool pool: cached registry of all builtin tools ──────────────
 // Built once on first build_tool_manager call (after all packages
 // registered, before keep filtering). Used by request_tool to look up
@@ -4400,11 +4502,19 @@ pub(crate) fn full_tool_pool() -> &'static FullToolPool {
         let mut pool = FullToolPool::new();
         for package in builtin_tool_packages() {
             for tool in package.tools {
-                let tool = enrich_tool_for_model(tool, Path::new("."), &crate::tool_docs::TemplateContext::default());
+                let tool = enrich_tool_for_model(
+                    tool,
+                    Path::new("."),
+                    &crate::tool_docs::TemplateContext::default(),
+                );
                 pool.insert(tool.name.clone(), tool);
             }
         }
-        let code_graph = enrich_tool_for_model(code_graph_tool(), Path::new("."), &crate::tool_docs::TemplateContext::default());
+        let code_graph = enrich_tool_for_model(
+            code_graph_tool(),
+            Path::new("."),
+            &crate::tool_docs::TemplateContext::default(),
+        );
         pool.insert(code_graph.name.clone(), code_graph);
         FULL_TOOL_POOL.get_or_init(|| pool)
     })
@@ -4426,27 +4536,51 @@ pub(crate) fn register_request_tool(
     let input_schema = ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
-            ("tool_name".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some("要申请使用的工具名称。".into()),
-                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
-                items: None, properties: None, required: None, additional_properties: None,
-            ref_: None,
-            }),
-            ("reason".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some("申请使用该工具的原因（角色 prompt 的上下文或任务需求描述）。".into()),
-                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
-                items: None, properties: None, required: None, additional_properties: None,
-            ref_: None,
-            }),
-        ].into_iter().collect(),
+            (
+                "tool_name".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some("要申请使用的工具名称。".into()),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+            (
+                "reason".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some(
+                        "申请使用该工具的原因（角色 prompt 的上下文或任务需求描述）。".into(),
+                    ),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
         required: Some(vec!["tool_name".into(), "reason".into()]),
         ..Default::default()
     };
     let tm_for_register = tm.clone();
     let handler: SharedToolHandler = Arc::new(move |input: serde_json::Value, _ctx| {
-        let tm = tm.clone();  // Arc is cheap; keep a copy for the async block
+        let tm = tm.clone(); // Arc is cheap; keep a copy for the async block
         let pool = pool.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
@@ -4466,9 +4600,9 @@ pub(crate) fn register_request_tool(
                 .ok_or_else(|| tool_err("'reason' 不能为空".into()))?;
 
             // Look up in the full tool pool.
-            let tool = pool.get(&tool_name).ok_or_else(|| {
-                tool_err(format!("未知工具 '{tool_name}'，不在可用工具池中"))
-            })?;
+            let tool = pool
+                .get(&tool_name)
+                .ok_or_else(|| tool_err(format!("未知工具 '{tool_name}'，不在可用工具池中")))?;
 
             // Check if already registered (idempotent).
             if tm.has(&tool_name) {
@@ -4499,7 +4633,6 @@ pub(crate) fn register_request_tool(
     tm_for_register.register(tool, Some("request_tool"));
     Ok(())
 }
-
 
 // ─────────────────────────────────────────────────────────────────────
 // code_graph：结构化代码导航
@@ -4773,7 +4906,6 @@ fn code_graph_signature_of(text: &str) -> String {
     }
 }
 
-
 const CODE_GRAPH_BACKEND: &str = "ast-grep";
 
 /// Keep backend diagnostics actionable without allowing an external process to
@@ -4786,11 +4918,17 @@ fn code_graph_short_diagnostic(raw: &str) -> String {
     if count <= MAX_CHARS {
         flat
     } else {
-        format!("{}…[+{}]", flat.chars().take(MAX_CHARS).collect::<String>(), count - MAX_CHARS)
+        format!(
+            "{}…[+{}]",
+            flat.chars().take(MAX_CHARS).collect::<String>(),
+            count - MAX_CHARS
+        )
     }
 }
 
-async fn code_graph_check_backend(program: &str) -> Result<(), latte_rs_agent_tools::error::ToolError> {
+async fn code_graph_check_backend(
+    program: &str,
+) -> Result<(), latte_rs_agent_tools::error::ToolError> {
     use latte_rs_agent_tools::error::ToolError;
 
     let output = tokio::process::Command::new(program)
@@ -4817,8 +4955,15 @@ async fn code_graph_check_backend(program: &str) -> Result<(), latte_rs_agent_to
         format!(
             "code_graph backend unavailable: `{program} --version` exited with {}{}. \
              Reinstall ast-grep; until then use search plus ranged read.",
-            output.status.code().map_or_else(|| "signal".to_string(), |code| code.to_string()),
-            if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") }
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            if diagnostic.is_empty() {
+                String::new()
+            } else {
+                format!(": {diagnostic}")
+            }
         ),
     ))
 }
@@ -4871,7 +5016,11 @@ fn code_graph_decode_backend_output(
             format!(
                 "ast-grep returned exit=1 without its expected JSON result{}. This is a backend \
                  protocol failure, not 0 matches.",
-                if diagnostic.is_empty() { String::new() } else { format!(": {diagnostic}") }
+                if diagnostic.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {diagnostic}")
+                }
             ),
         ));
     }
@@ -4894,13 +5043,19 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
     use std::sync::Arc;
 
     fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
-        ToolInputProperty { property_type: ty,
-        description: Some(desc.into()),
-        enum_values: None,
-        minimum: None,
-        maximum: None,
-        min_length: None,
-        max_length: None, items: None, properties: None, required: None, additional_properties: None, ref_: None,
+        ToolInputProperty {
+            property_type: ty,
+            description: Some(desc.into()),
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: None,
+            properties: None,
+            required: None,
+            additional_properties: None,
+            ref_: None,
         }
     }
     fn optional_schema(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
@@ -5020,14 +5175,8 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                         let mut result = serde_json::Map::new();
                         result.insert("format".into(), serde_json::Value::String("mermaid".into()));
                         result.insert("graph".into(), serde_json::Value::String(g.into()));
-                        result.insert(
-                            "mermaid".into(),
-                            serde_json::Value::String(out.mermaid),
-                        );
-                        result.insert(
-                            "truncated".into(),
-                            serde_json::Value::Bool(out.truncated),
-                        );
+                        result.insert("mermaid".into(), serde_json::Value::String(out.mermaid));
+                        result.insert("truncated".into(), serde_json::Value::Bool(out.truncated));
                         result.insert(
                             "note".into(),
                             serde_json::Value::String(
@@ -5192,10 +5341,7 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                             )));
                         }
                         if let Some(n) = &dir_lang_note {
-                            result.insert(
-                                "lang_note".into(),
-                                serde_json::Value::String(n.clone()),
-                            );
+                            result.insert("lang_note".into(), serde_json::Value::String(n.clone()));
                         }
                         return Ok(serde_json::Value::Object(result));
                     }
@@ -5235,7 +5381,11 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                                 )
                             },
                             vec![latte_rs_agent_tools::error::ValidationIssue {
-                                path: if avail.is_empty() { "lang".into() } else { "kind".into() },
+                                path: if avail.is_empty() {
+                                    "lang".into()
+                                } else {
+                                    "kind".into()
+                                },
                                 message: "取值不在支持范围内".into(),
                             }],
                         ));
@@ -5348,10 +5498,7 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 "total_matches".into(),
                 serde_json::Value::Number(total.into()),
             );
-            result.insert(
-                "shown".into(),
-                serde_json::Value::Number(emitted.into()),
-            );
+            result.insert("shown".into(), serde_json::Value::Number(emitted.into()));
             result.insert(
                 "matches".into(),
                 serde_json::Value::String(lines.join("\n")),
@@ -5379,10 +5526,7 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 result.insert("note".into(), serde_json::Value::String(note));
             }
             if !diagnostic.is_empty() {
-                result.insert(
-                    "diagnostics".into(),
-                    serde_json::Value::String(diagnostic),
-                );
+                result.insert("diagnostics".into(), serde_json::Value::String(diagnostic));
             }
             if let Some(n) = &dir_lang_note {
                 result.insert("lang_note".into(), serde_json::Value::String(n.clone()));
@@ -5444,8 +5588,19 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
         (
             "kind",
             vec![
-                "function", "method", "struct", "class", "interface", "enum", "trait",
-                "impl", "type", "macro", "call", "import", "decl",
+                "function",
+                "method",
+                "struct",
+                "class",
+                "interface",
+                "enum",
+                "trait",
+                "impl",
+                "type",
+                "macro",
+                "call",
+                "import",
+                "decl",
             ],
         ),
     ] {
@@ -5562,7 +5717,6 @@ pub(crate) fn role_roster_detail_text(merged: &AgentConfig) -> String {
         .join("\n")
 }
 
-
 /// 单 session 累计 workflow 失败**自动善后**次数上限。
 /// env `LATTE_AGENT_AUTO_REMEDIATE_MAX` 覆盖；非法值回退默认；`0` = 从不
 /// 自动善后（失败即刻转人工）。
@@ -5650,7 +5804,11 @@ pub fn workflow_tool_hint(cwd: &std::path::Path) -> String {
         available
             .iter()
             .map(|(n, d)| {
-                if d.is_empty() { format!("- `{n}`") } else { format!("- `{n}` — {d}") }
+                if d.is_empty() {
+                    format!("- `{n}`")
+                } else {
+                    format!("- `{n}` — {d}")
+                }
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -5668,9 +5826,19 @@ pub fn workflow_tool_hint(cwd: &std::path::Path) -> String {
             std::collections::BTreeMap::new();
         let mut unmarked: Vec<&str> = Vec::new();
         for (n, d) in &available {
-            match d.split("落点：").nth(1).map(str::trim).filter(|s| !s.is_empty()) {
+            match d
+                .split("落点：")
+                .nth(1)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 Some(landing) => {
-                    let key = landing.split('（').next().unwrap_or(landing).trim().to_string();
+                    let key = landing
+                        .split('（')
+                        .next()
+                        .unwrap_or(landing)
+                        .trim()
+                        .to_string();
                     by_landing.entry(key).or_default().push(n.as_str());
                 }
                 None => unmarked.push(n.as_str()),
@@ -5685,7 +5853,10 @@ pub fn workflow_tool_hint(cwd: &std::path::Path) -> String {
             .map(|(landing, names)| format!("- {landing} ← {}", names.join(", ")))
             .collect();
         if !unmarked.is_empty() {
-            lines.push(format!("- （描述未标注落点，见上方完整描述）← {}", unmarked.join(", ")));
+            lines.push(format!(
+                "- （描述未标注落点，见上方完整描述）← {}",
+                unmarked.join(", ")
+            ));
         }
         format!(
             "\n落点速查（先写下用户交付物的落点，再在这里对号选流程；只有对不上时才通读上方完整描述）：\n{}\n",
@@ -5913,6 +6084,22 @@ fn check_exists_tree(
     }
 }
 
+/// 两个 plan 任务之间是否声明了依赖关系（任一方向）。依赖引用写的是
+/// 对方**标题**（清单里的新任务还没有 id），比较时 trim + 忽略大小写。
+/// 有依赖 = 看板会串行执行它们，[`validate_plan_paths`] 的重叠校验因此
+/// 对这一对失去意义（重叠只在并发时有害）。
+fn plan_tasks_dep_linked(a: &PlanTask, b: &PlanTask) -> bool {
+    let refers_to = |from: &PlanTask, to: &PlanTask| {
+        let target = to.title.trim().to_lowercase();
+        !target.is_empty()
+            && from
+                .depends_on
+                .iter()
+                .any(|d| d.trim().to_lowercase() == target)
+    };
+    refers_to(a, b) || refers_to(b, a)
+}
+
 fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), String> {
     let normalize = |p: &str| -> String {
         p.trim()
@@ -5926,8 +6113,10 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     let mut missing: Vec<String> = Vec::new();
     // 只读类任务：不新建文件，声明的 paths 必须整条存在。
     let read_only = |task_type: Option<&str>, labels: &[String]| -> bool {
-        matches!(task_type, Some("learn") | Some("learn_loop") | Some("research"))
-            || labels.iter().any(|l| l.trim() == "只读")
+        matches!(
+            task_type,
+            Some("learn") | Some("learn_loop") | Some("research")
+        ) || labels.iter().any(|l| l.trim() == "只读")
     };
     let mut check_exists = |_title: &str, raw: &str, strict: bool| {
         let p = normalize(raw);
@@ -5999,6 +6188,11 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     // 会话：8 个纯阅读的学习任务因为都要读
     // `include/foo/internal` 被判 45 处冲突，5855 字错误回喂时又
     // 被截到 256 字节，模型看不全、改不动，连撞两次 plan 后靠蒙才过。）
+    //
+    // **声明了依赖关系的一对任务同样跳过**：重叠只在两个任务*同时*跑
+    // 的时候有害，而看板保证有依赖的任务串行执行（依赖 done 才派发）。
+    // 「实现」与「为它补测试」天然要改同一批文件，逼模型把它们的 paths
+    // 拆开只会得到假声明；正确的表达是 depends_on。
     let mut pairs = 0usize;
     // 冲突热点：重叠路径 → 牵涉到的任务下标集合。按路径聚合而不是按
     // "任务对"罗列，同一个热点路径只报一次，反馈短且可执行。
@@ -6012,6 +6206,10 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
             if is_readonly_plan_task(&tasks[j]) {
                 continue;
             }
+            // 有依赖关系（任一方向）→ 串行执行，重叠无害。
+            if plan_tasks_dep_linked(&tasks[i], &tasks[j]) {
+                continue;
+            }
             for a in tasks[i].paths.iter().map(|p| normalize(p)) {
                 for b in tasks[j].paths.iter().map(|p| normalize(p)) {
                     if a.is_empty() || b.is_empty() {
@@ -6021,7 +6219,11 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
                     if pa == pb || pa.starts_with(pb) || pb.starts_with(pa) {
                         pairs += 1;
                         // 记较短的那个（= 包含关系里的父前缀）作热点。
-                        let key = if a.len() <= b.len() { a.clone() } else { b.clone() };
+                        let key = if a.len() <= b.len() {
+                            a.clone()
+                        } else {
+                            b.clone()
+                        };
                         let entry = hot.entry(key).or_default();
                         entry.insert(i);
                         entry.insert(j);
@@ -6031,8 +6233,7 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
         }
     }
     if pairs > 0 {
-        let mut top: Vec<(String, usize)> =
-            hot.into_iter().map(|(p, ts)| (p, ts.len())).collect();
+        let mut top: Vec<(String, usize)> = hot.into_iter().map(|(p, ts)| (p, ts.len())).collect();
         // 牵涉任务最多的热点优先；同数按路径名稳定排序。
         top.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
         let head = top
@@ -6137,12 +6338,7 @@ fn validate_plan_task_types(cwd: &std::path::Path, tasks: &mut [PlanTask]) -> Re
     if unknown.is_empty() {
         return Ok(());
     }
-    let head = known
-        .iter()
-        .take(7)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("、");
+    let head = known.iter().take(7).cloned().collect::<Vec<_>>().join("、");
     let more = if known.len() > 7 {
         format!(" 等共 {} 个", known.len())
     } else {
@@ -6198,9 +6394,10 @@ fn load_task_type_ids(cwd: &std::path::Path) -> Vec<String> {
         #[serde(default)]
         types: std::collections::HashMap<String, toml::Value>,
     }
-    let mut ids: Vec<String> = toml::from_str::<RawRegistry>(include_str!("../../config/task_types.toml"))
-        .map(|r| r.types.into_keys().collect())
-        .unwrap_or_default();
+    let mut ids: Vec<String> =
+        toml::from_str::<RawRegistry>(include_str!("../../config/task_types.toml"))
+            .map(|r| r.types.into_keys().collect())
+            .unwrap_or_default();
     if let Ok(raw) = std::fs::read_to_string(cwd.join(".latte").join("task_types.toml")) {
         if let Ok(overlay) = toml::from_str::<RawRegistry>(&raw) {
             for k in overlay.types.into_keys() {
@@ -6228,6 +6425,7 @@ const PLAN_TASK_KNOWN_KEYS: &[&str] = &[
     "task_type",
     "workflow",
     "paths",
+    "depends_on",
     "subtasks",
     // paths 的 serde 别名
     "involved_paths",
@@ -6236,6 +6434,12 @@ const PLAN_TASK_KNOWN_KEYS: &[&str] = &[
     "affected_files",
     "file_paths",
     "files",
+    // depends_on 的 serde 别名
+    "deps",
+    "depends",
+    "dependencies",
+    "blocked_by",
+    "after",
 ];
 
 /// 递归收集 `tasks` 数组里所有不被 [`PlanTask`] 认得的键（去重、稳定
@@ -6319,7 +6523,20 @@ fn plan_task_input_property() -> latte_rs_agent_tools::types::ToolInputProperty 
         (
             "paths".into(),
             string_array_property(
-                "Non-overlapping file or directory prefixes affected by this task.",
+                "File or directory prefixes this task writes. Tasks with NON-overlapping \
+                 paths run IN PARALLEL, so declare them precisely — an omitted or overlapping \
+                 scope forces the whole task tree to run one-at-a-time.",
+            ),
+        ),
+        (
+            "depends_on".into(),
+            string_array_property(
+                "Titles of the tasks in THIS list that must finish BEFORE this one (or ids of \
+                 existing board tasks). This is the ONLY way to express ordering — same-tree \
+                 tasks run in parallel by default. Declare a dependency only for a real \
+                 prerequisite (e.g. implementation depends on its test task); a dependency \
+                 chain serializes work and costs wall-clock time. Two tasks that must edit the \
+                 SAME files need a dependency, not overlapping paths.",
             ),
         ),
     ]);
@@ -6393,15 +6610,14 @@ pub(crate) fn parse_and_validate_plan_tasks(
     // 重试（实测 manager 误诊成 workflow 字段、原样重撞两次）。
     let mut tasks: Vec<PlanTask> = Vec::with_capacity(tasks_arr.len());
     for (i, t) in tasks_arr.iter().enumerate() {
-        let pt: PlanTask =
-            serde_path_to_error::deserialize(t.clone()).map_err(|e| {
-                let path = e.path().to_string();
-                if path == "." {
-                    format!("tasks[{i}] invalid: {e}")
-                } else {
-                    format!("tasks[{i}] invalid: {e}（出错字段：{path}）")
-                }
-            })?;
+        let pt: PlanTask = serde_path_to_error::deserialize(t.clone()).map_err(|e| {
+            let path = e.path().to_string();
+            if path == "." {
+                format!("tasks[{i}] invalid: {e}")
+            } else {
+                format!("tasks[{i}] invalid: {e}（出错字段：{path}）")
+            }
+        })?;
         if pt.title.trim().is_empty() {
             return Err(format!("tasks[{i}].title must not be empty"));
         }
@@ -6641,7 +6857,6 @@ fn clear_persisted_ask(answer_log: Option<&crate::workflow::AnswerLog>, choice_i
     }
 }
 
-
 fn choice_option_input_property() -> latte_rs_agent_tools::types::ToolInputProperty {
     use latte_rs_agent_tools::types::PropertyType;
 
@@ -6659,7 +6874,10 @@ fn choice_option_input_property() -> latte_rs_agent_tools::types::ToolInputPrope
             input_property(PropertyType::String, "Optional image URL."),
         ),
         ("pros".into(), string_array_property("Advantages.")),
-        ("cons".into(), string_array_property("Disadvantages or risks.")),
+        (
+            "cons".into(),
+            string_array_property("Disadvantages or risks."),
+        ),
         (
             "details".into(),
             input_property(PropertyType::String, "Optional longer rationale."),
@@ -6692,8 +6910,7 @@ fn read_ask_document(project_root: &Path, rel: &str) -> Result<String, String> {
     if !canon.starts_with(&root) {
         return Err("路径逃逸出项目根".into());
     }
-    let content =
-        std::fs::read_to_string(&canon).map_err(|e| format!("读取失败: {e}"))?;
+    let content = std::fs::read_to_string(&canon).map_err(|e| format!("读取失败: {e}"))?;
     if content.len() > ASK_DOCUMENT_MAX_BYTES {
         let mut end = ASK_DOCUMENT_MAX_BYTES;
         while !content.is_char_boundary(end) && end > 0 {
@@ -6866,12 +7083,10 @@ pub fn register_ask_tool(
                                 opts_owned = a.clone();
                                 &opts_owned
                             }
-                            _ => {
-                                return Err(tool_err(
-                                    "'options' must be an array（收到对象且无法确定其中的候选项数组）"
-                                        .into(),
-                                ))
-                            }
+                            _ => return Err(tool_err(
+                                "'options' must be an array（收到对象且无法确定其中的候选项数组）"
+                                    .into(),
+                            )),
                         }
                     }
                     _ => return Err(tool_err("'options' must be an array".into())),
@@ -6971,7 +7186,11 @@ pub fn register_ask_tool(
                 )));
             }
 
-            let choice_id = format!("choice-{}-{}", role_id, CHOICE_SEQ.fetch_add(1, Ordering::Relaxed));
+            let choice_id = format!(
+                "choice-{}-{}",
+                role_id,
+                CHOICE_SEQ.fetch_add(1, Ordering::Relaxed)
+            );
 
             // ── 多题分支：一次问 N 道，收齐才回 ────────────────────
             //
@@ -6994,12 +7213,14 @@ pub fn register_ask_tool(
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty())
                             .ok_or_else(|| {
-                                tool_err(format!("questions[{qi}].question must be a non-empty string"))
+                                tool_err(format!(
+                                    "questions[{qi}].question must be a non-empty string"
+                                ))
                             })?;
-                        let qopts_arr = q
-                            .get("options")
-                            .and_then(|v| v.as_array())
-                            .ok_or_else(|| tool_err(format!("questions[{qi}].options must be an array")))?;
+                        let qopts_arr =
+                            q.get("options").and_then(|v| v.as_array()).ok_or_else(|| {
+                                tool_err(format!("questions[{qi}].options must be an array"))
+                            })?;
                         if qopts_arr.len() < 2 {
                             return Err(tool_err(format!(
                                 "questions[{qi}].options needs at least 2 entries（只有一个选项就不是选择题）"
@@ -7007,9 +7228,10 @@ pub fn register_ask_tool(
                         }
                         let mut qopts: Vec<ChoiceOption> = Vec::with_capacity(qopts_arr.len());
                         for (oi, o) in qopts_arr.iter().enumerate() {
-                            let opt: ChoiceOption = serde_json::from_value(o.clone()).map_err(|e| {
-                                tool_err(format!("questions[{qi}].options[{oi}] invalid: {e}"))
-                            })?;
+                            let opt: ChoiceOption =
+                                serde_json::from_value(o.clone()).map_err(|e| {
+                                    tool_err(format!("questions[{qi}].options[{oi}] invalid: {e}"))
+                                })?;
                             if opt.label.trim().is_empty() {
                                 return Err(tool_err(format!(
                                     "questions[{qi}].options[{oi}].label must not be empty"
@@ -7167,14 +7389,12 @@ pub fn register_ask_tool(
                 let cf = blk.cancel_flag.clone();
                 async move {
                     match cf {
-                        Some(cf) => {
-                            loop {
-                                if cf.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Some(cf) => loop {
+                            if cf.load(Ordering::SeqCst) {
+                                break;
                             }
-                        }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        },
                         None => std::future::pending::<()>().await,
                     }
                 }
@@ -7278,40 +7498,71 @@ pub fn register_task_report_tool(
     let input_schema = ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
-            ("task_id".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some(
-                    "要回报的任务 ID（如 LAT-100）；来自任务看板派发时的初始消息。必填。".into(),
-                ),
-                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
-                items: None, properties: None, required: None, additional_properties: None,
-            ref_: None,
-            }),
-            ("summary".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some(
-                    "完成情况摘要（1-3 句中文，写到任务 history note）。".into(),
-                ),
-                enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None,
-                items: None, properties: None, required: None, additional_properties: None,
-            ref_: None,
-            }),
-            ("result".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some(
-                    "执行结果枚举。completed → human_review，其他 → todo。".into(),
-                ),
-                enum_values: Some(VALID_RESULTS.iter().map(|s| serde_json::Value::String(s.to_string())).collect()),
-                minimum: None, maximum: None, min_length: None, max_length: None,
-                items: None, properties: None, required: None, additional_properties: None,
-            ref_: None,
-            }),
-        ].into_iter().collect(),
-        required: Some(vec![
-            "task_id".into(),
-            "summary".into(),
-            "result".into(),
-        ]),
+            (
+                "task_id".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some(
+                        "要回报的任务 ID（如 LAT-100）；来自任务看板派发时的初始消息。必填。"
+                            .into(),
+                    ),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+            (
+                "summary".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some("完成情况摘要（1-3 句中文，写到任务 history note）。".into()),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+            (
+                "result".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some(
+                        "执行结果枚举。completed → human_review，其他 → todo。".into(),
+                    ),
+                    enum_values: Some(
+                        VALID_RESULTS
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.to_string()))
+                            .collect(),
+                    ),
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        required: Some(vec!["task_id".into(), "summary".into(), "result".into()]),
         ..Default::default()
     };
 
@@ -7340,11 +7591,7 @@ pub fn register_task_report_tool(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .filter(|s| VALID_RESULTS.contains(&s.as_str()))
-                .ok_or_else(|| {
-                    tool_err(format!(
-                        "result must be one of {VALID_RESULTS:?}"
-                    ))
-                })?;
+                .ok_or_else(|| tool_err(format!("result must be one of {VALID_RESULTS:?}")))?;
 
             let _ = event_tx.send(ChatEvent::TaskReport {
                 role_id: role_id.clone(),
@@ -7354,7 +7601,11 @@ pub fn register_task_report_tool(
             });
             Ok(serde_json::Value::String(format!(
                 "已向任务看板报告 {task_id}（{result}）。任务进入 {} 状态。",
-                if result == "completed" { "human_review" } else { "todo" }
+                if result == "completed" {
+                    "human_review"
+                } else {
+                    "todo"
+                }
             )))
         })
     });
@@ -7510,7 +7761,6 @@ pub fn register_todo_tool(
     tm.replace(tool, Some(&role_id));
     Ok(())
 }
-
 
 /// Delegate-return gate: review a specialist's output before it flows
 /// back to the manager, checking (1) role-responsibility adherence and
@@ -7872,9 +8122,10 @@ async fn register_delegate_tool(
                     ))
                 })?
                 .clone();
-            let role = template.resolve(&default_params).await.map_err(|e| {
-                tool_err(format!("failed to resolve role '{}': {}", role_id, e))
-            })?;
+            let role = template
+                .resolve(&default_params)
+                .await
+                .map_err(|e| tool_err(format!("failed to resolve role '{}': {}", role_id, e)))?;
             // 角色模型指派优先取 resolver 最新快照：角色编辑器保存后
             // 新分派立即生效（merged 是 session 创建时的固化快照）。
             let (chain_ids, tier) = match resolver.role_model_assignment(&role.id) {
@@ -7890,9 +8141,7 @@ async fn register_delegate_tool(
             };
             let models = resolver
                 .resolve_chain(&role.id, tier, &chain_ids)
-                .map_err(|e| {
-                    tool_err(format!("no model for role '{}': {}", role_id, e))
-                })?;
+                .map_err(|e| tool_err(format!("no model for role '{}': {}", role_id, e)))?;
             // 熔断：delegate wall-clock 超时。解析顺序对齐 CLI
             // （chat.rs）：model.timeout_secs > env > UI 默认 900s。
             // 实测事故：无超时 → estimate 步骤的 programmer
@@ -7906,8 +8155,7 @@ async fn register_delegate_tool(
             //    DelegateStarted/Finished (the summary); the UI can
             //    right-click on those events and fetch the
             //    transcript via /api/sessions/.../subsessions/{sub_id}.
-            let (sub_id, sub_sink) =
-                subsession_store.create(session_id.as_str(), &role_id);
+            let (sub_id, sub_sink) = subsession_store.create(session_id.as_str(), &role_id);
             let _ = event_tx.send(ChatEvent::DelegateStarted {
                 from_role: "manager".into(),
                 to_role: role_id.clone(),
@@ -7967,9 +8215,7 @@ async fn register_delegate_tool(
                             state.clone(),
                             Some(sub_id.clone()),
                         )
-                        .map_err(|e| {
-                            tool_err(format!("register todo for '{}': {}", role_id, e))
-                        })?;
+                        .map_err(|e| tool_err(format!("register todo for '{}': {}", role_id, e)))?;
                     }
                     Some(state)
                 } else {
@@ -8042,11 +8288,7 @@ async fn register_delegate_tool(
             // 模型热更新：与主 runner / workflow step runner 对齐——
             // 「模型不可用暂停 → 用户 ▶ 恢复」重试前按 resolver 最新
             // 代际重建 model chain，用户在 UI 改的指派即刻生效。
-            runner = runner.with_model_hot_reload(
-                resolver.clone(),
-                tier,
-                chain_ids.clone(),
-            );
+            runner = runner.with_model_hot_reload(resolver.clone(), tier, chain_ids.clone());
 
             // Emit RoleStarted so the UI shows the specialist is working
             let task_clone = task.clone();
@@ -8062,19 +8304,24 @@ async fn register_delegate_tool(
             //    (`timeout_s`, resolved above) plus 500ms cancel_flag
             //    polling. 实测事故前无超时：子代理永不结束时
             //    父方永远等待。
-            let _permit = sem.acquire().await.map_err(|_| {
-                tool_err("delegate pool shut down".into())
-            })?;
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| tool_err("delegate pool shut down".into()))?;
             // Move runner + messages into a spawned task so we can
             // cancel it from the select! loop. The task owns everything.
             let task_content = task.clone();
             // 循环内 deadline（对齐 oh-my-pi）：让 agent 在临近超时时
             // 优雅退出返回 partial，而不是被 tokio timeout abort 丢失产出。
-            runner.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(timeout_s));
+            runner.set_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout_s),
+            );
             let mut run_handle = tokio::spawn(async move {
                 // gated 版：装了 gate_config 时产出先过 D5/D6；
                 // 没装时等价 run_turn。
-                runner.run_turn_gated(&[Message::user(task_content)], None).await
+                runner
+                    .run_turn_gated(&[Message::user(task_content)], None)
+                    .await
             });
             // abort-on-drop：**必须**有。下面的 select! 会在超时/取消
             // 分支里显式 abort，但那是这个 handler future 还在被 poll
@@ -8260,7 +8507,7 @@ async fn register_delegate_tool(
                     &role.system_prompt,
                     &task,
                     response,
-                    "", // manager delegate 路径，调用方无工具计数
+                    "",   // manager delegate 路径，调用方无工具计数
                     None, // manager delegate 无 step 级执行约束
                 )
                 .await
@@ -8349,16 +8596,12 @@ async fn register_delegate_tool(
         })
     });
 
-
     let usage = delegate_tool_hint(merged);
-    let tool = Tool::builder(
-        "delegate".to_string(),
-        usage,
-        input_schema,
-        handler,
-    )
-    .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
-    .build();
+    let tool = Tool::builder("delegate".to_string(), usage, input_schema, handler)
+        .timeout(std::time::Duration::from_secs(
+            ORCHESTRATION_TOOL_TIMEOUT_SECS,
+        ))
+        .build();
 
     tm.register(tool, Some("manager"));
     Ok(())
@@ -8406,7 +8649,11 @@ async fn register_workflow_tool(
         available
             .iter()
             .map(|(n, d)| {
-                if d.is_empty() { n.clone() } else { format!("{n} — {d}") }
+                if d.is_empty() {
+                    n.clone()
+                } else {
+                    format!("{n} — {d}")
+                }
             })
             .collect::<Vec<_>>()
             .join("; ")
@@ -8597,14 +8844,11 @@ async fn register_workflow_tool(
                 })
         })
     });
-    let tool = Tool::builder(
-        "workflow".to_string(),
-        usage,
-        input_schema,
-        handler,
-    )
-    .timeout(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS))
-    .build();
+    let tool = Tool::builder("workflow".to_string(), usage, input_schema, handler)
+        .timeout(std::time::Duration::from_secs(
+            ORCHESTRATION_TOOL_TIMEOUT_SECS,
+        ))
+        .build();
 
     tm.register(tool, Some("manager"));
     Ok(())
@@ -8696,14 +8940,15 @@ mod tests {
         };
         let handler: latte_rs_agent_tools::types::SharedToolHandler =
             Arc::new(|input, _ctx| Box::pin(async move { Ok(input) }));
-        let tool = latte_rs_agent_tools::types::Tool::builder(
-            "read", "test", schema, handler,
-        ).build();
+        let tool =
+            latte_rs_agent_tools::types::Tool::builder("read", "test", schema, handler).build();
         let wrapped = add_batch_read_contract(tool);
         let out = (wrapped.handler)(
             serde_json::json!({"paths": ["session://current"], "diagnostic": true}),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(out["files"][0]["path"], "session://current");
         assert_eq!(out["files"][0]["diagnostic"], true);
     }
@@ -8721,9 +8966,8 @@ mod tests {
         };
         let handler: latte_rs_agent_tools::types::SharedToolHandler =
             Arc::new(|input, _ctx| Box::pin(async move { Ok(input) }));
-        let tool = latte_rs_agent_tools::types::Tool::builder(
-            "read", "test", schema, handler,
-        ).build();
+        let tool =
+            latte_rs_agent_tools::types::Tool::builder("read", "test", schema, handler).build();
         add_batch_read_contract(tool)
     }
 
@@ -8738,7 +8982,9 @@ mod tests {
                 "paths": ["src/jemalloc.c:raw", "src/arena.c:raw"]
             }),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(out["count"], 2, "{out}");
         assert_eq!(out["files"][0]["path"], "src/jemalloc.c:raw");
         assert_eq!(out["files"][1]["path"], "src/arena.c:raw");
@@ -8752,7 +8998,9 @@ mod tests {
         let out = (wrapped.handler)(
             serde_json::json!({"path": "[\"src/sc.c:1-1\", \"src/decay.c:1-1\"]"}),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(out["count"], 2, "{out}");
         assert_eq!(out["files"][0]["path"], "src/sc.c:1-1");
         assert_eq!(out["files"][1]["path"], "src/decay.c:1-1");
@@ -8766,7 +9014,9 @@ mod tests {
         let out = (wrapped.handler)(
             serde_json::json!({"path": "src/sc.c:1-1"}),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(out["path"], "src/sc.c:1-1");
     }
 
@@ -8779,7 +9029,9 @@ mod tests {
         let out = (wrapped.handler)(
             serde_json::json!({"path": "", "paths": ["src/sc.c:1-1"]}),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(out["count"], 1, "{out}");
         assert_eq!(out["files"][0]["path"], "src/sc.c:1-1");
     }
@@ -8793,7 +9045,9 @@ mod tests {
         let out = (wrapped.handler)(
             serde_json::json!({"path": "src/sc.c:1-1", "paths": ["", "src/sz.c:1-1"]}),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(out["count"], 2, "{out}");
         assert_eq!(out["files"][0]["path"], "src/sz.c:1-1");
         assert_eq!(out["files"][1]["path"], "src/sc.c:1-1");
@@ -8808,7 +9062,9 @@ mod tests {
         let err = (wrapped.handler)(
             serde_json::json!({"path": "", "paths": [""], "maxSize": 1000}),
             ToolExecutionContext::fresh("read", 0),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("got neither"), "{message}");
         assert!(message.contains("\"path\""), "{message}");
@@ -8878,7 +9134,6 @@ mod tests {
         assert!(err.to_string().contains("signatures, full"));
     }
 
-
     #[test]
     fn plan_and_ask_publish_recursive_item_schemas() {
         let plan = serde_json::to_value(plan_input_schema()).expect("serialize plan schema");
@@ -8893,13 +9148,11 @@ mod tests {
         assert_eq!(task["properties"]["priority"]["minimum"], 1.0);
         assert_eq!(task["properties"]["priority"]["maximum"], 4.0);
         assert_eq!(
-            task["properties"]["subtasks"]["items"]["$ref"],
-            "#/$defs/planTask",
+            task["properties"]["subtasks"]["items"]["$ref"], "#/$defs/planTask",
             "subtasks 元素必须 $ref 自引用，才能表达任意深度"
         );
         assert_eq!(
-            plan["properties"]["tasks"]["items"]["$ref"],
-            "#/$defs/planTask",
+            plan["properties"]["tasks"]["items"]["$ref"], "#/$defs/planTask",
             "tasks 元素必须 $ref 到同一个定义"
         );
 
@@ -8939,6 +9192,7 @@ mod tests {
             task_type: None,
             workflow: None,
             paths: paths.iter().map(|s| s.to_string()).collect(),
+            depends_on: vec![],
             subtasks: vec![],
         }
     }
@@ -8965,7 +9219,13 @@ mod tests {
 
     #[test]
     fn plan_task_accepts_other_path_aliases() {
-        for key in ["involved_files", "affected_paths", "affected_files", "file_paths", "files"] {
+        for key in [
+            "involved_files",
+            "affected_paths",
+            "affected_files",
+            "file_paths",
+            "files",
+        ] {
             let v = serde_json::json!({ "title": "t", key: ["src/a.c"] });
             let t: PlanTask = serde_json::from_value(v).unwrap_or_else(|e| panic!("{key}: {e}"));
             assert_eq!(t.paths, vec!["src/a.c"], "别名 {key} 必须映射到 paths");
@@ -8974,8 +9234,9 @@ mod tests {
 
     #[test]
     fn unknown_plan_task_keys_reports_dropped_fields() {
-        // workflow 产出的 id/week/dependencies/risks 是合法附加信息，
-        // 不拦但要回执；paths 的别名不算未知键。
+        // workflow 产出的 id/week/risks 是合法附加信息，不拦但要回执；
+        // paths / depends_on 的别名不算未知键（`dependencies` 现在是
+        // depends_on 的别名，会被真正读进来，不再进回执清单）。
         let arr = vec![
             serde_json::json!({
                 "title": "a",
@@ -8992,8 +9253,8 @@ mod tests {
         let got = unknown_plan_task_keys(&arr);
         assert_eq!(
             got,
-            vec!["dependencies", "id", "risks", "week"],
-            "未知键必须去重、稳定排序，并递归覆盖 subtasks；paths 别名不算未知"
+            vec!["id", "risks", "week"],
+            "未知键必须去重、稳定排序，并递归覆盖 subtasks；paths/depends_on 别名不算未知"
         );
     }
 
@@ -9008,7 +9269,10 @@ mod tests {
             "paths": ["src/a.c"],
             "subtasks": [],
         })];
-        assert!(unknown_plan_task_keys(&arr).is_empty(), "全合法键不应有回执");
+        assert!(
+            unknown_plan_task_keys(&arr).is_empty(),
+            "全合法键不应有回执"
+        );
     }
 
     // ─── workflow 名提交侧校验 ────────────────────────────────────
@@ -9023,7 +9287,9 @@ mod tests {
         for n in names {
             std::fs::write(
                 dir.join(format!("{n}.toml")),
-                format!("name = \"{n}\"\n[[steps]]\nid = \"s\"\nspeakers = [\"pm\"]\nprompt = \"x\"\n"),
+                format!(
+                    "name = \"{n}\"\n[[steps]]\nid = \"s\"\nspeakers = [\"pm\"]\nprompt = \"x\"\n"
+                ),
             )
             .unwrap();
         }
@@ -9085,7 +9351,10 @@ mod tests {
         t.subtasks[0].task_type = Some("ghost_type".into());
         let err = validate_plan_task_types(cwd, &mut [t]).expect_err("未知 task_type 必须拒绝");
         assert!(err.contains("unknown task_type 'explore'"), "{err}");
-        assert!(err.contains("ghost_type"), "子任务的 task_type 也要报：{err}");
+        assert!(
+            err.contains("ghost_type"),
+            "子任务的 task_type 也要报：{err}"
+        );
         assert!(err.contains("feature"), "已知类型列表要给出：{err}");
         assert!(err.contains("留空"), "{err}");
         assert!(
@@ -9135,7 +9404,10 @@ mod tests {
         .unwrap();
         let mut t = plan_task("t", &[], &[]);
         t.task_type = Some("spike".into());
-        assert!(validate_plan_task_types(cwd, &mut [t]).is_ok(), "项目层增补类型必须放行");
+        assert!(
+            validate_plan_task_types(cwd, &mut [t]).is_ok(),
+            "项目层增补类型必须放行"
+        );
     }
 
     /// 纯阅读/学习类任务共用同一份代码是正常的（不会互相覆盖），
@@ -9151,11 +9423,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join("include/foo/internal")).unwrap();
         let tasks = vec![
             plan_task("P1 读公共头", &["学习", "只读"], &["include/foo"]),
-            plan_task(
-                "P2 读内部头",
-                &["只读"],
-                &["include/foo/internal"],
-            ),
+            plan_task("P2 读内部头", &["只读"], &["include/foo/internal"]),
         ];
         assert!(validate_plan_paths(cwd, &tasks).is_ok());
         // 同样的路径，但任务没有只读标记 → 仍然拦。
@@ -9190,14 +9458,21 @@ mod tests {
         // task_type = learn → 同样严格。
         let mut by_type = plan_task("T2 研读", &[], &[ghost]);
         by_type.task_type = Some("learn".into());
-        assert!(validate_plan_paths(cwd, &[by_type]).is_err(), "learn 类型应走严格档");
+        assert!(
+            validate_plan_paths(cwd, &[by_type]).is_err(),
+            "learn 类型应走严格档"
+        );
 
         // 真实存在的文件照常放行。
         let ok = vec![plan_task("T3 研读 tsd", &["只读"], &[real])];
         assert!(validate_plan_paths(cwd, &ok).is_ok(), "存在的文件不该被拦");
 
         // 实现类任务：文件还不存在是正常的（要新建），保持宽松。
-        let feature = vec![plan_task("T4 新建实现文件", &[], &["include/jemalloc/internal/brand_new.h"])];
+        let feature = vec![plan_task(
+            "T4 新建实现文件",
+            &[],
+            &["include/jemalloc/internal/brand_new.h"],
+        )];
         assert!(
             validate_plan_paths(cwd, &feature).is_ok(),
             "实现类任务允许 paths 指向待新建文件"
@@ -9220,7 +9495,10 @@ mod tests {
         parent.subtasks = vec![leaf];
 
         let err = validate_plan_paths(cwd, &[parent]).expect_err("子任务的幻觉文件必须被拦");
-        assert!(err.contains("chunk.c"), "错误要点名子任务里的那个路径：{err}");
+        assert!(
+            err.contains("chunk.c"),
+            "错误要点名子任务里的那个路径：{err}"
+        );
     }
 
     /// 任意深度任务树：三个校验器都必须下探到第三层（孙任务）。
@@ -9251,8 +9529,8 @@ mod tests {
         assert!(err.contains("ghost_wf"), "{err}");
 
         let mut tasks = vec![root];
-        let err = validate_plan_task_types(cwd, &mut tasks)
-            .expect_err("孙任务的未知 task_type 必须被拦");
+        let err =
+            validate_plan_task_types(cwd, &mut tasks).expect_err("孙任务的未知 task_type 必须被拦");
         assert!(err.contains("ghost_type"), "{err}");
     }
 
@@ -9448,7 +9726,12 @@ mod tests {
             delta: "半句话".into(),
         });
         match rx.try_recv().unwrap() {
-            ChatEvent::RoleTurn { content, is_complete, sub_id, .. } => {
+            ChatEvent::RoleTurn {
+                content,
+                is_complete,
+                sub_id,
+                ..
+            } => {
                 assert_eq!(content, "半句话");
                 assert!(!is_complete, "delta 是增量，不是终态");
                 assert_eq!(
@@ -9463,7 +9746,10 @@ mod tests {
         // 主 session 角色（sub_id: None）仍然不带 —— 不能反过来给主
         // 角色的流硬塞一个 sub_id。
         let (tx2, mut rx2) = broadcast::channel(8);
-        let main_sink = ChatEventTraceSink { event_tx: tx2, sub_id: None };
+        let main_sink = ChatEventTraceSink {
+            event_tx: tx2,
+            sub_id: None,
+        };
         main_sink.emit(crate::trace::TraceEvent::ModelDelta {
             meta: crate::trace::TraceMeta::test_default(),
             delta: "主角色".into(),
@@ -9479,7 +9765,10 @@ mod tests {
         use crate::trace::TraceSink as _;
 
         let (tx, mut rx) = broadcast::channel(8);
-        let sink = ChatEventTraceSink { event_tx: tx, sub_id: None };
+        let sink = ChatEventTraceSink {
+            event_tx: tx,
+            sub_id: None,
+        };
 
         // ParseToolCalls → one ToolUse per parsed call (this is what
         // lets the advisor monitor see routing decisions like the
@@ -9509,14 +9798,18 @@ mod tests {
         });
 
         match rx.try_recv().unwrap() {
-            ChatEvent::ToolUse { tool_name, args, .. } => {
+            ChatEvent::ToolUse {
+                tool_name, args, ..
+            } => {
                 assert_eq!(tool_name, "workflow");
                 assert!(args.contains("design_brainstorm"));
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
         match rx.try_recv().unwrap() {
-            ChatEvent::ToolError { tool_name, error, .. } => {
+            ChatEvent::ToolError {
+                tool_name, error, ..
+            } => {
                 assert_eq!(tool_name, "workflow");
                 assert!(error.contains("all models unavailable"));
             }
@@ -9591,7 +9884,11 @@ mod tests {
     fn delegate_hint_lists_roles_from_config() {
         let mut cfg = AgentConfig::default();
         for (id, name, desc) in [
-            ("programmer", "Software Engineer", "动手改代码：实现功能、修 bug、跑构建验证"),
+            (
+                "programmer",
+                "Software Engineer",
+                "动手改代码：实现功能、修 bug、跑构建验证",
+            ),
             ("my_custom_role", "", ""),
         ] {
             cfg.roles.insert(
@@ -9607,17 +9904,23 @@ mod tests {
                     tools: vec!["read".into(), "write".into()],
                     icon: String::new(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: desc.into(),
                 },
             );
         }
         let hint = delegate_tool_hint(&cfg);
         // 详情花名册：id + 显示名 + 职责 + 类别 + 工具
-        assert!(hint.contains("`programmer`（Software Engineer）"), "hint: {hint}");
+        assert!(
+            hint.contains("`programmer`（Software Engineer）"),
+            "hint: {hint}"
+        );
         assert!(hint.contains("动手改代码"), "hint: {hint}");
         // 没写描述的自定义角色回退到「类别 + 工具」派生简介
-        assert!(hint.contains("`my_custom_role` — 执行类角色【执行；tools: read, write】"), "hint: {hint}");
+        assert!(
+            hint.contains("`my_custom_role` — 执行类角色【执行；tools: read, write】"),
+            "hint: {hint}"
+        );
         // 细化后的说明必须覆盖：动态花名册语义、id 传参、并行扇出、
         // 派发幂等、结果处理。
         assert!(hint.contains("动态生成"), "hint: {hint}");
@@ -9626,7 +9929,10 @@ mod tests {
         assert!(hint.contains("Reading results"), "hint: {hint}");
         // 紧凑花名册仍保持排序（schema / 系统提示用）：my_custom_role 在 programmer 前
         let roster = role_roster_text(&cfg);
-        assert!(roster.contains("programmer(Software Engineer)"), "roster: {roster}");
+        assert!(
+            roster.contains("programmer(Software Engineer)"),
+            "roster: {roster}"
+        );
         assert!(roster.find("my_custom_role").unwrap() < roster.find("programmer").unwrap());
     }
 
@@ -9664,8 +9970,16 @@ mod tests {
         let wf = |name: &str, desc: &str| {
             format!("name = \"{name}\"\ndescription = \"{desc}\"\n[[steps]]\nid = \"a\"\nspeakers = [\"tester\"]\nprompt = \"{{{{topic}}}}\"\n")
         };
-        std::fs::write(wf_dir.join("wf_a.toml"), wf("wf_a", "甲流程｜落点：任务看板条目（弹窗导入）")).unwrap();
-        std::fs::write(wf_dir.join("wf_b.toml"), wf("wf_b", "乙流程｜落点：任务看板条目（弹窗导入）")).unwrap();
+        std::fs::write(
+            wf_dir.join("wf_a.toml"),
+            wf("wf_a", "甲流程｜落点：任务看板条目（弹窗导入）"),
+        )
+        .unwrap();
+        std::fs::write(
+            wf_dir.join("wf_b.toml"),
+            wf("wf_b", "乙流程｜落点：任务看板条目（弹窗导入）"),
+        )
+        .unwrap();
         std::fs::write(wf_dir.join("wf_c.toml"), wf("wf_c", "丙流程，没写落点")).unwrap();
         let hint = workflow_tool_hint(project.path());
         match prev {
@@ -9696,11 +10010,11 @@ mod tests {
     fn workflow_hint_selects_by_deliverable_landing_not_topic() {
         let dir = tempfile::tempdir().unwrap();
         let hint = workflow_tool_hint(dir.path());
+        assert!(hint.contains("按交付物落点，不按话题词"), "hint: {hint}");
         assert!(
-            hint.contains("按交付物落点，不按话题词"),
-            "hint: {hint}"
+            hint.contains("落点："),
+            "hint 必须指向清单里的落点标注: {hint}"
         );
-        assert!(hint.contains("落点："), "hint 必须指向清单里的落点标注: {hint}");
         assert!(
             hint.contains("几个不同落点，就发几个 workflow 调用"),
             "hint: {hint}"
@@ -9737,7 +10051,10 @@ mod tests {
             .join("workflows");
         let mut missing: Vec<String> = Vec::new();
         let mut checked = 0usize;
-        for e in std::fs::read_dir(&dir).expect("config/workflows 必须存在").flatten() {
+        for e in std::fs::read_dir(&dir)
+            .expect("config/workflows 必须存在")
+            .flatten()
+        {
             let path = e.path();
             if path.extension().and_then(|s| s.to_str()) != Some("toml") {
                 continue;
@@ -9922,7 +10239,11 @@ mod tests {
             },
         ];
         let plan = compute_waves(&steps);
-        assert_eq!(plan.waves.len(), 2, "research and plan should be in separate waves");
+        assert_eq!(
+            plan.waves.len(),
+            2,
+            "research and plan should be in separate waves"
+        );
         assert_eq!(plan.waves[0].steps, vec![0], "wave 0 should be research");
         assert_eq!(plan.waves[1].steps, vec![1], "wave 1 should be plan");
     }
@@ -9989,7 +10310,11 @@ mod tests {
         assert_eq!(plan.waves.len(), 3, "diamond should be 3 waves");
         assert_eq!(plan.waves[0].steps, vec![0], "wave 0 should be research");
         // Wave 1: review + test (both depend on research, independent of each other)
-        assert_eq!(plan.waves[1].steps.len(), 2, "wave 1 should have 2 parallel steps");
+        assert_eq!(
+            plan.waves[1].steps.len(),
+            2,
+            "wave 1 should have 2 parallel steps"
+        );
         assert!(plan.waves[1].steps.contains(&1));
         assert!(plan.waves[1].steps.contains(&2));
         assert_eq!(plan.waves[2].steps, vec![3], "wave 2 should be plan");
@@ -10038,7 +10363,10 @@ mod tests {
             wf_id: None,
         };
         let json = serde_json::to_value(&event).expect("serialize");
-        assert!(json.get("DelegateFinished").is_some(), "missing variant tag");
+        assert!(
+            json.get("DelegateFinished").is_some(),
+            "missing variant tag"
+        );
         assert_eq!(json["DelegateFinished"]["from_role"], "manager");
         assert_eq!(json["DelegateFinished"]["to_role"], "programmer");
         assert_eq!(json["DelegateFinished"]["status"], "ok");
@@ -10062,6 +10390,7 @@ mod tests {
                     task_type: Some("feature".into()),
                     workflow: Some("tdd_development".into()),
                     paths: vec!["src/ringbuf".into()],
+                    depends_on: vec![],
                     subtasks: vec![],
                 },
                 PlanTask {
@@ -10072,6 +10401,7 @@ mod tests {
                     task_type: None,
                     workflow: None,
                     paths: vec![],
+                    depends_on: vec![],
                     subtasks: vec![],
                 },
             ],
@@ -10091,7 +10421,10 @@ mod tests {
         assert_eq!(tasks[0]["paths"], serde_json::json!(["src/ringbuf"]));
         // 第二项：空字段被 skip_serializing_if 省略（title 必留）。
         assert_eq!(tasks[1]["title"], "补测试");
-        assert!(tasks[1].get("description").is_none(), "空 description 应省略");
+        assert!(
+            tasks[1].get("description").is_none(),
+            "空 description 应省略"
+        );
         assert!(tasks[1].get("priority").is_none(), "None priority 应省略");
         assert!(tasks[1].get("labels").is_none(), "空 labels 应省略");
         assert!(tasks[1].get("paths").is_none(), "空 paths 应省略");
@@ -10306,8 +10639,19 @@ mod tests {
     #[test]
     fn plan_mode_filter_keeps_readonly_drops_mutating_and_orchestration() {
         let allowed: Vec<String> = [
-            "read", "write", "edit", "bash", "search", "code_graph", "ask", "plan", "todo",
-            "delegate", "workflow", "task_report", "generate_image",
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "search",
+            "code_graph",
+            "ask",
+            "plan",
+            "todo",
+            "delegate",
+            "workflow",
+            "task_report",
+            "generate_image",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -10316,7 +10660,14 @@ mod tests {
         for t in ["read", "search", "code_graph", "ask", "plan", "todo"] {
             assert!(kept.iter().any(|k| k == t), "应保留 {t}");
         }
-        for t in ["write", "edit", "bash", "delegate", "workflow", "task_report"] {
+        for t in [
+            "write",
+            "edit",
+            "bash",
+            "delegate",
+            "workflow",
+            "task_report",
+        ] {
             assert!(!kept.iter().any(|k| k == t), "应剔除 {t}");
         }
     }
@@ -10325,7 +10676,10 @@ mod tests {
     fn plan_mode_changed_serializes_externally_tagged() {
         let ev = ChatEvent::PlanModeChanged { active: true };
         let v = serde_json::to_value(&ev).expect("serialize");
-        assert_eq!(v, serde_json::json!({ "PlanModeChanged": { "active": true } }));
+        assert_eq!(
+            v,
+            serde_json::json!({ "PlanModeChanged": { "active": true } })
+        );
         let back: ChatEvent = serde_json::from_value(v).expect("deserialize");
         assert!(matches!(back, ChatEvent::PlanModeChanged { active: true }));
     }
@@ -10386,21 +10740,28 @@ mod tests {
                 tiers: None,
                 role_tiers: None,
             },
-            roles: [("planner".to_string(), RoleTemplate {
-                id: "planner".into(),
-                name: "planner".into(),
-                category: "execution".into(),
-                model_tier: "standard".into(),
-                model_chain: vec![],
-                prompt_file: None,
-                temperature: None,
-                tools: ["read", "write", "bash", "search", "plan", "ask", "todo", "delegate"]
-                    .iter().map(|s| s.to_string()).collect(),
-                icon: String::new(),
-                skills: vec![],
-                code_paths: vec![],
-                description: String::new(),
-            })]
+            roles: [(
+                "planner".to_string(),
+                RoleTemplate {
+                    id: "planner".into(),
+                    name: "planner".into(),
+                    category: "execution".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: [
+                        "read", "write", "bash", "search", "plan", "ask", "todo", "delegate",
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
             .into_iter()
             .collect(),
         };
@@ -10456,7 +10817,8 @@ mod tests {
     }
 
     #[test]
-    fn default_max_delegates_respects_env_and_default() {        // env 缺失 → 0 = 不限制（改自旧默认 12：单 session 的
+    fn default_max_delegates_respects_env_and_default() {
+        // env 缺失 → 0 = 不限制（改自旧默认 12：单 session 的
         // delegate 次数改由 wall-clock timeout 与死循环熔断兜底，
         // 不再用一个固定次数硬砍）。
         let _g = lock_env();
@@ -10480,7 +10842,9 @@ mod tests {
         let check = |c: &std::sync::atomic::AtomicU32| -> Result<(), String> {
             let used = c.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if max > 0 && used > max {
-                Err(format!("本 session 已用尽 {max} 次 delegate（当前 {used}）"))
+                Err(format!(
+                    "本 session 已用尽 {max} 次 delegate（当前 {used}）"
+                ))
             } else {
                 Ok(())
             }
@@ -10504,13 +10868,22 @@ mod tests {
         };
         // 实现类角色被拒（含细分前缀），消息带 plan_id。
         for rid in ["programmer", "programmer_backend", "devops", "devops_k8s"] {
-            let msg = plan_gate_rejection(&stage, rid)
-                .unwrap_or_else(|| panic!("{rid} 应被阶段门拒绝"));
+            let msg =
+                plan_gate_rejection(&stage, rid).unwrap_or_else(|| panic!("{rid} 应被阶段门拒绝"));
             assert!(msg.contains("plan-manager-7"), "{msg}");
             assert!(msg.contains("尚未获用户批准"), "{msg}");
         }
         // 分析/设计/审查类角色放行。
-        for rid in ["pm", "architect", "architect_system", "designer_ui", "reviewer", "tester", "security", "tech_writer"] {
+        for rid in [
+            "pm",
+            "architect",
+            "architect_system",
+            "designer_ui",
+            "reviewer",
+            "tester",
+            "security",
+            "tech_writer",
+        ] {
             assert!(
                 plan_gate_rejection(&stage, rid).is_none(),
                 "{rid} 不应被阶段门拦截"
@@ -10529,8 +10902,15 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            std::path::Path::new("."),
+            String::new(),
+        )
+        .expect("register plan");
 
         let out = tm
             .execute(
@@ -10566,8 +10946,15 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut _rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            std::path::Path::new("."),
+            String::new(),
+        )
+        .expect("register plan");
 
         let out = tm
             .execute(
@@ -10614,8 +11001,15 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            std::path::Path::new("."),
+            String::new(),
+        )
+        .expect("register plan");
 
         let err = tm
             .execute(
@@ -10644,8 +11038,15 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            std::path::Path::new("."),
+            String::new(),
+        )
+        .expect("register plan");
 
         let out = tm
             .execute(
@@ -10707,22 +11108,32 @@ mod tests {
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
         let summary = "VERDICT: PASS\n```json\n{\"tasks\": [{\"title\": \"任务甲\"}, {\"title\": \"任务乙\"}]}\n```";
-        assert!(propose_plan_from_summary(&event_tx, &stage, "manager", summary, None));
+        assert!(propose_plan_from_summary(
+            &event_tx, &stage, "manager", summary, None
+        ));
 
         let ev = rx.try_recv().expect("PlanProposed event");
-        let ChatEvent::PlanProposed { role_id, plan_id, tasks } = ev else {
+        let ChatEvent::PlanProposed {
+            role_id,
+            plan_id,
+            tasks,
+        } = ev
+        else {
             panic!("expected PlanProposed, got {ev:?}");
         };
         assert_eq!(role_id, "manager");
         assert_eq!(tasks.len(), 2);
-        assert_eq!(
-            stage.read().clone(),
-            PlanStage::PendingApproval { plan_id }
-        );
+        assert_eq!(stage.read().clone(), PlanStage::PendingApproval { plan_id });
 
         // 无任务清单的产出：不提案、不动阶段门（复位后验证）。
         *stage.write() = PlanStage::Normal;
-        assert!(!propose_plan_from_summary(&event_tx, &stage, "manager", "没有任何清单", None));
+        assert!(!propose_plan_from_summary(
+            &event_tx,
+            &stage,
+            "manager",
+            "没有任何清单",
+            None
+        ));
         assert!(rx.try_recv().is_err(), "不应再发事件");
         assert_eq!(stage.read().clone(), PlanStage::Normal);
     }
@@ -10791,7 +11202,8 @@ mod tests {
     async fn ask_event_carries_pros_cons_and_multi() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "architect".into(), None, None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "architect".into(), None, None, None)
+            .expect("register ask");
 
         let input = serde_json::json!({
             "question": "鉴权方案？",
@@ -10855,7 +11267,9 @@ mod tests {
         let (event_tx, mut rx) = broadcast::channel(8);
         register_ask_tool(&tm, event_tx, "tutor".into(), None, None, None).expect("register ask");
 
-        tm.execute("ask", ask_input(), None).await.expect("ask call");
+        tm.execute("ask", ask_input(), None)
+            .await
+            .expect("ask call");
         let ev = rx.try_recv().expect("ChoiceRequested event");
         let ChatEvent::ChoiceRequested { multi, .. } = ev else {
             panic!("expected ChoiceRequested, got {ev:?}");
@@ -11080,7 +11494,10 @@ mod tests {
         let (event_tx, mut rx) = broadcast::channel(8);
         register_ask_tool(&tm, event_tx, "manager".into(), None, None, None).expect("register ask");
 
-        let out = tm.execute("ask", ask_input(), None).await.expect("ask call");
+        let out = tm
+            .execute("ask", ask_input(), None)
+            .await
+            .expect("ask call");
         let text = out.as_str().expect("string result");
         assert!(text.contains("结束本轮"), "{text}");
 
@@ -11116,7 +11533,10 @@ mod tests {
         // 事件必须带 wait=true；拿到 choice_id 后模拟 UI 提交答案。
         let choice_id = loop {
             let ev = rx.recv().await.expect("event");
-            if let ChatEvent::ChoiceRequested { choice_id, wait, .. } = ev {
+            if let ChatEvent::ChoiceRequested {
+                choice_id, wait, ..
+            } = ev
+            {
                 assert!(wait, "阻塞 ask 必须 wait=true");
                 break choice_id;
             }
@@ -11155,7 +11575,9 @@ mod tests {
         let tool = tm.get_tool("ask").expect("ask 已注册");
         assert_eq!(
             tool.timeout,
-            Some(std::time::Duration::from_secs(ORCHESTRATION_TOOL_TIMEOUT_SECS)),
+            Some(std::time::Duration::from_secs(
+                ORCHESTRATION_TOOL_TIMEOUT_SECS
+            )),
             "阻塞 ask 必须显式声明超时，否则被工具管理器默认值熔断"
         );
         // 25min（工具管理器默认）远小于本值——回归防线：一旦有人把
@@ -11170,17 +11592,39 @@ mod tests {
     #[test]
     fn lenient_bool_accepts_model_dialects() {
         use serde_json::json;
-        for v in [json!(true), json!("true"), json!("True"), json!("  TRUE "),
-                  json!("yes"), json!("1"), json!("on"), json!(1)] {
+        for v in [
+            json!(true),
+            json!("true"),
+            json!("True"),
+            json!("  TRUE "),
+            json!("yes"),
+            json!("1"),
+            json!("on"),
+            json!(1),
+        ] {
             assert_eq!(lenient_bool(&v), Some(true), "should be true: {v}");
         }
-        for v in [json!(false), json!("false"), json!("FALSE"), json!("no"),
-                  json!("0"), json!("off"), json!(0)] {
+        for v in [
+            json!(false),
+            json!("false"),
+            json!("FALSE"),
+            json!("no"),
+            json!("0"),
+            json!("off"),
+            json!(0),
+        ] {
             assert_eq!(lenient_bool(&v), Some(false), "should be false: {v}");
         }
         // 无法识别的形态 → None（调用点自行决定默认值）。
-        for v in [json!("maybe"), json!(2), json!(-1), json!(1.5), json!(null),
-                  json!([]), json!({})] {
+        for v in [
+            json!("maybe"),
+            json!(2),
+            json!(-1),
+            json!(1.5),
+            json!(null),
+            json!([]),
+            json!({}),
+        ] {
             assert_eq!(lenient_bool(&v), None, "should be None: {v}");
         }
     }
@@ -11228,7 +11672,9 @@ mod tests {
                 {"label": "B", "recommended": 7},
             ]
         });
-        tm.execute("ask", input, None).await.expect("垃圾值不该失败");
+        tm.execute("ask", input, None)
+            .await
+            .expect("垃圾值不该失败");
         let ChatEvent::ChoiceRequested { options, .. } = rx.try_recv().expect("event") else {
             panic!("expected ChoiceRequested");
         };
@@ -11257,7 +11703,8 @@ mod tests {
     async fn ask_normalizes_wrapped_options_and_aliases() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_ask_tool(&tm, event_tx, "programmer".into(), None, None, None).expect("register ask");
+        register_ask_tool(&tm, event_tx, "programmer".into(), None, None, None)
+            .expect("register ask");
 
         let input = serde_json::json!({
             "question": "归档份数：你希望按哪种粒度归档？",
@@ -11267,9 +11714,12 @@ mod tests {
             ]},
             "multi": "false"
         });
-        ask_via_pipeline(&tm, input).await.expect("包一层的 options 应被解开");
+        ask_via_pipeline(&tm, input)
+            .await
+            .expect("包一层的 options 应被解开");
 
-        let ChatEvent::ChoiceRequested { options, multi, .. } = rx.try_recv().expect("event") else {
+        let ChatEvent::ChoiceRequested { options, multi, .. } = rx.try_recv().expect("event")
+        else {
             panic!("expected ChoiceRequested");
         };
         assert!(!multi, "\"false\" 字符串必须解析成 false");
@@ -11295,8 +11745,11 @@ mod tests {
             "allow_upload": 1
         });
         ask_via_pipeline(&tm, input).await.expect("ask call");
-        let ChatEvent::ChoiceRequested { multi, allow_upload, .. } =
-            rx.try_recv().expect("event")
+        let ChatEvent::ChoiceRequested {
+            multi,
+            allow_upload,
+            ..
+        } = rx.try_recv().expect("event")
         else {
             panic!("expected ChoiceRequested");
         };
@@ -11401,8 +11854,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -11559,7 +12012,10 @@ mod tests {
                 break choice_id;
             }
         };
-        assert!(crate::choice::resolve(&choice_id, "改源码/做实现".to_string()));
+        assert!(crate::choice::resolve(
+            &choice_id,
+            "改源码/做实现".to_string()
+        ));
         let first = call.await.expect("join").expect("ask ok");
         assert!(first.as_str().expect("str").contains("改源码/做实现"));
 
@@ -11572,10 +12028,7 @@ mod tests {
         // 第二次（模拟 step 重试后的全新 subagent 又问同一题）：
         // 必须直接返回旧答案，且**不再**发 ChoiceRequested。
         while rx.try_recv().is_ok() {} // 清空历史事件
-        let second = tm
-            .execute("ask", input, None)
-            .await
-            .expect("重放不该失败");
+        let second = tm.execute("ask", input, None).await.expect("重放不该失败");
         let text = second.as_str().expect("str");
         assert!(text.contains("此前已回答"), "{text}");
         assert!(text.contains("改源码/做实现"), "{text}");
@@ -11661,8 +12114,14 @@ mod tests {
                 .collect()
         };
         for (raw, label) in [
-            (include_str!("../../config/agents/programmer.toml"), "config/agents"),
-            (include_str!("../../.latte/agents/programmer.toml"), ".latte/agents"),
+            (
+                include_str!("../../config/agents/programmer.toml"),
+                "config/agents",
+            ),
+            (
+                include_str!("../../.latte/agents/programmer.toml"),
+                ".latte/agents",
+            ),
         ] {
             let tools = tools_of(raw, label);
             assert!(
@@ -11714,8 +12173,15 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            std::path::Path::new("."),
+            String::new(),
+        )
+        .expect("register plan");
 
         tm.execute(
             "plan",
@@ -11764,8 +12230,15 @@ mod tests {
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
         let sid = "ui-test-direct-gate-1";
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), sid.to_string())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            sid.to_string(),
+        )
+        .expect("register plan");
 
         // 2 个任务的小清单：低于门禁阈值，直接放行。
         tm.execute(
@@ -11818,8 +12291,15 @@ mod tests {
             "{\"type\":\"meta\",\"wf_id\":\"wf-x\",\"workflow_name\":\"implementation_plan\",\"topic\":\"t\",\"started_at\":1,\"session_id\":\"ui-test-direct-gate-2\"}\n",
         )
         .unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), sid.to_string())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            sid.to_string(),
+        )
+        .expect("register plan");
 
         tm.execute(
             "plan",
@@ -11841,8 +12321,15 @@ mod tests {
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            String::new(),
+        )
+        .expect("register plan");
 
         let err = tm
             .execute(
@@ -11873,8 +12360,15 @@ mod tests {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), std::path::Path::new("."), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            std::path::Path::new("."),
+            String::new(),
+        )
+        .expect("register plan");
 
         let err = tm
             .execute(
@@ -11911,8 +12405,15 @@ mod tests {
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            String::new(),
+        )
+        .expect("register plan");
 
         tm.execute(
             "plan",
@@ -11932,8 +12433,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
         std::fs::create_dir_all(dir.path().join("src/cache")).unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            String::new(),
+        )
+        .expect("register plan");
 
         let err = tm
             .execute(
@@ -11952,7 +12460,10 @@ mod tests {
         // 256 字节，罗列式清单会被截断，模型看不全就改不动。
         assert!(msg.contains("src/ringbuf"), "{msg}");
         assert!(msg.contains("paths 范围重叠"), "{msg}");
-        assert!(!msg.contains("src/cache"), "不该牵连无重叠的任务范围: {msg}");
+        assert!(
+            !msg.contains("src/cache"),
+            "不该牵连无重叠的任务范围: {msg}"
+        );
         assert!(msg.len() <= 256, "错误必须塞进 256 字节: {msg}");
         assert_eq!(stage.read().clone(), PlanStage::Normal);
 
@@ -11969,6 +12480,60 @@ mod tests {
         .expect("互不重叠应放行");
     }
 
+    /// 声明了 `depends_on` 的一对任务允许 paths 重叠：看板保证它们串行
+    /// 执行（依赖 done 才派发），重叠只在并发时有害。「实现」与「为它补
+    /// 测试」天然改同一批文件，逼模型拆开只会拿到假声明。
+    #[tokio::test]
+    async fn plan_tool_allows_overlapping_paths_when_dependency_declared() {
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(8);
+        let stage = fresh_plan_stage();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/ringbuf")).unwrap();
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            String::new(),
+        )
+        .expect("register plan");
+
+        tm.execute(
+            "plan",
+            serde_json::json!({ "tasks": [
+                { "title": "写 ringbuf 测试", "paths": ["src/ringbuf"] },
+                // 依赖上一条（按标题引用）→ 串行，重叠放行
+                { "title": "实现 ringbuf", "paths": ["src/ringbuf/read.rs"],
+                  "depends_on": ["写 ringbuf 测试"] }
+            ]}),
+            None,
+        )
+        .await
+        .expect("有依赖关系的重叠应放行");
+        assert!(matches!(*stage.read(), PlanStage::PendingApproval { .. }));
+    }
+
+    /// `dependencies`（workflow 产出的既有字段名）等别名收编进
+    /// `depends_on`，不再被静默丢弃。
+    #[test]
+    fn plan_task_accepts_dependencies_alias() {
+        let pt: PlanTask = serde_json::from_value(serde_json::json!({
+            "title": "实现",
+            "dependencies": ["写测试"],
+        }))
+        .expect("parse");
+        assert_eq!(pt.depends_on, vec!["写测试".to_string()]);
+        // 未知键回执不该再点名 dependencies（它现在是已知别名）。
+        let dropped = unknown_plan_task_keys(&[serde_json::json!({
+            "title": "实现",
+            "dependencies": ["写测试"],
+            "week": 3,
+        })]);
+        assert_eq!(dropped, vec!["week".to_string()]);
+    }
+
     /// 空 paths = 未声明范围：不做校验直接过（与现状语义一致）。
     #[tokio::test]
     async fn plan_tool_skips_validation_for_undeclared_paths() {
@@ -11976,8 +12541,15 @@ mod tests {
         let (event_tx, _rx) = broadcast::channel(8);
         let stage = fresh_plan_stage();
         let dir = tempfile::tempdir().unwrap();
-        register_plan_tool(&tm, event_tx, "manager".into(), stage.clone(), dir.path(), String::new())
-            .expect("register plan");
+        register_plan_tool(
+            &tm,
+            event_tx,
+            "manager".into(),
+            stage.clone(),
+            dir.path(),
+            String::new(),
+        )
+        .expect("register plan");
 
         tm.execute(
             "plan",
@@ -12135,8 +12707,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12281,8 +12853,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12307,7 +12879,7 @@ mod tests {
                     tools: vec![],
                     icon: "👔".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             )]
@@ -12491,8 +13063,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12717,7 +13289,8 @@ mod tests {
                 .await
                 .expect("wait for parked status")
                 .expect("recv");
-            if matches!(ev, ChatEvent::Status { ref message } if message.contains("▶ 继续后执行")) {
+            if matches!(ev, ChatEvent::Status { ref message } if message.contains("▶ 继续后执行"))
+            {
                 break;
             }
         }
@@ -12732,20 +13305,19 @@ mod tests {
                 ChatEvent::UserMessage { text } if text == "不要执行这条" => {
                     panic!("cancelled parked input must never start")
                 }
-                ChatEvent::Status { message } if message.contains("已取消暂停中等待执行的输入") => {
+                ChatEvent::Status { message } if message.contains("已取消暂停中等待执行的输入") =>
+                {
                     break;
                 }
                 _ => {}
             }
         }
 
-        assert!(
-            controller
-                .resume_session()
-                .await
-                .gate_paused_for_ms
-                .is_some()
-        );
+        assert!(controller
+            .resume_session()
+            .await
+            .gate_paused_for_ms
+            .is_some());
         controller.submit_input("恢复后的新输入").await;
         loop {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
@@ -12770,7 +13342,9 @@ mod tests {
         loop {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
                 .await
-                .unwrap_or_else(|_| panic!("等 UserMessage('{expect}') 超时 —— driver 没在消费输入"))
+                .unwrap_or_else(|_| {
+                    panic!("等 UserMessage('{expect}') 超时 —— driver 没在消费输入")
+                })
                 .expect("recv");
             if let ChatEvent::UserMessage { text } = ev {
                 if text == expect {
@@ -12859,9 +13433,15 @@ mod tests {
         assert_eq!(opts[0]["details"], "适合 API 客户端。");
         // 第二项：空 description/image + recommended=false 被省略。
         assert_eq!(opts[1]["label"], "OAuth2");
-        assert!(opts[1].get("description").is_none(), "空 description 应省略");
+        assert!(
+            opts[1].get("description").is_none(),
+            "空 description 应省略"
+        );
         assert!(opts[1].get("image").is_none(), "空 image 应省略");
-        assert!(opts[1].get("recommended").is_none(), "recommended=false 应省略");
+        assert!(
+            opts[1].get("recommended").is_none(),
+            "recommended=false 应省略"
+        );
         assert!(opts[1].get("pros").is_none(), "空 pros 应省略");
         assert!(opts[1].get("cons").is_none(), "空 cons 应省略");
     }
@@ -12914,10 +13494,15 @@ mod tests {
             "workspaceId": "ws-1",
             "event": inner,
         });
-        let parsed: ChatEvent =
-            serde_json::from_value(wrapped["event"].clone()).expect("parse");
+        let parsed: ChatEvent = serde_json::from_value(wrapped["event"].clone()).expect("parse");
         match parsed {
-            ChatEvent::DelegateStarted { from_role, to_role, task, sub_id, .. } => {
+            ChatEvent::DelegateStarted {
+                from_role,
+                to_role,
+                task,
+                sub_id,
+                ..
+            } => {
                 assert_eq!(from_role, "manager");
                 assert_eq!(to_role, "programmer");
                 assert_eq!(task, "ping");
@@ -13053,8 +13638,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13079,7 +13664,7 @@ mod tests {
                     tools: vec![],
                     icon: "👔".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             )]
@@ -13111,7 +13696,11 @@ mod tests {
 
         async fn wait_request_count(server: &wiremock::MockServer, n: usize) {
             for _ in 0..150 {
-                let got = server.received_requests().await.map(|r| r.len()).unwrap_or(0);
+                let got = server
+                    .received_requests()
+                    .await
+                    .map(|r| r.len())
+                    .unwrap_or(0);
                 if got >= n {
                     return;
                 }
@@ -13201,8 +13790,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13280,7 +13869,11 @@ require = ["永远不可能出现的验收字符串"]
 
         async fn wait_request_count(server: &wiremock::MockServer, n: usize) {
             for _ in 0..150 {
-                let got = server.received_requests().await.map(|r| r.len()).unwrap_or(0);
+                let got = server
+                    .received_requests()
+                    .await
+                    .map(|r| r.len())
+                    .unwrap_or(0);
                 if got >= n {
                     return;
                 }
@@ -13365,8 +13958,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13447,13 +14040,26 @@ require = ["永远不可能出现的验收字符串"]
 
         // 先确认 workflow 的 worker step 真的跑了（=1 次模型调用）。
         for _ in 0..200 {
-            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) >= 1 {
+            if server
+                .received_requests()
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0)
+                >= 1
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let ran = server.received_requests().await.map(|r| r.len()).unwrap_or(0);
-        assert!(ran >= 1, "workflow 的 worker step 应至少调一次模型，实际 {ran}");
+        let ran = server
+            .received_requests()
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0);
+        assert!(
+            ran >= 1,
+            "workflow 的 worker step 应至少调一次模型，实际 {ran}"
+        );
         // 额度用尽时应发一条「转人工」Status。订阅早于 submit_input，
         // broadcast 会缓冲，不依赖调度时序。
         let mut handoff: Option<String> = None;
@@ -13475,7 +14081,10 @@ require = ["永远不可能出现的验收字符串"]
         }
         let msg = handoff.unwrap_or_else(|| {
             std::env::remove_var("LATTE_AGENT_AUTO_REMEDIATE_MAX");
-            panic!("额度用尽时应发一条「转人工」Status。收到的 Status:\n{}", seen.join("\n"))
+            panic!(
+                "额度用尽时应发一条「转人工」Status。收到的 Status:\n{}",
+                seen.join("\n")
+            )
         });
         assert!(msg.contains("转人工"), "{msg}");
         assert!(
@@ -13567,8 +14176,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13593,7 +14202,7 @@ require = ["永远不可能出现的验收字符串"]
                     tools: vec![],
                     icon: "💻".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             )]
@@ -13705,8 +14314,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13731,7 +14340,7 @@ require = ["永远不可能出现的验收字符串"]
                     tools: vec![],
                     icon: "👔".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             )]
@@ -13847,8 +14456,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -13899,9 +14508,7 @@ require = ["永远不可能出现的验收字符串"]
             session_id: String::new(),
         };
 
-        async fn next_event(
-            rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>,
-        ) -> ChatEvent {
+        async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<ChatEvent>) -> ChatEvent {
             tokio::time::timeout(std::time::Duration::from_secs(15), rx.recv())
                 .await
                 .expect("event timeout")
@@ -13915,7 +14522,10 @@ require = ["永远不可能出现的验收字符串"]
         loop {
             match next_event(&mut rx).await {
                 ChatEvent::Paused { reason } => {
-                    assert!(reason.contains("token budget"), "unexpected pause: {reason}");
+                    assert!(
+                        reason.contains("token budget"),
+                        "unexpected pause: {reason}"
+                    );
                     break;
                 }
                 _ => {}
@@ -14018,8 +14628,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -14099,7 +14709,8 @@ require = ["永远不可能出现的验收字符串"]
         loop {
             match next_event(&mut rx).await {
                 ChatEvent::Status { message } => {
-                    if message.contains("programmer") && message.contains("skipped — role paused") {
+                    if message.contains("programmer") && message.contains("skipped — role paused")
+                    {
                         programmer_skipped = true;
                     }
                 }
@@ -14153,17 +14764,32 @@ require = ["永远不可能出现的验收字符串"]
     /// （cwd 由 resolve_tool_input_against_cwd 注入）。
     #[tokio::test]
     async fn bash_tool_kept_and_accepts_cwd() {
-        let mgr = build_tool_manager(&["read".into(), "write".into(), "bash".into(), "search".into()])
-            .await
-            .expect("build_tool_manager");
+        let mgr = build_tool_manager(&[
+            "read".into(),
+            "write".into(),
+            "bash".into(),
+            "search".into(),
+        ])
+        .await
+        .expect("build_tool_manager");
         let names: Vec<String> = mgr.get_tool_names();
-        assert!(names.contains(&"bash".to_string()), "allowed \"bash\" 应保留 bash 工具: {names:?}");
+        assert!(
+            names.contains(&"bash".to_string()),
+            "allowed \"bash\" 应保留 bash 工具: {names:?}"
+        );
         // bash 必须接受 {command, cwd}。
         let args = serde_json::json!({"command":"pwd","cwd":"/tmp"});
         let r = mgr.execute("bash", args, None).await;
-        assert!(r.is_ok(), "bash 应接受 {{command,cwd}}，却失败: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "bash 应接受 {{command,cwd}}，却失败: {:?}",
+            r.err()
+        );
         // eval 不在 allowed 里，被过滤掉。
-        assert!(!names.iter().any(|n| n.starts_with("eval")), "eval 不应被保留（不在 allowed）: {names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with("eval")),
+            "eval 不应被保留（不在 allowed）: {names:?}"
+        );
     }
 
     /// 工具级说明是模型行为的单一事实源：read 的批量能力必须同时出现
@@ -14287,7 +14913,11 @@ require = ["永远不可能出现的验收字符串"]
 
         // 3) 项目同名覆盖 → Project，读到的是项目那份。
         std::fs::create_dir_all(project.path().join(".latte/tools.d")).unwrap();
-        std::fs::write(project.path().join(".latte/tools.d/zz_global.md"), "项目覆盖").unwrap();
+        std::fs::write(
+            project.path().join(".latte/tools.d/zz_global.md"),
+            "项目覆盖",
+        )
+        .unwrap();
         let p = docs::resolve_doc(project.path(), "zz_global");
         assert_eq!(p.source, docs::DocSource::Project);
         assert!(p.raw.contains("项目覆盖"));
@@ -14303,7 +14933,7 @@ require = ["永远不可能出现的验收字符串"]
     /// 幂等由 `base_description` 保证：再次 enrich 不重复追加。
     #[tokio::test]
     async fn dynamic_tools_get_enriched_after_registration() {
-        use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputSchema, ToolInputProperty};
+        use latte_rs_agent_tools::types::{PropertyType, Tool, ToolInputProperty, ToolInputSchema};
         crate::tool_docs::clear_base_descriptions();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".latte/tools.d")).unwrap();
@@ -14330,7 +14960,7 @@ require = ["永远不可能出现的验收字符串"]
                     properties: None,
                     required: None,
                     additional_properties: None,
-                ref_: None,
+                    ref_: None,
                 },
             )]
             .into_iter()
@@ -14353,8 +14983,16 @@ require = ["永远不可能出现的验收字符串"]
         // 注册后 enrich：动态工具拿到 .latte/tools.d 文档。
         enrich_registered_tools(&mgr, dir.path());
         let dyn_tool = mgr.get_tool("zz_dyn").expect("zz_dyn registered");
-        assert!(dyn_tool.description.contains("动态工具详情 MYTOOL-DOC"), "{}", dyn_tool.description);
-        assert!(dyn_tool.description.contains("动态工具简介"), "{}", dyn_tool.description);
+        assert!(
+            dyn_tool.description.contains("动态工具详情 MYTOOL-DOC"),
+            "{}",
+            dyn_tool.description
+        );
+        assert!(
+            dyn_tool.description.contains("动态工具简介"),
+            "{}",
+            dyn_tool.description
+        );
 
         // 幂等：再次 enrich 不重复追加。
         enrich_registered_tools(&mgr, dir.path());
@@ -14381,11 +15019,7 @@ require = ["永远不可能出现的验收字符串"]
         // path + paths 同时给不再是硬错误：归并为批量读（单文件不存在时
         // 错误落在 per-file failed 里，顶层调用本身合法）。
         let out = mgr
-            .execute(
-                "read",
-                serde_json::json!({"path":"a", "paths":["b"]}),
-                None,
-            )
+            .execute("read", serde_json::json!({"path":"a", "paths":["b"]}), None)
             .await
             .expect("path+paths should merge into a batch read");
         assert_eq!(out["count"], 2, "{out}");
@@ -14476,7 +15110,11 @@ require = ["永远不可能出现的验收字符串"]
     async fn read_folds_range_key_aliases_and_count() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("m.txt");
-        std::fs::write(&p, (1..=20).map(|i| format!("line{i}\n")).collect::<String>()).unwrap();
+        std::fs::write(
+            &p,
+            (1..=20).map(|i| format!("line{i}\n")).collect::<String>(),
+        )
+        .unwrap();
         let path = p.to_str().unwrap();
 
         // 别名对 + 字符串数字。
@@ -14516,7 +15154,10 @@ require = ["永远不可能出现的验收字符串"]
         }))
         .await
         .expect_err("两处范围冲突必须报错");
-        assert!(e.to_string().contains("path:start-end"), "报错要给写法: {e}");
+        assert!(
+            e.to_string().contains("path:start-end"),
+            "报错要给写法: {e}"
+        );
 
         // 批量 paths + 顶层 start/end。
         let e = read_via_manager(serde_json::json!({"paths": [path], "start": 1, "end": 2}))
@@ -14654,7 +15295,11 @@ require = ["永远不可能出现的验收字符串"]
         );
 
         let out = mgr
-            .execute("read", serde_json::json!({ "paths": anchors.clone() }), None)
+            .execute(
+                "read",
+                serde_json::json!({ "paths": anchors.clone() }),
+                None,
+            )
             .await
             .expect("批量读函数跨度应成功");
 
@@ -14673,9 +15318,9 @@ require = ["永远不可能出现的验收字符串"]
                 anchors[i]
             );
             // 选区元数据必须在（证明走的是 ranged read，没退化成整文件读）。
-            let start = f["startLine"].as_u64().unwrap_or_else(|| {
-                panic!("第 {i} 段缺 startLine，说明退化成整文件读了: {f:?}")
-            });
+            let start = f["startLine"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("第 {i} 段缺 startLine，说明退化成整文件读了: {f:?}"));
             let end = f["endLine"].as_u64().expect("endLine");
             assert_eq!(
                 f["selectedLines"].as_u64(),
@@ -14739,18 +15384,21 @@ require = ["永远不可能出现的验收字符串"]
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
-        let openai_body = |content: &str| serde_json::json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "test",
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": content },
-                "finish_reason": "stop"
-            }],
-            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-        }).to_string();
+        let openai_body = |content: &str| {
+            serde_json::json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": content },
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string()
+        };
 
         let server = wiremock::MockServer::start().await;
         // 前 3 次请求（1 initial + max_retries(2)）都给撞 D5 的短输出；
@@ -14792,8 +15440,8 @@ require = ["永远不可能出现的验收字符串"]
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -14818,7 +15466,7 @@ require = ["永远不可能出现的验收字符串"]
                     tools: vec![],
                     icon: "👔".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             )]
@@ -14866,7 +15514,12 @@ require = ["永远不可能出现的验收字符串"]
                         "bad answer must not be accepted as RoleTurn: {content}"
                     );
                 }
-                ChatEvent::AdvisorTerminated { role_id, reason, detector, sub_id } => {
+                ChatEvent::AdvisorTerminated {
+                    role_id,
+                    reason,
+                    detector,
+                    sub_id,
+                } => {
                     break (role_id, reason, detector, sub_id);
                 }
                 _ => {}
@@ -14885,7 +15538,9 @@ require = ["永远不可能出现的验收字符串"]
                 .expect("event timeout")
                 .expect("recv")
             {
-                ChatEvent::RoleTurn { role_id, content, .. } if role_id == "manager" => {
+                ChatEvent::RoleTurn {
+                    role_id, content, ..
+                } if role_id == "manager" => {
                     assert_eq!(content, good, "session continues after termination");
                     break;
                 }
@@ -14931,8 +15586,7 @@ require = ["永远不可能出现的验收字符串"]
         // 工具层：调 `task_report` 工具 → 必须广播 ChatEvent::TaskReport。
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
-        register_task_report_tool(&tm, event_tx, "manager".into())
-            .expect("register task_report");
+        register_task_report_tool(&tm, event_tx, "manager".into()).expect("register task_report");
 
         let out = tm
             .execute(
@@ -14947,11 +15601,19 @@ require = ["永远不可能出现的验收字符串"]
             .await
             .expect("task_report tool call");
         let text = out.as_str().expect("string result");
-        assert!(text.contains("LAT-100"), "tool result names the task: {text}");
+        assert!(
+            text.contains("LAT-100"),
+            "tool result names the task: {text}"
+        );
 
         let ev = rx.try_recv().expect("TaskReport event");
         match ev {
-            ChatEvent::TaskReport { task_id, summary, result, .. } => {
+            ChatEvent::TaskReport {
+                task_id,
+                summary,
+                result,
+                ..
+            } => {
                 assert_eq!(task_id, "LAT-100");
                 assert_eq!(summary, "实现 ringbuf 核心读写");
                 assert_eq!(result, "completed");
@@ -14968,7 +15630,9 @@ require = ["永远不可能出现的验收字符串"]
         // allowed 刻意含 "todo"：builtin pool 的纯函数版会被保留进 tm，
         // register_todo_tool 必须**覆写**它（replace），否则下面的状态
         // 写回断言会挂（纯函数版没有会话状态）。
-        let tm = build_tool_manager(&["todo".to_string()]).await.expect("tool manager");
+        let tm = build_tool_manager(&["todo".to_string()])
+            .await
+            .expect("tool manager");
         let (event_tx, mut rx) = broadcast::channel(8);
         let state = crate::todo::new_shared_todo_state();
         register_todo_tool(&tm, event_tx, "manager".into(), state.clone(), None)
@@ -15053,13 +15717,13 @@ require = ["永远不可能出现的验收字符串"]
             )
             .await
             .expect("failed batch still returns Ok with errors array");
-        let errors = out.get("errors").and_then(|v| v.as_array()).expect("errors");
+        let errors = out
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .expect("errors");
         assert!(!errors.is_empty(), "unknown task must error: {out}");
         assert!(state.read().is_empty(), "失败批次不得写回会话状态");
-        assert!(
-            rx.try_recv().is_err(),
-            "失败批次不得广播 TodoUpdated"
-        );
+        assert!(rx.try_recv().is_err(), "失败批次不得广播 TodoUpdated");
     }
 
     #[test]
@@ -15070,8 +15734,14 @@ require = ["永远不可能出现的验收字符串"]
             phases: vec![crate::todo::TodoPhaseView {
                 name: "Phase 1".into(),
                 tasks: vec![
-                    crate::todo::TodoTaskView { content: "task A".into(), status: "completed".into() },
-                    crate::todo::TodoTaskView { content: "task B".into(), status: "pending".into() },
+                    crate::todo::TodoTaskView {
+                        content: "task A".into(),
+                        status: "completed".into(),
+                    },
+                    crate::todo::TodoTaskView {
+                        content: "task B".into(),
+                        status: "pending".into(),
+                    },
                 ],
             }],
             sub_id: None,
@@ -15172,14 +15842,12 @@ require = ["永远不可能出现的验收字符串"]
         }
     }
 
-
     #[tokio::test]
     async fn task_report_tool_rejects_bad_result() {
         // 校验：result 必须是 completed/aborted/failed/timeout 之一。
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
-        register_task_report_tool(&tm, event_tx, "manager".into())
-            .expect("register task_report");
+        register_task_report_tool(&tm, event_tx, "manager".into()).expect("register task_report");
 
         let err = tm
             .execute(
@@ -15208,8 +15876,7 @@ require = ["永远不可能出现的验收字符串"]
         // 校验：task_id 非空。
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let (event_tx, _rx) = broadcast::channel(8);
-        register_task_report_tool(&tm, event_tx, "manager".into())
-            .expect("register task_report");
+        register_task_report_tool(&tm, event_tx, "manager".into()).expect("register task_report");
 
         let err = tm
             .execute(
@@ -15234,8 +15901,10 @@ require = ["永远不可能出现的验收字符串"]
 
         // request_tool 本身必须对所有角色可用。
         let names = tm.get_tool_names();
-        assert!(names.contains(&"request_tool".to_string()),
-            "request_tool must be registered for all roles: {names:?}");
+        assert!(
+            names.contains(&"request_tool".to_string()),
+            "request_tool must be registered for all roles: {names:?}"
+        );
 
         // 申请一个不存在的工具 → 拒绝。
         let err = tm
@@ -15258,12 +15927,17 @@ require = ["永远不可能出现的验收字符串"]
             .await
             .expect("request_tool should succeed for 'read'");
         let result_str = serde_json::to_string(&result).unwrap_or_default();
-        assert!(result_str.contains("已临时授权"), "expected 'granted', got: {result_str}");
+        assert!(
+            result_str.contains("已临时授权"),
+            "expected 'granted', got: {result_str}"
+        );
 
         // 申请后 read 应已注册。
         let names_after = tm.get_tool_names();
-        assert!(names_after.contains(&"read".to_string()),
-            "read must be registered after request: {names_after:?}");
+        assert!(
+            names_after.contains(&"read".to_string()),
+            "read must be registered after request: {names_after:?}"
+        );
     }
 
     // ─── code_graph ────────────────────────────────────────────────
@@ -15286,12 +15960,27 @@ require = ["永远不可能出现的验收字符串"]
     #[test]
     fn code_graph_no_rust_syntax_leaks_into_other_langs() {
         // 旧 bug 的直接形态：非 Rust 语言拿到 Rust 的节点类型。
-        for lang in ["c", "cpp", "go", "python", "typescript", "javascript", "java"] {
+        for lang in [
+            "c",
+            "cpp",
+            "go",
+            "python",
+            "typescript",
+            "javascript",
+            "java",
+        ] {
             for kind in code_graph_kinds_for_lang(lang) {
                 for node in code_graph_node_kinds(lang, kind) {
                     assert!(
-                        !matches!(node, "function_item" | "struct_item" | "trait_item"
-                                      | "impl_item" | "enum_item" | "use_declaration"),
+                        !matches!(
+                            node,
+                            "function_item"
+                                | "struct_item"
+                                | "trait_item"
+                                | "impl_item"
+                                | "enum_item"
+                                | "use_declaration"
+                        ),
                         "{lang}/{kind} 漏进了 Rust 专属节点类型 {node}"
                     );
                 }
@@ -15313,7 +16002,10 @@ require = ["永远不可能出现的验收字符串"]
     #[test]
     fn code_graph_lang_inference_from_extension() {
         assert_eq!(code_graph_infer_lang("src/pac.c"), Some("c"));
-        assert_eq!(code_graph_infer_lang("include/foo/internal/edata.h"), Some("c"));
+        assert_eq!(
+            code_graph_infer_lang("include/foo/internal/edata.h"),
+            Some("c")
+        );
         assert_eq!(code_graph_infer_lang("a/b/mod.rs"), Some("rust"));
         assert_eq!(code_graph_infer_lang("ui/src/api.ts"), Some("typescript"));
         assert_eq!(code_graph_infer_lang("main.go"), Some("go"));
@@ -15344,7 +16036,10 @@ require = ["永远不可能出现的验收字符串"]
         // 扫不到可识别源文件 → None，handler 才会要求显式传 lang。
         let empty = tempfile::tempdir().expect("tempdir");
         std::fs::write(empty.path().join("notes.md"), "x").unwrap();
-        assert_eq!(code_graph_infer_dir_lang(empty.path().to_str().unwrap()), None);
+        assert_eq!(
+            code_graph_infer_dir_lang(empty.path().to_str().unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -15376,7 +16071,11 @@ require = ["永远不可能出现的验收字符串"]
 
         // 4) 多节点类型 + name → all 里嵌 any，any 的子项缩进 4 空格
         assert_eq!(
-            code_graph_build_rule("go", &["function_declaration", "method_declaration"], Some("M")),
+            code_graph_build_rule(
+                "go",
+                &["function_declaration", "method_declaration"],
+                Some("M")
+            ),
             "id: code_graph\nlanguage: go\nrule:\n  all:\n  - any:\n    \
              - kind: function_declaration\n    - kind: method_declaration\n  - regex: 'M'\n"
         );
@@ -15392,7 +16091,10 @@ require = ["永远不可能出现的验收字符串"]
         // 签名模式必须压平并砍掉函数体——这是 19x 体积压缩的来源。
         let text = "static bool\npac_init(tsdn_t *tsdn, pac_t *pac,\n    base_t *base) {\n\tint x = 1;\n\treturn false;\n}";
         let sig = code_graph_signature_of(text);
-        assert_eq!(sig, "static bool pac_init(tsdn_t *tsdn, pac_t *pac, base_t *base)");
+        assert_eq!(
+            sig,
+            "static bool pac_init(tsdn_t *tsdn, pac_t *pac, base_t *base)"
+        );
         assert!(!sig.contains("return false"), "函数体没被砍掉: {sig}");
 
         // 没有函数体的匹配（如 import / 宏）原样压平即可。
@@ -15508,7 +16210,10 @@ require = ["永远不可能出现的验收字符串"]
     }
 
     fn cg_matches(v: &serde_json::Value) -> String {
-        v.get("matches").and_then(|m| m.as_str()).unwrap_or("").to_string()
+        v.get("matches")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .to_string()
     }
     fn cg_total(v: &serde_json::Value) -> u64 {
         v.get("total_matches").and_then(|m| m.as_u64()).unwrap_or(0)
@@ -15519,7 +16224,11 @@ require = ["永远不可能出现的验收字符串"]
         // 结构图走预建索引：fixture 写一份索引即可，不需要 ast-grep。
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("src")).unwrap();
-        std::fs::write(d.path().join("src/lib.rs"), "fn alpha() {}\nfn beta() { alpha() }\n").unwrap();
+        std::fs::write(
+            d.path().join("src/lib.rs"),
+            "fn alpha() {}\nfn beta() { alpha() }\n",
+        )
+        .unwrap();
         let idx = d.path().join(".latte/code_graph/index.json");
         std::fs::create_dir_all(idx.parent().unwrap()).unwrap();
         std::fs::write(
@@ -15534,9 +16243,12 @@ require = ["永远不可能出现的验收字符串"]
         let tool = code_graph_tool();
         let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
         ctx.metadata = Some(serde_json::json!({ "cwd": d.path().to_str().unwrap() }));
-        let out = (tool.handler)(serde_json::json!({ "path": "src", "graph": "structure" }), ctx)
-            .await
-            .unwrap();
+        let out = (tool.handler)(
+            serde_json::json!({ "path": "src", "graph": "structure" }),
+            ctx,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.get("format").and_then(|v| v.as_str()), Some("mermaid"));
         let mmd = out.get("mermaid").and_then(|v| v.as_str()).unwrap();
         assert!(mmd.starts_with("flowchart TD"), "{mmd}");
@@ -15601,10 +16313,16 @@ require = ["永远不可能出现的验收字符串"]
         let sig_text = cg_matches(&sigs);
 
         // 签名模式不能带函数体。
-        assert!(!sig_text.contains("return pac->npages"), "签名混进函数体: {sig_text}");
+        assert!(
+            !sig_text.contains("return pac->npages"),
+            "签名混进函数体: {sig_text}"
+        );
         assert!(!sig_text.contains('{'), "签名混进函数体起始: {sig_text}");
         // 必须带 file:line，供后续 ranged read 用。
-        assert!(sig_text.contains("sample.c:"), "缺 file:line 定位: {sig_text}");
+        assert!(
+            sig_text.contains("sample.c:"),
+            "缺 file:line 定位: {sig_text}"
+        );
 
         // full 模式应含函数体且明显更大。
         let full = cg_call(serde_json::json!({
@@ -15613,10 +16331,15 @@ require = ["永远不可能出现的验收字符串"]
         .await
         .unwrap();
         let full_text = cg_matches(&full);
-        assert!(full_text.contains("return n;"), "full 模式应含函数体: {full_text}");
+        assert!(
+            full_text.contains("return n;"),
+            "full 模式应含函数体: {full_text}"
+        );
         assert!(
             sig_text.len() < full_text.len(),
-            "签名({}) 应小于 full({})", sig_text.len(), full_text.len()
+            "签名({}) 应小于 full({})",
+            sig_text.len(),
+            full_text.len()
         );
 
         // 省 token 是这个工具存在的理由。这里比的是"签名正文"而不是整条
@@ -15656,11 +16379,13 @@ require = ["永远不可能出现的验收字符串"]
             .unwrap_or_else(|e| panic!("{file} 查询失败: {e}"));
             assert!(
                 cg_total(&out) >= *min_n,
-                "{file} 命中 {} < 期望 {min_n}: {out:?}", cg_total(&out)
+                "{file} 命中 {} < 期望 {min_n}: {out:?}",
+                cg_total(&out)
             );
             assert!(
                 cg_matches(&out).contains(needle),
-                "{file} 缺 {needle}: {}", cg_matches(&out)
+                "{file} 缺 {needle}: {}",
+                cg_matches(&out)
             );
         }
     }
@@ -15723,7 +16448,10 @@ require = ["永远不可能出现的验收字符串"]
             .await
             .expect("目录应自动推断 lang");
         assert_eq!(out.get("lang").and_then(|v| v.as_str()), Some("c"));
-        assert!(cg_total(&out) >= 3, "自动推断 lang=c 应命中 C 函数: {out:?}");
+        assert!(
+            cg_total(&out) >= 3,
+            "自动推断 lang=c 应命中 C 函数: {out:?}"
+        );
         // 多语言目录必须提示其它在场语言，模型才知道覆盖面不全。
         let note = out.get("lang_note").and_then(|v| v.as_str()).unwrap_or("");
         assert!(note.contains("rust"), "lang_note 应列出其它语言: {note}");
@@ -15787,7 +16515,11 @@ require = ["永远不可能出现的验收字符串"]
         .await
         .unwrap();
         assert!(cg_total(&out) >= 1, "裸 pattern 应有命中: {out:?}");
-        assert!(cg_matches(&out).contains("pac_npages_get"), "{}", cg_matches(&out));
+        assert!(
+            cg_matches(&out).contains("pac_npages_get"),
+            "{}",
+            cg_matches(&out)
+        );
     }
 
     #[tokio::test]
@@ -15806,7 +16538,11 @@ require = ["永远不可能出现的验收字符串"]
         }))
         .await
         .unwrap();
-        assert_eq!(cg_total(&via_kind), 2, "kind=call 应找到 2 处调用: {via_kind:?}");
+        assert_eq!(
+            cg_total(&via_kind),
+            2,
+            "kind=call 应找到 2 处调用: {via_kind:?}"
+        );
 
         // 裸 pattern 路线在 C 上不可靠（K&R 声明歧义）。锁住这个差异，
         // 避免以后有人把 call 的实现"优化"回 pattern。
@@ -15818,7 +16554,8 @@ require = ["永远不可能出现的验收字符串"]
         assert!(
             cg_total(&via_pattern) < cg_total(&via_kind),
             "C 上裸 pattern 查调用点不应优于 kind 路线（pattern={}, kind={}）",
-            cg_total(&via_pattern), cg_total(&via_kind)
+            cg_total(&via_pattern),
+            cg_total(&via_kind)
         );
     }
 
@@ -15854,11 +16591,16 @@ require = ["永远不可能出现的验收字符串"]
         let mut checked = 0usize;
         for entry in m.lines() {
             // 形状：`<file>:<start>-<end>: <签名>`
-            let (loc, sig) = entry.split_once(": ").expect(&format!("条目缺签名: {entry}"));
-            let span = loc.rsplit_once(':').expect(&format!("条目缺位置: {entry}")).1;
-            let (start, end) = span
-                .split_once('-')
-                .expect(&format!("位置必须是 start-end 跨度，实际 {span:?}: {entry}"));
+            let (loc, sig) = entry
+                .split_once(": ")
+                .expect(&format!("条目缺签名: {entry}"));
+            let span = loc
+                .rsplit_once(':')
+                .expect(&format!("条目缺位置: {entry}"))
+                .1;
+            let (start, end) = span.split_once('-').expect(&format!(
+                "位置必须是 start-end 跨度，实际 {span:?}: {entry}"
+            ));
             let start: usize = start.parse().expect("start 应为数字");
             let end: usize = end.parse().expect("end 应为数字");
             assert!(end > start, "多行函数的 end 必须大于 start: {entry}");
@@ -15896,7 +16638,10 @@ require = ["永远不可能出现的验收字符串"]
         assert_eq!(cg_total(&out), 0);
         let note = out.get("note").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!note.is_empty(), "0 命中必须给排查提示");
-        assert!(note.contains("kind") || note.contains("lang"), "提示不可操作: {note}");
+        assert!(
+            note.contains("kind") || note.contains("lang"),
+            "提示不可操作: {note}"
+        );
     }
     // ─── split_delimited_path_entry：把模型自然写出的多路径收下 ──────
     //
@@ -15906,7 +16651,13 @@ require = ["永远不可能出现的验收字符串"]
 
     fn split_fixture() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        for f in ["a.c", "b.h", "src/deep.rs", "My Notes, v2.md", "weird;name.txt"] {
+        for f in [
+            "a.c",
+            "b.h",
+            "src/deep.rs",
+            "My Notes, v2.md",
+            "weird;name.txt",
+        ] {
             let p = dir.path().join(f);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, "x").unwrap();
@@ -15953,7 +16704,11 @@ require = ["永远不可能出现的验收字符串"]
             None,
             "含分号的真实文件名不得被拆"
         );
-        assert_eq!(split_delimited_path_entry("a.c", Some(cwd)), None, "单个路径无需拆");
+        assert_eq!(
+            split_delimited_path_entry("a.c", Some(cwd)),
+            None,
+            "单个路径无需拆"
+        );
     }
 
     /// 任何一段不存在就不拆 —— 宁可原样报错，也不要把模型的一句话切碎。
@@ -15998,7 +16753,10 @@ require = ["永远不可能出现的验收字符串"]
         let mut v = serde_json::json!({ "path": "a.c, b.h", "paths": ["src/deep.rs"] });
         normalize_read_path_args(&mut v, Some(cwd));
         // path 被并入 paths（既有行为），但不该先被拆成两条
-        assert!(v["paths"].as_array().unwrap().iter().any(|x| x == "a.c, b.h"));
+        assert!(v["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "a.c, b.h"));
     }
-
 }
