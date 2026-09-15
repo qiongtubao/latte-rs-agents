@@ -11,8 +11,9 @@
 import {
   listTasks, createTask, updateTask, dispatchTask, abortTask, deleteTask,
   dispatchReady, listWorkflows, listTaskTypes, createTaskType, putTaskType, deleteTaskType, refineTask, setRefineParent,
+  getTaskWorktreeDiff,
 } from "./api";
-import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse } from "./api";
+import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse, WorktreeDiff } from "./api";
 
 // ─── 看板任务快照（供看板外的展示层联动消费）─────────────────────
 // refresh() 每次轮询成功后发布一份快照；chat_impl 的 todo dock 据此
@@ -142,6 +143,12 @@ export function actionLabel(
   return a.label;
 }
 
+/** 会真的去派发任务的动作 key（依赖未满足时这些必须禁用）。
+ * `run_now`/`run_rework` → dispatchTask；`to_todo` 只是改状态，不派发。 */
+export function isDispatchAction(key: string): boolean {
+  return key === "run_now" || key === "run_rework";
+}
+
 /** 「查看对话」用的 session：runs 最后一个元素；没有则 null（按钮禁用）。 */
 export function lastSessionId(task: Pick<TaskView, "runs">): string | null {
   const last = task.runs[task.runs.length - 1];
@@ -268,6 +275,62 @@ export function parentOptions(tasks: TaskView[], excludeId?: string): ParentOpti
     if (!t.parent_id || !byId.has(t.parent_id)) walk(t, 0);
   }
   return out;
+}
+
+/** 改动预览的一行统计 + 截断提示（纯函数，便于测边界）。
+ *
+ * `null` = 没有工作树；`file_count === 0` = 有树但没改动（批准也只是空合并，
+ * 这句提示要说清楚，否则用户以为预览挂了）。
+ * `rest > 0` = 服务端截了列表，得告诉用户还有多少没显示。
+ */
+export function worktreeDiffStat(
+  d: Pick<WorktreeDiff, "files" | "file_count" | "total_added" | "total_removed"> | null,
+): { line: string; rest: number } {
+  if (!d) return { line: "（没有隔离工作树）", rest: 0 };
+  if (d.file_count === 0) return { line: "尚无改动（批准也只是空合并）", rest: 0 };
+  return {
+    line: `${d.file_count} 个文件 · +${d.total_added} −${d.total_removed}`,
+    rest: Math.max(0, d.file_count - d.files.length),
+  };
+}
+
+/** 依赖候选：可以作为 `taskId` 的 `depends_on` 目标的任务，按看板顺序。
+ *
+ * 排除自身、全部后代、以及整条祖先链——父子是**聚合**关系不是依赖关系
+ * （父任务作为容器本来就等子任务完成），声明成依赖会死锁，后端也会 400。
+ * 与后端 `TaskStore::normalize_depends_on` 的判据一致，前端先不给选而不是
+ * 等提交报错。
+ *
+ * `taskId` 为空（新建任务）时全部可选：新任务还没有 id，不可能成环。
+ */
+export function dependencyCandidates(tasks: TaskView[], taskId?: string): TaskView[] {
+  if (!taskId) return tasks;
+  const excluded = descendantIds(tasks, taskId);
+  excluded.add(taskId);
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  let cur = byId.get(taskId)?.parent_id ?? null;
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    excluded.add(cur);
+    cur = byId.get(cur)?.parent_id ?? null;
+  }
+  return tasks.filter((t) => !excluded.has(t.id));
+}
+
+/** 隔离开关的三态 ↔ 下拉值互转。
+ *
+ * `null`/`undefined`（跟随默认）与 `false`（显式关闭）是**不同**语义，绝不能
+ * 用 falsy 判断合并——合并的后果是"跟随类型默认"被保存成"显式关闭"，用户
+ * 改了类型默认值之后该任务不再跟随。
+ */
+export function isolationToSelectValue(v: boolean | null | undefined): "" | "true" | "false" {
+  return v === true ? "true" : v === false ? "false" : "";
+}
+
+/** 下拉值 → 隔离三态：`""` → `null`（跟随默认）。 */
+export function isolationFromSelectValue(v: string): boolean | null {
+  return v === "" ? null : v === "true";
 }
 
 // ─── 工具函数 ────────────────────────────────────────────────────
@@ -508,6 +571,27 @@ export function mountTaskBoard(opts: {
     }
     body.appendChild(propSec);
 
+    // 隔离工作树的改动预览：批准 = 合并回 base，批之前得先看得见改的是什么。
+    // 异步拉取（git diff 是阻塞调用，不能挡住抽屉渲染），拉到再就地替换。
+    if (task.worktree) {
+      const wtSec = el("div", "tb-drawer-section");
+      wtSec.appendChild(el("div", "tb-label", "隔离工作树的改动"));
+      const box = el("div", "tb-desc-box", "读取中…");
+      wtSec.appendChild(box);
+      body.appendChild(wtSec);
+      const forTask = task.id;
+      void getTaskWorktreeDiff(task.id)
+        .then((d) => {
+          // 抽屉可能已经切到别的任务/关掉了，别改到无关内容。
+          if (drawerTaskId !== forTask) return;
+          box.replaceChildren(...renderWorktreeDiff(d));
+        })
+        .catch((e) => {
+          if (drawerTaskId !== forTask) return;
+          box.textContent = `读取失败：${(e as Error).message}`;
+        });
+    }
+
     // 子任务区（任意层级都可查看/再拆；sub_total/sub_done 是全部后代聚合）
     body.appendChild(renderChildrenSection(task));
 
@@ -534,6 +618,49 @@ export function mountTaskBoard(opts: {
     body.appendChild(histSec);
 
     drawer.appendChild(body);
+  }
+
+  /** 改动预览的 DOM。`null`/空 → 一句话说明，不留空白块。 */
+  function renderWorktreeDiff(d: WorktreeDiff | null): HTMLElement[] {
+    const stat = worktreeDiffStat(d);
+    if (!d) return [el("div", "tb-hint", stat.line)];
+    const out: HTMLElement[] = [];
+    const head = el("div", "tb-wt-head");
+    head.append(
+      el("span", "tb-chip tb-chip-worktree", `🌿 ${d.branch}`),
+      el("span", "tb-hint", `相对 ${d.base}`),
+    );
+    out.push(head);
+    if (d.file_count === 0) {
+      out.push(el("div", "tb-hint", stat.line));
+      return out;
+    }
+    out.push(el("div", "tb-wt-stat", stat.line));
+    const list = el("div", "tb-wt-files");
+    for (const f of d.files) {
+      const row = el("div", "tb-wt-file");
+      row.append(
+        el("span", "tb-wt-path", f.path),
+        el("span", "tb-wt-num add", f.binary ? "bin" : `+${f.added}`),
+        el("span", "tb-wt-num del", f.binary ? "" : `−${f.removed}`),
+      );
+      list.appendChild(row);
+    }
+    if (stat.rest > 0) {
+      list.appendChild(el("div", "tb-hint", `……还有 ${stat.rest} 个文件`));
+    }
+    out.push(list);
+    if (d.commits.length > 0) {
+      out.push(el("div", "tb-label", `提交（${d.commits.length}）`));
+      const cl = el("div", "tb-wt-files");
+      for (const c of d.commits) {
+        const row = el("div", "tb-wt-file");
+        row.append(el("span", "tb-wt-sha", c.sha), el("span", "tb-wt-path", c.subject));
+        cl.appendChild(row);
+      }
+      out.push(cl);
+    }
+    return out;
   }
 
   function kv(k: string, v: string): HTMLElement {
@@ -593,6 +720,11 @@ export function mountTaskBoard(opts: {
     if (a.key === "open_session" && !lastSessionId(task)) {
       btn.disabled = true;
       btn.title = "还没有执行记录（无 session）";
+    }
+    // 依赖未满足时派发必然 409：前端直接置灰并说明等谁，省一次往返。
+    if (isDispatchAction(a.key) && task.blocked_by.length > 0) {
+      btn.disabled = true;
+      btn.title = `等待依赖完成：${task.blocked_by.join("、")}`;
     }
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -752,7 +884,10 @@ export function mountTaskBoard(opts: {
       desc.style.fontSize = "12px";
       desc.style.color = "#64748b";
       const wfText = tt.default_workflow ? `↳ ${tt.default_workflow}` : "↳ 不绑定（走 manager）";
-      desc.textContent = `${tt.description ? tt.description + " · " : ""}${wfText}`;
+      const isoText = tt.isolated === undefined
+        ? ""
+        : tt.isolated ? " · 🌿 隔离执行" : " · 在项目工作区内执行";
+      desc.textContent = `${tt.description ? tt.description + " · " : ""}${wfText}${isoText}`;
       main.append(title, desc);
       const editBtn = el("button", "tb-btn tb-btn-ghost tb-btn-sm", "编辑") as HTMLButtonElement;
       editBtn.type = "button";
@@ -837,6 +972,23 @@ export function mountTaskBoard(opts: {
         wfSel.appendChild(o);
       }
     }
+    // 隔离执行三态。**必须回填并回传**：漏掉它的话，用户只是来改个图标，
+    // 保存时 isolated 就被抹掉（PUT 是整体替换），任务类型的隔离设置静默
+    // 变回内建默认——用户改过的行为悄悄失效。
+    const isoSel = document.createElement("select") as HTMLSelectElement;
+    isoSel.style.padding = "6px 8px";
+    isoSel.style.border = "1px solid #e2e8f0";
+    isoSel.style.borderRadius = "8px";
+    for (const [v, text] of [
+      ["", "内建判断（只读类型关，其余开）"],
+      ["true", "开（独立 git worktree）"],
+      ["false", "关（在项目工作区内）"],
+    ]) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = text;
+      isoSel.appendChild(o);
+    }
     // 回填编辑值
     if (typeMgrEditingId) {
       const cur = taskTypes.find(x => x.id === typeMgrEditingId);
@@ -848,6 +1000,7 @@ export function mountTaskBoard(opts: {
         descInput.value = cur.description || "";
         colorInput.value = cur.color || "";
         wfSel.value = cur.default_workflow || "";
+        isoSel.value = isolationToSelectValue(cur.isolated);
       }
     } else {
       idInput.disabled = false;
@@ -856,7 +1009,9 @@ export function mountTaskBoard(opts: {
     const row2 = el("div"); row2.style.display = "flex"; row2.style.gap = "8px"; row2.append(descInput, colorInput);
     const wfRow = el("div"); wfRow.style.display = "flex"; wfRow.style.gap = "8px"; wfRow.style.alignItems = "center";
     wfRow.append(el("span", undefined, "默认 Workflow"), wfSel);
-    form.append(row1, row2, wfRow);
+    const isoRow = el("div"); isoRow.style.display = "flex"; isoRow.style.gap = "8px"; isoRow.style.alignItems = "center";
+    isoRow.append(el("span", undefined, "隔离执行"), isoSel);
+    form.append(row1, row2, wfRow, isoRow);
     const actions = el("div", "tb-modal-actions");
     const cancelBtn = el("button", "tb-btn tb-btn-ghost", "取消") as HTMLButtonElement;
     cancelBtn.type = "button";
@@ -873,7 +1028,18 @@ export function mountTaskBoard(opts: {
       const id = idInput.value.trim();
       const label = labelInput.value.trim();
       if (!id || !label) { toast("id 与展示名必填"); return; }
-      const entry = { id, label, icon: iconInput.value.trim() || "🏷", description: descInput.value.trim(), color: colorInput.value.trim() || "#64748b", default_workflow: wfSel.value.trim() } as TaskTypeEntry;
+      const entry = {
+        id,
+        label,
+        icon: iconInput.value.trim() || "🏷",
+        description: descInput.value.trim(),
+        color: colorInput.value.trim() || "#64748b",
+        default_workflow: wfSel.value.trim(),
+        // "" = 不声明（省略字段，落回内建判断）；否则显式 true/false。
+        ...(isolationFromSelectValue(isoSel.value) === null
+          ? {}
+          : { isolated: isolationFromSelectValue(isoSel.value) as boolean }),
+      } as TaskTypeEntry;
       saveBtn.disabled = true;
       try {
         if (typeMgrEditingId) {
@@ -970,7 +1136,26 @@ export function mountTaskBoard(opts: {
   const wfLabel = el("label", "tb-field", "Workflow（可选）");
   const wfSelect = document.createElement("select");
   wfLabel.appendChild(wfSelect);
-  row.append(prioLabel, typeLabel, parentLabel, wfLabel);
+  // 隔离执行：三态（跟随类型默认 / 强制开 / 强制关）。开 = 在独立 git
+  // worktree 里跑，与同族任务并行时不会互相覆盖文件。
+  const isoLabel = el("label", "tb-field", "隔离执行");
+  const isoSelect = document.createElement("select");
+  for (const [v, text] of [["", "跟随任务类型默认"], ["true", "开（独立 worktree）"], ["false", "关（在项目工作区内）"]]) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = text;
+    isoSelect.appendChild(opt);
+  }
+  isoLabel.appendChild(isoSelect);
+  row.append(prioLabel, typeLabel, parentLabel, wfLabel, isoLabel);
+
+  // 依赖：多选（依赖全部 done 后本任务才可派发）。同族任务默认并行，
+  // 顺序**只能**由这里表达——写在描述里的「本任务依赖 X」派发逻辑读不到。
+  const depsLabel = el("label", "tb-field", "依赖（全部完成后才可派发）");
+  const depsSelect = document.createElement("select");
+  depsSelect.multiple = true;
+  depsSelect.size = 5;
+  depsLabel.appendChild(depsSelect);
 
   const formActions = el("div", "tb-modal-actions");
   const formCancel = el("button", "tb-btn tb-btn-ghost", "取消") as HTMLButtonElement;
@@ -980,7 +1165,7 @@ export function mountTaskBoard(opts: {
   formOk.type = "submit";
   formActions.append(formCancel, formOk);
 
-  taskForm.append(titleLabel, descLabel, row, formActions);
+  taskForm.append(titleLabel, descLabel, row, depsLabel, formActions);
   taskModal.appendChild(taskForm);
   taskMask.addEventListener("click", (e) => {
     if (e.target === taskMask) closeTaskModal();
@@ -1085,6 +1270,27 @@ export function mountTaskBoard(opts: {
         }
       });
 
+    // 隔离开关（三态）
+    isoSelect.value = isolationToSelectValue(opts2.edit?.isolated);
+    const isoHintOf = (typeId: string): string => {
+      const tt = taskTypes.find(v => v.id === typeId);
+      return tt ? `类型 ${tt.id} 的默认：${tt.isolated ?? "（内建判断：只读类型关，其余开）"}` : "";
+    };
+    isoSelect.title = isoHintOf(typeSelect.value);
+
+    // 依赖候选：全部任务，排除自身与自己的后代/祖先（父子是聚合关系，
+    // 声明成依赖会死锁——后端也会 400，这里先不给选）。
+    depsSelect.replaceChildren();
+    const current = new Set(opts2.edit?.depends_on ?? []);
+    for (const t of dependencyCandidates(tasks, opts2.edit?.id)) {
+      const opt = document.createElement("option");
+      opt.value = t.id;
+      const st = STATES[t.state]?.name ?? t.state;
+      opt.textContent = `${t.id} · ${t.title}（${st}）`;
+      opt.selected = current.has(t.id);
+      depsSelect.appendChild(opt);
+    }
+
     taskMask.classList.add("open");
     titleInput.focus();
   }
@@ -1099,12 +1305,17 @@ export function mountTaskBoard(opts: {
     const priority = Number(prioSelect.value);
     const workflow = wfSelect.value;
     const task_type = (typeSelect as HTMLSelectElement).value;
+    // 隔离三态：""=跟随类型（PATCH 用 null 表示），"true"/"false"=显式。
+    const isolated = isolationFromSelectValue(isoSelect.value);
+    const depends_on = Array.from(depsSelect.selectedOptions).map(o => o.value);
     try {
       if (editingTaskId) {
         await updateTask(editingTaskId, {
           title, description, priority,
           task_type: task_type || null,
           workflow: workflow || null,
+          isolated,
+          depends_on,
         });
         toast(`${editingTaskId} 已保存`);
       } else {
@@ -1116,6 +1327,8 @@ export function mountTaskBoard(opts: {
           parent_id: parentId,
           task_type: task_type || undefined,
           workflow: workflow || undefined,
+          isolated: isolated ?? undefined,
+          depends_on: depends_on.length > 0 ? depends_on : undefined,
         });
         toast(`${created.id} 已创建${parentId ? `（${parentId} 的子任务）` : ""}`);
       }
@@ -1237,6 +1450,35 @@ export function mountTaskBoard(opts: {
     }
     if (task.sub_total > 0) {
       meta.appendChild(el("span", "tb-chip tb-chip-rounds", `子任务 ${task.sub_done}/${task.sub_total}`));
+    }
+    // 隔离工作树：在跑/待合并时显示分支，否则只提示"会隔离执行"。
+    if (task.worktree) {
+      const chip = el("span", "tb-chip tb-chip-worktree", `🌿 ${task.worktree.branch}`);
+      chip.title = `隔离工作树：${task.worktree.root}\n从 ${task.worktree.base_branch} 派生`;
+      meta.appendChild(chip);
+    } else if (task.isolated_effective) {
+      const chip = el("span", "tb-chip hint", "🌿 隔离执行");
+      chip.title = task.isolated === null
+        ? "按任务类型默认在独立 git worktree 里执行"
+        : "本任务显式声明在独立 git worktree 里执行";
+      meta.appendChild(chip);
+    }
+    // 依赖：未满足的显式标出（挡住派发），全部满足但声明过的低调提示。
+    if (task.blocked_by.length > 0) {
+      const queued = task.dispatch_pending ? "，已排队自动开跑" : "";
+      const chip = el("span", "tb-chip tb-chip-blocked",
+        `${task.dispatch_pending ? "⏳" : "⛔"} 等待 ${task.blocked_by.join("、")}`);
+      chip.title = `依赖未完成${queued}：${task.blocked_by.join("、")}`;
+      meta.appendChild(chip);
+    } else if (task.dispatch_pending) {
+      // 依赖满足但仍 pending = 被文件范围冲突挡着，等在跑任务结束。
+      const chip = el("span", "tb-chip tb-chip-blocked", "⏳ 排队中（文件范围冲突）");
+      chip.title = "已排队：与在跑任务的文件范围重叠，对方完成后自动开跑";
+      meta.appendChild(chip);
+    } else if (task.depends_on.length > 0) {
+      const chip = el("span", "tb-chip hint", `⛓ 依赖 ${task.depends_on.length} 项已完成`);
+      chip.title = `依赖：${task.depends_on.join("、")}`;
+      meta.appendChild(chip);
     }
     card.appendChild(meta);
 

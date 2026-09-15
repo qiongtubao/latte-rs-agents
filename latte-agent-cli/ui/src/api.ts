@@ -1275,6 +1275,20 @@ export interface TaskView {
   created_at: number;
   updated_at: number;
   history: TaskHistoryEntry[];
+  /** 任务声明涉及的文件/目录前缀；同族任务想并行必须两边都声明且不重叠。 */
+  paths: string[];
+  /** 依赖的任务 id：全部 done 后本任务才可派发（同族任务默认并行，顺序靠它表达）。 */
+  depends_on: string[];
+  /** 未满足的依赖 id（服务端算好）；非空 = 现在派发必然 409。 */
+  blocked_by: string[];
+  /** 已派过但被依赖/冲突闸挡下：留在 todo，闸放开后由 scheduler 自动续跑。 */
+  dispatch_pending: boolean;
+  /** 是否在独立 git worktree 里执行；null = 跟随 task_type 默认。 */
+  isolated: boolean | null;
+  /** 生效的隔离设置（服务端按 任务 > 类型 解析好）。 */
+  isolated_effective: boolean;
+  /** 已建好的隔离工作树；null = 当前没有（非隔离，或已合并回收）。 */
+  worktree: { root: string; branch: string; base_branch: string; base_sha: string } | null;
   /** 绑定的 workflow 名；null = 未绑定 */
   workflow: string | null;
   /** 派发时实际生效的 workflow（显式 workflow 优先，否则按 task_type 默认推导；null=走 manager） */
@@ -1296,6 +1310,12 @@ export interface TaskCreateBody {
   task_type?: string;
   /** 可选：创建时绑定 workflow（派发时直接运行该 workflow）。 */
   workflow?: string;
+  /** 任务涉及的文件/目录前缀（相对项目根）。 */
+  paths?: string[];
+  /** 依赖的任务 id：全部 done 后才可派发。 */
+  depends_on?: string[];
+  /** 是否在独立 git worktree 里执行；缺省跟随 task_type 默认。 */
+  isolated?: boolean;
 }
 
 export interface TaskPatchBody {
@@ -1308,6 +1328,12 @@ export interface TaskPatchBody {
   task_type?: string | null;
   /** 可选：缺省 = 不变；null = 清除绑定；字符串 = 绑定该 workflow。 */
   workflow?: string | null;
+  /** 缺省 = 不变；数组 = 整体替换（空数组 = 清空声明）。 */
+  paths?: string[];
+  /** 缺省 = 不变；数组 = 整体替换（空数组 = 清空依赖）。未知 id/自依赖/成环 → 400。 */
+  depends_on?: string[];
+  /** 缺省 = 不变；null = 跟随类型默认；true/false = 显式开关隔离工作树。 */
+  isolated?: boolean | null;
 }
 
 /** POST /api/tasks/import 的单个任务项（支持嵌套 subtasks）。 */
@@ -1320,6 +1346,8 @@ export interface ImportTask {
   workflow?: string;
   /** 任务涉及的文件/目录前缀（相对项目根）；并行执行时范围重叠的任务会被拒绝派发（409）。 */
   paths?: string[];
+  /** 依赖：同批任务的标题，或已存在的任务 id。解析不到 → 整单 400（不静默丢弃）。 */
+  depends_on?: string[];
   subtasks?: ImportTask[];
 }
 
@@ -1423,6 +1451,30 @@ export interface TaskTypeEntry {
   default_workflow: string;
   color: string;
   icon: string;
+  /** 该类型默认是否在独立 git worktree 里执行；缺省 = 内建判断（只读类型关，其余开）。 */
+  isolated?: boolean;
+}
+
+/** 隔离工作树的改动预览（`GET /api/tasks/:id/worktree-diff`）。 */
+export interface WorktreeDiff {
+  branch: string;
+  root: string;
+  /** 比较基准（base 分支名，或分支已不在时的派生点 SHA）。 */
+  base: string;
+  /** 改动文件（服务端按上限截断，总数看 `file_count`）。 */
+  files: { path: string; added: number; removed: number; binary: boolean }[];
+  /** 改动文件总数（未截断的真实数量）。 */
+  file_count: number;
+  total_added: number;
+  total_removed: number;
+  /** 任务分支上尚未进 base 的提交（新到旧）。 */
+  commits: { sha: string; subject: string }[];
+}
+
+/** GET /api/tasks/:id/worktree-diff：隔离任务的改动预览（批准前看一眼）。
+ *  非隔离任务 / 已合并回收 → null。 */
+export async function getTaskWorktreeDiff(id: string): Promise<WorktreeDiff | null> {
+  return getTransport().request("GET", `/api/tasks/${encodeURIComponent(id)}/worktree-diff`);
 }
 
 /** GET /api/task-types：列出任务类型注册表（可配置）。 */
@@ -1447,7 +1499,7 @@ export async function deleteTaskType(id: string): Promise<void> {
 }
 
 /** POST /api/tasks/dispatch-ready：按优先级批量派发全部 todo 任务
- *  （后端遵守并发上限与同族/paths 互斥，冲突/超限任务留 todo 等位）。 */
+ *  （后端遵守并发上限、依赖与 paths 冲突，被挡下的任务留 todo 等位）。 */
 export async function dispatchReady(): Promise<DispatchReadyResponse> {
   return getTransport().request("POST", "/api/tasks/dispatch-ready");
 }

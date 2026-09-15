@@ -5,6 +5,9 @@
 // 这里锁定映射关系，防止改动作列表时悄悄破坏 mockup 定义的流转。
 import { describe, it, expect } from "vitest";
 import {
+  worktreeDiffStat,
+  dependencyCandidates, isolationToSelectValue, isolationFromSelectValue,
+  isDispatchAction,
   STATES, STATE_ACTIONS, COLUMN_ORDER,
   effectiveActions, lastSessionId, actionRequest, actionToast, actionLabel,
   dispatchReadyToast,
@@ -173,6 +176,19 @@ describe("dispatchReadyToast（派发全部结果提示）", () => {
   });
 });
 
+describe("isDispatchAction：只有真会派发的动作受依赖门禁约束", () => {
+  it("run_now / run_rework 是派发动作", () => {
+    expect(isDispatchAction("run_now")).toBe(true);
+    expect(isDispatchAction("run_rework")).toBe(true);
+  });
+
+  it("改状态类动作不是派发（to_todo 只是进就绪列，不启动会话）", () => {
+    for (const k of ["to_todo", "to_backlog", "approve", "reject", "abort", "edit", "schedule"]) {
+      expect(isDispatchAction(k)).toBe(false);
+    }
+  });
+});
+
 // ─── 任意深度任务树的纯函数 ──────────────────────────────────────
 
 /** 构造最小 TaskView；缺省字段给合理默认，只覆盖测试关心的。 */
@@ -182,6 +198,8 @@ function mkTask(id: string, parent_id: string | null = null, over: Partial<TaskV
     state: "todo", labels: [], task_type: null, parent_id, sub_order: 0,
     scheduled_at: null, runs: [], created_at: 0, updated_at: 0, history: [],
     workflow: null, effective_workflow: null,
+    paths: [], depends_on: [], blocked_by: [], dispatch_pending: false,
+    isolated: null, isolated_effective: false, worktree: null,
     sub_total: 0, sub_done: 0, sub_state_counts: {},
     ...over,
   };
@@ -257,5 +275,88 @@ describe("拆分入口对任意层级开放", () => {
     expect(keysOf({ state: "todo", scheduled_at: 1 })).toContain("refine");
     expect(keysOf({ state: "in_progress", scheduled_at: null })).not.toContain("refine");
     expect(keysOf({ state: "merging", scheduled_at: null })).not.toContain("refine");
+  });
+});
+
+// ─── 依赖候选与隔离三态（编辑弹窗的纯逻辑） ──────────────────────
+
+describe("dependencyCandidates：能选谁当依赖", () => {
+  it("排除自身、后代、以及整条祖先链（父子是聚合关系，不是依赖）", () => {
+    // R ─┬─ A ── B（孙）
+    //    └─ A2          另有一棵 C
+    const tasks = threeLevelTree();
+    const ids = (ts: TaskView[]) => ts.map(t => t.id).sort();
+    // 对 A 来说：自身、后代 B、祖先 R 都不能选；A2 与 C 可以。
+    expect(ids(dependencyCandidates(tasks, "A"))).toEqual(["A2", "C"]);
+    // 对孙 B 来说：祖先 A 与 R 都不能选。
+    expect(ids(dependencyCandidates(tasks, "B"))).toEqual(["A2", "C"]);
+    // 对根 R 来说：整棵子树都不能选。
+    expect(ids(dependencyCandidates(tasks, "R"))).toEqual(["C"]);
+  });
+
+  it("新建任务（无 id）时全部可选——没有 id 就不可能成环", () => {
+    const tasks = threeLevelTree();
+    expect(dependencyCandidates(tasks).length).toBe(tasks.length);
+  });
+
+  it("父任务已被删的孤儿不会让祖先链遍历死循环", () => {
+    const orphan = [mkTask("X", "GONE"), mkTask("Y")];
+    expect(dependencyCandidates(orphan, "X").map(t => t.id)).toEqual(["Y"]);
+  });
+});
+
+describe("隔离三态：null（跟随默认）与 false（显式关闭）不能混为一谈", () => {
+  it("回填：null/undefined → \"\"，true → \"true\"，false → \"false\"", () => {
+    expect(isolationToSelectValue(null)).toBe("");
+    expect(isolationToSelectValue(undefined)).toBe("");
+    expect(isolationToSelectValue(true)).toBe("true");
+    expect(isolationToSelectValue(false)).toBe("false");
+  });
+
+  it("回传：\"\" → null（跟随默认），不是 false", () => {
+    expect(isolationFromSelectValue("")).toBeNull();
+    expect(isolationFromSelectValue("true")).toBe(true);
+    expect(isolationFromSelectValue("false")).toBe(false);
+  });
+
+  it("往返稳定（保存后重开弹窗值不漂移）", () => {
+    for (const v of [null, true, false] as (boolean | null)[]) {
+      expect(isolationFromSelectValue(isolationToSelectValue(v))).toBe(v === null ? null : v);
+    }
+  });
+});
+
+describe("worktreeDiffStat：改动预览的统计行与截断提示", () => {
+  const d = (over: Partial<Parameters<typeof worktreeDiffStat>[0] & object> = {}) => ({
+    files: [], file_count: 0, total_added: 0, total_removed: 0, ...over,
+  });
+
+  it("没有工作树 → 一句话说明，不显示统计", () => {
+    expect(worktreeDiffStat(null)).toEqual({ line: "（没有隔离工作树）", rest: 0 });
+  });
+
+  it("有树但没改动 → 说清楚「批准也只是空合并」，避免被当成预览挂了", () => {
+    expect(worktreeDiffStat(d()).line).toContain("尚无改动");
+  });
+
+  it("统计行含文件数与增删行数", () => {
+    const s = worktreeDiffStat(d({
+      files: [{ path: "a", added: 1, removed: 2, binary: false }],
+      file_count: 1, total_added: 1, total_removed: 2,
+    }));
+    expect(s.line).toBe("1 个文件 · +1 −2");
+    expect(s.rest).toBe(0);
+  });
+
+  it("服务端截断了列表 → rest 是没显示的数量（40 列 / 共 57）", () => {
+    const files = Array.from({ length: 40 }, (_, i) => ({
+      path: `f${i}`, added: 0, removed: 0, binary: false,
+    }));
+    expect(worktreeDiffStat(d({ files, file_count: 57 })).rest).toBe(17);
+  });
+
+  it("file_count 比列表短（不该发生）也不给出负数", () => {
+    const files = [{ path: "a", added: 0, removed: 0, binary: false }];
+    expect(worktreeDiffStat(d({ files, file_count: 0 })).rest).toBe(0);
   });
 });

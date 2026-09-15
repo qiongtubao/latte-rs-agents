@@ -167,4 +167,48 @@ describe("buildSelectedPlanTasks：多层嵌套勾选树", () => {
     const out = buildSelectedPlanTasks([r]);
     expect(out[0].subtasks!.map(s => s.title)).toEqual(["子A"]);
   });
+  // ─── depends_on 的标题引用重映射 ────────────────────────────────
+
+  it("依赖引用跟随标题编辑：目标行改名后引用改成新标题", () => {
+    const out = buildSelectedPlanTasks([
+      row({ title: "写 ringbuf 测试（改名后）", task: { title: "写 ringbuf 测试" } }),
+      row({
+        title: "实现 ringbuf",
+        task: { title: "实现 ringbuf", depends_on: ["写 ringbuf 测试"] },
+      }),
+    ]);
+    expect(out[1].depends_on).toEqual(["写 ringbuf 测试（改名后）"]);
+  });
+
+  it("依赖的目标行未勾选 -> 丢掉该引用（否则整单导入 400 / 永久卡等待）", () => {
+    const out = buildSelectedPlanTasks([
+      row({ checked: false, title: "写 ringbuf 测试", task: { title: "写 ringbuf 测试" } }),
+      row({
+        title: "实现 ringbuf",
+        task: { title: "实现 ringbuf", depends_on: ["写 ringbuf 测试"] },
+      }),
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].depends_on).toBeUndefined();
+  });
+
+  it("看板任务 id 形状的引用原样保留（指向已存在的任务）", () => {
+    const out = buildSelectedPlanTasks([
+      row({ title: "实现", task: { title: "实现", depends_on: ["LAT-123", "不存在的任务"] } }),
+    ]);
+    expect(out[0].depends_on).toEqual(["LAT-123"]);
+  });
+
+  it("子任务层的依赖引用同样重映射", () => {
+    const parent = row({
+      title: "父",
+      task: { title: "父", subtasks: [{ title: "子A" }, { title: "子B", depends_on: ["子A"] }] },
+    }) as PlanImportRowInput;
+    parent.subRows = [
+      row({ title: "子A（改名）", task: { title: "子A" } }),
+      row({ title: "子B", task: { title: "子B", depends_on: ["子A"] } }),
+    ];
+    const out = buildSelectedPlanTasks([parent]);
+    expect(out[0].subtasks![1].depends_on).toEqual(["子A（改名）"]);
+  });
 });

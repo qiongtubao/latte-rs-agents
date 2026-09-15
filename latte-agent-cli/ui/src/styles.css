@@ -4361,6 +4361,20 @@ select {
 }
 .tb-chip-sched { background: #ede9fe; color: #6d28d9; }
 .tb-chip-sched.due { background: #dcfce7; color: #15803d; }
+/* 依赖未满足：派发被挡住，用琥珀色区别于「到点待派发」的绿色。 */
+.tb-chip-blocked { background: #fef3c7; color: #b45309; }
+/* 隔离工作树：绿色（"另一棵树"），与状态色系不撞。 */
+.tb-chip-worktree { background: #dcfce7; color: #166534; }
+/* 抽屉里的改动预览（批准前看一眼） */
+.tb-wt-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.tb-wt-stat { font-size: 12px; color: #334155; margin-bottom: 6px; }
+.tb-wt-files { display: flex; flex-direction: column; gap: 2px; max-height: 30vh; overflow-y: auto; }
+.tb-wt-file { display: flex; align-items: baseline; gap: 8px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tb-wt-path { flex: 1; min-width: 0; overflow-wrap: anywhere; color: #0f172a; }
+.tb-wt-num { min-width: 44px; text-align: right; }
+.tb-wt-num.add { color: #15803d; }
+.tb-wt-num.del { color: #b91c1c; }
+.tb-wt-sha { color: #64748b; }
 .tb-chip-session { background: #e0f2fe; color: #0369a1; cursor: pointer; }
 .tb-chip-session:hover { text-decoration: underline; }
 .tb-chip-rounds { background: #f1f5f9; color: #64748b; }
