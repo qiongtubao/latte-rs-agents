@@ -46,6 +46,7 @@ latte-agent ui --dev
 | Trace | 调试事件查看器，浏览 `$LATTE_HOME/traces/` 下的 JSONL 日志 |
 | Self-Loop | AI 自调试循环：输入任务描述，AI 自动截图、修改、验证 |
 | Role Graph | 角色 × 工具代码关系图 |
+| Tasks | 任务看板：状态机、任务树、依赖、隔离工作树（见下节） |
 
 ### UI 测试
 
@@ -209,6 +210,57 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
 | `LATTE_AGENT_PARALLEL_TOOL_CALLS` | 1（开） | 下发 OpenAI 协议的 `parallel_tool_calls`，显式声明"一条响应里可以发多个工具调用"。`0`/`false`/`off` → 下发 `false` 强制单调用；`omit` → 字段完全不下发（个别兼容端点不认它，如 litellm #22637 的 Bedrock Converse + Claude 4.5）。Anthropic 默认就允许并行，该路径不下发 |
 | `LATTE_AGENT_DELEGATE_PARALLEL` | 0（关） | 同一轮里的 `delegate` 调用进入并行段（与同批只读调用同池）。默认关：子 agent 会写文件，并发有真实竞态风险；开启后同路径写入由进程级 per-path 写锁互斥（write/edit/delete/ast_edit） |
 | `LATTE_AGENT_BLOCKING_CALLS_LAST` | 1（开） | 同一轮里**会停下来等人作答**的调用（`ask`、内部有 `ask` 步的 `workflow`）排到最后执行，同批其他派发调用先跑。设 `0`/`false`/`off` 退回严格按模型给出的下标串行 |
+
+### 任务并行与隔离工作树
+
+任务看板上的任务**默认并行执行**——包括同一次拆分出来的兄弟任务。顺序约束只有一个
+表达通道：`depends_on`（依赖的任务全部进终态后才派发）。
+
+并行的前提是不互相覆盖文件，按两档处理：
+
+| 档 | 判据 | 结果 |
+|---|---|---|
+| **隔离**（`isolated`） | 任务在独立 git worktree 里跑 | 完全无视文件重叠，任意并行 |
+| **非隔离** | 双方都声明了 `paths` 且不重叠 | 并行；任一方未声明或重叠 → 串行等待 |
+
+隔离档按任务类型开关（`config/task_types.toml` 的 `isolated`，缺省：只读类型
+`research`/`learn`/`learn_loop` 关，其余开），单个任务可在看板的编辑弹窗里覆盖。
+
+隔离任务的生命周期：
+
+```
+派发  → $LATTE_HOME/worktrees/<项目>/<任务 id>（分支 latte/task/<id>，从当前 base 派生）
+        agent 与 workflow 的工作目录都是这棵树；主仓工作区完全不受影响
+预览  → 看板抽屉里显示该树相对 base 的改动（文件 + 增删行 + 提交清单），口径与合并一致
+批准  → merging：merge 钩子在**树里**跑验证 + 出提交包（不动 base）
+完成  → done：机械合并回 base → 回收工作树 → 归档钩子在主仓总结
+冲突  → 主仓 merge --abort 复位，工作树与分支**保留**，冲突详情写进任务 history
+取消  → 回收工作树但保留分支（未合并的提交还拿得到）
+中止  → 保留整棵树，重新派发时复用（干到一半的活不丢）
+```
+
+细节：
+
+- 树建在**仓库外**（`$LATTE_HOME`，缺省 `~/.latte`）。建在仓库内会让主仓的
+  `search`/`grep`/代码图索引扫到 N 份完整代码副本。
+- 树里的 `.latte` 是指向主仓的**软链**：会话日志、workflow 断点、看板数据、项目层配置
+  （`agents.d`/`workflows.d`/`tools.d`）、生成的图片都与主仓共用一份——这些**必须**共用，
+  否则配置读不到、图片 URL 打不开、树一回收状态就没了。
+  唯一的例外是**代码图索引**：隔离树里的代码是改过的，共用 `index.json` 会让它覆盖主仓
+  索引（不报错，只是所有人查到的符号行号都变成别人树里的），所以 linked worktree 用
+  `index-<任务>-<哈希>.json` 独立文件（判据：`.git` 是文件而非目录）。
+- **被 gitignore 忽略的产物不会随合并带回**：合并只带 git 认得的改动。构建产物
+  （`target/`、`node_modules/`）本就该丢，但如果项目把**文档交付物**目录也 gitignore 了
+  （如 `.latte-review/`），隔离任务写出的文档会随工作树回收一起消失——这类目录不要
+  gitignore。
+- 改仓库状态的 git 操作（`worktree add` / `merge` / `remove`）按主仓**串行**——git 的
+  `index.lock` 是 O_EXCL 无等待锁，并发会直接失败而不是排队。
+- 仓库不是 git 时隔离自动降级为普通派发，原因记在任务 history 里。
+- 服务启动时先**对账**（上次进程留下的未结束 run 收尾、任务回 `todo`，工作树保留），
+  再回收**孤儿工作树**（磁盘上有树、看板里没有对应任务）；有未合并提交的一律保留。
+  对账刻意不自动重派——重启就重跑半成品会在用户不在场时烧掉大量 token。
+- 并发上限：`LATTE_DISPATCH_MAX_CONCURRENT`（默认 3，同时 `in_progress` 的任务数）。
+  被闸挡下的任务标记「待派发」，闸放开后 scheduler 在 5s 内自动开跑。
 
 ### 减少模型往返（read 批量读）
 

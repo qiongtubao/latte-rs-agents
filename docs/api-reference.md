@@ -706,13 +706,27 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 列出所有任务（含后代聚合进度）。
 
-**响应 `200`：** `TaskView[]`（含 `actions` / `sub_total` / `sub_done` / `sub_state_counts`）
+**响应 `200`：** `TaskView[]`（含 `actions` / `sub_total` / `sub_done` / `sub_state_counts` / `blocked_by`）
+
+`blocked_by` 是服务端算好的**未满足依赖 id 列表**（`depends_on` 里尚未进终态的那些）。非空
+= 现在派发必然 409，前端据此把「派发」按钮置灰。
+
+`dispatch_pending` = 已派过但被闸挡下、**已排队等自动续跑**。scheduler 每 5s 扫一遍这些
+任务，闸一放开就自动派发（遵守同一个并发上限）；用户把任务移出 `todo`/`rework` 即撤销。
+
+`isolated` / `isolated_effective` / `worktree` = 隔离执行（Phase 2）。`isolated` 是任务自己的
+声明（`null` = 跟随 `task_type`），`isolated_effective` 是服务端解析后的结果，`worktree` 是
+已建好的工作树（`{root, branch, base_branch, base_sha}`；`null` = 当前没有）。
 
 ### `POST /api/tasks`
 
 新建任务。
 
-**请求体：** `CreateTaskRequest`（title / description / priority / labels / parent_id / scheduled_at / workflow / paths）
+**请求体：** `CreateTaskRequest`（title / description / priority / labels / parent_id / scheduled_at / workflow / paths / depends_on / isolated）
+
+`depends_on` = 依赖的任务 id 数组，全部进终态（`done`/`cancelled`）后本任务才可派发。
+未知 id / 自依赖 / 父子关系 / 成环一律 `400`（不静默丢弃）。父子是**聚合**关系不是依赖，
+父任务作为容器本来就等子任务，所以禁止在同一条祖先链上声明依赖。
 
 **响应 `200`：** `TaskView`
 
@@ -726,7 +740,9 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 修改任务字段（partial patch）。
 
-**请求体：** `TaskPatch`（与 `create` 相同字段）
+**请求体：** `TaskPatch`（与 `create` 相同字段）。`paths` / `depends_on` 是**整体替换**语义
+（空数组 = 清空）；`depends_on` 走与 `create` 相同的校验。`isolated` 三态：缺省 = 不变，
+`null` = 跟随类型默认，`true`/`false` = 显式。
 
 **响应 `200`：** `TaskView`
 
@@ -740,13 +756,16 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 批量导入任务（plan 工具批准后调用）。导入的任务一律进 `todo`，是否派发由用户在任务看板手动操作（不做自动调度）。
 
-**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?`）。`parent_id` 三态：任务 id = 显式指定父任务（任意深度任务树：父任务本身也可以是子任务，item 的 `subtasks` 也可继续嵌套）；空串 = 显式「无父任务」；缺省 = 按 `session_id` 查拆分会话映射（`/api/tasks/<id>/refine` 登记，页面刷新不丢）
+**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?`）。
+item 的 `depends_on` 既可写已存在的任务 id，也可写**同一批任务的标题**（新任务此时还没有 id）；
+解析在全部任务创建完成后统一进行，所以前向引用（依赖清单里后面才出现的任务）同样有效。
+解析不到或标题歧义 → 整单 `400` 并点名该引用（不静默丢弃）。`parent_id` 三态：任务 id = 显式指定父任务（任意深度任务树：父任务本身也可以是子任务，item 的 `subtasks` 也可继续嵌套）；空串 = 显式「无父任务」；缺省 = 按 `session_id` 查拆分会话映射（`/api/tasks/<id>/refine` 登记，页面刷新不丢）
 
 **响应 `200`：** `ImportTasksResponse`（含 `created`）
 
 ### `POST /api/tasks/<id>/refine`
 
-拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 出拆分草案 → reviewer 评审 → 终审门 REJECT 自动返工 → 过审后用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。plan 提交前对 `paths` 做机械校验（路径前缀必须真实存在、清单内互不重叠），失败整单打回模型修正。不改变任务状态、不记 run。任意层级任务都可拆（任务树深度不限）；`in_progress`/`merging` 中的任务不可拆。
+拆分子任务：新建 session 跑 `task_refine` workflow（task_planner 出拆分草案 → reviewer 评审 → 终审门 REJECT 自动返工 → 过审后用 plan 工具提交子任务清单，用户在弹窗勾选导入，前端带 `parent_id`）。plan 提交前对 `paths` 做机械校验（路径前缀必须真实存在、清单内互不重叠；**声明了 `depends_on` 关系的一对任务不参与重叠校验**——它们由看板串行执行，重叠只在并发时有害），失败整单打回模型修正。不改变任务状态、不记 run。任意层级任务都可拆（任务树深度不限）；`in_progress`/`merging` 中的任务不可拆。
 
 **请求体：** `{}`
 
@@ -754,15 +773,46 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 ### `POST /api/tasks/dispatch-ready`
 
-一键批量派发所有 `todo` 任务（按 priority 排序）。
+一键批量派发所有 `todo` 任务（按 priority 排序），遵守并发上限、依赖与文件范围约束；
+被挡下的任务留在 `todo` 并在 `skipped` 里带原因。
 
-**请求体：** `{ "max_concurrent": 3 }`
+**请求体：** `{ "max_concurrent": 3 }`（缺省读 `LATTE_DISPATCH_MAX_CONCURRENT`，默认 3）
 
 **响应 `200`：** `DispatchReadyResponse`（`dispatched` / `skipped`）
 
 ### `POST /api/tasks/<id>/dispatch`
 
 派发单个任务（manager 走 task 调度 / workflow 绑定的任务直接跑 workflow）。
+
+**派发闸（按顺序）：**
+
+1. 状态必须是 `todo`/`rework`，否则 `400`；
+2. **依赖未满足** → `409`，消息点名等哪些任务及其当前状态；
+3. **同族文件冲突** → `409`。同一棵任务树下的任务**默认并行**；只有在无法证明它们不碰
+   同一批文件时才互斥——双方都声明了 `paths` 且不重叠即放行，任一方未声明或声明后重叠
+   则拒绝。容器祖先在跑不阻塞后代。
+4. **跨族 paths 重叠** → `409`。
+
+**隔离任务（`isolated_effective = true`）跳过第 3、4 条**：它们各自在独立 git worktree 里
+执行，物理上不可能互相覆盖，`paths` 重叠也无所谓。依赖闸（第 2 条）照旧生效。
+
+隔离任务的生命周期：派发时在 `$LATTE_HOME/worktrees/<项目>/<任务 id>` 建工作树（分支
+`latte/task/<id>`，从当前 base 分支派生），agent 与 workflow 的工作目录都指向它
+（`merging`/`done` 的生命周期钩子也跑在树里——`merge` 钩子要在**改动所在的树**里跑测试，
+跑主仓等于验证一份还没合并的工作区）；
+`state → merging` 只跑 `merge` 钩子（在**树里**验证 + 出提交包，不动 base）；
+`state → done` 才机械合并回 base、回收工作树，然后归档钩子在主仓总结。
+合并刻意不挂在 `merging`——那样它会排在 LLM 验证流之后，模型不可用或流程等人拍板时
+合并被无限期拖住，而用户点批准的意思就是"合进去"。冲突则**保留工作树与分支**、把冲突
+详情写进任务 history 等人处置；`cancelled` 回收但**保留分支**（未合并的提交还拿得到）。仓库不是 git 时隔离自动降级为普通派发，
+原因记在 history 里。
+
+⚠️ 合并只带 git 认得的改动，**被 gitignore 忽略的产物不会带回**（构建产物本就该丢，但把
+文档交付物目录 gitignore 掉的项目要注意）。代码图索引在隔离树里用独立文件，不与主仓
+共用——否则隔离树改过的代码会覆盖主仓索引、让所有人查到错的行号。
+
+带未完成子任务的父任务走**容器分流**：父任务标记 `in_progress` 作为聚合节点，逐个派发
+`todo` 子任务；被闸挡下的子任务留在 `todo`，原因写进该子任务的 history（看板可见）。
 
 **请求体：** `{}`
 
@@ -773,6 +823,30 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 中止任务执行（取消旗标 + chat_abort）。
 
 **响应 `200`：** `TaskView`
+
+### `GET /api/tasks/<id>/worktree-diff`
+
+隔离任务的**改动预览**：批准（`merging`）等于把工作树合并回 base，批之前得先看得见
+改的是什么——此前用户只能看 workflow 的文字摘要。
+
+口径与合并**完全一致**：已提交 + 未提交 + 未跟踪的新文件都算（`merge_back` 的 `add -A`
+会把它们一起提交），比较基准是 base 分支当前 tip（分支已不在时退回派生点 SHA）。合并完
+再查会得到空结果。
+
+**响应 `200`：** `WorktreeDiff | null`（`null` = 非隔离任务，或已合并回收）
+
+```json
+{
+  "branch": "latte/task/LAT-101", "root": "/Users/x/.latte/worktrees/proj-ab12cd34/LAT-101",
+  "base": "main",
+  "files": [{ "path": "src/ringbuf.c", "added": 42, "removed": 7, "binary": false }],
+  "file_count": 3, "total_added": 51, "total_removed": 7,
+  "commits": [{ "sha": "a1b2c3d", "subject": "task(LAT-101): 实现环形缓冲" }]
+}
+```
+
+`files` 最多 40 个（大重构能改上千文件，全塞进响应只会拖慢抽屉）；`file_count` 是**未截断
+的真实总数**，前端据此显示「还有 N 个」。
 
 ### `POST /api/tasks/<id>/report`
 
