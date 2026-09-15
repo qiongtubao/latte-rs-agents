@@ -376,8 +376,19 @@ Web UI 侧：写操作走 `POST /api/chat/command`（转发同样的斜杠命令
 `GoalUpdated` 事件推送；那是瞬时事件，所以刷新页面后靠 `GET /api/goal` 恢复
 徽章。
 
-目前 goal 层只在**单角色** `chat`（manager 主路）生效；多角色 `discuss` 的
-完成契约是 `RoundScheduler` 的轮次 + `Supervisor` 预算，两套不叠加。
+#### 为什么多角色 `discuss` 不接 goal
+
+goal 层只在**单角色** `chat`（manager 主路）生效。`discuss` 的完成契约是
+`RoundScheduler` 的轮次 + `Supervisor` 预算，它的 loop 里**没有 goal round
+driver**，两套不叠加：叠上去会变成两层嵌套的轮次计数器（goal 轮 × discuss 轮
+× 每轮 N 个角色），而"谁该判定目标达成"没有单一归属——discuss 的语义本来
+就是"跑 N 轮多角色讨论"，不是"达成某个目标"。
+
+这个边界写进了**签名**：`build_runner` 的 goal 参数是 `Option`，`None` = 这条
+路径没有 driver、因此不给角色注册 `goal` 工具。不这么做的后果是：角色调
+`goal(op="set")` 会收到一句「目标已设定，自动续跑已开启」，而实际上永远没人
+驱动它，用户盯着一个「第 0/24 轮」的徽章等下去。**注册与驱动必须同源**，
+所以把「有没有 driver」编码进类型而不是靠注释约定。
 
 #### 持久化：目标跨进程活，自动续跑不跨进程活
 
@@ -400,6 +411,7 @@ disarmed，用户设完发现它不跑且不知道为什么。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `LATTE_AGENT_GOAL_MAX_ROUNDS` | 24 | 新建 goal 时的默认轮次上限，钳在 `1..=256`。`goal set` 显式传 `max_rounds` 时以显式值为准 |
 | `LATTE_AGENT_WORKFLOW_DISPATCH_CAP` | 200 | 一次 workflow run（**含全部嵌套子 run**）能派出的分派单元总数上限，`0` = 不限 |
 
 这是那条被移除的墙钟机制（`LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS`）的

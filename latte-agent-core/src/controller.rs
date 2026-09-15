@@ -2024,7 +2024,6 @@ async fn run_driver(
             plan_stage,
             plan_mode,
             todo_state,
-            goal_state,
             advisor_pause,
             agent_pause_gate,
             last_user_input.clone(),
@@ -2082,10 +2081,6 @@ async fn run_multi_role_loop(
     plan_stage: SharedPlanStage,
     plan_mode: Arc<AtomicBool>,
     todo_state: crate::todo::SharedTodoState,
-    // 多角色路径目前不跑 goal 外循环（它的完成契约是 RoundScheduler 的
-    // 轮次 + Supervisor 预算），但 build_runner 要这个句柄来决定是否给
-    // 角色注册 `goal` 工具，所以照样透传。
-    goal_state: crate::goal::SharedGoal,
     advisor_pause: AdvisorPauseGate,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     // 与 ChatController 共享的原始用户诉求句柄（委派返回审查的准绳）。
@@ -2287,7 +2282,8 @@ async fn run_multi_role_loop(
             advisor_pause.clone(),
             &plan_stage,
             &todo_state,
-        &goal_state,
+            // 多角色 discuss 不跑 goal 层（见 build_runner 的参数说明）。
+            None,
             plan_mode.load(Ordering::SeqCst),
             agent_pause_gate.clone(),
             config.stream_mode.clone(),
@@ -2936,7 +2932,7 @@ async fn run_single_role_loop(
         advisor_pause.clone(),
         &plan_stage,
         &todo_state,
-        &goal_state,
+        Some(&goal_state),
         plan_mode.load(Ordering::SeqCst),
         agent_pause_gate.clone(),
         config.stream_mode.clone(),
@@ -3309,7 +3305,7 @@ async fn run_single_role_loop(
                                                 continue;
                                             };
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                 Ok((mut new_runner, rid)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3331,7 +3327,7 @@ async fn run_single_role_loop(
                                                 Ok(new_tier) => {
                                                     let role = current_role.clone();
                                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                                         Ok((mut new_runner, _)) => {
                                                             for m in history { new_runner.context_mut().push(m); }
                                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3584,7 +3580,7 @@ async fn run_single_role_loop(
                                 let mode_now = plan_mode.load(Ordering::SeqCst);
                                 if mode_now != runner_plan_mode {
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                         Ok((mut new_runner, _)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3871,7 +3867,7 @@ async fn run_single_role_loop(
                                     continue;
                                 }
                                 let history: Vec<Message> = runner.context().messages().to_vec();
-                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                     Ok((mut new_runner, rid)) => {
                                         for m in history { new_runner.context_mut().push(m); }
                                         runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3886,7 +3882,7 @@ async fn run_single_role_loop(
                             }
                             Some(ControllerInput::SwitchModel(new_tier)) => {
                                 let history: Vec<Message> = runner.context().messages().to_vec();
-                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, &goal_state, plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
                                     Ok((mut new_runner, _)) => {
                                         for m in history { new_runner.context_mut().push(m); }
                                         runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3964,7 +3960,15 @@ async fn build_runner(
     // 会话级 todo 状态共享句柄：透传给 `register_todo_tool`（读写 +
     // 广播 TodoUpdated）与 runner（TodoTracker 运行中纠偏）。
     todo_state: &crate::todo::SharedTodoState,
-    goal_state: &crate::goal::SharedGoal,
+    // `None` = **这条路径不跑 goal 层**，因此不给角色注册 `goal` 工具。
+    //
+    // 为什么用 Option 而不是永远传一个句柄：多角色 `discuss` 的完成契约是
+    // `RoundScheduler` 的轮次 + `Supervisor` 预算，它的 loop 里**没有 goal
+    // round driver**。若照样注册工具，角色调 `goal(op="set")` 会收到一句
+    // 「目标已设定，自动续跑已开启」，而实际上永远没人驱动它——用户盯着
+    // 一个「第 0/24 轮」的徽章等下去。把「有没有 driver」编码进签名，
+    // 注册与驱动就不可能再各说各话。
+    goal_state: Option<&crate::goal::SharedGoal>,
     // plan mode（只读规划模式）：true 时角色 allowlist 收敛到
     // [`PLAN_MODE_READONLY_TOOLS`]，并往 system prompt 追加只读引导段。
     // 切换在 turn 边界生效（driver 重建 runner 时才重读）。
@@ -4074,7 +4078,10 @@ async fn build_runner(
             .map_err(|e| AgentError::Tool(format!("register request_tool '{role_id}': {e}")))?;
         // goal：跨 turn 的完成契约（见 `crate::goal`）。声明了它的角色才
         // 拿到——目标层是"驱动整场任务"的工具，只该给编排型角色（manager）。
-        if role.allowed_tools.iter().any(|t| t == "goal") {
+        if let (true, Some(goal_state)) = (
+            role.allowed_tools.iter().any(|t| t == "goal"),
+            goal_state,
+        ) {
             register_goal_tool(
                 &tm,
                 event_tx.clone(),
@@ -11603,7 +11610,7 @@ mod tests {
                 AdvisorPauseGate::new(),
                 &fresh_plan_stage(),
                 &crate::todo::new_shared_todo_state(),
-                &crate::goal::new_shared_goal(),
+                Some(&crate::goal::new_shared_goal()),
                 false,
                 crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
@@ -11775,7 +11782,7 @@ mod tests {
                     AdvisorPauseGate::new(),
                     &fresh_plan_stage(),
                     &crate::todo::new_shared_todo_state(),
-                &crate::goal::new_shared_goal(),
+                Some(&crate::goal::new_shared_goal()),
                     plan_mode,
                     crate::pause_gate::AgentPauseGate::new("test"),
                     Arc::new(AtomicBool::new(false)),
@@ -12922,6 +12929,10 @@ mod tests {
             .expect("首次派发应成功");
         let calls_after_first = server.received_requests().await.unwrap().len();
         assert!(calls_after_first >= 1, "首次必须真的打了模型");
+        assert!(
+            !first.as_str().unwrap_or_default().is_empty(),
+            "首次派发要有实际产出"
+        );
 
         // 第二次同身份派发：必须**真的重跑**（模型请求数增加），且不得
         // 出现任何「复用」提示。
@@ -13224,6 +13235,93 @@ mod tests {
         );
 
         std::env::remove_var("LATTE_AGENT_DELEGATE_MAX_DEPTH");
+    }
+
+    /// `build_runner(goal_state = None)` 不得注册 `goal` 工具。
+    ///
+    /// 对应多角色 `discuss`：它的完成契约是 `RoundScheduler` 轮次 +
+    /// `Supervisor` 预算，loop 里**没有 goal round driver**。若照样注册工具，
+    /// 角色调 `goal(op="set")` 会收到一句「目标已设定，自动续跑已开启」，
+    /// 而实际上永远没人驱动它——用户盯着一个「第 0/24 轮」的徽章等下去。
+    ///
+    /// 把「有没有 driver」编码进 `Option` 参数后，注册与驱动就不可能各说
+    /// 各话；这条测试锁住这个不变量。判据取**模型请求体里真实下发的
+    /// tools**（`AgentRunner` 没有列工具的访问器，而这才是模型看到的东西）。
+    #[tokio::test]
+    async fn goal_tool_is_absent_when_the_path_has_no_driver() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-test", "object": "chat.completion", "created": 0, "model": "test",
+            "choices": [{ "index": 0,
+                "message": { "role": "assistant", "content": "占位回答，长度足够越过 advisor 的短输出阈值。" },
+                "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        }).to_string();
+
+        // 跑一轮、回收本次请求下发的工具名。
+        async fn tools_sent(with_goal: bool, body: String) -> Vec<String> {
+            let server = wiremock::MockServer::start().await;
+            server
+                .register(
+                    Mock::given(method("POST"))
+                        .and(path("/chat/completions"))
+                        .respond_with(ResponseTemplate::new(200).set_body_string(body)),
+                )
+                .await;
+            let merged = delegate_test_config(
+                server.uri(),
+                vec![delegate_test_role(
+                    "manager",
+                    vec!["goal".into(), "read".into()],
+                )],
+            );
+            let resolver = ModelResolver::from_config(&merged).expect("resolver");
+            let (event_tx, _rx) = broadcast::channel(64);
+            let params = GenerateParams::default();
+            let shared = crate::goal::new_shared_goal();
+            let (mut runner, _) = build_runner(
+                &merged, &resolver, &params, "manager", ModelTier::Standard, None,
+                &event_tx, std::path::Path::new("/tmp"),
+                Arc::new(crate::subsession::SubsessionStore::new()), "goal-opt-test",
+                Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)),
+                Arc::new(parking_lot::Mutex::new(String::new())), None,
+                AdvisorPauseGate::new(), &fresh_plan_stage(),
+                &crate::todo::new_shared_todo_state(),
+                if with_goal { Some(&shared) } else { None },
+                false, crate::pause_gate::AgentPauseGate::new("test"),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("build_runner");
+            let _ = runner
+                .run_turn(&[Message::user("hi".to_string())], None)
+                .await;
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .flat_map(|r| tool_names_in_request(&r.body))
+                .collect()
+        }
+
+        let with = tools_sent(true, body.clone()).await;
+        assert!(
+            with.iter().any(|n| n == "goal"),
+            "有 driver 的路径应下发 goal，实际：{with:?}"
+        );
+
+        let without = tools_sent(false, body).await;
+        assert!(
+            !without.iter().any(|n| n == "goal"),
+            "没有 driver 的路径不得下发 goal（否则模型会收到一句做不到的承诺），实际：{without:?}"
+        );
+        assert!(
+            without.iter().any(|n| n == "read"),
+            "只该摘掉 goal，别的工具照常：{without:?}"
+        );
     }
 
     /// 深度门的读取与钳制：env 覆盖、越界上钳到 5、`0` = 全局禁止委派。

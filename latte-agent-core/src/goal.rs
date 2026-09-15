@@ -233,6 +233,19 @@ pub const DEFAULT_MAX_GOAL_ROUNDS: u32 = 24;
 /// 轮次上限的硬顶。配再大也钳到这里——这是 runaway 兜底，不是配置项。
 pub const MAX_GOAL_ROUNDS_CEILING: u32 = 256;
 
+/// 新建目标时的默认轮次上限。env `LATTE_AGENT_GOAL_MAX_ROUNDS` 覆盖，
+/// 钳在 `1..=`[`MAX_GOAL_ROUNDS_CEILING`]。
+///
+/// 与项目里其他上限一致地提供 env 开关：一台机器上跑的活规模差异很大，
+/// 而每次 `goal set` 都手写 `max_rounds` 不现实。显式传参仍然优先。
+pub fn default_max_goal_rounds() -> u32 {
+    std::env::var("LATTE_AGENT_GOAL_MAX_ROUNDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|n| n.clamp(1, MAX_GOAL_ROUNDS_CEILING))
+        .unwrap_or(DEFAULT_MAX_GOAL_ROUNDS)
+}
+
 /// `block` 需要的最少连续轮数。
 ///
 /// 照 deepseek-harness 的 `blockedAfterConsecutiveRounds`（默认 3）：模型在
@@ -349,7 +362,7 @@ impl GoalState {
             phase: GoalPhase::Active,
             blocked_reason: None,
             max_rounds: max_rounds
-                .unwrap_or(DEFAULT_MAX_GOAL_ROUNDS)
+                .unwrap_or_else(default_max_goal_rounds)
                 .clamp(1, MAX_GOAL_ROUNDS_CEILING),
             rounds_started: 0,
             token_budget,
@@ -1055,6 +1068,43 @@ mod tests {
         assert_eq!(g.max_rounds, MAX_GOAL_ROUNDS_CEILING);
         let g = s.create("c", None, None, true).expect("create");
         assert_eq!(g.max_rounds, DEFAULT_MAX_GOAL_ROUNDS);
+    }
+
+    /// 默认轮次上限的 env 开关与钳制。
+    #[test]
+    fn default_max_goal_rounds_reads_env_and_clamps() {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = L.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::remove_var("LATTE_AGENT_GOAL_MAX_ROUNDS");
+        assert_eq!(default_max_goal_rounds(), DEFAULT_MAX_GOAL_ROUNDS);
+
+        std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", " 40 ");
+        assert_eq!(default_max_goal_rounds(), 40, "应容忍空白");
+
+        std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", "99999");
+        assert_eq!(
+            default_max_goal_rounds(),
+            MAX_GOAL_ROUNDS_CEILING,
+            "越界钳到硬顶——这是 runaway 兜底，不接受任意大"
+        );
+
+        std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", "0");
+        assert_eq!(default_max_goal_rounds(), 1, "0 会让目标建了就立刻 block");
+
+        std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", "不是数字");
+        assert_eq!(default_max_goal_rounds(), DEFAULT_MAX_GOAL_ROUNDS, "非法值回退默认");
+
+        // 显式传参优先于 env。
+        std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", "40");
+        let mut s = GoalState::default();
+        let g = s.create("显式优先", Some(7), None, true).expect("create");
+        assert_eq!(g.max_rounds, 7);
+        // 不传则走 env。
+        let g = s.create("走 env", None, None, true).expect("create");
+        assert_eq!(g.max_rounds, 40);
+
+        std::env::remove_var("LATTE_AGENT_GOAL_MAX_ROUNDS");
     }
 
     #[test]
