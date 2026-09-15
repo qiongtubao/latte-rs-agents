@@ -7,4 +7,8 @@ prompt_file = "prompts/manager.md"
 temperature = 0.5
 model_chain = ["MiniMax-M3", "glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash"]
 icon = "👔"
-tools = ["delegate", "read", "search", "workflow", "plan", "ask", "todo"]
+# goal —— 跨 turn 的完成契约（外层自主循环）。多轮才能做完的任务先
+#          goal(op="set") 立一个可验证目标；之后 manager 每次停下、目标
+#          还没达成，系统会自动唤醒它继续（有轮次上限）。达成必须
+#          goal(op="complete") 并附 evidence。用户侧见 /goal 命令。
+tools = ["delegate", "read", "search", "workflow", "plan", "ask", "todo", "goal"]
