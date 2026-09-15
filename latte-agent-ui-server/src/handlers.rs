@@ -26,9 +26,7 @@ pub(crate) async fn health() -> &'static str {
 
 // ─── Sessions ─────────────────────────────────────────────────────
 
-pub(crate) async fn list_sessions(
-    State(state): State<AppState>,
-) -> Json<Vec<api::SessionSummary>> {
+pub(crate) async fn list_sessions(State(state): State<AppState>) -> Json<Vec<api::SessionSummary>> {
     Json(api::list_sessions(&state.backend))
 }
 
@@ -454,26 +452,25 @@ pub(crate) async fn chat_resume_role(
 pub(crate) async fn events_sse(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Result<
-    Sse<impl Stream<Item = Result<Event, axum::Error>>>,
-    (StatusCode, String),
-> {
+) -> Result<Sse<impl Stream<Item = Result<Event, axum::Error>>>, (StatusCode, String)> {
     let id = params
         .get("id")
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "missing ?id=".into()))?;
     // 先订阅再取挂起弹框：反序会漏掉这两步之间新发出的弹框。
-    let rx = api::subscribe_session(&state.backend, id).await.map_err(|e| {
-        (
-            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            // events_sse 原来的错误消息带 "session ... not found"（不带
-            // session_id 前缀的 debug 格式），api 的是 "session_id {:?}
-            // not found"。保持路由行为不变：这里重写消息。
-            match e.status {
-                404 => format!("session {id} not found"),
-                _ => e.message,
-            },
-        )
-    })?;
+    let rx = api::subscribe_session(&state.backend, id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                // events_sse 原来的错误消息带 "session ... not found"（不带
+                // session_id 前缀的 debug 格式），api 的是 "session_id {:?}
+                // not found"。保持路由行为不变：这里重写消息。
+                match e.status {
+                    404 => format!("session {id} not found"),
+                    _ => e.message,
+                },
+            )
+        })?;
     // Each SessionHandle owns its own ChatController (and therefore
     // its own broadcast channel). Subscribing guarantees the SSE
     // stream sees only events for THIS tab — the server is no longer
@@ -503,7 +500,10 @@ pub(crate) async fn events_sse(
             // 调用是 fire-and-forget，失败只 eprintln（与其它 archiver
             // 失败处理一致——不打断聊天）。
             if let latte_agent_core::controller::ChatEvent::TaskReport {
-                task_id, summary, result, ..
+                task_id,
+                summary,
+                result,
+                ..
             } = &ev
             {
                 match crate::tasks::report_task(&backend, task_id, summary, result) {
@@ -515,9 +515,7 @@ pub(crate) async fn events_sse(
                 }
             }
             match chat_event_to_frontend_json(&ev) {
-                Ok(json) => Ok(Event::default()
-                    .event("chat_event")
-                    .data(json)),
+                Ok(json) => Ok(Event::default().event("chat_event").data(json)),
                 Err(e) => Ok(Event::default()
                     .event("error")
                     .data(format!("chat_event convert failed: {}", e))),
@@ -537,9 +535,7 @@ pub(crate) async fn events_sse(
     .map(|_| Ok(Event::default().event("ping").data("1")));
     // replay 在前、live 在后：挂起弹框先到，之后是实时事件。
     let stream = replay.chain(stream).merge(ping);
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-    ))
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15))))
 }
 
 // ─── Traces ───────────────────────────────────────────────────────
@@ -612,9 +608,7 @@ pub(crate) async fn self_loop_events_sse(
             .data(serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into()))),
         Err(_) => Ok(Event::default().event("ping").data("")),
     });
-    Sse::new(stream).keep_alive(
-        KeepAlive::new().interval(std::time::Duration::from_secs(10)),
-    )
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(10)))
 }
 
 pub(crate) async fn self_loop_stop(State(state): State<AppState>) -> StatusCode {
@@ -704,13 +698,12 @@ pub(crate) async fn get_workflow_toml_h(
     axum::extract::Path(name): axum::extract::Path<String>,
     State(state): State<AppState>,
 ) -> Result<String, (StatusCode, String)> {
-    api::get_workflow_toml(&state.backend, &name)
-        .map_err(|e| {
-            (
-                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                e.message,
-            )
-        })
+    api::get_workflow_toml(&state.backend, &name).map_err(|e| {
+        (
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            e.message,
+        )
+    })
 }
 
 pub(crate) async fn put_workflow_toml_h(
@@ -762,9 +755,8 @@ pub(crate) async fn workflow_run_events_sse(
             .event("error")
             .data(format!("broadcast lag: {}", e)))),
     });
-    Sse::new(replay.chain(live)).keep_alive(
-        KeepAlive::new().interval(std::time::Duration::from_secs(15)),
-    )
+    Sse::new(replay.chain(live))
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)))
 }
 
 // ─── Logs ────────────────────────────────────────────────────────
@@ -779,7 +771,12 @@ pub(crate) async fn get_logs(
     let tail = params.get("tail").and_then(|s| s.parse::<usize>().ok());
     api::list_logs(&state.backend, file, tail)
         .map(Json)
-        .map_err(|e| (StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), e.message))
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.message,
+            )
+        })
 }
 
 // ─── Models ─────────────────────────────────────────────────────
@@ -793,14 +790,12 @@ pub(crate) async fn get_logs(
 pub(crate) async fn list_models(
     State(state): State<AppState>,
 ) -> Result<Json<api::ModelsListResponse>, (StatusCode, String)> {
-    api::list_models(&state.backend)
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                e.message,
-            )
-        })
+    api::list_models(&state.backend).map(Json).map_err(|e| {
+        (
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            e.message,
+        )
+    })
 }
 
 /// `PATCH /api/models/:key` —— 部分更新单个 model（partial update）。
@@ -913,13 +908,12 @@ pub(crate) async fn get_model_toml(
     axum::extract::Path(key): axum::extract::Path<String>,
     State(state): State<AppState>,
 ) -> Result<String, (StatusCode, String)> {
-    api::get_model_toml(&state.backend, &key)
-        .map_err(|e| {
-            (
-                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                e.message,
-            )
-        })
+    api::get_model_toml(&state.backend, &key).map_err(|e| {
+        (
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            e.message,
+        )
+    })
 }
 
 /// `PUT /api/models/:key/toml` — 直接写入模型 TOML 源文件原始内容。
@@ -1024,15 +1018,21 @@ pub(crate) async fn put_tool_doc(
     State(state): State<AppState>,
     axum::extract::Json(body): axum::extract::Json<api::PutToolDocRequest>,
 ) -> Result<Json<api::PutToolDocResponse>, (StatusCode, String)> {
-    api::put_tool_doc(&state.backend, &id, &body.summary, &body.content, &body.target)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                e.message,
-            )
-        })
+    api::put_tool_doc(
+        &state.backend,
+        &id,
+        &body.summary,
+        &body.content,
+        &body.target,
+    )
+    .await
+    .map(Json)
+    .map_err(|e| {
+        (
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            e.message,
+        )
+    })
 }
 
 /// `DELETE /api/tools/:id/doc` —— 删掉项目工具文档，回到只有内置描述的状态。
@@ -1074,7 +1074,6 @@ pub(crate) async fn test_role(
     .await;
     Json(resp)
 }
-
 
 /// `POST /api/roles` 请求体：role_id + role_name。
 #[derive(Deserialize)]
@@ -1118,13 +1117,12 @@ pub(crate) async fn get_role_toml(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(state): State<AppState>,
 ) -> Result<String, (StatusCode, String)> {
-    api::get_role_toml(&state.backend, &id)
-        .map_err(|e| {
-            (
-                StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                e.message,
-            )
-        })
+    api::get_role_toml(&state.backend, &id).map_err(|e| {
+        (
+            StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            e.message,
+        )
+    })
 }
 
 /// `PUT /api/roles/:id/toml` — 直接写入角色 TOML 源文件原始内容。
@@ -1207,9 +1205,7 @@ pub(crate) async fn put_compaction(
 // ─── Tasks（任务看板，薄壳 → crate::tasks） ──────────────────────
 
 /// `GET /api/tasks` —— 全量列表（含子任务聚合进度）。
-pub(crate) async fn list_tasks(
-    State(state): State<AppState>,
-) -> Json<Vec<crate::tasks::TaskView>> {
+pub(crate) async fn list_tasks(State(state): State<AppState>) -> Json<Vec<crate::tasks::TaskView>> {
     Json(crate::tasks::list_tasks(&state.backend))
 }
 
@@ -1276,7 +1272,11 @@ pub(crate) async fn dispatch_task(
     State(state): State<AppState>,
     Json(body): Json<DispatchTaskBody>,
 ) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
-    let mode = if body.mode == "rework" { "rework" } else { "redo" };
+    let mode = if body.mode == "rework" {
+        "rework"
+    } else {
+        "redo"
+    };
     crate::tasks::dispatch_task(&state.backend, &id, "user", mode)
         .await
         .map(Json)
@@ -1306,6 +1306,17 @@ pub(crate) async fn abort_task(
         .map_err(Into::into)
 }
 
+/// `GET /api/tasks/:id/worktree-diff` —— 隔离任务的改动预览（批准前看一眼）。
+pub(crate) async fn task_worktree_diff(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Option<latte_agent_core::task_worktree::WorktreeDiff>>, (StatusCode, String)> {
+    crate::tasks::task_worktree_diff(&state.backend, &id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 /// `POST /api/tasks/:id/report` —— manager 回报完成（设计 §5.1 方案 A 的接口半区）。
 pub(crate) async fn report_task(
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -1330,7 +1341,11 @@ pub(crate) async fn get_task_type(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<crate::task_types::TaskTypeEntry>, (StatusCode, String)> {
     let reg = crate::task_types::TaskTypeRegistry::load(&state.backend.cwd);
-    let e = reg.types.get(&id).cloned().ok_or_else(|| (StatusCode::NOT_FOUND, format!("task_type '{id}' 不存在")))?;
+    let e = reg
+        .types
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("task_type '{id}' 不存在")))?;
     Ok(Json(crate::task_types::TaskTypeEntry { id, def: e }))
 }
 
@@ -1365,7 +1380,11 @@ pub(crate) async fn delete_task_type(
     crate::task_types::delete_task_type(&state.backend.cwd, &id)
         .map(|_| StatusCode::OK)
         .map_err(|m| {
-            let code = if m.contains("不存在") { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+            let code = if m.contains("不存在") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
             (code, m)
         })
 }
@@ -1433,14 +1452,20 @@ pub(crate) async fn upload_image(
     // 上限 10 MiB，避免超大 body 打爆内存 / 磁盘。
     const MAX_BYTES: usize = 10 * 1024 * 1024;
     if body.len() > MAX_BYTES {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "image exceeds 10 MiB".to_string()));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image exceeds 10 MiB".to_string(),
+        ));
     }
     let ext = params
         .get("ext")
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "png".to_string());
     if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported image ext: {ext}")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported image ext: {ext}"),
+        ));
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1448,13 +1473,23 @@ pub(crate) async fn upload_image(
         .unwrap_or(0);
     let file = format!("upload-{ts}.{ext}");
     let dir = state.backend.cwd.join(".latte/images");
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir images: {e}")))?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mkdir images: {e}"),
+        )
+    })?;
     tokio::fs::write(dir.join(&file), &body)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write image: {e}")))?;
-    Ok(Json(serde_json::json!({ "path": format!("/api/images/{file}") })))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write image: {e}"),
+            )
+        })?;
+    Ok(Json(
+        serde_json::json!({ "path": format!("/api/images/{file}") }),
+    ))
 }
 
 // ─── 学习/文档只读资源 ─────────────────────────────────────────────
@@ -1498,7 +1533,12 @@ pub(crate) async fn get_doc_asset(
         "gif" => "image/gif",
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
-        _ => return Err((StatusCode::BAD_REQUEST, "unsupported asset type".to_string())),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "unsupported asset type".to_string(),
+            ))
+        }
     };
     let path = resolve_whitelisted_path(&state.backend.cwd, rel)
         .ok_or_else(|| (StatusCode::BAD_REQUEST, "path not allowed".to_string()))?;
@@ -1525,7 +1565,10 @@ pub(crate) async fn get_doc(
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "doc not found".to_string()))?;
     if meta.len() > MAX_BYTES {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "doc exceeds 1 MiB".to_string()));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "doc exceeds 1 MiB".to_string(),
+        ));
     }
     let text = tokio::fs::read_to_string(&path)
         .await
@@ -1548,12 +1591,13 @@ pub(crate) async fn get_code_graph_mermaid(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let path = params.get("path").map(|s| s.as_str()).unwrap_or(".");
-    let graph = params.get("graph").map(|s| s.as_str()).unwrap_or("structure");
+    let graph = params
+        .get("graph")
+        .map(|s| s.as_str())
+        .unwrap_or("structure");
     let cwd = state.backend.cwd.clone();
     let result = match graph {
-        "structure" => {
-            latte_agent_core::code_graph_viz::structure_mermaid(&cwd, path).await
-        }
+        "structure" => latte_agent_core::code_graph_viz::structure_mermaid(&cwd, path).await,
         "calls" => latte_agent_core::code_graph_viz::calls_mermaid(&cwd, path).await,
         other => {
             return Err((

@@ -26,6 +26,15 @@ pub struct TaskTypeDef {
     pub color: String,
     #[serde(default)]
     pub icon: String,
+    /// 该类型的任务是否在**独立 git worktree** 里执行（Phase 2 隔离）。
+    ///
+    /// 缺省 `None` = 跟随内建判断：会改代码的类型（feature/bugfix/docs…）
+    /// 开，纯读类型（research/learn/learn_loop）关——给只读任务开树只是白
+    /// 花一次 checkout 的时间和磁盘，它们本来就不会互相覆盖。
+    /// 显式 `true`/`false` 覆盖内建判断；单个任务还能再用 `Task.isolated`
+    /// 覆盖类型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,20 +97,50 @@ impl TaskTypeRegistry {
         self.types.contains_key(t)
     }
 
+    /// 该类型是否默认隔离执行。类型没显式声明时用内建判断：
+    /// 只读类型（research / learn / learn_loop）关，其余开。
+    ///
+    /// 未注册的类型（含 `None`）→ `false`：没有类型信息的任务多半是杂事，
+    /// 给它开树反而制造一堆待合并的分支。
+    pub fn isolated_default(&self, t: Option<&str>) -> bool {
+        let Some(t) = t.map(str::trim).filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        match self.types.get(t).and_then(|d| d.isolated) {
+            Some(v) => v,
+            None => !matches!(t, "research" | "learn" | "learn_loop"),
+        }
+    }
+
     pub fn default_workflow(&self, t: &str) -> Option<String> {
         let def = self.types.get(t)?;
         let w = def.default_workflow.trim();
-        if w.is_empty() { None } else { Some(w.to_string()) }
+        if w.is_empty() {
+            None
+        } else {
+            Some(w.to_string())
+        }
     }
 
     pub fn entries(&self) -> Vec<TaskTypeEntry> {
-        let mut v: Vec<TaskTypeEntry> = self.types.iter().map(|(k, v)| TaskTypeEntry { id: k.clone(), def: v.clone() }).collect();
+        let mut v: Vec<TaskTypeEntry> = self
+            .types
+            .iter()
+            .map(|(k, v)| TaskTypeEntry {
+                id: k.clone(),
+                def: v.clone(),
+            })
+            .collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
 
     pub fn list(&self) -> Vec<(String, TaskTypeDef)> {
-        let mut v: Vec<(String, TaskTypeDef)> = self.types.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut v: Vec<(String, TaskTypeDef)> = self
+            .types
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
     }
@@ -110,15 +149,20 @@ impl TaskTypeRegistry {
     fn load_project_only(cwd: &Path) -> RawRegistry {
         let pp = project_path(cwd);
         if let Ok(raw) = std::fs::read_to_string(&pp) {
-            if let Some(r) = parse_toml(&raw) { return r; }
+            if let Some(r) = parse_toml(&raw) {
+                return r;
+            }
         }
-        RawRegistry { types: HashMap::new() }
+        RawRegistry {
+            types: HashMap::new(),
+        }
     }
 
     fn save_project(cwd: &Path, raw: &RawRegistry) -> Result<(), String> {
         let pp = project_path(cwd);
         if let Some(parent) = pp.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
         let s = toml::to_string_pretty(raw).map_err(|e| format!("serialize: {e}"))?;
         // 原子写
@@ -132,11 +176,17 @@ impl TaskTypeRegistry {
 /// 校验 id：仅允许小写字母、数字、_、-，以字母开头，长度 1..32
 pub fn validate_id(id: &str) -> Result<(), String> {
     let s = id.trim();
-    if s.is_empty() { return Err("id 不能为空".into()); }
-    if s.len() > 32 { return Err("id 长度不能超过 32".into()); }
+    if s.is_empty() {
+        return Err("id 不能为空".into());
+    }
+    if s.len() > 32 {
+        return Err("id 长度不能超过 32".into());
+    }
     let mut chars = s.chars();
     let first = chars.next().unwrap();
-    if !first.is_ascii_lowercase() { return Err("id 必须以小写字母开头".into()); }
+    if !first.is_ascii_lowercase() {
+        return Err("id 必须以小写字母开头".into());
+    }
     for c in s.chars() {
         if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
             return Err(format!("id 含非法字符 '{c}'（仅允许 a-z 0-9 _ -）"));
@@ -178,7 +228,9 @@ pub fn delete_task_type(cwd: &Path, id: &str) -> Result<(), String> {
     }
     if !raw.types.contains_key(id) {
         // 仅 bundled 存在
-        return Err(format!("内置类型 '{id}' 不能删除，可将其 default_workflow 设为空来禁用"));
+        return Err(format!(
+            "内置类型 '{id}' 不能删除，可将其 default_workflow 设为空来禁用"
+        ));
     }
     raw.types.remove(id);
     TaskTypeRegistry::save_project(cwd, &raw)?;
@@ -227,15 +279,24 @@ mod tests {
     fn bundled_loads() {
         let r = TaskTypeRegistry::from_toml_str(BUNDLED_TOML).expect("bundled parse");
         assert!(r.is_known("feature"));
-        assert_eq!(r.default_workflow("feature").as_deref(), Some("tdd_development"));
+        assert_eq!(
+            r.default_workflow("feature").as_deref(),
+            Some("tdd_development")
+        );
         assert_eq!(r.default_workflow("chore"), None);
     }
 
     #[test]
     fn effective_prefers_explicit() {
         let r = TaskTypeRegistry::from_toml_str(BUNDLED_TOML).unwrap();
-        assert_eq!(effective_workflow(Some("feature"), Some("bug_triage"), &r).as_deref(), Some("bug_triage"));
-        assert_eq!(effective_workflow(Some("feature"), None, &r).as_deref(), Some("tdd_development"));
+        assert_eq!(
+            effective_workflow(Some("feature"), Some("bug_triage"), &r).as_deref(),
+            Some("bug_triage")
+        );
+        assert_eq!(
+            effective_workflow(Some("feature"), None, &r).as_deref(),
+            Some("tdd_development")
+        );
         assert_eq!(effective_workflow(None, None, &r), None);
         assert_eq!(effective_workflow(Some("chore"), None, &r), None);
     }

@@ -225,9 +225,7 @@ pub async fn upsert_with_retry(
         match upsert_one(http, cfg, task_id, body).await {
             SyncResult::Ok => return SyncResult::Ok,
             SyncResult::ClientError(code, msg) => {
-                eprintln!(
-                    "[notion-sync] {task_id} 客户端错 {code}: {msg}（不重试）"
-                );
+                eprintln!("[notion-sync] {task_id} 客户端错 {code}: {msg}（不重试）");
                 return SyncResult::ClientError(code, msg);
             }
             SyncResult::RetriesExhausted(msg) => {
@@ -235,9 +233,7 @@ pub async fn upsert_with_retry(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
-                eprintln!(
-                    "[notion-sync] {task_id} 3 次重试仍失败: {msg}"
-                );
+                eprintln!("[notion-sync] {task_id} 3 次重试仍失败: {msg}");
                 return SyncResult::RetriesExhausted(msg);
             }
         }
@@ -270,14 +266,21 @@ impl DirtySet {
     }
 }
 
-
 /// 把一个任务序列化为 Notion `/api/ext/{ns}/records` PUT 请求体。
 /// - `title` = 任务 title（必填）。
 /// - `props` = 状态/优先级/labels/workflow 等结构化字段。
 /// - `content_md` = 任务描述 + 最近 4 条 history note。
 pub fn build_record_body(t: &crate::tasks::Task) -> serde_json::Value {
     let mut notes: Vec<String> = Vec::new();
-    for h in t.history.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev() {
+    for h in t
+        .history
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         if let Some(note) = &h.note {
             notes.push(format!(
                 "- [{}] {} → {}: {}",
@@ -309,7 +312,10 @@ pub fn build_record_body(t: &crate::tasks::Task) -> serde_json::Value {
 
     let mut props = serde_json::Map::new();
     props.insert("state".into(), serde_json::Value::String(t.state.clone()));
-    props.insert("priority".into(), serde_json::Value::Number(t.priority.into()));
+    props.insert(
+        "priority".into(),
+        serde_json::Value::Number(t.priority.into()),
+    );
     props.insert(
         "labels".into(),
         serde_json::Value::Array(
@@ -324,7 +330,10 @@ pub fn build_record_body(t: &crate::tasks::Task) -> serde_json::Value {
         serde_json::Value::String(t.workflow.clone().unwrap_or_default()),
     );
     if let Some(sched) = t.scheduled_at {
-        props.insert("scheduled_at".into(), serde_json::Value::Number(sched.into()));
+        props.insert(
+            "scheduled_at".into(),
+            serde_json::Value::Number(sched.into()),
+        );
     }
     // 看板已支持任意深度任务树：真实 parent_id 透传到 props。Notion
     // 记录是平铺结构（title/props/content_md），props 里保留父子引用
@@ -368,8 +377,7 @@ pub async fn sync_dirty_tasks(
         };
         match upsert_with_retry(http, cfg, &task_id, &body).await {
             SyncResult::Ok => summary.succeeded += 1,
-            SyncResult::ClientError(_, _) => {
-            }
+            SyncResult::ClientError(_, _) => {}
             SyncResult::RetriesExhausted(_) => {
                 // 5xx/网络错：把任务重新标 dirty，下一轮 5s 后再试。
                 store.mark_notion_dirty(&task_id);
@@ -438,8 +446,11 @@ async fn sync_once(b: &crate::UiBackend) {
     if summary.attempted > 0 {
         eprintln!(
             "[notion-sync] attempted={} ok={} 4xx={} 5xx={} missing={}",
-            summary.attempted, summary.succeeded, summary.failed_client,
-            summary.failed_server, summary.skipped_missing
+            summary.attempted,
+            summary.succeeded,
+            summary.failed_client,
+            summary.failed_server,
+            summary.skipped_missing
         );
     }
 
@@ -450,8 +461,11 @@ async fn sync_once(b: &crate::UiBackend) {
     if doc_summary.attempted > 0 {
         eprintln!(
             "[notion-sync] docs attempted={} ok={} 4xx={} 5xx={} missing={}",
-            doc_summary.attempted, doc_summary.succeeded, doc_summary.failed_client,
-            doc_summary.failed_server, doc_summary.skipped_missing
+            doc_summary.attempted,
+            doc_summary.succeeded,
+            doc_summary.failed_client,
+            doc_summary.failed_server,
+            doc_summary.skipped_missing
         );
     }
 }
@@ -481,8 +495,12 @@ mod tests {
         let cfg = NotionSyncConfig::from_env();
         std::env::remove_var("LATTE_NOTION_URL");
         std::env::remove_var("LATTE_NOTION_TOKEN");
-        if let Some(v) = prev_url { std::env::set_var("LATTE_NOTION_URL", v); }
-        if let Some(v) = prev_token { std::env::set_var("LATTE_NOTION_TOKEN", v); }
+        if let Some(v) = prev_url {
+            std::env::set_var("LATTE_NOTION_URL", v);
+        }
+        if let Some(v) = prev_token {
+            std::env::set_var("LATTE_NOTION_TOKEN", v);
+        }
         assert!(!cfg.enabled, "no token = disabled");
         assert_eq!(cfg.base_url, "http://127.0.0.1:3210");
         assert_eq!(cfg.namespace, "agents-tasks");
@@ -512,9 +530,14 @@ mod tests {
         std::env::set_var("LATTE_NOTION_TOKEN", "t");
         let cfg = NotionSyncConfig::from_env();
         std::env::remove_var("LATTE_NOTION_URL");
-        if let Some(v) = prev_url { std::env::set_var("LATTE_NOTION_URL", v); }
-        if let Some(v) = prev_token { std::env::set_var("LATTE_NOTION_TOKEN", v); }
-        else { std::env::remove_var("LATTE_NOTION_TOKEN"); }
+        if let Some(v) = prev_url {
+            std::env::set_var("LATTE_NOTION_URL", v);
+        }
+        if let Some(v) = prev_token {
+            std::env::set_var("LATTE_NOTION_TOKEN", v);
+        } else {
+            std::env::remove_var("LATTE_NOTION_TOKEN");
+        }
         assert!(cfg.enabled);
         assert_eq!(cfg.base_url, "http://10.0.0.5:9999");
     }
@@ -548,6 +571,10 @@ mod tests {
             scheduled_at: None,
             workflow: Some("tdd_development".into()),
             paths: vec!["src/ringbuf".into()],
+            depends_on: vec![],
+            dispatch_pending: false,
+            isolated: None,
+            worktree: None,
             runs: vec![],
             created_at: 1000,
             updated_at: 2000,
@@ -560,7 +587,10 @@ mod tests {
         assert_eq!(props["priority"], 1);
         assert_eq!(props["labels"], serde_json::json!(["core"]));
         assert_eq!(props["workflow"], "tdd_development");
-        assert_eq!(props["parent_id"], "LAT-99", "任意深度树的 parent_id 透传到 props");
+        assert_eq!(
+            props["parent_id"], "LAT-99",
+            "任意深度树的 parent_id 透传到 props"
+        );
         let content = body["content_md"].as_str().expect("content_md string");
         assert!(content.contains("覆盖并发读写路径"));
         assert!(content.contains("[LAT-100]"));
@@ -576,10 +606,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/api/ext/agents-tasks/records/LAT-100"))
             .and(header("authorization", "Bearer secret"))
-            .respond_with(
-                ResponseTemplate::new(401)
-                    .set_body_string(r#"{"error":"unauthorized"}"#),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"unauthorized"}"#))
             .mount(&server)
             .await;
 
@@ -654,24 +681,14 @@ mod tests {
     /// sync_dirty_tasks：成功 → succeeded 计数 + dirty 清除。
     #[tokio::test]
     async fn sync_dirty_pushes_and_clears() {
+        use crate::tasks::TaskStore;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use crate::tasks::TaskStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = TaskStore::load(dir.path()).expect("load");
         store
-            .create(
-                "demo",
-                "",
-                3,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                "user",
-            )
+            .create("demo", "", 3, vec![], None, None, None, None, "user")
             .expect("create");
         assert_eq!(store.notion_dirty_count(), 1, "create 标 dirty");
 
@@ -697,24 +714,14 @@ mod tests {
     /// sync_dirty_tasks：5xx 失败 → dirty 保留待下一轮。
     #[tokio::test]
     async fn sync_dirty_keeps_dirty_on_5xx() {
+        use crate::tasks::TaskStore;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        use crate::tasks::TaskStore;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = TaskStore::load(dir.path()).expect("load");
         store
-            .create(
-                "demo",
-                "",
-                3,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                "user",
-            )
+            .create("demo", "", 3, vec![], None, None, None, None, "user")
             .expect("create");
 
         let server = MockServer::start().await;
@@ -741,17 +748,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = TaskStore::load(dir.path()).expect("load");
         store
-            .create(
-                "demo",
-                "",
-                3,
-                vec![],
-                None,
-                None,
-                None,
-                None,
-                "user",
-            )
+            .create("demo", "", 3, vec![], None, None, None, None, "user")
             .expect("create");
         let cfg = NotionSyncConfig {
             enabled: false,
@@ -775,7 +772,10 @@ mod tests {
         assert_eq!(body["props"]["tags"], serde_json::json!(["rust", "auth"]));
         assert_eq!(body["props"]["path"], "entities/auth-service.md");
         let content_md = body["content_md"].as_str().unwrap();
-        assert!(content_md.starts_with("---\n"), "保留完整 frontmatter + 正文");
+        assert!(
+            content_md.starts_with("---\n"),
+            "保留完整 frontmatter + 正文"
+        );
     }
 
     /// sync_doc_dirty：成功 PUT 到 agents-docs 并删标记。
@@ -799,7 +799,9 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path("/api/ext/agents-docs/records/entities/auth-service.md"))
+            .and(path(
+                "/api/ext/agents-docs/records/entities/auth-service.md",
+            ))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
             .mount(&server)
@@ -831,7 +833,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let doc_path = dir.path().join(".latte-review/docs/entities");
         std::fs::create_dir_all(&doc_path).unwrap();
-        std::fs::write(doc_path.join("a.md"), "---\ntype: entity\ntitle: A\n---\n\nx").unwrap();
+        std::fs::write(
+            doc_path.join("a.md"),
+            "---\ntype: entity\ntitle: A\n---\n\nx",
+        )
+        .unwrap();
         let dirty_dir = dir.path().join(".latte/.docs-dirty");
         std::fs::create_dir_all(&dirty_dir).unwrap();
         std::fs::write(dirty_dir.join("entities.a.md"), "entities/a.md").unwrap();

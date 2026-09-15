@@ -45,18 +45,18 @@
 //! ```
 
 pub mod api;
+mod api_reference_integrity;
 mod handlers;
+pub mod models;
+pub mod notion_sync;
 pub mod role_graph;
 mod self_loop;
 mod sessions;
-mod api_reference_integrity;
-pub mod models;
-pub mod notion_sync;
 pub mod task_types;
 pub mod tasks;
+mod test;
 pub mod tools;
 pub mod workflows;
-mod test;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -157,14 +157,14 @@ pub struct UiBackend {
     /// 句柄（`/api/workflows/resume` 注册）。用于两事：
     /// at-most-one-per-session 并发 guard（409），以及 `chat_abort`
     /// 时连带取消。run 结束时从 map 移除。
-    pub(crate) session_workflows:
-        Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    pub(crate) session_workflows: Arc<
+        parking_lot::RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    >,
     /// 拆分会话 → 父任务 id（`POST /api/tasks/:id/refine` 登记）。导入
     /// 接口带 `session_id` 时从这里解析 parent_id——刷新页面也不丢
     /// （进程内存，server 重启才丢，届时前端弹窗的父任务下拉框可人工
     /// 指定）。
-    pub(crate) refine_parents:
-        Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
+    pub(crate) refine_parents: Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
     /// Notion 同步的共享 reqwest::Client 与配置。后台循环 5s 跑一轮
     /// `notion_sync::sync_dirty_tasks`，从 `tasks::TaskStore` 拉 dirty
     /// 任务推送到 latte-rs-notion-client。`None` 时禁用（缺 env）。
@@ -223,9 +223,11 @@ impl UiBackend {
             // subagent 落盘用：与 ui-sessions/*.jsonl 共用 `<cwd>/.latte/ui-sessions`
             // 作为根，subagent 文件落 `<sid>/<sub_id>.jsonl`，主 session 删时联删。
             // with_persistence 启动时一次扫盘建 sub_id→session_id 索引。
-            subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::with_persistence(
-                cwd.join(".latte").join("ui-sessions"),
-            )),
+            subsession_store: Arc::new(
+                latte_agent_core::subsession::SubsessionStore::with_persistence(
+                    cwd.join(".latte").join("ui-sessions"),
+                ),
+            ),
             tasks: Arc::new(parking_lot::RwLock::new(tasks::TaskStore::load(&cwd)?)),
             session_workflows: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             refine_parents: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -267,14 +269,14 @@ impl UiBackend {
     ///
     /// 返回新 session 的 id。失败（controller spawn 失败）时不留半成品。
     pub async fn bootstrap_default_session(&self) -> Result<String, String> {
-        let session_id =
-            format!("ui-{}-{}", std::process::id(), unix_ts_millis());
+        let session_id = format!("ui-{}-{}", std::process::id(), unix_ts_millis());
         let handle = sessions::create_session_handle(
             session_id.clone(),
             &self.initial_role,
             &self.merged,
             &self.resolver,
             &self.cwd,
+            None, // 默认会话不隔离
             self.primary_model_id.clone(),
             self.initial_tier.clone(),
             &self.subsession_store,
@@ -544,7 +546,11 @@ async fn doc_graph_index_loop(cwd: PathBuf) {
         let stats = run_scan(cwd).await?;
         eprintln!(
             "[{tag}] doc-graph index: {} nodes / {} edges / {} communities / {} orphans in {:?}",
-            stats.node_count, stats.edge_count, stats.community_count, stats.orphan_count, t0.elapsed()
+            stats.node_count,
+            stats.edge_count,
+            stats.community_count,
+            stats.orphan_count,
+            t0.elapsed()
         );
         Ok(())
     }
@@ -615,7 +621,9 @@ fn build_router(state: AppState) -> Router {
     let api = Router::new()
         .route(
             "/sessions",
-            get(list_sessions).post(create_session).delete(delete_session),
+            get(list_sessions)
+                .post(create_session)
+                .delete(delete_session),
         )
         .route("/sessions/fork", post(fork_session))
         .route("/session", get(get_session))
@@ -697,21 +705,25 @@ fn build_router(state: AppState) -> Router {
         // 角色 TOML 源文件编辑
         .route("/roles/:id/toml", get(get_role_toml).put(put_role_toml))
         .route("/task-types", get(list_task_types).post(create_task_type))
-        .route("/task-types/:id", get(get_task_type).put(put_task_type).delete(delete_task_type))
+        .route(
+            "/task-types/:id",
+            get(get_task_type)
+                .put(put_task_type)
+                .delete(delete_task_type),
+        )
         // 任务看板（docs/task-board-design.md §6）
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/import", post(import_tasks))
         .route("/tasks/dispatch-ready", post(dispatch_ready))
         .route(
             "/tasks/:id",
-            get(get_task)
-                .patch(update_task)
-                .delete(delete_task),
+            get(get_task).patch(update_task).delete(delete_task),
         )
         .route("/tasks/:id/dispatch", post(dispatch_task))
         .route("/tasks/:id/refine", post(refine_task))
         .route("/tasks/:id/abort", post(abort_task))
         .route("/tasks/:id/report", post(report_task))
+        .route("/tasks/:id/worktree-diff", get(task_worktree_diff))
         // 工作流管理（编辑器 CRUD + 校验 + 测试运行）
         .route("/workflows", get(list_workflows_h).post(create_workflow_h))
         .route("/workflows/validate", post(validate_workflow_h))
@@ -721,7 +733,9 @@ fn build_router(state: AppState) -> Router {
         .route("/workflows/resume", post(workflow_resume_h))
         .route(
             "/workflows/:name",
-            get(get_workflow_h).put(update_workflow_h).delete(delete_workflow_h),
+            get(get_workflow_h)
+                .put(update_workflow_h)
+                .delete(delete_workflow_h),
         )
         .route(
             "/workflows/:name/toml",
@@ -771,13 +785,80 @@ fn resolve_static_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// HTTP 层接线测试：请求直接喂给 `build_router` 出来的 Router。
+    ///
+    /// 为什么需要它：`tasks.rs` 的单测直接调 `tasks::task_worktree_diff` 等
+    /// 函数，**绕过了路由路径、处理器签名和 serde 序列化**——路由名写错
+    /// （`worktree-diff` vs `worktree_diff`）、处理器忘挂、响应类型不可序列化，
+    /// 单测一个都发现不了，只有真发请求才暴露。
+    async fn http_get(backend: Arc<UiBackend>, uri: &str) -> (axum::http::StatusCode, String) {
+        use tower::ServiceExt;
+        let app = build_router(AppState {
+            backend,
+            static_dir: None,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("route");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn test_backend(cwd: &std::path::Path) -> Arc<UiBackend> {
+        let cfg = latte_agent_core::AgentConfig::default();
+        let resolver = latte_agent_core::ModelResolver::from_config(&cfg).expect("resolver");
+        Arc::new(
+            UiBackend::new(crate::UiBackendConfig {
+                agent_config: cfg,
+                model_resolver: resolver,
+                role: None,
+                tier: None,
+                model_id: None,
+                cwd: Some(cwd.to_path_buf()),
+                agents_config: ".latte/agents.d".into(),
+            })
+            .expect("backend"),
+        )
+    }
+
+    /// `GET /api/tasks/:id/worktree-diff` 的路由 + 序列化确实接上了。
+    #[tokio::test]
+    async fn worktree_diff_route_is_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = test_backend(dir.path());
+        // 建一个普通任务（非隔离，没有工作树）→ 期望 200 + `null`。
+        let view = crate::tasks::create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({ "title": "普通任务" })).unwrap(),
+        )
+        .expect("create");
+        let (status, body) = http_get(
+            b.clone(),
+            &format!("/api/tasks/{}/worktree-diff", view.task.id),
+        )
+        .await;
+        assert_eq!(status, 200, "路由必须挂上：{body}");
+        assert_eq!(body.trim(), "null", "非隔离任务应返回 null，实际：{body}");
+
+        // 不存在的任务 → 404（错误映射也接上了）。
+        let (status, _) = http_get(b, "/api/tasks/LAT-99999/worktree-diff").await;
+        assert_eq!(status, 404);
+    }
+
     #[test]
     fn resolve_static_dir_handles_missing() {
         // 显式指定不存在的路径 → None（不挂静态路由，也不回退候选）。
-        assert!(resolve_static_dir(Some(PathBuf::from(
-            "/nonexistent/path/1234"
-        )))
-        .is_none());
+        assert!(resolve_static_dir(Some(PathBuf::from("/nonexistent/path/1234"))).is_none());
     }
 
     /// doc_graph_index_loop 优雅降级：
@@ -794,14 +875,20 @@ mod tests {
             doc_graph_index_loop(dir.path().to_path_buf()),
         )
         .await;
-        assert!(r.is_ok(), "loop should return promptly when docs absent + refresh off");
+        assert!(
+            r.is_ok(),
+            "loop should return promptly when docs absent + refresh off"
+        );
 
         // case 2: 有 docs 目录、但 latte-review 大概率不在 PATH → boot scan
         // 失败 → 返回（不 hang）。用一个几乎不可能存在的 bin 名强制失败，
         // 避免依赖环境里是否真装了 latte-review。
         let dir2 = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir2.path().join(".latte-review").join("docs")).unwrap();
-        std::env::set_var("LATTE_REVIEW_BIN", "latte-review-definitely-not-installed-xyz");
+        std::env::set_var(
+            "LATTE_REVIEW_BIN",
+            "latte-review-definitely-not-installed-xyz",
+        );
         std::env::set_var("LATTE_DOC_GRAPH_REFRESH_SECS", "0");
         let r2 = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -810,7 +897,10 @@ mod tests {
         .await;
         std::env::remove_var("LATTE_REVIEW_BIN");
         std::env::remove_var("LATTE_DOC_GRAPH_REFRESH_SECS");
-        assert!(r2.is_ok(), "loop should return (not hang) when latte-review missing");
+        assert!(
+            r2.is_ok(),
+            "loop should return (not hang) when latte-review missing"
+        );
     }
 
     /// 端口 0 语义 + 端到端冒烟：`bind: 127.0.0.1:0` 时
@@ -824,14 +914,11 @@ mod tests {
     #[tokio::test]
     async fn spawn_binds_ephemeral_port_and_serves() {
         // 注入的工作区根：agent 相对路径（prompt_file 等）应相对它解析。
-        let ws_root = std::env::temp_dir().join(format!(
-            "ui-server-cwd-test-{}",
-            std::process::id()
-        ));
+        let ws_root =
+            std::env::temp_dir().join(format!("ui-server-cwd-test-{}", std::process::id()));
         std::fs::create_dir_all(ws_root.join("prompts")).expect("mkdir prompts");
         const MARKER: &str = "CUSTOM PROMPT FROM INJECTED CWD 注入工作区";
-        std::fs::write(ws_root.join("prompts").join("manager.md"), MARKER)
-            .expect("write prompt");
+        std::fs::write(ws_root.join("prompts").join("manager.md"), MARKER).expect("write prompt");
 
         let mut agent_config = AgentConfig::default();
         agent_config.roles.insert(
@@ -847,7 +934,7 @@ mod tests {
                 tools: vec![],
                 icon: "[m]".into(),
                 skills: vec![],
-            code_paths: vec![],
+                code_paths: vec![],
                 description: String::new(),
             },
         );
@@ -924,8 +1011,7 @@ mod tests {
 
         // /api/roles/config：角色 prompt 必须读自注入的 cwd
         // （<ws_root>/prompts/manager.md），证明 UiServerConfig::cwd 生效。
-        let (status, body) =
-            http_get(&format!("http://127.0.0.1:{}/api/roles/config", port)).await;
+        let (status, body) = http_get(&format!("http://127.0.0.1:{}/api/roles/config", port)).await;
         assert_eq!(status, 200, "/api/roles/config body: {}", body);
         let v: serde_json::Value = serde_json::from_str(&body).expect("roles config json");
         let prompt = v["roles"]
@@ -949,10 +1035,8 @@ mod tests {
         use latte_agent_core::config::{AgentConfig, ModelCatalog, ModelDef};
         use latte_agent_core::role::RoleTemplate;
 
-        let ws = std::env::temp_dir().join(format!(
-            "ui-server-persist-test-{}",
-            std::process::id()
-        ));
+        let ws =
+            std::env::temp_dir().join(format!("ui-server-persist-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).expect("mkdir ws");
 
@@ -973,8 +1057,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -999,7 +1083,7 @@ mod tests {
                     tools: vec![],
                     icon: "[m]".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             )]
@@ -1126,10 +1210,8 @@ mod tests {
         use latte_agent_core::config::{AgentConfig, ModelCatalog, ModelDef};
         use latte_agent_core::role::RoleTemplate;
 
-        let ws = std::env::temp_dir().join(format!(
-            "ui-server-orphan-ask-test-{}",
-            std::process::id()
-        ));
+        let ws =
+            std::env::temp_dir().join(format!("ui-server-orphan-ask-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).expect("mkdir ws");
 
@@ -1148,8 +1230,8 @@ mod tests {
                         max_tokens: 4096,
                         omit_max_tokens: false,
                         max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                        prompt_cache: false,
+                        prompt_cache_key: None,
                         supports_thinking: false,
                         supports_vision: false,
                         supports_image_generation: false,
@@ -1220,7 +1302,13 @@ mod tests {
         })
         .to_string();
         latte_agent_core::pending_ask::persist(
-            &ws, choice_id, &sid, wf_id, "tutor", question, &event_json,
+            &ws,
+            choice_id,
+            &sid,
+            wf_id,
+            "tutor",
+            question,
+            &event_json,
         );
 
         // ① 孤儿弹框必须被补出来 —— 否则重启后用户连"可答"的入口都没有。
@@ -1228,7 +1316,9 @@ mod tests {
             .await
             .expect("pending prompts");
         assert!(
-            pending.iter().any(|v| v["choice_id"] == choice_id && v["wait"] == true),
+            pending
+                .iter()
+                .any(|v| v["choice_id"] == choice_id && v["wait"] == true),
             "重启后挂起的阻塞 ask 必须出现在 pending-prompts 里: {pending:?}"
         );
 
@@ -1287,10 +1377,9 @@ mod tests {
         std::fs::create_dir_all(&ws).expect("mkdir ws");
 
         let make_backend = || {
-            let resolver = ModelResolver::from_config(
-                &latte_agent_core::config::AgentConfig::default(),
-            )
-            .expect("resolver");
+            let resolver =
+                ModelResolver::from_config(&latte_agent_core::config::AgentConfig::default())
+                    .expect("resolver");
             UiBackend::new(UiBackendConfig {
                 agent_config: latte_agent_core::config::AgentConfig::default(),
                 model_resolver: resolver,
@@ -1316,12 +1405,7 @@ mod tests {
                 "tasks": [{ "title": "W0: 修复阻断问题" }],
             })
             .to_string();
-            latte_agent_core::pending_ask::persist_prompt(
-                &ws,
-                "plan-manager-0",
-                &sid,
-                &event_json,
-            );
+            latte_agent_core::pending_ask::persist_prompt(&ws, "plan-manager-0", &sid, &event_json);
             sid
             // backend drop = 进程重启：内存 PROMPTS 表随之消失。
         };
@@ -1377,10 +1461,9 @@ mod tests {
         std::fs::create_dir_all(&ws).expect("mkdir ws");
 
         let make_backend = || {
-            let resolver = ModelResolver::from_config(
-                &latte_agent_core::config::AgentConfig::default(),
-            )
-            .expect("resolver");
+            let resolver =
+                ModelResolver::from_config(&latte_agent_core::config::AgentConfig::default())
+                    .expect("resolver");
             UiBackend::new(UiBackendConfig {
                 agent_config: latte_agent_core::config::AgentConfig::default(),
                 model_resolver: resolver,
@@ -1395,9 +1478,7 @@ mod tests {
 
         // 进程 A：建一个 subagent，发 3 个事件
         let backend_a = make_backend();
-        let (sub_id, sink) = backend_a
-            .subsession_store
-            .create("sid-A", "programmer");
+        let (sub_id, sink) = backend_a.subsession_store.create("sid-A", "programmer");
         for i in 0..3 {
             sink.emit(TraceEvent::ToolExec {
                 meta: TraceMeta::now(i, "programmer", "sid-A"),
@@ -1451,17 +1532,14 @@ mod tests {
     async fn delete_session_cascades_to_subsessions() {
         use latte_agent_core::trace::{ToolStatus, TraceEvent, TraceMeta, TraceSink};
 
-        let ws = std::env::temp_dir().join(format!(
-            "ui-server-subs-delete-test-{}",
-            std::process::id()
-        ));
+        let ws =
+            std::env::temp_dir().join(format!("ui-server-subs-delete-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).expect("mkdir ws");
 
-        let resolver = ModelResolver::from_config(
-            &latte_agent_core::config::AgentConfig::default(),
-        )
-        .expect("resolver");
+        let resolver =
+            ModelResolver::from_config(&latte_agent_core::config::AgentConfig::default())
+                .expect("resolver");
         let backend = UiBackend::new(UiBackendConfig {
             agent_config: latte_agent_core::config::AgentConfig::default(),
             model_resolver: resolver,
@@ -1473,9 +1551,10 @@ mod tests {
         })
         .expect("backend");
 
-
         // 建一个真 session（进 SessionMap，delete 不会 404）
-        let info = crate::api::create_session(&backend).await.expect("create session");
+        let info = crate::api::create_session(&backend)
+            .await
+            .expect("create session");
         let sid = info.session_id;
 
         // 给它两个 subagent
@@ -1500,7 +1579,11 @@ mod tests {
 
         // 落盘文件应都在
         let session_dir = ws.join(".latte").join("ui-sessions").join(&sid);
-        assert!(session_dir.exists(), "session 目录应已建: {}", session_dir.display());
+        assert!(
+            session_dir.exists(),
+            "session 目录应已建: {}",
+            session_dir.display()
+        );
         assert!(session_dir.join(format!("{sub_a}.jsonl")).exists());
         assert!(session_dir.join(format!("{sub_b}.jsonl")).exists());
         // 2 个手动创建的 subagent + 1 个 advisor monitor 的 subsession
@@ -1508,7 +1591,9 @@ mod tests {
         assert!(backend.subsession_store.persisted_index_size() >= 2);
 
         // 删主 session
-        crate::api::delete_session(&backend, &sid).await.expect("delete");
+        crate::api::delete_session(&backend, &sid)
+            .await
+            .expect("delete");
 
         // 联删：session 整目录 + 索引 + 内存 entry 全清
         assert!(!session_dir.exists(), "session 目录应被联删");

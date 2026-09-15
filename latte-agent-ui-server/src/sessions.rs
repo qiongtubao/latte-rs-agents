@@ -61,6 +61,13 @@ pub(crate) struct SessionPersist {
     /// 最近一次 label（set_label 更新；compaction 重写 meta 时用，
     /// 避免 archiver 绕回 handle 拿锁）。
     last_label: Option<String>,
+    /// 隔离任务的 **agent 工作目录**（worktree 根）。`None` = 与项目 cwd
+    /// 相同（非隔离会话）。
+    ///
+    /// 必须落盘：重启后 `restore_sessions` 只知道项目 cwd，恢复出来的
+    /// 隔离会话会把 agent 指回主仓——用户续跑一个隔离任务就直接改到主仓
+    /// 工作区，隔离白做。
+    agent_cwd: Option<PathBuf>,
     lines: u64,
     bytes: u64,
 }
@@ -89,13 +96,19 @@ impl SessionPersist {
             "label": self.last_label,
             "initial_role": self.initial_role,
             "created_at_unix_ms": self.created_at_unix_ms,
+            "agent_cwd": self.agent_cwd.as_ref().map(|p| p.to_string_lossy().to_string()),
         })
         .to_string()
     }
 
     /// 新建 session：存在 `.latte/tmp/` 目录下，不碰 ui-sessions。
     /// 首个事件到达时由 [`append_event`] 做 promote 到 ui-sessions。
-    fn create(cwd: &Path, session_id: &str, initial_role: &str) -> std::io::Result<Self> {
+    fn create(
+        cwd: &Path,
+        session_id: &str,
+        initial_role: &str,
+        agent_cwd: Option<&Path>,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             path: Self::tmp_path_for(cwd, session_id),
             final_path: Self::path_for(cwd, session_id),
@@ -103,6 +116,7 @@ impl SessionPersist {
             initial_role: initial_role.to_string(),
             created_at_unix_ms: crate::unix_ts_millis(),
             last_label: None,
+            agent_cwd: agent_cwd.map(|p| p.to_path_buf()),
             lines: 0,
             bytes: 0,
         })
@@ -130,9 +144,7 @@ impl SessionPersist {
             Ok(())
         } else {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&self.path)?;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&self.path)?;
             f.write_all(line.as_bytes())?;
             f.write_all(b"\n")?;
             self.lines += 1;
@@ -143,11 +155,7 @@ impl SessionPersist {
 
     /// archiver 每归档一个事件调一次：追加 + 按需 compaction。
     /// 失败只告警不打断聊天（持久化是锦上添花）。
-    fn append_event(
-        &mut self,
-        json_line: &str,
-        event_log: &parking_lot::RwLock<Vec<String>>,
-    ) {
+    fn append_event(&mut self, json_line: &str, event_log: &parking_lot::RwLock<Vec<String>>) {
         if let Err(e) = self.append_raw(json_line) {
             eprintln!("[ui-sessions] append {}: {e}", self.path.display());
             return;
@@ -173,10 +181,7 @@ impl SessionPersist {
     }
 
     /// compaction：重写为 meta + event_log 当前内容（尾部窗口 ≤5000）。
-    fn compact(
-        &mut self,
-        event_log: &parking_lot::RwLock<Vec<String>>,
-    ) -> std::io::Result<()> {
+    fn compact(&mut self, event_log: &parking_lot::RwLock<Vec<String>>) -> std::io::Result<()> {
         let events = event_log.read().clone();
         let mut out = String::with_capacity(self.bytes.min(MAX_FILE_BYTES) as usize);
         out.push_str(&self.meta_line());
@@ -209,6 +214,8 @@ impl SessionPersist {
 /// 从磁盘恢复的 session 内容。
 struct LoadedSession {
     persist: SessionPersist,
+    /// 隔离会话的 agent 工作目录（worktree 根）；`None` = 用项目 cwd。
+    agent_cwd: Option<PathBuf>,
     label: Option<String>,
     event_log: Vec<String>,
     first_user_msg: Option<String>,
@@ -260,6 +267,13 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
         let text = v.get("text")?.as_str()?;
         Some(text.chars().take(80).collect::<String>())
     });
+    // 隔离会话的 agent cwd（worktree 根）。目录已被清理（任务归档过）时
+    // 视作 None——让 agent 退回项目 cwd，而不是在一个不存在的目录里启动。
+    let agent_cwd = meta
+        .get("agent_cwd")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir());
     let lines = (1 + events.len()) as u64; // 近似：meta 覆盖行未计，无碍阈值
     let bytes = raw.len() as u64;
     Some(LoadedSession {
@@ -270,9 +284,11 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
             initial_role,
             created_at_unix_ms,
             last_label: label.clone(),
+            agent_cwd: agent_cwd.clone(),
             lines,
             bytes,
         },
+        agent_cwd,
         label,
         event_log: events,
         first_user_msg,
@@ -343,8 +359,7 @@ fn last_resumable_workflow_from_log(
             "Status" => {
                 if let Some(msg) = v.get("message").and_then(|s| s.as_str()) {
                     if let Some(rest) = msg.split("从断点续跑（checkpoint ").nth(1) {
-                        let old: String =
-                            rest.chars().take_while(|c| *c != '）').collect();
+                        let old: String = rest.chars().take_while(|c| *c != '）').collect();
                         if !old.is_empty() {
                             superseded.insert(old);
                         }
@@ -378,7 +393,6 @@ fn last_resumable_workflow_from_log(
             failed_at_unix_ms: 0,
         })
 }
-
 
 /// Streaming deltas are transport-only. The final complete RoleTurn carries
 /// the full text, so persisting each partial would let one long answer evict
@@ -611,8 +625,7 @@ impl SessionHandle {
             advisor_monitor: advisor_monitor_cfg.clone(),
             stream_mode: self.stream_mode.clone(),
             // 单 session delegate 累计上限（env 覆盖，默认 12）。
-            max_delegates_per_session:
-                latte_agent_core::controller::default_max_delegates(),
+            max_delegates_per_session: latte_agent_core::controller::default_max_delegates(),
         };
         let controller = Arc::new(ChatController::new(256));
         // `spawn` returns a broadcast::Receiver (events consumer); the
@@ -660,10 +673,7 @@ impl SessionHandle {
                 self.spawn.resolver.clone(),
                 default_params,
             )
-            .with_watchdog_notes(
-                self.spawn.cwd.clone(),
-                advisor_monitor_cfg.watchdog_notes,
-            )
+            .with_watchdog_notes(self.spawn.cwd.clone(), advisor_monitor_cfg.watchdog_notes)
             .with_review_settings(advisor_monitor_cfg.review_settings);
             // 给 advisor 也分配一个 subsession sink：每次 review 的
             // LLM 调用 / 返回会落盘到
@@ -672,7 +682,10 @@ impl SessionHandle {
             let engine = if self.session_id.is_empty() {
                 engine
             } else {
-                let (_sub_id, sink) = self.spawn.subsession_store.create(&self.session_id, "advisor");
+                let (_sub_id, sink) = self
+                    .spawn
+                    .subsession_store
+                    .create(&self.session_id, "advisor");
                 engine.with_subsession_sink(sink)
             };
             AdvisorMonitor::spawn(
@@ -751,6 +764,17 @@ impl SessionHandle {
         }
         Ok(controller)
     }
+
+    /// agent 的工具工作目录：隔离会话 = 它的 worktree 根，普通会话 = 项目 cwd。
+    pub(crate) fn agent_cwd(&self) -> PathBuf {
+        self.spawn.cwd.clone()
+    }
+
+    /// agent 的工具工作目录（测试用别名）。
+    #[cfg(test)]
+    pub(crate) fn agent_cwd_for_test(&self) -> PathBuf {
+        self.agent_cwd()
+    }
 }
 
 /// Process-wide map of active session IDs to their per-tab handle.
@@ -761,18 +785,27 @@ pub(crate) type SessionMap = parking_lot::RwLock<HashMap<String, Arc<SessionHand
 /// `spawn`ed and owns its own broadcast channel. The caller inserts
 /// the handle into `SessionMap`; failure to spawn the controller is
 /// propagated to the HTTP caller via a 500.
+/// `cwd` = **项目根**（状态根：会话日志落 `<cwd>/.latte/ui-sessions/`）。
+/// `agent_cwd` = agent 的**工具工作目录**；隔离任务传它自己的 worktree 根，
+/// 普通会话传 `None`（= 与 `cwd` 相同）。
+///
+/// 两者刻意分开：会话日志必须始终落在主仓（worktree 会被 cleanup 删掉），
+/// 而工具读写必须落在 worktree（这才是隔离）。worktree 里的 `.latte` 是指向
+/// 主仓的软链，所以按 agent cwd 定位的其它状态（workflow 断点、项目配置）
+/// 依然落在主仓，见 `task_worktree::TaskWorktree::link_state_dir`。
 pub(crate) async fn create_session_handle(
     session_id: String,
     initial_role: &str,
     merged: &Arc<parking_lot::RwLock<AgentConfig>>,
     resolver: &Arc<ModelResolver>,
     cwd: &std::path::Path,
+    agent_cwd: Option<&std::path::Path>,
     primary_model_id: Option<String>,
     initial_tier: Option<ModelTier>,
     subsession_store: &Arc<latte_agent_core::subsession::SubsessionStore>,
 ) -> Result<SessionHandle, String> {
     // 落盘：创建失败只告警（聊天照常，只是不持久化）。
-    let persist = match SessionPersist::create(cwd, &session_id, initial_role) {
+    let persist = match SessionPersist::create(cwd, &session_id, initial_role, agent_cwd) {
         Ok(p) => Some(Arc::new(parking_lot::Mutex::new(p))),
         Err(e) => {
             eprintln!(
@@ -790,7 +823,7 @@ pub(crate) async fn create_session_handle(
         spawn: SessionSpawnParams {
             merged: merged.clone(),
             resolver: resolver.clone(),
-            cwd: cwd.to_path_buf(),
+            cwd: agent_cwd.unwrap_or(cwd).to_path_buf(),
             primary_model_id,
             initial_tier,
             subsession_store: subsession_store.clone(),
@@ -818,19 +851,25 @@ pub(crate) async fn create_session_handle(
 /// prefix is written to disk up front so the fork survives a restart;
 /// the eagerly-spawned controller's archiver then appends any new turns.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_forked_handle(
     session_id: String,
     initial_role: &str,
     merged: &Arc<parking_lot::RwLock<AgentConfig>>,
     resolver: &Arc<ModelResolver>,
     cwd: &std::path::Path,
+    // 源会话的 agent 工作目录：从**隔离任务的会话** fork 出来时必须继承，
+    // 否则分叉出的会话跑在主仓，而它继承来的对话历史说的是"我改了 src/x.c"
+    // ——那些改动其实在 worktree 里，分叉会话根本看不到，一上手就基于错误
+    // 的文件状态继续干。`None` = 与 `cwd` 相同（普通会话的 fork）。
+    agent_cwd: Option<&std::path::Path>,
     subsession_store: &Arc<latte_agent_core::subsession::SubsessionStore>,
     event_lines: Vec<String>,
     initial_history: Vec<latte_ai::models::Message>,
     first_user_msg: Option<String>,
     label: Option<String>,
 ) -> Result<SessionHandle, String> {
-    let persist = match SessionPersist::create(cwd, &session_id, initial_role) {
+    let persist = match SessionPersist::create(cwd, &session_id, initial_role, agent_cwd) {
         Ok(mut p) => {
             // Seed the label into the meta line, then write the cloned
             // prefix so the fork is durable before any new turn.
@@ -859,7 +898,7 @@ pub(crate) async fn create_forked_handle(
         spawn: SessionSpawnParams {
             merged: merged.clone(),
             resolver: resolver.clone(),
-            cwd: cwd.to_path_buf(),
+            cwd: agent_cwd.unwrap_or(cwd).to_path_buf(),
             primary_model_id: None,
             initial_tier: None,
             subsession_store: subsession_store.clone(),
@@ -901,8 +940,7 @@ pub(crate) fn restore_sessions(cwd: &Path, spawn: &SessionSpawnParams) -> Vec<Se
         };
         // created_at / last_activity 的 Instant 用墙钟年龄近似（system
         // clock 回拨时 saturate 到 now）。
-        let age_ms =
-            crate::unix_ts_millis().saturating_sub(loaded.persist.created_at_unix_ms);
+        let age_ms = crate::unix_ts_millis().saturating_sub(loaded.persist.created_at_unix_ms);
         let created_at = Instant::now()
             .checked_sub(Duration::from_millis(age_ms))
             .unwrap_or_else(Instant::now);
@@ -913,6 +951,12 @@ pub(crate) fn restore_sessions(cwd: &Path, spawn: &SessionSpawnParams) -> Vec<Se
         // 在 UI 可见，下一次模型调用却像一段全新对话。
         let restored_spawn = SessionSpawnParams {
             initial_history: initial_history_from_event_log(&loaded.event_log),
+            // 隔离会话恢复回它自己的 worktree（目录还在才用，见
+            // `load_session_file`），否则续跑会改到主仓工作区。
+            cwd: loaded
+                .agent_cwd
+                .clone()
+                .unwrap_or_else(|| spawn.cwd.clone()),
             ..spawn.clone()
         };
         out.push(SessionHandle {
@@ -1032,7 +1076,9 @@ mod tests {
         drop(archive);
 
         assert_eq!(log.len(), 2, "partial transport events must not be durable");
-        assert!(log.iter().all(|line| !line.contains(r#""is_complete":false"#)));
+        assert!(log
+            .iter()
+            .all(|line| !line.contains(r#""is_complete":false"#)));
         let history = initial_history_from_event_log(&log);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].as_text(), "long streamed question");
@@ -1044,8 +1090,8 @@ mod tests {
     #[test]
     fn restore_sessions_rebuilds_initial_history_from_event_log() {
         let dir = tempfile::tempdir().unwrap();
-        let mut persist = SessionPersist::create(dir.path(), "restored-history", "manager")
-            .unwrap();
+        let mut persist =
+            SessionPersist::create(dir.path(), "restored-history", "manager", None).unwrap();
         persist
             .append_raw(r#"{"type":"UserMessage","text":"before restart"}"#)
             .unwrap();
@@ -1060,16 +1106,18 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             primary_model_id: None,
             initial_tier: None,
-            subsession_store: Arc::new(
-                latte_agent_core::subsession::SubsessionStore::new(),
-            ),
+            subsession_store: Arc::new(latte_agent_core::subsession::SubsessionStore::new()),
             initial_history: Vec::new(),
         };
 
         let restored = restore_sessions(dir.path(), &spawn);
         assert_eq!(restored.len(), 1);
         let history = &restored[0].spawn.initial_history;
-        assert_eq!(history.len(), 2, "restart must seed user + assistant history");
+        assert_eq!(
+            history.len(),
+            2,
+            "restart must seed user + assistant history"
+        );
         assert_eq!(history[0].as_text(), "before restart");
         assert_eq!(history[1].as_text(), "remembered answer");
     }
@@ -1123,9 +1171,7 @@ mod tests {
     /// wf_id 写进 state（否则 resume API 会拿空串去拼 checkpoint 路径）。
     #[test]
     fn last_resumable_workflow_from_log_skips_missing_wf_id() {
-        let log = make_log(&[
-            r#"{"type":"WorkflowFinished","status":"failed"}"#,
-        ]);
+        let log = make_log(&[r#"{"type":"WorkflowFinished","status":"failed"}"#]);
         assert!(last_resumable_workflow_from_log(&log).is_none());
     }
 
@@ -1157,7 +1203,10 @@ mod tests {
             r#"{"type":"Paused","reason":"模型不可用"}"#,
         ]);
         let got = last_resumable_workflow_from_log(&log).unwrap();
-        assert_eq!(got.wf_id, "wf-parent", "最外层未完成 run 优先于嵌套未完成 run");
+        assert_eq!(
+            got.wf_id, "wf-parent",
+            "最外层未完成 run 优先于嵌套未完成 run"
+        );
         assert_eq!(got.name, "design_and_plan");
     }
 

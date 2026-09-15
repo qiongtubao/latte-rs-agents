@@ -16,7 +16,9 @@ use std::time::Instant;
 
 use latte_agent_core::config::{AgentConfig, ConfigLayer, ModelDef};
 use latte_agent_core::controller::{ChatEvent, RoleInfo};
-use latte_agent_core::workflow::{load_checkpoint, load_workflow, run_workflow, run_workflow_resume, WorkflowRunContext};
+use latte_agent_core::workflow::{
+    load_checkpoint, load_workflow, run_workflow, run_workflow_resume, WorkflowRunContext,
+};
 use latte_ai::params::GenerateParams;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -40,13 +42,22 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: 400, message: message.into() }
+        Self {
+            status: 400,
+            message: message.into(),
+        }
     }
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self { status: 404, message: message.into() }
+        Self {
+            status: 404,
+            message: message.into(),
+        }
     }
     pub fn internal(message: impl Into<String>) -> Self {
-        Self { status: 500, message: message.into() }
+        Self {
+            status: 500,
+            message: message.into(),
+        }
     }
 }
 
@@ -117,7 +128,10 @@ pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
             created_at_unix_ms: millis_from_now(now, h.created_at),
             last_activity_unix_ms: millis_from_now(now, *h.last_activity.lock()),
             restored: h.restored,
-            is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
+            is_paused: h
+                .try_controller()
+                .map(|c| c.is_session_paused())
+                .unwrap_or(false),
         })
         .collect();
     // last_activity_unix_ms 存的是"距上次活动的毫秒数"（age），越小越
@@ -129,6 +143,16 @@ pub fn list_sessions(b: &UiBackend) -> Vec<SessionSummary> {
 /// 分配一个新 session（含专属 ChatController）。调用方（HTTP 壳 /
 /// Tauri 适配器）拿到返回后通常还要接事件转发（[`subscribe_session`]）。
 pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
+    create_session_in(b, None).await
+}
+
+/// [`create_session`] 的隔离版：`agent_cwd` 指定 agent 的工具工作目录
+/// （任务隔离 worktree 的根）。会话日志仍落在项目 cwd 下——worktree 会被
+/// cleanup 删掉，日志不能跟着走。
+pub async fn create_session_in(
+    b: &UiBackend,
+    agent_cwd: Option<&std::path::Path>,
+) -> Result<SessionInfo, ApiError> {
     // 批量派发等场景同一毫秒可能建多个 session：加进程内序号兜底唯一性。
     static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let session_id = format!(
@@ -143,6 +167,7 @@ pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
         &b.merged,
         &b.resolver,
         &b.cwd,
+        agent_cwd,
         None,
         None,
         &b.subsession_store,
@@ -210,15 +235,27 @@ pub async fn fork_session(
         .clone()
         .or_else(|| src.first_user_msg.lock().clone())
         .unwrap_or_else(|| initial_role.clone());
-    let label = Some(format!("🍴 {}", src_base.chars().take(40).collect::<String>()));
+    let label = Some(format!(
+        "🍴 {}",
+        src_base.chars().take(40).collect::<String>()
+    ));
 
     let new_id = format!("ui-{}-{}", std::process::id(), crate::unix_ts_millis());
+    // 隔离会话的 fork 继承它的工作树：分叉出来的会话必须看到与继承的对话
+    // 历史一致的文件状态。工作树已被回收（任务归档过）时退回项目 cwd。
+    let src_agent_cwd = src.agent_cwd();
+    let inherited_cwd = if src_agent_cwd != b.cwd && src_agent_cwd.is_dir() {
+        Some(src_agent_cwd.as_path())
+    } else {
+        None
+    };
     let handle = create_forked_handle(
         new_id.clone(),
         &initial_role,
         &b.merged,
         &b.resolver,
         &b.cwd,
+        inherited_cwd,
         &b.subsession_store,
         event_lines,
         initial_history,
@@ -245,7 +282,10 @@ pub async fn fork_session(
             is_paused: false,
         }],
         available_roles: build_role_info(&b.merged.read()),
-        is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
+        is_paused: h
+            .try_controller()
+            .map(|c| c.is_session_paused())
+            .unwrap_or(false),
     };
     b.sessions.write().insert(h.session_id.clone(), h);
     Ok(resp)
@@ -298,10 +338,16 @@ pub fn get_session(b: &UiBackend, id: &str) -> Result<SessionInfo, ApiError> {
                 millis_from_now(Instant::now(), *g)
             },
             restored: h.restored,
-            is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
+            is_paused: h
+                .try_controller()
+                .map(|c| c.is_session_paused())
+                .unwrap_or(false),
         }],
         available_roles: build_role_info(&b.merged.read()),
-        is_paused: h.try_controller().map(|c| c.is_session_paused()).unwrap_or(false),
+        is_paused: h
+            .try_controller()
+            .map(|c| c.is_session_paused())
+            .unwrap_or(false),
     })
 }
 
@@ -435,10 +481,7 @@ pub async fn subscribe_session(
 ///
 /// 走 SSE 流的私有前缀而不是 `event_sender().send()` 重播：重播会被
 /// archiver 再归档一次，history 里出现重复弹框。
-pub async fn pending_choice_events(
-    b: &UiBackend,
-    id: &str,
-) -> Result<Vec<ChatEvent>, ApiError> {
+pub async fn pending_choice_events(b: &UiBackend, id: &str) -> Result<Vec<ChatEvent>, ApiError> {
     let h = resolve_session(b, Some(id))?;
     // 已 spawn 才可能有挂起弹框；未激活的恢复 session 直接空。
     let Some(controller) = h.try_controller() else {
@@ -841,9 +884,8 @@ fn resolve_prompt_path(
     project_role: bool,
 ) -> PathBuf {
     let direct = cwd.join(prompt_file);
-    let skip_global = prompt_file.starts_with('/')
-        || prompt_file.starts_with('~')
-        || prompt_file.contains("..");
+    let skip_global =
+        prompt_file.starts_with('/') || prompt_file.starts_with('~') || prompt_file.contains("..");
     if skip_global {
         return direct;
     }
@@ -875,8 +917,7 @@ fn read_role_prompt(
     tpl: &latte_agent_core::role::RoleTemplate,
 ) -> String {
     if let Some(file) = &tpl.prompt_file {
-        let skip_global =
-            file.starts_with('/') || file.starts_with('~') || file.contains("..");
+        let skip_global = file.starts_with('/') || file.starts_with('~') || file.contains("..");
         if let Ok(content) = std::fs::read_to_string(cwd.join(file)) {
             return content;
         }
@@ -897,10 +938,7 @@ fn read_role_prompt(
         .unwrap_or_default()
 }
 
-fn role_config_entry(
-    b: &UiBackend,
-    tpl: &latte_agent_core::role::RoleTemplate,
-) -> RoleConfigEntry {
+fn role_config_entry(b: &UiBackend, tpl: &latte_agent_core::role::RoleTemplate) -> RoleConfigEntry {
     let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
     let (toml_path, project_role) =
         resolve_role_toml_path(&project_dir, &global_agents_dir(), &tpl.id);
@@ -984,7 +1022,11 @@ fn reload_roles_from_disk_with(b: &UiBackend, global_dir: &Path) {
     let mut roles: std::collections::HashMap<String, RoleTemplate> = Default::default();
     // 项目层：agents_config 原值（相对 b.cwd 解析），文件或目录模式均可。
     let raw = PathBuf::from(&b.agents_config);
-    let abs = if raw.is_absolute() { raw } else { b.cwd.join(raw) };
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        b.cwd.join(raw)
+    };
     if std::fs::metadata(&abs).is_ok() {
         if let Some(p) = abs.to_str() {
             if let Ok(part) = AgentConfig::load(p) {
@@ -1049,7 +1091,9 @@ pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiE
         tiers: vec!["premium".into(), "standard".into(), "budget".into()],
         workspace_path: b.cwd.display().to_string(),
         agents_config_path: agents_dir.display().to_string(),
-        sessions_path: crate::sessions::SessionPersist::dir_for(&b.cwd).display().to_string(),
+        sessions_path: crate::sessions::SessionPersist::dir_for(&b.cwd)
+            .display()
+            .to_string(),
     })
 }
 
@@ -1065,8 +1109,8 @@ pub async fn get_roles_config(b: &UiBackend) -> Result<RolesConfigResponse, ApiE
 fn enumerate_available_models(b: &UiBackend) -> Vec<AvailableModel> {
     let cfg = b.merged.read();
     let project_dir = b.cwd.join(".latte/models.d");
-    let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
-        .unwrap_or_default();
+    let on_disk =
+        crate::models::ModelsState::load(&project_dir, &global_dir_fallback()).unwrap_or_default();
     let mut out: Vec<AvailableModel> = Vec::new();
     let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, recs) in &on_disk.entries {
@@ -1132,9 +1176,16 @@ pub struct SaveRoleConfigRequest {
 }
 fn agents_config_dir(cwd: &std::path::Path, agents_config: &str) -> PathBuf {
     let raw = PathBuf::from(agents_config);
-    let p = if raw.is_absolute() { raw } else { cwd.join(raw) };
+    let p = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
     if p.is_file() {
-        return p.parent().map(Path::to_path_buf).unwrap_or_else(|| cwd.join(".latte/agents.d"));
+        return p
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| cwd.join(".latte/agents.d"));
     }
     if agents_config.trim().is_empty() {
         return cwd.join(".latte/agents.d");
@@ -1157,7 +1208,9 @@ fn write_role_toml(
     use toml_edit::{value, DocumentMut, Item, Table};
     let content = std::fs::read_to_string(path).ok();
     let mut doc: DocumentMut = match &content {
-        Some(c) => c.parse().map_err(|e| format!("parse {}: {e}", path.display()))?,
+        Some(c) => c
+            .parse()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?,
         None => DocumentMut::new(),
     };
     let role_exists = doc
@@ -1224,8 +1277,7 @@ fn write_role_toml(
         doc["roles"] = Item::Table(roles);
     }
     let output = doc.to_string();
-    std::fs::write(path, &output)
-        .map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(path, &output).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// 保存角色配置：重写角色 TOML → 写 prompt 文件 → 更新内存配置
@@ -1247,8 +1299,7 @@ pub fn save_role_config(
 
     // 1. 确定写入路径并重写 TOML（项目已有该角色 → 项目，否则 → 全局）
     let project_dir = agents_config_dir(&b.cwd, &b.agents_config);
-    let (path, project_role) =
-        resolve_role_toml_path(&project_dir, &global_agents_dir(), &req.id);
+    let (path, project_role) = resolve_role_toml_path(&project_dir, &global_agents_dir(), &req.id);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| ApiError::internal(format!("create {}: {e}", dir.display())))?;
@@ -1289,9 +1340,7 @@ pub fn save_role_config(
                 }
                 role_config_entry(b, t)
             }
-            None => {
-                return Err(ApiError::not_found(format!("role {:?} not found", req.id)))
-            }
+            None => return Err(ApiError::not_found(format!("role {:?} not found", req.id))),
         }
     };
     // 角色模型指派（model_chain/model_tier）热生效：已加载 session
@@ -1302,12 +1351,19 @@ pub fn save_role_config(
 
 /// `POST /api/roles` — 创建新角色：生成默认 RoleTemplate，写入
 /// `<agents.d>/<role_id>.toml`，并加入内存配置。
-pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<RoleConfigEntry, ApiError> {
+pub fn create_role(
+    b: &UiBackend,
+    role_id: &str,
+    role_name: &str,
+) -> Result<RoleConfigEntry, ApiError> {
     // 检查是否已存在
     {
         let cfg = b.merged.read();
         if cfg.roles.contains_key(role_id) {
-            return Err(ApiError::bad_request(format!("role {:?} already exists", role_id)));
+            return Err(ApiError::bad_request(format!(
+                "role {:?} already exists",
+                role_id
+            )));
         }
     }
     let tpl = latte_agent_core::role::RoleTemplate {
@@ -1321,7 +1377,7 @@ pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<Role
         tools: vec![],
         icon: String::new(),
         skills: vec![],
-            code_paths: vec![],
+        code_paths: vec![],
         description: String::new(),
     };
     let agents_dir = agents_config_dir(&b.cwd, &b.agents_config);
@@ -1330,7 +1386,7 @@ pub fn create_role(b: &UiBackend, role_id: &str, role_name: &str) -> Result<Role
     let path = agents_dir.join(format!("{}.toml", role_id));
     // 序列化为 toml：`[roles.<role_id>]` 节。
     {
-        use toml_edit::{value, DocumentMut, Table, Item};
+        use toml_edit::{value, DocumentMut, Item, Table};
         let mut doc = DocumentMut::new();
         let mut roles = Table::new();
         let mut t = Table::new();
@@ -1466,10 +1522,7 @@ pub async fn chat_set_plan_mode(
 /// 与 `DELETE /api/sessions` 不同：后者是整个 session abort + 落盘
 /// 删除（`chat_controller_abort` 语义），这里是 per-turn cancel。
 /// 名字上的区分很重要 —— cancel 暗示"这个 turn 不要了，但 session
-pub async fn chat_cancel_turn(
-    b: &UiBackend,
-    session_id: Option<&str>,
-) -> Result<(), ApiError> {
+pub async fn chat_cancel_turn(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
     if let Some(controller) = h.try_controller() {
@@ -1510,10 +1563,7 @@ pub async fn chat_cancel_subagent(
 /// `POST /api/chat/abort` — 终止整个 session（所有 in-flight
 /// subagent / workflow / multi-role 全部停止）。不删 session，
 /// 归档事件保留。
-pub async fn chat_abort(
-    b: &UiBackend,
-    session_id: Option<&str>,
-) -> Result<(), ApiError> {
+pub async fn chat_abort(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
     let controller = h
@@ -1532,10 +1582,7 @@ pub async fn chat_abort(
 /// `POST /api/chat/pause` — 暂停当前 session。会话保留，正在等待
 /// 的下一个 turn 会被挂起，直到收到 resume。若 controller 尚未
 /// spawn（磁盘恢复但未激活），无操作。
-pub async fn chat_pause(
-    b: &UiBackend,
-    session_id: Option<&str>,
-) -> Result<(), ApiError> {
+pub async fn chat_pause(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
     if let Some(controller) = h.try_controller() {
@@ -1546,10 +1593,7 @@ pub async fn chat_pause(
 
 /// `POST /api/chat/resume` — 恢复被 `chat_pause` 暂停的 session。
 /// 若 controller 尚未 spawn，无操作。
-pub async fn chat_resume(
-    b: &UiBackend,
-    session_id: Option<&str>,
-) -> Result<(), ApiError> {
+pub async fn chat_resume(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
     if let Some(controller) = h.try_controller() {
@@ -1559,10 +1603,7 @@ pub async fn chat_resume(
 }
 
 /// `POST /api/chat/pause-session` — 用户按 ⏸ 触发全 session 冻结。
-pub async fn chat_pause_session(
-    b: &UiBackend,
-    session_id: Option<&str>,
-) -> Result<(), ApiError> {
+pub async fn chat_pause_session(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
     if let Some(controller) = h.try_controller() {
@@ -1579,16 +1620,11 @@ pub async fn chat_pause_session(
 /// 中断的 workflow」，并补发一条 `Resumed` 同步 UI 暂停态（replay
 /// 会把历史 Paused 恢复成 isPaused=true，而本进程 gate 未 engage，
 /// 不会有 listener 发 Resumed）。
-fn is_live_session_resume(
-    outcome: latte_agent_core::controller::SessionResumeOutcome,
-) -> bool {
+fn is_live_session_resume(outcome: latte_agent_core::controller::SessionResumeOutcome) -> bool {
     outcome.is_live()
 }
 
-pub async fn chat_resume_session(
-    b: &UiBackend,
-    session_id: Option<&str>,
-) -> Result<(), ApiError> {
+pub async fn chat_resume_session(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
     let resumed_live = match h.try_controller() {
@@ -1627,7 +1663,8 @@ pub async fn set_stream_mode(
 ) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
-    h.stream_mode.store(stream, std::sync::atomic::Ordering::SeqCst);
+    h.stream_mode
+        .store(stream, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
 
@@ -1720,7 +1757,9 @@ pub fn list_traces() -> Vec<TraceSummary> {
 /// `GET /api/traces/:session_id` — 读单个 trace 文件为
 /// `{ "session_id", "events": [...] }`。
 pub fn read_trace(session_id: &str) -> Result<serde_json::Value, ApiError> {
-    let path = latte_home().join("traces").join(format!("{}.jsonl", session_id));
+    let path = latte_home()
+        .join("traces")
+        .join(format!("{}.jsonl", session_id));
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| ApiError::not_found(format!("trace not found: {e}")))?;
     let mut events = Vec::new();
@@ -1758,14 +1797,20 @@ fn latte_home() -> PathBuf {
 /// 读路径：先内存（活读，1h 内）→ 内存 miss 再回查磁盘
 ///（`subsession_store.read_persisted`）。
 pub fn get_subsession(b: &UiBackend, id: &str, limit: usize) -> Vec<serde_json::Value> {
-    let result = b.subsession_store.snapshot_any(id).map(|evs| (evs, false)).or_else(|| {
-        if limit > 0 {
-            b.subsession_store
-                .read_persisted_last_n(id, limit, 5 * 1024 * 1024)
-        } else {
-            b.subsession_store.read_persisted(id).map(|evs| (evs, false))
-        }
-    });
+    let result = b
+        .subsession_store
+        .snapshot_any(id)
+        .map(|evs| (evs, false))
+        .or_else(|| {
+            if limit > 0 {
+                b.subsession_store
+                    .read_persisted_last_n(id, limit, 5 * 1024 * 1024)
+            } else {
+                b.subsession_store
+                    .read_persisted(id)
+                    .map(|evs| (evs, false))
+            }
+        });
     match result {
         Some((events, truncated)) => {
             let mut v: Vec<serde_json::Value> = events
@@ -2006,7 +2051,8 @@ pub fn workflow_run_start(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
-    b.workflow_run.start(tx.clone(), cancel.clone(), run_id.clone());
+    b.workflow_run
+        .start(tx.clone(), cancel.clone(), run_id.clone());
 
     // 与 sessions.rs 的 ControllerConfig 一致：default_params 用
     // GenerateParams::default()（session spawn 路径同款，也是
@@ -2282,7 +2328,11 @@ mod tests {
     fn write_role_file(dir: &std::path::Path, id: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(format!("{id}.toml"));
-        std::fs::write(&path, format!("[roles.{id}]\nid = \"{id}\"\nname = \"N\"\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("[roles.{id}]\nid = \"{id}\"\nname = \"N\"\n"),
+        )
+        .unwrap();
         path
     }
 
@@ -2353,7 +2403,11 @@ mod tests {
         let cwd = tmp.path().join("ws");
         let global_root = tmp.path().join("global");
         std::fs::create_dir_all(global_root.join("prompts.d")).unwrap();
-        std::fs::write(global_root.join("prompts.d/custom_role.md"), "global prompt").unwrap();
+        std::fs::write(
+            global_root.join("prompts.d/custom_role.md"),
+            "global prompt",
+        )
+        .unwrap();
         let tpl = latte_agent_core::role::RoleTemplate {
             id: "custom_role".into(),
             name: "Custom".into(),
@@ -2398,12 +2452,12 @@ mod tests {
                 tools: vec![],
                 icon: String::new(),
                 skills: vec![],
-            code_paths: vec![],
+                code_paths: vec![],
                 description: String::new(),
             },
         );
-        let resolver = latte_agent_core::model_resolver::ModelResolver::from_config(&cfg)
-            .expect("resolver");
+        let resolver =
+            latte_agent_core::model_resolver::ModelResolver::from_config(&cfg).expect("resolver");
         UiBackend::new(crate::UiBackendConfig {
             agent_config: cfg,
             model_resolver: resolver,
@@ -2497,11 +2551,7 @@ mod tests {
             let agents = cwd.join(".latte/agents.d");
             std::fs::create_dir_all(&agents).unwrap();
             // project 层显式声明 enabled = true。
-            std::fs::write(
-                agents.join("advisor.toml"),
-                "[advisor]\nenabled = true\n",
-            )
-            .unwrap();
+            std::fs::write(agents.join("advisor.toml"), "[advisor]\nenabled = true\n").unwrap();
             let b = test_backend(&cwd);
 
             // PUT false 写全局层成功，但生效值仍以 project 为准。
@@ -2567,8 +2617,8 @@ mod tests {
                     max_tokens: 1,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -2587,8 +2637,8 @@ mod tests {
                     max_tokens: 1,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -2607,8 +2657,8 @@ mod tests {
                     max_tokens: 1,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -2665,8 +2715,8 @@ max_tokens = 1
                 max_tokens: 1,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -2702,7 +2752,11 @@ pub struct LogEntry {
 
 /// `GET /api/logs` — 列出 `<cwd>/.latte/ui-sessions/` 下的日志文件。
 /// 支持 `?file=<name>&tail=30` 参数读取指定文件尾部。
-pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Result<Vec<LogEntry>, ApiError> {
+pub fn list_logs(
+    b: &UiBackend,
+    file: Option<&str>,
+    tail: Option<usize>,
+) -> Result<Vec<LogEntry>, ApiError> {
     let sessions_dir = b.cwd.join(".latte").join("ui-sessions");
     if !sessions_dir.exists() {
         return Ok(vec![]);
@@ -2721,7 +2775,11 @@ pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Resu
         if path.extension().map_or(true, |ext| ext != "jsonl") {
             continue;
         }
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let file_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(_) => continue,
@@ -2747,7 +2805,8 @@ pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Resu
                     format!("{line_num}: {l}")
                 })
                 .collect();
-            let modified = meta.modified()
+            let modified = meta
+                .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
@@ -2761,7 +2820,8 @@ pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Resu
         }
 
         // 否则只列出文件元信息（不读内容）
-        let modified = meta.modified()
+        let modified = meta
+            .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
@@ -2776,7 +2836,6 @@ pub fn list_logs(b: &UiBackend, file: Option<&str>, tail: Option<usize>) -> Resu
 
     Ok(entries)
 }
-
 
 // ─── Tools（工具管理） ─────────────────────────────────────────────
 
@@ -2802,7 +2861,8 @@ pub async fn list_tools(b: &UiBackend) -> Result<ToolsListResponse, ApiError> {
     }
     // 「这个工具写过文档没有」要按当前工作目录实时算，不能进枚举缓存。
     crate::tools::annotate_doc_state(&b.cwd, &mut tools);
-    let disabled: Vec<String> = tools.iter()
+    let disabled: Vec<String> = tools
+        .iter()
         .filter(|t| !t.enabled)
         .map(|t| t.id.clone())
         .collect();
@@ -2944,7 +3004,9 @@ async fn lookup_tool_meta(id: &str) -> Option<(String, String)> {
 fn dynamic_tool_description(b: &UiBackend, id: &str) -> Option<String> {
     match id {
         "workflow" => Some(latte_agent_core::controller::workflow_tool_hint(&b.cwd)),
-        "delegate" => Some(latte_agent_core::controller::delegate_tool_hint(&b.merged.read())),
+        "delegate" => Some(latte_agent_core::controller::delegate_tool_hint(
+            &b.merged.read(),
+        )),
         _ => None,
     }
 }
@@ -2986,7 +3048,11 @@ pub async fn get_tool_doc(b: &UiBackend, id: &str) -> Result<ToolDocResponse, Ap
 
     // 简介优先级：md 里人工写的 SUMMARY → 注册描述的首行/首句。
     let (desc_brief, builtin_detail) = docs::split_brief_and_detail(&description);
-    let brief = if summary.is_empty() { desc_brief } else { summary.clone() };
+    let brief = if summary.is_empty() {
+        desc_brief
+    } else {
+        summary.clone()
+    };
 
     // 模板按「当前进程能看到的全部工具」渲染，给编辑者一个预览。真正下发给
     // 模型时用的是各会话自己的工具集（见 core 的 enrich_registered_tools），
@@ -2998,7 +3064,8 @@ pub async fn get_tool_doc(b: &UiBackend, id: &str) -> Result<ToolDocResponse, Ap
         .map(|t| t.id)
         .collect();
     let mut ctx = docs::TemplateContext::from_tool_names(&b.cwd, &names);
-    ctx.set_var("tool", id).set_var("doc_path", doc.path.display().to_string());
+    ctx.set_var("tool", id)
+        .set_var("doc_path", doc.path.display().to_string());
 
     let active_layer = match doc.source {
         docs::DocSource::Global => Some("global"),
@@ -3106,8 +3173,8 @@ mod tool_doc_tests {
     /// 构造一个 cwd 指向临时目录的 backend（工具文档全按 cwd 解析）。
     fn doc_backend(cwd: &Path) -> UiBackend {
         let cfg = AgentConfig::default();
-        let resolver = latte_agent_core::model_resolver::ModelResolver::from_config(&cfg)
-            .expect("resolver");
+        let resolver =
+            latte_agent_core::model_resolver::ModelResolver::from_config(&cfg).expect("resolver");
         UiBackend::new(crate::UiBackendConfig {
             agent_config: cfg,
             model_resolver: resolver,
@@ -3135,7 +3202,10 @@ mod tool_doc_tests {
     #[test]
     fn write_target_matches_runtime_lookup_path() {
         assert_eq!(tool_doc_rel_path("read"), ".latte/tools.d/read.md");
-        assert_eq!(tool_doc_rel_path("doc_index"), ".latte/tools.d/doc_index.md");
+        assert_eq!(
+            tool_doc_rel_path("doc_index"),
+            ".latte/tools.d/doc_index.md"
+        );
     }
 
     /// PUT → GET 往返：简介/详情分别落到 SUMMARY/DETAILS 标记里，再读回来
@@ -3145,10 +3215,20 @@ mod tool_doc_tests {
         let tmp = tempfile::tempdir().unwrap();
         let backend = doc_backend(tmp.path());
 
-        let saved = put_tool_doc(&backend, "read", "一句话简介。", "详情正文\n- 第二行", "project")
-            .await
-            .expect("put");
-        assert!(saved.path.ends_with(".latte/tools.d/read.md"), "{}", saved.path);
+        let saved = put_tool_doc(
+            &backend,
+            "read",
+            "一句话简介。",
+            "详情正文\n- 第二行",
+            "project",
+        )
+        .await
+        .expect("put");
+        assert!(
+            saved.path.ends_with(".latte/tools.d/read.md"),
+            "{}",
+            saved.path
+        );
 
         let doc = get_tool_doc(&backend, "read").await.expect("get");
         assert_eq!(doc.summary, "一句话简介。");
@@ -3157,11 +3237,17 @@ mod tool_doc_tests {
         assert_eq!(doc.source, "project");
         assert_eq!(doc.matched_id, "read");
         assert!(!doc.is_template);
-        assert_eq!(doc.rendered_content, doc.content, "非模板时渲染结果 == 原文");
+        assert_eq!(
+            doc.rendered_content, doc.content,
+            "非模板时渲染结果 == 原文"
+        );
 
         // 磁盘上确实是带标记的 md（运行时按标记剥离）
         let raw = std::fs::read_to_string(tmp.path().join(".latte/tools.d/read.md")).unwrap();
-        assert!(raw.contains("<!-- SUMMARY -->") && raw.contains("<!-- DETAILS -->"), "{raw}");
+        assert!(
+            raw.contains("<!-- SUMMARY -->") && raw.contains("<!-- DETAILS -->"),
+            "{raw}"
+        );
     }
 
     /// 没有 md 时：简介回退到注册描述首句，详情走 `builtin_detail`，
@@ -3187,7 +3273,10 @@ mod tool_doc_tests {
         assert_eq!(doc.source, "none");
         assert_eq!(doc.brief, "一句话用途。");
         assert_eq!(doc.builtin_detail, "剩下的都是细则，很长很长。");
-        assert!(doc.summary.is_empty() && doc.content.is_empty(), "编辑缓冲必须是空的");
+        assert!(
+            doc.summary.is_empty() && doc.content.is_empty(),
+            "编辑缓冲必须是空的"
+        );
         assert!(doc.path.ends_with(".latte/tools.d/zz_probe.md"));
         crate::tools::clear_cache();
     }
@@ -3209,16 +3298,30 @@ mod tool_doc_tests {
         .unwrap();
         let backend = doc_backend(tmp.path());
 
-        let doc = get_tool_doc(&backend, "workflow").await.expect("get workflow");
-        assert!(doc.description.contains("zz_probe_wf"),
-                "workflow 详情没内嵌当前可用清单: {:?}", doc.description);
-        assert!(doc.builtin_detail.contains("zz_probe_wf"),
-                "清单应在 builtin_detail 里: {:?}", doc.builtin_detail);
+        let doc = get_tool_doc(&backend, "workflow")
+            .await
+            .expect("get workflow");
+        assert!(
+            doc.description.contains("zz_probe_wf"),
+            "workflow 详情没内嵌当前可用清单: {:?}",
+            doc.description
+        );
+        assert!(
+            doc.builtin_detail.contains("zz_probe_wf"),
+            "清单应在 builtin_detail 里: {:?}",
+            doc.builtin_detail
+        );
         assert_eq!(doc.brief, "Run a named multi-role workflow.");
 
-        let doc = get_tool_doc(&backend, "delegate").await.expect("get delegate");
-        assert!(doc.description.contains("Delegate a subtask to a specialist role"),
-                "delegate 详情不是注册路径的动态描述: {:?}", doc.description);
+        let doc = get_tool_doc(&backend, "delegate")
+            .await
+            .expect("get delegate");
+        assert!(
+            doc.description
+                .contains("Delegate a subtask to a specialist role"),
+            "delegate 详情不是注册路径的动态描述: {:?}",
+            doc.description
+        );
     }
 
     /// 无标记的 md（手写、或从 oh-my-pi 那种一份 md 直接拷来的）整份算详情，
@@ -3228,7 +3331,11 @@ mod tool_doc_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".latte/tools.d");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("bash.md"), "<instruction>\n- 直接写的正文\n</instruction>").unwrap();
+        std::fs::write(
+            dir.join("bash.md"),
+            "<instruction>\n- 直接写的正文\n</instruction>",
+        )
+        .unwrap();
         let backend = doc_backend(tmp.path());
 
         let doc = get_tool_doc(&backend, "bash").await.expect("get");
@@ -3267,14 +3374,31 @@ mod tool_doc_tests {
         assert!(doc.is_template, "没识别出模板: {}", doc.content);
         assert!(doc.content.contains("{{CWD}}"), "编辑缓冲必须是模板原文");
         assert!(
-            doc.rendered_content.contains(&tmp.path().display().to_string()),
+            doc.rendered_content
+                .contains(&tmp.path().display().to_string()),
             "渲染预览没替换 CWD: {}",
             doc.rendered_content
         );
-        assert!(doc.rendered_content.contains("read 可用"), "{}", doc.rendered_content);
-        assert!(!doc.rendered_content.contains("没有 read"), "{}", doc.rendered_content);
-        assert!(doc.template_vars.iter().any(|v| v == "cwd"), "{:?}", doc.template_vars);
-        assert!(doc.template_flags.iter().any(|f| f == "hasread"), "{:?}", doc.template_flags);
+        assert!(
+            doc.rendered_content.contains("read 可用"),
+            "{}",
+            doc.rendered_content
+        );
+        assert!(
+            !doc.rendered_content.contains("没有 read"),
+            "{}",
+            doc.rendered_content
+        );
+        assert!(
+            doc.template_vars.iter().any(|v| v == "cwd"),
+            "{:?}",
+            doc.template_vars
+        );
+        assert!(
+            doc.template_flags.iter().any(|f| f == "hasread"),
+            "{:?}",
+            doc.template_flags
+        );
         crate::tools::clear_cache();
     }
 
@@ -3287,22 +3411,27 @@ mod tool_doc_tests {
         let backend = doc_backend(tmp.path());
         latte_agent_core::tool_docs::clear_live_managers();
 
-        let tm = latte_agent_core::controller::build_tool_manager_at(
-            tmp.path(),
-            &["bash".to_string()],
-        )
-        .await
-        .expect("tool manager");
+        let tm =
+            latte_agent_core::controller::build_tool_manager_at(tmp.path(), &["bash".to_string()])
+                .await
+                .expect("tool manager");
         let before = tm.get_tool("bash").expect("bash").description;
         assert!(!before.contains("热更新验证段落"));
 
-        let saved = put_tool_doc(&backend, "bash", "", "热更新验证段落", "project").await.expect("put");
+        let saved = put_tool_doc(&backend, "bash", "", "热更新验证段落", "project")
+            .await
+            .expect("put");
         assert!(saved.refreshed_managers >= 1, "没刷新任何活跃 manager");
         let after = tm.get_tool("bash").expect("bash").description;
-        assert!(after.contains("热更新验证段落"), "文档没热更新进描述: {after}");
+        assert!(
+            after.contains("热更新验证段落"),
+            "文档没热更新进描述: {after}"
+        );
 
         // 再改一次：只保留新版，不叠加旧版。
-        put_tool_doc(&backend, "bash", "", "第二版段落", "project").await.expect("put");
+        put_tool_doc(&backend, "bash", "", "第二版段落", "project")
+            .await
+            .expect("put");
         let after2 = tm.get_tool("bash").expect("bash").description;
         assert!(after2.contains("第二版段落"), "{after2}");
         assert!(!after2.contains("热更新验证段落"), "旧文档残留: {after2}");
@@ -3320,10 +3449,7 @@ mod tool_doc_tests {
         let b = doc_backend(dir.path());
 
         // 保存前：resolver 里是空段（未配置）。
-        assert!(
-            b.resolver.compaction_section().is_unset(),
-            "初始应未配置"
-        );
+        assert!(b.resolver.compaction_section().is_unset(), "初始应未配置");
 
         let patch = latte_agent_core::config::CompactionSection {
             enabled: Some(true),
@@ -3342,7 +3468,10 @@ mod tool_doc_tests {
         let raw = std::fs::read_to_string(&st.project_file).expect("file written");
         assert!(raw.contains("[compaction]"), "{raw}");
         assert!(raw.contains("threshold_ratio = 0.66"), "{raw}");
-        assert!(!raw.contains("summary_max_tokens"), "未给的键不该写进去: {raw}");
+        assert!(
+            !raw.contains("summary_max_tokens"),
+            "未给的键不该写进去: {raw}"
+        );
 
         // 3. **热生效**：resolver 快照已带上新值。
         let live = b.resolver.compaction_section();
@@ -3352,7 +3481,11 @@ mod tool_doc_tests {
         // 4. GET 能回读一致的生效值。
         let got = get_compaction(&b);
         assert_eq!(got.effective.threshold_ratio, 0.66);
-        assert_eq!(got.project.threshold_ratio, Some(0.66), "project 层声明应回传");
+        assert_eq!(
+            got.project.threshold_ratio,
+            Some(0.66),
+            "project 层声明应回传"
+        );
     }
 
     /// 环境变量接管的字段要显式告知 UI——否则用户在面板改了不生效会以为坏了。
@@ -3382,7 +3515,6 @@ mod tool_doc_tests {
         assert_eq!(COMPACT_ENV_KEYS.len(), 6, "6 个可配字段都要有对应 env 键");
     }
 
-
     /// 删文档同样要热更新：删完模型只应看到内置描述。幂等——文件不在也成功。
     #[tokio::test]
     async fn delete_removes_doc_and_hot_reloads() {
@@ -3391,20 +3523,29 @@ mod tool_doc_tests {
         let backend = doc_backend(tmp.path());
         latte_agent_core::tool_docs::clear_live_managers();
 
-        let tm = latte_agent_core::controller::build_tool_manager_at(
-            tmp.path(),
-            &["bash".to_string()],
-        )
-        .await
-        .expect("tool manager");
+        let tm =
+            latte_agent_core::controller::build_tool_manager_at(tmp.path(), &["bash".to_string()])
+                .await
+                .expect("tool manager");
 
-        put_tool_doc(&backend, "bash", "", "待删除段落", "project").await.expect("put");
-        assert!(tm.get_tool("bash").unwrap().description.contains("待删除段落"));
+        put_tool_doc(&backend, "bash", "", "待删除段落", "project")
+            .await
+            .expect("put");
+        assert!(tm
+            .get_tool("bash")
+            .unwrap()
+            .description
+            .contains("待删除段落"));
 
-        let removed = delete_tool_doc(&backend, "bash", "project").await.expect("delete");
+        let removed = delete_tool_doc(&backend, "bash", "project")
+            .await
+            .expect("delete");
         assert!(removed.refreshed_managers >= 1);
         assert!(
-            !tm.get_tool("bash").unwrap().description.contains("待删除段落"),
+            !tm.get_tool("bash")
+                .unwrap()
+                .description
+                .contains("待删除段落"),
             "删完还留着: {}",
             tm.get_tool("bash").unwrap().description
         );
@@ -3414,10 +3555,15 @@ mod tool_doc_tests {
         assert!(doc.content.is_empty());
 
         // 幂等：再删一次不报错
-        delete_tool_doc(&backend, "bash", "project").await.expect("second delete is idempotent");
+        delete_tool_doc(&backend, "bash", "project")
+            .await
+            .expect("second delete is idempotent");
         // 非法 id 仍然要被拒（防路径穿越）
         assert_eq!(
-            delete_tool_doc(&backend, "../x", "project").await.expect_err("must reject").status,
+            delete_tool_doc(&backend, "../x", "project")
+                .await
+                .expect_err("must reject")
+                .status,
             400
         );
         latte_agent_core::tool_docs::clear_live_managers();
@@ -3452,12 +3598,20 @@ mod tool_doc_tests {
             .await
             .expect("put global");
         assert_eq!(saved.source, "global");
-        assert!(saved.path.starts_with(&global.path().display().to_string()), "{}", saved.path);
+        assert!(
+            saved.path.starts_with(&global.path().display().to_string()),
+            "{}",
+            saved.path
+        );
         let doc = get_tool_doc(&backend, "bash").await.expect("get");
         assert_eq!(doc.source, "global");
         assert_eq!(doc.content, "全局详情");
         assert!(!doc.layers[0].exists, "项目层不该被写");
-        assert!(doc.layers[1].exists && doc.layers[1].active, "{:?}", doc.layers);
+        assert!(
+            doc.layers[1].exists && doc.layers[1].active,
+            "{:?}",
+            doc.layers
+        );
 
         // 3) 存到项目 → 覆盖全局，两层都在
         let saved = put_tool_doc(&backend, "bash", "项目简介", "项目详情", "project")
@@ -3468,31 +3622,46 @@ mod tool_doc_tests {
         assert_eq!(doc.source, "project");
         assert_eq!(doc.content, "项目详情");
         assert!(doc.layers[0].exists && doc.layers[0].active);
-        assert!(doc.layers[1].exists && !doc.layers[1].active, "全局层仍应存在但不生效");
+        assert!(
+            doc.layers[1].exists && !doc.layers[1].active,
+            "全局层仍应存在但不生效"
+        );
 
         // 4) 删项目层 → 回落到全局层（不是变成「无文档」）
-        let removed = delete_tool_doc(&backend, "bash", "project").await.expect("delete project");
+        let removed = delete_tool_doc(&backend, "bash", "project")
+            .await
+            .expect("delete project");
         assert_eq!(removed.source, "project");
         let doc = get_tool_doc(&backend, "bash").await.expect("get");
         assert_eq!(doc.source, "global");
         assert_eq!(doc.content, "全局详情");
 
         // 5) 删全局层 → 彻底没文档
-        delete_tool_doc(&backend, "bash", "global").await.expect("delete global");
+        delete_tool_doc(&backend, "bash", "global")
+            .await
+            .expect("delete global");
         let doc = get_tool_doc(&backend, "bash").await.expect("get");
         assert_eq!(doc.source, "none");
 
         // 6) 非法层要报 400，不能悄悄按项目层处理
         assert_eq!(
-            put_tool_doc(&backend, "bash", "", "x", "nope").await.expect_err("bad target").status,
+            put_tool_doc(&backend, "bash", "", "x", "nope")
+                .await
+                .expect_err("bad target")
+                .status,
             400
         );
         assert_eq!(
-            delete_tool_doc(&backend, "bash", "nope").await.expect_err("bad target").status,
+            delete_tool_doc(&backend, "bash", "nope")
+                .await
+                .expect_err("bad target")
+                .status,
             400
         );
         // 省略 target（老客户端/空串）默认项目层，保持向后兼容
-        let saved = put_tool_doc(&backend, "bash", "", "默认层", "").await.expect("put default");
+        let saved = put_tool_doc(&backend, "bash", "", "默认层", "")
+            .await
+            .expect("put default");
         assert_eq!(saved.source, "project");
 
         match previous {
@@ -3663,9 +3832,8 @@ pub fn list_models(b: &UiBackend) -> Result<ModelsListResponse, ApiError> {
     // 文件位置信息，只能用 `ModelsState::load` 反查每个 model 实际
     // 落在哪个 .toml 文件里。两个扫描都很小（<10 个文件），开销可
     // 忽略；为了正确性值得做。
-    let on_disk =
-        crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
-            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+    let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
+        .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
     // 磁盘上每个 model 文件一条记录（不去重）：同一 `provider/name`
     // 在项目层与全局层各有一个文件时，两条都展示（UI 能区分编辑）。
     // 内存 catalog 里但磁盘上不存在的（catalog 源）追加在末尾。
@@ -3700,8 +3868,12 @@ pub fn list_models(b: &UiBackend) -> Result<ModelsListResponse, ApiError> {
     }
     // 稳定排序：provider → name → source → path，保证 UI 下拉框顺序稳定。
     models.sort_by(|a, b| {
-        (&a.def.provider, &a.def.name, &a.source, &a.file_path)
-            .cmp(&(&b.def.provider, &b.def.name, &b.source, &b.file_path))
+        (&a.def.provider, &a.def.name, &a.source, &a.file_path).cmp(&(
+            &b.def.provider,
+            &b.def.name,
+            &b.source,
+            &b.file_path,
+        ))
     });
     let tiers: BTreeMap<String, String> = cfg
         .models
@@ -3717,7 +3889,6 @@ pub fn list_models(b: &UiBackend) -> Result<ModelsListResponse, ApiError> {
         global_models_dir: global_dir.display().to_string(),
     })
 }
-
 
 /// 全局目录 `<HOME>/.latte/models.d/` 的解析逻辑，集中到这里避免
 /// `list_models` 内嵌三层 Option 链。
@@ -3783,10 +3954,7 @@ pub fn update_model(
     // 这两个按钮（保存到项目 / 保存到全局）共用一条路由，目标由 request
     // body 的 `target` 字段决定。先解析 target，磁盘回退时要按层挑基准值。
     let (write_dir, source_label) = match target {
-        "global" => (
-            crate::models::ModelsState::global_models_dir(),
-            "global",
-        ),
+        "global" => (crate::models::ModelsState::global_models_dir(), "global"),
         "project" | "" => (b.cwd.join(".latte/models.d"), "project"),
         other => {
             return Err(ApiError::bad_request(format!(
@@ -3810,9 +3978,8 @@ pub fn update_model(
     };
     if def.is_none() {
         let project_dir = b.cwd.join(".latte/models.d");
-        let on_disk =
-            crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
-                .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+        let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir_fallback())
+            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
         let prefer = if source_label == "global" {
             crate::models::ModelSource::Global
         } else {
@@ -3833,8 +4000,7 @@ pub fn update_model(
     // 合并补丁：只覆盖显式给出的字段（None 保持原值）。
     patch.apply_to(&mut def);
     // 合并后再整体校验，保证落盘的一定是一份完整合法的 ModelDef。
-    crate::models::validate(&def)
-        .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
+    crate::models::validate(&def).map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
     let new_key = format!("{}/{}", def.provider, def.name);
     if new_key != key {
         return Err(ApiError::bad_request(format!(
@@ -3850,9 +4016,12 @@ pub fn update_model(
     // 这里也追加进 catalog（写到哪里就在内存里出现一份）。
     {
         let mut cfg = b.merged.write();
-        if let Some(slot) = cfg.models.models.iter_mut().find(|m| {
-            format!("{}/{}", m.provider, m.name) == key
-        }) {
+        if let Some(slot) = cfg
+            .models
+            .models
+            .iter_mut()
+            .find(|m| format!("{}/{}", m.provider, m.name) == key)
+        {
             *slot = def.clone();
         } else {
             cfg.models.models.push(def.clone());
@@ -3914,9 +4083,9 @@ pub fn delete_model(b: &UiBackend, key: &str, source: Option<&str>) -> Result<()
     // 处处理 —— 磁盘扫描（`list_models` 的 entries）会如实反映剩余文件。
     {
         let mut cfg = b.merged.write();
-        cfg.models.models.retain(|m| {
-            format!("{}/{}", m.provider, m.name) != key
-        });
+        cfg.models
+            .models
+            .retain(|m| format!("{}/{}", m.provider, m.name) != key);
     }
     hot_reload_resolver(b);
     Ok(())
@@ -3929,10 +4098,7 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
         .map_err(|e| ApiError::bad_request(format!("validate: {e}")))?;
     let key = format!("{}/{}", req.def.provider, req.def.name);
     let (write_dir, src_label) = match req.target.as_str() {
-        "global" => (
-            crate::models::ModelsState::global_models_dir(),
-            "global",
-        ),
+        "global" => (crate::models::ModelsState::global_models_dir(), "global"),
         "project" | "" => (b.cwd.join(".latte/models.d"), "project"),
         other => {
             return Err(ApiError::bad_request(format!(
@@ -3948,9 +4114,12 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
     // 加入内存 catalog：同名 key 覆盖；不存在则追加。
     {
         let mut cfg = b.merged.write();
-        if let Some(slot) = cfg.models.models.iter_mut().find(|m| {
-            format!("{}/{}", m.provider, m.name) == key
-        }) {
+        if let Some(slot) = cfg
+            .models
+            .models
+            .iter_mut()
+            .find(|m| format!("{}/{}", m.provider, m.name) == key)
+        {
             *slot = req.def.clone();
         } else {
             cfg.models.models.push(req.def.clone());
@@ -3964,7 +4133,6 @@ pub fn create_model(b: &UiBackend, req: CreateModelRequest) -> Result<ModelWithS
         def: req.def,
     })
 }
-
 
 #[cfg(test)]
 mod list_models_tests {
@@ -4123,9 +4291,7 @@ pub fn put_role_toml(b: &UiBackend, role_id: &str, raw: &str) -> Result<(), ApiE
         .get("roles")
         .and_then(|r| r.get(role_id))
         .and_then(|r| r.as_table())
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("TOML 中缺少 [roles.{role_id}] 节"))
-        })?;
+        .ok_or_else(|| ApiError::bad_request(format!("TOML 中缺少 [roles.{role_id}] 节")))?;
     // 可选：校验 id 字段匹配
     if let Some(v) = role_table.get("id") {
         if v.as_str() != Some(role_id) {
@@ -4147,7 +4313,8 @@ pub fn put_role_toml(b: &UiBackend, role_id: &str, raw: &str) -> Result<(), ApiE
         .map_err(|e| ApiError::internal(format!("write {}: {e}", path.display())))?;
 
     let file_cfg = latte_agent_core::config::AgentConfig::load(
-        path.to_str().ok_or_else(|| ApiError::internal("path not UTF-8".to_string()))?,
+        path.to_str()
+            .ok_or_else(|| ApiError::internal("path not UTF-8".to_string()))?,
     )
     .map_err(|e| ApiError::internal(format!("reload {role_id}: {e}")))?;
     if let Some(tpl) = file_cfg.roles.into_iter().next().map(|(_, v)| v) {
@@ -4273,7 +4440,10 @@ const COMPACT_ENV_KEYS: &[(&str, &str)] = &[
     ("LATTE_AGENT_AUTO_COMPACT", "enabled"),
     ("LATTE_AGENT_COMPACT_THRESHOLD_RATIO", "threshold_ratio"),
     ("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS", "keep_recent_turns"),
-    ("LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS", "summary_max_tokens"),
+    (
+        "LATTE_AGENT_COMPACT_SUMMARY_MAX_TOKENS",
+        "summary_max_tokens",
+    ),
     ("LATTE_AGENT_COMPACT_MAX_PASSES", "max_passes"),
     ("LATTE_AGENT_COMPACT_SECTIONS", "sections"),
 ];
@@ -4334,8 +4504,14 @@ pub fn get_compaction(b: &UiBackend) -> CompactionState {
         project,
         global,
         env_overrides: compaction_env_overrides(),
-        project_file: project_dir.join("compaction.toml").to_string_lossy().into_owned(),
-        global_file: global_dir.join("compaction.toml").to_string_lossy().into_owned(),
+        project_file: project_dir
+            .join("compaction.toml")
+            .to_string_lossy()
+            .into_owned(),
+        global_file: global_dir
+            .join("compaction.toml")
+            .to_string_lossy()
+            .into_owned(),
     }
 }
 
@@ -4432,9 +4608,8 @@ pub fn put_compaction(
 pub fn get_model_toml(b: &UiBackend, key: &str) -> Result<String, ApiError> {
     let project_dir = b.cwd.join(".latte/models.d");
     let global_dir = global_dir_fallback();
-    let on_disk =
-        crate::models::ModelsState::load(&project_dir, &global_dir)
-            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+    let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir)
+        .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
     let path = on_disk.paths.get(key).cloned().unwrap_or_default();
     if path.as_os_str().is_empty() || !path.exists() {
         return Err(ApiError::not_found(format!(
@@ -4464,9 +4639,8 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
     // 2. 找到当前 model 文件路径
     let project_dir = b.cwd.join(".latte/models.d");
     let global_dir = global_dir_fallback();
-    let on_disk =
-        crate::models::ModelsState::load(&project_dir, &global_dir)
-            .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
+    let on_disk = crate::models::ModelsState::load(&project_dir, &global_dir)
+        .map_err(|e| ApiError::internal(format!("scan models.d: {e}")))?;
     let path = on_disk.paths.get(key).cloned().unwrap_or_default();
     if path.as_os_str().is_empty() || !path.exists() {
         return Err(ApiError::not_found(format!(
@@ -4483,9 +4657,12 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
     // 3. 更新内存 catalog
     {
         let mut cfg = b.merged.write();
-        if let Some(slot) = cfg.models.models.iter_mut().find(|m| {
-            format!("{}/{}", m.provider, m.name) == key
-        }) {
+        if let Some(slot) = cfg
+            .models
+            .models
+            .iter_mut()
+            .find(|m| format!("{}/{}", m.provider, m.name) == key)
+        {
             *slot = def;
         } else {
             cfg.models.models.push(def);
@@ -4494,7 +4671,6 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
     hot_reload_resolver(b);
     Ok(())
 }
-
 
 #[cfg(test)]
 mod workflow_resume_tests {
@@ -4524,6 +4700,7 @@ mod workflow_resume_tests {
             &b.merged,
             &b.resolver,
             &b.cwd,
+            None, // agent_cwd：测试会话不隔离
             None,
             None,
             &b.subsession_store,
@@ -4567,11 +4744,14 @@ mod workflow_resume_tests {
     async fn resume_unknown_session_404() {
         let dir = tempfile::tempdir().unwrap();
         let b = make_backend(dir.path());
-        let err = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: "ui-ghost".into(),
-            wf_id: Some("wf-x".into()),
-            topic: None,
-        })
+        let err = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: "ui-ghost".into(),
+                wf_id: Some("wf-x".into()),
+                topic: None,
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.status, 404);
@@ -4583,11 +4763,14 @@ mod workflow_resume_tests {
         let dir = tempfile::tempdir().unwrap();
         let b = make_backend(dir.path());
         let sid = add_session(&b, "ui-s1").await;
-        let err = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid,
-            wf_id: None,
-            topic: None,
-        })
+        let err = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid,
+                wf_id: None,
+                topic: None,
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.status, 404);
@@ -4600,11 +4783,14 @@ mod workflow_resume_tests {
         let dir = tempfile::tempdir().unwrap();
         let b = make_backend(dir.path());
         let sid = add_session(&b, "ui-s1").await;
-        let err = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid,
-            wf_id: Some("../etc/passwd".into()),
-            topic: None,
-        })
+        let err = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid,
+                wf_id: Some("../etc/passwd".into()),
+                topic: None,
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.status, 404);
@@ -4616,11 +4802,14 @@ mod workflow_resume_tests {
         let dir = tempfile::tempdir().unwrap();
         let b = make_backend(dir.path());
         let sid = add_session(&b, "ui-s1").await;
-        let err = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid,
-            wf_id: Some("wf-ghost".into()),
-            topic: None,
-        })
+        let err = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid,
+                wf_id: Some("wf-ghost".into()),
+                topic: None,
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.status, 404);
@@ -4633,11 +4822,14 @@ mod workflow_resume_tests {
         let b = make_backend(dir.path());
         let sid = add_session(&b, "ui-s1").await;
         write_checkpoint(dir.path(), "wf-a", "learn-ghost");
-        let err = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid,
-            wf_id: Some("wf-a".into()),
-            topic: None,
-        })
+        let err = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid,
+                wf_id: Some("wf-a".into()),
+                topic: None,
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.status, 404);
@@ -4652,11 +4844,14 @@ mod workflow_resume_tests {
         b.session_workflows
             .write()
             .insert(sid.clone(), Arc::new(AtomicBool::new(false)));
-        let err = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid,
-            wf_id: Some("wf-a".into()),
-            topic: None,
-        })
+        let err = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid,
+                wf_id: Some("wf-a".into()),
+                topic: None,
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.status, 409);
@@ -4672,11 +4867,14 @@ mod workflow_resume_tests {
         let sid = add_session(&b, "ui-s1").await;
         write_checkpoint(dir.path(), "wf-a", "learn");
         write_workflow(dir.path(), "learn");
-        let resp = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid.clone(),
-            wf_id: Some("wf-a".into()),
-            topic: None,
-        })
+        let resp = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid.clone(),
+                wf_id: Some("wf-a".into()),
+                topic: None,
+            },
+        )
         .await
         .expect("resume should start");
         assert_eq!(resp["started"], serde_json::json!(true));
@@ -4705,11 +4903,14 @@ mod workflow_resume_tests {
                 summary: "boom".into(),
                 failed_at_unix_ms: 1,
             });
-        let resp = workflow_resume(&b, WorkflowResumeRequest {
-            session_id: sid,
-            wf_id: None,
-            topic: None,
-        })
+        let resp = workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: sid,
+                wf_id: None,
+                topic: None,
+            },
+        )
         .await
         .expect("resume via snapshot should start");
         assert_eq!(resp["wf_id"], serde_json::json!("wf-snap"));
@@ -4752,7 +4953,9 @@ mod workflow_resume_tests {
                 summary: String::new(),
                 failed_at_unix_ms: 0,
             });
-        chat_resume_session(&b, Some(&sid)).await.expect("resume ok");
+        chat_resume_session(&b, Some(&sid))
+            .await
+            .expect("resume ok");
         assert!(
             b.session_workflows.read().contains_key(&sid),
             "兜底应注册续跑 guard（workflow 从 checkpoint 拉起）"
@@ -4777,7 +4980,9 @@ mod workflow_resume_tests {
             failed_at_unix_ms: 0,
         });
         c.pause_session();
-        chat_resume_session(&b, Some(&sid)).await.expect("resume ok");
+        chat_resume_session(&b, Some(&sid))
+            .await
+            .expect("resume ok");
         assert!(
             b.session_workflows.read().get(&sid).is_none(),
             "live 恢复只释放 gate，不该再起一份续跑"
@@ -4792,7 +4997,9 @@ mod workflow_resume_tests {
         let b = make_backend(dir.path());
         let sid = add_session(&b, "ui-s1").await;
         let flag = Arc::new(AtomicBool::new(false));
-        b.session_workflows.write().insert(sid.clone(), flag.clone());
+        b.session_workflows
+            .write()
+            .insert(sid.clone(), flag.clone());
         chat_abort(&b, Some(&sid)).await.expect("abort");
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
         assert!(b.session_workflows.read().is_empty());
@@ -4813,7 +5020,9 @@ mod workflow_resume_tests {
         let sid = add_session(&b, "ui-del-1").await;
 
         let flag = Arc::new(AtomicBool::new(false));
-        b.session_workflows.write().insert(sid.clone(), flag.clone());
+        b.session_workflows
+            .write()
+            .insert(sid.clone(), flag.clone());
 
         // 一条属于该 session 的孤儿 ask 记录（+ 它的 checkpoint，
         // 否则 load_for_session 会因 checkpoint 缺失先把它滤掉）。
@@ -4851,9 +5060,8 @@ mod workflow_resume_tests {
     /// 续跑永远 409，只能靠 chat_abort 或重启自愈。
     #[tokio::test]
     async fn session_workflow_guard_releases_even_on_panic() {
-        let runs: Arc<
-            parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>,
-        > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        let runs: Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>> =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
         let sid = "ui-panic-1".to_string();
         let owner = Arc::new(AtomicBool::new(false));
         runs.write().insert(sid.clone(), owner.clone());
@@ -4882,9 +5090,8 @@ mod workflow_resume_tests {
     /// its own Arc owner, never the replacement (ABA-safe cleanup).
     #[test]
     fn session_workflow_guard_does_not_remove_new_owner() {
-        let runs: Arc<
-            parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>,
-        > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        let runs: Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>> =
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
         let sid = "ui-aba-1".to_string();
         let old_owner = Arc::new(AtomicBool::new(false));
         runs.write().insert(sid.clone(), old_owner.clone());
@@ -4992,18 +5199,21 @@ mod hot_reload_tests {
         create_role(&b, "architect", "Architect").expect("create role");
         assert_eq!(b.resolver.generation(), g0 + 1, "create_role 推进代际");
 
-        save_role_config(&b, SaveRoleConfigRequest {
-            id: "architect".into(),
-            name: "Architect".into(),
-            icon: String::new(),
-            model_tier: "premium".into(),
-            model_chain: vec!["m1".into()],
-            temperature: None,
-            tools: vec![],
-            code_paths: vec![],
-            description: None,
-            prompt: String::new(),
-        })
+        save_role_config(
+            &b,
+            SaveRoleConfigRequest {
+                id: "architect".into(),
+                name: "Architect".into(),
+                icon: String::new(),
+                model_tier: "premium".into(),
+                model_chain: vec!["m1".into()],
+                temperature: None,
+                tools: vec![],
+                code_paths: vec![],
+                description: None,
+                prompt: String::new(),
+            },
+        )
         .expect("save role");
         assert_eq!(b.resolver.generation(), g0 + 2, "save_role_config 推进代际");
         let (chain, tier) = b
@@ -5024,29 +5234,32 @@ mod hot_reload_tests {
         let dir = tempfile::tempdir().unwrap();
         let b = make_backend(dir.path());
         let g0 = b.resolver.generation();
-        create_model(&b, CreateModelRequest {
-            target: "project".into(),
-            def: ModelDef {
-                name: "m1".into(),
-                api: "openai".into(),
-                provider: "test".into(),
-                base_url: "http://localhost:1".into(),
-                api_key: "k".into(),
-                context_window: 32000,
-                max_tokens: 4096,
-                omit_max_tokens: false,
-                max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
-                supports_thinking: false,
-                supports_vision: false,
-                supports_image_generation: false,
-                cost_per_million_input: None,
-                cost_per_million_output: None,
-                tier: None,
-                timeout_secs: None,
+        create_model(
+            &b,
+            CreateModelRequest {
+                target: "project".into(),
+                def: ModelDef {
+                    name: "m1".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: "http://localhost:1".into(),
+                    api_key: "k".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: None,
+                    timeout_secs: None,
+                },
             },
-        })
+        )
         .expect("create model");
         assert_eq!(b.resolver.generation(), g0 + 1);
         assert!(b.resolver.build_model("m1").is_ok(), "新模型即刻可解析");
@@ -5075,10 +5288,15 @@ mod hot_reload_tests {
         )
         .unwrap();
 
-        let out = update_model(&b, "diskonly/m1", "project", ModelPatch {
-            api_key: Some("sk-new".into()),
-            ..Default::default()
-        })
+        let out = update_model(
+            &b,
+            "diskonly/m1",
+            "project",
+            ModelPatch {
+                api_key: Some("sk-new".into()),
+                ..Default::default()
+            },
+        )
         .expect("PATCH 应回退磁盘扫描而不是 404");
 
         // 补丁字段生效，未打补丁的字段保留磁盘现值。

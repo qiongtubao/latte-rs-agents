@@ -39,3 +39,7 @@ base64 = "0.22"
 tempfile = "3"
 # notion_sync 集成测试：HTTP mock 验证 PUT 4xx/5xx/2xx 与重试。
 wiremock = "0.6"
+# HTTP 层接线测试：直接把请求喂给 build_router 出来的 Router
+# （`ServiceExt::oneshot`），验证路由路径 + 处理器 + serde 序列化——
+# 直接调 tasks:: 函数的单测绕过了这三样，路由名写错也发现不了。
+tower = { version = "0.4", features = ["util"] }
