@@ -6786,10 +6786,12 @@ role = "reviewer"
         assert_eq!(wf.steps[4].roles(), vec!["programmer"], "fix 只改");
         assert_eq!(wf.steps[5].roles(), vec!["reviewer"], "recheck 独立复核");
     }
-    /// learn_loop v2：文档驱动学习循环——plan（取证+拆解+出题）→ doc（写/增强
+    /// learn_loop v2：文档驱动学习循环——plan（取证+拆解+出题）→ annotate（默认：
+    /// 注释版代码副本，不改源码）→ doc（写/增强
     /// draft.md）→ read_confirm（「开始答题」按钮）→ quiz（批量出题+判分+写账本，
     /// 有错回 doc 增强）→ supplement（全对后问补充疑问，有补充回 doc）→ merge
-    /// （定稿 docs/learn/<slug>.md）→ report。
+    /// （定稿 docs/learn/<slug>.md）→ sync_code（可选，主题带「同步注释」才跑：
+    /// 把注释写进真实源码）→ report。
     /// 设计文档：docs/learn-loop-doc-driven-design.md。
     ///
     /// 这个测试锁的结构要点（前身的实测教训仍然算数）：
@@ -6836,16 +6838,28 @@ role = "reviewer"
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["plan", "doc", "read_confirm", "quiz", "supplement", "merge", "report"]
+            [
+                "plan",
+                "annotate",
+                "doc",
+                "read_confirm",
+                "quiz",
+                "supplement",
+                "merge",
+                "sync_code",
+                "report"
+            ]
         );
 
         let plan = &wf.steps[0];
-        let doc = &wf.steps[1];
-        let read_confirm = &wf.steps[2];
-        let quiz = &wf.steps[3];
-        let supplement = &wf.steps[4];
-        let merge = &wf.steps[5];
-        let report = &wf.steps[6];
+        let annotate = &wf.steps[1];
+        let doc = &wf.steps[2];
+        let read_confirm = &wf.steps[3];
+        let quiz = &wf.steps[4];
+        let supplement = &wf.steps[5];
+        let merge = &wf.steps[6];
+        let sync_code = &wf.steps[7];
+        let report = &wf.steps[8];
         for s in &wf.steps {
             assert_eq!(s.roles(), vec!["tutor"], "step {} 必须是 tutor", s.id);
         }
@@ -6903,6 +6917,44 @@ role = "reviewer"
                 && plan.output_contract.forbid.iter().any(|f| f == "/"),
             "plan 的 slug 不能带空格或斜杠"
         );
+        // 小白友好：每个知识点必须带最小具体例子（"传什么→出来什么"），
+        // 出题考场景理解，不考行号级查表题。
+        assert!(
+            plan.task_text().contains("example"),
+            "plan 必须要求每个知识点带 example 最小具体例子——抽象描述小白看不懂"
+        );
+        assert!(
+            norm(plan.task_text()).contains("考理解"),
+            "plan 出题必须考理解（给场景让学员推断），不考「在第几行」式查表题"
+        );
+
+        // ── annotate：默认生成的注释版代码副本（只读源码、只写副本）──
+        assert!(
+            annotate.when_any.is_empty() && annotate.unless_any.is_empty(),
+            "annotate 必须无条件执行——注释版副本是默认学习材料；「要不要注释进源码」\
+             的开关在 sync_code 步，不在本步"
+        );
+        assert!(
+            annotate.tools.iter().any(|t| t == "read")
+                && annotate.tools.iter().any(|t| t == "write"),
+            "annotate 需要 read 读源码、write 写副本"
+        );
+        assert!(
+            !annotate.tools.iter().any(|t| t == "edit") && !annotate.tools.iter().any(|t| t == "ask"),
+            "annotate 不许有 edit（可能改到源文件）也不许弹窗——不动源码靠工具隔离"
+        );
+        assert!(
+            annotate.require_tools.iter().any(|t| t == "write"),
+            "annotate 必须真把副本落盘"
+        );
+        assert!(
+            norm(annotate.task_text()).contains("逐字保留"),
+            "annotate 必须钉「逐字保留代码原文、只加注释」，否则副本会改丢代码"
+        );
+        assert!(
+            norm(annotate.task_text()).contains("绝不修改"),
+            "annotate 必须声明绝不修改副本目录以外的文件（learn_loop 是只读类型）"
+        );
 
         // ── doc：写文档，不许弹窗 ──
         // doc 拥有 write（文档与账本归它维护）但拿不到 ask——"写文档顺便出题"
@@ -6938,6 +6990,19 @@ role = "reviewer"
         assert!(
             doc.output_contract.min_chars.unwrap_or(0) >= 500,
             "doc 必须有 min_chars 下限，否则空正文/只给路径也能通过"
+        );
+        // 小白友好（实测反面教材：术语零解释、例子缺失、考据密度压过主线）：
+        assert!(
+            doc.task_text().contains("大白话"),
+            "doc 必须要求术语首次出现时用大白话解释（读者是零基础小白）"
+        );
+        assert!(
+            doc.task_text().contains("example"),
+            "doc 必须以知识点的 example 为底展开讲解（传什么→出来什么）"
+        );
+        assert!(
+            doc.task_text().contains("逐行讲解"),
+            "doc 必须要求代码摘录后配逐行讲解，不许只贴代码配行号表"
         );
 
         // ── read_confirm：答题按钮独占一步 ──
@@ -7092,6 +7157,28 @@ role = "reviewer"
             merge.task_text().contains("docs/learn/")
                 && merge.output_contract.require.iter().any(|r| r == "docs/learn/"),
             "merge 必须产出 docs/learn/<slug>.md 并在正文给出路径"
+        );
+
+        // ── sync_code：可选，把注释写进真实源码（when_any 触发）──
+        assert!(
+            !sync_code.when_any.is_empty(),
+            "sync_code 必须由 when_any 关键词触发——默认不动仓库，保持 learn_loop 只读惯例"
+        );
+        assert!(
+            sync_code.output_key.is_some(),
+            "条件 step 必须绑 output_key（引擎校验：跳过的 step 下游拿空串，没绑则配置写漏了也没人知道）"
+        );
+        assert!(
+            sync_code.tools.iter().any(|t| t == "edit") && !sync_code.tools.iter().any(|t| t == "ask"),
+            "sync_code 需要 edit 改源文件，但不许弹窗"
+        );
+        assert!(
+            sync_code.require_tools.iter().any(|t| t == "edit"),
+            "sync_code 必须真改过源文件（没 edit 就是空口报告）"
+        );
+        assert!(
+            norm(sync_code.task_text()).contains("绝不改任何代码逻辑"),
+            "sync_code 必须钉「只加注释、绝不改逻辑」"
         );
 
         // ── report：只读，按 wrong/passed 推导 ──

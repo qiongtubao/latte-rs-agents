@@ -44,7 +44,7 @@ isolated = false
 
 [types.learn_loop]
 label = "交互学习"
-description = "交互式学习循环：知识点拆解→弹窗出题→掌握报告，每轮 subagent 隔离不涨 token"
+description = "交互式学习循环：知识点拆解→弹窗出题→掌握报告，每轮 subagent 隔离不涨 token；默认附注释版代码副本，主题带「同步注释」可把注释写进源码"
 default_workflow = "learn_loop"
 color = "#a78bfa"
 icon = "🎓"

@@ -5,6 +5,7 @@
 
   /learn_loop <topic>
     → plan（落盘 plan.json / ledger.json）
+    → annotate（注释版代码副本 code/，默认生成；不带「同步注释」时 sync_code 跳过）
     → doc（draft.md；正文必须带文档全文）
     → read_confirm 弹窗「开始答题」—— 断言：doc 全文先于弹窗到达（先学后答）
     → quiz 弹窗（questions 多题）—— 第一轮故意答错第 1 题，验证

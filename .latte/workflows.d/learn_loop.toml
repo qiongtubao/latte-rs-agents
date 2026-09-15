@@ -1,13 +1,19 @@
 # Workflow: learn_loop（v2：文档驱动学习循环）
-# plan（取证 + 拆知识点 + 出题）→ doc（写/增强学习文档 draft.md）
+# plan（取证 + 拆知识点 + 出题）→ annotate（注释版代码副本，默认生成）
+#   → doc（写/增强学习文档 draft.md）
 #   → read_confirm（「开始答题」按钮，等学员读完）→ quiz（批量出题 + 判分 + 写账本，
 #   有错跳回 doc 增强）→ supplement（全对后问"还有不懂的吗"，有补充跳回 doc）
-#   → merge（定稿 docs/learn/<slug>.md）→ report
+#   → merge（定稿 docs/learn/<slug>.md）→ [sync_code（可选：注释写进源码）] → report
 #
 # 用法：/learn_loop <主题>，或 manager 调 workflow { name: "learn_loop", topic: "…" }
+#       annotate 默认生成注释版代码副本（.latte/learn/<slug>/code/），不改源码；
+#       可选开关：主题里带「同步注释」（或 写进源码）→ merge 之后由 sync_code 步
+#       把注释写进真实源文件（只加注释、不改逻辑）——这会修改仓库代码，
+#       建议该任务开 isolated worktree 执行（看板编辑弹窗可覆盖）。
 # 产物：.latte/learn/<slug>/plan.json（知识点+题目+答案+证据）
 #       .latte/learn/<slug>/ledger.json（wrong / passed 事实 + round + supplements）
 #       .latte/learn/<slug>/draft.md（学习期间的活文档，逐轮演进）
+#       .latte/learn/<slug>/code/（注释版代码副本 + README 索引）
 #       docs/learn/<slug>.md（merge 步定稿的最终交付文档）
 #
 # 设计文档：docs/learn-loop-doc-driven-design.md
@@ -30,7 +36,7 @@
 
 name = "learn_loop"
 command = "/learn_loop"
-description = "文档驱动学习循环：写学习文档 → 学员阅读 → 点「开始答题」→ 答错增强文档再学 → 全对后补充疑问 → 定稿合并｜落点：现在就开始上课：文档+弹窗互动 + docs/learn/<slug>.md 定稿 + .latte/learn/<slug>/ 掌握账本（不进任务看板）"
+description = "文档驱动学习循环：写学习文档 → 学员阅读 → 点「开始答题」→ 答错增强文档再学 → 全对后补充疑问 → 定稿合并｜落点：现在就开始上课：文档+弹窗互动 + docs/learn/<slug>.md 定稿 + .latte/learn/<slug>/ 掌握账本（不进任务看板）｜默认附注释版代码副本（.latte/learn/<slug>/code/）；主题带「同步注释」时把注释写进源码（会改仓库文件）"
 max_rounds = 1
 
 # ═══ 1. 取证 + 拆解知识点 + 出题 ══════════════════════════════
@@ -66,7 +72,9 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
 运转"、核心数据结构、运行原理、模块调用交互、流程图等，与知识点顺序对应。
 
 每个知识点写：`id`（短英文）、`title`（中文）、`evidence`（`file:line`，必须真实存在）、
-`teach_points`（讲解要点数组，每条一句话 + 出处）、`doc_section`（该点在文档里的章节
+`teach_points`（讲解要点数组，每条一句话 + 出处）、`example`（**最小具体例子**：讲参数
+就写"传什么进去 → 出来什么"，讲分支就写"A 情况下变成什么、B 情况下变成什么"——
+例子是小白理解的入口，不许只给抽象描述）、`doc_section`（该点在文档里的章节
 标题，如 `## 2. 所有权规则`）、`question` + 4 个 `options`、`answer`（正确选项的 label 原文）。
 
 ## 三、出题规则
@@ -77,12 +85,17 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
   第几项）；判分按 label 文本，与位置无关。
 - 四个选项等重：长度、语气、详略、术语密度一致。干扰项必须是真实存在的东西（真函数/宏/
   字段），只是不满足题干条件；一秒能排除的荒谬项（"两者完全等价"）不叫干扰项。
+- **考理解，不考查表**：给一个具体小场景让学员推断行为/结果（如"在 GCC 下这段宏
+  展开成什么""传 `x` 进去会怎样"）；**不许考"定义在第几行""有几个字段"这种翻
+  原文就有答案的记忆题**——那考的是检索不是学会。
 - 题目考 `title` 说的那个核心，各知识点的题目不得互相重叠。选项 `description` 里的事实
   同样来自取证。
 
 ## 四、落盘
 
-`write` 到 `.latte/learn/<slug>/plan.json`（slug 从主题推导，小写英文+连字符）：
+`write` 到 `.latte/learn/<slug>/plan.json`（slug 从主题推导，小写英文+连字符；
+**剔除「同步注释」/「写进源码」这类开关标记词**——它们是 sync_code 步的触发
+开关，不是主题内容）：
 
 ```json
 {
@@ -95,6 +108,7 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
       "title": "所有权规则",
       "evidence": "src/ownership.rs:12-48",
       "teach_points": ["每个值有唯一 owner（src/ownership.rs:12）"],
+      "example": "let a = String::from(\"hi\"); let b = a; —— 之后用 a 直接编译报错：owner 已移给 b",
       "doc_section": "## 2. 所有权规则",
       "question": "…",
       "options": [
@@ -125,6 +139,45 @@ min_chars = 3
 max_chars = 60
 forbid = [" ", "/", "\\", "`"]
 
+# ═══ 1b. 注释版代码副本（默认生成）═══════════════════════════════════
+# 默认必跑：注释版副本是学习材料的标配。「要不要注释进源码」才是开关——
+# 那是 merge 之后 sync_code 步的事（when_any 触发）。
+# tools          只有 read + write：副本是新文件，用不上 edit；没有 edit 也就
+#                不可能改到源文件——"不动源码"靠工具隔离，不靠 prompt 劝告。
+# 副本落在 .latte/learn/<slug>/code/，不违反只读类型的 paths 严格校验
+# （.latte/ 是学习产物目录，不是仓库源码）。
+[[steps]]
+id = "annotate"
+description = "为 plan 取证的代码生成注释版学习副本（不改源码）"
+role = "tutor"
+output_key = "annotate_out"
+max_retries = 1
+tools = ["read", "write"]
+require_tools = ["write"]
+task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
+
+读 `.latte/learn/{{plan_out}}/plan.json`，为每个知识点的 `evidence`（file:line）
+生成**注释版代码副本**，让学员读源码时旁边就有讲解：
+
+1. 按 `evidence` 的行号区间 `read` 原文件（函数/结构体读完整定义，前后带少量
+   上下文）；同一文件被多个知识点引用时合并成一个副本。
+2. `write` 到 `.latte/learn/{{plan_out}}/code/<知识点id>-<原文件名>`（如
+   `k1-ownership.rs`）：**逐字保留代码原文，只加中文注释**——
+   - 文件头注释块：原始出处（`file:line`）、对应知识点标题、"学习副本——
+     源文件未改动，行号可能随后续源码演进漂移"；
+   - 关键行上方用注释讲「做什么 / 为什么」，不复述代码本身；术语与
+     plan.json 的 `teach_points` 保持一致，且**面向零基础学员**——术语随口
+     用半句大白话带过（如"内联：把函数体直接铺到调用处"），不甩生词。
+3. 最后 `write` 索引 `.latte/learn/{{plan_out}}/code/README.md`：知识点 →
+   副本文件 → 原始出处的对照表。
+
+**绝不修改 `code/` 目录以外的任何文件**——源文件保持原样，学员对照副本
+阅读即可。正文列出副本清单（副本路径 → 原始出处），此外不输出别的。"""
+
+[steps.output_contract]
+min_chars = 30
+require = ["code/"]
+
 # ═══ 2. 写 / 增强学习文档 ════════════════════════════════════
 # tools           有 write + edit（返工增强是局部修改：实测没有 edit 时模型用
 #                 write 整文件覆写，丢掉既有章节后被迫全文重建，反复 thrash），
@@ -145,10 +198,18 @@ task = """你是互动学习辅导员，负责维护学习文档。当前主题 
 
 ## 首次进入（prompt 里没有上一轮的判分结果或补充问题）
 
-按 plan.json 的 `doc_outline` 写 `.latte/learn/{{plan_out}}/draft.md`：
+按 plan.json 的 `doc_outline` 写 `.latte/learn/{{plan_out}}/draft.md`。**读者是零
+基础小白**——写得像考据报告就是失败（反面教材的样子：满纸「翻译单元 / token /
+调用约定」没有一个被解释，行号表比讲解多，读三遍也不知道这东西拿来干嘛）：
 
-- 开头先讲"这是什么、整体怎么运转"，门外汉也能看懂；再按大纲展开核心数据结构、
-  运行原理、模块调用交互。
+- 开头先讲"这是什么、整体怎么运转、什么时候会碰到它"，门外汉也能看懂；再按大纲
+  展开核心数据结构、运行原理、模块调用交互。
+- **术语零信任**：每个术语第一次出现时必须用一句大白话解释（如"预处理：编译前
+  先把宏原样替换成最终代码的那一步"），之后才能直接使用；一句话解释不清的，
+  先给一个生活类比或一句话直觉建立画面，再展开细节。不许连续堆砌未解释的术语。
+- **例子优先**：每个知识点的讲解以它的 `example` 为底——讲参数就说清"传什么进去
+  → 出来什么"，讲分支就给"A 情况变成什么、B 情况变成什么"的具体对照；任何抽象
+  描述后面必须紧跟一个具体例子，不许只有定义没有例子。
 - **结构图/调用图不要凭记忆手写**：用 `code_graph(graph="structure", path=<相关目录>)`
   拿模块结构图、`code_graph(graph="calls", path=<子目录或单个文件>)` 拿真实调用图，
   把返回的 mermaid 原文原样嵌进 ```mermaid 围栏（UI 会渲染成 SVG，可缩放/下载）。
@@ -156,14 +217,23 @@ task = """你是互动学习辅导员，负责维护学习文档。当前主题 
   流向这类不对应具体代码符号的图）才手写 mermaid，节点名必须来自取证过的真实符号；
   图源里不要出现原始 HTML 标签。
 - 每个知识点一节（标题 = 它的 `doc_section`），以 `teach_points` 为骨架展开，按需再读
-  代码补细节（独立取证用 `paths` 批量发）。**必须带 `file:line`**，关键处摘几行真实代码。
+  代码补细节（独立取证用 `paths` 批量发）。**必须带 `file:line`** 出处（放句末即可
+  ——证据是注脚不是主角）；关键处摘几行真实代码，**摘录后面必须跟逐行讲解**，
+  不许只贴一段代码配一个行号表。
+- **控制信息密度**：正文主线只留理解必需的内容；行号级考据、使用次数统计、偏门
+  分支压进文末速查表或附录。每节末尾用一句「人话总结」收束本节。
+- `.latte/learn/{{plan_out}}/code/` 里有 annotate 步生成的注释版代码副本（README.md
+  是索引）：在对应知识点章节末尾标注副本路径（如 `code/k1-ownership.rs`），学员对照
+  源码阅读时旁边就有逐行讲解；目录不存在则不提。
 - 要覆盖每个知识点 `question` 会考的那个点——学完就考，不许突袭；但**不许摊开选项
   或点出答案**。
 
 ## 返工进入：QUIZ_FAIL（prompt 里带上一轮的「判分结果」「你选的是」）
 
 学员答错了。只增强答错点对应的 `doc_section`：加「易错点辨析」小节，讲清 `answer`
-那个选项与其余选项的区别（换个角度，不要把原文复制一遍）；其余章节不动。
+那个选项与其余选项的区别。**答错说明上一轮的讲法没让他懂**——换一个更具体的例子
+或类比重讲（回到 `example` 的"传什么→出来什么"句式），不要只是把原文换个措辞
+复制一遍；其余章节不动。
 **draft.md 的修改用 `edit` 做局部修改，不要用 `write` 整文件覆写**（覆写会丢掉
 其他章节）。然后把 ledger.json 的 `round` +1、刷新 `updated_at`（账本很小，直接
 write 覆盖写）。
@@ -171,7 +241,9 @@ write 覆盖写）。
 ## 返工进入：SUPPLEMENT（prompt 里带学员的补充问题，形如「补充：…」）
 
 学员全对后主动提出还有不懂的。先取证（read/code_graph/search），用 `edit` 把补充
-内容追加为 draft.md 的新章节（同样不要整文件覆写）；再把补充变成一个**新知识点**：
+内容追加为 draft.md 的新章节（同样不要整文件覆写）；若 `code/` 目录存在，同时为补充
+知识点的 `evidence` 生成注释版副本并更新 `code/README.md`（write 新副本 + edit 索引）。
+再把补充变成一个**新知识点**：
 追加进 plan.json 的 `knowledge_points`（`id` 顺延，含 `title`/`evidence`/`teach_points`/
 `doc_section`/`question`/`options`/`answer`，出题规则同 plan 步）和 ledger.json
 （`wrong:0, passed:false`）；`round` +1、刷新 `updated_at`。
@@ -335,6 +407,8 @@ task = """你是技术写作者。当前主题 slug：{{plan_out}}。
 - 保留全部 `file:line` 出处与代码摘录——这是文档的可信度来源；
 - draft 里的 ```mermaid 图块**原样保留**（不改写图源；chat 与文档预览都会渲染成
   SVG），不是过程痕迹，不要当轮次痕迹清理掉；
+- draft 中对 `.latte/learn/{{plan_out}}/code/` 注释版副本的引用同样**保留**（学习资产，
+  不是轮次痕迹）；若该目录存在，文末加「注释版代码副本」一节列出副本索引；
 - draft.md 原样保留作存档，不要删。
 
 正文给出最终文档的完整路径（`docs/learn/{{plan_out}}.md`）和一句内容概要，
@@ -342,6 +416,39 @@ task = """你是技术写作者。当前主题 slug：{{plan_out}}。
 
 [steps.output_contract]
 require = ["docs/learn/"]
+
+# ═══ 6b. 可选：把注释同步进真实源码（when_any 命中才跑）══════════════
+# when_any       主题带「同步注释」/「写进源码」才跑——默认只留 .latte/ 副本，
+#                不动仓库；开启后本步会修改源文件（只加注释、不改逻辑），
+#                建议任务开 isolated worktree（看板编辑弹窗可覆盖）。
+# output_key     条件 step 必须绑 output_key（引擎校验），跳过时下游拿到空串。
+# require_tools  edit 必须真调过——同步就是改文件，没 edit 就是空口报告。
+# 放在 merge 之后：此时 supplement 新增的副本也已由 doc 步补齐，一次同步全覆盖。
+[[steps]]
+id = "sync_code"
+description = "可选：把注释版副本里的注释写进真实源文件（只加注释不改逻辑）"
+role = "tutor"
+output_key = "sync_out"
+when_any = ["同步注释", "写进源码"]
+max_retries = 1
+tools = ["read", "edit"]
+require_tools = ["edit"]
+task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
+
+学员要求把学习期间生成的注释写进真实源码。读 `.latte/learn/{{plan_out}}/code/README.md`
+索引与各个注释版副本，按副本头部的原始出处（`file:line`）用 `edit` 把注释逐个应用
+到对应源文件：
+
+1. **只加/改注释，绝不改任何代码逻辑**——改动里除了注释行不许出现别的变化；
+2. 行号可能已漂移：以副本里的代码原文为锚点定位，对不上就 `read` 源文件重新找，
+   找不到锚点的条目跳过并在正文说明，不要硬插；
+3. 注释风格与所在文件已有注释一致（注释符号、语言、密度）；
+4. 副本头部的"学习副本 / 原始出处"元信息**不要**带进源码。
+
+正文列出改动文件清单 + 每处注释的一句话摘要（跳过项也列出原因），此外不输出别的。"""
+
+[steps.output_contract]
+min_chars = 30
 
 # ═══ 7. 掌握报告 ═════════════════════════════════════════════
 # tools     只读：报告步不许改账本（改了就掩盖真实掌握情况），也不许弹窗。
@@ -368,6 +475,8 @@ task = """读 `.latte/learn/{{plan_out}}/ledger.json`，输出掌握报告。
 **学员补充**：…（无则写"无"）
 
 **交付文档**：docs/learn/{{plan_out}}.md（学习材料存档：.latte/learn/{{plan_out}}/draft.md）
+
+**注释版代码副本**：.latte/learn/{{plan_out}}/code/（仅当该目录存在时输出此行）
 
 **建议**：一句总结。
 ```

@@ -148,30 +148,60 @@ v2 把教学载体从"chat 消息"改为"**持续演化的 markdown 文档**"：
 `docs/learn/<slug>.md`：merge 步把 draft.md 定稿（重排章节、合并补充内容、
 生成目录、去掉轮次痕迹），这是学习流程的交付物。
 
+### 4.5 注释版代码副本（2026-09-15 增补，2026-09-16 改为默认生成）
+
+annotate 步（默认必跑）为每个知识点的 `evidence` 生成
+`.latte/learn/<slug>/code/<知识点id>-<原文件名>`：逐字保留代码原文、
+只加中文注释（文件头标出处与"学习副本，源文件未改动"），外加 `README.md`
+索引。**只读源码、只写 `.latte/` 下的副本**——learn_loop 是只读类型
+（isolated=false、paths 严格校验不许新建仓库文件），副本目录不违反该假设；
+"不动源码"靠 annotate 步的 tools 白名单（只有 read + write，没有 edit）隔离。
+supplement 新增知识点时由 doc 步补生成对应副本。
+
+可选开关：主题带「同步注释」（或「写进源码」）时，merge 之后的 sync_code 步
+把副本里的注释写进真实源文件（只加注释、不改逻辑）——这一步**会修改仓库
+代码**，建议该任务开 isolated worktree（看板编辑弹窗可覆盖）。
+
 ## 5. Step 定义（workflow 层）
 
 ```
-plan → doc → read_confirm → quiz → supplement → merge → report
-              ↑__________|        |
-              ↑__QUIZ_FAIL__|     |__SUPPLEMENT（有补充）
-                            └ALL_DONE→ merge
+plan → annotate → doc → read_confirm → quiz → supplement → merge → [sync_code?] → report
+             ↑__________|        |
+             ↑__QUIZ_FAIL__|     |__SUPPLEMENT（有补充）
+                           └ALL_DONE→ merge
 ```
 
 | step | role | tools | 行为钉住（引擎字段） | 末行标记 |
 |---|---|---|---|---|
 | plan | tutor | read, code_graph, search, write | require_tools_any=[read,code_graph,search]；require_tools=[write]；output 仅 slug（max_chars） | — |
+| annotate | tutor | read, write | require_tools=[write]；无 edit/ask（不动源码靠工具隔离） | — |
 | doc | tutor | read, code_graph, search, write | require_tools=[write]；min_chars | 无状态行（正文含 draft.md 路径 + 本轮要点 + "看完点「开始答题」"） |
 | read_confirm | tutor | ask | require_tools=[ask]；tool_call_limits={ask=1} | — |
 | quiz | tutor | read, write, ask | require_tools=[ask,write]；tool_call_limits={ask=1}；require=[判分结果, 你选的是]；last_line_prefix_any=[QUIZ_PASS, QUIZ_FAIL]；loop_until=QUIZ_PASS；loop_back_routes={QUIZ_FAIL: doc}；max_iterations=10 | QUIZ_PASS / QUIZ_FAIL |
 | supplement | tutor | read, write, ask | require_tools=[ask,write]；tool_call_limits={ask=1}；last_line_prefix_any=[ALL_DONE, SUPPLEMENT]；loop_until=ALL_DONE；loop_back_to=doc；max_iterations=10 | ALL_DONE / SUPPLEMENT |
 | merge | tutor | read, write | require_tools=[write]；require=[docs/learn/] | — |
+| sync_code（可选） | tutor | read, edit | when_any=[同步注释, 写进源码]（未命中整步跳过）；require_tools=[edit] | — |
 | report | tutor | read | min_chars；require=[掌握进度] | — |
 
 ### 5.1 plan（基本沿用现有设计）
 
 取证 → 拆 3-6 个由浅入深的知识点 → 出题（选项自己乱序、禁 recommended）→
 写 plan.json（含 `doc_outline` / `doc_section`）与初始 ledger.json（round=0）。
-产出只输出 slug（下游拼路径，max_chars 硬约束保留）。
+产出只输出 slug（下游拼路径，max_chars 硬约束保留）。slug 推导时剔除
+「同步注释」/「写进源码」开关标记词——它们是 sync_code 步的触发开关，
+不是主题内容。
+
+小白友好（2026-09-16）：每个知识点必须带 `example` 最小具体例子（讲参数写
+"传什么进去 → 出来什么"，讲分支写"A 情况变成什么、B 情况变成什么"）；
+出题考场景理解（"在 GCC 下这段宏展开成什么"），不考"在第几行"式查表题。
+
+### 5.1b annotate（2026-09-15 增补，2026-09-16 改为默认）
+
+读 plan.json 的 `evidence` 清单 → 按行号区间读原文件 → 写注释版副本到
+`.latte/learn/<slug>/code/`（逐字保留代码、只加面向零基础的中文注释）
++ `README.md` 索引。tools 只给 read + write：**没有 edit，就不可能改到
+源文件**——只读约束落在工具隔离上，不靠 prompt 劝告。doc 步把副本路径
+标注进对应章节；merge 保留引用并在文末加索引节；report 附上副本路径。
 
 ### 5.2 doc（新）
 
@@ -179,6 +209,11 @@ plan → doc → read_confirm → quiz → supplement → merge → report
 （数据结构、运行原理、模块调用交互、流程图）+ 每个知识点一节，必须带
 `file:line` 出处与代码摘录（取证工具可用）。**正文直接输出 draft.md 全文**
 （学员在 chat 里读完，不必先找文件），文末给存档路径与「读完后点击开始答题」。
+
+小白友好硬要求（2026-09-16，反面教材：jemalloc 宏主题 draft——术语零解释、
+无最小例子、行号考据压过主线）：术语首次出现必须一句大白话解释；抽象描述
+后面必须紧跟具体例子（以 `example` 为底）；代码摘录后必须跟逐行讲解；
+每节末尾一句「人话总结」；考据性细节压进速查表/附录。
 
 被返工进入（prompt 里带 pending_feedback = quiz/supplement 的产出）：
 
@@ -237,6 +272,16 @@ plan → doc → read_confirm → quiz → supplement → merge → report
 - write 到 `docs/learn/<slug>.md`；draft.md 保留作存档。
 - 正文输出最终文档路径。
 
+### 5.6b sync_code（可选，2026-09-16 增补）
+
+仅当主题命中 `when_any`（「同步注释」/「写进源码」）时执行——默认只留
+`.latte/` 副本、不动仓库。读 `code/README.md` 索引与各注释版副本，按副本
+头部出处用 `edit` 把注释写进真实源文件：只加/改注释、绝不改逻辑，以代码
+原文为锚点容错行号漂移，风格跟随所在文件。tools 给 read + edit，
+require_tools=[edit] 钉"必须真改过"。放在 merge 之后：supplement 新增的
+副本此时已由 doc 步补齐，一次同步全覆盖。**本步会修改仓库代码**——
+learn_loop 类型 isolated=false，需要隔离时单个任务可在看板覆盖开 worktree。
+
 ### 5.7 report
 
 读 ledger.json 输出掌握报告（轮次、各点对错历史、补充清单、最终文档路径），
@@ -268,7 +313,8 @@ plan → doc → read_confirm → quiz → supplement → merge → report
 
 ```mermaid
 flowchart TD
-    A[plan: 取证+拆点+出题<br/>plan.json / ledger.json] --> B[doc: 写 draft.md<br/>正文给出文档路径与要点]
+    A[plan: 取证+拆点+出题<br/>plan.json / ledger.json] --> A2[annotate: 注释版代码副本<br/>→ .latte/learn/slug/code/]
+    A2 --> B[doc: 写 draft.md<br/>正文给出文档路径与要点]
     B --> C[read_confirm: ask<br/>「开始答题」按钮]
     C --> D[quiz: ask questions 批量出题<br/>判分+写账本]
     D -->|有错 QUIZ_FAIL| B2[doc: 增强答错点章节<br/>round+1]
@@ -277,7 +323,10 @@ flowchart TD
     E -->|其他: 补充内容 SUPPLEMENT| B3[doc: 新增补充章节<br/>round+1]
     B3 --> C
     E -->|没有了 ALL_DONE| F[merge: draft.md 定稿<br/>→ docs/learn/slug.md]
-    F --> G[report: 掌握报告]
+    F --> F1{主题带「同步注释」?}
+    F1 -->|是| F2[sync_code: 注释写进源文件<br/>只加注释不改逻辑]
+    F1 -->|否| G[report: 掌握报告]
+    F2 --> G
 ```
 
 （引擎视角：B2/B3 与 B 是同一个 doc step，返工由 quiz/supplement 的
@@ -293,6 +342,31 @@ loop_back 路由触发，实线箭头是串行顺序，回边是循环路由。�
    learn_loop step 形态的相关断言。
 4. plan 步 prompt 增加：选项自行乱序、`doc_outline`/`doc_section` 字段。
 5. quiz 步 prompt 增加：round 后缀绕过 AnswerLog、questions 批量出题。
+
+### 2026-09-15 增补：annotate 步（注释版代码副本）
+
+1. `config/workflows/learn_loop.toml` 在 plan 与 doc 之间插入 `annotate`
+   步（`when_any` 触发，同步 `.latte/workflows.d/` 副本）；plan/doc/merge/
+   report 四步 prompt 各加一条与 `code/` 副本衔接的条件指令。
+2. `learn_loop_workflow_structure` 的 step ids 与索引绑定更新，新增
+   annotate 的只读隔离断言。
+
+### 2026-09-16：annotate 默认化 + sync_code 开关 + 小白友好重写
+
+触发：jemalloc 宏主题实测 draft 是"考据报告"——术语零解释、无最小例子、
+行号考据压过主线，小白读不懂。
+
+1. annotate 改为**默认必跑**（去掉 `when_any`），注释版副本成为标配；
+   「要不要注释进源码」的开关移到新增的 `sync_code` 步（merge 之后，
+   `when_any = [同步注释, 写进源码]`，read+edit，只加注释不改逻辑）。
+2. plan 步：知识点新增 `example` 字段（最小具体例子）；出题改为考场景
+   理解、禁止行号级查表题。
+3. doc 步：小白友好硬要求——术语首次出现大白话解释、抽象描述必跟具体
+   例子、代码摘录必配逐行讲解、每节「人话总结」、考据细节压附录；
+   QUIZ_FAIL 返工要求换例子/类比重讲而非换措辞。
+4. 结构测试同步：ids 加 `sync_code`、annotate 断言改为无条件执行、
+   新增 sync_code 与小白友好断言。
+3. 引擎零改动：步级条件执行复用已有的 `when_any`/`is_enabled` 机制。
 
 ### v2（可选增强，需要动代码，单独评估）
 
