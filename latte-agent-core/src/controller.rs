@@ -2956,7 +2956,10 @@ async fn run_single_role_loop(
     // track pause locally and gate the next turn until Resume arrives.
     // Pause/Resume both flow through `input_rx`, so ordering is stable.
     let mut paused = false;
-
+    // Session 累计 token（单角色路径的预算记账）。`u64` 累加：一个长
+    // 会话轻易上千万 token，`u32` 会溢出（实测有过 22.19M 输入 token 的
+    // 单会话）。0 预算 = 不限，此时也不记账。
+    let mut session_tokens_used: u64 = 0;
     loop {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
@@ -3352,6 +3355,59 @@ async fn run_single_role_loop(
                                             sub_id: None,
                                         });
                                         let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
+                                        // ─── Session token 预算（单角色路径）───
+                                        // `session_token_budget` 此前**只**被
+                                        // `run_multi_role_loop` 消费（那里喂给
+                                        // `Supervisor`）；单角色这条路——也就是
+                                        // manager → delegate → workflow 的主路——
+                                        // 一行都没读它。CLI 与 UI 都把值传进
+                                        // `ChatControllerConfig` 了，行为上却等于
+                                        // 没配，而且不报错，纯死字段。
+                                        //
+                                        // 偏偏这条路最容易失控：工具循环是
+                                        // deadline-only（无轮次上限）、delegate
+                                        // 没有总预算、workflow 的按墙钟刹车机制
+                                        // 已废弃且没有替代，聚合起来没有任何上限。
+                                        //
+                                        // 为什么按 token 而不是墙钟：token 能区分
+                                        // 「后端卡死」（不涨）与「任务本身就重」
+                                        // （在涨），墙钟不能——这正是当初那个
+                                        // `WORKFLOW_BUDGET_PER_UNIT_SECS` 反复误杀
+                                        // 健康长任务、最终被移除的原因。
+                                        //
+                                        // 到顶按**自动暂停**处理（与多角色
+                                        // supervisor 同语义），不是硬杀 session：
+                                        // 已产出的成果全部保留，用户按 ▶ 即续跑。
+                                        // `0` = 不限（默认，向后兼容）。
+                                        if config.session_token_budget > 0 {
+                                            let budget = u64::from(config.session_token_budget);
+                                            // 只记**本轮增量**（`usage_*` 是 runner
+                                            // 的累计量，直接累加累计值会按 O(N²)
+                                            // 膨胀——多角色路径踩过这个坑，见
+                                            // `Supervisor::observe` 的注释）。
+                                            let think_delta = usage_after
+                                                .thinking_tokens
+                                                .saturating_sub(usage_before.thinking_tokens);
+                                            session_tokens_used = session_tokens_used
+                                                .saturating_add(u64::from(in_delta))
+                                                .saturating_add(u64::from(out_delta))
+                                                .saturating_add(u64::from(think_delta));
+                                            if session_tokens_used > budget {
+                                                paused = true;
+                                                let reason = format!(
+                                                    "token budget exceeded ({session_tokens_used} / {budget})"
+                                                );
+                                                let _ = event_tx.send(ChatEvent::Paused {
+                                                    reason: reason.clone(),
+                                                });
+                                                let _ = event_tx.send(ChatEvent::Status {
+                                                    message: format!(
+                                                        "⏸ 已达 session token 预算（{session_tokens_used} / {budget}）—— 自动暂停。\
+                                                         已产出的成果全部保留：按 ▶ 继续，或调大 session_token_budget 后再续跑。"
+                                                    ),
+                                                });
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         let _ = event_tx.send(ChatEvent::RoleFinished {
@@ -3588,9 +3644,12 @@ async fn build_runner(
         // （角色 prompt 与 allowed_tools 不对齐时的软拒绝 + 申请通道）。
         register_request_tool(tm.clone())
             .map_err(|e| AgentError::Tool(format!("register request_tool '{role_id}': {e}")))?;
-        // Any role with "delegate" in allowed_tools gets the delegate tool registered,
-        // enabling nested subsessions (roleA delegates to roleB, roleB can also delegate)
-        if role.allowed_tools.iter().any(|t| t == "delegate") {
+        // Any role with "delegate" in allowed_tools gets the delegate tool
+        // registered. 这是**顶层** runner，委派深度 = 0；派出的 specialist
+        // 由 `register_delegate_tool` 的 handler 递归注册（深度 +1），深度
+        // 门见 [`max_delegate_depth`]。`max_delegate_depth() == 0` 表示
+        // 全局关闭委派，连顶层 manager 也不给这个工具。
+        if role.allowed_tools.iter().any(|t| t == "delegate") && max_delegate_depth() > 0 {
             // 必须是真 session_id —— subsession_store 用它当落盘目录名。
             // 之前这里用 `cwd.to_string_lossy()` 凑数，cwd 含 `/` 会被
             // 路径安全检查拒绝，整路 subagent 退化到内存。
@@ -3615,6 +3674,8 @@ async fn build_runner(
                 std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 default_max_delegates(),
                 main_topic.clone(),
+                // 顶层 manager 的委派深度。
+                0,
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -5761,6 +5822,40 @@ pub fn default_max_delegates() -> u32 {
         None => 0,
     }
 }
+/// delegate 递归深度上限的内置默认值。
+///
+/// 语义：持有 delegate 工具的 runner 自身深度为 `d`（顶层 manager = 0），
+/// 它**能再派**（= 拿到 delegate 工具）的判据是 `d < max_depth`。默认 2
+/// 即：manager(0) → specialist(1) → specialist(2, 叶子)，共两级委派。
+///
+/// 为什么需要它：此前 delegate 派出的 specialist 根本没被注册 delegate
+/// 工具（`build_tool_manager_at` 只装 builtin，delegate 不是 builtin），
+/// 于是 `tools = ["delegate"]` 的 8 个 `*_leader` 角色被派到时拿到的是
+/// 一个**零工具**的 manager——两层 leader 架构在 delegate 路径上完全失效。
+/// 补上递归注册就必须同时补深度门，否则深度无界（对齐 oh-my-pi 的
+/// `canSpawnAtDepth(maxRecursionDepth=2, taskDepth)` 与 deepseek-harness
+/// 的 `tool-subagent` `maxDepth=3`）。
+///
+/// 到顶时的处理是**不注册这个工具**（模型 schema 里根本看不到它），而不是
+/// 注册了再在 handler 里报错——照 oh-my-pi 的做法（到顶直接隐藏 task
+/// 工具）。让模型看见一个必然失败的工具只会白烧往返。
+pub const DEFAULT_MAX_DELEGATE_DEPTH: u8 = 2;
+
+/// delegate 递归深度上限。env `LATTE_AGENT_DELEGATE_MAX_DEPTH` 覆盖，
+/// 钳在 `0..=5`；`0` = 完全禁止委派（连顶层 manager 也不给 delegate）。
+///
+/// 上钳 5：每一级都是一整个独立 subsession（自己的上下文、自己的工具
+/// 循环），深度是**乘性**成本，不是加性。
+pub fn max_delegate_depth() -> u8 {
+    match std::env::var("LATTE_AGENT_DELEGATE_MAX_DEPTH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u8>().ok())
+    {
+        Some(n) => n.min(5),
+        None => DEFAULT_MAX_DELEGATE_DEPTH,
+    }
+}
+
 /// Build the `delegate` tool description. Content goes straight into
 /// `Tool::builder(... description ...)` at registration time, not into
 /// the system prompt — the model sees it alongside the schema. The role
@@ -7911,6 +8006,56 @@ pub(crate) fn specialist_timeout_secs(model_timeout: Option<u64>) -> u64 {
         .unwrap_or(DEFAULT_UI_DELEGATE_TIMEOUT_SECS)
 }
 
+/// `register_delegate_tool` 的**类型擦除**入口，专门给递归调用用。
+///
+/// 为什么必须有：`register_delegate_tool` 的 handler 在构建 specialist 时
+/// 要再注册一层 delegate（让 specialist 也能派），这是 async 递归——直接
+/// `.await` 会让 future 类型无限自嵌套。而**仅 `Box::pin` 还不够**：rustc
+/// 推断 `impl Future: Send` 时同样会绕回它自己，报
+/// `E0283 type annotations needed: cannot satisfy impl Future: Send`。把
+/// `+ Send` 写进**返回类型声明**后，递归点直接采信声明、不再推断，环被
+/// 打断（这是 async 递归的标准解法）。
+#[allow(clippy::too_many_arguments)]
+fn register_delegate_tool_boxed<'a>(
+    tm: &'a Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    merged: &'a AgentConfig,
+    resolver: &'a ModelResolver,
+    default_params: GenerateParams,
+    event_tx: broadcast::Sender<ChatEvent>,
+    cwd: PathBuf,
+    subsession_store: Arc<SubsessionStore>,
+    session_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    turn_cancel_flag: Arc<AtomicBool>,
+    advisor_gate: Option<GateConfig>,
+    plan_stage: SharedPlanStage,
+    agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
+    delegate_counter: Arc<AtomicU32>,
+    max_delegates: u32,
+    main_topic: Arc<parking_lot::Mutex<String>>,
+    depth: u8,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+    Box::pin(register_delegate_tool(
+        tm,
+        merged,
+        resolver,
+        default_params,
+        event_tx,
+        cwd,
+        subsession_store,
+        session_id,
+        cancel_flag,
+        turn_cancel_flag,
+        advisor_gate,
+        plan_stage,
+        agent_pause_gate,
+        delegate_counter,
+        max_delegates,
+        main_topic,
+        depth,
+    ))
+}
+
 async fn register_delegate_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -7941,7 +8086,11 @@ async fn register_delegate_tool(
     // 委派返回审查拿它当「是否符合预期」的准绳。注册时取不到值——它每轮
     // 都变，所以传句柄、在 handler 里按次读取。
     main_topic: Arc<parking_lot::Mutex<String>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    // 本 runner 自身的委派深度：顶层 manager = 0，被 delegate 派出的
+    // specialist = 1，以此类推。handler 里递归注册子级 delegate 时 +1，
+    // 深度门见 [`max_delegate_depth`]。
+    depth: u8,
+) -> Result<(), String> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
 
@@ -8041,6 +8190,9 @@ async fn register_delegate_tool(
         let ledger = ledger.clone();
         // 每次 specialist 创建时 attach。
         let agent_pause_gate = agent_pause_gate.clone();
+        // 子级委派深度：本 runner 深度 +1。u8 是 Copy，`move` 闭包每次
+        // invocation 都能重新取到同一个值。
+        let child_depth = depth.saturating_add(1);
         // 主会话诉求句柄：每次 invocation 现读（它每轮都变）。
         let main_topic = Arc::clone(&main_topic);
         Box::pin(async move {
@@ -8065,30 +8217,30 @@ async fn register_delegate_tool(
                 return Err(tool_err(msg));
             }
 
-            // 派发幂等：同身份（role + task）的派发不做第二遍。
+            // 派发互斥：同身份（role + task）不并发跑两条。
             // 位置在**计数之前**：重复派发不该消耗 max_delegates 预算。
             // 也在分配 subsession / 发 DelegateStarted 之前——拒绝不留
             // 任何副作用（否则 UI 上留下一个永远转圈的分派气泡）。
+            //
+            // 只做互斥、**不缓存结果**（`begin_exclusive` 而非 `begin`）：
+            // 这与 `workflow` 工具的选择一致，理由也逐字相同——同一
+            // (role, task) 再派一遍常常是**有意的**（上一遍改错了、期间
+            // 文件变了、下游验证要求重做），而 delegate 有真实写文件副
+            // 作用，复用旧摘要会掩盖「这次其实什么都没跑」。
+            //
+            // 此前用的是带结果缓存的 `begin()`，且 `Entry::Done` 永不失效
+            // （无 TTL、不随新一轮用户输入清空）：`delegate(programmer,
+            // "修复构建失败")` → 改错了 → 同一条 task 再派 → 命中
+            // `Begin::Done` 打一条「↩ 复用已完成的委派结果」，**零工作量
+            // 返回旧的成功文本**。返工环就此被静默截断——正是 workflow
+            // 路径当初特意加固过的那个失败模式。
             let dispatch_key =
                 crate::dispatch_ledger::DispatchLedger::delegate_key(&role_id, &task);
-            let inflight_guard = match ledger.begin(dispatch_key) {
-                crate::dispatch_ledger::Begin::Fresh(g) => g,
-                crate::dispatch_ledger::Begin::InFlight => {
-                    return Err(tool_err(format!(
-                        "对 '{role_id}' 的这条委派**正在执行中**（同一 role + task）。\
-                         不要重复派发：等它返回即可。若确实需要不同的工作，请修改 task 描述。"
-                    )));
-                }
-                crate::dispatch_ledger::Begin::Done(prev) => {
-                    // 已经干过一遍且成功了 —— 直接复用，省掉整次
-                    // specialist 往返（几十秒到十几分钟）与重复副作用。
-                    let _ = event_tx.send(ChatEvent::Status {
-                        message: format!(
-                            "↩ 复用已完成的委派结果（{role_id}）：同一 role + task 不重复派发"
-                        ),
-                    });
-                    return Ok(serde_json::Value::String(prev));
-                }
+            let Some(inflight_guard) = ledger.begin_exclusive(dispatch_key) else {
+                return Err(tool_err(format!(
+                    "对 '{role_id}' 的这条委派**正在执行中**（同一 role + task）。\
+                     不要重复派发：等它返回即可。若确实需要不同的工作，请修改 task 描述。"
+                )));
             };
 
             // 单 session 内 delegate 计数检查：超过 max_delegates 直接拒。
@@ -8199,6 +8351,63 @@ async fn register_delegate_tool(
                     }
                 }
             };
+            // request_tool：与 `build_runner` 对齐——所有带工具的角色都
+            // 应有「申请临时使用未授权工具」的软拒绝通道。此前 delegate
+            // 派出的 specialist 唯独没有它，角色 prompt 与 allowed_tools
+            // 不对齐时只能硬碰壁，连申请的出口都没有。
+            if let Some(tm) = &specialist_tm {
+                register_request_tool(tm.clone()).map_err(|e| {
+                    tool_err(format!("register request_tool for '{role_id}': {e}"))
+                })?;
+            }
+            // delegate 递归注册（P0 修复）。
+            //
+            // `delegate` **不是 builtin 工具**（`builtin_tool_packages()`
+            // 里没有它，全靠本函数注册），而这里的 specialist 是用
+            // `build_tool_manager_at` 手工装的——它只注册 builtin + 
+            // code_graph，然后把 allowlist 之外的全部 unregister。后果：
+            // `tools = ["delegate"]` 的 8 个 `*_leader` 角色被派到时，拿到
+            // 的是一个**零工具**的 manager，两层 leader 架构在 delegate
+            // 路径上完全失效；任何声明了 delegate 的 specialist 也都静默
+            // 丢掉这个工具（`build_runner` 那句「roleB can also delegate」
+            // 的注释只对主 chat runner 成立）。
+            //
+            // 深度到顶时**不注册**——模型 schema 里根本看不到这个工具，
+            // 照 oh-my-pi「`canSpawnAtDepth` 到顶直接隐藏 task 工具」的
+            // 做法。注册了再在 handler 里报错只会让模型白烧往返去试。
+            if let Some(tm) = &specialist_tm {
+                let wants_delegate = role.allowed_tools.iter().any(|t| t == "delegate");
+                if wants_delegate && child_depth < max_delegate_depth() {
+                    // 走 `register_delegate_tool_boxed`（而不是直接
+                    // `Box::pin(register_delegate_tool(..))`）：async 递归
+                    // 既要类型擦除、又要**声明** `Send`，否则 rustc 推断
+                    // `impl Future: Send` 时绕回自己报 E0283。理由详见该
+                    // 包装函数的文档注释。
+                    register_delegate_tool_boxed(
+                        tm,
+                        &merged,
+                        &resolver,
+                        default_params.clone(),
+                        event_tx.clone(),
+                        cwd.clone(),
+                        subsession_store.clone(),
+                        session_id.clone(),
+                        Arc::clone(&cancel_flag),
+                        Arc::clone(&turn_cancel_flag),
+                        advisor_gate.clone(),
+                        plan_stage.clone(),
+                        agent_pause_gate.clone(),
+                        Arc::clone(&delegate_counter),
+                        max_delegates,
+                        Arc::clone(&main_topic),
+                        child_depth,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tool_err(format!("register delegate for '{role_id}': {e}"))
+                    })?;
+                }
+            }
             // 子会话 todo：specialist 声明了 "todo" 工具时，注册有状态
             // 包装版（replace 覆盖 builtin 纯函数版）——每个子会话一份
             // **独立**状态（不与父会话/并行兄弟子会话共享清单），广播
@@ -8573,11 +8782,10 @@ async fn register_delegate_tool(
                         sub_id: sub_id.clone(),
                         wf_id: None,
                     });
-                    // 只缓存成功：失败可能是瞬时的（模型不可用），换个
-                    // 时机重试是合理的，重复失败由 max_delegates 与
-                    // supervisor 兜。guard 未 complete 就 drop → 在飞
-                    // 标记自动摘除，同身份可重试。
-                    inflight_guard.complete(response.clone());
+                    // 台账只做互斥、不缓存结果（见上面 `begin_exclusive`
+                    // 处的说明）：guard 在此 drop → 在飞标记摘除，同身份
+                    // 下一次派发会**真的重跑**。这是返工环能成立的前提。
+                    drop(inflight_guard);
                     Ok(serde_json::Value::String(response))
                 }
                 Err(e) => {
@@ -11802,16 +12010,33 @@ mod tests {
         assert_eq!(out["question"], "q");
     }
 
-    /// 派发幂等：同一 (role, task) 的第二次 delegate 直接复用上次结果，
-    /// **不再打模型**、不再产生副作用。
+    /// 同一 (role, task) 的第二次 delegate **必须真的重跑**，不得复用
+    /// 上一次的结果。
     ///
-    /// 此前没有任何一道闸管这件事：`dedupe_native_tool_calls` 只管同一
-    /// 条响应内；`LoopDetector` 每轮重建、阈值是同轮连续 3 次；
-    /// `Supervisor` 看的是被压成不带参数的字符串 `"delegate"`（既误伤
-    /// 连续 3 轮的合法分工，又看不见同轮重复）。一次委派几十秒到十几
-    /// 分钟，白跑一遍是实打实的代价。
+    /// 这条契约在 2026-09 被改过一次方向，原因如下（原测试名是
+    /// `duplicate_delegate_reuses_previous_result_without_calling_model_again`）。
+    ///
+    /// 旧行为：台账用 `DispatchLedger::begin()`，成功后写 `Entry::Done`
+    /// 永久缓存（无 TTL、不随新一轮用户输入清空），第二次同身份派发直接
+    /// 返回旧文本 + 一条「↩ 复用已完成的委派结果」Status。动机是省掉
+    /// 一次几十秒到十几分钟的白跑。
+    ///
+    /// 为什么必须反过来：这条捷径**静默截断了所有返工环**。真实返工的
+    /// 形状是 `delegate(programmer, "修复构建失败")` → specialist 改完 →
+    /// manager 跑 `bash cargo build` 发现还是错 → 用同一条 task 再派。
+    /// 这一整套发生在 manager **同一个 turn 的工具循环里**，于是第二次
+    /// 派发命中缓存：零工作量返回上一次那份「已修复」的成功文本，manager
+    /// 以为修好了。delegate 会写文件，复用旧摘要正好掩盖「这次其实什么
+    /// 都没跑」——这与 `workflow` 工具当初选择 `begin_exclusive` 时写下的
+    /// 理由逐字相同，只是当时没有同步到 delegate 路径。
+    ///
+    /// 省下的白跑用别的闸兜：并发同身份仍被在飞标记挡住（`begin_exclusive`
+    /// 返回 `None`，见 `dispatch_ledger` 的
+    /// `concurrent_same_dispatch_is_rejected_while_in_flight`），而模型
+    /// 无意义地反复重发同一条调用由 `agent.rs` 的 `LoopDetector`（连击 /
+    /// 打转）熔断。用「可能白跑一次」换「不再把假成功喂回 manager」。
     #[tokio::test]
-    async fn duplicate_delegate_reuses_previous_result_without_calling_model_again() {
+    async fn duplicate_delegate_actually_reruns_instead_of_reusing_stale_result() {
         use crate::config::{ModelCatalog, ModelDef};
         use crate::role::RoleTemplate;
         use wiremock::matchers::{method, path};
@@ -11907,6 +12132,8 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicU32::new(0)),
             0,
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            // 顶层深度：测试里注册的就是 manager 那一层。
+            0,
         )
         .await
         .expect("register delegate");
@@ -11920,20 +12147,23 @@ mod tests {
         let calls_after_first = server.received_requests().await.unwrap().len();
         assert!(calls_after_first >= 1, "首次必须真的打了模型");
 
-        // 第二次同身份派发：结果一致，且模型请求数**没有增加**。
+        // 第二次同身份派发：必须**真的重跑**（模型请求数增加），且不得
+        // 出现任何「复用」提示。
         let second = tm
             .execute("delegate", args.clone(), None)
             .await
-            .expect("重复派发应直接复用，不该报错");
-        assert_eq!(first, second, "复用的结果必须与首次一致");
-        assert_eq!(
-            server.received_requests().await.unwrap().len(),
-            calls_after_first,
-            "重复派发不得再打模型"
+            .expect("重复派发应正常重跑，不该报错");
+        assert!(
+            server.received_requests().await.unwrap().len() > calls_after_first,
+            "同身份的第二次派发必须真的再打模型（不得复用旧结果）"
+        );
+        assert!(
+            !second.as_str().unwrap_or_default().is_empty(),
+            "重跑必须有实际产出"
         );
 
-        // 复用要对用户可见（Status），且**不能**再发一对
-        // DelegateStarted/Finished（否则 UI 上凭空多一条分派记录）。
+        // 重跑要像一次正常派发：两对 DelegateStarted，且**不得**再有
+        // 「复用已完成的委派结果」这条 Status。
         let mut started = 0usize;
         let mut reuse_notices = 0usize;
         while let Ok(ev) = rx.try_recv() {
@@ -11945,10 +12175,12 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(started, 1, "只应有首次派发的 DelegateStarted");
-        assert_eq!(reuse_notices, 1, "复用要发一条 Status 让用户看见");
+        assert_eq!(started, 2, "两次派发各自都应发 DelegateStarted");
+        assert_eq!(reuse_notices, 0, "不得再有任何复用提示");
 
-        // 换一个 task → 不该被挡住（会真的再打模型）。
+        let calls_after_second = server.received_requests().await.unwrap().len();
+
+        // 换一个 task → 同样正常派发。
         let other = tm
             .execute(
                 "delegate",
@@ -11958,10 +12190,289 @@ mod tests {
             .await
             .expect("不同任务应正常派发");
         assert!(
-            server.received_requests().await.unwrap().len() > calls_after_first,
+            server.received_requests().await.unwrap().len() > calls_after_second,
             "不同任务必须真的派发出去"
         );
         assert!(!other.as_str().unwrap_or_default().is_empty());
+    }
+
+    /// 从一次模型请求体里抽出下发的工具名清单（OpenAI 协议
+    /// `tools[*].function.name`，兼容扁平 `tools[*].name`）。
+    ///
+    /// 为什么按结构解析而不是 grep 整个 body：specialist 的 system prompt
+    /// 里本来就可能出现 "delegate" 字样（角色 prompt / tool usage 段），
+    /// 子串匹配会假阳性。要断言的是「模型 schema 里到底有没有这个工具」。
+    fn tool_names_in_request(body: &[u8]) -> Vec<String> {
+        let v: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(_) => return vec![],
+        };
+        v.get("tools")
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        t.pointer("/function/name")
+                            .or_else(|| t.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 搭一个只含 `stub` 模型 + 指定角色的配置，模型指向 wiremock。
+    fn delegate_test_config(
+        base_url: String,
+        roles: Vec<crate::role::RoleTemplate>,
+    ) -> AgentConfig {
+        use crate::config::{ModelCatalog, ModelDef};
+        AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url,
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: roles.into_iter().map(|r| (r.id.clone(), r)).collect(),
+        }
+    }
+
+    fn delegate_test_role(id: &str, tools: Vec<String>) -> crate::role::RoleTemplate {
+        crate::role::RoleTemplate {
+            id: id.into(),
+            name: id.into(),
+            category: "planning".into(),
+            model_tier: "standard".into(),
+            model_chain: vec![],
+            prompt_file: None,
+            temperature: None,
+            tools,
+            icon: String::new(),
+            skills: vec![],
+            code_paths: vec![],
+            description: String::new(),
+        }
+    }
+
+    /// P0：delegate 派出的 specialist 必须**真的拿到** `delegate` 与
+    /// `request_tool`；并且深度到顶时 `delegate` 从 schema 里消失。
+    ///
+    /// 修复前的实况：`delegate` 不是 builtin 工具（`builtin_tool_packages()`
+    /// 里没有它，只由 `register_delegate_tool` 注册），而 delegate handler
+    /// 构建 specialist 走的是 `build_tool_manager_at` —— 它注册 builtin +
+    /// code_graph，然后把 allowlist 之外的**全部** unregister。于是：
+    ///
+    /// - `tools = ["delegate"]` 的 8 个 `*_leader` 角色（architect_leader、
+    ///   designer_leader、devops_leader、pm_leader、programmer_leader、
+    ///   security_leader、tech_writer_leader、tester_leader）被派到时拿到
+    ///   的是一个**零工具**的 manager —— 两层 leader 架构在 delegate 路径
+    ///   上完全失效，leader 只能空口说「我需要委派给 X」；
+    /// - 任何声明了 delegate 的 specialist（programmer、architect_system、
+    ///   tester_whitebox…）都静默丢掉这个工具；
+    /// - `build_runner` 里那句注释「roleA delegates to roleB, roleB can
+    ///   also delegate」只对**主 chat runner** 成立，对每一个被派出去的
+    ///   子 agent 都是假的；
+    /// - `register_request_tool` 也没接，specialist 连「申请临时用某个
+    ///   未授权工具」的逃生口都没有。
+    ///
+    /// 补上递归注册就必须同时立深度门，否则深度无界（对齐 oh-my-pi 的
+    /// `maxRecursionDepth=2` 与 deepseek-harness 的 `maxDepth=3`）。到顶
+    /// 的表达方式是**不注册**——模型 schema 里看不到，而不是看得到却必然
+    /// 失败（那只会白烧往返）。
+    #[tokio::test]
+    async fn delegated_specialist_gets_delegate_and_request_tool_until_depth_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let body = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "架构负责人结论：这项工作需要拆成三块并分派给下级专家，理由与证据如下，长度足够越过 advisor 的短输出阈值。" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string();
+
+        // 深度门用到 env，与其他读 env 的测试串行。
+        let _g = lock_env();
+
+        // ── 情形 A：depth 0 → child_depth 1 < max 2，specialist 应拿到
+        //    delegate + request_tool。
+        std::env::set_var("LATTE_AGENT_DELEGATE_MAX_DEPTH", "2");
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(body.clone())),
+            )
+            .await;
+        let merged = delegate_test_config(
+            server.uri(),
+            vec![delegate_test_role("architect_leader", vec!["delegate".into()])],
+        );
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(64);
+        register_delegate_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "depth-test".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            fresh_plan_stage(),
+            crate::pause_gate::AgentPauseGate::new("test"),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            0,
+        )
+        .await
+        .expect("register delegate");
+
+        tm.execute(
+            "delegate",
+            serde_json::json!({ "role": "architect_leader", "task": "评估整体分层并把子问题分给下级" }),
+            None,
+        )
+        .await
+        .expect("派发 architect_leader 应成功");
+
+        let reqs = server.received_requests().await.unwrap();
+        let all_tools: Vec<String> = reqs
+            .iter()
+            .flat_map(|r| tool_names_in_request(&r.body))
+            .collect();
+        assert!(
+            all_tools.iter().any(|n| n == "delegate"),
+            "specialist 的模型请求里必须带 delegate 工具（否则 *_leader 角色是零工具空壳），实际下发：{all_tools:?}"
+        );
+        assert!(
+            all_tools.iter().any(|n| n == "request_tool"),
+            "specialist 必须有 request_tool 逃生口，实际下发：{all_tools:?}"
+        );
+
+        // ── 情形 B：max depth = 1 → child_depth 1 不 < 1，delegate 到顶，
+        //    specialist 的 schema 里不该再有它（但 request_tool 仍在）。
+        std::env::set_var("LATTE_AGENT_DELEGATE_MAX_DEPTH", "1");
+        let server2 = wiremock::MockServer::start().await;
+        server2
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(body)),
+            )
+            .await;
+        let merged2 = delegate_test_config(
+            server2.uri(),
+            vec![delegate_test_role("architect_leader", vec!["delegate".into()])],
+        );
+        let resolver2 = ModelResolver::from_config(&merged2).expect("resolver");
+        let tm2 = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx2, _rx2) = broadcast::channel(64);
+        register_delegate_tool(
+            &tm2,
+            &merged2,
+            &resolver2,
+            GenerateParams::default(),
+            event_tx2,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "depth-test-cap".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            fresh_plan_stage(),
+            crate::pause_gate::AgentPauseGate::new("test"),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            0,
+        )
+        .await
+        .expect("register delegate");
+
+        tm2.execute(
+            "delegate",
+            serde_json::json!({ "role": "architect_leader", "task": "评估整体分层并把子问题分给下级" }),
+            None,
+        )
+        .await
+        .expect("派发 architect_leader 应成功");
+
+        let reqs2 = server2.received_requests().await.unwrap();
+        let all_tools2: Vec<String> = reqs2
+            .iter()
+            .flat_map(|r| tool_names_in_request(&r.body))
+            .collect();
+        assert!(
+            !all_tools2.iter().any(|n| n == "delegate"),
+            "深度到顶时 delegate 必须从 specialist 的 schema 里消失（而不是留着必然失败），实际下发：{all_tools2:?}"
+        );
+        assert!(
+            all_tools2.iter().any(|n| n == "request_tool"),
+            "深度到顶只该摘掉 delegate，request_tool 仍应在：{all_tools2:?}"
+        );
+
+        std::env::remove_var("LATTE_AGENT_DELEGATE_MAX_DEPTH");
+    }
+
+    /// 深度门的读取与钳制：env 覆盖、越界上钳到 5、`0` = 全局禁止委派。
+    #[test]
+    fn max_delegate_depth_respects_env_and_clamps() {
+        let _g = lock_env();
+        std::env::remove_var("LATTE_AGENT_DELEGATE_MAX_DEPTH");
+        assert_eq!(max_delegate_depth(), DEFAULT_MAX_DELEGATE_DEPTH);
+
+        std::env::set_var("LATTE_AGENT_DELEGATE_MAX_DEPTH", "3");
+        assert_eq!(max_delegate_depth(), 3);
+
+        // 越界上钳：深度是**乘性**成本（每级一整个独立 subsession）。
+        std::env::set_var("LATTE_AGENT_DELEGATE_MAX_DEPTH", "99");
+        assert_eq!(max_delegate_depth(), 5);
+
+        // 0 = 完全禁止委派，连顶层 manager 也不给 delegate 工具。
+        std::env::set_var("LATTE_AGENT_DELEGATE_MAX_DEPTH", "0");
+        assert_eq!(max_delegate_depth(), 0);
+
+        // 垃圾值回落默认，不 panic。
+        std::env::set_var("LATTE_AGENT_DELEGATE_MAX_DEPTH", "abc");
+        assert_eq!(max_delegate_depth(), DEFAULT_MAX_DELEGATE_DEPTH);
+
+        std::env::remove_var("LATTE_AGENT_DELEGATE_MAX_DEPTH");
     }
 
     /// 阻塞 ask 收到答案必须**立刻**落盘，然后同一问题再问时直接回放
@@ -12619,6 +13130,8 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicU32::new(0)),
             0,
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            // 顶层深度：测试里注册的就是 manager 那一层。
+            0,
         )
         .await
         .expect("register delegate");
@@ -12760,6 +13273,8 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicU32::new(0)),
             0,
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            // 顶层深度：测试里注册的就是 manager 那一层。
+            0,
         )
         .await
         .expect("register delegate");
@@ -14104,6 +14619,167 @@ require = ["永远不可能出现的验收字符串"]
 
         controller.abort().await;
         std::env::remove_var("LATTE_AGENT_AUTO_REMEDIATE_MAX");
+    }
+
+    /// P2：`session_token_budget` 在**单角色**路径上必须真的生效。
+    ///
+    /// 修复前它是纯死字段：只有 `run_multi_role_loop` 把它喂给
+    /// `Supervisor`，而 `run_single_role_loop`（manager → delegate →
+    /// workflow 的主路）一行都没读。CLI 的 `--session-token-budget` 与 UI
+    /// 传进来的值在这条路上等于没配，还不报错。
+    ///
+    /// 偏偏这条路最需要预算：工具循环 deadline-only（无轮次上限）、
+    /// delegate 无总预算、workflow 的墙钟刹车已废弃且没有替代。
+    ///
+    /// 断言的是「到顶自动暂停」而不是「硬杀 session」——已产出的成果必须
+    /// 保留，用户按 ▶ 能续跑。
+    #[tokio::test]
+    async fn single_role_session_token_budget_auto_pauses() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        serde_json::json!({
+                            "id": "chatcmpl-test",
+                            "object": "chat.completion",
+                            "created": 0,
+                            "model": "test",
+                            "choices": [{
+                                "index": 0,
+                                "message": { "role": "assistant", "content": "占位长回答，避免 advisor 短输出 gate 干扰测试断言。" },
+                                "finish_reason": "stop"
+                            }],
+                            // 本轮 15 token，远超下面配的预算 1。
+                            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                        })
+                        .to_string(),
+                    )),
+            )
+            .await;
+
+        let agent_config = Arc::new(AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-standard".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: [(
+                "manager".to_string(),
+                RoleTemplate {
+                    id: "manager".into(),
+                    name: "manager".into(),
+                    category: "planning".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: "👔".into(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let resolver = Arc::new(ModelResolver::from_config(&agent_config).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+
+        let cfg = ControllerConfig {
+            task_id: None,
+            // 单角色：roles 只有一个 → 走 run_single_role_loop。
+            roles: vec!["manager".to_string()],
+            initial_prompt: None,
+            max_rounds: 0,
+            // 预算 1 token：任何一轮都会立刻越界。
+            session_token_budget: 1,
+            agent_config,
+            model_resolver: resolver,
+            default_params: GenerateParams::default(),
+            primary_model_id: None,
+            initial_tier: None,
+            initial_history: vec![],
+            cwd: dir.path().to_path_buf(),
+            subsession_store: Arc::new(crate::subsession::SubsessionStore::new()),
+            advisor_monitor: AdvisorMonitorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            stream_mode: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_delegates_per_session: crate::controller::default_max_delegates(),
+            session_id: String::new(),
+        };
+
+        let controller = ChatController::new(256);
+        let mut rx = controller.spawn(cfg).await;
+        controller.submit_input("随便问一句").await;
+
+        // 本轮的答复必须先正常产出（预算是**事后**刹车，不吞成果），
+        // 然后才是 Paused + 一条给用户看的 Status。
+        let mut saw_turn = false;
+        let mut saw_paused: Option<String> = None;
+        let mut saw_status: Option<String> = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(ChatEvent::RoleTurn { is_complete, .. })) if is_complete => saw_turn = true,
+                Ok(Ok(ChatEvent::Paused { reason })) => saw_paused = Some(reason),
+                Ok(Ok(ChatEvent::Status { message }))
+                    if message.contains("已达 session token 预算") =>
+                {
+                    saw_status = Some(message)
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {}
+                Err(_) => {}
+            }
+            if saw_paused.is_some() && saw_status.is_some() {
+                break;
+            }
+        }
+
+        assert!(saw_turn, "预算刹车不得吞掉本轮已产出的回复");
+        let reason = saw_paused.expect("超预算必须自动暂停（发 ChatEvent::Paused）");
+        assert!(
+            reason.contains("token budget exceeded"),
+            "暂停原因要点明是预算：{reason}"
+        );
+        let msg = saw_status.expect("要发一条 Status 让用户知道为什么停了");
+        assert!(
+            msg.contains("按 ▶ 继续") || msg.contains("session_token_budget"),
+            "Status 要给出可执行的下一步：{msg}"
+        );
+
+        controller.abort().await;
     }
 
     /// 额度上限的环境变量解析与默认值。

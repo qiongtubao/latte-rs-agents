@@ -205,6 +205,7 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
 | `LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS` | 90 | advisor 对 delegate/workflow 返回做**单次审查**的超时（秒），钳在 `10..=600`。超时按「未审直接放行」降级，所以这是「一次审查值多少钱」的预算。实测事故：默认 90s 撞上常态 >120s 的慢模型，一个会话里 4 次静默放行——审查门禁形同虚设。也可写 `[advisor] delegate_review_timeout_secs`；若审查和干活共用慢模型池，要么调大，要么给 advisor 单独配快模型 |
 | `LATTE_AGENT_ADVISOR_RETURN_MAX_REDO` | 1 | workflow speaker 的返回被 advisor 判 intervene/terminate 时的**重做上限**（每次重做都是全新 subagent），钳到硬顶 3。也可写 `[advisor] return_max_redo` |
 | `LATTE_MAX_DELEGATES_PER_SESSION` | 0（不限） | 单 session 累计 delegate 调用次数上限 |
+| `LATTE_AGENT_DELEGATE_MAX_DEPTH` | 2 | delegate **递归深度**上限，钳在 `0..=5`；`0` = 完全禁止委派（连顶层 manager 也不给 `delegate`）。语义：持有该工具的 runner 自身深度为 `d`（顶层 manager = 0），能再派的判据是 `d < 上限`；默认 2 即 manager → specialist → specialist（叶子）。到顶的表达方式是**从模型 schema 里摘掉这个工具**，而不是留着让它必然失败（后者只会白烧往返）。与次数上限（`LATTE_MAX_DELEGATES_PER_SESSION`）互补：那条管「总共派了几次」，这条管「套了几层」——深度是**乘性**成本，每一级都是一整个独立 subsession（自己的上下文、自己的工具循环）。<br>**实测事故**：`delegate` 不是 builtin 工具（只由 `register_delegate_tool` 注册），而 delegate 派出的 specialist 是用 `build_tool_manager_at` 装的——它只注册 builtin + `code_graph` 再按 allowlist 反向裁剪。于是 `tools = ["delegate"]` 的 8 个 `*_leader` 角色被派到时拿到的是一个**零工具**的 manager，两层 leader 架构在 delegate 路径上完全失效；任何声明了 delegate 的 specialist 也都静默丢掉它。补上递归注册后才需要这条深度门 |
 | `LATTE_AGENT_READONLY_PARALLEL` | 1（开） | 同一轮里**连续**的只读工具调用（`read` / `code_graph` / `search` / `find` / `grep` / `fetch`）并发执行（P1a 统一调度器：并行段滚动池 + exclusive 屏障）。设 `0`/`false`/`no`/`off` 退回严格串行。同时也是 `read` 批量读的并发开关 |
 | `LATTE_AGENT_READONLY_PARALLEL_MAX` | 8 | 并行段滚动池的 in-flight 上限，钳在 `1..=32`（`code_graph` 走 tree-sitter 解析，是 CPU 密集的）。`read` 批量读复用同一个值 |
 | `LATTE_AGENT_PARALLEL_TOOL_CALLS` | 1（开） | 下发 OpenAI 协议的 `parallel_tool_calls`，显式声明"一条响应里可以发多个工具调用"。`0`/`false`/`off` → 下发 `false` 强制单调用；`omit` → 字段完全不下发（个别兼容端点不认它，如 litellm #22637 的 Bedrock Converse + Claude 4.5）。Anthropic 默认就允许并行，该路径不下发 |
@@ -261,6 +262,44 @@ sections = ["Goal", "Progress", "Next Step"]   # 自定义摘要模板段落
   对账刻意不自动重派——重启就重跑半成品会在用户不在场时烧掉大量 token。
 - 并发上限：`LATTE_DISPATCH_MAX_CONCURRENT`（默认 3，同时 `in_progress` 的任务数）。
   被闸挡下的任务标记「待派发」，闸放开后 scheduler 在 5s 内自动开跑。
+
+### 派发的互斥与返工
+
+`delegate` 与 `workflow` 的派发身份台账（`DispatchLedger`）**只做互斥、不缓存结果**：
+同一身份（delegate 的 `(role, task)` / workflow 的 `(name, topic, resume)`）正在跑时
+第二条直接被拒，跑完即释放——同一身份再派**会真的重跑**。
+
+delegate 曾经是带结果缓存的（成功后写 `Entry::Done`，第二次同身份派发返回旧文本 +
+一条「↩ 复用已完成的委派结果」），动机是省掉一次几十秒到十几分钟的白跑。但这条捷径
+**静默截断了所有返工环**：真实返工的形状是 `delegate(programmer, "修复构建失败")` →
+specialist 改完 → manager 跑 `cargo build` 发现还是错 → 用同一条 task 再派。这一整套
+发生在 manager **同一个 turn 的工具循环里**，于是第二次命中缓存，零工作量返回上一次
+那份「已修复」的成功文本，manager 以为修好了。而且 `Entry::Done` 永不失效（无 TTL、
+不随新一轮用户输入清空）。delegate 会写文件，复用旧摘要正好掩盖「这次其实什么都没跑」
+——这与 workflow 当初选择只互斥不缓存时写下的理由逐字相同，只是当时没同步到 delegate。
+
+省下的白跑改由别的闸兜：并发同身份仍被在飞标记挡住，模型无意义地反复重发同一条调用
+由死循环熔断（连击 / 打转）处理。用「可能白跑一次」换「不再把假成功喂回 manager」。
+
+### Session token 预算
+
+`session_token_budget`（CLI `--session-token-budget`）在**单角色**与**多角色**两条路上
+都生效，`0` = 不限（默认）：
+
+| 路径 | 判据 | 到顶行为 |
+|---|---|---|
+| 多角色 `discuss` | `Supervisor::observe` 累加每轮增量 | 自动暂停（`[supervisor pause: …]`）|
+| 单角色 `chat`（manager → delegate → workflow 主路）| turn 收尾时累加本轮 in/out/thinking 增量 | 自动暂停 + 一条可执行提示 |
+
+单角色那一条此前是**死字段**：只有多角色路径读它，CLI 与 UI 传的值在主路上等于没配、
+还不报错。偏偏主路最需要预算——工具循环 deadline-only（无轮次上限）、delegate 没有总
+预算、workflow 的按墙钟刹车已废弃且没有替代，聚合起来没有任何上限。
+
+为什么按 token 而不是墙钟：token 能区分「后端卡死」（不涨）与「任务本身就重」（在涨），
+墙钟不能——这正是 `LATTE_AGENT_WORKFLOW_BUDGET_PER_UNIT_SECS` 反复误杀健康长任务、最终
+被移除的原因。到顶按**自动暂停**处理而不是硬杀 session：已产出的成果全部保留，按 ▶
+即续跑，也可以调大预算再来。记账只加**本轮增量**（累加 runner 的累计值会让预算按
+O(N²) 提前打爆——多角色路径踩过这个坑）。
 
 ### 减少模型往返（read 批量读）
 
