@@ -17751,9 +17751,29 @@ require = ["永远不可能出现的验收字符串"]
 
     /// 直接驱动 code_graph 的 handler（`Tool::handler` 是公开字段），
     /// 不用起 ToolManager。
+    /// 调一次 code_graph 工具。
+    ///
+    /// **必须持 `test_util::ENV_LOCK`**：`config.rs` 的 `load_with_global`
+    /// 系列用例会把**进程级** cwd 切到临时目录（并在结束时用 Drop 守卫切
+    /// 回来）。而 code_graph 要 spawn `ast-grep` 子进程 —— 撞上那个窗口时
+    /// 子进程直接 `No such file or directory (os error 2)`，或相对路径解析
+    /// 到别处（实测报「code_graph: path 不存在：src；相近的真实路径：src」
+    /// 这种自相矛盾的错）。
+    ///
+    /// 这是个**既有**的测试隔离缺陷，只在两组用例恰好并发时才现形，所以
+    /// 长期表现为「偶发失败、隔离跑就过、失败集合每次都不同」。判据不是
+    /// 猜的：那两条报错都直指 cwd 不对。
+    ///
+    /// 跨 `await` 持 `std::sync` 锁在这里是安全的：`#[tokio::test]` 默认
+    /// current-thread 运行时，测试 future 不会被 spawn 到别的线程。
+    #[allow(clippy::await_holding_lock)]
     async fn cg_call(
         args: serde_json::Value,
     ) -> Result<serde_json::Value, latte_rs_agent_tools::error::ToolError> {
+        let _cwd_guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tool = code_graph_tool();
         let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
         (tool.handler)(args, ctx).await
@@ -17794,6 +17814,8 @@ require = ["永远不可能出现的验收字符串"]
         let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
         ctx.metadata = Some(serde_json::json!({ "cwd": d.path().to_str().unwrap() }));
         let out = (tool.handler)(
+            // 路径必须**相对仓库根**（工具契约，绝对路径会被判「无已索引符号」）。
+            // cwd 竞态由 `cg_call` 持 ENV_LOCK 兜住。
             serde_json::json!({ "path": "src", "graph": "structure" }),
             ctx,
         )
