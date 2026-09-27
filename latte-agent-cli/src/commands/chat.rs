@@ -279,7 +279,11 @@ impl ChatCmd {
             session_id: session_id.clone(),
         };
 
-        // Build the initial runner.
+        // Build the initial runner. Legacy single-role chat owns a goal
+        // round driver, so the runner and the driver must share this exact
+        // state handle. Multi-role HIL passes `None` below because it has no
+        // outer goal driver (its completion contract is the round scheduler).
+        let goal_state = cli_goal_state();
         let (runner, role_id) = match build_runner(
             &merged,
             &resolver,
@@ -291,6 +295,7 @@ impl ChatCmd {
             // Legacy single-role REPL — no HIL session.
             None,
             &std::env::current_dir()?,
+            Some(goal_state.clone()),
             false,
         )
         .await
@@ -337,6 +342,9 @@ impl ChatCmd {
             turn_count: 0,
             debug_flags: debug_flags.clone(),
             plan_mode: false,
+            goal_state,
+            goal_cwd: std::env::current_dir()?,
+            goal_session_id: cli_session_id(),
             renderer: self.output.renderer(),
         };
         // If --resume was passed, load the saved history into the
@@ -374,7 +382,7 @@ impl ChatCmd {
                         text: input.to_string(),
                     },
                 );
-                session.turn(input).await?;
+                session.turn_with_goal_driver(input).await?;
                 if let Some(resp) = &session.last_response {
                     println!("{}", resp);
                 }
@@ -434,7 +442,7 @@ impl ChatCmd {
                     format!("{line}\n\n【advisor 纠正提示】\n{}", hints.join("\n"))
                 }
             };
-            if let Err(e) = session.turn(&line).await {
+            if let Err(e) = session.turn_with_goal_driver(&line).await {
                 // 用户 Ctrl-C 中止：回到提示符，不 auto-save、不退出。
                 if e.to_string().contains(TURN_CANCELLED) {
                     continue;
@@ -510,6 +518,12 @@ struct ChatSession {
     /// 用过滤后的工具集重建 runner（CLI 是逐命令同步循环，没有
     /// 「turn 边界」可等——重建点即下一次 run_turn 之前）。
     plan_mode: bool,
+    /// 与 runner 中 `goal` handler 共用的会话级状态。只有 legacy
+    /// 单角色 REPL 有外层 driver；HIL 多角色路径不会构造 ChatSession。
+    goal_state: latte_agent_core::goal::SharedGoal,
+    /// goal 快照的落盘坐标，与 `register_goal_tool` 使用的坐标一致。
+    goal_cwd: PathBuf,
+    goal_session_id: String,
     /// 渲染器：把事件转成 CLI 文本或 JSON Lines 输出。
     /// 调用方决定使用哪个具体实现。
     renderer: Box<dyn latte_agent_core::renderer::ChatRenderer>,
@@ -688,6 +702,150 @@ impl ChatSession {
         }
     }
 
+    /// 跑一轮用户输入，并在目标仍 active + armed 时自动续跑。
+    ///
+    /// 注册 `goal` 工具却没有这个 driver 会产生最危险的假成功：工具返回
+    /// “自动续跑已开启”，但 REPL 随即回到提示符，永远没有下一轮。
+    async fn turn_with_goal_driver(&mut self, user_input: &str) -> AnyResult {
+        let mut next_input = user_input.to_string();
+        loop {
+            let usage_before = self.runner.total_usage().clone();
+            self.turn(&next_input).await?;
+            let usage_after = self.runner.total_usage().clone();
+
+            let delta = latte_agent_core::goal::GoalUsageDelta {
+                input: u64::from(
+                    usage_after
+                        .input_tokens
+                        .saturating_sub(usage_before.input_tokens),
+                ),
+                output: u64::from(
+                    usage_after
+                        .output_tokens
+                        .saturating_sub(usage_before.output_tokens),
+                ),
+                thinking: u64::from(
+                    usage_after
+                        .thinking_tokens
+                        .saturating_sub(usage_before.thinking_tokens),
+                ),
+                cache_read: u64::from(
+                    usage_after
+                        .cache_read_tokens
+                        .saturating_sub(usage_before.cache_read_tokens),
+                ),
+                cache_write: u64::from(
+                    usage_after
+                        .cache_write_tokens
+                        .saturating_sub(usage_before.cache_write_tokens),
+                ),
+            };
+
+            let budget_block = self.goal_state.write().record_usage(&delta);
+            if budget_block.is_some() {
+                latte_agent_core::goal::persist(
+                    &self.goal_cwd,
+                    &self.goal_session_id,
+                    &self.goal_state.read(),
+                );
+            }
+            if let Some(reason) = budget_block {
+                let goal = self.goal_state.read().current();
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::GoalUpdated {
+                        goal,
+                        change: "blocked".into(),
+                    },
+                );
+                let _ =
+                    cli_session_event_tx().send(latte_agent_core::controller::ChatEvent::Status {
+                        message: format!(
+                        "🎯 目标已停在 blocked[{}]：{} 自动续跑停止；抬高预算后可以 resume 继续。",
+                        reason.code, reason.message
+                    ),
+                    });
+                return Ok(());
+            }
+
+            // `/pause` 的含义是当前轮收尾后别再自行开下一轮。
+            if cli_pause_gate().is_paused() {
+                return Ok(());
+            }
+
+            match self.begin_next_goal_round() {
+                Some(prompt) => {
+                    // 下一轮开始前把上一轮正文留在终端历史区；最终一轮仍由
+                    // 原调用点统一渲染，避免单轮普通聊天重复输出。
+                    if let Some(response) = &self.last_response {
+                        ui_emit(response);
+                    }
+                    next_input = prompt;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// 原子地占用下一轮并生成 continuation；`None` 表示目标已结束、暂停、
+    /// 阻塞或根本不存在。既供 turn 收尾调用，也供 `/resume` 唤醒调用。
+    fn begin_next_goal_round(&self) -> Option<String> {
+        let decision = self.goal_state.write().drive();
+        if !matches!(decision, latte_agent_core::goal::DriveDecision::Idle) {
+            latte_agent_core::goal::persist(
+                &self.goal_cwd,
+                &self.goal_session_id,
+                &self.goal_state.read(),
+            );
+        }
+        match decision {
+            latte_agent_core::goal::DriveDecision::Idle => None,
+            latte_agent_core::goal::DriveDecision::Round { goal, round } => {
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::GoalUpdated {
+                        goal: Some(goal.clone()),
+                        change: "round".into(),
+                    },
+                );
+                let _ =
+                    cli_session_event_tx().send(latte_agent_core::controller::ChatEvent::Status {
+                        message: format!(
+                            "🎯 目标未达成 —— 自动续跑第 {round}/{} 轮（/pause 可随时停）",
+                            goal.max_rounds
+                        ),
+                    });
+                Some(latte_agent_core::goal::render_goal_round_prompt(
+                    &goal, round,
+                ))
+            }
+            latte_agent_core::goal::DriveDecision::JustBlocked { goal, reason } => {
+                let _ = cli_session_event_tx().send(
+                    latte_agent_core::controller::ChatEvent::GoalUpdated {
+                        goal: Some(goal),
+                        change: "blocked".into(),
+                    },
+                );
+                let _ =
+                    cli_session_event_tx().send(latte_agent_core::controller::ChatEvent::Status {
+                        message: format!(
+                        "🎯 目标已停在 blocked[{}]：{} 请选择抬高轮次后 resume、缩小目标，或停止。",
+                        reason.code, reason.message
+                    ),
+                    });
+                None
+            }
+        }
+    }
+
+    async fn resume_goal_driver(&mut self) -> AnyResult<()> {
+        if cli_pause_gate().is_paused() {
+            return Ok(());
+        }
+        if let Some(prompt) = self.begin_next_goal_round() {
+            self.turn_with_goal_driver(&prompt).await?;
+        }
+        Ok(())
+    }
+
     /// 按当前 role/tier/plan_mode 重建 runner（历史整份搬过去）。
     /// `/planmode` 翻转后调用；与 `/role`、`/model` 的重建同款做法。
     async fn rebuild_runner(&mut self) -> AnyResult<()> {
@@ -702,6 +860,7 @@ impl ChatSession {
             &self.debug_flags,
             None,
             &std::env::current_dir()?,
+            Some(self.goal_state.clone()),
             self.plan_mode,
         )
         .await?;
@@ -823,6 +982,15 @@ impl ChatSession {
             // 非 TTY（管道 / e2e）没有输入线程，仍需这条兜底路径。
             "/pause" | "/resume" | "/cancel" => {
                 handle_out_of_band(cmd);
+                // 非 TTY 路径没有输入线程替我们投递内部唤醒事件。
+                if cmd == "/resume" && split_ui().lock().is_none() {
+                    self.resume_goal_driver().await?;
+                }
+            }
+            // TTY 的 `/resume` 在输入线程里带外生效；这条内部事件只负责
+            // 回到 async REPL 上下文里唤醒 goal driver，不对用户公开。
+            "/__goal_resume" => {
+                self.resume_goal_driver().await?;
             }
             "/stream" => {
                 // 非 TTY 兜底（分离模式下已被带外拦截）。整行透传，
@@ -930,6 +1098,7 @@ impl ChatSession {
                     // Legacy /role switch — no HIL session.
                     None,
                     &std::env::current_dir()?,
+                    Some(self.goal_state.clone()),
                     // 切角色保留 plan mode：模式是会话级状态，不随角色走。
                     self.plan_mode,
                 )
@@ -987,6 +1156,7 @@ impl ChatSession {
                             // Legacy /model switch — no HIL session.
                             None,
                             &std::env::current_dir()?,
+                            Some(self.goal_state.clone()),
                             self.plan_mode,
                         )
                         .await
@@ -1166,6 +1336,9 @@ async fn build_runner(
     // Working directory the runner should treat as ground truth for
     // system-prompt env injection (matches the process's actual cwd).
     cwd: &std::path::Path,
+    // `Some` 表示宿主具备 goal round driver；`None` 时即使角色 allowlist
+    // 声明了 `goal` 也不能注册，否则工具会承诺一个不存在的自动续跑器。
+    goal_state: Option<latte_agent_core::goal::SharedGoal>,
     // plan mode（只读规划模式）：true 时角色 allowlist 收敛到只读
     // 白名单（`plan_mode_filter_tools`），并往 system prompt 追加
     // 只读引导段。与 controller 的 build_runner 同款语义。
@@ -1371,6 +1544,22 @@ async fn build_runner(
                 None,
             )
             .map_err(|e| format!("todo tool setup failed: {}", e))?;
+        }
+        // `goal` 对齐 UI：这是跨 turn 的完成契约，状态按 CLI 会话共享，
+        // 并在每次 mutation 后落盘到 `.latte/goals/<session>.json`。
+        // 只给角色 allowlist 明确声明了该工具的 runner 注册，避免把
+        // manager-only 能力泄露给其它角色。
+        if let (true, Some(goal_state)) =
+            (role.allowed_tools.iter().any(|t| t == "goal"), goal_state)
+        {
+            latte_agent_core::controller::register_goal_tool(
+                &tm,
+                cli_session_event_tx().clone(),
+                role_id.to_string(),
+                goal_state,
+                Some((cwd.to_path_buf(), cli_session_id())),
+            )
+            .map_err(|e| format!("goal tool setup failed: {}", e))?;
         }
         // `generate_image` 对齐 UI（已是 pub，无需改可见性）。
         if role.allowed_tools.iter().any(|t| t == "generate_image") {
@@ -1746,6 +1935,16 @@ fn cli_todo_state() -> latte_agent_core::todo::SharedTodoState {
         std::sync::OnceLock::new();
     STATE
         .get_or_init(latte_agent_core::todo::new_shared_todo_state)
+        .clone()
+}
+
+/// CLI 会话级 goal 状态。与 todo 一样，角色切换或重建 runner 时仍须
+/// 看到同一个完成契约；具体状态落盘由 `register_goal_tool` 负责。
+fn cli_goal_state() -> latte_agent_core::goal::SharedGoal {
+    static STATE: std::sync::OnceLock<latte_agent_core::goal::SharedGoal> =
+        std::sync::OnceLock::new();
+    STATE
+        .get_or_init(latte_agent_core::goal::new_shared_goal)
         .clone()
 }
 
@@ -2145,6 +2344,19 @@ fn spawn_cli_workflow_event_consumer_with(
                         )),
                         None => ui_emit(&format!("📝 todo {done}/{total}")),
                     }
+                }
+                Ok(ChatEvent::GoalUpdated { goal, .. }) => match goal {
+                    Some(goal) => ui_emit(&format!(
+                        "🎯 目标 {} · 第 {}/{} 轮 — {}",
+                        goal.phase.as_str(),
+                        goal.rounds_started,
+                        goal.max_rounds,
+                        first_line_brief(&goal.objective, 100)
+                    )),
+                    None => ui_emit("🎯 目标已丢弃"),
+                },
+                Ok(ChatEvent::Status { message }) => {
+                    ui_emit(&message);
                 }
                 Ok(_) => {}
                 // Lagged：事件产出快于消费，丢了几条无所谓——ask 是
@@ -3403,6 +3615,12 @@ fn handle_out_of_band(line: &str) -> bool {
                 Some(ms) => {
                     ui_emit(&format!("▶ 已恢复（暂停了 {:.1}s）", ms as f64 / 1000.0));
                     ui_set_activity(None);
+                    // 输入线程不能 await；把唤醒交回 REPL 主循环。
+                    if split_ui().lock().is_some() {
+                        let _ = input_queue()
+                            .0
+                            .send(InputEvent::Line("/__goal_resume".into()));
+                    }
                 }
                 None => ui_emit("当前没有暂停"),
             }
@@ -4000,6 +4218,51 @@ mod tests {
         }
     }
 
+    /// `goal` 只有在宿主真的接了 round driver 时才能注册；同时 driver
+    /// 必须在 turn 收尾记账、占轮号并生成 continuation prompt。
+    #[test]
+    fn cli_goal_registration_and_driver_are_coherent() {
+        let chat = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands/chat.rs"),
+        )
+        .expect("chat.rs");
+        let src = chat.split("#[cfg(test)]").next().expect("非测试部分");
+
+        let build = src
+            .split("async fn build_runner")
+            .nth(1)
+            .expect("build_runner 应存在");
+        assert!(
+            build.contains("Some(goal_state)"),
+            "goal 注册必须受 driver 状态 Option 门控"
+        );
+
+        let driver = src
+            .split("async fn turn_with_goal_driver")
+            .nth(1)
+            .expect("CLI 单角色路径必须有 goal round driver");
+        let driver = driver
+            .split("async fn rebuild_runner")
+            .next()
+            .expect("driver 边界");
+        for required in [
+            "record_usage(&delta)",
+            ".drive()",
+            "render_goal_round_prompt",
+            "GoalUpdated",
+            "resume_goal_driver",
+        ] {
+            assert!(
+                driver.contains(required),
+                "goal driver 缺少 `{required}`，会出现注册了但不续跑/不记账的假支持"
+            );
+        }
+        assert!(
+            src.contains("InputEvent::Line(\"/__goal_resume\".into())"),
+            "TTY 的 /resume 必须把 goal 唤醒投回 async REPL 主循环"
+        );
+    }
+
     /// 防回归：CLI 的 workflow ctx 必须带上 subsession_store 与
     /// advisor_gate。原状两个都是 None——同一个 workflow 在 chat 里跑
     /// 没有子会话日志、也不过 advisor 的返回审查（UI 里会被 intervene
@@ -4342,6 +4605,9 @@ mod tests {
             "TaskReport",
             // todo 列表快照（进度 + 当前项）。
             "TodoUpdated",
+            // goal 轮次与 driver 状态同样必须可见。
+            "GoalUpdated",
+            "Status",
             // 既有的。
             "ChoiceRequested",
             "WorkflowStep",
@@ -4668,11 +4934,14 @@ async fn run_hil_chat(
     }
 
     // 2. Open or create the SessionManager
-    let mut mgr = SessionManager::new(&task_id, worktree_root.clone(), roles.clone());
-    if mgr.session_path().exists() {
-        let raw = std::fs::read_to_string(mgr.session_path())?;
-        let record: latte_agent_core::session::SessionRecord = serde_json::from_str(&raw)?;
-        mgr = SessionManager::from_record(record, worktree_root.clone());
+    // 按 task_id 找最近一次落盘记录续跑（session_id 带时间戳，`new`
+    // 出来的 path 恒不存在——拿它判 exists 永远 false，重启后续不上）。
+    let (mut mgr, restored) = latte_agent_core::session::SessionManager::load_or_create(
+        &task_id,
+        worktree_root.clone(),
+        roles.clone(),
+    );
+    if restored {
         renderer
             .on_session_info(
                 &mgr.record().task_id,
@@ -4839,6 +5108,8 @@ async fn run_hil_chat(
             &debug_flags,
             session_arg,
             &std::env::current_dir()?,
+            // 多角色 HIL 没有 goal 外层 driver，不能下发 goal 工具。
+            None,
             // HIL 多角色 chat 不接 plan mode（会话级开关在 controller /
             // 单角色 REPL；多角色轮值模式没有对应 UX）。
             false,
