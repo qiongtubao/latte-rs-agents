@@ -14,9 +14,20 @@ pub(crate) struct SelfLoopState {
 }
 
 impl SelfLoopState {
-    /// start 时登记新一轮的事件 sender。
-    pub(crate) fn set_progress(&self, tx: broadcast::Sender<SelfLoopEvent>) {
-        *self.progress.lock() = Some(tx);
+
+    /// 原子 start：检查-登记一把锁内完成，关闭旧裸 `set_progress` 的
+    /// TOCTOU——两个并发 start 都覆盖 progress，前一个 node 进程事件
+    /// 后续订阅者收不到。try_set_progress 返回 `Err(())` → caller 409。
+    pub(crate) fn try_set_progress(
+        &self,
+        tx: broadcast::Sender<SelfLoopEvent>,
+    ) -> Result<(), ()> {
+        let mut g = self.progress.lock();
+        if g.is_some() {
+            return Err(());
+        }
+        *g = Some(tx);
+        Ok(())
     }
 
     /// stop：清掉 sender（已有 receiver 会因 channel 关闭而结束）。
@@ -34,6 +45,26 @@ impl SelfLoopState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// 并发 try_set_progress 两次：只第一个落上，第二次返回 Err。
+    /// 修前裸 set_progress 会让前一个 node 进程事件被新 sender 覆盖、
+    /// 后续订阅者看不到前一个 run 的产物。
+    #[test]
+    fn concurrent_try_set_progress_only_one_succeeds() {
+        let s = SelfLoopState::default();
+        let (tx1, _rx1) = tokio::sync::broadcast::channel::<SelfLoopEvent>(1);
+        let (tx2, _rx2) = tokio::sync::broadcast::channel::<SelfLoopEvent>(1);
+        assert!(s.try_set_progress(tx1).is_ok());
+        assert!(s.try_set_progress(tx2).is_err());
+        s.clear();
+        let (tx3, _rx3) = tokio::sync::broadcast::channel::<SelfLoopEvent>(1);
+        assert!(s.try_set_progress(tx3).is_ok());
+    }
+}
+
 
 /// Self-loop 进度事件（SSE / Tauri `ui:self_loop_event` 的载荷）。
 /// `kind`: "started" | "iteration" | "log" | "screenshot" | "done" | "error"
@@ -178,5 +209,8 @@ pub(crate) fn self_loop_dir() -> Result<PathBuf, String> {
         }
     }
     let first = &candidates[0];
-    Err(format!("self-loop dir not found: tried {}", first.display()))
+    Err(format!(
+        "self-loop dir not found: tried {}",
+        first.display()
+    ))
 }

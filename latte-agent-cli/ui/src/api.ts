@@ -294,19 +294,73 @@ export interface SelfLoopEvent {
 
 // ─── Session-id plumbing ───────────────────────────────────────────────
 //
-// Each browser tab mints a `session_id`, persists it in localStorage,
-// and attaches it to every fetch + EventSource. Two tabs in the same
-// browser are independent browsing contexts — different localStorage
-// entries — but every tab talks to one logical session at the server.
-
-// When running inside the editor host, the session is persisted under a
-// host-provided per-workspace key (design doc §5.4); CLI browser mode
-// keeps the original bare key.
+// 多 tab 共享：同 origin 两 tab 共享同一个 localStorage key（**不是**不同
+// entries——前述注释有误，已修），共享 LS 下的当前 session_id。两 tab
+// 冷启动都调 `ensureSession()` 会在各自模块态走一遍 createSession，
+// 服务端建两份独立 session、LS 被后写者覆盖、其中一会话变成服务端
+// 孤儿。三层防护：
+//
+//   1. `ensureSession` 自己：**in-flight Promise 缓存**——同一 tab 重复
+//      调复用同一 promise；同 origin 跨 tab 用 BroadcastChannel（不可用
+//      时回退 storage 事件）互相告知"已有 X"。
+//   2. `persistSessionId` / `createSession` / `forkSession` / `deleteSession`
+//      调后 `announceSession(action, id)` 让其他 tab 跟上。
+//   3. 收到跨 tab 的「activated」若 id 不同 → 同步切换；「deleted」若删的
+//      是当前 → 清态并触发 ensureSession 重建。
+//
+// 单 tab 行为不变；BroadcastChannel 在不支持的环境（SSR / jsdom 老版 /
+// 不安全上下文）下被吞，无功能退化。
 const DEFAULT_SESSION_STORAGE_KEY = "latte-agent-ui-session-id";
 function sessionStorageKey(): string {
   return getHost()?.sessionKey ?? DEFAULT_SESSION_STORAGE_KEY;
 }
 let currentSessionId: string | null = null;
+
+/** 跨 tab 同步总线（`activated`/`created`/`deleted`）。
+ *  不可用环境（SSR / 老 jsdom / 不安全上下文）降级为本地模块态 no-op。 */
+type SessionAction = "activated" | "created" | "deleted";
+let _sessionBus: BroadcastChannel | null = null;
+const _sessionBusListeners = new Set<(a: SessionAction, id: string) => void>();
+function getSessionBus(): BroadcastChannel | null {
+  if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") {
+    return null;
+  }
+  if (_sessionBus) return _sessionBus;
+  try {
+    _sessionBus = new BroadcastChannel("latte-agent-session-bus");
+  } catch {
+    return null;
+  }
+  _sessionBus.onmessage = (e) => {
+    const data = (e as MessageEvent).data as
+      | { action?: unknown; sessionId?: unknown }
+      | null;
+    if (
+      !data ||
+      typeof data.action !== "string" ||
+      typeof data.sessionId !== "string"
+    ) {
+      return;
+    }
+    for (const fn of _sessionBusListeners) {
+      fn(data.action as SessionAction, data.sessionId);
+    }
+  };
+  return _sessionBus;
+}
+/** 给其他 tab 广播（best-effort）。 */
+export function announceSession(action: SessionAction, sessionId: string): void {
+  getSessionBus()?.postMessage({ action, sessionId });
+}
+/** 订阅跨 tab 事件，返回退订函数。 */
+export function onSessionEvent(
+  fn: (a: SessionAction, id: string) => void,
+): () => void {
+  _sessionBusListeners.add(fn);
+  return () => {
+    _sessionBusListeners.delete(fn);
+  };
+}
 
 export function getCurrentSessionId(): string | null {
   return currentSessionId;
@@ -319,6 +373,7 @@ export async function listSessions(): Promise<SessionSummary[]> {
 export async function createSession(): Promise<string> {
   const info = await getTransport().request<SessionInfo>("POST", "/api/sessions", {});
   persistSessionId(info.session_id);
+  announceSession("created", info.session_id);
   return info.session_id;
 }
 
@@ -341,6 +396,7 @@ export async function forkSession(
     { source_session_id: sourceSessionId, events },
   );
   persistSessionId(info.session_id);
+  announceSession("created", info.session_id);
   return info.session_id;
 }
 
@@ -354,13 +410,53 @@ export async function renameSession(
     label,
   });
 }
-
-/** Delete a session server-side (its controller is aborted). */
 export async function deleteSession(sessionId: string): Promise<void> {
   await getTransport().request(
     "DELETE",
     `/api/sessions?id=${encodeURIComponent(sessionId)}`,
   );
+  // 让其它 tab 跟上：当前指向被删 session 的 tab 清态 + 重建。
+  announceSession("deleted", sessionId);
+}
+
+// ─── Prompt-dismissal bus ───────────────────────────────────────────
+//
+// 两 tab 都看到了同一个 prompt card（A 弹 B 也弹）；A 答完 dismiss，
+// B 的卡必须同 tab 删除——单靠 server 端 PROMPTS/pending-asks 删除
+// 不够，因为 B 的 DOM 卡是本地状态、不会自己消失。`dismissPrompt` /
+// `importTasks(plan_id)` 在 server 落盘清理后向本 bus 广播 "dismissed"，
+// 监听器调 `chat.removePrompt(id)` 摘掉本地卡 + 关闭 plan/choice 弹窗。
+// 跨 tab BroadcastChannel 不可用时降级 no-op（单 tab 用不到）。
+const PROMPT_DISMISS_CHANNEL = "latte-agent-prompt-dismiss";
+let _promptDismissBus: BroadcastChannel | null = null;
+const _promptDismissListeners = new Set<(promptId: string) => void>();
+function getPromptDismissBus(): BroadcastChannel | null {
+  if (typeof window === "undefined" || typeof BroadcastChannel === "undefined") {
+    return null;
+  }
+  if (_promptDismissBus) return _promptDismissBus;
+  try {
+    _promptDismissBus = new BroadcastChannel(PROMPT_DISMISS_CHANNEL);
+  } catch {
+    return null;
+  }
+  _promptDismissBus.onmessage = (e) => {
+    const id = (e as MessageEvent).data as unknown;
+    if (typeof id !== "string") return;
+    for (const fn of _promptDismissListeners) fn(id);
+  };
+  return _promptDismissBus;
+}
+/** 通知其他 tab：「promptId」这条弹框刚被 dismiss/import 了，请摘卡。 */
+export function announcePromptDismissed(promptId: string): void {
+  getPromptDismissBus()?.postMessage(promptId);
+}
+/** 订阅跨 tab prompt-dismissed 事件，返回退订函数。 */
+export function onPromptDismissed(fn: (promptId: string) => void): () => void {
+  _promptDismissListeners.add(fn);
+  return () => {
+    _promptDismissListeners.delete(fn);
+  };
 }
 
 /** Persist the active session id both in module state and localStorage
@@ -377,7 +473,23 @@ export function persistSessionId(sessionId: string): void {
  * server still knows it; otherwise mint a new one and persist it.
  * Idempotent — safe to call on every reload.
  */
+// ensureSession in-flight Promise 缓存：同一 tab 重复调复用同一 promise
+// （并发 mount 也只跑一次 createSession）。跨 tab 由 BroadcastChannel
+// `announceSession("created", id)` 让其他 tab 跟上 + 后续 persistSessionId
+// 写入 LS。
+let _ensureSessionInflight: Promise<string> | null = null;
 export async function ensureSession(): Promise<string> {
+  if (_ensureSessionInflight) return _ensureSessionInflight;
+  _ensureSessionInflight = _ensureSessionImpl();
+  try {
+    return await _ensureSessionInflight;
+  } finally {
+    // resolve 后清缓存，让后续 ensureSession 走「读 LS → 复用」的快路径。
+    // create 完成 + persistSessionId 已写过 LS，下次调用直接命中。
+    _ensureSessionInflight = null;
+  }
+}
+async function _ensureSessionImpl(): Promise<string> {
   const ls = typeof window !== "undefined" ? window.localStorage : null;
   const persisted = ls?.getItem(sessionStorageKey()) ?? null;
   if (persisted) {
@@ -399,6 +511,36 @@ export async function ensureSession(): Promise<string> {
   persistSessionId(id);
   return id;
 }
+
+// 跨 tab 事件：其他 tab 创建 / 切换 / 删除 session 时跟上。
+onSessionEvent((action, id) => {
+  // 当前 tab 没有激活的 session（或本地指向被删的那个）：无主，跨 tab
+  // 通知不起作用——保持 ensureSession 自然恢复路径。
+  if (!currentSessionId) return;
+  if (action === "deleted") {
+    if (currentSessionId === id) {
+      // 被删的恰好是我们指向的：清态 + LS + 触发重建。
+      currentSessionId = null;
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem(sessionStorageKey());
+      }
+      // 重建不阻塞当前调用栈——主线程外异步触发，确保 UI 不卡。
+      void ensureSession().catch(() => {
+        // 重建失败下次再试；这里只 swallow 让调用栈继续。
+      });
+    }
+    return;
+  }
+  if (action === "created" || action === "activated") {
+    // 其他 tab 切到一个 session：跟随，避免每个 tab 各持一份 LS 漂移。
+    if (currentSessionId !== id) {
+      currentSessionId = id;
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(sessionStorageKey(), id);
+      }
+    }
+  }
+});
 
 /** Forget the current session id locally — used when the user clicks
  * "New Session". Server-side sessions persist until reload. */
@@ -558,6 +700,8 @@ export async function getPendingPrompts(sessionId: string): Promise<ChatEvent[]>
  *  选择 / 跳过 / 导入清单），销账后重连不再补发僵尸框。幂等。 */
 export async function dismissPrompt(promptId: string): Promise<void> {
   await getTransport().requestText("POST", "/api/chat/prompt-dismiss", { prompt_id: promptId });
+  // 跨 tab 通知：另一 tab 也看到了同一张卡，本地状态不会自己消失。
+  announcePromptDismissed(promptId);
 }
 
 export async function sendCommand(command: string): Promise<void> {
@@ -621,10 +765,7 @@ export async function resumeSession(): Promise<void> {
   await getTransport().request("POST", "/api/chat/resume", chatBody({}));
 }
 
-/** Session-level 暂停（用户按 ⏸）：全 session 冻结（turn / tool /
- *  subagent 一起停，对齐 oh-my-pi 的 agentPauseGate）。区别于
- *  `pauseSession()`（legacy flag-based，只停 driver loop 的下个
- *  turn）。后端广播 `Paused` 事件驱动 UI 按钮态。 */
+/** Session-level 暂停（用户按 ⏸）：打开 session gate。非流式模型请求会在继续后重试同一轮；已产生输出的流式调用、工具和后续 turn 在安全边界暂停。 */
 export async function pauseSessionV2(): Promise<void> {
   await getTransport().request("POST", "/api/chat/pause-session", chatBody({}));
 }
@@ -1477,6 +1618,69 @@ export async function getTaskWorktreeDiff(id: string): Promise<WorktreeDiff | nu
   return getTransport().request("GET", `/api/tasks/${encodeURIComponent(id)}/worktree-diff`);
 }
 
+// ─── Task workflow runs（任务级执行流水） ──────────────────────
+
+/** `GET /api/tasks/:id/workflow-runs` 返回的单条 run 列表项。 */
+export interface TaskWorkflowRunSummary {
+  wf_id: string;
+  workflow_name: string;
+  /** meta.topic 截断预览（≤200 字符）。 */
+  topic_preview: string;
+  /** unix 秒（注意：后端写秒，不是毫秒）。 */
+  started_at: number;
+  /** run 挂在哪个 UI session 的事件流上（lifecycle hook 复用任务最后 run 的 session）。 */
+  session_id?: string;
+  step_count: number;
+  last_step_id?: string;
+  last_finished_at?: number;
+}
+
+/** `GET /api/tasks/:id/workflow-runs/:wf_id` 返回的单条 step。 */
+export interface TaskWorkflowRunStep {
+  step_id: string;
+  output_key?: string;
+  /** step 产出全文（详情接口才有；列表接口空）。 */
+  output: string;
+  finished_at: number;
+}
+
+/** `CheckpointRecord::Answer`：workflow run 里用户在 ask 弹框的回答。 */
+export interface TaskWorkflowRunAnswer {
+  role: string;
+  question: string;
+  answer: string;
+  answered_at: number;
+}
+
+/** `GET /api/tasks/:id/workflow-runs/:wf_id` 完整详情。 */
+export interface TaskWorkflowRunDetail extends TaskWorkflowRunSummary {
+  /** 完整 topic（不截断）。 */
+  topic: string;
+  steps: TaskWorkflowRunStep[];
+  answers: TaskWorkflowRunAnswer[];
+}
+
+/** GET /api/tasks/:id/workflow-runs：该任务关联的所有 workflow run。
+ *  按 session_id 关联——lifecycle hook（merge/task_archive）复用任务
+ *  最后一个 run 的 session，所以同一 session 下可能有多条 run。 */
+export async function listTaskWorkflowRuns(id: string): Promise<TaskWorkflowRunSummary[]> {
+  return getTransport().request(
+    "GET",
+    `/api/tasks/${encodeURIComponent(id)}/workflow-runs`,
+  );
+}
+
+/** GET /api/tasks/:id/workflow-runs/:wf_id：单条 run 完整详情。 */
+export async function getTaskWorkflowRun(
+  id: string,
+  wfId: string,
+): Promise<TaskWorkflowRunDetail> {
+  return getTransport().request(
+    "GET",
+    `/api/tasks/${encodeURIComponent(id)}/workflow-runs/${encodeURIComponent(wfId)}`,
+  );
+}
+
 /** GET /api/task-types：列出任务类型注册表（可配置）。 */
 export async function listTaskTypes(): Promise<TaskTypeEntry[]> {
   return getTransport().request("GET", "/api/task-types");
@@ -1558,12 +1762,27 @@ function loadRefineParents(): Record<string, string> {
   }
 }
 
+// 同 origin 两 tab 共用 LS key。两 tab 同时 refine 两个不同 task 会
+// 各自 load→mutate→write 覆盖彼此。加一个 in-flight Promise 串行化所有
+// 写：load 时把上一次的结果接住（而不是只读「上次写入瞬间的值」），
+// 写时覆盖的是上一次落地后的快照，丢字段的事就堵住了。
+let _refineWriteLock: Promise<void> = Promise.resolve();
+
+// 写流程：拿最新快照 → 合并 → 写回 → 把最新快照留给下一位。
 function saveRefineParent(sessionId: string, taskId: string): void {
   if (typeof window === "undefined") return;
-  const mappings = loadRefineParents();
-  mappings[sessionId] = taskId;
-  window.localStorage.setItem(refineParentsStorageKey(), JSON.stringify(mappings));
+  const run = async () => {
+    const mappings = loadRefineParents();
+    mappings[sessionId] = taskId;
+    window.localStorage.setItem(
+      refineParentsStorageKey(),
+      JSON.stringify(mappings),
+    );
+  };
+  // 串行：把下一笔操作挂在前一笔的 settled 之后；错误也不互相打断。
+  _refineWriteLock = _refineWriteLock.then(run, run);
 }
+
 
 export function setRefineParent(sessionId: string, taskId: string): void {
   refineParents.set(sessionId, taskId);
@@ -1592,7 +1811,10 @@ export async function importTasks(
   parentId?: string,
   sessionId?: string,
 ): Promise<{ created: string[] }> {
-  return getTransport().request("POST", "/api/tasks/import", { tasks, plan_id: planId, parent_id: parentId, session_id: sessionId });
+  const resp = await getTransport().request<{ created: string[] }>("POST", "/api/tasks/import", { tasks, plan_id: planId, parent_id: parentId, session_id: sessionId });
+  // 跨 tab 通知：导入完成 → 另一 tab 的 plan 弹窗也要关闭。
+  if (planId) announcePromptDismissed(planId);
+  return resp;
 }
 
 

@@ -57,6 +57,12 @@ pub struct StepForm {
     pub prompt: String,
     #[serde(default)]
     pub output_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_token_budget: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ratio: Option<f64>,
+    #[serde(default)]
+    pub context_overflow_restart: bool,
     /// **只读**的门禁摘要：契约、返工回环、取证要求。
     ///
     /// 表单编辑器不支持编辑这些字段（保存走 TOML 原文，见
@@ -176,7 +182,10 @@ fn step_gate_summary(s: &WorkflowStepDef) -> Vec<String> {
         ));
     }
     if !s.require_tools.is_empty() {
-        out.push(format!("本步必须调用过（AND）：{}", s.require_tools.join(" / ")));
+        out.push(format!(
+            "本步必须调用过（AND）：{}",
+            s.require_tools.join(" / ")
+        ));
     }
     if !s.require_tools_any.is_empty() {
         out.push(format!(
@@ -209,6 +218,14 @@ fn step_gate_summary(s: &WorkflowStepDef) -> Vec<String> {
     if s.max_retries > 0 {
         out.push(format!("契约不合格可重试 {} 次", s.max_retries));
     }
+    if let Some(budget) = s.prompt_token_budget {
+        out.push(format!("prompt 预算上限：{budget} tokens（绝对值）"));
+    }
+    if let Some(ratio) = s.prompt_token_ratio {
+        out.push(format!(
+            "prompt 预算 = 模型窗口 × {ratio}（动态，随解析到的模型伸缩）"
+        ));
+    }
     if !s.tools.is_empty() {
         out.push(format!("本步工具收窄为：{}", s.tools.join(" / ")));
     }
@@ -223,6 +240,9 @@ fn step_to_form(s: &WorkflowStepDef) -> StepForm {
         speakers: s.roles(),
         prompt: s.task_text().to_string(),
         output_key: s.output_key.clone(),
+        prompt_token_budget: s.prompt_token_budget,
+        prompt_token_ratio: s.prompt_token_ratio,
+        context_overflow_restart: s.context_overflow_restart,
         gates: step_gate_summary(s),
     }
 }
@@ -261,6 +281,12 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 output_key: s.output_key.clone(),
                 depends_on: vec![],
                 max_retries: 0,
+                context_overflow_restart: s.context_overflow_restart,
+                context_overflow_max_restarts: 2,
+                context_overflow_files: vec![],
+                read_path_allowlist: vec![],
+                prompt_token_budget: s.prompt_token_budget,
+                prompt_token_ratio: s.prompt_token_ratio,
                 loop_until: None,
                 loop_back_to: None,
                 // 按病灶路由返工目标（loop_back_routes）同样只在 TOML
@@ -392,8 +418,12 @@ fn fill_doc(doc: &mut toml_edit::DocumentMut, form: &WorkflowForm) {
     doc["name"] = value(form.name.clone());
     doc["description"] = value(form.description.clone());
     match &form.command {
-        Some(cmd) => { doc["command"] = value(cmd.clone()); }
-        None => { doc.remove("command"); }
+        Some(cmd) => {
+            doc["command"] = value(cmd.clone());
+        }
+        None => {
+            doc.remove("command");
+        }
     }
     match form.max_rounds {
         Some(r) => {
@@ -461,7 +491,9 @@ pub fn update(cwd: &Path, name: &str, form: &WorkflowForm) -> Result<WorkflowDet
     let path = dir.join(format!("{}.toml", form.name));
     let existing = std::fs::read_to_string(&path).ok();
     let mut doc: toml_edit::DocumentMut = match &existing {
-        Some(c) => c.parse().map_err(|e| format!("parse {}: {e}", path.display()))?,
+        Some(c) => c
+            .parse()
+            .map_err(|e| format!("parse {}: {e}", path.display()))?,
         None => toml_edit::DocumentMut::new(),
     };
     fill_doc(&mut doc, form);
@@ -564,7 +596,10 @@ pub fn validate(form: &WorkflowForm, merged: &AgentConfig) -> ValidateResponse {
                     step.id
                 ));
             } else if !merged.roles.contains_key(sp) {
-                errors.push(format!("step '{}': role '{sp}' not found in config", step.id));
+                errors.push(format!(
+                    "step '{}': role '{sp}' not found in config",
+                    step.id
+                ));
             }
         }
         if step.prompt.trim().is_empty() {
@@ -586,7 +621,10 @@ pub fn validate(form: &WorkflowForm, merged: &AgentConfig) -> ValidateResponse {
     for step in &form.steps {
         for var in extract_placeholders(&step.prompt) {
             if var != "topic" && !seen_keys.contains(var.as_str()) {
-                warnings.push(format!("step '{}': unknown variable '{{{{{var}}}}}'", step.id));
+                warnings.push(format!(
+                    "step '{}': unknown variable '{{{{{var}}}}}'",
+                    step.id
+                ));
             }
         }
     }
@@ -619,20 +657,31 @@ pub(crate) struct WorkflowRunState {
 }
 
 impl WorkflowRunState {
-    /// start 时登记新一轮的事件 sender / cancel flag / run_id。
-    pub(crate) fn start(
+
+    /// 原子 start：检查-登记一把锁内完成，关闭旧 is_active()→start()
+    /// TOCTOU——两个并发请求都过 is_active，都跑 start，后者的 tx/
+    /// cancel/run_id 会覆盖前者的，第一次跑的事件永远到不了 SSE 客户端
+    /// （tx 换了）、cancel flag 没人观察。try_start 在写锁内一次性 set，
+    /// 返回 `Err(())` 让 caller 直接 409。
+    pub(crate) fn try_start(
         &self,
         tx: broadcast::Sender<ChatEvent>,
         cancel: Arc<AtomicBool>,
         run_id: String,
-    ) {
-        *self.inner.write() = Some(ActiveRun {
+    ) -> Result<(), ()> {
+        let mut g = self.inner.write();
+        if g.is_some() {
+            return Err(());
+        }
+        *g = Some(ActiveRun {
             tx,
             cancel,
             run_id,
             history: Vec::new(),
         });
+        Ok(())
     }
+
 
     /// 转发一条事件：同一把写锁内先记录回放再广播。与
     /// `subscribe_with_history`（读锁内建 receiver + 快照 history）
@@ -652,14 +701,12 @@ impl WorkflowRunState {
         }
     }
 
-    pub(crate) fn is_active(&self) -> bool {
-        self.inner.read().is_some()
-    }
-
     /// 订阅并带回放缓冲：receiver 与 history 快照在同一把读锁内取出，
     /// 与 `broadcast`（写锁内记录 + 发送）互斥 —— 订阅前的事件只在
     /// history 里，订阅后的只走 broadcast，不丢不重。
-    pub(crate) fn subscribe_with_history(&self) -> (Vec<ChatEvent>, broadcast::Receiver<ChatEvent>) {
+    pub(crate) fn subscribe_with_history(
+        &self,
+    ) -> (Vec<ChatEvent>, broadcast::Receiver<ChatEvent>) {
         match self.inner.read().as_ref() {
             Some(a) => {
                 let rx = a.tx.subscribe();
@@ -682,7 +729,28 @@ mod tests {
     use super::*;
     use latte_agent_core::role::RoleTemplate;
 
+    /// 并发 try_start 两个 run：只第一个成功，第二个返回 Err。
+    /// 修前用 `is_active()`+`start()` 双锁调用会有 TOCTOU——后者会
+    /// 覆盖前者的 tx/cancel/run_id，导致第一次跑的事件到不了 SSE。
+    #[test]
+    fn concurrent_try_start_only_one_succeeds() {
+        use std::sync::Arc;
+        let s = WorkflowRunState::default();
+        let (tx1, _rx1) = tokio::sync::broadcast::channel::<ChatEvent>(1);
+        let (tx2, _rx2) = tokio::sync::broadcast::channel::<ChatEvent>(1);
+        let r1 = s.try_start(tx1, Arc::new(std::sync::atomic::AtomicBool::new(false)), "run-1".into());
+        let r2 = s.try_start(tx2, Arc::new(std::sync::atomic::AtomicBool::new(false)), "run-2".into());
+        assert!(r1.is_ok());
+        assert!(r2.is_err(), "并发第二个必须 409，修复前会覆盖前者");
+        // 跑完第一个后 clear，第二个应该能正常起。
+        s.clear();
+        let (tx3, _rx3) = tokio::sync::broadcast::channel::<ChatEvent>(1);
+        let r3 = s.try_start(tx3, Arc::new(std::sync::atomic::AtomicBool::new(false)), "run-3".into());
+        assert!(r3.is_ok(), "clear 后必须能再次起 run");
+    }
+
     fn merged_with_roles(ids: &[&str]) -> AgentConfig {
+
         let mut cfg = AgentConfig::default();
         for id in ids {
             cfg.roles.insert(
@@ -698,7 +766,7 @@ mod tests {
                     tools: vec![],
                     icon: "[t]".into(),
                     skills: vec![],
-            code_paths: vec![],
+                    code_paths: vec![],
                     description: String::new(),
                 },
             );
@@ -717,6 +785,9 @@ mod tests {
                 speakers,
                 prompt: prompt.into(),
                 output_key: None,
+                prompt_token_budget: None,
+                prompt_token_ratio: None,
+                context_overflow_restart: false,
                 gates: Vec::new(),
             }],
             command: None,
@@ -727,11 +798,17 @@ mod tests {
     fn validate_rejects_bad_name() {
         let merged = merged_with_roles(&["pm"]);
         for bad in ["", "Bad", "my-workflow", "1 wf", "workflow!"] {
-            let v = validate(&one_step_form(bad, vec!["pm".into()], "do {{topic}}"), &merged);
+            let v = validate(
+                &one_step_form(bad, vec!["pm".into()], "do {{topic}}"),
+                &merged,
+            );
             assert!(!v.ok, "name {bad:?} should be invalid");
             assert!(v.errors.iter().any(|e| e.contains("invalid name")));
         }
-        let v = validate(&one_step_form("ok_name1", vec!["pm".into()], "do {{topic}}"), &merged);
+        let v = validate(
+            &one_step_form("ok_name1", vec!["pm".into()], "do {{topic}}"),
+            &merged,
+        );
         assert!(v.ok, "valid form failed: {:?}", v.errors);
     }
 
@@ -743,7 +820,10 @@ mod tests {
             &merged,
         );
         assert!(!v.ok);
-        assert!(v.errors.iter().any(|e| e.contains("role 'ghost' not found")));
+        assert!(v
+            .errors
+            .iter()
+            .any(|e| e.contains("role 'ghost' not found")));
     }
 
     #[test]
@@ -772,6 +852,9 @@ mod tests {
                     prompt: "draft {{topic}}".into(),
                     output_key: Some("draft".into()),
                     gates: Vec::new(),
+                    prompt_token_budget: None,
+                    prompt_token_ratio: None,
+                    context_overflow_restart: false,
                 },
                 StepForm {
                     id: "b".into(),
@@ -780,6 +863,9 @@ mod tests {
                     prompt: "refine {{draft}} with {{missing}}".into(),
                     output_key: Some("draft".into()),
                     gates: Vec::new(),
+                    prompt_token_budget: None,
+                    prompt_token_ratio: None,
+                    context_overflow_restart: false,
                 },
             ],
             command: None,
@@ -788,7 +874,7 @@ mod tests {
         assert!(v.ok, "errors: {:?}", v.errors);
         // {{draft}} 是已知 output_key → 不警告；{{missing}} → 警告；重复 output_key → 警告。
         assert!(v.warnings.iter().any(|w| w.contains("{{missing}}")));
-        assert!(!v.warnings.iter().any(|w| w.contains("{{draft}}}'") ));
+        assert!(!v.warnings.iter().any(|w| w.contains("{{draft}}}'")));
         assert!(v.warnings.iter().any(|w| w.contains("more than one step")));
     }
 
@@ -830,7 +916,10 @@ mod tests {
             None => std::env::remove_var("LATTE_HOME"),
         }
 
-        let shared = list.iter().find(|s| s.name == "shared").expect("shared listed");
+        let shared = list
+            .iter()
+            .find(|s| s.name == "shared")
+            .expect("shared listed");
         assert_eq!(shared.description, "project copy", "项目副本必须遮蔽全局");
         assert_eq!(shared.source, WorkflowSource::Project);
         assert_eq!(shared.steps_count, 2);
@@ -839,7 +928,10 @@ mod tests {
             .find(|s| s.name == "global_only")
             .expect("global_only listed");
         assert_eq!(g.source, WorkflowSource::Global);
-        assert!(list.windows(2).all(|w| w[0].name <= w[1].name), "按名字排序");
+        assert!(
+            list.windows(2).all(|w| w[0].name <= w[1].name),
+            "按名字排序"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -875,7 +967,9 @@ mod tests {
         assert!(!base.join(".latte/workflows.d/demo.toml").exists());
         // delete 项目副本。
         delete(&base, "demo_renamed").expect("delete");
-        assert!(delete(&base, "demo_renamed").unwrap_err().contains("not found"));
+        assert!(delete(&base, "demo_renamed")
+            .unwrap_err()
+            .contains("not found"));
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -911,7 +1005,10 @@ require_any = ["VERDICT: PASS", "VERDICT: FAIL"]
             joined.contains("跳回 'write'") && joined.contains("最多 2 轮"),
             "返工环要写清跳哪一步、最多几轮: {joined}"
         );
-        assert!(joined.contains("其一（OR）：read / search"), "取证要求: {joined}");
+        assert!(
+            joined.contains("其一（OR）：read / search"),
+            "取证要求: {joined}"
+        );
         assert!(joined.contains("符号必须"), "符号可解析要求: {joined}");
 
         // AND 语义要显式标 AND，别和 OR 混淆。
@@ -943,6 +1040,32 @@ task = "做点事"
         assert!(step_gate_summary(&wf.steps[0]).is_empty());
     }
 
+    #[test]
+    fn step_form_round_trips_budget_and_restart_fields() {
+        let toml_str = r#"
+name = "budget_test"
+description = "test"
+[[steps]]
+id = "s1"
+role = "proofreader"
+task = "verify text"
+output_key = "out"
+context_overflow_restart = true
+prompt_token_budget = 50000
+prompt_token_ratio = 0.85
+"#;
+        let def: WorkflowDef = toml::from_str(toml_str).unwrap();
+        let form = form_from_def(&def);
+        assert_eq!(form.steps[0].prompt_token_budget, Some(50_000));
+        assert_eq!(form.steps[0].prompt_token_ratio, Some(0.85));
+        assert!(form.steps[0].context_overflow_restart);
+
+        let back = def_from_form(&form);
+        assert_eq!(back.steps[0].prompt_token_budget, Some(50_000));
+        assert_eq!(back.steps[0].prompt_token_ratio, Some(0.85));
+        assert!(back.steps[0].context_overflow_restart);
+    }
+
     /// `gates` 是只读的：反序列化时忽略，请求体里带了也不会被当成可写字段。
     #[test]
     fn gates_field_is_ignored_on_deserialize() {
@@ -952,5 +1075,4 @@ task = "做点事"
         assert!(f.gates.is_empty(), "gates 不该从请求体读入: {:?}", f.gates);
         assert_eq!(f.id, "s");
     }
-
 }

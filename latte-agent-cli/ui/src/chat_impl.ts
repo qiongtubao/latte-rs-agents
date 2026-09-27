@@ -15,6 +15,18 @@ import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComple
 import { todoLinkedTask, type BoardTaskRef } from "./todo_board_link";
 import { parentOptions, getBoardTasksSnapshot, onBoardTasksUpdated } from "./task_board";
 import type { CodeRef } from "./host";
+import { HttpError } from "./transport";
+
+/** importTasks 409（= plan_id 重复导入防护）的判定：跨 realm 也稳，
+ *  不依赖 instanceof，复用 workflows_panel 的 httpStatusOf 思路。 */
+function isPlanAlreadyImported(err: unknown): boolean {
+  if (err instanceof HttpError) return err.status === 409;
+  if (typeof err === "object" && err !== null) {
+    const s = (err as { status?: unknown }).status;
+    return typeof s === "number" && s === 409;
+  }
+  return false;
+}
 
 export { renderMarkdown };
 interface UIBinding {
@@ -43,6 +55,9 @@ export interface ChatController {
   focus(): void;
   insertContext(ref: CodeRef & { quote?: string }): void;
   setRoleFilePaths(paths: Record<string, string>): void;
+  /** 跨 tab / 跨 cancel 路径：摘掉本 tab 的 prompt 卡（choice 或 plan）
+   *  + 关弹窗。调用方：BroadcastChannel prompt-dismissed 监听。 */
+  removePrompt(promptId: string): void;
 }
 
 const ROLE_ICONS: Record<string, string> = {
@@ -1890,6 +1905,13 @@ export function mountChat(opts: {
     header.className = "plan-import-header";
     header.textContent = `导入任务看板 · ${tasks.length} 个候选${planId ? `（${planId}）` : ""}${refineParent ? `（作为 ${refineParent} 的子任务）` : ""}`;
     box.appendChild(header);
+    // 跨 tab 关闭 / 同步用：另一 tab 经 BroadcastChannel 通知「plan
+    // dismissed」时，removePrompt 据此判断元素归属。
+    if (planId) {
+      const meta = document.createElement("meta");
+      meta.setAttribute("data-plan-id", planId);
+      box.appendChild(meta);
+    }
 
     // 每个任务一行：勾选框 + 可编辑 title/desc/priority；subtasks 任意
     // 深度递归成行（缩进表达层级），勾选父行会级联勾掉整个子树。
@@ -2030,20 +2052,28 @@ export function mountChat(opts: {
           ? `✅ 已导入 ${resp.created.length} 个子任务到 ${effectiveParent}（todo），请到任务看板派发执行`
           : `✅ 已导入 ${resp.created.length} 个任务到看板（todo），请到任务看板派发执行`;
         addMessage({ kind: "system", content });
-        overlay.remove();
       } catch (err) {
         importBtn.disabled = false;
         importBtn.textContent = "导入选中项";
+        // 409 = 另一 tab 已经成功导入过同 plan_id（import_tasks 落盘
+        // 幂等 marker 触发）。视为成功：清本地卡 + 关弹窗 + 提示。
+        if (isPlanAlreadyImported(err)) {
+          addMessage({
+            kind: "system",
+            content: `ℹ️ 另一个 tab 已经成功导入过这份清单；本地卡已摘除，请到任务看板查看。`,
+          });
+          if (planId) removePrompt(planId);
+          overlay.remove();
+          return;
+        }
         alert(`导入失败: ${(err as Error).message}`);
       }
     });
-
     overlay.appendChild(box);
     // 点遮罩空白处关闭（补救路径下用户可随时重开）。
     overlay.addEventListener("click", (ev) => { if (ev.target === overlay) overlay.remove(); });
     document.body.appendChild(overlay);
   }
-
 
   container.formEl.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -2220,10 +2250,10 @@ export function mountChat(opts: {
   container.quitBtn.addEventListener("click", async () => { addMessage({ kind: "system", content: "→ /quit" }); await sendCommand("/quit"); });
 
   // Two explicit buttons: 暂停 and 继续. Only one is active at a time —
-  // when running you can pause, when paused you can resume. The
-  // authoritative state is reconciled by the Paused/Resumed ChatEvents
-  // (see the event handler below), so a click/event race still
-  // converges to the correct enabled/disabled state.
+  // pause engages the gate; an already-running model call or tool finishes
+  // first, then the next safe boundary parks. The authoritative state is
+  // reconciled by the Paused/Resumed ChatEvents (see the event handler
+  // below), so a click/event race still converges to the correct state.
   // ── Plan mode（只读规划模式）─────────────────────────────────
   // active 时模型侧工具被收敛为只读（read/search/ask/plan/todo 等），
   // 产出走 PlanProposed 审批流。状态由 PlanModeChanged 事件驱动（回放
@@ -2298,8 +2328,8 @@ export function mountChat(opts: {
     if (container.pauseBtn.disabled) return;
     container.pauseBtn.disabled = true;
     try {
-      // 全 session 冻结（对齐 oh-my-pi agentPauseGate）：turn / tool /
-      // subagent 一起停，后端广播 Paused 驱动按钮复位。
+      // session gate：非流式模型请求会在继续后重试同一轮；已产生输出的
+      // 流式调用和工具在安全边界完成，后端广播 Paused 驱动按钮态。
       await pauseSessionV2();
     } catch (e) {
       console.error("[chat] pause failed:", e);
@@ -2435,6 +2465,41 @@ export function mountChat(opts: {
     promptRows.delete(id);
     return false;
   }
+  /** 跨 tab / 跨 cancel 路径：删掉一张弹框卡（choice 或 plan）。
+   *  抽离出来供 main.ts 的 BroadcastChannel 监听器调用——另一 tab
+   *  dismiss 了同 id 的弹框，本 tab 也得清掉卡片 + 弹窗。 */
+  function removePrompt(id: string): void {
+    // ChoiceRequested / PlanProposed 共享 promptRows。
+    const prev = promptRows.get(id);
+    if (prev) {
+      prev.row.remove();
+      promptRows.delete(id);
+    }
+    // Choice 队列里有这条 → 摘掉。
+    const idx = choiceQueue.findIndex(
+      (x) => x.e.choice_id === id,
+    );
+    if (idx >= 0) {
+      const entry = choiceQueue[idx];
+      if (activeChoice === entry) teardownChoiceModal();
+      entry.hint.remove();
+      choiceQueue.splice(idx, 1);
+      refreshChoicePill();
+    }
+    // Plan 弹窗（独立的居中模态，元素 id = "plan-import-modal"）。
+    const planModal = document.getElementById("plan-import-modal");
+    if (planModal) {
+      const meta = planModal.querySelector<HTMLElement>("[data-plan-id]");
+      if (meta?.dataset.planId === id) {
+        planModal.remove();
+      } else {
+        // 没有携带 data-plan-id 时用 header 文本里 `(planId)` 标记做兜底。
+        const header = planModal.querySelector(".plan-import-header");
+        if (header?.textContent?.includes(`(${id})`)) planModal.remove();
+      }
+    }
+  }
+
 
   /** 弹框去重第二步：登记这条弹框渲染出的消息行。 */
   function registerPromptRow(id: string, row: HTMLElement): void {
@@ -3170,7 +3235,7 @@ export function mountChat(opts: {
         // session snapshot; roles/model are already loaded via
         // getSession, so nothing to render here.
         break;
-      case "Paused": isPaused = true; renderPauseButtons(); addMessage({ kind: "status", content: `[paused] ${e.reason}` }); break;
+      case "Paused": isPaused = true; renderPauseButtons(); addMessage({ kind: "status", content: `[paused] ${e.reason}（非流式模型请求会在继续后重试；已产生输出的流式调用/工具会先完成）` }); break;
       case "Resumed": isPaused = false; renderPauseButtons(); hideAdvisorPauseBanner(); addMessage({ kind: "status", content: "[resumed]" }); break;
       case "RoundStarted":
         addMessage({ kind: "system", content: `[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
@@ -3222,10 +3287,16 @@ export function mountChat(opts: {
         const fi = roleIcon(e.from_role), ti = roleIcon(e.to_role);
         const wfTag = e.wf_id ? ` 🔀${wfNames.get(e.wf_id) ?? "workflow"}` : "";
         const label = `${fi} ${e.from_role} → ${ti} ${e.to_role}`;
-        const isFail = e.status !== "ok";
+        // 引擎会在 context_overflow_restart 开启时立刻新建 fresh runner；这里若
+        // 先画成红色“失败”，用户会把一次可恢复的子会话重启误认为整个 workflow 已失败。
+        const isRecoverableOverflow = e.status === "failed"
+          && /context overflow|上下文(?:长度)?超(?:出|限)/i.test(e.summary ?? "");
+        const isFail = e.status !== "ok" && !isRecoverableOverflow;
         const kind = isFail ? "error" : "system";
-        const prefix = isFail ? "❌" : "✅";
-        const statusText = isFail ? `失败(${e.status})` : "ok";
+        const prefix = isRecoverableOverflow ? "↻" : isFail ? "❌" : "✅";
+        const statusText = isRecoverableOverflow
+          ? "上下文超限，正在自动重启"
+          : isFail ? `失败(${e.status})` : "ok";
         // summary 是专家返回/失败原因的正文，失败时尤其要看，拼进消息里。
         const summary = e.summary?.trim() ? `\n${truncate(e.summary, 300)}` : "";
         const msg = addMessage({ kind, content: `${prefix}${wfTag} ${fi}${e.from_role}←${ti}${e.to_role}(${statusText})${summary}`, subId: e.sub_id });
@@ -3236,8 +3307,10 @@ export function mountChat(opts: {
         // 后 session 仍在跑）也能找回那枚 ⏳ 徽章。
         const finishedBadge = delegateBadge(e.sub_id);
         if (finishedBadge) {
-          finishedBadge.textContent = isFail ? `❌ ${e.status}` : "✅ 完成";
-          finishedBadge.className = `delegate-state ${isFail ? "failed" : "done"}`;
+          finishedBadge.textContent = isRecoverableOverflow
+            ? "↻ 正在重启"
+            : isFail ? `❌ ${e.status}` : "✅ 完成";
+          finishedBadge.className = `delegate-state ${isRecoverableOverflow ? "pending" : isFail ? "failed" : "done"}`;
         }
         // 这条分派结束 → 收掉它的超时询问条。DelegateFinished 是分派
         // 结束最可靠的信号（RoleFinished 在某些路径上不带 sub_id），
@@ -3731,8 +3804,23 @@ export function mountChat(opts: {
   function setRoleFilePaths(paths: Record<string, string>): void {
     roleFilePaths = new Map(Object.entries(paths));
   }
-
-  return { appendUser, handleEvent, replayEvents, setFooter, setRoleSelected, refreshRoles, setStatus, clear, focus, insertContext, setRoleFilePaths };
+  return {
+    appendUser,
+    handleEvent,
+    replayEvents,
+    setFooter,
+    setRoleSelected,
+    refreshRoles,
+    setStatus,
+    clear,
+    focus,
+    insertContext,
+    setRoleFilePaths,
+    removePrompt,
+  };
 }
 
-function truncate(s: string, max: number): string { if (s.length<=max) return s; return s.slice(0,max)+"…"; }
+function truncate(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max) + "…";
+}

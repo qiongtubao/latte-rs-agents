@@ -70,6 +70,10 @@ pub(crate) struct SessionPersist {
     agent_cwd: Option<PathBuf>,
     lines: u64,
     bytes: u64,
+    /// 已被显式删除：为 true 时所有落盘追加/compaction 一律静默 no-op，
+    /// 避免 `delete_session` 删盘后背景任务的 `Done` 事件把文件又重新创建
+    /// 成 203 字节空壳（2026-09-26 线上实锤）。
+    deleted: bool,
 }
 
 impl SessionPersist {
@@ -119,6 +123,7 @@ impl SessionPersist {
             agent_cwd: agent_cwd.map(|p| p.to_path_buf()),
             lines: 0,
             bytes: 0,
+            deleted: false,
         })
     }
 
@@ -126,6 +131,9 @@ impl SessionPersist {
     /// 写完后 promote 到 `.latte/ui-sessions/`（无事不移），确保
     /// 不发消息的空 session 不产生痕迹。
     fn append_raw(&mut self, line: &str) -> std::io::Result<()> {
+        if self.deleted {
+            return Ok(());
+        }
         if !self.path.exists() {
             std::fs::create_dir_all(self.path.parent().expect("dir_for 确保有父目录"))?;
             let mut f = std::fs::File::create(&self.path)?;
@@ -153,9 +161,40 @@ impl SessionPersist {
         }
     }
 
+    /// 派发/登记类调用方把"已有工作负载"的 session 立即落盘：
+    /// meta 行直接写进 `ui-sessions/`（tmp 阶段是「空 tab 不落盘」的
+    /// 暂存；派发出去的 session 不再空——它有 label、有 agent_cwd 归属，
+    /// 重启必须恢复得回来，否则任务 runs[] 指向一个 404）。
+    ///
+    /// 带上当前 label（`set_label` 在文件未落盘时只改了内存缓存）。
+    /// 已落盘 / final 已存在 / deleted → no-op。
+    fn materialize(&mut self, label: &Option<String>) -> std::io::Result<()> {
+        if self.deleted || self.path.exists() || self.final_path.exists() {
+            return Ok(());
+        }
+        if let Some(l) = label {
+            self.last_label = Some(l.clone());
+        }
+        std::fs::create_dir_all(self.final_path.parent().expect("dir_for 确保有父目录"))?;
+        // 只写 meta 行：事件仍由 archiver 经 append_raw 追加（那时
+        // path 已是 final_path，走 append 分支，不会再 promote）。
+        let mut f = std::fs::File::create(&self.final_path)?;
+        use std::io::Write;
+        let meta = self.meta_line();
+        f.write_all(meta.as_bytes())?;
+        f.write_all(b"\n")?;
+        self.path = self.final_path.clone();
+        self.lines = 1;
+        self.bytes = (meta.len() + 1) as u64;
+        Ok(())
+    }
+
     /// archiver 每归档一个事件调一次：追加 + 按需 compaction。
     /// 失败只告警不打断聊天（持久化是锦上添花）。
     fn append_event(&mut self, json_line: &str, event_log: &parking_lot::RwLock<Vec<String>>) {
+        if self.deleted {
+            return;
+        }
         if let Err(e) = self.append_raw(json_line) {
             eprintln!("[ui-sessions] append {}: {e}", self.path.display());
             return;
@@ -171,6 +210,9 @@ impl SessionPersist {
     /// 最后一条 meta 生效）。文件尚未落盘时只更新内存中的
     /// `last_label`——首个事件会带着正确 label 写 meta。
     fn set_label(&mut self, label: &Option<String>) {
+        if self.deleted {
+            return;
+        }
         self.last_label = label.clone();
         if self.path.exists() {
             let line = self.meta_line();
@@ -182,6 +224,9 @@ impl SessionPersist {
 
     /// compaction：重写为 meta + event_log 当前内容（尾部窗口 ≤5000）。
     fn compact(&mut self, event_log: &parking_lot::RwLock<Vec<String>>) -> std::io::Result<()> {
+        if self.deleted {
+            return Ok(());
+        }
         let events = event_log.read().clone();
         let mut out = String::with_capacity(self.bytes.min(MAX_FILE_BYTES) as usize);
         out.push_str(&self.meta_line());
@@ -199,6 +244,7 @@ impl SessionPersist {
     }
 
     fn remove_file(&mut self) {
+        self.deleted = true;
         match std::fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -287,6 +333,7 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
             agent_cwd: agent_cwd.clone(),
             lines,
             bytes,
+            deleted: false,
         },
         agent_cwd,
         label,
@@ -312,7 +359,7 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
 ///
 /// 返回 `Some(_)` = 找到了；checkpoint 文件是否还在由调用方
 /// （`spawn_controller`）另查，避免这里多 IO 依赖。
-fn last_resumable_workflow_from_log(
+pub(crate) fn last_resumable_workflow_from_log(
     event_log: &Arc<parking_lot::RwLock<Vec<String>>>,
 ) -> Option<FailedWorkflow> {
     let log = event_log.read();
@@ -482,10 +529,11 @@ pub(crate) struct SessionSpawnParams {
     pub(crate) initial_history: Vec<latte_ai::models::Message>,
 }
 
-/// Per-tab state. Holds the controller (restored sessions spawn it
-/// lazily) and the broadcast channel the SSE stream subscribes to. Two
-/// handles never share a controller, so `/api/chat/send` on tab A is
-/// invisible to tab B's SSE stream.
+/// Per-session state. `SessionMap` 按 `session_id` 索引——同 session_id
+/// 永远只有一条 handle，多 tab 共享同一 handle / controller / broadcast
+/// `tokio::Sender`（controller 同一份、事件同源 fan-out）。不同
+/// session_id 各拿各的 handle、互不共享——`/api/chat/send` on session X
+/// 只对订阅 X 的 SSE 可见，对 Y 的 SSE 不可见。
 pub(crate) struct SessionHandle {
     pub(crate) session_id: String,
     /// controller that runs the actual chat loop and owns history.
@@ -600,6 +648,21 @@ impl SessionHandle {
         *self.label.lock() = label.clone();
         if let Some(p) = &self.persist {
             p.lock().set_label(&label);
+        }
+    }
+
+    /// 把本 session 立即落盘到 ui-sessions/（meta-only），携带当前
+    /// label。派发任务等「session 已有工作负载」的调用方用——普通
+    /// 空 tab 仍走 lazy tmp→promote，不落盘。失败只告警不阻断派发。
+    pub(crate) fn materialize(&self) {
+        if let Some(p) = &self.persist {
+            let label = self.label.lock().clone();
+            if let Err(e) = p.lock().materialize(&label) {
+                eprintln!(
+                    "[ui-sessions] materialize {}: {e}",
+                    self.session_id
+                );
+            }
         }
     }
 
@@ -1136,6 +1199,32 @@ mod tests {
         assert_eq!(history[1].as_text(), "remembered answer");
     }
 
+    #[test]
+    fn deleted_session_persist_is_disarmed_against_resurrection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut persist =
+            SessionPersist::create(dir.path(), "deleted-zombie-test", "manager", None).unwrap();
+        persist
+            .append_raw(r#"{"type":"UserMessage","text":"hello"}"#)
+            .unwrap();
+        assert!(persist.path.exists());
+
+        // 模拟 delete_session 调用的 remove_file()
+        persist.remove_file();
+        assert!(!persist.path.exists(), "文件必须已被删掉");
+
+        // 模拟背景任务延迟收到的 Done 事件、compaction 或 label 更新
+        let event_log = parking_lot::RwLock::new(vec![r#"{"type":"Done"}"#.into()]);
+        persist.append_event(r#"{"type":"Done"}"#, &event_log);
+        persist.set_label(&Some("new label".into()));
+        let _ = persist.compact(&event_log);
+        let _ = persist.append_raw(r#"{"type":"Done"}"#);
+
+        assert!(
+            !persist.path.exists(),
+            "已删除的 session 绝不能被任何后续异步写事件重新创建为僵尸文件！"
+        );
+    }
     /// 正常路径：log 末尾有一条 status != "ok" 的 WorkflowFinished，
     /// 反向扫描应找到它并组装成 FailedWorkflow。
     #[test]

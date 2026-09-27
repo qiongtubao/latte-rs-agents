@@ -10,7 +10,7 @@ Notion 侧每个任务 = `📦 agents-tasks` 根页下的子页面，props 是 J
 | `LATTE_NOTION_TOKEN` | 是 | — | notion-client `~/.config/latte/config.toml` 的 `api_token` |
 | `LATTE_NOTION_URL` | 否 | `http://127.0.0.1:3210` | notion-client 监听地址 |
 
-`token` 缺失时整个 sync 静默禁用，server 仍正常启动；dirty 保留在内存中，等下次 token 设上后重启进程才会推送。
+`token` 缺失时整个 sync 静默禁用，server 仍正常启动；dirty 标在内存 **+ 落盘标记** `.latte/.tasks-dirty/<id>`，等 token 设上、网络恢复或下次重启后自然推出去。
 
 ## 数据流
 
@@ -19,7 +19,7 @@ Notion 侧每个任务 = `📦 agents-tasks` 根页下的子页面，props 是 J
    ↓
 TaskStore.create / persist / delete
    ↓ mark_notion_dirty(id)
-[TaskStore.notion_dirty: HashSet<String>]  ← 内存态，不落盘
+[TaskStore.notion_dirty: HashSet<String>]  ← 内存 + 落盘标记 `.latte/.tasks-dirty/<id>`（重启/离线不丢）
    ↓
 [background task: notion_sync_loop, every 5s]
    ↓
@@ -27,9 +27,10 @@ take_notion_dirty() → Vec<String>
    ↓ for each id
 upsert_with_retry(http, PUT /api/ext/agents-tasks/records/{id}, 3 retries on 5xx)
    ↓
-SyncResult::Ok           → 任务从 dirty 移除
-SyncResult::ClientError  → 4xx（401/400），从 dirty 移除（不重试）
-SyncResult::RetriesExhausted → 5xx/网络，标回 dirty 等下一轮
+SyncResult::Ok           → 删盘标记 + 从 dirty 移除
+SyncResult::ClientError  → 400/404（记录本身坏），删盘标记 + 移除（不重试）
+                          → 401/403/408/429（token 错/限流等瞬时/配置错），**保留**标记等下轮
+SyncResult::RetriesExhausted → 5xx/网络，盘标记保留 + 内存标回 dirty 等下一轮
 ```
 
 ## 集成点
@@ -58,9 +59,11 @@ SyncResult::RetriesExhausted → 5xx/网络，标回 dirty 等下一轮
 
 ## 重试与失败
 
-- 4xx（401/400/404）→ 不重试，从 dirty 移除（配置/数据错）
-- 5xx/网络 → 3 次重试（500ms 退避）；仍失败标回 dirty 等下轮
-- 启动后 dirty 不丢：本地 `create/update/delete` 路径都标 dirty，重启进程后无遗言（dirty 是内存态，重启即清空——避免在 server 启动瞬间连发 dirty flush）
+- **400/404（记录本身坏）** → 不重试，从 dirty 移除（删标记）。
+- **401/403/408/429（token 错/轮换、限流等瞬时/配置错）** → 不删标记，等下轮；修好 token / 限流放开后自动补推（此前一律按 4xx 删标记 → 401 窗口内的改动被永久丢掉，修好也不会补）。
+- **5xx/网络** → 3 次重试（500ms 退避）；仍失败标回 dirty 等下轮。
+- 重启/离线 dirty 不丢：每次标 dirty 同步写 `.latte/.tasks-dirty/<id>` 标记文件（与 doc 镜像 `.docs-dirty/` 同构）；`TaskStore::load` 扫盘重建内存集，server 起来后 5s 轮自动续推。离线期间的改动也留在盘上，网络恢复后推出去。
+- **doc 镜像 record id** 用 `.docs-dirty` 的 marker 文件名（`dirty_marker_name` 已把 `/`→`.` 等转成合法 `[A-Za-z0-9._-]`），不是含 `/` 的 rel_path——后者命中不了 notion-client 单段路由/id 校验，会 404/400。真实路径在 body 的 `props.path`。
 
 ## 已知限制（v1）
 

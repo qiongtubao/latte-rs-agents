@@ -286,9 +286,10 @@ pub struct TaskStore {
     /// 绑定 workflow 的任务时登记，run 结束或 abort 时清除。abort_task
     /// 置位后 `run_workflow` 在下一个 step/speaker 边界退出。
     workflow_cancels: HashMap<String, Arc<AtomicBool>>,
-    /// Notion 同步的 dirty 集合：每次 persist 末尾 mark 任务 id，
-    /// notion_sync 后台定时任务取走并 PUT。内存态，不落盘（重启即
-    /// 清空；用户须重做变更触发重新 sync）。详见 `crate::notion_sync`。
+    /// Notion 同步的 dirty 集合：每次 persist 末尾 mark 任务 id（写内存
+    /// + 落盘标记 `.latte/.tasks-dirty/<id>`），notion_sync 后台定时任务
+    /// 取走并 PUT，成功删盘标记。重启/离线由盘标记兜底恢复，不漏推。
+    /// 详见 `crate::notion_sync`。
     notion_dirty: crate::notion_sync::DirtySet,
 }
 
@@ -339,13 +340,83 @@ impl TaskStore {
                 }
             }
         }
+        // next_seq 对账：board.json 丢失/损坏回默认，或上次 save_meta 失败，
+        // next_seq 都可能小于已存在任务的最大 seq——不纠正的话下一个 create
+        // 会分配出已有 id，`save_task` 直接覆盖旧任务文件（静默丢任务）。
+        // 这里取所有 `{id_prefix}-{seq}` 任务 id 的最大 seq，强制
+        // next_seq ≥ max+1。
+        let prefix_dash = format!("{}-", meta.id_prefix);
+        let max_seq = tasks
+            .keys()
+            .filter_map(|id| {
+                id.strip_prefix(&prefix_dash)
+                    .and_then(|rest| rest.parse::<i64>().ok())
+            })
+            .max();
+        let mut meta = meta;
+        if let Some(max_seq) = max_seq {
+            let floor = max_seq + 1;
+            if meta.next_seq < floor {
+                eprintln!(
+                    "[tasks] next_seq {} < 已用最大 seq+1={floor}，对账修正",
+                    meta.next_seq
+                );
+                meta.next_seq = floor;
+            }
+        }
+        // 兜底：board.json 损坏/缺失时把修正后的 meta 回写（原子写），
+        // 避免每次启动都靠内存对账兜同一份坏盘。
+        if meta_path.exists() {
+            // 文件在但 next_seq 被对账抬过 → 盘上是坏的，回写修正值。
+            if meta.next_seq
+                > serde_json::from_str::<BoardMeta>(
+                    &std::fs::read_to_string(&meta_path).unwrap_or_default(),
+                )
+                .map(|m| m.next_seq)
+                .unwrap_or(0)
+            {
+                let _ = write_atomic_json(&meta_path, &meta);
+            }
+        } else {
+            let _ = write_atomic_json(&meta_path, &meta);
+        }
         Ok(Self {
             dir,
             meta,
             tasks,
             workflow_cancels: HashMap::new(),
-            notion_dirty: Default::default(),
+            notion_dirty: {
+                // 重启/离线后从 `.latte/.tasks-dirty/` 重建内存 dirty 集合：
+                // 上次进程没推出去的标记落盘还在，恢复后继续推 Notion。
+                let mut s = crate::notion_sync::DirtySet::default();
+                for id in crate::notion_sync::load_dirty_from_disk(cwd) {
+                    s.restore_id(id);
+                }
+                s
+            },
         })
+    }
+
+    /// 项目根（dirty 标记目录 `.latte/.tasks-dirty/` 所在）：
+    /// `self.dir` = `<cwd>/.latte/tasks`，上溯两级。
+    /// `<cwd>/.latte/tasks/imported-plans/<plan_id>` 目录：plan_id 已被
+    /// import_tasks 成功消费的标记。两 tab 同 origin 各自 import 同
+    /// plan_id 时，第二个看到 marker 就在 409 拒绝，避免重复造任务。
+    pub(crate) fn imported_plans_dir(&self) -> std::path::PathBuf {
+        self.dir.join("imported-plans")
+    }
+    /// plan_id 是否已成功 import（落盘标记存在）。跨重启稳定——服务
+    /// 进程死了 marker 也仍在，下次重启起来仍然判重。
+    pub fn plan_already_imported(&self, plan_id: &str) -> bool {
+        self.imported_plans_dir()
+            .join(plan_id)
+            .is_file()
+    }
+    pub(crate) fn project_root(&self) -> &Path {
+        self.dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(std::path::Path::new("."))
     }
 
     pub fn meta(&self) -> &BoardMeta {
@@ -358,6 +429,12 @@ impl TaskStore {
 
     pub fn get_mut(&mut self, id: &str) -> Option<&mut Task> {
         self.tasks.get_mut(id)
+    }
+    /// 测试用：直接塞一个 task 进内存索引（不走 create 的 next_seq/落盘）。
+    /// 给反查类/取消旗标类测试造状态用。
+    #[cfg(test)]
+    pub(crate) fn insert_task_for_test(&mut self, task: Task) {
+        self.tasks.insert(task.id.clone(), task);
     }
 
     /// 全量列表（按 created_at 再按 id 排序，稳定输出）。
@@ -539,7 +616,8 @@ impl TaskStore {
         self.tasks.insert(id.clone(), task.clone());
         self.save_task(&task)?;
         self.save_meta()?;
-        self.notion_dirty.mark(&id);
+        let cwd = self.project_root().to_path_buf();
+        self.notion_dirty.mark(&cwd, &id);
         Ok(task)
     }
 
@@ -549,15 +627,16 @@ impl TaskStore {
     }
 
     /// 内存里的 `id` 当前值落盘（配合 `get_mut` 原地改后用）。
-    /// 同时把任务 id 推入 Notion 同步的 dirty 集合（纯内存态，不
-    /// 落盘——重启即清空，sync no-op）。
+    /// 同时把任务 id 推入 Notion 同步的 dirty 集合（内存 + 落盘标记
+    /// 双写，重启/离线不漏推）。
     pub fn persist(&mut self, id: &str) -> Result<(), String> {
         let t = self
             .tasks
             .get(id)
             .ok_or_else(|| format!("task {id:?} 不存在"))?;
         self.save_task(t)?;
-        self.notion_dirty.mark(id);
+        let cwd = self.project_root().to_path_buf();
+        self.notion_dirty.mark(&cwd, id);
         Ok(())
     }
 
@@ -565,7 +644,8 @@ impl TaskStore {
     /// `persist`，需要调用方显式标 dirty）。`delete` 路径在
     /// `crate::api::delete_task` 处统一调。
     pub fn mark_notion_dirty(&mut self, id: &str) {
-        self.notion_dirty.mark(id);
+        let cwd = self.project_root().to_path_buf();
+        self.notion_dirty.mark(&cwd, id);
     }
 
     /// 取出当前 dirty 集合（清空），返回 id 列表。
@@ -577,6 +657,13 @@ impl TaskStore {
     pub fn notion_dirty_count(&self) -> usize {
         self.notion_dirty.dirty_count()
     }
+    /// sync_once 期间的 take → 用户 mark → 清盘这一 race 防护：take
+    /// 后某 id 是否仍在内存 dirty 集合里（被重新 mark 过）。sync 据此
+    /// 决定是否跳过 `clear_dirty_on_disk`，避免把新 mark 静默吃掉。
+    pub fn notion_dirty_contains(&self, id: &str) -> bool {
+        self.notion_dirty.contains_after_take(id)
+    }
+
 
     fn save_meta(&self) -> Result<(), String> {
         write_atomic_json(&self.dir.join("board.json"), &self.meta)
@@ -608,6 +695,35 @@ impl TaskStore {
     /// `None` = 该任务当前没有进行中的 workflow run。
     pub fn take_workflow_cancel(&mut self, id: &str) -> Option<Arc<AtomicBool>> {
         self.workflow_cancels.remove(id)
+    }
+    /// 翻转某任务 workflow 取消旗标（**不**移除）——给 chat_abort 等
+    /// 「连带取消」场景用：多个取消路径可能并发触发（abort_task 也可能
+    /// 在另一线程走 take 路径），把旗标从 map 里拿走会让另一边误判
+    /// 已取消。旗标本身是 `Arc<AtomicBool>`，原地翻 + 留着即可。
+    pub fn flip_workflow_cancel(&mut self, id: &str) -> bool {
+        if let Some(flag) = self.workflow_cancels.get(id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+    /// 反查 session_id → 当前持有它的任务 id（仅看 in_progress 且最新
+    /// run 未结束的）。chat_abort / delete_session 用：连带取消该任务
+    /// 的 workflow 取消旗标。多个任务可能在历史里用过同一 session
+    /// （轮转 token + 重派），但只有当下还在跑的那条算。
+    pub fn task_owning_active_session(&self, session_id: &str) -> Option<String> {
+        for t in self.tasks.values() {
+            if t.state != "in_progress" {
+                continue;
+            }
+            if let Some(last) = t.runs.last() {
+                if last.session_id == session_id && last.ended_at.is_none() {
+                    return Some(t.id.clone());
+                }
+            }
+        }
+        None
     }
 
     /// 给已有任务设置 parent 时的校验（v1 的 update 不改 parent，仅
@@ -1284,9 +1400,23 @@ pub async fn import_tasks(
     b: &UiBackend,
     req: ImportTasksRequest,
 ) -> Result<ImportTasksResponse, ApiError> {
+    // plan_id 幂等：两 tab 同 origin 各自 import 同 plan_id 时，
+    // 第二个看到 marker 就在 409 拒绝，避免重复造任务。检查在拿写
+    // 锁之前可降低拒绝时的成本，但同进程并发导入仍需锁内检查—见下。
+    let mut req = req;
+    let plan_id_owned: Option<String> = req.plan_id.clone().filter(|p| !p.is_empty());
+    if let Some(plan_id) = plan_id_owned.as_deref() {
+        if b.tasks.read().plan_already_imported(plan_id) {
+            return Err(ApiError {
+                status: 409,
+                message: format!(
+                    "plan {plan_id:?} 已经被本次 server 导入过一次（重复导入防护）"
+                ),
+            });
+        }
+    }
     // 父任务三态解析：显式 parent_id（含 ""=显式根任务）优先；
     // 缺省时按 session_id 查拆分会话映射（refine 登记，页面刷新不丢）。
-    let mut req = req;
     match req.parent_id.as_deref().map(str::trim) {
         Some("") => req.parent_id = None, // 用户在弹窗显式选了「无父任务」
         Some(_) => {}                     // 显式指定，原样校验使用
@@ -1301,7 +1431,35 @@ pub async fn import_tasks(
     // 写锁作用域收口在块内：guard 不 Send，不能活过下面的 .await。
     let created = {
         let mut store = b.tasks.write();
+        // 同进程并发二次检查（读锁检查到拿写锁之间有人抢跑的可能）：
+        // 持写锁再查一次，命中则放弃。
+        if let Some(plan_id) = plan_id_owned.as_deref() {
+            if store.plan_already_imported(plan_id) {
+                return Err(ApiError {
+                    status: 409,
+                    message: format!(
+                        "plan {plan_id:?} 已经被本次 server 导入过一次（重复导入防护）"
+                    ),
+                });
+            }
+        }
         let created = import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
+        // 先写幂等标记，再写任务文件，最后销账 prompt。顺序：
+        //   1. 写 marker（成功 → 任何重试都撞 409）
+        //   2. persist 各任务（失败也不影响 marker）
+        //   3. dismiss_prompt（撤销前端弹框与跨 tab 通知）
+        // 即便 1-2 之间崩了，重启后 marker 仍在，下次 import 会被挡。
+        if let Some(plan_id) = plan_id_owned.as_deref() {
+            let dir = store.imported_plans_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let marker = dir.join(plan_id);
+            let tmp = marker.with_extension("tmp");
+            if let Err(e) = std::fs::write(&tmp, b"imported") {
+                eprintln!("[tasks] write plan-import marker {plan_id}: {e}");
+            } else if let Err(e) = std::fs::rename(&tmp, &marker) {
+                eprintln!("[tasks] rename plan-import marker {plan_id}: {e}");
+            }
+        }
         // 导入即进 todo：执行与否由用户在任务看板手动派发，不做自动调度。
         let now = now_ms();
         for id in &created {
@@ -1317,7 +1475,7 @@ pub async fn import_tasks(
     // plan 阶段门：带 plan_id 的导入 = 用户批准该任务清单。找到持有
     // 该 PendingApproval 的 session（plan 弹窗属于某个 session，stage
     // 按 session 存），置 Approved 解除实现类 delegate 拦截。
-    if let Some(plan_id) = &req.plan_id {
+    if let Some(plan_id) = plan_id_owned.as_ref() {
         approve_plan_stage(b, plan_id);
         // 清单已导入 = 弹窗已处理：从补发表销账，否则用户下次重连
         // 又被弹一遍同一份清单。
@@ -1943,6 +2101,84 @@ fn build_dispatch_message(
     msg
 }
 
+/// 任务族上下文：拆分子任务（refine）/派发时注入的**确定性**背景——
+/// 祖先链（层级语境：编号体系、粒度参照）+ 兄弟任务边界（paths/
+/// depends_on/state）。拆分时 planner 必须看到兄弟的 paths 才能避开
+/// 重叠、看到祖先链才能沿用编号体系；这些此前都没给（实测：refine
+/// 只带 title+description，「不要自造编号体系」的约束无信息可依）。
+///
+/// 故意**不带**兄弟任务的 description：注入面只要边界，内容会让
+/// planner 被兄弟细节带偏（且控长）。被拆任务本体由调用方自行附上。
+///
+/// 纯函数数据装配，零 LLM——与 submit_plan_from/require_plan_tasks
+/// 同向：确定性工作归引擎，不烧成模型调用。
+fn build_family_context(store: &TaskStore, id: &str) -> String {
+    let mut out = String::new();
+    // 祖先链：沿 parent_id 从根爬到直接父（不含本体）。visited 兜底
+    // 异常成环数据，与 check_no_cycle 同款。
+    let mut chain: Vec<&Task> = Vec::new();
+    {
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(id.to_string());
+        let mut cur = store.get(id).and_then(|t| t.parent_id.clone());
+        while let Some(pid) = cur {
+            if !visited.insert(pid.clone()) {
+                break;
+            }
+            match store.get(&pid) {
+                Some(t) => {
+                    chain.push(t);
+                    cur = t.parent_id.clone();
+                }
+                None => break,
+            }
+        }
+        chain.reverse();
+    }
+    if !chain.is_empty() {
+        out.push_str("【父任务链（根 → 直接父，含各层编号语境）】\n");
+        for t in &chain {
+            out.push_str(&format!("  [{}] {}\n", t.id, t.title));
+        }
+    }
+    // 兄弟任务：同一 parent 下的其他子任务（含已完成的——paths 边界
+    // 依然有效）。按 sub_order 排，与看板展示一致。
+    let mut siblings: Vec<Task> = store
+        .get(id)
+        .and_then(|t| t.parent_id.as_ref())
+        .map(|pid| {
+            store
+                .children_of(pid)
+                .into_iter()
+                .filter(|t| t.id != id)
+                .collect()
+        })
+        .unwrap_or_default();
+    siblings.sort_by_key(|t| t.sub_order);
+    if !siblings.is_empty() {
+        out.push_str(
+            "【兄弟任务（paths 边界：拆出的子任务 paths 不得与它们重叠；依赖看 depends_on）】\n",
+        );
+        for t in &siblings {
+            let paths = if t.paths.is_empty() {
+                "未声明".to_string()
+            } else {
+                t.paths.join(", ")
+            };
+            let deps = if t.depends_on.is_empty() {
+                String::new()
+            } else {
+                format!(" depends_on={}", t.depends_on.join(","))
+            };
+            out.push_str(&format!(
+                "  [{}] {}（{}）paths={paths}{deps}\n",
+                t.id, t.title, t.state
+            ));
+        }
+    }
+    out
+}
+
 /// `POST /api/tasks/:id/dispatch` — 立即执行（或 rework 重新派发）：
 /// 新建 ui-session → 打 label → 发首条消息给 manager →
 /// state → in_progress，runs 追加一条。`actor` ∈ `user` / `scheduler`。
@@ -2046,7 +2282,17 @@ pub async fn dispatch_task(
             message,
         });
     }
-    let (title, priority, description, children, task_type, workflow, prev_state, recent_notes) = {
+    let (
+        title,
+        priority,
+        description,
+        children,
+        task_type,
+        workflow,
+        prev_state,
+        recent_notes,
+        family_ctx,
+    ) = {
         let store = b.tasks.read();
         let t = store
             .get(id)
@@ -2077,6 +2323,7 @@ pub async fn dispatch_task(
             t.workflow.clone(),
             t.state.clone(),
             notes,
+            build_family_context(&store, id),
         )
     };
 
@@ -2089,7 +2336,16 @@ pub async fn dispatch_task(
     let info = api::create_session_in(b, agent_cwd.as_deref()).await?;
     let label = format!("[{id}] {}", title.chars().take(20).collect::<String>());
     api::set_session_label(b, &info.session_id, &label)?;
+    // 派发出去的 session 已有工作负载（label + 待跑的派发消息），立即
+    // 落盘 meta：否则服务器在「首个可归档事件落盘前」重启，tmp 壳被
+    // clean_tmp 清掉，runs[] 里的 session_id 变成 404——「查看对话」
+    // 点开报错、又要重新点立即执行。materialize 是 best-effort（失败
+    // 只 eprintln），不阻断派发。
+    api::materialize_session(b, &info.session_id).await.ok();
     let base_msg = build_dispatch_message(id, &title, priority, &description, &children);
+    // 任务族上下文（祖先链 + 兄弟 paths 边界）随本体一起下发：子任务
+    // 执行时要知道自己在任务树里的位置，paths 声明的避让边界也在此。
+    let base_msg = format!("{base_msg}{family_ctx}");
 
     // 4. workflow 绑定分支：`mode` 决定重做方式。
     //    - "redo"（默认）：**优先按 task_type 默认 workflow 推导**，显式 workflow
@@ -2141,12 +2397,26 @@ pub async fn dispatch_task(
         let msg = format!("{base_msg}{feedback}");
         api::chat_send(b, Some(&info.session_id), &msg).await?;
         // 无绑定路径：直接跳到状态更新（wf_run = None）
+        // 写锁内复查 state：step-0 的校验已释放→await 到这里之间，
+        // 另一并发请求可能已把同一任务派成 in_progress 并 push 了 run。
+        // 不复查则双派发：双 session、双 token、隔离任务同一 worktree 覆盖。
         let now = now_ms();
         let mut store = b.tasks.write();
         {
             let t = store
                 .get_mut(id)
                 .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+            if t.state != "todo" && t.state != "rework" {
+                // 已被并发派发：拒绝；本请求建的 session 留作孤儿无害
+                // （重启后 reconcile 也不会动它——只 dispatch 状态回退）。
+                return Err(ApiError {
+                    status: 409,
+                    message: format!(
+                        "state {:?} 不可派发（已并发被另一请求派发）",
+                        t.state
+                    ),
+                });
+            }
             t.set_state("in_progress", actor, None, now);
             t.scheduled_at = None;
             // 真派出去了 → 清「待派发」，否则 scheduler 会一直重试它。
@@ -2171,13 +2441,24 @@ pub async fn dispatch_task(
     api::session_record_user_input(b, &info.session_id, &msg).await?;
     let wf_run = Some((wf, event_tx, Arc::new(AtomicBool::new(false)), msg));
 
-    // 5. 写锁更新状态（任务可能已被并发删除 → 404，session 留着无害）。
+    // 写锁内复查 state：step-0 读锁校验已释放，await 期间另一并发请求
+    // 可能已把同一任务派成 in_progress 并 push 了 run。不复查则双派发：
+    // 双 session、双 token、隔离任务同一 worktree 覆盖。
     let now = now_ms();
     let mut store = b.tasks.write();
     {
         let t = store
             .get_mut(id)
             .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        if t.state != "todo" && t.state != "rework" {
+            return Err(ApiError {
+                status: 409,
+                message: format!(
+                    "state {:?} 不可派发（已并发被另一请求派发）",
+                    t.state
+                ),
+            });
+        }
         t.set_state("in_progress", actor, None, now);
         t.scheduled_at = None;
         t.dispatch_pending = false;
@@ -2379,8 +2660,8 @@ pub struct RefineTaskResponse {
 /// 任意层级的任务都可再拆（任务树深度不限）；执行中（in_progress/
 /// merging）的任务不可拆。
 pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, ApiError> {
-    // 1. 读锁内校验 + 收集消息素材（不持锁跨 await）。
-    let (title, description) = {
+    // 读锁内校验 + 收集消息素材（含任务族上下文：祖先链 + 兄弟边界）。
+    let (title, description, family_ctx) = {
         let store = b.tasks.read();
         let t = store
             .get(id)
@@ -2391,7 +2672,8 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
                 t.state
             )));
         }
-        (t.title.clone(), t.description.clone())
+        let family_ctx = build_family_context(&store, id);
+        (t.title.clone(), t.description.clone(), family_ctx)
     };
 
     // 2. workflow 必须在建 session 之前加载成功（失败不改任何状态）。
@@ -2403,9 +2685,8 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
     let label = format!("[{id}] 拆分 {}", title.chars().take(20).collect::<String>());
     api::set_session_label(b, &info.session_id, &label)?;
     let msg = format!(
-        "[任务拆分 {id}] {title}\n描述：{description}\n请把该任务拆分为可独立执行、可独立验收的子任务，并用 plan 工具一次性提交完整清单（导入后它们将作为 {id} 的子任务出现在任务看板）。"
+        "[任务拆分 {id}] {title}\n描述：{description}\n{family_ctx}\n请把该任务拆分为可独立执行、可独立验收的子任务，并用 plan 工具一次性提交完整清单（导入后它们将作为 {id} 的子任务出现在任务看板）。"
     );
-    api::session_record_user_input(b, &info.session_id, &msg).await?;
     let event_tx = api::session_event_sender(b, &info.session_id).await?;
 
     // 4. 登记 拆分会话 → 父任务 映射（server 侧，页面刷新不丢）+ 任务
@@ -2416,11 +2697,15 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
     {
         let mut store = b.tasks.write();
         if let Some(t) = store.get_mut(id) {
+            // 拆分请求原文（含注入的父链+兄弟摘要）进 history：
+            // ① 看板可见 planner 拿到的完整上下文，不再是黑盒；
+            // ② 测试可断言族上下文确实注进了拆分请求。
             t.push_note(
                 "user",
                 format!("已发起拆分（session {}）", info.session_id),
                 now_ms(),
             );
+            t.push_note("refine", msg.clone(), now_ms());
             if let Err(e) = store.persist(id) {
                 eprintln!("[tasks] persist {id} after refine: {e}");
             }
@@ -3172,6 +3457,248 @@ pub async fn task_worktree_diff(
 /// 上限存在的理由：一次大重构能改上千个文件，全塞进 HTTP 响应只会拖慢抽屉。
 const WORKTREE_DIFF_MAX_FILES: usize = 40;
 
+// ─── Workflow 执行流水（任务级） ─────────────────────────────────
+
+/// 单条 step 的 checkpoint 记录（与 `latte_agent_core::workflow::CheckpointRecord`
+/// 同形，但只取 UI 需要的字段；时间戳单位是**秒**）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWorkflowRunStep {
+    pub step_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_key: Option<String>,
+    /// step 产出全文（详情接口才填，列表接口为节省流量置空）。
+    pub output: String,
+    /// unix 秒。
+    pub finished_at: u64,
+}
+
+/// 一条 workflow run 的列表视图（`GET /api/tasks/:id/workflow-runs` 返回数组元素）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWorkflowRunSummary {
+    pub wf_id: String,
+    pub workflow_name: String,
+    /// 首行 meta 的 topic 截断预览（≤200 字符）。
+    pub topic_preview: String,
+    /// unix 秒。
+    pub started_at: u64,
+    /// run 所属的 UI session（merge 等 lifecycle hook 复用任务最后一个 run 的 session）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// 已完成的 step 数。
+    pub step_count: usize,
+    /// 最后一个完成的 step_id（运行中/失败时可用来定位卡点）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_step_id: Option<String>,
+    /// 最后一次 step 完成时间（unix 秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_finished_at: Option<u64>,
+}
+
+/// 一条 workflow run 的完整详情（`GET /api/tasks/:id/workflow-runs/:wf_id`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWorkflowRunDetail {
+    #[serde(flatten)]
+    pub summary: TaskWorkflowRunSummary,
+    /// 完整 topic（不截断）。
+    pub topic: String,
+    /// 按完成顺序的全部 step（含 output 全文）。
+    pub steps: Vec<TaskWorkflowRunStep>,
+    /// run 里记录的用户回答（learn_loop 之类有交互问答的 workflow）。
+    pub answers: Vec<TaskWorkflowRunAnswer>,
+}
+
+/// workflow run 中用户在 ask 弹框里给出的回答（`CheckpointRecord::Answer`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWorkflowRunAnswer {
+    pub role: String,
+    pub question: String,
+    pub answer: String,
+    /// unix 秒。
+    pub answered_at: u64,
+}
+
+/// 读 `<cwd>/.latte/workflow-runs/<wf_id>.jsonl`，解析成 (summary, detail_parts)。
+/// 文件不存在/首行不是 meta → Err(None-ish)；中途坏行跳过。
+fn read_workflow_run_jsonl(
+    path: &Path,
+) -> Result<
+    (
+        TaskWorkflowRunSummary,
+        String,
+        Vec<TaskWorkflowRunStep>,
+        Vec<TaskWorkflowRunAnswer>,
+    ),
+    String,
+> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+    let mut meta: Option<serde_json::Value> = None;
+    let mut steps: Vec<TaskWorkflowRunStep> = Vec::new();
+    let mut answers: Vec<TaskWorkflowRunAnswer> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+        match ty {
+            "meta" => meta = Some(v),
+            "step" => {
+                let step_id = v
+                    .get("step_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output_key = v
+                    .get("output_key")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                let output = v
+                    .get("output")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let finished_at = v.get("finished_at").and_then(|n| n.as_u64()).unwrap_or(0);
+                steps.push(TaskWorkflowRunStep {
+                    step_id,
+                    output_key,
+                    output,
+                    finished_at,
+                });
+            }
+            "answer" => {
+                answers.push(TaskWorkflowRunAnswer {
+                    role: v
+                        .get("role")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    question: v
+                        .get("question")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    answer: v
+                        .get("answer")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    answered_at: v.get("answered_at").and_then(|n| n.as_u64()).unwrap_or(0),
+                });
+            }
+            _ => {}
+        }
+    }
+    let meta = meta.ok_or_else(|| format!("{} 缺 meta 首行", path.display()))?;
+    let wf_id = meta
+        .get("wf_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let workflow_name = meta
+        .get("workflow_name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let topic = meta
+        .get("topic")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let started_at = meta.get("started_at").and_then(|n| n.as_u64()).unwrap_or(0);
+    let session_id = meta
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    let last_step = steps.last();
+    let summary = TaskWorkflowRunSummary {
+        wf_id,
+        workflow_name,
+        topic_preview: topic.chars().take(200).collect(),
+        started_at,
+        session_id,
+        step_count: steps.len(),
+        last_step_id: last_step.map(|s| s.step_id.clone()),
+        last_finished_at: last_step.map(|s| s.finished_at),
+    };
+    Ok((summary, topic, steps, answers))
+}
+
+/// 列出某任务关联的所有 workflow run（按 started_at 升序）。
+///
+/// 关联口径：run 首行 `meta.session_id` ∈ `task.runs[].session_id`。
+/// merge 等 lifecycle hook 刻意复用任务最后一个 run 的 session（见
+/// `spawn_lifecycle_hook`），所以同一 session 可能挂多条 run——
+/// `learn_loop`/`code_review`/`merge` 会同时出现在一个任务下。
+pub fn task_workflow_runs(
+    b: &UiBackend,
+    id: &str,
+) -> Result<Vec<TaskWorkflowRunSummary>, ApiError> {
+    let session_ids: std::collections::HashSet<String> = {
+        let store = b.tasks.read();
+        let t = store
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        t.runs.iter().map(|r| r.session_id.clone()).collect()
+    };
+    if session_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dir = b.cwd.join(".latte").join("workflow-runs");
+    let mut out: Vec<TaskWorkflowRunSummary> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok((summary, _, _, _)) = read_workflow_run_jsonl(&path) else {
+                continue;
+            };
+            let Some(sid) = &summary.session_id else {
+                continue;
+            };
+            if session_ids.contains(sid) {
+                out.push(summary);
+            }
+        }
+    }
+    out.sort_by_key(|s| s.started_at);
+    Ok(out)
+}
+
+/// 取某任务下一条 workflow run 的完整详情（含全部 step output 全文）。
+/// `wf_id` 必须在任务关联的 run 集合里（先 list 过滤，避免任意 id 读盘）。
+pub fn task_workflow_run_detail(
+    b: &UiBackend,
+    id: &str,
+    wf_id: &str,
+) -> Result<TaskWorkflowRunDetail, ApiError> {
+    // 先 list 过滤：wf_id 必须属于该任务（防止任意路径遍历）。
+    let list = task_workflow_runs(b, id)?;
+    if !list.iter().any(|s| s.wf_id == wf_id) {
+        return Err(ApiError::not_found(format!(
+            "task {id:?} 下没有 workflow run {wf_id:?}"
+        )));
+    }
+    let path = b
+        .cwd
+        .join(".latte")
+        .join("workflow-runs")
+        .join(format!("{wf_id}.jsonl"));
+    let (summary, topic, steps, answers) =
+        read_workflow_run_jsonl(&path).map_err(ApiError::internal)?;
+    Ok(TaskWorkflowRunDetail {
+        summary,
+        topic,
+        steps,
+        answers,
+    })
+}
+
 /// `POST /api/tasks/:id/report` — manager 回报：run 补 ended_at/result；
 /// completed → human_review，其他 → todo。history actor=manager。
 pub fn report_task(
@@ -3478,6 +4005,42 @@ mod tests {
         store
             .create(title, "desc", 2, vec![], None, None, None, None, "user")
             .expect("create")
+    }
+
+    /// board.json 坏/丢 → next_seq 回绕 → 新任务覆盖旧任务文件（静默丢）。
+    /// load 对账必须强制 next_seq ≥ 已用最大 seq+1，且回写修正值。
+    #[test]
+    fn load_reconciles_next_seq_after_board_loss() {
+        let (dir, mut store) = tmp_store();
+        let t1 = make_task(&mut store, "旧任务"); // LAT-100
+        assert_eq!(t1.id, "LAT-100");
+        // 模拟 board.json 损坏/回绕：写一份 next_seq 倒退的版本。
+        let meta_path = dir.path().join(".latte/tasks/board.json");
+        let mut bad: BoardMeta = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path).unwrap(),
+        )
+        .unwrap();
+        bad.next_seq = 100; // 回绕到起点
+        std::fs::write(&meta_path, serde_json::to_string(&bad).unwrap()).unwrap();
+        drop(store);
+
+        // 重启加载：对账把 next_seq 抬到 max(seq)+1 = 101。
+        let mut store2 = TaskStore::load(dir.path()).expect("reload");
+        assert!(
+            store2.meta().next_seq >= 101,
+            "next_seq 应对账到 ≥101，实际 {}",
+            store2.meta().next_seq
+        );
+        // 新任务拿到全新 id，不覆盖 LAT-100。
+        let t2 = make_task(&mut store2, "新任务");
+        assert_ne!(t2.id, "LAT-100", "新任务不得复用已用 id");
+        assert!(store2.get("LAT-100").is_some(), "旧任务不能被覆盖丢");
+        // 盘上的 board.json 也应被回写修正（下次启动不再回绕）。
+        let fixed: BoardMeta = serde_json::from_str(
+            &std::fs::read_to_string(&meta_path).unwrap(),
+        )
+        .unwrap();
+        assert!(fixed.next_seq >= 101, "board.json 应回写修正后的 next_seq");
     }
 
     // ─── ImportTask.paths 字段名别名 ─────────────────────────────────
@@ -5506,6 +6069,115 @@ mod tests {
         assert_eq!(handle.agent_cwd_for_test(), root, "agent 必须跑在工作树里");
     }
 
+    /// 「立即执行」后、首个可归档事件落盘前服务器重启：派发出的
+    /// session 必须能从 ui-sessions/ 恢复回来。此前 session 要等首个
+    /// ChatEvent 才从 tmp/ promote，重启时 tmp 壳被 clean_tmp 清掉，
+    /// runs[] 里的 session_id 变成 404——「查看对话」点开报错、要
+    /// 重新点立即执行。`materialize_session` 在派发时就把 meta+label
+    /// 写进 ui-sessions/，堵住这个窗口。
+    #[tokio::test]
+    async fn dispatched_session_survives_restart_before_first_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = git_backend(&dir);
+        // 非隔离 + 无 task_type → 走 manager chat_send 路径，派发消息
+        // 立即进事件流；但即便 workflow 路径这里也成立：materialize 在
+        // session_event_sender 之前就落了盘。
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [{ "title": "重启后还要能看会话" }]}),
+        )
+        .await;
+        dispatch_task(&b, &ids[0], "user", "redo")
+            .await
+            .expect("派发");
+        let sid = b
+            .tasks
+            .read()
+            .get(&ids[0])
+            .unwrap()
+            .runs
+            .last()
+            .unwrap()
+            .session_id
+            .clone();
+
+        // 派发路径上 session 文件已落盘到 ui-sessions/（不依赖事件归档）。
+        let persisted = dir
+            .path()
+            .join(".latte/ui-sessions")
+            .join(format!("{sid}.jsonl"));
+        assert!(
+            persisted.is_file(),
+            "派发必须把 session meta 落盘，{} 不存在",
+            persisted.display()
+        );
+        // meta 行里带着 [task-id] label（恢复后列表不显示成空白）。
+        let raw = std::fs::read_to_string(&persisted).unwrap();
+        let meta = raw.lines().next().expect("meta line");
+        assert!(
+            meta.contains(&ids[0]),
+            "meta label 应含任务 id：{meta}"
+        );
+
+        // 模拟重启：丢弃旧 backend，UiBackend::new 重新扫盘恢复。
+        drop(b);
+        let b2 = test_backend(&dir);
+        let restored = b2
+            .sessions
+            .read()
+            .get(&sid)
+            .cloned()
+            .expect("重启后 runs[] 指向的 session 必须恢复得回来");
+        assert!(restored.restored, "应从落盘恢复（restored 标记）");
+        // 与生产启动一致：server 起来后对账中断的 run（in_progress → todo）。
+        reconcile_interrupted_runs(&b2);
+        let expected_label = format!("[{}] {}", ids[0], "重启后还要能看会话");
+        assert_eq!(
+            restored.label.lock().as_deref(),
+            Some(expected_label.as_str()),
+            "label 应随 meta 恢复",
+        );
+        // 任务本体也恢复且保持重启对账语义（run 中断 → 回 todo）。
+        let t = b2.tasks.read().get(&ids[0]).unwrap().clone();
+        assert_eq!(t.state, "todo", "中断的任务回 todo 待重派");
+        assert_eq!(t.runs.last().unwrap().session_id, sid, "runs 关联仍在");
+    }
+    /// 同一任务并发派发两次（双击/两 tab 同时点）：写锁内复查 state
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_dispatch_on_same_task_only_one_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = std::sync::Arc::new(git_backend(&dir));
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [{ "title": "竞态派发" }]}),
+        )
+        .await;
+        let id = ids[0].clone();
+
+        // 两个 dispatch 并发触发。join 收集结果。
+        let b1 = b.clone();
+        let id1 = id.clone();
+        let h1 = tokio::spawn(async move { dispatch_task(&b1, &id1, "user", "redo").await });
+        let b2 = b.clone();
+        let id2 = id.clone();
+        let h2 = tokio::spawn(async move { dispatch_task(&b2, &id2, "user", "redo").await });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.status == 409))
+            .count();
+        assert_eq!(oks, 1, "只有第一个该派成功：{:?} / {:?}", r1, r2);
+        assert_eq!(conflicts, 1, "另一个必须收到 409：{:?} / {:?}", r1, r2);
+
+        // 任务状态 in_progress，runs 只有一条（无双 session）。
+        let t = b.tasks.read().get(&id).unwrap().clone();
+        assert_eq!(t.state, "in_progress");
+        assert_eq!(t.runs.len(), 1, "并发双派只 push 一条 run");
+    }
+
     /// 隔离任务**免文件冲突闸**：两个 paths 完全重叠的隔离任务可以同时跑
     /// （各写各的树，物理上不可能互相覆盖）。这是 Phase 2 的核心收益。
     #[tokio::test]
@@ -6026,6 +6698,68 @@ mod tests {
         assert_eq!(b.tasks.read().get(&resp.created[0]).unwrap().state, "todo");
     }
 
+    /// 两 tab 同 origin 各自 import 同 plan_id（双击 / 跨 tab 同步导入）：
+    /// 第二个应被 409 拒绝，落盘 marker 锁住同 plan_id 后续所有 import。
+    /// 修前 import_tasks 无 plan_id 幂等保护，双 tab 各自走完流程会造
+    /// 两份完全相同的任务。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_same_plan_id_concurrently_only_one_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = std::sync::Arc::new(test_backend(&dir));
+        let make_req = || serde_json::from_value::<ImportTasksRequest>(serde_json::json!({
+            "plan_id": "plan-manager-dup",
+            "tasks": [{ "title": "重复导入候选" }, { "title": "再来一份" }]
+        }))
+        .expect("parse req");
+        let h1 = {
+            let b = b.clone();
+            tokio::spawn(async move { import_tasks(&b, make_req()).await })
+        };
+        let h2 = {
+            let b = b.clone();
+            tokio::spawn(async move { import_tasks(&b, make_req()).await })
+        };
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let conflicts = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.status == 409))
+            .count();
+        assert_eq!(oks, 1, "并发导入只该成功一个：{:?} / {:?}", r1, r2);
+        assert_eq!(conflicts, 1, "另一个必须 409：{:?} / {:?}", r1, r2);
+        // 只造出 2 条任务（不是 4）。
+        let store = b.tasks.read();
+        let n = store.list().iter().filter(|t| t.state == "todo").count();
+        assert_eq!(n, 2, "重复防护后任务数应是一次导入的 2 条，不是 4 条");
+        // marker 落盘存在。
+        assert!(b.tasks.read().plan_already_imported("plan-manager-dup"));
+    }
+
+    /// 同 plan_id 串行二次导入：第二次必须 409，**不**重新造任务。
+    #[tokio::test]
+    async fn import_same_plan_id_sequentially_second_call_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "plan_id": "plan-manager-seq",
+            "tasks": [{ "title": "甲" }]
+        }))
+        .expect("parse req");
+        let r1 = import_tasks(&b, req.clone()).await.expect("first ok");
+        assert_eq!(r1.created.len(), 1);
+        let r2 = import_tasks(&b, req).await.expect_err("second need 409");
+        assert_eq!(r2.status, 409);
+        // 不带 plan_id 的导入不受 marker 影响。
+        let req3: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{ "title": "无 plan 来源" }]
+        }))
+        .expect("parse req");
+        let r3 = import_tasks(&b, req3).await.expect("no-plan ok");
+        assert_eq!(r3.created.len(), 1);
+    }
+
+
     /// 拆分导入：带 parent_id 的导入全部挂为该父任务的子任务。
     #[tokio::test]
     async fn import_with_parent_id_creates_children() {
@@ -6434,5 +7168,370 @@ mod tests {
             .as_deref()
             .unwrap_or_default();
         assert!(note.contains("无进行中的 run"), "{note}");
+    }
+
+    // ─── build_family_context：拆分/派发注入的祖先链 + 兄弟边界 ──────
+    //
+    // 契约：被拆任务的 planner 必须能看到父链（编号体系参照）和兄弟
+    // 任务的 paths/depends_on（paths 避让边界），不含兄弟 description。
+
+    #[test]
+    fn family_context_root_task_empty() {
+        let (_dir, mut store) = tmp_store();
+        let t = make_task(&mut store, "根任务");
+        assert!(
+            build_family_context(&store, &t.id).is_empty(),
+            "根任务无父无兄弟 → 无上下文"
+        );
+    }
+
+    #[test]
+    fn family_context_ancestor_chain_root_to_parent() {
+        let (_dir, mut store) = tmp_store();
+        let root = make_task(&mut store, "L1：学透仓库");
+        let mid = store
+            .create(
+                "L2：内存管理",
+                "desc",
+                2,
+                vec![],
+                None,
+                Some(root.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        let leaf = store
+            .create(
+                "L3：extent 层",
+                "desc",
+                2,
+                vec![],
+                None,
+                Some(mid.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        let ctx = build_family_context(&store, &leaf.id);
+        assert!(ctx.contains("父任务链"), "{ctx}");
+        let i_root = ctx.find("L1：学透仓库").expect("根在链中");
+        let i_mid = ctx.find("L2：内存管理").expect("中间层在链中");
+        assert!(i_root < i_mid, "链序必须是 根 → 直接父");
+        assert!(
+            !ctx.contains(&leaf.title),
+            "被拆任务本体不进父链（由调用方另附）"
+        );
+    }
+
+    #[test]
+    fn family_context_siblings_carry_paths_and_deps_not_description() {
+        let (_dir, mut store) = tmp_store();
+        let parent = make_task(&mut store, "L2：精读主线");
+        let older = store
+            .create(
+                "L2.1：fastpath",
+                "机密描述甲",
+                2,
+                vec![],
+                None,
+                Some(parent.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        let me = store
+            .create(
+                "L2.2：slowpath",
+                "desc",
+                2,
+                vec![],
+                None,
+                Some(parent.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        let younger = store
+            .create(
+                "L2.3：底层原理",
+                "desc",
+                2,
+                vec![],
+                None,
+                Some(parent.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        // 兄任务声明 paths + depends_on；弟任务留空。
+        {
+            let t = store.get_mut(&older.id).unwrap();
+            t.paths = vec!["src/arena.c".into(), "src/extent.c".into()];
+        }
+        store
+            .set_depends_on(&younger.id, vec![me.id.clone()])
+            .expect("set deps");
+        let ctx = build_family_context(&store, &me.id);
+        assert!(ctx.contains("兄弟任务"), "{ctx}");
+        assert!(ctx.contains("L2.1：fastpath"), "{ctx}");
+        assert!(ctx.contains("src/arena.c"), "兄弟 paths 必须可见：{ctx}");
+        assert!(ctx.contains(&format!("depends_on={}", me.id)), "{ctx}");
+        assert!(ctx.contains("L2.3：底层原理"), "{ctx}");
+        assert!(
+            !ctx.contains("机密描述甲"),
+            "兄弟 description 不注入（只给边界）"
+        );
+        assert!(!ctx.contains(&format!("[{}] L2.2", me.id)), "自身不算兄弟");
+    }
+
+    #[test]
+    fn family_context_undeclared_paths_marked() {
+        let (_dir, mut store) = tmp_store();
+        let parent = make_task(&mut store, "父");
+        store
+            .create(
+                "兄",
+                "desc",
+                2,
+                vec![],
+                None,
+                Some(parent.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        let me = store
+            .create(
+                "我",
+                "desc",
+                2,
+                vec![],
+                None,
+                Some(parent.id.clone()),
+                None,
+                None,
+                "user",
+            )
+            .expect("create");
+        let ctx = build_family_context(&store, &me.id);
+        assert!(ctx.contains("paths=未声明"), "空 paths 要显式标注：{ctx}");
+    }
+
+    /// 无限深度拆分：任意层数祖先链都按 根→父 全量给出。
+    #[test]
+    fn family_context_unbounded_depth() {
+        let (_dir, mut store) = tmp_store();
+        let mut parent: Option<String> = None;
+        let mut leaf = String::new();
+        for depth in 1..=6 {
+            let t = store
+                .create(
+                    &format!("L{depth}"),
+                    "desc",
+                    2,
+                    vec![],
+                    None,
+                    parent.clone(),
+                    None,
+                    None,
+                    "user",
+                )
+                .expect("create");
+            leaf = t.id.clone();
+            parent = Some(t.id);
+        }
+        let ctx = build_family_context(&store, &leaf);
+        let pos: Vec<usize> = (1..=5)
+            .map(|d| {
+                ctx.find(&format!("] L{d}"))
+                    .unwrap_or_else(|| panic!("L{d} 应在父链: {ctx}"))
+            })
+            .collect();
+        assert!(
+            pos.windows(2).all(|w| w[0] < w[1]),
+            "深度不限的父链必须按 根→父 排序: {ctx}"
+        );
+    }
+    /// 拆分请求注入族上下文：深拆（L2 再拆 L3）时 planner 必须看到
+    /// 祖先链（L1 → L2 编号语境）与兄弟任务的 paths 边界。
+    #[tokio::test]
+    async fn refine_request_carries_family_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wf_dir = dir.path().join(".latte").join("workflows.d");
+        std::fs::create_dir_all(&wf_dir).expect("mkdir workflows.d");
+        std::fs::write(
+            wf_dir.join("task_refine.toml"),
+            "name = \"task_refine\"\nmax_rounds = 1\n[[steps]]\nid = \"refine\"\nspeakers = [\"manager\"]\nprompt = \"拆分\"\n",
+        )
+        .expect("write workflow");
+        let b = test_backend(&dir);
+        // 三层树：L1 根 → L2（带兄弟 L2a）→ 被拆的 L3 候选父。
+        let l1 = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({"title": "L1：学透仓库"})).unwrap(),
+        )
+        .expect("l1");
+        let l2 = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({
+            "title": "L2：内存管理", "parent_id": l1.task.id }))
+            .unwrap(),
+        )
+        .expect("l2");
+        let l2a = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({
+            "title": "L2a：并发模型", "parent_id": l1.task.id, "paths": ["src/threads.c"] }))
+            .unwrap(),
+        )
+        .expect("l2a");
+        // 被拆任务 = L2 的子任务（深拆），兄弟 = L2a？不——兄弟同 parent。
+        // L2 下建两个子任务：被拆的 + 一个带 paths 的兄弟。
+        let target = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({
+            "title": "L2.1：extent 层精读", "parent_id": l2.task.id }))
+            .unwrap(),
+        )
+        .expect("target");
+        let sib = create_task(
+            &b,
+            serde_json::from_value(serde_json::json!({
+            "title": "L2.2：tcache 精读", "parent_id": l2.task.id, "paths": ["src/tcache.c"] }))
+            .unwrap(),
+        )
+        .expect("sib");
+        b.tasks.write().get_mut(&sib.task.id).unwrap().paths = vec!["src/tcache.c".into()];
+
+        let _ = l2a; // L2a 是叔辈（parent 的兄弟），不应出现在本任务的兄弟段
+        let resp = refine_task(&b, &target.task.id).await.expect("refine");
+        assert!(!resp.session_id.is_empty());
+
+        let store = b.tasks.read();
+        let t = store.get(&target.task.id).unwrap();
+        // history 里应有一条 refine 原文，含父链与兄弟摘要。
+        let req = t
+            .history
+            .iter()
+            .rev()
+            .filter_map(|h| h.note.as_deref())
+            .find(|n| n.contains("任务拆分"))
+            .expect("refine 请求原文应入 history");
+        assert!(req.contains("父任务链"), "缺父链：{req}");
+        assert!(req.contains("L1：学透仓库"), "{req}");
+        assert!(req.contains("L2：内存管理"), "{req}");
+        assert!(req.contains("兄弟任务"), "缺兄弟段：{req}");
+        assert!(req.contains("L2.2：tcache 精读"), "{req}");
+        assert!(req.contains("src/tcache.c"), "兄弟 paths 要可见：{req}");
+        assert!(
+            !req.contains("L2a：并发模型"),
+            "叔辈不是兄弟，不该进兄弟段：{req}"
+        );
+    }
+
+    // ─── TaskWorkflowRun*：任务级 workflow run 流水 ────────────────────
+
+    /// 按 session_id 把 `.latte/workflow-runs/*.jsonl` 反查回任务：
+    /// merge / code_review / task_archive 等 lifecycle hook 复用任务最后
+    /// 一个 run 的 session（见 spawn_lifecycle_hook），所以同一 session
+    /// 可能挂多条 run——这里验证关联正确、且 step 顺序保留。
+    #[test]
+    fn task_workflow_runs_links_via_session_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let task = {
+            let mut store = b.tasks.write();
+            let t = store
+                .create("T", "d", 2, vec![], None, None, None, None, "user")
+                .expect("create");
+            // 塞两条 run：主派发 session 是 sess-1（learn_loop/code_review
+            // 都挂在它下面），第二次派发 sess-2。merge 会复用 sess-2。
+            let mut t = t;
+            t.runs.push(TaskRun {
+                session_id: "sess-1".into(),
+                started_at: 1000,
+                ended_at: Some(2000),
+                result: Some("completed".into()),
+            });
+            t.runs.push(TaskRun {
+                session_id: "sess-2".into(),
+                started_at: 3000,
+                ended_at: None,
+                result: None,
+            });
+            *store.get_mut(&t.id).unwrap() = t.clone();
+            store.persist(&t.id).unwrap();
+            t
+        };
+
+        // 造两条 workflow run：learn_loop 挂 sess-1，merge 挂 sess-2。
+        // 再加一条无关 run（sess-other）验证不误关联。
+        let runs_dir = dir.path().join(".latte").join("workflow-runs");
+        std::fs::create_dir_all(&runs_dir).unwrap();
+        std::fs::write(
+            runs_dir.join("wf-learn_loop-1.jsonl"),
+            concat!(
+                r#"{"type":"meta","wf_id":"wf-learn_loop-1","workflow_name":"learn_loop","topic":"T desc","started_at":1500,"session_id":"sess-1"}"#,
+                "\n",
+                r#"{"type":"step","wf_id":"wf-learn_loop-1","workflow_name":"learn_loop","topic":"T desc","step_id":"plan","output_key":"plan_out","output":"plan output","finished_at":1600}"#,
+                "\n",
+                r#"{"type":"step","wf_id":"wf-learn_loop-1","workflow_name":"learn_loop","topic":"T desc","step_id":"tutor","output_key":null,"output":"tutor output","finished_at":1700}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            runs_dir.join("wf-merge-1.jsonl"),
+            concat!(
+                r#"{"type":"meta","wf_id":"wf-merge-1","workflow_name":"merge","topic":"T merge","started_at":4000,"session_id":"sess-2"}"#,
+                "\n",
+                r#"{"type":"step","wf_id":"wf-merge-1","workflow_name":"merge","topic":"T merge","step_id":"final_check","output_key":"check","output":"check out","finished_at":4100}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            runs_dir.join("wf-other-1.jsonl"),
+            r#"{"type":"meta","wf_id":"wf-other-1","workflow_name":"merge","topic":"X","started_at":4500,"session_id":"sess-other"}"#,
+        )
+        .unwrap();
+
+        let runs = task_workflow_runs(&b, &task.id).expect("list");
+        assert_eq!(runs.len(), 2, "只应关联 sess-1/sess-2 的 run：{runs:?}");
+        assert_eq!(runs[0].wf_id, "wf-learn_loop-1", "按 started_at 升序");
+        assert_eq!(runs[1].wf_id, "wf-merge-1");
+        assert_eq!(runs[0].step_count, 2);
+        assert_eq!(runs[0].last_step_id.as_deref(), Some("tutor"));
+        assert_eq!(runs[1].last_step_id.as_deref(), Some("final_check"));
+
+        // detail：拿到完整 step output + 不属于本任务的 wf_id 应 404。
+        let detail = task_workflow_run_detail(&b, &task.id, "wf-learn_loop-1").expect("detail");
+        assert_eq!(detail.steps.len(), 2);
+        assert_eq!(detail.steps[0].step_id, "plan");
+        assert_eq!(detail.steps[0].output, "plan output");
+        let err = task_workflow_run_detail(&b, &task.id, "wf-other-1").unwrap_err();
+        assert_eq!(err.status, 404, "外任务 run 应 404：{err:?}");
+    }
+
+    /// 任务还没派发过 → `runs` 空 → 流水必然空（lifecycle hook 还没挂上来）。
+    #[test]
+    fn task_workflow_runs_empty_when_never_dispatched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let task = {
+            let mut store = b.tasks.write();
+            store
+                .create("T", "d", 2, vec![], None, None, None, None, "user")
+                .expect("create")
+        };
+        let runs = task_workflow_runs(&b, &task.id).expect("list");
+        assert!(runs.is_empty(), "未派发任务不该有流水：{runs:?}");
     }
 }

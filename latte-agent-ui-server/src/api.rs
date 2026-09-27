@@ -443,6 +443,18 @@ pub fn set_session_label(b: &UiBackend, session_id: &str, label: &str) -> Result
     Ok(())
 }
 
+/// 把"已有工作负载"的 session 立即落盘（meta 行 + label 进
+/// ui-sessions/）。任务看板派发后调用：此前 session 要等首个
+/// ChatEvent 归档才 promote，若服务器在这窗口内重启，tmp 壳被
+/// `clean_tmp` 清掉，任务 runs[] 里的 session_id 就变成了 404——
+/// 「查看对话」点开是空/报错。materialize 之后重启能恢复 session
+/// 元数据（label、agent_cwd），查看对话正常。
+pub async fn materialize_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
+    let h = resolve_session(b, Some(id))?;
+    h.materialize();
+    Ok(())
+}
+
 /// 订阅某 session 的 ChatEvent broadcast（只拿得到订阅之后的事件；
 /// 恢复 session 在此时懒 spawn controller）。Tauri 适配器用它把事件
 /// 转发成 `ui:chat_event`；HTTP 的 SSE handler 走的是同一通道。事件
@@ -1627,6 +1639,15 @@ pub async fn chat_abort(b: &UiBackend, session_id: Option<&str>) -> Result<(), A
     if let Some(flag) = b.session_workflows.write().remove(h.session_id.as_str()) {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // 连带取消任务看板派发的 workflow：它只在 `tasks.workflow_cancels`
+    // （按 task_id 索引），chat 侧中止本来不触达——补一条反查翻转。
+    if let Some(task_id) = b
+        .tasks
+        .read()
+        .task_owning_active_session(h.session_id.as_str())
+    {
+        b.tasks.write().flip_workflow_cancel(&task_id);
+    }
     Ok(())
 }
 
@@ -1653,7 +1674,8 @@ pub async fn chat_resume(b: &UiBackend, session_id: Option<&str>) -> Result<(), 
     Ok(())
 }
 
-/// `POST /api/chat/pause-session` — 用户按 ⏸ 触发全 session 冻结。
+/// `POST /api/chat/pause-session` — 用户按 ⏸ 打开全 session 暂停门；
+/// 非流式当前请求会在继续后重试，流式已有输出/工具在安全边界完成。
 pub async fn chat_pause_session(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
@@ -1690,11 +1712,19 @@ pub async fn chat_resume_session(b: &UiBackend, session_id: Option<&str>) -> Res
         .await
         .map_err(|e| ApiError::internal(format!("spawn controller: {e}")))?;
     let _ = controller.event_sender().send(ChatEvent::Resumed);
-    // spawn 时已从 event_log seed 最近可续跑的 workflow；有才续跑，
-    // 没有则只是解除 UI 暂停态（幂等 no-op）。404（checkpoint 已删）
-    // 与 409（已在跑，用户连点）都按成功处理。
-    if controller.last_failed_workflow().is_some() {
-        match spawn_workflow_resume(b, &h.session_id, None, None).await {
+    // controller 已有 seed 时优先使用它；若 controller 在 seed 前就被
+    // 懒 spawn，或 seed 因旧版本/并发时序缺失，则直接从 session event_log
+    // 找最近的中断 workflow。否则会出现「发出 Resumed 事件但没有任何
+    // workflow runtime 被拉起」的空操作，正是重启后 UI 继续按钮失效的表现。
+    let resumable_wf_id = controller
+        .last_failed_workflow()
+        .map(|failed| failed.wf_id)
+        .or_else(|| {
+            crate::sessions::last_resumable_workflow_from_log(&h.event_log)
+                .map(|failed| failed.wf_id)
+        });
+    if let Some(wf_id) = resumable_wf_id {
+        match spawn_workflow_resume(b, &h.session_id, Some(wf_id), None).await {
             Ok(_) => {}
             Err(e) if e.status == 404 || e.status == 409 => {}
             Err(e) => return Err(e),
@@ -1906,9 +1936,15 @@ pub async fn self_loop_start(
         return Err(ApiError::bad_request("task is required"));
     }
 
-    // 起 broadcast channel。
+    // 原子检查+登记，替代旧裸 `set_progress` 的 TOCTOU：
+    // 两并发 start 会让前一个 node 进程事件丢失（progress 被覆盖）。
     let (tx, rx) = broadcast::channel::<SelfLoopEvent>(64);
-    b.self_loop.set_progress(tx.clone());
+    if b.self_loop.try_set_progress(tx.clone()).is_err() {
+        return Err(ApiError {
+            status: 409,
+            message: "a self-loop run is already active".into(),
+        });
+    }
 
     // 找 self-loop 脚本。
     let self_loop_dir = crate::self_loop::self_loop_dir().map_err(ApiError::not_found)?;
@@ -2086,13 +2122,9 @@ pub fn workflow_run_start(
     };
     validate_form_or_400(b, &form)?;
 
-    if b.workflow_run.is_active() {
-        return Err(ApiError {
-            status: 409,
-            message: "a workflow test run is already active".into(),
-        });
-    }
-
+    // 原子检查+登记，替代原来 `is_active()`→`start()` 的 TOCTOU：
+    // 两个并发请求同时点「运行测试」时只会有一个真正落到 start，
+    // 另一个直接 409，不覆盖前者已建的 tx/cancel。
     let (tx, rx) = broadcast::channel::<ChatEvent>(64);
     let cancel = Arc::new(AtomicBool::new(false));
     let run_id = format!(
@@ -2102,8 +2134,16 @@ pub fn workflow_run_start(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
-    b.workflow_run
-        .start(tx.clone(), cancel.clone(), run_id.clone());
+    if b
+        .workflow_run
+        .try_start(tx.clone(), cancel.clone(), run_id.clone())
+        .is_err()
+    {
+        return Err(ApiError {
+            status: 409,
+            message: "a workflow test run is already active".into(),
+        });
+    }
 
     // 与 sessions.rs 的 ControllerConfig 一致：default_params 用
     // GenerateParams::default()（session spawn 路径同款，也是
@@ -4730,6 +4770,7 @@ pub fn put_model_toml(b: &UiBackend, key: &str, raw: &str) -> Result<(), ApiErro
 #[cfg(test)]
 mod workflow_resume_tests {
     use super::*;
+    use crate::tasks::TaskRun;
 
     /// 与 tasks.rs 测试同款：临时 cwd + 默认空配置构造 UiBackend。
     fn make_backend(dir: &std::path::Path) -> UiBackend {
@@ -5017,6 +5058,36 @@ mod workflow_resume_tests {
         );
     }
 
+    /// controller 已经懒 spawn 但没有拿到 cold-start seed 时，▶ 仍应
+    /// 从 session event_log 找到中断 workflow 并拉起 checkpoint resume。
+    #[tokio::test]
+    async fn chat_resume_session_scans_event_log_when_seed_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-interrupted", "learn");
+        write_workflow(dir.path(), "learn");
+        let h = resolve_session(&b, Some(&sid)).unwrap();
+        h.event_log
+            .write()
+            .push(r#"{"type":"WorkflowStarted","name":"learn","wf_id":"wf-interrupted"}"#.into());
+        assert!(
+            h.try_controller()
+                .expect("controller spawned before log append")
+                .last_failed_workflow()
+                .is_none(),
+            "测试前置条件：controller 没有 seed 快照"
+        );
+
+        chat_resume_session(&b, Some(&sid))
+            .await
+            .expect("resume ok");
+        assert!(
+            b.session_workflows.read().contains_key(&sid),
+            "event_log fallback 应注册 checkpoint resume guard"
+        );
+    }
+
     /// gate 真的暂停着（进程内暂停）→ 走 live resume 释放 gate，
     /// 不得重复触发 checkpoint 续跑（否则同一会话跑两份 workflow）。
     #[tokio::test]
@@ -5057,7 +5128,65 @@ mod workflow_resume_tests {
             .insert(sid.clone(), flag.clone());
         chat_abort(&b, Some(&sid)).await.expect("abort");
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(b.session_workflows.read().is_empty());
+    }
+
+    /// chat_abort 连带翻转任务看板的 workflow 取消旗标——原本只在
+    /// `tasks.workflow_cancels`（按 task_id 索引），chat 侧中止补一条
+    /// session→task 反查让看板 workflow 也停。
+    #[tokio::test]
+    async fn chat_abort_flips_task_board_workflow_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let task_id = "LAT-100";
+        let sid = "ui-board-1";
+        // 模拟 dispatch_task 后的状态：in_progress + workflow_cancels 登记 +
+        // runs 末尾一条指向该 session 且未结束。
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut t = crate::tasks::Task {
+            schema: 1,
+            id: task_id.into(),
+            title: "看板任务".into(),
+            description: String::new(),
+            priority: 3,
+            state: "in_progress".into(),
+            labels: vec![],
+            task_type: None,
+            parent_id: None,
+            sub_order: 0,
+            scheduled_at: None,
+            workflow: None,
+            paths: vec![],
+            depends_on: vec![],
+            dispatch_pending: false,
+            isolated: None,
+            worktree: None,
+            runs: vec![TaskRun {
+                session_id: sid.into(),
+                started_at: 0,
+                ended_at: None,
+                result: None,
+            }],
+            created_at: 0,
+            updated_at: 0,
+            history: vec![],
+        };
+        crate::tasks::Task::set_state(&mut t, "in_progress", "user", None, 0);
+        b.tasks.write().insert_task_for_test(t);
+        b.tasks.write().register_workflow_cancel(task_id, flag.clone());
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        // 反查 + 翻转（chat_abort 内部用的两段逻辑）。
+        let owner = b.tasks.read().task_owning_active_session(sid);
+        assert_eq!(owner.as_deref(), Some(task_id));
+        b.tasks.write().flip_workflow_cancel(task_id);
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "flip_workflow_cancel 必须置位旗标"
+        );
+        // flip 不消耗 map 条目（abort_task / apply 路径还会用到 take）。
+        assert!(
+            b.tasks.write().take_workflow_cancel(task_id).is_some(),
+            "flip 不应移除旗标"
+        );
     }
 
     /// **删除** session 必须和 abort 一样掐掉它的 workflow。

@@ -117,7 +117,7 @@ async fn sync_one_doc_dirty(
     http: &reqwest::Client,
     cfg: &NotionSyncConfig,
     cwd: &std::path::Path,
-    _marker: &str,
+    marker: &str,
     rel_path: &str,
 ) -> SyncResult {
     let full = cwd.join(".latte-review").join("docs").join(rel_path);
@@ -126,11 +126,13 @@ async fn sync_one_doc_dirty(
         Err(_) => return SyncResult::ClientError(404, format!("missing doc file: {rel_path}")),
     };
     let body = build_doc_record_body(&content, rel_path);
-    // 命名空间 agents-docs（doc 不覆盖任务命名空间）。
-    let _url = record_url(&cfg.base_url, "agents-docs", rel_path);
+    // record id 用 marker（`dirty_marker_name` 已把 rel_path 里的 `/`、`.`、
+    // `\\` 转成 `[A-Za-z0-9._-]` 合法 id）。rel_path 直接当 id 会因含 `/`
+    // 命中不了单段路由（404）/ id 校验（400）——之前所有文档因此永不推送
+    // 且 4xx 删标记静默丢镜像。真实路径在 body.props.path 里保留。
     let mut doc_cfg = cfg.clone();
     doc_cfg.namespace = "agents-docs".to_string();
-    upsert_with_retry(http, &doc_cfg, rel_path, &body).await
+    upsert_with_retry(http, &doc_cfg, marker, &body).await
 }
 
 /// 同步所有 `.latte/.docs-dirty/` 标记的文档到 Notion（agents-docs）。
@@ -183,6 +185,14 @@ pub async fn sync_doc_dirty(
 /// 构造 PUT 请求 URL：`{base}/api/ext/{ns}/records/{id}`。
 pub fn record_url(base: &str, ns: &str, id: &str) -> String {
     format!("{base}/api/ext/{ns}/records/{id}")
+}
+
+/// 4xx 是否「数据错、删标记不重试」。**只有** 400/404 算致命——
+/// 那意味着这条记录本身有问题，重推无用。401（token 错/轮换）/
+/// 403/408/429 都是瞬时/配置错，删标记会把那次改动永久丢掉（修好
+/// token 后也不补推），按服务端错对待：留标记等下轮/重启。
+fn is_fatal_client_error(status: u16) -> bool {
+    matches!(status, 400 | 404)
 }
 
 /// 单次 PUT：失败按 4xx/网络区分返回 `SyncResult`。
@@ -241,20 +251,90 @@ pub async fn upsert_with_retry(
     SyncResult::RetriesExhausted("loop exited without result".into())
 }
 
-/// 任务 dirty 集合（内存态）：每次 `TaskStore::persist` 把 id 推入，
-/// `sync_dirty_tasks` 取出推送成功后清空。本地文件是 source of truth，
-/// dirty 集合不落盘（重启后无遗言：用户须重新手动触发 sync 或重做变更）。
+/// 任务 dirty 集合：每次 `TaskStore::persist` 把 id 推入，
+/// `sync_dirty_tasks` 取出推送成功后移除。**内存索引 + 落盘标记双写**：
+/// 内存做快速读，磁盘标记 `<cwd>/.latte/.tasks-dirty/<id>` 是重启/离线
+/// 的真相源——与 doc 镜像的 `.latte/.docs-dirty/` 完全同构。
+///
+/// 此前是纯内存（重启即清空 → 改过未推的任务永久漏推 Notion）。现在
+/// 每次 mark 同步写标记文件，sync 成功/4xx 删文件，5xx/离线留文件；
+/// `TaskStore::load` 扫目录重建内存集，离线期间积累的 dirty 重启后
+/// 自然推出去。
 #[derive(Debug, Default)]
 pub struct DirtySet {
     ids: std::collections::HashSet<String>,
 }
 
-impl DirtySet {
-    pub fn mark(&mut self, id: &str) {
-        self.ids.insert(id.to_string());
-    }
+/// `.latte/.tasks-dirty/` 目录（与 `.docs-dirty/` 平级）。
+fn dirty_dir(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join(".latte").join(".tasks-dirty")
+}
 
-    /// 取出并清空当前 dirty 集合。
+/// 任务 id → 标记文件名（id 已是 `LAT###` 这类安全串，无需转义；
+/// 防御性再过一道，保证不逃出目录）。
+fn dirty_marker_name(id: &str) -> String {
+    id.replace(['/', '\\', '.'], "_")
+}
+
+/// 写一个 dirty 标记文件（内容 = 任务 id，便于人读/排查）。
+/// best-effort：写失败只告警，内存标记照样生效（宁漏盘不阻断写路径）。
+fn mark_dirty_on_disk(cwd: &std::path::Path, id: &str) {
+    let dir = dirty_dir(cwd);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[notion-sync] create {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join(dirty_marker_name(id));
+    if let Err(e) = std::fs::write(&path, id) {
+        eprintln!("[notion-sync] write dirty {}: {e}", path.display());
+    }
+}
+
+/// 删一个 dirty 标记文件（sync 成功 / 4xx 销账）。幂等。
+pub fn clear_dirty_on_disk(cwd: &std::path::Path, id: &str) {
+    let path = dirty_dir(cwd).join(dirty_marker_name(id));
+    let _ = std::fs::remove_file(path);
+}
+
+/// 扫 `<cwd>/.latte/.tasks-dirty/` 重建内存 dirty 集合（重启后）。
+/// 文件名与内容都还原成任务 id（取内容优先，兼容 marker_name 转义）。
+pub fn load_dirty_from_disk(cwd: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(entries) = std::fs::read_dir(dirty_dir(cwd)) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(id) = std::fs::read_to_string(&path) {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
+impl DirtySet {
+    /// 标记 dirty：内存 + 落盘双写。`cwd` 是项目根（dirty 目录所在）。
+    pub fn mark(&mut self, cwd: &std::path::Path, id: &str) {
+        self.ids.insert(id.to_string());
+        mark_dirty_on_disk(cwd, id);
+    }
+    /// take 后某 id 是否仍在内存集合里（即 take 期间被重新 mark 过）。
+    /// sync 用此判定「clear_dirty_on_disk 会否抹掉一次新 mark」——
+    /// 修前 sync_once 拿 take → 用户在循环里 mark → 清盘 = 丢这次 mark。
+    pub fn contains_after_take(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+    /// 重启重建时批量注入盘上扫出的 id（**不再落盘**——标记文件已存在）。
+     pub(crate) fn restore_id(&mut self, id: String) {
+         self.ids.insert(id);
+     }
+    /// 下一轮 `sync` 还会再读到。
     pub fn take_dirty(&mut self) -> Vec<String> {
         let out: Vec<String> = self.ids.iter().cloned().collect();
         self.ids.clear();
@@ -362,6 +442,7 @@ pub async fn sync_dirty_tasks(
         return SyncSummary::default();
     }
 
+    let cwd = store.project_root().to_path_buf();
     let dirty = store.take_notion_dirty();
     let mut summary = SyncSummary {
         attempted: dirty.len(),
@@ -371,15 +452,35 @@ pub async fn sync_dirty_tasks(
         let body = match store.get(&task_id) {
             Some(t) => build_record_body(t),
             None => {
+                // 本地已删（delete_task 标过 dirty 但对象没了）：盘标记
+                // 清掉，否则成为永远读不回的孤儿标记。v1 不发 DELETE。
+                clear_dirty_on_disk(&cwd, &task_id);
                 summary.skipped_missing += 1;
                 continue;
             }
         };
         match upsert_with_retry(http, cfg, &task_id, &body).await {
-            SyncResult::Ok => summary.succeeded += 1,
-            SyncResult::ClientError(_, _) => {}
+            SyncResult::Ok => {
+                // take → 用户在循环里 mark 这条 id 的 race 防护：
+                // 取到 Ok 想清盘，但 take 期间又被 mark 过，磁盘标记
+                // 留着（内存 dirty 由 mark_notion_dirty 重填，下轮再推）。
+                if !store.notion_dirty_contains(&task_id) {
+                    clear_dirty_on_disk(&cwd, &task_id);
+                }
+                summary.succeeded += 1;
+            }
+            SyncResult::ClientError(code, _) => {
+                if is_fatal_client_error(code) {
+                    clear_dirty_on_disk(&cwd, &task_id);
+                    summary.failed_client += 1;
+                } else {
+                    // 401/403/408/429：留标记重推。
+                    store.mark_notion_dirty(&task_id);
+                    summary.failed_server += 1;
+                }
+            }
             SyncResult::RetriesExhausted(_) => {
-                // 5xx/网络错：把任务重新标 dirty，下一轮 5s 后再试。
+                // 5xx/网络错：盘标记留着，内存重新标上下轮再试。
                 store.mark_notion_dirty(&task_id);
                 summary.failed_server += 1;
             }
@@ -423,15 +524,37 @@ async fn sync_once(b: &crate::UiBackend) {
             match store.get(&task_id) {
                 Some(t) => build_record_body(t),
                 None => {
+                    // 本地已删：清盘标记（孤儿标记否则永远留在盘上）。
+                    clear_dirty_on_disk(&b.cwd, &task_id);
                     summary.skipped_missing += 1;
                     continue;
                 }
             }
         };
         match upsert_with_retry(&http, &cfg, &task_id, &body).await {
-            SyncResult::Ok => summary.succeeded += 1,
-            SyncResult::ClientError(_, _) => summary.failed_client += 1,
+            SyncResult::Ok => {
+                // take → 用户在循环里 mark 这条 id 的 race 防护：
+                // 内存里又被 mark 时清盘会丢这次改动——留着标记让下轮再推。
+                if !b.tasks.read().notion_dirty_contains(&task_id) {
+                    clear_dirty_on_disk(&b.cwd, &task_id);
+                }
+                summary.succeeded += 1;
+            }
+            SyncResult::ClientError(code, _) => {
+                if is_fatal_client_error(code) {
+                    // 400/404 = 记录本身有问题，删标记不重试。
+                    clear_dirty_on_disk(&b.cwd, &task_id);
+                    summary.failed_client += 1;
+                } else {
+                    // 401/403/408/429 等瞬时/配置错：留标记等下轮，
+                    // 修好 token/限流放开后会自动补推。
+                    re_dirty.push(task_id);
+                    summary.failed_server += 1;
+                }
+            }
             SyncResult::RetriesExhausted(_) => {
+                // 5xx/网络错：盘标记留着（重启/下轮仍能读到），内存重新
+                // 标上让本轮 take 之后它还活着。
                 re_dirty.push(task_id);
                 summary.failed_server += 1;
             }
@@ -544,15 +667,69 @@ mod tests {
 
     #[test]
     fn dirty_set_marks_takes_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
         let mut s = DirtySet::default();
-        s.mark("LAT-100");
-        s.mark("LAT-101");
-        s.mark("LAT-100");
+        s.mark(cwd, "LAT-100");
+        s.mark(cwd, "LAT-101");
+        s.mark(cwd, "LAT-100");
         assert_eq!(s.dirty_count(), 2);
         let taken: HashSet<String> = s.take_dirty().into_iter().collect();
         assert!(taken.contains("LAT-100"));
         assert!(taken.contains("LAT-101"));
-        assert_eq!(s.dirty_count(), 0, "take 后集合应清空");
+        assert_eq!(s.dirty_count(), 0, "take 后内存集合应清空");
+        // 盘标记仍在（take 不动盘——sync 成功才删）。
+        assert!(cwd.join(".latte/.tasks-dirty/LAT-100").is_file());
+        assert!(cwd.join(".latte/.tasks-dirty/LAT-101").is_file());
+    }
+
+
+    /// sync_once 期间的 race：take 清空内存后，用户再次 mark 同 id。
+    /// 修前 sync 走 Ok 分支会无脑 clear_dirty_on_disk → 这次新 mark
+    /// 永久丢失。contains_after_take 给出保护信号。
+    #[test]
+    fn contains_after_take_detects_user_mark_during_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let mut s = DirtySet::default();
+        s.mark(cwd, "LAT-100");
+        // take 清空内存（不动盘）。
+        let _ = s.take_dirty();
+        assert!(
+            !s.contains_after_take("LAT-100"),
+            "take 后未重 mark 时应不在集合里"
+        );
+        // 模拟 sync 循环期间用户又改了一次——内存集合重新出现。
+        s.mark(cwd, "LAT-100");
+        assert!(
+            s.contains_after_take("LAT-100"),
+            "take 后重 mark 必须能被 contains_after_take 看见"
+        );
+    }
+
+    /// dirty 标记落盘 → 重启重建（`load_dirty_from_disk` + restore_id）→
+    /// sync 成功删盘。这是「离线/重启期间改动不漏推」的闭环。
+    #[test]
+    fn dirty_survives_restart_and_clears_on_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        // 第一进程：标脏 → 落盘标记。
+        {
+            let mut s = DirtySet::default();
+            s.mark(cwd, "LAT-100");
+        }
+        // 模拟重启：新 DirtySet 从盘重建。
+        let reloaded = load_dirty_from_disk(cwd);
+        assert!(reloaded.contains("LAT-100"), "重启后 dirty 应恢复");
+        // 重建进新集合 → sync 成功后删盘标记。
+        let mut s2 = DirtySet::default();
+        for id in reloaded {
+            s2.restore_id(id);
+        }
+        assert_eq!(s2.dirty_count(), 1);
+        clear_dirty_on_disk(cwd, "LAT-100");
+        assert!(!cwd.join(".latte/.tasks-dirty/LAT-100").exists());
+        assert!(load_dirty_from_disk(cwd).is_empty(), "清盘后不再恢复");
     }
 
     #[test]
@@ -711,6 +888,68 @@ mod tests {
         assert_eq!(store.notion_dirty_count(), 0, "成功后 dirty 清空");
     }
 
+    /// sync_dirty_tasks：401（token 错/轮换，瞬时/配置错）→ **保留**
+    /// 标记等补推；只有 400/404（记录本身坏）才删。这锁死「修好 token
+    /// 后未推送的改动会自动补上」的承诺。
+    #[tokio::test]
+    async fn sync_dirty_keeps_marker_on_401_but_clears_on_400() {
+        use crate::tasks::TaskStore;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 401：token 错。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = TaskStore::load(dir.path()).expect("load");
+        store
+            .create("demo", "", 3, vec![], None, None, None, None, "user")
+            .expect("create");
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad token"))
+            .mount(&server)
+            .await;
+        let cfg = NotionSyncConfig {
+            enabled: true,
+            base_url: server.uri(),
+            token: "t".into(),
+            namespace: "agents-tasks".into(),
+        };
+        let http = reqwest::Client::new();
+        let summary = sync_dirty_tasks(&http, &cfg, &mut store).await;
+        assert_eq!(summary.failed_server, 1, "401 归为可重试（留标记）");
+        assert_eq!(summary.failed_client, 0, "401 不是致命数据错");
+        assert_eq!(
+            store.notion_dirty_count(),
+            1,
+            "401 必须保留 dirty（修好 token 后补推）"
+        );
+
+        // 400：记录本身坏 → 删标记 + 计入 failed_client。
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let mut store2 = TaskStore::load(dir2.path()).expect("load");
+        store2
+            .create("demo", "", 3, vec![], None, None, None, None, "user")
+            .expect("create");
+        let server2 = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad record"))
+            .mount(&server2)
+            .await;
+        let cfg2 = NotionSyncConfig {
+            enabled: true,
+            base_url: server2.uri(),
+            token: "t".into(),
+            namespace: "agents-tasks".into(),
+        };
+        let summary2 = sync_dirty_tasks(&http, &cfg2, &mut store2).await;
+        assert_eq!(summary2.failed_client, 1, "400 是致命数据错");
+        assert_eq!(
+            store2.notion_dirty_count(),
+            0,
+            "400 删除标记（不再重推）"
+        );
+    }
+
     /// sync_dirty_tasks：5xx 失败 → dirty 保留待下一轮。
     #[tokio::test]
     async fn sync_dirty_keeps_dirty_on_5xx() {
@@ -798,9 +1037,12 @@ mod tests {
         std::fs::write(dirty_dir.join("entities.auth-service.md"), doc_rel).unwrap();
 
         let server = MockServer::start().await;
+        // record id = marker 文件名（`entities.auth-service.md`，合法
+        // `[A-Za-z0-9._-]`），不是含 `/` 的 rel_path——后者会被
+        // notion-client 拒（404/400）。
         Mock::given(method("PUT"))
             .and(path(
-                "/api/ext/agents-docs/records/entities/auth-service.md",
+                "/api/ext/agents-docs/records/entities.auth-service.md",
             ))
             .and(header("authorization", "Bearer secret"))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))

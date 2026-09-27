@@ -15,17 +15,30 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mountChat } from "./chat_impl";
 import type { ChatEvent } from "./api";
 
-const dismissPrompt = vi.fn(async (_promptId: string) => {});
 const sendMessage = vi.fn(async (_text: string) => {});
+const dismissPrompt = vi.fn(async (_promptId: string) => {});
+// plan import 重复防护：服务器返回 409 时前端应降级为「另一 tab 已经成功」
+// 而不是弹 alert 报错。
+class HttpError409 extends Error {
+  readonly status = 409;
+  constructor(msg = "plan x 已经被本次 server 导入过一次（重复导入防护）") {
+    super(msg);
+    this.name = "HttpError";
+  }
+}
+let importTasksMock = vi.fn(async () => {
+  throw new HttpError409();
+});
 vi.mock("./api", async () => {
   const actual = await vi.importActual<typeof import("./api")>("./api");
   return {
     ...actual,
     dismissPrompt: (promptId: string) => dismissPrompt(promptId),
     sendMessage: (text: string) => sendMessage(text),
+    importTasks: (...args: unknown[]) =>
+      (importTasksMock as (...args: unknown[]) => Promise<unknown>)(...args),
   };
 });
-
 function makeBinding() {
   const el = <T extends HTMLElement>(tag: string) => document.createElement(tag) as unknown as T;
   const statusPill = el<HTMLElement>("div");
@@ -226,4 +239,44 @@ describe("弹框补齐与去重", () => {
     // 必然 404），直接作为新的 user 消息回喂当前角色。
     expect(sendMessage).toHaveBeenCalledWith("我的选择：先重构");
   });
+
+describe("plan import 重复防护：409 降级", () => {
+  it("服务器 409 时不弹 alert：本地 plan 卡摘除 + 系统消息提示 + 关弹窗", async () => {
+    vi.useFakeTimers();
+    importTasksMock.mockImplementation(() => {
+      throw new HttpError409();
+    });
+    const { chat } = mount();
+    // 触发实时 PlanProposed → setTimeout(1500ms) 自动弹窗。
+    chat.handleEvent(plan("plan-dup-1"));
+    vi.advanceTimersByTime(2000);
+    expect(document.getElementById("plan-import-modal")).not.toBeNull();
+
+    // 用户点「导入」按钮 → importTasks 走 mock 抛 409。
+    const importBtn = document.querySelector<HTMLButtonElement>(
+      "#plan-import-modal .plan-import-go",
+    );
+    expect(importBtn).not.toBeNull();
+    // 直接调 click 触发 — 但 chat 里的 alert 仍然是 window.alert，jsdom
+    // 会抛 not implemented。把它打掉，再触发。
+    const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => undefined);
+    try {
+      importBtn!.click();
+      // flush microtasks：importTasks 抛 → catch 里的 addMessage + removePrompt。
+      await Promise.resolve();
+      await Promise.resolve();
+      // 弹窗已关、本地 prompt 卡已摘。
+      expect(document.getElementById("plan-import-modal")).toBeNull();
+      // 系统消息：降级提示出现。
+      expect(document.body.textContent).toContain(
+        "另一个 tab 已经成功导入过这份清单",
+      );
+      // dismissPrompt 没被调（重复防护是 409 路径，不走 broadcast）。
+      expect(dismissPrompt).not.toHaveBeenCalled();
+    } finally {
+      alertSpy.mockRestore();
+    }
+  });
 });
+});
+

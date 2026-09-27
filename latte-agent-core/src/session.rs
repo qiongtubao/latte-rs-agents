@@ -7,9 +7,9 @@
 //!
 //! See `docs/superpowers/specs/2026-06-28-latte-hil-blackboard-v1-design.md` §4.3.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// State machine for a single HIL session.
@@ -110,10 +110,18 @@ impl SessionManager {
         }
     }
 
-    pub fn state(&self) -> SessionState { self.record.state }
-    pub fn record(&self) -> &SessionRecord { &self.record }
-    pub fn session_path(&self) -> &Path { &self.session_path }
-    pub fn worktree_root(&self) -> &Path { &self.worktree_root }
+    pub fn state(&self) -> SessionState {
+        self.record.state
+    }
+    pub fn record(&self) -> &SessionRecord {
+        &self.record
+    }
+    pub fn session_path(&self) -> &Path {
+        &self.session_path
+    }
+    pub fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
 
     /// Persist the current record to `<session_path>` atomically
     /// (write to `.tmp`, rename). Updates `updated_at`.
@@ -190,15 +198,12 @@ impl SessionManager {
                 self.record.state = Running;
                 self.persist()
             }
-            Paused | Done | Failed => {
-                Err(SessionError::InvalidTransition {
-                    from: self.record.state,
-                    to: Running,
-                })
-            }
+            Paused | Done | Failed => Err(SessionError::InvalidTransition {
+                from: self.record.state,
+                to: Running,
+            }),
         }
     }
-
 
     pub fn mark_failed(&mut self, reason: &str) -> Result<(), SessionError> {
         self.transition(SessionState::Failed)?;
@@ -207,8 +212,15 @@ impl SessionManager {
     }
 
     /// Append a message to a role's history. Persists.
-    pub fn append_to_role(&mut self, role_id: &str, msg: latte_ai::models::Message) -> Result<(), SessionError> {
-        let role = self.record.roles.iter_mut()
+    pub fn append_to_role(
+        &mut self,
+        role_id: &str,
+        msg: latte_ai::models::Message,
+    ) -> Result<(), SessionError> {
+        let role = self
+            .record
+            .roles
+            .iter_mut()
             .find(|r| r.role_id == role_id)
             .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
         role.messages.push(msg);
@@ -217,7 +229,9 @@ impl SessionManager {
 
     /// Read a role's full history (empty Vec if role unknown).
     pub fn role_history(&self, role_id: &str) -> Vec<latte_ai::models::Message> {
-        self.record.roles.iter()
+        self.record
+            .roles
+            .iter()
             .find(|r| r.role_id == role_id)
             .map(|r| r.messages.clone())
             .unwrap_or_default()
@@ -229,7 +243,10 @@ impl SessionManager {
     /// roles; the scheduler skips only this role's turn.
     pub fn pause_role(&mut self, role_id: &str, reason: &str) -> Result<(), SessionError> {
         let now = crate::trace::iso8601_utc_now();
-        let role = self.record.roles.iter_mut()
+        let role = self
+            .record
+            .roles
+            .iter_mut()
             .find(|r| r.role_id == role_id)
             .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
         role.paused = true;
@@ -241,7 +258,10 @@ impl SessionManager {
     /// Resume a single paused role (HIL v1.4). Clears the role's
     /// `paused` flag + `pause_reason` + `paused_at`, then persists.
     pub fn resume_role(&mut self, role_id: &str) -> Result<(), SessionError> {
-        let role = self.record.roles.iter_mut()
+        let role = self
+            .record
+            .roles
+            .iter_mut()
             .find(|r| r.role_id == role_id)
             .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
         role.paused = false;
@@ -261,7 +281,10 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let now = crate::trace::iso8601_utc_now();
         {
-            let role = self.record.roles.iter_mut()
+            let role = self
+                .record
+                .roles
+                .iter_mut()
                 .find(|r| r.role_id == role_id)
                 .ok_or_else(|| SessionError::UnknownRole(role_id.to_string()))?;
             role.paused = false;
@@ -275,7 +298,9 @@ impl SessionManager {
     /// Whether the named role is individually paused. Unknown roles
     /// report `false`.
     pub fn is_role_paused(&self, role_id: &str) -> bool {
-        self.record.roles.iter()
+        self.record
+            .roles
+            .iter()
             .find(|r| r.role_id == role_id)
             .map(|r| r.paused)
             .unwrap_or(false)
@@ -283,7 +308,9 @@ impl SessionManager {
 
     /// List the role_ids that are currently individually paused.
     pub fn paused_roles(&self) -> Vec<String> {
-        self.record.roles.iter()
+        self.record
+            .roles
+            .iter()
             .filter(|r| r.paused)
             .map(|r| r.role_id.clone())
             .collect()
@@ -302,7 +329,65 @@ impl SessionManager {
             .join(".latte")
             .join("sessions")
             .join(format!("{}.json", record.session_id));
-        Self { record, session_path, worktree_root, sink: None }
+        Self {
+            record,
+            session_path,
+            worktree_root,
+            sink: None,
+        }
+    }
+
+    /// 按 task_id 找该工作树里**最近一次**的 SessionRecord（按文件
+    /// mtime 最新）。`session_id = {task_id}-{timestamp}` 每次 `new` 都
+    /// 换一个时间戳，靠它做 `session_path().exists()` 恒为 false——
+    /// 跨进程 resume 永远找不到旧记录。这里按 `record.task_id` 匹配
+    /// （而不是文件名前缀），返回最新那条。
+    pub fn find_latest_record(
+        worktree_root: &Path,
+        task_id: &str,
+    ) -> Option<SessionRecord> {
+        let sessions_dir = worktree_root.join(".latte").join("sessions");
+        let entries = std::fs::read_dir(&sessions_dir).ok()?;
+        let mut best: Option<(std::time::SystemTime, SessionRecord)> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            // 单条损坏不阻塞其它记录的恢复：metadata/读/解析任一失败跳过。
+            let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<SessionRecord>(&raw) else {
+                continue;
+            };
+            if record.task_id != task_id {
+                continue;
+            }
+            match &best {
+                Some((t, _)) if *t >= modified => {}
+                _ => best = Some((modified, record)),
+            }
+        }
+        best.map(|(_, r)| r)
+    }
+
+    /// 加载或新建：该 task 已有落盘 session → `from_record`（返回
+    /// `(mgr, true)`，true = 恢复的）；否则 `new` 一个（`(mgr, false)`）。
+    /// 这是 `controller.rs` / `chat.rs` resume 的统一入口。
+    pub fn load_or_create(
+        task_id: &str,
+        worktree_root: PathBuf,
+        roles: Vec<String>,
+    ) -> (Self, bool) {
+        if let Some(record) = Self::find_latest_record(&worktree_root, task_id) {
+            (Self::from_record(record, worktree_root), true)
+        } else {
+            (Self::new(task_id, worktree_root, roles), false)
+        }
     }
 
     /// Attach a trace sink. Used by the REPL driver to emit session
@@ -381,14 +466,14 @@ impl SessionManager {
         let legal = matches!(
             (from, to),
             (Created, Running)
-            | (Created, Paused)
-            | (Created, Done)
-            | (Running, Paused)
-            | (Paused, Resumed)
-            | (Resumed, Running)
-            | (Running, Done)
-            | (Resumed, Done)
-            | (_, Failed)
+                | (Created, Paused)
+                | (Created, Done)
+                | (Running, Paused)
+                | (Paused, Resumed)
+                | (Resumed, Running)
+                | (Running, Done)
+                | (Resumed, Done)
+                | (_, Failed)
         );
         if !legal {
             return Err(SessionError::InvalidTransition { from, to });
@@ -403,7 +488,10 @@ pub enum SessionError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid state transition from {from:?} to {to:?}")]
-    InvalidTransition { from: SessionState, to: SessionState },
+    InvalidTransition {
+        from: SessionState,
+        to: SessionState,
+    },
     #[error("not a git repository: {0}")]
     NotARepo(PathBuf),
     #[error("serde error: {0}")]
@@ -441,13 +529,50 @@ mod tests {
         let (_dir, mgr) = make_mgr();
         mgr.persist().unwrap();
         let path = mgr.session_path();
-        assert!(path.exists(), "session file should exist at {}", path.display());
+        assert!(
+            path.exists(),
+            "session file should exist at {}",
+            path.display()
+        );
         let tmp = path.with_extension("json.tmp");
         assert!(!tmp.exists(), "no .tmp leftover allowed");
         let raw = std::fs::read_to_string(path).unwrap();
         let parsed: SessionRecord = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.task_id, "test-task");
         assert_eq!(parsed.state, SessionState::Created);
+    }
+
+    /// 跨重启续跑：session_id 带时间戳，`new` 出的 path 恒不存在，
+    /// `load_or_create` 必须按 task_id 找回最近一次记录（而不是看
+    /// 新时间戳的 path）。
+    #[test]
+    fn load_or_create_resumes_latest_record_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // 第一次：新建 + persist（写入一个带时间戳的 session 文件）。
+        let (mgr0, restored0) =
+            SessionManager::load_or_create("task-x", root.clone(), vec!["manager".into()]);
+        assert!(!restored0, "无落盘记录 → 新建");
+        mgr0.persist().unwrap();
+        let first_path = mgr0.session_path().to_path_buf();
+        drop(mgr0);
+
+        // 第二次（模拟重启后）：必须恢复同一 task 的记录，而不是新建。
+        let (mgr1, restored1) =
+            SessionManager::load_or_create("task-x", root.clone(), vec!["manager".into()]);
+        assert!(restored1, "有落盘记录 → 恢复");
+        assert_eq!(
+            mgr1.session_path(),
+            first_path.as_path(),
+            "恢复的是同一份文件（按 task_id 找，不是新时间戳）"
+        );
+        assert_eq!(mgr1.record().task_id, "task-x");
+
+        // 不同 task 不会互相命中。
+        assert!(
+            SessionManager::find_latest_record(&root, "task-other").is_none(),
+            "别的 task_id 不应命中"
+        );
     }
 
     #[test]
@@ -482,7 +607,8 @@ mod tests {
     #[test]
     fn append_to_role_grows_history() {
         let (_dir, mut mgr) = make_mgr();
-        mgr.append_to_role("programmer", Message::user("hello")).unwrap();
+        mgr.append_to_role("programmer", Message::user("hello"))
+            .unwrap();
         let history = mgr.role_history("programmer");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].as_text(), "hello");
@@ -506,7 +632,8 @@ mod tests {
     #[test]
     fn pause_with_reason_sets_paused_at_and_reason() {
         let (_dir, mut mgr) = make_mgr();
-        mgr.pause_with_reason("token budget exceeded (50001 / 50000)").unwrap();
+        mgr.pause_with_reason("token budget exceeded (50001 / 50000)")
+            .unwrap();
         assert_eq!(mgr.state(), SessionState::Paused);
         assert_eq!(
             mgr.record().pause_reason.as_deref(),
@@ -518,7 +645,8 @@ mod tests {
     #[test]
     fn resume_with_message_appends_synthetic_user_message() {
         let (_dir, mut mgr) = make_mgr();
-        mgr.pause_with_reason("ask_human: programmer asked: how should I parse the CSV?").unwrap();
+        mgr.pause_with_reason("ask_human: programmer asked: how should I parse the CSV?")
+            .unwrap();
         mgr.resume_with_message("programmer", "use serde").unwrap();
         assert_eq!(mgr.state(), SessionState::Resumed);
         assert!(mgr.record().paused_at.is_none());
@@ -565,7 +693,8 @@ mod tests {
     fn pause_role_sets_flag_without_touching_global_state() {
         let (_dir, mut mgr) = make_mgr();
         mgr.start().unwrap();
-        mgr.pause_role("programmer", "operator paused programmer").unwrap();
+        mgr.pause_role("programmer", "operator paused programmer")
+            .unwrap();
         // Global state is untouched — session keeps running.
         assert_eq!(mgr.state(), SessionState::Running);
         assert!(mgr.is_role_paused("programmer"));
@@ -579,7 +708,11 @@ mod tests {
         mgr.pause_role("programmer", "wait for review").unwrap();
         let raw = std::fs::read_to_string(mgr.session_path()).unwrap();
         let parsed: SessionRecord = serde_json::from_str(&raw).unwrap();
-        let role = parsed.roles.iter().find(|r| r.role_id == "programmer").unwrap();
+        let role = parsed
+            .roles
+            .iter()
+            .find(|r| r.role_id == "programmer")
+            .unwrap();
         assert!(role.paused);
         assert_eq!(role.pause_reason.as_deref(), Some("wait for review"));
         assert!(role.paused_at.is_some());
@@ -599,7 +732,8 @@ mod tests {
     fn resume_role_with_message_appends_synthetic_message() {
         let (_dir, mut mgr) = make_mgr();
         mgr.pause_role("programmer", "r").unwrap();
-        mgr.resume_role_with_message("programmer", "carry on").unwrap();
+        mgr.resume_role_with_message("programmer", "carry on")
+            .unwrap();
         assert!(!mgr.is_role_paused("programmer"));
         let history = mgr.role_history("programmer");
         assert!(history.last().unwrap().as_text().contains("[HUMAN @"));

@@ -5,14 +5,14 @@ import {
   persistSessionId, getSessionHistory, getCurrentSessionId, forkSession,
   getPendingPrompts,
   renameSession, deleteSession,
-  getRolesConfig,
+  getRolesConfig, onSessionEvent, announceSession, onPromptDismissed, setStreamMode,
 } from "./api";
-import { setStreamMode } from "./api";
 import "highlight.js/styles/github.css";
 import "katex/dist/katex.min.css";
 import { mountChat } from "./chat_impl";
 import type { ChatController } from "./chat_impl";
 import { installDocLinkHandler } from "./doc_viewer";
+import { installImageModalHandler } from "./image_modal";
 import { mountTrace } from "./trace";
 import { mountSelfLoop } from "./self-loop";
 import { mountRoleGraph } from "./role_graph";
@@ -120,7 +120,7 @@ async function main(): Promise<void> {
   let sseConnector: () => void = () => {};
 
   installDocLinkHandler();
-
+  installImageModalHandler();
   const chat: ChatController = mountChat({
     container: {
       messagesEl: $("messages"),
@@ -162,11 +162,17 @@ async function main(): Promise<void> {
       try {
         const newId = await forkSession(sourceId, events);
         await activateSession(newId, { created: true });
-        chat.setFooter(`🍴 已分叉 ${events.length} 个事件 → ${newId.slice(0, 12)}…`);
+        chat.setFooter(`🍴 已分叉 ${events.length} 个事件 → ${newId}`);
       } catch (e) {
         chat.setFooter(`fork failed: ${String(e)}`);
       }
     },
+  });
+  // 跨 tab prompt-dismissed：另一 tab dismiss/import 同 id 弹框 → 本
+  // tab 摘卡 + 关弹窗。服务端 PROMPTS/pending-asks 已清，bus 仅补本地
+  // 状态缺口。
+  onPromptDismissed((promptId) => {
+    chat.removePrompt(promptId);
   });
 
   // 加载角色配置文件路径，用于聊天气泡第一行显示文件名
@@ -515,7 +521,28 @@ async function main(): Promise<void> {
    * subagent 跑的几分钟里一片空白，刷新才靠 history 显出「执行中」
    * （实测实录）。服务端 events_sse 早就写着同一条教训：
    * 「先订阅再取挂起弹框：反序会漏掉这两步之间新发出的弹框」。 */
-  async function activateSession(id: string, opts?: { created?: boolean }): Promise<void> {
+  // activateSession in-flight 缓存：双击 sessionSelect / 挂载时与用户
+  // 切换并发 → 各自再起 clear+replay 会「闪一下空屏」+ 清屏交错导致
+  // 看到不完整状态。同 id 复用同一 promise；不同 id 排队串行——上一次
+  // 跑完才进下一次（避免两个 clear 互相抹）。
+  let _activating: Promise<void> = Promise.resolve();
+  let _activatingId: string | null = null;
+  function activateSession(id: string, opts?: { created?: boolean }): Promise<void> {
+    // 同 tab 当前已经激活到目标 id → 直接返回（双击同一下拉项）。
+    if (_activatingId === id) return _activating;
+    // 排队：等上一次跑完再跑。
+    const next = _activating.then(async () => {
+      _activatingId = id;
+      await activateSessionImpl(id, opts);
+      _activatingId = null;
+    });
+    _activating = next.catch(() => undefined);
+    return next;
+  }
+  async function activateSessionImpl(
+    id: string,
+    opts?: { created?: boolean },
+  ): Promise<void> {
     sseDisconnector();
     switchSession(id);
     persistSessionId(id);
@@ -534,10 +561,10 @@ async function main(): Promise<void> {
     await replayPendingPrompts(id);
     await refreshSessionSelect(sessionSelect, id);
     if (opts?.created) {
-      chat.setFooter(`new session ${id.slice(0, 12)}… · ${info.role}`);
+      chat.setFooter(`new session ${id} · ${info.role}`);
     } else if (replayed !== null) {
       const restored = replayed > 0 ? ` · restored ${replayed} events` : "";
-      chat.setFooter(`switched · ${info.role} · ${id.slice(0, 12)}…${restored}`);
+      chat.setFooter(`switched · ${info.role} · ${id}${restored}`);
     }
   }
 
