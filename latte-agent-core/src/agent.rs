@@ -3779,6 +3779,8 @@ impl AgentRunner {
                 // 状态都能暂停"的完整覆盖。in-flight model stream
                 // 跑完，下个 round 才停。
                 self.park_if_paused("model call boundary").await;
+                // 暂停期间改了角色模型 → 恢复后下一次调用即用新链。
+                self.maybe_reload_models();
                 for hint in self.drain_advisor_hints() {
                     messages.push(Message::user(format!("🦉 advisor 监察：\n{hint}")));
                 }
@@ -4056,7 +4058,15 @@ impl AgentRunner {
                     // 因此收到用户暂停时可以安全丢弃当前 HTTP future；
                     // ▶ 释放 gate 后由外层重新发起同一轮请求。这样不会
                     // 终止 workflow step，也不会丢 checkpoint。
+                    let mut reload_after_park = false;
                     let r = loop {
+                        // 暂停期间用户可能改了角色模型：park 恢复后重发前
+                        // 必须热更新 chain，否则重发仍走旧模型。（chat future
+                        // 借用 self.agent，只能在它被 drop 后的下一轮循环头做。）
+                        if reload_after_park {
+                            reload_after_park = false;
+                            self.maybe_reload_models();
+                        }
                         let chat = self.agent.chat(
                             &messages,
                             chat_params.as_ref(),
@@ -4098,6 +4108,7 @@ impl AgentRunner {
                             // park_if_paused 等待用户 ▶；恢复后 loop
                             // 重新创建 chat future，当前 workflow step 仍在。
                             self.park_if_paused("in-flight model call").await;
+                            reload_after_park = true;
                             continue;
                         };
                         break r;
@@ -8994,6 +9005,105 @@ mod tests {
             .expect("run ok");
         assert_eq!(result, "resumed");
         assert!(server.received_requests().await.unwrap().len() >= 2);
+    }
+
+    /// 回归（jemalloc 会话 ui-46389-…-0）：手动暂停期间改了模型配置，
+    /// ▶ 后重发的请求必须走新模型，而不是构建时的旧链。
+    #[tokio::test]
+    async fn resume_after_manual_pause_uses_reloaded_model_chain() {
+        use crate::config::{AgentConfig, ModelCatalog, ModelDef};
+        use crate::pause_gate::AgentPauseGate;
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_string(openai_completion_body("late", vec![])),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_completion_body("resumed", vec![])),
+            )
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let cfg_with = |id: &str| AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: id.into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: uri.clone(),
+                    api_key: "k".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: Some(0.0),
+                    cost_per_million_output: Some(0.0),
+                    tier: None,
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = std::sync::Arc::new(
+            crate::model_resolver::ModelResolver::from_config(&cfg_with("m-old")).unwrap(),
+        );
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "m-old")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = AgentPauseGate::new("test");
+        let mut runner = AgentRunner::new_with_tools(agent, create_tool_manager())
+            .with_agent_pause_gate(gate.clone())
+            .with_model_hot_reload(resolver.clone(), ModelTier::Standard, vec!["m-old".into()]);
+        let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
+
+        for _ in 0..100 {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        gate.pause();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // 暂停期间在「UI」里换模型。
+        resolver.reload_from_config(&cfg_with("m-new")).unwrap();
+        gate.resume();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("resume 后 turn 应完成")
+            .expect("turn join ok")
+            .expect("run ok");
+        assert_eq!(result, "resumed");
+        let reqs = server.received_requests().await.unwrap();
+        let last = String::from_utf8_lossy(&reqs.last().unwrap().body).to_string();
+        assert!(last.contains("\"model\":\"m-new\""), "恢复后应发往新模型: {last}");
     }
 
     #[tokio::test]
