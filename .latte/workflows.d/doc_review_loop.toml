@@ -53,6 +53,7 @@ min_chars = 10
 id = "write_chapter"
 description = "章节 writer：引擎按 plan.json 每个知识点派发一次，并发写 sections/<k_id>.md"
 role = "tutor"
+output_key = "chapters_out"
 depends_on = ["outline"]
 max_retries = 1
 tools = ["read", "code_graph", "search", "edit", "write"]
@@ -92,6 +93,9 @@ task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}`
 file = ".latte/learn/{{slug}}/plan.json"
 items = "knowledge_points"
 id_key = "id"
+max_items = 32
+# 单章失败不拖垮其余章节；失败章节的产出以 FAN_OUT_ITEM_FAILED 开头，审稿员按缺章判 BLOCKER。
+tolerate_failures = true
 
 [[steps]]
 id = "proofread"
@@ -117,6 +121,10 @@ task = """你是学习文档审稿员，只读不改。既是零基础读者，�
 阅读顺序：.latte/learn/<slug>/index.md → sections/00_overview.md → sections/<k_id>.md（按 plan.json 顺序）。
 可以（且应当）读源码抽查：每章至少核对 2 处关键代码片段/数值是否与源码一致。
 草稿里的行号偏差、措辞、格式**只算 NIT，不许因此判 NEEDS_FIX**。
+
+章节写作步骤的汇总产出（含失败标记，`FAN_OUT_ITEM_FAILED <k_id>: 原因` 表示该章写作失败）：
+{{chapters_out}}
+出现失败标记或 sections/<k_id>.md 缺失 = 该章缺章，按 BLOCKER 报（章节写 k_id）。
 
 ## BLOCKER（必须修，才允许 NEEDS_FIX）
 - **事实错误**：代码/数值/算式与源码不符，或引用了不存在的代码（须你亲自读源码确认后才能报）；

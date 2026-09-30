@@ -1007,6 +1007,21 @@ pub struct FanOut {
     /// 数组元素里作为 id 的字段名。
     #[serde(default = "default_fan_out_id_key")]
     pub id_key: String,
+    /// 元素数量上限：超过直接失败，防止数据文件异常导致派发失控。
+    #[serde(default = "default_fan_out_max_items")]
+    pub max_items: usize,
+    /// 单个元素失败（模型步失败/契约耗尽）时是否容忍：`true` = 该元素产出记为
+    /// [`FAN_OUT_ITEM_FAILED`] 行，其余元素照常完成，下游（如审稿）自行发现缺项；
+    /// 全部元素都失败仍判整步失败。取消/上下文溢出永远整体终止。缺省 `false`。
+    #[serde(default)]
+    pub tolerate_failures: bool,
+}
+
+/// `tolerate_failures` 下失败元素的产出前缀（后接 `<item_id>: <原因>`）。
+pub const FAN_OUT_ITEM_FAILED: &str = "FAN_OUT_ITEM_FAILED";
+
+fn default_fan_out_max_items() -> usize {
+    64
 }
 
 fn default_fan_out_items() -> String {
@@ -5979,6 +5994,15 @@ fn load_fan_out_items(
         .get(&fo.items)
         .and_then(|v| v.as_array())
         .ok_or_else(|| format!("{} 缺少数组字段 `{}`", full.display(), fo.items))?;
+    if arr.len() > fo.max_items {
+        return Err(format!(
+            "{} 的 `{}` 有 {} 个元素，超过 fan_out.max_items={}",
+            full.display(),
+            fo.items,
+            arr.len(),
+            fo.max_items
+        ));
+    }
     arr.iter()
         .map(|it| {
             it.get(&fo.id_key)
@@ -6557,7 +6581,12 @@ async fn run_workflow_dag(
                     });
                 }
                 let feedback = pending_feedback.remove(wf.steps[idx].id.as_str());
+                let tolerate = wf.steps[idx]
+                    .fan_out
+                    .as_ref()
+                    .is_some_and(|f| f.tolerate_failures);
                 for item in item_vars {
+                    let item_label = item.as_ref().map(|(_, id)| id.clone()).unwrap_or_default();
                     let mut step_vars = vars.clone();
                     if let Some((n, id)) = &item {
                         step_vars.insert("item_id".into(), id.clone());
@@ -6598,7 +6627,20 @@ async fn run_workflow_dag(
                         // so `acquire_owned` only errors on shutdown — treat
                         // that as "run anyway" rather than fail the step.
                         let _permit = sem.acquire_owned().await.ok();
-                        run_dag_step(inp).await
+                        let step_id = inp.wf.steps[inp.step_idx].id.clone();
+                        let output_key = inp.wf.steps[inp.step_idx].output_key.clone();
+                        let step_idx = inp.step_idx;
+                        match run_dag_step(inp).await {
+                            // 容忍模式：单元素失败降级为失败标记，其余元素照常。
+                            Err(StepFail::Failed(msg)) if tolerate => Ok((
+                                step_idx,
+                                step_id,
+                                output_key,
+                                format!("{FAN_OUT_ITEM_FAILED} {item_label}: {msg}"),
+                                std::collections::BTreeMap::new(),
+                            )),
+                            other => other,
+                        }
                     });
                 }
             }
@@ -6618,6 +6660,18 @@ async fn run_workflow_dag(
                             got.push(out);
                             if got.len() < expected {
                                 continue;
+                            }
+                            if wf.steps[step_idx]
+                                .fan_out
+                                .as_ref()
+                                .is_some_and(|f| f.tolerate_failures)
+                                && got.iter().all(|o| o.starts_with(FAN_OUT_ITEM_FAILED))
+                            {
+                                set.abort_all();
+                                return WfOutcome::Failed(format!(
+                                    "step '{step_id}' fan_out 全部 {expected} 个元素都失败：{}",
+                                    got.first().map(|s| s.as_str()).unwrap_or("")
+                                ));
                             }
                             let joined = got.join("\n\n");
                             ckpt.record_step(&step_id, output_key.as_deref(), &joined);
@@ -12433,6 +12487,129 @@ task = "汇总"
         assert!(bodies.last().unwrap().contains("汇总"), "final 在全部章节后运行");
     }
 
+    /// fan_out 超过 max_items → 明确失败且不派发任何元素。
+    #[tokio::test]
+    async fn fan_out_over_max_items_fails_before_dispatch() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "fan_out_cap"
+[[steps]]
+id = "prep"
+role = "worker"
+task = "准备"
+[[steps]]
+id = "each"
+role = "worker"
+depends_on = ["prep"]
+task = "写 {{item_id}}"
+[steps.fan_out]
+file = "plan.json"
+max_items = 2
+"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plan.json"),
+            r#"{"knowledge_points":[{"id":"a"},{"id":"b"},{"id":"c"}]}"#,
+        )
+        .unwrap();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("ok")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "t", &ctx).await.expect_err("超限必须失败");
+        assert!(err.contains("max_items"), "got: {err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "只跑了 prep");
+    }
+
+    /// tolerate_failures：一章契约耗尽失败，其余章节照常完成，下游仍运行并能看到失败标记；
+    /// 不容忍时同样的失败使整个 workflow 失败。
+    #[tokio::test]
+    async fn fan_out_tolerates_single_item_failure_only_when_enabled() {
+        let build = |tolerate: bool| -> WorkflowDef {
+            toml::from_str(&format!(
+                r#"
+name = "fan_out_tol"
+[[steps]]
+id = "prep"
+role = "worker"
+task = "准备"
+[[steps]]
+id = "each"
+role = "worker"
+depends_on = ["prep"]
+task = "写 ITEM={{{{item_id}}}}"
+output_key = "chapters"
+[steps.output_contract]
+require = ["GOOD"]
+[steps.fan_out]
+file = "plan.json"
+tolerate_failures = {tolerate}
+[[steps]]
+id = "final"
+role = "worker"
+depends_on = ["each"]
+task = "汇总 {{{{chapters}}}}"
+"#
+            ))
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plan.json"),
+            r#"{"knowledge_points":[{"id":"a"},{"id":"b"},{"id":"c"}]}"#,
+        )
+        .unwrap();
+        // 模型：请求体含 ITEM=b 时不含 GOOD（契约耗尽失败），其余输出 GOOD。
+        struct Picky;
+        impl wiremock::Respond for Picky {
+            fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+                let body = String::from_utf8_lossy(&req.body);
+                let out = if body.contains("ITEM=b") { "坏" } else { "GOOD" };
+                ResponseTemplate::new(200).set_body_string(openai_body(out))
+            }
+        }
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(Picky)
+            .mount(&server)
+            .await;
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&build(false), "t", &ctx)
+            .await
+            .expect_err("不容忍时单章失败必须整体失败");
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(Picky)
+            .mount(&server)
+            .await;
+        run_workflow(&build(true), "t", &ctx)
+            .await
+            .expect("容忍时下游仍应运行");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let fin = bodies.last().unwrap();
+        assert!(fin.contains("汇总"), "final 必须运行");
+        assert!(
+            fin.contains(&format!("{FAN_OUT_ITEM_FAILED} b")),
+            "下游必须看到失败标记: {fin}"
+        );
+    }
+
     /// fan_out 的文件缺失 → workflow 明确失败，而不是静默零派发。
     #[tokio::test]
     async fn fan_out_missing_file_fails_loudly() {
@@ -15662,6 +15839,7 @@ task = "补充疑问"
             .expect("write_chapter");
         let fo = writer.fan_out.as_ref().expect("章节 writer 必须由引擎 fan_out 派发");
         assert_eq!(fo.items, "knowledge_points");
+        assert!(fo.tolerate_failures && fo.max_items > 0, "单章失败不得拖垮全部，且有派发上限");
         assert_eq!(writer.depends_on, vec!["outline".to_string()]);
         assert!(writer.task_text().contains("{{item_id}}"));
         assert!(
