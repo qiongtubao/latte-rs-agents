@@ -431,37 +431,20 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 min_chars = 30
 
 # ═══ 7. 掌握报告 ═════════════════════════════════════════════
-# tools     只读：报告步不许改账本（改了就掩盖真实掌握情况），也不许弹窗。
-# require   必须含进度小节，防一句话敷衍。
+# 引擎确定性步骤：报告只复述账本事实，由引擎按 ledger.json / plan.json
+# 渲染，不调用模型（模型写报告会数错、漏点或美化进度）。下面的 task
+# 只作说明。
 [[steps]]
 id = "report"
-description = "输出最终掌握报告"
+description = "引擎按账本输出最终掌握报告"
 role = "tutor"
 max_retries = 1
 tools = ["read"]
-task = """读 `.latte/learn/{{plan_out}}/ledger.json`，输出掌握报告。
+task = """由引擎读 `.latte/learn/{{plan_out}}/ledger.json` 渲染掌握报告，不调用模型。
 
-账本只有事实没有状态：`passed == true` → 已掌握；`passed == false` → 未掌握
-（循环提前结束才会剩这种）。`wrong` 是该点累计答错次数，`round` 是文档演化的
-轮次数，`supplements` 是学员主动补充的疑问清单。
-
-```
-## 学习报告：{{topic}}
-
-**掌握进度**：X/Y（已通过 X 个，共 Y 个知识点）
-
-**学习过程**：共 N 轮；各知识点答错次数：…
-
-**学员补充**：…（无则写"无"）
-
-**交付文档**：docs/learn/{{plan_out}}.md（学习材料存档：.latte/learn/{{plan_out}}/draft.md）
-
-**注释版代码副本**：.latte/learn/{{plan_out}}/code/（仅当该目录存在时输出此行）
-
-**建议**：一句总结。
-```
-
-需要知识点标题时读 plan.json。除报告文本外不输出别的。"""
+`passed == true` → 已掌握；`wrong` 是累计答错次数；`round` 是文档轮次；
+`supplements` 是学员补充的疑问。报告含掌握进度、学习过程、学员补充、交付文档
+（docs/learn/{{plan_out}}.md）、注释版代码副本（目录存在时）和一句建议。"""
 
 [steps.output_contract]
 min_chars = 80
