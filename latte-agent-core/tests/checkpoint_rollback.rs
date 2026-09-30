@@ -69,9 +69,7 @@ fn rollback_code_resets_worktree() {
     .unwrap();
 
     // cp0: clean (empty diff)
-    let _ = engine
-        .record_write("init", &serde_json::json!({}))
-        .unwrap();
+    let _ = engine.record_write("init", &serde_json::json!({})).unwrap();
     // cp1: add a line
     std::fs::write(wt.join("foo.rs"), "v1\n").unwrap();
     let cp1 = engine
@@ -85,10 +83,7 @@ fn rollback_code_resets_worktree() {
 
     // Roll back to cp1 — foo.rs should be "v1"
     engine.rollback(cp1.id, RollbackMode::Code).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(wt.join("foo.rs")).unwrap(),
-        "v1\n"
-    );
+    assert_eq!(std::fs::read_to_string(wt.join("foo.rs")).unwrap(), "v1\n");
 }
 
 #[test]
@@ -106,9 +101,7 @@ fn rollback_full_truncates_trace_jsonl() {
     )
     .unwrap();
     // cp0: empty trace
-    let cp0 = engine
-        .record_write("init", &serde_json::json!({}))
-        .unwrap();
+    let cp0 = engine.record_write("init", &serde_json::json!({})).unwrap();
     assert_eq!(cp0.trace_event_index, 0);
     // Append to the trace "file" then cp1: offset should reflect new length
     std::fs::write(&trace_path, b"line-A\nline-B\nline-C\nline-D\n").unwrap();

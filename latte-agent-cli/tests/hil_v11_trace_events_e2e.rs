@@ -71,22 +71,24 @@ impl MockOpenAIServer {
         let question_text = "should I refactor the DB connection first or write the migration?";
         tokio::spawn(async move {
             loop {
-                if *shutdown_clone.lock() { break; }
+                if *shutdown_clone.lock() {
+                    break;
+                }
                 let (mut socket, _) = match listener.accept().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 65536];
-                let read_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    socket.read(&mut buf),
-                ).await;
+                let read_result =
+                    tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await;
                 let n = match read_result {
                     Ok(Ok(n)) => n,
                     _ => continue,
                 };
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 if let Some(idx) = req_str.find("\r\n\r\n") {
                     let body = &req_str[idx + 4..];
@@ -155,7 +157,12 @@ impl MockOpenAIServer {
                 }
             }
         });
-        Self { addr, captured_request: captured, shutdown, remaining }
+        Self {
+            addr,
+            captured_request: captured,
+            shutdown,
+            remaining,
+        }
     }
 
     fn api_base(&self) -> String {
@@ -186,7 +193,11 @@ struct WorktreeGuard {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        let wt = self.repo.join(".latte").join("worktrees").join(&self.task_id);
+        let wt = self
+            .repo
+            .join(".latte")
+            .join("worktrees")
+            .join(&self.task_id);
         // 1) 正常路径：让 git 自己摘除登记 + 删目录。
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])
@@ -214,7 +225,8 @@ impl Drop for WorktreeGuard {
 /// `.latte/models.d/` so the config layer can resolve the model id
 /// "mock" before --model-override targets it.
 fn write_mock_toml(repo: &Path, api_base: &str) {
-    let mock_toml = format!(r#"
+    let mock_toml = format!(
+        r#"
 [[models.models]]
 id = "mock"
 name = "Mock"
@@ -229,7 +241,8 @@ max_tokens = 4096
 premium = "mock"
 standard = "mock"
 budget = "mock"
-"#);
+"#
+    );
     let dir = repo.join(".latte").join("models.d");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("mock.toml"), mock_toml).unwrap();
@@ -245,7 +258,8 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     //    tree are all present here, so the binary can resolve
     //    manager + programmer roles + their prompt files.
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf();
 
     // 3. Use a unique task_id per test run so re-runs (which
@@ -253,7 +267,10 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     //    collide with the previous run's worktree.
     let task_id = format!("v11trace-{}", std::process::id());
     // 建完 task_id 立刻挂 guard：后续任何 panic 都能清理。
-    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
+    let _wt_guard = WorktreeGuard {
+        repo: repo.clone(),
+        task_id: task_id.clone(),
+    };
 
     // 4. Write the mock model declaration.
     write_mock_toml(&repo, &api_base);
@@ -264,13 +281,18 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     // 6. Run `latte-agent run` to create the worktree.
     let run_out = Command::new(bin())
         .arg("run")
-        .arg("--task-id").arg(&task_id)
-        .arg("--initial-prompt").arg("noop")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--initial-prompt")
+        .arg("noop")
         .current_dir(&repo)
         .output()
         .unwrap();
-    assert!(run_out.status.success(),
-        "run failed: stderr={}", String::from_utf8_lossy(&run_out.stderr));
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
 
     // 7. Spawn chat with stdin that drives the full 2-round cycle.
     //    --roles manager,programmer: round order sorts then moves
@@ -290,15 +312,23 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     // line (lets round 2's role loop run before /quit) → /quit.
     let script = b"first task\nyes, refactor first\n\n/quit\n";
     let mut chat_cmd = Command::new(bin());
-    chat_cmd.arg("chat")
-        .arg("--task-id").arg(&task_id)
-        .arg("--roles").arg("manager,programmer")
-        .arg("--initial-prompt").arg("noop")
-        .arg("--max-rounds").arg("2")
+    chat_cmd
+        .arg("chat")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--roles")
+        .arg("manager,programmer")
+        .arg("--initial-prompt")
+        .arg("noop")
+        .arg("--max-rounds")
+        .arg("2")
         .arg("--debug")
-        .arg("--model-id").arg("mock")
-        .arg("--api-key").arg("mock-key")
-        .arg("--model-override").arg(&model_override)
+        .arg("--model-id")
+        .arg("mock")
+        .arg("--api-key")
+        .arg("mock-key")
+        .arg("--model-override")
+        .arg(&model_override)
         .current_dir(&repo);
     chat_cmd.stdin(Stdio::piped());
     chat_cmd.stdout(Stdio::piped());
@@ -347,9 +377,8 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
                 candidates, stderr
             )
         });
-    let raw_trace = std::fs::read_to_string(&trace_path).unwrap_or_else(|e| {
-        panic!("read {}: {}", trace_path.display(), e)
-    });
+    let raw_trace = std::fs::read_to_string(&trace_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", trace_path.display(), e));
 
     // 9. Parse each line as JSON. Each line is a `TraceEvent` whose
     //    top-level structure is `{ "<VariantName>": { ... } }`. Count
@@ -358,7 +387,9 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     let mut round_ended_count = 0usize;
     let mut ask_human_count = 0usize;
     for (i, line) in raw_trace.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
             panic!("parse {}:{} — {}: {}", trace_path.display(), i + 1, e, line)
         });
@@ -382,19 +413,25 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
         round_started_count >= 1,
         "expected at least 1 RoundStarted event in trace, got {}. \
          Trace file: {}\n---\n{}\n---",
-        round_started_count, trace_path.display(), raw_trace
+        round_started_count,
+        trace_path.display(),
+        raw_trace
     );
     assert!(
         round_ended_count >= 1,
         "expected at least 1 RoundEnded event in trace, got {}. \
          Trace file: {}\n---\n{}\n---",
-        round_ended_count, trace_path.display(), raw_trace
+        round_ended_count,
+        trace_path.display(),
+        raw_trace
     );
     assert!(
         ask_human_count >= 1,
         "expected at least 1 AskHuman event in trace, got {}. \
          Trace file: {}\n---\n{}\n---",
-        ask_human_count, trace_path.display(), raw_trace
+        ask_human_count,
+        trace_path.display(),
+        raw_trace
     );
 
     // 11. Sanity: the mock server captured the LLM request with
@@ -402,7 +439,9 @@ async fn v11_trace_events_round_started_round_ended_ask_human_appear_in_jsonl() 
     //     reached the mock and the ask_human response was
     //     processed.
     let captured = server.captured_request.lock();
-    let req = captured.as_ref().expect("mock server should have captured the request");
+    let req = captured
+        .as_ref()
+        .expect("mock server should have captured the request");
     let messages = req["messages"].as_array().expect("messages array");
     assert!(!messages.is_empty(), "LLM request had no messages");
 }

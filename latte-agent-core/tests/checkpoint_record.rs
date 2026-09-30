@@ -96,5 +96,10 @@ fn record_write_creates_checkpoint_patch_and_manifest() {
         .iter()
         .filter(|e| matches!(e, TraceEvent::CheckpointCreated { .. }))
         .count();
-    assert_eq!(count, 2, "expected 2 CheckpointCreated, got {:?}", events.len());
+    assert_eq!(
+        count,
+        2,
+        "expected 2 CheckpointCreated, got {:?}",
+        events.len()
+    );
 }

@@ -23,10 +23,10 @@
 //! message whose `content` starts with `"[INJECTED]"` and includes
 //! the injected text `"check this"`.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,22 +60,24 @@ impl MockOpenAIServer {
         let remaining_clone = remaining.clone();
         tokio::spawn(async move {
             loop {
-                if *shutdown_clone.lock().unwrap() { break; }
+                if *shutdown_clone.lock().unwrap() {
+                    break;
+                }
                 let (mut socket, _) = match listener.accept().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 65536];
-                let read_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    socket.read(&mut buf),
-                ).await;
+                let read_result =
+                    tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await;
                 let n = match read_result {
                     Ok(Ok(n)) => n,
                     _ => continue,
                 };
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 if let Some(idx) = req_str.find("\r\n\r\n") {
                     let body = &req_str[idx + 4..];
@@ -112,10 +114,16 @@ impl MockOpenAIServer {
                 let _ = socket.shutdown().await;
                 let mut r = remaining_clone.lock().unwrap();
                 *r -= 1;
-                if *r == 0 { break; }
+                if *r == 0 {
+                    break;
+                }
             }
         });
-        Self { addr, captured_request: captured, shutdown }
+        Self {
+            addr,
+            captured_request: captured,
+            shutdown,
+        }
     }
 
     fn api_base(&self) -> String {
@@ -146,7 +154,11 @@ struct WorktreeGuard {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        let wt = self.repo.join(".latte").join("worktrees").join(&self.task_id);
+        let wt = self
+            .repo
+            .join(".latte")
+            .join("worktrees")
+            .join(&self.task_id);
         // 1) 正常路径：让 git 自己摘除登记 + 删目录。
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])
@@ -174,7 +186,8 @@ impl Drop for WorktreeGuard {
 /// `.latte/models.d/` so the config layer can resolve the model id
 /// "mock" before --model-override targets it.
 fn write_mock_toml(repo: &Path, api_base: &str) {
-    let mock_toml = format!(r#"
+    let mock_toml = format!(
+        r#"
 [[models.models]]
 id = "mock"
 name = "Mock"
@@ -189,7 +202,8 @@ max_tokens = 4096
 premium = "mock"
 standard = "mock"
 budget = "mock"
-"#);
+"#
+    );
     let dir = repo.join(".latte").join("models.d");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("mock.toml"), mock_toml).unwrap();
@@ -205,7 +219,8 @@ async fn at_role_inject_lands_in_specialist_history() {
     //    tree are all present here, so the binary can resolve
     //    manager + programmer roles + their prompt files.
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf();
 
     // 3. Use a unique task_id per test run so re-runs (which
@@ -213,7 +228,10 @@ async fn at_role_inject_lands_in_specialist_history() {
     //    collide with the previous run's worktree.
     let task_id = format!("at-role-inject-{}", std::process::id());
     // 建完 task_id 立刻挂 guard：后续任何 panic 都能清理。
-    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
+    let _wt_guard = WorktreeGuard {
+        repo: repo.clone(),
+        task_id: task_id.clone(),
+    };
 
     // 4. Write the mock model declaration.
     write_mock_toml(&repo, &api_base);
@@ -224,13 +242,18 @@ async fn at_role_inject_lands_in_specialist_history() {
     // 6. Run `latte-agent run` to create the worktree.
     let run_out = Command::new(bin())
         .arg("run")
-        .arg("--task-id").arg(&task_id)
-        .arg("--initial-prompt").arg("noop")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--initial-prompt")
+        .arg("noop")
         .current_dir(&repo)
         .output()
         .unwrap();
-    assert!(run_out.status.success(),
-        "run failed: stderr={}", String::from_utf8_lossy(&run_out.stderr));
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
 
     // 7. Spawn chat with stdin that drives the inject + quit flow.
     //    --roles manager,programmer: scheduler.order is alphabetical
@@ -246,14 +269,22 @@ async fn at_role_inject_lands_in_specialist_history() {
     //    The script is exactly 2 lines, no ask_human, no manager input.
     let script = b"@programmer check this\n/quit\n";
     let mut chat_cmd = Command::new(bin());
-    chat_cmd.arg("chat")
-        .arg("--task-id").arg(&task_id)
-        .arg("--roles").arg("manager,programmer")
-        .arg("--initial-prompt").arg("noop")
-        .arg("--max-rounds").arg("2")
-        .arg("--model-id").arg("mock")
-        .arg("--api-key").arg("mock-key")
-        .arg("--model-override").arg(&model_override)
+    chat_cmd
+        .arg("chat")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--roles")
+        .arg("manager,programmer")
+        .arg("--initial-prompt")
+        .arg("noop")
+        .arg("--max-rounds")
+        .arg("2")
+        .arg("--model-id")
+        .arg("mock")
+        .arg("--api-key")
+        .arg("mock-key")
+        .arg("--model-override")
+        .arg(&model_override)
         .current_dir(&repo);
     chat_cmd.stdin(Stdio::piped());
     chat_cmd.stdout(Stdio::piped());
@@ -279,12 +310,10 @@ async fn at_role_inject_lands_in_specialist_history() {
             break;
         }
     }
-    let done_session = done_session.expect(
-        "expected a Done session JSON after the inject + quit cycle"
-    );
-    let record: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&done_session).unwrap()
-    ).unwrap();
+    let done_session =
+        done_session.expect("expected a Done session JSON after the inject + quit cycle");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&done_session).unwrap()).unwrap();
 
     // 9. Assert the programmer role has the injected message in its
     //    history (proves the queue drain + append_to_role path landed).
@@ -294,45 +323,58 @@ async fn at_role_inject_lands_in_specialist_history() {
     //    `writeln!` in queue_inject (chat.rs:2022). So the literal
     //    content is `"[INJECTED]\ncheck this\n"`.
     let roles = record["roles"].as_array().expect("roles array");
-    let programmer = roles.iter()
+    let programmer = roles
+        .iter()
         .find(|r| r["role_id"].as_str() == Some("programmer"))
         .expect("programmer role");
     let messages = programmer["messages"].as_array().expect("messages array");
     // Concatenate all text parts of a message (Vec<ContentPart> shape).
     let text_of = |m: &serde_json::Value| -> String {
-        m["content"].as_array()
-            .map(|parts| parts.iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(""))
+        m["content"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
             .unwrap_or_default()
     };
     let has_inject = messages.iter().any(|m| {
-        m["role"].as_str() == Some("user")
-            && {
-                let c = text_of(m);
-                c.contains("[INJECTED]") && c.contains("check this")
-            }
+        m["role"].as_str() == Some("user") && {
+            let c = text_of(m);
+            c.contains("[INJECTED]") && c.contains("check this")
+        }
     });
-    assert!(has_inject,
+    assert!(
+        has_inject,
         "programmer's history should contain the injected message with [INJECTED] sentinel \
-         and 'check this' payload; got messages: {:#?}", messages);
+         and 'check this' payload; got messages: {:#?}",
+        messages
+    );
 
     // 10. Sanity: the queue file was consumed and removed by the drain
     //     path. If the drain never fired, the file would still be
     //     present at <worktree>/.latte/inject/programmer.txt.
     let queue_path = repo.join(format!(
-        ".latte/worktrees/{}/.latte/inject/programmer.txt", task_id
+        ".latte/worktrees/{}/.latte/inject/programmer.txt",
+        task_id
     ));
-    assert!(!queue_path.exists(),
+    assert!(
+        !queue_path.exists(),
         "inject queue file should be drained and removed after round 1; \
-         still present at {}", queue_path.display());
+         still present at {}",
+        queue_path.display()
+    );
 
     // 11. Sanity: the mock server captured the LLM request with
     //     a "messages" array (so we know round 1 actually ran an
     //     LLM call rather than failing earlier).
     let captured = server.captured_request.lock().unwrap();
-    let req = captured.as_ref().expect("mock server should have captured the request");
+    let req = captured
+        .as_ref()
+        .expect("mock server should have captured the request");
     let req_messages = req["messages"].as_array().expect("messages array");
     assert!(!req_messages.is_empty(), "LLM request had no messages");
 }

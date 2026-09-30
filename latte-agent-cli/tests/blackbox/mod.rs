@@ -59,10 +59,7 @@ fn direct_answer_small_question() {
     assert!(
         events_of(&events, "SessionStart").len() >= 1,
         "no SessionStart event; events={:?}",
-        events
-            .iter()
-            .filter_map(variant_name)
-            .collect::<Vec<_>>()
+        events.iter().filter_map(variant_name).collect::<Vec<_>>()
     );
     assert!(
         events_of(&events, "SessionEnd").len() >= 1,
@@ -131,10 +128,7 @@ fn delegate_dispatch_visible() {
     assert!(
         !tool_execs.is_empty(),
         "no ToolExec events in trace; events={:?}",
-        events
-            .iter()
-            .filter_map(variant_name)
-            .collect::<Vec<_>>()
+        events.iter().filter_map(variant_name).collect::<Vec<_>>()
     );
     // At least one ToolExec must be a delegate.
     let delegate = tool_execs
@@ -186,8 +180,7 @@ fn delegate_dispatch_visible() {
 #[ignore = "requires DEEPSEEK_API_KEY — full 3-layer chain"]
 fn three_layer_review_chain() {
     let env = TestEnv::new();
-    let prompt =
-        "列出 src/agent.rs 中所有 pub items starting with Agent; review your own answer";
+    let prompt = "列出 src/agent.rs 中所有 pub items starting with Agent; review your own answer";
     let out = env.run(
         &[
             "chat",
@@ -386,10 +379,7 @@ fn hook_redact_pii() {
     assert!(
         !hooks.is_empty(),
         "no HookFired event for redact_pii; events={:?}",
-        events
-            .iter()
-            .filter_map(variant_name)
-            .collect::<Vec<_>>()
+        events.iter().filter_map(variant_name).collect::<Vec<_>>()
     );
     let _ = hooks
         .iter()
@@ -626,11 +616,7 @@ fn session_resume() {
     let save_path = env.latte_home().join("resume-input.jsonl");
     {
         let mut f = std::fs::File::create(&save_path).expect("create save file");
-        writeln!(
-            f,
-            r#"{{"role":"user","content":"remember the number 42"}}"#
-        )
-        .unwrap();
+        writeln!(f, r#"{{"role":"user","content":"remember the number 42"}}"#).unwrap();
         writeln!(
             f,
             r#"{{"role":"assistant","content":"OK I will remember 42"}}"#

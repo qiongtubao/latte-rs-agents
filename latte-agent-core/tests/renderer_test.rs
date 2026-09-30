@@ -13,7 +13,9 @@ struct RecordingRenderer {
 
 impl RecordingRenderer {
     fn new() -> Self {
-        Self { events: Arc::new(parking_lot::Mutex::new(Vec::new())) }
+        Self {
+            events: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
     }
     fn events(&self) -> Vec<String> {
         self.events.lock().clone()
@@ -23,7 +25,9 @@ impl RecordingRenderer {
 #[async_trait::async_trait]
 impl ChatRenderer for RecordingRenderer {
     async fn on_role_turn(&self, meta: &ChatEventMetadata) {
-        self.events.lock().push(format!("role_turn:{}", meta.role_id));
+        self.events
+            .lock()
+            .push(format!("role_turn:{}", meta.role_id));
     }
     async fn on_status(&self, message: &str) {
         self.events.lock().push(format!("status:{}", message));
@@ -38,10 +42,14 @@ impl ChatRenderer for RecordingRenderer {
         self.events.lock().push(format!("round_started:{}", round));
     }
     async fn on_session_info(&self, task_id: &str, state: &str, turn: u32) {
-        self.events.lock().push(format!("session_info:{}:{}:{}", task_id, state, turn));
+        self.events
+            .lock()
+            .push(format!("session_info:{}:{}:{}", task_id, state, turn));
     }
     async fn on_role_list(&self, roles: &[RoleInfo]) {
-        self.events.lock().push(format!("role_list:{}", roles.len()));
+        self.events
+            .lock()
+            .push(format!("role_list:{}", roles.len()));
     }
 }
 
@@ -67,7 +75,8 @@ async fn dispatch_event_routes_done() {
 #[tokio::test]
 async fn dispatch_event_routes_round_started() {
     let rec = RecordingRenderer::new();
-    rec.dispatch_event(&ChatEvent::RoundStarted { round: 5 }).await;
+    rec.dispatch_event(&ChatEvent::RoundStarted { round: 5 })
+        .await;
     assert_eq!(rec.events(), vec!["round_started:5"]);
 }
 
@@ -89,8 +98,16 @@ async fn dispatch_event_routes_role_list() {
     let rec = RecordingRenderer::new();
     rec.dispatch_event(&ChatEvent::RoleList {
         roles: vec![
-            RoleInfo { id: "pm".into(), name: "产品经理".into(), icon: "📋".into() },
-            RoleInfo { id: "programmer".into(), name: "程序员".into(), icon: "💻".into() },
+            RoleInfo {
+                id: "pm".into(),
+                name: "产品经理".into(),
+                icon: "📋".into(),
+            },
+            RoleInfo {
+                id: "programmer".into(),
+                name: "程序员".into(),
+                icon: "💻".into(),
+            },
         ],
     })
     .await;

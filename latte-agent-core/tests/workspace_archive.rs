@@ -1,6 +1,6 @@
+use latte_agent_core::workspace::{MergeMode, WorkspaceManager, WorkspaceState};
 use std::path::Path;
 use std::process::Command;
-use latte_agent_core::workspace::{MergeMode, WorkspaceManager, WorkspaceState};
 
 fn run(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")

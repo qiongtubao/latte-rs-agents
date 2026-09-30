@@ -9,9 +9,9 @@
 //!    inject queue file was drained; surgical rollback resets the
 //!    worktree but leaves plan.md untouched.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::io::Write;
 
 mod common;
 use common::{start_model_mock, write_isolated_home};
@@ -26,8 +26,17 @@ fn bin() -> std::path::PathBuf {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
-    assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
@@ -47,12 +56,18 @@ fn latte_with_home(
         cmd.env("LATTE_HOME", h);
     }
     if let Some(input) = stdin {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         child.stdin.as_mut().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     } else {
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
     }
 }
 
@@ -74,7 +89,12 @@ async fn chat_hil_pause_resume_inject_rollback() {
     git(repo, &["commit", "-q", "-m", "init"]);
 
     // 1. Start a task.
-    latte_with_home(repo, &["run", "--task-id", "e2e", "--initial-prompt", "noop"], None, Some(home.path()));
+    latte_with_home(
+        repo,
+        &["run", "--task-id", "e2e", "--initial-prompt", "noop"],
+        None,
+        Some(home.path()),
+    );
 
     let wt = repo.join(".latte/worktrees/e2e");
 
@@ -84,14 +104,35 @@ async fn chat_hil_pause_resume_inject_rollback() {
     //    stdin script is fully buffered before the binary spawns,
     //    so timing is deterministic.
     let script1 = b"first task\n/pause\n";
-    let out1 = latte_with_home(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script1), Some(home.path()));
+    let out1 = latte_with_home(
+        repo,
+        &[
+            "chat",
+            "--task-id",
+            "e2e",
+            "--roles",
+            "manager,programmer",
+            "--initial-prompt",
+            "noop",
+        ],
+        Some(script1),
+        Some(home.path()),
+    );
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     let stderr1 = String::from_utf8_lossy(&out1.stderr);
     println!("[chat1 stdout]\n{}", stdout1);
     println!("[chat1 stderr]\n{}", stderr1);
     assert!(out1.status.success(), "chat1 exited non-zero: {}", stderr1);
-    assert!(stdout1.contains("session: e2e"), "expected session banner, got: {}", stdout1);
-    assert!(stdout1.contains("paused"), "expected paused message, got: {}", stdout1);
+    assert!(
+        stdout1.contains("session: e2e"),
+        "expected session banner, got: {}",
+        stdout1
+    );
+    assert!(
+        stdout1.contains("paused"),
+        "expected paused message, got: {}",
+        stdout1
+    );
 
     // 3. Session JSON exists and is in Paused state.
     let sessions_dir = wt.join(".latte/sessions");
@@ -109,7 +150,11 @@ async fn chat_hil_pause_resume_inject_rollback() {
 
     // 4. plan.md exists and has the initial prompt
     let plan_md = std::fs::read_to_string(wt.join("plan.md")).unwrap();
-    assert!(plan_md.contains("noop"), "plan.md missing initial prompt: {}", plan_md);
+    assert!(
+        plan_md.contains("noop"),
+        "plan.md missing initial prompt: {}",
+        plan_md
+    );
 
     // 5. Re-open the chat, send @programmer, then /quit.
     //    v1.2: must re-pass --roles manager,programmer because the
@@ -119,24 +164,50 @@ async fn chat_hil_pause_resume_inject_rollback() {
     //    with just [manager] and `programmer` inject queue never
     //    exists.
     let script2 = b"@programmer check this\n/quit\n";
-    let out2 = latte_with_home(repo, &["chat", "--task-id", "e2e", "--roles", "manager,programmer", "--initial-prompt", "noop"], Some(script2), Some(home.path()));
+    let out2 = latte_with_home(
+        repo,
+        &[
+            "chat",
+            "--task-id",
+            "e2e",
+            "--roles",
+            "manager,programmer",
+            "--initial-prompt",
+            "noop",
+        ],
+        Some(script2),
+        Some(home.path()),
+    );
     let stdout2 = String::from_utf8_lossy(&out2.stdout);
     let stderr2 = String::from_utf8_lossy(&out2.stderr);
     println!("[chat2 stdout]\n{}", stdout2);
     println!("[chat2 stderr]\n{}", stderr2);
     assert!(out2.status.success(), "chat2 exited non-zero: {}", stderr2);
-    assert!(stdout2.contains("RESUMED") || stdout2.contains("session: e2e"),
-        "expected resume banner, got: {}", stdout2);
-    assert!(stdout2.contains("programmer queue: +1 message"),
-        "expected inject ack, got: {}", stdout2);
+    assert!(
+        stdout2.contains("RESUMED") || stdout2.contains("session: e2e"),
+        "expected resume banner, got: {}",
+        stdout2
+    );
+    assert!(
+        stdout2.contains("programmer queue: +1 message"),
+        "expected inject ack, got: {}",
+        stdout2
+    );
 
     // 6. Surgical rollback: plan.md and the inject queue should be
     //    untouched. (Inject queue was already drained by the REPL
     //    quit; we just verify plan.md byte-equal pre/post.)
     let plan_before = std::fs::read_to_string(wt.join("plan.md")).unwrap();
-    let out3 = latte_with_home(repo, &["checkpoint", "rollback", "--task-id", "e2e", "--id", "0"], None, Some(home.path()));
+    let out3 = latte_with_home(
+        repo,
+        &["checkpoint", "rollback", "--task-id", "e2e", "--id", "0"],
+        None,
+        Some(home.path()),
+    );
     let _ = String::from_utf8_lossy(&out3.stdout);
     let plan_after = std::fs::read_to_string(wt.join("plan.md")).unwrap();
-    assert_eq!(plan_before, plan_after,
-        "surgical rollback must not touch plan.md");
+    assert_eq!(
+        plan_before, plan_after,
+        "surgical rollback must not touch plan.md"
+    );
 }

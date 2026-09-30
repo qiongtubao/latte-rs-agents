@@ -17,9 +17,9 @@
 //!     via `SessionManager::append_to_role` so the manager can
 //!     read it on the next round)
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::io::Write;
 
 mod common;
 use common::{start_model_mock, write_isolated_home};
@@ -32,8 +32,17 @@ fn bin() -> std::path::PathBuf {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
-    assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
@@ -53,12 +62,18 @@ fn latte_with_home(
         cmd.env("LATTE_HOME", h);
     }
     if let Some(input) = stdin {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         child.stdin.as_mut().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     } else {
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
     }
 }
 
@@ -85,9 +100,11 @@ async fn specialist_output_written_back_to_history() {
         None,
         Some(home.path()),
     );
-    assert!(run_out.status.success(),
+    assert!(
+        run_out.status.success(),
         "latte run failed: stderr={}",
-        String::from_utf8_lossy(&run_out.stderr));
+        String::from_utf8_lossy(&run_out.stderr)
+    );
 
     // 2. Open chat with --max-rounds 3 and a 3-line script. The REPL
     //    reads one line per round, and `/quit` breaks the round loop
@@ -99,8 +116,17 @@ async fn specialist_output_written_back_to_history() {
     let script = b"first task\nnoop\n/quit\n";
     let out = latte_with_home(
         repo,
-        &["chat", "--task-id", "e2e12", "--roles", "manager,programmer",
-          "--initial-prompt", "noop", "--max-rounds", "3"],
+        &[
+            "chat",
+            "--task-id",
+            "e2e12",
+            "--roles",
+            "manager,programmer",
+            "--initial-prompt",
+            "noop",
+            "--max-rounds",
+            "3",
+        ],
         Some(script),
         Some(home.path()),
     );
@@ -108,7 +134,11 @@ async fn specialist_output_written_back_to_history() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     println!("[chat stdout]\n{}", stdout);
     println!("[chat stderr]\n{}", stderr);
-    assert!(out.status.success(), "chat exited non-zero: stderr={}", stderr);
+    assert!(
+        out.status.success(),
+        "chat exited non-zero: stderr={}",
+        stderr
+    );
 
     // 3. Find the Done session JSON.
     let sessions_dir = repo.join(".latte/worktrees/e2e12/.latte/sessions");
@@ -123,22 +153,34 @@ async fn specialist_output_written_back_to_history() {
         }
     }
     let done_session = done_session.expect("expected a Done session JSON");
-    let record: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&done_session).unwrap()
-    ).unwrap();
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&done_session).unwrap()).unwrap();
 
     // 4. Assert both roles are present and have non-empty messages.
     let roles = record["roles"].as_array().expect("roles array");
-    let role_ids: Vec<&str> = roles.iter()
+    let role_ids: Vec<&str> = roles
+        .iter()
         .map(|r| r["role_id"].as_str().unwrap())
         .collect();
-    assert!(role_ids.contains(&"manager"), "manager role missing: {:?}", role_ids);
-    assert!(role_ids.contains(&"programmer"), "programmer role missing: {:?}", role_ids);
+    assert!(
+        role_ids.contains(&"manager"),
+        "manager role missing: {:?}",
+        role_ids
+    );
+    assert!(
+        role_ids.contains(&"programmer"),
+        "programmer role missing: {:?}",
+        role_ids
+    );
 
     for role in roles {
         let role_id = role["role_id"].as_str().unwrap();
         let messages = role["messages"].as_array().expect("messages array");
-        assert!(!messages.is_empty(), "role '{}' has no messages in history", role_id);
+        assert!(
+            !messages.is_empty(),
+            "role '{}' has no messages in history",
+            role_id
+        );
     }
 
     // 5. Assert the round loop actually drove the specialist: stdout
@@ -149,9 +191,12 @@ async fn specialist_output_written_back_to_history() {
         || stdout.contains("[architect round 1: calling LLM")
         || stdout.contains("[tester round 1: calling LLM")
         || stdout.contains("[reviewer round 1: calling LLM");
-    assert!(specialist_called,
+    assert!(
+        specialist_called,
         "expected the round loop to drive a non-manager role's LLM call; \
-         stdout was:\n{}", stdout);
+         stdout was:\n{}",
+        stdout
+    );
 
     // 6. Assert at least one role has a non-empty assistant message.
     //    v1.2's `chat.rs` writes the assistant turn back to role
@@ -172,7 +217,9 @@ async fn specialist_output_written_back_to_history() {
             // text part carries any bytes.
             let has_text = msg["content"].as_array().map_or(false, |parts| {
                 parts.iter().any(|p| {
-                    p.get("text").and_then(|t| t.as_str()).map_or(false, |s| !s.is_empty())
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map_or(false, |s| !s.is_empty())
                 })
             });
             if has_text {
@@ -180,10 +227,14 @@ async fn specialist_output_written_back_to_history() {
                 break;
             }
         }
-        if found_assistant { break; }
+        if found_assistant {
+            break;
+        }
     }
-    assert!(found_assistant,
+    assert!(
+        found_assistant,
         "expected at least one role to have a non-empty assistant message in history \
          (proves specialist output was written back); \
-         check stdout/stderr above for the actual round output");
+         check stdout/stderr above for the actual round output"
+    );
 }

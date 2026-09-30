@@ -17,10 +17,10 @@
 //! fires before the role loop runs. The second response is just a
 //! safety net in case the round order changes.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,22 +56,24 @@ impl MockOpenAIServer {
         let question_text = "should I refactor the DB connection first or write the migration?";
         tokio::spawn(async move {
             loop {
-                if *shutdown_clone.lock().unwrap() { break; }
+                if *shutdown_clone.lock().unwrap() {
+                    break;
+                }
                 let (mut socket, _) = match listener.accept().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 65536];
-                let read_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    socket.read(&mut buf),
-                ).await;
+                let read_result =
+                    tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await;
                 let n = match read_result {
                     Ok(Ok(n)) => n,
                     _ => continue,
                 };
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 if let Some(idx) = req_str.find("\r\n\r\n") {
                     let body = &req_str[idx + 4..];
@@ -140,7 +142,12 @@ impl MockOpenAIServer {
                 }
             }
         });
-        Self { addr, captured_request: captured, shutdown, remaining }
+        Self {
+            addr,
+            captured_request: captured,
+            shutdown,
+            remaining,
+        }
     }
 
     fn api_base(&self) -> String {
@@ -171,7 +178,11 @@ struct WorktreeGuard {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        let wt = self.repo.join(".latte").join("worktrees").join(&self.task_id);
+        let wt = self
+            .repo
+            .join(".latte")
+            .join("worktrees")
+            .join(&self.task_id);
         // 1) 正常路径：让 git 自己摘除登记 + 删目录。
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])
@@ -199,7 +210,8 @@ impl Drop for WorktreeGuard {
 /// `.latte/models.d/` so the config layer can resolve the model id
 /// "mock" before --model-override targets it.
 fn write_mock_toml(repo: &Path, api_base: &str) {
-    let mock_toml = format!(r#"
+    let mock_toml = format!(
+        r#"
 [[models.models]]
 id = "mock"
 name = "Mock"
@@ -214,7 +226,8 @@ max_tokens = 4096
 premium = "mock"
 standard = "mock"
 budget = "mock"
-"#);
+"#
+    );
     let dir = repo.join(".latte").join("models.d");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("mock.toml"), mock_toml).unwrap();
@@ -230,7 +243,8 @@ async fn ask_human_full_pause_resume_done_cycle() {
     //    tree are all present here, so the binary can resolve
     //    manager + programmer roles + their prompt files.
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf();
 
     // 3. Use a unique task_id per test run so re-runs (which
@@ -238,7 +252,10 @@ async fn ask_human_full_pause_resume_done_cycle() {
     //    collide with the previous run's worktree.
     let task_id = format!("askhuman-resume-{}", std::process::id());
     // 建完 task_id 立刻挂 guard：后续任何 panic 都能清理。
-    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
+    let _wt_guard = WorktreeGuard {
+        repo: repo.clone(),
+        task_id: task_id.clone(),
+    };
 
     // 4. Write the mock model declaration.
     write_mock_toml(&repo, &api_base);
@@ -249,13 +266,18 @@ async fn ask_human_full_pause_resume_done_cycle() {
     // 6. Run `latte-agent run` to create the worktree.
     let run_out = Command::new(bin())
         .arg("run")
-        .arg("--task-id").arg(&task_id)
-        .arg("--initial-prompt").arg("noop")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--initial-prompt")
+        .arg("noop")
         .current_dir(&repo)
         .output()
         .unwrap();
-    assert!(run_out.status.success(),
-        "run failed: stderr={}", String::from_utf8_lossy(&run_out.stderr));
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
 
     // 7. Spawn chat with stdin that drives the full pause+resume+quit
     //    cycle. --roles manager,programmer: round order sorts then
@@ -270,14 +292,22 @@ async fn ask_human_full_pause_resume_done_cycle() {
     //               "/quit" -> mark_done -> break.
     let script = b"first task\nyes, refactor first\n/quit\n";
     let mut chat_cmd = Command::new(bin());
-    chat_cmd.arg("chat")
-        .arg("--task-id").arg(&task_id)
-        .arg("--roles").arg("manager,programmer")
-        .arg("--initial-prompt").arg("noop")
-        .arg("--max-rounds").arg("2")
-        .arg("--model-id").arg("mock")
-        .arg("--api-key").arg("mock-key")
-        .arg("--model-override").arg(&model_override)
+    chat_cmd
+        .arg("chat")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--roles")
+        .arg("manager,programmer")
+        .arg("--initial-prompt")
+        .arg("noop")
+        .arg("--max-rounds")
+        .arg("2")
+        .arg("--model-id")
+        .arg("mock")
+        .arg("--api-key")
+        .arg("mock-key")
+        .arg("--model-override")
+        .arg(&model_override)
         .current_dir(&repo);
     chat_cmd.stdin(Stdio::piped());
     chat_cmd.stdout(Stdio::piped());
@@ -303,45 +333,52 @@ async fn ask_human_full_pause_resume_done_cycle() {
             break;
         }
     }
-    let done_session = done_session.expect(
-        "expected a Done session JSON after the full pause+resume+quit cycle"
-    );
-    let record: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&done_session).unwrap()
-    ).unwrap();
+    let done_session =
+        done_session.expect("expected a Done session JSON after the full pause+resume+quit cycle");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&done_session).unwrap()).unwrap();
 
     // 9. Assert the programmer role has the human's reply in its history
     //    (proves resume_with_message worked). The synthetic message
     //    format from session.rs is: "[HUMAN @ <ts>]\n<reply>".
     let roles = record["roles"].as_array().expect("roles array");
-    let programmer = roles.iter()
+    let programmer = roles
+        .iter()
         .find(|r| r["role_id"].as_str() == Some("programmer"))
         .expect("programmer role");
     let messages = programmer["messages"].as_array().expect("messages array");
     // Concatenate all text parts of a message (Vec<ContentPart> shape).
     let text_of = |m: &serde_json::Value| -> String {
-        m["content"].as_array()
-            .map(|parts| parts.iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(""))
+        m["content"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
             .unwrap_or_default()
     };
     let has_human_reply = messages.iter().any(|m| {
-        m["role"].as_str() == Some("user")
-            && {
-                let c = text_of(m);
-                c.contains("[HUMAN @") && c.contains("yes, refactor first")
-            }
+        m["role"].as_str() == Some("user") && {
+            let c = text_of(m);
+            c.contains("[HUMAN @") && c.contains("yes, refactor first")
+        }
     });
-    assert!(has_human_reply,
+    assert!(
+        has_human_reply,
         "programmer's history should contain the human's reply with [HUMAN @ ...] prefix; \
-         got messages: {:#?}", messages);
+         got messages: {:#?}",
+        messages
+    );
 
     // 10. Sanity: the mock server captured the LLM request with
     //     a "messages" array.
     let captured = server.captured_request.lock().unwrap();
-    let req = captured.as_ref().expect("mock server should have captured the request");
+    let req = captured
+        .as_ref()
+        .expect("mock server should have captured the request");
     let messages = req["messages"].as_array().expect("messages array");
     assert!(!messages.is_empty(), "LLM request had no messages");
 }

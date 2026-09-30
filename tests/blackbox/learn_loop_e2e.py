@@ -52,7 +52,7 @@ def setup_test_home():
     agents = os.path.join(TEST_HOME, "agents.d")
     os.makedirs(agents, exist_ok=True)
     import shutil
-    for role in ("tutor", "advisor"):
+    for role in ("tutor", "advisor", "proofreader"):
         src = os.path.join(ROOT, ".latte", "agents.d", f"{role}.toml")
         if os.path.isfile(src):
             shutil.copy(src, os.path.join(agents, f"{role}.toml"))
@@ -227,12 +227,12 @@ def main():
                 continue
 
             if ev["type"] == "WorkflowTurn":
-                if ev.get("step_id") == "doc":
+                if ev.get("step_id") == "doc_write":
                     content = ev.get("content", "")
-                    assert "draft.md" in content, "doc 正文必须给出 draft.md 路径"
+                    assert "draft.md" in content, "doc_write 文档产出必须给出 draft.md 路径"
                     if len(content) >= 500:
                         doc_delivered = True
-                        log(f"doc 步投递全文（{len(content)} 字符）")
+                        log(f"doc_review 文档产出（{len(content)} 字符）")
                 if ev.get("step_id") == "plan" and slug is None:
                     plan, path = load_plan()
                     if plan:

@@ -25,13 +25,20 @@ mod common;
 
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR = <root>/latte-agent-cli
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn binary() -> PathBuf {
     // 与 `cargo test` 同一 profile 的产物目录。
     let mut p = repo_root().join("target");
-    p.push(if cfg!(debug_assertions) { "debug" } else { "release" });
+    p.push(if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    });
     p.push("latte-agent");
     p
 }
@@ -94,7 +101,11 @@ fn split_screen_enters_and_restores_the_terminal() {
 
     let on = out.matches("\u{1b}[?2004h").count();
     let off = out.matches("\u{1b}[?2004l").count();
-    assert!(on >= 1, "应进入分离模式（开启 bracketed paste）：\n{}", tail(&out));
+    assert!(
+        on >= 1,
+        "应进入分离模式（开启 bracketed paste）：\n{}",
+        tail(&out)
+    );
     assert_eq!(
         on, off,
         "bracketed paste 的开/关必须配对，否则终端留在 raw mode（static 永不 drop 那个 bug）"
@@ -127,7 +138,10 @@ fn slash_command_output_reaches_the_history_area() {
         return;
     }
     let cwd = scratch_dir("cmds");
-    let out = drive(&cwd, &[("4.0", "/roles"), ("2.5", "/tools"), ("2.5", "/quit")]);
+    let out = drive(
+        &cwd,
+        &[("4.0", "/roles"), ("2.5", "/tools"), ("2.5", "/quit")],
+    );
     assert!(
         out.contains("Available roles ("),
         "/roles 的输出应出现在历史区：\n{}",
@@ -184,10 +198,7 @@ fn no_bare_spinner_escapes_in_split_mode() {
     }
     let cwd = scratch_dir("spinner");
     // 触发一次真实模型调用（生成期间才会有 spinner）。
-    let out = drive(
-        &cwd,
-        &[("4.0", "用一句话说你好"), ("25.0", "/quit")],
-    );
+    let out = drive(&cwd, &[("4.0", "用一句话说你好"), ("25.0", "/quit")]);
     assert!(
         !out.contains("\r\u{1b}[K"),
         "分离模式下出现了 spinner 的 `\\r\\x1b[K`，会擦掉输入行：\n{}",
@@ -295,7 +306,13 @@ fn multi_line_command_output_is_batched() {
     // 连发 4 次 /roles（每次 50+ 行）。
     let out = drive(
         &cwd,
-        &[("4.0", "/roles"), ("1.2", "/roles"), ("1.2", "/roles"), ("1.2", "/roles"), ("1.5", "/quit")],
+        &[
+            ("4.0", "/roles"),
+            ("1.2", "/roles"),
+            ("1.2", "/roles"),
+            ("1.2", "/roles"),
+            ("1.5", "/quit"),
+        ],
     );
     let listings = out.matches("Available roles (").count();
     assert!(listings >= 3, "至少应有 3 次 /roles 输出，实际 {listings}");
@@ -342,17 +359,17 @@ async fn pause_takes_effect_during_a_turn_not_after() {
     let resumed = out.find("已恢复");
     let turn_end = out.find("TurnEnd");
     let (Some(p), Some(r), Some(t)) = (paused, resumed, turn_end) else {
-        panic!(
-            "应同时出现 已暂停 / 已恢复 / TurnEnd：\n{}",
-            tail(&out)
-        );
+        panic!("应同时出现 已暂停 / 已恢复 / TurnEnd：\n{}", tail(&out));
     };
     assert!(
         p < t,
         "/pause 必须在 turn 期间即时生效（已暂停@{p} 应早于 TurnEnd@{t}）：\n{}",
         tail(&out)
     );
-    assert!(r < t, "/resume 也应在 turn 期间生效（已恢复@{r} vs TurnEnd@{t}）");
+    assert!(
+        r < t,
+        "/resume 也应在 turn 期间生效（已恢复@{r} vs TurnEnd@{t}）"
+    );
 }
 
 /// 新命令的错误路径必须有反馈，且不能崩会话。

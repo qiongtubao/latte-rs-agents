@@ -361,10 +361,7 @@ fn list_chat_logs() -> Vec<PathBuf> {
 /// Wait for `child` to exit, with a wall-clock timeout. Returns the
 /// captured Output on success; on timeout, kills the child and
 /// returns an error string.
-fn wait_with_timeout(
-    mut child: std::process::Child,
-    timeout: Duration,
-) -> Result<Output, String> {
+fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Result<Output, String> {
     let start = Instant::now();
     loop {
         match child.try_wait() {
@@ -389,10 +386,7 @@ fn wait_with_timeout(
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "timed out after {:?} (no exit)",
-                        timeout
-                    ));
+                    return Err(format!("timed out after {:?} (no exit)", timeout));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }

@@ -21,10 +21,10 @@
 //! (manager excluded) so the round loop's only LLM call is the
 //! programmer's, where `ask_human` is available.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,22 +55,24 @@ impl MockOpenAIServer {
         let question_text = "should I refactor the DB connection first or write the migration?";
         tokio::spawn(async move {
             loop {
-                if *shutdown_clone.lock().unwrap() { break; }
+                if *shutdown_clone.lock().unwrap() {
+                    break;
+                }
                 let (mut socket, _) = match listener.accept().await {
                     Ok(c) => c,
                     Err(_) => break,
                 };
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 65536];
-                let read_result = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    socket.read(&mut buf),
-                ).await;
+                let read_result =
+                    tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buf)).await;
                 let n = match read_result {
                     Ok(Ok(n)) => n,
                     _ => continue,
                 };
-                if n == 0 { continue; }
+                if n == 0 {
+                    continue;
+                }
                 let req_str = String::from_utf8_lossy(&buf[..n]);
                 if let Some(idx) = req_str.find("\r\n\r\n") {
                     let body = &req_str[idx + 4..];
@@ -116,7 +118,11 @@ impl MockOpenAIServer {
                 break;
             }
         });
-        Self { addr, captured_request: captured, shutdown }
+        Self {
+            addr,
+            captured_request: captured,
+            shutdown,
+        }
     }
 
     fn api_base(&self) -> String {
@@ -147,7 +153,11 @@ struct WorktreeGuard {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
-        let wt = self.repo.join(".latte").join("worktrees").join(&self.task_id);
+        let wt = self
+            .repo
+            .join(".latte")
+            .join("worktrees")
+            .join(&self.task_id);
         // 1) 正常路径：让 git 自己摘除登记 + 删目录。
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])
@@ -175,7 +185,8 @@ impl Drop for WorktreeGuard {
 /// `.latte/models.d/` so the config layer can resolve the model id
 /// "mock" before --model-override targets it.
 fn write_mock_toml(repo: &Path, api_base: &str) {
-    let mock_toml = format!(r#"
+    let mock_toml = format!(
+        r#"
 [[models.models]]
 id = "mock"
 name = "Mock"
@@ -190,7 +201,8 @@ max_tokens = 4096
 premium = "mock"
 standard = "mock"
 budget = "mock"
-"#);
+"#
+    );
     let dir = repo.join(".latte").join("models.d");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("mock.toml"), mock_toml).unwrap();
@@ -211,10 +223,14 @@ async fn ask_human_actually_pauses_session_via_real_llm() {
     //    tree are all present here, so the binary can resolve
     //    manager + programmer roles + their prompt files.
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
+        .parent()
+        .unwrap()
         .to_path_buf();
     // repo 就绪后立刻挂 guard：后续任何 panic 都能清理 worktree + 分支。
-    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
+    let _wt_guard = WorktreeGuard {
+        repo: repo.clone(),
+        task_id: task_id.clone(),
+    };
 
     // 3. Write the mock model declaration.
     write_mock_toml(&repo, &api_base);
@@ -225,13 +241,18 @@ async fn ask_human_actually_pauses_session_via_real_llm() {
     // 5. Run `latte-agent run` to create the worktree.
     let run_out = Command::new(bin())
         .arg("run")
-        .arg("--task-id").arg(&task_id)
-        .arg("--initial-prompt").arg("noop")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--initial-prompt")
+        .arg("noop")
         .current_dir(&repo)
         .output()
         .unwrap();
-    assert!(run_out.status.success(),
-        "run failed: stderr={}", String::from_utf8_lossy(&run_out.stderr));
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
 
     // 6. Spawn chat with stdin that drives 1 round. Use --roles
     //    programmer (not manager) because ask_human is only
@@ -245,16 +266,27 @@ async fn ask_human_actually_pauses_session_via_real_llm() {
     //     collide with the previous run's worktree.
     let task_id = format!("askhuman-test-{}", std::process::id());
     // 建完 task_id 立刻挂 guard：后续任何 panic 都能清理。
-    let _wt_guard = WorktreeGuard { repo: repo.clone(), task_id: task_id.clone() };
+    let _wt_guard = WorktreeGuard {
+        repo: repo.clone(),
+        task_id: task_id.clone(),
+    };
     let mut chat_cmd = Command::new(bin());
-    chat_cmd.arg("chat")
-        .arg("--task-id").arg(&task_id)
-        .arg("--roles").arg("manager,programmer")
-        .arg("--initial-prompt").arg("noop")
-        .arg("--max-rounds").arg("2")
-        .arg("--model-id").arg("mock")
-        .arg("--api-key").arg("mock-key")
-        .arg("--model-override").arg(&model_override)
+    chat_cmd
+        .arg("chat")
+        .arg("--task-id")
+        .arg(&task_id)
+        .arg("--roles")
+        .arg("manager,programmer")
+        .arg("--initial-prompt")
+        .arg("noop")
+        .arg("--max-rounds")
+        .arg("2")
+        .arg("--model-id")
+        .arg("mock")
+        .arg("--api-key")
+        .arg("mock-key")
+        .arg("--model-override")
+        .arg(&model_override)
         .current_dir(&repo);
     chat_cmd.stdin(Stdio::piped());
     chat_cmd.stdout(Stdio::piped());
@@ -281,30 +313,35 @@ async fn ask_human_actually_pauses_session_via_real_llm() {
             break;
         }
     }
-    let paused_session = paused_session.expect(
-        "expected a Paused session JSON — ask_human tool should have paused the session"
-    );
-    let record: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&paused_session).unwrap()
-    ).unwrap();
-    let reason = record["pause_reason"].as_str().expect("pause_reason should be a string");
+    let paused_session = paused_session
+        .expect("expected a Paused session JSON — ask_human tool should have paused the session");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&paused_session).unwrap()).unwrap();
+    let reason = record["pause_reason"]
+        .as_str()
+        .expect("pause_reason should be a string");
     assert!(
         reason.contains("ask_human"),
-        "pause_reason should mention ask_human, got: {}", reason
+        "pause_reason should mention ask_human, got: {}",
+        reason
     );
     assert!(
         reason.contains("programmer asked"), // manager is in --roles just to satisfy the REPL dispatch,
-        "pause_reason should include the role, got: {}", reason
+        "pause_reason should include the role, got: {}",
+        reason
     );
     assert!(
         reason.contains("should I refactor the DB connection"),
-        "pause_reason should include the question text, got: {}", reason
+        "pause_reason should include the question text, got: {}",
+        reason
     );
 
     // 8. Sanity: the mock server captured the LLM request with
     //    a "messages" array.
     let captured = server.captured_request.lock().unwrap();
-    let req = captured.as_ref().expect("mock server should have captured the request");
+    let req = captured
+        .as_ref()
+        .expect("mock server should have captured the request");
     let messages = req["messages"].as_array().expect("messages array");
     assert!(!messages.is_empty(), "LLM request had no messages");
 }

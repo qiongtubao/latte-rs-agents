@@ -1,8 +1,8 @@
 //! End-to-end test for v1.1 round-robin scheduler.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::io::Write;
 
 mod common;
 use common::{start_model_mock, write_isolated_home};
@@ -15,8 +15,17 @@ fn bin() -> std::path::PathBuf {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    let out = Command::new("git").args(args).current_dir(cwd).output().unwrap();
-    assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn latte(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> std::process::Output {
@@ -36,12 +45,18 @@ fn latte_with_home(
         cmd.env("LATTE_HOME", h);
     }
     if let Some(input) = stdin {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
         child.stdin.as_mut().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     } else {
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().unwrap()
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
     }
 }
 
@@ -76,8 +91,17 @@ async fn round_robin_invokes_each_role_in_order() {
     let script = b"first task\nnoop\n/quit\n";
     let out = latte_with_home(
         repo,
-        &["chat", "--task-id", "e2e11", "--roles", "manager,programmer,reviewer",
-          "--initial-prompt", "noop", "--max-rounds", "3"],
+        &[
+            "chat",
+            "--task-id",
+            "e2e11",
+            "--roles",
+            "manager,programmer,reviewer",
+            "--initial-prompt",
+            "noop",
+            "--max-rounds",
+            "3",
+        ],
         Some(script),
         Some(home.path()),
     );
@@ -89,16 +113,30 @@ async fn round_robin_invokes_each_role_in_order() {
     let programmer_count = stdout.matches("programmer round").count();
     let reviewer_count = stdout.matches("reviewer round").count();
     let manager_count = stdout.matches("manager round").count();
-    assert!(programmer_count >= 2, "programmer round count: {}", programmer_count);
-    assert!(reviewer_count >= 2, "reviewer round count: {}", reviewer_count);
+    assert!(
+        programmer_count >= 2,
+        "programmer round count: {}",
+        programmer_count
+    );
+    assert!(
+        reviewer_count >= 2,
+        "reviewer round count: {}",
+        reviewer_count
+    );
     assert!(manager_count >= 2, "manager round count: {}", manager_count);
 
     // 4. Order: within a round, manager is last.
     let first_programmer = stdout.find("programmer round").unwrap();
     let first_reviewer = stdout.find("reviewer round").unwrap();
     let first_manager = stdout.find("manager round").unwrap();
-    assert!(first_programmer < first_reviewer, "programmer should come before reviewer");
-    assert!(first_reviewer < first_manager, "reviewer should come before manager");
+    assert!(
+        first_programmer < first_reviewer,
+        "programmer should come before reviewer"
+    );
+    assert!(
+        first_reviewer < first_manager,
+        "reviewer should come before manager"
+    );
 
     // 5. Session JSON is in Done state.
     let sessions_dir = repo.join(".latte/worktrees/e2e11/.latte/sessions");
