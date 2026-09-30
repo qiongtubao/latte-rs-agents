@@ -146,6 +146,27 @@ pub async fn create_session(b: &UiBackend) -> Result<SessionInfo, ApiError> {
     create_session_in(b, None).await
 }
 
+/// 面向用户的新建会话：为它按 session id 建独立工作空间（git 仓库 → worktree，
+/// 否则空目录），删除会话时随之删除。建失败降级为项目 cwd，不阻断。
+pub async fn create_session_with_workspace(b: &UiBackend) -> Result<SessionInfo, ApiError> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let session_id = format!(
+        "ui-{}-{}-w{}",
+        std::process::id(),
+        crate::unix_ts_millis(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let cwd = b.cwd.clone();
+    let sid = session_id.clone();
+    let ws = tokio::task::spawn_blocking(move || {
+        latte_agent_core::task_worktree::TaskWorktree::create_session_workspace(&cwd, &sid)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.map_err(|e| eprintln!("[sessions] 建会话工作空间失败，退回项目目录: {e}")).ok());
+    create_session_with_id(b, session_id, ws.as_deref()).await
+}
+
 /// [`create_session`] 的隔离版：`agent_cwd` 指定 agent 的工具工作目录
 /// （任务隔离 worktree 的根）。会话日志仍落在项目 cwd 下——worktree 会被
 /// cleanup 删掉，日志不能跟着走。
@@ -153,7 +174,6 @@ pub async fn create_session_in(
     b: &UiBackend,
     agent_cwd: Option<&std::path::Path>,
 ) -> Result<SessionInfo, ApiError> {
-    // 批量派发等场景同一毫秒可能建多个 session：加进程内序号兜底唯一性。
     static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let session_id = format!(
         "ui-{}-{}-{}",
@@ -161,6 +181,14 @@ pub async fn create_session_in(
         crate::unix_ts_millis(),
         SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
+    create_session_with_id(b, session_id, agent_cwd).await
+}
+
+async fn create_session_with_id(
+    b: &UiBackend,
+    session_id: String,
+    agent_cwd: Option<&std::path::Path>,
+) -> Result<SessionInfo, ApiError> {
     let handle = create_session_handle(
         session_id.clone(),
         &b.initial_role,
@@ -402,7 +430,20 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
             // 落盘的孤儿 ask 记录同理：按 session 归属加载，session 都
             // 没了就不该再被补发成弹框。
             latte_agent_core::pending_ask::remove_for_session(&b.cwd, id);
+            let agent_cwd = h.agent_cwd();
             h.delete_files();
+            // 该 session 的 workflow 断点 / 暂存草稿一并删除：同一任务重跑时
+            // 不该读到上一次的缓存文档。
+            latte_agent_core::workflow::remove_session_runs(&b.cwd, id);
+            // 独立工作空间（普通 session 按 id 建；fork 会继承源 session 的目录，
+            // 仍有其它 session 在用时不删）。
+            if !b.sessions.read().values().any(|o| o.agent_cwd() == agent_cwd) {
+                latte_agent_core::task_worktree::TaskWorktree::remove_session_workspace(
+                    &b.cwd, id, &agent_cwd,
+                );
+            }
+            // 任务隔离会话：连它的 worktree 一起回收（树 + 分支）。
+            crate::tasks::reclaim_session_worktree(b, &agent_cwd).await;
             // 联删 subagent 落盘文件（与主 session 文件同生命周期）：
             // `<ui-sessions>/<sid>/` 整目录 rm + 索引清掉 + 内存
             // entries 清掉。最佳努力，错误已在 store 内部 warn。

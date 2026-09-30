@@ -35,7 +35,7 @@ pub(crate) async fn create_session(
     // Empty body extractor — POST /api/sessions just allocates a session.
     _body: axum::Json<serde_json::Value>,
 ) -> Result<Json<api::SessionInfo>, (StatusCode, String)> {
-    api::create_session(&state.backend)
+    api::create_session_with_workspace(&state.backend)
         .await
         .map(Json)
         .map_err(Into::into)

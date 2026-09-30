@@ -785,6 +785,67 @@ impl TaskWorktree {
         wt.cleanup(false)?;
         Ok(true)
     }
+
+    /// 普通 session 的独立工作空间根：`derive_root(<项目>, <session_id>)`。
+    pub fn session_workspace_root(project_root: &Path, session_id: &str) -> PathBuf {
+        Self::derive_root(project_root, session_id)
+    }
+
+    /// 给普通 session 建独立工作空间，返回目录。
+    ///
+    /// git 仓库 → git worktree（agent 能看到项目代码，改动互不影响）；
+    /// 非 git / 建树失败 → 普通空目录。两种都放一个 `.latte` 软链回项目状态目录，
+    /// 保证会话日志、配置照旧按 cwd 落在项目里。
+    pub fn create_session_workspace(project_root: &Path, session_id: &str) -> std::io::Result<PathBuf> {
+        if !safe_task_id(session_id) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("session id {session_id:?} 不能用作目录名"),
+            ));
+        }
+        if let Ok(repo) = Self::resolve_repo_root(project_root) {
+            if let Ok(wt) = Self::open_or_create(&repo, session_id, None) {
+                return Ok(wt.info.root);
+            }
+        }
+        let root = Self::session_workspace_root(project_root, session_id);
+        std::fs::create_dir_all(&root)?;
+        #[cfg(unix)]
+        {
+            let link = root.join(".latte");
+            if link.symlink_metadata().is_err() {
+                let target = project_root.join(".latte");
+                std::fs::create_dir_all(&target)?;
+                std::os::unix::fs::symlink(&target, &link)?;
+            }
+        }
+        Ok(root)
+    }
+
+    /// 删除 [`create_session_workspace`] 建的目录（git worktree 连分支一起回收）。
+    /// `root` 必须恰好是该 session 的工作空间根，否则不动。幂等。
+    pub fn remove_session_workspace(project_root: &Path, session_id: &str, root: &Path) {
+        if root != Self::session_workspace_root(project_root, session_id) {
+            return;
+        }
+        if root.join(".git").exists() {
+            if let Ok(repo) = Self::resolve_repo_root(project_root) {
+                let wt = Self::from_info(
+                    &repo,
+                    session_id,
+                    TaskWorktreeInfo {
+                        root: root.to_path_buf(),
+                        branch: format!("{TASK_BRANCH_PREFIX}{session_id}"),
+                        base_branch: String::new(),
+                        base_sha: String::new(),
+                    },
+                );
+                let _ = wt.cleanup(false);
+            }
+        }
+        // 软链只删链本身，不跟进主仓 .latte。
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]
@@ -874,5 +935,31 @@ mod tests {
             started.wait();
         });
         h.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod session_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn non_git_workspace_created_and_removed_without_touching_project_state() {
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        std::env::set_var("LATTE_HOME", home.path());
+        std::fs::create_dir_all(proj.path().join(".latte")).unwrap();
+        std::fs::write(proj.path().join(".latte/keep.txt"), "k").unwrap();
+
+        let root = TaskWorktree::create_session_workspace(proj.path(), "ui-1-2-w0").unwrap();
+        assert!(root.is_dir());
+        std::fs::write(root.join("scratch.md"), "x").unwrap();
+
+        // 路径不匹配 → 不动
+        TaskWorktree::remove_session_workspace(proj.path(), "other", &root);
+        assert!(root.is_dir());
+
+        TaskWorktree::remove_session_workspace(proj.path(), "ui-1-2-w0", &root);
+        assert!(!root.exists());
+        assert!(proj.path().join(".latte/keep.txt").exists());
     }
 }

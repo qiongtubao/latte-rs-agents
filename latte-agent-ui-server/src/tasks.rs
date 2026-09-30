@@ -2052,6 +2052,30 @@ async fn cleanup_worktree_info(
     .map_err(|e| format!("cleanup panic: {e}"))?
 }
 
+/// session 删除时回收它独占的任务工作树。`agent_cwd` = 被删 session 的
+/// agent 工作目录；等于项目 cwd（非隔离）、找不到持有它的任务、或仍有其它
+/// 存活 session 在用同一棵树（rework 复用）时都不动——误删活树比残留更糟。
+/// 树与分支一并删除（`keep_branch = false`），下次派发从当前 HEAD 拉全新树。
+pub(crate) async fn reclaim_session_worktree(b: &UiBackend, agent_cwd: &Path) {
+    if agent_cwd == b.cwd {
+        return;
+    }
+    if b.sessions.read().values().any(|h| h.agent_cwd() == agent_cwd) {
+        return;
+    }
+    let owner = {
+        let store = b.tasks.read();
+        store
+            .tasks
+            .values()
+            .find(|t| t.worktree.as_ref().is_some_and(|w| w.root == agent_cwd))
+            .map(|t| t.id.clone())
+    };
+    if let Some(id) = owner {
+        cleanup_task_worktree(b, &id, false).await;
+    }
+}
+
 /// 登记「待派发」：闸挡下来的任务留在 todo，但标记用户已表达过要跑它，/// 由 scheduler 在闸放开后自动续跑。原因同时写进 history（看板可见），
 /// 但**同一条原因不重复记**——scheduler 每 5s 重试一次，逐次记 note 会
 /// 把 history 刷成几百条同文。

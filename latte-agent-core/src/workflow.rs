@@ -2704,6 +2704,40 @@ fn checkpoint_path(cwd: &Path, wf_id: &str) -> PathBuf {
     checkpoint_dir(cwd).join(format!("{wf_id}.jsonl"))
 }
 
+/// 删除属于某 UI session 的 workflow 运行产物：`workflow-runs/<wf_id>.jsonl`
+/// checkpoint（按首行 meta 的 `session_id` 归属）及其
+/// `staging/<wf_id>/` 暂存目录。session 删除时调用，避免同一任务重跑时
+/// 读到上一次的断点/草稿。best-effort，返回删掉的 run 数。
+pub fn remove_session_runs(cwd: &Path, session_id: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(checkpoint_dir(cwd)) else {
+        return 0;
+    };
+    let needle = format!("\"session_id\":\"{session_id}\"");
+    let mut removed = 0;
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mut first = String::new();
+        let owned = std::fs::File::open(&path)
+            .ok()
+            .map(std::io::BufReader::new)
+            .and_then(|mut r| std::io::BufRead::read_line(&mut r, &mut first).ok())
+            .is_some_and(|_| first.contains(&needle));
+        if !owned {
+            continue;
+        }
+        if let Some(wf_id) = path.file_stem().and_then(|s| s.to_str()) {
+            let _ = std::fs::remove_dir_all(cwd.join(".latte").join("staging").join(wf_id));
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Append one record to the run's checkpoint file (creating the
 /// directory on first use). Failures only warn — a checkpoint is a
 /// recovery aid, never a reason to fail the run.
@@ -6958,6 +6992,36 @@ async fn run_workflow_dag(
         .cloned()
         .unwrap_or_default();
     WfOutcome::Ok(final_out, keyed)
+}
+
+#[cfg(test)]
+mod remove_session_runs_tests {
+    use super::*;
+
+    #[test]
+    fn removes_only_owning_session_runs_and_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        for (wf, sid) in [("wf-a", "s1"), ("wf-b", "s2")] {
+            append_checkpoint(
+                cwd,
+                wf,
+                &CheckpointRecord::Meta {
+                    wf_id: wf.into(),
+                    workflow_name: "w".into(),
+                    topic: "t".into(),
+                    started_at: 0,
+                    session_id: Some(sid.into()),
+                },
+            );
+            std::fs::create_dir_all(cwd.join(".latte/staging").join(wf)).unwrap();
+        }
+        assert_eq!(remove_session_runs(cwd, "s1"), 1);
+        assert!(!checkpoint_path(cwd, "wf-a").exists());
+        assert!(!cwd.join(".latte/staging/wf-a").exists());
+        assert!(checkpoint_path(cwd, "wf-b").exists());
+        assert!(cwd.join(".latte/staging/wf-b").exists());
+    }
 }
 
 #[cfg(test)]
