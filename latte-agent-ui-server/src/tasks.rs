@@ -3820,17 +3820,20 @@ pub async fn reclaim_orphan_worktrees(b: &UiBackend) {
     }
 }
 
-/// 启动对账：把**上次进程留下的未结束 run** 收尾，任务回 `todo`。
+/// 启动对账：标记**上次进程留下的未结束 run**（不迁状态、不标 aborted）。
 ///
 /// 服务重启/崩溃时，正在跑的 workflow 与 controller 直接消亡，永远等不到
-/// `WorkflowFinished`——任务就永久停在 `in_progress`：看板上像在跑（实际没有
-/// 任何东西在跑），`abort` 之前既不能重派、也不会被 scheduler 碰。
+/// `WorkflowFinished`。但任务与它的执行 session 是绑定关系——session 文件在
+/// 盘上还在（dispatch 时已 materialize），run 的 `ended_at` 保持 None 如实
+/// 反映「绑定着一个已死、但可断点续跑的 session」。
 ///
-/// 处理：未结束的 run 标 `aborted`、状态回 `todo`、history 写明原因。
-/// **刻意不自动重派**（`dispatch_pending` 不置位）：重启就自动重跑半成品任务
-/// 会在用户不在场时烧掉大量 token，该由人看过 history 再决定。
+/// 处理：**不回退状态、不自动重派**。只写一条 history 让「上次跑过」可见；
+/// 任务留在 `in_progress`（绑定的 session 还指着它，只是执行体死了），由用户
+/// 在看板点「↺ 重试」（`resume_task` → 该 session 断点续跑）或「中止」
+/// （`abort_task` 收尾回 todo）。刻意不自动续跑/重派：重启就自动烧 token
+/// 跑半成品，该由人看过 history 再决定。
 ///
-/// **隔离工作树一律保留**：里面是上次干到一半的活，重新派发会复用同一棵树。
+/// **隔离工作树一律保留**：里面是上次干到一半的活，重试/重派会复用同一棵树。
 pub fn reconcile_interrupted_runs(b: &UiBackend) -> Vec<String> {
     let now = now_ms();
     let stuck: Vec<String> = b
@@ -3848,29 +3851,25 @@ pub fn reconcile_interrupted_runs(b: &UiBackend) -> Vec<String> {
     let mut store = b.tasks.write();
     for id in &stuck {
         let Some(t) = store.get_mut(id) else { continue };
-        if let Some(run) = t.runs.last_mut().filter(|r| r.ended_at.is_none()) {
-            run.ended_at = Some(now);
-            run.result = Some("aborted".to_string());
-        }
+        // 中断 ≠ 待派发：清掉否则 scheduler 会把「等用户重试」的任务又派出去。
+        t.dispatch_pending = false;
         let kept = if t.worktree.is_some() {
-            "，隔离工作树已保留（重新派发会复用）"
+            "，隔离工作树已保留"
         } else {
             ""
         };
-        t.set_state(
-            "todo",
+        t.push_note(
             "scheduler",
-            Some(format!("服务重启前的执行被中断，已回退待重派{kept}")),
+            format!("上次执行随服务重启中断{kept}；点「重试」断点续跑，或「中止」回 todo 重新派发"),
             now,
         );
-        t.dispatch_pending = false;
         t.updated_at = now;
         if let Err(e) = store.persist(id) {
             eprintln!("[tasks] reconcile {id}: {e}");
         }
     }
     eprintln!(
-        "[tasks] 启动对账：{} 个中断任务已回退 todo（{stuck:?}）",
+        "[tasks] 启动对账：{} 个中断任务已标记（待重试）（{stuck:?}）",
         stuck.len()
     );
     stuck
@@ -6129,7 +6128,7 @@ mod tests {
             .cloned()
             .expect("重启后 runs[] 指向的 session 必须恢复得回来");
         assert!(restored.restored, "应从落盘恢复（restored 标记）");
-        // 与生产启动一致：server 起来后对账中断的 run（in_progress → todo）。
+        // 与生产启动一致：server 起来后对账中断的 run（保持 in_progress + 标记）。
         reconcile_interrupted_runs(&b2);
         let expected_label = format!("[{}] {}", ids[0], "重启后还要能看会话");
         assert_eq!(
@@ -6137,10 +6136,11 @@ mod tests {
             Some(expected_label.as_str()),
             "label 应随 meta 恢复",
         );
-        // 任务本体也恢复且保持重启对账语义（run 中断 → 回 todo）。
+        // 任务本体也恢复且保持对账语义（run 中断 → 保持 in_progress，用户点重试/中止）。
         let t = b2.tasks.read().get(&ids[0]).unwrap().clone();
-        assert_eq!(t.state, "todo", "中断的任务回 todo 待重派");
+        assert_eq!(t.state, "in_progress", "中断的任务保持 in_progress");
         assert_eq!(t.runs.last().unwrap().session_id, sid, "runs 关联仍在");
+        assert!(t.runs.last().unwrap().ended_at.is_none(), "run 未收尾，留给续跑");
     }
     /// 同一任务并发派发两次（双击/两 tab 同时点）：写锁内复查 state
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6396,44 +6396,11 @@ mod tests {
         assert!(live_root.is_dir(), "活任务持有的树不能被回收");
     }
 
-    /// 中止后必须清掉「待派发」：否则 scheduler 5s 后又把它派出去，
-    /// 用户看到的是"点了中止还在跑"。
+    /// 启动对账：上次进程留下的未结束 run **保持 in_progress**（不迁状态、
+    /// 不标 aborted），只记 history 标记中断，工作树保留。任务与 session
+    /// 绑定，由用户「重试」断点续跑或「中止」回 todo。
     #[tokio::test]
-    async fn abort_cancels_pending_auto_dispatch() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let b = std::sync::Arc::new(test_backend(&dir));
-        let ids = import_as_todo(
-            &b,
-            serde_json::json!({"tasks": [
-                { "title": "甲", "paths": ["src/x"] },
-                { "title": "乙", "paths": ["src/x"] }
-            ]}),
-        )
-        .await;
-        dispatch_task(&b, &ids[0], "user", "redo")
-            .await
-            .expect("甲派发");
-        // 乙与甲范围重叠 → 被挡下并登记待派发。
-        let _ = dispatch_task(&b, &ids[1], "user", "redo").await;
-        assert!(b.tasks.read().get(&ids[1]).unwrap().dispatch_pending);
-
-        // 中止甲 → 冲突消失；但乙也被用户中止过的话不该自动跑。
-        abort_task(&b, &ids[0]).await.expect("中止甲");
-        b.tasks.write().get_mut(&ids[1]).unwrap().dispatch_pending = false;
-        scan_and_dispatch(&b).await;
-        assert_eq!(
-            b.tasks.read().get(&ids[1]).unwrap().state,
-            "todo",
-            "撤销待派发后 scheduler 不该再派它"
-        );
-        // 甲自己也不该因为 abort 而被自动重派。
-        assert_eq!(b.tasks.read().get(&ids[0]).unwrap().state, "todo");
-        assert!(!b.tasks.read().get(&ids[0]).unwrap().dispatch_pending);
-    }
-
-    /// 启动对账：上次进程留下的未结束 run 收尾、任务回 todo，工作树保留。
-    #[tokio::test]
-    async fn startup_reconciles_interrupted_runs_but_keeps_the_worktree() {
+    async fn startup_marks_interrupted_runs_but_keeps_state_and_worktree() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = git_backend(&dir);
         let ids = import_as_todo(
@@ -6461,17 +6428,19 @@ mod tests {
         assert_eq!(
             reconciled,
             vec![ids[0].clone()],
-            "只该动有未结束 run 的任务"
+            "只该标记有未结束 run 的任务"
         );
 
         let store = b.tasks.read();
         let t = store.get(&ids[0]).unwrap();
         assert_eq!(
-            t.state, "todo",
-            "中断的任务必须回 todo，否则永久卡 in_progress"
+            t.state, "in_progress",
+            "中断任务保持 in_progress（绑定着可续跑的 session），由用户决定重试/中止"
         );
-        assert_eq!(t.runs.last().unwrap().result.as_deref(), Some("aborted"));
-        assert!(t.runs.last().unwrap().ended_at.is_some());
+        // run 不被收尾：ended_at 仍 None、result 仍 None——续跑的是同一个 run。
+        let run = t.runs.last().unwrap();
+        assert!(run.ended_at.is_none(), "不标 aborted，run 留给续跑");
+        assert!(run.result.is_none());
         assert!(
             !t.dispatch_pending,
             "不自动重派——重启就重跑会在用户不在场时烧 token"
