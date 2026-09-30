@@ -1,16 +1,15 @@
 # Workflow: doc_review_loop
-# 学习文档「并发写作 + 分章审查」闭环（DAG，按 wave 执行）：
-#   wave0 outline   ：写主体框架 sections/00_overview.md + index.md（子章节链接），
-#                     并把返工意见按章拆到 feedback.md（首轮 MODE: FULL）
+# 学习文档「主体框架 + 并发写作」（DAG，按 wave 执行）：
+#   wave0 outline   ：写主体框架 sections/00_overview.md + index.md（子章节链接）
 #   wave1 write_chapter：引擎按 plan.json 的 knowledge_points **每章派发一次**（fan_out），
 #                     并发度受引擎信号量限制（LATTE_WORKFLOW_CONCURRENCY，缺省 4），
 #                     章节比并发度多时引擎自动排队，有空位就派下一章——章节数不受限，
 #                     分派完全由引擎负责，模型只写自己被分到的那一章
-#   wave2 proofread ：读 sections + 源码核对；事实错误以源码为准；教学缺陷才算 BLOCKER
-# NEEDS_FIX → 回 outline（wave0）拆意见 → 只有被点名的章节重写，其余章节的派发任务直接 UNCHANGED。
+# 章节写完就返回外层。学员阅读、答题；答错才按 feedback.md 重写被点名的章。
+# 不再等另一个模型输出 LOOKS_CLEAR。
 # draft.md 由引擎在控制步（read_confirm/quiz）前从 sections 自动装配，writer 不写它。
 name = "doc_review_loop"
-description = "主体框架先行 + 各章并发写作 + 对照源码的分章审查，最多 3 轮｜落点：.latte/learn/<slug>/{index.md,sections/*.md}"
+description = "主体框架先行 + 各章并发写作，写完即交给学员｜落点：.latte/learn/<slug>/{index.md,sections/*.md}"
 max_rounds = 1
 
 [[steps]]
@@ -101,51 +100,5 @@ file = ".latte/learn/{{slug}}/plan.json"
 items = "knowledge_points"
 id_key = "id"
 max_items = 32
-# 单章失败不拖垮其余章节；失败章节的产出以 FAN_OUT_ITEM_FAILED 开头，审稿员按缺章判 BLOCKER。
+# 单章失败不拖垮其余章节；失败章节的产出以 FAN_OUT_ITEM_FAILED 开头。
 tolerate_failures = true
-
-[[steps]]
-id = "proofread"
-description = "对照源码审查各章：事实错误、设计动机/取舍是否讲清、是否适合学习"
-role = "proofreader"
-depends_on = ["write_chapter"]
-output_key = "review_out"
-max_retries = 1
-loop_until = "LOOKS_CLEAR"
-loop_back_to = "outline"
-max_iterations = 3
-prompt_token_ratio = 0.8
-context_overflow_restart = true
-context_overflow_max_restarts = 2
-context_overflow_files = ["index.md"]
-tools = ["read", "search", "code_graph", "doc_graph_context"]
-require_tools = ["read"]
-task = """你是学习文档审稿员，只读不改。既是零基础读者，也是**对照源码的核查员**。
-
-契约：
-{{topic}}
-
-阅读顺序：.latte/learn/<slug>/index.md → sections/00_overview.md → sections/<k_id>.md（按 plan.json 顺序）。
-可以（且应当）读源码抽查：每章至少核对 2 处关键代码片段/数值是否与源码一致。
-草稿里的行号偏差、措辞、格式**只算 NIT，不许因此判 NEEDS_FIX**。
-
-章节写作步骤的汇总产出（含失败标记，`FAN_OUT_ITEM_FAILED <k_id>: 原因` 表示该章写作失败）：
-{{chapters_out}}
-出现失败标记或 sections/<k_id>.md 缺失 = 该章缺章，按 BLOCKER 报（章节写 k_id）。
-
-## BLOCKER（必须修，才允许 NEEDS_FIX）
-- **事实错误**：代码/数值/算式与源码不符，或引用了不存在的代码（须你亲自读源码确认后才能报）；
-- **「简化版」「…省略」伪代码冒充源码**；
-- **把猜测写成事实**（无源码注释/实现依据却断言作者意图，且未标「[推测]」）；
-- **缺章或章节互相矛盾**：sections 缺失、后文依赖前文没出现的概念、两章对同一事实说法相反。
-## NIT
-措辞、图表偏密、术语铺垫、行号小偏差、排版、设计动机讲得浅、备选方案不够具体。这些只建议，不得因此 NEEDS_FIX。
-
-逐条输出：
-ISSUE: <章节 k_id 或 overview> | <BLOCKER/NIT> | <类别> | <具体问题（事实错误须写明源码 file:line 与正确内容）> | <应补内容>
-章节 id 必须写准确（返工按它分派给对应 writer）。
-
-放行规则（引擎靠最后一行判定）：存在任一 BLOCKER → 最后一行 NEEDS_FIX；否则 LOOKS_CLEAR。
-除最后一行外不要输出这两个标记。"""
-[steps.output_contract]
-last_line_prefix_any = ["LOOKS_CLEAR", "NEEDS_FIX"]

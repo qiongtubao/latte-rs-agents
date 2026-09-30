@@ -9263,8 +9263,7 @@ role = "reviewer"
             step("legacy_proofread").when_any,
             vec!["__legacy_flat_learn_loop__"]
         );
-        // 外层所有实际执行的普通 speaker 都是 tutor；proofreader 只在
-        // nested doc_review_loop 内运行，不能混回外层。
+        // 外层实际执行的 speaker 都是 tutor。审稿不再挡在学员前面。
         for s in &wf.steps {
             if matches!(
                 s.id.as_str(),
@@ -16862,7 +16861,7 @@ task = "补充疑问"
             .find(|s| s.id == "doc_review")
             .expect("outer workflow must have doc_review nested step");
         assert_eq!(review.workflow.as_deref(), Some("doc_review_loop"));
-        assert_eq!(review.output_from.as_deref(), Some("review_out"));
+        assert_eq!(review.output_from.as_deref(), Some("chapters_out"));
 
         let inner: WorkflowDef =
             toml::from_str(include_str!("../../config/workflows/doc_review_loop.toml"))
@@ -16870,19 +16869,12 @@ task = "补充疑问"
         inner
             .validate()
             .expect("doc_review_loop config must validate");
-        let proofread = inner
-            .steps
-            .iter()
-            .find(|s| s.id == "proofread")
-            .expect("nested workflow must have proofread step");
-        assert_eq!(proofread.loop_until.as_deref(), Some("LOOKS_CLEAR"));
-        assert_eq!(proofread.loop_back_to.as_deref(), Some("outline"));
-        // loop_no_release_on 保持为 None，避免将 proofreader 的建议误判为致命硬拒绝，
-        // 确保耗尽时可走 loop_exhausted_last_resort_review 经 Advisor 语义复核放行。
-        assert_eq!(proofread.loop_no_release_on.as_deref(), None);
-        assert_eq!(proofread.max_iterations, Some(3));
+        assert!(
+            inner.steps.iter().all(|s| s.id != "proofread" && s.loop_until.is_none()),
+            "章节写完就交给学员，不得再等 LOOKS_CLEAR"
+        );
 
-        // 主体框架先行；章节由引擎 fan_out 派发（不靠模型认领），且晚于 outline、早于 proofread。
+        // 主体框架先行；章节由引擎 fan_out 派发（不靠模型认领）。
         let writer = inner
             .steps
             .iter()
@@ -16920,24 +16912,6 @@ task = "补充疑问"
                 .unwrap()
         };
         assert!(wave_of("outline") < wave_of("write_chapter"));
-        assert!(wave_of("write_chapter") < wave_of("proofread"));
-        assert!(
-            ["read", "search", "code_graph", "doc_graph_context"]
-                .iter()
-                .all(|t| proofread.tools.iter().any(|x| x == t))
-                && proofread.read_path_allowlist.is_empty(),
-            "审稿员必须能读源码核对事实"
-        );
-        assert!(
-            proofread
-                .task_text()
-                .contains("行号偏差、措辞、格式**只算 NIT"),
-            "行号偏差不得成为 BLOCKER"
-        );
-        assert!(
-            proofread.task_text().contains("设计动机讲得浅"),
-            "设计动机讲得浅只算 NIT，不得把审稿环打满"
-        );
         let outline = inner
             .steps
             .iter()
@@ -16965,82 +16939,21 @@ task = "补充疑问"
         }
     }
 
-    /// doc_review_loop 决策逻辑回归测试：
-    /// 1. proofreader 发现 BLOCKER 并输出 NEEDS_FIX 时，触发 Rework(0) 跳回 doc_write；
-    /// 2. proofreader 仅含 NIT 体验建议并输出 LOOKS_CLEAR 时，直接 Advance 放行进入下游。
-    #[tokio::test]
-    async fn doc_review_loop_decision_blocker_reworks_and_nit_advances() {
+    /// 章节写完就回到外层。审稿员的 LOOKS_CLEAR / NEEDS_FIX 不再挡在学员前面。
+    #[test]
+    fn doc_review_loop_decision_does_not_wait_for_proofread() {
         let raw = include_str!("../../config/workflows/doc_review_loop.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("doc_review_loop must parse");
         wf.validate().expect("doc_review_loop must validate");
-        let proofread_step = wf.steps.iter().find(|s| s.id == "proofread").unwrap();
-
-        let mut iters = HashMap::new();
-        let vars = HashMap::new();
-        let server = wiremock::MockServer::start().await;
-        let config = test_config_at(&server.uri());
-        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
-        let (event_tx, _event_rx) = broadcast::channel(64);
-        let ctx = WorkflowRunContext {
-            merged: config,
-            resolver,
-            default_params: GenerateParams::default(),
-            cwd: PathBuf::from("."),
-            event_tx,
-            turn_cancel_flag: None,
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            agent_pause_gate: None,
-            depth: 0,
-            subsession_store: None,
-            session_id: None,
-            advisor_gate: None,
-            advisor_pause: None,
-            staging: None,
-            dispatch_budget: None,
-            root_wf_id: None,
-        };
-
-        // 1. proofread 发现 BLOCKER，末行输出 NEEDS_FIX → 触发返工 Rework(0)（跳回 doc_write）
-        let blocker_out =
-            "ISSUE: §0.1 | BLOCKER | 算术错误 | 2²+1·2⁴=16 不成立 | 改为 2³+1·2³=16\nNEEDS_FIX";
-        let nav = serial_loop_decision(
-            &wf,
-            proofread_step,
-            1,
-            blocker_out,
-            &mut iters,
-            &vars,
-            &None,
-            &ctx,
-            "测试主题",
-        )
-        .await
-        .expect("blocker 输出应正常触发返工判定");
-        match nav {
-            SerialLoopNav::Rework(target) => assert_eq!(target, 0, "应跳回 doc_write(下标0)"),
-            SerialLoopNav::Advance => panic!("BLOCKER 且 NEEDS_FIX 不得放行"),
-        }
-        assert_eq!(iters.get(&1), Some(&1), "迭代计数递增至 1");
-
-        // 2. proofread 复审仅含 NIT，末行输出 LOOKS_CLEAR → 放行 Advance 进入下游
-        let nit_out = "ISSUE: §1.2 | NIT | 理解建议 | 图表偏密 | 建议拆行\nLOOKS_CLEAR";
-        let nav = serial_loop_decision(
-            &wf,
-            proofread_step,
-            1,
-            nit_out,
-            &mut iters,
-            &vars,
-            &None,
-            &ctx,
-            "测试主题",
-        )
-        .await
-        .expect("nit + LOOKS_CLEAR 输出应正常放行");
-        match nav {
-            SerialLoopNav::Advance => {}
-            SerialLoopNav::Rework(_) => panic!("LOOKS_CLEAR 必须直接放行 Advance"),
-        }
+        assert!(
+            wf.steps
+                .iter()
+                .all(|s| s.loop_until.is_none() && s.id != "proofread"),
+            "不得用审稿循环把学员挡在阅读之前"
+        );
+        let last = wf.steps.last().expect("steps");
+        assert_eq!(last.id, "write_chapter");
+        assert_eq!(last.output_key.as_deref(), Some("chapters_out"));
     }
 
     #[test]
@@ -17477,30 +17390,16 @@ prompt_token_ratio = {ratio:.1}
         assert!(err.contains("prompt_token_ratio"), "{err}");
     }
 
-    /// 出厂配置必须走动态预算：`doc_review_loop` 的 proofread 步不能再有
-    /// 写死的绝对预算（那正是事故里被文档尺寸顶穿的那个数）。
+    /// 写文档的路径上不再有审稿步，也就没有会被长文档顶穿的写死预算。
     #[test]
     fn doc_review_loop_proofread_uses_dynamic_budget() {
         let wf: WorkflowDef =
             toml::from_str(include_str!("../../config/workflows/doc_review_loop.toml"))
                 .expect("doc_review_loop TOML must parse");
-        let proofread = wf
-            .steps
-            .iter()
-            .find(|s| s.id == "proofread")
-            .expect("proofread step");
-        assert_eq!(
-            proofread.prompt_token_ratio,
-            Some(0.8),
-            "proofread 必须按模型窗口动态算预算"
-        );
         assert!(
-            proofread.prompt_token_budget.is_none(),
-            "不应再写死绝对预算（写死的值会被文档尺寸顶穿）"
+            wf.steps.iter().all(|s| s.prompt_token_budget.is_none()),
+            "不得再写死绝对预算（写死的值会被文档尺寸顶穿）"
         );
-        assert!(
-            proofread.context_overflow_restart,
-            "仍要保留受控重启作为最后兜底"
-        );
+        assert!(wf.steps.iter().all(|s| s.id != "proofread"));
     }
 }

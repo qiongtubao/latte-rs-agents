@@ -178,15 +178,15 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 min_chars = 30
 require = ["code/"]
 
-# ═══ 2. 嵌套文档审查门（B套A 分段打磨与审稿）══════════════════════
-# doc_review_loop 内部执行：B套A 分段打磨写文档 → proofreader 审查
-# 只有 LOOKS_CLEAR 才返回外层。
+# ═══ 2. 嵌套写作（主体框架 + 章节并发写作）══════════════════════
+# doc_review_loop：outline → 各章并发 write。写完就返回，学员开始阅读。
+# 放行条件是学员答题，不是审稿员的 LOOKS_CLEAR。
 [[steps]]
 id = "doc_review"
-description = "运行 tutor/proofreader 嵌套循环，执行 B套A 分段写文档与打磨"
+description = "运行 outline→并发章节写作"
 workflow = "doc_review_loop"
 output_key = "doc_review_out"
-output_from = "review_out"
+output_from = "chapters_out"
 task = """学习文档审查契约：
 slug={{plan_out}}
 draft=.latte/learn/{{plan_out}}/draft.md
