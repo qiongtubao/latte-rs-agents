@@ -50,9 +50,9 @@ describe("任务看板状态机：状态 → 动作映射", () => {
     expect(sched?.label).toBe("修改时间");
   });
 
-  it("in_progress：查看对话 / 中止", () => {
+  it("in_progress：查看对话 / 重试 / 中止", () => {
     expect(keysOf({ state: "in_progress", scheduled_at: null }))
-      .toEqual(["open_session", "abort", "delete"]);
+      .toEqual(["open_session", "resume", "abort", "delete"]);
   });
 
   it("human_review：查看对话 / 通过 / 打回", () => {

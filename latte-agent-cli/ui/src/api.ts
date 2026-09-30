@@ -1716,6 +1716,16 @@ export async function abortTask(id: string): Promise<TaskView> {
   );
 }
 
+/** POST /api/tasks/:id/resume：重试执行——断点续跑绑定的 session。
+ *  任务状态不变（仍 in_progress），run 不收尾；workflow 从 checkpoint
+ *  跳过已完成 step。session 已被删 → 400 提示改走中止。 */
+export async function resumeTask(id: string): Promise<TaskView> {
+  return getTransport().request(
+    "POST",
+    `/api/tasks/${encodeURIComponent(id)}/resume`,
+  );
+}
+
 /** DELETE /api/tasks/:id → 204。 */
 export async function deleteTask(id: string): Promise<void> {
   await getTransport().request(

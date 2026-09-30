@@ -9,7 +9,7 @@
 // 每个状态声明自己的「下一步动作」（STATE_ACTIONS），卡片上只放主
 // 动作，其余进右侧详情抽屉。
 import {
-  listTasks, createTask, updateTask, dispatchTask, abortTask, deleteTask,
+  listTasks, createTask, updateTask, dispatchTask, abortTask, resumeTask, deleteTask,
   dispatchReady, listWorkflows, listTaskTypes, createTaskType, putTaskType, deleteTaskType, refineTask, setRefineParent,
   getTaskWorktreeDiff,
 } from "./api";
@@ -96,6 +96,7 @@ export const STATE_ACTIONS: Record<string, TaskAction[]> = {
   ],
   in_progress: [
     { key: "open_session", label: "💬 查看对话", kind: "primary" },
+    { key: "resume", label: "↺ 重试", kind: "primary" },
     { key: "abort", label: "中止执行", kind: "danger" },
     { key: "delete", label: "删除任务", kind: "danger" },
   ],
@@ -174,6 +175,8 @@ export function actionRequest(
       return updateTask(taskId, { scheduled_at: null });
     case "abort":
       return abortTask(taskId);
+    case "resume":
+      return resumeTask(taskId);
     case "approve":
       return updateTask(taskId, { state: "merging" });
     case "reject":
@@ -200,6 +203,7 @@ export function actionToast(key: string, taskId: string): string {
     case "run_rework": return `${taskId} 已进入返工流程，新 session 已创建`;
     case "unschedule": return `${taskId} 已取消排期`;
     case "abort": return `${taskId} 已中止，回到 Todo`;
+    case "resume": return `${taskId} 已请求断点续跑`;
     case "approve": return `${taskId} 评审通过，进入 Merging`;
     case "reject": return `${taskId} 已打回重做`;
     case "mark_done": return `${taskId} 已完成 🎉`;
