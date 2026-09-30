@@ -180,6 +180,26 @@ impl UiBackend {
         &self.cwd
     }
 
+    /// workflow run 的配置快照：`merged` 与 advisor 闸门在**同一次读锁**里取齐。
+    /// 此前一个结构体字面量里连着三次 `merged.read()`；parking_lot 的写者一旦
+    /// 排队，后到的读者会被挡住，同线程嵌套读锁遇上并发写就死锁（且是整个
+    /// 服务静默卡住）。
+    pub(crate) fn workflow_cfg_snapshot(
+        &self,
+    ) -> (
+        Arc<AgentConfig>,
+        Option<latte_agent_core::advisor_monitor::GateConfig>,
+    ) {
+        let cfg = self.merged.read();
+        let gate = latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
+            enabled: cfg.advisor.enabled(),
+            review_settings: cfg.advisor.review_settings(),
+            ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
+        }
+        .runner_gate();
+        (Arc::new(cfg.clone()), gate)
+    }
+
     /// 构造容器：先扫描 `<cwd>/.latte/ui-sessions/` 恢复落盘 session
     /// （元数据 + event_log 载入，**不** spawn controller——首个
     /// chat_send/subscribe 懒 spawn）；不新建任何 session，新建走

@@ -1649,11 +1649,13 @@ pub async fn chat_abort(b: &UiBackend, session_id: Option<&str>) -> Result<(), A
     }
     // 连带取消任务看板派发的 workflow：它只在 `tasks.workflow_cancels`
     // （按 task_id 索引），chat 侧中止本来不触达——补一条反查翻转。
-    if let Some(task_id) = b
+    // 读锁必须先释放再拿写锁：`if let … = b.tasks.read()…` 的读锁临时值活到
+    // if-let 体结束，体内再 write() = 同线程自死锁，整个看板 API 随之挂死。
+    let owner = b
         .tasks
         .read()
-        .task_owning_active_session(h.session_id.as_str())
-    {
+        .task_owning_active_session(h.session_id.as_str());
+    if let Some(task_id) = owner {
         b.tasks.write().flip_workflow_cancel(&task_id);
     }
     Ok(())
@@ -2338,8 +2340,10 @@ async fn spawn_workflow_resume(
         Err(e) => return Err(e),
     };
 
+    // 配置与 advisor 闸门在**同一次读锁**里取齐（见 workflow_cfg_snapshot）。
+    let (merged_cfg, advisor_gate) = b.workflow_cfg_snapshot();
     let ctx = WorkflowRunContext {
-        merged: Arc::new(b.merged.read().clone()),
+        merged: merged_cfg,
         resolver: b.resolver.clone(),
         default_params: GenerateParams::default(),
         cwd: b.cwd.clone(),
@@ -2360,12 +2364,7 @@ async fn spawn_workflow_resume(
         // delegate / workflow 工具一致。
         subsession_store: Some(b.subsession_store.clone()),
         session_id: Some(session_id.to_string()),
-        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
-            enabled: b.merged.read().advisor.enabled(),
-            review_settings: b.merged.read().advisor.review_settings(),
-            ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-        }
-        .runner_gate(),
+        advisor_gate,
         advisor_pause: Some(controller.advisor_pause_gate()),
         staging: None,
         // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
@@ -5146,7 +5145,8 @@ mod workflow_resume_tests {
         let dir = tempfile::tempdir().unwrap();
         let b = make_backend(dir.path());
         let task_id = "LAT-100";
-        let sid = "ui-board-1";
+        let sid_owned = add_session(&b, "ui-board-1").await;
+        let sid = sid_owned.as_str();
         // 模拟 dispatch_task 后的状态：in_progress + workflow_cancels 登记 +
         // runs 末尾一条指向该 session 且未结束。
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -5182,10 +5182,25 @@ mod workflow_resume_tests {
         b.tasks.write().insert_task_for_test(t);
         b.tasks.write().register_workflow_cancel(task_id, flag.clone());
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
-        // 反查 + 翻转（chat_abort 内部用的两段逻辑）。
-        let owner = b.tasks.read().task_owning_active_session(sid);
-        assert_eq!(owner.as_deref(), Some(task_id));
-        b.tasks.write().flip_workflow_cancel(task_id);
+        // 必须走真正的 `chat_abort`：它曾在 `if let … = tasks.read()…` 的体内
+        // 再拿 `tasks.write()`（读守卫活到 if-let 结束）→ 同线程自死锁，整个
+        // 看板 API 卡死。
+        // 死锁会堵死当前线程，`tokio::time::timeout` 在单线程测试运行时里
+        // 永远轮询不到——所以放到独立线程 + 独立运行时，由本线程限时等结果，
+        // 回归表现为失败而不是测试挂死。
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b2 = b.clone();
+        let sid2 = sid.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = tx.send(rt.block_on(chat_abort(&b2, Some(&sid2))));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("chat_abort 不得死锁")
+            .expect("abort");
         assert!(
             flag.load(std::sync::atomic::Ordering::Relaxed),
             "flip_workflow_cancel 必须置位旗标"

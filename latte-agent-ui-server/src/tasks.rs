@@ -1844,8 +1844,10 @@ fn spawn_lifecycle_hook(
         let advisor_pause = api::session_advisor_pause_gate(&b, &session_id).await.ok();
         // per-turn 取消旗标：生命周期钩子的 workflow 也留终止逃生口。
         let turn_cancel = api::session_turn_cancel_flag(&b, &session_id).await.ok();
+        // 配置与 advisor 闸门在**同一次读锁**里取齐（见 workflow_cfg_snapshot）。
+        let (merged_cfg, advisor_gate) = b.workflow_cfg_snapshot();
         let ctx = WorkflowRunContext {
-            merged: Arc::new(b.merged.read().clone()),
+            merged: merged_cfg,
             resolver: b.resolver.clone(),
             default_params: GenerateParams::default(),
             cwd: run_cwd,
@@ -1860,12 +1862,7 @@ fn spawn_lifecycle_hook(
             // advisor gate，与 manager 的 delegate 一致。
             subsession_store: Some(b.subsession_store.clone()),
             session_id: Some(session_id.clone()),
-            advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
-                enabled: b.merged.read().advisor.enabled(),
-                review_settings: b.merged.read().advisor.review_settings(),
-                ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-            }
-            .runner_gate(),
+            advisor_gate,
             advisor_pause,
             staging: None,
             // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
@@ -2521,8 +2518,10 @@ pub async fn dispatch_task(
             // per-turn 取消旗标：step 无硬超时，用户点「终止当前任务」
             // 靠它掐掉卡住的 step（否则只能 session 级全杀）。
             let turn_cancel = api::session_turn_cancel_flag(&b2, &session_id).await.ok();
+            // 配置与 advisor 闸门在**同一次读锁**里取齐（见 workflow_cfg_snapshot）。
+            let (merged_cfg, advisor_gate) = b2.workflow_cfg_snapshot();
             let ctx = WorkflowRunContext {
-                merged: Arc::new(b2.merged.read().clone()),
+                merged: merged_cfg,
                 resolver: b2.resolver.clone(),
                 default_params: GenerateParams::default(),
                 cwd: run_cwd.clone(),
@@ -2537,12 +2536,7 @@ pub async fn dispatch_task(
                 // advisor gate，与 manager 的 delegate 一致。
                 subsession_store: Some(b2.subsession_store.clone()),
                 session_id: Some(session_id.clone()),
-                advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
-                    enabled: b2.merged.read().advisor.enabled(),
-                    review_settings: b2.merged.read().advisor.review_settings(),
-                    ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-                }
-                .runner_gate(),
+                advisor_gate,
                 advisor_pause: advisor_pause.clone(),
                 staging: None,
                 // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
@@ -2747,8 +2741,10 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
         let advisor_pause = api::session_advisor_pause_gate(&b2, &session_id).await.ok();
         // per-turn 取消旗标：任务细化也走多 step 流水线，留终止逃生口。
         let turn_cancel = api::session_turn_cancel_flag(&b2, &session_id).await.ok();
+        // 配置与 advisor 闸门在**同一次读锁**里取齐（见 workflow_cfg_snapshot）。
+        let (merged_cfg, advisor_gate) = b2.workflow_cfg_snapshot();
         let ctx = WorkflowRunContext {
-            merged: Arc::new(b2.merged.read().clone()),
+            merged: merged_cfg,
             resolver: b2.resolver.clone(),
             default_params: GenerateParams::default(),
             cwd: b2.cwd.clone(),
@@ -2761,12 +2757,7 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             agent_pause_gate: agent_pause_gate.clone(),
             subsession_store: Some(b2.subsession_store.clone()),
             session_id: Some(session_id.clone()),
-            advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
-                enabled: b2.merged.read().advisor.enabled(),
-                review_settings: b2.merged.read().advisor.review_settings(),
-                ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-            }
-            .runner_gate(),
+            advisor_gate,
             advisor_pause: advisor_pause.clone(),
             staging: None,
             // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
@@ -2956,8 +2947,10 @@ async fn chain_code_review(
     let advisor_pause = api::session_advisor_pause_gate(b, &session_id).await.ok();
     // per-turn 取消旗标：链式审查也可能卡在某个 step，给用户留逃生口。
     let turn_cancel = api::session_turn_cancel_flag(b, &session_id).await.ok();
+    // 配置与 advisor 闸门在**同一次读锁**里取齐（见 workflow_cfg_snapshot）。
+    let (merged_cfg, advisor_gate) = b.workflow_cfg_snapshot();
     let ctx = WorkflowRunContext {
-        merged: Arc::new(b.merged.read().clone()),
+        merged: merged_cfg,
         resolver: b.resolver.clone(),
         default_params: GenerateParams::default(),
         cwd: run_cwd,
@@ -2971,12 +2964,7 @@ async fn chain_code_review(
         // 与派发 run 同源：分派建 subsession、过 advisor gate。
         subsession_store: Some(b.subsession_store.clone()),
         session_id: Some(session_id),
-        advisor_gate: latte_agent_core::advisor_monitor::AdvisorMonitorConfig {
-            enabled: b.merged.read().advisor.enabled(),
-            review_settings: b.merged.read().advisor.review_settings(),
-            ..latte_agent_core::advisor_monitor::AdvisorMonitorConfig::default()
-        }
-        .runner_gate(),
+        advisor_gate,
         advisor_pause,
         staging: None,
         // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
