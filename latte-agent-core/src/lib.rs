@@ -70,6 +70,7 @@ pub mod scheduler;
 pub mod session;
 pub mod session_store;
 pub mod staging;
+pub mod step_journal;
 pub mod sub_cancel;
 pub mod subsession;
 mod subsession_disk;

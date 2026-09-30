@@ -996,6 +996,12 @@ pub struct AgentRunner {
     /// 运行中的 session 不用重启即可生效。None = 不热更新（测试/
     /// 嵌入方自建 runner 的默认）。
     model_source: Option<RunnerModelSource>,
+    /// step 进行中上下文落盘配置（workflow step 的 runner 才装）。
+    /// 每个工具轮次边界把「已完成的 tool 往返」写盘，进程重启后续跑
+    /// 能据此接着中断处继续。见 [`crate::step_journal`]。
+    step_journal: Option<crate::step_journal::StepJournalCfg>,
+    /// 续跑带来的、尚未被下一次 `run_turn` 消费的 step 快照（工具往返部分）。
+    resume_step: Option<crate::step_journal::SavedStep>,
     // 强制 native function-calling：tool schema 经 GenerateParams.tools
     // 下发，模型返回结构化 `completion.tool_calls`。文本 `<tool_call>`
     // 协议已移除，不再有降级路径——provider 必须支持 OpenAI/Anthropic
@@ -2432,6 +2438,8 @@ impl AgentRunner {
             agent_pause_gate: None,
             stream_mode: None,
             model_source: None,
+            step_journal: None,
+            resume_step: None,
             deadline: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
@@ -2472,6 +2480,8 @@ impl AgentRunner {
             agent_pause_gate: None,
             stream_mode: None,
             model_source: None,
+            step_journal: None,
+            resume_step: None,
             deadline: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
@@ -2510,6 +2520,8 @@ impl AgentRunner {
             agent_pause_gate: None,
             stream_mode: None,
             model_source: None,
+            step_journal: None,
+            resume_step: None,
             deadline: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
@@ -3114,6 +3126,21 @@ impl AgentRunner {
         self
     }
 
+    /// 挂上 step 进行中上下文落盘（workflow step 的 runner 专用）。
+    /// `cfg.prompt` 必须与本次分派的完整 prompt 一致：续跑侧按它校验
+    /// 快照身份，不一致的快照直接丢弃。
+    pub fn with_step_journal(mut self, cfg: crate::step_journal::StepJournalCfg) -> Self {
+        self.step_journal = Some(cfg);
+        self
+    }
+
+    /// 续跑回灌：把中断时保存的 step 对话（工具往返部分）标记为「下一个
+    /// `run_turn` 恢复」。调用方（workflow 引擎）必须先建好 runner、确认
+    /// prompt 一致再调用；`run_turn` 会把这段历史拼在 system + context 之后。
+    pub fn restore_step(&mut self, saved: crate::step_journal::SavedStep) {
+        self.resume_step = Some(saved);
+    }
+
     /// 配置代际变了就重新解析并替换 model chain。调用点：`run_turn`
     /// 入口、「模型不可用暂停 → 用户 ▶ 恢复」的重试前——后者正是
     /// 「模型挂了 → 用户在 UI 改配置 → 点继续」的救命路径。解析失败
@@ -3550,12 +3577,21 @@ impl AgentRunner {
         for msg in new_messages {
             self.context.push(msg.clone());
         }
+        // 续跑恢复标记：快照内容不直接进 context——否则它会被算进
+        // `context_prefix_len`，之后每轮的 journal 落盘就只含本轮新增的
+        // 工具往返，恢复链上再断一次会丢掉中断前的部分。计数器与摘要
+        // 还原，契约校验（require_tools / D6 echo）仍能看到中断前调过的工具。
+        let restored_step = self.resume_step.take();
 
         // Pre-persistence gate: 每次 turn 开始清零 tool 计数器，
         // run_turn 内部每次成功执行一个工具就 +1；run_turn 结束时
         // run_turn_gated 据此跑 D6 ToolCallEcho 检查。
         self.last_turn_tool_count = 0;
         self.last_turn_tool_summaries.clear();
+        if let Some(saved) = &restored_step {
+            self.last_turn_tool_count = saved.tool_count;
+            self.last_turn_tool_summaries = saved.tool_summaries.clone();
+        }
         // TodoTracker 每 turn 重置：nudge / stop reminder 的额度都按
         // turn 计（见 crate::todo）。
         self.todo_tracker = crate::todo::TodoTracker::default();
@@ -3656,6 +3692,14 @@ impl AgentRunner {
         // outside this prefix and must remain paired when a later budget-triggered
         // compaction rebuilds the persistent part.
         let mut context_prefix_len = self.context.messages().len();
+
+        // 续跑恢复：把中断时落盘的工具往返拼到 system + context（此刻仅
+        // 一条用户 prompt）之后。放在压缩重建之后，确保 prefix 内的
+        // tool_call↔tool_result 配对完整（快照只在工具轮次边界保存，
+        // 天然成对，对 provider 合法）。
+        if let Some(saved) = restored_step {
+            messages.extend(saved.messages);
+        }
 
         // 工具轮次没有硬性上限（对齐 oh-my-pi deadline-only 模式）。
         // 循环终止靠：
@@ -4487,6 +4531,17 @@ impl AgentRunner {
                         read_only_streak
                     )));
                 }
+            }
+
+            // step 进行中上下文落盘：工具轮次边界（所有 tool_result 已回填）
+            // 是安全切点，快照里不会出现孤儿 tool_result。只保存 prompt 之后
+            // 的尾段（context 前缀由调用方重建），续跑时直接续接。
+            if let Some(j) = &self.step_journal {
+                j.save(
+                    &messages[1 + context_prefix_len..],
+                    self.last_turn_tool_count,
+                    &self.last_turn_tool_summaries,
+                );
             }
 
             round += 1;

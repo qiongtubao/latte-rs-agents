@@ -2530,6 +2530,9 @@ fn run_nested_workflow(
     // `None`（父级自己就是顶层）时用它做根身份；否则原样继承 ctx 里
     // 已有的根。调用方传自己的 wf_id 即可，不必判断自己是第几层。
     parent_wf_id: String,
+    // 发起 step 的 id：续跑时按 `父workflow名:step_id:嵌套workflow名`
+    // 找上次没跑完的那次嵌套 run 的 checkpoint，跳过它已完成的 step。
+    step_id: String,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -2544,7 +2547,7 @@ fn run_nested_workflow(
             ));
         }
         // 根身份：父级已经在嵌套链里就沿用它的根，否则父级自己是根。
-        let root_wf_id = ctx.root_wf_id.clone().unwrap_or(parent_wf_id);
+        let root_wf_id = ctx.root_wf_id.clone().unwrap_or_else(|| parent_wf_id.clone());
         let wf = load_workflow(&name, &ctx.cwd).map_err(|e| {
             let available = list_workflows(&ctx.cwd)
                 .iter()
@@ -2576,9 +2579,38 @@ fn run_nested_workflow(
             // root 为 None，用父自己的 wf_id 兜底）。
             root_wf_id: Some(root_wf_id.clone()),
         };
+        // ── 嵌套 run 的断点续跑 ─────────────────────────────────────
+        // 续跑根 run 时，走到同一个嵌套 step：先查 step_journal 的
+        // carry-nested 链接——上次跑到一半的嵌套 run 有自己的 checkpoint，
+        // 续跑它（resume_wf_id=旧 id）会跳过内部已完成 step。
+        // link key 用 workflow 名不用 wf_id（resume 每次换 id）。
+        let link = format!(
+            "{}:{step_id}:{name}",
+            crate::step_journal::workflow_name_of(&parent_wf_id)
+        );
+        let resume_nested = crate::step_journal::take_carried_nested(&ctx.cwd, &root_wf_id, &link)
+            .and_then(|old_id| {
+                match load_checkpoint(&ctx.cwd, &old_id) {
+                    Ok(state) if state.workflow_name == name => Some(old_id),
+                    _ => None,
+                }
+            });
+        if let Some(rid) = &resume_nested {
+            let _ = ctx.event_tx.send(ChatEvent::Status {
+                message: format!("嵌套 workflow '{name}' 从断点续跑（checkpoint {rid}）"),
+            });
+        }
+        let nested_wf_id_hint = resume_nested.clone();
         // 嵌套 run 不自设预算（墙钟机制已废弃）：防挂死由下层 idle
         // 超时统一兜住。
-        let (last, keyed) = run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
+        let (last, keyed) = run_workflow_inner(
+            &wf,
+            &topic,
+            &nested_ctx,
+            nested_wf_id_hint.as_deref(),
+            Some((root_wf_id, link)),
+        )
+        .await?;
         let available = || keyed.keys().cloned().collect::<Vec<_>>().join(", ");
         // export：把子 workflow 的若干中间产物按「父级变量名 ← 子
         // output_key」带出去（打通信息漏斗，见 `WorkflowStepDef::export`）。
@@ -2730,6 +2762,7 @@ pub fn remove_session_runs(cwd: &Path, session_id: &str) -> usize {
         }
         if let Some(wf_id) = path.file_stem().and_then(|s| s.to_str()) {
             let _ = std::fs::remove_dir_all(cwd.join(".latte").join("staging").join(wf_id));
+            crate::step_journal::remove_root(cwd, wf_id);
         }
         if std::fs::remove_file(&path).is_ok() {
             removed += 1;
@@ -3618,7 +3651,7 @@ pub async fn run_workflow(
     topic: &str,
     ctx: &WorkflowRunContext,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, None)
+    run_workflow_inner(wf, topic, ctx, None, None)
         .await
         .map(|(out, _)| out)
 }
@@ -3639,7 +3672,7 @@ pub async fn run_workflow_resume(
     ctx: &WorkflowRunContext,
     resume_wf_id: &str,
 ) -> Result<String, String> {
-    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id))
+    run_workflow_inner(wf, topic, ctx, Some(resume_wf_id), None)
         .await
         .map(|(out, _)| out)
 }
@@ -3651,6 +3684,9 @@ async fn run_workflow_inner(
     topic: &str,
     ctx: &WorkflowRunContext,
     resume_wf_id: Option<&str>,
+    // 嵌套 run 才有：(根 wf_id, link key)。起跑后在根的 inflight 目录
+    // 登记自己的 wf_id（顶层续跑据此续上），成功收尾时摘除。
+    nested_link: Option<(String, String)>,
 ) -> Result<(String, std::collections::HashMap<String, String>), String> {
     wf.validate()?;
     let uses_dag = wf.uses_dependency_dag();
@@ -3675,7 +3711,6 @@ async fn run_workflow_inner(
         }
         resume = Some(state);
     }
-
     let name = wf.name.clone();
     let wf_id = format!(
         "wf-{}-{}",
@@ -3685,6 +3720,20 @@ async fn run_workflow_inner(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
+    // 续跑顶层 run：把旧根名下的 live-* 快照改名 carry-* 搬到新根（本 wf_id）
+    // 名下，供各 step 的 runner 在起跑时消费。嵌套 run 的 root_wf_id 已经在
+    // ctx 里（指向外层），不在这里重复 adopt。
+    if let (Some(rid), None) = (resume_wf_id, ctx.root_wf_id.as_deref()) {
+        crate::step_journal::adopt(&ctx.cwd, rid, &wf_id);
+    }
+
+    // 嵌套 run 起跑即登记自己的 wf_id 到**根** run 的 inflight 目录：
+    // 顶层续跑走到同一个嵌套 step 时靠这个链接续上，而不是从零重跑
+    // 嵌套里已完成的 step。成功收尾才摘除；失败留着（它正是要续的）。
+    let nested_link = nested_link.map(|(root, link)| {
+        crate::step_journal::save_nested_link(&ctx.cwd, &root, &link, &wf_id);
+        (root, link)
+    });
     // 文档暂存：workflow 声明 staging=true 且上游还没有暂存区时，本
     // run 是创建者/所有者——嵌套 run 继承同一个（见 nested_ctx），
     // 只由所有者在收尾时 promote。用增强副本替换 ctx 引用，下游
@@ -3868,10 +3917,17 @@ async fn run_workflow_inner(
             }
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
                 name,
-                wf_id,
+                wf_id: wf_id.clone(),
                 status: "ok".into(),
                 summary: last_output.clone(),
             });
+            if let Some((root, link)) = &nested_link {
+                crate::step_journal::clear_nested_link(&ctx.cwd, root, link);
+            }
+            // 顶层 run 成功收尾：清掉自己的 inflight 目录。
+            if ctx.root_wf_id.is_none() {
+                crate::step_journal::remove_root(&ctx.cwd, &wf_id);
+            }
             Ok((last_output, keyed_outputs))
         }
         WfOutcome::Cancelled => {
@@ -4912,6 +4968,22 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         .as_ref()
         .map(|e| e.return_max_redo())
         .unwrap_or(crate::advisor_monitor::DEFAULT_RETURN_MAX_REDO);
+    // step 进行中上下文落盘（见 crate::step_journal）：runner 在每个
+    // 工具轮次边界把对话尾段写进 `<根 run>.inflight/live-step.<key>.json`；
+    // 进程重启后 ▸ 续跑时，被中断的 step 从 `carry-step.<key>` 回灌这段
+    // 历史接着走，而不是从零重跑。key = `workflow名:step_id:speaker`，
+    // 与具体 wf_id 无关——resume 每次换 id，靠 adopt 把旧根的 carry 搬过来。
+    let journal_root = inp.answer_log.resume_wf_id().to_string();
+    let journal_key = format!(
+        "{}:{}:{}",
+        crate::step_journal::workflow_name_of(&inp.wf_id),
+        inp.step_id,
+        speaker
+    );
+    // 续跑回灌只在「本次分派的首个 runner」生效一次：读取即消费，且
+    // prompt 必须逐字节一致——上游产出/返工反馈变了就作废从头跑。
+    let mut carried_step =
+        crate::step_journal::take_carried_step(&inp.cwd, &journal_root, &journal_key, &inp.prompt);
     let mut prompt_for_turn = inp.prompt.clone();
     let mut redo: u8 = 0;
     // 续作句柄：advisor 打回判 remedy=patch 时**复用同一 runner** 追加
@@ -5001,6 +5073,23 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                 r
             }
         };
+        let mut runner = runner;
+        runner = runner.with_step_journal(crate::step_journal::StepJournalCfg {
+            cwd: inp.cwd.clone(),
+            root: journal_root.clone(),
+            key: journal_key.clone(),
+            prompt: prompt_for_turn.clone(),
+        });
+        if let Some(saved) = carried_step.take() {
+            let n = saved.messages.len();
+            runner.restore_step(saved);
+            let _ = inp.event_tx.send(ChatEvent::Status {
+                message: format!(
+                    "⟲ step '{}' speaker '{}' 从上次中断处继续（恢复 {n} 条工具往返消息）",
+                    inp.step_id, speaker
+                ),
+            });
+        }
         let _ = inp.event_tx.send(ChatEvent::RoleStarted {
             role_id: speaker.clone(),
             detail: format!("workflow step '{}'", inp.step_id),
@@ -5374,6 +5463,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         }
     };
 
+    // step 到终态就摘掉快照——成功产出已经由 checkpoint 的 Step 记录接管，
+    // 失败是确定性结局、后续重试要全新 subagent。只有「进程被杀/被取消
+    // drop」这种没走到这里的场景才留得住快照，那正是续跑要恢复的。
+    crate::step_journal::clear_step(&inp.cwd, &journal_root, &journal_key);
     // 5. 收尾事件（RoleTurn 由引擎的 WorkflowTurn 承担，不重复发）。
     match &result {
         Ok(out) => {
@@ -5676,6 +5769,7 @@ async fn run_workflow_serial(
                     step.output_from.clone(),
                     step.export.clone(),
                     wf_id.to_string(),
+                    step.id.clone(),
                 )
                 .await
                 {
@@ -6320,6 +6414,7 @@ async fn run_dag_step(
             step.output_from.clone(),
             step.export.clone(),
             inp.wf_id.clone(),
+            step.id.clone(),
         )
         .await
         .map_err(|e| {
@@ -12554,6 +12649,90 @@ output_key = "out_b"
             .flatten()
             .collect();
         assert_eq!(files.len(), 2, "resume 运行有自己的 checkpoint 文件");
+    }
+
+    /// 回归（jemalloc 会话）：被中断 step 的进行中对话（tool 往返）必须
+    /// 在续跑时回灌给新 runner，而不是从零重读 prompt、重做全部工具调用。
+    #[tokio::test]
+    async fn resume_restores_step_inflight_messages_from_journal() {
+        use latte_ai::models::Message;
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("完成总结")))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let wf = one_step_wf("worker", "审查代码");
+        let old_wf_id = "wf-test_one_step-1000";
+
+        // 造一个中断的 checkpoint（只有 meta，无 step 记录）。
+        let ckpt_dir = cwd.join(".latte").join("workflow-runs");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let meta = serde_json::json!({
+            "type": "meta",
+            "wf_id": old_wf_id,
+            "workflow_name": "test_one_step",
+            "topic": "代码审查",
+            "started_at": 1,
+        });
+        std::fs::write(ckpt_dir.join(format!("{old_wf_id}.jsonl")), format!("{meta}\n")).unwrap();
+
+        // 模拟中断前已落盘的工具往返快照：
+        // 1 个已完成的 tool_call + tool_result（例如 read 了一份文件）。
+        let rendered_prompt = "审查代码";
+        let key = format!("test_one_step:step_1:worker");
+        crate::step_journal::save_step(
+            cwd,
+            old_wf_id,
+            &key,
+            &crate::step_journal::SavedStep {
+                prompt: rendered_prompt.to_string(),
+                messages: vec![
+                    Message::assistant_with_tool_calls(
+                        "我先读一下代码".to_string(),
+                        vec![latte_ai::models::ToolCall {
+                            id: "call-1".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({ "path": "a.c" }),
+                            arguments_raw: Some("{\"path\":\"a.c\"}".to_string()),
+                            arguments_parse_error: None,
+                        }],
+                    ),
+                    Message::tool_result("call-1".to_string(), "int main() { return 0; }".to_string()),
+                ],
+                tool_count: 1,
+                tool_summaries: vec!["read {\"path\":\"a.c\"} -> ok".into()],
+            },
+        );
+
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), cwd.to_path_buf());
+        let out = run_workflow_resume(&wf, "代码审查", &ctx, old_wf_id)
+            .await
+            .expect("resume 应成功");
+        assert_eq!(out, "完成总结");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "只发了一次模型请求收尾");
+        let body = String::from_utf8_lossy(&reqs[0].body);
+        // 回灌的消息必须真实进到了发给模型的请求体里！
+        assert!(body.contains("call-1"), "必须包含中断前的 tool_call_id: {body}");
+        assert!(body.contains("int main()"), "必须包含中断前的工具结果: {body}");
+    }
+
+    fn one_step_wf(role: &str, task: &str) -> WorkflowDef {
+        let raw = format!(
+            r#"
+name = "test_one_step"
+[[steps]]
+id = "step_1"
+role = "{role}"
+task = "{task}"
+"#
+        );
+        toml::from_str(&raw).unwrap()
     }
 
     /// 契约最终失败时，错误消息必须附「不合格产出摘要」——gate 判
