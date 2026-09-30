@@ -3176,6 +3176,28 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
     Ok(false)
 }
 
+/// learn_loop 返工（quiz 答错 / supplement 有补充）跳回 doc_review 时，
+/// 文档即将演进一版：`ledger.round` +1 并写盘。
+///
+/// 必须由引擎做、不能交给模型 prompt：`read_confirm` / `supplement` 的题面靠
+/// `round` 保持文本唯一，否则 [`AnswerLog::recall`] 会静默回放上一轮答案、
+/// 不弹窗，学员没读新版就进入 quiz。账本缺失/损坏时静默跳过（首次运行前
+/// plan 步已保证其存在，这里不是失败理由）。
+fn bump_learn_round(cwd: &Path, slug: &str) {
+    let path = cwd.join(".latte").join("learn").join(slug).join("ledger.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut ledger) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let round = ledger["round"].as_u64().unwrap_or(0) + 1;
+    ledger["round"] = serde_json::Value::from(round);
+    if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
 async fn run_learn_control_step(
     step: &WorkflowStepDef,
     slug: &str,
@@ -5504,6 +5526,12 @@ async fn run_workflow_serial(
                         {
                             Ok(SerialLoopNav::Advance) => idx += 1,
                             Ok(SerialLoopNav::Rework(target)) => {
+                                if wf.name == "learn_loop" {
+                                    bump_learn_round(
+                                        &ctx.cwd,
+                                        vars.get("plan_out").map_or("", String::as_str),
+                                    );
+                                }
                                 pending_feedback = Some(last_output.clone());
                                 idx = target;
                             }
@@ -6065,6 +6093,12 @@ async fn run_workflow_serial(
             {
                 Ok(SerialLoopNav::Advance) => {}
                 Ok(SerialLoopNav::Rework(target_idx)) => {
+                    if wf.name == "learn_loop" {
+                        bump_learn_round(
+                            &ctx.cwd,
+                            vars.get("plan_out").map_or("", String::as_str),
+                        );
+                    }
                     pending_feedback = Some(last_output.clone());
                     idx = target_idx;
                     continue;
@@ -15669,6 +15703,27 @@ mod deterministic_learning_tests {
         let out = format_quiz_feedback(&grade);
         let k2_seg = out.split("知识点 k2").nth(1).unwrap();
         assert!(!k2_seg.contains("前置未掌握"), "{k2_seg}");
+    }
+
+    #[test]
+    fn bump_learn_round_increments_persisted_round() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join(".latte/learn/demo");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("ledger.json"),
+            r#"{"slug":"demo","round":0,"knowledge_points":[{"id":"k1","wrong":1,"passed":false}]}"#,
+        )
+        .unwrap();
+        super::bump_learn_round(dir.path(), "demo");
+        super::bump_learn_round(dir.path(), "demo");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).unwrap())
+                .unwrap();
+        assert_eq!(v["round"], 2);
+        assert_eq!(v["knowledge_points"][0]["wrong"], 1, "其余字段不动");
+        // 账本缺失不 panic
+        super::bump_learn_round(dir.path(), "nope");
     }
 
     #[test]
