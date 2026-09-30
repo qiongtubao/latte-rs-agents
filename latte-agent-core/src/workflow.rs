@@ -3156,7 +3156,7 @@ fn read_learn_json(path: &std::path::Path) -> Result<serde_json::Value, String> 
 }
 
 /// 知识点能否出卷：至少两个选项，且 answer 非空。
-/// 学员补充刚登记、总编还没补题时为 false，本轮不弹空卷。
+/// 学员补充由引擎写成固定两选一，登记后即可出卷。
 fn point_is_gradeable(point: &serde_json::Value) -> bool {
     let answer = point["answer"].as_str().unwrap_or("").trim();
     let options = point["options"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -3527,6 +3527,70 @@ fn insert_before_quiz_verdict(text: &str, extra: &str) -> String {
     }
 }
 
+/// 学员补充题的固定两选一。题面是学员原话，判分不交给模型出选项。
+const SUPPLEMENT_YES: &str = "这一节回答了我的问题";
+const SUPPLEMENT_NO: &str = "还是不懂";
+
+fn supplement_option_values() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "label": SUPPLEMENT_YES,
+            "description": "这一节已经把我补充的问题讲清楚了"
+        },
+        {
+            "label": SUPPLEMENT_NO,
+            "description": "还是没懂，需要把这一节再讲一遍"
+        }
+    ])
+}
+
+/// 引擎登记的补充点。模型若删掉 `supplement` 标记，`sup1` 这种 id 仍算。
+fn is_engine_supplement_point(point: &serde_json::Value) -> bool {
+    if point
+        .get("supplement")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(id) = point.get("id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(rest) = id.strip_prefix("sup") else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 把补充题的选项和答案写回引擎的两选一。普通知识点不动。
+fn seal_supplement_questions(plan: &mut serde_json::Value) -> bool {
+    let Some(points) = plan
+        .get_mut("knowledge_points")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for point in points.iter_mut() {
+        if !is_engine_supplement_point(point) {
+            continue;
+        }
+        let options = supplement_option_values();
+        let answer = serde_json::Value::String(SUPPLEMENT_YES.to_string());
+        let marked = serde_json::Value::Bool(true);
+        if point.get("options") != Some(&options)
+            || point.get("answer") != Some(&answer)
+            || point.get("supplement") != Some(&marked)
+        {
+            point["options"] = options;
+            point["answer"] = answer;
+            point["supplement"] = marked;
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// 「没有了」以及空的自定义输入算结束；`其他：…` 才是补充请求。
 fn supplement_request(answer: &str) -> Option<String> {
     let text = answer.trim();
@@ -3595,7 +3659,14 @@ async fn run_learn_control_step(
     if step.id != "quiz" {
         return Ok(None);
     }
-    let plan: serde_json::Value = read_learn_json(&base.join("plan.json"))?;
+    let mut plan: serde_json::Value = read_learn_json(&base.join("plan.json"))?;
+    if seal_supplement_questions(&mut plan) {
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_vec_pretty(&plan).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let pending = plan["knowledge_points"]
         .as_array()
         .into_iter()
@@ -3702,6 +3773,19 @@ async fn run_learn_control_step(
         .iter()
         .filter(|item| !item.correct)
         .map(|item| {
+            let point = plan["knowledge_points"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|p| p["id"].as_str() == Some(item.id.as_str()));
+            if let Some(point) = point.filter(|p| is_engine_supplement_point(p)) {
+                let asked = point["question"].as_str().unwrap_or(item.title.as_str());
+                return quiz_issue_block(
+                    &item.id,
+                    &format!("学员选择「{}」。原问题：{asked}", item.given),
+                    &format!("只修改本章 sections/{}.md，按学员原话把这一节讲清楚", item.id),
+                );
+            }
             quiz_issue_block(
                 &item.id,
                 &format!(
@@ -3778,7 +3862,7 @@ async fn run_learn_supplement(
             &id,
             &format!("学员补充：{asked}"),
             &format!(
-                "在 plan.json 为 {id} 补上 4 个 options 和 answer（question 已是学员原话），并只写 sections/{id}.md"
+                "只写 sections/{id}.md，按学员原话讲解。这一题的选项和答案由引擎维护，不要改 plan.json 里的 options 和 answer"
             ),
         );
         write_engine_feedback(base, &[block.clone()])?;
@@ -3831,8 +3915,8 @@ fn append_supplement_point(
             "example": "",
             "doc_section": format!("## 补充：{title}"),
             "question": asked,
-            "options": [],
-            "answer": "",
+            "options": supplement_option_values(),
+            "answer": SUPPLEMENT_YES,
             "supplement": true
         }));
     ledger["knowledge_points"]
@@ -16679,6 +16763,90 @@ task = "补充疑问"
             super::supplement_request("其他：生命周期怎么标注"),
             Some("生命周期怎么标注".into())
         );
+    }
+
+    #[test]
+    fn learn_loop_supplement_is_engine_two_choice() {
+        let mut plan = serde_json::json!({
+            "knowledge_points": [
+                {
+                    "id": "k1",
+                    "title": "所有权",
+                    "question": "传 a 之后还能用吗？",
+                    "options": [{"label": "能"}, {"label": "不能"}],
+                    "answer": "不能"
+                }
+            ]
+        });
+        let mut ledger = serde_json::json!({
+            "round": 1,
+            "knowledge_points": [
+                {"id": "k1", "title": "所有权", "wrong": 0, "passed": true}
+            ],
+            "supplements": []
+        });
+        let id = super::append_supplement_point(
+            &mut plan,
+            &mut ledger,
+            "生命周期怎么标注",
+            1,
+        )
+        .unwrap();
+        assert_eq!(id, "sup1");
+        let point = plan["knowledge_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "sup1")
+            .unwrap();
+        assert!(super::point_is_gradeable(point));
+        assert_eq!(point["answer"], "这一节回答了我的问题");
+        assert_eq!(point["options"][0]["label"], "这一节回答了我的问题");
+        assert_eq!(point["options"][1]["label"], "还是不懂");
+        assert_eq!(point["question"], "生命周期怎么标注");
+
+        point_mut(&mut plan)["options"] = serde_json::json!([
+            {"label": "A"}, {"label": "B"}, {"label": "C"}, {"label": "D"}
+        ]);
+        point_mut(&mut plan)["answer"] = serde_json::json!("A");
+        point_mut(&mut plan)["supplement"] = serde_json::json!(false);
+        assert!(super::seal_supplement_questions(&mut plan));
+        let point = plan["knowledge_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "sup1")
+            .unwrap();
+        assert_eq!(point["answer"], "这一节回答了我的问题");
+        assert_eq!(point["options"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            plan["knowledge_points"][0]["answer"], "不能",
+            "普通知识点的题目不被两选一覆盖"
+        );
+
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("sup1".into(), "这一节回答了我的问题".into());
+        let grade = super::deterministic_grade_quiz(&plan, &mut ledger, &answers);
+        assert!(grade.items.iter().any(|item| item.id == "sup1" && item.correct));
+        assert_eq!(ledger["knowledge_points"][1]["passed"], true);
+
+        ledger["knowledge_points"][1]["passed"] = serde_json::json!(false);
+        ledger["_graded_answers"] = serde_json::json!({});
+        answers.insert("sup1".into(), "还是不懂".into());
+        let grade = super::deterministic_grade_quiz(&plan, &mut ledger, &answers);
+        let item = grade.items.iter().find(|item| item.id == "sup1").unwrap();
+        assert!(!item.correct);
+        assert_eq!(ledger["knowledge_points"][1]["passed"], false);
+        assert_eq!(ledger["knowledge_points"][1]["wrong"], 1);
+
+        fn point_mut(plan: &mut serde_json::Value) -> &mut serde_json::Value {
+            plan["knowledge_points"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p["id"] == "sup1")
+                .unwrap()
+        }
     }
 
     #[test]

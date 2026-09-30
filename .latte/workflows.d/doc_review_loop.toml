@@ -48,7 +48,7 @@ task = """你是学习文档的总编，负责**主体框架**与**返工分派*
 若 feedback.md 已含 `SOURCE: engine`（quiz 答错或学员补充由引擎写入）：
 - 保持 `MODE: PATCH`，保留已有 `## <章节id>` 分组，不要改成 `MODE: FULL`，不要删这些分组；
 - 只允许追加 `## overview`；
-- plan.json 里 `options` 为空或 `answer` 为空的知识点，必须补上 4 个选项和 answer（label 写内容，不要 A/B/C/D，不加 recommended，正确项位置打散），id 保持不变。章节 writer 只能写自己的 sections/<id>.md，题目由你写进 plan.json。
+- `supplement` 为 true、或 id 形如 `sup1` 的知识点，选项和 answer 由引擎维护（两选一），不要改它们，不要补成四选项。章节 writer 只写 sections/<id>.md。
 
 严格以源码为事实来源；无法取证的写「[推测]」。输出：一句话说明写了哪些文件与本轮模式。"""
 [steps.output_contract]
