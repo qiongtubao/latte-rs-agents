@@ -385,8 +385,10 @@ export function mountTaskBoard(opts: {
   container: TaskBoardContainer;
   /** 「查看对话」：切到执行该任务的 session（main.ts 的 activateSession）。 */
   onOpenSession: (sessionId: string) => void;
+  /** 派发/中止/删除会新建或影响 session：通知宿主刷新会话下拉。 */
+  onSessionsChanged?: () => void;
 }): TaskBoardController {
-  const { container, onOpenSession } = opts;
+  const { container, onOpenSession, onSessionsChanged } = opts;
   let tasks: TaskView[] = [];
   let isLoading = false;
   let loadedOnce = false;
@@ -919,6 +921,7 @@ export function mountTaskBoard(opts: {
     try {
       await req;
       toast(actionToast(key, task.id));
+      onSessionsChanged?.();
       if (key === "delete") closeDrawer();
     } catch (e) {
       toast(`操作失败: ${(e as Error).message}`);

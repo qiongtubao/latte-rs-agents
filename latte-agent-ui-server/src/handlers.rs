@@ -1450,6 +1450,7 @@ pub(crate) async fn delete_task(
     State(state): State<AppState>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     crate::tasks::delete_task(&state.backend, &id)
+        .await
         .map(|_| StatusCode::OK)
         .map_err(Into::into)
 }

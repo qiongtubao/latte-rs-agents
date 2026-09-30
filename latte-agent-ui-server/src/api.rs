@@ -391,6 +391,14 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
             if let Some(flag) = b.session_workflows.write().remove(id) {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            // 任务看板派发的 workflow 只登记在 tasks.workflow_cancels，
+            // 与 chat_abort 一样按 session 反查后翻旗标。
+            {
+                let owner = b.tasks.read().task_owning_active_session(id);
+                if let Some(task_id) = owner {
+                    b.tasks.write().flip_workflow_cancel(&task_id);
+                }
+            }
             // 落盘的孤儿 ask 记录同理：按 session 归属加载，session 都
             // 没了就不该再被补发成弹框。
             latte_agent_core::pending_ask::remove_for_session(&b.cwd, id);

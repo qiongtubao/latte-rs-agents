@@ -355,6 +355,10 @@ async function main(): Promise<void> {
       statusEl: $("task-board-status"),
       boardEl: $("tb-board"),
     },
+    onSessionsChanged: () => {
+      const cur = getCurrentSessionId();
+      if (cur) refreshSessionSelect(sessionSelect, cur).catch(() => undefined);
+    },
     onOpenSession: (sessionId) => {
       taskBoard.close();
       activateSession(sessionId).catch((e) => {

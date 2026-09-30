@@ -2433,8 +2433,16 @@ pub async fn dispatch_task(
         let view = store.view(store.get(id).expect("刚 persist 的任务必然存在"));
         return Ok(view);
     };
-    let wf = load_workflow(&wf_name, &b.cwd)
-        .map_err(|e| ApiError::bad_request(format!("workflow '{wf_name}' 加载失败：{e}")))?;
+    let wf = match load_workflow(&wf_name, &b.cwd) {
+        Ok(w) => w,
+        Err(e) => {
+            // 已建并落盘的 session 没人引用了：回收，免得下拉里堆孤儿。
+            let _ = api::delete_session(b, &info.session_id).await;
+            return Err(ApiError::bad_request(format!(
+                "workflow '{wf_name}' 加载失败：{e}"
+            )));
+        }
+    };
     let event_tx = api::session_event_sender(b, &info.session_id).await?;
     // workflow 绑定分支不走 chat_send/submit_input，这里把派发消息
     // 显式记为 session 的用户诉求，否则 advisor 审查拿到空问题。
@@ -2445,20 +2453,37 @@ pub async fn dispatch_task(
     // 可能已把同一任务派成 in_progress 并 push 了 run。不复查则双派发：
     // 双 session、双 token、隔离任务同一 worktree 覆盖。
     let now = now_ms();
-    let mut store = b.tasks.write();
-    {
-        let t = store
-            .get_mut(id)
-            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
-        if t.state != "todo" && t.state != "rework" {
-            return Err(ApiError {
-                status: 409,
-                message: format!(
-                    "state {:?} 不可派发（已并发被另一请求派发）",
-                    t.state
-                ),
-            });
+    let (bad_state, gone) = {
+        let store = b.tasks.read();
+        match store.get(id) {
+            Some(t) => ((t.state != "todo" && t.state != "rework").then(|| t.state.clone()), false),
+            None => (None, true),
         }
+    };
+    if gone {
+        let _ = api::delete_session(b, &info.session_id).await;
+        return Err(ApiError::not_found(format!("task {id:?} 不存在")));
+    }
+    if let Some(state) = bad_state {
+        let _ = api::delete_session(b, &info.session_id).await;
+        return Err(ApiError {
+            status: 409,
+            message: format!("state {state:?} 不可派发（已并发被另一请求派发）"),
+        });
+    }
+    // 上面读锁已释放；写锁内再确认一次（两把锁之间无 await，但保持原语义）。
+    let mut store = b.tasks.write();
+    if store
+        .get(id)
+        .is_none_or(|t| t.state != "todo" && t.state != "rework")
+    {
+        return Err(ApiError {
+            status: 409,
+            message: "state 不可派发（已并发被另一请求派发）".into(),
+        });
+    }
+    {
+        let t = store.get_mut(id).expect("刚校验过存在");
         t.set_state("in_progress", actor, None, now);
         t.scheduled_at = None;
         t.dispatch_pending = false;
@@ -2907,7 +2932,11 @@ async fn chain_code_review(
         let store = b.tasks.read();
         store
             .get(id)
-            .map(|t| t.state == "human_review")
+            .map(|t| {
+                t.state == "human_review"
+                    // 只审**本次** run：中止后重派时旧 run 不得对新 run 发起审查。
+                    && t.runs.last().is_some_and(|r| r.session_id == session_id)
+            })
             .unwrap_or(false)
     };
     if !in_review {
@@ -3365,6 +3394,9 @@ pub async fn abort_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
         let wf_cancel = b.tasks.write().take_workflow_cancel(id);
         if let Some(flag) = wf_cancel {
             flag.store(true, Ordering::SeqCst);
+            // 旗标只在 step 边界生效；正在跑的 LLM step 靠 per-turn 取消掐掉，
+            // 否则状态已回 todo、旧 step 仍在烧 token 并写同一棵工作树。
+            let _ = api::chat_cancel_turn(b, Some(session_id)).await;
         } else {
             let _ = api::chat_abort(b, Some(session_id)).await;
         }
@@ -3817,7 +3849,29 @@ pub fn report_task(
 /// 下轮 sync 检测到「本应在 Notion 删除」（由 sync 端实现）。
 /// 简化：当前只把 id 推 dirty，sync 端判断本地已无该任务则发 DELETE
 /// — 见 notion_sync 的 hook（v1 暂只做 upsert；DELETE 留待 v2）。
-pub fn delete_task(b: &UiBackend, id: &str) -> Result<(), ApiError> {
+pub async fn delete_task(b: &UiBackend, id: &str) -> Result<(), ApiError> {
+    // 先掐掉在跑的执行体：否则任务记录没了，workflow 仍在后台烧 token，
+    // 收尾时才报「task 不存在」。
+    let active_session = {
+        let store = b.tasks.read();
+        store
+            .get(id)
+            .filter(|t| t.state == "in_progress")
+            .and_then(|t| t.runs.last().filter(|r| r.ended_at.is_none()))
+            .map(|r| r.session_id.clone())
+    };
+    if let Some(sid) = active_session {
+        let flag = b.tasks.write().take_workflow_cancel(id);
+        match flag {
+            Some(f) => {
+                f.store(true, Ordering::SeqCst);
+                let _ = api::chat_cancel_turn(b, Some(&sid)).await;
+            }
+            None => {
+                let _ = api::chat_abort(b, Some(&sid)).await;
+            }
+        }
+    }
     let mut store = b.tasks.write();
     // 删除前把工作树信息取出来：任务记录一删就再也查不到它，工作树和分支
     // 会永久残留在 `$LATTE_HOME/worktrees/` 下。
