@@ -19,11 +19,15 @@ use std::sync::Arc;
 
 use latte_ai::models::Message;
 use latte_ai::params::GenerateParams;
+use latte_rs_agent_tools::error::ToolError;
+use latte_rs_agent_tools::types::{SharedToolHandler, Tool, ToolManager};
 use tokio::sync::broadcast;
 
 use crate::agent::{Agent, AgentRunner};
 use crate::config::AgentConfig;
-use crate::controller::{build_tool_manager, register_plan_tool, ChatEvent, ChoiceOption, ChoiceQuestion};
+use crate::controller::{
+    build_tool_manager, register_plan_tool, ChatEvent, ChoiceOption, ChoiceQuestion,
+};
 use crate::model_resolver::ModelResolver;
 
 /// Names that the runner injects into `vars` itself (`topic` from the
@@ -126,7 +130,11 @@ fn check_required_tools(required: &[String], summary: &str) -> Result<(), String
             "本步要求实际调用工具 [{}]，但本轮没有调用（实际调用了 [{}]）。\
              不要只在正文里描述结果——必须真的把工具调起来。",
             missing.join(", "),
-            if called.is_empty() { "无".to_string() } else { called.join(", ") },
+            if called.is_empty() {
+                "无".to_string()
+            } else {
+                called.join(", ")
+            },
         ))
     }
 }
@@ -175,7 +183,11 @@ fn check_required_tools_any(any_of: &[String], summary: &str) -> Result<(), Stri
             "本步要求至少调用 [{}] 之中的一个工具，但本轮一个都没调用\
              （实际调用了 [{}]）。产出必须建立在真实取证之上，不能凭记忆写。",
             wanted.join(" / "),
-            if called.is_empty() { "无".to_string() } else { called.join(", ") },
+            if called.is_empty() {
+                "无".to_string()
+            } else {
+                called.join(", ")
+            },
         ))
     }
 }
@@ -221,7 +233,6 @@ fn check_tool_usage(step: &WorkflowStepDef, summary: &str) -> Result<(), String>
     check_required_tools_any(&step.require_tools_any, summary)?;
     check_tool_call_limits(&step.tool_call_limits, summary)
 }
-
 
 /// 把一个 step 内多个 speaker 的产出聚合成该 step 的输出。
 ///
@@ -284,7 +295,10 @@ fn check_output_contract(contract: &OutputContract, output: &str) -> Result<(), 
         }
     }
     if !contract.require_any.is_empty()
-        && !contract.require_any.iter().any(|p| output.contains(p.as_str()))
+        && !contract
+            .require_any
+            .iter()
+            .any(|p| output.contains(p.as_str()))
     {
         return Err(format!(
             "产出必须包含 [{}] 之中的至少一个，但一个都没出现。",
@@ -348,7 +362,11 @@ fn fenced_code_blocks(text: &str) -> Vec<(std::ops::Range<usize>, String, String
             content_end = offset.min(text.len());
         }
         let end = closed_end.unwrap_or_else(|| text.len());
-        out.push((line_start..end, info, text[content_start..content_end].to_string()));
+        out.push((
+            line_start..end,
+            info,
+            text[content_start..content_end].to_string(),
+        ));
     }
     out
 }
@@ -474,11 +492,7 @@ fn check_patch_field(field: &str, value: &serde_json::Value) -> Result<(), Strin
 
 /// 把 patch 步产出（修订说明 + ops）机械应用到上游草案，返回打了补丁
 /// 的完整草案。ops 为空 = 无修订，草案原样返回。
-fn apply_task_patch(
-    draft: &str,
-    response: &str,
-    cwd: &std::path::Path,
-) -> Result<String, String> {
+fn apply_task_patch(draft: &str, response: &str, cwd: &std::path::Path) -> Result<String, String> {
     let (ops, ops_span) = parse_task_patch_ops(response)?;
     if ops.is_empty() {
         return Ok(draft.to_string());
@@ -531,7 +545,10 @@ fn apply_task_patch(
             .ok_or_else(|| format!("ops[{i}]：tasks[{idx}] 不是对象"))?;
         // no-op 守卫：新值与现值相同 = 白转一圈还以为自己改了
         // （hashline 把 byte-identical edit 判为错误是同一道理）。
-        let old = obj.get(&op.field).cloned().unwrap_or(serde_json::Value::Null);
+        let old = obj
+            .get(&op.field)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         if old == op.set {
             return Err(format!(
                 "ops[{i}]：字段 '{}' 的新值与现值相同（无实际修改）。若无需修改请从 ops 里移除该条。",
@@ -551,11 +568,9 @@ fn apply_task_patch(
     // 补丁后重跑 plan 机械校验：修补最容易引入新重叠（task_refine
     // 实录：revise 把 src/arena.c 补进已持有它的任务，凑成第 14 处
     // 重叠，整单被 plan 工具拒绝）。
-    let patched = crate::controller::parse_and_validate_plan_tasks(
-        &serde_json::Value::Array(tasks),
-        cwd,
-    )
-    .map_err(|e| format!("补丁后的清单未通过机械校验：{e}"))?;
+    let patched =
+        crate::controller::parse_and_validate_plan_tasks(&serde_json::Value::Array(tasks), cwd)
+            .map_err(|e| format!("补丁后的清单未通过机械校验：{e}"))?;
     let new_fence = format!(
         "```json\n{}\n```",
         serde_json::to_string_pretty(&serde_json::json!({ "tasks": patched }))
@@ -566,7 +581,11 @@ fn apply_task_patch(
     out.push_str(&new_fence);
     out.push_str(&draft[span.end..]);
     // 修订说明 = 模型产出里去掉 ops fence 的部分，附在草案末尾给人看。
-    let notes = format!("{}{}", &response[..ops_span.start], &response[ops_span.end..]);
+    let notes = format!(
+        "{}{}",
+        &response[..ops_span.start],
+        &response[ops_span.end..]
+    );
     let notes = notes.trim();
     if !notes.is_empty() {
         out.push_str("\n\n---\n\n### 本次修订\n\n");
@@ -648,7 +667,7 @@ async fn contract_last_resort_review(
         "", // 此处拿不到角色职责全文，审查以任务+产出为基准
         task,
         response.to_string(),
-        "", // contract_last_resort_review 无工具调用数据
+        "",   // contract_last_resort_review 无工具调用数据
         None, // 兜底审查不注入 step 执行约束（契约此时已判失败）
     )
     .await;
@@ -739,7 +758,7 @@ async fn loop_exhausted_last_resort_review(
         "", // 此处不注入角色职责全文，审查以「产出 + 未消化意见」为基准
         &task,
         artifact.to_string(),
-        "", // 无工具调用数据
+        "",   // 无工具调用数据
         None, // 返工环复核无 step 执行约束上下文
     )
     .await;
@@ -756,6 +775,127 @@ async fn loop_exhausted_last_resort_review(
         ),
     });
     true
+}
+
+/// 串行引擎 loop_until 返工判定的导航结果。
+enum SerialLoopNav {
+    /// 前进到下一 step：条件满足、step 无 loop_until，或返工环耗尽后
+    /// 经 advisor 复核放行。
+    Advance,
+    /// 跳回指定下标的 step 返工；调用方负责把本 step 产出置为
+    /// pending_feedback 注入目标 step 的 prompt。
+    Rework(usize),
+}
+
+/// 串行引擎的 loop_until 返工判定（模型步与 learn_loop 确定性步共用，
+/// 两处语义必须保持一致、同步演进）。
+///
+/// 判定完全读 step 配置（loop_until / loop_abort_on / loop_back_routes /
+/// loop_back_to / loop_no_release_on / max_iterations），引擎不硬编码任何
+/// 状态标记——配置是唯一事实来源：
+/// - `loop_abort_on` 命中 → 立即 `Err`（终止整条 workflow）；
+/// - 产出含 `loop_until` 子串 → `Advance`；
+/// - 不含 → 迭代计数 +1；达到 max_iterations（缺省 3、硬上限 10）先按
+///   `loop_no_release_on` 判死，否则走 `loop_exhausted_last_resort_review`
+///   复核，仍不过则 `Err`；未耗尽 → 发 Status 事件并 `Rework(目标下标)`，
+///   目标由 `rework_target_id`（loop_back_routes → loop_back_to → 自环）
+///   决定。
+#[allow(clippy::too_many_arguments)]
+async fn serial_loop_decision(
+    wf: &WorkflowDef,
+    step: &WorkflowStepDef,
+    step_idx: usize,
+    last_output: &str,
+    loop_iters: &mut HashMap<usize, usize>,
+    vars: &HashMap<String, String>,
+    review_engine: &Option<Arc<crate::advisor_monitor::AdvisorReviewEngine>>,
+    ctx: &WorkflowRunContext,
+    topic: &str,
+) -> Result<SerialLoopNav, String> {
+    let Some(cond) = &step.loop_until else {
+        return Ok(SerialLoopNav::Advance);
+    };
+    // 显式声明了熔断标记的 step 才有「不可返工」终局；
+    // 缺省一律返工（见 `loop_abort_on` 文档）。
+    if let Some(marker) = &step.loop_abort_on {
+        if last_output.contains(marker.as_str()) {
+            return Err(format!(
+                "step '{}' 终止 workflow：{}",
+                step.id,
+                last_output.chars().take(500).collect::<String>()
+            ));
+        }
+    }
+    if last_output.contains(cond.as_str()) {
+        return Ok(SerialLoopNav::Advance);
+    }
+    let count = {
+        let c = loop_iters.entry(step_idx).or_insert(0);
+        *c += 1;
+        *c
+    };
+    let max = step.max_iterations.unwrap_or(3).min(10);
+    if count >= max {
+        // 「不可放行」标记：gate 已给出带证据的硬拒绝
+        // （如 VERDICT: REJECT），不许 advisor 复核把
+        // 失败吞成成功，直接判死（见 loop_no_release_on）。
+        if let Some(marker) = &step.loop_no_release_on {
+            if last_output.contains(marker.as_str()) {
+                return Err(format!(
+                    "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                     （已达 max_iterations={max}），产出含不可放行标记「{marker}」\
+                     （跳过 advisor 复核），最后一次产出摘要：{}",
+                    step.id,
+                    last_output.chars().take(200).collect::<String>()
+                ));
+            }
+        }
+        // 判死前最后一道 advisor 语义复核：把「被返工的那份
+        // 产出」+「未消化的评审意见」交给 advisor，判定实质
+        // 合格则放行进入下游（见 loop_exhausted_last_resort_review）。
+        let target_id = rework_target_id(step, last_output);
+        let artifact = wf
+            .steps
+            .iter()
+            .find(|s| s.id == target_id)
+            .and_then(|s| s.output_key.as_ref())
+            .and_then(|k| vars.get(k).cloned())
+            .unwrap_or_default();
+        if loop_exhausted_last_resort_review(
+            review_engine,
+            &ctx.event_tx,
+            topic,
+            &step.id,
+            cond,
+            count,
+            &artifact,
+            last_output,
+        )
+        .await
+        {
+            return Ok(SerialLoopNav::Advance);
+        }
+        let summary: String = last_output.chars().take(200).collect();
+        return Err(format!(
+            "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+             （已达 max_iterations={max}），最后一次产出摘要：{summary}",
+            step.id
+        ));
+    }
+    let target_id = rework_target_id(step, last_output);
+    let target_idx = wf
+        .steps
+        .iter()
+        .position(|s| s.id == target_id)
+        .expect("validate 已保证 loop_back_to/loop_back_routes 指向存在的 step");
+    let _ = ctx.event_tx.send(ChatEvent::Status {
+        message: format!(
+            "↩ 第 {count} 轮返工：step '{}' 产出未满足循环条件\
+             「{cond}」，跳回 '{target_id}' 重做",
+            step.id
+        ),
+    });
+    Ok(SerialLoopNav::Rework(target_idx))
 }
 
 /// 可选 speaker 的关键词匹配范围。
@@ -847,6 +987,35 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+fn default_context_overflow_max_restarts() -> usize {
+    2
+}
+
+/// 数据驱动的动态扇出：引擎读 `file`（JSON）里的数组，**每个元素派发一次**本
+/// step，元素 id 以 `{{item_id}}`、序号（从 1 计）以 `{{item_index}}` 注入 prompt。
+/// 并发度由引擎的全局信号量（`LATTE_WORKFLOW_CONCURRENCY`，缺省 4）限制：
+/// 元素比并发度多时，多出的排队等空闲名额（对象池语义），由引擎调度而非模型。
+/// 全部元素完成后本 step 才算完成（下游 `depends_on` 才放行）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FanOut {
+    /// JSON 文件路径（相对 workflow cwd），可含 `{{var}}`。
+    pub file: String,
+    /// 文件里数组字段名。
+    #[serde(default = "default_fan_out_items")]
+    pub items: String,
+    /// 数组元素里作为 id 的字段名。
+    #[serde(default = "default_fan_out_id_key")]
+    pub id_key: String,
+}
+
+fn default_fan_out_items() -> String {
+    "knowledge_points".to_string()
+}
+fn default_fan_out_id_key() -> String {
+    "id".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStepDef {
@@ -912,6 +1081,39 @@ pub struct WorkflowStepDef {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub max_retries: u32,
+    /// Provider 报 context overflow 时，是否丢弃当前 runner 并重启本 step。
+    /// 这是给“审查员重新读取文件”这类步骤的定向恢复开关；默认关闭，
+    /// 普通 workflow 仍沿用 compact/retry 后失败的旧语义。
+    #[serde(default)]
+    pub context_overflow_restart: bool,
+    /// 单个 step 最多允许多少次 context-overflow fresh restart。
+    /// 默认 2，运行时还会钳到硬上限，防止恢复策略本身形成无限循环。
+    #[serde(default = "default_context_overflow_max_restarts")]
+    pub context_overflow_max_restarts: usize,
+    /// fresh restart 时明确告知模型要重新读取的 workflow 产物文件。
+    /// 路径相对于 workflow 工作目录；learn_loop 中写成 draft.md，
+    /// proofreader 会按主题定位对应的 `.latte/learn/<slug>/draft.md`。
+    #[serde(default)]
+    pub context_overflow_files: Vec<String>,
+    /// read 工具的**真实执行路径**白名单。非空时引擎包装 read handler，
+    /// 任意不匹配的 `path` / `paths` 在工具执行前被拒绝；这不是 prompt
+    /// 建议。路径相对 workflow cwd，按路径段匹配，单独的 `*` 匹配一个
+    /// 目录段（如 `.latte/learn/*/draft.md`）。
+    #[serde(default)]
+    pub read_path_allowlist: Vec<String>,
+    /// 每次模型调用前允许发送的 prompt token 估算上限。超出时 runner
+    /// 返回 [`AgentError::PromptBudgetExceeded`]；启用
+    /// `context_overflow_restart` 的 step 会被 workflow 以全新 runner
+    /// 重启，而不是把越积越大的工具历史继续传给模型。0/None = 不限。
+    ///
+    /// 这是**绝对上限**，与 [`Self::prompt_token_ratio`] 同时存在时取更小者。
+    #[serde(default)]
+    pub prompt_token_budget: Option<usize>,
+    /// 动态预算比例：`预算 = 模型窗口 × 本比例 − 输出预留`，随真实窗口伸缩。
+    /// 取值 `(0, 1]`；未配置但开启了 `context_overflow_restart` 时，
+    /// 自动按 0.8 启用（见 [`resolve_prompt_budget`]）。
+    #[serde(default)]
+    pub prompt_token_ratio: Option<f64>,
     /// step 级工具过滤：非空时本 step 的 speaker 只能用
     /// `role.allowed_tools ∩ tools`（保持角色配置里的顺序）；空 =
     /// 角色全集（现状）。用途：同一角色在不同 step 的能力收紧——如
@@ -1170,11 +1372,19 @@ pub struct WorkflowStepDef {
     /// 产出」，混入转口货会让上层的 `output_from` 语义变模糊。
     #[serde(default)]
     pub export: std::collections::BTreeMap<String, String>,
+    /// 动态扇出（见 [`FanOut`]）。仅 DAG 引擎、仅模型 step，且不可带
+    /// `loop_until`（循环判定针对整 step 而非单元素）。
+    #[serde(default)]
+    pub fan_out: Option<FanOut>,
 }
 
 impl WorkflowStepDef {
     pub fn roles(&self) -> Vec<String> {
-        if let Some(role) = &self.role { vec![role.clone()] } else { self.speakers.clone() }
+        if let Some(role) = &self.role {
+            vec![role.clone()]
+        } else {
+            self.speakers.clone()
+        }
     }
 
     /// 全部**声明过**的角色（无条件 + 可选），供 validate 的角色存在性
@@ -1255,15 +1465,16 @@ impl WorkflowStepDef {
         if self.when_any.is_empty() || self.when_any.iter().any(|k| keyword_hit(&hay, k)) {
             (true, None)
         } else {
-            (
-                false,
-                Some(format!("{scope} 未命中 {:?}", self.when_any)),
-            )
+            (false, Some(format!("{scope} 未命中 {:?}", self.when_any)))
         }
     }
 
     pub fn task_text(&self) -> &str {
-        if self.task.is_empty() { &self.prompt } else { &self.task }
+        if self.task.is_empty() {
+            &self.prompt
+        } else {
+            &self.task
+        }
     }
 }
 
@@ -1276,7 +1487,9 @@ impl WorkflowDef {
         let mut out = Vec::new();
         for step in &self.steps {
             for role in step.declared_roles() {
-                if !out.contains(&role) { out.push(role); }
+                if !out.contains(&role) {
+                    out.push(role);
+                }
             }
         }
         out
@@ -1335,6 +1548,16 @@ impl WorkflowDef {
                 if step.loop_until.is_some() {
                     return Err(format!(
                         "step '{}': `loop_until` 与嵌套 workflow 互斥（嵌套 step 不参与循环）",
+                        step.id
+                    ));
+                }
+            }
+            // 动态预算比例的形状校验：(0,1] 之外的值要么恒不触发（0 等于
+            // 没写却以为写了）要么把预算推到窗口之外，都是静默失效。
+            if let Some(ratio) = step.prompt_token_ratio {
+                if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+                    return Err(format!(
+                        "step '{}': prompt_token_ratio 必须落在 (0.0, 1.0]，实际 {ratio}",
                         step.id
                     ));
                 }
@@ -1417,17 +1640,15 @@ impl WorkflowDef {
                     }
                 }
             }
-            if step.output_from.is_some() && step.workflow.is_none() {                return Err(format!(
+            if step.output_from.is_some() && step.workflow.is_none() {
+                return Err(format!(
                     "step '{}': `output_from` 仅对嵌套 workflow step 有效（该 step 没有 workflow 字段）",
                     step.id
                 ));
             }
             if let Some(of) = &step.output_from {
                 if of.trim().is_empty() {
-                    return Err(format!(
-                        "step '{}': output_from must not be empty",
-                        step.id
-                    ));
+                    return Err(format!("step '{}': output_from must not be empty", step.id));
                 }
             }
             // 工具行为字段的形状校验。空工具名会被 `short_tool_name`
@@ -1452,9 +1673,10 @@ impl WorkflowDef {
             }
             // min/max 反了的话没有任何产出能通过，且报错会指向 min（先查
             // min），排查方向完全错。配置期就拦掉。
-            if let (Some(min), Some(max)) =
-                (step.output_contract.min_chars, step.output_contract.max_chars)
-            {
+            if let (Some(min), Some(max)) = (
+                step.output_contract.min_chars,
+                step.output_contract.max_chars,
+            ) {
                 if min > max {
                     return Err(format!(
                         "step '{}': output_contract.min_chars ({min}) 大于 max_chars ({max})，\
@@ -1586,6 +1808,20 @@ impl WorkflowDef {
                     }
                 }
             }
+            if step.fan_out.is_some() {
+                if !uses_dag {
+                    return Err(format!(
+                        "step '{}': `fan_out` 仅支持 DAG 引擎（需有 step 声明 depends_on）",
+                        step.id
+                    ));
+                }
+                if step.workflow.is_some() || step.loop_until.is_some() {
+                    return Err(format!(
+                        "step '{}': `fan_out` 不能与嵌套 workflow / loop_until 同用",
+                        step.id
+                    ));
+                }
+            }
             if step.loop_until.is_some() && uses_dag {
                 // DAG 返工环（实测实锤：gate 的合法 REJECT 被契约
                 // 判死，50 分钟流水线零产出）。约束：跳回目标必须在
@@ -1627,10 +1863,7 @@ impl WorkflowDef {
             }
             if let Some(key) = &step.output_key {
                 if key.is_empty() {
-                    return Err(format!(
-                        "step '{}': output_key must not be empty",
-                        step.id
-                    ));
+                    return Err(format!("step '{}': output_key must not be empty", step.id));
                 }
                 if RESERVED_OUTPUT_KEYS.contains(&key.as_str()) {
                     return Err(format!(
@@ -1643,7 +1876,8 @@ impl WorkflowDef {
             }
             // patch / 机械提交字段的形状校验（三者都只在串行引擎实现，
             // DAG 用到即报配置错误，不静默忽略）。
-            if (step.require_plan_tasks || step.patch_from.is_some()
+            if (step.require_plan_tasks
+                || step.patch_from.is_some()
                 || step.submit_plan_from.is_some())
                 && uses_dag
             {
@@ -1677,8 +1911,7 @@ impl WorkflowDef {
                     ));
                 }
             }
-            if step.submit_plan_from.is_some()
-                && (step.role.is_some() || !step.speakers.is_empty())
+            if step.submit_plan_from.is_some() && (step.role.is_some() || !step.speakers.is_empty())
             {
                 return Err(format!(
                     "step '{}': `submit_plan_from` 是零模型调用的机械步，与 role/speakers 互斥",
@@ -1765,9 +1998,7 @@ fn compute_waves(steps: &[WorkflowStepDef]) -> Result<Vec<Vec<usize>>, String> {
             }
         }
         if wave.is_empty() {
-            return Err(
-                "workflow has a dependency cycle or unsatisfiable depends_on".into(),
-            );
+            return Err("workflow has a dependency cycle or unsatisfiable depends_on".into());
         }
         for &i in &wave {
             done[i] = true;
@@ -1817,15 +2048,32 @@ pub fn is_planning_workflow(name: &str) -> bool {
 const DELIVERABLES: [(&str, &[&str], &str, &[&str]); 4] = [
     (
         "任务清单",
-        &["拆分任务", "拆任务", "任务清单", "任务列表", "看板", "排任务"],
+        &[
+            "拆分任务",
+            "拆任务",
+            "任务清单",
+            "任务列表",
+            "看板",
+            "排任务",
+        ],
         "implementation_plan（拿到清单后用 plan 提交给用户勾选导入看板）",
-        &["implementation_plan", "task_refine", "design_and_plan", "feature_design"],
+        &[
+            "implementation_plan",
+            "task_refine",
+            "design_and_plan",
+            "feature_design",
+        ],
     ),
     (
         "计划",
         &["计划", "规划", "路线图", "roadmap"],
         "implementation_plan",
-        &["implementation_plan", "task_refine", "design_and_plan", "feature_design"],
+        &[
+            "implementation_plan",
+            "task_refine",
+            "design_and_plan",
+            "feature_design",
+        ],
     ),
     (
         "教程 / 学习材料",
@@ -2080,7 +2328,8 @@ pub fn load_workflow_by_command(cmd: &str, project_cwd: &Path) -> Result<Workflo
 /// Everything a workflow run needs from its host (controller tool
 /// handler, UI server test-run endpoint, ...).
 #[derive(Clone)]
-pub struct WorkflowRunContext {    /// Merged agent config (roles). Cloned per run by the host.
+pub struct WorkflowRunContext {
+    /// Merged agent config (roles). Cloned per run by the host.
     pub merged: Arc<AgentConfig>,
     pub resolver: Arc<ModelResolver>,
     pub default_params: GenerateParams,
@@ -2308,8 +2557,7 @@ fn run_nested_workflow(
         };
         // 嵌套 run 不自设预算（墙钟机制已废弃）：防挂死由下层 idle
         // 超时统一兜住。
-        let (last, keyed) =
-            run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
+        let (last, keyed) = run_workflow_inner(&wf, &topic, &nested_ctx, None).await?;
         let available = || keyed.keys().cloned().collect::<Vec<_>>().join(", ");
         // export：把子 workflow 的若干中间产物按「父级变量名 ← 子
         // output_key」带出去（打通信息漏斗，见 `WorkflowStepDef::export`）。
@@ -2482,16 +2730,15 @@ impl CheckpointState {
 /// Load and validate a checkpoint file for resume. `wf_id` comes from
 /// tool input, so reject anything that isn't a plain file name.
 pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, String> {
-    if wf_id.is_empty()
-        || wf_id.contains('/')
-        || wf_id.contains('\\')
-        || wf_id.contains("..")
-    {
+    if wf_id.is_empty() || wf_id.contains('/') || wf_id.contains('\\') || wf_id.contains("..") {
         return Err(format!("invalid resume wf_id '{wf_id}'"));
     }
     let path = checkpoint_path(cwd, wf_id);
     let raw = std::fs::read_to_string(&path).map_err(|_| {
-        format!("resume checkpoint '{wf_id}' not found at {}", path.display())
+        format!(
+            "resume checkpoint '{wf_id}' not found at {}",
+            path.display()
+        )
     })?;
     let mut meta: Option<(String, String)> = None;
     let mut completed = Vec::new();
@@ -2501,18 +2748,33 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
         if line.is_empty() {
             continue;
         }
-        let rec: CheckpointRecord = serde_json::from_str(line)
-            .map_err(|e| format!("checkpoint '{wf_id}' line {}: invalid JSON: {e}", lineno + 1))?;
+        let rec: CheckpointRecord = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "checkpoint '{wf_id}' line {}: invalid JSON: {e}",
+                lineno + 1
+            )
+        })?;
         match rec {
-            CheckpointRecord::Meta { workflow_name, topic, .. } => {
+            CheckpointRecord::Meta {
+                workflow_name,
+                topic,
+                ..
+            } => {
                 if meta.is_none() {
                     meta = Some((workflow_name, topic));
                 }
             }
-            CheckpointRecord::Step { step_id, output_key, output, .. } => {
+            CheckpointRecord::Step {
+                step_id,
+                output_key,
+                output,
+                ..
+            } => {
                 completed.push((step_id, output_key, output));
             }
-            CheckpointRecord::Answer { question, answer, .. } => {
+            CheckpointRecord::Answer {
+                question, answer, ..
+            } => {
                 // 后写覆盖：同一问题被问了两次（重试）时保留最后一次
                 // 的回答。
                 answers.insert(question, answer);
@@ -2521,7 +2783,12 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
     }
     let (workflow_name, topic) =
         meta.ok_or_else(|| format!("checkpoint '{wf_id}' has no meta line (corrupt?)"))?;
-    Ok(CheckpointState { workflow_name, topic, completed, answers })
+    Ok(CheckpointState {
+        workflow_name,
+        topic,
+        completed,
+        answers,
+    })
 }
 
 /// 用户回答的持久化台账：收到即落盘，同一问题再问直接回放。
@@ -2681,7 +2948,14 @@ impl CheckpointLog {
     /// seeds the completed counter with steps carried over from a
     /// previous run's checkpoint. `session_id` 写进 meta 首行，供
     /// plan 工具的直提门禁按 session 查询「是否跑过 workflow」。
-    fn new(cwd: &Path, wf_id: &str, workflow_name: &str, topic: &str, resumed: usize, session_id: Option<String>) -> Self {
+    fn new(
+        cwd: &Path,
+        wf_id: &str,
+        workflow_name: &str,
+        topic: &str,
+        resumed: usize,
+        session_id: Option<String>,
+    ) -> Self {
         append_checkpoint(
             cwd,
             wf_id,
@@ -2725,72 +2999,493 @@ impl CheckpointLog {
     }
 }
 
-async fn deterministic_learning_ask(ctx: &WorkflowRunContext, log: &Arc<AnswerLog>, id: String, question: String, questions: Vec<ChoiceQuestion>, options: Vec<ChoiceOption>, doc: String) -> Result<String, String> {
-    if let Some(answer) = log.recall(&question) { return Ok(answer); }
-    let event = ChatEvent::ChoiceRequested { role_id: "tutor".into(), choice_id: id.clone(), question: question.clone(), multi: false, layout: String::new(), allow_upload: false, wait: true, options, document_path: doc.clone(), document_markdown: std::fs::read_to_string(ctx.cwd.join(&doc)).unwrap_or_default(), questions };
+async fn deterministic_learning_ask(
+    ctx: &WorkflowRunContext,
+    log: &Arc<AnswerLog>,
+    id: String,
+    question: String,
+    questions: Vec<ChoiceQuestion>,
+    options: Vec<ChoiceOption>,
+    doc: String,
+) -> Result<String, String> {
+    if let Some(answer) = log.recall(&question) {
+        return Ok(answer);
+    }
+    let event = ChatEvent::ChoiceRequested {
+        role_id: "tutor".into(),
+        choice_id: id.clone(),
+        question: question.clone(),
+        multi: false,
+        layout: String::new(),
+        allow_upload: false,
+        wait: true,
+        options,
+        document_path: doc.clone(),
+        document_markdown: std::fs::read_to_string(ctx.cwd.join(&doc)).unwrap_or_default(),
+        questions,
+    };
     let rx = crate::choice::register(&id, event.clone(), ctx.event_tx.clone());
-    if let (Some(sid), Ok(json)) = (log.session_id(), crate::event_json::chat_event_to_frontend_json(&event)) { crate::pending_ask::persist(log.cwd(), &id, sid, log.resume_wf_id(), "tutor", &question, &json); }
-    let _guard = crate::choice::ChoiceGuard(id.clone()); let _ = ctx.event_tx.send(event);
+    if let (Some(sid), Ok(json)) = (
+        log.session_id(),
+        crate::event_json::chat_event_to_frontend_json(&event),
+    ) {
+        crate::pending_ask::persist(
+            log.cwd(),
+            &id,
+            sid,
+            log.resume_wf_id(),
+            "tutor",
+            &question,
+            &json,
+        );
+    }
+    let _guard = crate::choice::ChoiceGuard(id.clone());
+    let _ = ctx.event_tx.send(event);
     let answer = rx.await.map_err(|_| "学习问答等待通道已关闭".to_string())?;
-    log.record("tutor", &question, &answer); crate::pending_ask::remove(log.cwd(), &id); Ok(answer)
+    log.record("tutor", &question, &answer);
+    crate::pending_ask::remove(log.cwd(), &id);
+    Ok(answer)
+}
+/// 确定性装配：如果 `.latte/learn/<slug>/sections/` 目录下存在分段章节
+/// （`00_overview.md` 与各个 `<id>.md`），按 plan.json 的知识点顺序自动拼装成完整的 `draft.md`。
+/// 这是「B套A」分段打磨机制的装配引擎，零模型调用、保证拼接顺序确定与零内容丢失。
+pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<bool, String> {
+    let sections_dir = base.join("sections");
+    if !sections_dir.is_dir() {
+        return Ok(false);
+    }
+    let plan_path = base.join("plan.json");
+    if !plan_path.is_file() {
+        return Ok(false);
+    }
+    let plan: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&plan_path).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut combined = String::new();
+
+    // 1. 全局框架与心智模型（00_overview.md）
+    let overview_file = sections_dir.join("00_overview.md");
+    if overview_file.is_file() {
+        let content = std::fs::read_to_string(&overview_file).unwrap_or_default();
+        if !content.trim().is_empty() {
+            combined.push_str(content.trim());
+            combined.push_str("\n\n---\n\n");
+        }
+    }
+
+    // 2. 按 plan.json 的知识点顺序拼接各个章节
+    if let Some(kps) = plan["knowledge_points"].as_array() {
+        for kp in kps {
+            if let Some(id) = kp["id"].as_str() {
+                let direct = sections_dir.join(format!("{id}.md"));
+                let cand = if direct.is_file() {
+                    Some(direct)
+                } else {
+                    // 支持命名格式：01_k1.md, k1.md, k1_xxx.md
+                    std::fs::read_dir(&sections_dir)
+                        .ok()
+                        .and_then(|entries| {
+                            entries.flatten().find_map(|e| {
+                                let path = e.path();
+                                let stem = path.file_stem()?.to_str()?;
+                                if stem == id
+                                    || stem.ends_with(&format!("_{id}"))
+                                    || stem.starts_with(&format!("{id}_"))
+                                {
+                                    Some(path)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                };
+                if let Some(p) = cand {
+                    if let Ok(sec_text) = std::fs::read_to_string(&p) {
+                        if !sec_text.trim().is_empty() {
+                            combined.push_str(sec_text.trim());
+                            combined.push_str("\n\n---\n\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !combined.is_empty() {
+        let draft_path = base.join("draft.md");
+        std::fs::write(&draft_path, combined.trim_end()).map_err(|e| e.to_string())?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
-async fn run_learn_control_step(step: &WorkflowStepDef, slug: &str, ctx: &WorkflowRunContext, log: &Arc<AnswerLog>) -> Result<Option<String>, String> {
+async fn run_learn_control_step(
+    step: &WorkflowStepDef,
+    slug: &str,
+    ctx: &WorkflowRunContext,
+    log: &Arc<AnswerLog>,
+) -> Result<Option<String>, String> {
     let base = ctx.cwd.join(".latte").join("learn").join(slug);
-    let mut ledger: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // 在控制步（read_confirm / quiz）前，若存在分段文件自动装配最新 draft.md
+    let _ = assemble_draft_from_sections(&base);
+    let mut ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(base.join("ledger.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     if step.id == "read_confirm" {
         let round = ledger["round"].as_u64().unwrap_or(0) + 1;
-        let question = format!("学习材料（第 {round} 版）：.latte/learn/{slug}/draft.md。读完了吗？");
-        let options = vec![ChoiceOption { label: "开始答题，验证掌握程度".into(), description: "我已读完文档".into(), ..Default::default() }];
-        deterministic_learning_ask(ctx, log, format!("learn-{slug}-read-{round}"), question, vec![], options, format!(".latte/learn/{slug}/draft.md")).await?;
+        let question =
+            format!("学习材料（第 {round} 版）：.latte/learn/{slug}/draft.md。读完了吗？");
+        let options = vec![ChoiceOption {
+            label: "开始答题，验证掌握程度".into(),
+            description: "我已读完文档".into(),
+            ..Default::default()
+        }];
+        deterministic_learning_ask(
+            ctx,
+            log,
+            format!("learn-{slug}-read-{round}"),
+            question,
+            vec![],
+            options,
+            format!(".latte/learn/{slug}/draft.md"),
+        )
+        .await?;
         return Ok(Some("好，开始答题。".into()));
     }
-    if step.id != "quiz" { return Ok(None); }
-    let plan: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(base.join("plan.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let pending = plan["knowledge_points"].as_array().into_iter().flatten().filter(|p| {
-        ledger["knowledge_points"].as_array().into_iter().flatten().any(|e| e["id"] == p["id"] && !e["passed"].as_bool().unwrap_or(false))
-    }).collect::<Vec<_>>();
-    if pending.is_empty() { return Ok(Some("判分结果：全部答对。".into())); }
-    let questions = pending.iter().map(|p| {
-        let id = p["id"].as_str().unwrap_or("");
-        let wrong = ledger["knowledge_points"].as_array().into_iter().flatten().find(|e| e["id"] == p["id"]).and_then(|e| e["wrong"].as_u64()).unwrap_or(0);
-        ChoiceQuestion { id: id.into(), question: format!("{}［第{}次作答］", p["question"].as_str().unwrap_or(""), wrong + 1), options: serde_json::from_value(p["options"].clone()).unwrap_or_default(), ..Default::default() }
-    }).collect::<Vec<_>>();
-    let identity = questions.iter().map(|q| format!("{}-{}", q.id, ledger["knowledge_points"].as_array().into_iter().flatten().find(|e| e["id"].as_str() == Some(&q.id)).and_then(|e| e["wrong"].as_u64()).unwrap_or(0) + 1)).collect::<Vec<_>>().join("+");
+    if step.id != "quiz" {
+        return Ok(None);
+    }
+    let plan: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(base.join("plan.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let pending = plan["knowledge_points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| {
+            ledger["knowledge_points"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["id"] == p["id"] && !e["passed"].as_bool().unwrap_or(false))
+        })
+        .collect::<Vec<_>>();
+    // 全对的提前返回也要带 QUIZ_PASS 末行标记：quiz 步的 loop_until
+    // 判定（serial_loop_decision）靠这个子串放行，缺了会误判返工。
+    if pending.is_empty() {
+        return Ok(Some("判分结果：全部答对。\nQUIZ_PASS".into()));
+    }
+    let questions = pending
+        .iter()
+        .map(|p| {
+            let id = p["id"].as_str().unwrap_or("");
+            let wrong = ledger["knowledge_points"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["id"] == p["id"])
+                .and_then(|e| e["wrong"].as_u64())
+                .unwrap_or(0);
+            ChoiceQuestion {
+                id: id.into(),
+                question: format!(
+                    "{}［第{}次作答］",
+                    p["question"].as_str().unwrap_or(""),
+                    wrong + 1
+                ),
+                options: serde_json::from_value(p["options"].clone()).unwrap_or_default(),
+                ..Default::default()
+            }
+        })
+        .collect::<Vec<_>>();
+    let identity = questions
+        .iter()
+        .map(|q| {
+            format!(
+                "{}-{}",
+                q.id,
+                ledger["knowledge_points"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|e| e["id"].as_str() == Some(&q.id))
+                    .and_then(|e| e["wrong"].as_u64())
+                    .unwrap_or(0)
+                    + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("+");
     let answer_key = format!("learn:{slug}:quiz:{identity}");
-    let raw = deterministic_learning_ask(ctx, log, format!("learn-{slug}-quiz-{identity}"), answer_key, questions, vec![], String::new()).await?;
-    let answers = pending.iter().zip(raw.lines()).filter_map(|(p, line)| p["id"].as_str().map(|id| (id.to_string(), line.split_once('→').map_or(line, |(_, value)| value).trim().to_string()))).collect();
-    let passed = deterministic_grade_quiz(&plan, &mut ledger, &answers);
-    std::fs::write(base.join("ledger.json"), serde_json::to_vec_pretty(&ledger).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    Ok(Some(if passed { "判分结果：全部答对。" } else { "判分结果：存在答错知识点。" }.into()))
+    let raw = deterministic_learning_ask(
+        ctx,
+        log,
+        format!("learn-{slug}-quiz-{identity}"),
+        answer_key,
+        questions,
+        vec![],
+        String::new(),
+    )
+    .await?;
+    let answers = pending
+        .iter()
+        .zip(raw.lines())
+        .filter_map(|(p, line)| {
+            p["id"].as_str().map(|id| {
+                (
+                    id.to_string(),
+                    line.split_once('→')
+                        .map_or(line, |(_, value)| value)
+                        .trim()
+                        .to_string(),
+                )
+            })
+        })
+        .collect();
+    let grade = deterministic_grade_quiz(&plan, &mut ledger, &answers);
+    std::fs::write(
+        base.join("ledger.json"),
+        serde_json::to_vec_pretty(&ledger).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some(format_quiz_feedback(&grade)))
+}
+
+/// 单个知识点的判分结果：供 quiz 反馈文本拼装（哪个知识点、对/错、
+/// 用户实际答案、正确答案与出处）。
+pub(crate) struct QuizItemGrade {
+    pub id: String,
+    pub title: String,
+    pub correct: bool,
+    /// 用户实际答案（「你选的是」）。
+    pub given: String,
+    /// 正确选项的 label 原文。
+    pub expected: String,
+    /// plan.json 该点的 `evidence`（`file:line`）。
+    pub evidence: String,
+    /// plan.json 该点 `teach_points` 的首条（一句「为什么」）。
+    pub teach_point: String,
+    /// 该点 `requires` 声明的前置知识点里，账本上仍未 passed 的标题——
+    /// 答错时提示学员「先回去重学哪一节」。
+    pub unmet_requires: Vec<String>,
+}
+
+/// 一轮 quiz 的判分结果：`passed` = 账本全部知识点通过；`items` 是本轮
+/// 实际作答的逐题明细。
+pub(crate) struct QuizGrade {
+    pub passed: bool,
+    pub items: Vec<QuizItemGrade>,
+}
+
+/// 判分容忍度（对齐 learn_loop.toml quiz 步约定：「用户可能只回 label
+/// 的一部分或带前缀」）：双方归一化（去首尾空白、去常见收尾标点、忽略
+/// 大小写）后完全相等，或与正确 label 互相包含即判对——但正确 label
+/// 归一化后须 ≥ 2 字符才允许包含匹配，防止单字/空串把自由文本误判成对。
+/// 对不上任何 label（乱填、空、「不知道」、自定义自由文本）按答错。
+fn quiz_answer_matches(expected: &str, given: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .trim_end_matches(|c| {
+                matches!(
+                    c,
+                    '。' | '，'
+                        | '、'
+                        | ','
+                        | '.'
+                        | '！'
+                        | '!'
+                        | '？'
+                        | '?'
+                        | '；'
+                        | ';'
+                        | '：'
+                        | ':'
+                )
+            })
+            .trim()
+            .to_lowercase()
+    };
+    let (e, g) = (norm(expected), norm(given));
+    if e.is_empty() || g.is_empty() {
+        return false;
+    }
+    if e == g {
+        return true;
+    }
+    e.chars().count() >= 2 && (e.contains(&g) || g.contains(&e))
 }
 
 /// Grade persisted quiz answers by option label. Receipts are keyed by
 /// `knowledge-point-id:attempt`, so replay is idempotent while later attempts
 /// remain gradeable.
+///
+/// 返回值带逐题明细（[`QuizGrade::items`]）供反馈文本拼装；账本推进
+/// （passed / wrong+1）只在 receipt 缺失时发生——同一 attempt 重放不会
+/// 重复计数，也不会把已 passed 的点翻回去。
 pub(crate) fn deterministic_grade_quiz(
     plan: &serde_json::Value,
     ledger: &mut serde_json::Value,
     answers: &HashMap<String, String>,
-) -> bool {
-    let Some(points) = plan["knowledge_points"].as_array() else { return false };
-    let mut receipts = ledger["_graded_answers"].as_object().cloned().unwrap_or_default();
+) -> QuizGrade {
+    let mut items = Vec::new();
+    let failed = || QuizGrade {
+        passed: false,
+        items: Vec::new(),
+    };
+    let Some(points) = plan["knowledge_points"].as_array() else {
+        return failed();
+    };
+    let mut receipts = ledger["_graded_answers"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
     {
-        let Some(entries) = ledger["knowledge_points"].as_array_mut() else { return false };
+        let Some(entries) = ledger["knowledge_points"].as_array_mut() else {
+            return failed();
+        };
         for point in points {
-            let Some(id) = point["id"].as_str() else { continue };
-            let Some(answer) = answers.get(id) else { continue };
-            let Some(entry) = entries.iter_mut().find(|e| e["id"].as_str() == Some(id)) else { continue };
+            let Some(id) = point["id"].as_str() else {
+                continue;
+            };
+            let Some(answer) = answers.get(id) else {
+                continue;
+            };
+            let expected = point["answer"].as_str().unwrap_or("");
+            // 对错判定是纯函数（不看账本），重放时反馈文本依然准确；
+            // receipt 只守账本推进这一侧。
+            let correct = quiz_answer_matches(expected, answer);
+            items.push(QuizItemGrade {
+                id: id.to_string(),
+                title: point["title"].as_str().unwrap_or(id).to_string(),
+                correct,
+                given: answer.clone(),
+                expected: expected.to_string(),
+                evidence: point["evidence"].as_str().unwrap_or_default().to_string(),
+                teach_point: point["teach_points"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| t.as_str())
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                unmet_requires: Vec::new(),
+            });
+            let Some(entry) = entries.iter_mut().find(|e| e["id"].as_str() == Some(id)) else {
+                continue;
+            };
             let attempt = entry["wrong"].as_u64().unwrap_or(0) + 1;
             let key = format!("{id}:{attempt}");
-            if receipts.contains_key(&key) { continue; }
-            if point["answer"].as_str() == Some(answer.trim()) { entry["passed"] = serde_json::Value::Bool(true); }
-            else { entry["wrong"] = serde_json::Value::from(attempt); }
+            if receipts.contains_key(&key) {
+                continue;
+            }
+            if correct {
+                entry["passed"] = serde_json::Value::Bool(true);
+            } else {
+                entry["wrong"] = serde_json::Value::from(attempt);
+            }
             receipts.insert(key, serde_json::Value::String(answer.clone()));
         }
     }
     ledger["_graded_answers"] = serde_json::Value::Object(receipts);
-    ledger["knowledge_points"].as_array().is_some_and(|es| es.iter().all(|e| e["passed"].as_bool().unwrap_or(false)))
+    let passed = ledger["knowledge_points"]
+        .as_array()
+        .is_some_and(|es| es.iter().all(|e| e["passed"].as_bool().unwrap_or(false)));
+    // 前置未掌握提示：按判分后的账本状态算（同轮答对的前置不算未掌握），
+    // 标题从 plan 里取，取不到回退 id。
+    for item in &mut items {
+        let Some(point) = points
+            .iter()
+            .find(|p| p["id"].as_str() == Some(item.id.as_str()))
+        else {
+            continue;
+        };
+        item.unmet_requires = point["requires"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.as_str())
+            .filter(|rid| {
+                !ledger["knowledge_points"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|e| {
+                        e["id"].as_str() == Some(rid) && e["passed"].as_bool().unwrap_or(false)
+                    })
+            })
+            .map(|rid| {
+                points
+                    .iter()
+                    .find(|p| p["id"].as_str() == Some(rid))
+                    .and_then(|p| p["title"].as_str())
+                    .unwrap_or(rid)
+                    .to_string()
+            })
+            .collect();
+    }
+    QuizGrade { passed, items }
+}
+
+/// quiz 的确定性产出：逐题反馈 + 末行循环状态标记。
+///
+/// 逐题回显 `判分结果`（答对/答错）与 `你选的是`（用户实际选项）；答错
+/// 的题附正确答案、一句为什么（该点的 teach_points 首条）与 `file:line`
+/// 出处（evidence），并说明「该节讲解将在下一版文档里增强，重读后再考」。
+/// 末行单独一行 `QUIZ_PASS`（本轮全对）/ `QUIZ_FAIL`（有错）——quiz 步
+/// 的 output_contract（require = ["判分结果", "你选的是"]、
+/// last_line_prefix_any = ["QUIZ_PASS", "QUIZ_FAIL"]）钉的就是这个形状。
+///
+/// 有错时引擎按 loop_back_routes 跳回 doc 步，这段文本整段作为
+/// pending_feedback 注入 doc 步 prompt（「返工进入：QUIZ_FAIL」分支
+/// 消费），所以知识点 id、正确答案、evidence 必须带齐。
+fn format_quiz_feedback(grade: &QuizGrade) -> String {
+    let mut out = String::from("本轮测验判分如下：");
+    for (i, item) in grade.items.iter().enumerate() {
+        out.push_str(&format!(
+            "\n\n第 {} 题｜知识点 {}「{}」\n判分结果：{}\n你选的是：{}",
+            i + 1,
+            item.id,
+            item.title,
+            if item.correct { "答对" } else { "答错" },
+            if item.given.is_empty() {
+                "（未作答）"
+            } else {
+                item.given.as_str()
+            },
+        ));
+        if !item.correct {
+            let mut line = format!("\n正确答案：{}", item.expected);
+            if !item.teach_point.is_empty() {
+                line.push_str(&format!("。为什么：{}", item.teach_point));
+            }
+            if !item.evidence.is_empty() {
+                line.push_str(&format!("（出处：{}）", item.evidence));
+            }
+            if !item.unmet_requires.is_empty() {
+                line.push_str(&format!(
+                    "。前置未掌握：先重读{}再回来——答不对往往不是因为本节，而是前面的概念还没立住",
+                    item.unmet_requires
+                        .iter()
+                        .map(|t| format!("「{t}」"))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                ));
+            }
+            line.push_str("。该节讲解将在下一版文档里增强，重读后再考。");
+            out.push_str(&line);
+        }
+    }
+    out.push_str(if grade.passed {
+        "\n\nQUIZ_PASS"
+    } else {
+        "\n\nQUIZ_FAIL"
+    });
+    out
 }
 
 /// Max concurrent steps within a single dependency wave. Independent
@@ -2914,9 +3609,7 @@ async fn run_workflow_inner(
     let owned_ctx;
     let ctx: &WorkflowRunContext = if created_staging.is_some() || created_budget.is_some() {
         owned_ctx = WorkflowRunContext {
-            staging: created_staging
-                .clone()
-                .or_else(|| ctx.staging.clone()),
+            staging: created_staging.clone().or_else(|| ctx.staging.clone()),
             dispatch_budget: created_budget
                 .clone()
                 .or_else(|| ctx.dispatch_budget.clone()),
@@ -3165,11 +3858,198 @@ fn effective_step_tools(
 /// dispatch). `advisor` is rejected (monitor only).
 /// `step_tools` 非空时按 step 声明过滤角色工具（见
 /// [`effective_step_tools`]）。
+/// A path-spec selector (`:raw`, `:42-80`) is not part of the filesystem
+/// path and therefore must not participate in workflow read-scope matching.
+fn read_scope_file_part(spec: &str) -> &str {
+    let Some((path, suffix)) = spec.rsplit_once(':') else {
+        return spec;
+    };
+    let suffix = suffix.trim();
+    let is_selector = suffix.eq_ignore_ascii_case("raw")
+        || suffix.chars().all(|c| c.is_ascii_digit() || c == '-');
+    if is_selector {
+        path
+    } else {
+        spec
+    }
+}
+
+/// Match normalized relative paths segment-by-segment. `*` matches exactly one
+/// segment, so `.latte/learn/*/draft.md` cannot accidentally authorize a
+/// sibling or parent traversal.
+fn read_scope_matches(pattern: &str, candidate: &str) -> bool {
+    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let path: Vec<&str> = candidate.split('/').filter(|s| !s.is_empty()).collect();
+    pat.len() == path.len()
+        && pat
+            .iter()
+            .zip(path.iter())
+            .all(|(p, c)| *p == "*" || *p == *c)
+}
+
+fn workflow_relative_read_path(cwd: &Path, spec: &str) -> Option<String> {
+    let raw = read_scope_file_part(spec);
+    let path = PathBuf::from(raw);
+    let rel = if path.is_absolute() {
+        path.strip_prefix(cwd).ok()?.to_path_buf()
+    } else {
+        path
+    };
+    let mut out = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(s) => out.push(s.to_string_lossy().to_string()),
+            std::path::Component::CurDir => {}
+            // Parent traversal and a root/prefix cannot be authorized by a
+            // project-relative workflow scope.
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!out.is_empty()).then(|| out.join("/"))
+}
+
+/// Enforce the step's read allowlist at the actual handler boundary. The model
+/// can still *request* any path, but unauthorized paths never reach the read
+/// implementation and never enter the tool-result context.
+fn wrap_read_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[String]) {
+    if patterns.is_empty() {
+        return;
+    }
+    let Some(orig) = tm.get_tool("read") else {
+        return;
+    };
+    let patterns: Vec<String> = patterns
+        .iter()
+        .map(|p| p.trim().trim_start_matches("./").replace('\\', "/"))
+        .collect();
+    let cwd = cwd.to_path_buf();
+    let orig_handler = orig.handler.clone();
+    let handler: SharedToolHandler = Arc::new(move |input, ctx| {
+        let patterns = patterns.clone();
+        let cwd = cwd.clone();
+        let orig_handler = orig_handler.clone();
+        Box::pin(async move {
+            let requested: Vec<&str> =
+                if let Some(paths) = input.get("paths").and_then(|v| v.as_array()) {
+                    paths
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| ToolError::other("read.paths must contain only strings"))?
+                } else {
+                    vec![input
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| ToolError::other("read requires path or paths"))?]
+                };
+            for spec in requested {
+                let rel = workflow_relative_read_path(&cwd, spec).ok_or_else(|| {
+                    ToolError::other(format!(
+                        "workflow read scope rejects path outside workspace: {spec}"
+                    ))
+                })?;
+                if !patterns.iter().any(|p| read_scope_matches(p, &rel)) {
+                    return Err(ToolError::other(format!(
+                        "workflow step read scope rejects '{rel}'; allowed: {}",
+                        patterns.join(", ")
+                    )));
+                }
+            }
+            (orig_handler)(input, ctx).await
+        })
+    });
+    let wrapped = Tool::builder(
+        "read",
+        format!("{}（workflow 文件范围由引擎强制）", orig.description),
+        orig.input_schema.clone(),
+        handler,
+    )
+    .concurrency_safe(orig.concurrency_safe)
+    .build();
+    tm.unregister("read");
+    tm.register(wrapped, None);
+}
+
+
+/// 动态 prompt 预算的下限（估算 token）。窗口再小也不低于它——否则小窗口
+/// 模型会把预算压到几 K，一份正常文档都读不完。
+pub(crate) const PROMPT_BUDGET_FLOOR: usize = 16_384;
+
+/// 动态 prompt 预算的上限（估算 token）。
 ///
-/// Returns the runner plus the role's **base** system prompt (before
-/// the tool-protocol / ground-truth appends) — the delegate-return
-/// review uses it as the role-responsibilities reference, mirroring
-/// the controller's delegate path.
+/// 存在的理由：catalog 里的 `context_window` 会被虚填（实测
+/// `~/.latte/models.d/*.toml` 三个模型全写 `1000000`），直接乘比例会得到
+/// 几十万级预算，本地闸门等于消失。窗口改成真实值后可放开
+/// （`LATTE_AGENT_PROMPT_BUDGET_CEILING` 可临时调）。
+pub(crate) const PROMPT_BUDGET_CEILING: usize = 160_000;
+
+/// 参与计算的窗口上限：作用在「窗口 × 比例」之前的窗口本身。
+pub(crate) const PROMPT_BUDGET_WINDOW_CEILING: usize = 200_000;
+
+/// 窗口未声明（0）时用于动态预算的保守回退窗口。
+pub(crate) const PROMPT_BUDGET_FALLBACK_WINDOW: usize = 32_000;
+
+fn budget_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+/// 由 step 契约 + 解析到的模型算出**本次分派**的 prompt 预算。
+///
+/// 优先级：
+/// 1. `prompt_token_budget` 给了数字 → 它是绝对上限；
+/// 2. `prompt_token_ratio` 给了比例 → `(窗口 − 输出预留) × 比例`，随模型伸缩；
+/// 3. 都没给、但开了 `context_overflow_restart` → 按
+///    [`crate::compaction::DEFAULT_THRESHOLD_RATIO`] 自动启用动态预算
+///    （开了受控重启却没有任何闸门 = 配置自相矛盾：重启永不触发）；
+/// 4. 其余 → `None`（不限，保持历史行为）。
+///
+/// 1 与 2 同时存在取更小者：绝对上限钉死天花板，比例随窗伸缩，取交集安全。
+pub(crate) fn resolve_prompt_budget(
+    absolute: Option<usize>,
+    ratio: Option<f64>,
+    context_overflow_restart: bool,
+    model_window: u32,
+) -> Option<usize> {
+    let absolute = absolute.filter(|b| *b > 0);
+    let ratio =
+        ratio.or_else(|| context_overflow_restart.then_some(crate::compaction::DEFAULT_THRESHOLD_RATIO));
+    let Some(ratio) = ratio else {
+        return absolute;
+    };
+    let ratio = ratio.clamp(0.05, 1.0);
+    let window = model_window as usize;
+    let window = if window == 0 {
+        PROMPT_BUDGET_FALLBACK_WINDOW
+    } else {
+        window.min(budget_env_usize(
+            "LATTE_AGENT_PROMPT_BUDGET_WINDOW_CEILING",
+            PROMPT_BUDGET_WINDOW_CEILING,
+        ))
+    };
+    // 输出预留：prompt + 输出必须装进窗口。`max_tokens` 也可能虚高
+    // （配置里写 384000），所以再夹一道窗口的 20%。
+    let usable = window.saturating_sub(window / 5);
+    let derived = (usable as f64 * ratio) as usize;
+    let bounded = derived.clamp(
+        budget_env_usize("LATTE_AGENT_PROMPT_BUDGET_FLOOR", PROMPT_BUDGET_FLOOR),
+        budget_env_usize(
+            "LATTE_AGENT_PROMPT_BUDGET_CEILING",
+            PROMPT_BUDGET_CEILING,
+        ),
+    );
+    Some(match absolute {
+        Some(fixed) => fixed.min(bounded),
+        None => bounded,
+    })
+}
+/// Build a runner for one workflow speaker.
+///
 async fn build_role_runner(
     role_id: &str,
     merged: &Arc<AgentConfig>,
@@ -3183,6 +4063,10 @@ async fn build_role_runner(
     // 包装版（写重定向 + 读 overlay），见 crate::staging。
     staging: Option<Arc<crate::staging::Staging>>,
     step_tools: &[String],
+    read_path_allowlist: &[String],
+    prompt_token_budget: Option<usize>,
+    prompt_token_ratio: Option<f64>,
+    context_overflow_restart: bool,
     // 用户回答台账：装进阻塞 ask，收到答案即落盘、重复提问直接回放。
     // None = 不记账（独立测试）。
     answer_log: Option<Arc<AnswerLog>>,
@@ -3255,6 +4139,14 @@ async fn build_role_runner(
     let models = resolver
         .resolve_chain(&role.id, tier, &chain_ids)
         .map_err(|e| format!("no model for role '{role_id}': {e}"))?;
+    // 动态预算要看到**解析后的模型窗口**（而不是配置里声明的字段值），
+    // 所以计算放在 resolve_chain 之后、构建 agent 之前。
+    let resolved_budget = resolve_prompt_budget(
+        prompt_token_budget,
+        prompt_token_ratio,
+        context_overflow_restart,
+        models.first().map(|m| m.context_window).unwrap_or(0),
+    );
     let agent = Agent::new_with_chain(
         role_id.to_string(),
         role.clone(),
@@ -3276,6 +4168,9 @@ async fn build_role_runner(
         if let Some(st) = &staging {
             st.wrap_tools(&rtm, role_id);
         }
+        // 文件白名单必须包在 staging overlay 之外：先核验模型请求的
+        // 原始项目路径，再由内层 overlay 决定是否改读暂存副本。
+        wrap_read_path_allowlist(&rtm, cwd, read_path_allowlist);
         // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
         // （与 controller::build_runner 对齐）。workflow 引擎不走
         // delegate 工具，阶段门无人消费——调用方没给句柄时给一个私有的
@@ -3283,10 +4178,11 @@ async fn build_role_runner(
         // delegate 门禁）。调用方给了句柄（require_plan_submit 的 step）
         // 则用它，让引擎能在分派结束后读到提交结果。
         if role.allowed_tools.iter().any(|t| t == "plan") {
-            let plan_stage: crate::controller::SharedPlanStage = plan_stage
-                .clone()
-                .unwrap_or_else(|| {
-                    Arc::new(parking_lot::RwLock::new(crate::controller::PlanStage::Normal))
+            let plan_stage: crate::controller::SharedPlanStage =
+                plan_stage.clone().unwrap_or_else(|| {
+                    Arc::new(parking_lot::RwLock::new(
+                        crate::controller::PlanStage::Normal,
+                    ))
                 });
             // session_id 取自 answer_log（run 的恢复身份三元组之一）：
             // 有它才能把 PlanProposed 快照落盘，进程重启后「添加任务」
@@ -3362,9 +4258,14 @@ async fn build_role_runner(
         // doc-graph 工具（scan/context/write/index）：与 controller::build_runner
         // 对齐，让带 doc_graph_* 工具的角色在 workflow 里也能维护图谱。
         {
-            let has = ["doc_graph_scan", "doc_graph_context", "doc_write", "doc_index"]
-                .iter()
-                .any(|t| role.allowed_tools.iter().any(|a| a == t));
+            let has = [
+                "doc_graph_scan",
+                "doc_graph_context",
+                "doc_write",
+                "doc_index",
+            ]
+            .iter()
+            .any(|t| role.allowed_tools.iter().any(|a| a == t));
             if has {
                 crate::doc_graph_tools::register_doc_graph_tools(&rtm, cwd.to_path_buf())
                     .map_err(|e| format!("register doc_graph tools for '{role_id}': {e}"))?;
@@ -3378,6 +4279,9 @@ async fn build_role_runner(
     let mut r = runner
         .with_role(role_id.to_string())
         .with_cwd(cwd.to_path_buf());
+    if let Some(budget) = resolved_budget {
+        r = r.with_prompt_token_budget(budget);
+    }
     if let Some(id) = sub_id {
         r = r.with_sub_id(id.to_string());
     }
@@ -3431,6 +4335,18 @@ struct SpeakerDispatch {
     dispatch_budget: Option<Arc<DispatchBudget>>,
     /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
     step_tools: Vec<String>,
+    /// 引擎强制的 read 路径白名单（按路径段 `*` 模式匹配），而不是
+    /// 只在 prompt 中建议模型不要读取其它文件。
+    read_path_allowlist: Vec<String>,
+    /// 单次模型请求硬预算；超限上抛成可 fresh-restart 的 step 失败。
+    /// 与 [`Self::prompt_token_ratio`] 同时存在时取更小者
+    /// （见 [`resolve_prompt_budget`]）。
+    prompt_token_budget: Option<usize>,
+    /// 动态预算比例（`WorkflowStepDef::prompt_token_ratio`）。
+    prompt_token_ratio: Option<f64>,
+    /// 本 step 是否开启受控上下文重启。开启但未配任何预算时，
+    /// [`resolve_prompt_budget`] 按默认比例自动启用动态预算。
+    context_overflow_restart: bool,
     /// 本 step 的 `output_contract.max_chars`（产出形状上限）。它决定
     /// advisor D5 ShortOutput 闸门是否适用：契约明确要求"产出只是一个
     /// 短标识"的 step（learn_loop 的 plan 只许输出 slug 本身，≤60 字符），
@@ -3486,7 +4402,7 @@ impl SpeakerDispatch {
             cwd: ctx.cwd.clone(),
             event_tx: ctx.event_tx.clone(),
             cancel_flag: ctx.cancel_flag.clone(),
-    turn_cancel_flag: ctx.turn_cancel_flag.clone(),
+            turn_cancel_flag: ctx.turn_cancel_flag.clone(),
             agent_pause_gate: ctx.agent_pause_gate.clone(),
             subsession_store: ctx.subsession_store.clone(),
             session_id: ctx.session_id.clone(),
@@ -3496,6 +4412,10 @@ impl SpeakerDispatch {
             staging: ctx.staging.clone(),
             dispatch_budget: ctx.dispatch_budget.clone(),
             step_tools,
+            read_path_allowlist: Vec::new(),
+            prompt_token_budget: None,
+            prompt_token_ratio: None,
+            context_overflow_restart: false,
             // 测试构造器不关联具体 step 契约；生产站点（引擎派发处）
             // 按 step.output_contract.max_chars 显式写入。
             step_max_chars: None,
@@ -3553,8 +4473,11 @@ fn step_review_constraints(step: &WorkflowStepDef) -> Option<String> {
     }
     let c = &step.output_contract;
     if *c != OutputContract::default() {
-        lines.push("- 本步声明了产出契约，引擎会做机器校验；产出形态以契约为准，\
-                    不要拿「完整报告」的标准去衡量它：".to_string());
+        lines.push(
+            "- 本步声明了产出契约，引擎会做机器校验；产出形态以契约为准，\
+                    不要拿「完整报告」的标准去衡量它："
+                .to_string(),
+        );
         if let Some(min) = c.min_chars {
             lines.push(format!("  - 产出至少 {min} 字符"));
         }
@@ -3619,6 +4542,46 @@ fn step_review_constraints(step: &WorkflowStepDef) -> Option<String> {
 ///
 /// 为什么要加截断标注：下游 step（评审、拍板）必须知道这份输入没经过
 /// 作者收尾，否则会把半成品当终稿评审。
+/// Return the provider detail when an agent failure is a real context-window
+/// overflow. Keep this classification at the workflow boundary so the
+/// workflow can choose a recovery policy without weakening the generic agent
+/// compact/retry behavior.
+fn context_overflow_detail(error: &crate::error::AgentError) -> Option<String> {
+    match error {
+        crate::error::AgentError::ModelsUnavailable { failures, .. } => failures
+            .iter()
+            .find(|(_, detail)| crate::compaction::is_context_overflow_error(detail))
+            .map(|(_, detail)| detail.clone()),
+        crate::error::AgentError::PromptBudgetExceeded { estimated, budget } => Some(format!(
+            "engine prompt budget reached before provider overflow: estimated {estimated}, budget {budget}"
+        )),
+        _ => None,
+    }
+}
+
+fn context_overflow_restart_prompt(
+    step: &WorkflowStepDef,
+    topic: &str,
+    _static_prompt: &str,
+) -> String {
+    let files = if step.context_overflow_files.is_empty() {
+        "当前 workflow 产物文件（请按主题定位）".to_string()
+    } else {
+        step.context_overflow_files.join(", ")
+    };
+    // Deliberately do not replay the rendered step task: it may contain the
+    // full parent task tree and prior feedback. The role prompt + compact topic
+    // contract + engine-enforced read scope are the only restart context.
+    format!(
+        "【受控上下文重启】\n主题与文件契约：\n{topic}\n\n\
+         重新读取允许文件：{files}\n\
+         本次 runner 没有旧对话、旧反馈或工具历史；以当前文件内容为唯一事实来源。\n\
+         忽略旧过程提出的问题、失败原因和未完成的推理；先重新读取上述文件，\
+         再独立完成当前角色的步骤职责。若本步骤允许写入，请基于文件当前状态改进它；\
+         若为只读审查步骤，只输出本次重新阅读得出的结论。"
+    )
+}
+
 fn degrade_partial_on_break(
     speaker: &str,
     step_id: &str,
@@ -3647,9 +4610,8 @@ fn degrade_partial_on_break(
          不要视为终稿。",
         stripped.chars().count()
     );
-    let adopted = format!(
-        "{stripped}\n\n---\n[本产出因{cause}被截断，未经作者收尾]"
-    );
+
+    let adopted = format!("{stripped}\n\n---\n[本产出因{cause}被截断，未经作者收尾]");
     Some((notice, adopted))
 }
 
@@ -3666,7 +4628,6 @@ struct SpeakerOut {
 }
 
 async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> {
-
     let speaker = inp.speaker.clone();
     // 分派单元预算（runaway 兜底，见 [`DispatchBudget`]）。
     //
@@ -3771,6 +4732,13 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
     // 仅 remedy=restart（产出基于虚构/方向全错，续作不如重来）时清空
     // 此槽位，下一次循环重建全新 runner。
     let mut held_runner: Option<AgentRunner> = None;
+    // 失败/取消路径下 runner 被 drop，但它的累计 usage 必须留存——
+    // 否则补写的 TurnEnd 恒为 0（2026-09-25 LAT-110 实测：proofreader
+    // 成功发出 7 次模型调用，失败时日志里的 total_input 却是 0，
+    // 成本与上下文占用彻底不可观测）。
+    let mut last_failed_usage: Option<latte_ai::models::TokenUsage> = None;
+    // step 起跑时刻：失败补写的 TurnEnd 据此报真实耗时。
+    let speaker_turn_started = std::time::Instant::now();
     let mut role_responsibilities = String::new();
     let result: Result<SpeakerOut, StepFail> = loop {
         // 2. Runner：patch 续作复用 held_runner；首发与 restart 重建
@@ -3789,6 +4757,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     inp.cancel_flag.clone(),
                     inp.staging.clone(),
                     &inp.step_tools,
+                    &inp.read_path_allowlist,
+                    inp.prompt_token_budget,
+                    inp.prompt_token_ratio,
+                    inp.context_overflow_restart,
                     Some(inp.answer_log.clone()),
                     inp.plan_stage.clone(),
                     sub_id.as_deref(),
@@ -3857,7 +4829,9 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         let cancel = inp.cancel_flag.clone();
         // 循环内 deadline（对齐 oh-my-pi）：在 runner 被 move 进 spawn 之前设好。
         let step_timeout_s = crate::controller::specialist_timeout_secs(None);
-        runner.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(step_timeout_s));
+        runner.set_deadline(
+            std::time::Instant::now() + std::time::Duration::from_secs(step_timeout_s),
+        );
         let mut run_handle = tokio::spawn(async move {
             let result = runner.run_turn_gated(&[Message::user(prompt)], None).await;
             let tool_count = runner.last_turn_tool_count;
@@ -3910,7 +4884,8 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         Ok((returned, Err(e), tool_count, tool_summary)) => {
                             // 失败路径不复用 runner：context 可能带着半截
                             // 脏 turn；redo 环对 Err 也只会 break 出去，
-                            // 这里直接丢弃。
+                            // 这里直接丢弃。丢之前先留存 usage。
+                            last_failed_usage = Some(returned.total_usage().clone());
                             drop(returned);
                             // ── 死循环熔断的降级采纳 ──────────────────
                             //
@@ -3942,6 +4917,25 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                                     attempt = Ok((adopted, tool_count, tool_summary));
                                     break;
                                 }
+                            }
+                            if let crate::error::AgentError::DeadlineExceeded {
+                                elapsed_secs,
+                                tool_rounds,
+                                last_tool,
+                            } = &e
+                            {
+                                let last_info = last_tool
+                                    .as_ref()
+                                    .map(|t| format!("，最后调用的工具是 '{t}'"))
+                                    .unwrap_or_default();
+                                attempt = Err(StepFail::Failed(format!(
+                                    "subagent '{speaker}' 执行超时（已运行 {elapsed_secs}s，完成了 {tool_rounds} 轮工具调用{last_info}，未能及时输出正文）"
+                                )));
+                                break;
+                            }
+                            if let Some(detail) = context_overflow_detail(&e) {
+                                attempt = Err(StepFail::ContextOverflow(detail));
+                                break;
                             }
                             // Gate 重试耗尽 → 被 advisor 终止：发
                             // AdvisorTerminated（带 sub_id）让 UI 显示
@@ -4090,7 +5084,6 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     engine,
                     &inp.event_tx,
                     &inp.main_topic,
-
                     &speaker,
                     &role_responsibilities,
                     &inp.prompt,
@@ -4129,8 +5122,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     // 处置分流：patch（默认）复用 held_runner 在同一
                     // subsession 续作修补；restart 清空槽位，下一次循环
                     // 重建全新 subagent（仅在 advisor 判定续作不如重做时）。
-                    let restart =
-                        matches!(v.remedy, crate::advisor_monitor::Remedy::Restart);
+                    let restart = matches!(v.remedy, crate::advisor_monitor::Remedy::Restart);
                     if restart {
                         held_runner = None;
                     }
@@ -4149,15 +5141,21 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     let feedback = if v.hint.is_empty() {
                         v.reason.clone()
                     } else {
-                        format!("{}
-处理建议：{}", v.reason, v.hint)
+                        format!(
+                            "{}
+处理建议：{}",
+                            v.reason, v.hint
+                        )
                     };
                     prompt_for_turn = if restart {
                         // 全新 subagent 没有上下文：重发原始任务 + 反馈。
-                        format!("{}
+                        format!(
+                            "{}
 
 【上轮审查反馈】
-{}", inp.prompt, feedback)
+{}",
+                            inp.prompt, feedback
+                        )
                     } else {
                         // 续作：原始任务与上轮产出已在 runner context 里，
                         // 只发反馈 + 修补指令——重发原始任务会让模型误以为
@@ -4171,10 +5169,16 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     };
                     continue;
                 }
-                break Ok(SpeakerOut { response: annotated, tools: tool_summary });
+                break Ok(SpeakerOut {
+                    response: annotated,
+                    tools: tool_summary,
+                });
             }
             (other, _) => {
-                break other.map(|(r, _, t)| SpeakerOut { response: r, tools: t })
+                break other.map(|(r, _, t)| SpeakerOut {
+                    response: r,
+                    tools: t,
+                })
             }
         }
     };
@@ -4199,7 +5203,8 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                 });
             }
         }
-        Err(StepFail::Failed(msg)) => {
+        Err(failure @ (StepFail::Failed(_) | StepFail::ContextOverflow(_))) => {
+            let msg = failure.message();
             // 失败时 sub_sink 的 trace 在 TurnEnd 前断了——补写终结
             // 事件，让子会话日志有明确结尾（同 delegate 路径）。
             if let Some(sink) = &sub_sink {
@@ -4209,12 +5214,27 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         &speaker,
                         &inp.session_id.clone().unwrap_or_default(),
                     ),
-                    total_input: 0,
-                    total_output: 0,
-                    total_thinking: 0,
-                    total_cache_read: 0,
-                    total_cache_write: 0,
-                    elapsed_ms: 0,
+                    total_input: last_failed_usage
+                        .as_ref()
+                        .map(|u| u.input_tokens)
+                        .unwrap_or(0),
+                    total_output: last_failed_usage
+                        .as_ref()
+                        .map(|u| u.output_tokens)
+                        .unwrap_or(0),
+                    total_thinking: last_failed_usage
+                        .as_ref()
+                        .map(|u| u.thinking_tokens)
+                        .unwrap_or(0),
+                    total_cache_read: last_failed_usage
+                        .as_ref()
+                        .map(|u| u.cache_read_tokens)
+                        .unwrap_or(0),
+                    total_cache_write: last_failed_usage
+                        .as_ref()
+                        .map(|u| u.cache_write_tokens)
+                        .unwrap_or(0),
+                    elapsed_ms: speaker_turn_started.elapsed().as_millis() as u64,
                 });
             }
             let _ = inp.event_tx.send(ChatEvent::RoleFinished {
@@ -4285,7 +5305,10 @@ async fn run_workflow_serial(
         for (step_id, output_key, output) in &state.completed {
             done_steps.insert(step_id.as_str());
             if let Some(key) = output_key {
-                vars.insert(key.clone(), crate::controller::strip_review_annotation(output));
+                vars.insert(
+                    key.clone(),
+                    crate::controller::strip_review_annotation(output),
+                );
                 keyed.insert(key.clone(), output.clone());
             }
             last_output = output.clone();
@@ -4295,7 +5318,10 @@ async fn run_workflow_serial(
     for round in 0..wf.effective_max_rounds() {
         // 跨 step 循环（loop_until）的每轮状态：迭代计数按 loop_until
         // 所在 step 的完成次数计（key = step 下标）；pending_feedback
-        // 是跳回时预置进目标 step prompt 的"上轮审查反馈"批注。
+        // 是跳回时预置进目标 step prompt 的**唯一**跨轮语义输入。目标
+        // step 会重新调用 `run_step_speaker`，所以这不是 held runner 的
+        // 续作：每次 doc_write / proofread 都是新的 subsession，只重读
+        // 当前文件并消费本轮反馈。
         let mut loop_iters: HashMap<usize, usize> = HashMap::new();
         let mut pending_feedback: Option<String> = None;
         let mut idx = 0;
@@ -4305,8 +5331,35 @@ async fn run_workflow_serial(
                 let slug = vars.get("plan_out").cloned().unwrap_or_default();
                 match run_learn_control_step(step, &slug, ctx, answer_log).await {
                     Ok(Some(output)) => {
-                        last_output = output.clone(); ckpt.record_step(&step.id, step.output_key.as_deref(), &output);
-                        idx += 1; continue;
+                        last_output = output.clone();
+                        ckpt.record_step(&step.id, step.output_key.as_deref(), &output);
+                        // 确定性产出同样参与 loop_until 返工判定（与模型步
+                        // 共用 serial_loop_decision，语义必须保持一致、同步
+                        // 演进）：quiz 判错 → 产出末行 QUIZ_FAIL 不满足
+                        // loop_until，按 loop_back_routes 跳回 doc 增强文档
+                        // 并重考；read_confirm 无 loop_until，直通 Advance，
+                        // 行为与旧版（直接 idx += 1）一致。
+                        match serial_loop_decision(
+                            wf,
+                            step,
+                            idx,
+                            &last_output,
+                            &mut loop_iters,
+                            &vars,
+                            &review_engine,
+                            ctx,
+                            topic,
+                        )
+                        .await
+                        {
+                            Ok(SerialLoopNav::Advance) => idx += 1,
+                            Ok(SerialLoopNav::Rework(target)) => {
+                                pending_feedback = Some(last_output.clone());
+                                idx = target;
+                            }
+                            Err(msg) => return WfOutcome::Failed(msg),
+                        }
+                        continue;
                     }
                     Ok(None) => {}
                     Err(e) => return WfOutcome::Failed(format!("step '{}': {e}", step.id)),
@@ -4434,10 +5487,7 @@ async fn run_workflow_serial(
                         // 下游 step 用 {{父级变量名}} 取用。只进 vars
                         // 不进 keyed（见 `WorkflowStepDef::export`）。
                         for (var, value) in exported {
-                            vars.insert(
-                                var,
-                                crate::controller::strip_review_annotation(&value),
-                            );
+                            vars.insert(var, crate::controller::strip_review_annotation(&value));
                         }
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
                             wf_id: wf_id.to_string(),
@@ -4457,7 +5507,10 @@ async fn run_workflow_serial(
                 }
                 if let Some(key) = &step.output_key {
                     // 监察批注不进 vars（同主路径）。
-                    vars.insert(key.clone(), crate::controller::strip_review_annotation(&last_output));
+                    vars.insert(
+                        key.clone(),
+                        crate::controller::strip_review_annotation(&last_output),
+                    );
                     keyed.insert(key.clone(), last_output.clone());
                 }
                 ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
@@ -4471,7 +5524,10 @@ async fn run_workflow_serial(
                 let mut probe_vars = vars.clone();
                 probe_vars.insert("step_id".into(), step.id.clone());
                 let task_text = wf.render_task(step, &probe_vars);
-                step.active_roles(vars.get("topic").map(|s| s.as_str()).unwrap_or(""), &task_text)
+                step.active_roles(
+                    vars.get("topic").map(|s| s.as_str()).unwrap_or(""),
+                    &task_text,
+                )
             };
             for s in &skipped_speakers {
                 let _ = ctx.event_tx.send(ChatEvent::Status {
@@ -4486,6 +5542,9 @@ async fn run_workflow_serial(
             // `serial_loop_rework_then_pass` 里同时出现 VERDICT: FAIL 与
             // VERDICT: PASS 两轮内容）。
             let mut speaker_outputs: Vec<(String, String)> = Vec::new();
+            // context-overflow fresh restarts are bounded per step and do not
+            // reset loop_iters, token accounting, or dispatch budget.
+            let mut context_overflow_restarts = 0usize;
             for speaker in active_speakers {
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
                     return WfOutcome::Cancelled;
@@ -4493,13 +5552,13 @@ async fn run_workflow_serial(
                 let mut step_vars = vars.clone();
                 step_vars.insert("step_id".into(), step.id.clone());
                 step_vars.insert("speaker".into(), speaker.clone());
-                let mut base_prompt = wf.render_task(step, &step_vars);
+                let clean_prompt = wf.render_task(step, &step_vars);
+                let mut base_prompt = clean_prompt.clone();
                 // 循环返工批注：跳回目标 step 的第一个 speaker 的 prompt
                 // = 渲染后的 task + 上轮审查反馈（loop step 的产出）。
                 if step_transcript.is_empty() {
                     if let Some(feedback) = pending_feedback.take() {
-                        base_prompt =
-                            format!("{base_prompt}\n\n【上轮审查反馈】\n{feedback}");
+                        base_prompt = format!("{base_prompt}\n\n【上轮审查反馈】\n{feedback}");
                     }
                 }
                 let full_prompt = if step_transcript.is_empty() {
@@ -4536,12 +5595,43 @@ async fn run_workflow_serial(
                         topic.to_string(),
                     );
                     dispatch.plan_stage = plan_stage.clone();
+                    dispatch.read_path_allowlist = step.read_path_allowlist.clone();
+                    dispatch.prompt_token_budget =
+                        step.prompt_token_budget.filter(|budget| *budget > 0);
+                    dispatch.prompt_token_ratio = step.prompt_token_ratio;
+                    dispatch.context_overflow_restart = step.context_overflow_restart;
                     dispatch.step_max_chars = step.output_contract.max_chars;
                     dispatch.step_has_output_contract = step_has_output_contract(step);
                     dispatch.review_constraints = step_review_constraints(step);
                     let (mut response, tools_called) = match run_step_speaker(dispatch).await {
                         Ok(o) => (o.response, o.tools),
                         Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
+                        Err(StepFail::ContextOverflow(detail)) => {
+                            let max_restarts = step.context_overflow_max_restarts.min(3);
+                            if step.context_overflow_restart
+                                && context_overflow_restarts < max_restarts
+                            {
+                                context_overflow_restarts += 1;
+                                let _ = ctx.event_tx.send(ChatEvent::Status {
+                                    message: format!(
+                                        "↻ step '{}' speaker '{}' 发生 context overflow，\
+                                         仅保留主题和文件重新启动（第 {}/{} 次）",
+                                        step.id, speaker, context_overflow_restarts, max_restarts
+                                    ),
+                                });
+                                // Never carry pending feedback, the previous
+                                // step transcript, or the failed runner into
+                                // this retry. The static task is safe to keep;
+                                // all mutable truth is reread from files.
+                                prompt =
+                                    context_overflow_restart_prompt(step, topic, &clean_prompt);
+                                continue;
+                            }
+                            return WfOutcome::Failed(format!(
+                                "step '{}' speaker '{}': context overflow after {} fresh restart(s): {}",
+                                step.id, speaker, context_overflow_restarts, detail
+                            ));
+                        }
                         Err(StepFail::Failed(e)) => {
                             return WfOutcome::Failed(format!(
                                 "step '{}' speaker '{}': {e}",
@@ -4585,7 +5675,7 @@ async fn run_workflow_serial(
                         continue;
                     }
                     // 工具使用行为（require_tools / require_tools_any / tool_call_limits）：
-            // 查它**做了什么**（output_contract 只能查它说了什么）。
+                    // 查它**做了什么**（output_contract 只能查它说了什么）。
                     // 放在 output_contract 之前——「根本没调工具」比「正文缺字样」更根本，
                     // 批注也更有指导性。
                     if let Err(reason) = check_tool_usage(step, &tools_called) {
@@ -4660,7 +5750,9 @@ async fn run_workflow_serial(
                             ctx.session_id.clone().unwrap_or_default(),
                             speaker
                         );
-                        if let Err(reason) = check_symbols_output(&response, &ctx.cwd, &symbol_scope) {
+                        if let Err(reason) =
+                            check_symbols_output(&response, &ctx.cwd, &symbol_scope)
+                        {
                             if attempt >= step.max_retries {
                                 return WfOutcome::Failed(format!(
                                     "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
@@ -4672,8 +5764,9 @@ async fn run_workflow_serial(
                                 step = %step.id, speaker = %speaker, attempt,
                                 "workflow step referenced unresolvable symbols; retrying"
                             );
-                            step_transcript
-                                .push_str("[验收批注]: 引用了仓库中不存在的代码符号，已要求核对后重做\n");
+                            step_transcript.push_str(
+                                "[验收批注]: 引用了仓库中不存在的代码符号，已要求核对后重做\n",
+                            );
                             prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
                             continue;
                         }
@@ -4689,9 +5782,7 @@ async fn run_workflow_serial(
                             &speaker,
                         );
                         if let Err(reason) = crate::citation_check::check_citations_observed(
-                            &response,
-                            &scope,
-                            &ctx.cwd,
+                            &response, &scope, &ctx.cwd,
                         ) {
                             if attempt >= step.max_retries {
                                 return WfOutcome::Failed(format!(
@@ -4795,97 +5886,38 @@ async fn run_workflow_serial(
             if let Some(key) = &step.output_key {
                 // 监察批注（⚠️ [监察审查]…）不进 vars：它给人看，
                 // 穿给下游 step / 嵌套 workflow 是污染。
-                vars.insert(key.clone(), crate::controller::strip_review_annotation(&last_output));
+                vars.insert(
+                    key.clone(),
+                    crate::controller::strip_review_annotation(&last_output),
+                );
                 keyed.insert(key.clone(), last_output.clone());
             }
             ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
             // 跨 step 循环：产出不含 loop_until 子串 → 跳回 loop_back_to
             // （缺省 = 自己）重做，本 step 产出作为批注预置进目标 prompt；
             // 迭代上限 max_iterations（缺省 3，硬上限 10），耗尽即失败。
-            if let Some(cond) = &step.loop_until {
-                // 显式声明了熔断标记的 step 才有「不可返工」终局；
-                // 缺省一律返工（见 `loop_abort_on` 文档）。
-                if let Some(marker) = &step.loop_abort_on {
-                    if last_output.contains(marker.as_str()) {
-                        return WfOutcome::Failed(format!(
-                            "step '{}' 终止 workflow：{}",
-                            step.id,
-                            last_output.chars().take(500).collect::<String>()
-                        ));
-                    }
-                }
-                if !last_output.contains(cond.as_str()) {
-                    let count = {
-                        let c = loop_iters.entry(idx).or_insert(0);
-                        *c += 1;
-                        *c
-                    };
-                    let max = step.max_iterations.unwrap_or(3).min(10);
-                    if count >= max {
-                        // 「不可放行」标记：gate 已给出带证据的硬拒绝
-                        // （如 VERDICT: REJECT），不许 advisor 复核把
-                        // 失败吞成成功，直接判死（见 loop_no_release_on）。
-                        if let Some(marker) = &step.loop_no_release_on {
-                            if last_output.contains(marker.as_str()) {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
-                                     （已达 max_iterations={max}），产出含不可放行标记「{marker}」\
-                                     （跳过 advisor 复核），最后一次产出摘要：{}",
-                                    step.id,
-                                    last_output.chars().take(200).collect::<String>()
-                                ));
-                            }
-                        }
-                        // 判死前最后一道 advisor 语义复核：把「被返工的那份
-                        // 产出」+「未消化的评审意见」交给 advisor，判定实质
-                        // 合格则放行进入下游（见 loop_exhausted_last_resort_review）。
-                        let target_id = rework_target_id(step, &last_output);
-                        let artifact = wf
-                            .steps
-                            .iter()
-                            .find(|s| s.id == target_id)
-                            .and_then(|s| s.output_key.as_ref())
-                            .and_then(|k| vars.get(k).cloned())
-                            .unwrap_or_default();
-                        if loop_exhausted_last_resort_review(
-                            &review_engine,
-                            &ctx.event_tx,
-                            topic,
-                            &step.id,
-                            cond,
-                            count,
-                            &artifact,
-                            &last_output,
-                        )
-                        .await
-                        {
-                            idx += 1;
-                            continue;
-                        }
-                        let summary: String = last_output.chars().take(200).collect();
-                        return WfOutcome::Failed(format!(
-                            "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
-                             （已达 max_iterations={max}），最后一次产出摘要：{summary}",
-                            step.id
-                        ));
-                    }
-                    let target_id = rework_target_id(step, &last_output);
-                    let target_idx = wf
-                        .steps
-                        .iter()
-                        .position(|s| s.id == target_id)
-                        .expect("validate 已保证 loop_back_to/loop_back_routes 指向存在的 step");
-                    let _ = ctx.event_tx.send(ChatEvent::Status {
-                        message: format!(
-                            "↩ 第 {count} 轮返工：step '{}' 产出未满足循环条件\
-                             「{cond}」，跳回 '{target_id}' 重做",
-                            step.id
-                        ),
-                    });
+            // 判定逻辑抽在 serial_loop_decision，learn_loop 的确定性步
+            // （read_confirm/quiz）共用同一套语义，两处改动须同步。
+            match serial_loop_decision(
+                wf,
+                step,
+                idx,
+                &last_output,
+                &mut loop_iters,
+                &vars,
+                &review_engine,
+                ctx,
+                topic,
+            )
+            .await
+            {
+                Ok(SerialLoopNav::Advance) => {}
+                Ok(SerialLoopNav::Rework(target_idx)) => {
                     pending_feedback = Some(last_output.clone());
                     idx = target_idx;
                     continue;
                 }
+                Err(msg) => return WfOutcome::Failed(msg),
             }
             idx += 1;
         }
@@ -4897,7 +5929,64 @@ async fn run_workflow_serial(
 /// One step failure signal from a spawned DAG task.
 enum StepFail {
     Cancelled,
+    /// The provider rejected the request because its context window was
+    /// exceeded. This is kept distinct from ordinary failures so a step
+    /// may opt into a fresh, file-based restart.
+    ContextOverflow(String),
     Failed(String),
+}
+
+impl StepFail {
+    fn message(&self) -> String {
+        match self {
+            Self::Cancelled => "cancelled".to_string(),
+            Self::ContextOverflow(detail) => format!("context overflow: {detail}"),
+            Self::Failed(message) => message.clone(),
+        }
+    }
+}
+
+/// 契约式 topic 的 `key=value` 行（整行只有一个 `key=value`，key 为标识符）。
+fn parse_topic_kv(topic: &str) -> Vec<(String, String)> {
+    topic
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.trim().split_once('=')?;
+            let ok = !k.is_empty()
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !v.trim().is_empty()
+                && !v.trim().contains(char::is_whitespace);
+            ok.then(|| (k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// 读取 `fan_out` 的元素 id 列表（保持文件顺序）。
+fn load_fan_out_items(
+    fo: &FanOut,
+    vars: &HashMap<String, String>,
+    cwd: &Path,
+) -> Result<Vec<String>, String> {
+    let mut path = fo.file.clone();
+    for (k, v) in vars {
+        path = path.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    let full = cwd.join(&path);
+    let text = std::fs::read_to_string(&full).map_err(|e| format!("{}: {e}", full.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", full.display()))?;
+    let arr = json
+        .get(&fo.items)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{} 缺少数组字段 `{}`", full.display(), fo.items))?;
+    arr.iter()
+        .map(|it| {
+            it.get(&fo.id_key)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| format!("元素缺少字符串字段 `{}`", fo.id_key))
+        })
+        .collect()
 }
 
 /// Everything a single DAG step task owns (spawned onto a `JoinSet`,
@@ -5091,14 +6180,14 @@ async fn run_dag_step(
         loop {
             // 同串行引擎：require_plan_submit 的 step 每次尝试新建
             // PlanStage，引擎据此判断 plan 是否真的提交成功。
-            let plan_stage: Option<crate::controller::SharedPlanStage> =
-                if step.require_plan_submit {
-                    Some(Arc::new(parking_lot::RwLock::new(
-                        crate::controller::PlanStage::Normal,
-                    )))
-                } else {
-                    None
-                };
+            let plan_stage: Option<crate::controller::SharedPlanStage> = if step.require_plan_submit
+            {
+                Some(Arc::new(parking_lot::RwLock::new(
+                    crate::controller::PlanStage::Normal,
+                )))
+            } else {
+                None
+            };
             let dispatch = SpeakerDispatch {
                 speaker: speaker.clone(),
                 step_id: step.id.clone(),
@@ -5123,6 +6212,10 @@ async fn run_dag_step(
                 staging: inp.staging.clone(),
                 dispatch_budget: inp.dispatch_budget.clone(),
                 step_tools: step.tools.clone(),
+                read_path_allowlist: step.read_path_allowlist.clone(),
+                prompt_token_budget: step.prompt_token_budget.filter(|budget| *budget > 0),
+                prompt_token_ratio: step.prompt_token_ratio,
+                context_overflow_restart: step.context_overflow_restart,
                 step_max_chars: step.output_contract.max_chars,
                 step_has_output_contract: step_has_output_contract(step),
                 review_constraints: step_review_constraints(step),
@@ -5134,6 +6227,7 @@ async fn run_dag_step(
                 Err(e) => {
                     return Err(match e {
                         StepFail::Cancelled => StepFail::Cancelled,
+                        StepFail::ContextOverflow(detail) => StepFail::ContextOverflow(detail),
                         StepFail::Failed(msg) => StepFail::Failed(format!(
                             "step '{}' speaker '{}': {msg}",
                             step.id, speaker
@@ -5236,9 +6330,8 @@ async fn run_dag_step(
                         step = %step.id, speaker = %speaker, attempt,
                         "workflow step cited unobserved lines; retrying"
                     );
-                    step_transcript.push_str(
-                        "[验收批注]: 行号引用落在没读到过的行上，已带真实内容要求改正\n",
-                    );
+                    step_transcript
+                        .push_str("[验收批注]: 行号引用落在没读到过的行上，已带真实内容要求改正\n");
                     prompt = format!("{full_prompt}\n\n[验收批注]\n{reason}");
                     continue;
                 }
@@ -5274,12 +6367,12 @@ async fn run_dag_step(
                 } else {
                     attempt += 1;
                     tracing::warn!(
-                        step = %step.id,
-                        speaker = %speaker,
-                        attempt,
-                        reason = %reason,
-                    "workflow step output failed output_contract; retrying"
-                );
+                            step = %step.id,
+                            speaker = %speaker,
+                            attempt,
+                            reason = %reason,
+                        "workflow step output failed output_contract; retrying"
+                    );
                     let annotation =
                         format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
                     step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
@@ -5359,6 +6452,11 @@ async fn run_workflow_dag(
 
     let mut vars: HashMap<String, String> = HashMap::new();
     vars.insert("topic".into(), topic.to_string());
+    // 契约式 topic（`slug=xxx` 逐行）：`key=value` 行注入 vars，
+    // 供 `fan_out.file` 等 `{{slug}}` 取用；不覆盖已有变量。
+    for (k, v) in parse_topic_kv(topic) {
+        vars.entry(k).or_insert(v);
+    }
     // step_id -> last_output, used to resolve the final return value.
     let mut outputs: HashMap<String, String> = HashMap::new();
     // output_key → 产出（原始文本），供嵌套调用方的 output_from 选取。
@@ -5371,7 +6469,10 @@ async fn run_workflow_dag(
             done_steps.insert(step_id.as_str());
             outputs.insert(step_id.clone(), output.clone());
             if let Some(key) = output_key {
-                vars.insert(key.clone(), crate::controller::strip_review_annotation(output));
+                vars.insert(
+                    key.clone(),
+                    crate::controller::strip_review_annotation(output),
+                );
                 keyed.insert(key.clone(), output.clone());
             }
         }
@@ -5398,6 +6499,9 @@ async fn run_workflow_dag(
                 std::collections::BTreeMap<String, String>,
             );
             let mut set: JoinSet<Result<DagStepOk, StepFail>> = JoinSet::new();
+            // fan_out step 下标 → 派发的元素个数；全部完成才记一次 checkpoint。
+            let mut fan_out_expected: HashMap<usize, usize> = HashMap::new();
+            let mut fan_out_got: HashMap<usize, Vec<String>> = HashMap::new();
             for &idx in wave {
                 if done_steps.contains(wf.steps[idx].id.as_str()) {
                     continue;
@@ -5426,43 +6530,77 @@ async fn run_workflow_dag(
                         continue;
                     }
                 }
-                let inp = DagStepInput {
-                    wf: wf_arc.clone(),
-                    step_idx: idx,
-                    total,
-                    round,
-                    vars: vars.clone(),
-                    wf_id: wf_id.to_string(),
-                    root_wf_id: ctx.root_wf_id.clone(),
-                    merged: ctx.merged.clone(),
-                    resolver: ctx.resolver.clone(),
-                    default_params: ctx.default_params.clone(),
-                    cancel_flag: ctx.cancel_flag.clone(),
-                    cwd: ctx.cwd.clone(),
-                    event_tx: ctx.event_tx.clone(),
-                    turn_cancel_flag: ctx.turn_cancel_flag.clone(),
-                    agent_pause_gate: ctx.agent_pause_gate.clone(),
-                    depth: ctx.depth,
-                    subsession_store: ctx.subsession_store.clone(),
-                    session_id: ctx.session_id.clone(),
-                    advisor_gate: ctx.advisor_gate.clone(),
-                    review_engine: review_engine.clone(),
-                    advisor_pause: ctx.advisor_pause.clone(),
-                    staging: ctx.staging.clone(),
-                    dispatch_budget: ctx.dispatch_budget.clone(),
-                    feedback: pending_feedback.remove(wf.steps[idx].id.as_str()),
-                    answer_log: answer_log.clone(),
+                // 动态扇出：每个元素一个任务，共用同一个信号量（对象池）。
+                let item_vars: Vec<Option<(usize, String)>> = match &wf.steps[idx].fan_out {
+                    None => vec![None],
+                    Some(fo) => match load_fan_out_items(fo, &vars, &ctx.cwd) {
+                        Ok(ids) => ids.into_iter().enumerate().map(|(n, id)| Some((n + 1, id))).collect(),
+                        Err(e) => {
+                            set.abort_all();
+                            return WfOutcome::Failed(format!(
+                                "step '{}' fan_out 读取失败：{e}",
+                                wf.steps[idx].id
+                            ));
+                        }
+                    },
                 };
-                let sem = sem.clone();
-                set.spawn(async move {
-                    // Hold a permit for the whole step so a wide wave
-                    // can't launch more than `workflow_concurrency()`
-                    // specialists at once. Semaphore is never closed,
-                    // so `acquire_owned` only errors on shutdown — treat
-                    // that as "run anyway" rather than fail the step.
-                    let _permit = sem.acquire_owned().await.ok();
-                    run_dag_step(inp).await
-                });
+                if wf.steps[idx].fan_out.is_some() {
+                    fan_out_expected.insert(idx, item_vars.len());
+                    let _ = ctx.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "[workflow '{}'] step '{}' 扇出 {} 个任务（并发上限 {}，其余排队）",
+                            wf.name,
+                            wf.steps[idx].id,
+                            item_vars.len(),
+                            workflow_concurrency()
+                        ),
+                    });
+                }
+                let feedback = pending_feedback.remove(wf.steps[idx].id.as_str());
+                for item in item_vars {
+                    let mut step_vars = vars.clone();
+                    if let Some((n, id)) = &item {
+                        step_vars.insert("item_id".into(), id.clone());
+                        step_vars.insert("item_index".into(), n.to_string());
+                    }
+                    let inp = DagStepInput {
+                        wf: wf_arc.clone(),
+                        step_idx: idx,
+                        total,
+                        round,
+                        vars: step_vars,
+                        wf_id: wf_id.to_string(),
+                        root_wf_id: ctx.root_wf_id.clone(),
+                        merged: ctx.merged.clone(),
+                        resolver: ctx.resolver.clone(),
+                        default_params: ctx.default_params.clone(),
+                        cancel_flag: ctx.cancel_flag.clone(),
+                        cwd: ctx.cwd.clone(),
+                        event_tx: ctx.event_tx.clone(),
+                        turn_cancel_flag: ctx.turn_cancel_flag.clone(),
+                        agent_pause_gate: ctx.agent_pause_gate.clone(),
+                        depth: ctx.depth,
+                        subsession_store: ctx.subsession_store.clone(),
+                        session_id: ctx.session_id.clone(),
+                        advisor_gate: ctx.advisor_gate.clone(),
+                        review_engine: review_engine.clone(),
+                        advisor_pause: ctx.advisor_pause.clone(),
+                        staging: ctx.staging.clone(),
+                        dispatch_budget: ctx.dispatch_budget.clone(),
+                        feedback: feedback.clone(),
+                        answer_log: answer_log.clone(),
+                    };
+                    let sem = sem.clone();
+                    set.spawn(async move {
+                        // Hold a permit for the whole step so a wide wave
+                        // can't launch more than `workflow_concurrency()`
+                        // specialists at once. Semaphore is never closed,
+                        // so `acquire_owned` only errors on shutdown — treat
+                        // that as "run anyway" rather than fail the step.
+                        let _permit = sem.acquire_owned().await.ok();
+                        run_dag_step(inp).await
+                    });
+                }
             }
 
             // Collect the whole wave; merge outputs into `vars` only
@@ -5474,14 +6612,30 @@ async fn run_workflow_dag(
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(Ok((step_idx, step_id, output_key, out, exported))) => {
-                        ckpt.record_step(&step_id, output_key.as_deref(), &out);
-                        outputs.insert(step_id, out.clone());
                         wave_exports.extend(exported);
-                        wave_results.push((step_idx, output_key, out));
+                        if let Some(&expected) = fan_out_expected.get(&step_idx) {
+                            let got = fan_out_got.entry(step_idx).or_default();
+                            got.push(out);
+                            if got.len() < expected {
+                                continue;
+                            }
+                            let joined = got.join("\n\n");
+                            ckpt.record_step(&step_id, output_key.as_deref(), &joined);
+                            outputs.insert(step_id, joined.clone());
+                            wave_results.push((step_idx, output_key, joined));
+                        } else {
+                            ckpt.record_step(&step_id, output_key.as_deref(), &out);
+                            outputs.insert(step_id, out.clone());
+                            wave_results.push((step_idx, output_key, out));
+                        }
                     }
                     Ok(Err(StepFail::Cancelled)) => {
                         set.abort_all();
                         return WfOutcome::Cancelled;
+                    }
+                    Ok(Err(StepFail::ContextOverflow(detail))) => {
+                        set.abort_all();
+                        return WfOutcome::Failed(format!("context overflow: {detail}"));
                     }
                     Ok(Err(StepFail::Failed(msg))) => {
                         set.abort_all();
@@ -5489,9 +6643,7 @@ async fn run_workflow_dag(
                     }
                     Err(join_err) => {
                         set.abort_all();
-                        return WfOutcome::Failed(format!(
-                            "workflow step task failed: {join_err}"
-                        ));
+                        return WfOutcome::Failed(format!("workflow step task failed: {join_err}"));
                     }
                 }
             }
@@ -5519,7 +6671,9 @@ async fn run_workflow_dag(
             let mut rework_notes: Vec<String> = Vec::new();
             for (sidx, _key, out) in &wave_results {
                 let step = &wf.steps[*sidx];
-                let Some(cond) = &step.loop_until else { continue };
+                let Some(cond) = &step.loop_until else {
+                    continue;
+                };
                 // 熔断判定必须在 loop_until 保护内：此前它套在循环外、
                 // 对 wave 里**每个** step 生效，任何产出里出现该字符串
                 // 的无关 step（评审引用裁决原文就够）都能判死整条
@@ -5753,7 +6907,12 @@ mod tests {
             from_table.contains(&"任务清单") && from_table.contains(&"计划"),
             "{from_table:?}"
         );
-        for name in ["implementation_plan", "task_refine", "design_and_plan", "feature_design"] {
+        for name in [
+            "implementation_plan",
+            "task_refine",
+            "design_and_plan",
+            "feature_design",
+        ] {
             assert!(is_planning_workflow(name), "{name} 应是规划流程");
             assert!(
                 deliverables_produced_by(name).contains(&"任务清单"),
@@ -5770,8 +6929,14 @@ mod tests {
     fn learn_does_not_close_the_task_list_deliverable() {
         let closes = deliverables_produced_by("learn");
         assert!(closes.contains(&"教程 / 学习材料"), "{closes:?}");
-        assert!(!closes.contains(&"任务清单"), "learn 产不出任务清单: {closes:?}");
-        assert!(!closes.contains(&"计划"), "learn 产不出任务清单/计划: {closes:?}");
+        assert!(
+            !closes.contains(&"任务清单"),
+            "learn 产不出任务清单: {closes:?}"
+        );
+        assert!(
+            !closes.contains(&"计划"),
+            "learn 产不出任务清单/计划: {closes:?}"
+        );
         // learn_loop 同理（它多了知识点拆解，但拆的是知识点不是工程任务）。
         let closes = deliverables_produced_by("learn_loop");
         assert!(closes.contains(&"教程 / 学习材料"), "{closes:?}");
@@ -5837,7 +7002,10 @@ when_any = ["ui", "界面", "前端"]
         wf.validate().unwrap();
         // 声明过的角色仍然全都列出来（validate 的角色存在性检查、UI
         // 列举要看得到可选角色）。
-        assert_eq!(wf.speaker_roles(), vec!["architect", "programmer", "designer"]);
+        assert_eq!(
+            wf.speaker_roles(),
+            vec!["architect", "programmer", "designer"]
+        );
 
         // 实测那次的 topic：编排 jemalloc 源码学习路径，没有界面。
         let (active, skipped) = wf.steps[0].active_roles(
@@ -5847,7 +7015,11 @@ when_any = ["ui", "界面", "前端"]
         assert_eq!(active, vec!["architect", "programmer"], "designer 不该被派");
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].role, "designer");
-        assert!(skipped[0].reason.contains("topic 未命中"), "{:?}", skipped[0]);
+        assert!(
+            skipped[0].reason.contains("topic 未命中"),
+            "{:?}",
+            skipped[0]
+        );
     }
 
     #[test]
@@ -6027,7 +7199,11 @@ prompt = "x"
     fn concurrent_steps_in_a_wave_are_read_only() {
         const READ_ONLY: &[&str] = &["read", "search", "code_graph"];
         /// (workflow 名, step id 前缀) —— 写各自独立路径，已核实无竞态。
-        const EXEMPT: &[(&str, &str)] = &[("init_project", "overlay_")];
+        const EXEMPT: &[(&str, &str)] = &[
+            ("init_project", "overlay_"),
+            // fan_out 的每个派发只写 sections/<自己的 k_id>.md，路径互不重叠。
+            ("doc_review_loop", "write_"),
+        ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/workflows");
         let entries = std::fs::read_dir(&dir).expect("config/workflows");
         let mut checked = 0usize;
@@ -6037,11 +7213,15 @@ prompt = "x"
                 continue;
             }
             let raw = std::fs::read_to_string(&path).unwrap();
-            let Ok(wf) = toml::from_str::<WorkflowDef>(&raw) else { continue };
+            let Ok(wf) = toml::from_str::<WorkflowDef>(&raw) else {
+                continue;
+            };
             if !wf.uses_dependency_dag() {
                 continue;
             }
-            let Ok(waves) = compute_waves(&wf.steps) else { continue };
+            let Ok(waves) = compute_waves(&wf.steps) else {
+                continue;
+            };
             for wave in &waves {
                 // 只看真正会并发的（同 wave 有 ≥2 个非嵌套 step）。
                 let concurrent: Vec<&WorkflowStepDef> = wave
@@ -6078,7 +7258,10 @@ prompt = "x"
                 }
             }
         }
-        assert!(checked > 0, "应至少扫到一组并发 step，实际 0 组（扫描逻辑可能失效）");
+        assert!(
+            checked > 0,
+            "应至少扫到一组并发 step，实际 0 组（扫描逻辑可能失效）"
+        );
     }
 
     /// 仓库里有**两份** workflow 副本：`config/workflows/`（权威）与
@@ -6121,10 +7304,12 @@ prompt = "x"
                 toml::from_str::<WorkflowDef>(raw)
                     .unwrap_or_else(|e| panic!("workflow '{name}' 的 {which} 副本解析失败: {e}"))
             };
-            let (wa, wb) = (parse(&a, "config/workflows"), parse(&b, ".latte/workflows.d"));
-            let ids = |w: &WorkflowDef| -> Vec<String> {
-                w.steps.iter().map(|s| s.id.clone()).collect()
-            };
+            let (wa, wb) = (
+                parse(&a, "config/workflows"),
+                parse(&b, ".latte/workflows.d"),
+            );
+            let ids =
+                |w: &WorkflowDef| -> Vec<String> { w.steps.iter().map(|s| s.id.clone()).collect() };
             assert_eq!(
                 ids(&wa),
                 ids(&wb),
@@ -6216,7 +7401,9 @@ prompt = "x"
                 continue;
             }
             let raw = std::fs::read_to_string(&path).unwrap();
-            let Ok(wf) = toml::from_str::<WorkflowDef>(&raw) else { continue };
+            let Ok(wf) = toml::from_str::<WorkflowDef>(&raw) else {
+                continue;
+            };
             for step in &wf.steps {
                 let req = &step.output_contract.require;
                 for group in EXCLUSIVE {
@@ -6335,7 +7522,6 @@ when_any = ["ui", "界面"]
         assert!(active.contains(&"designer".to_string()));
     }
 
-
     const COND_WF: &str = r#"
 name = "cond"
 [[steps]]
@@ -6389,10 +7575,7 @@ when_any = ["ui", "界面"]
         // 条件 step 没有 output_key → 跳过与执行对下游没有可观察差别。
         let raw = COND_WF.replace("output_key = \"b\"\n", "");
         let wf: WorkflowDef = toml::from_str(&raw).unwrap();
-        assert!(wf
-            .validate()
-            .unwrap_err()
-            .contains("必须声明 output_key"));
+        assert!(wf.validate().unwrap_err().contains("必须声明 output_key"));
     }
 
     #[test]
@@ -6450,7 +7633,8 @@ task = "x"
     }
 
     #[test]
-    fn nested_workflow_step_validation() {        let ok = r#"
+    fn nested_workflow_step_validation() {
+        let ok = r#"
 name = "outer"
 [[steps]]
 id = "explore"
@@ -6533,7 +7717,10 @@ loop_back_to = "a"
         let gate = wf.steps.iter().find(|s| s.id == "g").unwrap();
 
         // 命中标记 → 跳回标记指定的病灶步（只重做便宜的那步）。
-        assert_eq!(rework_target_id(gate, "VERDICT: REJECT\nREWORK: b\n理由…"), "b");
+        assert_eq!(
+            rework_target_id(gate, "VERDICT: REJECT\nREWORK: b\n理由…"),
+            "b"
+        );
         // 没有任何标记 → 回落 loop_back_to（旧行为逐字节不变）。
         assert_eq!(rework_target_id(gate, "VERDICT: REJECT\n理由…"), "a");
     }
@@ -6559,7 +7746,11 @@ loop_until = "OK"
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         let g = wf.steps.iter().find(|s| s.id == "g").unwrap();
         let h = wf.steps.iter().find(|s| s.id == "h").unwrap();
-        assert_eq!(rework_target_id(g, "任何产出"), "a", "有 loop_back_to 就用它");
+        assert_eq!(
+            rework_target_id(g, "任何产出"),
+            "a",
+            "有 loop_back_to 就用它"
+        );
         assert_eq!(rework_target_id(h, "任何产出"), "h", "没配则自环");
     }
 
@@ -6597,6 +7788,46 @@ role = "reviewer"
         assert!(err.contains("loop_until"), "err: {err}");
     }
 
+    /// learn_plan（学习/课程类拆分专用）：与 implementation_plan 的关键差异
+    /// 必须保持——breakdown 不带 require_symbols_resolvable（书目录锚定真实
+    /// 文件路径即可，符号门禁套在目录上是打地鼠：2026-09-17 jemalloc 书目录
+    /// e2e 五轮实测 42→7→19→1→21 不收敛），tasks_json 保留
+    /// require_plan_tasks（路径存在性）；gate 沿用病灶路由返工。
+    #[test]
+    fn learn_plan_uses_path_gate_not_symbol_gate() {
+        let raw = include_str!("../../config/workflows/learn_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("learn_plan should validate");
+        let step = |id: &str| wf.steps.iter().find(|s| s.id == id).expect(id);
+
+        assert!(
+            !step("breakdown").require_symbols_resolvable,
+            "书目录 breakdown 不得带符号回指门禁（目录不点名内部符号）"
+        );
+        assert!(
+            step("tasks_json").require_plan_tasks,
+            "章任务锚定的文件路径必须机械校验存在性"
+        );
+        let gate = step("gate");
+        assert_eq!(gate.loop_until.as_deref(), Some("VERDICT: PASS"));
+        assert_eq!(
+            gate.loop_back_routes
+                .get("REWORK: tasks_json")
+                .map(String::as_str),
+            Some("tasks_json")
+        );
+        // 学习类契约：breakdown prompt 必须带书目录规则与「不点名内部函数」。
+        let p = step("breakdown").task_text();
+        assert!(
+            p.contains("编") && p.contains("章"),
+            "breakdown 需定义编/章结构"
+        );
+        assert!(
+            p.contains("不要点名内部函数"),
+            "breakdown 需禁止点名内部符号"
+        );
+    }
+
     /// implementation_plan 必须把 tasks_json 类病灶路由到 tasks_json——
     /// 这是 P0 修复真正生效的配置面（引擎能力 + 配置利用，缺一不可）。
     #[test]
@@ -6607,12 +7838,16 @@ role = "reviewer"
         let gate = wf.steps.iter().find(|s| s.id == "gate").expect("gate step");
 
         assert_eq!(
-            gate.loop_back_routes.get("REWORK: tasks_json").map(String::as_str),
+            gate.loop_back_routes
+                .get("REWORK: tasks_json")
+                .map(String::as_str),
             Some("tasks_json"),
             "JSON 落地类病灶必须只重做 tasks_json，不得连带重烧 breakdown"
         );
         assert_eq!(
-            gate.loop_back_routes.get("REWORK: breakdown").map(String::as_str),
+            gate.loop_back_routes
+                .get("REWORK: breakdown")
+                .map(String::as_str),
             Some("breakdown"),
             "方案层面病灶回到 breakdown"
         );
@@ -6620,8 +7855,14 @@ role = "reviewer"
         assert_eq!(gate.loop_back_to.as_deref(), Some("breakdown"));
         // gate 的 prompt 必须教会评审输出该标记，否则路由永远命不中。
         let p = gate.task_text();
-        assert!(p.contains("REWORK: tasks_json"), "prompt 需说明 tasks_json 标记");
-        assert!(p.contains("REWORK: breakdown"), "prompt 需说明 breakdown 标记");
+        assert!(
+            p.contains("REWORK: tasks_json"),
+            "prompt 需说明 tasks_json 标记"
+        );
+        assert!(
+            p.contains("REWORK: breakdown"),
+            "prompt 需说明 breakdown 标记"
+        );
     }
 
     /// 修问题 #5（评审独立性）：learn 的校验阶段必须是「审/改/复核」三步
@@ -6640,17 +7881,38 @@ role = "reviewer"
         let verify = step("verify").expect("verify step exists");
         let fix = step("fix").expect("fix step exists");
         let recheck = step("recheck").expect("recheck step exists");
-        assert_eq!(verify.speakers, vec!["reviewer".to_string()], "verify 只有 reviewer 审");
-        assert_eq!(fix.speakers, vec!["programmer".to_string()], "fix 只有 programmer 改");
-        assert_eq!(recheck.speakers, vec!["reviewer".to_string()], "recheck 由 reviewer 独立复核");
+        assert_eq!(
+            verify.speakers,
+            vec!["reviewer".to_string()],
+            "verify 只有 reviewer 审"
+        );
+        assert_eq!(
+            fix.speakers,
+            vec!["programmer".to_string()],
+            "fix 只有 programmer 改"
+        );
+        assert_eq!(
+            recheck.speakers,
+            vec!["reviewer".to_string()],
+            "recheck 由 reviewer 独立复核"
+        );
 
         // 放行门在 recheck（reviewer），不在 fix（programmer）——核心修复点。
-        assert_eq!(recheck.loop_until.as_deref(), Some("VERDICT: PASS"),
-            "放行门必须挂在 reviewer 的复核步上");
-        assert_eq!(recheck.loop_back_to.as_deref(), Some("fix"),
-            "复核不过应跳回 fix 再修一轮");
+        assert_eq!(
+            recheck.loop_until.as_deref(),
+            Some("VERDICT: PASS"),
+            "放行门必须挂在 reviewer 的复核步上"
+        );
+        assert_eq!(
+            recheck.loop_back_to.as_deref(),
+            Some("fix"),
+            "复核不过应跳回 fix 再修一轮"
+        );
         assert!(fix.loop_until.is_none(), "fix（改的人）不得持有放行门");
-        assert!(verify.loop_until.is_none(), "verify（初审）不放行，只列问题");
+        assert!(
+            verify.loop_until.is_none(),
+            "verify（初审）不放行，只列问题"
+        );
 
         // 步序：verify 在 fix 前、fix 在 recheck 前（审→改→复核）。
         let idx = |id: &str| wf.steps.iter().position(|s| s.id == id).unwrap();
@@ -6663,7 +7925,8 @@ role = "reviewer"
         let raw = include_str!("../../config/workflows/design_and_plan.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("design_and_plan should validate");
-        wf.validate_dag().expect("design_and_plan DAG should validate");
+        wf.validate_dag()
+            .expect("design_and_plan DAG should validate");
 
         // 波浪调度：串行链分层、并行组同层
         let waves = compute_waves(&wf.steps).unwrap();
@@ -6688,7 +7951,11 @@ role = "reviewer"
         wf.validate().expect("tdd_development should validate");
         // 实现 step：四态报告契约
         let implement = wf.steps.iter().find(|s| s.id == "implement").unwrap();
-        assert!(implement.output_contract.require.iter().any(|r| r == "STATUS:"));
+        assert!(implement
+            .output_contract
+            .require
+            .iter()
+            .any(|r| r == "STATUS:"));
         assert!(implement.task_text().contains("DONE_WITH_CONCERNS"));
         assert!(implement.task_text().contains("BLOCKED"));
         assert!(implement.task_text().contains("NEEDS_CONTEXT"));
@@ -6698,7 +7965,10 @@ role = "reviewer"
         assert!(spec.output_contract.require.iter().any(|r| r == "VERDICT:"));
         // 质量审查在规格审查之后
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["tests_first", "implement", "spec_review", "quality_review"]);
+        assert_eq!(
+            ids,
+            ["tests_first", "implement", "spec_review", "quality_review"]
+        );
     }
 
     /// `check_required_tools`：查步骤**做了什么**，而不是它说了什么。
@@ -6730,9 +8000,7 @@ role = "reviewer"
 
         // 带 namespace 的全名按短名比较（两侧都归一化）。
         assert!(check_required_tools(&need, "tutor.ask {} → x").is_ok());
-        assert!(check_required_tools(&[
-            "ns.ask".to_string()
-        ], "ask {} → x").is_ok());
+        assert!(check_required_tools(&["ns.ask".to_string()], "ask {} → x").is_ok());
     }
 
     /// `check_required_tools_any`：OR 语义——"必须取证"有多条合法路径。
@@ -6742,7 +8010,11 @@ role = "reviewer"
     /// search 都算，用 AND 的 `require_tools` 会逼它三个都调一遍。
     #[test]
     fn require_tools_any_is_or_semantics() {
-        let any = vec!["read".to_string(), "code_graph".to_string(), "search".to_string()];
+        let any = vec![
+            "read".to_string(),
+            "code_graph".to_string(),
+            "search".to_string(),
+        ];
 
         // 命中任意一个即通过。
         assert!(check_required_tools_any(&any, "code_graph {} → ok").is_ok());
@@ -6756,7 +8028,10 @@ role = "reviewer"
 
         // 一次工具都没调：占位行 `[本 step 工具调用数: 0]` 不能被当成工具名。
         let err = check_required_tools_any(&any, "[本 step 工具调用数: 0]").unwrap_err();
-        assert!(err.contains("无"), "零调用应显示\"无\"而不是伪工具名：{err}");
+        assert!(
+            err.contains("无"),
+            "零调用应显示\"无\"而不是伪工具名：{err}"
+        );
 
         // 空声明 = 不校验。
         assert!(check_required_tools_any(&[], "[本 step 工具调用数: 0]").is_ok());
@@ -6794,7 +8069,10 @@ role = "reviewer"
         // namespace 归一化 + 空声明恒通过。
         assert!(check_tool_call_limits(&limits, "tutor.ask {} → A").is_ok());
         let dup = "tutor.ask {} → A\nask {} → B";
-        assert!(check_tool_call_limits(&limits, dup).is_err(), "短名归一后应算 2 次");
+        assert!(
+            check_tool_call_limits(&limits, dup).is_err(),
+            "短名归一后应算 2 次"
+        );
         assert!(check_tool_call_limits(&Default::default(), dup).is_ok());
     }
 
@@ -6831,7 +8109,10 @@ role = "reviewer"
         // max_chars：learn_loop plan 步的产出被下游当路径片段拼接
         // （`.latte/learn/{{plan_out}}/plan.json`），多写一句话就拼出
         // 一条不存在的路径。
-        let c = OutputContract { max_chars: Some(10), ..Default::default() };
+        let c = OutputContract {
+            max_chars: Some(10),
+            ..Default::default()
+        };
         assert!(check_output_contract(&c, "rust-owner").is_ok());
         let err = check_output_contract(&c, "好的，slug 是 rust-ownership").unwrap_err();
         assert!(err.contains("产出过长"), "{err}");
@@ -6858,7 +8139,10 @@ role = "reviewer"
         // 标记在中间、末行是总结 → 必须拦下。这正是子串检查放过的那种。
         let err = check_output_contract(&c, "TEACH_DONE k1\n以上就是本节内容。").unwrap_err();
         assert!(err.contains("最后一行"), "{err}");
-        assert!(err.contains("以上就是本节内容。"), "批注要回显实际末行：{err}");
+        assert!(
+            err.contains("以上就是本节内容。"),
+            "批注要回显实际末行：{err}"
+        );
 
         // 空契约恒通过。
         let c = OutputContract::default();
@@ -6872,17 +8156,14 @@ role = "reviewer"
     #[test]
     fn validate_rejects_malformed_behavior_fields() {
         let base = |extra: &str| {
-            format!(
-                "name = \"w\"\n[[steps]]\nid = \"s\"\nrole = \"tutor\"\ntask = \"t\"\n{extra}"
-            )
+            format!("name = \"w\"\n[[steps]]\nid = \"s\"\nrole = \"tutor\"\ntask = \"t\"\n{extra}")
         };
 
         let wf: WorkflowDef = toml::from_str(&base("require_tools_any = [\"\"]")).unwrap();
         let err = wf.validate().unwrap_err();
         assert!(err.contains("require_tools_any"), "{err}");
 
-        let wf: WorkflowDef =
-            toml::from_str(&base("tool_call_limits = { \"\" = 1 }")).unwrap();
+        let wf: WorkflowDef = toml::from_str(&base("tool_call_limits = { \"\" = 1 }")).unwrap();
         let err = wf.validate().unwrap_err();
         assert!(err.contains("tool_call_limits"), "{err}");
 
@@ -6893,7 +8174,10 @@ role = "reviewer"
         ))
         .unwrap();
         let err = wf.validate().unwrap_err();
-        assert!(err.contains("min_chars") && err.contains("max_chars"), "{err}");
+        assert!(
+            err.contains("min_chars") && err.contains("max_chars"),
+            "{err}"
+        );
 
         // 合法配置照常通过。
         let wf: WorkflowDef = toml::from_str(&base(
@@ -6910,7 +8194,17 @@ role = "reviewer"
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("learn should validate");
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["investigate", "structure", "write", "verify", "fix", "recheck"]);
+        assert_eq!(
+            ids,
+            [
+                "investigate",
+                "structure",
+                "write",
+                "verify",
+                "fix",
+                "recheck"
+            ]
+        );
         // investigate：防幻觉——要求行号锚点
         assert!(wf.steps[0].task_text().contains("行号"));
         // structure：六层骨架契约
@@ -6923,8 +8217,16 @@ role = "reviewer"
         }
         // write：必须产出 Mermaid 图与名词解释
         let write = &wf.steps[2];
-        assert!(write.output_contract.require.iter().any(|r| r == "```mermaid"));
-        assert!(write.output_contract.require.iter().any(|r| r == "名词解释"));
+        assert!(write
+            .output_contract
+            .require
+            .iter()
+            .any(|r| r == "```mermaid"));
+        assert!(write
+            .output_contract
+            .require
+            .iter()
+            .any(|r| r == "名词解释"));
         // 校验阶段：审/改/复核三步分离（修问题 #5 评审独立性）。
         // 详见 learn_review_is_independent_audit_not_self_review。
         assert_eq!(wf.steps[3].roles(), vec!["reviewer"], "verify 独立审");
@@ -6986,7 +8288,9 @@ role = "reviewer"
             [
                 "plan",
                 "annotate",
-                "doc",
+                "doc_review",
+                "legacy_doc",
+                "legacy_proofread",
                 "read_confirm",
                 "quiz",
                 "supplement",
@@ -6996,22 +8300,49 @@ role = "reviewer"
             ]
         );
 
-        let plan = &wf.steps[0];
-        let annotate = &wf.steps[1];
-        let doc = &wf.steps[2];
-        let read_confirm = &wf.steps[3];
-        let quiz = &wf.steps[4];
-        let supplement = &wf.steps[5];
-        let merge = &wf.steps[6];
-        let sync_code = &wf.steps[7];
-        let report = &wf.steps[8];
+        let step = |id: &str| wf.steps.iter().find(|s| s.id == id).expect(id);
+        let plan = step("plan");
+        let annotate = step("annotate");
+        // 旧 doc/proofread 定义保留作配置迁移兼容，但不可命中；实际文档
+        // 维护和可读性门槛位于 doc_review_loop（单独回归测试覆盖）。
+        let doc = step("legacy_doc");
+        let _proofread = step("legacy_proofread");
+        let read_confirm = step("read_confirm");
+        let quiz = step("quiz");
+        let supplement = step("supplement");
+        let merge = step("merge");
+        let sync_code = step("sync_code");
+        let report = step("report");
+        assert!(step("doc_review").workflow.is_some());
+        assert_eq!(
+            step("legacy_doc").when_any,
+            vec!["__legacy_flat_learn_loop__"]
+        );
+        assert_eq!(
+            step("legacy_proofread").when_any,
+            vec!["__legacy_flat_learn_loop__"]
+        );
+        // 外层所有实际执行的普通 speaker 都是 tutor；proofreader 只在
+        // nested doc_review_loop 内运行，不能混回外层。
         for s in &wf.steps {
+            if matches!(
+                s.id.as_str(),
+                "doc_review" | "legacy_doc" | "legacy_proofread"
+            ) {
+                continue;
+            }
             assert_eq!(s.roles(), vec!["tutor"], "step {} 必须是 tutor", s.id);
         }
 
         // ── plan：先取证再出题，产出只是 slug ──
-        assert!(plan.task_text().contains("code_graph"), "plan 必须要求用 code_graph 取证");
-        assert!(plan.task_text().contains("evidence"), "plan 必须要求记 evidence 出处");
+        assert!(
+            plan.task_text().contains("code_graph"),
+            "plan 必须要求用 code_graph 取证"
+        );
+        assert!(
+            plan.task_text().contains("evidence"),
+            "plan 必须要求记 evidence 出处"
+        );
         assert!(plan.task_text().contains("ledger.json"));
         assert!(
             plan.task_text().contains("doc_outline") && plan.task_text().contains("doc_section"),
@@ -7022,7 +8353,10 @@ role = "reviewer"
             banned(plan.task_text(), "recommended"),
             "plan 必须禁止把答案标成 recommended"
         );
-        assert!(plan.task_text().contains("\"answer\""), "答案应放独立的 answer 字段");
+        assert!(
+            plan.task_text().contains("\"answer\""),
+            "答案应放独立的 answer 字段"
+        );
         // 答案位置偏置：ask 没有洗牌实现，正确项位置由 plan 自己随机打散；
         // 纯字母序号会让 answer 退化成位置引用。
         assert!(
@@ -7047,9 +8381,24 @@ role = "reviewer"
             plan.require_tools.iter().any(|t| t == "write"),
             "plan 必须真把 plan.json / ledger.json 落盘"
         );
+        assert!(
+            plan.task_text().contains("重跑不是无操作"),
+            "plan 必须把重跑定义为刷新当前源码对应的学习计划，而不是无操作复用"
+        );
+        assert!(
+            plan.task_text().contains("每次运行都必须 write"),
+            "plan 必须要求复用场景也实际刷新并写回计划与账本"
+        );
+        assert!(
+            !plan
+                .task_text()
+                .contains("一个知识点没新增就不必改写任何文件"),
+            "plan 不得允许复用场景跳过落盘，否则会与 require_tools=[write] 冲突"
+        );
         // 初始账本只存 wrong/passed 两个事实，状态由读取方推导。
         assert!(
-            plan.task_text().contains("\"wrong\":0") && plan.task_text().contains("\"passed\":false"),
+            plan.task_text().contains("\"wrong\":0")
+                && plan.task_text().contains("\"passed\":false"),
             "初始账本必须是 wrong/passed 两个事实，不是状态名"
         );
         // plan 的产出被下游当路径片段拼接，必须只是 slug 本身。
@@ -7085,7 +8434,8 @@ role = "reviewer"
             "annotate 需要 read 读源码、write 写副本"
         );
         assert!(
-            !annotate.tools.iter().any(|t| t == "edit") && !annotate.tools.iter().any(|t| t == "ask"),
+            !annotate.tools.iter().any(|t| t == "edit")
+                && !annotate.tools.iter().any(|t| t == "ask"),
             "annotate 不许有 edit（可能改到源文件）也不许弹窗——不动源码靠工具隔离"
         );
         assert!(
@@ -7125,6 +8475,12 @@ role = "reviewer"
         assert!(
             doc.task_text().contains("draft.md"),
             "doc 的正文必须把 draft.md 路径交付给学员"
+        );
+        assert!(
+            doc.task_text().contains("已经存在")
+                && doc.task_text().contains("draft.md")
+                && doc.task_text().contains("刷新"),
+            "doc 必须在重跑时读取并刷新既有 draft.md，而不是只在首次运行写文档"
         );
         // 文档内容直接随 doc 步正文返回 chat（学员先读完、再点答题按钮），
         // 而不是只给一个路径让学员自己找文件。
@@ -7184,8 +8540,8 @@ role = "reviewer"
         assert_eq!(quiz.loop_until.as_deref(), Some("QUIZ_PASS"));
         assert_eq!(
             quiz.loop_back_routes.get("QUIZ_FAIL").map(|s| s.as_str()),
-            Some("doc"),
-            "quiz 答错必须按病灶路由回 doc 增强文档"
+            Some("doc_review"),
+            "quiz 答错必须按病灶路由回 doc_review 增强文档"
         );
         // 引擎硬上限是 10（unwrap_or(3).min(10)），配更大是自欺。
         assert_eq!(quiz.max_iterations, Some(10));
@@ -7217,7 +8573,10 @@ role = "reviewer"
         // 末行契约：引擎按末行取循环状态。标记写在正文中间时子串检查照样
         // 通过，而循环控制拿不到依据。
         assert!(
-            quiz.output_contract.last_line_prefix_any.iter().any(|p| p == "QUIZ_PASS")
+            quiz.output_contract
+                .last_line_prefix_any
+                .iter()
+                .any(|p| p == "QUIZ_PASS")
                 && quiz
                     .output_contract
                     .last_line_prefix_any
@@ -7252,8 +8611,8 @@ role = "reviewer"
         assert_eq!(supplement.loop_until.as_deref(), Some("ALL_DONE"));
         assert_eq!(
             supplement.loop_back_to.as_deref(),
-            Some("doc"),
-            "有补充必须回 doc 写新章节与新知识点"
+            Some("doc_review"),
+            "有补充必须回 doc_review 写新章节与新知识点"
         );
         assert_eq!(supplement.max_iterations, Some(10));
         assert!(
@@ -7294,13 +8653,14 @@ role = "reviewer"
             merge.require_tools.iter().any(|t| t == "write"),
             "merge 必须真写出最终文档"
         );
-        assert!(
-            !merge.tools.iter().any(|t| t == "ask"),
-            "merge 不许弹窗"
-        );
+        assert!(!merge.tools.iter().any(|t| t == "ask"), "merge 不许弹窗");
         assert!(
             merge.task_text().contains("docs/learn/")
-                && merge.output_contract.require.iter().any(|r| r == "docs/learn/"),
+                && merge
+                    .output_contract
+                    .require
+                    .iter()
+                    .any(|r| r == "docs/learn/"),
             "merge 必须产出 docs/learn/<slug>.md 并在正文给出路径"
         );
 
@@ -7314,7 +8674,8 @@ role = "reviewer"
             "条件 step 必须绑 output_key（引擎校验：跳过的 step 下游拿空串，没绑则配置写漏了也没人知道）"
         );
         assert!(
-            sync_code.tools.iter().any(|t| t == "edit") && !sync_code.tools.iter().any(|t| t == "ask"),
+            sync_code.tools.iter().any(|t| t == "edit")
+                && !sync_code.tools.iter().any(|t| t == "ask"),
             "sync_code 需要 edit 改源文件，但不许弹窗"
         );
         assert!(
@@ -7334,7 +8695,11 @@ role = "reviewer"
             "report 必须按 wrong/passed 推导掌握情况"
         );
         assert!(
-            report.output_contract.require.iter().any(|r| r == "掌握进度"),
+            report
+                .output_contract
+                .require
+                .iter()
+                .any(|r| r == "掌握进度"),
             "report 必须含掌握进度小节"
         );
     }
@@ -7353,8 +8718,7 @@ role = "reviewer"
         assert_eq!(untouched.short_output_threshold, 50);
         // 阈值 0 时 D5 对短产出放行（slug 只有 29 字节）；D6 等其他
         // 探测器不受影响（这里 tool_count=3，回声模式也不命中）。
-        let verdict =
-            crate::advisor_monitor::check_response_gates("rust-ownership", 3, &adjusted);
+        let verdict = crate::advisor_monitor::check_response_gates("rust-ownership", 3, &adjusted);
         assert!(
             matches!(verdict, crate::advisor_monitor::GateVerdict::Pass),
             "slug 产出不该再被 D5 拦: {verdict:?}"
@@ -7432,9 +8796,13 @@ tools = ["read", "ask"]
     /// 验收：feature_design.toml 的 design step 必须含有 output_key="design"。
     /// 使用 include_str! 直接引用真文件，确保 TOML 编辑后测试立即红。
     #[test]
-    fn feature_design_design_step_has_output_key() {        let raw = include_str!("../../config/workflows/feature_design.toml");
+    fn feature_design_design_step_has_output_key() {
+        let raw = include_str!("../../config/workflows/feature_design.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
-        let design = wf.steps.iter().find(|s| s.id == "design")
+        let design = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "design")
             .expect("step 'design' must exist");
         assert_eq!(
             design.output_key,
@@ -7455,7 +8823,9 @@ tools = ["read", "ask"]
                 assert!(
                     !step.prompt.contains(phrase),
                     "step '{}' prompt contains forbidden vague reference '{}': {}",
-                    step.id, phrase, step.prompt
+                    step.id,
+                    phrase,
+                    step.prompt
                 );
             }
         }
@@ -7471,10 +8841,19 @@ tools = ["read", "ask"]
         vars.insert("topic".into(), "AI 助手".into());
         vars.insert("requirements".into(), "用户能创建笔记".into());
         let rendered = wf.render_prompt(design, &vars);
-        assert!(rendered.contains("用户能创建笔记"), "must inject {{requirements}}: {rendered}");
-        assert!(rendered.contains("AI 助手"), "must inject {{topic}}: {rendered}");
+        assert!(
+            rendered.contains("用户能创建笔记"),
+            "must inject {{requirements}}: {rendered}"
+        );
+        assert!(
+            rendered.contains("AI 助手"),
+            "must inject {{topic}}: {rendered}"
+        );
         // 确保没有残留的未替换模板语法
-        assert!(!rendered.contains("{{{"), "no unsubstituted template vars: {rendered}");
+        assert!(
+            !rendered.contains("{{{"),
+            "no unsubstituted template vars: {rendered}"
+        );
     }
 
     /// advisor_verdict 的 prompt 必须引用 {{requirements}} 和 {{design}} 两个 output_key。
@@ -7482,7 +8861,10 @@ tools = ["read", "ask"]
     fn advisor_verdict_prompt_uses_named_vars() {
         let raw = include_str!("../../config/workflows/feature_design.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
-        let verdict = wf.steps.iter().find(|s| s.id == "advisor_verdict")
+        let verdict = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "advisor_verdict")
             .expect("step 'advisor_verdict' must exist");
         assert!(
             verdict.prompt.contains("{{requirements}}"),
@@ -7546,7 +8928,8 @@ speakers = ["reviewer"]
 prompt = "review {{design}}"
 "#;
         let wf: WorkflowDef = toml::from_str(raw).unwrap();
-        wf.validate().expect("non-reserved, non-empty keys must validate");
+        wf.validate()
+            .expect("non-reserved, non-empty keys must validate");
     }
 
     /// Typo `ouput_key` (missing 't') must be rejected at parse time by
@@ -7567,7 +8950,10 @@ ouput_key = "design"
             "typo 'ouput_key' must be rejected at parse time"
         );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("ouput_key"), "error should mention the unknown field: {msg}");
+        assert!(
+            msg.contains("ouput_key"),
+            "error should mention the unknown field: {msg}"
+        );
     }
 }
 
@@ -7756,7 +9142,10 @@ loop_abort_on = "VERDICT: REJECT"
             !flag.load(Ordering::SeqCst),
             "任务应在守卫 drop 时被取消，不该跑完"
         );
-        assert!(handle.await.is_err(), "被 abort 的任务 join 应返回 JoinError");
+        assert!(
+            handle.await.is_err(),
+            "被 abort 的任务 join 应返回 JoinError"
+        );
     }
 
     /// 熔断标记若把放行条件当子串包含，放行判定永远先命中，熔断成
@@ -7797,7 +9186,9 @@ task = "t"
 loop_no_release_on = "VERDICT: REJECT"
 "#,
         );
-        let err = wf.validate().expect_err("孤立的 loop_no_release_on 必须报错");
+        let err = wf
+            .validate()
+            .expect_err("孤立的 loop_no_release_on 必须报错");
         assert!(err.contains("loop_no_release_on"), "错误应点名字段: {err}");
         assert!(err.contains("loop_until"), "错误应说明依赖: {err}");
     }
@@ -7821,7 +9212,9 @@ loop_back_to = "a"
 loop_no_release_on = "VERDICT: REJECT"
 "#,
         );
-        let err = wf.validate().expect_err("被放行条件遮蔽的不可放行标记必须报错");
+        let err = wf
+            .validate()
+            .expect_err("被放行条件遮蔽的不可放行标记必须报错");
         assert!(err.contains("永远不会触发"), "错误应解释原因: {err}");
     }
 
@@ -7978,7 +9371,9 @@ depends_on = []
 "#,
         );
         // Force DAG validation regardless of depends_on presence.
-        let err = wf.validate_dag().expect_err("duplicate id must be rejected");
+        let err = wf
+            .validate_dag()
+            .expect_err("duplicate id must be rejected");
         assert!(err.contains("duplicate"), "got: {err}");
     }
 
@@ -8045,9 +9440,13 @@ mod max_rounds_degrade_tests {
     #[test]
     fn substantive_partial_is_adopted_with_truncation_notice() {
         let partial = "## 工期估算\n\n实现复杂度中等，预计 6 小时。风险：inline 热路径。";
-        let (notice, adopted) =
-            degrade_partial_on_break("programmer", "estimate", "达到工具轮次上限（100 轮）", partial)
-                .expect("有实质内容应降级采纳");
+        let (notice, adopted) = degrade_partial_on_break(
+            "programmer",
+            "estimate",
+            "达到工具轮次上限（100 轮）",
+            partial,
+        )
+        .expect("有实质内容应降级采纳");
 
         // 通知要点名 speaker / step / 轮次，运维才能定位是哪一步被截断。
         assert!(notice.contains("programmer"), "{notice}");
@@ -8065,9 +9464,17 @@ mod max_rounds_degrade_tests {
     #[test]
     fn think_blocks_are_stripped_before_adoption() {
         let partial = "<think>先读 tcache.c 再决定</think>\n\n结论：可行，约 6 小时。";
-        let (_, adopted) = degrade_partial_on_break("programmer", "estimate", "达到工具轮次上限（100 轮）", partial)
-            .expect("剥掉 think 后仍有正文");
-        assert!(!adopted.contains("先读 tcache.c"), "think 未剥净: {adopted}");
+        let (_, adopted) = degrade_partial_on_break(
+            "programmer",
+            "estimate",
+            "达到工具轮次上限（100 轮）",
+            partial,
+        )
+        .expect("剥掉 think 后仍有正文");
+        assert!(
+            !adopted.contains("先读 tcache.c"),
+            "think 未剥净: {adopted}"
+        );
         assert!(adopted.contains("结论：可行"), "{adopted}");
     }
 
@@ -8077,7 +9484,13 @@ mod max_rounds_degrade_tests {
     fn empty_partial_is_not_adopted() {
         for partial in ["", "   \n\t ", "<think>只想了想，没写结论</think>"] {
             assert!(
-                degrade_partial_on_break("programmer", "estimate", "达到工具轮次上限（100 轮）", partial).is_none(),
+                degrade_partial_on_break(
+                    "programmer",
+                    "estimate",
+                    "达到工具轮次上限（100 轮）",
+                    partial
+                )
+                .is_none(),
                 "空 partial 不应降级采纳: {partial:?}"
             );
         }
@@ -8085,11 +9498,15 @@ mod max_rounds_degrade_tests {
 }
 
 #[cfg(test)]
-mod contract_tests {    use super::*;
+mod contract_tests {
+    use super::*;
 
     #[test]
     fn contract_min_chars() {
-        let c = OutputContract { min_chars: Some(5), ..Default::default() };
+        let c = OutputContract {
+            min_chars: Some(5),
+            ..Default::default()
+        };
         // 不足 → 报错，消息含实际/要求字符数
         let err = check_output_contract(&c, "太短").unwrap_err();
         assert!(err.contains('2') && err.contains('5'), "got: {err}");
@@ -8359,7 +9776,9 @@ task = "t"
             }
             // ③ 旧的自相矛盾表述不得回归。
             assert!(
-                !refine.task_text().contains("纯合成型子任务（只消费上游交付物）写它要产出的文档目录"),
+                !refine
+                    .task_text()
+                    .contains("纯合成型子任务（只消费上游交付物）写它要产出的文档目录"),
                 "{path}: refine 不得回退到旧的「隐式重叠」表述"
             );
             assert!(
@@ -8409,8 +9828,16 @@ task = "t"
             let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
             let wf: WorkflowDef = toml::from_str(&raw).unwrap();
             let gate = wf.steps.iter().find(|s| s.id == "gate").expect("gate step");
-            let review = wf.steps.iter().find(|s| s.id == "review").expect("review step");
-            let refine = wf.steps.iter().find(|s| s.id == "refine").expect("refine step");
+            let review = wf
+                .steps
+                .iter()
+                .find(|s| s.id == "review")
+                .expect("review step");
+            let refine = wf
+                .steps
+                .iter()
+                .find(|s| s.id == "refine")
+                .expect("refine step");
 
             assert!(
                 gate.prompt.contains("没有 blocking 问题"),
@@ -8526,7 +9953,11 @@ task = "t"
             assert!(prompt.contains("VERDICT: PASS") && prompt.contains("VERDICT: REJECT"));
             // 返工环必须真的通电：REJECT 是返工信号，不能被熔断标记
             // 提前判死。
-            assert_eq!(gate.loop_until.as_deref(), Some("VERDICT: PASS"), "{wf_name}");
+            assert_eq!(
+                gate.loop_until.as_deref(),
+                Some("VERDICT: PASS"),
+                "{wf_name}"
+            );
             assert!(
                 gate.loop_abort_on.is_none(),
                 "{wf_name} 的 gate 用 REJECT 表示返工，声明 loop_abort_on 会让返工环失效"
@@ -8544,11 +9975,7 @@ task = "t"
         let raw = include_str!("../../config/workflows/implementation_plan.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("implementation_plan should validate");
-        let gate = wf
-            .steps
-            .iter()
-            .find(|s| s.id == "gate")
-            .expect("gate step");
+        let gate = wf.steps.iter().find(|s| s.id == "gate").expect("gate step");
         assert_eq!(
             gate.loop_until.as_deref(),
             Some("VERDICT: PASS"),
@@ -8559,12 +9986,13 @@ task = "t"
             Some("breakdown"),
             "REJECT 反馈必须回到拆解步让 architect 吸收"
         );
+        assert!(gate.max_iterations.unwrap_or(3) >= 2, "至少给 2 轮返工机会");
         assert!(
-            gate.max_iterations.unwrap_or(3) >= 2,
-            "至少给 2 轮返工机会"
-        );
-        assert!(
-            !gate.output_contract.require.iter().any(|r| r == "VERDICT: PASS"),
+            !gate
+                .output_contract
+                .require
+                .iter()
+                .any(|r| r == "VERDICT: PASS"),
             "契约 require PASS 会把 REJECT 判死，必须只卡格式"
         );
         assert!(
@@ -8582,11 +10010,7 @@ task = "t"
         let raw = include_str!("../../config/workflows/design_and_plan.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("design_and_plan should validate");
-        let gate = wf
-            .steps
-            .iter()
-            .find(|s| s.id == "gate")
-            .expect("gate step");
+        let gate = wf.steps.iter().find(|s| s.id == "gate").expect("gate step");
         assert_eq!(
             gate.loop_until.as_deref(),
             Some("VERDICT: PASS"),
@@ -8597,12 +10021,13 @@ task = "t"
             Some("brainstorm"),
             "跨评审的结构性问题必须回到设计脑暴重做"
         );
+        assert!(gate.max_iterations.unwrap_or(3) >= 2, "至少给 2 轮返工机会");
         assert!(
-            gate.max_iterations.unwrap_or(3) >= 2,
-            "至少给 2 轮返工机会"
-        );
-        assert!(
-            !gate.output_contract.require.iter().any(|r| r == "VERDICT: PASS"),
+            !gate
+                .output_contract
+                .require
+                .iter()
+                .any(|r| r == "VERDICT: PASS"),
             "契约 require PASS 会把 REJECT 判死，必须只卡格式"
         );
         assert!(
@@ -8716,8 +10141,8 @@ mod contract_engine_tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -8745,7 +10170,8 @@ mod contract_engine_tests {
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 turn_cancel_flag: None,
-                agent_pause_gate: None, depth: 0,
+                agent_pause_gate: None,
+                depth: 0,
                 subsession_store: None,
                 session_id: None,
                 advisor_gate: None,
@@ -8795,6 +10221,10 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             &[],
+            &[],
+            None,
+            None,
+            false,
             None,
             None,
             None,
@@ -8814,10 +10244,7 @@ forbid = ["TBD"]
     #[tokio::test]
     async fn build_role_runner_wires_stateful_todo_with_sub_id() {
         let mut cfg = (*test_config_at("http://127.0.0.1:1")).clone();
-        cfg.roles
-            .get_mut("worker")
-            .unwrap()
-            .tools = vec!["todo".to_string()];
+        cfg.roles.get_mut("worker").unwrap().tools = vec!["todo".to_string()];
         let config = Arc::new(cfg);
         let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
         let (event_tx, mut rx) = broadcast::channel(64);
@@ -8832,6 +10259,10 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             &[],
+            &[],
+            None,
+            None,
+            false,
             None,
             None,
             Some("sub-wf-1"),
@@ -8887,10 +10318,7 @@ forbid = ["TBD"]
     #[tokio::test]
     async fn build_role_runner_without_todo_tool_has_no_todo_wiring() {
         let mut cfg = (*test_config_at("http://127.0.0.1:1")).clone();
-        cfg.roles
-            .get_mut("worker")
-            .unwrap()
-            .tools = vec!["read".to_string()];
+        cfg.roles.get_mut("worker").unwrap().tools = vec!["read".to_string()];
         let config = Arc::new(cfg);
         let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
         let (event_tx, _rx) = broadcast::channel(64);
@@ -8905,6 +10333,10 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             &[],
+            &[],
+            None,
+            None,
+            false,
             None,
             None,
             Some("sub-wf-2"),
@@ -9027,8 +10459,10 @@ when_any = ["ui", "界面"]
     #[tokio::test]
     async fn serial_engine_skips_optional_speaker_when_topic_misses() {
         let server = mock_server_always_ok().await;
-        let (ctx, mut rx) =
-            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        let (ctx, mut rx) = test_ctx(test_config_roles_at(
+            &server.uri(),
+            &["arch", "prog", "design"],
+        ));
         run_workflow(
             &optional_speaker_wf_serial(),
             "为 jemalloc 编排从浅到深的学习路径与任务清单",
@@ -9055,8 +10489,10 @@ when_any = ["ui", "界面"]
     #[tokio::test]
     async fn serial_engine_dispatches_optional_speaker_when_topic_hits() {
         let server = mock_server_always_ok().await;
-        let (ctx, mut rx) =
-            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        let (ctx, mut rx) = test_ctx(test_config_roles_at(
+            &server.uri(),
+            &["arch", "prog", "design"],
+        ));
         run_workflow(&optional_speaker_wf_serial(), "重做设置页的界面", &ctx)
             .await
             .expect("workflow 应成功");
@@ -9077,8 +10513,10 @@ when_any = ["ui", "界面"]
         let server = mock_server_always_ok().await;
         let wf = optional_speaker_wf_dag();
         assert!(wf.uses_dependency_dag(), "本用例必须走 DAG 引擎");
-        let (ctx, mut rx) =
-            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        let (ctx, mut rx) = test_ctx(test_config_roles_at(
+            &server.uri(),
+            &["arch", "prog", "design"],
+        ));
         run_workflow(&wf, "为 jemalloc 编排学习路径", &ctx)
             .await
             .expect("workflow 应成功");
@@ -9101,8 +10539,10 @@ when_any = ["ui", "界面"]
     #[tokio::test]
     async fn dag_engine_dispatches_optional_speaker_when_topic_hits() {
         let server = mock_server_always_ok().await;
-        let (ctx, mut rx) =
-            test_ctx(test_config_roles_at(&server.uri(), &["arch", "prog", "design"]));
+        let (ctx, mut rx) = test_ctx(test_config_roles_at(
+            &server.uri(),
+            &["arch", "prog", "design"],
+        ));
         run_workflow(&optional_speaker_wf_dag(), "把 UI 重构一遍", &ctx)
             .await
             .expect("workflow 应成功");
@@ -9211,7 +10651,9 @@ task = "下面是全部意见，请汇总：\n{{opinions}}"
         wf.validate().unwrap();
 
         let (ctx, _rx) = test_ctx(test_config_roles_at(&server.uri(), &["a", "b", "c"]));
-        run_workflow(&wf, "测试主题", &ctx).await.expect("workflow 应成功");
+        run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("workflow 应成功");
 
         // 最后一次请求是 join 步，它的 prompt 里应含三份产出。
         let requests = server.received_requests().await.unwrap();
@@ -9231,7 +10673,9 @@ task = "下面是全部意见，请汇总：\n{{opinions}}"
         }
     }
 
-    fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {        let mut n = 0;        while let Ok(ev) = rx.try_recv() {
+    fn count_workflow_turns(rx: &mut broadcast::Receiver<ChatEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
             if matches!(ev, ChatEvent::WorkflowTurn { .. }) {
                 n += 1;
             }
@@ -9269,7 +10713,10 @@ task = "下面是全部意见，请汇总：\n{{opinions}}"
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "首发 + 一次重试: {}", requests.len());
         let second = String::from_utf8_lossy(&requests[1].body);
-        assert!(second.contains("上次产出未通过验收"), "重试 prompt 带批注: {second}");
+        assert!(
+            second.contains("上次产出未通过验收"),
+            "重试 prompt 带批注: {second}"
+        );
         assert!(second.contains("产出过短"), "批注含违规原因: {second}");
         assert_eq!(
             count_workflow_turns(&mut rx),
@@ -9298,8 +10745,17 @@ task = "下面是全部意见，请汇总：\n{{opinions}}"
         assert!(err.contains("产出过短"), "错误含最后一次违规原因: {err}");
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2, "首发 + max_retries=1 次重试: {}", requests.len());
-        assert_eq!(count_workflow_turns(&mut rx), 0, "无合格产出，不发 WorkflowTurn");
+        assert_eq!(
+            requests.len(),
+            2,
+            "首发 + max_retries=1 次重试: {}",
+            requests.len()
+        );
+        assert_eq!(
+            count_workflow_turns(&mut rx),
+            0,
+            "无合格产出，不发 WorkflowTurn"
+        );
     }
 
     /// P0 回归（实测会话 实锤）：
@@ -9315,7 +10771,8 @@ task = "下面是全部意见，请汇总：\n{{opinions}}"
     async fn serial_require_plan_submit_fails_without_plan_proposal() {
         let server = wiremock::MockServer::start().await;
         // 模型每次都只回文字（模拟「plan 被拒 → 改口写请示报告」）。
-        let excuse = "plan 工具报 paths 范围重叠 14 处，我没有修改任务内容，请指示走 A / B / C 方案。";
+        let excuse =
+            "plan 工具报 paths 范围重叠 14 处，我没有修改任务内容，请指示走 A / B / C 方案。";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(excuse)))
@@ -9379,9 +10836,10 @@ require_plan_submit = true
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("v2 产出"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -9430,10 +10888,21 @@ prompt = "围绕测试主题产出学习笔记。"
         assert_eq!(out, v2, "最终产出必须是重做版");
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 4, "worker×2 + advisor×2: {}", requests.len());
+        assert_eq!(
+            requests.len(),
+            4,
+            "worker×2 + advisor×2: {}",
+            requests.len()
+        );
         let redo_req = String::from_utf8_lossy(&requests[2].body);
-        assert!(redo_req.contains("【上轮审查反馈】"), "续作 prompt 带反馈批注: {redo_req}");
-        assert!(redo_req.contains("重写并紧扣任务"), "批注含 advisor hint: {redo_req}");
+        assert!(
+            redo_req.contains("【上轮审查反馈】"),
+            "续作 prompt 带反馈批注: {redo_req}"
+        );
+        assert!(
+            redo_req.contains("重写并紧扣任务"),
+            "批注含 advisor hint: {redo_req}"
+        );
         // 续作的判据：同一 runner 的 context 保留了首轮产出——全新
         // subagent 重跑的请求里不会有它。
         assert!(
@@ -9489,9 +10958,10 @@ prompt = "围绕测试主题产出学习笔记。"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("v1 产出"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: intervene\nreason: 偏航\nhint: 重写",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: intervene\nreason: 偏航\nhint: 重写")),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -9557,9 +11027,10 @@ prompt = "围绕测试主题产出学习笔记。"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("v2 产出"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -9608,9 +11079,17 @@ prompt = "围绕测试主题产出学习笔记。"
         assert_eq!(out, v2, "最终产出必须是重做版");
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 4, "worker×2 + advisor×2: {}", requests.len());
+        assert_eq!(
+            requests.len(),
+            4,
+            "worker×2 + advisor×2: {}",
+            requests.len()
+        );
         let redo_req = String::from_utf8_lossy(&requests[2].body);
-        assert!(redo_req.contains("【上轮审查反馈】"), "重做 prompt 带反馈批注: {redo_req}");
+        assert!(
+            redo_req.contains("【上轮审查反馈】"),
+            "重做 prompt 带反馈批注: {redo_req}"
+        );
         assert!(
             !redo_req.contains("v1 产出"),
             "restart 必须是全新上下文，不得携带首轮产出: {redo_req}"
@@ -9672,7 +11151,12 @@ task = "任务B：{{out_a}}"
         let mut sub_ids = std::collections::HashSet::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
-                ChatEvent::DelegateStarted { from_role, sub_id, wf_id, .. } => {
+                ChatEvent::DelegateStarted {
+                    from_role,
+                    sub_id,
+                    wf_id,
+                    ..
+                } => {
                     // workflow 分派统一归属 manager，wf_id 标记「流程内」。
                     assert_eq!(from_role, "manager");
                     assert!(wf_id.is_some(), "workflow 分派必须带 wf_id 标记");
@@ -9709,18 +11193,15 @@ task = "任务B：{{out_a}}"
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                        good,
-                    ))),
+                    .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(good))),
             )
             .await;
         let mut ctx = test_ctx(test_config_at(&server.uri())).0;
         ctx.agent_pause_gate = Some(gate.clone());
         let cwd_tmp = ctx.cwd.clone();
         let _ = cwd_tmp;
-        let spawned = tokio::spawn(async move {
-            run_workflow(&contract_wf(), "测试主题", &ctx).await
-        });
+        let spawned =
+            tokio::spawn(async move { run_workflow(&contract_wf(), "测试主题", &ctx).await });
         // 200ms 后应仍挂起（第一个 model call 边界 park）。
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(!spawned.is_finished(), "gate paused → workflow 应 park");
@@ -9742,7 +11223,8 @@ task = "任务B：{{out_a}}"
     #[tokio::test]
     async fn loop_exhausted_advisor_ok_reaches_downstream() {
         let server = wiremock::MockServer::start().await;
-        let draft = "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
+        let draft =
+            "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
         // refine 产出草案（会被返工重跑，故不限次数）。
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -9763,9 +11245,10 @@ task = "任务B：{{out_a}}"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .mount(&server)
             .await;
         // 下游 submit。
@@ -9821,7 +11304,10 @@ task = "提交清单 {{draft}}"
         // 语义复核只在**耗尽那一刻**问一次，不是每轮都问（否则等于取消返工）。
         // 注意不能按 step 任务文本计数：advisor 的返回审查请求也内嵌任务原文。
         assert_eq!(
-            bodies.iter().filter(|b| b.contains("最后一次语义复核")).count(),
+            bodies
+                .iter()
+                .filter(|b| b.contains("最后一次语义复核"))
+                .count(),
             1,
             "advisor 语义复核应恰好在耗尽点被问一次"
         );
@@ -9842,7 +11328,8 @@ task = "提交清单 {{draft}}"
     #[tokio::test]
     async fn loop_exhausted_advisor_intervene_still_fails() {
         let server = wiremock::MockServer::start().await;
-        let draft = "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
+        let draft =
+            "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("产出拆分草案"))
@@ -9852,9 +11339,10 @@ task = "提交清单 {{draft}}"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REVISE 子任务引用了不存在的符号",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: REVISE 子任务引用了不存在的符号")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -9928,7 +11416,8 @@ task = "提交清单 {{draft}}"
     #[tokio::test]
     async fn loop_exhausted_reject_marker_is_not_released() {
         let server = wiremock::MockServer::start().await;
-        let draft = "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
+        let draft =
+            "拆分草案：子任务一覆盖构建系统认知，子任务二覆盖目录结构认知，各自可独立验收。";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("产出拆分草案"))
@@ -9948,9 +11437,10 @@ task = "提交清单 {{draft}}"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -10003,7 +11493,10 @@ task = "提交清单 {{draft}}"
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
         assert_eq!(
-            bodies.iter().filter(|b| b.contains("最后一次语义复核")).count(),
+            bodies
+                .iter()
+                .filter(|b| b.contains("最后一次语义复核"))
+                .count(),
             0,
             "含 REJECT 标记时绝不能问 advisor（问了就可能被放行）"
         );
@@ -10023,7 +11516,8 @@ task = "提交清单 {{draft}}"
     #[tokio::test]
     async fn dag_loop_exhausted_advisor_ok_reaches_downstream() {
         let server = wiremock::MockServer::start().await;
-        let design = "设计稿：分三层落地，接口与数据结构均已给出，边界条件与回滚路径写明，可直接进入实现。";
+        let design =
+            "设计稿：分三层落地，接口与数据结构均已给出，边界条件与回滚路径写明，可直接进入实现。";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("产出设计稿"))
@@ -10042,9 +11536,10 @@ task = "提交清单 {{draft}}"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("最后一次语义复核"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -10086,7 +11581,10 @@ depends_on = ["gate"]
         let out = run_workflow(&wf, "主题", &ctx)
             .await
             .expect("advisor 判 ok 应放行到下游 wave");
-        assert!(out.contains("实现已完成"), "必须真的执行到下游 impl 步: {out}");
+        assert!(
+            out.contains("实现已完成"),
+            "必须真的执行到下游 impl 步: {out}"
+        );
 
         let bodies: Vec<String> = server
             .received_requests()
@@ -10096,7 +11594,10 @@ depends_on = ["gate"]
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
         assert_eq!(
-            bodies.iter().filter(|b| b.contains("最后一次语义复核")).count(),
+            bodies
+                .iter()
+                .filter(|b| b.contains("最后一次语义复核"))
+                .count(),
             1,
             "语义复核只在耗尽点问一次"
         );
@@ -10110,7 +11611,8 @@ depends_on = ["gate"]
     #[tokio::test]
     async fn dag_loop_exhausted_advisor_intervene_still_fails() {
         let server = wiremock::MockServer::start().await;
-        let design = "设计稿：分三层落地，接口与数据结构均已给出，边界条件与回滚路径写明，可直接进入实现。";
+        let design =
+            "设计稿：分三层落地，接口与数据结构均已给出，边界条件与回滚路径写明，可直接进入实现。";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("产出设计稿"))
@@ -10208,9 +11710,10 @@ depends_on = ["gate"]
             .and(wiremock::matchers::body_string_contains(
                 "没有写约定验收标记",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .mount(&server)
             .await;
 
@@ -10319,9 +11822,10 @@ require = ["契约要求的验收标记字符串"]
             .and(wiremock::matchers::body_string_contains(
                 "没有写约定验收标记",
             ))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "verdict: ok\nreason:\nhint:",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("verdict: ok\nreason:\nhint:")),
+            )
             .mount(&server)
             .await;
 
@@ -10535,8 +12039,8 @@ mod resume_tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -10567,7 +12071,8 @@ mod resume_tests {
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 turn_cancel_flag: None,
-                agent_pause_gate: None, depth: 0,
+                agent_pause_gate: None,
+                depth: 0,
                 subsession_store: None,
                 session_id: None,
                 advisor_gate: None,
@@ -10618,8 +12123,8 @@ output_key = "out_c"
     }
 
     fn read_checkpoint(cwd: &Path, wf_id: &str) -> Vec<serde_json::Value> {
-        let raw = std::fs::read_to_string(checkpoint_path(cwd, wf_id))
-            .expect("checkpoint 文件应存在");
+        let raw =
+            std::fs::read_to_string(checkpoint_path(cwd, wf_id)).expect("checkpoint 文件应存在");
         raw.lines()
             .map(|l| serde_json::from_str(l).expect("每行都是合法 JSON"))
             .collect()
@@ -10717,9 +12222,10 @@ output_key = "out_b"
         let server2 = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "包含永远不可能出现的验收字符串的合格产出",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("包含永远不可能出现的验收字符串的合格产出")),
+            )
             .mount(&server2)
             .await;
         let (ctx2, mut rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
@@ -10755,7 +12261,9 @@ output_key = "out_b"
         }
         assert_eq!(step_events, vec!["b".to_string(), "c".to_string()]);
         assert!(
-            status_msgs.iter().any(|m| m.contains("断点续跑") && m.contains("跳过已完成的 1 步")),
+            status_msgs
+                .iter()
+                .any(|m| m.contains("断点续跑") && m.contains("跳过已完成的 1 步")),
             "应有断点续跑 Status: {status_msgs:?}"
         );
 
@@ -10842,9 +12350,10 @@ depends_on = ["b"]
         let server2 = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "包含永远不可能出现的验收字符串的合格产出",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("包含永远不可能出现的验收字符串的合格产出")),
+            )
             .mount(&server2)
             .await;
         let (ctx2, _rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
@@ -10859,6 +12368,101 @@ depends_on = ["b"]
             let body = String::from_utf8_lossy(&req.body);
             assert!(!body.contains("任务A"), "step a 不应重跑: {body}");
         }
+    }
+
+    /// fan_out：章节数（7）> 引擎并发度（4）时，每个章节都被引擎派发恰好一次，
+    /// 且各自拿到自己的 `{{item_id}}`；下游在全部章节完成后才运行。
+    #[tokio::test]
+    async fn fan_out_dispatches_every_item_once_beyond_concurrency() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "fan_out_pool"
+[[steps]]
+id = "prep"
+role = "worker"
+task = "准备"
+[[steps]]
+id = "each"
+role = "worker"
+depends_on = ["prep"]
+task = "写章节 ITEM={{item_id}} #{{item_index}}"
+[steps.fan_out]
+file = ".latte/learn/{{slug}}/plan.json"
+[[steps]]
+id = "final"
+role = "worker"
+depends_on = ["each"]
+task = "汇总"
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("fan_out workflow must validate");
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/demo");
+        std::fs::create_dir_all(&base).unwrap();
+        let kps: Vec<_> = (1..=7).map(|i| serde_json::json!({"id": format!("k{i}")})).collect();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({"knowledge_points": kps}).to_string(),
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("ok")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&wf, "slug=demo", &ctx).await.expect("run");
+
+        let reqs = server.received_requests().await.unwrap();
+        let bodies: Vec<String> = reqs
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        for i in 1..=7 {
+            let n = bodies
+                .iter()
+                .filter(|b| b.contains(&format!("ITEM=k{i} #{i}")))
+                .count();
+            assert_eq!(n, 1, "k{i} 必须恰好派发一次");
+        }
+        assert_eq!(reqs.len(), 9, "prep + 7 章 + final");
+        assert!(bodies.last().unwrap().contains("汇总"), "final 在全部章节后运行");
+    }
+
+    /// fan_out 的文件缺失 → workflow 明确失败，而不是静默零派发。
+    #[tokio::test]
+    async fn fan_out_missing_file_fails_loudly() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "fan_out_missing"
+[[steps]]
+id = "prep"
+role = "worker"
+task = "准备"
+[[steps]]
+id = "each"
+role = "worker"
+depends_on = ["prep"]
+task = "写 {{item_id}}"
+[steps.fan_out]
+file = "nope.json"
+"#,
+        )
+        .unwrap();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("ok")))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let err = run_workflow(&wf, "t", &ctx).await.expect_err("必须失败");
+        assert!(err.contains("fan_out"), "got: {err}");
     }
 
     /// resume 校验：wf_id 不存在 / workflow_name 不匹配 / 非法 wf_id →
@@ -10896,10 +12500,7 @@ depends_on = ["b"]
         let err = run_workflow_resume(&wf, "t", &ctx, "wf-other-1")
             .await
             .expect_err("workflow 不匹配必须报错");
-        assert!(
-            err.contains("belongs to workflow 'other_wf'"),
-            "got: {err}"
-        );
+        assert!(err.contains("belongs to workflow 'other_wf'"), "got: {err}");
     }
 
     /// DAG loop_until 端到端：gate 第一轮输出 REVISE → 跳回 design
@@ -10961,24 +12562,27 @@ max_iterations = 3
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REVISE 有阻断问题",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: REVISE 有阻断问题")),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: PASS 终审通过",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("VERDICT: PASS 终审通过")),
+            )
             .mount(&server)
             .await;
 
         let dir = tempfile::tempdir().unwrap();
         let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
-        let out = run_workflow(&wf, "主题", &ctx).await.expect("第二轮 PASS 应放行");
+        let out = run_workflow(&wf, "主题", &ctx)
+            .await
+            .expect("第二轮 PASS 应放行");
         assert_eq!(out, "VERDICT: PASS 终审通过");
 
         let requests = server.received_requests().await.unwrap();
@@ -10986,8 +12590,14 @@ max_iterations = 3
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
-        let design_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("产出设计稿")).collect();
-        assert_eq!(design_reqs.len(), 2, "design 应重跑一次: {}", design_reqs.len());
+        let design_reqs: Vec<&String> =
+            bodies.iter().filter(|b| b.contains("产出设计稿")).collect();
+        assert_eq!(
+            design_reqs.len(),
+            2,
+            "design 应重跑一次: {}",
+            design_reqs.len()
+        );
         assert!(
             design_reqs[1].contains("【上轮审查反馈】")
                 && design_reqs[1].contains("VERDICT: REVISE"),
@@ -10995,7 +12605,12 @@ max_iterations = 3
             design_reqs[1]
         );
         let impl_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("编写实现")).collect();
-        assert_eq!(impl_reqs.len(), 2, "下游 impl 应随返工作废重跑: {}", impl_reqs.len());
+        assert_eq!(
+            impl_reqs.len(),
+            2,
+            "下游 impl 应随返工作废重跑: {}",
+            impl_reqs.len()
+        );
         let gate_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("放行判定")).collect();
         assert_eq!(gate_reqs.len(), 2, "gate 应跑两轮: {}", gate_reqs.len());
     }
@@ -11036,9 +12651,9 @@ max_iterations = 2
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REVISE 仍有阻断",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("VERDICT: REVISE 仍有阻断")),
+            )
             .mount(&server)
             .await;
 
@@ -11120,9 +12735,10 @@ max_iterations = 3
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: PASS\n【实现计划】1. 改 stats.c",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: PASS\n【实现计划】1. 改 stats.c")),
+            )
             .mount(&server)
             .await;
 
@@ -11143,7 +12759,8 @@ max_iterations = 3
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).to_string())
             .collect();
-        let design_reqs: Vec<&String> = bodies.iter().filter(|b| b.contains("产出设计稿")).collect();
+        let design_reqs: Vec<&String> =
+            bodies.iter().filter(|b| b.contains("产出设计稿")).collect();
         assert_eq!(design_reqs.len(), 2, "REJECT 必须触发 brainstorm 重跑");
         assert!(
             design_reqs[1].contains("【上轮审查反馈】") && design_reqs[1].contains("stats.c:1234"),
@@ -11283,9 +12900,10 @@ max_iterations = 3
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("放行判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REJECT\n阻断原因：输入缺失无法核验",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: REJECT\n阻断原因：输入缺失无法核验")),
+            )
             .mount(&server)
             .await;
 
@@ -11354,8 +12972,11 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-ans-2", "design_and_plan", "主题", 0, None);
-        AnswerLog::new(cwd, "wf-ans-2", None, None, Default::default())
-            .record("tutor", "时间预算？", "10h+");
+        AnswerLog::new(cwd, "wf-ans-2", None, None, Default::default()).record(
+            "tutor",
+            "时间预算？",
+            "10h+",
+        );
 
         let state = load_checkpoint(cwd, "wf-ans-2").expect("checkpoint");
         // 新 run（新 wf_id）用上一次的回答预载。
@@ -11375,8 +12996,11 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _ckpt = CheckpointLog::new(cwd, "wf-carry-1", "design_and_plan", "主题", 0, None);
-        AnswerLog::new(cwd, "wf-carry-1", None, None, Default::default())
-            .record("tutor", "时间预算？", "10h+");
+        AnswerLog::new(cwd, "wf-carry-1", None, None, Default::default()).record(
+            "tutor",
+            "时间预算？",
+            "10h+",
+        );
         let first = load_checkpoint(cwd, "wf-carry-1").expect("第一份 checkpoint");
 
         // 模拟 run_workflow_inner 的 resume 抄写块（Step + Answer）。
@@ -11443,7 +13067,8 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _root = CheckpointLog::new(cwd, "wf-root-1", "design_and_plan", "主题", 0, None);
-        let _child = CheckpointLog::new(cwd, "wf-child-1", "requirements_review", "子主题", 0, None);
+        let _child =
+            CheckpointLog::new(cwd, "wf-child-1", "requirements_review", "子主题", 0, None);
 
         // 子 run 的 AnswerLog：root 指向顶层。
         let log = AnswerLog::new(
@@ -11489,7 +13114,9 @@ max_iterations = 3
         log.record("tutor", "选哪个？", "A");
 
         let raw = std::fs::read_to_string(
-            cwd.join(".latte").join("workflow-runs").join("wf-solo-1.jsonl"),
+            cwd.join(".latte")
+                .join("workflow-runs")
+                .join("wf-solo-1.jsonl"),
         )
         .expect("read ckpt");
         let answers = raw.lines().filter(|l| l.contains("\"answer\"")).count();
@@ -11529,7 +13156,8 @@ max_iterations = 3
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let _root = CheckpointLog::new(cwd, "wf-root-2", "design_and_plan", "主题", 0, None);
-        let _old_child = CheckpointLog::new(cwd, "wf-child-2a", "requirements_review", "子", 0, None);
+        let _old_child =
+            CheckpointLog::new(cwd, "wf-child-2a", "requirements_review", "子", 0, None);
 
         // 第一次跑：子 run A 里用户答了题（双写本层 + 根）。
         AnswerLog::new(
@@ -11665,7 +13293,10 @@ output_key = "user_profile"
         // checkpoint 里必须有 Answer 记录 —— 证明六层接线没有断在 None。
         let runs = dir.path().join(".latte").join("workflow-runs");
         let mut found: Option<String> = None;
-        for entry in std::fs::read_dir(&runs).expect("workflow-runs 目录").flatten() {
+        for entry in std::fs::read_dir(&runs)
+            .expect("workflow-runs 目录")
+            .flatten()
+        {
             let raw = std::fs::read_to_string(entry.path()).unwrap_or_default();
             for line in raw.lines() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -11678,8 +13309,14 @@ output_key = "user_profile"
         }
         let line = found.expect("checkpoint 必须落一条 answer 记录（接线断了就没有）");
         assert!(line.contains("改源码/做实现"), "答案原文要落盘: {line}");
-        assert!(line.contains("第 1 题"), "问题原文要落盘（回放的 key）: {line}");
-        assert!(line.contains("\"role\":\"worker\""), "记账要带提问角色: {line}");
+        assert!(
+            line.contains("第 1 题"),
+            "问题原文要落盘（回放的 key）: {line}"
+        );
+        assert!(
+            line.contains("\"role\":\"worker\""),
+            "记账要带提问角色: {line}"
+        );
     }
     /// 熔断判定必须锁在 loop_until 保护内：没有返工环的 step 产出里
     /// 出现别的 step 的裁决原文（评审引用 gate 结论是常态）不该判死
@@ -11709,9 +13346,10 @@ depends_on = ["review"]
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("复述历史裁决"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "上一轮评审写的是 VERDICT: REJECT，本轮已修复",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("上一轮评审写的是 VERDICT: REJECT，本轮已修复")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -11739,17 +13377,17 @@ depends_on = ["review"]
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("产出方案"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "方案本体：先做 X 再做 Y",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("方案本体：先做 X 再做 Y")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("终审"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: PASS 裁决文本",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("VERDICT: PASS 裁决文本")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -12147,7 +13785,10 @@ output_key = "design"
     fn dispatch_budget_reads_env_with_default() {
         let _g = lock_env_for_dispatch_cap();
         std::env::remove_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP");
-        assert_eq!(DispatchBudget::from_env().cap(), DEFAULT_WORKFLOW_DISPATCH_CAP);
+        assert_eq!(
+            DispatchBudget::from_env().cap(),
+            DEFAULT_WORKFLOW_DISPATCH_CAP
+        );
         std::env::set_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP", " 7 ");
         assert_eq!(DispatchBudget::from_env().cap(), 7, "应容忍空白");
         std::env::set_var("LATTE_AGENT_WORKFLOW_DISPATCH_CAP", "0");
@@ -12280,8 +13921,7 @@ workflow = "child"
         )
         .unwrap();
 
-        let (mut ctx, _rx) =
-            test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        let (mut ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
         // 父 1 个 + 子 2 个 = 3 个单元；预算给 2 → 必须在子流程里就撞上。
         let budget = Arc::new(DispatchBudget::new(2));
         ctx.dispatch_budget = Some(budget.clone());
@@ -12365,8 +14005,8 @@ mod loop_tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -12394,7 +14034,8 @@ mod loop_tests {
                 event_tx,
                 turn_cancel_flag: None,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
-                agent_pause_gate: None, depth: 0,
+                agent_pause_gate: None,
+                depth: 0,
                 subsession_store: None,
                 session_id: None,
                 advisor_gate: None,
@@ -12435,6 +14076,90 @@ output_key = "quality"
         toml::from_str(&raw).expect("valid TOML")
     }
 
+    #[tokio::test]
+    async fn read_path_allowlist_rejects_paths_outside_the_workflow_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let allowed = dir.path().join(".latte/learn/topic/draft.md");
+        std::fs::create_dir_all(allowed.parent().unwrap()).expect("mkdir");
+        std::fs::write(&allowed, "approved document").expect("write allowed fixture");
+        let forbidden = dir.path().join("src/secret.c");
+        std::fs::create_dir_all(forbidden.parent().unwrap()).expect("mkdir");
+        std::fs::write(&forbidden, "not review input").expect("write forbidden fixture");
+
+        let tm = build_tool_manager(&["read".to_string()])
+            .await
+            .expect("read manager");
+        wrap_read_path_allowlist(&tm, dir.path(), &[".latte/learn/*/draft.md".to_string()]);
+
+        let ok = tm
+            .execute("read", serde_json::json!({"path": allowed}), None)
+            .await
+            .expect("allowed draft read");
+        assert!(ok.to_string().contains("approved document"));
+        let err = tm
+            .execute("read", serde_json::json!({"path": forbidden}), None)
+            .await
+            .expect_err("source read must be rejected by workflow boundary");
+        assert!(
+            err.to_string().contains("workflow step read scope rejects"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_budget_restarts_with_compact_topic_not_original_task() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("LOOKS_CLEAR")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        let huge_task = format!("PROOFREAD_TASK {}", "x".repeat(120_000));
+        let wf: WorkflowDef = toml::from_str(&format!(
+            r#"
+name = "prompt_budget_restart"
+[[steps]]
+id = "proofread"
+role = "tester"
+task = "{huge_task}"
+output_key = "review"
+context_overflow_restart = true
+context_overflow_max_restarts = 1
+context_overflow_files = ["draft.md"]
+prompt_token_budget = 20_000
+loop_until = "LOOKS_CLEAR"
+loop_back_to = "proofread"
+max_iterations = 2
+"#
+        ))
+        .expect("valid proactive restart workflow");
+
+        let output = run_workflow(&wf, "slug=topic\ndraft=.latte/learn/topic/draft.md", &ctx)
+            .await
+            .expect("prompt budget must slim oversized message before restart");
+        assert!(output.contains("LOOKS_CLEAR"));
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "oversized task must be slimmed into budget and sent without restart"
+        );
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(
+            body.contains("PROOFREAD_TASK"),
+            "slimmed task retains its semantic: {body}"
+        );
+        assert!(
+            body.contains("中段省略"),
+            "slimmed task must carry middle-out marker: {body}"
+        );
+        assert!(
+            !body.contains("【受控上下文重启】"),
+            "slim rescue must avoid triggering fresh restart: {body}"
+        );
+    }
+
     fn bodies_containing(requests: &[wiremock::Request], pat: &str) -> Vec<String> {
         requests
             .iter()
@@ -12447,6 +14172,76 @@ output_key = "quality"
     /// 只有 REVISE 才允许通过 loop_until 回到上游返工。熔断词表由
     /// step 显式声明——引擎不再硬编码 `VERDICT: REJECT`。
     #[tokio::test]
+    async fn serial_context_overflow_restarts_current_step_with_topic_and_files() {
+        let server = wiremock::MockServer::start().await;
+        // The first proofreader request is a real provider-style context error.
+        // The generic fallback response below is only available after that
+        // request, so a successful workflow proves the step-level fresh restart.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("PROOFREAD_TASK"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"context_length_exceeded: maximum context length"}}"#,
+            ))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("LOOKS_CLEAR")))
+            .mount(&server)
+            .await;
+
+        let (ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "overflow_restart"
+max_rounds = 1
+[[steps]]
+ id = "proofread"
+ role = "tester"
+ task = "PROOFREAD_TASK {{topic}}"
+ output_key = "review"
+ context_overflow_restart = true
+ context_overflow_max_restarts = 2
+ context_overflow_files = ["draft.md"]
+ loop_until = "LOOKS_CLEAR"
+ loop_back_to = "proofread"
+ max_iterations = 2
+"#,
+        )
+        .expect("valid overflow recovery workflow");
+
+        let output = run_workflow(&wf, "overflow-topic", &ctx)
+            .await
+            .expect("context overflow should restart the configured step");
+        assert!(output.contains("LOOKS_CLEAR"), "output: {output}");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "expected two provider failures plus one fresh restart"
+        );
+        let retry = String::from_utf8_lossy(&requests[2].body);
+        assert!(
+            retry.contains("overflow-topic"),
+            "retry lost topic: {retry}"
+        );
+        assert!(
+            retry.contains("draft.md"),
+            "retry lost recovery file: {retry}"
+        );
+        assert!(
+            retry.contains("【受控上下文重启】")
+                && retry.contains("没有旧对话、旧反馈或工具历史")
+                && retry.contains("忽略旧过程提出的问题")
+                && retry.contains("重新读取上述文件"),
+            "retry must carry no-history, reread-and-improve contract: {retry}"
+        );
+    }
+
+    #[tokio::test]
     async fn serial_loop_reject_is_terminal() {
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
@@ -12458,9 +14253,10 @@ output_key = "quality"
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("终审判定"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: REJECT\nISSUES: 输入无法核验",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: REJECT\nISSUES: 输入无法核验")),
+            )
             .mount(&server)
             .await;
 
@@ -12490,7 +14286,10 @@ max_iterations = 2
         let err = run_workflow(&wf, "测试主题", &ctx)
             .await
             .expect_err("REJECT 必须立即终止 workflow");
-        assert!(err.contains("VERDICT: REJECT"), "错误应保留 REJECT 理由: {err}");
+        assert!(
+            err.contains("VERDICT: REJECT"),
+            "错误应保留 REJECT 理由: {err}"
+        );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(bodies_containing(&requests, "实现任务").len(), 1);
         assert_eq!(bodies_containing(&requests, "终审判定").len(), 1);
@@ -12508,9 +14307,10 @@ max_iterations = 2
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("审查规格"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: FAIL\nGAPS: 缺少边界测试",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: FAIL\nGAPS: 缺少边界测试")),
+            )
             .up_to_n_times(1)
             .expect(1)
             .mount(&server)
@@ -12518,9 +14318,10 @@ max_iterations = 2
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("审查规格"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: PASS\nEVIDENCE: 逐条核对全部通过",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: PASS\nEVIDENCE: 逐条核对全部通过")),
+            )
             .mount(&server)
             .await;
         // 兜底：implement / quality 通用产出。
@@ -12538,7 +14339,12 @@ max_iterations = 2
 
         let requests = server.received_requests().await.unwrap();
         let impl_reqs = bodies_containing(&requests, "实现任务");
-        assert_eq!(impl_reqs.len(), 2, "implement 的模型被调 2 次: {}", requests.len());
+        assert_eq!(
+            impl_reqs.len(),
+            2,
+            "implement 的模型被调 2 次: {}",
+            requests.len()
+        );
         assert!(
             impl_reqs[1].contains("【上轮审查反馈】"),
             "返工 prompt 带审查反馈批注: {}",
@@ -12550,7 +14356,12 @@ max_iterations = 2
             impl_reqs[1]
         );
         let review_reqs = bodies_containing(&requests, "审查规格");
-        assert_eq!(review_reqs.len(), 2, "spec_review 跑 2 次: {}", requests.len());
+        assert_eq!(
+            review_reqs.len(),
+            2,
+            "spec_review 跑 2 次: {}",
+            requests.len()
+        );
 
         // 返工 Status 事件。
         let mut status_msgs: Vec<String> = Vec::new();
@@ -12576,9 +14387,10 @@ max_iterations = 2
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(wiremock::matchers::body_string_contains("审查规格"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                "VERDICT: FAIL\nGAPS: 缺少边界测试",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_body("VERDICT: FAIL\nGAPS: 缺少边界测试")),
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -12733,7 +14545,9 @@ task = "干活"
 output_from = "proposal"
 "#;
         let wf: WorkflowDef = toml::from_str(not_nested).unwrap();
-        let err = wf.validate().expect_err("非嵌套 step 带 output_from 必须报错");
+        let err = wf
+            .validate()
+            .expect_err("非嵌套 step 带 output_from 必须报错");
         assert!(err.contains("output_from"), "got: {err}");
 
         let empty = r#"
@@ -12843,10 +14657,7 @@ output_key = "design"
                     .find(|s| s.id == id)
                     .unwrap_or_else(|| panic!("{id} step"));
                 let task = step.task_text();
-                assert!(
-                    task.contains("{{design}}"),
-                    "{id} 仍要收到方案本体: {task}"
-                );
+                assert!(task.contains("{{design}}"), "{id} 仍要收到方案本体: {task}");
                 assert!(
                     task.contains("{{survey}}"),
                     "{id} 必须引用 {{{{survey}}}}，否则 export 白配、漏斗照旧: {task}"
@@ -12916,7 +14727,8 @@ output_key = "design"
     #[test]
     fn apply_task_patch_unknown_task_lists_titles() {
         let dir = patch_test_dir("unknown");
-        let resp = "```json\n{\"ops\": [{\"task\": \"T9\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
+        let resp =
+            "```json\n{\"ops\": [{\"task\": \"T9\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
         let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
         assert!(err.contains("T9") && err.contains("T1 实现"), "{err}");
     }
@@ -12925,7 +14737,8 @@ output_key = "design"
     fn apply_task_patch_ambiguous_task_rejected() {
         let dir = patch_test_dir("ambiguous");
         // 「T」同时匹配 T1/T2
-        let resp = "```json\n{\"ops\": [{\"task\": \"T\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
+        let resp =
+            "```json\n{\"ops\": [{\"task\": \"T\", \"field\": \"priority\", \"set\": 1}]}\n```\n";
         let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
         assert!(err.contains("匹配到 2 个任务"), "{err}");
     }
@@ -12933,7 +14746,8 @@ output_key = "design"
     #[test]
     fn apply_task_patch_unknown_field_rejected() {
         let dir = patch_test_dir("field");
-        let resp = "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"owner\", \"set\": \"x\"}]}\n```\n";
+        let resp =
+            "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"owner\", \"set\": \"x\"}]}\n```\n";
         let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
         assert!(err.contains("owner") && err.contains("paths"), "{err}");
     }
@@ -12941,7 +14755,8 @@ output_key = "design"
     #[test]
     fn apply_task_patch_type_mismatch_rejected() {
         let dir = patch_test_dir("type");
-        let resp = "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"title\", \"set\": 5}]}\n```\n";
+        let resp =
+            "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"title\", \"set\": 5}]}\n```\n";
         let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
         assert!(err.contains("类型"), "{err}");
     }
@@ -12950,7 +14765,8 @@ output_key = "design"
     fn apply_task_patch_noop_guard() {
         let dir = patch_test_dir("noop");
         // priority 已是 2，再 set 2 = 无实际修改
-        let resp = "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"priority\", \"set\": 2}]}\n```\n";
+        let resp =
+            "```json\n{\"ops\": [{\"task\": \"T1\", \"field\": \"priority\", \"set\": 2}]}\n```\n";
         let err = apply_task_patch(PATCH_DRAFT, resp, &dir).unwrap_err();
         assert!(err.contains("无实际修改"), "{err}");
     }
@@ -12986,7 +14802,8 @@ output_key = "design"
         let dir = patch_test_dir("contract");
         assert!(check_plan_tasks_output(PATCH_DRAFT, &dir).is_ok());
         // 幻觉路径 → 机械校验打回
-        let bad = "```json\n{\"tasks\": [{\"title\": \"T\", \"paths\": [\"nonexistent_dir_xyz\"]}]}\n```";
+        let bad =
+            "```json\n{\"tasks\": [{\"title\": \"T\", \"paths\": [\"nonexistent_dir_xyz\"]}]}\n```";
         let err = check_plan_tasks_output(bad, &dir).unwrap_err();
         assert!(err.contains("机械校验"), "{err}");
     }
@@ -13221,7 +15038,9 @@ submit_plan_from = "final_draft"
         // paths 机械校验需要真实目录
         let dir = patch_test_dir("e2e");
         let ctx = WorkflowRunContext { cwd: dir, ..ctx };
-        let out = run_workflow(&wf, "测试主题", &ctx).await.expect("workflow 应成功");
+        let out = run_workflow(&wf, "测试主题", &ctx)
+            .await
+            .expect("workflow 应成功");
         assert!(out.contains("已提交 2 个任务候选"), "{out}");
 
         // submit 是机械步：模型请求只有 refine + revise 两次。
@@ -13244,27 +15063,882 @@ submit_plan_from = "final_draft"
 }
 #[cfg(test)]
 mod deterministic_learning_tests {
-    use super::deterministic_grade_quiz;
+    use super::{deterministic_grade_quiz, format_quiz_feedback};
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn one_point_plan(answer: &str) -> serde_json::Value {
+        json!({"knowledge_points":[{"id":"k1","answer":answer}]})
+    }
+    fn one_point_ledger() -> serde_json::Value {
+        json!({"knowledge_points":[{"id":"k1","wrong":0,"passed":false}]})
+    }
+    fn answers_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
     fn label_grading_and_receipt_replay_are_stable() {
-        let plan = json!({"knowledge_points":[{"id":"k1","answer":"borrow"}]});
-        let mut ledger = json!({"knowledge_points":[{"id":"k1","wrong":0,"passed":false}]});
-        let mut answers = HashMap::new(); answers.insert("k1".into(), "borrow".into());
-        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers));
-        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        let plan = one_point_plan("borrow");
+        let mut ledger = one_point_ledger();
+        let answers = answers_of(&[("k1", "borrow")]);
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers).passed);
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers).passed);
         assert_eq!(ledger["_graded_answers"]["k1:1"], "borrow");
     }
     #[test]
     fn incorrect_attempt_increments_and_later_attempt_is_gradeable() {
-        let plan = json!({"knowledge_points":[{"id":"k1","answer":"right"}]});
-        let mut ledger = json!({"knowledge_points":[{"id":"k1","wrong":0,"passed":false}]});
-        let mut answers = HashMap::new(); answers.insert("k1".into(), "wrong".into());
-        assert!(!deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        let plan = one_point_plan("right");
+        let mut ledger = one_point_ledger();
+        let mut answers = answers_of(&[("k1", "wrong")]);
+        assert!(!deterministic_grade_quiz(&plan, &mut ledger, &answers).passed);
         answers.insert("k1".into(), "right".into());
-        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers));
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &answers).passed);
         assert_eq!(ledger["knowledge_points"][0]["wrong"], 1);
         assert!(ledger["_graded_answers"].get("k1:2").is_some());
+    }
+
+    /// 判分容忍度：归一化后相等、部分 label、带前缀/后缀都判对；
+    /// 自由文本（「不知道」）、空串判错。
+    #[test]
+    fn grading_tolerates_partial_and_prefixed_labels() {
+        let plan = one_point_plan("borrow 语义");
+        // 完全相等（忽略大小写与收尾标点）。
+        let mut ledger = one_point_ledger();
+        assert!(
+            deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "Borrow 语义。")]))
+                .passed
+        );
+        // 只回 label 的一部分。
+        let mut ledger = one_point_ledger();
+        assert!(
+            deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "borrow")])).passed
+        );
+        // 带前缀（「我选 borrow 语义」），互相包含。
+        let mut ledger = one_point_ledger();
+        assert!(
+            deterministic_grade_quiz(
+                &plan,
+                &mut ledger,
+                &answers_of(&[("k1", "我选 borrow 语义")])
+            )
+            .passed
+        );
+        // 自由文本判错。
+        let mut ledger = one_point_ledger();
+        assert!(
+            !deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "不知道")])).passed
+        );
+        // 空串判错。
+        let mut ledger = one_point_ledger();
+        assert!(!deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "  ")])).passed);
+        // 单字正确 label 不允许包含匹配（防误判）。
+        let plan = one_point_plan("锁");
+        let mut ledger = one_point_ledger();
+        assert!(
+            !deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "不知道锁不锁")]))
+                .passed
+        );
+    }
+
+    /// 同 attempt 重放幂等：receipt（id:attempt）命中时账本不再推进——
+    /// wrong 不重复 +1，已 passed 的点也不会被翻回去。
+    #[test]
+    fn replay_is_idempotent_and_passed_is_not_flipped_back() {
+        let plan = one_point_plan("right");
+        // receipt 守卫：attempt 1 的 receipt 已存在而 wrong 仍为 0（同一
+        // attempt 的重放），同一答错重放不再 wrong+1。
+        let mut ledger = json!({
+            "knowledge_points": [{"id": "k1", "wrong": 0, "passed": false}],
+            "_graded_answers": {"k1:1": "wrong"}
+        });
+        let wrong = answers_of(&[("k1", "wrong")]);
+        assert!(!deterministic_grade_quiz(&plan, &mut ledger, &wrong).passed);
+        assert_eq!(
+            ledger["knowledge_points"][0]["wrong"], 0,
+            "receipt 命中的 attempt 重放不应重复计数"
+        );
+
+        // 自然推进：答错（attempt 1 → wrong=1）→ 答对（attempt 2 → passed）。
+        let mut ledger = one_point_ledger();
+        assert!(!deterministic_grade_quiz(&plan, &mut ledger, &wrong).passed);
+        assert_eq!(ledger["knowledge_points"][0]["wrong"], 1);
+        let right = answers_of(&[("k1", "right")]);
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &right).passed);
+        // passed 后 attempt 推导仍为 2 且 receipt 已存在：任何重放（即使
+        // 答案对不上）都不再把 passed 翻回、不再 wrong+1。
+        let replayed_wrong = answers_of(&[("k1", "wrong-again")]);
+        assert!(deterministic_grade_quiz(&plan, &mut ledger, &replayed_wrong).passed);
+        assert_eq!(ledger["knowledge_points"][0]["passed"], true);
+        assert_eq!(ledger["knowledge_points"][0]["wrong"], 1);
+        assert_eq!(ledger["_graded_answers"]["k1:2"], "right");
+    }
+
+    /// quiz 反馈文本：答错时逐题回显「判分结果」「你选的是」+ 正确答案、
+    /// 为什么与 file:line 出处，末行 QUIZ_FAIL；全对时末行 QUIZ_PASS。
+    #[test]
+    fn quiz_feedback_is_per_question_and_ends_with_marker() {
+        let plan = json!({"knowledge_points":[
+            {"id":"k1","title":"所有权规则","answer":"borrow 语义",
+             "evidence":"src/ownership.rs:12-48",
+             "teach_points":["每个值有唯一 owner（src/ownership.rs:12）"]},
+            {"id":"k2","title":"生命周期","answer":"借用检查器",
+             "evidence":"src/borrow.rs:3",
+             "teach_points":["借用不能越过 owner 存活期"]}
+        ]});
+        // 一错一对：反馈含错因与出处，末行 QUIZ_FAIL。
+        let mut ledger = json!({"knowledge_points":[
+            {"id":"k1","wrong":0,"passed":false},
+            {"id":"k2","wrong":0,"passed":false}
+        ]});
+        let grade = deterministic_grade_quiz(
+            &plan,
+            &mut ledger,
+            &answers_of(&[("k1", "随便填的"), ("k2", "借用检查器")]),
+        );
+        assert!(!grade.passed);
+        let out = format_quiz_feedback(&grade);
+        assert!(out.contains("判分结果"), "{out}");
+        assert!(out.contains("你选的是：随便填的"), "{out}");
+        assert!(out.contains("你选的是：借用检查器"), "{out}");
+        assert!(out.contains("知识点 k1「所有权规则」"), "{out}");
+        assert!(out.contains("正确答案：borrow 语义"), "{out}");
+        assert!(out.contains("每个值有唯一 owner"), "{out}");
+        assert!(out.contains("出处：src/ownership.rs:12-48"), "{out}");
+        assert!(
+            out.contains("该节讲解将在下一版文档里增强，重读后再考"),
+            "{out}"
+        );
+        // 答对的题不附正确答案段。
+        let k2_seg = out.split("知识点 k2").nth(1).unwrap();
+        assert!(!k2_seg.contains("正确答案"), "{k2_seg}");
+        assert_eq!(out.lines().last().unwrap(), "QUIZ_FAIL", "{out}");
+        // 循环判定子串：全对标记不得出现在失败产出里。
+        assert!(!out.contains("QUIZ_PASS"), "{out}");
+
+        // 重考全对：末行 QUIZ_PASS。
+        let grade = deterministic_grade_quiz(
+            &plan,
+            &mut ledger,
+            &answers_of(&[("k1", "borrow 语义"), ("k2", "借用检查器")]),
+        );
+        assert!(grade.passed);
+        let out = format_quiz_feedback(&grade);
+        assert_eq!(out.lines().last().unwrap(), "QUIZ_PASS", "{out}");
+        assert!(!out.contains("QUIZ_FAIL"), "{out}");
+        assert!(out.contains("判分结果：答对"), "{out}");
+    }
+
+    /// 前置链提示：k2 声明 requires=[k1]，k1 未通过时 k2 答错的反馈必须
+    /// 指出「前置未掌握」并点名前置标题；k1 已通过（含同轮答对）则不提示。
+    #[test]
+    fn wrong_answer_points_out_unmet_prerequisites() {
+        let plan = json!({"knowledge_points":[
+            {"id":"k1","title":"所有权规则","answer":"borrow 语义"},
+            {"id":"k2","title":"生命周期","answer":"借用检查器","requires":["k1"]}
+        ]});
+        // k1 答错、k2 也答错：k2 的反馈要点名前置「所有权规则」。
+        let mut ledger = json!({"knowledge_points":[
+            {"id":"k1","wrong":0,"passed":false},
+            {"id":"k2","wrong":0,"passed":false}
+        ]});
+        let grade = deterministic_grade_quiz(
+            &plan,
+            &mut ledger,
+            &answers_of(&[("k1", "随便"), ("k2", "随便")]),
+        );
+        assert!(!grade.passed);
+        let out = format_quiz_feedback(&grade);
+        let k2_seg = out.split("知识点 k2").nth(1).unwrap();
+        assert!(k2_seg.contains("前置未掌握"), "{k2_seg}");
+        assert!(k2_seg.contains("「所有权规则」"), "{k2_seg}");
+
+        // k1 同轮答对（按 plan 顺序先判）：k2 答错不再提示前置。
+        let mut ledger = json!({"knowledge_points":[
+            {"id":"k1","wrong":0,"passed":false},
+            {"id":"k2","wrong":0,"passed":false}
+        ]});
+        let grade = deterministic_grade_quiz(
+            &plan,
+            &mut ledger,
+            &answers_of(&[("k1", "borrow 语义"), ("k2", "随便")]),
+        );
+        let out = format_quiz_feedback(&grade);
+        let k2_seg = out.split("知识点 k2").nth(1).unwrap();
+        assert!(!k2_seg.contains("前置未掌握"), "{k2_seg}");
+    }
+
+    #[test]
+    fn test_assemble_draft_from_sections_deterministic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        let sections = base.join("sections");
+        std::fs::create_dir_all(&sections).unwrap();
+
+        // 写 plan.json
+        let plan = serde_json::json!({
+            "slug": "test-slug",
+            "knowledge_points": [
+                {"id": "k1", "title": "概念一"},
+                {"id": "k2", "title": "概念二"}
+            ]
+        });
+        std::fs::write(base.join("plan.json"), plan.to_string()).unwrap();
+
+        // 写 00_overview.md 和两个章节
+        std::fs::write(
+            sections.join("00_overview.md"),
+            "# 全局概览与心智模型\n\n以物流系统为例...",
+        )
+        .unwrap();
+        std::fs::write(
+            sections.join("01_k1.md"),
+            "## 1. 概念一\n\n### 怎么存\n网格化排布...",
+        )
+        .unwrap();
+        std::fs::write(
+            sections.join("k2.md"),
+            "## 2. 概念二\n\n### 为什么这样存\n反向思考...",
+        )
+        .unwrap();
+
+        // 执行确定性装配
+        let ok = super::assemble_draft_from_sections(base).expect("assemble ok");
+        assert!(ok, "存在 sections 时装配应返回 true");
+
+        let draft = std::fs::read_to_string(base.join("draft.md")).expect("read draft.md");
+        assert!(draft.contains("# 全局概览与心智模型"));
+        assert!(draft.contains("## 1. 概念一"));
+        assert!(draft.contains("## 2. 概念二"));
+        // 验证拼接顺序：overview 在前，k1 在前，k2 在后
+        let idx_ov = draft.find("# 全局概览").unwrap();
+        let idx_k1 = draft.find("## 1. 概念一").unwrap();
+        let idx_k2 = draft.find("## 2. 概念二").unwrap();
+        assert!(idx_ov < idx_k1);
+        assert!(idx_k1 < idx_k2);
+    }
+}
+
+/// learn_loop 串行引擎级测试：确定性 quiz 步参与 loop_until 返工判定。
+/// 用 wiremock 假模型跑 doc/supplement 两个模型步，read_confirm/quiz
+/// 由引擎确定性执行，用户作答经 `ChatEvent::ChoiceRequested` +
+/// `crate::choice::resolve` 模拟。
+#[cfg(test)]
+mod learn_loop_engine_tests {
+    use super::*;
+    use crate::config::{ModelCatalog, ModelDef};
+    use crate::role::RoleTemplate;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    fn openai_body(content: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    fn test_config_at(base_url: &str) -> Arc<AgentConfig> {
+        let roles = HashMap::from([(
+            "tutor".to_string(),
+            RoleTemplate {
+                id: "tutor".into(),
+                name: "tutor".into(),
+                category: "execution".into(),
+                model_tier: "premium".into(),
+                model_chain: vec![],
+                prompt_file: None,
+                temperature: None,
+                tools: vec![],
+                icon: String::new(),
+                skills: vec![],
+                code_paths: vec![],
+                description: String::new(),
+            },
+        )]);
+        Arc::new(AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "Test Premium".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: base_url.into(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles,
+        })
+    }
+
+    /// 最小 learn_loop：doc（模型，产出 slug）→ read_confirm（确定性）→
+    /// quiz（确定性，loop_until=QUIZ_PASS，QUIZ_FAIL 回 doc）→ supplement
+    /// （模型）。quiz 的循环配置全部从 step 配置读取，引擎不硬编码。
+    fn learn_loop_wf() -> WorkflowDef {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "写学习文档 {{topic}}"
+output_key = "plan_out"
+[[steps]]
+id = "read_confirm"
+role = "tutor"
+task = "确认读完"
+[[steps]]
+id = "quiz"
+role = "tutor"
+task = "出题判分"
+loop_until = "QUIZ_PASS"
+loop_back_routes = { QUIZ_FAIL = "doc" }
+max_iterations = 3
+[[steps]]
+id = "supplement"
+role = "tutor"
+task = "补充疑问"
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+        wf
+    }
+
+    /// 第一次 quiz 答错 k1 → QUIZ_FAIL 跳回 doc（pending_feedback 注入 doc
+    /// prompt）→ 重读 → 第二次 quiz 全对 → QUIZ_PASS 进入 supplement。
+    #[tokio::test]
+    async fn quiz_fail_reworks_to_doc_then_pass_advances() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte").join("learn").join("testslug");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "testslug",
+                "topic": "测试主题",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权规则", "evidence": "src/ownership.rs:12-48",
+                     "teach_points": ["每个值有唯一 owner（src/ownership.rs:12）"],
+                     "question": "传 a 进 f 之后还能用 a 吗？",
+                     "options": [{"label": "还能用"}, {"label": "borrow 语义"}],
+                     "answer": "borrow 语义"},
+                    {"id": "k2", "title": "生命周期", "evidence": "src/borrow.rs:3",
+                     "teach_points": ["借用不能越过 owner 存活期"],
+                     "question": "借用能活多久？",
+                     "options": [{"label": "永远"}, {"label": "不超过 owner"}],
+                     "answer": "不超过 owner"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("ledger.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "testslug", "round": 0,
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权规则", "wrong": 0, "passed": false},
+                    {"id": "k2", "title": "生命周期", "wrong": 0, "passed": false}
+                ],
+                "supplements": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(base.join("draft.md"), "# 学习文档").unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("写学习文档"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("testslug")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("补充疑问"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("学习完成")))
+            .mount(&server)
+            .await;
+
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, event_rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+
+        // 学员模拟器：read_confirm 点「开始答题」；quiz 第一轮 k1 答错、
+        // k2 答对，之后全对。收集 Status 事件供返工断言。
+        let driver = tokio::spawn(async move {
+            let mut rx = event_rx;
+            let mut quiz_round = 0usize;
+            let mut statuses: Vec<String> = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(ChatEvent::ChoiceRequested {
+                        choice_id,
+                        questions,
+                        options,
+                        ..
+                    }) => {
+                        let answer = if questions.is_empty() {
+                            options[0].label.clone()
+                        } else {
+                            quiz_round += 1;
+                            questions
+                                .iter()
+                                .map(|q| {
+                                    // 第一轮把 k1 答错（选干扰项），其余及各轮全对。
+                                    let wrong = quiz_round == 1 && q.id == "k1";
+                                    let label = if wrong {
+                                        q.options[0].label.clone()
+                                    } else {
+                                        match q.id.as_str() {
+                                            "k1" => "borrow 语义".to_string(),
+                                            other => {
+                                                let _ = other;
+                                                "不超过 owner".to_string()
+                                            }
+                                        }
+                                    };
+                                    format!("{}→{}", q.id, label)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        assert!(
+                            crate::choice::resolve(&choice_id, answer),
+                            "choice {choice_id} 应处于等待态"
+                        );
+                    }
+                    Ok(ChatEvent::Status { message }) => statuses.push(message),
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break statuses,
+                }
+            }
+        });
+
+        let wf = learn_loop_wf();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_workflow(&wf, "测试主题", &ctx),
+        )
+        .await
+        .expect("workflow 不应卡死")
+        .expect("workflow 应成功");
+        assert!(out.contains("学习完成"), "{out}");
+        drop(ctx);
+        let statuses = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+            .await
+            .expect("driver 应退出")
+            .expect("driver 不应 panic");
+
+        // 返工 Status 事件：跳回 doc。
+        assert!(
+            statuses
+                .iter()
+                .any(|m| m.contains("↩ 第 1 轮返工") && m.contains("跳回 'doc'")),
+            "应有跳回 doc 的返工事件，实际：{statuses:?}"
+        );
+
+        // doc 被派两次；第二次的 prompt 必须带 quiz 反馈（pending_feedback
+        // 注入）：判分结果、答错的知识点、正确答案与 evidence。
+        let requests = server.received_requests().await.unwrap();
+        let doc_bodies: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .filter(|b| b.contains("写学习文档"))
+            .collect();
+        assert_eq!(doc_bodies.len(), 2, "doc 应被派两次（初写 + 返工增强）");
+        assert!(!doc_bodies[0].contains("判分结果"), "第一次 doc 不应带反馈");
+        let rework = &doc_bodies[1];
+        for pat in [
+            "【上轮审查反馈】",
+            "判分结果",
+            "你选的是",
+            "k1",
+            "borrow 语义",
+            "src/ownership.rs:12-48",
+            "QUIZ_FAIL",
+        ] {
+            assert!(rework.contains(pat), "返工 doc prompt 缺 {pat}：{rework}");
+        }
+
+        // 账本：k1 wrong=1 后通过，k2 一次通过。
+        let ledger: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).unwrap())
+                .unwrap();
+        assert_eq!(ledger["knowledge_points"][0]["wrong"], 1);
+        assert_eq!(ledger["knowledge_points"][0]["passed"], true);
+        assert_eq!(ledger["knowledge_points"][1]["wrong"], 0);
+        assert_eq!(ledger["knowledge_points"][1]["passed"], true);
+    }
+
+    #[test]
+    fn learn_loop_nested_doc_review_config_is_hard_gated() {
+        let outer: WorkflowDef =
+            toml::from_str(include_str!("../../config/workflows/learn_loop.toml"))
+                .expect("learn_loop TOML must parse");
+        outer.validate().expect("learn_loop config must validate");
+
+        let review = outer
+            .steps
+            .iter()
+            .find(|s| s.id == "doc_review")
+            .expect("outer workflow must have doc_review nested step");
+        assert_eq!(review.workflow.as_deref(), Some("doc_review_loop"));
+        assert_eq!(review.output_from.as_deref(), Some("review_out"));
+
+        let inner: WorkflowDef =
+            toml::from_str(include_str!("../../config/workflows/doc_review_loop.toml"))
+                .expect("doc_review_loop TOML must parse");
+        inner
+            .validate()
+            .expect("doc_review_loop config must validate");
+        let proofread = inner
+            .steps
+            .iter()
+            .find(|s| s.id == "proofread")
+            .expect("nested workflow must have proofread step");
+        assert_eq!(proofread.loop_until.as_deref(), Some("LOOKS_CLEAR"));
+        assert_eq!(proofread.loop_back_to.as_deref(), Some("outline"));
+        // loop_no_release_on 保持为 None，避免将 proofreader 的建议误判为致命硬拒绝，
+        // 确保耗尽时可走 loop_exhausted_last_resort_review 经 Advisor 语义复核放行。
+        assert_eq!(proofread.loop_no_release_on.as_deref(), None);
+        assert_eq!(proofread.max_iterations, Some(3));
+
+        // 主体框架先行；章节由引擎 fan_out 派发（不靠模型认领），且晚于 outline、早于 proofread。
+        let writer = inner
+            .steps
+            .iter()
+            .find(|s| s.id == "write_chapter")
+            .expect("write_chapter");
+        let fo = writer.fan_out.as_ref().expect("章节 writer 必须由引擎 fan_out 派发");
+        assert_eq!(fo.items, "knowledge_points");
+        assert_eq!(writer.depends_on, vec!["outline".to_string()]);
+        assert!(writer.task_text().contains("{{item_id}}"));
+        assert!(
+            !inner.steps.iter().any(|s| s.task_text().contains("mkdir")),
+            "分派由引擎负责，不得让模型自行认领"
+        );
+        let waves = compute_waves(&inner.steps).expect("waves");
+        let wave_of = |id: &str| {
+            waves
+                .iter()
+                .position(|w| w.iter().any(|&i| inner.steps[i].id == id))
+                .unwrap()
+        };
+        assert!(wave_of("outline") < wave_of("write_chapter"));
+        assert!(wave_of("write_chapter") < wave_of("proofread"));
+        assert!(
+            proofread.tools.iter().any(|t| t == "search")
+                && proofread.read_path_allowlist.is_empty(),
+            "审稿员必须能读源码核对事实"
+        );
+        assert!(
+            proofread.task_text().contains("行号偏差、措辞、格式**只算 NIT"),
+            "行号偏差不得成为 BLOCKER"
+        );
+        let proofreader_prompt = include_str!("../../prompts/proofreader.md");
+        assert!(
+            proofreader_prompt.contains("每轮独立审稿")
+                && !proofreader_prompt.contains("PROOFREAD_HISTORY"),
+            "proofreader 不得通过历史问题维持跨轮记忆"
+        );
+
+        for id in ["legacy_doc", "legacy_proofread"] {
+            let legacy = outer
+                .steps
+                .iter()
+                .find(|s| s.id == id)
+                .expect("legacy step");
+            assert_eq!(legacy.when_any, vec!["__legacy_flat_learn_loop__"]);
+            assert!(legacy.output_key.is_some());
+        }
+    }
+
+    /// doc_review_loop 决策逻辑回归测试：
+    /// 1. proofreader 发现 BLOCKER 并输出 NEEDS_FIX 时，触发 Rework(0) 跳回 doc_write；
+    /// 2. proofreader 仅含 NIT 体验建议并输出 LOOKS_CLEAR 时，直接 Advance 放行进入下游。
+    #[tokio::test]
+    async fn doc_review_loop_decision_blocker_reworks_and_nit_advances() {
+        let raw = include_str!("../../config/workflows/doc_review_loop.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("doc_review_loop must parse");
+        wf.validate().expect("doc_review_loop must validate");
+        let proofread_step = wf.steps.iter().find(|s| s.id == "proofread").unwrap();
+
+        let mut iters = HashMap::new();
+        let vars = HashMap::new();
+        let server = wiremock::MockServer::start().await;
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _event_rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: PathBuf::from("."),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+
+        // 1. proofread 发现 BLOCKER，末行输出 NEEDS_FIX → 触发返工 Rework(0)（跳回 doc_write）
+        let blocker_out = "ISSUE: §0.1 | BLOCKER | 算术错误 | 2²+1·2⁴=16 不成立 | 改为 2³+1·2³=16\nNEEDS_FIX";
+        let nav = serial_loop_decision(
+            &wf,
+            proofread_step,
+            1,
+            blocker_out,
+            &mut iters,
+            &vars,
+            &None,
+            &ctx,
+            "测试主题",
+        )
+        .await
+        .expect("blocker 输出应正常触发返工判定");
+        match nav {
+            SerialLoopNav::Rework(target) => assert_eq!(target, 0, "应跳回 doc_write(下标0)"),
+            SerialLoopNav::Advance => panic!("BLOCKER 且 NEEDS_FIX 不得放行"),
+        }
+        assert_eq!(iters.get(&1), Some(&1), "迭代计数递增至 1");
+
+        // 2. proofread 复审仅含 NIT，末行输出 LOOKS_CLEAR → 放行 Advance 进入下游
+        let nit_out = "ISSUE: §1.2 | NIT | 理解建议 | 图表偏密 | 建议拆行\nLOOKS_CLEAR";
+        let nav = serial_loop_decision(
+            &wf,
+            proofread_step,
+            1,
+            nit_out,
+            &mut iters,
+            &vars,
+            &None,
+            &ctx,
+            "测试主题",
+        )
+        .await
+        .expect("nit + LOOKS_CLEAR 输出应正常放行");
+        match nav {
+            SerialLoopNav::Advance => {}
+            SerialLoopNav::Rework(_) => panic!("LOOKS_CLEAR 必须直接放行 Advance"),
+        }
+    }
+}
+
+/// 动态 prompt 预算（[`resolve_prompt_budget`]）的回归测试。
+///
+/// 事故背景：写死的 `prompt_token_budget = 48000/60000` 只在标定时的文档
+/// 尺寸下成立——2026-09-25 LAT-110 里一份 146KB 学习文档让正常的 proofread
+/// 步骤撞穿预算，两次受控重启耗尽后整条 workflow 失败。改成「模型窗口 ×
+/// 比例」后，同一份文档在大窗口模型上直接通过、在小窗口模型上自动收紧。
+#[cfg(test)]
+mod prompt_budget_tests {
+    use super::*;
+
+    /// 显式绝对上限仍然生效（向后兼容：老配置不改也能跑）。
+    #[test]
+    fn absolute_budget_wins_when_no_ratio() {
+        assert_eq!(
+            resolve_prompt_budget(Some(48_000), None, false, 128_000),
+            Some(48_000)
+        );
+        // 显式 0 = 不限（历史语义）
+        assert_eq!(resolve_prompt_budget(Some(0), None, false, 128_000), None);
+        assert_eq!(resolve_prompt_budget(None, None, false, 128_000), None);
+    }
+
+    /// 比例预算随模型窗口伸缩：这是本次改动的核心承诺。
+    #[test]
+    fn ratio_budget_scales_with_model_window() {
+        // 128K 窗口：0.8 × (128000 − 128000/5) = 0.8 × 102400 = 81920
+        let big = resolve_prompt_budget(None, Some(0.8), false, 128_000).unwrap();
+        // 32K 窗口：0.8 × (32000 − 6400) = 0.8 × 25600 = 20480
+        let small = resolve_prompt_budget(None, Some(0.8), false, 32_000).unwrap();
+        assert_eq!(big, 81_920);
+        assert_eq!(small, 20_480);
+        assert!(big > small * 3, "大窗口预算必须显著更大: {big} vs {small}");
+    }
+
+    /// catalog 虚标 1,000,000 时必须被安全天花板挡住——否则比例乘出来是
+    /// 十万级以上的预算，本地闸门等于消失（实测三个模型全虚标 1M）。
+    #[test]
+    fn ratio_budget_is_clamped_for_absurd_declared_window() {
+        let budget = resolve_prompt_budget(None, Some(0.8), false, 1_000_000).unwrap();
+        // 窗口先钳到 WINDOW_CEILING(200,000)，扣 20% 输出预留后
+        // 0.8 × 160,000 = 128,000；最终还必须落在 CEILING 之内。
+        let expected =
+            ((PROMPT_BUDGET_WINDOW_CEILING - PROMPT_BUDGET_WINDOW_CEILING / 5) as f64 * 0.8)
+                as usize;
+        assert_eq!(budget, expected, "虚标窗口必须走安全天花板链路");
+        assert!(budget <= PROMPT_BUDGET_CEILING, "预算必须不超过上限");
+    }
+
+    /// 窗口未声明（0）时退回保守回退窗口，而不是给出 0 或崩溃。
+    #[test]
+    fn ratio_budget_falls_back_when_window_unknown() {
+        let budget = resolve_prompt_budget(None, Some(0.8), false, 0).unwrap();
+        let expected =
+            ((PROMPT_BUDGET_FALLBACK_WINDOW - PROMPT_BUDGET_FALLBACK_WINDOW / 5) as f64 * 0.8)
+                as usize;
+        assert_eq!(budget, expected);
+        assert!(budget >= PROMPT_BUDGET_FLOOR);
+    }
+
+    /// 只开了 `context_overflow_restart` 却没配任何预算 = 配置自相矛盾
+    /// （重启永远不会触发）。此时按全局默认比例自动启用动态预算。
+    #[test]
+    fn restart_without_budget_enables_dynamic_budget() {
+        let budget = resolve_prompt_budget(None, None, true, 128_000).unwrap();
+        assert_eq!(
+            budget,
+            resolve_prompt_budget(
+                None,
+                Some(crate::compaction::DEFAULT_THRESHOLD_RATIO),
+                false,
+                128_000
+            )
+            .unwrap(),
+            "未配预算但开了受控重启时应按默认比例算"
+        );
+    }
+
+    /// 绝对值与比例同时存在 → 取更小者（天花板与随窗伸缩的线取交集）。
+    #[test]
+    fn absolute_and_ratio_take_the_smaller() {
+        // 小窗口下动态值更小 → 用动态值
+        assert_eq!(
+            resolve_prompt_budget(Some(100_000), Some(0.8), false, 32_000),
+            Some(20_480)
+        );
+        // 大窗口下绝对上限更小 → 用绝对上限
+        assert_eq!(
+            resolve_prompt_budget(Some(40_000), Some(0.8), false, 1_000_000),
+            Some(40_000)
+        );
+    }
+
+    /// 比例越界不静默失效：钳到可用区间。
+    #[test]
+    fn ratio_is_clamped_not_silently_ignored() {
+        // 5.0 → 钳 1.0 → 1.0 × 102400 = 102400
+        assert_eq!(
+            resolve_prompt_budget(None, Some(5.0), false, 128_000),
+            Some(102_400)
+        );
+        // 0.0 → 钳下限 0.05 → 5120，再被 floor 抬到 16384
+        assert_eq!(
+            resolve_prompt_budget(None, Some(0.0), false, 128_000),
+            Some(PROMPT_BUDGET_FLOOR)
+        );
+    }
+
+    /// 配置期校验：`(0,1]` 之外的比例要在 validate 被拦下，而不是等到
+    /// 运行时表现为「预算莫名不对」。
+    #[test]
+    fn validate_rejects_out_of_range_prompt_token_ratio() {
+        let wf = |ratio: f64| -> WorkflowDef {
+            toml::from_str(&format!(
+                r#"
+name = "ratio_check"
+[[steps]]
+id = "s"
+role = "worker"
+task = "x"
+output_key = "o"
+prompt_token_ratio = {ratio:.1}
+"#
+            ))
+            .expect("valid toml")
+        };
+        assert!(wf(0.8).validate().is_ok(), "0.8 应合法");
+        assert!(wf(1.0).validate().is_ok(), "1.0 应合法");
+        let err = wf(0.0).validate().expect_err("0.0 必须被拒");
+        assert!(err.contains("prompt_token_ratio"), "{err}");
+        let err = wf(1.5).validate().expect_err("1.5 必须被拒");
+        assert!(err.contains("prompt_token_ratio"), "{err}");
+    }
+
+    /// 出厂配置必须走动态预算：`doc_review_loop` 的 proofread 步不能再有
+    /// 写死的绝对预算（那正是事故里被文档尺寸顶穿的那个数）。
+    #[test]
+    fn doc_review_loop_proofread_uses_dynamic_budget() {
+        let wf: WorkflowDef =
+            toml::from_str(include_str!("../../config/workflows/doc_review_loop.toml"))
+                .expect("doc_review_loop TOML must parse");
+        let proofread = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "proofread")
+            .expect("proofread step");
+        assert_eq!(
+            proofread.prompt_token_ratio,
+            Some(0.8),
+            "proofread 必须按模型窗口动态算预算"
+        );
+        assert!(
+            proofread.prompt_token_budget.is_none(),
+            "不应再写死绝对预算（写死的值会被文档尺寸顶穿）"
+        );
+        assert!(
+            proofread.context_overflow_restart,
+            "仍要保留受控重启作为最后兜底"
+        );
     }
 }

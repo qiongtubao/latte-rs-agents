@@ -68,8 +68,7 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
 这种门外汉也能听懂的层级，越往后越细。若 topic 已给出分层（L0/L1/… 或阶段清单），
 就照它的顺序覆盖，不要跳过浅层直接挑深处的细节考。
 
-再定 `doc_outline`：学习文档的章节骨架，按主题定制——通常包含"它是什么、整体怎么
-运转"、核心数据结构、运行原理、模块调用交互、流程图等，与知识点顺序对应。
+再定 `doc_outline`：学习文档的章节骨架，按主题定制——**第 1 节必须是「全局心智模型与贯穿比喻（它是什么、整体怎么运转）」**；后续章节严格按主线逻辑展开核心分级/数据结构/运行原理/链路图；**凡涉及分档/分类/分层，章节必须覆盖「怎么存（物理视图）」与「为什么这样存（权衡与反向思考）」**，章节之间具备清晰的因果串联。
 
 每个知识点写：`id`（短英文）、`title`（中文）、`evidence`（`file:line`，必须真实存在）、
 `teach_points`（讲解要点数组，每条一句话 + 出处）、`example`（**最小具体例子**：讲参数
@@ -93,10 +92,11 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
 
 ## 四、落盘
 
-`write` 到 `.latte/learn/<slug>/plan.json`（slug 从主题推导，小写英文+连字符；
-**剔除「同步注释」/「写进源码」这类开关标记词**——它们是 sync_code 步的触发
-开关，不是主题内容）：
+**先查重，但重跑不是无操作**（同一任务重复派发是常态，不能因为 slug 已存在就跳过刷新）:
+1. 复用已有同主题计划的 slug 与学习账本，但每次运行都必须 write 完整的 plan.json 与 ledger.json（当前源码中的证据、行号、讲解要点、例子、题目和大纲有变化时刷新）；
+2. 确实全新才按推导规则写初始文件（slug 从主题推导，小写英文+连字符；**剔除「同步注释」/「写进源码」这类开关标记词**）；
 
+`write` 到 `.latte/learn/<slug>/plan.json`：
 ```json
 {
   "slug": "<slug>",
@@ -178,90 +178,70 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 min_chars = 30
 require = ["code/"]
 
-# ═══ 2. 写 / 增强学习文档 ════════════════════════════════════
-# tools           有 write + edit（返工增强是局部修改：实测没有 edit 时模型用
-#                 write 整文件覆写，丢掉既有章节后被迫全文重建，反复 thrash），
-#                 无 ask（不许弹窗出题）。
-# require_tools_any   draft.md 必须真被改过（edit 或 write 任一）。
-# 本步是 quiz（QUIZ_FAIL）与 supplement（SUPPLEMENT）的返工目标：被返工时，
-# 上一步的产出文本会由引擎预置进本步 prompt，据此决定增强/补充内容。
+# ═══ 2. 嵌套文档审查门（主体框架 + 章节并发写作 + 对照源码审稿）══════════════════════
+# doc_review_loop 内部执行：outline → 各章并发 write_N → proofread
+# 只有 LOOKS_CLEAR 才返回外层。
 [[steps]]
-id = "doc"
-description = "写学习文档 draft.md；返工时按反馈增强答错点或新增补充章节"
+id = "doc_review"
+description = "运行 outline→并发章节写作→proofread 嵌套循环"
+workflow = "doc_review_loop"
+output_key = "doc_review_out"
+output_from = "review_out"
+task = """学习文档审查契约：
+slug={{plan_out}}
+draft=.latte/learn/{{plan_out}}/draft.md
+plan=.latte/learn/{{plan_out}}/plan.json
+ledger=.latte/learn/{{plan_out}}/ledger.json
+"""
+
+# 兼容保留旧定义；实际执行由上面的 doc_review 嵌套 step 接管。
+[[steps]]
+id = "legacy_doc"
+description = "兼容保留：旧扁平 doc step（已由 doc_review 接管）"
 role = "tutor"
+output_key = "legacy_doc_out"
+when_any = ["__legacy_flat_learn_loop__"]
 max_retries = 1
 tools = ["read", "code_graph", "search", "edit", "write"]
 require_tools_any = ["edit", "write"]
 task = """你是互动学习辅导员，负责维护学习文档。当前主题 slug：{{plan_out}}。
 
-读 `.latte/learn/{{plan_out}}/plan.json` 与 `ledger.json`，然后按进入方式工作：
+读 `.latte/learn/{{plan_out}}/plan.json` 与 `ledger.json`，若已经存在 `draft.md`，必须先读取并刷新它。
 
 ## 首次进入（prompt 里没有上一轮的判分结果或补充问题）
 
-按 plan.json 的 `doc_outline` 写 `.latte/learn/{{plan_out}}/draft.md`。**读者是零
-基础小白**——写得像考据报告就是失败（反面教材的样子：满纸「翻译单元 / token /
-调用约定」没有一个被解释，行号表比讲解多，读三遍也不知道这东西拿来干嘛）：
-
-- 开头先讲"这是什么、整体怎么运转、什么时候会碰到它"，门外汉也能看懂；再按大纲
-  展开核心数据结构、运行原理、模块调用交互。
-- **术语零信任**：每个术语第一次出现时必须用一句大白话解释（如"预处理：编译前
-  先把宏原样替换成最终代码的那一步"），之后才能直接使用；一句话解释不清的，
-  先给一个生活类比或一句话直觉建立画面，再展开细节。不许连续堆砌未解释的术语。
-- **例子优先**：每个知识点的讲解以它的 `example` 为底——讲参数就说清"传什么进去
-  → 出来什么"，讲分支就给"A 情况变成什么、B 情况变成什么"的具体对照；任何抽象
-  描述后面必须紧跟一个具体例子，不许只有定义没有例子。
-- **结构图/调用图不要凭记忆手写**：用 `code_graph(graph="structure", path=<相关目录>)`
-  拿模块结构图、`code_graph(graph="calls", path=<子目录或单个文件>)` 拿真实调用图，
-  把返回的 mermaid 原文原样嵌进 ```mermaid 围栏（UI 会渲染成 SVG，可缩放/下载）。
-  图源是从符号索引/AST 生成的，不会出现不存在的函数名。概念性流程（状态机、数据
-  流向这类不对应具体代码符号的图）才手写 mermaid，节点名必须来自取证过的真实符号；
-  图源里不要出现原始 HTML 标签。
-- 每个知识点一节（标题 = 它的 `doc_section`），以 `teach_points` 为骨架展开，按需再读
-  代码补细节（独立取证用 `paths` 批量发）。**必须带 `file:line`** 出处（放句末即可
-  ——证据是注脚不是主角）；关键处摘几行真实代码，**摘录后面必须跟逐行讲解**，
-  不许只贴一段代码配一个行号表。
-- **控制信息密度**：正文主线只留理解必需的内容；行号级考据、使用次数统计、偏门
-  分支压进文末速查表或附录。每节末尾用一句「人话总结」收束本节。
-- `.latte/learn/{{plan_out}}/code/` 里有 annotate 步生成的注释版代码副本（README.md
-  是索引）：在对应知识点章节末尾标注副本路径（如 `code/k1-ownership.rs`），学员对照
-  源码阅读时旁边就有逐行讲解；目录不存在则不提。
-- 要覆盖每个知识点 `question` 会考的那个点——学完就考，不许突袭；但**不许摊开选项
-  或点出答案**。
+按 plan.json 的 `doc_outline` 写或刷新 `.latte/learn/{{plan_out}}/draft.md`。**读者是零
+基础小白**——写得像考据报告就是失败。开头先讲大白话和全局心智模型，按大纲展开核心数据结构与运行原理；
+术语首次出现一句大白话解释；每个知识点必须带最小具体例子（以 example 为底）；
+代码摘录后必须跟逐行讲解；每节末尾用一句「人话总结」收束本节。
 
 ## 返工进入：QUIZ_FAIL（prompt 里带上一轮的「判分结果」「你选的是」）
 
-学员答错了。只增强答错点对应的 `doc_section`：加「易错点辨析」小节，讲清 `answer`
-那个选项与其余选项的区别。**答错说明上一轮的讲法没让他懂**——换一个更具体的例子
-或类比重讲（回到 `example` 的"传什么→出来什么"句式），不要只是把原文换个措辞
-复制一遍；其余章节不动。
-**draft.md 的修改用 `edit` 做局部修改，不要用 `write` 整文件覆写**（覆写会丢掉
-其他章节）。然后把 ledger.json 的 `round` +1、刷新 `updated_at`（账本很小，直接
-write 覆盖写）。
+学员答错了。只增强答错点对应的 `doc_section`：加「易错点辨析」小节，讲清正确答案与干扰项区别。
+用 `edit` 做局部修改，不要用 `write` 整文件覆写。
 
-## 返工进入：SUPPLEMENT（prompt 里带学员的补充问题，形如「补充：…」）
+## 返工进入：SUPPLEMENT（prompt 里带学员的补充问题）
 
-学员全对后主动提出还有不懂的。先取证（read/code_graph/search），用 `edit` 把补充
-内容追加为 draft.md 的新章节（同样不要整文件覆写）；若 `code/` 目录存在，同时为补充
-知识点的 `evidence` 生成注释版副本并更新 `code/README.md`（write 新副本 + edit 索引）。
-再把补充变成一个**新知识点**：
-追加进 plan.json 的 `knowledge_points`（`id` 顺延，含 `title`/`evidence`/`teach_points`/
-`doc_section`/`question`/`options`/`answer`，出题规则同 plan 步）和 ledger.json
-（`wrong:0, passed:false`）；`round` +1、刷新 `updated_at`。
+学员全对后主动提出还有不懂的。用 `edit` 把补充内容追加为 draft.md 的新章节，并补全 plan/ledger。
 
 ## 正文（学员在 chat 里直接读的部分）
 
-本步正文在 step 结束时投递给学员，答题按钮在下一步才弹出——所以**正文就是学习材料本身**：
-
-1. **把 draft.md 的全文原样作为正文输出**（学员在 chat 里直接读完，不必先去找文件）；
-2. 文末两行：`学习材料已保存：.latte/learn/{{plan_out}}/draft.md`（想细查代码出处时可打开），
-   以及「读完后点击「开始答题」」。
-
-返工轮次（QUIZ_FAIL / SUPPLEMENT）的正文**不要重贴全文**：只输出本轮变更部分
-（增强/新增的章节全文）+ 一句"完整文档：.latte/learn/{{plan_out}}/draft.md"。"""
-
+把 draft.md 的全文原样作为正文输出，文末注明路径并提示「读完后点击「开始答题」」。
+返工轮次只输出本轮变更部分。"""
 [steps.output_contract]
 min_chars = 500
 forbid = ["正确答案是", "答案：", "选项 A", "选项一"]
+
+[[steps]]
+id = "legacy_proofread"
+description = "兼容保留：旧扁平 proofread step"
+role = "proofreader"
+output_key = "legacy_proofread_out"
+when_any = ["__legacy_flat_learn_loop__"]
+max_retries = 1
+tools = ["read"]
+require_tools = ["read"]
+task = """你是零基础读者 proofreader，只读不改。通读 draft.md，检查大白话解释、代码注释、推导与例子。"""
 
 # ═══ 3. 等学员读完：「开始答题」按钮 ═════════════════════════
 # tools            只读 + ask：不许改文档和账本。
@@ -310,7 +290,7 @@ description = "用 ask 批量出全部未掌握点的题、判分并更新账本
 role = "tutor"
 max_retries = 2
 loop_until = "QUIZ_PASS"
-loop_back_routes = { QUIZ_FAIL = "doc" }
+loop_back_routes = { QUIZ_FAIL = "doc_review" }
 max_iterations = 10
 tools = ["read", "write", "ask"]
 require_tools = ["ask", "write"]
@@ -357,7 +337,7 @@ description = "全对后问学员是否还有不懂的知识点要补充"
 role = "tutor"
 max_retries = 2
 loop_until = "ALL_DONE"
-loop_back_to = "doc"
+loop_back_to = "doc_review"
 max_iterations = 10
 tools = ["read", "write", "ask"]
 require_tools = ["ask", "write"]
