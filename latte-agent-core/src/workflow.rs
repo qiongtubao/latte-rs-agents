@@ -1116,6 +1116,12 @@ pub struct WorkflowStepDef {
     /// 目录段（如 `.latte/learn/*/draft.md`）。
     #[serde(default)]
     pub read_path_allowlist: Vec<String>,
+    /// 写类工具（write/edit/delete/ast_edit）的**真实执行路径**白名单，语义同
+    /// [`Self::read_path_allowlist`]，另外每项可含 `{{var}}`（如 fan_out 的
+    /// `{{item_id}}`、topic 的 `{{slug}}`），派发时按当次变量渲染。非空时这些
+    /// 工具的 `path`/`paths` 不匹配即被拒，并发 worker 因此无法互相覆盖文件。
+    #[serde(default)]
+    pub write_path_allowlist: Vec<String>,
     /// 每次模型调用前允许发送的 prompt token 估算上限。超出时 runner
     /// 返回 [`AgentError::PromptBudgetExceeded`]；启用
     /// `context_overflow_restart` 的 step 会被 workflow 以全新 runner
@@ -3925,6 +3931,94 @@ fn workflow_relative_read_path(cwd: &Path, spec: &str) -> Option<String> {
     (!out.is_empty()).then(|| out.join("/"))
 }
 
+/// 写类工具受白名单约束（短名）。`bash` 写什么看不出来，靠 step 的 `tools`
+/// 不给它来排除（本函数管不到）。
+const WRITE_SCOPED_TOOLS: &[&str] = &["write", "edit", "delete", "ast_edit"];
+
+/// 把 `patterns` 里的 `{{var}}` 用当次变量渲染（fan_out 元素 id、slug 等）。
+fn render_scope_patterns(patterns: &[String], vars: &HashMap<String, String>) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| {
+            let mut out = p.clone();
+            for (k, v) in vars {
+                out = out.replace(&format!("{{{{{k}}}}}"), v);
+            }
+            out
+        })
+        .collect()
+}
+
+/// 在真实 handler 边界强制写类工具的路径白名单（同 [`wrap_read_path_allowlist`]）。
+/// fail-closed：受管工具既无 `path` 也无 `paths` 时直接拒绝。
+fn wrap_write_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[String]) {
+    if patterns.is_empty() {
+        return;
+    }
+    let patterns: Vec<String> = patterns
+        .iter()
+        .map(|p| p.trim().trim_start_matches("./").replace('\\', "/"))
+        .collect();
+    for name in WRITE_SCOPED_TOOLS {
+        let Some(orig) = tm.get_tool(name) else {
+            continue;
+        };
+        let allowed_desc = patterns.join(", ");
+        let patterns = patterns.clone();
+        let cwd = cwd.to_path_buf();
+        let orig_handler = orig.handler.clone();
+        let tool_name = name.to_string();
+        let handler: SharedToolHandler = Arc::new(move |input, ctx| {
+            let patterns = patterns.clone();
+            let cwd = cwd.clone();
+            let orig_handler = orig_handler.clone();
+            let tool_name = tool_name.clone();
+            Box::pin(async move {
+                let mut requested: Vec<&str> = Vec::new();
+                if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
+                    requested.push(p);
+                }
+                if let Some(ps) = input.get("paths").and_then(|v| v.as_array()) {
+                    for v in ps {
+                        requested.push(v.as_str().ok_or_else(|| {
+                            ToolError::other(format!("{tool_name}.paths must contain only strings"))
+                        })?);
+                    }
+                }
+                if requested.is_empty() {
+                    return Err(ToolError::other(format!(
+                        "workflow write scope: {tool_name} 缺少 path，无法核验写入范围"
+                    )));
+                }
+                for spec in requested {
+                    let rel = workflow_relative_read_path(&cwd, spec).ok_or_else(|| {
+                        ToolError::other(format!(
+                            "workflow write scope rejects path outside workspace: {spec}"
+                        ))
+                    })?;
+                    if !patterns.iter().any(|p| read_scope_matches(p, &rel)) {
+                        return Err(ToolError::other(format!(
+                            "workflow step write scope rejects '{rel}'; allowed: {}",
+                            patterns.join(", ")
+                        )));
+                    }
+                }
+                (orig_handler)(input, ctx).await
+            })
+        });
+        let wrapped = Tool::builder(
+            *name,
+            format!("{}（写入范围由引擎强制：{allowed_desc}）", orig.description),
+            orig.input_schema.clone(),
+            handler,
+        )
+        .concurrency_safe(orig.concurrency_safe)
+        .build();
+        tm.unregister(name);
+        tm.register(wrapped, None);
+    }
+}
+
 /// Enforce the step's read allowlist at the actual handler boundary. The model
 /// can still *request* any path, but unauthorized paths never reach the read
 /// implementation and never enter the tool-result context.
@@ -4079,6 +4173,7 @@ async fn build_role_runner(
     staging: Option<Arc<crate::staging::Staging>>,
     step_tools: &[String],
     read_path_allowlist: &[String],
+    write_path_allowlist: &[String],
     prompt_token_budget: Option<usize>,
     prompt_token_ratio: Option<f64>,
     context_overflow_restart: bool,
@@ -4186,6 +4281,7 @@ async fn build_role_runner(
         // 文件白名单必须包在 staging overlay 之外：先核验模型请求的
         // 原始项目路径，再由内层 overlay 决定是否改读暂存副本。
         wrap_read_path_allowlist(&rtm, cwd, read_path_allowlist);
+        wrap_write_path_allowlist(&rtm, cwd, write_path_allowlist);
         // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
         // （与 controller::build_runner 对齐）。workflow 引擎不走
         // delegate 工具，阶段门无人消费——调用方没给句柄时给一个私有的
@@ -4353,6 +4449,9 @@ struct SpeakerDispatch {
     /// 引擎强制的 read 路径白名单（按路径段 `*` 模式匹配），而不是
     /// 只在 prompt 中建议模型不要读取其它文件。
     read_path_allowlist: Vec<String>,
+    /// 引擎强制的写路径白名单（已按当次变量渲染），见
+    /// [`WorkflowStepDef::write_path_allowlist`]。
+    write_path_allowlist: Vec<String>,
     /// 单次模型请求硬预算；超限上抛成可 fresh-restart 的 step 失败。
     /// 与 [`Self::prompt_token_ratio`] 同时存在时取更小者
     /// （见 [`resolve_prompt_budget`]）。
@@ -4428,6 +4527,7 @@ impl SpeakerDispatch {
             dispatch_budget: ctx.dispatch_budget.clone(),
             step_tools,
             read_path_allowlist: Vec::new(),
+            write_path_allowlist: Vec::new(),
             prompt_token_budget: None,
             prompt_token_ratio: None,
             context_overflow_restart: false,
@@ -4773,6 +4873,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     inp.staging.clone(),
                     &inp.step_tools,
                     &inp.read_path_allowlist,
+                    &inp.write_path_allowlist,
                     inp.prompt_token_budget,
                     inp.prompt_token_ratio,
                     inp.context_overflow_restart,
@@ -5611,6 +5712,8 @@ async fn run_workflow_serial(
                     );
                     dispatch.plan_stage = plan_stage.clone();
                     dispatch.read_path_allowlist = step.read_path_allowlist.clone();
+                    dispatch.write_path_allowlist =
+                        render_scope_patterns(&step.write_path_allowlist, &vars);
                     dispatch.prompt_token_budget =
                         step.prompt_token_budget.filter(|budget| *budget > 0);
                     dispatch.prompt_token_ratio = step.prompt_token_ratio;
@@ -6237,6 +6340,10 @@ async fn run_dag_step(
                 dispatch_budget: inp.dispatch_budget.clone(),
                 step_tools: step.tools.clone(),
                 read_path_allowlist: step.read_path_allowlist.clone(),
+                write_path_allowlist: render_scope_patterns(
+                    &step.write_path_allowlist,
+                    &inp.vars,
+                ),
                 prompt_token_budget: step.prompt_token_budget.filter(|budget| *budget > 0),
                 prompt_token_ratio: step.prompt_token_ratio,
                 context_overflow_restart: step.context_overflow_restart,
@@ -10276,6 +10383,7 @@ forbid = ["TBD"]
             None,
             &[],
             &[],
+            &[],
             None,
             None,
             false,
@@ -10312,6 +10420,7 @@ forbid = ["TBD"]
             None,
             Arc::new(AtomicBool::new(false)),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -10386,6 +10495,7 @@ forbid = ["TBD"]
             None,
             Arc::new(AtomicBool::new(false)),
             None,
+            &[],
             &[],
             &[],
             None,
@@ -14254,6 +14364,55 @@ output_key = "quality"
     }
 
     #[tokio::test]
+    async fn write_path_allowlist_confines_writes_to_the_rendered_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sections = dir.path().join(".latte/learn/demo/sections");
+        std::fs::create_dir_all(&sections).expect("mkdir");
+        let tm = build_tool_manager(&["write".to_string()])
+            .await
+            .expect("write manager");
+        let mut vars = HashMap::new();
+        vars.insert("slug".to_string(), "demo".to_string());
+        vars.insert("item_id".to_string(), "k1".to_string());
+        let scope = render_scope_patterns(
+            &[".latte/learn/{{slug}}/sections/{{item_id}}.md".to_string()],
+            &vars,
+        );
+        assert_eq!(scope, vec![".latte/learn/demo/sections/k1.md".to_string()]);
+        wrap_write_path_allowlist(&tm, dir.path(), &scope);
+
+        tm.execute(
+            "write",
+            serde_json::json!({"path": sections.join("k1.md"), "content": "mine"}),
+            None,
+        )
+        .await
+        .expect("own chapter write");
+        assert_eq!(std::fs::read_to_string(sections.join("k1.md")).unwrap(), "mine");
+
+        let err = tm
+            .execute(
+                "write",
+                serde_json::json!({"path": sections.join("k2.md"), "content": "steal"}),
+                None,
+            )
+            .await
+            .expect_err("another chapter must be rejected");
+        assert!(err.to_string().contains("write scope rejects"), "{err}");
+        assert!(!sections.join("k2.md").exists(), "被拒绝的写入不得落盘");
+
+        let err = tm
+            .execute(
+                "write",
+                serde_json::json!({"path": dir.path().join("../escape.md"), "content": "x"}),
+                None,
+            )
+            .await
+            .expect_err("path traversal must be rejected");
+        assert!(err.to_string().contains("write scope"), "{err}");
+    }
+
+    #[tokio::test]
     async fn read_path_allowlist_rejects_paths_outside_the_workflow_contract() {
         let dir = tempfile::tempdir().expect("tempdir");
         let allowed = dir.path().join(".latte/learn/topic/draft.md");
@@ -15842,6 +16001,12 @@ task = "补充疑问"
         assert!(fo.tolerate_failures && fo.max_items > 0, "单章失败不得拖垮全部，且有派发上限");
         assert_eq!(writer.depends_on, vec!["outline".to_string()]);
         assert!(writer.task_text().contains("{{item_id}}"));
+        assert_eq!(
+            writer.write_path_allowlist,
+            vec![".latte/learn/{{slug}}/sections/{{item_id}}.md".to_string()],
+            "并发章节 writer 只能写自己那一章（引擎强制，不靠约定）"
+        );
+        assert!(!writer.tools.iter().any(|t| t == "bash"), "bash 会绕开写白名单");
         assert!(
             !inner.steps.iter().any(|s| s.task_text().contains("mkdir")),
             "分派由引擎负责，不得让模型自行认领"

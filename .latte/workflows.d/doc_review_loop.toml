@@ -54,6 +54,8 @@ id = "write_chapter"
 description = "章节 writer：引擎按 plan.json 每个知识点派发一次，并发写 sections/<k_id>.md"
 role = "tutor"
 output_key = "chapters_out"
+# 引擎强制：每个并发章节 writer 只能写自己那一章，无法覆盖别人的文件。
+write_path_allowlist = [".latte/learn/{{slug}}/sections/{{item_id}}.md"]
 depends_on = ["outline"]
 max_retries = 1
 tools = ["read", "code_graph", "search", "edit", "write"]
