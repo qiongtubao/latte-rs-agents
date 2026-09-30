@@ -3677,6 +3677,98 @@ fn supplement_request(answer: &str) -> Option<String> {
     None
 }
 
+/// 掌握报告只复述账本事实，由引擎渲染：模型写报告会数错、漏点或美化进度。
+fn render_learn_report(
+    base: &Path,
+    slug: &str,
+    plan: &serde_json::Value,
+    ledger: &serde_json::Value,
+) -> String {
+    let topic = plan["topic"]
+        .as_str()
+        .or_else(|| ledger["topic"].as_str())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(slug);
+    let title_of = |id: &str| -> String {
+        plan["knowledge_points"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|p| p["id"].as_str() == Some(id))
+            .and_then(|p| p["title"].as_str())
+            .or_else(|| {
+                ledger["knowledge_points"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p["id"].as_str() == Some(id))
+                    .and_then(|p| p["title"].as_str())
+            })
+            .unwrap_or(id)
+            .to_string()
+    };
+    let points: Vec<&serde_json::Value> = ledger["knowledge_points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    let passed = points.iter().filter(|p| p["passed"].as_bool() == Some(true)).count();
+    let total = points.len();
+    let wrong_list: Vec<String> = points
+        .iter()
+        .map(|p| {
+            let id = p["id"].as_str().unwrap_or("");
+            format!("{}（{}）{} 次", title_of(id), id, p["wrong"].as_u64().unwrap_or(0))
+        })
+        .collect();
+    let supplements: Vec<String> = ledger["supplements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["asked"].as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let unpassed: Vec<String> = points
+        .iter()
+        .filter(|p| p["passed"].as_bool() != Some(true))
+        .map(|p| title_of(p["id"].as_str().unwrap_or("")))
+        .collect();
+
+    let mut out = format!("## 学习报告：{topic}\n\n");
+    out.push_str(&format!(
+        "**掌握进度**：{passed}/{total}（已通过 {passed} 个，共 {total} 个知识点）\n\n"
+    ));
+    out.push_str(&format!(
+        "**学习过程**：共 {} 轮；各知识点答错次数：{}\n\n",
+        ledger["round"].as_u64().unwrap_or(0),
+        if wrong_list.is_empty() { "无".to_string() } else { wrong_list.join("，") }
+    ));
+    out.push_str(&format!(
+        "**学员补充**：{}\n\n",
+        if supplements.is_empty() { "无".to_string() } else { supplements.join("；") }
+    ));
+    out.push_str(&format!(
+        "**交付文档**：docs/learn/{slug}.md（学习材料存档：.latte/learn/{slug}/draft.md）\n\n"
+    ));
+    if base.join("code").is_dir() {
+        out.push_str(&format!("**注释版代码副本**：.latte/learn/{slug}/code/\n\n"));
+    }
+    out.push_str("**建议**：");
+    if total > 0 && unpassed.is_empty() {
+        out.push_str("全部知识点已通过，按交付文档复习即可。");
+    } else if total == 0 {
+        out.push_str("账本里没有知识点，本次学习没有可核对的掌握记录。");
+    } else {
+        out.push_str(&format!(
+            "还有 {} 个知识点未掌握：{}，重读对应章节后再考。",
+            unpassed.len(),
+            unpassed.join("，")
+        ));
+    }
+    out
+}
+
 fn touch_updated_at(ledger: &mut serde_json::Value) {
     ledger["updated_at"] = serde_json::Value::String(now_secs().to_string());
 }
@@ -3722,6 +3814,10 @@ async fn run_learn_control_step(
     }
     if step.id == "supplement" {
         return run_learn_supplement(&base, &mut ledger, slug, ctx, log).await;
+    }
+    if step.id == "report" {
+        let plan = read_learn_json(&base.join("plan.json")).unwrap_or_default();
+        return Ok(Some(render_learn_report(&base, slug, &plan, &ledger)));
     }
     if step.id != "quiz" {
         return Ok(None);
@@ -6349,7 +6445,10 @@ async fn run_workflow_serial(
         while idx < wf.steps.len() {
             let step = &wf.steps[idx];
             if wf.name == "learn_loop"
-                && matches!(step.id.as_str(), "read_confirm" | "quiz" | "supplement")
+                && matches!(
+                    step.id.as_str(),
+                    "read_confirm" | "quiz" | "supplement" | "report"
+                )
             {
                 let slug = vars.get("plan_out").cloned().unwrap_or_default();
                 let new_reading = material_refreshed;
@@ -17327,6 +17426,105 @@ task = "补充疑问"
         let last = wf.steps.last().expect("steps");
         assert_eq!(last.id, "write_chapter");
         assert_eq!(last.output_key.as_deref(), Some("chapters_out"));
+    }
+
+    #[tokio::test]
+    async fn learn_loop_report_is_rendered_by_engine_from_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/testslug");
+        std::fs::create_dir_all(base.join("code")).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "testslug", "topic": "所有权",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权规则"},
+                    {"id": "k2", "title": "借用"},
+                    {"id": "k3", "title": "生命周期"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("ledger.json"),
+            serde_json::json!({
+                "slug": "testslug", "round": 3,
+                "knowledge_points": [
+                    {"id": "k1", "wrong": 2, "passed": false},
+                    {"id": "k2", "wrong": 0, "passed": true},
+                    {"id": "k3", "wrong": 1, "passed": true}
+                ],
+                "supplements": [{"round": 2, "asked": "move 之后原变量去哪了"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("testslug")))
+            .mount(&server)
+            .await;
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _event_rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "写学习文档 {{topic}}"
+output_key = "plan_out"
+[[steps]]
+id = "report"
+role = "tutor"
+tools = ["read"]
+task = "输出掌握报告"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("workflow 不应卡死")
+        .expect("workflow 应成功");
+
+        assert!(out.contains("## 学习报告：所有权"), "{out}");
+        assert!(out.contains("**掌握进度**：2/3"), "{out}");
+        assert!(out.contains("共 3 轮"), "{out}");
+        assert!(out.contains("所有权规则（k1）2 次"), "{out}");
+        assert!(out.contains("move 之后原变量去哪了"), "{out}");
+        assert!(out.contains("docs/learn/testslug.md"), "{out}");
+        assert!(out.contains(".latte/learn/testslug/code/"), "{out}");
+        assert!(out.contains("还有 1 个知识点未掌握：所有权规则"), "{out}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "只有 doc 调模型，report 由引擎渲染");
     }
 
     fn write_learn_plan(cwd: &std::path::Path, points: serde_json::Value) {
