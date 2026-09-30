@@ -3557,6 +3557,25 @@ fn format_quiz_feedback(grade: &QuizGrade) -> String {
             out.push_str(&line);
         }
     }
+    // 按章分组的返工意见：outline 要把它抄进 feedback.md 的 `## <k_id>` 分组。
+    // 由引擎确定性生成，避免让模型从自然语言里自己拆章 id（拆错会让该增强的
+    // 章被 UNCHANGED 跳过、或不该动的章被重写）。
+    let wrong: Vec<&QuizItemGrade> = grade.items.iter().filter(|i| !i.correct).collect();
+    if !wrong.is_empty() {
+        out.push_str("\n\n【按章分组的返工意见（feedback.md 直接抄录）】");
+        for item in wrong {
+            out.push_str(&format!(
+                "\n## {}\n- 学员答错「{}」（选了：{}；正确：{}）。在本章增强「易错点辨析」小节，讲清正确项与干扰项的区别",
+                item.id,
+                item.title,
+                if item.given.is_empty() { "未作答" } else { item.given.as_str() },
+                item.expected,
+            ));
+            if !item.evidence.is_empty() {
+                out.push_str(&format!("，依据 {}", item.evidence));
+            }
+        }
+    }
     out.push_str(if grade.passed {
         "\n\nQUIZ_PASS"
     } else {
@@ -15703,6 +15722,41 @@ mod deterministic_learning_tests {
         let out = format_quiz_feedback(&grade);
         let k2_seg = out.split("知识点 k2").nth(1).unwrap();
         assert!(!k2_seg.contains("前置未掌握"), "{k2_seg}");
+    }
+
+    #[test]
+    fn quiz_feedback_groups_wrong_points_by_chapter_id() {
+        let grade = super::QuizGrade {
+            passed: false,
+            items: vec![
+                super::QuizItemGrade {
+                    id: "k1".into(),
+                    title: "甲".into(),
+                    correct: true,
+                    given: "a".into(),
+                    expected: "a".into(),
+                    evidence: "x.rs:1-2".into(),
+                    teach_point: String::new(),
+                    unmet_requires: vec![],
+                },
+                super::QuizItemGrade {
+                    id: "k2".into(),
+                    title: "乙".into(),
+                    correct: false,
+                    given: "b".into(),
+                    expected: "c".into(),
+                    evidence: "y.rs:3-4".into(),
+                    teach_point: String::new(),
+                    unmet_requires: vec![],
+                },
+            ],
+        };
+        let out = format_quiz_feedback(&grade);
+        let block = out.split("【按章分组的返工意见").nth(1).expect("有分组块");
+        assert!(block.contains("\n## k2\n"), "{block}");
+        assert!(!block.contains("## k1"), "答对的章不得进返工分组：{block}");
+        assert!(block.contains("y.rs:3-4"), "{block}");
+        assert_eq!(out.lines().last().unwrap(), "QUIZ_FAIL", "{out}");
     }
 
     #[test]

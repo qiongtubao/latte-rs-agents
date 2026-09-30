@@ -250,6 +250,9 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
    触发 `Rework` 跳回 `doc_review` 时自增 `ledger.round` 并写盘（两处 `SerialLoopNav::Rework` 分支）。
    验证：单测 `bump_learn_round_increments_persisted_round`；`quiz_fail_reworks_to_doc_then_pass_advances` 仍通过。
    未做端到端实跑。
-2. **quiz 判分反馈没有专属的章 id 分组**。反馈是自由文本，outline 需要自己把它拆成 `## k2`；
-   格式里带了知识点 id，但拆错就会让不该重写的章被重写，或该增强的章被 `UNCHANGED` 跳过。
-   （判断依据：`format_quiz_feedback` 输出为自然语言列表，`feedback.md` 的分组由模型完成。）
+2. **quiz 判分反馈没有专属的章 id 分组（已修复）**。原先反馈是自由文本，outline 要自己拆出 `## k2`，
+   拆错会让该增强的章被 `UNCHANGED` 跳过。修复：`format_quiz_feedback` 在有答错时追加
+   「【按章分组的返工意见】」块（引擎确定性生成，只含答错的章，格式 `## <k_id>\n- …`），
+   `doc_review_loop` 的 outline prompt 要求把该块原样抄进 `feedback.md`。
+   验证：单测 `quiz_feedback_groups_wrong_points_by_chapter_id`；未做端到端实跑。
+   残余风险：抄录仍由 outline 模型执行，只是不再需要它判断章 id。
