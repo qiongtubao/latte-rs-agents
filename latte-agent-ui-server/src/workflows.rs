@@ -285,6 +285,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 context_overflow_max_restarts: 2,
                 context_overflow_files: vec![],
                 read_path_allowlist: vec![],
+                // 写白名单 / fan_out 同样只在 TOML 权威版可配。
+                write_path_allowlist: vec![],
+                fan_out: None,
                 prompt_token_budget: s.prompt_token_budget,
                 prompt_token_ratio: s.prompt_token_ratio,
                 loop_until: None,
