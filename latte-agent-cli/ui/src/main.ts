@@ -505,28 +505,21 @@ async function main(): Promise<void> {
     if (!pending) return;
     for (const ev of pending) chat.handleEvent(ev);
   }
-  // 首次激活 = 完整走一遍 activateSession：拉历史回放（live 与落盘
-  // 恢复的 session 都覆盖）+ 订阅 SSE + 刷新会话列表。没有这一步，
-  // 启动后聊天区永远空白（此前只靠切 session 才回放）。
-  await activateSession(currentId);
-
-  /** Make `id` the active session: disconnect old SSE, subscribe the new
-   * one, then restore its archived chat history and refresh role chrome.
-   *
-   * 顺序是「**先订阅**、再拉历史」，不能反：任务看板的「拆分子任务」/
-   * 「派发」在 HTTP 响应之前就已经把 workflow 跑起来了，实测
-   * WorkflowStarted / WorkflowStep / DelegateStarted / RoleStarted 全部
-   * 落在 session 创建后 ~2ms 内。事件 broadcast 没有回放，先拉历史再
-   * 订阅的话，落在「快照之后、订阅之前」的事件永久丢失 —— 主对话在
-   * subagent 跑的几分钟里一片空白，刷新才靠 history 显出「执行中」
-   * （实测实录）。服务端 events_sse 早就写着同一条教训：
-   * 「先订阅再取挂起弹框：反序会漏掉这两步之间新发出的弹框」。 */
   // activateSession in-flight 缓存：双击 sessionSelect / 挂载时与用户
   // 切换并发 → 各自再起 clear+replay 会「闪一下空屏」+ 清屏交错导致
   // 看到不完整状态。同 id 复用同一 promise；不同 id 排队串行——上一次
   // 跑完才进下一次（避免两个 clear 互相抹）。
+  //
+  // 注：必须先声明 `let _activating / _activatingId`，再首次调用
+  // `activateSession(...)`——`function activateSession` 被 hoisted，
+  // 首次调用时它体里读 `_activatingId`，如果两个 let 还没执行到声明
+  // 行就处于 TDZ，会抛 `Cannot access '...' before initialization`。
   let _activating: Promise<void> = Promise.resolve();
   let _activatingId: string | null = null;
+  // 首次激活 = 完整走一遍 activateSession：拉历史回放（live 与落盘
+  // 恢复的 session 都覆盖）+ 订阅 SSE + 刷新会话列表。没有这一步，
+  // 启动后聊天区永远空白（此前只靠切 session 才回放）。
+  await activateSession(currentId);
   function activateSession(id: string, opts?: { created?: boolean }): Promise<void> {
     // 同 tab 当前已经激活到目标 id → 直接返回（双击同一下拉项）。
     if (_activatingId === id) return _activating;
@@ -621,15 +614,6 @@ async function main(): Promise<void> {
   };
   setUiApi(uiApi);
   installUiCallListener(uiApi);
-  // e2e 可依赖的**确定性** mount 完成标记。
-  //
-  // 为什么需要它：`#chat-input` 出现 ≠ mount 完成——面板按钮的 click
-  // handler 是在这之后才绑的。实测（Playwright）在 `domcontentloaded`
-  // 或 `load` 之后立刻点 `#models-btn`，点击落在还没绑 handler 的按钮上、
-  // 静默丢失，面板打不开且**没有任何报错**，很容易被误判成应用 bug。
-  // 现有 e2e 靠 `waitForTimeout(500~5000)` 硬等，机器一慢就翻。
-  // 有了这个标记，测试可以 `waitForSelector('body[data-ui-mounted="1"]')`。
-  document.body.dataset.uiMounted = "1";
   console.log(`[ui] mounted; self-loop panel`, selfLoop.isOpen() ? "open" : "closed");
 }
 

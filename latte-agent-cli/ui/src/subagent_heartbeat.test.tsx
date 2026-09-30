@@ -125,4 +125,22 @@ describe("subagent 工具活动的主对话心跳", () => {
     });
     expect(badge(messagesEl)?.textContent).toBe("✅ 完成");
   });
+
+  it("context overflow 自动重启时显示重启中而非最终失败", () => {
+    const { chat, messagesEl } = mount();
+    chat.handleEvent(delegateStarted);
+    chat.handleEvent({
+      type: "DelegateFinished",
+      from_role: "manager",
+      to_role: "task_planner",
+      status: "failed",
+      summary: "context overflow: engine prompt budget reached before provider overflow",
+      sub_id: SUB,
+      wf_id: "wf-1",
+    });
+
+    expect(badge(messagesEl)?.textContent).toBe("↻ 正在重启");
+    expect(messagesEl.textContent).toContain("上下文超限，正在自动重启");
+    expect(messagesEl.querySelector(".fail-flash")).toBeNull();
+  });
 });

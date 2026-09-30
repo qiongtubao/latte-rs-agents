@@ -28,6 +28,8 @@ import {
 export interface ReducerContext {
   /** 活跃 stage id 的栈，最内层（最近委派）在末尾。 */
   stack: string[];
+  /** sub_id → Stage id；工具/流式事件可在并行或嵌套委派中精确归属。 */
+  subsessionStages: Record<string, string>;
   /** 用于生成唯一 stage id 的单调计数器。 */
   nextId: number;
   /** 取 TraceRecord.timestampMs 的时钟（便于测试/重放注入）。 */
@@ -47,7 +49,7 @@ export function emptyStore(): StageStore {
 
 /** 创建一个初始的 ReducerContext。 */
 export function createContext(now: () => number = Date.now): ReducerContext {
-  return { stack: [], nextId: 0, now };
+  return { stack: [], subsessionStages: {}, nextId: 0, now };
 }
 
 /** 截断过长文本，保持 Progress_Bubble / 摘要简短。 */
@@ -123,6 +125,15 @@ function topStage(store: StageStore, ctx: ReducerContext): Stage | undefined {
   return store.byId[topId];
 }
 
+/** 优先按事件的 sub_id 定位 Stage；旧归档缺失时保持栈顶回退。 */
+function stageForEvent(store: StageStore, event: ChatEvent, ctx: ReducerContext): Stage | undefined {
+  const subId = "sub_id" in event && typeof event.sub_id === "string" && event.sub_id
+    ? event.sub_id
+    : undefined;
+  const stageId = subId ? ctx.subsessionStages[subId] : undefined;
+  return stageId ? store.byId[stageId] : topStage(store, ctx);
+}
+
 /** 创建一个顶层 Stage 并把它压入 order 与委派栈。 */
 function createTopLevelStage(
   store: StageStore,
@@ -160,7 +171,7 @@ function appendTrace(
   event: ChatEvent,
   ctx: ReducerContext,
 ): ReducerResult {
-  const stage = topStage(store, ctx);
+  const stage = stageForEvent(store, event, ctx);
   if (!stage) return { store, ctx };
 
   const summary = summarize(event);
@@ -223,7 +234,7 @@ function appendResponseDelta(
   event: Extract<ChatEvent, { type: "RoleTurn" }>,
   ctx: ReducerContext,
 ): ReducerResult {
-  const stage = topStage(store, ctx);
+  const stage = stageForEvent(store, event, ctx);
   if (!stage) return { store, ctx };
 
   const nextStage: Stage = {
@@ -298,6 +309,7 @@ function startDelegate(
     const ctx2: ReducerContext = {
       ...ctx,
       stack: [...ctx.stack, id],
+      subsessionStages: { ...ctx.subsessionStages, [event.sub_id]: id },
       nextId: ctx.nextId + 1,
     };
     return { store: store2, ctx: ctx2 };
@@ -323,6 +335,7 @@ function startDelegate(
   const ctx2: ReducerContext = {
     ...ctx,
     stack: [...ctx.stack, id],
+    subsessionStages: { ...ctx.subsessionStages, [event.sub_id]: id },
     nextId: ctx.nextId + 1,
   };
   return { store: store2, ctx: ctx2 };
@@ -337,7 +350,7 @@ function finishDelegate(
   event: Extract<ChatEvent, { type: "DelegateFinished" }>,
   ctx: ReducerContext,
 ): ReducerResult {
-  const stage = topStage(store, ctx);
+  const stage = stageForEvent(store, event, ctx);
   if (!stage) return { store, ctx };
 
   const nextStage: Stage = {
@@ -347,7 +360,8 @@ function finishDelegate(
   };
   const ctx2: ReducerContext = {
     ...ctx,
-    stack: ctx.stack.slice(0, -1),
+    // 并行 delegate 的 Finished 事件可能不按栈顶顺序抵达；只移除它自己的 Stage。
+    stack: ctx.stack.filter((stageId) => stageId !== stage.id),
   };
   return { store: putStage(store, nextStage), ctx: ctx2 };
 }

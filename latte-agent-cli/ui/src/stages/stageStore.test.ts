@@ -182,3 +182,26 @@ describe("selectors", () => {
     expect(selectStageLog("missing")(store.getState())).toBeUndefined();
   });
 });
+
+describe("createStageStore — subsession event ownership", () => {
+  it("routes tool events to the Stage matched by sub_id instead of the current stack top", () => {
+    const store = createStageStore(fixedNow);
+    const events: ChatEvent[] = [
+      { type: "RoleStarted", role_id: "manager", detail: "" },
+      { type: "DelegateStarted", from_role: "manager", to_role: "tutor", task: "write docs", sub_id: "tutor-1" },
+      { type: "DelegateStarted", from_role: "manager", to_role: "proofreader", task: "review docs", sub_id: "proofreader-1" },
+      { type: "ToolUse", role_id: "tutor", tool_name: "write", args: "{\"path\":\"draft.md\"}", sub_id: "tutor-1" },
+      { type: "ToolResult", role_id: "proofreader", tool_name: "read", result: "ok", sub_id: "proofreader-1" },
+    ];
+    for (const event of events) store.getState().applyEvent(event);
+
+    const state = store.getState();
+    const manager = state.byId[state.order[0]];
+    const tutor = state.byId[manager.childIds[0]];
+    const proofreader = state.byId[tutor.childIds[0]];
+
+    expect(tutor.log.eventTrace.map((record) => record.kind)).toEqual(["ToolUse"]);
+    expect(proofreader.log.eventTrace.map((record) => record.kind)).toEqual(["ToolResult"]);
+    expect(manager.log.eventTrace).toHaveLength(0);
+  });
+});

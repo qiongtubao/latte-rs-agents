@@ -175,4 +175,18 @@ describe("renderMarkdown", () => {
     expect(out).toContain('data-doc-path=".latte/learn/rust/draft.md"');
     expect(out).not.toContain('href=".latte/');
   });
+
+  it("本地图片链接渲染为 img-link，指向 doc-asset 防止跳出 404", () => {
+    const out = renderMarkdown("[查看图片](.latte/learn/arch.svg)");
+    expect(out).toContain('class="img-link"');
+    expect(out).toContain('data-img-src="/api/doc-asset?path=.latte%2Flearn%2Farch.svg"');
+    expect(out).toContain('href="/api/doc-asset?path=.latte%2Flearn%2Farch.svg"');
+  });
+
+  it("超链接包裹图片同时重写外层 a 与内层 img", () => {
+    const out = renderMarkdown("[![架构图](.latte/learn/arch.svg)](.latte/learn/arch.svg)");
+    expect(out).toContain('class="img-link"');
+    expect(out).toContain('src="/api/doc-asset?path=.latte%2Flearn%2Farch.svg"');
+    expect(out).toContain('href="/api/doc-asset?path=.latte%2Flearn%2Farch.svg"');
+  });
 });

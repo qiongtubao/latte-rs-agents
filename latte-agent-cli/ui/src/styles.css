@@ -663,6 +663,68 @@ select {
   max-width: 100%;
   border-radius: 8px;
   border: 1px solid var(--border);
+  cursor: zoom-in;
+}
+
+.msg-content a.img-link,
+.markdown-body a.img-link {
+  cursor: zoom-in;
+  text-decoration: none;
+}
+
+/* 点击放大图片模态弹窗 */
+.img-modal-box {
+  width: 90vw;
+  height: 88vh;
+}
+.img-modal-viewport {
+  flex: 1;
+  overflow: hidden;
+  background: #0f172a;
+  cursor: grab;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.img-modal-viewport:active {
+  cursor: grabbing;
+}
+.img-modal-canvas {
+  transform-origin: center center;
+  transition: transform 0.05s linear;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.img-modal-canvas img {
+  max-width: 85vw;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  background: #ffffff;
+}
+
+/* 内联 SVG 模式：自适应放大充满视口，保证大图细节清晰 */
+.img-modal-canvas svg.img-modal-inline-svg {
+  width: 82vw;
+  height: 75vh;
+  max-width: 95%;
+  max-height: 95%;
+  display: block;
+  background: #ffffff;
+  border-radius: 6px;
+  padding: 16px;
+  box-sizing: border-box;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+/* PNG 高清模式：以高分辨率呈现，并允许自由拉伸缩放 */
+.img-modal-canvas img.img-modal-png-mode {
+  width: 82vw;
+  height: auto;
+  max-height: 75vh;
+  object-fit: contain;
 }
 
 .msg-content .katex-display,
@@ -753,16 +815,20 @@ select {
   overflow: hidden;
   background: #f8fafc;
   cursor: grab;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  position: relative;
 }
 .mermaid-viewport:active {
   cursor: grabbing;
 }
 .mermaid-canvas {
-  transform-origin: center center;
-  transition: transform 0.05s linear;
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+}
+.mermaid-canvas svg {
+  max-width: none !important;
+  display: block;
 }
 
 /* ─── 文档内嵌预览 ─────────────────────────────────────────────── */
@@ -1678,6 +1744,11 @@ select {
   color: #64748b;
   gap: 0.5rem;
   flex-shrink: 0;
+}
+#footer-msg {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: center;
 }
 
 /* ─── subsession detail link ─────────────────────────────────── */
@@ -4379,6 +4450,99 @@ select {
 .tb-chip-session:hover { text-decoration: underline; }
 .tb-chip-rounds { background: #f1f5f9; color: #64748b; }
 .tb-chip-workflow { background: #fef3c7; color: #92400e; }
+
+/* 执行流水（任务抽屉里列 workflow run 的卡片） */
+.tb-wfrun-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fff;
+  margin-bottom: 8px;
+}
+.tb-wfrun-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tb-wfrun-name { font-weight: 600; font-size: 13px; color: #0f172a; }
+.tb-wfrun-time { font-size: 11px; color: #64748b; white-space: nowrap; }
+.tb-wfrun-meta { font-size: 12px; color: #475569; margin-top: 4px; }
+.tb-wfrun-actions { display: flex; gap: 6px; margin-top: 8px; }
+
+/* workflow run 详情 modal（比 task modal 宽，step output 是长文） */
+.tb-modal-wfrun { max-width: 720px; width: 92vw; }
+.tb-wfrun-detail { max-height: 70vh; overflow-y: auto; }
+.tb-wfrun-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #e2e8f0;
+  margin-bottom: 10px;
+}
+.tb-wfrun-topic {
+  font-size: 12px;
+  color: #475569;
+  background: #f8fafc;
+  border-left: 3px solid #cbd5e1;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.tb-wfrun-step {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: #fff;
+}
+.tb-wfrun-step-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.tb-wfrun-step-id { font-weight: 600; font-size: 13px; color: #1e293b; }
+.tb-wfrun-step-key {
+  font-size: 11px;
+  color: #92400e;
+  background: #fef3c7;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.tb-wfrun-output summary {
+  font-size: 12px;
+  color: #0369a1;
+  cursor: pointer;
+  padding: 4px 0;
+}
+.tb-wfrun-output-pre {
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #f8fafc;
+  padding: 10px;
+  border-radius: 6px;
+  max-height: 40vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 6px 0 0;
+  color: #1e293b;
+}
+.tb-wfrun-answer {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  background: #fff;
+}
+.tb-wfrun-answer-q { font-size: 12px; color: #0f172a; font-weight: 500; margin-bottom: 4px; }
+.tb-wfrun-answer-a { font-size: 12px; color: #475569; white-space: pre-wrap; word-break: break-word; }
 
 /* 卡片上的快捷动作 */
 .tb-card .tb-quick-actions {

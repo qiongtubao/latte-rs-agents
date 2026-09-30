@@ -86,25 +86,38 @@ function downloadBlob(blob: Blob, filename: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-/** SVG 字符串 → PNG 下载（canvas 2x 光栅化）。 */
+/** SVG 字符串 → PNG 下载（canvas 2x 光栅化）。使用 data URI 避免 blob URL 导致 canvas tainted 报 SecurityError。 */
 function downloadPng(svgText: string, filename: string): void {
-  const svgUrl = URL.createObjectURL(new Blob([svgText], { type: "image/svg+xml" }));
+  let cleanSvg = svgText;
+  if (!cleanSvg.includes('xmlns="http://www.w3.org/2000/svg"')) {
+    cleanSvg = cleanSvg.replace('<svg ', '<svg xmlns="http://www.w3.org/2000/svg" ');
+  }
+  const svgUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(cleanSvg)}`;
   const img = new Image();
   img.onload = () => {
-    const w = img.naturalWidth || 800;
-    const h = img.naturalHeight || 600;
+    const w = (img.naturalWidth || 800) * 2;
+    const h = (img.naturalHeight || 600) * 2;
     const canvas = document.createElement("canvas");
-    canvas.width = w * 2;
-    canvas.height = h * 2;
+    canvas.width = w;
+    canvas.height = h;
     const ctx = canvas.getContext("2d");
-    if (!ctx) { URL.revokeObjectURL(svgUrl); return; }
+    if (!ctx) return;
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    URL.revokeObjectURL(svgUrl);
-    canvas.toBlob((b) => { if (b) downloadBlob(b, filename); }, "image/png");
+    try {
+      canvas.toBlob((b) => {
+        if (b) downloadBlob(b, filename);
+      }, "image/png");
+    } catch {
+      // 回退直接下载原 SVG
+      downloadBlob(new Blob([svgText], { type: "image/svg+xml" }), filename.replace(/\.png$/i, ".svg"));
+    }
   };
-  img.onerror = () => URL.revokeObjectURL(svgUrl);
+  img.onerror = () => {
+    // 回退下载原 SVG
+    downloadBlob(new Blob([svgText], { type: "image/svg+xml" }), filename.replace(/\.png$/i, ".svg"));
+  };
   img.src = svgUrl;
 }
 
@@ -119,36 +132,110 @@ function openMermaidModal(svgHtml: string, source: string): void {
   overlay.innerHTML = `
     <div class="md-modal mermaid-modal-box">
       <div class="md-modal-bar">
-        <span class="md-modal-title">图表预览（滚轮缩放 · 拖拽平移）</span>
+        <span class="md-modal-title">图表预览（光标聚焦无限缩放 · 拖拽平移 · 双击居中）</span>
+        <button type="button" class="code-block-btn" data-act="reset">重置居中</button>
         <button type="button" class="code-block-btn" data-act="copy-src">复制图源</button>
         <button type="button" class="code-block-btn" data-act="dl-svg">下载 SVG</button>
         <button type="button" class="code-block-btn" data-act="dl-png">下载 PNG</button>
         <button type="button" class="code-block-btn" data-act="close">关闭</button>
       </div>
-      <div class="mermaid-viewport"><div class="mermaid-canvas">${svgHtml}</div></div>
+      <div class="mermaid-viewport">
+        <div class="mermaid-canvas">${svgHtml}</div>
+      </div>
     </div>`;
   document.body.appendChild(overlay);
   mermaidModal = overlay;
 
-  const close = () => { overlay.remove(); if (mermaidModal === overlay) mermaidModal = null; };
+  // 先声明 onKey 再声明 close：close 引用 onKey 做 removeEventListener，
+  // 避免「close 中读 onKey 时 onKey 还在 TDZ」的潜在时序风险
+  // （目前所有触发 close 的事件都是异步的所以正常路径不会触发，但
+  // 任何后续在 setup 阶段同步触发 close 的改动都会撞上 TDZ）。
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") {
+      close();
+    }
+  };
+  const close = () => {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+    if (mermaidModal === overlay) mermaidModal = null;
+  };
   overlay.addEventListener("click", (e) => { if (e.target === overlay) close(); });
-  const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") { close(); document.removeEventListener("keydown", onKey); } };
   document.addEventListener("keydown", onKey);
 
   const viewport = overlay.querySelector<HTMLElement>(".mermaid-viewport")!;
   const canvas = overlay.querySelector<HTMLElement>(".mermaid-canvas")!;
-  let scale = 1, tx = 0, ty = 0;
-  const apply = () => { canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`; };
+  const svgEl = canvas.querySelector("svg");
+  if (svgEl) {
+    svgEl.style.maxWidth = "none";
+    svgEl.style.display = "block";
+  }
+
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+
+  const apply = () => {
+    canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  };
+
+  // 自动等比适配视口居中
+  const fitToViewport = () => {
+    const vRect = viewport.getBoundingClientRect();
+    const sRect = svgEl ? svgEl.getBoundingClientRect() : canvas.getBoundingClientRect();
+    const rawW = (svgEl ? (parseFloat(svgEl.getAttribute("width") || "0") || sRect.width / scale) : sRect.width / scale) || 600;
+    const rawH = (svgEl ? (parseFloat(svgEl.getAttribute("height") || "0") || sRect.height / scale) : sRect.height / scale) || 400;
+    scale = Math.min(2.0, Math.max(0.2, Math.min((vRect.width * 0.85) / rawW, (vRect.height * 0.85) / rawH)));
+    tx = (vRect.width - rawW * scale) / 2;
+    ty = (vRect.height - rawH * scale) / 2;
+    apply();
+  };
+
+  // 初始布局完成后自适应一次
+  requestAnimationFrame(fitToViewport);
+
+  // 以鼠标光标为中心缩放（Cursor-Centered Zoom）：滚轮缩放向鼠标所指字迹聚焦，支持高达 100x 放大
   viewport.addEventListener("wheel", (e) => {
     e.preventDefault();
-    scale = Math.min(8, Math.max(0.2, scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    const vRect = viewport.getBoundingClientRect();
+    const factor = e.deltaY < 0 ? 1.25 : 1 / 1.25;
+    const newScale = Math.min(100, Math.max(0.05, scale * factor));
+
+    const vx = e.clientX - vRect.left;
+    const vy = e.clientY - vRect.top;
+    const cx = (vx - tx) / scale;
+    const cy = (vy - ty) / scale;
+
+    tx = vx - cx * newScale;
+    ty = vy - cy * newScale;
+    scale = newScale;
     apply();
   }, { passive: false });
+
+  // 拖拽平移
   let drag: { x: number; y: number } | null = null;
-  viewport.addEventListener("pointerdown", (e) => { drag = { x: e.clientX - tx, y: e.clientY - ty }; viewport.setPointerCapture(e.pointerId); });
-  viewport.addEventListener("pointermove", (e) => { if (drag) { tx = e.clientX - drag.x; ty = e.clientY - drag.y; apply(); } });
+  viewport.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    drag = { x: e.clientX - tx, y: e.clientY - ty };
+    viewport.setPointerCapture(e.pointerId);
+  });
+  viewport.addEventListener("pointermove", (e) => {
+    if (drag) {
+      tx = e.clientX - drag.x;
+      ty = e.clientY - drag.y;
+      apply();
+    }
+  });
   viewport.addEventListener("pointerup", () => { drag = null; });
 
+  // 双击居中还原
+  viewport.addEventListener("dblclick", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    fitToViewport();
+  });
+
+  overlay.querySelector('[data-act="reset"]')!.addEventListener("click", fitToViewport);
   overlay.querySelector('[data-act="close"]')!.addEventListener("click", close);
   overlay.querySelector('[data-act="copy-src"]')!.addEventListener("click", (e) => {
     navigator.clipboard?.writeText(source).then(() => {
@@ -184,16 +271,25 @@ async function renderMermaidNode(el: HTMLElement): Promise<void> {
   if (el.dataset.mermaidPending) return;
   el.dataset.mermaidPending = "1";
   const source = el.textContent ?? "";
+  const renderId = `mmd-${Date.now()}-${mermaidSeq++}`;
   try {
     const mermaid = (await loadMermaid()).default;
-    mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
-    const { svg } = await mermaid.render(`mmd-${Date.now()}-${mermaidSeq++}`, source);
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      // 禁止 mermaid 遇到语法错误时向 document.body 注入包含版本号的错误 SVG
+      suppressErrorRendering: true,
+    });
+    const { svg } = await mermaid.render(renderId, source);
     if (!el.isConnected) return;
     el.innerHTML = svg;
     el.dataset.mermaidDone = "1";
     mermaidSources.set(el, source);
     enhanceMermaidFigure(el);
   } catch {
+    // 清理 mermaid 在某些异常路径下向 body 遗留的临时容器
+    document.getElementById(`d${renderId}`)?.remove();
+    document.getElementById(renderId)?.remove();
     // 图源非法（或流式中途的半成品）：回退为带工具条的普通代码块，
     // 保留原文可见，不静默吞掉内容。
     if (!el.isConnected) return;
@@ -210,7 +306,6 @@ async function renderMermaidNode(el: HTMLElement): Promise<void> {
     delete el.dataset.mermaidPending;
   }
 }
-
 export interface EnhanceOptions {
   /** 流式 delta 中途为 true：跳过 mermaid 渲染（图源大概率不完整，
    *  等 is_complete 的终态渲染再出 SVG），其余增强照常。 */

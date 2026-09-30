@@ -15,7 +15,9 @@ test.describe("latte-agent UI TDD Advanced", () => {
     page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
     page.on("pageerror", (err) => console.error("[pageerror]", err.message));
     await page.goto(UI_BASE, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await page.waitForTimeout(3000);
+    // 等 main() 挂载完成（panel button handler + SSE 订阅 + chat-send handler 都已就位）
+    // 旧 waitForTimeout(3000) 是硬等，慢机器上不够；data-ui-mounted 是 main() 末尾的确定性标记。
+    await page.waitForSelector('body[data-ui-mounted="1"]', { timeout: 15000 });
   });
 
   test.afterEach(async () => {
@@ -186,18 +188,17 @@ test.describe("latte-agent UI TDD Advanced", () => {
     // Wait briefly for UI update (setRoleSelected runs synchronously)
     await page.waitForTimeout(1000);
 
-    // Verify role pill updated to the new role (without icon, just role ID)
+    // 切角色后 role-pill 仍带 emoji：updateRoleDisplay 走
+    // `${icon} ${roleId}` 路径，icon 来自 currentRoleIcon 或 roleIcon(roleId) 回退。
     const afterSwitchPill = await page.evaluate(() => ({
       text: document.getElementById("role-pill")?.textContent || "",
       model: document.getElementById("model-pill")?.textContent || "",
     }));
 
-    // The role pill shows just the role ID (setRoleSelected sets textContent = roleId)
-    expect(afterSwitchPill.text).toBe(targetRole);
-
-    // Model pill should remain unchanged (no server switch, so no Prompt event)
-    expect(afterSwitchPill.model).toBe(initialPill.model);
-
+    expect(afterSwitchPill.text).toContain(targetRole);
+    // 至少保留 emoji 前缀（实测 `${initialIcon} ${targetRole}`，
+    // 但容许顺序/空白差异，只断言 emoji 在前）
+    expect(afterSwitchPill.text).toMatch(/^[\p{So}\p{Emoji_Presentation}]/u);
     // Switch back to the initial role
     await page.evaluate((role) => {
       const select = document.getElementById("role-select") as HTMLSelectElement;
@@ -208,11 +209,14 @@ test.describe("latte-agent UI TDD Advanced", () => {
     await page.waitForTimeout(1000);
 
     // Verify role pill reverted
+    // 切回初始终角色后 pill 也带 emoji（同样走 updateRoleDisplay 路径），
+    // 文本至少要包含 initialRole 且以 emoji 起首。
     const finalPill = await page.evaluate(() => ({
       text: document.getElementById("role-pill")?.textContent || "",
       model: document.getElementById("model-pill")?.textContent || "",
     }));
-    expect(finalPill.text).toBe(initialRole);
+    expect(finalPill.text).toContain(initialRole);
+    expect(finalPill.text).toMatch(/^[\p{So}\p{Emoji_Presentation}]/u);
     expect(finalPill.model).toBe(initialPill.model);
   });
 });

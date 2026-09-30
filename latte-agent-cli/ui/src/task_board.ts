@@ -11,9 +11,9 @@
 import {
   listTasks, createTask, updateTask, dispatchTask, abortTask, resumeTask, deleteTask,
   dispatchReady, listWorkflows, listTaskTypes, createTaskType, putTaskType, deleteTaskType, refineTask, setRefineParent,
-  getTaskWorktreeDiff,
+  getTaskWorktreeDiff, listTaskWorkflowRuns, getTaskWorkflowRun,
 } from "./api";
-import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse, WorktreeDiff } from "./api";
+import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse, WorktreeDiff, TaskWorkflowRunSummary, TaskWorkflowRunDetail } from "./api";
 
 // ─── 看板任务快照（供看板外的展示层联动消费）─────────────────────
 // refresh() 每次轮询成功后发布一份快照；chat_impl 的 todo dock 据此
@@ -596,6 +596,30 @@ export function mountTaskBoard(opts: {
         });
     }
 
+    // 执行流水：任务关联的 workflow run（learn_loop / code_review / merge /
+    // task_archive 等 lifecycle hook 都算）。异步拉取——只有跑过 workflow
+    // 的任务才有数据，空列表就不渲染该区。
+    const wfrunSec = el("div", "tb-drawer-section");
+    wfrunSec.appendChild(el("div", "tb-label", "执行流水"));
+    const wfrunBox = el("div", "tb-desc-box", "读取中…");
+    wfrunSec.appendChild(wfrunBox);
+    body.appendChild(wfrunSec);
+    const forWfTask = task.id;
+    void listTaskWorkflowRuns(task.id)
+      .then((runs) => {
+        if (drawerTaskId !== forWfTask) return;
+        if (runs.length === 0) {
+          wfrunSec.remove();
+          return;
+        }
+        wfrunBox.replaceChildren(...renderWorkflowRuns(forWfTask, runs));
+      })
+      .catch((e) => {
+        if (drawerTaskId !== forWfTask) return;
+        wfrunBox.textContent = `读取失败：${(e as Error).message}`;
+      });
+
+
     // 子任务区（任意层级都可查看/再拆；sub_total/sub_done 是全部后代聚合）
     body.appendChild(renderChildrenSection(task));
 
@@ -666,6 +690,136 @@ export function mountTaskBoard(opts: {
     }
     return out;
   }
+
+  /** 「执行流水」run 卡片列表 + 每条 run 的详情 modal。 */
+  function renderWorkflowRuns(
+    taskId: string,
+    runs: TaskWorkflowRunSummary[],
+  ): HTMLElement[] {
+    return runs.map((r) => {
+      const card = el("div", "tb-wfrun-card");
+      const head = el("div", "tb-wfrun-head");
+      head.appendChild(el("span", "tb-wfrun-name", r.workflow_name));
+      head.appendChild(
+        el("span", "tb-wfrun-time", fmtTime(r.started_at * 1000)),
+      );
+      card.appendChild(head);
+      const meta = el("div", "tb-wfrun-meta");
+      const bits: string[] = [`${r.step_count} 步`];
+      if (r.last_step_id) bits.push(`末步 ${r.last_step_id}`);
+      if (r.last_finished_at) {
+        bits.push(`最后活动 ${fmtTime(r.last_finished_at * 1000)}`);
+      }
+      meta.textContent = bits.join(" · ");
+      card.appendChild(meta);
+      const actions = el("div", "tb-wfrun-actions");
+      const viewBtn = el(
+        "button",
+        "tb-btn tb-btn-ghost tb-btn-sm",
+        "查看详情",
+      ) as HTMLButtonElement;
+      viewBtn.type = "button";
+      viewBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openWorkflowRunModal(taskId, r.wf_id);
+      });
+      actions.appendChild(viewBtn);
+      if (r.session_id) {
+        const jumpBtn = el(
+          "button",
+          "tb-btn tb-btn-ghost tb-btn-sm",
+          "打开会话 ↗",
+        ) as HTMLButtonElement;
+        jumpBtn.type = "button";
+        jumpBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          onOpenSession(r.session_id!);
+        });
+        actions.appendChild(jumpBtn);
+      }
+      card.appendChild(actions);
+      return card;
+    });
+  }
+
+  // ── 单条 workflow run 详情 modal ──
+  const wfrunMask = el("div", "tb-modal-mask");
+  const wfrunModal = el("div", "tb-modal tb-modal-wfrun");
+  wfrunMask.appendChild(wfrunModal);
+  document.body.appendChild(wfrunMask);
+  wfrunMask.addEventListener("click", (e) => {
+    if (e.target === wfrunMask) wfrunMask.classList.remove("open");
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && wfrunMask.classList.contains("open")) {
+      wfrunMask.classList.remove("open");
+    }
+  });
+
+  function openWorkflowRunModal(taskId: string, wfId: string): void {
+    wfrunModal.replaceChildren();
+    wfrunModal.appendChild(el("h4", undefined, `workflow run ${wfId}`));
+    const body = el("div", "tb-wfrun-detail", "读取中…");
+    wfrunModal.appendChild(body);
+    wfrunMask.classList.add("open");
+    void getTaskWorkflowRun(taskId, wfId)
+      .then((d) => {
+        body.replaceChildren(...renderWorkflowRunDetail(d));
+      })
+      .catch((e) => {
+        body.textContent = `读取失败：${(e as Error).message}`;
+      });
+  }
+
+  function renderWorkflowRunDetail(d: TaskWorkflowRunDetail): HTMLElement[] {
+    const out: HTMLElement[] = [];
+    // 概要条
+    const head = el("div", "tb-wfrun-detail-head");
+    head.appendChild(el("span", "tb-wfrun-name", d.workflow_name));
+    head.appendChild(
+      el(
+        "span",
+        "tb-wfrun-time",
+        `启动 ${fmtTime(d.started_at * 1000)}${d.last_finished_at ? ` · 最后活动 ${fmtTime(d.last_finished_at * 1000)}` : ""}`,
+      ),
+    );
+    out.push(head);
+    // topic（折行预览，全量塞 title 太长）
+    const topic = el("div", "tb-wfrun-topic", d.topic);
+    out.push(topic);
+    // 每 step 一张卡
+    for (const s of d.steps) {
+      const card = el("div", "tb-wfrun-step");
+      const sh = el("div", "tb-wfrun-step-head");
+      sh.appendChild(el("span", "tb-wfrun-step-id", s.step_id));
+      if (s.output_key) {
+        sh.appendChild(el("span", "tb-wfrun-step-key", `→ ${s.output_key}`));
+      }
+      sh.appendChild(
+        el("span", "tb-wfrun-time", fmtTime(s.finished_at * 1000)),
+      );
+      card.appendChild(sh);
+      const out_ = el("details", "tb-wfrun-output");
+      const sum = el("summary", undefined, `产出 ${s.output.length} 字符`);
+      out_.appendChild(sum);
+      const pre = el("pre", "tb-wfrun-output-pre", s.output);
+      out_.appendChild(pre);
+      card.appendChild(out_);
+      out.push(card);
+    }
+    // ask 回答（learn_loop 之类）
+    if (d.answers.length > 0) {
+      out.push(el("div", "tb-label", `问答（${d.answers.length}）`));
+      for (const a of d.answers) {
+        const card = el("div", "tb-wfrun-answer");
+        card.appendChild(el("div", "tb-wfrun-answer-q", `Q[${a.role}] ${a.question}`));
+        card.appendChild(el("div", "tb-wfrun-answer-a", `A ${a.answer}`));
+        out.push(card);
+      }
+    }
+    return out;
+  }
+
 
   function kv(k: string, v: string): HTMLElement {
     const row = el("div", "tb-kv");

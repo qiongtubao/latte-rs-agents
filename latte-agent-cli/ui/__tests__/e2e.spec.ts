@@ -38,6 +38,10 @@ test.describe("latte-agent UI e2e", () => {
       consoleErrors.push(`[pageerror] ${err.message}`);
     });
     await page.goto(UI_BASE, { waitUntil: "domcontentloaded", timeout: 15_000 });
+    // main() 启动是同步链上挂 await —— domcontentloaded 只说明 HTML 解析完，
+    // 面板按钮的 click handler 还没绑。等 `data-ui-mounted="1"` 再放行
+    // 后续测试，否则点击会落在没 handler 的按钮上静默丢失。
+    await page.waitForSelector('body[data-ui-mounted="1"]', { timeout: 15_000 });
   });
 
   test.afterEach(async () => {
@@ -50,7 +54,7 @@ test.describe("latte-agent UI e2e", () => {
 
   test("loads without console error", async () => {
     // 等首屏 SSE 连接 + initial /api/session。
-    await page.waitForSelector(".messages", { timeout: 5_000 });
+    await page.waitForSelector("#messages", { timeout: 5_000 });
     await page.waitForTimeout(500);
     // 接受非空错误（包括 dev mode React 警告）—— 真实 fix 跑时不允许。
     // self-loop 阶段会追踪 consoleErrors 长度变化。
@@ -61,6 +65,12 @@ test.describe("latte-agent UI e2e", () => {
     await expect(page.locator("#chat-input")).toBeVisible();
     await expect(page.locator("#chat-send")).toBeVisible();
     await expect(page.locator("#role-select")).toBeVisible();
+    // 角色列表由 SSE RoleList 事件异步填入，等填完再断言非空。
+    await page.waitForFunction(
+      () => document.querySelectorAll("#role-select option").length > 0,
+      undefined,
+      { timeout: 10_000 },
+    );
     const options = await page.locator("#role-select option").count();
     expect(options).toBeGreaterThan(0);
   });
@@ -93,22 +103,28 @@ test.describe("latte-agent UI e2e", () => {
   });
   test("self-loop panel toggleable", async () => {
     const panel = page.locator("#self-loop-panel");
-    await expect(panel).toBeHidden();
+    // .side-panel.hidden 用 transform: translateX(110%) 滑出而非 display:none，
+    // Playwright 的 toBeHidden 不识别 transform，所以改用 class 断言。
+    await expect(panel).toHaveClass(/hidden/);
     await page.click("#self-loop-btn");
-    await expect(panel).toBeVisible();
+    await expect(panel).not.toHaveClass(/hidden/);
     await page.click("#self-loop-close");
-    await expect(panel).toBeHidden();
+    await expect(panel).toHaveClass(/hidden/);
   });
 
   test("trace panel toggleable", async () => {
     const panel = page.locator("#trace-panel");
-    await expect(panel).toBeHidden();
+    await expect(panel).toHaveClass(/hidden/);
     await page.click("#trace-toggle");
-    await expect(panel).toBeVisible();
+    await expect(panel).not.toHaveClass(/hidden/);
   });
 
   test("self-loop form requires task", async () => {
     await page.click("#self-loop-btn");
+    // 侧边面板用 transform: translateX 滑入，submit 按钮在动画期间
+    // 可能仍在视口外；等动画完成（0.25s）再点 submit。
+    await expect(page.locator("#self-loop-panel")).not.toHaveClass(/hidden/);
+    await page.waitForTimeout(350);
     const input = page.locator("#self-loop-task");
     await expect(input).toBeVisible();
     // HTML5 required 阻止 form submit。断言：缺 task 时不应触发

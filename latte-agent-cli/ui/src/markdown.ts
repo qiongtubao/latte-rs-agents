@@ -34,6 +34,10 @@ function isLocalMarkdown(src: string): boolean {
   return isLocalPath(src) && /\.md(?:[#?].*)?$/i.test(src);
 }
 
+/** 本地图片链接（png/jpg/svg/webp/gif）：图片点击弹窗预览，防止外跳 404。 */
+function isLocalImage(src: string): boolean {
+  return isLocalPath(src) && /\.(png|jpe?g|gif|webp|svg)(?:[#?].*)?$/i.test(src);
+}
 const md = new MarkdownIt({
   html: false,
   linkify: false,
@@ -81,6 +85,11 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
     token.attrSet("href", "#");
     token.attrSet("class", "doc-link");
     token.attrSet("data-doc-path", href);
+  } else if (isLocalImage(href)) {
+    // 本地图片链接：标记为 img-link，指向 doc-asset 并支持前端预览，防止跳出 404。
+    token.attrSet("href", `/api/doc-asset?path=${encodeURIComponent(href)}`);
+    token.attrSet("class", "img-link");
+    token.attrSet("data-img-src", `/api/doc-asset?path=${encodeURIComponent(href)}`);
   }
   return defaultLinkOpen(tokens, idx, options, env, self);
 };

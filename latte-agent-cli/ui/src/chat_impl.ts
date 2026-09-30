@@ -3713,7 +3713,13 @@ export function mountChat(opts: {
     focus();
   }
   function setFooter(msg: string): void { container.footerMsg.textContent = msg; }
-  function setRoleSelected(roleId: string): void { container.rolePill.textContent = roleId; container.roleSelect.value = roleId; }
+  function setRoleSelected(roleId: string): void {
+    // 之前只设 roleId 会把 RoleList 阶段写入的 emoji 抹掉（playwright T1
+    // `初始状态显示角色头像` 直接挂掉），走 updateRoleDisplay 走完整
+    // `${icon} ${roleId}` 路径，icon 走 currentRoleIcon 或 roleIcon 回退。
+    updateRoleDisplay(roleId, currentRoleIcon || roleIcon(roleId));
+    container.roleSelect.value = roleId;
+  }
   function refreshRoles(roles: RoleInfo[], selected: string): void {
     container.roleSelect.innerHTML = "";
     for (const r of roles) { const opt = document.createElement("option"); opt.value=r.id; opt.dataset.baseLabel=`${r.icon??""} ${r.id}`; if (r.id===selected) opt.selected=true; container.roleSelect.appendChild(opt); }

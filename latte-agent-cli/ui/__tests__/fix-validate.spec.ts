@@ -23,7 +23,9 @@ test.describe("Delegate no-timeout fix validation", () => {
     page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
     page.on("pageerror", (err) => console.error("[pageerror]", err.message));
     await page.goto(UI_BASE, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await page.waitForTimeout(3000);
+    // 等 main() 挂载完成（panel button handler + SSE 订阅 + chat-send handler 都已就位）
+    // 旧 waitForTimeout(3000) 是硬等，慢机器上不够；data-ui-mounted 是 main() 末尾的确定性标记。
+    await page.waitForSelector('body[data-ui-mounted="1"]', { timeout: 15000 });
   });
 
   test.afterEach(async () => {

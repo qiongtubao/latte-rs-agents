@@ -55,6 +55,11 @@ test("user message echoes, survives reload and server restart", async ({ page })
   await page.goto(`${ORIGIN}/`);
   const input = page.locator("#chat-input");
   await expect(input).toBeVisible({ timeout: 10_000 });
+  // 等 main() 挂载完成（SSE 订阅 + chat-send handler 都已就位）。
+  // 仅等 #chat-input 可见不够——它静态 HTML 里就有，handler / SSE
+  // 都还在绑着，此时点 #chat-send 会 POST 出去但 UI 还没订阅 SSE，
+  // UserMessage 广播到达时没人在听，用户气泡永不出现。
+  await page.waitForSelector('body[data-ui-mounted="1"]', { timeout: 15_000 });
 
   // ① 发送 → UserMessage 事件回显出用户气泡（无本地乐观渲染）
   await input.fill(text);

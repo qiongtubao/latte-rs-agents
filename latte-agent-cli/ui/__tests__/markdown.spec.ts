@@ -59,6 +59,12 @@ const MD = [
   "",
   "![本地图](.latte/learn/__e2e__/img.png)",
   "",
+  "[![超链接本地SVG](.latte/learn/__e2e__/test.svg)](.latte/learn/__e2e__/test.svg)",
+  "",
+  "```mermaid",
+  "invalid mermaid syntax error !!!",
+  "```",
+  "",
   "[打开学习文档](.latte/learn/__e2e__/doc.md)",
 ].join("\n");
 
@@ -73,7 +79,7 @@ const PNG_1PX = Buffer.from(
   "base64",
 );
 const FIXTURE_DOC = "# E2E 学习文档\n\n## 小节A\n\n正文内容。\n\n![文档内图](.latte/learn/__e2e__/img.png)\n";
-
+const FIXTURE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100"><rect width="200" height="100" fill="#3b82f6"/><text x="100" y="55" fill="#fff" text-anchor="middle">SVG</text></svg>`;
 let server: ChildProcess;
 let browser: Browser;
 let context: BrowserContext;
@@ -97,8 +103,8 @@ async function waitForHealth(url: string, timeoutMs = 30_000): Promise<void> {
 test.beforeAll(async () => {
   fs.mkdirSync(FIXTURE_DIR, { recursive: true });
   fs.writeFileSync(path.join(FIXTURE_DIR, "img.png"), PNG_1PX);
+  fs.writeFileSync(path.join(FIXTURE_DIR, "test.svg"), FIXTURE_SVG);
   fs.writeFileSync(path.join(FIXTURE_DIR, "doc.md"), FIXTURE_DOC);
-
   const here = path.dirname(fileURLToPath(import.meta.url));
   const bin = path.resolve(here, "../../../target/debug/latte-agent");
   server = spawn(bin, ["ui", "--port", String(PORT)], { stdio: "ignore" });
@@ -252,5 +258,49 @@ test("mermaid 点击放大弹窗：缩放容器与下载按钮", async () => {
   await expect(modal.locator('[data-act="dl-png"]')).toBeVisible();
   await expect(modal.locator(".mermaid-canvas svg")).toBeVisible();
   await modal.locator('[data-act="close"]').click();
+  await expect(modal).toBeHidden();
+});
+
+test("mermaid 语法错误静默回退为代码块，不向 body 注入 Syntax error in text 错误节点", async () => {
+  // 检查错误图块回退为普通代码块
+  const errBlock = page.locator(".msg-content .mermaid.mermaid-error").first();
+  await expect(errBlock).toBeVisible({ timeout: 15_000 });
+  await expect(errBlock.locator("code")).toContainText("invalid mermaid syntax error");
+
+  // 断言 body 下不存在 mermaid 抛出的错误节点（id 以 dmmd- 开头）
+  const errorNodeCount = await page.evaluate(() => {
+    return document.querySelectorAll("body > [id^=dmmd]").length;
+  });
+  expect(errorNodeCount).toBe(0);
+
+  // 断言整个页面不包含 "Syntax error in text"
+  const bodyText = await page.evaluate(() => document.body.innerText);
+  expect(bodyText).not.toContain("Syntax error in text");
+  expect(bodyText).not.toContain("mermaid version");
+});
+
+test("点击或双击 Markdown 中的图片/SVG 弹出大图预览弹窗，不发生 404 页面跳转", async () => {
+  const svgImg = page.locator('.msg-content img[alt="超链接本地SVG"]').first();
+  await expect(svgImg).toBeVisible({ timeout: 15_000 });
+
+  // 双击图片
+  await svgImg.dblclick();
+  const modal = page.locator(".md-modal-overlay.img-modal");
+  await expect(modal).toBeVisible({ timeout: 5_000 });
+  await expect(modal.locator(".img-modal-canvas img")).toBeVisible();
+  expect(page.url()).not.toContain("test.svg");
+
+  // 关闭弹窗
+  await modal.locator('[data-act="close"]').click();
+  await expect(modal).toBeHidden();
+
+  // 点击普通图片
+  const pngImg = page.locator('.msg-content img[alt="本地图"]').first();
+  await pngImg.click();
+  await expect(modal).toBeVisible({ timeout: 5_000 });
+  await expect(modal.locator(".img-modal-canvas img")).toBeVisible();
+
+  // Esc 关闭弹窗
+  await page.keyboard.press("Escape");
   await expect(modal).toBeHidden();
 });
