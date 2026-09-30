@@ -793,9 +793,10 @@ impl TaskWorktree {
 
     /// 给普通 session 建独立工作空间，返回目录。
     ///
-    /// git 仓库 → git worktree（agent 能看到项目代码，改动互不影响）；
-    /// 非 git / 建树失败 → 普通空目录。两种都放一个 `.latte` 软链回项目状态目录，
-    /// 保证会话日志、配置照旧按 cwd 落在项目里。
+    /// git 仓库 → git worktree（agent 能看到项目代码，改动互不影响，`.latte`
+    /// 软链回项目状态目录）。非 git / 建树失败 → 直接用项目目录：空目录里
+    /// agent 看不到任何源码，读代码的 workflow（learn_loop 取证等）全部失效。
+    /// 项目目录不是 [`Self::session_workspace_root`]，删会话时不会被删。
     pub fn create_session_workspace(project_root: &Path, session_id: &str) -> std::io::Result<PathBuf> {
         if !safe_task_id(session_id) {
             return Err(std::io::Error::new(
@@ -808,43 +809,54 @@ impl TaskWorktree {
                 return Ok(wt.info.root);
             }
         }
-        let root = Self::session_workspace_root(project_root, session_id);
-        std::fs::create_dir_all(&root)?;
-        #[cfg(unix)]
-        {
-            let link = root.join(".latte");
-            if link.symlink_metadata().is_err() {
-                let target = project_root.join(".latte");
-                std::fs::create_dir_all(&target)?;
-                std::os::unix::fs::symlink(&target, &link)?;
-            }
-        }
-        Ok(root)
+        Ok(project_root.to_path_buf())
     }
 
-    /// 删除 [`create_session_workspace`] 建的目录（git worktree 连分支一起回收）。
-    /// `root` 必须恰好是该 session 的工作空间根，否则不动。幂等。
-    pub fn remove_session_workspace(project_root: &Path, session_id: &str, root: &Path) {
-        if root != Self::session_workspace_root(project_root, session_id) {
-            return;
+    /// 删除 [`create_session_workspace`] 建的目录。`root` 必须恰好是该 session
+    /// 的工作空间根，否则不动。幂等。
+    ///
+    /// 有未合并的工作（未提交改动或领先提交，如 learn_loop 定稿的
+    /// `docs/learn/<slug>.md`）时只删树、留分支并把改动提交上去，返回保留的
+    /// 分支名；删会话不能静默销毁没合并的成果。没有可丢的东西才连分支一起删。
+    pub fn remove_session_workspace(
+        project_root: &Path,
+        session_id: &str,
+        root: &Path,
+    ) -> Option<String> {
+        let repo = Self::resolve_repo_root(project_root).ok();
+        // git 分支下树根按 git 解析出的仓库根派生（可能是 canonical 路径），
+        // 与 project_root 直接派生的不一定相同。
+        let is_own = root == Self::session_workspace_root(project_root, session_id)
+            || repo
+                .as_deref()
+                .is_some_and(|r| root == Self::derive_root(r, session_id));
+        if !is_own {
+            return None;
         }
+        let mut kept = None;
         if root.join(".git").exists() {
-            if let Ok(repo) = Self::resolve_repo_root(project_root) {
+            if let Some(repo) = repo {
                 let wt = Self::from_info(
                     &repo,
                     session_id,
                     TaskWorktreeInfo {
                         root: root.to_path_buf(),
                         branch: format!("{TASK_BRANCH_PREFIX}{session_id}"),
-                        base_branch: String::new(),
-                        base_sha: String::new(),
+                        base_branch: git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+                            .unwrap_or_default(),
+                        base_sha: git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default(),
                     },
                 );
-                let _ = wt.cleanup(false);
+                let keep = wt.has_changes().unwrap_or(true);
+                let _ = wt.cleanup(keep);
+                if keep {
+                    kept = Some(wt.info.branch.clone());
+                }
             }
         }
         // 软链只删链本身，不跟进主仓 .latte。
         let _ = std::fs::remove_dir_all(root);
+        kept
     }
 }
 
@@ -942,24 +954,74 @@ mod tests {
 mod session_workspace_tests {
     use super::*;
 
+    fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git 可用")
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        git_in(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+            .status
+            .success()
+    }
+
+    /// LATTE_HOME 是进程级环境变量，非 git 与 git 两种情形放在同一个用例里
+    /// 顺序跑，避免并发用例互相改掉对方的 home。
     #[test]
-    fn non_git_workspace_created_and_removed_without_touching_project_state() {
+    fn session_workspace_lifecycle_keeps_project_and_unmerged_work() {
         let home = tempfile::tempdir().unwrap();
-        let proj = tempfile::tempdir().unwrap();
         std::env::set_var("LATTE_HOME", home.path());
+
+        // 非 git：直接用项目目录，删会话不动它。
+        let proj = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(proj.path().join(".latte")).unwrap();
-        std::fs::write(proj.path().join(".latte/keep.txt"), "k").unwrap();
-
+        std::fs::write(proj.path().join("main.c"), "int main(){}\n").unwrap();
         let root = TaskWorktree::create_session_workspace(proj.path(), "ui-1-2-w0").unwrap();
-        assert!(root.is_dir());
-        std::fs::write(root.join("scratch.md"), "x").unwrap();
+        assert_eq!(root, proj.path(), "非 git 项目要让 agent 看得到源码");
+        assert_eq!(TaskWorktree::remove_session_workspace(proj.path(), "ui-1-2-w0", &root), None);
+        assert!(proj.path().join("main.c").exists());
 
-        // 路径不匹配 → 不动
-        TaskWorktree::remove_session_workspace(proj.path(), "other", &root);
-        assert!(root.is_dir());
+        // git：会话里产出的文档不能随删会话丢失。
+        let repo = tempfile::tempdir().unwrap();
+        let r = repo.path();
+        if !git_in(r, &["init", "-q"]).status.success() {
+            eprintln!("git init 失败，跳过该用例");
+            return;
+        }
+        let _ = git_in(r, &["config", "user.email", "t@t"]);
+        let _ = git_in(r, &["config", "user.name", "t"]);
+        std::fs::write(r.join("main.c"), "int main(){}\n").unwrap();
+        let _ = git_in(r, &["add", "."]);
+        let _ = git_in(r, &["commit", "-qm", "init"]);
 
-        TaskWorktree::remove_session_workspace(proj.path(), "ui-1-2-w0", &root);
-        assert!(!root.exists());
-        assert!(proj.path().join(".latte/keep.txt").exists());
+        let ws = TaskWorktree::create_session_workspace(r, "ui-1-2-w1").unwrap();
+        assert_ne!(ws, r);
+        assert!(ws.join("main.c").exists());
+        assert_eq!(
+            TaskWorktree::remove_session_workspace(r, "other", &ws),
+            None,
+            "路径不匹配不动"
+        );
+        assert!(ws.is_dir());
+        std::fs::create_dir_all(ws.join("docs/learn")).unwrap();
+        std::fs::write(ws.join("docs/learn/own.md"), "# 所有权\n").unwrap();
+        let branch = format!("{TASK_BRANCH_PREFIX}ui-1-2-w1");
+        assert_eq!(
+            TaskWorktree::remove_session_workspace(r, "ui-1-2-w1", &ws),
+            Some(branch.clone())
+        );
+        assert!(!ws.exists());
+        assert!(branch_exists(r, &branch), "有未合并产出必须留分支");
+        let kept = git_in(r, &["show", &format!("{branch}:docs/learn/own.md")]);
+        assert_eq!(String::from_utf8_lossy(&kept.stdout), "# 所有权\n");
+
+        // 没产出的会话：树和分支一起删。
+        let ws = TaskWorktree::create_session_workspace(r, "ui-1-2-w2").unwrap();
+        assert_eq!(TaskWorktree::remove_session_workspace(r, "ui-1-2-w2", &ws), None);
+        assert!(!ws.exists());
+        assert!(!branch_exists(r, &format!("{TASK_BRANCH_PREFIX}ui-1-2-w2")));
     }
 }
