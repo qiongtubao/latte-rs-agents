@@ -3966,34 +3966,139 @@ pub(crate) struct QuizGrade {
     pub items: Vec<QuizItemGrade>,
 }
 
+fn quiz_label_norm(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(|c| {
+            matches!(
+                c,
+                '。' | '，' | '、' | ',' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | '：' | ':'
+            )
+        })
+        .trim()
+        .to_lowercase()
+}
+
+/// `evidence` 的一段 `path:start-end` 或 `path:line`，必须落在仓库里真实存在的行上。
+fn check_learn_evidence(cwd: &Path, evidence: &str) -> Result<(), String> {
+    let (path, range) = evidence
+        .trim()
+        .rsplit_once(':')
+        .ok_or_else(|| format!("「{evidence}」不是 file:line 格式"))?;
+    let path = path.trim();
+    if path.is_empty()
+        || Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("「{evidence}」的路径必须是仓库内的相对路径"));
+    }
+    let (start, end) = match range.trim().split_once('-') {
+        Some((a, b)) => (a.trim().parse::<usize>(), b.trim().parse::<usize>()),
+        None => (range.trim().parse::<usize>(), range.trim().parse::<usize>()),
+    };
+    let (Ok(start), Ok(end)) = (start, end) else {
+        return Err(format!("「{evidence}」的行号不是数字"));
+    };
+    if start == 0 || end < start {
+        return Err(format!("「{evidence}」的行号区间无效"));
+    }
+    let text = std::fs::read_to_string(cwd.join(path))
+        .map_err(|_| format!("「{evidence}」指向的文件 {path} 不存在"))?;
+    let lines = text.lines().count();
+    if end > lines {
+        return Err(format!("「{evidence}」超出文件范围（{path} 只有 {lines} 行）"));
+    }
+    Ok(())
+}
+
+/// plan 步写完 `plan.json` 后的机械校验。补充点（`sup1`）的题目由引擎维护，不在这里查。
+fn validate_learn_plan(cwd: &Path, slug: &str) -> Result<(), String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Err(format!("产出的 slug「{slug}」不合法"));
+    }
+    let path = cwd.join(".latte").join("learn").join(slug).join("plan.json");
+    let plan = read_learn_json(&path)
+        .map_err(|e| format!(".latte/learn/{slug}/plan.json 读不出合法 JSON：{e}"))?;
+    let points = plan
+        .get("knowledge_points")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or("plan.json 缺少非空的 knowledge_points 数组")?;
+    let mut problems = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for point in points {
+        let id = point.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if id.is_empty() {
+            problems.push("有知识点缺少 id".to_string());
+            continue;
+        }
+        if !ids.insert(id.to_string()) {
+            problems.push(format!("{id}：id 重复"));
+        }
+        if is_engine_supplement_point(point) {
+            continue;
+        }
+        let evidence = point.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
+        let parts: Vec<&str> = evidence
+            .split([',', '，', ';', '；'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            problems.push(format!("{id}：evidence 为空"));
+        }
+        for part in parts {
+            if let Err(e) = check_learn_evidence(cwd, part) {
+                problems.push(format!("{id}：{e}"));
+            }
+        }
+        let options = point
+            .get("options")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if options.len() < 2 {
+            problems.push(format!("{id}：options 少于 2 个"));
+        }
+        if options.iter().any(|o| o.get("recommended").is_some()) {
+            problems.push(format!("{id}：选项不得带 recommended（会把答案印在界面上）"));
+        }
+        let labels: Vec<String> = options
+            .iter()
+            .map(|o| quiz_label_norm(o.get("label").and_then(|v| v.as_str()).unwrap_or("")))
+            .collect();
+        if labels.iter().any(|l| l.is_empty()) {
+            problems.push(format!("{id}：有选项的 label 为空"));
+        }
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i + 1) {
+                if !a.is_empty() && !b.is_empty() && (a.contains(b.as_str()) || b.contains(a.as_str())) {
+                    problems.push(format!(
+                        "{id}：选项「{a}」和「{b}」互为子串，判分会把两者混在一起"
+                    ));
+                }
+            }
+        }
+        let answer = quiz_label_norm(point.get("answer").and_then(|v| v.as_str()).unwrap_or(""));
+        if answer.is_empty() || !labels.iter().any(|l| *l == answer) {
+            problems.push(format!("{id}：answer 必须逐字等于某个选项的 label"));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("plan.json 未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
 /// 判分：双方归一化（去首尾空白、去常见收尾标点、忽略大小写）后完全相等即对。
 /// 用户答案可以包住完整 label（序号前缀、`其他：` 前缀），正确 label 须 ≥ 2 字符。
 /// 不接受反过来的包含：短干扰项是正确项的子串时，选干扰项不得判对。
 /// 对不上任何 label（乱填、空、「不知道」、自定义自由文本）按答错。
 fn quiz_answer_matches(expected: &str, given: &str) -> bool {
-    let norm = |s: &str| {
-        s.trim()
-            .trim_end_matches(|c| {
-                matches!(
-                    c,
-                    '。' | '，'
-                        | '、'
-                        | ','
-                        | '.'
-                        | '！'
-                        | '!'
-                        | '？'
-                        | '?'
-                        | '；'
-                        | ';'
-                        | '：'
-                        | ':'
-                )
-            })
-            .trim()
-            .to_lowercase()
-    };
-    let (e, g) = (norm(expected), norm(given));
+    let (e, g) = (quiz_label_norm(expected), quiz_label_norm(given));
     if e.is_empty() || g.is_empty() {
         return false;
     }
@@ -6632,6 +6737,31 @@ async fn run_workflow_serial(
                             );
                             let annotation =
                                 format!("上次产出未通过验收：{reason}。请修正后重新产出完整结果。");
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    // 审稿员已不在路径上，事实靠这里的机械校验兜底：证据行真实存在，
+                    // 答案是某个选项，选项之间不互为子串。
+                    if wf.name == "learn_loop" && step.id == "plan" {
+                        if let Err(reason) = validate_learn_plan(&ctx.cwd, &response) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn plan failed evidence check; retrying"
+                            );
+                            let annotation = format!(
+                                "上次写的 plan.json 未通过引擎校验：\n{reason}\n\
+                                 请读源码核对后重写 plan.json，并再次只输出 slug。"
+                            );
                             step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
                             prompt = format!("{full_prompt}\n\n{annotation}");
                             continue;
@@ -16219,7 +16349,7 @@ mod deterministic_learning_tests {
     /// 判分容忍度：归一化后相等、部分 label、带前缀/后缀都判对；
     /// 自由文本（「不知道」）、空串判错。
     #[test]
-    fn grading_tolerates_partial_and_prefixed_labels() {
+    fn grading_tolerates_prefixed_labels_but_not_partial_ones() {
         let plan = one_point_plan("borrow 语义");
         // 完全相等（忽略大小写与收尾标点）。
         let mut ledger = one_point_ledger();
@@ -16227,12 +16357,12 @@ mod deterministic_learning_tests {
             deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "Borrow 语义。")]))
                 .passed
         );
-        // 只回 label 的一部分。
+        // 只回 label 的一部分判错：短干扰项可能正是它的子串。
         let mut ledger = one_point_ledger();
         assert!(
-            deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "borrow")])).passed
+            !deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "borrow")])).passed
         );
-        // 带前缀（「我选 borrow 语义」），互相包含。
+        // 带前缀（「我选 borrow 语义」），包含完整 label。
         let mut ledger = one_point_ledger();
         assert!(
             deterministic_grade_quiz(
@@ -16954,6 +17084,167 @@ task = "补充疑问"
         let last = wf.steps.last().expect("steps");
         assert_eq!(last.id, "write_chapter");
         assert_eq!(last.output_key.as_deref(), Some("chapters_out"));
+    }
+
+    fn write_learn_plan(cwd: &std::path::Path, points: serde_json::Value) {
+        let base = cwd.join(".latte").join("learn").join("own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "own",
+                "topic": "所有权",
+                "knowledge_points": points
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn good_point() -> serde_json::Value {
+        serde_json::json!({
+            "id": "k1",
+            "title": "所有权",
+            "evidence": "src/own.rs:2-3",
+            "question": "传 a 之后还能用吗？",
+            "options": [{"label": "move 语义"}, {"label": "借用规则"}],
+            "answer": "move 语义"
+        })
+    }
+
+    #[test]
+    fn learn_loop_plan_validation_rejects_fake_evidence_and_bad_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+
+        write_learn_plan(dir.path(), serde_json::json!([good_point()]));
+        validate_learn_plan(dir.path(), "own").expect("真实证据、答案是选项，应通过");
+
+        let mut sup = serde_json::json!({
+            "id": "sup1", "title": "补充", "evidence": "", "question": "学员原话",
+            "options": [], "answer": "", "supplement": true
+        });
+        write_learn_plan(dir.path(), serde_json::json!([good_point(), sup.clone()]));
+        validate_learn_plan(dir.path(), "own").expect("补充点由引擎维护，不查证据");
+
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            ("文件不存在", serde_json::json!({"evidence": "src/nope.rs:1-2"}), "不存在"),
+            ("行号越界", serde_json::json!({"evidence": "src/own.rs:2-40"}), "超出文件范围"),
+            ("路径逃出仓库", serde_json::json!({"evidence": "../own.rs:1"}), "相对路径"),
+            ("答案不是选项", serde_json::json!({"answer": "Copy trait"}), "answer"),
+            (
+                "选项互为子串",
+                serde_json::json!({
+                    "options": [{"label": "move"}, {"label": "move 语义"}],
+                    "answer": "move"
+                }),
+                "互为子串",
+            ),
+            (
+                "带 recommended",
+                serde_json::json!({
+                    "options": [{"label": "move 语义", "recommended": true}, {"label": "借用规则"}]
+                }),
+                "recommended",
+            ),
+        ];
+        for (name, patch, needle) in cases {
+            let mut point = good_point();
+            for (k, v) in patch.as_object().unwrap() {
+                point[k] = v.clone();
+            }
+            write_learn_plan(dir.path(), serde_json::json!([point]));
+            let err = validate_learn_plan(dir.path(), "own").expect_err(name);
+            assert!(err.contains(needle), "{name}：{err}");
+        }
+
+        sup["id"] = serde_json::json!("k1");
+        write_learn_plan(dir.path(), serde_json::json!([good_point(), sup]));
+        let err = validate_learn_plan(dir.path(), "own").expect_err("id 重复");
+        assert!(err.contains("id 重复"), "{err}");
+        assert!(validate_learn_plan(dir.path(), "../own").is_err());
+    }
+
+    /// 第一次 plan 写了不存在的证据：引擎把原因写回 prompt，只重试 plan 这一步。
+    #[tokio::test]
+    async fn learn_loop_plan_retries_until_evidence_is_real() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+        let mut bad = good_point();
+        bad["evidence"] = serde_json::json!("src/own.rs:2-99");
+        write_learn_plan(dir.path(), serde_json::json!([bad]));
+
+        let server = wiremock::MockServer::start().await;
+        let fixed_cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("未通过引擎校验"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_learn_plan(&fixed_cwd, serde_json::json!([good_point()]));
+                ResponseTemplate::new(200).set_body_string(openai_body("own"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "plan"
+role = "tutor"
+task = "PLAN_STEP"
+output_key = "plan_out"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次 plan 证据真实，应成功");
+        assert_eq!(out.trim(), "own");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 2, "只重试 plan 一次：{bodies:?}");
+        assert!(bodies[1].contains("超出文件范围"), "重试 prompt 要带上校验原因");
     }
 
     #[test]
