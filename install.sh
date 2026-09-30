@@ -32,6 +32,10 @@
 #   │   ├── design_brainstorm.toml
 #   │   ├── requirements_review.toml
 #   │   └── tech_director_dispatch.toml
+#   ├── prompts.d/           # role and skill prompt templates
+#   │   ├── tutor.md
+#   │   ├── proofreader.md
+#   │   └── ...
 #   └── discussion.toml      # merged single-file discussion config
 #
 # After install, these files are used by the three-layer config resolver:
@@ -125,17 +129,23 @@ install_file() {
         return 0
     fi
 
-    if [[ -f "$dst" ]] && ! $FORCE; then
-        warn "$name already exists at $dst"
-        if [[ -t 0 ]]; then
-            read -r -p "    Overwrite? [y/N] " answer
-            if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-                detail "skipped"
+    if [[ -f "$dst" ]]; then
+        if cmp -s "$src" "$dst"; then
+            detail "$name is already up-to-date"
+            return 0
+        fi
+        if ! $FORCE; then
+            warn "$name has drifted at $dst (source differs)"
+            if [[ -t 0 ]]; then
+                read -r -p "    Overwrite with repo version? [y/N] " answer
+                if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+                    detail "skipped"
+                    return 0
+                fi
+            else
+                warn "skipping drifted $name (non-interactive, run with --force to sync)"
                 return 0
             fi
-        else
-            detail "skipped (non-interactive, use --force to overwrite)"
-            return 0
         fi
     fi
 
@@ -222,6 +232,14 @@ for f in "$SOURCE_DIR/workflows/"*.toml; do
     name="$(basename "$f")"
     install_file "$f" "$TARGET_DIR/workflows.d/$name" "Workflow: $name"
 done
+
+# Install prompts (one per role/skill markdown file)
+if [[ -d "$SCRIPT_DIR/prompts" ]]; then
+    for f in "$SCRIPT_DIR/prompts/"*.md; do
+        name="$(basename "$f")"
+        install_file "$f" "$TARGET_DIR/prompts.d/$name" "Prompt: $name"
+    done
+fi
 
 # Install model catalog and merged single-file configs
 install_file "$SOURCE_DIR/models.toml"      "$TARGET_DIR/models.toml"      "Model catalog"

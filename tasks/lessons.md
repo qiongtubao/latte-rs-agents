@@ -205,4 +205,21 @@
   是否稳定可重建**。带时间戳/自增序号的 id 生成器 + 「先建成再看文件在不在」的判据 = 经典陷阱。
   离线优先场景下，任何「重建 key」都必须能从盘上稳定推导出来。
 - **4xx 语义**：只有 400/404（数据错）才删标记；401/403/408/429 是瞬时/配置错，必须留标记重试
-  （否则 token 轮换窗口内的改动被永久丢掉，修好也不会补）。
+
+## `doc_review_loop` 循环审查死锁与算术硬伤事故（2026-09-28）
+
+- **现象**：jemalloc 任务 `LAT-110` 在 `doc_review_loop`（`doc_write` ↔ `proofread`）往返 10 轮后，触发 `max_iterations=10` 超限，整个 session 失败崩溃（`status="failed"`）。
+- **根因链**：
+  1. **配置死锁开关**：`doc_review_loop.toml` 中配置了 `loop_no_release_on = "NEEDS_FIX"`。引擎原本在返工环耗尽时设计了 `loop_exhausted_last_resort_review`（由 Advisor 复核产物是否实质可用以兜底放行），但 `loop_no_release_on` 把审稿员的小建议直接等同于架构硬拒绝（如 `VERDICT: REJECT`），强行跳过 Advisor 语义复核，硬判整条流水线崩溃。
+  2. **严重性分级缺失（Blocker vs Nit）**：小白审稿员（Proofreader）在近 2000 行的底层硬核源码文档前，每轮 fresh 重读都能提出 6~11 条排版/图表/初见术语白话等阅读门槛问题，且因无分级机制统一打上 `NEEDS_FIX` 标签阻断流程。
+  3. **作者盲目顺从与算式幻觉（Regression）**：Tutor 采取“看一条、改一条”的局部修补策略，为迎合审稿员编造未经验算的等式，在正文中写出了 `2² + 1·2⁴ = 16`、`16384 == 14336`、`4 × delta = 2 × base` 等确凿的算术硬伤，被审稿员抓获真阻断问题，导致无法收敛。
+- **成熟 Harness 借鉴（oh-my-pi / opencode / deepseek-harness）**：
+  - **OMP**：彻底放弃同步闭门死循环，采用异步旁路 Advisor；严格区分 `nit`（非阻断批注）、`concern` 和 `blocker`（仅阻断性打断）；配备 `immuneTurns` 冷却期与去重过滤。
+  - **OpenCode**：步数超限时执行 `MAX_STEPS` 降级协议，拔掉工具权限强行收尾总结交回人类，绝不报致命失败；计划退出由人类仲裁。
+  - **DeepSeek-Harness**：Ralph 循环超限返回 `budget-limited` 保留最佳成果；区分 Blocker 与 Nit；明确要求被审者进行**技术反驳（Rebuttal）**，禁止表演式顺从修补。
+- **修复落地**：
+  1. 产物修复：修正 `jemalloc/.latte/learn/lat-110-jemalloc-size-class/draft.md` 中所有算式硬伤（pseudo 桥档公式改为 $2^3 + 1 \times 2^3 = 16$，几何约束改为 $4 \times delta = 1 \times base$，slab trace 如实还原 jemalloc 源码 7 轮 LCM 模拟并返回 7 页）。
+  2. 解开死锁：移除 `doc_review_loop.toml` 中的 `loop_no_release_on = "NEEDS_FIX"`，恢复耗尽时的 Advisor 语义复核放行能力。
+  3. 引入分级：`prompts/proofreader.md` 明确区分 `BLOCKER` 与 `NIT`，仅存在 BLOCKER 时才标 `NEEDS_FIX`，纯 NIT 允许正文带建议且末行输出 `LOOKS_CLEAR` 放行。
+  4. 反驳纪律：`prompts/tutor.md` 引入 Rebuttal 机制，强调源码是唯一事实源，严格验算每一个算式，严禁为迎合审稿员凭空捏造。
+  5. 全面同步：同步 `config/workflows/`、`.latte/workflows.d/`、`~/.latte/workflows.d/` 与对应 `prompts/`，更新 `workflow.rs` 单测。

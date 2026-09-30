@@ -281,7 +281,7 @@ export function mapRoles() {
  * code-editor:  invoke("chat_controller_resume", { sessionId }) → void
  *
  * agent-ui:  POST /api/chat/pause-session
- *   全 session 冻结。
+ *   打开全 session 暂停门（非流式当前请求在继续后重试，流式已有输出/工具在边界完成）。
  *   → pauseSession(req) → 200 OK
  * code-editor:  invoke("chat_controller_pause", { sessionId })（复用同一命令）
  *

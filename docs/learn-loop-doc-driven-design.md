@@ -1,8 +1,15 @@
 # learn_loop v2 设计：文档驱动的学习循环
 
-> 状态：设计稿（未实现）
+> 状态：已实现（v2 在 config/workflows/learn_loop.toml 生效）
 > 分支：feat/learn-loop-doc-driven
 > 前身：config/workflows/learn_loop.toml（teach 正文讲解 → 弹窗出题）
+>
+> 实现差异（2026-09-16 起）：read_confirm / quiz 两步由**引擎确定性执行**
+> （workflow.rs `run_learn_control_step`）——弹窗、判分、写账本不走模型，
+> 但 quiz 的 loop_until / loop_back_routes 照常由引擎判定：答错 → 逐题反馈
+> （含正确答案与 file:line）→ 跳回 doc 增强 → 重读 → 重考，直到全对或撞
+> max_iterations。判分按归一化后的 label 文本，容忍"只回 label 的一部分或
+> 带前缀"。§5.3 / §5.4 描述的行为契约不变，只是执行者从模型换成了引擎。
 
 ## 1. 背景与要解决的问题
 
@@ -78,7 +85,7 @@ v2 把教学载体从"chat 消息"改为"**持续演化的 markdown 文档**"：
 所有文件在 `.latte/learn/<slug>/` 下；最终交付文档在 `docs/learn/<slug>.md`
 （与 learn.toml 的产物约定一致）。
 
-### 4.1 plan.json（plan 步一次性产出，后续只读）
+### 4.1 plan.json（每次运行由 plan 步刷新）
 
 在现有结构上加两个字段：
 
@@ -109,7 +116,20 @@ v2 把教学载体从"chat 消息"改为"**持续演化的 markdown 文档**"：
 - `options` 里禁止 `recommended`（前端渲染成「✓ 推荐」= 泄题）；正确项位置由
   plan 自己随机化（无 shuffle 实现，见 §3.6）。
 
-### 4.2 ledger.json（每轮由 quiz / supplement 步更新）
+### 重跑与复用语义
+
+同一主题再次执行时，**复用的是身份和学习进度，不是复用旧内容**：
+
+| 文件 | 重跑时的职责 | 允许的变化 |
+|---|---|---|
+| `plan.json` | `plan` 每次重新取证后刷新 | 更新当前源码证据、行号、讲解、例子、题目和大纲；相同知识点尽量保留 id，新增点追加，已有学习记录的旧点不静默删除 |
+| `ledger.json` | `plan` 合并更新，`quiz`/`supplement` 继续记事实 | 保留 `round`、`wrong`、`passed`、`supplements`；只给新增知识点初始化事实，不得因重跑清零 |
+| `draft.md` | `doc` 每次进入都读取并刷新 | 根据新 plan 更新代码解释、章节和图；保留有效的答错增强与学员补充，不得因“内容看起来没变”跳过写入 |
+| `docs/learn/<slug>.md` | 仅 `merge` 成功后更新 | 失败或中断的重跑不能覆盖上一次已交付的最终文档 |
+
+因此，`slug` 是稳定身份，`plan.json` 和 `draft.md` 是随当前源码演进的材料，`ledger.json` 是跨运行保留的学习事实。`plan` 不能把“没有新增知识点”解释为“不需要写”；它仍必须刷新计划和账本，随后由 `doc` 刷新活文档。
+
+
 
 ```json
 {
@@ -183,12 +203,17 @@ plan → annotate → doc → read_confirm → quiz → supplement → merge →
 | sync_code（可选） | tutor | read, edit | when_any=[同步注释, 写进源码]（未命中整步跳过）；require_tools=[edit] | — |
 | report | tutor | read | min_chars；require=[掌握进度] | — |
 
-### 5.1 plan（基本沿用现有设计）
+### 5.1 plan（每次运行刷新，复用身份而不是复用旧内容）
 
-取证 → 拆 3-6 个由浅入深的知识点 → 出题（选项自己乱序、禁 recommended）→
-写 plan.json（含 `doc_outline` / `doc_section`）与初始 ledger.json（round=0）。
-产出只输出 slug（下游拼路径，max_chars 硬约束保留）。slug 推导时剔除
-「同步注释」/「写进源码」开关标记词——它们是 sync_code 步的触发开关，
+每次运行都要重新取证：复用已有主题的 slug 和 ledger 学习进度，但不能因为目录已存在
+就把计划当成不可变快照。plan 读取当前源码和既有 plan 后，更新 `plan.json` 中过时的
+证据、行号、讲解、例子、题目和大纲；相同知识点尽量保留 id，新增知识点追加，已有
+学习记录的旧点不静默删除。无论有没有新增知识点，都必须实际写回完整的 `plan.json`
+和 `ledger.json`：后者保留 `round`/`passed`/`wrong`/`supplements`，只为新增知识点
+初始化事实。plan 只维护计划和账本，不写 `draft.md`；后续 doc 步读取刷新后的 plan
+并更新活文档。
+
+slug 推导时剔除「同步注释」/「写进源码」开关标记词——它们是 sync_code 步的触发开关，
 不是主题内容。
 
 小白友好（2026-09-16）：每个知识点必须带 `example` 最小具体例子（讲参数写
@@ -228,6 +253,9 @@ plan → annotate → doc → read_confirm → quiz → supplement → merge →
 
 ### 5.3 read_confirm（新）
 
+> 实现注记：本步由引擎确定性执行（见文头「实现差异」）；题面带 `第 {round+1} 版`
+> 版本号后缀以规避同题回放。以下为行为契约。
+
 唯一职责：阻塞等学员读完。一次 ask：
 
 - question：`学习材料：.latte/learn/<slug>/draft.md（路径见上一条消息）。读完了吗？`
@@ -237,6 +265,10 @@ plan → annotate → doc → read_confirm → quiz → supplement → merge →
 连弹。
 
 ### 5.4 quiz
+
+> 实现注记：本步由引擎确定性执行（见文头「实现差异」）；重考题面后缀实为
+> `［第{wrong+1}次作答］`，判分容忍部分 label 匹配，账本由引擎落盘（含
+> `_graded_answers` 幂等 receipts）。以下为行为契约。
 
 - 读 plan.json 取**所有 `passed == false`** 知识点的题，一次 ask
   `questions=[...]` 全考完（一轮一窗）。
@@ -413,9 +445,10 @@ loop_back 路由触发，实线箭头是串行顺序，回边是循环路由。�
 - doc 返工完成 → merge → report 的收尾段。deepseek 欠费（402）、glm-5.3 长上下文
   频繁慢响应/空输出、MiniMax-M3 流式空闲超时——第 8/9 次全量运行均死在模型可用性
   上，非流程逻辑问题。待模型恢复后用 `python3 tests/blackbox/learn_loop_e2e.py` 补验。
-- QUIZ_FAIL → doc 增强 → 重读 → 重考 这条设计路径未被完整走一遍：实测中 quiz
-  第一次尝试的产出没通过契约（触发重试），重试的新子代理直接重考了答错点并全对
-  通过。两条路径都收敛，但"经 doc 增强再重考"的分支还欠一次实跑。
+- QUIZ_FAIL → doc 增强 → 重读 → 重考：引擎路径已接通（2026-09-16，确定性 quiz
+  参与 loop_until 判定，答错反馈作为 pending_feedback 注入 doc），仍欠一次真实
+  模型环境的端到端实跑。历史注记：3668d02 引入确定性 quiz 时曾把返工判定短路
+  （直接 idx+1），该回归已随本次接通修复。
 
 ## 10. 已知取舍
 

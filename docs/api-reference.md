@@ -273,7 +273,7 @@ turn 边界**收敛为只读白名单（read/search/code_graph/ask/plan/todo）�
 
 ### `POST /api/chat/pause-session`
 
-用户按 ⏸ 触发全 session 冻结（让所有 in-flight 与后续 turn 挂起）。
+用户按 ⏸ 触发全 session 暂停门：非流式模型请求会被暂停并在 ▶ 后重试同一轮；已产生输出的流式调用和工具在安全边界完成；后续 turn 等待继续。
 
 **请求体：** `{ "session_id": "abc123" }`
 
@@ -890,6 +890,20 @@ step 续跑（`run_workflow_resume`）；经典 chat 任务恢复 controller/gat
 仅 `in_progress` + 有进行中 run 可调；绑定的 session 已被删 → `400`（提示改走中止）。
 
 **响应 `200`：** `TaskView`
+
+### `GET /api/tasks/<id>/workflow-runs`
+
+列出该任务关联的所有 workflow run（`learn_loop` / `code_review` / `merge` 等
+lifecycle hook 与派发 workflow 都算；按 `session_id` 关联、`started_at` 升序）。
+
+**响应 `200`：** `TaskWorkflowRunSummary[]`
+
+### `GET /api/tasks/<id>/workflow-runs/<wf_id>`
+
+单条 run 完整详情（含全部 step output 全文与 ask 回答）。`wf_id` 必须属于该任务，
+否则 `404`。
+
+**响应 `200`：** `TaskWorkflowRunDetail`
 
 ### `GET /api/tasks/<id>/worktree-diff`
 
