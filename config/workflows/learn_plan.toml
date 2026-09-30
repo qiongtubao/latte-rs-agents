@@ -1,0 +1,148 @@
+# Workflow: learn_plan
+# 学习/课程类拆分专用：把「学透这个仓库/主题」拆成一本书的目录（编/章任务树）。
+# 与 implementation_plan 的分工：实现类拆分的产出要被 worker 直接执行，符号
+# 拼写就是契约，breakdown 带 require_symbols_resolvable 硬门禁；学习类拆分的
+# 产出是一本书的目录，章只锚定**真实存在的文件路径**（tasks_json 的
+# require_plan_tasks 校验），符号级取证留给每章的 learn_loop plan 步现场做——
+# 实测（2026-09-17 jemalloc 书目录 e2e，5 轮迭代）：把符号门禁套在书目录上
+# 是打地鼠（42→7→19→1→21 个未命中），模型每轮重写都从训练记忆漏进新的
+# 旧版符号/占位符（extents_pa_alloc、je_xxx、README），而目录章名根本不该
+# 点名内部函数。门禁位置错了，不是模型不努力。
+#
+# 步骤与 implementation_plan 同构：breakdown（出目录草案）→ tasks_json（转
+# 看板 JSON，路径存在性机械校验）→ verdict（终审，学习类检查清单）→
+# gate（REJECT 按病灶路由返工）。
+
+name = "learn_plan"
+command = "/learn-plan"
+description = "学习计划拆分：把「学透某仓库/主题」拆成一本书的目录（编=认知阶段、章=一次 learn_loop、节惰性展开），depends_on 先修链串成学习路径｜落点：任务看板条目（plan 弹窗勾选导入）+ 章任务的 learn_loop 流水线｜学习/课程/教材类「拆分任务、出学习计划」走这里，实现类拆分走 /plan"
+max_rounds = 1
+
+[[steps]]
+id = "breakdown"
+description = "出全书目录草案（编/章结构 + 先修链）"
+speakers = ["architect"]
+output_key = "plan"
+max_retries = 1
+# 取证下限：目录必须基于真实骨架（目录树/构建文件/模块符号索引），
+# 不许凭训练记忆编。但不带 require_symbols_resolvable——见文件头注释。
+require_tools_any = ["read", "code_graph", "search"]
+prompt = """为以下学习目标设计一本书的目录：{{topic}}。
+
+先读仓库骨架再拆：目录树、构建文件（Makefile/Cargo.toml/package.json 的模块清单）、
+code_graph 的模块符号索引。**只读骨架、不逐文件深读**——拆 50 章的书不需要先读完
+50 章的内容，file:line 级取证是每章学习阶段（learn_loop plan 步）的事。
+
+输出形态（必须读起来像一本书，不像一摞阅读卡片）：
+
+1. **编 = 认知阶段**，按学习规律排序：打地基（环境/工具/先修语言补课）→ 地图
+   （这是什么、整体怎么运转、数据从哪进哪出）→ 精读主线（自顶向下、主干优先，
+   跟着一次核心调用走）→ 外围机制 → 底层原理（内存/并发/性能）→ 观测与验证输出。
+2. **章 = 一个可独立学习验收的主题**（一章 = 一次 learn_loop，体量 ≈ 3-6 个知识点）。
+   **节不在本阶段展开**。
+3. **章名用模块名/主题词 + 真实文件路径锚点**（如「第 3 编第 1 章 extent 层精读
+   （锚点 src/extent.c）」），**不要点名内部函数/宏**——那是节级细节，现在写只会
+   凭记忆编错。引用文件一律写带扩展名的完整相对路径。
+4. 每章给出：章标题、学什么（2-3 句）、**验收标准写「能讲清/能推出什么」**
+   （如"能画出一次分配从入口到 cache_bin 的完整路径"），不写行号、不考细节记忆。
+5. **先修链**：章与章的先后关系（后一章要用到前一章的概念才算真依赖）。
+6. **螺旋上升优于一次到位**：同一主题允许出现两次（前章"先用起来"，后编"再拆开看"），
+   但不许原样复读——后章必须明确写出进阶在哪。
+7. **收尾编必须有「验证与输出」章**：重写一个迷你核心模块/写基准测试/把全书
+   讲成一张图——没有动手验证的学习计划不算拆完。
+
+输出：1) 全书结构说明（为什么这么编排）；2) 编/章目录（每章带上面第 4 条的内容）；
+3) 先修链说明；4) 风险与未知项（哪些章的内容你还没把握、学到时可能要调整）。"""
+
+[steps.output_contract]
+min_chars = 200
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "tasks_json"
+description = "把目录转成任务看板数据结构"
+speakers = ["architect"]
+output_key = "tasks"
+# 清单 JSON 较长，撞输出上限/格式瑕疵时给重试机会（实测第一跑就被截断）。
+max_retries = 2
+# 机械校验：paths 存在性、清单内重叠、workflow/task_type 名。章任务锚定
+# 真实文件路径即可——符号级正确性不在这里卡（见文件头注释）。
+require_plan_tasks = true
+prompt = """把这份学习目录转成任务看板数据结构：
+{{plan}}
+严格输出一个 ```json 代码块。**JSON 代码块之外不写任何文字——不写思考过程、不写说明、不写前后缀。**
+**JSON 用紧凑格式**（不缩进、不多余换行），且**控制规模**：顶层章任务 12-20 个，
+每条 description ≤ 60 字、验收一句话——细节留在 breakdown 文档里，清单只放骨架。
+超长的 JSON 会撞输出上限被截断，截断即整步打回（实测多次在此翻车）。
+schema：
+{"tasks": [{"title": "必填，一句话（带章节号，如「第 2 编第 1 章 fastpath 精读」）", "description": "学什么+验收标准（验收写「能讲清/能推出什么」，不写行号）", "priority": 1-4（1最高）, "labels": ["学习", "只读", "编分组标签，如 第2编-精读主线"], "task_type": "learn_loop（精读者）/learn（泛读讲解）/feature（含动手实验或验证输出章）/research（纯摸底）", "workflow": "默认留空", "depends_on": ["先修章的标题原文——学习类任务不适用默认并行，先修链必须全部落在这里"], "paths": ["可选：只写核实过存在的路径，不确定留空数组"], "subtasks": [同构，任意深度]}]}
+要求：
+- **章是任务本体，编只是标签**：每章一个任务（标题如「第2编第1章 fastpath 精读」），
+  编用 labels 分组（如「第2编-精读主线」）。**禁止编级容器任务**——标题里带
+  「（N章）」把多章捆成一个任务是错误形态（那样的任务对 learn_loop 太大，
+  一次学不完）。depends_on 串在章与章之间（可以跨编指向另一编的某章）。
+- 编用 labels 表达（如「第2编-精读主线」）；depends_on 串起先修链，
+  环境/工具章通常是全书的根依赖。
+- **章节号顺序 = 阅读顺序 = depends_on 拓扑序**：不允许「第 N 章依赖第 M 章但
+  M > N」——编号靠后的章不能被编号靠前的章依赖。发现依赖要求后章先读时，
+  要么把被依赖章的编号提前，要么去掉这条伪依赖。
+- 章级 paths 写本章锚定的真实文件/目录前缀；labels 必须含「学习」「只读」。
+- 任务粒度：一章是一次 learn_loop 的体量，不是一天的阅读量；太大就在 subtasks
+  里拆节（沿用章节号，如 2.1.1），但默认不拆——节的细化留给学习时的 plan 步。
+- 每个任务都能独立验收；depends_on 指向的标题必须是清单里真实存在的标题原文。
+- **paths 可选，宁空勿猜**：只写 breakdown 阶段**核实过存在**的路径；不确定就留空——
+  章任务的 labels 已带「学习」「只读」，不参与范围冲突校验，执行时由 learn_loop
+  现场取证，paths 在这里只是提示锚点。凭印象猜路径（尤其 test/ 下的文件名）会被
+  机械校验整单打回（实测 jemalloc 的 test/unit/bin.c 这类幻觉路径反复出现）。"""
+
+[[steps]]
+id = "verdict"
+description = "终审（学习类检查清单）"
+speakers = ["reviewer"]
+output_key = "verdict"
+# 抽查而非全量核验：实测 reviewer 逐项核验会把工具调用打成小时级
+# （2026-09-17 e2e 实录：gate 对着截断 verdict 核验 .rst 引用烧了 4 小时），
+# 且工具阶段过长会把输出预算耗尽（verdict 产出被截成 115 字符）。
+max_retries = 2
+tool_call_limits = { read = 8, search = 8, code_graph = 8 }
+require_tools_any = ["read", "code_graph", "search"]
+prompt = "终审这份学习计划：\n【拆解】{{plan}}\n【任务清单】{{tasks}}\n按裁决格式输出。**抽查即可，不要逐项全量核验**：paths/符号存在性抽 3-5 处验证（优先抽看起来最可疑的），工具调用总量控制在 10 次以内；章名若点名了具体符号则抽查其存在性（查不到的按实测错误处理）。\n学习类检查清单：① 目录是否覆盖学习目标（有没有漏掉核心机制）；② 编的顺序是否符合认知规律（环境/补课→地图→主线→外围→底层→验证输出）；③ 先修链是否全部落进 depends_on、且指向的章排在前面（倒置 = blocking；注意「章节号顺序 = 阅读顺序」：第 N 章依赖第 M 章且 M > N 也算倒置）；④ 每章验收是否是「能讲清/能推出什么」、有没有验收依赖未排在前序的知识（倒置 = blocking）；⑤ 章之间阅读落点是否重复（复读 = important，应合并或改写为进阶深化）；⑥ 有没有「验证与输出」收尾章；⑦ 章节号是否连续一致。"
+
+# ── gate：终审门（与 implementation_plan 同一套返工机制）─────────────
+[[steps]]
+id = "gate"
+description = "终审门：REJECT 自动返工，耗尽迭代才失败"
+speakers = ["reviewer"]
+max_retries = 2
+# 同 verdict：抽查复核，不许全量重验（防止对着长清单烧小时级工具调用）。
+tool_call_limits = { read = 6, search = 6, code_graph = 6 }
+loop_until = "VERDICT: PASS"
+loop_back_to = "breakdown"
+loop_no_release_on = "VERDICT: REJECT"
+max_iterations = 3
+prompt = """根据以下终审结论判定放行与否：
+
+【终审结论】
+{{verdict}}
+
+规则：
+- 终审为 ✅ 通过 → 第一行输出 `VERDICT: PASS`，然后**原样完整附上**下面的任务清单（不得增删改任务）：
+
+【任务清单】
+{{tasks}}
+
+- 终审为 ⚠️ 有条件通过（无阻断问题）→ 第一行输出 `VERDICT: PASS`，然后以「【通过条件/修正项】」为标题**原样附上终审列出的全部条件与修正项**（一条都不许丢），再原样完整附上任务清单。修正项必须随清单一并交付，禁止静默丢弃。
+- 终审（无论裁决为何）指出实测错误（路径/符号存在性核验不符）且这些修正未在任务清单中体现 → 必须输出 `VERDICT: REJECT`，理由列出未吸收的实测错误。
+- 终审为 ❌ 不通过 / changes-requested / 存在阻断问题（先修链倒置、验收依赖未学知识、漏核心机制）→ 只输出 `VERDICT: REJECT` 和阻断原因摘要（写清证据，返工要用），**不要**附任务清单。
+- 输出 REJECT 时，正文中不得再出现字符串「VERDICT: PASS」（会被循环条件误判为放行）。
+- **输出 REJECT 时必须另起一行标注病灶步**，二者选一（照抄，不要改写）：
+  - `REWORK: tasks_json` —— 问题只在**清单落地形态**：JSON 不合法/被截断/字段缺失（depends_on、labels、paths 等）、与目录不一致。方案本身没问题。
+  - `REWORK: breakdown` —— 问题在**目录层面**：编排顺序错、覆盖不全、先修链设计错。必须回到拆解重做。
+  判不准时选 `REWORK: breakdown`（更保守）。"""
+
+[steps.loop_back_routes]
+"REWORK: tasks_json" = "tasks_json"
+"REWORK: breakdown" = "breakdown"
+
+[steps.output_contract]
+require = ["VERDICT:"]

@@ -96,6 +96,11 @@ description = "按骨架写成小白教程并写入 docs/learn/"
 role = "tech_writer"
 output_key = "doc"
 max_retries = 1
+# 行号引用校验：文档里写的 `path:line` 必须落在本步实际读到过的行内。
+# 实测 LAT-113：7 个 `#error` 行号 6 个标错，符号门禁放行（名字都真实存在），
+# 靠 reviewer 事后抓，随后 8 次 edit 全在修引用。三态放行 + reveal 报错，
+# 细节见 WorkflowStepDef::require_citations_observed。
+require_citations_observed = true
 task = """你是写给零基础读者的技术作家。按下面的骨架，把主题「{{topic}}」写成一篇小白教程，用 write 工具存入 `docs/learn/` 目录（文件名用主题的短英文 slug）。
 
 【骨架】
