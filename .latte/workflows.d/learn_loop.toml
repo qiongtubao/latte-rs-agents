@@ -49,7 +49,7 @@ id = "plan"
 description = "读代码取证，拆解知识点、出题并写入 plan.json / ledger.json"
 role = "tutor"
 output_key = "plan_out"
-max_retries = 1
+max_retries = 2
 tools = ["read", "code_graph", "search", "write"]
 require_tools_any = ["read", "code_graph", "search"]
 require_tools = ["write"]
@@ -178,15 +178,15 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 min_chars = 30
 require = ["code/"]
 
-# ═══ 2. 嵌套文档审查门（B套A 分段打磨与审稿）══════════════════════
-# doc_review_loop 内部执行：B套A 分段打磨写文档 → proofreader 审查
-# 只有 LOOKS_CLEAR 才返回外层。
+# ═══ 2. 嵌套写作（主体框架 + 章节并发写作）══════════════════════
+# doc_review_loop：outline → 各章并发 write。写完就返回，学员开始阅读。
+# 放行条件是学员答题，不是审稿员的 LOOKS_CLEAR。
 [[steps]]
 id = "doc_review"
-description = "运行 tutor/proofreader 嵌套循环，执行 B套A 分段写文档与打磨"
+description = "运行 outline→并发章节写作"
 workflow = "doc_review_loop"
 output_key = "doc_review_out"
-output_from = "review_out"
+output_from = "chapters_out"
 task = """学习文档审查契约：
 slug={{plan_out}}
 draft=.latte/learn/{{plan_out}}/draft.md
@@ -307,8 +307,8 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
    - `options` 原样传，**不加 `recommended`**（渲染成「✓ 推荐」等于泄题）；
    - `answer` 只给你判分，永远不下发，也不要在题面或 `description` 里暗示。
 2. **判分**：用户答案与 `answer` 按 **label 文本**比对、**绝不按位置**（正确项位置是
-   plan 随机打散的，"第几项"没有意义；用户可能只回 label 的一部分或带前缀）。对不上
-   任何 label（乱填、空、"不知道"、或走了「其他（自定义）」自由文本）按答错。
+   plan 随机打散的，"第几项"没有意义；答案可以带序号前缀，但必须包含完整 label）。
+   只回 label 的一部分、对不上任何 label（乱填、空、"不知道"、或走了「其他（自定义）」自由文本）按答错。
 3. **更新账本**（write 覆盖写 ledger.json 并刷新 `updated_at`）。只做两件事，不做任何
    状态推理：答对 → 该点 `passed = true`（`wrong` 不动）；答错 → `wrong` = 读到的值
    **+1**（`passed` 保持 false）。`wrong` 只能 +1、绝不跳步；其余知识点原样保留。

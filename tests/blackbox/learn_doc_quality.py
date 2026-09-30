@@ -79,11 +79,10 @@ def sse_reader(url):
 
 
 def wait_doc_then_proofread(timeout=1800):
-    """等到 doc 步投递的全文，然后等到 proofread 步给出 LOOKS_CLEAR 或 NEEDS_FIX。
+    """等到章节写完、学员可以开始答题。
 
-    返回 (doc_content, proofread_content, proofread_verdict)。
-    NEEDS_FIX 时会看到引擎把 proofread 输出回灌给 doc 再跑一轮——本函数只观察到
-    第一次 proofread 判定就返回（循环本身交给引擎）。"""
+    返回 (doc_content, "", "STUDENT")。放行条件是 read_confirm 弹窗，
+    不是审稿员的 LOOKS_CLEAR。"""
     deadline = time.time() + timeout
     doc = None
     while time.time() < deadline:
@@ -100,7 +99,7 @@ def wait_doc_then_proofread(timeout=1800):
             log(f"── step {ev.get('index')}/{ev.get('total')}: {ev.get('step_id')}")
             continue
         if t == "WorkflowFinished":
-            fail(f"workflow 提前结束（proofread 前）：{ev.get('summary', '')[:200]}")
+            fail(f"workflow 提前结束（学员确认前）：{ev.get('summary', '')[:200]}")
         if t == "WorkflowTurn":
             sid = ev.get("step_id")
             content = ev.get("content", "")
@@ -108,14 +107,10 @@ def wait_doc_then_proofread(timeout=1800):
                 doc = content
                 log(f"doc 全文到手：{len(content)} 字符")
                 continue
-            if sid == "proofread" and doc is not None:
-                verdict = "LOOKS_CLEAR" if "LOOKS_CLEAR" in content else \
-                          "NEEDS_FIX" if "NEEDS_FIX" in content else "UNKNOWN"
-                return doc, content, verdict
         if t == "ChoiceRequested":
-            fail("read_confirm 弹窗到了但 proofread 未投递——顺序错了")
+            return doc or "", "", "STUDENT"
     recent = [e.get("type") for e in all_events[-10:]]
-    fail(f"等 doc/proofread 超时。最近事件：{recent}")
+    fail(f"等学员确认超时。最近事件：{recent}")
 
 
 # ─── 质量断言 ────────────────────────────────────────────
@@ -256,9 +251,8 @@ def main():
         http_json("POST", f"http://127.0.0.1:{port}/api/chat/command",
                   {"session_id": sid, "command": f"/learn_loop {args.topic}"})
 
-        doc, proof, verdict = wait_doc_then_proofread()
-        log(f"doc 全文到手：{len(doc)} 字符；proofread verdict = {verdict}")
-        log(f"proofread 输出前 300 字：{proof[:300].replace(chr(10),' | ')}")
+        doc, _proof, verdict = wait_doc_then_proofread()
+        log(f"doc 全文到手：{len(doc)} 字符；放行 = {verdict}")
         # 找到本次生成的 draft.md 落盘
         cands = sorted(glob.glob(os.path.join(ROOT, ".latte", "learn", "*", "draft.md")),
                        key=os.path.getmtime)
