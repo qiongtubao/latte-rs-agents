@@ -65,6 +65,13 @@ pub enum AgentError {
     #[error("token budget exceeded: used {used}, budget {budget}")]
     TokenBudgetExceeded { used: usize, budget: usize },
 
+    /// 一个 workflow step 在发送下一次模型调用前发现实际待发 prompt 已
+    /// 超出该 step 的硬预算。与 session token budget 不同：这是防止
+    /// 单个工具循环把 read/tool-result 历史不断重传的上下文边界；workflow
+    /// 可选择丢弃 runner 并从受控文件契约重新启动。
+    #[error("prompt budget exceeded: estimated {estimated}, budget {budget}")]
+    PromptBudgetExceeded { estimated: usize, budget: usize },
+
     /// A tool loop was detected: the model called the same tool with
     /// the same arguments `LOOP_STREAK_THRESHOLD+` times in a row,
     /// indicating it is stuck.
@@ -81,6 +88,13 @@ pub enum AgentError {
         reason: String,
         /// 熔断时模型已产出的正文（可能为空）。
         partial: String,
+    },
+    /// Wall-clock deadline exceeded before completion.
+    #[error("deadline exceeded after {elapsed_secs}s ({tool_rounds} tool rounds){}", last_tool.as_ref().map(|t| format!(", last tool: {t}")).unwrap_or_default())]
+    DeadlineExceeded {
+        elapsed_secs: u64,
+        tool_rounds: usize,
+        last_tool: Option<String>,
     },
 
     /// Invalid parameter.

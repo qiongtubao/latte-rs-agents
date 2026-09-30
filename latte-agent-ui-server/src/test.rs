@@ -201,7 +201,11 @@ async fn test_via_raw_http(req: &TestModelRequest, started: Instant) -> TestMode
     let raw_cap = (req.def.max_tokens > 0).then_some(req.def.max_tokens);
     let is_anthropic = req.def.api.eq_ignore_ascii_case("anthropic");
     // Anthropic 必填，没配就兜 4096；OpenAI 没配则整个不发该字段。
-    let reported_cap = if is_anthropic { Some(raw_cap.unwrap_or(4_096)) } else { raw_cap };
+    let reported_cap = if is_anthropic {
+        Some(raw_cap.unwrap_or(4_096))
+    } else {
+        raw_cap
+    };
     let body = if is_anthropic {
         serde_json::json!({
             // Anthropic 要求必填；用配置值，配错了这次测试就该失败。
@@ -348,10 +352,7 @@ fn build_latte_ai_model(def: &ModelDef) -> anyhow::Result<latte_ai::models::Mode
     })
 }
 
-fn build_user_message(
-    text: &str,
-    images: &[String],
-) -> anyhow::Result<latte_ai::models::Message> {
+fn build_user_message(text: &str, images: &[String]) -> anyhow::Result<latte_ai::models::Message> {
     use latte_ai::models::{ContentPart, Message, Role};
     if images.is_empty() {
         return Ok(Message::text(Role::User, text));
@@ -417,9 +418,9 @@ fn build_anthropic_content(text: &str, images: &[String]) -> serde_json::Value {
 
 fn parse_data_url(s: &str) -> anyhow::Result<(String, String)> {
     let s = s.trim();
-    let rest = s.strip_prefix("data:").ok_or_else(|| {
-        anyhow::anyhow!("image must be a data URL (data:image/...;base64,...)")
-    })?;
+    let rest = s
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow::anyhow!("image must be a data URL (data:image/...;base64,...)"))?;
     let (media_type, data) = rest
         .split_once(";base64,")
         .ok_or_else(|| anyhow::anyhow!("data URL missing `;base64,` separator"))?;
@@ -444,7 +445,11 @@ fn extract_model_list(body: &str) -> Option<Vec<String>> {
         .iter()
         .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
         .collect();
-    if ids.is_empty() { None } else { Some(ids) }
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids)
+    }
 }
 
 fn extract_chat_text(body: &str, api: &str) -> String {
@@ -573,9 +578,9 @@ pub async fn run_tool_test(req: TestToolRequest, cwd: &std::path::Path) -> TestT
         .get_tool(&resolved)
         .map(|_| resolved.clone())
         .or_else(|| {
-            mgr.get_tool_names().into_iter().find(|n| {
-                n.rsplit_once('.').map(|(_, s)| s) == Some(resolved.as_str())
-            })
+            mgr.get_tool_names()
+                .into_iter()
+                .find(|n| n.rsplit_once('.').map(|(_, s)| s) == Some(resolved.as_str()))
         });
 
     let Some(full_name) = full_name else {
@@ -649,11 +654,7 @@ pub async fn run_role_test(
     let config = req.config;
 
     // 1. 选择 model：优先用 model_chain 的第一个，否则按 tier 解析
-    let model_id = config
-        .model_chain
-        .first()
-        .cloned()
-        .unwrap_or_default();
+    let model_id = config.model_chain.first().cloned().unwrap_or_default();
     let tier = latte_agent_core::model_resolver::ModelTier::parse(&config.model_tier)
         .unwrap_or(latte_agent_core::model_resolver::ModelTier::Standard);
 
@@ -743,8 +744,8 @@ mod tests {
             max_tokens,
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
-        prompt_cache: false,
-        prompt_cache_key: None,
+            prompt_cache: false,
+            prompt_cache_key: None,
             supports_thinking: false,
             supports_vision: false,
             supports_image_generation: false,

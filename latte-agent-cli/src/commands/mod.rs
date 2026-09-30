@@ -16,10 +16,10 @@ pub mod role_injector;
 pub mod run;
 pub mod split_screen;
 pub mod style;
+pub mod test;
+pub mod trace_store;
 pub mod ui;
 pub mod workflow;
-pub mod trace_store;
-pub mod test;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,19 +35,21 @@ use crate::commands::debug::DebugFormat;
 /// When `flags.debug` is true, returns a `FanoutSink` of `[StdoutSink, JsonlSink]`
 /// plus the always-on `IndexSink` (unless `flags.no_session_index` is set).
 /// Otherwise returns just the `IndexSink` (no overhead).
-pub fn build_debug_sink(
-    session_id: &str,
-    flags: &DebugFlags,
-) -> Arc<dyn TraceSink> {
+pub fn build_debug_sink(session_id: &str, flags: &DebugFlags) -> Arc<dyn TraceSink> {
     let index_sink: Arc<dyn TraceSink> = if flags.no_session_index {
         Arc::new(latte_agent_core::trace::NullSink)
     } else {
-        let idx_path = latte_dir().join("sessions").join(format!("{}.idx", session_id));
+        let idx_path = latte_dir()
+            .join("sessions")
+            .join(format!("{}.idx", session_id));
         Arc::new(latte_agent_core::trace::IndexSink::new(idx_path))
     };
     if flags.debug {
-        let trace_path = latte_dir().join("traces").join(format!("{}.jsonl", session_id));
-        let jsonl: Arc<dyn TraceSink> = Arc::new(latte_agent_core::trace::JsonlSink::new(trace_path));
+        let trace_path = latte_dir()
+            .join("traces")
+            .join(format!("{}.jsonl", session_id));
+        let jsonl: Arc<dyn TraceSink> =
+            Arc::new(latte_agent_core::trace::JsonlSink::new(trace_path));
         let stdout: Arc<dyn TraceSink> = match flags.debug_format {
             DebugFormat::Auto => Arc::new(latte_agent_core::trace::StdoutSink::new(
                 std::io::stdout().is_terminal(),
@@ -64,16 +66,14 @@ pub fn build_debug_sink(
             None => stdout,
         };
         let fanout = Arc::new(latte_agent_core::trace::FanoutSink::new(vec![
-            jsonl,
-            stdout,
+            jsonl, stdout,
         ]));
         // Wrap the (jsonl + filtered-stdout) fanout in an outer
         // fanout that also writes to the always-on session index.
         // Two layers so a stdout-only filter doesn't drop the JSONL
         // or the index — both are written unconditionally.
         Arc::new(latte_agent_core::trace::FanoutSink::new(vec![
-            fanout,
-            index_sink,
+            fanout, index_sink,
         ]))
     } else {
         index_sink
@@ -85,9 +85,7 @@ pub fn build_debug_hooks(flags: &DebugFlags) -> Arc<HookChain> {
     if flags.debug_hooks.is_empty() {
         return Arc::new(HookChain::empty());
     }
-    let hooks = crate::commands::debug::debug_hook_names_to_arcs(
-        &flags.debug_hooks.join(","),
-    );
+    let hooks = crate::commands::debug::debug_hook_names_to_arcs(&flags.debug_hooks.join(","));
     let mut chain = HookChain::empty();
     for h in hooks {
         chain = chain.push(h);

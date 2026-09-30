@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use clap::Args;
 use latte_agent_core::checkpoint::CheckpointEngine;
+use latte_agent_core::config::ConfigLayer;
 use latte_agent_core::trace::{FanoutSink, IndexSink, JsonlSink, NullSink, TraceSink};
 use latte_agent_core::workspace::{MergeMode, WorkspaceManager};
-use latte_agent_core::config::ConfigLayer;
 
 /// Run a task inside an isolated worktree sandbox.
 #[derive(Args, Debug)]
@@ -65,8 +65,8 @@ impl RunCmd {
         // Sink fanout: JSONL on disk + always-on index. If those fail
         // (e.g. disk full), fall back to NullSink rather than aborting
         // the run.
-        let sink: Arc<dyn TraceSink> = build_sink(&self.task_id)
-            .unwrap_or_else(|_| Arc::new(NullSink));
+        let sink: Arc<dyn TraceSink> =
+            build_sink(&self.task_id).unwrap_or_else(|_| Arc::new(NullSink));
 
         // Checkpoint engine
         let storage_dir = mgr
@@ -74,11 +74,8 @@ impl RunCmd {
             .join(".latte")
             .join("checkpoints")
             .join(&self.task_id);
-        let mut engine = CheckpointEngine::new(
-            mgr.spec().worktree_root.clone(),
-            storage_dir,
-            sink.clone(),
-        )?;
+        let mut engine =
+            CheckpointEngine::new(mgr.spec().worktree_root.clone(), storage_dir, sink.clone())?;
 
         // Initial checkpoint 0 — captures the just-created worktree.
         let cp0 = engine

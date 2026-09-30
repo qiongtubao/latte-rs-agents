@@ -33,7 +33,9 @@ use super::{Hook, HookOutcome, PostParseCtx, PostResponseCtx, PreCallCtx};
 pub struct RedactPii;
 
 impl Hook for RedactPii {
-    fn name(&self) -> &str { "redact_pii" }
+    fn name(&self) -> &str {
+        "redact_pii"
+    }
 
     fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
         for m in ctx.messages.iter_mut() {
@@ -76,29 +78,47 @@ fn redact_text(s: &str) -> String {
 }
 
 fn try_match_aws(b: &[u8], i: usize) -> Option<usize> {
-    if i + 20 > b.len() { return None; }
-    if &b[i..i + 4] != b"AKIA" { return None; }
+    if i + 20 > b.len() {
+        return None;
+    }
+    if &b[i..i + 4] != b"AKIA" {
+        return None;
+    }
     for j in 4..20 {
         let c = b[i + j];
         // AKIA followed by 16 chars in [0-9A-Z].
-        if !(c.is_ascii_digit() || (b'A'..=b'Z').contains(&c)) { return None; }
+        if !(c.is_ascii_digit() || (b'A'..=b'Z').contains(&c)) {
+            return None;
+        }
     }
     Some(20)
 }
 
 fn try_match_openai(b: &[u8], i: usize) -> Option<usize> {
     // sk-ant-... or sk-... prefix. Look for the longer match first.
-    let prefix_len = if b[i..].starts_with(b"sk-ant-") { 7 }
-                     else if b[i..].starts_with(b"sk-") { 3 }
-                     else { return None; };
+    let prefix_len = if b[i..].starts_with(b"sk-ant-") {
+        7
+    } else if b[i..].starts_with(b"sk-") {
+        3
+    } else {
+        return None;
+    };
     let mut j = i + prefix_len;
     let mut count = 0;
     while j < b.len() && count < 200 {
         let c = b[j];
-        if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' { j += 1; count += 1; }
-        else { break; }
+        if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
+            j += 1;
+            count += 1;
+        } else {
+            break;
+        }
     }
-    if count >= 32 { Some(j - i) } else { None }
+    if count >= 32 {
+        Some(j - i)
+    } else {
+        None
+    }
 }
 
 fn try_match_email(b: &[u8], i: usize) -> Option<usize> {
@@ -106,19 +126,33 @@ fn try_match_email(b: &[u8], i: usize) -> Option<usize> {
     // [A-Za-z0-9._+-]+, domain is [A-Za-z0-9.-]+ with at least one dot.
     let start = i;
     let mut j = i;
-    while j < b.len() && is_email_local(b[j]) { j += 1; }
-    if j == i { return None; }
-    if j >= b.len() || b[j] != b'@' { return None; }
+    while j < b.len() && is_email_local(b[j]) {
+        j += 1;
+    }
+    if j == i {
+        return None;
+    }
+    if j >= b.len() || b[j] != b'@' {
+        return None;
+    }
     j += 1;
     let domain_start = j;
-    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.' || b[j] == b'-') { j += 1; }
-    if j == domain_start { return None; }
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.' || b[j] == b'-') {
+        j += 1;
+    }
+    if j == domain_start {
+        return None;
+    }
     // Require at least one dot in the domain.
-    if !b[domain_start..j].iter().any(|&c| c == b'.') { return None; }
+    if !b[domain_start..j].iter().any(|&c| c == b'.') {
+        return None;
+    }
     // TLD must end with 2+ letters.
     let last_dot = b[domain_start..j].iter().rposition(|&c| c == b'.')? + domain_start;
     let tld_len = j - last_dot - 1;
-    if tld_len < 2 { return None; }
+    if tld_len < 2 {
+        return None;
+    }
     Some(j - start)
 }
 
@@ -129,12 +163,21 @@ fn is_email_local(c: u8) -> bool {
 fn try_match_phone(b: &[u8], i: usize) -> Option<usize> {
     // Optional +86 / 86- prefix, then exactly 11 ASCII digits.
     let mut j = i;
-    if b[j..].starts_with(b"+86") { j += 3; }
-    else if b[j..].starts_with(b"86-") { j += 3; }
+    if b[j..].starts_with(b"+86") {
+        j += 3;
+    } else if b[j..].starts_with(b"86-") {
+        j += 3;
+    }
     let digit_start = j;
-    while j < b.len() && b[j].is_ascii_digit() { j += 1; }
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
     let n = j - digit_start;
-    if n == 11 { Some(j - i) } else { None }
+    if n == 11 {
+        Some(j - i)
+    } else {
+        None
+    }
 }
 
 // ─── EnforceToolAllowlist ─────────────────────────────────────────────
@@ -149,22 +192,33 @@ pub struct EnforceToolAllowlist {
 
 impl EnforceToolAllowlist {
     pub fn new(allowed: Vec<String>) -> Self {
-        Self { allowed: allowed.into_iter().collect() }
+        Self {
+            allowed: allowed.into_iter().collect(),
+        }
     }
 
     /// Construct from anything string-like. Convenience for callers
     /// that have a `&[&str]` or a `Vec<String>`.
     pub fn from<I, S>(allowed: I) -> Self
-    where I: IntoIterator<Item = S>, S: Into<String> {
-        Self { allowed: allowed.into_iter().map(Into::into).collect() }
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed: allowed.into_iter().map(Into::into).collect(),
+        }
     }
 }
 
 impl Hook for EnforceToolAllowlist {
-    fn name(&self) -> &str { "enforce_tool_allowlist" }
+    fn name(&self) -> &str {
+        "enforce_tool_allowlist"
+    }
 
     fn post_parse(&self, ctx: &mut PostParseCtx) -> HookOutcome<Vec<crate::trace::ParsedCall>> {
-        let bad: Vec<&str> = ctx.parsed.iter()
+        let bad: Vec<&str> = ctx
+            .parsed
+            .iter()
             .map(|c| c.name.as_str())
             .filter(|n| !self.allowed.contains(*n))
             .collect();
@@ -174,10 +228,7 @@ impl Hook for EnforceToolAllowlist {
             let mut allowlist: Vec<&str> = self.allowed.iter().map(|s| s.as_str()).collect();
             allowlist.sort_unstable();
             HookOutcome::Abort {
-                reason: format!(
-                    "tool(s) {:?} not in allowed list: {:?}",
-                    bad, allowlist
-                ),
+                reason: format!("tool(s) {:?} not in allowed list: {:?}", bad, allowlist),
             }
         }
     }
@@ -192,10 +243,14 @@ impl Hook for EnforceToolAllowlist {
 /// `min_words` whitespace-separated tokens. Responses containing
 /// `<tool_call` are always accepted (the model is acting, not just
 /// chatting).
-pub struct RequireToolCall { min_words: usize }
+pub struct RequireToolCall {
+    min_words: usize,
+}
 
 impl Default for RequireToolCall {
-    fn default() -> Self { Self { min_words: 20 } }
+    fn default() -> Self {
+        Self { min_words: 20 }
+    }
 }
 
 impl RequireToolCall {
@@ -206,10 +261,14 @@ impl RequireToolCall {
 }
 
 impl Hook for RequireToolCall {
-    fn name(&self) -> &str { "require_tool_call" }
+    fn name(&self) -> &str {
+        "require_tool_call"
+    }
 
     fn post_response(&self, ctx: &mut PostResponseCtx) -> HookOutcome<()> {
-        if ctx.raw.contains("<tool_call") { return HookOutcome::Continue; }
+        if ctx.raw.contains("<tool_call") {
+            return HookOutcome::Continue;
+        }
         let word_count = ctx.raw.split_whitespace().count();
         if word_count >= self.min_words {
             HookOutcome::Continue
@@ -262,7 +321,11 @@ impl ContextMonitor {
             "ContextMonitor: abort_at must be in [0.0, 1.0], got {}",
             abort_at
         );
-        Self { token_budget, warn_at, abort_at }
+        Self {
+            token_budget,
+            warn_at,
+            abort_at,
+        }
     }
 
     fn estimated_tokens(messages: &[latte_ai::models::Message]) -> usize {
@@ -271,7 +334,9 @@ impl ContextMonitor {
 }
 
 impl Hook for ContextMonitor {
-    fn name(&self) -> &str { "context_monitor" }
+    fn name(&self) -> &str {
+        "context_monitor"
+    }
 
     fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
         let estimated = Self::estimated_tokens(ctx.messages);
@@ -316,55 +381,116 @@ mod tests {
     #[test]
     fn redacts_chinese_phone() {
         let mut msgs = msgs_with("call me at 13812345678 today");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].as_text().contains("<REDACTED:phone>"), "got: {}", msgs[0].as_text());
-        assert!(!msgs[0].as_text().contains("13812345678"), "phone leaked: {}", msgs[0].as_text());
+        assert!(
+            msgs[0].as_text().contains("<REDACTED:phone>"),
+            "got: {}",
+            msgs[0].as_text()
+        );
+        assert!(
+            !msgs[0].as_text().contains("13812345678"),
+            "phone leaked: {}",
+            msgs[0].as_text()
+        );
     }
 
     #[test]
     fn redacts_phone_with_country_prefix() {
         let mut msgs = msgs_with("call +8613812345678 today");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].as_text().contains("<REDACTED:phone>"), "got: {}", msgs[0].as_text());
-        assert!(!msgs[0].as_text().contains("13812345678"), "phone leaked: {}", msgs[0].as_text());
+        assert!(
+            msgs[0].as_text().contains("<REDACTED:phone>"),
+            "got: {}",
+            msgs[0].as_text()
+        );
+        assert!(
+            !msgs[0].as_text().contains("13812345678"),
+            "phone leaked: {}",
+            msgs[0].as_text()
+        );
     }
 
     #[test]
     fn redacts_email() {
         let mut msgs = msgs_with("ping alice@example.com about it");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].as_text().contains("<REDACTED:email>"), "got: {}", msgs[0].as_text());
-        assert!(!msgs[0].as_text().contains("alice@example.com"), "email leaked: {}", msgs[0].as_text());
+        assert!(
+            msgs[0].as_text().contains("<REDACTED:email>"),
+            "got: {}",
+            msgs[0].as_text()
+        );
+        assert!(
+            !msgs[0].as_text().contains("alice@example.com"),
+            "email leaked: {}",
+            msgs[0].as_text()
+        );
     }
 
     #[test]
     fn redacts_aws_key() {
         let mut msgs = msgs_with("AKIAIOSFODNN7EXAMPLE was the key");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].as_text().contains("<REDACTED:aws_key>"), "got: {}", msgs[0].as_text());
-        assert!(!msgs[0].as_text().contains("AKIAIOSFODNN7EXAMPLE"), "key leaked: {}", msgs[0].as_text());
+        assert!(
+            msgs[0].as_text().contains("<REDACTED:aws_key>"),
+            "got: {}",
+            msgs[0].as_text()
+        );
+        assert!(
+            !msgs[0].as_text().contains("AKIAIOSFODNN7EXAMPLE"),
+            "key leaked: {}",
+            msgs[0].as_text()
+        );
     }
 
     #[test]
     fn redacts_openai_key() {
         let mut msgs = msgs_with("use sk-abcdef1234567890abcdef1234567890abcdef for auth");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].as_text().contains("<REDACTED:api_key>"), "got: {}", msgs[0].as_text());
-        assert!(!msgs[0].as_text().contains("sk-abcdef"), "key leaked: {}", msgs[0].as_text());
+        assert!(
+            msgs[0].as_text().contains("<REDACTED:api_key>"),
+            "got: {}",
+            msgs[0].as_text()
+        );
+        assert!(
+            !msgs[0].as_text().contains("sk-abcdef"),
+            "key leaked: {}",
+            msgs[0].as_text()
+        );
     }
 
     #[test]
     fn redacts_ant_style_key() {
-        let mut msgs = msgs_with("use sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890ABCD for auth");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut msgs =
+            msgs_with("use sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890ABCD for auth");
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert!(msgs[0].as_text().contains("<REDACTED:api_key>"), "got: {}", msgs[0].as_text());
-        assert!(!msgs[0].as_text().contains("sk-ant-api03"), "ant key leaked: {}", msgs[0].as_text());
+        assert!(
+            msgs[0].as_text().contains("<REDACTED:api_key>"),
+            "got: {}",
+            msgs[0].as_text()
+        );
+        assert!(
+            !msgs[0].as_text().contains("sk-ant-api03"),
+            "ant key leaked: {}",
+            msgs[0].as_text()
+        );
     }
 
     #[test]
@@ -372,19 +498,30 @@ mod tests {
         let mut msgs = msgs_with(
             "email a@b.com or call 13900000000; key AKIAIOSFODNN7EXAMPLE; use sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa now"
         );
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
         let s = msgs[0].as_text();
         let count = s.matches("<REDACTED:").count();
-        assert_eq!(count, 4, "expected 4 redactions (email, phone, aws, key) in: {}", s);
+        assert_eq!(
+            count, 4,
+            "expected 4 redactions (email, phone, aws, key) in: {}",
+            s
+        );
     }
 
     #[test]
     fn leaves_normal_text_alone() {
         let mut msgs = msgs_with("the quick brown fox jumps over 13 lazy dogs");
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
-        assert_eq!(msgs[0].as_text(), "the quick brown fox jumps over 13 lazy dogs");
+        assert_eq!(
+            msgs[0].as_text(),
+            "the quick brown fox jumps over 13 lazy dogs"
+        );
     }
 
     #[test]
@@ -393,7 +530,9 @@ mod tests {
             Message::user("call 13812345678"),
             Message::assistant("AKIAIOSFODNN7EXAMPLE leaked"),
         ];
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let _ = RedactPii.pre_call(&mut ctx);
         assert!(msgs[0].as_text().contains("<REDACTED:phone>"));
         assert!(msgs[1].as_text().contains("<REDACTED:aws_key>"));
@@ -405,10 +544,20 @@ mod tests {
     fn enforce_allowlist_aborts_on_unknown_tool() {
         let h = EnforceToolAllowlist::new(vec!["read".into(), "exec".into()]);
         let mut parsed = vec![
-            ParsedCall { id: "".into(), name: "read".into(), args: "{}".into() },
-            ParsedCall { id: "".into(), name: "rm_rf".into(), args: "{}".into() },
+            ParsedCall {
+                id: "".into(),
+                name: "read".into(),
+                args: "{}".into(),
+            },
+            ParsedCall {
+                id: "".into(),
+                name: "rm_rf".into(),
+                args: "{}".into(),
+            },
         ];
-        let mut ctx = PostParseCtx { parsed: &mut parsed };
+        let mut ctx = PostParseCtx {
+            parsed: &mut parsed,
+        };
         let outcome = h.post_parse(&mut ctx);
         match outcome {
             HookOutcome::Abort { reason } => {
@@ -422,17 +571,29 @@ mod tests {
     #[test]
     fn enforce_allowlist_continues_when_all_known() {
         let h = EnforceToolAllowlist::new(vec!["read".into(), "exec".into()]);
-        let mut parsed = vec![ParsedCall { id: "".into(), name: "read".into(), args: "{}".into() }];
-        let mut ctx = PostParseCtx { parsed: &mut parsed };
+        let mut parsed = vec![ParsedCall {
+            id: "".into(),
+            name: "read".into(),
+            args: "{}".into(),
+        }];
+        let mut ctx = PostParseCtx {
+            parsed: &mut parsed,
+        };
         let outcome = h.post_parse(&mut ctx);
-        assert!(matches!(outcome, HookOutcome::Continue), "got {:?}", outcome);
+        assert!(
+            matches!(outcome, HookOutcome::Continue),
+            "got {:?}",
+            outcome
+        );
     }
 
     #[test]
     fn enforce_allowlist_continues_on_empty_parsed() {
         let h = EnforceToolAllowlist::new(vec!["read".into()]);
         let mut parsed: Vec<ParsedCall> = vec![];
-        let mut ctx = PostParseCtx { parsed: &mut parsed };
+        let mut ctx = PostParseCtx {
+            parsed: &mut parsed,
+        };
         let outcome = h.post_parse(&mut ctx);
         assert!(matches!(outcome, HookOutcome::Continue));
     }
@@ -463,17 +624,24 @@ mod tests {
     #[test]
     fn require_tool_call_continues_on_substantive_response() {
         let h = RequireToolCall::default();
-        let text: String = std::iter::repeat("word").take(25).collect::<Vec<_>>().join(" ");
+        let text: String = std::iter::repeat("word")
+            .take(25)
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut ctx = PostResponseCtx { raw: &text };
         let outcome = h.post_response(&mut ctx);
-        assert!(matches!(outcome, HookOutcome::Continue), "got {:?}", outcome);
+        assert!(
+            matches!(outcome, HookOutcome::Continue),
+            "got {:?}",
+            outcome
+        );
     }
 
     #[test]
     fn require_tool_call_continues_when_response_has_tool_call_marker() {
         let h = RequireToolCall::default();
         let mut ctx = PostResponseCtx {
-            raw: "thinking...\n<tool_callbash/>"
+            raw: "thinking...\n<tool_callbash/>",
         };
         let outcome = h.post_response(&mut ctx);
         assert!(matches!(outcome, HookOutcome::Continue));

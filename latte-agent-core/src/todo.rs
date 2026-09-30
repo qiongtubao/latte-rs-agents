@@ -178,7 +178,11 @@ impl TodoTracker {
     ///
     /// `waiting_on_user`：有挂起的选择题（阻塞 ask / ChoiceRequested）
     /// 时为 true——agent 在等用户，不催。
-    pub fn take_stop_reminder(&mut self, phases: &[TodoPhase], waiting_on_user: bool) -> Option<String> {
+    pub fn take_stop_reminder(
+        &mut self,
+        phases: &[TodoPhase],
+        waiting_on_user: bool,
+    ) -> Option<String> {
         if self.stop_reminders_sent >= TODO_MAX_STOP_REMINDERS_PER_TURN
             || self.asked_user
             || waiting_on_user
@@ -349,7 +353,10 @@ mod tests {
             assert!(!msg.contains("- A"), "已完成项不应列出");
         }
         assert_eq!(t.stop_reminders_sent(), TODO_MAX_STOP_REMINDERS_PER_TURN);
-        assert!(t.take_stop_reminder(&p, false).is_none(), "每 turn 最多 3 次");
+        assert!(
+            t.take_stop_reminder(&p, false).is_none(),
+            "每 turn 最多 3 次"
+        );
     }
 
     #[test]

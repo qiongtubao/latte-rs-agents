@@ -115,10 +115,7 @@ impl From<&StoredSession> for SessionSummary {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StoredMessage {
     /// 用户输入。
-    User {
-        content: String,
-        timestamp: String,
-    },
+    User { content: String, timestamp: String },
     /// 某个角色的助手回复。
     Assistant {
         role_id: String,
@@ -155,24 +152,13 @@ pub enum StoredMessage {
         timestamp: String,
     },
     /// 多角色模式：某轮开始。
-    RoundStart {
-        round: u32,
-        timestamp: String,
-    },
+    RoundStart { round: u32, timestamp: String },
     /// 多角色模式：某轮结束。
-    RoundEnd {
-        round: u32,
-        timestamp: String,
-    },
+    RoundEnd { round: u32, timestamp: String },
     /// 会话被暂停（用户或 supervisor 触发）。
-    Paused {
-        reason: String,
-        timestamp: String,
-    },
+    Paused { reason: String, timestamp: String },
     /// 会话恢复。
-    Resumed {
-        timestamp: String,
-    },
+    Resumed { timestamp: String },
 }
 
 // ─── Store 实现 ──────────────────────────────────────────────────────────
@@ -459,8 +445,12 @@ mod tests {
         let (_dir, store) = fresh_store();
         futures::executor::block_on(store.create("a", "single", vec!["pm".into()]))
             .expect("create a");
-        futures::executor::block_on(store.create("b", "multi_role", vec!["pm".into(), "dev".into()]))
-            .expect("create b");
+        futures::executor::block_on(store.create(
+            "b",
+            "multi_role",
+            vec!["pm".into(), "dev".into()],
+        ))
+        .expect("create b");
 
         let got = futures::executor::block_on(store.get("a")).expect("get a");
         assert_eq!(got.chat_type, "single");
@@ -485,8 +475,7 @@ mod tests {
     #[test]
     fn get_missing_returns_not_found() {
         let (_dir, store) = fresh_store();
-        let err = futures::executor::block_on(store.get("nope"))
-            .expect_err("missing must error");
+        let err = futures::executor::block_on(store.get("nope")).expect_err("missing must error");
         match err {
             SessionStoreError::NotFound(id) => assert_eq!(id, "nope"),
             other => panic!("expected NotFound, got {other:?}"),
@@ -556,7 +545,8 @@ mod tests {
                 content: "hi".into(),
                 timestamp: ts(),
             },
-        )).expect("append user");
+        ))
+        .expect("append user");
         futures::executor::block_on(store.append_message(
             "s",
             StoredMessage::Assistant {
@@ -565,7 +555,8 @@ mod tests {
                 timestamp: ts(),
                 tokens: Some(42),
             },
-        )).expect("append assistant");
+        ))
+        .expect("append assistant");
         let got = futures::executor::block_on(store.get("s")).expect("get");
         assert_eq!(got.messages.len(), 2);
         match &got.messages[0] {
@@ -573,7 +564,12 @@ mod tests {
             other => panic!("expected User, got {other:?}"),
         }
         match &got.messages[1] {
-            StoredMessage::Assistant { role_id, content, tokens, .. } => {
+            StoredMessage::Assistant {
+                role_id,
+                content,
+                tokens,
+                ..
+            } => {
                 assert_eq!(role_id, "dev");
                 assert_eq!(content, "hello");
                 assert_eq!(tokens, &Some(42u32));
@@ -652,8 +648,12 @@ mod tests {
         // a 追加消息；b 再读一次也能看到（不靠缓存）。
         futures::executor::block_on(a.append_message(
             "s",
-            StoredMessage::User { content: "x".into(), timestamp: ts() },
-        )).expect("a append");
+            StoredMessage::User {
+                content: "x".into(),
+                timestamp: ts(),
+            },
+        ))
+        .expect("a append");
         let b_got = futures::executor::block_on(b.get("s")).expect("b get");
         assert_eq!(b_got.messages.len(), 1);
     }

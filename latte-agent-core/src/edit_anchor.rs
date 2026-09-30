@@ -110,7 +110,10 @@ pub struct Scope {
 impl Scope {
     /// 从会话与角色构造作用域。
     pub fn new(session_id: impl Into<String>, role: impl Into<String>) -> Self {
-        Self { session_id: session_id.into(), role: role.into() }
+        Self {
+            session_id: session_id.into(),
+            role: role.into(),
+        }
     }
 
     fn key(&self, path: &str) -> String {
@@ -163,7 +166,12 @@ impl Snapshot {
                 &lines[..]
             };
             if end <= lines.len() {
-                return Some(lines[start - 1..end].iter().map(|s| s.to_string()).collect());
+                return Some(
+                    lines[start - 1..end]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                );
             }
             return None;
         }
@@ -322,7 +330,10 @@ pub fn record_tool_result(scope: &Scope, tool_name: &str, result_json: &str) {
         Some(p) if !p.is_empty() => p.to_string(),
         _ => return,
     };
-    let tag = parsed.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let tag = parsed
+        .get("tag")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     // 这个工具对该文件成功了 → 锚点失败连击断了，清零。
     // 放在 match 之前是因为三个分支（read/edit/write）都算「有了新的
@@ -333,11 +344,17 @@ pub fn record_tool_result(scope: &Scope, tool_name: &str, result_json: &str) {
 
     match tool_name {
         "read" => {
-            let content = parsed.get("content").and_then(|v| v.as_str()).unwrap_or_default();
+            let content = parsed
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             // 折叠视图（结构摘要 / 文档大纲）的 content 不是原文，不能当内容基准；
             // 但它的 tag 仍可用于「文件是否被外部改动」的判定。
             let folded = parsed.get("mode").is_some();
-            let start_line = parsed.get("startLine").and_then(|v| v.as_u64()).map(|n| n as usize);
+            let start_line = parsed
+                .get("startLine")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
             if let Ok(mut lg) = ledger().write() {
                 lg.upsert(scope.key(&path), |snap| {
                     snap.tag = tag.clone().or(snap.tag.take());
@@ -438,8 +455,10 @@ fn clear_anchor_failures(path: &str) {
 
 /// 软提示：单次锚点失败后追加。只点「重读」，不喊停。
 fn soft_note(path: &str) -> String {
-    format!("\n\n[锚点提示] 对 `{path}` 的这次编辑没能定位到锚点。先 `read` 它、\
-             按当前内容重写 old_text，再改。")
+    format!(
+        "\n\n[锚点提示] 对 `{path}` 的这次编辑没能定位到锚点。先 `read` 它、\
+             按当前内容重写 old_text，再改。"
+    )
 }
 
 /// 硬性升级：连续失败到阈值后追加，要求**换策略**而不是继续猜。
@@ -508,7 +527,10 @@ fn record_search_seen_lines(scope: &Scope, parsed: &Value) {
         if line == 0 {
             continue;
         }
-        by_file.entry(file.to_string()).or_default().push(line as u32);
+        by_file
+            .entry(file.to_string())
+            .or_default()
+            .push(line as u32);
     }
     merge_seen(scope, by_file);
 }
@@ -667,16 +689,29 @@ pub fn heal_edit_input(scope: &Scope, tool_name: &str, input: &mut Value) -> Vec
         if op.get("expect").is_some() || op.get("start_line").is_none() {
             continue;
         }
-        let Some(start) = op.get("start_line").and_then(|v| v.as_u64()).map(|n| n as usize) else {
+        let Some(start) = op
+            .get("start_line")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+        else {
             continue;
         };
         // 插入类操作的锚点是单行；替换/删除用 end_line（缺省 = start）。
-        let is_insert = op.get("insert_after").and_then(|v| v.as_bool()).unwrap_or(false)
-            || op.get("insert_before").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_insert = op
+            .get("insert_after")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || op
+                .get("insert_before")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
         let end = if is_insert {
             start
         } else {
-            op.get("end_line").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(start)
+            op.get("end_line")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(start)
         };
         if let Some(lines) = snap.slice(start, end) {
             let expect = lines.join("\n");
@@ -742,15 +777,15 @@ mod tests {
         }
 
         // 非折叠项：expect + tag 都能自愈。
-        let mut input =
-            json!({"path":"/tmp/batch3.rs","ops":[{"start_line":2,"end_line":2,"new_content":"X"}]});
+        let mut input = json!({"path":"/tmp/batch3.rs","ops":[{"start_line":2,"end_line":2,"new_content":"X"}]});
         let notes = heal_edit_input(&sc("t"), "edit", &mut input);
         assert_eq!(input["tag"], "T003");
         assert_eq!(input["ops"][0]["expect"], "c2");
         assert_eq!(notes.len(), 2, "两条补写说明: {notes:?}");
 
         // 折叠项：只补 tag，不猜内容。
-        let mut folded = json!({"path":"/tmp/batch5.rs","ops":[{"start_line":1,"new_content":"X"}]});
+        let mut folded =
+            json!({"path":"/tmp/batch5.rs","ops":[{"start_line":1,"new_content":"X"}]});
         heal_edit_input(&sc("t"), "edit", &mut folded);
         assert_eq!(folded["tag"], "T005");
         assert!(
@@ -773,7 +808,8 @@ mod tests {
             "read",
             &json!({"path":"/tmp/a.rs","content":"l1\nl2\nl3\n","tag":"AB12"}).to_string(),
         );
-        let mut input = json!({"path":"/tmp/a.rs","ops":[{"start_line":2,"end_line":2,"new_content":"X"}]});
+        let mut input =
+            json!({"path":"/tmp/a.rs","ops":[{"start_line":2,"end_line":2,"new_content":"X"}]});
         let notes = heal_edit_input(&sc("t"), "edit", &mut input);
         assert_eq!(input["tag"], "AB12", "应自动附加 tag");
         assert_eq!(input["ops"][0]["expect"], "l2", "应自动附加 expect");
@@ -795,7 +831,10 @@ mod tests {
         // 区段外 → 不补 expect（无从推导，不猜）。
         let mut miss = json!({"path":"/tmp/b.rs","ops":[{"start_line":50,"new_content":"X"}]});
         heal_edit_input(&sc("t"), "edit", &mut miss);
-        assert!(miss["ops"][0].get("expect").is_none(), "区段外不应补 expect");
+        assert!(
+            miss["ops"][0].get("expect").is_none(),
+            "区段外不应补 expect"
+        );
     }
 
     #[test]
@@ -828,7 +867,10 @@ mod tests {
         });
         heal_edit_input(&sc("t"), "edit", &mut input);
         assert_eq!(input["tag"], "9999", "模型显式给的 tag 不覆盖");
-        assert_eq!(input["ops"][0]["expect"], "model_said", "模型显式给的 expect 不覆盖");
+        assert_eq!(
+            input["ops"][0]["expect"], "model_said",
+            "模型显式给的 expect 不覆盖"
+        );
     }
 
     #[test]
@@ -839,11 +881,21 @@ mod tests {
             &json!({"path":"/tmp/e.rs","content":"p\nq\n","tag":"AAAA"}).to_string(),
         );
         // agent 自己编辑后，tag 变了但内容认知保留。
-        record_tool_result(&sc("t"), "edit", &json!({"path":"/tmp/e.rs","tag":"BBBB"}).to_string());
+        record_tool_result(
+            &sc("t"),
+            "edit",
+            &json!({"path":"/tmp/e.rs","tag":"BBBB"}).to_string(),
+        );
         let mut input = json!({"path":"/tmp/e.rs","ops":[{"start_line":2,"new_content":"Z"}]});
         heal_edit_input(&sc("t"), "edit", &mut input);
-        assert_eq!(input["tag"], "BBBB", "tag 应刷新为编辑后的新值（不误报 stale）");
-        assert_eq!(input["ops"][0]["expect"], "q", "内容认知保留，供工具层重定位");
+        assert_eq!(
+            input["tag"], "BBBB",
+            "tag 应刷新为编辑后的新值（不误报 stale）"
+        );
+        assert_eq!(
+            input["ops"][0]["expect"], "q",
+            "内容认知保留，供工具层重定位"
+        );
     }
 
     #[test]
@@ -857,17 +909,27 @@ mod tests {
         let mut input = json!({"path":"/tmp/f.rs","ops":[{"start_line":1,"new_content":"X"}]});
         let notes = heal_edit_input(&sc("t"), "edit", &mut input);
         assert!(input.get("tag").is_none(), "write 后台账作废，不应再补 tag");
-        assert!(input["ops"][0].get("expect").is_none(), "write 后不应再补 expect");
+        assert!(
+            input["ops"][0].get("expect").is_none(),
+            "write 后不应再补 expect"
+        );
         assert!(notes.is_empty());
     }
 
     #[test]
     fn unknown_file_and_non_edit_tools_are_untouched() {
-        let mut input = json!({"path":"/tmp/never_read.rs","ops":[{"start_line":1,"new_content":"X"}]});
-        assert!(heal_edit_input(&sc("t"), "edit", &mut input).is_empty(), "没读过 → 保持原样");
+        let mut input =
+            json!({"path":"/tmp/never_read.rs","ops":[{"start_line":1,"new_content":"X"}]});
+        assert!(
+            heal_edit_input(&sc("t"), "edit", &mut input).is_empty(),
+            "没读过 → 保持原样"
+        );
         assert!(input.get("tag").is_none());
         let mut other = json!({"path":"/tmp/a.rs"});
-        assert!(heal_edit_input(&sc("t"), "search", &mut other).is_empty(), "非 edit 工具不处理");
+        assert!(
+            heal_edit_input(&sc("t"), "search", &mut other).is_empty(),
+            "非 edit 工具不处理"
+        );
     }
 
     #[test]
@@ -928,7 +990,10 @@ mod tests {
         });
         let notes = heal_edit_input(&sc("t"), "edit", &mut input);
         assert!(!notes.is_empty(), "台账应补上 expect/tag: {notes:?}");
-        assert_eq!(input["ops"][0]["expect"], "TARGET", "expect 应取自 read 时的第 3 行");
+        assert_eq!(
+            input["ops"][0]["expect"], "TARGET",
+            "expect 应取自 read 时的第 3 行"
+        );
 
         // 4. 派发给真实 edit 工具：行号对不上 → 唯一重定位到第 5 行。
         let edit_out = tm
@@ -937,7 +1002,9 @@ mod tests {
             .expect("自愈后编辑应成功");
         let warnings = edit_out["warnings"].as_array().expect("应有自愈 warning");
         assert!(
-            warnings.iter().any(|w| w.as_str().unwrap_or("").contains("行号自愈")),
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap_or("").contains("行号自愈")),
             "应报告行号重定位: {warnings:?}"
         );
 
@@ -969,7 +1036,10 @@ mod tests {
             .await
             .unwrap();
 
-        let read_out = tm.execute("read", json!({"path": path}), None).await.unwrap();
+        let read_out = tm
+            .execute("read", json!({"path": path}), None)
+            .await
+            .unwrap();
         record_tool_result(&sc("t"), "read", &serde_json::to_string(&read_out).unwrap());
 
         // OLD_LINE 被彻底删掉 → 无法重定位。
@@ -1131,7 +1201,10 @@ mod tests {
             .and_then(|lg| lg.map.get(&scope.key(path)).cloned())
             .expect("应有条目");
         assert!(snap.full.is_none(), "search 不该写 full");
-        assert!(snap.regions.is_empty(), "search 绝不能写 regions（会补出假 expect）");
+        assert!(
+            snap.regions.is_empty(),
+            "search 绝不能写 regions（会补出假 expect）"
+        );
     }
 
     /// `code_graph` 的 `matches` 是渲染后的整段文本，按 `path:start-end:` 反解。
@@ -1156,7 +1229,10 @@ mod tests {
         );
 
         let seen = observed_lines(&scope, a).expect("应有来源记录");
-        assert!(seen.contains(&21) && seen.contains(&35), "跨度要全展开: {seen:?}");
+        assert!(
+            seen.contains(&21) && seen.contains(&35),
+            "跨度要全展开: {seen:?}"
+        );
         assert!(seen.contains(&296), "单行形态也要认");
         assert!(!seen.contains(&36), "跨度外不该算看过: {seen:?}");
         let seen_c = observed_lines(&scope, "src/jemalloc.c").expect("第二个文件也要记");
@@ -1204,7 +1280,11 @@ mod tests {
             .read()
             .ok()
             .and_then(|lg| lg.map.get(&scope.key(path)).cloned());
-        let full_len = snap.as_ref().and_then(|s| s.full.as_ref()).map(|f| f.len()).unwrap_or(0);
+        let full_len = snap
+            .as_ref()
+            .and_then(|s| s.full.as_ref())
+            .map(|f| f.len())
+            .unwrap_or(0);
         assert!(
             full_len <= MAX_SNAPSHOT_FILE_BYTES,
             "超大文件的全文不该整份收进台账: {full_len}"

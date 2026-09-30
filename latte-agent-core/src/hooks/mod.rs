@@ -21,24 +21,36 @@ pub use latte_ai::models::Message;
 
 /// Pre-send hook. The `&mut` lets the hook mutate the outgoing
 /// message list (e.g. redact PII, add a guard rail).
-pub struct PreCallCtx<'a> { pub messages: &'a mut Vec<Message> }
+pub struct PreCallCtx<'a> {
+    pub messages: &'a mut Vec<Message>,
+}
 
 /// Post-model hook. The hook sees the raw model output (including
 /// the tool-call markers). It can abort (e.g. on empty/short output)
 /// but cannot mutate the text in v1.
-pub struct PostResponseCtx<'a> { pub raw: &'a str }
+pub struct PostResponseCtx<'a> {
+    pub raw: &'a str,
+}
 
 /// Post-parse hook. The hook sees the parsed tool-call list. It can
 /// mutate (e.g. drop a disallowed call) or abort (e.g. unknown tool).
-pub struct PostParseCtx<'a> { pub parsed: &'a mut Vec<ParsedCall> }
+pub struct PostParseCtx<'a> {
+    pub parsed: &'a mut Vec<ParsedCall>,
+}
 
 /// Pre-execute hook. The hook sees the resolved tool name and the
 /// parsed args; can mutate args or abort.
-pub struct PreToolCtx<'a> { pub name: &'a str, pub args: &'a mut Value }
+pub struct PreToolCtx<'a> {
+    pub name: &'a str,
+    pub args: &'a mut Value,
+}
 
 /// Post-execute hook. The hook sees the tool result; can mutate the
 /// result string (e.g. truncate large output) or abort.
-pub struct PostToolCtx<'a> { pub name: &'a str, pub result: &'a mut String }
+pub struct PostToolCtx<'a> {
+    pub name: &'a str,
+    pub result: &'a mut String,
+}
 
 // ─── Outcome ───────────────────────────────────────────────────────────
 
@@ -88,11 +100,21 @@ impl<T> HookOutcome<T> {
 pub trait Hook: Send + Sync {
     fn name(&self) -> &str;
 
-    fn pre_call(&self, _ctx: &mut PreCallCtx) -> HookOutcome<()> { HookOutcome::Continue }
-    fn post_response(&self, _ctx: &mut PostResponseCtx) -> HookOutcome<()> { HookOutcome::Continue }
-    fn post_parse(&self, _ctx: &mut PostParseCtx) -> HookOutcome<Vec<ParsedCall>> { HookOutcome::Continue }
-    fn pre_tool(&self, _ctx: &mut PreToolCtx) -> HookOutcome<Value> { HookOutcome::Continue }
-    fn post_tool(&self, _ctx: &mut PostToolCtx) -> HookOutcome<String> { HookOutcome::Continue }
+    fn pre_call(&self, _ctx: &mut PreCallCtx) -> HookOutcome<()> {
+        HookOutcome::Continue
+    }
+    fn post_response(&self, _ctx: &mut PostResponseCtx) -> HookOutcome<()> {
+        HookOutcome::Continue
+    }
+    fn post_parse(&self, _ctx: &mut PostParseCtx) -> HookOutcome<Vec<ParsedCall>> {
+        HookOutcome::Continue
+    }
+    fn pre_tool(&self, _ctx: &mut PreToolCtx) -> HookOutcome<Value> {
+        HookOutcome::Continue
+    }
+    fn post_tool(&self, _ctx: &mut PostToolCtx) -> HookOutcome<String> {
+        HookOutcome::Continue
+    }
 }
 
 /// Ordered chain of hooks. Composition rules:
@@ -112,11 +134,22 @@ pub struct HookChain {
 }
 
 impl HookChain {
-    pub fn empty() -> Self { Self { hooks: vec![] } }
-    pub fn push(mut self, h: Arc<dyn Hook>) -> Self { self.hooks.push(h); self }
-    pub fn len(&self) -> usize { self.hooks.len() }
-    pub fn is_empty(&self) -> bool { self.hooks.is_empty() }
-    pub fn hooks(&self) -> &[Arc<dyn Hook>] { &self.hooks }
+    pub fn empty() -> Self {
+        Self { hooks: vec![] }
+    }
+    pub fn push(mut self, h: Arc<dyn Hook>) -> Self {
+        self.hooks.push(h);
+        self
+    }
+    pub fn len(&self) -> usize {
+        self.hooks.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty()
+    }
+    pub fn hooks(&self) -> &[Arc<dyn Hook>] {
+        &self.hooks
+    }
 
     /// Run all pre_call hooks. Returns the first Abort or the last
     /// Mutate; Continue if no hook returned anything interesting.
@@ -129,7 +162,9 @@ impl HookChain {
             let outcome = h.pre_call(ctx);
             on_fire(h.name(), HookPoint::PreCall, outcome.kind());
             if let HookOutcome::Abort { reason } = &outcome {
-                return HookOutcome::Abort { reason: reason.clone() };
+                return HookOutcome::Abort {
+                    reason: reason.clone(),
+                };
             }
         }
         HookOutcome::Continue
@@ -144,7 +179,9 @@ impl HookChain {
             let outcome = h.post_response(ctx);
             on_fire(h.name(), HookPoint::PostResponse, outcome.kind());
             if let HookOutcome::Abort { reason } = &outcome {
-                return HookOutcome::Abort { reason: reason.clone() };
+                return HookOutcome::Abort {
+                    reason: reason.clone(),
+                };
             }
         }
         HookOutcome::Continue
@@ -224,7 +261,9 @@ impl HookChain {
 }
 
 impl Default for HookChain {
-    fn default() -> Self { Self::empty() }
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 pub mod builtin;
@@ -236,20 +275,32 @@ mod tests {
 
     struct NoopHook(&'static str);
     impl Hook for NoopHook {
-        fn name(&self) -> &str { self.0 }
-    }
-
-    struct AbortHook { reason: &'static str }
-    impl Hook for AbortHook {
-        fn name(&self) -> &str { "abort" }
-        fn pre_call(&self, _ctx: &mut PreCallCtx) -> HookOutcome<()> {
-            HookOutcome::Abort { reason: self.reason.to_string() }
+        fn name(&self) -> &str {
+            self.0
         }
     }
 
-    struct MutatePreToolHook { arg: Value }
+    struct AbortHook {
+        reason: &'static str,
+    }
+    impl Hook for AbortHook {
+        fn name(&self) -> &str {
+            "abort"
+        }
+        fn pre_call(&self, _ctx: &mut PreCallCtx) -> HookOutcome<()> {
+            HookOutcome::Abort {
+                reason: self.reason.to_string(),
+            }
+        }
+    }
+
+    struct MutatePreToolHook {
+        arg: Value,
+    }
     impl Hook for MutatePreToolHook {
-        fn name(&self) -> &str { "mutate-pre-tool" }
+        fn name(&self) -> &str {
+            "mutate-pre-tool"
+        }
         fn pre_tool(&self, _ctx: &mut PreToolCtx) -> HookOutcome<Value> {
             HookOutcome::Mutate(self.arg.clone())
         }
@@ -259,7 +310,9 @@ mod tests {
     fn empty_chain_continue() {
         let chain = HookChain::empty();
         let mut msgs: Vec<Message> = vec![];
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let fires: std::cell::RefCell<Vec<(String, HookPoint, String)>> =
             std::cell::RefCell::new(vec![]);
         let outcome = chain.run_pre_call(&mut ctx, |n, p, k| {
@@ -276,7 +329,9 @@ mod tests {
             .push(Arc::new(AbortHook { reason: "first" }))
             .push(Arc::new(AbortHook { reason: "second" }));
         let mut msgs: Vec<Message> = vec![];
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let fires: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(vec![]);
         let outcome = chain.run_pre_call(&mut ctx, |n, _p, _k| {
             fires.borrow_mut().push(n.to_string());
@@ -286,30 +341,48 @@ mod tests {
             other => panic!("expected Abort(first), got {:?}", other),
         }
         let fired: Vec<String> = fires.borrow().iter().cloned().collect();
-        assert_eq!(fired, vec!["noop1".to_string(), "abort".to_string()],
-            "third hook should not fire after first Abort");
+        assert_eq!(
+            fired,
+            vec!["noop1".to_string(), "abort".to_string()],
+            "third hook should not fire after first Abort"
+        );
     }
 
     #[test]
     fn pre_tool_mutate_composes() {
         let chain = HookChain::empty()
-            .push(Arc::new(MutatePreToolHook { arg: serde_json::json!("first") }))
-            .push(Arc::new(MutatePreToolHook { arg: serde_json::json!("second") }));
+            .push(Arc::new(MutatePreToolHook {
+                arg: serde_json::json!("first"),
+            }))
+            .push(Arc::new(MutatePreToolHook {
+                arg: serde_json::json!("second"),
+            }));
         let mut args = serde_json::json!("initial");
-        let mut ctx = PreToolCtx { name: "exec", args: &mut args };
+        let mut ctx = PreToolCtx {
+            name: "exec",
+            args: &mut args,
+        };
         let outcome = chain.run_pre_tool(&mut ctx, |_, _, _| {});
         match outcome {
-            HookOutcome::Mutate(v) => assert_eq!(v, serde_json::json!("second"), "last Mutate wins"),
+            HookOutcome::Mutate(v) => {
+                assert_eq!(v, serde_json::json!("second"), "last Mutate wins")
+            }
             other => panic!("expected Mutate, got {:?}", other),
         }
-        assert_eq!(*ctx.args, serde_json::json!("second"), "ctx mutated to last Mutate value");
+        assert_eq!(
+            *ctx.args,
+            serde_json::json!("second"),
+            "ctx mutated to last Mutate value"
+        );
     }
 
     #[test]
     fn noop_hook_fires_with_continue_outcome() {
         let chain = HookChain::empty().push(Arc::new(NoopHook("only")));
         let mut msgs: Vec<Message> = vec![];
-        let mut ctx = PreCallCtx { messages: &mut msgs };
+        let mut ctx = PreCallCtx {
+            messages: &mut msgs,
+        };
         let fires: std::cell::RefCell<Vec<(String, HookPoint, String)>> =
             std::cell::RefCell::new(vec![]);
         let outcome = chain.run_pre_call(&mut ctx, |n, p, k| {
@@ -326,6 +399,9 @@ mod tests {
     fn outcome_kind_labels() {
         assert_eq!(HookOutcome::<()>::Continue.kind(), "continue");
         assert_eq!(HookOutcome::Mutate(42).kind(), "mutate");
-        assert_eq!(HookOutcome::<()>::Abort { reason: "x".into() }.kind(), "abort");
-}
+        assert_eq!(
+            HookOutcome::<()>::Abort { reason: "x".into() }.kind(),
+            "abort"
+        );
+    }
 }

@@ -247,10 +247,7 @@ impl ModelResolver {
     /// 角色的模型指派（model_chain + model_tier），来自最新配置快照。
     /// 角色编辑器保存后，运行中的 runner（turn 边界自查）与 workflow
     /// 分派（每次分派重新解析）据此热生效。角色未知 → None。
-    pub fn role_model_assignment(
-        &self,
-        role_id: &str,
-    ) -> Option<(Vec<String>, Option<ModelTier>)> {
+    pub fn role_model_assignment(&self, role_id: &str) -> Option<(Vec<String>, Option<ModelTier>)> {
         let snap = self.snapshot();
         snap.role_model_chains
             .get(role_id)
@@ -326,12 +323,11 @@ impl ResolverSnapshot {
         if let Some(id) = self.tier_defaults.get(&tier) {
             push(id);
         }
-        if let Some(def) = self.models.values().find(|m| {
-            m.tier
-                .as_ref()
-                .and_then(|t| ModelTier::parse(t).ok())
-                == Some(tier)
-        }) {
+        if let Some(def) = self
+            .models
+            .values()
+            .find(|m| m.tier.as_ref().and_then(|t| ModelTier::parse(t).ok()) == Some(tier))
+        {
             push(&def.name);
         }
         if let Some(def) = self.models.values().next() {
@@ -416,8 +412,6 @@ impl ResolverSnapshot {
         Ok(out)
     }
 
-
-
     /// List all known model tiers for a role.
     pub fn available_tiers(&self, role_id: &str) -> Vec<ModelTier> {
         let mut tiers = std::collections::BTreeSet::new();
@@ -469,11 +463,7 @@ impl ResolverSnapshot {
             )));
         }
         // 3) Miss — build a helpful error.
-        let known: Vec<String> = self
-            .models
-            .values()
-            .map(|m| m.name.clone())
-            .collect();
+        let known: Vec<String> = self.models.values().map(|m| m.name.clone()).collect();
         Err(AgentError::Config(format!(
             "--model-id {}: no such id or display name. Available: [{}]",
             query,
@@ -481,7 +471,7 @@ impl ResolverSnapshot {
         )))
     }
 
-     pub fn build_model(&self, model_id: &str) -> AgentResult<Model> {
+    pub fn build_model(&self, model_id: &str) -> AgentResult<Model> {
         let def = self
             .models
             .get(model_id)
@@ -577,7 +567,11 @@ fn extract_env_var(s: &str) -> Option<String> {
     let rest = &s[start + 2..];
     let end = rest.find('}')?;
     let var = &rest[..end];
-    if var.is_empty() { None } else { Some(var.to_string()) }
+    if var.is_empty() {
+        None
+    } else {
+        Some(var.to_string())
+    }
 }
 impl std::fmt::Debug for ModelResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -749,7 +743,10 @@ mod tests {
             .expect_err("should miss");
         let msg = format!("{}", err);
         assert!(msg.contains("nope"), "msg should contain query: {msg}");
-        assert!(msg.contains("Real Name"), "msg should list real name: {msg}");
+        assert!(
+            msg.contains("Real Name"),
+            "msg should list real name: {msg}"
+        );
     }
     fn test_env_var_resolution() {
         std::env::set_var("TEST_KEY", "resolved-value");
@@ -840,7 +837,10 @@ mod tests {
     #[test]
     fn role_model_assignment_hot_updates_on_reload() {
         let mut cfg = catalog_with(vec![test_model_def("m1", None)]);
-        cfg.roles.insert("architect".into(), role_tpl("architect", "standard", vec!["m1"]));
+        cfg.roles.insert(
+            "architect".into(),
+            role_tpl("architect", "standard", vec!["m1"]),
+        );
         let resolver = ModelResolver::from_config(&cfg).unwrap();
         let (chain, tier) = resolver.role_model_assignment("architect").unwrap();
         assert_eq!(chain, vec!["m1".to_string()]);
@@ -848,7 +848,8 @@ mod tests {
         assert!(resolver.role_model_assignment("ghost").is_none());
 
         // 角色编辑器保存：换 chain + tier → reload 后读到新值。
-        cfg.roles.insert("architect".into(), role_tpl("architect", "premium", vec![]));
+        cfg.roles
+            .insert("architect".into(), role_tpl("architect", "premium", vec![]));
         resolver.reload_from_config(&cfg).unwrap();
         let (chain, tier) = resolver.role_model_assignment("architect").unwrap();
         assert!(chain.is_empty(), "空 chain 原样透出（调用方回退旧链）");
@@ -897,7 +898,6 @@ mod tests {
         );
     }
 
-
     /// `prompt_cache_key`（缓存亲和键开关）同样要从 TOML 透传。
     ///
     /// 它与 `prompt_cache` 的默认值**相反**：不写 = 跟随全局默认（开），
@@ -920,9 +920,11 @@ supports_thinking = false
         assert_eq!(def.prompt_cache_key, None, "缺省必须是「未声明」");
 
         // 显式关 → 透传 Some(false)
-        let def_off: crate::config::ModelDef =
-            toml::from_str(&format!("{base}prompt_cache_key = false
-")).expect("deserialize");
+        let def_off: crate::config::ModelDef = toml::from_str(&format!(
+            "{base}prompt_cache_key = false
+"
+        ))
+        .expect("deserialize");
         assert_eq!(def_off.prompt_cache_key, Some(false));
 
         let cfg = AgentConfig {
@@ -1003,7 +1005,6 @@ prompt_cache = true
         );
     }
 
-
     fn catalog_with_three() -> AgentConfig {
         AgentConfig {
             advisor: Default::default(),
@@ -1046,7 +1047,11 @@ prompt_cache = true
         let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
         // chain[0] becomes primary, then chain[1], then tier-based fallback.
         let chain = resolver
-            .resolve_chain("any", ModelTier::Premium, &["budget".into(), "standard".into()])
+            .resolve_chain(
+                "any",
+                ModelTier::Premium,
+                &["budget".into(), "standard".into()],
+            )
             .unwrap();
         assert_eq!(
             chain.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
@@ -1061,7 +1066,11 @@ prompt_cache = true
         // must not appear twice.
         let resolver = ModelResolver::from_config(&catalog_with_three()).unwrap();
         let chain = resolver
-            .resolve_chain("any", ModelTier::Premium, &["premium".into(), "budget".into()])
+            .resolve_chain(
+                "any",
+                ModelTier::Premium,
+                &["premium".into(), "budget".into()],
+            )
             .unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].name, "premium");

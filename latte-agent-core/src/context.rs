@@ -228,7 +228,8 @@ impl ConversationContext {
 
     /// Remove a contiguous range of messages. Returns how many were
     /// actually removed (clamped to the current length).
-    pub fn clear_range(&mut self, range: std::ops::Range<usize>) -> usize {        let start = range.start.min(self.messages.len());
+    pub fn clear_range(&mut self, range: std::ops::Range<usize>) -> usize {
+        let start = range.start.min(self.messages.len());
         let end = range.end.min(self.messages.len()).max(start);
         let count = end - start;
         if count == 0 {

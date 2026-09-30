@@ -81,7 +81,10 @@ pub struct WorkflowCmd {
 
 impl WorkflowCmd {
     pub async fn run(&self) -> AnyResult {
-        println!("=== latte-agent workflow ({} mode) ===", self.workflow_name());
+        println!(
+            "=== latte-agent workflow ({} mode) ===",
+            self.workflow_name()
+        );
         println!("Topic: {}", self.topic);
         if !self.roles.is_empty() {
             println!("Roles (override): {:?}", self.roles);
@@ -90,44 +93,41 @@ impl WorkflowCmd {
 
         // 1. Three-layer config: global (~/.latte/) ← project (CLI flags) ← CLI overrides.
         let cli = self.build_cli_overrides()?;
-        let resolved = config_layer::load(
-            Some(&self.agents_config),
-            Some(&self.models_config),
-            cli,
-        )
-        .map_err(|e| format!("failed to load configuration: {}", e))?;
+        let resolved =
+            config_layer::load(Some(&self.agents_config), Some(&self.models_config), cli)
+                .map_err(|e| format!("failed to load configuration: {}", e))?;
         let merged = resolved.config;
         let resolver = resolved.resolver;
 
         // 2. Load the named workflow (default: tech_director_dispatch).
-        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(&self.discussion_config))
-            .map_err(|e| format!("failed to load workflows: {}", e))?;
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(
+            &self.discussion_config,
+        ))
+        .map_err(|e| format!("failed to load workflows: {}", e))?;
         let wf_name = self.workflow_name();
-        let workflow = registry
-            .resolve(Some(&wf_name))
-            .map_err(|e| {
-                // 光报 "not found. Available: []" 会把人引向错误方向——真实原因
-                // 通常是「这个 workflow 是 step 式的，本子命令跑不了」。把
-                // registry 记下的跳过原因一并打出来。
-                let mut msg = format!("workflow '{wf_name}' not found: {e}");
-                if !registry.skipped.is_empty() {
-                    msg.push_str("\n\n以下文件被跳过：");
-                    for (file, reason) in &registry.skipped {
-                        msg.push_str(&format!("\n  - {file}: {reason}"));
-                    }
-                    if registry
-                        .skipped
-                        .iter()
-                        .any(|(f, _)| f.starts_with(&wf_name) || f.contains(&wf_name))
-                    {
-                        msg.push_str(&format!(
+        let workflow = registry.resolve(Some(&wf_name)).map_err(|e| {
+            // 光报 "not found. Available: []" 会把人引向错误方向——真实原因
+            // 通常是「这个 workflow 是 step 式的，本子命令跑不了」。把
+            // registry 记下的跳过原因一并打出来。
+            let mut msg = format!("workflow '{wf_name}' not found: {e}");
+            if !registry.skipped.is_empty() {
+                msg.push_str("\n\n以下文件被跳过：");
+                for (file, reason) in &registry.skipped {
+                    msg.push_str(&format!("\n  - {file}: {reason}"));
+                }
+                if registry
+                    .skipped
+                    .iter()
+                    .any(|(f, _)| f.starts_with(&wf_name) || f.contains(&wf_name))
+                {
+                    msg.push_str(&format!(
                             "\n\n`{wf_name}` 正在被跳过的名单里。它是 step 式 workflow，\
                              改用：latte-agent chat -r manager，然后让 manager 调 `workflow` 工具。"
                         ));
-                    }
                 }
-                msg
-            })?;
+            }
+            msg
+        })?;
 
         // 3. Determine which roles to instantiate. If the user gave
         //    --roles, use exactly that. Otherwise, derive the set from
@@ -162,15 +162,15 @@ impl WorkflowCmd {
             // mode and the model hallucinates a project description
             // instead of inspecting the actual codebase.
             if !role.allowed_tools.is_empty() {
-                role.system_prompt.push_str(&super::chat::tool_usage_prompt(
-                    &role.allowed_tools,
-                ));
+                role.system_prompt
+                    .push_str(&super::chat::tool_usage_prompt(&role.allowed_tools));
             }
             let role_for_tools = role.clone();
             let tier = role.default_model_tier;
             let models = resolver.resolve_chain(&role.id, tier, &role.model_chain)?;
             let _model_id = models[0].id.clone();
-            let agent = Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
+            let agent =
+                Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
             let runner = if !role_for_tools.allowed_tools.is_empty() {
                 let tm = super::chat::build_tool_manager(&role_for_tools.allowed_tools)
                     .await
@@ -181,7 +181,7 @@ impl WorkflowCmd {
             };
             agents.insert(role_name.clone(), runner);
         }
-         println!();
+        println!();
 
         // 4. Workflow variables: the {{topic}} placeholder is what every
         //    step prompt in tech_director_dispatch uses. Steps that
@@ -191,8 +191,8 @@ impl WorkflowCmd {
         let mut variables = HashMap::new();
         variables.insert("topic".into(), self.topic.clone());
 
-        let consensus = ConsensusMethod::parse(&self.consensus)
-            .unwrap_or(ConsensusMethod::NoConsensus);
+        let consensus =
+            ConsensusMethod::parse(&self.consensus).unwrap_or(ConsensusMethod::NoConsensus);
 
         let config = DiscussionConfig {
             workflow,
@@ -213,7 +213,14 @@ impl WorkflowCmd {
 
         println!("\n=== Workflow Complete ===");
         println!("Rounds: {}", result.rounds.len());
-        println!("Consensus: {}", if result.consensus_reached { "YES" } else { "NO" });
+        println!(
+            "Consensus: {}",
+            if result.consensus_reached {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
         println!(
             "Tokens: {} in / {} out",
             result.total_usage.input_tokens, result.total_usage.output_tokens

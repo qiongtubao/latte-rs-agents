@@ -13,9 +13,7 @@
 ///
 /// code-editor Tauri 格式（外部标记 + kind 字段）：
 ///   {"kind":"roleTurn","role_id":"manager","content":"...","is_complete":true}
-pub fn chat_event_to_controller_payload(
-    event_json: &str,
-) -> Result<String, String> {
+pub fn chat_event_to_controller_payload(event_json: &str) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_str(event_json).map_err(|e| format!("parse: {e}"))?;
 
@@ -84,8 +82,7 @@ pub fn controller_input_to_chat_event(
             map.insert(k.clone(), v.clone());
         }
     }
-    serde_json::to_string(&serde_json::Value::Object(map))
-        .map_err(|e| format!("serialize: {e}"))
+    serde_json::to_string(&serde_json::Value::Object(map)).map_err(|e| format!("serialize: {e}"))
 }
 
 #[cfg(test)]
@@ -94,7 +91,8 @@ mod tests {
 
     #[test]
     fn role_turn_conversion() {
-        let agent_event = r#"{"type":"RoleTurn","role_id":"manager","content":"hello","is_complete":true}"#;
+        let agent_event =
+            r#"{"type":"RoleTurn","role_id":"manager","content":"hello","is_complete":true}"#;
         let converted = chat_event_to_controller_payload(agent_event).unwrap();
         assert!(converted.contains("\"kind\":\"roleTurn\""));
         assert!(converted.contains("\"role_id\":\"manager\""));
@@ -118,7 +116,8 @@ mod tests {
 
     #[test]
     fn reverse_role_turn() {
-        let code_event = r#"{"kind":"roleTurn","role_id":"programmer","content":"hi","is_complete":true}"#;
+        let code_event =
+            r#"{"kind":"roleTurn","role_id":"programmer","content":"hi","is_complete":true}"#;
         let val: serde_json::Value = serde_json::from_str(code_event).unwrap();
         let kind = val.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let converted = controller_input_to_chat_event(kind, &val).unwrap();

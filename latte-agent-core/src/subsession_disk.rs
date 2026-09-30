@@ -113,11 +113,7 @@ impl SubsessionDiskSink {
         }
 
         let path = session_dir.join(format!("{}.jsonl", self.sub_id));
-        let mut file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!(
@@ -154,17 +150,15 @@ impl TraceSink for SubsessionDiskSink {
 
         let mut state = self.state.lock();
         match &mut *state {
-            LazyState::Uninitialized => {
-                match self.initialize() {
-                    Some(mut file) => {
-                        let _ = writeln!(file, "{json}");
-                        *state = LazyState::Open(file);
-                    }
-                    None => {
-                        *state = LazyState::Failed;
-                    }
+            LazyState::Uninitialized => match self.initialize() {
+                Some(mut file) => {
+                    let _ = writeln!(file, "{json}");
+                    *state = LazyState::Open(file);
                 }
-            }
+                None => {
+                    *state = LazyState::Failed;
+                }
+            },
             LazyState::Open(file) => {
                 let _ = writeln!(file, "{json}");
             }

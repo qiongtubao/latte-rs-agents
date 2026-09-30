@@ -75,8 +75,18 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         AgentError::TokenBudgetExceeded { .. } => ModelErrorKind::Config {
             message: "token budget exceeded".into(),
         },
+        AgentError::PromptBudgetExceeded { estimated, budget } => ModelErrorKind::Other {
+            message: format!("prompt budget exceeded ({estimated}/{budget})"),
+        },
         AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other {
             message: format!("tool loop: {tool}"),
+        },
+        AgentError::DeadlineExceeded {
+            elapsed_secs,
+            tool_rounds,
+            ..
+        } => ModelErrorKind::Other {
+            message: format!("deadline exceeded ({elapsed_secs}s, {tool_rounds} rounds)"),
         },
         AgentError::Orchestration(s) => ModelErrorKind::Other {
             message: format!("orchestration: {s}"),
@@ -2111,32 +2121,12 @@ async fn run_multi_role_loop(
     let worktree_root = repo_root.join(".latte").join("worktrees").join(&task_id);
 
     // Load or create SessionManager
-    let mut session_mgr =
-        SessionManager::new(&task_id, worktree_root.clone(), config.roles.clone());
-    if session_mgr.session_path().exists() {
-        let raw = match std::fs::read_to_string(session_mgr.session_path()) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("读取 session 文件失败: {e}"),
-                    sub_id: None,
-                });
-                return;
-            }
-        };
-        let record: SessionRecord = match serde_json::from_str(&raw) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = event_tx.send(ChatEvent::Error {
-                    kind: None,
-                    message: format!("解析 session JSON 失败: {e}"),
-                    sub_id: None,
-                });
-                return;
-            }
-        };
-        session_mgr = SessionManager::from_record(record, worktree_root.clone());
+    // Load or create SessionManager：按 task_id 找最近一次落盘记录续跑
+    // （session_id 带时间戳，`new` 出来的 path 恒不存在——不能直接拿
+    // 它判 exists，否则重启后旧 session 永远续不上）。
+    let (mut session_mgr, restored) =
+        SessionManager::load_or_create(&task_id, worktree_root.clone(), config.roles.clone());
+    if restored {
         let _ = event_tx.send(ChatEvent::Status {
             message: format!(
                 "[session: {}, state: {:?}, turn: {}]",
@@ -3024,8 +3014,8 @@ async fn run_single_role_loop(
     // 单会话）。0 预算 = 不限，此时也不记账。
     let mut session_tokens_used: u64 = 0;
     // goal 落盘坐标。空 session_id = 不落盘（临时/测试路径）。
-    let goal_persist_at: Option<(std::path::PathBuf, String)> = (!config.session_id.is_empty())
-        .then(|| (config.cwd.clone(), config.session_id.clone()));
+    let goal_persist_at: Option<(std::path::PathBuf, String)> =
+        (!config.session_id.is_empty()).then(|| (config.cwd.clone(), config.session_id.clone()));
     // 载回上次留下的目标（如果有）。
     //
     // **一律 disarmed**（`load_disarmed` 是安全阀的唯一实现点）：目标要跨
@@ -4078,10 +4068,9 @@ async fn build_runner(
             .map_err(|e| AgentError::Tool(format!("register request_tool '{role_id}': {e}")))?;
         // goal：跨 turn 的完成契约（见 `crate::goal`）。声明了它的角色才
         // 拿到——目标层是"驱动整场任务"的工具，只该给编排型角色（manager）。
-        if let (true, Some(goal_state)) = (
-            role.allowed_tools.iter().any(|t| t == "goal"),
-            goal_state,
-        ) {
+        if let (true, Some(goal_state)) =
+            (role.allowed_tools.iter().any(|t| t == "goal"), goal_state)
+        {
             register_goal_tool(
                 &tm,
                 event_tx.clone(),
@@ -4089,8 +4078,7 @@ async fn build_runner(
                 goal_state.clone(),
                 // 空 session_id 表示"临时 runner"（部分测试路径），
                 // 那种情况下不落盘。
-                (!session_id.is_empty())
-                    .then(|| (cwd.to_path_buf(), session_id.to_string())),
+                (!session_id.is_empty()).then(|| (cwd.to_path_buf(), session_id.to_string())),
             )
             .map_err(|e| AgentError::Tool(format!("register goal '{role_id}': {e}")))?;
         }
@@ -6410,7 +6398,7 @@ pub fn workflow_tool_hint(cwd: &std::path::Path) -> String {
     };
     format!(
         "Run a named multi-role workflow. Available workflows (sorted, including custom workflows from the workflow editor):\n{list}\n{index}\
-         \n**分派前先想流程**。When to use: a task that fits a fixed multi-role pipeline. Pick the workflow whose deliverable landing matches what the user asked for (each workflow declares its landing point — marked with「落点：」— in its description). **按交付物落点，不按话题词** — do not pick by topic word; match landing point to landing point. If the user asks for multiple deliverables with different landing points, call workflow multiple times in the same round — one call per deliverable. **几个不同落点，就发几个 workflow 调用**. After the workflow returns, synthesize results; if it failed, diagnose and either resume (with wf_id) or fall back manually and tell the user what failed.\n\
+         \n**分派前先想流程**。When to use: a task that fits a fixed multi-role pipeline. Pick the workflow whose deliverable landing matches what the user asked for (each workflow declares its landing point — marked with「落点：」— in its description). **按交付物落点，不按话题词** — do not pick by topic word; match landing point to landing point. If the user asks for multiple deliverables with different landing points, call workflow multiple times in the same round — one call per deliverable. **几个不同落点，就发几个 workflow 调用**. **调用后立即返回后台 job**：workflow 工具只负责启动并返回 running；不要等待工具结果，也不要在同一轮重复调用同一 name+topic。通过 WorkflowStarted/WorkflowStep/WorkflowFinished 事件观察进度，最终摘要也从事件流读取；如果最终 status=failed，使用事件里的 wf_id 以 resume 参数续跑。\n\
          \nHow to pick (the only rule — match by deliverable landing, not by topic word):\n\
          1. Write down where the user's deliverable finally lands — task board entry / a specific file / a conclusion in the conversation / a code change.\n\
          2. 先在「落点速查」表里对号——表是按各流程自声明的落点自动汇聚的；只有表里对不上时，才通读上方完整描述按「落点：」逐字比对。\n\
@@ -9133,15 +9121,14 @@ async fn register_delegate_tool(
             // 派出的 specialist 唯独没有它，角色 prompt 与 allowed_tools
             // 不对齐时只能硬碰壁，连申请的出口都没有。
             if let Some(tm) = &specialist_tm {
-                register_request_tool(tm.clone()).map_err(|e| {
-                    tool_err(format!("register request_tool for '{role_id}': {e}"))
-                })?;
+                register_request_tool(tm.clone())
+                    .map_err(|e| tool_err(format!("register request_tool for '{role_id}': {e}")))?;
             }
             // delegate 递归注册（P0 修复）。
             //
             // `delegate` **不是 builtin 工具**（`builtin_tool_packages()`
             // 里没有它，全靠本函数注册），而这里的 specialist 是用
-            // `build_tool_manager_at` 手工装的——它只注册 builtin + 
+            // `build_tool_manager_at` 手工装的——它只注册 builtin +
             // code_graph，然后把 allowlist 之外的全部 unregister。后果：
             // `tools = ["delegate"]` 的 8 个 `*_leader` 角色被派到时，拿到
             // 的是一个**零工具**的 manager，两层 leader 架构在 delegate
@@ -9180,9 +9167,7 @@ async fn register_delegate_tool(
                         child_depth,
                     )
                     .await
-                    .map_err(|e| {
-                        tool_err(format!("register delegate for '{role_id}': {e}"))
-                    })?;
+                    .map_err(|e| tool_err(format!("register delegate for '{role_id}': {e}")))?;
                 }
             }
             // 子会话 todo：specialist 声明了 "todo" 工具时，注册有状态
@@ -9302,12 +9287,15 @@ async fn register_delegate_tool(
             runner.set_deadline(
                 std::time::Instant::now() + std::time::Duration::from_secs(timeout_s),
             );
+            let delegate_started = std::time::Instant::now();
             let mut run_handle = tokio::spawn(async move {
                 // gated 版：装了 gate_config 时产出先过 D5/D6；
                 // 没装时等价 run_turn。
-                runner
+                let res = runner
                     .run_turn_gated(&[Message::user(task_content)], None)
-                    .await
+                    .await;
+                let usage = runner.total_usage().clone();
+                (res, usage)
             });
             // abort-on-drop：**必须**有。下面的 select! 会在超时/取消
             // 分支里显式 abort，但那是这个 handler future 还在被 poll
@@ -9325,14 +9313,13 @@ async fn register_delegate_tool(
             let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
             tokio::pin!(timeout);
             let result: Result<String, latte_rs_agent_tools::error::ToolError>;
+            let mut specialist_usage: Option<latte_ai::models::TokenUsage> = None;
             loop {
                 tokio::select! {
                     r = &mut run_handle => {
                         match r {
-                            // 剥掉 <think> 推理块：主 session 的气泡、
-                            // DelegateFinished 摘要和回喂 manager 的工具
-                            // 结果都只保留正式回答；原文留在子会话 trace。
-                            Ok(Ok(response)) => {
+                            Ok((Ok(response), usage)) => {
+                                specialist_usage = Some(usage);
                                 // 空产出不算成功：判失败回喂 manager，
                                 // 让它重派或换角色，而不是把空串当结论。
                                 let stripped = strip_think_blocks(&response);
@@ -9345,7 +9332,8 @@ async fn register_delegate_tool(
                                 }
                                 break;
                             }
-                            Ok(Err(e)) => {
+                            Ok((Err(e), usage)) => {
+                                specialist_usage = Some(usage);
                                 // 死循环熔断但已有实质产出：把正文一并回喂
                                 // manager。只报一句 "tool loop" 会让 manager
                                 // 以为这一支彻底没成果，从而原样重派——同一
@@ -9524,14 +9512,15 @@ async fn register_delegate_tool(
                     // 失败时 sub_sink 中的 trace 在 TurnEnd 前就断了（agent.chat?.await
                     // 提前返回），导致右键「查看日志」看不到失败原因。
                     // 这里写入 TurnEnd 作为 trace 终点事件，让子会话日志有明确结尾。
+                    let usage = specialist_usage.unwrap_or_default();
                     sub_sink.emit(crate::trace::TraceEvent::TurnEnd {
                         meta: crate::trace::TraceMeta::now(0, &role_id, &session_id),
-                        total_input: 0,
-                        total_output: 0,
-                        total_thinking: 0,
-                        total_cache_read: 0,
-                        total_cache_write: 0,
-                        elapsed_ms: 0,
+                        total_input: usage.input_tokens,
+                        total_output: usage.output_tokens,
+                        total_thinking: usage.thinking_tokens,
+                        total_cache_read: usage.cache_read_tokens,
+                        total_cache_write: usage.cache_write_tokens,
+                        elapsed_ms: delegate_started.elapsed().as_millis() as u64,
                     });
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
@@ -9608,7 +9597,7 @@ async fn register_workflow_tool(
     event_tx: broadcast::Sender<ChatEvent>,
     cwd: PathBuf,
     cancel_flag: Arc<AtomicBool>,
-    turn_cancel_flag: Arc<AtomicBool>,
+    _turn_cancel_flag: Arc<AtomicBool>,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     // 以下三项透传进 WorkflowRunContext，让 workflow 的每次角色
     // 分派与普通流程 delegate 一致：独立 subsession 日志、advisor
@@ -9621,7 +9610,7 @@ async fn register_workflow_tool(
     advisor_pause: AdvisorPauseGate,
     // 原始用户诉求。调研类流水线跑完后用它判断「用户点名的交付物是否
     // 还欠着」——这是个二值事实，不涉及任何阈值或轮次计数。
-    main_topic: Arc<parking_lot::Mutex<String>>,
+    _main_topic: Arc<parking_lot::Mutex<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     // 注册时动态枚举 .latte/workflows.d（项目 + 全局）里的可用
@@ -9711,7 +9700,6 @@ async fn register_workflow_tool(
         let default_params = default_params.clone();
         let event_tx = event_tx.clone();
         let cancel_flag = Arc::clone(&cancel_flag);
-        let turn_cancel_flag = turn_cancel_flag.clone();
         let agent_pause_gate = agent_pause_gate_owned.clone();
         let subsession_store = subsession_store.clone();
         let session_id = session_id.clone();
@@ -9719,7 +9707,6 @@ async fn register_workflow_tool(
         let advisor_pause = advisor_pause.clone();
         let cwd = cwd.clone();
         let wf_ledger = wf_ledger.clone();
-        let main_topic = Arc::clone(&main_topic);
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
             let name = input
@@ -9752,10 +9739,10 @@ async fn register_workflow_tool(
                 &topic,
                 resume.as_deref(),
             );
-            let Some(_wf_guard) = wf_ledger.begin_exclusive(wf_key) else {
+            let Some(wf_guard) = wf_ledger.begin_exclusive(wf_key) else {
                 return Err(tool_err(format!(
                     "workflow '{name}' 针对同一 topic 的运行**正在进行中**。\
-                     不要重复启动：等它返回即可（两条同身份流水线会互相踩 staging 区\
+                     不要重复启动：等它的 WorkflowFinished 事件即可（两条同身份流水线会互相踩 staging 区\
                      与 checkpoint，产出谁覆盖谁取决于时序）。"
                 )));
             };
@@ -9775,7 +9762,10 @@ async fn register_workflow_tool(
                 default_params,
                 cwd,
                 event_tx,
-                turn_cancel_flag: Some(turn_cancel_flag),
+                // 后台 workflow 不继承当前 manager turn 的取消旗标；否则
+                // 工具一返回，下一轮 turn 的清理就可能误杀后台 doc review。
+                // session cancel_flag / pause gate 仍保留，用户仍可取消/暂停。
+                turn_cancel_flag: None,
                 cancel_flag,
                 agent_pause_gate: Some(agent_pause_gate),
                 depth: 0,
@@ -9784,51 +9774,45 @@ async fn register_workflow_tool(
                 advisor_gate,
                 advisor_pause: Some(advisor_pause),
                 staging: None,
-                // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
                 dispatch_budget: None,
-                // 顶层 run：自己就是嵌套链的根。
                 root_wf_id: None,
             };
-            let result = match &resume {
-                Some(rid) => crate::workflow::run_workflow_resume(&wf, &topic, &ctx, rid).await,
-                None => crate::workflow::run_workflow(&wf, &topic, &ctx).await,
-            };
-            result
-                .map(|summary| {
-                    let mut out = strip_think_blocks(&summary);
-                    // 交付物提醒：调研类流水线跑完，且用户诉求里点名过
-                    // 交付物时，把"还欠着什么 + 该跑哪个流程"附在返回末
-                    // 尾。不数轮次、不设阈值、不阻断——只是把事实摆出来。
-                    // 诉求没点名交付物（如「这块代码怎么回事」）时
-                    // named 为空，什么也不加。
-                    if crate::workflow::is_research_workflow(&name) {
-                        let user_ask: String = main_topic.lock().clone();
-                        let named = crate::workflow::named_deliverables(&user_ask);
-                        if !named.is_empty() {
-                            out.push_str(&crate::workflow::deliverable_reminder(&named));
-                        }
+            let response_name = name.clone();
+            let response_topic = topic.clone();
+            let result_tx = ctx.event_tx.clone();
+            let workflow_name = name.clone();
+            let workflow_topic = topic.clone();
+            tokio::spawn(async move {
+                // guard 必须活到后台 workflow 最终结束，防止同身份并发重入。
+                let _wf_guard = wf_guard;
+                let result = match &resume {
+                    Some(rid) => {
+                        crate::workflow::run_workflow_resume(&wf, &workflow_topic, &ctx, rid).await
                     }
-                    serde_json::Value::String(out)
-                })
-                .map_err(|e| {
-                    // 用户主动终止 ≠ 执行失败，善后动作相反：绝不能
-                    // 自动 resume/重做——否则用户右键「终止此分派」把
-                    // 活停掉，manager 立刻又起一遍，功能等于没有。
-                    if crate::workflow::is_cancelled_by_user(&e) {
-                        return tool_err(format!(
-                            "{e}\n\n这是**用户主动终止**，不是失败：不要自动 resume 续跑，\
-                             也不要换路径重做同一件事。请简短告知用户已停止，\
-                             并询问下一步怎么做，然后结束本轮。"
-                        ));
+                    None => crate::workflow::run_workflow(&wf, &workflow_topic, &ctx).await,
+                };
+                if let Err(e) = &result {
+                    tracing::warn!(workflow = %workflow_name, error = %e, "background workflow ended");
+                }
+                // 保留原有调研交付物提醒，但不再把它作为主 session
+                // tool result 返回；它随后台事件流抵达 UI。
+                if result.is_ok() && crate::workflow::is_research_workflow(&workflow_name) {
+                    let named = crate::workflow::named_deliverables(&workflow_topic);
+                    if !named.is_empty() {
+                        let _ = result_tx.send(ChatEvent::Status {
+                            message: crate::workflow::deliverable_reminder(&named),
+                        });
                     }
-                    // 失败时给 manager 明确的善后指令——实测实锤：
-                    // 裸错误回 tool loop 后 manager 没有动作，流水线
-                    // 零产出收场。
-                    tool_err(format!(
-                        "{e}\n\n请善后：能修复的修复后用上面的 wf_id 以 resume 参数续跑，\
-                         或换路径重做；处理完向用户汇报结果，不要静默结束。"
-                    ))
-                })
+                }
+            });
+
+            Ok(serde_json::json!({
+                "started": true,
+                "status": "running",
+                "name": response_name,
+                "topic": response_topic,
+                "note": "workflow 已转入后台；请观察 WorkflowStarted/WorkflowStep/WorkflowFinished，不要重复启动同一 topic。"
+            }))
         })
     });
     let tool = Tool::builder("workflow".to_string(), usage, input_schema, handler)
@@ -9852,7 +9836,7 @@ async fn run_workflow_command(
     event_tx: &broadcast::Sender<ChatEvent>,
     cancel_flag: Arc<AtomicBool>,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
-    turn_cancel_flag: Arc<AtomicBool>,
+    _turn_cancel_flag: Arc<AtomicBool>,
     advisor_pause: AdvisorPauseGate,
 ) -> Result<Option<String>, String> {
     let wf = match crate::workflow::load_workflow_by_command(cmd, &config.cwd) {
@@ -9867,7 +9851,9 @@ async fn run_workflow_command(
         cwd: config.cwd.clone(),
         event_tx: event_tx.clone(),
         cancel_flag,
-        turn_cancel_flag: Some(turn_cancel_flag),
+        // slash workflow 进入后台后不继承当前 turn 的 cancel flag；
+        // session cancel_flag / pause gate 仍可控制整条后台 job。
+        turn_cancel_flag: None,
         agent_pause_gate: Some(agent_pause_gate),
         depth: 0,
         // 与 manager 的 workflow 工具一致：slash 命令触发的 workflow
@@ -9878,14 +9864,21 @@ async fn run_workflow_command(
         advisor_gate: config.advisor_monitor.runner_gate(),
         advisor_pause: Some(advisor_pause),
         staging: None,
-        // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
         dispatch_budget: None,
-        // 顶层 run：自己就是嵌套链的根。
         root_wf_id: None,
     };
-
-    let summary = crate::workflow::run_workflow(&wf, topic, &ctx).await?;
-    Ok(Some(summary))
+    let response_name = wf.name.clone();
+    let workflow_name = response_name.clone();
+    let workflow_topic = topic.to_string();
+    tokio::spawn(async move {
+        let result = crate::workflow::run_workflow(&wf, &workflow_topic, &ctx).await;
+        if let Err(e) = result {
+            tracing::warn!(workflow = %workflow_name, error = %e, "slash background workflow ended");
+        }
+    });
+    Ok(Some(format!(
+        "workflow '{response_name}' 已转入后台运行；请观察 WorkflowStarted/WorkflowStep/WorkflowFinished 事件。"
+    )))
 }
 
 fn role_icon(role_id: &str) -> String {
@@ -11782,7 +11775,7 @@ mod tests {
                     AdvisorPauseGate::new(),
                     &fresh_plan_stage(),
                     &crate::todo::new_shared_todo_state(),
-                Some(&crate::goal::new_shared_goal()),
+                    Some(&crate::goal::new_shared_goal()),
                     plan_mode,
                     crate::pause_gate::AgentPauseGate::new("test"),
                     Arc::new(AtomicBool::new(false)),
@@ -13123,7 +13116,10 @@ mod tests {
             .await;
         let merged = delegate_test_config(
             server.uri(),
-            vec![delegate_test_role("architect_leader", vec!["delegate".into()])],
+            vec![delegate_test_role(
+                "architect_leader",
+                vec!["delegate".into()],
+            )],
         );
         let resolver = ModelResolver::from_config(&merged).expect("resolver");
         let tm = build_tool_manager(&[]).await.expect("tool manager");
@@ -13185,7 +13181,10 @@ mod tests {
             .await;
         let merged2 = delegate_test_config(
             server2.uri(),
-            vec![delegate_test_role("architect_leader", vec!["delegate".into()])],
+            vec![delegate_test_role(
+                "architect_leader",
+                vec!["delegate".into()],
+            )],
         );
         let resolver2 = ModelResolver::from_config(&merged2).expect("resolver");
         let tm2 = build_tool_manager(&[]).await.expect("tool manager");
@@ -13282,15 +13281,26 @@ mod tests {
             let params = GenerateParams::default();
             let shared = crate::goal::new_shared_goal();
             let (mut runner, _) = build_runner(
-                &merged, &resolver, &params, "manager", ModelTier::Standard, None,
-                &event_tx, std::path::Path::new("/tmp"),
-                Arc::new(crate::subsession::SubsessionStore::new()), "goal-opt-test",
-                Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)),
-                Arc::new(parking_lot::Mutex::new(String::new())), None,
-                AdvisorPauseGate::new(), &fresh_plan_stage(),
+                &merged,
+                &resolver,
+                &params,
+                "manager",
+                ModelTier::Standard,
+                None,
+                &event_tx,
+                std::path::Path::new("/tmp"),
+                Arc::new(crate::subsession::SubsessionStore::new()),
+                "goal-opt-test",
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(parking_lot::Mutex::new(String::new())),
+                None,
+                AdvisorPauseGate::new(),
+                &fresh_plan_stage(),
                 &crate::todo::new_shared_todo_state(),
                 if with_goal { Some(&shared) } else { None },
-                false, crate::pause_gate::AgentPauseGate::new("test"),
+                false,
+                crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
             )
             .await
@@ -16577,28 +16587,38 @@ require = ["永远不可能出现的验收字符串"]
 
     #[tokio::test]
     async fn read_tool_batch_enforces_output_budget() {
+        // 新契约：单次 read 上限 50KiB（每条 tool result ≤ ~50KB JSON）。
+        // batch budget 192KB 需要 ≥4 条 ~50KB 才触发（旧契约下 110KB 文件
+        // 因 `numberedContent` 重复足以触发，去掉重复后不再自动触发）。
         let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first.txt");
-        let second = dir.path().join("second.txt");
+        // 4 条 ~50KB JSON = ~200KB > 192KB budget → 第 5 条必须进 failed。
         let payload = "x".repeat(110 * 1024);
-        tokio::fs::write(&first, &payload).await.unwrap();
-        tokio::fs::write(&second, &payload).await.unwrap();
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("f{i}.txt"));
+            tokio::fs::write(&p, &payload).await.unwrap();
+            paths.push(p.to_string_lossy().into_owned());
+        }
         let mgr = build_tool_manager(&["read".into()]).await.unwrap();
 
         let out = mgr
             .execute(
                 "read",
-                serde_json::json!({"paths":[first.to_string_lossy(), second.to_string_lossy()]}),
+                serde_json::json!({"paths": paths}),
                 None,
             )
             .await
             .expect("budgeted batch read");
-        assert_eq!(out["files"].as_array().unwrap().len(), 1);
+        // 单读 50KiB → 每条 JSON ~50KB；192KB budget 只够装 3 条，
+        // 第 4、5 条进 failed（110KB 原文被 50KiB 截断，JSON ~50KB）。
+        assert_eq!(out["files"].as_array().unwrap().len(), 3,
+            "batch budget 192KB 应只装下 3 条 ~50KB JSON");
         let failed = out["failed"].as_array().unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0]["path"], second.to_string_lossy().as_ref());
+        assert_eq!(failed.len(), 2, "第 4、5 条应进 failed");
+        assert_eq!(failed[0]["path"], paths[3]);
+        assert_eq!(failed[1]["path"], paths[4]);
         assert!(failed[0]["error"].as_str().unwrap().contains("budget"));
-        assert_eq!(out["count"], 2);
+        assert_eq!(out["count"], 5);
     }
 
     /// 动态授权必须拿到与初始 allowlist 相同的增强后工具；旧实现先缓存
@@ -18343,8 +18363,7 @@ require = ["永远不可能出现的验收字符串"]
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let state = crate::goal::new_shared_goal();
         let (tx, rx) = broadcast::channel(64);
-        register_goal_tool(&tm, tx, "manager".into(), state.clone(), None)
-            .expect("register goal");
+        register_goal_tool(&tm, tx, "manager".into(), state.clone(), None).expect("register goal");
         (tm, state, rx)
     }
 
@@ -18390,7 +18409,10 @@ require = ["永远不可能出现的验收字符串"]
             .expect("无目标时 get 也该成功");
         assert!(out["goal"].is_null());
         assert!(
-            out["note"].as_str().unwrap_or_default().contains("完成契约"),
+            out["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("完成契约"),
             "要给出「可以立一个目标」的指引：{out}"
         );
     }
@@ -18711,7 +18733,10 @@ require = ["永远不可能出现的验收字符串"]
 
         // 续跑注入的是**一行摘要**，不是整段 prompt。
         assert_eq!(round_msgs.first().map(String::as_str), Some("开始干活"));
-        let auto: Vec<&String> = round_msgs.iter().filter(|m| m.contains("自动续跑")).collect();
+        let auto: Vec<&String> = round_msgs
+            .iter()
+            .filter(|m| m.contains("自动续跑"))
+            .collect();
         assert_eq!(auto.len(), 2, "两轮续跑各应有一条摘要：{round_msgs:?}");
         for m in auto {
             assert!(
@@ -19035,7 +19060,8 @@ require = ["永远不可能出现的验收字符串"]
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(200), rx_b.recv()).await {
-                Ok(Ok(ChatEvent::Status { message })) if message.contains("载回上次的目标") => {
+                Ok(Ok(ChatEvent::Status { message })) if message.contains("载回上次的目标") =>
+                {
                     notice = Some(message);
                     break;
                 }
@@ -19060,7 +19086,13 @@ require = ["永远不可能出现的验收字符串"]
         // 用户真的说一句话时，跑那一轮，但**不**因为目标 active 就自动续跑。
         b.submit_input("先别继续那个目标，回答我一个问题").await;
         for _ in 0..100 {
-            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) >= 1 {
+            if server
+                .received_requests()
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0)
+                >= 1
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -19235,7 +19267,9 @@ require = ["永远不可能出现的验收字符串"]
 
         // 轮次收到 1，好让它下一轮就撞上限。
         c.submit_input("/goal rounds 1").await;
-        let msg = wait_status(&mut rx, "第 0/1 轮", 5).await.expect("rounds 应生效");
+        let msg = wait_status(&mut rx, "第 0/1 轮", 5)
+            .await
+            .expect("rounds 应生效");
         assert!(msg.contains("/goal resume"), "要提示 resume 才真跑：{msg}");
 
         // ── 干一轮活 → 自动续跑第 1 轮 → 再收尾时撞上限 ──
@@ -19258,10 +19292,15 @@ require = ["永远不可能出现的验收字符串"]
         let refused = wait_status(&mut rx, "resume 失败", 5)
             .await
             .expect("轮次用尽时 resume 应被拒");
-        assert!(refused.contains("抬高 max_rounds"), "报错要给出补救动作：{refused}");
+        assert!(
+            refused.contains("抬高 max_rounds"),
+            "报错要给出补救动作：{refused}"
+        );
 
         c.submit_input("/goal rounds 9").await;
-        wait_status(&mut rx, "第 1/9 轮", 5).await.expect("抬上限应生效");
+        wait_status(&mut rx, "第 1/9 轮", 5)
+            .await
+            .expect("抬上限应生效");
         c.submit_input("/goal resume").await;
         wait_status(&mut rx, "自动续跑开", 5)
             .await
@@ -19270,7 +19309,13 @@ require = ["永远不可能出现的验收字符串"]
         // resume 只是重新 arm；真正继续跑要等下一次 turn 收尾。
         c.submit_input("接着干").await;
         for _ in 0..200 {
-            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) > calls_at_block + 1 {
+            if server
+                .received_requests()
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0)
+                > calls_at_block + 1
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -19325,7 +19370,10 @@ require = ["永远不可能出现的验收字符串"]
         // resume 重新 arm。
         let resumed = state.write().resume(&paused.goal_ref()).expect("resume");
         assert_eq!(resumed.phase, crate::goal::GoalPhase::Active);
-        assert_eq!(state.read().activation(), crate::goal::GoalActivation::Armed);
+        assert_eq!(
+            state.read().activation(),
+            crate::goal::GoalActivation::Armed
+        );
 
         // budget：设上限 / off 清掉。
         let with_budget = state

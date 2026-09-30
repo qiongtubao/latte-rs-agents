@@ -42,10 +42,7 @@ impl CliOverrides {
     ///
     /// Because the list of model ids isn't known until the configs are
     /// loaded, the caller must resolve the target list and pass it in.
-    pub fn into_field_overrides(
-        self,
-        all_model_ids: &[String],
-    ) -> Vec<(String, String, String)> {
+    pub fn into_field_overrides(self, all_model_ids: &[String]) -> Vec<(String, String, String)> {
         let mut out = self.field_overrides;
         if let Some(key) = self.api_key {
             let targets: Vec<&str> = match &self.api_key_target {
@@ -149,34 +146,34 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
     DiscussionConfig::default()
 }
 
- pub fn load(
-     project_agents: Option<&str>,
-     project_models: Option<&str>,
-     _cli: CliOverrides,
- ) -> AgentResult<Resolved> {
-     // Layer 3 (lowest): global ~/.latte/models.{yaml,toml} + ~/.latte/models.d/
-     let global = GlobalConfig::load_default()?;
-     let mut sources = ResolvedSources {
-         global: GlobalConfig::default_candidates()
-             .into_iter()
-             .filter(|p| p.exists())
-             .map(|p| p.display().to_string())
-             .collect(),
-         ..Default::default()
-     };
-     if let Some(dir) = GlobalConfig::global_dir() {
-         let d = dir.join("models.d");
-         if d.is_dir() {
-             if let Ok(read) = std::fs::read_dir(&d) {
-                 for entry in read.flatten() {
-                     let p = entry.path();
-                     if p.is_file() {
-                         sources.global.push(p.display().to_string());
-                     }
-                 }
-             }
-         }
-     }
+pub fn load(
+    project_agents: Option<&str>,
+    project_models: Option<&str>,
+    _cli: CliOverrides,
+) -> AgentResult<Resolved> {
+    // Layer 3 (lowest): global ~/.latte/models.{yaml,toml} + ~/.latte/models.d/
+    let global = GlobalConfig::load_default()?;
+    let mut sources = ResolvedSources {
+        global: GlobalConfig::default_candidates()
+            .into_iter()
+            .filter(|p| p.exists())
+            .map(|p| p.display().to_string())
+            .collect(),
+        ..Default::default()
+    };
+    if let Some(dir) = GlobalConfig::global_dir() {
+        let d = dir.join("models.d");
+        if d.is_dir() {
+            if let Ok(read) = std::fs::read_dir(&d) {
+                for entry in read.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        sources.global.push(p.display().to_string());
+                    }
+                }
+            }
+        }
+    }
     // Per-file reverse map: every agent file under project/global
     // agents.d → list of role ids declared. Populated by
     // `scan_role_files_in_dir` below. Project wins over global, but
@@ -193,35 +190,39 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
             scan_role_files_in_dir(&d, &mut sources.role_files);
         }
     }
-     // Layer 2: project (agents + models) merged with the global
-     // `~/.latte/agents.d/` directory via `load_with_global` (project-wins
-     // per role / model id; global fills in anything the project did not
-     // declare). A missing project path is silently skipped so a bare
-     // `~/.latte/agents.d` setup can drive the system end-to-end.
-     //
-     // Check if the project agents path exists first; if not, pass None
-     // so load_with_global cleanly falls back to global + built-in roles
-     // without producing a misleading error in the log.
-     let agents_path_exists = project_agents
-         .map(|p| std::fs::metadata(p).is_ok())
-         .unwrap_or(false);
-     let active_agents = if agents_path_exists { project_agents } else { None };
-     let mut project_cfg = AgentConfig::load_with_global(active_agents)?;
-     if let Some(path) = project_agents {
-         if agents_path_exists {
-             sources.project_agents = Some(path.to_string());
-         }
-     }
-     // Models: project wins, but the global `models.{yaml,toml}` /
-     // `models.d/*.yaml` is still merged on top below. We do NOT call
-     // `load_with_global` for models here because the global *models*
-     // layer is merged in a separate step (`global.merge_into_project`)
-     // that already implements id-based field-filling semantics.
-     if let Some(path) = project_models {
-         if std::fs::metadata(path).is_ok() {
-             let part = AgentConfig::load(path)?;
-             merge_into(&mut project_cfg, &part);
-             sources.project_models = Some(path.to_string());
+    // Layer 2: project (agents + models) merged with the global
+    // `~/.latte/agents.d/` directory via `load_with_global` (project-wins
+    // per role / model id; global fills in anything the project did not
+    // declare). A missing project path is silently skipped so a bare
+    // `~/.latte/agents.d` setup can drive the system end-to-end.
+    //
+    // Check if the project agents path exists first; if not, pass None
+    // so load_with_global cleanly falls back to global + built-in roles
+    // without producing a misleading error in the log.
+    let agents_path_exists = project_agents
+        .map(|p| std::fs::metadata(p).is_ok())
+        .unwrap_or(false);
+    let active_agents = if agents_path_exists {
+        project_agents
+    } else {
+        None
+    };
+    let mut project_cfg = AgentConfig::load_with_global(active_agents)?;
+    if let Some(path) = project_agents {
+        if agents_path_exists {
+            sources.project_agents = Some(path.to_string());
+        }
+    }
+    // Models: project wins, but the global `models.{yaml,toml}` /
+    // `models.d/*.yaml` is still merged on top below. We do NOT call
+    // `load_with_global` for models here because the global *models*
+    // layer is merged in a separate step (`global.merge_into_project`)
+    // that already implements id-based field-filling semantics.
+    if let Some(path) = project_models {
+        if std::fs::metadata(path).is_ok() {
+            let part = AgentConfig::load(path)?;
+            merge_into(&mut project_cfg, &part);
+            sources.project_models = Some(path.to_string());
             // Track per-model origin for the model file the user
             // pointed at. When the path is a directory (default
             // `.latte/models.d`), we walk the dir below; when it's
@@ -232,8 +233,8 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
             } else if p.is_file() {
                 scan_model_file(p, &mut sources.model_files);
             }
-         }
-     }
+        }
+    }
     // Global models: same scan for the layered global locations
     // already enumerated into `sources.global`. We re-walk the
     // directory tree (cheap; just metadata) so the YAML files
@@ -282,7 +283,15 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
     let resolver = ModelResolver::from_config(&merged)?;
 
     // Load project discussion config
-    let discussion = load_discussion_config(project_agents.map(|p| std::path::Path::new(p).parent().unwrap_or(std::path::Path::new("."))).unwrap_or(std::path::Path::new(".")));
+    let discussion = load_discussion_config(
+        project_agents
+            .map(|p| {
+                std::path::Path::new(p)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+            })
+            .unwrap_or(std::path::Path::new(".")),
+    );
 
     Ok(Resolved {
         config: merged,
@@ -295,7 +304,8 @@ pub fn load_discussion_config(project_dir: &std::path::Path) -> DiscussionConfig
 /// Append `src`'s models, roles, and tier maps into `dst`.
 /// ids are the caller's problem (checked before this is called).
 fn merge_into(dst: &mut AgentConfig, src: &AgentConfig) {
-    dst.roles.extend(src.roles.iter().map(|(k, v)| (k.clone(), v.clone())));
+    dst.roles
+        .extend(src.roles.iter().map(|(k, v)| (k.clone(), v.clone())));
     dst.models.models.extend(src.models.models.iter().cloned());
     if let Some(t) = &src.models.tiers {
         dst.models
@@ -304,10 +314,7 @@ fn merge_into(dst: &mut AgentConfig, src: &AgentConfig) {
             .extend(t.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     if let Some(rt) = &src.models.role_tiers {
-        let dst_rt = dst
-            .models
-            .role_tiers
-            .get_or_insert_with(Default::default);
+        let dst_rt = dst.models.role_tiers.get_or_insert_with(Default::default);
         for (role, tier_map) in rt {
             dst_rt
                 .entry(role.clone())
@@ -316,7 +323,6 @@ fn merge_into(dst: &mut AgentConfig, src: &AgentConfig) {
         }
     }
 }
-
 
 /// Walk an agents directory and record every role id found in each
 /// `.toml` file into the `role_files` reverse map. Files are scanned
@@ -340,10 +346,7 @@ fn scan_role_files_in_dir(
     let mut paths: Vec<std::path::PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension().and_then(|s| s.to_str()) == Some("toml")
-        })
+        .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("toml"))
         .collect();
     paths.sort();
     for path in paths {
@@ -366,7 +369,10 @@ fn scan_role_file(
     };
     let path_str = path.display().to_string();
     for (id, _) in roles {
-        role_files.entry(id.clone()).or_default().push(path_str.clone());
+        role_files
+            .entry(id.clone())
+            .or_default()
+            .push(path_str.clone());
     }
 }
 
@@ -408,10 +414,7 @@ fn scan_model_file(
     path: &std::path::Path,
     model_files: &mut std::collections::BTreeMap<String, Vec<String>>,
 ) {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if ext != "toml" {
         return;
     }
@@ -431,10 +434,7 @@ fn scan_model_file(
     {
         for entry in models {
             if let Some(id) = model_entry_key(entry) {
-                model_files
-                    .entry(id)
-                    .or_default()
-                    .push(path_str.clone());
+                model_files.entry(id).or_default().push(path_str.clone());
             }
         }
     }
@@ -444,10 +444,7 @@ fn scan_model_file(
     if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
         for entry in models {
             if let Some(id) = model_entry_key(entry) {
-                model_files
-                    .entry(id)
-                    .or_default()
-                    .push(path_str.clone());
+                model_files.entry(id).or_default().push(path_str.clone());
             }
         }
     }
@@ -463,9 +460,7 @@ fn model_entry_key(entry: &toml::Value) -> Option<String> {
         table.get("provider").and_then(toml::Value::as_str),
         table.get("model_name").and_then(toml::Value::as_str),
     ) {
-        (Some(provider), Some(model_name))
-            if !provider.is_empty() && !model_name.is_empty() =>
-        {
+        (Some(provider), Some(model_name)) if !provider.is_empty() && !model_name.is_empty() => {
             Some(format!("{provider}/{model_name}"))
         }
         _ => table
@@ -516,7 +511,10 @@ max_tokens = 384000
         scan_model_file(&path, &mut model_files);
 
         assert_eq!(model_files.len(), 1);
-        assert_eq!(model_files["minimax/MiniMax-M3"], vec![path.display().to_string()]);
+        assert_eq!(
+            model_files["minimax/MiniMax-M3"],
+            vec![path.display().to_string()]
+        );
         let _ = std::fs::remove_file(path);
     }
 }

@@ -87,7 +87,10 @@ mod tests {
         let p = queue_path(d.path(), "programmer");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, "look at foo.rs\n").unwrap();
-        assert_eq!(drain(d.path(), "programmer").as_deref(), Some("look at foo.rs\n"));
+        assert_eq!(
+            drain(d.path(), "programmer").as_deref(),
+            Some("look at foo.rs\n")
+        );
         assert!(!p.exists());
         assert!(format_injected("x").starts_with(INJECT_MARKER));
     }

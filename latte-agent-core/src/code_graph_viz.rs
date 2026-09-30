@@ -36,8 +36,9 @@ fn load_index(cwd: &Path) -> Result<CodeGraphIndex, String> {
     let path = CodeGraphIndex::path(cwd);
     let raw = std::fs::read_to_string(&path)
         .map_err(|_| "代码索引尚未构建（.latte/code_graph/index.json 不存在）。UI 启动后会后台构建，稍候再试。".to_string())?;
-    let idx: CodeGraphIndex = serde_json::from_str(&raw)
-        .map_err(|e| format!("代码索引损坏：{e}。删除 .latte/code_graph/index.json 后等后台重建。"))?;
+    let idx: CodeGraphIndex = serde_json::from_str(&raw).map_err(|e| {
+        format!("代码索引损坏：{e}。删除 .latte/code_graph/index.json 后等后台重建。")
+    })?;
     if idx.version != CodeGraphIndex::CURRENT_VERSION {
         return Err("代码索引版本过旧，等后台重建完成后再试。".to_string());
     }
@@ -132,7 +133,11 @@ pub async fn structure_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, S
                 format!("{} {}", kind_tag(&sym.kind), sanitize_label(&name))
             };
             // label 为空（极端情况）时用位置兜底，保证节点可读。
-            let label = if label.is_empty() { format!("L{}", sym.line) } else { label };
+            let label = if label.is_empty() {
+                format!("L{}", sym.line)
+            } else {
+                label
+            };
             lines.push(format!("    n{node_count}[\"{label}\"]"));
             node_count += 1;
         }
@@ -152,7 +157,10 @@ pub async fn structure_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, S
             "  %% 图被截断：只画了前 {MAX_NODES} 个符号，缩小 path 范围再看"
         ));
     }
-    Ok(MermaidGraph { mermaid: lines.join("\n"), truncated })
+    Ok(MermaidGraph {
+        mermaid: lines.join("\n"),
+        truncated,
+    })
 }
 
 /// 语言 → call 表达式节点类型（CODE_GRAPH_KIND_TABLE 的 call 行子集，
@@ -246,7 +254,11 @@ pub async fn calls_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, Strin
             .symbols
             .iter()
             .filter(|s| s.kind == "function" || s.kind == "method")
-            .map(|s| FnSpan { name: name_of(&s.sig), line: s.line, end_line: s.end_line })
+            .map(|s| FnSpan {
+                name: name_of(&s.sig),
+                line: s.line,
+                end_line: s.end_line,
+            })
             .filter(|s| !s.name.is_empty())
             .collect();
         if !spans.is_empty() {
@@ -271,7 +283,10 @@ pub async fn calls_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, Strin
     let mut name_locations: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (rel, spans) in &fns_by_file {
         for s in spans {
-            name_locations.entry(s.name.clone()).or_default().push(rel.clone());
+            name_locations
+                .entry(s.name.clone())
+                .or_default()
+                .push(rel.clone());
         }
     }
 
@@ -310,7 +325,10 @@ pub async fn calls_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, Strin
                     _ => continue,
                 }
             };
-            edges.insert((format!("{file}::{}", caller.name), format!("{callee_file}::{callee}")));
+            edges.insert((
+                format!("{file}::{}", caller.name),
+                format!("{callee_file}::{callee}"),
+            ));
             if edges.len() >= MAX_EDGES {
                 truncated = true;
                 break 'lang_loop;
@@ -345,7 +363,10 @@ pub async fn calls_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, Strin
             truncated = true;
             break;
         }
-        lines.push(format!("  subgraph sg{sg}[\"📄 {}\"]", sanitize_label(file)));
+        lines.push(format!(
+            "  subgraph sg{sg}[\"📄 {}\"]",
+            sanitize_label(file)
+        ));
         sg += 1;
         for (key, name) in nodes {
             let id = format!("n{node_count}");
@@ -365,7 +386,10 @@ pub async fn calls_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, Strin
             "  %% 图被截断：上限 {MAX_EDGES} 边 / {MAX_NODES} 节点，缩小 path 范围再看"
         ));
     }
-    Ok(MermaidGraph { mermaid: lines.join("\n"), truncated })
+    Ok(MermaidGraph {
+        mermaid: lines.join("\n"),
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -436,8 +460,16 @@ mod tests {
     #[test]
     fn find_caller_picks_innermost_span() {
         let spans = vec![
-            FnSpan { name: "outer".into(), line: 1, end_line: 100 },
-            FnSpan { name: "inner".into(), line: 10, end_line: 20 },
+            FnSpan {
+                name: "outer".into(),
+                line: 1,
+                end_line: 100,
+            },
+            FnSpan {
+                name: "inner".into(),
+                line: 10,
+                end_line: 20,
+            },
         ];
         assert_eq!(find_caller(&spans, 15).unwrap().name, "inner");
         assert_eq!(find_caller(&spans, 50).unwrap().name, "outer");
@@ -470,13 +502,16 @@ mod tests {
             "fn helper() -> i32 { 1 }\nfn main_entry() { let _ = helper(); }\n",
         )
         .unwrap();
-        write_index(dir.path(), r#"{
+        write_index(
+            dir.path(),
+            r#"{
             "version": 2, "built_at": 9999999999, "lang_counts": {"rust": 1},
             "files": {"src/lib.rs": {"lang": "rust", "mtime": 1, "symbols": [
                 {"kind": "function", "sig": "fn helper()", "line": 1, "end_line": 1},
                 {"kind": "function", "sig": "fn main_entry()", "line": 2, "end_line": 2}
             ]}}
-        }"#);
+        }"#,
+        );
         let g = calls_mermaid(dir.path(), "src").await.unwrap();
         assert!(g.mermaid.starts_with("flowchart LR"), "{}", g.mermaid);
         assert!(g.mermaid.contains("fn helper"), "{}", g.mermaid);

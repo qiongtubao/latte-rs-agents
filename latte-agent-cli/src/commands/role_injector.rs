@@ -21,7 +21,10 @@ impl RoleInjector {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         writeln!(f, "{}", message)?;
         Ok(())
     }
@@ -34,7 +37,10 @@ impl RoleInjector {
     /// 独立实现且行为不一致（详见那个模块的文档）。这里只保留薄封装，
     /// 让既有调用方与测试不必改签名。
     pub fn drain(worktree_root: &Path, role_id: &str) -> std::io::Result<Option<String>> {
-        Ok(latte_agent_core::inject_queue::drain(worktree_root, role_id))
+        Ok(latte_agent_core::inject_queue::drain(
+            worktree_root,
+            role_id,
+        ))
     }
 
     pub fn queue_path(worktree_root: &Path, role_id: &str) -> PathBuf {

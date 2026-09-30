@@ -100,7 +100,10 @@ fn evaluate_majority(votes: &[AgentVote]) -> VoteResult {
         *counts.entry(v.position.clone()).or_default() += 1;
     }
 
-    let (winner, count) = counts.into_iter().max_by_key(|(_, c)| *c).unwrap_or_default();
+    let (winner, count) = counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .unwrap_or_default();
     let total = votes.len();
     let agreement = count as f64 / total as f64;
     let majority = (total / 2) + 1;
@@ -167,7 +170,10 @@ fn evaluate_deliberative(votes: &[AgentVote], min_agreement: f64) -> VoteResult 
         *counts.entry(v.position.clone()).or_default() += 1;
     }
 
-    let (winner, count) = counts.into_iter().max_by_key(|(_, c)| *c).unwrap_or_default();
+    let (winner, count) = counts
+        .into_iter()
+        .max_by_key(|(_, c)| *c)
+        .unwrap_or_default();
     let total = votes.len();
     let agreement = count as f64 / total as f64;
 
@@ -198,11 +204,7 @@ mod tests {
 
     #[test]
     fn test_majority_consensus() {
-        let votes = vec![
-            vote("pm", "yes"),
-            vote("dev", "yes"),
-            vote("qa", "no"),
-        ];
+        let votes = vec![vote("pm", "yes"), vote("dev", "yes"), vote("qa", "no")];
         let result = ConsensusMethod::MajorityVote.evaluate(&votes);
         assert!(result.consensus);
         assert_eq!(result.winner, Some("yes".into()));
@@ -211,11 +213,7 @@ mod tests {
 
     #[test]
     fn test_majority_no_consensus() {
-        let votes = vec![
-            vote("pm", "yes"),
-            vote("dev", "no"),
-            vote("qa", "no"),
-        ];
+        let votes = vec![vote("pm", "yes"), vote("dev", "no"), vote("qa", "no")];
         let result = ConsensusMethod::MajorityVote.evaluate(&votes);
         assert!(result.consensus);
         assert_eq!(result.winner, Some("no".into()));
@@ -254,8 +252,10 @@ mod tests {
             vote("qa", "yes"),
             vote("sec", "no"),
         ];
-        let result = ConsensusMethod::DeliberateUntilConsensus { min_agreement: 0.75 }
-            .evaluate(&votes);
+        let result = ConsensusMethod::DeliberateUntilConsensus {
+            min_agreement: 0.75,
+        }
+        .evaluate(&votes);
         assert!(result.consensus);
     }
 

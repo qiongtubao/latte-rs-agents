@@ -67,7 +67,10 @@ impl ChatRenderer for CliRenderer {
     }
 
     async fn on_paused(&self, reason: &str) {
-        self.write(style::paint_bold(style::FG_YELLOW, &format!("[paused: {}]", reason)));
+        self.write(style::paint_bold(
+            style::FG_YELLOW,
+            &format!("[paused: {}]", reason),
+        ));
     }
 
     async fn on_resumed(&self) {
@@ -105,7 +108,10 @@ impl ChatRenderer for CliRenderer {
     }
 
     async fn on_session_info(&self, task_id: &str, state: &str, turn: u32) {
-        self.write(format!("[session: {}, state: {}, turn: {}]", task_id, state, turn));
+        self.write(format!(
+            "[session: {}, state: {}, turn: {}]",
+            task_id, state, turn
+        ));
     }
 
     async fn on_tool_use(&self, role_id: &str, tool_name: &str, args: &str) {
@@ -116,7 +122,10 @@ impl ChatRenderer for CliRenderer {
     }
 
     async fn on_tool_result(&self, role_id: &str, tool_name: &str, result: &str) {
-        self.write(format!("[tool: {}] {} `{}` -> {}", role_id, role_id, tool_name, result));
+        self.write(format!(
+            "[tool: {}] {} `{}` -> {}",
+            role_id, role_id, tool_name, result
+        ));
     }
 }
 

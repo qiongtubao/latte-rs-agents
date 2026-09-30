@@ -15,8 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
-use latte_agent_core::trace::{IndexLine, TraceEvent};
 use latte_agent_core::config::ConfigLayer;
+use latte_agent_core::trace::{IndexLine, TraceEvent};
 
 /// Per-session summary derived from one or more of the three sibling
 /// files. `size_bytes` is the on-disk total across whichever files
@@ -48,12 +48,17 @@ pub fn latte_home() -> Option<PathBuf> {
 }
 
 pub fn logs_dir() -> Option<PathBuf> {
-    ConfigLayer::Project.logs_dir().filter(|d| d.is_dir())
+    ConfigLayer::Project
+        .logs_dir()
+        .filter(|d| d.is_dir())
         .or_else(|| ConfigLayer::Global.logs_dir())
 }
-pub fn sessions_dir() -> Option<PathBuf> { latte_home().map(|h| h.join("sessions")) }
-pub fn traces_dir() -> Option<PathBuf> { latte_home().map(|h| h.join("traces")) }
-
+pub fn sessions_dir() -> Option<PathBuf> {
+    latte_home().map(|h| h.join("sessions"))
+}
+pub fn traces_dir() -> Option<PathBuf> {
+    latte_home().map(|h| h.join("traces"))
+}
 
 /// Sanity-check that `id` is a plausible session id. Lenient by
 /// design: rejects path traversal (`..`, `/`) and empty strings;
@@ -62,7 +67,10 @@ pub fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && !id.contains('/')
         && !id.contains("..")
-        && id.chars().next().map_or(false, |c| c.is_ascii_alphanumeric())
+        && id
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_alphanumeric())
 }
 
 /// List every session seen across `logs/`, `sessions/`, and
@@ -76,16 +84,30 @@ pub fn list_sessions() -> Vec<SessionSummary> {
 
     let mut mark = |dir: Option<PathBuf>, ext: &str, set: fn(&mut SessionSummary, bool)| {
         let Some(d) = dir else { return };
-        let Ok(rd) = std::fs::read_dir(&d) else { return };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            return;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
-            if !path.is_file() { continue; }
-            let Some(this_ext) = path.extension().and_then(|s| s.to_str()) else { continue };
-            if this_ext != ext { continue; }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if !path.is_file() {
+                continue;
+            }
+            let Some(this_ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if this_ext != ext {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let id = stem.to_string();
             let summary = by_id.entry(id.clone()).or_insert_with(|| SessionSummary {
-                id, has_log: false, has_index: false, has_trace: false, size_bytes: 0,
+                id,
+                has_log: false,
+                has_index: false,
+                has_trace: false,
+                size_bytes: 0,
             });
             set(summary, true);
             if let Ok(meta) = std::fs::metadata(&path) {
@@ -94,9 +116,9 @@ pub fn list_sessions() -> Vec<SessionSummary> {
         }
     };
 
-    mark(logs_dir(),     "log",   |s, b| s.has_log = b);
-    mark(sessions_dir(), "idx",   |s, b| s.has_index = b);
-    mark(traces_dir(),   "jsonl", |s, b| s.has_trace = b);
+    mark(logs_dir(), "log", |s, b| s.has_log = b);
+    mark(sessions_dir(), "idx", |s, b| s.has_index = b);
+    mark(traces_dir(), "jsonl", |s, b| s.has_trace = b);
 
     by_id.into_values().collect()
 }
@@ -132,7 +154,9 @@ impl std::fmt::Display for TraceStoreError {
         match self {
             TraceStoreError::NotFound(p) => write!(f, "not found: {}", p.display()),
             TraceStoreError::Io(p, e) => write!(f, "io error on {}: {}", p.display(), e),
-            TraceStoreError::Parse(p, e, line) => write!(f, "parse error on {} line {}: {}", p.display(), line, e),
+            TraceStoreError::Parse(p, e, line) => {
+                write!(f, "parse error on {} line {}: {}", p.display(), line, e)
+            }
         }
     }
 }
@@ -148,10 +172,13 @@ pub fn load_trace(id: &str) -> Result<Vec<TraceEvent>, TraceStoreError> {
     if !path.exists() {
         return Err(TraceStoreError::NotFound(path));
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| TraceStoreError::Io(path.clone(), e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| TraceStoreError::Io(path.clone(), e))?;
     let mut events = Vec::new();
     for (idx, line) in content.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let ev: TraceEvent = serde_json::from_str(line)
             .map_err(|e| TraceStoreError::Parse(path.clone(), e, idx + 1))?;
         events.push(ev);
@@ -168,10 +195,13 @@ pub fn load_index(id: &str) -> Result<Vec<IndexLine>, TraceStoreError> {
     if !path.exists() {
         return Err(TraceStoreError::NotFound(path));
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| TraceStoreError::Io(path.clone(), e))?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| TraceStoreError::Io(path.clone(), e))?;
     let mut lines = Vec::new();
     for (idx, line) in content.lines().enumerate() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let l: IndexLine = serde_json::from_str(line)
             .map_err(|e| TraceStoreError::Parse(path.clone(), e, idx + 1))?;
         lines.push(l);
@@ -206,7 +236,14 @@ pub fn aggregate_tokens(events: &[TraceEvent]) -> TokenAggregate {
     let mut per: BTreeMap<(u32, String), (u32, u32, u32)> = BTreeMap::new();
     let mut total = TokenAggregate::default();
     for ev in events {
-        if let TraceEvent::TurnEnd { meta, total_input, total_output, total_thinking, .. } = ev {
+        if let TraceEvent::TurnEnd {
+            meta,
+            total_input,
+            total_output,
+            total_thinking,
+            ..
+        } = ev
+        {
             total.total_input += total_input;
             total.total_output += total_output;
             total.total_thinking += total_thinking;
@@ -218,7 +255,13 @@ pub fn aggregate_tokens(events: &[TraceEvent]) -> TokenAggregate {
         }
     }
     for ((turn, role), (input, output, thinking)) in per {
-        total.per_turn.push(TokenRow { turn, role, input, output, thinking });
+        total.per_turn.push(TokenRow {
+            turn,
+            role,
+            input,
+            output,
+            thinking,
+        });
     }
     total
 }
@@ -229,7 +272,10 @@ pub fn aggregate_tokens(events: &[TraceEvent]) -> TokenAggregate {
 pub fn filter_by_kind(events: Vec<TraceEvent>, kind: Option<&str>) -> Vec<TraceEvent> {
     match kind {
         None => events,
-        Some(k) => events.into_iter().filter(|e| e.variant_name() == k).collect(),
+        Some(k) => events
+            .into_iter()
+            .filter(|e| e.variant_name() == k)
+            .collect(),
     }
 }
 
@@ -256,7 +302,9 @@ pub fn format_timeline(events: &[TraceEvent]) -> String {
 /// directory and `.log` suffix to recover the id. Returns `None`
 /// if the path has no usable stem.
 pub fn session_id_from_log_path(path: &Path) -> Option<String> {
-    path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -285,7 +333,8 @@ mod tests {
     fn list_sessions_finds_files_across_all_three_dirs() {
         let _guard = ENV_LOCK.lock().unwrap();
         use std::fs;
-        let dir = std::env::temp_dir().join(format!("latte-trace-store-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("latte-trace-store-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let logs = dir.join("logs");
         let sessions = dir.join("sessions");
@@ -336,7 +385,10 @@ mod tests {
     #[test]
     fn session_id_from_log_path_strips_dir_and_suffix() {
         let p = PathBuf::from("/home/u/.latte/logs/chat-20260625-054204-73546.log");
-        assert_eq!(session_id_from_log_path(&p).as_deref(), Some("chat-20260625-054204-73546"));
+        assert_eq!(
+            session_id_from_log_path(&p).as_deref(),
+            Some("chat-20260625-054204-73546")
+        );
     }
 
     #[test]
@@ -360,21 +412,58 @@ mod tests {
         use latte_agent_core::trace::{ToolStatus, TraceEvent, TraceMeta};
         let events = vec![
             TraceEvent::TurnEnd {
-                meta: TraceMeta { turn: 0, role: "manager".into(), ts: "t".into(), session_id: "s".into() },
-                total_input: 100, total_output: 200, total_thinking: 5, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 1,
+                meta: TraceMeta {
+                    turn: 0,
+                    role: "manager".into(),
+                    ts: "t".into(),
+                    session_id: "s".into(),
+                },
+                total_input: 100,
+                total_output: 200,
+                total_thinking: 5,
+                total_cache_read: 0,
+                total_cache_write: 0,
+                elapsed_ms: 1,
             },
             TraceEvent::TurnEnd {
-                meta: TraceMeta { turn: 0, role: "manager".into(), ts: "t".into(), session_id: "s".into() },
-                total_input: 50, total_output: 100, total_thinking: 0, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 1,
+                meta: TraceMeta {
+                    turn: 0,
+                    role: "manager".into(),
+                    ts: "t".into(),
+                    session_id: "s".into(),
+                },
+                total_input: 50,
+                total_output: 100,
+                total_thinking: 0,
+                total_cache_read: 0,
+                total_cache_write: 0,
+                elapsed_ms: 1,
             },
             TraceEvent::ToolExec {
-                meta: TraceMeta { turn: 0, role: "manager".into(), ts: "t".into(), session_id: "s".into() },
-                name: "read".into(), args_json: "{}".into(), latency_ms: 1,
+                meta: TraceMeta {
+                    turn: 0,
+                    role: "manager".into(),
+                    ts: "t".into(),
+                    session_id: "s".into(),
+                },
+                name: "read".into(),
+                args_json: "{}".into(),
+                latency_ms: 1,
                 status: ToolStatus::Ok("ok".into()),
             },
             TraceEvent::TurnEnd {
-                meta: TraceMeta { turn: 1, role: "programmer".into(), ts: "t".into(), session_id: "s".into() },
-                total_input: 30, total_output: 60, total_thinking: 2, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 1,
+                meta: TraceMeta {
+                    turn: 1,
+                    role: "programmer".into(),
+                    ts: "t".into(),
+                    session_id: "s".into(),
+                },
+                total_input: 30,
+                total_output: 60,
+                total_thinking: 2,
+                total_cache_read: 0,
+                total_cache_write: 0,
+                elapsed_ms: 1,
             },
         ];
         let agg = aggregate_tokens(&events);
@@ -385,7 +474,11 @@ mod tests {
         let m = agg.per_turn.iter().find(|r| r.role == "manager").unwrap();
         assert_eq!(m.input, 150);
         assert_eq!(m.output, 300);
-        let p = agg.per_turn.iter().find(|r| r.role == "programmer").unwrap();
+        let p = agg
+            .per_turn
+            .iter()
+            .find(|r| r.role == "programmer")
+            .unwrap();
         assert_eq!(p.input, 30);
         assert_eq!(p.turn, 1);
     }
@@ -395,12 +488,27 @@ mod tests {
         use latte_agent_core::trace::{HookPoint, TraceEvent, TraceMeta};
         let events = vec![
             TraceEvent::HookFired {
-                meta: TraceMeta { turn: 0, role: "x".into(), ts: "t".into(), session_id: "s".into() },
-                hook_name: "h".into(), point: HookPoint::PreCall, outcome_kind: "continue".into(),
+                meta: TraceMeta {
+                    turn: 0,
+                    role: "x".into(),
+                    ts: "t".into(),
+                    session_id: "s".into(),
+                },
+                hook_name: "h".into(),
+                point: HookPoint::PreCall,
+                outcome_kind: "continue".into(),
             },
             TraceEvent::SessionEnd {
-                meta: TraceMeta { turn: 0, role: "x".into(), ts: "t".into(), session_id: "s".into() },
-                total_turns: 0, total_input: 0, total_output: 0, total_thinking: 0,
+                meta: TraceMeta {
+                    turn: 0,
+                    role: "x".into(),
+                    ts: "t".into(),
+                    session_id: "s".into(),
+                },
+                total_turns: 0,
+                total_input: 0,
+                total_output: 0,
+                total_thinking: 0,
             },
         ];
         let h = filter_by_kind(events.clone(), Some("HookFired"));

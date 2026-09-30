@@ -196,10 +196,7 @@ impl WorkflowRegistry {
     /// directory and dispatches accordingly.
     pub fn load(path: &str) -> OrchResult<Self> {
         let meta = std::fs::metadata(path).map_err(|e| {
-            crate::error::OrchError::Config(format!(
-                "cannot stat workflow path '{}': {}",
-                path, e
-            ))
+            crate::error::OrchError::Config(format!("cannot stat workflow path '{}': {}", path, e))
         })?;
 
         if meta.is_dir() {
@@ -248,7 +245,9 @@ impl WorkflowRegistry {
                 }
                 // 目录级失败（读不了目录 / 单文件格式坏了）也要留痕，
                 // 不能像原来那样 `if let Ok` 直接丢。
-                Err(e) => merged.skipped.push((path.clone(), format!("整层加载失败: {e}"))),
+                Err(e) => merged
+                    .skipped
+                    .push((path.clone(), format!("整层加载失败: {e}"))),
             }
         }
 
@@ -266,9 +265,7 @@ impl WorkflowRegistry {
                             merged.workflows.entry(id).or_insert(wf);
                         }
                     }
-                    Err(e) => merged
-                        .skipped
-                        .push((as_str, format!("整层加载失败: {e}"))),
+                    Err(e) => merged.skipped.push((as_str, format!("整层加载失败: {e}"))),
                 }
             }
         }
@@ -281,17 +278,11 @@ impl WorkflowRegistry {
     fn load_dir(dir: &str) -> OrchResult<Self> {
         let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| {
-                crate::error::OrchError::Config(format!(
-                    "cannot read dir '{}': {}",
-                    dir, e
-                ))
+                crate::error::OrchError::Config(format!("cannot read dir '{}': {}", dir, e))
             })?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && p.extension().and_then(|s| s.to_str()) == Some("toml")
-            })
+            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("toml"))
             .collect();
         entries.sort();
 
@@ -312,7 +303,9 @@ impl WorkflowRegistry {
             let wf = match DiscussionWorkflow::parse(&content) {
                 Ok(wf) => wf,
                 Err(e) => {
-                    registry.skipped.push((fname, classify_parse_failure(&content, &e)));
+                    registry
+                        .skipped
+                        .push((fname, classify_parse_failure(&content, &e)));
                     continue;
                 }
             };
@@ -327,8 +320,8 @@ impl WorkflowRegistry {
             }
             // File named `default.toml` (or matching the workflow's own
             // `name` of "default") is promoted to the default slot.
-            let is_default = entry.file_stem().and_then(|s| s.to_str()) == Some("default")
-                || id == "default";
+            let is_default =
+                entry.file_stem().and_then(|s| s.to_str()) == Some("default") || id == "default";
             if is_default {
                 registry.default = Some(wf.clone());
             }
@@ -367,12 +360,9 @@ impl WorkflowRegistry {
                 return Ok(wf.clone());
             }
             if n == "default" {
-                return self
-                    .default
-                    .clone()
-                    .ok_or_else(|| crate::error::OrchError::Config(
-                        "no default workflow available".into(),
-                    ));
+                return self.default.clone().ok_or_else(|| {
+                    crate::error::OrchError::Config("no default workflow available".into())
+                });
             }
             return Err(crate::error::OrchError::Config(format!(
                 "workflow '{}' not found. Available: {:?}",
@@ -380,11 +370,11 @@ impl WorkflowRegistry {
                 self.workflows.keys().collect::<Vec<_>>()
             )));
         }
-        self.default
-            .clone()
-            .ok_or_else(|| crate::error::OrchError::Config(
+        self.default.clone().ok_or_else(|| {
+            crate::error::OrchError::Config(
                 "no workflow specified and no default configured".into(),
-            ))
+            )
+        })
     }
 }
 
@@ -578,12 +568,14 @@ prompt = "Hi"
         std::fs::write(tmp.join("a.toml"), body).unwrap();
         std::fs::write(tmp.join("b.toml"), body).unwrap();
 
-        let reg = WorkflowRegistry::load(tmp.to_str().unwrap())
-            .expect("重名不能让整个目录加载失败");
+        let reg =
+            WorkflowRegistry::load(tmp.to_str().unwrap()).expect("重名不能让整个目录加载失败");
         assert!(reg.workflows.contains_key("same"));
         assert_eq!(reg.workflows.len(), 1);
         assert!(
-            reg.skipped.iter().any(|(f, r)| f == "b.toml" && r.contains("重复")),
+            reg.skipped
+                .iter()
+                .any(|(f, r)| f == "b.toml" && r.contains("重复")),
             "后来者要记进 skipped: {:?}",
             reg.skipped
         );
@@ -642,10 +634,7 @@ prompt = "Review"
             let reg = WorkflowRegistry::load_with_global(Some(tmp.to_str().unwrap())).unwrap();
             assert_eq!(reg.workflows.len(), 1);
             assert!(reg.workflows.contains_key("code_review"));
-            assert_eq!(
-                reg.workflows["code_review"].description,
-                "Project"
-            );
+            assert_eq!(reg.workflows["code_review"].description, "Project");
         });
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -738,7 +727,9 @@ prompt = "Review"
             "保留字母序在前的那个"
         );
         assert!(
-            reg.skipped.iter().any(|(f, r)| f == "b_second.toml" && r.contains("重复")),
+            reg.skipped
+                .iter()
+                .any(|(f, r)| f == "b_second.toml" && r.contains("重复")),
             "重名要留痕: {:?}",
             reg.skipped
         );
@@ -779,8 +770,7 @@ prompt = "Triage"
 "#,
             )
             .unwrap();
-            let reg =
-                WorkflowRegistry::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            let reg = WorkflowRegistry::load_with_global(Some(project.to_str().unwrap())).unwrap();
             assert_eq!(reg.workflows.len(), 2);
             assert!(reg.workflows.contains_key("code_review"));
             assert!(reg.workflows.contains_key("bug_triage"));
@@ -812,7 +802,10 @@ prompt = "Hi"
             assert_eq!(reg.workflows.len(), 1);
             assert!(reg.workflows.contains_key("default"));
             assert!(reg.default.is_some());
-            assert_eq!(reg.default.as_ref().unwrap().description, "From_global_only");
+            assert_eq!(
+                reg.default.as_ref().unwrap().description,
+                "From_global_only"
+            );
         });
     }
 }

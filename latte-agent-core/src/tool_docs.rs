@@ -94,7 +94,17 @@ pub const DYNAMIC_TOOL_CATALOG: &[(&str, &str)] = &[
 /// 文档按**注册名**查找，所以为别名写的 md 需要 [`alias_of`] 回退才能生效
 /// （`mcp.md` → `mcp_connect` / `mcp_list` / `mcp_call`）。
 pub const TOOL_ALIAS_GROUPS: &[(&str, &[&str])] = &[
-    ("git", &["git_status", "git_diff", "git_log", "git_add", "git_commit", "git_branch"]),
+    (
+        "git",
+        &[
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_add",
+            "git_commit",
+            "git_branch",
+        ],
+    ),
     ("mcp", &["mcp_connect", "mcp_list", "mcp_call"]),
     ("playwright", &["playwright_script", "screenshot"]),
 ];
@@ -154,7 +164,10 @@ fn split_first_sentence(text: &str) -> (String, String) {
         }
     }
     match split_at {
-        Some(end) => (text[..end].trim().to_string(), text[end..].trim().to_string()),
+        Some(end) => (
+            text[..end].trim().to_string(),
+            text[end..].trim().to_string(),
+        ),
         None => (text.to_string(), String::new()),
     }
 }
@@ -224,11 +237,21 @@ pub fn resolve_doc(cwd: &Path, name: &str) -> ResolvedDoc {
     for id in &candidates {
         let project = cwd.join(doc_rel_path(id));
         if let Some(raw) = read_trimmed(&project) {
-            return ResolvedDoc { raw, source: DocSource::Project, path: project, matched_id: id.clone() };
+            return ResolvedDoc {
+                raw,
+                source: DocSource::Project,
+                path: project,
+                matched_id: id.clone(),
+            };
         }
         if let Some(global) = global_docs_dir().map(|dir| dir.join(format!("{id}.md"))) {
             if let Some(raw) = read_trimmed(&global) {
-                return ResolvedDoc { raw, source: DocSource::Global, path: global, matched_id: id.clone() };
+                return ResolvedDoc {
+                    raw,
+                    source: DocSource::Global,
+                    path: global,
+                    matched_id: id.clone(),
+                };
             }
         }
     }
@@ -451,7 +474,10 @@ impl TemplateContext {
     }
 
     pub fn var(&self, key: &str) -> &str {
-        self.vars.get(&norm_key(key)).map(String::as_str).unwrap_or("")
+        self.vars
+            .get(&norm_key(key))
+            .map(String::as_str)
+            .unwrap_or("")
     }
 
     /// 未定义的开关按 `false`：模板写错工具名时走 `{{else}}` 分支，
@@ -840,7 +866,10 @@ mod tests {
         assert_eq!(b, "读取文件内容。");
         assert!(d.starts_with("支持行范围选择器"));
 
-        assert_eq!(split_brief_and_detail("列出目录内容"), ("列出目录内容".into(), String::new()));
+        assert_eq!(
+            split_brief_and_detail("列出目录内容"),
+            ("列出目录内容".into(), String::new())
+        );
         assert_eq!(
             split_brief_and_detail("Runs pi v1.2 scripts"),
             ("Runs pi v1.2 scripts".into(), String::new())
@@ -859,7 +888,9 @@ mod tests {
     #[test]
     fn template_substitutes_vars_and_branches() {
         let mut ctx = TemplateContext::new();
-        ctx.set_var("cwd", "/tmp/x").set_flag("has_eval", true).set_flag("has_browser", false);
+        ctx.set_var("cwd", "/tmp/x")
+            .set_flag("has_eval", true)
+            .set_flag("has_browser", false);
 
         assert_eq!(render_template("cwd={{CWD}}", &ctx), "cwd=/tmp/x");
         // 键名大小写/下划线不敏感
@@ -867,19 +898,37 @@ mod tests {
         // 未知变量 → 空串
         assert_eq!(render_template("[{{nope}}]", &ctx), "[]");
 
-        assert_eq!(render_template("{{#if hasEval}}yes{{else}}no{{/if}}", &ctx), "yes");
-        assert_eq!(render_template("{{#if has_browser}}yes{{else}}no{{/if}}", &ctx), "no");
+        assert_eq!(
+            render_template("{{#if hasEval}}yes{{else}}no{{/if}}", &ctx),
+            "yes"
+        );
+        assert_eq!(
+            render_template("{{#if has_browser}}yes{{else}}no{{/if}}", &ctx),
+            "no"
+        );
         // 未知开关按 false
-        assert_eq!(render_template("{{#if hasNothing}}y{{else}}n{{/if}}", &ctx), "n");
-        assert_eq!(render_template("{{#unless has_browser}}fallback{{/unless}}", &ctx), "fallback");
+        assert_eq!(
+            render_template("{{#if hasNothing}}y{{else}}n{{/if}}", &ctx),
+            "n"
+        );
+        assert_eq!(
+            render_template("{{#unless has_browser}}fallback{{/unless}}", &ctx),
+            "fallback"
+        );
         // 嵌套
         assert_eq!(
-            render_template("{{#if hasEval}}A{{#unless has_browser}}B{{/unless}}C{{/if}}", &ctx),
+            render_template(
+                "{{#if hasEval}}A{{#unless has_browser}}B{{/unless}}C{{/if}}",
+                &ctx
+            ),
             "ABC"
         );
         // 未选中的分支不能泄漏到输出里
         assert_eq!(
-            render_template("{{#if has_browser}}NO{{#if hasEval}}NEITHER{{/if}}{{else}}OK{{/if}}", &ctx),
+            render_template(
+                "{{#if has_browser}}NO{{#if hasEval}}NEITHER{{/if}}{{else}}OK{{/if}}",
+                &ctx
+            ),
             "OK"
         );
     }
@@ -899,10 +948,10 @@ mod tests {
 
     #[test]
     fn context_from_tool_names_exposes_flags_and_vars() {
-        let ctx = TemplateContext::from_tool_names(Path::new("/w"), &[
-            "read".to_string(),
-            "mcp_call".to_string(),
-        ]);
+        let ctx = TemplateContext::from_tool_names(
+            Path::new("/w"),
+            &["read".to_string(), "mcp_call".to_string()],
+        );
         assert!(ctx.flag("has_read"));
         assert!(ctx.flag("hasRead"));
         assert!(!ctx.flag("has_eval"));
@@ -969,7 +1018,10 @@ mod tests {
         assert_eq!(effective_description("base", cwd, "zz_probe", &ctx), "base");
 
         std::fs::write(dir.join("zz_probe.md"), "v1 doc").unwrap();
-        assert_eq!(effective_description("base", cwd, "zz_probe", &ctx), "base\n\nv1 doc");
+        assert_eq!(
+            effective_description("base", cwd, "zz_probe", &ctx),
+            "base\n\nv1 doc"
+        );
 
         std::fs::write(dir.join("zz_probe.md"), "v2 doc").unwrap();
         let again = effective_description("base", cwd, "zz_probe", &ctx);
@@ -1040,11 +1092,17 @@ mod tests {
         let ctx = TemplateContext::from_tool_names(cwd, &["zz_tpl".into()]);
         let text = effective_description("base", cwd, "zz_tpl", &ctx);
         assert!(text.contains("tool=zz_tpl"), "{text}");
-        assert!(text.contains("no eval") && !text.contains("use eval"), "{text}");
+        assert!(
+            text.contains("no eval") && !text.contains("use eval"),
+            "{text}"
+        );
 
         let ctx = TemplateContext::from_tool_names(cwd, &["zz_tpl".into(), "eval".into()]);
         let text = effective_description("base", cwd, "zz_tpl", &ctx);
-        assert!(text.contains("use eval") && !text.contains("no eval"), "{text}");
+        assert!(
+            text.contains("use eval") && !text.contains("no eval"),
+            "{text}"
+        );
     }
 
     /// 分层落点：项目层优先、全局层次之，与 models / roles 面板同一套语义。
@@ -1065,7 +1123,11 @@ mod tests {
         assert_eq!(layers[0].layer, DocLayer::Project);
         assert!(layers[0].path.ends_with(".latte/tools.d/zz_layer.md"));
         assert_eq!(layers[1].layer, DocLayer::Global);
-        assert!(layers[1].path.starts_with(global.path()), "{:?}", layers[1].path);
+        assert!(
+            layers[1].path.starts_with(global.path()),
+            "{:?}",
+            layers[1].path
+        );
 
         // 只写全局：全局命中，运行时也读全局
         let written = write_doc_in(cwd, "zz_layer", DocLayer::Global, "global body").unwrap();
@@ -1093,7 +1155,11 @@ mod tests {
         write_doc_in(cwd, "mcp", DocLayer::Global, "alias body").unwrap();
         let layers = doc_layers(cwd, "mcp_call");
         assert!(!layers[0].exists, "项目层不该命中");
-        assert!(layers[1].exists && layers[1].matched_id == "mcp", "{:?}", layers[1]);
+        assert!(
+            layers[1].exists && layers[1].matched_id == "mcp",
+            "{:?}",
+            layers[1]
+        );
 
         assert_eq!(DocLayer::parse("project"), Some(DocLayer::Project));
         assert_eq!(DocLayer::parse(""), Some(DocLayer::Project));
@@ -1155,14 +1221,22 @@ mod tests {
             })
         };
 
-        record_mcp_tools("srv-a", 0, parse_mcp_connect_result(&payload(&["alpha", "beta"])));
+        record_mcp_tools(
+            "srv-a",
+            0,
+            parse_mcp_connect_result(&payload(&["alpha", "beta"])),
+        );
         assert_eq!(mcp_tools().len(), 2);
 
         // 重连同一个 server，这次它只报一个工具 → 目录里就该只剩这一个
         let again = record_mcp_tools("srv-a", 0, parse_mcp_connect_result(&payload(&["alpha"])));
         assert_eq!(again.len(), 1);
         let names: Vec<String> = mcp_tools().into_iter().map(|t| t.name).collect();
-        assert_eq!(names, vec!["alpha".to_string()], "重连后不该残留旧工具/后缀副本");
+        assert_eq!(
+            names,
+            vec!["alpha".to_string()],
+            "重连后不该残留旧工具/后缀副本"
+        );
 
         // 另一个 server 报同名工具，仍然按下标加后缀区分
         record_mcp_tools("srv-b", 1, parse_mcp_connect_result(&payload(&["alpha"])));

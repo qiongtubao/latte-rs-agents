@@ -39,11 +39,7 @@ impl RoleCategory {
 /// the filesystem. Layers are additive — they never replace the base;
 /// empty layers and layers identical to the base (synced copies) are
 /// skipped.
-fn append_project_layers(
-    base: String,
-    project_ctx: Option<&str>,
-    overlay: Option<&str>,
-) -> String {
+fn append_project_layers(base: String, project_ctx: Option<&str>, overlay: Option<&str>) -> String {
     let mut out = base;
     for (content, tag) in [(project_ctx, "project_context"), (overlay, "project_rules")] {
         if let Some(c) = content {
@@ -81,7 +77,14 @@ pub fn system_tools_for(id: &str) -> &'static [&'static str] {
         // 硬啃（实测 jemalloc 会话 manager 用 bash 探索不走流程，是
         // 路由失效根因之一；add-only merge 意味着不在此列出 = 物理禁用）。
         "manager" => &[
-            "delegate", "workflow", "plan", "ask", "read", "search", "write", "code_graph",
+            "delegate",
+            "workflow",
+            "plan",
+            "ask",
+            "read",
+            "search",
+            "write",
+            "code_graph",
         ],
         "advisor" => &["read", "search"],
         _ => &[],
@@ -103,7 +106,6 @@ fn is_full_prompt_copy(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("<role>") || (t.contains("<role>") && t.contains("<rules>"))
 }
-
 
 /// Loaded from TOML config + markdown prompt files. Supports `{{variable}}` template
 /// substitution via handlebars.
@@ -198,13 +200,12 @@ impl RoleTemplate {
         &self,
         default_params: &GenerateParams,
     ) -> Result<Role, crate::error::AgentError> {
-        let category = RoleCategory::parse(&self.category)
-            .ok_or_else(|| {
-                crate::error::AgentError::Config(format!(
-                    "unknown role category '{}' for role '{}'",
-                    self.category, self.id
-                ))
-            })?;
+        let category = RoleCategory::parse(&self.category).ok_or_else(|| {
+            crate::error::AgentError::Config(format!(
+                "unknown role category '{}' for role '{}'",
+                self.category, self.id
+            ))
+        })?;
 
         let model_tier = crate::model_resolver::ModelTier::parse(&self.model_tier)?;
 
@@ -239,53 +240,55 @@ impl RoleTemplate {
                 Some(custom) => format!("{base}\n\n<project_rules>\n{custom}\n</project_rules>"),
                 None => base.to_string(),
             }
-        } else { match &self.prompt_file {
-            Some(path) => match tokio::fs::read_to_string(path).await {
-                Ok(content) => content,
-                Err(primary_err) => {
-                    // Absolute paths, `~`-prefixed paths, and paths
-                    // with `..` are deliberate user intent — we
-                    // still try the global `prompts.d/` override,
-                    // but we do NOT fall back to the binary's
-                    // built-in prompts (the user clearly meant
-                    // *this* file, not a default).
-                    let skip_global =
-                        path.starts_with('/') || path.starts_with('~') || path.contains("..");
-                    if skip_global {
-                        return Err(crate::error::AgentError::Config(format!(
-                            "cannot read prompt file '{}' for role '{}': {}",
-                            path, self.id, primary_err
-                        )));
+        } else {
+            match &self.prompt_file {
+                Some(path) => match tokio::fs::read_to_string(path).await {
+                    Ok(content) => content,
+                    Err(primary_err) => {
+                        // Absolute paths, `~`-prefixed paths, and paths
+                        // with `..` are deliberate user intent — we
+                        // still try the global `prompts.d/` override,
+                        // but we do NOT fall back to the binary's
+                        // built-in prompts (the user clearly meant
+                        // *this* file, not a default).
+                        let skip_global =
+                            path.starts_with('/') || path.starts_with('~') || path.contains("..");
+                        if skip_global {
+                            return Err(crate::error::AgentError::Config(format!(
+                                "cannot read prompt file '{}' for role '{}': {}",
+                                path, self.id, primary_err
+                            )));
+                        }
+                        match resolve_global_prompt(path, &self.id).await {
+                            Some(content) => content,
+                            None => match crate::prompts::for_role(&self.id) {
+                                // Built-in: compiled into the binary at
+                                // build time via `include_str!`. Always
+                                // available, no filesystem dependency.
+                                // This is what makes `latte-agent chat`
+                                // work out-of-the-box on a fresh checkout
+                                // (no project config, no global
+                                // overrides, just the binary).
+                                Some(content) => content.to_string(),
+                                None => {
+                                    return Err(crate::error::AgentError::Config(format!(
+                                        "cannot read prompt file '{}' for role '{}': {}",
+                                        path, self.id, primary_err
+                                    )));
+                                }
+                            },
+                        }
                     }
-                    match resolve_global_prompt(path, &self.id).await {
-                        Some(content) => content,
-                        None => match crate::prompts::for_role(&self.id) {
-                            // Built-in: compiled into the binary at
-                            // build time via `include_str!`. Always
-                            // available, no filesystem dependency.
-                            // This is what makes `latte-agent chat`
-                            // work out-of-the-box on a fresh checkout
-                            // (no project config, no global
-                            // overrides, just the binary).
-                            Some(content) => content.to_string(),
-                            None => {
-                                return Err(crate::error::AgentError::Config(format!(
-                                    "cannot read prompt file '{}' for role '{}': {}",
-                                    path, self.id, primary_err
-                                )));
-                            }
-                        },
-                    }
-                }
-            },
-            None => match crate::prompts::for_role(&self.id) {
-                Some(content) => content.to_string(),
-                None => format!(
-                    "You are a {}. Respond in character as a {}.\nYour task: {{topic}}",
-                    self.name, self.name
-                ),
-            },
-        } };
+                },
+                None => match crate::prompts::for_role(&self.id) {
+                    Some(content) => content.to_string(),
+                    None => format!(
+                        "You are a {}. Respond in character as a {}.\nYour task: {{topic}}",
+                        self.name, self.name
+                    ),
+                },
+            }
+        };
 
         // ── 项目级注入（init_project workflow 生成，对全角色生效）──
         // `prompts/project.md`：全角色共享的项目上下文（项目定位、技术
@@ -294,17 +297,12 @@ impl RoleTemplate {
         // 员→语言与代码规范、PM→项目定位……）。
         // 两者都是**追加**，不覆盖基座；与基座内容相同的同步拷贝和空
         // 文件跳过（去重）。
-        let project_ctx = tokio::fs::read_to_string("prompts/project.md")
-            .await
-            .ok();
+        let project_ctx = tokio::fs::read_to_string("prompts/project.md").await.ok();
         let overlay = tokio::fs::read_to_string(format!("prompts/overlays/{}.md", self.id))
             .await
             .ok();
-        let system_prompt = append_project_layers(
-            system_prompt,
-            project_ctx.as_deref(),
-            overlay.as_deref(),
-        );
+        let system_prompt =
+            append_project_layers(system_prompt, project_ctx.as_deref(), overlay.as_deref());
 
         // Load skills: append each skill file content to system prompt.
         // (Previously the content was loaded and then dropped — the
@@ -313,7 +311,10 @@ impl RoleTemplate {
         for skill_name in &self.skills {
             let skill_paths = [
                 format!("prompts/{skill_name}.md"),
-                format!("{}/prompts/{skill_name}.md", std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default()),
+                format!(
+                    "{}/prompts/{skill_name}.md",
+                    std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default()
+                ),
             ];
             if let Some(skill_content) = skill_paths
                 .iter()
@@ -434,7 +435,11 @@ fn render_code_file(p: &std::path::Path, display: &str) -> String {
                 (&bytes[..], false)
             };
             let text = String::from_utf8_lossy(slice);
-            let note = if truncated { "\n…（超过 8KB，截断）" } else { "" };
+            let note = if truncated {
+                "\n…（超过 8KB，截断）"
+            } else {
+                ""
+            };
             format!("\n#### `{display}`\n\n```\n{text}{note}\n```\n")
         }
     }
@@ -515,10 +520,22 @@ mod tests {
 
     #[test]
     fn test_role_category_parse() {
-        assert_eq!(RoleCategory::parse("planning"), Some(RoleCategory::Planning));
-        assert_eq!(RoleCategory::parse("Execution"), Some(RoleCategory::Execution));
-        assert_eq!(RoleCategory::parse("verification"), Some(RoleCategory::Verification));
-        assert_eq!(RoleCategory::parse("discussion"), Some(RoleCategory::Discussion));
+        assert_eq!(
+            RoleCategory::parse("planning"),
+            Some(RoleCategory::Planning)
+        );
+        assert_eq!(
+            RoleCategory::parse("Execution"),
+            Some(RoleCategory::Execution)
+        );
+        assert_eq!(
+            RoleCategory::parse("verification"),
+            Some(RoleCategory::Verification)
+        );
+        assert_eq!(
+            RoleCategory::parse("discussion"),
+            Some(RoleCategory::Discussion)
+        );
         assert_eq!(RoleCategory::parse("unknown"), None);
     }
 
@@ -577,7 +594,9 @@ mod tests {
         let _ = std::fs::remove_file(&rel);
         // Built-in base is present …（锚点取现行基座首行；b6f1284 轻量
         // 化后旧的"任务启动决策流程"已不在内置 prompt 里）
-        assert!(role.system_prompt.contains("你是资深技术负责人/架构师 agent（manager）"));
+        assert!(role
+            .system_prompt
+            .contains("你是资深技术负责人/架构师 agent（manager）"));
         // … and the user file was appended, not replaced.
         assert!(role.system_prompt.contains("<project_rules>"));
         assert!(role.system_prompt.contains("本项目约定：优先用 Rust。"));
@@ -619,7 +638,9 @@ mod tests {
     /// `is_full_prompt_copy` 的判据边界：整份 prompt 认得出，普通增量放行。
     #[test]
     fn test_full_prompt_copy_detection() {
-        assert!(is_full_prompt_copy("<role>\n你是…\n</role>\n<rules>\n…\n</rules>"));
+        assert!(is_full_prompt_copy(
+            "<role>\n你是…\n</role>\n<rules>\n…\n</rules>"
+        ));
         assert!(is_full_prompt_copy("\n\n<role>x</role>"));
         // 增量：只补充条款，不重新声明 <role>/<rules>。
         assert!(!is_full_prompt_copy("本项目约定：优先用 Rust。"));
@@ -733,7 +754,6 @@ mod tests {
             .lock()
             .unwrap();
 
-
         let tmp = std::env::temp_dir().join(format!(
             "latte_role_test_home_{}_{:?}",
             std::process::id(),
@@ -817,7 +837,10 @@ mod tests {
         // 不存在路径明确标注
         assert!(sp.contains("路径不存在"), "prompt: {sp}");
         // 空 code_paths 不注入
-        let role2 = make_template(None).resolve(&Default::default()).await.unwrap();
+        let role2 = make_template(None)
+            .resolve(&Default::default())
+            .await
+            .unwrap();
         assert!(!role2.system_prompt.contains("你的领域代码/文档资料"));
     }
 
@@ -912,10 +935,7 @@ mod tests {
 /// 3. Absolute paths, `~`-prefixed paths, and paths containing `..`
 ///    skip the global fallback (the user clearly meant a specific
 ///    location).
-async fn resolve_global_prompt(
-    configured: &str,
-    _role_id: &str,
-) -> Option<String> {
+async fn resolve_global_prompt(configured: &str, _role_id: &str) -> Option<String> {
     use crate::global_config::GlobalConfig;
     let global_dir = GlobalConfig::global_dir()?;
 
@@ -934,4 +954,3 @@ async fn resolve_global_prompt(
         Err(_) => None,
     }
 }
-

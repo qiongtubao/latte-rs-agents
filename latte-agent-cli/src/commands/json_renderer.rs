@@ -136,14 +136,26 @@ impl ChatRenderer for JsonRenderer {
     }
 
     async fn on_session_info(&self, task_id: &str, state: &str, turn: u32) {
-        self.emit(Event::SessionInfo { task_id, state, turn });
+        self.emit(Event::SessionInfo {
+            task_id,
+            state,
+            turn,
+        });
     }
 
     async fn on_tool_use(&self, role_id: &str, tool_name: &str, args: &str) {
-        self.emit(Event::ToolUse { role_id, tool_name, args });
+        self.emit(Event::ToolUse {
+            role_id,
+            tool_name,
+            args,
+        });
     }
 
     async fn on_tool_result(&self, role_id: &str, tool_name: &str, result: &str) {
-        self.emit(Event::ToolResult { role_id, tool_name, result });
+        self.emit(Event::ToolResult {
+            role_id,
+            tool_name,
+            result,
+        });
     }
 }

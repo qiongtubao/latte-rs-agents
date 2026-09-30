@@ -111,13 +111,19 @@ fn merge_models_or_insert(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
     // 去掉 `id` 字段，`name` 接管 API id 的语义；`provider` 仍是区分
     // 同名 model 的关键（"gpt-4"@openai vs "gpt-4"@azure 是不同的）。
     for m in src {
-        if !dst.iter().any(|e| e.provider == m.provider && e.name == m.name) {
+        if !dst
+            .iter()
+            .any(|e| e.provider == m.provider && e.name == m.name)
+        {
             dst.push(m.clone());
         }
     }
 }
 
-fn merge_tiers_or_insert(dst: &mut Option<HashMap<String, String>>, src: &Option<HashMap<String, String>>) {
+fn merge_tiers_or_insert(
+    dst: &mut Option<HashMap<String, String>>,
+    src: &Option<HashMap<String, String>>,
+) {
     if let Some(s) = src {
         let d = dst.get_or_insert_with(Default::default);
         for (k, v) in s {
@@ -305,9 +311,7 @@ pub enum HookKindConfig {
     /// Enforce a tool allowlist (abort on disallowed calls).
     EnforceToolAllowlist,
     /// Require at least `min_words` in the model response.
-    RequireToolCall {
-        min_words: usize,
-    },
+    RequireToolCall { min_words: usize },
     /// Monitor context token usage; abort or warn when approaching
     /// the configured budget.
     ContextMonitor {
@@ -319,7 +323,9 @@ pub enum HookKindConfig {
 }
 
 impl Default for HookKindConfig {
-    fn default() -> Self { Self::None }
+    fn default() -> Self {
+        Self::None
+    }
 }
 
 /// A single hook applied at a specific point in the workflow step
@@ -332,7 +338,7 @@ pub struct StepHookConfig {
     /// Empty string or "*" means all roles.
     #[serde(default)]
     pub role_filter: String,
- }
+}
 
 impl AgentConfig {
     /// Load config from a path. If `path` is a directory, merge every
@@ -405,7 +411,12 @@ impl AgentConfig {
                     merged.compaction = part.compaction.clone();
                 }
                 for m in part.models.models {
-                    if !merged.models.models.iter().any(|e| e.provider == m.provider && e.name == m.name) {
+                    if !merged
+                        .models
+                        .models
+                        .iter()
+                        .any(|e| e.provider == m.provider && e.name == m.name)
+                    {
                         merged.models.models.push(m);
                     }
                 }
@@ -422,7 +433,9 @@ impl AgentConfig {
                         .role_tiers
                         .get_or_insert_with(Default::default);
                     for (role, tier_map) in rt {
-                        dst.entry(role).or_insert_with(Default::default).extend(tier_map);
+                        dst.entry(role)
+                            .or_insert_with(Default::default)
+                            .extend(tier_map);
                     }
                 }
             }
@@ -435,7 +448,10 @@ impl AgentConfig {
                     merge_global_into(&mut merged.roles, &global_part.roles);
                     merge_models_or_insert(&mut merged.models.models, &global_part.models.models);
                     merge_tiers_or_insert(&mut merged.models.tiers, &global_part.models.tiers);
-                    merge_role_tiers_or_insert(&mut merged.models.role_tiers, &global_part.models.role_tiers);
+                    merge_role_tiers_or_insert(
+                        &mut merged.models.role_tiers,
+                        &global_part.models.role_tiers,
+                    );
                     // Advisor 开关：只填 project 未声明的空档（project 优先）。
                     if merged.advisor.is_unset() && !global_part.advisor.is_unset() {
                         merged.advisor = global_part.advisor.clone();
@@ -481,21 +497,14 @@ impl AgentConfig {
             .map_err(|e| AgentError::Config(format!("cannot read dir '{}': {}", dir, e)))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| {
-                p.is_file()
-                    && p.extension().and_then(|s| s.to_str()) == Some("toml")
-            })
+            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("toml"))
             .collect();
         // Deterministic merge order.
         entries.sort();
 
         for entry in &entries {
             let content = std::fs::read_to_string(entry).map_err(|e| {
-                AgentError::Config(format!(
-                    "cannot read '{}': {}",
-                    entry.display(),
-                    e
-                ))
+                AgentError::Config(format!("cannot read '{}': {}", entry.display(), e))
             })?;
             let mut part = Self::parse(&content)?;
 
@@ -532,7 +541,11 @@ impl AgentConfig {
             merged.models.models.extend(part.models.models);
             // Tier maps: merge shallowly (last writer wins per key).
             if let Some(tiers) = part.models.tiers {
-                merged.models.tiers.get_or_insert_with(Default::default).extend(tiers);
+                merged
+                    .models
+                    .tiers
+                    .get_or_insert_with(Default::default)
+                    .extend(tiers);
             }
             if let Some(rt) = part.models.role_tiers {
                 let dst = merged
@@ -540,7 +553,9 @@ impl AgentConfig {
                     .role_tiers
                     .get_or_insert_with(Default::default);
                 for (role, tier_map) in rt {
-                    dst.entry(role).or_insert_with(Default::default).extend(tier_map);
+                    dst.entry(role)
+                        .or_insert_with(Default::default)
+                        .extend(tier_map);
                 }
             }
         }
@@ -550,16 +565,13 @@ impl AgentConfig {
 
     /// Parse config from TOML string.
     pub fn parse(content: &str) -> AgentResult<Self> {
-        toml::from_str(content).map_err(|e| {
-            AgentError::Config(format!("invalid TOML: {}", e))
-        })
+        toml::from_str(content).map_err(|e| AgentError::Config(format!("invalid TOML: {}", e)))
     }
 
     /// Save config to a TOML file path.
     pub fn save(&self, path: &str) -> AgentResult<()> {
-        let content = toml::to_string_pretty(self).map_err(|e| {
-            AgentError::Config(format!("serialization failed: {}", e))
-        })?;
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| AgentError::Config(format!("serialization failed: {}", e)))?;
         std::fs::write(path, content)?;
         Ok(())
     }
@@ -756,8 +768,8 @@ max_tokens = 384000
 tier = "budget"
 timeout_secs = 300
 "#;
-        let def: ModelDef = toml::from_str(toml)
-            .expect("legacy `model_name` field must deserialize via alias");
+        let def: ModelDef =
+            toml::from_str(toml).expect("legacy `model_name` field must deserialize via alias");
         assert_eq!(def.name, "deepseek-v4-pro");
         assert_eq!(def.provider, "deepseek");
         assert_eq!(def.context_window, 1_000_000);
@@ -858,7 +870,6 @@ model_tier = "standard"
             .lock()
             .unwrap();
 
-
         let tmp = std::env::temp_dir().join(format!(
             "latte_agent_test_home_{}_{:?}",
             std::process::id(),
@@ -939,8 +950,7 @@ icon = "A"
             )
             .unwrap();
 
-            let cfg =
-                AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            let cfg = AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
             assert_eq!(cfg.roles.len(), 2);
             assert!(cfg.roles.contains_key("pm"));
             assert!(cfg.roles.contains_key("architect"));
@@ -955,7 +965,10 @@ icon = "A"
     #[test]
     fn test_advisor_switch_parse_and_default() {
         // 未声明 → 默认开。
-        let cfg = AgentConfig::parse("[roles.pm]\nid=\"pm\"\nname=\"P\"\ncategory=\"c\"\nmodel_tier=\"standard\"\n").unwrap();
+        let cfg = AgentConfig::parse(
+            "[roles.pm]\nid=\"pm\"\nname=\"P\"\ncategory=\"c\"\nmodel_tier=\"standard\"\n",
+        )
+        .unwrap();
         assert!(cfg.advisor.enabled());
         // 显式 false。
         let cfg = AgentConfig::parse("[advisor]\nenabled = false\n").unwrap();
@@ -979,7 +992,11 @@ icon = "A"
         with_latte_home(|home| {
             let agents_dir = home.join("agents.d");
             std::fs::create_dir_all(&agents_dir).unwrap();
-            std::fs::write(agents_dir.join("advisor.toml"), "[advisor]\nenabled = true\n").unwrap();
+            std::fs::write(
+                agents_dir.join("advisor.toml"),
+                "[advisor]\nenabled = true\n",
+            )
+            .unwrap();
 
             // project false 覆盖 global true。
             let cfg = AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
@@ -995,7 +1012,11 @@ icon = "A"
         with_latte_home(|home| {
             let agents_dir = home.join("agents.d");
             std::fs::create_dir_all(&agents_dir).unwrap();
-            std::fs::write(agents_dir.join("advisor.toml"), "[advisor]\nenabled = false\n").unwrap();
+            std::fs::write(
+                agents_dir.join("advisor.toml"),
+                "[advisor]\nenabled = false\n",
+            )
+            .unwrap();
 
             let cfg = AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
             assert!(!cfg.advisor.enabled(), "project 未声明时 global 层应生效");
@@ -1044,7 +1065,10 @@ icon = "A"
         );
         assert_eq!(configured.delegate_review_timeout_secs(), 180);
         assert_eq!(configured.return_max_redo(), 2);
-        assert_eq!(configured.review_settings().delegate_review_timeout_secs, 180);
+        assert_eq!(
+            configured.review_settings().delegate_review_timeout_secs,
+            180
+        );
 
         // 越界一律钳住：配错不会把行为推到极端
         let insane = AdvisorSection {
@@ -1053,7 +1077,11 @@ icon = "A"
             return_max_redo: Some(99),
         };
         assert_eq!(insane.delegate_review_timeout_secs(), 10, "下限钳到 10s");
-        assert_eq!(insane.return_max_redo(), MAX_RETURN_REDO, "重做上限钳到硬顶");
+        assert_eq!(
+            insane.return_max_redo(),
+            MAX_RETURN_REDO,
+            "重做上限钳到硬顶"
+        );
         let huge = AdvisorSection {
             enabled: None,
             delegate_review_timeout_secs: Some(99_999),
@@ -1114,8 +1142,7 @@ icon = "G"
             )
             .unwrap();
 
-            let cfg =
-                AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
+            let cfg = AgentConfig::load_with_global(Some(project.to_str().unwrap())).unwrap();
             assert_eq!(cfg.roles.len(), 1);
             assert_eq!(cfg.roles["pm"].name, "PM_project");
             assert_eq!(cfg.roles["pm"].icon, "P");
@@ -1149,10 +1176,7 @@ icon = "G"
                 "manager",
                 "advisor",
             ] {
-                assert!(
-                    cfg.roles.contains_key(id),
-                    "missing built-in role '{id}'"
-                );
+                assert!(cfg.roles.contains_key(id), "missing built-in role '{id}'");
             }
         });
     }
@@ -1183,7 +1207,6 @@ icon = "P"
         });
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
 
     #[test]
     fn test_load_with_global_only_global() {
@@ -1253,14 +1276,19 @@ icon = "Q"
         let _cwd_guard = CwdGuard(prev_cwd);
         std::env::set_current_dir(&project).unwrap();
 
-        let resolved = ConfigLayer::Project.agents_dir()
+        let resolved = ConfigLayer::Project
+            .agents_dir()
             .expect("project agents_dir should resolve");
         assert!(
             resolved.ends_with("agents"),
             "expected no-`.d` layout, got {}",
             resolved.display()
         );
-        assert!(resolved.is_dir(), "{} should be a directory", resolved.display());
+        assert!(
+            resolved.is_dir(),
+            "{} should be a directory",
+            resolved.display()
+        );
 
         let _ = std::fs::remove_dir_all(&project);
     }
@@ -1301,14 +1329,19 @@ icon = "P"
         let _cwd_guard = CwdGuard(prev_cwd);
         std::env::set_current_dir(&project).unwrap();
 
-        let resolved = ConfigLayer::Project.agents_dir()
+        let resolved = ConfigLayer::Project
+            .agents_dir()
             .expect("project agents_dir should resolve");
         assert!(
             resolved.ends_with("agents.d"),
             "expected `.d` fallback, got {}",
             resolved.display()
         );
-        assert!(resolved.is_dir(), "{} should be a directory", resolved.display());
+        assert!(
+            resolved.is_dir(),
+            "{} should be a directory",
+            resolved.display()
+        );
 
         let _ = std::fs::remove_dir_all(&project);
     }

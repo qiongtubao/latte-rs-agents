@@ -21,7 +21,7 @@ use latte_ai::error::AiError;
 ///   / "应该换模型" / "用户需要修配置"）
 /// - 不携带可执行的元信息（不暴露 api_key、URL 含 key 等敏感字段）
 /// - 错误原文仍放在 `error_message: String` 里供离线诊断
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]  // no Eq: f64 fields
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)] // no Eq: f64 fields
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelErrorKind {
     /// HTTP 请求整体超时（reqwest `is_timeout()`）。
@@ -117,24 +117,38 @@ impl From<&AiError> for ModelErrorKind {
                 } else if req.is_connect() {
                     Self::ConnectFailed
                 } else {
-                    Self::Other { message: format!("http: {req}") }
+                    Self::Other {
+                        message: format!("http: {req}"),
+                    }
                 }
             }
             AiError::Api { status, message } => match *status {
                 401 | 403 => Self::Auth,
                 404 => Self::ModelNotFound,
-                429 => Self::RateLimited { retry_after_secs: 0.0 },
-                other => Self::Http { status: other, message: message.clone() },
-            }
-            AiError::RateLimited { retry_after, .. } =>
-                Self::RateLimited { retry_after_secs: *retry_after },
+                429 => Self::RateLimited {
+                    retry_after_secs: 0.0,
+                },
+                other => Self::Http {
+                    status: other,
+                    message: message.clone(),
+                },
+            },
+            AiError::RateLimited { retry_after, .. } => Self::RateLimited {
+                retry_after_secs: *retry_after,
+            },
             AiError::Auth(_) => Self::Auth,
             AiError::ModelNotFound(_) => Self::ModelNotFound,
             AiError::Stream(s) => Self::Stream { message: s.clone() },
-            AiError::Serde(err) => Self::Serde { message: err.to_string() },
+            AiError::Serde(err) => Self::Serde {
+                message: err.to_string(),
+            },
             AiError::Config(s) => Self::Config { message: s.clone() },
-            AiError::UnsupportedProvider(s) => Self::Config { message: format!("unsupported provider: {s}") },
-            AiError::Io(err) => Self::Other { message: format!("io: {err}") },
+            AiError::UnsupportedProvider(s) => Self::Config {
+                message: format!("unsupported provider: {s}"),
+            },
+            AiError::Io(err) => Self::Other {
+                message: format!("io: {err}"),
+            },
             AiError::Other(s) => Self::Other { message: s.clone() },
         }
     }
@@ -270,7 +284,11 @@ fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let month_lens = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 0usize;
     while month < 12 {
-        let ml = if month == 1 && is_leap(year) { 29 } else { month_lens[month] };
+        let ml = if month == 1 && is_leap(year) {
+            29
+        } else {
+            month_lens[month]
+        };
         if days >= ml {
             days -= ml;
             month += 1;
@@ -314,10 +332,7 @@ pub enum TraceEvent {
     },
     /// 流式增量：模型正在生成，逐 token 推送。仅在 stream 模式下发射。
     /// `ChatEventTraceSink` 映射为 `RoleTurn { is_complete: false }`。
-    ModelDelta {
-        meta: TraceMeta,
-        delta: String,
-    },
+    ModelDelta { meta: TraceMeta, delta: String },
     /// 慢模型调用提示：非流式 `chat` 超过阈值未返回时发射一次——
     /// 非流式下生成过程没有任何中间事件，慢速 trickle 在 UI 上与
     /// 卡死无法区分（日志事故：glm 大上下文慢生成 8 分钟，叠加
@@ -414,14 +429,14 @@ pub enum TraceEvent {
         meta: TraceMeta,
         checkpoint_id: u32,
         git_commit: String,
-        trigger_kind: String,        // "tool_write" | "explicit" | "pre_hazard"
+        trigger_kind: String, // "tool_write" | "explicit" | "pre_hazard"
         diff_summary: DiffSummary,
     },
     CheckpointRolledBack {
         meta: TraceMeta,
         checkpoint_id: u32,
-        mode: String,                // "code" | "trace" | "full"
-        rolled_back_to: String,      // git_commit SHA
+        mode: String,           // "code" | "trace" | "full"
+        rolled_back_to: String, // git_commit SHA
     },
     AskHuman {
         meta: TraceMeta,
@@ -768,7 +783,9 @@ impl JsonlSink {
             path,
         }
     }
-    pub fn path(&self) -> &PathBuf { &self.path }
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
 }
 /// Per-process registry of `Weak<Mutex<BufWriter<File>>>` keyed by path.
 /// `JsonlSink::new` looks up the existing writer here; if absent, it
@@ -779,13 +796,13 @@ impl JsonlSink {
 /// Without sharing the writer, multiple `JsonlSink` instances opening
 /// the same path each hold an independent `BufWriter`, and `\n`
 /// boundaries between events emitted by different sinks get lost.
-fn shared_writer_for(
-    path: PathBuf,
-) -> Arc<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>> {
+fn shared_writer_for(path: PathBuf) -> Arc<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>> {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Weak};
     static REGISTRY: LazyLock<
-        parking_lot::Mutex<HashMap<PathBuf, Weak<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>>>>
+        parking_lot::Mutex<
+            HashMap<PathBuf, Weak<parking_lot::Mutex<std::io::BufWriter<std::fs::File>>>>,
+        >,
     > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
     {
         let mut map = REGISTRY.lock();
@@ -814,8 +831,7 @@ impl TraceSink for JsonlSink {
     fn emit(&self, event: TraceEvent) {
         use std::io::Write;
         let mut guard = self.inner.lock();
-        let json = serde_json::to_string(&event)
-            .expect("TraceEvent serialization");
+        let json = serde_json::to_string(&event).expect("TraceEvent serialization");
         writeln!(guard, "{}", json).expect("JsonlSink write");
     }
 }
@@ -882,64 +898,184 @@ impl TraceEvent {
     }
     pub fn body_for_pretty(&self) -> String {
         match self {
-            TraceEvent::SessionStart { tier, model_chain, allowed_tools, .. } =>
-                format!("tier={} model_chain={:?} tools={:?}", tier, model_chain, allowed_tools),
-            TraceEvent::PromptBuilt { est_input_tokens, history_len, user_input, .. } =>
-                format!("est_input={} history_len={} user_input={}",
-                    est_input_tokens, history_len, user_input),
-            TraceEvent::ContextCompacted { removed_messages, est_tokens_before, est_tokens_after, .. } =>
-                format!("compacted removed={} est {} -> {}",
-                    removed_messages, est_tokens_before, est_tokens_after),
-            TraceEvent::ModelCall { model_id, latency_ms, finish_reason, .. } =>
-                format!("model={} latency={}ms finish={}", model_id, latency_ms, finish_reason),
-            TraceEvent::ModelRawOut { raw_content, .. } =>
-                format!("{}", raw_content),
-            TraceEvent::ModelDelta { delta, .. } =>
-                format!("delta: {}", delta),
-            TraceEvent::ModelCallSlow { model_id, elapsed_secs, .. } =>
-                format!("model={} slow>{}s", model_id, elapsed_secs),
-            TraceEvent::ParseToolCalls { parsed, diagnostics, .. } =>
-                format!("parsed={} opens={} matched={} unmatched={}",
-                    parsed.len(), diagnostics.opens_found, diagnostics.closes_matched, diagnostics.unmatched_opens.len()),
-            TraceEvent::ToolExec { name, args_json, latency_ms, status, .. } => {
+            TraceEvent::SessionStart {
+                tier,
+                model_chain,
+                allowed_tools,
+                ..
+            } => format!(
+                "tier={} model_chain={:?} tools={:?}",
+                tier, model_chain, allowed_tools
+            ),
+            TraceEvent::PromptBuilt {
+                est_input_tokens,
+                history_len,
+                user_input,
+                ..
+            } => format!(
+                "est_input={} history_len={} user_input={}",
+                est_input_tokens, history_len, user_input
+            ),
+            TraceEvent::ContextCompacted {
+                removed_messages,
+                est_tokens_before,
+                est_tokens_after,
+                ..
+            } => format!(
+                "compacted removed={} est {} -> {}",
+                removed_messages, est_tokens_before, est_tokens_after
+            ),
+            TraceEvent::ModelCall {
+                model_id,
+                latency_ms,
+                finish_reason,
+                ..
+            } => format!(
+                "model={} latency={}ms finish={}",
+                model_id, latency_ms, finish_reason
+            ),
+            TraceEvent::ModelRawOut { raw_content, .. } => format!("{}", raw_content),
+            TraceEvent::ModelDelta { delta, .. } => format!("delta: {}", delta),
+            TraceEvent::ModelCallSlow {
+                model_id,
+                elapsed_secs,
+                ..
+            } => format!("model={} slow>{}s", model_id, elapsed_secs),
+            TraceEvent::ParseToolCalls {
+                parsed,
+                diagnostics,
+                ..
+            } => format!(
+                "parsed={} opens={} matched={} unmatched={}",
+                parsed.len(),
+                diagnostics.opens_found,
+                diagnostics.closes_matched,
+                diagnostics.unmatched_opens.len()
+            ),
+            TraceEvent::ToolExec {
+                name,
+                args_json,
+                latency_ms,
+                status,
+                ..
+            } => {
                 let result_str = match status {
                     ToolStatus::Ok(s) => format!("ok: {}", s),
                     ToolStatus::Err(s) => format!("err: {}", s),
                 };
-                format!("name={}\n  args:  {}\n  result: {}\n  latency: {}ms",
-                    name, args_json, result_str, latency_ms)
+                format!(
+                    "name={}\n  args:  {}\n  result: {}\n  latency: {}ms",
+                    name, args_json, result_str, latency_ms
+                )
             }
-            TraceEvent::ToolRetry { name, attempt, kind, reason, recovered, .. } =>
-                format!("name={} attempt={} kind={} recovered={} reason={}",
-                    name, attempt, kind, recovered, reason),
-            TraceEvent::HookFired { hook_name, point, outcome_kind, .. } =>
-                format!("{} {:?} {}", hook_name, point, outcome_kind),
-            TraceEvent::TurnEnd { total_input, total_output, total_thinking, elapsed_ms, .. } =>
-                format!("in={} out={} think={} elapsed={}ms",
-                    total_input, total_output, total_thinking, elapsed_ms),
-            TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } =>
-                format!("turns={} in={} out={} think={}", total_turns, total_input, total_output, total_thinking),
-            TraceEvent::SessionStarted { task_id, roles, .. } =>
-                format!("task={} roles={}", task_id, roles.join(",")),
-            TraceEvent::SessionPaused { task_id, reason, turn, .. } =>
-                format!("task={} turn={} reason={}", task_id, turn, reason),
-            TraceEvent::SessionResumed { task_id, turn, .. } =>
-                format!("task={} turn={}", task_id, turn),
-            TraceEvent::RoleInjected { task_id, target_role, message_preview, .. } =>
-                format!("task={} -> {} preview={:?}", task_id, target_role, message_preview),
-            TraceEvent::AskHuman { task_id, role, question, .. } =>
-                format!("task={} role={} question={:?}", task_id, role, question),
-            TraceEvent::RoundStarted { task_id, round, roles, .. } =>
-                format!("task={} round={} roles=[{}]", task_id, round, roles.join(",")),
-            TraceEvent::RoundEnded { task_id, round, .. } =>
-                format!("task={} round={}", task_id, round),
-            TraceEvent::CheckpointCreated { checkpoint_id, git_commit, trigger_kind, diff_summary, .. } =>
-                format!("id={} commit={} trigger={} files={} +{}/-{}",
-                    checkpoint_id, git_commit, trigger_kind,
-                    diff_summary.files_changed, diff_summary.insertions, diff_summary.deletions),
-            TraceEvent::CheckpointRolledBack { checkpoint_id, mode, rolled_back_to, .. } =>
-                format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
-            TraceEvent::ModelCallFailed { model_id, attempt_index, latency_ms, error_kind, cooldown_secs, error_message, .. } => {
+            TraceEvent::ToolRetry {
+                name,
+                attempt,
+                kind,
+                reason,
+                recovered,
+                ..
+            } => format!(
+                "name={} attempt={} kind={} recovered={} reason={}",
+                name, attempt, kind, recovered, reason
+            ),
+            TraceEvent::HookFired {
+                hook_name,
+                point,
+                outcome_kind,
+                ..
+            } => format!("{} {:?} {}", hook_name, point, outcome_kind),
+            TraceEvent::TurnEnd {
+                total_input,
+                total_output,
+                total_thinking,
+                elapsed_ms,
+                ..
+            } => format!(
+                "in={} out={} think={} elapsed={}ms",
+                total_input, total_output, total_thinking, elapsed_ms
+            ),
+            TraceEvent::SessionEnd {
+                total_turns,
+                total_input,
+                total_output,
+                total_thinking,
+                ..
+            } => format!(
+                "turns={} in={} out={} think={}",
+                total_turns, total_input, total_output, total_thinking
+            ),
+            TraceEvent::SessionStarted { task_id, roles, .. } => {
+                format!("task={} roles={}", task_id, roles.join(","))
+            }
+            TraceEvent::SessionPaused {
+                task_id,
+                reason,
+                turn,
+                ..
+            } => format!("task={} turn={} reason={}", task_id, turn, reason),
+            TraceEvent::SessionResumed { task_id, turn, .. } => {
+                format!("task={} turn={}", task_id, turn)
+            }
+            TraceEvent::RoleInjected {
+                task_id,
+                target_role,
+                message_preview,
+                ..
+            } => format!(
+                "task={} -> {} preview={:?}",
+                task_id, target_role, message_preview
+            ),
+            TraceEvent::AskHuman {
+                task_id,
+                role,
+                question,
+                ..
+            } => format!("task={} role={} question={:?}", task_id, role, question),
+            TraceEvent::RoundStarted {
+                task_id,
+                round,
+                roles,
+                ..
+            } => format!(
+                "task={} round={} roles=[{}]",
+                task_id,
+                round,
+                roles.join(",")
+            ),
+            TraceEvent::RoundEnded { task_id, round, .. } => {
+                format!("task={} round={}", task_id, round)
+            }
+            TraceEvent::CheckpointCreated {
+                checkpoint_id,
+                git_commit,
+                trigger_kind,
+                diff_summary,
+                ..
+            } => format!(
+                "id={} commit={} trigger={} files={} +{}/-{}",
+                checkpoint_id,
+                git_commit,
+                trigger_kind,
+                diff_summary.files_changed,
+                diff_summary.insertions,
+                diff_summary.deletions
+            ),
+            TraceEvent::CheckpointRolledBack {
+                checkpoint_id,
+                mode,
+                rolled_back_to,
+                ..
+            } => format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
+            TraceEvent::ModelCallFailed {
+                model_id,
+                attempt_index,
+                latency_ms,
+                error_kind,
+                cooldown_secs,
+                error_message,
+                ..
+            } => {
                 let cooldown_str = match cooldown_secs {
                     Some(s) => format!("{}s", s),
                     None => "n/a".into(),
@@ -950,189 +1086,499 @@ impl TraceEvent {
                 } else {
                     error_message.clone()
                 };
-                format!("model={} attempt={} latency={}ms kind={} cooldown={} message={:?}",
-                    model_id, attempt_index, latency_ms, error_kind.label(),
-                    cooldown_str, msg)
+                format!(
+                    "model={} attempt={} latency={}ms kind={} cooldown={} message={:?}",
+                    model_id,
+                    attempt_index,
+                    latency_ms,
+                    error_kind.label(),
+                    cooldown_str,
+                    msg
+                )
             }
-            TraceEvent::ModelCooldownEntered { model_id, cooldown_secs, trigger_kind, .. } =>
-                format!("model={} cooldown={}s trigger={} hint=\"{}\"",
-                    model_id, cooldown_secs, trigger_kind.label(), trigger_kind.user_hint()),
-            TraceEvent::FallbackTriggered { from_model, to_model, reason, cause_kind, .. } => {
-                let cause = cause_kind.as_ref().map(|k| format!("cause={}", k.label())).unwrap_or_default();
-                format!("from={} -> to={:?} reason={:?} {}", from_model, to_model, reason, cause)
+            TraceEvent::ModelCooldownEntered {
+                model_id,
+                cooldown_secs,
+                trigger_kind,
+                ..
+            } => format!(
+                "model={} cooldown={}s trigger={} hint=\"{}\"",
+                model_id,
+                cooldown_secs,
+                trigger_kind.label(),
+                trigger_kind.user_hint()
+            ),
+            TraceEvent::FallbackTriggered {
+                from_model,
+                to_model,
+                reason,
+                cause_kind,
+                ..
+            } => {
+                let cause = cause_kind
+                    .as_ref()
+                    .map(|k| format!("cause={}", k.label()))
+                    .unwrap_or_default();
+                format!(
+                    "from={} -> to={:?} reason={:?} {}",
+                    from_model, to_model, reason, cause
+                )
             }
-         }
+        }
     }
     /// Metadata-only projection for IndexSink. Returns None for
     /// events that have no indexable information.
     pub fn to_index_line(&self) -> Option<IndexLine> {
         let meta = self.meta();
         Some(match self {
-            TraceEvent::SessionStart { tier, model_chain, allowed_tools, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::SessionStart {
+                tier,
+                model_chain,
+                allowed_tools,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "SessionStart".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("tier={} chain_len={} tools={}", tier, model_chain.len(), allowed_tools.len()),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "tier={} chain_len={} tools={}",
+                    tier,
+                    model_chain.len(),
+                    allowed_tools.len()
+                ),
             },
-            TraceEvent::ContextCompacted { removed_messages, est_tokens_before, est_tokens_after, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ContextCompacted {
+                removed_messages,
+                est_tokens_before,
+                est_tokens_after,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ContextCompacted".into(),
-                model_id: None, latency_ms: None,
-                tokens_in: Some(*est_tokens_after), tokens_out: None, tokens_think: None,
-                detail: format!("removed={} est {} -> {}", removed_messages, est_tokens_before, est_tokens_after),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: Some(*est_tokens_after),
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "removed={} est {} -> {}",
+                    removed_messages, est_tokens_before, est_tokens_after
+                ),
             },
-            TraceEvent::PromptBuilt { est_input_tokens, history_len, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::PromptBuilt {
+                est_input_tokens,
+                history_len,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "PromptBuilt".into(),
-                model_id: None, latency_ms: None,
-                tokens_in: Some(*est_input_tokens), tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: Some(*est_input_tokens),
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("history_len={}", history_len),
             },
-            TraceEvent::ModelCall { model_id, latency_ms, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ModelCall {
+                model_id,
+                latency_ms,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ModelCall".into(),
-                model_id: Some(model_id.clone()), latency_ms: Some(*latency_ms),
-                tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: Some(model_id.clone()),
+                latency_ms: Some(*latency_ms),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: String::new(),
             },
             TraceEvent::ModelRawOut { .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ModelRawOut".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: String::new(),
             },
             TraceEvent::ModelDelta { .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ModelDelta".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: String::new(),
             },
-            TraceEvent::ModelCallSlow { model_id, elapsed_secs, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ModelCallSlow {
+                model_id,
+                elapsed_secs,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ModelCallSlow".into(),
-                model_id: Some(model_id.clone()), latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: Some(model_id.clone()),
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("slow>{}s", elapsed_secs),
             },
-            TraceEvent::ParseToolCalls { parsed, diagnostics, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ParseToolCalls {
+                parsed,
+                diagnostics,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ParseToolCalls".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("parsed={} unmatched={}", parsed.len(), diagnostics.unmatched_opens.len()),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "parsed={} unmatched={}",
+                    parsed.len(),
+                    diagnostics.unmatched_opens.len()
+                ),
             },
-            TraceEvent::ToolExec { name, latency_ms, status, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ToolExec {
+                name,
+                latency_ms,
+                status,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ToolExec".into(),
-                model_id: None, latency_ms: Some(*latency_ms), tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("name={} status={}", name, match status { ToolStatus::Ok(_) => "ok", ToolStatus::Err(_) => "err" }),
+                model_id: None,
+                latency_ms: Some(*latency_ms),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "name={} status={}",
+                    name,
+                    match status {
+                        ToolStatus::Ok(_) => "ok",
+                        ToolStatus::Err(_) => "err",
+                    }
+                ),
             },
-            TraceEvent::ToolRetry { name, attempt, kind, recovered, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ToolRetry {
+                name,
+                attempt,
+                kind,
+                recovered,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ToolRetry".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("name={} attempt={} kind={} recovered={}", name, attempt, kind, recovered),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "name={} attempt={} kind={} recovered={}",
+                    name, attempt, kind, recovered
+                ),
             },
-            TraceEvent::HookFired { hook_name, point, outcome_kind, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::HookFired {
+                hook_name,
+                point,
+                outcome_kind,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "HookFired".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("hook={} point={:?} outcome={}", hook_name, point, outcome_kind),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "hook={} point={:?} outcome={}",
+                    hook_name, point, outcome_kind
+                ),
             },
-            TraceEvent::TurnEnd { total_input, total_output, total_thinking, elapsed_ms, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::TurnEnd {
+                total_input,
+                total_output,
+                total_thinking,
+                elapsed_ms,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "TurnEnd".into(),
-                model_id: None, latency_ms: Some(*elapsed_ms),
-                tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
+                model_id: None,
+                latency_ms: Some(*elapsed_ms),
+                tokens_in: Some(*total_input),
+                tokens_out: Some(*total_output),
+                tokens_think: Some(*total_thinking),
                 detail: String::new(),
             },
-            TraceEvent::SessionEnd { total_turns, total_input, total_output, total_thinking, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::SessionEnd {
+                total_turns,
+                total_input,
+                total_output,
+                total_thinking,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "SessionEnd".into(),
-                model_id: None, latency_ms: None,
-                tokens_in: Some(*total_input), tokens_out: Some(*total_output), tokens_think: Some(*total_thinking),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: Some(*total_input),
+                tokens_out: Some(*total_output),
+                tokens_think: Some(*total_thinking),
                 detail: format!("turns={}", total_turns),
             },
             TraceEvent::SessionStarted { task_id, roles, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "SessionStarted".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} roles={}", task_id, roles.len()),
             },
-            TraceEvent::SessionPaused { task_id, reason, turn, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::SessionPaused {
+                task_id,
+                reason,
+                turn,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "SessionPaused".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} turn={} reason={}", task_id, turn, reason),
             },
             TraceEvent::SessionResumed { task_id, turn, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "SessionResumed".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} turn={}", task_id, turn),
             },
-            TraceEvent::RoleInjected { task_id, target_role, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::RoleInjected {
+                task_id,
+                target_role,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "RoleInjected".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} target={}", task_id, target_role),
             },
-            TraceEvent::AskHuman { task_id, role, question, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::AskHuman {
+                task_id,
+                role,
+                question,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "AskHuman".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} role={} q_len={}", task_id, role, question.len()),
             },
-            TraceEvent::RoundStarted { task_id, round, roles, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::RoundStarted {
+                task_id,
+                round,
+                roles,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "RoundStarted".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} round={} roles={}", task_id, round, roles.len()),
             },
             TraceEvent::RoundEnded { task_id, round, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "RoundEnded".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("task={} round={}", task_id, round),
             },
-            TraceEvent::CheckpointCreated { checkpoint_id, git_commit, diff_summary, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::CheckpointCreated {
+                checkpoint_id,
+                git_commit,
+                diff_summary,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "CheckpointCreated".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("id={} commit={} files={} +{}/-{}",
-                    checkpoint_id, git_commit,
-                    diff_summary.files_changed, diff_summary.insertions, diff_summary.deletions),
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "id={} commit={} files={} +{}/-{}",
+                    checkpoint_id,
+                    git_commit,
+                    diff_summary.files_changed,
+                    diff_summary.insertions,
+                    diff_summary.deletions
+                ),
             },
-            TraceEvent::CheckpointRolledBack { checkpoint_id, mode, rolled_back_to, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::CheckpointRolledBack {
+                checkpoint_id,
+                mode,
+                rolled_back_to,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "CheckpointRolledBack".into(),
-                model_id: None, latency_ms: None, tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: None,
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("id={} mode={} -> {}", checkpoint_id, mode, rolled_back_to),
             },
-            TraceEvent::ModelCallFailed { model_id, attempt_index, latency_ms, error_kind, cooldown_secs, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ModelCallFailed {
+                model_id,
+                attempt_index,
+                latency_ms,
+                error_kind,
+                cooldown_secs,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ModelCallFailed".into(),
-                model_id: Some(model_id.clone()), latency_ms: Some(*latency_ms),
-                tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("attempt={} kind={} hint=\"{}\" cooldown={}",
-                    attempt_index, error_kind.label(), error_kind.user_hint(),
-                    match cooldown_secs { Some(s) => format!("{}s", s), None => "n/a".into() }),
+                model_id: Some(model_id.clone()),
+                latency_ms: Some(*latency_ms),
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "attempt={} kind={} hint=\"{}\" cooldown={}",
+                    attempt_index,
+                    error_kind.label(),
+                    error_kind.user_hint(),
+                    match cooldown_secs {
+                        Some(s) => format!("{}s", s),
+                        None => "n/a".into(),
+                    }
+                ),
             },
-            TraceEvent::ModelCooldownEntered { model_id, cooldown_secs, trigger_kind, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::ModelCooldownEntered {
+                model_id,
+                cooldown_secs,
+                trigger_kind,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "ModelCooldownEntered".into(),
-                model_id: Some(model_id.clone()), latency_ms: None,
-                tokens_in: None, tokens_out: None, tokens_think: None,
+                model_id: Some(model_id.clone()),
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
                 detail: format!("{}s trigger={}", cooldown_secs, trigger_kind.label()),
             },
-            TraceEvent::FallbackTriggered { from_model, to_model, reason, cause_kind, .. } => IndexLine {
-                turn: meta.turn, ts: meta.ts.clone(), role: meta.role.clone(),
+            TraceEvent::FallbackTriggered {
+                from_model,
+                to_model,
+                reason,
+                cause_kind,
+                ..
+            } => IndexLine {
+                turn: meta.turn,
+                ts: meta.ts.clone(),
+                role: meta.role.clone(),
                 kind: "FallbackTriggered".into(),
-                model_id: Some(from_model.clone()), latency_ms: None,
-                tokens_in: None, tokens_out: None, tokens_think: None,
-                detail: format!("-> {:?} reason={:?} cause={}",
-                    to_model, reason,
-                    cause_kind.as_ref().map(|k| k.label()).unwrap_or("none")),
+                model_id: Some(from_model.clone()),
+                latency_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_think: None,
+                detail: format!(
+                    "-> {:?} reason={:?} cause={}",
+                    to_model,
+                    reason,
+                    cause_kind.as_ref().map(|k| k.label()).unwrap_or("none")
+                ),
             },
-         })
+        })
     }
 }
 
@@ -1185,20 +1631,36 @@ impl StdoutSink {
     /// Construct a pretty sink bound to stdout. `use_color` is
     /// honored when the writer is a TTY.
     pub fn new(use_color: bool) -> Self {
-        Self { writer: parking_lot::Mutex::new(Box::new(std::io::stdout())), pretty: true, use_color }
+        Self {
+            writer: parking_lot::Mutex::new(Box::new(std::io::stdout())),
+            pretty: true,
+            use_color,
+        }
     }
     /// Construct a pretty sink with a caller-supplied writer.
     pub fn with_writer(w: impl std::io::Write + Send + 'static, use_color: bool) -> Self {
-        Self { writer: parking_lot::Mutex::new(Box::new(w)), pretty: true, use_color }
+        Self {
+            writer: parking_lot::Mutex::new(Box::new(w)),
+            pretty: true,
+            use_color,
+        }
     }
     /// Construct a JSONL sink bound to stdout. Each emitted event
     /// is one JSON object per line; `use_color` is ignored.
     pub fn new_jsonl() -> Self {
-        Self { writer: parking_lot::Mutex::new(Box::new(std::io::stdout())), pretty: false, use_color: false }
+        Self {
+            writer: parking_lot::Mutex::new(Box::new(std::io::stdout())),
+            pretty: false,
+            use_color: false,
+        }
     }
     /// Construct a JSONL sink with a caller-supplied writer.
     pub fn with_writer_jsonl(w: impl std::io::Write + Send + 'static) -> Self {
-        Self { writer: parking_lot::Mutex::new(Box::new(w)), pretty: false, use_color: false }
+        Self {
+            writer: parking_lot::Mutex::new(Box::new(w)),
+            pretty: false,
+            use_color: false,
+        }
     }
 }
 
@@ -1207,8 +1669,14 @@ impl TraceSink for StdoutSink {
         use std::io::Write;
         let mut guard = self.writer.lock();
         if self.pretty {
-            let _ = writeln!(guard, "─── turn {} · role={} · session={} · {} ───",
-                event.meta().turn, event.meta().role, event.meta().session_id, event.meta().ts);
+            let _ = writeln!(
+                guard,
+                "─── turn {} · role={} · session={} · {} ───",
+                event.meta().turn,
+                event.meta().role,
+                event.meta().session_id,
+                event.meta().ts
+            );
             let _ = writeln!(guard, "[{}]", event.variant_name());
             let body = event.body_for_pretty();
             for line in body.lines() {
@@ -1233,15 +1701,26 @@ impl IndexSink {
     pub fn new(path: PathBuf) -> Self {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                panic!("IndexSink: failed to create parent dir {}: {}", parent.display(), e);
+                panic!(
+                    "IndexSink: failed to create parent dir {}: {}",
+                    parent.display(),
+                    e
+                );
             }
         }
         let file = std::fs::OpenOptions::new()
-            .create(true).append(true).open(&path)
+            .create(true)
+            .append(true)
+            .open(&path)
             .expect("IndexSink open");
-        Self { inner: parking_lot::Mutex::new(std::io::BufWriter::new(file)), path }
+        Self {
+            inner: parking_lot::Mutex::new(std::io::BufWriter::new(file)),
+            path,
+        }
     }
-    pub fn path(&self) -> &PathBuf { &self.path }
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
 }
 
 impl TraceSink for IndexSink {
@@ -1251,7 +1730,7 @@ impl TraceSink for IndexSink {
         let index = event.to_index_line();
         if let Some(line) = index {
             let json = serde_json::to_string(&line).expect("index serialization");
-writeln!(guard, "{}", json).expect("IndexSink write");
+            writeln!(guard, "{}", json).expect("IndexSink write");
         }
     }
 }
@@ -1259,11 +1738,17 @@ writeln!(guard, "{}", json).expect("IndexSink write");
 /// Routes a single emit to N child sinks in order. Each child runs in
 /// the caller's thread (no async/spawning); sink implementations are
 /// expected to be cheap or internally-thread-safe.
-pub struct FanoutSink { sinks: Vec<std::sync::Arc<dyn TraceSink>> }
+pub struct FanoutSink {
+    sinks: Vec<std::sync::Arc<dyn TraceSink>>,
+}
 
 impl FanoutSink {
-    pub fn new(sinks: Vec<std::sync::Arc<dyn TraceSink>>) -> Self { Self { sinks } }
-    pub fn push(&mut self, s: std::sync::Arc<dyn TraceSink>) { self.sinks.push(s); }
+    pub fn new(sinks: Vec<std::sync::Arc<dyn TraceSink>>) -> Self {
+        Self { sinks }
+    }
+    pub fn push(&mut self, s: std::sync::Arc<dyn TraceSink>) {
+        self.sinks.push(s);
+    }
 }
 
 impl TraceSink for FanoutSink {
@@ -1290,7 +1775,9 @@ pub struct ScopedSink {
 }
 
 impl ScopedSink {
-    pub fn new(inner: std::sync::Arc<dyn TraceSink>, role: String) -> Self { Self { inner, role } }
+    pub fn new(inner: std::sync::Arc<dyn TraceSink>, role: String) -> Self {
+        Self { inner, role }
+    }
 }
 
 impl TraceSink for ScopedSink {
@@ -1494,20 +1981,30 @@ mod tests {
         let sink = JsonlSink::new(path.clone());
         sink.emit(TraceEvent::SessionEnd {
             meta: TraceMeta::test_default(),
-            total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
+            total_turns: 1,
+            total_input: 10,
+            total_output: 20,
+            total_thinking: 0,
         });
         sink.emit(TraceEvent::SessionEnd {
             meta: TraceMeta::test_default(),
-            total_turns: 2, total_input: 100, total_output: 200, total_thinking: 5,
+            total_turns: 2,
+            total_input: 100,
+            total_output: 200,
+            total_thinking: 5,
         });
-        drop(sink);  // flush BufWriter
+        drop(sink); // flush BufWriter
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2, "expected 2 JSONL lines, got: {:?}", content);
         // Each line must be valid JSON with a "SessionEnd" key
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert!(v.get("SessionEnd").is_some(), "line missing SessionEnd: {}", line);
+            assert!(
+                v.get("SessionEnd").is_some(),
+                "line missing SessionEnd: {}",
+                line
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1523,35 +2020,56 @@ mod tests {
     fn model_error_kind_struct_variants_serialize() {
         let cases = vec![
             (ModelErrorKind::Timeout, r#"{"kind":"timeout"}"#),
-            (ModelErrorKind::ConnectFailed, r#"{"kind":"connect_failed"}"#),
-            (ModelErrorKind::Auth, r#"{"kind":"auth"}"#),
-            (ModelErrorKind::ModelNotFound, r#"{"kind":"model_not_found"}"#),
             (
-                ModelErrorKind::RateLimited { retry_after_secs: 1.5 },
+                ModelErrorKind::ConnectFailed,
+                r#"{"kind":"connect_failed"}"#,
+            ),
+            (ModelErrorKind::Auth, r#"{"kind":"auth"}"#),
+            (
+                ModelErrorKind::ModelNotFound,
+                r#"{"kind":"model_not_found"}"#,
+            ),
+            (
+                ModelErrorKind::RateLimited {
+                    retry_after_secs: 1.5,
+                },
                 r#"{"kind":"rate_limited","retry_after_secs":1.5}"#,
             ),
             (
-                ModelErrorKind::Http { status: 503, message: "down".into() },
+                ModelErrorKind::Http {
+                    status: 503,
+                    message: "down".into(),
+                },
                 r#"{"kind":"http","status":503,"message":"down"}"#,
             ),
             (
-                ModelErrorKind::Stream { message: "sse died".into() },
+                ModelErrorKind::Stream {
+                    message: "sse died".into(),
+                },
                 r#"{"kind":"stream","message":"sse died"}"#,
             ),
             (
-                ModelErrorKind::Serde { message: "bad json".into() },
+                ModelErrorKind::Serde {
+                    message: "bad json".into(),
+                },
                 r#"{"kind":"serde","message":"bad json"}"#,
             ),
             (
-                ModelErrorKind::Config { message: "no api_key".into() },
+                ModelErrorKind::Config {
+                    message: "no api_key".into(),
+                },
                 r#"{"kind":"config","message":"no api_key"}"#,
             ),
             (
-                ModelErrorKind::CooldownHit { cooldown_remaining_secs: 10.0 },
+                ModelErrorKind::CooldownHit {
+                    cooldown_remaining_secs: 10.0,
+                },
                 r#"{"kind":"cooldown_hit","cooldown_remaining_secs":10.0}"#,
             ),
             (
-                ModelErrorKind::Other { message: "http: error decoding response body".into() },
+                ModelErrorKind::Other {
+                    message: "http: error decoding response body".into(),
+                },
                 r#"{"kind":"other","message":"http: error decoding response body"}"#,
             ),
         ];
@@ -1591,7 +2109,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let line = content.lines().next().expect("trace file empty");
         let v: serde_json::Value = serde_json::from_str(line)
- .unwrap_or_else(|e| panic!("trace jsonl unreadable: {} -- line: {}", e, line));
+            .unwrap_or_else(|e| panic!("trace jsonl unreadable: {} -- line: {}", e, line));
         // 关键不变量：error_kind.kind 字段是 "other"，message 字段保留原文，
         // 防止 someone 重新把 Other 改回 newtype variant 又 panic 一次。
         assert_eq!(v["ModelCallFailed"]["error_kind"]["kind"], "other");
@@ -1608,7 +2126,8 @@ mod tests {
         // don't interleave bytes. If the Mutex<BufWriter> ever regressed (e.g.
         // switched to per-call open/append), serde_json::from_str on each line
         // would fail because mid-line byte mixing produces invalid JSON.
-        let dir = std::env::temp_dir().join(format!("latte-test-concurrent-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("latte-test-concurrent-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("trace-concurrent.jsonl");
         let sink = std::sync::Arc::new(JsonlSink::new(path.clone()));
@@ -1635,24 +2154,36 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 100, "expected 100 JSONL lines, got: {}", lines.len());
+        assert_eq!(
+            lines.len(),
+            100,
+            "expected 100 JSONL lines, got: {}",
+            lines.len()
+        );
 
         // Each line must be valid JSON whose SessionEnd.total_turns matches
         // the originating thread index. Any byte-mixing between threads
         // would either fail JSON parsing or yield a total_turns value that
         // does not match any single thread index.
         for line in &lines {
-            let v: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| panic!("line not valid JSON (byte interleaving?): {} -- {}", line, e));
-            let se = v.get("SessionEnd")
+            let v: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!(
+                    "line not valid JSON (byte interleaving?): {} -- {}",
+                    line, e
+                )
+            });
+            let se = v
+                .get("SessionEnd")
                 .unwrap_or_else(|| panic!("line missing SessionEnd: {}", line));
-            let total_turns = se.get("total_turns")
+            let total_turns = se
+                .get("total_turns")
                 .and_then(|x| x.as_u64())
                 .expect("total_turns missing or not u64");
             assert!(
                 total_turns < 4,
                 "total_turns={} from a thread index 0..=3 — line is corrupt: {}",
-                total_turns, line
+                total_turns,
+                line
             );
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -1681,11 +2212,20 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 lines (1 prior + 1 new), got: {:?}", content);
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected 2 lines (1 prior + 1 new), got: {:?}",
+            content
+        );
         // The new (second) line must be the SessionEnd event we emitted.
-        let v: serde_json::Value = serde_json::from_str(lines[1])
-            .expect("second line not valid JSON");
-        assert!(v.get("SessionEnd").is_some(), "second line missing SessionEnd: {}", lines[1]);
+        let v: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("second line not valid JSON");
+        assert!(
+            v.get("SessionEnd").is_some(),
+            "second line missing SessionEnd: {}",
+            lines[1]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
     #[test]
@@ -1695,7 +2235,10 @@ mod tests {
         let sink = StdoutSink::with_writer(writer, false /* no color */);
         sink.emit(TraceEvent::SessionEnd {
             meta: TraceMeta::test_default(),
-            total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
+            total_turns: 1,
+            total_input: 10,
+            total_output: 20,
+            total_thinking: 0,
         });
         let out = String::from_utf8(buf.lock().clone()).unwrap();
         assert!(out.contains("SessionEnd"), "missing variant: {}", out);
@@ -1709,7 +2252,9 @@ mod tests {
             self.0.lock().extend_from_slice(b);
             Ok(b.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1718,7 +2263,8 @@ mod tests {
         // content-bearing variant (e.g. ModelRawOut) once that variant
         // lands. The current 2 variants (SessionStart, SessionEnd) carry
         // no payload fields, so this test only verifies on-disk write.
-        let dir = std::env::temp_dir().join(format!("latte-test-idx-{}-{}", std::process::id(), line!()));
+        let dir =
+            std::env::temp_dir().join(format!("latte-test-idx-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.idx");
         let sink = IndexSink::new(path.clone());
@@ -1726,7 +2272,10 @@ mod tests {
         meta.role = "manager".into();
         sink.emit(TraceEvent::SessionEnd {
             meta,
-            total_turns: 1, total_input: 10, total_output: 20, total_thinking: 0,
+            total_turns: 1,
+            total_input: 10,
+            total_output: 20,
+            total_thinking: 0,
         });
         drop(sink);
         let content = std::fs::read_to_string(&path).unwrap();
@@ -1737,7 +2286,9 @@ mod tests {
 
     struct PanickingSink;
     impl TraceSink for PanickingSink {
-        fn emit(&self, _event: TraceEvent) { panic!("intentional"); }
+        fn emit(&self, _event: TraceEvent) {
+            panic!("intentional");
+        }
     }
 
     #[test]
@@ -1751,7 +2302,10 @@ mod tests {
         let fan = FanoutSink::new(vec![bad, ok.clone()]);
         fan.emit(TraceEvent::SessionEnd {
             meta: TraceMeta::test_default(),
-            total_turns: 1, total_input: 1, total_output: 1, total_thinking: 0,
+            total_turns: 1,
+            total_input: 1,
+            total_output: 1,
+            total_thinking: 0,
         });
         assert_eq!(
             ok.0.lock().len(),
@@ -1767,7 +2321,10 @@ mod tests {
         let fan = FanoutSink::new(vec![s1.clone(), s2.clone()]);
         fan.emit(TraceEvent::SessionEnd {
             meta: TraceMeta::test_default(),
-            total_turns: 1, total_input: 1, total_output: 1, total_thinking: 0,
+            total_turns: 1,
+            total_input: 1,
+            total_output: 1,
+            total_thinking: 0,
         });
         assert_eq!(s1.0.lock().len(), 1);
         assert_eq!(s2.0.lock().len(), 1);
@@ -1782,7 +2339,10 @@ mod tests {
         meta.role = "WRONG".into();
         scoped.emit(TraceEvent::SessionEnd {
             meta,
-            total_turns: 1, total_input: 1, total_output: 1, total_thinking: 0,
+            total_turns: 1,
+            total_input: 1,
+            total_output: 1,
+            total_thinking: 0,
         });
         let captured = inner.0.lock();
         assert_eq!(captured.len(), 1);
@@ -1830,8 +2390,16 @@ mod tests {
             TraceEvent::ParseToolCalls {
                 meta: meta.clone(),
                 raw_in: "<tool_callexec> {\"command\": \"pwd\"}</tool_call>".into(),
-                parsed: vec![ParsedCall { id: "".into(), name: "exec".into(), args: "{}".into() }],
-                diagnostics: ParseDiag { opens_found: 1, closes_matched: 1, unmatched_opens: vec![] },
+                parsed: vec![ParsedCall {
+                    id: "".into(),
+                    name: "exec".into(),
+                    args: "{}".into(),
+                }],
+                diagnostics: ParseDiag {
+                    opens_found: 1,
+                    closes_matched: 1,
+                    unmatched_opens: vec![],
+                },
             },
             TraceEvent::ToolExec {
                 meta: meta.clone(),
@@ -1848,11 +2416,19 @@ mod tests {
             },
             TraceEvent::TurnEnd {
                 meta: meta.clone(),
-                total_input: 100, total_output: 200, total_thinking: 0, total_cache_read: 0, total_cache_write: 0, elapsed_ms: 5000,
+                total_input: 100,
+                total_output: 200,
+                total_thinking: 0,
+                total_cache_read: 0,
+                total_cache_write: 0,
+                elapsed_ms: 5000,
             },
             TraceEvent::SessionEnd {
                 meta,
-                total_turns: 3, total_input: 300, total_output: 600, total_thinking: 10,
+                total_turns: 3,
+                total_input: 300,
+                total_output: 600,
+                total_thinking: 10,
             },
         ];
         assert_eq!(events.len(), 9);
@@ -1861,15 +2437,21 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
             // Each variant serializes as a single-key object whose key
             // is the variant name. Verify the key matches variant_name().
-            let key = v.as_object().expect("object").keys().next().expect("one key").clone();
+            let key = v
+                .as_object()
+                .expect("object")
+                .keys()
+                .next()
+                .expect("one key")
+                .clone();
             assert_eq!(key, e.variant_name(), "variant_name mismatch for {}", key);
         }
     }
 
     #[test]
     fn checkpoint_variants_serde_round_trip() {
-        use crate::trace::{TraceEvent, TraceMeta, DiffSummary};
         use crate::checkpoint::{CheckpointTrigger, RollbackMode};
+        use crate::trace::{DiffSummary, TraceEvent, TraceMeta};
 
         let meta = TraceMeta {
             turn: 1,
@@ -1883,7 +2465,11 @@ mod tests {
             checkpoint_id: 1,
             git_commit: "abc123".into(),
             trigger_kind: "tool_write".into(),
-            diff_summary: DiffSummary { files_changed: 1, insertions: 5, deletions: 0 },
+            diff_summary: DiffSummary {
+                files_changed: 1,
+                insertions: 5,
+                deletions: 0,
+            },
         };
         let json = serde_json::to_string(&created).unwrap();
         let back: TraceEvent = serde_json::from_str(&json).unwrap();

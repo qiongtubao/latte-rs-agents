@@ -58,7 +58,9 @@ fn image_file_name() -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let mut x = millis
-        ^ (NAME_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ (NAME_COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15))
         ^ ((std::process::id() as u64) << 32);
     let mut suffix = String::with_capacity(6);
     for _ in 0..6 {
@@ -191,34 +193,40 @@ pub fn register_generate_image_tool(
     let input_schema = ToolInputSchema {
         schema_type: SchemaType,
         properties: vec![
-            ("prompt".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some("图片描述（画面内容、风格、构图）".into()),
-                enum_values: None,
-                minimum: None,
-                maximum: None,
-                min_length: None,
-                max_length: None,
-                items: None,
-                properties: None,
-                required: None,
-                additional_properties: None,
-                ref_: None,
-            }),
-            ("size".into(), ToolInputProperty {
-                property_type: PropertyType::String,
-                description: Some("尺寸，如 1024x1024".into()),
-                enum_values: None,
-                minimum: None,
-                maximum: None,
-                min_length: None,
-                max_length: None,
-                items: None,
-                properties: None,
-                required: None,
-                additional_properties: None,
-                ref_: None,
-            }),
+            (
+                "prompt".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some("图片描述（画面内容、风格、构图）".into()),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
+            (
+                "size".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: Some("尺寸，如 1024x1024".into()),
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                },
+            ),
         ]
         .into_iter()
         .collect(),

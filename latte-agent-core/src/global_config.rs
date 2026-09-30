@@ -126,11 +126,7 @@ impl GlobalConfig {
         if models_d.is_dir() {
             let mut entries: Vec<PathBuf> = std::fs::read_dir(&models_d)
                 .map_err(|e| {
-                    AgentError::Config(format!(
-                        "cannot read '{}': {}",
-                        models_d.display(),
-                        e
-                    ))
+                    AgentError::Config(format!("cannot read '{}': {}", models_d.display(), e))
                 })?
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -163,10 +159,7 @@ impl GlobalConfig {
             ))
         })?;
 
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
 
         match ext {
             "yaml" | "yml" => Self::parse_yaml(&content),
@@ -240,7 +233,10 @@ impl GlobalConfig {
         // new id → append. Then layer tier maps on top.
         merge_models(&mut self.models, &other.models);
         append_models(&mut self.models, &other.models);
-        merge_tier_map(self.tiers.get_or_insert_with(Default::default), &other.tiers);
+        merge_tier_map(
+            self.tiers.get_or_insert_with(Default::default),
+            &other.tiers,
+        );
     }
 
     /// Merge this global config into a project `AgentConfig`, then return
@@ -305,10 +301,7 @@ impl GlobalConfig {
                 .iter_mut()
                 .find(|m| &m.name == model_id)
                 .ok_or_else(|| {
-                    AgentError::Config(format!(
-                        "CLI override targets unknown model '{}'",
-                        model_id
-                    ))
+                    AgentError::Config(format!("CLI override targets unknown model '{}'", model_id))
                 })?;
             apply_field_override(model, field, value)?;
         }
@@ -325,9 +318,9 @@ fn apply_field_override(model: &mut ModelDef, field: &str, value: &str) -> Agent
         "provider" => model.provider = value.to_string(),
         "tier" => model.tier = Some(value.to_string()),
         "max_tokens" => {
-            model.max_tokens = value.parse().map_err(|e| {
-                AgentError::Config(format!("invalid max_tokens '{}': {}", value, e))
-            })?
+            model.max_tokens = value
+                .parse()
+                .map_err(|e| AgentError::Config(format!("invalid max_tokens '{}': {}", value, e)))?
         }
         "context_window" => {
             model.context_window = value.parse().map_err(|e| {
@@ -352,7 +345,10 @@ fn merge_models(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
     // Callers that want to accumulate (e.g. `merge_from` reading
     // multiple global config files) use [`append_models`] instead.
     for new_model in src {
-        if let Some(existing) = dst.iter_mut().find(|m| m.provider == new_model.provider && m.name == new_model.name) {
+        if let Some(existing) = dst
+            .iter_mut()
+            .find(|m| m.provider == new_model.provider && m.name == new_model.name)
+        {
             if is_unset(&existing.api_key) && !is_unset(&new_model.api_key) {
                 existing.api_key = new_model.api_key.clone();
             }
@@ -390,7 +386,10 @@ fn merge_models(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
 /// files (single-file + `models.d/*.yaml`) without losing any.
 fn append_models(dst: &mut Vec<ModelDef>, src: &[ModelDef]) {
     for new_model in src {
-        if !dst.iter().any(|m| m.provider == new_model.provider && m.name == new_model.name) {
+        if !dst
+            .iter()
+            .any(|m| m.provider == new_model.provider && m.name == new_model.name)
+        {
             dst.push(new_model.clone());
         }
     }
@@ -496,7 +495,10 @@ max_tokens = 8192
         let cfg = GlobalConfig::load_file(&path).unwrap();
         assert_eq!(cfg.models.len(), 1);
         let tiers = cfg.tiers.expect("tiers present");
-        assert_eq!(tiers.get("standard").map(String::as_str), Some("claude-sonnet"));
+        assert_eq!(
+            tiers.get("standard").map(String::as_str),
+            Some("claude-sonnet")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -543,8 +545,8 @@ models:
                     max_tokens: 256,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -569,8 +571,8 @@ models:
                 max_tokens: 256,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -605,8 +607,8 @@ models:
                     max_tokens: 256,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -631,8 +633,8 @@ models:
                 max_tokens: 256,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -668,8 +670,8 @@ models:
                     max_tokens: 8192,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -694,8 +696,8 @@ models:
                 max_tokens: 384000,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -724,8 +726,8 @@ models:
                 max_tokens: 256,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -769,8 +771,8 @@ models:
                 max_tokens: 256,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -790,4 +792,3 @@ models:
         assert!(format!("{err}").contains("unknown override field 'frobnicate'"));
     }
 }
-

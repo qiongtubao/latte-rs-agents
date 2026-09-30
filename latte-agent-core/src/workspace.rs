@@ -2,10 +2,10 @@
 //!
 //! See `docs/superpowers/specs/2026-06-27-blackboard-worktree-sandbox-design.md` §4.3-§5.
 
-use std::path::{Path, PathBuf};
-use std::fs;
-use std::process::Command;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -48,7 +48,9 @@ pub enum MergeMode {
 }
 
 impl Default for MergeMode {
-    fn default() -> Self { MergeMode::NoFf }
+    fn default() -> Self {
+        MergeMode::NoFf
+    }
 }
 
 impl WorktreeSpec {
@@ -68,20 +70,28 @@ pub struct Blackboard {
 }
 
 impl Blackboard {
-    pub fn new(path: PathBuf) -> Self { Self { path } }
-    pub fn path(&self) -> &Path { &self.path }
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 
     pub fn read(&self) -> Result<String, WorkspaceError> {
         Ok(fs::read_to_string(&self.path)?)
     }
 
     pub fn write(&self, content: &str) -> Result<(), WorkspaceError> {
-        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(&self.path, content)?;
         Ok(())
     }
 
-    pub fn exists(&self) -> bool { self.path.exists() }
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
 }
 
 #[cfg(test)]
@@ -93,9 +103,15 @@ mod tests {
     fn derive_paths_places_worktree_under_latte_dir() {
         let repo = PathBuf::from("/tmp/fake-repo");
         let (wt, branch, bb) = WorktreeSpec::derive_paths(&repo, "fix-redis-bug");
-        assert_eq!(wt, PathBuf::from("/tmp/fake-repo/.latte/worktrees/fix-redis-bug"));
+        assert_eq!(
+            wt,
+            PathBuf::from("/tmp/fake-repo/.latte/worktrees/fix-redis-bug")
+        );
         assert_eq!(branch, "latte/fix-redis-bug");
-        assert_eq!(bb, PathBuf::from("/tmp/fake-repo/.latte/worktrees/fix-redis-bug/plan.md"));
+        assert_eq!(
+            bb,
+            PathBuf::from("/tmp/fake-repo/.latte/worktrees/fix-redis-bug/plan.md")
+        );
     }
 
     #[test]
@@ -108,7 +124,6 @@ mod tests {
         assert_eq!(bb.read().unwrap(), "# Hello\n");
     }
 }
-
 
 fn git_cmd(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
     let out = Command::new("git")
@@ -133,10 +148,18 @@ pub struct WorkspaceManager {
 }
 
 impl WorkspaceManager {
-    pub fn spec(&self) -> &WorktreeSpec { &self.spec }
-    pub fn state(&self) -> &WorkspaceState { &self.state }
-    pub fn blackboard(&self) -> &Blackboard { &self.blackboard }
-    pub fn repo_root(&self) -> &Path { &self.repo_root }
+    pub fn spec(&self) -> &WorktreeSpec {
+        &self.spec
+    }
+    pub fn state(&self) -> &WorkspaceState {
+        &self.state
+    }
+    pub fn blackboard(&self) -> &Blackboard {
+        &self.blackboard
+    }
+    pub fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
 
     /// Resolve the current git repo root. Errors with `NotARepo` if
     /// `git rev-parse --show-toplevel` fails or returns empty.
@@ -160,11 +183,7 @@ impl WorkspaceManager {
 
     /// Create the worktree, branch, and blackboard. Initial state is
     /// `Created`. Checkpoint 0 is recorded in this step; see Task 3.2.
-    pub fn create(
-        cwd: &Path,
-        task_id: &str,
-        initial_prompt: &str,
-    ) -> Result<Self, WorkspaceError> {
+    pub fn create(cwd: &Path, task_id: &str, initial_prompt: &str) -> Result<Self, WorkspaceError> {
         let repo_root = Self::resolve_repo_root(cwd)?;
         let base_branch = Self::resolve_base_branch(cwd)?;
         let (worktree_root, branch_name, blackboard_path) =
@@ -178,7 +197,14 @@ impl WorkspaceManager {
 
         git_cmd(
             &repo_root,
-            &["worktree", "add", "-b", &branch_name, worktree_root.to_str().unwrap(), &base_branch],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                worktree_root.to_str().unwrap(),
+                &base_branch,
+            ],
         )?;
 
         // Drop a .gitignore so the worktree's own .latte/ (checkpoints,
@@ -201,7 +227,13 @@ impl WorkspaceManager {
         )?;
 
         Ok(Self {
-            spec: WorktreeSpec { task_id: task_id.into(), base_branch, worktree_root, branch_name, blackboard_path },
+            spec: WorktreeSpec {
+                task_id: task_id.into(),
+                base_branch,
+                worktree_root,
+                branch_name,
+                blackboard_path,
+            },
             repo_root,
             blackboard,
             state: WorkspaceState::Created,
@@ -242,12 +274,16 @@ impl WorkspaceManager {
         if let Err(e) = res {
             // Try to abort the merge so the main branch isn't left mid-merge.
             let _ = git_cmd(&self.repo_root, &["merge", "--abort"]);
-            self.state = WorkspaceState::Failed { reason: e.to_string() };
+            self.state = WorkspaceState::Failed {
+                reason: e.to_string(),
+            };
             return Err(e);
         }
 
         let merge_commit = git_cmd(&self.repo_root, &["rev-parse", "HEAD"])?;
-        self.state = WorkspaceState::Archived { merge_commit: merge_commit.clone() };
+        self.state = WorkspaceState::Archived {
+            merge_commit: merge_commit.clone(),
+        };
         Ok(merge_commit)
     }
     /// Best-effort: remove the worktree directory and delete the
@@ -256,7 +292,15 @@ impl WorkspaceManager {
     pub fn cleanup(&mut self) -> Result<(), WorkspaceError> {
         // Remove the worktree
         if self.spec.worktree_root.exists() {
-            if let Err(e) = git_cmd(&self.repo_root, &["worktree", "remove", "--force", self.spec.worktree_root.to_str().unwrap()]) {
+            if let Err(e) = git_cmd(
+                &self.repo_root,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    self.spec.worktree_root.to_str().unwrap(),
+                ],
+            ) {
                 eprintln!("[workspace] worktree remove failed: {}", e);
                 // Fall back to manual removal
                 let _ = std::fs::remove_dir_all(&self.spec.worktree_root);
@@ -264,7 +308,10 @@ impl WorkspaceManager {
         }
         // Delete the branch (may already be gone, that's fine)
         if let Err(e) = git_cmd(&self.repo_root, &["branch", "-D", &self.spec.branch_name]) {
-            eprintln!("[workspace] branch delete failed (ok if already gone): {}", e);
+            eprintln!(
+                "[workspace] branch delete failed (ok if already gone): {}",
+                e
+            );
         }
         // Prune worktree bookkeeping
         let _ = git_cmd(&self.repo_root, &["worktree", "prune"]);

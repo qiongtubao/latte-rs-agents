@@ -44,12 +44,7 @@ pub fn should_intervene(context: &ToolFixContext) -> bool {
 }
 
 /// Build the `ChatEvent` that the frontend renders as a fix popup.
-pub fn build_fix_event(
-    role_id: &str,
-    choice_id: &str,
-    req: &FixRequest,
-    wait: bool,
-) -> ChatEvent {
+pub fn build_fix_event(role_id: &str, choice_id: &str, req: &FixRequest, wait: bool) -> ChatEvent {
     ChatEvent::ToolFixRequested {
         role_id: role_id.to_string(),
         choice_id: choice_id.to_string(),

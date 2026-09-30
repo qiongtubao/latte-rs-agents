@@ -12,10 +12,10 @@
 //! key=value payload. Plain text + structured fields, no external
 //! dependency on a logging framework.
 
+use latte_agent_core::config::ConfigLayer;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use latte_agent_core::config::ConfigLayer;
 
 /// A session-scoped log file. The `Drop` impl flushes any pending
 /// writes; the mutex serializes concurrent writes from the REPL loop
@@ -32,23 +32,30 @@ impl ChatLog {
     pub fn open() -> Self {
         let dir = match global_log_dir() {
             Some(d) => d,
-            None => return Self { file: None, path: None },
+            None => {
+                return Self {
+                    file: None,
+                    path: None,
+                }
+            }
         };
         if let Err(e) = std::fs::create_dir_all(&dir) {
             eprintln!("chatlog: cannot create {}: {}", dir.display(), e);
-            return Self { file: None, path: None };
+            return Self {
+                file: None,
+                path: None,
+            };
         }
-        let name = format!(
-            "chat-{}-{}.log",
-            iso_local_date_time(),
-            std::process::id()
-        );
+        let name = format!("chat-{}-{}.log", iso_local_date_time(), std::process::id());
         let path = dir.join(name);
         let file = match std::fs::File::create(&path) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("chatlog: cannot create {}: {}", path.display(), e);
-                return Self { file: None, path: None };
+                return Self {
+                    file: None,
+                    path: None,
+                };
             }
         };
         Self {
@@ -212,7 +219,11 @@ fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let month_lens = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 0usize;
     while month < 12 {
-        let ml = if month == 1 && is_leap(year) { 29 } else { month_lens[month] };
+        let ml = if month == 1 && is_leap(year) {
+            29
+        } else {
+            month_lens[month]
+        };
         if days >= ml {
             days -= ml;
             month += 1;
@@ -220,7 +231,14 @@ fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
             break;
         }
     }
-    (year as u32, month as u32 + 1, days as u32 + 1, hour, min, sec)
+    (
+        year as u32,
+        month as u32 + 1,
+        days as u32 + 1,
+        hour,
+        min,
+        sec,
+    )
 }
 
 fn is_leap(y: i64) -> bool {

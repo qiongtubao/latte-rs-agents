@@ -44,8 +44,12 @@ pub const SUMMARY_CLOSE_TAG: &str = "</compacted-summary>";
 /// 触发压缩的上下文占用比例（默认 0.8 = 用到窗口 80%）。
 ///
 /// 取 0.8 与 deepseek-harness 的 `DEFAULT_THRESHOLD_RATIO` 一致：留 20%
-/// 余量给「本轮还要发生的输出 + 工具结果」，否则刚压完就又撞窗口。
-const DEFAULT_THRESHOLD_RATIO: f64 = 0.8;
+///
+/// 同一比例也被 workflow 的动态 prompt 预算复用
+/// （`workflow::resolve_prompt_budget` 在 step 只开
+/// `context_overflow_restart` 而未显式配预算时的默认值）——两处都是
+/// 「一个请求该占用窗口多少」这同一个问题的答案，不该各写一个魔数。
+pub(crate) const DEFAULT_THRESHOLD_RATIO: f64 = 0.8;
 /// 保留**逐字原文**的尾部轮数（默认 2）。
 ///
 /// 对齐 opencode 的 `DEFAULT_TAIL_TURNS`。保留的是最近的完整往返，让模型
@@ -308,14 +312,20 @@ pub fn select_compaction_end(messages: &[Message], keep_recent_turns: usize) -> 
 /// 7 段多了 "Errors and Fixes"，对编码 agent 很关键——踩过的坑不该在压缩
 /// 后重新踩一遍）。可通过 [`summary_template_sections`] 定制。
 pub const DEFAULT_TEMPLATE_SECTIONS: &[(&str, &str)] = &[
-    ("Primary Request and Intent", "用户最初与演进中的目标；措辞关键处原样引用"),
+    (
+        "Primary Request and Intent",
+        "用户最初与演进中的目标；措辞关键处原样引用",
+    ),
     ("Key Technical Concepts", "涉及的技术、框架、模式与约定"),
     ("Files and Code", "精确路径：为什么重要、关键改动或片段"),
     ("Errors and Fixes", "报错：怎么解决的，以及相关的用户反馈"),
     ("Pending Jobs", "明确要求但尚未完成的工作"),
     ("Current Work", "此 checkpoint 时点正在进行的事"),
     ("Next Step", "紧接最近一次请求的下一个动作，或「(none)」"),
-    ("Critical Context", "决策与其理由、约束、用户偏好、待解问题、继续所需的数据"),
+    (
+        "Critical Context",
+        "决策与其理由、约束、用户偏好、待解问题、继续所需的数据",
+    ),
 ];
 
 /// 解析摘要模板段落，优先级 **环境变量 > 配置段 > 内置 8 段**。
@@ -541,7 +551,10 @@ mod tests {
 
     #[test]
     fn disabled_policy_never_compacts() {
-        let p = CompactionPolicy { enabled: false, ..Default::default() };
+        let p = CompactionPolicy {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(!p.should_compact(999_999, 1000));
     }
 
@@ -552,10 +565,14 @@ mod tests {
         // 4 轮对话，保留最近 2 轮 → 压掉前 2 轮。
         let msgs = vec![
             sys("role"),
-            user("u1"), asst("a1"),
-            user("u2"), asst("a2"),
-            user("u3"), asst("a3"),
-            user("u4"), asst("a4"),
+            user("u1"),
+            asst("a1"),
+            user("u2"),
+            asst("a2"),
+            user("u3"),
+            asst("a3"),
+            user("u4"),
+            asst("a4"),
         ];
         let end = select_compaction_end(&msgs, 2).expect("应有可压区间");
         // 保留 u3/a3/u4/a4 → 切点在 u3 之前（下标 5）。
@@ -607,7 +624,11 @@ mod tests {
         ];
         let end = select_compaction_end(&msgs, 2).expect("有区间");
         // 切点前一条不能是 Tool，也不能是带 tool_calls 的 assistant。
-        assert_ne!(msgs[end - 1].role, Role::Tool, "切点不能紧跟在 tool_result 后断开配对");
+        assert_ne!(
+            msgs[end - 1].role,
+            Role::Tool,
+            "切点不能紧跟在 tool_result 后断开配对"
+        );
         assert!(
             msgs[end - 1].tool_calls.is_none(),
             "切点不能把带 tool_calls 的 assistant 与它的结果分开"
@@ -620,7 +641,10 @@ mod tests {
     fn default_template_has_eight_sections() {
         assert_eq!(DEFAULT_TEMPLATE_SECTIONS.len(), 8);
         let titles: Vec<&str> = DEFAULT_TEMPLATE_SECTIONS.iter().map(|(t, _)| *t).collect();
-        assert!(titles.contains(&"Errors and Fixes"), "编码 agent 必须留这一节: {titles:?}");
+        assert!(
+            titles.contains(&"Errors and Fixes"),
+            "编码 agent 必须留这一节: {titles:?}"
+        );
         assert!(titles.contains(&"Next Step"));
     }
 
@@ -631,7 +655,10 @@ mod tests {
         for (title, _) in &sections {
             assert!(text.contains(&format!("## {title}")), "缺段落 {title}");
         }
-        assert!(text.contains(SUMMARY_OPEN_TAG), "必须给出合并旧 checkpoint 的规则");
+        assert!(
+            text.contains(SUMMARY_OPEN_TAG),
+            "必须给出合并旧 checkpoint 的规则"
+        );
         assert!(text.contains("(none)"), "空节要写 (none) 而不是删掉");
     }
 

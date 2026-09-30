@@ -318,7 +318,10 @@ pub fn visible_window(text: &str, cursor_chars: usize, width: usize) -> (String,
         vis.push(c);
         vw += cw;
     }
-    let col: usize = chars[start..cursor_chars].iter().map(|c| char_width(*c)).sum();
+    let col: usize = chars[start..cursor_chars]
+        .iter()
+        .map(|c| char_width(*c))
+        .sum();
     (vis, col)
 }
 
@@ -663,13 +666,33 @@ pub fn apply_key(buf: &mut EditBuffer, key: crossterm::event::KeyEvent) -> KeyOu
     match key.code {
         KeyCode::Enter => KeyOutcome::Submit(buf.take()),
         KeyCode::Backspace => {
-            if buf.backspace() { KeyOutcome::Redraw } else { KeyOutcome::Ignored }
+            if buf.backspace() {
+                KeyOutcome::Redraw
+            } else {
+                KeyOutcome::Ignored
+            }
         }
         KeyCode::Delete => {
-            if buf.delete() { KeyOutcome::Redraw } else { KeyOutcome::Ignored }
+            if buf.delete() {
+                KeyOutcome::Redraw
+            } else {
+                KeyOutcome::Ignored
+            }
         }
-        KeyCode::Left => if buf.left() { KeyOutcome::Redraw } else { KeyOutcome::Ignored },
-        KeyCode::Right => if buf.right() { KeyOutcome::Redraw } else { KeyOutcome::Ignored },
+        KeyCode::Left => {
+            if buf.left() {
+                KeyOutcome::Redraw
+            } else {
+                KeyOutcome::Ignored
+            }
+        }
+        KeyCode::Right => {
+            if buf.right() {
+                KeyOutcome::Redraw
+            } else {
+                KeyOutcome::Ignored
+            }
+        }
         // ↑/↓ 不在这里改缓冲：历史状态归 `InputHistory`，由调用方套用，
         // 这样 apply_key 保持"只动缓冲"的纯粹性。
         KeyCode::Up => KeyOutcome::HistoryPrev,
@@ -703,7 +726,11 @@ pub fn apply_key(buf: &mut EditBuffer, key: crossterm::event::KeyEvent) -> KeyOu
             KeyOutcome::Redraw
         }
         KeyCode::Char('w') if ctrl => {
-            if buf.delete_word_left() { KeyOutcome::Redraw } else { KeyOutcome::Ignored }
+            if buf.delete_word_left() {
+                KeyOutcome::Redraw
+            } else {
+                KeyOutcome::Ignored
+            }
         }
         KeyCode::Char('a') if ctrl => {
             buf.home();
@@ -988,7 +1015,11 @@ mod tests {
         assert_eq!(h.prev("").as_deref(), Some("b"));
         assert_eq!(h.prev("").as_deref(), Some("a"));
         h.push("c");
-        assert_eq!(h.prev("").as_deref(), Some("c"), "提交后应从最新一条重新开始");
+        assert_eq!(
+            h.prev("").as_deref(),
+            Some("c"),
+            "提交后应从最新一条重新开始"
+        );
     }
 
     #[test]
@@ -1031,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn pasted_cjk_is_preserved(){
+    fn pasted_cjk_is_preserved() {
         assert_eq!(
             normalize_pasted("读一下\nsrc/main.rs"),
             "读一下 src/main.rs"
@@ -1085,7 +1116,11 @@ mod tests {
         // ECMA-48：CUU 参数为 0 时按 1 处理，所以 `\x1b[0A` 会真的上移
         // 一行、吃掉一行历史。实机在伪终端里抓到过这条序列。
         assert_eq!(viewport_move_up(0), 0, "没画过就不该移动");
-        assert_eq!(viewport_move_up(1), 0, "只有输入行时光标已在顶，不能下发 MoveUp");
+        assert_eq!(
+            viewport_move_up(1),
+            0,
+            "只有输入行时光标已在顶，不能下发 MoveUp"
+        );
         assert_eq!(viewport_move_up(2), 1, "状态行 + 输入行 → 上移 1");
         assert_eq!(viewport_move_up(3), 2);
     }

@@ -50,7 +50,7 @@ pub fn chat_event_to_frontend_json(ev: &ChatEvent) -> Result<String, String> {
             // variants can't reach this branch because they serialize
             // to a bare string (handled below).
             let mut out = serde_json::Map::with_capacity(
-                1 + fields.as_object().map(|m| m.len()).unwrap_or(0)
+                1 + fields.as_object().map(|m| m.len()).unwrap_or(0),
             );
             out.insert("type".to_string(), serde_json::Value::String(variant_name));
             if let serde_json::Value::Object(inner) = fields {
@@ -63,9 +63,10 @@ pub fn chat_event_to_frontend_json(ev: &ChatEvent) -> Result<String, String> {
         // Unit variant: ChatEvent::Done → bare string `"Done"`.
         // We wrap it as `{"type":"Done"}` to match the TS discriminated
         // union shape (every other case uses the same envelope).
-        serde_json::Value::String(variant_name) => {
-            Ok(format!(r#"{{"type":{}}}"#, serde_json::to_string(&variant_name).map_err(|e| e.to_string())?))
-        }
+        serde_json::Value::String(variant_name) => Ok(format!(
+            r#"{{"type":{}}}"#,
+            serde_json::to_string(&variant_name).map_err(|e| e.to_string())?
+        )),
         // Anything else is a contract bug — surface it instead of
         // silently dropping the event (which is what triggered the
         // original `[chat] unknown event` bug).
@@ -83,7 +84,9 @@ mod tests {
     /// 这是协议适配层的关键测试 — 改坏会触发 [chat] unknown event。
     #[test]
     fn chat_event_to_frontend_json_handles_status_with_message() {
-        let ev = ChatEvent::Status { message: "[calling LLM...]".into() };
+        let ev = ChatEvent::Status {
+            message: "[calling LLM...]".into(),
+        };
         let json = chat_event_to_frontend_json(&ev).expect("convert");
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
         // 外层 key = type
@@ -91,12 +94,18 @@ mod tests {
         // 字段被平铺到外层
         assert_eq!(v["message"], "[calling LLM...]");
         // 不能残留旧的 "Status" 外层对象
-        assert!(v.get("Status").is_none(), "stale externally-tagged object leaked: {}", v);
+        assert!(
+            v.get("Status").is_none(),
+            "stale externally-tagged object leaked: {}",
+            v
+        );
     }
 
     #[test]
     fn chat_event_to_frontend_json_handles_user_message() {
-        let ev = ChatEvent::UserMessage { text: "分析一下 Cargo.toml".into() };
+        let ev = ChatEvent::UserMessage {
+            text: "分析一下 Cargo.toml".into(),
+        };
         let json = chat_event_to_frontend_json(&ev).expect("convert");
         let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
         assert_eq!(v["type"], "UserMessage");
@@ -114,7 +123,12 @@ mod tests {
         // Done 是 unit variant —— 序列化是 `{"Done":null}`。
         // 转换后只有 `type` 字段，没有额外字段。
         assert_eq!(v["type"], "Done");
-        assert_eq!(v.as_object().unwrap().len(), 1, "Done should be a single-field object, got {}", v);
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            1,
+            "Done should be a single-field object, got {}",
+            v
+        );
     }
 
     #[test]
@@ -141,31 +155,139 @@ mod tests {
     #[test]
     fn chat_event_to_frontend_json_every_variant_has_type_field() {
         let cases: Vec<(&str, ChatEvent)> = vec![
-            ("Status", ChatEvent::Status { message: "x".into() }),
+            (
+                "Status",
+                ChatEvent::Status {
+                    message: "x".into(),
+                },
+            ),
             ("UserMessage", ChatEvent::UserMessage { text: "hi".into() }),
-            ("Paused", ChatEvent::Paused { reason: "ask_human".into() }),
+            (
+                "Paused",
+                ChatEvent::Paused {
+                    reason: "ask_human".into(),
+                },
+            ),
             ("Resumed", ChatEvent::Resumed),
             ("RoundStarted", ChatEvent::RoundStarted { round: 1 }),
             ("RoundEnded", ChatEvent::RoundEnded { round: 1 }),
             ("Done", ChatEvent::Done),
-            ("Error", ChatEvent::Error { kind: None, message: "boom".into(), sub_id: None }),
+            (
+                "Error",
+                ChatEvent::Error {
+                    kind: None,
+                    message: "boom".into(),
+                    sub_id: None,
+                },
+            ),
             ("ContextCleared", ChatEvent::ContextCleared),
-            ("ToolUse", ChatEvent::ToolUse { role_id: "m".into(), tool_name: "read".into(), args: "{}".into(), sub_id: None }),
-            ("ToolResult", ChatEvent::ToolResult { role_id: "m".into(), tool_name: "read".into(), result: "ok".into(), sub_id: None }),
-            ("ToolError", ChatEvent::ToolError { role_id: "m".into(), tool_name: "read".into(), error: "fail".into(), sub_id: None }),
-            ("RoleStarted", ChatEvent::RoleStarted { role_id: "m".into(), detail: "calling LLM".into(), sub_id: None }),
-            ("RoleFinished", ChatEvent::RoleFinished { role_id: "m".into(), detail: "ok".into(), sub_id: None }),
-            ("RolePaused", ChatEvent::RolePaused { role_id: "programmer".into() }),
-            ("RoleResumed", ChatEvent::RoleResumed { role_id: "programmer".into() }),
-            ("DelegateStarted", ChatEvent::DelegateStarted { from_role: "manager".into(), to_role: "programmer".into(), task: "ping".into(), sub_id: "x".into(), wf_id: None }),
-            ("DelegateFinished", ChatEvent::DelegateFinished { from_role: "manager".into(), to_role: "programmer".into(), status: "ok".into(), summary: "done".into(), sub_id: "x".into(), wf_id: None }),
-            ("SessionInfo", ChatEvent::SessionInfo { task_id: "ui-1".into(), state: "running".into(), turn: 0, roles: vec![RoleInfo { id: "manager".into(), name: "Manager".into(), icon: "[m]".into() }] }),
-            ("AdvisorTerminated", ChatEvent::AdvisorTerminated { role_id: "manager".into(), reason: "gate D5 重试耗尽".into(), detector: Some("D5".into()), sub_id: None }),
+            (
+                "ToolUse",
+                ChatEvent::ToolUse {
+                    role_id: "m".into(),
+                    tool_name: "read".into(),
+                    args: "{}".into(),
+                    sub_id: None,
+                },
+            ),
+            (
+                "ToolResult",
+                ChatEvent::ToolResult {
+                    role_id: "m".into(),
+                    tool_name: "read".into(),
+                    result: "ok".into(),
+                    sub_id: None,
+                },
+            ),
+            (
+                "ToolError",
+                ChatEvent::ToolError {
+                    role_id: "m".into(),
+                    tool_name: "read".into(),
+                    error: "fail".into(),
+                    sub_id: None,
+                },
+            ),
+            (
+                "RoleStarted",
+                ChatEvent::RoleStarted {
+                    role_id: "m".into(),
+                    detail: "calling LLM".into(),
+                    sub_id: None,
+                },
+            ),
+            (
+                "RoleFinished",
+                ChatEvent::RoleFinished {
+                    role_id: "m".into(),
+                    detail: "ok".into(),
+                    sub_id: None,
+                },
+            ),
+            (
+                "RolePaused",
+                ChatEvent::RolePaused {
+                    role_id: "programmer".into(),
+                },
+            ),
+            (
+                "RoleResumed",
+                ChatEvent::RoleResumed {
+                    role_id: "programmer".into(),
+                },
+            ),
+            (
+                "DelegateStarted",
+                ChatEvent::DelegateStarted {
+                    from_role: "manager".into(),
+                    to_role: "programmer".into(),
+                    task: "ping".into(),
+                    sub_id: "x".into(),
+                    wf_id: None,
+                },
+            ),
+            (
+                "DelegateFinished",
+                ChatEvent::DelegateFinished {
+                    from_role: "manager".into(),
+                    to_role: "programmer".into(),
+                    status: "ok".into(),
+                    summary: "done".into(),
+                    sub_id: "x".into(),
+                    wf_id: None,
+                },
+            ),
+            (
+                "SessionInfo",
+                ChatEvent::SessionInfo {
+                    task_id: "ui-1".into(),
+                    state: "running".into(),
+                    turn: 0,
+                    roles: vec![RoleInfo {
+                        id: "manager".into(),
+                        name: "Manager".into(),
+                        icon: "[m]".into(),
+                    }],
+                },
+            ),
+            (
+                "AdvisorTerminated",
+                ChatEvent::AdvisorTerminated {
+                    role_id: "manager".into(),
+                    reason: "gate D5 重试耗尽".into(),
+                    detector: Some("D5".into()),
+                    sub_id: None,
+                },
+            ),
         ];
         for (expected_type, ev) in cases {
             let json = chat_event_to_frontend_json(&ev).expect("convert");
             let v: serde_json::Value = serde_json::from_str(&json).expect("parse");
-            assert_eq!(v["type"], expected_type, "type mismatch for variant {}: {}", expected_type, v);
+            assert_eq!(
+                v["type"], expected_type,
+                "type mismatch for variant {}: {}",
+                expected_type, v
+            );
         }
     }
     /// Error 事件携带 sub_id 是 UI 右键「查看日志」的关键字段。
@@ -174,7 +296,9 @@ mod tests {
     #[test]
     fn chat_event_to_frontend_json_preserves_error_sub_id() {
         let ev = ChatEvent::Error {
-            kind: Some(crate::trace::ModelErrorKind::Other { message: "boom".into() }),
+            kind: Some(crate::trace::ModelErrorKind::Other {
+                message: "boom".into(),
+            }),
             message: "delegate programmer failed: timeout".into(),
             sub_id: Some("sub-42".into()),
         };
@@ -184,11 +308,18 @@ mod tests {
         assert_eq!(v["message"], "delegate programmer failed: timeout");
         assert_eq!(v["sub_id"], "sub-42", "sub_id must reach frontend");
         // 没 sub_id 的 Error 不应该泄漏空字符串字段
-        let no_sub = ChatEvent::Error { kind: None, message: "main turn failed".into(), sub_id: None };
-        let v2: serde_json::Value = serde_json::from_str(
-            &chat_event_to_frontend_json(&no_sub).expect("convert")
-        ).expect("parse");
-        assert!(v2.get("sub_id").is_none(), "sub_id must be skipped when None");
+        let no_sub = ChatEvent::Error {
+            kind: None,
+            message: "main turn failed".into(),
+            sub_id: None,
+        };
+        let v2: serde_json::Value =
+            serde_json::from_str(&chat_event_to_frontend_json(&no_sub).expect("convert"))
+                .expect("parse");
+        assert!(
+            v2.get("sub_id").is_none(),
+            "sub_id must be skipped when None"
+        );
     }
 
     /// 工具事件携带 sub_id 是前端把 delegate/workflow 子代理的工具
@@ -214,9 +345,12 @@ mod tests {
             result: "ok".into(),
             sub_id: None,
         };
-        let v2: serde_json::Value = serde_json::from_str(
-            &chat_event_to_frontend_json(&no_sub).expect("convert")
-        ).expect("parse");
-        assert!(v2.get("sub_id").is_none(), "sub_id must be skipped when None");
+        let v2: serde_json::Value =
+            serde_json::from_str(&chat_event_to_frontend_json(&no_sub).expect("convert"))
+                .expect("parse");
+        assert!(
+            v2.get("sub_id").is_none(),
+            "sub_id must be skipped when None"
+        );
     }
 }

@@ -62,7 +62,9 @@ pub struct ToolEntry {
     pub registered_by: Option<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// `code_graph` → `Code Graph`，`bash` → `Bash`。参考 oh-my-pi 每个工具都带
 /// 一个 `label` 供 UI 展示（它那边是手写的，这里按注册名推导，够用且不会漂移）。
@@ -102,10 +104,8 @@ impl ToolsState {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("create {}: {e}", parent.display()))?;
         }
-        let s = serde_yaml::to_string(self)
-            .map_err(|e| anyhow!("serialize tools.yaml: {e}"))?;
-        std::fs::write(path, s)
-            .map_err(|e| anyhow!("write {}: {e}", path.display()))
+        let s = serde_yaml::to_string(self).map_err(|e| anyhow!("serialize tools.yaml: {e}"))?;
+        std::fs::write(path, s).map_err(|e| anyhow!("write {}: {e}", path.display()))
     }
 }
 
@@ -123,15 +123,17 @@ impl ToolsStore {
     pub fn new(cwd: &Path) -> Self {
         let project_path = cwd.join(".latte").join("tools.yaml");
         let home = std::env::var("HOME").unwrap_or_default();
-        let global_path = PathBuf::from(home)
-            .join(".latte")
-            .join("tools.yaml");
+        let global_path = PathBuf::from(home).join(".latte").join("tools.yaml");
         let project = ToolsState::load(&project_path);
         let global = ToolsState::load(&global_path);
         let mut disabled = BTreeSet::new();
         disabled.extend(project.disabled);
         disabled.extend(global.disabled);
-        Self { project_path, global_path, disabled }
+        Self {
+            project_path,
+            global_path,
+            disabled,
+        }
     }
 
     /// 重新从磁盘加载（编辑器写盘后调用）。
@@ -262,7 +264,11 @@ fn fallback_tools() -> Vec<ToolEntry> {
         ("bash", "builtin", "执行 shell 命令"),
         ("search", "builtin", "搜索文件内容（正则 + glob）"),
         ("grep", "builtin", "AST 结构化代码搜索"),
-        ("code_graph", "builtin", "结构化代码导航（按 AST 节点类型查函数/调用点）"),
+        (
+            "code_graph",
+            "builtin",
+            "结构化代码导航（按 AST 节点类型查函数/调用点）",
+        ),
         ("delegate", "dynamic", "把独立子任务派发给专业角色"),
         ("workflow", "dynamic", "启动多步骤结构化流程"),
     ]
@@ -284,7 +290,10 @@ fn fallback_tools() -> Vec<ToolEntry> {
 /// 完整枚举，由预热线程调用，结果写入 `ENUMERATE_CACHE`。
 pub(crate) async fn enumerate_inner() -> Result<Vec<ToolEntry>> {
     let mut by_id: BTreeMap<String, ToolEntry> = BTreeMap::new();
-    let mut push = |id: String, kind: tool_docs::ToolKind, description: String, registered_by: Option<String>| {
+    let mut push = |id: String,
+                    kind: tool_docs::ToolKind,
+                    description: String,
+                    registered_by: Option<String>| {
         by_id.entry(id.clone()).or_insert(ToolEntry {
             label: label_for(&id),
             brief: tool_docs::split_brief_and_detail(&description).0,
@@ -377,7 +386,9 @@ pub(crate) async fn scan_register_tool_fns(root: &Path) -> Vec<String> {
     let mut found: BTreeSet<String> = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -387,7 +398,9 @@ pub(crate) async fn scan_register_tool_fns(root: &Path) -> Vec<String> {
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
             let mut rest = text.as_str();
             while let Some(pos) = rest.find("register_") {
                 let name: String = rest[pos..]
@@ -482,7 +495,9 @@ mod tests {
     #[tokio::test]
     async fn scan_register_tool_fns_handles_missing_and_empty_dirs() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(scan_register_tool_fns(&tmp.path().join("does/not/exist")).await.is_empty());
+        assert!(scan_register_tool_fns(&tmp.path().join("does/not/exist"))
+            .await
+            .is_empty());
         let empty = tmp.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         assert!(scan_register_tool_fns(&empty).await.is_empty());
@@ -498,8 +513,10 @@ mod tests {
         assert!(ids.contains(&"write"), "write missing: {ids:?}");
         assert!(ids.contains(&"git"), "git alias missing: {ids:?}");
         assert!(ids.contains(&"bash"), "bash alias missing: {ids:?}");
-        assert!(tools.iter().any(|t| t.id == "exec" || t.id == "search"),
-                "expected exec/search: {ids:?}");
+        assert!(
+            tools.iter().any(|t| t.id == "exec" || t.id == "search"),
+            "expected exec/search: {ids:?}"
+        );
     }
 
     /// 面板列表必须覆盖运行时真会注册的工具。历史 bug：
@@ -527,11 +544,17 @@ mod tests {
             "generate_image",
             "playwright",
         ] {
-            assert!(ids.contains(expected), "{expected} missing from panel: {ids:?}");
+            assert!(
+                ids.contains(expected),
+                "{expected} missing from panel: {ids:?}"
+            );
         }
         // `request` 是旧的 `register_*_tool` → id 推导留下的幽灵条目：
         // 运行时没有这个工具名，`request.md` 永远不会被读到。
-        assert!(!ids.contains("request"), "phantom `request` entry resurfaced: {ids:?}");
+        assert!(
+            !ids.contains("request"),
+            "phantom `request` entry resurfaced: {ids:?}"
+        );
     }
 
     /// 描述必须是模型 schema 里真读到的那一行，不能是 `builtin tool: x`
@@ -542,15 +565,23 @@ mod tests {
         let tools = enumerate_inner().await.expect("enumerate_inner");
         let placeholders: Vec<&str> = tools
             .iter()
-            .filter(|t| t.description.starts_with("builtin tool:")
-                || t.description.starts_with("dynamic tool registered via"))
+            .filter(|t| {
+                t.description.starts_with("builtin tool:")
+                    || t.description.starts_with("dynamic tool registered via")
+            })
             .map(|t| t.id.as_str())
             .collect();
-        assert!(placeholders.is_empty(), "placeholder descriptions: {placeholders:?}");
+        assert!(
+            placeholders.is_empty(),
+            "placeholder descriptions: {placeholders:?}"
+        );
 
         let read = tools.iter().find(|t| t.id == "read").expect("read");
-        assert!(read.description.len() > "builtin tool: read".len(),
-                "read description looks synthetic: {:?}", read.description);
+        assert!(
+            read.description.len() > "builtin tool: read".len(),
+            "read description looks synthetic: {:?}",
+            read.description
+        );
     }
 
     /// `read` 的描述必须是**运行时改写后**的那份（讲 `paths` 批量入口），
@@ -571,8 +602,16 @@ mod tests {
         // 简介 = 改写后描述的首句，且首句本身就要讲「能并发批量读」——
         // 模型在选工具那一刻只看得到这一句。
         for keyword in ["并发", "批量", "paths"] {
-            let target: &str = if keyword == "paths" { &read.description } else { &read.brief };
-            assert!(target.contains(keyword), "缺「{keyword}」: brief={:?}", read.brief);
+            let target: &str = if keyword == "paths" {
+                &read.description
+            } else {
+                &read.brief
+            };
+            assert!(
+                target.contains(keyword),
+                "缺「{keyword}」: brief={:?}",
+                read.brief
+            );
         }
         assert!(
             read.brief.len() < read.description.len(),

@@ -55,8 +55,7 @@ pub async fn run_scan(cwd: &Path) -> Result<ScanStats, String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("解析 scan 输出失败: {e}"))
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("解析 scan 输出失败: {e}"))
 }
 
 /// 调 `latte-review context -C <cwd> "<query>" --json`，返回 bundle。
@@ -231,7 +230,10 @@ pub fn clear_doc_dirty(cwd: &Path, marker: &str) {
 pub fn read_doc_md(cwd: &Path, rel_path: &str) -> Result<String, String> {
     // 路径穿越防护：rel_path 必须相对，不含 ..
     let p = Path::new(rel_path);
-    if p.is_absolute() || p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return Err(format!("非法相对路径: {rel_path}"));
     }
     let full = cwd.join(".latte-review").join("docs").join(rel_path);
@@ -244,7 +246,8 @@ pub fn generate_index(cwd: &Path, now_unix: i64) -> Result<String, String> {
     let graph_path = cwd.join(".latte-review").join("graph.json");
     let raw = std::fs::read_to_string(&graph_path)
         .map_err(|e| format!("读 graph.json 失败（先运行 doc_graph_scan）: {e}"))?;
-    let graph: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("解析 graph.json 失败: {e}"))?;
+    let graph: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 graph.json 失败: {e}"))?;
     let nodes = graph
         .get("nodes")
         .and_then(|v| v.as_object())
@@ -293,13 +296,20 @@ pub fn generate_index(cwd: &Path, now_unix: i64) -> Result<String, String> {
 // ─── 工具 schema 构造辅助 ─────────────────────────────────────────
 
 fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
-    ToolInputProperty { property_type: ty,
-    description: Some(desc.into()),
-    enum_values: None,
-    minimum: None,
-    maximum: None,
-    min_length: None,
-    max_length: None, items: None, properties: None, required: None, additional_properties: None, ref_: None }
+    ToolInputProperty {
+        property_type: ty,
+        description: Some(desc.into()),
+        enum_values: None,
+        minimum: None,
+        maximum: None,
+        min_length: None,
+        max_length: None,
+        items: None,
+        properties: None,
+        required: None,
+        additional_properties: None,
+        ref_: None,
+    }
 }
 
 fn tool_err(msg: String) -> latte_rs_agent_tools::error::ToolError {
@@ -546,13 +556,22 @@ mod tests {
 
     #[test]
     fn frontmatter_has_required_fields() {
-        let fm = build_frontmatter("Auth Service", "entity", &["src/auth.rs".into()], &["rust".into(), "auth".into()], 1786217357);
+        let fm = build_frontmatter(
+            "Auth Service",
+            "entity",
+            &["src/auth.rs".into()],
+            &["rust".into(), "auth".into()],
+            1786217357,
+        );
         assert!(fm.starts_with("---\n"), "frontmatter 以 --- 开始");
         assert!(fm.contains("type: entity\n"));
         assert!(fm.contains("title: \"Auth Service\"\n"));
         assert!(fm.contains("sources:\n  - \"src/auth.rs\"\n"));
         assert!(fm.contains("tags:\n  - \"rust\"\n  - \"auth\"\n"));
-        assert!(fm.contains("created: 2026-08-08\n"), "epoch 1786217357 → 2026-08-08（本地 UTC）");
+        assert!(
+            fm.contains("created: 2026-08-08\n"),
+            "epoch 1786217357 → 2026-08-08（本地 UTC）"
+        );
         assert!(fm.ends_with("---\n"), "frontmatter 以 --- 结束");
     }
 
@@ -586,10 +605,19 @@ mod tests {
 
     #[test]
     fn dirty_marker_safe() {
-        assert_eq!(dirty_marker_name("entities/auth-service.md"), "entities.auth-service.md");
-        assert_eq!(dirty_marker_name("entities/user-account.md"), "entities.user-account.md");
+        assert_eq!(
+            dirty_marker_name("entities/auth-service.md"),
+            "entities.auth-service.md"
+        );
+        assert_eq!(
+            dirty_marker_name("entities/user-account.md"),
+            "entities.user-account.md"
+        );
         // 防路径穿越：跳过前导点。
-        assert!(!dirty_marker_name("../x.md").starts_with(".") || dirty_marker_name("../x.md").contains("..") == false);
+        assert!(
+            !dirty_marker_name("../x.md").starts_with(".")
+                || dirty_marker_name("../x.md").contains("..") == false
+        );
     }
 
     #[test]
@@ -623,7 +651,11 @@ mod tests {
             }
         });
         std::fs::create_dir_all(dir.path().join(".latte-review")).unwrap();
-        std::fs::write(dir.path().join(".latte-review/graph.json"), graph.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join(".latte-review/graph.json"),
+            graph.to_string(),
+        )
+        .unwrap();
         let md = generate_index(dir.path(), 1704067200).expect("index");
         assert!(md.contains("## entity"), "含 entity 分组: {md}");
         assert!(md.contains("## concept"), "含 concept 分组: {md}");

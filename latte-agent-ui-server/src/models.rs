@@ -31,8 +31,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let mut tmp_os = path.as_os_str().to_os_string();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
-    std::fs::write(&tmp, content)
-        .map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, content).map_err(|e| anyhow!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         // rename 失败时尽量清掉临时文件，别在目录里留垃圾。
         let _ = std::fs::remove_file(&tmp);
@@ -135,11 +134,11 @@ impl ModelsState {
                 // def 直接带上 —— 多 model 文件（`[[models]]` 数组）里
                 // 每条 model 的配置不同，重读文件只会取到第一条。
                 let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
-                state
-                    .entries
-                    .entry(key.clone())
-                    .or_default()
-                    .push((source, abs.clone(), def.clone()));
+                state.entries.entry(key.clone()).or_default().push((
+                    source,
+                    abs.clone(),
+                    def.clone(),
+                ));
                 // 合并后生效值：项目覆盖全局（与 `config_layer::load`
                 // 的"项目优先"语义一致）。
                 state.merged.insert(key.clone(), def);
@@ -159,16 +158,11 @@ impl ModelsState {
     }
 
     /// 写一个 ModelDef 到项目目录（覆盖同名文件，原子写）。
-    pub fn write_project(
-        project_models_dir: &Path,
-        key: &str,
-        def: &ModelDef,
-    ) -> Result<PathBuf> {
+    pub fn write_project(project_models_dir: &Path, key: &str, def: &ModelDef) -> Result<PathBuf> {
         std::fs::create_dir_all(project_models_dir)
             .map_err(|e| anyhow!("mkdir {}: {e}", project_models_dir.display()))?;
         let path = project_models_dir.join(key_to_filename(key));
-        let content = toml::to_string_pretty(def)
-            .map_err(|e| anyhow!("serialize {key}: {e}"))?;
+        let content = toml::to_string_pretty(def).map_err(|e| anyhow!("serialize {key}: {e}"))?;
         atomic_write(&path, &content)?;
         Ok(path)
     }
@@ -177,8 +171,7 @@ impl ModelsState {
     pub fn delete_project(project_models_dir: &Path, key: &str) -> Result<bool> {
         let path = project_models_dir.join(key_to_filename(key));
         if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| anyhow!("remove {}: {e}", path.display()))?;
+            std::fs::remove_file(&path).map_err(|e| anyhow!("remove {}: {e}", path.display()))?;
             Ok(true)
         } else {
             Ok(false)
@@ -200,15 +193,13 @@ impl ModelsState {
     /// 注意：原地更新按 serde 整体重新序列化，原文件里的注释/排版会丢失，
     /// 但所有配置项（含同文件其它 model）都会保留。
     pub fn write_to_layer(dir: &Path, key: &str, def: &ModelDef) -> Result<PathBuf> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow!("mkdir {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| anyhow!("mkdir {}: {e}", dir.display()))?;
         if let Some(path) = Self::find_file_containing(dir, key) {
             Self::update_entry_in_file(&path, key, def)?;
             return Ok(path);
         }
         let path = dir.join(key_to_filename(key));
-        let content = toml::to_string_pretty(def)
-            .map_err(|e| anyhow!("serialize {key}: {e}"))?;
+        let content = toml::to_string_pretty(def).map_err(|e| anyhow!("serialize {key}: {e}"))?;
         atomic_write(&path, &content)?;
         Ok(path)
     }
@@ -242,8 +233,8 @@ impl ModelsState {
     /// 三种 schema 分别处理（与 [`parse_models_in_file`] 的解析顺序对称）。
     fn update_entry_in_file(path: &Path, key: &str, def: &ModelDef) -> Result<()> {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("toml");
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("read {}: {e}", path.display()))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| anyhow!("read {}: {e}", path.display()))?;
         let matches_key = |m: &ModelDef| format!("{}/{}", m.provider, m.name) == key;
         let out = match ext {
             "yaml" | "yml" => {
@@ -321,16 +312,12 @@ impl ModelsState {
     /// 写一个 ModelDef 到全局目录 `~/.latte/models.d/<provider>__<id>.toml`。
     /// 用于「保存到全局」按钮 —— 把当前 model 配置提升到全局层，
     /// 与 `GlobalConfig::load_default` 后续加载行为一致。
-    pub fn write_global(
-        global_models_dir: &Path,
-        key: &str,
-        def: &ModelDef,
-    ) -> Result<PathBuf> {
+    pub fn write_global(global_models_dir: &Path, key: &str, def: &ModelDef) -> Result<PathBuf> {
         std::fs::create_dir_all(global_models_dir)
             .map_err(|e| anyhow!("mkdir {}: {e}", global_models_dir.display()))?;
         let path = global_models_dir.join(key_to_filename(key));
-        let content = toml::to_string_pretty(def)
-            .map_err(|e| anyhow!("serialize {}: {}", key, e))?;
+        let content =
+            toml::to_string_pretty(def).map_err(|e| anyhow!("serialize {}: {}", key, e))?;
         atomic_write(&path, &content)?;
         Ok(path)
     }
@@ -444,7 +431,10 @@ mod tests {
     #[test]
     fn key_filename_round_trip() {
         assert_eq!(key_to_filename("openai/gpt-4o"), "openai__gpt-4o.toml");
-        assert_eq!(filename_to_key("openai__gpt-4o.toml").as_deref(), Some("openai/gpt-4o"));
+        assert_eq!(
+            filename_to_key("openai__gpt-4o.toml").as_deref(),
+            Some("openai/gpt-4o")
+        );
         // 边界
         assert_eq!(filename_to_key("plain.toml"), None);
         assert_eq!(filename_to_key("foo__.toml"), None);
@@ -472,8 +462,7 @@ mod tests {
 
     #[test]
     fn write_project_round_trips_and_leaves_no_tmp() {
-        let tmp = std::env::temp_dir()
-            .join(format!("latte-models-atomic-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("latte-models-atomic-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
         let def = sample_def();
@@ -487,7 +476,10 @@ mod tests {
 
         // 内容可回读为同一个 ModelDef。
         let back = ModelsState::load(&tmp, &tmp.join("nonexistent")).unwrap();
-        assert_eq!(back.merged.get("openai/gpt-4o").unwrap().api_key, def.api_key);
+        assert_eq!(
+            back.merged.get("openai/gpt-4o").unwrap().api_key,
+            def.api_key
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -524,10 +516,8 @@ mod tests {
     /// 全部全局 model 在 UI 里消失（"暂无 model"）。
     #[test]
     fn load_reads_global_array_of_tables() {
-        let tmp = std::env::temp_dir().join(format!(
-            "latte-models-global-aot-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("latte-models-global-aot-{}", std::process::id()));
         let proj = tmp.join("project");
         let glob = tmp.join("global");
         std::fs::create_dir_all(&proj).unwrap();
@@ -567,7 +557,10 @@ max_tokens = 8192\n\
             .get("deepseek/deepseek-v4-flash")
             .expect("deepseek-v4-flash must be loaded from global array-of-tables");
         assert_eq!(v4.api_key, "sk-global");
-        assert_eq!(state.sources["deepseek/deepseek-v4-flash"], ModelSource::Global);
+        assert_eq!(
+            state.sources["deepseek/deepseek-v4-flash"],
+            ModelSource::Global
+        );
 
         let chat = state
             .merged
@@ -583,10 +576,7 @@ max_tokens = 8192\n\
     /// 处理这种 schema。
     #[test]
     fn load_reads_project_models_models_array() {
-        let tmp = std::env::temp_dir().join(format!(
-            "latte-models-proj-ms-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("latte-models-proj-ms-{}", std::process::id()));
         let proj = tmp.join("project");
         let glob = tmp.join("global");
         std::fs::create_dir_all(&proj).unwrap();
@@ -631,10 +621,7 @@ max_tokens = 8192\n\
     /// 被绕过）。
     #[test]
     fn write_to_layer_updates_entry_in_vendor_split_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "latte-models-inplace-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("latte-models-inplace-{}", std::process::id()));
         let glob = tmp.join("global");
         std::fs::create_dir_all(&glob).unwrap();
 
@@ -684,10 +671,8 @@ max_tokens = 4096\n\
     /// tiers 等其余配置必须随整体序列化保留。
     #[test]
     fn write_to_layer_preserves_tiers_in_agent_config_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "latte-models-inplace-cfg-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("latte-models-inplace-cfg-{}", std::process::id()));
         let proj = tmp.join("project");
         std::fs::create_dir_all(&proj).unwrap();
 
@@ -730,10 +715,8 @@ max_tokens = 4096\n\
     /// `<provider>__<id>.toml` flat 单条文件。
     #[test]
     fn write_to_layer_creates_flat_file_when_key_absent() {
-        let tmp = std::env::temp_dir().join(format!(
-            "latte-models-inplace-new-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("latte-models-inplace-new-{}", std::process::id()));
         let dir = tmp.join("layer");
         let def = sample_def();
         let path = ModelsState::write_to_layer(&dir, "openai/gpt-4o", &def).unwrap();

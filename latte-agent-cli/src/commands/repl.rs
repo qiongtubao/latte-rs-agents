@@ -11,9 +11,17 @@ pub enum ReplInput {
     Empty,
     /// A built-in slash command. `arg` carries an optional operand,
     /// e.g. `/pause programmer` → `Cmd { name: "pause", arg: Some("programmer") }`.
-    Cmd { name: String, arg: Option<String> },
-    RoleInject { role_id: String, message: String },
-    ManagerInput { message: String },
+    Cmd {
+        name: String,
+        arg: Option<String>,
+    },
+    RoleInject {
+        role_id: String,
+        message: String,
+    },
+    ManagerInput {
+        message: String,
+    },
 }
 
 impl ReplInput {
@@ -85,11 +93,15 @@ pub fn parse_repl_line(line: &str) -> Result<ReplInput, ReplParseError> {
         let message = after_id.trim_start().to_string();
         return Ok(ReplInput::RoleInject { role_id, message });
     }
-    Ok(ReplInput::ManagerInput { message: trimmed.to_string() })
+    Ok(ReplInput::ManagerInput {
+        message: trimmed.to_string(),
+    })
 }
 
 fn is_valid_role_id(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 #[cfg(test)]
@@ -107,7 +119,10 @@ mod tests {
     fn slash_pause() {
         assert_eq!(
             parse_repl_line("/pause").unwrap(),
-            ReplInput::Cmd { name: "pause".to_string(), arg: None }
+            ReplInput::Cmd {
+                name: "pause".to_string(),
+                arg: None
+            }
         );
     }
 
@@ -115,7 +130,10 @@ mod tests {
     fn slash_resume() {
         assert_eq!(
             parse_repl_line("/resume").unwrap(),
-            ReplInput::Cmd { name: "resume".to_string(), arg: None }
+            ReplInput::Cmd {
+                name: "resume".to_string(),
+                arg: None
+            }
         );
     }
 
@@ -123,7 +141,10 @@ mod tests {
     fn slash_pause_with_role_arg() {
         assert_eq!(
             parse_repl_line("/pause programmer").unwrap(),
-            ReplInput::Cmd { name: "pause".to_string(), arg: Some("programmer".to_string()) }
+            ReplInput::Cmd {
+                name: "pause".to_string(),
+                arg: Some("programmer".to_string())
+            }
         );
     }
 
@@ -131,7 +152,10 @@ mod tests {
     fn slash_resume_with_role_arg() {
         assert_eq!(
             parse_repl_line("/resume programmer").unwrap(),
-            ReplInput::Cmd { name: "resume".to_string(), arg: Some("programmer".to_string()) }
+            ReplInput::Cmd {
+                name: "resume".to_string(),
+                arg: Some("programmer".to_string())
+            }
         );
     }
 
@@ -162,6 +186,11 @@ mod tests {
     #[test]
     fn plain_text_routes_to_manager() {
         let out = parse_repl_line("look at foo.rs").unwrap();
-        assert_eq!(out, ReplInput::ManagerInput { message: "look at foo.rs".to_string() });
+        assert_eq!(
+            out,
+            ReplInput::ManagerInput {
+                message: "look at foo.rs".to_string()
+            }
+        );
     }
 }

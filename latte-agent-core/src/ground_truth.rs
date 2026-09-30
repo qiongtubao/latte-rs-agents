@@ -28,10 +28,7 @@ use std::path::Path;
 pub fn ground_truth_block(cwd: &Path) -> String {
     let cwd_display = cwd.display().to_string();
     let host = std::env::var("HOSTNAME")
-        .or_else(|_| {
-            std::fs::read_to_string("/etc/hostname")
-                .map(|s| s.trim().to_string())
-        })
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_default();
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;

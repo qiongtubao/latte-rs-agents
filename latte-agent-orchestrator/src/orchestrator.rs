@@ -51,10 +51,7 @@ pub struct DiscussionOrchestrator {
 
 impl DiscussionOrchestrator {
     /// Create a new orchestrator with the given agents and configuration.
-    pub fn new(
-        agents: HashMap<String, AgentRunner>,
-        config: DiscussionConfig,
-    ) -> OrchResult<Self> {
+    pub fn new(agents: HashMap<String, AgentRunner>, config: DiscussionConfig) -> OrchResult<Self> {
         // Validate all workflow speakers exist
         let agent_names: Vec<String> = agents.keys().cloned().collect();
         config.workflow.validate(&agent_names)?;
@@ -62,10 +59,7 @@ impl DiscussionOrchestrator {
         // Check moderator if needed
         if let Some(moderator) = config.consensus.requires_moderator() {
             if !agents.contains_key(moderator) {
-                return Err(OrchError::AgentNotFound(
-                    moderator.into(),
-                    agent_names,
-                ));
+                return Err(OrchError::AgentNotFound(moderator.into(), agent_names));
             }
         }
 
@@ -128,19 +122,22 @@ impl DiscussionOrchestrator {
                 let mut step_transcript = String::new();
 
                 for speaker in &step.speakers {
-                    let agent_runner = self
-                        .agents
-                        .get_mut(speaker)
-                        .ok_or_else(|| OrchError::AgentNotFound(
-                            speaker.clone(),
-                            agent_names.clone(),
-                        ))?;
+                    let agent_runner = self.agents.get_mut(speaker).ok_or_else(|| {
+                        OrchError::AgentNotFound(speaker.clone(), agent_names.clone())
+                    })?;
 
                     // Build the prompt for this speaker
                     let mut vars = self.config.variables.clone();
                     vars.insert("step_id".into(), step.id.clone());
                     vars.insert("speaker".into(), speaker.clone());
-                    vars.insert("topic".into(), self.config.variables.get("topic").cloned().unwrap_or_default());
+                    vars.insert(
+                        "topic".into(),
+                        self.config
+                            .variables
+                            .get("topic")
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
 
                     let step_prompt = self.config.workflow.build_step_prompt(step, &vars);
 
@@ -163,10 +160,7 @@ impl DiscussionOrchestrator {
 
                     // Run the agent's turn
                     let response = agent_runner
-                        .run_turn(
-                            &[Message::user(context_prompt)],
-                            Some(&system_vars),
-                        )
+                        .run_turn(&[Message::user(context_prompt)], Some(&system_vars))
                         .await?;
 
                     // Update usage
@@ -184,10 +178,7 @@ impl DiscussionOrchestrator {
                         turn_number: round.turns.len(),
                     });
 
-                    step_transcript.push_str(&format!(
-                        "[{}]: {}\n",
-                        speaker, response
-                    ));
+                    step_transcript.push_str(&format!("[{}]: {}\n", speaker, response));
 
                     // Store step output if configured
                     if let Some(ref key) = step.output_key {
@@ -215,12 +206,21 @@ impl DiscussionOrchestrator {
             self.rounds.push(round);
 
             // Break if consensus reached
-            if self.rounds.last().map(|r| r.consensus_reached).unwrap_or(false) {
+            if self
+                .rounds
+                .last()
+                .map(|r| r.consensus_reached)
+                .unwrap_or(false)
+            {
                 break;
             }
         }
 
-        let consensus_reached = self.rounds.last().map(|r| r.consensus_reached).unwrap_or(false);
+        let consensus_reached = self
+            .rounds
+            .last()
+            .map(|r| r.consensus_reached)
+            .unwrap_or(false);
 
         Ok(DiscussionResult {
             rounds: self.rounds.clone(),
@@ -234,10 +234,7 @@ impl DiscussionOrchestrator {
     /// Run the discussion, calling `on_turn` after each agent turn completes.
     /// This is a streaming variant of `run()` — it yields the same result but
     /// notifies a callback after every turn so UIs can show progress.
-    pub async fn run_with_events<F>(
-        &mut self,
-        mut on_turn: F,
-    ) -> OrchResult<DiscussionResult>
+    pub async fn run_with_events<F>(&mut self, mut on_turn: F) -> OrchResult<DiscussionResult>
     where
         F: FnMut(&TurnRecord),
     {
@@ -261,7 +258,11 @@ impl DiscussionOrchestrator {
                     vars.insert("speaker".into(), speaker.clone());
                     vars.insert(
                         "topic".into(),
-                        self.config.variables.get("topic").cloned().unwrap_or_default(),
+                        self.config
+                            .variables
+                            .get("topic")
+                            .cloned()
+                            .unwrap_or_default(),
                     );
 
                     let step_prompt = self.config.workflow.build_step_prompt(&step, &vars);
@@ -281,10 +282,7 @@ impl DiscussionOrchestrator {
                     });
 
                     let response = agent_runner
-                        .run_turn(
-                        &[Message::user(context_prompt)],
-                            Some(&system_vars),
-                        )
+                        .run_turn(&[Message::user(context_prompt)], Some(&system_vars))
                         .await?;
 
                     let usage = agent_runner.total_usage();
@@ -321,7 +319,12 @@ impl DiscussionOrchestrator {
             }
 
             self.rounds.push(round);
-            if self.rounds.last().map(|r| r.consensus_reached).unwrap_or(false) {
+            if self
+                .rounds
+                .last()
+                .map(|r| r.consensus_reached)
+                .unwrap_or(false)
+            {
                 break;
             }
         }
@@ -346,13 +349,7 @@ impl DiscussionOrchestrator {
         self.rounds
             .iter()
             .enumerate()
-            .map(|(i, r)| {
-                format!(
-                    "=== Round {} ===\n{}",
-                    i + 1,
-                    r.transcript()
-                )
-            })
+            .map(|(i, r)| format!("=== Round {} ===\n{}", i + 1, r.transcript()))
             .collect::<Vec<_>>()
             .join("\n")
     }

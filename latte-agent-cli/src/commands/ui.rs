@@ -109,7 +109,11 @@ impl UiCmd {
         // 解析 cwd：--cwd 参数优先，否则取进程当前目录
         let cwd = self.cwd.as_ref().map(|s| {
             let p = PathBuf::from(s);
-            if p.is_absolute() { p } else { std::env::current_dir().unwrap().join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                std::env::current_dir().unwrap().join(p)
+            }
         });
         // 4. 起 server（库里完成 bind，端口 0 时 handle.addr 是真实端口）。
         let handle = latte_agent_ui_server::spawn(UiServerConfig {
@@ -159,10 +163,7 @@ async fn spawn_vite_dev(
     backend_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidates = [
-        manifest_dir.join("ui"),
-        PathBuf::from("latte-agent-cli/ui"),
-    ];
+    let candidates = [manifest_dir.join("ui"), PathBuf::from("latte-agent-cli/ui")];
     let ui_dir = candidates.into_iter().find(|p| p.exists());
     let ui_dir = match ui_dir {
         Some(d) => d,
@@ -218,9 +219,18 @@ mod tests {
 
     #[test]
     fn parse_tier_str_works() {
-        assert!(matches!(parse_tier_str("premium").unwrap(), ModelTier::Premium));
-        assert!(matches!(parse_tier_str("standard").unwrap(), ModelTier::Standard));
-        assert!(matches!(parse_tier_str("budget").unwrap(), ModelTier::Budget));
+        assert!(matches!(
+            parse_tier_str("premium").unwrap(),
+            ModelTier::Premium
+        ));
+        assert!(matches!(
+            parse_tier_str("standard").unwrap(),
+            ModelTier::Standard
+        ));
+        assert!(matches!(
+            parse_tier_str("budget").unwrap(),
+            ModelTier::Budget
+        ));
         assert!(parse_tier_str("nope").is_err());
     }
 }

@@ -126,12 +126,9 @@ impl TestCmd {
                 .map(|u| vec![(self.model.clone(), "base_url".to_string(), u.clone())])
                 .unwrap_or_default(),
         };
-        let resolved = config_layer::load(
-            Some(&self.agents_config),
-            Some(&self.models_config),
-            cli,
-        )
-        .map_err(|e| TestFailure::Usage(format!("failed to load config: {e}")))?;
+        let resolved =
+            config_layer::load(Some(&self.agents_config), Some(&self.models_config), cli)
+                .map_err(|e| TestFailure::Usage(format!("failed to load config: {e}")))?;
 
         // 2) 通过 resolver 拿到一个真正能跑的 Model（含解析后的 env vars、api_key、base_url）。
         //    `resolve_id_or_name` 同时支持精确 id 和大小写不敏感的 display name，
@@ -162,10 +159,7 @@ impl TestCmd {
         // URL：和 AiClient 走 OpenAI 路径时一样的拼法（base_url + "/chat/completions"）。
         // 注意：默认 base_url 形如 `https://api.minimaxi.com/v1`，
         // 所以拼出来是 `https://api.minimaxi.com/v1/chat/completions`。
-        let url = format!(
-            "{}/chat/completions",
-            model.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
 
         // 极简 body：model + 单条 user message + max_tokens=16。
         // 不带 tools / temperature / stream —— 这些都可能让 vendor
@@ -207,13 +201,13 @@ impl TestCmd {
         let headers = resp.headers().clone();
 
         eprintln!("--- RESPONSE ---");
-        eprintln!("HTTP {} {}", status.as_u16(), status.canonical_reason().unwrap_or(""));
+        eprintln!(
+            "HTTP {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("")
+        );
         for (k, v) in headers.iter() {
-            eprintln!(
-                "{}: {}",
-                k,
-                v.to_str().unwrap_or("<binary header value>")
-            );
+            eprintln!("{}: {}", k, v.to_str().unwrap_or("<binary header value>"));
         }
         eprintln!();
 
@@ -297,7 +291,14 @@ fn redact_key(key: &str) -> String {
         return "***".to_string();
     }
     let head: String = chars.iter().take(4).collect();
-    let tail: String = chars.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = chars
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{}********{}", head, tail)
 }
 
@@ -363,7 +364,10 @@ mod tests {
         let e = AiError::Auth("bad key".into());
         let msg = format_ai_error(&e);
         assert!(msg.contains("auth"), "expected 'auth' label, got: {msg}");
-        assert!(msg.contains("check api_key"), "expected user_hint, got: {msg}");
+        assert!(
+            msg.contains("check api_key"),
+            "expected user_hint, got: {msg}"
+        );
     }
 
     #[test]
@@ -395,7 +399,10 @@ mod tests {
             message: "down".into(),
         };
         let msg = format_ai_error(&e);
-        assert!(msg.contains("http_error"), "expected http_error, got: {msg}");
+        assert!(
+            msg.contains("http_error"),
+            "expected http_error, got: {msg}"
+        );
     }
 
     /// **直接复现用户当前 hit 的 case**：
@@ -471,20 +478,30 @@ mod tests {
         let kinds = [
             ModelErrorKind::Timeout,
             ModelErrorKind::ConnectFailed,
-            ModelErrorKind::RateLimited { retry_after_secs: 0.0 },
+            ModelErrorKind::RateLimited {
+                retry_after_secs: 0.0,
+            },
             ModelErrorKind::Http {
                 status: 500,
                 message: "x".into(),
             },
             ModelErrorKind::Auth,
             ModelErrorKind::ModelNotFound,
-            ModelErrorKind::Stream { message: "x".into() },
-            ModelErrorKind::Serde { message: "x".into() },
-            ModelErrorKind::Config { message: "x".into() },
+            ModelErrorKind::Stream {
+                message: "x".into(),
+            },
+            ModelErrorKind::Serde {
+                message: "x".into(),
+            },
+            ModelErrorKind::Config {
+                message: "x".into(),
+            },
             ModelErrorKind::CooldownHit {
                 cooldown_remaining_secs: 0.0,
             },
-            ModelErrorKind::Other { message: "x".into() },
+            ModelErrorKind::Other {
+                message: "x".into(),
+            },
         ];
         for k in &kinds {
             assert!(!k.variant_name().is_empty(), "{:?} has empty name", k);

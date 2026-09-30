@@ -107,14 +107,19 @@ impl ListCmd {
         }
 
         if !resolved.sources.global.is_empty() {
-            println!("\n(merged from global: {})", resolved.sources.global.join(", "));
+            println!(
+                "\n(merged from global: {})",
+                resolved.sources.global.join(", ")
+            );
         }
         Ok(())
     }
 
     async fn list_workflows(&self) -> AnyResult {
-        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(&self.discussion_config))
-            .map_err(|e| format!("failed to load workflows: {}", e))?;
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(
+            &self.discussion_config,
+        ))
+        .map_err(|e| format!("failed to load workflows: {}", e))?;
 
         if let Some(ref default_wf) = registry.default {
             println!("Default Workflow: {}", default_wf.name);

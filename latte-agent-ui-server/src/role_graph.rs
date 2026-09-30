@@ -84,8 +84,7 @@ fn load_agent_config(agents_dir: &Path, models_dir: &Path) -> Result<AgentConfig
         let models = models_dir
             .to_str()
             .ok_or_else(|| anyhow!("models path contains non-utf8"))?;
-        let part =
-            AgentConfig::load(models).map_err(|e| anyhow!("load models config: {e}"))?;
+        let part = AgentConfig::load(models).map_err(|e| anyhow!("load models config: {e}"))?;
         cfg.roles.extend(part.roles);
     }
     Ok(cfg)
@@ -234,7 +233,12 @@ mod tests {
         let cwd = tmp.path();
         let agents_d = cwd.join(".latte/agents.d");
         write_role(&agents_d, "pm", "Product Manager", &["read", "search"]);
-        write_role(&agents_d, "dev", "Software Engineer", &["read", "write", "bash"]);
+        write_role(
+            &agents_d,
+            "dev",
+            "Software Engineer",
+            &["read", "write", "bash"],
+        );
 
         // Fake latte-agent-core source tree.
         let core_src = cwd.join("latte-agent-core/src");
@@ -254,8 +258,18 @@ mod tests {
         // 四个工具确实存在。
         assert!(g.stats.roles >= 2);
         assert!(g.stats.tools >= 4);
-        for id in ["role:pm", "role:dev", "tool:read", "tool:search", "tool:write", "tool:bash"] {
-            assert!(g.nodes.iter().any(|n| n.id == id), "missing fixture node {id}");
+        for id in [
+            "role:pm",
+            "role:dev",
+            "tool:read",
+            "tool:search",
+            "tool:write",
+            "tool:bash",
+        ] {
+            assert!(
+                g.nodes.iter().any(|n| n.id == id),
+                "missing fixture node {id}"
+            );
         }
         assert_eq!(g.stats.registrations, 2); // delegate + workflow (no _tool excluded)
 
@@ -280,9 +294,9 @@ mod tests {
             ("role:dev", "tool:bash"),
         ] {
             assert!(
-                g.edges.iter().any(|e| {
-                    e.kind == "USES_TOOL" && e.source == role && e.target == tool
-                }),
+                g.edges
+                    .iter()
+                    .any(|e| { e.kind == "USES_TOOL" && e.source == role && e.target == tool }),
                 "missing fixture edge {role} -> {tool}"
             );
         }

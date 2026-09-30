@@ -357,12 +357,7 @@ impl TurnDetectors {
         *self = Self::default();
     }
 
-    fn fire_once(
-        &mut self,
-        kind: DetectorKind,
-        hint: String,
-        evidence: String,
-    ) -> Option<Finding> {
+    fn fire_once(&mut self, kind: DetectorKind, hint: String, evidence: String) -> Option<Finding> {
         if self.fired.insert(kind) {
             Some(Finding {
                 kind,
@@ -385,7 +380,10 @@ impl TurnDetectors {
             if let Some(f) = self.fire_once(
                 DetectorKind::InvalidToolArgs,
                 "工具参数不是合法 JSON（不要用 XML 参数块），工具收到的是原始字符串".to_string(),
-                format!("工具 {tool_name} 的参数不是合法 JSON：{}", truncate_chars(args, 200)),
+                format!(
+                    "工具 {tool_name} 的参数不是合法 JSON：{}",
+                    truncate_chars(args, 200)
+                ),
             ) {
                 out.push(f);
             }
@@ -403,7 +401,10 @@ impl TurnDetectors {
             if let Some(f) = self.fire_once(
                 DetectorKind::ToolCallLoop,
                 "检测到调用循环：换思路，不要重试相同调用".to_string(),
-                format!("同一调用 {tool_name} 已连续出现 {} 次", self.same_call_streak),
+                format!(
+                    "同一调用 {tool_name} 已连续出现 {} 次",
+                    self.same_call_streak
+                ),
             ) {
                 out.push(f);
             }
@@ -496,11 +497,29 @@ fn is_benign_probe_error(error: &str) -> bool {
 /// ——所以宁可宽松：命中调研动词且没有落地动词才算。
 fn delegate_task_looks_like_research(task: &str) -> bool {
     const RESEARCH: [&str; 12] = [
-        "通读", "解剖", "调研", "探索", "摸清", "梳理", "弄清", "学习路径",
-        "背景说明", "survey", "explore", "investigate",
+        "通读",
+        "解剖",
+        "调研",
+        "探索",
+        "摸清",
+        "梳理",
+        "弄清",
+        "学习路径",
+        "背景说明",
+        "survey",
+        "explore",
+        "investigate",
     ];
     const DELIVERY: [&str; 10] = [
-        "实现", "修改", "重构", "修复", "编写", "写入", "落盘", "提交", "任务清单",
+        "实现",
+        "修改",
+        "重构",
+        "修复",
+        "编写",
+        "写入",
+        "落盘",
+        "提交",
+        "任务清单",
         "验收标准",
     ];
     let has_research = RESEARCH.iter().any(|k| task.contains(k));
@@ -625,8 +644,8 @@ fn looks_like_short_ack(response: &str) -> bool {
     }
     // 典型 ack 开头（中英常见）
     const ACK_PREFIXES: &[&str] = &[
-        "ok", "OK", "好的", "收到", "好", "是", "否", "yes", "no", "ack",
-        "ack ", "ACK", "done", "Done", "完成", "确认", "明白", "了解",
+        "ok", "OK", "好的", "收到", "好", "是", "否", "yes", "no", "ack", "ack ", "ACK", "done",
+        "Done", "完成", "确认", "明白", "了解",
     ];
     ACK_PREFIXES.iter().any(|p| trimmed.starts_with(p))
 }
@@ -1196,9 +1215,7 @@ impl AdvisorReviewEngine {
         // ── 落盘：调 LLM 后 emit ModelCall（真实时延 + finish_reason。
         // 此前在调用前记 latency=0/finish=''，审查耗时与成败全黑盒）──
         let started = std::time::Instant::now();
-        let completion = agent
-            .chat(&[sys, user], None, WaitPolicy::NoWait)
-            .await;
+        let completion = agent.chat(&[sys, user], None, WaitPolicy::NoWait).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         let completion = match completion {
             Ok(c) => c,
@@ -1365,12 +1382,7 @@ fn read_watchdog_notes(session_cwd: Option<&Path>) -> String {
 /// (`prompts::ADVISOR`) is the system message; this is the user
 /// message. `notes` is the raw concatenation of 监察笔记 files
 /// (empty when none found or the feature is off).
-fn build_review_prompt(
-    user_question: &str,
-    digest: &str,
-    trigger: &str,
-    notes: &str,
-) -> String {
+fn build_review_prompt(user_question: &str, digest: &str, trigger: &str, notes: &str) -> String {
     let attention_block = if notes.is_empty() {
         String::new()
     } else {
@@ -1824,13 +1836,12 @@ impl MonitorState {
                     // tool_use，不算空转）**且未 delegate**。也就是「反复
                     // 输出正文、既不动手也不问用户」。连续到阈值 → 升级
                     // 强制 ask，让 manager 停止空转、把分叉交用户拍板。
-                    let substantive_output = !looks_like_short_ack(content)
-                        && content.trim().chars().count() >= 40;
-                    let zero_progress = self.detectors.tool_use_count == 0
-                        && !self.delegated_this_turn;
+                    let substantive_output =
+                        !looks_like_short_ack(content) && content.trim().chars().count() >= 40;
+                    let zero_progress =
+                        self.detectors.tool_use_count == 0 && !self.delegated_this_turn;
                     if substantive_output && zero_progress {
-                        self.reasoning_stall_streak =
-                            self.reasoning_stall_streak.saturating_add(1);
+                        self.reasoning_stall_streak = self.reasoning_stall_streak.saturating_add(1);
                         if self.reasoning_stall_streak >= REASONING_STALL_TRIGGER {
                             findings.push(Finding {
                                 kind: DetectorKind::ReasoningFlipFlop,
@@ -2003,9 +2014,9 @@ impl MonitorState {
                     });
                 }
             }
-            ChatEvent::RoleFinished { role_id, detail, .. }
-                if role_id == &self.watched_role =>
-            {
+            ChatEvent::RoleFinished {
+                role_id, detail, ..
+            } if role_id == &self.watched_role => {
                 // Turn ended without a RoleTurn (error/timeout path):
                 // reset per-turn state. D1 has no final text to
                 // reconcile, so nothing fires here.
@@ -2064,12 +2075,9 @@ impl MonitorState {
                     // 嵌套 workflow 级联失败折叠：外层 summary 完整内嵌
                     // 内层 summary（或反之），同一次失败只报一次，
                     // 否则 monitor 会对同一根因连发审查、连弹暂停。
-                    let nested_dup = self
-                        .last_workflow_failure
-                        .as_deref()
-                        .is_some_and(|prev| {
-                            summary.contains(prev) || prev.contains(summary.as_str())
-                        });
+                    let nested_dup = self.last_workflow_failure.as_deref().is_some_and(|prev| {
+                        summary.contains(prev) || prev.contains(summary.as_str())
+                    });
                     self.last_workflow_failure = Some(summary.clone());
                     if !nested_dup {
                         findings.push(Finding {
@@ -2135,8 +2143,9 @@ pub trait AdvisorHost: Send + Sync + 'static {
     /// 而那需要 `.await` 一把 tokio Mutex。用 `try_lock` 降级会在锁竞争
     /// 时**丢掉唤醒**——terminate 是安全关键路径，不接受概率性失效。
     /// 手写 boxed future 可以逐字保留原行为，且不必引入 async_trait。
-    fn request_cancel_turn(&self)
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
+    fn request_cancel_turn(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>;
 }
 
 impl AdvisorHost for ChatController {
@@ -2152,12 +2161,12 @@ impl AdvisorHost for ChatController {
     fn last_user_input(&self) -> String {
         ChatController::last_user_input(self)
     }
-    fn request_cancel_turn(&self)
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    fn request_cancel_turn(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move { ChatController::cancel_turn(self).await })
     }
 }
-
 
 pub struct AdvisorMonitor;
 
@@ -2219,9 +2228,7 @@ impl AdvisorMonitor {
                     AdvisorReviewMode::OnAnomaly => {
                         !outcome.findings.is_empty() || outcome.review_requested
                     }
-                    AdvisorReviewMode::EveryTurn => {
-                        outcome.turn_ended || outcome.review_requested
-                    }
+                    AdvisorReviewMode::EveryTurn => outcome.turn_ended || outcome.review_requested,
                 };
                 if !should_review {
                     continue;
@@ -2241,7 +2248,12 @@ impl AdvisorMonitor {
                 let trigger = if !outcome.findings.is_empty() {
                     let mut s = "命中确定性检测器：".to_string();
                     for f in &outcome.findings {
-                        s.push_str(&format!("\n- {} {:?}：{}", f.kind.label(), f.kind, f.evidence));
+                        s.push_str(&format!(
+                            "\n- {} {:?}：{}",
+                            f.kind.label(),
+                            f.kind,
+                            f.evidence
+                        ));
                     }
                     s
                 } else if outcome.review_requested {
@@ -2431,7 +2443,10 @@ mod tests {
         assert!(s.allow_review(2, window));
         assert!(!s.allow_review(2, window), "quota exhausted within window");
         std::thread::sleep(std::time::Duration::from_millis(60));
-        assert!(s.allow_review(2, window), "window slid past — quota recovered");
+        assert!(
+            s.allow_review(2, window),
+            "window slid past — quota recovered"
+        );
     }
 
     // ── D8: serial delegate streak ─────────────────────────────────
@@ -2482,7 +2497,10 @@ mod tests {
         assert!(s.observe(&delegate_started("designer")).findings.is_empty());
         s.observe(&delegate_finished("pm"));
         // designer 仍在跑，再发一个也算并行
-        assert!(s.observe(&delegate_started("programmer")).findings.is_empty());
+        assert!(s
+            .observe(&delegate_started("programmer"))
+            .findings
+            .is_empty());
     }
 
     // ── specialist tool errors ─────────────────────────────────────
@@ -2499,13 +2517,19 @@ mod tests {
     #[test]
     fn specialist_error_streak_fires_once_per_turn() {
         let mut s = state();
-        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+        assert!(s
+            .observe(&specialist_error("programmer"))
+            .findings
+            .is_empty());
         let out = s.observe(&specialist_error("programmer"));
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
         assert!(out.findings[0].hint.contains("programmer"));
         // 第三次不重复报
-        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+        assert!(s
+            .observe(&specialist_error("programmer"))
+            .findings
+            .is_empty());
     }
 
     #[test]
@@ -2519,7 +2543,10 @@ mod tests {
             sub_id: None,
         });
         // streak 被重置，单个错误不再触发
-        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+        assert!(s
+            .observe(&specialist_error("programmer"))
+            .findings
+            .is_empty());
     }
 
     #[test]
@@ -2576,7 +2603,15 @@ mod tests {
     fn delegate_review_prompt_fits_typical_report_without_truncation() {
         // 25K 字符的专家报告（本次事故的实际尺寸）应完整进入 prompt。
         let report = "x".repeat(25_000);
-        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "", None);
+        let p = build_delegate_review_prompt(
+            "主诉求",
+            "programmer",
+            "写代码",
+            "任务",
+            &report,
+            "",
+            None,
+        );
         assert!(p.contains(&report), "25K 报告不应被截断");
         assert!(!p.contains("被截断"), "未截断时不应出现截断提示");
     }
@@ -2584,7 +2619,15 @@ mod tests {
     #[test]
     fn delegate_review_prompt_notes_truncation_when_over_budget() {
         let report = "x".repeat(DELEGATE_REVIEW_RESPONSE_MAX_CHARS + 10_000);
-        let p = build_delegate_review_prompt("主诉求", "programmer", "写代码", "任务", &report, "", None);
+        let p = build_delegate_review_prompt(
+            "主诉求",
+            "programmer",
+            "写代码",
+            "任务",
+            &report,
+            "",
+            None,
+        );
         assert!(p.contains("被截断"), "超预算时必须显式告知复审模型");
         assert!(p.contains("[+"), "保留截断标记");
     }
@@ -2604,14 +2647,27 @@ mod tests {
             Some("- 本步授权工具（白名单）：write\n- 产出上限 60 字符"),
         );
         assert!(with.contains("执行约束"), "要有约束专节标题: {with}");
-        assert!(with.contains("产出上限 60 字符"), "约束正文要进 prompt: {with}");
+        assert!(
+            with.contains("产出上限 60 字符"),
+            "约束正文要进 prompt: {with}"
+        );
         assert!(
             with.contains("流水线的其中一环"),
             "要有「不要拿完整任务标准量一环」的指引: {with}"
         );
-        let without =
-            build_delegate_review_prompt("主诉求", "planner", "产出计划标识", "只输出 slug", "r", "", None);
-        assert!(!without.contains("执行约束"), "无约束时不渲染该节: {without}");
+        let without = build_delegate_review_prompt(
+            "主诉求",
+            "planner",
+            "产出计划标识",
+            "只输出 slug",
+            "r",
+            "",
+            None,
+        );
+        assert!(
+            !without.contains("执行约束"),
+            "无约束时不渲染该节: {without}"
+        );
         assert!(!without.contains("流水线的其中一环"));
     }
 
@@ -2650,7 +2706,10 @@ mod tests {
         let mut s = state();
         // 真实错误 → ENOENT 探测 → 真实错误：streak 延续，第二个
         // 真实错误到达 ≥2 即触发。
-        assert!(s.observe(&tool_error("bash", "exit code 1")).findings.is_empty());
+        assert!(s
+            .observe(&tool_error("bash", "exit code 1"))
+            .findings
+            .is_empty());
         assert!(s.observe(&tool_error("read", ENOENT)).findings.is_empty());
         let out = s.observe(&tool_error("bash", "exit code 1"));
         assert_eq!(out.findings.len(), 1);
@@ -2670,7 +2729,10 @@ mod tests {
         assert!(s.observe(&enoent()).findings.is_empty());
         assert_eq!(s.specialist_error_streak, 0);
         // 之后真实错误仍从 0 开始累计，单个不触发。
-        assert!(s.observe(&specialist_error("programmer")).findings.is_empty());
+        assert!(s
+            .observe(&specialist_error("programmer"))
+            .findings
+            .is_empty());
         let out = s.observe(&specialist_error("programmer"));
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].kind, DetectorKind::ToolErrorStreak);
@@ -2695,8 +2757,13 @@ mod tests {
     fn d9_silent_with_short_message_or_tool_use() {
         // 短消息（闲聊）不报
         let mut s = state();
-        s.observe(&ChatEvent::UserMessage { text: "你好".into() });
-        assert!(s.observe(&role_turn("你好！有什么可以帮你？")).findings.is_empty());
+        s.observe(&ChatEvent::UserMessage {
+            text: "你好".into(),
+        });
+        assert!(s
+            .observe(&role_turn("你好！有什么可以帮你？"))
+            .findings
+            .is_empty());
 
         // 用了工具不报
         let mut s = state();
@@ -2704,7 +2771,10 @@ mod tests {
             text: "帮我分析一下这个项目的架构并给出三个可落地的重构建议".into(),
         });
         s.observe(&tool_use("search", "{\"q\":\"arch\"}"));
-        assert!(s.observe(&role_turn("查完了，结论如下：……")).findings.is_empty());
+        assert!(s
+            .observe(&role_turn("查完了，结论如下：……"))
+            .findings
+            .is_empty());
     }
 
     /// 回归：流式片段（`is_complete: false`）不能触发 D1/D9/D10。
@@ -2740,7 +2810,9 @@ mod tests {
         let out = s.observe(&role_turn("已发起 learn workflow。"));
         assert!(out.turn_ended);
         assert!(
-            out.findings.iter().all(|f| f.kind != DetectorKind::NoToolTurn),
+            out.findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::NoToolTurn),
             "真正调用了工具，D9 不该报: {:?}",
             out.findings
         );
@@ -2910,7 +2982,9 @@ mod tests {
     #[test]
     fn many_research_rounds_are_fine_when_no_deliverable_was_named() {
         let mut s = state();
-        s.observe(&user_msg("arena 和 extent 之间的锁顺序是怎么回事？有什么坑"));
+        s.observe(&user_msg(
+            "arena 和 extent 之间的锁顺序是怎么回事？有什么坑",
+        ));
         for _ in 0..5 {
             s.observe(&wf_started("explore"));
             s.observe(&wf_finished("explore"));
@@ -2977,9 +3051,7 @@ mod tests {
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some());
         s.observe(&wf_started("implementation_plan"));
-        let facts = s
-            .session_facts()
-            .expect("教程还欠着，缺口不该整体关闭");
+        let facts = s.session_facts().expect("教程还欠着，缺口不该整体关闭");
         assert!(facts.contains("已经往产出走的"), "{facts}");
         assert!(facts.contains("任务清单"), "{facts}");
         assert!(facts.contains("仍然欠着的"), "{facts}");
@@ -3008,9 +3080,7 @@ mod tests {
         s.observe(&wf_started("explore"));
         s.observe(&wf_finished("explore"));
         s.observe(&wf_started("learn"));
-        let facts = s
-            .session_facts()
-            .expect("任务清单还欠着，必须继续报缺口");
+        let facts = s.session_facts().expect("任务清单还欠着，必须继续报缺口");
         assert!(facts.contains("仍然欠着的"), "{facts}");
         assert!(facts.contains("任务清单"), "{facts}");
         assert!(
@@ -3027,9 +3097,7 @@ mod tests {
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some());
         s.observe(&tool_use("plan", "{\"tasks\":[]}"));
-        let facts = s
-            .session_facts()
-            .expect("提交清单关不掉「教程」这一样");
+        let facts = s.session_facts().expect("提交清单关不掉「教程」这一样");
         assert!(facts.contains("任务清单"), "{facts}");
         assert!(facts.contains("教程 / 学习材料"), "{facts}");
     }
@@ -3110,8 +3178,7 @@ mod tests {
     fn d7_nested_cascade_reports_once() {
         let mut s = state();
         let inner = "step 'synthesize' speaker 'architect': subagent failed（已完成 1/2 步）";
-        let outer =
-            format!("step 'explore' nested workflow 'explore': {inner}（已完成 0/6 步）");
+        let outer = format!("step 'explore' nested workflow 'explore': {inner}（已完成 0/6 步）");
 
         let out1 = s.observe(&ChatEvent::WorkflowFinished {
             name: "explore".into(),
@@ -3161,7 +3228,10 @@ mod tests {
     fn d1_fires_when_turn_text_has_more_opens_than_executions() {
         let mut s = state();
         // One call executed, but the final answer contains two opens.
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
         let out = s.observe(&role_turn(
             "我来读两个文件\n<tool_call>read {\"path\":\"a\"}</tool_call>\n<tool_call>read {\"path\":\"b\"}</tool_call>",
         ));
@@ -3202,10 +3272,16 @@ mod tests {
     #[test]
     fn d2_silent_on_valid_json_and_skips_sink_truncated_args() {
         let mut s = state();
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
         // Sink-truncated payload: invalid JSON but only because of the
         // truncation marker — must not fire.
-        let truncated = format!("{}...[+42B]", "{\"path\":\"".to_string() + &"x".repeat(1_200));
+        let truncated = format!(
+            "{}...[+42B]",
+            "{\"path\":\"".to_string() + &"x".repeat(1_200)
+        );
         assert!(s.observe(&tool_use("read", &truncated)).findings.is_empty());
     }
 
@@ -3242,13 +3318,22 @@ mod tests {
     #[test]
     fn d4_fires_on_third_identical_call_and_dedups() {
         let mut s = state();
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
         let out = s.observe(&tool_use("read", "{\"path\":\"a\"}"));
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.findings[0].kind, DetectorKind::ToolCallLoop);
         // Fourth identical: no re-fire this turn.
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
     }
 
     #[test]
@@ -3257,8 +3342,14 @@ mod tests {
         s.observe(&tool_use("read", "{\"path\":\"a\"}"));
         s.observe(&tool_use("read", "{\"path\":\"a\"}"));
         s.observe(&tool_use("read", "{\"path\":\"b\"}"));
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
-        assert!(s.observe(&tool_use("read", "{\"path\":\"a\"}")).findings.is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
+        assert!(s
+            .observe(&tool_use("read", "{\"path\":\"a\"}"))
+            .findings
+            .is_empty());
     }
 
     // ── role filtering / self-ignore ───────────────────────────────
@@ -3450,7 +3541,10 @@ mod tests {
         let mut d = DispatchDigest::default();
         d.push("[delegate → programmer] 写代码".into());
         let rendered = d.render();
-        assert!(!rendered.contains("已省略"), "未超限不该有省略提示: {rendered}");
+        assert!(
+            !rendered.contains("已省略"),
+            "未超限不该有省略提示: {rendered}"
+        );
         assert_eq!(d.dropped, 0);
     }
 
@@ -3460,7 +3554,11 @@ mod tests {
         let mut d = DispatchDigest::default();
         d.push(format!("[delegate → programmer] {}", "任".repeat(2_000)));
         let rendered = d.render();
-        assert!(rendered.contains("[+"), "单条截断要留标记: {}", &rendered[..80.min(rendered.len())]);
+        assert!(
+            rendered.contains("[+"),
+            "单条截断要留标记: {}",
+            &rendered[..80.min(rendered.len())]
+        );
     }
 
     /// 惰性重置：标记后要等下一条事件才清空。
@@ -3519,8 +3617,8 @@ mod tests {
                     max_tokens: 4096,
                     omit_max_tokens: false,
                     max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                    prompt_cache: false,
+                    prompt_cache_key: None,
                     supports_thinking: false,
                     supports_vision: false,
                     supports_image_generation: false,
@@ -3548,8 +3646,12 @@ mod tests {
         pred: impl Fn(&[String]) -> bool,
     ) -> Vec<String> {
         for _ in 0..100 {
-            let snapshot: Vec<String> =
-                controller.advisor_hint_queue().lock().iter().cloned().collect();
+            let snapshot: Vec<String> = controller
+                .advisor_hint_queue()
+                .lock()
+                .iter()
+                .cloned()
+                .collect();
             if pred(&snapshot) {
                 return snapshot;
             }
@@ -3596,16 +3698,20 @@ mod tests {
             h.iter().any(|x| x.contains("工具连续报错"))
         })
         .await;
-        assert_eq!(hints.len(), 1, "only the deterministic hint so far: {hints:?}");
+        assert_eq!(
+            hints.len(),
+            1,
+            "only the deterministic hint so far: {hints:?}"
+        );
 
         // 2. LLM review ran (mock advisor hit once) and produced an
         //    intervene verdict → channel B bubble + corrective hint.
         let bubble = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match bubble_rx.recv().await {
-                    Ok(ChatEvent::RoleTurn { role_id, content, .. }) if role_id == "advisor" => {
-                        break content
-                    }
+                    Ok(ChatEvent::RoleTurn {
+                        role_id, content, ..
+                    }) if role_id == "advisor" => break content,
                     Ok(_) => continue,
                     Err(e) => panic!("event stream ended before advisor bubble: {e}"),
                 }
@@ -3613,9 +3719,18 @@ mod tests {
         })
         .await
         .expect("advisor bubble should arrive");
-        assert!(bubble.contains("🛑 intervene"), "bubble has verdict label: {bubble}");
-        assert!(bubble.contains("工具连续失败"), "bubble carries reason: {bubble}");
-        assert!(bubble.contains("停止重复调用"), "bubble quotes hint: {bubble}");
+        assert!(
+            bubble.contains("🛑 intervene"),
+            "bubble has verdict label: {bubble}"
+        );
+        assert!(
+            bubble.contains("工具连续失败"),
+            "bubble carries reason: {bubble}"
+        );
+        assert!(
+            bubble.contains("停止重复调用"),
+            "bubble quotes hint: {bubble}"
+        );
 
         let hints = wait_for_hints(&controller, |h| h.len() >= 2).await;
         assert!(
@@ -3626,13 +3741,27 @@ mod tests {
         // 3. The review request carried the trigger + transcript +
         //    user question.
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "exactly one review call: {}", requests.len());
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one review call: {}",
+            requests.len()
+        );
         let body: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("request body is json");
         let body_str = body.to_string();
-        assert!(body_str.contains("D3"), "trigger evidence in prompt: {body_str}");
-        assert!(body_str.contains("[tool_error] exec"), "transcript in prompt");
-        assert!(body_str.contains("帮我修 compile error"), "user question in prompt");
+        assert!(
+            body_str.contains("D3"),
+            "trigger evidence in prompt: {body_str}"
+        );
+        assert!(
+            body_str.contains("[tool_error] exec"),
+            "transcript in prompt"
+        );
+        assert!(
+            body_str.contains("帮我修 compile error"),
+            "user question in prompt"
+        );
     }
 
     #[tokio::test]
@@ -3672,12 +3801,19 @@ mod tests {
             let (mut saw_bubble, mut saw_terminated) = (false, false);
             loop {
                 match bubble_rx.recv().await {
-                    Ok(ChatEvent::RoleTurn { role_id, content, .. }) if role_id == "advisor" => {
+                    Ok(ChatEvent::RoleTurn {
+                        role_id, content, ..
+                    }) if role_id == "advisor" => {
                         assert!(content.contains("🛑 terminate"), "label: {content}");
                         assert!(content.contains("幻觉实锤"), "reason in bubble: {content}");
                         saw_bubble = true;
                     }
-                    Ok(ChatEvent::AdvisorTerminated { role_id, reason, detector, sub_id }) => {
+                    Ok(ChatEvent::AdvisorTerminated {
+                        role_id,
+                        reason,
+                        detector,
+                        sub_id,
+                    }) => {
                         assert_eq!(role_id, "manager", "terminated role is the watched role");
                         assert!(reason.contains("幻觉实锤"), "reason carried: {reason}");
                         assert_eq!(detector.as_deref(), Some("LLM"), "LLM review source");
@@ -3841,8 +3977,8 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
-                        "verdict: warn\nreason: 有点跑偏但可能自愈\nhint: 收敛范围，先交付最小可用版",
-                    ))),
+                    "verdict: warn\nreason: 有点跑偏但可能自愈\nhint: 收敛范围，先交付最小可用版",
+                ))),
             )
             .await;
 
@@ -3864,9 +4000,9 @@ mod tests {
         let bubble = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match bubble_rx.recv().await {
-                    Ok(ChatEvent::RoleTurn { role_id, content, .. }) if role_id == "advisor" => {
-                        break content
-                    }
+                    Ok(ChatEvent::RoleTurn {
+                        role_id, content, ..
+                    }) if role_id == "advisor" => break content,
                     Ok(_) => continue,
                     Err(e) => panic!("event stream ended before advisor bubble: {e}"),
                 }
@@ -3884,10 +4020,7 @@ mod tests {
         // …and the hint IS injected into the manager's hint queue
         // (实测事故：warn 只发气泡，「过度编排」警告 manager
         // 完全收不到)。队列里同时有确定性 D3 hint 和 warn hint。
-        let hints = wait_for_hints(&controller, |h| {
-            h.iter().any(|x| x.contains("收敛范围"))
-        })
-        .await;
+        let hints = wait_for_hints(&controller, |h| h.iter().any(|x| x.contains("收敛范围"))).await;
         assert!(
             hints.iter().any(|x| x.contains("工具连续报错")),
             "deterministic D3 hint still injected: {hints:?}"
@@ -3942,10 +4075,7 @@ mod tests {
         for _ in 0..3 {
             tx.send(tool_use("read", "{\"path\":\"a\"}")).unwrap();
         }
-        let hints = wait_for_hints(&controller, |h| {
-            h.iter().any(|x| x.contains("调用循环"))
-        })
-        .await;
+        let hints = wait_for_hints(&controller, |h| h.iter().any(|x| x.contains("调用循环"))).await;
         assert_eq!(hints.len(), 2, "D3 + D4 deterministic hints: {hints:?}");
     }
 
@@ -3960,8 +4090,7 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(
-                        ResponseTemplate::new(200)
-                            .set_body_string(openai_body("verdict: ok")),
+                        ResponseTemplate::new(200).set_body_string(openai_body("verdict: ok")),
                     ),
             )
             .await;
@@ -4001,7 +4130,9 @@ mod tests {
     /// Redirect LATTE_HOME to `dir` for the rest of the test,
     /// holding the process-wide env lock. Returns the guard +
     /// previous value; restore via `restore_latte_home`.
-    fn set_latte_home(dir: &std::path::Path) -> (std::sync::MutexGuard<'static, ()>, Option<String>) {
+    fn set_latte_home(
+        dir: &std::path::Path,
+    ) -> (std::sync::MutexGuard<'static, ()>, Option<String>) {
         let guard = crate::test_util::ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
@@ -4046,7 +4177,13 @@ mod tests {
         tx.send(tool_error("exec", "boom1")).unwrap();
         tx.send(tool_error("exec", "boom2")).unwrap();
         for _ in 0..150 {
-            if server.received_requests().await.map(|r| r.len()).unwrap_or(0) >= 1 {
+            if server
+                .received_requests()
+                .await
+                .map(|r| r.len())
+                .unwrap_or(0)
+                >= 1
+            {
                 let reqs = server.received_requests().await.unwrap();
                 return String::from_utf8_lossy(&reqs[0].body).to_string();
             }
@@ -4071,8 +4208,14 @@ mod tests {
         let body = run_one_review_request(engine, &server).await;
 
         assert!(body.contains("<attention>"), "attention block: {body}");
-        assert!(body.contains("本项目禁止直接改生产 DB"), "note content: {body}");
-        assert!(body.contains("特别关注以下本项目监察笔记"), "guidance line: {body}");
+        assert!(
+            body.contains("本项目禁止直接改生产 DB"),
+            "note content: {body}"
+        );
+        assert!(
+            body.contains("特别关注以下本项目监察笔记"),
+            "guidance line: {body}"
+        );
 
         restore_latte_home(prev);
     }
@@ -4081,9 +4224,17 @@ mod tests {
     async fn watchdog_project_and_global_notes_project_first() {
         let proj = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(proj.path().join(".latte")).unwrap();
-        std::fs::write(proj.path().join(".latte").join("advisor-watchdog.md"), "PROJECT-NOTE-项目级").unwrap();
+        std::fs::write(
+            proj.path().join(".latte").join("advisor-watchdog.md"),
+            "PROJECT-NOTE-项目级",
+        )
+        .unwrap();
         let global = tempfile::tempdir().unwrap();
-        std::fs::write(global.path().join("advisor-watchdog.md"), "GLOBAL-NOTE-全局级").unwrap();
+        std::fs::write(
+            global.path().join("advisor-watchdog.md"),
+            "GLOBAL-NOTE-全局级",
+        )
+        .unwrap();
         let (_guard, prev) = set_latte_home(global.path());
 
         let server = wiremock::MockServer::start().await;
@@ -4091,8 +4242,12 @@ mod tests {
             .with_watchdog_notes(proj.path().to_path_buf(), true);
         let body = run_one_review_request(engine, &server).await;
 
-        let i_proj = body.find("PROJECT-NOTE-项目级").expect("project note present");
-        let i_glob = body.find("GLOBAL-NOTE-全局级").expect("global note present");
+        let i_proj = body
+            .find("PROJECT-NOTE-项目级")
+            .expect("project note present");
+        let i_glob = body
+            .find("GLOBAL-NOTE-全局级")
+            .expect("global note present");
         assert!(i_proj < i_glob, "project note before global note: {body}");
 
         restore_latte_home(prev);
@@ -4120,7 +4275,11 @@ mod tests {
     async fn watchdog_disabled_switch_skips_reading() {
         let proj = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(proj.path().join(".latte")).unwrap();
-        std::fs::write(proj.path().join(".latte").join("advisor-watchdog.md"), "PROJECT-NOTE-项目级").unwrap();
+        std::fs::write(
+            proj.path().join(".latte").join("advisor-watchdog.md"),
+            "PROJECT-NOTE-项目级",
+        )
+        .unwrap();
         let global = tempfile::tempdir().unwrap();
         let (_guard, prev) = set_latte_home(global.path());
 
@@ -4129,7 +4288,10 @@ mod tests {
             .with_watchdog_notes(proj.path().to_path_buf(), false);
         let body = run_one_review_request(engine, &server).await;
 
-        assert!(!body.contains("<attention>"), "switch off → no block: {body}");
+        assert!(
+            !body.contains("<attention>"),
+            "switch off → no block: {body}"
+        );
         assert!(!body.contains("PROJECT-NOTE"), "note not read: {body}");
 
         restore_latte_home(prev);
@@ -4149,18 +4311,27 @@ mod tests {
         let cfg = GateConfig::default();
         let verdict = check_response_gates(response, 0, &cfg);
         assert!(
-            matches!(verdict, GateVerdict::Fail { detector: DetectorKind::ToolCallEcho, .. }),
+            matches!(
+                verdict,
+                GateVerdict::Fail {
+                    detector: DetectorKind::ToolCallEcho,
+                    ..
+                }
+            ),
             "expected D6 ToolCallEcho fail, got {verdict:?}"
         );
     }
     #[test]
     fn gate_d6_passes_when_tool_was_actually_executed() {
-         // 同样的 response，但 tool_use_count=1（工具真执行了，response
+        // 同样的 response，但 tool_use_count=1（工具真执行了，response
         let response = "Here is the result based on the read tool I just called: \
                         <read><path>foo.rs</path></read>";
         let cfg = GateConfig::default();
         let verdict = check_response_gates(response, 1, &cfg);
-        assert!(matches!(verdict, GateVerdict::Pass), "expected Pass, got {verdict:?}");
+        assert!(
+            matches!(verdict, GateVerdict::Pass),
+            "expected Pass, got {verdict:?}"
+        );
     }
 
     #[test]
@@ -4179,7 +4350,13 @@ mod tests {
         let response = "TODO"; // 4 chars, not an ack
         let verdict = check_response_gates(response, 0, &GateConfig::default());
         assert!(
-            matches!(verdict, GateVerdict::Fail { detector: DetectorKind::ShortOutput, .. }),
+            matches!(
+                verdict,
+                GateVerdict::Fail {
+                    detector: DetectorKind::ShortOutput,
+                    ..
+                }
+            ),
             "expected D5, got {verdict:?}"
         );
     }
@@ -4190,7 +4367,10 @@ mod tests {
                         and has way more than the 50 character threshold. It contains real \
                         content, not just tool call syntax.";
         let verdict = check_response_gates(response, 0, &GateConfig::default());
-        assert!(matches!(verdict, GateVerdict::Pass), "expected Pass, got {verdict:?}");
+        assert!(
+            matches!(verdict, GateVerdict::Pass),
+            "expected Pass, got {verdict:?}"
+        );
     }
 
     #[test]
@@ -4202,8 +4382,14 @@ mod tests {
         let verdict = check_response_gates(response, 0, &cfg);
         match verdict {
             GateVerdict::Fail { hint, .. } => {
-                assert!(hint.contains("tool_call"), "hint must mention <tool_call> format: {hint}");
-                assert!(hint.contains("D6"), "hint should label the detector: {hint}");
+                assert!(
+                    hint.contains("tool_call"),
+                    "hint must mention <tool_call> format: {hint}"
+                );
+                assert!(
+                    hint.contains("D6"),
+                    "hint should label the detector: {hint}"
+                );
             }
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -4225,7 +4411,10 @@ mod tests {
             twenty_cjk.chars().count() < cfg.short_output_threshold,
             "前提：字符数不足阈值"
         );
-        assert!(twenty_cjk.len() > cfg.short_output_threshold, "前提：字节数超阈值");
+        assert!(
+            twenty_cjk.len() > cfg.short_output_threshold,
+            "前提：字节数超阈值"
+        );
         assert!(
             matches!(check_response_gates(twenty_cjk, 0, &cfg), GateVerdict::Pass),
             "合格的中文短答复必须放行（按字节计），实际 {:?}",
@@ -4235,7 +4424,10 @@ mod tests {
         match check_response_gates("TODO", 0, &cfg) {
             GateVerdict::Fail { hint, evidence, .. } => {
                 assert!(hint.contains("字节"), "hint 应如实说字节: {hint}");
-                assert!(evidence.contains("bytes"), "evidence 应标明单位: {evidence}");
+                assert!(
+                    evidence.contains("bytes"),
+                    "evidence 应标明单位: {evidence}"
+                );
             }
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -4263,7 +4455,10 @@ mod tests {
                 "前提：{verdict_text} 确实短于阈值"
             );
             assert!(
-                matches!(check_response_gates(verdict_text, 0, &cfg), GateVerdict::Pass),
+                matches!(
+                    check_response_gates(verdict_text, 0, &cfg),
+                    GateVerdict::Pass
+                ),
                 "契约要求的裁决 `{verdict_text}` 必须放行，实际 {:?}",
                 check_response_gates(verdict_text, 0, &cfg)
             );
@@ -4278,7 +4473,10 @@ mod tests {
         assert!(
             matches!(
                 check_response_gates(sneaky, 0, &cfg),
-                GateVerdict::Fail { detector: DetectorKind::ShortOutput, .. }
+                GateVerdict::Fail {
+                    detector: DetectorKind::ShortOutput,
+                    ..
+                }
             ),
             "非开头的 VERDICT 不应豁免"
         );
@@ -4346,7 +4544,10 @@ mod tests {
             basis: String::new(),
         };
         let out = compose_intervene_hint(&v);
-        assert!(out.contains("请先核实"), "无依据的 factual 应降级为先核实: {out}");
+        assert!(
+            out.contains("请先核实"),
+            "无依据的 factual 应降级为先核实: {out}"
+        );
         assert!(!out.contains("应服从"), "无依据不该要求盲从: {out}");
     }
 
@@ -4388,7 +4589,9 @@ mod tests {
         // 第一轮：有输出、零工具、零 delegate → 累计，不触发。
         let out1 = s.observe(&role_turn(STALL_TEXT));
         assert!(
-            out1.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            out1.findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
             "首轮空转只累计不触发"
         );
         // 第二轮再空转 → 达阈值触发 D10。
@@ -4399,7 +4602,11 @@ mod tests {
             .iter()
             .find(|f| f.kind == DetectorKind::ReasoningFlipFlop)
             .expect("连续两轮零推进应触发 D10");
-        assert!(d10.hint.contains("ask"), "D10 hint 应指示用 ask 交用户拍板: {}", d10.hint);
+        assert!(
+            d10.hint.contains("ask"),
+            "D10 hint 应指示用 ask 交用户拍板: {}",
+            d10.hint
+        );
     }
 
     #[test]
@@ -4413,7 +4620,9 @@ mod tests {
         s.observe(&mgr_tool_use("ask")); // 本轮问了用户
         let out = s.observe(&role_turn("请在上方选择"));
         assert!(
-            out.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            out.findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
             "调用了 ask 的轮次是正确出口，不该触发 D10"
         );
     }
@@ -4428,7 +4637,9 @@ mod tests {
         s.observe(&delegate_started("programmer")); // 本轮派了活
         let out = s.observe(&role_turn("已委派 programmer 去实现"));
         assert!(
-            out.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            out.findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
             "发生 delegate 的轮次不是空转，不该触发 D10"
         );
     }
@@ -4438,25 +4649,32 @@ mod tests {
         let mut s = state();
         s.observe(&user_msg("拆分学习 jemalloc 的任务清单和配套教程"));
         s.observe(&role_turn(STALL_TEXT)); // streak = 1
-        // 中间一轮有实质工具动作（read）→ 该轮收尾清零。
+                                           // 中间一轮有实质工具动作（read）→ 该轮收尾清零。
         s.observe(&user_msg("继续"));
         s.observe(&mgr_tool_use("read"));
         let mid = s.observe(&role_turn("读了 src/x.rs，接下来…"));
         assert!(
-            mid.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            mid.findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
             "有工具动作的这轮不该触发、且清零"
         );
         // 此后需要重新连续两轮零推进才触发。
         s.observe(&user_msg("继续"));
         let first = s.observe(&role_turn(STALL_TEXT)); // streak = 1
         assert!(
-            first.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            first
+                .findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
             "清零后首轮只累计"
         );
         s.observe(&user_msg("继续"));
         let out = s.observe(&role_turn(STALL_TEXT)); // streak = 2 → fire
         assert!(
-            out.findings.iter().any(|f| f.kind == DetectorKind::ReasoningFlipFlop),
+            out.findings
+                .iter()
+                .any(|f| f.kind == DetectorKind::ReasoningFlipFlop),
             "清零后重新连续两轮零推进才触发"
         );
     }
@@ -4471,7 +4689,9 @@ mod tests {
         s.observe(&user_msg("继续"));
         let out = s.observe(&role_turn("好的")); // 仍是短 ack
         assert!(
-            out.findings.iter().all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
+            out.findings
+                .iter()
+                .all(|f| f.kind != DetectorKind::ReasoningFlipFlop),
             "短 ack 不算实质输出，不该累计成空转"
         );
     }

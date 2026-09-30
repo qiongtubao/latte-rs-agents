@@ -141,7 +141,8 @@ impl Goal {
 
     /// 剩余 token 预算；`None` = 不限。
     pub fn tokens_remaining(&self) -> Option<u64> {
-        self.token_budget.map(|b| b.saturating_sub(self.tokens_used))
+        self.token_budget
+            .map(|b| b.saturating_sub(self.tokens_used))
     }
 }
 
@@ -175,7 +176,10 @@ pub enum GoalError {
     /// 已有一个未完成的目标，不能再建。
     AlreadyActive { objective: String },
     /// 轮次预算已耗尽，`resume` 前必须先抬高 `max_rounds`。
-    RoundsExhausted { rounds_started: u32, max_rounds: u32 },
+    RoundsExhausted {
+        rounds_started: u32,
+        max_rounds: u32,
+    },
     /// token 预算已耗尽，`resume` 前必须先抬高或清除预算。
     TokensExhausted { tokens_used: u64, token_budget: u64 },
     /// objective 为空。
@@ -286,10 +290,7 @@ pub enum DriveDecision {
     /// 不需要驱动（没目标 / 非 active / disarmed）。
     Idle,
     /// 该注入一轮 continuation。`round` 是本轮轮号（1-based）。
-    Round {
-        goal: Goal,
-        round: u32,
-    },
+    Round { goal: Goal, round: u32 },
     /// 刚刚因为撞上硬边界转成 `blocked`——调用方应把 `reason` 告知用户。
     JustBlocked { goal: Goal, reason: GoalBlockReason },
 }
@@ -307,10 +308,7 @@ impl GoalState {
 
     /// 是否正在推进一个目标（active，不论 armed）。
     pub fn is_active(&self) -> bool {
-        matches!(
-            self.goal.as_ref().map(|g| g.phase),
-            Some(GoalPhase::Active)
-        )
+        matches!(self.goal.as_ref().map(|g| g.phase), Some(GoalPhase::Active))
     }
 
     /// **安全阀**：把一个（比如从磁盘/session log 载入的）目标装进来，
@@ -603,10 +601,7 @@ pub struct GoalUsageDelta {
 impl GoalUsageDelta {
     /// 计入预算的 token 数。见 [`GoalState::record_usage`] 的口径说明。
     pub fn billable(&self) -> u64 {
-        self.input.saturating_sub(self.cache_read)
-            + self.output
-            + self.thinking
-            + self.cache_write
+        self.input.saturating_sub(self.cache_read) + self.output + self.thinking + self.cache_write
     }
 }
 
@@ -835,7 +830,8 @@ mod tests {
     fn create_allowed_after_complete() {
         let (mut s, r) = armed_goal(3);
         s.complete(&r).expect("complete");
-        s.create("下一件事", None, None, false).expect("create again");
+        s.create("下一件事", None, None, false)
+            .expect("create again");
         assert_eq!(s.current().unwrap().phase, GoalPhase::Active);
     }
 
@@ -856,16 +852,20 @@ mod tests {
             GoalActivation::Disarmed,
             "但自动续跑必须是关的——重启就自己接着跑会在用户不在场时烧 token"
         );
-        assert_eq!(s.drive(), DriveDecision::Idle, "disarmed 时 driver 必须不动");
+        assert_eq!(
+            s.drive(),
+            DriveDecision::Idle,
+            "disarmed 时 driver 必须不动"
+        );
 
         // 显式 resume → arm → driver 才开始工作。
         let resumed = s.resume(&persisted.goal_ref()).expect("resume");
         assert_eq!(s.activation(), GoalActivation::Armed);
-        assert!(matches!(
-            s.drive(),
-            DriveDecision::Round { round: 1, .. }
-        ));
-        assert!(resumed.revision > persisted.revision, "mutation 必须推进 revision");
+        assert!(matches!(s.drive(), DriveDecision::Round { round: 1, .. }));
+        assert!(
+            resumed.revision > persisted.revision,
+            "mutation 必须推进 revision"
+        );
     }
 
     /// CAS：陈旧 ref 必须被拒，且不改状态。
@@ -900,7 +900,8 @@ mod tests {
         ));
         // block 只能从 active
         assert!(matches!(
-            s.block(&paused.goal_ref(), GoalBlockReason::new("x", "y")).unwrap_err(),
+            s.block(&paused.goal_ref(), GoalBlockReason::new("x", "y"))
+                .unwrap_err(),
             GoalError::InvalidTransition { op: "block", .. }
         ));
         // paused → active
@@ -909,7 +910,11 @@ mod tests {
         let blocked = s
             .block(&active.goal_ref(), GoalBlockReason::new("x", "y"))
             .expect("active → blocked");
-        assert_eq!(s.activation(), GoalActivation::Disarmed, "block 必须 disarm");
+        assert_eq!(
+            s.activation(),
+            GoalActivation::Disarmed,
+            "block 必须 disarm"
+        );
         let re = s.resume(&blocked.goal_ref()).expect("blocked → active");
         assert!(re.blocked_reason.is_none(), "resume 应清掉 blocked_reason");
         // complete 之后不能再 complete / resume
@@ -947,7 +952,11 @@ mod tests {
         assert!(matches!(s.drive(), DriveDecision::Round { round: 2, .. }));
         match s.drive() {
             DriveDecision::JustBlocked { goal, reason } => {
-                assert_eq!(goal.phase, GoalPhase::Blocked, "耗尽是 blocked 而非 complete");
+                assert_eq!(
+                    goal.phase,
+                    GoalPhase::Blocked,
+                    "耗尽是 blocked 而非 complete"
+                );
                 assert_eq!(reason.code, BLOCK_CODE_ROUND_LIMIT);
                 assert!(reason.message.contains("≠ 目标达成"), "{}", reason.message);
             }
@@ -1011,7 +1020,8 @@ mod tests {
     #[test]
     fn token_budget_exhaustion_blocks_rather_than_completing() {
         let mut s = GoalState::default();
-        s.create("重活", Some(10), Some(1_000), false).expect("create");
+        s.create("重活", Some(10), Some(1_000), false)
+            .expect("create");
         let under = GoalUsageDelta {
             input: 400,
             ..Default::default()
@@ -1093,7 +1103,11 @@ mod tests {
         assert_eq!(default_max_goal_rounds(), 1, "0 会让目标建了就立刻 block");
 
         std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", "不是数字");
-        assert_eq!(default_max_goal_rounds(), DEFAULT_MAX_GOAL_ROUNDS, "非法值回退默认");
+        assert_eq!(
+            default_max_goal_rounds(),
+            DEFAULT_MAX_GOAL_ROUNDS,
+            "非法值回退默认"
+        );
 
         // 显式传参优先于 env。
         std::env::set_var("LATTE_AGENT_GOAL_MAX_ROUNDS", "40");
@@ -1131,27 +1145,43 @@ mod tests {
         };
         let p = render_goal_round_prompt(&goal, 1);
 
-        assert!(p.contains("<goal_round>") && p.contains("</goal_round>"), "要有标签边界");
+        assert!(
+            p.contains("<goal_round>") && p.contains("</goal_round>"),
+            "要有标签边界"
+        );
         assert!(p.contains("把 loop 缺口补齐"), "要带 objective 原文");
         assert!(p.contains("Round: 1/7"), "要带轮号与上限：{p}");
         assert!(p.contains("未设上限"), "无预算时要说明：{p}");
 
         // 6 条审计规定的关键措辞
-        assert!(p.contains("绝不把成功重新定义成更小"), "缺「不得缩小成功定义」");
-        assert!(p.contains("绝不依赖早前轮次的记忆"), "缺第 3 条（重新取证）");
+        assert!(
+            p.contains("绝不把成功重新定义成更小"),
+            "缺「不得缩小成功定义」"
+        );
+        assert!(
+            p.contains("绝不依赖早前轮次的记忆"),
+            "缺第 3 条（重新取证）"
+        );
         assert!(p.contains("验证范围 = 断言范围"), "缺第 4 条");
         assert!(p.contains("不确定 = 未达成"), "缺第 5 条");
         assert!(p.contains("预算耗尽 ≠ 完成"), "缺第 6 条");
-        assert!(p.contains("不要叙述你打算怎么继续"), "缺「别只叙述、直接执行」");
+        assert!(
+            p.contains("不要叙述你打算怎么继续"),
+            "缺「别只叙述、直接执行」"
+        );
         // 两条出路都要给：完成走 complete，真卡住走 blocked
-        assert!(p.contains("complete") && p.contains("blocked"), "要给出两条出路");
+        assert!(
+            p.contains("complete") && p.contains("blocked"),
+            "要给出两条出路"
+        );
     }
 
     /// 有预算时要把剩余量摊给模型看（第 6 条才有判断依据）。
     #[test]
     fn continuation_prompt_shows_remaining_budget() {
         let mut s = GoalState::default();
-        s.create("重活", Some(5), Some(10_000), false).expect("create");
+        s.create("重活", Some(5), Some(10_000), false)
+            .expect("create");
         s.record_usage(&GoalUsageDelta {
             input: 3_000,
             ..Default::default()
@@ -1202,7 +1232,10 @@ mod tests {
         let g = b.current().expect("goal");
         assert_eq!(g.objective, "跨进程也要记得的目标");
         assert_eq!(g.phase, GoalPhase::Active);
-        assert_eq!(g.rounds_started, 2, "已用轮次必须一起活下来，否则预算可被重启刷掉");
+        assert_eq!(
+            g.rounds_started, 2,
+            "已用轮次必须一起活下来，否则预算可被重启刷掉"
+        );
         assert_eq!(g.max_rounds, 9);
         assert_eq!(g.tokens_used, 7_300, "token 记账同理");
         assert_eq!(g.token_budget, Some(100_000));

@@ -93,12 +93,9 @@ impl DiscussCmd {
         println!();
         // 1. Three-layer config: global (~/.latte/) ← project (CLI flags) ← CLI overrides.
         let cli = build_cli_overrides(self)?;
-        let resolved = config_layer::load(
-            Some(&self.agents_config),
-            Some(&self.models_config),
-            cli,
-        )
-        .map_err(|e| format!("failed to load configuration: {}", e))?;
+        let resolved =
+            config_layer::load(Some(&self.agents_config), Some(&self.models_config), cli)
+                .map_err(|e| format!("failed to load configuration: {}", e))?;
         let merged = resolved.config;
         let resolver = resolved.resolver;
 
@@ -149,7 +146,8 @@ impl DiscussCmd {
             // file and session index.
             let sink = super::build_debug_sink(&debug_flags.session_id, &debug_flags);
             let hooks = super::build_debug_hooks(&debug_flags);
-            let agent = Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
+            let agent =
+                Agent::new_with_chain(role_name.clone(), role, models, default_params.clone())?;
             let runner = AgentRunner::new(agent)
                 .with_sink(sink)
                 .with_hooks(hooks)
@@ -176,8 +174,8 @@ impl DiscussCmd {
         let mut variables = HashMap::new();
         variables.insert("topic".into(), self.topic.clone());
 
-        let consensus = ConsensusMethod::parse(&self.consensus)
-            .unwrap_or(ConsensusMethod::NoConsensus);
+        let consensus =
+            ConsensusMethod::parse(&self.consensus).unwrap_or(ConsensusMethod::NoConsensus);
 
         let config = DiscussionConfig {
             workflow,
@@ -188,7 +186,10 @@ impl DiscussCmd {
         };
 
         // 6. Run discussion
-        println!("Starting discussion ({} round(s))...\n", config.effective_max_rounds());
+        println!(
+            "Starting discussion ({} round(s))...\n",
+            config.effective_max_rounds()
+        );
 
         let mut orchestrator = DiscussionOrchestrator::new(agents, config)?;
         let result = orchestrator.run().await?;
@@ -205,7 +206,14 @@ impl DiscussCmd {
         // 7. Print results
         println!("\n=== Discussion Complete ===");
         println!("Rounds: {}", result.rounds.len());
-        println!("Consensus: {}", if result.consensus_reached { "YES" } else { "NO" });
+        println!(
+            "Consensus: {}",
+            if result.consensus_reached {
+                "YES"
+            } else {
+                "NO"
+            }
+        );
         println!(
             "Tokens: {} in / {} out",
             result.total_usage.input_tokens, result.total_usage.output_tokens
@@ -244,9 +252,14 @@ impl DiscussCmd {
         }
     }
 
-    fn load_named_workflow(&self, name: &str) -> Result<DiscussionWorkflow, Box<dyn std::error::Error>> {
-        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(&self.discussion_config))
-            .map_err(|e| format!("failed to load workflows: {}", e))?;
+    fn load_named_workflow(
+        &self,
+        name: &str,
+    ) -> Result<DiscussionWorkflow, Box<dyn std::error::Error>> {
+        let registry = latte_agent_orchestrator::WorkflowRegistry::load_with_global(Some(
+            &self.discussion_config,
+        ))
+        .map_err(|e| format!("failed to load workflows: {}", e))?;
         registry.resolve(Some(name)).map_err(|e| e.into())
     }
 }
@@ -306,7 +319,11 @@ fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let month_lens = [31, 28, 31, 30, 31, 30, 31, 31, 31, 30, 31, 30];
     let mut month = 0usize;
     while month < 12 {
-        let ml = if month == 1 && is_leap(year) { 29 } else { month_lens[month] };
+        let ml = if month == 1 && is_leap(year) {
+            29
+        } else {
+            month_lens[month]
+        };
         if days >= ml {
             days -= ml;
             month += 1;
@@ -352,8 +369,15 @@ mod tests {
         assert_eq!(s.len(), 15); // YYYYMMDD-HHMMSS
         assert_eq!(s.as_bytes()[8], b'-');
         for (i, c) in s.chars().enumerate() {
-            if i == 8 { continue; }
-            assert!(c.is_ascii_digit(), "expected digit at position {} in {}", i, s);
+            if i == 8 {
+                continue;
+            }
+            assert!(
+                c.is_ascii_digit(),
+                "expected digit at position {} in {}",
+                i,
+                s
+            );
         }
     }
 }

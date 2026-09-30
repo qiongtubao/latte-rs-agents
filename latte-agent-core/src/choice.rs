@@ -125,7 +125,12 @@ pub fn register_prompt(
         slot.persist = owned;
         return;
     }
-    g.push(Prompt { id: id.to_string(), event, chan: chan.clone(), persist: owned });
+    g.push(Prompt {
+        id: id.to_string(),
+        event,
+        chan: chan.clone(),
+        persist: owned,
+    });
     // 只对同通道计数：A session 的弹框不该被 B session 的挤掉。
     while g.iter().filter(|p| p.chan.same_channel(&chan)).count() > MAX_PROMPTS_PER_CHANNEL {
         if let Some(pos) = g.iter().position(|p| p.chan.same_channel(&chan)) {
@@ -194,7 +199,10 @@ pub fn pending_dialogs_for_channel(chan: &broadcast::Sender<ChatEvent>) -> Vec<C
 /// 丢弃该通道所有未处理的非阻塞弹框（session 删除 / 归档时调用，
 /// 防止随进程生命周期泄漏）。
 pub fn clear_prompts_for_channel(chan: &broadcast::Sender<ChatEvent>) {
-    PROMPTS.lock().unwrap().retain(|p| !p.chan.same_channel(chan));
+    PROMPTS
+        .lock()
+        .unwrap()
+        .retain(|p| !p.chan.same_channel(chan));
 }
 
 /// 阻塞中的 ask 注册等待通道。同一 `choice_id` 重复注册会顶掉旧通道
@@ -632,14 +640,32 @@ mod tests {
         let id = "choice-manager-multi-1";
         let mut rx = register(id, multi_event(id, &["q1", "q2", "q3"]), tx);
 
-        assert_eq!(resolve_one(id, "q1", "小白".into()), Ok(false), "答 1/3 不该放行");
+        assert_eq!(
+            resolve_one(id, "q1", "小白".into()),
+            Ok(false),
+            "答 1/3 不该放行"
+        );
         assert!(rx.try_recv().is_err(), "还没收齐就不能有答案送达");
-        assert_eq!(resolve_one(id, "q2", "清单+教程".into()), Ok(false), "答 2/3 仍不放行");
-        assert!(rx.try_recv().is_err(), "这正是实测里 manager 提前开工的那一刻");
+        assert_eq!(
+            resolve_one(id, "q2", "清单+教程".into()),
+            Ok(false),
+            "答 2/3 仍不放行"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "这正是实测里 manager 提前开工的那一刻"
+        );
 
-        assert_eq!(resolve_one(id, "q3", "先广后深".into()), Ok(true), "收齐才放行");
+        assert_eq!(
+            resolve_one(id, "q3", "先广后深".into()),
+            Ok(true),
+            "收齐才放行"
+        );
         let got = rx.await.expect("收齐后应送达");
-        assert!(got.contains("小白") && got.contains("清单+教程") && got.contains("先广后深"), "{got}");
+        assert!(
+            got.contains("小白") && got.contains("清单+教程") && got.contains("先广后深"),
+            "{got}"
+        );
         // 按题序编号，便于模型对号
         assert!(got.starts_with("1. 小白"), "{got}");
     }
@@ -651,11 +677,18 @@ mod tests {
         let mut rx = register(id, multi_event(id, &["q1", "q2"]), tx);
         assert_eq!(resolve_one(id, "q1", "A".into()), Ok(false));
         // 同一题重复回答只是覆盖，不能把进度算成 2/2
-        assert_eq!(resolve_one(id, "q1", "A2".into()), Ok(false), "重复答同一题不算收齐");
+        assert_eq!(
+            resolve_one(id, "q1", "A2".into()),
+            Ok(false),
+            "重复答同一题不算收齐"
+        );
         assert!(rx.try_recv().is_err());
         assert_eq!(resolve_one(id, "q2", "B".into()), Ok(true));
         let got = rx.await.unwrap();
-        assert!(got.contains("A2") && got.contains("B"), "覆盖后取最新: {got}");
+        assert!(
+            got.contains("A2") && got.contains("B"),
+            "覆盖后取最新: {got}"
+        );
     }
 
     #[tokio::test]
@@ -718,5 +751,4 @@ mod tests {
     async fn resolve_one_reports_missing_pending() {
         assert_eq!(resolve_one("no-such-choice", "q1", "x".into()), Err(()));
     }
-
 }

@@ -339,7 +339,6 @@ impl Agent {
         Ok(())
     }
 
-
     /// Send a single chat completion request (one-turn, no context).
     ///
     /// Walks `model_chain` in priority order, skipping models on cooldown.
@@ -537,7 +536,10 @@ impl Agent {
     /// 同一个模型，永远换不掉，模型链形同虚设。
     pub fn cooldown_serving_model(&self, cd: Duration) -> Option<String> {
         let i = self.served_index.load(std::sync::atomic::Ordering::Relaxed);
-        let mc = self.model_chain.get(i).or_else(|| self.model_chain.first())?;
+        let mc = self
+            .model_chain
+            .get(i)
+            .or_else(|| self.model_chain.first())?;
         mc.set_cooldown(cd);
         Some(mc.model.id.clone())
     }
@@ -617,7 +619,9 @@ fn is_length_truncation(stop_reason: &str) -> bool {
 /// - 比较的是 arguments 的**规范化 JSON 形式**（`to_string` 后），让
 ///   键顺序不同但语义相同的调用被识别为同一次。
 /// - 不同的 `(name, arguments)` 不合并 -- 并行读多个文件等场景保留全部。
-fn dedupe_native_tool_calls(calls: Vec<latte_ai::models::ToolCall>) -> Vec<latte_ai::models::ToolCall> {
+fn dedupe_native_tool_calls(
+    calls: Vec<latte_ai::models::ToolCall>,
+) -> Vec<latte_ai::models::ToolCall> {
     use std::collections::HashSet;
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out: Vec<latte_ai::models::ToolCall> = Vec::with_capacity(calls.len());
@@ -795,9 +799,7 @@ impl LoopDetector {
         }
         let cycle = counts
             .iter()
-            .map(|((tool, args), c)| {
-                format!("{tool}({}) ×{c}", truncate_tool_summary(args, 60))
-            })
+            .map(|((tool, args), c)| format!("{tool}({}) ×{c}", truncate_tool_summary(args, 60)))
             .collect::<Vec<_>>()
             .join(" ↔ ");
         Some(format!(
@@ -840,11 +842,18 @@ fn brief_model_error(e: &AiError) -> String {
     format!("{cut}…")
 }
 
-fn cooldown_for_error(e: &AiError) -> Option<Duration> {    match e {
+fn cooldown_for_error(e: &AiError) -> Option<Duration> {
+    match e {
         // Vendor told us how long to wait — respect it (floor 1s).
         AiError::RateLimited { retry_after, .. } => {
             let secs = retry_after.max(1.0);
             Some(Duration::from_secs_f64(secs))
+        }
+        // A context-window rejection cannot be healed by replaying the same
+        // payload after the normal 4xx cooldown. Return immediately so the
+        // caller can compact or apply its workflow-level fresh restart.
+        AiError::Api { message, .. } if crate::compaction::is_context_overflow_error(message) => {
+            Some(Duration::ZERO)
         }
         // HTTP status codes from the upstream provider.
         AiError::Api { status, .. } => match *status {
@@ -1004,6 +1013,10 @@ pub struct AgentRunner {
     /// 每 turn 的 todo 纠偏计数器，`run_turn` 入口重置（与
     /// `last_turn_tool_count` 同位置）。
     todo_tracker: crate::todo::TodoTracker,
+    /// 单次模型调用实际待发消息的硬预算。None = 不限制（默认）；
+    /// workflow step 可用它把工具循环的 prompt 放大转成可恢复的
+    /// `PromptBudgetExceeded`，而不是等供应商拒绝。
+    prompt_token_budget: Option<usize>,
 }
 /// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
 /// 来的，以及构建时的配置代际。
@@ -1021,9 +1034,7 @@ struct RunnerModelSource {
 /// - 消息匹配参数/路径类永久模式（ENOENT、缺必填、非法路径等）→
 ///   PermanentExec（不重试，但喂回 model 换路径）；
 /// - 其余 ToolExecution 视为瞬时执行错误 → Execution（重试一次）。
-fn classify_tool_execution_error(
-    e: &latte_rs_agent_tools::error::ToolError,
-) -> ToolCallErrorKind {
+fn classify_tool_execution_error(e: &latte_rs_agent_tools::error::ToolError) -> ToolCallErrorKind {
     if let ToolError::ToolNotFound { name, .. } = e {
         return ToolCallErrorKind::ToolNotFound {
             tried_aliases: vec![name.clone()],
@@ -1252,7 +1263,10 @@ fn compact_middle_out(text: &str, max_bytes: usize) -> String {
     let head = crate::trace::utf8_safe_prefix(text, head_budget);
     let tail = crate::trace::utf8_safe_suffix(text, tail_budget);
     let elided = text.len().saturating_sub(head.len() + tail.len());
-    format!("{head}\n…[中段省略 {elided} 字节，共 {} 字节]…\n{tail}", text.len())
+    format!(
+        "{head}\n…[中段省略 {elided} 字节，共 {} 字节]…\n{tail}",
+        text.len()
+    )
 }
 
 /// [`compact_middle_out`] 的字符版（预算以字符而非字节计）。
@@ -1356,29 +1370,69 @@ fn context_stale_chars() -> usize {
 ///
 /// 工具结果本就不入持久 context（见 [`slim_oversized_messages`]），因此
 /// 压缩只影响这一次待发 payload，会话记录与 trace 落盘均不受影响。
+/// 保留逐字原文的最近工具结果累积字符上限（24,000 字符，≈6,000 tokens）。
+///
+/// 为什么不能只按条数豁免：若模型在 6 条豁免区内每条返回 40KB，合计就有
+/// 240KB（≈60K tokens）全被逐字重传，条数门槛完全失效（2026-09-25 LAT-110
+/// 事故正是如此：7 次读取全部落在保留区附近，压缩无事可做）。
+/// 双重约束：条数不超过 `keep_recent`、**且**累积体积不超过本上限，两者
+/// 取交集才豁免，超出的压成头尾标记。
+const RECENT_TOOL_RESULTS_BUDGET_CHARS: usize = 24_000;
+
 fn compact_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> usize {
-    let budget = context_stale_chars();
-    // 至少要能省下 1/3 才值得动它（预算的 4/3）。默认 900 → 门槛 1200，
-    // 与 [`STALE_TOOL_RESULT_FLOOR`] 一致。
-    let floor = budget * 4 / 3;
-    // 先定位所有工具结果的下标，末尾 keep_recent 条豁免。
-    let tool_idx: Vec<usize> = messages
+    let stale_budget = context_stale_chars();
+    let floor = stale_budget * 4 / 3;
+
+    // 1. 先定位所有 Role::Tool 消息的下标
+    let tool_indices: Vec<usize> = messages
         .iter()
         .enumerate()
         .filter(|(_, m)| m.role == Role::Tool)
         .map(|(i, _)| i)
         .collect();
-    if tool_idx.len() <= keep_recent {
+
+    if tool_indices.is_empty() {
         return 0;
     }
-    let stale = &tool_idx[..tool_idx.len() - keep_recent];
+
+    // 2. 从最新一条往回数：统计多少条能落在 (条数 <= keep_recent 且 体积 <= 24KB) 保护区内
+    let mut exempt_count = 0usize;
+    let mut exempt_chars = 0usize;
+    for &idx in tool_indices.iter().rev() {
+        if exempt_count >= keep_recent {
+            break;
+        }
+        let msg_chars: usize = messages[idx]
+            .content
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => text.chars().count(),
+                _ => 0,
+            })
+            .sum();
+        // 单条超大的（> OVERSIZED_MSG_CHARS）即使在最新条目也不全额豁免——
+        // 它自身会被后序 slim 处理，但在体积统计里计为 slim 后的估算大小
+        let effective_chars = msg_chars.min(OVERSIZED_MSG_CHARS);
+        if exempt_chars.saturating_add(effective_chars) > RECENT_TOOL_RESULTS_BUDGET_CHARS
+            && exempt_count > 0
+        {
+            // 已有至少一条最新结果，且后续结果会撑爆保护区体积 → 停止豁免
+            break;
+        }
+        exempt_chars = exempt_chars.saturating_add(effective_chars);
+        exempt_count += 1;
+    }
+
+    // 3. 超出豁免范围的更早结果：一律按中段省略压到 stale_budget（留头留尾）
+    let stale_len = tool_indices.len().saturating_sub(exempt_count);
+    let stale = &tool_indices[..stale_len];
     let mut compacted = 0usize;
     for &i in stale {
         let mut touched = false;
         for part in messages[i].content.iter_mut() {
             if let ContentPart::Text { text } = part {
                 if text.chars().count() > floor {
-                    *text = compact_middle_out_chars(text, budget);
+                    *text = compact_middle_out_chars(text, stale_budget);
                     touched = true;
                 }
             }
@@ -1387,6 +1441,25 @@ fn compact_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> u
             compacted += 1;
         }
     }
+
+    // 4. 最新豁免区内若有单条超过 OVERSIZED_MSG_CHARS 的特大结果，
+    // 也地中段省略到 8,000 字符（防止单条把请求撑爆）
+    let recent = &tool_indices[stale_len..];
+    for &i in recent {
+        let mut touched = false;
+        for part in messages[i].content.iter_mut() {
+            if let ContentPart::Text { text } = part {
+                if text.chars().count() > OVERSIZED_MSG_CHARS {
+                    *text = compact_middle_out_chars(text, OVERSIZED_MSG_CHARS);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            compacted += 1;
+        }
+    }
+
     compacted
 }
 
@@ -1446,7 +1519,11 @@ pub(crate) fn fast_heuristic_json_repair(raw: &str) -> Option<String> {
 
     let mut attempt = cleaned.to_string();
     // 1. 去除对象/数组末尾的尾随逗号 (trailing commas)
-    attempt = attempt.replace(",\n}", "\n}").replace(",}", "}").replace(",\n]", "\n]").replace(",]", "]");
+    attempt = attempt
+        .replace(",\n}", "\n}")
+        .replace(",}", "}")
+        .replace(",\n]", "\n]")
+        .replace(",]", "]");
     if serde_json::from_str::<serde_json::Value>(&attempt).is_ok() {
         return Some(attempt);
     }
@@ -1522,15 +1599,15 @@ Do NOT include markdown formatting, backticks, or any explanation.";
         "Tool name: `{tool_name}`\nError: {serde_err}\n\nMalformed JSON arguments:\n{raw_args}\n\nOutput only valid JSON:"
     );
 
-    let messages = vec![
-        Message::system(sys_prompt),
-        Message::user(user_msg),
-    ];
+    let messages = vec![Message::system(sys_prompt), Message::user(user_msg)];
 
     let mut params = agent.params.clone();
     params.temperature = Some(0.0);
 
-    match agent.chat(&messages, Some(&params), WaitPolicy::NoWait).await {
+    match agent
+        .chat(&messages, Some(&params), WaitPolicy::NoWait)
+        .await
+    {
         Ok(completion) => {
             let raw_out = completion.content;
             let cleaned = clean_json_string(&raw_out);
@@ -1538,7 +1615,10 @@ Do NOT include markdown formatting, backticks, or any explanation.";
                 tracing::info!(tool = tool_name, "工具参数 JSON 由 Subsession 模型修复成功");
                 Some(cleaned.to_string())
             } else if let Some(heuristic) = fast_heuristic_json_repair(cleaned) {
-                tracing::info!(tool = tool_name, "工具参数 JSON 由 Subsession + 启发式修复成功");
+                tracing::info!(
+                    tool = tool_name,
+                    "工具参数 JSON 由 Subsession + 启发式修复成功"
+                );
                 Some(heuristic)
             } else {
                 tracing::warn!(tool = tool_name, output = %raw_out, "Subsession 修复产物仍非合法 JSON");
@@ -1685,8 +1765,7 @@ fn parallel_tool_calls_pref() -> Option<bool> {
 /// 注意白名单按**短名**匹配（见 [`short_tool_name`]）：MCP 工具若恰好叫
 /// `search`/`find` 等同名也会获得并发资格——这四个名字对应的内置实现都是
 /// 纯查询，同名外部工具若并非如此，应改名注册或改用全名命名空间区分。
-const READONLY_PARALLEL_TOOLS: &[&str] =
-    &["read", "code_graph", "search", "find", "grep", "fetch"];
+const READONLY_PARALLEL_TOOLS: &[&str] = &["read", "code_graph", "search", "find", "grep", "fetch"];
 
 /// `name` 是否属于 [`READONLY_PARALLEL_TOOLS`]（按短名比较，容忍
 /// `namespace.read` 这类遗留全名）。
@@ -1913,7 +1992,9 @@ fn workflow_call_blocks_on_human(args_json: &str, cwd: Option<&std::path::Path>)
     wf.steps.iter().any(|s| {
         s.tools.iter().any(|t| is_human_blocking_tool(t))
             || s.require_tools.iter().any(|t| is_human_blocking_tool(t))
-            || s.require_tools_any.iter().any(|t| is_human_blocking_tool(t))
+            || s.require_tools_any
+                .iter()
+                .any(|t| is_human_blocking_tool(t))
             || s.tool_call_limits.keys().any(|t| is_human_blocking_tool(t))
     })
 }
@@ -2026,7 +2107,10 @@ fn tool_execution_metadata(
         metadata.insert("cwd".into(), cwd.display().to_string().into());
     }
     if let Some(path) = current_session_file {
-        metadata.insert("current_session_file".into(), path.display().to_string().into());
+        metadata.insert(
+            "current_session_file".into(),
+            path.display().to_string().into(),
+        );
     }
     Some(serde_json::Value::Object(metadata))
 }
@@ -2074,7 +2158,9 @@ async fn run_one_tool_call(
     let mut attempt: u32 = 0;
     let max_attempts: u32 = 2;
     let mut final_outcome: Result<String, (ToolCallErrorKind, String)> = Err((
-        ToolCallErrorKind::ToolNotFound { tried_aliases: vec![] },
+        ToolCallErrorKind::ToolNotFound {
+            tried_aliases: vec![],
+        },
         "init".into(),
     ));
     let mut loop_records: Vec<(String, String)> = Vec::new();
@@ -2090,13 +2176,8 @@ async fn run_one_tool_call(
                 // 方案 B：触发一次旁路 JSON 修复（从已删除的串行内联
                 // 路径收口过来）。若修复成功，主上下文不会塞入任何错误
                 // 反馈（避免污染）。
-                let repaired = repair_json_via_subsession(
-                    agent,
-                    &tc.name,
-                    &tc_args,
-                    &e.to_string(),
-                )
-                .await;
+                let repaired =
+                    repair_json_via_subsession(agent, &tc.name, &tc_args, &e.to_string()).await;
                 if let Some(new_args) = repaired {
                     tc_args = new_args;
                     match serde_json::from_str(&tc_args) {
@@ -2104,7 +2185,9 @@ async fn run_one_tool_call(
                         Err(e2) => {
                             let detail = format!("invalid JSON (post-repair): {e2}");
                             final_outcome = Err((
-                                ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
+                                ToolCallErrorKind::MalformedArgs {
+                                    serde_err: detail.clone(),
+                                },
                                 detail,
                             ));
                             break;
@@ -2126,7 +2209,9 @@ async fn run_one_tool_call(
                         format!("invalid JSON: {e}")
                     };
                     final_outcome = Err((
-                        ToolCallErrorKind::MalformedArgs { serde_err: detail.clone() },
+                        ToolCallErrorKind::MalformedArgs {
+                            serde_err: detail.clone(),
+                        },
                         detail,
                     ));
                     break;
@@ -2194,8 +2279,7 @@ async fn run_one_tool_call(
         let input = mutable_input;
 
         // 3. Execute
-        let mut ctx =
-            latte_rs_agent_tools::types::ToolExecutionContext::fresh(&resolved_name, 1);
+        let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(&resolved_name, 1);
         ctx.metadata = tool_execution_metadata(cwd.as_deref(), current_session_file.as_deref());
         // P1b：per-path 写锁——写类工具（write/edit/delete/ast_edit）
         // 按目标文件互斥，挡住「并行 delegate 子代理 / 主 agent + 子代理」
@@ -2204,8 +2288,7 @@ async fn run_one_tool_call(
         let tool_start = Instant::now();
         let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
         let tool_latency = tool_start.elapsed().as_millis() as u64;
-        let args_json =
-            serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
+        let args_json = serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
         loop_records.push((tc.name.clone(), args_json.clone()));
 
         match exec_result {
@@ -2261,9 +2344,7 @@ async fn run_one_tool_call(
                     name: tc.name.clone(),
                     args_json: args_json.clone(),
                     latency_ms: tool_latency,
-                    status: ToolStatus::Ok(
-                        serde_json::to_string(&result).unwrap_or_default(),
-                    ),
+                    status: ToolStatus::Ok(serde_json::to_string(&result).unwrap_or_default()),
                 });
                 final_outcome = Ok(result_str);
                 break;
@@ -2278,14 +2359,12 @@ async fn run_one_tool_call(
                 };
                 // 锚点类 edit 失败按文件累计计数：单次给软提示，连续到阈值
                 // 升级成「换策略」硬指令（oh-my-pi 的两级 no-op 守卫）。
-                if let Some(note) =
-                    crate::edit_anchor::note_edit_failure(
-                        &crate::edit_anchor::Scope::new(anchor_scope_id, &meta.role),
-                        &resolved_name,
-                        &input,
-                        &e,
-                    )
-                {
+                if let Some(note) = crate::edit_anchor::note_edit_failure(
+                    &crate::edit_anchor::Scope::new(anchor_scope_id, &meta.role),
+                    &resolved_name,
+                    &input,
+                    &e,
+                ) {
                     detail.push_str(&note);
                 }
                 sink.emit(TraceEvent::ToolExec {
@@ -2328,7 +2407,6 @@ async fn run_one_tool_call(
     }
 }
 
-
 impl AgentRunner {
     /// Create a new runner for an agent (no tools).
     pub fn new(agent: Agent) -> Self {
@@ -2357,6 +2435,7 @@ impl AgentRunner {
             deadline: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
+            prompt_token_budget: None,
         }
     }
     /// 构造带工具的 runner。
@@ -2367,7 +2446,10 @@ impl AgentRunner {
     /// 工作，正好印证它已被忽略）。现在循环的自动刹车只有
     /// [`LoopDetector`]（同参数死循环），超时与叫停交给
     /// `set_deadline` / 人工 ⏸ / advisor。
-    pub fn new_with_tools(agent: Agent, tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>) -> Self {
+    pub fn new_with_tools(
+        agent: Agent,
+        tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
+    ) -> Self {
         Self {
             agent,
             context: ConversationContext::default(),
@@ -2393,6 +2475,7 @@ impl AgentRunner {
             deadline: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
+            prompt_token_budget: None,
         }
     }
     /// Attach an event broadcaster so the runner can trigger human-intervention
@@ -2430,11 +2513,21 @@ impl AgentRunner {
             deadline: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
+            prompt_token_budget: None,
         }
     }
 
     /// Enable pre-persistence gate (D5/D6) with the given config.
     /// When set, [`AgentRunner::run_turn_gated`] becomes the entry
+    /// Bound the estimated size of every actual model request in this runner.
+    /// `0` disables the bound. This is intentionally checked inside the tool
+    /// loop, because tool results—not only persisted conversation history—are
+    /// retransmitted by each subsequent model call.
+    pub fn with_prompt_token_budget(mut self, budget: usize) -> Self {
+        self.prompt_token_budget = (budget > 0).then_some(budget);
+        self
+    }
+
     /// point — it wraps `run_turn` and retries the same turn up to
     /// `config.max_retries` times when the gate fails. By default
     /// (no `with_gate_config` call) `run_turn` keeps its current
@@ -2513,7 +2606,6 @@ impl AgentRunner {
             format!(
                 "{}s 后自动重试（第 {}/{} 次），也可点 ▶ 立即继续",
                 d.as_secs(),
-
                 attempt + 1,
                 max_retries
             )
@@ -2534,15 +2626,13 @@ impl AgentRunner {
             // 退避窗口内人点了 ▶ 就走人工路径；没人管则超时自恢复。
             // 注意 gate 必须由我们显式 resume：wait 超时不会解除门，
             // 而门还 engaged 的话后续 park 点会再次卡住。
-            Some(d) => {
-                match tokio::time::timeout(d, gate.wait_until_resumed(None)).await {
-                    Ok(r) => matches!(r, crate::pause_gate::WaitResult::Ok),
-                    Err(_) => {
-                        gate.resume();
-                        true
-                    }
+            Some(d) => match tokio::time::timeout(d, gate.wait_until_resumed(None)).await {
+                Ok(r) => matches!(r, crate::pause_gate::WaitResult::Ok),
+                Err(_) => {
+                    gate.resume();
+                    true
                 }
-            }
+            },
             None => matches!(
                 gate.wait_until_resumed(None).await,
                 crate::pause_gate::WaitResult::Ok
@@ -2667,7 +2757,8 @@ impl AgentRunner {
             self.last_turn_tool_count += 1;
             // TodoTracker 记账：todo 调用清零 nudge 计数，ask 标记
             // 「本 turn 问过用户」（stop reminder 据此跳过）。
-            self.todo_tracker.record_tool_call(short_tool_name(tool_name));
+            self.todo_tracker
+                .record_tool_call(short_tool_name(tool_name));
             if let (Some((name, args)), Ok(result_str)) = (r.loop_records.first(), &r.outcome) {
                 self.last_turn_tool_summaries.push(format!(
                     "{} {} → {}",
@@ -2706,21 +2797,37 @@ impl AgentRunner {
                         // 如果配置了 event_tx，则向前端发出 ToolFixRequested 弹窗，
                         // 允许用户直接在线修好 JSON 或参数，而不是直接硬终止。
                         if let Some(event_tx) = &self.tool_fix_event_tx {
-                            let choice_id = format!("toolfix-{}-{}", tool_name, uuid_or_timestamp());
+                            let choice_id =
+                                format!("toolfix-{}-{}", tool_name, uuid_or_timestamp());
                             let req = crate::tool_fix::FixRequest {
                                 tool_name: tool_name.to_string(),
                                 malformed_args: compacted.clone(),
                                 error_detail: detail.clone(),
-                                first_failed_idx: messages.len().saturating_sub(permanent_streak.1 * 2),
+                                first_failed_idx: messages
+                                    .len()
+                                    .saturating_sub(permanent_streak.1 * 2),
                             };
-                            let ev = crate::tool_fix::build_fix_event(&self.role_id, &choice_id, &req, true);
-                            let rx = crate::choice::register(&choice_id, ev.clone(), event_tx.clone());
+                            let ev = crate::tool_fix::build_fix_event(
+                                &self.role_id,
+                                &choice_id,
+                                &req,
+                                true,
+                            );
+                            let rx =
+                                crate::choice::register(&choice_id, ev.clone(), event_tx.clone());
                             let _ = event_tx.send(ev);
                             // 等待用户修改提交（非阻塞测试模式下若无等待者则自然超时）
                             let mut rx = rx;
-                            if let Ok(Ok(corrected_args)) = tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx).await {
+                            if let Ok(Ok(corrected_args)) =
+                                tokio::time::timeout(std::time::Duration::from_millis(50), &mut rx)
+                                    .await
+                            {
                                 // 裁剪前面 N 轮死循环纠错历史
-                                crate::tool_fix::prune_failed_rounds(messages, req.first_failed_idx, &corrected_args);
+                                crate::tool_fix::prune_failed_rounds(
+                                    messages,
+                                    req.first_failed_idx,
+                                    &corrected_args,
+                                );
                                 *permanent_streak = (String::new(), 0);
                                 return Ok(());
                             }
@@ -2807,10 +2914,8 @@ impl AgentRunner {
         let ordered: Vec<ParsedCall> = order.iter().map(|&i| calls[i].clone()).collect();
         let runs = parallel_runs(&ordered);
         // 段起点 → 段终点，便于顺序遍历时跳段。
-        let run_start: std::collections::HashMap<usize, usize> =
-            runs.iter().copied().collect();
-        let mut results: Vec<Option<OneCallResult>> =
-            (0..calls.len()).map(|_| None).collect();
+        let run_start: std::collections::HashMap<usize, usize> = runs.iter().copied().collect();
+        let mut results: Vec<Option<OneCallResult>> = (0..calls.len()).map(|_| None).collect();
 
         let mut pos = 0usize;
         while pos < ordered.len() {
@@ -2826,10 +2931,7 @@ impl AgentRunner {
                     end - pos,
                     readonly_parallel_max(),
                 );
-                let mut set: JoinSet<(
-                    usize,
-                    std::thread::Result<OneCallResult>,
-                )> = JoinSet::new();
+                let mut set: JoinSet<(usize, std::thread::Result<OneCallResult>)> = JoinSet::new();
                 for (j, tc) in ordered.iter().enumerate().take(end).skip(pos) {
                     let idx = order[j];
                     let tm_c = tm.clone();
@@ -2846,9 +2948,17 @@ impl AgentRunner {
                     set.spawn(async move {
                         let _permit = sem_c.acquire().await;
                         let r = std::panic::AssertUnwindSafe(run_one_tool_call(
-                            tm_c, hooks_c, sink_c, rp_c, cwd_c,
-                            current_session_file_c, meta_c, &anchor_scope_id_c, tc_c,
-                            &agent_c, output_truncated,
+                            tm_c,
+                            hooks_c,
+                            sink_c,
+                            rp_c,
+                            cwd_c,
+                            current_session_file_c,
+                            meta_c,
+                            &anchor_scope_id_c,
+                            tc_c,
+                            &agent_c,
+                            output_truncated,
                         ))
                         .catch_unwind()
                         .await;
@@ -2869,8 +2979,7 @@ impl AgentRunner {
                                 tool = %calls[idx].name,
                                 "tool task panicked; degrading to error result: {panic_msg}"
                             );
-                            let detail =
-                                format!("internal: tool task panicked ({panic_msg})");
+                            let detail = format!("internal: tool task panicked ({panic_msg})");
                             self.sink.emit(crate::trace::TraceEvent::ToolExec {
                                 meta: meta.refreshed(),
                                 name: calls[idx].name.clone(),
@@ -2881,7 +2990,9 @@ impl AgentRunner {
                             results[idx] = Some(OneCallResult {
                                 id: calls[idx].id.clone(),
                                 outcome: Err((
-                                    ToolCallErrorKind::Execution { reason: detail.clone() },
+                                    ToolCallErrorKind::Execution {
+                                        reason: detail.clone(),
+                                    },
                                     detail,
                                 )),
                                 loop_records: vec![],
@@ -2934,7 +3045,9 @@ impl AgentRunner {
                     OneCallResult {
                         id: calls[i].id.clone(),
                         outcome: Err((
-                            ToolCallErrorKind::Execution { reason: detail.clone() },
+                            ToolCallErrorKind::Execution {
+                                reason: detail.clone(),
+                            },
                             detail,
                         )),
                         loop_records: vec![],
@@ -2975,7 +3088,10 @@ impl AgentRunner {
     /// 逐 Delta 发 `TraceEvent::ModelDelta`，UI 逐 token 渲染。
     /// `load(false)` 或未设置时走非流式 `Agent::chat`（默认）。
     /// 用 `Arc<AtomicBool>` 让 UI/session 层实时切换无需重建 runner。
-    pub fn with_stream_mode(mut self, stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+    pub fn with_stream_mode(
+        mut self,
+        stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         self.stream_mode = Some(stream_mode);
         self
     }
@@ -3056,7 +3172,9 @@ impl AgentRunner {
     /// 当前是否处于流式模式。`stream_mode` 未设置或 `load(false)` 时返回 false。
     fn is_stream_mode(&self) -> bool {
         use std::sync::atomic::Ordering;
-        self.stream_mode.as_ref().map_or(false, |m| m.load(Ordering::SeqCst))
+        self.stream_mode
+            .as_ref()
+            .map_or(false, |m| m.load(Ordering::SeqCst))
     }
 
     /// 流上报错时决定「冷却当前模型 + 重开流」还是「把错误上交」。
@@ -3140,7 +3258,9 @@ impl AgentRunner {
         };
         let pending: Vec<String> = queue.lock().drain(..).collect();
         for hint in &pending {
-            self.context.push(latte_ai::models::Message::user(format!("🦉 advisor 监察：\n{hint}")));
+            self.context.push(latte_ai::models::Message::user(format!(
+                "🦉 advisor 监察：\n{hint}"
+            )));
         }
         pending
     }
@@ -3179,7 +3299,8 @@ impl AgentRunner {
         let state = self.todo_state.clone()?;
         let phases = state.read().clone();
         let waiting_on_user = crate::choice::has_any_pending();
-        self.todo_tracker.take_stop_reminder(&phases, waiting_on_user)
+        self.todo_tracker
+            .take_stop_reminder(&phases, waiting_on_user)
     }
 
     /// Set the absolute wall-clock deadline for the tool loop (对齐 oh-my-pi
@@ -3266,7 +3387,8 @@ impl AgentRunner {
         let mut compacted_any = false;
         for _pass in 0..policy.max_passes {
             let msgs = self.context.messages().to_vec();
-            let Some(end) = crate::compaction::select_compaction_end(&msgs, policy.keep_recent_turns)
+            let Some(end) =
+                crate::compaction::select_compaction_end(&msgs, policy.keep_recent_turns)
             else {
                 break; // 没有可压区间（历史太短 / 全是要保留的尾部）
             };
@@ -3345,7 +3467,6 @@ impl AgentRunner {
         out
     }
 
-
     /// Total token usage accumulated so far.
     pub fn total_usage(&self) -> &TokenUsage {
         &self.total_usage
@@ -3358,11 +3479,7 @@ impl AgentRunner {
     /// end-to-end without re-reading config. Turn is always 0
     /// because this precedes the first turn.
     pub fn emit_session_start(&self, tier: &str) {
-        let meta = crate::trace::TraceMeta::now(
-            0,
-            self.role_id.clone(),
-            self.session_id.clone(),
-        );
+        let meta = crate::trace::TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
         let model_chain: Vec<String> = self
             .agent
             .model_chain
@@ -3391,11 +3508,7 @@ impl AgentRunner {
     /// reused across sessions). The three token counters come
     /// straight from the runner's accumulated `total_usage`.
     pub fn emit_session_end(&self, total_turns: u32) {
-        let meta = crate::trace::TraceMeta::now(
-            0,
-            self.role_id.clone(),
-            self.session_id.clone(),
-        );
+        let meta = crate::trace::TraceMeta::now(0, self.role_id.clone(), self.session_id.clone());
         self.sink.emit(crate::trace::TraceEvent::SessionEnd {
             meta,
             total_turns,
@@ -3404,7 +3517,6 @@ impl AgentRunner {
             total_thinking: self.total_usage.thinking_tokens,
         });
     }
-
 
     pub async fn run_turn(
         &mut self,
@@ -3447,7 +3559,7 @@ impl AgentRunner {
         // TodoTracker 每 turn 重置：nudge / stop reminder 的额度都按
         // turn 计（见 crate::todo）。
         self.todo_tracker = crate::todo::TodoTracker::default();
-        use crate::trace::{ParsedCall, ParseDiag, TraceEvent, TraceMeta};
+        use crate::trace::{ParseDiag, ParsedCall, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         // wall-clock 起点：与 `turn_start`（单调）配对，用来暴露进程被
         // 挂起（系统睡眠）的时长——见 TurnEnd 发射处。
@@ -3470,16 +3582,20 @@ impl AgentRunner {
         // fired hook emits a HookFired TraceEvent so the trace stream
         // records the redaction (and tests can assert on it).
         {
-            let mut pre_call_ctx = crate::hooks::PreCallCtx { messages: &mut messages };
-            let outcome = self.hooks.run_pre_call(&mut pre_call_ctx, |hook_name, point, kind| {
-                self.sink.emit(TraceEvent::HookFired {
-                    meta: meta.refreshed(),
-                    hook_name: hook_name.to_string(),
-                    point,
-                    outcome_kind: kind.to_string(),
+            let mut pre_call_ctx = crate::hooks::PreCallCtx {
+                messages: &mut messages,
+            };
+            let outcome = self
+                .hooks
+                .run_pre_call(&mut pre_call_ctx, |hook_name, point, kind| {
+                    self.sink.emit(TraceEvent::HookFired {
+                        meta: meta.refreshed(),
+                        hook_name: hook_name.to_string(),
+                        point,
+                        outcome_kind: kind.to_string(),
+                    });
+                    log_hook_fire(hook_name, point, kind);
                 });
-                log_hook_fire(hook_name, point, kind);
-            });
             if let crate::hooks::HookOutcome::Abort { reason } = &outcome {
                 return Err(AgentError::HookAborted {
                     hook: "pre_call".into(),
@@ -3505,7 +3621,8 @@ impl AgentRunner {
         // `ModelCall` / `ModelCallSlow` 使用，于是 fallback 换过模型之后日志
         // 仍标着链首 —— 实测一次 `glm-5.3 → MiniMax-M3` 回退后三条
         // `ModelCall` 全标 `glm-5.3`，把"换没换成"从日志里抹掉了。
-        let est_input_tokens = (messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4) as u32;
+        let est_input_tokens =
+            (messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4) as u32;
         self.sink.emit(TraceEvent::PromptBuilt {
             meta: meta.refreshed(),
             system_rendered,
@@ -3523,10 +3640,22 @@ impl AgentRunner {
         // 压缩改了 self.context，所以要在它之后重新取待发消息列表。
         let compacted = self.maybe_auto_compact(&meta).await;
         let mut messages: Vec<Message> = if compacted {
-            self.context.messages().to_vec()
+            // `ConversationContext` intentionally excludes the system message.
+            // Preserve the rendered (and potentially hook-mutated) system prompt
+            // when rebuilding the outbound list after a normal compaction.
+            let system = messages.first().cloned();
+            system
+                .into_iter()
+                .chain(self.context.messages().iter().cloned())
+                .collect()
         } else {
             messages
         };
+        // `messages` begins with one system message followed by this persisted
+        // context. Tool-call / tool-result pairs appended during the turn stay
+        // outside this prefix and must remain paired when a later budget-triggered
+        // compaction rebuilds the persistent part.
+        let mut context_prefix_len = self.context.messages().len();
 
         // 工具轮次没有硬性上限（对齐 oh-my-pi deadline-only 模式）。
         // 循环终止靠：
@@ -3571,6 +3700,12 @@ impl AgentRunner {
         // continuation_prefix + 本轮 completion.content。空 = 未进入续写。
         let mut continuation_prefix = String::new();
 
+        // 只读工具防沉迷计数器：连续调用 read/search/glob 等无副作用探索工具的次数。
+        // 达到阈值时注入系统级提醒，打断穷尽式检索强迫症，催促尽快落笔修改。
+        let mut read_only_streak: usize = 0;
+        let mut read_only_nudge_sent = false;
+        let mut deadline_hit = false;
+        let mut last_executed_tool: Option<String> = None;
         // 死循环探测器：**整个 turn 共用一个**，streak 跨 round 累积。
         //
         // 这是 deadline-only 模式下唯一的自动刹车。轮次上限
@@ -3603,12 +3738,20 @@ impl AgentRunner {
         // (工具, 失败类别) 的计数器。
         let mut permanent_streak: (String, usize) = (String::new(), 0);
         let mut round: usize = 0;
+        // `PromptBudgetExceeded` is raised before a provider request. Without
+        // this guard it bypasses the ordinary provider-overflow recovery path
+        // entirely and workflow code can only fresh-restart a subsession. Give
+        // normal history compaction one deterministic, forced attempt first;
+        // if it cannot reclaim enough persistent context, callers still receive
+        // the same error and may use their specialized recovery policy.
+        let mut prompt_budget_compaction_attempted = false;
         loop {
             // Deadline 检查（对齐 oh-my-pi `isDeadlineExceeded`）：
             // 每个 model call 前检查，超时时优雅退出、返回已有 partial。
             if let Some(dl) = self.deadline {
                 if std::time::Instant::now() >= dl {
-                    tracing::info!(round, "deadline exceeded, returning partial output");
+                    tracing::info!(round, "deadline exceeded, returning partial output or error");
+                    deadline_hit = true;
                     if !last_substantive_response.is_empty() {
                         final_response = last_substantive_response.clone();
                     }
@@ -3665,6 +3808,61 @@ impl AgentRunner {
                     );
                 }
             }
+            if let Some(budget) = self.prompt_token_budget {
+                let estimated = messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4;
+                if estimated >= budget {
+                    // 第一性压缩：先按「单条超长消息」剪（工具结果/代码块），
+                    // 不动 `tool_call ↔ tool_result` 配对。这一步是纯文本，
+                    // 不依赖 LLM 摘要模型可用性，能把 proofreader 通读大文档
+                    // 这类场景里占大头的工具结果先压下来。
+                    // （2026-09-25 jemalloc LAT-110：proofreader 读了整篇 146KB
+                    // draft.md，6 次范围读合计 ~313KB，8 字节/token 估算 79.6K
+                    // 超 60K 预算；`slim_oversized_messages` 把单条超长结果
+                    // 压到头+尾，能直接覆盖这次事故而不用重启子会话。）
+                    let slim = slim_oversized_messages(&mut messages);
+                    if slim > 0 {
+                        tracing::debug!(
+                            round,
+                            slimmed = slim,
+                            "slimmed oversized tool results under prompt budget pressure"
+                        );
+                    }
+                    let estimated = messages.iter().map(|m| m.as_text().len()).sum::<usize>() / 4;
+                    if estimated >= budget {
+                        // This is the local counterpart of provider context-overflow
+                        // recovery. The provider has not seen the request yet, but
+                        // the configured step budget is already a hard fact, so use
+                        // the forced trigger (not the model-window pressure ratio).
+                        // Only try once: if the summary cannot be made or does not
+                        // save enough, returning the original error lets a workflow
+                        // choose its opt-in fresh-subsesson recovery without looping.
+                        if !prompt_budget_compaction_attempted {
+                            prompt_budget_compaction_attempted = true;
+                            if self
+                                .compact_with_trigger(
+                                    &meta,
+                                    crate::compaction::CompactionTrigger::ContextOverflow,
+                                )
+                                .await
+                            {
+                                // Preserve every in-turn tool-call/result pair. Only
+                                // rebuild the system + persisted-context prefix that
+                                // `compact_with_trigger` changed.
+                                let system = messages.first().cloned();
+                                let trailing = messages.split_off(1 + context_prefix_len);
+                                messages = system
+                                    .into_iter()
+                                    .chain(self.context.messages().iter().cloned())
+                                    .chain(trailing)
+                                    .collect();
+                                context_prefix_len = self.context.messages().len();
+                                continue;
+                            }
+                        }
+                        return Err(AgentError::PromptBudgetExceeded { estimated, budget });
+                    }
+                }
+            }
             let chat_start = Instant::now();
             // native function-calling：tool schema 经 GenerateParams.tools 下发。
             // 文本 `<tool_call>` 协议已移除，不再有降级路径。
@@ -3717,14 +3915,15 @@ impl AgentRunner {
                 const MAX_STREAM_FALLBACKS: u8 = 3;
                 'stream_attempt: loop {
                     let mut rx = loop {
-                        match self.agent.chat_stream(&messages, chat_params.as_ref()).await {
+                        match self
+                            .agent
+                            .chat_stream(&messages, chat_params.as_ref())
+                            .await
+                        {
                             Ok(rx) => break rx,
                             Err(e @ AgentError::ModelsUnavailable { .. }) => {
                                 let overflow = failures_include_context_overflow(&e);
-                                if !self
-                                    .pause_wait_model_unavailable(&e, unavail_attempt)
-                                    .await
-                                {
+                                if !self.pause_wait_model_unavailable(&e, unavail_attempt).await {
                                     return Err(e);
                                 }
                                 unavail_attempt = unavail_attempt.saturating_add(1);
@@ -3763,7 +3962,8 @@ impl AgentRunner {
                     let c = loop {
                         match rx.recv().await {
                             Some(StreamEvent::Delta { content, .. }) => {
-                                let delta_text: String = content.iter()
+                                let delta_text: String = content
+                                    .iter()
                                     .filter_map(|p| match p {
                                         ContentPart::Text { text } => Some(text.as_str()),
                                         _ => None,
@@ -3780,8 +3980,14 @@ impl AgentRunner {
                                     });
                                 }
                             }
-                            Some(StreamEvent::Done { content, tool_calls, usage, stop_reason }) => {
-                                let text = content.iter()
+                            Some(StreamEvent::Done {
+                                content,
+                                tool_calls,
+                                usage,
+                                stop_reason,
+                            }) => {
+                                let text = content
+                                    .iter()
                                     .filter_map(|p| match p {
                                         ContentPart::Text { text } => Some(text.as_str()),
                                         _ => None,
@@ -3792,7 +3998,11 @@ impl AgentRunner {
                                     content: text,
                                     content_parts: content,
                                     tool_calls,
-                                    stop_reason: if stop_reason.is_empty() { "stop".into() } else { stop_reason },
+                                    stop_reason: if stop_reason.is_empty() {
+                                        "stop".into()
+                                    } else {
+                                        stop_reason
+                                    },
                                     usage,
                                 };
                             }
@@ -3842,44 +4052,61 @@ impl AgentRunner {
                 // 模型全链不可用 → 自动暂停 session 门，退避自动重试 / 等用户「继续」。
                 let mut unavail_attempt = 0u32;
                 loop {
-                    // 慢调用可见性：非流式下生成过程没有任何中间事件，
-                    // 慢速 trickle 在 UI 上等同卡死（日志事故：glm 大
-                    // 上下文慢生成 8 分钟，叠加 advisor 暂停弹窗，看起来
-                    // 像假暂停）。超过阈值未返回发一次 ModelCallSlow，
-                    // 然后继续等——提示不是超时，不影响等待本身。
-                    let r = {
+                    // 暂停语义：非流式请求没有已经展示给用户的增量内容，
+                    // 因此收到用户暂停时可以安全丢弃当前 HTTP future；
+                    // ▶ 释放 gate 后由外层重新发起同一轮请求。这样不会
+                    // 终止 workflow step，也不会丢 checkpoint。
+                    let r = loop {
                         let chat = self.agent.chat(
                             &messages,
                             chat_params.as_ref(),
                             WaitPolicy::WaitAndRetry,
                         );
                         tokio::pin!(chat);
+                        let mut pause_wait = Box::pin(async {
+                            if let Some(gate) = self.agent_pause_gate.clone() {
+                                gate.wait_until_paused().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        });
                         let mut noticed = false;
-                        loop {
-                            match tokio::time::timeout(slow_model_call_notice(), &mut chat).await
-                            {
-                                Ok(r) => break r,
-                                Err(_) => {
-                                    if !noticed {
-                                        noticed = true;
-                                        self.sink.emit(TraceEvent::ModelCallSlow {
-                                            meta: meta.refreshed(),
-                                            model_id: self.agent.served_model_id(),
-                                            elapsed_secs: slow_model_call_notice().as_secs(),
-                                        });
+                        let result: Option<Result<Completion, AgentError>> = loop {
+                            tokio::select! {
+                                biased;
+                                _ = &mut pause_wait => {
+                                    break None;
+                                }
+                                result = tokio::time::timeout(slow_model_call_notice(), &mut chat) => {
+                                    match result {
+                                        Ok(r) => break Some(r),
+                                        Err(_) => {
+                                            if !noticed {
+                                                noticed = true;
+                                                self.sink.emit(TraceEvent::ModelCallSlow {
+                                                    meta: meta.refreshed(),
+                                                    model_id: self.agent.served_model_id(),
+                                                    elapsed_secs: slow_model_call_notice().as_secs(),
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        }
+                        };
+                        let Some(r) = result else {
+                            // park_if_paused 等待用户 ▶；恢复后 loop
+                            // 重新创建 chat future，当前 workflow step 仍在。
+                            self.park_if_paused("in-flight model call").await;
+                            continue;
+                        };
+                        break r;
                     };
                     match r {
                         Ok(c) => break c,
                         Err(e @ AgentError::ModelsUnavailable { .. }) => {
                             let overflow = failures_include_context_overflow(&e);
-                            if !self
-                                .pause_wait_model_unavailable(&e, unavail_attempt)
-                                .await
-                            {
+                            if !self.pause_wait_model_unavailable(&e, unavail_attempt).await {
                                 return Err(e);
                             }
                             unavail_attempt = unavail_attempt.saturating_add(1);
@@ -3950,16 +4177,20 @@ impl AgentRunner {
 
             // 2b. Run PostResponseHook
             {
-                let mut ctx = crate::hooks::PostResponseCtx { raw: &final_response };
-                let outcome = self.hooks.run_post_response(&mut ctx, |hook_name, point, kind| {
-                    self.sink.emit(TraceEvent::HookFired {
-                        meta: meta.refreshed(),
-                        hook_name: hook_name.to_string(),
-                        point,
-                        outcome_kind: kind.to_string(),
+                let mut ctx = crate::hooks::PostResponseCtx {
+                    raw: &final_response,
+                };
+                let outcome = self
+                    .hooks
+                    .run_post_response(&mut ctx, |hook_name, point, kind| {
+                        self.sink.emit(TraceEvent::HookFired {
+                            meta: meta.refreshed(),
+                            hook_name: hook_name.to_string(),
+                            point,
+                            outcome_kind: kind.to_string(),
+                        });
+                        log_hook_fire(hook_name, point, kind);
                     });
-                    log_hook_fire(hook_name, point, kind);
-                });
                 if let crate::hooks::HookOutcome::Abort { reason } = &outcome {
                     return Err(AgentError::HookAborted {
                         hook: "PostResponse".into(),
@@ -3983,15 +4214,20 @@ impl AgentRunner {
             // 3a. Emit ParseToolCalls。opens/closes 现在都等于结构化
             // tool_calls 数量（不再有文本解析失配），保留字段是为了
             // trace JSON 向后兼容。
-            let parsed_calls: Vec<ParsedCall> = tool_calls.iter().map(|tc| ParsedCall {
-                id: tc.id.clone(),
-                name: tc.name.clone(),
-                // 优先用模型原始 JSON 串（arguments_raw）：合法时与
-                // arguments 等价；latte-ai 解析失败时保留坏串，让下面
-                // exec loop 的 from_str 失败归类为 MalformedArgs。
-                args: tc.arguments_raw.clone()
-                    .unwrap_or_else(|| tc.arguments.to_string()),
-            }).collect();
+            let parsed_calls: Vec<ParsedCall> = tool_calls
+                .iter()
+                .map(|tc| ParsedCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    // 优先用模型原始 JSON 串（arguments_raw）：合法时与
+                    // arguments 等价；latte-ai 解析失败时保留坏串，让下面
+                    // exec loop 的 from_str 失败归类为 MalformedArgs。
+                    args: tc
+                        .arguments_raw
+                        .clone()
+                        .unwrap_or_else(|| tc.arguments.to_string()),
+                })
+                .collect();
             self.sink.emit(TraceEvent::ParseToolCalls {
                 meta: meta.refreshed(),
                 raw_in: final_response.clone(),
@@ -4064,8 +4300,7 @@ impl AgentRunner {
                          （finish_reason={}），上面的内容**可能不完整**，\
                          结构化数据（JSON/清单）很可能缺尾。下游请勿当作\
                          完整产出使用。",
-                        MAX_LENGTH_CONTINUATIONS,
-                        completion.stop_reason
+                        MAX_LENGTH_CONTINUATIONS, completion.stop_reason
                     ));
                     tracing::warn!(
                         stop_reason = %completion.stop_reason,
@@ -4081,9 +4316,7 @@ impl AgentRunner {
                 // 死循环）。
                 if markup_retried == 0 && has_dangling_tool_markup_tail(&final_response) {
                     markup_retried += 1;
-                    tracing::warn!(
-                        "final response ends with dangling tool markup; retrying once"
-                    );
+                    tracing::warn!("final response ends with dangling tool markup; retrying once");
                     messages.push(Message::assistant(final_response.clone()));
                     messages.push(Message::user(
                         "你上一条回复的尾部带有未完成的工具调用标记（如 </parameter>/</function>），回复疑似被截断。请重新输出完整答复；需要调用工具时用 native function-calling，正文里不要输出任何工具调用标记。"
@@ -4118,16 +4351,20 @@ impl AgentRunner {
             // 3b. Run PostParseHook (can mutate parsed calls)
             let mut post_parse_calls: Vec<ParsedCall> = parsed_calls;
             {
-                let mut ctx = crate::hooks::PostParseCtx { parsed: &mut post_parse_calls };
-                let outcome = self.hooks.run_post_parse(&mut ctx, |hook_name, point, kind| {
-                    self.sink.emit(TraceEvent::HookFired {
-                        meta: meta.refreshed(),
-                        hook_name: hook_name.to_string(),
-                        point,
-                        outcome_kind: kind.to_string(),
+                let mut ctx = crate::hooks::PostParseCtx {
+                    parsed: &mut post_parse_calls,
+                };
+                let outcome = self
+                    .hooks
+                    .run_post_parse(&mut ctx, |hook_name, point, kind| {
+                        self.sink.emit(TraceEvent::HookFired {
+                            meta: meta.refreshed(),
+                            hook_name: hook_name.to_string(),
+                            point,
+                            outcome_kind: kind.to_string(),
+                        });
+                        log_hook_fire(hook_name, point, kind);
                     });
-                    log_hook_fire(hook_name, point, kind);
-                });
                 match outcome {
                     crate::hooks::HookOutcome::Abort { reason } => {
                         return Err(AgentError::HookAborted {
@@ -4192,7 +4429,13 @@ impl AgentRunner {
                 };
 
                 let results = self
-                    .execute_tool_batch(&tm, &post_parse_calls, &exec_order, &meta, output_truncated)
+                    .execute_tool_batch(
+                        &tm,
+                        &post_parse_calls,
+                        &exec_order,
+                        &meta,
+                        output_truncated,
+                    )
                     .await;
 
                 // 按原始调用顺序记账 + 回填 tool_result：并发/重排只改变
@@ -4207,7 +4450,31 @@ impl AgentRunner {
                         &mut permanent_streak,
                         &final_response,
                         &last_substantive_response,
-                    ).await?;
+                    )
+                    .await?;
+                }
+                // ── 只读工具防沉迷催促（Read-Only Tool Runaway Nudge）──
+                // 对齐 oh-my-pi System Interrupt：防止模型在收到大量 issue 时陷入
+                // 连续几十甚至上百次 read/search 穷尽式探查而不动笔（如 196 次读搜事故）。
+                for call in &post_parse_calls {
+                    let short = short_tool_name(&call.name);
+                    last_executed_tool = Some(short.to_string());
+                    if matches!(short, "read" | "search" | "glob") {
+                        read_only_streak += 1;
+                    } else if matches!(short, "edit" | "write" | "bash") {
+                        read_only_streak = 0;
+                        read_only_nudge_sent = false;
+                    }
+                }
+                const READ_ONLY_NUDGE_THRESHOLD: usize = 20;
+                if read_only_streak >= READ_ONLY_NUDGE_THRESHOLD && !read_only_nudge_sent {
+                    read_only_nudge_sent = true;
+                    tracing::warn!(read_only_streak, "read-only tool streak threshold reached; injecting steer nudge");
+                    messages.push(Message::user(format!(
+                        "【系统提醒】你已连续执行了 {} 次只读查询（read/search/glob），但尚未对目标文件调用任何编辑工具（edit/write）。\n\
+                         请立即停止继续发散检索，基于当前已掌握的依据，针对已确认的问题调用 edit 或 write 工具开始落盘修改！",
+                        read_only_streak
+                    )));
                 }
             }
 
@@ -4260,7 +4527,16 @@ impl AgentRunner {
         // （日志事故：reviewer 空响应入 context 后 gate 重试全 400，
         // 整个 workflow 被拖垮。）
         if !final_response.trim().is_empty() {
-            self.context.push(Message::assistant(final_response.clone()));
+            self.context
+                .push(Message::assistant(final_response.clone()));
+        }
+
+        if deadline_hit && final_response.trim().is_empty() {
+            return Err(AgentError::DeadlineExceeded {
+                elapsed_secs: wall_elapsed.as_secs(),
+                tool_rounds: round,
+                last_tool: last_executed_tool,
+            });
         }
 
         Ok(final_response)
@@ -4295,8 +4571,7 @@ impl AgentRunner {
         let mut response = self.run_turn(new_messages, system_vars).await?;
         let mut tool_count = self.last_turn_tool_count;
         for attempt in 0..=max_retries {
-            let verdict =
-                crate::advisor_monitor::check_response_gates(&response, tool_count, &cfg);
+            let verdict = crate::advisor_monitor::check_response_gates(&response, tool_count, &cfg);
             match verdict {
                 crate::advisor_monitor::GateVerdict::Pass => return Ok(response),
                 crate::advisor_monitor::GateVerdict::Fail {
@@ -4352,7 +4627,10 @@ impl AgentRunner {
         let mut messages = vec![self.agent.system_message(vars)?];
         messages.extend_from_slice(new_messages);
 
-        let completion = self.agent.chat(&messages, None, WaitPolicy::WaitAndRetry).await?;
+        let completion = self
+            .agent
+            .chat(&messages, None, WaitPolicy::WaitAndRetry)
+            .await?;
         Ok(completion.content)
     }
 
@@ -4385,7 +4663,6 @@ impl AgentRunner {
         self.role_id = role_id.into();
         self
     }
-
 
     /// Set the working directory tools see as their default cwd.
     /// `run_turn` rewrites relative paths in tool inputs against it
@@ -4472,12 +4749,20 @@ impl AgentRunner {
     /// native function-calling 下，assistant 消息的 `tool_calls` 字段携带
     /// 结构化调用（id+name+arguments），直接读它而非解析 `<tool_call>` 文本。
     pub fn last_decision_kind(&self) -> String {
-        use latte_ai::models::Role as MsgRole;
         use crate::checkpoint::short_hash;
-        let Some(last) = self.context.messages().last() else { return "text".to_string(); };
-        if last.role != MsgRole::Assistant { return "text".to_string(); }
-        let Some(calls) = &last.tool_calls else { return "text".to_string(); };
-        let Some(first) = calls.first() else { return "text".to_string(); };
+        use latte_ai::models::Role as MsgRole;
+        let Some(last) = self.context.messages().last() else {
+            return "text".to_string();
+        };
+        if last.role != MsgRole::Assistant {
+            return "text".to_string();
+        }
+        let Some(calls) = &last.tool_calls else {
+            return "text".to_string();
+        };
+        let Some(first) = calls.first() else {
+            return "text".to_string();
+        };
         // 优先识别 delegate / ask_human（更具体的决策标签）。
         match first.name.as_str() {
             "delegate" => return "delegate".to_string(),
@@ -4499,7 +4784,6 @@ impl std::fmt::Debug for AgentRunner {
             .finish()
     }
 }
-
 
 /// Convenience: parameters override for agent construction.
 
@@ -4600,8 +4884,8 @@ fn normalize_model_schema_node(schema: &mut serde_json::Value) {
 fn model_facing_tool_schema(
     definition: &latte_rs_agent_tools::types::ToolDefinition,
 ) -> serde_json::Value {
-    let mut schema = serde_json::to_value(&definition.input_schema)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let mut schema =
+        serde_json::to_value(&definition.input_schema).unwrap_or_else(|_| serde_json::json!({}));
     normalize_model_schema_node(&mut schema);
     schema
 }
@@ -4753,7 +5037,9 @@ pub(crate) fn coerce_tool_input_to_schema(
         if !matches!(prop.property_type, PropertyType::String) {
             continue;
         }
-        let Some(items) = value.as_array() else { continue };
+        let Some(items) = value.as_array() else {
+            continue;
+        };
         if items.is_empty() || !items.iter().all(|v| v.is_string()) {
             continue;
         }
@@ -4811,8 +5097,8 @@ mod tests {
     use crate::model_resolver::ModelTier;
     use crate::role::Role as AgentRole;
     use crate::role::RoleCategory;
-    use latte_ai::models::{ContentPart, Model};
     use latte_ai::models::Role as MsgRole;
+    use latte_ai::models::{ContentPart, Model};
     use std::time::Duration;
 
     fn test_role() -> AgentRole {
@@ -4839,7 +5125,10 @@ mod tests {
         assert_eq!(meta_a["cwd"], "/workspace");
         assert_eq!(meta_a["current_session_file"], a.to_string_lossy().as_ref());
         assert_eq!(meta_b["current_session_file"], b.to_string_lossy().as_ref());
-        assert_ne!(meta_a["current_session_file"], meta_b["current_session_file"]);
+        assert_ne!(
+            meta_a["current_session_file"],
+            meta_b["current_session_file"]
+        );
         assert!(tool_execution_metadata(None, None).is_none());
     }
 
@@ -4917,8 +5206,7 @@ mod tests {
         crate::edit_anchor::record_tool_result(
             &scope_a,
             "read",
-            &serde_json::json!({"path": path, "content": "fn a() {}\n", "tag": "AAAA"})
-                .to_string(),
+            &serde_json::json!({"path": path, "content": "fn a() {}\n", "tag": "AAAA"}).to_string(),
         );
         assert!(
             crate::edit_anchor::observed_lines(&scope_a, path).is_some(),
@@ -4942,7 +5230,9 @@ mod tests {
         let bad2 = "好的，我来处理<tool_call>";
         assert!(has_dangling_tool_markup_tail(bad2));
         // 干净答复
-        assert!(!has_dangling_tool_markup_tail("这是一段完整的中文答复，没有任何标记。"));
+        assert!(!has_dangling_tool_markup_tail(
+            "这是一段完整的中文答复，没有任何标记。"
+        ));
         // 标记在正文前部（尾部窗口之外）→ 不误伤
         let mut mid = "示例：`</function>` 是闭合标记。\n".to_string();
         mid.push_str(&"后续正文。".repeat(100));
@@ -5112,10 +5402,8 @@ mod tests {
         assert!(is_relative_fs_path("docs/note[1].md"));
 
         let cwd = std::path::Path::new("/tmp/proj");
-        let out = resolve_tool_input_against_cwd(
-            serde_json::json!({ "path": r#"["a.c", "b.h"]"# }),
-            cwd,
-        );
+        let out =
+            resolve_tool_input_against_cwd(serde_json::json!({ "path": r#"["a.c", "b.h"]"# }), cwd);
         assert_eq!(
             out["path"].as_str().unwrap(),
             r#"["a.c", "b.h"]"#,
@@ -5171,15 +5459,25 @@ mod tests {
     #[test]
     fn test_agent_construction() {
         let role = test_role();
-        let agent = Agent::new("test-agent".into(), role, test_model(), GenerateParams::default());
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        );
         assert!(agent.is_ok());
     }
 
     #[test]
     fn test_system_message_building() {
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
 
         let vars = serde_json::json!({
             "role_name": "Tester",
@@ -5195,8 +5493,13 @@ mod tests {
     #[test]
     fn test_runner_construction() {
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let runner = AgentRunner::new(agent);
         assert_eq!(runner.context().messages().len(), 0);
         assert_eq!(runner.total_usage().input_tokens, 0);
@@ -5205,8 +5508,13 @@ mod tests {
     #[test]
     fn test_runner_context_management() {
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent);
 
         runner.context_mut().push(Message::user("Hello"));
@@ -5216,8 +5524,13 @@ mod tests {
     #[test]
     fn test_prune_context() {
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent);
 
         runner.context_mut().set_token_budget(10);
@@ -5337,9 +5650,10 @@ mod tests {
     fn test_context_overflow_detection() {
         let overflow = AgentError::ModelsUnavailable {
             tried: vec!["m1".into()],
-            failures: vec![
-                ("m1".into(), "API error: 400 - invalid params, context window exceeds limit".into()),
-            ],
+            failures: vec![(
+                "m1".into(),
+                "API error: 400 - invalid params, context window exceeds limit".into(),
+            )],
             next_retry_in: None,
         };
         assert!(failures_include_context_overflow(&overflow));
@@ -5380,9 +5694,17 @@ mod tests {
         );
         assert!(slimmed.contains("中段省略"), "{slimmed}");
         let (head, tail) = slimmed.split_once("\n…[中段省略").expect("应有中段标记");
-        assert_eq!(head.chars().count(), OVERSIZED_MSG_CHARS * 6 / 10, "头部预算 60%");
+        assert_eq!(
+            head.chars().count(),
+            OVERSIZED_MSG_CHARS * 6 / 10,
+            "头部预算 60%"
+        );
         let tail = tail.split_once("]…\n").expect("标记应闭合").1;
-        assert_eq!(tail.chars().count(), OVERSIZED_MSG_CHARS * 4 / 10, "尾部预算 40%");
+        assert_eq!(
+            tail.chars().count(),
+            OVERSIZED_MSG_CHARS * 4 / 10,
+            "尾部预算 40%"
+        );
     }
 
     // ─── compact_stale_tool_results tests ───────────────────────────
@@ -5400,10 +5722,10 @@ mod tests {
         let mut msgs = vec![
             Message::system("sys"),
             Message::user("go"),
-            Message::tool_result("t1", &big), // 陈旧 + 大 → 压
+            Message::tool_result("t1", &big),   // 陈旧 + 大 → 压
             Message::tool_result("t2", &small), // 陈旧但小 → 不动
-            Message::tool_result("t3", &big), // 陈旧 + 大 → 压
-            Message::tool_result("t4", &big), // 最近 2 条 → 不动
+            Message::tool_result("t3", &big),   // 陈旧 + 大 → 压
+            Message::tool_result("t4", &big),   // 最近 2 条 → 不动
             Message::tool_result("t5", &big),
         ];
         let n = compact_stale_tool_results(&mut msgs, 2);
@@ -5428,6 +5750,26 @@ mod tests {
             5,
             "绝不删消息，否则 provider 因 tool_call 无配对结果直接拒请求"
         );
+    }
+
+    /// 哪怕都在 keep_recent 条数内，若累积字符超过 RECENT_TOOL_RESULTS_BUDGET_CHARS
+    /// （24KB），超出体积预算的较早结果依然必须被压缩。
+    /// 事故回归：proofreader 6 次读取虽然条数刚落在 6 条豁免区，但累积 100KB+
+    /// 全被重传；加上体积上限后，更早的立即被压到头尾标记。
+    #[test]
+    fn compact_stale_tool_results_enforces_byte_budget_even_within_keep_recent() {
+        let big_chunk = "B".repeat(10_000); // 10KB
+        let mut msgs = vec![
+            Message::user("go"),
+            Message::tool_result("t1", &big_chunk),
+            Message::tool_result("t2", &big_chunk),
+            Message::tool_result("t3", &big_chunk),
+            Message::tool_result("t4", &big_chunk), // 最新 4 条合计 40KB > 24KB 保护区
+        ];
+        // 要求保留 6 条——但体积预算是 24KB，所以即使条数未超，更早的也必须被压缩
+        let n = compact_stale_tool_results(&mut msgs, 6);
+        assert!(n >= 1, "超出 24KB 累积体积的较早结果必须被压缩: {n}");
+        assert!(msgs[1].as_text().contains("中段省略"), "t1 必须被压缩以腾出空间");
     }
 
     /// 压缩必须**留头留尾**：换成占位符会让模型认不出读过什么，转头
@@ -5523,7 +5865,10 @@ mod tests {
                 if compact {
                     compact_stale_tool_results(&mut msgs, CONTEXT_KEEP_RECENT_TOOL_RESULTS);
                 }
-                total += msgs.iter().map(|m| m.as_text().chars().count()).sum::<usize>();
+                total += msgs
+                    .iter()
+                    .map(|m| m.as_text().chars().count())
+                    .sum::<usize>();
             }
             total
         };
@@ -5641,10 +5986,17 @@ mod tests {
         )
         .unwrap();
         let mut runner = AgentRunner::new_with_tools(agent, make_tm());
-        let _ = runner.run_turn(&[Message::user("连续读")], None).await.unwrap();
+        let _ = runner
+            .run_turn(&[Message::user("连续读")], None)
+            .await
+            .unwrap();
 
         let reqs = server.received_requests().await.expect("mock 应记录请求");
-        assert!(reqs.len() > CONTEXT_KEEP_RECENT_TOOL_RESULTS, "轮数要够才压得到: {}", reqs.len());
+        assert!(
+            reqs.len() > CONTEXT_KEEP_RECENT_TOOL_RESULTS,
+            "轮数要够才压得到: {}",
+            reqs.len()
+        );
         let last = String::from_utf8_lossy(&reqs[reqs.len() - 1].body).to_string();
 
         assert!(
@@ -5670,7 +6022,10 @@ mod tests {
         )
         .unwrap();
         let mut runner2 = AgentRunner::new_with_tools(agent2, make_tm());
-        let _ = runner2.run_turn(&[Message::user("连续读")], None).await.unwrap();
+        let _ = runner2
+            .run_turn(&[Message::user("连续读")], None)
+            .await
+            .unwrap();
         let reqs2 = server2.received_requests().await.unwrap();
         let last2 = String::from_utf8_lossy(&reqs2[reqs2.len() - 1].body).to_string();
         assert!(!last2.contains("中段省略"), "关闭开关后不应有任何压缩");
@@ -5736,8 +6091,14 @@ mod tests {
         let long = format!("{head_marker}{}{tail_marker}", "冲突对; ".repeat(2000));
         assert!(long.len() > MAX_TOOL_ERROR_BYTES * 2, "样本要够长");
         let out = compact_middle_out(&long, MAX_TOOL_ERROR_BYTES);
-        assert!(out.starts_with(head_marker), "头部（错误分类）必须保留: {out:.80}");
-        assert!(out.ends_with(tail_marker), "尾部（修复指引）必须保留 —— 这正是旧实现丢掉的");
+        assert!(
+            out.starts_with(head_marker),
+            "头部（错误分类）必须保留: {out:.80}"
+        );
+        assert!(
+            out.ends_with(tail_marker),
+            "尾部（修复指引）必须保留 —— 这正是旧实现丢掉的"
+        );
         assert!(out.contains("中段省略"), "必须告知模型内容被压缩过");
         // 预算：正文 ≤ 上限，标记是常数级开销。
         assert!(
@@ -5799,7 +6160,10 @@ mod tests {
         let mc2 = mc1.clone();
         mc2.set_cooldown(Duration::from_secs(60));
         assert!(!mc2.is_available());
-        assert!(mc1.is_available(), "original must not be affected by clone's cooldown");
+        assert!(
+            mc1.is_available(),
+            "original must not be affected by clone's cooldown"
+        );
     }
 
     // ─── new_with_chain validation ─────────────────────────────────────
@@ -5875,33 +6239,39 @@ mod tests {
         let mut out = String::new();
         for c in chunks {
             out.push_str("data: ");
-            out.push_str(&serde_json::json!({
+            out.push_str(
+                &serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test",
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": c },
+                        "finish_reason": None::<String>
+                    }]
+                })
+                .to_string(),
+            );
+            out.push_str("\n\n");
+        }
+        // 末尾 chunk：finish_reason + usage
+        out.push_str("data: ");
+        out.push_str(
+            &serde_json::json!({
                 "id": "chatcmpl-test",
                 "object": "chat.completion.chunk",
                 "created": 0,
                 "model": "test",
                 "choices": [{
                     "index": 0,
-                    "delta": { "content": c },
-                    "finish_reason": None::<String>
-                }]
-            }).to_string());
-            out.push_str("\n\n");
-        }
-        // 末尾 chunk：finish_reason + usage
-        out.push_str("data: ");
-        out.push_str(&serde_json::json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion.chunk",
-            "created": 0,
-            "model": "test",
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }],
-            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
-        }).to_string());
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+            })
+            .to_string(),
+        );
         out.push_str("\n\n");
         out.push_str("data: [DONE]\n\n");
         out
@@ -5971,7 +6341,10 @@ mod tests {
         )
         .unwrap();
         let mut runner = AgentRunner::new(agent);
-        runner.run_turn(&[Message::user("你好")], None).await.unwrap();
+        runner
+            .run_turn(&[Message::user("你好")], None)
+            .await
+            .unwrap();
 
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1, "应恰好一次请求");
@@ -6013,7 +6386,10 @@ mod tests {
         )
         .unwrap();
         let mut runner = AgentRunner::new(agent);
-        runner.run_turn(&[Message::user("你好")], None).await.unwrap();
+        runner
+            .run_turn(&[Message::user("你好")], None)
+            .await
+            .unwrap();
 
         let reqs = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
@@ -6043,8 +6419,8 @@ mod tests {
                         max_tokens: 4096,
                         omit_max_tokens: false,
                         max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                        prompt_cache: false,
+                        prompt_cache_key: None,
                         supports_thinking: false,
                         supports_vision: false,
                         supports_image_generation: false,
@@ -6104,8 +6480,8 @@ mod tests {
                 max_tokens: 4096,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 supports_image_generation: false,
@@ -6269,26 +6645,26 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("fallback won", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("fallback won", vec![])),
+                    ),
             )
             .await;
 
         let agent = Agent::new_with_chain(
             "a".into(),
             test_role(),
-            vec![model_at(&primary, "primary"), model_at(&fallback, "fallback")],
+            vec![
+                model_at(&primary, "primary"),
+                model_at(&fallback, "fallback"),
+            ],
             GenerateParams::default(),
         )
         .unwrap();
 
         let resp = agent
-            .chat(
-                &[Message::user("hi")],
-                None,
-                WaitPolicy::NoWait,
-            )
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
             .await
             .expect("fallback should succeed");
         assert_eq!(resp.content, "fallback won");
@@ -6323,16 +6699,20 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("fallback won", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("fallback won", vec![])),
+                    ),
             )
             .await;
 
         let agent = Agent::new_with_chain(
             "a".into(),
             test_role(),
-            vec![model_at(&primary, "primary"), model_at(&fallback, "fallback")],
+            vec![
+                model_at(&primary, "primary"),
+                model_at(&fallback, "fallback"),
+            ],
             GenerateParams::default(),
         )
         .unwrap();
@@ -6420,10 +6800,7 @@ mod tests {
         let sink = Arc::new(LocalVecSink(parking_lot::Mutex::new(vec![])));
         let mut runner = AgentRunner::new(agent).with_sink(sink.clone() as Arc<dyn TraceSink>);
 
-        let out = runner
-            .run_turn(&[Message::user("hi")], None)
-            .await
-            .unwrap();
+        let out = runner.run_turn(&[Message::user("hi")], None).await.unwrap();
         std::env::remove_var("LATTE_AGENT_SLOW_CALL_NOTICE_SECS");
         drop(_guard);
 
@@ -6448,9 +6825,10 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("success-output", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("success-output", vec![])),
+                    ),
             )
             .await;
         let agent = Agent::new_with_chain(
@@ -6510,7 +6888,11 @@ mod tests {
             .await;
         assert!(result.is_err(), "401 must fail the turn");
         let history = runner.context().messages();
-        assert_eq!(history.len(), 1, "failed turn must retain only its user input");
+        assert_eq!(
+            history.len(),
+            1,
+            "failed turn must retain only its user input"
+        );
         assert_eq!(history[0].as_text(), "input-before-model-error");
     }
 
@@ -6553,7 +6935,11 @@ mod tests {
         drop(future);
 
         let history = runner.context().messages();
-        assert_eq!(history.len(), 1, "cancelled turn must retain its user input");
+        assert_eq!(
+            history.len(),
+            1,
+            "cancelled turn must retain its user input"
+        );
         assert_eq!(history[0].as_text(), "input-before-cancel");
     }
 
@@ -6665,7 +7051,9 @@ mod tests {
         );
         let nudged = String::from_utf8_lossy(&reqs[PERMANENT_NUDGE_AT].body);
         assert!(
-            nudged.contains(&format!("已连续 {PERMANENT_NUDGE_AT} 次因输入校验/JSON失败被拒")),
+            nudged.contains(&format!(
+                "已连续 {PERMANENT_NUDGE_AT} 次因输入校验/JSON失败被拒"
+            )),
             "第 {} 个请求应带熔断前的硬指令: {nudged}",
             PERMANENT_NUDGE_AT + 1
         );
@@ -6726,7 +7114,10 @@ mod tests {
         });
         let reason = paused.expect("应发 SessionPaused");
         assert!(reason.contains("tool exec boundary"), "reason: {reason}");
-        assert!(reason.contains("用户按了 ⏸"), "应带上门的暂停原因: {reason}");
+        assert!(
+            reason.contains("用户按了 ⏸"),
+            "应带上门的暂停原因: {reason}"
+        );
         assert!(
             events
                 .iter()
@@ -6784,9 +7175,9 @@ mod tests {
         let (end_ts, elapsed) = events
             .iter()
             .find_map(|e| match e {
-                TraceEvent::TurnEnd { meta, elapsed_ms, .. } => {
-                    Some((meta.ts.clone(), *elapsed_ms))
-                }
+                TraceEvent::TurnEnd {
+                    meta, elapsed_ms, ..
+                } => Some((meta.ts.clone(), *elapsed_ms)),
                 _ => None,
             })
             .expect("TurnEnd");
@@ -6826,11 +7217,7 @@ mod tests {
         .unwrap();
 
         let err = agent
-            .chat(
-                &[Message::user("hi")],
-                None,
-                WaitPolicy::NoWait,
-            )
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
             .await
             .expect_err("all models should fail");
         match err {
@@ -6872,9 +7259,10 @@ mod tests {
         s2.register(
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
-                .respond_with(ResponseTemplate::new(200).set_body_string(
-                    openai_completion_body("reached via fallback", vec![]),
-                )),
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body("reached via fallback", vec![])),
+                ),
         )
         .await;
 
@@ -6938,11 +7326,7 @@ mod tests {
         )
         .unwrap();
         let err = agent
-            .chat(
-                &[Message::user("hi")],
-                None,
-                WaitPolicy::NoWait,
-            )
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
             .await
             .expect_err("single model failure");
         assert!(matches!(err, AgentError::ModelsUnavailable { .. }));
@@ -6963,9 +7347,10 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .and(wiremock::matchers::header_exists("x-test-first"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("recovered", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("recovered", vec![])),
+                    ),
             )
             .await;
         // Simpler: register two mocks. wiremock returns the most
@@ -6995,9 +7380,10 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("after wait", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("after wait", vec![])),
+                    ),
             )
             .await;
         let agent = Agent::new_with_chain(
@@ -7013,11 +7399,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let resp = agent
-            .chat(
-                &[Message::user("hi")],
-                None,
-                WaitPolicy::WaitAndRetry,
-            )
+            .chat(&[Message::user("hi")], None, WaitPolicy::WaitAndRetry)
             .await
             .expect("should succeed after short wait");
         let elapsed = start.elapsed();
@@ -7054,7 +7436,7 @@ mod tests {
                 self.0.lock().push(e);
             }
         }
-        use crate::hooks::{Hook, HookChain, PreCallCtx, HookOutcome};
+        use crate::hooks::{Hook, HookChain, HookOutcome, PreCallCtx};
         use std::sync::Arc;
 
         // Stub model returns a plain text response (no tool calls).
@@ -7064,19 +7446,25 @@ mod tests {
         s.register(
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
-                .respond_with(ResponseTemplate::new(200)
-                    .set_body_string(openai_completion_body("plain text reply", vec![]))),
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body("plain text reply", vec![])),
+                ),
         )
         .await;
 
         // PreCall hook: redacts PII in user messages.
         struct RedactPreCall;
         impl Hook for RedactPreCall {
-            fn name(&self) -> &str { "redact_pre_call" }
+            fn name(&self) -> &str {
+                "redact_pre_call"
+            }
             fn pre_call(&self, ctx: &mut PreCallCtx) -> HookOutcome<()> {
                 for m in ctx.messages.iter_mut() {
                     if m.role == MsgRole::User {
-                        m.content = vec![ContentPart::text(m.as_text().replace("13812345678", "<REDACTED>"))];
+                        m.content = vec![ContentPart::text(
+                            m.as_text().replace("13812345678", "<REDACTED>"),
+                        )];
                     }
                 }
                 HookOutcome::Continue
@@ -7084,10 +7472,8 @@ mod tests {
         }
 
         let sink = Arc::new(LocalVecSink(parking_lot::Mutex::new(vec![])));
-        let hooks: Arc<HookChain> = Arc::new(
-            HookChain::empty()
-                .push(Arc::new(RedactPreCall) as Arc<dyn Hook>)
-        );
+        let hooks: Arc<HookChain> =
+            Arc::new(HookChain::empty().push(Arc::new(RedactPreCall) as Arc<dyn Hook>));
 
         let role = test_role();
         let agent = Agent::new_with_chain(
@@ -7095,7 +7481,8 @@ mod tests {
             role,
             vec![model_at(&s, "stub-model")],
             GenerateParams::default(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let mut runner = AgentRunner::new(agent)
             .with_sink(sink.clone() as Arc<dyn TraceSink>)
@@ -7107,9 +7494,15 @@ mod tests {
         runner.emit_session_start("standard");
         {
             let events = sink.0.lock();
-            assert!(matches!(&events[0], TraceEvent::SessionStart { .. }),
-                "first event should be SessionStart, got {:?}", events[0]);
-            if let TraceEvent::SessionStart { tier, model_chain, .. } = &events[0] {
+            assert!(
+                matches!(&events[0], TraceEvent::SessionStart { .. }),
+                "first event should be SessionStart, got {:?}",
+                events[0]
+            );
+            if let TraceEvent::SessionStart {
+                tier, model_chain, ..
+            } = &events[0]
+            {
                 assert_eq!(tier, "standard");
                 assert_eq!(model_chain, &["stub-model".to_string()]);
             }
@@ -7123,40 +7516,75 @@ mod tests {
         //    mutate it, and PromptBuilt.user_input should reflect
         //    the post-hook state.
         let msgs = vec![Message::user("call me at 13812345678 about it")];
-        let resp = runner.run_turn(&msgs, None).await
+        let resp = runner
+            .run_turn(&msgs, None)
+            .await
             .expect("run_turn should succeed against wiremock");
         assert_eq!(resp, "plain text reply");
 
         // 3. Sink should contain the expected event sequence.
         let events = sink.0.lock();
         let kinds: Vec<&'static str> = events.iter().map(|e| e.variant_name()).collect();
-        assert!(kinds.contains(&"SessionStart"), "missing SessionStart: {kinds:?}");
+        assert!(
+            kinds.contains(&"SessionStart"),
+            "missing SessionStart: {kinds:?}"
+        );
         assert!(kinds.contains(&"HookFired"), "missing HookFired: {kinds:?}");
-        assert!(kinds.contains(&"PromptBuilt"), "missing PromptBuilt: {kinds:?}");
+        assert!(
+            kinds.contains(&"PromptBuilt"),
+            "missing PromptBuilt: {kinds:?}"
+        );
         assert!(kinds.contains(&"ModelCall"), "missing ModelCall: {kinds:?}");
-        assert!(kinds.contains(&"ModelRawOut"), "missing ModelRawOut: {kinds:?}");
-        assert!(kinds.contains(&"ParseToolCalls"), "missing ParseToolCalls: {kinds:?}");
+        assert!(
+            kinds.contains(&"ModelRawOut"),
+            "missing ModelRawOut: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"ParseToolCalls"),
+            "missing ParseToolCalls: {kinds:?}"
+        );
         assert!(kinds.contains(&"TurnEnd"), "missing TurnEnd: {kinds:?}");
 
         // 4. PreCall hook fired exactly once (bug 1 fix verified).
-        let pre_call_fires: usize = events.iter().filter(|e| {
-            matches!(e, TraceEvent::HookFired { point: HookPoint::PreCall, .. })
-        }).count();
-        assert_eq!(pre_call_fires, 1, "expected 1 PreCall HookFired, got {pre_call_fires}");
+        let pre_call_fires: usize = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    TraceEvent::HookFired {
+                        point: HookPoint::PreCall,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            pre_call_fires, 1,
+            "expected 1 PreCall HookFired, got {pre_call_fires}"
+        );
 
         // 5. PromptBuilt's user_input is the post-hook (redacted)
         //    message, NOT the original input. This is the visible
         //    end-to-end proof that the PreCall hook mutation is
         //    applied to the model call.
-        let prompt_built = events.iter().find_map(|e| {
-            if let TraceEvent::PromptBuilt { user_input, .. } = e {
-                Some(user_input.clone())
-            } else { None }
-        }).expect("PromptBuilt should be present");
-        assert!(prompt_built.contains("<REDACTED>"),
-            "PromptBuilt.user_input should be redacted, got: {prompt_built:?}");
-        assert!(!prompt_built.contains("13812345678"),
-            "PromptBuilt.user_input should not contain raw PII, got: {prompt_built:?}");
+        let prompt_built = events
+            .iter()
+            .find_map(|e| {
+                if let TraceEvent::PromptBuilt { user_input, .. } = e {
+                    Some(user_input.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("PromptBuilt should be present");
+        assert!(
+            prompt_built.contains("<REDACTED>"),
+            "PromptBuilt.user_input should be redacted, got: {prompt_built:?}"
+        );
+        assert!(
+            !prompt_built.contains("13812345678"),
+            "PromptBuilt.user_input should not contain raw PII, got: {prompt_built:?}"
+        );
 
         drop(events);
 
@@ -7164,8 +7592,10 @@ mod tests {
         runner.emit_session_end(1);
         let events = sink.0.lock();
         let last = events.last().expect("should have events");
-        assert!(matches!(last, TraceEvent::SessionEnd { .. }),
-            "last event should be SessionEnd, got {last:?}");
+        assert!(
+            matches!(last, TraceEvent::SessionEnd { .. }),
+            "last event should be SessionEnd, got {last:?}"
+        );
         if let TraceEvent::SessionEnd { total_turns, .. } = last {
             assert_eq!(*total_turns, 1u32);
         }
@@ -7303,9 +7733,10 @@ mod tests {
         s.register(
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
-                .respond_with(ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "text/event-stream")
-                    .set_body_string(openai_sse_body(&["Hello", ", ", "stream", " mode!"])),
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", "text/event-stream")
+                        .set_body_string(openai_sse_body(&["Hello", ", ", "stream", " mode!"])),
                 ),
         )
         .await;
@@ -7317,7 +7748,8 @@ mod tests {
             role,
             vec![model_at(&s, "stream-model")],
             GenerateParams::default(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent)
             .with_sink(sink.clone() as Arc<dyn TraceSink>)
             .with_role("stream-test".to_string())
@@ -7335,15 +7767,19 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, TraceEvent::ModelDelta { .. }))
             .count();
-        assert!(delta_count > 0, "stream 模式应发出 ModelDelta，但收到 {delta_count} 个");
+        assert!(
+            delta_count > 0,
+            "stream 模式应发出 ModelDelta，但收到 {delta_count} 个"
+        );
 
         // non-stream（默认，不装 stream_mode）时不应发 ModelDelta，走 chat() 聚合。
         let s2 = wiremock::MockServer::start().await;
         s2.register(
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
-                .respond_with(ResponseTemplate::new(200)
-                    .set_body_string(openai_completion_body("plain", vec![])),
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(openai_completion_body("plain", vec![])),
                 ),
         )
         .await;
@@ -7353,7 +7789,8 @@ mod tests {
             test_role(),
             vec![model_at(&s2, "nostream-model")],
             GenerateParams::default(),
-        ).unwrap();
+        )
+        .unwrap();
         let mut runner2 = AgentRunner::new(agent2)
             .with_sink(sink2.clone() as Arc<dyn TraceSink>)
             .with_role("nostream-test".to_string());
@@ -7364,7 +7801,9 @@ mod tests {
         assert_eq!(resp2, "plain", "non-stream 模式返回完整文本");
         let events2 = sink2.0.lock().clone();
         assert!(
-            !events2.iter().any(|e| matches!(e, TraceEvent::ModelDelta { .. })),
+            !events2
+                .iter()
+                .any(|e| matches!(e, TraceEvent::ModelDelta { .. })),
             "non-stream 模式不应发 ModelDelta（走 chat() 聚合路径）"
         );
     }
@@ -7387,8 +7826,10 @@ mod tests {
         let decision = d.record("read", "{\"path\":\"a.rs\"}");
         match decision {
             LoopDecision::Break(reason) => {
-                assert!(reason.contains("read"),
-                    "break reason should name the offending tool, got: {reason}");
+                assert!(
+                    reason.contains("read"),
+                    "break reason should name the offending tool, got: {reason}"
+                );
             }
             LoopDecision::Continue => panic!("expected Break on 5th identical call"),
         }
@@ -7405,7 +7846,10 @@ mod tests {
             ));
         }
         // 换一个调用把连击清零 —— 这正是「改了参数就是有进展」的语义。
-        assert!(matches!(d.record("search", "{\"path\":\".\"}"), LoopDecision::Continue));
+        assert!(matches!(
+            d.record("search", "{\"path\":\".\"}"),
+            LoopDecision::Continue
+        ));
         // 重新计数：接下来 4 次仍在阈值之下。
         for _ in 0..4 {
             assert!(matches!(
@@ -7414,7 +7858,10 @@ mod tests {
             ));
         }
         // 清零后的第 5 次连续调用才触发。
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Break(_)));
+        assert!(matches!(
+            d.record("read", "{\"path\":\"a.rs\"}"),
+            LoopDecision::Break(_)
+        ));
     }
 
     #[test]
@@ -7424,10 +7871,15 @@ mod tests {
         d.record("read", "{\"path\":\"a.rs\"}");
         d.reset();
         // After reset, the streak is gone; next call starts fresh.
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
-        assert!(matches!(d.record("read", "{\"path\":\"a.rs\"}"), LoopDecision::Continue));
+        assert!(matches!(
+            d.record("read", "{\"path\":\"a.rs\"}"),
+            LoopDecision::Continue
+        ));
+        assert!(matches!(
+            d.record("read", "{\"path\":\"a.rs\"}"),
+            LoopDecision::Continue
+        ));
     }
-
 
     // ─── Advisor hint queue ────────────────────────────────────────
     //
@@ -7456,7 +7908,9 @@ mod tests {
 
         let hints: Arc<Mutex<std::collections::VecDeque<String>>> =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        hints.lock().push_back("注意：src/main.rs 已改名为 src/lib.rs".to_string());
+        hints
+            .lock()
+            .push_back("注意：src/main.rs 已改名为 src/lib.rs".to_string());
 
         let role = test_role();
         let agent = Agent::new_with_chain(
@@ -7469,10 +7923,7 @@ mod tests {
         let mut runner = AgentRunner::new(agent).with_advisor_hints(hints.clone());
 
         let resp = runner
-            .run_turn(
-                &[Message::user("继续")],
-                None,
-            )
+            .run_turn(&[Message::user("继续")], None)
             .await
             .expect("run_turn against wiremock");
         assert_eq!(resp, "done");
@@ -7489,17 +7940,20 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         assert_eq!(reqs.len(), 1);
         let body = String::from_utf8_lossy(&reqs[0].body);
-        assert!(body.contains("🦉 advisor 监察"), "model saw the hint: {body}");
+        assert!(
+            body.contains("🦉 advisor 监察"),
+            "model saw the hint: {body}"
+        );
     }
 
     #[tokio::test]
     async fn advisor_hints_drained_mid_tool_loop() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         let hints: Arc<Mutex<std::collections::VecDeque<String>>> =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
@@ -7545,16 +7999,17 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("", vec![
-                            serde_json::json!({
+                        openai_completion_body(
+                            "",
+                            vec![serde_json::json!({
                                 "id": "call_ping",
                                 "type": "function",
                                 "function": {
                                     "name": "ping",
                                     "arguments": "{}"
                                 }
-                            })
-                        ]),
+                            })],
+                        ),
                     ))
                     .up_to_n_times(3),
             )
@@ -7563,9 +8018,10 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("收尾产出", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("收尾产出", vec![])),
+                    ),
             )
             .await;
 
@@ -7590,7 +8046,11 @@ mod tests {
         // request #2 carry that hint — i.e. the correction reached
         // the model MID tool loop, before the turn ended.
         let reqs = server.received_requests().await.unwrap();
-        assert!(reqs.len() >= 2, "expected ≥2 model calls, got {}", reqs.len());
+        assert!(
+            reqs.len() >= 2,
+            "expected ≥2 model calls, got {}",
+            reqs.len()
+        );
         let body2 = String::from_utf8_lossy(&reqs[1].body);
         assert!(
             body2.contains("🦉 advisor 监察"),
@@ -7783,7 +8243,7 @@ mod tests {
                     "应在第 5 次连续相同调用时熔断: {reason}"
                 );
             }
-            other => panic!("期望 ToolLoopDetected，实际 {other:?}"),
+            other => panic!("expected ToolLoopDetected, got {other:?}"),
         }
         // 熔断要快：5 轮就够，不该把几十轮 model call 都烧掉。
         let n = server.received_requests().await.unwrap().len();
@@ -7791,6 +8251,144 @@ mod tests {
             (5..=7).contains(&n),
             "应在 ~5 轮内熔断，实际发了 {n} 次 model call"
         );
+    }
+    #[tokio::test]
+    async fn run_turn_returns_deadline_exceeded_when_deadline_hit_with_empty_response() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move { Ok(serde_json::json!({ "read": "data" })) })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+            defs: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("read", "read something", schema, handler).build(),
+            None,
+        );
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body(
+                            "",
+                            vec![serde_json::json!({
+                                "id": "call_read",
+                                "type": "function",
+                                "function": { "name": "read", "arguments": "{\"path\":\"a.txt\"}" }
+                            })],
+                        ),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+        runner.set_deadline(std::time::Instant::now() - std::time::Duration::from_secs(1));
+
+        let err = runner
+            .run_turn(&[Message::user("do work")], None)
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::DeadlineExceeded { tool_rounds, last_tool, .. } => {
+                assert_eq!(tool_rounds, 0);
+                assert_eq!(last_tool.as_deref(), None, "启动时已超时，尚未执行任何工具");
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_streak_injects_steer_nudge() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move { Ok(serde_json::json!({ "content": "file text" })) })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+            defs: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("read", "read file", schema, handler).build(),
+            None,
+        );
+
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let rc = req_count.clone();
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(move |req: &wiremock::Request| {
+                        let cur = rc.fetch_add(1, Ordering::SeqCst);
+                        // 前 21 次全部发 read tool call，第 22 次给出结束正文
+                        if cur < 21 {
+                            ResponseTemplate::new(200).set_body_string(
+                                openai_completion_body(
+                                    "",
+                                    vec![serde_json::json!({
+                                        "id": format!("call_read_{cur}"),
+                                        "type": "function",
+                                        "function": { "name": "read", "arguments": format!("{{\"path\":\"f{cur}.txt\"}}") }
+                                    })],
+                                ),
+                            )
+                        } else {
+                            // 检查在第 21 次请求中是否已经收到了系统提醒
+                            let body_str = String::from_utf8_lossy(&req.body);
+                            let saw_nudge = body_str.contains("系统提醒") && body_str.contains("连续执行了 20 次只读查询");
+                            assert!(saw_nudge, "请求中必须包含系统防沉迷催促注入");
+                            ResponseTemplate::new(200).set_body_string(
+                                openai_completion_body("I will edit now and done.", vec![]),
+                            )
+                        }
+                    }),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+        let res = runner.run_turn(&[Message::user("do work")], None).await.unwrap();
+        assert!(res.contains("I will edit now and done."));
     }
 
     /// 反向防线：参数**每次都变**的连续调用不是死循环，不得误杀。
@@ -7852,9 +8450,10 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("按步骤走完了", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("按步骤走完了", vec![])),
+                    ),
             )
             .await;
 
@@ -7929,7 +8528,10 @@ mod tests {
         ));
         for i in 0..3 {
             assert!(
-                matches!(d.record("read", r#"{"path":"a.rs"}"#), LoopDecision::Continue),
+                matches!(
+                    d.record("read", r#"{"path":"a.rs"}"#),
+                    LoopDecision::Continue
+                ),
                 "第 {i} 次 read 不该被判打转（search 只出现 1 次）"
             );
         }
@@ -7945,7 +8547,10 @@ mod tests {
         for i in 0..4 {
             // 读同一个文件（参数相同）——改完要复核，这是正常的。
             assert!(
-                matches!(d.record("read", r#"{"path":"a.rs"}"#), LoopDecision::Continue),
+                matches!(
+                    d.record("read", r#"{"path":"a.rs"}"#),
+                    LoopDecision::Continue
+                ),
                 "第 {i} 轮 read 不该熔断"
             );
             // 每次写入不同内容 → 不同 key。
@@ -8048,19 +8653,18 @@ mod tests {
         );
     }
 
-
     /// v3 pause gate：runner 在 tool-round 边界挂起，直到拍板
     /// （resolve）才继续。模拟链路：工具 handler 扮演 monitor 置位
     /// pause gate → 下一轮边界 runner 挂起 → 外部任务（扮演用户
     /// 输入）resolve → turn 继续跑完。
     #[tokio::test]
     async fn pause_gate_suspends_tool_loop_until_resolved() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         let gate = crate::advisor_monitor::AdvisorPauseGate::with_timeout(
             std::time::Duration::from_secs(30),
@@ -8099,16 +8703,17 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("", vec![
-                            serde_json::json!({
+                        openai_completion_body(
+                            "",
+                            vec![serde_json::json!({
                                 "id": "call_ping",
                                 "type": "function",
                                 "function": {
                                     "name": "ping",
                                     "arguments": "{}"
                                 }
-                            })
-                        ]),
+                            })],
+                        ),
                     )),
             )
             .await;
@@ -8136,7 +8741,10 @@ mod tests {
         // runner 应在 round-1 边界挂起：给足够时间它也不该完成
         // （没有 gate 时 4 轮乒乓远早于 300ms 撞上限）。
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!turn.is_finished(), "runner suspended at the tool-round boundary");
+        assert!(
+            !turn.is_finished(),
+            "runner suspended at the tool-round boundary"
+        );
         assert!(
             server.received_requests().await.unwrap().len() == 1,
             "no second model call while paused: {}",
@@ -8185,7 +8793,9 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_completion_body("hi", vec![])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_completion_body("hi", vec![])),
+            )
             .mount(&server)
             .await;
         let role = test_role();
@@ -8200,12 +8810,14 @@ mod tests {
         let gate = AgentPauseGate::new("test");
         // Pre-pause（模拟用户先按 ⏸ 后才发消息）。
         gate.pause();
-        let mut runner =
-            AgentRunner::new_with_tools(agent, tm).with_agent_pause_gate(gate.clone());
+        let mut runner = AgentRunner::new_with_tools(agent, tm).with_agent_pause_gate(gate.clone());
         let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
         // 200ms 后仍不完成（gate 在 park）。
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!turn.is_finished(), "run_turn parked at entry on pre-paused gate");
+        assert!(
+            !turn.is_finished(),
+            "run_turn parked at entry on pre-paused gate"
+        );
         // resolve → 跑完。
         gate.resume();
         let r = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
@@ -8254,21 +8866,25 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_completion_body(
-                "",
-                vec![serde_json::json!({
-                    "id": "call_ping",
-                    "type": "function",
-                    "function": {"name": "ping", "arguments": "{}"}
-                })],
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_completion_body(
+                    "",
+                    vec![serde_json::json!({
+                        "id": "call_ping",
+                        "type": "function",
+                        "function": {"name": "ping", "arguments": "{}"}
+                    })],
+                )),
+            )
             .up_to_n_times(1)
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(openai_completion_body("done", vec![])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_completion_body("done", vec![])),
+            )
             .mount(&server)
             .await;
         let tm = create_tool_manager();
@@ -8281,8 +8897,7 @@ mod tests {
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner =
-            AgentRunner::new_with_tools(agent, tm).with_agent_pause_gate(gate.clone());
+        let mut runner = AgentRunner::new_with_tools(agent, tm).with_agent_pause_gate(gate.clone());
         let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
         // 第一个 tool 已启动、in-flight 会跑完，但 tool 内部 engage
         // 了 gate → 下个 model call 边界 park。
@@ -8294,7 +8909,10 @@ mod tests {
         }
         assert!(gate.is_paused(), "tool handler engaged the gate");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!turn.is_finished(), "in-flight tool 跑完，但下个 model call park");
+        assert!(
+            !turn.is_finished(),
+            "in-flight tool 跑完，但下个 model call park"
+        );
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             1,
@@ -8314,15 +8932,79 @@ mod tests {
         );
     }
 
+    /// 用户在非流式模型调用期间按 ⏸：当前请求可安全丢弃（没有增量
+    /// 输出），run_turn 保留在同一轮，▶ 后重新发起请求，而不是把
+    /// workflow step 判成失败或让继续按钮变成空操作。
+    #[tokio::test]
+    async fn agent_pause_gate_retries_in_flight_non_stream_call_after_resume() {
+        use crate::pause_gate::AgentPauseGate;
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(5))
+                    .set_body_string(openai_completion_body("late", vec![])),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(openai_completion_body("resumed", vec![])),
+            )
+            .mount(&server)
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = AgentPauseGate::new("test");
+        let mut runner = AgentRunner::new_with_tools(agent, create_tool_manager())
+            .with_agent_pause_gate(gate.clone());
+        let turn = tokio::spawn(async move { runner.run_turn(&[Message::user("go")], None).await });
+
+        for _ in 0..100 {
+            if server.received_requests().await.unwrap().len() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        gate.pause();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!turn.is_finished(), "pause 应让当前轮等待 resume");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        gate.resume();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+            .await
+            .expect("resume 后 turn 应完成")
+            .expect("turn join ok")
+            .expect("run ok");
+        assert_eq!(result, "resumed");
+        assert!(server.received_requests().await.unwrap().len() >= 2);
+    }
+
     #[tokio::test]
     async fn non_json_tool_args_feed_back_format_error_without_executing() {
-        use wiremock::matchers::{body_string_contains, method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
         use std::sync::atomic::{AtomicBool, Ordering};
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         // The tool must NEVER run: args are XML, not JSON.
         let executed = Arc::new(AtomicBool::new(false));
@@ -8359,8 +9041,9 @@ mod tests {
                     .and(path("/chat/completions"))
                     .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("", vec![
-                            serde_json::json!({
+                        openai_completion_body(
+                            "",
+                            vec![serde_json::json!({
                                 "id": "call_ping",
                                 "type": "function",
                                 "function": {
@@ -8369,18 +9052,19 @@ mod tests {
                                     "name": "ping",
                                     "arguments": "<arg_key>x</arg_key>"
                                 }
-                            })
-                        ]),
+                            })],
+                        ),
                     )),
-                )
-                .await;
+            )
+            .await;
         // 兜底：round 1 起一律 finish。
         server
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(
-                        ResponseTemplate::new(200).set_body_string(openai_completion_body("done", vec![])),
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("done", vec![])),
                     ),
             )
             .await;
@@ -8396,14 +9080,14 @@ mod tests {
         let mut runner = AgentRunner::new_with_tools(agent, tm);
 
         let resp = runner
-            .run_turn(
-                &[Message::user("go")],
-                None,
-            )
+            .run_turn(&[Message::user("go")], None)
             .await
             .expect("turn completes after the format error feedback");
         assert_eq!(resp, "done");
-        assert!(!executed.load(Ordering::SeqCst), "tool must not execute on non-JSON args");
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "tool must not execute on non-JSON args"
+        );
 
         let reqs = server.received_requests().await.unwrap();
         // 3 次请求，不是 2 次：① 原始工具调用（吐出非法 JSON 参数）
@@ -8415,7 +9099,11 @@ mod tests {
         //    第二轮 "done" 收尾
         // 断言曾写死 2，是在 `repair_json_via_subsession`（84bccb1）加入
         // 之前的产物，没有跟上这次行为变化。
-        assert_eq!(reqs.len(), 3, "1 次原始调用 + 1 次 JSON 修复子会话尝试 + 1 次反馈后的 round-2");
+        assert_eq!(
+            reqs.len(),
+            3,
+            "1 次原始调用 + 1 次 JSON 修复子会话尝试 + 1 次反馈后的 round-2"
+        );
         let body2 = String::from_utf8_lossy(&reqs[2].body);
         // 协议闭环：MalformedArgs 也以 tool 消息回填 call_ping，否则
         // assistant 的 tool_calls 没有对应 tool 消息，下游 API 直接 400。
@@ -8451,18 +9139,23 @@ mod tests {
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .and(FirstOnly(std::sync::atomic::AtomicUsize::new(0)))
-                    .respond_with(ResponseTemplate::new(200)
-                        .set_body_string(openai_completion_body("TODO", vec![]))),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("TODO", vec![])),
+                    ),
             )
             .await;
         // 兜底：纠偏后的正常长回答。
-        let good = "这是纠偏后的完整回答：逐条说明结论、依据和后续步骤，长度远超五十字符的 D5 阈值。";
+        let good =
+            "这是纠偏后的完整回答：逐条说明结论、依据和后续步骤，长度远超五十字符的 D5 阈值。";
         server
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200)
-                        .set_body_string(openai_completion_body(good, vec![]))),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body(good, vec![])),
+                    ),
             )
             .await;
 
@@ -8492,7 +9185,10 @@ mod tests {
             body2.contains("[advisor gate D5]"),
             "retry request carries the gate annotation hint: {body2}"
         );
-        assert!(hints.lock().is_empty(), "hint drained into the retry context");
+        assert!(
+            hints.lock().is_empty(),
+            "hint drained into the retry context"
+        );
     }
 
     /// Gate 重试耗尽 → AgentError::AdvisorTerminated 向上传播。
@@ -8507,8 +9203,10 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200)
-                        .set_body_string(openai_completion_body("TODO", vec![]))),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("TODO", vec![])),
+                    ),
             )
             .await;
 
@@ -8553,8 +9251,10 @@ mod tests {
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200)
-                        .set_body_string(openai_completion_body("TODO", vec![]))),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("TODO", vec![])),
+                    ),
             )
             .await;
 
@@ -8663,9 +9363,7 @@ mod tests {
         struct FirstOnly(std::sync::atomic::AtomicUsize);
         impl wiremock::Match for FirstOnly {
             fn matches(&self, _req: &wiremock::Request) -> bool {
-                self.0
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    == 0
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
             }
         }
         server
@@ -8742,14 +9440,14 @@ mod tests {
     /// with the round-1 "done" reply. Env is mutated only by this test.
     #[tokio::test]
     async fn delegate_batch_runs_serial_by_default_concurrent_when_enabled() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         // Runs one turn where round 0 emits two `delegate` calls and
         // round 1 replies "done". Returns the max concurrency the tool
@@ -8829,9 +9527,10 @@ mod tests {
                 .register(
                     Mock::given(method("POST"))
                         .and(path("/chat/completions"))
-                        .respond_with(ResponseTemplate::new(200).set_body_string(
-                            openai_completion_body("done", vec![]),
-                        )),
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_string(openai_completion_body("done", vec![])),
+                        ),
                 )
                 .await;
 
@@ -8862,7 +9561,10 @@ mod tests {
         std::env::set_var("LATTE_AGENT_DELEGATE_PARALLEL", "1");
         let parallel_max = run_phase().await;
         std::env::remove_var("LATTE_AGENT_DELEGATE_PARALLEL");
-        assert_eq!(parallel_max, 2, "flag on must run the two delegates concurrently");
+        assert_eq!(
+            parallel_max, 2,
+            "flag on must run the two delegates concurrently"
+        );
     }
 
     /// [`human_blocking_last_order`]：会等人点弹窗的调用必须排到最后，
@@ -8875,7 +9577,11 @@ mod tests {
     #[test]
     fn human_blocking_calls_are_reordered_last() {
         fn c(name: &str, args: &str) -> ParsedCall {
-            ParsedCall { id: String::new(), name: name.into(), args: args.into() }
+            ParsedCall {
+                id: String::new(),
+                name: name.into(),
+                args: args.into(),
+            }
         }
         // workflow 定义 fixture：interactive 步里有 ask，plain 没有。
         let dir = tempfile::tempdir().expect("tempdir");
@@ -8981,10 +9687,7 @@ tools = ["read", "write"]
             ),
             None
         );
-        assert_eq!(
-            human_blocking_last_order(&[c("ask", "{}")], cwd),
-            None
-        );
+        assert_eq!(human_blocking_last_order(&[c("ask", "{}")], cwd), None);
 
         // 名字加载不到的 workflow 按"不阻塞"处理：判断只影响顺序，
         // 猜不出时退回现状，绝不因此报错。
@@ -9036,7 +9739,11 @@ tools = ["read", "write"]
     #[test]
     fn parallel_runs_splits_on_exclusive_barriers() {
         fn c(name: &str) -> ParsedCall {
-            ParsedCall { id: String::new(), name: name.into(), args: "{}".into() }
+            ParsedCall {
+                id: String::new(),
+                name: name.into(),
+                args: "{}".into(),
+            }
         }
         std::env::remove_var("LATTE_AGENT_DELEGATE_PARALLEL");
         std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL");
@@ -9048,19 +9755,10 @@ tools = ["read", "write"]
         // 单个只读不成段（并发无意义）。
         assert_eq!(parallel_runs(&[c("read")]), vec![]);
         // bash 是屏障：两侧各 1 个 read，都不成段 → 全串行。
-        assert_eq!(
-            parallel_runs(&[c("read"), c("bash"), c("read")]),
-            vec![]
-        );
+        assert_eq!(parallel_runs(&[c("read"), c("bash"), c("read")]), vec![]);
         // 屏障两侧各 2 个 read → 两段，互不跨越屏障。
         assert_eq!(
-            parallel_runs(&[
-                c("read"),
-                c("read"),
-                c("write"),
-                c("code_graph"),
-                c("read"),
-            ]),
+            parallel_runs(&[c("read"), c("read"), c("write"), c("code_graph"), c("read"),]),
             vec![(0, 2), (3, 5)]
         );
         // delegate 默认 exclusive / edit 永远 exclusive。
@@ -9110,14 +9808,14 @@ tools = ["read", "write"]
     /// 两种情况都必须回填 3 条 tool_result 并以第 1 轮的 "done" 收尾。
     #[tokio::test]
     async fn readonly_batch_runs_concurrently_by_default_serial_when_disabled() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         async fn run_phase() -> usize {
             let active = Arc::new(AtomicUsize::new(0));
@@ -9187,9 +9885,10 @@ tools = ["read", "write"]
                 .register(
                     Mock::given(method("POST"))
                         .and(path("/chat/completions"))
-                        .respond_with(ResponseTemplate::new(200).set_body_string(
-                            openai_completion_body("done", vec![]),
-                        )),
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_string(openai_completion_body("done", vec![])),
+                        ),
                 )
                 .await;
 
@@ -9233,14 +9932,14 @@ tools = ["read", "write"]
     /// 记账不变量同时锁定：4 次成功计数、第 2 轮 "done" 收尾。
     #[tokio::test]
     async fn unified_scheduler_runs_mixed_batch_in_one_parallel_pool() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         std::env::set_var("LATTE_AGENT_DELEGATE_PARALLEL", "1");
         let active = Arc::new(AtomicUsize::new(0));
@@ -9300,9 +9999,17 @@ tools = ["read", "write"]
                             // 会把 (name, args) 完全相同的并行调用折叠成
                             // 一个（协议层的去重，与调度器无关）。
                             vec![
-                                call("call_a", "delegate", "{\"role\":\"programmer\",\"task\":\"a\"}"),
+                                call(
+                                    "call_a",
+                                    "delegate",
+                                    "{\"role\":\"programmer\",\"task\":\"a\"}",
+                                ),
                                 call("call_b", "read", "{\"path\":\"/tmp/a\"}"),
-                                call("call_c", "delegate", "{\"role\":\"architect\",\"task\":\"b\"}"),
+                                call(
+                                    "call_c",
+                                    "delegate",
+                                    "{\"role\":\"architect\",\"task\":\"b\"}",
+                                ),
                                 call("call_d", "read", "{\"path\":\"/tmp/b\"}"),
                             ],
                         ),
@@ -9313,9 +10020,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("done", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("done", vec![])),
+                    ),
             )
             .await;
 
@@ -9347,13 +10055,13 @@ tools = ["read", "write"]
     /// turn 正常收尾（旧实现 join 失败直接终止整个 turn）。
     #[tokio::test]
     async fn parallel_pool_panicking_task_degrades_to_error_result() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         let ok_count = Arc::new(AtomicUsize::new(0));
         let ok_h = ok_count.clone();
@@ -9376,7 +10084,10 @@ tools = ["read", "write"]
             defs: None,
         };
         let tm = create_tool_manager();
-        tm.register(Tool::builder("read", "test read", schema, handler).build(), None);
+        tm.register(
+            Tool::builder("read", "test read", schema, handler).build(),
+            None,
+        );
 
         let server = wiremock::MockServer::start().await;
         struct FirstOnly(std::sync::atomic::AtomicUsize);
@@ -9413,9 +10124,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("done", vec![]),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("done", vec![])),
+                    ),
             )
             .await;
 
@@ -9451,7 +10163,10 @@ tools = ["read", "write"]
             "panic 调用要记错误结果: {events:?}"
         );
         assert_eq!(
-            execs.iter().filter(|s| matches!(s, crate::trace::ToolStatus::Ok(_))).count(),
+            execs
+                .iter()
+                .filter(|s| matches!(s, crate::trace::ToolStatus::Ok(_)))
+                .count(),
             2,
             "两个好调用记 Ok"
         );
@@ -9472,7 +10187,10 @@ tools = ["read", "write"]
             acquire_write_permit("edit", &serde_json::json!({"path": "/tmp/p1b-lock-a.rs"})),
         )
         .await;
-        assert!(contended.is_err(), "同一 path 的 edit 应被 write 的许可挡住");
+        assert!(
+            contended.is_err(),
+            "同一 path 的 edit 应被 write 的许可挡住"
+        );
         drop(p1);
         let p2 = acquire_write_permit("edit", &serde_json::json!({"path": "/tmp/p1b-lock-a.rs"}))
             .await
@@ -9494,7 +10212,11 @@ tools = ["read", "write"]
         let probe = std::env::temp_dir().join("p1b-lock-lexical.rs");
         std::fs::write(&probe, "x").unwrap();
         let canon = probe.display().to_string();
-        let dotted = format!("{}/./{}", std::env::temp_dir().display(), "p1b-lock-lexical.rs");
+        let dotted = format!(
+            "{}/./{}",
+            std::env::temp_dir().display(),
+            "p1b-lock-lexical.rs"
+        );
         let _g = acquire_write_permit("edit", &serde_json::json!({"path": canon}))
             .await
             .expect("edit canonical");
@@ -9506,8 +10228,16 @@ tools = ["read", "write"]
         assert!(dotted_blocked.is_err(), "./ 变体应共享同一把锁");
 
         // fail-open：非写类工具与缺 path 字段都不加锁。
-        assert!(acquire_write_permit("bash", &serde_json::json!({"command": "rm x"})).await.is_none());
-        assert!(acquire_write_permit("write", &serde_json::json!({"no_path": 1})).await.is_none());
+        assert!(
+            acquire_write_permit("bash", &serde_json::json!({"command": "rm x"}))
+                .await
+                .is_none()
+        );
+        assert!(
+            acquire_write_permit("write", &serde_json::json!({"no_path": 1}))
+                .await
+                .is_none()
+        );
     }
 
     /// 批量读的 `paths` 数组也要按 cwd 改写，否则会出现「单路径按 cwd
@@ -9538,13 +10268,20 @@ tools = ["read", "write"]
             PropertyType, SchemaType, ToolInputProperty, ToolInputSchema,
         };
         fn p(ty: PropertyType) -> ToolInputProperty {
-            ToolInputProperty { property_type: ty,
-            description: None,
-            enum_values: None,
-            minimum: None,
-            maximum: None,
-            min_length: None,
-            max_length: None, items: None, properties: None, required: None, additional_properties: None, ref_: None, }
+            ToolInputProperty {
+                property_type: ty,
+                description: None,
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+                items: None,
+                properties: None,
+                required: None,
+                additional_properties: None,
+                ref_: None,
+            }
         }
         let mut props = std::collections::BTreeMap::new();
         props.insert("path".to_string(), p(PropertyType::String));
@@ -9558,10 +10295,7 @@ tools = ["read", "write"]
         };
 
         // 搬移：path 收到字符串数组。
-        let out = coerce_tool_input_to_schema(
-            serde_json::json!({"path":["a.rs","b.rs"]}),
-            &schema,
-        );
+        let out = coerce_tool_input_to_schema(serde_json::json!({"path":["a.rs","b.rs"]}), &schema);
         assert!(out.get("path").is_none(), "原字段应被搬走");
         assert_eq!(out["paths"], serde_json::json!(["a.rs", "b.rs"]));
 
@@ -9591,12 +10325,12 @@ tools = ["read", "write"]
     /// 为了把意图显式化，并给不认这个字段的端点留 `omit` 逃生口。
     #[tokio::test]
     async fn parallel_tool_calls_lands_on_wire_and_can_be_omitted() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, ResponseTemplate};
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
 
         /// 跑一轮（无工具调用直接收尾），返回请求体里 parallel_tool_calls 的值。
         async fn body_flag() -> Option<serde_json::Value> {
@@ -9617,9 +10351,10 @@ tools = ["read", "write"]
                 .register(
                     Mock::given(method("POST"))
                         .and(path("/chat/completions"))
-                        .respond_with(ResponseTemplate::new(200).set_body_string(
-                            openai_completion_body("done", vec![]),
-                        )),
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_string(openai_completion_body("done", vec![])),
+                        ),
                 )
                 .await;
             let agent = Agent::new_with_chain(
@@ -9639,10 +10374,18 @@ tools = ["read", "write"]
         }
 
         std::env::remove_var("LATTE_AGENT_PARALLEL_TOOL_CALLS");
-        assert_eq!(body_flag().await, Some(serde_json::json!(true)), "默认应显式下发 true");
+        assert_eq!(
+            body_flag().await,
+            Some(serde_json::json!(true)),
+            "默认应显式下发 true"
+        );
 
         std::env::set_var("LATTE_AGENT_PARALLEL_TOOL_CALLS", "off");
-        assert_eq!(body_flag().await, Some(serde_json::json!(false)), "关掉应下发 false");
+        assert_eq!(
+            body_flag().await,
+            Some(serde_json::json!(false)),
+            "关掉应下发 false"
+        );
 
         std::env::set_var("LATTE_AGENT_PARALLEL_TOOL_CALLS", "omit");
         assert_eq!(body_flag().await, None, "omit 时字段必须完全不出现");
@@ -9653,11 +10396,17 @@ tools = ["read", "write"]
     fn last_decision_kind_returns_text_for_plain_response() {
         use latte_ai::models::Role as MsgRole;
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
-                .unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent);
-        runner.context_mut().push(Message::assistant("no tools here"));
+        runner
+            .context_mut()
+            .push(Message::assistant("no tools here"));
         assert_eq!(runner.last_decision_kind(), "text");
     }
 
@@ -9665,9 +10414,13 @@ tools = ["read", "write"]
     fn last_decision_kind_returns_tool_call_for_write() {
         use crate::checkpoint::short_hash;
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
-                .unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent);
         let args = serde_json::json!({"path":"/tmp/x"});
         // native function-calling: assistant 消息带 tool_calls 字段。
@@ -9678,10 +10431,9 @@ tools = ["read", "write"]
             arguments_raw: None,
             arguments_parse_error: None,
         };
-        runner.context_mut().push(Message::assistant_with_tool_calls(
-            String::new(),
-            vec![tc],
-        ));
+        runner
+            .context_mut()
+            .push(Message::assistant_with_tool_calls(String::new(), vec![tc]));
         let expected = format!("tool_call:write:{}", &short_hash(&args.to_string())[..8]);
         assert_eq!(runner.last_decision_kind(), expected);
     }
@@ -9695,12 +10447,19 @@ tools = ["read", "write"]
     #[test]
     fn with_cwd_starts_none_and_sets_some() {
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
-                .unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         // Default — no cwd wired.
         let runner = AgentRunner::new(agent.clone());
-        assert!(runner.cwd.is_none(), "freshly-built runner must have cwd = None");
+        assert!(
+            runner.cwd.is_none(),
+            "freshly-built runner must have cwd = None"
+        );
         // After `with_cwd` the field is Some(path).
         let cwd_path = std::path::PathBuf::from("/tmp/latte-cwd-test");
         let runner = AgentRunner::new(agent).with_cwd(cwd_path.clone());
@@ -9714,9 +10473,13 @@ tools = ["read", "write"]
         // `.with_role(role_id).with_cwd(cwd)` in
         // `latte-agent-core/src/controller.rs`.
         let role = test_role();
-        let agent =
-            Agent::new("test-agent".into(), role, test_model(), GenerateParams::default())
-                .unwrap();
+        let agent = Agent::new(
+            "test-agent".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let cwd_path = std::path::PathBuf::from("/home/user/my-project");
         let runner = AgentRunner::new(agent)
             .with_role("manager")
@@ -9735,15 +10498,22 @@ tools = ["read", "write"]
 
     fn t(name: &str, args: serde_json::Value) -> latte_ai::models::ToolCall {
         latte_ai::models::ToolCall {
-            id: "call".into(), name: name.into(), arguments: args,
-            arguments_raw: None, arguments_parse_error: None,
+            id: "call".into(),
+            name: name.into(),
+            arguments: args,
+            arguments_raw: None,
+            arguments_parse_error: None,
         }
     }
 
     #[test]
     fn dedupe_drops_three_identical_delegate_calls() {
         let args = serde_json::json!({"role":"programmer","task":"run pwd"});
-        let calls = vec![t("delegate", args.clone()), t("delegate", args.clone()), t("delegate", args.clone())];
+        let calls = vec![
+            t("delegate", args.clone()),
+            t("delegate", args.clone()),
+            t("delegate", args.clone()),
+        ];
         let deduped = dedupe_native_tool_calls(calls);
         assert_eq!(deduped.len(), 1, "3 个相同 delegate 调用应合并为 1 个");
         assert_eq!(deduped[0].name, "delegate");
@@ -9804,7 +10574,8 @@ tools = ["read", "write"]
         // arguments_raw 传递原始坏串，arguments 为 Null；去重靠 to_string()。
         // 两个相同 arguments_raw（如"pwd && ls"）应被识别为重复。
         let make = |raw: &str| latte_ai::models::ToolCall {
-            id: "call".into(), name: "bash".into(),
+            id: "call".into(),
+            name: "bash".into(),
             arguments: serde_json::Value::Null,
             arguments_raw: Some(raw.into()),
             arguments_parse_error: Some("parse failed".into()),
@@ -9845,7 +10616,14 @@ tools = ["read", "write"]
 
     #[test]
     fn length_truncation_rejects_normal_stop_reasons() {
-        for s in ["stop", "tool_calls", "end_turn", "", "stop_sequence", "content_filter"] {
+        for s in [
+            "stop",
+            "tool_calls",
+            "end_turn",
+            "",
+            "stop_sequence",
+            "content_filter",
+        ] {
             assert!(!is_length_truncation(s), "{s:?} 不是长度截断");
         }
     }
@@ -9915,12 +10693,14 @@ tools = ["read", "write"]
         )
         .unwrap();
         let mut runner = AgentRunner::new(agent);
-        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
+        let out = runner
+            .run_turn(&[Message::user("出任务清单")], None)
+            .await
+            .unwrap();
 
         // 关键断言：两段无缝拼接成完整 JSON，第一段**没有被丢弃**。
         assert_eq!(
-            out,
-            r#"{"tasks":[{"title":"T0","desc":"aaa"},{"title":"T1","desc":"bbb"}]}"#,
+            out, r#"{"tasks":[{"title":"T0","desc":"aaa"},{"title":"T1","desc":"bbb"}]}"#,
             "截断的前半段与续写后半段必须无缝拼接成完整产出: {out}"
         );
         // 拼出来的必须是合法 JSON（证明续写真的补全了、不是半截）。
@@ -9961,9 +10741,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish("SEG", "length"),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body_with_finish("SEG", "length")),
+                    ),
             )
             .await;
 
@@ -9975,13 +10756,19 @@ tools = ["read", "write"]
         )
         .unwrap();
         let mut runner = AgentRunner::new(agent);
-        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
+        let out = runner
+            .run_turn(&[Message::user("出任务清单")], None)
+            .await
+            .unwrap();
 
         assert!(
             out.contains("⚠️ [产出被截断]"),
             "续满上限仍截断必须留下显式标记，实际: {out}"
         );
-        assert!(out.contains("finish_reason=length"), "标记要带真实原因: {out}");
+        assert!(
+            out.contains("finish_reason=length"),
+            "标记要带真实原因: {out}"
+        );
         // 首段 + 5 段续写 = "SEG" 出现 6 次（1 初始 + MAX_LENGTH_CONTINUATIONS）。
         let seg_count = out.matches("SEG").count();
         assert_eq!(
@@ -10014,8 +10801,16 @@ tools = ["read", "write"]
     fn unique_ids_fixes_empty_ids_on_parallel_same_role_delegates() {
         // 两次委派 programmer，不同任务，provider 给了空 id。
         let mut calls = vec![
-            t_id("", "delegate", serde_json::json!({"role":"programmer","task":"A"})),
-            t_id("", "delegate", serde_json::json!({"role":"programmer","task":"B"})),
+            t_id(
+                "",
+                "delegate",
+                serde_json::json!({"role":"programmer","task":"A"}),
+            ),
+            t_id(
+                "",
+                "delegate",
+                serde_json::json!({"role":"programmer","task":"B"}),
+            ),
         ];
         // dedupe 不会合并（args 不同），随后 id 唯一化。
         let mut deduped = dedupe_native_tool_calls(calls.drain(..).collect());
@@ -10053,13 +10848,18 @@ tools = ["read", "write"]
         // 已有一个真实 id 恰好等于合成候选 "call_1"，空 id 的那个
         // 必须跳过它另取，不能撞车。
         let mut calls = vec![
-            t_id("", "delegate", serde_json::json!({"task":"A"})),   // idx 0 → call_0
+            t_id("", "delegate", serde_json::json!({"task":"A"})), // idx 0 → call_0
             t_id("call_1", "delegate", serde_json::json!({"task":"B"})), // 保留
-            t_id("", "delegate", serde_json::json!({"task":"C"})),   // idx 2 → call_2 (不撞 call_1)
+            t_id("", "delegate", serde_json::json!({"task":"C"})), // idx 2 → call_2 (不撞 call_1)
         ];
         ensure_unique_tool_call_ids(&mut calls);
         let ids: std::collections::HashSet<_> = calls.iter().map(|c| c.id.clone()).collect();
-        assert_eq!(ids.len(), 3, "三个 id 全部唯一: {:?}", calls.iter().map(|c| &c.id).collect::<Vec<_>>());
+        assert_eq!(
+            ids.len(),
+            3,
+            "三个 id 全部唯一: {:?}",
+            calls.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
         assert_eq!(calls[1].id, "call_1");
     }
 
@@ -10123,8 +10923,8 @@ tools = ["read", "write"]
     #[test]
     fn model_schema_recurses_without_tool_or_field_name_special_cases() {
         use latte_rs_agent_tools::types::{
-            PropertyType, SchemaType, ToolAdditionalProperties, ToolDefinition,
-            ToolInputProperty, ToolInputSchema,
+            PropertyType, SchemaType, ToolAdditionalProperties, ToolDefinition, ToolInputProperty,
+            ToolInputSchema,
         };
 
         fn property(property_type: PropertyType) -> ToolInputProperty {
@@ -10144,8 +10944,7 @@ tools = ["read", "write"]
             }
         }
 
-        let mut tags = property(PropertyType::Array)
-            .with_items(property(PropertyType::Integer));
+        let mut tags = property(PropertyType::Array).with_items(property(PropertyType::Integer));
         tags.min_length = Some(2);
         tags.max_length = Some(4);
         let item = property(PropertyType::Object).with_object(
@@ -10217,7 +11016,10 @@ tools = ["read", "write"]
         for tool in &schemas {
             inspect(&tool.parameters, &tool.name, &mut missing);
         }
-        assert!(missing.is_empty(), "array schemas missing items: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "array schemas missing items: {missing:?}"
+        );
     }
 
     /// 工具 description 和 schema 必须进入真实 provider 请求，而不只是留在本地 registry。
@@ -10225,8 +11027,8 @@ tools = ["read", "write"]
     async fn tool_description_lands_on_openai_wire() {
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
-            PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty,
-            ToolInputSchema, ToolManager as _,
+            PropertyType, SchemaType, SharedToolHandler, Tool, ToolInputProperty, ToolInputSchema,
+            ToolManager as _,
         };
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
@@ -10244,30 +11046,39 @@ tools = ["read", "write"]
         };
         schema.properties.insert(
             "paths".into(),
-            ToolInputProperty { property_type: PropertyType::Array,
-            description: Some(PATHS_DESCRIPTION.into()),
-            enum_values: None,
-            minimum: None,
-            maximum: None,
-            min_length: Some(1),
-            max_length: Some(10),
-            items: Some(Box::new(ToolInputProperty {
-                property_type: PropertyType::String,
-                description: None,
+            ToolInputProperty {
+                property_type: PropertyType::Array,
+                description: Some(PATHS_DESCRIPTION.into()),
                 enum_values: None,
                 minimum: None,
                 maximum: None,
-                min_length: None,
-                max_length: None,
-                items: None,
+                min_length: Some(1),
+                max_length: Some(10),
+                items: Some(Box::new(ToolInputProperty {
+                    property_type: PropertyType::String,
+                    description: None,
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: None,
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                    ref_: None,
+                })),
                 properties: None,
                 required: None,
                 additional_properties: None,
                 ref_: None,
-            })), properties: None, required: None, additional_properties: None, ref_: None, },
+            },
         );
         let tm = create_tool_manager();
-        tm.register(Tool::builder("read", SENTINEL, schema, handler).build(), None);
+        tm.register(
+            Tool::builder("read", SENTINEL, schema, handler).build(),
+            None,
+        );
 
         let server = wiremock::MockServer::start().await;
         server
@@ -10359,8 +11170,7 @@ tools = ["read", "write"]
                 Some(vec!["pattern".into()]),
                 Some(ToolAdditionalProperties::Boolean(false)),
             );
-            let mut queries = property(PropertyType::Array, "Queries to execute.")
-                .with_items(item);
+            let mut queries = property(PropertyType::Array, "Queries to execute.").with_items(item);
             queries.min_length = Some(2);
             queries.max_length = Some(4);
 
@@ -10428,8 +11238,8 @@ tools = ["read", "write"]
                 max_tokens: 4_096,
                 omit_max_tokens: false,
                 max_tokens_field: Default::default(),
-            prompt_cache: false,
-            prompt_cache_key: None,
+                prompt_cache: false,
+                prompt_cache_key: None,
                 supports_thinking: false,
                 supports_vision: false,
                 cost_per_million_input: 0.0,
@@ -10437,9 +11247,8 @@ tools = ["read", "write"]
                 timeout_secs: None,
             };
             let tm = create_tool_manager();
-            let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
-                Box::pin(async move { Ok(serde_json::json!({})) })
-            });
+            let handler: SharedToolHandler =
+                Arc::new(move |_input, _ctx| Box::pin(async move { Ok(serde_json::json!({})) }));
             tm.register(
                 Tool::builder(
                     "static_schema_matrix",
@@ -10461,7 +11270,10 @@ tools = ["read", "write"]
             let mut runner = AgentRunner::new_with_tools(agent, tm.clone());
 
             // First turn sees only the tool present when the runner was created.
-            runner.run_turn(&[Message::user("static")], None).await.unwrap();
+            runner
+                .run_turn(&[Message::user("static")], None)
+                .await
+                .unwrap();
 
             // Register between turns: the next turn must rebuild model-facing schemas
             // and send this dynamically granted tool through the same provider path.
@@ -10476,7 +11288,10 @@ tools = ["read", "write"]
                 None,
             );
 
-            runner.run_turn(&[Message::user("dynamic")], None).await.unwrap();
+            runner
+                .run_turn(&[Message::user("dynamic")], None)
+                .await
+                .unwrap();
             let requests = server.received_requests().await.unwrap();
             assert_eq!(requests.len(), 2, "{provider} request count");
             let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -10653,11 +11468,7 @@ tools = ["read", "write"]
             anthropic_static_schema, anthropic_dynamic_schema,
             "static and dynamic tools share the Anthropic schema path"
         );
-        for tool in [
-            anthropic_first_static,
-            anthropic_static,
-            anthropic_dynamic,
-        ] {
+        for tool in [anthropic_first_static, anthropic_static, anthropic_dynamic] {
             assert!(tool.get("parameters").is_none());
         }
     }
@@ -10666,16 +11477,18 @@ tools = ["read", "write"]
     /// 注册名一致（latte-rs-agent-tools 已扁平化命名空间，不再有点号前缀）。
     #[tokio::test]
     async fn build_tool_schemas_uses_flat_names() {
-        let mgr = crate::controller::build_tool_manager(
-            &["bash".into(), "read".into(), "search".into()],
-        )
-        .await
-        .unwrap();
+        let mgr =
+            crate::controller::build_tool_manager(&["bash".into(), "read".into(), "search".into()])
+                .await
+                .unwrap();
         let schemas = build_tool_schemas(&mgr);
         let names: Vec<String> = schemas.iter().map(|t| t.name.clone()).collect();
         assert!(names.contains(&"bash".to_string()), "应有 bash: {names:?}");
         assert!(names.contains(&"read".to_string()), "应有 read: {names:?}");
-        assert!(names.contains(&"search".to_string()), "应有 search: {names:?}");
+        assert!(
+            names.contains(&"search".to_string()),
+            "应有 search: {names:?}"
+        );
     }
 
     /// byte-stability：工具 schema 顺序必须**确定且跨调用一致**。    ///
@@ -10686,14 +11499,20 @@ tools = ["read", "write"]
     /// 缓存是对症解法，而缓存的前提就是这条。
     #[tokio::test]
     async fn build_tool_schemas_order_is_byte_stable() {
-        let mgr = crate::controller::build_tool_manager(
-            &["bash".into(), "read".into(), "search".into(), "write".into()],
-        )
+        let mgr = crate::controller::build_tool_manager(&[
+            "bash".into(),
+            "read".into(),
+            "search".into(),
+            "write".into(),
+        ])
         .await
         .unwrap();
 
         let names_of = |m: &_| -> Vec<String> {
-            build_tool_schemas(m).iter().map(|t| t.name.clone()).collect()
+            build_tool_schemas(m)
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
         };
         let first = names_of(&mgr);
 
@@ -10747,8 +11566,12 @@ tools = ["read", "write"]
         // 灌入 6 轮历史（每条都够长，保证 token 估算越过 2000*0.5）。
         let filler = "x".repeat(1_200);
         for i in 0..6 {
-            runner.context_mut().push(Message::user(format!("u{i} {filler}")));
-            runner.context_mut().push(Message::assistant(format!("a{i} {filler}")));
+            runner
+                .context_mut()
+                .push(Message::user(format!("u{i} {filler}")));
+            runner
+                .context_mut()
+                .push(Message::assistant(format!("a{i} {filler}")));
         }
         let before = runner.context().messages().len();
         assert!(before >= 12, "前置历史应有 12 条: {before}");
@@ -10772,6 +11595,126 @@ tools = ["read", "write"]
         assert!(
             head.contains(crate::compaction::SUMMARY_OPEN_TAG),
             "首条应是带标签的 checkpoint: {head:.120}"
+        );
+    }
+
+    /// `PromptBudgetExceeded` happens before a provider request, so it must
+    /// still take the ordinary forced-compaction recovery path before callers
+    /// decide whether a workflow-specific fresh subsession is warranted.
+    #[tokio::test]
+    async fn prompt_budget_exceeded_compacts_before_returning_to_caller() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body("## Primary Request and Intent\n- compacted", vec![]),
+                    )),
+            )
+            .await;
+
+        // Keep normal pressure compaction dormant: this test specifically
+        // exercises the smaller, workflow-style prompt budget in the tool-loop
+        // preflight below.
+        let mut model = model_at(&server, "stub");
+        model.context_window = 1_000_000;
+        let agent = Agent::new_with_chain(
+            "prompt-budget-compact".into(),
+            test_role(),
+            vec![model],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent).with_prompt_token_budget(2_500);
+        let filler = "x".repeat(1_200);
+        for i in 0..6 {
+            runner
+                .context_mut()
+                .push(Message::user(format!("u{i} {filler}")));
+            runner
+                .context_mut()
+                .push(Message::assistant(format!("a{i} {filler}")));
+        }
+
+        std::env::set_var("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS", "1");
+        let response = runner.run_turn(&[Message::user("go")], None).await;
+        std::env::remove_var("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS");
+
+        assert!(response.is_ok(), "forced compact should make the request fit: {response:?}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected one ordinary summary call followed by the recovered turn"
+        );
+        assert!(
+            runner.context().messages()[0]
+                .as_text()
+                .contains(crate::compaction::SUMMARY_OPEN_TAG),
+            "ordinary checkpoint must be retained after budget recovery"
+        );
+    }
+
+    /// 工具结果撑爆预算时，`slim_oversized_messages` 先就地剪成头+尾，
+    /// 不动 `tool_call ↔ tool_result` 配对、不发 LLM 摘要调用。
+    ///
+    /// 场景：proofreader 通读一份大文档（如 146KB 的 draft.md）后，几个
+    /// 范围读结果累计 ~300KB，超 `prompt_token_budget`（如 60K）。旧行为是
+    /// 直接 `PromptBudgetExceeded` → workflow fresh restart → 同样的负载必
+    /// 复现 → 整条 workflow 失败。新行为是把超长单条消息压成头+尾（保留
+    /// 出口信息），payload 瘦身到预算内后继续发请求。
+    #[tokio::test]
+    async fn prompt_budget_slims_oversized_tool_results_before_compact() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("ok", vec![])),
+                    ),
+            )
+            .await;
+
+        let mut model = model_at(&server, "stub");
+        model.context_window = 1_000_000; // 关掉 provider 级自动 compaction 干扰
+        let agent = Agent::new_with_chain(
+            "prompt-budget-slim".into(),
+            test_role(),
+            vec![model],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        // 预算设小，让 3 条 30KB 工具结果必然超限；
+        // 但 slim 后每条压到 8K → 3*8K + 少量系统/用户消息 < 预算。
+        let mut runner = AgentRunner::new(agent).with_prompt_token_budget(12_000);
+        // 每条 ~30KB（远大于 OVERSIZED_MSG_CHARS=8000 的门槛），让 slim
+        // 成为唯一救星（不走 LLM 摘要也能救回）。
+        let big = "x".repeat(30_000);
+        for i in 0..3 {
+            runner
+                .context_mut()
+                .push(Message::tool_result(&format!("t{i}"), &big));
+        }
+        runner.context_mut().push(Message::user("read these chunks"));
+
+        let response = runner.run_turn(&[], None).await;
+
+        // slim 后 payload 应在预算内 → 请求成功，不走 LLM 摘要恢复路径。
+        assert!(response.is_ok(), "slim must rescue the turn: {response:?}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "slim 救回后应该只发正常请求，不再发摘要调用"
         );
     }
 
@@ -10804,8 +11747,12 @@ tools = ["read", "write"]
         let mut runner = AgentRunner::new(agent);
         let filler = "y".repeat(1_200);
         for i in 0..6 {
-            runner.context_mut().push(Message::user(format!("u{i} {filler}")));
-            runner.context_mut().push(Message::assistant(format!("a{i} {filler}")));
+            runner
+                .context_mut()
+                .push(Message::user(format!("u{i} {filler}")));
+            runner
+                .context_mut()
+                .push(Message::assistant(format!("a{i} {filler}")));
         }
         let before = runner.context().messages().len();
 
@@ -10814,10 +11761,7 @@ tools = ["read", "write"]
         std::env::remove_var("LATTE_AGENT_AUTO_COMPACT");
 
         // 关掉后只增不减：新增本轮 user + assistant，绝不摘要替换。
-        assert!(
-            runner.context().messages().len() > before,
-            "关闭时不应压缩"
-        );
+        assert!(runner.context().messages().len() > before, "关闭时不应压缩");
         assert!(
             !runner.context().messages()[0]
                 .as_text()
@@ -10852,16 +11796,51 @@ tools = ["read", "write"]
         let mut streak = (String::new(), 0);
         let mut detector = LoopDetector::default();
         let role = test_role();
-        let agent = Agent::new("tester".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let agent = Agent::new(
+            "tester".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent);
         let mut msgs = Vec::new();
 
         for i in 1..PERMANENT_BREAK_AT {
-            let res = runner.apply_call_result(
+            let res = runner
+                .apply_call_result(
+                    OneCallResult {
+                        id: format!("call_{i}"),
+                        outcome: Err((
+                            ToolCallErrorKind::MalformedArgs {
+                                serde_err: "syntax error".into(),
+                            },
+                            "bad json".into(),
+                        )),
+                        loop_records: vec![],
+                        executed_ok: false,
+                    },
+                    "some_tool",
+                    &mut msgs,
+                    &mut detector,
+                    &mut streak,
+                    "",
+                    "",
+                )
+                .await;
+            assert!(res.is_ok(), "round {i} should not break yet");
+            assert_eq!(streak.1, i);
+        }
+
+        // Round BREAK_AT should break
+        let res = runner
+            .apply_call_result(
                 OneCallResult {
-                    id: format!("call_{i}"),
+                    id: format!("call_{PERMANENT_BREAK_AT}"),
                     outcome: Err((
-                        ToolCallErrorKind::MalformedArgs { serde_err: "syntax error".into() },
+                        ToolCallErrorKind::MalformedArgs {
+                            serde_err: "syntax error".into(),
+                        },
                         "bad json".into(),
                     )),
                     loop_records: vec![],
@@ -10873,29 +11852,8 @@ tools = ["read", "write"]
                 &mut streak,
                 "",
                 "",
-            ).await;
-            assert!(res.is_ok(), "round {i} should not break yet");
-            assert_eq!(streak.1, i);
-        }
-
-        // Round BREAK_AT should break
-        let res = runner.apply_call_result(
-            OneCallResult {
-                id: format!("call_{PERMANENT_BREAK_AT}"),
-                outcome: Err((
-                    ToolCallErrorKind::MalformedArgs { serde_err: "syntax error".into() },
-                    "bad json".into(),
-                )),
-                loop_records: vec![],
-                executed_ok: false,
-            },
-            "some_tool",
-            &mut msgs,
-            &mut detector,
-            &mut streak,
-            "",
-            "",
-        ).await;
+            )
+            .await;
         assert!(res.is_err(), "should break on reaching PERMANENT_BREAK_AT");
         match res.unwrap_err() {
             AgentError::ToolLoopDetected { tool, reason, .. } => {
@@ -10910,7 +11868,13 @@ tools = ["read", "write"]
         use tokio::sync::broadcast;
         let (event_tx, mut rx) = broadcast::channel(16);
         let role = test_role();
-        let agent = Agent::new("tester".into(), role, test_model(), GenerateParams::default()).unwrap();
+        let agent = Agent::new(
+            "tester".into(),
+            role,
+            test_model(),
+            GenerateParams::default(),
+        )
+        .unwrap();
         let mut runner = AgentRunner::new(agent).with_tool_fix_event_tx(event_tx);
         let mut streak = (String::new(), 0);
         let mut detector = LoopDetector::default();
@@ -10932,24 +11896,31 @@ tools = ["read", "write"]
         });
 
         streak = ("tool_a".to_string(), PERMANENT_BREAK_AT - 1);
-        let res = runner.apply_call_result(
-            OneCallResult {
-                id: "call_break".into(),
-                outcome: Err((
-                    ToolCallErrorKind::MalformedArgs { serde_err: "syntax error".into() },
-                    "bad json".into(),
-                )),
-                loop_records: vec![],
-                executed_ok: false,
-            },
-            "tool_a",
-            &mut msgs,
-            &mut detector,
-            &mut streak,
-            "",
-            "",
-        ).await;
-        assert!(res.is_ok(), "Human intervention should successfully intercept the break");
+        let res = runner
+            .apply_call_result(
+                OneCallResult {
+                    id: "call_break".into(),
+                    outcome: Err((
+                        ToolCallErrorKind::MalformedArgs {
+                            serde_err: "syntax error".into(),
+                        },
+                        "bad json".into(),
+                    )),
+                    loop_records: vec![],
+                    executed_ok: false,
+                },
+                "tool_a",
+                &mut msgs,
+                &mut detector,
+                &mut streak,
+                "",
+                "",
+            )
+            .await;
+        assert!(
+            res.is_ok(),
+            "Human intervention should successfully intercept the break"
+        );
         assert_eq!(streak.1, 0, "Streak should be reset after human fix");
         // The pruned messages should contain the user correction marker
         assert!(msgs.iter().any(|m| m.as_text().contains("人工修正并执行")));

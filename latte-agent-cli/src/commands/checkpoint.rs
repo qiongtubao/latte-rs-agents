@@ -45,8 +45,8 @@ pub enum CheckpointAction {
 impl CheckpointCmd {
     pub fn run(self) -> anyhow::Result<()> {
         let cwd = std::env::current_dir()?;
-        let repo_root = WorkspaceManager::resolve_repo_root(&cwd)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let repo_root =
+            WorkspaceManager::resolve_repo_root(&cwd).map_err(|e| anyhow::anyhow!("{}", e))?;
         match self.action {
             CheckpointAction::Create { task_id } => {
                 let (mut engine, _) = open_engine(&repo_root, &task_id)?;
@@ -67,8 +67,7 @@ impl CheckpointCmd {
                     if line.trim().is_empty() {
                         continue;
                     }
-                    let cp: latte_agent_core::checkpoint::Checkpoint =
-                        serde_json::from_str(line)?;
+                    let cp: latte_agent_core::checkpoint::Checkpoint = serde_json::from_str(line)?;
                     println!(
                         "#{:<4} {} {} {}",
                         cp.id,
@@ -80,8 +79,14 @@ impl CheckpointCmd {
             }
             CheckpointAction::Rollback { task_id, id } => {
                 let (engine, _) = open_engine(&repo_root, &task_id)?;
-                let cp = engine.rollback(id, RollbackMode::Code).map_err(anyhow::Error::from)?;
-                println!("rolled back to #{} (commit {})", cp.id, short_sha(&cp.git_commit));
+                let cp = engine
+                    .rollback(id, RollbackMode::Code)
+                    .map_err(anyhow::Error::from)?;
+                println!(
+                    "rolled back to #{} (commit {})",
+                    cp.id,
+                    short_sha(&cp.git_commit)
+                );
             }
         }
         Ok(())

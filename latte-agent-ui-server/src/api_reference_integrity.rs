@@ -72,7 +72,11 @@ fn normalize_endpoint(path: &str) -> String {
             let is_param = s.starts_with(':')
                 || (s.starts_with('<') && s.ends_with('>'))
                 || (s.starts_with('{') && s.ends_with('}'));
-            if is_param { "*".to_string() } else { s.to_ascii_lowercase() }
+            if is_param {
+                "*".to_string()
+            } else {
+                s.to_ascii_lowercase()
+            }
         })
         .collect();
     let joined = segs.join("/");
@@ -165,16 +169,19 @@ mod tests {
     fn normalize_unifies_param_styles_and_prefix() {
         let expect = "/api/traces/*";
         for form in [
-            "/traces/:id",                 // 路由写法
-            "/api/traces/<session_id>",    // 文档尖括号
-            "/api/traces/{id}",            // 文档花括号
-            "/api/traces/:id",             // 文档冒号
-            "/api/traces/<session_id>?x=1" // 带查询串
+            "/traces/:id",                  // 路由写法
+            "/api/traces/<session_id>",     // 文档尖括号
+            "/api/traces/{id}",             // 文档花括号
+            "/api/traces/:id",              // 文档冒号
+            "/api/traces/<session_id>?x=1", // 带查询串
         ] {
             assert_eq!(normalize_endpoint(form), expect, "form = {form}");
         }
         // 大小写与多段
-        assert_eq!(normalize_endpoint("/Models/:key/TOML"), "/api/models/*/toml");
+        assert_eq!(
+            normalize_endpoint("/Models/:key/TOML"),
+            "/api/models/*/toml"
+        );
         // 根路径端点不套 /api 前缀（否则 /health 会被误报未登记）。
         assert_eq!(normalize_endpoint("/health"), "/health");
     }

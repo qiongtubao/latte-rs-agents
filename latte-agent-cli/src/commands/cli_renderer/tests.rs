@@ -6,11 +6,11 @@
 use std::io::Write;
 use std::sync::Arc;
 
+use super::super::cli_renderer::CliRenderer;
+use super::super::json_renderer::JsonRenderer;
 use latte_agent_core::controller::ChatEvent;
 use latte_agent_core::controller::RoleInfo;
 use latte_agent_core::renderer::{ChatEventMetadata, ChatRenderer};
-use super::super::cli_renderer::CliRenderer;
-use super::super::json_renderer::JsonRenderer;
 
 /// 把写入数据收集进共享 Vec<u8> 的 Writer。
 struct CapturingWriter {
@@ -18,7 +18,10 @@ struct CapturingWriter {
 }
 
 impl CapturingWriter {
-    fn new() -> (Arc<parking_lot::Mutex<Vec<u8>>>, Arc<parking_lot::Mutex<Box<dyn Write + Send>>>) {
+    fn new() -> (
+        Arc<parking_lot::Mutex<Vec<u8>>>,
+        Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
+    ) {
         let buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let writer = CapturingWriter { buf: buf.clone() };
         let shared: Arc<parking_lot::Mutex<Box<dyn Write + Send>>> =
@@ -64,7 +67,11 @@ async fn cli_renderer_role_turn_writes_role_id_and_content() {
     .await;
     let out = read_buf(&buf);
     assert!(out.contains("pm"), "should contain role id: {:?}", out);
-    assert!(out.contains("需求分析完成"), "should contain content: {:?}", out);
+    assert!(
+        out.contains("需求分析完成"),
+        "should contain content: {:?}",
+        out
+    );
 }
 
 #[tokio::test]
@@ -73,7 +80,11 @@ async fn cli_renderer_paused_uses_color_code() {
     let r = CliRenderer::new(writer);
     r.on_paused("用户暂停").await;
     let out = read_buf(&buf);
-    assert!(out.contains("paused"), "should contain paused tag: {:?}", out);
+    assert!(
+        out.contains("paused"),
+        "should contain paused tag: {:?}",
+        out
+    );
     assert!(out.contains("用户暂停"), "should contain reason: {:?}", out);
 }
 
@@ -82,8 +93,16 @@ async fn cli_renderer_render_prompt_returns_string() {
     let (_buf, writer) = CapturingWriter::new();
     let r = CliRenderer::new(writer);
     let prompt = r.render_prompt("💬", "manager", "deepseek-v4-flash");
-    assert!(prompt.contains("manager"), "prompt should contain role: {:?}", prompt);
-    assert!(prompt.contains("deepseek-v4-flash"), "prompt should contain model: {:?}", prompt);
+    assert!(
+        prompt.contains("manager"),
+        "prompt should contain role: {:?}",
+        prompt
+    );
+    assert!(
+        prompt.contains("deepseek-v4-flash"),
+        "prompt should contain model: {:?}",
+        prompt
+    );
 }
 
 // ─── JsonRenderer ───────────────────────────────────
@@ -103,10 +122,26 @@ async fn json_renderer_emits_line_delimited_json() {
     let out = read_buf(&buf);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 3, "expected 3 json lines, got: {:?}", lines);
-    assert!(lines[0].contains("\"type\":\"role_turn\""), "line 0: {:?}", lines[0]);
-    assert!(lines[0].contains("\"role_id\":\"pm\""), "line 0: {:?}", lines[0]);
-    assert!(lines[1].contains("\"type\":\"status\""), "line 1: {:?}", lines[1]);
-    assert!(lines[2].contains("\"type\":\"done\""), "line 2: {:?}", lines[2]);
+    assert!(
+        lines[0].contains("\"type\":\"role_turn\""),
+        "line 0: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("\"role_id\":\"pm\""),
+        "line 0: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("\"type\":\"status\""),
+        "line 1: {:?}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("\"type\":\"done\""),
+        "line 2: {:?}",
+        lines[2]
+    );
 }
 
 #[tokio::test]
@@ -114,8 +149,16 @@ async fn json_renderer_role_list_includes_all_roles() {
     let (buf, writer) = CapturingWriter::new();
     let r = JsonRenderer::new(writer);
     let roles = vec![
-        RoleInfo { id: "pm".into(), name: "产品经理".into(), icon: "📋".into() },
-        RoleInfo { id: "programmer".into(), name: "程序员".into(), icon: "💻".into() },
+        RoleInfo {
+            id: "pm".into(),
+            name: "产品经理".into(),
+            icon: "📋".into(),
+        },
+        RoleInfo {
+            id: "programmer".into(),
+            name: "程序员".into(),
+            icon: "💻".into(),
+        },
     ];
     r.on_role_list(&roles).await;
     let out = read_buf(&buf);
@@ -143,7 +186,11 @@ async fn json_renderer_tool_events() {
     r.on_tool_use("programmer", "edit_file", "{}").await;
     r.on_tool_result("programmer", "edit_file", "ok").await;
     let out = read_buf(&buf);
-    assert!(out.contains("\"tool_name\":\"edit_file\""), "got: {:?}", out);
+    assert!(
+        out.contains("\"tool_name\":\"edit_file\""),
+        "got: {:?}",
+        out
+    );
     assert!(out.contains("\"type\":\"tool_use\""), "got: {:?}", out);
     assert!(out.contains("\"type\":\"tool_result\""), "got: {:?}", out);
 }

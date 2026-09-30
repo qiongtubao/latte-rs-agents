@@ -20,8 +20,8 @@
 //! 单进程内唯一；跨进程撞名概率极低（约同微秒内同角色名），后果是
 //! 后写覆盖前写（接受——这是排查辅助，不是审计）。
 use std::fs::File;
-use std::io::{Read, SeekFrom};
 use std::io::Seek as _;
+use std::io::{Read, SeekFrom};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -139,11 +139,7 @@ impl SubsessionStore {
     ///
     /// 有持久化时 sink 内部 fanout 到 `MemorySink` + `DiskSink`；
     /// 磁盘不可写时降级到纯内存（`create()` 本身不失败，runner 看不出）。
-    pub fn create(
-        &self,
-        session_id: &str,
-        role_name: &str,
-    ) -> (SubId, Arc<dyn TraceSink>) {
+    pub fn create(&self, session_id: &str, role_name: &str) -> (SubId, Arc<dyn TraceSink>) {
         let sub_id = format!(
             "{}-{}",
             role_name,
@@ -200,11 +196,7 @@ impl SubsessionStore {
     ///
     /// delegate 路径继续用 [`create`]（每次新建，因为每次委派是独立
     /// 的子会话）。
-    pub fn get_or_create(
-        &self,
-        session_id: &str,
-        role_name: &str,
-    ) -> (SubId, Arc<dyn TraceSink>) {
+    pub fn get_or_create(&self, session_id: &str, role_name: &str) -> (SubId, Arc<dyn TraceSink>) {
         self.sweep();
         let key_prefix = format!("{role_name}-");
         let g = self.inner.lock();
@@ -248,12 +240,11 @@ impl SubsessionStore {
     /// 文件不存在 / meta 缺 sub_id / 事件反序列化失败 → None。
     pub fn read_persisted(&self, sub_id: &str) -> Option<Vec<TraceEvent>> {
         let persistence = self.persistence.as_ref()?;
-        let sid = persistence
-            .sub_to_session
-            .read()
-            .get(sub_id)
-            .cloned()?;
-        let path = persistence.base_dir.join(&sid).join(format!("{sub_id}.jsonl"));
+        let sid = persistence.sub_to_session.read().get(sub_id).cloned()?;
+        let path = persistence
+            .base_dir
+            .join(&sid)
+            .join(format!("{sub_id}.jsonl"));
         let raw = std::fs::read_to_string(&path).ok()?;
         parse_persisted_file(&raw)
     }
@@ -272,12 +263,11 @@ impl SubsessionStore {
         max_line_size: u64,
     ) -> Option<(Vec<TraceEvent>, bool)> {
         let persistence = self.persistence.as_ref()?;
-        let sid = persistence
-            .sub_to_session
-            .read()
-            .get(sub_id)
-            .cloned()?;
-        let path = persistence.base_dir.join(&sid).join(format!("{sub_id}.jsonl"));
+        let sid = persistence.sub_to_session.read().get(sub_id).cloned()?;
+        let path = persistence
+            .base_dir
+            .join(&sid)
+            .join(format!("{sub_id}.jsonl"));
         let file = File::open(&path).ok()?;
         let file_size = file.metadata().ok()?.len();
         if file_size == 0 {
@@ -316,9 +306,7 @@ impl SubsessionStore {
             }
 
             // 从后往前拆行
-            let mut lines: Vec<&[u8]> = combined
-                .split(|&b| b == b'\n')
-                .collect();
+            let mut lines: Vec<&[u8]> = combined.split(|&b| b == b'\n').collect();
 
             // 第一个片段可能不完整（跨 chunk），留到下次
             if read_start > 0 && !combined.is_empty() && combined.last() != Some(&b'\n') {
@@ -469,7 +457,7 @@ fn read_meta_subid_sid(path: &Path) -> Option<(SubId, SessionId)> {
     let raw = std::fs::read_to_string(path).ok()?;
     let first = raw.lines().next()?;
     let v: serde_json::Value = serde_json::from_str(first).ok()?;
-        if v.get("type").and_then(|t| t.as_str()) != Some(crate::subsession_disk::META_TYPE) {
+    if v.get("type").and_then(|t| t.as_str()) != Some(crate::subsession_disk::META_TYPE) {
         return None;
     }
     let sub_id = v.get("sub_id")?.as_str()?.to_string();

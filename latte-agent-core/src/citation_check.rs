@@ -265,11 +265,7 @@ fn parse_line_list(text: &str, at: usize, multi: bool) -> (Vec<u32>, usize) {
 /// 从**磁盘**读而不是从台账读：reveal 的目的是告诉模型「那儿实际是什么」，
 /// 磁盘上的当前内容才是 ground truth（台账里存的是它当初看到的样子，用它
 /// reveal 等于用错误的依据纠正错误）。
-fn reveal_lines(
-    cwd: &std::path::Path,
-    path: &str,
-    lines: &[u32],
-) -> Vec<(u32, String)> {
+fn reveal_lines(cwd: &std::path::Path, path: &str, lines: &[u32]) -> Vec<(u32, String)> {
     let full = cwd.join(path);
     let Ok(text) = std::fs::read_to_string(&full) else {
         return Vec::new();
@@ -404,11 +400,11 @@ mod tests {
     #[test]
     fn does_not_misread_non_citations() {
         for text in [
-            "std::collections::HashMap 里的 foo::bar:12",  // `::`
-            "见 https://example.com:8080/x",                // URL 端口
-            "会议在 12:30 开始",                            // 时间（无扩展名）
-            "版本 1.2:3 不是路径",                          // 纯数字扩展名
-            "变量 x:1",                                     // 太短、无扩展名
+            "std::collections::HashMap 里的 foo::bar:12", // `::`
+            "见 https://example.com:8080/x",              // URL 端口
+            "会议在 12:30 开始",                          // 时间（无扩展名）
+            "版本 1.2:3 不是路径",                        // 纯数字扩展名
+            "变量 x:1",                                   // 太短、无扩展名
         ] {
             assert!(
                 parse_citations(text).is_empty(),
@@ -456,8 +452,11 @@ mod tests {
     fn citations_within_observed_lines_pass() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let file = dir.path().join("bit_util.h");
-        std::fs::write(&file, (1..=20).map(|n| format!("line{n}\n")).collect::<String>())
-            .expect("write");
+        std::fs::write(
+            &file,
+            (1..=20).map(|n| format!("line{n}\n")).collect::<String>(),
+        )
+        .expect("write");
         let scope = Scope::new("sess-cite-ok", "tech_writer");
         // 读了 1-20 行（无行范围 = 全文）
         record_tool_result(
@@ -506,8 +505,14 @@ mod tests {
         let err = check_citations_observed(out, &scope, dir.path())
             .expect_err("引用了没读到的 310/322，必须拦");
 
-        assert!(err.contains("310") && err.contains("322"), "应点名问题行: {err}");
-        assert!(!err.contains("未读到的行：296"), "296 读过，不该被点名: {err}");
+        assert!(
+            err.contains("310") && err.contains("322"),
+            "应点名问题行: {err}"
+        );
+        assert!(
+            !err.contains("未读到的行：296"),
+            "296 读过，不该被点名: {err}"
+        );
         // reveal：把真实内容给出来，模型可以原地改对
         assert!(
             err.contains("#endif"),

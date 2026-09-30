@@ -233,7 +233,13 @@ fn is_wide(c: char) -> bool {
 }
 
 /// Render the per-turn token status line.
-pub fn render_status_line(model_id: &str, in_delta: u32, out_delta: u32, total_in: u32, total_out: u32) -> String {
+pub fn render_status_line(
+    model_id: &str,
+    in_delta: u32,
+    out_delta: u32,
+    total_in: u32,
+    total_out: u32,
+) -> String {
     let model = paint(FG_BRIGHT_CYAN, model_id);
     let up = paint(FG_GREEN, "↑");
     let down = paint(FG_YELLOW, "↓");
@@ -376,7 +382,9 @@ mod tests {
         let lines = wrap_line(&input, 10);
         // ANSI sequences should not be split mid-escape.
         for line in &lines {
-            assert!(!line.contains("\x1b[1") || line.ends_with("\x1b[0m") || line.contains("\x1b[0m"));
+            assert!(
+                !line.contains("\x1b[1") || line.ends_with("\x1b[0m") || line.contains("\x1b[0m")
+            );
         }
     }
 

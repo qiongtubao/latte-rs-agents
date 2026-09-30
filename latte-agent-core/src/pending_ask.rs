@@ -317,7 +317,15 @@ mod tests {
     }
 
     fn persist_one(cwd: &Path, choice_id: &str, sid: &str, wf_id: &str, question: &str) {
-        persist(cwd, choice_id, sid, wf_id, "tutor", question, r#"{"type":"ChoiceRequested"}"#);
+        persist(
+            cwd,
+            choice_id,
+            sid,
+            wf_id,
+            "tutor",
+            question,
+            r#"{"type":"ChoiceRequested"}"#,
+        );
     }
 
     #[test]
@@ -391,7 +399,8 @@ mod tests {
         persist_one(cwd, "choice-tutor-0", "sess-a", "wf-1", "选哪个？");
         // 手改 created_at 到 8 天前。
         let p = path_for(cwd, "choice-tutor-0").unwrap();
-        let mut rec: PendingAsk = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let mut rec: PendingAsk =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         rec.created_at = now_secs() - (8 * 24 * 3600);
         std::fs::write(&p, serde_json::to_string(&rec).unwrap()).unwrap();
 
@@ -406,7 +415,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let cwd = d.path();
         // 故意不建任何 checkpoint：非阻塞弹框本来就没有 run 可续。
-        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed"}"#);
+        persist_prompt(
+            cwd,
+            "plan-manager-0",
+            "sess-a",
+            r#"{"type":"PlanProposed"}"#,
+        );
 
         let out = load_for_session(cwd, "sess-a");
         assert_eq!(out.len(), 1, "非阻塞弹框应无条件补发（不查 checkpoint）");
@@ -420,8 +434,18 @@ mod tests {
     fn prompt_scopes_by_session() {
         let d = tempfile::tempdir().unwrap();
         let cwd = d.path();
-        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed"}"#);
-        persist_prompt(cwd, "choice-tutor-9", "sess-b", r#"{"type":"ChoiceRequested"}"#);
+        persist_prompt(
+            cwd,
+            "plan-manager-0",
+            "sess-a",
+            r#"{"type":"PlanProposed"}"#,
+        );
+        persist_prompt(
+            cwd,
+            "choice-tutor-9",
+            "sess-b",
+            r#"{"type":"ChoiceRequested"}"#,
+        );
 
         assert_eq!(load_for_session(cwd, "sess-a").len(), 1);
         assert_eq!(load_for_session(cwd, "sess-b").len(), 1);
@@ -436,8 +460,18 @@ mod tests {
     fn prompt_same_choice_id_coexists_across_sessions() {
         let d = tempfile::tempdir().unwrap();
         let cwd = d.path();
-        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed","n":1}"#);
-        persist_prompt(cwd, "plan-manager-0", "sess-b", r#"{"type":"PlanProposed","n":2}"#);
+        persist_prompt(
+            cwd,
+            "plan-manager-0",
+            "sess-a",
+            r#"{"type":"PlanProposed","n":1}"#,
+        );
+        persist_prompt(
+            cwd,
+            "plan-manager-0",
+            "sess-b",
+            r#"{"type":"PlanProposed","n":2}"#,
+        );
 
         let a = load_for_session(cwd, "sess-a");
         let b = load_for_session(cwd, "sess-b");
@@ -475,7 +509,11 @@ mod tests {
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, serde_json::to_string(&rec).unwrap()).unwrap();
 
-        assert_eq!(load_for_session(cwd, "sess-a").len(), 1, "旧文件名仍应可读回");
+        assert_eq!(
+            load_for_session(cwd, "sess-a").len(),
+            1,
+            "旧文件名仍应可读回"
+        );
         remove_prompt(cwd, "plan-manager-0");
         assert!(!legacy.exists(), "销账必须清掉旧文件名");
         assert!(load_for_session(cwd, "sess-a").is_empty());
@@ -486,7 +524,12 @@ mod tests {
     fn dismissed_prompt_is_not_replayed() {
         let d = tempfile::tempdir().unwrap();
         let cwd = d.path();
-        persist_prompt(cwd, "plan-manager-0", "sess-a", r#"{"type":"PlanProposed"}"#);
+        persist_prompt(
+            cwd,
+            "plan-manager-0",
+            "sess-a",
+            r#"{"type":"PlanProposed"}"#,
+        );
         assert_eq!(load_for_session(cwd, "sess-a").len(), 1);
 
         remove_prompt(cwd, "plan-manager-0");
@@ -506,8 +549,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let cwd = d.path();
         seed_checkpoint(cwd, "wf-1");
-        persist_one(cwd, "choice-manager-7", "sess-a", "wf-1", "怎么推 L1 改稿？");
-        persist_prompt(cwd, "choice-manager-7", "sess-a", r#"{"type":"ChoiceRequested"}"#);
+        persist_one(
+            cwd,
+            "choice-manager-7",
+            "sess-a",
+            "wf-1",
+            "怎么推 L1 改稿？",
+        );
+        persist_prompt(
+            cwd,
+            "choice-manager-7",
+            "sess-a",
+            r#"{"type":"ChoiceRequested"}"#,
+        );
 
         // 删非阻塞那份，阻塞记录必须还在（续跑要用）。
         remove_prompt(cwd, "choice-manager-7");
@@ -517,7 +571,12 @@ mod tests {
         );
 
         // 反向：删阻塞那份，非阻塞快照不受影响。
-        persist_prompt(cwd, "choice-manager-7", "sess-a", r#"{"type":"ChoiceRequested"}"#);
+        persist_prompt(
+            cwd,
+            "choice-manager-7",
+            "sess-a",
+            r#"{"type":"ChoiceRequested"}"#,
+        );
         remove(cwd, "choice-manager-7");
         assert_eq!(
             load_for_session(cwd, "sess-a").len(),

@@ -4,9 +4,10 @@
 //!
 //! 设计与不变量（参照 oh-my-pi 的 `AgentPauseGate`）：
 //!
-//! 1. **in-flight 不被打断**：已经启动的 model stream / tool exec 跑完
-//!    落地，下一个边界才 park。对应 chat UI 的"暂停"按钮 —— 用户
-//!    按下时如果在 LLM 响应中、tool 正在跑，会等这一步走完才停。
+//! 1. **按调用类型处理 in-flight**：已经产生增量输出的 model stream / tool exec
+//!    跑完落地；没有对外增量的非流式 model call 可以被暂停丢弃，继续后由
+//!    同一 turn 重新请求。其他情况下在下一个安全边界 park。对应 chat UI
+//!    的“暂停”按钮。
 //! 2. **abort 不解除 gate**：调用 [`wait_until_resumed`] 时可以传
 //!    `CancellationToken`/`AbortSignal`；该 signal 触发只唤醒**这一个**
 //!    waiter、门继续保持 engaged。其他 waiter（同一 session 的
@@ -152,11 +153,7 @@ impl AgentPauseGate {
         drop(state);
         self.notify.notify_waiters();
         self.notify_listeners(false);
-        tracing::debug!(
-            gate = self.name,
-            elapsed_ms,
-            "agent pause gate released"
-        );
+        tracing::debug!(gate = self.name, elapsed_ms, "agent pause gate released");
         Some(elapsed_ms)
     }
 
@@ -181,7 +178,12 @@ impl AgentPauseGate {
             .state
             .lock()
             .as_ref()
-            .map(|s| s.paused_at_instant.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .map(|s| {
+                s.paused_at_instant
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            })
             .unwrap_or(0);
         // 重读一次 done：若上面那个 race 真发生了（live=0 但 resume 已
         // 把时长记进 done），这次能读到新值，账目不会变小。
@@ -262,6 +264,25 @@ impl AgentPauseGate {
                 if !self.is_paused() {
                     return WaitResult::Ok;
                 }
+            }
+        }
+    }
+
+    /// Wait until this gate becomes engaged. Unlike `wait_until_resumed`,
+    /// this is used by an in-flight model call to notice a newly requested
+    /// pause before the call completes. The caller owns the cancellation
+    /// policy; observing the pause never changes the gate state.
+    pub async fn wait_until_paused(&self) {
+        loop {
+            // Create the notification future before checking the state so a
+            // pause racing with the check cannot be missed.
+            let notified = self.notify.notified();
+            if self.is_paused() {
+                return;
+            }
+            notified.await;
+            if self.is_paused() {
+                return;
             }
         }
     }

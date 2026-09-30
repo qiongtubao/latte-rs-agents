@@ -49,7 +49,6 @@ pub fn for_skill(name: &str) -> Option<&'static str> {
     }
 }
 
-
 /// Look up a default role prompt by its id (e.g. `"pm"`, `"architect"`).
 /// Look up a default role prompt by its id (e.g. `"pm"`, `"architect"`).
 ///
@@ -140,12 +139,7 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             model_chain: vec![],
             prompt_file: None,
             temperature: Some(0.4),
-            tools: vec![
-                "read".into(),
-                "bash".into(),
-                "search".into(),
-                "todo".into(),
-            ],
+            tools: vec!["read".into(), "bash".into(), "search".into(), "todo".into()],
             icon: "🧪".into(),
             skills: vec![],
             code_paths: vec![],
@@ -229,7 +223,12 @@ pub fn template_for(id: &str) -> Option<crate::role::RoleTemplate> {
             model_chain: vec![],
             prompt_file: None,
             temperature: Some(0.5),
-            tools: vec!["delegate".into(), "workflow".into(), "plan".into(), "todo".into()],
+            tools: vec![
+                "delegate".into(),
+                "workflow".into(),
+                "plan".into(),
+                "todo".into(),
+            ],
             icon: "👔".into(),
             skills: vec![],
             code_paths: vec![],
@@ -302,10 +301,7 @@ mod tests {
                     "pm 应沿用既有的 300 字上限，而不是另立一个更宽的数值"
                 );
             } else {
-                assert!(
-                    p.contains("默认上限"),
-                    "角色 '{id}' 应给出明确的字数上限"
-                );
+                assert!(p.contains("默认上限"), "角色 '{id}' 应给出明确的字数上限");
             }
         }
     }
@@ -369,5 +365,4 @@ mod tests {
             "轮次上限已被判定为错误设计，不得再出现"
         );
     }
-
 }

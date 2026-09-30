@@ -51,7 +51,9 @@ impl ConfigShow {
             CliOverrides::default(),
         )?;
         if resolved.sources.global.is_empty() {
-            println!("  (none found; checked ~/.latte/models.{{yaml,toml}} and ~/.latte/models.d/)");
+            println!(
+                "  (none found; checked ~/.latte/models.{{yaml,toml}} and ~/.latte/models.d/)"
+            );
         } else {
             for src in &resolved.sources.global {
                 println!("  {}", src);
@@ -75,7 +77,10 @@ impl ConfigShow {
             Ok(m) => println!("  loaded ({} bytes)", m.len()),
             Err(_) => println!("  (not present)"),
         }
-        println!("\n[Merged model catalog: {} models]", resolved.config.models.models.len());
+        println!(
+            "\n[Merged model catalog: {} models]",
+            resolved.config.models.models.len()
+        );
         for m in &resolved.config.models.models {
             let key = classify_key(&m.api_key);
             println!(

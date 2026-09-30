@@ -1,8 +1,8 @@
 //! Round-robin peer discussion scheduler + H2-tagged plan.md slicing.
 
+use crate::session::{SessionError, SessionManager};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::session::{SessionError, SessionManager};
 
 /// Return the substring of `plan_md` that `role_id` should see this turn.
 ///
@@ -55,18 +55,34 @@ pub fn plan_md_slice_for(plan_md: &str, role_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::session::SessionManager;
+    use std::sync::Arc;
 
     #[test]
     fn extracts_matching_h2() {
         let plan = "# Task\n\ninitial prompt here\n\n## programmer round 1\nfoo work\n\n## reviewer round 1\nbar review\n";
         let s = plan_md_slice_for(plan, "programmer");
-        assert!(s.contains("initial prompt here"), "top-of-file must be included: {}", s);
-        assert!(s.contains("## programmer round 1"), "own H2 must be included: {}", s);
+        assert!(
+            s.contains("initial prompt here"),
+            "top-of-file must be included: {}",
+            s
+        );
+        assert!(
+            s.contains("## programmer round 1"),
+            "own H2 must be included: {}",
+            s
+        );
         assert!(s.contains("foo work"), "own body must be included: {}", s);
-        assert!(!s.contains("## reviewer round 1"), "other role's H2 must NOT be included: {}", s);
-        assert!(!s.contains("bar review"), "other role's body must NOT be included: {}", s);
+        assert!(
+            !s.contains("## reviewer round 1"),
+            "other role's H2 must NOT be included: {}",
+            s
+        );
+        assert!(
+            !s.contains("bar review"),
+            "other role's body must NOT be included: {}",
+            s
+        );
     }
 
     #[test]
@@ -93,7 +109,11 @@ mod tests {
         let rs = RoundScheduler::new(Arc::new(tokio::sync::Mutex::new(mgr))).unwrap();
         assert_eq!(
             rs.order,
-            vec!["programmer".to_string(), "reviewer".to_string(), "manager".to_string()]
+            vec![
+                "programmer".to_string(),
+                "reviewer".to_string(),
+                "manager".to_string()
+            ]
         );
     }
 
@@ -110,7 +130,10 @@ mod tests {
         // RoundSchedulerConfig { max_rounds: 0, .. } is valid (not an error).
         // The scheduler itself does not enforce this; the REPL driver does
         // (it picks manager-dispatch vs round-robin based on max_rounds).
-        let cfg = RoundSchedulerConfig { max_rounds: 0, session_token_budget: 0 };
+        let cfg = RoundSchedulerConfig {
+            max_rounds: 0,
+            session_token_budget: 0,
+        };
         assert_eq!(cfg.max_rounds, 0);
     }
 
@@ -153,7 +176,10 @@ pub struct RoundSchedulerConfig {
 
 impl Default for RoundSchedulerConfig {
     fn default() -> Self {
-        Self { max_rounds: 10, session_token_budget: 50_000 }
+        Self {
+            max_rounds: 10,
+            session_token_budget: 50_000,
+        }
     }
 }
 
@@ -176,7 +202,12 @@ impl RoundScheduler {
     pub fn new(session: Arc<Mutex<SessionManager>>) -> Result<Self, SessionError> {
         let order = {
             let mgr = session.blocking_lock();
-            let mut roles: Vec<String> = mgr.record().roles.iter().map(|r| r.role_id.clone()).collect();
+            let mut roles: Vec<String> = mgr
+                .record()
+                .roles
+                .iter()
+                .map(|r| r.role_id.clone())
+                .collect();
             if roles.is_empty() {
                 return Err(SessionError::UnknownRole("empty role list".into()));
             }
@@ -191,12 +222,10 @@ impl RoundScheduler {
             roles
         };
         let config = RoundSchedulerConfig::default();
-        let supervisor = crate::supervisor::Supervisor::new(
-            crate::supervisor::SupervisorConfig {
-                session_token_budget: config.session_token_budget,
-                dead_loop_window: 3,
-            }
-        );
+        let supervisor = crate::supervisor::Supervisor::new(crate::supervisor::SupervisorConfig {
+            session_token_budget: config.session_token_budget,
+            dead_loop_window: 3,
+        });
         Ok(Self {
             session,
             order,

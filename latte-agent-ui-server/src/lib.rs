@@ -728,6 +728,11 @@ fn build_router(state: AppState) -> Router {
         .route("/tasks/:id/resume", post(resume_task))
         .route("/tasks/:id/report", post(report_task))
         .route("/tasks/:id/worktree-diff", get(task_worktree_diff))
+        .route("/tasks/:id/workflow-runs", get(task_workflow_runs))
+        .route(
+            "/tasks/:id/workflow-runs/:wf_id",
+            get(task_workflow_run_detail),
+        )
         // 工作流管理（编辑器 CRUD + 校验 + 测试运行）
         .route("/workflows", get(list_workflows_h).post(create_workflow_h))
         .route("/workflows/validate", post(validate_workflow_h))

@@ -56,7 +56,9 @@ pub enum RollbackMode {
 }
 
 impl Default for RollbackMode {
-    fn default() -> Self { RollbackMode::Full }
+    fn default() -> Self {
+        RollbackMode::Full
+    }
 }
 
 /// Wraps a worktree, intercepts write/edit calls, and produces
@@ -79,7 +81,9 @@ impl CheckpointEngine {
         sink: Arc<dyn TraceSink>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&storage_dir)?;
-        let next_id = Self::max_existing_id(&storage_dir).map(|n| n + 1).unwrap_or(0);
+        let next_id = Self::max_existing_id(&storage_dir)
+            .map(|n| n + 1)
+            .unwrap_or(0);
         let mut write_tools = HashSet::new();
         write_tools.insert("write".to_string());
         write_tools.insert("edit".to_string());
@@ -93,8 +97,12 @@ impl CheckpointEngine {
         })
     }
 
-    pub fn worktree_root(&self) -> &Path { &self.worktree_root }
-    pub fn storage_dir(&self) -> &Path { &self.storage_dir }
+    pub fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
+    pub fn storage_dir(&self) -> &Path {
+        &self.storage_dir
+    }
 
     fn max_existing_id(storage_dir: &Path) -> Option<u32> {
         let mut max = None;
@@ -112,7 +120,6 @@ impl CheckpointEngine {
         max
     }
 }
-
 
 impl CheckpointEngine {
     /// Capture the worktree's current dirty (or clean) state as a
@@ -147,7 +154,10 @@ impl CheckpointEngine {
             tool,
             args_hash
         );
-        run_git_allow_empty(&self.worktree_root, &["commit", "--allow-empty", "-m", &msg])?;
+        run_git_allow_empty(
+            &self.worktree_root,
+            &["commit", "--allow-empty", "-m", &msg],
+        )?;
         let git_commit = run_git(&self.worktree_root, &["rev-parse", "HEAD"])?;
 
         // 5. trace byte offset — read after commit so the line is in the file
@@ -288,11 +298,7 @@ impl CheckpointEngine {
     /// find the git commit for `id`, then runs `git reset --hard`.
     /// If `mode` is `Trace` or `Full`, also truncates the on-disk
     /// trace JSONL to the recorded `trace_event_index`.
-    pub fn rollback(
-        &self,
-        id: u32,
-        mode: RollbackMode,
-    ) -> Result<Checkpoint, CheckpointError> {
+    pub fn rollback(&self, id: u32, mode: RollbackMode) -> Result<Checkpoint, CheckpointError> {
         use crate::trace::TraceEvent;
         let target = self
             .read_manifest_entry(id)?
@@ -300,7 +306,10 @@ impl CheckpointEngine {
 
         // 1. Always reset the worktree (Code is the floor)
         if matches!(mode, RollbackMode::Code | RollbackMode::Full) {
-            run_git(&self.worktree_root, &["reset", "--hard", &target.git_commit])?;
+            run_git(
+                &self.worktree_root,
+                &["reset", "--hard", &target.git_commit],
+            )?;
         }
 
         // 2. Truncate trace if requested

@@ -13,12 +13,16 @@ mod commands;
 
 use commands::{
     chat::ChatCmd, checkpoint::CheckpointCmd, config::ConfigCmd, debug::DebugCmd,
-    discuss::DiscussCmd, inject::InjectCmd, list::ListCmd, pause::PauseCmd,
-    resume::ResumeCmd, run::RunCmd, test::TestCmd, ui::UiCmd, workflow::WorkflowCmd,
+    discuss::DiscussCmd, inject::InjectCmd, list::ListCmd, pause::PauseCmd, resume::ResumeCmd,
+    run::RunCmd, test::TestCmd, ui::UiCmd, workflow::WorkflowCmd,
 };
 
 #[derive(Parser)]
-#[command(name = "latte-agent", version, about = "Multi-role agent discussion system")]
+#[command(
+    name = "latte-agent",
+    version,
+    about = "Multi-role agent discussion system"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -116,12 +120,11 @@ fn init_rtk_path() {
     };
     // 把 rtk 所在目录放在 PATH 最前, 优先于任何系统 / 用户装的同名 binary.
     let mut iter = std::env::split_paths(&current_path);
-    let new_path = match std::env::join_paths(
-        std::iter::once(rtk_dir.to_path_buf()).chain(iter.by_ref()),
-    ) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let new_path =
+        match std::env::join_paths(std::iter::once(rtk_dir.to_path_buf()).chain(iter.by_ref())) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
     // SAFETY: tokio runtime 还没启动, 不会有线程持有 env var 句柄.
     unsafe {
         std::env::set_var("PATH", new_path);
@@ -138,8 +141,7 @@ fn init_rtk_path() {
 /// `try_init` 防止测试或库调用方已经装过 subscriber 时 panic。
 fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_writer(std::io::stderr))

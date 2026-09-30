@@ -72,7 +72,12 @@ pub trait ChatRenderer: Send + Sync {
     /// 便捷方法：把一个完整的 `ChatEvent` 派发到对应的方法。
     async fn dispatch_event(&self, event: &ChatEvent) {
         match event {
-            ChatEvent::RoleTurn { role_id, content, is_complete, .. } => {
+            ChatEvent::RoleTurn {
+                role_id,
+                content,
+                is_complete,
+                ..
+            } => {
                 self.on_role_turn(&ChatEventMetadata {
                     role_id: role_id.clone(),
                     content: content.clone(),
@@ -80,7 +85,12 @@ pub trait ChatRenderer: Send + Sync {
                 })
                 .await;
             }
-            ChatEvent::ToolFixRequested { tool_name, malformed_args, error_detail, .. } => {
+            ChatEvent::ToolFixRequested {
+                tool_name,
+                malformed_args,
+                error_detail,
+                ..
+            } => {
                 self.on_status(&format!(
                     "⚠️ 工具 `{tool_name}` 连续出错，等待人工介入修正参数:\n错误信息: {error_detail}\n坏参数: {malformed_args}"
                 ))
@@ -99,11 +109,17 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::Resumed => self.on_resumed().await,
             ChatEvent::RoundStarted { round } => self.on_round_started(*round).await,
             ChatEvent::RoundEnded { round } => self.on_round_ended(*round).await,
-            ChatEvent::RoleStarted { role_id, detail, .. } => {
-                self.on_status(&format!("{role_id} started: {detail}")).await;
+            ChatEvent::RoleStarted {
+                role_id, detail, ..
+            } => {
+                self.on_status(&format!("{role_id} started: {detail}"))
+                    .await;
             }
-            ChatEvent::RoleFinished { role_id, detail, .. } => {
-                self.on_status(&format!("{role_id} finished: {detail}")).await;
+            ChatEvent::RoleFinished {
+                role_id, detail, ..
+            } => {
+                self.on_status(&format!("{role_id} finished: {detail}"))
+                    .await;
             }
             ChatEvent::RolePaused { role_id } => {
                 self.on_status(&format!("[role paused: {role_id}]")).await;
@@ -111,35 +127,79 @@ pub trait ChatRenderer: Send + Sync {
             ChatEvent::RoleResumed { role_id } => {
                 self.on_status(&format!("[role resumed: {role_id}]")).await;
             }
-            ChatEvent::DelegateStarted { from_role, to_role, task, .. } => {
-                self.on_status(&format!("{from_role} delegated to {to_role}: {task}")).await;
+            ChatEvent::DelegateStarted {
+                from_role,
+                to_role,
+                task,
+                ..
+            } => {
+                self.on_status(&format!("{from_role} delegated to {to_role}: {task}"))
+                    .await;
             }
-            ChatEvent::DelegateFinished { from_role, to_role, status, summary, .. } => {
-                self.on_status(&format!("{from_role} delegate {to_role} {status}: {summary}")).await;
+            ChatEvent::DelegateFinished {
+                from_role,
+                to_role,
+                status,
+                summary,
+                ..
+            } => {
+                self.on_status(&format!(
+                    "{from_role} delegate {to_role} {status}: {summary}"
+                ))
+                .await;
             }
             ChatEvent::Done => self.on_done().await,
             ChatEvent::Error { message, .. } => self.on_error(message).await,
             ChatEvent::RoleList { roles } => self.on_role_list(roles).await,
             ChatEvent::ContextCleared => self.on_context_cleared().await,
-            ChatEvent::SessionInfo { task_id, state, turn, .. } => {
+            ChatEvent::SessionInfo {
+                task_id,
+                state,
+                turn,
+                ..
+            } => {
                 self.on_session_info(task_id, state, *turn).await;
             }
-            ChatEvent::ToolUse { role_id, tool_name, args, .. } => {
+            ChatEvent::ToolUse {
+                role_id,
+                tool_name,
+                args,
+                ..
+            } => {
                 self.on_tool_use(role_id, tool_name, args).await;
             }
-            ChatEvent::ToolResult { role_id, tool_name, result, .. } => {
+            ChatEvent::ToolResult {
+                role_id,
+                tool_name,
+                result,
+                ..
+            } => {
                 self.on_tool_result(role_id, tool_name, result).await;
             }
-            ChatEvent::ToolError { role_id, tool_name, error, .. } => {
+            ChatEvent::ToolError {
+                role_id,
+                tool_name,
+                error,
+                ..
+            } => {
                 self.on_tool_result(role_id, tool_name, error).await;
             }
             ChatEvent::WorkflowStarted { name, topic, .. } => {
-                self.on_status(&format!("workflow {name} started: {topic}")).await;
+                self.on_status(&format!("workflow {name} started: {topic}"))
+                    .await;
             }
-            ChatEvent::WorkflowStep { step_id, index, total, .. } => {
-                self.on_status(&format!("workflow step {index}/{total}: {step_id}")).await;
+            ChatEvent::WorkflowStep {
+                step_id,
+                index,
+                total,
+                ..
+            } => {
+                self.on_status(&format!("workflow step {index}/{total}: {step_id}"))
+                    .await;
             }
-            ChatEvent::WorkflowTurn { role_id, content, .. } => {
+            ChatEvent::WorkflowTurn {
+                role_id, content, ..
+            } => {
                 self.on_role_turn(&ChatEventMetadata {
                     role_id: role_id.clone(),
                     content: content.clone(),
@@ -147,23 +207,39 @@ pub trait ChatRenderer: Send + Sync {
                 })
                 .await;
             }
-            ChatEvent::WorkflowFinished { name, status, summary, .. } => {
-                self.on_status(&format!("workflow {name} {status}: {summary}")).await;
+            ChatEvent::WorkflowFinished {
+                name,
+                status,
+                summary,
+                ..
+            } => {
+                self.on_status(&format!("workflow {name} {status}: {summary}"))
+                    .await;
             }
             // 生成的图片：CLI 无法渲染 <img>，提示落盘路径即可（web UI
             // 走 /api/images/<file> 直接渲染）。
             ChatEvent::ImageGenerated { role_id, path, .. } => {
-                self.on_status(&format!("{role_id} generated image: {path}")).await;
+                self.on_status(&format!("{role_id} generated image: {path}"))
+                    .await;
             }
             // plan 工具提交的任务候选：CLI 仅提示数量，web UI 弹窗勾选导入。
-            ChatEvent::PlanProposed { role_id, plan_id, tasks } => {
+            ChatEvent::PlanProposed {
+                role_id,
+                plan_id,
+                tasks,
+            } => {
                 self.on_status(&format!(
                     "📋 {role_id} 提交 {} 个任务候选（{plan_id}），请在 UI 弹窗勾选导入任务看板",
                     tasks.len()
                 ))
                 .await;
             }
-            ChatEvent::ChoiceRequested { role_id, question, options, .. } => {
+            ChatEvent::ChoiceRequested {
+                role_id,
+                question,
+                options,
+                ..
+            } => {
                 self.on_status(&format!(
                     "❓ {role_id} 请你选择（{} 个选项）：{question}",
                     options.len()
@@ -186,21 +262,33 @@ pub trait ChatRenderer: Send + Sync {
                 ))
                 .await;
             }
-            ChatEvent::AdvisorTerminated { role_id, reason, detector, .. } => {
+            ChatEvent::AdvisorTerminated {
+                role_id,
+                reason,
+                detector,
+                ..
+            } => {
                 let det = detector.as_deref().unwrap_or("?");
-                self.on_status(&format!("🛑 advisor terminated [{role_id}, {det}]: {reason}")).await;
-            }
-            // task_report 工具汇报：CLI 仅打印状态行，web UI 走事件→
-            // POST /api/tasks/:id/report 桥接完成实际的状态推进。
-            ChatEvent::TaskReport { task_id, result, summary, .. } => {
                 self.on_status(&format!(
-                    "📊 task_report: {task_id} {result} — {summary}"
+                    "🛑 advisor terminated [{role_id}, {det}]: {reason}"
                 ))
                 .await;
             }
+            // task_report 工具汇报：CLI 仅打印状态行，web UI 走事件→
+            // POST /api/tasks/:id/report 桥接完成实际的状态推进。
+            ChatEvent::TaskReport {
+                task_id,
+                result,
+                summary,
+                ..
+            } => {
+                self.on_status(&format!("📊 task_report: {task_id} {result} — {summary}"))
+                    .await;
+            }
             // todo 工具应用 ops 后的列表快照：紧凑一行（进度 + 当前项），
             // web UI 渲染完整面板。
-            ChatEvent::TodoUpdated { phases, .. } => {                let mut done = 0usize;
+            ChatEvent::TodoUpdated { phases, .. } => {
+                let mut done = 0usize;
                 let mut total = 0usize;
                 let mut current: Option<&str> = None;
                 for p in phases {
@@ -242,7 +330,9 @@ pub trait ChatRenderer: Send + Sync {
                     None => "🎯 目标已丢弃".to_string(),
                     Some(g) => {
                         let budget = match (g.token_budget, g.tokens_remaining()) {
-                            (Some(b), Some(rem)) => format!(" · token {}/{b}（剩 {rem}）", g.tokens_used),
+                            (Some(b), Some(rem)) => {
+                                format!(" · token {}/{b}（剩 {rem}）", g.tokens_used)
+                            }
                             _ => String::new(),
                         };
                         let tail = match (&g.phase, &g.blocked_reason) {

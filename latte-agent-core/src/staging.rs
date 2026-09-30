@@ -199,7 +199,9 @@ impl Staging {
                             for (file, (orig_spec, staged)) in
                                 files.iter_mut().zip(staged_of.iter())
                             {
-                                let Some(obj) = file.as_object_mut() else { continue };
+                                let Some(obj) = file.as_object_mut() else {
+                                    continue;
+                                };
                                 obj.insert("path".into(), serde_json::json!(orig_spec));
                                 if let Some(staged) = staged {
                                     obj.insert("stagedFrom".into(), serde_json::json!(staged));
@@ -284,9 +286,8 @@ impl Staging {
                         .filter(|v| v.is_object());
                     if let Some(env) = env {
                         if let Some(obj) = env.as_object_mut() {
-                            obj.entry("LATTE_STAGING_ROOT".to_string()).or_insert_with(
-                                || serde_json::json!(st.root().to_string_lossy()),
-                            );
+                            obj.entry("LATTE_STAGING_ROOT".to_string())
+                                .or_insert_with(|| serde_json::json!(st.root().to_string_lossy()));
                             obj.entry("LATTE_STAGING_ACTIVE".to_string())
                                 .or_insert_with(|| serde_json::json!("1"));
                         }
@@ -502,13 +503,9 @@ mod tests {
     /// 里跑。裸注册出来的 `read` 还是单 `path` 版本，于是「staging 外层包装
     /// 把 `paths` 调用挡在批量适配器之前」这个真实 bug 在测试里根本复现不出来。
     async fn make_tm() -> Arc<dyn ToolManager> {
-        crate::controller::build_tool_manager(&[
-            "read".into(),
-            "write".into(),
-            "bash".into(),
-        ])
-        .await
-        .expect("build_tool_manager")
+        crate::controller::build_tool_manager(&["read".into(), "write".into(), "bash".into()])
+            .await
+            .expect("build_tool_manager")
     }
 
     fn ctx() -> Option<ToolExecutionContext> {
@@ -563,7 +560,11 @@ mod tests {
         // ——`wrap_tools` 是外层包装，原来这里硬要求 `path`，导致 staging
         // 启用时任何 `paths` 调用都在到达批量适配器前就报 "path is required"。
         let out = tm
-            .execute("read", serde_json::json!({"paths": ["notes/plan.md"]}), ctx())
+            .execute(
+                "read",
+                serde_json::json!({"paths": ["notes/plan.md"]}),
+                ctx(),
+            )
             .await
             .unwrap();
         assert_eq!(out["files"][0]["content"], "草稿v1");
@@ -663,7 +664,10 @@ mod tests {
         let (promoted, errors) = st.promote();
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(promoted.len(), 2);
-        assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "v2-final");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.md")).unwrap(),
+            "v2-final"
+        );
         assert_eq!(std::fs::read_to_string(dir.join("sub/b.md")).unwrap(), "b");
         // 全部成功 → 暂存目录已清理。
         assert!(!st.root().exists());
@@ -762,7 +766,12 @@ mod tests {
             .expect("碰到有草稿的路径必须挂 stagingNotice");
         assert!(notice.contains("notes/plan.md"), "{notice}");
         assert!(
-            notice.contains(&st.root().join("notes/plan.md").to_string_lossy().to_string()),
+            notice.contains(
+                &st.root()
+                    .join("notes/plan.md")
+                    .to_string_lossy()
+                    .to_string()
+            ),
             "通知要给出暂存路径，模型才能直接去读: {notice}"
         );
 

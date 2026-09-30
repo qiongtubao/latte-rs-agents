@@ -1349,6 +1349,29 @@ pub(crate) async fn task_worktree_diff(
         .map_err(Into::into)
 }
 
+/// `GET /api/tasks/:id/workflow-runs` —— 该任务关联的所有 workflow run
+/// （learn_loop / code_review / merge 等 lifecycle hook 与派发 workflow
+/// 都算；按 session_id 关联）。
+pub(crate) async fn task_workflow_runs(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::tasks::TaskWorkflowRunSummary>>, (StatusCode, String)> {
+    crate::tasks::task_workflow_runs(&state.backend, &id)
+        .map(Json)
+        .map_err(Into::into)
+}
+
+/// `GET /api/tasks/:id/workflow-runs/:wf_id` —— 单条 run 完整详情
+/// （含全部 step output 全文与 ask 回答）。
+pub(crate) async fn task_workflow_run_detail(
+    axum::extract::Path((id, wf_id)): axum::extract::Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::tasks::TaskWorkflowRunDetail>, (StatusCode, String)> {
+    crate::tasks::task_workflow_run_detail(&state.backend, &id, &wf_id)
+        .map(Json)
+        .map_err(Into::into)
+}
+
 /// `POST /api/tasks/:id/report` —— manager 回报完成（设计 §5.1 方案 A 的接口半区）。
 pub(crate) async fn report_task(
     axum::extract::Path(id): axum::extract::Path<String>,
