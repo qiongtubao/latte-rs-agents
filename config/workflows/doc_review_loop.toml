@@ -113,7 +113,7 @@ prompt_token_ratio = 0.8
 context_overflow_restart = true
 context_overflow_max_restarts = 2
 context_overflow_files = ["index.md"]
-tools = ["read", "code_graph", "search"]
+tools = ["read", "search", "code_graph", "doc_graph_context"]
 require_tools = ["read"]
 task = """你是学习文档审稿员，只读不改。既是零基础读者，也是**对照源码的核查员**。
 

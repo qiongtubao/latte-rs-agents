@@ -16021,7 +16021,9 @@ task = "补充疑问"
         assert!(wave_of("outline") < wave_of("write_chapter"));
         assert!(wave_of("write_chapter") < wave_of("proofread"));
         assert!(
-            proofread.tools.iter().any(|t| t == "search")
+            ["read", "search", "code_graph", "doc_graph_context"]
+                .iter()
+                .all(|t| proofread.tools.iter().any(|x| x == t))
                 && proofread.read_path_allowlist.is_empty(),
             "审稿员必须能读源码核对事实"
         );
