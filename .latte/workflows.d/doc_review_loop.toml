@@ -61,7 +61,7 @@ output_key = "chapters_out"
 # 引擎强制：每个并发章节 writer 只能写自己那一章，无法覆盖别人的文件。
 write_path_allowlist = [".latte/learn/{{slug}}/sections/{{item_id}}.md"]
 depends_on = ["outline"]
-max_retries = 1
+max_retries = 2
 tools = ["read", "code_graph", "search", "edit", "write"]
 task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 个）。
 引擎并发派发多个 writer，各写各的章节：只写你自己的 sections/{{item_id}}.md，不读、不改别的章节文件。
@@ -72,7 +72,9 @@ task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}`
 ## 先判断要不要写
 读 feedback.md（不存在按 MODE: FULL）：
 - `MODE: PATCH` 且没有 `## {{item_id}}` 分组，且 sections/{{item_id}}.md 已存在 → 只输出 `UNCHANGED` 并结束；
-- 有 `## {{item_id}}` 分组 → 只针对这些意见修改已有文件，其余保持稳定；
+- 有 `## {{item_id}}` 分组 → 只针对这些意见在已有文件上**增补**（如「易错点辨析」）。
+  原有段落、`file:line` 出处和代码摘录一律保留，不许整章推倒。引擎会核对出处是否还在、
+  篇幅有没有被砍掉；不合格会还原原文件并要求重写。
 - `MODE: FULL` → 整章重写（旧文件只当参考，质量不行推倒重来）。
 写完 write 落盘到 .latte/learn/<slug>/sections/{{item_id}}.md。
 

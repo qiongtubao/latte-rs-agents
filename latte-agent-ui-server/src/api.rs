@@ -438,9 +438,13 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
             // 独立工作空间（普通 session 按 id 建；fork 会继承源 session 的目录，
             // 仍有其它 session 在用时不删）。
             if !b.sessions.read().values().any(|o| o.agent_cwd() == agent_cwd) {
-                latte_agent_core::task_worktree::TaskWorktree::remove_session_workspace(
-                    &b.cwd, id, &agent_cwd,
-                );
+                if let Some(branch) =
+                    latte_agent_core::task_worktree::TaskWorktree::remove_session_workspace(
+                        &b.cwd, id, &agent_cwd,
+                    )
+                {
+                    eprintln!("[sessions] 会话 {id} 有未合并的改动，已保留在分支 {branch}");
+                }
             }
             // 任务隔离会话：连它的 worktree 一起回收（树 + 分支）。
             crate::tasks::reclaim_session_worktree(b, &agent_cwd).await;
