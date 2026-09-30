@@ -874,6 +874,23 @@ item 的 `depends_on` 既可写已存在的任务 id，也可写**同一批任�
 
 **响应 `200`：** `TaskView`
 
+### `POST /api/tasks/<id>/resume`
+
+**重试执行**：让任务绑定的执行 session 从断点续跑——服务重启/网络/模型故障导致
+执行中断后，用户在看板点「↺ 重试」。**任务状态不变**（仍 `in_progress`，run 的
+`ended_at` 保持 `None`——续跑的是同一个 run，不是新开）。
+
+底层走 `POST /api/chat/resume` 的同一机制：workflow 任务从 checkpoint 跳过已完成
+step 续跑（`run_workflow_resume`）；经典 chat 任务恢复 controller/gate。
+
+启动对账（`reconcile_interrupted_runs`）不再把中断任务回退 `todo`：任务与 session
+绑定，重启只在 history 标记「上次执行中断」并清 `dispatch_pending`，由用户决定
+「重试」（续跑）还是「中止」（放弃这次 run 回 `todo` 重新派发）。
+
+仅 `in_progress` + 有进行中 run 可调；绑定的 session 已被删 → `400`（提示改走中止）。
+
+**响应 `200`：** `TaskView`
+
 ### `GET /api/tasks/<id>/worktree-diff`
 
 隔离任务的**改动预览**：批准（`merging`）等于把工作树合并回 base，批之前得先看得见

@@ -215,7 +215,7 @@ impl Task {
                 vec!["dispatch", "reschedule", "unschedule", "to_backlog"]
             }
             "todo" => vec!["dispatch", "schedule", "to_backlog"],
-            "in_progress" => vec!["view_session", "abort"],
+            "in_progress" => vec!["view_session", "resume", "abort"],
             "human_review" => vec!["view_session", "approve", "rework"],
             "rework" => vec!["dispatch", "edit"],
             "merging" => vec!["view_session", "mark_done"],
@@ -3415,6 +3415,74 @@ fn apply_abort_finish(
     Ok(())
 }
 
+/// `POST /api/tasks/:id/resume` — 重试执行：让任务绑定的执行 session 从断点
+/// 续跑。**任务状态不变**（仍是 `in_progress`，run 的 `ended_at` 保持 None）——
+/// 重试是让同一个 run 的执行体重新跑起来，不是新开一个 run。
+///
+/// 适用场景：服务重启/网络/模型故障导致执行中断，session 文件还在盘上
+/// （dispatch 时已 materialize）。workflow 任务从 checkpoint 跳过已完成
+/// step 续跑；经典 chat 任务恢复其 controller/gate。底层走
+/// [`api::chat_resume_session`]——它与「重启后点继续」是同一条路径，已处理
+/// `last_failed_workflow` seed、checkpoint 校验、at-most-one guard。
+///
+/// 与 [`abort_task`] 正交：重试是「续上这次执行」，中止是「放弃这次执行回
+/// todo 重派」。
+pub async fn resume_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
+    // 1. 读锁校验 + 取绑定的 session。
+    let session_id = {
+        let store = b.tasks.read();
+        let t = store
+            .get(id)
+            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        if t.state != "in_progress" {
+            return Err(ApiError::bad_request(format!(
+                "state {:?} 不可重试（仅 in_progress）",
+                t.state
+            )));
+        }
+        t.runs
+            .last()
+            .filter(|r| r.ended_at.is_none())
+            .map(|r| r.session_id.clone())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "没有进行中的 run 可重试（session 可能已被中止/删除，请改用中止回 todo）"
+                        .to_string(),
+                )
+            })?
+    };
+
+    // 2. 让绑定的 session 从断点续跑。session 已被删 → 404，提示用户改走
+    //    中止（语义：执行体没了，只能放弃这次 run）。
+    api::chat_resume_session(b, Some(&session_id)).await.map_err(|e| {
+        if e.status == 404 {
+            ApiError::bad_request(format!(
+                "绑定的执行 session {session_id} 已不存在，无法续跑——请「中止」回 todo 后重新派发"
+            ))
+        } else {
+            e
+        }
+    })?;
+
+    // 3. 记 history（状态不变）。actor=user：重试是人触发的恢复动作。
+    let now = now_ms();
+    let mut store = b.tasks.write();
+    {
+        let t = store
+            .get_mut(id)
+            .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        t.push_note(
+            "user",
+            format!("重试执行：断点续跑 session {session_id}"),
+            now,
+        );
+        t.updated_at = now;
+    }
+    store.persist(id).map_err(ApiError::internal)?;
+    let t = store.get(id).expect("刚 persist 的任务必然存在");
+    Ok(store.view(t))
+}
+
 /// `GET /api/tasks/:id/worktree-diff` — 隔离任务的改动预览。
 ///
 /// 存在的理由：隔离任务的改动全在它自己的工作树里，用户在看板上点「批准」
@@ -6460,6 +6528,67 @@ mod tests {
             .history
             .iter()
             .all(|h| h.actor != "scheduler"));
+    }
+
+    /// 重试执行：`in_progress` + 绑定的死 session → 断点续跑（状态不变、
+    /// run 不收尾）；非 in_progress / 无进行中 run → 400。
+    #[tokio::test]
+    async fn resume_task_retries_bound_session_without_touching_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let ids = import_as_todo(&b, serde_json::json!({"tasks": [{ "title": "断点续跑" }]})).await;
+        // 派发出去建一个真实 session（非隔离 + 无 workflow → 走 chat_send
+        // manager 路径），run 记上 session_id。
+        dispatch_task(&b, &ids[0], "user", "redo")
+            .await
+            .expect("派发");
+
+        // todo → 400（造第二个 todo 任务校验状态守卫）。
+        let todo_id = import_as_todo(&b, serde_json::json!({"tasks": [{ "title": "别的" }]})).await;
+        let err = resume_task(&b, &todo_id[0]).await.expect_err("todo 不可重试");
+        assert_eq!(err.status, 400);
+
+        // in_progress → 走 chat_resume_session 续跑（session 在盘上，无
+        // workflow → 无 resumable_wf_id，controller_or_spawn 后正常返回）。
+        resume_task(&b, &ids[0])
+            .await
+            .expect("in_progress 应能重试");
+        let t = b.tasks.read().get(&ids[0]).unwrap().clone();
+        assert_eq!(t.state, "in_progress", "重试不改任务状态");
+        assert!(t.runs.last().unwrap().ended_at.is_none(), "run 不收尾");
+        let note = t.history.iter().rev().find_map(|h| h.note.clone()).unwrap();
+        assert!(note.contains("重试执行"), "{note}");
+    }
+
+    /// 绑定的 session 已被删 → resume_task 提示改走中止（不再 404 裸抛）。
+    #[tokio::test]
+    async fn resume_task_surfaces_deleted_session_as_abort_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let ids = import_as_todo(&b, serde_json::json!({"tasks": [{ "title": "死 session" }]})).await;
+        dispatch_task(&b, &ids[0], "user", "redo")
+            .await
+            .expect("派发");
+        let sid = b
+            .tasks
+            .read()
+            .get(&ids[0])
+            .unwrap()
+            .runs
+            .last()
+            .unwrap()
+            .session_id
+            .clone();
+        crate::api::delete_session(&b, &sid).await.expect("删 session");
+
+        let err = resume_task(&b, &ids[0])
+            .await
+            .expect_err("session 没了不能续跑");
+        assert!(
+            err.message.contains("中止") || err.message.contains("重新派发"),
+            "要提示改走中止：{}",
+            err.message
+        );
     }
 
     /// 对账保留的工作树**不能**被随后的孤儿回收当垃圾删掉（顺序回归）。

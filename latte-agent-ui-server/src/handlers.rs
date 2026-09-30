@@ -1327,6 +1327,17 @@ pub(crate) async fn abort_task(
         .map_err(Into::into)
 }
 
+/// `POST /api/tasks/:id/resume` —— 重试执行（断点续跑绑定的 session）。
+pub(crate) async fn resume_task(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<crate::tasks::TaskView>, (StatusCode, String)> {
+    crate::tasks::resume_task(&state.backend, &id)
+        .await
+        .map(Json)
+        .map_err(Into::into)
+}
+
 /// `GET /api/tasks/:id/worktree-diff` —— 隔离任务的改动预览（批准前看一眼）。
 pub(crate) async fn task_worktree_diff(
     axum::extract::Path(id): axum::extract::Path<String>,

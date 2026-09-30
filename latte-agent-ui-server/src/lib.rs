@@ -725,6 +725,7 @@ fn build_router(state: AppState) -> Router {
         .route("/tasks/:id/dispatch", post(dispatch_task))
         .route("/tasks/:id/refine", post(refine_task))
         .route("/tasks/:id/abort", post(abort_task))
+        .route("/tasks/:id/resume", post(resume_task))
         .route("/tasks/:id/report", post(report_task))
         .route("/tasks/:id/worktree-diff", get(task_worktree_diff))
         // 工作流管理（编辑器 CRUD + 校验 + 测试运行）
