@@ -362,6 +362,24 @@ fn load_session_file(path: PathBuf) -> Option<LoadedSession> {
 pub(crate) fn last_resumable_workflow_from_log(
     event_log: &Arc<parking_lot::RwLock<Vec<String>>>,
 ) -> Option<FailedWorkflow> {
+    let (interrupted, failed) = scan_resumable_workflows(event_log);
+    interrupted.or(failed)
+}
+
+/// 只看「被中断」的那类候选（有 Started 无 Finished、未被续跑取代）。
+/// 在**存活进程**里这样的 run 一定还在跑（有对应 task）；在冷启动恢复的
+/// session 里它是孤儿——旧进程的 task 已随进程消亡。调用方结合
+/// `ChatController::has_active_workflow` 区分两者。
+pub(crate) fn interrupted_workflow_from_log(
+    event_log: &Arc<parking_lot::RwLock<Vec<String>>>,
+) -> Option<FailedWorkflow> {
+    scan_resumable_workflows(event_log).0
+}
+
+/// 返回 (被中断的最外层 run, 最近一条失败的 Finished)。
+fn scan_resumable_workflows(
+    event_log: &Arc<parking_lot::RwLock<Vec<String>>>,
+) -> (Option<FailedWorkflow>, Option<FailedWorkflow>) {
     let log = event_log.read();
     // wf_id → (起始 idx, name)
     let mut started: Vec<(usize, String, String)> = Vec::new();
@@ -417,19 +435,17 @@ pub(crate) fn last_resumable_workflow_from_log(
         }
     }
     // 中断候选：started 顺序即外层优先（嵌套的 Started 更晚）。
-    for (_, wf_id, name) in &started {
-        if finished.contains_key(wf_id) || superseded.contains(wf_id) {
-            continue;
-        }
-        return Some(FailedWorkflow {
+    let interrupted = started
+        .iter()
+        .find(|(_, wf_id, _)| !finished.contains_key(wf_id) && !superseded.contains(wf_id))
+        .map(|(_, wf_id, name)| FailedWorkflow {
             name: name.clone(),
             wf_id: wf_id.clone(),
             summary: String::new(),
             failed_at_unix_ms: 0, // cold-start 不知道精确时间；0 表示"非实时"
         });
-    }
-    // 无中断：最近一条失败的 Finished。
-    finished
+    // 最近一条失败的 Finished。
+    let failed = finished
         .into_iter()
         .filter(|(_, (_, status, _, _))| status != "ok")
         .max_by_key(|(_, (idx, _, _, _))| *idx)
@@ -438,7 +454,8 @@ pub(crate) fn last_resumable_workflow_from_log(
             wf_id,
             summary,
             failed_at_unix_ms: 0,
-        })
+        });
+    (interrupted, failed)
 }
 
 /// Streaming deltas are transport-only. The final complete RoleTurn carries

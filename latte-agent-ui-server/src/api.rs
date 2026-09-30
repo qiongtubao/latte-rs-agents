@@ -1751,8 +1751,19 @@ fn is_live_session_resume(outcome: latte_agent_core::controller::SessionResumeOu
 pub async fn chat_resume_session(b: &UiBackend, session_id: Option<&str>) -> Result<(), ApiError> {
     let h = resolve_session(b, session_id)?;
     h.touch();
+    // 冷启动孤儿：本进程没有存活 workflow，而日志里有「有 Started 无
+    // Finished」的 run——它属于已消亡的旧进程，没有任何 task 在等 gate。
+    // 此时用户在新进程里 ⏸→▶ 会让 gate 报告「刚被暂停过」，被误判成
+    // live resume 而跳过 checkpoint 续跑（实测 ui-46389：▶ 后永远没有
+    // 「从断点续跑」）。有存活 workflow 时孤儿判据不成立。
     let resumed_live = match h.try_controller() {
-        Some(controller) => is_live_session_resume(controller.resume_session().await),
+        Some(controller) => {
+            let outcome = controller.resume_session().await;
+            let orphaned = !controller.has_active_workflow()
+                && !outcome.driver_resumed
+                && crate::sessions::interrupted_workflow_from_log(&h.event_log).is_some();
+            is_live_session_resume(outcome) && !orphaned
+        }
         None => false,
     };
     if resumed_live {
@@ -5160,6 +5171,30 @@ mod workflow_resume_tests {
         assert!(
             b.session_workflows.read().get(&sid).is_none(),
             "live 恢复只释放 gate，不该再起一份续跑"
+        );
+    }
+
+    /// 回归（ui-46389）：server 重启后旧 workflow 已消亡；用户在新进程里
+    /// ⏸→▶ 时 gate 报告「刚被暂停过」，不能因此判成 live 而跳过续跑。
+    #[tokio::test]
+    async fn chat_resume_session_cold_start_pause_then_resume_still_resumes_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-interrupted", "learn");
+        write_workflow(dir.path(), "learn");
+        let h = resolve_session(&b, Some(&sid)).unwrap();
+        h.event_log
+            .write()
+            .push(r#"{"type":"WorkflowStarted","name":"learn","wf_id":"wf-interrupted"}"#.into());
+        h.try_controller().expect("spawned").pause_session();
+
+        chat_resume_session(&b, Some(&sid))
+            .await
+            .expect("resume ok");
+        assert!(
+            b.session_workflows.read().contains_key(&sid),
+            "孤儿 workflow 必须从 checkpoint 拉起，不能被 gate 的「刚暂停过」吞掉"
         );
     }
 

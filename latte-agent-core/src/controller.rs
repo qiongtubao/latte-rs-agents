@@ -1347,6 +1347,10 @@ pub struct ChatController {
     /// 最近一次失败的 workflow 快照 —— UI-server 的
     /// `/api/workflows/resume` 直接读这个字段判断是否可续跑。
     last_failed_workflow: Arc<parking_lot::RwLock<Option<FailedWorkflow>>>,
+    /// 本进程内已 Started 未 Finished 的 workflow（wf_id 集合）。冷启动
+    /// 恢复的 session 里为空——用来区分「gate 只是被本进程新打开」与
+    /// 「真有 workflow 在等这个 gate 放行」。
+    active_workflows: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     /// Session-level 暂停门（用户按 ⏸ 触发）。`Arc` 让 main driver
     /// + delegate 出去的 specialist 共享同一个 gate —— 用户暂停时
     /// 全部一起冻结。
@@ -1402,6 +1406,7 @@ impl ChatController {
             goal_state: crate::goal::new_shared_goal(),
             advisor_pause: AdvisorPauseGate::new(),
             last_failed_workflow: Arc::new(parking_lot::RwLock::new(None)),
+            active_workflows: Arc::new(parking_lot::Mutex::new(Default::default())),
             agent_pause_gate,
             last_config: tokio::sync::Mutex::new(None),
         }
@@ -1439,6 +1444,7 @@ impl ChatController {
         // 内部订阅者：跟踪 WorkflowFinished 事件，维护
         // last_failed_workflow 状态。
         let state_slot = self.last_failed_workflow.clone();
+        let active_slot = self.active_workflows.clone();
         let mut state_rx = self.event_tx.subscribe();
         tokio::spawn(async move {
             loop {
@@ -1451,6 +1457,15 @@ impl ChatController {
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 };
+                match &ev {
+                    ChatEvent::WorkflowStarted { wf_id, .. } if !wf_id.is_empty() => {
+                        active_slot.lock().insert(wf_id.clone());
+                    }
+                    ChatEvent::WorkflowFinished { wf_id, .. } => {
+                        active_slot.lock().remove(wf_id);
+                    }
+                    _ => {}
+                }
                 if let ChatEvent::WorkflowFinished {
                     name,
                     wf_id,
@@ -1728,6 +1743,12 @@ impl ChatController {
     /// 直接读这个字段判断"该不该续跑"，不扫 event_log。
     pub fn last_failed_workflow(&self) -> Option<FailedWorkflow> {
         self.last_failed_workflow.read().clone()
+    }
+
+    /// 本进程内是否有 workflow 正在运行（Started 未 Finished）。
+    /// 冷启动恢复的 session 恒为 false：旧进程的 workflow task 已消亡。
+    pub fn has_active_workflow(&self) -> bool {
+        !self.active_workflows.lock().is_empty()
     }
 
     /// 直接写入"最近失败 workflow"快照 —— 仅供恢复路径（cold-start
