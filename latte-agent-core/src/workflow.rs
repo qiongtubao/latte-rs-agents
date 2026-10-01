@@ -3551,7 +3551,7 @@ fn ledger_has_progress(ledger: &serde_json::Value) -> bool {
 
 /// 取快照时同时落盘 `ledger.prev.json`：plan 写坏 ledger.json 后进程崩溃，
 /// 下次快照从备份读，进度不会丢。备份在合并成功或回滚后删除。
-fn snapshot_learn_ledgers(cwd: &Path) -> Vec<LedgerSnapshot> {
+fn snapshot_learn_ledgers(cwd: &Path, skip: &[String]) -> Vec<LedgerSnapshot> {
     let root = cwd.join(".latte").join("learn");
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
@@ -3559,7 +3559,7 @@ fn snapshot_learn_ledgers(cwd: &Path) -> Vec<LedgerSnapshot> {
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let dir = entry.path();
-        if !dir.is_dir() {
+        if !dir.is_dir() || skip.iter().any(|s| *s == *entry.file_name().to_string_lossy()) {
             continue;
         }
         let Ok(plan) = read_learn_json(&dir.join("plan.json")) else {
@@ -3687,21 +3687,168 @@ fn write_ledger_file(path: &Path, ledger: &serde_json::Value) -> Result<(), Stri
     .map_err(|e| e.to_string())
 }
 
+const LEARN_LOCK: &str = "session.lock";
+
+/// 一个主题（`.latte/learn/<slug>/`）同一时间只归一个学习流程。会话的
+/// worktree 都把 `.latte` 软链回项目，两个会话学同一主题会互相覆盖
+/// plan.json / ledger.json / 章节。用 OS 文件锁：进程崩溃时自动释放，
+/// 不会留下需要手工清理的死锁。
+struct LearnTopicLock {
+    slug: String,
+    _file: std::fs::File,
+}
+
+impl LearnTopicLock {
+    fn acquire(cwd: &Path, slug: &str, holder: &str) -> Result<Self, String> {
+        use std::io::{Read, Seek, Write};
+        let dir = cwd.join(".latte").join("learn").join(slug);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("建 {} 失败：{e}", dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LEARN_LOCK))
+            .map_err(|e| format!("打开学习锁失败：{e}"))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut owner = String::new();
+                let _ = file.read_to_string(&mut owner);
+                let owner = owner.trim();
+                let owner = if owner.is_empty() { "另一个会话" } else { owner };
+                return Err(format!(
+                    "主题「{slug}」正在{owner}中学习。同一主题同时只能由一个会话学习，\
+                     请回到那个会话继续，或等它结束后再开始。"
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("学习锁加锁失败：{e}"));
+            }
+        }
+        let _ = file.set_len(0);
+        let _ = file.rewind();
+        let _ = file.write_all(holder.as_bytes());
+        Ok(Self {
+            slug: slug.to_string(),
+            _file: file,
+        })
+    }
+
+    /// 别的流程正持有这个主题的锁。
+    fn held_elsewhere(dir: &Path) -> bool {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(LEARN_LOCK))
+        else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    }
+}
+
+fn learn_lock_holder(ctx: &WorkflowRunContext) -> String {
+    match ctx.session_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(sid) => format!("会话 {sid}"),
+        None => "另一个会话".into(),
+    }
+}
+
+/// 已经有 slug 却还没持锁（续跑跳过了 plan）时补锁。
+fn ensure_learn_lock(
+    lock: &mut Option<LearnTopicLock>,
+    vars: &HashMap<String, String>,
+    ctx: &WorkflowRunContext,
+) -> Result<(), String> {
+    let slug = vars.get("plan_out").map_or("", |s| s.trim());
+    if !learn_slug_ok(slug) || lock.as_ref().is_some_and(|l| l.slug == slug) {
+        return Ok(());
+    }
+    *lock = Some(LearnTopicLock::acquire(&ctx.cwd, slug, &learn_lock_holder(ctx))?);
+    Ok(())
+}
+
 /// plan 步期间的账本快照。合并成功后 `disarm`；plan 没走到合并就退出
 /// （校验重试耗尽、取消、speaker 失败）时，drop 把旧账本写回。
 struct LedgerRestoreGuard {
     cwd: PathBuf,
     snaps: Vec<LedgerSnapshot>,
+    /// 正被别的会话学习的主题：plan 开跑前的 plan.json / ledger.json 原文。
+    /// 本次 plan 选中这些主题时据此原样还原，别人的进度不能被覆盖。
+    locked: Vec<LockedTopic>,
     armed: bool,
 }
 
+struct LockedTopic {
+    slug: String,
+    topic: String,
+    files: Vec<(&'static str, Option<Vec<u8>>)>,
+}
+
 impl LedgerRestoreGuard {
-    fn take(cwd: &Path) -> Self {
+    /// `own`：本 run 自己持有的主题，它的锁不算别人的。
+    fn take(cwd: &Path, own: Option<&str>) -> Self {
+        let mut locked = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(cwd.join(".latte").join("learn")) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir()
+                    || own.is_some_and(|s| *s == *entry.file_name().to_string_lossy())
+                    || !LearnTopicLock::held_elsewhere(&dir)
+                {
+                    continue;
+                }
+                let topic = read_learn_json(&dir.join("plan.json"))
+                    .ok()
+                    .and_then(|p| p["topic"].as_str().map(|s| s.trim().to_string()))
+                    .unwrap_or_default();
+                let files = ["plan.json", "ledger.json"]
+                    .into_iter()
+                    .map(|name| (name, std::fs::read(dir.join(name)).ok()))
+                    .collect();
+                locked.push(LockedTopic {
+                    slug: entry.file_name().to_string_lossy().to_string(),
+                    topic,
+                    files,
+                });
+            }
+        }
+        let skip: Vec<String> = locked.iter().map(|t| t.slug.clone()).collect();
         Self {
             cwd: cwd.to_path_buf(),
-            snaps: snapshot_learn_ledgers(cwd),
+            snaps: snapshot_learn_ledgers(cwd, &skip),
+            locked,
             armed: true,
         }
+    }
+
+    /// 同一主题文字正被别的会话学习：plan 开跑前就该拦下，不让模型去写。
+    fn locked_slug_for_topic(&self, topic: &str) -> Option<&str> {
+        let topic = topic.trim();
+        self.locked
+            .iter()
+            .find(|t| !topic.is_empty() && t.topic == topic)
+            .map(|t| t.slug.as_str())
+    }
+
+    /// 本次 plan 撞上别人正在学的主题：把它写过的文件还原成开跑前的原文。
+    /// 守卫随之解除，drop 不再按快照回写这个主题的账本。
+    fn restore_locked(&mut self, slug: &str) {
+        let base = self.cwd.join(".latte").join("learn").join(slug);
+        if let Some(t) = self.locked.iter().find(|t| t.slug == slug) {
+            for (name, raw) in &t.files {
+                match raw {
+                    Some(bytes) => {
+                        let _ = std::fs::write(base.join(name), bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(base.join(name));
+                    }
+                }
+            }
+        }
+        self.snaps.retain(|s| s.slug != slug);
     }
 
     fn disarm(&mut self) {
@@ -7032,6 +7179,9 @@ async fn run_workflow_serial(
         }
     }
 
+    // learn_loop：本次学习独占的主题，持有到整个 run 结束。
+    let mut learn_lock: Option<LearnTopicLock> = None;
+
     for round in 0..wf.effective_max_rounds() {
         // 跨 step 循环（loop_until）的每轮状态：迭代计数按 loop_until
         // 所在 step 的完成次数计（key = step 下标）；pending_feedback
@@ -7047,6 +7197,11 @@ async fn run_workflow_serial(
         let mut idx = 0;
         while idx < wf.steps.len() {
             let step = &wf.steps[idx];
+            if wf.name == "learn_loop" {
+                if let Err(e) = ensure_learn_lock(&mut learn_lock, &vars, ctx) {
+                    return WfOutcome::Failed(format!("step '{}': {e}", step.id));
+                }
+            }
             if wf.name == "learn_loop"
                 && matches!(
                     step.id.as_str(),
@@ -7279,7 +7434,18 @@ async fn run_workflow_serial(
             // plan 会在本次调用里 write 覆盖 ledger.json。快照必须取在
             // speaker 之前，成功后再按知识点 id 把进度合并回去。
             let mut ledger_guard = (wf.name == "learn_loop" && step.id == "plan")
-                .then(|| LedgerRestoreGuard::take(&ctx.cwd));
+                .then(|| {
+                    LedgerRestoreGuard::take(&ctx.cwd, learn_lock.as_ref().map(|l| l.slug.as_str()))
+                });
+            if let Some(slug) = ledger_guard
+                .as_ref()
+                .and_then(|g| g.locked_slug_for_topic(topic))
+            {
+                match LearnTopicLock::acquire(&ctx.cwd, slug, &learn_lock_holder(ctx)) {
+                    Ok(lock) => learn_lock = Some(lock),
+                    Err(e) => return WfOutcome::Failed(format!("step 'plan': {e}")),
+                }
+            }
             // sync_code 会 edit 真实源文件：开跑前留原文，改出注释以外的变化就还原。
             let sync_baseline = (wf.name == "learn_loop" && step.id == "sync_code").then(|| {
                 SyncCodeBaseline::take(
@@ -7727,6 +7893,16 @@ async fn run_workflow_serial(
             // 产出，所以既有 workflow 的下游输入不变。
             last_output = aggregate_step_output(&speaker_outputs);
             if let Some(guard) = ledger_guard.as_mut() {
+                let slug = last_output.trim();
+                if learn_slug_ok(slug) && learn_lock.as_ref().is_none_or(|l| l.slug != slug) {
+                    match LearnTopicLock::acquire(&ctx.cwd, slug, &learn_lock_holder(ctx)) {
+                        Ok(lock) => learn_lock = Some(lock),
+                        Err(e) => {
+                            guard.restore_locked(slug);
+                            return WfOutcome::Failed(format!("step 'plan': {e}"));
+                        }
+                    }
+                }
                 match apply_ledger_merge(&ctx.cwd, last_output.trim(), &guard.snaps) {
                     Ok(merged) => {
                         guard.disarm();
@@ -18400,6 +18576,138 @@ task = "输出掌握报告"
         assert!(validate_learn_plan(dir.path(), "../own").is_err());
     }
 
+    #[test]
+    fn learn_topic_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = LearnTopicLock::acquire(dir.path(), "own", "会话 A").expect("A 先拿到");
+        let err = LearnTopicLock::acquire(dir.path(), "own", "会话 B")
+            .err()
+            .expect("同一主题不能再锁");
+        assert!(err.contains("会话 A") && err.contains("own"), "{err}");
+        LearnTopicLock::acquire(dir.path(), "borrow", "会话 B").expect("别的主题不受影响");
+        assert!(LearnTopicLock::held_elsewhere(
+            &dir.path().join(".latte/learn/own")
+        ));
+
+        // 续跑跳过 plan：已有 slug 时补锁，撞上别人照样拒绝。
+        let vars = HashMap::from([("plan_out".to_string(), "own".to_string())]);
+        let mut held = None;
+        let (event_tx, _rx) = broadcast::channel(1);
+        let ctx = lock_test_ctx(dir.path(), event_tx);
+        assert!(ensure_learn_lock(&mut held, &vars, &ctx).is_err());
+
+        drop(a);
+        ensure_learn_lock(&mut held, &vars, &ctx).expect("A 结束后 B 能接着学");
+        assert_eq!(held.as_ref().map(|l| l.slug.as_str()), Some("own"));
+    }
+
+    fn lock_test_ctx(
+        cwd: &std::path::Path,
+        event_tx: broadcast::Sender<ChatEvent>,
+    ) -> WorkflowRunContext {
+        let config = test_config_at("http://127.0.0.1:9");
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: cwd.to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: Some("B".into()),
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        }
+    }
+
+    /// 会话 A 正在学 own。会话 B 发起学习，plan 撞上同一主题：B 失败并
+    /// 点名 A，A 的 plan.json / ledger.json 一个字节都不能变。
+    async fn run_plan_against_locked_topic(topic: &str) -> (String, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+        write_learn_plan(dir.path(), serde_json::json!([good_point()]));
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::write(
+            base.join("ledger.json"),
+            r#"{"slug":"own","round":2,"knowledge_points":[{"id":"k1","title":"所有权","wrong":1,"passed":true}],"supplements":[]}"#,
+        )
+        .unwrap();
+        let plan_before = std::fs::read(base.join("plan.json")).unwrap();
+        let ledger_before = std::fs::read(base.join("ledger.json")).unwrap();
+        let _a = LearnTopicLock::acquire(dir.path(), "own", "会话 A").unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let fixed_cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut point = good_point();
+                point["title"] = serde_json::json!("B 改写的标题");
+                write_learn_plan(&fixed_cwd, serde_json::json!([point]));
+                std::fs::write(
+                    fixed_cwd.join(".latte/learn/own/ledger.json"),
+                    r#"{"slug":"own","round":0,"knowledge_points":[],"supplements":[]}"#,
+                )
+                .unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("own"))
+            })
+            .mount(&server)
+            .await;
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "plan"
+role = "tutor"
+task = "PLAN_STEP {{topic}}"
+output_key = "plan_out"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let (event_tx, _rx) = broadcast::channel(16);
+        let mut ctx = lock_test_ctx(dir.path(), event_tx);
+        let config = test_config_at(&server.uri());
+        ctx.resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        ctx.merged = config;
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, topic, &ctx),
+        )
+        .await
+        .expect("workflow 不应卡死")
+        .expect_err("撞上别人正在学的主题必须失败");
+        assert_eq!(std::fs::read(base.join("plan.json")).unwrap(), plan_before);
+        assert_eq!(std::fs::read(base.join("ledger.json")).unwrap(), ledger_before);
+        assert!(!base.join(LEDGER_BACKUP).exists(), "别人的目录里不留备份");
+        let requests = server.received_requests().await.unwrap().len();
+        (err.to_string(), requests)
+    }
+
+    #[tokio::test]
+    async fn learn_loop_same_topic_is_refused_before_plan_runs() {
+        let (err, requests) = run_plan_against_locked_topic("所有权").await;
+        assert!(err.contains("会话 A") && err.contains("own"), "{err}");
+        assert_eq!(requests, 0, "同一主题文字：不调模型，直接拒绝");
+    }
+
+    #[tokio::test]
+    async fn learn_loop_plan_landing_on_locked_slug_restores_files() {
+        let (err, requests) = run_plan_against_locked_topic("Rust 的所有权").await;
+        assert!(err.contains("会话 A") && err.contains("own"), "{err}");
+        assert_eq!(requests, 1, "主题文字不同：plan 跑完才知道撞上，写过的文件原样还原");
+    }
+
     /// 第一次 plan 写了不存在的证据：引擎把原因写回 prompt，只重试 plan 这一步。
     #[tokio::test]
     async fn learn_loop_plan_retries_until_evidence_is_real() {
@@ -19042,7 +19350,7 @@ max_retries = 2
         });
         std::fs::write(base.join("ledger.json"), old.to_string()).unwrap();
         {
-            let _guard = LedgerRestoreGuard::take(dir.path());
+            let _guard = LedgerRestoreGuard::take(dir.path(), None);
             assert!(base.join("ledger.prev.json").exists());
             std::fs::write(
                 base.join("ledger.json"),
@@ -19188,7 +19496,7 @@ id_key = "id"
             .unwrap(),
         )
         .unwrap();
-        let snaps = snapshot_learn_ledgers(dir.path());
+        let snaps = snapshot_learn_ledgers(dir.path(), &[]);
         assert_eq!(snaps.len(), 1);
 
         let fresh = dir.path().join(".latte").join("learn").join("own-v2");

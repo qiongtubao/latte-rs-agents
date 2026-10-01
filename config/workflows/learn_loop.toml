@@ -15,6 +15,8 @@
 #       .latte/learn/<slug>/draft.md（学习期间的活文档，逐轮演进）
 #       .latte/learn/<slug>/code/（注释版代码副本 + README 索引）
 #       docs/learn/<slug>.md（merge 步定稿的最终交付文档）
+#       .latte/learn/<slug>/session.lock（引擎持有：同一主题同时只归一个会话，
+#       另一个会话再学同一主题会被拒绝并点名正在学的会话）
 #
 # 设计文档：docs/learn-loop-doc-driven-design.md
 #
