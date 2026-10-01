@@ -42,6 +42,8 @@ export interface SessionInfo {
   available_roles: RoleInfo[];
   /** true when the user pressed ⏸ and the session is frozen. */
   is_paused: boolean;
+  /** true when this process still has a workflow running on the session. */
+  workflow_active?: boolean;
 }
 
 

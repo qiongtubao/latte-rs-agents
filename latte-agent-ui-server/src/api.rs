@@ -87,6 +87,11 @@ pub struct SessionInfo {
     /// true = 当前 session 处于用户按 ⏸ 的暂停状态。
     #[serde(default)]
     pub is_paused: bool,
+    /// true = 本进程里这个 session 正有一条 workflow 在跑。
+    /// 刷新页面时历史里会留下「有 Started 无 Finished」，前端靠这个
+    /// 区分「还在跑」和「进程死了该点继续」。
+    #[serde(default)]
+    pub workflow_active: bool,
 }
 
 /// 侧栏轻量条目 — `GET /api/sessions` 返回，也内嵌在 [`SessionInfo`]。
@@ -220,6 +225,7 @@ async fn create_session_with_id(
         }],
         available_roles: build_role_info(&b.merged.read()),
         is_paused: false,
+        workflow_active: false,
     };
     b.sessions.write().insert(h.session_id.clone(), h);
     Ok(resp)
@@ -314,6 +320,7 @@ pub async fn fork_session(
             .try_controller()
             .map(|c| c.is_session_paused())
             .unwrap_or(false),
+        workflow_active: false,
     };
     b.sessions.write().insert(h.session_id.clone(), h);
     Ok(resp)
@@ -376,7 +383,15 @@ pub fn get_session(b: &UiBackend, id: &str) -> Result<SessionInfo, ApiError> {
             .try_controller()
             .map(|c| c.is_session_paused())
             .unwrap_or(false),
+        workflow_active: session_workflow_active(b, id),
     })
+}
+
+fn session_workflow_active(b: &UiBackend, session_id: &str) -> bool {
+    b.session_workflows
+        .read()
+        .get(session_id)
+        .is_some_and(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// `GET /api/session/history?id=...` — 回放归档的 ChatEvent 前端 JSON
@@ -459,10 +474,35 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
 /// 必须是 RAII 而不是「await 之后 remove」：workflow 执行链上任意
 /// panic 都会 unwind 跳过手写的 remove，留下 `flag=false` 的僵尸条目，
 /// 而 409 的判据正是 `!flag.load()` —— 该 session 之后所有续跑永远 409。
-struct SessionWorkflowGuard {
+pub(crate) struct SessionWorkflowGuard {
     runs: Arc<parking_lot::RwLock<std::collections::HashMap<String, Arc<AtomicBool>>>>,
     session_id: String,
     owner: Arc<AtomicBool>,
+}
+
+/// 把正在跑的 workflow 登记到 session 的 at-most-one 表。
+/// 看板派发与断点续跑共用这张表：活着的登记让续跑 409，避免刷新后
+/// 点「继续」再拉起一条并行流水线。
+pub(crate) fn hold_session_workflow(
+    b: &UiBackend,
+    session_id: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<SessionWorkflowGuard, ApiError> {
+    let mut runs = b.session_workflows.write();
+    if let Some(flag) = runs.get(session_id) {
+        if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(ApiError {
+                status: 409,
+                message: "a workflow is already running on this session".into(),
+            });
+        }
+    }
+    runs.insert(session_id.to_string(), cancel.clone());
+    Ok(SessionWorkflowGuard {
+        runs: b.session_workflows.clone(),
+        session_id: session_id.to_string(),
+        owner: cancel,
+    })
 }
 
 impl Drop for SessionWorkflowGuard {
@@ -1786,11 +1826,7 @@ pub async fn chat_resume_session(b: &UiBackend, session_id: Option<&str>) -> Res
                 .map(|failed| failed.wf_id)
         });
     if let Some(wf_id) = resumable_wf_id {
-        match spawn_workflow_resume(b, &h.session_id, Some(wf_id), None).await {
-            Ok(_) => {}
-            Err(e) if e.status == 404 || e.status == 409 => {}
-            Err(e) => return Err(e),
-        }
+        spawn_workflow_resume(b, &h.session_id, Some(wf_id), None).await?;
     }
     Ok(())
 }
@@ -2398,7 +2434,9 @@ async fn spawn_workflow_resume(
         merged: merged_cfg,
         resolver: b.resolver.clone(),
         default_params: GenerateParams::default(),
-        cwd: b.cwd.clone(),
+        // 续跑必须落在这个 session 自己的工作空间（git worktree），
+        // 不能退回项目根。`.latte` 是指回主仓的软链，断点文件两边都能读到。
+        cwd: h.agent_cwd(),
         event_tx: controller.event_sender(),
         cancel_flag: cancel,
         // step 已无硬超时，必须给用户留 per-turn 逃生口：点「终止当前
@@ -5041,6 +5079,65 @@ mod workflow_resume_tests {
         );
     }
 
+    /// 续跑的工具 cwd 是 session 工作空间，不是 UI 的项目根。
+    /// 断点仍从项目 `.latte` 读取（工作空间里的 `.latte` 是指回那里的软链）。
+    #[tokio::test]
+    async fn resume_writes_checkpoint_into_session_workspace() {
+        let project = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let b = make_backend(project.path());
+        write_checkpoint(project.path(), "wf-a", "learn");
+        write_workflow(project.path(), "learn");
+        // 工作空间没有软链时，续跑读的是自己的 `.latte`。把同一份断点放进去，
+        // 才能区分「写进工作空间」和「写回项目根」。
+        write_checkpoint(workspace.path(), "wf-a", "learn");
+        let h = crate::sessions::create_session_handle(
+            "ui-ws".into(),
+            "manager",
+            &b.merged,
+            &b.resolver,
+            project.path(),
+            Some(workspace.path()),
+            None,
+            None,
+            &b.subsession_store,
+        )
+        .await
+        .expect("session");
+        b.sessions
+            .write()
+            .insert("ui-ws".into(), std::sync::Arc::new(h));
+        workflow_resume(
+            &b,
+            WorkflowResumeRequest {
+                session_id: "ui-ws".into(),
+                wf_id: Some("wf-a".into()),
+                topic: None,
+            },
+        )
+        .await
+        .expect("resume should start");
+
+        let runs = workspace.path().join(".latte/workflow-runs");
+        let mut saw_new = false;
+        for _ in 0..50 {
+            if let Ok(rd) = std::fs::read_dir(&runs) {
+                saw_new = rd
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy() != "wf-a.jsonl");
+                if saw_new {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_new,
+            "新的 checkpoint 应出现在 session 工作空间 {}，而不是项目根",
+            runs.display()
+        );
+    }
+
     /// wf_id 缺省 → 回退到 controller 的 last_failed_workflow 快照。
     #[tokio::test]
     async fn resume_falls_back_to_last_failed_snapshot() {
@@ -5196,6 +5293,34 @@ mod workflow_resume_tests {
             b.session_workflows.read().contains_key(&sid),
             "孤儿 workflow 必须从 checkpoint 拉起，不能被 gate 的「刚暂停过」吞掉"
         );
+    }
+
+    /// 本进程里这条 session 已经有 workflow 在跑：▶ 必须 409，
+    /// 不能吞掉后再起一条并行流水线。
+    #[tokio::test]
+    async fn chat_resume_session_live_workflow_returns_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = make_backend(dir.path());
+        let sid = add_session(&b, "ui-s1").await;
+        write_checkpoint(dir.path(), "wf-live", "learn");
+        write_workflow(dir.path(), "learn");
+        let flag = Arc::new(AtomicBool::new(false));
+        b.session_workflows
+            .write()
+            .insert(sid.clone(), flag);
+        let h = resolve_session(&b, Some(&sid)).unwrap();
+        h.try_controller()
+            .expect("spawned")
+            .set_last_failed_workflow(latte_agent_core::controller::FailedWorkflow {
+                name: "learn".into(),
+                wf_id: "wf-live".into(),
+                summary: String::new(),
+                failed_at_unix_ms: 0,
+            });
+        let err = chat_resume_session(&b, Some(&sid))
+            .await
+            .expect_err("live run 应 409");
+        assert_eq!(err.status, 409);
     }
 
     /// chat_abort 连带取消该 session 事件流上的 workflow：flag 置位 +

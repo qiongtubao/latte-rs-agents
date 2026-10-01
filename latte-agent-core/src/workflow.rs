@@ -2594,6 +2594,9 @@ fn run_nested_workflow(
                     Ok(state) if state.workflow_name == name => Some(old_id),
                     _ => None,
                 }
+            })
+            .or_else(|| {
+                find_incomplete_nested_run(&ctx.cwd, ctx.session_id.as_deref(), &name)
             });
         if let Some(rid) = &resume_nested {
             let _ = ctx.event_tx.send(ChatEvent::Status {
@@ -2719,6 +2722,17 @@ enum CheckpointRecord {
         answer: String,
         answered_at: u64,
     },
+    /// 扇出的单个元素完成。整步 `Step` 要等全部元素结束才写；进程在波次
+    /// 中途死掉时，靠这一行让 resume 跳过已经写完的元素。
+    FanOutItem {
+        wf_id: String,
+        workflow_name: String,
+        topic: String,
+        step_id: String,
+        item_id: String,
+        output: String,
+        finished_at: u64,
+    },
 }
 
 fn now_secs() -> u64 {
@@ -2802,6 +2816,12 @@ pub struct CheckpointState {
     /// 上一次运行里用户已经回答过的问题：question → answer。
     /// resume 时预载进 [`AnswerLog`]，同一个问题不再弹给用户。
     answers: std::collections::HashMap<String, String>,
+    /// 扇出 step → 已完成元素 `(item_id, output)`，按完成顺序。同一
+    /// item 后写覆盖。step 本身不因此算完成。
+    fan_out: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Meta 里的 session。旧文件没有这一栏。
+    session_id: Option<String>,
+    started_at: u64,
 }
 
 impl CheckpointState {
@@ -2828,9 +2848,11 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
             path.display()
         )
     })?;
-    let mut meta: Option<(String, String)> = None;
+    let mut meta: Option<(String, String, Option<String>, u64)> = None;
     let mut completed = Vec::new();
     let mut answers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut fan_out: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
     for (lineno, line) in raw.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -2846,10 +2868,12 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
             CheckpointRecord::Meta {
                 workflow_name,
                 topic,
+                session_id,
+                started_at,
                 ..
             } => {
                 if meta.is_none() {
-                    meta = Some((workflow_name, topic));
+                    meta = Some((workflow_name, topic, session_id, started_at));
                 }
             }
             CheckpointRecord::Step {
@@ -2867,16 +2891,88 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
                 // 的回答。
                 answers.insert(question, answer);
             }
+            CheckpointRecord::FanOutItem {
+                step_id,
+                item_id,
+                output,
+                ..
+            } => {
+                let slot = fan_out.entry(step_id).or_default();
+                if let Some(existing) = slot.iter_mut().find(|(id, _)| id == &item_id) {
+                    existing.1 = output;
+                } else {
+                    slot.push((item_id, output));
+                }
+            }
         }
     }
-    let (workflow_name, topic) =
+    let (workflow_name, topic, session_id, started_at) =
         meta.ok_or_else(|| format!("checkpoint '{wf_id}' has no meta line (corrupt?)"))?;
     Ok(CheckpointState {
         workflow_name,
         topic,
         completed,
         answers,
+        fan_out,
+        session_id,
+        started_at,
     })
+}
+
+/// journal 丢失时，按 session + 子 workflow 名找回还没跑完的嵌套 run。
+/// 不认别的 session 的断点（`.latte` 是软链，多会话共享同一目录）。
+fn find_incomplete_nested_run(
+    cwd: &Path,
+    session_id: Option<&str>,
+    workflow_name: &str,
+) -> Option<String> {
+    let sid = session_id.filter(|s| !s.is_empty())?;
+    let Ok(rd) = std::fs::read_dir(checkpoint_dir(cwd)) else {
+        return None;
+    };
+    let expected: Option<Vec<String>> = load_workflow(workflow_name, cwd)
+        .ok()
+        .map(|wf| wf.steps.iter().map(|s| s.id.clone()).collect());
+    let mut best: Option<(u64, String)> = None;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
+            continue;
+        };
+        let Ok(state) = load_checkpoint(cwd, &id) else {
+            continue;
+        };
+        if state.workflow_name != workflow_name {
+            continue;
+        }
+        match state.session_id.as_deref() {
+            Some(got) if got == sid => {}
+            None => {}
+            Some(_) => continue,
+        }
+        let done: std::collections::HashSet<&str> = state
+            .completed
+            .iter()
+            .map(|(step, _, _)| step.as_str())
+            .collect();
+        let incomplete = match &expected {
+            Some(steps) => {
+                steps.iter().any(|s| !done.contains(s.as_str()))
+                    || state.fan_out.keys().any(|k| !done.contains(k.as_str()))
+            }
+            None => true,
+        };
+        if !incomplete {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(t, _)| state.started_at >= *t) {
+            best = Some((state.started_at, id));
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 /// 用户回答的持久化台账：收到即落盘，同一问题再问直接回放。
@@ -3082,6 +3178,23 @@ impl CheckpointLog {
         self.completed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// 扇出元素单独落盘，不计入「已完成 step」——step 仍等整波收齐。
+    fn record_fan_out_item(&self, step_id: &str, item_id: &str, output: &str) {
+        append_checkpoint(
+            &self.cwd,
+            &self.wf_id,
+            &CheckpointRecord::FanOutItem {
+                wf_id: self.wf_id.clone(),
+                workflow_name: self.workflow_name.clone(),
+                topic: self.topic.clone(),
+                step_id: step_id.to_string(),
+                item_id: item_id.to_string(),
+                output: output.to_string(),
+                finished_at: now_secs(),
+            },
+        );
+    }
+
     fn completed(&self) -> usize {
         self.completed.load(Ordering::Relaxed)
     }
@@ -3146,10 +3259,9 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
     if !plan_path.is_file() {
         return Ok(false);
     }
-    let plan: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&plan_path).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let plan: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
 
     let mut combined = String::new();
 
@@ -3172,22 +3284,20 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
                     Some(direct)
                 } else {
                     // 支持命名格式：01_k1.md, k1.md, k1_xxx.md
-                    std::fs::read_dir(&sections_dir)
-                        .ok()
-                        .and_then(|entries| {
-                            entries.flatten().find_map(|e| {
-                                let path = e.path();
-                                let stem = path.file_stem()?.to_str()?;
-                                if stem == id
-                                    || stem.ends_with(&format!("_{id}"))
-                                    || stem.starts_with(&format!("{id}_"))
-                                {
-                                    Some(path)
-                                } else {
-                                    None
-                                }
-                            })
+                    std::fs::read_dir(&sections_dir).ok().and_then(|entries| {
+                        entries.flatten().find_map(|e| {
+                            let path = e.path();
+                            let stem = path.file_stem()?.to_str()?;
+                            if stem == id
+                                || stem.ends_with(&format!("_{id}"))
+                                || stem.starts_with(&format!("{id}_"))
+                            {
+                                Some(path)
+                            } else {
+                                None
+                            }
                         })
+                    })
                 };
                 if let Some(p) = cand {
                     if let Ok(sec_text) = std::fs::read_to_string(&p) {
@@ -3820,6 +3930,23 @@ async fn run_workflow_inner(
                 },
             );
         }
+        for (step_id, items) in &state.fan_out {
+            for (item_id, output) in items {
+                append_checkpoint(
+                    &ctx.cwd,
+                    &wf_id,
+                    &CheckpointRecord::FanOutItem {
+                        wf_id: wf_id.clone(),
+                        workflow_name: name.clone(),
+                        topic: topic.clone(),
+                        step_id: step_id.clone(),
+                        item_id: item_id.clone(),
+                        output: output.clone(),
+                        finished_at: now_secs(),
+                    },
+                );
+            }
+        }
         let _ = ctx.event_tx.send(ChatEvent::Status {
             message: format!(
                 "workflow '{name}' 从断点续跑（checkpoint {}）：跳过已完成的 {} 步",
@@ -4212,7 +4339,6 @@ fn wrap_read_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[S
     tm.register(wrapped, None);
 }
 
-
 /// 动态 prompt 预算的下限（估算 token）。窗口再小也不低于它——否则小窗口
 /// 模型会把预算压到几 K，一份正常文档都读不完。
 pub(crate) const PROMPT_BUDGET_FLOOR: usize = 16_384;
@@ -4257,8 +4383,8 @@ pub(crate) fn resolve_prompt_budget(
     model_window: u32,
 ) -> Option<usize> {
     let absolute = absolute.filter(|b| *b > 0);
-    let ratio =
-        ratio.or_else(|| context_overflow_restart.then_some(crate::compaction::DEFAULT_THRESHOLD_RATIO));
+    let ratio = ratio
+        .or_else(|| context_overflow_restart.then_some(crate::compaction::DEFAULT_THRESHOLD_RATIO));
     let Some(ratio) = ratio else {
         return absolute;
     };
@@ -4278,10 +4404,7 @@ pub(crate) fn resolve_prompt_budget(
     let derived = (usable as f64 * ratio) as usize;
     let bounded = derived.clamp(
         budget_env_usize("LATTE_AGENT_PROMPT_BUDGET_FLOOR", PROMPT_BUDGET_FLOOR),
-        budget_env_usize(
-            "LATTE_AGENT_PROMPT_BUDGET_CEILING",
-            PROMPT_BUDGET_CEILING,
-        ),
+        budget_env_usize("LATTE_AGENT_PROMPT_BUDGET_CEILING", PROMPT_BUDGET_CEILING),
     );
     Some(match absolute {
         Some(fixed) => fixed.min(bounded),
@@ -4615,6 +4738,9 @@ struct SpeakerDispatch {
     /// 用户回答台账：阻塞 `ask` 收到答案即落盘，同一问题重试/resume
     /// 时直接回放，不再让用户重答一遍。
     answer_log: Arc<AnswerLog>,
+    /// 扇出元素 id。同一 step 的并发 writer 共用 step_id / speaker，
+    /// 进行中快照的 key 必须再带上它，否则各章互相覆盖。
+    fan_out_item: Option<String>,
     /// plan 工具的 PlanStage 句柄。`Some` 时由**引擎**持有（而不是
     /// `build_role_runner` 自建私有句柄），这样本次分派结束后引擎能读到
     /// 「plan 到底提交成功了没有」——`WorkflowStepDef::require_plan_submit`
@@ -4669,6 +4795,7 @@ impl SpeakerDispatch {
             step_has_output_contract: false,
             review_constraints: None,
             answer_log,
+            fan_out_item: None,
             // 默认不接管；需要 require_plan_submit 的 step 由引擎在
             // 构造后写入自己的句柄。
             plan_stage: None,
@@ -4971,15 +5098,20 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
     // step 进行中上下文落盘（见 crate::step_journal）：runner 在每个
     // 工具轮次边界把对话尾段写进 `<根 run>.inflight/live-step.<key>.json`；
     // 进程重启后 ▸ 续跑时，被中断的 step 从 `carry-step.<key>` 回灌这段
-    // 历史接着走，而不是从零重跑。key = `workflow名:step_id:speaker`，
-    // 与具体 wf_id 无关——resume 每次换 id，靠 adopt 把旧根的 carry 搬过来。
+    // 历史接着走，而不是从零重跑。key = `workflow名:step_id:speaker`
+    // （扇出再加 `:item_id`），与具体 wf_id 无关——resume 每次换 id，
+    // 靠 adopt 把旧根的 carry 搬过来。
     let journal_root = inp.answer_log.resume_wf_id().to_string();
-    let journal_key = format!(
+    let mut journal_key = format!(
         "{}:{}:{}",
         crate::step_journal::workflow_name_of(&inp.wf_id),
         inp.step_id,
         speaker
     );
+    if let Some(item) = &inp.fan_out_item {
+        journal_key.push(':');
+        journal_key.push_str(item);
+    }
     // 续跑回灌只在「本次分派的首个 runner」生效一次：读取即消费，且
     // prompt 必须逐字节一致——上游产出/返工反馈变了就作废从头跑。
     let mut carried_step =
@@ -6522,10 +6654,7 @@ async fn run_dag_step(
                 dispatch_budget: inp.dispatch_budget.clone(),
                 step_tools: step.tools.clone(),
                 read_path_allowlist: step.read_path_allowlist.clone(),
-                write_path_allowlist: render_scope_patterns(
-                    &step.write_path_allowlist,
-                    &inp.vars,
-                ),
+                write_path_allowlist: render_scope_patterns(&step.write_path_allowlist, &inp.vars),
                 prompt_token_budget: step.prompt_token_budget.filter(|budget| *budget > 0),
                 prompt_token_ratio: step.prompt_token_ratio,
                 context_overflow_restart: step.context_overflow_restart,
@@ -6533,6 +6662,10 @@ async fn run_dag_step(
                 step_has_output_contract: step_has_output_contract(step),
                 review_constraints: step_review_constraints(step),
                 answer_log: inp.answer_log.clone(),
+                fan_out_item: step
+                    .fan_out
+                    .as_ref()
+                    .and_then(|_| inp.vars.get("item_id").cloned()),
                 plan_stage: plan_stage.clone(),
             };
             let (mut response, tools_called) = match run_step_speaker(dispatch).await {
@@ -6810,8 +6943,10 @@ async fn run_workflow_dag(
                 Option<String>,
                 String,
                 std::collections::BTreeMap<String, String>,
+                String,
             );
             let mut set: JoinSet<Result<DagStepOk, StepFail>> = JoinSet::new();
+            let mut carried_fan_out: Vec<(usize, Option<String>, String)> = Vec::new();
             // fan_out step 下标 → 派发的元素个数；全部完成才记一次 checkpoint。
             let mut fan_out_expected: HashMap<usize, usize> = HashMap::new();
             let mut fan_out_got: HashMap<usize, Vec<String>> = HashMap::new();
@@ -6847,7 +6982,11 @@ async fn run_workflow_dag(
                 let item_vars: Vec<Option<(usize, String)>> = match &wf.steps[idx].fan_out {
                     None => vec![None],
                     Some(fo) => match load_fan_out_items(fo, &vars, &ctx.cwd) {
-                        Ok(ids) => ids.into_iter().enumerate().map(|(n, id)| Some((n + 1, id))).collect(),
+                        Ok(ids) => ids
+                            .into_iter()
+                            .enumerate()
+                            .map(|(n, id)| Some((n + 1, id)))
+                            .collect(),
                         Err(e) => {
                             set.abort_all();
                             return WfOutcome::Failed(format!(
@@ -6857,14 +6996,59 @@ async fn run_workflow_dag(
                         }
                     },
                 };
+                let prior_items: Vec<(String, String)> = if wf.steps[idx].fan_out.is_some() {
+                    resume
+                        .and_then(|s| s.fan_out.get(wf.steps[idx].id.as_str()))
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let pending_items: Vec<Option<(usize, String)>> = if prior_items.is_empty() {
+                    item_vars.clone()
+                } else {
+                    item_vars
+                        .iter()
+                        .filter(|item| match item {
+                            Some((_, id)) => !prior_items.iter().any(|(done, _)| done == id),
+                            None => true,
+                        })
+                        .cloned()
+                        .collect()
+                };
+                if wf.steps[idx].fan_out.is_some()
+                    && pending_items.is_empty()
+                    && !prior_items.is_empty()
+                {
+                    let joined = prior_items
+                        .iter()
+                        .map(|(_, output)| output.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let step = &wf.steps[idx];
+                    ckpt.record_step(&step.id, step.output_key.as_deref(), &joined);
+                    outputs.insert(step.id.clone(), joined.clone());
+                    carried_fan_out.push((idx, step.output_key.clone(), joined));
+                    continue;
+                }
                 if wf.steps[idx].fan_out.is_some() {
                     fan_out_expected.insert(idx, item_vars.len());
+                    if !prior_items.is_empty() {
+                        fan_out_got.insert(
+                            idx,
+                            prior_items
+                                .iter()
+                                .map(|(_, output)| output.clone())
+                                .collect(),
+                        );
+                    }
                     let _ = ctx.event_tx.send(ChatEvent::Status {
                         message: format!(
-                            "[workflow '{}'] step '{}' 扇出 {} 个任务（并发上限 {}，其余排队）",
+                            "[workflow '{}'] step '{}' 扇出 {} 个任务（已完成 {}，并发上限 {}，其余排队）",
                             wf.name,
                             wf.steps[idx].id,
-                            item_vars.len(),
+                            pending_items.len(),
+                            prior_items.len(),
                             workflow_concurrency()
                         ),
                     });
@@ -6874,7 +7058,7 @@ async fn run_workflow_dag(
                     .fan_out
                     .as_ref()
                     .is_some_and(|f| f.tolerate_failures);
-                for item in item_vars {
+                for item in pending_items {
                     let item_label = item.as_ref().map(|(_, id)| id.clone()).unwrap_or_default();
                     let mut step_vars = vars.clone();
                     if let Some((n, id)) = &item {
@@ -6927,8 +7111,12 @@ async fn run_workflow_dag(
                                 output_key,
                                 format!("{FAN_OUT_ITEM_FAILED} {item_label}: {msg}"),
                                 std::collections::BTreeMap::new(),
+                                item_label,
                             )),
-                            other => other,
+                            Ok((step_idx, step_id, output_key, out, exported)) => {
+                                Ok((step_idx, step_id, output_key, out, exported, item_label))
+                            }
+                            Err(err) => Err(err),
                         }
                     });
                 }
@@ -6937,14 +7125,17 @@ async fn run_workflow_dag(
             // Collect the whole wave; merge outputs into `vars` only
             // after every step in the wave has finished (they were all
             // independent and read the same pre-wave snapshot).
-            let mut wave_results: Vec<(usize, Option<String>, String)> = Vec::new();
+            let mut wave_results: Vec<(usize, Option<String>, String)> = carried_fan_out;
             let mut wave_exports: std::collections::BTreeMap<String, String> =
                 std::collections::BTreeMap::new();
             while let Some(joined) = set.join_next().await {
                 match joined {
-                    Ok(Ok((step_idx, step_id, output_key, out, exported))) => {
+                    Ok(Ok((step_idx, step_id, output_key, out, exported, item_label))) => {
                         wave_exports.extend(exported);
                         if let Some(&expected) = fan_out_expected.get(&step_idx) {
+                            if !item_label.is_empty() {
+                                ckpt.record_fan_out_item(&step_id, &item_label, &out);
+                            }
                             let got = fan_out_got.entry(step_idx).or_default();
                             got.push(out);
                             if got.len() < expected {
@@ -12861,7 +13052,9 @@ task = "汇总"
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join(".latte/learn/demo");
         std::fs::create_dir_all(&base).unwrap();
-        let kps: Vec<_> = (1..=7).map(|i| serde_json::json!({"id": format!("k{i}")})).collect();
+        let kps: Vec<_> = (1..=7)
+            .map(|i| serde_json::json!({"id": format!("k{i}")}))
+            .collect();
         std::fs::write(
             base.join("plan.json"),
             serde_json::json!({"knowledge_points": kps}).to_string(),
@@ -12890,7 +13083,440 @@ task = "汇总"
             assert_eq!(n, 1, "k{i} 必须恰好派发一次");
         }
         assert_eq!(reqs.len(), 9, "prep + 7 章 + final");
-        assert!(bodies.last().unwrap().contains("汇总"), "final 在全部章节后运行");
+        assert!(
+            bodies.last().unwrap().contains("汇总"),
+            "final 在全部章节后运行"
+        );
+    }
+
+    /// 扇出中途被掐断时，已完成的元素写进 checkpoint；resume 只补没写完的。
+    #[tokio::test]
+    async fn fan_out_resume_skips_checkpointed_items() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "fan_partial"
+[[steps]]
+id = "prep"
+role = "worker"
+task = "准备"
+[[steps]]
+id = "each"
+role = "worker"
+depends_on = ["prep"]
+task = "写 ITEM={{item_id}}"
+[steps.fan_out]
+file = "plan.json"
+"#,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plan.json"),
+            serde_json::json!({"knowledge_points": [{"id": "k1"}, {"id": "k2"}]}).to_string(),
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("章节ok")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&wf, "slug=demo", &ctx)
+            .await
+            .expect("first run");
+
+        let runs = dir.path().join(".latte/workflow-runs");
+        let ckpt_path = std::fs::read_dir(&runs)
+            .unwrap()
+            .find_map(|e| e.ok().map(|e| e.path()))
+            .expect("checkpoint");
+        let raw = std::fs::read_to_string(&ckpt_path).unwrap();
+        assert!(
+            raw.lines().any(
+                |l| l.contains("\"type\":\"fan_out_item\"") && l.contains("\"item_id\":\"k1\"")
+            ),
+            "k1 完成时就该落 fan_out_item，而不是等整波结束: {raw}"
+        );
+        let wf_id = raw
+            .lines()
+            .next()
+            .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .and_then(|v| {
+                v.get("wf_id")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            })
+            .expect("meta wf_id");
+        // 模拟「k2 还没跑完进程就没了」：删掉 k2 的元素账和整步 Step。
+        let kept: Vec<_> = raw
+            .lines()
+            .filter(|l| {
+                if l.contains("\"step_id\":\"each\"") && l.contains("\"type\":\"step\"") {
+                    return false;
+                }
+                if l.contains("\"type\":\"fan_out_item\"") && l.contains("\"item_id\":\"k2\"") {
+                    return false;
+                }
+                true
+            })
+            .collect();
+        std::fs::write(&ckpt_path, format!("{}\n", kept.join("\n"))).unwrap();
+
+        let server2 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("补写ok")))
+            .mount(&server2)
+            .await;
+        let (ctx2, _rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
+        run_workflow_resume(&wf, "", &ctx2, &wf_id)
+            .await
+            .expect("resume");
+        let bodies: Vec<String> = server2
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let k1 = bodies.iter().filter(|b| b.contains("ITEM=k1")).count();
+        let k2 = bodies.iter().filter(|b| b.contains("ITEM=k2")).count();
+        assert_eq!(k1, 0, "k1 已记账，不应重跑: {bodies:?}");
+        assert_eq!(k2, 1, "只补 k2: {bodies:?}");
+    }
+
+    /// 扇出的并发 writer 各有一份进行中快照：同一 step 的 k1、k2 不能写进
+    /// 同一个 journal 文件互相覆盖，续跑时两章都要接着自己的对话走。
+    #[tokio::test]
+    async fn fan_out_items_keep_separate_step_journals() {
+        use latte_ai::models::Message;
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "fan_journal"
+[[steps]]
+id = "prep"
+role = "worker"
+task = "准备"
+[[steps]]
+id = "each"
+role = "worker"
+depends_on = ["prep"]
+task = "写 ITEM={{item_id}}"
+[steps.fan_out]
+file = "plan.json"
+"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::write(
+            cwd.join("plan.json"),
+            serde_json::json!({"knowledge_points": [{"id": "k1"}, {"id": "k2"}]}).to_string(),
+        )
+        .unwrap();
+        let old_wf_id = "wf-fan_journal-1000";
+        let runs = cwd.join(".latte/workflow-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let meta = serde_json::json!({
+            "type": "meta",
+            "wf_id": old_wf_id,
+            "workflow_name": "fan_journal",
+            "topic": "t",
+            "started_at": 1,
+        });
+        let prep = serde_json::json!({
+            "type": "step",
+            "wf_id": old_wf_id,
+            "workflow_name": "fan_journal",
+            "topic": "t",
+            "step_id": "prep",
+            "output": "准备好了",
+            "finished_at": 1,
+        });
+        std::fs::write(
+            runs.join(format!("{old_wf_id}.jsonl")),
+            format!("{meta}\n{prep}\n"),
+        )
+        .unwrap();
+        for item in ["k1", "k2"] {
+            crate::step_journal::save_step(
+                cwd,
+                old_wf_id,
+                &format!("fan_journal:each:worker:{item}"),
+                &crate::step_journal::SavedStep {
+                    prompt: format!("写 ITEM={item}"),
+                    messages: vec![
+                        Message::assistant_with_tool_calls(
+                            String::new(),
+                            vec![latte_ai::models::ToolCall {
+                                id: format!("call-{item}"),
+                                name: "read".to_string(),
+                                arguments: serde_json::json!({ "path": "a.c" }),
+                                arguments_raw: Some("{\"path\":\"a.c\"}".to_string()),
+                                arguments_parse_error: None,
+                            }],
+                        ),
+                        Message::tool_result(format!("call-{item}"), format!("读到了 {item}")),
+                    ],
+                    tool_count: 1,
+                    tool_summaries: vec![],
+                },
+            );
+        }
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("章节ok")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), cwd.to_path_buf());
+        run_workflow_resume(&wf, "", &ctx, old_wf_id)
+            .await
+            .expect("resume");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        for item in ["k1", "k2"] {
+            let b = bodies
+                .iter()
+                .find(|b| b.contains(&format!("ITEM={item}")))
+                .unwrap_or_else(|| panic!("{item} 应被派发: {bodies:?}"));
+            assert!(
+                b.contains(&format!("call-{item}")),
+                "{item} 应接着自己的进行中对话: {b}"
+            );
+        }
+    }
+
+    /// 父流程停在未完成的嵌套 step 时，resume 接着子流程的 checkpoint，
+    /// 不把子流程里已经跑完的 step 再跑一遍。
+    #[tokio::test]
+    async fn nested_resume_skips_completed_child_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte/workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("child.toml"),
+            r#"
+name = "child"
+[[steps]]
+id = "c1"
+role = "worker"
+task = "子步骤A"
+[[steps]]
+id = "c2"
+role = "worker"
+task = "子步骤B"
+"#,
+        )
+        .unwrap();
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "parent_resume"
+[[steps]]
+id = "nest"
+workflow = "child"
+"#,
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("子产出")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        run_workflow(&wf, "主题", &ctx).await.expect("first run");
+
+        let runs = dir.path().join(".latte/workflow-runs");
+        let mut parent_path = None;
+        let mut nested_id = None;
+        for ent in std::fs::read_dir(&runs).unwrap().flatten() {
+            if ent.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let text = std::fs::read_to_string(ent.path()).unwrap();
+            if text.contains("\"workflow_name\":\"parent_resume\"") {
+                parent_path = Some(ent.path());
+            } else if text.contains("\"workflow_name\":\"child\"") {
+                nested_id = ent
+                    .path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string);
+            }
+        }
+        let parent_path = parent_path.expect("parent checkpoint");
+        let nested_id = nested_id.expect("child checkpoint");
+        let nested_path = runs.join(format!("{nested_id}.jsonl"));
+        let nested_raw = std::fs::read_to_string(&nested_path).unwrap();
+        let nested_kept: Vec<_> = nested_raw
+            .lines()
+            .filter(|l| !(l.contains("\"type\":\"step\"") && l.contains("\"step_id\":\"c2\"")))
+            .collect();
+        std::fs::write(&nested_path, format!("{}\n", nested_kept.join("\n"))).unwrap();
+        let parent_raw = std::fs::read_to_string(&parent_path).unwrap();
+        let parent_wf_id =
+            serde_json::from_str::<serde_json::Value>(parent_raw.lines().next().unwrap())
+                .unwrap()
+                .get("wf_id")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+        let parent_kept: Vec<_> = parent_raw
+            .lines()
+            .filter(|l| !(l.contains("\"type\":\"step\"") && l.contains("\"step_id\":\"nest\"")))
+            .collect();
+        std::fs::write(&parent_path, format!("{}\n", parent_kept.join("\n"))).unwrap();
+        // 子流程成功收尾会摘掉 live-nested；中途被杀时它还在。
+        crate::step_journal::save_nested_link(
+            dir.path(),
+            &parent_wf_id,
+            "parent_resume:nest:child",
+            &nested_id,
+        );
+
+        let server2 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("补子产出")))
+            .mount(&server2)
+            .await;
+        let (ctx2, _rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
+        run_workflow_resume(&wf, "", &ctx2, &parent_wf_id)
+            .await
+            .expect("resume parent");
+        let bodies: Vec<String> = server2
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let a = bodies.iter().filter(|b| b.contains("子步骤A")).count();
+        let b = bodies.iter().filter(|b| b.contains("子步骤B")).count();
+        assert_eq!(a, 0, "子步骤 A 已完成，不应重跑: {bodies:?}");
+        assert_eq!(b, 1, "只补子步骤 B: {bodies:?}");
+    }
+
+    /// 历史 run / journal 丢失：父 checkpoint 没有 live-nested 链接时，
+    /// 仍应按 session + 子 workflow 名找回未完成的子断点，跳过已完成的子步。
+    #[tokio::test]
+    async fn nested_resume_recovers_child_without_journal_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf_dir = dir.path().join(".latte/workflows.d");
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("child.toml"),
+            r#"
+name = "child"
+[[steps]]
+id = "c1"
+role = "worker"
+task = "子步骤A"
+[[steps]]
+id = "c2"
+role = "worker"
+task = "子步骤B"
+"#,
+        )
+        .unwrap();
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "parent_resume"
+[[steps]]
+id = "nest"
+workflow = "child"
+"#,
+        )
+        .unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("子产出")))
+            .mount(&server)
+            .await;
+        let (mut ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
+        ctx.session_id = Some("ui-recover".into());
+        run_workflow(&wf, "主题", &ctx).await.expect("first run");
+
+        let runs = dir.path().join(".latte/workflow-runs");
+        let mut parent_path = None;
+        let mut nested_id = None;
+        for ent in std::fs::read_dir(&runs).unwrap().flatten() {
+            if ent.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let text = std::fs::read_to_string(ent.path()).unwrap();
+            if text.contains("\"workflow_name\":\"parent_resume\"") {
+                parent_path = Some(ent.path());
+            } else if text.contains("\"workflow_name\":\"child\"") {
+                nested_id = ent
+                    .path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string);
+            }
+        }
+        let parent_path = parent_path.expect("parent checkpoint");
+        let nested_id = nested_id.expect("child checkpoint");
+        let nested_path = runs.join(format!("{nested_id}.jsonl"));
+        let nested_raw = std::fs::read_to_string(&nested_path).unwrap();
+        let nested_kept: Vec<_> = nested_raw
+            .lines()
+            .filter(|l| !(l.contains("\"type\":\"step\"") && l.contains("\"step_id\":\"c2\"")))
+            .collect();
+        std::fs::write(&nested_path, format!("{}\n", nested_kept.join("\n"))).unwrap();
+        let parent_raw = std::fs::read_to_string(&parent_path).unwrap();
+        let parent_wf_id =
+            serde_json::from_str::<serde_json::Value>(parent_raw.lines().next().unwrap())
+                .unwrap()
+                .get("wf_id")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+        let parent_kept: Vec<_> = parent_raw
+            .lines()
+            .filter(|l| !(l.contains("\"type\":\"step\"") && l.contains("\"step_id\":\"nest\"")))
+            .collect();
+        std::fs::write(&parent_path, format!("{}\n", parent_kept.join("\n"))).unwrap();
+        // 模拟进程被杀：成功收尾会摘掉的链接这里本来就没有。
+        crate::step_journal::remove_root(dir.path(), &parent_wf_id);
+
+        let server2 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("补子产出")))
+            .mount(&server2)
+            .await;
+        let (mut ctx2, _rx2) = test_ctx_at(test_config_at(&server2.uri()), dir.path().to_path_buf());
+        ctx2.session_id = Some("ui-recover".into());
+        run_workflow_resume(&wf, "", &ctx2, &parent_wf_id)
+            .await
+            .expect("resume parent");
+        let bodies: Vec<String> = server2
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let a = bodies.iter().filter(|b| b.contains("子步骤A")).count();
+        let b = bodies.iter().filter(|b| b.contains("子步骤B")).count();
+        assert_eq!(a, 0, "没有 journal 也应跳过已完成的子步骤 A: {bodies:?}");
+        assert_eq!(b, 1, "只补子步骤 B: {bodies:?}");
     }
 
     /// fan_out 超过 max_items → 明确失败且不派发任何元素。
@@ -12927,9 +13553,15 @@ max_items = 2
             .mount(&server)
             .await;
         let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), dir.path().to_path_buf());
-        let err = run_workflow(&wf, "t", &ctx).await.expect_err("超限必须失败");
+        let err = run_workflow(&wf, "t", &ctx)
+            .await
+            .expect_err("超限必须失败");
         assert!(err.contains("max_items"), "got: {err}");
-        assert_eq!(server.received_requests().await.unwrap().len(), 1, "只跑了 prep");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "只跑了 prep"
+        );
     }
 
     /// tolerate_failures：一章契约耗尽失败，其余章节照常完成，下游仍运行并能看到失败标记；
@@ -12975,7 +13607,11 @@ task = "汇总 {{{{chapters}}}}"
         impl wiremock::Respond for Picky {
             fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
                 let body = String::from_utf8_lossy(&req.body);
-                let out = if body.contains("ITEM=b") { "坏" } else { "GOOD" };
+                let out = if body.contains("ITEM=b") {
+                    "坏"
+                } else {
+                    "GOOD"
+                };
                 ResponseTemplate::new(200).set_body_string(openai_body(out))
             }
         }
@@ -14684,7 +15320,10 @@ output_key = "quality"
         )
         .await
         .expect("own chapter write");
-        assert_eq!(std::fs::read_to_string(sections.join("k1.md")).unwrap(), "mine");
+        assert_eq!(
+            std::fs::read_to_string(sections.join("k1.md")).unwrap(),
+            "mine"
+        );
 
         let err = tm
             .execute(
@@ -16348,9 +16987,15 @@ task = "补充疑问"
             .iter()
             .find(|s| s.id == "write_chapter")
             .expect("write_chapter");
-        let fo = writer.fan_out.as_ref().expect("章节 writer 必须由引擎 fan_out 派发");
+        let fo = writer
+            .fan_out
+            .as_ref()
+            .expect("章节 writer 必须由引擎 fan_out 派发");
         assert_eq!(fo.items, "knowledge_points");
-        assert!(fo.tolerate_failures && fo.max_items > 0, "单章失败不得拖垮全部，且有派发上限");
+        assert!(
+            fo.tolerate_failures && fo.max_items > 0,
+            "单章失败不得拖垮全部，且有派发上限"
+        );
         assert_eq!(writer.depends_on, vec!["outline".to_string()]);
         assert!(writer.task_text().contains("{{item_id}}"));
         assert_eq!(
@@ -16358,7 +17003,10 @@ task = "补充疑问"
             vec![".latte/learn/{{slug}}/sections/{{item_id}}.md".to_string()],
             "并发章节 writer 只能写自己那一章（引擎强制，不靠约定）"
         );
-        assert!(!writer.tools.iter().any(|t| t == "bash"), "bash 会绕开写白名单");
+        assert!(
+            !writer.tools.iter().any(|t| t == "bash"),
+            "bash 会绕开写白名单"
+        );
         assert!(
             !inner.steps.iter().any(|s| s.task_text().contains("mkdir")),
             "分派由引擎负责，不得让模型自行认领"
@@ -16380,7 +17028,9 @@ task = "补充疑问"
             "审稿员必须能读源码核对事实"
         );
         assert!(
-            proofread.task_text().contains("行号偏差、措辞、格式**只算 NIT"),
+            proofread
+                .task_text()
+                .contains("行号偏差、措辞、格式**只算 NIT"),
             "行号偏差不得成为 BLOCKER"
         );
         let proofreader_prompt = include_str!("../../prompts/proofreader.md");
@@ -16437,7 +17087,8 @@ task = "补充疑问"
         };
 
         // 1. proofread 发现 BLOCKER，末行输出 NEEDS_FIX → 触发返工 Rework(0)（跳回 doc_write）
-        let blocker_out = "ISSUE: §0.1 | BLOCKER | 算术错误 | 2²+1·2⁴=16 不成立 | 改为 2³+1·2³=16\nNEEDS_FIX";
+        let blocker_out =
+            "ISSUE: §0.1 | BLOCKER | 算术错误 | 2²+1·2⁴=16 不成立 | 改为 2³+1·2³=16\nNEEDS_FIX";
         let nav = serial_loop_decision(
             &wf,
             proofread_step,
@@ -16520,9 +17171,8 @@ mod prompt_budget_tests {
         let budget = resolve_prompt_budget(None, Some(0.8), false, 1_000_000).unwrap();
         // 窗口先钳到 WINDOW_CEILING(200,000)，扣 20% 输出预留后
         // 0.8 × 160,000 = 128,000；最终还必须落在 CEILING 之内。
-        let expected =
-            ((PROMPT_BUDGET_WINDOW_CEILING - PROMPT_BUDGET_WINDOW_CEILING / 5) as f64 * 0.8)
-                as usize;
+        let expected = ((PROMPT_BUDGET_WINDOW_CEILING - PROMPT_BUDGET_WINDOW_CEILING / 5) as f64
+            * 0.8) as usize;
         assert_eq!(budget, expected, "虚标窗口必须走安全天花板链路");
         assert!(budget <= PROMPT_BUDGET_CEILING, "预算必须不超过上限");
     }
@@ -16531,9 +17181,8 @@ mod prompt_budget_tests {
     #[test]
     fn ratio_budget_falls_back_when_window_unknown() {
         let budget = resolve_prompt_budget(None, Some(0.8), false, 0).unwrap();
-        let expected =
-            ((PROMPT_BUDGET_FALLBACK_WINDOW - PROMPT_BUDGET_FALLBACK_WINDOW / 5) as f64 * 0.8)
-                as usize;
+        let expected = ((PROMPT_BUDGET_FALLBACK_WINDOW - PROMPT_BUDGET_FALLBACK_WINDOW / 5) as f64
+            * 0.8) as usize;
         assert_eq!(budget, expected);
         assert!(budget >= PROMPT_BUDGET_FLOOR);
     }

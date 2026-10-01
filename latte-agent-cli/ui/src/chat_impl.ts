@@ -46,7 +46,7 @@ interface UIBinding {
 export interface ChatController {
   appendUser(content: string): string;
   handleEvent(e: ChatEvent): void;
-  replayEvents(events: ChatEvent[]): void;
+  replayEvents(events: ChatEvent[], opts?: { workflowActive?: boolean }): void;
   setFooter(msg: string): void;
   setRoleSelected(roleId: string): void;
   refreshRoles(roles: RoleInfo[], selected: string): void;
@@ -2319,9 +2319,35 @@ export function mountChat(opts: {
   });
 
   let isPaused = false;
+  // 回放里有 WorkflowStarted 但没有 WorkflowFinished：进程重启把流水线掐断了。
+  // 活着的 run 不会走这条，因为 ▶ 只在 replay 结束时根据当时的未完成集合打开。
+  const openWorkflowIds = new Set<string>();
+  let interruptResume = false;
   function renderPauseButtons() {
     container.pauseBtn.disabled = isPaused;
-    container.resumeBtn.disabled = !isPaused;
+    container.resumeBtn.disabled = !isPaused && !interruptResume;
+    if (interruptResume && !isPaused) {
+      container.resumeBtn.title = "从断点续跑被中断的 workflow";
+    }
+  }
+  function noteWorkflowStarted(wfId: string): void {
+    openWorkflowIds.add(wfId);
+  }
+  function noteWorkflowClosed(wfId: string): void {
+    openWorkflowIds.delete(wfId);
+    if (openWorkflowIds.size === 0 && interruptResume) {
+      interruptResume = false;
+      renderPauseButtons();
+    }
+  }
+  function noteResumeSupersedes(message: string): void {
+    const mark = "从断点续跑（checkpoint ";
+    const at = message.indexOf(mark);
+    if (at < 0) return;
+    const rest = message.slice(at + mark.length);
+    const end = rest.indexOf("）");
+    if (end <= 0) return;
+    noteWorkflowClosed(rest.slice(0, end));
   }
   renderPauseButtons();
   container.pauseBtn.addEventListener("click", async () => {
@@ -2341,9 +2367,19 @@ export function mountChat(opts: {
     container.resumeBtn.disabled = true;
     try {
       await resumeSessionV2();
+      if (interruptResume) {
+        interruptResume = false;
+        renderPauseButtons();
+      }
     } catch (e) {
       console.error("[chat] resume failed:", e);
-      container.resumeBtn.disabled = false; // re-enable on failure
+      if (e instanceof HttpError && e.status === 409) {
+        // 流水线还在本进程里跑：历史看起来像中断，其实不用续。
+        interruptResume = false;
+        renderPauseButtons();
+        return;
+      }
+      container.resumeBtn.disabled = false;
     }
   });
   container.roleSelect.addEventListener("change", async () => {
@@ -3222,6 +3258,7 @@ export function mountChat(opts: {
           turnStartTime = 0;
         }
         addMessage({ kind: "status", content: msg });
+        noteResumeSupersedes(e.message);
         if (!currentToolCall && !delegateRunning) container.footerMsg.textContent = `⟳ ${currentRoleIcon || "🧠"} ${e.message}`;
         resetWaitTimer();
         break;
@@ -3332,6 +3369,7 @@ export function mountChat(opts: {
         retireAllDelegates("会话已终止");
         setStatus("connected"); clearWaitTimer(); addMessage({ kind: "system", content: "[会话结束]" }); setFooter("会话结束"); break;
       case "WorkflowStarted": {
+        noteWorkflowStarted(e.wf_id);
         const msg = addMessage({
           kind: "role",
           content: `🔀 工作流「${e.name}」启动\n${truncate(e.topic, 200)}`,
@@ -3406,6 +3444,7 @@ export function mountChat(opts: {
         break;
       }
       case "WorkflowFinished": {
+        noteWorkflowClosed(e.wf_id);
         const isFail = e.status !== "ok";
         // JoinSet::abort_all can drop sibling step futures before they emit
         // DelegateFinished. The workflow terminal is authoritative for all
@@ -3734,6 +3773,9 @@ export function mountChat(opts: {
     currentEventIdx=-1;
     clearAllStreams();
     clearAllDelegates();
+    openWorkflowIds.clear();
+    interruptResume = false;
+    renderPauseButtons();
     subagentTools.length = 0;
     lastUserMsgId = "";
     lastRoleStarted = "";
@@ -3776,7 +3818,7 @@ export function mountChat(opts: {
     applyPlanMode(false);
     updateFooter();
   }
-  function replayEvents(events: ChatEvent[]): void {
+  function replayEvents(events: ChatEvent[], opts?: { workflowActive?: boolean }): void {
     replaying = true;
     try {
       for (const e of events) handleEvent(e);
@@ -3791,17 +3833,20 @@ export function mountChat(opts: {
       hideAllTimeoutPrompts();
       hideAdvisorPauseBanner();
       clearWaitTimer();
-      // 冷启动重播：若历史停在 Paused（server 重启前 workflow 被暂停/
-      // 进程崩溃），残留的运行中徽章永远等不到完成事件——标注「已中断」，
-      // 避免误导；▶ 会触发后端从 checkpoint 续跑（chat_resume_session
-      // 兜底逻辑）。仍在实时运行的 workflow（无尾随 Paused）不受影响：
-      // 后续 live 事件会正常翻转这些徽章。
-      if (isPaused) {
+      // 冷启动重播：历史停在 Started 而无 Finished。若本进程里这条
+      // 流水线还活着，只是刷新了页面——不要标「已中断」，也不要亮 ▶。
+      // 进程已经死掉时 workflowActive 为 false，▶ 从 checkpoint 续跑。
+      const live = opts?.workflowActive === true;
+      if (!live && (isPaused || openWorkflowIds.size > 0)) {
         for (const el of workflowStates.values()) {
           el.textContent = "⚠️ 已中断（点 ▶ 从断点续跑）";
           el.className = "delegate-state failed";
         }
         workflowStates.clear();
+      }
+      if (!live && !isPaused && openWorkflowIds.size > 0) {
+        interruptResume = true;
+        renderPauseButtons();
       }
       setStatus("connected");
     }

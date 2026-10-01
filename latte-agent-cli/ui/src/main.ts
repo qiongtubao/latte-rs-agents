@@ -470,7 +470,8 @@ async function main(): Promise<void> {
       return null;
     }
     chat.clear();
-    chat.replayEvents(history);
+    const sessionInfo = await getSession().catch(() => null);
+    chat.replayEvents(history, { workflowActive: sessionInfo?.workflow_active === true });
     const pending = pendingAfterHistory(history, buffered);
     liveBuffer = null;
     for (const ev of pending) chat.handleEvent(ev);

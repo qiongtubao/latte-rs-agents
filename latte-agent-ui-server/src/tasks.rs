@@ -2533,7 +2533,9 @@ pub async fn dispatch_task(
         // 隔离任务的 workflow 也必须跑在它自己的工作树里，否则 speaker 的
         // 工具写回主仓——隔离只做了一半（会话隔离了、流水线没隔离）。
         let run_cwd = agent_cwd.clone().unwrap_or_else(|| b.cwd.clone());
+        let session_guard = api::hold_session_workflow(b, &info.session_id, cancel.clone()).ok();
         tokio::spawn(async move {
+            let _session_guard = session_guard;
             // 复用该 session 的暂停门：用户 ⏸ 时这个看板 workflow 也一起停。
             let agent_pause_gate = api::session_pause_gate(&b2, &info.session_id).await.ok();
             let session_id = info.session_id.clone();
