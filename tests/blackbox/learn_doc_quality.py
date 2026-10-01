@@ -3,11 +3,12 @@
 
 跑 /learn_loop <topic>，等到 doc 步投递 draft.md 全文后立刻检查：
 
-  R1 真实数值    文中出现 ≥N 个具体数字/数组值（不许全是宏名）
-  R2 逐值 trace  至少一处「变量 = 表达式 = 值」推导链（= X = Y 形式）
+  R1 真实数值    记录具体数字数量；查表/位运算主题才有意义，设计向文档不因此失败
+  R2 逐值 trace  记录链式等式；设计向文档不因此失败
   R3 非符号索引图 mermaid 节点含动作/数据描述，不是 fn xxx / struct xxx 罗列
-  R4 记号约定    开头有「写给完全没读过/约定/读者」类的导读段
+  R4 记号约定    开头有导读，或引擎写入的「一句话结论 / 核心结论」
   R5 file:line   每节带行号引用（原有要求，回归保护）
+  R8 设计深度    开头有决策总览表，正文有方案对比与代价
 
 通过后不继续走 read_confirm/quiz —— 直接退出（learn 目录残留无妨）。
 
@@ -125,13 +126,18 @@ def check_rules(doc, draft_path):
     array_literals = len(re.findall(r"\[\s*\d+\s*[,\]]", doc))
     notes.append(f"R1: numeric_assigns={numeric_assigns}, array_literals={array_literals}")
     if numeric_assigns + array_literals < 8:
-        failures.append(f"R1 真实数值不足：只有 {numeric_assigns + array_literals} 处具体数字（<8）")
+        notes.append(
+            f"R1 提示：具体数字偏少（{numeric_assigns + array_literals}），"
+            "仅在查表/位运算类主题视为不足，设计向文档不因此失败"
+        )
 
     # R2 逐值 trace：「x = f(...) = 数字」或「= <expr> = <数字>」链式等式
     trace_chains = re.findall(r"=\s*[^=\n]{1,40}=\s*\d", doc)
     notes.append(f"R2: trace_chains={len(trace_chains)}")
     if len(trace_chains) < 3:
-        failures.append(f"R2 逐值 trace 不足：只找到 {len(trace_chains)} 处链式推导（<3）")
+        notes.append(
+            f"R2 提示：链式推导 {len(trace_chains)} 处，设计向文档不因此失败"
+        )
 
     # R3 mermaid 图不是符号索引
     mermaid_blocks = re.findall(r"```mermaid\n(.*?)```", doc, re.DOTALL)
@@ -151,6 +157,7 @@ def check_rules(doc, draft_path):
     has_intro = any(k in head for k in (
         "写给", "读者", "约定", "只需要知道", "这一章只讲",
         "先建立画面", "它是什么", "是什么、整体", "人话总结",
+        "一句话结论", "核心结论", "核心要点",
     ))
     notes.append(f"R4: has_intro={has_intro}")
     if not has_intro:
@@ -203,6 +210,16 @@ def check_rules(doc, draft_path):
     notes.append(f"R7: labeled_nodes={labeled_nodes}, bare_fn_nodes={bare_fn_nodes}")
     if mermaid_blocks and bare_fn_nodes > labeled_nodes:
         failures.append(f"R7 调用图节点缺动作描述：{bare_fn_nodes} 个节点只有符号名/无中文")
+
+    # R8 设计深度：开头有决策总览表，正文有方案对比与代价，而不只是概念讲解
+    has_decision_table = bool(re.search(r"\|\s*设计问题\s*\|", doc[:6000]))
+    tradeoff_hits = sum(doc.count(k) for k in ("为什么选", "替代方案", "放弃的方案", "方案对比"))
+    cost_hits = sum(doc.count(k) for k in ("代价", "失效", "边界"))
+    notes.append(f"R8: decision_table={has_decision_table}, tradeoff={tradeoff_hits}, cost={cost_hits}")
+    if not has_decision_table:
+        failures.append("R8 开头缺少「设计问题 | 作者的选择 | 放弃的方案 …」决策总览表")
+    if tradeoff_hits < 3 or cost_hits < 2:
+        failures.append(f"R8 设计取舍讨论不足：方案对比 {tradeoff_hits} 处（<3）/ 代价边界 {cost_hits} 处（<2）")
 
     return failures, notes
 

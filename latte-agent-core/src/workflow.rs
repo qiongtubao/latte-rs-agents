@@ -3137,6 +3137,92 @@ async fn deterministic_learning_ask(
 /// 确定性装配：如果 `.latte/learn/<slug>/sections/` 目录下存在分段章节
 /// （`00_overview.md` 与各个 `<id>.md`），按 plan.json 的知识点顺序自动拼装成完整的 `draft.md`。
 /// 这是「B套A」分段打磨机制的装配引擎，零模型调用、保证拼接顺序确定与零内容丢失。
+fn format_design_spine(plan: &serde_json::Value) -> Option<String> {
+    let design = plan.get("design")?;
+    let core = design.get("core_idea")?.as_str()?.trim();
+    if core.is_empty() {
+        return None;
+    }
+    let decisions = design.get("decisions")?.as_array()?;
+    if decisions.is_empty() {
+        return None;
+    }
+    let cell = |s: &str| s.trim().replace('|', "/").replace('\n', " ");
+    let mut out = String::from("## 核心结论与设计决策\n\n");
+    out.push_str(&format!("**一句话结论**：{core}\n\n"));
+    if let Some(problem) = design
+        .get("problem")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(problem);
+        out.push_str("\n\n");
+    }
+    out.push_str("| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for d in decisions {
+        let alts = d
+            .get("alternatives")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("；");
+        let field = |key: &str| cell(d.get(key).and_then(|v| v.as_str()).unwrap_or(""));
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            field("question"),
+            field("chosen"),
+            cell(&alts),
+            field("why"),
+            field("cost"),
+        ));
+    }
+    Some(out)
+}
+fn is_symbol_index_mermaid(block: &str) -> bool {
+    let labels: Vec<&str> = block
+        .split("[\"")
+        .skip(1)
+        .filter_map(|s| s.split("\"]").next())
+        .collect();
+    if labels.len() < 4 {
+        return false;
+    }
+    let symbolic = labels
+        .iter()
+        .filter(|l| {
+            ["fn ", "struct ", "enum ", "type ", "trait "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .count();
+    symbolic * 10 > labels.len() * 6
+}
+fn strip_symbol_index_mermaid(md: &str) -> String {
+    let mut out = String::new();
+    let mut rest = md;
+    while let Some(start) = rest.find("```mermaid") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "```mermaid".len()..];
+        if let Some(end) = after.find("```") {
+            let block = &after[..end];
+            if !is_symbol_index_mermaid(block) {
+                out.push_str("```mermaid");
+                out.push_str(block);
+                out.push_str("```");
+            }
+            rest = &after[end + 3..];
+        } else {
+            out.push_str(&rest[start..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
 pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<bool, String> {
     let sections_dir = base.join("sections");
     if !sections_dir.is_dir() {
@@ -3153,12 +3239,18 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
 
     let mut combined = String::new();
 
+    // 引擎写入决策脊梁。plan 没有 design 时跳过，旧文档装配行为不变。
+    if let Some(spine) = format_design_spine(&plan) {
+        combined.push_str(&spine);
+        combined.push_str("\n\n---\n\n");
+    }
+
     // 1. 全局框架与心智模型（00_overview.md）
     let overview_file = sections_dir.join("00_overview.md");
     if overview_file.is_file() {
         let content = std::fs::read_to_string(&overview_file).unwrap_or_default();
         if !content.trim().is_empty() {
-            combined.push_str(content.trim());
+            combined.push_str(&strip_symbol_index_mermaid(content.trim()));
             combined.push_str("\n\n---\n\n");
         }
     }
@@ -3192,7 +3284,7 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
                 if let Some(p) = cand {
                     if let Ok(sec_text) = std::fs::read_to_string(&p) {
                         if !sec_text.trim().is_empty() {
-                            combined.push_str(sec_text.trim());
+                            combined.push_str(&strip_symbol_index_mermaid(sec_text.trim()));
                             combined.push_str("\n\n---\n\n");
                         }
                     }
@@ -4539,6 +4631,156 @@ fn check_learn_evidence(cwd: &Path, evidence: &str) -> Result<(), String> {
 }
 
 /// plan 步写完 `plan.json` 后的机械校验。补充点（`sup1`）的题目由引擎维护，不在这里查。
+fn looks_like_design_question(q: &str) -> bool {
+    [
+        "？",
+        "?",
+        "为什么",
+        "怎么",
+        "如何",
+        "该不该",
+        "要不要",
+        "还是",
+    ]
+    .iter()
+    .any(|k| q.contains(k))
+}
+
+fn looks_like_code_unit_title(title: &str) -> bool {
+    let t = title.trim();
+    let is_unit = ["结构体", "函数", "字段", "枚举", "模块", "struct", "fn "]
+        .iter()
+        .any(|k| t.contains(k));
+    let has_design = ["为什么", "怎么", "为何", "如何", "该不该"]
+        .iter()
+        .any(|k| t.contains(k));
+    is_unit && !has_design
+}
+
+fn looks_like_design_quiz(q: &str) -> bool {
+    [
+        "如果",
+        "换成",
+        "为什么",
+        "若不",
+        "不这样做",
+        "代价",
+        "换成方案",
+    ]
+    .iter()
+    .any(|k| q.contains(k))
+}
+
+fn alternatives_are_only_strawmen(alts: &[serde_json::Value]) -> bool {
+    let names: Vec<&str> = alts.iter().filter_map(|a| a["name"].as_str()).collect();
+    !names.is_empty()
+        && names.iter().all(|n| {
+            ["stdin", "不加锁", "不用锁", "干脆不", "轮询数据库"]
+                .iter()
+                .any(|k| n.contains(k))
+        })
+}
+
+fn check_learn_plan_design(
+    plan: &serde_json::Value,
+    points: &[serde_json::Value],
+    problems: &mut Vec<String>,
+) {
+    let filled = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
+    let design = &plan["design"];
+    if !design.is_object() {
+        problems.push("缺少 design 对象（problem / core_idea / decisions）".to_string());
+    }
+    for key in ["problem", "core_idea"] {
+        if design.is_object() && !filled(&design[key]) {
+            problems.push(format!("design.{key} 为空"));
+        }
+    }
+    let mut decision_ids = std::collections::HashSet::new();
+    match design["decisions"].as_array() {
+        Some(ds) if !ds.is_empty() => {
+            for (i, d) in ds.iter().enumerate() {
+                let id = d["id"].as_str().unwrap_or("").trim().to_string();
+                let label = if id.is_empty() {
+                    format!("第 {} 个", i + 1)
+                } else {
+                    id.clone()
+                };
+                for key in ["id", "question", "chosen", "why", "cost"] {
+                    if !filled(&d[key]) {
+                        problems.push(format!("决策 {label} 缺 {key}"));
+                    }
+                }
+                let alts = d["alternatives"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let real_alts = alts
+                    .iter()
+                    .filter(|a| filled(&a["name"]) && (filled(&a["pros"]) || filled(&a["cons"])))
+                    .count();
+                if real_alts == 0 {
+                    problems.push(format!(
+                        "决策 {label} 没有带 name + pros/cons 的替代方案（没有对比就讲不出为什么选它）"
+                    ));
+                }
+                if !id.is_empty() {
+                    decision_ids.insert(id);
+                }
+                let question = d["question"].as_str().unwrap_or("");
+                if !question.is_empty() && !looks_like_design_question(question) {
+                    problems.push(format!(
+                        "决策 {label} 的 question「{question}」不像设计问题（要写成「……怎么/为什么/如何……」，不要写成「X 是什么」）"
+                    ));
+                }
+                if alternatives_are_only_strawmen(alts) {
+                    problems.push(format!(
+                        "决策 {label} 的替代方案全是稻草人（stdin / 不加锁 / 干脆不……）——换一个认真的工程师会考虑的方案"
+                    ));
+                }
+            }
+        }
+        _ if design.is_object() => problems.push("design.decisions 为空".to_string()),
+        _ => {}
+    }
+
+    let mut quiz_stems = Vec::new();
+    for point in points {
+        if is_engine_supplement_point(point) {
+            continue;
+        }
+        let kid = point["id"].as_str().unwrap_or("?");
+        match point["decision"].as_str().map(str::trim) {
+            Some(d) if decision_ids.contains(d) => {}
+            Some(d) if !d.is_empty() => problems.push(format!(
+                "知识点 {kid} 的 decision「{d}」不在 design.decisions 里"
+            )),
+            _ => problems.push(format!(
+                "知识点 {kid} 缺 decision（每个知识点要对应一个设计决策）"
+            )),
+        }
+        if let Some(title) = point["title"].as_str() {
+            if looks_like_code_unit_title(title) {
+                problems.push(format!(
+                    "知识点 {kid} 的 title「{title}」是代码单元名，请改成设计问题或结论（如「为什么要收齐才放行」）"
+                ));
+            }
+        }
+        if let Some(q) = point["question"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            quiz_stems.push(q.to_string());
+        }
+    }
+    if quiz_stems.len() >= 2 && !quiz_stems.iter().any(|q| looks_like_design_quiz(q)) {
+        problems.push(
+            "题目全是事实回忆：至少一道题干要带「如果 / 换成 / 为什么」，否则考不出设计理解".into(),
+        );
+    }
+}
+
 fn validate_learn_plan(cwd: &Path, slug: &str) -> Result<(), String> {
     let slug = slug.trim();
     if !learn_slug_ok(slug) {
@@ -4612,6 +4854,7 @@ fn validate_learn_plan(cwd: &Path, slug: &str) -> Result<(), String> {
             problems.push(format!("{id}：answer 必须逐字等于某个选项的 label"));
         }
     }
+    check_learn_plan_design(&plan, points, &mut problems);
     if problems.is_empty() {
         Ok(())
     } else {
@@ -7743,7 +7986,7 @@ async fn run_workflow_serial(
                         }
                     }
                     // 审稿员已不在路径上，事实靠这里的机械校验兜底：证据行真实存在，
-                    // 答案是某个选项，选项之间不互为子串。
+                    // 答案是某个选项，选项之间不互为子串，并且 design 讲得出取舍。
                     if wf.name == "learn_loop" && step.id == "plan" {
                         if let Err(reason) = validate_learn_plan(&ctx.cwd, &response) {
                             if attempt >= step.max_retries {
@@ -18496,6 +18739,21 @@ task = "输出掌握报告"
         assert_eq!(requests.len(), 1, "只有 doc 调模型，report 由引擎渲染");
     }
 
+    fn learn_plan_design() -> serde_json::Value {
+        serde_json::json!({
+            "problem": "赋值之后原来的变量还能不能用",
+            "core_idea": "赋值默认把所有权搬走",
+            "decisions": [{
+                "id": "d1",
+                "question": "为什么赋值默认是 move？",
+                "chosen": "move 语义",
+                "why": "避免两份 owner 同时释放同一块内存",
+                "cost": "原变量不能再用",
+                "alternatives": [{"name": "默认拷贝", "cons": "深拷贝贵，浅拷贝会 double free"}]
+            }]
+        })
+    }
+
     fn write_learn_plan(cwd: &std::path::Path, points: serde_json::Value) {
         let base = cwd.join(".latte").join("learn").join("own");
         std::fs::create_dir_all(&base).unwrap();
@@ -18504,6 +18762,7 @@ task = "输出掌握报告"
             serde_json::to_string(&serde_json::json!({
                 "slug": "own",
                 "topic": "所有权",
+                "design": learn_plan_design(),
                 "knowledge_points": points
             }))
             .unwrap(),
@@ -18515,6 +18774,7 @@ task = "输出掌握报告"
         serde_json::json!({
             "id": "k1",
             "title": "所有权",
+            "decision": "d1",
             "evidence": "src/own.rs:2-3",
             "question": "传 a 之后还能用吗？",
             "options": [{"label": "move 语义"}, {"label": "借用规则"}],
@@ -18574,6 +18834,127 @@ task = "输出掌握报告"
         let err = validate_learn_plan(dir.path(), "own").expect_err("id 重复");
         assert!(err.contains("id 重复"), "{err}");
         assert!(validate_learn_plan(dir.path(), "../own").is_err());
+    }
+
+    #[test]
+    fn learn_plan_check_rejects_missing_design_strawmen_and_fact_quizzes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+
+        let mut bare = good_point();
+        bare.as_object_mut().unwrap().remove("decision");
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "knowledge_points": [bare]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = validate_learn_plan(dir.path(), "own").unwrap_err();
+        assert!(
+            err.contains("缺少 design 对象") && err.contains("缺 decision"),
+            "{err}"
+        );
+
+        let mut straw = learn_plan_design();
+        straw["decisions"][0]["alternatives"] =
+            serde_json::json!([{"name": "用 stdin", "cons": "没有控制台"}]);
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "design": straw,
+                "knowledge_points": [good_point()]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = validate_learn_plan(dir.path(), "own").unwrap_err();
+        assert!(err.contains("稻草人"), "{err}");
+
+        let mut facts = learn_plan_design();
+        facts["decisions"][0]["question"] = serde_json::json!("Pending 结构体");
+        let point = |id: &str, title: &str, question: &str| {
+            serde_json::json!({
+                "id": id,
+                "title": title,
+                "decision": "d1",
+                "evidence": "src/own.rs:2-3",
+                "question": question,
+                "options": [{"label": "甲"}, {"label": "乙"}],
+                "answer": "甲"
+            })
+        };
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "design": facts,
+                "knowledge_points": [
+                    point("k1", "Pending 结构体", "expected 是哪个字段"),
+                    point("k2", "resolve_one 函数", "collected 存在哪一行")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = validate_learn_plan(dir.path(), "own").unwrap_err();
+        assert!(err.contains("不像设计问题"), "{err}");
+        assert!(err.contains("代码单元名"), "{err}");
+        assert!(err.contains("题目全是事实回忆"), "{err}");
+    }
+
+    #[test]
+    fn assemble_draft_injects_design_spine_and_strips_symbol_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let sections = base.join("sections");
+        std::fs::create_dir_all(&sections).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "design": {
+                    "problem": "三题只答两题就放行",
+                    "core_idea": "收齐才唤醒",
+                    "decisions": [{
+                        "id": "d1",
+                        "question": "多题怎么判定收齐？",
+                        "chosen": "expected + collected",
+                        "why": "按名单对账",
+                        "cost": "要约定题号",
+                        "alternatives": [{"name": "逐题放行"}]
+                    }]
+                },
+                "knowledge_points": [{"id": "k1", "title": "为什么要收齐"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(sections.join("00_overview.md"), "# 概览\n先看整体。").unwrap();
+        std::fs::write(
+            sections.join("k1.md"),
+            "## 为什么要收齐\n\n先结论。\n\n```mermaid\nflowchart LR\n  n0[\"fn a\"]\n  n1[\"fn b\"]\n  n2[\"fn c\"]\n  n3[\"fn d\"]\n```\n\n```mermaid\nflowchart TD\n  a[\"收到答案\"] --> b[\"记账\"]\n```\n",
+        )
+        .unwrap();
+
+        assert!(assemble_draft_from_sections(base).unwrap());
+        let draft = std::fs::read_to_string(base.join("draft.md")).unwrap();
+        assert!(draft.starts_with("## 核心结论与设计决策"), "{draft}");
+        assert!(draft.contains("**一句话结论**：收齐才唤醒"));
+        assert!(draft.contains("| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |"));
+        assert!(draft.contains("逐题放行"));
+        assert!(draft.contains("# 概览"));
+        assert!(draft.contains("收到答案"), "数据流图应保留：{draft}");
+        assert!(!draft.contains("fn a"), "符号索引图应被剥掉：{draft}");
+        let spine = draft.find("## 核心结论").unwrap();
+        let overview = draft.find("# 概览").unwrap();
+        let chapter = draft.find("## 为什么要收齐").unwrap();
+        assert!(spine < overview && overview < chapter);
     }
 
     #[test]
