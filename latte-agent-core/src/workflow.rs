@@ -10760,8 +10760,6 @@ role = "reviewer"
                 "plan",
                 "annotate",
                 "doc_review",
-                "legacy_doc",
-                "legacy_proofread",
                 "read_confirm",
                 "quiz",
                 "supplement",
@@ -10774,10 +10772,7 @@ role = "reviewer"
         let step = |id: &str| wf.steps.iter().find(|s| s.id == id).expect(id);
         let plan = step("plan");
         let annotate = step("annotate");
-        // 旧 doc/proofread 定义保留作配置迁移兼容，但不可命中；实际文档
-        // 维护和可读性门槛位于 doc_review_loop（单独回归测试覆盖）。
-        let doc = step("legacy_doc");
-        let _proofread = step("legacy_proofread");
+        // 文档写作与可读性门槛在 doc_review_loop（单独回归测试覆盖）。
         let read_confirm = step("read_confirm");
         let quiz = step("quiz");
         let supplement = step("supplement");
@@ -10785,20 +10780,9 @@ role = "reviewer"
         let sync_code = step("sync_code");
         let report = step("report");
         assert!(step("doc_review").workflow.is_some());
-        assert_eq!(
-            step("legacy_doc").when_any,
-            vec!["__legacy_flat_learn_loop__"]
-        );
-        assert_eq!(
-            step("legacy_proofread").when_any,
-            vec!["__legacy_flat_learn_loop__"]
-        );
         // 外层实际执行的 speaker 都是 tutor。审稿不再挡在学员前面。
         for s in &wf.steps {
-            if matches!(
-                s.id.as_str(),
-                "doc_review" | "legacy_doc" | "legacy_proofread"
-            ) {
+            if s.id == "doc_review" {
                 continue;
             }
             assert_eq!(s.roles(), vec!["tutor"], "step {} 必须是 tutor", s.id);
@@ -10921,61 +10905,6 @@ role = "reviewer"
             "annotate 必须声明绝不修改副本目录以外的文件（learn_loop 是只读类型）"
         );
 
-        // ── doc：写文档，不许弹窗 ──
-        // doc 拥有 write（文档与账本归它维护）但拿不到 ask——"写文档顺便出题"
-        // 会让学员在读到文档路径之前先看到弹窗（step 正文结束时才投递）。
-        assert!(
-            doc.tools.iter().any(|t| t == "write"),
-            "doc 必须有 write：draft.md / plan.json / ledger.json 都归它更新"
-        );
-        assert!(
-            !doc.tools.iter().any(|t| t == "ask"),
-            "doc 的 tools 白名单里不能有 ask——禁弹窗要靠工具隔离，不是 prompt 劝告"
-        );
-        assert!(
-            doc.require_tools_any.iter().any(|t| t == "write")
-                && doc.require_tools_any.iter().any(|t| t == "edit"),
-            "doc 必须真改过 draft.md（edit/write 任一——返工是局部修改，不能只认 write）"
-        );
-        assert!(
-            doc.tools.iter().any(|t| t == "edit"),
-            "doc 必须有 edit：返工增强是局部修改，没有 edit 时模型会用 write \
-             整文件覆写、丢掉既有章节（实测 thrash 57 分钟）"
-        );
-        assert!(
-            doc.task_text().contains("draft.md"),
-            "doc 的正文必须把 draft.md 路径交付给学员"
-        );
-        assert!(
-            doc.task_text().contains("已经存在")
-                && doc.task_text().contains("draft.md")
-                && doc.task_text().contains("刷新"),
-            "doc 必须在重跑时读取并刷新既有 draft.md，而不是只在首次运行写文档"
-        );
-        // 文档内容直接随 doc 步正文返回 chat（学员先读完、再点答题按钮），
-        // 而不是只给一个路径让学员自己找文件。
-        assert!(
-            doc.task_text().contains("全文"),
-            "doc 必须把 draft.md 全文作为正文输出到 chat"
-        );
-        assert!(
-            doc.output_contract.min_chars.unwrap_or(0) >= 500,
-            "doc 必须有 min_chars 下限，否则空正文/只给路径也能通过"
-        );
-        // 小白友好（实测反面教材：术语零解释、例子缺失、考据密度压过主线）：
-        assert!(
-            doc.task_text().contains("大白话"),
-            "doc 必须要求术语首次出现时用大白话解释（读者是零基础小白）"
-        );
-        assert!(
-            doc.task_text().contains("example"),
-            "doc 必须以知识点的 example 为底展开讲解（传什么→出来什么）"
-        );
-        assert!(
-            doc.task_text().contains("逐行讲解"),
-            "doc 必须要求代码摘录后配逐行讲解，不许只贴代码配行号表"
-        );
-
         // ── read_confirm：答题按钮独占一步 ──
         assert!(
             read_confirm.tools.iter().any(|t| t == "ask"),
@@ -11005,8 +10934,8 @@ role = "reviewer"
         );
 
         // ── quiz：批量出题 + 判分 + 循环路由 ──
-        // 循环标记只挂在 quiz/supplement 上：doc/read_confirm 不负责循环控制。
-        assert!(doc.loop_until.is_none() && read_confirm.loop_until.is_none());
+        // 循环标记只挂在 quiz/supplement 上：read_confirm 不负责循环控制。
+        assert!(read_confirm.loop_until.is_none());
         assert_eq!(quiz.loop_until.as_deref(), Some("QUIZ_PASS"));
         assert_eq!(
             quiz.loop_back_routes.get("QUIZ_FAIL").map(|s| s.as_str()),
@@ -18584,6 +18513,23 @@ task = "补充疑问"
             !writer.tools.iter().any(|t| t == "bash"),
             "bash 会绕开写白名单"
         );
+        // 章节 writer 能改文件但拿不到 ask：禁弹窗靠工具隔离。
+        assert!(
+            ["read", "edit", "write"]
+                .iter()
+                .all(|t| writer.tools.iter().any(|w| w == t))
+                && !writer.tools.iter().any(|t| t == "ask"),
+            "{:?}",
+            writer.tools
+        );
+        // 活路径写作标准（原先锁在永远跑不到的 legacy_doc 上）。
+        for (kw, why) in [
+            ("设计问题与结论", "每章先给结论再讲代码"),
+            ("方案对比", "必须对比真实可行方案"),
+            ("最小示例", "分支不显然时要有输入到输出的例子"),
+        ] {
+            assert!(writer.task_text().contains(kw), "write_chapter 缺：{why}");
+        }
         assert!(
             !inner.steps.iter().any(|s| s.task_text().contains("mkdir")),
             "分派由引擎负责，不得让模型自行认领"
@@ -18612,15 +18558,10 @@ task = "补充疑问"
             "proofreader 不得通过历史问题维持跨轮记忆"
         );
 
-        for id in ["legacy_doc", "legacy_proofread"] {
-            let legacy = outer
-                .steps
-                .iter()
-                .find(|s| s.id == id)
-                .expect("legacy step");
-            assert_eq!(legacy.when_any, vec!["__legacy_flat_learn_loop__"]);
-            assert!(legacy.output_key.is_some());
-        }
+        assert!(
+            !outer.steps.iter().any(|s| s.id.starts_with("legacy_")),
+            "不许留永远跑不到的兼容步骤"
+        );
     }
 
     /// 章节写完就回到外层。审稿员的 LOOKS_CLEAR / NEEDS_FIX 不再挡在学员前面。
