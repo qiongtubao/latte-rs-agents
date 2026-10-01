@@ -3404,7 +3404,7 @@ fn patch_chapter_baseline(
 
 /// 正文里的 `path/file.ext:12` / `path/file.ext:12-48` 出处。
 fn chapter_citations(text: &str) -> BTreeSet<String> {
-    text.split(|c: char| c.is_whitespace() || "()[]（）【】`\"'，,。;；、<>|*".contains(c))
+    text.split(|c: char| c.is_whitespace() || "()[]（）【】`\"'，,。;；、<>|*：".contains(c))
         .filter_map(|tok| {
             let tok = tok.trim_end_matches(['.', ':', '：']);
             let (path, lines) = tok.rsplit_once(':')?;
@@ -4463,6 +4463,142 @@ fn validate_learn_plan(cwd: &Path, slug: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("plan.json 未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
+const COMMENT_MARKERS: [&str; 9] = ["//", "#", "--", "/*", "*", ";", "<!--", "-->", "\"\"\""];
+
+fn is_comment_line(line: &str) -> bool {
+    COMMENT_MARKERS.iter().any(|m| line.starts_with(m))
+}
+
+/// 副本行与源码行一致：逐字相同，或在源码行后面追加了行尾注释。
+fn copy_line_matches(copy: &str, source_lines: &std::collections::HashSet<String>) -> bool {
+    if source_lines.contains(copy) {
+        return true;
+    }
+    source_lines.iter().any(|src| {
+        !src.is_empty()
+            && copy.starts_with(src.as_str())
+            && is_comment_line(copy[src.len()..].trim_start())
+    })
+}
+
+fn safe_relative_source(cwd: &Path, rel: &str) -> Option<PathBuf> {
+    let p = Path::new(rel);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let full = cwd.join(p);
+    full.is_file().then_some(full)
+}
+
+/// annotate 写完注释副本后的机械校验：每个副本标了真实出处，代码行逐字来自
+/// 源文件（只许加注释），plan 证据涉及的源文件都有副本覆盖。
+fn validate_learn_annotations(cwd: &Path, slug: &str) -> Result<(), String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Err(format!("slug「{slug}」不合法"));
+    }
+    let base = cwd.join(".latte").join("learn").join(slug);
+    let code_dir = base.join("code");
+    let rel_dir = format!(".latte/learn/{slug}/code");
+    if !code_dir.join("README.md").is_file() {
+        return Err(format!("{rel_dir}/README.md 索引不存在"));
+    }
+    let mut copies: Vec<PathBuf> = std::fs::read_dir(&code_dir)
+        .map_err(|e| format!("{rel_dir} 读不出：{e}"))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n != "README.md"))
+        .collect();
+    copies.sort();
+    if copies.is_empty() {
+        return Err(format!("{rel_dir} 里没有任何注释副本"));
+    }
+
+    let mut problems = Vec::new();
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    let mut source_cache: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for copy in &copies {
+        let name = copy.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(copy).unwrap_or_default();
+        let mut sources: Vec<String> = Vec::new();
+        for cite in chapter_citations(&text) {
+            let Some((path, _)) = cite.rsplit_once(':') else {
+                continue;
+            };
+            if sources.iter().any(|s| s == path) {
+                continue;
+            }
+            let Some(full) = safe_relative_source(cwd, path) else {
+                continue;
+            };
+            let lines = std::fs::read_to_string(&full)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect();
+            source_cache.entry(path.to_string()).or_insert(lines);
+            sources.push(path.to_string());
+        }
+        if sources.is_empty() {
+            problems.push(format!("{name}：文件头没写指向真实源文件的原始出处（file:line）"));
+            continue;
+        }
+        covered.extend(sources.iter().cloned());
+        let mut source_lines = std::collections::HashSet::new();
+        for s in &sources {
+            source_lines.extend(source_cache[s].iter().cloned());
+        }
+        let mut bad = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || is_comment_line(line) {
+                continue;
+            }
+            if !copy_line_matches(line, &source_lines) {
+                bad.push(format!("第 {} 行「{line}」", n + 1));
+            }
+        }
+        if !bad.is_empty() {
+            let shown = bad.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+            let more = if bad.len() > 3 { format!(" 等 {} 行", bad.len()) } else { String::new() };
+            problems.push(format!(
+                "{name}：{shown}{more} 在 {} 里找不到原文——副本只许加注释，不许改代码",
+                sources.join("、")
+            ));
+        }
+    }
+
+    if let Ok(plan) = read_learn_json(&base.join("plan.json")) {
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        for point in plan["knowledge_points"].as_array().into_iter().flatten() {
+            if is_engine_supplement_point(point) {
+                continue;
+            }
+            let evidence = point["evidence"].as_str().unwrap_or("");
+            for part in evidence.split([',', '，', ';', '；']).map(str::trim) {
+                if let Some((path, _)) = part.rsplit_once(':') {
+                    if safe_relative_source(cwd, path).is_some() {
+                        needed.insert(path.to_string());
+                    }
+                }
+            }
+        }
+        let missing: Vec<String> = needed.difference(&covered).cloned().collect();
+        if !missing.is_empty() {
+            problems.push(format!("这些证据文件没有注释副本：{}", missing.join("、")));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("注释副本未通过校验：\n- {}", problems.join("\n- ")))
     }
 }
 
@@ -7244,6 +7380,30 @@ async fn run_workflow_serial(
                             let annotation = format!(
                                 "上次写的 plan.json 未通过引擎校验：\n{reason}\n\
                                  请读源码核对后重写 plan.json，并再次只输出 slug。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    if wf.name == "learn_loop" && step.id == "annotate" {
+                        let slug = vars.get("plan_out").cloned().unwrap_or_default();
+                        if let Err(reason) = validate_learn_annotations(&ctx.cwd, &slug) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn annotated copies failed check; retrying"
+                            );
+                            let annotation = format!(
+                                "上次写的注释副本未通过引擎校验：\n{reason}\n\
+                                 请重新 read 源文件，逐字复制代码后只加注释，重写有问题的副本。"
                             );
                             step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
                             prompt = format!("{full_prompt}\n\n{annotation}");
@@ -18016,6 +18176,142 @@ max_retries = 2
             .collect();
         assert_eq!(bodies.len(), 2, "只重试 plan 一次：{bodies:?}");
         assert!(bodies[1].contains("超出文件范围"), "重试 prompt 要带上校验原因");
+    }
+
+    const OWN_SRC: &str = "fn main() {\n    let s = String::from(\"hi\");\n    let t = s;\n    println!(\"{t}\");\n}\n";
+    const GOOD_COPY: &str = "// 学习副本——源文件未改动。原始出处：src/own.rs:2-3（k1 所有权）\nfn main() {\n    // s 是这块堆内存唯一的 owner\n    let s = String::from(\"hi\");\n    let t = s; // move：所有权交给 t，s 之后不能再用\n    println!(\"{t}\");\n}\n";
+
+    fn setup_annotate(cwd: &std::path::Path) {
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/own.rs"), OWN_SRC).unwrap();
+        write_learn_plan(cwd, serde_json::json!([good_point()]));
+    }
+
+    fn write_copy(cwd: &std::path::Path, copy: &str) {
+        let code = cwd.join(".latte/learn/own/code");
+        std::fs::create_dir_all(&code).unwrap();
+        std::fs::write(code.join("README.md"), "| k1 | k1-own.rs | src/own.rs:2-3 |\n").unwrap();
+        std::fs::write(code.join("k1-own.rs"), copy).unwrap();
+    }
+
+    #[test]
+    fn learn_loop_annotation_validation_rejects_changed_code() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("还没写副本");
+        assert!(err.contains("README.md"), "{err}");
+
+        write_copy(dir.path(), GOOD_COPY);
+        validate_learn_annotations(dir.path(), "own").expect("逐字代码 + 注释应通过");
+
+        write_copy(dir.path(), &GOOD_COPY.replace("let t = s;", "let t = s.clone();"));
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("改了代码");
+        assert!(err.contains("s.clone()") && err.contains("只许加注释"), "{err}");
+
+        write_copy(dir.path(), &GOOD_COPY.replace("    println!(\"{t}\");\n", "    ...\n"));
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("省略代码");
+        assert!(err.contains("「...」"), "{err}");
+
+        write_copy(dir.path(), &GOOD_COPY.replace("src/own.rs:2-3", "src/nope.rs:2-3"));
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("出处不存在");
+        assert!(err.contains("原始出处"), "{err}");
+
+        let code = dir.path().join(".latte/learn/own/code");
+        std::fs::remove_file(code.join("k1-own.rs")).unwrap();
+        std::fs::write(dir.path().join("src/other.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(code.join("k9-other.rs"), "// 原始出处：src/other.rs:1\nfn x() {}\n").unwrap();
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("证据文件没副本");
+        assert!(err.contains("没有注释副本") && err.contains("src/own.rs"), "{err}");
+    }
+
+    /// 第一次副本改了代码：引擎点名对不上的行，只重试 annotate。
+    #[tokio::test]
+    async fn learn_loop_annotate_retries_until_copy_matches_source() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+
+        let server = wiremock::MockServer::start().await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("注释副本未通过引擎校验"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_copy(&cwd, GOOD_COPY);
+                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs"))
+            })
+            .mount(&server)
+            .await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("ANNOTATE_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_copy(&cwd, &GOOD_COPY.replace("let t = s;", "let t = s.clone();"));
+                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "annotate"
+role = "tutor"
+task = "ANNOTATE_STEP {{plan_out}}"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次副本逐字保留代码，应成功");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 3, "doc 一次 + annotate 两次：{bodies:?}");
+        assert!(bodies[2].contains("s.clone()"), "重试 prompt 要点名改坏的那一行");
     }
 
     const LEARN_DRAFT: &str = "# 所有权\n\n每个值有唯一 owner，见 src/own.rs:2-3。\n\n```mermaid\ngraph LR\n  a --> b\n```\n\n借用见 src/borrow.rs:5-9，借用不能比 owner 活得久。\n";
