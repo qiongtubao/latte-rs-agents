@@ -4602,6 +4602,153 @@ fn validate_learn_annotations(cwd: &Path, slug: &str) -> Result<(), String> {
     }
 }
 
+/// 一行去掉注释后的代码部分。整行注释、空行返回 None。
+fn code_part(line: &str) -> Option<&str> {
+    let t = line.trim();
+    if t.is_empty() || is_comment_line(t) {
+        return None;
+    }
+    let end = [" //", "\t//", " #", "\t#", " --", " /*"]
+        .iter()
+        .filter_map(|m| t.find(m))
+        .min()
+        .unwrap_or(t.len());
+    Some(t[..end].trim_end())
+}
+
+fn code_lines(text: &str) -> Vec<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(n, l)| code_part(l).map(|c| (n + 1, c)))
+        .collect()
+}
+
+/// 比较改动前后的代码行（去注释后），返回第一处不一致的说明。
+fn diff_code_only(rel: &str, before: &str, after: &str) -> Option<String> {
+    let (old, new) = (code_lines(before), code_lines(after));
+    for (i, (n, code)) in new.iter().enumerate() {
+        match old.get(i) {
+            Some((_, was)) if was == code => {}
+            Some((_, was)) => {
+                return Some(format!("{rel}：第 {n} 行「{code}」改了代码（原来是「{was}」）"));
+            }
+            None => return Some(format!("{rel}：第 {n} 行「{code}」是新加的代码")),
+        }
+    }
+    old.get(new.len())
+        .map(|(n, was)| format!("{rel}：原第 {n} 行「{was}」被删掉了"))
+}
+
+fn git_dirty_paths(cwd: &Path) -> Option<BTreeSet<String>> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.get(3..))
+            .map(|p| p.rsplit(" -> ").next().unwrap_or(p).trim().to_string())
+            .collect(),
+    )
+}
+
+/// sync_code 开跑前的源文件原文。学习范围 = plan 证据 + 注释副本标注的出处。
+struct SyncCodeBaseline {
+    files: Vec<(String, String)>,
+    dirty_before: Option<BTreeSet<String>>,
+}
+
+impl SyncCodeBaseline {
+    fn take(cwd: &Path, slug: &str) -> Self {
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        if learn_slug_ok(slug) {
+            let base = cwd.join(".latte").join("learn").join(slug);
+            if let Ok(plan) = read_learn_json(&base.join("plan.json")) {
+                for point in plan["knowledge_points"].as_array().into_iter().flatten() {
+                    let evidence = point["evidence"].as_str().unwrap_or("");
+                    for part in evidence.split([',', '，', ';', '；']).map(str::trim) {
+                        if let Some((path, _)) = part.rsplit_once(':') {
+                            paths.insert(path.to_string());
+                        }
+                    }
+                }
+            }
+            for copy in std::fs::read_dir(base.join("code")).into_iter().flatten().flatten() {
+                let text = std::fs::read_to_string(copy.path()).unwrap_or_default();
+                for cite in chapter_citations(&text) {
+                    if let Some((path, _)) = cite.rsplit_once(':') {
+                        paths.insert(path.to_string());
+                    }
+                }
+            }
+        }
+        let files = paths
+            .into_iter()
+            .filter_map(|rel| {
+                let full = safe_relative_source(cwd, &rel)?;
+                Some((rel, std::fs::read_to_string(full).ok()?))
+            })
+            .collect();
+        Self {
+            files,
+            dirty_before: git_dirty_paths(cwd),
+        }
+    }
+
+    /// 核对改动只涉及注释。不合格时把源文件全部还原，再返回原因。
+    fn check_and_restore(&self, cwd: &Path) -> Result<(), String> {
+        let mut problems = Vec::new();
+        for (rel, before) in &self.files {
+            let after = std::fs::read_to_string(cwd.join(rel)).unwrap_or_default();
+            if let Some(p) = diff_code_only(rel, before, &after) {
+                problems.push(p);
+            }
+            let leaked = after
+                .lines()
+                .filter(|l| l.contains("学习副本") || l.contains("原始出处"))
+                .count()
+                > before
+                    .lines()
+                    .filter(|l| l.contains("学习副本") || l.contains("原始出处"))
+                    .count();
+            if leaked {
+                problems.push(format!("{rel}：把副本头部的「学习副本 / 原始出处」带进了源码"));
+            }
+        }
+        let mut strays = Vec::new();
+        if let (Some(before), Some(after)) = (&self.dirty_before, git_dirty_paths(cwd)) {
+            strays = after
+                .difference(before)
+                .filter(|p| !p.starts_with(".latte/"))
+                .filter(|p| !self.files.iter().any(|(rel, _)| rel == *p))
+                .cloned()
+                .collect();
+            if !strays.is_empty() {
+                problems.push(format!("改了学习范围以外的文件：{}", strays.join("、")));
+            }
+        }
+        if problems.is_empty() {
+            return Ok(());
+        }
+        for (rel, before) in &self.files {
+            let _ = std::fs::write(cwd.join(rel), before);
+        }
+        for p in &strays {
+            let _ = std::process::Command::new("git")
+                .args(["checkout", "--", p])
+                .current_dir(cwd)
+                .output();
+        }
+        Err(format!(
+            "源码改动不只是注释，引擎已全部还原：\n- {}",
+            problems.join("\n- ")
+        ))
+    }
+}
+
 fn mermaid_blocks(text: &str) -> usize {
     text.lines()
         .filter(|l| l.trim_start().starts_with("```mermaid"))
@@ -7072,6 +7219,13 @@ async fn run_workflow_serial(
             // speaker 之前，成功后再按知识点 id 把进度合并回去。
             let mut ledger_guard = (wf.name == "learn_loop" && step.id == "plan")
                 .then(|| LedgerRestoreGuard::take(&ctx.cwd));
+            // sync_code 会 edit 真实源文件：开跑前留原文，改出注释以外的变化就还原。
+            let sync_baseline = (wf.name == "learn_loop" && step.id == "sync_code").then(|| {
+                SyncCodeBaseline::take(
+                    &ctx.cwd,
+                    vars.get("plan_out").map_or("", |s| s.trim()),
+                )
+            });
             // context-overflow fresh restarts are bounded per step and do not
             // reset loop_iters, token accounting, or dispatch budget.
             let mut context_overflow_restarts = 0usize;
@@ -7404,6 +7558,29 @@ async fn run_workflow_serial(
                             let annotation = format!(
                                 "上次写的注释副本未通过引擎校验：\n{reason}\n\
                                  请重新 read 源文件，逐字复制代码后只加注释，重写有问题的副本。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    if let Some(baseline) = &sync_baseline {
+                        if let Err(reason) = baseline.check_and_restore(&ctx.cwd) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn sync_code changed code; reverted and retrying"
+                            );
+                            let annotation = format!(
+                                "上次同步注释改到了代码：\n{reason}\n\
+                                 请重新 read 源文件，只插入或修改注释行，代码一个字符都不要动。"
                             );
                             step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
                             prompt = format!("{full_prompt}\n\n{annotation}");
@@ -18312,6 +18489,159 @@ max_retries = 2
             .collect();
         assert_eq!(bodies.len(), 3, "doc 一次 + annotate 两次：{bodies:?}");
         assert!(bodies[2].contains("s.clone()"), "重试 prompt 要点名改坏的那一行");
+    }
+
+    const OWN_SYNCED: &str = "fn main() {\n    // s 是这块堆内存唯一的 owner\n    let s = String::from(\"hi\");\n    let t = s; // move：所有权交给 t\n    println!(\"{t}\");\n}\n";
+
+    #[test]
+    fn learn_loop_sync_code_allows_comments_only() {
+        assert!(diff_code_only("src/own.rs", OWN_SRC, OWN_SYNCED).is_none());
+        let err = diff_code_only("src/own.rs", OWN_SRC, &OWN_SRC.replace("let t = s;", "let t = s.clone();"))
+            .unwrap();
+        assert!(err.contains("s.clone()") && err.contains("let t = s;"), "{err}");
+        let err = diff_code_only("src/own.rs", OWN_SRC, &OWN_SRC.replace("    println!(\"{t}\");\n", ""))
+            .unwrap();
+        assert!(err.contains("被删掉了") || err.contains("改了代码"), "{err}");
+        let err = diff_code_only("src/own.rs", OWN_SRC, &format!("{OWN_SRC}fn extra() {{}}\n")).unwrap();
+        assert!(err.contains("新加的代码"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap()
+        };
+        if !git(&["init", "-q"]).status.success() {
+            eprintln!("git init 失败，跳过该用例");
+            return;
+        }
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+        setup_annotate(cwd);
+        std::fs::write(cwd.join("src/other.rs"), "fn x() {}\n").unwrap();
+        let _ = git(&["add", "src"]);
+        let _ = git(&["commit", "-qm", "init"]);
+
+        let baseline = SyncCodeBaseline::take(cwd, "own");
+        assert_eq!(baseline.files.len(), 1, "学习范围 = plan 证据里的 src/own.rs");
+        std::fs::write(cwd.join("src/own.rs"), OWN_SYNCED).unwrap();
+        baseline.check_and_restore(cwd).expect("只加注释应通过");
+        assert_eq!(std::fs::read_to_string(cwd.join("src/own.rs")).unwrap(), OWN_SYNCED);
+
+        std::fs::write(cwd.join("src/own.rs"), OWN_SRC).unwrap();
+        let baseline = SyncCodeBaseline::take(cwd, "own");
+        std::fs::write(cwd.join("src/own.rs"), OWN_SRC.replace("let t = s;", "let t = s.clone();")).unwrap();
+        std::fs::write(cwd.join("src/other.rs"), "fn x() { panic!() }\n").unwrap();
+        let err = baseline.check_and_restore(cwd).expect_err("改了代码、碰了别的文件");
+        assert!(err.contains("s.clone()") && err.contains("src/other.rs"), "{err}");
+        assert_eq!(std::fs::read_to_string(cwd.join("src/own.rs")).unwrap(), OWN_SRC, "源文件已还原");
+        assert_eq!(std::fs::read_to_string(cwd.join("src/other.rs")).unwrap(), "fn x() {}\n", "范围外文件已还原");
+
+        let baseline = SyncCodeBaseline::take(cwd, "own");
+        std::fs::write(
+            cwd.join("src/own.rs"),
+            format!("// 学习副本——原始出处：src/own.rs:2-3\n{OWN_SRC}"),
+        )
+        .unwrap();
+        let err = baseline.check_and_restore(cwd).expect_err("副本头被带进源码");
+        assert!(err.contains("学习副本"), "{err}");
+    }
+
+    /// 第一次同步改了代码：引擎还原源文件并点名，第二次只加注释才放行。
+    #[tokio::test]
+    async fn learn_loop_sync_code_reverts_code_changes_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+
+        let server = wiremock::MockServer::start().await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("同步注释改到了代码"))
+            .respond_with(move |_: &wiremock::Request| {
+                std::fs::write(cwd.join("src/own.rs"), OWN_SYNCED).unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("src/own.rs：加了 2 处注释"))
+            })
+            .mount(&server)
+            .await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("SYNC_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                std::fs::write(
+                    cwd.join("src/own.rs"),
+                    OWN_SYNCED.replace("let t = s;", "let t = s.clone();"),
+                )
+                .unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("src/own.rs：加了注释"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "sync_code"
+role = "tutor"
+task = "SYNC_STEP {{plan_out}}"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权 同步注释", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次只加注释，应成功");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 3, "doc 一次 + sync_code 两次：{bodies:?}");
+        assert!(bodies[2].contains("s.clone()"), "重试 prompt 要点名改坏的那一行");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/own.rs")).unwrap(),
+            OWN_SYNCED
+        );
     }
 
     const LEARN_DRAFT: &str = "# 所有权\n\n每个值有唯一 owner，见 src/own.rs:2-3。\n\n```mermaid\ngraph LR\n  a --> b\n```\n\n借用见 src/borrow.rs:5-9，借用不能比 owner 活得久。\n";
