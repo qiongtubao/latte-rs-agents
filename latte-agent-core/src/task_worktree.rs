@@ -140,8 +140,17 @@ pub fn with_repo_lock<T>(repo_root: &Path, f: impl FnOnce() -> T) -> T {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceError> {
+    git_env(cwd, args, &[])
+}
+
+fn git_env(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, &std::ffi::OsStr)],
+) -> Result<String, WorkspaceError> {
     let out = std::process::Command::new("git")
         .args(args)
+        .envs(envs.iter().copied())
         .current_dir(cwd)
         .output()
         .map_err(|e| WorkspaceError::GitFailed(format!("spawn git {args:?}: {e}")))?;
@@ -199,6 +208,66 @@ fn project_slug(repo_root: &Path) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{name}-{:08x}", (h & 0xffff_ffff) as u32)
+}
+
+/// 会话工作区派生点（未提交改动快照）的 ref：`<前缀><session_id>`。
+const SESSION_BASE_REF: &str = "refs/latte/session-base/";
+
+/// 把 `checkout` 里已跟踪文件的未提交改动（含已暂存）拍成一个提交，父提交
+/// 是它的 HEAD。用临时 index，不动用户的 index 和工作区。没有改动返回 None。
+///
+/// 未跟踪的新文件不收：没进 .gitignore 的 node_modules、构建产物会被整个
+/// 打进对象库。
+fn snapshot_uncommitted(checkout: &Path, tag: &str) -> Result<Option<String>, WorkspaceError> {
+    let head = git(checkout, &["rev-parse", "HEAD"])?;
+    let git_path = |p: &str| -> Result<PathBuf, WorkspaceError> {
+        git(
+            checkout,
+            &["rev-parse", "--path-format=absolute", "--git-path", p],
+        )
+        .map(PathBuf::from)
+    };
+    let index = git_path(&format!("latte-snapshot-{tag}.index"))?;
+    // 复制真 index 而不是 read-tree：带着 stat 缓存，add -u 不必重哈希全仓。
+    if std::fs::copy(git_path("index")?, &index).is_err() {
+        git_env(
+            checkout,
+            &["read-tree", "HEAD"],
+            &[("GIT_INDEX_FILE", index.as_os_str())],
+        )?;
+    }
+    let result = (|| {
+        let env = [("GIT_INDEX_FILE", index.as_os_str())];
+        git_env(checkout, &["add", "-u", "--", "."], &env)?;
+        let tree = git_env(checkout, &["write-tree"], &env)?;
+        if tree == git(checkout, &["rev-parse", "HEAD^{tree}"])? {
+            return Ok(None);
+        }
+        // 快照在保留分支时会被 rebase 掉，不进用户历史；身份用固定值，
+        // 免得用户没配 user.name 时整个会话建不出来。
+        let ident = std::ffi::OsStr::new("latte");
+        let mail = std::ffi::OsStr::new("latte@local");
+        git_env(
+            checkout,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-m",
+                "latte: 会话开始时的未提交改动（快照）",
+            ],
+            &[
+                ("GIT_AUTHOR_NAME", ident),
+                ("GIT_AUTHOR_EMAIL", mail),
+                ("GIT_COMMITTER_NAME", ident),
+                ("GIT_COMMITTER_EMAIL", mail),
+            ],
+        )
+        .map(Some)
+    })();
+    let _ = std::fs::remove_file(&index);
+    result
 }
 
 /// 任务 id 能否安全用作目录名/分支名的一段。
@@ -267,6 +336,16 @@ impl TaskWorktree {
         task_id: &str,
         base: Option<&str>,
     ) -> Result<Self, WorkspaceError> {
+        Self::open_or_create_at(repo_root, task_id, base, None)
+    }
+
+    /// 同 [`Self::open_or_create`]；新建分支时从 `start`（缺省 base 分支）拉出。
+    fn open_or_create_at(
+        repo_root: &Path,
+        task_id: &str,
+        base: Option<&str>,
+        start: Option<&str>,
+    ) -> Result<Self, WorkspaceError> {
         if !safe_task_id(task_id) {
             return Err(WorkspaceError::TaskIdInUse(format!(
                 "task_id {task_id:?} 不能用作目录/分支名"
@@ -306,7 +385,10 @@ impl TaskWorktree {
                 return Ok(wt);
             }
 
-            let base_sha = git(repo_root, &["rev-parse", &base_branch])?;
+            let base_sha = match start {
+                Some(sha) => sha.to_string(),
+                None => git(repo_root, &["rev-parse", &base_branch])?,
+            };
             std::fs::create_dir_all(root.parent().expect("derive_root 至少两级"))?;
             let root_str = root.to_str().ok_or_else(|| {
                 WorkspaceError::GitFailed(format!("worktree 路径非 UTF-8: {}", root.display()))
@@ -469,15 +551,18 @@ impl TaskWorktree {
         if !self.info.root.exists() {
             return Ok(false);
         }
-        let dirty = !git(
-            &self.info.root,
-            &["status", "--porcelain", "--", ".", EXCLUDE_STATE_PATHSPEC],
-        )?
-        .is_empty();
-        if dirty {
+        if self.is_dirty()? {
             return Ok(true);
         }
         Ok(self.unmerged_commits()? > 0)
+    }
+
+    fn is_dirty(&self) -> Result<bool, WorkspaceError> {
+        Ok(!git(
+            &self.info.root,
+            &["status", "--porcelain", "--", ".", EXCLUDE_STATE_PATHSPEC],
+        )?
+        .is_empty())
     }
 
     /// 任务分支上**还没进 base 分支**的提交数。
@@ -797,6 +882,10 @@ impl TaskWorktree {
     /// 软链回项目状态目录）。非 git / 建树失败 → 直接用项目目录：空目录里
     /// agent 看不到任何源码，读代码的 workflow（learn_loop 取证等）全部失效。
     /// 项目目录不是 [`Self::session_workspace_root`]，删会话时不会被删。
+    ///
+    /// 新建的树从项目里已跟踪文件的未提交改动快照拉出：用户在编辑器里改了
+    /// 还没 commit 的代码，会话里也能读到（learn_loop 取证、行号才对得上）。
+    /// 快照记在 [`SESSION_BASE_REF`] 下，删会话时据此只算会话自己的产出。
     pub fn create_session_workspace(project_root: &Path, session_id: &str) -> std::io::Result<PathBuf> {
         if !safe_task_id(session_id) {
             return Err(std::io::Error::new(
@@ -805,11 +894,54 @@ impl TaskWorktree {
             ));
         }
         if let Ok(repo) = Self::resolve_repo_root(project_root) {
-            if let Ok(wt) = Self::open_or_create(&repo, session_id, None) {
+            let fresh = !Self::derive_root(&repo, session_id).join(".git").exists();
+            let snapshot = if fresh {
+                snapshot_uncommitted(project_root, session_id)
+                    .map_err(|e| eprintln!("[sessions] 未提交改动快照失败，会话从 HEAD 开始: {e}"))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            if let Ok(wt) = Self::open_or_create_at(&repo, session_id, None, snapshot.as_deref()) {
+                if let Some(sha) = &snapshot {
+                    let _ = git(
+                        &repo,
+                        &["update-ref", &format!("{SESSION_BASE_REF}{session_id}"), sha],
+                    );
+                }
                 return Ok(wt.info.root);
             }
         }
         Ok(project_root.to_path_buf())
+    }
+
+    /// 保留会话分支前去掉开头的快照提交：分支只剩会话自己的提交，接在原
+    /// HEAD 上。不去掉的话，用户合并分支会把自己工作区里仍未提交的那些改动
+    /// 再合进来一遍，git 直接拒绝（本地改动会被覆盖）。
+    /// 变基冲突时保持原样：快照还在，但会话的产出一行不丢。
+    fn drop_session_snapshot(&self, snapshot: &str) {
+        with_repo_lock(&self.repo_root, || {
+            let root = &self.info.root;
+            if self.is_dirty().unwrap_or(false) {
+                let msg = format!("task({}): WIP 未完成的改动（保留分支）", self.task_id);
+                if self
+                    .add_all()
+                    .and_then(|_| git(root, &["commit", "-m", &msg]).map(|_| ()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let parent = format!("{snapshot}^");
+            if let Err(e) = git(root, &["rebase", "--onto", &parent, snapshot]) {
+                let _ = git(root, &["rebase", "--abort"]);
+                eprintln!(
+                    "[sessions] {}: 去掉未提交改动快照失败，分支里保留快照提交: {e}",
+                    self.task_id
+                );
+            }
+        });
     }
 
     /// 删除 [`create_session_workspace`] 建的目录。`root` 必须恰好是该 session
@@ -847,8 +979,24 @@ impl TaskWorktree {
                         base_sha: git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default(),
                     },
                 );
-                let keep = wt.has_changes().unwrap_or(true);
+                let base_ref = format!("{SESSION_BASE_REF}{session_id}");
+                let snapshot = git(&repo, &["rev-parse", "--verify", "--quiet", &base_ref]).ok();
+                // 有快照时以快照为基准：快照本身不是会话的产出。
+                let keep = match &snapshot {
+                    Some(s) => {
+                        wt.is_dirty().unwrap_or(true)
+                            || git(root, &["rev-list", "--count", &format!("{s}..HEAD")])
+                                .map_or(true, |n| n != "0")
+                    }
+                    None => wt.has_changes().unwrap_or(true),
+                };
+                if let (true, Some(s)) = (keep, &snapshot) {
+                    wt.drop_session_snapshot(s);
+                }
                 let _ = wt.cleanup(keep);
+                if snapshot.is_some() {
+                    let _ = git(&repo, &["update-ref", "-d", &base_ref]);
+                }
                 if keep {
                     kept = Some(wt.info.branch.clone());
                 }
@@ -1023,5 +1171,47 @@ mod session_workspace_tests {
         assert_eq!(TaskWorktree::remove_session_workspace(r, "ui-1-2-w2", &ws), None);
         assert!(!ws.exists());
         assert!(!branch_exists(r, &format!("{TASK_BRANCH_PREFIX}ui-1-2-w2")));
+
+        // 用户改了 main.c 还没 commit：会话里读到的是改后的版本，用户的
+        // 工作区和 index 原样不动。
+        let head = String::from_utf8_lossy(&git_in(r, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        let edited = "int main(){ return 1; }\n";
+        std::fs::write(r.join("main.c"), edited).unwrap();
+        std::fs::write(r.join("new.c"), "// 未跟踪\n").unwrap();
+        let status_before = git_in(r, &["status", "--porcelain"]).stdout;
+        let ws = TaskWorktree::create_session_workspace(r, "ui-1-2-w3").unwrap();
+        assert_eq!(std::fs::read_to_string(ws.join("main.c")).unwrap(), edited);
+        assert!(!ws.join("new.c").exists(), "未跟踪文件不进快照");
+        assert_eq!(git_in(r, &["status", "--porcelain"]).stdout, status_before);
+        assert!(git_in(r, &["diff", "--cached", "--quiet"]).status.success());
+        // 会话自己没产出：快照不算改动，树、分支、快照 ref 一起删。
+        assert_eq!(TaskWorktree::remove_session_workspace(r, "ui-1-2-w3", &ws), None);
+        assert!(!branch_exists(r, &format!("{TASK_BRANCH_PREFIX}ui-1-2-w3")));
+        assert!(!git_in(
+            r,
+            &["rev-parse", "--verify", "--quiet", &format!("{SESSION_BASE_REF}ui-1-2-w3")]
+        )
+        .status
+        .success());
+
+        // 会话有产出：保留的分支直接接在原 HEAD 上，只有会话自己的文档，
+        // 不夹带用户那份未提交的 main.c。
+        let ws = TaskWorktree::create_session_workspace(r, "ui-1-2-w4").unwrap();
+        std::fs::create_dir_all(ws.join("docs/learn")).unwrap();
+        std::fs::write(ws.join("docs/learn/own.md"), "# 所有权\n").unwrap();
+        let branch = format!("{TASK_BRANCH_PREFIX}ui-1-2-w4");
+        assert_eq!(
+            TaskWorktree::remove_session_workspace(r, "ui-1-2-w4", &ws),
+            Some(branch.clone())
+        );
+        let parent = git_in(r, &["rev-parse", &format!("{branch}^")]).stdout;
+        assert_eq!(String::from_utf8_lossy(&parent).trim(), head);
+        let main_c = git_in(r, &["show", &format!("{branch}:main.c")]).stdout;
+        assert_eq!(String::from_utf8_lossy(&main_c), "int main(){}\n");
+        let doc = git_in(r, &["show", &format!("{branch}:docs/learn/own.md")]).stdout;
+        assert_eq!(String::from_utf8_lossy(&doc), "# 所有权\n");
+        assert_eq!(std::fs::read_to_string(r.join("main.c")).unwrap(), edited);
     }
 }
