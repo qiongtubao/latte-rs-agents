@@ -1,8 +1,8 @@
 # Workflow: learn_loop（v2：文档驱动学习循环）
 # plan（取证 + 拆知识点 + 出题）→ annotate（注释版代码副本，默认生成）
-#   → doc（写/增强学习文档 draft.md）
+#   → doc_review（嵌套 doc_review_loop：outline → 按知识点并发 write_chapter，装配 draft.md）
 #   → read_confirm（「开始答题」按钮，等学员读完）→ quiz（批量出题 + 判分 + 写账本，
-#   有错跳回 doc 增强）→ supplement（全对后问"还有不懂的吗"，有补充跳回 doc）
+#   有错跳回 doc_review，只重写答错的章）→ supplement（全对后问"还有不懂的吗"，有补充跳回 doc_review）
 #   → merge（定稿 docs/learn/<slug>.md）→ [sync_code（可选：注释写进源码）] → report
 #
 # 用法：/learn_loop <主题>，或 manager 调 workflow { name: "learn_loop", topic: "…" }
@@ -224,55 +224,6 @@ draft=.latte/learn/{{plan_out}}/draft.md
 plan=.latte/learn/{{plan_out}}/plan.json
 ledger=.latte/learn/{{plan_out}}/ledger.json
 """
-
-# 兼容保留旧定义；实际执行由上面的 doc_review 嵌套 step 接管。
-[[steps]]
-id = "legacy_doc"
-description = "兼容保留：旧扁平 doc step（已由 doc_review 接管）"
-role = "tutor"
-output_key = "legacy_doc_out"
-when_any = ["__legacy_flat_learn_loop__"]
-max_retries = 1
-tools = ["read", "code_graph", "search", "edit", "write"]
-require_tools_any = ["edit", "write"]
-task = """你是互动学习辅导员，负责维护学习文档。当前主题 slug：{{plan_out}}。
-
-读 `.latte/learn/{{plan_out}}/plan.json` 与 `ledger.json`，若已经存在 `draft.md`，必须先读取并刷新它。
-
-## 首次进入（prompt 里没有上一轮的判分结果或补充问题）
-
-按 plan.json 的 `doc_outline` 写或刷新 `.latte/learn/{{plan_out}}/draft.md`。**读者是零
-基础小白**——写得像考据报告就是失败。开头先讲大白话和全局心智模型，按大纲展开核心数据结构与运行原理；
-术语首次出现一句大白话解释；每个知识点必须带最小具体例子（以 example 为底）；
-代码摘录后必须跟逐行讲解；每节末尾用一句「人话总结」收束本节。
-
-## 返工进入：QUIZ_FAIL（prompt 里带上一轮的「判分结果」「你选的是」）
-
-学员答错了。只增强答错点对应的 `doc_section`：加「易错点辨析」小节，讲清正确答案与干扰项区别。
-用 `edit` 做局部修改，不要用 `write` 整文件覆写。
-
-## 返工进入：SUPPLEMENT（prompt 里带学员的补充问题）
-
-学员全对后主动提出还有不懂的。用 `edit` 把补充内容追加为 draft.md 的新章节，并补全 plan/ledger。
-
-## 正文（学员在 chat 里直接读的部分）
-
-把 draft.md 的全文原样作为正文输出，文末注明路径并提示「读完后点击「开始答题」」。
-返工轮次只输出本轮变更部分。"""
-[steps.output_contract]
-min_chars = 500
-forbid = ["正确答案是", "答案：", "选项 A", "选项一"]
-
-[[steps]]
-id = "legacy_proofread"
-description = "兼容保留：旧扁平 proofread step"
-role = "proofreader"
-output_key = "legacy_proofread_out"
-when_any = ["__legacy_flat_learn_loop__"]
-max_retries = 1
-tools = ["read"]
-require_tools = ["read"]
-task = """你是零基础读者 proofreader，只读不改。通读 draft.md，检查大白话解释、代码注释、推导与例子。"""
 
 # ═══ 3. 等学员读完：「开始答题」按钮 ═════════════════════════
 # tools            只读 + ask：不许改文档和账本。

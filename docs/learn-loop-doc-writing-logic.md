@@ -30,7 +30,6 @@ plan ─► annotate ─► doc_review ─► [引擎装配draft.md] ─► read
 
 - `read_confirm`、`quiz` 由引擎确定性执行（弹窗、判分、写账本不走模型）。
 - `doc_review` 是一个**嵌套 workflow**（`doc_review_loop`），不是单个模型步。
-  旧的 `legacy_doc` / `legacy_proofread` 只是兼容保留，`when_any = ["__legacy_flat_learn_loop__"]` 永不触发。
 
 ## 3. 产物目录：每个文件谁写、谁读
 
