@@ -1,16 +1,15 @@
 # Workflow: doc_review_loop
-# 学习文档「并发写作 + 分章审查」闭环（DAG，按 wave 执行）：
-#   wave0 outline   ：写主体框架 sections/00_overview.md + index.md（子章节链接），
-#                     并把返工意见按章拆到 feedback.md（首轮 MODE: FULL）
+# 学习文档「主体框架 + 并发写作」（DAG，按 wave 执行）：
+#   wave0 outline   ：写主体框架 sections/00_overview.md + index.md（子章节链接）
 #   wave1 write_chapter：引擎按 plan.json 的 knowledge_points **每章派发一次**（fan_out），
 #                     并发度受引擎信号量限制（LATTE_WORKFLOW_CONCURRENCY，缺省 4），
 #                     章节比并发度多时引擎自动排队，有空位就派下一章——章节数不受限，
 #                     分派完全由引擎负责，模型只写自己被分到的那一章
-#   wave2 proofread ：读 sections + 源码核对；事实错误以源码为准；教学缺陷才算 BLOCKER
-# NEEDS_FIX → 回 outline（wave0）拆意见 → 只有被点名的章节重写，其余章节的派发任务直接 UNCHANGED。
+# 章节写完就返回外层。学员阅读、答题；答错才按 feedback.md 重写被点名的章。
+# 不再等另一个模型输出 LOOKS_CLEAR。
 # draft.md 由引擎在控制步（read_confirm/quiz）前从 sections 自动装配，writer 不写它。
 name = "doc_review_loop"
-description = "主体框架先行 + 各章并发写作 + 对照源码的分章审查，最多 3 轮｜落点：.latte/learn/<slug>/{index.md,sections/*.md}"
+description = "主体框架先行 + 各章并发写作，写完即交给学员｜落点：.latte/learn/<slug>/{index.md,sections/*.md}"
 max_rounds = 1
 
 [[steps]]
@@ -28,12 +27,17 @@ task = """你是学习文档的总编，负责**主体框架**与**返工分派*
 
 先读 plan.json、ledger.json（以及已有的 sections/ 文件，若有）。工作目录 .latte/learn/<slug>/。
 
-## 一、主体框架 sections/00_overview.md（必写；返工时仅当意见涉及全局比喻/主线时改）
-1. 全局心智模型：一个贴切的生活化比喻，把核心角色/规格映射成实体；
-2. 端到端全景图（Spine）：一次典型操作从头到尾的流转链路；
-3. **学习路径**：按「由浅入深、后一章依赖前一章」的因果顺序说明各章要回答的**设计问题**
-   （不是代码文件清单）：这一章解决前一章留下的哪个矛盾，作者为何这样取舍；
-4. 各章链接：`[k1 标题](k1.md)` 相对链接。
+## 一、主体框架 sections/00_overview.md（必写；返工时仅当意见涉及全局设计/主线时改）
+这一页是电梯演讲：只读这一页也要能说出问题、核心思路和关键取舍。以 plan.json 的 `design` 为底
+（没有 `design` 时从知识点和源码注释归纳）：
+1. **一句话结论**：`design.core_idea`；
+2. **要解决的问题与约束**：`design.problem`，配一个不这样做会出什么事的真实场景；
+3. **设计决策总览表**：`| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |`，每行一个 decision，链到对应章节；
+4. 端到端全景：一次典型操作从头到尾（ASCII 或 mermaid，节点写动作，不写函数名）；
+5. **学习路径**：各章要回答的设计问题，后一章解决前一章留下的哪个矛盾；
+6. **概念归属表**：`| 概念 | 负责讲解的章 |`，每个会被多章用到的概念只归一章讲完；
+7. 各章链接：`[k1 标题](k1.md)`。
+比喻可选，全文最多一个。不科普通用语言/库概念。
 
 ## 二、index.md（必写）
 文档入口：一句话主题 + 阅读顺序 + 各章相对链接（sections/<k_id>.md）+ 一句话摘要。
@@ -42,10 +46,13 @@ task = """你是学习文档的总编，负责**主体框架**与**返工分派*
 - 本 prompt 末尾**没有**【上轮审查反馈】→ 首轮：写入单行 `MODE: FULL`（全部章节重写）。
 - **有**【上轮审查反馈】→ `MODE: PATCH`，随后按章节 id 分组抄录每条 ISSUE 的原文：
   `## k3\n- <ISSUE 原文>`；只有被点名的章节会被重写，未点名的章节保持不动。
-  若反馈里含「【按章分组的返工意见】」块（学员答题答错，由引擎生成），把该块里的
-  `## <k_id>` 分组**原样抄进** feedback.md，不要自己重新判断是哪一章。
-  全局性意见（比喻/主线/章节顺序）用 `## overview` 分组并当场改 00_overview.md 与 index.md。
+    全局性意见（比喻/主线/章节顺序）用 `## overview` 分组并当场改 00_overview.md 与 index.md。
   绝不自己去改 sections/k*.md。
+
+若 feedback.md 已含 `SOURCE: engine`（quiz 答错或学员补充由引擎写入）：
+- 保持 `MODE: PATCH`，保留已有 `## <章节id>` 分组，不要改成 `MODE: FULL`，不要删这些分组；
+- 只允许追加 `## overview`；
+- `supplement` 为 true、或 id 形如 `sup1` 的知识点，选项和 answer 由引擎维护（两选一），不要改它们，不要补成四选项。章节 writer 只写 sections/<id>.md。
 
 严格以源码为事实来源；无法取证的写「[推测]」。输出：一句话说明写了哪些文件与本轮模式。"""
 [steps.output_contract]
@@ -59,7 +66,7 @@ output_key = "chapters_out"
 # 引擎强制：每个并发章节 writer 只能写自己那一章，无法覆盖别人的文件。
 write_path_allowlist = [".latte/learn/{{slug}}/sections/{{item_id}}.md"]
 depends_on = ["outline"]
-max_retries = 1
+max_retries = 2
 tools = ["read", "code_graph", "search", "edit", "write"]
 task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 个）。
 引擎并发派发多个 writer，各写各的章节：只写你自己的 sections/{{item_id}}.md，不读、不改别的章节文件。
@@ -70,7 +77,9 @@ task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}`
 ## 先判断要不要写
 读 feedback.md（不存在按 MODE: FULL）：
 - `MODE: PATCH` 且没有 `## {{item_id}}` 分组，且 sections/{{item_id}}.md 已存在 → 只输出 `UNCHANGED` 并结束；
-- 有 `## {{item_id}}` 分组 → 只针对这些意见修改已有文件，其余保持稳定；
+- 有 `## {{item_id}}` 分组 → 只针对这些意见在已有文件上**增补**（如「易错点辨析」）。
+  原有段落、`file:line` 出处和代码摘录一律保留，不许整章推倒。引擎会核对出处是否还在、
+  篇幅有没有被砍掉；不合格会还原原文件并要求重写。
 - `MODE: FULL` → 整章重写（旧文件只当参考，质量不行推倒重来）。
 写完 write 落盘到 .latte/learn/<slug>/sections/{{item_id}}.md。
 
@@ -78,19 +87,19 @@ task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}`
 读 sections/00_overview.md 了解全局比喻与本章位置，再**自己读源码取证**
 （evidence 行号区间必须实际读出来；不许凭记忆、不许沿用旧章节里未核对的说法）。
 
-## 章节写作标准（这是学习材料，不是源码翻译；目标是读完能复述「作者为什么这么设计」）
-每章必须依次回答，用小标题组织：
-1. **它是什么 / 要解决什么问题**：承接 00_overview 的比喻，大白话，术语首现即解释；
-2. **作者的设计与动机**：为什么是这个方案。依据只能来自源码注释、文档、实现本身的必然性；
-   无法取证的判断标「[推测]」，不许把猜测写成事实；
-3. **备选方案与取舍**：至少一个真实可行的替代方案，说明作者为什么没选；
-   用**表格**列「方案 / 好处 / 坏处」，好处坏处要具体（数值、内存、指令数、碎片率），
-   并给出「这个设计的代价与失效场景」；
-4. **怎么存 / 怎么运转**：物理布局或调用链，配图（ASCII）；
-5. **真实源码**：贴**原文**关键片段（`file:start-end`），关键行行内中文注释。
-   **严禁**「简化版」「…省略」「伪代码」冒充源码；太长就分段贴真实行或只引行范围；
-6. **最小示例**：具体输入 → 每一步中间值 → 输出，算式必须自己重算一遍；
-7. **本章小结与承上启下**：一句话结论 + 引出下一章要解决的矛盾。
+## 章节写作标准（设计分析，不是源码翻译；读完要能复述「作者为什么这么设计」）
+读者是有编程基础、没读过这段代码的工程师。本章只回答一个设计问题：本知识点 `decision`
+指向的那条 `design.decisions`。先给结论，再讲推理，最后才上代码。前 3 段必写，后面有新东西再写：
+1. **设计问题与结论**（开头 2-4 句）；
+2. **约束**：为什么直觉做法行不通，最好有真实失败场景；
+3. **方案对比**：至少两个真实可行方案（含作者的），表格在同一组维度上比。不许拿稻草人凑数。
+   总览表已经列过的，这里展开依据和失效场景，不要原样再贴一遍。依据来自注释/测试/文档，无依据标「[推测]」；
+4. **实现如何落地**（有承载代码才写）：贴原文（`file:start-end`），行内注释讲这行守护哪个约束。
+   **严禁**「简化版」「…省略」「伪代码」；
+5. **最小示例**（分支不显然时才写）：输入 → 中间值 → 输出；能写就写换成替代方案会怎样；
+6. **代价与边界**；
+7. **本章要点**：1-3 条 bullet，引出下一章矛盾。
+不重复别章（按概念归属表链接）、不科普通用概念、不贴符号索引图。
 不要在章节末尾写「本文件完整内容 = draft.md 行 xx-yy」之类的行号锚点或过程说明。"""
 
 [steps.fan_out]
@@ -98,52 +107,5 @@ file = ".latte/learn/{{slug}}/plan.json"
 items = "knowledge_points"
 id_key = "id"
 max_items = 32
-# 单章失败不拖垮其余章节；失败章节的产出以 FAN_OUT_ITEM_FAILED 开头，审稿员按缺章判 BLOCKER。
+# 单章失败不拖垮其余章节；失败章节的产出以 FAN_OUT_ITEM_FAILED 开头。
 tolerate_failures = true
-
-[[steps]]
-id = "proofread"
-description = "对照源码审查各章：事实错误、设计动机/取舍是否讲清、是否适合学习"
-role = "proofreader"
-depends_on = ["write_chapter"]
-output_key = "review_out"
-max_retries = 1
-loop_until = "LOOKS_CLEAR"
-loop_back_to = "outline"
-max_iterations = 3
-prompt_token_ratio = 0.8
-context_overflow_restart = true
-context_overflow_max_restarts = 2
-context_overflow_files = ["index.md"]
-tools = ["read", "search", "code_graph", "doc_graph_context"]
-require_tools = ["read"]
-task = """你是学习文档审稿员，只读不改。既是零基础读者，也是**对照源码的核查员**。
-
-契约：
-{{topic}}
-
-阅读顺序：.latte/learn/<slug>/index.md → sections/00_overview.md → sections/<k_id>.md（按 plan.json 顺序）。
-可以（且应当）读源码抽查：每章至少核对 2 处关键代码片段/数值是否与源码一致。
-草稿里的行号偏差、措辞、格式**只算 NIT，不许因此判 NEEDS_FIX**。
-
-章节写作步骤的汇总产出（含失败标记，`FAN_OUT_ITEM_FAILED <k_id>: 原因` 表示该章写作失败）：
-{{chapters_out}}
-出现失败标记或 sections/<k_id>.md 缺失 = 该章缺章，按 BLOCKER 报（章节写 k_id）。
-
-## BLOCKER（必须修，才允许 NEEDS_FIX）
-- **事实错误**：代码/数值/算式与源码不符，或引用了不存在的代码（须你亲自读源码确认后才能报）；
-- **「简化版」「…省略」伪代码冒充源码**；
-- **没讲清作者为什么这么设计**：缺设计动机、缺备选方案对比、缺好处/坏处（或只有空话，无数值/依据）；
-- **把猜测写成事实**（无源码注释/实现依据却断言作者意图，且未标「[推测]」）；
-- **不适合学习**：章节顺序跳跃、后文依赖前文没讲的概念、章与章之间互相重复或矛盾、只是罗列代码没有讲解。
-## NIT
-措辞、图表偏密、术语铺垫、行号小偏差、排版。
-
-逐条输出：
-ISSUE: <章节 k_id 或 overview> | <BLOCKER/NIT> | <类别> | <具体问题（事实错误须写明源码 file:line 与正确内容）> | <应补内容>
-章节 id 必须写准确（返工按它分派给对应 writer）。
-
-放行规则（引擎靠最后一行判定）：存在任一 BLOCKER → 最后一行 NEEDS_FIX；否则 LOOKS_CLEAR。
-除最后一行外不要输出这两个标记。"""
-[steps.output_contract]
-last_line_prefix_any = ["LOOKS_CLEAR", "NEEDS_FIX"]

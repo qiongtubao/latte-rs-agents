@@ -12,7 +12,7 @@
 //!   2. `$LATTE_HOME/workflows.d/<name>.toml` (or `~/.latte/workflows.d/`)
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -3250,6 +3250,92 @@ async fn deterministic_learning_ask(
 /// 确定性装配：如果 `.latte/learn/<slug>/sections/` 目录下存在分段章节
 /// （`00_overview.md` 与各个 `<id>.md`），按 plan.json 的知识点顺序自动拼装成完整的 `draft.md`。
 /// 这是「B套A」分段打磨机制的装配引擎，零模型调用、保证拼接顺序确定与零内容丢失。
+fn format_design_spine(plan: &serde_json::Value) -> Option<String> {
+    let design = plan.get("design")?;
+    let core = design.get("core_idea")?.as_str()?.trim();
+    if core.is_empty() {
+        return None;
+    }
+    let decisions = design.get("decisions")?.as_array()?;
+    if decisions.is_empty() {
+        return None;
+    }
+    let cell = |s: &str| s.trim().replace('|', "/").replace('\n', " ");
+    let mut out = String::from("## 核心结论与设计决策\n\n");
+    out.push_str(&format!("**一句话结论**：{core}\n\n"));
+    if let Some(problem) = design
+        .get("problem")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(problem);
+        out.push_str("\n\n");
+    }
+    out.push_str("| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for d in decisions {
+        let alts = d
+            .get("alternatives")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a.get("name").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("；");
+        let field = |key: &str| cell(d.get(key).and_then(|v| v.as_str()).unwrap_or(""));
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            field("question"),
+            field("chosen"),
+            cell(&alts),
+            field("why"),
+            field("cost"),
+        ));
+    }
+    Some(out)
+}
+fn is_symbol_index_mermaid(block: &str) -> bool {
+    let labels: Vec<&str> = block
+        .split("[\"")
+        .skip(1)
+        .filter_map(|s| s.split("\"]").next())
+        .collect();
+    if labels.len() < 4 {
+        return false;
+    }
+    let symbolic = labels
+        .iter()
+        .filter(|l| {
+            ["fn ", "struct ", "enum ", "type ", "trait "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .count();
+    symbolic * 10 > labels.len() * 6
+}
+fn strip_symbol_index_mermaid(md: &str) -> String {
+    let mut out = String::new();
+    let mut rest = md;
+    while let Some(start) = rest.find("```mermaid") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "```mermaid".len()..];
+        if let Some(end) = after.find("```") {
+            let block = &after[..end];
+            if !is_symbol_index_mermaid(block) {
+                out.push_str("```mermaid");
+                out.push_str(block);
+                out.push_str("```");
+            }
+            rest = &after[end + 3..];
+        } else {
+            out.push_str(&rest[start..]);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
 pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<bool, String> {
     let sections_dir = base.join("sections");
     if !sections_dir.is_dir() {
@@ -3265,12 +3351,18 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
 
     let mut combined = String::new();
 
+    // 引擎写入决策脊梁。plan 没有 design 时跳过，旧文档装配行为不变。
+    if let Some(spine) = format_design_spine(&plan) {
+        combined.push_str(&spine);
+        combined.push_str("\n\n---\n\n");
+    }
+
     // 1. 全局框架与心智模型（00_overview.md）
     let overview_file = sections_dir.join("00_overview.md");
     if overview_file.is_file() {
         let content = std::fs::read_to_string(&overview_file).unwrap_or_default();
         if !content.trim().is_empty() {
-            combined.push_str(content.trim());
+            combined.push_str(&strip_symbol_index_mermaid(content.trim()));
             combined.push_str("\n\n---\n\n");
         }
     }
@@ -3302,7 +3394,7 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
                 if let Some(p) = cand {
                     if let Ok(sec_text) = std::fs::read_to_string(&p) {
                         if !sec_text.trim().is_empty() {
-                            combined.push_str(sec_text.trim());
+                            combined.push_str(&strip_symbol_index_mermaid(sec_text.trim()));
                             combined.push_str("\n\n---\n\n");
                         }
                     }
@@ -3319,26 +3411,925 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
     Ok(false)
 }
 
-/// learn_loop 返工（quiz 答错 / supplement 有补充）跳回 doc_review 时，
-/// 文档即将演进一版：`ledger.round` +1 并写盘。
-///
-/// 必须由引擎做、不能交给模型 prompt：`read_confirm` / `supplement` 的题面靠
-/// `round` 保持文本唯一，否则 [`AnswerLog::recall`] 会静默回放上一轮答案、
-/// 不弹窗，学员没读新版就进入 quiz。账本缺失/损坏时静默跳过（首次运行前
-/// plan 步已保证其存在，这里不是失败理由）。
-fn bump_learn_round(cwd: &Path, slug: &str) {
-    let path = cwd.join(".latte").join("learn").join(slug).join("ledger.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(mut ledger) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let round = ledger["round"].as_u64().unwrap_or(0) + 1;
-    ledger["round"] = serde_json::Value::from(round);
-    if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
-        let _ = std::fs::write(&path, bytes);
+fn write_ledger(base: &std::path::Path, ledger: &serde_json::Value) -> Result<(), String> {
+    std::fs::write(
+        base.join("ledger.json"),
+        serde_json::to_vec_pretty(ledger).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn read_learn_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// 知识点能否出卷：至少两个选项，且 answer 非空。
+/// 学员补充由引擎写成固定两选一，登记后即可出卷。
+fn point_is_gradeable(point: &serde_json::Value) -> bool {
+    let answer = point["answer"].as_str().unwrap_or("").trim();
+    let options = point["options"].as_array().map(|a| a.len()).unwrap_or(0);
+    !answer.is_empty() && options >= 2
+}
+
+/// 多题收齐后的一行是 `1. label`；测试夹具用 `id→label`。
+/// 两者都剥成选项原文，避免序号前缀被当成答案的一部分。
+fn quiz_given_label(line: &str) -> String {
+    let line = line.trim();
+    if let Some((_, value)) = line.split_once('→') {
+        return value.trim().to_string();
     }
+    if let Some((idx, rest)) = line.split_once(". ") {
+        if !idx.is_empty() && idx.chars().all(|c| c.is_ascii_digit()) {
+            return rest.trim().to_string();
+        }
+    }
+    line.to_string()
+}
+
+/// 引擎写入的返工单。章节 writer 只认 `MODE: PATCH` + `## <id>`。
+fn write_engine_feedback(base: &std::path::Path, blocks: &[String]) -> Result<(), String> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let mut body = String::from("MODE: PATCH\nSOURCE: engine\n");
+    for block in blocks {
+        body.push_str(block);
+        if !block.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    std::fs::write(base.join("feedback.md"), body).map_err(|e| e.to_string())
+}
+
+/// outline 开跑前抓住的引擎返工单。模型若把它改成 `MODE: FULL` 或删掉
+/// `SOURCE: engine`，wave 结束前按这份原文写回。
+struct EngineFeedbackGuard {
+    path: PathBuf,
+    original: String,
+}
+
+fn learn_slug_ok(slug: &str) -> bool {
+    !slug.is_empty()
+        && !slug.contains('/')
+        && !slug.contains('\\')
+        && !slug.contains("..")
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn learn_feedback_path(cwd: &Path, vars: &HashMap<String, String>) -> Option<PathBuf> {
+    let slug = vars.get("slug")?.trim();
+    if !learn_slug_ok(slug) {
+        return None;
+    }
+    Some(
+        cwd.join(".latte")
+            .join("learn")
+            .join(slug)
+            .join("feedback.md"),
+    )
+}
+
+fn is_engine_feedback(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("SOURCE: engine"))
+}
+
+/// `MODE: PATCH` 时返回被点名的章节 id（不含 `overview`）。
+/// 没有 MODE，或 MODE 不是 PATCH（首轮 FULL）时返回 None：全部派发。
+fn patch_chapter_ids(text: &str) -> Option<BTreeSet<String>> {
+    let mut mode_patch: Option<bool> = None;
+    let mut ids = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((key, value)) = line.split_once(':') {
+            if key.eq_ignore_ascii_case("MODE") {
+                mode_patch = Some(value.trim().eq_ignore_ascii_case("PATCH"));
+            }
+        }
+        if let Some(rest) = line.strip_prefix("## ") {
+            let id = rest.split_whitespace().next().unwrap_or("");
+            if !id.is_empty() && !id.eq_ignore_ascii_case("overview") {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    match mode_patch {
+        Some(true) => Some(ids),
+        _ => None,
+    }
+}
+
+fn engine_feedback_clobbered(original: &str, current: &str) -> bool {
+    if !is_engine_feedback(original) {
+        return false;
+    }
+    if !is_engine_feedback(current) {
+        return true;
+    }
+    let Some(orig_ids) = patch_chapter_ids(original) else {
+        return false;
+    };
+    match patch_chapter_ids(current) {
+        None => true,
+        Some(cur_ids) => !orig_ids.is_subset(&cur_ids),
+    }
+}
+
+fn capture_engine_feedback(cwd: &Path, vars: &HashMap<String, String>) -> Option<EngineFeedbackGuard> {
+    let path = learn_feedback_path(cwd, vars)?;
+    let original = std::fs::read_to_string(&path).ok()?;
+    if !is_engine_feedback(&original) {
+        return None;
+    }
+    Some(EngineFeedbackGuard { path, original })
+}
+
+/// 模型改坏了引擎返工单就写回原文。没改坏（只追加了 `## overview`）保持不动。
+fn restore_engine_feedback(guard: &EngineFeedbackGuard) -> bool {
+    let current = std::fs::read_to_string(&guard.path).unwrap_or_default();
+    if !engine_feedback_clobbered(&guard.original, &current) {
+        return false;
+    }
+    std::fs::write(&guard.path, &guard.original).is_ok()
+}
+
+fn restore_wave_feedback(
+    guards: &[EngineFeedbackGuard],
+    event_tx: &broadcast::Sender<ChatEvent>,
+    wf_name: &str,
+) {
+    for guard in guards {
+        if restore_engine_feedback(guard) {
+            let _ = event_tx.send(ChatEvent::Status {
+                message: format!(
+                    "[workflow '{wf_name}'] outline 改写了引擎返工单，已恢复 feedback.md"
+                ),
+            });
+        }
+    }
+}
+
+/// PATCH 返工前被点名章节的原文。writer 只该按意见增改，不许整章推倒。
+struct ChapterBaseline {
+    path: PathBuf,
+    original: String,
+}
+
+fn patch_chapter_baseline(
+    wf_name: &str,
+    step_id: &str,
+    cwd: &Path,
+    vars: &HashMap<String, String>,
+) -> Option<ChapterBaseline> {
+    if wf_name != "doc_review_loop" || step_id != "write_chapter" {
+        return None;
+    }
+    let id = vars.get("item_id")?.trim();
+    if !learn_slug_ok(id) {
+        return None;
+    }
+    let feedback = learn_feedback_path(cwd, vars)?;
+    let named = patch_chapter_ids(&std::fs::read_to_string(&feedback).ok()?)?;
+    if !named.contains(id) {
+        return None;
+    }
+    let path = feedback.parent()?.join("sections").join(format!("{id}.md"));
+    let original = std::fs::read_to_string(&path).ok()?;
+    if original.trim().is_empty() {
+        return None;
+    }
+    Some(ChapterBaseline { path, original })
+}
+
+/// 正文里的 `path/file.ext:12` / `path/file.ext:12-48` 出处。
+fn chapter_citations(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| c.is_whitespace() || "()[]（）【】`\"'，,。;；、<>|*：".contains(c))
+        .filter_map(|tok| {
+            let tok = tok.trim_end_matches(['.', ':', '：']);
+            let (path, lines) = tok.rsplit_once(':')?;
+            let (start, end) = lines.split_once('-').unwrap_or((lines, lines));
+            let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+            let file = path.rsplit('/').next()?;
+            (digits(start) && digits(end) && file.contains('.') && !path.contains("://"))
+                .then(|| tok.to_string())
+        })
+        .collect()
+}
+
+/// 返工后的章节必须保留原有全部出处，篇幅不能缩到原文六成以下。
+fn check_chapter_patch(original: &str, current: &str) -> Result<(), String> {
+    if current.trim().is_empty() {
+        return Err("本章文件被清空了".into());
+    }
+    let kept = chapter_citations(current);
+    let missing: Vec<String> = chapter_citations(original)
+        .into_iter()
+        .filter(|c| !kept.contains(c))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("删掉了原有的源码出处：{}", missing.join("、")));
+    }
+    let (before, after) = (original.chars().count(), current.chars().count());
+    if after * 10 < before * 6 {
+        return Err(format!("正文从 {before} 字缩到 {after} 字，像是整章重写"));
+    }
+    Ok(())
+}
+
+/// 不合格就把原文件写回去，避免半成品留在磁盘上给下一轮或学员看到。
+fn reject_chapter_overwrite(baseline: Option<&ChapterBaseline>) -> Result<(), String> {
+    let Some(base) = baseline else {
+        return Ok(());
+    };
+    let current = std::fs::read_to_string(&base.path).unwrap_or_default();
+    if let Err(reason) = check_chapter_patch(&base.original, &current) {
+        let _ = std::fs::write(&base.path, &base.original);
+        return Err(reason);
+    }
+    Ok(())
+}
+
+/// 引擎返工单已经点名要改的章，outline 不必再跑一遍（多一次模型调用，还会
+/// 改动学员读过的总览）。框架文件缺失时仍交给 outline 补写。
+/// 返回 Some(新补的章节链接数) 表示跳过 outline。
+fn skip_outline_for_engine_feedback(guard: &EngineFeedbackGuard) -> Option<usize> {
+    let base = guard.path.parent()?;
+    let index = base.join("index.md");
+    let overview = base.join("sections").join("00_overview.md");
+    if !index.is_file() || !overview.is_file() {
+        return None;
+    }
+    Some(ensure_chapter_links(base, &index, &overview))
+}
+
+/// 学员补充出的新章（如 sup1）要出现在 index.md 与 00_overview.md 的
+/// 章节链接里。已有链接不动，只追加缺的。
+fn ensure_chapter_links(base: &Path, index: &Path, overview: &Path) -> usize {
+    let Ok(plan) = read_learn_json(&base.join("plan.json")) else {
+        return 0;
+    };
+    let mut index_text = std::fs::read_to_string(index).unwrap_or_default();
+    let mut overview_text = std::fs::read_to_string(overview).unwrap_or_default();
+    let mut added = 0;
+    let mut overview_changed = false;
+    for point in plan["knowledge_points"].as_array().into_iter().flatten() {
+        let Some(id) = point["id"].as_str().filter(|id| learn_slug_ok(id)) else {
+            continue;
+        };
+        let title = point["title"].as_str().unwrap_or(id);
+        let index_link = format!("sections/{id}.md");
+        if !index_text.contains(&index_link) {
+            if !index_text.ends_with('\n') && !index_text.is_empty() {
+                index_text.push('\n');
+            }
+            index_text.push_str(&format!("- [{title}]({index_link})\n"));
+            added += 1;
+        }
+        let overview_link = format!("({id}.md)");
+        if !overview_text.contains(&overview_link) {
+            if !overview_text.ends_with('\n') && !overview_text.is_empty() {
+                overview_text.push('\n');
+            }
+            overview_text.push_str(&format!("- [{title}]{overview_link}\n"));
+            overview_changed = true;
+        }
+    }
+    if added > 0 {
+        let _ = std::fs::write(index, index_text);
+    }
+    if overview_changed {
+        let _ = std::fs::write(overview, overview_text);
+    }
+    added
+}
+
+/// `doc_review_loop` 的 write_chapter：feedback.md 为 MODE: PATCH 时，
+/// 只允许派发被 `## <id>` 点名的章。None = 不限制（首轮或 MODE: FULL）。
+fn patch_fan_out_allowlist(
+    wf_name: &str,
+    step_id: &str,
+    cwd: &Path,
+    vars: &HashMap<String, String>,
+) -> Option<BTreeSet<String>> {
+    if wf_name != "doc_review_loop" || step_id != "write_chapter" {
+        return None;
+    }
+    let path = learn_feedback_path(cwd, vars)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    patch_chapter_ids(&text)
+}
+
+/// 再跑 learn_loop 之前，各 slug 目录里已经记过的账。
+struct LedgerSnapshot {
+    slug: String,
+    topic: String,
+    ledger: serde_json::Value,
+}
+
+fn normalize_learn_topic(topic: &str) -> String {
+    let mut text = topic.to_string();
+    for word in ["同步注释", "写进源码"] {
+        text = text.replace(word, " ");
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const LEDGER_BACKUP: &str = "ledger.prev.json";
+
+/// 账本里有没有值得保留的进度。空账本不进快照：plan 失败前新建的 slug
+/// 目录只有空账本，按 slug 精确匹配会盖掉按 topic 找到的旧进度。
+fn ledger_has_progress(ledger: &serde_json::Value) -> bool {
+    ledger["round"].as_u64().unwrap_or(0) > 0
+        || ledger["supplements"].as_array().is_some_and(|a| !a.is_empty())
+        || ledger["knowledge_points"].as_array().is_some_and(|points| {
+            points.iter().any(|p| {
+                p["passed"].as_bool() == Some(true) || p["wrong"].as_u64().unwrap_or(0) > 0
+            })
+        })
+}
+
+/// 取快照时同时落盘 `ledger.prev.json`：plan 写坏 ledger.json 后进程崩溃，
+/// 下次快照从备份读，进度不会丢。备份在合并成功或回滚后删除。
+fn snapshot_learn_ledgers(cwd: &Path, skip: &[String]) -> Vec<LedgerSnapshot> {
+    let root = cwd.join(".latte").join("learn");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || skip.iter().any(|s| *s == *entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(plan) = read_learn_json(&dir.join("plan.json")) else {
+            continue;
+        };
+        let Ok(ledger) = read_learn_json(&dir.join(LEDGER_BACKUP))
+            .or_else(|_| read_learn_json(&dir.join("ledger.json")))
+        else {
+            continue;
+        };
+        let slug = entry.file_name().to_string_lossy().to_string();
+        if !learn_slug_ok(&slug) || !ledger_has_progress(&ledger) {
+            continue;
+        }
+        if write_ledger_file(&dir.join(LEDGER_BACKUP), &ledger).is_err() {
+            continue;
+        }
+        let topic = plan
+            .get("topic")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(LedgerSnapshot {
+            slug,
+            topic,
+            ledger,
+        });
+    }
+    out
+}
+
+/// 用新 plan 的知识点名单套旧账本的进度。新 id 从 wrong=0 / passed=false 起；
+/// 旧 id 只要已经答错过或通过了，即使这次计划没再列出也留着。
+fn merge_ledger_progress(
+    previous: &serde_json::Value,
+    plan: &serde_json::Value,
+) -> serde_json::Value {
+    let mut out = previous.clone();
+    if let Some(slug) = plan.get("slug").and_then(|v| v.as_str()) {
+        if learn_slug_ok(slug) {
+            out["slug"] = serde_json::Value::String(slug.to_string());
+        }
+    }
+    let old_points = previous
+        .get("knowledge_points")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut old_by_id: HashMap<String, serde_json::Value> = HashMap::new();
+    for point in &old_points {
+        if let Some(id) = point.get("id").and_then(|v| v.as_str()) {
+            old_by_id.insert(id.to_string(), point.clone());
+        }
+    }
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let empty = Vec::new();
+    let plan_points = plan
+        .get("knowledge_points")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
+    for point in plan_points {
+        let Some(id) = point.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        let title = point
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                old_by_id
+                    .get(id)
+                    .and_then(|old| old.get("title"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let (wrong, passed) = old_by_id.get(id).map_or((0, false), |old| {
+            (
+                old.get("wrong").and_then(|v| v.as_u64()).unwrap_or(0),
+                old.get("passed").and_then(|v| v.as_bool()).unwrap_or(false),
+            )
+        });
+        merged.push(serde_json::json!({
+            "id": id,
+            "title": title,
+            "wrong": wrong,
+            "passed": passed,
+        }));
+    }
+    for point in &old_points {
+        let Some(id) = point.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if seen.contains(id) {
+            continue;
+        }
+        let wrong = point.get("wrong").and_then(|v| v.as_u64()).unwrap_or(0);
+        let passed = point.get("passed").and_then(|v| v.as_bool()).unwrap_or(false);
+        if passed || wrong > 0 {
+            merged.push(point.clone());
+        }
+    }
+    out["knowledge_points"] = serde_json::Value::Array(merged);
+    if let Some(supplements) = previous.get("supplements") {
+        out["supplements"] = supplements.clone();
+    }
+    if let Some(answers) = previous.get("_supplement_answers") {
+        out["_supplement_answers"] = answers.clone();
+    }
+    if let Some(round) = previous.get("round") {
+        out["round"] = round.clone();
+    }
+    touch_updated_at(&mut out);
+    out
+}
+
+fn write_ledger_file(path: &Path, ledger: &serde_json::Value) -> Result<(), String> {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(ledger).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+const LEARN_LOCK: &str = "session.lock";
+
+/// 一个主题（`.latte/learn/<slug>/`）同一时间只归一个学习流程。会话的
+/// worktree 都把 `.latte` 软链回项目，两个会话学同一主题会互相覆盖
+/// plan.json / ledger.json / 章节。用 OS 文件锁：进程崩溃时自动释放，
+/// 不会留下需要手工清理的死锁。
+struct LearnTopicLock {
+    slug: String,
+    _file: std::fs::File,
+}
+
+impl LearnTopicLock {
+    fn acquire(cwd: &Path, slug: &str, holder: &str) -> Result<Self, String> {
+        use std::io::{Read, Seek, Write};
+        let dir = cwd.join(".latte").join("learn").join(slug);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("建 {} 失败：{e}", dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(LEARN_LOCK))
+            .map_err(|e| format!("打开学习锁失败：{e}"))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut owner = String::new();
+                let _ = file.read_to_string(&mut owner);
+                let owner = owner.trim();
+                let owner = if owner.is_empty() { "另一个会话" } else { owner };
+                return Err(format!(
+                    "主题「{slug}」正在{owner}中学习。同一主题同时只能由一个会话学习，\
+                     请回到那个会话继续，或等它结束后再开始。"
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("学习锁加锁失败：{e}"));
+            }
+        }
+        let _ = file.set_len(0);
+        let _ = file.rewind();
+        let _ = file.write_all(holder.as_bytes());
+        Ok(Self {
+            slug: slug.to_string(),
+            _file: file,
+        })
+    }
+
+    /// 别的流程正持有这个主题的锁。
+    fn held_elsewhere(dir: &Path) -> bool {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(LEARN_LOCK))
+        else {
+            return false;
+        };
+        matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    }
+}
+
+fn learn_lock_holder(ctx: &WorkflowRunContext) -> String {
+    match ctx.session_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(sid) => format!("会话 {sid}"),
+        None => "另一个会话".into(),
+    }
+}
+
+/// 已经有 slug 却还没持锁（续跑跳过了 plan）时补锁。
+fn ensure_learn_lock(
+    lock: &mut Option<LearnTopicLock>,
+    vars: &HashMap<String, String>,
+    ctx: &WorkflowRunContext,
+) -> Result<(), String> {
+    let slug = vars.get("plan_out").map_or("", |s| s.trim());
+    if !learn_slug_ok(slug) || lock.as_ref().is_some_and(|l| l.slug == slug) {
+        return Ok(());
+    }
+    *lock = Some(LearnTopicLock::acquire(&ctx.cwd, slug, &learn_lock_holder(ctx))?);
+    Ok(())
+}
+
+/// plan 步期间的账本快照。合并成功后 `disarm`；plan 没走到合并就退出
+/// （校验重试耗尽、取消、speaker 失败）时，drop 把旧账本写回。
+struct LedgerRestoreGuard {
+    cwd: PathBuf,
+    snaps: Vec<LedgerSnapshot>,
+    /// 正被别的会话学习的主题：plan 开跑前的 plan.json / ledger.json 原文。
+    /// 本次 plan 选中这些主题时据此原样还原，别人的进度不能被覆盖。
+    locked: Vec<LockedTopic>,
+    armed: bool,
+}
+
+struct LockedTopic {
+    slug: String,
+    topic: String,
+    files: Vec<(&'static str, Option<Vec<u8>>)>,
+}
+
+impl LedgerRestoreGuard {
+    /// `own`：本 run 自己持有的主题，它的锁不算别人的。
+    fn take(cwd: &Path, own: Option<&str>) -> Self {
+        let mut locked = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(cwd.join(".latte").join("learn")) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.is_dir()
+                    || own.is_some_and(|s| *s == *entry.file_name().to_string_lossy())
+                    || !LearnTopicLock::held_elsewhere(&dir)
+                {
+                    continue;
+                }
+                let topic = read_learn_json(&dir.join("plan.json"))
+                    .ok()
+                    .and_then(|p| p["topic"].as_str().map(|s| s.trim().to_string()))
+                    .unwrap_or_default();
+                let files = ["plan.json", "ledger.json"]
+                    .into_iter()
+                    .map(|name| (name, std::fs::read(dir.join(name)).ok()))
+                    .collect();
+                locked.push(LockedTopic {
+                    slug: entry.file_name().to_string_lossy().to_string(),
+                    topic,
+                    files,
+                });
+            }
+        }
+        let skip: Vec<String> = locked.iter().map(|t| t.slug.clone()).collect();
+        Self {
+            cwd: cwd.to_path_buf(),
+            snaps: snapshot_learn_ledgers(cwd, &skip),
+            locked,
+            armed: true,
+        }
+    }
+
+    /// 同一主题文字正被别的会话学习：plan 开跑前就该拦下，不让模型去写。
+    fn locked_slug_for_topic(&self, topic: &str) -> Option<&str> {
+        let topic = topic.trim();
+        self.locked
+            .iter()
+            .find(|t| !topic.is_empty() && t.topic == topic)
+            .map(|t| t.slug.as_str())
+    }
+
+    /// 本次 plan 撞上别人正在学的主题：把它写过的文件还原成开跑前的原文。
+    /// 守卫随之解除，drop 不再按快照回写这个主题的账本。
+    fn restore_locked(&mut self, slug: &str) {
+        let base = self.cwd.join(".latte").join("learn").join(slug);
+        if let Some(t) = self.locked.iter().find(|t| t.slug == slug) {
+            for (name, raw) in &t.files {
+                match raw {
+                    Some(bytes) => {
+                        let _ = std::fs::write(base.join(name), bytes);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(base.join(name));
+                    }
+                }
+            }
+        }
+        self.snaps.retain(|s| s.slug != slug);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.clear_backups();
+    }
+
+    fn clear_backups(&self) {
+        for snap in &self.snaps {
+            let _ = std::fs::remove_file(self.base(snap).join(LEDGER_BACKUP));
+        }
+    }
+
+    fn base(&self, snap: &LedgerSnapshot) -> PathBuf {
+        self.cwd.join(".latte").join("learn").join(&snap.slug)
+    }
+}
+
+impl Drop for LedgerRestoreGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for snap in &self.snaps {
+            let base = self.base(snap);
+            if write_ledger_file(&base.join("ledger.json"), &snap.ledger).is_ok() {
+                let _ = std::fs::remove_file(base.join(LEDGER_BACKUP));
+            }
+        }
+    }
+}
+
+/// 用开跑前的快照盖住模型刚 write 的 ledger.json。
+/// 没有可配对的旧账（第一次）返回 Ok(false)，磁盘上的新文件保持不动。
+fn apply_ledger_merge(
+    cwd: &Path,
+    slug: &str,
+    snapshots: &[LedgerSnapshot],
+) -> Result<bool, String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Ok(false);
+    }
+    let base = cwd.join(".latte").join("learn").join(slug);
+    let Ok(plan) = read_learn_json(&base.join("plan.json")) else {
+        return Ok(false);
+    };
+    let new_topic = normalize_learn_topic(plan.get("topic").and_then(|v| v.as_str()).unwrap_or(""));
+    let previous = snapshots.iter().find(|snap| snap.slug == slug).or_else(|| {
+        snapshots
+            .iter()
+            .filter(|snap| {
+                !new_topic.is_empty() && normalize_learn_topic(&snap.topic) == new_topic
+            })
+            .max_by_key(|snap| snap.ledger.get("round").and_then(|v| v.as_u64()).unwrap_or(0))
+    });
+    let Some(previous) = previous else {
+        return Ok(false);
+    };
+    let merged = merge_ledger_progress(&previous.ledger, &plan);
+    write_ledger(&base, &merged)?;
+    Ok(true)
+}
+
+/// quiz 的 `QUIZ_FAIL` 或 supplement 的 `SUPPLEMENT` 表示 doc_review 还得再跑。
+/// 后面若又有一条 doc_review 完成记录，才重新算它做完。
+fn learn_rework_invalidated(
+    wf_name: &str,
+    completed: &[(String, Option<String>, String)],
+) -> std::collections::HashSet<String> {
+    let mut invalidated = std::collections::HashSet::new();
+    if wf_name != "learn_loop" {
+        return invalidated;
+    }
+    for (step_id, _, output) in completed {
+        if step_id == "doc_review" {
+            invalidated.remove("doc_review");
+        } else if (step_id == "quiz" && output.contains("QUIZ_FAIL"))
+            || (step_id == "supplement" && output.contains("SUPPLEMENT"))
+        {
+            invalidated.insert("doc_review".to_string());
+        }
+    }
+    invalidated
+}
+
+fn quiz_issue_block(id: &str, detail: &str, action: &str) -> String {
+    format!("## {id}\n- ISSUE: {id} | BLOCKER | quiz | {detail} | {action}\n")
+}
+
+fn insert_before_quiz_verdict(text: &str, extra: &str) -> String {
+    if let Some(idx) = text.rfind("\nQUIZ_") {
+        let mut out = text[..idx].to_string();
+        out.push('\n');
+        out.push_str(extra);
+        out.push_str(&text[idx..]);
+        out
+    } else {
+        format!("{text}\n{extra}")
+    }
+}
+
+/// 学员补充题的固定两选一。题面是学员原话，判分不交给模型出选项。
+const SUPPLEMENT_YES: &str = "这一节回答了我的问题";
+const SUPPLEMENT_NO: &str = "还是不懂";
+
+fn supplement_option_values() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "label": SUPPLEMENT_YES,
+            "description": "这一节已经把我补充的问题讲清楚了"
+        },
+        {
+            "label": SUPPLEMENT_NO,
+            "description": "还是没懂，需要把这一节再讲一遍"
+        }
+    ])
+}
+
+/// 引擎登记的补充点。模型若删掉 `supplement` 标记，`sup1` 这种 id 仍算。
+fn is_engine_supplement_point(point: &serde_json::Value) -> bool {
+    if point
+        .get("supplement")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Some(id) = point.get("id").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let Some(rest) = id.strip_prefix("sup") else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 把补充题的选项和答案写回引擎的两选一。普通知识点不动。
+fn seal_supplement_questions(plan: &mut serde_json::Value) -> bool {
+    let Some(points) = plan
+        .get_mut("knowledge_points")
+        .and_then(|v| v.as_array_mut())
+    else {
+        return false;
+    };
+    let mut changed = false;
+    for point in points.iter_mut() {
+        if !is_engine_supplement_point(point) {
+            continue;
+        }
+        let options = supplement_option_values();
+        let answer = serde_json::Value::String(SUPPLEMENT_YES.to_string());
+        let marked = serde_json::Value::Bool(true);
+        if point.get("options") != Some(&options)
+            || point.get("answer") != Some(&answer)
+            || point.get("supplement") != Some(&marked)
+        {
+            point["options"] = options;
+            point["answer"] = answer;
+            point["supplement"] = marked;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 「没有了」以及空的自定义输入算结束；`其他：…` 才是补充请求。
+fn supplement_request(answer: &str) -> Option<String> {
+    let text = answer.trim();
+    if text.is_empty() || text == "没有了，全部理解" || text == "其他（未填）" {
+        return None;
+    }
+    if let Some(rest) = text
+        .strip_prefix("其他：")
+        .or_else(|| text.strip_prefix("其他:"))
+    {
+        let rest = rest.trim();
+        if rest.is_empty() || rest == "没有了，全部理解" {
+            return None;
+        }
+        return Some(rest.to_string());
+    }
+    None
+}
+
+/// 掌握报告只复述账本事实，由引擎渲染：模型写报告会数错、漏点或美化进度。
+fn render_learn_report(
+    base: &Path,
+    slug: &str,
+    plan: &serde_json::Value,
+    ledger: &serde_json::Value,
+) -> String {
+    let topic = plan["topic"]
+        .as_str()
+        .or_else(|| ledger["topic"].as_str())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(slug);
+    let title_of = |id: &str| -> String {
+        plan["knowledge_points"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|p| p["id"].as_str() == Some(id))
+            .and_then(|p| p["title"].as_str())
+            .or_else(|| {
+                ledger["knowledge_points"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p["id"].as_str() == Some(id))
+                    .and_then(|p| p["title"].as_str())
+            })
+            .unwrap_or(id)
+            .to_string()
+    };
+    let points: Vec<&serde_json::Value> = ledger["knowledge_points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect();
+    let passed = points.iter().filter(|p| p["passed"].as_bool() == Some(true)).count();
+    let total = points.len();
+    let wrong_list: Vec<String> = points
+        .iter()
+        .map(|p| {
+            let id = p["id"].as_str().unwrap_or("");
+            format!("{}（{}）{} 次", title_of(id), id, p["wrong"].as_u64().unwrap_or(0))
+        })
+        .collect();
+    let supplements: Vec<String> = ledger["supplements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["asked"].as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let unpassed: Vec<String> = points
+        .iter()
+        .filter(|p| p["passed"].as_bool() != Some(true))
+        .map(|p| title_of(p["id"].as_str().unwrap_or("")))
+        .collect();
+
+    let mut out = format!("## 学习报告：{topic}\n\n");
+    out.push_str(&format!(
+        "**掌握进度**：{passed}/{total}（已通过 {passed} 个，共 {total} 个知识点）\n\n"
+    ));
+    out.push_str(&format!(
+        "**学习过程**：共 {} 轮；各知识点答错次数：{}\n\n",
+        ledger["round"].as_u64().unwrap_or(0),
+        if wrong_list.is_empty() { "无".to_string() } else { wrong_list.join("，") }
+    ));
+    out.push_str(&format!(
+        "**学员补充**：{}\n\n",
+        if supplements.is_empty() { "无".to_string() } else { supplements.join("；") }
+    ));
+    out.push_str(&format!(
+        "**交付文档**：docs/learn/{slug}.md（学习材料存档：.latte/learn/{slug}/draft.md）\n\n"
+    ));
+    if base.join("code").is_dir() {
+        out.push_str(&format!("**注释版代码副本**：.latte/learn/{slug}/code/\n\n"));
+    }
+    out.push_str("**建议**：");
+    if total > 0 && unpassed.is_empty() {
+        out.push_str("全部知识点已通过，按交付文档复习即可。");
+    } else if total == 0 {
+        out.push_str("账本里没有知识点，本次学习没有可核对的掌握记录。");
+    } else {
+        out.push_str(&format!(
+            "还有 {} 个知识点未掌握：{}，重读对应章节后再考。",
+            unpassed.len(),
+            unpassed.join("，")
+        ));
+    }
+    out
+}
+
+fn touch_updated_at(ledger: &mut serde_json::Value) {
+    ledger["updated_at"] = serde_json::Value::String(now_secs().to_string());
 }
 
 async fn run_learn_control_step(
@@ -3346,16 +4337,21 @@ async fn run_learn_control_step(
     slug: &str,
     ctx: &WorkflowRunContext,
     log: &Arc<AnswerLog>,
+    new_reading: bool,
 ) -> Result<Option<String>, String> {
     let base = ctx.cwd.join(".latte").join("learn").join(slug);
     // 在控制步（read_confirm / quiz）前，若存在分段文件自动装配最新 draft.md
     let _ = assemble_draft_from_sections(&base);
-    let mut ledger: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(base.join("ledger.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let mut ledger: serde_json::Value = read_learn_json(&base.join("ledger.json"))?;
     if step.id == "read_confirm" {
-        let round = ledger["round"].as_u64().unwrap_or(0) + 1;
+        let mut round = ledger["round"].as_u64().unwrap_or(0);
+        // 新文档才递增。resume 重入同一版时题面不变，AnswerLog 回放旧确认。
+        if new_reading || round == 0 {
+            round = round.saturating_add(1).max(1);
+            ledger["round"] = serde_json::Value::from(round);
+            touch_updated_at(&mut ledger);
+            write_ledger(&base, &ledger)?;
+        }
         let question =
             format!("学习材料（第 {round} 版）：.latte/learn/{slug}/draft.md。读完了吗？");
         let options = vec![ChoiceOption {
@@ -3375,13 +4371,24 @@ async fn run_learn_control_step(
         .await?;
         return Ok(Some("好，开始答题。".into()));
     }
+    if step.id == "supplement" {
+        return run_learn_supplement(&base, &mut ledger, slug, ctx, log).await;
+    }
+    if step.id == "report" {
+        let plan = read_learn_json(&base.join("plan.json")).unwrap_or_default();
+        return Ok(Some(render_learn_report(&base, slug, &plan, &ledger)));
+    }
     if step.id != "quiz" {
         return Ok(None);
     }
-    let plan: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(base.join("plan.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let mut plan: serde_json::Value = read_learn_json(&base.join("plan.json"))?;
+    if seal_supplement_questions(&mut plan) {
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_vec_pretty(&plan).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let pending = plan["knowledge_points"]
         .as_array()
         .into_iter()
@@ -3399,7 +4406,28 @@ async fn run_learn_control_step(
     if pending.is_empty() {
         return Ok(Some("判分结果：全部答对。\nQUIZ_PASS".into()));
     }
-    let questions = pending
+    let (ready, unready): (Vec<_>, Vec<_>) =
+        pending.into_iter().partition(|p| point_is_gradeable(p));
+    if ready.is_empty() {
+        let blocks: Vec<String> = unready
+            .iter()
+            .filter_map(|p| p["id"].as_str().map(|id| {
+                quiz_issue_block(
+                    id,
+                    "该知识点还没有可判分的题目（options 或 answer 为空）",
+                    &format!("在 plan.json 为 {id} 补上 question、4 个 options 和 answer，id 保持不变，并只写 sections/{id}.md"),
+                )
+            }))
+            .collect();
+        write_engine_feedback(&base, &blocks)?;
+        let mut text = String::from(
+            "本轮测验判分如下：\n\n判分结果：题目未就绪，未作答。\n你选的是：（未作答）\n",
+        );
+        text.push_str(&blocks.concat());
+        text.push_str("\nQUIZ_FAIL");
+        return Ok(Some(text));
+    }
+    let questions = ready
         .iter()
         .map(|p| {
             let id = p["id"].as_str().unwrap_or("");
@@ -3410,6 +4438,12 @@ async fn run_learn_control_step(
                 .find(|e| e["id"] == p["id"])
                 .and_then(|e| e["wrong"].as_u64())
                 .unwrap_or(0);
+            let mut options: Vec<ChoiceOption> =
+                serde_json::from_value(p["options"].clone()).unwrap_or_default();
+            if !is_engine_supplement_point(p) {
+                let answer = p["answer"].as_str().unwrap_or("");
+                options = shuffle_quiz_options(options, answer, slug, id, wrong + 1);
+            }
             ChoiceQuestion {
                 id: id.into(),
                 question: format!(
@@ -3417,7 +4451,7 @@ async fn run_learn_control_step(
                     p["question"].as_str().unwrap_or(""),
                     wrong + 1
                 ),
-                options: serde_json::from_value(p["options"].clone()).unwrap_or_default(),
+                options,
                 ..Default::default()
             }
         })
@@ -3451,28 +4485,187 @@ async fn run_learn_control_step(
         String::new(),
     )
     .await?;
-    let answers = pending
+    let answers = ready
         .iter()
         .zip(raw.lines())
         .filter_map(|(p, line)| {
-            p["id"].as_str().map(|id| {
-                (
-                    id.to_string(),
-                    line.split_once('→')
-                        .map_or(line, |(_, value)| value)
-                        .trim()
-                        .to_string(),
-                )
-            })
+            p["id"]
+                .as_str()
+                .map(|id| (id.to_string(), quiz_given_label(line)))
         })
         .collect();
     let grade = deterministic_grade_quiz(&plan, &mut ledger, &answers);
-    std::fs::write(
-        base.join("ledger.json"),
-        serde_json::to_vec_pretty(&ledger).map_err(|e| e.to_string())?,
+    write_ledger(&base, &ledger)?;
+    let mut blocks: Vec<String> = grade
+        .items
+        .iter()
+        .filter(|item| !item.correct)
+        .map(|item| {
+            let point = plan["knowledge_points"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|p| p["id"].as_str() == Some(item.id.as_str()));
+            if let Some(point) = point.filter(|p| is_engine_supplement_point(p)) {
+                let asked = point["question"].as_str().unwrap_or(item.title.as_str());
+                return quiz_issue_block(
+                    &item.id,
+                    &format!("学员选择「{}」。原问题：{asked}", item.given),
+                    &format!("只修改本章 sections/{}.md，按学员原话把这一节讲清楚", item.id),
+                );
+            }
+            quiz_issue_block(
+                &item.id,
+                &format!(
+                    "学员答错。你选的是「{}」，正确答案是「{}」。出处：{}。",
+                    item.given, item.expected, item.evidence
+                ),
+                &format!(
+                    "只修改本章 sections/{}.md：增加易错点辨析，讲清正确项与学员误选的区别",
+                    item.id
+                ),
+            )
+        })
+        .collect();
+    for point in &unready {
+        if let Some(id) = point["id"].as_str() {
+            blocks.push(quiz_issue_block(
+                id,
+                "该知识点还没有可判分的题目（options 或 answer 为空）",
+                &format!("在 plan.json 为 {id} 补上 question、4 个 options 和 answer，id 保持不变，并只写 sections/{id}.md"),
+            ));
+        }
+    }
+    let mut text = format_quiz_feedback(&grade);
+    if !blocks.is_empty() {
+        write_engine_feedback(&base, &blocks)?;
+        text = insert_before_quiz_verdict(&text, &blocks.concat());
+    }
+    Ok(Some(text))
+}
+
+async fn run_learn_supplement(
+    base: &std::path::Path,
+    ledger: &mut serde_json::Value,
+    slug: &str,
+    ctx: &WorkflowRunContext,
+    log: &Arc<AnswerLog>,
+) -> Result<Option<String>, String> {
+    let mut plan = read_learn_json(&base.join("plan.json"))?;
+    let round = ledger["round"].as_u64().unwrap_or(0);
+    let topic = plan["topic"].as_str().unwrap_or(slug);
+    let question =
+        format!("第 {round} 轮：「{topic}」的内容都掌握了吗？还有不懂、想补充讲解的知识点吗？");
+    let receipt_key = format!("supplement-round-{round}");
+    if let Some(prev) = ledger
+        .get("_supplement_answers")
+        .and_then(|v| v.get(&receipt_key))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(Some(prev.to_string()));
+    }
+    let options = vec![ChoiceOption {
+        label: "没有了，全部理解".into(),
+        description: "可以定稿结束了".into(),
+        ..Default::default()
+    }];
+    let raw = deterministic_learning_ask(
+        ctx,
+        log,
+        format!("learn-{slug}-supplement-{round}"),
+        question,
+        vec![],
+        options,
+        String::new(),
     )
-    .map_err(|e| e.to_string())?;
-    Ok(Some(format_quiz_feedback(&grade)))
+    .await?;
+    let output = if let Some(asked) = supplement_request(&raw) {
+        let id = append_supplement_point(&mut plan, ledger, &asked, round)?;
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_vec_pretty(&plan).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let block = quiz_issue_block(
+            &id,
+            &format!("学员补充：{asked}"),
+            &format!(
+                "只写 sections/{id}.md，按学员原话讲解。这一题的选项和答案由引擎维护，不要改 plan.json 里的 options 和 answer"
+            ),
+        );
+        write_engine_feedback(base, &[block.clone()])?;
+        format!("将把学员的补充写进文档并补一道题。\n{block}\nSUPPLEMENT")
+    } else {
+        touch_updated_at(ledger);
+        "没有补充。\nALL_DONE".to_string()
+    };
+    if !ledger["_supplement_answers"].is_object() {
+        ledger["_supplement_answers"] = serde_json::Value::Object(Default::default());
+    }
+    ledger["_supplement_answers"]
+        .as_object_mut()
+        .expect("supplement receipt object")
+        .insert(receipt_key, serde_json::Value::String(output.clone()));
+    write_ledger(base, ledger)?;
+    Ok(Some(output))
+}
+
+fn append_supplement_point(
+    plan: &mut serde_json::Value,
+    ledger: &mut serde_json::Value,
+    asked: &str,
+    round: u64,
+) -> Result<String, String> {
+    if !plan["knowledge_points"].is_array() {
+        plan["knowledge_points"] = serde_json::Value::Array(Vec::new());
+    }
+    if !ledger["knowledge_points"].is_array() {
+        ledger["knowledge_points"] = serde_json::Value::Array(Vec::new());
+    }
+    if !ledger["supplements"].is_array() {
+        ledger["supplements"] = serde_json::Value::Array(Vec::new());
+    }
+    let n = ledger["supplements"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
+        + 1;
+    let id = format!("sup{n}");
+    let title: String = asked.chars().take(40).collect();
+    plan["knowledge_points"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": id,
+            "title": title,
+            "evidence": "",
+            "teach_points": [],
+            "example": "",
+            "doc_section": format!("## 补充：{title}"),
+            "question": asked,
+            "options": supplement_option_values(),
+            "answer": SUPPLEMENT_YES,
+            "supplement": true
+        }));
+    ledger["knowledge_points"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": id,
+            "title": title,
+            "wrong": 0,
+            "passed": false
+        }));
+    ledger["supplements"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "round": round,
+            "asked": asked,
+            "doc_section": format!("## 补充：{title}")
+        }));
+    touch_updated_at(ledger);
+    Ok(id)
 }
 
 /// 单个知识点的判分结果：供 quiz 反馈文本拼装（哪个知识点、对/错、
@@ -3501,42 +4694,684 @@ pub(crate) struct QuizGrade {
     pub items: Vec<QuizItemGrade>,
 }
 
-/// 判分容忍度（对齐 learn_loop.toml quiz 步约定：「用户可能只回 label
-/// 的一部分或带前缀」）：双方归一化（去首尾空白、去常见收尾标点、忽略
-/// 大小写）后完全相等，或与正确 label 互相包含即判对——但正确 label
-/// 归一化后须 ≥ 2 字符才允许包含匹配，防止单字/空串把自由文本误判成对。
+fn quiz_label_norm(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(|c| {
+            matches!(
+                c,
+                '。' | '，' | '、' | ',' | '.' | '！' | '!' | '？' | '?' | '；' | ';' | '：' | ':'
+            )
+        })
+        .trim()
+        .to_lowercase()
+}
+
+/// `evidence` 的一段 `path:start-end` 或 `path:line`，必须落在仓库里真实存在的行上。
+fn check_learn_evidence(cwd: &Path, evidence: &str) -> Result<(), String> {
+    let (path, range) = evidence
+        .trim()
+        .rsplit_once(':')
+        .ok_or_else(|| format!("「{evidence}」不是 file:line 格式"))?;
+    let path = path.trim();
+    if path.is_empty()
+        || Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("「{evidence}」的路径必须是仓库内的相对路径"));
+    }
+    let (start, end) = match range.trim().split_once('-') {
+        Some((a, b)) => (a.trim().parse::<usize>(), b.trim().parse::<usize>()),
+        None => (range.trim().parse::<usize>(), range.trim().parse::<usize>()),
+    };
+    let (Ok(start), Ok(end)) = (start, end) else {
+        return Err(format!("「{evidence}」的行号不是数字"));
+    };
+    if start == 0 || end < start {
+        return Err(format!("「{evidence}」的行号区间无效"));
+    }
+    let text = std::fs::read_to_string(cwd.join(path))
+        .map_err(|_| format!("「{evidence}」指向的文件 {path} 不存在"))?;
+    let lines = text.lines().count();
+    if end > lines {
+        return Err(format!("「{evidence}」超出文件范围（{path} 只有 {lines} 行）"));
+    }
+    Ok(())
+}
+
+/// plan 步写完 `plan.json` 后的机械校验。补充点（`sup1`）的题目由引擎维护，不在这里查。
+fn looks_like_design_question(q: &str) -> bool {
+    [
+        "？",
+        "?",
+        "为什么",
+        "怎么",
+        "如何",
+        "该不该",
+        "要不要",
+        "还是",
+    ]
+    .iter()
+    .any(|k| q.contains(k))
+}
+
+fn looks_like_code_unit_title(title: &str) -> bool {
+    let t = title.trim();
+    let is_unit = ["结构体", "函数", "字段", "枚举", "模块", "struct", "fn "]
+        .iter()
+        .any(|k| t.contains(k));
+    let has_design = ["为什么", "怎么", "为何", "如何", "该不该"]
+        .iter()
+        .any(|k| t.contains(k));
+    is_unit && !has_design
+}
+
+fn looks_like_design_quiz(q: &str) -> bool {
+    [
+        "如果",
+        "换成",
+        "为什么",
+        "若不",
+        "不这样做",
+        "代价",
+        "换成方案",
+    ]
+    .iter()
+    .any(|k| q.contains(k))
+}
+
+fn alternatives_are_only_strawmen(alts: &[serde_json::Value]) -> bool {
+    let names: Vec<&str> = alts.iter().filter_map(|a| a["name"].as_str()).collect();
+    !names.is_empty()
+        && names.iter().all(|n| {
+            ["stdin", "不加锁", "不用锁", "干脆不", "轮询数据库"]
+                .iter()
+                .any(|k| n.contains(k))
+        })
+}
+
+fn check_learn_plan_design(
+    plan: &serde_json::Value,
+    points: &[serde_json::Value],
+    problems: &mut Vec<String>,
+) {
+    let filled = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
+    let design = &plan["design"];
+    if !design.is_object() {
+        problems.push("缺少 design 对象（problem / core_idea / decisions）".to_string());
+    }
+    for key in ["problem", "core_idea"] {
+        if design.is_object() && !filled(&design[key]) {
+            problems.push(format!("design.{key} 为空"));
+        }
+    }
+    let mut decision_ids = std::collections::HashSet::new();
+    match design["decisions"].as_array() {
+        Some(ds) if !ds.is_empty() => {
+            for (i, d) in ds.iter().enumerate() {
+                let id = d["id"].as_str().unwrap_or("").trim().to_string();
+                let label = if id.is_empty() {
+                    format!("第 {} 个", i + 1)
+                } else {
+                    id.clone()
+                };
+                for key in ["id", "question", "chosen", "why", "cost"] {
+                    if !filled(&d[key]) {
+                        problems.push(format!("决策 {label} 缺 {key}"));
+                    }
+                }
+                let alts = d["alternatives"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let real_alts = alts
+                    .iter()
+                    .filter(|a| filled(&a["name"]) && (filled(&a["pros"]) || filled(&a["cons"])))
+                    .count();
+                if real_alts == 0 {
+                    problems.push(format!(
+                        "决策 {label} 没有带 name + pros/cons 的替代方案（没有对比就讲不出为什么选它）"
+                    ));
+                }
+                if !id.is_empty() {
+                    decision_ids.insert(id);
+                }
+                let question = d["question"].as_str().unwrap_or("");
+                if !question.is_empty() && !looks_like_design_question(question) {
+                    problems.push(format!(
+                        "决策 {label} 的 question「{question}」不像设计问题（要写成「……怎么/为什么/如何……」，不要写成「X 是什么」）"
+                    ));
+                }
+                if alternatives_are_only_strawmen(alts) {
+                    problems.push(format!(
+                        "决策 {label} 的替代方案全是稻草人（stdin / 不加锁 / 干脆不……）——换一个认真的工程师会考虑的方案"
+                    ));
+                }
+            }
+        }
+        _ if design.is_object() => problems.push("design.decisions 为空".to_string()),
+        _ => {}
+    }
+
+    let mut quiz_stems = Vec::new();
+    for point in points {
+        if is_engine_supplement_point(point) {
+            continue;
+        }
+        let kid = point["id"].as_str().unwrap_or("?");
+        match point["decision"].as_str().map(str::trim) {
+            Some(d) if decision_ids.contains(d) => {}
+            Some(d) if !d.is_empty() => problems.push(format!(
+                "知识点 {kid} 的 decision「{d}」不在 design.decisions 里"
+            )),
+            _ => problems.push(format!(
+                "知识点 {kid} 缺 decision（每个知识点要对应一个设计决策）"
+            )),
+        }
+        if let Some(title) = point["title"].as_str() {
+            if looks_like_code_unit_title(title) {
+                problems.push(format!(
+                    "知识点 {kid} 的 title「{title}」是代码单元名，请改成设计问题或结论（如「为什么要收齐才放行」）"
+                ));
+            }
+        }
+        if let Some(q) = point["question"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            quiz_stems.push(q.to_string());
+        }
+    }
+    if quiz_stems.len() >= 2 && !quiz_stems.iter().any(|q| looks_like_design_quiz(q)) {
+        problems.push(
+            "题目全是事实回忆：至少一道题干要带「如果 / 换成 / 为什么」，否则考不出设计理解".into(),
+        );
+    }
+}
+
+fn validate_learn_plan(cwd: &Path, slug: &str) -> Result<(), String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Err(format!("产出的 slug「{slug}」不合法"));
+    }
+    let path = cwd.join(".latte").join("learn").join(slug).join("plan.json");
+    let plan = read_learn_json(&path)
+        .map_err(|e| format!(".latte/learn/{slug}/plan.json 读不出合法 JSON：{e}"))?;
+    let points = plan
+        .get("knowledge_points")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or("plan.json 缺少非空的 knowledge_points 数组")?;
+    let mut problems = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for point in points {
+        let id = point.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
+        if id.is_empty() {
+            problems.push("有知识点缺少 id".to_string());
+            continue;
+        }
+        if !ids.insert(id.to_string()) {
+            problems.push(format!("{id}：id 重复"));
+        }
+        if is_engine_supplement_point(point) {
+            continue;
+        }
+        let evidence = point.get("evidence").and_then(|v| v.as_str()).unwrap_or("");
+        let parts: Vec<&str> = evidence
+            .split([',', '，', ';', '；'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() {
+            problems.push(format!("{id}：evidence 为空"));
+        }
+        for part in parts {
+            if let Err(e) = check_learn_evidence(cwd, part) {
+                problems.push(format!("{id}：{e}"));
+            }
+        }
+        let options = point
+            .get("options")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if options.len() < 2 {
+            problems.push(format!("{id}：options 少于 2 个"));
+        }
+        if options.iter().any(|o| o.get("recommended").is_some()) {
+            problems.push(format!("{id}：选项不得带 recommended（会把答案印在界面上）"));
+        }
+        let labels: Vec<String> = options
+            .iter()
+            .map(|o| quiz_label_norm(o.get("label").and_then(|v| v.as_str()).unwrap_or("")))
+            .collect();
+        if labels.iter().any(|l| l.is_empty()) {
+            problems.push(format!("{id}：有选项的 label 为空"));
+        }
+        for (i, a) in labels.iter().enumerate() {
+            for b in labels.iter().skip(i + 1) {
+                if !a.is_empty() && !b.is_empty() && (a.contains(b.as_str()) || b.contains(a.as_str())) {
+                    problems.push(format!(
+                        "{id}：选项「{a}」和「{b}」互为子串，判分会把两者混在一起"
+                    ));
+                }
+            }
+        }
+        let answer = quiz_label_norm(point.get("answer").and_then(|v| v.as_str()).unwrap_or(""));
+        if answer.is_empty() || !labels.iter().any(|l| *l == answer) {
+            problems.push(format!("{id}：answer 必须逐字等于某个选项的 label"));
+        }
+    }
+    check_learn_plan_design(&plan, points, &mut problems);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("plan.json 未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
+const COMMENT_MARKERS: [&str; 9] = ["//", "#", "--", "/*", "*", ";", "<!--", "-->", "\"\"\""];
+
+fn is_comment_line(line: &str) -> bool {
+    COMMENT_MARKERS.iter().any(|m| line.starts_with(m))
+}
+
+/// 副本行与源码行一致：逐字相同，或在源码行后面追加了行尾注释。
+fn copy_line_matches(copy: &str, source_lines: &std::collections::HashSet<String>) -> bool {
+    if source_lines.contains(copy) {
+        return true;
+    }
+    source_lines.iter().any(|src| {
+        !src.is_empty()
+            && copy.starts_with(src.as_str())
+            && is_comment_line(copy[src.len()..].trim_start())
+    })
+}
+
+fn safe_relative_source(cwd: &Path, rel: &str) -> Option<PathBuf> {
+    let p = Path::new(rel);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let full = cwd.join(p);
+    full.is_file().then_some(full)
+}
+
+/// annotate 写完注释副本后的机械校验：每个副本标了真实出处，代码行逐字来自
+/// 源文件（只许加注释），plan 证据涉及的源文件都有副本覆盖。
+fn validate_learn_annotations(cwd: &Path, slug: &str) -> Result<(), String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Err(format!("slug「{slug}」不合法"));
+    }
+    let base = cwd.join(".latte").join("learn").join(slug);
+    let code_dir = base.join("code");
+    let rel_dir = format!(".latte/learn/{slug}/code");
+    if !code_dir.join("README.md").is_file() {
+        return Err(format!("{rel_dir}/README.md 索引不存在"));
+    }
+    let mut copies: Vec<PathBuf> = std::fs::read_dir(&code_dir)
+        .map_err(|e| format!("{rel_dir} 读不出：{e}"))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n != "README.md"))
+        .collect();
+    copies.sort();
+    if copies.is_empty() {
+        return Err(format!("{rel_dir} 里没有任何注释副本"));
+    }
+
+    let mut problems = Vec::new();
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+    let mut source_cache: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for copy in &copies {
+        let name = copy.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let text = std::fs::read_to_string(copy).unwrap_or_default();
+        let mut sources: Vec<String> = Vec::new();
+        for cite in chapter_citations(&text) {
+            let Some((path, _)) = cite.rsplit_once(':') else {
+                continue;
+            };
+            if sources.iter().any(|s| s == path) {
+                continue;
+            }
+            let Some(full) = safe_relative_source(cwd, path) else {
+                continue;
+            };
+            let lines = std::fs::read_to_string(&full)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect();
+            source_cache.entry(path.to_string()).or_insert(lines);
+            sources.push(path.to_string());
+        }
+        if sources.is_empty() {
+            problems.push(format!("{name}：文件头没写指向真实源文件的原始出处（file:line）"));
+            continue;
+        }
+        covered.extend(sources.iter().cloned());
+        let mut source_lines = std::collections::HashSet::new();
+        for s in &sources {
+            source_lines.extend(source_cache[s].iter().cloned());
+        }
+        let mut bad = Vec::new();
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || is_comment_line(line) {
+                continue;
+            }
+            if !copy_line_matches(line, &source_lines) {
+                bad.push(format!("第 {} 行「{line}」", n + 1));
+            }
+        }
+        if !bad.is_empty() {
+            let shown = bad.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+            let more = if bad.len() > 3 { format!(" 等 {} 行", bad.len()) } else { String::new() };
+            problems.push(format!(
+                "{name}：{shown}{more} 在 {} 里找不到原文——副本只许加注释，不许改代码",
+                sources.join("、")
+            ));
+        }
+    }
+
+    if let Ok(plan) = read_learn_json(&base.join("plan.json")) {
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        for point in plan["knowledge_points"].as_array().into_iter().flatten() {
+            if is_engine_supplement_point(point) {
+                continue;
+            }
+            let evidence = point["evidence"].as_str().unwrap_or("");
+            for part in evidence.split([',', '，', ';', '；']).map(str::trim) {
+                if let Some((path, _)) = part.rsplit_once(':') {
+                    if safe_relative_source(cwd, path).is_some() {
+                        needed.insert(path.to_string());
+                    }
+                }
+            }
+        }
+        let missing: Vec<String> = needed.difference(&covered).cloned().collect();
+        if !missing.is_empty() {
+            problems.push(format!("这些证据文件没有注释副本：{}", missing.join("、")));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("注释副本未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
+/// 一行去掉注释后的代码部分。整行注释、空行返回 None。
+fn code_part(line: &str) -> Option<&str> {
+    let t = line.trim();
+    if t.is_empty() || is_comment_line(t) {
+        return None;
+    }
+    let end = [" //", "\t//", " #", "\t#", " --", " /*"]
+        .iter()
+        .filter_map(|m| t.find(m))
+        .min()
+        .unwrap_or(t.len());
+    Some(t[..end].trim_end())
+}
+
+fn code_lines(text: &str) -> Vec<(usize, &str)> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(n, l)| code_part(l).map(|c| (n + 1, c)))
+        .collect()
+}
+
+/// 比较改动前后的代码行（去注释后），返回第一处不一致的说明。
+fn diff_code_only(rel: &str, before: &str, after: &str) -> Option<String> {
+    let (old, new) = (code_lines(before), code_lines(after));
+    for (i, (n, code)) in new.iter().enumerate() {
+        match old.get(i) {
+            Some((_, was)) if was == code => {}
+            Some((_, was)) => {
+                return Some(format!("{rel}：第 {n} 行「{code}」改了代码（原来是「{was}」）"));
+            }
+            None => return Some(format!("{rel}：第 {n} 行「{code}」是新加的代码")),
+        }
+    }
+    old.get(new.len())
+        .map(|(n, was)| format!("{rel}：原第 {n} 行「{was}」被删掉了"))
+}
+
+fn git_dirty_paths(cwd: &Path) -> Option<BTreeSet<String>> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.get(3..))
+            .map(|p| p.rsplit(" -> ").next().unwrap_or(p).trim().to_string())
+            .collect(),
+    )
+}
+
+/// sync_code 开跑前的源文件原文。学习范围 = plan 证据 + 注释副本标注的出处。
+struct SyncCodeBaseline {
+    files: Vec<(String, String)>,
+    dirty_before: Option<BTreeSet<String>>,
+}
+
+impl SyncCodeBaseline {
+    fn take(cwd: &Path, slug: &str) -> Self {
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        if learn_slug_ok(slug) {
+            let base = cwd.join(".latte").join("learn").join(slug);
+            if let Ok(plan) = read_learn_json(&base.join("plan.json")) {
+                for point in plan["knowledge_points"].as_array().into_iter().flatten() {
+                    let evidence = point["evidence"].as_str().unwrap_or("");
+                    for part in evidence.split([',', '，', ';', '；']).map(str::trim) {
+                        if let Some((path, _)) = part.rsplit_once(':') {
+                            paths.insert(path.to_string());
+                        }
+                    }
+                }
+            }
+            for copy in std::fs::read_dir(base.join("code")).into_iter().flatten().flatten() {
+                let text = std::fs::read_to_string(copy.path()).unwrap_or_default();
+                for cite in chapter_citations(&text) {
+                    if let Some((path, _)) = cite.rsplit_once(':') {
+                        paths.insert(path.to_string());
+                    }
+                }
+            }
+        }
+        let files = paths
+            .into_iter()
+            .filter_map(|rel| {
+                let full = safe_relative_source(cwd, &rel)?;
+                Some((rel, std::fs::read_to_string(full).ok()?))
+            })
+            .collect();
+        Self {
+            files,
+            dirty_before: git_dirty_paths(cwd),
+        }
+    }
+
+    /// 核对改动只涉及注释。不合格时把源文件全部还原，再返回原因。
+    fn check_and_restore(&self, cwd: &Path) -> Result<(), String> {
+        let mut problems = Vec::new();
+        for (rel, before) in &self.files {
+            let after = std::fs::read_to_string(cwd.join(rel)).unwrap_or_default();
+            if let Some(p) = diff_code_only(rel, before, &after) {
+                problems.push(p);
+            }
+            let leaked = after
+                .lines()
+                .filter(|l| l.contains("学习副本") || l.contains("原始出处"))
+                .count()
+                > before
+                    .lines()
+                    .filter(|l| l.contains("学习副本") || l.contains("原始出处"))
+                    .count();
+            if leaked {
+                problems.push(format!("{rel}：把副本头部的「学习副本 / 原始出处」带进了源码"));
+            }
+        }
+        let mut strays = Vec::new();
+        if let (Some(before), Some(after)) = (&self.dirty_before, git_dirty_paths(cwd)) {
+            strays = after
+                .difference(before)
+                .filter(|p| !p.starts_with(".latte/"))
+                .filter(|p| !self.files.iter().any(|(rel, _)| rel == *p))
+                .cloned()
+                .collect();
+            if !strays.is_empty() {
+                problems.push(format!("改了学习范围以外的文件：{}", strays.join("、")));
+            }
+        }
+        if problems.is_empty() {
+            return Ok(());
+        }
+        for (rel, before) in &self.files {
+            let _ = std::fs::write(cwd.join(rel), before);
+        }
+        for p in &strays {
+            let _ = std::process::Command::new("git")
+                .args(["checkout", "--", p])
+                .current_dir(cwd)
+                .output();
+        }
+        Err(format!(
+            "源码改动不只是注释，引擎已全部还原：\n- {}",
+            problems.join("\n- ")
+        ))
+    }
+}
+
+fn mermaid_blocks(text: &str) -> usize {
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("```mermaid"))
+        .count()
+}
+
+/// merge 写完 `docs/learn/<slug>.md` 后的机械校验：定稿以 draft.md 为底稿，
+/// 出处、图、篇幅都不能在定稿时丢掉。
+fn validate_learn_final(cwd: &Path, slug: &str) -> Result<(), String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Err(format!("slug「{slug}」不合法"));
+    }
+    let rel = format!("docs/learn/{slug}.md");
+    let final_text = std::fs::read_to_string(cwd.join(&rel)).unwrap_or_default();
+    if final_text.trim().is_empty() {
+        return Err(format!("{rel} 不存在或为空"));
+    }
+    let base = cwd.join(".latte").join("learn").join(slug);
+    let _ = assemble_draft_from_sections(&base);
+    let Ok(draft) = std::fs::read_to_string(base.join("draft.md")) else {
+        return Ok(());
+    };
+    let mut problems = Vec::new();
+    let kept = chapter_citations(&final_text);
+    let missing: Vec<String> = chapter_citations(&draft)
+        .into_iter()
+        .filter(|c| !kept.contains(c))
+        .collect();
+    if !missing.is_empty() {
+        problems.push(format!("丢了 draft 里的源码出处：{}", missing.join("、")));
+    }
+    let (draft_graphs, final_graphs) = (mermaid_blocks(&draft), mermaid_blocks(&final_text));
+    if final_graphs < draft_graphs {
+        problems.push(format!(
+            "mermaid 图从 {draft_graphs} 张变成 {final_graphs} 张，图要原样保留"
+        ));
+    }
+    let (before, after) = (draft.chars().count(), final_text.chars().count());
+    if after * 2 < before {
+        problems.push(format!("正文从 {before} 字缩到 {after} 字，定稿不能砍掉一半以上"));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{rel} 未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
+/// 第 `attempt` 次作答的选项顺序（下标排列）。种子只由 slug、知识点 id 和作答
+/// 次数决定：续跑重放同一次作答时顺序不变，重考时换一种顺序。
+fn quiz_option_order(n: usize, slug: &str, id: &str, attempt: u64) -> Vec<usize> {
+    // FNV-1a：跨进程、跨版本稳定（DefaultHasher 不保证）。
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{slug}\0{id}\0{attempt}").bytes() {
+        seed ^= u64::from(b);
+        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
+}
+
+/// 洗牌出卷。判分按 label 比对，与顺序无关。重考时正确项不留在上一次的位置，
+/// 学员不能靠记位置答对。
+fn shuffle_quiz_options(
+    options: Vec<ChoiceOption>,
+    answer: &str,
+    slug: &str,
+    id: &str,
+    attempt: u64,
+) -> Vec<ChoiceOption> {
+    let n = options.len();
+    if n < 2 {
+        return options;
+    }
+    let answer_idx = options
+        .iter()
+        .position(|o| quiz_label_norm(&o.label) == quiz_label_norm(answer));
+    let mut order = quiz_option_order(n, slug, id, attempt.max(1));
+    if let Some(a) = answer_idx {
+        // 逐次重放到本次：比较的是学员上一次实际看到的位置（可能已被换位过）。
+        let mut prev_pos = None;
+        for k in 1..=attempt.max(1) {
+            order = quiz_option_order(n, slug, id, k);
+            if order.iter().position(|&i| i == a) == prev_pos {
+                order.rotate_left(1);
+            }
+            prev_pos = order.iter().position(|&i| i == a);
+        }
+    }
+    let mut slots: Vec<Option<ChoiceOption>> = options.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// 判分：双方归一化（去首尾空白、去常见收尾标点、忽略大小写）后完全相等即对。
+/// 用户答案可以包住完整 label（序号前缀、`其他：` 前缀），正确 label 须 ≥ 2 字符。
+/// 不接受反过来的包含：短干扰项是正确项的子串时，选干扰项不得判对。
 /// 对不上任何 label（乱填、空、「不知道」、自定义自由文本）按答错。
 fn quiz_answer_matches(expected: &str, given: &str) -> bool {
-    let norm = |s: &str| {
-        s.trim()
-            .trim_end_matches(|c| {
-                matches!(
-                    c,
-                    '。' | '，'
-                        | '、'
-                        | ','
-                        | '.'
-                        | '！'
-                        | '!'
-                        | '？'
-                        | '?'
-                        | '；'
-                        | ';'
-                        | '：'
-                        | ':'
-                )
-            })
-            .trim()
-            .to_lowercase()
-    };
-    let (e, g) = (norm(expected), norm(given));
+    let (e, g) = (quiz_label_norm(expected), quiz_label_norm(given));
     if e.is_empty() || g.is_empty() {
         return false;
     }
     if e == g {
         return true;
     }
-    e.chars().count() >= 2 && (e.contains(&g) || g.contains(&e))
+    e.chars().count() >= 2 && g.contains(&e)
 }
 
 /// Grade persisted quiz answers by option label. Receipts are keyed by
@@ -3698,25 +5533,6 @@ fn format_quiz_feedback(grade: &QuizGrade) -> String {
             }
             line.push_str("。该节讲解将在下一版文档里增强，重读后再考。");
             out.push_str(&line);
-        }
-    }
-    // 按章分组的返工意见：outline 要把它抄进 feedback.md 的 `## <k_id>` 分组。
-    // 由引擎确定性生成，避免让模型从自然语言里自己拆章 id（拆错会让该增强的
-    // 章被 UNCHANGED 跳过、或不该动的章被重写）。
-    let wrong: Vec<&QuizItemGrade> = grade.items.iter().filter(|i| !i.correct).collect();
-    if !wrong.is_empty() {
-        out.push_str("\n\n【按章分组的返工意见（feedback.md 直接抄录）】");
-        for item in wrong {
-            out.push_str(&format!(
-                "\n## {}\n- 学员答错「{}」（选了：{}；正确：{}）。在本章增强「易错点辨析」小节，讲清正确项与干扰项的区别",
-                item.id,
-                item.title,
-                if item.given.is_empty() { "未作答" } else { item.given.as_str() },
-                item.expected,
-            ));
-            if !item.evidence.is_empty() {
-                out.push_str(&format!("，依据 {}", item.evidence));
-            }
         }
     }
     out.push_str(if grade.passed {
@@ -5716,10 +7532,17 @@ async fn run_workflow_serial(
     let mut keyed: HashMap<String, String> = HashMap::new();
     // 断点续跑：已完成 step 的产出直接注入 vars，step 本体跳过
     // （不重跑、不重发 WorkflowStep/Turn 事件）。
+    // learn_loop：QUIZ_FAIL / SUPPLEMENT 之后还没有新的 doc_review
+    // 完成记录时，doc_review 不算做完，续跑必须再写一轮。
+    let rework_pending = resume
+        .map(|state| learn_rework_invalidated(&wf.name, &state.completed))
+        .unwrap_or_default();
     let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
     if let Some(state) = resume {
         for (step_id, output_key, output) in &state.completed {
-            done_steps.insert(step_id.as_str());
+            if !rework_pending.contains(step_id.as_str()) {
+                done_steps.insert(step_id.as_str());
+            }
             if let Some(key) = output_key {
                 vars.insert(
                     key.clone(),
@@ -5731,6 +7554,9 @@ async fn run_workflow_serial(
         }
     }
 
+    // learn_loop：本次学习独占的主题，持有到整个 run 结束。
+    let mut learn_lock: Option<LearnTopicLock> = None;
+
     for round in 0..wf.effective_max_rounds() {
         // 跨 step 循环（loop_until）的每轮状态：迭代计数按 loop_until
         // 所在 step 的完成次数计（key = step 下标）；pending_feedback
@@ -5740,13 +7566,30 @@ async fn run_workflow_serial(
         // 当前文件并消费本轮反馈。
         let mut loop_iters: HashMap<usize, usize> = HashMap::new();
         let mut pending_feedback: Option<String> = None;
+        // 文档步刚写完才算新的一版。resume 跳过已完成的文档步时保持 false，
+        // read_confirm 不递增 round，题面不变，旧的「开始答题」可以被回放。
+        let mut material_refreshed = false;
         let mut idx = 0;
         while idx < wf.steps.len() {
             let step = &wf.steps[idx];
-            if wf.name == "learn_loop" && matches!(step.id.as_str(), "read_confirm" | "quiz") {
+            if wf.name == "learn_loop" {
+                if let Err(e) = ensure_learn_lock(&mut learn_lock, &vars, ctx) {
+                    return WfOutcome::Failed(format!("step '{}': {e}", step.id));
+                }
+            }
+            if wf.name == "learn_loop"
+                && matches!(
+                    step.id.as_str(),
+                    "read_confirm" | "quiz" | "supplement" | "report"
+                )
+            {
                 let slug = vars.get("plan_out").cloned().unwrap_or_default();
-                match run_learn_control_step(step, &slug, ctx, answer_log).await {
+                let new_reading = material_refreshed;
+                match run_learn_control_step(step, &slug, ctx, answer_log, new_reading).await {
                     Ok(Some(output)) => {
+                        if step.id == "read_confirm" {
+                            material_refreshed = false;
+                        }
                         last_output = output.clone();
                         ckpt.record_step(&step.id, step.output_key.as_deref(), &output);
                         // 确定性产出同样参与 loop_until 返工判定（与模型步
@@ -5770,13 +7613,8 @@ async fn run_workflow_serial(
                         {
                             Ok(SerialLoopNav::Advance) => idx += 1,
                             Ok(SerialLoopNav::Rework(target)) => {
-                                if wf.name == "learn_loop" {
-                                    bump_learn_round(
-                                        &ctx.cwd,
-                                        vars.get("plan_out").map_or("", String::as_str),
-                                    );
-                                }
                                 pending_feedback = Some(last_output.clone());
+                                done_steps.remove(wf.steps[target].id.as_str());
                                 idx = target;
                             }
                             Err(msg) => return WfOutcome::Failed(msg),
@@ -5937,6 +7775,9 @@ async fn run_workflow_serial(
                     keyed.insert(key.clone(), last_output.clone());
                 }
                 ckpt.record_step(&step.id, step.output_key.as_deref(), &last_output);
+                if wf.name == "learn_loop" {
+                    material_refreshed = true;
+                }
                 idx += 1;
                 continue;
             }
@@ -5965,6 +7806,28 @@ async fn run_workflow_serial(
             // `serial_loop_rework_then_pass` 里同时出现 VERDICT: FAIL 与
             // VERDICT: PASS 两轮内容）。
             let mut speaker_outputs: Vec<(String, String)> = Vec::new();
+            // plan 会在本次调用里 write 覆盖 ledger.json。快照必须取在
+            // speaker 之前，成功后再按知识点 id 把进度合并回去。
+            let mut ledger_guard = (wf.name == "learn_loop" && step.id == "plan")
+                .then(|| {
+                    LedgerRestoreGuard::take(&ctx.cwd, learn_lock.as_ref().map(|l| l.slug.as_str()))
+                });
+            if let Some(slug) = ledger_guard
+                .as_ref()
+                .and_then(|g| g.locked_slug_for_topic(topic))
+            {
+                match LearnTopicLock::acquire(&ctx.cwd, slug, &learn_lock_holder(ctx)) {
+                    Ok(lock) => learn_lock = Some(lock),
+                    Err(e) => return WfOutcome::Failed(format!("step 'plan': {e}")),
+                }
+            }
+            // sync_code 会 edit 真实源文件：开跑前留原文，改出注释以外的变化就还原。
+            let sync_baseline = (wf.name == "learn_loop" && step.id == "sync_code").then(|| {
+                SyncCodeBaseline::take(
+                    &ctx.cwd,
+                    vars.get("plan_out").map_or("", |s| s.trim()),
+                )
+            });
             // context-overflow fresh restarts are bounded per step and do not
             // reset loop_iters, token accounting, or dispatch budget.
             let mut context_overflow_restarts = 0usize;
@@ -6254,6 +8117,102 @@ async fn run_workflow_serial(
                             continue;
                         }
                     }
+                    // 审稿员已不在路径上，事实靠这里的机械校验兜底：证据行真实存在，
+                    // 答案是某个选项，选项之间不互为子串，并且 design 讲得出取舍。
+                    if wf.name == "learn_loop" && step.id == "plan" {
+                        if let Err(reason) = validate_learn_plan(&ctx.cwd, &response) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn plan failed evidence check; retrying"
+                            );
+                            let annotation = format!(
+                                "上次写的 plan.json 未通过引擎校验：\n{reason}\n\
+                                 请读源码核对后重写 plan.json，并再次只输出 slug。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    if wf.name == "learn_loop" && step.id == "annotate" {
+                        let slug = vars.get("plan_out").cloned().unwrap_or_default();
+                        if let Err(reason) = validate_learn_annotations(&ctx.cwd, &slug) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn annotated copies failed check; retrying"
+                            );
+                            let annotation = format!(
+                                "上次写的注释副本未通过引擎校验：\n{reason}\n\
+                                 请重新 read 源文件，逐字复制代码后只加注释，重写有问题的副本。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    if let Some(baseline) = &sync_baseline {
+                        if let Err(reason) = baseline.check_and_restore(&ctx.cwd) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn sync_code changed code; reverted and retrying"
+                            );
+                            let annotation = format!(
+                                "上次同步注释改到了代码：\n{reason}\n\
+                                 请重新 read 源文件，只插入或修改注释行，代码一个字符都不要动。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    if wf.name == "learn_loop" && step.id == "merge" {
+                        let slug = vars.get("plan_out").cloned().unwrap_or_default();
+                        if let Err(reason) = validate_learn_final(&ctx.cwd, &slug) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn final doc failed check; retrying"
+                            );
+                            let annotation = format!(
+                                "上次写的定稿未通过引擎校验：\n{reason}\n\
+                                 请对照 draft.md 补回缺的内容后重新 write 定稿。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
                     // patch 模式（patch_from）：产出是「修订说明 + ops」，
                     // 引擎机械打到上游草案上，本步产出 = 打过补丁的完整草案
                     // （下游拿到的仍是全量文本，只有模型那一跳是增量）。
@@ -6308,6 +8267,33 @@ async fn run_workflow_serial(
             // 聚合本 step 全部 speaker 的产出。单 speaker 时逐字等于原
             // 产出，所以既有 workflow 的下游输入不变。
             last_output = aggregate_step_output(&speaker_outputs);
+            if let Some(guard) = ledger_guard.as_mut() {
+                let slug = last_output.trim();
+                if learn_slug_ok(slug) && learn_lock.as_ref().is_none_or(|l| l.slug != slug) {
+                    match LearnTopicLock::acquire(&ctx.cwd, slug, &learn_lock_holder(ctx)) {
+                        Ok(lock) => learn_lock = Some(lock),
+                        Err(e) => {
+                            guard.restore_locked(slug);
+                            return WfOutcome::Failed(format!("step 'plan': {e}"));
+                        }
+                    }
+                }
+                match apply_ledger_merge(&ctx.cwd, last_output.trim(), &guard.snaps) {
+                    Ok(merged) => {
+                        guard.disarm();
+                        if merged {
+                            let _ = ctx.event_tx.send(ChatEvent::Status {
+                                message: "plan 重跑：已按知识点 id 合并 ledger，保留 round / wrong / passed"
+                                    .into(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return WfOutcome::Failed(format!("step 'plan': 账本合并失败：{e}"));
+                    }
+                }
+            }
+            drop(ledger_guard);
             if let Some(key) = &step.output_key {
                 // 监察批注（⚠️ [监察审查]…）不进 vars：它给人看，
                 // 穿给下游 step / 嵌套 workflow 是污染。
@@ -6338,17 +8324,15 @@ async fn run_workflow_serial(
             {
                 Ok(SerialLoopNav::Advance) => {}
                 Ok(SerialLoopNav::Rework(target_idx)) => {
-                    if wf.name == "learn_loop" {
-                        bump_learn_round(
-                            &ctx.cwd,
-                            vars.get("plan_out").map_or("", String::as_str),
-                        );
-                    }
                     pending_feedback = Some(last_output.clone());
+                    done_steps.remove(wf.steps[target_idx].id.as_str());
                     idx = target_idx;
                     continue;
                 }
                 Err(msg) => return WfOutcome::Failed(msg),
+            }
+            if wf.name == "learn_loop" {
+                material_refreshed = true;
             }
             idx += 1;
         }
@@ -6571,6 +8555,8 @@ async fn run_dag_step(
         ));
     }
 
+    let chapter_baseline =
+        patch_chapter_baseline(&inp.wf.name, &step.id, &inp.cwd, &inp.vars);
     let mut step_transcript = String::new();
     let mut last_output = String::new();
     // 本 step 内各 speaker 的产出，按声明顺序。step 收尾时聚合成
@@ -6782,6 +8768,27 @@ async fn run_dag_step(
                     continue;
                 }
             }
+            if let Err(reason) = reject_chapter_overwrite(chapter_baseline.as_ref()) {
+                if attempt >= step.max_retries {
+                    return Err(StepFail::Failed(format!(
+                        "step '{}' speaker '{}': 返工章节未通过增补校验（已重试 {attempt} 次）：{reason}",
+                        step.id, speaker
+                    )));
+                }
+                attempt += 1;
+                tracing::warn!(
+                    step = %step.id, speaker = %speaker, attempt,
+                    reason = %reason,
+                    "learn chapter overwrite rejected; retrying"
+                );
+                let annotation = format!(
+                    "上次重写把原章节改坏了：{reason}。引擎已把原文件还原。\
+                     请在原文上增补（如「易错点辨析」），保留全部 file:line 出处和代码摘录，不要整章推倒。"
+                );
+                step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                prompt = format!("{full_prompt}\n\n{annotation}");
+                continue;
+            }
             if let Err(reason) = check_output_contract(&step.output_contract, &response) {
                 if attempt >= step.max_retries {
                     // 重试耗尽：判死前过一道 advisor 语义兜底（同串行
@@ -6908,11 +8915,17 @@ async fn run_workflow_dag(
     // output_key → 产出（原始文本），供嵌套调用方的 output_from 选取。
     let mut keyed: HashMap<String, String> = HashMap::new();
     // 断点续跑：已完成 step 预填 outputs/vars（视为依赖已满足），
-    // wave 调度时跳过，不再 spawn。
+    // wave 调度时跳过，不再 spawn。learn_loop 的 doc_review 若还欠
+    // 一轮返工，不放进 done 集合（与串行引擎同一条规则）。
+    let rework_pending = resume
+        .map(|state| learn_rework_invalidated(&wf.name, &state.completed))
+        .unwrap_or_default();
     let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
     if let Some(state) = resume {
         for (step_id, output_key, output) in &state.completed {
-            done_steps.insert(step_id.as_str());
+            if !rework_pending.contains(step_id.as_str()) {
+                done_steps.insert(step_id.as_str());
+            }
             outputs.insert(step_id.clone(), output.clone());
             if let Some(key) = output_key {
                 vars.insert(
@@ -6950,6 +8963,10 @@ async fn run_workflow_dag(
             // fan_out step 下标 → 派发的元素个数；全部完成才记一次 checkpoint。
             let mut fan_out_expected: HashMap<usize, usize> = HashMap::new();
             let mut fan_out_got: HashMap<usize, Vec<String>> = HashMap::new();
+            // outline 开跑前的引擎返工单。模型改成 FULL 时，本 wave 收口前写回。
+            let mut feedback_guards: Vec<EngineFeedbackGuard> = Vec::new();
+            // MODE: PATCH 且没有点名章节时，write_chapter 不派发，但仍要记完成。
+            let mut patch_only_notes: Vec<(usize, Option<String>, String)> = Vec::new();
             for &idx in wave {
                 if done_steps.contains(wf.steps[idx].id.as_str()) {
                     continue;
@@ -6978,15 +8995,71 @@ async fn run_workflow_dag(
                         continue;
                     }
                 }
+                if wf.name == "doc_review_loop" && wf.steps[idx].id == "outline" {
+                    if let Some(guard) = capture_engine_feedback(&ctx.cwd, &vars) {
+                        if let Some(added) = skip_outline_for_engine_feedback(&guard) {
+                            let mut note =
+                                "引擎返工单已点名章节，跳过 outline，框架文件保持不动".to_string();
+                            if added > 0 {
+                                note.push_str(&format!("；补上 {added} 条新章节链接"));
+                            }
+                            note.push('。');
+                            let _ = ctx.event_tx.send(ChatEvent::Status {
+                                message: format!("[workflow '{}'] {note}", wf.name),
+                            });
+                            ckpt.record_step(
+                                &wf.steps[idx].id,
+                                wf.steps[idx].output_key.as_deref(),
+                                &note,
+                            );
+                            outputs.insert(wf.steps[idx].id.clone(), note.clone());
+                            patch_only_notes.push((idx, wf.steps[idx].output_key.clone(), note));
+                            continue;
+                        }
+                        feedback_guards.push(guard);
+                    }
+                }
                 // 动态扇出：每个元素一个任务，共用同一个信号量（对象池）。
+                // MODE: PATCH 时只留下 feedback.md 里 `## <id>` 点名的章。
+                let mut patch_skipped = false;
                 let item_vars: Vec<Option<(usize, String)>> = match &wf.steps[idx].fan_out {
                     None => vec![None],
                     Some(fo) => match load_fan_out_items(fo, &vars, &ctx.cwd) {
-                        Ok(ids) => ids
-                            .into_iter()
-                            .enumerate()
-                            .map(|(n, id)| Some((n + 1, id)))
-                            .collect(),
+                        Ok(ids) => {
+                            let total = ids.len();
+                            let allow = patch_fan_out_allowlist(
+                                &wf.name,
+                                &wf.steps[idx].id,
+                                &ctx.cwd,
+                                &vars,
+                            );
+                            let kept: Vec<Option<(usize, String)>> = ids
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(_, id)| match &allow {
+                                    None => true,
+                                    Some(set) => set.contains(id),
+                                })
+                                .map(|(n, id)| Some((n + 1, id)))
+                                .collect();
+                            if allow.is_some() && total > 0 && kept.is_empty() {
+                                patch_skipped = true;
+                                Vec::new()
+                            } else {
+                                if allow.is_some() && kept.len() != total {
+                                    let _ = ctx.event_tx.send(ChatEvent::Status {
+                                        message: format!(
+                                            "[workflow '{}'] step '{}' 按 MODE: PATCH 只派发 {} 章（计划 {} 章）",
+                                            wf.name,
+                                            wf.steps[idx].id,
+                                            kept.len(),
+                                            total
+                                        ),
+                                    });
+                                }
+                                kept
+                            }
+                        }
                         Err(e) => {
                             set.abort_all();
                             return WfOutcome::Failed(format!(
@@ -7016,6 +9089,17 @@ async fn run_workflow_dag(
                         .cloned()
                         .collect()
                 };
+                if patch_skipped {
+                    let note = "MODE: PATCH 没有点名的章节，引擎未派发 writer。".to_string();
+                    ckpt.record_step(
+                        &wf.steps[idx].id,
+                        wf.steps[idx].output_key.as_deref(),
+                        &note,
+                    );
+                    outputs.insert(wf.steps[idx].id.clone(), note.clone());
+                    patch_only_notes.push((idx, wf.steps[idx].output_key.clone(), note));
+                    continue;
+                }
                 if wf.steps[idx].fan_out.is_some()
                     && pending_items.is_empty()
                     && !prior_items.is_empty()
@@ -7147,6 +9231,7 @@ async fn run_workflow_dag(
                                 .is_some_and(|f| f.tolerate_failures)
                                 && got.iter().all(|o| o.starts_with(FAN_OUT_ITEM_FAILED))
                             {
+                                restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                                 set.abort_all();
                                 return WfOutcome::Failed(format!(
                                     "step '{step_id}' fan_out 全部 {expected} 个元素都失败：{}",
@@ -7158,29 +9243,37 @@ async fn run_workflow_dag(
                             outputs.insert(step_id, joined.clone());
                             wave_results.push((step_idx, output_key, joined));
                         } else {
+                            if step_id == "outline" {
+                                restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
+                            }
                             ckpt.record_step(&step_id, output_key.as_deref(), &out);
                             outputs.insert(step_id, out.clone());
                             wave_results.push((step_idx, output_key, out));
                         }
                     }
                     Ok(Err(StepFail::Cancelled)) => {
+                        restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
                         return WfOutcome::Cancelled;
                     }
                     Ok(Err(StepFail::ContextOverflow(detail))) => {
+                        restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
                         return WfOutcome::Failed(format!("context overflow: {detail}"));
                     }
                     Ok(Err(StepFail::Failed(msg))) => {
+                        restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
                         return WfOutcome::Failed(msg);
                     }
                     Err(join_err) => {
+                        restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
                         return WfOutcome::Failed(format!("workflow step task failed: {join_err}"));
                     }
                 }
             }
+            wave_results.extend(patch_only_notes);
             for (_sidx, output_key, out) in &wave_results {
                 if let Some(key) = output_key {
                     // 监察批注不进 vars（同串行引擎）。
@@ -7299,10 +9392,11 @@ async fn run_workflow_dag(
                 });
                 // 作废目标 wave 及之后全部 step 的产出（vars/keyed/
                 // outputs），让下游随重跑拿到返工后的新值而不是旧快照。
-                // checkpoint 只增不改：重跑会产生重复 step 记录，resume
-                // 预填是「后写覆盖」，最后一次产出生效，无需清理。
+                // checkpoint 只增不改，但 done_steps 按 step id 去重：
+                // 不移出的话，续跑或同一次运行里的返工会把目标当成已完成跳过。
                 for w in &waves[target_wave..] {
                     for &i in w {
+                        done_steps.remove(wf.steps[i].id.as_str());
                         outputs.remove(wf.steps[i].id.as_str());
                         if let Some(key) = &wf.steps[i].output_key {
                             vars.remove(key);
@@ -8813,8 +10907,8 @@ role = "reviewer"
     ///      "正确答案"是幻觉。plan 必须先取证（require_tools_any），每个知识
     ///      点带 evidence（file:line）；doc 步同理，必须真 write 落盘。
     ///   3. **答案泄漏**：options 禁止 recommended（前端渲染成「✓ 推荐」= 印
-    ///      答案）；ask 没有洗牌实现（handler 不解析 shuffle），正确项位置由
-    ///      plan 自己随机打散，判分按 label 文本、绝不按位置。
+    ///      答案）；正确项位置由引擎出卷时洗牌（shuffle_quiz_options），
+    ///      判分按 label 文本、绝不按位置。
     ///   4. **同题复用回放**：ask 的 allow_repeat 未实现，同一题面文本重问
     ///      会被 AnswerLog 静默回放旧答案、不弹窗——read_confirm / quiz 重考
     ///      / supplement 这些跨轮次重复的 ask，题面都必须嵌轮次号。
@@ -8853,8 +10947,6 @@ role = "reviewer"
                 "plan",
                 "annotate",
                 "doc_review",
-                "legacy_doc",
-                "legacy_proofread",
                 "read_confirm",
                 "quiz",
                 "supplement",
@@ -8867,10 +10959,7 @@ role = "reviewer"
         let step = |id: &str| wf.steps.iter().find(|s| s.id == id).expect(id);
         let plan = step("plan");
         let annotate = step("annotate");
-        // 旧 doc/proofread 定义保留作配置迁移兼容，但不可命中；实际文档
-        // 维护和可读性门槛位于 doc_review_loop（单独回归测试覆盖）。
-        let doc = step("legacy_doc");
-        let _proofread = step("legacy_proofread");
+        // 文档写作与可读性门槛在 doc_review_loop（单独回归测试覆盖）。
         let read_confirm = step("read_confirm");
         let quiz = step("quiz");
         let supplement = step("supplement");
@@ -8878,21 +10967,9 @@ role = "reviewer"
         let sync_code = step("sync_code");
         let report = step("report");
         assert!(step("doc_review").workflow.is_some());
-        assert_eq!(
-            step("legacy_doc").when_any,
-            vec!["__legacy_flat_learn_loop__"]
-        );
-        assert_eq!(
-            step("legacy_proofread").when_any,
-            vec!["__legacy_flat_learn_loop__"]
-        );
-        // 外层所有实际执行的普通 speaker 都是 tutor；proofreader 只在
-        // nested doc_review_loop 内运行，不能混回外层。
+        // 外层实际执行的 speaker 都是 tutor。审稿不再挡在学员前面。
         for s in &wf.steps {
-            if matches!(
-                s.id.as_str(),
-                "doc_review" | "legacy_doc" | "legacy_proofread"
-            ) {
+            if s.id == "doc_review" {
                 continue;
             }
             assert_eq!(s.roles(), vec!["tutor"], "step {} 必须是 tutor", s.id);
@@ -8921,11 +10998,11 @@ role = "reviewer"
             plan.task_text().contains("\"answer\""),
             "答案应放独立的 answer 字段"
         );
-        // 答案位置偏置：ask 没有洗牌实现，正确项位置由 plan 自己随机打散；
+        // 答案位置偏置由引擎出卷时洗牌消除（shuffle_quiz_options）；
         // 纯字母序号会让 answer 退化成位置引用。
         assert!(
-            norm(plan.task_text()).contains("随机"),
-            "plan 必须自己打散正确项位置（ask 无 shuffle 实现）"
+            norm(plan.task_text()).contains("洗牌"),
+            "plan 应知道选项顺序由引擎洗牌"
         );
         assert!(
             banned(plan.task_text(), "A/B/C/D"),
@@ -9015,61 +11092,6 @@ role = "reviewer"
             "annotate 必须声明绝不修改副本目录以外的文件（learn_loop 是只读类型）"
         );
 
-        // ── doc：写文档，不许弹窗 ──
-        // doc 拥有 write（文档与账本归它维护）但拿不到 ask——"写文档顺便出题"
-        // 会让学员在读到文档路径之前先看到弹窗（step 正文结束时才投递）。
-        assert!(
-            doc.tools.iter().any(|t| t == "write"),
-            "doc 必须有 write：draft.md / plan.json / ledger.json 都归它更新"
-        );
-        assert!(
-            !doc.tools.iter().any(|t| t == "ask"),
-            "doc 的 tools 白名单里不能有 ask——禁弹窗要靠工具隔离，不是 prompt 劝告"
-        );
-        assert!(
-            doc.require_tools_any.iter().any(|t| t == "write")
-                && doc.require_tools_any.iter().any(|t| t == "edit"),
-            "doc 必须真改过 draft.md（edit/write 任一——返工是局部修改，不能只认 write）"
-        );
-        assert!(
-            doc.tools.iter().any(|t| t == "edit"),
-            "doc 必须有 edit：返工增强是局部修改，没有 edit 时模型会用 write \
-             整文件覆写、丢掉既有章节（实测 thrash 57 分钟）"
-        );
-        assert!(
-            doc.task_text().contains("draft.md"),
-            "doc 的正文必须把 draft.md 路径交付给学员"
-        );
-        assert!(
-            doc.task_text().contains("已经存在")
-                && doc.task_text().contains("draft.md")
-                && doc.task_text().contains("刷新"),
-            "doc 必须在重跑时读取并刷新既有 draft.md，而不是只在首次运行写文档"
-        );
-        // 文档内容直接随 doc 步正文返回 chat（学员先读完、再点答题按钮），
-        // 而不是只给一个路径让学员自己找文件。
-        assert!(
-            doc.task_text().contains("全文"),
-            "doc 必须把 draft.md 全文作为正文输出到 chat"
-        );
-        assert!(
-            doc.output_contract.min_chars.unwrap_or(0) >= 500,
-            "doc 必须有 min_chars 下限，否则空正文/只给路径也能通过"
-        );
-        // 小白友好（实测反面教材：术语零解释、例子缺失、考据密度压过主线）：
-        assert!(
-            doc.task_text().contains("大白话"),
-            "doc 必须要求术语首次出现时用大白话解释（读者是零基础小白）"
-        );
-        assert!(
-            doc.task_text().contains("example"),
-            "doc 必须以知识点的 example 为底展开讲解（传什么→出来什么）"
-        );
-        assert!(
-            doc.task_text().contains("逐行讲解"),
-            "doc 必须要求代码摘录后配逐行讲解，不许只贴代码配行号表"
-        );
-
         // ── read_confirm：答题按钮独占一步 ──
         assert!(
             read_confirm.tools.iter().any(|t| t == "ask"),
@@ -9099,8 +11121,8 @@ role = "reviewer"
         );
 
         // ── quiz：批量出题 + 判分 + 循环路由 ──
-        // 循环标记只挂在 quiz/supplement 上：doc/read_confirm 不负责循环控制。
-        assert!(doc.loop_until.is_none() && read_confirm.loop_until.is_none());
+        // 循环标记只挂在 quiz/supplement 上：read_confirm 不负责循环控制。
+        assert!(read_confirm.loop_until.is_none());
         assert_eq!(quiz.loop_until.as_deref(), Some("QUIZ_PASS"));
         assert_eq!(
             quiz.loop_back_routes.get("QUIZ_FAIL").map(|s| s.as_str()),
@@ -16375,7 +18397,7 @@ mod deterministic_learning_tests {
     /// 判分容忍度：归一化后相等、部分 label、带前缀/后缀都判对；
     /// 自由文本（「不知道」）、空串判错。
     #[test]
-    fn grading_tolerates_partial_and_prefixed_labels() {
+    fn grading_tolerates_prefixed_labels_but_not_partial_ones() {
         let plan = one_point_plan("borrow 语义");
         // 完全相等（忽略大小写与收尾标点）。
         let mut ledger = one_point_ledger();
@@ -16383,12 +18405,12 @@ mod deterministic_learning_tests {
             deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "Borrow 语义。")]))
                 .passed
         );
-        // 只回 label 的一部分。
+        // 只回 label 的一部分判错：短干扰项可能正是它的子串。
         let mut ledger = one_point_ledger();
         assert!(
-            deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "borrow")])).passed
+            !deterministic_grade_quiz(&plan, &mut ledger, &answers_of(&[("k1", "borrow")])).passed
         );
-        // 带前缀（「我选 borrow 语义」），互相包含。
+        // 带前缀（「我选 borrow 语义」），包含完整 label。
         let mut ledger = one_point_ledger();
         assert!(
             deterministic_grade_quiz(
@@ -16540,62 +18562,6 @@ mod deterministic_learning_tests {
         let out = format_quiz_feedback(&grade);
         let k2_seg = out.split("知识点 k2").nth(1).unwrap();
         assert!(!k2_seg.contains("前置未掌握"), "{k2_seg}");
-    }
-
-    #[test]
-    fn quiz_feedback_groups_wrong_points_by_chapter_id() {
-        let grade = super::QuizGrade {
-            passed: false,
-            items: vec![
-                super::QuizItemGrade {
-                    id: "k1".into(),
-                    title: "甲".into(),
-                    correct: true,
-                    given: "a".into(),
-                    expected: "a".into(),
-                    evidence: "x.rs:1-2".into(),
-                    teach_point: String::new(),
-                    unmet_requires: vec![],
-                },
-                super::QuizItemGrade {
-                    id: "k2".into(),
-                    title: "乙".into(),
-                    correct: false,
-                    given: "b".into(),
-                    expected: "c".into(),
-                    evidence: "y.rs:3-4".into(),
-                    teach_point: String::new(),
-                    unmet_requires: vec![],
-                },
-            ],
-        };
-        let out = format_quiz_feedback(&grade);
-        let block = out.split("【按章分组的返工意见").nth(1).expect("有分组块");
-        assert!(block.contains("\n## k2\n"), "{block}");
-        assert!(!block.contains("## k1"), "答对的章不得进返工分组：{block}");
-        assert!(block.contains("y.rs:3-4"), "{block}");
-        assert_eq!(out.lines().last().unwrap(), "QUIZ_FAIL", "{out}");
-    }
-
-    #[test]
-    fn bump_learn_round_increments_persisted_round() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().join(".latte/learn/demo");
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(
-            base.join("ledger.json"),
-            r#"{"slug":"demo","round":0,"knowledge_points":[{"id":"k1","wrong":1,"passed":false}]}"#,
-        )
-        .unwrap();
-        super::bump_learn_round(dir.path(), "demo");
-        super::bump_learn_round(dir.path(), "demo");
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).unwrap())
-                .unwrap();
-        assert_eq!(v["round"], 2);
-        assert_eq!(v["knowledge_points"][0]["wrong"], 1, "其余字段不动");
-        // 账本缺失不 panic
-        super::bump_learn_round(dir.path(), "nope");
     }
 
     #[test]
@@ -16846,6 +18812,7 @@ task = "补充疑问"
             let mut rx = event_rx;
             let mut quiz_round = 0usize;
             let mut statuses: Vec<String> = Vec::new();
+            let mut k1_orders: Vec<Vec<String>> = Vec::new();
             loop {
                 match rx.recv().await {
                     Ok(ChatEvent::ChoiceRequested {
@@ -16858,13 +18825,17 @@ task = "补充疑问"
                             options[0].label.clone()
                         } else {
                             quiz_round += 1;
+                            if let Some(q) = questions.iter().find(|q| q.id == "k1") {
+                                k1_orders
+                                    .push(q.options.iter().map(|o| o.label.clone()).collect());
+                            }
                             questions
                                 .iter()
                                 .map(|q| {
                                     // 第一轮把 k1 答错（选干扰项），其余及各轮全对。
                                     let wrong = quiz_round == 1 && q.id == "k1";
                                     let label = if wrong {
-                                        q.options[0].label.clone()
+                                        "还能用".to_string()
                                     } else {
                                         match q.id.as_str() {
                                             "k1" => "borrow 语义".to_string(),
@@ -16887,7 +18858,7 @@ task = "补充疑问"
                     Ok(ChatEvent::Status { message }) => statuses.push(message),
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break statuses,
+                    Err(broadcast::error::RecvError::Closed) => break (statuses, k1_orders),
                 }
             }
         });
@@ -16900,12 +18871,21 @@ task = "补充疑问"
         .await
         .expect("workflow 不应卡死")
         .expect("workflow 应成功");
-        assert!(out.contains("学习完成"), "{out}");
+        assert!(out.contains("ALL_DONE"), "{out}");
         drop(ctx);
-        let statuses = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
-            .await
-            .expect("driver 应退出")
-            .expect("driver 不应 panic");
+        let (statuses, k1_orders) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+                .await
+                .expect("driver 应退出")
+                .expect("driver 不应 panic");
+
+        // 重考换位：k1 两次作答，正确项不在同一位置；选项集合不变。
+        assert_eq!(k1_orders.len(), 2, "k1 应作答两次：{k1_orders:?}");
+        let pos = |o: &Vec<String>| o.iter().position(|l| l == "borrow 语义");
+        assert_ne!(pos(&k1_orders[0]), pos(&k1_orders[1]), "{k1_orders:?}");
+        let mut sorted = k1_orders[1].clone();
+        sorted.sort();
+        assert_eq!(sorted, ["borrow 语义", "还能用"]);
 
         // 返工 Status 事件：跳回 doc。
         assert!(
@@ -16933,12 +18913,13 @@ task = "补充疑问"
             "k1",
             "borrow 语义",
             "src/ownership.rs:12-48",
+            "ISSUE: k1",
             "QUIZ_FAIL",
         ] {
             assert!(rework.contains(pat), "返工 doc prompt 缺 {pat}：{rework}");
         }
 
-        // 账本：k1 wrong=1 后通过，k2 一次通过。
+        // 账本：k1 wrong=1 后通过，k2 一次通过。两轮阅读确认把 round 递增到 2。
         let ledger: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).unwrap())
                 .unwrap();
@@ -16946,6 +18927,168 @@ task = "补充疑问"
         assert_eq!(ledger["knowledge_points"][0]["passed"], true);
         assert_eq!(ledger["knowledge_points"][1]["wrong"], 0);
         assert_eq!(ledger["knowledge_points"][1]["passed"], true);
+        assert_eq!(ledger["round"], 2, "每次新文档的读完确认都要落盘 round");
+        let feedback = std::fs::read_to_string(base.join("feedback.md")).expect("feedback.md");
+        assert!(
+            feedback.contains("SOURCE: engine") && feedback.contains("## k1"),
+            "答错必须写成只重写 k1 的返工单：{feedback}"
+        );
+    }
+
+    #[test]
+    fn quiz_scoring_accepts_full_label_with_prefix_only() {
+        assert!(super::quiz_answer_matches("borrow 语义", "borrow 语义"));
+        assert!(super::quiz_answer_matches("borrow 语义", "1. borrow 语义"));
+        assert!(super::quiz_answer_matches(
+            "borrow 语义",
+            "其他：borrow 语义"
+        ));
+        assert!(
+            !super::quiz_answer_matches("borrow 语义", "语义"),
+            "短干扰项是正确项的子串时不得判对"
+        );
+        assert_eq!(super::quiz_given_label("1. borrow 语义"), "borrow 语义");
+        assert_eq!(super::quiz_given_label("k1→borrow 语义"), "borrow 语义");
+        assert_eq!(super::supplement_request("没有了，全部理解"), None);
+        assert_eq!(
+            super::supplement_request("其他：生命周期怎么标注"),
+            Some("生命周期怎么标注".into())
+        );
+    }
+
+    #[test]
+    fn quiz_options_shuffle_is_stable_and_moves_answer_on_retake() {
+        let opts = |labels: &[&str]| -> Vec<ChoiceOption> {
+            labels
+                .iter()
+                .map(|l| ChoiceOption {
+                    label: (*l).into(),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let labels = |o: &[ChoiceOption]| o.iter().map(|o| o.label.clone()).collect::<Vec<_>>();
+        let four = ["move 语义", "借用规则", "Copy 语义", "Clone 语义"];
+
+        // 同一次作答（续跑重放）顺序不变。
+        let a = super::shuffle_quiz_options(opts(&four), "move 语义", "rust", "k1", 1);
+        let b = super::shuffle_quiz_options(opts(&four), "move 语义", "rust", "k1", 1);
+        assert_eq!(labels(&a), labels(&b));
+
+        // 每次重考：选项不丢不重，正确项不留在上一次的位置。
+        for slug in ["rust", "tokio", "serde"] {
+            for id in ["k1", "k2", "k3"] {
+                let mut prev = None;
+                for attempt in 1..=6 {
+                    let s = super::shuffle_quiz_options(opts(&four), "move 语义", slug, id, attempt);
+                    let mut got = labels(&s);
+                    let pos = got.iter().position(|l| l == "move 语义");
+                    if let Some(p) = prev {
+                        assert_ne!(pos, Some(p), "{slug}/{id} 第 {attempt} 次正确项没换位");
+                    }
+                    prev = pos;
+                    got.sort();
+                    let mut want: Vec<String> = four.iter().map(|s| s.to_string()).collect();
+                    want.sort();
+                    assert_eq!(got, want);
+                }
+            }
+        }
+
+        // 不止一种排列：引擎确实在洗，不是原样返回。
+        let distinct: std::collections::HashSet<Vec<String>> = (1..=8)
+            .map(|n| labels(&super::shuffle_quiz_options(opts(&four), "move 语义", "rust", "k1", n)))
+            .collect();
+        assert!(distinct.len() > 1, "{distinct:?}");
+
+        assert_eq!(
+            labels(&super::shuffle_quiz_options(opts(&["唯一"]), "唯一", "rust", "k1", 2)),
+            ["唯一"]
+        );
+    }
+
+    #[test]
+    fn learn_loop_supplement_is_engine_two_choice() {
+        let mut plan = serde_json::json!({
+            "knowledge_points": [
+                {
+                    "id": "k1",
+                    "title": "所有权",
+                    "question": "传 a 之后还能用吗？",
+                    "options": [{"label": "能"}, {"label": "不能"}],
+                    "answer": "不能"
+                }
+            ]
+        });
+        let mut ledger = serde_json::json!({
+            "round": 1,
+            "knowledge_points": [
+                {"id": "k1", "title": "所有权", "wrong": 0, "passed": true}
+            ],
+            "supplements": []
+        });
+        let id = super::append_supplement_point(
+            &mut plan,
+            &mut ledger,
+            "生命周期怎么标注",
+            1,
+        )
+        .unwrap();
+        assert_eq!(id, "sup1");
+        let point = plan["knowledge_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "sup1")
+            .unwrap();
+        assert!(super::point_is_gradeable(point));
+        assert_eq!(point["answer"], "这一节回答了我的问题");
+        assert_eq!(point["options"][0]["label"], "这一节回答了我的问题");
+        assert_eq!(point["options"][1]["label"], "还是不懂");
+        assert_eq!(point["question"], "生命周期怎么标注");
+
+        point_mut(&mut plan)["options"] = serde_json::json!([
+            {"label": "A"}, {"label": "B"}, {"label": "C"}, {"label": "D"}
+        ]);
+        point_mut(&mut plan)["answer"] = serde_json::json!("A");
+        point_mut(&mut plan)["supplement"] = serde_json::json!(false);
+        assert!(super::seal_supplement_questions(&mut plan));
+        let point = plan["knowledge_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "sup1")
+            .unwrap();
+        assert_eq!(point["answer"], "这一节回答了我的问题");
+        assert_eq!(point["options"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            plan["knowledge_points"][0]["answer"], "不能",
+            "普通知识点的题目不被两选一覆盖"
+        );
+
+        let mut answers = std::collections::HashMap::new();
+        answers.insert("sup1".into(), "这一节回答了我的问题".into());
+        let grade = super::deterministic_grade_quiz(&plan, &mut ledger, &answers);
+        assert!(grade.items.iter().any(|item| item.id == "sup1" && item.correct));
+        assert_eq!(ledger["knowledge_points"][1]["passed"], true);
+
+        ledger["knowledge_points"][1]["passed"] = serde_json::json!(false);
+        ledger["_graded_answers"] = serde_json::json!({});
+        answers.insert("sup1".into(), "还是不懂".into());
+        let grade = super::deterministic_grade_quiz(&plan, &mut ledger, &answers);
+        let item = grade.items.iter().find(|item| item.id == "sup1").unwrap();
+        assert!(!item.correct);
+        assert_eq!(ledger["knowledge_points"][1]["passed"], false);
+        assert_eq!(ledger["knowledge_points"][1]["wrong"], 1);
+
+        fn point_mut(plan: &mut serde_json::Value) -> &mut serde_json::Value {
+            plan["knowledge_points"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|p| p["id"] == "sup1")
+                .unwrap()
+        }
     }
 
     #[test]
@@ -16961,7 +19104,7 @@ task = "补充疑问"
             .find(|s| s.id == "doc_review")
             .expect("outer workflow must have doc_review nested step");
         assert_eq!(review.workflow.as_deref(), Some("doc_review_loop"));
-        assert_eq!(review.output_from.as_deref(), Some("review_out"));
+        assert_eq!(review.output_from.as_deref(), Some("chapters_out"));
 
         let inner: WorkflowDef =
             toml::from_str(include_str!("../../config/workflows/doc_review_loop.toml"))
@@ -16969,19 +19112,12 @@ task = "补充疑问"
         inner
             .validate()
             .expect("doc_review_loop config must validate");
-        let proofread = inner
-            .steps
-            .iter()
-            .find(|s| s.id == "proofread")
-            .expect("nested workflow must have proofread step");
-        assert_eq!(proofread.loop_until.as_deref(), Some("LOOKS_CLEAR"));
-        assert_eq!(proofread.loop_back_to.as_deref(), Some("outline"));
-        // loop_no_release_on 保持为 None，避免将 proofreader 的建议误判为致命硬拒绝，
-        // 确保耗尽时可走 loop_exhausted_last_resort_review 经 Advisor 语义复核放行。
-        assert_eq!(proofread.loop_no_release_on.as_deref(), None);
-        assert_eq!(proofread.max_iterations, Some(3));
+        assert!(
+            inner.steps.iter().all(|s| s.id != "proofread" && s.loop_until.is_none()),
+            "章节写完就交给学员，不得再等 LOOKS_CLEAR"
+        );
 
-        // 主体框架先行；章节由引擎 fan_out 派发（不靠模型认领），且晚于 outline、早于 proofread。
+        // 主体框架先行；章节由引擎 fan_out 派发（不靠模型认领）。
         let writer = inner
             .steps
             .iter()
@@ -17003,10 +19139,32 @@ task = "补充疑问"
             vec![".latte/learn/{{slug}}/sections/{{item_id}}.md".to_string()],
             "并发章节 writer 只能写自己那一章（引擎强制，不靠约定）"
         );
+        assert_eq!(writer.max_retries, 2, "整章推倒时引擎要留一次重写机会");
+        assert!(
+            writer.task_text().contains("增补") && writer.task_text().contains("不许整章推倒"),
+            "PATCH 返工必须写明只增补"
+        );
         assert!(
             !writer.tools.iter().any(|t| t == "bash"),
             "bash 会绕开写白名单"
         );
+        // 章节 writer 能改文件但拿不到 ask：禁弹窗靠工具隔离。
+        assert!(
+            ["read", "edit", "write"]
+                .iter()
+                .all(|t| writer.tools.iter().any(|w| w == t))
+                && !writer.tools.iter().any(|t| t == "ask"),
+            "{:?}",
+            writer.tools
+        );
+        // 活路径写作标准（原先锁在永远跑不到的 legacy_doc 上）。
+        for (kw, why) in [
+            ("设计问题与结论", "每章先给结论再讲代码"),
+            ("方案对比", "必须对比真实可行方案"),
+            ("最小示例", "分支不显然时要有输入到输出的例子"),
+        ] {
+            assert!(writer.task_text().contains(kw), "write_chapter 缺：{why}");
+        }
         assert!(
             !inner.steps.iter().any(|s| s.task_text().contains("mkdir")),
             "分派由引擎负责，不得让模型自行认领"
@@ -17019,19 +19177,14 @@ task = "补充疑问"
                 .unwrap()
         };
         assert!(wave_of("outline") < wave_of("write_chapter"));
-        assert!(wave_of("write_chapter") < wave_of("proofread"));
+        let outline = inner
+            .steps
+            .iter()
+            .find(|s| s.id == "outline")
+            .expect("outline");
         assert!(
-            ["read", "search", "code_graph", "doc_graph_context"]
-                .iter()
-                .all(|t| proofread.tools.iter().any(|x| x == t))
-                && proofread.read_path_allowlist.is_empty(),
-            "审稿员必须能读源码核对事实"
-        );
-        assert!(
-            proofread
-                .task_text()
-                .contains("行号偏差、措辞、格式**只算 NIT"),
-            "行号偏差不得成为 BLOCKER"
+            outline.task_text().contains("SOURCE: engine"),
+            "总编不得把引擎写好的 PATCH 返工单改成全文重写"
         );
         let proofreader_prompt = include_str!("../../prompts/proofreader.md");
         assert!(
@@ -17040,30 +19193,68 @@ task = "补充疑问"
             "proofreader 不得通过历史问题维持跨轮记忆"
         );
 
-        for id in ["legacy_doc", "legacy_proofread"] {
-            let legacy = outer
-                .steps
-                .iter()
-                .find(|s| s.id == id)
-                .expect("legacy step");
-            assert_eq!(legacy.when_any, vec!["__legacy_flat_learn_loop__"]);
-            assert!(legacy.output_key.is_some());
-        }
+        assert!(
+            !outer.steps.iter().any(|s| s.id.starts_with("legacy_")),
+            "不许留永远跑不到的兼容步骤"
+        );
     }
 
-    /// doc_review_loop 决策逻辑回归测试：
-    /// 1. proofreader 发现 BLOCKER 并输出 NEEDS_FIX 时，触发 Rework(0) 跳回 doc_write；
-    /// 2. proofreader 仅含 NIT 体验建议并输出 LOOKS_CLEAR 时，直接 Advance 放行进入下游。
-    #[tokio::test]
-    async fn doc_review_loop_decision_blocker_reworks_and_nit_advances() {
+    /// 章节写完就回到外层。审稿员的 LOOKS_CLEAR / NEEDS_FIX 不再挡在学员前面。
+    #[test]
+    fn doc_review_loop_decision_does_not_wait_for_proofread() {
         let raw = include_str!("../../config/workflows/doc_review_loop.toml");
         let wf: WorkflowDef = toml::from_str(raw).expect("doc_review_loop must parse");
         wf.validate().expect("doc_review_loop must validate");
-        let proofread_step = wf.steps.iter().find(|s| s.id == "proofread").unwrap();
+        assert!(
+            wf.steps
+                .iter()
+                .all(|s| s.loop_until.is_none() && s.id != "proofread"),
+            "不得用审稿循环把学员挡在阅读之前"
+        );
+        let last = wf.steps.last().expect("steps");
+        assert_eq!(last.id, "write_chapter");
+        assert_eq!(last.output_key.as_deref(), Some("chapters_out"));
+    }
 
-        let mut iters = HashMap::new();
-        let vars = HashMap::new();
+    #[tokio::test]
+    async fn learn_loop_report_is_rendered_by_engine_from_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/testslug");
+        std::fs::create_dir_all(base.join("code")).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "testslug", "topic": "所有权",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权规则"},
+                    {"id": "k2", "title": "借用"},
+                    {"id": "k3", "title": "生命周期"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("ledger.json"),
+            serde_json::json!({
+                "slug": "testslug", "round": 3,
+                "knowledge_points": [
+                    {"id": "k1", "wrong": 2, "passed": false},
+                    {"id": "k2", "wrong": 0, "passed": true},
+                    {"id": "k3", "wrong": 1, "passed": true}
+                ],
+                "supplements": [{"round": 2, "asked": "move 之后原变量去哪了"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
         let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("testslug")))
+            .mount(&server)
+            .await;
         let config = test_config_at(&server.uri());
         let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
         let (event_tx, _event_rx) = broadcast::channel(64);
@@ -17071,7 +19262,7 @@ task = "补充疑问"
             merged: config,
             resolver,
             default_params: GenerateParams::default(),
-            cwd: PathBuf::from("."),
+            cwd: dir.path().to_path_buf(),
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -17085,48 +19276,1406 @@ task = "补充疑问"
             dispatch_budget: None,
             root_wf_id: None,
         };
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "写学习文档 {{topic}}"
+output_key = "plan_out"
+[[steps]]
+id = "report"
+role = "tutor"
+tools = ["read"]
+task = "输出掌握报告"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
 
-        // 1. proofread 发现 BLOCKER，末行输出 NEEDS_FIX → 触发返工 Rework(0)（跳回 doc_write）
-        let blocker_out =
-            "ISSUE: §0.1 | BLOCKER | 算术错误 | 2²+1·2⁴=16 不成立 | 改为 2³+1·2³=16\nNEEDS_FIX";
-        let nav = serial_loop_decision(
-            &wf,
-            proofread_step,
-            1,
-            blocker_out,
-            &mut iters,
-            &vars,
-            &None,
-            &ctx,
-            "测试主题",
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
         )
         .await
-        .expect("blocker 输出应正常触发返工判定");
-        match nav {
-            SerialLoopNav::Rework(target) => assert_eq!(target, 0, "应跳回 doc_write(下标0)"),
-            SerialLoopNav::Advance => panic!("BLOCKER 且 NEEDS_FIX 不得放行"),
-        }
-        assert_eq!(iters.get(&1), Some(&1), "迭代计数递增至 1");
+        .expect("workflow 不应卡死")
+        .expect("workflow 应成功");
 
-        // 2. proofread 复审仅含 NIT，末行输出 LOOKS_CLEAR → 放行 Advance 进入下游
-        let nit_out = "ISSUE: §1.2 | NIT | 理解建议 | 图表偏密 | 建议拆行\nLOOKS_CLEAR";
-        let nav = serial_loop_decision(
-            &wf,
-            proofread_step,
-            1,
-            nit_out,
-            &mut iters,
-            &vars,
-            &None,
-            &ctx,
-            "测试主题",
+        assert!(out.contains("## 学习报告：所有权"), "{out}");
+        assert!(out.contains("**掌握进度**：2/3"), "{out}");
+        assert!(out.contains("共 3 轮"), "{out}");
+        assert!(out.contains("所有权规则（k1）2 次"), "{out}");
+        assert!(out.contains("move 之后原变量去哪了"), "{out}");
+        assert!(out.contains("docs/learn/testslug.md"), "{out}");
+        assert!(out.contains(".latte/learn/testslug/code/"), "{out}");
+        assert!(out.contains("还有 1 个知识点未掌握：所有权规则"), "{out}");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "只有 doc 调模型，report 由引擎渲染");
+    }
+
+    fn learn_plan_design() -> serde_json::Value {
+        serde_json::json!({
+            "problem": "赋值之后原来的变量还能不能用",
+            "core_idea": "赋值默认把所有权搬走",
+            "decisions": [{
+                "id": "d1",
+                "question": "为什么赋值默认是 move？",
+                "chosen": "move 语义",
+                "why": "避免两份 owner 同时释放同一块内存",
+                "cost": "原变量不能再用",
+                "alternatives": [{"name": "默认拷贝", "cons": "深拷贝贵，浅拷贝会 double free"}]
+            }]
+        })
+    }
+
+    fn write_learn_plan(cwd: &std::path::Path, points: serde_json::Value) {
+        let base = cwd.join(".latte").join("learn").join("own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "own",
+                "topic": "所有权",
+                "design": learn_plan_design(),
+                "knowledge_points": points
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn good_point() -> serde_json::Value {
+        serde_json::json!({
+            "id": "k1",
+            "title": "所有权",
+            "decision": "d1",
+            "evidence": "src/own.rs:2-3",
+            "question": "传 a 之后还能用吗？",
+            "options": [{"label": "move 语义"}, {"label": "借用规则"}],
+            "answer": "move 语义"
+        })
+    }
+
+    #[test]
+    fn learn_loop_plan_validation_rejects_fake_evidence_and_bad_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+
+        write_learn_plan(dir.path(), serde_json::json!([good_point()]));
+        validate_learn_plan(dir.path(), "own").expect("真实证据、答案是选项，应通过");
+
+        let mut sup = serde_json::json!({
+            "id": "sup1", "title": "补充", "evidence": "", "question": "学员原话",
+            "options": [], "answer": "", "supplement": true
+        });
+        write_learn_plan(dir.path(), serde_json::json!([good_point(), sup.clone()]));
+        validate_learn_plan(dir.path(), "own").expect("补充点由引擎维护，不查证据");
+
+        let cases: Vec<(&str, serde_json::Value, &str)> = vec![
+            ("文件不存在", serde_json::json!({"evidence": "src/nope.rs:1-2"}), "不存在"),
+            ("行号越界", serde_json::json!({"evidence": "src/own.rs:2-40"}), "超出文件范围"),
+            ("路径逃出仓库", serde_json::json!({"evidence": "../own.rs:1"}), "相对路径"),
+            ("答案不是选项", serde_json::json!({"answer": "Copy trait"}), "answer"),
+            (
+                "选项互为子串",
+                serde_json::json!({
+                    "options": [{"label": "move"}, {"label": "move 语义"}],
+                    "answer": "move"
+                }),
+                "互为子串",
+            ),
+            (
+                "带 recommended",
+                serde_json::json!({
+                    "options": [{"label": "move 语义", "recommended": true}, {"label": "借用规则"}]
+                }),
+                "recommended",
+            ),
+        ];
+        for (name, patch, needle) in cases {
+            let mut point = good_point();
+            for (k, v) in patch.as_object().unwrap() {
+                point[k] = v.clone();
+            }
+            write_learn_plan(dir.path(), serde_json::json!([point]));
+            let err = validate_learn_plan(dir.path(), "own").expect_err(name);
+            assert!(err.contains(needle), "{name}：{err}");
+        }
+
+        sup["id"] = serde_json::json!("k1");
+        write_learn_plan(dir.path(), serde_json::json!([good_point(), sup]));
+        let err = validate_learn_plan(dir.path(), "own").expect_err("id 重复");
+        assert!(err.contains("id 重复"), "{err}");
+        assert!(validate_learn_plan(dir.path(), "../own").is_err());
+    }
+
+    #[test]
+    fn learn_plan_check_rejects_missing_design_strawmen_and_fact_quizzes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+
+        let mut bare = good_point();
+        bare.as_object_mut().unwrap().remove("decision");
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "knowledge_points": [bare]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = validate_learn_plan(dir.path(), "own").unwrap_err();
+        assert!(
+            err.contains("缺少 design 对象") && err.contains("缺 decision"),
+            "{err}"
+        );
+
+        let mut straw = learn_plan_design();
+        straw["decisions"][0]["alternatives"] =
+            serde_json::json!([{"name": "用 stdin", "cons": "没有控制台"}]);
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "design": straw,
+                "knowledge_points": [good_point()]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = validate_learn_plan(dir.path(), "own").unwrap_err();
+        assert!(err.contains("稻草人"), "{err}");
+
+        let mut facts = learn_plan_design();
+        facts["decisions"][0]["question"] = serde_json::json!("Pending 结构体");
+        let point = |id: &str, title: &str, question: &str| {
+            serde_json::json!({
+                "id": id,
+                "title": title,
+                "decision": "d1",
+                "evidence": "src/own.rs:2-3",
+                "question": question,
+                "options": [{"label": "甲"}, {"label": "乙"}],
+                "answer": "甲"
+            })
+        };
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "design": facts,
+                "knowledge_points": [
+                    point("k1", "Pending 结构体", "expected 是哪个字段"),
+                    point("k2", "resolve_one 函数", "collected 存在哪一行")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = validate_learn_plan(dir.path(), "own").unwrap_err();
+        assert!(err.contains("不像设计问题"), "{err}");
+        assert!(err.contains("代码单元名"), "{err}");
+        assert!(err.contains("题目全是事实回忆"), "{err}");
+    }
+
+    #[test]
+    fn assemble_draft_injects_design_spine_and_strips_symbol_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let sections = base.join("sections");
+        std::fs::create_dir_all(&sections).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "design": {
+                    "problem": "三题只答两题就放行",
+                    "core_idea": "收齐才唤醒",
+                    "decisions": [{
+                        "id": "d1",
+                        "question": "多题怎么判定收齐？",
+                        "chosen": "expected + collected",
+                        "why": "按名单对账",
+                        "cost": "要约定题号",
+                        "alternatives": [{"name": "逐题放行"}]
+                    }]
+                },
+                "knowledge_points": [{"id": "k1", "title": "为什么要收齐"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(sections.join("00_overview.md"), "# 概览\n先看整体。").unwrap();
+        std::fs::write(
+            sections.join("k1.md"),
+            "## 为什么要收齐\n\n先结论。\n\n```mermaid\nflowchart LR\n  n0[\"fn a\"]\n  n1[\"fn b\"]\n  n2[\"fn c\"]\n  n3[\"fn d\"]\n```\n\n```mermaid\nflowchart TD\n  a[\"收到答案\"] --> b[\"记账\"]\n```\n",
+        )
+        .unwrap();
+
+        assert!(assemble_draft_from_sections(base).unwrap());
+        let draft = std::fs::read_to_string(base.join("draft.md")).unwrap();
+        assert!(draft.starts_with("## 核心结论与设计决策"), "{draft}");
+        assert!(draft.contains("**一句话结论**：收齐才唤醒"));
+        assert!(draft.contains("| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |"));
+        assert!(draft.contains("逐题放行"));
+        assert!(draft.contains("# 概览"));
+        assert!(draft.contains("收到答案"), "数据流图应保留：{draft}");
+        assert!(!draft.contains("fn a"), "符号索引图应被剥掉：{draft}");
+        let spine = draft.find("## 核心结论").unwrap();
+        let overview = draft.find("# 概览").unwrap();
+        let chapter = draft.find("## 为什么要收齐").unwrap();
+        assert!(spine < overview && overview < chapter);
+    }
+
+    #[test]
+    fn learn_topic_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = LearnTopicLock::acquire(dir.path(), "own", "会话 A").expect("A 先拿到");
+        let err = LearnTopicLock::acquire(dir.path(), "own", "会话 B")
+            .err()
+            .expect("同一主题不能再锁");
+        assert!(err.contains("会话 A") && err.contains("own"), "{err}");
+        LearnTopicLock::acquire(dir.path(), "borrow", "会话 B").expect("别的主题不受影响");
+        assert!(LearnTopicLock::held_elsewhere(
+            &dir.path().join(".latte/learn/own")
+        ));
+
+        // 续跑跳过 plan：已有 slug 时补锁，撞上别人照样拒绝。
+        let vars = HashMap::from([("plan_out".to_string(), "own".to_string())]);
+        let mut held = None;
+        let (event_tx, _rx) = broadcast::channel(1);
+        let ctx = lock_test_ctx(dir.path(), event_tx);
+        assert!(ensure_learn_lock(&mut held, &vars, &ctx).is_err());
+
+        drop(a);
+        ensure_learn_lock(&mut held, &vars, &ctx).expect("A 结束后 B 能接着学");
+        assert_eq!(held.as_ref().map(|l| l.slug.as_str()), Some("own"));
+    }
+
+    fn lock_test_ctx(
+        cwd: &std::path::Path,
+        event_tx: broadcast::Sender<ChatEvent>,
+    ) -> WorkflowRunContext {
+        let config = test_config_at("http://127.0.0.1:9");
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: cwd.to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: Some("B".into()),
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        }
+    }
+
+    /// 会话 A 正在学 own。会话 B 发起学习，plan 撞上同一主题：B 失败并
+    /// 点名 A，A 的 plan.json / ledger.json 一个字节都不能变。
+    async fn run_plan_against_locked_topic(topic: &str) -> (String, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+        write_learn_plan(dir.path(), serde_json::json!([good_point()]));
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::write(
+            base.join("ledger.json"),
+            r#"{"slug":"own","round":2,"knowledge_points":[{"id":"k1","title":"所有权","wrong":1,"passed":true}],"supplements":[]}"#,
+        )
+        .unwrap();
+        let plan_before = std::fs::read(base.join("plan.json")).unwrap();
+        let ledger_before = std::fs::read(base.join("ledger.json")).unwrap();
+        let _a = LearnTopicLock::acquire(dir.path(), "own", "会话 A").unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        let fixed_cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let mut point = good_point();
+                point["title"] = serde_json::json!("B 改写的标题");
+                write_learn_plan(&fixed_cwd, serde_json::json!([point]));
+                std::fs::write(
+                    fixed_cwd.join(".latte/learn/own/ledger.json"),
+                    r#"{"slug":"own","round":0,"knowledge_points":[],"supplements":[]}"#,
+                )
+                .unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("own"))
+            })
+            .mount(&server)
+            .await;
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "plan"
+role = "tutor"
+task = "PLAN_STEP {{topic}}"
+output_key = "plan_out"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let (event_tx, _rx) = broadcast::channel(16);
+        let mut ctx = lock_test_ctx(dir.path(), event_tx);
+        let config = test_config_at(&server.uri());
+        ctx.resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        ctx.merged = config;
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, topic, &ctx),
         )
         .await
-        .expect("nit + LOOKS_CLEAR 输出应正常放行");
-        match nav {
-            SerialLoopNav::Advance => {}
-            SerialLoopNav::Rework(_) => panic!("LOOKS_CLEAR 必须直接放行 Advance"),
+        .expect("workflow 不应卡死")
+        .expect_err("撞上别人正在学的主题必须失败");
+        assert_eq!(std::fs::read(base.join("plan.json")).unwrap(), plan_before);
+        assert_eq!(std::fs::read(base.join("ledger.json")).unwrap(), ledger_before);
+        assert!(!base.join(LEDGER_BACKUP).exists(), "别人的目录里不留备份");
+        let requests = server.received_requests().await.unwrap().len();
+        (err.to_string(), requests)
+    }
+
+    #[tokio::test]
+    async fn learn_loop_same_topic_is_refused_before_plan_runs() {
+        let (err, requests) = run_plan_against_locked_topic("所有权").await;
+        assert!(err.contains("会话 A") && err.contains("own"), "{err}");
+        assert_eq!(requests, 0, "同一主题文字：不调模型，直接拒绝");
+    }
+
+    #[tokio::test]
+    async fn learn_loop_plan_landing_on_locked_slug_restores_files() {
+        let (err, requests) = run_plan_against_locked_topic("Rust 的所有权").await;
+        assert!(err.contains("会话 A") && err.contains("own"), "{err}");
+        assert_eq!(requests, 1, "主题文字不同：plan 跑完才知道撞上，写过的文件原样还原");
+    }
+
+    /// 第一次 plan 写了不存在的证据：引擎把原因写回 prompt，只重试 plan 这一步。
+    #[tokio::test]
+    async fn learn_loop_plan_retries_until_evidence_is_real() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+        let mut bad = good_point();
+        bad["evidence"] = serde_json::json!("src/own.rs:2-99");
+        write_learn_plan(dir.path(), serde_json::json!([bad]));
+
+        let server = wiremock::MockServer::start().await;
+        let fixed_cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("未通过引擎校验"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_learn_plan(&fixed_cwd, serde_json::json!([good_point()]));
+                ResponseTemplate::new(200).set_body_string(openai_body("own"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "plan"
+role = "tutor"
+task = "PLAN_STEP"
+output_key = "plan_out"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次 plan 证据真实，应成功");
+        assert_eq!(out.trim(), "own");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 2, "只重试 plan 一次：{bodies:?}");
+        assert!(bodies[1].contains("超出文件范围"), "重试 prompt 要带上校验原因");
+    }
+
+    const OWN_SRC: &str = "fn main() {\n    let s = String::from(\"hi\");\n    let t = s;\n    println!(\"{t}\");\n}\n";
+    const GOOD_COPY: &str = "// 学习副本——源文件未改动。原始出处：src/own.rs:2-3（k1 所有权）\nfn main() {\n    // s 是这块堆内存唯一的 owner\n    let s = String::from(\"hi\");\n    let t = s; // move：所有权交给 t，s 之后不能再用\n    println!(\"{t}\");\n}\n";
+
+    fn setup_annotate(cwd: &std::path::Path) {
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/own.rs"), OWN_SRC).unwrap();
+        write_learn_plan(cwd, serde_json::json!([good_point()]));
+    }
+
+    fn write_copy(cwd: &std::path::Path, copy: &str) {
+        let code = cwd.join(".latte/learn/own/code");
+        std::fs::create_dir_all(&code).unwrap();
+        std::fs::write(code.join("README.md"), "| k1 | k1-own.rs | src/own.rs:2-3 |\n").unwrap();
+        std::fs::write(code.join("k1-own.rs"), copy).unwrap();
+    }
+
+    #[test]
+    fn learn_loop_annotation_validation_rejects_changed_code() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("还没写副本");
+        assert!(err.contains("README.md"), "{err}");
+
+        write_copy(dir.path(), GOOD_COPY);
+        validate_learn_annotations(dir.path(), "own").expect("逐字代码 + 注释应通过");
+
+        write_copy(dir.path(), &GOOD_COPY.replace("let t = s;", "let t = s.clone();"));
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("改了代码");
+        assert!(err.contains("s.clone()") && err.contains("只许加注释"), "{err}");
+
+        write_copy(dir.path(), &GOOD_COPY.replace("    println!(\"{t}\");\n", "    ...\n"));
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("省略代码");
+        assert!(err.contains("「...」"), "{err}");
+
+        write_copy(dir.path(), &GOOD_COPY.replace("src/own.rs:2-3", "src/nope.rs:2-3"));
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("出处不存在");
+        assert!(err.contains("原始出处"), "{err}");
+
+        let code = dir.path().join(".latte/learn/own/code");
+        std::fs::remove_file(code.join("k1-own.rs")).unwrap();
+        std::fs::write(dir.path().join("src/other.rs"), "fn x() {}\n").unwrap();
+        std::fs::write(code.join("k9-other.rs"), "// 原始出处：src/other.rs:1\nfn x() {}\n").unwrap();
+        let err = validate_learn_annotations(dir.path(), "own").expect_err("证据文件没副本");
+        assert!(err.contains("没有注释副本") && err.contains("src/own.rs"), "{err}");
+    }
+
+    /// 第一次副本改了代码：引擎点名对不上的行，只重试 annotate。
+    #[tokio::test]
+    async fn learn_loop_annotate_retries_until_copy_matches_source() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+
+        let server = wiremock::MockServer::start().await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("注释副本未通过引擎校验"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_copy(&cwd, GOOD_COPY);
+                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs"))
+            })
+            .mount(&server)
+            .await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("ANNOTATE_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_copy(&cwd, &GOOD_COPY.replace("let t = s;", "let t = s.clone();"));
+                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "annotate"
+role = "tutor"
+task = "ANNOTATE_STEP {{plan_out}}"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次副本逐字保留代码，应成功");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 3, "doc 一次 + annotate 两次：{bodies:?}");
+        assert!(bodies[2].contains("s.clone()"), "重试 prompt 要点名改坏的那一行");
+    }
+
+    const OWN_SYNCED: &str = "fn main() {\n    // s 是这块堆内存唯一的 owner\n    let s = String::from(\"hi\");\n    let t = s; // move：所有权交给 t\n    println!(\"{t}\");\n}\n";
+
+    #[test]
+    fn learn_loop_sync_code_allows_comments_only() {
+        assert!(diff_code_only("src/own.rs", OWN_SRC, OWN_SYNCED).is_none());
+        let err = diff_code_only("src/own.rs", OWN_SRC, &OWN_SRC.replace("let t = s;", "let t = s.clone();"))
+            .unwrap();
+        assert!(err.contains("s.clone()") && err.contains("let t = s;"), "{err}");
+        let err = diff_code_only("src/own.rs", OWN_SRC, &OWN_SRC.replace("    println!(\"{t}\");\n", ""))
+            .unwrap();
+        assert!(err.contains("被删掉了") || err.contains("改了代码"), "{err}");
+        let err = diff_code_only("src/own.rs", OWN_SRC, &format!("{OWN_SRC}fn extra() {{}}\n")).unwrap();
+        assert!(err.contains("新加的代码"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap()
+        };
+        if !git(&["init", "-q"]).status.success() {
+            eprintln!("git init 失败，跳过该用例");
+            return;
         }
+        let _ = git(&["config", "user.email", "t@t"]);
+        let _ = git(&["config", "user.name", "t"]);
+        setup_annotate(cwd);
+        std::fs::write(cwd.join("src/other.rs"), "fn x() {}\n").unwrap();
+        let _ = git(&["add", "src"]);
+        let _ = git(&["commit", "-qm", "init"]);
+
+        let baseline = SyncCodeBaseline::take(cwd, "own");
+        assert_eq!(baseline.files.len(), 1, "学习范围 = plan 证据里的 src/own.rs");
+        std::fs::write(cwd.join("src/own.rs"), OWN_SYNCED).unwrap();
+        baseline.check_and_restore(cwd).expect("只加注释应通过");
+        assert_eq!(std::fs::read_to_string(cwd.join("src/own.rs")).unwrap(), OWN_SYNCED);
+
+        std::fs::write(cwd.join("src/own.rs"), OWN_SRC).unwrap();
+        let baseline = SyncCodeBaseline::take(cwd, "own");
+        std::fs::write(cwd.join("src/own.rs"), OWN_SRC.replace("let t = s;", "let t = s.clone();")).unwrap();
+        std::fs::write(cwd.join("src/other.rs"), "fn x() { panic!() }\n").unwrap();
+        let err = baseline.check_and_restore(cwd).expect_err("改了代码、碰了别的文件");
+        assert!(err.contains("s.clone()") && err.contains("src/other.rs"), "{err}");
+        assert_eq!(std::fs::read_to_string(cwd.join("src/own.rs")).unwrap(), OWN_SRC, "源文件已还原");
+        assert_eq!(std::fs::read_to_string(cwd.join("src/other.rs")).unwrap(), "fn x() {}\n", "范围外文件已还原");
+
+        let baseline = SyncCodeBaseline::take(cwd, "own");
+        std::fs::write(
+            cwd.join("src/own.rs"),
+            format!("// 学习副本——原始出处：src/own.rs:2-3\n{OWN_SRC}"),
+        )
+        .unwrap();
+        let err = baseline.check_and_restore(cwd).expect_err("副本头被带进源码");
+        assert!(err.contains("学习副本"), "{err}");
+    }
+
+    /// 第一次同步改了代码：引擎还原源文件并点名，第二次只加注释才放行。
+    #[tokio::test]
+    async fn learn_loop_sync_code_reverts_code_changes_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+
+        let server = wiremock::MockServer::start().await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("同步注释改到了代码"))
+            .respond_with(move |_: &wiremock::Request| {
+                std::fs::write(cwd.join("src/own.rs"), OWN_SYNCED).unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("src/own.rs：加了 2 处注释"))
+            })
+            .mount(&server)
+            .await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("SYNC_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                std::fs::write(
+                    cwd.join("src/own.rs"),
+                    OWN_SYNCED.replace("let t = s;", "let t = s.clone();"),
+                )
+                .unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("src/own.rs：加了注释"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "sync_code"
+role = "tutor"
+task = "SYNC_STEP {{plan_out}}"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权 同步注释", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次只加注释，应成功");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 3, "doc 一次 + sync_code 两次：{bodies:?}");
+        assert!(bodies[2].contains("s.clone()"), "重试 prompt 要点名改坏的那一行");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/own.rs")).unwrap(),
+            OWN_SYNCED
+        );
+    }
+
+    const LEARN_DRAFT: &str = "# 所有权\n\n每个值有唯一 owner，见 src/own.rs:2-3。\n\n```mermaid\ngraph LR\n  a --> b\n```\n\n借用见 src/borrow.rs:5-9，借用不能比 owner 活得久。\n";
+
+    fn write_learn_draft(cwd: &std::path::Path) {
+        let base = cwd.join(".latte/learn/own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("draft.md"), LEARN_DRAFT).unwrap();
+    }
+
+    fn write_learn_final(cwd: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(cwd.join("docs/learn")).unwrap();
+        std::fs::write(cwd.join("docs/learn/own.md"), text).unwrap();
+    }
+
+    #[test]
+    fn learn_loop_final_doc_validation_rejects_lost_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_learn_draft(dir.path());
+        let err = validate_learn_final(dir.path(), "own").expect_err("没写定稿");
+        assert!(err.contains("不存在或为空"), "{err}");
+
+        let polished = format!("{LEARN_DRAFT}\n## 易错点辨析\n选「还能用」是错的。\n");
+        write_learn_final(dir.path(), &polished);
+        validate_learn_final(dir.path(), "own").expect("保留出处和图的定稿应通过");
+
+        write_learn_final(dir.path(), &LEARN_DRAFT.replace("src/borrow.rs:5-9", "借用模块"));
+        let err = validate_learn_final(dir.path(), "own").expect_err("丢出处");
+        assert!(err.contains("src/borrow.rs:5-9"), "{err}");
+
+        write_learn_final(dir.path(), &LEARN_DRAFT.replace("```mermaid", "```text"));
+        let err = validate_learn_final(dir.path(), "own").expect_err("丢图");
+        assert!(err.contains("mermaid"), "{err}");
+
+        write_learn_final(dir.path(), "src/own.rs:2-3 src/borrow.rs:5-9\n```mermaid\n```");
+        let err = validate_learn_final(dir.path(), "own").expect_err("砍掉大半");
+        assert!(err.contains("一半"), "{err}");
+
+        assert!(validate_learn_final(dir.path(), "../own").is_err());
+    }
+
+    /// 第一次定稿丢了出处：引擎带原因重试 merge，第二次写全才放行。
+    #[tokio::test]
+    async fn learn_loop_merge_retries_until_final_doc_keeps_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        write_learn_draft(dir.path());
+
+        let server = wiremock::MockServer::start().await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("定稿未通过引擎校验"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_learn_final(&cwd, LEARN_DRAFT);
+                ResponseTemplate::new(200).set_body_string(openai_body("docs/learn/own.md"))
+            })
+            .mount(&server)
+            .await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("MERGE_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_learn_final(&cwd, &LEARN_DRAFT.replace("src/borrow.rs:5-9", "借用模块"));
+                ResponseTemplate::new(200).set_body_string(openai_body("docs/learn/own.md"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "merge"
+role = "tutor"
+task = "MERGE_STEP {{plan_out}}"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次定稿保留了出处，应成功");
+        assert!(out.contains("docs/learn/own.md"), "{out}");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 3, "doc 一次 + merge 两次：{bodies:?}");
+        assert!(bodies[2].contains("src/borrow.rs:5-9"), "重试 prompt 要点名丢了哪条出处");
+        let final_text = std::fs::read_to_string(dir.path().join("docs/learn/own.md")).unwrap();
+        assert!(final_text.contains("src/borrow.rs:5-9"));
+    }
+
+    #[test]
+    fn learn_loop_patch_dispatch_keeps_named_chapters_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte").join("learn").join("own");
+        std::fs::create_dir_all(&base).unwrap();
+        let original = "MODE: PATCH\nSOURCE: engine\n## k1\n";
+        std::fs::write(base.join("feedback.md"), original).unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("slug".into(), "own".into());
+
+        let allow = patch_fan_out_allowlist("doc_review_loop", "write_chapter", dir.path(), &vars)
+            .expect("PATCH 必须限制派发");
+        assert!(allow.contains("k1"));
+        assert!(!allow.contains("overview"));
+        assert!(
+            patch_fan_out_allowlist("doc_review_loop", "outline", dir.path(), &vars).is_none(),
+            "只有 write_chapter 按返工单过滤"
+        );
+
+        let guard = capture_engine_feedback(dir.path(), &vars).expect("应抓住引擎返工单");
+        std::fs::write(base.join("feedback.md"), "MODE: FULL\n").unwrap();
+        assert!(engine_feedback_clobbered(&guard.original, "MODE: FULL\n"));
+        assert!(restore_engine_feedback(&guard));
+        let restored = std::fs::read_to_string(base.join("feedback.md")).unwrap();
+        assert!(restored.contains("SOURCE: engine") && restored.contains("## k1"));
+
+        std::fs::write(
+            base.join("feedback.md"),
+            "MODE: PATCH\nSOURCE: engine\n## k1\n## overview\n",
+        )
+        .unwrap();
+        assert!(
+            !engine_feedback_clobbered(&guard.original, &std::fs::read_to_string(base.join("feedback.md")).unwrap()),
+            "只追加 overview 不算改坏返工单"
+        );
+        assert!(!restore_engine_feedback(&guard));
+
+        std::fs::write(base.join("feedback.md"), "MODE: FULL\n").unwrap();
+        assert!(patch_fan_out_allowlist("doc_review_loop", "write_chapter", dir.path(), &vars).is_none());
+        std::fs::write(base.join("feedback.md"), "MODE: PATCH\n## k1\n## k3\n## overview\n").unwrap();
+        let allow = patch_fan_out_allowlist("doc_review_loop", "write_chapter", dir.path(), &vars).unwrap();
+        assert_eq!(allow.iter().cloned().collect::<Vec<_>>(), vec!["k1".to_string(), "k3".to_string()]);
+    }
+
+    #[test]
+    fn learn_loop_chapter_patch_rejects_rewrite_and_restores_file() {
+        let original = "# 所有权\n\n每个值有唯一 owner，见 src/own.rs:12-20。\n\nmove 之后不能再用原来的变量。这是一整段已经读懂的讲解，不能被推倒。\n";
+        let patched = format!("{original}\n\n## 易错点辨析\n选「还能用」是错的，因为 src/own.rs:12-20 把所有权交出去了。\n");
+        check_chapter_patch(original, &patched).expect("增补应通过");
+        assert!(
+            check_chapter_patch(original, "短文，没有出处")
+                .unwrap_err()
+                .contains("源码出处")
+        );
+        let shrunk = "src/own.rs:12-20 还在，但正文被砍光了。";
+        assert!(
+            check_chapter_patch(original, shrunk)
+                .unwrap_err()
+                .contains("整章重写"),
+            "{}",
+            check_chapter_patch(original, shrunk).unwrap_err()
+        );
+        assert!(
+            check_chapter_patch(original, &original.replace("src/own.rs:12-20", "别处"))
+                .unwrap_err()
+                .contains("源码出处")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k1.md");
+        std::fs::write(&path, original).unwrap();
+        let baseline = ChapterBaseline {
+            path: path.clone(),
+            original: original.to_string(),
+        };
+        std::fs::write(&path, "短文").unwrap();
+        let err = reject_chapter_overwrite(Some(&baseline)).expect_err("短文应拒绝");
+        assert!(err.contains("源码出处") || err.contains("整章重写"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        reject_chapter_overwrite(Some(&baseline)).expect("还原后应通过");
+    }
+
+    #[test]
+    fn learn_loop_skip_outline_when_engine_already_named_chapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(base.join("sections")).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权"},
+                    {"id": "sup1", "title": "move 之后呢", "supplement": true}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(base.join("index.md"), "# 所有权\n\n- [所有权](sections/k1.md)\n").unwrap();
+        std::fs::write(base.join("sections/00_overview.md"), "# 总览\n\n- [所有权](k1.md)\n").unwrap();
+        std::fs::write(base.join("feedback.md"), "MODE: PATCH\nSOURCE: engine\n## k1\n").unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("slug".into(), "own".into());
+        let guard = capture_engine_feedback(dir.path(), &vars).unwrap();
+        let added = skip_outline_for_engine_feedback(&guard).expect("框架在就该跳过 outline");
+        assert_eq!(added, 1, "sup1 要补进目录");
+        let index = std::fs::read_to_string(base.join("index.md")).unwrap();
+        let overview = std::fs::read_to_string(base.join("sections/00_overview.md")).unwrap();
+        assert!(index.contains("sections/sup1.md"), "{index}");
+        assert!(overview.contains("(sup1.md)"), "{overview}");
+        assert!(index.contains("sections/k1.md") && overview.contains("(k1.md)"));
+
+        std::fs::remove_file(base.join("sections/00_overview.md")).unwrap();
+        assert!(
+            skip_outline_for_engine_feedback(&guard).is_none(),
+            "总览缺失时仍交给 outline"
+        );
+    }
+
+    #[test]
+    fn learn_loop_plan_failure_restores_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            r#"{"slug":"own","topic":"所有权","knowledge_points":[]}"#,
+        )
+        .unwrap();
+        let old = serde_json::json!({
+            "slug": "own", "round": 2,
+            "knowledge_points": [
+                {"id": "k2", "title": "借用", "wrong": 0, "passed": true},
+                {"id": "k3", "title": "生命周期", "wrong": 1, "passed": true}
+            ],
+            "supplements": []
+        });
+        std::fs::write(base.join("ledger.json"), old.to_string()).unwrap();
+        {
+            let _guard = LedgerRestoreGuard::take(dir.path(), None);
+            assert!(base.join("ledger.prev.json").exists());
+            std::fs::write(
+                base.join("ledger.json"),
+                r#"{"slug":"own","round":0,"knowledge_points":[{"id":"k1","passed":false,"wrong":0}]}"#,
+            )
+            .unwrap();
+        }
+        let ledger: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(ledger["round"], 2);
+        assert_eq!(ledger["knowledge_points"][0]["id"], "k2");
+        assert_eq!(ledger["knowledge_points"][0]["passed"], true);
+        assert!(!base.join("ledger.prev.json").exists(), "回滚后删备份");
+    }
+
+    #[tokio::test]
+    async fn learn_loop_engine_rework_skips_outline_and_dispatches_named_chapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(base.join("sections")).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({
+                "slug": "own",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权"},
+                    {"id": "k2", "title": "借用"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(base.join("index.md"), "- [所有权](sections/k1.md)\n- [借用](sections/k2.md)\n").unwrap();
+        std::fs::write(base.join("sections/00_overview.md"), "- [所有权](k1.md)\n- [借用](k2.md)\n").unwrap();
+        std::fs::write(base.join("sections/k1.md"), "# 所有权\n\nsrc/own.rs:2-3\n").unwrap();
+        std::fs::write(base.join("feedback.md"), "MODE: PATCH\nSOURCE: engine\n## k1\n").unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("写主体框架"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("outline 不该被调用"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("写章节"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("UNCHANGED")))
+            .mount(&server)
+            .await;
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _event_rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "doc_review_loop"
+max_rounds = 1
+[[steps]]
+id = "outline"
+role = "tutor"
+task = "写主体框架 {{topic}}"
+output_key = "outline_out"
+[[steps]]
+id = "write_chapter"
+role = "tutor"
+depends_on = ["outline"]
+task = "写章节 {{item_id}}"
+output_key = "chapters_out"
+[steps.fan_out]
+file = ".latte/learn/{{slug}}/plan.json"
+items = "knowledge_points"
+id_key = "id"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "slug=own", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("跳过 outline 后只写点名的章，应成功");
+        assert!(out.contains("UNCHANGED") || out.contains("k1"), "{out}");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 1, "outline 跳过，只派 k1：{bodies:?}");
+        assert!(bodies[0].contains("写章节"), "{:?}", bodies[0]);
+        assert!(!bodies[0].contains("写主体框架"));
+    }
+
+    #[test]
+    fn learn_loop_ledger_merge_keeps_progress_across_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte").join("learn").join("own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "own",
+                "topic": "所有权 同步注释",
+                "knowledge_points": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("ledger.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "own",
+                "round": 2,
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权", "wrong": 1, "passed": true},
+                    {"id": "k2", "title": "借用", "wrong": 0, "passed": false},
+                    {"id": "k4", "title": "已通过但计划删了", "wrong": 0, "passed": true},
+                    {"id": "k5", "title": "从没考过", "wrong": 0, "passed": false}
+                ],
+                "supplements": [{"round": 1, "asked": "生命周期"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let snaps = snapshot_learn_ledgers(dir.path(), &[]);
+        assert_eq!(snaps.len(), 1);
+
+        let fresh = dir.path().join(".latte").join("learn").join("own-v2");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(
+            fresh.join("plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "own-v2",
+                "topic": "所有权",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权"},
+                    {"id": "k2", "title": "借用"},
+                    {"id": "k3", "title": "生命周期"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            fresh.join("ledger.json"),
+            r#"{"slug":"own-v2","round":0,"knowledge_points":[],"supplements":[]}"#,
+        )
+        .unwrap();
+        assert!(apply_ledger_merge(dir.path(), "own-v2", &snaps).unwrap());
+        let ledger: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fresh.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(ledger["round"], 2);
+        assert_eq!(ledger["supplements"][0]["asked"], "生命周期");
+        let points = ledger["knowledge_points"].as_array().unwrap();
+        let by_id = |id: &str| points.iter().find(|p| p["id"] == id).unwrap();
+        assert_eq!(by_id("k1")["wrong"], 1);
+        assert_eq!(by_id("k1")["passed"], true);
+        assert_eq!(by_id("k2")["wrong"], 0);
+        assert_eq!(by_id("k2")["passed"], false);
+        assert_eq!(by_id("k3")["wrong"], 0);
+        assert_eq!(by_id("k3")["passed"], false);
+        assert_eq!(by_id("k4")["passed"], true);
+        assert!(points.iter().all(|p| p["id"] != "k5"), "没考过的旧点应丢掉");
+
+        std::fs::write(
+            base.join("ledger.json"),
+            r#"{"slug":"own","round":0,"knowledge_points":[{"id":"k1","title":"所有权","wrong":0,"passed":false}],"supplements":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::to_string(&serde_json::json!({
+                "slug": "own",
+                "topic": "所有权 同步注释",
+                "knowledge_points": [
+                    {"id": "k1", "title": "所有权"},
+                    {"id": "k2", "title": "借用"}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(apply_ledger_merge(dir.path(), "own", &snaps).unwrap());
+        let ledger: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(base.join("ledger.json")).unwrap()).unwrap();
+        assert_eq!(ledger["round"], 2);
+        assert_eq!(ledger["knowledge_points"][0]["wrong"], 1);
+        assert_eq!(ledger["knowledge_points"][0]["passed"], true);
+    }
+
+    #[test]
+    fn learn_loop_resume_drops_doc_review_until_rework_finishes() {
+        let rows = |items: &[(&str, &str)]| -> Vec<(String, Option<String>, String)> {
+            items
+                .iter()
+                .map(|(id, output)| ((*id).to_string(), None, (*output).to_string()))
+                .collect()
+        };
+        let pending = learn_rework_invalidated(
+            "learn_loop",
+            &rows(&[("doc_review", "ok"), ("quiz", "判分结果\nQUIZ_FAIL")]),
+        );
+        assert!(pending.contains("doc_review"));
+        let pending = learn_rework_invalidated(
+            "learn_loop",
+            &rows(&[
+                ("doc_review", "ok"),
+                ("quiz", "QUIZ_FAIL"),
+                ("doc_review", "rewritten"),
+            ]),
+        );
+        assert!(!pending.contains("doc_review"));
+        let pending = learn_rework_invalidated(
+            "learn_loop",
+            &rows(&[("doc_review", "ok"), ("supplement", "学员补充\nSUPPLEMENT")]),
+        );
+        assert!(pending.contains("doc_review"));
+        let pending = learn_rework_invalidated(
+            "learn_loop",
+            &rows(&[("doc_review", "ok"), ("supplement", "没有补充。\nALL_DONE")]),
+        );
+        assert!(!pending.contains("doc_review"));
+        assert!(learn_rework_invalidated(
+            "doc_review_loop",
+            &rows(&[("doc_review", "ok"), ("quiz", "QUIZ_FAIL")])
+        )
+        .is_empty());
+    }
+
+    fn learn_resume_wf() -> WorkflowDef {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "plan"
+role = "tutor"
+task = "PLAN_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "doc_review"
+role = "tutor"
+task = "DOC_REVIEW_STEP"
+[[steps]]
+id = "tail"
+role = "tutor"
+task = "TAIL_STEP"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        wf
+    }
+
+    fn seed_learn_checkpoint(cwd: &std::path::Path, steps: &[(&str, Option<&str>, &str)]) {
+        let log = CheckpointLog::new(cwd, "wf-learn-resume", "learn_loop", "主题", 0, None);
+        for (id, key, output) in steps {
+            log.record_step(id, *key, output);
+        }
+    }
+
+    async fn resumed_task_bodies(steps: &[(&str, Option<&str>, &str)]) -> Vec<String> {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("rewritten")))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        seed_learn_checkpoint(dir.path(), steps);
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let wf = learn_resume_wf();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow_resume(&wf, "主题", &ctx, "wf-learn-resume"),
+        )
+        .await
+        .expect("resume 不应卡死")
+        .expect("resume 应成功");
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|req| String::from_utf8_lossy(&req.body).into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn learn_loop_resume_reruns_doc_review_after_quiz_fail() {
+        let bodies = resumed_task_bodies(&[
+            ("plan", Some("plan_out"), "own"),
+            ("doc_review", None, "first draft"),
+            ("quiz", None, "判分结果\nQUIZ_FAIL"),
+        ])
+        .await;
+        assert!(
+            bodies.iter().any(|b| b.contains("DOC_REVIEW_STEP")),
+            "QUIZ_FAIL 之后必须重跑 doc_review：{bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("TAIL_STEP")),
+            "返工之后的步骤仍要继续：{bodies:?}"
+        );
+        assert!(
+            bodies.iter().all(|b| !b.contains("PLAN_STEP")),
+            "已完成的 plan 不应重跑：{bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn learn_loop_resume_keeps_doc_review_after_rework_recorded() {
+        let bodies = resumed_task_bodies(&[
+            ("plan", Some("plan_out"), "own"),
+            ("doc_review", None, "first draft"),
+            ("quiz", None, "QUIZ_FAIL"),
+            ("doc_review", None, "rewritten"),
+        ])
+        .await;
+        assert!(
+            bodies.iter().all(|b| !b.contains("DOC_REVIEW_STEP")),
+            "返工已经记完就不应再跑 doc_review：{bodies:?}"
+        );
+        assert!(
+            bodies.iter().any(|b| b.contains("TAIL_STEP")),
+            "应从返工之后的步骤继续：{bodies:?}"
+        );
     }
 }
 
@@ -17261,30 +20810,16 @@ prompt_token_ratio = {ratio:.1}
         assert!(err.contains("prompt_token_ratio"), "{err}");
     }
 
-    /// 出厂配置必须走动态预算：`doc_review_loop` 的 proofread 步不能再有
-    /// 写死的绝对预算（那正是事故里被文档尺寸顶穿的那个数）。
+    /// 写文档的路径上不再有审稿步，也就没有会被长文档顶穿的写死预算。
     #[test]
     fn doc_review_loop_proofread_uses_dynamic_budget() {
         let wf: WorkflowDef =
             toml::from_str(include_str!("../../config/workflows/doc_review_loop.toml"))
                 .expect("doc_review_loop TOML must parse");
-        let proofread = wf
-            .steps
-            .iter()
-            .find(|s| s.id == "proofread")
-            .expect("proofread step");
-        assert_eq!(
-            proofread.prompt_token_ratio,
-            Some(0.8),
-            "proofread 必须按模型窗口动态算预算"
-        );
         assert!(
-            proofread.prompt_token_budget.is_none(),
-            "不应再写死绝对预算（写死的值会被文档尺寸顶穿）"
+            wf.steps.iter().all(|s| s.prompt_token_budget.is_none()),
+            "不得再写死绝对预算（写死的值会被文档尺寸顶穿）"
         );
-        assert!(
-            proofread.context_overflow_restart,
-            "仍要保留受控重启作为最后兜底"
-        );
+        assert!(wf.steps.iter().all(|s| s.id != "proofread"));
     }
 }

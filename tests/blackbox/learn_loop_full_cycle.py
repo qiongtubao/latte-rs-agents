@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""learn_loop 完整流程验证（含 proofread 迭代循环）。
+"""learn_loop 完整流程验证。
 
 跑 /learn_loop <topic>，观察：
 
-  plan → annotate → doc → proofread（可能 NEEDS_FIX → 回 doc → 再 proofread）
-       → read_confirm → quiz → supplement → merge → report
+  plan → annotate → 写章节 → read_confirm → quiz → supplement → merge → report
 
 测试行为：
-- 每收到一次 doc/proofread WorkflowTurn，记录 verdict
 - read_confirm 弹窗自动点「开始答题」
 - quiz 弹窗按 plan.json 的正确答案作答（保证 QUIZ_PASS，不触发教学循环）
 - supplement 弹窗答「没有了，全部理解」→ ALL_DONE
 - 最后断言 WorkflowFinished status=ok + docs/learn/<slug>.md 生成
 
 断言点：
-- proofread 至少跑过一次（verdict ∈ {LOOKS_CLEAR, NEEDS_FIX}）
-- 若第一次 NEEDS_FIX，必须看到 doc 再次执行（证明 loop_back_to 生效）
-- 最终 MUST 收敛到 read_confirm（proofread 收敛）
+- 章节写完就出现 read_confirm，不等审稿员的 LOOKS_CLEAR
+- quiz 与 supplement 都跑完
 
 用法：
   python3 tests/blackbox/learn_loop_full_cycle.py [--topic "…"] [--port 4796]
@@ -242,7 +239,7 @@ def main():
 
             elif any("开始答题" in l for l in labels):
                 saw_read_confirm = True
-                log(f"read_confirm 弹窗：proofread 已收敛（verdicts={proof_verdicts}）")
+                log("read_confirm 弹窗：章节已写完，学员开始阅读")
                 label = next(l for l in labels if "开始答题" in l)
                 st = post_answer(port, choice_id, label)
                 if st != 200:
@@ -258,15 +255,8 @@ def main():
                 fail(f"未识别弹窗：labels={labels} questions={len(questions)}")
 
         # ── 收尾断言 ──
-        if not proof_verdicts:
-            fail("proofread 一次都没跑——步骤没接入")
-        log(f"proofread 共跑 {len(proof_verdicts)} 次：{proof_verdicts}")
-        if proof_verdicts[-1] != "LOOKS_CLEAR":
-            fail(f"proofread 未收敛到 LOOKS_CLEAR：{proof_verdicts}")
-        if "NEEDS_FIX" in proof_verdicts[:-1] and doc_rounds < 2:
-            fail("有 NEEDS_FIX 但 doc 没回跑——loop_back_to 失效")
         if not saw_read_confirm:
-            fail("read_confirm 弹窗未到——proofread 收敛后没放行")
+            fail("read_confirm 弹窗未到——章节写完后没有放行给学员")
         if not quiz_answered:
             fail("quiz 未跑")
         if not supplement_answered:

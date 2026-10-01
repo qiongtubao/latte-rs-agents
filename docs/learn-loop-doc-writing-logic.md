@@ -30,7 +30,6 @@ plan ─► annotate ─► doc_review ─► [引擎装配draft.md] ─► read
 
 - `read_confirm`、`quiz` 由引擎确定性执行（弹窗、判分、写账本不走模型）。
 - `doc_review` 是一个**嵌套 workflow**（`doc_review_loop`），不是单个模型步。
-  旧的 `legacy_doc` / `legacy_proofread` 只是兼容保留，`when_any = ["__legacy_flat_learn_loop__"]` 永不触发。
 
 ## 3. 产物目录：每个文件谁写、谁读
 
@@ -162,9 +161,12 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
 `assemble_draft_from_sections`，在 read_confirm 与 quiz 执行前调用：
 
 1. `sections/` 或 `plan.json` 不存在 → 不装配（返回 false）；
-2. 拼接顺序固定：`00_overview.md` → 按 `plan.json` 的知识点顺序逐章；
-3. 找章文件：先 `<id>.md`，找不到再匹配 `<id>_*`、`*_<id>`；空文件跳过；
-4. 各段之间以 `\n\n---\n\n` 分隔，整体覆盖写 `draft.md`；全空则不写。
+2. 若 `plan.json` 有 `design.decisions`，引擎先写入「核心结论与设计决策」
+   （一句话结论 + 决策总览表），不依赖 outline 手写；没有 `design` 时跳过，旧文档装配不变；
+3. 再拼 `00_overview.md`，然后按知识点顺序逐章；
+4. 找章文件：先 `<id>.md`，找不到再匹配 `<id>_*`、`*_<id>`；空文件跳过；
+5. 装配时剥掉符号索引 mermaid（节点多数是 `fn xxx` / `struct xxx`），数据流图保留；
+6. 各段之间以 `\n\n---\n\n` 分隔，整体覆盖写 `draft.md`；全空则不写。
 
 ### 步骤 5：read_confirm —— 等学员读完（引擎）
 

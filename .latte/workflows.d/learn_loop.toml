@@ -1,8 +1,8 @@
 # Workflow: learn_loop（v2：文档驱动学习循环）
 # plan（取证 + 拆知识点 + 出题）→ annotate（注释版代码副本，默认生成）
-#   → doc（写/增强学习文档 draft.md）
+#   → doc_review（嵌套 doc_review_loop：outline → 按知识点并发 write_chapter，装配 draft.md）
 #   → read_confirm（「开始答题」按钮，等学员读完）→ quiz（批量出题 + 判分 + 写账本，
-#   有错跳回 doc 增强）→ supplement（全对后问"还有不懂的吗"，有补充跳回 doc）
+#   有错跳回 doc_review，只重写答错的章）→ supplement（全对后问"还有不懂的吗"，有补充跳回 doc_review）
 #   → merge（定稿 docs/learn/<slug>.md）→ [sync_code（可选：注释写进源码）] → report
 #
 # 用法：/learn_loop <主题>，或 manager 调 workflow { name: "learn_loop", topic: "…" }
@@ -15,6 +15,8 @@
 #       .latte/learn/<slug>/draft.md（学习期间的活文档，逐轮演进）
 #       .latte/learn/<slug>/code/（注释版代码副本 + README 索引）
 #       docs/learn/<slug>.md（merge 步定稿的最终交付文档）
+#       .latte/learn/<slug>/session.lock（引擎持有：同一主题同时只归一个会话，
+#       另一个会话再学同一主题会被拒绝并点名正在学的会话）
 #
 # 设计文档：docs/learn-loop-doc-driven-design.md
 #
@@ -29,7 +31,8 @@
 # 3. ask 的 allow_repeat / shuffle / auto_answer 参数未实现（handler 不解析）。
 #    后果一：同一 question 文本重问会被"同题复用旧答案"保护静默回放、不弹窗——
 #    凡跨轮次重复出现的 ask（read_confirm / quiz 重考 / supplement），题面必须
-#    嵌入轮次号使文本不同。后果二：没有程序洗牌，选项顺序由 plan 自己随机。
+#    嵌入轮次号使文本不同。quiz 选项由引擎按「slug + 知识点 + 作答次数」洗牌，
+#    重考时正确项换位置；补充题（两选一）不洗。
 # 4. 跨 step 的结构化状态只走文件（plan.json / ledger.json / draft.md）；
 #    quiz / supplement 返工时其产出文本由引擎自动预置进 doc 步的 prompt
 #    （pending_feedback），doc 据此决定"增强哪里 / 补充什么"。
@@ -49,11 +52,13 @@ id = "plan"
 description = "读代码取证，拆解知识点、出题并写入 plan.json / ledger.json"
 role = "tutor"
 output_key = "plan_out"
-max_retries = 1
+max_retries = 2
 tools = ["read", "code_graph", "search", "write"]
 require_tools_any = ["read", "code_graph", "search"]
 require_tools = ["write"]
-task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不教学，只产出知识点清单与文档大纲。
+task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不教学，只产出设计分析、知识点清单与文档大纲。
+
+读者是有编程基础、没读过这段代码的工程师。他要带走的是「作者面对什么问题、做了哪几个取舍、为什么这样选、代价是什么」。通用语言/库概念不配成为知识点。
 
 ## 一、先取证
 
@@ -62,31 +67,36 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
 精读，宏和字符串用 `search`。独立的取证同一轮批量发：`read(paths=[...])`，一次最多 10 个。
 涉及"有几个字段""按什么顺序""定义在哪一行"这类事实，必须把定义整段读出来数。
 
-## 二、拆知识点 + 定文档大纲
+**"为什么"也要取证**：优先找源码注释里的动机（`为什么` / `why` / `否则` / `实测`）、测试名与断言、`docs/` 与 `tasks/lessons.md`。
 
-拆成 3-6 个，互不重叠，**按由浅入深排序**：第一个必须是"这东西是什么、整体怎么运转"
-这种门外汉也能听懂的层级，越往后越细。若 topic 已给出分层（L0/L1/… 或阶段清单），
-就照它的顺序覆盖，不要跳过浅层直接挑深处的细节考。
+## 二、设计分析
 
-再定 `doc_outline`：学习文档的章节骨架，按主题定制——**第 1 节必须是「全局心智模型与贯穿比喻（它是什么、整体怎么运转）」**；后续章节严格按主线逻辑展开核心分级/数据结构/运行原理/链路图；**凡涉及分档/分类/分层，章节必须覆盖「怎么存（物理视图）」与「为什么这样存（权衡与反向思考）」**，章节之间具备清晰的因果串联。
+先写 `design`，没有它后面的章节只能停留在代码概念：
 
-每个知识点写：`id`（短英文）、`title`（中文）、`evidence`（`file:line`，必须真实存在）、
-`teach_points`（讲解要点数组，每条一句话 + 出处）、`example`（**最小具体例子**：讲参数
-就写"传什么进去 → 出来什么"，讲分支就写"A 情况下变成什么、B 情况下变成什么"——
-例子是小白理解的入口，不许只给抽象描述）、`doc_section`（该点在文档里的章节
-标题，如 `## 2. 所有权规则`）、`question` + 4 个 `options`、`answer`（正确选项的 label 原文）。
+- `problem`：核心问题 + 硬约束，最好带一个「不这样做会出什么事」的真实场景；
+- `core_idea`：一句话核心设计思想；
+- `decisions`：2-5 个关键决策。每个含 `id`（d1…）、`question`（设计问题，如「多题答案怎么判定收齐」，不要写成「X 函数做什么」）、`chosen`、`alternatives`（≥1 个真实可行方案，各有 `name` 与 `pros` 或 `cons`；「用 stdin」「干脆不加锁」这类稻草人不算）、`why`、`basis`（`file:line`；找不到依据就在 why 里标 `[推测]`）、`cost`。
+
+## 三、拆知识点 + 定文档大纲
+
+知识点围绕设计决策组织，不按结构体/函数平铺：每个点的 `decision` 指向一个 d_id。拆成 3-6 个，按因果顺序，第一个讲「要解决的问题与整体方案」。
+
+`doc_outline` 第 1 节必须是「核心结论与全局设计」；中间每节回答一个设计问题；**最后一节是「代价、边界与复盘」**。涉及分档/分层时，章节仍要覆盖「怎么存」和「为什么这样存」。
+
+每个知识点写：`id`、`title`（写成设计问题或结论，如「为什么赋值默认是 move」，不要写成「Pending 结构体」）、`decision`、`evidence`（`file:line`）、`why`（一句话）、`teach_points`（至少一半讲为什么/代价）、`example`（最小具体例子；能写就写「换成替代方案会变成什么」）、`doc_section`、`question` + 4 个 `options`、`answer`。
 
 ## 三、出题规则
 
 - `options` 里**禁止 `recommended` 字段**——前端会渲染成「✓ 推荐」徽标，等于印上答案。
 - `label` 写选项的实际内容（符号名/短语，≤20 字），**不许用 A/B/C/D**——那会让 `answer`
-  退化成位置引用。**正确项的位置由你自己随机打散**（ask 没有洗牌实现，写在第几项就是
-  第几项）；判分按 label 文本，与位置无关。
+  退化成位置引用。出卷时引擎会洗牌，你写的顺序不影响学员看到的顺序；判分按 label
+  文本，与位置无关。
 - 四个选项等重：长度、语气、详略、术语密度一致。干扰项必须是真实存在的东西（真函数/宏/
   字段），只是不满足题干条件；一秒能排除的荒谬项（"两者完全等价"）不叫干扰项。
 - **考理解，不考查表**：给一个具体小场景让学员推断行为/结果（如"在 GCC 下这段宏
   展开成什么""传 `x` 进去会怎样"）；**不许考"定义在第几行""有几个字段"这种翻
   原文就有答案的记忆题**——那考的是检索不是学会。
+- **优先考设计推理**：至少一半题干带「如果 / 换成 / 为什么」。
 - 题目考 `title` 说的那个核心，各知识点的题目不得互相重叠。选项 `description` 里的事实
   同样来自取证。
 
@@ -101,15 +111,30 @@ task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不�
 {
   "slug": "<slug>",
   "topic": "{{topic}}",
-  "doc_outline": ["它是什么、整体怎么运转", "核心数据结构", "模块调用交互", "流程图"],
+  "design": {
+    "problem": "不用 GC 也要保证内存安全：没有运行时追踪，谁来决定何时释放？",
+    "core_idea": "把谁负责释放编码进类型系统，由编译器在编译期检查",
+    "decisions": [{
+      "id": "d1",
+      "question": "值赋给另一个变量后，原变量还能用吗？",
+      "chosen": "默认 move，原变量失效",
+      "alternatives": [{"name": "默认深拷贝", "pros": "两份独立", "cons": "大对象隐式复制"}],
+      "why": "唯一 owner 让释放点在编译期可判定",
+      "basis": "src/ownership.rs:10-11",
+      "cost": "共享结构要显式用 Rc"
+    }]
+  },
+  "doc_outline": ["核心结论与全局设计", "为什么默认 move", "代价、边界与复盘"],
   "knowledge_points": [
     {
       "id": "k1",
-      "title": "所有权规则",
+      "title": "为什么赋值默认是 move",
+      "decision": "d1",
       "evidence": "src/ownership.rs:12-48",
-      "teach_points": ["每个值有唯一 owner（src/ownership.rs:12）"],
-      "example": "let a = String::from(\"hi\"); let b = a; —— 之后用 a 直接编译报错：owner 已移给 b",
-      "doc_section": "## 2. 所有权规则",
+      "why": "唯一 owner 让编译器能静态确定释放点",
+      "teach_points": ["每个值有唯一 owner（src/ownership.rs:12）", "换成深拷贝会让大对象的复制成本隐形"],
+      "example": "let a = String::from(\"hi\"); let b = a; —— 之后用 a 编译报错。若是深拷贝，这里会静默再分配一份堆内存",
+      "doc_section": "## 2. 为什么赋值默认是 move",
       "question": "…",
       "options": [
         {"label": "move 语义", "description": "客观描述这一项是什么"},
@@ -151,7 +176,7 @@ id = "annotate"
 description = "为 plan 取证的代码生成注释版学习副本（不改源码）"
 role = "tutor"
 output_key = "annotate_out"
-max_retries = 1
+max_retries = 2
 tools = ["read", "write"]
 require_tools = ["write"]
 task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
@@ -172,76 +197,33 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
    副本文件 → 原始出处的对照表。
 
 **绝不修改 `code/` 目录以外的任何文件**——源文件保持原样，学员对照副本
-阅读即可。正文列出副本清单（副本路径 → 原始出处），此外不输出别的。"""
+阅读即可。
+
+引擎写完后会核对：README.md 存在；每个副本文件头写了真实存在的原始出处
+（`file:line`）；副本里每一行非注释代码都能在源文件里找到原样（行尾追加注释可以）；
+plan 证据涉及的每个源文件都有副本。所以讲解一律写成以该语言注释符号开头的整行
+注释（`//`、`#` 等）或行尾注释，不要省略代码、不要写伪代码。不合格会点名哪一行
+对不上，让你重写。正文列出副本清单（副本路径 → 原始出处），此外不输出别的。"""
 
 [steps.output_contract]
 min_chars = 30
 require = ["code/"]
 
-# ═══ 2. 嵌套文档审查门（B套A 分段打磨与审稿）══════════════════════
-# doc_review_loop 内部执行：B套A 分段打磨写文档 → proofreader 审查
-# 只有 LOOKS_CLEAR 才返回外层。
+# ═══ 2. 嵌套写作（主体框架 + 章节并发写作）══════════════════════
+# doc_review_loop：outline → 各章并发 write。写完就返回，学员开始阅读。
+# 放行条件是学员答题，不是审稿员的 LOOKS_CLEAR。
 [[steps]]
 id = "doc_review"
-description = "运行 tutor/proofreader 嵌套循环，执行 B套A 分段写文档与打磨"
+description = "运行 outline→并发章节写作"
 workflow = "doc_review_loop"
 output_key = "doc_review_out"
-output_from = "review_out"
+output_from = "chapters_out"
 task = """学习文档审查契约：
 slug={{plan_out}}
 draft=.latte/learn/{{plan_out}}/draft.md
 plan=.latte/learn/{{plan_out}}/plan.json
 ledger=.latte/learn/{{plan_out}}/ledger.json
 """
-
-# 兼容保留旧定义；实际执行由上面的 doc_review 嵌套 step 接管。
-[[steps]]
-id = "legacy_doc"
-description = "兼容保留：旧扁平 doc step（已由 doc_review 接管）"
-role = "tutor"
-output_key = "legacy_doc_out"
-when_any = ["__legacy_flat_learn_loop__"]
-max_retries = 1
-tools = ["read", "code_graph", "search", "edit", "write"]
-require_tools_any = ["edit", "write"]
-task = """你是互动学习辅导员，负责维护学习文档。当前主题 slug：{{plan_out}}。
-
-读 `.latte/learn/{{plan_out}}/plan.json` 与 `ledger.json`，若已经存在 `draft.md`，必须先读取并刷新它。
-
-## 首次进入（prompt 里没有上一轮的判分结果或补充问题）
-
-按 plan.json 的 `doc_outline` 写或刷新 `.latte/learn/{{plan_out}}/draft.md`。**读者是零
-基础小白**——写得像考据报告就是失败。开头先讲大白话和全局心智模型，按大纲展开核心数据结构与运行原理；
-术语首次出现一句大白话解释；每个知识点必须带最小具体例子（以 example 为底）；
-代码摘录后必须跟逐行讲解；每节末尾用一句「人话总结」收束本节。
-
-## 返工进入：QUIZ_FAIL（prompt 里带上一轮的「判分结果」「你选的是」）
-
-学员答错了。只增强答错点对应的 `doc_section`：加「易错点辨析」小节，讲清正确答案与干扰项区别。
-用 `edit` 做局部修改，不要用 `write` 整文件覆写。
-
-## 返工进入：SUPPLEMENT（prompt 里带学员的补充问题）
-
-学员全对后主动提出还有不懂的。用 `edit` 把补充内容追加为 draft.md 的新章节，并补全 plan/ledger。
-
-## 正文（学员在 chat 里直接读的部分）
-
-把 draft.md 的全文原样作为正文输出，文末注明路径并提示「读完后点击「开始答题」」。
-返工轮次只输出本轮变更部分。"""
-[steps.output_contract]
-min_chars = 500
-forbid = ["正确答案是", "答案：", "选项 A", "选项一"]
-
-[[steps]]
-id = "legacy_proofread"
-description = "兼容保留：旧扁平 proofread step"
-role = "proofreader"
-output_key = "legacy_proofread_out"
-when_any = ["__legacy_flat_learn_loop__"]
-max_retries = 1
-tools = ["read"]
-require_tools = ["read"]
-task = """你是零基础读者 proofreader，只读不改。通读 draft.md，检查大白话解释、代码注释、推导与例子。"""
 
 # ═══ 3. 等学员读完：「开始答题」按钮 ═════════════════════════
 # tools            只读 + ask：不许改文档和账本。
@@ -307,8 +289,8 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
    - `options` 原样传，**不加 `recommended`**（渲染成「✓ 推荐」等于泄题）；
    - `answer` 只给你判分，永远不下发，也不要在题面或 `description` 里暗示。
 2. **判分**：用户答案与 `answer` 按 **label 文本**比对、**绝不按位置**（正确项位置是
-   plan 随机打散的，"第几项"没有意义；用户可能只回 label 的一部分或带前缀）。对不上
-   任何 label（乱填、空、"不知道"、或走了「其他（自定义）」自由文本）按答错。
+   plan 随机打散的，"第几项"没有意义；答案可以带序号前缀，但必须包含完整 label）。
+   只回 label 的一部分、对不上任何 label（乱填、空、"不知道"、或走了「其他（自定义）」自由文本）按答错。
 3. **更新账本**（write 覆盖写 ledger.json 并刷新 `updated_at`）。只做两件事，不做任何
    状态推理：答对 → 该点 `passed = true`（`wrong` 不动）；答错 → `wrong` = 读到的值
    **+1**（`passed` 保持 false）。`wrong` 只能 +1、绝不跳步；其余知识点原样保留。
@@ -373,7 +355,7 @@ last_line_prefix_any = ["ALL_DONE", "SUPPLEMENT"]
 id = "merge"
 description = "把 draft.md 与学习期间的补充合并定稿到 docs/learn/<slug>.md"
 role = "tutor"
-max_retries = 1
+max_retries = 2
 tools = ["read", "write"]
 require_tools = ["write"]
 task = """你是技术写作者。当前主题 slug：{{plan_out}}。
@@ -381,6 +363,8 @@ task = """你是技术写作者。当前主题 slug：{{plan_out}}。
 学习已结束（题目全对、学员无更多疑问）。读 `.latte/learn/{{plan_out}}/draft.md`、
 `plan.json` 与 `ledger.json`，产出最终交付文档 `docs/learn/{{plan_out}}.md`：
 
+- 开头放「核心要点」（3-6 条，每条是结论 + 为什么）和一张设计决策总览表
+  （`| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |`，来自 plan.json 的 `design`）；
 - 把 `supplements` 对应的补充章节**融进正文结构**（按主题归位到合适章节附近，去掉
   "补充"字样的临时痕迹），答错轮次产生的「易错点辨析」保留但润色为正式小节；
 - 重排章节、生成目录、去重，清理一切轮次/过程痕迹（如"第几版""本轮新增"）；
@@ -390,6 +374,9 @@ task = """你是技术写作者。当前主题 slug：{{plan_out}}。
 - draft 中对 `.latte/learn/{{plan_out}}/code/` 注释版副本的引用同样**保留**（学习资产，
   不是轮次痕迹）；若该目录存在，文末加「注释版代码副本」一节列出副本索引；
 - draft.md 原样保留作存档，不要删。
+
+引擎写完后会核对：定稿文件存在；draft 里的每个 `file:line` 出处都还在；mermaid 图
+不少于 draft；篇幅不少于 draft 的一半。不合格会带原因让你重写。
 
 正文给出最终文档的完整路径（`docs/learn/{{plan_out}}.md`）和一句内容概要，
 此外不输出别的。"""
@@ -403,14 +390,15 @@ require = ["docs/learn/"]
 #                建议任务开 isolated worktree（看板编辑弹窗可覆盖）。
 # output_key     条件 step 必须绑 output_key（引擎校验），跳过时下游拿到空串。
 # require_tools  edit 必须真调过——同步就是改文件，没 edit 就是空口报告。
-# 放在 merge 之后：此时 supplement 新增的副本也已由 doc 步补齐，一次同步全覆盖。
+# 放在 merge 之后：学习已结束，副本是最终版本，一次同步全覆盖。
+# 引擎在开跑前给相关源文件留原文，改出注释以外的变化就整体还原并重试。
 [[steps]]
 id = "sync_code"
 description = "可选：把注释版副本里的注释写进真实源文件（只加注释不改逻辑）"
 role = "tutor"
 output_key = "sync_out"
 when_any = ["同步注释", "写进源码"]
-max_retries = 1
+max_retries = 2
 tools = ["read", "edit"]
 require_tools = ["edit"]
 task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
@@ -425,43 +413,30 @@ task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 3. 注释风格与所在文件已有注释一致（注释符号、语言、密度）；
 4. 副本头部的"学习副本 / 原始出处"元信息**不要**带进源码。
 
+引擎会逐行比对：去掉注释后，源文件的代码行必须和改之前一模一样；不许碰学习范围
+以外的文件；不许把「学习副本 / 原始出处」写进源码。违反任何一条，引擎会把源文件
+全部还原，点名哪一行，让你重做。
+
 正文列出改动文件清单 + 每处注释的一句话摘要（跳过项也列出原因），此外不输出别的。"""
 
 [steps.output_contract]
 min_chars = 30
 
 # ═══ 7. 掌握报告 ═════════════════════════════════════════════
-# tools     只读：报告步不许改账本（改了就掩盖真实掌握情况），也不许弹窗。
-# require   必须含进度小节，防一句话敷衍。
+# 引擎确定性步骤：报告只复述账本事实，由引擎按 ledger.json / plan.json
+# 渲染，不调用模型（模型写报告会数错、漏点或美化进度）。下面的 task
+# 只作说明。
 [[steps]]
 id = "report"
-description = "输出最终掌握报告"
+description = "引擎按账本输出最终掌握报告"
 role = "tutor"
 max_retries = 1
 tools = ["read"]
-task = """读 `.latte/learn/{{plan_out}}/ledger.json`，输出掌握报告。
+task = """由引擎读 `.latte/learn/{{plan_out}}/ledger.json` 渲染掌握报告，不调用模型。
 
-账本只有事实没有状态：`passed == true` → 已掌握；`passed == false` → 未掌握
-（循环提前结束才会剩这种）。`wrong` 是该点累计答错次数，`round` 是文档演化的
-轮次数，`supplements` 是学员主动补充的疑问清单。
-
-```
-## 学习报告：{{topic}}
-
-**掌握进度**：X/Y（已通过 X 个，共 Y 个知识点）
-
-**学习过程**：共 N 轮；各知识点答错次数：…
-
-**学员补充**：…（无则写"无"）
-
-**交付文档**：docs/learn/{{plan_out}}.md（学习材料存档：.latte/learn/{{plan_out}}/draft.md）
-
-**注释版代码副本**：.latte/learn/{{plan_out}}/code/（仅当该目录存在时输出此行）
-
-**建议**：一句总结。
-```
-
-需要知识点标题时读 plan.json。除报告文本外不输出别的。"""
+`passed == true` → 已掌握；`wrong` 是累计答错次数；`round` 是文档轮次；
+`supplements` 是学员补充的疑问。报告含掌握进度、学习过程、学员补充、交付文档
+（docs/learn/{{plan_out}}.md）、注释版代码副本（目录存在时）和一句建议。"""
 
 [steps.output_contract]
 min_chars = 80
