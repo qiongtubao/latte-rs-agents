@@ -4089,6 +4089,12 @@ async fn run_learn_control_step(
                 .find(|e| e["id"] == p["id"])
                 .and_then(|e| e["wrong"].as_u64())
                 .unwrap_or(0);
+            let mut options: Vec<ChoiceOption> =
+                serde_json::from_value(p["options"].clone()).unwrap_or_default();
+            if !is_engine_supplement_point(p) {
+                let answer = p["answer"].as_str().unwrap_or("");
+                options = shuffle_quiz_options(options, answer, slug, id, wrong + 1);
+            }
             ChoiceQuestion {
                 id: id.into(),
                 question: format!(
@@ -4096,7 +4102,7 @@ async fn run_learn_control_step(
                     p["question"].as_str().unwrap_or(""),
                     wrong + 1
                 ),
-                options: serde_json::from_value(p["options"].clone()).unwrap_or_default(),
+                options,
                 ..Default::default()
             }
         })
@@ -4796,6 +4802,61 @@ fn validate_learn_final(cwd: &Path, slug: &str) -> Result<(), String> {
     } else {
         Err(format!("{rel} 未通过校验：\n- {}", problems.join("\n- ")))
     }
+}
+
+/// 第 `attempt` 次作答的选项顺序（下标排列）。种子只由 slug、知识点 id 和作答
+/// 次数决定：续跑重放同一次作答时顺序不变，重考时换一种顺序。
+fn quiz_option_order(n: usize, slug: &str, id: &str, attempt: u64) -> Vec<usize> {
+    // FNV-1a：跨进程、跨版本稳定（DefaultHasher 不保证）。
+    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in format!("{slug}\0{id}\0{attempt}").bytes() {
+        seed ^= u64::from(b);
+        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (next() % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
+}
+
+/// 洗牌出卷。判分按 label 比对，与顺序无关。重考时正确项不留在上一次的位置，
+/// 学员不能靠记位置答对。
+fn shuffle_quiz_options(
+    options: Vec<ChoiceOption>,
+    answer: &str,
+    slug: &str,
+    id: &str,
+    attempt: u64,
+) -> Vec<ChoiceOption> {
+    let n = options.len();
+    if n < 2 {
+        return options;
+    }
+    let answer_idx = options
+        .iter()
+        .position(|o| quiz_label_norm(&o.label) == quiz_label_norm(answer));
+    let mut order = quiz_option_order(n, slug, id, attempt.max(1));
+    if let Some(a) = answer_idx {
+        // 逐次重放到本次：比较的是学员上一次实际看到的位置（可能已被换位过）。
+        let mut prev_pos = None;
+        for k in 1..=attempt.max(1) {
+            order = quiz_option_order(n, slug, id, k);
+            if order.iter().position(|&i| i == a) == prev_pos {
+                order.rotate_left(1);
+            }
+            prev_pos = order.iter().position(|&i| i == a);
+        }
+    }
+    let mut slots: Vec<Option<ChoiceOption>> = options.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
 /// 判分：双方归一化（去首尾空白、去常见收尾标点、忽略大小写）后完全相等即对。
@@ -10240,8 +10301,8 @@ role = "reviewer"
     ///      "正确答案"是幻觉。plan 必须先取证（require_tools_any），每个知识
     ///      点带 evidence（file:line）；doc 步同理，必须真 write 落盘。
     ///   3. **答案泄漏**：options 禁止 recommended（前端渲染成「✓ 推荐」= 印
-    ///      答案）；ask 没有洗牌实现（handler 不解析 shuffle），正确项位置由
-    ///      plan 自己随机打散，判分按 label 文本、绝不按位置。
+    ///      答案）；正确项位置由引擎出卷时洗牌（shuffle_quiz_options），
+    ///      判分按 label 文本、绝不按位置。
     ///   4. **同题复用回放**：ask 的 allow_repeat 未实现，同一题面文本重问
     ///      会被 AnswerLog 静默回放旧答案、不弹窗——read_confirm / quiz 重考
     ///      / supplement 这些跨轮次重复的 ask，题面都必须嵌轮次号。
@@ -10347,11 +10408,11 @@ role = "reviewer"
             plan.task_text().contains("\"answer\""),
             "答案应放独立的 answer 字段"
         );
-        // 答案位置偏置：ask 没有洗牌实现，正确项位置由 plan 自己随机打散；
+        // 答案位置偏置由引擎出卷时洗牌消除（shuffle_quiz_options）；
         // 纯字母序号会让 answer 退化成位置引用。
         assert!(
-            norm(plan.task_text()).contains("随机"),
-            "plan 必须自己打散正确项位置（ask 无 shuffle 实现）"
+            norm(plan.task_text()).contains("洗牌"),
+            "plan 应知道选项顺序由引擎洗牌"
         );
         assert!(
             banned(plan.task_text(), "A/B/C/D"),
@@ -17768,6 +17829,7 @@ task = "补充疑问"
             let mut rx = event_rx;
             let mut quiz_round = 0usize;
             let mut statuses: Vec<String> = Vec::new();
+            let mut k1_orders: Vec<Vec<String>> = Vec::new();
             loop {
                 match rx.recv().await {
                     Ok(ChatEvent::ChoiceRequested {
@@ -17780,13 +17842,17 @@ task = "补充疑问"
                             options[0].label.clone()
                         } else {
                             quiz_round += 1;
+                            if let Some(q) = questions.iter().find(|q| q.id == "k1") {
+                                k1_orders
+                                    .push(q.options.iter().map(|o| o.label.clone()).collect());
+                            }
                             questions
                                 .iter()
                                 .map(|q| {
                                     // 第一轮把 k1 答错（选干扰项），其余及各轮全对。
                                     let wrong = quiz_round == 1 && q.id == "k1";
                                     let label = if wrong {
-                                        q.options[0].label.clone()
+                                        "还能用".to_string()
                                     } else {
                                         match q.id.as_str() {
                                             "k1" => "borrow 语义".to_string(),
@@ -17809,7 +17875,7 @@ task = "补充疑问"
                     Ok(ChatEvent::Status { message }) => statuses.push(message),
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break statuses,
+                    Err(broadcast::error::RecvError::Closed) => break (statuses, k1_orders),
                 }
             }
         });
@@ -17824,10 +17890,19 @@ task = "补充疑问"
         .expect("workflow 应成功");
         assert!(out.contains("ALL_DONE"), "{out}");
         drop(ctx);
-        let statuses = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
-            .await
-            .expect("driver 应退出")
-            .expect("driver 不应 panic");
+        let (statuses, k1_orders) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+                .await
+                .expect("driver 应退出")
+                .expect("driver 不应 panic");
+
+        // 重考换位：k1 两次作答，正确项不在同一位置；选项集合不变。
+        assert_eq!(k1_orders.len(), 2, "k1 应作答两次：{k1_orders:?}");
+        let pos = |o: &Vec<String>| o.iter().position(|l| l == "borrow 语义");
+        assert_ne!(pos(&k1_orders[0]), pos(&k1_orders[1]), "{k1_orders:?}");
+        let mut sorted = k1_orders[1].clone();
+        sorted.sort();
+        assert_eq!(sorted, ["borrow 语义", "还能用"]);
 
         // 返工 Status 事件：跳回 doc。
         assert!(
@@ -17895,6 +17970,57 @@ task = "补充疑问"
         assert_eq!(
             super::supplement_request("其他：生命周期怎么标注"),
             Some("生命周期怎么标注".into())
+        );
+    }
+
+    #[test]
+    fn quiz_options_shuffle_is_stable_and_moves_answer_on_retake() {
+        let opts = |labels: &[&str]| -> Vec<ChoiceOption> {
+            labels
+                .iter()
+                .map(|l| ChoiceOption {
+                    label: (*l).into(),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let labels = |o: &[ChoiceOption]| o.iter().map(|o| o.label.clone()).collect::<Vec<_>>();
+        let four = ["move 语义", "借用规则", "Copy 语义", "Clone 语义"];
+
+        // 同一次作答（续跑重放）顺序不变。
+        let a = super::shuffle_quiz_options(opts(&four), "move 语义", "rust", "k1", 1);
+        let b = super::shuffle_quiz_options(opts(&four), "move 语义", "rust", "k1", 1);
+        assert_eq!(labels(&a), labels(&b));
+
+        // 每次重考：选项不丢不重，正确项不留在上一次的位置。
+        for slug in ["rust", "tokio", "serde"] {
+            for id in ["k1", "k2", "k3"] {
+                let mut prev = None;
+                for attempt in 1..=6 {
+                    let s = super::shuffle_quiz_options(opts(&four), "move 语义", slug, id, attempt);
+                    let mut got = labels(&s);
+                    let pos = got.iter().position(|l| l == "move 语义");
+                    if let Some(p) = prev {
+                        assert_ne!(pos, Some(p), "{slug}/{id} 第 {attempt} 次正确项没换位");
+                    }
+                    prev = pos;
+                    got.sort();
+                    let mut want: Vec<String> = four.iter().map(|s| s.to_string()).collect();
+                    want.sort();
+                    assert_eq!(got, want);
+                }
+            }
+        }
+
+        // 不止一种排列：引擎确实在洗，不是原样返回。
+        let distinct: std::collections::HashSet<Vec<String>> = (1..=8)
+            .map(|n| labels(&super::shuffle_quiz_options(opts(&four), "move 语义", "rust", "k1", n)))
+            .collect();
+        assert!(distinct.len() > 1, "{distinct:?}");
+
+        assert_eq!(
+            labels(&super::shuffle_quiz_options(opts(&["唯一"]), "唯一", "rust", "k1", 2)),
+            ["唯一"]
         );
     }
 
