@@ -4466,6 +4466,55 @@ fn validate_learn_plan(cwd: &Path, slug: &str) -> Result<(), String> {
     }
 }
 
+fn mermaid_blocks(text: &str) -> usize {
+    text.lines()
+        .filter(|l| l.trim_start().starts_with("```mermaid"))
+        .count()
+}
+
+/// merge 写完 `docs/learn/<slug>.md` 后的机械校验：定稿以 draft.md 为底稿，
+/// 出处、图、篇幅都不能在定稿时丢掉。
+fn validate_learn_final(cwd: &Path, slug: &str) -> Result<(), String> {
+    let slug = slug.trim();
+    if !learn_slug_ok(slug) {
+        return Err(format!("slug「{slug}」不合法"));
+    }
+    let rel = format!("docs/learn/{slug}.md");
+    let final_text = std::fs::read_to_string(cwd.join(&rel)).unwrap_or_default();
+    if final_text.trim().is_empty() {
+        return Err(format!("{rel} 不存在或为空"));
+    }
+    let base = cwd.join(".latte").join("learn").join(slug);
+    let _ = assemble_draft_from_sections(&base);
+    let Ok(draft) = std::fs::read_to_string(base.join("draft.md")) else {
+        return Ok(());
+    };
+    let mut problems = Vec::new();
+    let kept = chapter_citations(&final_text);
+    let missing: Vec<String> = chapter_citations(&draft)
+        .into_iter()
+        .filter(|c| !kept.contains(c))
+        .collect();
+    if !missing.is_empty() {
+        problems.push(format!("丢了 draft 里的源码出处：{}", missing.join("、")));
+    }
+    let (draft_graphs, final_graphs) = (mermaid_blocks(&draft), mermaid_blocks(&final_text));
+    if final_graphs < draft_graphs {
+        problems.push(format!(
+            "mermaid 图从 {draft_graphs} 张变成 {final_graphs} 张，图要原样保留"
+        ));
+    }
+    let (before, after) = (draft.chars().count(), final_text.chars().count());
+    if after * 2 < before {
+        problems.push(format!("正文从 {before} 字缩到 {after} 字，定稿不能砍掉一半以上"));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{rel} 未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
 /// 判分：双方归一化（去首尾空白、去常见收尾标点、忽略大小写）后完全相等即对。
 /// 用户答案可以包住完整 label（序号前缀、`其他：` 前缀），正确 label 须 ≥ 2 字符。
 /// 不接受反过来的包含：短干扰项是正确项的子串时，选干扰项不得判对。
@@ -7195,6 +7244,30 @@ async fn run_workflow_serial(
                             let annotation = format!(
                                 "上次写的 plan.json 未通过引擎校验：\n{reason}\n\
                                  请读源码核对后重写 plan.json，并再次只输出 slug。"
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
+                    if wf.name == "learn_loop" && step.id == "merge" {
+                        let slug = vars.get("plan_out").cloned().unwrap_or_default();
+                        if let Err(reason) = validate_learn_final(&ctx.cwd, &slug) {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::Failed(format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ));
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "learn final doc failed check; retrying"
+                            );
+                            let annotation = format!(
+                                "上次写的定稿未通过引擎校验：\n{reason}\n\
+                                 请对照 draft.md 补回缺的内容后重新 write 定稿。"
                             );
                             step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
                             prompt = format!("{full_prompt}\n\n{annotation}");
@@ -17943,6 +18016,138 @@ max_retries = 2
             .collect();
         assert_eq!(bodies.len(), 2, "只重试 plan 一次：{bodies:?}");
         assert!(bodies[1].contains("超出文件范围"), "重试 prompt 要带上校验原因");
+    }
+
+    const LEARN_DRAFT: &str = "# 所有权\n\n每个值有唯一 owner，见 src/own.rs:2-3。\n\n```mermaid\ngraph LR\n  a --> b\n```\n\n借用见 src/borrow.rs:5-9，借用不能比 owner 活得久。\n";
+
+    fn write_learn_draft(cwd: &std::path::Path) {
+        let base = cwd.join(".latte/learn/own");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("draft.md"), LEARN_DRAFT).unwrap();
+    }
+
+    fn write_learn_final(cwd: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(cwd.join("docs/learn")).unwrap();
+        std::fs::write(cwd.join("docs/learn/own.md"), text).unwrap();
+    }
+
+    #[test]
+    fn learn_loop_final_doc_validation_rejects_lost_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_learn_draft(dir.path());
+        let err = validate_learn_final(dir.path(), "own").expect_err("没写定稿");
+        assert!(err.contains("不存在或为空"), "{err}");
+
+        let polished = format!("{LEARN_DRAFT}\n## 易错点辨析\n选「还能用」是错的。\n");
+        write_learn_final(dir.path(), &polished);
+        validate_learn_final(dir.path(), "own").expect("保留出处和图的定稿应通过");
+
+        write_learn_final(dir.path(), &LEARN_DRAFT.replace("src/borrow.rs:5-9", "借用模块"));
+        let err = validate_learn_final(dir.path(), "own").expect_err("丢出处");
+        assert!(err.contains("src/borrow.rs:5-9"), "{err}");
+
+        write_learn_final(dir.path(), &LEARN_DRAFT.replace("```mermaid", "```text"));
+        let err = validate_learn_final(dir.path(), "own").expect_err("丢图");
+        assert!(err.contains("mermaid"), "{err}");
+
+        write_learn_final(dir.path(), "src/own.rs:2-3 src/borrow.rs:5-9\n```mermaid\n```");
+        let err = validate_learn_final(dir.path(), "own").expect_err("砍掉大半");
+        assert!(err.contains("一半"), "{err}");
+
+        assert!(validate_learn_final(dir.path(), "../own").is_err());
+    }
+
+    /// 第一次定稿丢了出处：引擎带原因重试 merge，第二次写全才放行。
+    #[tokio::test]
+    async fn learn_loop_merge_retries_until_final_doc_keeps_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        write_learn_draft(dir.path());
+
+        let server = wiremock::MockServer::start().await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("定稿未通过引擎校验"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_learn_final(&cwd, LEARN_DRAFT);
+                ResponseTemplate::new(200).set_body_string(openai_body("docs/learn/own.md"))
+            })
+            .mount(&server)
+            .await;
+        let cwd = dir.path().to_path_buf();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("MERGE_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                write_learn_final(&cwd, &LEARN_DRAFT.replace("src/borrow.rs:5-9", "借用模块"));
+                ResponseTemplate::new(200).set_body_string(openai_body("docs/learn/own.md"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "merge"
+role = "tutor"
+task = "MERGE_STEP {{plan_out}}"
+max_retries = 2
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(16);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_workflow(&wf, "所有权", &ctx),
+        )
+        .await
+        .expect("不应卡死")
+        .expect("第二次定稿保留了出处，应成功");
+        assert!(out.contains("docs/learn/own.md"), "{out}");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(bodies.len(), 3, "doc 一次 + merge 两次：{bodies:?}");
+        assert!(bodies[2].contains("src/borrow.rs:5-9"), "重试 prompt 要点名丢了哪条出处");
+        let final_text = std::fs::read_to_string(dir.path().join("docs/learn/own.md")).unwrap();
+        assert!(final_text.contains("src/borrow.rs:5-9"));
     }
 
     #[test]

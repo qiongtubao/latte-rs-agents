@@ -373,7 +373,7 @@ last_line_prefix_any = ["ALL_DONE", "SUPPLEMENT"]
 id = "merge"
 description = "把 draft.md 与学习期间的补充合并定稿到 docs/learn/<slug>.md"
 role = "tutor"
-max_retries = 1
+max_retries = 2
 tools = ["read", "write"]
 require_tools = ["write"]
 task = """你是技术写作者。当前主题 slug：{{plan_out}}。
@@ -390,6 +390,9 @@ task = """你是技术写作者。当前主题 slug：{{plan_out}}。
 - draft 中对 `.latte/learn/{{plan_out}}/code/` 注释版副本的引用同样**保留**（学习资产，
   不是轮次痕迹）；若该目录存在，文末加「注释版代码副本」一节列出副本索引；
 - draft.md 原样保留作存档，不要删。
+
+引擎写完后会核对：定稿文件存在；draft 里的每个 `file:line` 出处都还在；mermaid 图
+不少于 draft；篇幅不少于 draft 的一半。不合格会带原因让你重写。
 
 正文给出最终文档的完整路径（`docs/learn/{{plan_out}}.md`）和一句内容概要，
 此外不输出别的。"""
