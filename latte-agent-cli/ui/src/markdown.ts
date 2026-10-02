@@ -38,6 +38,38 @@ function isLocalMarkdown(src: string): boolean {
 function isLocalImage(src: string): boolean {
   return isLocalPath(src) && /\.(png|jpe?g|gif|webp|svg)(?:[#?].*)?$/i.test(src);
 }
+
+/** 渲染环境：baseDir = 当前文档所在目录（相对 cwd），用于解析文档内的相对链接。 */
+export interface RenderOptions {
+  baseDir?: string;
+}
+
+/** 把文档内的本地相对路径解析成相对 cwd 的规范路径：
+ *  去掉 #fragment / ?query（服务端按 `.md` 结尾校验），拼上 baseDir，
+ *  折叠 `.` / `..`。越过根的 `..` 原样保留，交给服务端白名单拒绝。
+ *  例：baseDir="docs/learn"，"../guide/c.md#x" → "docs/guide/c.md"。 */
+export function resolveDocPath(href: string, baseDir?: string): string {
+  const path = href.replace(/[#?].*$/, "");
+  let decoded = path;
+  try { decoded = decodeURI(path); } catch { /* 非法转义按原文 */ }
+  const joined = baseDir ? `${baseDir.replace(/\/+$/, "")}/${decoded}` : decoded;
+  const out: string[] = [];
+  for (const seg of joined.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === ".." && out.length > 0 && out[out.length - 1] !== "..") out.pop();
+    else out.push(seg);
+  }
+  return out.join("/");
+}
+
+/** 取路径所在目录（"docs/learn/a.md" → "docs/learn"）。 */
+export function docDirname(path: string): string {
+  const i = path.lastIndexOf("/");
+  return i < 0 ? "" : path.slice(0, i);
+}
+
+const envBaseDir = (env: unknown): string | undefined =>
+  (env as RenderOptions | undefined)?.baseDir || undefined;
 const md = new MarkdownIt({
   html: false,
   linkify: false,
@@ -84,12 +116,14 @@ md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
     // 本地 md 文档：标记为 doc-link，点击由 doc_viewer 打开内嵌预览。
     token.attrSet("href", "#");
     token.attrSet("class", "doc-link");
-    token.attrSet("data-doc-path", href);
+    // 相对当前文档目录解析（嵌套文档里的 `b.md` / `../x/c.md`），去掉 #fragment。
+    token.attrSet("data-doc-path", resolveDocPath(href, envBaseDir(env)));
   } else if (isLocalImage(href)) {
     // 本地图片链接：标记为 img-link，指向 doc-asset 并支持前端预览，防止跳出 404。
-    token.attrSet("href", `/api/doc-asset?path=${encodeURIComponent(href)}`);
+    const assetUrl = `/api/doc-asset?path=${encodeURIComponent(resolveDocPath(href, envBaseDir(env)))}`;
+    token.attrSet("href", assetUrl);
     token.attrSet("class", "img-link");
-    token.attrSet("data-img-src", `/api/doc-asset?path=${encodeURIComponent(href)}`);
+    token.attrSet("data-img-src", assetUrl);
   }
   return defaultLinkOpen(tokens, idx, options, env, self);
 };
@@ -100,7 +134,7 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const token = tokens[idx];
   const src = String(token.attrGet("src") ?? "");
   if (isLocalPath(src) && !isLocalMarkdown(src)) {
-    token.attrSet("src", `/api/doc-asset?path=${encodeURIComponent(src)}`);
+    token.attrSet("src", `/api/doc-asset?path=${encodeURIComponent(resolveDocPath(src, envBaseDir(env)))}`);
     token.attrSet("loading", "lazy");
   }
   // alt 需从子 token 重新渲染纯文本（对齐 markdown-it 默认 image 规则）。
@@ -140,7 +174,50 @@ md.renderer.rules.fence = (tokens, idx) => {
   return `<pre><code${cls ? ` class="${cls}"` : ""}>${inner}</code></pre>\n`;
 };
 
+/** 修复「```markdown 块里嵌套 ``` 代码块」：CommonMark 下内层同长度的
+ *  ``` 会提前关闭外层，后半截文档掉出代码块、整体错乱。模型输出 md 示例时
+ *  几乎总这么写。这里只处理 info 为 md/markdown 的外层围栏：在其内部按
+ *  「带 info 的围栏 = 开、裸围栏 = 关」配对计深度，深度归零时的裸围栏才是
+ *  外层结束；然后把外层围栏加长到比内部最长的还长，交给 markdown-it 正常解析。
+ *  找不到匹配的外层结束时原样保留（不臆造结构）。 */
+export function repairNestedMarkdownFences(text: string): string {
+  const lines = text.split("\n");
+  const fenceRe = /^( {0,3})(`{3,}|~{3,})\s*(.*)$/;
+  for (let i = 0; i < lines.length; i++) {
+    const open = fenceRe.exec(lines[i]);
+    if (!open) continue;
+    const [, indent, fence, info] = open;
+    const ch = fence[0];
+    if (!/^(md|markdown)\b/i.test(info.trim())) {
+      // 普通围栏：跳到它的结束，避免把其内容当成外层候选。
+      for (let j = i + 1; j < lines.length; j++) {
+        const m = fenceRe.exec(lines[j]);
+        if (m && m[2][0] === ch && m[2].length >= fence.length && m[3].trim() === "") { i = j; break; }
+      }
+      continue;
+    }
+    let depth = 0;
+    let maxInner = 0;
+    let close = -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      const m = fenceRe.exec(lines[j]);
+      if (!m || m[2][0] !== ch) continue;
+      if (m[3].trim() !== "") { depth++; maxInner = Math.max(maxInner, m[2].length); }
+      else if (depth > 0) { depth--; maxInner = Math.max(maxInner, m[2].length); }
+      else if (m[2].length >= fence.length) { close = j; break; }
+    }
+    if (close < 0) continue;
+    if (maxInner >= fence.length) {
+      const longer = ch.repeat(maxInner + 1);
+      lines[i] = `${indent}${longer}${info}`;
+      lines[close] = lines[close].replace(fence[0] === "`" ? /`{3,}/ : /~{3,}/, longer);
+    }
+    i = close;
+  }
+  return lines.join("\n");
+}
+
 /** 渲染 Markdown 为 HTML 字符串。输出可安全用于 innerHTML。 */
-export function renderMarkdown(text: string): string {
-  return md.render(text);
+export function renderMarkdown(text: string, opts: RenderOptions = {}): string {
+  return md.render(repairNestedMarkdownFences(text), { ...opts });
 }

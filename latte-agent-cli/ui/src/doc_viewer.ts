@@ -4,7 +4,7 @@
 // .latte/learn/ 与 docs/），渲染与聊天正文同一 markdown 管线 + 后处理
 // （mermaid、代码块工具条都生效）。
 
-import { renderMarkdown } from "./markdown";
+import { docDirname, renderMarkdown } from "./markdown";
 import { enhanceRenderedMarkdown } from "./codeblock";
 
 let overlay: HTMLElement | null = null;
@@ -59,7 +59,8 @@ export async function openDocViewer(path: string): Promise<void> {
   }
   if (!overlay.isConnected) return;
 
-  contentEl.innerHTML = renderMarkdown(text);
+  // 文档内的相对链接/图片相对**本文档所在目录**解析，而不是 cwd。
+  contentEl.innerHTML = renderMarkdown(text, { baseDir: docDirname(path) });
   enhanceRenderedMarkdown(contentEl);
 
   // TOC：渲染后的标题（# 已降为 h3 起）收集成侧边目录，点击滚动定位。
