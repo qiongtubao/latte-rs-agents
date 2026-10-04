@@ -1551,7 +1551,7 @@ pub(crate) async fn upload_image(
 // ─── 学习/文档只读资源 ─────────────────────────────────────────────
 // 前端 markdown 渲染把本地相对路径图片改写到 /api/doc-asset，把 .md
 // 链接交给内嵌预览（/api/doc）。两个路由共用同一条白名单：只允许读
-// `<cwd>` 下 `.latte/learn/`、`docs/` 里的文件，防穿越（拒绝对路径、
+// `<cwd>` 下 `.latte/learn/`、`.latte/sessions/<sid>/learn/`、`docs/` 里的文件，防穿越（拒绝对路径、
 // `..`、反斜杠），doc-asset 再加图片扩展名白名单，doc 限制 1 MiB。
 
 /// 校验相对路径并拼到 cwd 下。返回 None = 不合法/不在白名单目录。
@@ -1564,11 +1564,43 @@ fn resolve_whitelisted_path(cwd: &std::path::Path, rel: &str) -> Option<std::pat
     {
         return None;
     }
-    let allowed = rel.starts_with(".latte/learn/") || rel.starts_with("docs/");
+    let allowed = rel.starts_with(".latte/learn/")
+        || rel.starts_with("docs/")
+        || is_session_learn_path(rel);
     if !allowed {
         return None;
     }
     Some(cwd.join(rel))
+}
+
+/// 会话学习工作区 `.latte/sessions/<sid>/learn/…`（learn_loop 学习过程中的
+/// draft / 章节 / 布局图都在这里，定稿才发布到 docs/learn/）。只放行 learn
+/// 子树——会话目录里的其它东西（日志、子会话）不经这个路由暴露。
+fn is_session_learn_path(rel: &str) -> bool {
+    let mut parts = rel.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(".latte"), Some("sessions"), Some(sid), Some("learn"), Some(rest))
+            if !sid.is_empty() && !sid.starts_with('.') && !rest.is_empty()
+    )
+}
+
+#[cfg(test)]
+mod doc_whitelist_tests {
+    use super::*;
+
+    #[test]
+    fn session_learn_tree_is_readable_but_rest_of_session_is_not() {
+        let cwd = std::path::Path::new("/p");
+        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1-2-0/learn/own/draft.md").is_some());
+        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/learn/own/img/ml-1.svg").is_some());
+        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/events.jsonl").is_none());
+        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/learn/../x.md").is_none());
+        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/../learn/a.md").is_none());
+        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/learn/").is_none());
+        assert!(resolve_whitelisted_path(cwd, ".latte/learn/own/draft.md").is_some());
+        assert!(resolve_whitelisted_path(cwd, "docs/learn/own.md").is_some());
+    }
 }
 
 /// `GET /api/doc-asset?path=<相对路径>` —— 文档内嵌图片（白名单目录 +

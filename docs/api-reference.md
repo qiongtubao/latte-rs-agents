@@ -1074,7 +1074,7 @@ workflow run 进度 SSE 流（独立 session，与主 events 隔离）。
 
 > 前端 markdown 渲染把本地相对路径图片改写到 `/api/doc-asset`，把本地
 > `.md` 链接交给内嵌文档查看器（`/api/doc`）。两个路由共用白名单：
-> 只允许读 `<cwd>` 下 `.latte/learn/`、`docs/` 里的文件；拒绝对路径、
+> 只允许读 `<cwd>` 下 `.latte/learn/`、`.latte/sessions/<sid>/learn/`（learn_loop 会话学习工作区）、`docs/` 里的文件；拒绝对路径、
 > `..`、反斜杠。
 
 ### `GET /api/doc-asset?path=<相对路径>`

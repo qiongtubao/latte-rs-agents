@@ -9,12 +9,13 @@
 # 不再等另一个模型输出 LOOKS_CLEAR。
 # draft.md 由引擎在控制步（read_confirm/quiz）前从 sections 自动装配，writer 不写它。
 name = "doc_review_loop"
-description = "主体框架先行 + 各章并发写作，写完即交给学员｜落点：.latte/learn/<slug>/{index.md,sections/*.md}"
+description = "主体框架先行 + 各章并发写作，写完即交给学员｜落点：{{learn_root}}/<slug>/{index.md,sections/*.md}"
 max_rounds = 1
 
 [[steps]]
 id = "outline"
 description = "写主体框架(00_overview.md)与 index.md；返工时把审查意见按章拆到 feedback.md"
+budget = "small"
 role = "tutor"
 output_key = "outline_out"
 max_retries = 1
@@ -25,19 +26,32 @@ task = """你是学习文档的总编，负责**主体框架**与**返工分派*
 契约：
 {{topic}}
 
-先读 plan.json、ledger.json（以及已有的 sections/ 文件，若有）。工作目录 .latte/learn/<slug>/。
+先读 `{{learn_root}}/{{slug}}/plan.json`、`{{learn_root}}/{{slug}}/ledger.json`（以及已有的 `{{learn_root}}/{{slug}}/sections/` 文件，若有）。下文的相对路径都相对这个工作目录（会话目录下的学习工作区），工具调用里要写完整路径。
 
 ## 一、主体框架 sections/00_overview.md（必写；返工时仅当意见涉及全局设计/主线时改）
 这一页是电梯演讲：只读这一页也要能说出问题、核心思路和关键取舍。以 plan.json 的 `design` 为底
-（没有 `design` 时从知识点和源码注释归纳）：
-1. **一句话结论**：`design.core_idea`；
-2. **要解决的问题与约束**：`design.problem`，配一个不这样做会出什么事的真实场景；
-3. **设计决策总览表**：`| 设计问题 | 作者的选择 | 放弃的方案 | 为什么 | 代价 |`，每行一个 decision，链到对应章节；
-4. 端到端全景：一次典型操作从头到尾（ASCII 或 mermaid，节点写动作，不写函数名）；
+（没有 `design` 时从知识点和源码注释归纳）。**引擎会在文档最前面自动生成「一句话结论 + 设计决策
+总览表」，这里不要再写那张表**，用图把它讲直观：
+1. **要解决的问题与约束**：`design.problem`，配一个带具体输入的场景（不这样做会在哪一步出事）；
+2. **整体架构图**（mermaid `flowchart`）：系统里有哪些部件、数据/请求怎么流过它们。
+   节点写「部件 + 它负责什么」，不写裸函数名；
+   主题涉及内存/数据怎么存时，再给一张 ```memlayout 物理视图（一页/一个对象怎么切、元数据指向哪里；
+   语法：`lane <id> "说明"`、`cell <id> <大小> <used|free|meta|data|pad> "标签"`、`gap <大小> "说明"`、
+   `ptr <lane>.<cell> -> <lane>.<cell> "说明"`，引擎渲染成 SVG）。**这张图先于各章写成、之后没人回头核对，
+   所以必须现在就读源码核实**：格子布局以源码里地址/偏移怎么算出来为准，元数据在别的结构里就画成独立 lane
+   再用 `ptr` 指过去，不要画成内嵌头部；行说明里写了 `= N KiB` 的总数要等于格子之和；数据格和元数据格画在
+   同一行必须在行说明里写 `file:line`。引擎会对账，对不上带原因打回。拿不准就不画这张图（用 mermaid 讲结构），
+   各章的内存布局图由各章 writer 读源码后画；
+3. **决策地图**（mermaid `flowchart LR`）：`问题 → 每个决策（选了什么）→ 对应章节`，
+   每个决策节点旁用虚线连一个「放弃了：<替代方案>」节点，读者一眼看到全部取舍和去哪章看细节；
+4. **端到端走一遍**：一次典型操作从头到尾（`sequenceDiagram` 优先），标出每一步对应哪个决策；
 5. **学习路径**：各章要回答的设计问题，后一章解决前一章留下的哪个矛盾；
 6. **概念归属表**：`| 概念 | 负责讲解的章 |`，每个会被多章用到的概念只归一章讲完；
 7. 各章链接：`[k1 标题](k1.md)`。
-比喻可选，全文最多一个。不科普通用语言/库概念。
+比喻可选，全文最多一个。不科普通用语言/库概念。不编造吞吐/延迟/百分比这类性能数字。
+
+mermaid 语法：第一行写图类型；节点 id 只用字母数字下划线，**标签一律加双引号**
+（`A["arena->bins[i]"]`，标签里的 `[](){}<>|#` 不加引号会渲染失败）；单图 ≤ 15 个节点。
 
 ## 二、index.md（必写）
 文档入口：一句话主题 + 阅读顺序 + 各章相对链接（sections/<k_id>.md）+ 一句话摘要。
@@ -59,53 +73,334 @@ task = """你是学习文档的总编，负责**主体框架**与**返工分派*
 min_chars = 10
 
 [[steps]]
-id = "write_chapter"
-description = "章节 writer：引擎按 plan.json 每个知识点派发一次，并发写 sections/<k_id>.md"
+id = "ch_frame"
+description = "章节 1-2 节：问题与背景、目标与预期结果（引擎按知识点 fan_out）"
+budget = "small"
 role = "tutor"
-output_key = "chapters_out"
-# 引擎强制：每个并发章节 writer 只能写自己那一章，无法覆盖别人的文件。
-write_path_allowlist = [".latte/learn/{{slug}}/sections/{{item_id}}.md"]
+write_path_allowlist = ["{{learn_root}}/{{slug}}/sections/{{item_id}}/1_background.md", "{{learn_root}}/{{slug}}/sections/{{item_id}}/2_goals.md"]
 depends_on = ["outline"]
 max_retries = 2
 tools = ["read", "code_graph", "search", "edit", "write"]
-task = """你是章节 writer，本次只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 个）。
-引擎并发派发多个 writer，各写各的章节：只写你自己的 sections/{{item_id}}.md，不读、不改别的章节文件。
-
-契约：
+task = """契约：
 {{topic}}
 
-## 先判断要不要写
-读 feedback.md（不存在按 MODE: FULL）：
-- `MODE: PATCH` 且没有 `## {{item_id}}` 分组，且 sections/{{item_id}}.md 已存在 → 只输出 `UNCHANGED` 并结束；
-- 有 `## {{item_id}}` 分组 → 只针对这些意见在已有文件上**增补**（如「易错点辨析」）。
-  原有段落、`file:line` 出处和代码摘录一律保留，不许整章推倒。引擎会核对出处是否还在、
-  篇幅有没有被砍掉；不合格会还原原文件并要求重写。
-- `MODE: FULL` → 整章重写（旧文件只当参考，质量不行推倒重来）。
-写完 write 落盘到 .latte/learn/<slug>/sections/{{item_id}}.md。
+你只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 章）的这几节：
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/1_background.md`
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/2_goals.md`
+引擎会给每节加标题（`### n. 节名`）并按顺序装配，**不要写节标题**，从正文开始；节内小标题用 `####`。
+只能写上面这几个文件，写别的路径会被拒绝。
 
-## 写每一章前
-读 sections/00_overview.md 了解全局比喻与本章位置，再**自己读源码取证**
-（evidence 行号区间必须实际读出来；不许凭记忆、不许沿用旧章节里未核对的说法）。
+本章前面几节（引擎注入，已定稿，不要和它矛盾，也不要重复它）：
+<<<
+{{chapter_so_far}}
+>>>
 
-## 章节写作标准（设计分析，不是源码翻译；读完要能复述「作者为什么这么设计」）
-读者是有编程基础、没读过这段代码的工程师。本章只回答一个设计问题：本知识点 `decision`
-指向的那条 `design.decisions`。先给结论，再讲推理，最后才上代码。前 3 段必写，后面有新东西再写：
-1. **设计问题与结论**（开头 2-4 句）；
-2. **约束**：为什么直觉做法行不通，最好有真实失败场景；
-3. **方案对比**：至少两个真实可行方案（含作者的），表格在同一组维度上比。不许拿稻草人凑数。
-   总览表已经列过的，这里展开依据和失效场景，不要原样再贴一遍。依据来自注释/测试/文档，无依据标「[推测]」；
-4. **实现如何落地**（有承载代码才写）：贴原文（`file:start-end`），行内注释讲这行守护哪个约束。
-   **严禁**「简化版」「…省略」「伪代码」；
-5. **最小示例**（分支不显然时才写）：输入 → 中间值 → 输出；能写就写换成替代方案会怎样；
-6. **代价与边界**；
-7. **本章要点**：1-3 条 bullet，引出下一章矛盾。
-不重复别章（按概念归属表链接）、不科普通用概念、不贴符号索引图。
-不要在章节末尾写「本文件完整内容 = draft.md 行 xx-yy」之类的行号锚点或过程说明。"""
+先读 `{{learn_root}}/{{slug}}/plan.json` 里本知识点及它 `decision` 指向的那条 `design.decisions`，读 `{{learn_root}}/{{slug}}/sections/00_overview.md`
+了解本章在全局的位置；涉及源码的，自己读 evidence 行号区间（不许凭记忆）。
+
+返工：读 `{{learn_root}}/{{slug}}/feedback.md`（不存在按 MODE: FULL）。`MODE: PATCH` 且有 `## {{item_id}}` 分组时，只在已有文件上
+**增补**这几节里与意见相关的内容（原有段落、`file:line` 出处、代码摘录一律保留）；意见和这几节无关就只输出
+`UNCHANGED`。引擎会核对出处和篇幅，改坏了会还原。
+
+## 1. 问题与背景（1_background.md）
+这段代码要解决什么问题、在系统里处于什么位置、谁会调用它。给一个**带具体输入的场景**
+（plan 的 `scenario`），说明直觉做法在这个场景下哪一步出事。术语首次出现用半句话解释。
+
+## 2. 目标与预期结果（2_goals.md）
+解决方案必须满足的目标与硬约束，写成可检验的条目（如「同一个 arena 上的 4 个线程，一次分配
+只争 1 把锁」「reset 不能释放分配器自己的元数据」）。再写「做到了会怎样」：上面那个场景的预期结果。
+后面的方案对比就按这些目标来比。
+
+通用纪律：
+- 只写能从源码/测试/文档推出来的数（字节数、锁个数、循环次数，写出算式）；**不许编造吞吐、延迟、百分比**；
+- 依据来自源码注释/测试/文档，无依据标「[推测]」；
+- mermaid：第一行写图类型；节点 id 只用字母数字下划线，**标签一律加双引号**（`A["arena->bins[i]"]`），
+  单图 ≤ 15 个节点。
+- 讲内存怎么摆（页/格子/偏移/字段指针）用 ```memlayout 块，不要用 mermaid 硬画字节布局。语法每行一条：
+  `lane <id> "说明"`（一行内存）、`cell <id> <大小> <used|free|meta|data|pad> "标签"`、`gap <大小> "省略说明"`、
+  `ptr <lane>.<cell> -> <lane>.<cell> "说明"`；`@偏移` 只用来核对，必须等于前面各格大小之和（跳过的字节写成 `gap`）；
+  引擎校验后渲染成 SVG，写错会带行号打回。
+  **画之前先读源码核实**：每个格子、每条 `ptr` 都要能指到一处源码（宏、`sizeof`、地址/偏移是怎么算出来的那一行），
+  不许凭通用教科书模型想当然。最容易画错的是「元数据内嵌在数据区里，还是放在别的结构里」——以源码里**地址怎么算出来**为准
+  （如 `base + idx * size` 说明数据区没有头部），元数据在别处就画成独立 lane、用 `ptr` 指向数据格。
+  引擎会对账：行说明/标题里写了 `= N KiB` 的总数必须等于格子之和；数据格和元数据格画在同一行，行说明里必须写 `file:line`；对不上带原因打回。
+写完 write 落盘，正文一句话说明写了哪几节。"""
 
 [steps.fan_out]
-file = ".latte/learn/{{slug}}/plan.json"
+file = "{{learn_root}}/{{slug}}/plan.json"
 items = "knowledge_points"
 id_key = "id"
 max_items = 32
-# 单章失败不拖垮其余章节；失败章节的产出以 FAN_OUT_ITEM_FAILED 开头。
+tolerate_failures = true
+
+[[steps]]
+id = "ch_options"
+description = "章节 3-4 节：多个解决方案、方案优缺点对比（引擎按知识点 fan_out）"
+budget = "small"
+role = "tutor"
+write_path_allowlist = ["{{learn_root}}/{{slug}}/sections/{{item_id}}/3_solutions.md", "{{learn_root}}/{{slug}}/sections/{{item_id}}/4_comparison.md"]
+depends_on = ["ch_frame"]
+max_retries = 2
+tools = ["read", "code_graph", "search", "edit", "write"]
+task = """契约：
+{{topic}}
+
+你只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 章）的这几节：
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/3_solutions.md`
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/4_comparison.md`
+引擎会给每节加标题（`### n. 节名`）并按顺序装配，**不要写节标题**，从正文开始；节内小标题用 `####`。
+只能写上面这几个文件，写别的路径会被拒绝。
+
+本章前面几节（引擎注入，已定稿，不要和它矛盾，也不要重复它）：
+<<<
+{{chapter_so_far}}
+>>>
+
+先读 `{{learn_root}}/{{slug}}/plan.json` 里本知识点及它 `decision` 指向的那条 `design.decisions`，读 `{{learn_root}}/{{slug}}/sections/00_overview.md`
+了解本章在全局的位置；涉及源码的，自己读 evidence 行号区间（不许凭记忆）。
+
+返工：读 `{{learn_root}}/{{slug}}/feedback.md`（不存在按 MODE: FULL）。`MODE: PATCH` 且有 `## {{item_id}}` 分组时，只在已有文件上
+**增补**这几节里与意见相关的内容（原有段落、`file:line` 出处、代码摘录一律保留）；意见和这几节无关就只输出
+`UNCHANGED`。引擎会核对出处和篇幅，改坏了会还原。
+
+## 3. 多个解决方案（3_solutions.md）
+至少 2 个真实可行的方案（含作者选的，来自 `chosen` 与 `alternatives`；稻草人不算）。每个方案一个
+`#### 方案 X：<名字>` 小标题，下面写：
+- 思路（2-3 句）；
+- 结构草图：mermaid 画出它的结构（谁持有什么、锁/数据放在哪），或在本节开头用一张图、每个方案一个 `subgraph`；
+- 同一场景推演：把第 1 节的场景放进这个方案，编号步骤写每步的数据/状态变化（来自 `chosen_walkthrough` /
+  `walkthrough`）。替代方案走到出问题的那一步，点明「这里坏了」。
+本节**不评价优劣**，评价放第 4 节。
+
+## 4. 方案优缺点对比（4_comparison.md）
+- 一张对比表：行 = 比较维度（plan 的 `dimensions` + 第 2 节的目标），列 = 各方案。每个单元格写第 3 节推演里
+  **能数出来的具体值**（「1 把 bin 锁」「随线程数增长：1000 线程 → 1000 份」「编译期报错」），
+  不许只写「极佳 / 灾难级 / 较好」这类形容词——引擎会查；
+- 每个方案的优点 / 缺点各一两条，落到表里的具体维度上；
+- 翻转条件：什么规模/负载/约束下替代方案反而更好（`wins_when`），作者为什么判断自己不属于那种情况。
+
+通用纪律：
+- 只写能从源码/测试/文档推出来的数（字节数、锁个数、循环次数，写出算式）；**不许编造吞吐、延迟、百分比**；
+- 依据来自源码注释/测试/文档，无依据标「[推测]」；
+- mermaid：第一行写图类型；节点 id 只用字母数字下划线，**标签一律加双引号**（`A["arena->bins[i]"]`），
+  单图 ≤ 15 个节点。
+- 讲内存怎么摆（页/格子/偏移/字段指针）用 ```memlayout 块，不要用 mermaid 硬画字节布局。语法每行一条：
+  `lane <id> "说明"`（一行内存）、`cell <id> <大小> <used|free|meta|data|pad> "标签"`、`gap <大小> "省略说明"`、
+  `ptr <lane>.<cell> -> <lane>.<cell> "说明"`；`@偏移` 只用来核对，必须等于前面各格大小之和（跳过的字节写成 `gap`）；
+  引擎校验后渲染成 SVG，写错会带行号打回。
+  **画之前先读源码核实**：每个格子、每条 `ptr` 都要能指到一处源码（宏、`sizeof`、地址/偏移是怎么算出来的那一行），
+  不许凭通用教科书模型想当然。最容易画错的是「元数据内嵌在数据区里，还是放在别的结构里」——以源码里**地址怎么算出来**为准
+  （如 `base + idx * size` 说明数据区没有头部），元数据在别处就画成独立 lane、用 `ptr` 指向数据格。
+  引擎会对账：行说明/标题里写了 `= N KiB` 的总数必须等于格子之和；数据格和元数据格画在同一行，行说明里必须写 `file:line`；对不上带原因打回。
+写完 write 落盘，正文一句话说明写了哪几节。"""
+
+[steps.fan_out]
+file = "{{learn_root}}/{{slug}}/plan.json"
+items = "knowledge_points"
+id_key = "id"
+max_items = 32
+tolerate_failures = true
+
+[[steps]]
+id = "ch_design"
+description = "章节 5-6 节：推荐方案与原理、代码详解（引擎按知识点 fan_out）"
+budget = "small"
+role = "tutor"
+write_path_allowlist = ["{{learn_root}}/{{slug}}/sections/{{item_id}}/5_principle.md", "{{learn_root}}/{{slug}}/sections/{{item_id}}/6_code.md"]
+depends_on = ["ch_options"]
+max_retries = 2
+tools = ["read", "code_graph", "search", "edit", "write"]
+task = """契约：
+{{topic}}
+
+你只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 章）的这几节：
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/5_principle.md`
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/6_code.md`
+引擎会给每节加标题（`### n. 节名`）并按顺序装配，**不要写节标题**，从正文开始；节内小标题用 `####`。
+只能写上面这几个文件，写别的路径会被拒绝。
+
+本章前面几节（引擎注入，已定稿，不要和它矛盾，也不要重复它）：
+<<<
+{{chapter_so_far}}
+>>>
+
+先读 `{{learn_root}}/{{slug}}/plan.json` 里本知识点及它 `decision` 指向的那条 `design.decisions`，读 `{{learn_root}}/{{slug}}/sections/00_overview.md`
+了解本章在全局的位置；涉及源码的，自己读 evidence 行号区间（不许凭记忆）。
+
+返工：读 `{{learn_root}}/{{slug}}/feedback.md`（不存在按 MODE: FULL）。`MODE: PATCH` 且有 `## {{item_id}}` 分组时，只在已有文件上
+**增补**这几节里与意见相关的内容（原有段落、`file:line` 出处、代码摘录一律保留）；意见和这几节无关就只输出
+`UNCHANGED`。引擎会核对出处和篇幅，改坏了会还原。
+
+## 5. 推荐方案与原理（5_principle.md）
+作者选的方案为什么能达成第 2 节的目标。**先给一张原理图**：调用链 / 状态机用 mermaid（节点写动作或数据，
+不写裸函数名）；**涉及数据怎么存的（内存/页/对象布局），必须再给一张 memlayout 内存布局图**，用一个具体
+数值例子画到字节（如「一页 4 KiB 切成 512 个 8 B region，edata_t 的哪个字段指向第几格」）。再按图逐步讲：
+关键不变量是什么、靠什么保证。最后写代价（`cost`）与适用边界。
+
+**内存布局图（memlayout）**：讲「数据在内存里怎么摆」时（一页 4 KiB 怎么切成 8 B 的格子、元数据结构体
+的哪个字段指向哪一格、空闲链表/位图怎么标记），mermaid 画不出字节和偏移，改用 ```memlayout 文本块，
+引擎校验语法并渲染成 SVG 图（写错会带着行号打回）：
+```memlayout
+title 一个 4 KiB slab 页切成 512 个 8 B region
+lane page "slab 页（4 KiB = 4096 B）"
+cell r0 8 used "region[0]"
+cell r1 8 free "region[1]"
+gap 4072 "region[2..510]"
+cell r511 8 used "region[511]" @4088
+lane meta "edata_t（这一页的元数据）"
+cell addr 8 meta "e_addr"
+cell nfree 4 meta "nfree=255"
+cell bm 64 meta "bitmap[8]"
+ptr meta.addr -> page.r0 "e_addr = 页首地址"
+ptr meta.bm -> page.r1 "bit1=1 → region[1] 空闲"
+```
+- `lane <id> "说明"` 一行内存（一页、一个结构体、一个数组），≤ 6 行；`cell <id> <大小> <种类> "标签" [@偏移]`，
+  大小写 `8` / `64B` / `4K` / `0x1000`，种类 `used` / `free` / `meta` / `data` / `pad`；
+- 重复的格子用 `gap <大小> "说明"` 省略（每行 ≤ 16 格），引擎在格子下方标出累计偏移，所以大小要算对、
+  加起来等于整行（上例 8+8+4072+8 = 4096），算式在正文里写出来；
+- `ptr <lane>.<cell> -> <lane>.<cell> "说明"` 画指针/地址引用（结构体字段 → 它指向的那一格）；
+- 数值必须来自源码（宏、sizeof、注释），讲清「为什么是这个数」。
+
+## 6. 代码详解（6_code.md）
+贴真实源码原文（代码块 + `file:start-end` 出处），行内中文注释讲这一行守护哪个约束、对应原理图里哪一步。
+代码多就按「原理图的步骤」分段贴，每段前一句话说明在做什么。**严禁**「简化版」「…省略」「伪代码」。
+
+通用纪律：
+- 只写能从源码/测试/文档推出来的数（字节数、锁个数、循环次数，写出算式）；**不许编造吞吐、延迟、百分比**；
+- 依据来自源码注释/测试/文档，无依据标「[推测]」；
+- mermaid：第一行写图类型；节点 id 只用字母数字下划线，**标签一律加双引号**（`A["arena->bins[i]"]`），
+  单图 ≤ 15 个节点。
+- 讲内存怎么摆（页/格子/偏移/字段指针）用 ```memlayout 块，不要用 mermaid 硬画字节布局。语法每行一条：
+  `lane <id> "说明"`（一行内存）、`cell <id> <大小> <used|free|meta|data|pad> "标签"`、`gap <大小> "省略说明"`、
+  `ptr <lane>.<cell> -> <lane>.<cell> "说明"`；`@偏移` 只用来核对，必须等于前面各格大小之和（跳过的字节写成 `gap`）；
+  引擎校验后渲染成 SVG，写错会带行号打回。
+  **画之前先读源码核实**：每个格子、每条 `ptr` 都要能指到一处源码（宏、`sizeof`、地址/偏移是怎么算出来的那一行），
+  不许凭通用教科书模型想当然。最容易画错的是「元数据内嵌在数据区里，还是放在别的结构里」——以源码里**地址怎么算出来**为准
+  （如 `base + idx * size` 说明数据区没有头部），元数据在别处就画成独立 lane、用 `ptr` 指向数据格。
+  引擎会对账：行说明/标题里写了 `= N KiB` 的总数必须等于格子之和；数据格和元数据格画在同一行，行说明里必须写 `file:line`；对不上带原因打回。
+写完 write 落盘，正文一句话说明写了哪几节。"""
+
+[steps.fan_out]
+file = "{{learn_root}}/{{slug}}/plan.json"
+items = "knowledge_points"
+id_key = "id"
+max_items = 32
+tolerate_failures = true
+
+[[steps]]
+id = "ch_usage"
+description = "章节 7-8 节：使用示例、常见问题与排查（引擎按知识点 fan_out）"
+budget = "small"
+role = "tutor"
+write_path_allowlist = ["{{learn_root}}/{{slug}}/sections/{{item_id}}/7_usage.md", "{{learn_root}}/{{slug}}/sections/{{item_id}}/8_faq.md"]
+depends_on = ["ch_options"]
+max_retries = 2
+tools = ["read", "code_graph", "search", "edit", "write"]
+task = """契约：
+{{topic}}
+
+你只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 章）的这几节：
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/7_usage.md`
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/8_faq.md`
+引擎会给每节加标题（`### n. 节名`）并按顺序装配，**不要写节标题**，从正文开始；节内小标题用 `####`。
+只能写上面这几个文件，写别的路径会被拒绝。
+
+本章前面几节（引擎注入，已定稿，不要和它矛盾，也不要重复它）：
+<<<
+{{chapter_so_far}}
+>>>
+
+先读 `{{learn_root}}/{{slug}}/plan.json` 里本知识点及它 `decision` 指向的那条 `design.decisions`，读 `{{learn_root}}/{{slug}}/sections/00_overview.md`
+了解本章在全局的位置；涉及源码的，自己读 evidence 行号区间（不许凭记忆）。
+
+返工：读 `{{learn_root}}/{{slug}}/feedback.md`（不存在按 MODE: FULL）。`MODE: PATCH` 且有 `## {{item_id}}` 分组时，只在已有文件上
+**增补**这几节里与意见相关的内容（原有段落、`file:line` 出处、代码摘录一律保留）；意见和这几节无关就只输出
+`UNCHANGED`。引擎会核对出处和篇幅，改坏了会还原。
+
+## 7. 使用示例（7_usage.md）
+调用方怎么用这个函数/功能：入口在哪（`file:line`）、参数/配置怎么给、典型调用代码（代码块，优先取自仓库里
+真实的调用点或测试，注明出处），以及输入 → 输出 / 状态变化。能写就再给一个「用错了会怎样」的反例。
+
+## 8. 常见问题与排查（8_faq.md）
+至少 2 条，每条一个 `#### <现象>` 小标题，下面写：原因 → 怎么确认（看哪个日志/断言/统计、读哪段代码）→ 怎么修。
+来源优先：源码里的 assert/错误分支、测试用例、注释里的「否则 / 注意」。不要编造没有依据的故障。
+
+通用纪律：
+- 只写能从源码/测试/文档推出来的数（字节数、锁个数、循环次数，写出算式）；**不许编造吞吐、延迟、百分比**；
+- 依据来自源码注释/测试/文档，无依据标「[推测]」；
+- mermaid：第一行写图类型；节点 id 只用字母数字下划线，**标签一律加双引号**（`A["arena->bins[i]"]`），
+  单图 ≤ 15 个节点。
+- 讲内存怎么摆（页/格子/偏移/字段指针）用 ```memlayout 块，不要用 mermaid 硬画字节布局。语法每行一条：
+  `lane <id> "说明"`（一行内存）、`cell <id> <大小> <used|free|meta|data|pad> "标签"`、`gap <大小> "省略说明"`、
+  `ptr <lane>.<cell> -> <lane>.<cell> "说明"`；`@偏移` 只用来核对，必须等于前面各格大小之和（跳过的字节写成 `gap`）；
+  引擎校验后渲染成 SVG，写错会带行号打回。
+  **画之前先读源码核实**：每个格子、每条 `ptr` 都要能指到一处源码（宏、`sizeof`、地址/偏移是怎么算出来的那一行），
+  不许凭通用教科书模型想当然。最容易画错的是「元数据内嵌在数据区里，还是放在别的结构里」——以源码里**地址怎么算出来**为准
+  （如 `base + idx * size` 说明数据区没有头部），元数据在别处就画成独立 lane、用 `ptr` 指向数据格。
+  引擎会对账：行说明/标题里写了 `= N KiB` 的总数必须等于格子之和；数据格和元数据格画在同一行，行说明里必须写 `file:line`；对不上带原因打回。
+写完 write 落盘，正文一句话说明写了哪几节。"""
+
+[steps.fan_out]
+file = "{{learn_root}}/{{slug}}/plan.json"
+items = "knowledge_points"
+id_key = "id"
+max_items = 32
+tolerate_failures = true
+
+[[steps]]
+id = "ch_wrap"
+description = "章节第 9 节：总结与下一步（引擎按知识点 fan_out）"
+budget = "small"
+role = "tutor"
+output_key = "chapters_out"
+write_path_allowlist = ["{{learn_root}}/{{slug}}/sections/{{item_id}}/9_summary.md"]
+depends_on = ["ch_design", "ch_usage"]
+max_retries = 2
+tools = ["read", "code_graph", "search", "edit", "write"]
+task = """契约：
+{{topic}}
+
+你只负责 plan.json 中 id = `{{item_id}}` 的知识点（第 {{item_index}} 章）的这几节：
+- `{{learn_root}}/{{slug}}/sections/{{item_id}}/9_summary.md`
+引擎会给每节加标题（`### n. 节名`）并按顺序装配，**不要写节标题**，从正文开始；节内小标题用 `####`。
+只能写上面这几个文件，写别的路径会被拒绝。
+
+本章前面几节（引擎注入，已定稿，不要和它矛盾，也不要重复它）：
+<<<
+{{chapter_so_far}}
+>>>
+
+先读 `{{learn_root}}/{{slug}}/plan.json` 里本知识点及它 `decision` 指向的那条 `design.decisions`，读 `{{learn_root}}/{{slug}}/sections/00_overview.md`
+了解本章在全局的位置；涉及源码的，自己读 evidence 行号区间（不许凭记忆）。
+
+返工：读 `{{learn_root}}/{{slug}}/feedback.md`（不存在按 MODE: FULL）。`MODE: PATCH` 且有 `## {{item_id}}` 分组时，只在已有文件上
+**增补**这几节里与意见相关的内容（原有段落、`file:line` 出处、代码摘录一律保留）；意见和这几节无关就只输出
+`UNCHANGED`。引擎会核对出处和篇幅，改坏了会还原。
+
+## 9. 总结与下一步（9_summary.md）
+- 3 条以内的要点：问题 → 选了什么 → 代价；
+- 下一步：本章留下了什么矛盾或没覆盖的问题，引出下一章（按 00_overview.md 的学习路径，链接 `[标题](<下一章id>.md)`）；
+  这是最后一章就写延伸阅读（相关源码文件、测试）。
+不复述前面各节的细节。
+
+通用纪律：
+- 只写能从源码/测试/文档推出来的数（字节数、锁个数、循环次数，写出算式）；**不许编造吞吐、延迟、百分比**；
+- 依据来自源码注释/测试/文档，无依据标「[推测]」；
+- mermaid：第一行写图类型；节点 id 只用字母数字下划线，**标签一律加双引号**（`A["arena->bins[i]"]`），
+  单图 ≤ 15 个节点。
+- 讲内存怎么摆（页/格子/偏移/字段指针）用 ```memlayout 块，不要用 mermaid 硬画字节布局。语法每行一条：
+  `lane <id> "说明"`（一行内存）、`cell <id> <大小> <used|free|meta|data|pad> "标签"`、`gap <大小> "省略说明"`、
+  `ptr <lane>.<cell> -> <lane>.<cell> "说明"`；`@偏移` 只用来核对，必须等于前面各格大小之和（跳过的字节写成 `gap`）；
+  引擎校验后渲染成 SVG，写错会带行号打回。
+  **画之前先读源码核实**：每个格子、每条 `ptr` 都要能指到一处源码（宏、`sizeof`、地址/偏移是怎么算出来的那一行），
+  不许凭通用教科书模型想当然。最容易画错的是「元数据内嵌在数据区里，还是放在别的结构里」——以源码里**地址怎么算出来**为准
+  （如 `base + idx * size` 说明数据区没有头部），元数据在别处就画成独立 lane、用 `ptr` 指向数据格。
+  引擎会对账：行说明/标题里写了 `= N KiB` 的总数必须等于格子之和；数据格和元数据格画在同一行，行说明里必须写 `file:line`；对不上带原因打回。
+写完 write 落盘，正文一句话说明写了哪几节。"""
+
+[steps.fan_out]
+file = "{{learn_root}}/{{slug}}/plan.json"
+items = "knowledge_points"
+id_key = "id"
+max_items = 32
 tolerate_failures = true

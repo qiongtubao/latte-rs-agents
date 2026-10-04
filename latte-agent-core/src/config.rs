@@ -611,12 +611,12 @@ pub struct ModelCatalog {
 /// Compatible with `latte-rs-model-router/models.toml` format, extended with
 /// optional `tier`, `supports_thinking`, and `timeout_secs` fields.
 ///
-/// `timeout_secs` sets an optional per-turn wall-clock budget. Resolution
-/// order:
-/// 1. `model.timeout_secs` from this field (per-model override)
-/// 2. Controller-specific env var (`LATTE_AGENT_TURN_TIMEOUT_SECS` or
-///    `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`)
-/// 3. No controller-level timeout
+/// `timeout_secs` is a **streaming** timeout for this model (first token and
+/// gap between SSE chunks; read by `latte-ai`, overrides
+/// `LATTE_AI_FIRST_EVENT_TIMEOUT_SECS` / `LATTE_AI_IDLE_TIMEOUT_SECS`). It is
+/// not a per-turn wall-clock budget: how long a delegate / workflow step may
+/// run is bounded by request-count budgets (`workflow::STEP_BUDGET_TIERS`)
+/// plus a global backstop (`LATTE_AGENT_DELEGATE_TIMEOUT_SECS`, default 3h).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDef {
     /// Model identifier — 同时是 API 请求里的 `model` 字段与 UI 显示名。
@@ -704,10 +704,10 @@ pub struct ModelDef {
     /// Which tier this model belongs to (for auto-resolution without explicit tier map).
     #[serde(default)]
     pub tier: Option<String>,
-    /// Per-specialist wall-clock timeout (seconds) for the `delegate` tool.
-    /// Default: 60s if not set; can be overridden per-model and via
-    /// `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`. Used by slow models (e.g. GLM 5.2
-    /// on 8-step tasks) that need a longer budget than the global default.
+    /// 流式超时（秒）：首 token 与 SSE chunk 间隔，精确覆盖 `LATTE_AI_*` 环境变量。
+    /// 慢速 reasoning 模型可以放宽（如 300），已知秒回的模型可以收紧做快速失败。
+    /// **不是**整个 turn 的总时长——此前 delegate 路径把它复用成总时长，
+    /// 配大配小都会误伤另一边，已拆开。
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }

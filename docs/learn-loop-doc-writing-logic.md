@@ -33,7 +33,10 @@ plan ─► annotate ─► doc_review ─► [引擎装配draft.md] ─► read
 
 ## 3. 产物目录：每个文件谁写、谁读
 
-根目录 `.latte/learn/<slug>/`（只有定稿在 `docs/learn/`）：
+学习工作区在**会话目录**下：`.latte/sessions/<会话id>/learn/<slug>/`（模板变量 `{{learn_root}}/<slug>`；
+没有会话 id 的独立 run 退回 `.latte/learn/<slug>/`）。学习过程的中间产物都只在这里，任务完成时由 merge
+发布到项目的 `docs/learn/`。同一任务换会话重跑时，plan 步开跑前引擎把旧位置或其它会话里同一任务
+（按看板编号前缀）/ 同一主题的工作区**拷贝**进本会话，进度（round / wrong / passed）与已写章节接着用：
 
 | 文件 | 谁写 | 谁读 | 作用 |
 |---|---|---|---|
@@ -45,7 +48,8 @@ plan ─► annotate ─► doc_review ─► [引擎装配draft.md] ─► read
 | `feedback.md` | outline | 各 writer | 本轮是全量重写还是局部修补，及按章分组的意见 |
 | `sections/<kid>.md` | 每个 writer 各写一个 | proofread、引擎装配 | 一个知识点一章正文 |
 | `draft.md` | **引擎装配**（writer 不写） | 学员、merge | 学员阅读的整篇文档 |
-| `docs/learn/<slug>.md` | merge | — | 最终交付 |
+| `img/ml-<hash>.svg` | **引擎渲染**（来自 ```memlayout 块） | 学员、merge | 内存布局图 |
+| `docs/learn/<主题名>.md` + `docs/learn/<主题名>/` | merge（引擎） | — | 最终交付 + 它引用的章节/副本/图 |
 
 `plan.json` 每个知识点的字段：`id`、`title`、`evidence`(file:line)、`teach_points`、`example`、
 `doc_section`、`question`、`options`(4 项)、`answer`。`ledger.json`：`{round, knowledge_points:[{id,wrong,passed}], supplements, _graded_answers}`。
@@ -78,7 +82,7 @@ plan ─► annotate ─► doc_review ─► [引擎装配draft.md] ─► read
 引擎把 `slug`、`draft`、`plan`、`ledger` 路径作为 topic 传入。内部分三个 wave：
 
 ```
-wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proofread ──┐
+wave0 outline ──► 章节分节写作 5 阶段 ×N（§3.2）──► wave2 proofread ──┐
     ▲                                                                  │
     └──────────────── NEEDS_FIX（最多 3 轮）◄──────────────────────────┘
                                           LOOKS_CLEAR → 返回外层
@@ -103,32 +107,40 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
      `## overview` 组代表全局意见：outline 当场改 `00_overview.md` 与 `index.md`。
    - outline **不许**自己改 `sections/k*.md`。
 
-#### 3.2 write_chapter：章节 writer（引擎 fan_out 并发）
+#### 3.2 章节分节写作：结构由引擎持有（5 个 fan_out 阶段）
 
-- 引擎读 `plan.json` 的 `knowledge_points`，**每个知识点派发一个 writer**（`max_items=32`）。
-  并发度由 `LATTE_WORKFLOW_CONCURRENCY` 控制（缺省 4），超出的排队，有空位补下一个。
-- 每个 writer 只知道自己是哪一章（`{{item_id}}`、`{{item_index}}`）。
-- **写权限被引擎锁死**：`write_path_allowlist = [.latte/learn/{{slug}}/sections/{{item_id}}.md]`，
-  写别的路径会被工具层拒绝（有单测 `write_path_allowlist_confines_writes_to_the_rendered_scope`）。
-- `tolerate_failures = true`：某章失败不拖垮其他章，该章产出以 `FAN_OUT_ITEM_FAILED` 开头，审稿按缺章判 BLOCKER。
-- writer 的决策表（先读 `feedback.md`，不存在按 `MODE: FULL`）：
+一章固定 9 节，每节一个文件 `sections/<k_id>/<n>_<key>.md`。章节写作拆成 5 个阶段，
+每个阶段都是按 `plan.json` 的 `knowledge_points` 每章派发一次的 fan_out step：
 
-  | feedback 状态 | 本章文件 | 行为 |
-  |---|---|---|
-  | `MODE: PATCH`，无 `## <本章id>` 组 | 已存在 | 只输出 `UNCHANGED`，不动文件 |
-  | `MODE: PATCH`，有 `## <本章id>` 组 | 已存在 | 只按这些意见局部修改 |
-  | `MODE: FULL` | 任意 | 整章重写（旧文件仅参考，不好就推倒） |
+```mermaid
+flowchart LR
+  O["outline"] --> F["ch_frame<br/>1 问题与背景 · 2 目标与预期结果"]
+  F --> P["ch_options<br/>3 多个解决方案 · 4 方案优缺点对比"]
+  P --> D["ch_design<br/>5 推荐方案与原理 · 6 代码详解"]
+  P --> U["ch_usage<br/>7 使用示例 · 8 常见问题与排查"]
+  D --> W["ch_wrap<br/>9 总结与下一步"]
+  U --> W
+```
 
-- 写前必须：读 `00_overview.md`（对齐比喻与本章位置）；**自己读 evidence 行号区间**，
-  不许凭记忆、不许沿用旧章里未核对的说法。
-- 每章 7 段，依次回答：
-  1. 它是什么 / 要解决什么问题（承接总览比喻，术语首现即解释）；
-  2. 作者的设计与动机（依据只能是源码注释/文档/实现的必然性，无依据标 `[推测]`）；
-  3. 备选方案与取舍（表格「方案/好处/坏处」，数值级具体，含设计代价与失效场景）；
-  4. 怎么存 / 怎么运转（物理布局或调用链 + ASCII 图）；
-  5. 真实源码（**原文**片段 + `file:start-end` + 行内中文注释；禁止「简化版」「…省略」「伪代码」）；
-  6. 最小示例（输入→每步中间值→输出，算式自己重算）；
-  7. 本章小结与承上启下（引出下一章矛盾）。
+「先讲问题、再列方案、再对比、最后讲原理和代码」由流程保证，不靠 prompt：
+
+| 机制 | 作用 |
+|---|---|
+| `write_path_allowlist` 只放行本阶段的节 | 写方案对比的阶段物理上写不了代码详解，不会把节挤在一起 |
+| 引擎注入 `{{chapter_so_far}}`（本章前面已写好的节） | 写对比时一定看得到方案，写代码时一定看得到对比结论 |
+| 阶段结束逐节检查（`check_chapter_stage`），不过带原因重试 | 缺节；方案 < 2 个或没有草图；对比表 > 一半单元格是纯形容词；原理节没图；代码节没代码块或没 `file:line`；示例节没代码；FAQ < 2 条；mermaid 首行不是图类型 / 标签含特殊字符没加引号 / 引号不成对 |
+| 装配时引擎写 `## 章名` + `### n. 节名`、按 1→9 拼接 | 节的顺序和标题不可能漂移；writer 自写的重复标题被剥掉；缺的节不出空标题 |
+
+- 节检查重试用完按现稿放行并发 Status：一节不够好不值得让整章变成 `FAN_OUT_ITEM_FAILED`。
+- 装配结果写回 `sections/<k_id>.md`，所以 index 链接、merge、旧的返工基线都照旧。
+  没有分节目录的旧章节仍按整章文件装配。
+- 返工（`MODE: PATCH` 且点名本章）：5 个阶段都只派发被点名的章；已有的节抓基线，
+  改坏（删出处 / 篇幅缩到六成以下）就还原并重试；与意见无关的阶段回 `UNCHANGED`。
+  旧章节没有分节目录时，返工按首写处理——借返工迁移到 9 节结构。
+- 素材来源：plan 步的每个决策必须带 `scenario`（带具体输入的场景）、`dimensions`（≥2 个可数的比较维度）、
+  `chosen_walkthrough`、各替代方案的 `walkthrough`，至少一个替代方案带 `wins_when`
+  （翻转条件），由 `check_learn_plan_design` 机械校验。第 3、4 节就是照着它们展开的。
+- 代价：每章模型调用从 1 次变成 5 次（每次范围更小、上下文更短），阶段之间有 wave 屏障。
 
 #### 3.3 proofread：审稿员，只读不改，对照源码核查
 
@@ -167,11 +179,26 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
 4. 找章文件：先 `<id>.md`，找不到再匹配 `<id>_*`、`*_<id>`；空文件跳过；
 5. 装配时剥掉符号索引 mermaid（节点多数是 `fn xxx` / `struct xxx`），数据流图保留；
 6. 各段之间以 `\n\n---\n\n` 分隔，整体覆盖写 `draft.md`；全空则不写。
+7. **相对链接改基准**：节文件在 `sections/<id>/`、章与总览在 `sections/`，各自写的相对链接（`k2.md`、
+   `../00_overview.md`）拼进上层文件时改写成相对新位置（`draft.md` 里是 `sections/k2.md`）。节里的章节互链
+   按约定写 `k2.md`，在节目录下找不到时按 `sections/` 兜底解析。代码块、行内代码、URL、锚点不动。
+   此前不改写：draft 里的 `[k1](k1.md)` 指向不存在的 `<slug>/k1.md`，大窗里点开 404。
+8. **memlayout → SVG**：```memlayout 块（`lane` / `cell` / `gap` / `ptr` 四种指令）渲染成
+   `img/ml-<源码哈希>.svg`，正文换成图片链接；节文件里保留源码，返工改的仍是文本。写作阶段
+   `check_chapter_part` 先校验语法（错误带行号打回），并把它算作「图」。写作期另查**偏移连续性**：`@偏移` 必须等于前面各格大小之和
+   （跳过的字节要写成 `gap`，重叠说明大小算错）；渲染时不拦，已写好的图照常出 SVG。
+   另查**图自己的声明**（`memlayout_claim_problems`）：行说明里的 `= N KiB` 必须等于这一行格子之和，
+   标题里的 `= N KiB` 至少等于某一行的总长；数据格（used/free/data）和元数据格（meta）画在同一行、
+   行说明里又没有 `file:line` 出处时打回（这是在断言「元数据内嵌在数据区里」，最容易画错）。
+   `outline` 步写的 `00_overview.md` 也走同一套检查（只在本步改动过文件时查）。
+   装配后清掉不再被引用的 `img/ml-*.svg`。
 
 ### 步骤 5：read_confirm —— 等学员读完（引擎）
 
 - 弹一个只有一项「开始答题，验证掌握程度」的窗口，窗口里直接渲染 `draft.md` 内容；
-- 题面：`学习材料（第 {round+1} 版）：.latte/learn/<slug>/draft.md。读完了吗？`；
+- 题面：`学习材料（第 {round+1} 版）：<learn_root>/<slug>/draft.md。读完了吗？`；
+- 卡片里的文档按 `document_path` 所在目录解析相对链接；「大窗查看」里点嵌套 md 在同一窗口打开，带「← 返回」；
+  `/api/doc`、`/api/doc-asset` 放行 `.latte/sessions/<sid>/learn/` 子树（会话目录其它内容不暴露）；
 - 引擎先查 `AnswerLog.recall(题面)`：**题面文本相同则直接回放上次答案，不弹窗**。
 
 ### 步骤 6：quiz —— 判分（引擎，确定性）
@@ -197,9 +224,14 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
 
 ### 步骤 8：merge、sync_code、report
 
-- **merge**（read+write）：把补充融入正文并归位、「易错点辨析」润色保留；重排、生成目录、去重、清过程痕迹
-  （「第几版」「本轮新增」）；保留全部 `file:line`、代码摘录、` ```mermaid ` 块、`code/` 引用；
-  文末加「注释版代码副本」索引；写 `docs/learn/<slug>.md`，`draft.md` 保留作存档。
+- **merge**（引擎确定性，不调模型）：`finalize_learn_doc` 把装配好的 draft 加标题、目录，有注释副本则文末附索引；
+  定稿名 = slug 去掉看板任务编号（`lat-110-jemalloc-size-class` → `jemalloc-size-class`），写
+  `docs/learn/<主题名>.md`；定稿引用的文件**及其传递闭包**（章节 md 里再链到的章/图/副本）拷到
+  `docs/learn/<主题名>/`（目录带 `.latte-learn-assets` 标记，每次定稿整体重建），链接改指那里——
+  定稿不依赖会话目录。只拷闭包不拷整目录：工作区跨会话沿用，`sections/` 里留着旧 plan 的章
+  （实测 LAT-110：plan 从 7 点变 4 点后 k5–k7、appendix 还在）。
+  写完按出处/图数/篇幅自检。
+  早先由模型整篇重写；9 节结构下实测 4 章 draft 191KB，一次 write 远超模型输出上限。
 - **sync_code**（可选，主题含「同步注释」/「写进源码」才跑）：`edit` 把注释写进真实源码，
   只改注释、以代码原文为锚点，找不到锚点就跳过并说明。会修改仓库，建议开 isolated worktree。
 - **report**（只读）：输出掌握进度 X/Y、答错次数、补充清单、交付路径。
@@ -217,6 +249,7 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
 | 返工范围失控 | `feedback.md` 按章分组 + `UNCHANGED` |
 | 审稿无限循环 | `max_iterations=3`；外层 quiz/supplement 各 10 |
 | 上下文爆掉 | `prompt_token_ratio` + 自动重启 |
+| 图与自己的说明/格子对不上 | `memlayout_claim_problems`（声明总数对账、内嵌元数据要出处），章节各节与总览都查 |
 
 ## 6. 一次完整示例（3 个知识点 k1/k2/k3）
 
@@ -258,3 +291,33 @@ wave0 outline ──► wave1 write_chapter ×N（并发）──► wave2 proof
    `doc_review_loop` 的 outline prompt 要求把该块原样抄进 `feedback.md`。
    验证：单测 `quiz_feedback_groups_wrong_points_by_chapter_id`；未做端到端实跑。
    残余风险：抄录仍由 outline 模型执行，只是不再需要它判断章 id。
+3. **方案对比讲不透、原理与代码挤在一起（已改为流程约束）**。单个 write_chapter 一次写整章时，
+   prompt 里列的 7 段要求在产出里退化：对比表全是「灾难级 / 极低 / 极佳」，配了编造的性能数字
+   （「暴跌至单核的 10%」），全景图的 mermaid 标签 `arena->bins[bin_ind]` 没加引号、页面渲染失败
+   （实测 jemalloc `lat-111-jemalloc-arena`）。修复见 §3.2：拆成 5 个阶段 × 9 节、引擎持有结构与检查。
+   验证：对该实测文档跑新检查，overview 报出 5 处未加引号标签，k1-k4 均报缺方案对比各节、0 张图；
+   单测 `chapter_part_checks_are_mechanical_per_section` 等。未做端到端实跑。
+4. **端到端实跑（2026-10-02，主题 choice.rs resolve/resolve_one，glm-5.3）暴露的问题（已修复）**：
+   - plan 被打回后**整轮重新取证**（单次 ~9 分钟）：批注改为「plan.json 保留原处，只改点名字段」；
+   - evidence 写成 `src/choice.rs:255-317, 606-608`，续写段被判格式错误：续写行号沿用前一个文件（`split_learn_evidence`）；
+   - 重试时模型在 slug 前加一句说明，被 60 字符契约打回又白跑一轮：取末行 slug（`trailing_slug`）；
+   - 对比深度（wins_when 等）卡死 plan 的风险：重试用完时只放行深度项，证据/题目错误仍判死；
+   - merge 让模型重写 191KB 定稿必然截断：改为引擎定稿；
+   - 总览小节与章名同为 `##`，定稿目录混排：总览挂到「全局总览」下并降级。
+   实测结果：4 章 × 9 节全部按序装配，逐节检查一次通过（无重试），22 张 mermaid 全部通过 mermaid.parse；
+   对比表单元格为具体值。耗时：plan 18 分钟（3 次尝试）、annotate 2.5 分钟、文档 5 阶段 28 分钟。
+5. **图文不一致：总览里的内存布局图多画了一块不存在的内嵌头部（已加机械对账，语义层仍有缺口）**。
+   实测 jemalloc `lat-110`：总览的 slab 图画成「1 KiB 位图元数据头 + 14 KiB 槽 0 + 14 KiB 槽 1」（共 29696 B），
+   而行说明写「7 个 4KB 页 = 28 KiB」，各章里同主题的图也是 28672 B、无头部。源码事实：
+   `arena_slab_reg_alloc` 用 `edata_addr_get(slab) + reg_size * regind` 算地址（`src/arena.c:235-237`），
+   位图在带外的 `edata_t.e_slab_data`（`edata.h:246`），slab 数据页就是 `nregs × reg_size` 一整块。
+   漏网原因：(a) `outline` 步没有任何质量门，总览里的图连语法都没被 lint；(b) 现有检查只看语法和 `@偏移` 连续，
+   这张图格子自己加起来是连续的；(c) 总览先于各章写成，之后没有环节回头核对图与图、图与文；(d) 审稿步已移除，
+   没有任何环节拿图去对源码。
+   修复：`memlayout_claim_problems`（声明总数对账 + 内嵌元数据要 `file:line`）接入 `lint_memlayout_blocks`，
+   章节各节与 `outline` 写的总览都走它；writer prompt 要求画之前读源码核实地址/偏移怎么算。
+   验证：对该工作区的 8 个真实 memlayout 块跑新检查，只命中总览那 1 个（命中原因：声明 28672 B、格子 29696 B），
+   其余 7 个零误报；单测 `memlayout_claims_*`、`overview_figures_are_linted_with_claim_check`。未做端到端实跑。
+   **残余缺口（机械检查做不到的）**：声明与格子自洽、又给了一个看似合理的 `file:line`，但结构本身画错，
+   仍会漏过去——出处只做格式检查，不核对内容；图与正文其它位置的数值（如 232 vs 235、4096 vs 8192）互相矛盾也不查。
+   补这一层需要独立于 writer 的「图文核对」审稿（拿图里每个 cell/ptr 对源码），代价是重新引入一个会拖慢学员的环节，见讨论。

@@ -69,4 +69,33 @@ describe("doc_viewer", () => {
     );
     host.remove();
   });
+
+  it("大窗里点嵌套 md：按当前文档目录解析、可返回上一篇", async () => {
+    installDocLinkHandler();
+    const draft = ".latte/sessions/ui-1/learn/own/draft.md";
+    fetchMock.mockImplementation(async (url: string) => ({
+      ok: true,
+      text: async () =>
+        url.includes("draft.md") ? "# 总\n\n[第一章](sections/k1.md)\n" : "# 第一章\n\n[下一章](k2.md)\n",
+    }));
+    await openDocViewer(draft);
+    await flush();
+    const link = document.querySelector<HTMLAnchorElement>(".doc-viewer-content a.doc-link")!;
+    expect(link.dataset.docPath).toBe(".latte/sessions/ui-1/learn/own/sections/k1.md");
+    expect(document.querySelector<HTMLButtonElement>('[data-act="back"]')!.hidden).toBe(true);
+    link.click();
+    await flush();
+    expect(document.querySelectorAll(".doc-viewer").length).toBe(1);
+    expect(document.querySelector(".doc-viewer-path")!.textContent).toBe(
+      ".latte/sessions/ui-1/learn/own/sections/k1.md",
+    );
+    const next = document.querySelector<HTMLAnchorElement>(".doc-viewer-content a.doc-link")!;
+    expect(next.dataset.docPath).toBe(".latte/sessions/ui-1/learn/own/sections/k2.md");
+    const back = document.querySelector<HTMLButtonElement>('[data-act="back"]')!;
+    expect(back.hidden).toBe(false);
+    back.click();
+    await flush();
+    expect(document.querySelector(".doc-viewer-path")!.textContent).toBe(draft);
+    expect(document.querySelector<HTMLButtonElement>('[data-act="back"]')!.hidden).toBe(true);
+  });
 });

@@ -372,6 +372,23 @@ describe("ask 选择框弹窗", () => {
     expect(submitBtn().disabled).toBe(false);
   });
 
+  it("卡片里的文档链接相对文档所在目录解析（嵌套 md / 图片不 404）", () => {
+    const { chat } = mount();
+    chat.handleEvent(
+      choiceEvent({
+        document_path: ".latte/sessions/ui-1/learn/own/draft.md",
+        document_markdown: "[第一章](sections/k1.md)\n\n![布局](img/ml-1.svg)",
+      }),
+    );
+    const body = cardInOverlay()!.querySelector(".choice-doc-body")!;
+    expect(body.querySelector<HTMLAnchorElement>("a.doc-link")!.dataset.docPath).toBe(
+      ".latte/sessions/ui-1/learn/own/sections/k1.md",
+    );
+    expect(body.querySelector("img")!.getAttribute("src")).toBe(
+      `/api/doc-asset?path=${encodeURIComponent(".latte/sessions/ui-1/learn/own/img/ml-1.svg")}`,
+    );
+  });
+
   it("多题弹框也渲染附带文档；不带 document_markdown 时零侵入", () => {
     const { chat } = mount();
     chat.handleEvent(

@@ -89,12 +89,30 @@ pub enum AgentError {
         /// 熔断时模型已产出的正文（可能为空）。
         partial: String,
     },
+    #[error("request budget exceeded: {requests} model requests (budget {budget}){}", last_tool.as_ref().map(|t| format!(", last tool: {t}")).unwrap_or_default())]
+    /// 本 turn 的模型请求次数用完了请求预算（见 `AgentRunner::set_request_budget`）。
+    /// 达到软预算时 runner 已注入过「立即收尾」提示；仍未收尾、到硬上限才报这个。
+    /// 与 `DeadlineExceeded` 同样带 `partial`，调用方按截断降级采纳。
+    RequestBudgetExceeded {
+        requests: usize,
+        budget: usize,
+        last_tool: Option<String>,
+        partial: String,
+    },
     /// Wall-clock deadline exceeded before completion.
     #[error("deadline exceeded after {elapsed_secs}s ({tool_rounds} tool rounds){}", last_tool.as_ref().map(|t| format!(", last tool: {t}")).unwrap_or_default())]
     DeadlineExceeded {
         elapsed_secs: u64,
         tool_rounds: usize,
         last_tool: Option<String>,
+        /// 截止时模型已产出的最后一段正文（可能为空）。
+        ///
+        /// 截止截断**一律**报这个错误，不再把 partial 当成正常回复返回：
+        /// 截止往往发生在工具循环中途，最后一段正文是「再补读三个片段……」
+        /// 这类过程性旁白，当成 `Ok` 交出去，下游契约校验会拿它报一个
+        /// 与真实原因（超时）毫不相干的错误（实测：annotate 步 904s 截断，
+        /// 被判「缺少 code/」重试）。调用方据此自行决定降级采纳并标注截断。
+        partial: String,
     },
 
     /// Invalid parameter.

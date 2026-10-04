@@ -281,6 +281,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 output_key: s.output_key.clone(),
                 depends_on: vec![],
                 max_retries: 0,
+                // 请求预算档位只在 TOML 权威版可配；试运行走默认档。
+                budget: None,
+                max_requests: None,
                 context_overflow_restart: s.context_overflow_restart,
                 context_overflow_max_restarts: 2,
                 context_overflow_files: vec![],

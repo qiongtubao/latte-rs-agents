@@ -79,7 +79,7 @@ def sse_reader(url):
             events.put({"type": "__sse_error__", "error": str(e)})
 
 
-def wait_doc_then_proofread(timeout=1800):
+def wait_doc_then_proofread(timeout=int(os.environ.get("LEARN_E2E_TIMEOUT", "1800"))):
     """等到章节写完、学员可以开始答题。
 
     返回 (doc_content, "", "STUDENT")。放行条件是 read_confirm 弹窗，
@@ -99,7 +99,7 @@ def wait_doc_then_proofread(timeout=1800):
         if t == "WorkflowStep":
             log(f"── step {ev.get('index')}/{ev.get('total')}: {ev.get('step_id')}")
             continue
-        if t == "WorkflowFinished":
+        if t == "WorkflowFinished" and ev.get("name") == "learn_loop":
             fail(f"workflow 提前结束（学员确认前）：{ev.get('summary', '')[:200]}")
         if t == "WorkflowTurn":
             sid = ev.get("step_id")

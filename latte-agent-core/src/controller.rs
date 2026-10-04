@@ -81,6 +81,9 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other {
             message: format!("tool loop: {tool}"),
         },
+        AgentError::RequestBudgetExceeded { requests, budget, .. } => ModelErrorKind::Other {
+            message: format!("request budget exceeded ({requests} requests, budget {budget})"),
+        },
         AgentError::DeadlineExceeded {
             elapsed_secs,
             tool_rounds,
@@ -8745,12 +8748,20 @@ pub(crate) async fn gate_delegate_return(
     (out, Some(verdict))
 }
 
-/// UI/controller 路径 delegate 的默认 wall-clock 超时（秒）。
-/// 与 CLI 的 `DEFAULT_DELEGATE_TIMEOUT_SECS` 同值（900s）：慢速厂商模型
-/// 下一次深读/写文档的 specialist 多轮往返，300s 级超时只会误杀重跑。
-/// 解析顺序对齐 CLI（chat.rs）：
-/// `model.timeout_secs` > env `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` > 本值。
-pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
+/// specialist（delegate / workflow step）墙钟**兜底**的默认值（秒）：3 小时。
+///
+/// 此前是 900s，而且是「这一步该收手了」的唯一判据：慢模型单次调用 455s，
+/// 两三轮就撞线，正在干活的 step 被砍、重试、再被砍（实测 LAT-110 annotate
+/// 三次全部超时）。现在常规收手由**请求次数预算**判定（见
+/// `workflow::STEP_BUDGET_TIERS` 与 `AgentRunner::set_request_budget`），后端
+/// 挂死由流式首 token / 空闲超时秒级发现，墙钟只防真正的失控。
+/// env `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` 覆盖。
+pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 3 * 3600;
+
+/// workflow step 的 `TimeoutWarning` 复发周期（秒）：只提醒用户「这一步
+/// 跑了很久」，不杀。与兜底墙钟分开——墙钟放宽到小时级后，提醒仍要按
+/// 原来的节奏出现。env `LATTE_AGENT_STEP_WARN_SECS` 覆盖。
+pub(crate) const DEFAULT_STEP_WARN_SECS: u64 = 900;
 
 /// 编排类工具（`workflow` / `delegate` / 阻塞 `ask`）的单次调用超时。
 ///
@@ -8780,16 +8791,39 @@ pub(crate) const DEFAULT_UI_DELEGATE_TIMEOUT_SECS: u64 = 900;
 /// manager 依错误提示 resume 又是 25min，两次空等 50 分钟零产出。
 pub const ORCHESTRATION_TOOL_TIMEOUT_SECS: u64 = 86_400;
 
-/// Specialist 的 wall-clock 超时（秒）。`model_timeout` 是模型目录里
-/// 的 per-model `timeout_secs`（workflow 路径拿不到模型 id，传 None）。
-pub(crate) fn specialist_timeout_secs(model_timeout: Option<u64>) -> u64 {
-    model_timeout
-        .or_else(|| {
-            std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
+/// Specialist 的墙钟兜底（秒）：env `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` > 默认 3h。
+///
+/// 不再读模型目录的 `timeout_secs`：那个字段是**流式**超时（首 token / chunk
+/// 间隔，latte-ai 读它），此前这里把它当成整个 turn 的总时长复用，配大配小都
+/// 会误伤另一边（想给慢模型放宽总时长，首 token 超时也跟着变成半小时）。
+pub(crate) fn specialist_timeout_secs() -> u64 {
+    // 单测用 task-local 覆盖（见 tests::TEST_SPECIALIST_TIMEOUT），不改全局 env。
+    if let Some(v) = test_specialist_timeout_override() {
+        return v;
+    }
+    std::env::var("LATTE_AGENT_DELEGATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_UI_DELEGATE_TIMEOUT_SECS)
+}
+
+fn test_specialist_timeout_override() -> Option<u64> {
+    if cfg!(test) {
+        test_hooks::specialist_timeout()
+    } else {
+        None
+    }
+}
+
+/// workflow step `TimeoutWarning` 的复发周期（秒），不超过兜底墙钟。
+pub(crate) fn specialist_warn_secs() -> u64 {
+    std::env::var("LATTE_AGENT_STEP_WARN_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_STEP_WARN_SECS)
+        .min(specialist_timeout_secs())
 }
 
 /// `register_delegate_tool` 的**类型擦除**入口，专门给递归调用用。
@@ -9080,13 +9114,10 @@ async fn register_delegate_tool(
             let models = resolver
                 .resolve_chain(&role.id, tier, &chain_ids)
                 .map_err(|e| tool_err(format!("no model for role '{}': {}", role_id, e)))?;
-            // 熔断：delegate wall-clock 超时。解析顺序对齐 CLI
-            // （chat.rs）：model.timeout_secs > env > UI 默认 900s。
+            // 熔断：墙钟兜底（env > 3h），常规收手靠请求次数预算。
             // 实测事故：无超时 → estimate 步骤的 programmer
             // 盲改循环 24min，父 workflow 被无限期吊住。
-            let timeout_s = specialist_timeout_secs(
-                resolver.get_def(&models[0].id).and_then(|d| d.timeout_secs),
-            );
+            let timeout_s = specialist_timeout_secs();
 
             // 2. Allocate a subsession so the specialist's full event
             //    log is captured. The main chat SSE stream sees only
@@ -9308,6 +9339,7 @@ async fn register_delegate_tool(
             runner.set_deadline(
                 std::time::Instant::now() + std::time::Duration::from_secs(timeout_s),
             );
+            runner.set_request_budget(crate::workflow::delegate_request_budget());
             let delegate_started = std::time::Instant::now();
             let mut run_handle = tokio::spawn(async move {
                 // gated 版：装了 gate_config 时产出先过 D5/D6；
@@ -9367,6 +9399,30 @@ async fn register_delegate_tool(
                                             "subagent failed: 检测到工具死循环（'{tool}' 反复调用）。\
                                              以下是它被中止前已产出的未收尾内容，请据此决定\
                                              「缩小范围重派」还是「让它接着收尾」，不要原样重派：\n\n{stripped}"
+                                        )));
+                                        break;
+                                    }
+                                }
+                                // 截止截断同理：已有正文就一并回喂，并说明它是
+                                // 被时限截断的半成品，不是结论。
+                                if let AgentError::RequestBudgetExceeded { requests, budget, partial, .. } = &e {
+                                    let stripped = strip_think_blocks(partial);
+                                    if !is_empty_output(&stripped) && !is_only_think_blocks(partial) {
+                                        result = Err(tool_err(format!(
+                                            "subagent failed: 用完了请求预算（{requests} 次模型调用，预算 {budget}），\
+                                             收尾提示后仍没有收尾。以下是中止前最后一段正文（可能只是过程旁白），\
+                                             请据此「缩小范围重派」或「拆步」，不要原样重派：\n\n{stripped}"
+                                        )));
+                                        break;
+                                    }
+                                }
+                                if let AgentError::DeadlineExceeded { elapsed_secs, partial, .. } = &e {
+                                    let stripped = strip_think_blocks(partial);
+                                    if !is_empty_output(&stripped) && !is_only_think_blocks(partial) {
+                                        result = Err(tool_err(format!(
+                                            "subagent failed: 执行超时（已运行 {elapsed_secs}s），被时限截断、没有收尾。\
+                                             以下是截断前最后一段正文（可能只是过程旁白，不是结论），请据此决定\
+                                             「缩小范围重派」还是「拆步」，不要原样重派：\n\n{stripped}"
                                         )));
                                         break;
                                     }
@@ -9923,6 +9979,11 @@ fn role_icon(role_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    tokio::task_local! {
+        /// 单测用：在当前 task 内覆盖墙钟兜底，避免改全局 env 与并行测试互相干扰。
+        pub(crate) static TEST_SPECIALIST_TIMEOUT: u64;
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -14094,8 +14155,10 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
-        // 模型端永不返回（30s 延迟），model.timeout_secs=1 → delegate
-        // 必须在 ~1s 被熔断：tool error + DelegateFinished status=timeout。
+        // 模型端永不返回（30s 延迟），墙钟兜底 env=1s → delegate 必须在
+        // ~1s 被熔断：tool error + DelegateFinished status=timeout。
+        // （per-model `timeout_secs` 现在只管流式超时，不再是总时长。）
+
         // 回归：实测事故前 controller delegate 无 wall-clock 超时，
         // 失控子代理把父 workflow 吊死 24min。
         let server = wiremock::MockServer::start().await;
@@ -14133,7 +14196,7 @@ mod tests {
                     cost_per_million_input: None,
                     cost_per_million_output: None,
                     tier: Some("standard".into()),
-                    timeout_secs: Some(1),
+                    timeout_secs: None,
                 }],
                 tiers: None,
                 role_tiers: None,
@@ -14186,10 +14249,13 @@ mod tests {
 
         let err = tokio::time::timeout(
             std::time::Duration::from_secs(15),
-            tm.execute(
-                "delegate",
-                serde_json::json!({ "role": "programmer", "task": "写一份永远写不完的文档" }),
-                None,
+            TEST_SPECIALIST_TIMEOUT.scope(
+                1,
+                tm.execute(
+                    "delegate",
+                    serde_json::json!({ "role": "programmer", "task": "写一份永远写不完的文档" }),
+                    None,
+                ),
             ),
         )
         .await
@@ -14221,12 +14287,8 @@ mod tests {
         // `DEFAULT_SPECIALIST_MAX_TOOL_ROUNDS`）：值读出来只是存进
         // `AgentRunner.max_tool_rounds`，从不被读取。现在只剩 wall-clock
         // 超时这一路熔断。
-        assert_eq!(
-            specialist_timeout_secs(None),
-            DEFAULT_UI_DELEGATE_TIMEOUT_SECS
-        );
-        // per-model timeout_secs 优先级最高。
-        assert_eq!(specialist_timeout_secs(Some(120)), 120);
+        assert_eq!(specialist_timeout_secs(), DEFAULT_UI_DELEGATE_TIMEOUT_SECS);
+        assert_eq!(specialist_warn_secs(), DEFAULT_STEP_WARN_SECS);
     }
 
     #[tokio::test]
@@ -16845,7 +16907,7 @@ require = ["永远不可能出现的验收字符串"]
             let p = d.path().join(file);
             let src = std::fs::read_to_string(&p).expect("读 fixture");
             let src_lines: Vec<&str> = src.lines().collect();
-            let out = cg_call(serde_json::json!({
+            let out = cg_call_holding_lock(serde_json::json!({
                 "path": p.to_str().unwrap(), "kind": "function"
             }))
             .await
@@ -17815,6 +17877,16 @@ require = ["永远不可能出现的验收字符串"]
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        cg_call_holding_lock(args).await
+    }
+
+    /// 调用方**已经**持有 `ENV_LOCK` 时用这个。`std::sync::Mutex` 不可重入：
+    /// 持锁再走 [`cg_call`] 会在同一线程上自锁死，此后所有要这把锁的用例
+    /// 全部排队挂住（实测：全量 `cargo test` 卡在 8 个「running for over
+    /// 60 seconds」，单跑每一个都秒过）。
+    async fn cg_call_holding_lock(
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, latte_rs_agent_tools::error::ToolError> {
         let tool = code_graph_tool();
         let ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh("code_graph", 0);
         (tool.handler)(args, ctx).await
@@ -19416,5 +19488,21 @@ require = ["永远不可能出现的验收字符串"]
             state.read().activation(),
             crate::goal::GoalActivation::Disarmed
         );
+    }
+}
+
+// 放在文件末尾：源码钉扎测试按第一个 `#[cfg(test)]` 截取「非测试部分」。
+mod test_hooks {
+    // 非测试构建下恒为 None；测试构建由 tests 模块里的 task-local 提供。
+    pub(super) fn specialist_timeout() -> Option<u64> {
+        imp()
+    }
+    #[cfg(not(test))]
+    fn imp() -> Option<u64> {
+        None
+    }
+    #[cfg(test)]
+    fn imp() -> Option<u64> {
+        super::tests::TEST_SPECIALIST_TIMEOUT.try_with(|v| *v).ok()
     }
 }

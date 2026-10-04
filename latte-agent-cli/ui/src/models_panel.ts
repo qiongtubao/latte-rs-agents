@@ -57,7 +57,7 @@ const FIELDS: ReadonlyArray<FieldSpec> = [
   // 容量
   { key: "context_window", label: "context_window（tokens）", kind: "number" },
   { key: "max_tokens", label: "max_tokens（tokens）", kind: "number" },
-  { key: "timeout_secs", label: "timeout_secs（per-turn）", kind: "number" },
+  { key: "timeout_secs", label: "timeout_secs（流式：首 token / chunk 间隔）", kind: "number" },
   // 能力开关
   { key: "supports_thinking", label: "supports_thinking", kind: "checkbox" },
   { key: "supports_vision", label: "supports_vision", kind: "checkbox" },

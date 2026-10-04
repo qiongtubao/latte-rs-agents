@@ -15,13 +15,13 @@ use tokio::time::timeout as tokio_timeout;
 
 /// Max concurrent `delegate` tool calls per manager session.
 const DEFAULT_DELEGATE_CONCURRENCY: usize = 4;
-/// Per-specialist wall-clock timeout in seconds.
+/// Per-specialist wall-clock **backstop** in seconds（3h，与 UI 的
+/// `DEFAULT_UI_DELEGATE_TIMEOUT_SECS` 对齐）。
 ///
-/// 与 UI 的 `DEFAULT_UI_DELEGATE_TIMEOUT_SECS` 对齐（900s）。原值 300s
-/// 在慢速厂商模型下会误杀正常任务：实测 glm-5.3 单次模型调用 167s+，
-/// architect 深读一个模块（多轮 read/search 往返）首轮 delegate 被 300s
-/// 掐死、manager 原样重派又烧一遍，整轮近 1/3 时间浪费在重跑上。
-const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 900;
+/// 常规的「该收手了」由请求次数预算判定（`workflow::delegate_request_budget`），
+/// 墙钟只防真正的失控。此前 300s → 900s 都在慢速厂商模型下误杀正常任务：
+/// 实测 glm-5.3 单次模型调用 167–455s，两三轮往返就撞线。
+const DEFAULT_DELEGATE_TIMEOUT_SECS: u64 = 3 * 3600;
 
 use clap::Args;
 use latte_agent_core::agent::{Agent, AgentRunner};
@@ -2117,8 +2117,45 @@ fn spawn_cli_workflow_event_consumer_with(
                     layout,
                     document_path,
                     document_markdown,
+                    questions,
                     ..
                 }) => {
+                    // 多题形态（learn_loop 的 quiz 一次出 N 题）：逐题提问、逐题
+                    // `resolve_one`，收齐才唤醒等待方——与 UI 多题弹框同一协议。
+                    // 此前这里只看顶层 question/options：多题时顶层 options 为空、
+                    // question 是内部 answer_key，终端看到一道没有选项的怪题，
+                    // 答一行就被整体 resolve，判分按行对题，全部错位。
+                    if wait && !questions.is_empty() {
+                        let total = questions.len();
+                        for (qi, q) in questions.into_iter().enumerate() {
+                            let req = AskRequest {
+                                role_id: role_id.clone(),
+                                question: format!("（第 {}/{total} 题）{}", qi + 1, q.question),
+                                multi: q.multi,
+                                allow_upload: q.allow_upload,
+                                layout: q.layout,
+                                document_path: if qi == 0 { document_path.clone() } else { String::new() },
+                                document_markdown: if qi == 0 {
+                                    document_markdown.clone()
+                                } else {
+                                    String::new()
+                                },
+                                options: q.options,
+                            };
+                            let Some(answer) = answerer(req).await else {
+                                ui_emit("[ask] stdin 不可用，取消本次提问");
+                                latte_agent_core::choice::cancel(&choice_id);
+                                break;
+                            };
+                            if latte_agent_core::choice::resolve_one(&choice_id, &q.id, answer).is_err() {
+                                ui_emit(&format!(
+                                    "[ask] 答案未送达（choice_id={choice_id} 已被取消或已回答）"
+                                ));
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     if !wait {
                         // fire-and-forget：提问方没在等，回答会作为下一条
                         // user 消息回喂。终端只提示，不阻塞。
@@ -2760,9 +2797,9 @@ async fn register_workflow_tool(
 ///
 /// `env_timeout_secs` is the `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` value
 /// resolved once at the call site (env doesn't change at runtime);
-/// the per-call timeout is then resolved as
-/// `model.timeout_secs > env_timeout_secs > DEFAULT_DELEGATE_TIMEOUT_SECS`
-/// — see the closure below. Default 60s.
+/// the per-call backstop is `env_timeout_secs > DEFAULT_DELEGATE_TIMEOUT_SECS`
+/// (3h); the model catalog's `timeout_secs` is a streaming timeout and is
+/// not reused here.
 // =====================================================================
 // HIL v1 Phase 6 — checkpoint wire-up verification marker
 //
@@ -2881,18 +2918,9 @@ async fn register_delegate_tool(
                 let models = resolver
                     .resolve_chain(&role.id, tier, &role.model_chain)
                     .map_err(|e| tool_err(format!("no model for role '{}': {}", role_id, e)))?;
-                // Resolve the per-specialist wall-clock timeout. Order:
-                //   1. `model.timeout_secs` from the model catalog (per-model
-                //      override — e.g. glm-5.2 sets 120s because it's slow
-                //      on 8-step tasks)
-                //   2. `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` (env, captured
-                //      once at startup as `env_timeout`)
-                //   3. `DEFAULT_DELEGATE_TIMEOUT_SECS` (900s, 与 UI 对齐)
-                let timeout_s = resolver
-                    .get_def(&models[0].id)
-                    .and_then(|d| d.timeout_secs)
-                    .or(env_timeout)
-                    .unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS);
+                // 墙钟兜底：env > 3h。模型目录的 `timeout_secs` 是流式超时
+                // （首 token / chunk 间隔），不复用成整个 turn 的总时长。
+                let timeout_s = env_timeout.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS);
                 // Print the dispatch header now that we know which
                 // model the specialist will use. Multi-line task
                 // is shown verbatim so the user can see what was
@@ -2995,6 +3023,7 @@ async fn register_delegate_tool(
                 if let Some(state) = specialist_todo {
                     runner = runner.with_todo_state(state);
                 }
+                runner.set_request_budget(latte_agent_core::workflow::delegate_request_budget());
                 let msgs = vec![Message {
                     role: MsgRole::User,
                     content: vec![latte_ai::models::ContentPart::text(task)],
@@ -4016,6 +4045,47 @@ mod tests {
             .expect("通道不该被关闭");
         assert_eq!(answer, "做调优");
 
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// 多题 ask（learn_loop quiz）：逐题作答，收齐后等待方拿到 `1. a\n2. b`。
+    #[tokio::test]
+    async fn multi_question_ask_is_answered_per_question() {
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        let answerer: AskAnswerer = Arc::new(move |req: AskRequest| {
+            let seen = seen2.clone();
+            Box::pin(async move {
+                let ans = req.options.first().map(|o| o.label.clone());
+                seen.lock().unwrap().push(req.question);
+                ans
+            })
+        });
+        let task = spawn_cli_workflow_event_consumer_with(rx, answerer);
+        let id = "choice-cli-multi-q";
+        let mut ev = choice_event(id, true, false);
+        if let latte_agent_core::controller::ChatEvent::ChoiceRequested { questions, options, .. } = &mut ev {
+            options.clear();
+            for (qid, label) in [("k1", "甲"), ("k2", "乙")] {
+                questions.push(latte_agent_core::controller::ChoiceQuestion {
+                    id: qid.into(),
+                    question: format!("{qid} 题"),
+                    options: vec![opt(label, "")],
+                    ..Default::default()
+                });
+            }
+        }
+        let waiter = latte_agent_core::choice::register(id, ev.clone(), tx.clone());
+        tx.send(ev).unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("多题 ask 收齐后必须唤醒")
+            .unwrap();
+        assert_eq!(answer, "1. 甲\n2. 乙");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen, vec!["（第 1/2 题）k1 题", "（第 2/2 题）k2 题"]);
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }

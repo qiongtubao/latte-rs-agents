@@ -58,6 +58,7 @@ pub mod goal;
 pub mod ground_truth;
 pub mod hooks;
 pub mod image_gen;
+pub mod learn_doc;
 pub mod inject_queue;
 pub mod model_resolver;
 pub mod pause_gate;

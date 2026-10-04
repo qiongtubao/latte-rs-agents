@@ -129,7 +129,9 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | CLI 300s / UI 900s | specialist（delegate / workflow step）的 wall-clock 超时，超时即中止并回喂 manager 重派。**注意**：模型目录里的 per-model `timeout_secs` 管的是**流式超时**（首 token / chunk 间隔），与这条 wall-clock 超时是两套独立机制，不存在覆盖关系 |
+| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | 10800（3h） | specialist（delegate / workflow step）的墙钟**兜底**，只防真正的失控。常规的「这一步该收手了」由下面的**请求次数预算**判定；后端挂死由流式首 token / 空闲超时秒级发现。此前它是 900s 且是唯一判据：慢模型（glm-5.3 单次调用 455s）两三轮就撞线，正在干活的 step 被砍、重试、再被砍（实测 LAT-110 annotate 三次全部超时）。模型目录里的 per-model `timeout_secs` 是**流式超时**，不参与这条——此前 delegate 路径把它复用成总时长，已拆开 |
+| `LATTE_AGENT_STEP_WARN_SECS` | 900 | workflow step 的 `TimeoutWarning` 复发周期：只提醒「这一步跑了很久」，不杀，不超过上面的兜底 |
+| `LATTE_AGENT_REQUEST_BUDGET_SCALE` | 1.0 | **请求次数预算**的全局缩放（钳 `0..=10`，`0` = 关闭）。workflow step 按档位给软预算：`small` 30 / `default` 80（缺省）/ `large` 200，step 上写 `budget = "small"` 或精确的 `max_requests = N`（`0` = 不设）；delegate 按 `large`。到软预算时引擎注入「立即落盘收尾」，到 1.5 倍仍未收尾就强停并降级采纳已有产出。按次数而不是墙钟（对齐 oh-my-pi 的 `SOFT_REQUEST_BUDGET`）：慢但在干活的不误杀，「一直读、从不写」的原地打转被次数抓住 |
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
 | `LATTE_AI_FIRST_EVENT_TIMEOUT_SECS` | 100 | 首 token（TTFB）超时。reasoning 模型思考久，窗口给得宽。模型目录里的 `timeout_secs` **精确覆盖**它（既能放宽也能收紧，用于给已知秒回的模型配快速失败） |
 | `LATTE_AI_IDLE_TIMEOUT_SECS` | 120 | 两个 SSE chunk 之间的最大间隔。只要 token 在流动就不触发，总生成时间无上限。同样被 per-model `timeout_secs` 精确覆盖 |

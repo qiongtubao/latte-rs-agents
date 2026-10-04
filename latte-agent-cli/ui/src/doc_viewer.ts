@@ -1,28 +1,39 @@
 // 学习/项目文档的 UI 内嵌预览：markdown 里的本地 .md 链接（renderMarkdown
 // 输出 <a class="doc-link" data-doc-path="...">）点击后在弹窗里渲染全文，
 // 左侧带标题目录（TOC）。文档经 /api/doc 只读路由获取（服务端白名单
-// .latte/learn/ 与 docs/），渲染与聊天正文同一 markdown 管线 + 后处理
+// .latte/learn/、.latte/sessions/<sid>/learn/ 与 docs/），渲染与聊天正文同一 markdown 管线 + 后处理
 // （mermaid、代码块工具条都生效）。
 
 import { docDirname, renderMarkdown } from "./markdown";
 import { enhanceRenderedMarkdown } from "./codeblock";
 
 let overlay: HTMLElement | null = null;
+/** 弹窗内跳转历史：在文档里点子文档链接时压栈，「返回」弹栈。关窗清空。 */
+let history: string[] = [];
+let current: string | null = null;
 
 function closeViewer(): void {
   overlay?.remove();
   overlay = null;
+  history = [];
+  current = null;
 }
 
-/** 拉取并渲染一份本地 md 文档。幂等（重复调用替换旧弹窗）。 */
-export async function openDocViewer(path: string): Promise<void> {
+/** 拉取并渲染一份本地 md 文档。幂等（重复调用替换旧弹窗）。
+ *  弹窗已打开时（文档内点了另一个 .md 链接）记入历史，可「返回」。 */
+export async function openDocViewer(path: string, opts: { back?: boolean } = {}): Promise<void> {
+  const keep = overlay?.isConnected && current !== null && current !== path;
+  const prev = keep ? [...history, ...(opts.back ? [] : [current!])] : [];
   closeViewer();
+  history = prev;
+  current = path;
 
   overlay = document.createElement("div");
   overlay.className = "md-modal-overlay doc-viewer";
   overlay.innerHTML = `
     <div class="md-modal doc-viewer-box">
       <div class="md-modal-bar">
+        <button type="button" class="code-block-btn" data-act="back" hidden>← 返回</button>
         <span class="md-modal-title doc-viewer-path"></span>
         <button type="button" class="code-block-btn" data-act="close">关闭</button>
       </div>
@@ -35,6 +46,14 @@ export async function openDocViewer(path: string): Promise<void> {
   document.body.appendChild(overlay);
 
   overlay.querySelector('[data-act="close"]')!.addEventListener("click", closeViewer);
+  const backBtn = overlay.querySelector<HTMLButtonElement>('[data-act="back"]')!;
+  if (history.length > 0) {
+    backBtn.hidden = false;
+    backBtn.addEventListener("click", () => {
+      const target = history.pop();
+      if (target) void openDocViewer(target, { back: true });
+    });
+  }
   overlay.addEventListener("click", (e) => { if (e.target === overlay) closeViewer(); });
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") { closeViewer(); document.removeEventListener("keydown", onKey); }

@@ -1010,6 +1010,8 @@ pub struct AgentRunner {
     /// 前检查：超时时优雅退出、返回 partial 产出，而不是被外层 tokio
     /// timeout abort（后者会丢失所有未 flush 的 partial 文本）。
     deadline: Option<std::time::Instant>,
+    /// 单个 turn 的模型请求次数预算（软上限）。见 [`AgentRunner::set_request_budget`]。
+    request_budget: Option<usize>,
     /// Optional event channel for human intervention on broken JSON/inputs (Scheme A).
     tool_fix_event_tx: Option<tokio::sync::broadcast::Sender<crate::controller::ChatEvent>>,
     /// 会话级 todo 状态（见 [`crate::todo`]）：todo 工具 handler 读写，
@@ -1139,6 +1141,21 @@ fn short_tool_name(name: &str) -> &str {
 /// advisor delegate-return 审查的动机是「judge based on evidence」——
 /// 工具摘要太长会挤占审查上下文（还有 32K 字符的结果预算），
 /// 单条截断即可。返回的字符串以 `…[+N]` 结尾标记丢弃的字符数。
+/// 请求预算硬上限：软预算的 1.5 倍（软预算时已提示收尾，再给一半余量收尾）。
+pub(crate) fn request_budget_hard(soft: usize) -> usize {
+    soft + soft.div_ceil(2)
+}
+
+fn request_budget_nudge(used: usize, soft: usize) -> String {
+    format!(
+        "【引擎提示：请求预算已用完】本次任务已经调用了 {used} 次模型（预算 {soft} 次，\
+         到 {} 次会被强制中止）。不要再读新的文件或继续探索：用你已经拿到的信息，\
+         **马上**把必须落盘的结果写完（write / edit），然后输出最终结论。\
+         信息不全的地方如实标注，不要为了补全而继续读。",
+        request_budget_hard(soft)
+    )
+}
+
 fn truncate_tool_summary(text: &str, max: usize) -> String {
     let count = text.chars().count();
     if count <= max {
@@ -1389,7 +1406,20 @@ fn compact_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> u
     let stale_budget = context_stale_chars();
     let floor = stale_budget * 4 / 3;
 
-    // 1. 先定位所有 Role::Tool 消息的下标
+    // 1. 先定位所有 Role::Tool 消息的下标。
+    //
+    // **本轮刚返回的结果（最后一条 assistant 之后的 tool 消息）一律不动**：
+    // 模型还没看过它们，此时压缩是纯损失——模型拿到的第一眼就是「中段省略」，
+    // 只能分段重读，重读的结果下一轮又因为同样的规则被压。实测 LAT-110
+    // annotate：一次批量读 4 个源文件（~15K 字符）当场被压到 8K，模型回
+    // 「src/sc.c 中段被截断了，我分段重读」，11 次调用全在重读，一个副本都
+    // 没写就撞了 1200s 截止，三次重试全部失败。单条结果的体积由工具自己的
+    // 预算兜（read 单文件 50KiB / 批量 192KB），不该由这里在首读前砍。
+    // 「本轮」= 末尾连续的 tool 消息，且紧跟在一条 assistant（发起调用的那条）之后。
+    let fresh_from = match messages.iter().rposition(|m| m.role != Role::Tool) {
+        Some(i) if messages[i].role == Role::Assistant => i + 1,
+        _ => messages.len(),
+    };
     let tool_indices: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -1433,7 +1463,8 @@ fn compact_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> u
     let stale_len = tool_indices.len().saturating_sub(exempt_count);
     let stale = &tool_indices[..stale_len];
     let mut compacted = 0usize;
-    for &i in stale {
+    // 本轮结果仍计入条数/体积（保住重传成本上限），只是自己不被压。
+    for &i in stale.iter().filter(|&&i| i < fresh_from) {
         let mut touched = false;
         for part in messages[i].content.iter_mut() {
             if let ContentPart::Text { text } = part {
@@ -1451,7 +1482,7 @@ fn compact_stale_tool_results(messages: &mut [Message], keep_recent: usize) -> u
     // 4. 最新豁免区内若有单条超过 OVERSIZED_MSG_CHARS 的特大结果，
     // 也地中段省略到 8,000 字符（防止单条把请求撑爆）
     let recent = &tool_indices[stale_len..];
-    for &i in recent {
+    for &i in recent.iter().filter(|&&i| i < fresh_from) {
         let mut touched = false;
         for part in messages[i].content.iter_mut() {
             if let ContentPart::Text { text } = part {
@@ -2441,6 +2472,7 @@ impl AgentRunner {
             step_journal: None,
             resume_step: None,
             deadline: None,
+            request_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
@@ -2483,6 +2515,7 @@ impl AgentRunner {
             step_journal: None,
             resume_step: None,
             deadline: None,
+            request_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
@@ -2523,6 +2556,7 @@ impl AgentRunner {
             step_journal: None,
             resume_step: None,
             deadline: None,
+            request_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
@@ -2772,11 +2806,15 @@ impl AgentRunner {
             self.todo_tracker
                 .record_tool_call(short_tool_name(tool_name));
             if let (Some((name, args)), Ok(result_str)) = (r.loop_records.first(), &r.outcome) {
+                // 一条调用一行：参数/结果里的换行压平。下游按行取首个 token
+                // 当工具名（`check_required_tools`），多行结果会把 `"content":`、
+                // `{` 这类片段当成「实际调用了」的工具（实测 LAT-110 报错清单）。
+                let flat = |s: String| s.replace(['\n', '\r'], " ");
                 self.last_turn_tool_summaries.push(format!(
                     "{} {} → {}",
                     name,
-                    truncate_tool_summary(args, 160),
-                    truncate_tool_summary(result_str, 240),
+                    flat(truncate_tool_summary(args, 160)),
+                    flat(truncate_tool_summary(result_str, 240)),
                 ));
             }
         }
@@ -3332,6 +3370,18 @@ impl AgentRunner {
 
     /// Set the absolute wall-clock deadline for the tool loop (对齐 oh-my-pi
     /// `config.deadline`). 超时时循环优雅退出、返回 partial 产出。
+    /// 设置单个 turn 的模型请求次数预算（软上限 `soft`，0 = 不限）。
+    ///
+    /// 按**次数**而不是墙钟限制一次分派（对齐 oh-my-pi 的
+    /// `SOFT_REQUEST_BUDGET`）：慢模型单次调用几百秒但一直在干活时不误杀；
+    /// 「一直读、从不写」这种原地打转则被次数抓住。
+    /// - 第 `soft` 次请求前注入一条「立即落盘收尾」的硬指令（一次）；
+    /// - 到 `soft × 1.5` 次仍没收尾，报 [`AgentError::RequestBudgetExceeded`]
+    ///   （带 partial，调用方降级采纳）。
+    pub fn set_request_budget(&mut self, soft: usize) {
+        self.request_budget = (soft > 0).then_some(soft);
+    }
+
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
         self.deadline = Some(deadline);
     }
@@ -3789,6 +3839,8 @@ impl AgentRunner {
         // if it cannot reclaim enough persistent context, callers still receive
         // the same error and may use their specialized recovery policy.
         let mut prompt_budget_compaction_attempted = false;
+        let mut budget_hit: Option<usize> = None;
+        let mut budget_nudged = false;
         loop {
             // Deadline 检查（对齐 oh-my-pi `isDeadlineExceeded`）：
             // 每个 model call 前检查，超时时优雅退出、返回已有 partial。
@@ -3796,10 +3848,20 @@ impl AgentRunner {
                 if std::time::Instant::now() >= dl {
                     tracing::info!(round, "deadline exceeded, returning partial output or error");
                     deadline_hit = true;
-                    if !last_substantive_response.is_empty() {
-                        final_response = last_substantive_response.clone();
-                    }
                     break;
+                }
+            }
+            if let Some(soft) = self.request_budget {
+                if round >= request_budget_hard(soft) {
+                    tracing::info!(round, soft, "request budget exhausted, stopping turn");
+                    budget_hit = Some(soft);
+                    break;
+                }
+                if round == soft && !budget_nudged {
+                    budget_nudged = true;
+                    let nudge = request_budget_nudge(round, soft);
+                    self.context.push(Message::user(nudge.clone()));
+                    messages.push(Message::user(nudge));
                 }
             }
 
@@ -4592,17 +4654,29 @@ impl AgentRunner {
         // context，后续每个请求都带着它，这个 turn 就永久卡死。
         // （日志事故：reviewer 空响应入 context 后 gate 重试全 400，
         // 整个 workflow 被拖垮。）
-        if !final_response.trim().is_empty() {
-            self.context
-                .push(Message::assistant(final_response.clone()));
+        //
+        // 截止截断一律报错（带 partial），不当成正常收尾：截断时最后一段
+        // 正文多半是工具循环中途的过程旁白，不是结论。也不入 context——
+        // 这个 turn 没有收尾，不该留下一条假装收尾的 assistant 消息。
+        if let Some(budget) = budget_hit {
+            return Err(AgentError::RequestBudgetExceeded {
+                requests: round,
+                budget,
+                last_tool: last_executed_tool,
+                partial: last_substantive_response,
+            });
         }
-
-        if deadline_hit && final_response.trim().is_empty() {
+        if deadline_hit {
             return Err(AgentError::DeadlineExceeded {
                 elapsed_secs: wall_elapsed.as_secs(),
                 tool_rounds: round,
                 last_tool: last_executed_tool,
+                partial: last_substantive_response,
             });
+        }
+        if !final_response.trim().is_empty() {
+            self.context
+                .push(Message::assistant(final_response.clone()));
         }
 
         Ok(final_response)
@@ -5778,6 +5852,27 @@ mod tests {
     // 回归 2026-09-07 jemalloc 会话的 token 放大：工具循环每轮重传全部
     // 历史，一个 reviewer 子会话 70 次调用（返回内容合计 ≈47K token）
     // 烧掉 1.79M 输入 token；整场 22.19M 里唯一内容仅 ≈0.97M（23 倍）。
+
+    /// 本轮刚返回、模型还没看过的结果绝不压（哪怕超过单条上限/体积预算）；
+    /// 上一轮已看过的照常按预算压。回归 LAT-110 annotate：批量读 15K 字符
+    /// 首读即被砍成「中段省略」，模型反复分段重读、一个副本都没写。
+    #[test]
+    fn compact_stale_tool_results_never_touches_unseen_results() {
+        let huge = "B".repeat(OVERSIZED_MSG_CHARS * 2);
+        let mut msgs = vec![
+            Message::system("sys"),
+            Message::user("go"),
+            Message::assistant("先读"),
+            Message::tool_result("t1", &huge),
+            Message::assistant("再读"),
+            Message::tool_result("t2", &huge),
+            Message::tool_result("t3", &huge),
+        ];
+        compact_stale_tool_results(&mut msgs, 6);
+        assert!(msgs[3].as_text().contains("中段省略"), "上一轮看过的超大结果照常压");
+        assert_eq!(msgs[5].as_text(), huge, "本轮结果逐字");
+        assert_eq!(msgs[6].as_text(), huge, "本轮结果逐字");
+    }
 
     /// 只压陈旧的、只压大的；最近 N 条与小结果一律不动。
     #[test]
@@ -8379,6 +8474,146 @@ mod tests {
             AgentError::DeadlineExceeded { tool_rounds, last_tool, .. } => {
                 assert_eq!(tool_rounds, 0);
                 assert_eq!(last_tool.as_deref(), None, "启动时已超时，尚未执行任何工具");
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+    }
+
+    /// 请求预算：第 soft 次请求前注入「立即收尾」，到 1.5 倍仍在调工具 → 报
+    /// RequestBudgetExceeded（带 partial）。回归 LAT-110 annotate「一直读不写」。
+    #[tokio::test]
+    async fn request_budget_nudges_then_stops_turn() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let handler: SharedToolHandler =
+            Arc::new(|_input, _ctx| Box::pin(async move { Ok(serde_json::json!({ "ok": 1 })) }));
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+            defs: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(Tool::builder("read", "read", schema, handler).build(), None);
+        let server = wiremock::MockServer::start().await;
+        // 每次参数不同，避免死循环熔断先触发。
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = n.clone();
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(move |_: &wiremock::Request| {
+                        let i = n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        ResponseTemplate::new(200).set_body_string(openai_completion_body(
+                            &format!("继续读第 {i} 个"),
+                            vec![serde_json::json!({
+                                "id": format!("c{i}"),
+                                "type": "function",
+                                "function": { "name": "read", "arguments": format!("{{\"path\":\"f{i}\"}}") }
+                            })],
+                        ))
+                    }),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+        runner.set_request_budget(2);
+
+        let err = runner.run_turn(&[Message::user("do work")], None).await.unwrap_err();
+        match err {
+            AgentError::RequestBudgetExceeded { requests, budget, partial, last_tool } => {
+                assert_eq!((requests, budget), (3, 2));
+                assert_eq!(last_tool.as_deref(), Some("read"));
+                assert!(partial.contains("继续读"), "{partial}");
+            }
+            other => panic!("expected RequestBudgetExceeded, got {other:?}"),
+        }
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 3, "硬上限 = 1.5 × 2 = 3 次请求");
+        let third = String::from_utf8_lossy(&reqs[2].body).to_string();
+        assert!(third.contains("请求预算已用完"), "第 3 次请求要带收尾提示");
+        assert!(!String::from_utf8_lossy(&reqs[1].body).contains("请求预算已用完"));
+    }
+
+    /// 截止发生在工具循环中途、已有一段正文：一律报 DeadlineExceeded 并带出
+    /// partial，不再把这段过程旁白当成正常收尾的 Ok 返回。
+    /// 回归 LAT-110：annotate 904s 截断，「再补读三个 plan 片段……」被当成产出。
+    #[tokio::test]
+    async fn run_turn_deadline_mid_tool_loop_returns_err_with_partial() {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 工具执行跨过截止时刻，下一次模型调用前的检查即命中。
+        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                Ok(serde_json::json!({ "read": "data" }))
+            })
+        });
+        let schema = ToolInputSchema {
+            schema_type: SchemaType,
+            properties: Default::default(),
+            required: None,
+            additional_properties: None,
+            defs: None,
+        };
+        let tm = create_tool_manager();
+        tm.register(
+            Tool::builder("read", "read something", schema, handler).build(),
+            None,
+        );
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body(
+                            "再补读三个 plan 片段",
+                            vec![serde_json::json!({
+                                "id": "call_read",
+                                "type": "function",
+                                "function": { "name": "read", "arguments": "{\"path\":\"a.txt\"}" }
+                            })],
+                        ),
+                    )),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, tm);
+        runner.set_deadline(std::time::Instant::now() + std::time::Duration::from_millis(200));
+
+        let err = runner
+            .run_turn(&[Message::user("do work")], None)
+            .await
+            .unwrap_err();
+        match err {
+            AgentError::DeadlineExceeded { partial, last_tool, .. } => {
+                assert_eq!(partial, "再补读三个 plan 片段");
+                assert_eq!(last_tool.as_deref(), Some("read"));
             }
             other => panic!("expected DeadlineExceeded, got {other:?}"),
         }

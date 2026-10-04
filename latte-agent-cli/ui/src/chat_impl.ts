@@ -8,7 +8,7 @@ import { extractImportableTasks } from "./workflows_panel";
 import { extractCodeRefs, makeRefChips } from "./linkify";
 import { eventIdentity } from "./event_identity";
 import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
-import { renderMarkdown } from "./markdown";
+import { docDirname, renderMarkdown } from "./markdown";
 import { enhanceRenderedMarkdown } from "./codeblock";
 import { openDocViewer } from "./doc_viewer";
 import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, countTodoPhases, currentTaskInPhases, subPhases, subTodoIds, type TodoState } from "./todo_store";
@@ -128,7 +128,9 @@ function appendChoiceDocument(card: HTMLElement, e: ChoiceRequestedEvent): void 
 
   const body = document.createElement("div");
   body.className = "choice-doc-body markdown-body";
-  body.innerHTML = renderMarkdown(md);
+  // 文档里的相对链接（`sections/k1.md`、`img/x.svg`）相对**文档所在目录**
+  // 解析——不带 baseDir 会按 cwd 解析，点进去就是 404。
+  body.innerHTML = renderMarkdown(md, docPath ? { baseDir: docDirname(docPath) } : {});
   enhanceRenderedMarkdown(body);
   doc.appendChild(body);
 
