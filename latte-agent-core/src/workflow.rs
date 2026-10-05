@@ -729,6 +729,7 @@ async fn contract_last_resort_review(
         response.to_string(),
         "",   // contract_last_resort_review 无工具调用数据
         None, // 兜底审查不注入 step 执行约束（契约此时已判失败）
+        crate::controller::ReviewMode::Blocking,
     )
     .await;
     let v = verdict?;
@@ -820,6 +821,7 @@ async fn loop_exhausted_last_resort_review(
         artifact.to_string(),
         "",   // 无工具调用数据
         None, // 返工环复核无 step 执行约束上下文
+        crate::controller::ReviewMode::Blocking,
     )
     .await;
     let Some(v) = verdict else {
@@ -7698,6 +7700,12 @@ struct SpeakerDispatch {
     plan_stage: Option<crate::controller::SharedPlanStage>,
     /// 本次分派的软请求预算（0 = 不设），见 [`step_request_budget`]。
     request_budget: usize,
+    /// 委派返回审查不阻塞（结论本就只作参考的 step），见 [`review_is_advisory`]。
+    review_async: bool,
+    /// 机械验收依据（产出契约 + 工具使用约束）。`Some` 时先过机械验收，
+    /// 不合格的产出**不送 LLM 审查**——引擎随后会带批注重试，审它是白花一次
+    /// 慢调用（实测 LAT-110：plan / annotate 第 1 次都是先审 ~分钟级、再被机械打回）。
+    gate_step: Option<Arc<WorkflowStepDef>>,
 }
 
 impl SpeakerDispatch {
@@ -7752,6 +7760,8 @@ impl SpeakerDispatch {
             // 构造后写入自己的句柄。
             plan_stage: None,
             request_budget: scaled_budget(step_budget_tier("default").unwrap_or(0)),
+            review_async: false,
+            gate_step: None,
         }
     }
 }
@@ -7778,6 +7788,21 @@ fn gate_for_step(
 /// 所以「非默认」就是「声明了至少一条约束」。
 fn step_has_output_contract(step: &WorkflowStepDef) -> bool {
     step.output_contract != OutputContract::default()
+}
+
+/// 这个 step 的委派返回审查结论是否「只作参考」——是则审查不阻塞。
+/// - 声明了产出契约：机器契约是唯一验收器，intervene 也不触发重做（见
+///   run_step_speaker 里 `step_has_output_contract` 分支）；
+/// - 章节写作阶段（doc_review_loop 的 ch_* / write_chapter）：引擎逐节机械
+///   检查兜底，且扇出时 N 次审查并发打到后端，是超时的主要来源。
+fn review_is_advisory(wf_name: &str, step: &WorkflowStepDef) -> bool {
+    step_has_output_contract(step) || is_chapter_writer(wf_name, &step.id)
+}
+
+/// 机械验收（产出契约 + 工具使用约束）是否通过。审查前调用：不合格就不审。
+fn passes_mechanical_gate(step: &WorkflowStepDef, response: &str, tool_summary: &str) -> bool {
+    check_output_contract(&step.output_contract, response).is_ok()
+        && check_tool_usage(step, tool_summary).is_ok()
 }
 
 /// 组装给委派返回审查的「该子任务的执行约束」文本：step 级授权工具
@@ -8516,6 +8541,18 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         // 4. Delegate-return 审查：advisor 启用（gate Some ⇒ review_engine
         //    Some）时产出先过审查再回写引擎；intervene/terminate → 重做。
         match (attempt, &inp.review_engine) {
+            (Ok((response, _tool_count, tool_summary)), Some(_))
+                if inp
+                    .gate_step
+                    .as_ref()
+                    .is_some_and(|st| !passes_mechanical_gate(st, &response, &tool_summary)) =>
+            {
+                // 机械验收不过：不审，原样交回引擎，由它带批注重试。
+                break Ok(SpeakerOut {
+                    response,
+                    tools: tool_summary,
+                });
+            }
             (Ok((response, _tool_count, tool_summary)), Some(engine)) => {
                 // 审查基准是原始任务（inp.prompt），不含重做批注。
                 // 工具调用摘要：让 advisor 的返回审查能看到专家实际执行了
@@ -8533,6 +8570,11 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     response,
                     &tool_summary,
                     inp.review_constraints.as_deref(),
+                    if inp.review_async {
+                        crate::controller::ReviewMode::Background
+                    } else {
+                        crate::controller::ReviewMode::Blocking
+                    },
                 )
                 .await;
                 let intervene = matches!(
@@ -9154,6 +9196,8 @@ async fn run_workflow_serial(
                     dispatch.step_has_output_contract = step_has_output_contract(step);
                     dispatch.review_constraints = step_review_constraints(step);
                     dispatch.request_budget = step_request_budget(step);
+                    dispatch.review_async = review_is_advisory(&wf.name, step);
+                    dispatch.gate_step = Some(Arc::new(step.clone()));
                     let (mut response, tools_called) = match run_step_speaker(dispatch).await {
                         Ok(o) => (o.response, o.tools),
                         Err(StepFail::Cancelled) => return WfOutcome::Cancelled,
@@ -9962,6 +10006,11 @@ async fn run_dag_step(
                     .and_then(|_| inp.vars.get("item_id").cloned()),
                 plan_stage: plan_stage.clone(),
                 request_budget: step_request_budget(step),
+                review_async: review_is_advisory(
+                    crate::step_journal::workflow_name_of(&inp.wf_id),
+                    step,
+                ),
+                gate_step: Some(Arc::new(step.clone())),
             };
             let (mut response, tools_called) = match run_step_speaker(dispatch).await {
                 Ok(o) => (o.response, o.tools),
@@ -15863,7 +15912,17 @@ max_chars = 60
             .expect("合规 slug 必须直接通过，advisor intervene 仅作参考");
         assert_eq!(out, slug, "产出必须是未批注的原始 slug: {out}");
 
-        let requests = server.received_requests().await.unwrap();
+        // 契约 step 的审查是后台的（结论只作参考）：workflow 已经返回，审查
+        // 稍后才到——等它落地再断言。
+        let mut requests = server.received_requests().await.unwrap();
+        for _ in 0..50 {
+            if requests.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            requests = server.received_requests().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
             requests.len(),
             2,
@@ -15893,22 +15952,54 @@ max_chars = 60
             }
             v
         };
-        assert!(
-            events.iter().any(|ev| matches!(
-                ev,
-                ChatEvent::Status { message } if message.contains("仅作参考")
-            )),
-            "应有「语义意见仅作参考」Status: {events:?}"
-        );
-        // 气泡照发：advisor 的意见对用户仍然可见。
+        // 气泡照发（迟到审查）：advisor 的意见对用户仍然可见。
         assert!(
             events.iter().any(|ev| matches!(
                 ev,
                 ChatEvent::RoleTurn { role_id, content, .. }
-                    if role_id == "advisor" && content.contains("没有返回正文讲解")
+                    if role_id == "advisor"
+                        && content.contains("没有返回正文讲解")
+                        && content.contains("迟到")
             )),
-            "advisor intervene 气泡应照常可见: {events:?}"
+            "advisor intervene 迟到气泡应照常可见: {events:?}"
         );
+    }
+
+    /// 机械验收不过的产出不送 LLM 审查：引擎会带批注重试，审它白花一次慢调用。
+    #[tokio::test]
+    async fn mechanically_rejected_output_is_not_sent_to_advisor() {
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                "文件已经写好了，内容包括背景、目标、方案对比与代码详解四个部分，共计约两千字。",
+            )))
+            .mount(&server)
+            .await;
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "gate_order_demo"
+[[steps]]
+id = "s"
+role = "worker"
+task = "写文件"
+output_key = "o"
+require_tools = ["write"]
+max_retries = 1
+"#,
+        )
+        .unwrap();
+        let (mut ctx, _rx) = test_ctx(test_config_at(&server.uri()));
+        ctx.advisor_gate = Some(crate::advisor_monitor::GateConfig::default());
+        let err = run_workflow(&wf, "t", &ctx).await.expect_err("没调 write 必须判失败");
+        assert!(err.to_string().contains("write"), "{err}");
+        let requests = server.received_requests().await.unwrap();
+        let reviews = requests
+            .iter()
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("执行约束") || String::from_utf8_lossy(&r.body).contains("verdict"))
+            .count();
+        assert_eq!(reviews, 0, "机械验收没过，不该有审查请求");
+        assert_eq!(requests.len(), 2, "2 次 worker（首发 + 1 次重试）");
     }
 
     /// 修 B 单元面：机器契约校验永远作用于未批注的原始产出——同一段

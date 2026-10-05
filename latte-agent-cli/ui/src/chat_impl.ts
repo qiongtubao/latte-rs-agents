@@ -11,6 +11,7 @@ import { buildSelectedPlanTasks, type PlanImportRowInput } from "./plan_import";
 import { docDirname, renderMarkdown } from "./markdown";
 import { enhanceRenderedMarkdown } from "./codeblock";
 import { openDocViewer } from "./doc_viewer";
+import { refreshBillingBanner } from "./billing_banner";
 import { emptyTodoState, applyTodoUpdated, countTodos, countPhase, isPhaseComplete, currentTask, todoSummaryLine, countTodoPhases, currentTaskInPhases, subPhases, subTodoIds, type TodoState } from "./todo_store";
 import { todoLinkedTask, type BoardTaskRef } from "./todo_board_link";
 import { parentOptions, getBoardTasksSnapshot, onBoardTasksUpdated } from "./task_board";
@@ -158,6 +159,8 @@ export function mountChat(opts: {
   onReconnect?: () => void;
 }): ChatController {
   const { container, initialRole, initialModel, onRoleSwitch, onShowSubsession, onShowSessionLog, onEditRole, onFork } = opts;
+  // 余额不足横幅：挂载时拉一次（后端可能早已摘除了某个账户）。
+  void refreshBillingBanner(container.messagesEl);
   let msgCounter = 0;
   let turnStartTime = 0;
   // ── Fork support: mirror the ordered ChatEvent stream this session
@@ -3260,6 +3263,7 @@ export function mountChat(opts: {
           turnStartTime = 0;
         }
         addMessage({ kind: "status", content: msg });
+        if (e.message.startsWith("💳")) void refreshBillingBanner(container.messagesEl);
         noteResumeSupersedes(e.message);
         if (!currentToolCall && !delegateRunning) container.footerMsg.textContent = `⟳ ${currentRoleIcon || "🧠"} ${e.message}`;
         resetWaitTimer();
@@ -3275,7 +3279,7 @@ export function mountChat(opts: {
         // getSession, so nothing to render here.
         break;
       case "Paused": isPaused = true; renderPauseButtons(); addMessage({ kind: "status", content: `[paused] ${e.reason}（非流式模型请求会在继续后重试；已产生输出的流式调用/工具会先完成）` }); break;
-      case "Resumed": isPaused = false; renderPauseButtons(); hideAdvisorPauseBanner(); addMessage({ kind: "status", content: "[resumed]" }); break;
+      case "Resumed": isPaused = false; renderPauseButtons(); hideAdvisorPauseBanner(); void refreshBillingBanner(container.messagesEl); addMessage({ kind: "status", content: "[resumed]" }); break;
       case "RoundStarted":
         addMessage({ kind: "system", content: `[回合 ${e.round} 开始]` }); setFooter(`回合 ${e.round} 开始`);
         resetWaitTimer(); currentToolCall = ""; currentDelegate = ""; updateFooter(); break;

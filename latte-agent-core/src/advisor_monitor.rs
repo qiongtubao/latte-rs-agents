@@ -1096,6 +1096,29 @@ fn compose_intervene_hint(v: &ReviewVerdict) -> String {
 }
 
 // ─── LLM review engine ─────────────────────────────────────────────
+
+/// delegate-return 审查的并发上限：env `LATTE_AGENT_ADVISOR_REVIEW_CONCURRENCY`
+/// （默认 2，钳在 1..=16）。
+fn review_concurrency() -> usize {
+    std::env::var("LATTE_AGENT_ADVISOR_REVIEW_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 16))
+        .unwrap_or(2)
+}
+
+/// 审查模型链上第 `i` 个模型（共 `n` 个）在剩余预算 `remaining` 里能用多久。
+/// `None` = 不限（最后一个模型：预算耗尽后审查转入后台继续跑完，结论晚到）。
+/// 第一个模型最多用一半，其余均分——慢的首选模型不能把整段预算吃光，
+/// 否则模型链里的备用模型在审查路径上永远轮不到（首 token 超时 100s >
+/// 审查预算 90s）。
+pub(crate) fn review_attempt_limit(i: usize, n: usize, remaining: Duration) -> Option<Duration> {
+    if i + 1 >= n {
+        return None;
+    }
+    let share = if i == 0 { 2 } else { (n - i) as u32 };
+    Some(remaining / share)
+}
 /// Builds and runs the single-turn advisor review call.
 ///
 /// Uses `Agent::chat` with `WaitPolicy::NoWait` rather than
@@ -1118,6 +1141,13 @@ pub struct AdvisorReviewEngine {
     /// （测试 / 未启用 persistence 的 caller）。由 UI server 在 spawn
     /// advisor monitor 前调 [`with_subsession_sink`] 注入。
     subsession_sink: Option<Arc<dyn crate::trace::TraceSink>>,
+    /// delegate-return 审查的并发闸（整个 engine 共享）。扇出 step 的 N 个
+    /// writer 几乎同时收尾，N 次审查一齐打到同一个后端，长尾就落在超时外
+    /// （实测 LAT-110：4 章并发收尾时 3 次审查超过 90s）。审查超时预算从
+    /// **拿到许可**才开始算，排队时间不计入。
+    review_permits: Arc<tokio::sync::Semaphore>,
+    /// 当前在飞审查用的模型 id（最近一次开始调用的那个），超时提示里点名用。
+    inflight_model: Arc<parking_lot::Mutex<String>>,
     /// delegate-return 审查与重做参数（超时 + 重做上限），来自
     /// `AdvisorMonitorConfig::review_settings`；未注入时用默认值。
     review_settings: AdvisorReviewSettings,
@@ -1137,7 +1167,19 @@ impl AdvisorReviewEngine {
             watchdog_notes: true,
             subsession_sink: None,
             review_settings: AdvisorReviewSettings::default(),
+            review_permits: Arc::new(tokio::sync::Semaphore::new(review_concurrency())),
+            inflight_model: Arc::new(parking_lot::Mutex::new(String::new())),
         }
+    }
+
+    /// 审查并发许可（见 `review_permits`）。
+    pub(crate) fn review_permits(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.review_permits)
+    }
+
+    /// 最近一次开始调用的审查模型 id（未开始时为空）。
+    pub(crate) fn inflight_model(&self) -> String {
+        self.inflight_model.lock().clone()
     }
 
     /// 注入 delegate-return 审查参数（`AdvisorMonitorConfig::review_settings`）。
@@ -1272,6 +1314,8 @@ impl AdvisorReviewEngine {
         tool_call_summary: &str,
         // 被审子任务的执行约束（见 build_delegate_review_prompt）。
         constraints: Option<&str>,
+        // 同步等待的预算：按模型链分段（见 review_attempt_limit）。None = 不分段。
+        budget: Option<Duration>,
     ) -> AgentResult<ReviewVerdict> {
         let template = self
             .agent_config
@@ -1284,14 +1328,7 @@ impl AdvisorReviewEngine {
         let models =
             self.resolver
                 .resolve_chain("advisor", ModelTier::Premium, &role.model_chain)?;
-        let agent = Agent::new_with_chain(
-            "advisor".to_string(),
-            role,
-            models,
-            self.default_params.clone(),
-        )?;
-        let sys = agent.system_message(&serde_json::json!({}))?;
-        let user = Message::user(build_delegate_review_prompt(
+        let prompt = build_delegate_review_prompt(
             main_topic,
             role_id,
             role_responsibilities,
@@ -1299,48 +1336,86 @@ impl AdvisorReviewEngine {
             response,
             tool_call_summary,
             constraints,
-        ));
-        let model_id = agent
-            .model_chain
-            .first()
-            .map(|m| m.model.id.clone())
-            .unwrap_or_default();
-        // 同 review()：真实时延 + finish_reason 在调用完成后记录。
-        let started = std::time::Instant::now();
-        let completion = agent.chat(&[sys, user], None, WaitPolicy::NoWait).await;
-        let latency_ms = started.elapsed().as_millis() as u64;
-        let completion = match completion {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(sink) = self.subsession_sink.as_ref() {
-                    let meta = crate::trace::TraceMeta::now(0, "advisor", "");
-                    sink.emit(crate::trace::TraceEvent::ModelCall {
-                        meta,
-                        model_id,
-                        params_json: serde_json::to_string(&self.default_params)
-                            .unwrap_or_default(),
-                        latency_ms,
-                        finish_reason: format!("error: {e}"),
-                    });
-                }
-                return Err(e);
-            }
-        };
-        if let Some(sink) = self.subsession_sink.as_ref() {
-            let meta = crate::trace::TraceMeta::now(0, "advisor", "");
-            sink.emit(crate::trace::TraceEvent::ModelCall {
-                meta: meta.clone(),
-                model_id,
-                params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
-                latency_ms,
-                finish_reason: completion.stop_reason.clone(),
+        );
+        // 逐个模型尝试：前面的模型各有一段时限，超时/出错换下一个；最后一个
+        // 不限时（同步预算耗尽后由调用方转入后台，结论晚到但不作废）。
+        let started_all = std::time::Instant::now();
+        let n = models.len();
+        let mut last_err: Option<AgentError> = None;
+        for (i, model) in models.into_iter().enumerate() {
+            let limit = budget.and_then(|b| {
+                review_attempt_limit(i, n, b.saturating_sub(started_all.elapsed()))
             });
+            let agent = Agent::new_with_chain(
+                "advisor".to_string(),
+                role.clone(),
+                vec![model],
+                self.default_params.clone(),
+            )?;
+            let sys = agent.system_message(&serde_json::json!({}))?;
+            let user = Message::user(prompt.clone());
+            let model_id = agent
+                .model_chain
+                .first()
+                .map(|m| m.model.id.clone())
+                .unwrap_or_default();
+            *self.inflight_model.lock() = model_id.clone();
+            let started = std::time::Instant::now();
+            let msgs = [sys, user];
+            let call = agent.chat(&msgs, None, WaitPolicy::NoWait);
+            let completion = match limit {
+                Some(l) => match tokio::time::timeout(l, call).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        self.emit_review_call(&model_id, started, "timeout".into(), None);
+                        tracing::warn!(model = %model_id, secs = l.as_secs(), "advisor review attempt timed out; trying next model");
+                        continue;
+                    }
+                },
+                None => call.await,
+            };
+            match completion {
+                Ok(c) => {
+                    self.emit_review_call(&model_id, started, c.stop_reason.clone(), Some(&c.content));
+                    return Ok(parse_verdict(&c.content));
+                }
+                Err(e) => {
+                    self.emit_review_call(&model_id, started, format!("error: {e}"), None);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            AgentError::Orchestration("advisor 审查模型链上的模型都在时限内没有返回".into())
+        }))
+    }
+
+    /// 审查调用落盘：真实时延 + finish_reason（超时也记，此前超时的审查
+    /// 整个 future 被丢弃，子会话里没有任何痕迹）。
+    fn emit_review_call(
+        &self,
+        model_id: &str,
+        started: std::time::Instant,
+        finish_reason: String,
+        raw: Option<&str>,
+    ) {
+        let Some(sink) = self.subsession_sink.as_ref() else {
+            return;
+        };
+        let meta = crate::trace::TraceMeta::now(0, "advisor", "");
+        sink.emit(crate::trace::TraceEvent::ModelCall {
+            meta: meta.clone(),
+            model_id: model_id.to_string(),
+            params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            finish_reason,
+        });
+        if let Some(raw) = raw {
             sink.emit(crate::trace::TraceEvent::ModelRawOut {
                 meta,
-                raw_content: completion.content.clone(),
+                raw_content: raw.to_string(),
             });
         }
-        Ok(parse_verdict(&completion.content))
     }
 }
 
@@ -2379,6 +2454,18 @@ impl AdvisorMonitor {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn review_attempt_limit_splits_budget_across_chain() {
+        let b = Duration::from_secs(90);
+        assert_eq!(review_attempt_limit(0, 1, b), None, "唯一的模型不限时（预算外转后台）");
+        assert_eq!(review_attempt_limit(0, 2, b), Some(Duration::from_secs(45)));
+        assert_eq!(review_attempt_limit(1, 2, b), None);
+        assert_eq!(review_attempt_limit(0, 3, b), Some(Duration::from_secs(45)));
+        assert_eq!(review_attempt_limit(1, 3, Duration::from_secs(40)), Some(Duration::from_secs(20)));
+        assert_eq!(review_attempt_limit(2, 3, b), None);
+    }
+
     use super::*;
     use crate::config::{ModelCatalog, ModelDef};
 

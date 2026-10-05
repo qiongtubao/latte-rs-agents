@@ -230,10 +230,16 @@ impl UiBackend {
         // 的工作区根（Tauri 内嵌场景）。
         let cwd = cwd.map(Ok).unwrap_or_else(std::env::current_dir)?;
 
+        let resolver = Arc::new(model_resolver);
+        // 余额不足提示要点名「哪些角色在用没钱的账户」：注册模型目录与角色查询。
+        latte_agent_core::billing::register_host(
+            Arc::clone(&resolver),
+            merged.read().models.models.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+        );
         let backend = Self {
             sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             merged,
-            resolver: Arc::new(model_resolver),
+            resolver,
             cwd: cwd.clone(),
             initial_role,
             initial_tier,
@@ -712,6 +718,7 @@ fn build_router(state: AppState) -> Router {
         // 自动上下文压缩设置面板（写 agents.d/compaction.toml；
         // 保存后推进 resolver 快照，已加载会话下一轮即生效）
         .route("/compaction", get(get_compaction).put(put_compaction))
+        .route("/billing", get(get_billing))
         // 工具管理
         .route("/tools", get(list_tools))
         .route("/tools/test", axum::routing::post(test_tool))

@@ -174,6 +174,9 @@ impl ModelClient {
 
     /// Whether this model is currently usable (cooldown absent or elapsed).
     fn is_available(&self) -> bool {
+        if crate::billing::blocked(&self.model).is_some() {
+            return false;
+        }
         match *self.cooldown_until.lock() {
             None => true,
             Some(t) => Instant::now() >= t,
@@ -366,6 +369,15 @@ impl Agent {
         let mut failures: Vec<(String, String)> = Vec::with_capacity(self.model_chain.len());
 
         for mc in &self.model_chain {
+            if let Some(msg) = crate::billing::blocked(&mc.model) {
+                // 账户没钱：本进程内所有模型链都跳过它，不发请求。
+                tried.push(mc.model.id.clone());
+                failures.push((
+                    mc.model.id.clone(),
+                    format!("{}：{msg}", crate::billing::BILLING_FAILURE_PREFIX),
+                ));
+                continue;
+            }
             if !mc.is_available() {
                 continue;
             }
@@ -388,6 +400,16 @@ impl Agent {
                 }
                 Err(e) => {
                     tried.push(mc.model.id.clone());
+                    if crate::billing::is_billing_error(&e) {
+                        // 不设冷却：冷却挂在本 Agent 上，新建的 Agent 会再撞一次；
+                        // 进程级登记让所有链都跳过它，且不计入自动重试时间。
+                        crate::billing::mark(&mc.model, &e.to_string());
+                        failures.push((
+                            mc.model.id.clone(),
+                            format!("{}：{}", crate::billing::BILLING_FAILURE_PREFIX, brief_model_error(&e)),
+                        ));
+                        continue;
+                    }
                     failures.push((mc.model.id.clone(), brief_model_error(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
@@ -412,8 +434,13 @@ impl Agent {
         if wait == WaitPolicy::WaitAndRetry {
             if let Some(d) = earliest {
                 tokio::time::sleep(d).await;
-                // After waiting, retry the highest-priority model once.
-                if let Some(mc) = self.model_chain.first() {
+                // After waiting, retry the highest-priority usable model once
+                // （余额不足的账户不算：重试它毫无意义）。
+                if let Some(mc) = self
+                    .model_chain
+                    .iter()
+                    .find(|mc| crate::billing::blocked(&mc.model).is_none())
+                {
                     match mc.client.chat(messages, p).await {
                         Ok(c) if !is_empty_completion(&c) => return Ok(c),
                         Ok(_) => {
@@ -426,8 +453,10 @@ impl Agent {
                             ));
                         }
                         Err(e) => {
-                            // Refresh its cooldown if retryable.
-                            if let Some(cd) = cooldown_for_error(&e) {
+                            if crate::billing::is_billing_error(&e) {
+                                crate::billing::mark(&mc.model, &e.to_string());
+                            } else if let Some(cd) = cooldown_for_error(&e) {
+                                // Refresh its cooldown if retryable.
                                 mc.set_cooldown(cd);
                             }
                             tried.push(mc.model.id.clone());
@@ -473,6 +502,14 @@ impl Agent {
         let mut failures: Vec<(String, String)> = Vec::with_capacity(self.model_chain.len());
 
         for mc in &self.model_chain {
+            if let Some(msg) = crate::billing::blocked(&mc.model) {
+                tried.push(mc.model.id.clone());
+                failures.push((
+                    mc.model.id.clone(),
+                    format!("{}：{msg}", crate::billing::BILLING_FAILURE_PREFIX),
+                ));
+                continue;
+            }
             if !mc.is_available() {
                 continue;
             }
@@ -483,6 +520,14 @@ impl Agent {
                 }
                 Err(e) => {
                     tried.push(mc.model.id.clone());
+                    if crate::billing::is_billing_error(&e) {
+                        crate::billing::mark(&mc.model, &e.to_string());
+                        failures.push((
+                            mc.model.id.clone(),
+                            format!("{}：{}", crate::billing::BILLING_FAILURE_PREFIX, brief_model_error(&e)),
+                        ));
+                        continue;
+                    }
                     failures.push((mc.model.id.clone(), brief_model_error(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
@@ -535,12 +580,21 @@ impl Agent {
     /// 的场景（实测 glm-5.3 中转站的 400）。不冷却的话下一次重开流还会选中
     /// 同一个模型，永远换不掉，模型链形同虚设。
     pub fn cooldown_serving_model(&self, cd: Duration) -> Option<String> {
-        let i = self.served_index.load(std::sync::atomic::Ordering::Relaxed);
-        let mc = self
-            .model_chain
-            .get(i)
-            .or_else(|| self.model_chain.first())?;
+        let mc = self.serving_model()?;
         mc.set_cooldown(cd);
+        Some(mc.model.id.clone())
+    }
+
+    fn serving_model(&self) -> Option<&ModelClient> {
+        let i = self.served_index.load(std::sync::atomic::Ordering::Relaxed);
+        self.model_chain.get(i).or_else(|| self.model_chain.first())
+    }
+
+    /// 流已建立后才报出的余额类错误（`StreamEvent::HttpError` 402）：把当前
+    /// 接单的模型所属账户登记为摘除。返回模型 id。
+    pub fn mark_serving_billing(&self, err: &AiError) -> Option<String> {
+        let mc = self.serving_model()?;
+        crate::billing::mark(&mc.model, &err.to_string());
         Some(mc.model.id.clone())
     }
 
@@ -1211,6 +1265,19 @@ fn failures_are_all_transport(failures: &[(String, String)]) -> bool {
 
 /// `ModelsUnavailable` 的人类可读摘要：tried/failures + 最近可重试
 /// 时间。给自动暂停的 Paused 事件原因用。
+/// 失败清单里每一项都是「余额不足 / 配额耗尽」。
+fn failures_are_all_billing(e: &AgentError) -> bool {
+    match e {
+        AgentError::ModelsUnavailable { failures, .. } => {
+            !failures.is_empty()
+                && failures
+                    .iter()
+                    .all(|(_, f)| f.starts_with(crate::billing::BILLING_FAILURE_PREFIX))
+        }
+        _ => false,
+    }
+}
+
 fn model_failures_summary(e: &AgentError) -> String {
     match e {
         AgentError::ModelsUnavailable {
@@ -2645,7 +2712,14 @@ impl AgentRunner {
             .filter(|_| attempt < max_retries)
             .map(|d| auto_pause_backoff(attempt, d));
 
-        let hint = if failures_include_context_overflow(e) {
+        let billing = crate::billing::blocked_summary();
+        let all_billing = failures_are_all_billing(e);
+        let hint = if all_billing {
+            format!(
+                "模型链上能用的账户都余额不足/配额耗尽：{}。重试无意义，已停下等你处理——充值（或在模型配置里换掉这些模型）后点 ▶ 继续，会重新检测",
+                billing.join("；")
+            )
+        } else if failures_include_context_overflow(e) {
             "检测到上下文超出模型窗口——原样重试必败。点 ▶ 继续将自动裁剪本轮待发消息中的超长内容（多为工具结果）后重试；会话记录不受影响"
                 .to_string()
         } else if let Some(d) = auto_after {
@@ -2660,6 +2734,15 @@ impl AgentRunner {
         } else {
             format!("已连续自动重试 {max_retries} 次仍不可用，转人工——点 ▶ 继续会再试一次")
         };
+        // 混合失败（限流 + 余额不足）：只重试能恢复的那些，余额不足的账户点名出来。
+        let hint = if !all_billing && !billing.is_empty() {
+            format!(
+                "{hint}。另：{} 余额不足/配额耗尽，已摘除、不参与重试，充值后点 ▶ 继续会重新启用",
+                billing.join("；")
+            )
+        } else {
+            hint
+        };
         gate.pause_with_reason(format!("模型不可用（{summary}），已自动暂停——{hint}"));
         self.sink.emit(crate::trace::TraceEvent::SessionPaused {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
@@ -2668,22 +2751,35 @@ impl AgentRunner {
             turn: 0,
         });
 
-        let resumed = match auto_after {
+        // 全是余额类失败：不自动重试（auto_after 已经是 None，因为它们不计入
+        // cooldown），直接等人工；人工继续 = 多半刚充完值，放行所有账户重测。
+        let auto_after = if all_billing { None } else { auto_after };
+        // (是否恢复, 是否人工点的继续)
+        let (resumed, manual) = match auto_after {
             // 退避窗口内人点了 ▶ 就走人工路径；没人管则超时自恢复。
             // 注意 gate 必须由我们显式 resume：wait 超时不会解除门，
             // 而门还 engaged 的话后续 park 点会再次卡住。
             Some(d) => match tokio::time::timeout(d, gate.wait_until_resumed(None)).await {
-                Ok(r) => matches!(r, crate::pause_gate::WaitResult::Ok),
+                Ok(r) => (matches!(r, crate::pause_gate::WaitResult::Ok), true),
                 Err(_) => {
                     gate.resume();
-                    true
+                    (true, false)
                 }
             },
-            None => matches!(
-                gate.wait_until_resumed(None).await,
-                crate::pause_gate::WaitResult::Ok
+            None => (
+                matches!(
+                    gate.wait_until_resumed(None).await,
+                    crate::pause_gate::WaitResult::Ok
+                ),
+                true,
             ),
         };
+        // 人工继续 = 多半刚充完值：放行所有被摘除的账户，下一次请求重新检测。
+        // 自动退避恢复不放行——那只是限流窗口过去了，余额不会自己回来。
+        if resumed && manual && !billing.is_empty() {
+            let n = crate::billing::clear_all();
+            tracing::info!(accounts = n, "manual resume: billing blocks cleared for re-probe");
+        }
         self.sink.emit(crate::trace::TraceEvent::SessionResumed {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
             task_id: String::new(),
@@ -3264,8 +3360,12 @@ impl AgentRunner {
         if streamed_any || *fallbacks >= max {
             return None;
         }
-        let cd = cooldown_for_error(err)?;
-        let from = self.agent.cooldown_serving_model(cd)?;
+        let from = if crate::billing::is_billing_error(err) {
+            self.agent.mark_serving_billing(err)?
+        } else {
+            let cd = cooldown_for_error(err)?;
+            self.agent.cooldown_serving_model(cd)?
+        };
         let to = self.agent.next_available_model_after(&from);
         *fallbacks += 1;
         self.sink.emit(crate::trace::TraceEvent::FallbackTriggered {
@@ -6439,6 +6539,56 @@ mod tests {
     }
 
     /// Build a Model whose `base_url` points at the given wiremock server.
+    /// 余额不足（402）：登记到进程级账户表，**新建的 Agent** 也直接跳过它、
+    /// 不再发请求；全链只剩余额类失败时 next_retry_in = None（不自动重试）。
+    #[tokio::test]
+    async fn billing_failure_is_shared_across_agents_and_not_retried() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let broke = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(402).set_body_string(
+                r#"{"error":{"message":"Insufficient Balance"}}"#,
+            ))
+            .mount(&broke)
+            .await;
+        let ok = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_completion_body("好", vec![])),
+            )
+            .mount(&ok)
+            .await;
+        let chain = || vec![model_at(&broke, "broke-a"), model_at(&ok, "ok-b")];
+        let mk = |models| {
+            Agent::new_with_chain("t".into(), test_role(), models, GenerateParams::default()).unwrap()
+        };
+        let msgs = [Message::user("hi")];
+        mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("回落到 ok-b");
+        mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("第二个 Agent 同样成功");
+        assert_eq!(
+            broke.received_requests().await.unwrap().len(),
+            1,
+            "余额不足的账户只打一次：第二个 Agent 不再请求它"
+        );
+        // 同账户（同 base_url + key）的另一个模型也被摘除。
+        let err = mk(vec![model_at(&broke, "broke-c")])
+            .chat(&msgs, None, WaitPolicy::WaitAndRetry)
+            .await
+            .unwrap_err();
+        match &err {
+            AgentError::ModelsUnavailable { failures, next_retry_in, .. } => {
+                assert!(next_retry_in.is_none(), "余额不足不给重试时间");
+                assert!(failures[0].1.starts_with(crate::billing::BILLING_FAILURE_PREFIX));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(failures_are_all_billing(&err));
+        assert_eq!(broke.received_requests().await.unwrap().len(), 1, "WaitAndRetry 也不重试它");
+    }
+
     fn model_at(server: &wiremock::MockServer, id: &str) -> Model {
         Model {
             id: id.into(),
@@ -6735,6 +6885,42 @@ mod tests {
         let retry = runner.pause_wait_model_unavailable(&err, 0).await;
         assert!(retry, "resume 后应返回 true（重试）");
         assert!(!gate.is_paused(), "resume 后门已放开");
+    }
+
+    /// 全链只剩余额不足：不自动退避重试（哪怕带了 cooldown），暂停原因点明
+    /// 「余额不足」；用户手动继续时放行被摘除的账户重新检测。
+    #[tokio::test]
+    async fn billing_only_failure_pauses_without_auto_retry() {
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = crate::pause_gate::AgentPauseGate::new("session");
+        let runner = AgentRunner::new(agent).with_agent_pause_gate(gate.clone());
+        let err = AgentError::ModelsUnavailable {
+            tried: vec!["ds".into()],
+            failures: vec![(
+                "ds".into(),
+                format!("{}：402 Insufficient Balance", crate::billing::BILLING_FAILURE_PREFIX),
+            )],
+            next_retry_in: Some(Duration::from_millis(50)),
+        };
+        let g2 = gate.clone();
+        let watcher = tokio::spawn(async move {
+            // 远超 50ms 的退避窗口：若仍在自动重试，这期间门早已被放开。
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let still_paused = g2.is_paused();
+            let reason = g2.pause_reason().unwrap_or_default();
+            g2.resume();
+            (still_paused, reason)
+        });
+        assert!(runner.pause_wait_model_unavailable(&err, 0).await);
+        let (still_paused, reason) = watcher.await.unwrap();
+        assert!(still_paused, "余额不足不该自动退避恢复");
+        assert!(reason.contains("余额不足") && reason.contains("充值"), "{reason}");
     }
 
     /// 无暂停门 → 不等人，直接 false（调用方原样抛错，保持旧行为）。

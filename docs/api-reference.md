@@ -603,6 +603,26 @@ rounds <N> | budget <N|off>` 走 `POST /api/chat/command`（见 3 节），模�
 
 ## 9c. 自动上下文压缩设置
 
+### `GET /api/billing`
+
+当前因**余额不足 / 配额耗尽**（402、`insufficient_quota`、「余额不足」等）被摘除的模型账户，以及哪些角色的实际模型链用到了它们。账户 = provider + base_url + key 指纹；被摘除的账户在所有模型链里都被跳过、不再重试，用户手动继续或 `LATTE_AI_BILLING_RECHECK_SECS` 后重新探测。UI 聊天区顶部的 💳 横幅读这个端点。
+
+```json
+{
+  "accounts": [{
+    "provider": "deepseek",
+    "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
+    "message": "API error: 402 - Insufficient Balance",
+    "recheck_in_secs": 1740,
+    "roles": [
+      { "role": "manager", "models": ["deepseek-v4-flash", "deepseek-v4-pro"], "all_blocked": false }
+    ]
+  }]
+}
+```
+
+`all_blocked = true` 表示该角色链上的模型全部被摘除，派给它的任务会暂停等人处理。
+
 ### `GET /api/compaction`
 
 读取自动上下文压缩的**生效参数**与各层原始声明。

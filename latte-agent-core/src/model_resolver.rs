@@ -244,6 +244,38 @@ impl ModelResolver {
         self.snapshot().get_def(model_id).cloned()
     }
 
+    /// 哪些角色的**实际模型链**（与 runner / workflow 分派同一套解析：
+    /// model_chain 优先，否则按 tier）用到了 `models` 里的模型。
+    /// 返回 `(角色 id, 命中的模型 id)`，按角色 id 排序。余额不足提示用：
+    /// 告诉用户「这些角色正在用没钱的账户」。
+    pub fn roles_using_models(
+        &self,
+        models: &std::collections::BTreeSet<String>,
+    ) -> Vec<(String, Vec<String>)> {
+        let snap = self.snapshot();
+        let mut roles: Vec<&String> = snap.role_model_chains.keys().collect();
+        roles.sort();
+        roles
+            .into_iter()
+            .filter_map(|role| {
+                let chain = snap.role_model_chains.get(role).cloned().unwrap_or_default();
+                let tier = snap
+                    .role_model_tiers
+                    .get(role)
+                    .copied()
+                    .unwrap_or(ModelTier::Standard);
+                let hit: Vec<String> = snap
+                    .resolve_chain(role, tier, &chain)
+                    .ok()?
+                    .into_iter()
+                    .map(|m| m.id)
+                    .filter(|id| models.contains(id))
+                    .collect();
+                (!hit.is_empty()).then(|| (role.clone(), hit))
+            })
+            .collect()
+    }
+
     /// 角色的模型指派（model_chain + model_tier），来自最新配置快照。
     /// 角色编辑器保存后，运行中的 runner（turn 边界自查）与 workflow
     /// 分派（每次分派重新解析）据此热生效。角色未知 → None。

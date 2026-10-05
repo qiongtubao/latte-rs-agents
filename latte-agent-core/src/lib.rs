@@ -38,6 +38,7 @@
 
 pub mod advisor_monitor;
 pub mod agent;
+pub mod billing;
 pub mod bridge;
 pub mod checkpoint;
 pub mod choice;

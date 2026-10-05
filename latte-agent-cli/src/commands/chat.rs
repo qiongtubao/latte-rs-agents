@@ -237,6 +237,11 @@ impl ChatCmd {
         emit_config_loaded(&log, &resolved.sources);
         let merged = resolved.config;
         let resolver = resolved.resolver;
+        // 余额不足提示要点名受影响角色：注册模型目录与角色查询。
+        latte_agent_core::billing::register_host(
+            Arc::new(resolver.clone()),
+            merged.models.models.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+        );
         let default_params = GenerateParams::default();
         let initial_role = self.role.clone().unwrap_or_else(|| "manager".into());
         // Advisor 监察：旁路订阅会话事件流，异常时经 hint 注入纠偏
@@ -1916,6 +1921,37 @@ fn cli_session_event_tx(
         let (tx, rx) = tokio::sync::broadcast::channel(256);
         // 消费者随进程存活；REPL 退出即进程退出，无需回收。
         spawn_cli_workflow_event_consumer_with(rx, terminal_ask_answerer());
+        latte_agent_core::billing::forward_to(tx.clone());
+        // 自动暂停（模型全链不可用）必须让 chat 用户看见：此前 CLI 的 pause gate
+        // 没挂 on_change，runner 自动暂停后终端一片安静（实测 LAT-110：静默挂起
+        // 45 分钟，用户以为卡死）。对齐 UI 的 `ChatController::new`。
+        {
+            let tx2 = tx.clone();
+            let gate = cli_pause_gate();
+            let gate2 = gate.clone();
+            // /pause、/resume 由带外处理自己打印；这里只转发引擎发起的暂停与其恢复。
+            let auto = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            gate.on_change(move |paused| {
+                use std::sync::atomic::Ordering;
+                let ev = if paused {
+                    let reason = gate2
+                        .pause_reason()
+                        .filter(|r| !r.is_empty())
+                        .unwrap_or_else(|| "session 已暂停".into());
+                    if reason.starts_with("用户手动暂停") {
+                        return;
+                    }
+                    auto.store(true, Ordering::SeqCst);
+                    latte_agent_core::controller::ChatEvent::Paused { reason }
+                } else {
+                    if !auto.swap(false, Ordering::SeqCst) {
+                        return;
+                    }
+                    latte_agent_core::controller::ChatEvent::Resumed
+                };
+                let _ = tx2.send(ev);
+            });
+        }
         tx
     })
 }

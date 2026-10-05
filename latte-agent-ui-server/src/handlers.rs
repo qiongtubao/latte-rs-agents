@@ -1702,3 +1702,11 @@ pub(crate) async fn get_code_graph_mermaid(
         Err(msg) => Err((StatusCode::UNPROCESSABLE_ENTITY, msg)),
     }
 }
+
+/// `GET /api/billing` —— 当前因余额不足 / 配额耗尽被摘除的模型账户，以及
+/// 哪些角色的模型链用到了它们（UI 顶部横幅用）。
+pub(crate) async fn get_billing() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "accounts": latte_agent_core::billing::blocked_accounts(),
+    }))
+}

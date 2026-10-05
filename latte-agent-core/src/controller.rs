@@ -1377,6 +1377,8 @@ impl ChatController {
     /// `spawn()` to begin.
     pub fn new(event_capacity: usize) -> Self {
         let (event_tx, _) = broadcast::channel(event_capacity);
+        // 模型账户余额不足：进程级登记首次摘除某账户时，本会话收到一条状态消息。
+        crate::billing::forward_to(event_tx.clone());
         let agent_pause_gate = crate::pause_gate::AgentPauseGate::new("session");
         // 暂停事件统一由 gate 的 on_change 发出：用户手动 ⏸/▶
         // （pause_session/resume_session）与 runner 的自动暂停（模型
@@ -8646,6 +8648,47 @@ pub fn register_goal_tool(
     Ok(())
 }
 
+/// delegate-return 审查的等待方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReviewMode {
+    /// 按预算同步等结论（结论会触发重做/批注的路径）。
+    Blocking,
+    /// 不等：产出立即放行，结论到了作为气泡发出。用于结论本就「仅作参考」
+    /// 的 step（声明了产出契约、或有引擎机械检查的章节写作阶段）。
+    Background,
+}
+
+/// 调用方已经放行之后才到的审查结论：只有 warn 及以上才发气泡（ok 不打扰）。
+fn emit_late_review(
+    event_tx: &broadcast::Sender<ChatEvent>,
+    role_id: &str,
+    r: crate::error::AgentResult<crate::advisor_monitor::ReviewVerdict>,
+) {
+    use crate::advisor_monitor::Verdict;
+    let v = match r {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("late delegate-return review failed: {e}");
+            return;
+        }
+    };
+    if v.verdict == Verdict::Ok {
+        return;
+    }
+    let label = if v.verdict == Verdict::Warn { "⚠️ warn" } else { "🛑 intervene" };
+    let reason = if v.reason.is_empty() { "疑似偏离职责或未完全达成委派任务".to_string() } else { v.reason };
+    let mut bubble = format!("{label}（{role_id} 委派返回审查·迟到，产出已放行）：{reason}");
+    if !v.hint.is_empty() {
+        bubble.push_str(&format!("\n\n> 建议：{}", v.hint));
+    }
+    let _ = event_tx.send(ChatEvent::RoleTurn {
+        role_id: "advisor".to_string(),
+        content: bubble,
+        is_complete: true,
+        sub_id: None,
+    });
+}
+
 /// Delegate-return gate: review a specialist's output before it flows
 /// back to the manager, checking (1) role-responsibility adherence and
 /// (2) whether the return actually answers the delegated task. Emits a
@@ -8654,7 +8697,7 @@ pub fn register_goal_tool(
 /// Degrades silently (returns `response` unchanged) when the advisor is
 /// unavailable or the review times out.
 pub(crate) async fn gate_delegate_return(
-    engine: &AdvisorReviewEngine,
+    engine: &Arc<AdvisorReviewEngine>,
     event_tx: &broadcast::Sender<ChatEvent>,
     // 用户在主会话里的原始诉求，作为「是否符合预期」的准绳。空串表示
     // 调用方拿不到（此时 prompt 会显式告知 advisor 不要据此下判）。
@@ -8667,29 +8710,68 @@ pub(crate) async fn gate_delegate_return(
     // 被审子任务的执行约束（授权工具 + 产出契约摘要），workflow step
     // 路径由引擎组装传入；None = 调用方拿不到（manager delegate 等）。
     constraints: Option<&str>,
+    mode: ReviewMode,
 ) -> (String, Option<crate::advisor_monitor::ReviewVerdict>) {
     use crate::advisor_monitor::Verdict;
-    // Bound the review so a slow/absent advisor model can't stall the
-    // delegate return (mirrors the monitor's REVIEW_TIMEOUT_SECS).
-    // 预算可配（AdvisorMonitorConfig::review_settings）：实测实锤
-    // 45s 硬编码对 20–44s 延迟的慢审查模型太紧，频繁未审放行。
-    let timeout = engine.delegate_review_timeout();
-    let review = tokio::time::timeout(
-        timeout,
-        engine.review_delegate(
-            main_topic,
-            role_id,
-            role_responsibilities,
-            task,
-            &response,
-            tool_call_summary,
-            constraints,
-        ),
-    )
-    .await;
-    let verdict = match review {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
+    // 审查在独立 task 里跑，调用方只按预算**等**它，而不是按预算**杀**它：
+    // - 同步预算耗尽 → 产出放行，审查继续跑完，结论作为「迟到审查」气泡发出
+    //   （此前 timeout 直接 drop future：已等的 90s 作废、子会话无痕迹）；
+    // - `ReviewMode::Background`（结论本就只作参考的 step）→ 根本不等。
+    // 预算从拿到并发许可才开始算（见 AdvisorReviewEngine::review_permits）。
+    let budget = engine.delegate_review_timeout();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let engine = Arc::clone(engine);
+        let event_tx = event_tx.clone();
+        let (main_topic, role_id, duties, task, resp, tools, constraints) = (
+            main_topic.to_string(),
+            role_id.to_string(),
+            role_responsibilities.to_string(),
+            task.to_string(),
+            response.clone(),
+            tool_call_summary.to_string(),
+            constraints.map(str::to_string),
+        );
+        tokio::spawn(async move {
+            let Ok(_permit) = engine.review_permits().acquire_owned().await else {
+                return;
+            };
+            let _ = start_tx.send(());
+            let r = engine
+                .review_delegate(
+                    &main_topic,
+                    &role_id,
+                    &duties,
+                    &task,
+                    &resp,
+                    &tools,
+                    constraints.as_deref(),
+                    Some(budget),
+                )
+                .await;
+            // 调用方已不等了（超时放行 / 后台模式）：结论晚到，照样让人看见。
+            if let Err(r) = result_tx.send(r) {
+                emit_late_review(&event_tx, &role_id, r);
+            }
+        });
+    }
+    if mode == ReviewMode::Background {
+        return (response, None);
+    }
+    // 排队上限：等许可最多再等一个预算，过了就放行（审查仍会在拿到许可后跑完）。
+    if tokio::time::timeout(budget, start_rx).await.is_err() {
+        let _ = event_tx.send(ChatEvent::Status {
+            message: format!(
+                "⏳ advisor 审查排队超过 {}s：{role_id} 的返回先放行，审查结论稍后补发",
+                budget.as_secs()
+            ),
+        });
+        return (response, None);
+    }
+    let verdict = match tokio::time::timeout(budget, result_rx).await {
+        Ok(Ok(Ok(v))) => v,
+        Ok(Ok(Err(e))) => {
             tracing::warn!("delegate-return review failed (degraded): {e}");
             // 降级可见化：审查失败静默放行会让 advisor 看起来「卡住/
             // 消失」，发 Status 让用户知道这次返回没审。
@@ -8698,12 +8780,15 @@ pub(crate) async fn gate_delegate_return(
             });
             return (response, None);
         }
+        Ok(Err(_)) => return (response, None),
         Err(_) => {
-            tracing::warn!("delegate-return review timed out; passing through");
+            let model = engine.inflight_model();
+            tracing::warn!(model = %model, "delegate-return review timed out; passing through, verdict will arrive late");
             let _ = event_tx.send(ChatEvent::Status {
                 message: format!(
-                    "⏳ advisor 审查超时（{}s）：{role_id} 的返回未审直接放行",
-                    timeout.as_secs()
+                    "⏳ advisor 审查超过 {}s（{}）：{role_id} 的返回先放行，审查仍在后台进行，结论稍后补发",
+                    budget.as_secs(),
+                    if model.is_empty() { "模型未知".to_string() } else { format!("当前模型 {model}") }
                 ),
             });
             return (response, None);
@@ -9560,6 +9645,7 @@ async fn register_delegate_tool(
                     response,
                     "",   // manager delegate 路径，调用方无工具计数
                     None, // manager delegate 无 step 级执行约束
+                    ReviewMode::Blocking,
                 )
                 .await
                 .0),
