@@ -5408,3 +5408,5 @@ select {
 }
 .billing-banner__chip.is-dead { background: #fee2e2; border-color: #f87171; color: #991b1b; font-weight: 600; }
 .billing-banner__tip { margin-top: 4px; color: #92400e; font-size: 12px; word-break: break-all; }
+.billing-banner__more summary { cursor: pointer; }
+.billing-banner__more .billing-banner__chip { margin-top: 4px; }

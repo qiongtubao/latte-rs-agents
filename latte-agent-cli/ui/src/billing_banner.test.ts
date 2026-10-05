@@ -24,9 +24,12 @@ describe("billing_banner", () => {
     expect(banner.textContent).toContain("deepseek-v4-flash、deepseek-v4-pro");
     const chips = banner.querySelectorAll(".billing-banner__chip");
     expect(chips.length).toBe(2);
-    expect(chips[0].textContent).toContain("advisor");
-    expect(chips[1].classList.contains("is-dead")).toBe(true);
-    expect(chips[1].textContent).toContain("整条链不可用");
+    // 整条链不可用的排在前面、标红；其余折叠在 details 里。
+    expect(chips[0].textContent).toBe("summarizer");
+    expect(chips[0].classList.contains("is-dead")).toBe(true);
+    expect(banner.textContent).toContain("整条链不可用");
+    expect(banner.querySelector("details")!.textContent).toContain("1 个角色");
+    expect(chips[1].textContent).toBe("advisor");
     renderBillingBanner(msgs, []);
     expect(host.querySelector(".billing-banner")).toBeNull();
   });

@@ -51,17 +51,34 @@ export function renderBillingBanner(anchor: HTMLElement, accounts: BlockedAccoun
     if (a.roles.length === 0) {
       roles.textContent = "当前没有角色的模型链用到它。";
     } else {
-      roles.append("受影响角色：");
-      a.roles.forEach((r, i) => {
-        const chip = document.createElement("span");
-        chip.className = "billing-banner__chip" + (r.all_blocked ? " is-dead" : "");
-        chip.textContent = `${r.role}（${r.models.join("、")}${r.all_blocked ? "，整条链不可用" : "，会回落到链上其它模型"}）`;
-        chip.title = r.all_blocked
-          ? "这个角色链上的所有模型都没钱了，派给它的任务会暂停等你处理"
-          : "这个角色还有其它可用模型，会自动跳过没钱的账户";
-        roles.appendChild(chip);
-        if (i < a.roles.length - 1) roles.append(" ");
-      });
+      // 整条链不可用的角色逐个标红（它们的任务会暂停）；其余角色会自动回落到
+      // 链上其它模型，数量往往很多（tier 回落里人人都挂着同一个便宜模型），
+      // 折叠起来按需展开。
+      const dead = a.roles.filter((r) => r.all_blocked);
+      const live = a.roles.filter((r) => !r.all_blocked);
+      const chip = (r: RoleHit) => {
+        const c = document.createElement("span");
+        c.className = "billing-banner__chip" + (r.all_blocked ? " is-dead" : "");
+        c.textContent = r.role;
+        c.title = `${r.role} 链上被摘除：${r.models.join("、")}` +
+          (r.all_blocked ? "；整条链不可用，派给它的任务会暂停" : "；会自动回落到链上其它模型");
+        return c;
+      };
+      if (dead.length > 0) {
+        const line = document.createElement("div");
+        line.append("整条链不可用（任务会暂停）：");
+        dead.forEach((r) => line.append(chip(r), " "));
+        roles.appendChild(line);
+      }
+      if (live.length > 0) {
+        const det = document.createElement("details");
+        det.className = "billing-banner__more";
+        const sum = document.createElement("summary");
+        sum.textContent = `${live.length} 个角色链上有它，会自动回落到其它模型（展开查看）`;
+        det.appendChild(sum);
+        live.forEach((r) => det.append(chip(r), " "));
+        roles.appendChild(det);
+      }
     }
     row.appendChild(roles);
     const tip = document.createElement("div");

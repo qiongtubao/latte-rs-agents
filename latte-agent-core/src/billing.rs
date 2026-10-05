@@ -43,6 +43,8 @@ pub struct BillingNotice {
     pub message: String,
     /// 正在用这些模型的角色（宿主注册了 [`set_role_lookup`] 时才有）。
     pub roles: Vec<String>,
+    /// 其中整条模型链都已不可用的角色（派给它们的任务会暂停）。
+    pub dead_roles: Vec<String>,
 }
 
 /// 被摘除账户的快照（`GET /api/billing` 用）。
@@ -123,10 +125,24 @@ fn lookup_roles(models: &BTreeSet<String>) -> Vec<(String, Vec<String>, bool)> {
 impl BillingNotice {
     /// 给用户看的一行。
     pub fn render(&self) -> String {
+        // 角色多时（模型链的 tier 回落里几乎人人都挂着同一个便宜模型）只列名
+        // 不列模型，并截断——完整清单在 UI 横幅 / GET /api/billing。
+        const SHOW: usize = 8;
         let roles = if self.roles.is_empty() {
             String::new()
         } else {
-            format!("受影响角色：{}。", self.roles.join("、"))
+            let dead = if self.dead_roles.is_empty() {
+                "其余模型可用，会自动回落".to_string()
+            } else {
+                format!("其中整条链不可用、派给它们的任务会暂停：{}", self.dead_roles.join("、"))
+            };
+            let shown = self.roles.iter().take(SHOW).cloned().collect::<Vec<_>>().join("、");
+            let more = if self.roles.len() > SHOW {
+                format!(" 等 {} 个（完整列表见 UI 横幅 / GET /api/billing）", self.roles.len())
+            } else {
+                String::new()
+            };
+            format!("受影响角色：{shown}{more}；{dead}。")
         };
         format!(
             "💳 模型账户余额不足 / 配额耗尽：{}（{}），已从所有模型链中摘除，不再重试。{roles}\
@@ -270,18 +286,15 @@ pub fn mark(m: &Model, message: &str) -> bool {
         // 补进来：只要角色链里有同 provider+base_url+key 的模型都算受影响。
         let siblings = sibling_models(m);
         let all: BTreeSet<String> = models.iter().cloned().chain(siblings).collect();
-        let roles = lookup_roles(&all)
-            .into_iter()
-            .map(|(r, hit, all_blocked)| {
-                let tag = if all_blocked { "，整条链不可用" } else { "" };
-                format!("{r}（{}{tag}）", hit.join("、"))
-            })
-            .collect();
+        let hits = lookup_roles(&all);
+        let dead_roles = hits.iter().filter(|h| h.2).map(|h| h.0.clone()).collect();
+        let roles = hits.into_iter().map(|h| h.0).collect();
         let notice = BillingNotice {
             provider,
             models: all.into_iter().collect(),
             message,
             roles,
+            dead_roles,
         };
         tracing::warn!(provider = %notice.provider, models = ?notice.models, "model account out of balance; removed from chains");
         let _ = channel().send(notice);
@@ -440,10 +453,12 @@ mod tests {
             provider: "deepseek".into(),
             models: vec!["ds-flash".into()],
             message: "402".into(),
-            roles: vec!["tutor（ds-flash）".into(), "summarizer（ds-flash，整条链不可用）".into()],
+            roles: (0..10).map(|i| format!("r{i}")).collect(),
+            dead_roles: vec!["r3".into()],
         };
         let t = n.render();
-        assert!(t.contains("受影响角色：tutor（ds-flash）、summarizer（ds-flash，整条链不可用）"), "{t}");
+        assert!(t.contains("受影响角色：r0、r1、r2、r3、r4、r5、r6、r7 等 10 个"), "{t}");
+        assert!(t.contains("整条链不可用、派给它们的任务会暂停：r3"), "{t}");
     }
 
 }
