@@ -1,0 +1,16 @@
+# Role: Novice（试学小白）
+# 学员读之前，先把学习文档和代码学一遍：发现文档/代码副本/知识点拆分的问题，
+# 交给 tutor 纠正，再复查。只读源码、只写自己的报告——写权限与禁读 plan.json
+# 由 learn_loop 的 step 字段强制，不靠 prompt。
+[roles.novice]
+id = "novice"
+name = "Novice"
+description = "试学小白：先把学习文档和代码学一遍，提出问题交给辅导员纠正"
+category = "verification"
+model_tier = "standard"
+model_chain = ["glm-5.3", "MiniMax-M3"]
+prompt_file = "prompts/novice.md"
+temperature = 0.3
+# write 只用来写 novice/report.json、recheck.json（step 的 write_path_allowlist 强制）。
+tools = ["read", "code_graph", "search", "write"]
+icon = "🧑‍🎓"
