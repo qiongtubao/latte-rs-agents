@@ -111,6 +111,36 @@ describe("enhanceRenderedMarkdown", () => {
     el.remove();
   });
 
+  it("首次渲染失败时用修补后的图源重试；成功后放大/复制仍用原图源", async () => {
+    mermaidRender.mockRejectedValueOnce(new Error("Parse error on line 2"));
+    const el = make('<div class="mermaid">flowchart TD\n  A[调用 f(x)] --&gt; B</div>');
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el);
+    for (let i = 0; i < 4; i++) await flush();
+    const mmd = el.querySelector(".mermaid") as HTMLElement;
+    expect(mermaidRender).toHaveBeenCalledTimes(2);
+    expect(mermaidRender.mock.calls[1][1]).toContain('A["调用 f(x)"]');
+    expect(mmd.classList.contains("mermaid-error")).toBe(false);
+    expect(mmd.querySelector("svg")).not.toBeNull();
+    el.remove();
+  });
+
+  it("修补后仍失败：回退代码块并写明原始报错", async () => {
+    mermaidRender.mockRejectedValueOnce(new Error("Parse error on line 2\nlong detail"));
+    mermaidRender.mockRejectedValueOnce(new Error("second"));
+    const el = make('<div class="mermaid">flowchart TD\n  A[f(x)] --&gt; B</div>');
+    document.body.appendChild(el);
+    enhanceRenderedMarkdown(el);
+    for (let i = 0; i < 4; i++) await flush();
+    const mmd = el.querySelector(".mermaid")!;
+    expect(mmd.classList.contains("mermaid-error")).toBe(true);
+    const note = mmd.querySelector(".mermaid-error-note")!.textContent!;
+    expect(note).toContain("Parse error on line 2");
+    expect(note).not.toContain("second");
+    expect(mmd.querySelector("pre code")!.textContent).toBe("flowchart TD\n  A[f(x)] --> B");
+    el.remove();
+  });
+
   it("渲染完成的 mermaid 有「放大」入口，点击打开弹窗可下载/复制图源", async () => {
     const el = make('<div class="mermaid">graph TD; A--&gt;B;</div>');
     document.body.appendChild(el);

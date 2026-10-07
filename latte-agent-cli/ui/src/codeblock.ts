@@ -7,6 +7,7 @@
 // 流式 delta 每帧都会整体重渲染再调一次，两个步骤都必须幂等。
 
 import { getHost } from "./host";
+import { repairMermaidSource } from "./mermaid_repair";
 
 /** info string 是否形如可跳转的文件路径（带扩展名、无空白、非 URL）。 */
 function looksLikePath(info: string): boolean {
@@ -271,7 +272,12 @@ async function renderMermaidNode(el: HTMLElement): Promise<void> {
   if (el.dataset.mermaidPending) return;
   el.dataset.mermaidPending = "1";
   const source = el.textContent ?? "";
-  const renderId = `mmd-${Date.now()}-${mermaidSeq++}`;
+  let renderId = `mmd-${Date.now()}-${mermaidSeq++}`;
+  const cleanup = (id: string) => {
+    // 清理 mermaid 在某些异常路径下向 body 遗留的临时容器
+    document.getElementById(`d${id}`)?.remove();
+    document.getElementById(id)?.remove();
+  };
   try {
     const mermaid = (await loadMermaid()).default;
     mermaid.initialize({
@@ -280,25 +286,42 @@ async function renderMermaidNode(el: HTMLElement): Promise<void> {
       // 禁止 mermaid 遇到语法错误时向 document.body 注入包含版本号的错误 SVG
       suppressErrorRendering: true,
     });
-    const { svg } = await mermaid.render(renderId, source);
+    let svg: string;
+    try {
+      ({ svg } = await mermaid.render(renderId, source));
+    } catch (first) {
+      // 模型手写的图源常有可机械修补的语法错误（节点文字含括号没加引号等），
+      // 修补后再试一次；修不了就按原报错回退。
+      cleanup(renderId);
+      const repaired = repairMermaidSource(source);
+      if (!repaired) throw first;
+      renderId = `mmd-${Date.now()}-${mermaidSeq++}`;
+      try {
+        ({ svg } = await mermaid.render(renderId, repaired));
+      } catch {
+        throw first;
+      }
+    }
     if (!el.isConnected) return;
     el.innerHTML = svg;
     el.dataset.mermaidDone = "1";
     mermaidSources.set(el, source);
     enhanceMermaidFigure(el);
-  } catch {
-    // 清理 mermaid 在某些异常路径下向 body 遗留的临时容器
-    document.getElementById(`d${renderId}`)?.remove();
-    document.getElementById(renderId)?.remove();
+  } catch (err) {
+    cleanup(renderId);
     // 图源非法（或流式中途的半成品）：回退为带工具条的普通代码块，
-    // 保留原文可见，不静默吞掉内容。
+    // 保留原文可见，不静默吞掉内容；同时写明为什么没出图。
     if (!el.isConnected) return;
+    const note = document.createElement("div");
+    note.className = "mermaid-error-note";
+    const reason = String((err as Error)?.message ?? err).split("\n")[0].slice(0, 200);
+    note.textContent = `图表语法有误，未能渲染，下方为图源。${reason ? `（${reason}）` : ""}`;
     const pre = document.createElement("pre");
     const code = document.createElement("code");
     code.className = "language-mermaid";
     code.textContent = source;
     pre.appendChild(code);
-    el.replaceChildren(pre);
+    el.replaceChildren(note, pre);
     el.classList.add("mermaid-error");
     el.dataset.mermaidDone = "1";
     enhanceCodeBlocks(el);
