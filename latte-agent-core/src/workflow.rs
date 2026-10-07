@@ -172,10 +172,14 @@ fn check_required_tools(required: &[String], summary: &str) -> Result<(), String
         return Ok(());
     }
     let called = called_tool_names(summary);
+    // `write` 的语义是「真把产出落盘」：用 `edit` 改已有文件同样落了盘。返工时
+    // 只改被点名的字段就该用 edit——否则只能为补几个字段整份重写（实测 LAT-110
+    // cli-23288：为补 3 个 `wins_when` 把 19KB 的 plan.json 整份重写，第一次撞
+    // 输出长度上限被截断，整个重试耗了 32 分钟）。
     let missing: Vec<&str> = required
         .iter()
         .map(|r| short_tool_name(r))
-        .filter(|r| !called.contains(r))
+        .filter(|r| !(called.contains(r) || (*r == "write" && called.contains(&"edit"))))
         .collect();
     if missing.is_empty() {
         Ok(())
@@ -3538,8 +3542,24 @@ pub(crate) fn assemble_draft_from_sections(base: &std::path::Path) -> Result<boo
     if !combined.is_empty() {
         let draft_path = base.join("draft.md");
         std::fs::write(&draft_path, combined.trim_end()).map_err(|e| e.to_string())?;
-        // 章文件也引用 ml-*.svg（同一哈希），draft 覆盖全部章节，按它清旧图即可。
-        crate::learn_doc::prune_memlayout_images(base, &[combined.as_str()]);
+        // 清旧哈希的图：引用方按 draft **加上 sections/ 下所有 md** 算。只按 draft
+        // 算会误删——定稿发布沿链接走传递闭包，会走进不在当前 plan 里的旧章节
+        // （实测 LAT-110：k5 的「下一章」链到旧 plan 留下的 k6.md），它引用的图
+        // 已被清掉，发布出来就是破图。
+        let mut refs = vec![combined.clone()];
+        let mut stack = vec![sections_dir.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "md") {
+                    refs.extend(std::fs::read_to_string(&p).ok());
+                }
+            }
+        }
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        crate::learn_doc::prune_memlayout_images(base, &refs);
         return Ok(true);
     }
     Ok(false)
@@ -3553,7 +3573,7 @@ fn write_ledger(base: &std::path::Path, ledger: &serde_json::Value) -> Result<()
     .map_err(|e| e.to_string())
 }
 
-fn read_learn_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
+pub(crate) fn read_learn_json(path: &std::path::Path) -> Result<serde_json::Value, String> {
     serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
 }
@@ -3894,6 +3914,8 @@ fn chapter_so_far(sections: &Path, id: &str, step_id: &str) -> String {
 /// 单节的机械检查。`full` = false（返工增补）时只查 mermaid 能不能渲染。
 fn check_chapter_part(check: PartCheck, text: &str, full: bool) -> Vec<String> {
     let mut problems = lint_mermaid_blocks(text);
+    // 围栏没闭合、表格行被换行打断、<think> 泄漏：返工增补同样会写坏，一起查。
+    problems.extend(crate::md_lint::lint(text, None));
     problems.extend(crate::learn_doc::lint_memlayout_blocks(text));
     if !full {
         return problems;
@@ -4054,13 +4076,13 @@ fn chapter_part_targets(
 
 /// 阶段收尾的逐节检查：返工的节不许改坏（出处/篇幅），每节都得写出来且过检查项。
 /// 返回 Err 时，返工改坏的节已被还原。
-fn check_chapter_stage(targets: &[PartTarget], unchanged: bool) -> Result<(), String> {
+fn check_chapter_stage(targets: &[PartTarget], unchanged: bool, cwd: Option<&Path>) -> Result<(), String> {
     let mut problems = Vec::new();
     for t in targets {
         let (_, _, heading, check) = *chapter_part(t.n);
         if let Some(base) = &t.baseline {
             let current = std::fs::read_to_string(&base.path).unwrap_or_default();
-            if let Err(reason) = check_chapter_patch(&base.original, &current) {
+            if let Err(reason) = check_chapter_patch(&base.original, &current, cwd) {
                 let _ = std::fs::write(&base.path, &base.original);
                 problems.push(format!("「{}. {heading}」返工时改坏了（已还原）：{reason}", t.n));
                 continue;
@@ -4105,14 +4127,21 @@ fn chapter_citations(text: &str) -> BTreeSet<String> {
 }
 
 /// 返工后的章节必须保留原有全部出处，篇幅不能缩到原文六成以下。
-fn check_chapter_patch(original: &str, current: &str) -> Result<(), String> {
+///
+/// 例外：原文里**核对不通过**的出处（符号不在所引行里，见 [`crate::learn_cite`]）
+/// 允许改掉或删掉。否则写错一次的行号就被锁死，返工永远改不回来
+/// （实测 LAT-110：ch_design 把 `sz.h:133-137` 改对，被判「删掉了原有出处」还原）。
+fn check_chapter_patch(original: &str, current: &str, cwd: Option<&Path>) -> Result<(), String> {
     if current.trim().is_empty() {
         return Err("本章文件被清空了".into());
     }
     let kept = chapter_citations(current);
+    let wrong = cwd
+        .map(|c| crate::learn_cite::wrong_citations(original, &mut crate::learn_cite::SourceIndex::new(c)))
+        .unwrap_or_default();
     let missing: Vec<String> = chapter_citations(original)
         .into_iter()
-        .filter(|c| !kept.contains(c))
+        .filter(|c| !kept.contains(c) && !wrong.contains(c))
         .collect();
     if !missing.is_empty() {
         return Err(format!("删掉了原有的源码出处：{}", missing.join("、")));
@@ -4125,12 +4154,12 @@ fn check_chapter_patch(original: &str, current: &str) -> Result<(), String> {
 }
 
 /// 不合格就把原文件写回去，避免半成品留在磁盘上给下一轮或学员看到。
-fn reject_chapter_overwrite(baseline: Option<&ChapterBaseline>) -> Result<(), String> {
+fn reject_chapter_overwrite(baseline: Option<&ChapterBaseline>, cwd: Option<&Path>) -> Result<(), String> {
     let Some(base) = baseline else {
         return Ok(());
     };
     let current = std::fs::read_to_string(&base.path).unwrap_or_default();
-    if let Err(reason) = check_chapter_patch(&base.original, &current) {
+    if let Err(reason) = check_chapter_patch(&base.original, &current, cwd) {
         let _ = std::fs::write(&base.path, &base.original);
         return Err(reason);
     }
@@ -4656,7 +4685,7 @@ fn supplement_option_values() -> serde_json::Value {
 }
 
 /// 引擎登记的补充点。模型若删掉 `supplement` 标记，`sup1` 这种 id 仍算。
-fn is_engine_supplement_point(point: &serde_json::Value) -> bool {
+pub(crate) fn is_engine_supplement_point(point: &serde_json::Value) -> bool {
     if point
         .get("supplement")
         .and_then(|v| v.as_bool())
@@ -5439,7 +5468,7 @@ fn trailing_slug(response: &str) -> Option<String> {
 /// 把 plan.json 的 `evidence` 拆成一条条 `file:line[-line]`。
 /// 只写行号的段（`src/a.rs:10-20, 30-40` 里的 `30-40`）沿用前一段的文件——
 /// 实测模型自然会这么写，按格式错误打回会白烧一整轮重新取证。
-fn split_learn_evidence(evidence: &str) -> Vec<String> {
+pub(crate) fn split_learn_evidence(evidence: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut last_file: Option<String> = None;
     for part in evidence
@@ -5554,26 +5583,7 @@ fn is_comment_line(line: &str) -> bool {
     COMMENT_MARKERS.iter().any(|m| line.starts_with(m))
 }
 
-/// 副本行与源码行一致：逐字相同，或在源码行后面追加了行尾注释。
-/// 代码行比对口径：去首尾空白、内部连续空白（含 tab）压成一个空格。
-/// 宏续行 `\\` 前的对齐 tab 个数是排版，不是代码——实测 LAT-110：源码两个
-/// tab、副本一个 tab，被判「改了代码」，打回重写了三轮。
-fn normalize_code_ws(line: &str) -> String {
-    line.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn copy_line_matches(copy: &str, source_lines: &std::collections::HashSet<String>) -> bool {
-    if source_lines.contains(copy) {
-        return true;
-    }
-    source_lines.iter().any(|src| {
-        !src.is_empty()
-            && copy.starts_with(src.as_str())
-            && is_comment_line(copy[src.len()..].trim_start())
-    })
-}
-
-fn safe_relative_source(cwd: &Path, rel: &str) -> Option<PathBuf> {
+pub(crate) fn safe_relative_source(cwd: &Path, rel: &str) -> Option<PathBuf> {
     let p = Path::new(rel);
     if p.is_absolute()
         || p.components()
@@ -5798,161 +5808,6 @@ fn quarantine_learn_code(root: &Path, slug: &str) -> Result<Option<String>, Stri
     Ok(Some(qdir.join(&name).display().to_string()))
 }
 
-/// annotate 写完注释副本后的机械校验：每个副本标了真实出处，代码行逐字来自
-/// 源文件（只许加注释），plan 证据涉及的源文件都有副本覆盖。
-fn validate_learn_annotations(cwd: &Path, root_rel: &str, slug: &str) -> Result<(), String> {
-    let slug = slug.trim();
-    if !learn_slug_ok(slug) {
-        return Err(format!("slug「{slug}」不合法"));
-    }
-    let base = cwd.join(root_rel).join(slug);
-    let code_dir = base.join("code");
-    let rel_dir = format!("{root_rel}/{slug}/code");
-    if !code_dir.join("README.md").is_file() {
-        return Err(format!("{rel_dir}/README.md 索引不存在"));
-    }
-    let mut copies: Vec<PathBuf> = std::fs::read_dir(&code_dir)
-        .map_err(|e| format!("{rel_dir} 读不出：{e}"))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n != "README.md"))
-        .collect();
-    copies.sort();
-    if copies.is_empty() {
-        return Err(format!("{rel_dir} 里没有任何注释副本"));
-    }
-
-    let mut problems = Vec::new();
-    let mut covered: BTreeSet<String> = BTreeSet::new();
-    let mut source_cache: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-    // plan 证据里的源文件：副本出处写成裸文件名（`sc.h:198-241`）或只在
-    // 文件名里体现（`k2-sc.h`）时，按文件名回查到这里的完整路径。
-    let evidence_files: Vec<String> = read_learn_json(&base.join("plan.json"))
-        .ok()
-        .into_iter()
-        .flat_map(|plan| {
-            plan["knowledge_points"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|p| {
-                    split_learn_evidence(p["evidence"].as_str().unwrap_or(""))
-                        .into_iter()
-                        .filter_map(|part| part.rsplit_once(':').map(|(f, _)| f.to_string()))
-                        .collect::<Vec<_>>()
-                })
-        })
-        .filter(|f| safe_relative_source(cwd, f).is_some())
-        .collect();
-    let by_basename = |name: &str| -> Vec<String> {
-        evidence_files
-            .iter()
-            .filter(|f| f.rsplit('/').next() == Some(name))
-            .cloned()
-            .collect()
-    };
-    for copy in &copies {
-        let name = copy.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let text = std::fs::read_to_string(copy).unwrap_or_default();
-        let mut sources: Vec<String> = Vec::new();
-        let mut cited: Vec<String> = Vec::new();
-        let mut bogus: Vec<String> = Vec::new();
-        for cite in chapter_citations(&text) {
-            if let Some((path, _)) = cite.rsplit_once(':') {
-                if safe_relative_source(cwd, path).is_some() {
-                    cited.push(path.to_string());
-                } else if !path.contains('/') {
-                    cited.extend(by_basename(path));
-                } else if !bogus.iter().any(|b| b == path) {
-                    bogus.push(path.to_string());
-                }
-            }
-        }
-        // 写了完整路径却不存在：学员照着找不到文件，必须改（文件名推断救不了它）。
-        if !bogus.is_empty() {
-            problems.push(format!(
-                "{name}：原始出处 {} 不存在，写成仓库里真实的相对路径",
-                bogus.join("、")
-            ));
-            continue;
-        }
-        // 副本文件名 `<kid>-<源文件名>`：本身就是在声明出处。
-        if let Some((_, base_name)) = name.split_once('-') {
-            cited.extend(by_basename(base_name));
-        }
-        for path in cited {
-            if sources.iter().any(|s| *s == path) {
-                continue;
-            }
-            let Some(full) = safe_relative_source(cwd, &path) else {
-                continue;
-            };
-            let lines = std::fs::read_to_string(&full)
-                .unwrap_or_default()
-                .lines()
-                .map(normalize_code_ws)
-                .collect();
-            source_cache.entry(path.clone()).or_insert(lines);
-            sources.push(path);
-        }
-        if sources.is_empty() {
-            problems.push(format!("{name}：文件头没写指向真实源文件的原始出处（file:line）"));
-            continue;
-        }
-        covered.extend(sources.iter().cloned());
-        let mut source_lines = std::collections::HashSet::new();
-        for s in &sources {
-            source_lines.extend(source_cache[s].iter().cloned());
-        }
-        let mut bad = Vec::new();
-        for (n, raw) in text.lines().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || is_comment_line(line) {
-                continue;
-            }
-            if !copy_line_matches(&normalize_code_ws(line), &source_lines) {
-                bad.push(format!("第 {} 行「{line}」", n + 1));
-            }
-        }
-        if !bad.is_empty() {
-            let shown = bad.iter().take(3).cloned().collect::<Vec<_>>().join("、");
-            let more = if bad.len() > 3 { format!(" 等 {} 行", bad.len()) } else { String::new() };
-            problems.push(format!(
-                "{name}：{shown}{more} 在 {} 里找不到原文——副本只许加注释，不许改代码",
-                sources.join("、")
-            ));
-        }
-    }
-
-    if let Ok(plan) = read_learn_json(&base.join("plan.json")) {
-        let mut needed: BTreeSet<String> = BTreeSet::new();
-        for point in plan["knowledge_points"].as_array().into_iter().flatten() {
-            if is_engine_supplement_point(point) {
-                continue;
-            }
-            let evidence = point["evidence"].as_str().unwrap_or("");
-            for part in split_learn_evidence(evidence) {
-                if let Some((path, _)) = part.rsplit_once(':') {
-                    if safe_relative_source(cwd, path).is_some() {
-                        needed.insert(path.to_string());
-                    }
-                }
-            }
-        }
-        let missing: Vec<String> = needed.difference(&covered).cloned().collect();
-        if !missing.is_empty() {
-            problems.push(format!("这些证据文件没有注释副本：{}", missing.join("、")));
-        }
-    }
-
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("注释副本未通过校验：\n- {}", problems.join("\n- ")))
-    }
-}
-
 /// 一行去掉注释后的代码部分。整行注释、空行返回 None。
 fn code_part(line: &str) -> Option<&str> {
     let t = line.trim();
@@ -6101,166 +5956,17 @@ impl SyncCodeBaseline {
 }
 
 fn mermaid_blocks(text: &str) -> usize {
-    text.lines()
-        .filter(|l| l.trim_start().starts_with("```mermaid"))
-        .count()
+    crate::mermaid_lint::count_blocks(text)
 }
 
-/// 抽出全部 ```mermaid 围栏的源码（不含围栏行）。未闭合的围栏也算一块。
-fn mermaid_sources(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim_start();
-        match cur.as_mut() {
-            None if t.starts_with("```mermaid") => cur = Some(String::new()),
-            None => {}
-            Some(_) if t.starts_with("```") => out.push(cur.take().unwrap_or_default()),
-            Some(buf) => {
-                buf.push_str(line);
-                buf.push('\n');
-            }
-        }
-    }
-    if let Some(buf) = cur {
-        out.push(buf);
-    }
-    out
-}
-
-const MERMAID_KINDS: &[&str] = &[
-    "flowchart",
-    "graph",
-    "sequenceDiagram",
-    "stateDiagram",
-    "classDiagram",
-    "erDiagram",
-    "gantt",
-    "pie",
-    "mindmap",
-    "timeline",
-    "journey",
-    "quadrantChart",
-    "block-beta",
-    "packet-beta",
-    "xychart-beta",
-];
-
-/// flowchart 一行里未加引号、又含特殊字符的节点标签。
-/// 只认「标识符紧跟 `[` `(` `{`」这一种节点写法；`|…|` 边标签整段跳过，
-/// 避免把 `-->|有空闲(1)|` 误判成节点。返回出问题的标签原文。
-fn flowchart_bad_labels(line: &str) -> Vec<String> {
-    let chars: Vec<char> = line.chars().collect();
-    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    let mut bad = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '|' {
-            // 边标签：跳到下一个 `|`
-            i += 1;
-            while i < chars.len() && chars[i] != '|' {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        if c == '"' {
-            i += 1;
-            while i < chars.len() && chars[i] != '"' {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        if "[({".contains(c) && i > 0 && ident(chars[i - 1]) {
-            // 形状开括号最多两个字符（`((`、`([`、`[[`、`{{`、`[(`）
-            let mut j = i + 1;
-            if j < chars.len() && "[({/\\".contains(chars[j]) {
-                j += 1;
-            }
-            if j < chars.len() && chars[j] == '"' {
-                j += 1;
-                while j < chars.len() && chars[j] != '"' {
-                    j += 1;
-                }
-                i = j + 1;
-                continue;
-            }
-            let start = j;
-            while j < chars.len() && !"])}".contains(chars[j]) {
-                j += 1;
-            }
-            let label: String = chars[start..j.min(chars.len())].iter().collect();
-            if label.chars().any(|ch| "[({<>|#\"".contains(ch)) || label.contains("->") {
-                bad.push(label.trim().to_string());
-            }
-            i = j + 1;
-            continue;
-        }
-        i += 1;
-    }
-    bad
-}
-
-/// mermaid 轻量语法检查：只抓实测里最常见、在页面上直接渲染失败的几类，
-/// 不是完整解析器——宁可漏判，不误判（误判会让 writer 白重试）。
-fn lint_mermaid(src: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    let mut lines = src
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with("%%"));
-    let Some(head) = lines.next() else {
-        problems.push("图是空的".to_string());
-        return problems;
-    };
-    let kind = head.split_whitespace().next().unwrap_or("");
-    let kind = kind.trim_end_matches(':');
-    if !MERMAID_KINDS
-        .iter()
-        .any(|k| kind == *k || kind.starts_with(&format!("{k}-")))
-    {
-        problems.push(format!(
-            "第一行「{head}」不是图类型（应为 flowchart TD / sequenceDiagram / stateDiagram-v2 …）"
-        ));
-        return problems;
-    }
-    let is_flow = kind == "flowchart" || kind == "graph";
-    for line in lines {
-        if line.matches('"').count() % 2 == 1 {
-            problems.push(format!("引号不成对：`{line}`"));
-            continue;
-        }
-        if !is_flow {
-            continue;
-        }
-        let first = line.split_whitespace().next().unwrap_or("");
-        if ["subgraph", "end", "classDef", "class", "style", "linkStyle", "click", "direction"]
-            .contains(&first)
-        {
-            continue;
-        }
-        for label in flowchart_bad_labels(line) {
-            problems.push(format!(
-                "节点标签「{label}」含特殊字符却没加双引号，会渲染失败——写成 `id[\"{label}\"]`"
-            ));
-        }
-    }
-    problems
-}
-
-/// 一段正文里所有 mermaid 块的语法问题，带块序号。
+/// 一段正文里 mermaid 图的语法问题（检查用，不改文件）：能机械修正的与修不了的
+/// 都报——门禁前已经跑过 `mermaid_lint::autofix_file`，走到这里的可修问题只会是
+/// 写回失败的那部分。规则与实测依据见 `mermaid_lint`。
 fn lint_mermaid_blocks(text: &str) -> Vec<String> {
-    mermaid_sources(text)
-        .iter()
-        .enumerate()
-        .flat_map(|(i, src)| {
-            lint_mermaid(src)
-                .into_iter()
-                .map(move |p| format!("第 {} 张 mermaid 图：{p}", i + 1))
-        })
-        .collect()
+    let r = crate::mermaid_lint::check_doc(text);
+    let mut out = r.fatal;
+    out.extend(r.fixed_notes);
+    out
 }
 
 /// 对比表单元格是不是空洞的形容词：去掉强调/符号后很短、且没有任何
@@ -6305,6 +6011,7 @@ fn overview_path(
 /// （`= 28 KiB` 是否等于格子之和、数据区里内嵌元数据有没有给出处）。
 fn check_overview_text(text: &str) -> Result<(), String> {
     let mut problems = lint_mermaid_blocks(text);
+    problems.extend(crate::md_lint::lint(text, None));
     problems.extend(crate::learn_doc::lint_memlayout_blocks(text));
     if problems.is_empty() {
         Ok(())
@@ -6379,6 +6086,19 @@ fn finalize_learn_doc(cwd: &Path, base: &Path, slug: &str) -> Result<String, Str
     std::fs::create_dir_all(&docs_dir).map_err(|e| e.to_string())?;
     std::fs::write(&path, &out).map_err(|e| format!("写 {rel} 失败：{e}"))?;
     validate_learn_final(cwd, base, slug)?;
+    // 发布后的死链/破图：多半是引擎侧的问题（旧 plan 留下的章节、被清掉的图），
+    // 重写定稿修不好，所以不打回，只在结果里点名，让人看得见。
+    let dead = crate::md_lint::dead_links(&path);
+    let dead_note = if dead.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n⚠️ 定稿里有 {} 个本地链接/图片指不到文件：{}{}",
+            dead.len(),
+            dead.iter().take(8).cloned().collect::<Vec<_>>().join("、"),
+            if dead.len() > 8 { " 等" } else { "" }
+        )
+    };
     let chapters = out.lines().filter(|l| l.starts_with("## ")).count();
     let assets = if copied > 0 {
         format!("资源 {copied} 个文件在 `docs/learn/{name}/`；")
@@ -6386,7 +6106,7 @@ fn finalize_learn_doc(cwd: &Path, base: &Path, slug: &str) -> Result<String, Str
         String::new()
     };
     Ok(format!(
-        "定稿已写入 `{rel}`：{chapters} 个一级小节，{} 张图，{} 字。{assets}学习过程存档留在会话目录 `{}`。",
+        "定稿已写入 `{rel}`：{chapters} 个一级小节，{} 张图，{} 字。{assets}学习过程存档留在会话目录 `{}`。{dead_note}",
         mermaid_blocks(&out) + image_links(&out),
         out.chars().count(),
         base.strip_prefix(cwd).unwrap_or(base).display()
@@ -6406,6 +6126,10 @@ fn validate_learn_final(cwd: &Path, base: &Path, slug: &str) -> Result<(), Strin
         return Err(format!("slug「{slug}」不合法"));
     }
     let rel = format!("docs/learn/{}.md", crate::learn_doc::publish_name(slug));
+    // 定稿是读者真正打开的那份：最后再过一遍 mermaid 自动修正（各节在写作门禁
+    // 里已修过，这里兜住门禁上线前写的旧节、以及装配时带进来的图）。
+    let _ = crate::mermaid_lint::autofix_file(&cwd.join(&rel));
+    let _ = crate::learn_cite::autofix_file(&cwd.join(&rel), &mut crate::learn_cite::SourceIndex::new(cwd));
     let final_text = std::fs::read_to_string(cwd.join(&rel)).unwrap_or_default();
     if final_text.trim().is_empty() {
         return Err(format!("{rel} 不存在或为空"));
@@ -6437,6 +6161,242 @@ fn validate_learn_final(cwd: &Path, base: &Path, slug: &str) -> Result<(), Strin
         Ok(())
     } else {
         Err(format!("{rel} 未通过校验：\n- {}", problems.join("\n- ")))
+    }
+}
+
+// ═══ 小白试学（novice → novice_fix → novice_recheck）══════════════════════
+// 纯逻辑在 learn_novice.rs；这里是引擎前后置：出卷、核实、判分、还原、收尾。
+
+fn is_learn_novice_step(wf: &WorkflowDef, step: &WorkflowStepDef) -> bool {
+    wf.name == "learn_loop" && matches!(step.id.as_str(), "novice" | "novice_fix" | "novice_recheck")
+}
+
+fn novice_base(ctx: &WorkflowRunContext, vars: &HashMap<String, String>) -> Option<(PathBuf, String)> {
+    let slug = vars.get("plan_out").map(|s| s.trim().to_string()).unwrap_or_default();
+    learn_slug_ok(&slug).then(|| (learn_root(ctx).join(&slug), format!("{}/{slug}", learn_root_rel(ctx))))
+}
+
+/// 学习工作区里全部正文（总览 + 各章分节 + 整章文件）。
+fn novice_doc_files(base: &Path) -> Vec<PathBuf> {
+    crate::learn_novice::walk(&base.join("sections"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "md") && p.file_name().is_some_and(|n| n != "feedback.md"))
+        .collect()
+}
+
+fn novice_rel(base: &Path, p: &Path) -> String {
+    p.strip_prefix(base).unwrap_or(p).to_string_lossy().replace('\\', "/")
+}
+
+/// 跑出处核对（就地改正能确定的），返回改不了的那些（作为引擎提出的问题）。
+fn novice_cite_pass(cwd: &Path, base: &Path) -> (usize, Vec<crate::learn_novice::Issue>) {
+    let mut idx = crate::learn_cite::SourceIndex::new(cwd);
+    let mut fixed = 0;
+    let mut issues = Vec::new();
+    for f in novice_doc_files(base) {
+        let rel = novice_rel(base, &f);
+        for x in crate::learn_cite::autofix_file(&f, &mut idx) {
+            if x.is_fixed() {
+                fixed += 1;
+            } else {
+                issues.push(crate::learn_novice::Issue {
+                    kind: "cite".into(),
+                    chapter: crate::learn_novice::chapter_of(&rel),
+                    file: rel.clone(),
+                    quote: x.cite.clone(),
+                    problem: format!("第 {} 行出处对不上：{}", x.doc_line, x.describe()),
+                    source: "engine".into(),
+                    status: "open".into(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    (fixed, issues)
+}
+
+/// `path:a-b` 必须解析到仓库里唯一的文件、且行号存在。
+fn novice_evidence_ok(cwd: &Path, ev: &str) -> bool {
+    let mut idx = crate::learn_cite::SourceIndex::new(cwd);
+    ev.split(['，', ',', '；', ';', '、']).map(str::trim).filter(|p| !p.is_empty()).all(|part| {
+        let part = part.trim_matches('`');
+        let Some((path, range)) = part.rsplit_once(':') else { return false };
+        let (a, b) = range.split_once('-').unwrap_or((range, range));
+        let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else { return false };
+        let Some(rel) = idx.resolve(path.trim()) else { return false };
+        idx.lines(&rel).is_some_and(|l| a >= 1 && a <= b && b <= l.len())
+    })
+}
+
+/// 小白试学步的引擎前置。`Some(output)` = 不必调模型，直接以此为本步产出。
+fn learn_novice_pre(
+    step_id: &str,
+    ctx: &WorkflowRunContext,
+    vars: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let Some((base, base_rel)) = novice_base(ctx, vars) else {
+        return Ok(Some("NOVICE_DONE：没有学习工作区，跳过试学".into()));
+    };
+    let status = |m: String| {
+        let _ = ctx.event_tx.send(ChatEvent::Status { message: format!("[workflow 'learn_loop' step '{step_id}'] {m}") });
+    };
+    match step_id {
+        "novice" => {
+            // 沿用的旧章节、刚写的新章节一律先过出处核对。
+            let (fixed, cite_issues) = novice_cite_pass(&ctx.cwd, &base);
+            if fixed > 0 {
+                status(format!("引擎已改正 {fixed} 处对不上源码的「符号（文件:行号）」出处"));
+            }
+            let _ = assemble_draft_from_sections(&base);
+            let scope = crate::learn_novice::study_scope(&base);
+            let n_cite = cite_issues.len();
+            crate::learn_novice::write_study_brief(&base, &base_rel, &scope, cite_issues)?;
+            if scope.is_empty() {
+                return Ok(Some(if n_cite > 0 {
+                    format!("NOVICE_FIX_NEEDED：章节自上次试学后没有变化，只有 {n_cite} 处引擎核出的出处问题")
+                } else {
+                    "NOVICE_DONE：章节自上次试学后没有变化，不再试学".into()
+                }));
+            }
+            status(format!("🧑‍🎓 小白开始试学 {} 章：{}（试学说明：{base_rel}/novice/brief.md）", scope.len(), scope.join("、")));
+            Ok(None)
+        }
+        "novice_fix" => {
+            if crate::learn_novice::write_fix_brief(&base, &base_rel)? {
+                Ok(None)
+            } else {
+                Ok(Some("NOVICE_NOTHING_TO_FIX：没有要改的问题".into()))
+            }
+        }
+        "novice_recheck" => {
+            if crate::learn_novice::write_recheck_brief(&base, &base_rel)? {
+                Ok(None)
+            } else {
+                Ok(Some(novice_finish(ctx, &base)?))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// 收尾：未解决的标「⚠️ 待确认」，装配 draft。返回本步产出（含 NOVICE_DONE）。
+fn novice_finish(ctx: &WorkflowRunContext, base: &Path) -> Result<String, String> {
+    let pending = crate::learn_novice::finalize(base)?;
+    let _ = assemble_draft_from_sections(base);
+    let all = crate::learn_novice::load_issues(base);
+    let resolved = all.iter().filter(|i| i.status == "resolved").count();
+    let mut out = format!(
+        "NOVICE_DONE：试学共提出 {} 个问题，已纠正并经小白复查通过 {resolved} 个，待你确认 {} 个。",
+        all.len(),
+        pending.len()
+    );
+    if !pending.is_empty() {
+        out.push_str("\n\n⚠️ 待确认（已在文档原文处标注）：");
+        for i in &pending {
+            out.push_str(&format!("\n- {}（{}，章节 {}）{}", i.id, i.kind, i.chapter, i.problem));
+        }
+    }
+    let _ = ctx.event_tx.send(ChatEvent::Status { message: out.clone() });
+    Ok(out)
+}
+
+/// 小白试学步的引擎后置。`Ok(新产出)` 放行；`Err(批注)` 要求重做。
+fn learn_novice_post(
+    step_id: &str,
+    ctx: &WorkflowRunContext,
+    vars: &HashMap<String, String>,
+    response: &str,
+    fix_baseline: Option<&Vec<(PathBuf, String)>>,
+) -> Result<String, String> {
+    let Some((base, _)) = novice_base(ctx, vars) else {
+        return Ok(response.to_string());
+    };
+    let status = |m: String| {
+        let _ = ctx.event_tx.send(ChatEvent::Status { message: format!("[workflow 'learn_loop' step '{step_id}'] {m}") });
+    };
+    match step_id {
+        "novice" => {
+            let got = crate::learn_novice::ingest_report(&base, &|ev| novice_evidence_ok(&ctx.cwd, ev))?;
+            let mut msg = format!(
+                "小白试学提出 {} 个问题（其中答错 {} 题）",
+                got.issues.len(),
+                got.wrong_answers
+            );
+            if !got.dropped.is_empty() {
+                msg.push_str(&format!("；引擎核实后丢弃 {} 条：{}", got.dropped.len(), got.dropped.join("；")));
+            }
+            for i in &got.issues {
+                msg.push_str(&format!("\n- {}（{}，{}）{}", i.id, i.kind, i.chapter, i.problem));
+            }
+            status(msg);
+            if crate::learn_novice::fixable(&got.issues).is_empty() {
+                return novice_finish(ctx, &base);
+            }
+            Ok(format!("NOVICE_FIX_NEEDED：{} 个问题交给辅导员纠正", crate::learn_novice::fixable(&got.issues).len()))
+        }
+        "novice_fix" => {
+            // 改坏的（删了核对通过的出处、整段推倒）还原；mermaid/出处机械可修的引擎修；
+            // 代码副本的代码行按源码原文还原，只留注释。
+            let mut broken = Vec::new();
+            let mut idx = crate::learn_cite::SourceIndex::new(&ctx.cwd);
+            for (path, original) in fix_baseline.into_iter().flatten() {
+                let current = std::fs::read_to_string(path).unwrap_or_default();
+                if current == *original {
+                    continue;
+                }
+                if let Err(reason) = check_chapter_patch(original, &current, Some(&ctx.cwd)) {
+                    let _ = std::fs::write(path, original);
+                    let rel = novice_rel(&base, path);
+                    status(format!("{rel} 改坏了（已还原）：{reason}"));
+                    broken.push(rel);
+                    continue;
+                }
+                let _ = crate::mermaid_lint::autofix_file(path);
+                let _ = crate::learn_cite::autofix_file(path, &mut idx);
+            }
+            if base.join("code").is_dir() {
+                let _ = crate::learn_code::reconcile_all(&ctx.cwd, &base);
+            }
+            let silent = crate::learn_novice::apply_fix_response(&base, response, &broken)?;
+            // 出处类由引擎复核，不等小白。
+            let (_, still) = novice_cite_pass(&ctx.cwd, &base);
+            let mut issues = crate::learn_novice::load_issues(&base);
+            for i in issues.iter_mut().filter(|i| i.kind == "cite" && i.status != "resolved") {
+                let open = still.iter().any(|s| s.file == i.file && s.quote == i.quote);
+                i.status = if open { "open".into() } else { "resolved".into() };
+            }
+            crate::learn_novice::save_issues(&base, &issues)?;
+            if !silent.is_empty() {
+                return Err(format!(
+                    "这些问题没有逐条回应：{}。每条单独一行写 `FIXED <id>: 改了什么` 或 `WONTFIX <id>: 不改的理由`。",
+                    silent.join("、")
+                ));
+            }
+            let _ = assemble_draft_from_sections(&base);
+            Ok(response.to_string())
+        }
+        "novice_recheck" => {
+            let (open, done) = crate::learn_novice::ingest_recheck(&base)?;
+            if done {
+                return novice_finish(ctx, &base);
+            }
+            let (_, base_rel) = novice_base(ctx, vars).unwrap_or_default();
+            crate::learn_novice::write_fix_brief(&base, &base_rel)?;
+            status(format!("小白复查后仍有 {open} 个问题没解决，交回辅导员再改"));
+            Ok(format!("NOVICE_REWORK：{open} 个问题复查未通过，见 novice/fix_brief.md"))
+        }
+        _ => Ok(response.to_string()),
+    }
+}
+
+/// 后置判定不合格且重试用完：试学是辅助环节，不拖死整条学习流程。
+fn learn_novice_degrade(step_id: &str, ctx: &WorkflowRunContext, vars: &HashMap<String, String>, reason: &str) -> String {
+    let _ = ctx.event_tx.send(ChatEvent::Status {
+        message: format!("[workflow 'learn_loop' step '{step_id}'] 重试用完仍不合格，跳过试学余下环节：{reason}"),
+    });
+    match novice_base(ctx, vars) {
+        Some((base, _)) => novice_finish(ctx, &base).unwrap_or_else(|e| format!("NOVICE_DONE：{e}")),
+        None => "NOVICE_DONE".into(),
     }
 }
 
@@ -7232,21 +7192,37 @@ fn wrap_write_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[
 /// Enforce the step's read allowlist at the actual handler boundary. The model
 /// can still *request* any path, but unauthorized paths never reach the read
 /// implementation and never enter the tool-result context.
+///
+/// 以 `!` 开头的项是**禁读**（只写禁读项 = 其余全部可读）。小白试学要读源码
+/// （路径不可预知），但不许读 plan.json——答案在里面。禁读项存在时，`search`
+/// / `find` 也不许搜隐藏目录、不许关掉 gitignore、不许把目标指向禁读文件所在的
+/// 目录（`.latte/` 默认不在搜索范围内，这样就绕不过去）。
 fn wrap_read_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[String]) {
     if patterns.is_empty() {
         return;
+    }
+    let norm_pat = |p: &str| p.trim().trim_start_matches("./").replace('\\', "/");
+    let deny: Vec<String> = patterns
+        .iter()
+        .filter_map(|p| p.trim().strip_prefix('!').map(norm_pat))
+        .collect();
+    if !deny.is_empty() {
+        wrap_search_denylist(tm, cwd, &deny);
     }
     let Some(orig) = tm.get_tool("read") else {
         return;
     };
     let patterns: Vec<String> = patterns
         .iter()
-        .map(|p| p.trim().trim_start_matches("./").replace('\\', "/"))
+        .filter(|p| !p.trim().starts_with('!'))
+        .map(|p| norm_pat(p))
         .collect();
+    let deny_for_read = deny.clone();
     let cwd = cwd.to_path_buf();
     let orig_handler = orig.handler.clone();
     let handler: SharedToolHandler = Arc::new(move |input, ctx| {
         let patterns = patterns.clone();
+        let deny = deny_for_read.clone();
         let cwd = cwd.clone();
         let orig_handler = orig_handler.clone();
         Box::pin(async move {
@@ -7269,11 +7245,14 @@ fn wrap_read_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[S
                         "workflow read scope rejects path outside workspace: {spec}"
                     ))
                 })?;
-                if !patterns.iter().any(|p| read_scope_matches(p, &rel)) {
+                if !patterns.is_empty() && !patterns.iter().any(|p| read_scope_matches(p, &rel)) {
                     return Err(ToolError::other(format!(
                         "workflow step read scope rejects '{rel}'; allowed: {}",
                         patterns.join(", ")
                     )));
+                }
+                if deny.iter().any(|p| read_scope_matches(p, &rel)) {
+                    return Err(ToolError::other(format!("本步不许读 '{rel}'（引擎禁读）")));
                 }
             }
             (orig_handler)(input, ctx).await
@@ -7289,6 +7268,60 @@ fn wrap_read_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[S
     .build();
     tm.unregister("read");
     tm.register(wrapped, None);
+}
+
+/// 禁读项存在时约束 `search` / `find`：见 [`wrap_read_path_allowlist`]。
+fn wrap_search_denylist(tm: &Arc<dyn ToolManager>, cwd: &Path, deny: &[String]) {
+    for name in ["search", "find"] {
+        let Some(orig) = tm.get_tool(name) else {
+            continue;
+        };
+        let deny = deny.to_vec();
+        let cwd = cwd.to_path_buf();
+        let orig_handler = orig.handler.clone();
+        let handler: SharedToolHandler = Arc::new(move |input, ctx| {
+            let deny = deny.clone();
+            let cwd = cwd.clone();
+            let orig_handler = orig_handler.clone();
+            Box::pin(async move {
+                if input.get("hidden").and_then(|v| v.as_bool()) == Some(true)
+                    || input.get("gitignore").and_then(|v| v.as_bool()) == Some(false)
+                {
+                    return Err(ToolError::other("本步不许搜隐藏目录或关掉 gitignore（引擎禁读）"));
+                }
+                let mut targets: Vec<String> = Vec::new();
+                for key in ["path", "paths"] {
+                    match input.get(key) {
+                        Some(serde_json::Value::String(s)) => targets.push(s.clone()),
+                        Some(serde_json::Value::Array(a)) => {
+                            targets.extend(a.iter().filter_map(|v| v.as_str().map(str::to_string)))
+                        }
+                        _ => {}
+                    }
+                }
+                for t in targets {
+                    let rel = workflow_relative_read_path(&cwd, &t).unwrap_or_default();
+                    let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+                    // 目标是禁读文件本身或它的某一级上层目录（根目录 "." 不算：隐藏目录默认不搜）。
+                    let hits = !segs.is_empty()
+                        && deny.iter().any(|d| {
+                            let ds: Vec<&str> = d.split('/').filter(|s| !s.is_empty()).collect();
+                            segs.len() <= ds.len()
+                                && segs.iter().zip(ds.iter()).all(|(a, b)| *b == "*" || a == b)
+                        });
+                    if hits || t.contains(".latte") {
+                        return Err(ToolError::other(format!("本步不许搜 '{t}'（引擎禁读）")));
+                    }
+                }
+                (orig_handler)(input, ctx).await
+            })
+        });
+        let wrapped = Tool::builder(name, orig.description.clone(), orig.input_schema.clone(), handler)
+            .concurrency_safe(orig.concurrency_safe)
+            .build();
+        tm.unregister(name);
+        tm.register(wrapped, None);
+    }
 }
 
 /// 动态 prompt 预算的下限（估算 token）。窗口再小也不低于它——否则小窗口
@@ -8915,6 +8948,32 @@ async fn run_workflow_serial(
                     continue;
                 }
             }
+            // 小白试学：引擎判定这一步不必调模型（没有要学/要改/要复查的）时直接给出产出，
+            // 照常参与 loop_until 判定。
+            if is_learn_novice_step(wf, step) {
+                let short = match learn_novice_pre(&step.id, ctx, &vars) {
+                    Ok(v) => v,
+                    Err(e) => Some(learn_novice_degrade(&step.id, ctx, &vars, &e)),
+                };
+                if let Some(output) = short {
+                    last_output = output.clone();
+                    if let Some(key) = &step.output_key {
+                        vars.insert(key.clone(), output.clone());
+                        keyed.insert(key.clone(), output.clone());
+                    }
+                    ckpt.record_step(&step.id, step.output_key.as_deref(), &output);
+                    match serial_loop_decision(wf, step, idx, &last_output, &mut loop_iters, &vars, &review_engine, ctx, topic).await {
+                        Ok(SerialLoopNav::Advance) => idx += 1,
+                        Ok(SerialLoopNav::Rework(target)) => {
+                            pending_feedback = Some(last_output.clone());
+                            done_steps.remove(wf.steps[target].id.as_str());
+                            idx = target;
+                        }
+                        Err(msg) => return WfOutcome::Failed(msg),
+                    }
+                    continue;
+                }
+            }
             let first_role = step.roles().first().cloned().unwrap_or_default();
             let _ = ctx.event_tx.send(ChatEvent::WorkflowStep {
                 wf_id: wf_id.to_string(),
@@ -9120,6 +9179,21 @@ async fn run_workflow_serial(
                     Ok(None) => {}
                     Err(e) => return WfOutcome::Failed(format!("step 'annotate': {e}")),
                 }
+                // 代码由引擎逐字拷：按 plan 证据写出副本骨架与索引，模型只往里插注释。
+                if learn_slug_ok(slug) {
+                    match crate::learn_code::write_skeletons(&ctx.cwd, &learn_root(ctx).join(slug)) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            let _ = ctx.event_tx.send(ChatEvent::Status {
+                                message: format!(
+                                    "📄 引擎已按 plan 证据逐字拷出 {n} 个代码副本骨架（{}/{slug}/code/），辅导员只插注释",
+                                    learn_root_rel(ctx)
+                                ),
+                            });
+                        }
+                        Err(e) => return WfOutcome::Failed(format!("step 'annotate': {e}")),
+                    }
+                }
             }
             // sync_code 会 edit 真实源文件：开跑前留原文，改出注释以外的变化就还原。
             let sync_baseline = (wf.name == "learn_loop" && step.id == "sync_code").then(|| {
@@ -9129,6 +9203,18 @@ async fn run_workflow_serial(
                     vars.get("plan_out").map_or("", |s| s.trim()),
                 )
             });
+            // novice_fix 会改章节与代码副本：开跑前留原文，改坏的还原。
+            let novice_fix_baseline: Option<Vec<(PathBuf, String)>> =
+                (wf.name == "learn_loop" && step.id == "novice_fix").then(|| {
+                    novice_base(ctx, &vars)
+                        .map(|(base, _)| {
+                            novice_doc_files(&base)
+                                .into_iter()
+                                .filter_map(|p| std::fs::read_to_string(&p).ok().map(|t| (p, t)))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
             // context-overflow fresh restarts are bounded per step and do not
             // reset loop_iters, token accounting, or dispatch budget.
             let mut context_overflow_restarts = 0usize;
@@ -9185,7 +9271,7 @@ async fn run_workflow_serial(
                         topic.to_string(),
                     );
                     dispatch.plan_stage = plan_stage.clone();
-                    dispatch.read_path_allowlist = step.read_path_allowlist.clone();
+                    dispatch.read_path_allowlist = render_scope_patterns(&step.read_path_allowlist, &vars);
                     dispatch.write_path_allowlist =
                         render_scope_patterns(&step.write_path_allowlist, &vars);
                     dispatch.prompt_token_budget =
@@ -9445,15 +9531,19 @@ async fn run_workflow_serial(
                             None => Ok(()),
                         }
                         .and_then(|()| validate_learn_plan(&ctx.cwd, &learn_root(ctx), &response));
-                        // 重试用完、只差对比深度时放行：证据/题目错误仍判死。
+                        // 只差对比深度（scenario / dimensions / walkthrough / wins_when）时
+                        // **不重试**、直接按现稿继续：这几项只影响对比章节讲得深不深，
+                        // 而一次 plan 重试要重新生成整份 plan、在慢模型上动辄半小时（实测
+                        // LAT-110 cli-23288：为 3 个 wins_when 重试，整条 69 分钟里占了 32 分钟）。
+                        // 证据行号、题目与答案这类事实错误仍打回。
                         let checked = match checked {
-                            Err(reason) if attempt >= step.max_retries
-                                && slug_pin.as_ref().is_none_or(|pin| pin.check(&response).is_ok())
-                                && validate_learn_plan_with(&ctx.cwd, &learn_root(ctx), &response, false).is_ok() =>
+                            Err(reason)
+                                if slug_pin.as_ref().is_none_or(|pin| pin.check(&response).is_ok())
+                                    && validate_learn_plan_with(&ctx.cwd, &learn_root(ctx), &response, false).is_ok() =>
                             {
                                 let _ = ctx.event_tx.send(ChatEvent::Status {
                                     message: format!(
-                                        "[workflow '{}' step 'plan'] 方案对比素材仍不完整、重试已用完，按现稿继续（章节里的对比会偏浅）：\n{reason}",
+                                        "[workflow '{}' step 'plan'] 方案对比素材不完整，按现稿继续（只影响对比章节的深度，不为它重跑 plan）：\n{reason}",
                                         wf.name
                                     ),
                                 });
@@ -9476,8 +9566,8 @@ async fn run_workflow_serial(
                             );
                             let annotation = format!(
                                 "{}上次写的 plan.json 未通过引擎校验：\n{reason}\n\
-                                 plan.json 保留在原处：先 read 它，只改上面点名的字段（证据行号有问题的才回源码核对），\
-                                 其余内容原样保留、不必重新取证；改完 write 覆盖，并再次只输出 slug。"
+                                 plan.json 保留在原处：先 read 它，用 edit 只改上面点名的字段（证据行号有问题的才回源码核对），\
+                                 不要用 write 整份重写——其余内容原样保留、不必重新取证。改完再次只输出 slug。"
                                 ,truncation_retry_hint(&response)
                             );
                             step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
@@ -9487,27 +9577,69 @@ async fn run_workflow_serial(
                     }
                     if wf.name == "learn_loop" && step.id == "annotate" {
                         let slug = vars.get("plan_out").cloned().unwrap_or_default();
-                        if let Err(reason) = validate_learn_annotations(&ctx.cwd, &learn_root_rel(ctx), &slug) {
-                            if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                    step.id, speaker
-                                ));
+                        let slug = slug.trim();
+                        if learn_slug_ok(slug) {
+                            // 引擎对齐：代码行换回原文、注释保留、新造的代码丢掉——不打回。
+                            let outcome = match crate::learn_code::reconcile_all(&ctx.cwd, &learn_root(ctx).join(slug)) {
+                                Ok(o) => o,
+                                Err(e) => return WfOutcome::Failed(format!("step 'annotate': {e}")),
+                            };
+                            if !outcome.notes.is_empty() {
+                                let _ = ctx.event_tx.send(ChatEvent::Status {
+                                    message: format!(
+                                        "[workflow '{}' step 'annotate'] 引擎已核对注释副本：\n- {}",
+                                        wf.name,
+                                        outcome.notes.join("\n- ")
+                                    ),
+                                });
                             }
-                            attempt += 1;
-                            tracing::warn!(
-                                step = %step.id, speaker = %speaker, attempt,
-                                reason = %reason,
-                                "learn annotated copies failed check; retrying"
-                            );
-                            let annotation = format!(
-                                "{}上次写的注释副本未通过引擎校验：\n{reason}\n\
-                                 请重新 read 源文件，逐字复制代码后只加注释，重写有问题的副本。"
-                                ,truncation_retry_hint(&response)
-                            );
-                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
-                            prompt = format!("{full_prompt}\n\n{annotation}");
-                            continue;
+                            // 唯一打回的情况：一条注释都没插。重试用完就降级为无注释原文，
+                            // 不让辅助材料拖死整条学习流程。
+                            if outcome.total > 0 && outcome.unannotated.len() == outcome.total {
+                                if attempt < step.max_retries {
+                                    attempt += 1;
+                                    tracing::warn!(
+                                        step = %step.id, speaker = %speaker, attempt,
+                                        "learn annotated copies have no comments; retrying"
+                                    );
+                                    let annotation = format!(
+                                        "{}code/ 下的 {} 个副本还没有任何注释。副本骨架已由引擎写好（代码逐字来自源文件）：\
+                                         先 read 副本，再用 edit 的 insert_before / insert_after 在关键行前后插入整行注释，\
+                                         或在行尾追加注释；不要用 write 重写整个文件，代码行改了也会被引擎还原。",
+                                        truncation_retry_hint(&response),
+                                        outcome.total
+                                    );
+                                    step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                                    prompt = format!("{full_prompt}\n\n{annotation}");
+                                    continue;
+                                }
+                                let _ = ctx.event_tx.send(ChatEvent::Status {
+                                    message: format!(
+                                        "[workflow '{}' step 'annotate'] 重试用完仍没有注释，按无注释的源码原文副本继续（README 已标「未加注释」）",
+                                        wf.name
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    if is_learn_novice_step(wf, step) {
+                        match learn_novice_post(&step.id, ctx, &vars, &response, novice_fix_baseline.as_ref()) {
+                            Ok(out) => response = out,
+                            Err(reason) if attempt < step.max_retries => {
+                                attempt += 1;
+                                tracing::warn!(step = %step.id, speaker = %speaker, attempt, reason = %reason, "learn novice step rejected; retrying");
+                                let annotation = format!("{}引擎核对没通过：{reason}", truncation_retry_hint(&response));
+                                step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                                prompt = format!("{full_prompt}\n\n{annotation}");
+                                continue;
+                            }
+                            // 纠正步漏回应几条不值得停：没回应的留在 open，复查后再交回来。
+                            Err(reason) if step.id == "novice_fix" => {
+                                let _ = ctx.event_tx.send(ChatEvent::Status {
+                                    message: format!("[workflow 'learn_loop' step 'novice_fix'] {reason}（重试已用完，未回应的留到下一轮）"),
+                                });
+                            }
+                            Err(reason) => response = learn_novice_degrade(&step.id, ctx, &vars, &reason),
                         }
                     }
                     if let Some(baseline) = &sync_baseline {
@@ -10126,7 +10258,7 @@ async fn run_dag_step(
                     continue;
                 }
             }
-            if let Err(reason) = reject_chapter_overwrite(chapter_baseline.as_ref()) {
+            if let Err(reason) = reject_chapter_overwrite(chapter_baseline.as_ref(), Some(&inp.cwd)) {
                 if attempt >= step.max_retries {
                     return Err(StepFail::Failed(format!(
                         "step '{}' speaker '{}': 返工章节未通过增补校验（已重试 {attempt} 次）：{reason}",
@@ -10150,10 +10282,52 @@ async fn run_dag_step(
             // 章节质量门禁：分节阶段逐节查（缺节、方案数、图、对比表、源码出处），
             // 旧版整章 writer 只查 mermaid 能否渲染。
             let unchanged = response.trim().starts_with("UNCHANGED");
+            let mut cite_wrong: Vec<String> = Vec::new();
+            // mermaid 语法：机械可修的（节点文字含括号没加引号、subgraph 标题带
+            // 全角标点……）由引擎直接改写文件，不打回 writer 白跑一轮；下面的门禁
+            // 只会再看到修不了的那部分。
+            {
+                let files = part_targets
+                    .iter()
+                    .map(|t| &t.path)
+                    .chain(legacy_chapter.iter().filter(|_| !unchanged))
+                    .chain(overview_file.iter());
+                let mut notes = Vec::new();
+                let mut cite_idx = crate::learn_cite::SourceIndex::new(&inp.cwd);
+                for path in files {
+                    let (fixed, _) = crate::mermaid_lint::autofix_file(path);
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if !fixed.is_empty() {
+                        notes.extend(fixed.into_iter().map(|f| format!("{name} {f}")));
+                    }
+                    // 「`符号`（`文件:行号`）」对不上源码：能确定的引擎直接改，改不了的打回。
+                    for f in crate::learn_cite::autofix_file(path, &mut cite_idx) {
+                        if f.is_fixed() {
+                            notes.push(format!("{name} 出处 {}", f.describe()));
+                        } else {
+                            cite_wrong.push(format!("{name} 第 {} 行：{}", f.doc_line, f.describe()));
+                        }
+                    }
+                }
+                if !notes.is_empty() {
+                    let _ = inp.event_tx.send(ChatEvent::Status {
+                        message: format!(
+                            "[workflow '{}' step '{}' {}] 引擎已自动修正 {} 处 mermaid 语法 / 源码出处：\n- {}",
+                            inp.wf.name,
+                            step.id,
+                            inp.vars.get("item_id").map(String::as_str).unwrap_or(""),
+                            notes.len(),
+                            notes.join("\n- ")
+                        ),
+                    });
+                }
+            }
             let quality = if !part_targets.is_empty() {
-                check_chapter_stage(&part_targets, unchanged)
+                check_chapter_stage(&part_targets, unchanged, Some(&inp.cwd))
             } else if let Some(path) = legacy_chapter.as_ref().filter(|_| !unchanged) {
-                let problems = lint_mermaid_blocks(&std::fs::read_to_string(path).unwrap_or_default());
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let mut problems = lint_mermaid_blocks(&text);
+                problems.extend(crate::md_lint::lint(&text, path.parent()));
                 if problems.is_empty() { Ok(()) } else { Err(problems.join("\n- ")) }
             } else if let Some(path) = overview_file.as_ref() {
                 let now = std::fs::read_to_string(path).unwrap_or_default();
@@ -10164,6 +10338,18 @@ async fn run_dag_step(
                 }
             } else {
                 Ok(())
+            };
+            let quality = if cite_wrong.is_empty() {
+                quality
+            } else {
+                let wrong = format!(
+                    "这些源码出处对不上（符号不在所引的行里，且有多处定义、引擎没法替你选）：\n  - {}",
+                    cite_wrong.join("\n  - ")
+                );
+                match quality {
+                    Ok(()) => Err(wrong),
+                    Err(e) => Err(format!("{e}\n- {wrong}")),
+                }
             };
             if let Err(reason) = quality {
                 if attempt >= step.max_retries {
@@ -12046,6 +12232,20 @@ role = "reviewer"
         assert!(spec.task_text().contains("不要相信实现报告"));
         assert!(spec.output_contract.require.iter().any(|r| r == "VERDICT:"));
         // 质量审查在规格审查之后
+        // 小白试学：学员读之前先替他学一遍。禁读答案、只写自己的报告；
+        // 复查不通过跳回纠正步。
+        let step = |id: &str| wf.steps.iter().find(|s| s.id == id).unwrap();
+        for id in ["novice", "novice_recheck"] {
+            let st = step(id);
+            assert_eq!(st.role.as_deref(), Some("novice"));
+            assert!(st.read_path_allowlist.iter().any(|p| p == "!{{learn_root}}/*/plan.json"), "{id} 不许读答案");
+            assert_eq!(st.write_path_allowlist.len(), 1, "{id} 只写自己的报告");
+            assert!(!st.tools.iter().any(|t| t == "edit"), "{id} 不改文档");
+        }
+        assert_eq!(step("novice_recheck").loop_until.as_deref(), Some("NOVICE_DONE"));
+        assert_eq!(step("novice_recheck").loop_back_to.as_deref(), Some("novice_fix"));
+        assert_eq!(step("novice_fix").role.as_deref(), Some("tutor"));
+
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -12086,6 +12286,12 @@ role = "reviewer"
         // 多行结果残片（`"content":`、`{`）不是工具名。回归 LAT-110 报错清单。
         let polluted = "read {} → {\n\"content\": 1,\n{\n\"files\": [\nread {} → ok";
         assert_eq!(called_tool_names(polluted), vec!["read", "read"]);
+
+        // `write` 的语义是落盘：返工时用 edit 改已有文件同样满足（LAT-110 cli-23288）。
+        let w = vec!["write".to_string()];
+        assert!(check_required_tools(&w, "read {} → ok\nedit {\"path\":\"plan.json\"} → ok").is_ok());
+        assert!(check_required_tools(&w, "read {} → ok").is_err());
+        assert!(check_required_tools(&vec!["edit".to_string()], "write {} → ok").is_err(), "反过来不成立");
     }
 
     /// `check_required_tools_any`：OR 语义——"必须取证"有多条合法路径。
@@ -12374,6 +12580,9 @@ role = "reviewer"
                 "plan",
                 "annotate",
                 "doc_review",
+                "novice",
+                "novice_fix",
+                "novice_recheck",
                 "read_confirm",
                 "quiz",
                 "supplement",
@@ -12394,9 +12603,9 @@ role = "reviewer"
         let sync_code = step("sync_code");
         let report = step("report");
         assert!(step("doc_review").workflow.is_some());
-        // 外层实际执行的 speaker 都是 tutor。审稿不再挡在学员前面。
+        // 外层实际执行的 speaker 都是 tutor（小白试学两步除外：试学者必须是另一个角色）。
         for s in &wf.steps {
-            if s.id == "doc_review" {
+            if s.id == "doc_review" || s.id == "novice" || s.id == "novice_recheck" {
                 continue;
             }
             assert_eq!(s.roles(), vec!["tutor"], "step {} 必须是 tutor", s.id);
@@ -12444,6 +12653,13 @@ role = "reviewer"
                     .iter()
                     .all(|t| ["read", "code_graph", "search"].contains(&t.as_str())),
             "plan 必须声明 require_tools_any 覆盖取证工具，否则可以零取证凭记忆出题"
+        );
+        // 返工只改点名字段：有 edit，且写权限只到工作区的 plan.json / ledger.json。
+        assert!(plan.tools.iter().any(|t| t == "edit"), "plan 返工要能用 edit 局部修改");
+        assert_eq!(
+            plan.write_path_allowlist,
+            vec!["{{learn_root}}/*/plan.json".to_string(), "{{learn_root}}/*/ledger.json".to_string()],
+            "plan 的写权限只到学习工作区的两个文件"
         );
         assert!(
             plan.require_tools.iter().any(|t| t == "write"),
@@ -12496,27 +12712,29 @@ role = "reviewer"
             "annotate 必须无条件执行——注释版副本是默认学习材料；「要不要注释进源码」\
              的开关在 sync_code 步，不在本步"
         );
+        // 代码由引擎逐字拷（learn_code::write_skeletons），模型只插注释：
+        // 没有 write 就无法凭记忆重打整份代码（回归 LAT-110 ui-16242）；
+        // edit 被 write_path_allowlist 钉在 code/ 下，改不到源文件。
         assert!(
-            annotate.tools.iter().any(|t| t == "read")
-                && annotate.tools.iter().any(|t| t == "write"),
-            "annotate 需要 read 读源码、write 写副本"
+            annotate.tools.iter().any(|t| t == "read") && annotate.tools.iter().any(|t| t == "edit"),
+            "annotate 需要 read 读副本、edit 插注释"
         );
         assert!(
-            !annotate.tools.iter().any(|t| t == "edit")
-                && !annotate.tools.iter().any(|t| t == "ask"),
-            "annotate 不许有 edit（可能改到源文件）也不许弹窗——不动源码靠工具隔离"
+            !annotate.tools.iter().any(|t| t == "write") && !annotate.tools.iter().any(|t| t == "ask"),
+            "annotate 不许有 write（会整份重打代码）也不许弹窗"
         );
         assert!(
-            annotate.require_tools.iter().any(|t| t == "write"),
-            "annotate 必须真把副本落盘"
+            annotate.require_tools.iter().any(|t| t == "edit"),
+            "annotate 必须真插过注释"
+        );
+        assert_eq!(
+            annotate.write_path_allowlist,
+            vec!["{{learn_root}}/{{plan_out}}/code/*".to_string()],
+            "annotate 的写权限只到副本目录——不动源码靠引擎拦截"
         );
         assert!(
-            norm(annotate.task_text()).contains("逐字保留"),
-            "annotate 必须钉「逐字保留代码原文、只加注释」，否则副本会改丢代码"
-        );
-        assert!(
-            norm(annotate.task_text()).contains("绝不修改"),
-            "annotate 必须声明绝不修改副本目录以外的文件（learn_loop 是只读类型）"
+            norm(annotate.task_text()).contains("逐字") && norm(annotate.task_text()).contains("insert_before"),
+            "annotate 要说明代码已由引擎逐字拷好、用 edit 插入注释"
         );
 
         // ── read_confirm：答题按钮独占一步 ──
@@ -18856,6 +19074,31 @@ output_key = "quality"
         );
     }
 
+    /// 只写禁读项：其余全部可读，plan.json（答案）读不到，也搜不进 `.latte/`。
+    #[tokio::test]
+    async fn read_denylist_hides_answers_but_allows_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = dir.path().join(".latte/learn/own/plan.json");
+        std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+        std::fs::write(&plan, "ANSWER").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.c"), "int x;").unwrap();
+        let tm = build_tool_manager(&["read".to_string(), "search".to_string()]).await.unwrap();
+        wrap_read_path_allowlist(&tm, dir.path(), &["!.latte/learn/*/plan.json".to_string()]);
+        let ok = tm.execute("read", serde_json::json!({"path": dir.path().join("src/a.c")}), None).await.unwrap();
+        assert!(ok.to_string().contains("int x"));
+        let err = tm.execute("read", serde_json::json!({"path": plan}), None).await.unwrap_err();
+        assert!(err.to_string().contains("引擎禁读"), "{err}");
+        for bad in [
+            serde_json::json!({"pattern": "ANSWER", "paths": [dir.path().join(".latte/learn")]}),
+            serde_json::json!({"pattern": "ANSWER", "hidden": true}),
+        ] {
+            assert!(tm.execute("search", bad, None).await.unwrap_err().to_string().contains("引擎禁读"));
+        }
+        let found = tm.execute("search", serde_json::json!({"pattern": "ANSWER|int x", "paths": [dir.path()]}), None).await.unwrap();
+        assert!(!found.to_string().contains("plan.json"), "{found}");
+    }
+
     #[tokio::test]
     async fn prompt_budget_restarts_with_compact_topic_not_original_task() {
         let server = wiremock::MockServer::start().await;
@@ -21128,18 +21371,18 @@ output_key = "plan_out"
     /// 实测 jemalloc arena 文档里的原句：未加引号的 `arena->bins[bin_ind]`。
     #[test]
     fn mermaid_lint_flags_unquoted_special_labels_and_bad_header() {
-        let bad = "flowchart TD\n    C[计算 bin 索引] --> D[通过柔性数组 arena->bins[bin_ind] 快速偏移]\n    D --> F{当前 bin->slabcur 有空闲?}\n    F -- 有空闲 --> G[标记]\n";
-        let p = lint_mermaid(bad);
-        assert_eq!(p.len(), 2, "{p:?}");
+        let bad = "```mermaid\nflowchart TD\n    C[计算 bin 索引] --> D[通过柔性数组 arena->bins[bin_ind] 快速偏移]\n    D --> F{当前 bin->slabcur 有空闲?}\n    F -- 有空闲 --> G[标记]\n```\n";
+        let p = lint_mermaid_blocks(bad);
+        assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("arena->bins"), "{p:?}");
 
-        let good = "flowchart TD\n    C[\"计算 bin 索引\"] --> D[\"arena->bins[i] 偏移\"]\n    D -->|有空闲(1)| G((\"标记\"))\n    subgraph s1[\"方案 A\"]\n    X[普通标签]\n    end\n";
-        assert!(lint_mermaid(good).is_empty(), "{:?}", lint_mermaid(good));
+        let good = "```mermaid\nflowchart TD\n    C[\"计算 bin 索引\"] --> D[\"arena->bins[i] 偏移\"]\n    D -->|\"有空闲(1)\"| G((\"标记\"))\n    subgraph s1[\"方案 A\"]\n    X[普通标签]\n    end\n```\n";
+        assert!(lint_mermaid_blocks(good).is_empty(), "{:?}", lint_mermaid_blocks(good));
 
-        assert!(lint_mermaid("A --> B\n")[0].contains("不是图类型"));
-        assert!(lint_mermaid("sequenceDiagram\n  A->>B: 取锁(1)\n").is_empty());
-        assert!(lint_mermaid("stateDiagram-v2\n  [*] --> Idle\n").is_empty());
-        assert!(lint_mermaid("flowchart LR\n  A[\"未闭合] --> B\n")[0].contains("引号不成对"));
+        assert!(lint_mermaid_blocks("```mermaid\nHello --> B\n```\n")[0].contains("flowchart TD"));
+        assert!(lint_mermaid_blocks("```mermaid\n这是散文\n```\n")[0].contains("不是图类型"));
+        assert!(lint_mermaid_blocks("```mermaid\nsequenceDiagram\n  A->>B: 取锁(1)\n```\n").is_empty());
+        assert!(lint_mermaid_blocks("```mermaid\nflowchart LR\n  A[\"未闭合] --> B\n```\n")[0].contains("引号不成对"));
     }
 
     #[test]
@@ -21173,7 +21416,9 @@ output_key = "plan_out"
 
         // 返工增补只查图能不能渲染
         assert!(check_chapter_part(PartCheck::Solutions, "补一句", false).is_empty());
-        let broken = "```mermaid\nflowchart TD\n  A[x->y] --> B\n```";
+        // `A[x->y]` 实测能渲染，不报；`A[f(x)]` 才会失败。
+        assert!(check_chapter_part(PartCheck::Prose, "```mermaid\nflowchart TD\n  A[x->y] --> B\n```", false).is_empty());
+        let broken = "```mermaid\nflowchart TD\n  A[f(x)] --> B\n```";
         assert!(check_chapter_part(PartCheck::Prose, broken, false)[0].contains("双引号"));
     }
 
@@ -21197,10 +21442,10 @@ output_key = "plan_out"
         assert_eq!(targets.len(), 2);
         assert!(targets.iter().all(|t| t.full && t.baseline.is_none()));
         std::fs::write(chapter_part_path(&sections, "k1", 1), "背景").unwrap();
-        let err = check_chapter_stage(&targets, false).unwrap_err();
+        let err = check_chapter_stage(&targets, false, None).unwrap_err();
         assert!(err.contains("没写「2. 目标与预期结果」") && !err.contains("1. 问题与背景"), "{err}");
         std::fs::write(chapter_part_path(&sections, "k1", 2), "目标").unwrap();
-        check_chapter_stage(&targets, false).expect("两节都写了");
+        check_chapter_stage(&targets, false, None).expect("两节都写了");
 
         // 返工：点名 k1，基线抓好；改坏（删掉出处）被还原
         let original = "原理图之后的讲解，出处 src/a.c:1-2，".repeat(5);
@@ -21210,7 +21455,7 @@ output_key = "plan_out"
         assert!(targets[0].baseline.is_some() && !targets[0].full);
         assert!(targets[1].baseline.is_none() && targets[1].full, "6 节原本没有 → 按首写查");
         std::fs::write(chapter_part_path(&sections, "k1", 5), "短").unwrap();
-        let err = check_chapter_stage(&targets, false).unwrap_err();
+        let err = check_chapter_stage(&targets, false, None).unwrap_err();
         assert!(err.contains("改坏了（已还原）"), "{err}");
         assert_eq!(std::fs::read_to_string(chapter_part_path(&sections, "k1", 5)).unwrap(), original);
 
@@ -21287,6 +21532,28 @@ output_key = "plan_out"
             let allow = patch_fan_out_allowlist("doc_review_loop", sid, dir.path(), &vars).unwrap();
             assert_eq!(allow.into_iter().collect::<Vec<_>>(), vec!["k2".to_string()], "{sid}");
         }
+    }
+
+    /// 实测 LAT-110：plan 从 6 点改成 5 点后，旧 k6.md 还在 sections/ 且被 k5 的
+    /// 「下一章」链接引用；按 draft 清图把 k6 的布局图删了，定稿发布出来是破图。
+    #[test]
+    fn assemble_draft_keeps_images_referenced_by_stale_chapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("sections")).unwrap();
+        std::fs::create_dir_all(base.join("img")).unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({"knowledge_points": [{"id": "k1", "title": "一"}]}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(base.join("sections/k1.md"), "## 一\n\n正文，下一章见 [k6](k6.md)\n").unwrap();
+        std::fs::write(base.join("sections/k6.md"), "## 旧章\n\n![布局](../img/ml-00000000000000aa.svg)\n").unwrap();
+        std::fs::write(base.join("img/ml-00000000000000aa.svg"), "<svg/>").unwrap();
+        std::fs::write(base.join("img/ml-00000000000000bb.svg"), "<svg/>").unwrap();
+        assert!(assemble_draft_from_sections(base).unwrap());
+        assert!(base.join("img/ml-00000000000000aa.svg").is_file(), "旧章引用的图不能删");
+        assert!(!base.join("img/ml-00000000000000bb.svg").is_file(), "谁都不引用的旧图照删");
     }
 
     #[test]
@@ -21473,6 +21740,66 @@ output_key = "plan_out"
 
     /// 第一次 plan 写了不存在的证据：引擎把原因写回 prompt，只重试 plan 这一步。
     #[tokio::test]
+    async fn learn_loop_plan_depth_gap_passes_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/own.rs"), "a\nb\nc\n").unwrap();
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut shallow = learn_plan_design();
+        shallow["decisions"][0]["alternatives"][0].as_object_mut().unwrap().remove("wins_when");
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({"slug": "own", "design": shallow, "knowledge_points": [good_point()]}).to_string(),
+        )
+        .unwrap();
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+        let wf: WorkflowDef = toml::from_str(
+            "name = \"learn_loop\"\nmax_rounds = 1\n[[steps]]\nid = \"plan\"\nrole = \"tutor\"\ntask = \"PLAN_STEP\"\noutput_key = \"plan_out\"\nmax_retries = 2\n",
+        )
+        .unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, mut rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), run_workflow(&wf, "所有权", &ctx))
+            .await
+            .expect("不应卡死")
+            .expect("只差对比深度应直接放行");
+        assert_eq!(out.trim(), "own");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "不为 wins_when 重跑 plan");
+        let mut statuses = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::Status { message } = ev {
+                statuses.push(message);
+            }
+        }
+        assert!(statuses.iter().any(|m| m.contains("不为它重跑 plan") && m.contains("wins_when")), "{statuses:?}");
+    }
+
+    #[tokio::test]
     async fn learn_loop_plan_retries_until_evidence_is_real() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -21568,67 +21895,78 @@ max_retries = 2
         std::fs::write(code.join("k1-own.rs"), copy).unwrap();
     }
 
-    #[test]
-    fn learn_loop_annotation_validation_rejects_changed_code() {
-        let dir = tempfile::tempdir().unwrap();
-        setup_annotate(dir.path());
-        let err = validate_learn_annotations(dir.path(), ".latte/learn", "own").expect_err("还没写副本");
-        assert!(err.contains("README.md"), "{err}");
-
-        write_copy(dir.path(), GOOD_COPY);
-        validate_learn_annotations(dir.path(), ".latte/learn", "own").expect("逐字代码 + 注释应通过");
-
-        write_copy(dir.path(), &GOOD_COPY.replace("let t = s;", "let t = s.clone();"));
-        let err = validate_learn_annotations(dir.path(), ".latte/learn", "own").expect_err("改了代码");
-        assert!(err.contains("s.clone()") && err.contains("只许加注释"), "{err}");
-
-        write_copy(dir.path(), &GOOD_COPY.replace("    println!(\"{t}\");\n", "    ...\n"));
-        let err = validate_learn_annotations(dir.path(), ".latte/learn", "own").expect_err("省略代码");
-        assert!(err.contains("「...」"), "{err}");
-
-        write_copy(dir.path(), &GOOD_COPY.replace("src/own.rs:2-3", "src/nope.rs:2-3"));
-        let err = validate_learn_annotations(dir.path(), ".latte/learn", "own").expect_err("出处不存在");
-        assert!(err.contains("原始出处"), "{err}");
-
-        // 宏续行前的对齐 tab 个数不同、出处写成裸文件名：都不算改代码。
-        let ws = GOOD_COPY
-            .replace("src/own.rs:2-3", "own.rs:2-3")
-            .replace("let t = s;", "let  t\t=   s;");
-        write_copy(dir.path(), &ws);
-        validate_learn_annotations(dir.path(), ".latte/learn", "own").expect("空白差异 + 裸文件名出处应通过");
-
-        let code = dir.path().join(".latte/learn/own/code");
-        std::fs::remove_file(code.join("k1-own.rs")).unwrap();
-        std::fs::write(dir.path().join("src/other.rs"), "fn x() {}\n").unwrap();
-        std::fs::write(code.join("k9-other.rs"), "// 原始出处：src/other.rs:1\nfn x() {}\n").unwrap();
-        let err = validate_learn_annotations(dir.path(), ".latte/learn", "own").expect_err("证据文件没副本");
-        assert!(err.contains("没有注释副本") && err.contains("src/own.rs"), "{err}");
-    }
-
-    /// 第一次副本改了代码：引擎点名对不上的行，只重试 annotate。
+    /// 小白试学全链路：引擎先改正出处 → 小白答错题 + 报文档问题（另有一条编造的原文被丢弃）
+    /// → 辅导员纠正 → 小白复查重答答对 → NOVICE_DONE，文档里不留待确认。
     #[tokio::test]
-    async fn learn_loop_annotate_retries_until_copy_matches_source() {
+    async fn learn_loop_novice_finds_issue_and_tutor_fixes_it() {
         let dir = tempfile::tempdir().unwrap();
-        setup_annotate(dir.path());
+        let cwd = dir.path().to_path_buf();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src/own.rs"), "fn a() {}\nconst LIMIT: usize = 16384;\nfn b() {}\n").unwrap();
+        write_learn_plan(&cwd, serde_json::json!([{
+            "id": "k1", "title": "边界", "evidence": "src/own.rs:2",
+            "question": "申请恰好 16384 字节走哪条路？",
+            "options": [{"label": "走 large"}, {"label": "走 small"}],
+            "answer": "走 large"
+        }]));
+        let base = cwd.join(".latte/learn/own");
+        std::fs::create_dir_all(base.join("sections/k1")).unwrap();
+        let wrong = "比 16 KiB 大才走 large，所以 16384 字节仍然走 small。";
+        std::fs::write(
+            base.join("sections/k1/1_background.md"),
+            format!("上限 `LIMIT`（`src/own.rs:3`）。\n\n{wrong}\n\n后面还有一整段已经写好的讲解，返工不能把它推倒。\n"),
+        )
+        .unwrap();
 
         let server = wiremock::MockServer::start().await;
-        let cwd = dir.path().to_path_buf();
+        let b1 = base.clone();
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(wiremock::matchers::body_string_contains("注释副本未通过引擎校验"))
+            .and(wiremock::matchers::body_string_contains("RECHECK_STEP"))
             .respond_with(move |_: &wiremock::Request| {
-                write_copy(&cwd, GOOD_COPY);
-                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs"))
+                std::fs::write(
+                    b1.join("novice/recheck.json"),
+                    r#"{"issues":[{"id":"n1","resolved":true},{"id":"n2","resolved":true}],"answers":[{"id":"k1","choice":"走 large"}]}"#,
+                )
+                .unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("复查完了"))
             })
             .mount(&server)
             .await;
-        let cwd = dir.path().to_path_buf();
+        let b2 = base.clone();
+        let wrong2 = wrong.to_string();
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(wiremock::matchers::body_string_contains("ANNOTATE_STEP"))
+            .and(wiremock::matchers::body_string_contains("FIX_STEP"))
             .respond_with(move |_: &wiremock::Request| {
-                write_copy(&cwd, &GOOD_COPY.replace("let t = s;", "let t = s.clone();"));
-                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs"))
+                let f = b2.join("sections/k1/1_background.md");
+                let t = std::fs::read_to_string(&f).unwrap();
+                std::fs::write(&f, t.replace(&wrong2, "≥ 16 KiB（16384 字节）就走 large。")).unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("FIXED n1: 边界改成 ≥\nFIXED n2: 同上"))
+            })
+            .mount(&server)
+            .await;
+        let b3 = base.clone();
+        let wrong3 = wrong.to_string();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("NOVICE_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                let brief = std::fs::read_to_string(b3.join("novice/brief.md")).unwrap();
+                assert!(brief.contains("申请恰好 16384 字节") && !brief.contains("\"answer\""), "{brief}");
+                std::fs::write(
+                    b3.join("novice/report.json"),
+                    serde_json::json!({
+                        "answers": [{"id": "k1", "choice": "走 small", "basis": wrong3}],
+                        "issues": [
+                            {"kind": "doc", "quote": wrong3, "problem": "和源码 LIMIT=16384 的含义对不上", "evidence": "src/own.rs:2"},
+                            {"kind": "doc", "quote": "文档里没有这句话", "problem": "编的"}
+                        ]
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("学了 1 章，提了 2 个问题"))
             })
             .mount(&server)
             .await;
@@ -21648,22 +21986,35 @@ role = "tutor"
 task = "DOC_STEP"
 output_key = "plan_out"
 [[steps]]
-id = "annotate"
+id = "novice"
 role = "tutor"
-task = "ANNOTATE_STEP {{plan_out}}"
-max_retries = 2
+task = "NOVICE_STEP {{plan_out}}"
+max_retries = 1
+[[steps]]
+id = "novice_fix"
+role = "tutor"
+task = "FIX_STEP"
+max_retries = 1
+[[steps]]
+id = "novice_recheck"
+role = "tutor"
+task = "RECHECK_STEP"
+max_retries = 1
+loop_until = "NOVICE_DONE"
+loop_back_to = "novice_fix"
+max_iterations = 10
 "#,
         )
         .unwrap();
         wf.validate().unwrap();
         let config = test_config_at(&server.uri());
         let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
-        let (event_tx, _rx) = broadcast::channel(16);
+        let (event_tx, mut rx) = broadcast::channel(256);
         let ctx = WorkflowRunContext {
             merged: config,
             resolver,
             default_params: GenerateParams::default(),
-            cwd: dir.path().to_path_buf(),
+            cwd: cwd.clone(),
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -21677,22 +22028,165 @@ max_retries = 2
             dispatch_budget: None,
             root_wf_id: None,
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            run_workflow(&wf, "所有权", &ctx),
-        )
-        .await
-        .expect("不应卡死")
-        .expect("第二次副本逐字保留代码，应成功");
-        let bodies: Vec<String> = server
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), run_workflow(&wf, "边界", &ctx))
+            .await
+            .expect("不应卡死")
+            .expect("试学流程应跑完");
+        let mut statuses = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::Status { message } = ev {
+                statuses.push(message);
+            }
+        }
+        assert!(out.contains("NOVICE_DONE"), "{out}");
+        assert!(out.contains("待你确认 0 个"), "{out}");
+        let doc = std::fs::read_to_string(base.join("sections/k1/1_background.md")).unwrap();
+        assert!(doc.contains("`src/own.rs:2`"), "引擎改正了出处: {doc}");
+        assert!(doc.contains("≥ 16 KiB") && !doc.contains("⚠️"), "{doc}");
+        let issues = crate::learn_novice::load_issues(&base);
+        assert_eq!(issues.len(), 2, "编造原文的那条被丢弃: {issues:?}");
+        assert_eq!(issues[0].kind, "quiz");
+        assert!(issues.iter().all(|i| i.status == "resolved"), "{issues:?}");
+        assert!(statuses.iter().any(|m| m.contains("引擎已改正 1 处")), "{statuses:?}");
+        assert!(statuses.iter().any(|m| m.contains("丢弃 1 条")), "{statuses:?}");
+        let n = server.received_requests().await.unwrap().len();
+        assert_eq!(n, 4, "doc + 试学 + 纠正 + 复查各一次");
+        // 内容没再变 → 下次不再试学。
+        assert!(crate::learn_novice::study_scope(&base).is_empty());
+    }
+
+
+    async fn run_annotate_wf(
+        dir: &std::path::Path,
+        server: &wiremock::MockServer,
+        max_retries: usize,
+    ) -> (Result<String, String>, Vec<String>, Vec<String>) {
+        let wf: WorkflowDef = toml::from_str(&format!(
+            r#"
+name = "learn_loop"
+max_rounds = 1
+[[steps]]
+id = "doc"
+role = "tutor"
+task = "DOC_STEP"
+output_key = "plan_out"
+[[steps]]
+id = "annotate"
+role = "tutor"
+task = "ANNOTATE_STEP {{{{plan_out}}}}"
+max_retries = {max_retries}
+"#
+        ))
+        .unwrap();
+        wf.validate().unwrap();
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, mut rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(30), run_workflow(&wf, "所有权", &ctx))
+            .await
+            .expect("不应卡死")
+            .map_err(|e| e.to_string());
+        let bodies = server
             .received_requests()
             .await
             .unwrap()
             .iter()
             .map(|r| String::from_utf8_lossy(&r.body).into_owned())
             .collect();
-        assert_eq!(bodies.len(), 3, "doc 一次 + annotate 两次：{bodies:?}");
-        assert!(bodies[2].contains("s.clone()"), "重试 prompt 要点名改坏的那一行");
+        let mut statuses = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::Status { message } = ev {
+                statuses.push(message);
+            }
+        }
+        (out, bodies, statuses)
+    }
+
+    /// 回归 LAT-110（ui-16242）：模型凭记忆重打副本，改了代码。现在代码由引擎
+    /// 拷，模型插注释时顺手改坏的代码由引擎换回原文，不打回、不重试。
+    #[tokio::test]
+    async fn learn_loop_annotate_engine_restores_changed_code_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+        let server = wiremock::MockServer::start().await;
+        let copy = dir.path().join(".latte/learn/own/code/k1-own.rs");
+        let c = copy.clone();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("ANNOTATE_STEP"))
+            .respond_with(move |_: &wiremock::Request| {
+                let skel = std::fs::read_to_string(&c).expect("开跑前引擎已写好骨架");
+                assert!(skel.contains("原始出处：src/own.rs:1-5"), "{skel}");
+                let edited = skel.replace(
+                    "    let t = s;\n",
+                    "    // move：所有权交给 t\n    let t = s.clone();\n",
+                );
+                std::fs::write(&c, edited).unwrap();
+                ResponseTemplate::new(200).set_body_string(openai_body("code/k1-own.rs 已插注释"))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+        let (out, bodies, statuses) = run_annotate_wf(dir.path(), &server, 2).await;
+        out.expect("代码被引擎还原后应通过");
+        assert_eq!(bodies.iter().filter(|b| b.contains("ANNOTATE_STEP")).count(), 1, "不重试");
+        let now = std::fs::read_to_string(&copy).unwrap();
+        assert!(now.contains("    // move：所有权交给 t\n    let t = s;\n"), "{now}");
+        assert!(!now.contains("clone"), "{now}");
+        assert!(statuses.iter().any(|m| m.contains("逐字拷出 1 个代码副本骨架")), "{statuses:?}");
+        assert!(statuses.iter().any(|m| m.contains("还原 1 行")), "{statuses:?}");
+        let readme = std::fs::read_to_string(dir.path().join(".latte/learn/own/code/README.md")).unwrap();
+        assert!(readme.contains("k1-own.rs") && !readme.contains("未加注释"), "{readme}");
+    }
+
+    /// 一条注释都没插：打回一次；重试用完仍没有就降级成无注释原文，流程继续。
+    #[tokio::test]
+    async fn learn_loop_annotate_without_comments_retries_then_degrades() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_annotate(dir.path());
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("ANNOTATE_STEP"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("什么也没做")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("own")))
+            .mount(&server)
+            .await;
+        let (out, bodies, statuses) = run_annotate_wf(dir.path(), &server, 1).await;
+        out.expect("没注释不该让整条学习流程失败");
+        let annotate: Vec<&String> = bodies.iter().filter(|b| b.contains("ANNOTATE_STEP")).collect();
+        assert_eq!(annotate.len(), 2, "打回一次");
+        assert!(annotate[1].contains("还没有任何注释") && annotate[1].contains("insert_before"));
+        assert!(statuses.iter().any(|m| m.contains("按无注释的源码原文副本继续")), "{statuses:?}");
+        let code = dir.path().join(".latte/learn/own/code");
+        assert_eq!(std::fs::read_to_string(code.join("k1-own.rs")).unwrap().matches("let t = s;").count(), 1);
+        assert!(std::fs::read_to_string(code.join("README.md")).unwrap().contains("未加注释"));
     }
 
     /// 上次 run 留下的旧副本（这次 plan 里已经没有的知识点）不能污染本次校验。
@@ -22191,26 +22685,41 @@ max_retries = 2
         assert_eq!(allow.iter().cloned().collect::<Vec<_>>(), vec!["k1".to_string(), "k3".to_string()]);
     }
 
+    /// 回归 LAT-110：错的出处被锁死——返工把 `sc.h:3` 改成正确的 `sc.h:7`
+    /// 被判「删掉了原有出处」并还原。核对不通过的出处允许改掉；对的仍然不许删。
+    #[test]
+    fn learn_loop_chapter_patch_allows_correcting_wrong_citations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sc.h"), "a\nb\nc\nd\ne\nf\n#define SC_LG_MAX_LOOKUP 12\n#define OTHER 1\n").unwrap();
+        let body = "这一段是已经写好的讲解，篇幅足够长，返工不能把它推倒重来。";
+        let original = format!("`SC_LG_MAX_LOOKUP`（`sc.h:3`）{body}\n`OTHER`（`sc.h:8`）{body}\n");
+        let fixed = original.replace("sc.h:3", "sc.h:7");
+        check_chapter_patch(&original, &fixed, Some(dir.path())).expect("改对错误出处应通过");
+        assert!(check_chapter_patch(&original, &fixed, None).is_err(), "不核对时仍按旧规则");
+        let dropped_good = original.replace("（`sc.h:8`）", "");
+        assert!(check_chapter_patch(&original, &dropped_good, Some(dir.path())).unwrap_err().contains("sc.h:8"));
+    }
+
     #[test]
     fn learn_loop_chapter_patch_rejects_rewrite_and_restores_file() {
         let original = "# 所有权\n\n每个值有唯一 owner，见 src/own.rs:12-20。\n\nmove 之后不能再用原来的变量。这是一整段已经读懂的讲解，不能被推倒。\n";
         let patched = format!("{original}\n\n## 易错点辨析\n选「还能用」是错的，因为 src/own.rs:12-20 把所有权交出去了。\n");
-        check_chapter_patch(original, &patched).expect("增补应通过");
+        check_chapter_patch(original, &patched, None).expect("增补应通过");
         assert!(
-            check_chapter_patch(original, "短文，没有出处")
+            check_chapter_patch(original, "短文，没有出处", None)
                 .unwrap_err()
                 .contains("源码出处")
         );
         let shrunk = "src/own.rs:12-20 还在，但正文被砍光了。";
         assert!(
-            check_chapter_patch(original, shrunk)
+            check_chapter_patch(original, shrunk, None)
                 .unwrap_err()
                 .contains("整章重写"),
             "{}",
-            check_chapter_patch(original, shrunk).unwrap_err()
+            check_chapter_patch(original, shrunk, None).unwrap_err()
         );
         assert!(
-            check_chapter_patch(original, &original.replace("src/own.rs:12-20", "别处"))
+            check_chapter_patch(original, &original.replace("src/own.rs:12-20", "别处"), None)
                 .unwrap_err()
                 .contains("源码出处")
         );
@@ -22223,10 +22732,10 @@ max_retries = 2
             original: original.to_string(),
         };
         std::fs::write(&path, "短文").unwrap();
-        let err = reject_chapter_overwrite(Some(&baseline)).expect_err("短文应拒绝");
+        let err = reject_chapter_overwrite(Some(&baseline), None).expect_err("短文应拒绝");
         assert!(err.contains("源码出处") || err.contains("整章重写"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        reject_chapter_overwrite(Some(&baseline)).expect("还原后应通过");
+        reject_chapter_overwrite(Some(&baseline), None).expect("还原后应通过");
     }
 
     #[test]
@@ -22301,6 +22810,96 @@ max_retries = 2
         assert_eq!(ledger["knowledge_points"][0]["id"], "k2");
         assert_eq!(ledger["knowledge_points"][0]["passed"], true);
         assert!(!base.join("ledger.prev.json").exists(), "回滚后删备份");
+    }
+
+    /// 写文档时 mermaid 语法错误由引擎当场修正写回，不打回 writer 重试。
+    /// 图源取自 jemalloc 会话里实测在页面上渲染失败的原句。
+    #[tokio::test]
+    async fn doc_writer_mermaid_syntax_is_fixed_by_engine_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join(".latte/learn/own");
+        std::fs::create_dir_all(base.join("sections")).unwrap();
+        let overview = base.join("sections/00_overview.md");
+        let broken = "# 总览\n\n```mermaid\ngraph LR\n  subgraph 面向用户（低频）\n    U[\"sz_s2u\"]\n  end\n  base -->|base_alloc_impl (src/base.c:485)| U\n  C[计算 bin 索引] --> D[通过柔性数组 arena->bins[bin_ind] 快速偏移]\n```\n";
+
+        let server = wiremock::MockServer::start().await;
+        let ov = overview.clone();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |r: &wiremock::Request| {
+                if String::from_utf8_lossy(&r.body).contains("写主体框架") {
+                    std::fs::write(&ov, broken).unwrap();
+                }
+                ResponseTemplate::new(200).set_body_string(openai_body("sections/00_overview.md"))
+            })
+            .mount(&server)
+            .await;
+        let config = test_config_at(&server.uri());
+        let resolver = Arc::new(ModelResolver::from_config(&config).unwrap());
+        let (event_tx, mut event_rx) = broadcast::channel(64);
+        let ctx = WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd: dir.path().to_path_buf(),
+            event_tx,
+            turn_cancel_flag: None,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            root_wf_id: None,
+        };
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "doc_review_loop"
+max_rounds = 1
+[[steps]]
+id = "outline"
+role = "tutor"
+task = "写主体框架 {{topic}}"
+output_key = "outline_out"
+max_retries = 2
+[[steps]]
+id = "after"
+role = "tutor"
+depends_on = ["outline"]
+task = "后续步 {{outline_out}}"
+"#,
+        )
+        .unwrap();
+        wf.validate().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), run_workflow(&wf, "slug=own", &ctx))
+            .await
+            .expect("不应卡死")
+            .expect("修正后应通过");
+
+        // 生产 doc_review_loop 是依赖 DAG（outline → ch_*），测试也走 DAG：
+        // outline 1 次 + 后续步 1 次，outline 没有被打回重写。
+        let bodies: Vec<String> = server.received_requests().await.unwrap().iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned()).collect();
+        assert_eq!(bodies.iter().filter(|b| b.contains("写主体框架")).count(), 1, "可修的语法错误不该让 writer 重写");
+        let now = std::fs::read_to_string(&overview).unwrap();
+        assert!(now.contains("subgraph sg1[\"面向用户（低频）\"]"), "{now}");
+        assert!(now.contains("-->|\"base_alloc_impl (src/base.c:485)\"| U"), "{now}");
+        assert!(now.contains("D[\"通过柔性数组 arena->bins[bin_ind] 快速偏移\"]"), "{now}");
+        assert!(now.contains("C[计算 bin 索引]"), "能渲染的节点不动：{now}");
+        assert!(now.starts_with("# 总览\n\n```mermaid\ngraph LR\n"), "图外内容不动：{now}");
+        let mut statuses = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let ChatEvent::Status { message } = ev {
+                statuses.push(message);
+            }
+        }
+        assert!(
+            statuses.iter().any(|m| m.contains("引擎已自动修正 3 处 mermaid 语法")),
+            "{statuses:?}"
+        );
     }
 
     #[tokio::test]

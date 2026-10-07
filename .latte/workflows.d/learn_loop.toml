@@ -1,6 +1,7 @@
 # Workflow: learn_loop（v2：文档驱动学习循环）
 # plan（取证 + 拆知识点 + 出题）→ annotate（注释版代码副本，默认生成）
 #   → doc_review（嵌套 doc_review_loop：outline → 按知识点并发 write_chapter，装配 draft.md）
+#   → novice → novice_fix ⇄ novice_recheck（小白先试学一遍，问题由辅导员纠正、小白复查）
 #   → read_confirm（「开始答题」按钮，等学员读完）→ quiz（批量出题 + 判分 + 写账本，
 #   有错跳回 doc_review，只重写答错的章）→ supplement（全对后问"还有不懂的吗"，有补充跳回 doc_review）
 #   → merge（引擎定稿 docs/learn/<主题名>.md）→ [sync_code（可选：注释写进源码）] → report
@@ -45,7 +46,7 @@ max_rounds = 1
 # ═══ 1. 取证 + 拆解知识点 + 出题 ══════════════════════════════
 # tools              无 ask：课程设计阶段不许弹窗打扰学员。
 # require_tools_any  取证不可跳过（read/code_graph/search 任一即可）。
-# require_tools      plan.json / ledger.json 必须落盘，下游靠文件工作。
+# require_tools      plan.json / ledger.json 必须落盘，下游靠文件工作（返工用 edit 改也算落盘）。
 # output_contract    产出被当路径片段拼接，所以只能是 slug 本身。
 [[steps]]
 id = "plan"
@@ -53,9 +54,12 @@ description = "读代码取证，拆解知识点、出题并写入 plan.json / l
 role = "tutor"
 output_key = "plan_out"
 max_retries = 2
-tools = ["read", "code_graph", "search", "write"]
+tools = ["read", "code_graph", "search", "write", "edit"]
 require_tools_any = ["read", "code_graph", "search"]
 require_tools = ["write"]
+# 只许写学习工作区里的 plan.json / ledger.json（slug 由本步决定，所以用 `*`）。
+# 有 edit：返工只改被点名的字段，不必为几个字段整份重写 19KB 的 plan.json。
+write_path_allowlist = ["{{learn_root}}/*/plan.json", "{{learn_root}}/*/ledger.json"]
 task = """围绕主题「{{topic}}」设计课程。你是课程设计师，不教学，只产出设计分析、知识点清单与文档大纲。
 
 读者是有编程基础、没读过这段代码的工程师。他要带走的是「作者面对什么问题、做了哪几个取舍、为什么这样选、代价是什么」。通用语言/库概念不配成为知识点。
@@ -188,48 +192,43 @@ forbid = [" ", "/", "\\", "`"]
 # ═══ 1b. 注释版代码副本（默认生成）═══════════════════════════════════
 # 默认必跑：注释版副本是学习材料的标配。「要不要注释进源码」才是开关——
 # 那是 merge 之后 sync_code 步的事（when_any 触发）。
-# tools          只有 read + write：副本是新文件，用不上 edit；没有 edit 也就
-#                不可能改到源文件——"不动源码"靠工具隔离，不靠 prompt 劝告。
+# tools          只有 read + edit，且 write_path_allowlist 只放行 code/ 下的副本：
+#                改不到源文件——"不动源码"靠引擎拦截，不靠 prompt 劝告。
 # 副本落在 .latte/sessions/<会话>/learn/<slug>/code/，不违反只读类型的 paths 严格校验
 # （.latte/ 是学习产物目录，不是仓库源码）。
 [[steps]]
 id = "annotate"
-description = "为 plan 取证的代码生成注释版学习副本（不改源码）"
+description = "在引擎逐字拷好的代码副本里插入讲解注释（不改源码，不改代码行）"
 budget = "small"
 role = "tutor"
 output_key = "annotate_out"
-max_retries = 2
-tools = ["read", "write"]
-require_tools = ["write"]
+max_retries = 1
+# 代码由引擎拷（开跑前按 plan 证据写好 code/<知识点>-<文件名> 骨架与 README）。
+# 只给 read + edit：模型没有 write，也就无法凭记忆重打整份代码（实测 LAT-110：
+# 300+ 行副本里数字、折行、声明被改，3 次 × 40 分钟全被打回）。改坏的代码行
+# 由引擎换回原文；只能改 code/ 下的副本。
+tools = ["read", "edit"]
+require_tools = ["edit"]
+write_path_allowlist = ["{{learn_root}}/{{plan_out}}/code/*"]
 task = """你是互动学习辅导员。当前主题 slug：{{plan_out}}。
 
-读 `{{learn_root}}/{{plan_out}}/plan.json`，为每个知识点的 `evidence`（file:line）
-生成**注释版代码副本**，让学员读源码时旁边就有讲解：
+引擎已经把 plan 证据涉及的源码**逐字**拷进 `{{learn_root}}/{{plan_out}}/code/`（索引见
+`{{learn_root}}/{{plan_out}}/code/README.md`），文件头写好了原始出处和对应知识点。你的任务
+只有一件：**在这些副本里插入中文讲解注释**，让学员读源码时旁边就有讲解。
 
-1. 按 `evidence` 的行号区间 `read` 原文件（函数/结构体读完整定义，前后带少量
-   上下文）；同一文件被多个知识点引用时合并成一个副本。
-2. `write` 到 `{{learn_root}}/{{plan_out}}/code/<知识点id>-<原文件名>`（如
-   `k1-ownership.rs`）：**逐字保留代码原文，只加中文注释**——
-   - 文件头注释块：原始出处（`file:line`）、对应知识点标题、"学习副本——
-     源文件未改动，行号可能随后续源码演进漂移"；
-   - 关键行上方用注释讲「做什么 / 为什么」，不复述代码本身；术语与
-     plan.json 的 `teach_points` 保持一致，且**面向零基础学员**——术语随口
-     用半句大白话带过（如"内联：把函数体直接铺到调用处"），不甩生词。
-3. 最后 `write` 索引 `{{learn_root}}/{{plan_out}}/code/README.md`：知识点 →
-   副本文件 → 原始出处的对照表。
+1. 读 `{{learn_root}}/{{plan_out}}/plan.json`（知识点的 `teach_points`、`why`）和
+   README.md，再 `read` 每个副本。
+2. 用 `edit` 插注释：`insert_before` / `insert_after` 在关键行前后插整行注释（用该
+   语言的注释符号开头），或在代码行尾追加行尾注释。一次 edit 可以带多个插入。
+   - 讲「做什么 / 为什么」，不复述代码本身；术语与 `teach_points` 一致，
+     **面向零基础学员**——术语随口用半句大白话带过（如"内联：把函数体直接铺到调用处"）。
+   - 每个副本至少讲清它对应知识点的关键几行。
 
-**绝不修改 `code/` 目录以外的任何文件**——源文件保持原样，学员对照副本
-阅读即可。
-
-引擎写完后会核对：README.md 存在；每个副本文件头写了真实存在的原始出处
-（`file:line`）；副本里每一行非注释代码都能在源文件里找到原样（行尾追加注释可以）；
-plan 证据涉及的每个源文件都有副本。所以讲解一律写成以该语言注释符号开头的整行
-注释（`//`、`#` 等）或行尾注释，不要省略代码、不要写伪代码。不合格会点名哪一行
-对不上，让你重写。正文列出副本清单（副本路径 → 原始出处），此外不输出别的。"""
+代码行一个字符都不要改、不要删、不要新增——改了引擎也会换回原文。不要动 README.md。
+正文列出你注释了哪些副本，此外不输出别的。"""
 
 [steps.output_contract]
-min_chars = 30
-require = ["code/"]
+min_chars = 10
 
 # ═══ 2. 嵌套写作（主体框架 + 章节并发写作）══════════════════════
 # doc_review_loop：outline → 各章并发 write。写完就返回，学员开始阅读。
@@ -246,6 +245,75 @@ draft={{learn_root}}/{{plan_out}}/draft.md
 plan={{learn_root}}/{{plan_out}}/plan.json
 ledger={{learn_root}}/{{plan_out}}/ledger.json
 """
+
+# ═══ 2b. 小白试学：学员读之前先替他学一遍，问题交给辅导员纠正 ══════════
+# 三步都由引擎前后置（workflow.rs learn_novice_pre / learn_novice_post）：
+#   novice          引擎先改正对不上源码的「符号（文件:行号）」，按章节内容哈希只学
+#                   变过的章，出不带答案的试学卷；小白写 report.json。引擎核实（摘的
+#                   原文要逐字在文档里、依据行号要真实存在），按选项判分，答错自动成为问题。
+#   novice_fix      辅导员逐条 FIXED / WONTFIX；改坏的还原，代码副本只留注释。
+#   novice_recheck  小白复查；答题类必须重答答对才算解决。最多 2 轮，仍未解决的在原文处
+#                   标「⚠️ 待确认」，交给学员。知识点拆分类问题不自动改，直接列为待确认。
+# read_path_allowlist 只写禁读项（`!`）：小白要读任意源码，但不许读 plan.json / ledger.json（答案在里面）。
+# 没有要学 / 要改 / 要复查的，引擎直接给出产出，不调模型。
+[[steps]]
+id = "novice"
+description = "小白试学：读文档和代码、答试学卷，提出问题"
+role = "novice"
+output_key = "novice_out"
+max_retries = 1
+tools = ["read", "code_graph", "search", "write"]
+require_tools_any = ["read"]
+require_tools = ["write"]
+read_path_allowlist = ["!{{learn_root}}/*/plan.json", "!{{learn_root}}/*/ledger.json", "!{{learn_root}}/*/feedback.md", "!{{learn_root}}/*/novice/issues.json"]
+write_path_allowlist = ["{{learn_root}}/{{plan_out}}/novice/report.json"]
+task = """你在学员之前先学这份学习材料。先 read `{{learn_root}}/{{plan_out}}/novice/brief.md`（试学说明：要学的章节、代码副本、试学卷），
+然后按顺序学完，对照源码核对文档里的数字、边界和条件，最后答完试学卷。
+
+把结果 write 到 `{{learn_root}}/{{plan_out}}/novice/report.json`（格式见你的角色说明）。
+完成后正文只输出一句话：学了几章、提了几个问题。"""
+[steps.output_contract]
+min_chars = 4
+
+[[steps]]
+id = "novice_fix"
+description = "辅导员纠正小白试学提出的问题"
+role = "tutor"
+output_key = "novice_fix_out"
+max_retries = 1
+tools = ["read", "code_graph", "search", "edit"]
+write_path_allowlist = ["{{learn_root}}/{{plan_out}}/sections/*.md", "{{learn_root}}/{{plan_out}}/sections/*/*.md", "{{learn_root}}/{{plan_out}}/code/*"]
+task = """小白在学员之前试学了这份材料，提出的问题已由引擎核实，见 `{{learn_root}}/{{plan_out}}/novice/fix_brief.md`。
+逐条处理：先回源码核对，问题成立就用 edit 改对应文件（章节在 sections/，代码副本在 code/，代码副本只改注释）；
+问题不成立就不改，并说明理由。只在原文上改，不要整段推倒，原有的正确 `文件:行号` 出处保留。
+
+正文逐条回应，每条单独一行：
+FIXED <id>: 改了什么
+WONTFIX <id>: 不改的理由（要能说服小白）"""
+[steps.output_contract]
+min_chars = 4
+
+[[steps]]
+id = "novice_recheck"
+description = "小白复查纠正结果"
+role = "novice"
+output_key = "novice_recheck_out"
+max_retries = 1
+loop_until = "NOVICE_DONE"
+loop_back_to = "novice_fix"
+max_iterations = 10
+tools = ["read", "code_graph", "search", "write"]
+require_tools = ["write"]
+read_path_allowlist = ["!{{learn_root}}/*/plan.json", "!{{learn_root}}/*/ledger.json", "!{{learn_root}}/*/feedback.md", "!{{learn_root}}/*/novice/issues.json"]
+write_path_allowlist = ["{{learn_root}}/{{plan_out}}/novice/recheck.json"]
+task = """辅导员处理了你上次提的问题。read `{{learn_root}}/{{plan_out}}/novice/recheck_brief.md`，只看里面列出的条目和改过的地方，
+逐条判断问题是否真的解决了，需要重新作答的题照样作答。
+
+write `{{learn_root}}/{{plan_out}}/novice/recheck.json`：
+{"issues": [{"id": "n1", "resolved": true, "note": "…"}], "answers": [{"id": "k2", "choice": "选项原文", "basis": "文档原句"}]}
+完成后正文只输出一句话。"""
+[steps.output_contract]
+min_chars = 4
 
 # ═══ 3. 等学员读完：「开始答题」按钮 ═════════════════════════
 # tools            只读 + ask：不许改文档和账本。
