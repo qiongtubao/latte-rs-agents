@@ -303,6 +303,36 @@ fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
+/// 单次模型调用的 token 用量（`TraceEvent::ModelCall` 携带）。
+///
+/// 口径与 `latte_ai::models::TokenUsage` 一致：`cache_read_tokens` 是 `input_tokens` 的**子集**
+///（命中缓存的那部分），所以「真正新付费的输入」= `input_tokens - cache_read_tokens`。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallUsage {
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub thinking_tokens: u32,
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    #[serde(default)]
+    pub cache_write_tokens: u32,
+}
+
+impl From<&latte_ai::models::TokenUsage> for CallUsage {
+    fn from(u: &latte_ai::models::TokenUsage) -> Self {
+        Self {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            thinking_tokens: u.thinking_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+        }
+    }
+}
+
 /// payload that varies per variant. 9 variants cover the full
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TraceEvent {
@@ -325,6 +355,11 @@ pub enum TraceEvent {
         params_json: String,
         latency_ms: u64,
         finish_reason: String,
+        /// 这一次调用的 token 用量。**逐次**记录——`TurnEnd` 只有整个 turn 的合计，看不出工具循环里
+        /// 每一轮重传了多少历史（输入 token 随轮数线性涨）、哪一步的缓存没命中、哪次调用白烧。
+        /// 旧日志没有这个字段，反序列化时按全 0 处理。
+        #[serde(default)]
+        usage: CallUsage,
     },
     ModelRawOut {
         meta: TraceMeta,
@@ -929,10 +964,16 @@ impl TraceEvent {
                 model_id,
                 latency_ms,
                 finish_reason,
+                usage,
                 ..
             } => format!(
-                "model={} latency={}ms finish={}",
-                model_id, latency_ms, finish_reason
+                "model={} latency={}ms finish={} in={} out={} cache_read={}",
+                model_id,
+                latency_ms,
+                finish_reason,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens
             ),
             TraceEvent::ModelRawOut { raw_content, .. } => format!("{}", raw_content),
             TraceEvent::ModelDelta { delta, .. } => format!("delta: {}", delta),
@@ -2382,6 +2423,7 @@ mod tests {
                 params_json: r#"{"temperature":0.5}"#.into(),
                 latency_ms: 2741,
                 finish_reason: "stop".into(),
+                usage: CallUsage::default(),
             },
             TraceEvent::ModelRawOut {
                 meta: meta.clone(),

@@ -1,0 +1,114 @@
+# Workflow: build_verify
+# 编译构建验证流：探测构建体系 → 实际编译 → 验证产物 → 把跑通的方法
+# 沉淀成可复用脚本 + 文档。面向「把一个工程编译起来并确认产物正确」这类
+# 任务（LAT-100 rocksdb 静态库构建即此类）。
+#
+# 设计要点：
+#   - 第一步只探测、不编译：先搞清这个仓库用什么构建体系、入口命令是什么，
+#     避免上来就瞎跑 make/cmake。
+#   - 第二步真正编译并验证产物存在、符号正确（不接受"应该能编过"）。
+#   - 第三步把验证过的命令固化成 build_tools/<task>/ 下的脚本 + RESULTS.md，
+#     下次同类任务直接 `bash run_all.sh` 复用，不必重新探索。
+# 步骤间用 output_key 显式穿线。格式见 config/workflows/tdd_development.toml。
+
+name = "build_verify"
+command = "/build-verify"
+description = "编译构建验证：探测构建体系 → 实际编译 → 验证产物 → 沉淀可复用构建脚本+文档｜落点：build_tools/<task>/ 脚本 + RESULTS.md"
+max_rounds = 1
+
+[[steps]]
+id = "probe_build_system"
+description = "探测构建体系：用什么工具、入口命令、关键产物"
+speakers = ["devops"]
+output_key = "build_probe"
+max_retries = 1
+prompt = """围绕构建任务「{{topic}}」，先**只探测、不编译**，弄清这个仓库怎么构建。
+
+亲自读构建文件（按存在与否取舍）：Makefile / CMakeLists.txt / configure / build_tools/ /
+INSTALL.md / README 的构建章节 / package.json / Cargo.toml / pom.xml 等。
+
+输出：
+1) 构建体系与工具（make / cmake / cargo / autotools / …）及版本要求；
+2) 关键构建命令（如 `make static_lib`、`make all`、`cmake --build`），**逐条标注它产出什么**；
+3) 预期关键产物（库文件 / 可执行文件 / 头文件）的路径与名字（如 `librocksdb.a`）；
+4) 已知的平台坑（如 macOS 无 `inotify`、homebrew gtest 的 `-isystem` 顺序问题、
+   缺失 `timeout` 命令需用 `perl -e 'alarm'` 兜底）——基于真实读到的构建文件，不臆测；
+5) 本次任务要验证的产物清单（后续步骤据此逐条核对）。"""
+
+[steps.output_contract]
+min_chars = 150
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "build_and_verify"
+description = "实际编译并逐条验证产物"
+speakers = ["devops"]
+output_key = "build_result"
+max_retries = 1
+# 验证 FAIL → 跳回自身重跑（带本轮失败证据），直到 PASS 或 3 次迭代耗尽。
+loop_until = "VERDICT: PASS"
+loop_back_to = "build_and_verify"
+max_iterations = 3
+prompt = """按探测结论实际编译并验证，**不许声称"应该能编过"**，必须真跑命令、贴真实输出。
+
+【构建探测结论】{{build_probe}}
+任务：{{topic}}
+
+要求：
+1) 先 `make clean`（或等价清理）跑一次**干净构建**，记录退出码与耗时；
+2) 验证每个预期产物真实存在：
+   - 库/可执行文件存在且非空（`ls -l` / `stat` 贴大小）；
+   - 库里 object 数量合理（如 `ar t librocksdb.a | wc -l`）；
+   - 关键符号已定义（如 `nm librocksdb.a | grep 'T __ZN7rocksdb2DB4Open'`）；
+3) 遇到失败：判断是**本任务范围内的 bug** 还是**上游/环境 bug**（如上游 Makefile
+   `-isystem` 顺序、macOS 平台差异）。上游/环境 bug 要明确标注 OUT_OF_SCOPE 并说清
+   根因，不要试图修上游；
+4) 幂等性：第二次构建应成功且产物完好。
+
+【输出格式】
+VERDICT: PASS | FAIL
+EVIDENCE: 逐条核对（预期产物 → 验证命令 → 真实输出/退出码/大小/符号）
+OUT_OF_SCOPE: 判定为上游/环境问题的失败（根因 + 为什么不在本任务修；无则写"无"）
+GAPS: 本任务范围内仍未通过的点（无则写"无"）
+
+FAIL 时 GAPS 必须非空。上游 bug 不计入 FAIL（归 OUT_OF_SCOPE）。"""
+
+[steps.output_contract]
+min_chars = 150
+require = ["VERDICT:", "EVIDENCE:"]
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "persist_scripts"
+description = "把验证过的构建方法固化成可复用脚本 + 文档"
+speakers = ["devops"]
+output_key = "build_assets"
+max_retries = 1
+prompt = """把上面验证通过的构建方法**固化成可复用资产**，让下次同类任务直接复用、不必重新探索。
+
+【构建探测】{{build_probe}}
+【构建验证结论】{{build_result}}
+任务：{{topic}}
+
+产出到仓库 `build_tools/<task_id>/`（task_id 从 {{topic}} 推断，如 lat100）：
+1) 一个或多个可执行 `.sh` 脚本，封装验证过的构建+产物检查命令：
+   - 开头 `set -u`，用 `ROOT=$(cd "$(dirname "$0")/../.." && pwd); cd "$ROOT"` 定位仓库根；
+   - 每个检查用 `ok`/`bad` 函数输出 PASS/FAIL + 证据；
+   - 退出码反映失败数（`exit $FAIL`）；
+   - 跨平台兜底（缺 `timeout` 用 `perl -e 'alarm shift; exec @ARGV'`）；
+2) 一个 `run_all.sh` 编排脚本，按"轻→重"顺序串起各阶段，最后打印汇总；
+3) 一个 `RESULTS.md`，记录：验收条目 → 状态(PASS/PARTIAL/FAIL) → 证据；
+   已知上游/环境缺陷（OUT_OF_SCOPE）单列一节；本次 DEVIATIONS。
+
+要求：脚本里的命令必须是上一步**真实跑通过**的，不许写没验证过的命令。
+完成后列出创建/修改的文件清单。
+
+【输出格式】
+FILES: 创建/修改的文件逐一列出
+HOWTO: 下次如何复用（一行命令，如 `bash build_tools/lat100/run_all.sh`）
+NOTES: 固化时的关键决策（如为什么 B1-clean 排最后）"""
+
+[steps.output_contract]
+min_chars = 100
+require = ["FILES:", "HOWTO:"]
+forbid = ["TBD", "待补充", "占位符"]

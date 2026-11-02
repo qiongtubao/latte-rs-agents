@@ -196,6 +196,9 @@ fn step_gate_summary(s: &WorkflowStepDef) -> Vec<String> {
     if s.require_plan_tasks {
         out.push("任务清单 JSON 机械校验（路径存在性 / 重叠 / 类型名）".into());
     }
+    if s.require_learn_book {
+        out.push("学习书目录结构校验（层级先主干后枝叶 / 推导章 / 锚点体量）".into());
+    }
     if s.require_plan_submit {
         out.push("本步必须真的提交 plan".into());
     }
@@ -322,6 +325,8 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // 可配；表单编辑器的试运行给零值（不校验、不 patch、不
                 // 机械提交 = 现状行为）。
                 require_plan_tasks: false,
+                // 学习书目录结构校验同样只在 TOML 权威版可配。
+                require_learn_book: false,
                 // 符号可解析性校验同样只在 TOML 权威版可配（false = 现状行为）。
                 require_symbols_resolvable: false,
                 // 新门禁：UI 侧的表单构造用默认关（与 serde default 一致）——

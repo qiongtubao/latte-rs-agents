@@ -104,4 +104,22 @@ ISSUES:
 - Critical: 必须修复才能合入的问题（含文件与位置）
 - Important: 应当修复的问题
 - Minor: 可选改进
-ASSESSMENT: ✅ 可合入 / ⚠️ 修复 Important 后可合入 / ❌ 必须返工（附返工清单）"""
+ASSESSMENT: ✅ 可合入 / ⚠️ 修复 Important 后可合入 / ❌ 必须返工（附返工清单）
+
+最后一行必须是机器可判的闸门行，且与上面的 ASSESSMENT 一致：
+GATE: PASS | REWORK
+映射规则（不许偏离）：ASSESSMENT 为 ✅ 可合入 或 ⚠️ 修复 Important 后可合入 → `GATE: PASS`；
+ASSESSMENT 为 ❌ 必须返工 → `GATE: REWORK`。存在任何 Critical 问题时必须 `GATE: REWORK`。"""
+# 质量审查判「必须返工」→ 跳回 implement 重做，直到 PASS 或 3 次迭代耗尽。
+# 此前本步没有任何闸门：reviewer 写「❌ 必须返工」也只是正文，引擎跑完即 ok，
+# 失败被吞成成功（实测 LAT-100：quality_review 产出 ❌ 必须返工，workflow 却判 ok）。
+loop_until = "GATE: PASS"
+loop_back_to = "implement"
+# 迭代耗尽时若仍是 REWORK，直接判死——不许 advisor 复核把带返工清单的硬拒绝
+# 放行成功（见 loop_no_release_on 文档记录的 jemalloc 事故）。
+loop_no_release_on = "GATE: REWORK"
+max_iterations = 3
+
+[steps.output_contract]
+min_chars = 100
+require = ["GATE:", "ASSESSMENT:"]

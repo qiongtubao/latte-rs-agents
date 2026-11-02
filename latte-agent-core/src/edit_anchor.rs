@@ -685,8 +685,9 @@ pub fn heal_edit_input(scope: &Scope, tool_name: &str, input: &mut Value) -> Vec
         return notes;
     };
     for (idx, op) in ops.iter_mut().enumerate() {
-        // 只给「行号操作且模型没自己给 expect」的补。
-        if op.get("expect").is_some() || op.get("start_line").is_none() {
+        // 只给「行号操作且模型没自己给 expect」的补。带 `old_text` 的 op 是文本定位（按内容自校验），
+        // 它的 start_line 只是提示，不是行号锚点：给它补 expect 会把提示行的内容当成锚点去校验，没有意义。
+        if op.get("expect").is_some() || op.get("start_line").is_none() || op.get("old_text").is_some() {
             continue;
         }
         let Some(start) = op
@@ -799,6 +800,24 @@ mod tests {
             .ok()
             .and_then(|lg| lg.map.get(&sc("t").key("/tmp/batch_missing.rs")).cloned());
         assert!(missing.is_none(), "failed 里的路径不该有快照");
+    }
+
+    /// 文本定位（带 old_text）的 op 不补 expect：start_line 只是提示。
+    #[test]
+    fn text_anchored_ops_do_not_get_a_line_expect() {
+        let s = sc("text-anchored");
+        record_tool_result(
+            &s,
+            "read",
+            &json!({"path":"/tmp/t.rs","content":"a\nb\nc\n","tag":"AA11"}).to_string(),
+        );
+        let mut input = json!({"path":"/tmp/t.rs","ops":[
+            {"old_text":"b","start_line":2,"new_text":"B"},
+            {"start_line":3,"new_content":"C"}
+        ]});
+        heal_edit_input(&s, "edit", &mut input);
+        assert!(input["ops"][0].get("expect").is_none(), "文本 op 不补 expect: {input}");
+        assert!(input["ops"][1].get("expect").is_some(), "行号 op 照常补: {input}");
     }
 
     #[test]

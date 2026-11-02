@@ -1,7 +1,12 @@
 <instruction>
-- `edit` 有两类操作：
-  1. **文本操作** `{old_text, new_text}` —— 按内容锚定，不依赖行号，**优先用这个**。
-  2. **行号操作** `{start_line, end_line, new_content}`（或 `delete` / `insert_after` / `insert_before`）。
+- `edit` 的一个 op 由「**定位**」和「**替换内容**」两部分组成，写在**同一个 op 里**：
+  1. **定位**二选一：`old_text`（按内容锚定，不依赖行号，**优先用这个**，只取能唯一定位的几行，别贴整大段），
+     或 `start_line` [+ `end_line`]（按行号）。两个都给时以 `old_text` 为准，`start_line` 只是提示
+     （`old_text` 出现多处时，选离它最近的一处）。
+  2. **替换内容**统一叫 `new_text`（`new_content` 是旧名，也认）。
+  3. **删除**：加 `"delete": true`；文本定位只给 `old_text` 不给 `new_text` 也按删除处理（会在 `warnings` 里提示）。
+  4. 行号插入：`insert_after` / `insert_before` + `start_line` + `new_text`。
+  - **不要把定位和替换内容拆成两个 op**（只有替换内容、前面没有可配对的 `old_text` 会被拒绝）。
 - **行号安全是自动的**：运行时会根据你**此前 `read` 看到的内容**，自动给行号操作补上
   `expect`（那几行的原文）与文件快照 `tag`，你不必手动传。
   - 行号若有小偏移 → 工具按内容在全文唯一定位后**自动改到正确的行**，并在 `warnings` 说明；

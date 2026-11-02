@@ -272,6 +272,10 @@ export function mountChat(opts: {
   }
   /** wf_id → workflow output transcript used for plan import extraction. */
   const workflowTranscripts = new Map<string, string>();
+  /** wf_id → 用户已「导入 / 取消过」的清单。同一 wf 后续再收 WorkflowFinished
+   *  就不要自动弹窗了，只保留按钮作为再入口。in-memory 即可 —— 跨 reload 的
+   *  防骚扰不是本次痛点（页面刷新后整套重放，自然会重弹一次）。 */
+  const importedOrDismissedWfs = new Set<string>();
   /** role_id → 配置文件 basename，由 main.ts 加载后注入 */
   let roleFilePaths = new Map<string, string>();
 
@@ -297,6 +301,7 @@ export function mountChat(opts: {
     workflowStates.clear();
     workflowTranscripts.clear();
     delegateToolCounts.clear();
+    importedOrDismissedWfs.clear();
   }
   /** sub_id → 该 subsession 已发生的工具调用数（心跳用，见
    *  [`bumpDelegateHeartbeat`]）。 */
@@ -1893,7 +1898,11 @@ export function mountChat(opts: {
   // ── plan 导入弹窗 ──
   // PlanProposed 事件触发（主路径）或右键「导入任务看板」（补救路径）
   // 勾选 + 可编辑 title/description/priority 后调 importTasks 进 todo。
-  function openPlanImportModal(tasks: ImportTask[], planId?: string): void {
+  function openPlanImportModal(
+    tasks: ImportTask[],
+    planId?: string,
+    onClose?: (planId: string | undefined, action: "imported" | "canceled") => void,
+  ): void {
     // 防重复弹窗：已存在则先移除再重建（同 planId 重开）。
     document.getElementById("plan-import-modal")?.remove();
     // 拆分会话（看板「拆分子任务」入口）的导入带 parent_id，成为父任务的子任务。
@@ -2022,7 +2031,10 @@ export function mountChat(opts: {
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
     cancelBtn.textContent = "取消";
-    cancelBtn.addEventListener("click", () => overlay.remove());
+    cancelBtn.addEventListener("click", () => {
+      onClose?.(planId, "canceled");
+      overlay.remove();
+    });
     const importBtn = document.createElement("button");
     importBtn.type = "button";
     importBtn.className = "plan-import-go";
@@ -2057,6 +2069,9 @@ export function mountChat(opts: {
           ? `✅ 已导入 ${resp.created.length} 个子任务到 ${effectiveParent}（todo），请到任务看板派发执行`
           : `✅ 已导入 ${resp.created.length} 个任务到看板（todo），请到任务看板派发执行`;
         addMessage({ kind: "system", content });
+        // 通知调用方（WorkflowFinished 那条支需要）：这份清单已经
+        // 导入过，避免同一个 wf 后续事件再自动弹窗。
+        onClose?.(planId, "imported");
       } catch (err) {
         importBtn.disabled = false;
         importBtn.textContent = "导入选中项";
@@ -2068,6 +2083,7 @@ export function mountChat(opts: {
             content: `ℹ️ 另一个 tab 已经成功导入过这份清单；本地卡已摘除，请到任务看板查看。`,
           });
           if (planId) removePrompt(planId);
+          onClose?.(planId, "imported");
           overlay.remove();
           return;
         }
@@ -2076,7 +2092,12 @@ export function mountChat(opts: {
     });
     overlay.appendChild(box);
     // 点遮罩空白处关闭（补救路径下用户可随时重开）。
-    overlay.addEventListener("click", (ev) => { if (ev.target === overlay) overlay.remove(); });
+    overlay.addEventListener("click", (ev) => {
+      if (ev.target === overlay) {
+        onClose?.(planId, "canceled");
+        overlay.remove();
+      }
+    });
     document.body.appendChild(overlay);
   }
 
@@ -3507,22 +3528,54 @@ export function mountChat(opts: {
           const transcript = workflowTranscripts.get(e.wf_id) ?? "";
           const found = extractImportableTasks(transcript);
           if (found) {
-            const msg = addMessage({ kind: "system", content: `📋 检测到 ${found.length} 个可导入任务` });
-            const btn = document.createElement("button");
-            btn.className = "workflow-import-btn";
-            btn.textContent = `📥 导入任务看板（${found.length} 个任务）`;
-            btn.addEventListener("click", async () => {
-              if (!confirm(`导入 ${found.length} 个任务到看板（backlog）？`)) return;
-              btn.disabled = true;
-              try {
-                const resp = await importTasks(found);
-                btn.textContent = `✅ 已创建 ${resp.created.length} 个任务，请到任务看板查看`;
-              } catch (err) {
-                btn.disabled = false;
-                btn.textContent = `导入失败: ${(err as Error).message}`;
+            // 同 PlanProposed 体验：弹勾选框（title/desc/priority 可编辑、
+            // 子任务缩进、勾选父行级联子树），不再 confirm() 一把全导。
+            // 2026-10-19 rocksdb 那次 26 个任务因为弹框没出来，按钮又没
+            // 进 DOM，用户完全看不到入口 —— 后来即使按钮挂上了，confirm
+            // 全导对 26 个也意义不大，得能挑。
+            //
+            // 用户已导入 / 取消过这份清单 → 不再造一条「检测到 N 个」的
+            // 系统消息（消息流不要重复刷），也不再自动弹窗；原来的按钮
+            // 还在，可以再点回弹窗查看。
+            const alreadyHandled = importedOrDismissedWfs.has(e.wf_id);
+            if (alreadyHandled) {
+              // 旧消息 / 旧按钮留着即可，不重复 addMessage。
+            } else {
+              const msg = addMessage({
+                kind: "system",
+                content: `📋 ${e.name} workflow 检测到 ${found.length} 个可导入任务，请在弹窗勾选导入任务看板`,
+              });
+              const markHandled = (id: string | undefined, action: "imported" | "canceled"): void => {
+                if (id) importedOrDismissedWfs.add(id);
+              };
+              const btn = document.createElement("button");
+              btn.className = "workflow-import-btn";
+              btn.textContent = `📥 导入任务看板（${found.length} 个）`;
+              btn.addEventListener("click", () => openPlanImportModal(found, e.wf_id, markHandled));
+              // system 消息走 addMessage 的无头像分支：row 里只有一个
+              // div.message.system（没有 .msg-bubble，`.msg-bubble` 只在
+              // 带头像的 user/role/tool/error 通道里建），所以必须挂到
+              // 实际的 .content 容器里，按钮才会进 DOM —— 否则
+              // `.msg-bubble` 查不到、appendChild 被 `?.` 静默吞掉，
+              // 表现为「能看到检测到 N 个任务的提示文本，但没有任何按钮
+              // 也没有弹窗」（2026-10-19 rocksdb 上 26 个任务的实际表现）。
+              const sysContent = msg.querySelector<HTMLElement>(".message.system > .content");
+              if (sysContent) sysContent.appendChild(btn);
+              else msg.appendChild(btn); // 兜底：万一未来 addMessage 改了结构
+              // 与 PlanProposed 共用 1.5s 防抖：连续 plan / workflow-finished
+              // 只弹最后一份。replay 出来的历史 finish 不自动弹（用户可能早
+              // 就导入过 / 已放弃，每次刷新糊个旧模态很骚扰。真正还没处理
+              // 的那份会经 pending-prompts 以 live 事件再来一次）。
+              if (!replaying) {
+                if ((window as unknown as Record<string, unknown>).__planDebounceTimer) {
+                  clearTimeout((window as unknown as Record<string, unknown>).__planDebounceTimer as number);
+                }
+                (window as unknown as Record<string, unknown>).__planDebounceTimer = setTimeout(() => {
+                  openPlanImportModal(found, e.wf_id, markHandled);
+                  (window as unknown as Record<string, unknown>).__planDebounceTimer = undefined;
+                }, 1500);
               }
-            });
-            msg.querySelector(".msg-bubble")?.appendChild(btn);
+            }
           }
         }
         workflowTranscripts.delete(e.wf_id);
@@ -3578,7 +3631,12 @@ export function mountChat(opts: {
         btn.className = "workflow-import-btn";
         btn.textContent = `📥 导入任务看板（${n} 个）`;
         btn.addEventListener("click", () => openPlanImportModal(e.tasks, e.plan_id));
-        msg.querySelector(".msg-bubble")?.appendChild(btn);
+        // 同上：system 消息没有 .msg-bubble，按钮必须挂到真实的
+        // .content 容器（下面的 1.5s 防抖自动开弹窗只是巧合掩盖了
+        // 这条 drop，重连回放 / 防抖期间也要按得到这个按钮才行）。
+        const sysContent = msg.querySelector<HTMLElement>(".message.system > .content");
+        if (sysContent) sysContent.appendChild(btn);
+        else msg.appendChild(btn);
         setFooter(`${e.role_id} 提交 ${n} 个任务候选`);
         resetWaitTimer();
         // 重放的历史 plan 不自动弹窗：它可能早就导入过 / 用户已经放弃，

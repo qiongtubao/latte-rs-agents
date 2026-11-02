@@ -110,17 +110,46 @@ pub fn lint(text: &str, dir: Option<&std::path::Path>) -> Vec<String> {
 }
 
 /// 表格行的列数（忽略行内代码与转义的 `\|`）。
+///
+/// 行内代码按 CommonMark 的规则配对：N 个连续反引号开头，到下一段**恰好 N 个**连续反引号
+/// 结束，中间原样不解析；找不到配对的反引号就是普通字符。早先逐个反引号翻转"在代码里"开关，
+/// 单元格里出现 `` `line="```rust"` `` 这种（单反引号包着三连反引号）会让奇偶错位，后面的
+/// `|` 全被当成代码里的字符，列数算成 1 列，白白把合法表格打回去（实测：写 markdown 围栏
+/// 相关主题时，逐轮推演表整张被判坏，重试用完只能带着"坏表格"放行）。
 fn table_cols(row: &str) -> usize {
+    let chars: Vec<char> = row.trim().trim_start_matches('|').trim_end_matches('|').chars().collect();
+    let run_len = |from: usize| chars[from..].iter().take_while(|c| **c == '`').count();
     let mut n = 0;
-    let mut in_code = false;
     let mut prev = ' ';
-    for c in row.trim().trim_start_matches('|').trim_end_matches('|').chars() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if c == '`' {
-            in_code = !in_code;
-        } else if c == '|' && !in_code && prev != '\\' {
+            let open = run_len(i);
+            // 找下一段长度恰好等于 open 的反引号。
+            let mut k = i + open;
+            let mut close_end = None;
+            while k < chars.len() {
+                if chars[k] == '`' {
+                    let m = run_len(k);
+                    if m == open {
+                        close_end = Some(k + m);
+                        break;
+                    }
+                    k += m;
+                } else {
+                    k += 1;
+                }
+            }
+            i = close_end.unwrap_or(i + open);
+            prev = '`';
+            continue;
+        }
+        if c == '|' && prev != '\\' {
             n += 1;
         }
         prev = c;
+        i += 1;
     }
     n + 1
 }
@@ -242,6 +271,21 @@ mod tests {
     }
 
     /// lat-113 原形：表格中间插了一段说明，后半截表格没有表头。
+    /// 单反引号包着三连反引号的单元格不能打乱列数（逐个反引号翻转开关会错位成 1 列）。
+    #[test]
+    fn table_cols_pairs_backtick_runs_like_commonmark() {
+        assert_eq!(table_cols("| 1 | `line=\"```rust\"` | 否 |"), 3);
+        assert_eq!(table_cols("| 4 | ```` ``` ```` | 是 | x |"), 4);
+        assert_eq!(table_cols("| `a` | `b` |"), 2);
+        // 没有配对的反引号是普通字符，后面的 | 照常分列
+        assert_eq!(table_cols("| it`s | b | c |"), 3);
+        // 转义的 \| 不分列；真正多出来的 | 仍然会被算出来
+        assert_eq!(table_cols("| a \\| b | c |"), 2);
+        assert_eq!(table_cols("| a | b | c |"), 3);
+        let md = "| 轮次 | 变量 | 动作 |\n|---|---|---|\n| 1 | `line=\"```rust\"` | 翻转 |\n";
+        assert!(lint(md, None).is_empty(), "{:?}", lint(md, None));
+    }
+
     #[test]
     fn table_split_by_inserted_paragraph() {
         let doc = "| 位 | 字段 | 含义 |\n|---|---|---|\n| `a` | `arena` | 所属 arena |\n\n**PAC** = 经典页分配器。\n| `z` | `zeroed` | 是否全 0 |\n| `g` | `guarded` | 是否挂 guard |\n\n正文\n";

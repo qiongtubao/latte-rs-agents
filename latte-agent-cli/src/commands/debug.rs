@@ -108,6 +108,15 @@ pub enum DebugAction {
         /// Session id.
         id: String,
     },
+    /// Per-step / role / model token & latency report for a UI session — where the tokens and
+    /// the wall time went (tool-loop resend amplification, cache hits, wasted failed calls).
+    Usage {
+        /// UI session id (e.g. `ui-3210-1791969344652-w0`), or a path to its `ui-sessions` log.
+        id: String,
+        /// Directory holding `ui-sessions/` (default: `./.latte`, then `$LATTE_HOME`).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+    },
     /// One-line-per-event timeline of a session.
     Trace {
         /// Session id.
@@ -139,6 +148,7 @@ impl DebugCmd {
             DebugAction::Session { id, kind } => run_session(id, kind.as_deref()),
             DebugAction::Sessions => run_sessions(),
             DebugAction::Tokens { id } => run_tokens(id),
+            DebugAction::Usage { id, dir } => run_usage(id, dir.as_deref()),
             DebugAction::Trace { id } => run_trace(id),
             DebugAction::Replay { id, parser, hook } => run_replay(id, parser.as_deref(), hook),
         }
@@ -291,6 +301,65 @@ fn run_tokens(id: &str) -> Result<(), Box<dyn std::error::Error>> {
         "{:<6} {:<12} {:>10} {:>10} {:>10}",
         "", "TOTAL", agg.total_input, agg.total_output, agg.total_thinking
     );
+    Ok(())
+}
+
+/// 读一个 UI 会话的主事件流与全部子会话 trace，打印 token / 耗时报告。
+fn run_usage(id: &str, dir: Option<&std::path::Path>) -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::PathBuf;
+    // id 不能带路径分隔符 / `..`：它只是 ui-sessions 下的文件名。
+    let given = std::path::Path::new(id);
+    let (root, sid): (PathBuf, String) = if given.is_absolute() || id.contains('/') {
+        // 允许直接给 `<...>/ui-sessions/<sid>.jsonl` 或 `<...>/ui-sessions/<sid>` 的路径。
+        let stem = given
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .ok_or("无法从路径取出会话 id")?;
+        let root = given.parent().ok_or("路径没有父目录")?.to_path_buf();
+        (root, stem)
+    } else {
+        if id.is_empty() || id.contains("..") {
+            return Err(format!("invalid session id '{id}'").into());
+        }
+        let candidates: Vec<PathBuf> = dir
+            .map(|d| vec![d.join("ui-sessions")])
+            .unwrap_or_else(|| {
+                let mut v = vec![PathBuf::from(".latte/ui-sessions")];
+                if let Some(h) = trace_store::latte_home() {
+                    v.push(h.join("ui-sessions"));
+                }
+                v
+            });
+        let root = candidates
+            .into_iter()
+            .find(|d| d.join(format!("{id}.jsonl")).is_file() || d.join(id).is_dir())
+            .ok_or_else(|| format!("找不到会话 {id} 的日志（在 ./.latte/ui-sessions 或 $LATTE_HOME/ui-sessions 下），可用 --dir 指定"))?;
+        (root, id.to_string())
+    };
+    let read_lines = |p: &std::path::Path| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let main = read_lines(&root.join(format!("{sid}.jsonl")));
+    let mut subs = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(root.join(&sid)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "jsonl") {
+                let sub_id = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                subs.push((sub_id, read_lines(&p)));
+            }
+        }
+    }
+    if main.is_empty() && subs.is_empty() {
+        return Err(format!("会话 {sid} 没有可读的日志（{}）", root.display()).into());
+    }
+    subs.sort_by(|a, b| a.0.cmp(&b.0));
+    let report = super::usage_report::analyze(&main, subs);
+    print!("{}", super::usage_report::render(&report));
     Ok(())
 }
 
@@ -462,6 +531,7 @@ impl IndexLineExt for latte_agent_core::trace::IndexLine {
                 params_json: String::new(),
                 latency_ms: self.latency_ms.unwrap_or(0),
                 finish_reason: String::new(),
+                usage: Default::default(),
             },
             "ModelRawOut" => TraceEvent::ModelRawOut {
                 meta,

@@ -411,6 +411,21 @@ warn；口径与 `pending-asks` 一致）。落盘的**只有目标**，`activat
 还没有目标时才发生——否则会把调用方在 loop 就绪前刚设好的目标降级成
 disarmed，用户设完发现它不跑且不知道为什么。
 
+### token 用量怎么查（排查浪费）
+
+`ModelCall` 事件**逐次**记录 `usage`（输入 / 输出 / 思考 / 缓存读 / 缓存写；`cache_read` 是 `input` 的子集），
+落在 `.latte/ui-sessions/<会话>/<子会话>.jsonl`。`latte-agent debug usage <ui会话id>` 把它按步骤 / 角色 /
+模型汇总，并给出「浪费信号」：
+
+| 指标 | 含义 |
+|---|---|
+| 放大（输入 / 输出） | 工具循环每一轮都重传全部历史，这个比值是重传放大的直接度量；实测一次 learn_loop 达 38x |
+| 缓存命中 | `cache_read / input`；新付费输入 = `input - cache_read` |
+| 白等 | 失败调用（超时 / 限流 / 欠费 / 报错）白白等掉的时延 |
+| 单次输入 a → b | 同一子会话里第一次与最后一次调用的输入，看历史涨了多少 |
+
+旧日志没有逐次用量时回退到 `TurnEnd` 合计（报告里带 `*`），只能看总量。
+
 ### Workflow 分派单元上限
 
 | 变量 | 默认 | 说明 |
@@ -506,7 +521,9 @@ O(N²) 提前打爆——多角色路径踩过这个坑）。
 2. `deadline` —— 仅 delegate 与 workflow step 会设置（见
    `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`）。**交互式 `chat` 不设**，超时按设计
    交给人工 ⏸ 或 advisor 角色叫停；
-3. **死循环熔断** —— 唯一始终生效的自动刹车，两条规则并行：
+3. **死循环熔断** —— 唯一始终生效的自动刹车，两条规则并行。熔断前先**提醒一次**：同一工具 + 逐字节
+   相同的参数连续第 3 次时，提醒（"你在重复，再来 2 次本次任务就会被中止，换个做法"）附在这次调用的
+   tool_result 末尾，模型多半只是没意识到自己在原地打转，提醒后能自己跳出来；第 5 次才真正熔断：
    - **连击**：同一工具 + 逐字节相同的参数连续 5 次；
    - **打转**：最近 8 次调用里只有 ≤2 种调用、且每种都重复出现（抓
      `read A → search B → read A → search B …` 这类交替空转——它每次都与
@@ -542,7 +559,13 @@ delegate 据此降级采纳，不会把前面几十轮的成果一起丢掉。
 > 锚点时**每次 `old_text` 都不一样**，两条规则一条都不触发。所以这里按
 > **语义类别**计数，而不是按参数指纹。
 
-另外，`edit` 的布尔参数（`all` / `delete` / `insert_after` /
+另外，`edit` 的 op 语法统一：**定位**（`old_text` 文本定位，或 `start_line` 行号定位；两个都给时以 `old_text`
+为准、`start_line` 只当提示，多处命中时选最近的一处）+ **替换内容**（统一叫 `new_text`，`new_content` 是旧名也认）。
+只给 `old_text` 不给替换内容 = 删除（`warnings` 里提示）；diff 写法的相邻 `{old_text}` + `{new_text}` 两个 op
+并成一次替换。这些都是实测模型会写的形态——同一个"替换内容"在两种模式里叫两个名字，天然会混；与其教模型
+"别这么写"，不如让协议认下无歧义的写法。只有替换内容、前面没有可配对的 `old_text` 才报错。
+
+`edit` 的布尔参数（`all` / `delete` / `insert_after` /
 `insert_before`）接受字符串写法（`"true"` / `"1"` / `"yes"` / `"on"`）——
 实测部分模型就是这么发的，只认 JSON 布尔会静默判 `false`，然后报「请显式
 传 `all: true`」，而模型认为自己已经传了，于是原地打转。宽容解析的同时会
@@ -629,7 +652,8 @@ latte-agent debug parse "<tool_callbash/>"       # 重解析器
 latte-agent debug prompt --role manager          # 构建 system prompt
 latte-agent debug session <id>                   # 打印所有事件
 latte-agent debug trace <id>                     # 时间线 + 时延
-latte-agent debug tokens <id>                    # Token 用量汇总
+latte-agent debug tokens <id>                    # Token 用量汇总（trace 里按 turn 合计）
+latte-agent debug usage <ui会话id> [--dir <项目/.latte>]   # UI 会话 token/耗时报告：按步骤/角色/模型，附浪费信号
 latte-agent debug replay <id>                    # 重放历史解析
 ```
 

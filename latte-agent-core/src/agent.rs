@@ -757,10 +757,20 @@ struct LoopDetector {
     history: Vec<(String, String)>,
     /// Count of consecutive identical tool calls seen at the tail.
     streak: usize,
+    /// 连击到 [`LOOP_NUDGE_AT`] 次时留下的一次性提醒，由调用方 [`LoopDetector::take_nudge`] 取走，
+    /// 附在这次调用的 tool_result 末尾。
+    nudge: Option<String>,
 }
 
 const LOOP_WINDOW_SIZE: usize = 8;
 const LOOP_STREAK_THRESHOLD: usize = 5;
+/// 逐字节相同的调用连击到第几次先**提醒**一次（熔断前的最后一次自救机会）。
+///
+/// 熔断一律是"中止本次任务、把半成品当产出"（workflow 里就是降级采纳未收尾产出），代价很高；
+/// 而陷进去的模型多半只是没意识到自己在重复——tool_result 一模一样，它没有新信息可依。提前在
+/// 结果里明说"你在重复，再来一次就中止，换个做法"，多数能自己跳出来（opencode 的 doom loop 是
+/// 先问、deepseek-harness 的 repeat-tool-reminder 是先提醒，都不是一上来就杀）。
+const LOOP_NUDGE_AT: usize = 3;
 
 /// 正文撞长度上限后，最多**续写**几段再拼接。到顶仍未正常收尾才降级
 /// 贴 `⚠️ [产出被截断]` 标记。给 5 段：既能把 5×单次上限的长产出续全
@@ -768,6 +778,47 @@ const LOOP_STREAK_THRESHOLD: usize = 5;
 /// 本身失控」有硬止损。每续一段，前文都会随消息历史回传，输入 token
 /// 单调涨，靠这个上限兜住成本。
 const MAX_LENGTH_CONTINUATIONS: u8 = 5;
+
+/// 正文撞长度上限（且没有工具调用）时，**丢弃**截断的这一轮后最多重试几次。
+///
+/// 不再续写拼接：续写会放大坏输出——实测 tasks_json 一次出错的输出被续写到 5 段、13 万字符，
+/// 之后照样被解析失败打回，白烧十几分钟。做法借鉴 oh-my-pi（`length-stop-retry`）：
+/// 截断的轮次对模型不可见、不进上下文，只告诉它撞了上限、要缩短；重试有上限，到顶后
+/// 带显式标记交给下游（契约 / 解析会拒绝，由步骤级重试接手）。
+const LENGTH_DISCARD_MAX_RETRIES: u8 = 2;
+
+fn length_continuation_from_env() -> bool {
+    std::env::var("LATTE_AGENT_LENGTH_RECOVERY")
+        .map(|v| v.trim().eq_ignore_ascii_case("continue"))
+        .unwrap_or(false)
+}
+
+/// 去掉模型泄漏进正文的 `<think>…</think>`（闭合的）。reasoning 模型（实测 MiniMax-M3）会把思考过程
+/// 写进 content，占掉输出预算，还会让后面的解析把思考里的草稿当成正式产出。
+/// 正文截断时若尾部有**未闭合**的 `<think>`，说明预算全花在思考上：从那里起整段丢弃。
+fn strip_leaked_think(content: &str, truncated: bool) -> String {
+    if !content.contains("<think>") {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<think>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        match after.find("</think>") {
+            Some(end) => rest = after[end + "</think>".len()..].trim_start_matches('\n'),
+            None => {
+                // 未闭合：被截断就是预算花光在思考上，丢掉；没截断就保守保留原文（别误删正文）。
+                if !truncated {
+                    out.push_str(&rest[start..]);
+                }
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// 判「打转」时窗口内最多允许几种不同调用。2 = 只在两个调用之间来回跳。
 const LOOP_CYCLE_MAX_DISTINCT: usize = 2;
@@ -807,6 +858,16 @@ impl LoopDetector {
         let key = (tool_name.to_string(), args_json.to_string());
         if self.history.last().map(|k| k == &key).unwrap_or(false) {
             self.streak += 1;
+            if self.streak == LOOP_NUDGE_AT {
+                self.nudge = Some(format!(
+                    "⚠️ 系统提示：你已连续 {} 次用逐字节相同的参数调用 `{}`，结果不会变。\
+                     再重复 {} 次本次任务就会被中止。换一种做法：重新 read 当前内容再改、换别的工具、\
+                     缩小/拆开参数，或者直接把进展和卡点讲清楚。",
+                    self.streak,
+                    tool_name,
+                    LOOP_STREAK_THRESHOLD - self.streak
+                ));
+            }
             if self.streak >= LOOP_STREAK_THRESHOLD {
                 return LoopDecision::Break(format!(
                     "'{}' called {} times in a row with identical args; \
@@ -865,11 +926,17 @@ impl LoopDetector {
         ))
     }
 
+    /// 取走（并清空）待发的连击提醒。
+    fn take_nudge(&mut self) -> Option<String> {
+        self.nudge.take()
+    }
+
     /// Clear all state. Tests use it to reset between scenarios.
     #[cfg_attr(not(test), allow(dead_code))]
     fn reset(&mut self) {
         self.history.clear();
         self.streak = 0;
+        self.nudge = None;
     }
 }
 
@@ -1079,6 +1146,9 @@ pub struct AgentRunner {
     /// workflow step 可用它把工具循环的 prompt 放大转成可恢复的
     /// `PromptBudgetExceeded`，而不是等供应商拒绝。
     prompt_token_budget: Option<usize>,
+    /// 正文撞长度上限时是否**续写拼接**（旧行为）。默认 false：丢弃截断的这一轮并要求模型缩短重来，
+    /// 见 [`LENGTH_DISCARD_MAX_RETRIES`]。`LATTE_AGENT_LENGTH_RECOVERY=continue` 或 [`AgentRunner::with_length_continuation`] 打开。
+    length_continuation: bool,
 }
 /// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
 /// 来的，以及构建时的配置代际。
@@ -2543,6 +2613,7 @@ impl AgentRunner {
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
+            length_continuation: length_continuation_from_env(),
         }
     }
     /// 构造带工具的 runner。
@@ -2586,6 +2657,7 @@ impl AgentRunner {
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
+            length_continuation: length_continuation_from_env(),
         }
     }
     /// Attach an event broadcaster so the runner can trigger human-intervention
@@ -2627,6 +2699,7 @@ impl AgentRunner {
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
+            length_continuation: length_continuation_from_env(),
         }
     }
 
@@ -2636,6 +2709,12 @@ impl AgentRunner {
     /// `0` disables the bound. This is intentionally checked inside the tool
     /// loop, because tool results—not only persisted conversation history—are
     /// retransmitted by each subsequent model call.
+    /// 正文撞长度上限时改用旧的「续写拼接」（默认是丢弃重来）。
+    pub fn with_length_continuation(mut self, on: bool) -> Self {
+        self.length_continuation = on;
+        self
+    }
+
     pub fn with_prompt_token_budget(mut self, budget: usize) -> Self {
         self.prompt_token_budget = (budget > 0).then_some(budget);
         self
@@ -2881,8 +2960,13 @@ impl AgentRunner {
         last_substantive_response: &str,
     ) -> Result<(), AgentError> {
         // 1. 死循环探测：回放并发任务里攒下的 (name, args) 记录。
+        let mut nudge: Option<String> = None;
         for (name, args_json) in &r.loop_records {
-            if let LoopDecision::Break(reason) = loop_detector.record(name, args_json) {
+            let decision = loop_detector.record(name, args_json);
+            if nudge.is_none() {
+                nudge = loop_detector.take_nudge();
+            }
+            if let LoopDecision::Break(reason) = decision {
                 return Err(AgentError::ToolLoopDetected {
                     tool: name.clone(),
                     reason,
@@ -2916,17 +3000,23 @@ impl AgentRunner {
         }
         // 3. 回填 tool_result（成功失败都必须回填，否则 native 协议下
         //    下一轮请求 400，见串行路径的长注释）。
+        // 连击提醒附在 tool_result 末尾：协议安全（不在一批 tool_result 中间插 user 消息），
+        // 模型下一轮读结果时必然看到。
+        let with_nudge = |body: String| match &nudge {
+            Some(n) => format!("{body}\n\n{n}"),
+            None => body,
+        };
         match r.outcome {
             Ok(result_str) => {
                 if permanent_streak.0 == tool_name {
                     *permanent_streak = (String::new(), 0);
                 }
-                messages.push(Message::tool_result(r.id, result_str));
+                messages.push(Message::tool_result(r.id, with_nudge(result_str)));
             }
             Err((kind, detail)) => {
                 // 中段省略而非截头：错误分类在头、修复指引在尾，两头都要留。
                 let compacted = compact_middle_out(&detail, MAX_TOOL_ERROR_BYTES);
-                messages.push(Message::tool_result(r.id, compacted.clone()));
+                messages.push(Message::tool_result(r.id, with_nudge(compacted.clone())));
                 // 方案 B 跟进：`MalformedArgs` 不再是无声清零的失败。
                 // subsession 修复耗尽了（heuristic 与 LLM 都失败）时也应计入 streak：
                 // 每轮都是合法 JSON 校验失败 + 修复失败 = 同一确定性问题反复重试。
@@ -3890,6 +3980,8 @@ impl AgentRunner {
         // 已生成内容，让模型从截断处接着写，engine 侧累加，直到
         // finish_reason 正常收尾或达到 MAX_LENGTH_CONTINUATIONS。
         let mut length_continued: u8 = 0;
+        // 丢弃式恢复已用掉的重试次数（见 LENGTH_DISCARD_MAX_RETRIES）；工具轮之后清零。
+        let mut length_discarded: u8 = 0;
         // 已续写确认的前缀：截断续写模式下，每轮真正的产出 =
         // continuation_prefix + 本轮 completion.content。空 = 未进入续写。
         let mut continuation_prefix = String::new();
@@ -4363,10 +4455,12 @@ impl AgentRunner {
             // 「接着写的下一段」——真正的产出是前缀 + 本段拼起来。下游
             // 看到的 final_response 始终是**拼接后的完整内容**，TraceEvent、
             // hooks、tool 解析、workflow 契约都据此工作，感知不到分段。
+            let healed_content =
+                strip_leaked_think(&completion.content, is_length_truncation(&completion.stop_reason));
             final_response = if continuation_prefix.is_empty() {
-                completion.content.clone()
+                healed_content
             } else {
-                format!("{continuation_prefix}{}", completion.content)
+                format!("{continuation_prefix}{healed_content}")
             };
             if !final_response.trim().is_empty() {
                 last_substantive_response = final_response.clone();
@@ -4378,6 +4472,7 @@ impl AgentRunner {
                 params_json: serde_json::to_string(&self.agent.params).unwrap_or_default(),
                 latency_ms,
                 finish_reason: completion.stop_reason.clone(),
+                usage: crate::trace::CallUsage::from(&completion.usage),
             });
             // 输出被长度上限截断：native tool_calls 的 arguments 会是半截
             // JSON，下游 `from_str` 报 "EOF while parsing a string"，模型
@@ -4481,7 +4576,48 @@ impl AgentRunner {
                 // `final_response` = 前缀 + 新段，下游看到的始终是拼接后的
                 // 完整内容。循环到 finish_reason 正常收尾（不再是 length）
                 // 或续满 MAX_LENGTH_CONTINUATIONS 段为止。
-                if output_truncated && length_continued < MAX_LENGTH_CONTINUATIONS {
+                if output_truncated && !self.length_continuation {
+                    if length_discarded < LENGTH_DISCARD_MAX_RETRIES {
+                        length_discarded += 1;
+                        tracing::warn!(
+                            stop_reason = %completion.stop_reason,
+                            chars = final_response.chars().count(),
+                            output_tokens = completion.usage.output_tokens,
+                            attempt = length_discarded,
+                            "final response hit the output length limit; discarding it and asking for a shorter retry"
+                        );
+                        // 截断的这一轮**不进上下文**（模型看不到那半截，也就不会照着续或复述），
+                        // 只补一条说明：撞了上限，要缩短，别重新规划整件事。
+                        // 先补一条占位 assistant，避免连续两条 user 被个别兼容端点拒绝。
+                        messages.push(Message::assistant("（上一条回复撞上输出长度上限，已被丢弃）".to_string()));
+                        messages.push(Message::user(format!(
+                            "你上一条回复撞上了输出长度上限（finish_reason={}，约 {} 个输出 token），已被丢弃，没有被使用。\
+                             重新来一遍，这次必须写得更短：\n\
+                             - 只输出要求的内容本身，不要写思考过程、核对过程、说明或前后缀；\n\
+                             - 能省的字段 / 条目不要写（空字段省略，描述只留一句）；\n\
+                             - 太大的交付物不要一次写完：用 write 工具分段落盘，或先给最小可用版本；\n\
+                             （第 {}/{} 次重试）",
+                            completion.stop_reason,
+                            completion.usage.output_tokens,
+                            length_discarded,
+                            LENGTH_DISCARD_MAX_RETRIES
+                        )));
+                        final_response.clear();
+                        continue;
+                    }
+                    // 重试用完仍撞上限：不再续写，带显式标记交给下游（契约 / 解析会拒绝并走步骤级重试）。
+                    final_response.push_str(&format!(
+                        "\n\n⚠️ [产出被截断] 本回复在 {} 次缩短重试后仍撞上长度上限\
+                         （finish_reason={}），上面的内容**不完整**，结构化数据（JSON/清单）很可能缺尾。\
+                         下游请勿当作完整产出使用。",
+                        LENGTH_DISCARD_MAX_RETRIES, completion.stop_reason
+                    ));
+                    tracing::warn!(
+                        stop_reason = %completion.stop_reason,
+                        retries = LENGTH_DISCARD_MAX_RETRIES,
+                        "final response still truncated after discard retries; annotated the payload"
+                    );
+                } else if output_truncated && length_continued < MAX_LENGTH_CONTINUATIONS {
                     length_continued += 1;
                     tracing::warn!(
                         stop_reason = %completion.stop_reason,
@@ -4509,7 +4645,7 @@ impl AgentRunner {
                     continuation_prefix = final_response.clone();
                     continue;
                 }
-                if output_truncated {
+                if output_truncated && self.length_continuation {
                     // 续满上限仍未收尾：照收拼好的部分，但绝不静默——
                     // 贴显式标记让人、下游评审、workflow 契约都看得见。
                     final_response.push_str(&format!(
@@ -4564,6 +4700,7 @@ impl AgentRunner {
             // 前缀后面。
             continuation_prefix.clear();
             length_continued = 0;
+            length_discarded = 0;
 
             // 3b. Run PostParseHook (can mutate parsed calls)
             let mut post_parse_calls: Vec<ParsedCall> = parsed_calls;
@@ -8503,6 +8640,46 @@ mod tests {
         assert!(msg.contains("tool loop detected"), "msg = {msg}");
         assert!(msg.contains("可降级采纳"), "msg 应提示可降级: {msg}");
         assert!(!msg.contains(PROSE), "Display 不应内联正文: {msg}");
+
+        // 熔断前已经给过一次提醒：第 3 次相同调用的 tool_result 末尾带着"再重复就中止"，
+        // 所以第 4 次请求的消息里能看到它，而第 3 次请求（还没发生）里看不到。
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        let nudge = "逐字节相同的参数调用";
+        assert!(bodies.len() >= 4, "至少 4 轮请求，实际 {}", bodies.len());
+        assert!(!bodies[2].contains(nudge), "第 3 次请求发出时还没有提醒");
+        assert!(bodies[3].contains(nudge), "第 4 次请求要带上上一轮结果里的提醒");
+        assert_eq!(bodies[3].matches(nudge).count(), 1, "只提醒一次，不叠加");
+    }
+
+    /// 连击提醒：到第 [`LOOP_NUDGE_AT`] 次逐字节相同的调用留下一次性提醒，早于熔断；取走后不再重复。
+    #[test]
+    fn loop_detector_nudges_before_it_breaks() {
+        let mut d = LoopDetector::default();
+        for i in 1..LOOP_NUDGE_AT {
+            assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue), "第 {i} 次");
+            assert!(d.take_nudge().is_none(), "第 {i} 次还不该提醒");
+        }
+        assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue));
+        let n = d.take_nudge().expect("第 3 次相同调用应留下提醒");
+        assert!(n.contains("连续 3 次") && n.contains("`edit`") && n.contains("再重复 2 次"), "{n}");
+        assert!(d.take_nudge().is_none(), "提醒是一次性的");
+        // 第 4 次不再提醒；第 5 次熔断
+        assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue));
+        assert!(d.take_nudge().is_none());
+        assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Break(_)));
+        // 参数一变，连击清零，之后重新累计
+        let mut d = LoopDetector::default();
+        d.record("edit", "{\"a\":1}");
+        d.record("edit", "{\"a\":1}");
+        d.record("edit", "{\"a\":2}");
+        d.record("edit", "{\"a\":2}");
+        assert!(d.take_nudge().is_none());
     }
 
     /// 核心保证：**跨 round 的同参数死循环必须被抓到。**
@@ -11278,7 +11455,7 @@ tools = ["read", "write"]
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new(agent);
+        let mut runner = AgentRunner::new(agent).with_length_continuation(true);
         let out = runner
             .run_turn(&[Message::user("出任务清单")], None)
             .await
@@ -11312,6 +11489,91 @@ tools = ["read", "write"]
         );
     }
 
+    /// 默认（oh-my-pi 式）：撞长度上限的这一轮被**丢弃**，模型看不到那半截，只被告知要缩短重来；
+    /// 第二次正常收尾就直接采用，不拼接。
+    #[tokio::test]
+    async fn length_truncated_response_is_discarded_and_retried_shorter_by_default() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("HALF_WRITTEN_DRAFT", "length"),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("SHORT_FINAL", "stop"),
+                    )),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "trunc-discard".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
+        assert_eq!(out, "SHORT_FINAL", "第二次正常收尾的产出直接采用，不与截断的半截拼接: {out}");
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(reqs.len(), 2);
+        let second = String::from_utf8_lossy(&reqs[1].body).to_string();
+        assert!(second.contains("已被丢弃") && second.contains("必须写得更短"), "{second}");
+        assert!(!second.contains("HALF_WRITTEN_DRAFT"), "截断的半截不能回喂给模型: {second}");
+    }
+
+    /// 重试用完仍撞上限：不再续写，带显式标记交给下游；请求数 = 1 首次 + LENGTH_DISCARD_MAX_RETRIES。
+    #[tokio::test]
+    async fn persistently_truncated_response_stops_after_bounded_discard_retries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("SEG", "length"),
+                    )),
+            )
+            .await;
+        let agent = Agent::new_with_chain(
+            "trunc-cap".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent);
+        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
+        assert!(out.contains("⚠️ [产出被截断]") && out.contains("缩短重试"), "{out}");
+        assert_eq!(out.matches("SEG").count(), 1, "只保留最后一次的内容，不累加: {out}");
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(reqs.len(), 1 + usize::from(LENGTH_DISCARD_MAX_RETRIES));
+    }
+
+    #[test]
+    fn leaked_think_blocks_are_stripped_but_plain_text_is_kept() {
+        assert_eq!(strip_leaked_think("<think>草稿 {\"tasks\":[]}</think>\n正式", false), "正式");
+        assert_eq!(strip_leaked_think("前<think>a</think>中<think>b</think>后", false), "前中后");
+        assert_eq!(strip_leaked_think("没有思考", false), "没有思考");
+        // 未闭合：截断 = 预算花在思考上，整段丢；没截断则保守保留
+        assert_eq!(strip_leaked_think("开头<think>想了很久", true), "开头");
+        assert_eq!(strip_leaked_think("开头<think>想了很久", false), "开头<think>想了很久");
+    }
+
     /// 续满上限仍被截断：照收拼好的部分（不死循环），但必须打上显式
     /// 标记——最坏情况下也不能静默采纳。且**所有已产出的段都要保留**
     /// （降级采纳的是完整累加内容，不是最后一段）。
@@ -11341,7 +11603,7 @@ tools = ["read", "write"]
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new(agent);
+        let mut runner = AgentRunner::new(agent).with_length_continuation(true);
         let out = runner
             .run_turn(&[Message::user("出任务清单")], None)
             .await

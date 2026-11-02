@@ -50,20 +50,6 @@ pub fn learn_root_rel_ok(rel: &str) -> bool {
         && parts[3] == "learn"
 }
 
-/// 所有可能存放学习目录的根（旧位置 + 各会话），供跨会话找回进度。
-pub fn all_learn_roots(cwd: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![cwd.join(LEGACY_LEARN_ROOT)];
-    if let Ok(entries) = std::fs::read_dir(cwd.join(".latte").join("sessions")) {
-        for e in entries.flatten() {
-            let p = e.path().join("learn");
-            if p.is_dir() {
-                roots.push(p);
-            }
-        }
-    }
-    roots
-}
-
 /// 定稿文件名：去掉看板任务编号前缀（`lat-110-jemalloc-size-class` →
 /// `jemalloc-size-class`）。工作区 slug 保留前缀——重跑靠它找回同一目录；
 /// 交付给项目的文档按主题命名，不按任务编号。
@@ -762,15 +748,27 @@ fn memlayout_claim_problems(ml: &MemLayout) -> Vec<String> {
     let totals: Vec<u64> = ml.lanes.iter().filter_map(lane_total).collect();
     if totals.len() == ml.lanes.len() && !totals.is_empty() {
         for (raw, bytes) in declared_sizes(&ml.title) {
-            if !totals.contains(&bytes) {
+            if !title_total_matches(&totals, bytes) {
                 errs.push(format!(
-                    "标题写「= {raw}」（{bytes} B），但没有任何一行的格子加起来等于它（各行总长：{}）：标题和格子对不上",
+                    "标题写「= {raw}」（{bytes} B），但既没有哪一行、也没有哪几行的格子加起来等于它（各行总长：{}）：标题和格子对不上",
                     totals.iter().map(|t| fmt_size(*t)).collect::<Vec<_>>().join("、")
                 ));
             }
         }
     }
     errs
+}
+
+/// 标题里声明的总大小，是否等于某一行、或**某几行**总长之和。
+///
+/// 标题常概括整张图（"两个 4 KiB 的 slab 页 = 8K"，两个 lane 各 4 KiB 外加一个 64 B 的元数据 lane）。
+/// 早先只认"等于某一行"，合法的"几行之和"也被判错，writer 把图改来改去、重试用完带着不合法的图放行
+/// （实测 jemalloc ch_options k1）。仍然拦"和任何一种行组合都对不上"的数字。lane 数 ≤ 6，子集枚举很小。
+fn title_total_matches(totals: &[u64], target: u64) -> bool {
+    let n = totals.len().min(16);
+    (1u32..(1u32 << n)).any(|mask| {
+        (0..n).filter(|i| mask >> i & 1 == 1).map(|i| totals[i]).sum::<u64>() == target
+    })
 }
 
 /// 文本里有没有 `name.ext:行号` 形式的出处（`src/arena.c:236`、`sz.h:191-197`）。
@@ -1410,6 +1408,19 @@ cell body 48 used "用户数据"
         let bad = "title 一页 = 8 KiB\nlane p \"页\"\ncell a 4K data \"a\"\n";
         let e = lint_memlayout_blocks(&format!("```memlayout\n{bad}```\n")).join("\n");
         assert!(e.contains("标题写「= 8 KiB」") && e.contains("4 KiB"), "{e}");
+    }
+
+    /// 标题概括整张图时，等于几行之和也是合法的（jemalloc ch_options k1 实测被误判）。
+    #[test]
+    fn memlayout_title_may_equal_sum_of_several_lanes() {
+        let two_pages = "title 两个 4 KiB 的 slab 页 = 8K\nlane meta \"带外描述符\"\ncell m 64 meta \"edata\"\n\
+                         lane p0 \"页 0\"\ncell a 4K data \"a\"\nlane p1 \"页 1\"\ncell b 4K data \"b\"\n";
+        assert!(lint_memlayout_blocks(&format!("```memlayout\n{two_pages}```\n")).is_empty());
+        // 和任何一种行组合都对不上的数字仍然被拦
+        let wrong = two_pages.replace("= 8K", "= 9K");
+        let e = lint_memlayout_blocks(&format!("```memlayout\n{wrong}```\n")).join("\n");
+        assert!(e.contains("标题写「= 9K」") && e.contains("哪几行"), "{e}");
+        assert!(title_total_matches(&[64, 4096, 4096], 8192) && !title_total_matches(&[64, 4096], 8192));
     }
 
     #[test]

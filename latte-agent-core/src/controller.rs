@@ -6957,6 +6957,26 @@ fn load_task_type_ids(cwd: &std::path::Path) -> Vec<String> {
         toml::from_str::<RawRegistry>(include_str!("../../config/task_types.toml"))
             .map(|r| r.types.into_keys().collect())
             .unwrap_or_default();
+    // 全局层 `$LATTE_HOME/task_types.toml`（回退 `~/.latte/`）——与
+    // `TaskTypeRegistry::load` 的三层惯例对齐：bundled < 全局 < 项目。
+    // 校验端若不读全局层，全局定义的 task_type 会在 plan 提交时被当未知
+    // 类型整单拒绝，而执行端却认得它——两端必须读同样的层级。
+    if let Some(gp) = std::env::var_os("LATTE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".latte")))
+        .map(|d| d.join("task_types.toml"))
+    {
+        if let Ok(raw) = std::fs::read_to_string(&gp) {
+            if let Ok(overlay) = toml::from_str::<RawRegistry>(&raw) {
+                for k in overlay.types.into_keys() {
+                    if !ids.iter().any(|i| i == &k) {
+                        ids.push(k);
+                    }
+                }
+            }
+        }
+    }
     if let Ok(raw) = std::fs::read_to_string(cwd.join(".latte").join("task_types.toml")) {
         if let Ok(overlay) = toml::from_str::<RawRegistry>(&raw) {
             for k in overlay.types.into_keys() {

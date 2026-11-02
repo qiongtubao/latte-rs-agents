@@ -246,39 +246,19 @@ pub fn load(
         }
     }
 
-    // Compute the set of model ids that the global config contributed
-    // exclusively. These are appended to every role's `model_chain`
-    // so that a role whose primary model has no configured credentials
-    // falls through to a model the operator actually configured in
-    // `~/.latte/models.yaml`. The same ids are also appended to the
-    // merged catalog below so the resolver can find them.
-    let project_ids: std::collections::HashSet<&str> = project_cfg
-        .models
-        .models
-        .iter()
-        .map(|m| m.name.as_str())
-        .collect();
-    let extra_ids: Vec<String> = global
-        .models
-        .iter()
-        .map(|m| m.name.as_str())
-        .filter(|id| !project_ids.contains(id))
-        .map(str::to_string)
-        .collect();
-
-    // Merge global UNDER project (project wins per id); the same
-    // global-only ids are also appended to the merged catalog so the
-    // resolver can find them when walking the chain.
-    let mut merged = global.merge_into_project(&project_cfg);
-    if !extra_ids.is_empty() {
-        for template in merged.roles.values_mut() {
-            for id in &extra_ids {
-                if !template.model_chain.iter().any(|c| c == id) {
-                    template.model_chain.push(id.clone());
-                }
-            }
-        }
-    }
+    // 全局模型目录只并入 catalog（见 `merge_into_project`），供角色 chain 里
+    // **声明的** id 按名字解析；绝不改写角色的 `model_chain`。
+    //
+    // 此前这里有一段「把全局独有的模型 id 追加到每个角色 model_chain 末尾」，
+    // 意图是主模型没配 key 时掉到别的模型。它违背「角色配置的模型不能用就
+    // 中止」：实测 rocksdb/jemalloc 会话里 advisor 声明的是
+    // ["glm-5.3","MiniMax-M3"]，运行时 chain 却变成
+    // [glm, MiniMax, deepseek-v4-flash, deepseek-v4-pro]，glm/minimax 超时后
+    // 就顺着追加的 deepseek 一路试下去并报 402——用户已把所有角色改成只用
+    // glm/minimax，deepseek 仍只因留在 ~/.latte/models.d 里就被塞进每个角色。
+    // 该追加发生在 `resolve_chain` 之前，所以删掉 resolve_chain 的兜底网也拦
+    // 不住它。
+    let merged = global.merge_into_project(&project_cfg);
 
     let resolver = ModelResolver::from_config(&merged)?;
 
@@ -483,6 +463,78 @@ fn redact(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归（rocksdb/jemalloc 会话）：advisor 声明 ["glm-5.3"]，全局
+    /// models.d 里另有 deepseek。`load()` 不得把 deepseek 追加进任何角色
+    /// 的 model_chain——否则 glm 超时后会顺着追加的 deepseek 一路试下去。
+    /// deepseek 仍应留在 catalog 里（只是不进 chain）。
+    #[test]
+    fn load_never_injects_global_models_into_role_chain() {
+        let home = tempfile::tempdir().unwrap();
+        let models_d = home.path().join("models.d");
+        std::fs::create_dir_all(&models_d).unwrap();
+        std::fs::write(
+            models_d.join("all.toml"),
+            r#"
+[[models]]
+name = "glm-5.3"
+api = "openai"
+provider = "glm"
+base_url = "http://x"
+api_key = "k1"
+context_window = 1000
+max_tokens = 256
+
+[[models]]
+name = "deepseek-v4-pro"
+api = "openai"
+provider = "deepseek"
+base_url = "http://y"
+api_key = "k2"
+context_window = 1000
+max_tokens = 256
+"#,
+        )
+        .unwrap();
+        let agents = tempfile::tempdir().unwrap();
+        std::fs::write(
+            agents.path().join("advisor.toml"),
+            r#"
+[roles.advisor]
+id = "advisor"
+name = "Advisor"
+category = "verification"
+model_tier = "premium"
+model_chain = ["glm-5.3"]
+"#,
+        )
+        .unwrap();
+
+        let prev = std::env::var_os("LATTE_HOME");
+        std::env::set_var("LATTE_HOME", home.path());
+        let resolved = load(agents.path().to_str(), None, CliOverrides::default());
+        match prev {
+            Some(v) => std::env::set_var("LATTE_HOME", v),
+            None => std::env::remove_var("LATTE_HOME"),
+        }
+        let resolved = resolved.expect("load");
+
+        let advisor = resolved.config.roles.get("advisor").expect("advisor role");
+        assert_eq!(
+            advisor.model_chain,
+            vec!["glm-5.3".to_string()],
+            "角色声明的 chain 不得被全局目录里的其它模型追加"
+        );
+        assert!(
+            resolved
+                .config
+                .models
+                .models
+                .iter()
+                .any(|m| m.name == "deepseek-v4-pro"),
+            "全局模型仍应并入 catalog（供按名字解析），只是不进 chain"
+        );
+    }
 
     #[test]
     fn scans_router_models_by_composite_key() {

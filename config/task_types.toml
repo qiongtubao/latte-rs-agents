@@ -58,6 +58,22 @@ color = "#10b981"
 icon = "📝"
 isolated = true
 
+[types.build_verify]
+label = "构建验证"
+description = "跑通工程构建、验证产物、沉淀可复用构建/测试脚本（学习树的「环境/工具根依赖章」与「验证输出收尾章」归此类，而非 feature）"
+default_workflow = "build_verify"
+color = "#f59e0b"
+icon = "🔨"
+isolated = true
+
+[types.unit_test]
+label = "单测验证"
+description = "定位测试体系、运行单测、独立核对真实通过/失败、沉淀可复用测试脚本"
+default_workflow = "unit_test"
+color = "#eab308"
+icon = "🧪"
+isolated = true
+
 [types.chore]
 label = "杂项/运维"
 description = "不适合固定流水线的杂事，走普通 manager 会话"

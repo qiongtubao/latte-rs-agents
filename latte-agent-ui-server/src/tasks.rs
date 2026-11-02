@@ -2416,7 +2416,13 @@ pub async fn dispatch_task(
             String::new()
         };
         let msg = format!("{base_msg}{feedback}");
-        api::chat_send(b, Some(&info.session_id), &msg).await?;
+        if let Err(e) = api::chat_send(b, Some(&info.session_id), &msg).await {
+            // 状态迁移之前失败：session 已 materialize 但任务还是 todo、
+            // 没 push run——回收孤儿 session，否则看板「立即执行」仍可点、
+            // 重启后依旧（见 workflow 分支同款处理）。
+            let _ = api::delete_session(b, &info.session_id).await;
+            return Err(e);
+        }
         // 无绑定路径：直接跳到状态更新（wf_run = None）
         // 写锁内复查 state：step-0 的校验已释放→await 到这里之间，
         // 另一并发请求可能已把同一任务派成 in_progress 并 push 了 run。
@@ -2464,10 +2470,24 @@ pub async fn dispatch_task(
             )));
         }
     };
-    let event_tx = api::session_event_sender(b, &info.session_id).await?;
+    let event_tx = match api::session_event_sender(b, &info.session_id).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            // 失败在状态迁移之前：session 已建并 materialize，但任务还是
+            // todo、runs[] 也没 push。不回收就留下：盘上一个孤儿 session +
+            // 任务停在 todo（看板「立即执行」仍可点、重启后依旧）——这正是
+            // 「点了立即执行却没记录、重启后又能点」的根因。与上面
+            // load_workflow 失败分支同样处理。
+            let _ = api::delete_session(b, &info.session_id).await;
+            return Err(e);
+        }
+    };
     // workflow 绑定分支不走 chat_send/submit_input，这里把派发消息
     // 显式记为 session 的用户诉求，否则 advisor 审查拿到空问题。
-    api::session_record_user_input(b, &info.session_id, &msg).await?;
+    if let Err(e) = api::session_record_user_input(b, &info.session_id, &msg).await {
+        let _ = api::delete_session(b, &info.session_id).await;
+        return Err(e);
+    }
     let wf_run = Some((wf, event_tx, Arc::new(AtomicBool::new(false)), msg));
 
     // 写锁内复查 state：step-0 读锁校验已释放，await 期间另一并发请求

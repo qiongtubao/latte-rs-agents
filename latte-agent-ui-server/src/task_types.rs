@@ -1,8 +1,11 @@
 //! 任务类型注册表：`task_type → 默认 workflow`
 //!
-//! 可配置：权威默认在 `config/task_types.toml`（随包编译进 binary，
-//! `include_str!`），项目层可在 `<cwd>/.latte/task_types.toml` 按同
-//! 格式覆盖/增补（同名 type 覆盖，未声明的不动）。
+//! 可配置，三层覆盖（低→高优先级，与 workflows.d / tools.d / agents.d /
+//! models.d 的惯例一致）：
+//!   1. 权威默认 `config/task_types.toml`（随包编译进 binary，`include_str!`）
+//!   2. 全局层 `$LATTE_HOME/task_types.toml`（回退 `~/.latte/task_types.toml`）
+//!   3. 项目层 `<cwd>/.latte/task_types.toml`
+//! 同名 type 后者覆盖前者，未声明的保留下层。
 //!
 //! 规则（与 `tasks.rs` 约定一致）：
 //! - 未填 `task_type` 或 `workflow` → 普通 manager 会话（不走 workflow）
@@ -61,14 +64,43 @@ fn project_path(cwd: &Path) -> PathBuf {
     cwd.join(".latte").join("task_types.toml")
 }
 
+/// 全局层路径：`$LATTE_HOME/task_types.toml`，回退 `~/.latte/task_types.toml`。
+/// 与 workflows.d / tools.d / agents.d 的全局目录同源（见
+/// `workflow::workflows_dirs`）。无 `LATTE_HOME`/`HOME` 时返回 `None`。
+fn global_path() -> Option<PathBuf> {
+    std::env::var_os("LATTE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".latte")))
+        .map(|d| d.join("task_types.toml"))
+}
+
 fn parse_toml(s: &str) -> Option<RawRegistry> {
     toml::from_str(s).ok()
 }
 
 impl TaskTypeRegistry {
-    /// 加载注册表：bundled 默认 + 项目层 `<cwd>/.latte/task_types.toml` 覆盖。
+    /// 加载注册表，三层覆盖（低→高优先级）：
+    ///   1. bundled 默认（`include_str!` 编译进 binary）
+    ///   2. 全局层 `$LATTE_HOME/task_types.toml`（回退 `~/.latte/`）
+    ///   3. 项目层 `<cwd>/.latte/task_types.toml`
+    /// 同名 type 后者覆盖前者，未声明的保留下层。与 workflow / tools.d /
+    /// agents.d / models.d 的「项目 > 全局 > 内置」三层惯例一致——此前
+    /// task_types 是唯一缺全局层的配置，放 `~/.latte` 的全局 task_type
+    /// 对任何项目都读不到。
     pub fn load(cwd: &Path) -> Self {
         let mut reg = Self::from_toml_str(BUNDLED_TOML).unwrap_or_default();
+        // 全局层（低于项目、高于 bundled）。
+        if let Some(gp) = global_path() {
+            if let Ok(raw) = std::fs::read_to_string(&gp) {
+                if let Some(overlay) = Self::from_toml_str(&raw) {
+                    for (k, v) in overlay.types {
+                        reg.types.insert(k, v);
+                    }
+                }
+            }
+        }
+        // 项目层（最高优先级）。
         let pp = project_path(cwd);
         if let Ok(raw) = std::fs::read_to_string(&pp) {
             if let Some(overlay) = Self::from_toml_str(&raw) {

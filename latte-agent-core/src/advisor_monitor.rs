@@ -1271,6 +1271,7 @@ impl AdvisorReviewEngine {
                             .unwrap_or_default(),
                         latency_ms,
                         finish_reason: format!("error: {e}"),
+                        usage: crate::trace::CallUsage::default(),
                     });
                 }
                 return Err(e);
@@ -1284,6 +1285,7 @@ impl AdvisorReviewEngine {
                 params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
                 latency_ms,
                 finish_reason: completion.stop_reason.clone(),
+                usage: crate::trace::CallUsage::from(&completion.usage),
             });
             // ── 落盘：emit ModelRawOut（含 verdict 原始输出） ──
             sink.emit(crate::trace::TraceEvent::ModelRawOut {
@@ -1367,7 +1369,7 @@ impl AdvisorReviewEngine {
                 Some(l) => match tokio::time::timeout(l, call).await {
                     Ok(r) => r,
                     Err(_) => {
-                        self.emit_review_call(&model_id, started, "timeout".into(), None);
+                        self.emit_review_call(&model_id, started, "timeout".into(), None, None);
                         tracing::warn!(model = %model_id, secs = l.as_secs(), "advisor review attempt timed out; trying next model");
                         continue;
                     }
@@ -1376,11 +1378,17 @@ impl AdvisorReviewEngine {
             };
             match completion {
                 Ok(c) => {
-                    self.emit_review_call(&model_id, started, c.stop_reason.clone(), Some(&c.content));
+                    self.emit_review_call(
+                        &model_id,
+                        started,
+                        c.stop_reason.clone(),
+                        Some(&c.content),
+                        Some(crate::trace::CallUsage::from(&c.usage)),
+                    );
                     return Ok(parse_verdict(&c.content));
                 }
                 Err(e) => {
-                    self.emit_review_call(&model_id, started, format!("error: {e}"), None);
+                    self.emit_review_call(&model_id, started, format!("error: {e}"), None, None);
                     last_err = Some(e);
                 }
             }
@@ -1398,6 +1406,7 @@ impl AdvisorReviewEngine {
         started: std::time::Instant,
         finish_reason: String,
         raw: Option<&str>,
+        usage: Option<crate::trace::CallUsage>,
     ) {
         let Some(sink) = self.subsession_sink.as_ref() else {
             return;
@@ -1409,6 +1418,7 @@ impl AdvisorReviewEngine {
             params_json: serde_json::to_string(&self.default_params).unwrap_or_default(),
             latency_ms: started.elapsed().as_millis() as u64,
             finish_reason,
+            usage: usage.unwrap_or_default(),
         });
         if let Some(raw) = raw {
             sink.emit(crate::trace::TraceEvent::ModelRawOut {

@@ -1,0 +1,115 @@
+# Workflow: unit_test
+# 单元测试验证流：定位测试体系 → 运行单测 → 独立核对结果 → 把跑通的方法
+# 沉淀成可复用脚本 + 文档。面向「把一个工程的单测跑起来并确认真实通过」
+# 这类任务。与 build_verify 互补：那个管"编得出来"，这个管"测得过"。
+#
+# 设计要点：
+#   - 第一步只定位、不跑：搞清测试框架、测试目标、如何只跑子集（全量太慢）。
+#   - 第二步真跑并记录真实通过/失败数（借鉴 tdd_development 的"不要相信报告"）。
+#   - 第三步固化成 build_tools/<task>/ 下的测试脚本 + RESULTS.md 供复用。
+# 步骤间用 output_key 显式穿线。格式见 config/workflows/tdd_development.toml。
+
+name = "unit_test"
+command = "/unit-test"
+description = "单元测试验证：定位测试体系 → 运行单测 → 独立核对真实通过/失败 → 沉淀可复用测试脚本+文档｜落点：build_tools/<task>/ 脚本 + RESULTS.md"
+max_rounds = 1
+
+[[steps]]
+id = "locate_tests"
+description = "定位测试体系：框架、测试目标、如何跑子集"
+speakers = ["tester"]
+output_key = "test_probe"
+max_retries = 1
+prompt = """围绕单测任务「{{topic}}」，先**只定位、不运行**，弄清这个仓库怎么跑单测。
+
+亲自读测试相关文件：测试目录（test/ tests/ *_test.* spec/）、测试配置
+（Makefile 的 test target / CMake 的 ctest / cargo test / pytest.ini / jest.config）、
+CI 配置里跑测试的命令、README/CONTRIBUTING 的测试章节。
+
+输出：
+1) 测试框架（gtest / ctest / cargo test / pytest / jest / …）与运行入口命令；
+2) 本任务相关的测试目标/用例（具体到 target 名或文件，如 `db_test`、`version_set_test`）；
+3) **如何只跑子集**（全量单测往往几十分钟）——如 gtest 的 `--gtest_filter=`、
+   ctest 的 `-R`、cargo 的 `cargo test <name>`、pytest 的 `-k`；
+4) 单测依赖的前置产物（是否需要先 build_verify 产出的库/可执行文件）；
+5) 已知平台坑（如 macOS 缺 `inotify`、`-Wsign-compare -Werror` 在系统 gtest 下报错、
+   缺 `timeout` 用 `perl -e 'alarm'` 兜底）——基于真实读到的文件，不臆测。"""
+
+[steps.output_contract]
+min_chars = 150
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "run_tests"
+description = "实际运行单测并记录真实通过/失败"
+speakers = ["tester"]
+output_key = "test_result"
+max_retries = 1
+# 失败（非上游）→ 跳回自身重跑（带本轮证据），直到 PASS 或 3 次迭代耗尽。
+loop_until = "VERDICT: PASS"
+loop_back_to = "run_tests"
+max_iterations = 3
+prompt = """按定位结论**实际运行单测**，不接受"应该能过"，必须真跑、贴真实输出（通过几/失败几）。
+
+【测试定位结论】{{test_probe}}
+任务：{{topic}}
+
+要求：
+1) 先确认前置产物就绪（需要库/可执行文件时先构建或复用已有产物）；
+2) 运行相关测试目标，**记录真实结果**：总数、通过数、失败数、跳过数，贴关键输出；
+3) 大工程优先按定位出的子集跑法跑相关用例，避免全量超时；真要全量跑时用
+   `timeout`（或 `perl -e 'alarm shift; exec @ARGV' <秒> <cmd>` 兜底）加时限；
+4) 失败逐条分类：**本任务范围内的真实失败** vs **上游/环境失败**
+   （如系统 gtest 的 `-Wsign-compare -Werror`、平台 POSIX 差异）。上游/环境失败
+   标 OUT_OF_SCOPE 并说清根因，不去修上游；
+5) 不许用"抑制输出 + 只看退出码"掩盖失败——必须看真实测试计数。
+
+【输出格式】
+VERDICT: PASS | FAIL
+EVIDENCE: 真实运行结果（命令 → 总数/通过/失败/跳过 → 关键输出摘录）
+OUT_OF_SCOPE: 判为上游/环境的失败（根因 + 为何不在本任务修；无则写"无"）
+GAPS: 本任务范围内仍失败/未覆盖的点（无则写"无"）
+
+FAIL 时 GAPS 必须非空。上游失败不计入 FAIL（归 OUT_OF_SCOPE）。"""
+
+[steps.output_contract]
+min_chars = 150
+require = ["VERDICT:", "EVIDENCE:"]
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "persist_scripts"
+description = "把验证过的测试方法固化成可复用脚本 + 文档"
+speakers = ["tester"]
+output_key = "test_assets"
+max_retries = 1
+prompt = """把上面跑通的单测方法**固化成可复用资产**，让下次同类任务直接复用。
+
+【测试定位】{{test_probe}}
+【测试运行结论】{{test_result}}
+任务：{{topic}}
+
+产出到仓库 `build_tools/<task_id>/`（task_id 从 {{topic}} 推断，如 lat100）：
+1) 一个或多个可执行 `.sh` 测试脚本，封装跑通过的运行+核对命令：
+   - 开头 `set -u`，`ROOT=$(cd "$(dirname "$0")/../.." && pwd); cd "$ROOT"` 定位根；
+   - 每个用例/场景用 `ok`/`bad` 输出 PASS/FAIL + 真实计数证据；
+   - 退出码反映失败数（`exit $FAIL`）；上游/环境失败用单独的 `defect` 计数、
+     不阻塞退出码（degraded but not blocking）；
+   - 跨平台兜底（缺 `timeout` 用 `perl -e 'alarm'`）；
+2) 若还没有 `run_all.sh` 则创建/若已存在则把测试阶段接进去（按轻→重排序）；
+3) 更新/创建 `RESULTS.md`：测试条目 → 状态 → 真实通过/失败数证据；
+   OUT_OF_SCOPE 上游失败单列；DEVIATIONS 记录偏差。
+
+要求：脚本里的命令必须是上一步**真实跑通过**的；验证类断言要包含正向
+（声称通过的用例确实通过）与反向（明确不该出现的失败不被重新引入）。
+完成后列出创建/修改的文件清单。
+
+【输出格式】
+FILES: 创建/修改的文件逐一列出
+HOWTO: 下次如何复用（一行命令）
+NOTES: 固化时的关键决策（如为什么用 defect 而非 bad 记录上游失败）"""
+
+[steps.output_contract]
+min_chars = 100
+require = ["FILES:", "HOWTO:"]
+forbid = ["TBD", "待补充", "占位符"]

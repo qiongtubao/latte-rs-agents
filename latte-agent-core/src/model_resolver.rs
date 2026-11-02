@@ -337,8 +337,11 @@ impl ResolverSnapshot {
     }
 
     /// Returns every model id that could satisfy this (role, tier) in
-    /// priority order: per-role override → global tier default → catalog
-    /// match on `tier` field → first model in catalog.
+    /// priority order: per-role override → global tier default.
+    ///
+    /// 只返回**显式配置**的候选。没有任何 role_tiers / tiers 映射命中时
+    /// 返回空——调用方据此报 `ModelResolutionFailed`，绝不凭 catalog
+    /// 内容推测一个未被指定的模型（旧版会这么做，见函数体注释）。
     fn candidates_for(&self, role_id: &str, tier: ModelTier) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -347,6 +350,9 @@ impl ResolverSnapshot {
                 out.push(id.to_string());
             }
         };
+        // 只认**显式配置**的两级：per-role 覆盖 → 全局 tier 默认。
+        // 二者都是用户在 `[models.role_tiers.<role>]` / `[models.tiers]`
+        // 里亲手写的映射，属于"角色配置的模型"。
         if let Some(role_map) = self.role_tiers.get(role_id) {
             if let Some(id) = role_map.get(&tier) {
                 push(id);
@@ -355,16 +361,14 @@ impl ResolverSnapshot {
         if let Some(id) = self.tier_defaults.get(&tier) {
             push(id);
         }
-        if let Some(def) = self
-            .models
-            .values()
-            .find(|m| m.tier.as_ref().and_then(|t| ModelTier::parse(t).ok()) == Some(tier))
-        {
-            push(&def.name);
-        }
-        if let Some(def) = self.models.values().next() {
-            push(&def.name);
-        }
+        // 不做 catalog 推测兜底。此前这里还有两步：
+        //   3) 找 catalog 里任意 `tier` 字段匹配的模型；
+        //   4) 直接取 catalog 第一个模型。
+        // 两步都在"角色没有任何显式映射"时凭空挑一个模型顶上，与
+        // resolve_chain 里被删的 last-resort 安全网同性质——实测会捞到
+        // 用户想弃用、只因 `tier = "budget"` 还留在模型目录里的 deepseek。
+        // 去掉后：没有任何显式映射的 tier 解析为空候选，resolve 直接报
+        // ModelResolutionFailed，而不是偷换一个没人指定的模型。
         out
     }
 
@@ -422,23 +426,31 @@ impl ResolverSnapshot {
             }
         }
 
-        // Last-resort safety net: walk the full catalog for any model
-        // with a valid `api_key`.
-        if out.is_empty() {
-            for def in self.models.values() {
-                if let Ok(m) = self.build_model(&def.name) {
-                    if !m.api_key.trim().is_empty() {
-                        out.push(m);
-                        break;
-                    }
-                }
-            }
-        }
+        // 不设兜底网：chain / tier 候选全不可用就直接失败。
+        //
+        // 角色声明的 model_chain（chain 为空时则是 `[role_tiers]`/`[tiers]`
+        // 的 tier 映射）就是它对模型的**完整意图**。此前这里有一张
+        // last-resort 安全网：chain 全哑时遍历整个 catalog 抓第一个带
+        // api_key 的模型顶上。它违背声明意图——实测事故：jemalloc 会话里
+        // advisor 的 chain 是 ["glm-5.3","MiniMax-M3"]，两个都 timeout 后
+        // 安全网捞出了用户早已从所有角色里删掉、只剩在模型目录中的
+        // deepseek，接着报 402。用户"全局角色都改成只用 glm/minimax 了，
+        // 为什么还在调 deepseek"无从排查，因为模型根本不来自任何角色配置。
+        //
+        // 正确行为是中止并报 ModelResolutionFailed，让调用方按既有降级路径
+        // 处理：advisor 静默降级、delegate/workflow step 采纳 partial 或
+        // 失败善后、顶层 chat 自动暂停等人工。要彻底不用某个模型，把它从
+        // 角色 chain / tier 映射里去掉即可——不必再去模型目录里删它。
         if out.is_empty() {
             return Err(AgentError::ModelResolutionFailed {
                 role: role_id.into(),
                 tier: tier.label().into(),
-                reason: "no candidate with a configured api_key".into(),
+                reason: format!(
+                    "角色配置的模型全部不可用（chain + tier 候选均无法构建或缺 api_key）；\
+                     不启用 catalog 兜底，直接中止。请检查角色 model_chain / tier 映射里的模型是否可用。\
+                     chain_ids={:?}",
+                    chain_ids
+                ),
             });
         }
         Ok(out)
@@ -696,12 +708,17 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_fallback() {
+    fn test_resolve_without_explicit_mapping_fails_no_catalog_guess() {
+        // 回归：catalog 里有模型（带 api_key），但角色没有任何显式的
+        // tier 映射（role_tiers / tiers 都没命中），且 tier 字段也不匹配。
+        // 旧行为会凭"catalog 第一个模型"或"tier 字段匹配"兜底挑一个；
+        // 新契约是直接失败，绝不偷换一个用户没指定的模型。
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
             models: crate::config::ModelCatalog {
-                models: vec![test_model_def("only-model", None)],
+                // 只有一个 premium 模型，且无 tiers 映射。
+                models: vec![test_model_def("some-model", Some("premium"))],
                 tiers: None,
                 role_tiers: None,
             },
@@ -709,8 +726,38 @@ mod tests {
         };
 
         let resolver = ModelResolver::from_config(&config).unwrap();
-        let model = resolver.resolve("any_role", ModelTier::Budget).unwrap();
-        assert_eq!(model.name, "only-model");
+        // 按 Budget 解析：没有 budget 映射、也不该拿 premium 模型兜底。
+        let err = resolver
+            .resolve("any_role", ModelTier::Budget)
+            .expect_err("无显式映射必须失败，不得凭 catalog 推测");
+        assert!(matches!(err, AgentError::ModelResolutionFailed { .. }));
+    }
+
+    #[test]
+    fn test_resolve_chain_aborts_when_chain_unavailable_no_catalog_fallback() {
+        // 核心回归：角色 chain 指向的模型全不可用（此处用未知 id 模拟
+        // "构建失败/缺 key"），catalog 里却躺着一个带 key 的"弃用模型"
+        // （相当于只剩在模型目录里的 deepseek）。必须中止，绝不捞它。
+        let config = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            models: crate::config::ModelCatalog {
+                // 这个带 key 的模型既不在 chain 里、也没有任何 tier 映射
+                // 指向它——它就是旧安全网会捞出来的 deepseek 替身。
+                models: vec![test_model_def("unwanted-deepseek", Some("budget"))],
+                tiers: None,
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        let err = resolver
+            .resolve_chain("advisor", ModelTier::Premium, &["glm-5.3".into(), "MiniMax-M3".into()])
+            .expect_err("chain 全不可用必须中止，不得兜底到 catalog 里的 unwanted-deepseek");
+        match err {
+            AgentError::ModelResolutionFailed { role, .. } => assert_eq!(role, "advisor"),
+            other => panic!("期望 ModelResolutionFailed，实际 {other:?}"),
+        }
     }
 
     #[test]
@@ -863,6 +910,38 @@ mod tests {
             code_paths: vec![],
             description: String::new(),
         }
+    }
+
+    /// 角色声明的 chain 就是全部意图：catalog 里躺着别的带 key 的模型
+    /// （如只剩在 ~/.latte/models.d 里的 deepseek）不得进入解析结果；
+    /// 声明的模型不可用时必须报错中止，而不是换成它。
+    #[test]
+    fn declared_chain_is_complete_intent_undeclared_catalog_models_never_used() {
+        let mut glm = test_model_def("glm-5.3", None);
+        glm.api_key = "glm-key".into();
+        let mut ds = test_model_def("deepseek-v4-pro", None);
+        ds.api_key = "ds-key".into();
+        let cfg = catalog_with(vec![glm.clone(), ds.clone()]);
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+
+        // 声明的模型可用 → 只返回它，不掺 deepseek。
+        let chain = resolver
+            .resolve_chain("advisor", ModelTier::Premium, &["glm-5.3".into()])
+            .unwrap();
+        assert_eq!(
+            chain.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["glm-5.3"],
+            "未声明的 catalog 模型不得出现在解析结果里"
+        );
+
+        // 声明的模型没有 key → 报错中止，绝不降级到有 key 的 deepseek。
+        glm.api_key = String::new();
+        let cfg = catalog_with(vec![glm, ds]);
+        let resolver = ModelResolver::from_config(&cfg).unwrap();
+        let err = resolver
+            .resolve_chain("advisor", ModelTier::Premium, &["glm-5.3".into()])
+            .expect_err("声明的模型不可用必须中止，不得换成 catalog 里别的模型");
+        assert!(matches!(err, AgentError::ModelResolutionFailed { .. }));
     }
 
     /// 角色模型指派进快照并随 reload 热更新（角色编辑器保存场景）。

@@ -246,12 +246,11 @@ impl GlobalConfig {
     pub fn merge_into_project(&self, project: &AgentConfig) -> AgentConfig {
         let mut models = project.models.models.clone();
         merge_models(&mut models, &self.models);
-        // Append global-only models (e.g. `deepseek-v4-flash`) so the
-        // resolver can find them when walking the role's fallback
-        // chain. The caller (`config_layer::load`) computes the same
-        // set *before* calling this so it can inject the ids into
-        // every role's `model_chain` — keeping the catalog and the
-        // chain in sync.
+        // Append global-only models (e.g. `deepseek-v4-flash`) to the catalog
+        // so the resolver can find a role's **declared** chain ids by name.
+        // They are NOT injected into any role's `model_chain`: a role's chain
+        // is its complete intent, and a model sitting in the global catalog
+        // does not become a fallback for roles that never named it.
         append_models(&mut models, &self.models);
         let mut tiers: HashMap<String, String> = self.tiers.clone().unwrap_or_default();
         if let Some(p) = &project.models.tiers {
