@@ -31,16 +31,40 @@ pub struct MermaidGraph {
     pub truncated: bool,
 }
 
-/// 读取预建索引。索引缺失/版本不符时给可操作的错误提示。
-fn load_index(cwd: &Path) -> Result<CodeGraphIndex, String> {
+/// 读取预建索引；缺失/版本不符时**同步兜底构建**再读一次。
+///
+/// 索引由 UI server 后台循环（`code_graph_index_loop`）维护，但它只覆盖
+/// UI 自己的 cwd。agent 实际工作在任务 worktree 或 CLI 场景里时，后台
+/// 构建者不存在——旧实现在这里直接报"稍候再试"，而重试永远等不到文件
+/// （实测 jemalloc 会话：tutor 两个子会话各连撞 4 次 ToolError）。
+/// 索引本质是缓存：miss 就现场填充。`build_or_update` 幂等且增量
+/// （无改动秒退），首次构建只花一次 ast-grep 冷扫的成本。
+async fn load_index(cwd: &Path) -> Result<CodeGraphIndex, String> {
+    let path = CodeGraphIndex::path(cwd);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(idx) = serde_json::from_str::<CodeGraphIndex>(&raw) {
+            if idx.version == CodeGraphIndex::CURRENT_VERSION {
+                return Ok(idx);
+            }
+        }
+    }
+    match crate::code_graph_index::build_or_update(cwd).await {
+        crate::code_graph_index::BuildOutcome::AstGrepMissing => {
+            return Err(
+                "代码索引不可用且无法现场构建：ast-grep 未安装。改用 search/read，或安装 ast-grep 后重试。"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
     let path = CodeGraphIndex::path(cwd);
     let raw = std::fs::read_to_string(&path)
-        .map_err(|_| "代码索引尚未构建（.latte/code_graph/index.json 不存在）。UI 启动后会后台构建，稍候再试。".to_string())?;
+        .map_err(|_| "代码索引现场构建后仍不可读（磁盘/权限问题）。改用 search/read。".to_string())?;
     let idx: CodeGraphIndex = serde_json::from_str(&raw).map_err(|e| {
-        format!("代码索引损坏：{e}。删除 .latte/code_graph/index.json 后等后台重建。")
+        format!("代码索引损坏：{e}。删除 {} 后重试。", path.display())
     })?;
     if idx.version != CodeGraphIndex::CURRENT_VERSION {
-        return Err("代码索引版本过旧，等后台重建完成后再试。".to_string());
+        return Err("代码索引版本过旧且现场重建未生效，改用 search/read。".to_string());
     }
     Ok(idx)
 }
@@ -102,7 +126,7 @@ fn kind_tag(kind: &str) -> &str {
 
 /// 结构图：索引里的定义类符号按文件分 subgraph。
 pub async fn structure_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, String> {
-    let idx = load_index(cwd)?;
+    let idx = load_index(cwd).await?;
     let scope = normalize_scope(path);
 
     let mut lines = vec!["flowchart TD".to_string()];
@@ -241,7 +265,7 @@ fn find_caller<'a>(spans: &'a [FnSpan], line: u64) -> Option<&'a FnSpan> {
 
 /// 调用图：scope 内函数之间的调用边。
 pub async fn calls_mermaid(cwd: &Path, path: &str) -> Result<MermaidGraph, String> {
-    let idx = load_index(cwd)?;
+    let idx = load_index(cwd).await?;
     let scope = normalize_scope(path);
 
     // caller 跨度表：file → 函数符号（定义类里的可调用体）。
@@ -443,10 +467,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structure_missing_index_errors() {
+    async fn structure_missing_index_self_heals_or_falls_back() {
+        // 索引缺失不再报"稍候再试"：ast-grep 可用就现场构建后成功；
+        // ast-grep 缺失才报错，且错误必须可操作（指明装 ast-grep 或改用
+        // search/read），不再引导模型空转重试。
         let dir = tempfile::tempdir().unwrap();
-        let err = structure_mermaid(dir.path(), ".").await.unwrap_err();
-        assert!(err.contains("索引尚未构建"));
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        match structure_mermaid(dir.path(), ".").await {
+            Ok(g) => {
+                // 兜底构建成功：空仓（无源文件）时索引为空，报"没有已索引的符号"，
+                // 有源文件时应命中。
+                assert!(g.mermaid.contains("fn alpha") || g.mermaid.starts_with("flowchart TD"));
+            }
+            Err(err) => {
+                assert!(
+                    err.contains("ast-grep") || err.contains("search/read"),
+                    "unactionable error: {err}"
+                );
+                assert!(!err.contains("稍候再试"), "must not tell model to blind-retry: {err}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn structure_stale_version_index_self_heals() {
+        // 版本过旧的索引同样触发兜底重建，而不是报"等后台重建"。
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        let stale = IDX.replace("\"version\": 2", "\"version\": 1");
+        write_index(dir.path(), &stale);
+        match structure_mermaid(dir.path(), ".").await {
+            Ok(g) => assert!(g.mermaid.starts_with("flowchart TD")),
+            Err(err) => {
+                assert!(
+                    err.contains("ast-grep") || err.contains("search/read"),
+                    "unactionable error: {err}"
+                );
+            }
+        }
     }
 
     #[test]
