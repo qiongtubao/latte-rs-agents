@@ -1,3 +1,7 @@
+<!-- SUMMARY -->
+以 AST 方式高效探索代码结构，查询函数、类型、调用和声明签名。
+<!-- /SUMMARY -->
+<!-- DETAILS -->
 <instruction>
 - PREFER this tool over `read` and `search` for code exploration. It returns precise signatures+line spans at minimal token cost.
 - Use `kind` parameter (recommended): `function`, `struct`, `type`, `macro`, `call`, `import`, `decl`. Avoids pattern syntax errors.
@@ -15,9 +19,4 @@
 - 0 matches usually means wrong `lang` or `kind` for the language — check the error message for available kinds.
 - Token comparison: reading a 500-line .c file costs ~4000 tokens; `code_graph` signatures for the same file costs ~200 tokens (20x savings).
 </critical>
-
-<visualization>
-- `graph=structure` / `graph=calls` returns a mermaid diagram source in the `mermaid` field (no kind/pattern needed). Reply with it verbatim inside a ```mermaid fence — the UI renders it as an SVG diagram (zoomable, downloadable).
-- Use this when the user asks for a module/class/call diagram instead of hand-writing mermaid from memory: the generated graph is derived from the real index/AST, not your recollection.
-- `structure` reads the prebuilt index (fast, whole-tree OK); `calls` does a live full scan — keep its `path` to a subdirectory or single file, whole-repo call graphs get truncated (truncated=true tells you).
-</visualization>
+<!-- /DETAILS -->

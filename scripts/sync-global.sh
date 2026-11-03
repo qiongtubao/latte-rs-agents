@@ -18,13 +18,12 @@
 #   - workflows：config/workflows/ 是权威版，.latte/workflows.d/ 是它的运行时
 #     副本。二者内容本应一致（config/README.md 的编辑约定），实测只有
 #     learn_loop 的 description 一处漂移——同步时以 config/ 为准。
-#   - roles：config/agents/ 带 description 等较新字段（.latte/agents.d/ 那份
-#     自 8 月起就没跟上），但**不含** .latte/agents.d/ 里的 proofreader /
-#     compaction 两个角色——那两个是运行时新增的，一并从 .latte/agents.d/ 补齐。
+#   - roles：config/agents/ 是角色的唯一权威源（含原先只在项目层副本里的
+#     proofreader / compaction —— 项目级 .latte/ 副本已全部移除）。
 #   - prompts：仓库根 prompts/ 与二进制内置基座 include_str! 同源。
 #     config/prompts/ 是历史镜像（实测 tutor.md 落后、proofreader.md 缺失）。
-#   - tool docs：.latte/tools.d/ 是被 git 跟踪的权威集（18 个）；
-#     prompts/tools/ 只有 2 个，且 plan.md 缺少 SUMMARY/DETAILS 标记。
+#   - tool docs：config/prompts/tools/ 是权威集（带 SUMMARY/DETAILS 标记，
+#     运行时按 <id>.md 匹配工具名）；仓库根 prompts/tools/ 只有 2 个。
 #
 # **不同步**（刻意）：
 #   - 模型编目（config/models.toml → ~/.latte/models.d/）：api_key / base_url
@@ -216,14 +215,9 @@ for f in "$REPO_DIR/config/agents/"*.toml; do
     role_count=$((role_count + 1))
 done
 
-# config/agents/ 缺的角色（运行时新增的）从 .latte/agents.d/ 补齐。
-for f in "$REPO_DIR/.latte/agents.d/"*.toml; do
-    [[ -e "$f" ]] || continue
-    name="$(basename "$f")"
-    [[ -f "$REPO_DIR/config/agents/$name" ]] && continue
-    install_role_preserving_chain "$f" "$TARGET_DIR/agents.d/$name" "role: $name"
-    role_count=$((role_count + 1))
-done
+# 说明：项目级 .latte/ 运行时副本已于 2026-10-31 全部移除，config/agents/
+# 是角色的唯一权威源（含原先只在 .latte/agents.d/ 的 proofreader / compaction，
+# 它们已并入 config/agents/）。
 info "$role_count role configs"
 
 # ─── 3. Prompts ────────────────────────────────────────────────────────────
@@ -248,11 +242,12 @@ done
 info "$prompt_count prompt files"
 
 # ─── 4. Tool docs ──────────────────────────────────────────────────────────
-# 权威源：仓库 .latte/tools.d/（工具说明 md，运行时按 <id>.md 匹配工具名）。
+# 权威源：config/prompts/tools/（工具说明 md，运行时按 <id>.md 匹配工具名）。
+# 项目级 .latte/tools.d/ 副本已移除，原先只存在于那里的内容已并入这里。
 section "Tool docs → ${TARGET_DIR#$HOME/}/tools.d/"
 
 tool_count=0
-for f in "$REPO_DIR/.latte/tools.d/"*.md; do
+for f in "$REPO_DIR/config/prompts/tools/"*.md; do
     [[ -e "$f" ]] || continue
     name="$(basename "$f")"
     install_plain "$f" "$TARGET_DIR/tools.d/$name" "tool doc: $name"

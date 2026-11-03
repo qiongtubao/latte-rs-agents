@@ -1,0 +1,176 @@
+# Workflow: learn_book_pages （learn_plan 的内层子流程，一般不单独调用）
+# 职责：把「学透某仓库/主题」的书**骨架 + 逐章细化**做掉，产物落盘到
+# 固定目录 .latte/learn-plan/，供外层 learn_plan 的 assemble 读取装配。
+#
+# 为什么要单独一层：fan_out（动态扇出）只在 DAG 引擎可用，而 learn_plan
+# 外层要用的 require_plan_tasks / require_verdict_json / gate_from 只在串行
+# 引擎可用——两套机制在当前引擎里互斥。于是把**扇出**关进这个 DAG 子流程，
+# 外层保持串行、保留全部机械门禁（对标 learn_loop 串行外层嵌套 doc_review_loop
+# 这个 DAG 子流程的既有写法）。
+#
+# 本层是 DAG（detail.depends_on = breakdown）：
+#   breakdown → 写 .latte/learn-plan/chapters.json（精简骨架）+ 返回 prose 结构说明
+#   detail    → 按 chapters.json **每章扇出一个独立 subsession**，各写一条完整任务
+#               条目到 .latte/learn-plan/tasks/<chNN>.json
+# 核心收益：把「一个会话扛整本书」换成「每章一个小会话」，从源头避免单会话
+# 数据过多（jemalloc ui-8557 复盘：旧单会话 21 万字符 + 900s 超时 + think 泄漏）。
+
+# 角色选 tutor 而非 architect：两步都必须 write 落盘，而全局 architect 角色
+# 的工具集是只读的（ask/code_graph/delegate/read/search），引擎会静默忽略
+# step 请求的 write（实测 2026-10-31 jemalloc 首跑：「step 请求了角色
+# 'architect' 没有的工具，已忽略：write」）。tutor 带 read/code_graph/search/
+# write，且本就是 learn_loop 里落盘 plan.json 的角色。
+
+name = "learn_book_pages"
+description = "learn_plan 内层：出书骨架 chapters.json，再按章扇出逐章细化为 tasks/<chNN>.json（供外层装配）"
+max_rounds = 1
+
+# ── breakdown：出全书骨架（prose 结构说明 + 落盘 chapters.json）──────────
+[[steps]]
+id = "breakdown"
+description = "出全书目录骨架（编/章结构 + 先修链），并写 chapters.json 供逐章扇出"
+role = "tutor"
+output_key = "plan"
+# 定向返工模式（外层 rechapter 步的 task 带此标记）：骨架不动，跳过本步。
+unless_any = ["[[learn_plan:rechapter]]"]
+# 骨架写盘后机械校验（章号连续 / 先修只指前序 / brief·accept 跨章引用在闭包内），
+# 不合格带批注在本步重试，而不是让扇出前校验判死整单（实测 ch01 验收前指 ch02）。
+require_learn_skeleton = ".latte/learn-plan/chapters.json"
+max_retries = 2
+tools = ["read", "code_graph", "search", "write"]
+require_tools = ["write"]
+require_tools_any = ["read", "code_graph", "search"]
+task = """为以下学习目标设计一本书的目录骨架：{{topic}}。
+
+先读仓库骨架再拆：目录树、构建文件（Makefile/Cargo.toml/package.json 的模块清单）、
+code_graph 的模块符号索引。**只读骨架、不逐文件深读**——拆书不需要先读完每章的
+内容，file:line 级取证是每章学习阶段（learn_loop plan 步）的事。
+
+这一步**只出骨架，不写每章的完整验收长文**（那是下一步逐章扇出做的）。产出两样东西：
+
+A) 面向人读的**全书结构说明**（prose，作为本步正文返回）：为什么这么编排——
+   **两条学习原则统领整本书的结构**：
+   - **原则一：先抓主干，再填细节。** 把知识想象成一棵树：先搞懂树干和主要分支（基本原理），再去记树叶（细碎知识点），知识才挂得住。所以每一章必须归入四层之一，**阅读顺序层级只升不降**（地基 → 树干 → 枝干 → 树叶）：
+     · **层-地基**（0-2 章，可选）：让读者先把东西**跑起来、会用公开 API**（构建运行、入门 API 与配置）。只管“怎么用”，不讲内部原理；topic 里点名了“入门 / 上手”就必须有。
+     · **层-树干**（1-3 章）：这个系统**为什么存在、整体长什么样**。必含一章「推导章」（见原则二），再加一章「端到端走一遍」（跟一次最典型的请求从入口走到出口，只到模块 / 函数名这一级，不钻实现细节）。树干章用 `learn`（泛读讲解）类型，不锚定具体文件也可以。
+     · **层-枝干**：主要子系统，每个子系统一章。每章开头要能回答「它是推导里的哪一个必要环节 / 解决推导里的哪个矛盾」，答不上来说明它不该是枝干。
+     · **层-树叶**：**删掉它不影响理解主干和枝干**的东西——工具类 / 小构件 / 可替换的实现细节 / 调优参数 / 观测工具 / 动手验证。判据：被后面两章以上依赖的章不是树叶（引擎会查）；快照与可见性规则、事务、版本管理这类**别的机制要用它才讲得通**的，是枝干，不是树叶。
+       **不要因为“其他章会用到”就把小构件提前**——主干章里把它当黑盒，到树叶层再打开；枝干章里需要时讲到够用即可，不单列。
+   - **原则二：回归本质（第一性原理）。** 不照搬别人的结论，拆到最基础的事实，从底层重新推导。树干里的**「推导章」**要做的事：列出 3-5 个最基础的事实（硬件 / 物理 / 业务约束，各带一个具体数字或例子），然后一步一步推出「所以系统必须这样设计」，推到能和真实系统的整体结构对上号为止。标题或描述里写明「推导」。
+     枝干章讲真实代码时，也要回到“这个设计是在应对推导里的哪个事实”，而不是只描述代码做了什么。
+     **推导章里的基础事实要编号**（事实1、事实2…）；**每个枝干章的描述以「回应事实N：」开头**，写明它是哪条事实的解法（引擎会查）。
+   此外：
+   - **章 = 一个可独立学习验收的主题**（一章 = 一次 learn_loop）。**体量跟着锚点源码的实际行数走**，不是固定的 3-6 个知识点：锚点文件加起来 < 300 行的章 1-2 个知识点就够，300-1200 行 2-4 个，更大的才到 5-6 个。
+     **引擎会数**：单个锚点文件超过 3000 行代码、一章锚点合计超过 6000 行、不足 100 行（树干章除外）都会被打回——规划时 `wc -l` 锚点文件，超大文件不要整个当锚点（paths 留空，在章描述里点名要读的函数）。
+   - **尊重学习目标里对篇幅的约束**：若 topic 明确要求「N 章 / 小册子 / 精简」，就严格控制在那个量级。
+   - **螺旋上升优于一次到位**：同一主题允许出现两次（前章先用起来、后编再拆开看），但后章必须写明进阶在哪，不许原样复读。
+   - **收尾必须有「验证与输出」章**（动手实现一个最小版本 / 写基准测试 / 把全书讲成一张图），归树叶层。
+   - 风险与未知项：哪些章你还没把握、学到时可能要调整。
+
+B) 用 `write` 写一份精简骨架到**固定路径** `.latte/learn-plan/chapters.json`
+   （JSON，紧凑格式；若已存在直接覆盖），schema：
+   {"chapters":[{
+     "id":"ch01",                     // 全书连续稳定编号 chNN，从 ch01 起逐一递增
+     "title":"ch01 仓库与构建全景",    // 以 chNN 开头；= 章号 + 模块/主题 +（可带真实路径锚点）
+     "bian":"第1编-打地基",           // 编分组标签
+     "brief":"学什么，2-3 句，不写行号不点名内部函数",
+     "accept":"能讲清/能推出什么（一句话，只能用到先修链上前序章教过的知识）",
+     "task_type":"learn_loop",        // 精读章=learn_loop；泛读讲解=learn；含动手实验/验证输出=feature；纯摸底=research
+     "depends_on":["ch00 的完整标题原文"],  // 先修章的**完整标题原文**，只能指向编号更小的章；根章留空数组
+     "paths":["src/foo.c"],           // 可选：只写**核实过存在**的路径；不确定留空数组，宁空勿猜
+     "layer":"层-树干",               // 层-地基 / 层-树干 / 层-枝干 / 层-树叶（四选一，阅读顺序只升不降）
+     "derive":"推导章的基础事实编号列表", // 仅推导章填：事实1、事实2…；其余章留空
+     "responds_to":"事实1"           // 仅枝干章填：这条设计在回应推导里的哪条事实
+   }]}
+
+chapters.json 的硬规则（外层 assemble 机械校验，违反整单打回，现在就要守住）：
+- `id` 从 ch01 起**连续递增**，不跳号不重号；编只是 `bian` 标签，不另起章号。
+- `layer` 四选一（层-地基 / 层-树干 / 层-枝干 / 层-树叶），且**层级只升不降**：
+  地基排在最前，树干之后是枝干，最后是树叶。地基章 ≤ 2 章。
+- 树干层里**必须有一章是推导章**（title / brief 含「推导」或「第一性」，且填了
+  `derive`）：否则整本书没有「为什么这样设计」的根。
+- 枝干层的章要填 `responds_to`（回应事实N），且每个枝干章都必须能回答「它是推导里的
+  哪一个必要环节」。
+- `depends_on` 写被依赖章的**完整 title 原文**，且只能指向**编号更小**的章。
+- `brief`/`accept` 里若提到其他章，一律写 chNN，且该章必须在本章 depends_on 里。
+- 精读章（task_type = learn_loop）**必须**有 paths：至少锚定 1 个用 `search` / `ls`
+  核实过存在的源码文件；单文件 > 3000 行、一章合计 > 6000 行的会被引擎打回，
+  过薄（< 100 行）的章与相邻同层章合并。
+- 章名/brief **不要点名内部函数、宏、符号**；paths 只写核实过存在的文件/目录
+  （尤其别猜 test/ 下的文件名，实测反复幻觉）。
+- 章数由学习目标覆盖面决定（一章一次 learn_loop 的体量），上限 60 章。
+
+如果本次是返工（任务末尾带【上轮审查反馈】）：反馈里的事实性结论**先回源码核实
+再改**（审查也会错，实测出现过把「可选参数」改成「必须参数」的矫枉过正）；核实属实
+才改，与源码不符的在结构说明里写明依据并保留原结论；未被点到的章不要动。
+返工时**重写整份 chapters.json**（它是扇出的唯一真相，不能只改 prose）。"""
+
+[steps.output_contract]
+min_chars = 200
+forbid = ["TBD", "待补充", "占位符"]
+
+# ── detail：按 chapters.json 每章扇出一个独立 subsession ────────────────
+[[steps]]
+id = "detail"
+description = "逐章扇出：每章一个独立 subsession，产出该章完整任务条目并落盘 tasks/<chNN>.json"
+role = "tutor"
+depends_on = ["breakdown"]
+max_retries = 2
+tools = ["read", "search", "write"]
+require_tools = ["write"]
+# 扇出 N 个有界单章子会话，下游还有 assemble 机械校验 + verdict 抽查 +
+# 每章各自的 learn_loop 兜底，无需给每个子会话再跑一次 advisor 审查
+# （实测那是近乎翻倍的扇出开销）。关掉 advisor，开销减半。
+no_advisor = true
+task = """你是章节细化者，本次**只负责一章**。这一章的骨架（摘自全书 chapters.json，权威）已随附在下面，**不用再去读 chapters.json，也不要读别的章**：
+
+本章骨架 JSON（id=`{{item_id}}`，第 {{item_index}} 个）：
+{{item_json}}
+
+学习目标（返工时末尾附有【上轮审查反馈】——**只看点名本章 `{{item_id}}` 的条目并据此修正**，其他章的问题与你无关）：
+{{topic}}
+
+步骤：
+1. 从上面骨架取出本章的 id / title / bian / brief / accept / task_type / layer /
+   derive / responds_to / depends_on / paths。
+2. 用 `read` / `search` 对**本章 paths 锚点**做轻量核实（确认文件/目录真实存在、章名没点错
+   模块）——不要深读源码到行号级（那是学习阶段 learn_loop 的事）。
+   **锚点要能读出验收要求的东西**：验收里出现的每个关键机制（类 / 函数），本章锚点里必须有
+   定义它的那个文件——先 `search` 它的定义确认在哪个文件，再把那个文件放进 paths；工厂 / 壳
+   文件（只有 `new X(...)` 或 `main` 调一个函数）不算实现，要锚真正的实现文件。C/C++ 的 `.h`
+   只有声明，验收若要「讲清成因 / 画时序 / 手绘算法」，必须同时锚定对应的 `.cc` 实现文件；
+   只有头文件的章只能是「接口契约」章，并在描述里写明。
+3. 用 `write` 把这一章细化成一条完整任务条目，写到 **`.latte/learn-plan/tasks/{{item_id}}.json`**（紧凑 JSON，单个对象）：
+   {
+     "title": "原样照抄骨架的 title（以 chNN 开头）",
+     "description": "学什么 + 验收标准，≤ 60 字；验收写「能讲清/能推出什么」，不写行号；提到其他章只写 chNN，且只许提先修链上的前序章",
+     "priority": 2,
+     "labels": ["学习", "只读", "<本章 bian 原文>", "<骨架 layer 原文>"],
+     "task_type": "<原样照抄骨架的 task_type>",
+     "workflow": "",
+     "depends_on": [ /* 原样照抄骨架的 depends_on */ ],
+     "paths": [ /* 原样照抄骨架 paths，只保留核实过存在的 */ ],
+     "subtasks": []
+   }
+
+硬规则：
+- `title` / `depends_on` **原样照抄骨架**（装配时引擎也会以骨架为准覆盖，你别改——改了只会被覆盖回去，白费 token）。
+- `labels` 必须含「学习」「只读」，并带**且只有一个**层级标签（层-地基 / 层-树干 / 层-枝干 / 层-树叶，照抄骨架的 layer）。
+- 枝干章的 description **以「回应事实N：」开头**（照抄骨架的 responds_to），这句要一路传给后面精读这一章的流程，别省。
+- `description` 提到其他章只能写 chNN，且只许提本章骨架 `depends_on` **直接列出**的章；要用后章才讲的产物（如基准），别写进本章验收。
+- 返工反馈若要求改 title / depends_on（如"depends_on 增加 chNN"），**你改不了**：不要在 description 里引用不在 depends_on 里的章，改写成不依赖它的表述，并在产出正文里说明"该项需改骨架"。
+- **精读章必须有 paths**（1-4 个源码文件）：paths 留空会让体量检查失效，精读时也不知道读哪儿。每个路径都必须是你用 `ls` / `search` 亲眼确认存在的——不要凭类名猜文件名（类名 ≠ 文件名）。确认不了就换一个确认存在的；实在没有就如实留空并在正文里说明。
+- 只写这一个文件，产出正文随便写一句确认即可（真正的交付是落盘 JSON）。"""
+
+[steps.fan_out]
+file = ".latte/learn-plan/chapters.json"
+items = "chapters"
+id_key = "id"
+max_items = 60
+# 扇出前骨架校验：章号连续 / depends_on 只指向前序章 / brief·accept 的跨章
+# 引用在先修闭包内。坏骨架在派发任何子会话之前就失败（省掉整轮 ~11 分钟扇出）。
+require_learn_chapters = true
+# 增量扇出：tasks/<chNN>.json 已存在且不早于 chapters.json → 跳过。
+# 断点续扇只补缺章；定向返工时 gate 删掉被点名章的文件，这里只重做它们；
+# breakdown 重写骨架后 mtime 变新，旧产物全部失效、全量重做。
+skip_fresh = ".latte/learn-plan/tasks/{{item_id}}.json"

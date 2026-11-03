@@ -294,6 +294,10 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // 写白名单 / fan_out 同样只在 TOML 权威版可配。
                 write_path_allowlist: vec![],
                 fan_out: None,
+                collect_plan_tasks: None,
+                no_advisor: false,
+                gate_invalidate: None,
+                require_learn_skeleton: None,
                 prompt_token_budget: s.prompt_token_budget,
                 prompt_token_ratio: s.prompt_token_ratio,
                 loop_until: None,
@@ -334,6 +338,15 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 require_citations_observed: false,
                 patch_from: None,
                 submit_plan_from: None,
+                // 学习章节号校验 / 结构化裁决 / 机械终审门 / 收敛度量 /
+                // 历史反馈同样只在 TOML 权威版可配（零值 = 现状行为）。
+                require_learn_chapters: false,
+                require_verdict_json: false,
+                gate_from: None,
+                gate_attach: None,
+                loop_progress_marker: None,
+                max_iterations_on_progress: None,
+                loop_carry_history: false,
                 // step 级工具过滤仅 TOML 权威版可配；表单编辑器不支持，
                 // 试运行给空（= 角色全集）。
                 tools: vec![],

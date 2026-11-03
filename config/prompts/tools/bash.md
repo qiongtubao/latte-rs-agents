@@ -1,3 +1,7 @@
+<!-- SUMMARY -->
+运行构建、测试、Git 与进程管理命令，并捕获标准输出和错误。
+<!-- /SUMMARY -->
+<!-- DETAILS -->
 <instruction>
 - Use for: running build commands, tests, git operations, installing dependencies, process management.
 - Prefer dedicated tools when available: `read` for file content, `search` for pattern matching, `write` for file creation/editing, `code_graph` for code structure.
@@ -13,3 +17,5 @@
 - Capture both stdout and stderr when diagnosing failures.
 - Avoid interactive commands (no vim, less, man with pager).
 </critical>
+
+<!-- /DETAILS -->

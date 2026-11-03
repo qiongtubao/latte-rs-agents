@@ -1,3 +1,7 @@
+<!-- SUMMARY -->
+启动实施计划、测试开发或代码审查等多步骤结构化流程。
+<!-- /SUMMARY -->
+<!-- DETAILS -->
 <instruction>
 - Use to launch multi-step structured processes: implementation_plan, tdd_development, code_review, explore, etc.
 - Choose the workflow that best matches the task complexity. Simple tasks don't need workflows.
@@ -10,3 +14,5 @@
 - If a workflow fails, diagnose the root cause before restarting or falling back to manual dispatch.
 - Disclose workflow failures to the user — never silently degrade to manual execution.
 </critical>
+
+<!-- /DETAILS -->

@@ -82,7 +82,7 @@ done
 for f in "$SOURCE_DIR/config/prompts/"*.md; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
-    if [ -f "$SOURCE_DIR/prompts/$name" ]; then continue ;; fi
+    if [ -f "$SOURCE_DIR/prompts/$name" ]; then continue; fi
     case "$name" in
         manager.md|advisor.md) continue ;;
     esac
@@ -99,8 +99,10 @@ done
 echo "  ✅ Prompts: $count 个提示词文件（跳过 manager/advisor，由内置基座兜底）"
 
 # 3. 同步模型和讨论配置
-for f in "$SOURCE_DIR/.latte/"*.toml; do
-    [ -f "$f" ] && cp "$f" "$TARGET_DIR/.latte/"
+#    权威源：config/models.toml（模型编目）。项目级 .latte/*.toml 副本已移除，
+#    模型编目仍按各机器本地维护（api_key / base_url 不同），但目录结构一致。
+for f in "$SOURCE_DIR/config/models.toml"; do
+    [ -f "$f" ] && cp "$f" "$TARGET_DIR/.latte/models.toml"
 done
 echo "  ✅ Configs: 模型/讨论配置"
 

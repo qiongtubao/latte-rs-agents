@@ -1,2 +1,8 @@
+# pnpm 要求 pnpm-workspace.yaml 必须有非空 packages 字段，否则任何
+# pnpm 命令都会报 ERR_PNPM_INVALID_WORKSPACE_CONFIGURATION。
+# 本目录是单包项目，根即 workspace 根。
+packages:
+  - "."
+
 allowBuilds:
   esbuild: true

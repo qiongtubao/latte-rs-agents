@@ -1,3 +1,7 @@
+<!-- SUMMARY -->
+将独立子任务分派给合适的专家角色，并在完成后综合核对结果。
+<!-- /SUMMARY -->
+<!-- DETAILS -->
 <instruction>
 - Use to assign subtasks to specialist roles (programmer, architect, reviewer, tester, etc.).
 - Provide clear task description with: goal, scope, acceptance criteria. Do NOT include specific commands or tool usage instructions.
@@ -12,3 +16,5 @@
 - Each delegated task must be independently verifiable — don't delegate steps that depend on your unreturned context.
 - Wait for ALL specialists to return before giving final answers to the user.
 </critical>
+
+<!-- /DETAILS -->

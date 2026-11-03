@@ -1,3 +1,7 @@
+<!-- SUMMARY -->
+使用 Playwright 进行浏览器自动化、端到端测试和截图交互。
+<!-- /SUMMARY -->
+<!-- DETAILS -->
 <instruction>
 - Use for: browser automation, e2e testing, screenshot capture, web page interaction.
 - Write focused scripts that test one behavior per call.
@@ -10,3 +14,5 @@
 - NEVER assume page load is instant — use proper waitFor/expect patterns.
 - NEVER hard-code timeouts without justification — prefer condition-based waiting.
 </critical>
+
+<!-- /DETAILS -->

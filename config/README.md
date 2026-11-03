@@ -6,21 +6,34 @@
 
 | 目录 | 内容 | 同步目标 |
 | ---- | ---- | -------- |
-| `config/workflows/` | 全部 workflow 定义（精致化中文版本，与 `.latte/workflows.d/` 内容一致） | 目标机 `.latte/workflows.d/` |
-| `config/agents/` | 全部角色配置（含注释的权威版；`archive/` 是已归档的冗余角色） | 目标机 `.latte/agents.d/` |
-| `config/prompts/` | 全部角色 prompt（精致化中文版本，与仓库根 `prompts/` 运行时副本一致） | 目标机 `prompts/` |
+| `config/workflows/` | 全部 workflow 定义（精致化中文版本） | 全局 `~/.latte/workflows.d/` |
+| `config/agents/` | 全部角色配置（含注释的权威版；`archive/` 是已归档的冗余角色） | 全局 `~/.latte/agents.d/` |
+| `config/prompts/tools/` | 全部工具说明 md（带 `SUMMARY`/`DETAILS` 标记） | 全局 `~/.latte/tools.d/` |
+| `config/task_types.toml` | 任务类型注册表 | 全局 `~/.latte/task_types.toml` |
 
-**编辑约定**：改 prompt/workflow/角色配置时先改 `config/` 下的权威版，
-再复制到运行时副本（`prompts/`、`.latte/workflows.d/`、`.latte/agents.d/`），
-与 `scripts/sync-config.sh` 的推送方向保持一致。
+**权威源唯一**（2026-10-31 起）：本仓库**不再保留项目级运行时副本**
+（`.latte/agents.d/`、`.latte/workflows.d/`、`.latte/prompts.d/`、`.latte/tools.d/`）。
+运行时统一从全局层 `~/.latte/` 加载，由 `scripts/sync-global.sh` 从本仓库的
+`config/` 同步过去。
+
+原先「权威版 + 项目副本」两份的配置，运行时加载的是**项目副本**——改了
+权威版忘了同步副本，运行时跑的是旧版（`workflow_copies_do_not_drift` 那条
+测试就是为此而写）。副本没了，这个风险从根上消失。
+
+**编辑约定**：改 prompt/workflow/角色配置时改 `config/` 下的权威版，
+再跑 `scripts/sync-global.sh` 推到全局层；项目根的 `prompts/` 是角色提示词的
+**编译期源**（`core/src/prompts.rs` 的 `include_str!`），改它要重新构建二进制。
 
 **不同步**：`config/models.toml` 与 `~/.latte/models.d/`——`api_key`
 等机密留在各机器本地，模型编目由每台机器自行维护。`.latte/agents.d/`
 里的 `model_chain`/`temperature` 也是**本机调优值**，不回灌 `config/`
 （权威版固定 `deepseek-v4-flash` 链以保证可移植的确定性解析）。
 
-同步脚本：`scripts/sync-config.sh [目标项目路径]`（推 config/agents +
-prompts 到目标项目的 `.latte/`）。
+同步脚本：
+- `scripts/sync-global.sh` —— 把本仓库的 `config/` 推到**全局层** `~/.latte/`
+  （角色保留本机 `model_chain` 调优值；workflows 全量覆盖）。
+- `scripts/sync-config.sh [目标项目路径]` —— 把 `config/agents` + `prompts/`
+  推到**另一个项目**的 `.latte/`。
 
 ## 运行时分层
 
@@ -28,12 +41,15 @@ prompts 到目标项目的 `.latte/`）。
 > bundle for new projects. It is **not** read by `latte-agent` at
 > runtime in the `latte-rs-agents` repo itself.
 >
-> At runtime, `latte-agent` reads from the **project root**:
+> At runtime, `latte-agent` reads from the **global layer** `~/.latte/`
+> (falling back to the project layer when a project still ships its own copies):
 >
-> - `.latte/agents.d/` (per-role TOML files)
-> - `.latte/models.d/` (model catalog)
-> - `.latte/workflows.d/` (per-workflow TOML files)
-> - `prompts/` (per-role prompt markdown)
+> - `~/.latte/agents.d/` (per-role TOML files)
+> - `~/.latte/models.d/` (model catalog)
+> - `~/.latte/workflows.d/` (per-workflow TOML files)
+> - `~/.latte/prompts.d/` (per-role prompt overrides)
+> - `~/.latte/tools.d/` (tool documentation)
+> - `prompts/` (per-role prompt markdown, resolved relative to the project root)
 > - `.latte/ui-sessions/` (chat session logs)
 >
 > The actual config files at runtime live in `.latte/` 与 `prompts/`。`config/`
@@ -46,8 +62,8 @@ prompts 到目标项目的 `.latte/`）。
 All role prompts (`prompts/*.md`) and workflows (`.latte/workflows/*.toml`)
 in this repo are written in **Simplified Chinese**. They are the source
 of truth that `latte-agent` compiles into the binary via
-`include_str!`, and they are mirrored to `.latte/prompts.d/` and
-`~/.latte/prompts.d/` for the runtime override chain.
+`include_str!`, and they are mirrored to `~/.latte/prompts.d/` for the
+runtime override chain.
 
 If you want to ship your own role definitions or workflows in a different
 language, the layering is:

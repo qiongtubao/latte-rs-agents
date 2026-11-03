@@ -25,7 +25,7 @@ LATTE_AGENT = os.environ.get("LATTE_AGENT", "./target/release/latte-agent")
 # Prompt patterns chat uses in interactive REPL mode:
 #   "› 👔 manager · MiniMax-M3 › " (role prompt, waiting for next user line)
 #   "answer › " (ask tool blocking prompt)
-ROLE_PROMPT_RE = re.compile(r"›\s*👔\s*manager\s*·\s*\w+\s*›\s*$")
+ROLE_PROMPT_RE = re.compile(r"›\s*👔\s*manager\s*·\s*[\w.\-]+\s*›\s*$")
 ANSWER_PROMPT_RE = re.compile(r"answer\s*[›>]\s*$")
 
 # Ask option lines look like:  "  1) Label" then optional "     Description"

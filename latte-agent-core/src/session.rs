@@ -342,10 +342,7 @@ impl SessionManager {
     /// 换一个时间戳，靠它做 `session_path().exists()` 恒为 false——
     /// 跨进程 resume 永远找不到旧记录。这里按 `record.task_id` 匹配
     /// （而不是文件名前缀），返回最新那条。
-    pub fn find_latest_record(
-        worktree_root: &Path,
-        task_id: &str,
-    ) -> Option<SessionRecord> {
+    pub fn find_latest_record(worktree_root: &Path, task_id: &str) -> Option<SessionRecord> {
         let sessions_dir = worktree_root.join(".latte").join("sessions");
         let entries = std::fs::read_dir(&sessions_dir).ok()?;
         let mut best: Option<(std::time::SystemTime, SessionRecord)> = None;

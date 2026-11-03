@@ -4038,7 +4038,10 @@ impl AgentRunner {
             // 每个 model call 前检查，超时时优雅退出、返回已有 partial。
             if let Some(dl) = self.deadline {
                 if std::time::Instant::now() >= dl {
-                    tracing::info!(round, "deadline exceeded, returning partial output or error");
+                    tracing::info!(
+                        round,
+                        "deadline exceeded, returning partial output or error"
+                    );
                     deadline_hit = true;
                     break;
                 }
@@ -4823,7 +4826,10 @@ impl AgentRunner {
                 const READ_ONLY_NUDGE_THRESHOLD: usize = 20;
                 if read_only_streak >= READ_ONLY_NUDGE_THRESHOLD && !read_only_nudge_sent {
                     read_only_nudge_sent = true;
-                    tracing::warn!(read_only_streak, "read-only tool streak threshold reached; injecting steer nudge");
+                    tracing::warn!(
+                        read_only_streak,
+                        "read-only tool streak threshold reached; injecting steer nudge"
+                    );
                     messages.push(Message::user(format!(
                         "【系统提醒】你已连续执行了 {} 次只读查询（read/search/glob），但尚未对目标文件调用任何编辑工具（edit/write）。\n\
                          请立即停止继续发散检索，基于当前已掌握的依据，针对已确认的问题调用 edit 或 write 工具开始落盘修改！",
@@ -6167,7 +6173,10 @@ mod tests {
         // 要求保留 6 条——但体积预算是 24KB，所以即使条数未超，更早的也必须被压缩
         let n = compact_stale_tool_results(&mut msgs, 6);
         assert!(n >= 1, "超出 24KB 累积体积的较早结果必须被压缩: {n}");
-        assert!(msgs[1].as_text().contains("中段省略"), "t1 必须被压缩以腾出空间");
+        assert!(
+            msgs[1].as_text().contains("中段省略"),
+            "t1 必须被压缩以腾出空间"
+        );
     }
 
     /// 压缩必须**留头留尾**：换成占位符会让模型认不出读过什么，转头
@@ -8834,7 +8843,11 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            AgentError::DeadlineExceeded { tool_rounds, last_tool, .. } => {
+            AgentError::DeadlineExceeded {
+                tool_rounds,
+                last_tool,
+                ..
+            } => {
                 assert_eq!(tool_rounds, 0);
                 assert_eq!(last_tool.as_deref(), None, "启动时已超时，尚未执行任何工具");
             }
@@ -8988,9 +9001,9 @@ mod tests {
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
         };
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
-        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
             Box::pin(async move { Ok(serde_json::json!({ "content": "file text" })) })
@@ -9051,7 +9064,10 @@ mod tests {
         )
         .unwrap();
         let mut runner = AgentRunner::new_with_tools(agent, tm);
-        let res = runner.run_turn(&[Message::user("do work")], None).await.unwrap();
+        let res = runner
+            .run_turn(&[Message::user("do work")], None)
+            .await
+            .unwrap();
         assert!(res.contains("I will edit now and done."));
     }
 
@@ -12460,7 +12476,10 @@ tools = ["read", "write"]
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
                     .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body("## Primary Request and Intent\n- compacted", vec![]),
+                        openai_completion_body(
+                            "## Primary Request and Intent\n- compacted",
+                            vec![],
+                        ),
                     )),
             )
             .await;
@@ -12492,7 +12511,10 @@ tools = ["read", "write"]
         let response = runner.run_turn(&[Message::user("go")], None).await;
         std::env::remove_var("LATTE_AGENT_COMPACT_KEEP_RECENT_TURNS");
 
-        assert!(response.is_ok(), "forced compact should make the request fit: {response:?}");
+        assert!(
+            response.is_ok(),
+            "forced compact should make the request fit: {response:?}"
+        );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(
             requests.len(),
@@ -12552,7 +12574,9 @@ tools = ["read", "write"]
                 .context_mut()
                 .push(Message::tool_result(&format!("t{i}"), &big));
         }
-        runner.context_mut().push(Message::user("read these chunks"));
+        runner
+            .context_mut()
+            .push(Message::user("read these chunks"));
 
         let response = runner.run_turn(&[], None).await;
 

@@ -13696,16 +13696,12 @@ mod tests {
                 .map(|t| t.as_str().unwrap_or_default().to_string())
                 .collect()
         };
-        for (raw, label) in [
-            (
-                include_str!("../../config/agents/programmer.toml"),
-                "config/agents",
-            ),
-            (
-                include_str!("../../.latte/agents/programmer.toml"),
-                ".latte/agents",
-            ),
-        ] {
+        // .latte/agents/ 运行时副本已移除（2026-10-31 改为只用全局配置），
+        // 只校验权威版 config/agents/。
+        for (raw, label) in [(
+            include_str!("../../config/agents/programmer.toml"),
+            "config/agents",
+        )] {
             let tools = tools_of(raw, label);
             assert!(
                 tools.iter().any(|t| t == "ask"),
@@ -16791,17 +16787,16 @@ require = ["永远不可能出现的验收字符串"]
         let mgr = build_tool_manager(&["read".into()]).await.unwrap();
 
         let out = mgr
-            .execute(
-                "read",
-                serde_json::json!({"paths": paths}),
-                None,
-            )
+            .execute("read", serde_json::json!({"paths": paths}), None)
             .await
             .expect("budgeted batch read");
         // 单读 50KiB → 每条 JSON ~50KB；192KB budget 只够装 3 条，
         // 第 4、5 条进 failed（110KB 原文被 50KiB 截断，JSON ~50KB）。
-        assert_eq!(out["files"].as_array().unwrap().len(), 3,
-            "batch budget 192KB 应只装下 3 条 ~50KB JSON");
+        assert_eq!(
+            out["files"].as_array().unwrap().len(),
+            3,
+            "batch budget 192KB 应只装下 3 条 ~50KB JSON"
+        );
         let failed = out["failed"].as_array().unwrap();
         assert_eq!(failed.len(), 2, "第 4、5 条应进 failed");
         assert_eq!(failed[0]["path"], paths[3]);

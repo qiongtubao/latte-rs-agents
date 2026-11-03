@@ -1,0 +1,10 @@
+# 自动上下文压缩参数（UI 设置面板写入）。
+# 缺席的键 = 未配置，交给下层（global）或内置默认。
+# 优先级：环境变量 > 项目配置 > 全局配置 > 内置默认。
+[compaction]
+enabled = true
+threshold_ratio = 0.8
+keep_recent_turns = 2
+summary_max_tokens = 2048
+max_passes = 1
+sections = ["Primary Request and Intent", "Key Technical Concepts", "Files and Code", "Errors and Fixes", "Pending Jobs", "Current Work", "Next Step", "Critical Context"]

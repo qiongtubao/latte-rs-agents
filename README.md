@@ -180,7 +180,7 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 #### 压缩参数也可写在配置文件里
 
 上面 6 个环境变量都能改成 `[compaction]` 配置段，写在任意 agents 配置文件
-（项目 `.latte/agents.d/*.toml` 或全局 `~/.latte/agents.d/*.toml`）：
+（全局 `~/.latte/agents.d/*.toml`；项目仍带 `.latte/agents.d/` 副本时以项目层为准）：
 
 ```toml
 [compaction]
@@ -574,7 +574,8 @@ delegate 据此降级采纳，不会把前面几十轮的成果一起丢掉。
 ## 工具说明（tool docs）
 
 模型在 schema 里读到的工具说明 = **基线描述**（代码里写死）+ **项目/全局 md**
-（`.latte/tools.d/<工具名>.md`）。md 首行是一句话简介，其后是细则；可以用
+（`.latte/tools.d/<工具名>.md`，本仓库的权威源是 `config/prompts/tools/`）。
+md 首行是一句话简介，其后是细则；可以用
 `{{#if has_eval}}…{{/if}}` 按当前会话真实可用的工具改写内容。
 
 在 Web UI 的 Tools 面板里直接编辑：保存后**就地刷新所有活跃会话**

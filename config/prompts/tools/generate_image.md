@@ -1,3 +1,7 @@
+<!-- SUMMARY -->
+根据详细提示创建图表、模型图、插图等视觉资源。
+<!-- /SUMMARY -->
+<!-- DETAILS -->
 <instruction>
 - Use for: creating diagrams, mockups, visual assets, or illustrations requested by the user.
 - Provide detailed, specific prompts describing the desired image content, style, and dimensions.
@@ -8,3 +12,5 @@
 - NEVER generate images unless the user explicitly requests visual content or the task clearly requires it.
 - NEVER use vague prompts — be specific about composition, style, colors, and content.
 </critical>
+
+<!-- /DETAILS -->
