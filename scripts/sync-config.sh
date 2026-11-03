@@ -8,7 +8,7 @@
 #
 # 同步内容:
 #   - config/agents/*.toml  → .latte/agents.d/ 和 .latte/agents/
-#   - config/prompts/*.md   → <目标项目根>/prompts/（运行时按 prompt_file 相对路径解析，只读这里；.latte/prompts/ 不被读取）
+#   - prompts/*.md          → <目标项目根>/prompts/（运行时按 prompt_file 相对路径解析，只读这里；.latte/prompts/ 不被读取）
 #   - .latte/*.toml         → .latte/
 
 set -euo pipefail
@@ -58,16 +58,31 @@ PYEOF
 done
 echo "  ✅ Agents: $count 个角色配置（已有文件保留本机 model_chain）"
 
-# 2. 同步 prompts（权威源：config/prompts/）
+# 2. 同步 prompts（权威源：仓库根的 prompts/）
 #    运行时解析 prompt_file（如 "prompts/manager.md"）时按目标项目根目录的
 #    相对路径读取，因此必须同步到 <target>/prompts/，而不是 .latte/prompts/。
 #    例外：manager/advisor 是基础设施角色，prompt 由二进制内置基座兜底、
 #    用户文件只追加（见 role.rs is_infrastructure_role）——同步它们的拷贝
 #    只会在基座更新后变成陈旧追加，故跳过。
+#    权威源取仓库根 prompts/：它与二进制内置基座（core/src/prompts.rs 的
+#    include_str!("../../prompts/*.md")）同源，且是完整集合；config/prompts/
+#    只是历史镜像（实测其 tutor.md 落后于仓库根版本，proofreader.md 甚至缺失），
+#    只在仓库根缺该文件时兜底。
 mkdir -p "$TARGET_DIR/prompts"
 count=0
-for f in "$SOURCE_DIR/config/prompts/"*.md; do
+for f in "$SOURCE_DIR/prompts/"*.md; do
+    [ -f "$f" ] || continue
     name="$(basename "$f")"
+    case "$name" in
+        manager.md|advisor.md) continue ;;
+    esac
+    cp "$f" "$TARGET_DIR/prompts/"
+    count=$((count + 1))
+done
+for f in "$SOURCE_DIR/config/prompts/"*.md; do
+    [ -f "$f" ] || continue
+    name="$(basename "$f")"
+    if [ -f "$SOURCE_DIR/prompts/$name" ]; then continue ;; fi
     case "$name" in
         manager.md|advisor.md) continue ;;
     esac
