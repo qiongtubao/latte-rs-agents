@@ -22,7 +22,7 @@
 # write，且本就是 learn_loop 里落盘 plan.json 的角色。
 
 name = "learn_book_pages"
-description = "learn_plan 内层：出书骨架 chapters.json，再按章扇出逐章细化为 tasks/<chNN>.json（供外层装配）"
+description = "learn_plan 内层：出书骨架 chapters.json，再按章扇出逐章细化为 tasks/<chNN>.json（供外层装配）｜落点：.latte/learn-plan/{chapters.json,tasks/<chNN>.json}"
 max_rounds = 1
 
 # ── breakdown：出全书骨架（prose 结构说明 + 落盘 chapters.json）──────────
