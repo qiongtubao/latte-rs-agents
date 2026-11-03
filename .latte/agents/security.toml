@@ -1,9 +1,0 @@
-[roles.security]
-id = "security"
-name = "Security Auditor"
-category = "verification"
-model_tier = "standard"
-prompt_file = "prompts/security.md"
-temperature = 0.4
-tools = ["read", "search"]
-icon = "🛡️"
