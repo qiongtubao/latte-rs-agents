@@ -2157,14 +2157,46 @@ select {
 /* ─── scrollbar polish ────────────────────────────────────────── */
 
 .message-list::-webkit-scrollbar {
-  width: 4px;
+  width: 10px;
 }
 .message-list::-webkit-scrollbar-track {
   background: transparent;
 }
 .message-list::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
+  background: #94a3b8;
   border-radius: 12px;
+}
+.message-list::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* ─── scroll-to-bottom button ─────────────────────────────────── */
+
+.scroll-bottom-btn {
+  position: absolute;
+  right: 18px;
+  bottom: 84px;
+  z-index: 30;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border, #e2e8f0);
+  background: #ffffff;
+  color: #475569;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.15);
+  transition: opacity 150ms, transform 150ms;
+}
+.scroll-bottom-btn:hover {
+  background: #f1f5f9;
+  color: #1e293b;
+}
+.scroll-bottom-btn.hidden-scroll-btn {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(6px);
 }
 
 /* ─── highlight flash for reference jumps ─────────────────────── */

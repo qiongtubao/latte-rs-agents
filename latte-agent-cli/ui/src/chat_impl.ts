@@ -473,9 +473,35 @@ export function mountChat(opts: {
     const el = container.messagesEl;
     return el.scrollHeight - el.scrollTop - el.clientHeight < 80;
   }
-  function scrollToBottom(): void {
-    container.messagesEl.scrollTop = container.messagesEl.scrollHeight;
+  function scrollToBottom(smooth = true): void {
+    const el = container.messagesEl;
+    if (!smooth) {
+      // 关闭 CSS smooth-scroll 后瞬时跳底：按钮点击走这条路径，避免
+      // 长列表平滑滚动期间 scrollTop 未达 scrollHeight 被误判「没到底」。
+      const prev = el.style.scrollBehavior;
+      el.style.scrollBehavior = "auto";
+      el.scrollTop = el.scrollHeight;
+      el.style.scrollBehavior = prev;
+    } else {
+      el.scrollTop = el.scrollHeight;
+    }
   }
+  // ── scroll-to-bottom floating button ──
+  // 「跳到最新消息」：smart-scroll 只在贴近底部时才自动跟随，用户上翻
+  // 长历史后靠这枚按钮一键回到最底部。贴近底部时自动隐藏。
+  const scrollBottomBtn = document.createElement("button");
+  scrollBottomBtn.type = "button";
+  scrollBottomBtn.className = "scroll-bottom-btn hidden-scroll-btn";
+  scrollBottomBtn.title = "跳到最后一条消息";
+  scrollBottomBtn.textContent = "↓";
+  scrollBottomBtn.addEventListener("click", () => {
+    scrollToBottom(false);
+  });
+  const chatHost = container.messagesEl.parentElement;
+  if (chatHost) chatHost.appendChild(scrollBottomBtn);
+  container.messagesEl.addEventListener("scroll", () => {
+    scrollBottomBtn.classList.toggle("hidden-scroll-btn", isNearBottom());
+  });
 
   // ── addMessage: render a message into the chat ──
   function addMessage(opts2: {
