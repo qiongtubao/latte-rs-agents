@@ -1614,6 +1614,8 @@ async fn build_runner(
                 .with_role(role_id),
         )
     };
+    let mut runner = runner;
+    runner.set_request_budget(latte_agent_core::workflow::top_level_request_budget());
     Ok((runner, role_id.to_string()))
 }
 
@@ -3059,6 +3061,10 @@ async fn register_delegate_tool(
                 if let Some(state) = specialist_todo {
                     runner = runner.with_todo_state(state);
                 }
+                let graceful_timeout_s = timeout_s.saturating_sub(timeout_s.min(5)).max(1);
+                runner.set_deadline(
+                    std::time::Instant::now() + Duration::from_secs(graceful_timeout_s),
+                );
                 runner.set_request_budget(latte_agent_core::workflow::delegate_request_budget());
                 let msgs = vec![Message {
                     role: MsgRole::User,

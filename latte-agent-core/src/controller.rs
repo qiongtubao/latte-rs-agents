@@ -4300,6 +4300,7 @@ async fn build_runner(
             tier,
             role.model_chain.clone(),
         );
+        runner.set_request_budget(crate::workflow::top_level_request_budget());
         Ok((runner, role_id.to_string()))
     } else {
         // ── 给主 runner 分配 subsession sink（同上） ──
@@ -4340,6 +4341,7 @@ async fn build_runner(
             tier,
             role.model_chain.clone(),
         );
+        runner.set_request_budget(crate::workflow::top_level_request_budget());
         Ok((runner, role_id.to_string()))
     }
 }
@@ -6276,14 +6278,13 @@ pub fn default_max_auto_remediations() -> u32 {
 
 /// 单 session 累计 delegate 工具调用上限。env `LATTE_MAX_DELEGATES_PER_SESSION`
 /// 覆盖；非法值回退到默认。0 = 禁用限制（无上限）。
-/// 详见 `docs/perf/diagnose-latency.md` §5（#1-A 方案）。
+pub const DEFAULT_MAX_DELEGATES_PER_SESSION: u32 = 12;
+
 pub fn default_max_delegates() -> u32 {
     let raw = std::env::var("LATTE_MAX_DELEGATES_PER_SESSION").ok();
     match raw.and_then(|s| s.parse::<u32>().ok()) {
         Some(n) => n,
-        // 默认无限制。delegate 路径有 wall-clock 超时（set_deadline）兜底；
-        // 交互式 chat 没有，按设计由人工 ⏸ / advisor 叫停 + 死循环熔断兜住。
-        None => 0,
+        None => DEFAULT_MAX_DELEGATES_PER_SESSION,
     }
 }
 /// delegate 递归深度上限的内置默认值。
@@ -6568,6 +6569,12 @@ pub(crate) fn propose_plan_from_summary(
     let Some(tasks) = extract_plan_tasks(summary) else {
         return false;
     };
+    if let Err(error) = validate_plan_dependencies(&tasks) {
+        let _ = event_tx.send(ChatEvent::Status {
+            message: format!("Workflow 产出的任务清单依赖图无效，未提交导入弹窗：{error}"),
+        });
+        return false;
+    }
     let plan_id = next_plan_id(role_id);
     *plan_stage.write() = PlanStage::PendingApproval {
         plan_id: plan_id.clone(),
@@ -6609,6 +6616,170 @@ fn walk_plan_tasks(tasks: &[PlanTask], f: &mut impl FnMut(&PlanTask)) {
         f(t);
         walk_plan_tasks(&t.subtasks, f);
     }
+}
+
+/// 提交 plan 前校验整棵任务树的标题依赖图。后端导入会把标题引用解析成
+/// 新任务 id，但如果等到用户点「导入」才发现悬空、歧义或成环，模型已经
+/// 离场，且旧的两趟导入实现可能已经写下一部分任务。这里先用与后端一致的
+/// 标题规则（trim、截 80 字符、忽略大小写）做纯内存 preflight。
+///
+/// 已存在看板任务只能用形如 `LAT-123` 的 id 引用；core 不反向依赖
+/// ui-server，无法在这里检查该 id 是否存在，留给导入后端验证。
+fn validate_plan_dependencies(tasks: &[PlanTask]) -> Result<(), String> {
+    #[derive(Debug)]
+    struct Node {
+        title: String,
+        key: String,
+        parent: Option<usize>,
+        refs: Vec<String>,
+    }
+
+    fn normalized_title(raw: &str) -> String {
+        raw.trim()
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .to_lowercase()
+    }
+
+    fn looks_like_board_id(raw: &str) -> bool {
+        let Some((prefix, seq)) = raw.rsplit_once('-') else {
+            return false;
+        };
+        let mut chars = prefix.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !seq.is_empty()
+            && seq.chars().all(|c| c.is_ascii_digit())
+    }
+
+    fn flatten(tasks: &[PlanTask], parent: Option<usize>, nodes: &mut Vec<Node>) {
+        for task in tasks {
+            let index = nodes.len();
+            nodes.push(Node {
+                title: task.title.trim().chars().take(80).collect(),
+                key: normalized_title(&task.title),
+                parent,
+                refs: task.depends_on.clone(),
+            });
+            flatten(&task.subtasks, Some(index), nodes);
+        }
+    }
+
+    fn is_ancestor(nodes: &[Node], ancestor: usize, mut descendant: usize) -> bool {
+        while let Some(parent) = nodes[descendant].parent {
+            if parent == ancestor {
+                return true;
+            }
+            descendant = parent;
+        }
+        false
+    }
+
+    fn visit(
+        node: usize,
+        nodes: &[Node],
+        edges: &[Vec<usize>],
+        states: &mut [u8],
+        stack: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        match states[node] {
+            2 => return Ok(()),
+            1 => {
+                let start = stack.iter().position(|i| *i == node).unwrap_or(0);
+                let mut cycle = stack[start..]
+                    .iter()
+                    .map(|i| nodes[*i].title.as_str())
+                    .collect::<Vec<_>>();
+                cycle.push(nodes[node].title.as_str());
+                return Err(format!("depends_on 形成环：{}", cycle.join(" → ")));
+            }
+            _ => {}
+        }
+        states[node] = 1;
+        stack.push(node);
+        for &dep in &edges[node] {
+            visit(dep, nodes, edges, states, stack)?;
+        }
+        stack.pop();
+        states[node] = 2;
+        Ok(())
+    }
+
+    let mut nodes = Vec::new();
+    flatten(tasks, None, &mut nodes);
+    let mut by_title: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        by_title.entry(node.key.clone()).or_default().push(index);
+    }
+
+    let mut edges = vec![Vec::new(); nodes.len()];
+    for (owner, node) in nodes.iter().enumerate() {
+        let mut seen = std::collections::HashSet::new();
+        for raw in &node.refs {
+            let reference = raw.trim();
+            if reference.is_empty() {
+                continue;
+            }
+            let key = normalized_title(reference);
+            let target = match by_title.get(&key).map(Vec::as_slice) {
+                Some([one]) => *one,
+                Some(many) if many.len() > 1 => {
+                    return Err(format!(
+                        "任务 {:?} 的 depends_on {:?} 匹配到 {} 个同标题任务，请先改成唯一标题",
+                        node.title,
+                        reference,
+                        many.len()
+                    ));
+                }
+                _ if looks_like_board_id(reference) => continue,
+                _ => {
+                    return Err(format!(
+                        "任务 {:?} 的 depends_on {:?} 既不是本清单唯一标题，也不像看板任务 id",
+                        node.title, reference
+                    ));
+                }
+            };
+            if target == owner {
+                return Err(format!("任务 {:?} 不能依赖自身", node.title));
+            }
+            if is_ancestor(&nodes, target, owner) || is_ancestor(&nodes, owner, target) {
+                return Err(format!(
+                    "任务 {:?} 与依赖 {:?} 是父子/祖孙关系，聚合关系不能再声明为 depends_on",
+                    node.title, nodes[target].title
+                ));
+            }
+            if seen.insert(target) {
+                edges[owner].push(target);
+            }
+        }
+    }
+
+    let mut states = vec![0u8; nodes.len()];
+    let mut stack = Vec::new();
+    for node in 0..nodes.len() {
+        visit(node, &nodes, &edges, &mut states, &mut stack)?;
+    }
+    Ok(())
+}
+
+fn plan_task_count(tasks: &[PlanTask]) -> usize {
+    let mut count = 0;
+    walk_plan_tasks(tasks, &mut |_| count += 1);
+    count
+}
+
+fn plan_dependency_edge_count(tasks: &[PlanTask]) -> usize {
+    let mut count = 0;
+    walk_plan_tasks(tasks, &mut |task| {
+        count += task
+            .depends_on
+            .iter()
+            .filter(|reference| !reference.trim().is_empty())
+            .count();
+    });
+    count
 }
 
 /// plan 清单内 paths 的机械校验（提交前调用，失败则整单拒绝、不进
@@ -7203,6 +7374,9 @@ pub(crate) fn parse_and_validate_plan_tasks(
         tasks.push(pt);
     }
 
+    // 依赖图 preflight 必须早于 paths 重叠判断：后者会把“声明了依赖”的
+    // 任务视为串行并放行重叠；若依赖本身悬空或成环，不能借此绕过校验。
+    validate_plan_dependencies(&tasks)?;
     // paths 机械校验（存在性 + 清单内重叠）：失败整单拒绝——模型可
     // 修正后重提。
     validate_plan_paths(cwd, &tasks)?;
@@ -7314,6 +7488,8 @@ pub(crate) fn submit_plan_proposal(
 
     let plan_id = next_plan_id(role_id);
     let n = tasks.len();
+    let total_tasks = plan_task_count(&tasks);
+    let dependency_edges = plan_dependency_edge_count(&tasks);
     let proposed = ChatEvent::PlanProposed {
         role_id: role_id.to_string(),
         plan_id: plan_id.clone(),
@@ -7337,8 +7513,14 @@ pub(crate) fn submit_plan_proposal(
     *plan_stage.write() = PlanStage::PendingApproval {
         plan_id: plan_id.clone(),
     };
+    let dependency_note = if dependency_edges == 0 && total_tasks > 1 {
+        "⚠️ 本清单声明 0 条依赖边，同层任务默认可并行；若存在先修顺序，请补 depends_on 后重新提交。"
+            .to_string()
+    } else {
+        format!("本清单声明 {dependency_edges} 条依赖边。")
+    };
     Ok(format!(
-        "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。{dropped_note}"
+        "已提交 {n} 个任务候选给用户选择（plan_id={plan_id}）。{dependency_note}请在弹窗中勾选要导入任务看板的项；若弹窗已关闭，可右键本条消息选「导入任务看板」补救。{dropped_note}"
     ))
 }
 
@@ -9441,8 +9623,11 @@ async fn register_delegate_tool(
             let task_content = task.clone();
             // 循环内 deadline（对齐 oh-my-pi）：让 agent 在临近超时时
             // 优雅退出返回 partial，而不是被 tokio timeout abort 丢失产出。
+            // 内层 deadline 比外层 abort 提前最多 5 秒，优先让 runner
+            // 返回携带 partial 的 DeadlineExceeded；外层只兜真正不返回的调用。
+            let graceful_timeout_s = timeout_s.saturating_sub(timeout_s.min(5)).max(1);
             runner.set_deadline(
-                std::time::Instant::now() + std::time::Duration::from_secs(timeout_s),
+                std::time::Instant::now() + std::time::Duration::from_secs(graceful_timeout_s),
             );
             runner.set_request_budget(crate::workflow::delegate_request_budget());
             let delegate_started = std::time::Instant::now();
@@ -10315,6 +10500,10 @@ mod tests {
         assert_eq!(task["required"], serde_json::json!(["title"]));
         assert_eq!(task["properties"]["labels"]["items"]["type"], "string");
         assert_eq!(task["properties"]["paths"]["items"]["type"], "string");
+        assert_eq!(
+            task["properties"]["depends_on"]["items"]["type"], "string",
+            "depends_on 必须作为结构化字符串数组进入 plan schema"
+        );
         assert_eq!(task["properties"]["priority"]["minimum"], 1.0);
         assert_eq!(task["properties"]["priority"]["maximum"], 4.0);
         assert_eq!(
@@ -11993,15 +12182,12 @@ mod tests {
 
     #[test]
     fn default_max_delegates_respects_env_and_default() {
-        // env 缺失 → 0 = 不限制（改自旧默认 12：单 session 的
-        // delegate 次数改由 wall-clock timeout 与死循环熔断兜底，
-        // 不再用一个固定次数硬砍）。
         let _g = lock_env();
         std::env::remove_var("LATTE_MAX_DELEGATES_PER_SESSION");
-        assert_eq!(default_max_delegates(), 0);
+        assert_eq!(default_max_delegates(), DEFAULT_MAX_DELEGATES_PER_SESSION);
         // env 非法 → 回退默认。
         std::env::set_var("LATTE_MAX_DELEGATES_PER_SESSION", "abc");
-        assert_eq!(default_max_delegates(), 0);
+        assert_eq!(default_max_delegates(), DEFAULT_MAX_DELEGATES_PER_SESSION);
         // env 合法 → 用之。
         std::env::set_var("LATTE_MAX_DELEGATES_PER_SESSION", "5");
         assert_eq!(default_max_delegates(), 5);

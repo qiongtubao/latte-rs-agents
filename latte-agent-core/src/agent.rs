@@ -717,6 +717,138 @@ fn ensure_unique_tool_call_ids(calls: &mut [latte_ai::models::ToolCall]) {
         seen.insert(tc.id.clone());
     }
 }
+// ─── ErrorLoopDetector ─────────────────────────────────────────────────────
+
+/// Recursively sort JSON object keys so semantically identical arguments have
+/// one stable fingerprint regardless of provider key order.
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                out.insert(key.clone(), canonical_json(&map[key]));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn normalize_tool_args(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => serde_json::to_string(&canonical_json(&value)).unwrap_or_default(),
+        Err(_) => raw.split_whitespace().collect::<Vec<_>>().join(" "),
+    }
+}
+
+fn is_uuid_like(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+    let parts = token.split('-').collect::<Vec<_>>();
+    parts.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(parts.iter())
+            .all(|(len, part)| part.len() == *len && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn is_duration_like(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| matches!(c, ',' | ';' | ')' | ']' | '}'));
+    for suffix in ["ms", "secs", "sec", "seconds", "second", "s"] {
+        if let Some(number) = token.strip_suffix(suffix) {
+            if !number.is_empty() && number.parse::<f64>().is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Normalize only known volatile fragments. Line numbers, status codes and
+/// paths remain intact because they often distinguish genuinely different
+/// failures and must not be collapsed into one fingerprint.
+fn normalize_tool_error(kind: &ToolCallErrorKind, detail: &str) -> String {
+    let normalized = detail
+        .split_whitespace()
+        .map(|raw| {
+            let lower = raw.to_ascii_lowercase();
+            let volatile_assignment = lower.split_once(['=', ':']).is_some_and(|(key, _)| {
+                matches!(
+                    key.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_'),
+                    "request_id" | "requestid" | "trace_id" | "traceid"
+                )
+            });
+            let trimmed = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            let long_hex = trimmed.len() >= 16 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
+            let iso_time = trimmed.len() >= 20
+                && trimmed.contains('t')
+                && trimmed.ends_with('z')
+                && trimmed.chars().any(|c| c.is_ascii_digit());
+            if volatile_assignment
+                || is_uuid_like(&lower)
+                || long_hex
+                || iso_time
+                || is_duration_like(&lower)
+            {
+                "<volatile>".to_string()
+            } else {
+                lower
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{}:{normalized}", kind.label())
+}
+
+/// Detects repeated *failed* model-issued calls. The older `LoopDetector`
+/// watches calls only and therefore waits for five identical attempts even
+/// when the tool has already returned the same deterministic error every
+/// time. This detector includes the normalized result and stops on the third
+/// identical failure without counting an internal execute retry twice.
+#[derive(Default)]
+struct ErrorLoopDetector {
+    last: Option<(String, String, String)>,
+    streak: usize,
+}
+
+const ERROR_LOOP_BREAK_AT: usize = 3;
+
+impl ErrorLoopDetector {
+    fn record(
+        &mut self,
+        tool_name: &str,
+        normalized_args: &str,
+        normalized_error: String,
+    ) -> Option<String> {
+        let fingerprint = (
+            tool_name.to_string(),
+            normalized_args.to_string(),
+            normalized_error,
+        );
+        if self.last.as_ref() == Some(&fingerprint) {
+            self.streak += 1;
+        } else {
+            self.last = Some(fingerprint);
+            self.streak = 1;
+        }
+        (self.streak >= ERROR_LOOP_BREAK_AT).then(|| {
+            format!(
+                "'{tool_name}' 连续 {} 次以相同参数返回同一错误；继续重试不会产生新信息，停止本次任务",
+                self.streak
+            )
+        })
+    }
+
+    fn reset(&mut self) {
+        self.last = None;
+        self.streak = 0;
+    }
+}
+
 // ─── LoopDetector ─────────────────────────────────────────────────────────
 
 /// Detects when a model is stuck calling the same tool with the
@@ -2362,6 +2494,9 @@ struct OneCallResult {
     id: String,
     /// Terminal result: `Ok(result_str)` or `Err((kind, detail))`.
     outcome: Result<String, (ToolCallErrorKind, String)>,
+    /// Canonical arguments for one model-issued call. Unlike
+    /// `loop_records`, an internal execute retry still counts as one call.
+    normalized_args: String,
     /// `(name, args_json)` recorded per execute attempt, in order.
     /// Replayed into the shared `LoopDetector` by the caller so loop
     /// detection keeps working without sharing `&mut` state across
@@ -2441,6 +2576,7 @@ async fn run_one_tool_call(
         "init".into(),
     ));
     let mut loop_records: Vec<(String, String)> = Vec::new();
+    let mut normalized_args = normalize_tool_args(&tc.args);
     let mut executed_ok = false;
 
     while attempt < max_attempts {
@@ -2565,7 +2701,9 @@ async fn run_one_tool_call(
         let tool_start = Instant::now();
         let exec_result = tm.execute(&full_name, input.clone(), Some(ctx)).await;
         let tool_latency = tool_start.elapsed().as_millis() as u64;
-        let args_json = serde_json::to_string(&input).unwrap_or_else(|_| tc.args.clone());
+        normalized_args = serde_json::to_string(&canonical_json(&input))
+            .unwrap_or_else(|_| normalize_tool_args(&tc.args));
+        let args_json = normalized_args.clone();
         loop_records.push((tc.name.clone(), args_json.clone()));
 
         match exec_result {
@@ -2679,6 +2817,7 @@ async fn run_one_tool_call(
     OneCallResult {
         id: tc.id.clone(),
         outcome: final_outcome,
+        normalized_args,
         loop_records,
         executed_ok,
     }
@@ -3115,6 +3254,7 @@ impl AgentRunner {
         tool_name: &str,
         messages: &mut Vec<Message>,
         loop_detector: &mut LoopDetector,
+        error_loop_detector: &mut ErrorLoopDetector,
         permanent_streak: &mut (String, usize),
         final_response: &str,
         last_substantive_response: &str,
@@ -3168,6 +3308,7 @@ impl AgentRunner {
         };
         match r.outcome {
             Ok(result_str) => {
+                error_loop_detector.reset();
                 if permanent_streak.0 == tool_name {
                     *permanent_streak = (String::new(), 0);
                 }
@@ -3177,6 +3318,20 @@ impl AgentRunner {
                 // 中段省略而非截头：错误分类在头、修复指引在尾，两头都要留。
                 let compacted = compact_middle_out(&detail, MAX_TOOL_ERROR_BYTES);
                 messages.push(Message::tool_result(r.id, with_nudge(compacted.clone())));
+                let normalized_error = normalize_tool_error(&kind, &detail);
+                if let Some(reason) =
+                    error_loop_detector.record(tool_name, &r.normalized_args, normalized_error)
+                {
+                    return Err(AgentError::ToolLoopDetected {
+                        tool: tool_name.to_string(),
+                        reason,
+                        partial: if last_substantive_response.is_empty() {
+                            final_response.to_string()
+                        } else {
+                            last_substantive_response.to_string()
+                        },
+                    });
+                }
                 // 方案 B 跟进：`MalformedArgs` 不再是无声清零的失败。
                 // subsession 修复耗尽了（heuristic 与 LLM 都失败）时也应计入 streak：
                 // 每轮都是合法 JSON 校验失败 + 修复失败 = 同一确定性问题反复重试。
@@ -3391,6 +3546,7 @@ impl AgentRunner {
                                     },
                                     detail,
                                 )),
+                                normalized_args: normalize_tool_args(&calls[idx].args),
                                 loop_records: vec![],
                                 executed_ok: false,
                             });
@@ -3446,6 +3602,7 @@ impl AgentRunner {
                             },
                             detail,
                         )),
+                        normalized_args: normalize_tool_args(&calls[i].args),
                         loop_records: vec![],
                         executed_ok: false,
                     }
@@ -4178,6 +4335,9 @@ impl AgentRunner {
         // 跨 round 的「manager 反复改派同类任务」（参数每次都变）仍归
         // supervisor 的 `dead_loop_window = 3` 管，两者互补不重叠。
         let mut loop_detector = LoopDetector::default();
+        // 相同工具 + 规范化参数 + 规范化错误连续三次即硬停。与上面的
+        // 调用型探测器分开计数，内部 execute retry 只算一次模型调用。
+        let mut error_loop_detector = ErrorLoopDetector::default();
         // 跨 round 的「同一工具连续确定性失败」熔断计数：
         // (工具名, 连续 PermanentExec 次数)。`LoopDetector` 只认参数
         // **完全相同**的重复调用，而模型每次都会改一点参数再撞同一个
@@ -5007,6 +5167,7 @@ impl AgentRunner {
                         &name,
                         &mut messages,
                         &mut loop_detector,
+                        &mut error_loop_detector,
                         &mut permanent_streak,
                         &final_response,
                         &last_substantive_response,
@@ -13294,6 +13455,7 @@ tools = ["read", "write"]
         // instead of getting cleared and looping forever.
         let mut streak = (String::new(), 0);
         let mut detector = LoopDetector::default();
+        let mut error_detector = ErrorLoopDetector::default();
         let role = test_role();
         let agent = Agent::new(
             "tester".into(),
@@ -13316,12 +13478,16 @@ tools = ["read", "write"]
                             },
                             "bad json".into(),
                         )),
+                        // 参数逐轮变化：本测试只验证较宽松的
+                        // permanent_streak，不应被三元组错误熔断先截住。
+                        normalized_args: format!("{{\"attempt\":{i}}}"),
                         loop_records: vec![],
                         executed_ok: false,
                     },
                     "some_tool",
                     &mut msgs,
                     &mut detector,
+                    &mut error_detector,
                     &mut streak,
                     "",
                     "",
@@ -13342,12 +13508,14 @@ tools = ["read", "write"]
                         },
                         "bad json".into(),
                     )),
+                    normalized_args: format!("{{\"attempt\":{PERMANENT_BREAK_AT}}}"),
                     loop_records: vec![],
                     executed_ok: false,
                 },
                 "some_tool",
                 &mut msgs,
                 &mut detector,
+                &mut error_detector,
                 &mut streak,
                 "",
                 "",
@@ -13377,6 +13545,7 @@ tools = ["read", "write"]
         let mut runner = AgentRunner::new(agent).with_tool_fix_event_tx(event_tx);
         let mut streak = (String::new(), 0);
         let mut detector = LoopDetector::default();
+        let mut error_detector = ErrorLoopDetector::default();
         let mut msgs = vec![
             Message::user("Task description"),
             Message::assistant("I will run tool"),
@@ -13405,12 +13574,14 @@ tools = ["read", "write"]
                         },
                         "bad json".into(),
                     )),
+                    normalized_args: "{}".into(),
                     loop_records: vec![],
                     executed_ok: false,
                 },
                 "tool_a",
                 &mut msgs,
                 &mut detector,
+                &mut error_detector,
                 &mut streak,
                 "",
                 "",

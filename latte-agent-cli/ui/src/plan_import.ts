@@ -31,13 +31,15 @@ export interface PlanImportRowInput {
  *
  * 主路径（PlanProposed 弹窗点导入）与补救路径（右键重开弹窗）共用此逻辑。
  *
- * depends_on 走**标题引用**（清单里的新任务还没有 id），所以要跟着弹窗里
- * 的编辑动作重映射：
- * - 目标任务被用户改了标题 → 引用改成新标题（否则后端解析不到，整单 400）；
- * - 目标任务被用户取消勾选（不导入）→ **丢掉这条引用**。这里丢弃是对的：
- *   用户明确不导入那个前置任务，留着引用只会让整单导入失败，或者让任务
- *   永久卡在"等一个不存在的依赖"。
+ * depends_on 走**标题引用**（清单里的新任务还没有 id），所以要跟着弹窗里的
+ * 编辑动作重映射：
+ * - 目标任务被用户改了标题 → 引用改成新标题；
+ * - 目标任务被取消勾选或标题无法唯一匹配 → **拒绝构建导入请求**，绝不
+ *   静默删边。用户可以重新勾选前置任务，或先移除依赖方；
  * - 形如 `LAT-123` 的看板 id 原样保留（引用的是已存在的任务）。
+ *
+ * 函数会在依赖图无法保真时抛出 Error。调用方必须把错误展示给用户，
+ * 不得继续 POST 一个已经丢失 depends_on 的任务数组。
  */
 export function buildSelectedPlanTasks(rows: PlanImportRowInput[]): ImportTask[] {
   return buildWithDepMap(rows, collectImportedTitles(rows));
@@ -47,17 +49,27 @@ export function buildSelectedPlanTasks(rows: PlanImportRowInput[]): ImportTask[]
 const BOARD_ID_RE = /^[A-Za-z][A-Za-z0-9_]*-\d+$/;
 
 /** 递归收集**会被导入**的行：原标题（小写）→ 用户编辑后的最终标题。
- * 与 buildWithDepMap 的跳过规则保持一致（未勾选 / 空标题连子树一起跳）。 */
-function collectImportedTitles(rows: PlanImportRowInput[]): Map<string, string> {
-  const map = new Map<string, string>();
+ * 与 buildWithDepMap 的跳过规则保持一致（未勾选 / 空标题连子树一起跳）。
+ * 重复原标题记为 null；只有依赖真正引用它时才报歧义，避免无依赖的
+ * 同名展示行阻断导入。最终标题重复会让后端标题解析歧义，直接拒绝。
+ */
+function collectImportedTitles(rows: PlanImportRowInput[]): Map<string, string | null> {
+  const map = new Map<string, string | null>();
+  const finalTitles = new Set<string>();
   const walk = (rs: PlanImportRowInput[]): void => {
     for (const r of rs) {
       if (!r.checked) continue;
       const title = r.title.trim();
       if (!title) continue;
       const orig = (r.task.title ?? "").trim().toLowerCase();
-      if (orig) map.set(orig, title);
-      // 同名 key 后者覆盖：重名标题本来就无法靠标题区分，后端也会判歧义。
+      if (orig) {
+        map.set(orig, map.has(orig) ? null : title);
+      }
+      const finalKey = title.toLowerCase();
+      if (finalTitles.has(finalKey)) {
+        throw new Error(`导入后的任务标题重复，依赖无法唯一解析：${title}`);
+      }
+      finalTitles.add(finalKey);
       if (r.subRows) walk(r.subRows);
     }
   };
@@ -65,23 +77,31 @@ function collectImportedTitles(rows: PlanImportRowInput[]): Map<string, string> 
   return map;
 }
 
-/** 依赖引用重映射：改过的标题跟着改，没导入的引用丢掉，看板 id 原样留。 */
-function remapDeps(refs: string[] | undefined, titles: Map<string, string>): string[] | undefined {
+/** 依赖引用重映射：改过的标题跟着改，看板 id 原样保留；任何无法匹配
+ * 的标题引用都报错。静默删除会把“有先修关系”改成“可并行”，比导入失败
+ * 更危险。 */
+function remapDeps(refs: string[] | undefined, titles: Map<string, string | null>): string[] | undefined {
   if (!refs || refs.length === 0) return undefined;
   const out: string[] = [];
   for (const raw of refs) {
     const r = raw.trim();
     if (!r) continue;
-    const mapped = titles.get(r.toLowerCase());
+    const key = r.toLowerCase();
+    const mapped = titles.get(key);
     if (mapped) out.push(mapped);
-    else if (BOARD_ID_RE.test(r)) out.push(r);
+    else if (titles.has(key)) {
+      throw new Error(`依赖目标标题重复，无法唯一解析：${r}`);
+    } else if (BOARD_ID_RE.test(r)) out.push(r);
+    else {
+      throw new Error(`依赖目标未选中、已改成无法匹配的标题或不存在：${r}`);
+    }
   }
   return out.length > 0 ? out : undefined;
 }
 
 function buildWithDepMap(
   rows: PlanImportRowInput[],
-  titles: Map<string, string>,
+  titles: Map<string, string | null>,
 ): ImportTask[] {
   const out: ImportTask[] = [];
   for (const r of rows) {

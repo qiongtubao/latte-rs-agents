@@ -180,21 +180,19 @@ describe("buildSelectedPlanTasks：多层嵌套勾选树", () => {
     expect(out[1].depends_on).toEqual(["写 ringbuf 测试（改名后）"]);
   });
 
-  it("依赖的目标行未勾选 -> 丢掉该引用（否则整单导入 400 / 永久卡等待）", () => {
-    const out = buildSelectedPlanTasks([
+  it("依赖的目标行未勾选 -> 拒绝导入，不能静默删边", () => {
+    expect(() => buildSelectedPlanTasks([
       row({ checked: false, title: "写 ringbuf 测试", task: { title: "写 ringbuf 测试" } }),
       row({
         title: "实现 ringbuf",
         task: { title: "实现 ringbuf", depends_on: ["写 ringbuf 测试"] },
       }),
-    ]);
-    expect(out).toHaveLength(1);
-    expect(out[0].depends_on).toBeUndefined();
+    ])).toThrow(/依赖目标未选中/);
   });
 
   it("看板任务 id 形状的引用原样保留（指向已存在的任务）", () => {
     const out = buildSelectedPlanTasks([
-      row({ title: "实现", task: { title: "实现", depends_on: ["LAT-123", "不存在的任务"] } }),
+      row({ title: "实现", task: { title: "实现", depends_on: ["LAT-123"] } }),
     ]);
     expect(out[0].depends_on).toEqual(["LAT-123"]);
   });

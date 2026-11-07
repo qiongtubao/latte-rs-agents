@@ -2078,7 +2078,13 @@ export function mountChat(opts: {
         task: r.task,
         subRows: r.subRows.length > 0 ? r.subRows.map(toInput) : undefined,
       });
-      const selected = buildSelectedPlanTasks(rows.map(toInput));
+      let selected: ImportTask[];
+      try {
+        selected = buildSelectedPlanTasks(rows.map(toInput));
+      } catch (err) {
+        alert(`依赖校验失败：${(err as Error).message}`);
+        return;
+      }
       if (selected.length === 0) { alert("未选择任何任务"); return; }
       importBtn.disabled = true;
       importBtn.textContent = "导入中…";

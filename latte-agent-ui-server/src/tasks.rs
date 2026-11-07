@@ -293,6 +293,14 @@ pub struct TaskStore {
     notion_dirty: crate::notion_sync::DirtySet,
 }
 
+/// 导入事务开始前的内存快照。导入只会新增任务并推进 `next_seq`，但保存
+/// 任一任务、board 元数据或 plan marker 失败时，仍需把三者一起恢复。
+struct ImportSnapshot {
+    meta: BoardMeta,
+    tasks: HashMap<String, Task>,
+    notion_dirty: crate::notion_sync::DirtySet,
+}
+
 impl TaskStore {
     /// 加载 `<cwd>/.latte/tasks/`：目录不存在则创建；`board.json`
     /// 缺失时按默认值新建（project 取 cwd 目录名）。
@@ -405,13 +413,98 @@ impl TaskStore {
     pub(crate) fn imported_plans_dir(&self) -> std::path::PathBuf {
         self.dir.join("imported-plans")
     }
-    /// plan_id 是否已成功 import（落盘标记存在）。跨重启稳定——服务
-    /// 进程死了 marker 也仍在，下次重启起来仍然判重。
-    pub fn plan_already_imported(&self, plan_id: &str) -> bool {
-        self.imported_plans_dir()
-            .join(plan_id)
-            .is_file()
+
+    fn imported_plan_marker(&self, plan_id: &str) -> Result<PathBuf, String> {
+        let mut components = Path::new(plan_id).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(name)), None) if !name.is_empty() => {
+                Ok(self.imported_plans_dir().join(name))
+            }
+            _ => Err(format!("plan_id {plan_id:?} 不是安全的文件名")),
+        }
     }
+
+    /// plan_id 是否已成功 import（落盘标记存在）。跨重启稳定——服务
+    /// 进程死了 marker 也仍在，下次重启起来仍然判重。非法 plan_id
+    /// 不参与路径拼接，后续提交阶段会返回明确的 400。
+    pub fn plan_already_imported(&self, plan_id: &str) -> bool {
+        self.imported_plan_marker(plan_id)
+            .is_ok_and(|path| path.is_file())
+    }
+
+    fn mark_plan_imported(&self, plan_id: &str) -> Result<(), String> {
+        let marker = self.imported_plan_marker(plan_id)?;
+        let dir = self.imported_plans_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("create plan marker dir {}: {e}", dir.display()))?;
+        let tmp = marker.with_extension("tmp");
+        std::fs::write(&tmp, b"imported")
+            .map_err(|e| format!("write plan-import marker {}: {e}", tmp.display()))?;
+        if let Err(error) = std::fs::rename(&tmp, &marker) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "rename plan-import marker {}: {error}",
+                marker.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn import_snapshot(&self) -> ImportSnapshot {
+        ImportSnapshot {
+            meta: self.meta.clone(),
+            tasks: self.tasks.clone(),
+            notion_dirty: self.notion_dirty.clone(),
+        }
+    }
+
+    /// 撤销一次失败导入产生的任务文件、next_seq 与 Notion dirty 标记。
+    /// 所有清理项都会尝试；单项失败会汇总返回，避免第一个错误掩盖后续
+    /// 残留。workflow cancel 不在快照内，因为导入路径不会修改它。
+    fn rollback_import(&mut self, snapshot: ImportSnapshot) -> Result<(), String> {
+        let start = snapshot.meta.next_seq;
+        let end = self.meta.next_seq.max(start);
+        let prefix = snapshot.meta.id_prefix.clone();
+        let mut errors = Vec::new();
+
+        for seq in start..end {
+            let id = format!("{prefix}-{seq}");
+            let path = self.dir.join(format!("{id}.json"));
+            if let Some(previous) = snapshot.tasks.get(&id) {
+                if let Err(error) = write_atomic_json(&path, previous) {
+                    errors.push(format!("restore {}: {error}", path.display()));
+                }
+            } else if let Err(error) = std::fs::remove_file(&path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    errors.push(format!("remove {}: {error}", path.display()));
+                }
+            }
+
+            let tmp = path.with_extension("json.tmp");
+            if tmp.is_file() {
+                if let Err(error) = std::fs::remove_file(&tmp) {
+                    errors.push(format!("remove {}: {error}", tmp.display()));
+                }
+            }
+            if !snapshot.notion_dirty.contains_after_take(&id) {
+                crate::notion_sync::clear_dirty_on_disk(self.project_root(), &id);
+            }
+        }
+
+        if let Err(error) = write_atomic_json(&self.dir.join("board.json"), &snapshot.meta) {
+            errors.push(format!("restore board.json: {error}"));
+        }
+        self.meta = snapshot.meta;
+        self.tasks = snapshot.tasks;
+        self.notion_dirty = snapshot.notion_dirty;
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("；"))
+        }
+    }
+
     pub(crate) fn project_root(&self) -> &Path {
         self.dir
             .parent()
@@ -1238,6 +1331,158 @@ fn prepare_import_fields(
     Ok((title, item.priority.unwrap_or(3), task_type, workflow))
 }
 
+/// 批量导入的纯内存 preflight。旧实现先创建全部任务、再解析标题依赖；
+/// 悬空、歧义或环要到第二趟才报错，此时任务文件已经部分落盘。这里在
+/// 分配 id 和写文件前，先按最终标题验证整批依赖图，使所有逻辑错误都
+/// 保持零副作用；后续意外 IO 错误由导入事务统一回滚。
+fn preflight_import_dependencies(
+    store: &TaskStore,
+    cwd: &Path,
+    req: &ImportTasksRequest,
+) -> Result<(), String> {
+    #[derive(Debug)]
+    struct Candidate {
+        title: String,
+        parent: Option<usize>,
+        refs: Vec<String>,
+    }
+
+    fn collect(
+        cwd: &Path,
+        items: &[ImportTask],
+        parent: Option<usize>,
+        out: &mut Vec<Candidate>,
+    ) -> Result<(), String> {
+        for item in items {
+            let (title, _, _, _) = prepare_import_fields(cwd, item)
+                .map_err(|e| format!("导入任务 {:?} 失败：{e}", item.title.trim()))?;
+            let index = out.len();
+            out.push(Candidate {
+                title,
+                parent,
+                refs: item.depends_on.clone(),
+            });
+            collect(cwd, &item.subtasks, Some(index), out)?;
+        }
+        Ok(())
+    }
+
+    fn is_ancestor(nodes: &[Candidate], ancestor: usize, mut descendant: usize) -> bool {
+        while let Some(parent) = nodes[descendant].parent {
+            if parent == ancestor {
+                return true;
+            }
+            descendant = parent;
+        }
+        false
+    }
+
+    fn visit(
+        node: usize,
+        nodes: &[Candidate],
+        edges: &[Vec<usize>],
+        states: &mut [u8],
+        stack: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        match states[node] {
+            2 => return Ok(()),
+            1 => {
+                let start = stack.iter().position(|i| *i == node).unwrap_or(0);
+                let mut cycle = stack[start..]
+                    .iter()
+                    .map(|i| nodes[*i].title.as_str())
+                    .collect::<Vec<_>>();
+                cycle.push(nodes[node].title.as_str());
+                return Err(format!("depends_on 形成环：{}", cycle.join(" → ")));
+            }
+            _ => {}
+        }
+        states[node] = 1;
+        stack.push(node);
+        for &dep in &edges[node] {
+            visit(dep, nodes, edges, states, stack)?;
+        }
+        stack.pop();
+        states[node] = 2;
+        Ok(())
+    }
+
+    if let Some(pid) = req.parent_id.as_deref() {
+        if store.get(pid).is_none() {
+            return Err(format!("父任务 {pid:?} 不存在"));
+        }
+    }
+
+    let mut nodes = Vec::new();
+    collect(cwd, &req.tasks, None, &mut nodes)?;
+    let mut by_title: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        by_title
+            .entry(node.title.to_lowercase())
+            .or_default()
+            .push(index);
+    }
+
+    let mut edges = vec![Vec::new(); nodes.len()];
+    for (owner, node) in nodes.iter().enumerate() {
+        let mut seen = std::collections::HashSet::new();
+        for raw in &node.refs {
+            let reference = raw.trim();
+            if reference.is_empty() {
+                continue;
+            }
+            // 与真实导入解析顺序一致：现有任务 id 优先，其次同批标题。
+            if store.get(reference).is_some() {
+                if let Some(parent_id) = req.parent_id.as_deref() {
+                    if reference == parent_id || is_ancestor_of(store, reference, parent_id) {
+                        return Err(format!(
+                            "任务 {:?} 不能依赖自己的父任务/祖先 {reference}",
+                            node.title
+                        ));
+                    }
+                }
+                continue;
+            }
+            let target = match by_title.get(&reference.to_lowercase()).map(Vec::as_slice) {
+                Some([one]) => *one,
+                Some(many) if many.len() > 1 => {
+                    return Err(format!(
+                        "任务 {:?} 的 depends_on {:?} 匹配到多个同标题任务（{}），请改成唯一标题",
+                        node.title,
+                        reference,
+                        many.len()
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "任务 {:?} 的 depends_on {:?} 既不是已存在任务 id，也不是本批唯一标题",
+                        node.title, reference
+                    ));
+                }
+            };
+            if target == owner {
+                return Err(format!("任务 {:?} 不能依赖自身", node.title));
+            }
+            if is_ancestor(&nodes, target, owner) || is_ancestor(&nodes, owner, target) {
+                return Err(format!(
+                    "任务 {:?} 与依赖 {:?} 是父子/祖孙关系，不能声明为 depends_on",
+                    node.title, nodes[target].title
+                ));
+            }
+            if seen.insert(target) {
+                edges[owner].push(target);
+            }
+        }
+    }
+
+    let mut states = vec![0u8; nodes.len()];
+    let mut stack = Vec::new();
+    for node in 0..nodes.len() {
+        visit(node, &nodes, &edges, &mut states, &mut stack)?;
+    }
+    Ok(())
+}
+
 /// 导入单个任务（`subtasks` 可任意深度嵌套）的校验 + 落库：递归
 /// 创建，返回新建 id（父先于子，深度优先）。`parent_id` 非空时任务
 /// 作为该父任务的子任务创建（拆分导入）。
@@ -1281,24 +1526,16 @@ fn import_one(
     Ok(())
 }
 
-/// `POST /api/tasks/import` 的核心逻辑（可测）：顺序创建，首个失败即
-/// 返回 400 语义的错误（消息含失败任务的 title 与已创建的 id）。
-///
-/// `pub`：CLI（无 ui-server 进程）的 PlanProposed 导入闭环复用它——
-/// 见 [`import_tasks_standalone`]。两边写同一份 board.json，schema /
-/// id 分配（LAT-100 起）/ history 记录天然逐字一致，不存在第二份实现。
-pub fn import_tasks_into(
+/// 批量导入的内部两趟实现。调用方必须通过 [`run_import_transaction`]
+/// 包裹，不能直接暴露部分写入。
+fn import_tasks_into_inner(
     store: &mut TaskStore,
     cwd: &Path,
     req: &ImportTasksRequest,
 ) -> Result<Vec<String>, String> {
-    // 拆分导入：父任务必须存在（任意深度任务树——父任务本身也可以是
-    // 子任务，item 的 subtasks 也可继续嵌套）。
-    if let Some(pid) = req.parent_id.as_deref() {
-        if store.get(pid).is_none() {
-            return Err(format!("父任务 {pid:?} 不存在"));
-        }
-    }
+    // 在分配 id / 写任务文件前完成整批字段与依赖图 preflight。
+    // 悬空、歧义、自依赖、父子依赖和环都必须保持零副作用。
+    preflight_import_dependencies(store, cwd, req)?;
     let mut created: Vec<String> = Vec::new();
     // 第一趟：建全部任务（含任意深度 subtasks），记录 id → 声明的依赖
     // 引用，以及标题 → id 的索引（同名标题记多个，解析时判歧义）。
@@ -1326,10 +1563,75 @@ pub fn import_tasks_into(
         let resolved = resolve_dep_refs(store, id, refs, &by_title)
             .map_err(|e| format!("任务 {id} 的 depends_on 无法解析：{e}（已创建：{created:?}）"))?;
         store
-            .set_depends_on(id, resolved)
+            .set_depends_on(id, resolved.clone())
             .map_err(|e| format!("任务 {id} 的 depends_on 非法：{e}（已创建：{created:?}）"))?;
+        let actual = &store.get(id).expect("依赖写入后任务必须仍存在").depends_on;
+        let mut expected = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for dep in resolved {
+            if seen.insert(dep.clone()) {
+                expected.push(dep);
+            }
+        }
+        if actual != &expected {
+            return Err(format!(
+                "任务 {id} 的 depends_on 导入后不一致：期望 {expected:?}，实际 {actual:?}"
+            ));
+        }
     }
     Ok(created)
+}
+
+fn run_import_transaction<T>(
+    store: &mut TaskStore,
+    operation: impl FnOnce(&mut TaskStore) -> Result<T, String>,
+) -> Result<T, String> {
+    let snapshot = store.import_snapshot();
+    match operation(store) {
+        Ok(value) => Ok(value),
+        Err(error) if store.meta.next_seq == snapshot.meta.next_seq => Err(error),
+        Err(error) => match store.rollback_import(snapshot) {
+            Ok(()) => Err(format!("{error}（本次导入已回滚）")),
+            Err(rollback_error) => Err(format!("{error}；导入回滚未完全成功：{rollback_error}")),
+        },
+    }
+}
+
+/// 批量导入的事务入口：任一任务或依赖写入失败时，恢复任务内存索引、
+/// 任务文件、board next_seq 与 Notion dirty 状态。成功时保持 backlog，
+/// 供底层测试和其他调用方复用。
+pub fn import_tasks_into(
+    store: &mut TaskStore,
+    cwd: &Path,
+    req: &ImportTasksRequest,
+) -> Result<Vec<String>, String> {
+    run_import_transaction(store, |store| import_tasks_into_inner(store, cwd, req))
+}
+
+/// UI/CLI 的完整导入事务：创建和依赖解析后统一进入 todo；UI 传入
+/// plan_id 时，幂等 marker 也必须成功落盘才提交。任何一步失败都回滚。
+fn import_tasks_as_todo_into(
+    store: &mut TaskStore,
+    cwd: &Path,
+    req: &ImportTasksRequest,
+    plan_id: Option<&str>,
+) -> Result<Vec<String>, String> {
+    run_import_transaction(store, |store| {
+        let created = import_tasks_into_inner(store, cwd, req)?;
+        let now = now_ms();
+        for id in &created {
+            if let Some(task) = store.get_mut(id) {
+                task.set_state("todo", "import", Some("已导入，待派发".into()), now);
+            }
+            store
+                .persist(id)
+                .map_err(|error| format!("导入任务 {id} 的 todo 状态落盘失败：{error}"))?;
+        }
+        if let Some(plan_id) = plan_id {
+            store.mark_plan_imported(plan_id)?;
+        }
+        Ok(created)
+    })
 }
 
 /// 把一条依赖引用解析成任务 id：已存在的任务 id 直接用；否则按同批
@@ -1369,7 +1671,7 @@ fn resolve_dep_refs(
 }
 
 /// 无 `UiBackend` 的导入入口（CLI 的 PlanProposed 导入闭环用）：
-/// 现 load 看板 → [`import_tasks_into`] → 全部落 `todo` → persist。
+/// 现 load 看板，在同一导入事务内创建任务、解析依赖并全部落 `todo`。
 /// 与 [`import_tasks`] 的差别只是没有 refine 父任务解析、plan 阶段门
 /// 批准与弹窗销账——那些要 session 句柄，CLI 调用方自己处理（销账走
 /// `latte_agent_core::choice::dismiss_prompt`）。
@@ -1384,16 +1686,7 @@ pub fn import_tasks_standalone(
     req: &ImportTasksRequest,
 ) -> Result<Vec<String>, String> {
     let mut store = TaskStore::load(cwd).map_err(|e| format!("load task board: {e}"))?;
-    let created = import_tasks_into(&mut store, cwd, req)?;
-    // 导入即进 todo（与 import_tasks 同语义）：执行与否由用户手动派发。
-    let now = now_ms();
-    for id in &created {
-        if let Some(t) = store.get_mut(id) {
-            t.set_state("todo", "import", Some("已导入，待派发".into()), now);
-        }
-        store.persist(id)?;
-    }
-    Ok(created)
+    import_tasks_as_todo_into(&mut store, cwd, req, None)
 }
 
 pub async fn import_tasks(
@@ -1406,7 +1699,13 @@ pub async fn import_tasks(
     let mut req = req;
     let plan_id_owned: Option<String> = req.plan_id.clone().filter(|p| !p.is_empty());
     if let Some(plan_id) = plan_id_owned.as_deref() {
-        if b.tasks.read().plan_already_imported(plan_id) {
+        let already_imported = b
+            .tasks
+            .read()
+            .imported_plan_marker(plan_id)
+            .map_err(ApiError::bad_request)?
+            .is_file();
+        if already_imported {
             return Err(ApiError {
                 status: 409,
                 message: format!(
@@ -1434,7 +1733,11 @@ pub async fn import_tasks(
         // 同进程并发二次检查（读锁检查到拿写锁之间有人抢跑的可能）：
         // 持写锁再查一次，命中则放弃。
         if let Some(plan_id) = plan_id_owned.as_deref() {
-            if store.plan_already_imported(plan_id) {
+            let already_imported = store
+                .imported_plan_marker(plan_id)
+                .map_err(ApiError::bad_request)?
+                .is_file();
+            if already_imported {
                 return Err(ApiError {
                     status: 409,
                     message: format!(
@@ -1443,34 +1746,8 @@ pub async fn import_tasks(
                 });
             }
         }
-        let created = import_tasks_into(&mut store, &b.cwd, &req).map_err(ApiError::bad_request)?;
-        // 先写幂等标记，再写任务文件，最后销账 prompt。顺序：
-        //   1. 写 marker（成功 → 任何重试都撞 409）
-        //   2. persist 各任务（失败也不影响 marker）
-        //   3. dismiss_prompt（撤销前端弹框与跨 tab 通知）
-        // 即便 1-2 之间崩了，重启后 marker 仍在，下次 import 会被挡。
-        if let Some(plan_id) = plan_id_owned.as_deref() {
-            let dir = store.imported_plans_dir();
-            let _ = std::fs::create_dir_all(&dir);
-            let marker = dir.join(plan_id);
-            let tmp = marker.with_extension("tmp");
-            if let Err(e) = std::fs::write(&tmp, b"imported") {
-                eprintln!("[tasks] write plan-import marker {plan_id}: {e}");
-            } else if let Err(e) = std::fs::rename(&tmp, &marker) {
-                eprintln!("[tasks] rename plan-import marker {plan_id}: {e}");
-            }
-        }
-        // 导入即进 todo：执行与否由用户在任务看板手动派发，不做自动调度。
-        let now = now_ms();
-        for id in &created {
-            if let Some(t) = store.get_mut(id) {
-                t.set_state("todo", "import", Some("已导入，待派发".into()), now);
-            }
-            if let Err(e) = store.persist(id) {
-                eprintln!("[tasks] persist {id} after import: {e}");
-            }
-        }
-        created
+        import_tasks_as_todo_into(&mut store, &b.cwd, &req, plan_id_owned.as_deref())
+            .map_err(ApiError::bad_request)?
     };
     // plan 阶段门：带 plan_id 的导入 = 用户批准该任务清单。找到持有
     // 该 PendingApproval 的 session（plan 弹窗属于某个 session，stage
@@ -5015,10 +5292,11 @@ mod tests {
         let err = import_tasks_into(&mut store, dir.path(), &req).unwrap_err();
         assert!(err.contains("坏优先级"), "{err}");
         assert!(err.contains("priority"), "{err}");
-        // 已创建的 id 要出现在错误消息里（部分导入可见）。
-        assert!(err.contains("LAT-100"), "{err}");
-        assert!(store.get("LAT-100").is_some(), "第一个任务已创建");
-        assert!(store.get("LAT-101").is_none(), "失败的任务未创建");
+        assert!(
+            store.list().is_empty(),
+            "preflight 失败必须保持零副作用，不能留下前面已创建的任务"
+        );
+        assert!(store.get("LAT-100").is_none());
     }
 
     #[test]
@@ -5912,6 +6190,10 @@ mod tests {
         let err = import_tasks(&b, req).await.expect_err("应整单拒绝");
         assert!(err.message.contains("depends_on"), "{}", err.message);
         assert!(err.message.contains("不存在的任务"), "{}", err.message);
+        assert!(
+            b.tasks.read().list().is_empty(),
+            "依赖 preflight 失败必须保持零副作用"
+        );
     }
 
     /// 模型把依赖写成 `dependencies`（workflow 产出的既有字段名）时

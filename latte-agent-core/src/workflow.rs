@@ -158,6 +158,12 @@ pub fn delegate_request_budget() -> usize {
     scaled_budget(step_budget_tier(DELEGATE_BUDGET_TIER).unwrap_or(0))
 }
 
+/// 顶层交互 runner 的软请求预算。主会话要编排 delegate/workflow，给它
+/// large 档位，但不能继续保持无限；全局 scale=0 仍可显式关闭。
+pub fn top_level_request_budget() -> usize {
+    scaled_budget(step_budget_tier("large").unwrap_or(0))
+}
+
 /// 校验本步是否真的调用过 `required` 里的工具。
 ///
 /// `summary` 是 runner 收集的工具摘要，每行形如 `"{name} {args} → {result}"`
@@ -11905,16 +11911,15 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         continue;
                     }
                     // 发 TimeoutWarning，让 UI 弹「继续等待 / 终止当前任务」。
-                    // 不硬杀：防死循环不由 wall-clock 兜底——run_turn 内部
-                    // 有 tool rounds 上限（100 轮）和工具循环检测（连续 3 次
-                    // 同参相同调用），两者都会报 AgentError 终止 turn。合法
-                    // 长任务（loop agent 跑很久）不应被杀。
+                    // 这条提醒本身不硬杀；真实硬兜底是 step_timeout_s 对应
+                    // 的 runner deadline。常规收手优先由请求预算、三元组
+                    // 重复错误和工具循环检测触发，避免用短墙钟误杀健康长任务。
                     let elapsed_secs = step_started.elapsed().as_secs();
                     let _ = inp.event_tx.send(ChatEvent::TimeoutWarning {
                         role_id: speaker.clone(),
                         elapsed_secs,
                         soft_timeout_secs: timeout_s,
-                        hard_timeout_secs: 0, // 0 = 无硬超时（无限等待）
+                        hard_timeout_secs: step_timeout_s,
                         sub_id: sub_id.clone(),
                     });
                     // 按 timeout_s 周期性复发，而不是 park 到 1 年后：用户

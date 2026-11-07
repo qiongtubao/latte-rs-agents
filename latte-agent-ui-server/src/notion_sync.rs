@@ -260,7 +260,7 @@ pub async fn upsert_with_retry(
 /// 每次 mark 同步写标记文件，sync 成功/4xx 删文件，5xx/离线留文件；
 /// `TaskStore::load` 扫目录重建内存集，离线期间积累的 dirty 重启后
 /// 自然推出去。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DirtySet {
     ids: std::collections::HashSet<String>,
 }
