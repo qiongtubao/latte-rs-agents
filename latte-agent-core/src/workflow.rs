@@ -3129,10 +3129,7 @@ impl WorkflowDef {
                 }
             }
             if step.hard_timeout_secs == Some(0) {
-                return Err(format!(
-                    "step '{}': hard_timeout_secs 必须大于 0",
-                    step.id
-                ));
+                return Err(format!("step '{}': hard_timeout_secs 必须大于 0", step.id));
             }
             if (step.hard_timeout_secs.is_some() || step.max_tool_calls.is_some())
                 && step.declared_roles().is_empty()
@@ -4447,13 +4444,49 @@ pub fn is_cancelled_by_user(msg: &str) -> bool {
 
 /// Internal outcome of a workflow engine (serial or DAG), before the
 /// `WorkflowFinished` event is emitted by [`run_workflow`].
+struct WfFailure {
+    reason: String,
+    step_id: Option<String>,
+    role: Option<String>,
+}
+
 enum WfOutcome {
     /// (最后一步输出, output_key → 各 step 产出)。后者供嵌套 step 的
     /// `output_from` 取子 workflow 的中间产物（如 proposal 而非末尾
     /// 的评审 verdict）。
     Ok(String, std::collections::HashMap<String, String>),
     Cancelled,
-    Failed(String),
+    Failed(WfFailure),
+}
+
+impl WfOutcome {
+    fn failed(reason: impl Into<String>) -> Self {
+        Self::Failed(WfFailure {
+            reason: reason.into(),
+            step_id: None,
+            role: None,
+        })
+    }
+
+    fn step_failed(step_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Failed(WfFailure {
+            reason: reason.into(),
+            step_id: Some(step_id.into()),
+            role: None,
+        })
+    }
+
+    fn speaker_failed(
+        step_id: impl Into<String>,
+        role: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::Failed(WfFailure {
+            reason: reason.into(),
+            step_id: Some(step_id.into()),
+            role: Some(role.into()),
+        })
+    }
 }
 
 // ─── Checkpoint（断点续跑）────────────────────────────────────────
@@ -10589,7 +10622,7 @@ async fn run_workflow_inner(
             });
             Err(summary)
         }
-        WfOutcome::Failed(reason) => {
+        WfOutcome::Failed(failure) => {
             if let Some(st) = &created_staging {
                 let _ = ctx.event_tx.send(ChatEvent::Status {
                     message: format!(
@@ -10600,14 +10633,19 @@ async fn run_workflow_inner(
                 });
             }
             // Failure 是终态诊断，不计入 completed，也不会被 resume 抄入
-            // 新 checkpoint。当前 WfOutcome 尚未携带结构化 step/role；未知
-            // 时显式留空，避免从易变错误文案反向解析。
-            ckpt.record_failure(None, None, &reason);
+            // 新 checkpoint。step/role 来自执行引擎的结构化上下文，不能
+            // 从面向用户的错误文案反向解析。
+            ckpt.record_failure(
+                failure.step_id.as_deref(),
+                failure.role.as_deref(),
+                &failure.reason,
+            );
             // 失败不丢成果：已完成 step 都落了 checkpoint，消息尾部
             // 带上进度与 wf_id，manager 可直接用 resume 续跑。
             let total = wf.steps.len() * wf.effective_max_rounds();
             let msg = format!(
-                "{reason}（已完成 {}/{total} 步，可用 resume 从断点续跑：wf_id={wf_id}）",
+                "{}（已完成 {}/{total} 步，可用 resume 从断点续跑：wf_id={wf_id}）",
+                failure.reason,
                 ckpt.completed()
             );
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
@@ -11951,15 +11989,12 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
             .hard_timeout_secs
             .unwrap_or_else(crate::controller::specialist_timeout_secs);
         let graceful_timeout_s = if inp.hard_timeout_secs.is_some() {
-            step_timeout_s
-                .saturating_sub(step_timeout_s.min(5))
-                .max(1)
+            step_timeout_s.saturating_sub(step_timeout_s.min(5)).max(1)
         } else {
             step_timeout_s
         };
         runner.set_deadline(
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(graceful_timeout_s),
+            std::time::Instant::now() + std::time::Duration::from_secs(graceful_timeout_s),
         );
         runner.set_request_budget(inp.request_budget);
         runner.set_max_tool_calls(inp.max_tool_calls);
@@ -12644,7 +12679,7 @@ async fn run_workflow_serial(
             let step = &wf.steps[idx];
             if wf.name == "learn_loop" {
                 if let Err(e) = ensure_learn_lock(&mut learn_lock, &vars, ctx) {
-                    return WfOutcome::Failed(format!("step '{}': {e}", step.id));
+                    return WfOutcome::step_failed(&step.id, format!("step '{}': {e}", step.id));
                 }
             }
             if wf.name == "learn_loop"
@@ -12693,12 +12728,14 @@ async fn run_workflow_serial(
                                 done_steps.remove(wf.steps[target].id.as_str());
                                 idx = target;
                             }
-                            Err(msg) => return WfOutcome::Failed(msg),
+                            Err(msg) => return WfOutcome::step_failed(&step.id, msg),
                         }
                         continue;
                     }
                     Ok(None) => {}
-                    Err(e) => return WfOutcome::Failed(format!("step '{}': {e}", step.id)),
+                    Err(e) => {
+                        return WfOutcome::step_failed(&step.id, format!("step '{}': {e}", step.id))
+                    }
                 }
             }
             if ctx.cancel_flag.load(Ordering::SeqCst) {
@@ -12770,7 +12807,7 @@ async fn run_workflow_serial(
                             done_steps.remove(wf.steps[target].id.as_str());
                             idx = target;
                         }
-                        Err(msg) => return WfOutcome::Failed(msg),
+                        Err(msg) => return WfOutcome::step_failed(&step.id, msg),
                     }
                     continue;
                 }
@@ -12794,10 +12831,13 @@ async fn run_workflow_serial(
                 let mut issues = match parse_verdict_issues(&src) {
                     Ok(v) => v,
                     Err(e) => {
-                        return WfOutcome::Failed(format!(
-                            "step '{}' 机械终审门读取裁决 '{src_key}' 失败：{e}",
-                            step.id
-                        ))
+                        return WfOutcome::step_failed(
+                            &step.id,
+                            format!(
+                                "step '{}' 机械终审门读取裁决 '{src_key}' 失败：{e}",
+                                step.id
+                            ),
+                        )
                     }
                 };
                 // 定向返工：先把"点了病灶步却没给目标"的 blocking 降级，再算
@@ -12916,7 +12956,7 @@ async fn run_workflow_serial(
                         ));
                         idx = target;
                     }
-                    Err(msg) => return WfOutcome::Failed(msg),
+                    Err(msg) => return WfOutcome::step_failed(&step.id, msg),
                 }
                 continue;
             }
@@ -12993,10 +13033,10 @@ async fn run_workflow_serial(
                                 continue;
                             }
                         }
-                        return WfOutcome::Failed(format!(
-                            "step '{}' 机械装配 plan 清单失败：{e}",
-                            step.id
-                        ));
+                        return WfOutcome::step_failed(
+                            &step.id,
+                            format!("step '{}' 机械装配 plan 清单失败：{e}", step.id),
+                        );
                     }
                 }
             }
@@ -13039,10 +13079,10 @@ async fn run_workflow_serial(
                         continue;
                     }
                     Err(e) => {
-                        return WfOutcome::Failed(format!(
-                            "step '{}' 机械提交 plan 失败：{e}",
-                            step.id
-                        ))
+                        return WfOutcome::step_failed(
+                            &step.id,
+                            format!("step '{}' 机械提交 plan 失败：{e}", step.id),
+                        )
                     }
                 }
             }
@@ -13093,10 +13133,10 @@ async fn run_workflow_serial(
                         last_output = output;
                     }
                     Err(e) => {
-                        return WfOutcome::Failed(format!(
-                            "step '{}' nested workflow '{nested_name}': {e}",
-                            step.id
-                        ))
+                        return WfOutcome::step_failed(
+                            &step.id,
+                            format!("step '{}' nested workflow '{nested_name}': {e}", step.id),
+                        )
                     }
                 }
                 if let Some(key) = &step.output_key {
@@ -13150,7 +13190,9 @@ async fn run_workflow_serial(
                 if learn_lock.as_ref().is_none_or(|l| &l.slug != slug) {
                     match LearnTopicLock::acquire(&learn_root(ctx), slug, &learn_lock_holder(ctx)) {
                         Ok(lock) => learn_lock = Some(lock),
-                        Err(e) => return WfOutcome::Failed(format!("step 'plan': {e}")),
+                        Err(e) => {
+                            return WfOutcome::step_failed("plan", format!("step 'plan': {e}"))
+                        }
                     }
                 }
             }
@@ -13166,7 +13208,7 @@ async fn run_workflow_serial(
             {
                 match LearnTopicLock::acquire(&learn_root(ctx), slug, &learn_lock_holder(ctx)) {
                     Ok(lock) => learn_lock = Some(lock),
-                    Err(e) => return WfOutcome::Failed(format!("step 'plan': {e}")),
+                    Err(e) => return WfOutcome::step_failed("plan", format!("step 'plan': {e}")),
                 }
             }
             // annotate 每次 run 都重新生成全部副本：开跑前把上次 run 的 code/
@@ -13186,7 +13228,9 @@ async fn run_workflow_serial(
                         });
                     }
                     Ok(None) => {}
-                    Err(e) => return WfOutcome::Failed(format!("step 'annotate': {e}")),
+                    Err(e) => {
+                        return WfOutcome::step_failed("annotate", format!("step 'annotate': {e}"))
+                    }
                 }
                 // 代码由引擎逐字拷：按 plan 证据写出副本骨架与索引，模型只往里插注释。
                 if learn_slug_ok(slug) {
@@ -13206,7 +13250,12 @@ async fn run_workflow_serial(
                                     .unwrap_or_default();
                             vars.insert("annotate_brief".into(), annotate_brief(&ctx.cwd, &plan));
                         }
-                        Err(e) => return WfOutcome::Failed(format!("step 'annotate': {e}")),
+                        Err(e) => {
+                            return WfOutcome::step_failed(
+                                "annotate",
+                                format!("step 'annotate': {e}"),
+                            )
+                        }
                     }
                 }
             }
@@ -13339,16 +13388,20 @@ async fn run_workflow_serial(
                                     context_overflow_restart_prompt(step, topic, &clean_prompt);
                                 continue;
                             }
-                            return WfOutcome::Failed(format!(
-                                "step '{}' speaker '{}': context overflow after {} fresh restart(s): {}",
+                            return WfOutcome::speaker_failed(
+                                &step.id,
+                                &speaker,
+                                format!(
+                                    "step '{}' speaker '{}': context overflow after {} fresh restart(s): {}",
                                 step.id, speaker, context_overflow_restarts, detail
                             ));
                         }
                         Err(StepFail::Failed(e)) => {
-                            return WfOutcome::Failed(format!(
-                                "step '{}' speaker '{}': {e}",
-                                step.id, speaker
-                            ))
+                            return WfOutcome::speaker_failed(
+                                &step.id,
+                                &speaker,
+                                format!("step '{}' speaker '{}': {e}", step.id, speaker),
+                            )
                         }
                     };
                     // 监察批注（⚠️ [监察审查]…）是给人读的旁注，绝不参与
@@ -13365,14 +13418,18 @@ async fn run_workflow_serial(
                     // 实测实录）。
                     if step.require_plan_submit && !plan_submitted(plan_stage.as_ref()) {
                         if attempt >= step.max_retries {
-                            return WfOutcome::Failed(format!(
-                                "step '{}' speaker '{}': 本步要求成功提交 plan 提案，\
+                            return WfOutcome::speaker_failed(
+                                &step.id,
+                                &speaker,
+                                format!(
+                                    "step '{}' speaker '{}': 本步要求成功提交 plan 提案，\
                                  重试 {attempt} 次后仍未提交成功（任务未进看板）\
                                  ；最后一次产出摘要：{}",
-                                step.id,
-                                speaker,
-                                output_excerpt(&response, 1200)
-                            ));
+                                    step.id,
+                                    speaker,
+                                    output_excerpt(&response, 1200)
+                                ),
+                            );
                         }
                         attempt += 1;
                         tracing::warn!(
@@ -13392,10 +13449,14 @@ async fn run_workflow_serial(
                     // 批注也更有指导性。
                     if let Err(reason) = check_tool_usage(step, &tools_called) {
                         if attempt >= step.max_retries {
-                            return WfOutcome::Failed(format!(
-                                "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                step.id, speaker
-                            ));
+                            return WfOutcome::speaker_failed(
+                                &step.id,
+                                &speaker,
+                                format!(
+                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                    step.id, speaker
+                                ),
+                            );
                         }
                         attempt += 1;
                         tracing::warn!(
@@ -13448,14 +13509,18 @@ async fn run_workflow_serial(
                             {
                                 Some(annotated) => response = annotated,
                                 None => {
-                                    return WfOutcome::Failed(format!(
-                                        "step '{}' speaker '{}': 产出契约校验失败\
+                                    return WfOutcome::speaker_failed(
+                                        &step.id,
+                                        &speaker,
+                                        format!(
+                                            "step '{}' speaker '{}': 产出契约校验失败\
                                          （重试 {attempt} 次后仍不合格）：{reason}\
                                          ；不合格产出摘要：{}",
-                                        step.id,
-                                        speaker,
-                                        output_excerpt(&response, 1200)
-                                    ))
+                                            step.id,
+                                            speaker,
+                                            output_excerpt(&response, 1200)
+                                        ),
+                                    )
                                 }
                             }
                         } else {
@@ -13491,10 +13556,14 @@ async fn run_workflow_serial(
                             check_symbols_output(&response, &ctx.cwd, &symbol_scope)
                         {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                    step.id, speaker
-                                ));
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                        step.id, speaker
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13522,10 +13591,14 @@ async fn run_workflow_serial(
                             &response, &scope, &ctx.cwd,
                         ) {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                    step.id, speaker
-                                ));
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                        step.id, speaker
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13562,13 +13635,17 @@ async fn run_workflow_serial(
                         });
                         if let Err(reason) = checked {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）\
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）\
                                      ；不合格产出摘要：{}",
-                                    step.id,
-                                    speaker,
-                                    output_excerpt(&response, 1200)
-                                ));
+                                        step.id,
+                                        speaker,
+                                        output_excerpt(&response, 1200)
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13590,13 +13667,17 @@ async fn run_workflow_serial(
                     if step.require_verdict_json {
                         if let Err(reason) = parse_verdict_issues(&response) {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）\
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）\
                                      ；不合格产出摘要：{}",
-                                    step.id,
-                                    speaker,
-                                    output_excerpt(&response, 1200)
-                                ));
+                                        step.id,
+                                        speaker,
+                                        output_excerpt(&response, 1200)
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13674,10 +13755,14 @@ async fn run_workflow_serial(
                         };
                         if let Err(reason) = checked {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                    step.id, speaker
-                                ));
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                        step.id, speaker
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13707,7 +13792,10 @@ async fn run_workflow_serial(
                             ) {
                                 Ok(o) => o,
                                 Err(e) => {
-                                    return WfOutcome::Failed(format!("step 'annotate': {e}"))
+                                    return WfOutcome::step_failed(
+                                        "annotate",
+                                        format!("step 'annotate': {e}"),
+                                    )
                                 }
                             };
                             if !outcome.notes.is_empty() {
@@ -13818,10 +13906,14 @@ async fn run_workflow_serial(
                     if let Some(baseline) = &sync_baseline {
                         if let Err(reason) = baseline.check_and_restore(&ctx.cwd) {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                    step.id, speaker
-                                ));
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                        step.id, speaker
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13846,10 +13938,14 @@ async fn run_workflow_serial(
                             &slug,
                         ) {
                             if attempt >= step.max_retries {
-                                return WfOutcome::Failed(format!(
-                                    "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
-                                    step.id, speaker
-                                ));
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）",
+                                        step.id, speaker
+                                    ),
+                                );
                             }
                             attempt += 1;
                             tracing::warn!(
@@ -13875,14 +13971,18 @@ async fn run_workflow_serial(
                             Ok(patched) => response = patched,
                             Err(reason) => {
                                 if attempt >= step.max_retries {
-                                    return WfOutcome::Failed(format!(
-                                        "step '{}' speaker '{}': patch 应用失败\
+                                    return WfOutcome::speaker_failed(
+                                        &step.id,
+                                        &speaker,
+                                        format!(
+                                            "step '{}' speaker '{}': patch 应用失败\
                                          （已重试 {attempt} 次）：{reason}\
                                          ；不合格产出摘要：{}",
-                                        step.id,
-                                        speaker,
-                                        output_excerpt(&response, 1200)
-                                    ));
+                                            step.id,
+                                            speaker,
+                                            output_excerpt(&response, 1200)
+                                        ),
+                                    );
                                 }
                                 attempt += 1;
                                 tracing::warn!(
@@ -13927,7 +14027,7 @@ async fn run_workflow_serial(
                         Ok(lock) => learn_lock = Some(lock),
                         Err(e) => {
                             guard.restore_locked(slug);
-                            return WfOutcome::Failed(format!("step 'plan': {e}"));
+                            return WfOutcome::step_failed("plan", format!("step 'plan': {e}"));
                         }
                     }
                 }
@@ -13942,7 +14042,10 @@ async fn run_workflow_serial(
                         }
                     }
                     Err(e) => {
-                        return WfOutcome::Failed(format!("step 'plan': 账本合并失败：{e}"));
+                        return WfOutcome::step_failed(
+                            "plan",
+                            format!("step 'plan': 账本合并失败：{e}"),
+                        );
                     }
                 }
             }
@@ -13988,7 +14091,7 @@ async fn run_workflow_serial(
                     idx = target_idx;
                     continue;
                 }
-                Err(msg) => return WfOutcome::Failed(msg),
+                Err(msg) => return WfOutcome::step_failed(&step.id, msg),
             }
             if wf.name == "learn_loop" {
                 material_refreshed = true;
@@ -14920,7 +15023,7 @@ async fn run_workflow_dag(
 
     let waves = match compute_waves(&wf.steps) {
         Ok(w) => w,
-        Err(e) => return WfOutcome::Failed(e),
+        Err(e) => return WfOutcome::failed(e),
     };
     let wf_arc = Arc::new(wf.clone());
     let total = wf.steps.len();
@@ -15002,7 +15105,7 @@ async fn run_workflow_dag(
                 std::collections::BTreeMap<String, String>,
                 String,
             );
-            let mut set: JoinSet<Result<DagStepOk, StepFail>> = JoinSet::new();
+            let mut set: JoinSet<Result<DagStepOk, (String, StepFail)>> = JoinSet::new();
             let mut carried_fan_out: Vec<(usize, Option<String>, String)> = Vec::new();
             // fan_out step 下标 → 派发的元素个数；全部完成才记一次 checkpoint。
             let mut fan_out_expected: HashMap<usize, usize> = HashMap::new();
@@ -15128,10 +15231,10 @@ async fn run_workflow_dag(
                         }
                         Err(e) => {
                             set.abort_all();
-                            return WfOutcome::Failed(format!(
-                                "step '{}' fan_out 读取失败：{e}",
-                                wf.steps[idx].id
-                            ));
+                            return WfOutcome::step_failed(
+                                &wf.steps[idx].id,
+                                format!("step '{}' fan_out 读取失败：{e}", wf.steps[idx].id),
+                            );
                         }
                     },
                 };
@@ -15322,7 +15425,7 @@ async fn run_workflow_dag(
                             Ok((step_idx, step_id, output_key, out, exported)) => {
                                 Ok((step_idx, step_id, output_key, out, exported, item_label))
                             }
-                            Err(err) => Err(err),
+                            Err(err) => Err((step_id, err)),
                         }
                     });
                 }
@@ -15355,10 +15458,13 @@ async fn run_workflow_dag(
                             {
                                 restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                                 set.abort_all();
-                                return WfOutcome::Failed(format!(
-                                    "step '{step_id}' fan_out 全部 {expected} 个元素都失败：{}",
-                                    got.first().map(|s| s.as_str()).unwrap_or("")
-                                ));
+                                return WfOutcome::step_failed(
+                                    &step_id,
+                                    format!(
+                                        "step '{step_id}' fan_out 全部 {expected} 个元素都失败：{}",
+                                        got.first().map(|s| s.as_str()).unwrap_or("")
+                                    ),
+                                );
                             }
                             let joined = got.join("\n\n");
                             ckpt.record_step(&step_id, output_key.as_deref(), &joined);
@@ -15373,25 +15479,28 @@ async fn run_workflow_dag(
                             wave_results.push((step_idx, output_key, out));
                         }
                     }
-                    Ok(Err(StepFail::Cancelled)) => {
+                    Ok(Err((_step_id, StepFail::Cancelled))) => {
                         restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
                         return WfOutcome::Cancelled;
                     }
-                    Ok(Err(StepFail::ContextOverflow(detail))) => {
+                    Ok(Err((step_id, StepFail::ContextOverflow(detail)))) => {
                         restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
-                        return WfOutcome::Failed(format!("context overflow: {detail}"));
+                        return WfOutcome::step_failed(
+                            step_id,
+                            format!("context overflow: {detail}"),
+                        );
                     }
-                    Ok(Err(StepFail::Failed(msg))) => {
+                    Ok(Err((step_id, StepFail::Failed(msg)))) => {
                         restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
-                        return WfOutcome::Failed(msg);
+                        return WfOutcome::step_failed(step_id, msg);
                     }
                     Err(join_err) => {
                         restore_wave_feedback(&feedback_guards, &ctx.event_tx, &wf.name);
                         set.abort_all();
-                        return WfOutcome::Failed(format!("workflow step task failed: {join_err}"));
+                        return WfOutcome::failed(format!("workflow step task failed: {join_err}"));
                     }
                 }
             }
@@ -15429,11 +15538,14 @@ async fn run_workflow_dag(
                 // workflow。且缺省不再熔断（见 `loop_abort_on`）。
                 if let Some(marker) = &step.loop_abort_on {
                     if out.contains(marker.as_str()) {
-                        return WfOutcome::Failed(format!(
-                            "step '{}' 终止 workflow：{}",
-                            step.id,
-                            out.chars().take(500).collect::<String>()
-                        ));
+                        return WfOutcome::step_failed(
+                            &step.id,
+                            format!(
+                                "step '{}' 终止 workflow：{}",
+                                step.id,
+                                out.chars().take(500).collect::<String>()
+                            ),
+                        );
                     }
                 }
                 if out.contains(cond.as_str()) {
@@ -15450,13 +15562,16 @@ async fn run_workflow_dag(
                     // advisor 复核放行（见 loop_no_release_on）。
                     if let Some(marker) = &step.loop_no_release_on {
                         if out.contains(marker.as_str()) {
-                            return WfOutcome::Failed(format!(
-                                "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                            return WfOutcome::step_failed(
+                                &step.id,
+                                format!(
+                                    "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
                                  （已达 max_iterations={max}），产出含不可放行标记「{marker}」\
                                  （跳过 advisor 复核），最后一次产出摘要：{}",
-                                step.id,
-                                out.chars().take(200).collect::<String>()
-                            ));
+                                    step.id,
+                                    out.chars().take(200).collect::<String>()
+                                ),
+                            );
                         }
                     }
                     // 判死前最后一道 advisor 语义复核（与串行引擎同款）：
@@ -15487,11 +15602,14 @@ async fn run_workflow_dag(
                         continue;
                     }
                     let summary: String = out.chars().take(200).collect();
-                    return WfOutcome::Failed(format!(
-                        "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
+                    return WfOutcome::step_failed(
+                        &step.id,
+                        format!(
+                            "step '{}' 循环条件「{cond}」在 {count} 次迭代后仍未满足\
                          （已达 max_iterations={max}），最后一次产出摘要：{summary}",
-                        step.id
-                    ));
+                            step.id
+                        ),
+                    );
                 }
                 let target_id = rework_target_id(step, out).to_string();
                 let target_wave = waves
@@ -16714,7 +16832,10 @@ role = "reviewer"
             "机械门不过应跳回 fix 再修一轮"
         );
         assert!(fix.loop_until.is_none(), "fix（改的人）不得持有放行门");
-        assert!(recheck.loop_until.is_none(), "reviewer 不得用自由文本自宣放行");
+        assert!(
+            recheck.loop_until.is_none(),
+            "reviewer 不得用自由文本自宣放行"
+        );
         assert!(
             verify.loop_until.is_none(),
             "verify（初审）不放行，只列问题"
@@ -21167,6 +21288,8 @@ output_key = "out_b"
         assert_eq!(lines[1]["output"], "步骤产出");
         assert_eq!(lines[2]["type"], "failure");
         assert_eq!(lines[2]["wf_id"], wf_id);
+        assert_eq!(lines[2]["step_id"], "b");
+        assert_eq!(lines[2]["role"], "worker");
         assert!(lines[2]["reason"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(lines[2]["failed_at"].is_number());
         assert_eq!(
