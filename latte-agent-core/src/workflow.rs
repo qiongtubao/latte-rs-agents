@@ -1048,13 +1048,13 @@ fn check_patch_field(field: &str, value: &serde_json::Value) -> Result<(), Strin
     let ok = match field {
         "title" | "description" => value.is_string(),
         "priority" => value.is_i64() || value.is_u64() || value.is_null(),
-        "labels" | "paths" => value
+        "labels" | "paths" | "artifact_paths" => value
             .as_array()
             .is_some_and(|a| a.iter().all(|x| x.is_string())),
         "task_type" | "workflow" => value.is_string() || value.is_null(),
         _ => {
             return Err(format!(
-                "field '{field}' 不可 patch（允许：title / description / priority / labels / task_type / workflow / paths）"
+                "field '{field}' 不可 patch（允许：title / description / priority / labels / task_type / workflow / paths / artifact_paths）"
             ))
         }
     };
@@ -4126,6 +4126,10 @@ pub struct WorkflowRunContext {
     pub resolver: Arc<ModelResolver>,
     pub default_params: GenerateParams,
     pub cwd: PathBuf,
+    /// Task-level outer write boundary. `None` preserves legacy behavior;
+    /// `Some([])` is read-only; non-empty entries are project-relative
+    /// directory/file prefixes. Every nested workflow inherits this policy.
+    pub artifact_paths: Option<Vec<String>>,
     pub event_tx: broadcast::Sender<ChatEvent>,
     pub cancel_flag: Arc<AtomicBool>,
     /// Per-turn cancellation flag, distinct from `cancel_flag` (which
@@ -4352,6 +4356,7 @@ fn run_nested_workflow(
             resolver: ctx.resolver.clone(),
             default_params: ctx.default_params.clone(),
             cwd: ctx.cwd.clone(),
+            artifact_paths: ctx.artifact_paths.clone(),
             event_tx: ctx.event_tx.clone(),
             cancel_flag: ctx.cancel_flag.clone(),
             turn_cancel_flag: ctx.turn_cancel_flag.clone(),
@@ -4513,6 +4518,10 @@ enum CheckpointRecord {
         /// default 兼容。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// Explicit task artifact boundary. Persisted so a cold resume cannot
+        /// silently regain unrestricted writes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_paths: Option<Vec<String>>,
     },
     /// One completed step.
     Step {
@@ -4653,6 +4662,8 @@ pub struct CheckpointState {
     fan_out: std::collections::HashMap<String, Vec<(String, String)>>,
     /// Meta 里的 session。旧文件没有这一栏。
     session_id: Option<String>,
+    /// Persisted task-level write boundary. Old checkpoints are unscoped.
+    artifact_paths: Option<Vec<String>>,
     started_at: u64,
 }
 
@@ -4680,7 +4691,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
             path.display()
         )
     })?;
-    let mut meta: Option<(String, String, Option<String>, u64)> = None;
+    let mut meta: Option<(String, String, Option<String>, Option<Vec<String>>, u64)> = None;
     let mut completed = Vec::new();
     let mut answers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut fan_out: std::collections::HashMap<String, Vec<(String, String)>> =
@@ -4701,11 +4712,12 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
                 workflow_name,
                 topic,
                 session_id,
+                artifact_paths,
                 started_at,
                 ..
             } => {
                 if meta.is_none() {
-                    meta = Some((workflow_name, topic, session_id, started_at));
+                    meta = Some((workflow_name, topic, session_id, artifact_paths, started_at));
                 }
             }
             CheckpointRecord::Step {
@@ -4742,7 +4754,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
             }
         }
     }
-    let (workflow_name, topic, session_id, started_at) =
+    let (workflow_name, topic, session_id, artifact_paths, started_at) =
         meta.ok_or_else(|| format!("checkpoint '{wf_id}' has no meta line (corrupt?)"))?;
     Ok(CheckpointState {
         workflow_name,
@@ -4751,6 +4763,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
         answers,
         fan_out,
         session_id,
+        artifact_paths,
         started_at,
     })
 }
@@ -4975,6 +4988,7 @@ impl CheckpointLog {
     /// seeds the completed counter with steps carried over from a
     /// previous run's checkpoint. `session_id` 写进 meta 首行，供
     /// plan 工具的直提门禁按 session 查询「是否跑过 workflow」。
+    #[cfg(test)]
     fn new(
         cwd: &Path,
         wf_id: &str,
@@ -4982,6 +4996,18 @@ impl CheckpointLog {
         topic: &str,
         resumed: impl IntoIterator<Item = String>,
         session_id: Option<String>,
+    ) -> Self {
+        Self::new_scoped(cwd, wf_id, workflow_name, topic, resumed, session_id, None)
+    }
+
+    fn new_scoped(
+        cwd: &Path,
+        wf_id: &str,
+        workflow_name: &str,
+        topic: &str,
+        resumed: impl IntoIterator<Item = String>,
+        session_id: Option<String>,
+        artifact_paths: Option<Vec<String>>,
     ) -> Self {
         append_checkpoint(
             cwd,
@@ -4992,6 +5018,7 @@ impl CheckpointLog {
                 topic: topic.to_string(),
                 started_at: now_secs(),
                 session_id,
+                artifact_paths,
             },
         );
         Self {
@@ -10381,12 +10408,33 @@ async fn run_workflow_inner(
     } else {
         None
     };
+    // A resumed run inherits the original task boundary when its host cannot
+    // reconstruct task metadata (for example after server restart).
+    let mut effective_artifact_paths = ctx.artifact_paths.clone().or_else(|| {
+        resume
+            .as_ref()
+            .and_then(|state| state.artifact_paths.clone())
+    });
+    // learn_loop's model-authored drafts live in a session-private engine
+    // workspace before deterministic publication. Explicit task scopes grant
+    // that exact internal prefix automatically, never the whole `.latte` tree.
+    if wf.name == "learn_loop" {
+        if let Some(paths) = &mut effective_artifact_paths {
+            let internal = crate::learn_doc::learn_root_rel(ctx.session_id.as_deref());
+            if !paths.contains(&internal) {
+                paths.push(internal);
+            }
+        }
+    }
+    let artifact_scope_changed = effective_artifact_paths != ctx.artifact_paths;
     let owned_ctx;
     let ctx: &WorkflowRunContext = if created_staging.is_some()
         || created_budget.is_some()
         || created_token_budget.is_some()
+        || artifact_scope_changed
     {
         owned_ctx = WorkflowRunContext {
+            artifact_paths: effective_artifact_paths,
             staging: created_staging.clone().or_else(|| ctx.staging.clone()),
             dispatch_budget: created_budget
                 .clone()
@@ -10418,7 +10466,7 @@ async fn run_workflow_inner(
             });
         }
     }
-    let ckpt = CheckpointLog::new(
+    let ckpt = CheckpointLog::new_scoped(
         &ctx.cwd,
         &wf_id,
         &name,
@@ -10433,10 +10481,10 @@ async fn run_workflow_inner(
             })
             .unwrap_or_default(),
         ctx.session_id.clone(),
+        ctx.artifact_paths.clone(),
     );
-    // Copy the carried-over step records into the new run's checkpoint
-    // file so it stays self-contained (a second resume needs only the
-    // new wf_id).
+    // Copy the carried-over records into the new run's checkpoint file so it
+    // stays self-contained (a second resume needs only the new wf_id).
     if let Some(state) = &resume {
         for (step_id, output_key, output) in &state.completed {
             append_checkpoint(
@@ -10851,6 +10899,113 @@ fn wrap_write_path_allowlist(tm: &Arc<dyn ToolManager>, cwd: &Path, patterns: &[
     }
 }
 
+fn artifact_target_stays_in_workspace(cwd: &Path, relative: &str) -> bool {
+    let Ok(root) = cwd.canonicalize() else {
+        return false;
+    };
+    let mut probe = cwd.join(relative);
+    while !probe.exists() {
+        if !probe.pop() || !probe.starts_with(cwd) {
+            return false;
+        }
+    }
+    probe
+        .canonicalize()
+        .is_ok_and(|resolved| resolved.starts_with(root))
+}
+
+/// Task-level outer write boundary. Unlike a workflow step allowlist, `Some([])`
+/// means read-only and therefore still wraps every managed write tool. Entries
+/// are prefixes: `docs/learn` authorizes that directory and all descendants.
+fn wrap_task_artifact_scope(
+    tm: &Arc<dyn ToolManager>,
+    cwd: &Path,
+    artifact_paths: Option<&[String]>,
+) {
+    let Some(paths) = artifact_paths else { return };
+    let allowed: Vec<String> = paths
+        .iter()
+        .filter_map(|path| workflow_relative_read_path(cwd, path))
+        .collect();
+    for name in WRITE_SCOPED_TOOLS {
+        let Some(orig) = tm.get_tool(name) else {
+            continue;
+        };
+        let allowed_desc = if allowed.is_empty() {
+            "只读（无允许产物路径）".to_string()
+        } else {
+            allowed.join(", ")
+        };
+        let allowed = allowed.clone();
+        let allowed_desc_for_handler = allowed_desc.clone();
+        let cwd = cwd.to_path_buf();
+        let orig_handler = orig.handler.clone();
+        let tool_name = name.to_string();
+        let handler: SharedToolHandler = Arc::new(move |input, ctx| {
+            let allowed = allowed.clone();
+            let allowed_desc_for_handler = allowed_desc_for_handler.clone();
+            let cwd = cwd.clone();
+            let orig_handler = orig_handler.clone();
+            let tool_name = tool_name.clone();
+            Box::pin(async move {
+                let mut requested: Vec<&str> = Vec::new();
+                if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                    requested.push(path);
+                }
+                if let Some(paths) = input.get("paths").and_then(|v| v.as_array()) {
+                    for value in paths {
+                        requested.push(value.as_str().ok_or_else(|| {
+                            ToolError::other(format!("{tool_name}.paths must contain only strings"))
+                        })?);
+                    }
+                }
+                if requested.is_empty() {
+                    return Err(ToolError::other(format!(
+                        "task artifact scope: {tool_name} 缺少 path，无法核验写入范围"
+                    )));
+                }
+                for spec in requested {
+                    let rel = workflow_relative_read_path(&cwd, spec).ok_or_else(|| {
+                        ToolError::other(format!(
+                            "task artifact scope rejects path outside workspace: {spec}"
+                        ))
+                    })?;
+                    if !artifact_target_stays_in_workspace(&cwd, &rel) {
+                        return Err(ToolError::other(format!(
+                            "task artifact scope rejects symlink escape: {rel}"
+                        )));
+                    }
+                    let permitted = allowed.iter().any(|prefix| {
+                        rel == *prefix
+                            || rel
+                                .strip_prefix(prefix)
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    });
+                    if !permitted {
+                        return Err(ToolError::other(format!(
+                            "task artifact scope rejects '{rel}'; allowed: {allowed_desc_for_handler}"
+                        )));
+                    }
+                }
+                (orig_handler)(input, ctx).await
+            })
+        });
+        let wrapped = Tool::builder(
+            *name,
+            format!(
+                "{}（任务产物范围由引擎强制：{allowed_desc}）",
+                orig.description
+            ),
+            orig.input_schema.clone(),
+            handler,
+        )
+        .concurrency_safe(orig.concurrency_safe)
+        .build();
+        tm.unregister(name);
+        tm.register(wrapped, None);
+    }
+}
+
 /// Enforce the step's read allowlist at the actual handler boundary. The model
 /// can still *request* any path, but unauthorized paths never reach the read
 /// implementation and never enter the tool-result context.
@@ -11083,6 +11238,7 @@ async fn build_role_runner(
     step_tools: &[String],
     read_path_allowlist: &[String],
     write_path_allowlist: &[String],
+    task_artifact_paths: Option<&[String]>,
     prompt_token_budget: Option<usize>,
     prompt_token_ratio: Option<f64>,
     context_overflow_restart: bool,
@@ -11132,6 +11288,24 @@ async fn build_role_runner(
         );
     }
     role.allowed_tools = effective_tools;
+    // Shell and opaque writer tools do not expose a trustworthy path field,
+    // so an explicit artifact boundary must reject the step instead of
+    // pretending the managed write wrappers cover it.
+    if task_artifact_paths.is_some() {
+        const OPAQUE_WRITERS: &[&str] = &["bash", "spawn", "doc_write", "doc_index"];
+        let blocked: Vec<&str> = role
+            .allowed_tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| OPAQUE_WRITERS.contains(name))
+            .collect();
+        if !blocked.is_empty() {
+            return Err(format!(
+                "task artifact scope cannot safely authorize opaque writer tool(s): {}",
+                blocked.join(", ")
+            ));
+        }
+    }
     // 与 chat 的 build_runner 一致：带工具的角色必须拿到工具调用协议
     // 提示 + 系统 ground truth（cwd 等），否则模型不知道该用工具，
     // 会回答"我没有文件访问权限"。
@@ -11191,6 +11365,9 @@ async fn build_role_runner(
         // 原始项目路径，再由内层 overlay 决定是否改读暂存副本。
         wrap_read_path_allowlist(&rtm, cwd, read_path_allowlist);
         wrap_write_path_allowlist(&rtm, cwd, write_path_allowlist);
+        // Task scope is wrapped last, so it forms an outer AND boundary around
+        // the step-specific allowlist. `Some([])` is deliberately read-only.
+        wrap_task_artifact_scope(&rtm, cwd, task_artifact_paths);
         // 注册 plan 工具：角色有"plan"时，注册 tool 使其在 LLM 可见
         // （与 controller::build_runner 对齐）。workflow 引擎不走
         // delegate 工具，阶段门无人消费——调用方没给句柄时给一个私有的
@@ -11342,6 +11519,9 @@ struct SpeakerDispatch {
     default_params: GenerateParams,
     event_tx: broadcast::Sender<ChatEvent>,
     cwd: PathBuf,
+    /// Inherited task-level artifact boundary; unlike the step allowlist,
+    /// `Some([])` deliberately rejects every managed write.
+    artifact_paths: Option<Vec<String>>,
     cancel_flag: Arc<AtomicBool>,
     /// Per-turn cancellation flag, distinct from `cancel_flag`. When
     /// `Some`, the step timeout emits `TimeoutWarning` + waits for user
@@ -11436,6 +11616,7 @@ impl SpeakerDispatch {
             resolver: ctx.resolver.clone(),
             default_params: ctx.default_params.clone(),
             cwd: ctx.cwd.clone(),
+            artifact_paths: ctx.artifact_paths.clone(),
             event_tx: ctx.event_tx.clone(),
             cancel_flag: ctx.cancel_flag.clone(),
             turn_cancel_flag: ctx.turn_cancel_flag.clone(),
@@ -11885,6 +12066,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     &inp.step_tools,
                     &inp.read_path_allowlist,
                     &inp.write_path_allowlist,
+                    inp.artifact_paths.as_deref(),
                     inp.prompt_token_budget,
                     inp.prompt_token_ratio,
                     inp.context_overflow_restart,
@@ -14414,6 +14596,7 @@ struct DagStepInput {
     event_tx: broadcast::Sender<ChatEvent>,
     default_params: GenerateParams,
     cwd: PathBuf,
+    artifact_paths: Option<Vec<String>>,
     cancel_flag: Arc<AtomicBool>,
     turn_cancel_flag: Option<Arc<AtomicBool>>,
     agent_pause_gate: Option<Arc<crate::pause_gate::AgentPauseGate>>,
@@ -14491,6 +14674,7 @@ async fn run_dag_step(
             resolver: inp.resolver.clone(),
             default_params: inp.default_params.clone(),
             cwd: inp.cwd.clone(),
+            artifact_paths: inp.artifact_paths.clone(),
             event_tx: inp.event_tx.clone(),
             cancel_flag: inp.cancel_flag.clone(),
             turn_cancel_flag: inp.turn_cancel_flag.clone(),
@@ -14617,6 +14801,7 @@ async fn run_dag_step(
                 resolver: inp.resolver.clone(),
                 default_params: inp.default_params.clone(),
                 cwd: inp.cwd.clone(),
+                artifact_paths: inp.artifact_paths.clone(),
                 cancel_flag: inp.cancel_flag.clone(),
                 event_tx: inp.event_tx.clone(),
                 turn_cancel_flag: inp.turn_cancel_flag.clone(),
@@ -15384,6 +15569,7 @@ async fn run_workflow_dag(
                         merged: ctx.merged.clone(),
                         resolver: ctx.resolver.clone(),
                         default_params: ctx.default_params.clone(),
+                        artifact_paths: ctx.artifact_paths.clone(),
                         cancel_flag: ctx.cancel_flag.clone(),
                         cwd: ctx.cwd.clone(),
                         event_tx: ctx.event_tx.clone(),
@@ -15685,6 +15871,7 @@ mod remove_session_runs_tests {
                     topic: "t".into(),
                     started_at: 0,
                     session_id: Some(sid.into()),
+                    artifact_paths: None,
                 },
             );
             std::fs::create_dir_all(cwd.join(".latte/staging").join(wf)).unwrap();
@@ -19175,6 +19362,7 @@ mod contract_engine_tests {
                 resolver,
                 default_params: GenerateParams::default(),
                 cwd: std::env::temp_dir(),
+                artifact_paths: None,
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 turn_cancel_flag: None,
@@ -19235,6 +19423,7 @@ forbid = ["TBD"]
             &[],
             None,
             None,
+            None,
             false,
             None,
             None,
@@ -19273,6 +19462,7 @@ forbid = ["TBD"]
             &[],
             &[],
             &[],
+            None,
             None,
             None,
             false,
@@ -19349,6 +19539,7 @@ forbid = ["TBD"]
             &[],
             &[],
             &[],
+            None,
             None,
             None,
             false,
@@ -21136,6 +21327,7 @@ mod resume_tests {
                 resolver,
                 default_params: GenerateParams::default(),
                 cwd,
+                artifact_paths: None,
                 event_tx,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 turn_cancel_flag: None,
@@ -24081,6 +24273,7 @@ mod loop_tests {
                 resolver,
                 default_params: GenerateParams::default(),
                 cwd: std::env::temp_dir(),
+                artifact_paths: None,
                 event_tx,
                 turn_cancel_flag: None,
                 cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -25675,6 +25868,7 @@ task = "补充疑问"
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -26181,6 +26375,7 @@ task = "补充疑问"
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -28406,6 +28601,7 @@ output_key = "plan_out"
             resolver,
             default_params: GenerateParams::default(),
             cwd: cwd.to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -28548,6 +28744,7 @@ output_key = "plan_out"
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -28605,6 +28802,7 @@ output_key = "plan_out"
             resolver,
             default_params: GenerateParams::default(),
             cwd: PathBuf::from("."),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -28720,6 +28918,7 @@ max_retries = 2
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -28905,6 +29104,7 @@ max_iterations = 10
             resolver,
             default_params: GenerateParams::default(),
             cwd: cwd.clone(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -28986,6 +29186,7 @@ max_retries = {max_retries}
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -29246,6 +29447,7 @@ max_retries = 0
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -29576,6 +29778,7 @@ max_retries = 2
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -29800,6 +30003,7 @@ max_retries = 2
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -30078,6 +30282,7 @@ max_retries = 2
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -30217,6 +30422,7 @@ task = "后续步 {{outline_out}}"
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -30468,6 +30674,7 @@ task = "TAIL_STEP"
             resolver,
             default_params: GenerateParams::default(),
             cwd: dir.path().to_path_buf(),
+            artifact_paths: None,
             event_tx,
             turn_cancel_flag: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),

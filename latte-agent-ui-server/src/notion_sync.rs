@@ -747,6 +747,7 @@ mod tests {
             scheduled_at: None,
             workflow: Some("tdd_development".into()),
             paths: vec!["src/ringbuf".into()],
+            artifact_paths: Some(vec!["src/ringbuf".into()]),
             depends_on: vec![],
             dispatch_pending: false,
             isolated: None,

@@ -1273,6 +1273,22 @@ export function mountTaskBoard(opts: {
   descInput.placeholder = "任务描述：背景、验收标准、交给 manager 的说明…";
   descLabel.appendChild(descInput);
 
+  const pathsLabel = el("label", "tb-field", "输入/涉及路径（每行一个）");
+  const pathsInput = document.createElement("textarea");
+  pathsInput.rows = 2;
+  pathsInput.placeholder = "例如 src/cache/；用于上下文与并发冲突判断，不授予写权限";
+  pathsLabel.appendChild(pathsInput);
+
+  const artifactLabel = el("label", "tb-field", "产物写入边界（每行一个）");
+  const artifactEnabled = document.createElement("input");
+  artifactEnabled.type = "checkbox";
+  const artifactToggle = el("span", undefined, " 启用硬边界（勾选且留空 = 只读）");
+  artifactLabel.append(artifactEnabled, artifactToggle);
+  const artifactInput = document.createElement("textarea");
+  artifactInput.rows = 2;
+  artifactInput.placeholder = "例如 docs/learn/；未勾选 = 兼容旧任务，不限制写入";
+  artifactLabel.appendChild(artifactInput);
+
   const row = el("div", "tb-form-row");
   const prioLabel = el("label", "tb-field", "优先级");
   const prioSelect = document.createElement("select");
@@ -1326,7 +1342,7 @@ export function mountTaskBoard(opts: {
   formOk.type = "submit";
   formActions.append(formCancel, formOk);
 
-  taskForm.append(titleLabel, descLabel, row, depsLabel, formActions);
+  taskForm.append(titleLabel, descLabel, pathsLabel, artifactLabel, row, depsLabel, formActions);
   taskModal.appendChild(taskForm);
   taskMask.addEventListener("click", (e) => {
     if (e.target === taskMask) closeTaskModal();
@@ -1387,6 +1403,13 @@ export function mountTaskBoard(opts: {
     formOk.textContent = opts2.edit ? "保存" : "创建";
     titleInput.value = opts2.edit?.title ?? "";
     descInput.value = opts2.edit?.description ?? "";
+    pathsInput.value = (opts2.edit?.paths ?? []).join("\n");
+    artifactEnabled.checked = opts2.edit?.artifact_paths != null;
+    artifactInput.value = (opts2.edit?.artifact_paths ?? []).join("\n");
+    artifactInput.disabled = !artifactEnabled.checked;
+    artifactEnabled.onchange = () => {
+      artifactInput.disabled = !artifactEnabled.checked;
+    };
     prioSelect.value = String(opts2.edit?.priority ?? 3);
 
     // 父任务候选：列全部任务（按树形缩进帮助辨识层级）；编辑时排除
@@ -1463,6 +1486,12 @@ export function mountTaskBoard(opts: {
     const title = titleInput.value.trim();
     if (!title) { toast("请填写标题"); return; }
     const description = descInput.value.trim();
+    const parsePaths = (value: string): string[] => value
+      .split(/\r?\n|,/)
+      .map((path) => path.trim())
+      .filter(Boolean);
+    const paths = parsePaths(pathsInput.value);
+    const artifact_paths = artifactEnabled.checked ? parsePaths(artifactInput.value) : null;
     const priority = Number(prioSelect.value);
     const workflow = wfSelect.value;
     const task_type = (typeSelect as HTMLSelectElement).value;
@@ -1476,6 +1505,8 @@ export function mountTaskBoard(opts: {
           task_type: task_type || null,
           workflow: workflow || null,
           isolated,
+          paths,
+          artifact_paths,
           depends_on,
         });
         toast(`${editingTaskId} 已保存`);
@@ -1489,6 +1520,8 @@ export function mountTaskBoard(opts: {
           task_type: task_type || undefined,
           workflow: workflow || undefined,
           isolated: isolated ?? undefined,
+          paths: paths.length > 0 ? paths : undefined,
+          artifact_paths: artifactEnabled.checked ? artifact_paths ?? [] : undefined,
           depends_on: depends_on.length > 0 ? depends_on : undefined,
         });
         toast(`${created.id} 已创建${parentId ? `（${parentId} 的子任务）` : ""}`);

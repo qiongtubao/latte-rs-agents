@@ -120,6 +120,11 @@ pub struct Task {
     /// 旧落盘文件无此字段 → 空。
     #[serde(default)]
     pub paths: Vec<String>,
+    /// 任务产物允许写入的项目相对前缀。三态用于兼容旧任务：
+    /// `None` = 未启用硬边界；`Some([])` = 明确只读；非空 = 只允许
+    /// 写入这些前缀。不能复用 `paths`，后者经常是只读源码输入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_paths: Option<Vec<String>>,
     /// 依赖的任务 id：全部进入终态（done/cancelled）后本任务才可派发。
     /// 空 = 无依赖 → 与同族兄弟**并行**（v2 语义；此前同族一律串行）。
     ///
@@ -691,6 +696,7 @@ impl TaskStore {
             scheduled_at,
             workflow,
             paths: vec![],
+            artifact_paths: None,
             depends_on: vec![],
             dispatch_pending: false,
             isolated: None,
@@ -1018,6 +1024,15 @@ pub struct CreateTaskRequest {
         alias = "files"
     )]
     pub paths: Vec<String>,
+    /// 任务产物写入边界。缺字段 = 兼容旧任务、不启用；空数组 = 明确只读；
+    /// 非空数组 = 只允许写入这些项目相对前缀。
+    #[serde(
+        default,
+        alias = "output_paths",
+        alias = "write_paths",
+        alias = "artifacts"
+    )]
+    pub artifact_paths: Option<Vec<String>>,
     /// 依赖的任务 id：全部 done 后才可派发。未知 id / 自依赖 / 父子
     /// 关系 / 成环一律 400（不静默丢弃）。
     #[serde(
@@ -1074,6 +1089,16 @@ pub struct TaskPatch {
         alias = "files"
     )]
     pub paths: Option<Vec<String>>,
+    /// 产物写入边界：缺省 = 不变；null = 关闭边界（兼容模式）；空数组 =
+    /// 明确只读；非空数组 = 只允许这些项目相对前缀。
+    #[serde(
+        default,
+        alias = "output_paths",
+        alias = "write_paths",
+        alias = "artifacts",
+        deserialize_with = "deserialize_nullable"
+    )]
+    pub artifact_paths: Option<Option<Vec<String>>>,
     /// 依赖的任务 id：缺省 = 不变；数组 = 整体替换（空数组 = 清空）。
     /// 校验同 create（未知 id / 自依赖 / 父子关系 / 成环 → 400）。
     #[serde(
@@ -1151,6 +1176,15 @@ pub struct ImportTask {
         alias = "files"
     )]
     pub paths: Vec<String>,
+    /// 任务产物写入边界。缺字段 = 旧式不受限；空数组 = 明确只读；
+    /// 非空数组 = 只允许写入这些项目相对前缀。
+    #[serde(
+        default,
+        alias = "output_paths",
+        alias = "write_paths",
+        alias = "artifacts"
+    )]
+    pub artifact_paths: Option<Vec<String>>,
     /// 依赖的任务：可写**已存在的任务 id**，也可写同一份清单里其他任务
     /// 的**标题**（拆分场景下新任务还没有 id）。解析在全部任务创建完成
     /// 后统一做（两趟），所以前向引用（依赖后面才出现的任务）同样有效。
@@ -1216,6 +1250,12 @@ pub fn get_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> {
 pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, ApiError> {
     validate_task_type(&b.cwd, req.task_type.as_deref())?;
     validate_workflow_name(&b.cwd, req.workflow.as_deref())?;
+    let artifact_paths = req
+        .artifact_paths
+        .clone()
+        .map(normalize_artifact_paths)
+        .transpose()
+        .map_err(ApiError::bad_request)?;
     let mut store = b.tasks.write();
     let t = store
         .create(
@@ -1237,6 +1277,10 @@ pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, Ap
     let paths = normalize_paths(req.paths);
     if !paths.is_empty() {
         store.get_mut(&id).expect("刚创建").paths = paths;
+        store.persist(&id).map_err(ApiError::internal)?;
+    }
+    if let Some(paths) = artifact_paths {
+        store.get_mut(&id).expect("刚创建").artifact_paths = Some(paths);
         store.persist(&id).map_err(ApiError::internal)?;
     }
     if !req.depends_on.is_empty() {
@@ -1262,6 +1306,42 @@ fn normalize_paths(paths: Vec<String>) -> Vec<String> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty() && seen.insert(p.clone()))
         .collect()
+}
+
+/// 产物范围比调度 `paths` 更严格：只接受项目相对前缀，拒绝根目录、
+/// 绝对路径与 `..`。目标可以尚不存在，因为它描述的是待创建产物。
+fn normalize_artifact_paths(paths: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in paths {
+        let normalized_separators = raw.trim().replace('\\', "/");
+        let path = normalized_separators
+            .trim_start_matches("./")
+            .trim_end_matches('/');
+        if path.is_empty() || path == "." {
+            return Err("artifact_paths 不能包含空路径或项目根目录".into());
+        }
+        let parsed = std::path::Path::new(path);
+        if parsed.is_absolute()
+            || parsed.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!(
+                "artifact_paths 只接受项目相对路径且不能包含 `..`：{raw:?}"
+            ));
+        }
+        let normalized = path.replace('\\', "/");
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
 }
 
 /// 校验 workflow 名：`Some(name)` 时必须能在项目/全局
@@ -1508,6 +1588,11 @@ fn import_one(
     )?;
     if !item.paths.is_empty() {
         store.get_mut(&task.id).expect("刚创建").paths = normalize_paths(item.paths.clone());
+        store.persist(&task.id)?;
+    }
+    if let Some(paths) = &item.artifact_paths {
+        let paths = normalize_artifact_paths(paths.clone())?;
+        store.get_mut(&task.id).expect("刚创建").artifact_paths = Some(paths);
         store.persist(&task.id)?;
     }
     // 依赖引用留到第二趟解析（前向引用 + 标题引用都要等全部任务建完）。
@@ -1780,6 +1865,13 @@ fn approve_plan_stage(b: &UiBackend, plan_id: &str) {
 }
 
 pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView, ApiError> {
+    let artifact_paths = match patch.artifact_paths.clone() {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(paths)) => Some(Some(
+            normalize_artifact_paths(paths).map_err(ApiError::bad_request)?,
+        )),
+    };
     let mut hook: Option<&str> = None;
     let mut hook_topic: Option<String> = None;
     let mut wt_action: Option<WorktreeAction> = None;
@@ -1813,6 +1905,9 @@ pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView
             // 归一化：去空白、丢空串、去重（保持首次出现顺序）。派发时
             // 的范围互斥按前缀比较，空串会匹配一切，必须挡在入口。
             t.paths = normalize_paths(paths);
+        }
+        if let Some(paths) = artifact_paths {
+            t.artifact_paths = paths;
         }
         if let Some(sched) = patch.scheduled_at {
             t.scheduled_at = sched;
@@ -2125,6 +2220,7 @@ fn spawn_lifecycle_hook(
             resolver: b.resolver.clone(),
             default_params: GenerateParams::default(),
             cwd: run_cwd,
+            artifact_paths: None,
             event_tx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             turn_cancel_flag: turn_cancel,
@@ -2383,13 +2479,24 @@ fn build_dispatch_message(
     priority: i64,
     description: &str,
     paths: &[String],
+    artifact_paths: Option<&[String]>,
     children: &[Task],
 ) -> String {
     let mut msg = format!("[任务 {id}] {title}\n优先级：P{priority}\n描述：{description}\n");
     if !paths.is_empty() {
-        msg.push_str("【任务声明范围 task.paths】\n");
+        msg.push_str("【输入/涉及范围 task.paths（不代表写权限）】\n");
         for path in paths {
             msg.push_str(&format!("  - {path}\n"));
+        }
+    }
+    if let Some(paths) = artifact_paths {
+        msg.push_str("【产物写入边界 task.artifact_paths（引擎强制）】\n");
+        if paths.is_empty() {
+            msg.push_str("  - 只读：不允许模型写入项目文件\n");
+        } else {
+            for path in paths {
+                msg.push_str(&format!("  - {path}\n"));
+            }
         }
     }
     if !children.is_empty() {
@@ -2472,13 +2579,18 @@ fn build_family_context(store: &TaskStore, id: &str) -> String {
             } else {
                 t.paths.join(", ")
             };
+            let artifacts = match &t.artifact_paths {
+                None => "未启用".to_string(),
+                Some(paths) if paths.is_empty() => "只读".to_string(),
+                Some(paths) => paths.join(", "),
+            };
             let deps = if t.depends_on.is_empty() {
                 String::new()
             } else {
                 format!(" depends_on={}", t.depends_on.join(","))
             };
             out.push_str(&format!(
-                "  [{}] {}（{}）paths={paths}{deps}\n",
+                "  [{}] {}（{}）paths={paths} artifact_paths={artifacts}{deps}\n",
                 t.id, t.title, t.state
             ));
         }
@@ -2597,6 +2709,7 @@ pub async fn dispatch_task(
         task_type,
         workflow,
         task_paths,
+        task_artifact_paths,
         prev_state,
         recent_notes,
         family_ctx,
@@ -2630,6 +2743,7 @@ pub async fn dispatch_task(
             t.task_type.clone(),
             t.workflow.clone(),
             t.paths.clone(),
+            t.artifact_paths.clone(),
             t.state.clone(),
             notes,
             build_family_context(&store, id),
@@ -2657,6 +2771,7 @@ pub async fn dispatch_task(
         priority,
         &description,
         &task_paths,
+        task_artifact_paths.as_deref(),
         &children,
     );
     // 任务族上下文（祖先链 + 兄弟 paths 边界）随本体一起下发：子任务
@@ -2701,6 +2816,15 @@ pub async fn dispatch_task(
         };
         (bound.clone(), format!("{base_msg}{feedback}"))
     } else {
+        // Ordinary manager sessions and recursive delegates do not yet share
+        // the workflow tool boundary. Refuse an explicit hard scope rather
+        // than advertise a guarantee that this execution path cannot enforce.
+        if task_artifact_paths.is_some() {
+            let _ = api::delete_session(b, &info.session_id).await;
+            return Err(ApiError::bad_request(
+                "artifact_paths requires a task_type/workflow-backed task; ordinary manager dispatch cannot enforce it",
+            ));
+        }
         // 无绑定 → 走普通 manager 会话
         let feedback = if prev_state == "rework" && !recent_notes.is_empty() {
             format!(
@@ -2866,6 +2990,7 @@ pub async fn dispatch_task(
                 resolver: b2.resolver.clone(),
                 default_params: GenerateParams::default(),
                 cwd: run_cwd.clone(),
+                artifact_paths: task_artifact_paths.clone(),
                 event_tx: event_tx.clone(),
                 cancel_flag: cancel.clone(),
                 turn_cancel_flag: turn_cancel.clone(),
@@ -3090,6 +3215,7 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             resolver: b2.resolver.clone(),
             default_params: GenerateParams::default(),
             cwd: b2.cwd.clone(),
+            artifact_paths: None,
             event_tx: event_tx.clone(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             turn_cancel_flag: turn_cancel,
@@ -3297,6 +3423,7 @@ async fn chain_code_review(
         resolver: b.resolver.clone(),
         default_params: GenerateParams::default(),
         cwd: run_cwd,
+        artifact_paths: None,
         event_tx,
         cancel_flag: Arc::new(AtomicBool::new(false)),
         turn_cancel_flag: turn_cancel,
@@ -3422,6 +3549,18 @@ fn is_ancestor_of(store: &TaskStore, ancestor: &str, id: &str) -> bool {
 /// 完成"的聚合节点）处于 in_progress 时，**不阻塞其后代**派发——
 /// 否则子任务永远无法开跑（见 [`dispatch_task`] 的容器分流）。
 /// 同树其他分支、以及后代在跑反过来阻塞祖先被当叶子派发，仍然有效。
+fn task_conflict_paths(task: &Task) -> Vec<String> {
+    let mut paths = task.paths.clone();
+    if let Some(artifacts) = &task.artifact_paths {
+        for path in artifacts {
+            if !paths.contains(path) {
+                paths.push(path.clone());
+            }
+        }
+    }
+    paths
+}
+
 fn family_running_conflict(store: &TaskStore, id: &str) -> Option<(String, String)> {
     let me = store.get(id)?;
     let root = store.root_of(id);
@@ -3437,18 +3576,22 @@ fn family_running_conflict(store: &TaskStore, id: &str) -> Option<(String, Strin
             if is_ancestor_of(store, &oid, id) {
                 return None;
             }
-            match (me.paths.is_empty(), o.paths.is_empty()) {
-                // 双方都声明了范围：只有真重叠才算冲突。
-                (false, false) => first_path_overlap(&me.paths, &o.paths).map(|(mine, theirs)| {
-                    (
-                        o.id.clone(),
-                        format!("文件范围重叠（本任务 {mine:?} 与对方 {theirs:?}）"),
-                    )
-                }),
+            let mine_paths = task_conflict_paths(me);
+            let other_paths = task_conflict_paths(o);
+            match (mine_paths.is_empty(), other_paths.is_empty()) {
+                // 双方都声明了范围：只有输入/产物范围真重叠才算冲突。
+                (false, false) => {
+                    first_path_overlap(&mine_paths, &other_paths).map(|(mine, theirs)| {
+                        (
+                            o.id.clone(),
+                            format!("文件或产物范围重叠（本任务 {mine:?} 与对方 {theirs:?}）"),
+                        )
+                    })
+                }
                 // 有一方没声明范围 → 无法证明不冲突，保守串行。
                 _ => Some((
                     o.id.clone(),
-                    "同族任务未声明 paths，无法证明不会写同一批文件".to_string(),
+                    "同族任务未声明 paths/artifact_paths，无法证明不会写同一批文件".to_string(),
                 )),
             }
         })
@@ -3520,14 +3663,16 @@ fn first_path_overlap(a: &[String], b: &[String]) -> Option<(String, String)> {
 /// 覆盖，靠显式声明的 paths 拦住。
 fn path_running_conflict(store: &TaskStore, id: &str) -> Option<(String, (String, String))> {
     let t = store.get(id)?;
-    if t.paths.is_empty() {
+    let mine = task_conflict_paths(t);
+    if mine.is_empty() {
         return None;
     }
     store.list().into_iter().find_map(|other| {
-        if other.id == id || other.state != "in_progress" || other.paths.is_empty() {
+        let theirs = task_conflict_paths(&other);
+        if other.id == id || other.state != "in_progress" || theirs.is_empty() {
             return None;
         }
-        first_path_overlap(&t.paths, &other.paths).map(|pair| (other.id.clone(), pair))
+        first_path_overlap(&mine, &theirs).map(|pair| (other.id.clone(), pair))
     })
 }
 

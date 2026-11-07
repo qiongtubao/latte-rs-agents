@@ -149,12 +149,14 @@ task = """你是章节细化者，本次**只负责一章**。这一章的骨架
      "task_type": "<原样照抄骨架的 task_type>",
      "workflow": "",
      "depends_on": [ /* 原样照抄骨架的 depends_on */ ],
-     "paths": [ /* 原样照抄骨架 paths，只保留核实过存在的 */ ],
+     "paths": [ /* 原样照抄骨架 paths，只保留核实过存在的源码输入 */ ],
+     "artifact_paths": ["docs/learn"],
      "subtasks": []
    }
 
 硬规则：
 - `title` / `depends_on` **原样照抄骨架**（装配时引擎也会以骨架为准覆盖，你别改——改了只会被覆盖回去，白费 token）。
+- `artifact_paths` 固定写 `["docs/learn"]`；源码锚点只能放 `paths`，不得把源码输入误写成产物授权。
 - `labels` 必须含「学习」「只读」，并带**且只有一个**层级标签（层-地基 / 层-树干 / 层-枝干 / 层-树叶，照抄骨架的 layer）。
 - 枝干章的 description **以「回应事实N：」开头**（照抄骨架的 responds_to），这句要一路传给后面精读这一章的流程，别省。
 - `description` 提到其他章只能写 chNN，且只许提本章骨架 `depends_on` **直接列出**的章；要用后章才讲的产物（如基准），别写进本章验收。

@@ -1450,8 +1450,10 @@ export interface TaskView {
   created_at: number;
   updated_at: number;
   history: TaskHistoryEntry[];
-  /** 任务声明涉及的文件/目录前缀；同族任务想并行必须两边都声明且不重叠。 */
+  /** 任务声明涉及的文件/目录前缀；用于输入上下文和并发冲突判断，不代表写权限。 */
   paths: string[];
+  /** 任务产物写入边界；null = 旧式不受限，[] = 明确只读，非空 = 允许的项目相对前缀。 */
+  artifact_paths?: string[] | null;
   /** 依赖的任务 id：全部 done 后本任务才可派发（同族任务默认并行，顺序靠它表达）。 */
   depends_on: string[];
   /** 未满足的依赖 id（服务端算好）；非空 = 现在派发必然 409。 */
@@ -1485,8 +1487,10 @@ export interface TaskCreateBody {
   task_type?: string;
   /** 可选：创建时绑定 workflow（派发时直接运行该 workflow）。 */
   workflow?: string;
-  /** 任务涉及的文件/目录前缀（相对项目根）。 */
+  /** 任务涉及的输入文件/目录前缀（相对项目根）。 */
   paths?: string[];
+  /** 产物写入边界；[] 表示明确只读。缺省表示兼容旧式不受限。 */
+  artifact_paths?: string[];
   /** 依赖的任务 id：全部 done 后才可派发。 */
   depends_on?: string[];
   /** 是否在独立 git worktree 里执行；缺省跟随 task_type 默认。 */
@@ -1505,6 +1509,8 @@ export interface TaskPatchBody {
   workflow?: string | null;
   /** 缺省 = 不变；数组 = 整体替换（空数组 = 清空声明）。 */
   paths?: string[];
+  /** 缺省 = 不变；null = 关闭边界；[] = 明确只读；非空 = 允许写入前缀。 */
+  artifact_paths?: string[] | null;
   /** 缺省 = 不变；数组 = 整体替换（空数组 = 清空依赖）。未知 id/自依赖/成环 → 400。 */
   depends_on?: string[];
   /** 缺省 = 不变；null = 跟随类型默认；true/false = 显式开关隔离工作树。 */
@@ -1519,8 +1525,10 @@ export interface ImportTask {
   labels?: string[];
   task_type?: string;
   workflow?: string;
-  /** 任务涉及的文件/目录前缀（相对项目根）；并行执行时范围重叠的任务会被拒绝派发（409）。 */
+  /** 任务涉及的输入文件/目录前缀（相对项目根）；用于上下文和调度冲突。 */
   paths?: string[];
+  /** 产物写入边界；[] = 明确只读，缺省 = 兼容旧任务。 */
+  artifact_paths?: string[];
   /** 依赖：同批任务的标题，或已存在的任务 id。解析不到 → 整单 400（不静默丢弃）。 */
   depends_on?: string[];
   subtasks?: ImportTask[];

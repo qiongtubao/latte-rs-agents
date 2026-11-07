@@ -198,7 +198,7 @@ function mkTask(id: string, parent_id: string | null = null, over: Partial<TaskV
     state: "todo", labels: [], task_type: null, parent_id, sub_order: 0,
     scheduled_at: null, runs: [], created_at: 0, updated_at: 0, history: [],
     workflow: null, effective_workflow: null,
-    paths: [], depends_on: [], blocked_by: [], dispatch_pending: false,
+    paths: [], artifact_paths: null, depends_on: [], blocked_by: [], dispatch_pending: false,
     isolated: null, isolated_effective: false, worktree: null,
     sub_total: 0, sub_done: 0, sub_state_counts: {},
     ...over,

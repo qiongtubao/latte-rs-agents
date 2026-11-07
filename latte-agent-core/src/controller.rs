@@ -889,6 +889,17 @@ pub struct PlanTask {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub paths: Vec<String>,
+    /// 允许任务产出的文件/目录前缀（相对项目根）。与 `paths`（输入/
+    /// 调度范围）分离：`None` 保持旧任务的不受限行为，`Some([])` 明确
+    /// 表示只读，`Some([...])` 表示模型写工具只能落在这些前缀下。
+    #[serde(
+        default,
+        alias = "output_paths",
+        alias = "write_paths",
+        alias = "artifacts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_paths: Option<Vec<String>>,
     /// 依赖的任务：写**同一份清单里其他任务的标题**（新任务还没有 id），
     /// 或已存在的看板任务 id。看板据此排序执行：依赖全部 done 才派发。
     ///
@@ -6941,6 +6952,38 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
             .trim_end_matches('/')
             .to_string()
     };
+    // Artifact paths are write authorization, so reject broad/escaping forms
+    // before the task reaches the board. They may point to files not created yet.
+    fn validate_artifacts(tasks: &[PlanTask]) -> Result<(), String> {
+        for task in tasks {
+            if let Some(paths) = &task.artifact_paths {
+                for raw in paths {
+                    let normalized = raw.trim().replace('\\', "/");
+                    let path = normalized.trim_start_matches("./").trim_end_matches('/');
+                    let parsed = std::path::Path::new(path);
+                    if path.is_empty()
+                        || path == "."
+                        || parsed.is_absolute()
+                        || parsed.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::ParentDir
+                                    | std::path::Component::RootDir
+                                    | std::path::Component::Prefix(_)
+                            )
+                        })
+                    {
+                        return Err(format!(
+                            "artifact_paths 只接受非根目录的项目相对路径：{raw:?}"
+                        ));
+                    }
+                }
+            }
+            validate_artifacts(&task.subtasks)?;
+        }
+        Ok(())
+    }
+    validate_artifacts(tasks)?;
     // ── 存在性 ──
     // 反馈只报路径本身（不带任务标题）并去重：tool_result 只有 256
     // 字节，带标题的长清单一撑就爆，模型看到的是被砍掉尾部的残句。
@@ -7027,36 +7070,46 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     // 的时候有害，而看板保证有依赖的任务串行执行（依赖 done 才派发）。
     // 「实现」与「为它补测试」天然要改同一批文件，逼模型把它们的 paths
     // 拆开只会得到假声明；正确的表达是 depends_on。
+    let conflict_paths = |task: &PlanTask| -> Vec<String> {
+        let source_paths = (!is_readonly_plan_task(task))
+            .then_some(task.paths.as_slice())
+            .into_iter()
+            .flatten();
+        source_paths
+            .chain(task.artifact_paths.as_deref().unwrap_or_default().iter())
+            .map(|path| normalize(path))
+            .filter(|path| !path.is_empty())
+            .collect()
+    };
     let mut pairs = 0usize;
     // 冲突热点：重叠路径 → 牵涉到的任务下标集合。按路径聚合而不是按
     // "任务对"罗列，同一个热点路径只报一次，反馈短且可执行。
     let mut hot: std::collections::HashMap<String, std::collections::BTreeSet<usize>> =
         std::collections::HashMap::new();
     for i in 0..tasks.len() {
-        if is_readonly_plan_task(&tasks[i]) {
+        let left = conflict_paths(&tasks[i]);
+        if left.is_empty() {
             continue;
         }
         for j in (i + 1)..tasks.len() {
-            if is_readonly_plan_task(&tasks[j]) {
+            let right = conflict_paths(&tasks[j]);
+            if right.is_empty() {
                 continue;
             }
             // 有依赖关系（任一方向）→ 串行执行，重叠无害。
             if plan_tasks_dep_linked(&tasks[i], &tasks[j]) {
                 continue;
             }
-            for a in tasks[i].paths.iter().map(|p| normalize(p)) {
-                for b in tasks[j].paths.iter().map(|p| normalize(p)) {
-                    if a.is_empty() || b.is_empty() {
-                        continue;
-                    }
-                    let (pa, pb) = (std::path::Path::new(&a), std::path::Path::new(&b));
+            for a in &left {
+                for b in &right {
+                    let (pa, pb) = (std::path::Path::new(a), std::path::Path::new(b));
                     if pa == pb || pa.starts_with(pb) || pb.starts_with(pa) {
                         pairs += 1;
                         // 记较短的那个（= 包含关系里的父前缀）作热点。
                         let key = if a.len() <= b.len() {
-                            a.clone()
+                            a.as_str().to_string()
                         } else {
-                            b.clone()
+                            b.as_str().to_string()
                         };
                         let entry = hot.entry(key).or_default();
                         entry.insert(i);
@@ -7077,7 +7130,7 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
             .collect::<Vec<_>>()
             .join("、");
         return Err(format!(
-            "paths 范围重叠 {pairs} 处，集中在：{head}。并行会互相覆盖（派发被看板 409），\
+            "paths/artifact_paths 范围重叠 {pairs} 处，集中在：{head}。并行会互相覆盖（派发被看板 409），\
              请让各任务范围互不重叠；纯阅读任务的 labels 加「只读」可跳过本校验"
         ));
     }
@@ -7279,6 +7332,10 @@ const PLAN_TASK_KNOWN_KEYS: &[&str] = &[
     "task_type",
     "workflow",
     "paths",
+    "artifact_paths",
+    "output_paths",
+    "write_paths",
+    "artifacts",
     "depends_on",
     "subtasks",
     // paths 的 serde 别名
@@ -7377,9 +7434,20 @@ fn plan_task_input_property() -> latte_rs_agent_tools::types::ToolInputProperty 
         (
             "paths".into(),
             string_array_property(
-                "File or directory prefixes this task writes. Tasks with NON-overlapping \
-                 paths run IN PARALLEL, so declare them precisely — an omitted or overlapping \
-                 scope forces the whole task tree to run one-at-a-time.",
+                "Source/input file or directory prefixes this task inspects or touches for \
+                 scheduling. This field does NOT grant write permission. Tasks with \
+                 non-overlapping paths may run in parallel; omit only when the scope is truly \
+                 unknown.",
+            ),
+        ),
+        (
+            "artifact_paths".into(),
+            string_array_property(
+                "Optional hard output boundary for workflow-backed tasks. Use project-relative \
+                 file/directory prefixes. [] means read-only; non-empty means managed write/edit/\
+                 delete tools may write only under these prefixes. Omit for legacy unrestricted \
+                 behavior. For learn/research tasks, keep source anchors in `paths` and put only \
+                 generated notes/tutorials in `artifact_paths`.",
             ),
         ),
         (
@@ -10343,6 +10411,7 @@ async fn register_workflow_tool(
                 resolver,
                 default_params,
                 cwd,
+                artifact_paths: None,
                 event_tx,
                 // 后台 workflow 不继承当前 manager turn 的取消旗标；否则
                 // 工具一返回，下一轮 turn 的清理就可能误杀后台 doc review。
@@ -10438,6 +10507,7 @@ async fn run_workflow_command(
         resolver: config.model_resolver.clone(),
         default_params: config.default_params.clone(),
         cwd: config.cwd.clone(),
+        artifact_paths: None,
         event_tx: event_tx.clone(),
         cancel_flag,
         // slash workflow 进入后台后不继承当前 turn 的 cancel flag；
@@ -10774,6 +10844,7 @@ mod tests {
             task_type: None,
             workflow: None,
             paths: paths.iter().map(|s| s.to_string()).collect(),
+            artifact_paths: None,
             depends_on: vec![],
             subtasks: vec![],
         }
@@ -11966,6 +12037,7 @@ mod tests {
                     task_type: Some("feature".into()),
                     workflow: Some("tdd_development".into()),
                     paths: vec!["src/ringbuf".into()],
+                    artifact_paths: Some(vec!["src/ringbuf".into()]),
                     depends_on: vec![],
                     subtasks: vec![],
                 },
@@ -11977,6 +12049,7 @@ mod tests {
                     task_type: None,
                     workflow: None,
                     paths: vec![],
+                    artifact_paths: None,
                     depends_on: vec![],
                     subtasks: vec![],
                 },

@@ -2045,6 +2045,7 @@ fn cli_workflow_ctx_on(
         resolver,
         default_params,
         cwd,
+        artifact_paths: None,
         event_tx,
         cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         turn_cancel_flag: None,
@@ -4047,6 +4048,7 @@ mod tests {
             task_type: Some("feature".into()),
             workflow: None,
             paths: vec!["src/".into()],
+            artifact_paths: Some(vec!["src/".into()]),
             // 依赖引用写的是同批任务的标题（新任务还没有 id）。
             depends_on: vec!["补单测".into()],
             subtasks: vec![latte_agent_core::controller::PlanTask {
@@ -4057,6 +4059,7 @@ mod tests {
                 task_type: None,
                 workflow: None,
                 paths: vec![],
+                artifact_paths: Some(vec![]),
                 depends_on: vec![],
                 subtasks: vec![],
             }],
@@ -4068,6 +4071,7 @@ mod tests {
         assert_eq!(it.priority, Some(1));
         assert_eq!(it.labels, vec!["core".to_string()]);
         assert_eq!(it.paths, vec!["src/".to_string()]);
+        assert_eq!(it.artifact_paths, Some(vec!["src/".to_string()]));
         assert_eq!(
             it.depends_on,
             vec!["补单测".to_string()],

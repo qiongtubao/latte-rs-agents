@@ -124,6 +124,7 @@ function buildWithDepMap(
       task_type: (r.task as any).task_type ?? (r.task as any).taskType,
       workflow: r.task.workflow,
       paths: r.task.paths,
+      artifact_paths: r.task.artifact_paths,
       depends_on: remapDeps(r.task.depends_on, titles),
       subtasks,
     });

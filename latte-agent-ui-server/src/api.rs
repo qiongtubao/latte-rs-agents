@@ -2306,6 +2306,7 @@ pub fn workflow_run_start(
             resolver,
             default_params: GenerateParams::default(),
             cwd,
+            artifact_paths: None,
             event_tx: tx_inner,
             cancel_flag: cancel,
             turn_cancel_flag: None,
@@ -2454,6 +2455,7 @@ async fn spawn_workflow_resume(
         // 续跑必须落在这个 session 自己的工作空间（git worktree），
         // 不能退回项目根。`.latte` 是指回主仓的软链，断点文件两边都能读到。
         cwd: h.agent_cwd(),
+        artifact_paths: None,
         event_tx: controller.event_sender(),
         cancel_flag: cancel,
         // step 已无硬超时，必须给用户留 per-turn 逃生口：点「终止当前
@@ -5381,6 +5383,7 @@ mod workflow_resume_tests {
             scheduled_at: None,
             workflow: None,
             paths: vec![],
+            artifact_paths: None,
             depends_on: vec![],
             dispatch_pending: false,
             isolated: None,
