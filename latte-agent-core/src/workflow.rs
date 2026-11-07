@@ -4521,6 +4521,17 @@ enum CheckpointRecord {
         output: String,
         finished_at: u64,
     },
+    /// Terminal workflow failure. This is diagnostic state only: it never
+    /// counts as a completed step and is not copied into a resumed run.
+    Failure {
+        wf_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        reason: String,
+        failed_at: u64,
+    },
 }
 
 fn now_secs() -> u64 {
@@ -4678,6 +4689,10 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
                 // 后写覆盖：同一问题被问了两次（重试）时保留最后一次
                 // 的回答。
                 answers.insert(question, answer);
+            }
+            CheckpointRecord::Failure { .. } => {
+                // Terminal diagnostics are intentionally excluded from resume
+                // state. Only completed work and user answers carry forward.
             }
             CheckpointRecord::FanOutItem {
                 step_id,
@@ -4987,6 +5002,21 @@ impl CheckpointLog {
                 item_id: item_id.to_string(),
                 output: output.to_string(),
                 finished_at: now_secs(),
+            },
+        );
+    }
+
+    /// Persist terminal failure diagnostics without changing completion count.
+    fn record_failure(&self, step_id: Option<&str>, role: Option<&str>, reason: &str) {
+        append_checkpoint(
+            &self.cwd,
+            &self.wf_id,
+            &CheckpointRecord::Failure {
+                wf_id: self.wf_id.clone(),
+                step_id: step_id.map(str::to_string),
+                role: role.map(str::to_string),
+                reason: reason.to_string(),
+                failed_at: now_secs(),
             },
         );
     }
@@ -10559,7 +10589,7 @@ async fn run_workflow_inner(
             });
             Err(summary)
         }
-        WfOutcome::Failed(msg) => {
+        WfOutcome::Failed(reason) => {
             if let Some(st) = &created_staging {
                 let _ = ctx.event_tx.send(ChatEvent::Status {
                     message: format!(
@@ -10569,11 +10599,15 @@ async fn run_workflow_inner(
                     ),
                 });
             }
+            // Failure 是终态诊断，不计入 completed，也不会被 resume 抄入
+            // 新 checkpoint。当前 WfOutcome 尚未携带结构化 step/role；未知
+            // 时显式留空，避免从易变错误文案反向解析。
+            ckpt.record_failure(None, None, &reason);
             // 失败不丢成果：已完成 step 都落了 checkpoint，消息尾部
             // 带上进度与 wf_id，manager 可直接用 resume 续跑。
             let total = wf.steps.len() * wf.effective_max_rounds();
             let msg = format!(
-                "{msg}（已完成 {}/{total} 步，可用 resume 从断点续跑：wf_id={wf_id}）",
+                "{reason}（已完成 {}/{total} 步，可用 resume 从断点续跑：wf_id={wf_id}）",
                 ckpt.completed()
             );
             let _ = ctx.event_tx.send(ChatEvent::WorkflowFinished {
@@ -21125,11 +21159,24 @@ output_key = "out_b"
         assert!(err.contains("从断点续跑"), "失败消息带 resume 提示: {err}");
         let wf_id = extract_wf_id(&err);
 
-        // checkpoint：meta + step a 一条记录。
+        // checkpoint：meta + step a + terminal failure。Failure 只记诊断，
+        // 不会被 load_checkpoint 当成已完成 step。
         let lines = read_checkpoint(dir.path(), &wf_id);
-        assert_eq!(lines.len(), 2, "meta + 已完成的 step a: {lines:?}");
+        assert_eq!(lines.len(), 3, "meta + step a + failure: {lines:?}");
         assert_eq!(lines[1]["step_id"], "a");
         assert_eq!(lines[1]["output"], "步骤产出");
+        assert_eq!(lines[2]["type"], "failure");
+        assert_eq!(lines[2]["wf_id"], wf_id);
+        assert!(lines[2]["reason"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(lines[2]["failed_at"].is_number());
+        assert_eq!(
+            load_checkpoint(dir.path(), &wf_id)
+                .expect("failure checkpoint 可恢复")
+                .completed
+                .len(),
+            1,
+            "failure 不能计入完成进度"
+        );
 
         // Resume：新 mock server（若 step a 重跑会向它多发请求）。
         // 模型这次产出含验收字符串 → b、c 都能过。
