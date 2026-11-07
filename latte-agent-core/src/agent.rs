@@ -1355,6 +1355,9 @@ pub struct AgentRunner {
     deadline: Option<std::time::Instant>,
     /// 单个 turn 的模型请求次数预算（软上限）。见 [`AgentRunner::set_request_budget`]。
     request_budget: Option<usize>,
+    /// Shared workflow/session token meter. Every attached runner contributes
+    /// actual input + output + thinking usage after each model response.
+    shared_token_budget: Option<std::sync::Arc<SharedTokenBudget>>,
     /// Optional event channel for human intervention on broken JSON/inputs (Scheme A).
     tool_fix_event_tx: Option<tokio::sync::broadcast::Sender<crate::controller::ChatEvent>>,
     /// 会话级 todo 状态（见 [`crate::todo`]）：todo 工具 handler 读写，
@@ -1500,6 +1503,47 @@ fn short_tool_name(name: &str) -> &str {
 /// advisor delegate-return 审查的动机是「judge based on evidence」——
 /// 工具摘要太长会挤占审查上下文（还有 32K 字符的结果预算），
 /// 单条截断即可。返回的字符串以 `…[+N]` 结尾标记丢弃的字符数。
+/// A token meter shared by every runner in one workflow/session scope.
+/// `budget == 0` disables enforcement while retaining usage accounting.
+pub struct SharedTokenBudget {
+    used: std::sync::atomic::AtomicU64,
+    budget: u64,
+}
+
+impl SharedTokenBudget {
+    pub fn new(budget: u64) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicU64::new(0),
+            budget,
+        }
+    }
+
+    pub fn record(&self, tokens: u64) -> u64 {
+        let previous = self
+            .used
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |used| Some(used.saturating_add(tokens)),
+            )
+            .unwrap_or_else(|used| used);
+        previous.saturating_add(tokens)
+    }
+
+    pub fn exceeded(&self) -> Option<(u64, u64)> {
+        let used = self.used.load(std::sync::atomic::Ordering::Relaxed);
+        (self.budget > 0 && used >= self.budget).then_some((used, self.budget))
+    }
+
+    pub fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+}
+
 /// 请求预算硬上限：软预算的 1.5 倍（软预算时已提示收尾，再给一半余量收尾）。
 pub(crate) fn request_budget_hard(soft: usize) -> usize {
     soft + soft.div_ceil(2)
@@ -2852,6 +2896,7 @@ impl AgentRunner {
             resume_step: None,
             deadline: None,
             request_budget: None,
+            shared_token_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
@@ -2898,6 +2943,7 @@ impl AgentRunner {
             resume_step: None,
             deadline: None,
             request_budget: None,
+            shared_token_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
@@ -2942,6 +2988,7 @@ impl AgentRunner {
             resume_step: None,
             deadline: None,
             request_budget: None,
+            shared_token_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
@@ -3889,6 +3936,11 @@ impl AgentRunner {
         self.request_budget = (soft > 0).then_some(soft);
     }
 
+    pub fn with_shared_token_budget(mut self, budget: std::sync::Arc<SharedTokenBudget>) -> Self {
+        self.shared_token_budget = Some(budget);
+        self
+    }
+
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
         self.deadline = Some(deadline);
     }
@@ -4355,8 +4407,17 @@ impl AgentRunner {
         // the same error and may use their specialized recovery policy.
         let mut prompt_budget_compaction_attempted = false;
         let mut budget_hit: Option<usize> = None;
+        let mut shared_budget_hit: Option<(u64, u64)> = None;
         let mut budget_nudged = false;
         loop {
+            if let Some(hit) = self
+                .shared_token_budget
+                .as_ref()
+                .and_then(|budget| budget.exceeded())
+            {
+                shared_budget_hit = Some(hit);
+                break;
+            }
             // Deadline 检查（对齐 oh-my-pi `isDeadlineExceeded`）：
             // 每个 model call 前检查，超时时优雅退出、返回已有 partial。
             if let Some(dl) = self.deadline {
@@ -4776,6 +4837,13 @@ impl AgentRunner {
             self.total_usage.input_tokens += completion.usage.input_tokens;
             self.total_usage.output_tokens += completion.usage.output_tokens;
             self.total_usage.thinking_tokens += completion.usage.thinking_tokens;
+            if let Some(budget) = &self.shared_token_budget {
+                budget.record(
+                    u64::from(completion.usage.input_tokens)
+                        .saturating_add(u64::from(completion.usage.output_tokens))
+                        .saturating_add(u64::from(completion.usage.thinking_tokens)),
+                );
+            }
             total_input += completion.usage.input_tokens;
             total_output += completion.usage.output_tokens;
             total_thinking += completion.usage.thinking_tokens;
@@ -5265,6 +5333,13 @@ impl AgentRunner {
         // 截止截断一律报错（带 partial），不当成正常收尾：截断时最后一段
         // 正文多半是工具循环中途的过程旁白，不是结论。也不入 context——
         // 这个 turn 没有收尾，不该留下一条假装收尾的 assistant 消息。
+        if let Some((used, budget)) = shared_budget_hit {
+            return Err(AgentError::TokenBudgetExceeded {
+                used,
+                budget,
+                partial: last_substantive_response,
+            });
+        }
         if let Some(budget) = budget_hit {
             return Err(AgentError::RequestBudgetExceeded {
                 requests: round,

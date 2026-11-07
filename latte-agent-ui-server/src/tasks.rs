@@ -2144,6 +2144,7 @@ fn spawn_lifecycle_hook(
             staging: None,
             // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
             dispatch_budget: None,
+            token_budget: None,
         };
         let result = run_workflow(&wf, &topic, &ctx).await;
         // 写锁必须在**内层块**里用完就还：`parking_lot` 的 guard 不是 Send，
@@ -2864,6 +2865,7 @@ pub async fn dispatch_task(
                 staging: None,
                 // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
                 dispatch_budget: None,
+                token_budget: None,
             };
             let result = run_workflow(&wf, &msg2, &ctx).await;
             // 开发流跑完（非 code_review 本身）→ 链式自动审查。
@@ -3085,6 +3087,7 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
             staging: None,
             // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
             dispatch_budget: None,
+            token_budget: None,
         };
         let result = run_workflow(&wf, &msg, &ctx).await;
         if let Err(e) = &result {
@@ -3292,6 +3295,7 @@ async fn chain_code_review(
         staging: None,
         // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
         dispatch_budget: None,
+        token_budget: None,
     };
     let result = run_workflow(&wf, &topic, &ctx).await;
     let mut store = b.tasks.write();

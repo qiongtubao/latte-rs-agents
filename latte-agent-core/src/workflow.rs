@@ -4131,6 +4131,20 @@ pub struct WorkflowRunContext {
     /// 建出来，嵌套 run 原样继承 —— 这是要点：预算必须按**根 run** 计，
     /// 而不是每层各算一份。宿主一般传 `None`。
     pub dispatch_budget: Option<Arc<DispatchBudget>>,
+    /// 整棵嵌套 workflow 树共享的实际 token 预算。宿主传入时可与更
+    /// 外层 session 共用；缺省由顶层 run 创建，所有 step runner 共同记账。
+    pub token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
+}
+
+/// Workflow 根级 token 上限。它统计所有 step 和嵌套 workflow 的实际
+/// input + output + thinking token；并发请求可能产生少量在途超额。
+pub const DEFAULT_WORKFLOW_TOKEN_BUDGET: u64 = 1_000_000;
+
+fn workflow_token_budget() -> u64 {
+    std::env::var("LATTE_AGENT_WORKFLOW_TOKEN_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WORKFLOW_TOKEN_BUDGET)
 }
 
 /// 一次 workflow run（含其**全部嵌套子 run**）能派出去的分派单元总数上限。
@@ -4272,8 +4286,9 @@ fn run_nested_workflow(
             format!("nested workflow '{name}': {e}. available workflows: {available}")
         })?;
         let nested_ctx = WorkflowRunContext {
-            // 分派预算按**整棵嵌套树**计，所以原样继承而不是新建。
+            // 两种预算都按整棵嵌套树计，原样继承而不是新建。
             dispatch_budget: ctx.dispatch_budget.clone(),
+            token_budget: ctx.token_budget.clone(),
             merged: ctx.merged.clone(),
             resolver: ctx.resolver.clone(),
             default_params: ctx.default_params.clone(),
@@ -10050,6 +10065,64 @@ fn workflow_concurrency() -> usize {
         .unwrap_or(4)
 }
 
+/// Session-scoped workflow activity registry. Unlike the controller's
+/// event-derived cache, this registry is written directly at the execution
+/// boundary and cleaned by RAII on success, failure, panic, cancellation, or
+/// future drop.
+static ACTIVE_SESSION_WORKFLOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub struct WorkflowActivityGuard {
+    session_id: String,
+    run_id: String,
+}
+
+pub fn track_session_workflow(
+    session_id: &str,
+    run_id: impl Into<String>,
+) -> Option<WorkflowActivityGuard> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let run_id = run_id.into();
+    ACTIVE_SESSION_WORKFLOWS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(session_id.to_string())
+        .or_default()
+        .insert(run_id.clone());
+    Some(WorkflowActivityGuard {
+        session_id: session_id.to_string(),
+        run_id,
+    })
+}
+
+pub fn active_workflows_for_session(session_id: &str) -> Vec<String> {
+    let mut active = ACTIVE_SESSION_WORKFLOWS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(session_id)
+        .map(|runs| runs.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    active.sort();
+    active
+}
+
+impl Drop for WorkflowActivityGuard {
+    fn drop(&mut self) {
+        let mut registry = ACTIVE_SESSION_WORKFLOWS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(runs) = registry.get_mut(&self.session_id) {
+            runs.remove(&self.run_id);
+            if runs.is_empty() {
+                registry.remove(&self.session_id);
+            }
+        }
+    }
+}
+
 /// Run a loaded workflow to completion. Returns the last step's output
 /// on success; on cancel/failure emits `WorkflowFinished` with the
 /// matching status and returns the summary as `Err`.
@@ -10141,6 +10214,10 @@ async fn run_workflow_inner(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
+    let _activity_guard = ctx
+        .session_id
+        .as_deref()
+        .and_then(|session_id| track_session_workflow(session_id, wf_id.clone()));
     // 续跑顶层 run：把旧根名下的 live-* 快照改名 carry-* 搬到新根（本 wf_id）
     // 名下，供各 step 的 runner 在起跑时消费。嵌套 run 的 root_wf_id 已经在
     // ctx 里（指向外层），不在这里重复 adopt。
@@ -10172,13 +10249,26 @@ async fn run_workflow_inner(
     } else {
         None
     };
+    let created_token_budget = if ctx.token_budget.is_none() {
+        Some(Arc::new(crate::agent::SharedTokenBudget::new(
+            workflow_token_budget(),
+        )))
+    } else {
+        None
+    };
     let owned_ctx;
-    let ctx: &WorkflowRunContext = if created_staging.is_some() || created_budget.is_some() {
+    let ctx: &WorkflowRunContext = if created_staging.is_some()
+        || created_budget.is_some()
+        || created_token_budget.is_some()
+    {
         owned_ctx = WorkflowRunContext {
             staging: created_staging.clone().or_else(|| ctx.staging.clone()),
             dispatch_budget: created_budget
                 .clone()
                 .or_else(|| ctx.dispatch_budget.clone()),
+            token_budget: created_token_budget
+                .clone()
+                .or_else(|| ctx.token_budget.clone()),
             ..ctx.clone()
         };
         &owned_ctx
@@ -10192,6 +10282,16 @@ async fn run_workflow_inner(
                 st.root().display()
             ),
         });
+    }
+    if let Some(budget) = &created_token_budget {
+        if budget.budget() > 0 {
+            let _ = ctx.event_tx.send(ChatEvent::Status {
+                message: format!(
+                    "🧮 本次 workflow（含全部嵌套流程）共享 {} token 硬上限；达到后保留 checkpoint 并停止新模型请求",
+                    budget.budget()
+                ),
+            });
+        }
     }
     let ckpt = CheckpointLog::new(
         &ctx.cwd,
@@ -10845,6 +10945,7 @@ async fn build_role_runner(
     // 文档暂存层：Some 时把 runner 工具表里的 write/read 换成暂存
     // 包装版（写重定向 + 读 overlay），见 crate::staging。
     staging: Option<Arc<crate::staging::Staging>>,
+    token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
     step_tools: &[String],
     read_path_allowlist: &[String],
     write_path_allowlist: &[String],
@@ -11067,6 +11168,9 @@ async fn build_role_runner(
     if let Some(budget) = resolved_budget {
         r = r.with_prompt_token_budget(budget);
     }
+    if let Some(budget) = token_budget {
+        r = r.with_shared_token_budget(budget);
+    }
     if let Some(id) = sub_id {
         r = r.with_sub_id(id.to_string());
     }
@@ -11118,6 +11222,8 @@ struct SpeakerDispatch {
     staging: Option<Arc<crate::staging::Staging>>,
     /// 整棵嵌套树共享的分派单元预算。`None` = 不计（独立测试路径）。
     dispatch_budget: Option<Arc<DispatchBudget>>,
+    /// 根 workflow 共享 token 预算；所有 speaker runner 写入同一计数器。
+    token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
     /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
     step_tools: Vec<String>,
     /// 引擎强制的 read 路径白名单（按路径段 `*` 模式匹配），而不是
@@ -11203,6 +11309,7 @@ impl SpeakerDispatch {
             advisor_pause: ctx.advisor_pause.clone(),
             staging: ctx.staging.clone(),
             dispatch_budget: ctx.dispatch_budget.clone(),
+            token_budget: ctx.token_budget.clone(),
             step_tools,
             read_path_allowlist: Vec::new(),
             write_path_allowlist: Vec::new(),
@@ -11546,7 +11653,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
     // 「这条分派还在跑」，UI 据此决定是否显示菜单项。
     let (sub_cancel_flag, _sub_cancel_guard) = match &sub_id {
         Some(id) => (
-            Some(crate::sub_cancel::register(id)),
+            Some(crate::sub_cancel::register_for_session(
+                id,
+                inp.session_id.as_deref(),
+            )),
             Some(crate::sub_cancel::SubCancelGuard(id.clone())),
         ),
         None => (None, None),
@@ -11620,6 +11730,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     inp.agent_pause_gate.clone(),
                     inp.cancel_flag.clone(),
                     inp.staging.clone(),
+                    inp.token_budget.clone(),
                     &inp.step_tools,
                     &inp.read_path_allowlist,
                     &inp.write_path_allowlist,
@@ -11814,6 +11925,31 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                                     attempt = Ok((adopted, tool_count, tool_summary));
                                     break;
                                 }
+                            }
+                            if let crate::error::AgentError::TokenBudgetExceeded {
+                                used,
+                                budget,
+                                partial,
+                            } = &e
+                            {
+                                if let Some((notice, adopted)) = degrade_partial_on_break(
+                                    &speaker,
+                                    &inp.step_id,
+                                    &format!(
+                                        "workflow 共享 token 预算用完（{used}/{budget}）"
+                                    ),
+                                    partial,
+                                ) {
+                                    let _ = inp
+                                        .event_tx
+                                        .send(ChatEvent::Status { message: notice });
+                                    attempt = Ok((adopted, tool_count, tool_summary));
+                                    break;
+                                }
+                                attempt = Err(StepFail::Failed(format!(
+                                    "subagent '{speaker}' 启动前发现 workflow 共享 token 预算已用完（{used}/{budget}），未再发模型请求"
+                                )));
+                                break;
                             }
                             if let crate::error::AgentError::RequestBudgetExceeded {
                                 requests,
@@ -13942,6 +14078,8 @@ struct DagStepInput {
     staging: Option<Arc<crate::staging::Staging>>,
     /// 整棵嵌套树共享的分派单元预算（透传给 SpeakerDispatch）。
     dispatch_budget: Option<Arc<DispatchBudget>>,
+    /// 整棵嵌套树共享的 token 预算。
+    token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
     /// loop_until 返工时由调度器预置的「上轮审查反馈」（未满足循环
     /// 条件的那个 step 的产出），拼进本 step 的 prompt 后消费。
     feedback: Option<String>,
@@ -14017,6 +14155,7 @@ async fn run_dag_step(
             staging: inp.staging.clone(),
             // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
             dispatch_budget: None,
+            token_budget: inp.token_budget.clone(),
             root_wf_id: inp.root_wf_id.clone(),
         };
         let (output, exported) = run_nested_workflow(
@@ -14153,6 +14292,7 @@ async fn run_dag_step(
                 },
                 staging: inp.staging.clone(),
                 dispatch_budget: inp.dispatch_budget.clone(),
+                token_budget: inp.token_budget.clone(),
                 step_tools: step.tools.clone(),
                 read_path_allowlist: step.read_path_allowlist.clone(),
                 write_path_allowlist: render_scope_patterns(&step.write_path_allowlist, &inp.vars),
@@ -14907,6 +15047,7 @@ async fn run_workflow_dag(
                         advisor_pause: ctx.advisor_pause.clone(),
                         staging: ctx.staging.clone(),
                         dispatch_budget: ctx.dispatch_budget.clone(),
+                        token_budget: ctx.token_budget.clone(),
                         feedback: feedback.clone(),
                         answer_log: answer_log.clone(),
                     };
@@ -18671,6 +18812,7 @@ mod contract_engine_tests {
                 advisor_pause: None,
                 staging: None,
                 dispatch_budget: None,
+                token_budget: None,
                 root_wf_id: None,
             },
             event_rx,
@@ -18713,6 +18855,7 @@ forbid = ["TBD"]
             None,
             Arc::new(AtomicBool::new(false)),
             None,
+            None,
             &[],
             &[],
             &[],
@@ -18751,6 +18894,7 @@ forbid = ["TBD"]
             &event_tx,
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
             &[],
             &[],
@@ -18826,6 +18970,7 @@ forbid = ["TBD"]
             &event_tx,
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
             &[],
             &[],
@@ -20628,6 +20773,7 @@ mod resume_tests {
                 advisor_pause: None,
                 staging: None,
                 dispatch_budget: None,
+                token_budget: None,
                 root_wf_id: None,
             },
             event_rx,
@@ -23557,6 +23703,7 @@ mod loop_tests {
                 advisor_pause: None,
                 staging: None,
                 dispatch_budget: None,
+                token_budget: None,
                 root_wf_id: None,
             },
             event_rx,
@@ -25150,6 +25297,7 @@ task = "补充疑问"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
 
@@ -25655,6 +25803,7 @@ task = "补充疑问"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let wf: WorkflowDef = toml::from_str(
@@ -27881,6 +28030,7 @@ output_key = "plan_out"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         }
     }
@@ -28020,6 +28170,7 @@ output_key = "plan_out"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let out = tokio::time::timeout(
@@ -28076,6 +28227,7 @@ output_key = "plan_out"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let vars = HashMap::new();
@@ -28190,6 +28342,7 @@ max_retries = 2
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let out = tokio::time::timeout(
@@ -28374,6 +28527,7 @@ max_iterations = 10
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let out = tokio::time::timeout(
@@ -28454,6 +28608,7 @@ max_retries = {max_retries}
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let out = tokio::time::timeout(
@@ -28713,6 +28868,7 @@ max_retries = 0
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         tokio::time::timeout(
@@ -29042,6 +29198,7 @@ max_retries = 2
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         tokio::time::timeout(
@@ -29265,6 +29422,7 @@ max_retries = 2
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let out = tokio::time::timeout(
@@ -29542,6 +29700,7 @@ max_retries = 2
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let wf: WorkflowDef = toml::from_str(
@@ -29680,6 +29839,7 @@ task = "后续步 {{outline_out}}"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let wf: WorkflowDef = toml::from_str(
@@ -29930,6 +30090,7 @@ task = "TAIL_STEP"
             advisor_pause: None,
             staging: None,
             dispatch_budget: None,
+            token_budget: None,
             root_wf_id: None,
         };
         let wf = learn_resume_wf();

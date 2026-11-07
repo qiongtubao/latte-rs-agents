@@ -24,8 +24,13 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-/// `sub_id` → 该分派的取消旗标。
-static PENDING: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+struct PendingDispatch {
+    session_id: Option<String>,
+    flag: Arc<AtomicBool>,
+}
+
+/// `sub_id` → 该分派的 session 归属与取消旗标。
+static PENDING: LazyLock<Mutex<HashMap<String, PendingDispatch>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 登记一条正在跑的分派，返回它的取消旗标。
@@ -34,11 +39,20 @@ static PENDING: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
 /// [`SubCancelGuard`] 保证退出时摘除登记。同一 `sub_id` 重复登记会顶掉
 /// 旧旗标（正常不会发生——`sub_id` 唯一）。
 pub fn register(sub_id: &str) -> Arc<AtomicBool> {
+    register_for_session(sub_id, None)
+}
+
+/// 登记带 session 归属的分派。goal complete 用 session 查询，而历史
+/// SubsessionStore 不能代表活动状态，因此归属必须和取消旗标同生命周期。
+pub fn register_for_session(sub_id: &str, session_id: Option<&str>) -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
-    PENDING
-        .lock()
-        .unwrap()
-        .insert(sub_id.to_string(), flag.clone());
+    PENDING.lock().unwrap().insert(
+        sub_id.to_string(),
+        PendingDispatch {
+            session_id: session_id.map(str::to_string),
+            flag: flag.clone(),
+        },
+    );
     flag
 }
 
@@ -48,8 +62,8 @@ pub fn register(sub_id: &str) -> Arc<AtomicBool> {
 /// 调用方据此告诉用户"该分派已结束"，而不是假装取消成功。
 pub fn cancel(sub_id: &str) -> bool {
     match PENDING.lock().unwrap().get(sub_id) {
-        Some(flag) => {
-            flag.store(true, Ordering::SeqCst);
+        Some(entry) => {
+            entry.flag.store(true, Ordering::SeqCst);
             true
         }
         None => false,
@@ -65,6 +79,19 @@ pub fn unregister(sub_id: &str) {
 /// 该分派是否仍在登记表里（即仍在跑）。供 UI/API 判断"还能不能取消"。
 pub fn is_active(sub_id: &str) -> bool {
     PENDING.lock().unwrap().contains_key(sub_id)
+}
+
+/// 该 session 当前仍在运行的分派 id，稳定排序便于错误回执和诊断。
+pub fn active_for_session(session_id: &str) -> Vec<String> {
+    let mut active = PENDING
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, entry)| entry.session_id.as_deref() == Some(session_id))
+        .map(|(sub_id, _)| sub_id.clone())
+        .collect::<Vec<_>>();
+    active.sort();
+    active
 }
 
 /// 当前在跑的分派数。仅用于测试与诊断。

@@ -4105,6 +4105,7 @@ async fn build_runner(
                 // 空 session_id 表示"临时 runner"（部分测试路径），
                 // 那种情况下不落盘。
                 (!session_id.is_empty()).then(|| (cwd.to_path_buf(), session_id.to_string())),
+                Some(plan_stage.clone()),
             )
             .map_err(|e| AgentError::Tool(format!("register goal '{role_id}': {e}")))?;
         }
@@ -8551,6 +8552,59 @@ fn goal_prop(
 /// 里的话**。低于这个长度基本只能写出「已完成」三个字，那等于没有审计。
 const GOAL_EVIDENCE_MIN_CHARS: usize = 40;
 
+fn goal_completion_blockers(
+    event_tx: &broadcast::Sender<ChatEvent>,
+    persist_at: Option<&(PathBuf, String)>,
+    plan_stage: Option<&SharedPlanStage>,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let session_id = persist_at.map(|(_, session_id)| session_id.as_str());
+
+    if let Some(session_id) = session_id {
+        let workflows = crate::workflow::active_workflows_for_session(session_id);
+        if !workflows.is_empty() {
+            blockers.push(format!("运行中 workflow: {}", workflows.join(", ")));
+        }
+        let delegates = crate::sub_cancel::active_for_session(session_id);
+        if !delegates.is_empty() {
+            blockers.push(format!("运行中 delegate/step: {}", delegates.join(", ")));
+        }
+    }
+
+    let mut dialogs = std::collections::BTreeSet::new();
+    for event in crate::choice::pending_dialogs_for_channel(event_tx) {
+        match event {
+            ChatEvent::ChoiceRequested { choice_id, .. } => {
+                dialogs.insert(choice_id);
+            }
+            ChatEvent::PlanProposed { plan_id, .. } => {
+                dialogs.insert(plan_id);
+            }
+            _ => {}
+        }
+    }
+    if let Some((cwd, session_id)) = persist_at {
+        dialogs.extend(
+            crate::pending_ask::load_for_session(cwd, session_id)
+                .into_iter()
+                .map(|record| record.choice_id),
+        );
+    }
+    if !dialogs.is_empty() {
+        blockers.push(format!(
+            "待用户处理的提问/弹框: {}",
+            dialogs.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    if let Some(stage) = plan_stage {
+        if let PlanStage::PendingApproval { plan_id } = &*stage.read() {
+            blockers.push(format!("待批准 plan: {plan_id}"));
+        }
+    }
+    blockers
+}
+
 /// 注册 `goal` 工具：模型自己维护跨 turn 的完成契约。
 ///
 /// # 权限门（这是本函数存在的主要理由）
@@ -8560,7 +8614,7 @@ const GOAL_EVIDENCE_MIN_CHARS: usize = 40;
 /// **完全信任模型**：oh-my-pi 的 `completeGoalFromTool()` 只校验状态机合法
 /// 性，deepseek-harness 的 README 直接写明 "No independent evaluator"。
 ///
-/// 这里加了两道 latte 特有的**程序性**门禁——不裁决对错，只强制把判断
+/// 这里加了三道 latte 特有的**程序性**门禁——不裁决对错，只强制把判断
 /// 摊开：
 ///
 /// 1. **`complete` 必须带 `evidence`**（≥ [`GOAL_EVIDENCE_MIN_CHARS`] 字符）。
@@ -8568,11 +8622,14 @@ const GOAL_EVIDENCE_MIN_CHARS: usize = 40;
 ///    于是用户与 advisor 事后可复核。对症 `loop_no_release_on` 那条注释记的
 ///    事故：run 以 `ok` 收尾、summary 却是 REJECT 原文，失败被吞成成功——
 ///    当时没有任何地方留下「凭什么算过了」。
-/// 2. **`blocked` 要求至少已跑过 [`crate::goal::BLOCK_MIN_ROUNDS`] 轮**
+/// 2. **完成前 session 必须静默**：不能还有运行中 workflow、delegate、
+///    待用户处理的 ask/plan。机制借鉴 oh-my-pi 的 owner-scoped
+///    quiescence barrier；OpenCode 和 Agent Teams 都只有局部门禁，不照搬。
+/// 3. **`blocked` 要求至少已跑过 [`crate::goal::BLOCK_MIN_ROUNDS`] 轮**
 ///    （照 deepseek-harness 的 `blockedAfterConsecutiveRounds`）。模型在第一
 ///    轮就报「我被卡住了」几乎总是没真试过；先让它真的试几轮。
 ///
-/// 两道门都返回**可执行的**报错（告诉模型缺什么、下一步干什么），而不是
+/// 三道门都返回**可执行的**报错（告诉模型缺什么、下一步干什么），而不是
 /// 单纯拒绝——单纯拒绝会让模型原地重试同一个调用。
 pub fn register_goal_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
@@ -8585,6 +8642,9 @@ pub fn register_goal_tool(
     // 每次成功的 mutation 之后立刻写盘：goal 的价值就在于跨 turn / 跨进程
     // 记得那个目标，攒着批量写只会在崩溃时丢掉最该留下的那一次。
     persist_at: Option<(PathBuf, String)>,
+    // session 活动完成门：生产 runner 传入自己的 plan stage；测试或临时
+    // runner 可传 None，此时仍保留 evidence 门。
+    plan_stage: Option<SharedPlanStage>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler};
 
@@ -8663,6 +8723,7 @@ pub fn register_goal_tool(
         let goal_state = goal_state.clone();
         let event_tx = event_tx.clone();
         let persist_at = persist_at.clone();
+        let plan_stage = plan_stage.clone();
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
             let s = |k: &str| {
@@ -8748,6 +8809,22 @@ pub fn register_goal_tool(
                              输出是什么、测试过没过。这一轮实际核对过的当前状态，不要凭记忆。\n\
                              还没核对就先去核对（读文件 / 跑测试），核对完再调这一步；\
                              确实达不成就用 op=blocked 说明卡点。"
+                        )));
+                    }
+                    // 门禁 2：参考 oh-my-pi 的 quiescence barrier。主 agent
+                    // 已经能输出，不代表 session 内的 workflow、delegate
+                    // 或待用户交互已经收尾；这些活动全部归零后才准完成。
+                    let blockers = goal_completion_blockers(
+                        &event_tx,
+                        persist_at.as_ref(),
+                        plan_stage.as_ref(),
+                    );
+                    if !blockers.is_empty() {
+                        return Err(tool_err(format!(
+                            "op=complete 被拒：本 session 仍有工作未收尾：\n- {}\n\
+                             先等待对应 Finished/结果事件并处理用户弹框；\
+                             若确实无法继续，用 op=blocked 说明卡点。",
+                            blockers.join("\n- ")
                         )));
                     }
                     let g = {
@@ -9422,7 +9499,8 @@ async fn register_delegate_tool(
             // per-subsession 取消登记：UI 右键该分派 →「终止此分派」时
             // 只掐这一条（manager 并行委派多个 specialist 时，不必为了
             // 停一个而 cancel 整轮）。guard 随 handler 退出自动摘除。
-            let sub_cancel_flag = crate::sub_cancel::register(&sub_id);
+            let sub_cancel_flag =
+                crate::sub_cancel::register_for_session(&sub_id, Some(session_id.as_str()));
             let _sub_cancel_guard = crate::sub_cancel::SubCancelGuard(sub_id.clone());
             // Fan out ONLY to the subsession memory sink: the
             // `sub_sink` is `Arc<dyn TraceSink>` returning from
@@ -9957,6 +10035,15 @@ async fn register_delegate_tool(
 /// `latte-agent-core` implements its own tiny engine (see
 /// `crate::workflow`) instead of reusing `latte-agent-orchestrator`,
 /// because the orchestrator depends on core — a dependency cycle.
+static WORKFLOW_START_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_workflow_start_id(name: &str) -> String {
+    format!(
+        "starting:{name}:{}",
+        WORKFLOW_START_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 async fn register_workflow_tool(
     tm: &Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     merged: &AgentConfig,
@@ -10124,6 +10211,8 @@ async fn register_workflow_tool(
                 tool_err(format!("{e}. available workflows: {available}"))
             })?;
 
+            let startup_activity =
+                crate::workflow::track_session_workflow(&session_id, next_workflow_start_id(&name));
             let ctx = crate::workflow::WorkflowRunContext {
                 merged,
                 resolver,
@@ -10143,6 +10232,7 @@ async fn register_workflow_tool(
                 advisor_pause: Some(advisor_pause),
                 staging: None,
                 dispatch_budget: None,
+                token_budget: None,
                 root_wf_id: None,
             };
             let response_name = name.clone();
@@ -10151,6 +10241,8 @@ async fn register_workflow_tool(
             let workflow_name = name.clone();
             let workflow_topic = topic.clone();
             tokio::spawn(async move {
+                // 从 workflow 工具返回前到执行边界完成登记之间也必须算 active。
+                let _startup_activity = startup_activity;
                 // guard 必须活到后台 workflow 最终结束，防止同身份并发重入。
                 let _wf_guard = wf_guard;
                 let result = match &resume {
@@ -10212,6 +10304,10 @@ async fn run_workflow_command(
         Err(_) => return Ok(None), // no workflow registered for this command
     };
 
+    let startup_activity = crate::workflow::track_session_workflow(
+        &config.session_id,
+        next_workflow_start_id(&wf.name),
+    );
     let ctx = crate::workflow::WorkflowRunContext {
         merged: config.agent_config.clone(),
         resolver: config.model_resolver.clone(),
@@ -10233,12 +10329,14 @@ async fn run_workflow_command(
         advisor_pause: Some(advisor_pause),
         staging: None,
         dispatch_budget: None,
+        token_budget: None,
         root_wf_id: None,
     };
     let response_name = wf.name.clone();
     let workflow_name = response_name.clone();
     let workflow_topic = topic.to_string();
     tokio::spawn(async move {
+        let _startup_activity = startup_activity;
         let result = crate::workflow::run_workflow(&wf, &workflow_topic, &ctx).await;
         if let Err(e) = result {
             tracing::warn!(workflow = %workflow_name, error = %e, "slash background workflow ended");
@@ -18793,7 +18891,8 @@ require = ["永远不可能出现的验收字符串"]
         let tm = build_tool_manager(&[]).await.expect("tool manager");
         let state = crate::goal::new_shared_goal();
         let (tx, rx) = broadcast::channel(64);
-        register_goal_tool(&tm, tx, "manager".into(), state.clone(), None).expect("register goal");
+        register_goal_tool(&tm, tx, "manager".into(), state.clone(), None, None)
+            .expect("register goal");
         (tm, state, rx)
     }
 

@@ -61,9 +61,17 @@ pub enum AgentError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Token budget exceeded.
-    #[error("token budget exceeded: used {used}, budget {budget}")]
-    TokenBudgetExceeded { used: usize, budget: usize },
+    /// Shared run/session token budget exceeded. All runners attached to the
+    /// same meter stop before their next model request.
+    #[error(
+        "token budget exceeded: used {used}, budget {budget}{}",
+        fmt_partial(partial)
+    )]
+    TokenBudgetExceeded {
+        used: u64,
+        budget: u64,
+        partial: String,
+    },
 
     /// 一个 workflow step 在发送下一次模型调用前发现实际待发 prompt 已
     /// 超出该 step 的硬预算。与 session token budget 不同：这是防止

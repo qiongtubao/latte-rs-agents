@@ -1563,6 +1563,7 @@ async fn build_runner(
                 role_id.to_string(),
                 goal_state,
                 Some((cwd.to_path_buf(), cli_session_id())),
+                None,
             )
             .map_err(|e| format!("goal tool setup failed: {}", e))?;
         }
@@ -2066,6 +2067,7 @@ fn cli_workflow_ctx_on(
         staging: None,
         // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
         dispatch_budget: None,
+        token_budget: None,
     }
 }
 
