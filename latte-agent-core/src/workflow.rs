@@ -12176,6 +12176,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                         role_id: speaker.clone(),
                         detail: format!("timed out after {step_timeout_s}s"),
+                        status: "timeout".into(),
                         sub_id: sub_id.clone(),
                     });
                     if let Some(id) = &sub_id {
@@ -12229,6 +12230,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                             role_id: speaker.clone(),
                             detail: "cancelled by user".into(),
+                            status: "cancelled".into(),
                             sub_id: sub_id.clone(),
                         });
                         if let Some(id) = &sub_id {
@@ -12254,6 +12256,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                             role_id: speaker.clone(),
                             detail: "cancelled by user".into(),
+                            status: "cancelled".into(),
                             sub_id: sub_id.clone(),
                         });
                         if let Some(id) = &sub_id {
@@ -12282,6 +12285,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                             role_id: speaker.clone(),
                             detail: "terminated by user (subsession)".into(),
+                            status: "cancelled".into(),
                             sub_id: sub_id.clone(),
                         });
                         if let Some(id) = &sub_id {
@@ -12385,6 +12389,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                         role_id: speaker.clone(),
                         detail: format!("advisor intervene：带审查意见{action}"),
+                        status: "failed".into(),
                         sub_id: sub_id.clone(),
                     });
                     let feedback = if v.hint.is_empty() {
@@ -12443,6 +12448,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
             let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                 role_id: speaker.clone(),
                 detail: format!("ok, {} chars", response.len()),
+                status: "ok".into(),
                 sub_id: sub_id.clone(),
             });
             if let Some(id) = &sub_id {
@@ -12493,6 +12499,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
             let _ = inp.event_tx.send(ChatEvent::RoleFinished {
                 role_id: speaker.clone(),
                 detail: format!("error: {msg}"),
+                status: "failed".into(),
                 sub_id: sub_id.clone(),
             });
             if let Some(id) = &sub_id {

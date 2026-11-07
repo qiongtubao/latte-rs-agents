@@ -221,6 +221,7 @@ mod tests {
                 ChatEvent::RoleFinished {
                     role_id: "m".into(),
                     detail: "ok".into(),
+                    status: "ok".into(),
                     sub_id: None,
                 },
             ),

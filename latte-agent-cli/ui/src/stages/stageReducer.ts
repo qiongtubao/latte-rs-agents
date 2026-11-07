@@ -9,7 +9,7 @@
 // 为保证折叠是全函数 (total)，未识别或暂未实现的事件都走 no-op 分支，
 // 绝不静默丢弃到会破坏折叠的程度。
 
-import type { ChatEvent } from "../api";
+import { effectiveRoleFinishStatus, type ChatEvent } from "../api";
 import {
   createStage,
   type Stage,
@@ -272,6 +272,29 @@ function completeTop(store: StageStore, ctx: ReducerContext): ReducerResult {
   return { store: putStage(store, nextStage), ctx: ctx2 };
 }
 
+/** RoleFinished 自带权威终态，不能先无条件 complete 再等 Error 修正。
+ * 并行 delegate 按 sub_id 找到自己的 stage，旧事件按 detail 兼容推断。 */
+function finishRole(
+  store: StageStore,
+  event: Extract<ChatEvent, { type: "RoleFinished" }>,
+  ctx: ReducerContext,
+): ReducerResult {
+  const stage = stageForEvent(store, event, ctx);
+  if (!stage) return { store, ctx };
+  const status = effectiveRoleFinishStatus(event);
+  const nextStage: Stage = {
+    ...stage,
+    status: status === "ok" ? "complete" : "error",
+    content: status === "ok" ? stage.log.modelExchange.response : event.detail,
+    currentEventText: event.detail,
+  };
+  const ctx2: ReducerContext = {
+    ...ctx,
+    stack: ctx.stack.filter((stageId) => stageId !== stage.id),
+  };
+  return { store: putStage(store, nextStage), ctx: ctx2 };
+}
+
 /**
  * DelegateStarted：在栈顶 Stage 之下创建一个子 Stage（Subagent_Stage）。
  *  - parentId = 当前栈顶 id
@@ -471,10 +494,12 @@ export function stageReducer(
       return finishDelegate(store, event, ctx);
     }
 
-    case "RoleFinished":
+    case "RoleFinished": {
+      return finishRole(store, event, ctx);
+    }
+
     case "Done": {
-      // 完成栈顶 Stage：定型 content、置为 complete、弹栈（保留同一 id 与 log）。
-      // 栈为空时（不匹配的 RoleFinished）completeTop 直通忽略，保持折叠全函数 (2.4)。
+      // 完成栈顶 Stage：定型 content、置为 complete、弹栈。
       return completeTop(store, ctx);
     }
 

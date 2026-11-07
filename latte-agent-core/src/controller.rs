@@ -438,10 +438,13 @@ pub enum ChatEvent {
         sub_id: Option<String>,
     },
     /// A role has finished working. `sub_id` 与对应的
-    /// [`ChatEvent::RoleStarted`] 一致。
+    /// [`ChatEvent::RoleStarted`] 一致。`status` 是新事件的权威终态；旧归档
+    /// 缺字段时为空，由 [`effective_role_finish_status`] 按 detail 兼容推断。
     RoleFinished {
         role_id: String,
         detail: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        status: String,
         sub_id: Option<String>,
     },
     /// A single role was individually paused (HIL v1.4, multi-role
@@ -792,6 +795,39 @@ fn set_plan_mode_flag(
 ) {
     if plan_mode.swap(active, Ordering::SeqCst) != active {
         let _ = event_tx.send(ChatEvent::PlanModeChanged { active });
+    }
+}
+
+/// RoleFinished 的有效终态。新事件直接使用结构化 `status`；旧归档没有
+/// 该字段时才按历史 detail 文案推断，避免把旧 error/timeout 重放成成功。
+pub fn effective_role_finish_status<'a>(status: &'a str, detail: &str) -> &'a str {
+    if !status.trim().is_empty() {
+        return status;
+    }
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("timed out") || detail.contains("timeout") {
+        "timeout"
+    } else if detail.contains("cancelled")
+        || detail.contains("canceled")
+        || detail.contains("terminated by user")
+    {
+        "cancelled"
+    } else if detail.contains("error") || detail.contains("failed") {
+        "failed"
+    } else {
+        "ok"
+    }
+}
+
+fn role_finish_status_for_error(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::DeadlineExceeded { .. } => "timeout",
+        AgentError::Orchestration(message)
+            if message == "session cancelled by user" || message == "turn cancelled by user" =>
+        {
+            "cancelled"
+        }
+        _ => "failed",
     }
 }
 
@@ -2820,6 +2856,7 @@ async fn run_multi_role_loop(
                         let _ = event_tx.send(ChatEvent::RoleFinished {
                             role_id: role_id.clone(),
                             detail: format!("round {round_num}: ok, {} chars", text.len()),
+                            status: "ok".into(),
                             sub_id: None,
                         });
                         text
@@ -2831,6 +2868,7 @@ async fn run_multi_role_loop(
                         let _ = event_tx.send(ChatEvent::RoleFinished {
                             role_id: role_id.clone(),
                             detail: format!("round {round_num}: error: {e}"),
+                            status: role_finish_status_for_error(&e).into(),
                             sub_id: None,
                         });
                         // Advisor gate 重试耗尽：发 AdvisorTerminated，
@@ -3701,6 +3739,7 @@ async fn run_single_role_loop(
                                         let _ = event_tx.send(ChatEvent::RoleFinished {
                                             role_id: current_role.clone(),
                                             detail: format!("ok, {} chars", response.len()),
+                                            status: "ok".into(),
                                             sub_id: None,
                                         });
                                         let _ = event_tx.send(ChatEvent::Prompt { icon: ico, role_id: current_role.clone(), model_id: mid });
@@ -3889,6 +3928,7 @@ async fn run_single_role_loop(
                                         let _ = event_tx.send(ChatEvent::RoleFinished {
                                             role_id: current_role.clone(),
                                             detail: format!("error: {e}"),
+                                            status: role_finish_status_for_error(&e).into(),
                                             sub_id: None,
                                         });
                                         // Advisor gate 重试耗尽：发
@@ -9900,6 +9940,7 @@ async fn register_delegate_tool(
                         let _ = event_tx.send(ChatEvent::RoleFinished {
                             role_id: role_id.clone(),
                             detail: format!("timed out after {timeout_s}s"),
+                            status: "timeout".into(),
                             sub_id: Some(sub_id.clone()),
                         });
                         let summary = format!(
@@ -9922,6 +9963,7 @@ async fn register_delegate_tool(
                             let _ = event_tx.send(ChatEvent::RoleFinished {
                                 role_id: role_id.clone(),
                                 detail: "cancelled by user".into(),
+                                status: "cancelled".into(),
                                 sub_id: Some(sub_id.clone()),
                             });
                             let summary = String::from("delegate cancelled by user");
@@ -9940,6 +9982,7 @@ async fn register_delegate_tool(
                             let _ = event_tx.send(ChatEvent::RoleFinished {
                                 role_id: role_id.clone(),
                                 detail: "cancelled by user".into(),
+                                status: "cancelled".into(),
                                 sub_id: Some(sub_id.clone()),
                             });
                             let summary = String::from("delegate cancelled by user");
@@ -9962,6 +10005,7 @@ async fn register_delegate_tool(
                             let _ = event_tx.send(ChatEvent::RoleFinished {
                                 role_id: role_id.clone(),
                                 detail: "terminated by user (subsession)".into(),
+                                status: "cancelled".into(),
                                 sub_id: Some(sub_id.clone()),
                             });
                             let summary = format!(
@@ -10030,6 +10074,7 @@ async fn register_delegate_tool(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("ok, {} chars", response.len()),
+                        status: "ok".into(),
                         sub_id: Some(sub_id.clone()),
                     });
                 }
@@ -10050,6 +10095,7 @@ async fn register_delegate_tool(
                     let _ = event_tx.send(ChatEvent::RoleFinished {
                         role_id: role_id.clone(),
                         detail: format!("error: {}", e),
+                        status: "failed".into(),
                         sub_id: Some(sub_id.clone()),
                     });
                     let _ = event_tx.send(ChatEvent::Error {

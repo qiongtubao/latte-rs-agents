@@ -2099,12 +2099,15 @@ impl MonitorState {
                 }
             }
             ChatEvent::RoleFinished {
-                role_id, detail, ..
+                role_id,
+                detail,
+                status,
+                ..
             } if role_id == &self.watched_role => {
-                // Turn ended without a RoleTurn (error/timeout path):
-                // reset per-turn state. D1 has no final text to
-                // reconcile, so nothing fires here.
-                if detail.contains("error") || detail.contains("timeout") {
+                // Turn ended without a RoleTurn (error/timeout/cancel path):
+                // reset per-turn state. New events use structured status;
+                // archived events fall back to their legacy detail text.
+                if crate::controller::effective_role_finish_status(status, detail) != "ok" {
                     self.reset_turn_state();
                     turn_ended = true;
                 }
@@ -3515,6 +3518,7 @@ mod tests {
         let out = s.observe(&ChatEvent::RoleFinished {
             role_id: "manager".into(),
             detail: "error: turn failed".into(),
+            status: "failed".into(),
             sub_id: None,
         });
         assert!(out.turn_ended);

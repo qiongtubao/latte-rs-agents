@@ -163,6 +163,24 @@ export interface TodoPhase {
   tasks: TodoTask[];
 }
 
+export type RoleFinishStatus = "ok" | "failed" | "timeout" | "cancelled";
+
+/** New events carry status explicitly. Archived events predate that field, so
+ * only those fall back to the legacy detail text. */
+export function effectiveRoleFinishStatus(event: {
+  status?: RoleFinishStatus | string;
+  detail: string;
+}): RoleFinishStatus {
+  if (event.status === "ok" || event.status === "failed" || event.status === "timeout" || event.status === "cancelled") {
+    return event.status;
+  }
+  const detail = event.detail.toLowerCase();
+  if (detail.includes("timed out") || detail.includes("timeout")) return "timeout";
+  if (detail.includes("cancelled") || detail.includes("canceled") || detail.includes("terminated by user")) return "cancelled";
+  if (detail.includes("error") || detail.includes("failed")) return "failed";
+  return "ok";
+}
+
 // ChatEvent —— Rust enum ChatEvent 的 JSON 表示（discriminated union）。
 // 字段命名沿用 Rust（snake_case）。
 export type ChatEvent =
@@ -177,7 +195,7 @@ export type ChatEvent =
   // speaker）；同一 role 可被并行 workflow 步同时委派，起止事件
   // 按 (role_id, sub_id) 配对。主 session 角色的 turn 不带 sub_id。
   | { type: "RoleStarted"; role_id: string; detail: string; sub_id?: string | null }
-  | { type: "RoleFinished"; role_id: string; detail: string; sub_id?: string | null }
+  | { type: "RoleFinished"; role_id: string; detail: string; status?: RoleFinishStatus; sub_id?: string | null }
   // 单角色被单独暂停/恢复（多角色 HIL）。区别于 Paused/Resumed
   // （整会话）。UI 据此渲染角色的「已暂停」标记与暂停/恢复切换。
   | { type: "RolePaused"; role_id: string }

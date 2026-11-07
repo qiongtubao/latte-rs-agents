@@ -1,4 +1,4 @@
-import { ChatEvent, RoleInfo, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, setPlanMode, type ImportTask, type ChoiceOption, type TaskView } from "./api";
+import { ChatEvent, RoleInfo, effectiveRoleFinishStatus, sendMessage, sendChoiceAnswer, dismissPrompt, sendCommand, switchRole, cancelTurn, cancelSubagent, pauseSessionV2, resumeSessionV2, pauseRole, resumeRole, importTasks, refineParentFor, uploadImage, listWorkflows, listTasks, resumeWorkflow, getCurrentSessionId, setPlanMode, type ImportTask, type ChoiceOption, type TaskView } from "./api";
 import { BUILTIN_CMD_HINTS, mergeWorkflowCommands, type CmdHint } from "./cmd_hints";
 /** ChoiceRequested 事件的窄化类型（从 ChatEvent union 抽出）。 */
 type ChoiceRequestedEvent = Extract<ChatEvent, { type: "ChoiceRequested" }>;
@@ -3121,17 +3121,26 @@ export function mountChat(opts: {
       }
       case "RoleFinished": {
         clearStream(e.role_id, e.sub_id);
+        const status = effectiveRoleFinishStatus(e);
+        const presentation = status === "ok"
+          ? { state: "done" as const, icon: "✅", label: "完成" }
+          : status === "timeout"
+            ? { state: "error" as const, icon: "⏱", label: "超时" }
+            : status === "cancelled"
+              ? { state: "error" as const, icon: "⏹", label: "已取消" }
+              : { state: "error" as const, icon: "❌", label: "失败" };
+        const text = `${presentation.icon} ${e.role_id} ${presentation.label}`;
         const entry = takeExecutingRow(e.role_id, e.sub_id);
         if (entry) {
           const inner = entry.row.querySelector(".message.status") as HTMLElement | null;
           if (inner) {
-            inner.classList.remove("executing");
-            inner.classList.add("done");
+            inner.classList.remove("executing", "done", "error");
+            inner.classList.add(presentation.state);
             const content = inner.querySelector(".content");
-            if (content) content.textContent = `✅ ${e.role_id} 完成`;
+            if (content) content.textContent = text;
           }
         } else {
-          addMessage({ kind: "status", content: `✅ ${e.role_id} 完成`, meta: e.role_id, state: "done" });
+          addMessage({ kind: "status", content: text, meta: e.role_id, state: presentation.state });
         }
         hideTimeoutPrompt(e.role_id, e.sub_id);
         break;
