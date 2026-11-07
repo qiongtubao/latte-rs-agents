@@ -177,7 +177,9 @@ impl ModelClient {
 
     /// Whether this model is currently usable (cooldown absent or elapsed).
     fn is_available(&self) -> bool {
-        if crate::billing::blocked(&self.model).is_some() {
+        if crate::billing::blocked(&self.model).is_some()
+            || crate::credentials::blocked(&self.model).is_some()
+        {
             return false;
         }
         match *self.cooldown_until.lock() {
@@ -381,6 +383,14 @@ impl Agent {
                 ));
                 continue;
             }
+            if let Some(msg) = crate::credentials::blocked(&mc.model) {
+                tried.push(mc.model.id.clone());
+                failures.push((
+                    mc.model.id.clone(),
+                    format!("{}：{msg}", crate::credentials::CREDENTIAL_FAILURE_PREFIX),
+                ));
+                continue;
+            }
             if !mc.is_available() {
                 continue;
             }
@@ -413,6 +423,18 @@ impl Agent {
                         ));
                         continue;
                     }
+                    if crate::credentials::is_auth_error(&e) {
+                        crate::credentials::mark(&mc.model, &e);
+                        failures.push((
+                            mc.model.id.clone(),
+                            format!(
+                                "{}：{}",
+                                crate::credentials::CREDENTIAL_FAILURE_PREFIX,
+                                brief_model_error(&e)
+                            ),
+                        ));
+                        continue;
+                    }
                     failures.push((mc.model.id.clone(), brief_model_error(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
@@ -428,22 +450,17 @@ impl Agent {
 
         // Every model in the chain is either on cooldown or just failed
         // with a retryable error.
-        let earliest = self
-            .model_chain
-            .iter()
-            .filter_map(|mc| mc.cooldown_remaining())
-            .min();
+        let earliest = self.retry_after();
 
         if wait == WaitPolicy::WaitAndRetry {
             if let Some(d) = earliest {
                 tokio::time::sleep(d).await;
                 // After waiting, retry the highest-priority usable model once
                 // （余额不足的账户不算：重试它毫无意义）。
-                if let Some(mc) = self
-                    .model_chain
-                    .iter()
-                    .find(|mc| crate::billing::blocked(&mc.model).is_none())
-                {
+                if let Some(mc) = self.model_chain.iter().find(|mc| {
+                    crate::billing::blocked(&mc.model).is_none()
+                        && crate::credentials::blocked(&mc.model).is_none()
+                }) {
                     match mc.client.chat(messages, p).await {
                         Ok(c) => {
                             if let Some(reason) = completion_rejection_reason(&c) {
@@ -458,20 +475,27 @@ impl Agent {
                         Err(e) => {
                             if crate::billing::is_billing_error(&e) {
                                 crate::billing::mark(&mc.model, &e.to_string());
+                            } else if crate::credentials::is_auth_error(&e) {
+                                crate::credentials::mark(&mc.model, &e);
                             } else if let Some(cd) = cooldown_for_error(&e) {
                                 // Refresh its cooldown if retryable.
                                 mc.set_cooldown(cd);
                             }
                             tried.push(mc.model.id.clone());
-                            failures.push((mc.model.id.clone(), brief_model_error(&e)));
+                            let failure = if crate::credentials::is_auth_error(&e) {
+                                format!(
+                                    "{}：{}",
+                                    crate::credentials::CREDENTIAL_FAILURE_PREFIX,
+                                    brief_model_error(&e)
+                                )
+                            } else {
+                                brief_model_error(&e)
+                            };
+                            failures.push((mc.model.id.clone(), failure));
                         }
                     }
                 }
-                let new_earliest = self
-                    .model_chain
-                    .iter()
-                    .filter_map(|mc| mc.cooldown_remaining())
-                    .min();
+                let new_earliest = self.retry_after();
                 return Err(AgentError::ModelsUnavailable {
                     tried,
                     failures,
@@ -513,6 +537,14 @@ impl Agent {
                 ));
                 continue;
             }
+            if let Some(msg) = crate::credentials::blocked(&mc.model) {
+                tried.push(mc.model.id.clone());
+                failures.push((
+                    mc.model.id.clone(),
+                    format!("{}：{msg}", crate::credentials::CREDENTIAL_FAILURE_PREFIX),
+                ));
+                continue;
+            }
             if !mc.is_available() {
                 continue;
             }
@@ -535,6 +567,18 @@ impl Agent {
                         ));
                         continue;
                     }
+                    if crate::credentials::is_auth_error(&e) {
+                        crate::credentials::mark(&mc.model, &e);
+                        failures.push((
+                            mc.model.id.clone(),
+                            format!(
+                                "{}：{}",
+                                crate::credentials::CREDENTIAL_FAILURE_PREFIX,
+                                brief_model_error(&e)
+                            ),
+                        ));
+                        continue;
+                    }
                     failures.push((mc.model.id.clone(), brief_model_error(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
@@ -548,12 +592,19 @@ impl Agent {
         Err(AgentError::ModelsUnavailable {
             tried,
             failures,
-            next_retry_in: self
-                .model_chain
-                .iter()
-                .filter_map(|mc| mc.cooldown_remaining())
-                .min(),
+            next_retry_in: self.retry_after(),
         })
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        self.model_chain
+            .iter()
+            .filter(|mc| {
+                crate::billing::blocked(&mc.model).is_none()
+                    && crate::credentials::blocked(&mc.model).is_none()
+            })
+            .filter_map(ModelClient::cooldown_remaining)
+            .min()
     }
 
     /// 记下这次请求由链上哪个模型接的（仅观测用，见 `served_index`）。
@@ -602,6 +653,14 @@ impl Agent {
     pub fn mark_serving_billing(&self, err: &AiError) -> Option<String> {
         let mc = self.serving_model()?;
         crate::billing::mark(&mc.model, &err.to_string());
+        Some(mc.model.id.clone())
+    }
+
+    /// 流已建立后才报告 401/403：摘除当前凭证/模型授权，让重开的流
+    /// 直接选择下一候选，且新建 Agent 也不会再次撞同一凭证。
+    pub fn mark_serving_credentials(&self, err: &AiError) -> Option<String> {
+        let mc = self.serving_model()?;
+        crate::credentials::mark(&mc.model, err);
         Some(mc.model.id.clone())
     }
 
@@ -1207,6 +1266,7 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
         }
         // HTTP status codes from the upstream provider.
         AiError::Api { status, .. } => match *status {
+            401 | 403 => None,
             429 => Some(Duration::from_secs(60)),
             500..=599 => Some(Duration::from_secs(30)),
             // 402 Payment Required / 余额不足：在**本次会话内不会自愈**
@@ -1230,12 +1290,9 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
             _ => Some(Duration::from_secs(30)),
         },
         AiError::Http(_) => Some(Duration::from_secs(10)),
-        // 认证失败：本系统里每个模型有**各自的 key/厂商**（deepseek
-        // 官方、kimi、minimax、glm 中转……），一个模型 token 失效并不
-        // 意味着整链都坏——glm 中转 key 过期时 deepseek 官方可能健
-        // 在。短冷却让链落到下一个模型；若全链都 auth 失败，最终以
-        // ModelsUnavailable 报错，信息同样明确。
-        AiError::Auth(_) => Some(Duration::from_secs(5)),
+        // Authentication is handled by the process-wide credential registry
+        // before this function is called. It has no automatic retry timer.
+        AiError::Auth(_) => None,
         // 流式超时/中断（TTFB 首事件超时、idle 超时、连接中断）：多为
         // 厂商侧卡顿或 payload 过大处理慢，换链上下一个模型很可能立刻
         // 能跑。短冷却后跟链走；全链都超时才以 ModelsUnavailable 进入
@@ -1637,6 +1694,19 @@ fn failures_are_all_billing(e: &AgentError) -> bool {
                 && failures
                     .iter()
                     .all(|(_, f)| f.starts_with(crate::billing::BILLING_FAILURE_PREFIX))
+        }
+        _ => false,
+    }
+}
+
+fn failures_are_all_permanent_accounts(e: &AgentError) -> bool {
+    match e {
+        AgentError::ModelsUnavailable { failures, .. } => {
+            !failures.is_empty()
+                && failures.iter().all(|(_, failure)| {
+                    failure.starts_with(crate::billing::BILLING_FAILURE_PREFIX)
+                        || failure.starts_with(crate::credentials::CREDENTIAL_FAILURE_PREFIX)
+                })
         }
         _ => false,
     }
@@ -3195,11 +3265,18 @@ impl AgentRunner {
             .map(|d| auto_pause_backoff(attempt, d));
 
         let billing = crate::billing::blocked_summary();
+        let credentials = crate::credentials::blocked_summary();
         let all_billing = failures_are_all_billing(e);
+        let all_permanent = failures_are_all_permanent_accounts(e);
         let hint = if all_billing {
             format!(
                 "模型链上能用的账户都余额不足/配额耗尽：{}。重试无意义，已停下等你处理——充值（或在模型配置里换掉这些模型）后点 ▶ 继续，会重新检测",
                 billing.join("；")
+            )
+        } else if all_permanent && !credentials.is_empty() {
+            format!(
+                "模型链上的凭证/模型授权均被拒绝：{}。已摘除且不自动重试——修正 API key 或授权后点 ▶ 继续，会重新检测",
+                credentials.join("；")
             )
         } else if failures_include_context_overflow(e) {
             "检测到上下文超出模型窗口——原样重试必败。点 ▶ 继续将自动裁剪本轮待发消息中的超长内容（多为工具结果）后重试；会话记录不受影响"
@@ -3225,6 +3302,14 @@ impl AgentRunner {
         } else {
             hint
         };
+        let hint = if !all_permanent && !credentials.is_empty() {
+            format!(
+                "{hint}。另：{} 鉴权失败，已摘除、不参与自动重试，修正后点 ▶ 继续会重新检测",
+                credentials.join("；")
+            )
+        } else {
+            hint
+        };
         gate.pause_with_reason(format!("模型不可用（{summary}），已自动暂停——{hint}"));
         self.sink.emit(crate::trace::TraceEvent::SessionPaused {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
@@ -3233,9 +3318,9 @@ impl AgentRunner {
             turn: 0,
         });
 
-        // 全是余额类失败：不自动重试（auto_after 已经是 None，因为它们不计入
-        // cooldown），直接等人工；人工继续 = 多半刚充完值，放行所有账户重测。
-        let auto_after = if all_billing { None } else { auto_after };
+        // 全是不会随时间自愈的账户类失败（余额或鉴权）：直接等人工，
+        // 不进入 cooldown 自动重试。
+        let auto_after = if all_permanent { None } else { auto_after };
         // (是否恢复, 是否人工点的继续)
         let (resumed, manual) = match auto_after {
             // 退避窗口内人点了 ▶ 就走人工路径；没人管则超时自恢复。
@@ -3256,14 +3341,23 @@ impl AgentRunner {
                 true,
             ),
         };
-        // 人工继续 = 多半刚充完值：放行所有被摘除的账户，下一次请求重新检测。
-        // 自动退避恢复不放行——那只是限流窗口过去了，余额不会自己回来。
-        if resumed && manual && !billing.is_empty() {
-            let n = crate::billing::clear_all();
-            tracing::info!(
-                accounts = n,
-                "manual resume: billing blocks cleared for re-probe"
-            );
+        // 人工继续表示用户已处理账户问题：余额与鉴权摘除都放行一次
+        // 重新探测。配置热更新换 key 时即使不清也会因指纹变化自动放行。
+        if resumed && manual {
+            if !billing.is_empty() {
+                let n = crate::billing::clear_all();
+                tracing::info!(
+                    accounts = n,
+                    "manual resume: billing blocks cleared for re-probe"
+                );
+            }
+            if !credentials.is_empty() {
+                let n = crate::credentials::clear_all();
+                tracing::info!(
+                    accounts = n,
+                    "manual resume: credential blocks cleared for re-probe"
+                );
+            }
         }
         self.sink.emit(crate::trace::TraceEvent::SessionResumed {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
@@ -3876,6 +3970,8 @@ impl AgentRunner {
         }
         let from = if crate::billing::is_billing_error(err) {
             self.agent.mark_serving_billing(err)?
+        } else if crate::credentials::is_auth_error(err) {
+            self.agent.mark_serving_credentials(err)?
         } else {
             let cd = cooldown_for_error(err)?;
             self.agent.cooldown_serving_model(cd)?
@@ -6573,7 +6669,7 @@ mod tests {
         );
         // 对照：其余 4xx 仍是短冷却（可能是模型 id 写错，下一个模型
         // 换个 id 格式就能成，值得快速重试）。
-        for status in [400u16, 401, 403, 404, 422] {
+        for status in [400u16, 404, 422] {
             let other = cooldown_for_error(&AiError::Api {
                 status,
                 message: "bad".into(),
@@ -6606,12 +6702,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cooldown_for_4xx_other_than_429_is_60s() {
-        // 400/401/403/404：模型 id 不存在或 payload 不被该模型接受，
-        // 60s 冷却后链落到下一个模型（不同 id / 不同厂商）。cd92331
-        // 把 4xx 从 5s 提到 60s（流式 400 沿模型链 fallback），本测试
-        // 对齐现行语义。
-        for status in [400u16, 401, 403, 404] {
+    fn test_cooldown_for_non_auth_4xx_is_60s() {
+        // Deterministic non-auth 4xx retain the existing model-chain fallback
+        // behavior. Authentication has a separate process-wide block.
+        for status in [400u16, 404, 422] {
             let d = cooldown_for_error(&AiError::Api {
                 status,
                 message: "bad request".into(),
@@ -6621,11 +6715,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cooldown_for_auth_error_falls_through_quickly() {
-        // 模型各自的 key 失效是模型局部问题：短冷却后链落到下一个
-        // 模型，而不是整链陪葬（glm 中转 key 过期 ≠ deepseek 也坏）。
+    fn test_cooldown_for_auth_error_has_no_retry_timer() {
+        // Authentication moves to the process-wide credential registry and
+        // must not schedule a retry of the same rejected key.
         let d = cooldown_for_error(&AiError::Auth("bad key".into()));
-        assert_eq!(d, Some(Duration::from_secs(5)));
+        assert_eq!(d, None);
+        for status in [401, 403] {
+            assert_eq!(
+                cooldown_for_error(&AiError::Api {
+                    status,
+                    message: "bad key".into(),
+                }),
+                None
+            );
+        }
     }
     #[test]
     fn test_cooldown_for_stream_error_falls_through_chain() {
@@ -8380,7 +8483,8 @@ mod tests {
         // Auth errors DO walk the chain: each model has its own
         // key/vendor, so one model's bad token says nothing about the
         // next model's health (glm relay key expired ≠ deepseek key
-        // bad). The dead model is cooled down and the chain continues.
+        // bad). The rejected credential is blocked process-wide and the chain
+        // continues, including for subsequently constructed Agents.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
@@ -8416,9 +8520,24 @@ mod tests {
             .await
             .expect("chain should fall through to the healthy model");
         assert!(completion.content.contains("reached via fallback"));
-        // m1 got exactly one attempt, then the chain moved on.
+
+        // A newly constructed Agent must inherit the process-wide block and
+        // skip m1 without spending another request on the same rejected key.
+        let fresh_agent = Agent::new_with_chain(
+            "fresh".into(),
+            test_role(),
+            vec![model_at(&s1, "m1"), model_at(&s2, "m2")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        fresh_agent
+            .chat(&[Message::user("again")], None, WaitPolicy::NoWait)
+            .await
+            .expect("fresh agent should skip the rejected credential");
+
         assert_eq!(s1.received_requests().await.unwrap().len(), 1);
-        assert_eq!(s2.received_requests().await.unwrap().len(), 1);
+        assert_eq!(s2.received_requests().await.unwrap().len(), 2);
+        crate::credentials::clear_all();
     }
 
     #[tokio::test]

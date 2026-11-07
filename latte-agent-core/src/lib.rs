@@ -50,6 +50,7 @@ pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod controller;
+pub mod credentials;
 pub mod dispatch_ledger;
 pub mod doc_graph_tools;
 pub mod edit_anchor;
